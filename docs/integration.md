@@ -13,7 +13,7 @@
 | `apiUrl` | 工作台服务器视角的 HTTP(S) 服务地址，也是 `proxy` 唯一的连接目标；不能含查询参数、锚点或 URL 内的用户名密码。`link` 使用 `proxy` 时也必须填写。 |
 | `authOrigin` | 可选的原项目登录来源地址，仅接受 HTTP(S) 来源（协议、主机和可选端口，不含路径、查询参数或凭据）；ASTER 的 `ASTER_PUBLIC_ORIGIN` 或 Asset 的 `PUBLIC_ORIGIN` 配置了外部来源时填写相同来源，例如 `https://asset.example.com`。留空使用接口服务来源。 |
 | `accessMode` | `proxy` 经工作台访问完整页面，`direct` 直接打开 `url`。内置 `aster`、`monitor`、`asset` 默认 `proxy`，`standard`、`link` 默认 `direct`；可手动切换，旧配置缺少字段时采用同样默认值。 |
-| `mode` | `external` 独立打开原页面，`embed` 按需嵌入；代理仅允许当前工作台嵌入，直接访问仍遵循原页面策略。 |
+| `mode` | `direct` 连接时，`external` 提供新窗口入口，`embed` 在进入项目时自动嵌入；`proxy` 连接统一直接显示原始页面，不受旧 `mode` 值影响。 |
 | `autoSync` | 布尔值，仅 Asset 使用：启用后每 60 秒触发原项目资产同步。Asset 默认 `true`，其他适配器默认 `false`；旧记录缺少字段时采用同样默认值。 |
 | `enabled` | 是否参与后台读取、Asset 同步和常规展示；停用项目也不能获得新的页面代理授权。 |
 | `staleAfterSeconds` | 30–86400；按数据源 `updatedAt` 判断过期。 |

@@ -18,3 +18,20 @@
 @media(max-width:760px){.sidebar{visibility:hidden}.sidebar.open{visibility:visible}}
 .chart-caption{font-size:.8125rem;color:#6b7a92;margin:0 12px 6px}
 .sync-panel{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:22px 26px;margin-bottom:20px}.sync-panel strong{font-size:15px}.sync-panel p{margin:7px 0;color:var(--muted);font-size:14px}.sync-panel small{font-size:12px;color:var(--muted)}@media(max-width:650px){.sync-panel{align-items:flex-start;flex-direction:column;padding:18px}.sync-panel .button{width:100%}}
+
+/* The original app owns the project content area; the hub supplies navigation. */
+.project-shell{height:100dvh;min-height:0;overflow:hidden}
+.project-shell .workspace{min-width:0;min-height:0}
+.project-shell .topbar{flex-shrink:0}
+.main-content.project-content{display:flex;flex-direction:column;max-width:none;min-height:0;padding:0;overflow:hidden}
+.project-content>.inline-error{flex-shrink:0;margin:12px 16px 0}
+.project-screen{display:flex;flex:1;flex-direction:column;min-height:0;min-width:0;background:#fff}
+.original-page-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0;padding:8px 16px;border-bottom:1px solid var(--border)}
+.original-page-loading{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:.8125rem;min-width:0}
+.original-page-actions{display:flex;align-items:center;gap:4px;margin-left:auto;flex-shrink:0}
+.original-page-actions .button{font-size:.8125rem;padding:7px 10px;min-height:36px;white-space:nowrap}
+.original-project-frame{display:block;flex:1;width:100%;min-height:0;border:0;background:#fff}
+.original-page-placeholder{flex:1;min-height:0;overflow:auto}
+.original-page-error{flex-shrink:0;margin:12px 16px}
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+@media(max-width:650px){.original-page-toolbar{padding:6px 8px;gap:4px;flex-wrap:wrap}.original-page-loading:not(:empty){flex-basis:100%;padding:4px 6px}.original-page-actions{justify-content:flex-end;width:100%}.original-page-actions .button{padding:7px 8px}.project-shell .breadcrumb{min-width:0}.project-shell .breadcrumb strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-shell .topbar-right{display:none}}
