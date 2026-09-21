@@ -45,6 +45,20 @@ test('authentication gates private data, enforces Origin/CSRF, and logout revoke
   assert.equal((await f.request('/api/projects')).status, 401);
 });
 
+test('Aster reads the server port independently of its browser tunnel and preserves saved addresses', async t => {
+  let requested;
+  const f = await fixture(t, { summaryReader: async project => { requested = project; return summary(); } });
+  await f.login();
+  await f.app.check('aster');
+  assert.equal(requested.apiUrl, 'http://127.0.0.1:8765');
+  assert.equal(requested.url, 'http://127.0.0.1:18765');
+  const custom = { apiUrl: 'http://127.0.0.1:9876', url: 'http://127.0.0.1:19876' };
+  assert.equal((await f.request('/api/projects/aster', { method: 'PUT', body: custom })).status, 200);
+  await f.reopen(); await f.login();
+  const project = (await f.request('/api/projects')).data.projects.find(item => item.id === 'aster');
+  assert.equal(project.apiUrl, custom.apiUrl); assert.equal(project.url, custom.url);
+});
+
 test('project and encrypted credentials persist; changing service clears credentials', async t => {
   const f = await fixture(t); await f.login();
   const secret = 'upstream-password-do-not-disclose';

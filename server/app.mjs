@@ -14,7 +14,7 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const SESSION_AGE = 12 * 60 * 60 * 1000;
 const defaults = [
-  { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:18765', apiUrl: 'http://127.0.0.1:18765', staleAfterSeconds: 120 },
+  { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:18765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
   { id: 'monitor', name: 'Market Monitor', description: '原油价差与市场监控', category: 'monitoring', adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=oil', apiUrl: 'http://127.0.0.1:3000', staleAfterSeconds: 120 },
   { id: 'asset', name: 'Asset Ledger', description: '资产账本、持有金额与历史变化', category: 'assets', adapter: 'asset', url: 'http://127.0.0.1:5678', apiUrl: 'http://127.0.0.1:5678', staleAfterSeconds: 900 },
 ].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));

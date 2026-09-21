@@ -45,7 +45,7 @@ test('asset adapter uses cookie login, keeps USD totals separate from withdrawn 
 });
 
 test('aster adapter uses snapshot timestamps, leaves missing values null and reports USD1 units', async () => {
-  const result = await readSummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:18765' }, null, { request: async () => ({ data: { ready: true, updated_at: Date.now() / 1000, accounts: [{ enabled: true, mode: 'live', snapshot: { occupied_margin: '12.3', timestamp: 1600000000 }, cycle_state: { daily_volume: { volume: null } } }] } }) });
+  const result = await readSummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, updated_at: Date.now() / 1000, accounts: [{ enabled: true, mode: 'live', snapshot: { occupied_margin: '12.3', timestamp: 1600000000 }, cycle_state: { daily_volume: { volume: null } } }] } }) });
   assert.equal(result.updatedAt, new Date(1600000000000).toISOString()); assert.equal(result.metrics.find(item => item.key === 'occupied_margin').unit, 'USD1'); assert.equal(result.metrics.find(item => item.key === 'daily_volume').value, null);
 });
 
