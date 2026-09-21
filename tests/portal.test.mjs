@@ -9,6 +9,7 @@ async function fixture(t, options = {}) {
   let upstreamCalls = 0; let ledgerReads = 0; let validSession = true; let revision = 'revision-one'; let time = Date.now();
   const upstream = http.createServer((req, res) => {
     upstreamCalls++;
+    if (options.onUpstream?.(req, res)) return;
     if (req.url === '/api/ledger' && options.assetLedger) { ledgerReads++; res.writeHead(req.headers.cookie?.includes('asset_session=valid') ? 200 : 401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(req.headers.cookie?.includes('asset_session=valid') ? { assets: [{ id: 'real-browser-ledger', value: 123 }], history: [], version: options.ledgerVersion?.() || 0 } : { error: '请先登录原资产项目' })); return; }
     if (req.url === '/nested/start') { res.writeHead(302, { Location: '../done?relative=1' }); res.end(); return; }
     if (req.url === '/slow-header') { const timer = setTimeout(() => res.end('completed'), 130); res.on('close', () => clearTimeout(timer)); return; }
@@ -23,6 +24,7 @@ async function fixture(t, options = {}) {
   });
   upstream.on('upgrade', (req, socket) => {
     upstreamCalls++;
+    options.onUpstreamUpgrade?.(req);
     upgradedSockets.add(socket); socket.on('close', () => upgradedSockets.delete(socket));
     const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
@@ -309,4 +311,156 @@ test('asset partial completion returns a real ledger, absent hooks stay transpar
   const limitedGrant = await limited.authorize();
   const rejected = await limited.request('/api/sync', { method: 'POST', cookie: `${limitedGrant.cookie}; asset_session=valid`, headers: { Origin: `http://${limited.host('asset')}` }, body: Buffer.alloc(2048) });
   assert.equal(rejected.status, 413); assert.equal(limited.ledgerReads, 0); assert.equal(calls, 0);
+});
+
+test('automatic sessions are independent per grant and authenticate HTML, assets, APIs, SSE and WebSockets', async t => {
+  const observed = [];
+  let logins = 0;
+  const f = await fixture(t, {
+    authenticateProject: async ({ projectId, revision, deadline, signal }) => {
+      assert.equal(projectId, 'asset'); assert.equal(revision, 'revision-one');
+      assert.ok(deadline > Date.now()); assert.equal(signal.aborted, false);
+      return { cookie: { name: 'asset_session', value: `server-only-${++logins}` } };
+    },
+    onUpstream: req => { observed.push({ path: req.url, headers: req.headers }); },
+    onUpstreamUpgrade: req => { observed.push({ path: req.url, headers: req.headers }); },
+  });
+  const first = await f.authorize(); const second = await f.authorize();
+  assert.equal(logins, 2); assert.notEqual(first.cookie, second.cookie);
+  for (const grant of [first, second]) {
+    assert.equal(grant.result.headers['set-cookie'].length, 1);
+    assert.match(grant.result.headers['set-cookie'][0], /^hub_portal=/);
+    assert.doesNotMatch(JSON.stringify(grant.result.headers), /server-only|asset_session/);
+  }
+  const cookie = `${first.cookie}; asset_session=browser-forged; ASSET_SESSION=also-forged; hub_session=hub-secret; language=zh`;
+  const headers = { Authorization: 'Basic browser-forged', Origin: `http://${f.host('asset')}` };
+  for (const path of ['/', '/_next/static/app.js', '/api/state']) assert.equal((await f.request(path, { cookie, headers })).status, 200);
+  const posted = await f.request('/api/save', { method: 'POST', cookie, headers, body: '{"value":123}' });
+  assert.equal(posted.status, 200); assert.equal(JSON.parse(posted.body).body, '{"value":123}');
+  assert.equal((await f.request('/sse', { cookie, headers })).body.toString(), 'data: first\n\ndata: second\n\n');
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: f.port, path: '/ws', headers: { ...headers, Host: f.host('asset'), Cookie: cookie, Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': randomBytes(16).toString('base64'), 'Sec-WebSocket-Version': '13' } });
+    req.on('error', reject); req.on('response', res => reject(new Error(`Unexpected response ${res.statusCode}`)));
+    req.on('upgrade', (res, socket) => { assert.equal(res.statusCode, 101); socket.destroy(); resolve(); }); req.end();
+  });
+  assert.deepEqual(observed.map(item => item.path), ['/', '/_next/static/app.js', '/api/state', '/api/save', '/sse', '/ws']);
+  for (const item of observed) { assert.equal(item.headers.cookie, 'language=zh; asset_session=server-only-1'); assert.equal(item.headers.authorization, undefined); }
+  const other = JSON.parse((await f.request('/api/state', { cookie: second.cookie })).body);
+  assert.equal(other.headers.cookie, 'asset_session=server-only-2');
+  assert.equal(logins, 2);
+});
+
+test('automatic response sessions remain server-side and Basic credentials override the browser on every path', async t => {
+  const cookieFixture = await fixture(t, {
+    authenticateProject: async () => ({ cookie: { name: 'asset_session', value: 'server-cookie-secret' } }),
+    onUpstream: (req, res) => {
+      if (req.url !== '/cookie-response') return false;
+      res.writeHead(200, { 'Set-Cookie': ['asset_session=rotated-secret; Path=/; HttpOnly', 'ASSET_SESSION=alternate-secret; Path=/', 'language=zh; Domain=.hub.localhost; Path=/'], 'WWW-Authenticate': 'Basic realm="private"' }); res.end('ok'); return true;
+    },
+  });
+  const granted = await cookieFixture.authorize(); const response = await cookieFixture.request('/cookie-response', { cookie: granted.cookie });
+  assert.equal(response.status, 200); assert.deepEqual(response.headers['set-cookie'], ['language=zh; Path=/']);
+  assert.equal(response.headers['www-authenticate'], undefined); assert.doesNotMatch(JSON.stringify(response.headers), /secret/);
+
+  let logins = 0;
+  const basic = await fixture(t, { authenticateProject: async () => { logins++; return { authorization: 'Basic ' + Buffer.from('monitor:stored-password').toString('base64') }; } });
+  const basicGrant = await basic.authorize('monitor');
+  for (const path of ['/', '/_next/static/app.js', '/api/monitors']) {
+    const result = await basic.request(path, { id: 'monitor', cookie: basicGrant.cookie, headers: { Authorization: 'Basic forged' } });
+    assert.equal(result.status, 200); assert.equal(JSON.parse(result.body).headers.authorization, 'Basic ' + Buffer.from('monitor:stored-password').toString('base64'));
+  }
+  assert.equal(logins, 1); assert.doesNotMatch(JSON.stringify(basicGrant.result.headers), /Basic|stored-password/);
+});
+
+test('logging out of an original app revokes only that grant and reopening obtains a fresh login', async t => {
+  let logins = 0;
+  const f = await fixture(t, { authenticateProject: async () => ({ cookie: { name: 'asset_session', value: `session-${++logins}` } }) });
+  const first = await f.authorize(); const second = await f.authorize();
+  const logout = await f.request('/api/logout', { method: 'POST', cookie: first.cookie, headers: { Origin: `http://${f.host('asset')}` } });
+  assert.equal(logout.status, 200); assert.equal(JSON.parse(logout.body).headers.cookie, 'asset_session=session-1');
+  assert.deepEqual(logout.headers['set-cookie'], ['hub_portal=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0']);
+  assert.equal((await f.request('/private', { cookie: first.cookie })).status, 401);
+  assert.equal((await f.request('/private', { cookie: second.cookie })).status, 200); assert.equal(logins, 2);
+  const reopened = await f.authorize(); assert.equal(logins, 3);
+  assert.equal(JSON.parse((await f.request('/private', { cookie: reopened.cookie })).body).headers.cookie, 'asset_session=session-3');
+});
+
+test('automatic auth failures suppress login pages and Basic challenges without replaying business writes or logging in again', async t => {
+  for (const variant of ['cookie-401', 'asset-login-redirect', 'basic-401']) {
+    let logins = 0; let writes = 0;
+    const f = await fixture(t, {
+      authenticateProject: async () => { logins++; return variant === 'basic-401' ? { authorization: 'Basic dXNlcjpwYXNzd29yZA==' } : { cookie: { name: 'asset_session', value: 'login-secret' } }; },
+      onUpstream: (req, res) => {
+        if (req.url !== '/api/action') return false;
+        writes++; req.resume();
+        res.writeHead(variant === 'asset-login-redirect' ? 307 : 401, { Location: '/login?next=%2F', 'WWW-Authenticate': 'Basic realm="original login"', 'Set-Cookie': 'asset_session=leaked-secret; Path=/' }); res.end('upstream-private-detail'); return true;
+      },
+    });
+    f.projects[0].adapter = 'asset';
+    const { cookie } = await f.authorize();
+    const response = await f.request('/api/action', { method: 'POST', cookie, headers: { Origin: `http://${f.host('asset')}` }, body: '{"business":"write"}' });
+    assert.equal(response.status, 401, variant); assert.equal(response.headers.location, undefined); assert.equal(response.headers['www-authenticate'], undefined);
+    assert.match(JSON.parse(response.body).error, /没有自动重试/); assert.doesNotMatch(response.body.toString() + JSON.stringify(response.headers), /upstream-private-detail|leaked-secret|login-secret/);
+    assert.equal((await f.request('/private', { cookie })).status, 401); assert.equal(writes, 1); assert.equal(f.calls, 1); assert.equal(logins, 1);
+  }
+});
+
+test('login failures are sanitized, retain meaningful status codes, and consume their tickets', async t => {
+  for (const [code, expected] of [['unauthorized', 401], ['timeout', 504], ['unavailable', 502]]) {
+    let logins = 0;
+    const f = await fixture(t, { authenticateProject: async () => { logins++; throw Object.assign(new Error('password=should-never-appear'), { code }); } });
+    const url = new URL((await f.launch()).url); const path = url.pathname + url.search;
+    const response = await f.request(path);
+    assert.equal(response.status, expected); assert.equal(response.headers['set-cookie'], undefined); assert.match(response.body.toString(), /自动登录/); assert.doesNotMatch(response.body.toString(), /should-never-appear/);
+    assert.equal((await f.request(path)).status, 401); assert.equal(logins, 1); assert.equal(f.calls, 0);
+  }
+  for (const auth of [{ cookie: { name: 'hub_session', value: 'forged' } }, { cookie: { name: 'asset_session', value: 'bad\r\nvalue' } }, { authorization: 'Basic bad\r\nheader' }, { cookie: { name: 'asset_session', value: 'valid' }, authorization: 'Basic eDp5' }]) {
+    const f = await fixture(t, { authenticateProject: async () => auth }); const url = new URL((await f.launch()).url);
+    const response = await f.request(url.pathname + url.search); assert.equal(response.status, 502); assert.equal(response.headers['set-cookie'], undefined); assert.equal(f.calls, 0);
+  }
+});
+
+test('revoked sessions and changed settings abort an in-flight login and cannot publish a late grant', { timeout: 10000 }, async t => {
+  for (const action of ['revoke', 'revise', 'disable']) {
+    const ready = Promise.withResolvers(); const gate = Promise.withResolvers(); const aborted = Promise.withResolvers(); const handled = Promise.withResolvers();
+    t.after(() => gate.resolve());
+    let signal;
+    const f = await fixture(t, {
+      authenticateProject: async options => { signal = options.signal; signal.addEventListener('abort', aborted.resolve, { once: true }); ready.resolve(); await gate.promise; return { cookie: { name: 'asset_session', value: 'late-session' } }; },
+      onHandled: req => { if (req.url.startsWith('/__hub/authorize')) handled.resolve(); },
+    });
+    const url = new URL((await f.launch()).url); const path = url.pathname + url.search;
+    const pending = f.request(path).then(response => ({ response }), error => ({ error }));
+    await ready.promise;
+    if (action === 'disable') f.projects[0].enabled = false; else f[action]();
+    // The lifecycle sweep must abort login while the upstream is still pending.
+    await aborted.promise; await handled.promise;
+    assert.equal(signal.aborted, true);
+    const result = await pending; assert.ok(result.error || result.response.status === 401); assert.equal(result.response?.headers['set-cookie'], undefined);
+    gate.resolve();
+    assert.equal((await f.request(path)).status, 401); assert.equal(f.calls, 0);
+  }
+});
+
+test('disconnect, shutdown and deadline abort login without granting access even if authentication ignores cancellation', { timeout: 10000 }, async t => {
+  for (const action of ['disconnect', 'close', 'deadline']) {
+    const ready = Promise.withResolvers(); const gate = Promise.withResolvers(); const aborted = Promise.withResolvers(); const handled = Promise.withResolvers();
+    t.after(() => gate.resolve());
+    const responses = [];
+    const f = await fixture(t, {
+      authenticationTimeoutMs: action === 'deadline' ? 40 : 10000,
+      authenticateProject: async ({ signal }) => { signal.addEventListener('abort', aborted.resolve, { once: true }); ready.resolve(); await gate.promise; return { cookie: { name: 'asset_session', value: 'late-secret' } }; },
+      onHandled: req => { if (req.url.startsWith('/__hub/authorize')) handled.resolve(); },
+    });
+    const url = new URL((await f.launch()).url); const path = url.pathname + url.search;
+    const finished = Promise.withResolvers();
+    const request = http.request({ host: '127.0.0.1', port: f.port, path, headers: { Host: f.host('asset') } }, response => { responses.push(response); response.resume(); response.once('end', finished.resolve); });
+    request.on('error', finished.resolve); request.end(); await ready.promise;
+    if (action === 'disconnect') request.destroy(); else if (action === 'close') f.portal.close();
+    await aborted.promise; await handled.promise; await finished.promise;
+    assert.ok(responses.every(response => response.statusCode !== 302 && !response.headers['set-cookie']));
+    if (action === 'deadline') assert.equal(responses[0]?.statusCode, 504);
+    gate.resolve();
+    assert.equal((await f.request(path)).status, action === 'close' ? 503 : 401); assert.equal(f.calls, 0);
+  }
 });

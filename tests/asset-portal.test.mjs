@@ -44,12 +44,13 @@ function routedRequest(port, host, route, { method = 'GET', cookie, body, header
   });
 }
 
-async function fixture(t, { autoSync = true, failure = false, partial = false } = {}) {
+async function fixture(t, { autoSync = true, failure = false, partial = false, savedPassword = assetPassword } = {}) {
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   const calls = [];
   const summaryReads = [];
   let version = 0;
+  let logins = 0;
   const ledger = () => ({
     dataKind: 'personal',
     assets: [{ id: 'test-holding', name: 'Fixture holding', mode: 'market', updatedAt: version ? refreshedTime : originalTime,
@@ -73,9 +74,9 @@ async function fixture(t, { autoSync = true, failure = false, partial = false } 
       calls.push(call);
       if (req.url === '/api/login' && req.method === 'POST') {
         if (JSON.parse(body).password !== assetPassword) { send(res, 401, { error: 'Login required' }); return; }
-        send(res, 200, { ok: true }, { 'Set-Cookie': 'asset_session=worker; HttpOnly; Path=/' }); return;
+        send(res, 200, { ok: true }, { 'Set-Cookie': `asset_session=login-${++logins}; HttpOnly; Path=/` }); return;
       }
-      const authorized = /(?:^|;\s*)asset_session=(?:worker|browser-one|browser-two)(?:;|$)/.test(call.cookie);
+      const authorized = /(?:^|;\s*)asset_session=(?:login-\d+|browser-one|browser-two)(?:;|$)/.test(call.cookie);
       if (!authorized) { send(res, 401, { error: 'Please log in to Asset' }); return; }
       if (req.url === '/api/ledger' && req.method === 'GET') { send(res, 200, ledger()); return; }
       if (req.url === '/api/sync' && req.method === 'POST') {
@@ -125,35 +126,41 @@ async function fixture(t, { autoSync = true, failure = false, partial = false } 
   hubCookie = login.headers['set-cookie'][0].split(';')[0];
   csrf = login.data.csrfToken;
   const configured = await hub('/api/projects/asset', { method: 'PUT', body: {
-    apiUrl: upstreamOrigin, url: upstreamOrigin, accessMode: 'proxy', enabled: true, autoSync, password: assetPassword,
+    apiUrl: upstreamOrigin, url: upstreamOrigin, accessMode: 'proxy', enabled: true, autoSync, ...(savedPassword ? { password: savedPassword } : { clearCredentials: true }),
   } });
   assert.equal(configured.status, 200);
-  assert.equal(configured.data.project.hasCredentials, true);
+  assert.equal(configured.data.project.hasCredentials, !!savedPassword);
   await until(() => summaryReads.includes('asset'));
 
-  async function browser(session = 'browser-one') {
+  async function launch() {
     const launch = await hub('/api/projects/asset/launch', { method: 'POST' });
     assert.equal(launch.status, 200);
     const url = new URL(launch.data.url);
     const authorized = await routedRequest(port, url.host, url.pathname + url.search, {
       headers: { Origin: hubOrigin, 'Sec-Fetch-Site': 'same-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'iframe' },
     });
+    return { url, authorized };
+  }
+  async function browser(session = '') {
+    const { url, authorized } = await launch();
     assert.equal(authorized.status, 302);
+    assert.ok(authorized.headers['set-cookie'].every(value => value.startsWith('hub_portal=')), 'upstream sessions stay on the server');
     const grant = authorized.headers['set-cookie'][0].split(';')[0];
     return {
+      ledger: () => routedRequest(port, url.host, '/api/ledger', { cookie: grant + (session ? '; asset_session=' + session : '') }),
       sync: () => routedRequest(port, url.host, '/api/sync', {
         method: 'POST', body: {}, cookie: grant + (session ? '; asset_session=' + session : ''),
         headers: { Origin: url.origin, 'Sec-Fetch-Site': 'same-origin' },
       }),
     };
   }
-  return { app, calls, summaryReads, browser, hub, upstreamOrigin, release,
+  return { app, calls, summaryReads, browser, launch, hub, upstreamOrigin, release,
     syncCalls: () => calls.filter(call => call.method === 'POST' && call.path === '/api/sync'),
     ledgerCalls: () => calls.filter(call => call.method === 'GET' && call.path === '/api/ledger'),
   };
 }
 
-test('saved credentials, background work, and two logged-in Asset pages share one sync POST', async t => {
+test('automatic Asset page sessions and the independent background session share one sync POST', async t => {
   const f = await fixture(t);
   const one = await f.browser('browser-one');
   const two = await f.browser('browser-two');
@@ -174,28 +181,28 @@ test('saved credentials, background work, and two logged-in Asset pages share on
     assert.ok(!response.text.includes(assetPassword));
   }
   assert.equal(f.syncCalls().length, 1);
-  assert.equal(f.syncCalls()[0].cookie, 'asset_session=worker');
+  assert.equal(f.syncCalls()[0].cookie, 'asset_session=login-3');
   assert.equal(f.syncCalls()[0].body, '{}');
   assert.equal(f.syncCalls()[0].origin, f.upstreamOrigin);
-  assert.equal(f.calls.filter(call => call.path === '/api/login').length, 1);
+  assert.equal(f.calls.filter(call => call.path === '/api/login').length, 3);
   assert.deepEqual(f.ledgerCalls().map(call => call.cookie).sort(), [
-    'asset_session=browser-one', 'asset_session=browser-one', 'asset_session=browser-two', 'asset_session=browser-two',
+    'asset_session=login-1', 'asset_session=login-1', 'asset_session=login-2', 'asset_session=login-2',
   ]);
   assert.ok(f.calls.every(call => !call.cookie.includes('hub_')));
   assert.equal(f.summaryReads.filter(id => id === 'asset').length, 2);
 });
 
-test('a portal grant without the original Asset login cannot start saved-credential sync', async t => {
-  const f = await fixture(t);
+test('without saved credentials, a portal grant alone cannot access a protected Asset service', async t => {
+  const f = await fixture(t, { savedPassword: '' });
   const page = await f.browser('');
-  const response = await page.sync();
+  const response = await page.ledger();
   assert.equal(response.status, 401);
   assert.equal(response.data.error, 'Please log in to Asset');
   assert.equal(f.syncCalls().length, 0);
   assert.equal(f.calls.filter(call => call.path === '/api/login').length, 0);
   assert.equal(f.ledgerCalls().length, 1);
   assert.equal(f.ledgerCalls()[0].cookie, '');
-  assert.equal(f.app.assetSync.getStatus('asset').state, 'idle');
+  assert.equal(f.app.assetSync.getStatus('asset').state, 'unconfigured');
 });
 
 test('a shared Asset sync failure remains a failure and does not return the saved ledger as success', async t => {
@@ -244,10 +251,24 @@ test('disabling Asset background sync transparently forwards the original browse
   const response = await responsePromise;
   assert.equal(response.status, 200);
   assert.equal(response.data.testVersion, 1);
-  assert.equal(f.syncCalls()[0].cookie, 'asset_session=browser-two');
+  assert.equal(f.syncCalls()[0].cookie, 'asset_session=login-1');
   assert.equal(f.syncCalls()[0].body, '{}');
-  assert.equal(f.calls.filter(call => call.path === '/api/login').length, 0);
+  assert.equal(f.calls.filter(call => call.path === '/api/login').length, 1);
   assert.equal(f.ledgerCalls().length, 0);
   assert.equal(f.app.assetSync.getStatus('asset').state, 'disabled');
   assert.equal(f.summaryReads.filter(id => id === 'asset').length, 1);
+});
+
+
+test('invalid saved Asset credentials do not grant access or expose a password challenge', async t => {
+  const f = await fixture(t, { savedPassword: 'wrong-fixture-password' });
+  const { authorized } = await f.launch();
+  assert.equal(authorized.status, 401);
+  assert.equal(authorized.headers['set-cookie'], undefined);
+  assert.equal(authorized.headers['www-authenticate'], undefined);
+  assert.ok(!authorized.text.includes('wrong-fixture-password'));
+  assert.ok(!authorized.text.includes(assetPassword));
+  assert.equal(f.calls.filter(call => call.path === '/api/login').length, 1);
+  assert.equal(f.ledgerCalls().length, 0);
+  assert.equal(f.syncCalls().length, 0);
 });

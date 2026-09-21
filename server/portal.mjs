@@ -28,15 +28,15 @@ function checkedPath(raw) {
   throw new PortalError(400, '项目路径编码层数过多');
 }
 
-function cleanCookies(value) {
-  return (value || '').split(';').map(part => part.trim()).filter(part => part.includes('=') && !reservedCookie(part.slice(0, part.indexOf('=')))).join('; ');
+function cleanCookies(value, auth) {
+  return (value || '').split(';').map(part => part.trim()).filter(part => part.includes('=') && !reservedCookie(part.slice(0, part.indexOf('='))) && part.slice(0, part.indexOf('=')).toLowerCase() !== auth?.cookie?.name.toLowerCase()).join('; ');
 }
 
-function setCookies(values, secure) {
+function setCookies(values, secure, auth) {
   return (values || []).flatMap(value => {
     const parts = value.split(';').map(part => part.trim());
     const name = parts[0].slice(0, parts[0].indexOf('='));
-    if (!name || reservedCookie(name)) return [];
+    if (!name || reservedCookie(name) || name.toLowerCase() === auth?.cookie?.name.toLowerCase()) return [];
     return [parts.filter((part, index) => index === 0 || (!/^domain\s*=/i.test(part) && (secure || !/^(secure|partitioned)$/i.test(part)))).map(part => !secure && /^samesite\s*=\s*none$/i.test(part) ? 'SameSite=Lax' : part).join('; ')];
   });
 }
@@ -56,11 +56,12 @@ function framePolicy(value, hubOrigin) {
  * getProjects(): Project[] (only projects permitted to use the portal).
  * getProjectRevision(id): opaque revision string covering configuration and credentials.
  * isSessionValid(id): whether the hashed hub session id remains valid.
+ * authenticateProject({projectId, revision, deadline, signal}): optional fresh server-side login per grant.
  * coordinateAssetSync({projectId, revision}): optional shared background Promise<{state, message}>.
  * Client cancellation never cancels that shared background promise.
  * createLaunch is called only by the authenticated, CSRF-protected hub API.
  */
-export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
+export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function')) throw new Error('项目代理需要项目、版本和会话校验回调');
   const tickets = new Map(); const grants = new Map(); const active = new Set(); const syncFlights = new Map();
   let closed = false;
@@ -83,7 +84,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
   function projectFor(id) { return getProjects().find(project => project.id === id && project.enabled && project.apiUrl); }
 
   function liveGrant(grant) {
-    if (closed || !grant || grant.expires <= now() || !isSessionValid(grant.sessionId)) return false;
+    if (closed || !grant || grant.revoked || grant.expires <= now() || !isSessionValid(grant.sessionId)) return false;
     const project = projectFor(grant.projectId);
     return !!project && getProjectRevision(project.id) === grant.revision;
   }
@@ -138,6 +139,70 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     return grant;
   }
 
+  function normalizedAuth(auth) {
+    if (auth == null) return null;
+    const invalid = () => { throw new PortalError(502, '项目自动登录失败，请返回工作台检查登录信息后重新打开'); };
+    if (!auth || typeof auth !== 'object' || (!!auth.cookie === !!auth.authorization)) return invalid();
+    if (auth.cookie) {
+      const { name, value, maxAge = 43200 } = auth.cookie;
+      if (typeof name !== 'string' || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,100}$/.test(name) || reservedCookie(name) || typeof value !== 'string' || !/^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]{1,4096}$/.test(value) || !Number.isFinite(maxAge) || maxAge <= 0) return invalid();
+      return { cookie: { name, value, maxAge: Math.min(43200, Math.floor(maxAge)) } };
+    }
+    if (typeof auth.authorization !== 'string' || auth.authorization.length > 8192 || !/^Basic [A-Za-z0-9+/]+={0,2}$/.test(auth.authorization)) return invalid();
+    return { authorization: auth.authorization };
+  }
+
+  async function authenticateGrant(req, res, ticket) {
+    if (!authenticateProject) return null;
+    const controller = new AbortController();
+    const abort = reason => { if (!controller.signal.aborted) controller.abort(reason); };
+    const disconnected = () => abort(new PortalError(401, '项目入口已关闭，请从工作台重新打开'));
+    const stream = { grant: ticket, destroy: () => { abort(new PortalError(401, '项目入口已失效，请从工作台重新打开')); res.destroy(); } };
+    const aborted = new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }));
+    active.add(stream); res.once('close', disconnected); req.once('aborted', disconnected);
+    const limit = Math.max(1, Math.min(10000, authenticationTimeoutMs));
+    const timer = setTimeout(() => abort(new PortalError(504, '项目自动登录超时，请返回工作台检查登录信息后重新打开')), limit);
+    const check = () => { if (!liveGrant(ticket) || req.aborted || req.socket.destroyed || res.destroyed || controller.signal.aborted) throw new PortalError(401, '项目入口已失效，请从工作台重新打开'); };
+    try {
+      check();
+      const auth = await Promise.race([Promise.resolve().then(() => { check(); return authenticateProject({ projectId: ticket.projectId, revision: ticket.revision, deadline: Date.now() + limit, signal: controller.signal }); }), aborted]);
+      check(); return normalizedAuth(auth);
+    } catch (error) {
+      abort(error instanceof PortalError ? error : new PortalError(502, '项目自动登录失败'));
+      if (error instanceof PortalError) throw error;
+      const status = error?.code === 'unauthorized' ? 401 : error?.code === 'timeout' ? 504 : 502;
+      throw new PortalError(status, status === 504 ? '项目自动登录超时，请返回工作台检查登录信息后重新打开' : '项目自动登录失败，请返回工作台检查登录信息后重新打开');
+    } finally { clearTimeout(timer); res.removeListener('close', disconnected); req.removeListener('aborted', disconnected); active.delete(stream); }
+  }
+
+  function revokeGrant(grant) {
+    grant.revoked = true;
+    for (const [key, value] of grants) if (value === grant) grants.delete(key);
+    delete grant.auth;
+  }
+
+  function clearPortalCookie(context) {
+    return `${PORTAL_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${context.secure ? '; Secure' : ''}`;
+  }
+
+  function automaticAuthFailed(incoming, grant, project, target, requestPath) {
+    if (!grant.auth) return false;
+    if (incoming.statusCode === 401) return true;
+    if (project.adapter !== 'asset' || incoming.statusCode < 300 || incoming.statusCode >= 400 || !incoming.headers.location) return false;
+    try {
+      const redirect = new URL(incoming.headers.location, new URL(target.base.pathname.replace(/\/$/, '') + requestPath, target.base.origin));
+      const prefix = target.base.pathname.replace(/\/$/, '');
+      return [target.base.origin, target.authOrigin].includes(redirect.origin) && [prefix + '/login', prefix + '/login/'].includes(redirect.pathname);
+    } catch { return false; }
+  }
+
+  function sendAutomaticAuthFailure(res, context, grant) {
+    revokeGrant(grant);
+    if (res.destroyed || res.headersSent) return;
+    res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'Set-Cookie': clearPortalCookie(context), 'Content-Security-Policy': `default-src 'none'; frame-ancestors ${context.hubOrigin}` });
+    const message = '项目登录已失效，请返回工作台检查登录信息后重新打开；刚才的操作没有自动重试';
+    res.end(JSON.stringify({ error: message, detail: message }));
+  }
   async function targetFor(project) {
     const base = new URL(validateUrl(project.apiUrl, { api: true }));
     const hostname = base.hostname.replace(/^\[|\]$/g, '');
@@ -149,11 +214,13 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     } finally { clearTimeout(timer); }
   }
 
-  function requestHeaders(req, context, target, websocket) {
+  function requestHeaders(req, context, target, websocket, grant) {
     const headers = cleanHeaders(req.headers);
     for (const name of Object.keys(headers)) if (/^(?:forwarded|x-forwarded-.*|x-real-ip|proxy-.*)$/i.test(name)) delete headers[name];
     headers.host = target.base.host;
-    const cookies = cleanCookies(req.headers.cookie);
+    let cookies = cleanCookies(req.headers.cookie, grant?.auth);
+    if (grant?.auth) { delete headers.authorization; if (grant.auth.authorization) headers.authorization = grant.auth.authorization; }
+    if (grant?.auth?.cookie) cookies = [cookies, grant.auth.cookie.name + '=' + grant.auth.cookie.value].filter(Boolean).join('; ');
     if (cookies) headers.cookie = cookies; else delete headers.cookie;
     headers.origin = target.authOrigin;
     if (headers.referer) { try { const reference = new URL(headers.referer); if (reference.origin === context.origin) headers.referer = target.authOrigin + reference.pathname + reference.search; else delete headers.referer; } catch { delete headers.referer; } }
@@ -161,11 +228,12 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     return headers;
   }
 
-  function responseHeaders(source, context, target, requestPath = '/') {
+  function responseHeaders(source, context, target, requestPath = '/', grant) {
     const headers = cleanHeaders(source);
     for (const name of Object.keys(headers)) if (/^access-control-/i.test(name) || /^(?:x-frame-options|clear-site-data|refresh|alt-svc|service-worker-allowed)$/i.test(name)) delete headers[name];
-    headers['set-cookie'] = setCookies(source['set-cookie'], context.secure);
+    headers['set-cookie'] = setCookies(source['set-cookie'], context.secure, grant?.auth);
     if (!headers['set-cookie'].length) delete headers['set-cookie'];
+    if (grant?.auth) delete headers['www-authenticate'];
     headers['content-security-policy'] = framePolicy(source['content-security-policy'], context.hubOrigin);
     if (source['content-security-policy-report-only']) headers['content-security-policy-report-only'] = framePolicy(source['content-security-policy-report-only'], context.hubOrigin);
     headers['referrer-policy'] = 'no-referrer';
@@ -220,7 +288,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
 
     function ledger(discardSuccess) {
       check();
-      const headers = requestHeaders(req, context, target, false);
+      const headers = requestHeaders(req, context, target, false, grant);
       for (const key of ['content-length', 'content-type', 'content-encoding', 'expect', 'if-modified-since', 'if-none-match', 'range']) delete headers[key];
       const route = '/api/ledger';
       return new Promise((resolve, reject) => {
@@ -233,9 +301,10 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         upstream.once('response', incoming => {
           try {
             check();
+            if (automaticAuthFailed(incoming, grant, project, target, route)) { incoming.destroy(); sendAutomaticAuthFailure(res, context, grant); resolve(false); return; }
             const discard = discardSuccess && incoming.statusCode === 200;
             if (discard) incoming.resume();
-            else { res.writeHead(incoming.statusCode, responseHeaders(incoming.headers, context, target, route)); incoming.pipe(res); }
+            else { res.writeHead(incoming.statusCode, responseHeaders(incoming.headers, context, target, route, grant)); incoming.pipe(res); }
             incoming.once('error', reject);
             incoming.once('end', () => resolve(discard));
           } catch (error) { incoming.destroy(); reject(error); }
@@ -246,7 +315,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
 
     try {
       await wait(consumeBody(req)); check();
-      // The browser's original application login is required independently of hub credentials.
+      // Verify the grant's application session before joining the shared worker.
       if (!await wait(ledger(true))) return;
       check();
       const key = project.id + ':' + grant.revision;
@@ -282,14 +351,22 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     if (coordinateAssetSync && project.adapter === 'asset' && project.autoSync !== false && project.hasCredentials && req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/sync') { await coordinatedSync(req, res, context, project, grant, target); return; }
     const prefix = target.base.pathname.replace(/\/$/, '');
     const path = prefix + checkedPath(req.url);
-    const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: req.method, path, headers: requestHeaders(req, context, target, false), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
+    const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: req.method, path, headers: requestHeaders(req, context, target, false, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
     const timer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务响应超时')), responseHeaderTimeoutMs);
     const connectionTimer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务连接超时')), connectTimeoutMs);
     upstream.once('socket', socket => { if (!socket.connecting) clearTimeout(connectionTimer); else socket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });
     const stream = { grant, destroy: () => { upstream.destroy(); res.destroy(); } }; active.add(stream);
     upstream.once('response', incoming => {
       clearTimeout(timer);
-      try { if (!liveGrant(grant)) throw new PortalError(401, '项目访问授权已失效'); res.writeHead(incoming.statusCode, responseHeaders(incoming.headers, context, target, req.url)); incoming.pipe(res); }
+      try {
+        if (!liveGrant(grant)) throw new PortalError(401, '项目访问授权已失效');
+        if (automaticAuthFailed(incoming, grant, project, target, req.url)) { incoming.destroy(); sendAutomaticAuthFailure(res, context, grant); return; }
+        const headers = responseHeaders(incoming.headers, context, target, req.url, grant);
+        if (req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/logout' && incoming.statusCode >= 200 && incoming.statusCode < 300) {
+          revokeGrant(grant); headers['set-cookie'] = [...(headers['set-cookie'] || []), clearPortalCookie(context)];
+        }
+        res.writeHead(incoming.statusCode, headers); incoming.pipe(res);
+      }
       catch (error) { incoming.destroy(); sendError(res, error); }
       incoming.on('error', error => sendError(res, error));
     });
@@ -318,9 +395,12 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         const ticket = raw && /^[A-Za-z0-9_-]{43}$/.test(raw) ? tickets.get(digest(raw)) : null;
         if (!ticket || ticket.projectId !== project.id || !liveGrant(ticket)) throw new PortalError(401, '项目入口已过期，请从工作台重新打开');
         tickets.delete(digest(raw));
-        const grantToken = token(); const grant = { ...ticket, expires: Math.min(now() + grantTtlMs, now() + 12 * 3600000) };
+        const auth = await authenticateGrant(req, res, ticket);
+        if (!liveGrant(ticket) || req.aborted || req.socket.destroyed || res.destroyed) throw new PortalError(401, '项目入口已失效，请从工作台重新打开');
+        if (grants.size >= 300) throw new PortalError(429, '项目访问会话过多，请稍后重试');
+        const grantToken = token(); const grant = { ...ticket, ...(auth ? { auth } : {}), expires: Math.min(now() + grantTtlMs, now() + 12 * 3600000, auth?.cookie ? now() + auth.cookie.maxAge * 1000 : Infinity) };
         grants.set(digest(grantToken), grant);
-        res.writeHead(302, { Location: ticket.destination, 'Set-Cookie': `${PORTAL_COOKIE}=${grantToken}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(grantTtlMs / 1000)}${context.secure ? '; Secure' : ''}`, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': `default-src 'none'; frame-ancestors ${context.hubOrigin}` }); res.end(); return true;
+        res.writeHead(302, { Location: ticket.destination, 'Set-Cookie': `${PORTAL_COOKIE}=${grantToken}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.max(1, Math.floor((grant.expires - now()) / 1000))}${context.secure ? '; Secure' : ''}`, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': `default-src 'none'; frame-ancestors ${context.hubOrigin}` }); res.end(); return true;
       }
       if (url.pathname.startsWith('/__hub/')) throw new PortalError(404, '项目代理接口不存在');
       browserBoundary(req, context);
@@ -342,7 +422,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
       const grant = authorized(req, context, project);
       const target = await targetFor(project);
       if (!liveGrant(grant) || req.aborted || socket.destroyed) throw new PortalError(401, '项目访问授权已失效');
-      const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: 'GET', path: target.base.pathname.replace(/\/$/, '') + req.url, headers: requestHeaders(req, context, target, true), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
+      const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: 'GET', path: target.base.pathname.replace(/\/$/, '') + req.url, headers: requestHeaders(req, context, target, true, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
       const timer = setTimeout(() => upstream.destroy(), responseHeaderTimeoutMs);
       const connectionTimer = setTimeout(() => upstream.destroy(), connectTimeoutMs);
       upstream.once('socket', peerSocket => { if (!peerSocket.connecting) clearTimeout(connectionTimer); else peerSocket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });
@@ -353,7 +433,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         clearTimeout(timer); peer = targetSocket;
         if (!liveGrant(grant)) { stream.destroy(); return; }
         try {
-          const headers = responseHeaders(response.headers, context, target, req.url); headers.connection = 'Upgrade'; headers.upgrade = 'websocket';
+          const headers = responseHeaders(response.headers, context, target, req.url, grant); headers.connection = 'Upgrade'; headers.upgrade = 'websocket';
           const lines = Object.entries(headers).flatMap(([name, value]) => (Array.isArray(value) ? value : [value]).map(item => `${name}: ${item}`));
           socket.write(`HTTP/1.1 101 Switching Protocols\r\n${lines.join('\r\n')}\r\n\r\n`);
           if (targetHead.length) socket.write(targetHead); if (head.length) targetSocket.write(head);

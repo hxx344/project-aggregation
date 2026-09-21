@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateUrl, validateAuthOrigin, readSummary, UpstreamError } from './adapters.mjs';
 import { createPortal } from './portal.mjs';
+import { loginForPortal } from './portal-auth.mjs';
 import { createAssetSync, syncAsset } from './asset-sync.mjs';
 
 const scrypt = promisify(scryptCallback);
@@ -75,6 +76,13 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
     getProjectRevision: projectRevision,
     isSessionValid: id => !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+    authenticateProject: async ({ projectId, revision, deadline, signal }) => {
+      if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
+      const row = rowFor(projectId);
+      const auth = await loginForPortal(publicProject(row), decrypt(row.credentials), { deadline, signal });
+      if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
+      return auth;
+    },
     coordinateAssetSync: async ({ projectId, revision }) => {
       if (closed || projectRevision(projectId) !== revision) return null;
       const status = await assetSync.run(projectId);
