@@ -1,0 +1,37 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check installer syntax
+        run: |
+          bash -n install.sh
+          bash -n deploy/test-install.sh
+          bash -n deploy/test-environment.sh
+      - name: Check configuration, atomic activation, cleanup boundaries, and rollback
+        run: bash deploy/test-install.sh
+      - name: Verify failed configuration changes restore the previous port
+        run: bash deploy/test-environment.sh
