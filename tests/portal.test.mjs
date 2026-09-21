@@ -33,7 +33,10 @@ async function fixture(t, options = {}) {
   const projects = [{ id: 'asset', enabled: true, ...(options.assetLedger ? { adapter: 'asset', autoSync: true, hasCredentials: true } : {}), apiUrl: `http://127.0.0.1:${upstream.address().port}`, url: 'http://127.0.0.1:5678/?view=ledger', authOrigin: '' }, { id: 'monitor', enabled: true, apiUrl: `http://127.0.0.1:${upstream.address().port}`, url: 'http://127.0.0.1:3000/?monitor=oil', authOrigin: '' }];
   let portal;
   const server = http.createServer(async (req, res) => {
-    if (await portal.handle(req, res)) return;
+    options.onRequest?.(req, res);
+    const handled = await portal.handle(req, res);
+    options.onHandled?.(req, res);
+    if (handled) return;
     if (req.url.startsWith('/launch')) {
       try { const result = portal.createLaunch({ projectId: new URL(req.url, 'http://local').searchParams.get('id') || 'asset', sessionId: 'hashed-session-id', req }); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(result)); }
       catch (error) { res.writeHead(error.status || 500); res.end(error.message); }
@@ -167,9 +170,27 @@ test('asset page sync verifies its browser login and merges concurrent worker ru
   const f = await fixture(t, { assetLedger: true, ledgerVersion: () => version, coordinateAssetSync: async ({ projectId, revision }) => { calls++; assert.equal(projectId, 'asset'); assert.equal(revision, 'revision-one'); await gate; version++; return { state: 'success', message: '同步成功' }; } });
   const { cookie } = await f.authorize();
   const params = { method: 'POST', cookie: `${cookie}; asset_session=valid`, headers: { Origin: `http://${f.host('asset')}`, 'Content-Type': 'application/json' }, body: '{}' };
+  let completedPreflights = 0;
+  const preflightsConsumed = Promise.withResolvers();
+  const originalRequest = http.request;
+  t.mock.method(http, 'request', function (...args) {
+    const request = Reflect.apply(originalRequest, this, args);
+    if (args[0] instanceof URL && args[0].port === String(f.upstream.address().port) && args[1]?.method === 'GET' && args[1]?.path === '/api/ledger') {
+      request.prependOnceListener('response', incoming => {
+        incoming.once('end', () => {
+          // Wait until the portal's end handler and its promise continuations have joined the flight.
+          setImmediate(() => { if (++completedPreflights === 2) preflightsConsumed.resolve(); });
+        });
+      });
+    }
+    return request;
+  });
   const first = f.request('/api/sync', params); const second = f.request('/api/sync?from=page', params);
-  while (f.ledgerReads < 2 || calls < 1) await new Promise(resolve => setTimeout(resolve, 2));
-  assert.equal(calls, 1); release();
+  let barrierTimeout;
+  try {
+    await Promise.race([preflightsConsumed.promise, new Promise((_, reject) => { barrierTimeout = setTimeout(() => reject(new Error('Both portal preflights were not consumed')), 5000); })]);
+    assert.equal(calls, 1);
+  } finally { clearTimeout(barrierTimeout); release(); }
   const results = await Promise.all([first, second]);
   for (const result of results) { assert.equal(result.status, 200); assert.deepEqual(JSON.parse(result.body), { assets: [{ id: 'real-browser-ledger', value: 123 }], history: [], version: 1 }); }
   assert.equal(calls, 1); assert.equal(f.ledgerReads, 4); assert.equal(f.calls, 4);
@@ -214,31 +235,54 @@ test('asset coordination rechecks session and revision after waiting and does no
   }
 });
 
-test('disconnecting an asset page does not cancel its shared worker or trigger the final browser read', async t => {
+test('disconnecting an asset page does not cancel its shared worker or trigger the final browser read', { timeout: 5000 }, async t => {
   let release; let started; let completed = false;
   const gate = new Promise(resolve => { release = resolve; }); const ready = new Promise(resolve => { started = resolve; });
-  const f = await fixture(t, { assetLedger: true, coordinateAssetSync: async () => { started(); await gate; completed = true; return { state: 'success' }; } });
+  const disconnected = Promise.withResolvers(); const handled = Promise.withResolvers(); const finished = Promise.withResolvers();
+  t.after(() => release());
+  const f = await fixture(t, {
+    assetLedger: true,
+    onRequest: (req, res) => { if (req.url === '/api/sync') res.once('close', disconnected.resolve); },
+    onHandled: req => { if (req.url === '/api/sync') handled.resolve(); },
+    coordinateAssetSync: async () => { started(); await gate; completed = true; finished.resolve(); return { state: 'success' }; },
+  });
   const { cookie } = await f.authorize();
   const req = http.request({ host: '127.0.0.1', port: f.port, path: '/api/sync', method: 'POST', headers: { Host: f.host('asset'), Cookie: `${cookie}; asset_session=valid`, Origin: `http://${f.host('asset')}` } });
   req.on('error', () => {}); req.end('{}'); await ready;
-  const closed = new Promise(resolve => req.once('close', resolve)); req.destroy(); await closed;
-  release(); await new Promise(resolve => setTimeout(resolve, 30));
+  // Local ClientRequest.close does not mean that the server has observed the disconnect.
+  req.destroy(); await disconnected.promise; await handled.promise;
+  assert.equal(completed, false);
+  release(); await finished.promise;
   assert.equal(completed, true); assert.equal(f.ledgerReads, 1);
 });
 
-test('closing the portal or disconnecting while DNS waits cannot create a late upstream request', async t => {
+test('closing the portal or disconnecting while DNS waits cannot create a late upstream request', { timeout: 5000 }, async t => {
+  const outboundPorts = [];
+  const originalRequest = http.request;
+  t.mock.method(http, 'request', function (...args) {
+    if (args[0] instanceof URL) outboundPorts.push(args[0].port);
+    return Reflect.apply(originalRequest, this, args);
+  });
   for (const action of ['close', 'disconnect']) {
     let release; let started;
     const gate = new Promise(resolve => { release = resolve; }); const ready = new Promise(resolve => { started = resolve; });
-    const f = await fixture(t, { dnsLookup: async () => { started(); await gate; return [{ address: '127.0.0.1', family: 4 }]; } });
+    const disconnected = Promise.withResolvers(); const handled = Promise.withResolvers();
+    t.after(() => release());
+    const f = await fixture(t, {
+      onRequest: (req, res) => { if (req.url === '/private') res.once('close', disconnected.resolve); },
+      onHandled: req => { if (req.url === '/private') handled.resolve(); },
+      dnsLookup: async () => { started(); await gate; return [{ address: '127.0.0.1', family: 4 }]; },
+    });
     const { cookie } = await f.authorize();
     if (action === 'close') {
       const pending = f.request('/private', { cookie }); await ready; f.portal.close(); release(); assert.equal((await pending).status, 401);
     } else {
       const req = http.request({ host: '127.0.0.1', port: f.port, path: '/private', headers: { Host: f.host('asset'), Cookie: cookie } });
       req.on('error', () => {}); req.end(); await ready;
-      const closed = new Promise(resolve => req.once('close', resolve)); req.destroy(); await closed; release(); await new Promise(resolve => setTimeout(resolve, 30));
+      req.destroy(); await disconnected.promise; release(); await handled.promise;
     }
+    // handle() can return before a newly created request reaches the upstream server.
+    assert.equal(outboundPorts.filter(port => port === String(f.upstream.address().port)).length, 0);
     assert.equal(f.calls, 0);
   }
 });
