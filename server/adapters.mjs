@@ -6,7 +6,7 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
 export class UpstreamError extends Error {
-  constructor(code, message) { super(message); this.code = code; }
+  constructor(code, message, statusCode) { super(message); this.code = code; if (statusCode !== undefined) this.statusCode = statusCode; }
 }
 
 export function blockedAddress(address) {
@@ -67,7 +67,7 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
         headers: { Accept: 'application/json', ...headers, ...(serialized ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(serialized) } : {}) },
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(new UpstreamError('invalid', '服务返回重定向，请配置最终服务地址')); return; }
-        if ([401, 403, 429].includes(res.statusCode)) { res.destroy(); reject(new UpstreamError('unauthorized', res.statusCode === 429 ? '上游登录限流，请稍后重试' : '需要有效的网页登录凭据，请检查项目设置')); return; }
+        if ([401, 403, 429].includes(res.statusCode)) { res.destroy(); reject(new UpstreamError('unauthorized', res.statusCode === 429 ? '上游登录限流，请稍后重试' : '需要有效的网页登录凭据，请检查项目设置', res.statusCode)); return; }
         if (res.statusCode < 200 || res.statusCode >= 300) { res.destroy(); reject(new UpstreamError('offline', `上游服务响应异常（${res.statusCode}）`)); return; }
         const chunks = []; let bytes = 0;
         res.on('data', chunk => { bytes += chunk.length; if (bytes > limit) { res.destroy(); reject(new UpstreamError('invalid', '上游响应超过大小限制')); } else chunks.push(chunk); });
@@ -103,32 +103,90 @@ export function standardSummary(raw) {
   return { metrics: data.metrics, updatedAt: strictDate(data.updatedAt), ...(data.trend ? { trend: data.trend.map(point => ({ at: strictDate(point.at), value: point.value })).sort((a, b) => a.at.localeCompare(b.at)) } : {}), message: '服务数据已更新' };
 }
 
+// Login requests are shared while each caller retains its own deadline and cancellation.
+const loginFlights = new Map();
+function waitWithin(promise, deadline, signal) {
+  if (signal?.aborted || deadline <= Date.now()) return Promise.reject(new UpstreamError('timeout', '服务响应超时'));
+  return new Promise((resolve, reject) => {
+    const finish = (callback, value) => { clearTimeout(timer); signal?.removeEventListener('abort', abort); callback(value); };
+    const abort = () => finish(reject, new UpstreamError('timeout', '服务响应超时'));
+    const timer = setTimeout(abort, Math.max(1, deadline - Date.now()));
+    signal?.addEventListener('abort', abort, { once: true });
+    promise.then(value => finish(resolve, value), error => finish(reject, error));
+  });
+}
+async function authenticatedSession(project, credentials, { request, deadline, signal }) {
+  const authOrigin = project.authOrigin || new URL(project.apiUrl).origin;
+  if (!credentials?.password) return { headers: { Origin: authOrigin } };
+  const key = createHash('sha256').update(JSON.stringify([project.apiUrl, project.adapter, authOrigin, credentials.password])).digest('hex');
+  const now = Date.now();
+  for (const [storedKey, value] of loginSessions) if (value.expires <= now) loginSessions.delete(storedKey);
+  let session = loginSessions.get(key);
+  if (!session) {
+    let flight = loginFlights.get(key);
+    if (!flight) {
+      flight = { controller: new AbortController(), waiters: 0, settled: false, promise: null };
+      loginFlights.set(key, flight);
+      flight.promise = Promise.resolve().then(async () => {
+        const loginDeadline = Date.now() + 60000;
+        const response = await waitWithin(Promise.resolve().then(() => request(project.apiUrl, '/api/login', {
+          deadline: loginDeadline, signal: flight.controller.signal, method: 'POST', headers: { Origin: authOrigin }, body: { password: credentials.password },
+        })), loginDeadline, flight.controller.signal);
+        const name = project.adapter === 'aster' ? 'aster_session' : 'asset_session';
+        const cookie = response.cookies?.find(value => value.startsWith(name + '='));
+        if (!cookie) throw new UpstreamError('unauthorized', '上游没有返回有效的登录会话');
+        const value = { cookie: cookie.split(';')[0], expires: Date.now() + 11 * 3600000 };
+        if (!flight.controller.signal.aborted && loginFlights.get(key) === flight) {
+          if (loginSessions.size >= 100) loginSessions.delete(loginSessions.keys().next().value);
+          loginSessions.set(key, value);
+        }
+        return value;
+      }).finally(() => {
+        flight.settled = true;
+        if (loginFlights.get(key) === flight) loginFlights.delete(key);
+      });
+      flight.promise.catch(() => {});
+    }
+    flight.waiters++;
+    try { session = await waitWithin(flight.promise, deadline, signal); }
+    finally {
+      flight.waiters--;
+      if (flight.waiters === 0 && !flight.settled) {
+        if (loginFlights.get(key) === flight) loginFlights.delete(key);
+        flight.controller.abort();
+      }
+    }
+  }
+  if (signal?.aborted || deadline <= Date.now()) throw new UpstreamError('timeout', '服务响应超时');
+  return { key, cookie: session.cookie, headers: { Origin: authOrigin, Cookie: session.cookie } };
+}
+
+// This helper only authenticates; callers supply the fixed, explicitly allowed business route.
+export async function requestAuthenticatedJson(project, credentials, path, {
+  request = requestJson, deadline = Date.now() + 5000, signal, method = 'GET', body, retryUnauthorized = false,
+} = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const session = await authenticatedSession(project, credentials, { request, deadline, signal });
+    try {
+      return await request(project.apiUrl, path, { deadline, signal, method, body, headers: session.headers });
+    } catch (error) {
+      if (error.code === 'unauthorized' && session.key && loginSessions.get(session.key)?.cookie === session.cookie) loginSessions.delete(session.key);
+      if (!(retryUnauthorized && attempt === 0 && error.code === 'unauthorized' && error.statusCode === 401 && credentials?.password)) throw error;
+    }
+  }
+}
+
 export async function readSummary(project, credentials, { request = requestJson, deadline = Date.now() + 5000, signal } = {}) {
   const options = { deadline, signal };
   const authOrigin = project.authOrigin || new URL(project.apiUrl).origin;
-  let memoKey;
-  const get = async (path, headers = {}) => { try { return (await request(project.apiUrl, path, { ...options, headers: { Origin: authOrigin, ...headers } })).data; } catch (error) { if (error.code === 'unauthorized' && memoKey) loginSessions.delete(memoKey); throw error; } };
+  const get = async (path, headers = {}) => {
+    if (project.adapter === 'asset' || project.adapter === 'aster') return (await requestAuthenticatedJson(project, credentials, path, { ...options, request })).data;
+    return (await request(project.apiUrl, path, { ...options, headers: { Origin: authOrigin, ...headers } })).data;
+  };
   if (project.adapter === 'standard') return standardSummary(await get('/api/hub/summary', credentials?.password ? { Authorization: `Basic ${Buffer.from(`${credentials.username || ''}:${credentials.password}`).toString('base64')}` } : {}));
   if (project.adapter === 'monitor') return readMonitor(project, credentials, get);
-  let headers = {};
-  if (credentials?.password) {
-    memoKey = createHash('sha256').update(JSON.stringify([project.apiUrl, project.adapter, authOrigin, credentials.password])).digest('hex');
-    const now = Date.now();
-    for (const [key, value] of loginSessions) if (value.expires <= now) loginSessions.delete(key);
-    let session = loginSessions.get(memoKey);
-    if (!session) {
-      const response = await request(project.apiUrl, '/api/login', { ...options, method: 'POST', headers: { Origin: authOrigin }, body: { password: credentials.password } });
-      const name = project.adapter === 'aster' ? 'aster_session' : 'asset_session';
-      const cookie = response.cookies.find(value => value.startsWith(`${name}=`));
-      if (!cookie) throw new UpstreamError('unauthorized', '上游没有返回有效的登录会话');
-      session = { cookie: cookie.split(';')[0], expires: now + 11 * 3600000 };
-      if (loginSessions.size >= 100) loginSessions.delete(loginSessions.keys().next().value);
-      loginSessions.set(memoKey, session);
-    }
-    headers = { Cookie: session.cookie };
-  }
   if (project.adapter === 'aster') {
-    const data = await get('/api/state?compact=true', headers);
+    const data = await get('/api/state?compact=true');
     if (!data || !Array.isArray(data.accounts) || data.accounts.length > 200) throw new UpstreamError('invalid', '交易项目响应格式不正确');
     const accounts = data.accounts.filter(account => account.enabled);
     const live = accounts.filter(account => account.mode === 'live');
@@ -138,7 +196,7 @@ export async function readSummary(project, credentials, { request = requestJson,
     const metrics = [metric('accounts', '启用账户', accounts.length, '个'), metric('live_accounts', '实盘账户', live.length, '个'), metric('occupied_margin', '实盘占用保证金', sum(live.map(account => finite(account.snapshot?.occupied_margin))), 'USD1'), metric('daily_volume', '实盘今日成交量', sum(volumes), 'USD1', '上游 UTC 日口径；不计入资产汇总')];
     return { metrics, updatedAt, partial: !!data.error || !data.ready || live.some(account => !account.snapshot) || volumes.some(value => value === null), message: data.demo ? '上游为演示模式；交易数据不计入资产汇总' : '交易服务已连接；保证金与成交量使用 USD1 口径' };
   }
-  const data = await get('/api/ledger', headers);
+  const data = await get('/api/ledger');
   if (!data || !Array.isArray(data.assets) || data.assets.length > 1000 || !Array.isArray(data.history)) throw new UpstreamError('invalid', '资产项目响应格式不正确');
   const total = sum(data.assets.map(asset => finite(asset.value)));
   const withdrawals = data.assets.filter(asset => asset.project?.trim() === '出金').reduce((acc, asset) => acc + (finite(asset.value) || 0), 0);

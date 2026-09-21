@@ -12,7 +12,7 @@ const summary = () => ({ updatedAt: new Date().toISOString(), metrics: [{ key: '
 
 async function fixture(t, options = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'project-hub-test-'));
-  let app = await createApp({ dataDir, initialPassword: password, refreshInterval: 0, summaryReader: async () => summary(), ...options });
+  let app = await createApp({ dataDir, initialPassword: password, refreshInterval: 0, assetSyncIntervalMs: 0, summaryReader: async () => summary(), ...options });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
   let origin = `http://127.0.0.1:${app.server.address().port}`;
   let cookie = ''; let csrf = '';
@@ -26,7 +26,7 @@ async function fixture(t, options = {}) {
     return result;
   }
   t.after(async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); });
-  return { get app() { return app; }, get origin() { return origin; }, dataDir, request, login, async reopen() { await app.close(); app = await createApp({ dataDir, initialPassword: 'different-password-ignored', refreshInterval: 0, summaryReader: options.summaryReader || (async () => summary()) }); await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${app.server.address().port}`; } };
+  return { get app() { return app; }, get origin() { return origin; }, dataDir, request, login, async reopen() { await app.close(); app = await createApp({ dataDir, initialPassword: 'different-password-ignored', refreshInterval: 0, assetSyncIntervalMs: 0, summaryReader: options.summaryReader || (async () => summary()) }); await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${app.server.address().port}`; } };
 }
 
 test('authentication gates private data, enforces Origin/CSRF, and logout revokes session', async t => {
@@ -51,12 +51,61 @@ test('Aster reads the server port independently of its browser tunnel and preser
   await f.login();
   await f.app.check('aster');
   assert.equal(requested.apiUrl, 'http://127.0.0.1:8765');
-  assert.equal(requested.url, 'http://127.0.0.1:18765');
+  assert.equal(requested.url, 'http://127.0.0.1:8765');
   const custom = { apiUrl: 'http://127.0.0.1:9876', url: 'http://127.0.0.1:19876' };
   assert.equal((await f.request('/api/projects/aster', { method: 'PUT', body: custom })).status, 200);
   await f.reopen(); await f.login();
   const project = (await f.request('/api/projects')).data.projects.find(item => item.id === 'aster');
   assert.equal(project.apiUrl, custom.apiUrl); assert.equal(project.url, custom.url);
+});
+
+test('single-port launch requires hub login and CSRF, and logout revokes an open project', async t => {
+  const upstream = http.createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ path: req.url, cookie: req.headers.cookie || '' })); });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => upstream.close(resolve)));
+  const f = await fixture(t);
+  assert.equal((await f.request('/api/projects/aster/launch', { method: 'POST' })).status, 401);
+  await f.login();
+  const target = `http://127.0.0.1:${upstream.address().port}`;
+  await f.request('/api/projects/aster', { method: 'PUT', body: { apiUrl: target, url: 'http://127.0.0.1:18765/?view=accounts' } });
+  assert.equal((await f.request('/api/projects/aster/launch', { method: 'POST', csrfHeader: '' })).status, 403);
+  const launched = await f.request('/api/projects/aster/launch', { method: 'POST' });
+  assert.equal(launched.status, 200);
+  const url = new URL(launched.data.url);
+  assert.match(url.hostname, /^p-[a-f0-9]+\.hub\.localhost$/);
+  assert.equal(url.port, new URL(f.origin).port);
+  const routed = (pathname, cookie = '') => new Promise((resolve, reject) => {
+    const request = http.request(f.origin + pathname, { agent: false, headers: { Host: url.host, ...(cookie ? { Cookie: cookie } : {}) } }, response => {
+      const chunks = []; response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, headers: { get: name => { const value = response.headers[name]; return Array.isArray(value) ? value[0] : value; } }, json: async () => JSON.parse(Buffer.concat(chunks).toString()) }));
+    }); request.on('error', reject); request.end();
+  });
+  const authorization = await routed(url.pathname + url.search);
+  assert.equal(authorization.status, 302);
+  assert.equal(authorization.headers.get('location'), '/?view=accounts');
+  const grant = authorization.headers.get('set-cookie').split(';')[0];
+  const content = await routed('/?view=accounts', grant);
+  assert.equal(content.status, 200);
+  assert.deepEqual(await content.json(), { path: '/?view=accounts', cookie: '' });
+  await f.request('/api/logout', { method: 'POST' });
+  assert.equal((await routed('/', grant)).status, 401);
+});
+
+test('proxy and asset sync preferences persist and canonical navigation keeps the same port', async t => {
+  const f = await fixture(t); await f.login();
+  const projects = (await f.request('/api/projects')).data.projects;
+  assert.ok(projects.every(project => project.accessMode === 'proxy'));
+  assert.equal(projects.find(project => project.id === 'asset').autoSync, true);
+  for (const body of [{ accessMode: 'arbitrary' }, { autoSync: 'true' }]) assert.equal((await f.request('/api/projects/asset', { method: 'PUT', body })).status, 400);
+  assert.equal((await f.request('/api/projects/asset', { method: 'PUT', body: { autoSync: false, accessMode: 'direct' } })).status, 200);
+  assert.equal((await f.request('/api/projects/asset/launch', { method: 'POST' })).status, 400);
+  assert.equal((await f.request('/api/projects/asset/sync', { method: 'POST' })).status, 400);
+  await f.reopen(); await f.login();
+  const asset = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'asset');
+  assert.equal(asset.project.accessMode, 'direct'); assert.equal(asset.sync.state, 'disabled');
+  const navigation = await fetch(f.origin + '/?view=projects', { redirect: 'manual' });
+  assert.equal(navigation.status, 302);
+  assert.equal(navigation.headers.get('location'), `http://hub.localhost:${new URL(f.origin).port}/?view=projects`);
 });
 
 test('project and encrypted credentials persist; changing service clears credentials', async t => {

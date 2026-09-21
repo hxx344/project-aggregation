@@ -29,7 +29,7 @@ test('upstream transport enforces deadline, redirect prohibition, body cap and s
   assert.deepEqual((await requestJson(base, '/ok', { deadline: Date.now() + 1000 })).data, { ok: true });
   await assert.rejects(requestJson(base, '/redirect', { deadline: Date.now() + 1000 }), /重定向/);
   await assert.rejects(requestJson(base, '/large', { deadline: Date.now() + 1000, limit: 1024 }), /大小限制/);
-  await assert.rejects(requestJson(base, '/private', { deadline: Date.now() + 1000 }), error => error.code === 'unauthorized' && !error.message.includes('secret'));
+  await assert.rejects(requestJson(base, '/private', { deadline: Date.now() + 1000 }), error => error.code === 'unauthorized' && error.statusCode === 401 && !error.message.includes('secret'));
   const start = Date.now(); await assert.rejects(requestJson(base, '/slow', { deadline: start + 60 }), /超时/); assert.ok(Date.now() - start < 450);
 });
 

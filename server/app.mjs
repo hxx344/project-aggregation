@@ -7,6 +7,8 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateUrl, validateAuthOrigin, readSummary, UpstreamError } from './adapters.mjs';
+import { createPortal } from './portal.mjs';
+import { createAssetSync, syncAsset } from './asset-sync.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -14,7 +16,7 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const SESSION_AGE = 12 * 60 * 60 * 1000;
 const defaults = [
-  { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:18765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
+  { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:8765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
   { id: 'monitor', name: 'Market Monitor', description: '原油价差与市场监控', category: 'monitoring', adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=oil', apiUrl: 'http://127.0.0.1:3000', staleAfterSeconds: 120 },
   { id: 'asset', name: 'Asset Ledger', description: '资产账本、持有金额与历史变化', category: 'assets', adapter: 'asset', url: 'http://127.0.0.1:5678', apiUrl: 'http://127.0.0.1:5678', staleAfterSeconds: 900 },
 ].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));
@@ -32,7 +34,8 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+  const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
   mkdirSync(resolvedData, { recursive: true, mode: 0o700 });
   if (process.platform !== 'win32') chmodSync(resolvedData, 0o700);
@@ -61,17 +64,29 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   }
   const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64'); };
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
-  const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', ...project, hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
+  const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
   const getProjects = () => db.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set(); const loginAttempts = new Map();
   let closed = false;
+  let assetSync = null;
+  const projectRevision = id => { const row = db.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
+  const portal = createPortal({
+    getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
+    getProjectRevision: projectRevision,
+    isSessionValid: id => !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+    coordinateAssetSync: async ({ projectId, revision }) => {
+      if (closed || projectRevision(projectId) !== revision) return null;
+      const status = await assetSync.run(projectId);
+      return !closed && projectRevision(projectId) === revision ? status : null;
+    },
+  });
 
   function snapshot(project) {
     const saved = db.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id);
     const old = saved ? JSON.parse(saved.json) : null;
     const state = states.get(project.id) || old;
-    const base = { project, state: 'unconfigured', message: '等待首次读取数据', checkedAt: null, updatedAt: null, latencyMs: null, metrics: [] };
+    const base = { project, state: 'unconfigured', message: '等待首次读取数据', checkedAt: null, updatedAt: null, latencyMs: null, metrics: [], ...(project.adapter === 'asset' ? { sync: assetSync?.getStatus(project.id) || null } : {}) };
     if (!project.enabled) return { ...base, state: 'disabled', message: '项目已停用' };
     if (!project.apiUrl && project.adapter !== 'link') return { ...base, message: '请配置接口地址' };
     if (project.adapter === 'link') return { ...base, state: project.url ? 'online' : 'unconfigured', message: project.url ? '链接入口；不采集项目数据' : '请配置项目地址' };
@@ -112,11 +127,14 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   }
 
   function validateProject(body, existing) {
-    const allowed = ['id', 'name', 'description', 'category', 'adapter', 'url', 'apiUrl', 'authOrigin', 'mode', 'enabled', 'staleAfterSeconds', 'order', 'password', 'username', 'clearCredentials'];
+    const allowed = ['id', 'name', 'description', 'category', 'adapter', 'url', 'apiUrl', 'authOrigin', 'accessMode', 'autoSync', 'mode', 'enabled', 'staleAfterSeconds', 'order', 'password', 'username', 'clearCredentials'];
     if (Object.keys(body).some(key => !allowed.includes(key))) throw new HttpError(400, '项目包含不支持的字段');
     if (body.id !== undefined && (typeof body.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(body.id) || (existing && body.id !== existing.id))) throw new HttpError(400, '项目标识必须为1至64位字母、数字、下划线或短横线，创建后不能修改');
     const value = { name: '', description: '', category: 'other', adapter: 'link', url: '', apiUrl: '', authOrigin: '', mode: 'external', enabled: true, staleAfterSeconds: 120, order: 0, ...existing };
     for (const field of allowed.filter(field => !['password', 'username', 'clearCredentials'].includes(field))) if (body[field] !== undefined) value[field] = body[field];
+    value.accessMode ??= ['aster', 'monitor', 'asset'].includes(value.adapter) ? 'proxy' : 'direct';
+    value.autoSync ??= value.adapter === 'asset';
+    if (!['proxy', 'direct'].includes(value.accessMode) || typeof value.autoSync !== 'boolean') throw new HttpError(400, '页面连接或后台同步设置不正确');
     if (typeof value.name !== 'string' || !value.name.trim() || value.name.length > 80 || typeof value.description !== 'string' || value.description.length > 500) throw new HttpError(400, '项目名称或说明长度不正确');
     value.name = value.name.trim();
     if (!['trading', 'monitoring', 'assets', 'other'].includes(value.category) || !['aster', 'monitor', 'asset', 'standard', 'link'].includes(value.adapter) || !['external', 'embed'].includes(value.mode) || typeof value.enabled !== 'boolean' || !Number.isInteger(value.staleAfterSeconds) || value.staleAfterSeconds < 30 || value.staleAfterSeconds > 86400 || !Number.isInteger(value.order) || Math.abs(value.order) > 10000) throw new HttpError(400, '项目配置值不正确');
@@ -181,12 +199,22 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (db.prepare('SELECT id FROM projects WHERE id=?').get(value.id)) throw new HttpError(409, '项目标识已存在');
       const credentials = body.password ? encrypt({ password: body.password, username: body.username || '' }) : null;
       db.prepare('INSERT INTO projects(id,json,credentials) VALUES (?,?,?)').run(value.id, JSON.stringify(value), credentials);
-      send(res, 201, { project: publicProject(rowFor(value.id)) }); void check(value.id).catch(() => {}); return;
+      send(res, 201, { project: publicProject(rowFor(value.id)) }); void check(value.id).catch(() => {}); if (assetSyncIntervalMs > 0) void assetSync.refresh(); return;
     }
-    const match = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)(\/check)?$/);
+    const match = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)(\/(?:check|launch|sync))?$/);
     if (match) {
       const id = match[1]; const row = rowFor(id);
-      if (match[2] && req.method === 'POST') { send(res, 200, { snapshot: await check(id) }); return; }
+      if (match[2] === '/check' && req.method === 'POST') { send(res, 200, { snapshot: await check(id) }); return; }
+      if (match[2] === '/launch' && req.method === 'POST') {
+        const project = publicProject(row);
+        if (!project.enabled || project.accessMode !== 'proxy' || !project.apiUrl) throw new HttpError(400, '请先启用项目并配置通过工作台访问的服务地址');
+        send(res, 200, portal.createLaunch({ projectId: id, sessionId: current.id, req })); return;
+      }
+      if (match[2] === '/sync' && req.method === 'POST') {
+        const project = publicProject(row);
+        if (project.adapter !== 'asset' || !project.enabled || !project.autoSync) throw new HttpError(400, '请先启用资产后台同步');
+        void assetSync.run(id).catch(() => {}); send(res, 202, { sync: assetSync.getStatus(id) }); return;
+      }
       if (!match[2] && req.method === 'PUT') {
         const body = await bodyOf(req); const prior = JSON.parse(row.json); const value = validateProject(body, prior);
         const boundaryChanged = prior.apiUrl !== value.apiUrl || prior.adapter !== value.adapter || (prior.authOrigin || '') !== value.authOrigin;
@@ -195,23 +223,31 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         const inFlight = pending.get(id);
         db.prepare('UPDATE projects SET json=?,credentials=? WHERE id=?').run(JSON.stringify(value), credentials, id);
         if (boundaryChanged || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) db.prepare('DELETE FROM snapshots WHERE id=?').run(id);
-        states.delete(id); send(res, 200, { project: publicProject(rowFor(id)) });
+        states.delete(id); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { project: publicProject(rowFor(id)) });
         if (inFlight) void inFlight.finally(() => { if (!closed && db.prepare('SELECT id FROM projects WHERE id=?').get(id)) void check(id).catch(() => {}); }).catch(() => {});
         else void check(id).catch(() => {}); return;
       }
-      if (!match[2] && req.method === 'DELETE') { db.prepare('DELETE FROM projects WHERE id=?').run(id); states.delete(id); send(res, 200, { ok: true }); return; }
+      if (!match[2] && req.method === 'DELETE') { db.prepare('DELETE FROM projects WHERE id=?').run(id); states.delete(id); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
     }
     throw new HttpError(404, '接口不存在');
   }
 
   const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.json': 'application/json' };
   const server = http.createServer(async (req, res) => {
+    try { if ((!configuredOrigin || req.headers.host !== new URL(configuredOrigin).host) && await portal.handle(req, res)) return; }
+    catch { if (!res.headersSent) send(res, 502, { error: '项目页面暂时不可用，请从工作台重新打开' }); else res.destroy(); return; }
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src http: https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     try {
+      if (!req.url.startsWith('/') || req.url.startsWith('//')) throw new HttpError(400, '请求地址格式不正确');
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const localHost = ['127.0.0.1', 'localhost', '[::1]', 'hub.localhost'].includes(url.hostname);
+      if (!localHost && (!configuredOrigin || url.host !== new URL(configuredOrigin).host)) throw new HttpError(421, '请使用工作台配置的访问地址');
       if (url.pathname.startsWith('/api/')) { await api(req, res, url); return; }
       if (!['GET', 'HEAD'].includes(req.method)) throw new HttpError(405, '请求方法不支持');
+      if (localHost && url.hostname !== 'hub.localhost') {
+        res.writeHead(302, { Location: `${portal.canonicalOrigin(req)}${url.pathname}${url.search}`, 'Cache-Control': 'no-store' }); res.end(); return;
+      }
       let decoded; try { decoded = decodeURIComponent(url.pathname); } catch { throw new HttpError(400, '地址格式不正确'); }
       let filename = path.resolve(distDir, `.${decoded}`);
       if (!filename.startsWith(`${path.resolve(distDir)}${path.sep}`)) filename = path.join(distDir, 'index.html');
@@ -221,14 +257,21 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       res.end(req.method === 'HEAD' ? undefined : await readFile(filename));
     } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError ? error.status : 500, { error: error instanceof HttpError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
   });
-  server.requestTimeout = 15000; server.headersTimeout = 10000; server.maxHeadersCount = 40;
+  server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
+  server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
+  assetSync = createAssetSync({
+    listTargets: () => db.prepare('SELECT * FROM projects').all().map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
+    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader,
+    onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
+  });
   async function refresh() { await Promise.allSettled(getProjects().filter(project => project.enabled && project.apiUrl && project.adapter !== 'link').map(project => check(project.id))); }
   const interval = refreshInterval > 0 ? setInterval(() => { if (!closed) void refresh(); }, refreshInterval) : null;
   interval?.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   return {
-    server, check, refresh, dataDir: resolvedData,
+    server, check, refresh, assetSync, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); return password; },
-    async close() { closed = true; clearInterval(interval); clearTimeout(first); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearTimeout(first); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }
