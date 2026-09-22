@@ -4,6 +4,19 @@ import http from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { createPortal, HUB_HOST, PORTAL_COOKIE } from '../server/portal.mjs';
 
+test('portal caches only public immutable build files after authorization', async t => {
+  const f = await fixture(t, { onUpstream(req, res) {
+    const privateFile = req.url.includes('private');
+    res.writeHead(200, { 'Content-Type': req.url.endsWith('.js') ? 'text/javascript' : 'text/html', 'Cache-Control': 'public, max-age=31536000, immutable', ...(privateFile ? { 'Set-Cookie': 'session=private; HttpOnly' } : {}) });
+    res.end(privateFile ? 'private' : 'public'); return true;
+  } });
+  assert.equal((await f.request('/assets/index-12345678.js')).status, 401);
+  const { cookie } = await f.authorize();
+  assert.equal((await f.request('/assets/index-12345678.js', { cookie })).headers['cache-control'], 'private, max-age=31536000, immutable');
+  for (const path of ['/', '/api/state', '/assets/private-12345678.js']) assert.equal((await f.request(path, { cookie })).headers['cache-control'], 'no-store');
+  f.revoke(); assert.equal((await f.request('/assets/index-12345678.js', { cookie })).status, 401);
+});
+
 async function fixture(t, options = {}) {
   const upgradedSockets = new Set();
   let upstreamCalls = 0; let ledgerReads = 0; let validSession = true; let revision = 'revision-one'; let time = Date.now();

@@ -3,6 +3,7 @@ import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { createHash, randomBytes } from 'node:crypto';
 import { validateUrl, validateAuthOrigin, blockedAddress } from './adapters.mjs';
+import { cachePolicy } from './static-cache.mjs';
 
 export const HUB_HOST = 'hub.localhost';
 export const PORTAL_COOKIE = 'hub_portal';
@@ -228,7 +229,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     return headers;
   }
 
-  function responseHeaders(source, context, target, requestPath = '/', grant) {
+  function responseHeaders(source, context, target, requestPath = '/', grant, status = 200) {
     const headers = cleanHeaders(source);
     for (const name of Object.keys(headers)) if (/^access-control-/i.test(name) || /^(?:x-frame-options|clear-site-data|refresh|alt-svc|service-worker-allowed)$/i.test(name)) delete headers[name];
     headers['set-cookie'] = setCookies(source['set-cookie'], context.secure, grant?.auth);
@@ -238,7 +239,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     if (source['content-security-policy-report-only']) headers['content-security-policy-report-only'] = framePolicy(source['content-security-policy-report-only'], context.hubOrigin);
     headers['referrer-policy'] = 'no-referrer';
     // Avoid a shared browser cache serving private data after a grant is revoked.
-    headers['cache-control'] = 'no-store';
+    headers['cache-control'] = cachePolicy(requestPath, source, status);
     if (source.location) {
       let location;
       try { location = new URL(source.location, new URL(target.base.pathname.replace(/\/$/, '') + requestPath, target.base.origin)); } catch { throw new PortalError(502, '项目返回了无效跳转地址'); }
@@ -361,7 +362,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
       try {
         if (!liveGrant(grant)) throw new PortalError(401, '项目访问授权已失效');
         if (automaticAuthFailed(incoming, grant, project, target, req.url)) { incoming.destroy(); sendAutomaticAuthFailure(res, context, grant); return; }
-        const headers = responseHeaders(incoming.headers, context, target, req.url, grant);
+        const headers = responseHeaders(incoming.headers, context, target, req.url, grant, incoming.statusCode);
         if (req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/logout' && incoming.statusCode >= 200 && incoming.statusCode < 300) {
           revokeGrant(grant); headers['set-cookie'] = [...(headers['set-cookie'] || []), clearPortalCookie(context)];
         }
@@ -433,7 +434,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         clearTimeout(timer); peer = targetSocket;
         if (!liveGrant(grant)) { stream.destroy(); return; }
         try {
-          const headers = responseHeaders(response.headers, context, target, req.url, grant); headers.connection = 'Upgrade'; headers.upgrade = 'websocket';
+          const headers = responseHeaders(response.headers, context, target, req.url, grant, response.statusCode); headers.connection = 'Upgrade'; headers.upgrade = 'websocket';
           const lines = Object.entries(headers).flatMap(([name, value]) => (Array.isArray(value) ? value : [value]).map(item => `${name}: ${item}`));
           socket.write(`HTTP/1.1 101 Switching Protocols\r\n${lines.join('\r\n')}\r\n\r\n`);
           if (targetHead.length) socket.write(targetHead); if (head.length) targetSocket.write(head);

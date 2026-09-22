@@ -35,7 +35,7 @@ CrossEx 第一版仅模拟同币种跨交易所永续价差套利。Monitor 作�
 ## 摘要接口
 
 ```http
-GET /api/hub/summary
+GET /api/hub/summary?schemaVersion=2
 Accept: application/json
 ```
 
@@ -45,9 +45,10 @@ Accept: application/json
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "data": {
     "updatedAt": "2026-09-21T12:00:00.000Z",
+    "health": { "state": "online", "message": "来源正常", "staleAfterSeconds": 120 },
     "metrics": [
       {
         "key": "balance",
@@ -72,7 +73,10 @@ Accept: application/json
 }
 ```
 
-- 顶层只接受 `schemaVersion`、`data`；`data` 只接受 `updatedAt`、`metrics`、可选的 `trend`，未知字段会被拒绝。
+- 顶层只接受 `schemaVersion`、`data`；v2 的 `data` 接受 `updatedAt`、`metrics`、`health`，以及可选的 `trend`、`freshness`，未知字段会被拒绝。
+- `health` 只包含 `state`（`online` / `partial` / `stale` / `offline`）、`message`（最长 500 字符）、`staleAfterSeconds`（1–86400 的整数）。工作台保留来源状态，并取来源与项目阈值较短者。动态数据允许 `updatedAt: null`，但不能因此显示新鲜。
+- `freshness` 可选 `dynamic` 或 `static`。只有明确为人工估值的静态数据使用 `static`；来源错误仍须通过 `health` 反映，不能借此隐藏错误。
+- 工作台先请求 `?schemaVersion=2`，仅在 404/405 时回退旧接口。v1 仍支持，`data` 只能包含 `updatedAt`、`metrics`、可选 `trend`，且必须有有效时间。CrossEx 无参数请求继续返回 v1，兼容旧工作台。
 - `updatedAt` 是 ISO 8601 的数据源时间，不能用当前请求时间掩盖旧快照；不能比工作台时钟超前 60 秒。全部指标应属于该时间点，聚合多源时使用最早有效时间。
 - `metrics` 最多 24 个。`key` 唯一，只允许英文字母、数字、下划线和短横线，长度 1–64；`label` 长度 1–80。
 - `value` 接受有限数值、最长 160 字符的字符串或 `null`。缺失数据使用 `null`，不要使用 0 代替。数值不要携带千分位或币种字符，单位写在 `unit`。
@@ -83,7 +87,7 @@ Accept: application/json
 
 ## 已有项目适配
 
-下表说明后台数据读取的认证。页面自动登录另建独立会话，不复用下表的缓存。
+四类适配器均优先请求轻量 v2 摘要（Monitor 携带当前 `monitor` 查看条件），认证与旧接口相同。下表列出接口缺失时的兼容读取。页面自动登录另建独立会话，不复用下表的缓存。
 
 | 适配器 | 请求 | 认证 |
 | --- | --- | --- |
@@ -117,7 +121,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 ## Asset 后台同步
 
-`autoSync=true`、项目启用且已保存原项目登录凭据时，服务器每 60 秒向 Asset 的 `POST /api/sync` 发送认证请求，单次超时 60 秒。该任务独立于每 30 秒的摘要读取，不阻塞其他项目；不依赖工作台页面、Asset 页面或 SSH 连接保持打开。项目设置可关闭同步，之后仍读取已保存的账本。
+`autoSync=true`、项目启用且已保存原项目登录凭据时，服务器每 60 秒向 Asset 的 `POST /api/sync` 发送认证请求，单次超时 60 秒。该任务独立于按来源时限（最多每 30 秒）的摘要读取，不阻塞其他项目；不依赖工作台页面、Asset 页面或 SSH 连接保持打开。项目设置可关闭同步，之后仍读取已保存的账本。
 
 此调用使用 Asset 已有的只读资产来源同步功能，会写入估值及历史，不会下单或转账。保存的原项目登录凭据用于服务器认证，不向浏览器暴露。后台同步的尝试、结果和错误状态独立于资产 `updatedAt`；不能用请求完成时间更新源数据时间。即使接口成功返回，某个来源也可能保留旧值，应以账本中的真实更新时间及来源错误判断新鲜度。
 
@@ -127,4 +131,16 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 资产适配器使用原账本的 `mode` 分类：`manual` 为手工估值，`market`、`bybit`、`aster` 为动态数据。混合账本的 `updatedAt` 取所有非 `manual` 行最早更新时间，并通过 `manual_valuation_at` 指标单独保留手工行最早估值时间。缺少或未知 `mode` 按动态行处理并提示数据不完整，避免误判为不会过期。
 
-仅全部行都明确为 `manual` 时，快照带有 `freshness: "static"`，更新时间为最早估值记录时间；按静态账本展示，不套用实时刷新阈值。该标记是内置资产适配器返回的快照属性，不是标准摘要协议可提交的字段。上游错误、数据缺失或汇率问题仍会单独提示。
+仅全部行都明确为 `manual` 时，快照带有 `freshness: "static"`，更新时间为最早估值记录时间；按静态账本展示，不套用实时刷新阈值。该标记也可由 v2 摘要明确提供；v1 不接受此字段。上游错误、数据缺失或汇率问题仍会单独提示。
+
+## 页面活动与查看条件联动
+
+工作台最多保留两个确认支持 `activity` 的代理 iframe。未确认能力的旧页面切换时卸载；项目配置或凭据 revision 改变时立即重新授权。页面隐藏、离线或 host `active=false` 时停止前台刷新并取消在途读取，恢复后立即补查；不停止任何后台交易、采集或同步任务。
+
+消息统一使用 `{channel:"project-hub", version:1, type:...}`。工作台发 `ready`（`role:"host"`），模块确认 `ready`（`role:"module", capabilities:["activity","navigate","changed"]`）。模块可以先发无能力的 `ready` 探测，工作台回握手后才确认能力。`activity` 携带布尔 `active`；实际写入成功后可发 `changed, scope:"summary"`，工作台合并短时间重复通知，只刷新相应项目。
+
+`navigate` 携带 `projectId` 和 `query`。目标限 `monitor`、`crossex`、`aster`、`asset`；前两者只接受 `symbol`（1–40 位大写字母、数字、点、下划线、短横线）、`longExchange`、`shortExchange`（binance/bybit/okx/gate/kraken/hyperliquid/lighter）。ASTER 和 Asset 只接受空条件。导航只改变查看状态，不触发交易、导入或保存。
+
+双方校验精确 `origin`、`event.source` 与消息结构，不使用 `*`。模块仅在 `p-<24位十六进制>.hub.localhost` 代理 iframe 内建立桥，父来源为同协议、同端口的 `hub.localhost`；独立打开不启用桥。工作台只接受当前可见、已完成握手的页面发起导航，目标也必须启用代理。
+
+`GET /api/overview/events` 受工作台登录会话保护，每次推送重新验证会话；退出登录或改密码关闭订阅。每个会话最多 12 条订阅，全局 60 条，慢客户端断开重连。前端在隐藏/离线时关闭订阅，正常可见时接收推送与 15 秒心跳，订阅断开才使用 30 秒补查；卡片每秒按服务端时间基准更新过期状态。

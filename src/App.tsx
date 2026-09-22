@@ -2,7 +2,9 @@ import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } f
 import type { FormEvent, ReactNode } from 'react';
 import { Activity, ArrowUpRight, Check, ChevronRight, CircleAlert, FolderKanban, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, Plus, RefreshCw, Save, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
 import { api, ApiError, setCsrfToken } from './api';
-import ProjectPage from './ProjectPage';
+import ProjectWorkspace from './ProjectWorkspace';
+import { ageSnapshot, navigationQuery } from './hub-state';
+import type { NavigationQuery } from './hub-state';
 import type { Adapter, Category, Metric, Overview, Project, ProjectInput, Snapshot } from './types';
 
 const TrendChart = lazy(() => import('./TrendChart'));
@@ -16,12 +18,13 @@ class ChartBoundary extends Component<{ children: ReactNode }, { failed: boolean
 const categories: Record<Category, string> = { trading: '交易执行', monitoring: '市场监控', assets: '资产管理', other: '其他项目' };
 const adapters: Record<Adapter, string> = { aster: 'Aster 交易工作台', monitor: 'Market Monitor', asset: '资产账本', standard: '标准概览接口', link: '仅网页入口' };
 const statusText: Record<Snapshot['state'], string> = { unconfigured: '待配置', online: '已连接', stale: '数据过期', offline: '连接中断', unauthorized: '需要登录', disabled: '已停用', partial: '部分数据异常' };
-type Route = { view: 'overview' | 'projects' | 'project'; id: string };
+type Route = { view: 'overview' | 'projects' | 'project'; id: string; query?: NavigationQuery };
 
 function readRoute(): Route {
   const params = new URLSearchParams(location.search);
   const view = params.get('view');
-  return { view: view === 'projects' || view === 'project' ? view : 'overview', id: params.get('id') || '' };
+  const query = Object.fromEntries(['symbol', 'longExchange', 'shortExchange'].filter(key => params.has(key)).map(key => [key, params.get(key)]));
+  return { view: view === 'projects' || view === 'project' ? view : 'overview', id: params.get('id') || '', ...(Object.keys(query).length && navigationQuery(query) ? { query: navigationQuery(query)! } : {}) };
 }
 function formatDate(value: string | null, full = false) {
   if (!value || !Number.isFinite(new Date(value).getTime())) return '尚无记录';
@@ -66,7 +69,10 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [editor, setEditor] = useState<Project | 'new' | null>(null);
   const [checking, setChecking] = useState<string | null>(null);
-  const [pageRevision, setPageRevision] = useState(0);
+  const [, setClock] = useState(0);
+  const receivedAt = useRef(performance.now());
+  const streamLive = useRef(false);
+  const refreshTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const sidebar = useRef<HTMLElement>(null);
   const requestVersion = useRef(0);
@@ -90,28 +96,56 @@ export default function App() {
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
     return () => controller.abort();
   }, []);
-  const load = useCallback(async (signal?: AbortSignal, reloadProject = false) => {
+  const accept = useCallback((data: Overview) => { receivedAt.current = performance.now(); setOverview(data); setError(''); }, []);
+  const load = useCallback(async (signal?: AbortSignal) => {
     const version = ++requestVersion.current;
     setLoading(true);
-    try { const data = await api<Overview>('/api/overview', { signal }); if (version === requestVersion.current) { setOverview(data); setError(''); if (reloadProject) setPageRevision(value => value + 1); } }
-    catch (e) { if (e instanceof ApiError && e.status === 401) expire(); else if (e instanceof Error && e.name !== 'AbortError' && version === requestVersion.current) setError(e.message); }
+    try { const data = await api<Overview>('/api/overview', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) }); if (version === requestVersion.current) accept(data); }
+    catch (e) { if (version !== requestVersion.current) return; if (e instanceof ApiError && e.status === 401) expire(); else if (e instanceof Error && e.name !== 'AbortError') setError(e.message); }
     finally { if (version === requestVersion.current) setLoading(false); }
-  }, [expire]);
+  }, [expire, accept]);
   useEffect(() => {
     if (!authenticated) return;
     const controller = new AbortController();
     void load(controller.signal);
-    const refresh = () => { if (document.visibilityState === 'visible') void load(controller.signal); };
+    const refresh = () => { if (document.visibilityState === 'visible' && !streamLive.current) void load(controller.signal); };
     const interval = window.setInterval(refresh, 30_000);
     document.addEventListener('visibilitychange', refresh); window.addEventListener('online', refresh);
     return () => { controller.abort(); clearInterval(interval); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('online', refresh); };
   }, [authenticated, load]);
+  useEffect(() => {
+    if (!authenticated) return;
+    let stream: EventSource | null = null;
+    const controller = new AbortController();
+    const connect = () => {
+      stream?.close(); streamLive.current = false;
+      if (document.hidden || !navigator.onLine) return;
+      const current = new EventSource('/api/overview/events'); stream = current;
+      current.onmessage = event => {
+        if (controller.signal.aborted || stream !== current || document.hidden) return;
+        try { const data = JSON.parse(event.data) as Overview; if (!Array.isArray(data.projects) || !Number.isFinite(Date.parse(data.generatedAt))) return; requestVersion.current++; setLoading(false); streamLive.current = true; accept(data); }
+        catch { streamLive.current = false; }
+      };
+      current.onerror = () => { if (controller.signal.aborted || stream !== current || document.hidden) return; streamLive.current = false; void load(controller.signal); };
+    };
+    connect();
+    document.addEventListener('visibilitychange', connect); window.addEventListener('online', connect); window.addEventListener('offline', connect);
+    const clock = window.setInterval(() => { if (!document.hidden) setClock(value => value + 1); }, 1000);
+    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearInterval(clock); document.removeEventListener('visibilitychange', connect); window.removeEventListener('online', connect); window.removeEventListener('offline', connect); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
+  }, [authenticated, accept, load]);
   useEffect(() => { const change = () => setRoute(readRoute()); window.addEventListener('popstate', change); return () => window.removeEventListener('popstate', change); }, []);
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 5000); return () => clearTimeout(timer); }, [notice]);
   const navigate = (next: Route) => {
     const params = new URLSearchParams(); if (next.view !== 'overview') params.set('view', next.view); if (next.view === 'project') params.set('id', next.id);
+    if (next.view === 'project' && next.query) for (const [key, value] of Object.entries(next.query)) params.set(key, value);
     history.pushState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}`); setRoute(next); setMenuOpen(false); if (menuOpen) mobileMenuButton.current?.focus(); window.scrollTo(0, 0);
   };
+  const changed = useCallback((id: string) => {
+    if (refreshTimers.current.has(id)) return;
+    refreshTimers.current.set(id, setTimeout(() => {
+      void api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal: AbortSignal.timeout(10_000) }).then(() => { if (!streamLive.current) void load(); }).catch(e => { if (e instanceof ApiError && e.status === 401) expire(); }).finally(() => refreshTimers.current.delete(id));
+    }, 500));
+  }, [load, expire]);
   const check = async (project: Project) => {
     setChecking(project.id);
     try { const result = await api<{ snapshot: Snapshot }>(`/api/projects/${encodeURIComponent(project.id)}/check`, { method: 'POST' }); setNotice(`${project.name}：${project.adapter === 'link' ? '网页入口已配置，未检测可达性' : statusText[result.snapshot.state]}`); await load(); }
@@ -124,7 +158,8 @@ export default function App() {
   };
   if (authenticated === null) return <div className="app-loading"><LoaderCircle className="spin" /><p>正在打开工作台</p></div>;
   if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { setError(''); setAuthenticated(true); }} /></>;
-  const snapshots = overview?.projects || [];
+  const serverNow = overview ? Date.parse(overview.generatedAt) + performance.now() - receivedAt.current : Date.now();
+  const snapshots = overview?.projects.map(snapshot => ageSnapshot(snapshot, serverNow)) || [];
   const selected = snapshots.find(s => s.project.id === route.id);
   const pageTitle = route.view === 'overview' ? '总览' : route.view === 'projects' ? '项目管理' : selected?.project.name || '项目详情';
   return <div className={`app-shell ${route.view === 'project' ? 'project-shell' : ''}`}>
@@ -134,10 +169,11 @@ export default function App() {
     <div className="workspace"><header className="topbar"><div className="breadcrumb"><button ref={mobileMenuButton} className="icon-button mobile-menu" aria-label="打开导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={21} /></button><span>工作台</span><ChevronRight size={14} /><strong>{pageTitle}</strong></div><div className="topbar-right"><span className="refresh-label">总览读取于 {formatDate(overview?.generatedAt || null)}</span><button className="icon-button" aria-label="刷新总览" title="刷新总览" disabled={loading} onClick={() => void load()}><RefreshCw size={18} className={loading ? 'spin' : ''} /></button></div></header>
       <main id="main-content" className={`main-content ${route.view === 'project' ? 'project-content' : ''}`}>{route.view !== 'project' ? <div className="page-heading"><div><h1>{pageTitle}</h1><p>{route.view === 'overview' ? '先看当前状态，再进入需要处理的项目。' : route.view === 'projects' ? '配置连接，管理入口，接入后续项目。' : selected?.project.description}</p></div>{route.view === 'projects' ? <Button className="button primary" onClick={() => setEditor('new')}><Plus size={18} />添加项目</Button> : <span className="today">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</span>}</div> : null}
       {error ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{error}<button onClick={() => void load()}>重试</button></div> : null}
-      {!overview ? <div className="empty-state loading-state"><LoaderCircle className="spin" /><h2>正在读取项目</h2><p>各项目独立连接，结果会在这里显示。</p></div> : route.view === 'overview' ? <OverviewPage snapshots={snapshots} onProject={id => navigate({ view: 'project', id })} onEdit={setEditor} onManage={() => navigate({ view: 'projects', id: '' })} /> : route.view === 'projects' ? <ProjectsPage snapshots={snapshots} onEdit={setEditor} onCheck={check} checking={checking} /> : selected ? <ProjectPage key={JSON.stringify(selected.project) + pageRevision} project={selected.project} onEdit={() => setEditor(selected.project)} onExpired={expire} /> : <div className="empty-state"><FolderKanban /><h2>没有找到这个项目</h2><p>项目可能已被移除，请回到项目管理查看。</p><button className="button secondary" onClick={() => navigate({ view: 'projects', id: '' })}>查看项目</button></div>}
+      {!overview ? <div className="empty-state loading-state"><LoaderCircle className="spin" /><h2>正在读取项目</h2><p>各项目独立连接，结果会在这里显示。</p></div> : route.view === 'overview' ? <OverviewPage snapshots={snapshots} onProject={id => navigate({ view: 'project', id })} onEdit={setEditor} onManage={() => navigate({ view: 'projects', id: '' })} /> : route.view === 'projects' ? <ProjectsPage snapshots={snapshots} onEdit={setEditor} onCheck={check} checking={checking} /> : selected ? null : <div className="empty-state"><FolderKanban /><h2>没有找到这个项目</h2><p>项目可能已被移除，请回到项目管理查看。</p><button className="button secondary" onClick={() => navigate({ view: 'projects', id: '' })}>查看项目</button></div>}
+      {overview ? <ProjectWorkspace projects={overview.projects.map(s => s.project)} activeId={route.view === 'project' ? route.id : null} query={route.query} onEdit={setEditor} onExpired={expire} onChanged={changed} onNavigate={(id, query) => { const target = overview.projects.find(s => s.project.id === id && s.project.enabled && s.project.accessMode === 'proxy'); if (target) navigate({ view: 'project', id, query }); }} /> : null}
       </main>{route.view !== 'project' ? <footer className="workspace-footer"><span>各项目独立运行，工作台汇总展示。</span><span>时间按本机时区显示</span></footer> : null}
     </div>
-    {editor ? <ProjectEditor key={editor === 'new' ? 'new' : editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { setEditor(null); setNotice(message); await load(undefined, true); }} onExpired={expire} /> : null}
+    {editor ? <ProjectEditor key={editor === 'new' ? 'new' : editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { setEditor(null); setNotice(message); await load(); }} onExpired={expire} /> : null}
     {notice ? <div className="toast" role="status"><Check size={18} />{notice}<button aria-label="关闭提示" onClick={() => setNotice('')}><X size={16} /></button></div> : null}
   </div>;
 }

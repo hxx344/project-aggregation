@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { validateUrl, blockedAddress, standardSummary, requestJson, readSummary, normalizeMonitorQuote } from '../server/adapters.mjs';
+import { validateUrl, blockedAddress, standardSummary, requestJson, readSummary, normalizeMonitorQuote, UpstreamError } from '../server/adapters.mjs';
 
 test('URL validation allows intentional private services and blocks metadata addresses', () => {
   assert.equal(validateUrl('http://127.0.0.1:3000/?monitor=oil'), 'http://127.0.0.1:3000/?monitor=oil');
@@ -35,7 +35,7 @@ test('upstream transport enforces deadline, redirect prohibition, body cap and s
 
 test('asset adapter uses cookie login, keeps USD totals separate from withdrawn and ignores extra accounts', async () => {
   const calls = []; const at = new Date().toISOString();
-  const result = await readSummary({ adapter: 'asset', apiUrl: 'http://127.0.0.1:5678' }, { password: 'mock-password' }, { request: async (base, route, options) => {
+  const result = await readLegacySummary({ adapter: 'asset', apiUrl: 'http://127.0.0.1:5678' }, { password: 'mock-password' }, { request: async (base, route, options) => {
     calls.push({ base, route, options });
     if (route === '/api/login') return { data: { ok: true }, cookies: ['asset_session=mock-cookie; Path=/; HttpOnly'] };
     return { data: { dataKind: 'personal', assets: [{ id: 'exchange', project: '持仓', mode: 'bybit', status: '只读同步', value: 100, updatedAt: at }, { id: 'withdrawn', project: '出金', mode: 'manual', status: '手工录入', value: 20, updatedAt: at }], asterAccounts: [{ equity: 1000 }], history: [{ id: 'old', date: '2025-01-01', total: 5 }, { id: 'daily-x', date: '2025-01-01', total: 10 }, { id: 'late', date: '2025-01-01', total: 15 }, { id: 'future', date: '2030-01-01', total: 200, future: true }], fx: 7, fxStatus: { rateDate: '2025-01-01' } } };
@@ -45,13 +45,13 @@ test('asset adapter uses cookie login, keeps USD totals separate from withdrawn 
 });
 
 test('aster adapter uses snapshot timestamps, leaves missing values null and reports USD1 units', async () => {
-  const result = await readSummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, updated_at: Date.now() / 1000, accounts: [{ enabled: true, mode: 'live', snapshot: { occupied_margin: '12.3', timestamp: 1600000000 }, cycle_state: { daily_volume: { volume: null } } }] } }) });
+  const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, updated_at: Date.now() / 1000, accounts: [{ enabled: true, mode: 'live', snapshot: { occupied_margin: '12.3', timestamp: 1600000000 }, cycle_state: { daily_volume: { volume: null } } }] } }) });
   assert.equal(result.updatedAt, new Date(1600000000000).toISOString()); assert.equal(result.metrics.find(item => item.key === 'occupied_margin').unit, 'USD1'); assert.equal(result.metrics.find(item => item.key === 'daily_volume').value, null);
 });
 
 test('monitor reads Basic auth and selected module, marks upstream snapshots stale', async () => {
   let authorization;
-  const result = await readSummary({ adapter: 'monitor', apiUrl: 'http://127.0.0.1:3000', url: 'http://127.0.0.1:3000/?monitor=oil' }, { username: 'reader', password: 'mock-pass' }, { request: async (_base, route, options) => {
+  const result = await readLegacySummary({ adapter: 'monitor', apiUrl: 'http://127.0.0.1:3000', url: 'http://127.0.0.1:3000/?monitor=oil' }, { username: 'reader', password: 'mock-pass' }, { request: async (_base, route, options) => {
     authorization = options.headers.Authorization;
     return route === '/api/monitors' ? { data: { schemaVersion: 1, monitors: [{ id: 'oil', title: '原油' }] } } : { data: { brent: { markPx: 80 }, wti: { markPx: 75 }, fetchedAt: '2026-09-01T00:00:00Z', status: 'snapshot', collection: { stale: true } } };
   } });
@@ -69,10 +69,10 @@ test('upstream sessions are reused and invalidated after an unauthorized respons
     if (expired) { const error = new Error('expired'); error.code = 'unauthorized'; throw error; }
     return { data: { dataKind: 'personal', assets: [], history: [], fx: 7, fxStatus: {} } };
   };
-  await readSummary(project, credentials, { request }); await readSummary(project, credentials, { request });
+  await readLegacySummary(project, credentials, { request }); await readLegacySummary(project, credentials, { request });
   assert.equal(logins, 1); expired = true;
-  await assert.rejects(readSummary(project, credentials, { request })); expired = false;
-  await readSummary(project, credentials, { request }); assert.equal(logins, 2);
+  await assert.rejects(readLegacySummary(project, credentials, { request })); expired = false;
+  await readLegacySummary(project, credentials, { request }); assert.equal(logins, 2);
 });
 
 
@@ -80,8 +80,8 @@ test('public authOrigin is sent to a loopback target and partitions cached sessi
   const calls = []; const project = { adapter: 'aster', apiUrl: 'http://127.0.0.1:18999', authOrigin: 'https://aster.example.com' };
   const request = async (base, route, options) => { calls.push({ base, route, options }); return route === '/api/login' ? { data: { ok: true }, cookies: ['aster_session=origin-test; Path=/'] } : { data: { ready: true, accounts: [] } }; };
   const credentials = { password: 'origin-cache-password' };
-  await readSummary(project, credentials, { request }); await readSummary(project, credentials, { request });
-  await readSummary({ ...project, authOrigin: 'https://other.example.com' }, credentials, { request });
+  await readLegacySummary(project, credentials, { request }); await readLegacySummary(project, credentials, { request });
+  await readLegacySummary({ ...project, authOrigin: 'https://other.example.com' }, credentials, { request });
   assert.equal(calls.filter(call => call.route === '/api/login').length, 2);
   assert.ok(calls.every(call => call.base === project.apiUrl));
   assert.ok(calls.slice(0, 3).every(call => call.options.headers.Origin === project.authOrigin));
@@ -92,7 +92,7 @@ test('asset freshness follows dynamic mode rows and preserves manual valuation d
   const now = new Date().toISOString(); const old = '2020-01-02T00:00:00.000Z';
   const manual = { id: 'manual', project: '手工估值', mode: 'manual', quantity: 1, price: 50, value: 50, updatedAt: old, status: '手工录入' };
   const dynamic = { id: 'bybit', project: 'Bybit', mode: 'bybit', quantity: 100, price: 1, value: 100, updatedAt: now, status: '只读同步' };
-  const read = assets => readSummary({ adapter: 'asset', apiUrl: 'http://127.0.0.1:5678' }, null, { request: async () => ({ data: { dataKind: 'personal', assets, history: [], fx: 7, fxStatus: { source: 'Coinbase', fetchedAt: now, rateDate: now.slice(0, 10), error: null } } }) });
+  const read = assets => readLegacySummary({ adapter: 'asset', apiUrl: 'http://127.0.0.1:5678' }, null, { request: async () => ({ data: { dataKind: 'personal', assets, history: [], fx: 7, fxStatus: { source: 'Coinbase', fetchedAt: now, rateDate: now.slice(0, 10), error: null } } }) });
   const mixed = await read([manual, dynamic]);
   assert.equal(mixed.updatedAt, now); assert.equal(mixed.freshness, undefined); assert.equal(mixed.partial, false);
   assert.equal(mixed.metrics.find(metric => metric.key === 'manual_valuation_at').value, old);
@@ -104,3 +104,11 @@ test('asset freshness follows dynamic mode rows and preserves manual valuation d
   assert.equal(missing.freshness, undefined); assert.equal(missing.updatedAt, null); assert.equal(missing.partial, true);
   const empty = await read([]); assert.equal(empty.freshness, undefined);
 });
+
+// Model an unupgraded module explicitly: only a missing summary route permits fallback.
+function readLegacySummary(project, credentials, options) {
+  return readSummary(project, credentials, { ...options, request: (...args) => {
+    if (args[1].startsWith('/api/hub/summary?schemaVersion=2')) throw new UpstreamError('offline', 'Not found', 404);
+    return options.request(...args);
+  } });
+}

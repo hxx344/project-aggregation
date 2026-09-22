@@ -68,7 +68,7 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(new UpstreamError('invalid', '服务返回重定向，请配置最终服务地址')); return; }
         if ([401, 403, 429].includes(res.statusCode)) { res.destroy(); reject(new UpstreamError('unauthorized', res.statusCode === 429 ? '上游登录限流，请稍后重试' : '需要有效的网页登录凭据，请检查项目设置', res.statusCode)); return; }
-        if (res.statusCode < 200 || res.statusCode >= 300) { res.destroy(); reject(new UpstreamError('offline', `上游服务响应异常（${res.statusCode}）`)); return; }
+        if (res.statusCode < 200 || res.statusCode >= 300) { res.destroy(); reject(new UpstreamError('offline', `上游服务响应异常（${res.statusCode}）`, res.statusCode)); return; }
         const chunks = []; let bytes = 0;
         res.on('data', chunk => { bytes += chunk.length; if (bytes > limit) { res.destroy(); reject(new UpstreamError('invalid', '上游响应超过大小限制')); } else chunks.push(chunk); });
         res.on('error', reject);
@@ -91,16 +91,19 @@ const sum = values => values.length && values.every(value => value !== null) ? v
 const metric = (key, label, value, unit, detail) => ({ key, label, value, ...(unit ? { unit } : {}), ...(detail ? { detail } : {}) });
 
 export function standardSummary(raw) {
-  if (!raw || raw.schemaVersion !== 1 || !raw.data || Object.keys(raw).some(key => !['schemaVersion', 'data'].includes(key))) throw new UpstreamError('invalid', '标准协议版本或顶层字段不正确');
+  if (!raw || ![1, 2].includes(raw.schemaVersion) || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data) || Object.keys(raw).some(key => !['schemaVersion', 'data'].includes(key))) throw new UpstreamError('invalid', '标准协议版本或顶层字段不正确');
   const data = raw.data;
-  if (Object.keys(data).some(key => !['updatedAt', 'metrics', 'trend'].includes(key)) || !strictDate(data.updatedAt) || new Date(data.updatedAt).getTime() > Date.now() + 60000 || !Array.isArray(data.metrics) || data.metrics.length > 24) throw new UpstreamError('invalid', '标准协议摘要字段不正确');
+  const v2 = raw.schemaVersion === 2;
+  const allowed = v2 ? ['updatedAt', 'metrics', 'trend', 'health', 'freshness'] : ['updatedAt', 'metrics', 'trend'];
+  if (Object.keys(data).some(key => !allowed.includes(key)) || (!(v2 && data.updatedAt === null) && !strictDate(data.updatedAt)) || new Date(data.updatedAt).getTime() > Date.now() + 60000 || !Array.isArray(data.metrics) || data.metrics.length > 24) throw new UpstreamError('invalid', '标准协议摘要字段不正确');
+  if (v2 && (!data.health || typeof data.health !== 'object' || Array.isArray(data.health) || Object.keys(data.health).some(key => !['state', 'message', 'staleAfterSeconds'].includes(key)) || !['online', 'partial', 'stale', 'offline'].includes(data.health.state) || typeof data.health.message !== 'string' || data.health.message.length > 500 || !Number.isInteger(data.health.staleAfterSeconds) || data.health.staleAfterSeconds < 1 || data.health.staleAfterSeconds > 86400 || (data.freshness !== undefined && !['static', 'dynamic'].includes(data.freshness)))) throw new UpstreamError('invalid', '标准协议健康状态不正确');
   const keys = new Set();
   for (const item of data.metrics) {
     if (!item || Object.keys(item).some(key => !['key', 'label', 'value', 'unit', 'detail'].includes(key)) || typeof item.key !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(item.key) || keys.has(item.key) || typeof item.label !== 'string' || !item.label.length || item.label.length > 80 || !(item.value === null || (typeof item.value === 'number' && Number.isFinite(item.value)) || (typeof item.value === 'string' && item.value.length <= 160)) || (item.unit !== undefined && (typeof item.unit !== 'string' || item.unit.length > 24)) || (item.detail !== undefined && (typeof item.detail !== 'string' || item.detail.length > 240))) throw new UpstreamError('invalid', '标准协议指标格式不正确');
     keys.add(item.key);
   }
   if (data.trend !== undefined && (!Array.isArray(data.trend) || data.trend.length > 366 || data.trend.some(point => !point || Object.keys(point).some(key => !['at', 'value'].includes(key)) || !strictDate(point.at) || typeof point.value !== 'number' || !Number.isFinite(point.value)))) throw new UpstreamError('invalid', '标准协议趋势格式不正确');
-  return { metrics: data.metrics, updatedAt: strictDate(data.updatedAt), ...(data.trend ? { trend: data.trend.map(point => ({ at: strictDate(point.at), value: point.value })).sort((a, b) => a.at.localeCompare(b.at)) } : {}), message: '服务数据已更新' };
+  return { metrics: data.metrics, updatedAt: strictDate(data.updatedAt), ...(data.trend ? { trend: data.trend.map(point => ({ at: strictDate(point.at), value: point.value })).sort((a, b) => a.at.localeCompare(b.at)) } : {}), ...(v2 ? { state: data.health.state, staleAfterSeconds: data.health.staleAfterSeconds, ...(data.freshness ? { freshness: data.freshness } : {}), message: data.health.message } : { message: '服务数据已更新' }) };
 }
 
 // Login requests are shared while each caller retains its own deadline and cancellation.
@@ -183,7 +186,12 @@ export async function readSummary(project, credentials, { request = requestJson,
     if (project.adapter === 'asset' || project.adapter === 'aster') return (await requestAuthenticatedJson(project, credentials, path, { ...options, request })).data;
     return (await request(project.apiUrl, path, { ...options, headers: { Origin: authOrigin, ...headers } })).data;
   };
-  if (project.adapter === 'standard') return standardSummary(await get('/api/hub/summary', credentials?.password ? { Authorization: `Basic ${Buffer.from(`${credentials.username || ''}:${credentials.password}`).toString('base64')}` } : {}));
+  const summaryHeaders = credentials?.password && ['standard', 'monitor'].includes(project.adapter) ? { Authorization: `Basic ${Buffer.from(`${credentials.username || ''}:${credentials.password}`).toString('base64')}` } : {};
+  const selectedMonitor = project.adapter === 'monitor' ? new URL(project.url || project.apiUrl).searchParams.get('monitor') : null;
+  const summaryPath = `/api/hub/summary?schemaVersion=2${selectedMonitor ? `&monitor=${encodeURIComponent(selectedMonitor)}` : ''}`;
+  try { return standardSummary(await get(summaryPath, summaryHeaders)); }
+  catch (error) { if (![404, 405].includes(error.statusCode)) throw error; }
+  if (project.adapter === 'standard') return standardSummary(await get('/api/hub/summary', summaryHeaders));
   if (project.adapter === 'monitor') return readMonitor(project, credentials, get);
   if (project.adapter === 'aster') {
     const data = await get('/api/state?compact=true');

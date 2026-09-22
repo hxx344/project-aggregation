@@ -11,6 +11,45 @@ import { UpstreamError } from '../server/adapters.mjs';
 const password = 'test-password-not-a-real-secret';
 const summary = () => ({ updatedAt: new Date().toISOString(), metrics: [{ key: 'total', label: '总额', value: 42, unit: 'USD' }], message: '测试数据' });
 
+test('source health and stricter TTL survive checks, persistence and missing timestamps', async t => {
+  let value = { ...summary(), state: 'partial', staleAfterSeconds: 10, updatedAt: new Date(Date.now() - 11000).toISOString() };
+  const f = await fixture(t, { summaryReader: async () => value }); await f.login();
+  const old = await f.app.check('crossex'); assert.equal(old.state, 'stale'); assert.equal(old.staleAfterSeconds, 10);
+  value = { ...value, state: 'offline' }; assert.equal((await f.app.check('crossex')).state, 'offline');
+  value = { ...value, state: 'online', updatedAt: null }; assert.equal((await f.app.check('crossex')).state, 'stale');
+  value = { ...value, freshness: 'static' }; assert.equal((await f.app.check('asset')).state, 'online');
+  await f.reopen();
+  const projects = (await f.request('/api/overview')).data.projects;
+  assert.equal(projects.find(item => item.project.id === 'crossex').state, 'stale');
+  assert.equal(projects.find(item => item.project.id === 'asset').freshness, 'static');
+});
+
+test('authenticated overview stream publishes checks and config revocation, then closes on logout', async t => {
+  const f = await fixture(t); await f.login();
+  const url = f.origin + '/api/overview/events';
+  assert.equal((await fetch(url)).status, 401);
+  assert.equal((await fetch(url, { headers: { Cookie: f.cookie, Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await fetch(url, { headers: { Cookie: f.cookie, 'Sec-Fetch-Site': 'same-site' } })).status, 403);
+  const controller = new AbortController(); t.after(() => controller.abort());
+  const res = await fetch(url, { headers: { Cookie: f.cookie }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) });
+  assert.equal(res.status, 200); assert.match(res.headers.get('content-type'), /text\/event-stream/); assert.equal(res.headers.get('cache-control'), 'no-store');
+  const reader = res.body.getReader(); let buffered = '';
+  async function event() {
+    while (!buffered.includes('\n\n')) { const { value, done } = await reader.read(); if (done) return null; buffered += new TextDecoder().decode(value); }
+    const end = buffered.indexOf('\n\n'); const entry = buffered.slice(0, end); buffered = buffered.slice(end + 2);
+    return JSON.parse(entry.split('\n').find(line => line.startsWith('data: ')).slice(6));
+  }
+  const first = await event(); const revision = first.projects.find(item => item.project.id === 'crossex').project.revision;
+  await f.app.check('crossex'); const checked = await event(); assert.equal(checked.projects.find(item => item.project.id === 'crossex').metrics[0].value, 42);
+  await f.request('/api/projects/crossex', { method: 'PUT', body: { password: 'changed-test-password' } });
+  const revised = await event(); const next = revised.projects.find(item => item.project.id === 'crossex').project;
+  assert.notEqual(next.revision, revision); assert.equal(next.hasCredentials, true); assert.equal(next.password, undefined);
+  await f.request('/api/logout', { method: 'POST' });
+  // A config-triggered check can already be queued; logout must terminate the stream.
+  let last; for (let i = 0; i < 4; i++) { last = await event(); if (last === null) break; }
+  assert.equal(last, null);
+});
+
 async function fixture(t, options = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'project-hub-test-'));
   let app = await createApp({ dataDir, initialPassword: password, refreshInterval: 0, assetSyncIntervalMs: 0, summaryReader: async () => summary(), ...options });
@@ -27,7 +66,7 @@ async function fixture(t, options = {}) {
     return result;
   }
   t.after(async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); });
-  return { get app() { return app; }, get origin() { return origin; }, dataDir, request, login, async reopen(editDatabase) {
+  return { get app() { return app; }, get origin() { return origin; }, get cookie() { return cookie; }, dataDir, request, login, async reopen(editDatabase) {
     await app.close();
     if (editDatabase) {
       const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
@@ -63,7 +102,8 @@ test('CrossEx is the fourth proxy preset and its simulated balance stays in its 
   await f.login();
   const projects = (await f.request('/api/projects')).data.projects;
   assert.deepEqual(projects.map(project => project.id), ['aster', 'monitor', 'asset', 'crossex']);
-  assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false });
+  assert.match(projects[3].revision, /^[a-f0-9]{64}$/);
+  assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false, revision: projects[3].revision });
   const asset = await f.app.check('asset');
   const simulation = await f.app.check('crossex');
   assert.equal(requested.adapter, 'standard');

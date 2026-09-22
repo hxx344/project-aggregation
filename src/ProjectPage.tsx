@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { ExternalLink, FolderKanban, LoaderCircle, RefreshCw, Settings2 } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { Project } from './types';
+import { navigation } from './hub-state';
+import type { NavigationQuery } from './hub-state';
 
-export default function ProjectPage({ project, onEdit, onExpired }: { project: Project; onEdit: () => void; onExpired: () => void }) {
+export default function ProjectPage({ project, active, query, onEdit, onExpired, onReady, onChanged, onNavigate }: { project: Project; active: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onReady: (value: boolean) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
   const proxied = project.accessMode === 'proxy';
   const embedded = proxied || project.mode === 'embed';
   const accessible = project.enabled && !!(proxied ? project.apiUrl : project.url);
@@ -13,6 +15,42 @@ export default function ProjectPage({ project, onEdit, onExpired }: { project: P
   const [error, setError] = useState('');
   const [openingTab, setOpeningTab] = useState(false);
   const pendingTabs = useRef(new Map<AbortController, Window>());
+  const frame = useRef<HTMLIFrameElement>(null);
+  const connected = useRef(false);
+  const acknowledged = useRef(false);
+  const sentNavigation = useRef('');
+  const latest = useRef({ active, query, onReady, onChanged, onNavigate });
+  latest.current = { active, query, onReady, onChanged, onNavigate };
+  const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
+  function synchronize() {
+    if (!connected.current) return;
+    post({ type: 'activity', active: latest.current.active && document.visibilityState === 'visible' });
+    const next = latest.current.query;
+    const key = next === undefined ? '' : JSON.stringify(next);
+    if (!latest.current.active) { sentNavigation.current = ''; return; }
+    if (next !== undefined && key !== sentNavigation.current) { sentNavigation.current = key; post({ type: 'navigate', projectId: project.id, query: next }); }
+  }
+  useEffect(() => {
+    if (!proxied || !source) return;
+    const origin = new URL(source.url).origin;
+    function message(event: MessageEvent) {
+      if (event.origin !== origin || event.source !== frame.current?.contentWindow) return;
+      const data = event.data;
+      if (!data || typeof data !== 'object' || Array.isArray(data) || data.channel !== 'project-hub' || data.version !== 1) return;
+      if (data.type === 'ready' && data.role === 'module') {
+        if (!acknowledged.current) { acknowledged.current = true; post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] }); }
+        if (!Array.isArray(data.capabilities) || !data.capabilities.includes('activity')) return;
+        connected.current = true; latest.current.onReady(true);
+        synchronize();
+      } else if (connected.current && data.type === 'changed' && data.scope === 'summary') latest.current.onChanged();
+      else if (connected.current && latest.current.active && document.visibilityState === 'visible' && data.type === 'navigate') {
+        const target = navigation(data); if (target) latest.current.onNavigate(target.projectId, target.query);
+      }
+    }
+    window.addEventListener('message', message); document.addEventListener('visibilitychange', synchronize);
+    return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
+  }, [proxied, source]);
+  useEffect(synchronize, [active, query, source]);
 
   useEffect(() => {
     const pending = pendingTabs.current;
@@ -22,6 +60,7 @@ export default function ProjectPage({ project, onEdit, onExpired }: { project: P
   useEffect(() => {
     if (!accessible || !embedded) return;
     const controller = new AbortController();
+    connected.current = false; acknowledged.current = false; sentNavigation.current = ''; latest.current.onReady(false);
     setSource(null); setError(''); setLoading(true);
     const request = proxied
       ? api<{ url: string }>(`/api/projects/${encodeURIComponent(project.id)}/launch`, { method: 'POST', signal: controller.signal })
@@ -62,7 +101,7 @@ export default function ProjectPage({ project, onEdit, onExpired }: { project: P
     }
   }
 
-  return <section className="project-screen" aria-label={project.name}>
+  return <section className="project-screen" hidden={!active} aria-label={project.name}>
     <h1 className="visually-hidden">{project.name}</h1>
     <div className="original-page-toolbar">
       <span className="original-page-loading" role="status">{loading ? <><LoaderCircle size={15} className="spin" />正在打开项目…</> : null}</span>
@@ -75,7 +114,7 @@ export default function ProjectPage({ project, onEdit, onExpired }: { project: P
     {error ? <div className="error-box original-page-error" role="alert">{error}</div> : null}
     {!accessible ? <div className="empty-state original-page-placeholder"><FolderKanban size={32} /><h2>{project.enabled ? '请先设置项目地址' : '项目已停用'}</h2><p>{project.enabled ? '保存连接设置后，即可在这里打开原始页面。' : '在连接设置中启用后，可继续访问原始页面。'}</p><button className="button secondary" onClick={onEdit}>连接设置</button></div>
       : !embedded ? <div className="empty-state original-page-placeholder"><ExternalLink size={32} /><h2>{project.name}</h2><p>此项目设为在新窗口打开。</p><button className="button primary" disabled={openingTab} onClick={() => void openInTab()}>打开原始页面</button></div>
-        : source ? <iframe key={`${source.attempt}:${source.url}`} className="original-project-frame" title={project.name + '原始页面'} src={source.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" onLoad={() => setLoading(false)} />
+        : source ? <iframe ref={frame} key={`${source.attempt}:${source.url}`} className="original-project-frame" title={project.name + '原始页面'} src={source.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" onLoad={() => { setLoading(false); connected.current = false; acknowledged.current = false; sentNavigation.current = ''; latest.current.onReady(false); post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] }); }} />
           : <div className="empty-state original-page-placeholder">{loading ? <LoaderCircle size={28} className="spin" /> : <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>重新载入</button>}</div>}
   </section>;
 }

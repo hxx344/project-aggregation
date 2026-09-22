@@ -19,13 +19,23 @@
 
 ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
 
-样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。**仅更新工作台不会更新三个原项目的界面**。已在同一台服务器部署这四个服务时，可运行以下一条命令依次调用各自现有安装器升级：
+样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。**仅更新工作台不会更新四个模块**。已在同一台服务器部署这些服务时，可运行以下一条命令依次调用各自现有安装器升级：
 
 ```bash
-sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in aster_5x/main/install-trading.sh market-spread-monitor/main/deploy/install.sh asset-ledger/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
+sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in aster_5x/main/install-trading.sh market-spread-monitor/main/deploy/install.sh asset-ledger/main/install.sh gate-crossex-arbitrage/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
 ```
 
 各安装器沿用已有配置、密码和数据，按原有增量规则决定是否构建和重启；某一步失败即停止后续升级，修复后可重复执行。完成后重新载入工作台中的项目，仍只需转发 `3100`。后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+
+## 性能与模块联动
+
+升级四个模块后，工作台优先读取轻量摘要：ASTER 使用已发布快照和报告缓存，Asset 读取当前资产与最近 90 个北京时间日期的趋势，Monitor / CrossEx 使用已有行情状态。只有接口不存在（404/405）才回退旧接口；登录失败或无效响应不会触发更重的读取。
+
+工作台通过 SSE 推送摘要，连接中断时每 30 秒补查；行情按源时间本地判断过期，采用模块与工作台阈值中较短者。CrossEx 的 10 秒阈值不会被工作台默认 120 秒覆盖。摘要读取按来源时限调整频率，最快每秒、最慢每 30 秒；资产同步仍独立每分钟运行。
+
+切换项目最多保留两个已确认支持活动状态协议的页面，保留筛选和滚动位置；离开或隐藏工作台时暂停这些页面的前台网络刷新，恢复时立即补查。交易引擎、行情采集和服务器资产同步继续运行。未升级的模块按原方式重新打开；修改连接配置、凭据或停用项目会撤销旧页面。
+
+Monitor 与 CrossEx 可以携带币种、做多和做空交易所跳转定位；ASTER 提供到账本的入口，不根据钱包地址猜测对应资产账户。联动只调整查看条件。代理仅缓存上游明确标记为公开且不可变、带构建哈希的 JS/CSS；页面、接口及携带会话的响应继续不缓存。
 
 ## 接入 Gate CrossEx 模拟模块
 
@@ -130,7 +140,7 @@ Asset 后台同步可在项目设置中开关。启用、项目未停用且已�
 2. 需要摘要：选择 `standard`，让新项目实现 `GET /api/hub/summary`。可选 HTTP Basic 认证，填写用户名与密码；页面默认 `direct`。改为 `proxy` 后，工作台会用该接口验证保存的 Basic 凭据，再自动认证页面请求。
 3. 旧系统接口不符合标准：在 `server/adapters.mjs` 增加适配器，同时更新前后端允许的适配器列表，并补充行为测试。
 
-标准接口 `schemaVersion: 1` 的示例与字段约束见 [扩展协议](docs/integration.md)。当前最多接入 30 个项目，单个摘要最多 24 个指标、366 个趋势点。接入配置保存在本机数据库里，重启或升级后保留。
+标准接口 `schemaVersion: 2` 的健康状态、时间约束及旧版兼容方式见 [扩展协议](docs/integration.md)。当前最多接入 30 个项目，单个摘要最多 24 个指标、366 个趋势点。接入配置保存在本机数据库里，重启或升级后保留。
 
 ## 维护、配置和恢复
 

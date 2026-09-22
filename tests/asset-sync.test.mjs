@@ -127,7 +127,7 @@ test('summary and sync share one login and only sync invokes POST /api/sync with
     if (route === '/api/login') { await new Promise(resolve => { finishLogin = resolve; }); return { data: { ok: true }, cookies: ['asset_session=shared-cookie; Path=/'] }; }
     return { data: ledger() };
   };
-  const read = readSummary(project, credentials, { request });
+  const read = readLegacySummary(project, credentials, { request });
   const sync = syncAsset(project, credentials, { request });
   await until(() => !!finishLogin);
   assert.equal(calls.filter(call => call.route === '/api/login').length, 1);
@@ -170,7 +170,7 @@ test('a short summary deadline does not cancel a shared login still needed by th
     }
     return { data: ledger() };
   };
-  const read = readSummary(project, credentials, { request, deadline: Date.now() + 30 });
+  const read = readLegacySummary(project, credentials, { request, deadline: Date.now() + 30 });
   const rejected = assert.rejects(read, error => error.code === 'timeout');
   const sync = syncAsset(project, credentials, { request, deadline: Date.now() + 500 });
   await until(() => !!release); await rejected;
@@ -202,3 +202,11 @@ test('canceling all login waiters aborts the login and does not cache its reject
   await assert.rejects(syncAsset(project, null, { request: async () => { sent = true; } }));
   assert.equal(sent, false);
 });
+
+// Model an unupgraded module explicitly: only a missing summary route permits fallback.
+function readLegacySummary(project, credentials, options) {
+  return readSummary(project, credentials, { ...options, request: (...args) => {
+    if (args[1] === '/api/hub/summary?schemaVersion=2') throw new UpstreamError('offline', 'Not found', 404);
+    return options.request(...args);
+  } });
+}
