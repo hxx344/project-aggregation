@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { standardSummary, readSummary, UpstreamError } from '../server/adapters.mjs';
 import { cachePolicy } from '../server/static-cache.mjs';
-import { ageSnapshot, retainedProjects, projectKey, navigation } from '../src/hub-state.ts';
+import { ageSnapshot, navigation } from '../src/hub-state.ts';
 import { checkNotice } from '../src/check-notice.ts';
 
 const project = { id: 'crossex', enabled: true, adapter: 'standard', apiUrl: 'http://127.0.0.1:3200', staleAfterSeconds: 120, revision: 'one' };
@@ -54,12 +54,6 @@ test('lightweight Monitor summary preserves the configured module and Basic auth
   await readSummary({ ...project, adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=hynix' }, { username: 'reader', password: 'test-value' }, { request: async (_base, route, options) => { requested = { route, headers: options.headers }; return { data: summary() }; } });
   assert.equal(requested.route, '/api/hub/summary?schemaVersion=2&monitor=hynix');
   assert.equal(requested.headers.Authorization, 'Basic ' + Buffer.from('reader:test-value').toString('base64'));
-});
-test('only two compatible frames survive and edits/removal revoke retained pages', () => {
-  const projects = ['a','b','c'].map(id => ({ ...project, id })); const keys = projects.map(projectKey);
-  assert.deepEqual(retainedProjects(keys, projects, 'c', new Set(keys)), [keys[2], keys[0]]);
-  assert.deepEqual(retainedProjects(keys, projects, null, new Set([keys[1]])), [keys[1]]);
-  assert.deepEqual(retainedProjects(keys, [{ ...projects[0], revision: 'two' }, { ...projects[1], enabled: false }], null, new Set(keys)), []);
 });
 test('cross-module navigation accepts only known targets and bounded view filters', () => {
   assert.deepEqual(navigation({ projectId: 'crossex', query: { symbol: 'BTC', longExchange: 'binance', shortExchange: 'bybit' } }).query.symbol, 'BTC');

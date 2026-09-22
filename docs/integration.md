@@ -135,12 +135,18 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 ## 页面活动与查看条件联动
 
-工作台最多保留两个确认支持 `activity` 的代理 iframe。未确认能力的旧页面切换时卸载；项目配置或凭据 revision 改变时立即重新授权。页面隐藏、离线或 host `active=false` 时停止前台刷新并取消在途读取，恢复后立即补查；不停止任何后台交易、采集或同步任务。
+工作台最多保留四个确认支持 `activity` 的代理 iframe，按插入顺序保持 DOM 稳定，切换项目不移动已有 iframe。登录并取得项目配置后，可见且联网持续 200 ms 即开始依次预加载四个内置模块；只接受已启用、配置了 `apiUrl` 且 ID 与适配器匹配的代理接入（`aster/aster`、`monitor/monitor`、`asset/asset`、`crossex/standard`）。直接接入和自定义模块仍由点击打开。
+
+后台一次准备一个模块，点击选择的项目立即打开；快速切换时最多保留当前项目和一个后台项目的未完成加载。悬停或键盘聚焦只调整尚未开始的队列顺序。每个 revision 自动尝试一次，失败、超时或文档加载后 3 秒仍未确认 `activity` 的隐藏页面会卸载并释放队列，用户点击可重新尝试；不循环签发 launch。首次授权仍在创建 iframe 后立即消费原有一次性 ticket，不缓存 ticket 或改变授权有效期。退出登录卸载全部页面；项目配置或凭据 revision 改变时撤销旧页面并重新授权，停用或移除项目会清理相应预加载。
+
+四个内置模块在代理 iframe 中默认 inactive，先准备界面与脚本，收到宿主 activity 后才开始前台数据读取。页面隐藏、离线或 host `active=false` 时停止前台刷新并取消在途读取，恢复后立即补查；不停止任何后台交易、采集或同步任务。预加载不延长行情有效期，也不保证刚登录后立即点击的模块已经加载完成。
 
 消息统一使用 `{channel:"project-hub", version:1, type:...}`。工作台发 `ready`（`role:"host"`），模块确认 `ready`（`role:"module", capabilities:["activity","navigate","changed"]`）。模块可以先发无能力的 `ready` 探测，工作台回握手后才确认能力。`activity` 携带布尔 `active`；实际写入成功后可发 `changed, scope:"summary"`，工作台合并短时间重复通知，只刷新相应项目。
+
+模块确认可以早于或晚于 iframe `load`。每次文档 `load` 都重新探测能力，防止内部刷新或跳转至登录页后沿用旧文档状态；新文档提前发送的无能力探针也能在 load 前重新握手。能力确认不会无限触发 ready 往返。
 
 `navigate` 携带 `projectId` 和 `query`。目标限 `monitor`、`crossex`、`aster`、`asset`；前两者只接受 `symbol`（1–40 位大写字母、数字、点、下划线、短横线）、`longExchange`、`shortExchange`（binance/bybit/okx/gate/kraken/hyperliquid/lighter）。ASTER 和 Asset 只接受空条件。导航只改变查看状态，不触发交易、导入或保存。
 
 双方校验精确 `origin`、`event.source` 与消息结构，不使用 `*`。模块仅在 `p-<24位十六进制>.hub.localhost` 代理 iframe 内建立桥，父来源为同协议、同端口的 `hub.localhost`；独立打开不启用桥。工作台只接受当前可见、已完成握手的页面发起导航，目标也必须启用代理。
 
-`GET /api/overview/events` 受工作台登录会话保护，每次推送重新验证会话；退出登录或改密码关闭订阅。每个会话最多 12 条订阅，全局 60 条，慢客户端断开重连。前端在隐藏/离线时关闭订阅，正常可见时接收推送与 15 秒心跳，订阅断开才使用 30 秒补查；卡片每秒按服务端时间基准更新过期状态。
+`GET /api/overview/events` 受工作台登录会话保护，每次推送重新验证会话；退出登录或改密码关闭订阅。每个会话最多 12 条订阅，全局 60 条，慢客户端断开重连。前端在隐藏/离线时关闭订阅，正常可见时接收推送与 15 秒心跳，订阅断开才使用 30 秒补查；卡片按下一次来源过期时刻定时更新，不每秒重绘整个总览。

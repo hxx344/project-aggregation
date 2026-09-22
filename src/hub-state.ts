@@ -36,9 +36,41 @@ export function nextSnapshotExpiry(snapshots: Snapshot[], now: number): number |
   }
   return Number.isFinite(next) ? next : null;
 }
-export function retainedProjects(previous: string[], projects: Project[], activeId: string | null, ready: ReadonlySet<string>) {
-  const available = new Map(projects.filter(p => p.enabled).map(p => [projectKey(p), p]));
-  const active = projects.find(p => p.id === activeId);
-  const key = active ? projectKey(active) : null;
-  return [...(key ? [key] : []), ...previous.filter(item => item !== key && ready.has(item) && available.has(item))].slice(0, 2);
+export type FramePhase = 'loading' | 'ready' | 'failed' | 'unsupported';
+export type WorkspacePlan = { frames: { key: string; phase: FramePhase }[]; attempted: string[]; recent: string[] };
+export const emptyWorkspacePlan = (): WorkspacePlan => ({ frames: [], attempted: [], recent: [] });
+export function canPreload(project: Project) {
+  const adapters: Record<string, string> = { aster: 'aster', monitor: 'monitor', asset: 'asset', crossex: 'standard' };
+  return project.enabled && project.accessMode === 'proxy' && !!project.apiUrl && adapters[project.id] === project.adapter;
+}
+export function planWorkspace(previous: WorkspacePlan, projects: Project[], activeId: string | null, priorityId: string | null, allowPreload: boolean): WorkspacePlan {
+  const live = new Map(projects.map(project => [projectKey(project), project]));
+  const active = projects.find(project => project.id === activeId);
+  const activeKey = active ? projectKey(active) : null;
+  const attempted = new Set(previous.attempted.filter(key => live.has(key)));
+  const recent = [...(activeKey ? [activeKey] : []), ...previous.recent.filter(key => key !== activeKey && live.has(key))];
+  // Preserve insertion order: moving an iframe DOM node can reload its document.
+  let frames = previous.frames.filter(frame => {
+    const project = live.get(frame.key);
+    return project && (frame.key === activeKey || (project.enabled && (frame.phase === 'ready' || (frame.phase === 'loading' && canPreload(project)))));
+  });
+  if (activeKey && !frames.some(frame => frame.key === activeKey)) {
+    frames.push({ key: activeKey, phase: 'loading' }); attempted.add(activeKey);
+  }
+  // Rapid clicks may leave one old load in the background, never an unbounded queue.
+  const pending = frames.filter(frame => frame.key !== activeKey && frame.phase === 'loading');
+  const retainedPending = recent.map(key => pending.find(frame => frame.key === key)).find(Boolean) ?? pending[0];
+  frames = frames.filter(frame => frame.phase !== 'loading' || frame.key === activeKey || frame === retainedPending);
+  while (frames.length > 4) {
+    const candidates = frames.filter(frame => frame.key !== activeKey);
+    const oldest = candidates.reduce((a, b) => (recent.indexOf(a.key) < 0 ? Infinity : recent.indexOf(a.key)) >= (recent.indexOf(b.key) < 0 ? Infinity : recent.indexOf(b.key)) ? a : b);
+    frames = frames.filter(frame => frame !== oldest);
+  }
+  if (allowPreload && frames.length < 4 && !frames.some(frame => frame.phase === 'loading')) {
+    const candidates = projects.filter(project => canPreload(project) && !attempted.has(projectKey(project)) && !frames.some(frame => frame.key === projectKey(project)));
+    const next = candidates.find(project => project.id === priorityId) ?? candidates[0];
+    if (next) { const key = projectKey(next); frames.push({ key, phase: 'loading' }); attempted.add(key); }
+  }
+  const result = { frames, attempted: [...attempted], recent };
+  return JSON.stringify(result) === JSON.stringify(previous) ? previous : result;
 }
