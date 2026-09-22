@@ -26,14 +26,14 @@ ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶
 在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
 
 ```bash
-sudo bash -c 'set -e; if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then apt-get update -qq; apt-get install -y --no-install-recommends curl ca-certificates; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fsSL --retry 3 https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh -o "$f"; bash "$f"'
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash
 ```
 
-支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，使用 systemd。脚本合并安装缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
+支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，使用 systemd。下载命令需要系统已有 curl 和 CA 证书；极简新系统若缺少它们，先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`，以后无需重复。脚本合并安装其他缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
 
 部署时实时显示进度，每个项目完成后显示耗时，最后汇总结果。完整日志保存在 `/var/log/project-aggregation-stack/`，仅 root 可读。某个项目失败立即停止后续部署，保留之前成功的项目；修复原因后重跑同一命令即可。重跑仍检查每个项目，不会因历史成功记录而漏掉配置修改或服务停止。
 
-只更新部分项目时，在命令末尾将 `bash "$f"` 改为 `bash "$f" --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
+只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
 
 部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
 
