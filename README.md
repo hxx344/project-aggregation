@@ -15,6 +15,18 @@
 
 工作台的自动任务不会下单、启停策略或转账；Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
 
+## 三个项目的统一界面
+
+ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
+
+样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。**仅更新工作台不会更新三个原项目的界面**。已在同一台服务器部署这四个服务时，可运行以下一条命令依次调用各自现有安装器升级：
+
+```bash
+sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in aster_5x/main/install-trading.sh market-spread-monitor/main/deploy/install.sh asset-ledger/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
+```
+
+各安装器沿用已有配置、密码和数据，按原有增量规则决定是否构建和重启；某一步失败即停止后续升级，修复后可重复执行。完成后重新载入工作台中的项目，仍只需转发 `3100`。后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+
 ## 在现有 Linux 服务器安装
 
 适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。三个旧项目继续使用原来的端口。以下同一条命令用于首次安装和后续更新：
