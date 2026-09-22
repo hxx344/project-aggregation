@@ -35,14 +35,19 @@ jobs:
       - run: npm run build
   installer:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Check installer syntax
         run: |
           bash -n install.sh
+          bash -n install-all.sh
+          bash -n deploy/test-all.sh
           bash -n deploy/test-install.sh
           bash -n deploy/test-environment.sh
       - name: Check configuration, atomic activation, cleanup boundaries, and rollback
         run: bash deploy/test-install.sh
       - name: Verify failed configuration changes restore the previous port
         run: bash deploy/test-environment.sh
+      - name: Check stack caching, dependency batching, failure recovery and signals
+        run: sudo bash deploy/test-all.sh

@@ -11,7 +11,7 @@
 - 接入管理：新增、编辑、停用、删除项目，配置页面访问方式、接口地址、适配器、Asset 后台同步和数据过期阈值。
 - 工作台后端按来源时限读取已启用项目的现有数据（最多间隔 30 秒）；启用 Asset 后台同步时，每 60 秒调用原项目的同步接口。浏览器关闭后仍会执行。
 - 独立的工作台密码登录、服务器端会话和本地 SQLite 持久化。
-- 增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
+- 四个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
 
 工作台的自动任务不会下单、启停策略或转账；Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
 
@@ -19,13 +19,23 @@
 
 ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
 
-样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。**仅更新工作台不会更新四个模块**。已在同一台服务器部署这些服务时，可运行以下一条命令依次调用各自现有安装器升级：
+样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。使用下方总部署命令可同时安装或升级四个模块与平台；后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+
+## 一键部署四个模块与平台
+
+在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
 
 ```bash
-sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in aster_5x/main/install-trading.sh market-spread-monitor/main/deploy/install.sh asset-ledger/main/install.sh gate-crossex-arbitrage/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
+sudo bash -c 'set -e; if ! command -v curl >/dev/null || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then apt-get update -qq; apt-get install -y --no-install-recommends curl ca-certificates; fi; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; curl -fsSL --retry 3 https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh -o "$f"; bash "$f"'
 ```
 
-各安装器沿用已有配置、密码和数据，按原有增量规则决定是否构建和重启；某一步失败即停止后续升级，修复后可重复执行。完成后重新载入工作台中的项目，仍只需转发 `3100`。后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，使用 systemd。脚本合并安装缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
+
+部署时实时显示进度，每个项目完成后显示耗时，最后汇总结果。完整日志保存在 `/var/log/project-aggregation-stack/`，仅 root 可读。某个项目失败立即停止后续部署，保留之前成功的项目；修复原因后重跑同一命令即可。重跑仍检查每个项目，不会因历史成功记录而漏掉配置修改或服务停止。
+
+只更新部分项目时，在命令末尾将 `bash "$f"` 改为 `bash "$f" --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
+
+部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
 
 ## 性能与模块联动
 
@@ -39,13 +49,7 @@ Monitor 与 CrossEx 可以携带币种、做多和做空交易所跳转定位；
 
 ## 接入 Gate CrossEx 模拟模块
 
-Gate CrossEx 独立部署，第一版用于同币种跨交易所永续价差套利模拟，与 Market Monitor 的价差发现配合使用，不执行实盘下单。以下一条命令依次更新 Monitor、安装或更新 CrossEx、更新工作台，复用各仓库现有安装器：
-
-```bash
-sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in market-spread-monitor/main/deploy/install.sh gate-crossex-arbitrage/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
-```
-
-各安装器保留已有配置与数据；无变化时按各自规则跳过重复安装、构建和重启。某一步失败会停止，修复后可重复执行。
+Gate CrossEx 独立运行，第一版用于同币种跨交易所永续价差套利模拟，与 Market Monitor 的价差发现配合使用，不执行实盘下单。上方总部署入口已包含 CrossEx；也可用 `--only monitor,crossex,hub` 只处理这三个项目。
 
 工作台升级后会一次性补充 `Gate CrossEx` 入口，默认通过代理访问服务器 `127.0.0.1:3200`。在“项目管理 → Gate CrossEx”填写用户名 `admin` 和 **CrossEx 自己的网页登录密码**，该密码与工作台密码独立，首次启动时记录在 `gate-crossex-arbitrage` 服务日志中。保存后点击左侧入口即可自动登录，仍只需转发工作台的 `3100`。
 
@@ -57,9 +61,9 @@ Monitor 数据源地址及其 Basic 凭据在 **CrossEx 页面**配置；同机�
 
 升级保留全部已有项目配置；若已有 `crossex` 标识，不会覆盖。手动删除入口后重启不会重新添加。首次升级时已满 30 个项目则跳过自动添加并记为已处理；腾出名额后可手动添加 `standard` 项目，使用 `proxy`、端口 `3200`、过期阈值 `120` 秒。
 
-## 在现有 Linux 服务器安装
+## 单独安装或更新工作台
 
-适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。三个旧项目继续使用原来的端口。以下同一条命令用于首次安装和后续更新：
+适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。这一入口仅部署工作台，四个模块继续使用原来的端口。需要一起安装或升级时使用上方总部署命令。以下同一条命令用于工作台的首次安装和后续更新：
 
 ```bash
 sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install.sh -o "$f"; bash "$f"; rm -f "$f"'
