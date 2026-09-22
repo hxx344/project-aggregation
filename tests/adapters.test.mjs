@@ -49,6 +49,37 @@ test('aster adapter uses snapshot timestamps, leaves missing values null and rep
   assert.equal(result.updatedAt, new Date(1600000000000).toISOString()); assert.equal(result.metrics.find(item => item.key === 'occupied_margin').unit, 'USD1'); assert.equal(result.metrics.find(item => item.key === 'daily_volume').value, null);
 });
 
+test('legacy ASTER describes each missing source and report failure without extra requests', async () => {
+  const utcDate = new Date().toISOString().slice(0, 10);
+  const healthy = { name: '账户 A', enabled: true, mode: 'live', snapshot: { timestamp: Date.now() / 1000, occupied_margin: '12.3' }, cycle_state: { daily_volume: { utc_date: utcDate, volume: '42' }, report_status: { status: 'ready' } } };
+  const read = async data => {
+    const calls = [];
+    const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async (_base, route) => { calls.push(route); return { data }; } });
+    assert.deepEqual(calls, ['/api/state?compact=true']); return result;
+  };
+  assert.equal((await read({ ready: true, accounts: [healthy] })).partial, false);
+  const cases = [
+    [{ ...healthy, snapshot: null }, /账户 A：缺少账户快照/],
+    [{ ...healthy, snapshot: { timestamp: null, occupied_margin: null } }, /账户 A：快照缺少有效更新时间.*账户 A：保证金数据缺失或无效/],
+    [{ ...healthy, cycle_state: {} }, /账户 A：成交统计尚未就绪/],
+    [{ ...healthy, cycle_state: { report_status: { status: 'error', error: '统计缓存读取失败' } } }, /账户 A：成交统计读取失败：统计缓存读取失败/],
+    [{ ...healthy, cycle_state: { report_status: { status: 'stale' } } }, /账户 A：成交统计已过期/],
+    [{ ...healthy, cycle_state: { ...healthy.cycle_state, daily_volume: { utc_date: '2000-01-01', volume: 42 } } }, /账户 A：成交统计缺少当日 UTC 数据/],
+    [{ ...healthy, cycle_state: { ...healthy.cycle_state, daily_volume: { utc_date: utcDate, volume: null } } }, /账户 A：今日成交量缺失或无效/],
+  ];
+  for (const [account, expected] of cases) {
+    const result = await read({ ready: true, accounts: [account] }); assert.equal(result.partial, true); assert.match(result.message, expected);
+  }
+  const failed = await read({ ready: false, error: '交易规则加载失败', accounts: [healthy] });
+  assert.match(failed.message, /交易服务异常：交易规则加载失败.*交易服务尚未就绪/);
+  const noLive = await read({ ready: true, accounts: [{ ...healthy, enabled: false, snapshot: null }, { ...healthy, mode: 'paper', snapshot: null }] });
+  assert.equal(noLive.partial, false); assert.equal(noLive.metrics.find(item => item.key === 'occupied_margin').value, null);
+  const many = await read({ ready: true, accounts: Array.from({ length: 200 }, (_, i) => ({ ...healthy, name: `账户 ${i}`, snapshot: null })) });
+  assert.ok(many.message.length <= 500); assert.match(many.message, /另有 \d+ 项异常/);
+  const objectError = await read({ ready: false, error: { secret: 'never-serialize' }, accounts: [] });
+  assert.match(objectError.message, /上游未提供具体原因/); assert.ok(!objectError.message.includes('never-serialize'));
+});
+
 test('monitor reads Basic auth and selected module, marks upstream snapshots stale', async () => {
   let authorization;
   const result = await readLegacySummary({ adapter: 'monitor', apiUrl: 'http://127.0.0.1:3000', url: 'http://127.0.0.1:3000/?monitor=oil' }, { username: 'reader', password: 'mock-pass' }, { request: async (_base, route, options) => {

@@ -11,6 +11,16 @@ import { UpstreamError } from '../server/adapters.mjs';
 const password = 'test-password-not-a-real-secret';
 const summary = () => ({ updatedAt: new Date().toISOString(), metrics: [{ key: 'total', label: '总额', value: 42, unit: 'USD' }], message: '测试数据' });
 
+test('partial diagnostics survive the check endpoint, overview refresh and restart', async t => {
+  const message = '测试账户（account-a）：成交统计已过期（超过 15 秒）';
+  const f = await fixture(t, { summaryReader: async () => ({ ...summary(), state: 'partial', message }) }); await f.login();
+  const checked = await f.request('/api/projects/aster/check', { method: 'POST' });
+  assert.equal(checked.data.snapshot.state, 'partial'); assert.equal(checked.data.snapshot.message, message);
+  await f.reopen();
+  const snapshot = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'aster');
+  assert.equal(snapshot.state, 'partial'); assert.equal(snapshot.message, message);
+});
+
 test('source health and stricter TTL survive checks, persistence and missing timestamps', async t => {
   let value = { ...summary(), state: 'partial', staleAfterSeconds: 10, updatedAt: new Date(Date.now() - 11000).toISOString() };
   const f = await fixture(t, { summaryReader: async () => value }); await f.login();

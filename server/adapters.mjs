@@ -89,6 +89,15 @@ const oldest = values => values.length > 0 && values.every(Boolean) ? [...values
 const strictDate = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT/.test(value) && iso(value) ? iso(value) : null;
 const sum = values => values.length && values.every(value => value !== null) ? values.reduce((a, b) => a + b, 0) : null;
 const metric = (key, label, value, unit, detail) => ({ key, label, value, ...(unit ? { unit } : {}), ...(detail ? { detail } : {}) });
+const diagnosticText = (value, fallback) => typeof value === 'string' && value.trim() ? value.trim().slice(0, 120) : fallback;
+function diagnosticMessage(base, reasons) {
+  let message = base;
+  for (const [index, reason] of reasons.entries()) {
+    if (message.length + reason.length + 40 > 500) return `${message}；另有 ${reasons.length - index} 项异常，请进入项目查看`;
+    message += `；${reason}`;
+  }
+  return message;
+}
 
 export function standardSummary(raw) {
   if (!raw || ![1, 2].includes(raw.schemaVersion) || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data) || Object.keys(raw).some(key => !['schemaVersion', 'data'].includes(key))) throw new UpstreamError('invalid', '标准协议版本或顶层字段不正确');
@@ -202,7 +211,29 @@ export async function readSummary(project, credentials, { request = requestJson,
     const utcDay = new Date().toISOString().slice(0, 10);
     const volumes = live.map(account => account.cycle_state?.daily_volume?.utc_date === utcDay && account.cycle_state?.report_status?.status === 'ready' ? finite(account.cycle_state.daily_volume.volume) : null);
     const metrics = [metric('accounts', '启用账户', accounts.length, '个'), metric('live_accounts', '实盘账户', live.length, '个'), metric('occupied_margin', '实盘占用保证金', sum(live.map(account => finite(account.snapshot?.occupied_margin))), 'USD1'), metric('daily_volume', '实盘今日成交量', sum(volumes), 'USD1', '上游 UTC 日口径；不计入资产汇总')];
-    return { metrics, updatedAt, partial: !!data.error || !data.ready || live.some(account => !account.snapshot) || volumes.some(value => value === null), message: data.demo ? '上游为演示模式；交易数据不计入资产汇总' : '交易服务已连接；保证金与成交量使用 USD1 口径' };
+    const reasons = [];
+    if (data.error) reasons.push(`交易服务异常：${diagnosticText(data.error, '上游未提供具体原因')}`);
+    if (!data.ready) reasons.push('交易服务尚未就绪');
+    for (const [index, account] of live.entries()) {
+      const label = diagnosticText(account.name || account.id, `实盘账户 ${index + 1}`);
+      if (!account.snapshot) reasons.push(`${label}：缺少账户快照`);
+      else {
+        if (!iso(account.snapshot.timestamp)) reasons.push(`${label}：快照缺少有效更新时间`);
+        if (finite(account.snapshot.occupied_margin) === null) reasons.push(`${label}：保证金数据缺失或无效`);
+      }
+      if (volumes[index] === null) {
+        const report = account.cycle_state?.report_status;
+        const daily = account.cycle_state?.daily_volume;
+        const reason = report?.error ? `成交统计读取失败：${diagnosticText(report.error, '上游未提供具体原因')}`
+          : report?.status === 'stale' ? '成交统计已过期'
+          : report?.status === 'error' ? '成交统计读取失败，上游未提供具体原因'
+          : report?.status !== 'ready' ? '成交统计尚未就绪'
+          : daily?.utc_date !== utcDay ? '成交统计缺少当日 UTC 数据'
+          : '今日成交量缺失或无效';
+        reasons.push(`${label}：${reason}`);
+      }
+    }
+    return { metrics, updatedAt, partial: reasons.length > 0, message: diagnosticMessage(data.demo ? '上游为演示模式；交易数据不计入资产汇总' : '保证金与成交量使用 USD1 口径', reasons) };
   }
   const data = await get('/api/ledger');
   if (!data || !Array.isArray(data.assets) || data.assets.length > 1000 || !Array.isArray(data.history)) throw new UpstreamError('invalid', '资产项目响应格式不正确');

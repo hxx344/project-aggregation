@@ -1,9 +1,11 @@
 import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { Activity, ArrowUpRight, Check, ChevronRight, CircleAlert, FolderKanban, Gauge, LayoutDashboard, LoaderCircle, LogOut, Menu, Plus, RefreshCw, Save, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
+import { Activity, ArrowUpRight, Check, ChevronRight, CircleAlert, FolderKanban, Gauge, Info, LayoutDashboard, LoaderCircle, LogOut, Menu, Plus, RefreshCw, Save, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
 import { api, ApiError, setCsrfToken } from './api';
 import ProjectWorkspace from './ProjectWorkspace';
 import { ageSnapshot, navigationQuery } from './hub-state';
+import { checkNotice, statusText } from './check-notice';
+import type { Notice } from './check-notice';
 import type { NavigationQuery } from './hub-state';
 import type { Adapter, Category, Metric, Overview, Project, ProjectInput, Snapshot } from './types';
 
@@ -17,7 +19,6 @@ class ChartBoundary extends Component<{ children: ReactNode }, { failed: boolean
 }
 const categories: Record<Category, string> = { trading: '交易执行', monitoring: '市场监控', assets: '资产管理', other: '其他项目' };
 const adapters: Record<Adapter, string> = { aster: 'Aster 交易工作台', monitor: 'Market Monitor', asset: '资产账本', standard: '标准概览接口', link: '仅网页入口' };
-const statusText: Record<Snapshot['state'], string> = { unconfigured: '待配置', online: '已连接', stale: '数据过期', offline: '连接中断', unauthorized: '需要登录', disabled: '已停用', partial: '部分数据异常' };
 type Route = { view: 'overview' | 'projects' | 'project'; id: string; query?: NavigationQuery };
 
 function readRoute(): Route {
@@ -64,7 +65,7 @@ export default function App() {
   const [route, setRoute] = useState<Route>(readRoute);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [loading, setLoading] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [editor, setEditor] = useState<Project | 'new' | null>(null);
@@ -90,7 +91,7 @@ export default function App() {
     document.addEventListener('keydown', onKey); return () => document.removeEventListener('keydown', onKey);
   }, [menuOpen]);
 
-  const expire = useCallback(() => { requestVersion.current++; setAuthenticated(false); setOverview(null); setEditor(null); setCsrfToken(''); }, []);
+  const expire = useCallback(() => { requestVersion.current++; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, []);
   useEffect(() => {
     const controller = new AbortController();
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
@@ -134,7 +135,7 @@ export default function App() {
     return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearInterval(clock); document.removeEventListener('visibilitychange', connect); window.removeEventListener('online', connect); window.removeEventListener('offline', connect); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
   }, [authenticated, accept, load]);
   useEffect(() => { const change = () => setRoute(readRoute()); window.addEventListener('popstate', change); return () => window.removeEventListener('popstate', change); }, []);
-  useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 5000); return () => clearTimeout(timer); }, [notice]);
+  useEffect(() => { if (!notice || notice.tone === 'warning' || notice.tone === 'error') return; const timer = window.setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }, [notice]);
   const navigate = (next: Route) => {
     const params = new URLSearchParams(); if (next.view !== 'overview') params.set('view', next.view); if (next.view === 'project') params.set('id', next.id);
     if (next.view === 'project' && next.query) for (const [key, value] of Object.entries(next.query)) params.set(key, value);
@@ -147,8 +148,9 @@ export default function App() {
     }, 500));
   }, [load, expire]);
   const check = async (project: Project) => {
+    setNotice(null);
     setChecking(project.id);
-    try { const result = await api<{ snapshot: Snapshot }>(`/api/projects/${encodeURIComponent(project.id)}/check`, { method: 'POST' }); setNotice(`${project.name}：${project.adapter === 'link' ? '网页入口已配置，未检测可达性' : statusText[result.snapshot.state]}`); await load(); }
+    try { const result = await api<{ snapshot: Snapshot }>(`/api/projects/${encodeURIComponent(project.id)}/check`, { method: 'POST' }); setNotice(checkNotice(project, result.snapshot)); await load(); }
     catch (e) { if (e instanceof ApiError && e.status === 401) expire(); else setError(e instanceof Error ? e.message : '连接检查失败'); }
     finally { setChecking(null); }
   };
@@ -173,8 +175,8 @@ export default function App() {
       {overview ? <ProjectWorkspace projects={overview.projects.map(s => s.project)} activeId={route.view === 'project' ? route.id : null} query={route.query} onEdit={setEditor} onExpired={expire} onChanged={changed} onNavigate={(id, query) => { const target = overview.projects.find(s => s.project.id === id && s.project.enabled && s.project.accessMode === 'proxy'); if (target) navigate({ view: 'project', id, query }); }} /> : null}
       </main>{route.view !== 'project' ? <footer className="workspace-footer"><span>各项目独立运行，工作台汇总展示。</span><span>时间按本机时区显示</span></footer> : null}
     </div>
-    {editor ? <ProjectEditor key={editor === 'new' ? 'new' : editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { setEditor(null); setNotice(message); await load(); }} onExpired={expire} /> : null}
-    {notice ? <div className="toast" role="status"><Check size={18} />{notice}<button aria-label="关闭提示" onClick={() => setNotice('')}><X size={16} /></button></div> : null}
+    {editor ? <ProjectEditor key={editor === 'new' ? 'new' : editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { setEditor(null); setNotice({ title: message, tone: 'success' }); await load(); }} onExpired={expire} /> : null}
+    {notice ? <div className={`toast ${notice.tone}`} role={notice.tone === 'warning' || notice.tone === 'error' ? 'alert' : 'status'}>{notice.tone === 'success' ? <Check size={18} /> : notice.tone === 'info' ? <Info size={18} /> : <CircleAlert size={18} />}<div className="toast-content"><strong>{notice.title}</strong>{notice.detail ? <p>{notice.detail}</p> : null}</div><button aria-label="关闭提示" onClick={() => setNotice(null)}><X size={16} /></button></div> : null}
   </div>;
 }
 
@@ -196,7 +198,7 @@ function ProjectCard({ snapshot: s, onOpen, onEdit }: { snapshot: Snapshot; onOp
   return <article className="project-card"><div className="project-card-top"><span className={`project-icon ${s.project.category}`}><ProjectIcon category={s.project.category} /></span><Status state={s.state} adapter={s.project.adapter} /></div><h3>{s.project.name}</h3><p className="project-description">{s.project.description || categories[s.project.category]}</p>{s.metrics.length ? <div className="mini-metrics">{s.metrics.slice(0, 2).map(m => <MetricView metric={m} key={m.key} />)}</div> : <div className="project-empty"><span>暂未取得概览数据</span><small>{s.message || '配置数据连接后自动读取'}</small></div>}<div className="project-time">{s.freshness === 'static' ? '手工估值记录' : '源数据'} {formatDate(s.updatedAt, true)}</div><div className="project-card-actions"><button className="button secondary" onClick={onOpen}>进入项目<ArrowUpRight size={15} /></button><button className="icon-button" aria-label={`配置${s.project.name}`} title="配置连接" onClick={onEdit}><Settings2 size={17} /></button></div></article>;
 }
 function ProjectsPage({ snapshots, onEdit, onCheck, checking }: { snapshots: Snapshot[]; onEdit: (p: Project) => void; onCheck: (p: Project) => void; checking: string | null }) {
-  return <section className="panel management-panel"><div className="panel-heading"><h2>已接入项目 <span className="count-label">{snapshots.length}</span></h2><span className="muted">支持独立服务和网页入口</span></div><div className="project-table" role="table" aria-label="项目连接列表"><div className="project-table-head" role="row"><span role="columnheader">项目</span><span role="columnheader">接入方式</span><span role="columnheader">连接状态</span><span role="columnheader">操作</span></div>{snapshots.map(s => <div className="project-table-row" role="row" key={s.project.id}><div className="table-project" role="cell"><span className={`project-icon ${s.project.category}`}><ProjectIcon category={s.project.category} /></span><div><strong>{s.project.name}</strong><span>{s.project.accessMode === 'proxy' ? '通过工作台访问 · 单端口' : s.project.url || '尚未设置网页地址'}</span></div></div><div className="adapter-cell" role="cell"><span>{adapters[s.project.adapter]}</span><small>{s.project.hasCredentials ? (s.project.accessMode === 'proxy' && s.project.adapter !== 'link' ? '已保存登录信息 · 自动登录' : '已保存登录信息') : '未保存登录信息'}</small></div><div role="cell"><Status state={s.state} adapter={s.project.adapter} /><small className="table-time">检查于 {formatDate(s.checkedAt)}</small>{s.project.adapter === 'asset' && s.sync ? <small className="table-time" title={s.sync.message}>后台同步：{({ idle: '等待同步', syncing: '正在同步', success: '已完成', partial: '部分来源异常', error: '同步失败', unauthorized: '登录信息无效', unconfigured: '待配置', disabled: '已关闭' })[s.sync.state]}</small> : null}</div><div className="row-actions" role="cell"><Button className="button ghost" busy={checking === s.project.id} disabled={checking !== null || !s.project.enabled} onClick={() => onCheck(s.project)}>检查</Button><button className="button secondary" onClick={() => onEdit(s.project)}>编辑</button></div></div>)}</div>{!snapshots.length ? <div className="empty-state"><FolderKanban /><h3>还没有项目</h3><p>点击右上角“添加项目”，登记已有服务。</p></div> : null}<div className="management-note"><ShieldCheck size={19} /><p>通过工作台可打开完整项目；资产后台同步可单独关闭，交易等操作仍由你在原项目中执行。</p></div></section>;
+  return <section className="panel management-panel"><div className="panel-heading"><h2>已接入项目 <span className="count-label">{snapshots.length}</span></h2><span className="muted">支持独立服务和网页入口</span></div><div className="project-table" role="table" aria-label="项目连接列表"><div className="project-table-head" role="row"><span role="columnheader">项目</span><span role="columnheader">接入方式</span><span role="columnheader">连接状态</span><span role="columnheader">操作</span></div>{snapshots.map(s => <div className="project-table-row" role="row" key={s.project.id}><div className="table-project" role="cell"><span className={`project-icon ${s.project.category}`}><ProjectIcon category={s.project.category} /></span><div><strong>{s.project.name}</strong><span>{s.project.accessMode === 'proxy' ? '通过工作台访问 · 单端口' : s.project.url || '尚未设置网页地址'}</span></div></div><div className="adapter-cell" role="cell"><span>{adapters[s.project.adapter]}</span><small>{s.project.hasCredentials ? (s.project.accessMode === 'proxy' && s.project.adapter !== 'link' ? '已保存登录信息 · 自动登录' : '已保存登录信息') : '未保存登录信息'}</small></div><div role="cell"><Status state={s.state} adapter={s.project.adapter} /><small className="table-time">检查于 {formatDate(s.checkedAt)}</small>{s.message && s.state !== 'online' ? <details className="connection-details"><summary>查看原因</summary><p>{s.message}</p></details> : null}{s.project.adapter === 'asset' && s.sync ? <small className="table-time" title={s.sync.message}>后台同步：{({ idle: '等待同步', syncing: '正在同步', success: '已完成', partial: '部分来源异常', error: '同步失败', unauthorized: '登录信息无效', unconfigured: '待配置', disabled: '已关闭' })[s.sync.state]}</small> : null}</div><div className="row-actions" role="cell"><Button className="button ghost" busy={checking === s.project.id} disabled={checking !== null || !s.project.enabled} onClick={() => onCheck(s.project)}>检查</Button><button className="button secondary" onClick={() => onEdit(s.project)}>编辑</button></div></div>)}</div>{!snapshots.length ? <div className="empty-state"><FolderKanban /><h3>还没有项目</h3><p>点击右上角“添加项目”，登记已有服务。</p></div> : null}<div className="management-note"><ShieldCheck size={19} /><p>通过工作台可打开完整项目；资产后台同步可单独关闭，交易等操作仍由你在原项目中执行。</p></div></section>;
 }
 const newProject: ProjectInput = { id: '', name: '', description: '', category: 'other', adapter: 'standard', url: '', apiUrl: '', accessMode: 'direct', autoSync: false, mode: 'external', enabled: true, staleAfterSeconds: 120, order: 100, username: '' };
 function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) { return <label className="field"><span>{label}</span>{children}{hint ? <small>{hint}</small> : null}</label>; }
