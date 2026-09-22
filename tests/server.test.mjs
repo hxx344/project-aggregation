@@ -331,12 +331,15 @@ test('concurrent partial login bodies reserve quota before await and success rel
 
 test('malformed login bodies consume quota and a valid login works after the window expires', async t => {
   const f = await fixture(t, { loginWindowMs: 120 });
+  // HTTP and password hashing can exceed a 120 ms window on a busy CI worker.
+  // Advance the rate-limit clock explicitly instead of racing wall-clock time.
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
   for (let index = 0; index < 10; index++) {
     const response = await fetch(`${f.origin}/api/login`, { method: 'POST', headers: { Origin: f.origin, 'Content-Type': 'application/json' }, body: '{' });
     assert.equal(response.status, 400); await response.arrayBuffer();
   }
   assert.equal((await f.login()).status, 429);
-  await new Promise(resolve => setTimeout(resolve, 150));
+  now += 121;
   assert.equal((await f.login()).status, 200);
   assert.equal((await f.login()).status, 200);
 });
