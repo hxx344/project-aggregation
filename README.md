@@ -1,8 +1,8 @@
 # Project Aggregation · 项目工作台
 
-把 ASTER 5X、Market Monitor 和 Asset Ledger 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
+把 ASTER 5X、Market Monitor、Asset Ledger 和 Gate CrossEx 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
 
-工作台独立运行，通过一个 SSH 转发端口查看摘要并打开三个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量不会再次计入资产。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
+工作台独立运行，通过一个 SSH 转发端口查看摘要并打开四个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量不会再次计入资产，CrossEx 的模拟余额和模拟盈亏也不会计入。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
 
 ## 首版提供什么
 
@@ -15,7 +15,7 @@
 
 工作台的自动任务不会下单、启停策略或转账；Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
 
-## 三个项目的统一界面
+## 原有三个项目的统一界面
 
 ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
 
@@ -26,6 +26,26 @@ sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in ast
 ```
 
 各安装器沿用已有配置、密码和数据，按原有增量规则决定是否构建和重启；某一步失败即停止后续升级，修复后可重复执行。完成后重新载入工作台中的项目，仍只需转发 `3100`。后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+
+## 接入 Gate CrossEx 模拟模块
+
+Gate CrossEx 独立部署，第一版用于同币种跨交易所永续价差套利模拟，与 Market Monitor 的价差发现配合使用，不执行实盘下单。以下一条命令依次更新 Monitor、安装或更新 CrossEx、更新工作台，复用各仓库现有安装器：
+
+```bash
+sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in market-spread-monitor/main/deploy/install.sh gate-crossex-arbitrage/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
+```
+
+各安装器保留已有配置与数据；无变化时按各自规则跳过重复安装、构建和重启。某一步失败会停止，修复后可重复执行。
+
+工作台升级后会一次性补充 `Gate CrossEx` 入口，默认通过代理访问服务器 `127.0.0.1:3200`。在“项目管理 → Gate CrossEx”填写用户名 `admin` 和 **CrossEx 自己的网页登录密码**，该密码与工作台密码独立，首次启动时记录在 `gate-crossex-arbitrage` 服务日志中。保存后点击左侧入口即可自动登录，仍只需转发工作台的 `3100`。
+
+```bash
+sudo journalctl -u gate-crossex-arbitrage --no-pager -n 30
+```
+
+Monitor 数据源地址及其 Basic 凭据在 **CrossEx 页面**配置；同机默认来源为 `http://127.0.0.1:3000`。工作台保存的项目登录信息不会自动传给 CrossEx 的数据源设置，也不需要在工作台填写交易所 API Key。
+
+升级保留全部已有项目配置；若已有 `crossex` 标识，不会覆盖。手动删除入口后重启不会重新添加。首次升级时已满 30 个项目则跳过自动添加并记为已处理；腾出名额后可手动添加 `standard` 项目，使用 `proxy`、端口 `3200`、过期阈值 `120` 秒。
 
 ## 在现有 Linux 服务器安装
 
@@ -49,21 +69,22 @@ sudo journalctl -u project-aggregation --no-pager -n 30
 ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 ```
 
-保持这个终端运行。打开 `http://127.0.0.1:3100` 会跳转到 `http://hub.localhost:3100`；从工作台进入项目时，工作台为各项目生成独立的 `.localhost` 子域，仍使用 `3100`。无需再转发原项目的三个端口。
+保持这个终端运行。打开 `http://127.0.0.1:3100` 会跳转到 `http://hub.localhost:3100`；从工作台进入项目时，工作台为各项目生成独立的 `.localhost` 子域，仍使用 `3100`。无需再转发各原项目端口。
 
 Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或 DNS；单端口原页面代理当前支持这种 SSH 本地访问方式，不承诺 Safari 或通用域名代理。[浏览器兼容说明](https://learn.microsoft.com/en-us/aspnet/core/test/localhost-tld?view=aspnetcore-10.0)
 
-## 连接三个项目
+## 连接四个项目
 
-以下是首启时预置的配置。进入“项目管理”，为已设登录保护的项目填写现有页面的密码；monitor 若启用 HTTP Basic，还要填写用户名。保存一次后，通过工作台打开项目即可自动登录。这里填写的是原项目登录凭据，不是交易所 API Key。
+以下是首启时预置的配置。进入“项目管理”，为已设登录保护的项目填写现有页面的密码；monitor 若启用 HTTP Basic，还要填写用户名，CrossEx 用户名为 `admin`。保存一次后，通过工作台打开项目即可自动登录。这里填写的是原项目登录凭据，不是交易所 API Key。
 
 | 项目 | 页面地址：提供入口路径和查询参数 | 接口地址：工作台服务器访问 | 适配器 |
 | --- | --- | --- | --- |
 | ASTER 5X | `http://127.0.0.1:8765/` | `http://127.0.0.1:8765` | `aster` |
 | Market Monitor | `http://127.0.0.1:3000/?monitor=oil` | `http://127.0.0.1:3000` | `monitor` |
 | Asset Ledger | `http://127.0.0.1:5678/` | `http://127.0.0.1:5678` | `asset` |
+| Gate CrossEx | `http://127.0.0.1:3200/` | `http://127.0.0.1:3200` | `standard` |
 
-升级时，缺少 `accessMode` 的三个内置项目默认采用 `proxy`；缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
+升级时，缺少 `accessMode` 的三个原有内置项目默认采用 `proxy`；CrossEx 预置显式使用 `proxy`。缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
 
 接口地址不会自动迁移。若现有 ASTER 接口地址仍是 `http://127.0.0.1:18765`，请在“项目管理”中改为 `http://127.0.0.1:8765`，重新填写 ASTER 网页登录密码并保存。工作台不会自动改端口或把旧密码搬到新目标。采用 `proxy` 时，旧页面地址中的 `18765` 不作为连接目标，可以保留或改为上表地址。
 
@@ -86,13 +107,14 @@ Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或
 | 数据 | 来源和口径 |
 | --- | --- |
 | 资产表内总额 | `asset /api/ledger` 中所有资产行的 `value` 之和，单位 USD，包含原账本的“出金”行。 |
-| 当前持有 | 表内总额减去项目名为“出金”的行。不叠加 ASTER 的余额、保证金。 |
+| 当前持有 | 表内总额减去项目名为“出金”的行。不叠加 ASTER 的余额、保证金或 CrossEx 模拟余额。 |
 | 资产历史 | 原账本已经保存的历史总额，最多最近 90 个有效日期；排除未来与归档记录，同日优先日快照。日期按北京时间展示。这是资产金额历史，不是收益率或回测曲线，入金和出金也会改变它。 |
 | 资产更新时间 | 动态资产行更新时间中的最早值，明确标记 `mode=manual` 的手工行不参与实时过期计算；手工行最早估值记录时间单独展示。纯手工账本标记“静态估值”，保留估值记录时间。后台同步状态在项目管理中单独展示，不代替资产源时间。 |
 | 交易概览 | `aster /api/state?compact=true`，统计启用账户及实盘账户。保证金、今日成交量使用上游 USD1 单位；今日成交量按上游 UTC 日口径，不做人民币换算。演示数据会有明确提示。 |
 | 交易更新时间 | 实盘账户快照中的最早时间；快照缺失不会当成刚刚更新。 |
 | 原油监控 | monitor 模块的 Binance 标记价格；价差 = 布伦特 − WTI，单位 USDT/桶，不是现货报价或百分比。 |
 | 监控时效 | 使用报价的源更新时间并保留采集器的过期/部分失败状态；工作台成功连通不代表行情新鲜。 |
+| CrossEx 模拟摘要 | `standard /api/hub/summary`，单独展示模块提供的模拟指标，不计入真实资产总额或资产历史。具体价差发现、来源配置和模拟操作在 CrossEx 原页面进行。 |
 
 `checkedAt` 是工作台最近一次检查时间，`updatedAt` 是数据源实际更新时间；纯手工账本对应手工估值记录时间。默认 aster / monitor 超过 120 秒、asset 动态资产超过 900 秒标记过期，可按项目调整为 30–86400 秒。只有所有资产行都明确为 `mode=manual` 才按静态估值处理，不因记录较早就判定实时报价过期；未知或缺失分类按动态数据处理并提示不完整。单次上游读取总时限默认 5 秒；一个项目超时不会阻塞其他项目。
 

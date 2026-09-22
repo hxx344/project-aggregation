@@ -26,6 +26,12 @@
 
 内置 ASTER 的正确同机接口地址是 `http://127.0.0.1:8765`，Asset 为 `http://127.0.0.1:5678`，monitor 为 `http://127.0.0.1:3000`。旧 ASTER 配置中的错误 `18765` 不会自动修改；管理员需改为 `8765` 并重填密码，工作台不会将旧目标凭据迁移给新目标。
 
+Gate CrossEx 是第四个预置入口：`id=crossex`、`category=trading`、`adapter=standard`，页面与接口地址均为 `http://127.0.0.1:3200`，显式使用 `accessMode=proxy`、`autoSync=false`、`staleAfterSeconds=120`、`order=3`。其 HTTP Basic 用户名为 `admin`；填写 CrossEx 服务日志中的独立网页登录密码即可复用标准摘要与代理自动登录。普通新建 `standard` 项目的默认访问方式仍为 `direct`。
+
+旧数据库通过独立 `seeded-crossex-v1` 标记在事务内一次性 `INSERT OR IGNORE` 补充入口，不改写同标识的已有项目、凭据或快照，也不恢复已删除的旧预置。删除 CrossEx 后重启不再添加；升级时已满 30 个项目会记录迁移完成并跳过添加，之后可腾出名额手动接入。
+
+CrossEx 第一版仅模拟同币种跨交易所永续价差套利。Monitor 作为发现数据源，在 CrossEx 页面配置来源地址和来源凭据；这些凭据与工作台保存的 CrossEx 登录凭据独立。模拟余额、收益及趋势只属于该标准项目，不进入 Asset Ledger 资产总额与曲线。
+
 ## 摘要接口
 
 ```http

@@ -16,10 +16,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const SESSION_AGE = 12 * 60 * 60 * 1000;
+const MAX_PROJECTS = 30;
 const defaults = [
   { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:8765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
   { id: 'monitor', name: 'Market Monitor', description: '原油价差与市场监控', category: 'monitoring', adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=oil', apiUrl: 'http://127.0.0.1:3000', staleAfterSeconds: 120 },
   { id: 'asset', name: 'Asset Ledger', description: '资产账本、持有金额与历史变化', category: 'assets', adapter: 'asset', url: 'http://127.0.0.1:5678', apiUrl: 'http://127.0.0.1:5678', staleAfterSeconds: 900 },
+  { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
 ].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
@@ -60,8 +62,18 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (!initialPassword) logger(`工作台初始登录密码：${password}\n请保存此密码；只在首次启动显示。重置请运行 node server/setup.mjs --reset-password`);
   }
   if (!getSetting('seeded')) {
-    db.exec('BEGIN');
-    try { for (const project of defaults) db.prepare('INSERT OR IGNORE INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project)); db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
+    db.exec('BEGIN IMMEDIATE');
+    try { for (const project of defaults) db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  if (!getSetting('seeded-crossex-v1')) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const project = defaults.find(item => item.id === 'crossex');
+      // Keep existing connections intact; the marker also preserves a later user deletion.
+      db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
+      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded-crossex-v1', '1');
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
   const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64'); };
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
@@ -202,7 +214,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (pathname === '/api/overview' && req.method === 'GET') { send(res, 200, { projects: getProjects().map(snapshot), generatedAt: new Date().toISOString() }); return; }
     if (pathname === '/api/projects' && req.method === 'POST') {
       const body = await bodyOf(req);
-      if (getProjects().length >= 30) throw new HttpError(400, '最多接入 30 个项目');
+      if (getProjects().length >= MAX_PROJECTS) throw new HttpError(400, `最多接入 ${MAX_PROJECTS} 个项目`);
       const value = validateProject(body); value.id = body.id || randomBytes(8).toString('hex');
       if (db.prepare('SELECT id FROM projects WHERE id=?').get(value.id)) throw new HttpError(409, '项目标识已存在');
       const credentials = body.password ? encrypt({ password: body.password, username: body.username || '' }) : null;

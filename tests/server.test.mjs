@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server/app.mjs';
 import { UpstreamError } from '../server/adapters.mjs';
 
@@ -26,7 +27,15 @@ async function fixture(t, options = {}) {
     return result;
   }
   t.after(async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); });
-  return { get app() { return app; }, get origin() { return origin; }, dataDir, request, login, async reopen() { await app.close(); app = await createApp({ dataDir, initialPassword: 'different-password-ignored', refreshInterval: 0, assetSyncIntervalMs: 0, summaryReader: options.summaryReader || (async () => summary()) }); await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${app.server.address().port}`; } };
+  return { get app() { return app; }, get origin() { return origin; }, dataDir, request, login, async reopen(editDatabase) {
+    await app.close();
+    if (editDatabase) {
+      const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
+      try { db.exec('PRAGMA foreign_keys=ON'); editDatabase(db); } finally { db.close(); }
+    }
+    app = await createApp({ dataDir, initialPassword: 'different-password-ignored', refreshInterval: 0, assetSyncIntervalMs: 0, summaryReader: options.summaryReader || (async () => summary()) });
+    await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${app.server.address().port}`;
+  } };
 }
 
 test('authentication gates private data, enforces Origin/CSRF, and logout revokes session', async t => {
@@ -38,11 +47,81 @@ test('authentication gates private data, enforces Origin/CSRF, and logout revoke
   assert.equal((await f.login('wrong-password')).status, 401);
   const logged = await f.login();
   assert.equal(logged.status, 200); assert.match(logged.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
-  assert.equal((await f.request('/api/projects')).data.projects.length, 3);
+  assert.equal((await f.request('/api/projects')).data.projects.length, 4);
   assert.equal((await f.request('/api/logout', { method: 'POST', csrfHeader: '' })).status, 403);
   assert.equal((await f.request('/api/logout', { method: 'POST', originHeader: 'https://evil.example' })).status, 403);
   assert.equal((await f.request('/api/logout', { method: 'POST' })).status, 200);
   assert.equal((await f.request('/api/projects')).status, 401);
+});
+
+test('CrossEx is the fourth proxy preset and its simulated balance stays in its own snapshot', async t => {
+  let requested;
+  const f = await fixture(t, { summaryReader: async project => {
+    if (project.id === 'crossex') { requested = project; return { ...summary(), metrics: [{ key: 'sim_equity', label: '模拟权益', value: 100000, unit: 'USDT', detail: '模拟账本，不计入真实资产' }] }; }
+    return summary();
+  } });
+  await f.login();
+  const projects = (await f.request('/api/projects')).data.projects;
+  assert.deepEqual(projects.map(project => project.id), ['aster', 'monitor', 'asset', 'crossex']);
+  assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false });
+  const asset = await f.app.check('asset');
+  const simulation = await f.app.check('crossex');
+  assert.equal(requested.adapter, 'standard');
+  assert.equal(simulation.metrics[0].value, 100000);
+  const snapshots = (await f.request('/api/overview')).data.projects;
+  assert.deepEqual(snapshots.find(item => item.project.id === 'asset').metrics, asset.metrics);
+  assert.equal(snapshots.find(item => item.project.id === 'asset').metrics[0].value, 42);
+});
+
+test('an existing installation gains CrossEx once without restoring deleted presets or changing saved data', async t => {
+  const f = await fixture(t); await f.login();
+  await f.request('/api/projects/aster', { method: 'PUT', body: { name: 'My ASTER', apiUrl: 'http://127.0.0.1:9876', accessMode: 'direct', password: 'saved-upstream-password' } });
+  await f.request('/api/projects/asset', { method: 'PUT', body: { autoSync: false, staleAfterSeconds: 1800 } });
+  await f.request('/api/projects/monitor', { method: 'DELETE' });
+  await f.app.check('asset');
+  const before = (await f.request('/api/overview')).data.projects.filter(item => item.project.id !== 'crossex');
+  await f.reopen(db => db.exec("DELETE FROM projects WHERE id='crossex'; DELETE FROM settings WHERE key='seeded-crossex-v1';"));
+  const upgraded = (await f.request('/api/overview')).data.projects;
+  assert.equal(upgraded.length, 3);
+  assert.deepEqual(upgraded.filter(item => item.project.id !== 'crossex'), before);
+  assert.equal(upgraded.find(item => item.project.id === 'crossex').project.accessMode, 'proxy');
+  assert.equal((await f.request('/api/projects/crossex', { method: 'DELETE' })).status, 200);
+  await f.reopen();
+  assert.deepEqual((await f.request('/api/projects')).data.projects.map(item => item.id), ['aster', 'asset']);
+});
+
+test('the CrossEx migration preserves an existing same-id project, credentials and cached summary', async t => {
+  const f = await fixture(t); await f.login();
+  await f.request('/api/projects/crossex', { method: 'PUT', body: { name: 'Existing CrossEx', apiUrl: 'http://127.0.0.1:9320', url: 'http://127.0.0.1:9320/custom', accessMode: 'direct', order: 12, username: 'custom-reader', password: 'saved-crossex-password' } });
+  const before = await f.app.check('crossex');
+  let saved;
+  await f.reopen(db => { saved = db.prepare("SELECT * FROM projects WHERE id='crossex'").get(); db.exec("DELETE FROM settings WHERE key='seeded-crossex-v1'"); });
+  assert.deepEqual((await f.request('/api/overview')).data.projects.find(item => item.project.id === 'crossex'), before);
+  await f.reopen(db => { assert.deepEqual(db.prepare("SELECT * FROM projects WHERE id='crossex'").get(), saved); });
+});
+
+test('CrossEx migration respects the 30-project limit and does not retry after a full installation frees a slot', async t => {
+  for (const size of [29, 30]) await t.test(`${size} existing projects`, async t => {
+    const f = await fixture(t); await f.login();
+    await f.reopen(db => {
+      db.exec("DELETE FROM projects WHERE id='crossex'; DELETE FROM settings WHERE key='seeded-crossex-v1';");
+      const template = JSON.parse(db.prepare("SELECT json FROM projects WHERE id='aster'").get().json);
+      for (let index = 3; index < size; index++) {
+        const project = { ...template, id: `custom-${index}`, name: `Custom ${index}`, adapter: 'link', enabled: false, order: index + 10 };
+        db.prepare('INSERT INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project));
+      }
+    });
+    const projects = (await f.request('/api/projects')).data.projects;
+    assert.equal(projects.length, 30);
+    assert.equal(projects.some(item => item.id === 'crossex'), size === 29);
+    assert.equal((await f.request('/api/projects', { method: 'POST', body: { id: 'over-limit', name: 'Extra' } })).status, 400);
+    const removed = size === 29 ? 'crossex' : 'custom-3';
+    assert.equal((await f.request(`/api/projects/${removed}`, { method: 'DELETE' })).status, 200);
+    await f.reopen();
+    const restarted = (await f.request('/api/projects')).data.projects;
+    assert.equal(restarted.length, 29);
+    assert.equal(restarted.some(item => item.id === 'crossex'), false);
+  });
 });
 
 test('Aster reads the server port independently of its browser tunnel and preserves saved addresses', async t => {
