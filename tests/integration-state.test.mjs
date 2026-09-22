@@ -54,6 +54,8 @@ test('cross-module navigation accepts only known targets and bounded view filter
 test('only explicitly public immutable hashed JS/CSS are cacheable', () => {
   const headers = { 'cache-control': 'public, max-age=31536000, immutable', 'content-type': 'text/javascript; charset=utf-8' };
   assert.match(cachePolicy('/assets/index-AbCd1234.js', headers), /^private,/);
+  assert.match(cachePolicy('/_next/static/chunks/framework-DTZGTDtF.js', headers), /^private,/);
+  assert.match(cachePolicy('/_next/static/chunks/1234-abcdef123456.js', headers), /^private,/);
   for (const path of ['/api/state', '/', '/assets/private.js', '/assets/index-AbCd1234.js.map']) assert.equal(cachePolicy(path, headers), 'no-store');
   for (const patch of [{ 'set-cookie': ['private=1'] }, { 'content-type': 'text/html' }, { 'cache-control': 'no-store' }, { 'cache-control': 'private, immutable' }]) assert.equal(cachePolicy('/assets/index-AbCd1234.js', { ...headers, ...patch }), 'no-store');
   assert.equal(cachePolicy('/assets/index-AbCd1234.js', headers, 401), 'no-store');

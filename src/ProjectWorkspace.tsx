@@ -21,9 +21,10 @@ export default function ProjectWorkspace({ projects, activeId, query, onEdit, on
   // Revisions disappear on config edits/removal; neither their frames nor capabilities survive.
   const revisions = projects.map(projectKey).join('|');
   useEffect(() => { const live = new Set(revisions.split('|')); setReady(previous => [...previous].every(key => live.has(key)) ? previous : new Set([...previous].filter(key => live.has(key)))); }, [revisions]);
-  return <>{retained.map(key => {
-    const project = projects.find(p => projectKey(p) === key);
-    if (!project) return null;
+  // MRU chooses eviction only. Reordering iframe DOM nodes reloads them in Chrome,
+  // which also consumes their single-use authorization URL a second time.
+  return <>{projects.filter(project => retained.includes(projectKey(project))).map(project => {
+    const key = projectKey(project);
     return <ProjectPage key={key} project={project} active={project.id === activeId} query={project.id === activeId ? query : undefined} onEdit={() => onEdit(project)} onExpired={onExpired} onReady={value => onReady(key, value)} onChanged={() => onChanged(project.id)} onNavigate={onNavigate} />;
   })}</>;
 }

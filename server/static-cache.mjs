@@ -3,7 +3,7 @@
 export function cachePolicy(path, headers, status = 200) {
   const pathname = path.split('?')[0];
   const vite = /^\/assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:js|css)$/.test(pathname);
-  const next = /^\/_next\/static\/(?:chunks|css)\/[A-Za-z0-9_./-]*[a-f0-9]{8,}[A-Za-z0-9_.-]*\.(?:js|css)$/.test(pathname);
+  const next = /^\/_next\/static\/(?:chunks|css)\/[A-Za-z0-9_./-]*(?:[a-f0-9]{8,}|[-.][A-Za-z0-9_-]{8,})\.(?:js|css)$/.test(pathname);
   const control = String(headers['cache-control'] || '');
   const type = String(headers['content-type'] || '').split(';')[0].trim().toLowerCase();
   const rightType = pathname.endsWith('.css') ? type === 'text/css' : ['application/javascript', 'text/javascript'].includes(type);
