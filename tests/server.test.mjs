@@ -7,6 +7,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server/app.mjs';
 import { UpstreamError } from '../server/adapters.mjs';
+import { createOverviewDecoder } from '../src/overview-feed.ts';
 
 const password = 'test-password-not-a-real-secret';
 const summary = () => ({ updatedAt: new Date().toISOString(), metrics: [{ key: 'total', label: '总额', value: 42, unit: 'USD' }], message: '测试数据' });
@@ -34,9 +35,10 @@ test('source health and stricter TTL survive checks, persistence and missing tim
   assert.equal(projects.find(item => item.project.id === 'asset').freshness, 'static');
 });
 
-test('authenticated overview stream publishes checks and config revocation, then closes on logout', async t => {
+for (const protocol of ['', '?protocol=2']) test(`authenticated overview stream ${protocol || 'legacy'} publishes checks and config revocation, then closes on logout`, async t => {
   const f = await fixture(t); await f.login();
-  const url = f.origin + '/api/overview/events';
+  const url = f.origin + '/api/overview/events' + protocol;
+  const decode = createOverviewDecoder();
   assert.equal((await fetch(url)).status, 401);
   assert.equal((await fetch(url, { headers: { Cookie: f.cookie, Origin: 'https://evil.example' } })).status, 403);
   assert.equal((await fetch(url, { headers: { Cookie: f.cookie, 'Sec-Fetch-Site': 'same-site' } })).status, 403);
@@ -47,7 +49,9 @@ test('authenticated overview stream publishes checks and config revocation, then
   async function event() {
     while (!buffered.includes('\n\n')) { const { value, done } = await reader.read(); if (done) return null; buffered += new TextDecoder().decode(value); }
     const end = buffered.indexOf('\n\n'); const entry = buffered.slice(0, end); buffered = buffered.slice(end + 2);
-    return JSON.parse(entry.split('\n').find(line => line.startsWith('data: ')).slice(6));
+    const raw = entry.split('\n').find(line => line.startsWith('data: ')).slice(6);
+    if (protocol) assert.ok(['snapshot', 'patch', 'heartbeat'].includes(JSON.parse(raw).type));
+    return decode(raw) || event();
   }
   const first = await event(); const revision = first.projects.find(item => item.project.id === 'crossex').project.revision;
   await f.app.check('crossex'); const checked = await event(); assert.equal(checked.projects.find(item => item.project.id === 'crossex').metrics[0].value, 42);

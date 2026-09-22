@@ -26,6 +26,16 @@ export function ageSnapshot(snapshot: Snapshot, now: number): Snapshot {
   if (Number.isFinite(updated) && now - updated <= ttl * 1000) return snapshot;
   return { ...snapshot, state: 'stale', message: `数据已过期。${snapshot.message}` };
 }
+export function nextSnapshotExpiry(snapshots: Snapshot[], now: number): number | null {
+  let next = Infinity;
+  for (const snapshot of snapshots) {
+    if (snapshot.freshness === 'static' || !['online', 'partial'].includes(snapshot.state) || !snapshot.updatedAt) continue;
+    const ttl = Math.min(snapshot.project.staleAfterSeconds, snapshot.staleAfterSeconds || snapshot.project.staleAfterSeconds);
+    const expiry = Date.parse(snapshot.updatedAt) + ttl * 1000 + 1;
+    if (expiry > now) next = Math.min(next, expiry);
+  }
+  return Number.isFinite(next) ? next : null;
+}
 export function retainedProjects(previous: string[], projects: Project[], activeId: string | null, ready: ReadonlySet<string>) {
   const available = new Map(projects.filter(p => p.enabled).map(p => [projectKey(p), p]));
   const active = projects.find(p => p.id === activeId);

@@ -3,7 +3,8 @@ import type { FormEvent, ReactNode } from 'react';
 import { Activity, ArrowUpRight, Check, ChevronRight, CircleAlert, FolderKanban, Gauge, Info, LayoutDashboard, LoaderCircle, LogOut, Menu, Plus, RefreshCw, Save, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
 import { api, ApiError, setCsrfToken } from './api';
 import ProjectWorkspace from './ProjectWorkspace';
-import { ageSnapshot, navigationQuery } from './hub-state';
+import { ageSnapshot, navigationQuery, nextSnapshotExpiry } from './hub-state';
+import { createOverviewDecoder, createStreamWatchdog } from './overview-feed';
 import { checkNotice, statusText } from './check-notice';
 import type { Notice } from './check-notice';
 import type { NavigationQuery } from './hub-state';
@@ -70,13 +71,14 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [editor, setEditor] = useState<Project | 'new' | null>(null);
   const [checking, setChecking] = useState<string | null>(null);
-  const [, setClock] = useState(0);
+  const [clock, setClock] = useState(0);
   const receivedAt = useRef(performance.now());
   const streamLive = useRef(false);
   const refreshTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const sidebar = useRef<HTMLElement>(null);
   const requestVersion = useRef(0);
+  const pendingLoad = useRef<{ promise: Promise<void>; signal: AbortSignal } | null>(null);
   useEffect(() => {
     if (!menuOpen) return;
     const first = sidebar.current?.querySelector<HTMLButtonElement>('button'); first?.focus();
@@ -91,49 +93,72 @@ export default function App() {
     document.addEventListener('keydown', onKey); return () => document.removeEventListener('keydown', onKey);
   }, [menuOpen]);
 
-  const expire = useCallback(() => { requestVersion.current++; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, []);
+  const expire = useCallback(() => { requestVersion.current++; pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, []);
   useEffect(() => {
     const controller = new AbortController();
-    api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
+    api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { if (controller.signal.aborted) return; setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (!controller.signal.aborted && e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
     return () => controller.abort();
   }, []);
   const accept = useCallback((data: Overview) => { receivedAt.current = performance.now(); setOverview(data); setError(''); }, []);
-  const load = useCallback(async (signal?: AbortSignal) => {
+  const load = useCallback((signal?: AbortSignal) => {
+    if (pendingLoad.current && !pendingLoad.current.signal.aborted) return pendingLoad.current.promise;
+    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
     const version = ++requestVersion.current;
     setLoading(true);
-    try { const data = await api<Overview>('/api/overview', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) }); if (version === requestVersion.current) accept(data); }
-    catch (e) { if (version !== requestVersion.current) return; if (e instanceof ApiError && e.status === 401) expire(); else if (e instanceof Error && e.name !== 'AbortError') setError(e.message); }
-    finally { if (version === requestVersion.current) setLoading(false); }
+    const promise = (async () => {
+      try { const data = await api<Overview>('/api/overview', { signal: requestSignal }); if (version === requestVersion.current) accept(data); }
+      catch (e) { if (version !== requestVersion.current) return; if (e instanceof ApiError && e.status === 401) expire(); else if (e instanceof Error && e.name !== 'AbortError') setError(e.message); }
+      finally { if (version === requestVersion.current) setLoading(false); }
+    })().finally(() => { if (pendingLoad.current?.promise === promise) pendingLoad.current = null; });
+    pendingLoad.current = { promise, signal: requestSignal }; return promise;
   }, [expire, accept]);
   useEffect(() => {
     if (!authenticated) return;
     const controller = new AbortController();
-    void load(controller.signal);
-    const refresh = () => { if (document.visibilityState === 'visible' && !streamLive.current) void load(controller.signal); };
+    const refresh = () => { if (document.visibilityState === 'visible' && navigator.onLine && !streamLive.current) void load(controller.signal); };
+    const first = window.setTimeout(refresh, 1500);
     const interval = window.setInterval(refresh, 30_000);
     document.addEventListener('visibilitychange', refresh); window.addEventListener('online', refresh);
-    return () => { controller.abort(); clearInterval(interval); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('online', refresh); };
+    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('online', refresh); };
   }, [authenticated, load]);
   useEffect(() => {
     if (!authenticated) return;
     let stream: EventSource | null = null;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let watchdog = createStreamWatchdog();
     const controller = new AbortController();
     const connect = () => {
-      stream?.close(); streamLive.current = false;
+      stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry);
       if (document.hidden || !navigator.onLine) return;
-      const current = new EventSource('/api/overview/events'); stream = current;
+      watchdog = createStreamWatchdog();
+      const decode = createOverviewDecoder();
+      const current = new EventSource('/api/overview/events?protocol=2'); stream = current;
       current.onmessage = event => {
         if (controller.signal.aborted || stream !== current || document.hidden) return;
-        try { const data = JSON.parse(event.data) as Overview; if (!Array.isArray(data.projects) || !Number.isFinite(Date.parse(data.generatedAt))) return; requestVersion.current++; setLoading(false); streamLive.current = true; accept(data); }
-        catch { streamLive.current = false; }
+        try { const data = decode(event.data); watchdog.received(); streamLive.current = true; if (data) { requestVersion.current++; setLoading(false); accept(data); } }
+        catch { streamLive.current = false; current.close(); stream = null; void load(controller.signal); retry = setTimeout(connect, 5000); }
       };
       current.onerror = () => { if (controller.signal.aborted || stream !== current || document.hidden) return; streamLive.current = false; void load(controller.signal); };
     };
     connect();
     document.addEventListener('visibilitychange', connect); window.addEventListener('online', connect); window.addEventListener('offline', connect);
-    const clock = window.setInterval(() => { if (!document.hidden) setClock(value => value + 1); }, 1000);
-    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearInterval(clock); document.removeEventListener('visibilitychange', connect); window.removeEventListener('online', connect); window.removeEventListener('offline', connect); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
+    const health = window.setInterval(() => { if (!document.hidden && navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
+    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearInterval(health); document.removeEventListener('visibilitychange', connect); window.removeEventListener('online', connect); window.removeEventListener('offline', connect); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
   }, [authenticated, accept, load]);
+  useEffect(() => {
+    if (!overview || !authenticated) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      clearTimeout(timer);
+      if (document.hidden) return;
+      const now = Date.parse(overview.generatedAt) + performance.now() - receivedAt.current;
+      const expiry = nextSnapshotExpiry(overview.projects, now);
+      if (expiry !== null) timer = setTimeout(() => setClock(value => value + 1), Math.min(expiry - now, 2_147_483_647));
+    };
+    const visible = () => { if (!document.hidden) setClock(value => value + 1); schedule(); };
+    schedule(); document.addEventListener('visibilitychange', visible);
+    return () => { clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
+  }, [authenticated, overview, clock]);
   useEffect(() => { const change = () => setRoute(readRoute()); window.addEventListener('popstate', change); return () => window.removeEventListener('popstate', change); }, []);
   useEffect(() => { if (!notice || notice.tone === 'warning' || notice.tone === 'error') return; const timer = window.setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }, [notice]);
   const navigate = (next: Route) => {
@@ -151,7 +176,7 @@ export default function App() {
     setNotice(null);
     setChecking(project.id);
     try { const result = await api<{ snapshot: Snapshot }>(`/api/projects/${encodeURIComponent(project.id)}/check`, { method: 'POST' }); setNotice(checkNotice(project, result.snapshot)); await load(); }
-    catch (e) { if (e instanceof ApiError && e.status === 401) expire(); else setError(e instanceof Error ? e.message : '连接检查失败'); }
+    catch (e) { if (e instanceof ApiError && e.status === 401) expire(); else setNotice({ title: `${project.name}：连接检查失败`, tone: 'error', detail: e instanceof Error ? e.message : '未能取得检查结果，请稍后重试。' }); }
     finally { setChecking(null); }
   };
   const logout = async () => {

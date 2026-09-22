@@ -3,13 +3,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
 import { promisify } from 'node:util';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateUrl, validateAuthOrigin, readSummary, UpstreamError } from './adapters.mjs';
 import { createPortal } from './portal.mjs';
 import { loginForPortal } from './portal-auth.mjs';
 import { createAssetSync, syncAsset } from './asset-sync.mjs';
+import { createOverviewEncoder } from './overview-stream.mjs';
+import { createStaticResponder } from './static-response.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -84,14 +85,16 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   let closed = false;
   let assetSync = null;
   const streams = new Map();
+  const serveStatic = createStaticResponder();
   const overview = () => ({ projects: getProjects().map(snapshot), generatedAt: new Date().toISOString() });
   function publishOverview() {
-    let message;
+    let message, data;
     for (const [res, current] of streams) {
       if (closed || !db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(current.id, Date.now())) { res.end(); streams.delete(res); continue; }
       if (res.writableLength > 256 * 1024) { res.destroy(); streams.delete(res); continue; }
-      message ??= `data: ${JSON.stringify(overview())}\n\n`;
-      res.write(message);
+      data ??= overview();
+      if (current.encode) res.write(`data: ${JSON.stringify(current.encode(data))}\n\n`);
+      else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
     }
   }
   const projectRevision = id => { const row = db.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
@@ -228,7 +231,8 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (req.headers.origin) sameOrigin(req);
       if (streams.size >= 60 || [...streams.values()].filter(value => value.id === current.id).length >= 12) throw new HttpError(429, '状态订阅过多');
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
-      streams.set(res, current); res.write(`retry: 5000\ndata: ${JSON.stringify(overview())}\n\n`);
+      const encode = url.searchParams.get('protocol') === '2' ? createOverviewEncoder() : null;
+      streams.set(res, { ...current, encode }); res.write(`retry: 5000\ndata: ${JSON.stringify(encode ? encode(overview()) : overview())}\n\n`);
       res.once('close', () => streams.delete(res)); return;
     }
     if (pathname === '/api/projects' && req.method === 'POST') {
@@ -292,8 +296,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (!filename.startsWith(`${path.resolve(distDir)}${path.sep}`)) filename = path.join(distDir, 'index.html');
       if (!existsSync(filename) || !statSync(filename).isFile()) { if (path.extname(decoded)) throw new HttpError(404, '文件不存在'); filename = path.join(distDir, 'index.html'); }
       if (!existsSync(filename)) { send(res, 503, { error: '前端尚未构建，请先执行 npm run build' }); return; }
-      res.writeHead(200, { 'Content-Type': mime[path.extname(filename)] || 'application/octet-stream', 'Cache-Control': path.basename(filename) === 'index.html' ? 'no-cache' : 'public, max-age=3600' });
-      res.end(req.method === 'HEAD' ? undefined : await readFile(filename));
+      await serveStatic(req, res, filename, { 'Content-Type': mime[path.extname(filename)] || 'application/octet-stream', 'Cache-Control': path.basename(filename) === 'index.html' ? 'no-cache' : 'public, max-age=3600' });
     } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError ? error.status : 500, { error: error instanceof HttpError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
   });
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });

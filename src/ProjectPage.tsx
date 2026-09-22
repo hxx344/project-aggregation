@@ -76,6 +76,12 @@ export default function ProjectPage({ project, active, query, onEdit, onExpired,
     return () => controller.abort();
   }, [accessible, embedded, proxied, project.id, project.url, attempt, onExpired]);
 
+  useEffect(() => {
+    if (!source || !loading) return;
+    const timer = setTimeout(() => { setLoading(false); setError('项目页面加载超时，请重新载入或检查该项目服务。'); }, 30_000);
+    return () => clearTimeout(timer);
+  }, [source, loading]);
+
   async function openInTab() {
     const tab = window.open('about:blank', '_blank');
     if (!tab) { setError('浏览器阻止了新窗口，请允许此页面打开新窗口后重试。'); return; }
@@ -114,7 +120,7 @@ export default function ProjectPage({ project, active, query, onEdit, onExpired,
     {error ? <div className="error-box original-page-error" role="alert">{error}</div> : null}
     {!accessible ? <div className="empty-state original-page-placeholder"><FolderKanban size={32} /><h2>{project.enabled ? '请先设置项目地址' : '项目已停用'}</h2><p>{project.enabled ? '保存连接设置后，即可在这里打开原始页面。' : '在连接设置中启用后，可继续访问原始页面。'}</p><button className="button secondary" onClick={onEdit}>连接设置</button></div>
       : !embedded ? <div className="empty-state original-page-placeholder"><ExternalLink size={32} /><h2>{project.name}</h2><p>此项目设为在新窗口打开。</p><button className="button primary" disabled={openingTab} onClick={() => void openInTab()}>打开原始页面</button></div>
-        : source ? <iframe ref={frame} key={`${source.attempt}:${source.url}`} className="original-project-frame" title={project.name + '原始页面'} src={source.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" onLoad={() => { setLoading(false); connected.current = false; acknowledged.current = false; sentNavigation.current = ''; latest.current.onReady(false); post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] }); }} />
+        : source ? <iframe ref={frame} key={`${source.attempt}:${source.url}`} className="original-project-frame" title={project.name + '原始页面'} src={source.url} referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" onLoad={() => { setLoading(false); setError(value => value === '项目页面加载超时，请重新载入或检查该项目服务。' ? '' : value); connected.current = false; acknowledged.current = false; sentNavigation.current = ''; latest.current.onReady(false); post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] }); }} />
           : <div className="empty-state original-page-placeholder">{loading ? <LoaderCircle size={28} className="spin" /> : <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>重新载入</button>}</div>}
   </section>;
 }
