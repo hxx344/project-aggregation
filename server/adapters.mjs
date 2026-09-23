@@ -86,7 +86,7 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
 const finite = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)) ? Number(value) : null;
 const iso = value => { const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value); return value != null && Number.isFinite(date.getTime()) ? date.toISOString() : null; };
 const oldest = values => values.length > 0 && values.every(Boolean) ? [...values].sort()[0] : null;
-const strictDate = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT/.test(value) && iso(value) ? iso(value) : null;
+const strictDate = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT/.test(value) ? iso(value) : null;
 const sum = values => values.length && values.every(value => value !== null) ? values.reduce((a, b) => a + b, 0) : null;
 const metric = (key, label, value, unit, detail) => ({ key, label, value, ...(unit ? { unit } : {}), ...(detail ? { detail } : {}) });
 const diagnosticText = (value, fallback) => typeof value === 'string' && value.trim() ? value.trim().slice(0, 120) : fallback;
