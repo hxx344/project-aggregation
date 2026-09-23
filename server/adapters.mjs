@@ -272,7 +272,8 @@ export function normalizeMonitorQuote(quote, entry, count) {
   if (entry.id === 'oil') {
     const brent = finite(quote.brent?.markPx); const wti = finite(quote.wti?.markPx);
     if (brent === null || wti === null) throw new UpstreamError('invalid', '原油报价缺少价格字段');
-    return { ...common, metrics: [metric('brent', '布伦特原油', brent, 'USDT/桶'), metric('wti', 'WTI 原油', wti, 'USDT/桶'), metric('spread', '布伦特 − WTI', brent - wti, 'USDT/桶'), metric('modules', '监控模块', count, '个')], message: `${common.message}；Binance 标记价格，价差为布伦特减 WTI` };
+    const spread = brent > 0 && wti > 0 ? finite((brent - wti) / wti * 100) : null;
+    return { ...common, partial: common.partial || spread === null, metrics: [metric('brent', '布伦特原油', brent, 'USDT/桶'), metric('wti', 'WTI 原油', wti, 'USDT/桶'), metric('spread', '布伦特相对 WTI 价差', spread, '%'), metric('modules', '监控模块', count, '个')], message: `${common.message}；Binance 标记价格，价差＝(布伦特 − WTI) ÷ WTI × 100%${spread === null ? '；价格无效，价差暂不可用' : ''}` };
   }
   if (entry.id === 'hynix') return { ...common, metrics: [metric('premium', 'ADR 溢价', finite(quote.premium), '%'), metric('spread', 'ADR 与换算价格差', finite(quote.spread), 'USD'), metric('funding', '资金费率年化', finite(quote.funding?.annualizedRate) === null ? null : Number(quote.funding.annualizedRate) * 100, '%'), metric('modules', '监控模块', count, '个')], partial: common.partial || !!quote.fundingError };
   if (entry.id === 'perpetual') {

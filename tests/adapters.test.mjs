@@ -86,9 +86,19 @@ test('monitor reads Basic auth and selected module, marks upstream snapshots sta
     authorization = options.headers.Authorization;
     return route === '/api/monitors' ? { data: { schemaVersion: 1, monitors: [{ id: 'oil', title: '原油' }] } } : { data: { brent: { markPx: 80 }, wti: { markPx: 75 }, fetchedAt: '2026-09-01T00:00:00Z', status: 'snapshot', collection: { stale: true } } };
   } });
-  assert.equal(authorization, `Basic ${Buffer.from('reader:mock-pass').toString('base64')}`); assert.equal(result.metrics.find(item => item.key === 'spread').value, 5); assert.equal(result.stale, true);
+  assert.equal(authorization, `Basic ${Buffer.from('reader:mock-pass').toString('base64')}`); assert.equal(result.metrics.find(item => item.key === 'spread').value, 5 / 75 * 100); assert.equal(result.metrics.find(item => item.key === 'spread').unit, '%'); assert.equal(result.stale, true);
   const hynix = normalizeMonitorQuote({ premium: 2.1, spread: 3, funding: { annualizedRate: 0.1 }, fetchedAt: new Date().toISOString() }, { id: 'hynix' }, 3);
   assert.equal(hynix.metrics.find(item => item.key === 'funding').value, 10);
+});
+
+test('oil fallback retains signed percentages and never divides by an invalid WTI price', () => {
+  for (const [brent, wti, expected] of [[80, 80, 0], [75, 80, -6.25], [105, 100, 5], [80, 0, null], [80, -1, null], [Number.MAX_VALUE, Number.MIN_VALUE, null]]) {
+    const result = normalizeMonitorQuote({ brent: { markPx: brent }, wti: { markPx: wti } }, { id: 'oil' }, 3);
+    assert.equal(result.metrics.find(item => item.key === 'spread').value, expected);
+    assert.equal(result.metrics.find(item => item.key === 'spread').unit, '%');
+    assert.equal(result.partial, expected === null);
+    assert.equal(result.metrics[1].unit, 'USDT/桶');
+  }
 });
 
 test('upstream sessions are reused and invalidated after an unauthorized response', async () => {
