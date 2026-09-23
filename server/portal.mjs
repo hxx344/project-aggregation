@@ -2,8 +2,11 @@ import http from 'node:http';
 import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { createHash, randomBytes } from 'node:crypto';
+import { createGzip } from 'node:zlib';
+import { pipeline } from 'node:stream';
 import { validateUrl, validateAuthOrigin, blockedAddress } from './adapters.mjs';
 import { cachePolicy } from './static-cache.mjs';
+import { prepareAssetCompression } from './portal-compression.mjs';
 
 export const HUB_HOST = 'hub.localhost';
 export const PORTAL_COOKIE = 'hub_portal';
@@ -366,7 +369,11 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         if (req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/logout' && incoming.statusCode >= 200 && incoming.statusCode < 300) {
           revokeGrant(grant); headers['set-cookie'] = [...(headers['set-cookie'] || []), clearPortalCookie(context)];
         }
-        res.writeHead(incoming.statusCode, headers); incoming.pipe(res);
+        const compress = prepareAssetCompression(req, incoming, headers);
+        res.writeHead(incoming.statusCode, headers);
+        if (compress && req.method === 'HEAD') { incoming.resume(); res.end(); }
+        else if (compress) pipeline(incoming, createGzip(), res, error => { if (error) sendError(res, error); });
+        else incoming.pipe(res);
       }
       catch (error) { incoming.destroy(); sendError(res, error); }
       incoming.on('error', error => sendError(res, error));

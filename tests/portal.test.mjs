@@ -2,7 +2,60 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { createPortal, HUB_HOST, PORTAL_COOKIE } from '../server/portal.mjs';
+
+test('portal streams compressed public assets while preserving identity, HEAD and conditional reads', async t => {
+  const body = Buffer.from('export const message = "ASTER static build fixture";\n'.repeat(1000));
+  const f = await fixture(t, { onUpstream(req, res) {
+    const headers = { 'Content-Type': 'text/javascript', 'Cache-Control': 'public, max-age=31536000, immutable', ETag: '"build-one"', 'Content-Length': body.length };
+    if (req.headers['if-none-match'] === 'W/"build-one"') { res.writeHead(304, headers); res.end(); return true; }
+    res.writeHead(200, headers); res.end(req.method === 'HEAD' ? undefined : body); return true;
+  } });
+  const { cookie } = await f.authorize();
+  const path = '/_next/static/chunks/page-AbCd1234.js';
+  const zipped = await f.request(path, { cookie, headers: { 'Accept-Encoding': 'gzip' } });
+  assert.equal(zipped.status, 200); assert.equal(zipped.headers['content-encoding'], 'gzip');
+  assert.deepEqual(gunzipSync(zipped.body), body); assert.ok(zipped.body.length < body.length / 4);
+  assert.equal(zipped.headers['content-length'], undefined); assert.equal(zipped.headers.etag, 'W/"build-one"');
+  assert.equal(zipped.headers['cache-control'], 'private, max-age=31536000, immutable');
+  for (const encoding of ['', 'gzip;q=0, *;q=1']) {
+    const plain = await f.request(path, { cookie, headers: { 'Accept-Encoding': encoding } });
+    assert.deepEqual(plain.body, body); assert.equal(plain.headers['content-encoding'], undefined); assert.equal(plain.headers.vary, 'Accept-Encoding');
+  }
+  const head = await f.request(path, { cookie, method: 'HEAD', headers: { 'Accept-Encoding': 'gzip' } });
+  assert.equal(head.body.length, 0); assert.equal(head.headers['content-encoding'], 'gzip'); assert.equal(head.headers['content-length'], undefined);
+  const cached = await f.request(path, { cookie, headers: { 'Accept-Encoding': 'gzip', 'If-None-Match': zipped.headers.etag } });
+  assert.equal(cached.status, 304); assert.equal(cached.body.length, 0); assert.equal(cached.headers['content-encoding'], undefined);
+});
+
+test('already compressed public builds pass through without a second encoding', async t => {
+  const body = gzipSync(Buffer.from('export default "already compressed";'.repeat(1000)));
+  const f = await fixture(t, { onUpstream(_req, res) { res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'public, immutable', 'Content-Encoding': 'gzip', 'Content-Length': body.length }); res.end(body); return true; } });
+  const { cookie } = await f.authorize();
+  const result = await f.request('/assets/index-AbCd1234.js', { cookie, headers: { 'Accept-Encoding': 'gzip' } });
+  assert.deepEqual(result.body, body); assert.equal(Number(result.headers['content-length']), body.length);
+});
+
+test('closing a compressed download also closes the upstream stream', async t => {
+  let finish;
+  const closed = new Promise(resolve => { finish = resolve; });
+  const f = await fixture(t, { onUpstream(_req, res) {
+    res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'public, immutable' });
+    const timer = setInterval(() => res.write(randomBytes(65536)), 10);
+    res.once('close', () => { clearInterval(timer); finish(); }); return true;
+  } });
+  const { cookie } = await f.authorize();
+  await new Promise((resolve, reject) => {
+    const request = http.get({ host: '127.0.0.1', port: f.port, path: '/assets/index-AbCd1234.js', headers: { Host: f.host('asset'), Cookie: cookie, 'Accept-Encoding': 'gzip' } }, response => {
+      assert.equal(response.headers['content-encoding'], 'gzip');
+      response.once('data', () => { response.destroy(); resolve(); });
+      response.on('error', reject);
+    });
+    request.on('error', reject);
+  });
+  await closed;
+});
 
 test('portal caches only public immutable build files after authorization', async t => {
   const f = await fixture(t, { onUpstream(req, res) {
