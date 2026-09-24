@@ -107,6 +107,27 @@ test('authentication gates private data, enforces Origin/CSRF, and logout revoke
   assert.equal((await f.request('/api/projects')).status, 401);
 });
 
+test('login lasts seven days across restarts and expires without sliding renewal', async t => {
+  const f = await fixture(t);
+  const loggedAt = Date.now(); let now = loggedAt;
+  t.mock.method(Date, 'now', () => now);
+  const logged = await f.login();
+  assert.equal(logged.status, 200);
+  assert.match(logged.headers.get('set-cookie'), /; Max-Age=604800(?:;|$)/);
+
+  now = loggedAt + 13 * 60 * 60 * 1000;
+  assert.equal((await f.request('/api/projects')).status, 200);
+  await f.reopen();
+  now = loggedAt + 7 * 24 * 60 * 60 * 1000 - 1;
+  assert.deepEqual((await f.request('/api/session')).data, { authenticated: true, csrfToken: logged.data.csrfToken });
+  assert.equal((await f.request('/api/projects')).status, 200);
+
+  now += 1;
+  assert.deepEqual((await f.request('/api/session')).data, { authenticated: false });
+  assert.equal((await f.request('/api/projects')).status, 401);
+  assert.equal((await f.login()).status, 200);
+});
+
 test('CrossEx is the fourth proxy preset and its simulated balance stays in its own snapshot', async t => {
   let requested;
   const f = await fixture(t, { summaryReader: async project => {

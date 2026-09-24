@@ -16,7 +16,7 @@ const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
-const SESSION_AGE = 12 * 60 * 60 * 1000;
+const SESSION_AGE = 7 * 24 * 60 * 60 * 1000;
 const MAX_PROJECTS = 30;
 const defaults = [
   { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:8765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
