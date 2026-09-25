@@ -1,8 +1,8 @@
 # Project Aggregation · 项目工作台
 
-把 ASTER 5X、Market Monitor、Asset Ledger 和 Gate CrossEx 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
+把 ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx 和 Variational Grid 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
 
-工作台独立运行，通过一个 SSH 转发端口查看摘要并打开四个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量不会再次计入资产，CrossEx 的模拟余额和模拟盈亏也不会计入。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
+工作台独立运行，通过一个 SSH 转发端口查看摘要并打开五个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量不会再次计入资产，CrossEx 的模拟余额和模拟盈亏也不会计入。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
 
 ## 首版提供什么
 
@@ -11,7 +11,7 @@
 - 接入管理：新增、编辑、停用、删除项目，配置页面访问方式、接口地址、适配器、Asset 后台同步和数据过期阈值。
 - 工作台后端按来源时限读取已启用项目的现有数据（最多间隔 30 秒）；启用 Asset 后台同步时，每 60 秒调用原项目的同步接口。浏览器关闭后仍会执行。
 - 独立的工作台密码登录、服务器端会话和本地 SQLite 持久化。
-- 四个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
+- 五个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
 
 工作台的自动任务不会下单、启停策略或转账；Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
 
@@ -19,31 +19,31 @@
 
 ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
 
-样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。使用下方总部署命令可同时安装或升级四个模块与平台；后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。使用下方总部署命令可同时安装或升级五个模块与平台；后续项目可复用 [界面样式约定](docs/workspace-style.md)。
 
-## 一键部署四个模块与平台
+## 一键部署五个模块与平台
 
-在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
+在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx、Variational Grid 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash
 ```
 
-支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，使用 systemd。下载命令需要系统已有 curl 和 CA 证书；极简新系统若缺少它们，先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`，以后无需重复。脚本合并安装其他缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
+完整部署支持 Ubuntu 24.04、Debian 12/13，x64/arm64，使用 systemd。Variational Grid 要求 `/usr/bin/python3` 3.11+；Ubuntu 22.04 默认 Python 不满足要求，可用 `--only aster,monitor,asset,crossex,hub` 更新其余项目。脚本在安装任何项目之前检查此条件。下载命令需要系统已有 curl 和 CA 证书；极简新系统若缺少它们，先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`，以后无需重复。脚本合并安装其他缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
 
 部署时实时显示进度，每个项目完成后显示耗时，最后汇总结果。完整日志保存在 `/var/log/project-aggregation-stack/`，仅 root 可读。某个项目失败立即停止后续部署，保留之前成功的项目；修复原因后重跑同一命令即可。重跑仍检查每个项目，不会因历史成功记录而漏掉配置修改或服务停止。
 
-只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
+只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,variational,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
 
 部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
 
 ## 性能与模块联动
 
-升级四个模块后，工作台优先读取轻量摘要：ASTER 使用已发布快照和报告缓存，Asset 读取当前资产与最近 90 个北京时间日期的趋势，Monitor / CrossEx 使用已有行情状态。只有接口不存在（404/405）才回退旧接口；登录失败或无效响应不会触发更重的读取。
+升级五个模块后，工作台优先读取轻量摘要：ASTER 使用已发布快照和报告缓存，Asset 读取当前资产与最近 90 个北京时间日期的趋势，Monitor / CrossEx 使用已有行情状态。只有接口不存在（404/405）才回退旧接口；登录失败或无效响应不会触发更重的读取。
 
 工作台通过 SSE 推送摘要，连接中断时每 30 秒补查；行情按源时间本地判断过期，采用模块与工作台阈值中较短者。CrossEx 的 10 秒阈值不会被工作台默认 120 秒覆盖。摘要读取按来源时限调整频率，最快每秒、最慢每 30 秒；资产同步仍独立每分钟运行。
 
-登录后，工作台在可见且联网时依次预加载 ASTER、Monitor、Asset、CrossEx 的代理页面，最多保留四个已确认支持活动状态协议的页面，保留筛选和滚动位置。后台一次准备一个模块；直接点击立即优先打开，不必等后台队列。未显示的模块暂停前台网络刷新，进入时立即补查；交易引擎、行情采集和服务器资产同步继续运行。预加载失败或未升级的模块不会自动反复重试，可点击重新打开；修改连接配置、凭据或停用项目会撤销旧页面。
+登录后，工作台在可见且联网时依次预加载 ASTER、Monitor、Asset、CrossEx、Variational Grid 的代理页面，最多保留五个已确认支持活动状态协议的页面，保留筛选和滚动位置。后台一次准备一个模块；直接点击立即优先打开，不必等后台队列。未显示的模块暂停前台网络刷新，进入时立即补查；交易引擎、行情采集和服务器资产同步继续运行。预加载失败或未升级的模块不会自动反复重试，可点击重新打开；修改连接配置、凭据或停用项目会撤销旧页面。
 
 Monitor 与 CrossEx 可以携带币种、做多和做空交易所跳转定位；ASTER 提供到账本的入口，不根据钱包地址猜测对应资产账户。联动只调整查看条件。代理仅缓存上游明确标记为公开且不可变、带构建哈希的 JS/CSS；页面、接口及携带会话的响应继续不缓存。符合此条件且上游未压缩的静态资源会按浏览器支持启用 gzip 流式传输，减少首次打开 ASTER 时的脚本下载等待；不压缩交易接口或流式行情，也不改变已有会话校验。[限速验收记录](docs/aster-loading-2026-09-23.md)。
 
@@ -61,9 +61,25 @@ Monitor 数据源地址及其 Basic 凭据在 **CrossEx 页面**配置；同机�
 
 升级保留全部已有项目配置；若已有 `crossex` 标识，不会覆盖。手动删除入口后重启不会重新添加。首次升级时已满 30 个项目则跳过自动添加并记为已处理；腾出名额后可手动添加 `standard` 项目，使用 `proxy`、端口 `3200`、过期阈值 `120` 秒。
 
+## 接入 Variational Grid
+
+[Variational Grid](https://github.com/hxx344/variational-grid) 提供 CL/BZ 价差网格、库存组合和 QQQ / US100 对冲模拟。仓库原名 `variational-cl-bz-grid`；升级时安装器会迁移已知旧仓库地址，保留 `/etc/variational-grid`、`/var/lib/variational-grid`、原服务名和已选择的策略模式。
+
+只升级这个模块和工作台：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only variational,hub
+```
+
+工作台升级后一次性添加 `Variational Grid`，使用 `standard` 摘要、`proxy` 页面和服务器 `127.0.0.1:9876`。无需在“项目管理”填写用户名、密码或 `vr-token`；仍只转发工作台的 `3100`。模块保持仅监听本机，由工作台登录和页面授权保护代理访问。已有同标识 `variational` 的配置不会被覆盖；删除后不重加，满 30 项时跳过自动添加。
+
+首次安装默认使用原模块的三组 CL/BZ 对照；已有部署继续保留模式。请在交互式 SSH 终端执行命令：没有有效行情会话时按提示隐藏输入 `vr-token`，不会写入部署日志。没有终端且无法验证现有会话时，总部署在更新任何模块前停止并说明原因。QQQ 模式以后可在模块原页面使用“更新 Var token”；工作台摘要只读取本地已发布的模拟采样，不访问交易所或读取 token。
+
+各组模拟盈亏独立显示，单位 USDC，不相加、不计入资产账本。来源暂停、进程停止、旧样本和合成行情均明确标记；摘要沿用真实采样及持仓估值时间。网页支持预加载，隐藏时停止前台刷新，重新进入时补查；后台模拟继续运行。
+
 ## 单独安装或更新工作台
 
-适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。这一入口仅部署工作台，四个模块继续使用原来的端口。需要一起安装或升级时使用上方总部署命令。以下同一条命令用于工作台的首次安装和后续更新：
+适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。这一入口仅部署工作台，五个模块继续使用原来的端口。需要一起安装或升级时使用上方总部署命令。以下同一条命令用于工作台的首次安装和后续更新：
 
 ```bash
 sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install.sh -o "$f"; bash "$f"; rm -f "$f"'
@@ -87,7 +103,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或 DNS；单端口原页面代理当前支持这种 SSH 本地访问方式，不承诺 Safari 或通用域名代理。[浏览器兼容说明](https://learn.microsoft.com/en-us/aspnet/core/test/localhost-tld?view=aspnetcore-10.0)
 
-## 连接四个项目
+## 连接五个项目
 
 以下是首启时预置的配置。进入“项目管理”，为已设登录保护的项目填写现有页面的密码；monitor 若启用 HTTP Basic，还要填写用户名，CrossEx 用户名为 `admin`。保存一次后，通过工作台打开项目即可自动登录。这里填写的是原项目登录凭据，不是交易所 API Key。
 
@@ -97,8 +113,9 @@ Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或
 | Market Monitor | `http://127.0.0.1:3000/?monitor=oil` | `http://127.0.0.1:3000` | `monitor` |
 | Asset Ledger | `http://127.0.0.1:5678/` | `http://127.0.0.1:5678` | `asset` |
 | Gate CrossEx | `http://127.0.0.1:3200/` | `http://127.0.0.1:3200` | `standard` |
+| Variational Grid | `http://127.0.0.1:9876/` | `http://127.0.0.1:9876` | `standard` |
 
-升级时，缺少 `accessMode` 的三个原有内置项目默认采用 `proxy`；CrossEx 预置显式使用 `proxy`。缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
+升级时，缺少 `accessMode` 的三个原有内置项目默认采用 `proxy`；CrossEx 与 Variational Grid 预置显式使用 `proxy`。缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
 
 接口地址不会自动迁移。若现有 ASTER 接口地址仍是 `http://127.0.0.1:18765`，请在“项目管理”中改为 `http://127.0.0.1:8765`，重新填写 ASTER 网页登录密码并保存。工作台不会自动改端口或把旧密码搬到新目标。采用 `proxy` 时，旧页面地址中的 `18765` 不作为连接目标，可以保留或改为上表地址。
 
@@ -128,6 +145,7 @@ Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或
 | 交易更新时间 | 实盘账户快照中的最早时间；快照缺失不会当成刚刚更新。 |
 | 原油监控 | monitor 模块的 Binance 标记价格；价差 = (布伦特 − WTI) ÷ WTI × 100%，以 WTI 为基准；两腿价格仍为 USDT/桶。 |
 | 监控时效 | 使用报价的源更新时间并保留采集器的过期/部分失败状态；工作台成功连通不代表行情新鲜。 |
+| Variational 模拟摘要 | `standard /api/hub/summary`，各组本轮累计模拟盈亏，单位 USDC；不汇总成真实资产。仅查询最新已发布采样。 |
 | CrossEx 模拟摘要 | `standard /api/hub/summary`，单独展示模块提供的模拟指标，不计入真实资产总额或资产历史。具体价差发现、来源配置和模拟操作在 CrossEx 原页面进行。 |
 
 `checkedAt` 是工作台最近一次检查时间，`updatedAt` 是数据源实际更新时间；纯手工账本对应手工估值记录时间。默认 aster / monitor 超过 120 秒、asset 动态资产超过 900 秒标记过期，可按项目调整为 30–86400 秒。只有所有资产行都明确为 `mode=manual` 才按静态估值处理，不因记录较早就判定实时报价过期；未知或缺失分类按动态数据处理并提示不完整。单次上游读取总时限默认 5 秒；一个项目超时不会阻塞其他项目。

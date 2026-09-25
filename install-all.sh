@@ -5,32 +5,35 @@ set -Eeuo pipefail
 STACK_CACHE=/var/cache/project-aggregation-stack
 STACK_LOGS=/var/log/project-aggregation-stack
 STACK_LOCK=/run/lock/project-aggregation-stack.lock
-STACK_ORDER=(aster monitor asset crossex hub)
+STACK_ORDER=(aster monitor asset crossex variational hub)
 declare -A STACK_REPOS=(
   [aster]=aster_5x [monitor]=market-spread-monitor [asset]=asset-ledger
-  [crossex]=gate-crossex-arbitrage [hub]=project-aggregation
+  [variational]=variational-grid [crossex]=gate-crossex-arbitrage [hub]=project-aggregation
 )
 declare -A STACK_PATHS=(
   [aster]=install-trading.sh [monitor]=deploy/install.sh [asset]=install.sh
-  [crossex]=install.sh [hub]=install.sh
+  [variational]=install.sh [crossex]=install.sh [hub]=install.sh
 )
 declare -A STACK_NAMES=(
   [aster]='ASTER 5X' [monitor]='Market Monitor' [asset]='Asset Ledger'
-  [crossex]='Gate CrossEx' [hub]='Project Aggregation'
+  [variational]='Variational Grid' [crossex]='Gate CrossEx' [hub]='Project Aggregation'
 )
 declare -A stack_status=() stack_seconds=()
 stack_selected=()
 stack_workers=()
 stack_refresh=0 stack_run='' stack_active='' stack_child='' stack_viewer=''
   stack_started=$SECONDS
+stack_input=''
 
 stack_log() { printf '[总部署] %s\n' "$*"; }
 stack_fail() { stack_log "错误：$*" >&2; return 1; }
 stack_usage() {
   cat <<'HELP'
-用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,hub] [--refresh]
-默认安装或升级四个模块及平台；已有配置、密码和数据由各自安装器保留。
+用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,variational,hub] [--refresh]
+默认安装或升级五个模块及平台；已有配置、密码和数据由各自安装器保留。
 支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，需 systemd。
+  Variational 需要 Python 3.11+；Ubuntu 22.04 默认 Python 不满足要求。
+  首次导入行情令牌请从交互式 SSH 终端运行，输入隐藏且不写入日志。
   --only     只检查和部署指定项目，始终按上述顺序执行，平台最后部署。
   --refresh  重新下载安装器；不强制重装应用依赖、构建或重启。
   --help     查看说明，无需 root。
@@ -56,7 +59,7 @@ stack_parse() {
   IFS=, read -r -a items <<< "$only"
   for item in "${items[@]}"; do
     # Validate before using a user-supplied associative array subscript.
-    case "$item" in aster|monitor|asset|crossex|hub) requested[$item]=1 ;;
+    case "$item" in aster|monitor|asset|crossex|variational|hub) requested[$item]=1 ;;
       *) stack_fail "未知项目：$item"; return 1 ;; esac
   done
   stack_selected=()
@@ -75,9 +78,29 @@ stack_preflight() {
   case "$ID:$VERSION_ID" in ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;;
     *) stack_fail '支持 Ubuntu 22.04/24.04、Debian 12/13。'; return 1 ;; esac
   case $(uname -m) in x86_64|aarch64|arm64) ;; *) stack_fail '仅支持 x64 或 arm64。'; return 1 ;; esac
+  if [[ " ${stack_selected[*]} " == *' variational '* ]]; then stack_variational_preflight "$ID:$VERSION_ID"; fi
   command -v apt-get >/dev/null && command -v dpkg-query >/dev/null && command -v flock >/dev/null || {
     stack_fail '需要 apt-get、dpkg-query 和 util-linux 的 flock。'; return 1;
   }
+}
+
+# Open the terminal before setsid, preserving hidden getpass input in the child.
+stack_variational_python_ready() { /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; }
+stack_open_terminal() { { exec {stack_input}</dev/tty; } 2>/dev/null; }
+stack_variational_session_ready() {
+  local current=/opt/variational-grid/current conf=/etc/variational-grid mode config=config.json
+  [[ -d $current && -f $conf/mode ]] || return 1
+  mode=$(cat "$conf/mode")
+  [[ $mode != inventory ]] || config=inventory-base.json
+  (cd "$current" && runuser -u variational-grid -- /usr/bin/python3 -m variational_grid check-session --config "$conf/$config") >/dev/null 2>&1
+}
+stack_variational_preflight() {
+  if [[ $1 == ubuntu:22.04 || -x /usr/bin/python3 ]]; then
+    stack_variational_python_ready || { stack_fail 'Variational Grid 需要 /usr/bin/python3 3.11+；请使用 Debian 12/13 或 Ubuntu 24.04，或用 --only aster,monitor,asset,crossex,hub 跳过此模块。'; return 1; }
+  fi
+  if stack_open_terminal; then return; fi
+  stack_input=''
+  stack_variational_session_ready || { stack_fail 'Variational Grid 首次安装或令牌失效时需要交互式终端，请在 SSH 终端重跑原命令以隐藏输入 vr-token。尚未安装或更新任何模块。'; return 1; }
 }
 
 stack_ensure_tools() {
@@ -87,6 +110,7 @@ stack_ensure_tools() {
   for item in "${stack_selected[@]}"; do
     case "$item" in
       aster) packages+=(python3 python3-venv tar xz-utils util-linux passwd) ;;
+      variational) packages+=(python3 git util-linux passwd) ;;
       monitor) packages+=(python3 xz-utils util-linux passwd iproute2) ;;
       asset|crossex|hub) packages+=(git xz-utils tar util-linux passwd) ;;
     esac
@@ -226,7 +250,13 @@ stack_run_installers() {
     # Do not use 'if bash ...' or source the installer: preserve its own errexit and traps.
     # Log directly to disk; a broken console/tee must not abort a service activation.
     : > "$stack_run/$item.log"
-    setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
+    if [[ $item == variational && -n $stack_input ]]; then
+      VARIATIONAL_SESSION_STDIN=1 setsid bash "$stack_run/$item.sh" <&"$stack_input" > "$stack_run/$item.log" 2>&1 &
+    elif [[ $item == variational ]]; then
+      VARIATIONAL_SESSION_STDIN=1 setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
+    else
+      setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
+    fi
     stack_child=$!
     stack_stream "$stack_child" "$stack_run/$item.log" &
     stack_viewer=$!

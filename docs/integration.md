@@ -32,6 +32,16 @@ Gate CrossEx 是第四个预置入口：`id=crossex`、`category=trading`、`ada
 
 CrossEx 第一版仅模拟同币种跨交易所永续价差套利。Monitor 作为发现数据源，在 CrossEx 页面配置来源地址和来源凭据；这些凭据与工作台保存的 CrossEx 登录凭据独立。模拟余额、收益及趋势只属于该标准项目，不进入 Asset Ledger 资产总额与曲线。
 
+## Variational Grid 预置接入
+
+第五个预置为 `id=variational`、`name=Variational Grid`、`adapter=standard`、`category=trading`、`accessMode=proxy`、`autoSync=false`、`order=4`，页面和接口使用 `http://127.0.0.1:9876`，工作台阈值 120 秒。独立 `seeded-variational-v1` 迁移遵循同样的一次性添加、同标识保留及 30 项上限规则。
+
+该模块只监听 loopback，不提供独立 Basic 登录；项目凭据留空。代理沿用工作台会话及一次性页面授权，原模块继续检查 localhost Host、同源 Origin 和写操作 token。`vr-token` 仅供原模拟引擎访问行情，不是工作台登录凭据。
+
+`/api/hub/summary` 和 `?schemaVersion=2` 都返回 v2；仅查询共同采样库的 runtime 和末条 summary，不读取历史或各组仓位库，不调用交易所。CL/BZ、库存组合及压缩/旧格式 QQQ 采样均受支持。显示独立组的本轮模拟盈亏 USDC，不相加；无效数值为 null。来源时间取采样时间；QQQ 还受行情源及已持有 US100 仓位估值时间限制。过期阈值沿用模块 `max(60, poll_seconds * 3)`，工作台采用与本地设置较短者。无样本或重置中使用 null 时间；暂停/降级为 partial，停止为 offline，过期为 stale，合成行情标明演示。
+
+三种页面均支持 `activity`；只接受精确宿主来源与父窗口的握手，隐藏、离线时暂停 GET，重新激活时补查，不影响后台模拟或自动重试写请求。
+
 ## 摘要接口
 
 ```http
@@ -135,11 +145,11 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 ## 页面活动与查看条件联动
 
-工作台最多保留四个确认支持 `activity` 的代理 iframe，按插入顺序保持 DOM 稳定，切换项目不移动已有 iframe。登录并取得项目配置后，可见且联网持续 200 ms 即开始依次预加载四个内置模块；只接受已启用、配置了 `apiUrl` 且 ID 与适配器匹配的代理接入（`aster/aster`、`monitor/monitor`、`asset/asset`、`crossex/standard`）。直接接入和自定义模块仍由点击打开。
+工作台最多保留五个确认支持 `activity` 的代理 iframe，按插入顺序保持 DOM 稳定，切换项目不移动已有 iframe。登录并取得项目配置后，可见且联网持续 200 ms 即开始依次预加载五个内置模块；只接受已启用、配置了 `apiUrl` 且 ID 与适配器匹配的代理接入（`aster/aster`、`monitor/monitor`、`asset/asset`、`crossex/standard`、`variational/standard`）。直接接入和自定义模块仍由点击打开。
 
 后台一次准备一个模块，点击选择的项目立即打开；快速切换时最多保留当前项目和一个后台项目的未完成加载。悬停或键盘聚焦只调整尚未开始的队列顺序。每个 revision 自动尝试一次，失败、超时或文档加载后 3 秒仍未确认 `activity` 的隐藏页面会卸载并释放队列，用户点击可重新尝试；不循环签发 launch。首次授权仍在创建 iframe 后立即消费原有一次性 ticket，不缓存 ticket 或改变授权有效期。退出登录卸载全部页面；项目配置或凭据 revision 改变时撤销旧页面并重新授权，停用或移除项目会清理相应预加载。
 
-四个内置模块在代理 iframe 中默认 inactive，先准备界面与脚本，收到宿主 activity 后才开始前台数据读取。页面隐藏、离线或 host `active=false` 时停止前台刷新并取消在途读取，恢复后立即补查；不停止任何后台交易、采集或同步任务。预加载不延长行情有效期，也不保证刚登录后立即点击的模块已经加载完成。
+五个内置模块在代理 iframe 中默认 inactive，先准备界面与脚本，收到宿主 activity 后才开始前台数据读取。页面隐藏、离线或 host `active=false` 时停止前台刷新并取消在途读取，恢复后立即补查；不停止任何后台交易、采集或同步任务。预加载不延长行情有效期，也不保证刚登录后立即点击的模块已经加载完成。
 
 消息统一使用 `{channel:"project-hub", version:1, type:...}`。工作台发 `ready`（`role:"host"`），模块确认 `ready`（`role:"module", capabilities:["activity","navigate","changed"]`）。模块可以先发无能力的 `ready` 探测，工作台回握手后才确认能力。`activity` 携带布尔 `active`；实际写入成功后可发 `changed, scope:"summary"`，工作台合并短时间重复通知，只刷新相应项目。
 

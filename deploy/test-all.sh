@@ -75,9 +75,23 @@ if [[ $(uname -s) != Linux ]]; then
 fi
 
 stack_parse
-[[ ${stack_selected[*]} == 'aster monitor asset crossex hub' ]]
+[[ ${stack_selected[*]} == 'aster monitor asset crossex variational hub' ]]
 stack_parse --only hub,monitor,monitor,aster
 [[ ${stack_selected[*]} == 'aster monitor hub' ]]
+stack_parse --only hub,variational
+[[ ${stack_selected[*]} == 'variational hub' ]]
+[[ ${STACK_REPOS[variational]} == variational-grid && ${STACK_PATHS[variational]} == install.sh ]]
+# Capability failures are detected before dependencies/downloads or earlier modules run.
+(
+  stack_variational_python_ready() { return 1; }
+  if stack_variational_preflight ubuntu:22.04; then exit 1; fi
+  stack_variational_python_ready() { return 0; }
+  stack_open_terminal() { return 1; }
+  stack_variational_session_ready() { return 1; }
+  if stack_variational_preflight ubuntu:24.04; then exit 1; fi
+  stack_variational_session_ready() { return 0; }
+  stack_variational_preflight ubuntu:24.04
+)
 for invalid in unknown ',hub' 'hub,' 'aster,,hub'; do
   if (stack_parse --only "$invalid"); then echo "Invalid selection accepted: $invalid" >&2; exit 1; fi
 done
@@ -104,7 +118,7 @@ grep -q 'install .*curl' "$test_root/apt"
 grep -q 'install .*python3-venv' "$test_root/apt"
 rm "$test_root/missing-packages"
 
-# Fresh deployment prefetches every script and runs all five, with the hub last.
+# Fresh deployment prefetches every script and runs all six, with the hub last.
 new_run
 stack_prefetch
 for item in "${STACK_ORDER[@]}"; do assert stack_cache_valid "$STACK_CACHE/$item"; done
@@ -117,7 +131,7 @@ cmp "$test_root/expected" "$test_root/executed"
 : > "$test_root/downloads"
 new_run
 stack_prefetch
-[[ $(grep -c $'\t.*/etag$' "$test_root/downloads") == 5 ]]
+[[ $(grep -c $'\t.*/etag$' "$test_root/downloads") == 6 ]]
 for item in "${STACK_ORDER[@]}"; do grep -q '复用缓存' "$stack_run/$item.download.log"; done
 stack_run_installers
 cmp "$test_root/expected" "$test_root/executed"

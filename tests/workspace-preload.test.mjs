@@ -2,20 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { canPreload, emptyWorkspacePlan, planWorkspace, projectKey } from '../src/hub-state.ts';
 
-const projects = ['aster', 'monitor', 'asset', 'crossex'].map(id => ({ id, adapter: id === 'crossex' ? 'standard' : id, enabled: true, accessMode: 'proxy', apiUrl: 'http://127.0.0.1:9000', revision: 'one' }));
+const projects = ['aster', 'monitor', 'asset', 'crossex', 'variational'].map(id => ({ id, adapter: ['crossex', 'variational'].includes(id) ? 'standard' : id, enabled: true, accessMode: 'proxy', apiUrl: 'http://127.0.0.1:9000', revision: 'one' }));
 const keys = projects.map(projectKey);
 const finish = (state, key, phase = 'ready') => ({ ...state, frames: state.frames.map(frame => frame.key === key ? { ...frame, phase } : frame) });
 const reconcile = (state, active = null, hint = null, allowed = true, list = projects) => planWorkspace(state, list, active, hint, allowed);
 
-test('idle warmup starts one module at a time and retains all four without moving their documents', () => {
+test('idle warmup starts one module at a time and retains all five without moving their documents', () => {
   let state = reconcile(emptyWorkspacePlan(), null, null, false); assert.deepEqual(state.frames, []);
   for (const key of keys) {
     state = reconcile(state); assert.deepEqual(state.frames.filter(frame => frame.phase === 'loading').map(frame => frame.key), [key]);
     state = finish(state, key);
   }
   const order = state.frames.map(frame => frame.key);
-  for (const id of ['crossex', 'aster', 'asset', 'monitor', 'crossex']) {
-    state = reconcile(state, id); assert.deepEqual(state.frames.map(frame => frame.key), order); assert.equal(state.frames.length, 4);
+  for (const id of ['crossex', 'variational', 'aster', 'asset', 'monitor', 'crossex']) {
+    state = reconcile(state, id); assert.deepEqual(state.frames.map(frame => frame.key), order); assert.equal(state.frames.length, 5);
   }
   state = reconcile(state, null, null, true, [...projects].reverse()); assert.deepEqual(state.frames.map(frame => frame.key), order);
 });
@@ -41,9 +41,9 @@ test('failed or incompatible preload frees the queue and is not retried until ex
   let state = reconcile(emptyWorkspacePlan());
   state = reconcile(finish(state, keys[0], 'failed')); assert.deepEqual(state.frames.map(frame => frame.key), [keys[1]]);
   state = reconcile(finish(state, keys[1], 'unsupported')); assert.deepEqual(state.frames.map(frame => frame.key), [keys[2]]);
-  state = reconcile(finish(state, keys[2])); state = reconcile(finish(state, keys[3]));
+  state = reconcile(finish(state, keys[2])); state = reconcile(finish(state, keys[3])); state = reconcile(finish(state, keys[4]));
   for (let i = 0; i < 10; i++) state = reconcile(state);
-  assert.deepEqual(state.frames.map(frame => frame.key), [keys[2], keys[3]]);
+  assert.deepEqual(state.frames.map(frame => frame.key), [keys[2], keys[3], keys[4]]);
   state = reconcile(state, 'aster'); assert.equal(state.frames.at(-1).key, keys[0]); assert.equal(state.frames.at(-1).phase, 'loading');
 });
 

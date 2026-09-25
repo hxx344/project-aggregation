@@ -40,7 +40,7 @@ export type FramePhase = 'loading' | 'ready' | 'failed' | 'unsupported';
 export type WorkspacePlan = { frames: { key: string; phase: FramePhase }[]; attempted: string[]; recent: string[] };
 export const emptyWorkspacePlan = (): WorkspacePlan => ({ frames: [], attempted: [], recent: [] });
 export function canPreload(project: Project) {
-  const adapters: Record<string, string> = { aster: 'aster', monitor: 'monitor', asset: 'asset', crossex: 'standard' };
+  const adapters: Record<string, string> = { aster: 'aster', monitor: 'monitor', asset: 'asset', crossex: 'standard', variational: 'standard' };
   return project.enabled && project.accessMode === 'proxy' && !!project.apiUrl && adapters[project.id] === project.adapter;
 }
 export function planWorkspace(previous: WorkspacePlan, projects: Project[], activeId: string | null, priorityId: string | null, allowPreload: boolean): WorkspacePlan {
@@ -61,12 +61,12 @@ export function planWorkspace(previous: WorkspacePlan, projects: Project[], acti
   const pending = frames.filter(frame => frame.key !== activeKey && frame.phase === 'loading');
   const retainedPending = recent.map(key => pending.find(frame => frame.key === key)).find(Boolean) ?? pending[0];
   frames = frames.filter(frame => frame.phase !== 'loading' || frame.key === activeKey || frame === retainedPending);
-  while (frames.length > 4) {
+  while (frames.length > 5) {
     const candidates = frames.filter(frame => frame.key !== activeKey);
     const oldest = candidates.reduce((a, b) => (recent.indexOf(a.key) < 0 ? Infinity : recent.indexOf(a.key)) >= (recent.indexOf(b.key) < 0 ? Infinity : recent.indexOf(b.key)) ? a : b);
     frames = frames.filter(frame => frame !== oldest);
   }
-  if (allowPreload && frames.length < 4 && !frames.some(frame => frame.phase === 'loading')) {
+  if (allowPreload && frames.length < 5 && !frames.some(frame => frame.phase === 'loading')) {
     const candidates = projects.filter(project => canPreload(project) && !attempted.has(projectKey(project)) && !frames.some(frame => frame.key === projectKey(project)));
     const next = candidates.find(project => project.id === priorityId) ?? candidates[0];
     if (next) { const key = projectKey(next); frames.push({ key, phase: 'loading' }); attempted.add(key); }

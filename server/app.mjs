@@ -23,6 +23,7 @@ const defaults = [
   { id: 'monitor', name: 'Market Monitor', description: '原油价差与市场监控', category: 'monitoring', adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=oil', apiUrl: 'http://127.0.0.1:3000', staleAfterSeconds: 120 },
   { id: 'asset', name: 'Asset Ledger', description: '资产账本、持有金额与历史变化', category: 'assets', adapter: 'asset', url: 'http://127.0.0.1:5678', apiUrl: 'http://127.0.0.1:5678', staleAfterSeconds: 900 },
   { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
+  { id: 'variational', name: 'Variational Grid', description: 'CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:9876', apiUrl: 'http://127.0.0.1:9876', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
 ].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
@@ -66,13 +67,15 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     db.exec('BEGIN IMMEDIATE');
     try { for (const project of defaults) db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
-  if (!getSetting('seeded-crossex-v1')) {
+  for (const id of ['crossex', 'variational']) {
+    const marker = `seeded-${id}-v1`;
+    if (getSetting(marker)) continue;
     db.exec('BEGIN IMMEDIATE');
     try {
-      const project = defaults.find(item => item.id === 'crossex');
+      const project = defaults.find(item => item.id === id);
       // Keep existing connections intact; the marker also preserves a later user deletion.
       db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
-      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded-crossex-v1', '1');
+      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run(marker, '1');
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
