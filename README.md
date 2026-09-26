@@ -63,7 +63,7 @@ Monitor 数据源地址及其 Basic 凭据在 **CrossEx 页面**配置；同机�
 
 ## 接入 Variational Grid
 
-[Variational Grid](https://github.com/hxx344/variational-grid) 提供 CL/BZ 价差网格、库存组合和 QQQ / US100 对冲模拟。仓库原名 `variational-cl-bz-grid`；升级时安装器会迁移已知旧仓库地址，保留 `/etc/variational-grid`、`/var/lib/variational-grid`、原服务名和已选择的策略模式。
+[Variational Grid](https://github.com/hxx344/variational-grid) 默认提供 Lighter QQQ / Variational US100 对冲剥头皮模拟；旧 CL/BZ 模式仅保留历史兼容入口，不与 QQQ 同时启动。仓库原名 `variational-cl-bz-grid`；升级时安装器会迁移已知旧仓库地址，保留 `/etc/variational-grid`、`/var/lib/variational-grid`、原服务名和已选择的策略模式。
 
 只升级这个模块和工作台：
 
@@ -71,9 +71,9 @@ Monitor 数据源地址及其 Basic 凭据在 **CrossEx 页面**配置；同机�
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only variational,hub
 ```
 
-工作台升级后一次性添加 `Variational Grid`，使用 `standard` 摘要、`proxy` 页面和服务器 `127.0.0.1:9876`。无需在“项目管理”填写用户名、密码或 `vr-token`；仍只转发工作台的 `3100`。模块保持仅监听本机，由工作台登录和页面授权保护代理访问。已有同标识 `variational` 的配置不会被覆盖；删除后不重加，满 30 项时跳过自动添加。
+工作台升级后一次性添加 `Variational Grid`，使用 `standard` 摘要、`proxy` 页面和服务器 `127.0.0.1:9876`。无需在“项目管理”填写用户名、密码或 `vr-token`；仍只转发工作台的 `3100`。模块保持仅监听本机，由工作台登录和页面授权保护代理访问。已有同标识 `variational` 的连接配置不会被覆盖；精确匹配的旧内置介绍一次性更新为 QQQ / US100，自定义介绍保留。删除后不重加，满 30 项时跳过自动添加。
 
-首次安装默认使用原模块的三组 CL/BZ 对照；已有部署继续保留模式。请在交互式 SSH 终端执行命令：没有有效行情会话时按提示隐藏输入 `vr-token`，不会写入部署日志。没有终端且无法验证现有会话时，总部署在更新任何模块前停止并说明原因。QQQ 模式以后可在模块原页面使用“更新 Var token”；工作台摘要只读取本地已发布的模拟采样，不访问交易所或读取 token。
+首次安装默认使用 QQQ / US100 的三组止盈对照；已有部署继续保留模式。原模块显式使用 `--qqq-hedge` 可切换到 QQQ，沿用同一对模拟和网页服务，保留旧账本。请在交互式 SSH 终端执行命令：没有有效行情会话时按提示隐藏输入 `vr-token`，不会写入部署日志。没有终端且无法验证现有会话时，总部署在更新任何模块前停止并说明原因。QQQ 模式以后可在模块原页面使用“更新 Var token”；工作台摘要只读取本地已发布的模拟采样，不访问交易所或读取 token。
 
 各组模拟盈亏独立显示，单位 USDC，不相加、不计入资产账本。来源暂停、进程停止、旧样本和合成行情均明确标记；摘要沿用真实采样及持仓估值时间。网页支持预加载，隐藏时停止前台刷新，重新进入时补查；后台模拟继续运行。
 

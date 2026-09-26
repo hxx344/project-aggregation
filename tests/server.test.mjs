@@ -139,6 +139,7 @@ test('CrossEx and Variational proxy presets keep paper metrics outside the real 
   assert.deepEqual(projects.map(project => project.id), ['aster', 'monitor', 'asset', 'crossex', 'variational']);
   assert.match(projects[3].revision, /^[a-f0-9]{64}$/);
   assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false, revision: projects[3].revision });
+  assert.equal(projects[4].description, 'Lighter QQQ / Variational US100 对冲剥头皮模拟');
   const asset = await f.app.check('asset');
   const simulation = await f.app.check('crossex');
   assert.equal(requested.adapter, 'standard');
@@ -230,6 +231,63 @@ test('the Variational migration preserves an existing same-id project, credentia
   await f.reopen(db => { saved = db.prepare("SELECT * FROM projects WHERE id='variational'").get(); db.exec("DELETE FROM settings WHERE key='seeded-variational-v1'"); });
   assert.deepEqual((await f.request('/api/overview')).data.projects.find(item => item.project.id === 'variational'), before);
   await f.reopen(db => { assert.deepEqual(db.prepare("SELECT * FROM projects WHERE id='variational'").get(), saved); });
+});
+
+test('Variational description upgrades the exact old default once while preserving saved configuration and snapshots', async t => {
+  const oldDescription = 'CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟';
+  const description = 'Lighter QQQ / Variational US100 对冲剥头皮模拟';
+  const f = await fixture(t); await f.login();
+  assert.equal((await f.request('/api/projects/variational', { method: 'PUT', body: { name: 'My QQQ', apiUrl: 'http://127.0.0.1:9320', url: 'http://127.0.0.1:9320/custom', authOrigin: 'http://localhost:9320', accessMode: 'direct', staleAfterSeconds: 600, order: 12, username: 'custom-reader', password: 'test-only-variational-password' } })).status, 200);
+  await f.app.check('variational');
+  let saved; let snapshots; let other;
+  await f.reopen(db => {
+    const row = db.prepare("SELECT * FROM projects WHERE id='variational'").get();
+    const project = { ...JSON.parse(row.json), description: oldDescription, enabled: false };
+    db.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'variational');
+    saved = { ...row, json: JSON.stringify(project) };
+    snapshots = db.prepare('SELECT * FROM snapshots ORDER BY id').all();
+    assert.ok(snapshots.some(item => item.id === 'variational'));
+    const monitor = JSON.parse(db.prepare("SELECT json FROM projects WHERE id='monitor'").get().json);
+    db.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify({ ...monitor, description: oldDescription }), 'monitor');
+    other = db.prepare("SELECT * FROM projects WHERE id!='variational' ORDER BY id").all();
+    db.exec("DELETE FROM settings WHERE key='updated-variational-description-v1'");
+  });
+  const upgraded = (await f.request('/api/projects')).data.projects.find(item => item.id === 'variational');
+  assert.equal(upgraded.description, description);
+  assert.equal(upgraded.enabled, false);
+  assert.equal(upgraded.hasCredentials, true);
+  await f.reopen(db => {
+    const row = db.prepare("SELECT * FROM projects WHERE id='variational'").get();
+    assert.deepEqual({ ...row, json: JSON.stringify({ ...JSON.parse(row.json), description: oldDescription }) }, saved);
+    assert.deepEqual(db.prepare('SELECT * FROM snapshots ORDER BY id').all(), snapshots);
+    assert.deepEqual(db.prepare("SELECT * FROM projects WHERE id!='variational' ORDER BY id").all(), other);
+    assert.equal(db.prepare("SELECT value FROM settings WHERE key='updated-variational-description-v1'").get().value, '1');
+  });
+  assert.equal((await f.request('/api/projects/variational', { method: 'PUT', body: { description: oldDescription } })).status, 200);
+  await f.reopen();
+  assert.equal((await f.request('/api/projects')).data.projects.find(item => item.id === 'variational').description, oldDescription);
+});
+
+test('Variational description migration preserves custom text including near-matches', async t => {
+  for (const description of ['My QQQ research', 'CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟 ']) await t.test(description, async t => {
+    const f = await fixture(t); await f.login();
+    assert.equal((await f.request('/api/projects/variational', { method: 'PUT', body: { description, name: 'Custom Var', enabled: false } })).status, 200);
+    const before = (await f.request('/api/overview')).data.projects;
+    await f.reopen(db => db.exec("DELETE FROM settings WHERE key='updated-variational-description-v1'"));
+    assert.deepEqual((await f.request('/api/overview')).data.projects, before);
+    await f.reopen(db => assert.equal(db.prepare("SELECT value FROM settings WHERE key='updated-variational-description-v1'").get().value, '1'));
+    assert.deepEqual((await f.request('/api/overview')).data.projects, before);
+  });
+});
+
+test('Variational description migration does not restore a deleted project', async t => {
+  const f = await fixture(t); await f.login();
+  assert.equal((await f.request('/api/projects/variational', { method: 'DELETE' })).status, 200);
+  const before = (await f.request('/api/overview')).data.projects;
+  await f.reopen(db => db.exec("DELETE FROM settings WHERE key='updated-variational-description-v1'"));
+  assert.deepEqual((await f.request('/api/overview')).data.projects, before);
+  await f.reopen(db => assert.equal(db.prepare("SELECT value FROM settings WHERE key='updated-variational-description-v1'").get().value, '1'));
+  assert.deepEqual((await f.request('/api/overview')).data.projects, before);
 });
 
 test('Variational migration respects the 30-project limit and does not retry after a full installation frees a slot', async t => {

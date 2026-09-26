@@ -36,6 +36,8 @@ CrossEx 第一版仅模拟同币种跨交易所永续价差套利。Monitor 作�
 
 第五个预置为 `id=variational`、`name=Variational Grid`、`adapter=standard`、`category=trading`、`accessMode=proxy`、`autoSync=false`、`order=4`，页面和接口使用 `http://127.0.0.1:9876`，工作台阈值 120 秒。独立 `seeded-variational-v1` 迁移遵循同样的一次性添加、同标识保留及 30 项上限规则。
 
+默认说明为“Lighter QQQ / Variational US100 对冲剥头皮模拟”。独立 `updated-variational-description-v1` 迁移在事务内仅替换 `variational` 精确匹配的旧默认说明“CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟”，保留自定义说明、名称、连接配置、凭据、禁用状态和快照，不恢复已删除项目；记录完成后不再改写。
+
 该模块只监听 loopback，不提供独立 Basic 登录；项目凭据留空。代理沿用工作台会话及一次性页面授权，原模块继续检查 localhost Host、同源 Origin 和写操作 token。`vr-token` 仅供原模拟引擎访问行情，不是工作台登录凭据。
 
 `/api/hub/summary` 和 `?schemaVersion=2` 都返回 v2；仅查询共同采样库的 runtime 和末条 summary，不读取历史或各组仓位库，不调用交易所。CL/BZ、库存组合及压缩/旧格式 QQQ 采样均受支持。显示独立组的本轮模拟盈亏 USDC，不相加；无效数值为 null。来源时间取采样时间；QQQ 还受行情源及已持有 US100 仓位估值时间限制。过期阈值沿用模块 `max(60, poll_seconds * 3)`，工作台采用与本地设置较短者。无样本或重置中使用 null 时间；暂停/降级为 partial，停止为 offline，过期为 stale，合成行情标明演示。
