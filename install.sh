@@ -410,7 +410,7 @@ main() {
   if [[ -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
         "$deployed_state" == "$commit $deployment_key" ]] && healthy; then
     remember_environment
-    log "版本 ${commit:0:12}、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
+    log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -452,7 +452,7 @@ main() {
   prune_releases
   rm -rf -- "$work_dir"
   trap - ERR INT TERM
-  log "安装完成：提交 ${commit:0:12}，监听 $HOST_VALUE:$PORT_VALUE；配置与数据已保留。"
+  log "安装完成：已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha")；监听 $HOST_VALUE:$PORT_VALUE，配置与数据已保留。"
   log "首次登录密码请在服务器运行：sudo journalctl -u $SERVICE --no-pager -n 30"
 }
 
