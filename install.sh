@@ -11,7 +11,9 @@ UNIT_FILE=/etc/systemd/system/project-aggregation.service
 REPOSITORY=https://github.com/hxx344/project-aggregation.git
 BRANCH=main
 NODE_VERSION=24.15.0
-INSTALL_REVISION=1
+INSTALL_REVISION=2
+# The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
+RUNTIME_DEPENDENCIES=0
 activation_started=0
 old_release=
 old_unit_backup=
@@ -172,6 +174,141 @@ run_as_service() {
   runuser -u "$SERVICE_USER" -- env "HOME=$APP_DIR/build-home" "PATH=$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin" "$@"
 }
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
+atomic_record() {
+  local destination=$1 value=$2 temporary="${1}.new.$$"
+  printf '%s\n' "$value" > "$temporary"
+  mv -f -- "$temporary" "$destination"
+}
+input_keys() {
+  # Read git trees separately so a failed read cannot be masked by printf/hash.
+  local dependency_tree typecheck_tree test_tree build_tree runtime_tree
+  dependency_tree=$(tree_hash package.json package-lock.json .npmrc) || return
+  typecheck_tree=$(tree_hash src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
+  test_tree=$(tree_hash src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
+  build_tree=$(tree_hash src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
+  runtime_tree=$(tree_hash server package.json) || return
+  # Recipes describe preparation semantics, independently of installer comments/docs.
+  dependency_key=$(printf 'dependencies-v2\n%s\n%s' "$dependency_tree" "$runtime_key" | hash)
+  typecheck_key=$(printf 'typecheck-v2\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
+  test_key=$(printf 'tests-v2\n%s\n%s' "$test_tree" "$dependency_key" | hash)
+  # Vite may inline build-time environment; keep those inputs out of runtime config.
+  build_key=$(printf 'build-v2\n%s\n%s\n%s' "$build_tree" "$dependency_key" "$build_environment" | hash)
+  application_key=$(printf 'application-v2\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$RUNTIME_DEPENDENCIES" | hash)
+  dependencies="$APP_DIR/cache/dependencies-$dependency_key"
+  built="$APP_DIR/cache/build-$build_key"
+  typecheck_stamp="$APP_DIR/cache/typechecked-$typecheck_key"
+  test_stamp="$APP_DIR/cache/tested-$test_key"
+}
+application_ready() {
+  [[ -n "$old_release" && -f "$old_release/.install-ready" && -f "$old_release/.application-key" &&
+     "$(cat "$old_release/.application-key")" == "$application_key" && -s "$old_release/dist/index.html" ]] || return 1
+  if (( RUNTIME_DEPENDENCIES )); then
+    [[ -f "$dependencies/.complete" && -d "$dependencies/node_modules" &&
+       -L "$old_release/node_modules" && "$(readlink "$old_release/node_modules")" == "$dependencies/node_modules" ]] || return 1
+  fi
+}
+prepare_source() {
+  [[ ! -d "$work_dir/source" ]] || return 0
+  mkdir "$work_dir/source"
+  git --git-dir="$APP_DIR/repository.git" archive "$commit" | tar -x -C "$work_dir/source"
+  chmod 0755 "$work_dir"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$work_dir/source"
+}
+prepare_dependencies() {
+  if [[ -f "$dependencies/.complete" && -d "$dependencies/node_modules" ]]; then
+    log '依赖与运行环境未变化，复用 root 只读依赖缓存。'
+    return
+  fi
+  [[ ! -e "$dependencies" ]] || fail '依赖缓存目录不完整，请检查后重试。'
+  log '依赖内容或运行环境变化，安装依赖。'
+  local staging="$work_dir/dependencies"
+  mkdir "$staging"
+  local name
+  for name in package.json package-lock.json .npmrc; do
+    git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:$name" 2>/dev/null || continue
+    git --git-dir="$APP_DIR/repository.git" show "$commit:$name" > "$staging/$name"
+  done
+  chmod 0755 "$work_dir"
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$staging"
+  (cd "$staging" && run_as_service env NODE_ENV=development "$NODE_BIN" "$NPM_BIN" ci --include=dev --no-audit --no-fund)
+  [[ -d "$staging/node_modules" ]] || fail '依赖安装未生成 node_modules。'
+  # Freeze once. Neither the running service nor later tests/builds can edit packages.
+  chown -R root:root "$staging"
+  chmod -R go-w "$staging"
+  atomic_record "$staging/.complete" "$dependency_key"
+  mv -- "$staging" "$dependencies"
+}
+prepare_workspace() {
+  prepare_source
+  [[ ! -d "$work_dir/source/node_modules" ]] || return 0
+  prepare_dependencies
+  local entry name modules="$work_dir/source/node_modules"
+  mkdir "$modules"
+  # Only top-level links: packages stay immutable, while Vite's .vite-temp/.vite
+  # are created in this private workspace. No dependency copy or recursive chown.
+  for entry in "$dependencies/node_modules/"* "$dependencies/node_modules/".[!.]*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    name=${entry##*/}
+    case "$name" in .vite|.vite-temp) continue ;; esac
+    ln -s "$entry" "$modules/$name"
+  done
+  chown "$SERVICE_USER:$SERVICE_USER" "$modules"
+}
+prepare_application() {
+  local reuse=0 need_build=1
+  if application_ready; then reuse=1; fi
+  if (( reuse )) || [[ -f "$built/.complete" && -s "$built/dist/index.html" ]]; then need_build=0; fi
+  if [[ ! -f "$typecheck_stamp" || ! -f "$test_stamp" ]] || (( need_build )); then prepare_workspace; fi
+  if [[ ! -f "$typecheck_stamp" ]]; then
+    log '类型检查输入变化，执行一次类型检查。'
+    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run check)
+    atomic_record "$typecheck_stamp" "$typecheck_key"
+  else log '类型检查输入未变化，复用验证结果。'; fi
+  if [[ ! -f "$test_stamp" ]]; then
+    log '测试或相关源码变化，在隔离目录执行行为测试。'
+    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" test)
+    atomic_record "$test_stamp" "$test_key"
+  else log '行为测试输入未变化，复用验证结果。'; fi
+  if (( need_build )); then
+    log '前端内容或运行环境变化，构建页面。'
+    (cd "$work_dir/source" && run_as_service env NODE_ENV=production "$NODE_BIN" "$NPM_BIN" run build:bundle)
+    [[ -s "$work_dir/source/dist/index.html" ]] || fail '构建缺少 dist/index.html。'
+    [[ ! -e "$built" ]] || fail '构建缓存目录不完整，请检查后重试。'
+    mkdir "$work_dir/build"
+    cp -a "$work_dir/source/dist" "$work_dir/build/dist"
+    chown -R root:root "$work_dir/build"
+    atomic_record "$work_dir/build/.complete" "$build_key"
+    mv -- "$work_dir/build" "$built"
+  else log '前端内容未变化，复用页面产物。'; fi
+  if (( reuse )); then
+    release=$old_release
+    log '运行代码未变化，复用当前版本；未创建发布目录。'
+    return
+  fi
+  release="$APP_DIR/releases/${commit:0:12}-${application_key:0:16}"
+  if [[ -e "$release" ]]; then
+    [[ ! -L "$release" && -f "$release/.managed-release" && "$(cat "$release/.managed-release")" == "$commit" &&
+       -f "$release/.application-key" && "$(cat "$release/.application-key")" == "$application_key" &&
+       -s "$release/dist/index.html" ]] || fail '候选版本目录已有未知或不完整内容，请检查后重试。'
+    if (( RUNTIME_DEPENDENCIES )); then
+      prepare_dependencies
+      [[ -L "$release/node_modules" && "$(readlink "$release/node_modules")" == "$dependencies/node_modules" ]] || fail '候选版本依赖链接不正确。'
+    fi
+    return
+  fi
+  mkdir "$work_dir/publish"
+  # Re-extract runtime source as root; tests/builds cannot modify published code.
+  git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$work_dir/publish"
+  cp -a "$built/dist" "$work_dir/publish/dist"
+  if (( RUNTIME_DEPENDENCIES )); then
+    prepare_dependencies
+    ln -s "$dependencies/node_modules" "$work_dir/publish/node_modules"
+  fi
+  atomic_record "$work_dir/publish/.managed-release" "$commit"
+  atomic_record "$work_dir/publish/.source-sha" "$commit"
+  atomic_record "$work_dir/publish/.application-key" "$application_key"
+  mv -- "$work_dir/publish" "$release"
+}
 write_unit() {
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
@@ -262,14 +399,16 @@ main() {
   NPM_BIN="$(dirname "$NODE_BIN")/npm"
   [[ -x "$NPM_BIN" ]] || fail '当前 Node.js 没有对应 npm，请安装完整 Node.js 24 运行时。'
   runtime_key=$(printf '%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$("$NODE_BIN" "$NPM_BIN" --version)" "$(uname -m)" | hash)
+  build_environment=$("$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key.startsWith("VITE_")).sort(([a], [b]) => a.localeCompare(b))))')
   write_unit
-  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION"; } | hash)
+  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   log '检查远端版本。'
   commit=$(git ls-remote --exit-code "$REPOSITORY" "refs/heads/$BRANCH" | cut -f 1)
   [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail '无法确定远端 main 的提交。'
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
-  if [[ -n "$old_release" && "$deployed_state" == "$commit $deployment_key" ]] && healthy; then
+  if [[ -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
+        "$deployed_state" == "$commit $deployment_key" ]] && healthy; then
     remember_environment
     log "版本 ${commit:0:12}、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
     rm -rf -- "$work_dir"
@@ -282,76 +421,21 @@ main() {
   else
     log '源码已缓存，跳过下载。'
   fi
-  dependency_key=$(printf '%s\n%s' "$(tree_hash package.json package-lock.json)" "$runtime_key" | hash)
-  validation_key=$(printf '%s\n%s' "$(tree_hash src public server tests package.json package-lock.json tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html)" "$runtime_key" | hash)
-  build_key=$(printf '%s\n%s' "$(tree_hash src public package.json package-lock.json tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html)" "$runtime_key" | hash)
-  if [[ -n "$old_release" && -f "$old_release/.validation-key" && "${deployed_state#* }" == "$deployment_key" && "$(cat "$old_release/.validation-key")" == "$validation_key" ]] && healthy; then
-    printf '%s %s\n' "$commit" "$deployment_key" > "$APP_DIR/.deployed-state"
+  input_keys
+  prepare_application
+  if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] && healthy; then
+    atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
-    log '只有文档或部署以外的文件变化，应用内容未变化；跳过依赖、验证、构建和重启。'
+    log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
   fi
-  release="$APP_DIR/releases/${commit:0:12}-${validation_key:0:16}"
-  dependencies="$APP_DIR/cache/dependencies-$dependency_key"
-  built="$APP_DIR/cache/build-$build_key"
-  validation_stamp="$APP_DIR/cache/validated-$validation_key"
-  if [[ ! -d "$release" ]]; then
-    mkdir "$work_dir/source"
-    git --git-dir="$APP_DIR/repository.git" archive "$commit" | tar -x -C "$work_dir/source"
-    printf '%s\n' "$commit" > "$work_dir/source/.managed-release"
-    printf '%s\n' "$commit" > "$work_dir/source/.source-sha"
-    printf '%s\n' "$validation_key" > "$work_dir/source/.validation-key"
-    mv -- "$work_dir/source" "$release"
-  else
-    [[ ! -L "$release" && -f "$release/.managed-release" && "$(cat "$release/.managed-release")" == "$commit" ]] || fail '版本目录已有未知内容，停止更新。'
-  fi
-  if [[ ! -f "$dependencies/.complete" ]]; then
-    log '依赖内容或运行环境变化，安装依赖。'
-    dependency_work="$work_dir/dependencies"
-    mkdir "$dependency_work"
-    cp "$release/package.json" "$release/package-lock.json" "$dependency_work/"
-    chmod 0755 "$work_dir"
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$dependency_work"
-    (cd "$dependency_work" && run_as_service "$NODE_BIN" "$NPM_BIN" ci --no-audit --no-fund)
-    touch "$dependency_work/.complete"
-    [[ ! -e "$dependencies" ]] || fail '依赖缓存目录不完整，请检查后重试。'
-    chown -R root:root "$dependency_work"
-    mv -- "$dependency_work" "$dependencies"
-  else
-    log '依赖与运行环境未变化，复用已安装依赖。'
-  fi
-  if [[ ! -d "$release/node_modules" ]]; then cp -a "$dependencies/node_modules" "$release/node_modules"; fi
-  if [[ ! -f "$validation_stamp" || ! -f "$built/.complete" ]]; then chown -R "$SERVICE_USER:$SERVICE_USER" "$release"; fi
-  if [[ ! -f "$validation_stamp" ]]; then
-    log '内容或运行环境变化，执行类型检查和行为测试。'
-    (cd "$release" && run_as_service "$NODE_BIN" "$NPM_BIN" run check && run_as_service "$NODE_BIN" "$NPM_BIN" test)
-    touch "$validation_stamp"
-  else
-    log '复用相同内容与运行环境的验证结果。'
-  fi
-  if [[ ! -f "$built/.complete" ]]; then
-    log '前端内容或运行环境变化，构建页面。'
-    (cd "$release" && run_as_service "$NODE_BIN" "$NPM_BIN" run build)
-    [[ ! -e "$built" ]] || fail '构建缓存目录不完整，请检查后重试。'
-    mkdir "$work_dir/build"
-    cp -a "$release/dist" "$work_dir/build/dist"
-    touch "$work_dir/build/.complete"
-    mv -- "$work_dir/build" "$built"
-  elif [[ ! -f "$release/dist/index.html" ]]; then
-    log '前端内容未变化，复用构建结果。'
-    cp -a "$built/dist" "$release/dist"
-  else
-    log '前端构建已存在，跳过重复构建。'
-  fi
-  [[ -f "$release/dist/index.html" ]] || fail '构建缺少 dist/index.html。'
-  chown -R root:root "$release"
   previous_release=$old_release
   if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
   prepare_environment_rollback
   activation_started=1
-  atomic_link "$release" "$APP_DIR/current"
+  if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
   if [[ ! -f "$UNIT_FILE" ]] || ! cmp -s "$work_dir/service" "$UNIT_FILE"; then
     install -m 0644 "$work_dir/service" "$UNIT_FILE"
     systemctl daemon-reload
@@ -361,8 +445,9 @@ main() {
   wait_healthy || fail '服务未在 30 次健康检查内就绪。'
   remember_environment
   activation_started=0
-  printf '%s %s\n' "$commit" "$deployment_key" > "$APP_DIR/.deployed-state"
-  printf '%s\n' "$NODE_BIN" > "$APP_DIR/.node-path"
+  atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
+  atomic_record "$release/.install-ready" "$application_key"
+  atomic_record "$APP_DIR/.node-path" "$NODE_BIN"
   if [[ -n "$previous_release" && "$previous_release" != "$release" ]]; then atomic_link "$previous_release" "$APP_DIR/previous"; fi
   prune_releases
   rm -rf -- "$work_dir"
