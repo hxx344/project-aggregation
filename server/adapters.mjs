@@ -244,7 +244,7 @@ export async function readSummary(project, credentials, { request = requestJson,
   const staticValuation = data.assets.length > 0 && dynamicAssets.length === 0;
   const manualAt = oldest(manualAssets.map(asset => iso(asset.updatedAt)));
   const updatedAt = staticValuation ? manualAt : oldest(dynamicAssets.map(asset => iso(asset.updatedAt)));
-  const unknownMode = dynamicAssets.some(asset => !['market', 'bybit', 'aster'].includes(asset.mode));
+  const unknownMode = dynamicAssets.some(asset => !['market', 'bybit', 'aster', 'binance'].includes(asset.mode));
   const fxTime = iso(data.fxStatus?.fetchedAt);
   const fxStale = !fxTime || Date.now() - new Date(fxTime).getTime() > 300000 || !!data.fxStatus?.error;
   const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
