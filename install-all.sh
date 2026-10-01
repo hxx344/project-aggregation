@@ -23,7 +23,6 @@ stack_selected=()
 stack_workers=()
 stack_refresh=0 stack_run='' stack_active='' stack_child='' stack_viewer=''
   stack_started=$SECONDS
-stack_input=''
 
 stack_log() { printf '[总部署] %s\n' "$*"; }
 stack_fail() { stack_log "错误：$*" >&2; return 1; }
@@ -33,7 +32,8 @@ stack_usage() {
 默认安装或升级五个模块及平台；已有配置、密码和数据由各自安装器保留。
 支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，需 systemd。
   Variational 需要 Python 3.11+；Ubuntu 22.04 默认 Python 不满足要求。
-  首次导入行情令牌请从交互式 SSH 终端运行，输入隐藏且不写入日志。
+  Variational 不要求部署时输入 vr-token；缺失或失效不阻止安装。
+  默认 QQQ 模式可在页面“更新 Var token”，认证恢复前暂停相关模拟活动。
   --only     只检查和部署指定项目，始终按上述顺序执行，平台最后部署。
   --refresh  重新下载安装器；不强制重装应用依赖、构建或重启。
   --help     查看说明，无需 root。
@@ -84,23 +84,11 @@ stack_preflight() {
   }
 }
 
-# Open the terminal before setsid, preserving hidden getpass input in the child.
 stack_variational_python_ready() { /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; }
-stack_open_terminal() { { exec {stack_input}</dev/tty; } 2>/dev/null; }
-stack_variational_session_ready() {
-  local current=/opt/variational-grid/current conf=/etc/variational-grid mode config=config.json
-  [[ -d $current && -f $conf/mode ]] || return 1
-  mode=$(cat "$conf/mode")
-  [[ $mode != inventory ]] || config=inventory-base.json
-  (cd "$current" && runuser -u variational-grid -- /usr/bin/python3 -m variational_grid check-session --config "$conf/$config") >/dev/null 2>&1
-}
 stack_variational_preflight() {
   if [[ $1 == ubuntu:22.04 || -x /usr/bin/python3 ]]; then
     stack_variational_python_ready || { stack_fail 'Variational Grid 需要 /usr/bin/python3 3.11+；请使用 Debian 12/13 或 Ubuntu 24.04，或用 --only aster,monitor,asset,crossex,hub 跳过此模块。'; return 1; }
   fi
-  if stack_open_terminal; then return; fi
-  stack_input=''
-  stack_variational_session_ready || { stack_fail 'Variational Grid 首次安装或令牌失效时需要交互式终端，请在 SSH 终端重跑原命令以隐藏输入 vr-token。尚未安装或更新任何模块。'; return 1; }
 }
 
 stack_ensure_tools() {
@@ -250,13 +238,7 @@ stack_run_installers() {
     # Do not use 'if bash ...' or source the installer: preserve its own errexit and traps.
     # Log directly to disk; a broken console/tee must not abort a service activation.
     : > "$stack_run/$item.log"
-    if [[ $item == variational && -n $stack_input ]]; then
-      VARIATIONAL_SESSION_STDIN=1 setsid bash "$stack_run/$item.sh" <&"$stack_input" > "$stack_run/$item.log" 2>&1 &
-    elif [[ $item == variational ]]; then
-      VARIATIONAL_SESSION_STDIN=1 setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
-    else
-      setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
-    fi
+    setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
     stack_child=$!
     stack_stream "$stack_child" "$stack_run/$item.log" &
     stack_viewer=$!

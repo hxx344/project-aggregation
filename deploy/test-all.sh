@@ -26,10 +26,14 @@ new_run() {
 original_private_dir=$(declare -f stack_private_dir)
 stack_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
 export STACK_TEST_ROOT="$test_root"
+unset VARIATIONAL_SESSION_STDIN
 for item in "${STACK_ORDER[@]}"; do
   cat > "$test_root/upstream/$item.sh" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# Every module receives EOF, no strategy switch, and no legacy token-input flag.
+[[ ! -t 0 && \$# == 0 && ! -v VARIATIONAL_SESSION_STDIN ]]
+if read -r -t 1 unexpected_input; then exit 24; else [[ \$? == 1 ]]; fi
 printf '%s\\n' '$item' >> "\$STACK_TEST_ROOT/executed"
 printf 'Checked $item configuration and health; unchanged inputs are skipped.\\n'
 if [[ -f "\$STACK_TEST_ROOT/fail-$item" ]]; then exit 23; fi
@@ -86,11 +90,11 @@ stack_parse --only hub,variational
   stack_variational_python_ready() { return 1; }
   if stack_variational_preflight ubuntu:22.04; then exit 1; fi
   stack_variational_python_ready() { return 0; }
+  # No terminal or saved session must not gate deployment. These legacy boundary
+  # stubs also catch a regression that reintroduces the old prerequisite checks.
   stack_open_terminal() { return 1; }
   stack_variational_session_ready() { return 1; }
-  if stack_variational_preflight ubuntu:24.04; then exit 1; fi
-  stack_variational_session_ready() { return 0; }
-  stack_variational_preflight ubuntu:24.04
+  stack_variational_preflight ubuntu:22.04 </dev/null
 )
 for invalid in unknown ',hub' 'hub,' 'aster,,hub'; do
   if (stack_parse --only "$invalid"); then echo "Invalid selection accepted: $invalid" >&2; exit 1; fi
@@ -122,7 +126,7 @@ rm "$test_root/missing-packages"
 new_run
 stack_prefetch
 for item in "${STACK_ORDER[@]}"; do assert stack_cache_valid "$STACK_CACHE/$item"; done
-stack_run_installers
+stack_run_installers <<< 'Coordinator input must never reach a module installer.'
 printf '%s\n' "${STACK_ORDER[@]}" > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/executed"
 
