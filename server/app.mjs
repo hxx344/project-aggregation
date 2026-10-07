@@ -12,6 +12,7 @@ import { createAssetSync, syncAsset } from './asset-sync.mjs';
 import { createOverviewEncoder } from './overview-stream.mjs';
 import { createStaticResponder } from './static-response.mjs';
 import { createTrading, TradingError } from './trading.mjs';
+import { snapshotDiagnostics } from './diagnostics.mjs';
 import { createTradingImporter } from './trading-import.mjs';
 
 const scrypt = promisify(scryptCallback);
@@ -146,9 +147,16 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (!project.apiUrl && project.adapter !== 'link') return { ...base, message: '请配置接口地址' };
     if (project.adapter === 'link') return { ...base, state: project.url ? 'online' : 'unconfigured', message: project.url ? '链接入口；不采集项目数据' : '请配置项目地址' };
     if (!state) return base;
-    const result = { ...base, ...state, project };
+    const diagnostics = snapshotDiagnostics(state, project);
+    if (JSON.stringify(diagnostics) !== JSON.stringify(state.diagnostics)) {
+      state = { ...state, diagnostics };
+      db.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(project.id, JSON.stringify(state));
+      states.set(project.id, state);
+    }
+    const { sourceDiagnostics, sourceState, sourceMessage, transportError, ...visible } = state;
+    const result = { ...base, ...visible, project };
     result.staleAfterSeconds = Math.min(project.staleAfterSeconds, state.staleAfterSeconds || project.staleAfterSeconds);
-    if (result.freshness !== 'static' && ['online', 'partial'].includes(result.state) && (!result.updatedAt || Date.now() - new Date(result.updatedAt).getTime() > result.staleAfterSeconds * 1000)) { result.state = 'stale'; result.message = result.updatedAt ? `数据已过期。${result.message}` : `上游未提供有效的数据更新时间。${result.message}`; }
+    if (['online', 'partial'].includes(result.state) && diagnostics.some(item => item.id === 'hub:data-freshness')) { result.state = 'stale'; result.message = result.updatedAt ? `数据已过期。${result.message}` : `上游未提供有效的数据更新时间。${result.message}`; }
     return result;
   }
 
@@ -167,7 +175,10 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         const latest = db.prepare('SELECT * FROM projects WHERE id=?').get(id);
         if (!latest) return null;
         if (latest.json !== row.json || latest.credentials !== row.credentials) return snapshot(publicProject(latest));
-        const value = { state: data.state || (data.stale ? 'stale' : data.partial ? 'partial' : 'online'), message: data.message, checkedAt, updatedAt: data.updatedAt || null, latencyMs: Date.now() - start, metrics: data.metrics, ...(data.staleAfterSeconds ? { staleAfterSeconds: data.staleAfterSeconds } : {}), ...(data.freshness === 'static' ? { freshness: 'static' } : {}), ...(data.trend ? { trend: data.trend } : {}) };
+        const value = { state: data.state || (data.stale ? 'stale' : data.partial ? 'partial' : 'online'), message: data.message, checkedAt, lastSuccessAt: new Date(Date.now()).toISOString(), updatedAt: data.updatedAt || null, latencyMs: Date.now() - start, metrics: data.metrics, ...(data.staleAfterSeconds ? { staleAfterSeconds: data.staleAfterSeconds } : {}), ...(data.freshness === 'static' ? { freshness: 'static' } : {}), ...(data.trend ? { trend: data.trend } : {}) };
+        value.sourceState = value.state; value.sourceMessage = value.message;
+        if (Array.isArray(data.diagnostics)) value.sourceDiagnostics = data.diagnostics.map(({ id, kind, message }) => ({ id, kind, message }));
+        value.diagnostics = snapshotDiagnostics({ ...value, diagnostics: states.get(id)?.diagnostics || previous?.diagnostics }, project);
         db.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
       } catch (error) {
         if (closed) return null;
@@ -175,7 +186,11 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         if (!latest) return null;
         if (latest.json !== row.json || latest.credentials !== row.credentials) return snapshot(publicProject(latest));
         const unauthorized = error instanceof UpstreamError && error.code === 'unauthorized';
-        states.set(id, { ...(previous || {}), state: unauthorized ? 'unauthorized' : previous ? 'stale' : 'offline', message: `${error instanceof UpstreamError ? error.message : '无法读取项目摘要'}${previous ? '；保留上次成功数据' : ''}`, checkedAt, latencyMs: Date.now() - start, updatedAt: previous?.updatedAt || null, metrics: previous?.metrics || [] });
+        const hasData = previous && previous.lastSuccessAt !== null;
+        const message = error instanceof UpstreamError ? error.message : '无法读取项目摘要';
+        const value = { ...(previous || {}), sourceState: previous?.sourceState || (hasData ? previous.state : 'online'), sourceMessage: previous?.sourceMessage || previous?.message, lastSuccessAt: hasData ? previous.lastSuccessAt || previous.checkedAt : null, transportError: { code: unauthorized ? 'unauthorized' : 'connection', message }, state: unauthorized ? 'unauthorized' : hasData ? 'stale' : 'offline', message: `${message}${hasData ? '；保留上次成功数据' : ''}`, checkedAt, latencyMs: Date.now() - start, updatedAt: previous?.updatedAt || null, metrics: previous?.metrics || [] };
+        value.diagnostics = snapshotDiagnostics({ ...value, diagnostics: states.get(id)?.diagnostics || value.diagnostics }, project);
+        db.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
       }
       return snapshot(publicProject(rowFor(id)));
     })().finally(() => { pending.delete(id); controllers.delete(controller); if (!closed) publishOverview(); });
@@ -301,7 +316,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         const credentials = body.password ? encrypt({ password: body.password, username: body.username ?? previous?.username ?? '' }) : previous ? encrypt({ ...previous, username: body.username ?? previous.username }) : null;
         const inFlight = pending.get(id);
         db.prepare('UPDATE projects SET json=?,credentials=? WHERE id=?').run(JSON.stringify(value), credentials, id);
-        if (boundaryChanged || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) db.prepare('DELETE FROM snapshots WHERE id=?').run(id);
+        if (boundaryChanged || prior.enabled !== value.enabled || prior.staleAfterSeconds !== value.staleAfterSeconds || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) db.prepare('DELETE FROM snapshots WHERE id=?').run(id);
         states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { project: publicProject(rowFor(id)) });
         if (inFlight) void inFlight.finally(() => { if (!closed && db.prepare('SELECT id FROM projects WHERE id=?').get(id)) void check(id).catch(() => {}); }).catch(() => {});
         else void check(id).catch(() => {}); return;

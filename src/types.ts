@@ -7,6 +7,7 @@ export type Project = {
   revision?: string;
 };
 export type Metric = { key: string; label: string; value: number | string | null; unit?: string; detail?: string };
+export type Diagnostic = { id: string; kind: 'action' | 'fault' | 'notice'; message: string; firstSeenAt: string };
 export type SyncStatus = {
   state: 'idle' | 'syncing' | 'success' | 'partial' | 'error' | 'unauthorized' | 'unconfigured' | 'disabled';
   message: string; startedAt: string | null; finishedAt: string | null; lastSuccessAt: string | null; nextAttemptAt: string | null;
@@ -15,6 +16,7 @@ export type Snapshot = {
   project: Project;
   state: 'unconfigured' | 'online' | 'stale' | 'offline' | 'unauthorized' | 'disabled' | 'partial';
   message: string; checkedAt: string | null; updatedAt: string | null; latencyMs: number | null;
+  diagnostics?: Diagnostic[]; lastSuccessAt?: string | null;
   freshness?: 'dynamic' | 'static'; staleAfterSeconds?: number; sync?: SyncStatus | null; metrics: Metric[]; trend?: { at: string; value: number }[];
 };
 export type Overview = { projects: Snapshot[]; generatedAt: string };

@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { ExternalLink, FolderKanban, LoaderCircle, RefreshCw, Settings2 } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { Project } from './types';
+import type { Project, Snapshot } from './types';
+import DiagnosticDetails from './DiagnosticDetails';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
 
-export default function ProjectPage({ project, active, query, onEdit, onExpired, onStatus, onChanged, onNavigate }: { project: Project; active: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
+export default function ProjectPage({ project, snapshot, now, active, query, onEdit, onExpired, onStatus, onChanged, onNavigate }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
   const proxied = project.accessMode === 'proxy';
   const embedded = proxied || project.mode === 'embed';
   const accessible = project.enabled && !!(proxied ? project.apiUrl : project.url);
@@ -139,6 +140,7 @@ export default function ProjectPage({ project, active, query, onEdit, onExpired,
         <button className="button ghost" onClick={onEdit}><Settings2 size={16} />连接设置</button>
       </div>
     </div>
+    {snapshot ? <DiagnosticDetails snapshot={snapshot} now={now} /> : null}
     {error ? <div className="error-box original-page-error" role="alert">{error}</div> : null}
     {!accessible ? <div className="empty-state original-page-placeholder"><FolderKanban size={32} /><h2>{project.enabled ? '请先设置项目地址' : '项目已停用'}</h2><p>{project.enabled ? '保存连接设置后，即可在这里打开原始页面。' : '在连接设置中启用后，可继续访问原始页面。'}</p><button className="button secondary" onClick={onEdit}>连接设置</button></div>
       : !embedded ? <div className="empty-state original-page-placeholder"><ExternalLink size={32} /><h2>{project.name}</h2><p>此项目设为在新窗口打开。</p><button className="button primary" disabled={openingTab} onClick={() => void openInTab()}>打开原始页面</button></div>

@@ -122,11 +122,11 @@ function asterPairOrdersUnresolved(state) {
 }
 
 function asterPairVolume(state, side, now, utcDay) {
-  const unavailable = reason => ({ value: null, reason });
+  const unavailable = (reason, kind = 'notice') => ({ value: null, reason, kind });
   const stamp = finite(state?.updated_at);
-  if (stamp === null || stamp <= 0 || stamp > now) return unavailable('配对运行记录缺少有效更新时间');
-  if (now - stamp >= 120) return unavailable('配对运行记录已过期（超过 120 秒）');
-  if (asterPairOrdersUnresolved(state)) return unavailable('配对订单尚待核对，今日成交量暂不可用');
+  if (stamp === null || stamp <= 0 || stamp > now) return unavailable('配对运行记录缺少有效更新时间', 'fault');
+  if (now - stamp >= 120) return unavailable('配对运行记录已过期（超过 120 秒）', 'fault');
+  if (asterPairOrdersUnresolved(state)) return unavailable('配对订单尚待核对，今日成交量暂不可用', asterRuntimeKind(state) || 'fault');
   let unknown = !!state.volume_unknown;
   const until = state.volume_unknown_until_utc;
   if (until != null) {
@@ -143,20 +143,58 @@ function asterPairVolume(state, side, now, utcDay) {
   return value !== null && value >= 0 ? { value } : unavailable('配对今日成交量缺失或无效');
 }
 
+function asterRuntimeKind(state) {
+  if (!state || typeof state !== 'object') return null;
+  if (state.attention || state.phase === 'attention' || state.pending?.status === 'attention') return 'action';
+  if (state.error || ['reconciling', 'repairing'].includes(state.phase)) return 'fault';
+  // Compact legacy payloads do not publish the archived-order guard result.
+  // A watch alone cannot prove that the current live position is safe.
+  if (state.pending && asterPairOrdersUnresolved({ ...state, recovery_watch: null })) return 'fault';
+  return state.recovery_watch != null ? 'fault' : null;
+}
+
+function asterDiagnosticCollector() {
+  const rows = new Map();
+  const priority = { notice: 0, fault: 1, action: 2 };
+  return {
+    add(scope, key, kind, message) {
+      const id = `aster:${scope}:${createHash('sha256').update(String(key)).digest('hex').slice(0, 24)}`;
+      const row = rows.get(id) || { id, kind, messages: new Set() };
+      if (priority[kind] > priority[row.kind]) row.kind = kind;
+      row.messages.add(message); rows.set(id, row);
+    },
+    values() {
+      const entries = [...rows.values()].map(({ id, kind, messages }) => ({ id, kind, message: diagnosticMessage('', [...messages]).replace(/^；/, '') }));
+      if (entries.length <= 256) return entries;
+      const overflow = entries.splice(255);
+      entries.push({ id: 'aster:additional-issues', kind: overflow.reduce((kind, row) => priority[row.kind] > priority[kind] ? row.kind : kind, 'notice'), message: `另有 ${overflow.length} 项异常，请进入项目查看` });
+      return entries;
+    },
+  };
+}
+
 export function standardSummary(raw) {
   if (!raw || ![1, 2].includes(raw.schemaVersion) || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data) || Object.keys(raw).some(key => !['schemaVersion', 'data'].includes(key))) throw new UpstreamError('invalid', '标准协议版本或顶层字段不正确');
   const data = raw.data;
   const v2 = raw.schemaVersion === 2;
-  const allowed = v2 ? ['updatedAt', 'metrics', 'trend', 'health', 'freshness'] : ['updatedAt', 'metrics', 'trend'];
+  const allowed = v2 ? ['updatedAt', 'metrics', 'trend', 'health', 'freshness', 'diagnostics'] : ['updatedAt', 'metrics', 'trend'];
   if (Object.keys(data).some(key => !allowed.includes(key)) || (!(v2 && data.updatedAt === null) && !strictDate(data.updatedAt)) || new Date(data.updatedAt).getTime() > Date.now() + 60000 || !Array.isArray(data.metrics) || data.metrics.length > 24) throw new UpstreamError('invalid', '标准协议摘要字段不正确');
   if (v2 && (!data.health || typeof data.health !== 'object' || Array.isArray(data.health) || Object.keys(data.health).some(key => !['state', 'message', 'staleAfterSeconds'].includes(key)) || !['online', 'partial', 'stale', 'offline'].includes(data.health.state) || typeof data.health.message !== 'string' || data.health.message.length > 500 || !Number.isInteger(data.health.staleAfterSeconds) || data.health.staleAfterSeconds < 1 || data.health.staleAfterSeconds > 86400 || (data.freshness !== undefined && !['static', 'dynamic'].includes(data.freshness)))) throw new UpstreamError('invalid', '标准协议健康状态不正确');
   const keys = new Set();
+  if (data.diagnostics !== undefined) {
+    if (!Array.isArray(data.diagnostics) || data.diagnostics.length > 256) throw new UpstreamError('invalid', '标准协议诊断列表不正确');
+    const ids = new Set();
+    for (const item of data.diagnostics) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || Object.keys(item).some(key => !['id', 'kind', 'message'].includes(key)) || typeof item.id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9:_.-]{0,127}$/.test(item.id) || item.id.startsWith('hub:') || ids.has(item.id) || !['action', 'fault', 'notice'].includes(item.kind) || typeof item.message !== 'string' || !item.message.trim() || item.message.length > 500) throw new UpstreamError('invalid', '标准协议诊断字段不正确');
+      ids.add(item.id);
+    }
+  }
   for (const item of data.metrics) {
     if (!item || Object.keys(item).some(key => !['key', 'label', 'value', 'unit', 'detail'].includes(key)) || typeof item.key !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(item.key) || keys.has(item.key) || typeof item.label !== 'string' || !item.label.length || item.label.length > 80 || !(item.value === null || (typeof item.value === 'number' && Number.isFinite(item.value)) || (typeof item.value === 'string' && item.value.length <= 160)) || (item.unit !== undefined && (typeof item.unit !== 'string' || item.unit.length > 24)) || (item.detail !== undefined && (typeof item.detail !== 'string' || item.detail.length > 240))) throw new UpstreamError('invalid', '标准协议指标格式不正确');
     keys.add(item.key);
   }
   if (data.trend !== undefined && (!Array.isArray(data.trend) || data.trend.length > 366 || data.trend.some(point => !point || Object.keys(point).some(key => !['at', 'value'].includes(key)) || !strictDate(point.at) || typeof point.value !== 'number' || !Number.isFinite(point.value)))) throw new UpstreamError('invalid', '标准协议趋势格式不正确');
-  return { metrics: data.metrics, updatedAt: strictDate(data.updatedAt), ...(data.trend ? { trend: data.trend.map(point => ({ at: strictDate(point.at), value: point.value })).sort((a, b) => a.at.localeCompare(b.at)) } : {}), ...(v2 ? { state: data.health.state, staleAfterSeconds: data.health.staleAfterSeconds, ...(data.freshness ? { freshness: data.freshness } : {}), message: data.health.message } : { message: '服务数据已更新' }) };
+  return { metrics: data.metrics, updatedAt: strictDate(data.updatedAt), ...(data.diagnostics !== undefined ? { diagnostics: data.diagnostics.map(({ id, kind, message }) => ({ id, kind, message })) } : {}), ...(data.trend ? { trend: data.trend.map(point => ({ at: strictDate(point.at), value: point.value })).sort((a, b) => a.at.localeCompare(b.at)) } : {}), ...(v2 ? { state: data.health.state, staleAfterSeconds: data.health.staleAfterSeconds, ...(data.freshness ? { freshness: data.freshness } : {}), message: data.health.message } : { message: '服务数据已更新' }) };
 }
 
 // Login requests are shared while each caller retains its own deadline and cancellation.
@@ -241,7 +279,7 @@ export async function readSummary(project, credentials, { request = requestJson,
   };
   const summaryHeaders = credentials?.password && ['standard', 'monitor'].includes(project.adapter) ? { Authorization: `Basic ${Buffer.from(`${credentials.username || ''}:${credentials.password}`).toString('base64')}` } : {};
   const selectedMonitor = project.adapter === 'monitor' ? new URL(project.url || project.apiUrl).searchParams.get('monitor') : null;
-  const summaryPath = `/api/hub/summary?schemaVersion=2${selectedMonitor ? `&monitor=${encodeURIComponent(selectedMonitor)}` : ''}`;
+  const summaryPath = `/api/hub/summary?schemaVersion=2${project.adapter === 'aster' ? '&diagnostics=1' : ''}${selectedMonitor ? `&monitor=${encodeURIComponent(selectedMonitor)}` : ''}`;
   try { return standardSummary(await get(summaryPath, summaryHeaders)); }
   catch (error) { if (![404, 405].includes(error.statusCode)) throw error; }
   if (project.adapter === 'standard') return standardSummary(await get('/api/hub/summary', summaryHeaders));
@@ -250,12 +288,17 @@ export async function readSummary(project, credentials, { request = requestJson,
     const data = await get('/api/state?compact=true');
     if (!data || !Array.isArray(data.accounts) || data.accounts.length > 200) throw new UpstreamError('invalid', '交易项目响应格式不正确');
     if (data.pairs !== undefined && (!Array.isArray(data.pairs) || data.pairs.length > 100)) throw new UpstreamError('invalid', '配对项目响应格式不正确');
-    const paired = new Map();
-    for (const pair of data.pairs || []) {
-      if (!pair?.enabled) continue;
+    const paired = new Map(); const allPaired = new Map(); const pairRows = [];
+    for (const [index, pair] of (data.pairs || []).entries()) {
+      if (!pair) continue;
+      const member = { state: pair.state, id: pair.id || `${pair.long_account_id}:${pair.short_account_id}`, label: diagnosticText(pair.name || pair.id, `配对组 ${index + 1}`) };
+      pairRows.push({ pair, member });
       for (const side of ['long', 'short']) {
         const id = pair[`${side}_account_id`];
-        if (typeof id === 'string' && id) paired.set(id, { side, state: pair.state });
+        if (typeof id === 'string' && id) {
+          allPaired.set(id, member);
+          if (pair.enabled) paired.set(id, { ...member, side });
+        }
       }
     }
     const now = Date.now() / 1000;
@@ -280,17 +323,40 @@ export async function readSummary(project, credentials, { request = requestJson,
     const volumeDetail = pairVolumes.size ? '上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总' : '上游 UTC 日口径；不计入资产汇总';
     const metrics = [metric('accounts', '启用账户', accounts.length, '个'), metric('live_accounts', '实盘账户', live.length, '个'), metric('occupied_margin', '实盘占用保证金', sum(live.map(account => finite(account.snapshot?.occupied_margin))), 'USD1'), metric('daily_volume', '实盘今日成交量', sum(volumes), 'USD1', volumeDetail)];
     const reasons = [];
-    if (data.error) reasons.push(`交易服务异常：${diagnosticText(data.error, '上游未提供具体原因')}`);
-    if (!data.ready) reasons.push('交易服务尚未就绪');
+    const diagnostics = asterDiagnosticCollector();
+    if (data.error) { const reason = `交易服务异常：${diagnosticText(data.error, '上游未提供具体原因')}`; reasons.push(reason); diagnostics.add('service', 'runtime', 'fault', reason); }
+    if (!data.ready) { reasons.push('交易服务尚未就绪'); diagnostics.add('service', 'runtime', 'fault', '交易服务尚未就绪'); }
+    // Fault handling can disable a pair or account. Collect its explicit manual
+    // intervention evidence independently of the enabled-live metric scope.
+    for (const { pair, member } of pairRows) {
+      if (pair.pause_reason || asterRuntimeKind(pair.state) === 'action') diagnostics.add('pair', member.id, 'action', `${member.label}：${diagnosticText(pair.pause_reason || pair.state?.attention || pair.state?.reason, '配对组需要人工核对')}`);
+    }
+    for (const [index, account] of data.accounts.entries()) {
+      if (account.mode !== 'live') continue;
+      const runtime = [account.cycle_state, account.migration_state].find(state => asterRuntimeKind(state) === 'action');
+      if (!account.pause_reason && account.status !== 'attention' && !runtime) continue;
+      const pair = allPaired.get(account.id);
+      const label = pair?.label || diagnosticText(account.name || account.id, `实盘账户 ${index + 1}`);
+      diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, 'action', `${label}：${diagnosticText(account.pause_reason || runtime?.reason || account.reason, '账户需要人工核对')}`);
+    }
     for (const [index, account] of live.entries()) {
       const label = diagnosticText(account.name || account.id, `实盘账户 ${index + 1}`);
-      if (!account.snapshot) reasons.push(`${label}：缺少账户快照`);
+      const pair = paired.get(account.id);
+      const add = (reason, kind = 'fault') => {
+        reasons.push(`${label}：${reason}`);
+        diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, kind, `${pair ? pair.label : label}：${reason}`);
+      };
+      const runtime = pair?.state || account.cycle_state;
+      const runtimeKind = asterRuntimeKind(runtime);
+      if (runtimeKind === 'fault') diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, runtimeKind, `${pair ? pair.label : label}：${diagnosticText(runtime?.reason || runtime?.error, runtime?.recovery_watch != null ? '历史订单观察结果待确认，请升级源模块获取分类结果' : '订单正在核对或修复')}`);
+      if (account.error) add(`账户读取失败：${diagnosticText(account.error, '上游未提供具体原因')}`);
+      if (!account.snapshot) add('缺少账户快照');
       else {
-        if (!iso(account.snapshot.timestamp)) reasons.push(`${label}：快照缺少有效更新时间`);
-        if (finite(account.snapshot.occupied_margin) === null) reasons.push(`${label}：保证金数据缺失或无效`);
+        if (!iso(account.snapshot.timestamp)) add('快照缺少有效更新时间');
+        if (finite(account.snapshot.occupied_margin) === null) add('保证金数据缺失或无效');
       }
       if (volumes[index] === null) {
-        if (pairVolumes.has(account.id)) { reasons.push(`${label}：${pairVolumes.get(account.id).reason}`); continue; }
+        if (pairVolumes.has(account.id)) { const volume = pairVolumes.get(account.id); add(volume.reason, volume.kind); continue; }
         const report = account.cycle_state?.report_status;
         const daily = account.cycle_state?.daily_volume;
         const reason = report?.error ? `成交统计读取失败：${diagnosticText(report.error, '上游未提供具体原因')}`
@@ -299,10 +365,10 @@ export async function readSummary(project, credentials, { request = requestJson,
           : report?.status !== 'ready' ? '成交统计尚未就绪'
           : daily?.utc_date !== utcDay ? '成交统计缺少当日 UTC 数据'
           : '今日成交量缺失或无效';
-        reasons.push(`${label}：${reason}`);
+        add(reason, report?.error || report?.status === 'error' ? 'fault' : 'notice');
       }
     }
-    return { metrics, updatedAt, partial: reasons.length > 0, message: diagnosticMessage(data.demo ? '上游为演示模式；交易数据不计入资产汇总' : '保证金与成交量使用 USD1 口径', reasons) };
+    return { metrics, updatedAt, partial: reasons.length > 0, diagnostics: diagnostics.values(), message: diagnosticMessage(data.demo ? '上游为演示模式；交易数据不计入资产汇总' : '保证金与成交量使用 USD1 口径', reasons) };
   }
   const data = await get('/api/ledger');
   if (!data || !Array.isArray(data.assets) || data.assets.length > 1000 || !Array.isArray(data.history)) throw new UpstreamError('invalid', '资产项目响应格式不正确');

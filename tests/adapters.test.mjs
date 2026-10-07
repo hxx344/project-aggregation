@@ -299,3 +299,83 @@ function readLegacySummary(project, credentials, options) {
     return options.request(...args);
   } });
 }
+
+test('standard v2 diagnostics are optional, bounded, unique and cannot inject hub timing or identity', () => {
+  const data = { updatedAt: new Date().toISOString(), metrics: [], health: { state: 'partial', message: '统计延迟', staleAfterSeconds: 120 } };
+  const read = diagnostics => standardSummary({ schemaVersion: 2, data: { ...data, diagnostics } });
+  assert.equal(Object.hasOwn(standardSummary({ schemaVersion: 2, data }), 'diagnostics'), false);
+  assert.deepEqual(read([]).diagnostics, []);
+  const entry = { id: 'pair:gold', kind: 'notice', message: '统计延迟' };
+  assert.deepEqual(read([entry]).diagnostics, [entry]);
+  for (const diagnostics of [null, {}, [null], ['fault'], [entry, entry], Array.from({ length: 257 }, (_, i) => ({ ...entry, id: `a:${i}` })),
+    [{ ...entry, id: '' }], [{ ...entry, id: 'a'.repeat(129) }], [{ ...entry, id: 'hub:connection' }], [{ ...entry, kind: 'warning' }],
+    [{ ...entry, message: ' ' }], [{ ...entry, message: 'a'.repeat(501) }], [{ ...entry, firstSeenAt: '2000-01-01T00:00:00Z' }], [{ ...entry, secret: 'hidden' }]]) {
+    assert.throws(() => read(diagnostics), error => error.code === 'invalid');
+  }
+  assert.throws(() => standardSummary({ schemaVersion: 1, data: { updatedAt: data.updatedAt, metrics: [], diagnostics: [] } }));
+});
+
+test('only ASTER opts in to diagnostics and unchanged standard v2 sources remain compatible', async () => {
+  for (const adapter of ['aster', 'asset', 'standard', 'monitor']) {
+    const calls = [];
+    const result = await readSummary({ adapter, apiUrl: 'http://127.0.0.1:9876', url: 'http://127.0.0.1:9876/?monitor=oil' }, null, { request: async (_base, route) => {
+      calls.push(route);
+      return { data: { schemaVersion: 2, data: { updatedAt: new Date().toISOString(), metrics: [{ key: 'unknown', label: '未知', value: null }], health: { state: 'partial', message: '旧源兼容', staleAfterSeconds: 120 } } } };
+    } });
+    assert.deepEqual(calls, [`/api/hub/summary?schemaVersion=2${adapter === 'aster' ? '&diagnostics=1' : adapter === 'monitor' ? '&monitor=oil' : ''}`]);
+    assert.equal(Object.hasOwn(result, 'diagnostics'), false); assert.equal(result.metrics[0].value, null);
+  }
+});
+
+test('legacy ASTER merges pair diagnostics by stable ID and uses runtime evidence rather than message matching', async () => {
+  const f = pairedAsterFixture();
+  f.state.phase = 'attention'; f.state.attention = '人工核对'; f.state.reason = '成交统计尚未就绪';
+  let result = await f.read();
+  assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'action');
+  const id = result.diagnostics[0].id;
+  f.data.pairs[0].name = '改名'; f.state.reason = '新文案';
+  result = await f.read(); assert.equal(result.diagnostics[0].id, id);
+  f.state.phase = 'holding'; delete f.state.attention; f.state.recovery_watch = { batches: ['old'] };
+  result = await f.read(); assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'fault');
+  delete f.state.recovery_watch; f.state.volume_unknown = true;
+  result = await f.read(); assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'notice');
+  assert.equal(result.values.daily_volume, null);
+  f.state.volume_unknown = false;
+  result = await f.read(); assert.deepEqual(result.diagnostics, []); assert.equal(result.values.daily_volume, 220);
+});
+
+test('legacy ASTER ordinary statistics delays stay notices while report and margin faults remain faults', async () => {
+  const data = { ready: true, accounts: [{ id: 'a', name: 'A', enabled: true, mode: 'live', snapshot: { timestamp: Date.now() / 1000, occupied_margin: '1' }, cycle_state: { report_status: { status: 'stale' } } }] };
+  const read = () => readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data }) });
+  assert.equal((await read()).diagnostics[0].kind, 'notice');
+  data.accounts[0].cycle_state.report_status = { status: 'error', error: '读取失败' };
+  assert.equal((await read()).diagnostics[0].kind, 'fault');
+  data.accounts[0].cycle_state.report_status = { status: 'stale' }; data.accounts[0].snapshot.occupied_margin = null;
+  const result = await read(); assert.equal(result.diagnostics[0].kind, 'fault'); assert.equal(result.metrics.find(row => row.key === 'occupied_margin').value, null);
+});
+
+test('legacy ASTER retains actions for fault-paused pairs and merges paused member evidence without counting their metrics', async () => {
+  const f = pairedAsterFixture();
+  f.data.pairs[0].pause_reason = '账户模式需要人工核对'; f.state.phase = 'attention';
+  const active = await f.read(); assert.equal(active.diagnostics[0].kind, 'action');
+  f.data.pairs[0].enabled = false;
+  f.data.accounts[0].pause_reason = '账户暂停等待核对'; f.data.accounts[1].status = 'attention';
+  const paused = await f.read();
+  assert.equal(paused.diagnostics.length, 1); assert.equal(paused.diagnostics[0].kind, 'action'); assert.equal(paused.diagnostics[0].id, active.diagnostics[0].id);
+  assert.deepEqual(paused.values, { accounts: 0, live_accounts: 0, occupied_margin: null, daily_volume: null });
+  delete f.data.pairs[0].pause_reason; delete f.data.accounts[0].pause_reason; delete f.data.accounts[1].status;
+  f.state.phase = 'paused'; f.state.reason = '用户手动暂停，保持现有仓位';
+  assert.deepEqual((await f.read()).diagnostics, []);
+});
+
+test('legacy ASTER identifies disabled single-account actions from explicit runtime evidence, never pause wording', async t => {
+  const read = async account => readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, accounts: [account] } }) });
+  const base = { id: 'paused', mode: 'live', enabled: false, status: 'paused', reason: '用户暂停后可人工检查' };
+  const normal = await read({ ...base, cycle_state: { phase: 'paused', reason: '等待用户恢复' } });
+  assert.deepEqual(normal.diagnostics, []);
+  for (const evidence of [{ pause_reason: '账户模式错误' }, { status: 'attention' }, { cycle_state: { phase: 'attention', reason: '订单待核对' } }, { migration_state: { phase: 'attention', reason: '迁移待核对' } }]) await t.test(JSON.stringify(evidence), async () => {
+    const result = await read({ ...base, ...evidence });
+    assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'action');
+    assert.deepEqual(Object.fromEntries(result.metrics.map(row => [row.key, row.value])), { accounts: 0, live_accounts: 0, occupied_margin: null, daily_volume: null });
+  });
+});

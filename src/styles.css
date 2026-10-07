@@ -37,6 +37,14 @@
 @media(max-width:650px){.original-page-toolbar{padding:6px 8px;gap:4px;flex-wrap:wrap}.original-page-loading:not(:empty){flex-basis:100%;padding:4px 6px}.original-page-actions{justify-content:flex-end;width:100%}.original-page-actions .button{padding:7px 8px}.project-shell .breadcrumb{min-width:0}.project-shell .breadcrumb strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-shell .topbar-right{display:none}}
 
 .project-screen[hidden]{display:none}
+.attention-item p{white-space:pre-line}
+.diagnostic-details{flex-shrink:0;margin:8px 16px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:.8125rem;min-width:0;overflow-wrap:anywhere}
+.diagnostic-details summary{cursor:pointer;color:#47566f}.diagnostic-details summary>span{margin-left:6px;color:#8491a5;font-size:.75rem}
+.diagnostic-details ul{list-style:none;margin:10px 0 0;padding:0;max-height:240px;overflow:auto}.diagnostic-details li+li{margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+.diagnostic-details p{margin:5px 0;line-height:1.65;white-space:pre-line}.diagnostic-details small{color:#8491a5;font-size:.6875rem}
+.diagnostic-kind{font-size:.6875rem;border-radius:4px;padding:2px 6px;background:#f0f4f8;color:#66758c}.diagnostic-kind.action{color:#a1463e;background:#fff0ed}.diagnostic-kind.fault{color:#926423;background:#fff5e6}
+.project-table-row .diagnostic-details{margin:8px 0 0;max-width:360px}
+@media(max-width:650px){.diagnostic-details{margin:6px 8px}.diagnostic-details ul{max-height:180px}}
 
 .toast{align-items:flex-start;width:max-content;max-width:min(560px,calc(100vw - 32px));max-height:calc(100dvh - 50px)}.toast-content{min-width:0;overflow:auto;max-height:calc(100dvh - 82px);overflow-wrap:anywhere;white-space:pre-wrap}.toast-content strong{font-weight:500}.toast-content p{margin-top:6px;line-height:1.6;color:#e1e8f0}.toast>svg,.toast>button{margin-top:2px}.toast>button{flex-shrink:0}.toast.warning>svg{color:#ffd38c}.toast.error>svg{color:#ffb4ad}.toast.info>svg{color:#bdd6f1}.connection-details{margin-top:8px;max-width:320px;overflow-wrap:anywhere;font-size:.75rem}.connection-details summary{cursor:pointer;color:#9b642d}.connection-details p{margin-top:6px;line-height:1.6;color:#69758a;white-space:pre-wrap}.project-table-row>div{min-width:0}
 .nav-readonly { margin-left: auto; font-size: 10px; color: #acd4d2; border: 1px solid #ffffff26; border-radius: 4px; padding: 2px 5px; line-height: 1.4; }

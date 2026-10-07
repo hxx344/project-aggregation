@@ -1,4 +1,30 @@
-import type { Project, Snapshot } from './types';
+import type { Diagnostic, Project, Snapshot } from './types';
+
+export const ATTENTION_DELAY_MS = 120_000;
+
+export function snapshotDiagnostics(snapshot: Snapshot): Diagnostic[] {
+  if (!snapshot.project.enabled || snapshot.project.adapter === 'link') return [];
+  if (snapshot.diagnostics !== undefined) return snapshot.diagnostics;
+  if (['online', 'unconfigured', 'disabled'].includes(snapshot.state)) return [];
+  // Keep older server responses visible until the server can track continuity.
+  return [{ id: 'hub:legacy-health', kind: snapshot.state === 'unauthorized' ? 'action' : 'fault',
+    message: snapshot.message || '项目状态异常，请进入项目查看', firstSeenAt: snapshot.checkedAt || snapshot.updatedAt || '' }];
+}
+
+export function attentionDiagnostics(snapshot: Snapshot, now: number): Diagnostic[] {
+  return snapshotDiagnostics(snapshot).filter(issue => issue.kind === 'action'
+    || issue.kind === 'fault' && (snapshot.diagnostics === undefined || now - Date.parse(issue.firstSeenAt) >= ATTENTION_DELAY_MS));
+}
+
+export function diagnosticLabel(issue: Diagnostic, now: number): string {
+  if (issue.kind === 'action') return '需要处理';
+  if (issue.kind === 'notice') return '运行提示';
+  return now - Date.parse(issue.firstSeenAt) >= ATTENTION_DELAY_MS ? '持续异常' : '观察中';
+}
+
+export function connectionDiagnostic(issue: Diagnostic): boolean {
+  return ['hub:auth', 'hub:connection'].includes(issue.id);
+}
 
 export type NavigationQuery = { symbol?: string; longExchange?: string; shortExchange?: string };
 const venues = new Set(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter']);
@@ -20,19 +46,31 @@ export function navigation(value: unknown): { projectId: string; query: Navigati
 }
 export const projectKey = (project: Project) => `${project.id}:${project.revision || JSON.stringify(project)}`;
 export function ageSnapshot(snapshot: Snapshot, now: number): Snapshot {
-  if (snapshot.freshness === 'static' || !['online', 'partial'].includes(snapshot.state)) return snapshot;
+  if (snapshot.project.enabled === false || snapshot.project.adapter === 'link' || snapshot.freshness === 'static' || !['online', 'partial'].includes(snapshot.state)) return snapshot;
   const updated = snapshot.updatedAt ? Date.parse(snapshot.updatedAt) : NaN;
   const ttl = Math.min(snapshot.project.staleAfterSeconds, snapshot.staleAfterSeconds || snapshot.project.staleAfterSeconds);
   if (Number.isFinite(updated) && now - updated <= ttl * 1000) return snapshot;
-  return { ...snapshot, state: 'stale', message: `数据已过期。${snapshot.message}` };
+  const observed = snapshot.checkedAt ? Date.parse(snapshot.checkedAt) : NaN;
+  const expired = Number.isFinite(updated) ? updated + ttl * 1000 : observed;
+  const firstSeenAt = new Date(Math.min(now, Math.max(Number.isFinite(observed) ? observed : now, Number.isFinite(expired) ? expired : now))).toISOString();
+  const diagnostics = snapshot.diagnostics === undefined || snapshot.diagnostics.some(issue => issue.id === 'hub:data-freshness')
+    ? snapshot.diagnostics : [...snapshot.diagnostics, { id: 'hub:data-freshness', kind: 'fault' as const,
+      message: snapshot.updatedAt ? '源数据已过期，等待项目更新' : '上游未提供有效的数据更新时间', firstSeenAt }];
+  return { ...snapshot, state: 'stale', message: `数据已过期。${snapshot.message}`, ...(diagnostics ? { diagnostics } : {}) };
 }
 export function nextSnapshotExpiry(snapshots: Snapshot[], now: number): number | null {
   let next = Infinity;
   for (const snapshot of snapshots) {
-    if (snapshot.freshness === 'static' || !['online', 'partial'].includes(snapshot.state) || !snapshot.updatedAt) continue;
-    const ttl = Math.min(snapshot.project.staleAfterSeconds, snapshot.staleAfterSeconds || snapshot.project.staleAfterSeconds);
-    const expiry = Date.parse(snapshot.updatedAt) + ttl * 1000 + 1;
-    if (expiry > now) next = Math.min(next, expiry);
+    if (snapshot.project.enabled === false || snapshot.project.adapter === 'link') continue;
+    if (snapshot.freshness !== 'static' && ['online', 'partial'].includes(snapshot.state) && snapshot.updatedAt) {
+      const ttl = Math.min(snapshot.project.staleAfterSeconds, snapshot.staleAfterSeconds || snapshot.project.staleAfterSeconds);
+      const expiry = Date.parse(snapshot.updatedAt) + ttl * 1000 + 1;
+      if (expiry > now) next = Math.min(next, expiry);
+    }
+    for (const issue of ageSnapshot(snapshot, now).diagnostics || []) {
+      const maturity = Date.parse(issue.firstSeenAt) + ATTENTION_DELAY_MS;
+      if (issue.kind === 'fault' && maturity > now) next = Math.min(next, maturity);
+    }
   }
   return Number.isFinite(next) ? next : null;
 }

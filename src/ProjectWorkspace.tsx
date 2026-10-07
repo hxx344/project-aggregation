@@ -2,10 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import ProjectPage from './ProjectPage';
 import { emptyWorkspacePlan, planWorkspace, projectKey } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
-import type { Project } from './types';
+import type { Project, Snapshot } from './types';
 
-export default function ProjectWorkspace({ projects, activeId, priorityId = null, query, onEdit, onExpired, onChanged, onNavigate }: {
-  projects: Project[]; activeId: string | null; priorityId?: string | null; query?: NavigationQuery;
+export default function ProjectWorkspace({ projects, snapshots, now, activeId, priorityId = null, query, onEdit, onExpired, onChanged, onNavigate }: {
+  projects: Project[]; snapshots: Snapshot[]; now: number; activeId: string | null; priorityId?: string | null; query?: NavigationQuery;
   onEdit: (project: Project) => void; onExpired: () => void; onChanged: (id: string) => void;
   onNavigate: (id: string, query: NavigationQuery) => void;
 }) {
@@ -38,6 +38,6 @@ export default function ProjectWorkspace({ projects, activeId, priorityId = null
   return <>{plan.frames.map(frame => {
     const project = projects.find(project => projectKey(project) === frame.key);
     if (!project || (!project.enabled && project.id !== activeId)) return null;
-    return <ProjectPage key={frame.key} project={project} active={project.id === activeId} query={project.id === activeId ? query : undefined} onEdit={() => onEdit(project)} onExpired={onExpired} onStatus={phase => onStatus(frame.key, phase)} onChanged={() => onChanged(project.id)} onNavigate={onNavigate} />;
+    return <ProjectPage key={frame.key} project={project} snapshot={snapshots.find(item => item.project.id === project.id)} now={now} active={project.id === activeId} query={project.id === activeId ? query : undefined} onEdit={() => onEdit(project)} onExpired={onExpired} onStatus={phase => onStatus(frame.key, phase)} onChanged={() => onChanged(project.id)} onNavigate={onNavigate} />;
   })}</>;
 }

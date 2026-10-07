@@ -512,3 +512,87 @@ test('explicitly static valuations preserve source date without automatic stalen
   const persisted = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'asset');
   assert.equal(persisted.state, 'online'); assert.equal(persisted.freshness, 'static'); assert.equal(persisted.updatedAt, at);
 });
+
+test('structured diagnostic timers survive messages and restarts, reset on kind changes, and clear on successful recovery', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  let entries = [{ id: 'pair:gold', kind: 'fault', message: '订单核对中', firstSeenAt: '2000-01-01T00:00:00Z' }];
+  const f = await fixture(t, { summaryReader: async () => ({ ...summary(), updatedAt: new Date(now).toISOString(), state: 'partial', diagnostics: entries }) }); await f.login();
+  const first = await f.app.check('aster');
+  assert.equal(first.diagnostics[0].firstSeenAt, new Date(now).toISOString());
+  assert.equal(first.sourceDiagnostics, undefined); assert.equal(first.sourceState, undefined);
+  now += 60000; entries = [{ ...entries[0], message: '继续核对' }];
+  const continuing = await f.app.check('aster');
+  assert.equal(continuing.diagnostics[0].firstSeenAt, first.diagnostics[0].firstSeenAt);
+  await f.reopen(); now += 60000;
+  let current = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'aster');
+  assert.deepEqual(current.diagnostics, continuing.diagnostics);
+  entries = [{ ...entries[0], kind: 'action' }];
+  current = await f.app.check('aster'); assert.equal(current.diagnostics[0].firstSeenAt, new Date(now).toISOString());
+  entries = []; now += 1000;
+  assert.deepEqual((await f.app.check('aster')).diagnostics, []);
+  await f.reopen(); current = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'aster'); assert.deepEqual(current.diagnostics, []);
+  entries = [{ id: 'pair:gold', kind: 'fault', message: '再次核对' }]; now += 1000;
+  current = await f.app.check('aster'); assert.equal(current.diagnostics[0].firstSeenAt, new Date(now).toISOString());
+});
+
+test('persisted initial failures never create fake successful data and recovery clears transport diagnostics', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  let failure = new UpstreamError('timeout', '读取超时');
+  const f = await fixture(t, { summaryReader: async () => {
+    if (failure) throw failure;
+    return { ...summary(), updatedAt: new Date(now).toISOString(), diagnostics: [], metrics: [{ key: 'unknown', label: '未知金额', value: null }] };
+  } });
+  const first = await f.app.check('aster');
+  assert.equal(first.state, 'offline'); assert.equal(first.lastSuccessAt, null); assert.equal(first.updatedAt, null);
+  assert.deepEqual(first.diagnostics.map(item => item.id), ['hub:connection']);
+  now += 60000; await f.reopen();
+  const again = await f.app.check('aster');
+  assert.equal(again.state, 'offline'); assert.equal(again.lastSuccessAt, null); assert.equal(again.updatedAt, null); assert.doesNotMatch(again.message, /保留上次成功数据/);
+  assert.deepEqual(again.diagnostics, first.diagnostics);
+  failure = null; now += 1000;
+  const success = await f.app.check('aster'); assert.deepEqual(success.diagnostics, []); assert.equal(success.metrics[0].value, null);
+  failure = new UpstreamError('unauthorized', '凭据无效'); now += 1000;
+  const unauthorized = await f.app.check('aster');
+  assert.equal(unauthorized.state, 'unauthorized'); assert.equal(unauthorized.updatedAt, success.updatedAt); assert.equal(unauthorized.lastSuccessAt, success.lastSuccessAt);
+  assert.equal(unauthorized.metrics[0].value, null); assert.deepEqual(unauthorized.diagnostics.map(({ id, kind }) => ({ id, kind })), [{ id: 'hub:auth', kind: 'action' }]);
+  await f.reopen(); await f.login();
+  const restored = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'aster');
+  assert.equal(restored.state, 'unauthorized'); assert.deepEqual(restored.diagnostics, unauthorized.diagnostics);
+  failure = null; now += 1000; assert.deepEqual((await f.app.check('aster')).diagnostics, []);
+});
+
+test('overview observation starts expiry timing locally, persists it once and clears it when actual source data refreshes', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  let sourceAt = new Date(now).toISOString();
+  const f = await fixture(t, { summaryReader: async () => ({ ...summary(), updatedAt: sourceAt, diagnostics: [], state: 'partial' }) }); await f.login();
+  assert.deepEqual((await f.app.check('aster')).diagnostics, []);
+  now += 120000;
+  const read = async () => (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'aster');
+  const expired = await read(); assert.equal(expired.state, 'stale');
+  assert.deepEqual(expired.diagnostics.map(item => item.id), ['hub:data-freshness']);
+  assert.equal(expired.diagnostics[0].firstSeenAt, new Date(now).toISOString());
+  now += 10000; assert.deepEqual((await read()).diagnostics, expired.diagnostics);
+  let stored;
+  await f.reopen(db => { stored = db.prepare("SELECT json FROM snapshots WHERE id='aster'").get().json; });
+  assert.deepEqual((await read()).diagnostics, expired.diagnostics);
+  await f.reopen(db => assert.equal(db.prepare("SELECT json FROM snapshots WHERE id='aster'").get().json, stored));
+  sourceAt = new Date(now).toISOString(); assert.deepEqual((await f.app.check('aster')).diagnostics, []);
+  sourceAt = null; now += 1000;
+  const missing = await f.app.check('aster'); assert.equal(missing.updatedAt, null); assert.equal(missing.diagnostics[0].id, 'hub:data-freshness'); assert.equal(missing.diagnostics[0].firstSeenAt, new Date(now).toISOString());
+});
+
+test('cosmetic changes preserve timers while disable, source boundaries and freshness policy changes clear them', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const f = await fixture(t, { summaryReader: async () => ({ ...summary(), updatedAt: new Date(now).toISOString(), diagnostics: [{ id: 'runtime', kind: 'fault', message: '运行异常' }] }) }); await f.login();
+  const first = await f.app.check('aster'); now += 60000;
+  await f.request('/api/projects/aster', { method: 'PUT', body: { name: '新名称' } });
+  assert.equal((await f.app.check('aster')).diagnostics[0].firstSeenAt, first.diagnostics[0].firstSeenAt);
+  await f.request('/api/projects/aster', { method: 'PUT', body: { enabled: false } });
+  assert.equal((await f.app.check('aster')).diagnostics, undefined);
+  await f.reopen(); now += 1000;
+  for (const body of [{ enabled: true }, { apiUrl: 'http://127.0.0.1:18765' }, { password: 'replacement-test-password' }, { staleAfterSeconds: 300 }]) {
+    now += 1000;
+    assert.equal((await f.request('/api/projects/aster', { method: 'PUT', body })).status, 200);
+    assert.equal((await f.app.check('aster')).diagnostics[0].firstSeenAt, new Date(now).toISOString());
+  }
+});
