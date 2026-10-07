@@ -23,6 +23,13 @@ function exchangeOf(exchange) {
   if (!EXCHANGES.includes(exchange)) throw new TradingError(404, '交易所不存在');
   return exchange;
 }
+export function accountModeOf(exchange, value) {
+  exchangeOf(exchange);
+  const modes = exchange === 'binance' ? ['standard', 'portfolio-margin'] : ['unified'];
+  if (value === undefined) return modes[0];
+  if (!modes.includes(value)) throw new TradingError(400, '账户模式无效，请选择此交易所支持的账户模式');
+  return value;
+}
 function revisionOf(value) {
   if (!Number.isSafeInteger(value) || value < 0) throw new TradingError(400, '连接版本无效，请刷新后重试');
   return value;
@@ -133,8 +140,15 @@ function structure(legs) {
 
 /** Account reads only. This service deliberately has no exchange mutation operation. */
 export function createTrading({ db, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000 } = {}) {
-  db.exec('CREATE TABLE IF NOT EXISTS trading_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, verified_at TEXT, snapshot TEXT)');
-  for (const exchange of EXCHANGES) db.prepare('INSERT OR IGNORE INTO trading_accounts(exchange) VALUES (?)').run(exchange);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec("CREATE TABLE IF NOT EXISTS trading_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, verified_at TEXT, snapshot TEXT, account_mode TEXT NOT NULL DEFAULT 'standard')");
+    if (!db.prepare('PRAGMA table_info(trading_accounts)').all().some(column => column.name === 'account_mode')) {
+      db.exec("ALTER TABLE trading_accounts ADD COLUMN account_mode TEXT NOT NULL DEFAULT 'standard'; UPDATE trading_accounts SET account_mode='unified' WHERE exchange='bybit'");
+    }
+    for (const exchange of EXCHANGES) db.prepare('INSERT OR IGNORE INTO trading_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, accountModeOf(exchange));
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
   const rowFor = exchange => db.prepare('SELECT * FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
   const cache = new Map(EXCHANGES.map(exchange => [exchange, parseSnapshot(rowFor(exchange))]));
   const clients = new Map(EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
@@ -176,8 +190,8 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], lastAttemptAt: iso(now()), ...(kind === 'funding' ? { requestedEnd: end } : {}) } }));
     const promise = (async () => {
       try {
-        const credentials = privateCredentials(row);
-        const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? clients.get(exchange).positions(credentials, { signal }) : clients.get(exchange).funding(credentials, { start, end, signal }));
+        const credentials = privateCredentials(row), accountMode = accountModeOf(exchange, row.account_mode);
+        const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? clients.get(exchange).positions(credentials, { signal, accountMode }) : clients.get(exchange).funding(credentials, { start, end, signal, accountMode }));
         if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
         if (kind === 'positions') {
           const value = normalizePositions(result, exchange, now());
@@ -215,7 +229,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     const accounts = entries.map(({ row, snapshot }) => {
       const connected = !!row.credentials;
       const fundingState = readState(connected, snapshot.funding, current, FUNDING_STALE);
-      return { exchange: row.exchange, name: NAMES[row.exchange], connected, revision: row.revision, verifiedAt: row.verified_at,
+      return { exchange: row.exchange, name: NAMES[row.exchange], accountMode: row.account_mode, connected, revision: row.revision, verifiedAt: row.verified_at,
         refreshing: [...jobs.keys()].some(key => key.startsWith(`${row.exchange}:`)),
         positions: { state: readState(connected, snapshot.positions, current, POSITION_STALE), fetchedAt: snapshot.positions.fetchedAt, error: snapshot.positions.error },
         funding: { state: fundingState, fetchedAt: snapshot.funding.fetchedAt, error: snapshot.funding.error,
@@ -250,6 +264,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   }
   async function connect(exchange, body, { credentialReader, beforeSave, signal: externalSignal, timeoutMs = validationTimeoutMs } = {}) {
     exchangeOf(exchange); const revision = revisionOf(body.revision);
+    const accountMode = accountModeOf(exchange, body.accountMode);
     let credentials = credentialReader ? null : credentialsOf(body);
     if (closed) throw new TradingError(503, '交易模块正在关闭');
     if (rowFor(exchange).revision !== revision) throw new TradingError(409, '连接已被更新，请刷新后重试');
@@ -261,7 +276,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       const result = await deadline(controller, timeoutMs, async signal => {
         if (credentialReader) credentials = credentialsOf(await credentialReader(signal));
         signal.throwIfAborted();
-        return clients.get(exchange).verify(credentials, { signal });
+        return clients.get(exchange).verify(credentials, { signal, accountMode });
       });
       controller.signal.throwIfAborted();
       if (closed) throw new TradingError(503, '交易模块正在关闭');
@@ -270,7 +285,8 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       const positions = normalizePositions(result, exchange, now()), snapshot = emptySnapshot(exchange);
       snapshot.positions = { ...snapshot.positions, ...positions, lastAttemptAt: iso(now()) };
       const encrypted = encrypt({ exchange, ...credentials });
-      db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, iso(now()), JSON.stringify(snapshot), exchange, revision);
+      const saved = db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), JSON.stringify(snapshot), exchange, revision);
+      if (!saved.changes) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
       cancel(exchange); cache.set(exchange, snapshot);
       if (!fundingBatchEnd || now() - fundingBatchEnd >= FUNDING_INTERVAL) fundingBatchEnd = now();
       void run(exchange, 'funding', { end: fundingBatchEnd }).catch(() => {});

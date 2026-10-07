@@ -8,6 +8,7 @@ async (page) => {
   let sources = [], sourceFailure = false, readFailure = false, rejection = null, holdImport = false, releaseImport = null;
   let message = '已保留原有 Binance 只读连接。';
   const revisions = { binance: 7, bybit: 2 }, configured = { binance: true, bybit: false }, verifiedAt = { binance: fixedTime, bybit: null };
+  const accountModes = { binance: 'standard', bybit: 'unified' };
   const connection = (exchange, revision, label, overrides = {}) => ({ exchange, configured: true, revision, label, updatedAt: fixedTime, supported: true, reason: null, ...overrides });
   const readySources = () => [
     { projectId: 'asset-a', name: 'Asset A', projectRevision: 'project-a-v1', status: 'ready', error: null, connections: [connection('binance', 'a-binance-v1', '•••• 1234'), connection('bybit', 'a-bybit-v1', '•••• 4321')] },
@@ -18,7 +19,7 @@ async (page) => {
   const state = days => {
     const start = days === 30 ? '2026-09-07T04:00:00.000Z' : '2026-09-30T04:00:00.000Z';
     const accounts = ['binance', 'bybit'].map(exchange => ({
-      exchange, name: exchange === 'binance' ? 'Binance' : 'Bybit', connected: configured[exchange], revision: revisions[exchange], verifiedAt: verifiedAt[exchange], refreshing: false,
+      exchange, name: exchange === 'binance' ? 'Binance' : 'Bybit', connected: configured[exchange], revision: revisions[exchange], accountMode: accountModes[exchange], verifiedAt: verifiedAt[exchange], refreshing: false,
       positions: { state: configured[exchange] ? 'live' : 'unconfigured', fetchedAt: configured[exchange] ? fixedTime : null, error: null },
       funding: { state: configured[exchange] ? 'live' : 'unconfigured', fetchedAt: configured[exchange] ? fixedTime : null, error: null, coverageStart: configured[exchange] ? start : null, coverageEnd: configured[exchange] ? fixedTime : null, complete: configured[exchange] },
     }));
@@ -46,7 +47,7 @@ async (page) => {
     }
     const exchange = url.pathname.match(/^\/api\/trading\/accounts\/(binance|bybit)\/import$/)?.[1];
     if (exchange && method === 'POST') {
-      assert(Object.keys(record.body).sort().join(',') === 'projectId,projectRevision,revision,sourceRevision', 'import sends only source identifiers and revisions');
+      assert(Object.keys(record.body).sort().join(',') === 'accountMode,projectId,projectRevision,revision,sourceRevision', 'import sends only source identifiers, revisions and account mode');
       assert(record.body.revision === revisions[exchange], 'import uses current target account revision');
       const selectedSource = sources.find(source => source.projectId === record.body.projectId);
       const selectedConnection = selectedSource?.connections.find(item => item.exchange === exchange);
@@ -55,9 +56,15 @@ async (page) => {
       if (rejection === 'permission') return send({ error: '只允许没有交易权限的只读密钥，已保留原连接。' }, 400);
       if (rejection === 'stale') return send({ error: 'Asset 中的密钥已变更，请刷新来源后重新选择。' }, 409);
       if (holdImport) await new Promise(resolve => { releaseImport = resolve; });
-      configured[exchange] = true; revisions[exchange]++; verifiedAt[exchange] = importedTime;
+      configured[exchange] = true; revisions[exchange]++; verifiedAt[exchange] = importedTime; accountModes[exchange] = record.body.accountMode;
       message = `已导入 ${record.body.projectId === 'asset-b' ? 'Asset B' : 'Asset A'} ${exchange === 'binance' ? 'Binance' : 'Bybit'} 测试连接。`;
       return send(state(url.searchParams.get('days') === '30' ? 30 : 7), 202);
+    }
+    if (url.pathname === '/api/trading/accounts/binance' && method === 'PUT') {
+      assert(record.body.revision === revisions.binance && ['standard', 'portfolio-margin'].includes(record.body.accountMode), 'manual connection includes current revision and selected mode');
+      if (rejection === 'api') return send({ error: 'Binance 组合保证金仓位读取失败（HTTP 401，Binance -2015），请检查账户模式、API 读取权限、IP 白名单与服务器时间' }, 400);
+      accountModes.binance = record.body.accountMode; revisions.binance++; verifiedAt.binance = importedTime;
+      return send(state(30), 202);
     }
     return send({ error: `Unexpected fixture API: ${method} ${url.pathname}` }, 404);
   });
@@ -81,6 +88,9 @@ async (page) => {
   await waitForText('暂无已启用的 Asset 项目');
   const binance = page.getByRole('form', { name: 'Binance 账户连接' }), bybit = page.getByRole('form', { name: 'Bybit 账户连接' });
   const binanceSource = binance.getByRole('combobox', { name: 'Asset 来源', exact: true }), bybitSource = bybit.getByRole('combobox', { name: 'Asset 来源', exact: true });
+  const binanceMode = binance.getByRole('combobox', { name: 'Binance 账户模式', exact: true });
+  assert(await binanceMode.inputValue() === 'standard', 'existing ordinary connection defaults to standard mode');
+  assert(await bybit.getByRole('combobox').count() === 1, 'Bybit keeps its unified-account flow');
   const importBinance = binance.getByRole('button', { name: '从 Asset 导入并替换', exact: true });
   assert(await importBinance.isDisabled() && await binanceSource.isDisabled(), 'empty metadata disables import while retaining manual input');
   await binance.getByLabel('API Key', { exact: true }).fill('manual-binance-draft');
@@ -108,14 +118,16 @@ async (page) => {
   assert(await binanceSource.inputValue() === 'asset-b', 'trading polling retains explicit source selection');
   assert(await binance.getByLabel('API Key', { exact: true }).inputValue() === 'manual-binance-draft', 'metadata and trading refresh preserve manual draft');
 
+  await binanceMode.selectOption('portfolio-margin');
   holdImport = true; readFailure = true;
   await importBinance.click();
   await page.waitForFunction(() => document.querySelector('#trading-key-binance')?.disabled === true);
   assert(await binanceSource.isDisabled() && await bybitSource.isDisabled(), 'pending import locks both source selectors');
+  assert(await binanceMode.isDisabled(), 'pending import locks account mode');
   assert(await page.getByRole('button', { name: '刷新来源', exact: true }).isDisabled(), 'pending import blocks metadata refresh');
   assert(await binance.getByRole('button', { name: '验证并替换连接', exact: true }).isDisabled(), 'pending import blocks manual mutation');
   const selectedB = imports().at(-1);
-  assert(selectedB?.query === '?days=30' && JSON.stringify(selectedB.body) === JSON.stringify({ revision: 7, projectId: 'asset-b', projectRevision: 'project-b-v1', sourceRevision: 'b-binance-v1' }), 'selected Asset B payload and time range are correct');
+  assert(selectedB?.query === '?days=30' && JSON.stringify(selectedB.body) === JSON.stringify({ revision: 7, accountMode: 'portfolio-margin', projectId: 'asset-b', projectRevision: 'project-b-v1', sourceRevision: 'b-binance-v1' }), 'selected Asset B payload, portfolio mode and time range are correct');
   assert(typeof releaseImport === 'function', 'import fixture is held for busy-state checks');
   releaseImport(); holdImport = false;
   await waitForText('已导入 Asset B Binance 测试连接。');
@@ -125,17 +137,19 @@ async (page) => {
   assert(await bybit.getByLabel('API Secret', { exact: true }).inputValue() === 'manual-bybit-secret', 'importing Binance preserves the other account draft');
   assert((await binance.locator('small').allTextContents()).some(text => text.includes('13:00:00')), 'direct import response updates account despite failed follow-up GET');
   assert(metadataCount() === beforePolling, 'successful import does not mechanically reload sources');
+  assert(await binanceMode.inputValue() === 'portfolio-margin' && await binance.getByText('当前连接：组合保证金（Portfolio Margin）', { exact: true }).count() === 1, 'successful import uses and displays the saved account mode');
   readFailure = false; await refreshCache();
 
   await binance.getByLabel('API Key', { exact: true }).fill('keep-on-failure-key');
   await binance.getByLabel('API Secret', { exact: true }).fill('keep-on-failure-secret');
-  await binanceSource.selectOption('asset-a'); rejection = 'permission';
+  await binanceSource.selectOption('asset-a'); await binanceMode.selectOption('standard'); rejection = 'permission';
   await importBinance.click(); await waitForText('只允许没有交易权限的只读密钥，已保留原连接。');
   await refreshCache();
   assert(await binance.getByLabel('API Key', { exact: true }).inputValue() === 'keep-on-failure-key' && await binance.getByLabel('API Secret', { exact: true }).inputValue() === 'keep-on-failure-secret', 'failed permission verification preserves both manual draft fields');
   assert(await page.getByText('已导入 Asset B Binance 测试连接。', { exact: true }).count() === 1 && await binance.locator('.trading-account-form-heading').textContent() === 'Binance已连接', 'failed replacement keeps old connected account');
   assert(await page.getByRole('alert').filter({ hasText: '只允许没有交易权限' }).count() === 1, 'background polling does not erase import error');
   assert(imports().at(-1).body.projectId === 'asset-a' && imports().at(-1).body.sourceRevision === 'a-binance-v1', 'changing from B to A sends A revisions');
+  assert(imports().at(-1).body.accountMode === 'standard' && await binance.getByText('当前连接：组合保证金（Portfolio Margin）', { exact: true }).count() === 1, 'failed mode replacement preserves active portfolio connection');
 
   sources[0] = { ...sources[0], projectRevision: 'project-a-v2', connections: [connection('binance', 'a-binance-v2', '•••• 1122'), sources[0].connections[1]] };
   await refreshSources();
@@ -168,6 +182,21 @@ async (page) => {
   await page.waitForFunction(() => !document.querySelector('#trading-source-binance')?.disabled);
   assert(metadataCount() === offlineMetadataCount, 'network recovery does not choose or reload import sources');
 
+  await binanceMode.selectOption('standard');
+  await binance.getByRole('button', { name: '验证并替换连接', exact: true }).click();
+  await waitForText('当前连接：普通 U 本位');
+  assert(await binanceMode.inputValue() === 'standard', 'manual mode change follows the successful response');
+  await binanceMode.selectOption('portfolio-margin');
+  await binance.getByLabel('API Key', { exact: true }).fill('manual-portfolio-key');
+  await binance.getByLabel('API Secret', { exact: true }).fill('manual-portfolio-secret');
+  rejection = 'api';
+  await binance.getByRole('button', { name: '验证并替换连接', exact: true }).click();
+  await waitForText('Binance 组合保证金仓位读取失败（HTTP 401，Binance -2015）');
+  assert(await binance.getByText('当前连接：普通 U 本位', { exact: true }).count() === 1, 'provider rejection displays stage and code without replacing active mode');
+  rejection = null;
+  await binance.getByRole('button', { name: '验证并替换连接', exact: true }).click();
+  await waitForText('当前连接：组合保证金（Portfolio Margin）');
+  assert(await binanceMode.inputValue() === 'portfolio-margin', 'manual Portfolio Margin connection uses selected mode');
   await binanceSource.selectOption('asset-b');
   await page.screenshot({ path: 'output/playwright/trading-import-desktop.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -177,8 +206,8 @@ async (page) => {
   await page.screenshot({ path: 'output/playwright/trading-import-mobile.png', fullPage: true });
   const storage = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }));
   assert(!/manual-binance|manual-bybit|keep-on-failure/.test(storage), 'draft credentials never enter browser storage');
-  assert(requests.filter(request => request.method !== 'GET').every(request => /^\/api\/trading\/accounts\/(binance|bybit)\/import$/.test(request.path) && !/manual-binance|manual-bybit|keep-on-failure|apiKey|apiSecret/.test(JSON.stringify(request.body))), 'import requests never contain browser keys or secrets');
+  assert(imports().every(request => !/manual-binance|manual-bybit|keep-on-failure|apiKey|apiSecret/.test(JSON.stringify(request.body))), 'import requests never contain browser keys or secrets');
   assert(externalRequests.length === 0, `browser never contacts an Asset or exchange origin: ${externalRequests.join(', ')}`);
   assert(!pageErrors.length, `No uncaught browser errors: ${pageErrors.join('; ')}`);
-  return { passed: true, scenarios: ['on-demand metadata', 'no sources', 'old and unconfigured source isolation', 'two source selection', 'exact revision payload', 'busy and offline lock', 'direct state success and draft clearing', 'permission failure preserves old account', 'metadata revision invalidation', '409 source conflict', 'metadata refresh failure', 'Bybit exchange matching', '390px mobile', 'no browser credentials or external requests'], metadataRequests: metadataCount(), imports: imports().length };
+  return { passed: true, scenarios: ['on-demand metadata', 'no sources', 'old and unconfigured source isolation', 'two source selection', 'exact revision and account mode payload', 'busy and offline lock', 'direct state success and draft clearing', 'permission failure preserves old account and mode', 'metadata revision invalidation', '409 source conflict', 'metadata refresh failure', 'Bybit exchange matching', 'manual ordinary and Portfolio Margin selection', 'provider error stage and code', '390px mobile', 'no imported credentials or external requests'], metadataRequests: metadataCount(), imports: imports().length };
 }

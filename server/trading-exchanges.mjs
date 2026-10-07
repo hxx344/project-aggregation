@@ -13,6 +13,8 @@ const ENDPOINTS = Object.freeze({
     permissions: ['https://api.binance.com', '/sapi/v1/account/apiRestrictions'],
     positions: ['https://fapi.binance.com', '/fapi/v3/positionRisk'],
     funding: ['https://fapi.binance.com', '/fapi/v1/income'],
+    portfolioPositions: ['https://papi.binance.com', '/papi/v1/um/positionRisk'],
+    portfolioFunding: ['https://papi.binance.com', '/papi/v1/um/income'],
   }),
   bybit: Object.freeze({
     permissions: ['https://api.bybit.com', '/v5/user/query-api'],
@@ -92,7 +94,7 @@ async function limitedJson(response, signal) {
   }
 }
 
-function normalizePosition(exchange, row, symbol) {
+function normalizePosition(exchange, row, symbol, accountMode) {
   if (!object(row) || row.symbol !== symbol) throw invalidData();
   let side, mode, quantity, suffix;
   if (exchange === 'binance') {
@@ -101,7 +103,9 @@ function normalizePosition(exchange, row, symbol) {
     if ((row.positionSide === 'LONG' && compareDecimals(signed, '0') < 0) || (row.positionSide === 'SHORT' && compareDecimals(signed, '0') > 0)) throw invalidData();
     quantity = absolute(signed);
     if (quantity === '0') return null;
-    if (row.marginAsset !== 'USDT') throw invalidData();
+    // PAPI UM omits marginAsset. Its fixed CLUSDT/BZUSDT requests identify the
+    // USDT contract; an explicitly conflicting asset must still be rejected.
+    if (accountMode === 'portfolio-margin' ? Object.hasOwn(row, 'marginAsset') && row.marginAsset !== 'USDT' : row.marginAsset !== 'USDT') throw invalidData();
     side = compareDecimals(signed, '0') > 0 ? 'long' : 'short';
     mode = row.positionSide === 'BOTH' ? 'one-way' : 'hedge';
     suffix = row.positionSide;
@@ -155,12 +159,28 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
   if (typeof fetchImpl !== 'function' || typeof now !== 'function' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new TradingExchangeError('交易所读取配置无效', 'configuration');
   const clock = () => timestamp(now());
   const fetchedAt = () => new Date(clock()).toISOString();
+  function modeOf(value) {
+    const mode = value === undefined ? (exchange === 'binance' ? 'standard' : 'unified') : value;
+    if (!(exchange === 'binance' ? ['standard', 'portfolio-margin'] : ['unified']).includes(mode)) throw new TradingExchangeError('交易所账户模式无效', 'account_mode');
+    return mode;
+  }
 
-  async function request(operation, credentials, parameters = {}, signal, budget) {
+  async function request(operation, credentials, parameters = {}, signal, budget, accountMode) {
     checkAbort(signal);
     if (!object(credentials) || typeof credentials.apiKey !== 'string' || !/^[\x21-\x7e]{1,512}$/.test(credentials.apiKey) || typeof credentials.apiSecret !== 'string' || !credentials.apiSecret.trim() || credentials.apiSecret.length > 1024 || /[\r\n\0]/.test(credentials.apiSecret)) throw new TradingExchangeError('API Key 与 Secret 无效或为空', 'credentials');
     if (budget && ++budget.requests > MAX_REQUESTS) throw new TradingExchangeError('资金费读取达到请求上限，当前结果不完整', 'page_limit');
-    const [host, path] = ENDPOINTS[exchange][operation];
+    const endpoint = exchange === 'binance' && accountMode === 'portfolio-margin'
+      ? ({ positions: 'portfolioPositions', funding: 'portfolioFunding' }[operation] ?? operation) : operation;
+    const [host, path] = ENDPOINTS[exchange][endpoint];
+    const stage = { permissions: '只读权限检查', account: '账户检查', positions: '仓位读取', funding: '资金费读取' }[operation];
+    const label = exchange === 'binance' ? `Binance ${accountMode === 'portfolio-margin' ? '组合保证金' : '普通 U 本位'}${stage}` : `Bybit ${stage}`;
+    function upstreamError(status, data) {
+      const details = [];
+      if (Number.isInteger(status) && status >= 100 && status <= 599) details.push(`HTTP ${status}`);
+      const code = exchange === 'binance' ? data?.code : data?.retCode;
+      if (Number.isSafeInteger(code)) details.push(`${exchange === 'binance' ? 'Binance' : 'Bybit'} ${code}`);
+      return new TradingExchangeError(`${label}失败${details.length ? `（${details.join('，')}）` : ''}，请检查账户模式、API 读取权限、IP 白名单与服务器时间`, status === undefined ? 'api' : 'http');
+    }
     const params = new URLSearchParams(parameters);
     const time = String(clock());
     const headers = {};
@@ -195,32 +215,36 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
       const response = await fetchImpl(host + path + (query ? '?' + query : ''), { method: 'GET', headers, redirect: 'error', signal: controller.signal, cache: 'no-store' });
       checkAbort(signal);
       if (controller.signal.aborted) throw abortError();
-      if (!response.ok || response.redirected || (response.status >= 300 && response.status < 400)) {
-        const status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599 ? `（HTTP ${response.status}）` : '';
-        throw new TradingExchangeError(`交易所读取失败${status}，请检查网络、权限与 IP 白名单`, 'http');
+      if (response.redirected || (response.status >= 300 && response.status < 400)) throw upstreamError(response.status);
+      if (!response.ok) {
+        let failure;
+        try { failure = await limitedJson(response, controller.signal); }
+        catch (error) {
+          if (error?.name === 'AbortError' || error instanceof TradingExchangeError && error.code === 'response_limit') throw error;
+          // Non-JSON error pages never become user-visible upstream text.
+        }
+        throw upstreamError(response.status, failure);
       }
       const data = await limitedJson(response, controller.signal);
       if (exchange === 'bybit') {
         if (!object(data) || data.retCode !== 0 || !object(data.result)) {
-          const code = Number.isSafeInteger(data?.retCode) ? `（${data.retCode}）` : '';
-          throw new TradingExchangeError(`Bybit 读取失败${code}，请检查 API 权限、IP 白名单与服务器时间`, 'api');
+          throw upstreamError(undefined, data);
         }
         return data.result;
       }
       if (!object(data) && !Array.isArray(data)) throw invalidData();
       if (object(data) && Object.hasOwn(data, 'code')) {
-        const code = Number.isSafeInteger(data.code) ? `（${data.code}）` : '';
-        throw new TradingExchangeError(`Binance 读取失败${code}，请检查 API 权限、IP 白名单与服务器时间`, 'api');
+        throw upstreamError(undefined, data);
       }
       return data;
       };
       return await Promise.race([read(), abortPromise]);
     } catch (error) {
       if (signal?.aborted) throw abortError();
-      if (timedOut) throw new TradingExchangeError('交易所读取超时，请稍后重试', 'timeout');
+      if (timedOut) throw new TradingExchangeError(`${label}超时，请稍后重试`, 'timeout');
       if (error instanceof TradingExchangeError) throw error;
       // Never return upstream error text, response bodies, signed URLs, or keys.
-      throw new TradingExchangeError('交易所读取失败，请检查连接与服务器时间', 'transport');
+      throw new TradingExchangeError(`${label}失败，请检查连接与服务器时间`, 'transport');
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
@@ -229,8 +253,8 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     }
   }
 
-  async function permissions(credentials, signal, budget) {
-    const info = await request('permissions', credentials, {}, signal, budget);
+  async function permissions(credentials, signal, budget, accountMode) {
+    const info = await request('permissions', credentials, {}, signal, budget, accountMode);
     if (exchange === 'binance') {
       if (!object(info) || info.enableReading !== true || CORE_WRITE_PERMISSIONS.some(field => info[field] !== false) || OPTIONAL_WRITE_PERMISSIONS.some(field => Object.hasOwn(info, field) && info[field] !== false) || (Object.hasOwn(info, 'enableFixReadOnly') && typeof info.enableFixReadOnly !== 'boolean')) throw new TradingExchangeError('Binance API 无法确认只读权限，请使用仅启用读取的密钥', 'permissions');
     } else {
@@ -240,7 +264,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     }
   }
 
-  async function readPositions(credentials, signal) {
+  async function readPositions(credentials, signal, accountMode) {
     const positions = [], ids = new Set(), modes = new Map();
     for (const symbol of SYMBOLS) {
       let cursor = '';
@@ -249,11 +273,11 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
       do {
         if (++pages > 20) throw new TradingExchangeError('仓位分页超过支持范围', 'page_limit');
         const params = exchange === 'binance' ? { symbol } : { category: 'linear', symbol, limit: '200', ...(cursor ? { cursor } : {}) };
-        const data = await request('positions', credentials, params, signal);
+        const data = await request('positions', credentials, params, signal, undefined, accountMode);
         const rows = exchange === 'binance' ? data : requireList(data, 200, true);
         if (!Array.isArray(rows) || rows.length > 200) throw invalidData();
         for (const row of rows) {
-          const position = normalizePosition(exchange, row, symbol);
+          const position = normalizePosition(exchange, row, symbol, accountMode);
           if (!position) continue;
           if (ids.has(position.id)) throw new TradingExchangeError('交易所仓位返回重复记录，无法确认持仓', 'duplicate');
           if (modes.has(symbol) && modes.get(symbol) !== position.mode) throw new TradingExchangeError('交易所仓位模式存在冲突，无法确认持仓', 'invalid_data');
@@ -271,13 +295,14 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     return { fetchedAt: fetchedAt(), positions };
   }
 
-  async function verify(credentials, { signal } = {}) {
-    await permissions(credentials, signal);
-    const result = await readPositions(credentials, signal);
+  async function verify(credentials, { signal, accountMode: requestedMode } = {}) {
+    const accountMode = modeOf(requestedMode);
+    await permissions(credentials, signal, undefined, accountMode);
+    const result = await readPositions(credentials, signal, accountMode);
     const end = clock(), start = end - DAY;
     if (exchange === 'binance') {
       for (const symbol of SYMBOLS) {
-        const rows = await request('funding', credentials, { symbol, incomeType: 'FUNDING_FEE', startTime: String(start), endTime: String(end - 1), page: '1', limit: '1' }, signal);
+        const rows = await request('funding', credentials, { symbol, incomeType: 'FUNDING_FEE', startTime: String(start), endTime: String(end - 1), page: '1', limit: '1' }, signal, undefined, accountMode);
         if (!Array.isArray(rows) || rows.length > 1) throw invalidData();
         for (const row of rows) normalizeReceipt(exchange, row, { symbol, start, end });
       }
@@ -289,12 +314,14 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     return result;
   }
 
-  async function positions(credentials, { signal } = {}) {
-    await permissions(credentials, signal);
-    return readPositions(credentials, signal);
+  async function positions(credentials, { signal, accountMode: requestedMode } = {}) {
+    const accountMode = modeOf(requestedMode);
+    await permissions(credentials, signal, undefined, accountMode);
+    return readPositions(credentials, signal, accountMode);
   }
 
-  async function funding(credentials, { start, end, signal } = {}) {
+  async function funding(credentials, { start, end, signal, accountMode: requestedMode } = {}) {
+    const accountMode = modeOf(requestedMode);
     checkAbort(signal);
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end - start > 30 * DAY || end > clock() + 1000 || start < clock() - 31 * DAY) throw new TradingExchangeError('资金费读取仅支持最近 30 天内的有效时间范围', 'range');
     const receipts = new Map(), coverage = [], budget = { requests: 0 };
@@ -308,7 +335,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     }
     let error = null;
     try {
-      await permissions(credentials, signal, budget);
+      await permissions(credentials, signal, budget, accountMode);
       for (let windowStart = start; windowStart < end; windowStart += 7 * DAY) {
         const windowEnd = Math.min(windowStart + 7 * DAY, end);
         const timeParams = { startTime: String(windowStart), endTime: String(windowEnd - 1) };
@@ -316,7 +343,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
           for (const symbol of SYMBOLS) {
             const pages = new Set();
             for (let page = 1; ; page++) {
-              const rows = await request('funding', credentials, { symbol, incomeType: 'FUNDING_FEE', ...timeParams, page: String(page), limit: '1000' }, signal, budget);
+              const rows = await request('funding', credentials, { symbol, incomeType: 'FUNDING_FEE', ...timeParams, page: String(page), limit: '1000' }, signal, budget, accountMode);
               if (!Array.isArray(rows) || rows.length > 1000) throw invalidData();
               const fingerprint = JSON.stringify(rows);
               if (rows.length && pages.has(fingerprint)) throw new TradingExchangeError('资金费分页未取得进展，当前结果不完整', 'pagination');

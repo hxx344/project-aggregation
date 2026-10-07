@@ -3,10 +3,12 @@ import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
 import TradingFundingChart from './TradingFundingChart';
-import type { TradingAccount, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
+import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
 import './trading.css';
 
 const exchangeNames = { binance: 'Binance', bybit: 'Bybit' };
+const accountModeNames: Record<TradingAccountMode, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金（Portfolio Margin）', unified: '统一交易账户' };
+type ImportRequest = TradingImportSelection & { revision: number; accountMode: TradingAccountMode };
 const stateNames: Record<TradingReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const readDays = (): 7 | 30 => new URLSearchParams(location.search).get('tradingDays') === '30' ? 30 : 7;
@@ -48,10 +50,11 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
   account: TradingAccount; busy: boolean;
   mutate: (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => Promise<boolean>;
   sources: TradingImportSource[] | null; sourcesLoading: boolean;
-  importAccount: (exchange: TradingExchange, body: TradingImportSelection & { revision: number }) => Promise<boolean>;
+  importAccount: (exchange: TradingExchange, body: ImportRequest) => Promise<boolean>;
 }) {
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
+  const [accountMode, setAccountMode] = useState<TradingAccountMode>(account.accountMode ?? (account.exchange === 'binance' ? 'standard' : 'unified'));
   const [selection, setSelection] = useState<TradingImportSelection | null>(null);
   const choices = (sources ?? []).map(source => {
     const connection = source.connections.find(item => item.exchange === account.exchange);
@@ -67,18 +70,20 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
   }
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (await mutate(account.exchange, 'PUT', { revision: account.revision, apiKey: apiKey.trim(), apiSecret: apiSecret.trim() })) { setApiKey(''); setApiSecret(''); }
+    if (await mutate(account.exchange, 'PUT', { revision: account.revision, accountMode, apiKey: apiKey.trim(), apiSecret: apiSecret.trim() })) { setApiKey(''); setApiSecret(''); }
   }
   async function disconnect() {
     if (await mutate(account.exchange, 'DELETE', { revision: account.revision })) { setApiKey(''); setApiSecret(''); }
   }
   async function importSelected() {
     if (!chosen || !selection || busy || sourcesLoading) return;
-    if (await importAccount(account.exchange, { revision: account.revision, ...selection })) { setApiKey(''); setApiSecret(''); }
+    if (await importAccount(account.exchange, { revision: account.revision, accountMode, ...selection })) { setApiKey(''); setApiSecret(''); }
   }
   return <form className="trading-account-form" onSubmit={save} aria-label={`${exchangeNames[account.exchange]} 账户连接`}>
     <div className="trading-account-form-heading"><h3>{exchangeNames[account.exchange]}</h3><span>{account.connected ? '已连接' : '未连接'}</span></div>
+    {account.connected ? <p>当前连接：{accountModeNames[account.accountMode]}</p> : null}
     <div className="trading-account-import">
+      {account.exchange === 'binance' ? <label htmlFor="trading-binance-mode">Binance 账户模式<select id="trading-binance-mode" value={accountMode} disabled={busy} onChange={event => setAccountMode(event.target.value as TradingAccountMode)}><option value="standard">普通 U 本位</option><option value="portfolio-margin">组合保证金（Portfolio Margin）</option></select></label> : null}
       <label htmlFor={`trading-source-${account.exchange}`}>Asset 来源<select id={`trading-source-${account.exchange}`} value={chosen?.source.projectId ?? ''} disabled={busy || sourcesLoading || !choices.some(choice => choice.available)} onChange={event => choose(event.target.value)}><option value="">{sourcesLoading ? '正在读取 Asset 来源…' : choices.some(choice => choice.available) ? '请选择 Asset 项目' : '暂无可导入的 Asset 连接'}</option>{choices.map(({ source, available, description }) => <option key={source.projectId} value={source.projectId} disabled={!available}>{source.name} · {description}</option>)}</select></label>
       {chosen ? <p className="trading-import-detail">{chosen.connection?.label ? `密钥尾号 ${chosen.connection.label} · ` : ''}{chosen.connection?.updatedAt ? `Asset 保存时间：${formatDate(chosen.connection.updatedAt)}（北京时间）` : '导入时将重新验证只读权限。'}</p> : selection && sources ? <p className="trading-import-detail">来源已变更或不可用，请重新选择。</p> : null}
       {choices.filter(choice => !choice.available && choice.source.status === 'ready').map(choice => <p key={choice.source.projectId} className="trading-import-detail">{choice.source.name}：{choice.description}</p>)}
@@ -208,7 +213,7 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
     return succeeded;
   }
   const mutateAccount = (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => write(`/api/trading/accounts/${exchange}`, method, body, exchange);
-  const importAccount = (exchange: TradingExchange, body: TradingImportSelection & { revision: number }) => write(`/api/trading/accounts/${exchange}/import`, 'POST', body, exchange, true);
+  const importAccount = (exchange: TradingExchange, body: ImportRequest) => write(`/api/trading/accounts/${exchange}/import`, 'POST', body, exchange, true);
   const connected = data?.accounts.some(account => account.connected) ?? false;
   const refreshing = data?.accounts.some(account => account.refreshing) ?? false;
   const events = data?.funding.events ?? [];
@@ -260,7 +265,7 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
           {sources?.length === 0 ? <p>暂无已启用的 Asset 项目。可先在工作台配置 Asset 登录连接，或在下方手动填写只读密钥。</p> : null}
           {sources?.filter(source => source.status !== 'ready').map(source => <p className="trading-warning" key={source.projectId}>{source.name}：{source.error || (source.status === 'unconfigured' ? '请先在工作台配置 Asset API 地址与登录密码。' : '来源暂不可用，请确认 Asset 服务已更新并刷新来源。')}</p>)}
         </div>
-        <div className="trading-account-forms">{data.accounts.map(account => <AccountConnection key={account.exchange} account={account} busy={!!busy || offline} mutate={mutateAccount} sources={sources} sourcesLoading={sourcesLoading} importAccount={importAccount} />)}</div>{busy && busy !== 'refresh' ? <p className="trading-saving" role="status"><LoaderCircle className="spin" size={16} />正在验证账户连接，请稍候…</p> : null}
+        <div className="trading-account-forms">{data.accounts.map(account => <AccountConnection key={`${account.exchange}:${account.revision}`} account={account} busy={!!busy || offline} mutate={mutateAccount} sources={sources} sourcesLoading={sourcesLoading} importAccount={importAccount} />)}</div>{busy && busy !== 'refresh' ? <p className="trading-saving" role="status"><LoaderCircle className="spin" size={16} />正在验证账户连接，请稍候…</p> : null}
       </div></details>
       <p className="trading-page-note">只读查看仓位与资金费 · 页面每 5 秒检查同步状态 · 所有时间为北京时间</p>
     </>}

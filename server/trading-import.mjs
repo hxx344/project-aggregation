@@ -1,5 +1,5 @@
 import { requestAuthenticatedJson, requestJson } from './adapters.mjs';
-import { TradingError } from './trading.mjs';
+import { TradingError, accountModeOf } from './trading.mjs';
 
 const EXCHANGES = ['binance', 'bybit'];
 const CATALOG = '/api/hub/trading-connections';
@@ -84,12 +84,13 @@ export function createTradingImporter({ listTargets, trading, request = requestJ
   }
   async function importAccount(exchange, body) {
     if (!EXCHANGES.includes(exchange)) throw new TradingError(404, '交易所不存在');
-    if (!object(body) || Object.keys(body).some(key => !['revision', 'projectId', 'projectRevision', 'sourceRevision'].includes(key))
+    if (!object(body) || Object.keys(body).some(key => !['revision', 'projectId', 'projectRevision', 'sourceRevision', 'accountMode'].includes(key))
       || !Number.isSafeInteger(body.revision) || body.revision < 0 || typeof body.projectId !== 'string'
       || !/^[a-zA-Z0-9_-]{1,64}$/.test(body.projectId) || !hex(body.projectRevision) || !hex(body.sourceRevision)) throw new TradingError(400, '导入参数无效，请刷新来源后重试');
+    const accountMode = accountModeOf(exchange, body.accountMode);
     const target = current(body.projectId, body.projectRevision), controller = new AbortController(); controllers.add(controller);
     try {
-      await trading.connect(exchange, { revision: body.revision }, {
+      await trading.connect(exchange, { revision: body.revision, accountMode }, {
         signal: controller.signal, timeoutMs: importTimeoutMs,
         credentialReader: async signal => {
           const rows = catalogOf(await read(target, CATALOG, signal));

@@ -72,7 +72,7 @@ async function fixture(t, overrides = {}) {
   }
   return { get app() { return app; }, get now() { return clock; }, get origin() { return origin; },
     advance: amount => { clock += amount; }, rows, handlers, calls, request, login, connect, stored, dataDir,
-    async reopen() { await app.close(); closed = true; await open(); },
+    async reopen() { if (!closed) await app.close(); closed = true; await open(); },
     async close() { await app.close(); closed = true; },
   };
 }
@@ -105,21 +105,25 @@ test('private trading routes require login, Origin, CSRF and JSON; disconnected 
   assert.equal(response.data.structure.state, 'unknown');
   assert.equal(response.data.funding.net, null);
   assert.equal(response.data.funding.complete, false);
+  assert.deepEqual(response.data.accounts.map(row => [row.exchange, row.accountMode]), [['binance', 'standard'], ['bybit', 'unified']]);
   assert.equal(f.calls.length, 0);
 });
 
-test('connection API encrypts credentials, hides them from responses and disk, and failed replacement keeps the verified account', async t => {
+test('connection API encrypts credentials and a failed mode switch preserves the verified account and funding ledger', async t => {
   const f = await fixture(t); await f.login();
   const secret = credentials('sensitive_original');
+  f.handlers.binance.funding = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events: [receipt('binance', 'original-ledger', '0.1', end - 1)], coverage: [{ start, end }], complete: true });
   const response = await f.request('/api/trading/accounts/binance', { method: 'PUT', body: { revision: 0, ...secret } });
   assert.equal(response.status, 202); await f.app.trading.refresh();
   const previous = f.stored('binance');
   assert.equal(previous.revision, 1); assert.ok(previous.credentials);
   f.handlers.binance.verify = async () => { throw new Error(`transport exposed ${secret.apiSecret} ${secret.apiKey}`); };
-  const failed = await f.request('/api/trading/accounts/binance', { method: 'PUT', body: { revision: 1, ...credentials('replacement') } });
+  const failed = await f.request('/api/trading/accounts/binance', { method: 'PUT', body: { revision: 1, accountMode: 'portfolio-margin', ...credentials('replacement') } });
   assert.equal(failed.status, 400);
-  assert.equal(f.stored('binance').credentials, previous.credentials);
-  assert.equal(f.stored('binance').revision, 1);
+  assert.deepEqual(f.stored('binance'), previous);
+  assert.equal(f.app.trading.state().accounts[0].accountMode, 'standard');
+  assert.equal(f.app.trading.state().funding.events[0].id, 'original-ledger');
+  assert.equal(f.calls.filter(row => row.method === 'verify').at(-1).accountMode, 'portfolio-margin');
   assert.equal((await f.request('/api/trading/accounts/binance', { method: 'DELETE', body: { revision: 0 } })).status, 409);
   for (const data of [response.data, failed.data, (await f.request('/api/trading')).data, (await f.request('/api/overview')).data]) {
     const serialized = JSON.stringify(data);
@@ -138,6 +142,62 @@ test('connection API encrypts credentials, hides them from responses and disk, a
   assert.equal((await f.request('/api/trading/accounts/binance', { method: 'DELETE', body: { revision: 1 } })).status, 200);
   assert.equal(f.stored('binance').credentials, null);
   await f.reopen(); assert.equal(f.app.trading.state().accounts[0].connected, false);
+});
+
+test('invalid explicit account modes are rejected before credentials or exchange reads', async t => {
+  const f = await fixture(t); await f.login();
+  for (const [exchange, modes] of [['binance', [null, '', 'unified', 'Portfolio-Margin', true, {}]], ['bybit', [null, 'standard', 'portfolio-margin', []]]]) {
+    const previous = f.stored(exchange);
+    for (const accountMode of modes) {
+      const response = await f.request(`/api/trading/accounts/${exchange}`, { method: 'PUT', body: { revision: 0, ...credentials(), accountMode } });
+      assert.equal(response.status, 400);
+      let read = false;
+      await assert.rejects(f.app.trading.connect(exchange, { revision: 0, accountMode }, {
+        credentialReader: async () => { read = true; return credentials(); },
+      }), error => error.status === 400);
+      assert.equal(read, false);
+    }
+    assert.deepEqual(f.stored(exchange), previous);
+  }
+  assert.equal(f.calls.length, 0);
+});
+
+test('portfolio margin mode persists across restart and governs every verification and refresh', async t => {
+  const f = await fixture(t); await f.login();
+  const response = await f.request('/api/trading/accounts/binance', { method: 'PUT', body: { revision: 0, ...credentials(), accountMode: 'portfolio-margin' } });
+  assert.equal(response.status, 202);
+  assert.equal(response.data.accounts[0].accountMode, 'portfolio-margin');
+  await f.app.trading.refresh();
+  const previous = f.stored('binance');
+  await f.reopen();
+  assert.deepEqual(f.stored('binance'), previous);
+  assert.equal(f.app.trading.state().accounts[0].accountMode, 'portfolio-margin');
+  f.advance(6000); await f.app.trading.refresh({ force: true });
+  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['funding', 'positions', 'verify']);
+  assert.ok(f.calls.every(row => row.accountMode === 'portfolio-margin'));
+});
+
+test('legacy account migration preserves encrypted connections and snapshots with exchange-specific mode defaults', async t => {
+  const f = await fixture(t);
+  for (const exchange of ['binance', 'bybit']) {
+    f.handlers[exchange].funding = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events: [receipt(exchange, 'legacy-ledger', '0.2', end - 1)], coverage: [{ start, end }], complete: true });
+    await f.connect(exchange);
+  }
+  const before = f.app.trading.state(), stored = ['binance', 'bybit'].map(f.stored), reads = f.calls.length;
+  await f.close();
+  const db = new DatabaseSync(path.join(f.dataDir, 'hub.sqlite'));
+  try {
+    db.exec('ALTER TABLE trading_accounts DROP COLUMN account_mode');
+    assert.equal(db.prepare('PRAGMA table_info(trading_accounts)').all().some(column => column.name === 'account_mode'), false);
+  } finally { db.close(); }
+  await f.reopen();
+  assert.deepEqual(f.app.trading.state(), before);
+  assert.deepEqual(['binance', 'bybit'].map(f.stored), stored);
+  await f.reopen();
+  assert.deepEqual(['binance', 'bybit'].map(f.stored), stored);
+  assert.equal(f.calls.length, reads);
+  f.advance(6000); await f.app.trading.refresh({ force: true });
+  assert.ok(f.calls.slice(reads).every(row => row.accountMode === (row.exchange === 'binance' ? 'standard' : 'unified')));
 });
 
 test('four-leg structure follows observed positions, preserves both hedge sides and marks old data unknown', async t => {
@@ -252,20 +312,38 @@ test('disconnect cancels only that account and late funding or positions cannot 
   assert.equal(f.stored('binance').snapshot, null);
 });
 
-test('successful credential replacement discards the old account snapshot and suppresses an older in-flight result', async t => {
-  const f = await fixture(t); await f.connect('binance');
-  const late = deferred(); f.handlers.binance.positions = () => late.promise;
-  f.advance(31000); const refreshing = f.app.trading.refresh(); await nextTurn();
+test('successful mode switch clears the old ledger and cancels older position and funding results', async t => {
+  const f = await fixture(t);
+  f.handlers.binance.funding = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events: [receipt('binance', 'old-ledger', '0.1', end - 1)], coverage: [{ start, end }], complete: true });
+  await f.connect('binance');
+  const late = deferred(), oldFunding = deferred(), newFunding = deferred();
+  f.handlers.binance.positions = () => late.promise;
+  f.handlers.binance.funding = (_secret, { accountMode }) => accountMode === 'standard' ? oldFunding.promise : newFunding.promise;
+  f.advance(6000); const refreshing = f.app.trading.refresh({ force: true }); await nextTurn();
+  const staleCalls = f.calls.filter(row => row.exchange === 'binance' && row.method !== 'verify').slice(-2);
   f.rows.binance = [position('binance', 'BZUSDT', 'long', { quantity: '9' })];
-  await f.app.trading.connect('binance', { revision: 1, ...credentials('new_account') });
+  await f.app.trading.connect('binance', { revision: 1, ...credentials('new_account'), accountMode: 'portfolio-margin' });
   await refreshing; await nextTurn();
+  assert.ok(staleCalls.every(row => row.accountMode === 'standard' && row.signal.aborted));
+  assert.equal(f.app.trading.state().funding.events.length, 0);
+  assert.equal(f.app.trading.state().funding.net, null);
+  assert.deepEqual(JSON.parse(f.stored('binance').snapshot).funding.coverage, []);
   late.resolve({ fetchedAt: stamp(f.now), positions: [position('binance', 'CLUSDT', 'short', { quantity: '999' })] });
+  oldFunding.resolve({ fetchedAt: stamp(f.now), events: [receipt('binance', 'late-ledger', '999', f.now - 1)], coverage: [{ start: f.now - 30 * DAY, end: f.now }], complete: true });
   await nextTurn();
   const state = f.app.trading.state();
   assert.equal(state.accounts[0].revision, 2);
+  assert.equal(state.accounts[0].accountMode, 'portfolio-margin');
+  assert.equal(f.stored('binance').account_mode, 'portfolio-margin');
   assert.equal(state.legs[0].positions.length, 0);
   assert.equal(state.legs[1].positions[0].quantity, '9');
-  assert.ok(f.calls.filter(row => row.method === 'funding').some(row => row.secret.apiKey === credentials('new_account').apiKey));
+  assert.equal(state.funding.events.length, 0);
+  const incoming = f.calls.filter(row => row.method === 'funding').at(-1);
+  assert.equal(incoming.secret.apiKey, credentials('new_account').apiKey);
+  assert.equal(incoming.accountMode, 'portfolio-margin');
+  newFunding.resolve({ fetchedAt: stamp(f.now), events: [receipt('binance', 'new-ledger', '0.3', incoming.end - 1)], coverage: [{ start: incoming.start, end: incoming.end }], complete: true });
+  await nextTurn();
+  assert.deepEqual(f.app.trading.state().funding.events.map(row => row.id), ['new-ledger']);
 });
 
 test('disconnect during verification cancels its save and concurrent verification cannot overwrite it', async t => {

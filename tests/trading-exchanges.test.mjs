@@ -24,7 +24,7 @@ function harness(exchange, handler, options = {}) {
       assert.equal(init.redirect, 'error'); assert.equal(init.cache, 'no-store');
       assert.equal(init.body, undefined);
       const allowed = exchange === 'binance'
-        ? { '/sapi/v1/account/apiRestrictions': 'api.binance.com', '/fapi/v3/positionRisk': 'fapi.binance.com', '/fapi/v1/income': 'fapi.binance.com' }
+        ? { '/sapi/v1/account/apiRestrictions': 'api.binance.com', '/fapi/v3/positionRisk': 'fapi.binance.com', '/fapi/v1/income': 'fapi.binance.com', '/papi/v1/um/positionRisk': 'papi.binance.com', '/papi/v1/um/income': 'papi.binance.com' }
         : { '/v5/user/query-api': 'api.bybit.com', '/v5/account/info': 'api.bybit.com', '/v5/position/list': 'api.bybit.com', '/v5/account/transaction-log': 'api.bybit.com' };
       assert.equal(parsed.host, allowed[parsed.pathname]);
       if (exchange === 'binance') {
@@ -342,4 +342,99 @@ test('invalid credentials and out-of-policy ranges never send an HTTP request', 
   for (const invalid of [{ apiKey: '', apiSecret: 'a' }, { apiKey: 'key\nvalue', apiSecret: 'a' }, { apiKey: 'a', apiSecret: '' }, null]) await assert.rejects(client.verify(invalid), /无效或为空/);
   for (const interval of [{ start: NOW, end: NOW }, { start: NOW - 31 * DAY, end: NOW }, { start: -1, end: 1 }, { start: NOW - DAY, end: Infinity }]) await assert.rejects(client.funding(credentials, interval), /时间范围/);
   assert.equal(calls, 0);
+});
+
+test('Portfolio Margin verifies and refreshes using only signed PAPI UM reads after the SAPI permission check', async () => {
+  const options = { accountMode: 'portfolio-margin' };
+  const { client, calls } = harness('binance', url => {
+    const symbol = url.searchParams.get('symbol');
+    if (url.pathname === '/papi/v1/um/positionRisk') {
+      const row = binancePosition(symbol, { positionSide: 'SHORT', positionAmt: '-2.5', leverage: '10' });
+      delete row.marginAsset;
+      return [row];
+    }
+    if (url.pathname === '/papi/v1/um/income') return [income(symbol, Number(url.searchParams.get('endTime')), { income: '-0.0123' })];
+  });
+  const verified = await client.verify(credentials, options);
+  assert.equal(verified.positions.length, 2);
+  assert.equal(verified.positions[0].side, 'short'); assert.equal(verified.positions[0].quantity, '2.5');
+  assert.equal(verified.positions[0].leverage, '10'); assert.equal(verified.positions[0].notional, '177.75');
+  assert.deepEqual((await client.positions(credentials, options)).positions, verified.positions);
+  const ledger = await client.funding(credentials, { ...options, start: NOW - DAY, end: NOW });
+  assert.equal(ledger.complete, true); assert.equal(ledger.events.length, 2);
+  assert.ok(ledger.events.every(row => row.amount === '-0.0123' && row.currency === 'USDT'));
+  assert.equal(ledger.coverage.length, 1);
+  assert.ok(calls.every(({ url }) => url.hostname === 'api.binance.com' || url.hostname === 'papi.binance.com'));
+  assert.equal(calls.filter(({ url }) => url.pathname.endsWith('apiRestrictions')).length, 3);
+});
+
+test('Portfolio Margin preserves ordinary USDT validation and rejects a conflicting explicit asset', async () => {
+  for (const [accountMode, marginAsset] of [['standard', undefined], ['portfolio-margin', 'USDC']]) {
+    const { client } = harness('binance', url => url.pathname.endsWith('positionRisk') ? [binancePosition(url.searchParams.get('symbol'), { marginAsset })] : undefined);
+    await assert.rejects(client.positions(credentials, { accountMode }), { code: 'invalid_data' });
+  }
+  const { client } = harness('binance', url => url.pathname.endsWith('positionRisk') ? [binancePosition(url.searchParams.get('symbol'), { marginAsset: undefined, notional: undefined, liquidationPrice: undefined })] : undefined);
+  const result = await client.positions(credentials, { accountMode: 'portfolio-margin' });
+  assert.equal(result.positions[0].notional, null); assert.equal(result.positions[0].liquidationPrice, null);
+});
+
+test('Portfolio Margin funding pages and seven-day windows keep one API family and exact transaction IDs', async () => {
+  const { client, calls } = harness('binance', url => {
+    if (url.pathname !== '/papi/v1/um/income') return;
+    const symbol = url.searchParams.get('symbol'), start = Number(url.searchParams.get('startTime'));
+    const page = Number(url.searchParams.get('page'));
+    if (symbol === 'CLUSDT' && start === NOW - 8 * DAY && page === 1) return Array.from({ length: 1000 }, (_, index) => income(symbol, start + index, { tranId: String(9007199254740993000n + BigInt(index)) }));
+    return [income(symbol, start + 1001, { tranId: `${symbol}-${start}-${page}` })];
+  });
+  const result = await client.funding(credentials, { accountMode: 'portfolio-margin', start: NOW - 8 * DAY, end: NOW });
+  assert.equal(result.complete, true); assert.equal(result.coverage.length, 2); assert.equal(result.events.length, 1004);
+  assert.ok(result.events.some(row => row.id.endsWith('9007199254740993001')));
+  assert.ok(calls.some(({ url }) => url.searchParams.get('page') === '2'));
+  assert.ok(calls.every(({ url }) => !url.pathname.startsWith('/fapi')));
+});
+
+test('Portfolio Margin rejects write-enabled keys before any PAPI request and never falls back after a 401', async () => {
+  for (const field of [...core, 'enablePortfolioMarginTrading', 'enableFixApiTrade']) {
+    const { client, calls } = harness('binance', () => ({ ...permission(), [field]: true }));
+    await assert.rejects(client.verify(credentials, { accountMode: 'portfolio-margin' }), { code: 'permissions' });
+    assert.equal(calls.length, 1);
+  }
+  for (const operation of ['positions', 'funding']) {
+    const { client, calls } = harness('binance', url => url.hostname === 'papi.binance.com' ? json({ code: -2015, msg: 'fixture-secret signature=private' }, 401) : undefined);
+    const options = { accountMode: 'portfolio-margin', start: NOW - DAY, end: NOW };
+    const expected = /Binance 组合保证金(?:仓位|资金费)读取失败（HTTP 401，Binance -2015）/;
+    if (operation === 'positions') await assert.rejects(client.positions(credentials, options), error => expected.test(error.message) && !error.message.includes('private'));
+    else {
+      const result = await client.funding(credentials, options);
+      assert.equal(result.complete, false); assert.deepEqual(result.coverage, []); assert.match(result.error, expected);
+    }
+    assert.equal(calls.length, 2); assert.ok(calls.every(({ url }) => url.hostname !== 'fapi.binance.com'));
+  }
+});
+
+test('HTTP diagnostics retain only safe numeric codes and operation labels, with bounded error bodies', async () => {
+  const secret = 'fixture-secret signature=private https://private.invalid';
+  for (const data of [{ code: -2015, msg: secret }, { code: secret, msg: secret }, { code: Number.MAX_SAFE_INTEGER + 1 }, { code: { value: secret } }]) {
+    const { client } = harness('binance', () => json(data, 401));
+    await assert.rejects(client.verify(credentials), error => error.code === 'http' && error.message.includes('只读权限检查失败（HTTP 401') && error.message.includes('Binance -2015') === (data.code === -2015) && !/fixture|signature|private/.test(error.message));
+  }
+  const html = harness('binance', () => new Response(secret, { status: 502 }));
+  await assert.rejects(html.client.verify(credentials), error => error.code === 'http' && error.message.includes('HTTP 502') && !error.message.includes(secret));
+  for (const headers of [{ 'content-length': '99999999' }, {}]) {
+    const large = harness('binance', () => new Response(' '.repeat(2 * 1024 * 1024 + 1), { status: 401, headers }));
+    await assert.rejects(large.client.verify(credentials), { code: 'response_limit' });
+  }
+  const hanging = createTradingExchangeClient('binance', { now: () => NOW, timeoutMs: 10, fetchImpl: async () => new Response(new ReadableStream({ start() {} }), { status: 401 }) });
+  await assert.rejects(hanging.verify(credentials), { code: 'timeout' });
+});
+
+test('account mode is validated before HTTP and remains request-local on a shared client', async () => {
+  const { client, calls } = healthy('binance');
+  for (const accountMode of [null, '', 'unified', 'https://evil.invalid', {}, 'constructor']) {
+    for (const operation of ['verify', 'positions', 'funding']) await assert.rejects(client[operation](credentials, { accountMode, start: NOW - DAY, end: NOW }), { code: 'account_mode' });
+  }
+  assert.equal(calls.length, 0);
+  await Promise.all([client.positions(credentials, { accountMode: 'portfolio-margin' }), client.positions(credentials, { accountMode: 'standard' })]);
+  assert.equal(calls.filter(({ url }) => url.hostname === 'papi.binance.com').length, 2);
+  assert.equal(calls.filter(({ url }) => url.hostname === 'fapi.binance.com').length, 2);
 });

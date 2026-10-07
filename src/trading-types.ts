@@ -1,4 +1,5 @@
 export type TradingExchange = 'binance' | 'bybit';
+export type TradingAccountMode = 'standard' | 'portfolio-margin' | 'unified';
 export type OilSymbol = 'CLUSDT' | 'BZUSDT';
 export type TradingReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
 export type TradingImportSource = {
@@ -23,7 +24,7 @@ export type FundingReceipt = {
   time: string; amount: string; currency: 'USDT';
 };
 export type TradingAccount = {
-  exchange: TradingExchange; name: string; connected: boolean; revision: number;
+  exchange: TradingExchange; name: string; connected: boolean; revision: number; accountMode: TradingAccountMode;
   verifiedAt: string | null; refreshing: boolean;
   positions: { state: TradingReadState; fetchedAt: string | null; error: string | null };
   funding: { state: TradingReadState; fetchedAt: string | null; error: string | null;

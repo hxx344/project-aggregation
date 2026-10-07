@@ -133,8 +133,12 @@ test('import HTTP routes require Hub login, same Origin, CSRF and JSON, and reje
   for (const rawBody of ['{', '[]', 'null']) assert.equal((await f.request(importRoute('binance'), { method: 'POST', rawBody })).status, 400);
   for (const body of [{ ...input, apiUrl: f.assetOrigin }, { ...input, password: ASSET_PASSWORD }, { ...input, apiKey: 'attacker_key' },
     { ...input, apiSecret: 'attacker_secret' }, { ...input, revision: '0' }, { ...input, revision: -1 }, { ...input, sourceRevision: 'short' },
-    { ...input, projectRevision: null }, { ...input, projectId: '../asset' }, { ...input, projectRevision: undefined }]) {
+    { ...input, projectRevision: null }, { ...input, projectId: '../asset' }, { ...input, projectRevision: undefined },
+    ...[null, '', 'unified', 'Portfolio-Margin', true, {}].map(accountMode => ({ ...input, accountMode }))]) {
     assert.equal((await f.request(importRoute('binance'), { method: 'POST', body })).status, 400);
+  }
+  for (const accountMode of [null, 'standard', 'portfolio-margin', []]) {
+    assert.equal((await f.request(importRoute('bybit'), { method: 'POST', body: { ...input, accountMode } })).status, 400);
   }
   assert.equal((await f.request(importRoute('aster'), { method: 'POST', body: input })).status, 404);
   assert.equal(f.calls.length, before); assert.equal(f.clientCalls.length, 0); assert.equal(f.stored().revision, 0);
@@ -151,11 +155,16 @@ test('real HTTP Asset imports both exchanges through session and password export
   assert.deepEqual(listed.data.sources[0].connections.map(row => row.label), exchanges.map(exchange => f.secrets[exchange].apiKey.slice(-4)));
   const responses = [listed];
   for (const exchange of exchanges) {
-    const response = await f.request(importRoute(exchange), { method: 'POST', body: await f.body(exchange) }); responses.push(response);
+    const input = await f.body(exchange), accountMode = exchange === 'binance' ? 'portfolio-margin' : 'unified';
+    if (exchange === 'binance') input.accountMode = accountMode;
+    const response = await f.request(importRoute(exchange), { method: 'POST', body: input }); responses.push(response);
     assert.equal(response.status, 202, JSON.stringify(response.data));
     await f.app.trading.refresh();
     assert.equal(f.stored(exchange).revision, 1); assert.ok(f.stored(exchange).credentials);
+    assert.equal(f.stored(exchange).account_mode, accountMode);
+    assert.equal(response.data.accounts.find(row => row.exchange === exchange).accountMode, accountMode);
     assert.deepEqual(f.clientCalls.find(row => row.exchange === exchange && row.method === 'verify').secret, f.secrets[exchange]);
+    assert.ok(f.clientCalls.filter(row => row.exchange === exchange).every(row => row.accountMode === accountMode));
     const exported = f.calls.find(row => row.route === CATALOG + '/export' && row.body.exchange === exchange);
     assert.deepEqual(exported.body, { exchange, revision: revisions[exchange], password: ASSET_PASSWORD });
     assert.match(exported.headers.cookie, /^asset_session=fixture-\d+$/);
@@ -258,6 +267,8 @@ test('per-exchange import lock covers source reads, while disconnect cancels sou
 
 test('exchange rejection retains encrypted credentials and snapshots; successful retry atomically replaces the account', async t => {
   const f = await fixture(t), previous = await f.connectOriginal(), input = await f.body();
+  input.accountMode = 'portfolio-margin';
+  assert.equal(previous.account_mode, 'standard');
   f.verifyHandlers.binance = async () => { throw new Error(`private provider rejection ${f.secrets.binance.apiKey} ${f.secrets.binance.apiSecret}`); };
   const failed = await f.request(importRoute('binance'), { method: 'POST', body: input });
   assert.equal(failed.status, 400); assert.deepEqual(f.stored(), previous);
@@ -266,6 +277,7 @@ test('exchange rejection retains encrypted credentials and snapshots; successful
   const imported = await f.request(importRoute('binance'), { method: 'POST', body: input });
   assert.equal(imported.status, 202); await f.app.trading.refresh();
   const replaced = f.stored(); assert.equal(replaced.revision, previous.revision + 1); assert.notEqual(replaced.credentials, previous.credentials);
+  assert.equal(replaced.account_mode, 'portfolio-margin');
   assert.equal(f.app.trading.state().legs[0].positions[0].quantity, '2');
 });
 

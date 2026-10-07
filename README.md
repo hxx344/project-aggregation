@@ -20,7 +20,9 @@
 
 左侧“交易”或 `/?view=trading` 打开内置原油四腿资金费套利页。四腿为 Binance、Bybit 各自的 `CLUSDT` 和 `BZUSDT`；多空方向直接读取实际仓位。同品种跨所方向相反时显示结构状态，数量和名义金额仍逐腿列出，不把方向相反等同于完全对冲。同一合约多空并存时保留两条仓位，空仓与尚未读取到数据分别显示。
 
-在页内“账户连接”分别填写国际站的只读 HMAC API Key 和 API Secret，或选择“从 Asset 导入”，从工作台中已启用的 Asset 项目选择对应交易所连接。Binance 使用 USDⓈ-M 账户查询，要求读取权限开启、交易及划转提现等写权限关闭；Bybit 需要统一账户和 `readOnly=1`。保存前验证只读权限及仓位、资金费账本的实际读取能力；验证失败保留旧连接。密钥仅在服务器使用工作台现有密钥加密保存，不返回页面。当前模块仅包含固定的交易所 GET 接口，没有下单、撤单、杠杆调整或转账功能。
+在页内“账户连接”分别填写国际站的只读 HMAC API Key 和 API Secret，或选择“从 Asset 导入”，从工作台中已启用的 Asset 项目选择对应交易所连接。Binance 先选择“普通 U 本位”或“组合保证金（Portfolio Margin）”，分别使用 FAPI 或 PAPI UM 的仓位与资金费查询；选择同时适用于 Asset 导入和手工连接，验证成功后随连接保存。已有连接默认普通 U 本位；验证失败保留旧连接、账户模式及账本，不按错误自动切换接口。Binance 要求读取权限开启、交易及划转提现等写权限关闭；Bybit 需要统一账户和 `readOnly=1`。保存前验证只读权限及仓位、资金费账本的实际读取能力。密钥仅在服务器使用工作台现有密钥加密保存，不返回页面。当前模块仅包含固定的交易所 GET 接口，没有下单、撤单、杠杆调整或转账功能。
+
+Asset 余额同步成功只说明钱包接口可读，不能证明合约仓位接口可读。交易接口失败时显示账户模式、失败步骤、HTTP 状态和交易所数值错误码，不回显上游错误原文或签名链接。Portfolio Margin 的接口与字段依据 [Binance 官方账户文档](https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account)。
 
 Asset 导入是一次性复制，之后两边独立管理；Asset 更换或删除连接不会自动更新交易模块。导入要求 Asset 项目已保存服务地址及登录密码，服务间使用 HTTPS 或实际解析到本机回环的 HTTP 地址（同机部署默认 `127.0.0.1` 可直接使用）。来源列表仅含交易所、密钥尾号和版本；后台验证 Asset 密码后读取选定密钥，再重新检查交易所只读权限。仅支持全球站 Binance、Bybit HMAC 连接；Aster 和其他地区连接不可导入。导入期间来源配置或目标连接发生变化时拒绝保存。旧版 Asset 需和工作台一起升级：`curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
 
