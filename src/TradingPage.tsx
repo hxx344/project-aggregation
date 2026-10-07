@@ -125,6 +125,7 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   const mounted = useRef(false);
   const sequence = useRef(0);
   const pending = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null);
+  const lastReadAt = useRef<number | null>(null);
   const sourceRequest = useRef<AbortController | null>(null);
   const connectionsRef = useRef<HTMLDetailsElement>(null);
   useEffect(() => { expiredRef.current = onExpired; }, [onExpired]);
@@ -149,13 +150,17 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
     }
   }, [cache, cancelSources]);
   const load = useCallback((force = false): Promise<void> => {
-    if (!mounted.current || cache.busy() || document.hidden || !navigator.onLine) return Promise.resolve();
+    if (!mounted.current || cache.busy() || !navigator.onLine) return Promise.resolve();
     if (pending.current && !force) return pending.current.promise;
+    // Embedded or restored browser pages can keep reporting hidden. Continue
+    // bounded cache reads there, without triggering any exchange collection.
+    if (!force && document.hidden && lastReadAt.current !== null && performance.now() - lastReadAt.current < 30_000) return Promise.resolve();
     if (force) cancelRead();
     const request = cache.beginRead(), controller = request.controller;
     const version = ++sequence.current;
     const requestedDays = daysRef.current;
     const requestedPage = pageRef.current;
+    lastReadAt.current = performance.now();
     setReading(true);
     const promise = (async () => {
       try {
@@ -183,16 +188,18 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
     const resume = () => {
       setOffline(!navigator.onLine);
       setClock(value => value + 1);
-      if (document.hidden || !navigator.onLine) { cancelRead(); setReading(false); if (!navigator.onLine) { cancelSources(); setSourcesLoading(false); } }
-      else void load();
+      if (!navigator.onLine) { cancelRead(); setReading(false); cancelSources(); setSourcesLoading(false); }
+      else void load(true);
     };
     const timer = window.setInterval(() => { setClock(value => value + 1); void load(); }, 5000);
     document.addEventListener('visibilitychange', resume);
     window.addEventListener('online', resume); window.addEventListener('offline', resume);
+    window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
     return () => {
       mounted.current = false; cancelRead(); cancelSources();
       clearInterval(timer); document.removeEventListener('visibilitychange', resume);
       window.removeEventListener('online', resume); window.removeEventListener('offline', resume);
+      window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume);
     };
   }, [cancelRead, cancelSources, load]);
   useEffect(() => { daysRef.current = days; pageRef.current = page; cache.select(days, page); setError(''); void load(true); }, [cache, days, page, load]);
@@ -297,7 +304,7 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
         </div>
         <div className="trading-account-forms">{data.accounts.map(account => <AccountConnection key={`${account.exchange}:${account.revision}`} account={account} busy={!!busy || offline} mutate={mutateAccount} sources={sources} sourcesLoading={sourcesLoading} importAccount={importAccount} />)}</div>{busy && busy !== 'refresh' ? <p className="trading-saving" role="status"><LoaderCircle className="spin" size={16} />正在验证账户连接，请稍候…</p> : null}
       </div></details>
-      <p className="trading-page-note">只读查看仓位与资金费 · 页面每 5 秒检查同步状态 · 所有时间为北京时间</p>
+      <p className="trading-page-note">只读查看仓位与资金费 · 前台每 5 秒检查缓存，返回页面立即更新 · 所有时间为北京时间</p>
     </>}
   </div>;
 }

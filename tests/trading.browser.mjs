@@ -209,9 +209,11 @@ async (page) => {
   await page.waitForFunction(() => [...document.querySelectorAll('.trading-account-status .trading-status')].every(element => element.classList.contains('stale')));
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'freshness ages while held reads retain positions');
   releaseReads();
+  const hiddenResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading');
   await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
+  await hiddenResponse;
   const hiddenCount = getCount(); await page.clock.runFor(15000);
-  assert(getCount() === hiddenCount, 'hidden tab stops polling');
+  assert(getCount() === hiddenCount, 'hidden tab does not keep the five-second foreground polling rate');
   await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => false }); window.dispatchEvent(new Event('offline')); });
   const offlineCount = getCount(); await page.clock.runFor(15000);
   assert(getCount() === offlineCount, 'offline tab stops polling');
