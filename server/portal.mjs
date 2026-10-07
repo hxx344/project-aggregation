@@ -36,6 +36,15 @@ function cleanCookies(value, auth) {
   return (value || '').split(';').map(part => part.trim()).filter(part => part.includes('=') && !reservedCookie(part.slice(0, part.indexOf('='))) && part.slice(0, part.indexOf('=')).toLowerCase() !== auth?.cookie?.name.toLowerCase()).join('; ');
 }
 
+// Exported exchange credentials are reserved for the backend import operation.
+function checkedProxyPath(raw) {
+  checkedPath(raw);
+  let pathname = raw.split('?')[0];
+  for (let round = 0; round < 6; round++) { const next = decodeURIComponent(pathname); if (next === pathname) break; pathname = next; }
+  if (/(?:^|\/)api\/hub\/trading-connections\/export\/?$/.test(pathname.replace(/\/+/g, '/'))) throw new PortalError(403, '请从交易模块导入账户连接');
+  return raw;
+}
+
 function setCookies(values, secure, auth) {
   return (values || []).flatMap(value => {
     const parts = value.split(';').map(part => part.trim());
@@ -354,7 +363,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     if (!liveGrant(grant) || req.aborted || req.socket.destroyed || res.destroyed) throw new PortalError(401, '项目访问授权已失效');
     if (coordinateAssetSync && project.adapter === 'asset' && project.autoSync !== false && project.hasCredentials && req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/sync') { await coordinatedSync(req, res, context, project, grant, target); return; }
     const prefix = target.base.pathname.replace(/\/$/, '');
-    const path = prefix + checkedPath(req.url);
+    const path = checkedProxyPath(prefix + checkedPath(req.url));
     const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: req.method, path, headers: requestHeaders(req, context, target, false, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
     const timer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务响应超时')), responseHeaderTimeoutMs);
     const connectionTimer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务连接超时')), connectTimeoutMs);
@@ -430,7 +439,8 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
       const grant = authorized(req, context, project);
       const target = await targetFor(project);
       if (!liveGrant(grant) || req.aborted || socket.destroyed) throw new PortalError(401, '项目访问授权已失效');
-      const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: 'GET', path: target.base.pathname.replace(/\/$/, '') + req.url, headers: requestHeaders(req, context, target, true, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
+      const path = checkedProxyPath(target.base.pathname.replace(/\/$/, '') + req.url);
+      const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: 'GET', path, headers: requestHeaders(req, context, target, true, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
       const timer = setTimeout(() => upstream.destroy(), responseHeaderTimeoutMs);
       const connectionTimer = setTimeout(() => upstream.destroy(), connectTimeoutMs);
       upstream.once('socket', peerSocket => { if (!peerSocket.connecting) clearTimeout(connectionTimer); else peerSocket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });

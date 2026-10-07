@@ -1,13 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { validateUrl, blockedAddress, standardSummary, requestJson, readSummary, normalizeMonitorQuote, UpstreamError } from '../server/adapters.mjs';
+import { validateUrl, blockedAddress, loopbackAddress, standardSummary, requestJson, requestAuthenticatedJson, readSummary, normalizeMonitorQuote, UpstreamError } from '../server/adapters.mjs';
 
 test('URL validation allows intentional private services and blocks metadata addresses', () => {
   assert.equal(validateUrl('http://127.0.0.1:3000/?monitor=oil'), 'http://127.0.0.1:3000/?monitor=oil');
   assert.equal(validateUrl('http://10.0.0.5:3100/', { api: true }), 'http://10.0.0.5:3100');
   for (const value of ['http://169.254.169.254', 'http://[fe80::1]', 'http://[::ffff:a9fe:a9fe]', 'http://0xA9FEA9FE', 'http://metadata.google.internal']) assert.throws(() => validateUrl(value));
   assert.equal(blockedAddress('::ffff:169.254.1.1'), true);
+});
+
+test('credential imports require TLS or a pinned loopback destination before sending a request', async t => {
+  for (const address of ['127.0.0.1', '127.2.3.4', '::1', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::ffff:7f00:1']) assert.equal(loopbackAddress(address), true, address);
+  for (const address of ['10.0.0.1', '192.168.1.2', '8.8.8.8', '::ffff:c0a8:102', '::2', 'localhost', 'invalid']) assert.equal(loopbackAddress(address), false, address);
+  let calls = 0;
+  const server = http.createServer((_req, res) => { calls++; res.end('{"ok":true}'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => new Promise(resolve => server.close(resolve)));
+  assert.deepEqual((await requestJson(`http://127.0.0.1:${server.address().port}`, '/', { deadline: Date.now() + 1000, requireSecureTransport: true })).data, { ok: true });
+  assert.equal(calls, 1);
+  for (const base of ['http://10.0.0.1', 'http://192.168.1.2', 'http://[::ffff:a00:1]']) await assert.rejects(requestJson(base, '/api/login', { method: 'POST', body: { password: 'fixture_password' }, deadline: Date.now() + 1000, requireSecureTransport: true }), error => error.code === 'insecure_transport');
+});
+
+test('sensitive authentication does not reuse a default login flight or its transport', async () => {
+  const project = { adapter: 'asset', apiUrl: 'http://127.0.0.1:19981' }, credentials = { password: 'fixture_scoped_password' };
+  const calls = [];
+  const request = scope => async (_base, path) => { calls.push([scope, path]); return path === '/api/login' ? { cookies: [`asset_session=${scope}; Path=/`], data: {} } : { data: { scope } }; };
+  await Promise.all([
+    requestAuthenticatedJson(project, credentials, '/ordinary', { request: request('ordinary') }),
+    requestAuthenticatedJson(project, credentials, '/sensitive', { request: request('sensitive'), sessionScope: 'trading-import' }),
+  ]);
+  assert.equal(calls.filter(([scope, path]) => scope === 'sensitive' && path === '/api/login').length, 1);
+  assert.equal(calls.filter(([scope, path]) => scope === 'ordinary' && path === '/api/login').length, 1);
 });
 
 test('standard protocol validates finite metrics, timestamps, limits and unknown fields', () => {

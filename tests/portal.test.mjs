@@ -139,6 +139,34 @@ test('portal requires a grant and tickets are single-use, expire, and bind the p
   assert.equal((await f.request(expired.pathname + expired.search)).status, 401);
 });
 
+test('portal never proxies Asset credential export, including encoded paths and project base prefixes', async t => {
+  const f = await fixture(t);
+  for (const id of ['asset', 'monitor']) {
+    const { cookie } = await f.authorize(id);
+    for (const path of ['/api/hub/trading-connections/export', '/api/hub/trading-connections/export/', '/api/hub/trading-connections/%65xport', '/api/hub/trading-connections/%2565xport', '/api//hub/trading-connections/export?format=json']) {
+      const before = f.calls;
+      const response = await f.request(path, { id, method: 'POST', cookie, headers: { Origin: `http://${f.host(id)}`, 'Content-Type': 'application/json' }, body: '{}' });
+      assert.equal(response.status, 403, path); assert.equal(f.calls, before);
+    }
+    assert.equal((await f.request('/api/hub/trading-connections', { id, cookie })).status, 200);
+  }
+  for (const prefix of ['/api/hub/trading-connections', '/mounted/api/hub/trading-connections']) {
+    f.projects[0].apiUrl = `http://127.0.0.1:${f.upstream.address().port}${prefix}`;
+    const { cookie } = await f.authorize(); const before = f.calls;
+    assert.equal((await f.request('/export', { cookie })).status, 403);
+    assert.equal(f.calls, before);
+  }
+});
+
+test('portal blocks WebSocket upgrades to Asset export before opening upstream', async t => {
+  const f = await fixture(t), { cookie } = await f.authorize(); const before = f.calls;
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: f.port, path: '/api/hub/trading-connections/export', headers: { Host: f.host('asset'), Cookie: cookie, Origin: `http://${f.host('asset')}`, Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version': '13' } });
+    req.on('response', res => { res.resume(); resolve(res.statusCode); }); req.on('upgrade', (_res, socket) => { socket.destroy(); reject(new Error('Unexpected upgrade')); }); req.on('error', reject); req.end();
+  });
+  assert.equal(status, 403); assert.equal(f.calls, before);
+});
+
 test('logout, configuration changes, and project disablement revoke granted reads', async t => {
   const f = await fixture(t); const { cookie } = await f.authorize();
   assert.equal((await f.request('/private', { cookie })).status, 200);

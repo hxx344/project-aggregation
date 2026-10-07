@@ -42,7 +42,7 @@ export function validateAuthOrigin(value = '') {
   return url.origin;
 }
 // Pin the validated DNS answer to this connection, including when private hosts are allowed.
-export async function requestJson(base, path, { method = 'GET', headers = {}, body, deadline, signal, limit = 1024 * 1024 } = {}) {
+export async function requestJson(base, path, { method = 'GET', headers = {}, body, deadline, signal, limit = 1024 * 1024, requireSecureTransport = false } = {}) {
   const target = new URL(base.replace(/\/$/, '') + path);
   if (target.origin !== new URL(base).origin) throw new UpstreamError('invalid', '接口地址不在配置的服务内');
   const remaining = Math.max(1, deadline - Date.now());
@@ -58,6 +58,7 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
       new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new UpstreamError('timeout', '服务响应超时')), { once: true })),
     ]);
     if (!addresses.length || addresses.some(({ address }) => blockedAddress(address))) throw new UpstreamError('invalid', '服务地址解析到不允许访问的地址');
+    if (requireSecureTransport && target.protocol !== 'https:' && addresses.some(({ address }) => !loopbackAddress(address))) throw new UpstreamError('insecure_transport', '从 Asset 导入需要 HTTPS 或本机回环地址');
     const address = addresses[0];
     const serialized = body === undefined ? undefined : JSON.stringify(body);
     return await new Promise((resolve, reject) => {
@@ -81,6 +82,12 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
     if (error instanceof UpstreamError) throw error;
     throw new UpstreamError('offline', '无法连接上游服务，请检查地址和服务状态');
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); }
+}
+
+export function loopbackAddress(address) {
+  let value;
+  try { value = new URL(`http://${address.includes(':') ? `[${address.replace(/^\[|\]$/g, '')}]` : address}`).hostname.replace(/^\[|\]$/g, '').toLowerCase(); } catch { return false; }
+  return value === '::1' || /^127\./.test(value) || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(value);
 }
 
 const finite = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -164,10 +171,10 @@ function waitWithin(promise, deadline, signal) {
     promise.then(value => finish(resolve, value), error => finish(reject, error));
   });
 }
-async function authenticatedSession(project, credentials, { request, deadline, signal }) {
+async function authenticatedSession(project, credentials, { request, deadline, signal, sessionScope = '' }) {
   const authOrigin = project.authOrigin || new URL(project.apiUrl).origin;
   if (!credentials?.password) return { headers: { Origin: authOrigin } };
-  const key = createHash('sha256').update(JSON.stringify([project.apiUrl, project.adapter, authOrigin, credentials.password])).digest('hex');
+  const key = createHash('sha256').update(JSON.stringify([project.apiUrl, project.adapter, authOrigin, credentials.password, sessionScope])).digest('hex');
   const now = Date.now();
   for (const [storedKey, value] of loginSessions) if (value.expires <= now) loginSessions.delete(storedKey);
   let session = loginSessions.get(key);
@@ -212,10 +219,10 @@ async function authenticatedSession(project, credentials, { request, deadline, s
 
 // This helper only authenticates; callers supply the fixed, explicitly allowed business route.
 export async function requestAuthenticatedJson(project, credentials, path, {
-  request = requestJson, deadline = Date.now() + 5000, signal, method = 'GET', body, retryUnauthorized = false,
+  request = requestJson, deadline = Date.now() + 5000, signal, method = 'GET', body, retryUnauthorized = false, sessionScope = '',
 } = {}) {
   for (let attempt = 0; ; attempt++) {
-    const session = await authenticatedSession(project, credentials, { request, deadline, signal });
+    const session = await authenticatedSession(project, credentials, { request, deadline, signal, sessionScope });
     try {
       return await request(project.apiUrl, path, { deadline, signal, method, body, headers: session.headers });
     } catch (error) {

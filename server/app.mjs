@@ -12,6 +12,7 @@ import { createAssetSync, syncAsset } from './asset-sync.mjs';
 import { createOverviewEncoder } from './overview-stream.mjs';
 import { createStaticResponder } from './static-response.mjs';
 import { createTrading, TradingError } from './trading.mjs';
+import { createTradingImporter } from './trading-import.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -40,7 +41,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
   mkdirSync(resolvedData, { recursive: true, mode: 0o700 });
@@ -116,6 +117,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     }
   }
   const projectRevision = id => { const row = db.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
+  const tradingImporter = createTradingImporter({ trading, request: tradingImportRequest, sourceTimeoutMs: tradingImportSourceTimeoutMs, importTimeoutMs: tradingImportTimeoutMs,
+    listTargets: () => db.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+  });
   const portal = createPortal({
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
     getProjectRevision: projectRevision,
@@ -247,6 +251,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (!['7', '30'].includes(daysValue)) throw new HttpError(400, '资金费区间仅支持 7 天或 30 天');
       const days = Number(daysValue);
       if (pathname === '/api/trading' && req.method === 'GET') { send(res, 200, trading.state(days)); return; }
+      if (pathname === '/api/trading/import-sources' && req.method === 'GET') { send(res, 200, await tradingImporter.sources()); return; }
+      const importedAccount = pathname.match(/^\/api\/trading\/accounts\/(binance|bybit)\/import$/);
+      if (importedAccount && req.method === 'POST') { await tradingImporter.importAccount(importedAccount[1], await bodyOf(req)); send(res, 202, trading.state(days)); return; }
       if (pathname === '/api/trading/refresh' && req.method === 'POST') { await bodyOf(req); void trading.refresh({ force: true }); send(res, 202, trading.state(days)); return; }
       const account = pathname.match(/^\/api\/trading\/accounts\/(binance|bybit)$/);
       if (account && req.method === 'PUT') { await trading.connect(account[1], await bodyOf(req)); send(res, 202, trading.state(days)); return; }
@@ -350,6 +357,6 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   return {
     server, check, refresh, assetSync, trading, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await tradingImporter.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

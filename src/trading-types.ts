@@ -1,6 +1,15 @@
 export type TradingExchange = 'binance' | 'bybit';
 export type OilSymbol = 'CLUSDT' | 'BZUSDT';
 export type TradingReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
+export type TradingImportSource = {
+  projectId: string; name: string; projectRevision: string;
+  status: 'ready' | 'unavailable' | 'unconfigured'; error: string | null;
+  connections: {
+    exchange: TradingExchange; configured: boolean; revision: string | null;
+    label: string | null; updatedAt: string | null; supported: boolean; reason: string | null;
+  }[];
+};
+export type TradingImportSelection = { projectId: string; projectRevision: string; sourceRevision: string };
 export type TradingPosition = {
   id: string; exchange: TradingExchange; symbol: OilSymbol;
   side: 'long' | 'short'; mode: 'one-way' | 'hedge';

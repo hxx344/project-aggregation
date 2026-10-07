@@ -3,7 +3,7 @@ import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
 import TradingFundingChart from './TradingFundingChart';
-import type { TradingAccount, TradingExchange, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
+import type { TradingAccount, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
 import './trading.css';
 
 const exchangeNames = { binance: 'Binance', bybit: 'Bybit' };
@@ -44,9 +44,27 @@ function PositionRow({ leg, position, first }: { leg: TradingLeg; position: Trad
     <td className="trading-details-cell">{position ? <PositionDetails position={position} /> : null}</td>
   </tr>;
 }
-function AccountConnection({ account, busy, mutate }: { account: TradingAccount; busy: boolean; mutate: (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => Promise<boolean> }) {
+function AccountConnection({ account, busy, mutate, sources, sourcesLoading, importAccount }: {
+  account: TradingAccount; busy: boolean;
+  mutate: (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => Promise<boolean>;
+  sources: TradingImportSource[] | null; sourcesLoading: boolean;
+  importAccount: (exchange: TradingExchange, body: TradingImportSelection & { revision: number }) => Promise<boolean>;
+}) {
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
+  const [selection, setSelection] = useState<TradingImportSelection | null>(null);
+  const choices = (sources ?? []).map(source => {
+    const connection = source.connections.find(item => item.exchange === account.exchange);
+    const available = source.status === 'ready' && connection?.configured && connection.supported && !!connection.revision;
+    const description = source.status !== 'ready' ? source.status === 'unconfigured' ? '未配置登录连接' : '暂不可用' : connection && !connection.supported ? connection.reason || '不支持导入' : !connection?.configured ? `未配置 ${exchangeNames[account.exchange]} 密钥` : connection.label ? `密钥尾号 ${connection.label}` : '已保存只读候选密钥';
+    return { source, connection, available, description };
+  });
+  // Keep the user's chosen revisions. Refreshing metadata must never silently choose a new key.
+  const chosen = choices.find(({ source, connection, available }) => available && source.projectId === selection?.projectId && source.projectRevision === selection.projectRevision && connection?.revision === selection.sourceRevision);
+  function choose(projectId: string) {
+    const choice = choices.find(item => item.available && item.source.projectId === projectId);
+    setSelection(choice?.connection?.revision ? { projectId, projectRevision: choice.source.projectRevision, sourceRevision: choice.connection.revision } : null);
+  }
   async function save(event: FormEvent) {
     event.preventDefault();
     if (await mutate(account.exchange, 'PUT', { revision: account.revision, apiKey: apiKey.trim(), apiSecret: apiSecret.trim() })) { setApiKey(''); setApiSecret(''); }
@@ -54,8 +72,18 @@ function AccountConnection({ account, busy, mutate }: { account: TradingAccount;
   async function disconnect() {
     if (await mutate(account.exchange, 'DELETE', { revision: account.revision })) { setApiKey(''); setApiSecret(''); }
   }
+  async function importSelected() {
+    if (!chosen || !selection || busy || sourcesLoading) return;
+    if (await importAccount(account.exchange, { revision: account.revision, ...selection })) { setApiKey(''); setApiSecret(''); }
+  }
   return <form className="trading-account-form" onSubmit={save} aria-label={`${exchangeNames[account.exchange]} 账户连接`}>
     <div className="trading-account-form-heading"><h3>{exchangeNames[account.exchange]}</h3><span>{account.connected ? '已连接' : '未连接'}</span></div>
+    <div className="trading-account-import">
+      <label htmlFor={`trading-source-${account.exchange}`}>Asset 来源<select id={`trading-source-${account.exchange}`} value={chosen?.source.projectId ?? ''} disabled={busy || sourcesLoading || !choices.some(choice => choice.available)} onChange={event => choose(event.target.value)}><option value="">{sourcesLoading ? '正在读取 Asset 来源…' : choices.some(choice => choice.available) ? '请选择 Asset 项目' : '暂无可导入的 Asset 连接'}</option>{choices.map(({ source, available, description }) => <option key={source.projectId} value={source.projectId} disabled={!available}>{source.name} · {description}</option>)}</select></label>
+      {chosen ? <p className="trading-import-detail">{chosen.connection?.label ? `密钥尾号 ${chosen.connection.label} · ` : ''}{chosen.connection?.updatedAt ? `Asset 保存时间：${formatDate(chosen.connection.updatedAt)}（北京时间）` : '导入时将重新验证只读权限。'}</p> : selection && sources ? <p className="trading-import-detail">来源已变更或不可用，请重新选择。</p> : null}
+      {choices.filter(choice => !choice.available && choice.source.status === 'ready').map(choice => <p key={choice.source.projectId} className="trading-import-detail">{choice.source.name}：{choice.description}</p>)}
+      <button className="button secondary" type="button" disabled={busy || sourcesLoading || !chosen} onClick={() => void importSelected()}><Link2 size={16} />{account.connected ? '从 Asset 导入并替换' : '从 Asset 导入'}</button>
+    </div>
     <p>{account.connected ? '填写新的只读密钥可替换当前连接。' : '连接后读取 CLUSDT、BZUSDT 仓位和资金费账单。'}</p>
     <label htmlFor={`trading-key-${account.exchange}`}>API Key<input id={`trading-key-${account.exchange}`} type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={event => setApiKey(event.target.value)} required disabled={busy} /></label>
     <label htmlFor={`trading-secret-${account.exchange}`}>API Secret<input id={`trading-secret-${account.exchange}`} type="password" autoComplete="off" spellCheck={false} value={apiSecret} onChange={event => setApiSecret(event.target.value)} required disabled={busy} /></label>
@@ -75,15 +103,37 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
   const [offline, setOffline] = useState(!navigator.onLine);
   const [page, setPage] = useState(0);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  const [sources, setSources] = useState<TradingImportSource[] | null>(null);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [sourcesError, setSourcesError] = useState('');
   const daysRef = useRef(days);
   const expiredRef = useRef(onExpired);
   const mounted = useRef(false);
   const sequence = useRef(0);
   const pending = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null);
   const mutation = useRef<AbortController | null>(null);
+  const sourceRequest = useRef<AbortController | null>(null);
   const connectionsRef = useRef<HTMLDetailsElement>(null);
   useEffect(() => { expiredRef.current = onExpired; }, [onExpired]);
   const cancelRead = useCallback(() => { sequence.current++; pending.current?.controller.abort(); pending.current = null; }, []);
+  const cancelSources = useCallback(() => { sourceRequest.current?.abort(); sourceRequest.current = null; }, []);
+  const loadSources = useCallback(async () => {
+    if (!mounted.current || mutation.current || !navigator.onLine) return;
+    cancelSources();
+    const controller = new AbortController(); sourceRequest.current = controller;
+    setSourcesLoading(true); setSourcesError('');
+    try {
+      const next = await api<{ sources: TradingImportSource[] }>('/api/trading/import-sources', { signal: controller.signal, timeoutMs: 30_000 });
+      if (!mounted.current || controller.signal.aborted) return;
+      setSources(next.sources);
+    } catch (cause) {
+      if (!mounted.current || controller.signal.aborted) return;
+      if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
+      else { setSources(null); setSourcesError(cause instanceof Error ? cause.message : 'Asset 来源读取失败，请刷新来源重试。'); }
+    } finally {
+      if (sourceRequest.current === controller) { sourceRequest.current = null; if (mounted.current) setSourcesLoading(false); }
+    }
+  }, [cancelSources]);
   const load = useCallback((force = false): Promise<void> => {
     if (!mounted.current || mutation.current || document.hidden || !navigator.onLine) return Promise.resolve();
     if (pending.current && !force) return pending.current.promise;
@@ -113,19 +163,20 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
     mounted.current = true;
     const resume = () => {
       setOffline(!navigator.onLine);
-      if (document.hidden || !navigator.onLine) { cancelRead(); setReading(false); }
+      if (document.hidden || !navigator.onLine) { cancelRead(); setReading(false); if (!navigator.onLine) { cancelSources(); setSourcesLoading(false); } }
       else void load();
     };
     const timer = window.setInterval(() => void load(), 5000);
     document.addEventListener('visibilitychange', resume);
     window.addEventListener('online', resume); window.addEventListener('offline', resume);
     return () => {
-      mounted.current = false; cancelRead(); mutation.current?.abort(); mutation.current = null;
+      mounted.current = false; cancelRead(); cancelSources(); mutation.current?.abort(); mutation.current = null;
       clearInterval(timer); document.removeEventListener('visibilitychange', resume);
       window.removeEventListener('online', resume); window.removeEventListener('offline', resume);
     };
-  }, [cancelRead, load]);
+  }, [cancelRead, cancelSources, load]);
   useEffect(() => { daysRef.current = days; void load(true); setPage(0); }, [days, load]);
+  useEffect(() => { if (connectionsOpen) void loadSources(); }, [connectionsOpen, loadSources]);
   useEffect(() => {
     const back = () => setDays(readDays());
     window.addEventListener('popstate', back); return () => window.removeEventListener('popstate', back);
@@ -135,17 +186,17 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
     const url = new URL(location.href); url.searchParams.set('tradingDays', String(next));
     history.pushState(null, '', url); setDays(next);
   }
-  async function write(path: string, method: 'POST' | 'PUT' | 'DELETE', body: object, label: string) {
-    if (mutation.current) return false;
+  async function write(path: string, method: 'POST' | 'PUT' | 'DELETE', body: object, label: string, importing = false) {
+    if (mutation.current || !navigator.onLine) return false;
     const controller = new AbortController(); mutation.current = controller;
-    cancelRead(); setReading(false); setBusy(label); setOperationError(''); setNotice('');
+    cancelRead(); cancelSources(); setSourcesLoading(false); setReading(false); setBusy(label); setOperationError(''); setNotice('');
     let succeeded = false;
     try {
-      const next = await api<TradingState>(`${path}?days=${daysRef.current}`, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: method === 'PUT' ? 45_000 : 15_000 });
+      const next = await api<TradingState>(`${path}?days=${daysRef.current}`, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: importing ? 65_000 : method === 'PUT' ? 45_000 : 15_000 });
       if (!mounted.current || controller.signal.aborted) return false;
       setData(next);
       succeeded = true;
-      setNotice(method === 'DELETE' ? '账户已断开，已清除该账户的当前缓存。' : method === 'PUT' ? '只读密钥已验证，正在同步账户数据。' : '已请求同步，已有数据会保留到同步完成。');
+      setNotice(importing ? '已从 Asset 导入并验证只读密钥，正在同步账户数据。' : method === 'DELETE' ? '账户已断开，已清除该账户的当前缓存。' : method === 'PUT' ? '只读密钥已验证，正在同步账户数据。' : '已请求同步，已有数据会保留到同步完成。');
     } catch (cause) {
       if (!mounted.current || controller.signal.aborted) return false;
       if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
@@ -157,6 +208,7 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
     return succeeded;
   }
   const mutateAccount = (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => write(`/api/trading/accounts/${exchange}`, method, body, exchange);
+  const importAccount = (exchange: TradingExchange, body: TradingImportSelection & { revision: number }) => write(`/api/trading/accounts/${exchange}/import`, 'POST', body, exchange, true);
   const connected = data?.accounts.some(account => account.connected) ?? false;
   const refreshing = data?.accounts.some(account => account.refreshing) ?? false;
   const events = data?.funding.events ?? [];
@@ -197,7 +249,19 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
         {events.length ? <><div className="trading-table-scroll trading-ledger-scroll" tabIndex={0} role="region" aria-label="资金费流水明细"><table><thead><tr><th scope="col">时间（北京时间）</th><th scope="col">交易所</th><th scope="col">合约</th><th scope="col">收付</th><th scope="col">金额 · USDT</th></tr></thead><tbody>{events.slice(currentPage * 50, (currentPage + 1) * 50).map(event => <tr key={`${event.exchange}-${event.id}`}><td>{formatDate(event.time)}</td><td>{exchangeNames[event.exchange]}</td><td>{event.symbol}</td><td>{!/[1-9]/.test(event.amount) ? '零额' : event.amount.startsWith('-') ? '支出' : '收入'}</td><td className={polarity(event.amount)}>{amount(event.amount, true)}</td></tr>)}</tbody></table></div><div className="trading-pagination"><span>第 {currentPage + 1} / {pageCount} 页 · 每页最多 50 条</span><div><button className="button secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button><button className="button secondary" disabled={currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}>下一页</button></div></div></> : <div className="trading-ledger-empty">{data.funding.complete ? '所选区间没有资金费流水。' : '尚无已获取的资金费流水；连接账户并完成同步后显示。'}</div>}
       </section>
 
-      <details ref={connectionsRef} className="trading-panel trading-connections" open={connectionsOpen} onToggle={event => setConnectionsOpen(event.currentTarget.open)}><summary><span><Link2 size={18} /><strong>账户连接</strong><small>{data.accounts.filter(account => account.connected).length} / 2 已连接</small></span><ChevronDown size={18} /></summary><div className="trading-connections-body"><p className="trading-connection-note">仅支持 HMAC 只读密钥，请关闭交易和提现权限。密钥在服务器保存，保存后不回显。</p><div className="trading-account-forms">{data.accounts.map(account => <AccountConnection key={account.exchange} account={account} busy={!!busy || offline} mutate={mutateAccount} />)}</div>{busy && busy !== 'refresh' ? <p className="trading-saving" role="status"><LoaderCircle className="spin" size={16} />正在验证账户连接，请稍候…</p> : null}</div></details>
+      <details ref={connectionsRef} className="trading-panel trading-connections" open={connectionsOpen} onToggle={event => setConnectionsOpen(event.currentTarget.open)}><summary><span><Link2 size={18} /><strong>账户连接</strong><small>{data.accounts.filter(account => account.connected).length} / 2 已连接</small></span><ChevronDown size={18} /></summary><div className="trading-connections-body">
+        <p className="trading-connection-note">仅支持 HMAC 只读密钥，请关闭交易和提现权限。密钥在服务器保存，保存后不回显。</p>
+        <div className="trading-import-sources">
+          <div className="trading-import-heading"><h3>从 Asset 导入</h3><button className="button secondary" type="button" disabled={!!busy || offline || sourcesLoading} onClick={() => void loadSources()}>{sourcesLoading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}刷新来源</button></div>
+          <p>使用工作台已保存的 Asset 登录连接，重新验证只读权限后导入。</p>
+          <p>导入后独立保存；Asset 更换或移除密钥不会自动修改这里。</p>
+          {sourcesLoading ? <p role="status">正在读取 Asset 来源…</p> : null}
+          {sourcesError ? <p className="trading-warning" role="alert">{sourcesError}</p> : null}
+          {sources?.length === 0 ? <p>暂无已启用的 Asset 项目。可先在工作台配置 Asset 登录连接，或在下方手动填写只读密钥。</p> : null}
+          {sources?.filter(source => source.status !== 'ready').map(source => <p className="trading-warning" key={source.projectId}>{source.name}：{source.error || (source.status === 'unconfigured' ? '请先在工作台配置 Asset API 地址与登录密码。' : '来源暂不可用，请确认 Asset 服务已更新并刷新来源。')}</p>)}
+        </div>
+        <div className="trading-account-forms">{data.accounts.map(account => <AccountConnection key={account.exchange} account={account} busy={!!busy || offline} mutate={mutateAccount} sources={sources} sourcesLoading={sourcesLoading} importAccount={importAccount} />)}</div>{busy && busy !== 'refresh' ? <p className="trading-saving" role="status"><LoaderCircle className="spin" size={16} />正在验证账户连接，请稍候…</p> : null}
+      </div></details>
       <p className="trading-page-note">只读查看仓位与资金费 · 页面每 5 秒检查同步状态 · 所有时间为北京时间</p>
     </>}
   </div>;

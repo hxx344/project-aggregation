@@ -248,17 +248,25 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: iso(current), period: { days, start: iso(start), end: iso(end) },
       accounts, legs, structure: structure(legs), funding: { complete, ...totals, currency: 'USDT', events, daily } };
   }
-  async function connect(exchange, body) {
-    exchangeOf(exchange); const revision = revisionOf(body.revision), credentials = credentialsOf(body);
+  async function connect(exchange, body, { credentialReader, beforeSave, signal: externalSignal, timeoutMs = validationTimeoutMs } = {}) {
+    exchangeOf(exchange); const revision = revisionOf(body.revision);
+    let credentials = credentialReader ? null : credentialsOf(body);
     if (closed) throw new TradingError(503, '交易模块正在关闭');
     if (rowFor(exchange).revision !== revision) throw new TradingError(409, '连接已被更新，请刷新后重试');
     if (validations.has(exchange)) throw new TradingError(409, '此交易所正在验证连接，请稍候');
     const controller = new AbortController(); validations.set(exchange, controller);
+    const abort = () => controller.abort(externalSignal.reason);
+    if (externalSignal?.aborted) abort(); else externalSignal?.addEventListener('abort', abort, { once: true });
     try {
-      const result = await deadline(controller, validationTimeoutMs, signal => clients.get(exchange).verify(credentials, { signal }));
+      const result = await deadline(controller, timeoutMs, async signal => {
+        if (credentialReader) credentials = credentialsOf(await credentialReader(signal));
+        signal.throwIfAborted();
+        return clients.get(exchange).verify(credentials, { signal });
+      });
       controller.signal.throwIfAborted();
       if (closed) throw new TradingError(503, '交易模块正在关闭');
       if (rowFor(exchange).revision !== revision) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
+      beforeSave?.();
       const positions = normalizePositions(result, exchange, now()), snapshot = emptySnapshot(exchange);
       snapshot.positions = { ...snapshot.positions, ...positions, lastAttemptAt: iso(now()) };
       const encrypted = encrypt({ exchange, ...credentials });
@@ -269,7 +277,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     } catch (error) {
       if (error instanceof TradingError) throw error;
       throw new TradingError(400, controller.signal.aborted && controller.signal.reason?.name !== 'TimeoutError' ? '连接验证已取消' : safeError(error));
-    } finally { if (validations.get(exchange) === controller) validations.delete(exchange); }
+    } finally { externalSignal?.removeEventListener('abort', abort); if (validations.get(exchange) === controller) validations.delete(exchange); }
   }
   function disconnect(exchange, revision) {
     exchangeOf(exchange); revisionOf(revision);
