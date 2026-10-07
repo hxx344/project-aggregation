@@ -14,6 +14,8 @@ import { createStaticResponder } from './static-response.mjs';
 import { createTrading, TradingError } from './trading.mjs';
 import { snapshotDiagnostics } from './diagnostics.mjs';
 import { createTradingImporter } from './trading-import.mjs';
+import { createTradingExecution } from './trading-execution.mjs';
+import { ExecutionError } from './trading-execution-plan.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -42,7 +44,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
   mkdirSync(resolvedData, { recursive: true, mode: 0o700 });
@@ -98,6 +100,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64'); };
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
   const trading = createTrading({ db, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs });
+  const execution = createTradingExecution({ db, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, isSessionActive: id => !!db.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
   const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
   const getProjects = () => db.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
@@ -261,6 +264,17 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
     if (pathname === '/api/logout' && req.method === 'POST') { db.prepare('DELETE FROM sessions WHERE id=?').run(current.id); publishOverview(); send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` }); return; }
+    if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
+      if (pathname === '/api/trading/execution' && req.method === 'GET') { send(res, 200, execution.state()); return; }
+      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit)$/);
+      if (account && req.method === 'PUT') { send(res, 200, await execution.connect(account[1], await bodyOf(req), current.id)); return; }
+      if (account && req.method === 'DELETE') { send(res, 200, execution.disconnect(account[1], await bodyOf(req), current.id)); return; }
+      if (pathname === '/api/trading/execution/preview' && req.method === 'POST') { send(res, 200, await execution.preview(await bodyOf(req), current.id)); return; }
+      if (pathname === '/api/trading/execution/jobs' && req.method === 'POST') { send(res, 202, execution.start(await bodyOf(req), current.id)); return; }
+      const job = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/(stop|reconcile)$/);
+      if (job && req.method === 'POST') { const body = await bodyOf(req); send(res, 200, job[2] === 'stop' ? execution.stop(job[1], body, current.id) : await execution.reconcile(job[1], body, current.id)); return; }
+      throw new HttpError(404, '实盘执行接口不存在');
+    }
     if (pathname === '/api/trading' || pathname.startsWith('/api/trading/')) {
       const daysValue = url.searchParams.get('days') || '7';
       if (!['7', '30'].includes(daysValue)) throw new HttpError(400, '资金费区间仅支持 7 天或 30 天');
@@ -351,7 +365,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (!existsSync(filename) || !statSync(filename).isFile()) { if (path.extname(decoded)) throw new HttpError(404, '文件不存在'); filename = path.join(distDir, 'index.html'); }
       if (!existsSync(filename)) { send(res, 503, { error: '前端尚未构建，请先执行 npm run build' }); return; }
       await serveStatic(req, res, filename, { 'Content-Type': mime[path.extname(filename)] || 'application/octet-stream', 'Cache-Control': path.basename(filename) === 'index.html' ? 'no-cache' : 'public, max-age=3600' });
-    } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError || error instanceof TradingError ? error.status : 500, { error: error instanceof HttpError || error instanceof TradingError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
+    } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError ? error.status : 500, { error: error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
   });
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
@@ -373,8 +387,8 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const heartbeat = setInterval(publishOverview, 15000); heartbeat.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   return {
-    server, check, refresh, assetSync, trading, dataDir: resolvedData,
+    server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await tradingImporter.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await execution.close(); await tradingImporter.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

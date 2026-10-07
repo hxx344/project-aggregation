@@ -1,7 +1,8 @@
-// Run with playwright-cli run-code, passing this file's text as the code argument.
-// Uses the origin of the already-open app page; all /api requests are isolated fixtures.
+// Open about:blank, then run this file with playwright-cli run-code.
+// All API intercepts are installed before navigating to isolated localhost:4175.
 async (page) => {
-  const origin = new URL(page.url()).origin;
+  const origin = page.url() === 'about:blank' ? 'http://127.0.0.1:4175' : new URL(page.url()).origin;
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):4175$/.test(origin)) throw new Error('Trading fixture requires isolated localhost:4175');
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const requests = [], pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
@@ -37,11 +38,13 @@ async (page) => {
     const pages = Math.max(1, Math.ceil(events.length / 50)), pageIndex = Math.min(requestedPage, pages - 1);
     return { mode: 'read-only', pnl, strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, cache: { builtAt: fixedTime, servedAt: fixedTime, rebuilding: refreshing }, period: { days, start, end: fixedTime }, accounts, legs, structure: { state: !any ? 'unknown' : hedge ? 'mixed' : partial ? 'incomplete' : 'opposed', message: !any ? '连接账户后检查同品种的跨所持仓方向。' : hedge ? 'CLUSDT 同时存在双向持仓，请分别核对。' : partial ? '部分仓位状态未能确认，暂不能判断完整结构。' : 'CLUSDT 与 BZUSDT 均为跨交易所反向持仓。' }, funding: { complete, income: any ? days === 30 ? '95.4' : '18.6' : null, expense: any ? '6.2' : null, net: any ? days === 30 ? '89.2' : '12.4' : null, currency: 'USDT', events: events.slice(pageIndex * 50, (pageIndex + 1) * 50), pagination: { page: pageIndex, pageSize: 50, total: events.length, pages }, daily: any ? Array.from({ length: days + 1 }, (_, index) => ({ date: new Date(Date.parse(fixedTime) - (days - index) * 86400000).toISOString().slice(0, 10), income: partial && index === 2 ? null : index % 3 ? '1.7' : '0', expense: partial && index === 2 ? null : index % 4 ? '0' : '0.7', net: partial && index === 2 ? null : index % 3 ? '1.7' : '-0.7', complete: !partial })) : [] } };
   };
+  await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort('blockedbyclient'));
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url()), method = request.method();
     const record = { path: url.pathname, query: url.search, method, body: request.postDataJSON() };
     requests.push(record);
     const send = (json, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(json) });
+    if (url.pathname === '/api/trading/execution' && method === 'GET') return send({ generatedAt: fixedTime, connections: [], positions: [], jobs: [] });
     if (url.pathname === '/api/session') return send({ authenticated: true, csrfToken: 'fixture-only-csrf' });
     if (url.pathname === '/api/login') { expire = false; return send({ csrfToken: 'fixture-only-csrf-new-login' }); }
     if (url.pathname === '/api/logout') return send({ ok: true });
@@ -118,7 +121,7 @@ async (page) => {
   assert(await page.getByRole('button', { name: '近7天', exact: true }).getAttribute('aria-pressed') === 'true', 'history restores range');
   holdReads = true;
   await page.getByRole('button', { name: '总览', exact: true }).click();
-  await page.getByRole('button', { name: /^交易\s*只读$/ }).click();
+  await page.getByRole('button', { name: '交易', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.trading-funding-summary')?.textContent.includes('12.4'));
   assert(await page.locator('.trading-initial').count() === 0, 'returning to trading displays the cached page before a held GET completes');
   await page.getByRole('button', { name: '近30天', exact: true }).click();
@@ -130,7 +133,7 @@ async (page) => {
   await page.getByRole('button', { name: '账户连接', exact: true }).click();
   await binanceForm.getByLabel('API Key', { exact: true }).fill('draft-keep');
   await binanceForm.getByLabel('API Secret', { exact: true }).fill('draft-secret');
-  await page.getByRole('button', { name: '刷新数据', exact: true }).click();
+  await page.getByRole('button', { name: '刷新观察数据', exact: true }).click();
   await waitForText('后台同步中');
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'manual refresh retains positions');
   assert(await binanceForm.getByLabel('API Secret', { exact: true }).inputValue() === 'draft-secret', 'manual refresh preserves secret draft');

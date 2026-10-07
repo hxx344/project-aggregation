@@ -6,6 +6,7 @@ import { ageTradingData, tradingCacheNow } from './trading-cache';
 import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
 import TradingPnlChart from './TradingPnlChart';
+import TradingExecution from './TradingExecution';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
 import './trading.css';
 
@@ -253,7 +254,8 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   };
 
   return <div className="trading-page">
-    <header className="trading-heading"><div><div className="trading-title-line"><h1>原油四腿资金费套利</h1><span className="trading-readonly"><ShieldCheck size={14} />只读</span></div><p>Binance 与 Bybit · CLUSDT / BZUSDT</p></div><button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新数据'}</button></header>
+    <header className="trading-heading"><div><div className="trading-title-line"><h1>原油四腿资金费套利</h1></div><p>Binance 与 Bybit · CLUSDT / BZUSDT</p></div><button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button></header>
+    <TradingExecution onExpired={onExpired} />
     {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
     {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}

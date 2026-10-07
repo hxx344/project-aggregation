@@ -41,6 +41,7 @@ async (page) => {
     if (request.method() !== 'GET') { writes.push(`${request.method()} ${url.pathname}`); return send({ error: 'Unexpected mutation' }, 400); }
     if (url.pathname === '/api/session') return send({ authenticated: true, csrfToken: 'fixture-only-csrf' });
     const overview = { projects: [], generatedAt: new Date(base + elapsed).toISOString() };
+    if (url.pathname === '/api/trading/execution') return send({ generatedAt: overview.generatedAt, connections: [], positions: [], jobs: [] });
     if (url.pathname === '/api/overview') return send(overview);
     if (url.pathname === '/api/overview/events') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `data: ${JSON.stringify(overview)}\n\n` });
     if (url.pathname !== '/api/trading') return send({ error: `Unexpected fixture API: ${url.pathname}` }, 404);

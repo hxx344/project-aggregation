@@ -37,6 +37,7 @@ async (page) => {
     const record = { path: url.pathname, query: url.search, method, body: request.postDataJSON() };
     requests.push(record);
     const send = (json, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(json) });
+    if (url.pathname === '/api/trading/execution' && method === 'GET') return send({ generatedAt: fixedTime, connections: [], positions: [], jobs: [] });
     if (url.pathname === '/api/session') return send({ authenticated: true, csrfToken: 'fixture-only-csrf' });
     if (url.pathname === '/api/overview/events') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `data: ${JSON.stringify({ projects: [], generatedAt: fixedTime })}\n\n` });
     if (url.pathname === '/api/overview') return send({ projects: [], generatedAt: fixedTime });
