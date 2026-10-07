@@ -259,6 +259,43 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     catch { /* Even a failed or timed-out stop must be reconciled by a fresh query. */ }
     await inspectOrder(orderFor(order.localId));
   }
+  async function amendOrder(job, leg, order, market) {
+    writable();
+    if (order.exchange !== 'binance' || !order.remoteId || order.settled || order.unknown || order.amendPending) throw new ExecutionError(409, '原订单尚未确认，禁止追价');
+    if ((order.amendCount ?? 0) >= 9000) throw new ExecutionError(409, '原订单已达到追价次数上限，请停止后重新预览');
+    const ctx = context(order.exchange, order.accountRevision);
+    // Amend the original total, never its remainder. Existing fills continue to
+    // belong to the same order; this intent must survive a lost acknowledgement.
+    Object.assign(order, { state: 'amending', amendPending: true, unknown: true, lastAmendAt: iso(now()), amendCount: (order.amendCount ?? 0) + 1 });
+    saveOrder(order);
+    try {
+      const beforeMutation = () => {
+        requireLease();
+        const current = jobFor(job.id), original = orderFor(order.localId);
+        if (closing || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)
+            || original.settled || original.remoteId !== order.remoteId || !original.amendPending) throw new NotSubmittedError('任务或原订单已停止，本次追价未发送');
+        try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次追价未发送'); }
+        if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价停止价，本次追价未发送');
+      };
+      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation }));
+      requireLease();
+      const current = orderFor(order.localId), filledQuantity = validateInspection(current, value);
+      Object.assign(current, { filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
+      saveOrder(current);
+      if (current.settled && compareDecimals(current.filledQuantity, current.spec.quantity) < 0) throw new ExecutionError(409, '原生追价后订单提前终止且未全部成交，暂停其余交易腿');
+    } catch (error) {
+      requireLease();
+      // A rejected amendment says nothing about whether the original order is
+      // still live. Keep it unsettled until inspection and stop finish normally.
+      const current = orderFor(order.localId);
+      if (current.amendPending) {
+        current.amendPending = false;
+        current.unknown = !(error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain);
+        current.state = current.unknown ? 'unknown' : 'working'; saveOrder(current);
+      }
+      pause(job.id, `Binance ${leg.symbol} 原生追价结果：${safeError(error)}`);
+    }
+  }
   async function submit(job, leg, quantity, market) {
     writable();
     if (!['queued', 'running'].includes(jobFor(job.id).status)) return;
@@ -324,7 +361,11 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
           if (order.state === 'paused' || order.state === 'terminal') throw new ExecutionError(409, '交易所策略暂停或子单尚未结束，暂停其余交易腿');
           const market = normalizeMarket(await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })), leg.symbol, now());
           if (stopReached(leg, market)) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 已达到追价停止价`);
-          if (leg.exchange === 'binance' && now() - Date.parse(order.createdAt) >= job.plan.repriceIntervalMs) await cancelOrder(order);
+          if (leg.exchange === 'binance' && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= job.plan.repriceIntervalMs
+              && (order.price === null || compareDecimals(order.price, leg.orderSide === 'buy' ? market.bid : market.ask) !== 0)) {
+            await amendOrder(job, leg, order, market);
+            if (jobFor(id).status === 'stopping') break;
+          }
         }
       }
       job = jobFor(id);

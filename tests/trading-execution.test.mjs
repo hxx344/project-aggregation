@@ -19,7 +19,7 @@ async function fixture(t, options = {}) {
   const records = new Map(), calls = [], handlers = {}, markets = {};
   const accounts = Object.fromEntries(['binance', 'bybit'].map(exchange => [exchange, { identity: exchange === 'bybit' ? 'fixture-uid' : null, modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
-  const factory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'inspect', 'stop'].map(method => [method, async (...args) => {
+  const factory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
     if (handlers[`${exchange}:${method}`]) return handlers[`${exchange}:${method}`](...args);
     if (method === 'verify') return { identity: accounts[exchange].identity };
@@ -33,6 +33,12 @@ async function fixture(t, options = {}) {
     const record = spec.id ? records.get(spec.id) : [...records.values()].find(item => item.clientId === spec.clientId);
     if (!record) throw new ExecutionExchangeError('not_found', { notFound: true });
     if (method === 'inspect') return structuredClone(record);
+    if (method === 'amend') {
+      args[2].beforeMutation();
+      assert.equal(exchange, 'binance'); assert.equal(spec.quantity, record.quantity);
+      record.price = (markets[exchange] ?? market(spec.symbol))[spec.side === 'buy' ? 'bid' : 'ask'];
+      return structuredClone(record);
+    }
     if (method === 'stop') Object.assign(record, { status: 'terminal', terminal: true, childrenSettled: true });
   }]));
   const create = () => createTradingExecution({ db, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, ...options });
@@ -92,20 +98,30 @@ test('batch barrier waits for all legs and all native children, then starts next
   assert.ok(f.service.state().connections.every(connection => !connection.locked));
 });
 
-test('partial Binance fill is canceled and reconciled before replacing only the remainder', async t => {
+test('partial Binance fills use native amendments on the same order and original total quantity', async t => {
   const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
   const binance = [...f.records.values()].find(record => record.kind === 'order'); binance.filledQuantity = '0.75';
+  f.markets.binance = { bid: '71', ask: '71.01' };
   f.advance(1000); await f.service.tick();
-  assert.equal(f.creates.length, 3); assert.equal(f.creates.at(-1).exchange, 'binance'); assert.equal(f.creates.at(-1).args[1].quantity, '1.25');
-  const stop = f.calls.findIndex(call => call.method === 'stop' && call.exchange === 'binance'), replacement = f.calls.findLastIndex(call => call.method === 'create');
-  assert.ok(f.calls.slice(stop + 1, replacement).some(call => call.method === 'inspect'));
+  assert.equal(f.creates.length, 2); assert.equal(f.job.legs[0].currentOrder.id, binance.id);
+  assert.equal(f.calls.filter(call => call.method === 'stop').length, 0);
+  let amendments = f.calls.filter(call => call.method === 'amend');
+  assert.equal(amendments.length, 1); assert.equal(amendments[0].args[1].quantity, '2');
+  assert.equal(amendments[0].args[1].id, binance.id); assert.equal(amendments[0].args[1].clientId, binance.clientId);
   assert.equal(f.job.legs[0].filledQuantity, '0.75');
+  f.markets.binance = { bid: '72', ask: '72.01' }; binance.filledQuantity = '1.25';
+  f.advance(999); await f.service.tick(); assert.equal(f.calls.filter(call => call.method === 'amend').length, 1);
+  f.advance(1); await f.service.tick(); amendments = f.calls.filter(call => call.method === 'amend');
+  assert.equal(amendments.length, 2); assert.ok(amendments.every(call => call.args[1].quantity === '2' && call.args[1].id === binance.id));
+  for (const record of f.records.values()) f.fill(record.id);
+  await f.service.tick(); assert.equal(f.job.status, 'completed'); assert.equal(f.creates.length, 2);
+  assert.deepEqual(f.job.legs.map(leg => leg.filledQuantity), ['2', '2']);
 });
 
 test('cancel ACK with still-active original order cannot authorize a replacement', async t => {
   const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
   f.handlers['binance:stop'] = async () => {};
-  f.advance(1000); await f.service.tick(); assert.equal(f.creates.length, 2);
+  f.service.stop(f.job.id, {}); await f.service.tick(); assert.equal(f.creates.length, 2); assert.equal(f.job.status, 'attention');
   f.advance(1000); await f.service.tick(); assert.equal(f.creates.length, 2);
 });
 
@@ -233,8 +249,8 @@ test('stop or deadline while exchange prepares request prevents dispatch without
 });
 
 test('foreign orders with the same raw ID as another leg cannot be treated as owned', async t => {
-  const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
-  const [binance, bybit] = [...f.records.values()]; binance.filledQuantity = '0.5';
+  const f = await fixture(t); f.start(await f.preview()); await f.service.tick();
+  const [binance, bybit] = [...f.records.values()]; f.fill(binance.id); f.fill(bybit.id); await f.service.tick();
   f.accounts.binance.openOrders.push({ id: bybit.id, symbol: 'CLUSDT' });
   f.advance(1000); await f.service.tick();
   assert.equal(f.creates.length, 2); assert.equal(f.job.status, 'paused');
@@ -314,4 +330,78 @@ test('a former owner cannot reacquire a released lease and revive an earlier del
   assert.equal(f.job.legs[0].filledQuantity, '0.5'); assert.equal(f.creates.length, 2);
   assert.throws(() => old.stop(f.job.id, {}), /重启服务/);
   await old.close();
+});
+
+test('unchanged same-side quote skips native amendments without resetting the order', async t => {
+  const f = await fixture(t); f.start(await f.preview()); await f.service.tick();
+  f.advance(1000); await f.service.tick();
+  assert.equal(f.calls.filter(call => call.method === 'amend').length, 0);
+  assert.equal(f.calls.filter(call => call.method === 'stop').length, 0); assert.equal(f.creates.length, 2);
+});
+
+test('a native GTX cancellation pauses immediately without creating another order', async t => {
+  const f = await fixture(t); f.start(await f.preview()); await f.service.tick();
+  const binance = [...f.records.values()].find(record => record.kind === 'order');
+  f.handlers['binance:amend'] = async (_credentials, spec, options) => {
+    options.beforeMutation(); assert.equal(spec.quantity, '1');
+    Object.assign(binance, { status: 'terminal', terminal: true, childrenSettled: true, filledQuantity: '0.3' });
+    return structuredClone(binance);
+  };
+  f.markets.binance = { bid: '71', ask: '71.01' }; f.advance(1000); await f.service.tick();
+  assert.equal(f.job.status, 'paused'); assert.equal(f.creates.length, 2); assert.equal(f.job.legs[0].filledQuantity, '0.3');
+  await f.service.tick(); assert.equal(f.creates.length, 2);
+});
+
+test('rejected, uncertain and malformed amendments reconcile the original instead of marking it rejected', async t => {
+  for (const failure of ['rejected', 'timeout', 'malformed']) {
+    const f = await fixture(t); f.start(await f.preview()); await f.service.tick();
+    const binance = [...f.records.values()].find(record => record.kind === 'order');
+    f.handlers['binance:amend'] = async (_credentials, _spec, options) => {
+      options.beforeMutation(); binance.filledQuantity = '0.4';
+      if (failure === 'malformed') return { ...binance, quantity: '9' };
+      throw new ExecutionExchangeError(failure, { uncertain: failure === 'timeout' });
+    };
+    f.markets.binance = { bid: '71', ask: '71.01' }; f.advance(1000); await f.service.tick();
+    assert.equal(f.job.status, 'paused', failure); assert.equal(f.creates.length, 2, failure);
+    assert.equal(f.job.legs[0].filledQuantity, '0.4', failure); assert.equal(binance.terminal, true, failure);
+    assert.equal(f.calls.filter(call => call.method === 'amend').length, 1, failure);
+    assert.ok(f.calls.some(call => call.method === 'stop' && call.args[1].id === binance.id), failure);
+  }
+});
+
+test('stop, deadline or stale market blocks a prepared native amendment and any timestamp retry', async t => {
+  for (const action of ['stop', 'deadline', 'stale']) {
+    const f = await fixture(t), arrived = deferred(), release = deferred(); let dispatches = 0;
+    f.start(await f.preview(intent({ timeoutMs: 30_000 }))); await f.service.tick();
+    f.handlers['binance:amend'] = async (_credentials, _spec, options) => {
+      options.beforeMutation(); arrived.resolve(); await release.promise;
+      options.beforeMutation(); dispatches += 1;
+      throw new Error('Second dispatch must be blocked');
+    };
+    f.markets.binance = { bid: '71', ask: '71.01' }; f.advance(1000);
+    const running = f.service.tick(); await arrived.promise;
+    const pending = f.db.prepare('SELECT json FROM execution_orders').all().map(row => JSON.parse(row.json)).find(order => order.exchange === 'binance');
+    assert.equal(pending.amendPending, true); assert.equal(pending.spec.quantity, '1');
+    if (action === 'stop') f.service.stop(f.job.id, {}); else f.advance(action === 'deadline' ? 30_001 : 10_001);
+    release.resolve(); await running;
+    assert.equal(dispatches, 0, action); assert.equal(f.creates.length, 2, action);
+    assert.equal(f.job.status, action === 'stop' ? 'stopped' : 'paused', action);
+  }
+});
+
+test('restart reconciles an in-flight native amendment and ignores its former owner ACK', async t => {
+  const f = await fixture(t), arrived = deferred(), release = deferred();
+  f.start(await f.preview()); await f.service.tick();
+  const binance = [...f.records.values()].find(record => record.kind === 'order');
+  f.handlers['binance:amend'] = async (_credentials, _spec, options) => {
+    options.beforeMutation(); binance.filledQuantity = '0.6'; arrived.resolve(); await release.promise;
+    return { ...binance, filledQuantity: '0.1', status: 'working', terminal: false, childrenSettled: false };
+  };
+  f.markets.binance = { bid: '71', ask: '71.01' }; f.advance(1000);
+  const old = f.service, running = old.tick(); await arrived.promise;
+  f.db.prepare('UPDATE execution_lease SET expires=0').run(); f.service = f.create(); await f.service.tick();
+  const before = f.db.prepare('SELECT json FROM execution_orders ORDER BY rowid').all();
+  release.resolve(); await running; await old.close();
+  assert.deepEqual(f.db.prepare('SELECT json FROM execution_orders ORDER BY rowid').all(), before);
+  assert.equal(f.job.status, 'paused'); assert.equal(f.job.legs[0].filledQuantity, '0.6'); assert.equal(f.creates.length, 2);
 });

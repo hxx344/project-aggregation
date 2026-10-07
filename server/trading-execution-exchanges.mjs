@@ -15,6 +15,7 @@ import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-
  *     filledQuantity, price, averagePrice, terminal, childrenSettled,
  *     symbol, side, reduceOnly, positionSide, createdAt
  *   }
+ *   amend(credentials, { ...spec, id: string }, options) -> same as inspect (Binance only)
  *   stop(credentials, { ...spec, id: string | null }, options) -> void (ACK only)
  * options = { accountMode: 'standard' | 'portfolio-margin' | 'unified', signal,
  *   beforeMutation?: () => void } (the guard is an internal service callback).
@@ -24,7 +25,10 @@ import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-
  *
  * Binance: LIMIT + GTX + priceMatch=QUEUE; never sends an explicit price.
  * stopPrice is a strategy stop trigger, NOT a guaranteed execution-price cap;
- * the caller watches prices and stops/reconciles each child before replacing it.
+ * the caller watches prices and periodically amends the same order id with its
+ * original total quantity. Each amendment is a single native modify operation,
+ * not an exchange-managed chase. A failed amendment can leave the original live;
+ * reconcile that order instead of canceling and replacing it to chase prices.
  * Bybit: native chaseOrder, zero offset, maxChasePrice=stopPrice. There is no
  * documented client id / idempotency token for native strategy creation. An
  * uncertain create must never be retried or matched by approximate parameters.
@@ -44,7 +48,9 @@ import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-
  *
  * Official protocol references (verified 2026-10-07):
  * https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Order
+ * https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Modify-Order
  * https://developers.binance.com/docs/derivatives/portfolio-margin/trade/New-UM-Order
+ * https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Modify-UM-Order
  * https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info
  * https://bybit-exchange.github.io/docs/v5/strategy/create-strategy
  * https://bybit-exchange.github.io/docs/v5/strategy/strategy-list
@@ -176,6 +182,7 @@ function binanceEndpoints(mode) {
     openOrders: [host, `${prefix}/openOrders`, 'GET', true],
     openAlgoOrders: [host, portfolio ? `${prefix}/algo/openAlgoOrders` : '/fapi/v1/openAlgoOrders', 'GET', true],
     create: [host, `${prefix}/order`, 'POST', true],
+    amend: [host, `${prefix}/order`, 'PUT', true],
     inspect: [host, `${prefix}/order`, 'GET', true],
     stop: [host, `${prefix}/order`, 'DELETE', true],
     rules: ['https://fapi.binance.com', '/fapi/v1/exchangeInfo', 'GET', false],
@@ -604,6 +611,27 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     } catch { fail('invalid_data', { uncertain: true }); }
   }
 
+  async function amend(credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) {
+    if (exchange !== 'binance') fail('input');
+    const options = { accountMode: modeOf(accountMode), signal, beforeMutation }, spec = validateSpec(rawSpec, true);
+    if (spec.id === null) fail('input');
+    const row = await request('amend', credentials, {
+      symbol: spec.symbol, side: spec.side.toUpperCase(), orderId: spec.id,
+      quantity: spec.quantity, priceMatch: 'QUEUE',
+      // FAPI uses this flag only to validate the original order. Hedge closes
+      // have no explicit reduceOnly flag, and PAPI does not accept this field.
+      ...(options.accountMode === 'standard' && spec.positionSide === 'BOTH' && spec.reduceOnly ? { reduceOnly: 'true' } : {}),
+    }, options);
+    try {
+      const result = parseBinanceOrder(row);
+      if (result.id !== spec.id || result.symbol !== spec.symbol || result.side !== spec.side
+        || result.positionSide !== spec.positionSide || result.reduceOnly !== spec.reduceOnly
+        || result.quantity !== spec.quantity || row.clientOrderId !== spec.clientId
+        || row.type !== 'LIMIT' || row.timeInForce !== 'GTX') fail();
+      return result;
+    } catch { fail('invalid_data', { uncertain: true }); }
+  }
+
   async function inspect(credentials, rawSpec, { accountMode, signal } = {}) {
     const options = { accountMode: modeOf(accountMode), signal }, spec = validateSpec(rawSpec, true);
     if (exchange === 'binance') {
@@ -661,5 +689,5 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     } catch { fail('invalid_data', { uncertain: true }); }
   }
 
-  return Object.freeze({ verify, account, market, create, inspect, stop });
+  return Object.freeze({ verify, account, market, create, amend, inspect, stop });
 }

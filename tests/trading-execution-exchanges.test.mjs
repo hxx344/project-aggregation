@@ -107,7 +107,108 @@ for (const mode of ['standard', 'portfolio-margin']) {
     assert.ok(calls.some(call => call.url.pathname === (mode === 'standard' ? '/fapi/v1/accountConfig' : '/papi/v1/um/accountConfig')));
     for (const call of calls) authenticatedSignature('binance', call);
   });
+
+  test(`Binance ${mode} amends the original order with native QUEUE and its original total quantity`, async () => {
+    const { client, calls } = harness('binance', () => binanceOrder({ status: 'PARTIALLY_FILLED', executedQty: '0.75', price: '80.03', avgPrice: '80.02' }));
+    const result = await client.amend(credentials, { ...spec, id: ORDER, remainingQuantity: '1.25', price: '1', type: 'MARKET', timeInForce: 'IOC', newClientOrderId: 'foreign' }, { accountMode: mode });
+    assert.deepEqual(result, { id: ORDER, kind: 'order', status: 'working', quantity: '2', filledQuantity: '0.75',
+      price: '80.03', averagePrice: '80.02', terminal: false, childrenSettled: false, symbol: 'CLUSDT', side: 'buy',
+      reduceOnly: false, positionSide: 'BOTH', createdAt: new Date(NOW).toISOString() });
+    assert.equal(calls.length, 1); authenticatedSignature('binance', calls[0]);
+    assert.equal(calls[0].init.method, 'PUT');
+    assert.equal(calls[0].url.host, mode === 'standard' ? 'fapi.binance.com' : 'papi.binance.com');
+    assert.equal(calls[0].url.pathname, mode === 'standard' ? '/fapi/v1/order' : '/papi/v1/um/order');
+    assert.deepEqual(calls[0].parameters, { symbol: 'CLUSDT', side: 'BUY', orderId: ORDER, quantity: '2', priceMatch: 'QUEUE',
+      timestamp: String(NOW), recvWindow: '5000', signature: calls[0].parameters.signature });
+  });
+
+  test(`Binance ${mode} amendment preserves explicit and implicit reduce-only directions`, async () => {
+    for (const [positionSide, side] of [['BOTH', 'sell'], ['LONG', 'sell'], ['SHORT', 'buy']]) {
+      const { client, calls } = harness('binance', () => binanceOrder({ positionSide, side: side.toUpperCase(), reduceOnly: positionSide === 'BOTH' }));
+      const result = await client.amend(credentials, { ...spec, id: ORDER, positionSide, side, reduceOnly: true }, { accountMode: mode });
+      assert.equal(result.reduceOnly, true); assert.equal(result.positionSide, positionSide); assert.equal(result.side, side);
+      assert.equal(calls.length, 1); assert.equal(calls[0].init.method, 'PUT');
+      assert.equal(calls[0].parameters.reduceOnly, mode === 'standard' && positionSide === 'BOTH' ? 'true' : undefined);
+      for (const key of ['positionSide', 'timeInForce', 'type', 'price', 'origClientOrderId', 'newClientOrderId']) assert.equal(Object.hasOwn(calls[0].parameters, key), false);
+    }
+  });
+
+  test(`Binance ${mode} GTX cancellation and a fill racing an amendment return terminal fills without replacement`, async () => {
+    for (const [status, executedQty] of [['CANCELED', '0.75'], ['FILLED', '2']]) {
+      const { client, calls } = harness('binance', () => binanceOrder({ status, executedQty, avgPrice: '80.02' }));
+      const result = await client.amend(credentials, { ...spec, id: ORDER }, { accountMode: mode });
+      assert.equal(result.id, ORDER); assert.equal(result.quantity, '2'); assert.equal(result.filledQuantity, executedQty);
+      assert.equal(result.status, 'terminal'); assert.equal(result.terminal, true); assert.equal(result.childrenSettled, true);
+      assert.equal(calls.length, 1); assert.equal(calls[0].init.method, 'PUT');
+    }
+  });
+
+  test(`Binance ${mode} malformed or mismatched amendment acknowledgements are uncertain`, async () => {
+    for (const override of [{ orderId: '123' }, { clientOrderId: 'foreign' }, { symbol: 'BZUSDT' }, { side: 'SELL' },
+      { positionSide: 'LONG' }, { reduceOnly: true }, { origQty: '1.25' }, { type: 'MARKET' }, { timeInForce: 'GTC' },
+      { executedQty: undefined }, { executedQty: '3' }, { status: 'UNKNOWN' }, { status: 'FILLED', executedQty: '1' }]) {
+      const { client, calls } = harness('binance', () => binanceOrder(override));
+      await assert.rejects(client.amend(credentials, { ...spec, id: ORDER }, { accountMode: mode }), isError('invalid_data', true));
+      assert.equal(calls.length, 1); assert.equal(calls[0].init.method, 'PUT');
+    }
+  });
+
+  test(`Binance ${mode} amendment clock correction retries only the same PUT and rechecks its lease`, async () => {
+    let writes = 0, guards = 0;
+    const { client, calls } = harness('binance', call => {
+      if (call.init.method === 'PUT' && ++writes === 1) return json({ code: -1021 }, 400);
+    });
+    await client.amend(credentials, { ...spec, id: ORDER }, { accountMode: mode, beforeMutation: () => { guards += 1; } });
+    assert.equal(calls.length, 3); assert.equal(writes, 2); assert.equal(guards, 2);
+    assert.deepEqual(calls.map(call => call.init.method), ['PUT', 'GET', 'PUT']);
+    assert.equal(calls[1].url.pathname, '/fapi/v1/time');
+    assert.deepEqual(calls[1].init.headers, {});
+    for (const call of [calls[0], calls[2]]) {
+      authenticatedSignature('binance', call);
+      assert.equal(call.parameters.orderId, ORDER); assert.equal(call.parameters.quantity, '2'); assert.equal(call.parameters.priceMatch, 'QUEUE');
+    }
+    assert.equal(calls[0].parameters.timestamp, String(NOW)); assert.equal(calls[2].parameters.timestamp, String(NOW + 2000));
+  });
 }
+
+test('native Binance amendment requires an explicit valid order id; Bybit refuses amendment without HTTP', async () => {
+  const binance = harness('binance');
+  for (const id of [undefined, null, '', 'foreign-id', '-1', '1'.repeat(31)]) {
+    await assert.rejects(binance.client.amend(credentials, { ...spec, id }), isError('input'));
+  }
+  await assert.rejects(binance.client.amend(credentials, { ...spec, id: ORDER, quantity: '0' }), isError('input'));
+  await assert.rejects(binance.client.amend(credentials, { ...spec, id: ORDER }, { accountMode: 'unified' }), isError('account_mode'));
+  assert.equal(binance.calls.length, 0);
+  const bybit = harness('bybit'); let guards = 0;
+  await assert.rejects(bybit.client.amend(credentials, { ...spec, id: STRATEGY }, { beforeMutation: () => { guards += 1; } }), isError('input'));
+  assert.equal(bybit.calls.length, 0); assert.equal(guards, 0);
+});
+
+test('Binance ambiguous amendment errors never retry, recreate, or cancel the original order', async () => {
+  for (const mode of ['standard', 'portfolio-margin']) {
+    for (const code of [-1000, -1006, -1007, -1199, -2010, -2013, -4116, -4999, -5026, -5047, -9999]) {
+      const { client, calls } = harness('binance', () => json({ code }, 400));
+      await assert.rejects(client.amend(credentials, { ...spec, id: ORDER }, { accountMode: mode }), error =>
+        error instanceof ExecutionExchangeError && error.providerCode === code && error.uncertain);
+      assert.equal(calls.length, 1); assert.equal(calls[0].init.method, 'PUT');
+    }
+    const rejected = harness('binance', () => json({ code: -5022 }, 400));
+    await assert.rejects(rejected.client.amend(credentials, { ...spec, id: ORDER }, { accountMode: mode }), isError('rejected'));
+    assert.equal(rejected.calls.length, 1); assert.equal(rejected.calls[0].init.method, 'PUT');
+  }
+});
+
+test('Binance amendment network failures, malformed responses and timeouts remain uncertain', async () => {
+  for (const response of [() => { throw new Error('private exchange payload'); }, () => new Response('{'),
+    () => json({}), () => json({ code: -5022 }, 503), () => new Promise(() => {})]) {
+    const { client, calls } = harness('binance', response, { timeoutMs: 10 });
+    await assert.rejects(client.amend(credentials, { ...spec, id: ORDER }), error => {
+      assert.ok(error instanceof ExecutionExchangeError); assert.equal(error.uncertain, true);
+      assert.equal(error.message.includes('private'), false); return true;
+    });
+    assert.equal(calls.length, 1); assert.equal(calls[0].init.method, 'PUT');
+  }
+});
 
 test('hedge closes omit Binance reduceOnly but use explicit position side; one-way closes set it', async () => {
   const { client, calls } = harness('binance');
@@ -227,7 +328,7 @@ for (const exchange of ['binance', 'bybit']) {
   test(`${exchange} checks the execution lease before each mutation, including clock-adjusted retries`, async () => {
     const leaseError = new Error('execution lease lost');
     const stopSpec = { ...spec, id: exchange === 'binance' ? ORDER : STRATEGY };
-    for (const operation of ['create', 'stop']) {
+    for (const operation of ['create', 'stop', ...(exchange === 'binance' ? ['amend'] : [])]) {
       const input = operation === 'create' ? spec : stopSpec;
       const blocked = harness(exchange);
       let checks = 0;

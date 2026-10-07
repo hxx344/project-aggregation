@@ -152,7 +152,7 @@ export function buildPlan(intent, snapshots, markets, connections, now) {
   });
   return { ...intent, batchCount: count, legs,
     notes: [
-      'Bybit 使用交易所原生追逐限价策略（PostOnly）；Binance 使用 LIMIT / GTX / QUEUE 同向一档，按设定间隔撤销、核对后重新排队。',
+      'Bybit 使用交易所原生追逐限价策略（PostOnly）；Binance 使用 LIMIT / GTX / QUEUE 同向一档，由服务按设定间隔调用原生改单接口追价，保留原订单号与总数量。',
       '停止价用于触达后停止追价并撤销余单，不是对所有成交价格的硬保证；不发送市价单，不用市价补齐或回滚。',
       '同一批所有腿完成且委托终结后才进入下一批；任一腿失败会暂停后续批次并撤销余单，已成交仓位不会自动撤回。',
       ...(count > intent.batchCount ? [`按交易所单笔数量上限，批次数已从 ${intent.batchCount} 增加至 ${count}，请核对预览。`] : []),
