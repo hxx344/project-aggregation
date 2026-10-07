@@ -80,6 +80,122 @@ test('legacy ASTER describes each missing source and report failure without extr
   assert.match(objectError.message, /上游未提供具体原因/); assert.ok(!objectError.message.includes('never-serialize'));
 });
 
+function pairedAsterFixture() {
+  const now = Date.now() / 1000;
+  const day = new Date(now * 1000).toISOString().slice(0, 10);
+  const data = { ready: true, accounts: ['long', 'short'].map(id => ({ id, name: id, enabled: false, mode: 'live',
+    cycle_state: { daily_volume: { utc_date: day, volume: '999999' }, report_status: { status: 'ready' } } })),
+    pairs: [{ id: 'gold', enabled: true, long_account_id: 'long', short_account_id: 'short', state: {
+      updated_at: now, snapshots: { long: { timestamp: now - 10, occupied_margin: '12.5' }, short: { timestamp: now - 5, occupied_margin: '7.5' } },
+      daily_volume: { [day]: { long: '100', short: '120' } }, pending: null,
+    } }] };
+  const read = async () => {
+    const calls = [];
+    const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async (_base, route) => { calls.push(route); return { data }; } });
+    assert.deepEqual(calls, ['/api/state?compact=true']);
+    return { ...result, values: Object.fromEntries(result.metrics.map(item => [item.key, item.value])) };
+  };
+  return { data, state: data.pairs[0].state, now, day, read };
+}
+
+test('legacy ASTER counts enabled pair members and reads their own snapshots and confirmed volume', async () => {
+  const f = pairedAsterFixture();
+  const result = await f.read();
+  assert.deepEqual(result.values, { accounts: 2, live_accounts: 2, occupied_margin: 20, daily_volume: 220 });
+  assert.equal(result.partial, false);
+  assert.equal(result.updatedAt, new Date((f.now - 10) * 1000).toISOString());
+  f.data.accounts[0].enabled = true; // Union membership never counts one account twice.
+  f.data.accounts.push({ id: 'single', enabled: true, mode: 'live', snapshot: { timestamp: f.now, occupied_margin: '2' },
+    cycle_state: { daily_volume: { utc_date: f.day, volume: '30' }, report_status: { status: 'ready' } } });
+  assert.deepEqual((await f.read()).values, { accounts: 3, live_accounts: 3, occupied_margin: 22, daily_volume: 250 });
+});
+
+test('legacy ASTER excludes paused pair members and paper pairs from live totals', async () => {
+  const f = pairedAsterFixture();
+  f.data.pairs[0].enabled = false;
+  assert.deepEqual((await f.read()).values, { accounts: 0, live_accounts: 0, occupied_margin: null, daily_volume: null });
+  f.data.pairs[0].enabled = true;
+  f.data.accounts.forEach(account => { account.mode = 'paper'; });
+  assert.deepEqual((await f.read()).values, { accounts: 2, live_accounts: 0, occupied_margin: null, daily_volume: null });
+});
+
+test('legacy ASTER pair freshness comes from all member snapshots, never the response time', async () => {
+  const f = pairedAsterFixture();
+  f.data.updated_at = f.now;
+  f.data.accounts[0].snapshot = { timestamp: f.now - 2, occupied_margin: '15' };
+  let result = await f.read();
+  assert.equal(result.updatedAt, new Date((f.now - 5) * 1000).toISOString());
+  assert.equal(result.values.occupied_margin, 22.5);
+  f.state.snapshots.short.timestamp = f.now + 3600;
+  result = await f.read();
+  assert.equal(result.updatedAt, null); assert.equal(result.partial, true);
+  assert.equal(result.values.occupied_margin, null);
+  f.state.snapshots.short.timestamp = f.now - 121;
+  assert.equal((await f.read()).updatedAt, new Date((f.now - 121) * 1000).toISOString());
+});
+
+test('legacy ASTER distinguishes confirmed zero pair volume from missing or uncertain data', async t => {
+  const f = pairedAsterFixture();
+  f.state.daily_volume = {};
+  assert.equal((await f.read()).values.daily_volume, 0);
+  const cases = [
+    [{ updated_at: null }, /运行记录缺少有效更新时间/],
+    [{ updated_at: f.now + 3600 }, /运行记录缺少有效更新时间/],
+    [{ updated_at: f.now - 120 }, /运行记录已过期/],
+    [{ daily_volume: null }, /今日成交量缺失或无效/],
+    [{ daily_volume: { [f.day]: { long: '100' } } }, /今日成交量缺失或无效/],
+    [{ daily_volume: { [f.day]: { long: '-1', short: '0' } } }, /今日成交量缺失或无效/],
+    [{ daily_volume: { [f.day]: { long: false, short: '0' } } }, /今日成交量缺失或无效/],
+    [{ volume_unknown: true }, /成交时间或金额尚未核实/],
+    [{ volume_unknown: true, volume_unknown_until_utc: f.day }, /成交时间或金额尚未核实/],
+    [{ volume_unknown: true, volume_unknown_until_utc: '2000-99-00' }, /未知日期无效/],
+    [{ pending: { kind: 'cycle' } }, /订单尚待核对/],
+    [{ recovery_watch: { batches: ['old'] } }, /订单尚待核对/],
+  ];
+  for (const [changes, reason] of cases) await t.test(JSON.stringify(changes), async () => {
+    const current = pairedAsterFixture(); Object.assign(current.state, changes);
+    const result = await current.read();
+    assert.equal(result.values.daily_volume, null); assert.equal(result.partial, true); assert.match(result.message, reason);
+  });
+  f.state.volume_unknown = true; f.state.volume_unknown_until_utc = '2000-01-01';
+  assert.equal((await f.read()).values.daily_volume, 0);
+  f.data.pairs[0].state = undefined;
+  assert.equal((await f.read()).values.daily_volume, null);
+});
+
+test('legacy ASTER keeps confirmed volume during normal submissions and leverage changes', async () => {
+  const f = pairedAsterFixture();
+  f.state.phase = 'submitting';
+  f.state.pending = { kind: 'cycle', phase: 'open', legs: [{ receipt: null, dispatch: 'sending' }, { receipt: { status: 'FILLED' } }], repairs: [] };
+  let result = await f.read();
+  assert.equal(result.partial, false); assert.equal(result.values.daily_volume, 220);
+  assert.match(result.metrics.find(metric => metric.key === 'daily_volume').detail, /配对仅统计已核对成交/);
+  for (const phase of ['attention', 'reconciling', 'repairing']) {
+    f.state.phase = phase;
+    assert.equal((await f.read()).values.daily_volume, null);
+  }
+  f.state.phase = 'submitting'; f.state.pending.legs[0].submit_evidence = 'ambiguous';
+  assert.equal((await f.read()).values.daily_volume, null);
+  f.state.phase = 'leverage'; f.state.pending = { kind: 'leverage', results: {} };
+  result = await f.read();
+  assert.equal(result.partial, false); assert.equal(result.values.daily_volume, 220);
+  f.state.pending.results.long = { unknown: true };
+  assert.equal((await f.read()).values.daily_volume, null);
+});
+
+test('legacy ASTER starts a new UTC day at zero only with a fresh confirmed runtime', async t => {
+  const f = pairedAsterFixture();
+  const nextDay = (Math.floor(f.now / 86400) + 1) * 86400;
+  t.mock.method(Date, 'now', () => (nextDay + 2) * 1000);
+  f.state.updated_at = nextDay + 1;
+  f.state.snapshots.long.timestamp = nextDay + 1; f.state.snapshots.short.timestamp = nextDay + 1;
+  assert.equal((await f.read()).values.daily_volume, 0);
+  f.state.volume_unknown = true; f.state.volume_unknown_until_utc = f.day;
+  assert.equal((await f.read()).values.daily_volume, 0);
+  f.state.updated_at = nextDay - 121;
+  assert.equal((await f.read()).values.daily_volume, null);
+});
+
 test('monitor reads Basic auth and selected module, marks upstream snapshots stale', async () => {
   let authorization;
   const result = await readLegacySummary({ adapter: 'monitor', apiUrl: 'http://127.0.0.1:3000', url: 'http://127.0.0.1:3000/?monitor=oil' }, { username: 'reader', password: 'mock-pass' }, { request: async (_base, route, options) => {

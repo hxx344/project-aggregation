@@ -99,6 +99,43 @@ function diagnosticMessage(base, reasons) {
   return message;
 }
 
+function asterPairOrdersUnresolved(state) {
+  const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (state.recovery_watch != null || state.attention || ['attention', 'reconciling', 'repairing'].includes(state.phase)) return true;
+  const pending = state.pending;
+  if (pending == null) return false;
+  if (!record(pending)) return true;
+  if (pending.kind === 'leverage') return state.phase !== 'leverage' || !record(pending.results)
+    || Object.values(pending.results).some(row => !record(row) || row.unknown);
+  if (state.phase !== 'submitting' || !['cycle', 'ordinary'].includes(pending.kind) || !['open', 'close'].includes(pending.phase)) return true;
+  if (!Array.isArray(pending.legs) || pending.legs.length !== 2 || !Array.isArray(pending.repairs) || pending.repairs.length) return true;
+  return pending.legs.some(leg => !record(leg) || (leg.receipt == null
+    ? !!(leg.error || leg.submit_error || leg.submit_evidence)
+    : !record(leg.receipt) || !['NEW', 'PARTIALLY_FILLED', 'PENDING_CANCEL', 'FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'].includes(leg.receipt.status)));
+}
+
+function asterPairVolume(state, side, now, utcDay) {
+  const unavailable = reason => ({ value: null, reason });
+  const stamp = finite(state?.updated_at);
+  if (stamp === null || stamp <= 0 || stamp > now) return unavailable('配对运行记录缺少有效更新时间');
+  if (now - stamp >= 120) return unavailable('配对运行记录已过期（超过 120 秒）');
+  if (asterPairOrdersUnresolved(state)) return unavailable('配对订单尚待核对，今日成交量暂不可用');
+  let unknown = !!state.volume_unknown;
+  const until = state.volume_unknown_until_utc;
+  if (until != null) {
+    if (!(typeof until === 'string' && /^\d{4}-\d\d-\d\d$/.test(until) && iso(`${until}T00:00:00.000Z`)?.slice(0, 10) === until)) return unavailable('配对成交统计未知日期无效');
+    unknown = utcDay <= until;
+  }
+  if (unknown) return unavailable('配对成交时间或金额尚未核实');
+  const daily = state.daily_volume;
+  if (!daily || typeof daily !== 'object' || Array.isArray(daily)) return unavailable('配对今日成交量缺失或无效');
+  // Only reconciled batches enter this ledger; normal in-flight orders do not invalidate it.
+  if (!Object.hasOwn(daily, utcDay)) return { value: 0 };
+  const row = daily[utcDay];
+  const value = row && !Array.isArray(row) ? finite(row[side]) : null;
+  return value !== null && value >= 0 ? { value } : unavailable('配对今日成交量缺失或无效');
+}
+
 export function standardSummary(raw) {
   if (!raw || ![1, 2].includes(raw.schemaVersion) || !raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data) || Object.keys(raw).some(key => !['schemaVersion', 'data'].includes(key))) throw new UpstreamError('invalid', '标准协议版本或顶层字段不正确');
   const data = raw.data;
@@ -205,12 +242,36 @@ export async function readSummary(project, credentials, { request = requestJson,
   if (project.adapter === 'aster') {
     const data = await get('/api/state?compact=true');
     if (!data || !Array.isArray(data.accounts) || data.accounts.length > 200) throw new UpstreamError('invalid', '交易项目响应格式不正确');
-    const accounts = data.accounts.filter(account => account.enabled);
+    if (data.pairs !== undefined && (!Array.isArray(data.pairs) || data.pairs.length > 100)) throw new UpstreamError('invalid', '配对项目响应格式不正确');
+    const paired = new Map();
+    for (const pair of data.pairs || []) {
+      if (!pair?.enabled) continue;
+      for (const side of ['long', 'short']) {
+        const id = pair[`${side}_account_id`];
+        if (typeof id === 'string' && id) paired.set(id, { side, state: pair.state });
+      }
+    }
+    const now = Date.now() / 1000;
+    const accounts = data.accounts.filter(account => account.enabled || paired.has(account.id)).map(account => {
+      const member = paired.get(account.id);
+      if (!member) return account;
+      const snapshots = [member.state?.snapshots?.[member.side], account.snapshot].filter(snapshot => {
+        const stamp = finite(snapshot?.timestamp);
+        return stamp !== null && stamp > 0 && stamp <= now + 60;
+      }).sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
+      return { ...account, snapshot: snapshots[0] ? { ...snapshots[0], timestamp: Number(snapshots[0].timestamp) } : null };
+    });
     const live = accounts.filter(account => account.mode === 'live');
     const updatedAt = oldest(live.map(account => iso(account.snapshot?.timestamp)));
-    const utcDay = new Date().toISOString().slice(0, 10);
-    const volumes = live.map(account => account.cycle_state?.daily_volume?.utc_date === utcDay && account.cycle_state?.report_status?.status === 'ready' ? finite(account.cycle_state.daily_volume.volume) : null);
-    const metrics = [metric('accounts', '启用账户', accounts.length, '个'), metric('live_accounts', '实盘账户', live.length, '个'), metric('occupied_margin', '实盘占用保证金', sum(live.map(account => finite(account.snapshot?.occupied_margin))), 'USD1'), metric('daily_volume', '实盘今日成交量', sum(volumes), 'USD1', '上游 UTC 日口径；不计入资产汇总')];
+    const utcDay = new Date(now * 1000).toISOString().slice(0, 10);
+    const pairVolumes = new Map(live.filter(account => paired.has(account.id)).map(account => {
+      const member = paired.get(account.id);
+      return [account.id, asterPairVolume(member.state, member.side, now, utcDay)];
+    }));
+    const volumes = live.map(account => pairVolumes.has(account.id) ? pairVolumes.get(account.id).value
+      : account.cycle_state?.daily_volume?.utc_date === utcDay && account.cycle_state?.report_status?.status === 'ready' ? finite(account.cycle_state.daily_volume.volume) : null);
+    const volumeDetail = pairVolumes.size ? '上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总' : '上游 UTC 日口径；不计入资产汇总';
+    const metrics = [metric('accounts', '启用账户', accounts.length, '个'), metric('live_accounts', '实盘账户', live.length, '个'), metric('occupied_margin', '实盘占用保证金', sum(live.map(account => finite(account.snapshot?.occupied_margin))), 'USD1'), metric('daily_volume', '实盘今日成交量', sum(volumes), 'USD1', volumeDetail)];
     const reasons = [];
     if (data.error) reasons.push(`交易服务异常：${diagnosticText(data.error, '上游未提供具体原因')}`);
     if (!data.ready) reasons.push('交易服务尚未就绪');
@@ -222,6 +283,7 @@ export async function readSummary(project, credentials, { request = requestJson,
         if (finite(account.snapshot.occupied_margin) === null) reasons.push(`${label}：保证金数据缺失或无效`);
       }
       if (volumes[index] === null) {
+        if (pairVolumes.has(account.id)) { reasons.push(`${label}：${pairVolumes.get(account.id).reason}`); continue; }
         const report = account.cycle_state?.report_status;
         const daily = account.cycle_state?.daily_volume;
         const reason = report?.error ? `成交统计读取失败：${diagnosticText(report.error, '上游未提供具体原因')}`
