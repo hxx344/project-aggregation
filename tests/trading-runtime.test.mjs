@@ -95,6 +95,7 @@ test('private trading routes require login, Origin, CSRF and JSON; disconnected 
     assert.equal((await f.request(route, { method: 'POST', body: {} })).status, 404);
   }
   assert.equal((await f.request('/api/trading?days=8')).status, 400);
+  for (const page of ['-1', '1.5', '2000', 'NaN']) assert.equal((await f.request(`/api/trading?page=${page}`)).status, 400);
   assert.equal((await f.request('/api/trading/refresh', { method: 'POST', body: {} })).status, 202);
   await f.app.trading.refresh();
   const response = await f.request('/api/trading');
@@ -342,7 +343,7 @@ test('successful mode switch clears the old ledger and cancels older position an
   assert.equal(incoming.secret.apiKey, credentials('new_account').apiKey);
   assert.equal(incoming.accountMode, 'portfolio-margin');
   newFunding.resolve({ fetchedAt: stamp(f.now), events: [receipt('binance', 'new-ledger', '0.3', incoming.end - 1)], coverage: [{ start: incoming.start, end: incoming.end }], complete: true });
-  await nextTurn();
+  await f.app.trading.refresh();
   assert.deepEqual(f.app.trading.state().funding.events.map(row => row.id), ['new-ledger']);
 });
 
@@ -445,6 +446,15 @@ test('funding runtime accepts more than twelve thousand distinct receipts and de
   assert.equal(f.app.trading.state().funding.events.length, 12050);
   assert.equal(f.app.trading.state().funding.net, '120.5');
   assert.equal(f.app.trading.state().accounts[1].funding.error, null);
+  await f.login();
+  const firstPage = await f.request('/api/trading?days=30&page=0'), secondPage = await f.request('/api/trading?days=30&page=1');
+  assert.equal(firstPage.status, 200);
+  assert.equal(firstPage.headers.get('cache-control'), 'no-store');
+  assert.equal(firstPage.data.funding.pagination.total, 12050);
+  assert.equal(firstPage.data.funding.events.length, 50);
+  assert.equal(secondPage.data.funding.pagination.page, 1);
+  assert.equal(new Set([...firstPage.data.funding.events, ...secondPage.data.funding.events].map(row => row.id)).size, 100);
+  assert.equal(firstPage.data.funding.net, secondPage.data.funding.net);
 });
 
 test('PnL records real snapshots, keeps decimal precision, recalculates late funding and survives restart without GET writes', async t => {

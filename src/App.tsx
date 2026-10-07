@@ -7,6 +7,7 @@ import DiagnosticDetails from './DiagnosticDetails';
 import { ageSnapshot, attentionDiagnostics, connectionDiagnostic, navigationQuery, nextSnapshotExpiry } from './hub-state';
 import { createOverviewDecoder, createStreamWatchdog } from './overview-feed';
 import { checkNotice, statusText } from './check-notice';
+import { createTradingCache } from './trading-cache';
 import type { Notice } from './check-notice';
 import type { NavigationQuery } from './hub-state';
 import type { Adapter, Category, Metric, Overview, Project, ProjectInput, Snapshot } from './types';
@@ -69,6 +70,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  const [tradingCache] = useState(createTradingCache);
   const [route, setRoute] = useState<Route>(readRoute);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [error, setError] = useState('');
@@ -100,7 +102,7 @@ export default function App() {
     document.addEventListener('keydown', onKey); return () => document.removeEventListener('keydown', onKey);
   }, [menuOpen]);
 
-  const expire = useCallback(() => { requestVersion.current++; pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, []);
+  const expire = useCallback(() => { tradingCache.clear(); requestVersion.current++; pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
   useEffect(() => {
     const controller = new AbortController();
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { if (controller.signal.aborted) return; setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (!controller.signal.aborted && e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
@@ -170,6 +172,7 @@ export default function App() {
   useEffect(() => { if (!notice || notice.tone === 'warning' || notice.tone === 'error') return; const timer = window.setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }, [notice]);
   const navigate = (next: Route) => {
     const params = new URLSearchParams(); if (next.view !== 'overview') params.set('view', next.view); if (next.view === 'project') params.set('id', next.id);
+    if (next.view === 'trading') params.set('tradingDays', String(tradingCache.selection().days));
     if (next.view === 'project' && next.query) for (const [key, value] of Object.entries(next.query)) params.set(key, value);
     history.pushState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}`); setRoute(next); setMenuOpen(false); if (menuOpen) mobileMenuButton.current?.focus(); window.scrollTo(0, 0);
   };
@@ -191,7 +194,7 @@ export default function App() {
     catch (e) { setError(e instanceof Error ? e.message : '退出失败，请重试'); }
   };
   if (authenticated === null) return <div className="app-loading"><LoaderCircle className="spin" /><p>正在打开工作台</p></div>;
-  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { setError(''); setAuthenticated(true); }} /></>;
+  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); setError(''); setAuthenticated(true); }} /></>;
   const serverNow = overview ? Date.parse(overview.generatedAt) + performance.now() - receivedAt.current : Date.now();
   const snapshots = overview?.projects.map(snapshot => ageSnapshot(snapshot, serverNow)) || [];
   const selected = snapshots.find(s => s.project.id === route.id);
@@ -203,7 +206,7 @@ export default function App() {
     <div className="workspace"><header className="topbar"><div className="breadcrumb"><button ref={mobileMenuButton} className="icon-button mobile-menu" aria-label="打开导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={21} /></button><span>工作台</span><ChevronRight size={14} /><strong>{pageTitle}</strong></div>{route.view !== 'trading' ? <div className="topbar-right"><span className="refresh-label">总览读取于 {formatDate(overview?.generatedAt || null)}</span><button className="icon-button" aria-label="刷新总览" title="刷新总览" disabled={loading} onClick={() => void load()}><RefreshCw size={18} className={loading ? 'spin' : ''} /></button></div> : null}</header>
       <main id="main-content" className={`main-content ${route.view === 'project' ? 'project-content' : ''}`}>{route.view !== 'project' && route.view !== 'trading' ? <div className="page-heading"><div><h1>{pageTitle}</h1><p>{route.view === 'overview' ? '先看当前状态，再进入需要处理的项目。' : route.view === 'projects' ? '配置连接，管理入口，接入后续项目。' : selected?.project.description}</p></div>{route.view === 'projects' ? <Button className="button primary" onClick={() => setEditor('new')}><Plus size={18} />添加项目</Button> : <span className="today">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</span>}</div> : null}
       {error ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{error}<button onClick={() => void load()}>重试</button></div> : null}
-      {route.view === 'trading' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载交易模块…</p></div>}><TradingPage onExpired={expire} /></Suspense> : !overview ? <div className="empty-state loading-state"><LoaderCircle className="spin" /><h2>正在读取项目</h2><p>各项目独立连接，结果会在这里显示。</p></div> : route.view === 'overview' ? <OverviewPage now={serverNow} onPreload={setPreloadId} snapshots={snapshots} onProject={id => navigate({ view: 'project', id })} onEdit={setEditor} onManage={() => navigate({ view: 'projects', id: '' })} /> : route.view === 'projects' ? <ProjectsPage now={serverNow} snapshots={snapshots} onEdit={setEditor} onCheck={check} checking={checking} /> : selected ? null : <div className="empty-state"><FolderKanban /><h2>没有找到这个项目</h2><p>项目可能已被移除，请回到项目管理查看。</p><button className="button secondary" onClick={() => navigate({ view: 'projects', id: '' })}>查看项目</button></div>}
+      {route.view === 'trading' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载交易模块…</p></div>}><TradingPage cache={tradingCache} onExpired={expire} /></Suspense> : !overview ? <div className="empty-state loading-state"><LoaderCircle className="spin" /><h2>正在读取项目</h2><p>各项目独立连接，结果会在这里显示。</p></div> : route.view === 'overview' ? <OverviewPage now={serverNow} onPreload={setPreloadId} snapshots={snapshots} onProject={id => navigate({ view: 'project', id })} onEdit={setEditor} onManage={() => navigate({ view: 'projects', id: '' })} /> : route.view === 'projects' ? <ProjectsPage now={serverNow} snapshots={snapshots} onEdit={setEditor} onCheck={check} checking={checking} /> : selected ? null : <div className="empty-state"><FolderKanban /><h2>没有找到这个项目</h2><p>项目可能已被移除，请回到项目管理查看。</p><button className="button secondary" onClick={() => navigate({ view: 'projects', id: '' })}>查看项目</button></div>}
       {overview ? <ProjectWorkspace snapshots={snapshots} now={serverNow} priorityId={preloadId} projects={overview.projects.map(s => s.project)} activeId={route.view === 'project' ? route.id : null} query={route.query} onEdit={setEditor} onExpired={expire} onChanged={changed} onNavigate={(id, query) => { const target = overview.projects.find(s => s.project.id === id && s.project.enabled && s.project.accessMode === 'proxy'); if (target) navigate({ view: 'project', id, query }); }} /> : null}
       </main>{route.view !== 'project' ? <footer className="workspace-footer"><span>{route.view === 'trading' ? '只读账户数据 · 已结算资金费' : '各项目独立运行，工作台汇总展示。'}</span><span>{route.view === 'trading' ? '时间按北京时间显示' : '时间按本机时区显示'}</span></footer> : null}
     </div>

@@ -26,7 +26,7 @@ async (page) => {
     const legs = ['CLUSDT', 'BZUSDT'].flatMap(symbol => accounts.map(account => ({
       id: `${account.exchange}-${symbol}`, exchange: account.exchange, symbol, name: `${account.name} ${symbol}`, state: account.positions.state, fetchedAt: account.positions.fetchedAt, positions: [], grossNotional: account.connected ? '0' : null, netNotional: account.connected ? '0' : null, unrealizedPnl: account.connected ? '0' : null, fundingNet: account.connected ? '0' : null, fundingComplete: account.connected,
     })));
-    return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, period: { days, start, end: fixedTime }, accounts, legs, structure: { state: 'incomplete', message }, funding: { complete: configured.binance && configured.bybit, income: '0', expense: '0', net: '0', currency: 'USDT', events: [], daily: [] } };
+    return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, cache: { builtAt: fixedTime, servedAt: fixedTime, rebuilding: false }, period: { days, start, end: fixedTime }, accounts, legs, structure: { state: 'incomplete', message }, funding: { complete: configured.binance && configured.bybit, income: '0', expense: '0', net: '0', currency: 'USDT', events: [], pagination: { page: 0, pageSize: 50, total: 0, pages: 1 }, daily: [] } };
   };
   await page.unrouteAll({ behavior: 'wait' });
   page.on('pageerror', error => pageErrors.push(error.message));
@@ -82,7 +82,7 @@ async (page) => {
   };
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${origin}/?view=trading`);
-  await waitForText(message);
+  await waitForText('等待两所最新仓位，暂不判断四腿结构');
   assert(metadataCount() === 0, 'closed connections do not load Asset metadata');
   await page.getByRole('button', { name: '账户连接', exact: true }).click();
   await waitForText('暂无已启用的 Asset 项目');
@@ -127,10 +127,15 @@ async (page) => {
   assert(await page.getByRole('button', { name: '刷新来源', exact: true }).isDisabled(), 'pending import blocks metadata refresh');
   assert(await binance.getByRole('button', { name: '验证并替换连接', exact: true }).isDisabled(), 'pending import blocks manual mutation');
   const selectedB = imports().at(-1);
-  assert(selectedB?.query === '?days=30' && JSON.stringify(selectedB.body) === JSON.stringify({ revision: 7, accountMode: 'portfolio-margin', projectId: 'asset-b', projectRevision: 'project-b-v1', sourceRevision: 'b-binance-v1' }), 'selected Asset B payload, portfolio mode and time range are correct');
+  assert(selectedB?.query === '?days=30&page=0' && JSON.stringify(selectedB.body) === JSON.stringify({ revision: 7, accountMode: 'portfolio-margin', projectId: 'asset-b', projectRevision: 'project-b-v1', sourceRevision: 'b-binance-v1' }), 'selected Asset B payload, portfolio mode and time range are correct');
+  const pendingImports = imports().length;
+  await page.getByRole('button', { name: '近7天', exact: true }).click();
+  assert(await importBinance.isDisabled(), 'changing range retains the pending mutation lock');
+  await page.getByRole('button', { name: '近30天', exact: true }).click();
+  assert(imports().length === pendingImports, 'range switching never duplicates the import');
   assert(typeof releaseImport === 'function', 'import fixture is held for busy-state checks');
   releaseImport(); holdImport = false;
-  await waitForText('已导入 Asset B Binance 测试连接。');
+  await waitForText('已从 Asset 导入并验证只读密钥');
   await waitForText('测试缓存暂不可读');
   await page.waitForFunction(() => document.querySelector('#trading-key-binance')?.value === '');
   assert(await binance.getByLabel('API Secret', { exact: true }).inputValue() === '', 'successful import clears its manual secret draft');
@@ -146,7 +151,7 @@ async (page) => {
   await importBinance.click(); await waitForText('只允许没有交易权限的只读密钥，已保留原连接。');
   await refreshCache();
   assert(await binance.getByLabel('API Key', { exact: true }).inputValue() === 'keep-on-failure-key' && await binance.getByLabel('API Secret', { exact: true }).inputValue() === 'keep-on-failure-secret', 'failed permission verification preserves both manual draft fields');
-  assert(await page.getByText('已导入 Asset B Binance 测试连接。', { exact: true }).count() === 1 && await binance.locator('.trading-account-form-heading').textContent() === 'Binance已连接', 'failed replacement keeps old connected account');
+  assert(await binance.getByText('当前连接：组合保证金（Portfolio Margin）', { exact: true }).count() === 1 && await binance.locator('.trading-account-form-heading').textContent() === 'Binance已连接', 'failed replacement keeps old connected account');
   assert(await page.getByRole('alert').filter({ hasText: '只允许没有交易权限' }).count() === 1, 'background polling does not erase import error');
   assert(imports().at(-1).body.projectId === 'asset-a' && imports().at(-1).body.sourceRevision === 'a-binance-v1', 'changing from B to A sends A revisions');
   assert(imports().at(-1).body.accountMode === 'standard' && await binance.getByText('当前连接：组合保证金（Portfolio Margin）', { exact: true }).count() === 1, 'failed mode replacement preserves active portfolio connection');
@@ -159,7 +164,7 @@ async (page) => {
   await importBinance.click(); await waitForText('Asset 中的密钥已变更，请刷新来源后重新选择。');
   assert(await binance.getByLabel('API Secret', { exact: true }).inputValue() === 'keep-on-failure-secret', '409 preserves manual draft');
   assert(imports().at(-1).body.projectRevision === 'project-a-v2' && imports().at(-1).body.sourceRevision === 'a-binance-v2', 'reselected source carries refreshed revisions');
-  assert(await page.getByText('已导入 Asset B Binance 测试连接。', { exact: true }).count() === 1, '409 does not replace old account');
+  assert(await binance.getByText('当前连接：组合保证金（Portfolio Margin）', { exact: true }).count() === 1 && (await binance.locator('small').allTextContents()).some(text => text.includes('13:00:00')), '409 does not replace the previously verified account or its mode');
 
   sourceFailure = true; await refreshSources(); await waitForText('测试来源读取失败，请刷新来源重试。');
   assert(await importBinance.isDisabled(), 'failed metadata refresh blocks old source import');
@@ -167,7 +172,7 @@ async (page) => {
   sourceFailure = false; rejection = null; await refreshSources();
   await bybitSource.selectOption('asset-a');
   await bybit.getByRole('button', { name: '从 Asset 导入', exact: true }).click();
-  await waitForText('已导入 Asset A Bybit 测试连接。');
+  await bybit.locator('.trading-account-form-heading').getByText('已连接', { exact: true }).waitFor();
   await page.waitForFunction(() => document.querySelector('#trading-key-bybit')?.value === '');
   assert(imports().at(-1).path === '/api/trading/accounts/bybit/import' && imports().at(-1).body.sourceRevision === 'a-bybit-v1', 'Bybit imports only the Bybit connection from its chosen project');
   assert(await bybit.getByLabel('API Secret', { exact: true }).inputValue() === '', 'Bybit success clears its secret draft');

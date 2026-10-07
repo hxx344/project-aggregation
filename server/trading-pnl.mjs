@@ -37,17 +37,18 @@ export function createTradingPnl(db) {
   const revisions = entries => entries.map(({ row }) => row.revision);
   const latestRow = entries => db.prepare('SELECT * FROM trading_pnl_samples WHERE binance_revision=? AND bybit_revision=? ORDER BY time DESC LIMIT 1').get(...revisions(entries));
   function record(entries, current) {
-    if (entries.some(({ row }) => !row.credentials)) return;
+    if (entries.some(({ row }) => !row.credentials)) return false;
     const sources = entries.map(({ snapshot }) => stamp(snapshot.positions.fetchedAt));
     const rows = entries.flatMap(({ snapshot }) => snapshot.positions.rows);
     const good = entries.every(({ snapshot }, index) => !snapshot.positions.error && validTime(sources[index]) && sources[index] <= current && current - sources[index] <= MAX_AGE)
       && Math.max(...sources) - Math.min(...sources) <= MAX_SKEW && rows.every(row => row.unrealizedPnl !== null);
     const time = good ? Math.max(...sources) : current;
     const previous = latestRow(entries);
-    if (previous && (time <= previous.time || Math.floor(time / PNL_INTERVAL) === Math.floor(previous.time / PNL_INTERVAL) && (previous.unrealized_pnl !== null) === good)) return;
+    if (previous && (time <= previous.time || Math.floor(time / PNL_INTERVAL) === Math.floor(previous.time / PNL_INTERVAL) && (previous.unrealized_pnl !== null) === good)) return false;
     const value = good ? addDecimals(rows.map(row => row.unrealizedPnl)) : null;
     db.prepare('INSERT OR IGNORE INTO trading_pnl_samples VALUES (?,?,?,?,?,?)').run(time, ...revisions(entries), ...sources.map(value => validTime(value) ? value : null), value);
     db.prepare('DELETE FROM trading_pnl_samples WHERE time < ? OR binance_revision != ? OR bybit_revision != ?').run(current - 31 * DAY, ...revisions(entries));
+    return true;
   }
   function read(entries, start, current) {
     const connected = entries.every(({ row }) => !!row.credentials);
@@ -71,5 +72,5 @@ export function createTradingPnl(db) {
       pointCount: records.length, points: reducePnlPoints(points), latest,
       status: !records.some(row => row.unrealized_pnl !== null) ? 'collecting' : latest?.totalPnl === null ? 'incomplete' : 'ready' };
   }
-  return { record, read };
+  return { record, read, sourceKey: entries => latestRow(entries)?.time ?? null };
 }

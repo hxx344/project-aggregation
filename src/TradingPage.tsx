@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
+import { ageTradingData, tradingCacheNow } from './trading-cache';
+import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
 import TradingPnlChart from './TradingPnlChart';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
@@ -98,118 +100,135 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
   </form>;
 }
 
-export default function TradingPage({ onExpired }: { onExpired: () => void }) {
+export default function TradingPage({ cache, onExpired }: { cache: TradingCache; onExpired: () => void }) {
+  useSyncExternalStore(cache.subscribe, cache.getVersion);
   const [days, setDays] = useState<7 | 30>(readDays);
-  const [data, setData] = useState<TradingState | null>(null);
   const [reading, setReading] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [, setClock] = useState(0);
+  const busy = cache.busy();
   const [error, setError] = useState('');
   const [operationError, setOperationError] = useState('');
   const [notice, setNotice] = useState('');
   const [offline, setOffline] = useState(!navigator.onLine);
-  const [page, setPage] = useState(0);
+  const [page, setPage] = useState(() => cache.selection().days === days ? cache.selection().page : 0);
+  const entry = cache.get(days, page) ?? cache.latest();
+  const now = entry ? tradingCacheNow(entry) : 0;
+  const data = entry ? ageTradingData(entry, now, offline || !!error) : null;
+  const oldCache = !!entry && (offline || !!error || entry.failed || !entry.data.cache.builtAt || now - Date.parse(entry.data.cache.builtAt) > 75_000);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   const [sources, setSources] = useState<TradingImportSource[] | null>(null);
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [sourcesError, setSourcesError] = useState('');
   const daysRef = useRef(days);
+  const pageRef = useRef(page);
   const expiredRef = useRef(onExpired);
   const mounted = useRef(false);
   const sequence = useRef(0);
   const pending = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null);
-  const mutation = useRef<AbortController | null>(null);
   const sourceRequest = useRef<AbortController | null>(null);
   const connectionsRef = useRef<HTMLDetailsElement>(null);
   useEffect(() => { expiredRef.current = onExpired; }, [onExpired]);
   const cancelRead = useCallback(() => { sequence.current++; pending.current?.controller.abort(); pending.current = null; }, []);
   const cancelSources = useCallback(() => { sourceRequest.current?.abort(); sourceRequest.current = null; }, []);
   const loadSources = useCallback(async () => {
-    if (!mounted.current || mutation.current || !navigator.onLine) return;
+    if (!mounted.current || cache.busy() || !navigator.onLine) return;
     cancelSources();
-    const controller = new AbortController(); sourceRequest.current = controller;
+    const request = cache.beginSource(), controller = request.controller; sourceRequest.current = controller;
     setSourcesLoading(true); setSourcesError('');
     try {
       const next = await api<{ sources: TradingImportSource[] }>('/api/trading/import-sources', { signal: controller.signal, timeoutMs: 30_000 });
-      if (!mounted.current || controller.signal.aborted) return;
+      if (!mounted.current || !cache.valid(request)) return;
       setSources(next.sources);
     } catch (cause) {
-      if (!mounted.current || controller.signal.aborted) return;
+      if (!mounted.current || !cache.valid(request)) return;
       if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
       else { setSources(null); setSourcesError(cause instanceof Error ? cause.message : 'Asset 来源读取失败，请刷新来源重试。'); }
     } finally {
+      cache.finish(request);
       if (sourceRequest.current === controller) { sourceRequest.current = null; if (mounted.current) setSourcesLoading(false); }
     }
-  }, [cancelSources]);
+  }, [cache, cancelSources]);
   const load = useCallback((force = false): Promise<void> => {
-    if (!mounted.current || mutation.current || document.hidden || !navigator.onLine) return Promise.resolve();
+    if (!mounted.current || cache.busy() || document.hidden || !navigator.onLine) return Promise.resolve();
     if (pending.current && !force) return pending.current.promise;
     if (force) cancelRead();
-    const controller = new AbortController();
+    const request = cache.beginRead(), controller = request.controller;
     const version = ++sequence.current;
     const requestedDays = daysRef.current;
+    const requestedPage = pageRef.current;
     setReading(true);
     const promise = (async () => {
       try {
-        const next = await api<TradingState>(`/api/trading?days=${requestedDays}`, { signal: controller.signal, timeoutMs: 12_000 });
-        if (!mounted.current || version !== sequence.current || requestedDays !== daysRef.current) return;
-        setData(next); setError('');
+        const next = await api<TradingState>(`/api/trading?days=${requestedDays}&page=${requestedPage}`, { signal: controller.signal, timeoutMs: 12_000 });
+        if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
+        if (cache.accept(request, next)) {
+          setError('');
+          if (requestedDays === daysRef.current && requestedPage === pageRef.current && next.funding.pagination.page !== requestedPage) setPage(next.funding.pagination.page);
+        }
       } catch (cause) {
-        if (!mounted.current || version !== sequence.current || controller.signal.aborted) return;
+        if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
         if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
-        else setError(cause instanceof Error ? cause.message : '交易数据读取失败，请重试。');
+        else { cache.fail(request, requestedDays, requestedPage); setError(cause instanceof Error ? cause.message : '交易数据读取失败，请重试。'); }
       } finally {
+        cache.finish(request);
         if (mounted.current && version === sequence.current) setReading(false);
         if (pending.current?.controller === controller) pending.current = null;
       }
     })();
     pending.current = { controller, promise };
     return promise;
-  }, [cancelRead]);
+  }, [cache, cancelRead]);
   useEffect(() => {
     mounted.current = true;
     const resume = () => {
       setOffline(!navigator.onLine);
+      setClock(value => value + 1);
       if (document.hidden || !navigator.onLine) { cancelRead(); setReading(false); if (!navigator.onLine) { cancelSources(); setSourcesLoading(false); } }
       else void load();
     };
-    const timer = window.setInterval(() => void load(), 5000);
+    const timer = window.setInterval(() => { setClock(value => value + 1); void load(); }, 5000);
     document.addEventListener('visibilitychange', resume);
     window.addEventListener('online', resume); window.addEventListener('offline', resume);
     return () => {
-      mounted.current = false; cancelRead(); cancelSources(); mutation.current?.abort(); mutation.current = null;
+      mounted.current = false; cancelRead(); cancelSources();
       clearInterval(timer); document.removeEventListener('visibilitychange', resume);
       window.removeEventListener('online', resume); window.removeEventListener('offline', resume);
     };
   }, [cancelRead, cancelSources, load]);
-  useEffect(() => { daysRef.current = days; void load(true); setPage(0); }, [days, load]);
+  useEffect(() => { daysRef.current = days; pageRef.current = page; cache.select(days, page); setError(''); void load(true); }, [cache, days, page, load]);
+  useEffect(() => { if (!busy) void load(); }, [busy, load]);
   useEffect(() => { if (connectionsOpen) void loadSources(); }, [connectionsOpen, loadSources]);
   useEffect(() => {
-    const back = () => setDays(readDays());
+    const back = () => { setDays(readDays()); setPage(0); };
     window.addEventListener('popstate', back); return () => window.removeEventListener('popstate', back);
   }, []);
   function changeDays(next: 7 | 30) {
     if (next === days) return;
     const url = new URL(location.href); url.searchParams.set('tradingDays', String(next));
-    history.pushState(null, '', url); setDays(next);
+    history.pushState(null, '', url); setDays(next); setPage(0);
   }
   async function write(path: string, method: 'POST' | 'PUT' | 'DELETE', body: object, label: string, importing = false) {
-    if (mutation.current || !navigator.onLine) return false;
-    const controller = new AbortController(); mutation.current = controller;
-    cancelRead(); cancelSources(); setSourcesLoading(false); setReading(false); setBusy(label); setOperationError(''); setNotice('');
+    if (!navigator.onLine) return false;
+    const request = cache.beginMutation(label);
+    if (!request) return false;
+    const controller = request.controller;
+    const requestedDays = daysRef.current;
+    cancelRead(); cancelSources(); setSourcesLoading(false); setReading(false); setOperationError(''); setNotice('');
     let succeeded = false;
     try {
-      const next = await api<TradingState>(`${path}?days=${daysRef.current}`, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: importing ? 65_000 : method === 'PUT' ? 45_000 : 15_000 });
-      if (!mounted.current || controller.signal.aborted) return false;
-      setData(next);
+      const next = await api<TradingState>(`${path}?days=${requestedDays}&page=0`, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: importing ? 65_000 : method === 'PUT' ? 45_000 : 15_000 });
+      if (!cache.accept(request, next, label !== 'refresh')) return false;
       succeeded = true;
-      setNotice(importing ? '已从 Asset 导入并验证只读密钥，正在同步账户数据。' : method === 'DELETE' ? '账户已断开，已清除该账户的当前缓存。' : method === 'PUT' ? '只读密钥已验证，正在同步账户数据。' : '已请求同步，已有数据会保留到同步完成。');
+      if (mounted.current) {
+        setPage(0); setError('');
+        setNotice(importing ? '已从 Asset 导入并验证只读密钥，正在同步账户数据。' : method === 'DELETE' ? '账户已断开，已清除该账户的当前缓存。' : method === 'PUT' ? '只读密钥已验证，正在同步账户数据。' : '已请求同步，已有数据会保留到同步完成。');
+      }
     } catch (cause) {
-      if (!mounted.current || controller.signal.aborted) return false;
+      if (!cache.valid(request)) return false;
       if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
-      else setOperationError(cause instanceof Error ? cause.message : '操作未完成，请重试。');
+      else if (mounted.current) setOperationError(cause instanceof Error ? cause.message : '操作未完成，请重试。');
     } finally {
-      if (mutation.current === controller) mutation.current = null;
-      if (mounted.current) { setBusy(null); void load(true); }
+      cache.finish(request);
     }
     return succeeded;
   }
@@ -218,8 +237,9 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
   const connected = data?.accounts.some(account => account.connected) ?? false;
   const refreshing = data?.accounts.some(account => account.refreshing) ?? false;
   const events = data?.funding.events ?? [];
-  const pageCount = Math.max(1, Math.ceil(events.length / 50));
-  const currentPage = Math.min(page, pageCount - 1);
+  const pageCount = Math.max(1, data?.funding.pagination.pages ?? 1);
+  const currentPage = data?.funding.pagination.page ?? 0;
+  const pendingPage = !!data && (days !== data.period.days || page !== currentPage);
   const openConnections = () => {
     setConnectionsOpen(true);
     requestAnimationFrame(() => { connectionsRef.current?.scrollIntoView({ behavior: 'auto', block: 'start' }); connectionsRef.current?.querySelector('summary')?.focus(); });
@@ -231,6 +251,7 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
     {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}
     {notice ? <div className="trading-notice" role="status">{notice}</div> : null}
+    {data ? <div className={`trading-notice trading-cache-status${oldCache ? ' warning' : ''}`} role="status"><span>{oldCache ? '当前显示旧缓存，等待更新。' : data.cache.rebuilding ? '后台正在更新缓存，当前显示上次数据。' : reading ? '已显示缓存，正在检查更新。' : '已显示缓存。'} 缓存生成：{formatDate(data.cache.builtAt)}{data.cache.builtAt ? '（北京时间）' : ''}</span></div> : null}
     {!data ? <div className="trading-initial" role="status">{reading ? <><LoaderCircle className="spin" size={22} /><span>正在读取交易账户状态…</span></> : <span>尚未获取交易数据</span>}</div> : <>
       <section className="trading-panel trading-positions" aria-labelledby="trading-positions-title">
         <div className="trading-panel-heading"><div><h2 id="trading-positions-title">四腿仓位</h2><p>按实际持仓显示方向 · 数量为各交易所原生合约单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
@@ -244,7 +265,7 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
 
       <section className="trading-panel trading-pnl" aria-labelledby="trading-pnl-title">
         <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">四腿总盈亏</h2><p>持仓浮盈亏＋区间累计已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
-        {days !== data.period.days ? <p className="trading-window-loading" role="status">{reading ? `正在读取近${days}天；下方仍显示近${data.period.days}天的数据。` : `所选区间尚未取得，保留近${data.period.days}天的数据。`}</p> : null}
+        {days !== data.period.days ? <p className="trading-window-loading" role="status">{reading ? `正在读取近${days}天缓存；下方仍显示近${data.period.days}天的数据。` : `所选区间尚未取得，保留近${data.period.days}天的数据。`}</p> : null}
         <p className="trading-caption">资金费累计起点：{formatDate(data.period.start)}（北京时间）；每个采样点仅累计到该时刻。</p>
         <TradingPnlChart pnl={data.pnl} />
         <p className="trading-footnote">仅统计这四腿的浮盈亏与资金费，不含平仓已实现盈亏及交易手续费；切换账户后重新开始记录。切换区间会改变资金费累计起点。</p>
@@ -258,8 +279,9 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
         <p className="trading-footnote">资金费按账户与合约归属，可能包含其他策略；区间账单不等于当前持仓周期收益。</p>
       </section>
 
-      <section className="trading-panel trading-ledger" aria-labelledby="trading-ledger-title"><div className="trading-panel-heading"><div><h2 id="trading-ledger-title">{data.funding.complete ? '资金费流水' : '已获取的资金费流水'}</h2><p>仅 CLUSDT / BZUSDT 的资金费收付 · 共 {events.length} 条</p></div></div>
-        {events.length ? <><div className="trading-table-scroll trading-ledger-scroll" tabIndex={0} role="region" aria-label="资金费流水明细"><table><thead><tr><th scope="col">时间（北京时间）</th><th scope="col">交易所</th><th scope="col">合约</th><th scope="col">收付</th><th scope="col">金额 · USDT</th></tr></thead><tbody>{events.slice(currentPage * 50, (currentPage + 1) * 50).map(event => <tr key={`${event.exchange}-${event.id}`}><td>{formatDate(event.time)}</td><td>{exchangeNames[event.exchange]}</td><td>{event.symbol}</td><td>{!/[1-9]/.test(event.amount) ? '零额' : event.amount.startsWith('-') ? '支出' : '收入'}</td><td className={polarity(event.amount)}>{amount(event.amount, true)}</td></tr>)}</tbody></table></div><div className="trading-pagination"><span>第 {currentPage + 1} / {pageCount} 页 · 每页最多 50 条</span><div><button className="button secondary" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button><button className="button secondary" disabled={currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}>下一页</button></div></div></> : <div className="trading-ledger-empty">{data.funding.complete ? '所选区间没有资金费流水。' : '尚无已获取的资金费流水；连接账户并完成同步后显示。'}</div>}
+      <section className="trading-panel trading-ledger" aria-labelledby="trading-ledger-title"><div className="trading-panel-heading"><div><h2 id="trading-ledger-title">{data.funding.complete ? '资金费流水' : '已获取的资金费流水'}</h2><p>仅 CLUSDT / BZUSDT 的资金费收付 · 共 {data.funding.pagination.total} 条</p></div></div>
+        {pendingPage ? <p className="trading-window-loading" role="status">{reading ? `正在读取近${days}天第 ${page + 1} 页缓存；` : `所选分页尚未取得；`}当前保留近{data.period.days}天第 {currentPage + 1} 页。</p> : null}
+        {events.length ? <><div className="trading-table-scroll trading-ledger-scroll" tabIndex={0} role="region" aria-label="资金费流水明细"><table><thead><tr><th scope="col">时间（北京时间）</th><th scope="col">交易所</th><th scope="col">合约</th><th scope="col">收付</th><th scope="col">金额 · USDT</th></tr></thead><tbody>{events.map(event => <tr key={`${event.exchange}-${event.id}`}><td>{formatDate(event.time)}</td><td>{exchangeNames[event.exchange]}</td><td>{event.symbol}</td><td>{!/[1-9]/.test(event.amount) ? '零额' : event.amount.startsWith('-') ? '支出' : '收入'}</td><td className={polarity(event.amount)}>{amount(event.amount, true)}</td></tr>)}</tbody></table></div><div className="trading-pagination"><span>第 {currentPage + 1} / {pageCount} 页 · 每页最多 50 条</span><div><button className="button secondary" disabled={pendingPage || currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button><button className="button secondary" disabled={pendingPage || currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}>下一页</button></div></div></> : <div className="trading-ledger-empty">{data.funding.complete ? '所选区间没有资金费流水。' : '尚无已获取的资金费流水；连接账户并完成同步后显示。'}</div>}
       </section>
 
       <details ref={connectionsRef} className="trading-panel trading-connections" open={connectionsOpen} onToggle={event => setConnectionsOpen(event.currentTarget.open)}><summary><span><Link2 size={18} /><strong>账户连接</strong><small>{data.accounts.filter(account => account.connected).length} / 2 已连接</small></span><ChevronDown size={18} /></summary><div className="trading-connections-body">

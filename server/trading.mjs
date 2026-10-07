@@ -2,6 +2,8 @@ import { createTradingExchangeClient, TradingExchangeError, MAX_FUNDING_EVENTS }
 import { decimal, addDecimals, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createTradingPnl } from './trading-pnl.mjs';
+import { createHash } from 'node:crypto';
+import { TRADING_VIEW_VERSION, packTradingView, unpackTradingView } from './trading-view-cache.mjs';
 
 const EXCHANGES = ['binance', 'bybit'];
 const SYMBOLS = ['CLUSDT', 'BZUSDT'];
@@ -9,6 +11,7 @@ const NAMES = { binance: 'Binance', bybit: 'Bybit' };
 const DAY = 86_400_000;
 const POSITION_INTERVAL = 30_000, FUNDING_INTERVAL = 300_000;
 const POSITION_STALE = 75_000, FUNDING_STALE = 900_000;
+const PAGE_SIZE = 50;
 const iso = time => new Date(time).toISOString();
 const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
 
@@ -153,19 +156,30 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     for (const exchange of EXCHANGES) db.prepare('INSERT OR IGNORE INTO trading_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, accountModeOf(exchange));
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); throw error; }
-  const rowFor = exchange => db.prepare('SELECT * FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
-  const cache = new Map(EXCHANGES.map(exchange => [exchange, parseSnapshot(rowFor(exchange))]));
+  const rowFor = exchange => db.prepare('SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
+  const storedRows = db.prepare('SELECT * FROM trading_accounts ORDER BY exchange').all();
+  const cache = new Map(storedRows.map(row => [row.exchange, parseSnapshot(row)]));
+  const hash = value => createHash('sha256').update(value || '').digest('hex');
+  const fundingHash = funding => hash(JSON.stringify([funding.fetchedAt, funding.requestedEnd, funding.events, funding.coverage]));
+  const snapshotHashes = new Map(EXCHANGES.map(exchange => [exchange, fundingHash(cache.get(exchange).funding)]));
   const pnl = createTradingPnl(db);
   const entriesFor = () => EXCHANGES.map(exchange => ({ row: rowFor(exchange), snapshot: cache.get(exchange) }));
   const clients = new Map(EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const jobs = new Map(), validations = new Map();
+  db.exec('CREATE TABLE IF NOT EXISTS trading_views (days INTEGER PRIMARY KEY, version INTEGER NOT NULL, source_key TEXT NOT NULL, json TEXT NOT NULL)');
+  let views = new Map(), viewsDirty = false, viewTimer = null;
   let closed = false;
   let fundingBatchEnd = Math.max(0, ...EXCHANGES.map(exchange => cache.get(exchange).funding.requestedEnd || 0));
   function write(exchange, revision, change) {
     if (closed || rowFor(exchange).revision !== revision) return false;
     const next = change(cache.get(exchange));
-    if (!db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(next), exchange, revision).changes) return false;
-    cache.set(exchange, next); return true;
+    const serialized = JSON.stringify(next);
+    if (!db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(serialized, exchange, revision).changes) return false;
+    const previous = cache.get(exchange);
+    cache.set(exchange, next);
+    if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage || previous.funding.requestedEnd !== next.funding.requestedEnd) snapshotHashes.set(exchange, fundingHash(next.funding));
+    if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage) invalidateViews();
+    return true;
   }
   async function deadline(controller, timeoutMs, work) {
     const timer = setTimeout(() => controller.abort(new DOMException('Read timed out', 'TimeoutError')), timeoutMs); timer.unref?.();
@@ -229,10 +243,10 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   function refresh({ force = false } = {}) {
     const current = now();
     if (!fundingBatchEnd || current - fundingBatchEnd >= (force ? 5000 : FUNDING_INTERVAL)) fundingBatchEnd = current;
-    const positions = Promise.allSettled(EXCHANGES.map(exchange => run(exchange, 'positions', { force, end: current }))).then(() => { if (!closed) pnl.record(entriesFor(), now()); });
-    return Promise.allSettled([positions, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]);
+    const positions = Promise.allSettled(EXCHANGES.map(exchange => run(exchange, 'positions', { force, end: current }))).then(() => { if (!closed && pnl.record(entriesFor(), now())) invalidateViews(); });
+    return Promise.allSettled([positions, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]).then(result => { if (!closed) flushViews(); return result; });
   }
-  function state(days = 7) {
+  function buildState(days = 7) {
     if (![7, 30].includes(days)) throw new TradingError(400, '资金费区间仅支持 7 天或 30 天');
     const current = now();
     const entries = EXCHANGES.map(exchange => ({ row: rowFor(exchange), snapshot: cache.get(exchange) }));
@@ -261,18 +275,112 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
         state: account.positions.state, fetchedAt: account.positions.fetchedAt, positions,
         grossNotional: known ? sumOrUnknown(positions, 'notional') : null, netNotional: known ? sumOrUnknown(positions, 'notional', true) : null,
         unrealizedPnl: known ? sumOrUnknown(positions, 'unrealizedPnl') : null,
-        fundingNet: cashTotals(receipts, account.funding.complete).net, fundingComplete: account.funding.complete };
+        fundingNet: cashTotals(receipts, account.funding.complete).net, fundingComplete: account.funding.complete, fundingReceiptCount: receipts.length };
     }));
-    const daily = [];
+    const daily = [], rowsByDay = new Map();
+    for (const event of events) {
+      const day = Math.floor((timeOf(event.time) + 8 * 3600000) / DAY) * DAY - 8 * 3600000;
+      if (!rowsByDay.has(day)) rowsByDay.set(day, []);
+      rowsByDay.get(day).push(event);
+    }
     // The first and last Beijing dates may be partial calendar days; both are clipped to the displayed interval.
     for (let day = Math.floor((start + 8 * 3600000) / DAY) * DAY - 8 * 3600000; day < end; day += DAY) {
       const from = Math.max(day, start), to = Math.min(day + DAY, end);
       const dayComplete = entries.every(({ row, snapshot }) => !!row.credentials && readState(true, snapshot.funding, current, FUNDING_STALE) === 'live' && covered(snapshot.funding.coverage, from, to));
-      const rows = events.filter(item => timeOf(item.time) >= from && timeOf(item.time) < to);
-      daily.push({ date: iso(day + 8 * 3600000).slice(0, 10), ...cashTotals(rows, dayComplete), complete: dayComplete });
+      const rows = rowsByDay.get(day) || [];
+      daily.push({ date: iso(day + 8 * 3600000).slice(0, 10), ...cashTotals(rows, dayComplete), complete: dayComplete, receiptCount: rows.length });
     }
     return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: iso(current), period: { days, start: iso(start), end: iso(end) },
       accounts, legs, structure: structure(legs), funding: { complete, ...totals, currency: 'USDT', events, daily }, pnl: pnl.read(entries, start, current) };
+  }
+  function sourceKey() {
+    const entries = entriesFor();
+    return JSON.stringify([entries.map(({ row }) => [row.exchange, row.revision, !!row.credentials, snapshotHashes.get(row.exchange)]), pnl.sourceKey(entries)]);
+  }
+  function invalidateViews() {
+    viewsDirty = true;
+    if (closed || viewTimer) return;
+    // Coalesce partial ledger windows and independent account completions. This
+    // timer only calculates local data; no HTTP reader triggers or awaits it.
+    viewTimer = setTimeout(() => { viewTimer = null; try { flushViews(); } catch { if (!closed) invalidateViews(); } }, 750);
+    viewTimer.unref?.();
+  }
+  function flushViews() {
+    if (closed || !viewsDirty) return;
+    clearTimeout(viewTimer); viewTimer = null;
+    const key = sourceKey();
+    const next = new Map([7, 30].map(days => [days, buildState(days)]));
+    if (key !== sourceKey()) { invalidateViews(); return; }
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const save = db.prepare('INSERT INTO trading_views(days,version,source_key,json) VALUES (?,?,?,?) ON CONFLICT(days) DO UPDATE SET version=excluded.version,source_key=excluded.source_key,json=excluded.json');
+      for (const [days, value] of next) save.run(days, TRADING_VIEW_VERSION, key, packTradingView(value));
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    views = next; viewsDirty = false;
+  }
+  function resetViews() {
+    views.clear();
+    db.prepare('DELETE FROM trading_views').run();
+    invalidateViews(); flushViews();
+  }
+  function restoreViews() {
+    const key = sourceKey(), restored = new Map();
+    for (const days of [7, 30]) {
+      const saved = db.prepare('SELECT * FROM trading_views WHERE days=?').get(days);
+      if (!saved || saved.version !== TRADING_VIEW_VERSION || saved.source_key !== key) return false;
+      try {
+        const value = unpackTradingView(saved.json, days, now());
+        const start = timeOf(value.period.start), end = timeOf(value.period.end);
+        value.funding.events = entriesFor().filter(({ row }) => row.credentials).flatMap(({ snapshot }) => snapshot.funding.events)
+          .filter(event => timeOf(event.time) >= start && timeOf(event.time) < end).sort((a, b) => timeOf(b.time) - timeOf(a.time) || a.id.localeCompare(b.id));
+        restored.set(days, value);
+      } catch { return false; }
+    }
+    views = restored; return true;
+  }
+  function state(days = 7, { page } = {}) {
+    if (![7, 30].includes(days)) throw new TradingError(400, '资金费区间仅支持 7 天或 30 天');
+    if (page !== undefined && (!Number.isSafeInteger(page) || page < 0 || page > 1999)) throw new TradingError(400, '流水页码无效');
+    const current = now(), saved = views.get(days);
+    // All history scans and monetary aggregation happened before publication.
+    // Only bounded account freshness, four positions and one ledger slice remain.
+    const accounts = entriesFor().map(({ row, snapshot }) => {
+      const connected = !!row.credentials;
+      const stored = saved.accounts.find(account => account.exchange === row.exchange).funding;
+      const funding = { ...stored, error: snapshot.funding.error };
+      const fundingState = readState(connected, funding, current, FUNDING_STALE);
+      return { exchange: row.exchange, name: NAMES[row.exchange], accountMode: row.account_mode, connected, revision: row.revision, verifiedAt: row.verified_at,
+        refreshing: [...jobs.keys()].some(key => key.startsWith(`${row.exchange}:`)),
+        positions: { state: readState(connected, snapshot.positions, current, POSITION_STALE), fetchedAt: snapshot.positions.fetchedAt, error: snapshot.positions.error },
+        funding: { ...funding, state: fundingState, complete: stored.complete && fundingState === 'live' } };
+    });
+    const legs = EXCHANGES.flatMap(exchange => SYMBOLS.map(symbol => {
+      const account = accounts.find(account => account.exchange === exchange), snapshot = cache.get(exchange);
+      const positions = account.connected ? snapshot.positions.rows.filter(row => row.symbol === symbol) : [];
+      const stored = saved.legs.find(leg => leg.id === `${exchange}:${symbol}`), known = !!account.positions.fetchedAt;
+      return { id: `${exchange}:${symbol}`, exchange, symbol, name: symbol === 'CLUSDT' ? 'CL · WTI' : 'BZ · 布伦特', state: account.positions.state,
+        fetchedAt: account.positions.fetchedAt, positions, grossNotional: known ? sumOrUnknown(positions, 'notional') : null,
+        netNotional: known ? sumOrUnknown(positions, 'notional', true) : null, unrealizedPnl: known ? sumOrUnknown(positions, 'unrealizedPnl') : null,
+        fundingNet: !account.funding.complete && !stored.fundingReceiptCount ? null : stored.fundingNet, fundingComplete: account.funding.complete };
+    }));
+    const complete = accounts.every(account => account.funding.complete), events = saved.funding.events;
+    const totals = !complete && !events.length ? { income: null, expense: null, net: null } : { income: saved.funding.income, expense: saved.funding.expense, net: saved.funding.net };
+    const allFundingFresh = accounts.every(account => account.funding.state === 'live');
+    const daily = saved.funding.daily.map(({ receiptCount, ...day }) => {
+      const complete = day.complete && allFundingFresh;
+      return { ...day, complete, ...(!complete && !receiptCount ? { income: null, expense: null, net: null } : {}) };
+    });
+    const historical = saved.pnl, last = historical.latest;
+    const expired = last && current - last.time > POSITION_STALE && (last.unrealizedPnl !== null || last.totalPnl !== null);
+    const latest = expired ? { time: current, unrealizedPnl: null, fundingPnl: null, totalPnl: null } : last;
+    const pages = Math.max(1, Math.ceil(events.length / PAGE_SIZE)), selected = Math.min(page ?? 0, pages - 1);
+    return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: saved.generatedAt,
+      period: saved.period, accounts, legs, structure: structure(legs),
+      funding: { complete, ...totals, currency: 'USDT', daily, events: page === undefined ? events : events.slice(selected * PAGE_SIZE, (selected + 1) * PAGE_SIZE), pagination: { page: selected, pageSize: PAGE_SIZE, total: events.length, pages } },
+      pnl: { ...historical, end: current, points: expired ? [...historical.points, latest] : historical.points, latest, status: expired ? 'incomplete' : historical.status },
+      cache: { builtAt: saved.generatedAt, servedAt: iso(current), rebuilding: viewsDirty },
+    };
   }
   async function connect(exchange, body, { credentialReader, beforeSave, signal: externalSignal, timeoutMs = validationTimeoutMs } = {}) {
     exchangeOf(exchange); const revision = revisionOf(body.revision);
@@ -297,10 +405,13 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       const positions = normalizePositions(result, exchange, now()), snapshot = emptySnapshot(exchange);
       snapshot.positions = { ...snapshot.positions, ...positions, lastAttemptAt: iso(now()) };
       const encrypted = encrypt({ exchange, ...credentials });
-      const saved = db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), JSON.stringify(snapshot), exchange, revision);
+      const serialized = JSON.stringify(snapshot);
+      const saved = db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), serialized, exchange, revision);
       if (!saved.changes) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
       cancel(exchange); cache.set(exchange, snapshot);
+      snapshotHashes.set(exchange, fundingHash(snapshot.funding));
       pnl.record(entriesFor(), now());
+      resetViews();
       if (!fundingBatchEnd || now() - fundingBatchEnd >= FUNDING_INTERVAL) fundingBatchEnd = now();
       void run(exchange, 'funding', { end: fundingBatchEnd }).catch(() => {});
     } catch (error) {
@@ -313,10 +424,12 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     if (rowFor(exchange).revision !== revision) throw new TradingError(409, '连接已被更新，请刷新后重试');
     db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=? AND revision=?').run(exchange, revision);
     validations.get(exchange)?.abort(); cancel(exchange); cache.set(exchange, emptySnapshot(exchange));
+    snapshotHashes.set(exchange, fundingHash(cache.get(exchange).funding)); resetViews();
   }
+  if (!restoreViews()) { viewsDirty = true; flushViews(); }
   const timer = intervalMs > 0 ? setInterval(() => { if (!closed) void refresh(); }, intervalMs) : null; timer?.unref();
   const first = intervalMs > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   return { state, refresh, connect, disconnect,
-    async close() { closed = true; clearInterval(timer); clearTimeout(first); for (const controller of validations.values()) controller.abort(); for (const job of jobs.values()) job.controller.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise)); jobs.clear(); validations.clear(); },
+    async close() { closed = true; clearInterval(timer); clearTimeout(first); clearTimeout(viewTimer); for (const controller of validations.values()) controller.abort(); for (const job of jobs.values()) job.controller.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise)); jobs.clear(); validations.clear(); },
   };
 }

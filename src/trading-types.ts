@@ -45,12 +45,14 @@ export type TradingPnl = {
 export type TradingState = {
   mode: 'read-only'; strategy: { id: 'oil-four-leg'; name: string };
   generatedAt: string; period: { days: 7 | 30; start: string; end: string };
+  cache: { builtAt: string | null; servedAt: string; rebuilding: boolean };
   accounts: TradingAccount[]; legs: TradingLeg[];
   pnl: TradingPnl;
   structure: { state: 'unknown' | 'incomplete' | 'opposed' | 'same-direction' | 'mixed'; message: string };
   funding: {
     complete: boolean; income: string | null; expense: string | null; net: string | null;
     currency: 'USDT'; events: FundingReceipt[];
+    pagination: { page: number; pageSize: 50; total: number; pages: number };
     daily: { date: string; income: string | null; expense: string | null; net: string | null; complete: boolean }[];
   };
 };
