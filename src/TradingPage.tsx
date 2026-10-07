@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
 import TradingFundingChart from './TradingFundingChart';
+import TradingPnlChart from './TradingPnlChart';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
 import './trading.css';
 
@@ -241,9 +242,16 @@ export default function TradingPage({ onExpired }: { onExpired: () => void }) {
         <p className="trading-footnote">方向仅反映当前持仓结构；不同交易所的合约数量不直接等同，不代表完全对冲。</p>
       </section>
 
-      <section className="trading-panel trading-funding" aria-labelledby="trading-funding-title">
-        <div className="trading-panel-heading"><div><h2 id="trading-funding-title">{data.funding.complete ? '区间资金费' : '已获取的资金费'}</h2><p>{formatDate(data.period.start)} — {formatDate(data.period.end)}（北京时间）</p></div><div className="trading-range" role="group" aria-label="资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
+      <section className="trading-panel trading-pnl" aria-labelledby="trading-pnl-title">
+        <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">四腿总盈亏</h2><p>持仓浮盈亏＋区间累计已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
         {days !== data.period.days ? <p className="trading-window-loading" role="status">{reading ? `正在读取近${days}天；下方仍显示近${data.period.days}天的数据。` : `所选区间尚未取得，保留近${data.period.days}天的数据。`}</p> : null}
+        <p className="trading-caption">资金费累计起点：{formatDate(data.period.start)}（北京时间）；每个采样点仅累计到该时刻。</p>
+        <TradingPnlChart pnl={data.pnl} />
+        <p className="trading-footnote">仅统计这四腿的浮盈亏与资金费，不含平仓已实现盈亏及交易手续费；切换账户后重新开始记录。切换区间会改变资金费累计起点。</p>
+      </section>
+
+      <section className="trading-panel trading-funding" aria-labelledby="trading-funding-title">
+        <div className="trading-panel-heading"><div><h2 id="trading-funding-title">{data.funding.complete ? '区间资金费' : '已获取的资金费'}</h2><p>{formatDate(data.period.start)} — {formatDate(data.period.end)}（北京时间）· 与上方曲线共用近{data.period.days}天区间</p></div></div>
         <div className="trading-funding-summary"><div><span>{data.funding.complete ? '收入' : '已获取收入'}<small>USDT</small></span><strong className="trading-positive">{amount(data.funding.income)}</strong></div><div><span>{data.funding.complete ? '支出' : '已获取支出'}<small>USDT</small></span><strong className="trading-negative">{amount(data.funding.expense)}</strong></div><div><span>{data.funding.complete ? '净额' : '已获取净额'}<small>USDT</small></span><strong className={polarity(data.funding.net)}>{amount(data.funding.net, true)}</strong></div></div>
         <div className="trading-funding-coverage">{!data.funding.complete ? <p className="trading-warning"><CircleAlert size={15} />部分记录：当前汇总不代表整个区间的完整实收。</p> : null}{data.accounts.map(account => <div key={account.exchange}><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.funding.state} /><span>资金费截至：{account.funding.coverageEnd ? formatDate(account.funding.coverageEnd) : '尚未同步'}</span>{account.funding.error ? <p className="trading-warning">{account.funding.error}</p> : null}</div>)}</div>
         <TradingFundingChart daily={data.funding.daily} />

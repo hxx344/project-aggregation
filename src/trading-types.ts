@@ -36,10 +36,17 @@ export type TradingLeg = {
   grossNotional: string | null; netNotional: string | null; unrealizedPnl: string | null;
   fundingNet: string | null; fundingComplete: boolean;
 };
+export type TradingPnlPoint = { time: number; unrealizedPnl: string | null; fundingPnl: string | null; totalPnl: string | null };
+export type TradingPnl = {
+  currency: 'USDT'; intervalMs: number; cumulativeStart: number; end: number; recordingStartedAt: number | null;
+  pointCount: number; points: TradingPnlPoint[]; latest: TradingPnlPoint | null;
+  status: 'ready' | 'collecting' | 'incomplete';
+};
 export type TradingState = {
   mode: 'read-only'; strategy: { id: 'oil-four-leg'; name: string };
   generatedAt: string; period: { days: 7 | 30; start: string; end: string };
   accounts: TradingAccount[]; legs: TradingLeg[];
+  pnl: TradingPnl;
   structure: { state: 'unknown' | 'incomplete' | 'opposed' | 'same-direction' | 'mixed'; message: string };
   funding: {
     complete: boolean; income: string | null; expense: string | null; net: string | null;

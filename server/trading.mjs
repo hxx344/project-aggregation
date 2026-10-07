@@ -1,5 +1,7 @@
-import { createTradingExchangeClient, TradingExchangeError } from './trading-exchanges.mjs';
+import { createTradingExchangeClient, TradingExchangeError, MAX_FUNDING_EVENTS } from './trading-exchanges.mjs';
 import { decimal, addDecimals, negateDecimal, compareDecimals } from './trading-decimal.mjs';
+import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
+import { createTradingPnl } from './trading-pnl.mjs';
 
 const EXCHANGES = ['binance', 'bybit'];
 const SYMBOLS = ['CLUSDT', 'BZUSDT'];
@@ -16,8 +18,8 @@ export class TradingError extends Error {
 
 function emptySnapshot(exchange) {
   return { version: 1, exchange,
-    positions: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null },
-    funding: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null } };
+    positions: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
+    funding: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null, diagnostic: null } };
 }
 function exchangeOf(exchange) {
   if (!EXCHANGES.includes(exchange)) throw new TradingError(404, '交易所不存在');
@@ -85,7 +87,7 @@ function normalizePositions(result, exchange, now) {
   return { rows, fetchedAt: iso(timeOf(result.fetchedAt)) };
 }
 function normalizeReceipts(events, exchange, start = 0, end = Infinity) {
-  if (!Array.isArray(events) || events.length > 12000) throw new Error('Invalid funding events');
+  if (!Array.isArray(events) || events.length > MAX_FUNDING_EVENTS * 2) throw new Error('Invalid funding events');
   const result = new Map();
   for (const item of events) {
     const time = timeOf(item?.time);
@@ -94,6 +96,7 @@ function normalizeReceipts(events, exchange, start = 0, end = Infinity) {
     const previous = result.get(row.id);
     if (previous && JSON.stringify(previous) !== JSON.stringify(row)) throw new Error('Conflicting funding receipt');
     result.set(row.id, row);
+    if (result.size > MAX_FUNDING_EVENTS) throw new Error('Invalid funding event count');
   }
   return [...result.values()].sort((a, b) => timeOf(a.time) - timeOf(b.time) || a.id.localeCompare(b.id));
 }
@@ -106,10 +109,11 @@ function parseSnapshot(row) {
     const positions = value.positions.fetchedAt ? normalizePositions({ positions: value.positions.rows, fetchedAt: value.positions.fetchedAt }, row.exchange, Date.now()) : { rows: [], fetchedAt: null };
     const events = normalizeReceipts(value.funding.events, row.exchange), coverage = mergeCoverage(value.funding.coverage);
     const safeStamp = value => timeOf(value) === null ? null : iso(timeOf(value));
+    const positionsDiagnostic = normalizeTradingDiagnostic(value.positions.diagnostic), fundingDiagnostic = normalizeTradingDiagnostic(value.funding.diagnostic);
     // Persist only application-owned diagnostics. Arbitrary disk strings never become API error text.
-    return { ...fallback, positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), error: value.positions.error ? '上次仓位读取失败，请刷新重试' : null },
+    return { ...fallback, positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
       funding: { events, coverage, fetchedAt: safeStamp(value.funding.fetchedAt), lastAttemptAt: safeStamp(value.funding.lastAttemptAt),
-        requestedEnd: Number.isSafeInteger(value.funding.requestedEnd) ? value.funding.requestedEnd : null, error: value.funding.error ? '上次资金费读取未完成，请刷新重试' : null } };
+        requestedEnd: Number.isSafeInteger(value.funding.requestedEnd) ? value.funding.requestedEnd : null, diagnostic: fundingDiagnostic, error: formatTradingDiagnostic(fundingDiagnostic) || (value.funding.error ? '上次资金费读取未完成，请刷新重试' : null) } };
   } catch {
     fallback.positions.error = fallback.funding.error = '本地交易缓存无效，请刷新重新读取';
     return fallback;
@@ -151,6 +155,8 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   } catch (error) { db.exec('ROLLBACK'); throw error; }
   const rowFor = exchange => db.prepare('SELECT * FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
   const cache = new Map(EXCHANGES.map(exchange => [exchange, parseSnapshot(rowFor(exchange))]));
+  const pnl = createTradingPnl(db);
+  const entriesFor = () => EXCHANGES.map(exchange => ({ row: rowFor(exchange), snapshot: cache.get(exchange) }));
   const clients = new Map(EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const jobs = new Map(), validations = new Map();
   let closed = false;
@@ -158,7 +164,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   function write(exchange, revision, change) {
     if (closed || rowFor(exchange).revision !== revision) return false;
     const next = change(cache.get(exchange));
-    db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(next), exchange, revision);
+    if (!db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(next), exchange, revision).changes) return false;
     cache.set(exchange, next); return true;
   }
   async function deadline(controller, timeoutMs, work) {
@@ -187,30 +193,35 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     if (previous.lastAttemptAt && now() - timeOf(previous.lastAttemptAt) < cooldown) return Promise.resolve();
     const controller = new AbortController();
     const start = kind === 'funding' ? fundingStart(previous, end) : null;
+    const saveFunding = (result, progress = false) => {
+      if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
+      if (timeOf(result?.fetchedAt) === null || timeOf(result.fetchedAt) > now() + 60000 || typeof result.complete !== 'boolean' || !Array.isArray(result.coverage)) throw new Error('Invalid funding response');
+      const added = normalizeReceipts(result.events, exchange, start, end), incomingCoverage = mergeCoverage(result.coverage);
+      if (incomingCoverage.some(item => item.start < start || item.end > end) || result.complete && !covered(incomingCoverage, start, end)) throw new Error('Invalid funding coverage');
+      const diagnostic = progress || result.complete ? null : normalizeTradingDiagnostic(result.diagnostic);
+      write(exchange, row.revision, snapshot => {
+        const events = normalizeReceipts([...snapshot.funding.events.filter(item => timeOf(item.time) >= end - 31 * DAY), ...added], exchange);
+        const coverage = mergeCoverage([...snapshot.funding.coverage, ...incomingCoverage]).filter(item => item.end > end - 31 * DAY).map(item => ({ start: Math.max(item.start, end - 31 * DAY), end: item.end }));
+        return { ...snapshot, funding: { ...snapshot.funding, events, coverage, fetchedAt: result.fetchedAt, diagnostic,
+          error: progress || result.complete ? null : formatTradingDiagnostic(diagnostic) || '资金费记录未取全，当前仅显示已获取记录，请刷新重试' } };
+      });
+    };
     write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], lastAttemptAt: iso(now()), ...(kind === 'funding' ? { requestedEnd: end } : {}) } }));
     const promise = (async () => {
       try {
         const credentials = privateCredentials(row), accountMode = accountModeOf(exchange, row.account_mode);
-        const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? clients.get(exchange).positions(credentials, { signal, accountMode }) : clients.get(exchange).funding(credentials, { start, end, signal, accountMode }));
+        const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? clients.get(exchange).positions(credentials, { signal, accountMode }) : clients.get(exchange).funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
         if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
         if (kind === 'positions') {
           const value = normalizePositions(result, exchange, now());
-          write(exchange, row.revision, snapshot => ({ ...snapshot, positions: { ...snapshot.positions, ...value, error: null } }));
+          write(exchange, row.revision, snapshot => ({ ...snapshot, positions: { ...snapshot.positions, ...value, error: null, diagnostic: null } }));
         } else {
-          if (timeOf(result?.fetchedAt) === null || timeOf(result.fetchedAt) > now() + 60000 || typeof result.complete !== 'boolean' || !Array.isArray(result.coverage)) throw new Error('Invalid funding response');
-          const added = normalizeReceipts(result.events, exchange, start, end);
-          const incomingCoverage = mergeCoverage(result.coverage);
-          if (incomingCoverage.some(item => item.start < start || item.end > end) || result.complete && !covered(incomingCoverage, start, end)) throw new Error('Invalid funding coverage');
-          write(exchange, row.revision, snapshot => {
-            const events = normalizeReceipts([...snapshot.funding.events, ...added], exchange).filter(item => timeOf(item.time) >= end - 31 * DAY);
-            const coverage = mergeCoverage([...snapshot.funding.coverage, ...incomingCoverage]).filter(item => item.end > end - 31 * DAY).map(item => ({ start: Math.max(item.start, end - 31 * DAY), end: item.end }));
-            return { ...snapshot, funding: { ...snapshot.funding, events, coverage, fetchedAt: result.fetchedAt,
-              error: result.complete ? null : '资金费记录未取全，当前仅显示已获取记录，请刷新重试' } };
-          });
+          saveFunding(result);
         }
       } catch (error) {
         if (closed || rowFor(exchange).revision !== row.revision || controller.signal.aborted && controller.signal.reason?.name !== 'TimeoutError') return;
-        write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], error: safeError(error) } }));
+        const diagnostic = normalizeTradingDiagnostic(error?.diagnostic) || normalizeTradingDiagnostic({ version: 1, exchange, accountMode: row.account_mode, operation: kind, code: error?.name === 'TimeoutError' ? 'timeout' : 'upstream' });
+        write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], diagnostic, error: formatTradingDiagnostic(diagnostic) || safeError(error) } }));
       }
     })().finally(() => { if (jobs.get(key)?.promise === promise) jobs.delete(key); });
     jobs.set(key, { controller, promise }); return promise;
@@ -218,7 +229,8 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   function refresh({ force = false } = {}) {
     const current = now();
     if (!fundingBatchEnd || current - fundingBatchEnd >= (force ? 5000 : FUNDING_INTERVAL)) fundingBatchEnd = current;
-    return Promise.allSettled(EXCHANGES.flatMap(exchange => ['positions', 'funding'].map(kind => run(exchange, kind, { force, end: kind === 'funding' ? fundingBatchEnd : current }))));
+    const positions = Promise.allSettled(EXCHANGES.map(exchange => run(exchange, 'positions', { force, end: current }))).then(() => { if (!closed) pnl.record(entriesFor(), now()); });
+    return Promise.allSettled([positions, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]);
   }
   function state(days = 7) {
     if (![7, 30].includes(days)) throw new TradingError(400, '资金费区间仅支持 7 天或 30 天');
@@ -260,7 +272,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       daily.push({ date: iso(day + 8 * 3600000).slice(0, 10), ...cashTotals(rows, dayComplete), complete: dayComplete });
     }
     return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: iso(current), period: { days, start: iso(start), end: iso(end) },
-      accounts, legs, structure: structure(legs), funding: { complete, ...totals, currency: 'USDT', events, daily } };
+      accounts, legs, structure: structure(legs), funding: { complete, ...totals, currency: 'USDT', events, daily }, pnl: pnl.read(entries, start, current) };
   }
   async function connect(exchange, body, { credentialReader, beforeSave, signal: externalSignal, timeoutMs = validationTimeoutMs } = {}) {
     exchangeOf(exchange); const revision = revisionOf(body.revision);
@@ -288,6 +300,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       const saved = db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), JSON.stringify(snapshot), exchange, revision);
       if (!saved.changes) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
       cancel(exchange); cache.set(exchange, snapshot);
+      pnl.record(entriesFor(), now());
       if (!fundingBatchEnd || now() - fundingBatchEnd >= FUNDING_INTERVAL) fundingBatchEnd = now();
       void run(exchange, 'funding', { end: fundingBatchEnd }).catch(() => {});
     } catch (error) {

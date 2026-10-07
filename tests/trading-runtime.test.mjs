@@ -394,3 +394,112 @@ test('one timed-out exchange preserves its old timestamp while the other complet
   await f.close(); await nextRefresh;
   assert.equal(active.signal.aborted, true);
 });
+
+test('funding saves completed windows before timeout, resumes after restart and ignores late progress after disconnect', async t => {
+  const f = await fixture(t, { tradingTaskTimeoutMs: 80 });
+  let progress, completedEnd;
+  f.handlers.bybit.funding = async (_secret, { start, onProgress }) => {
+    completedEnd = start + 7 * DAY;
+    progress = onProgress;
+    await onProgress({ fetchedAt: stamp(f.now), events: [receipt('bybit', 'completed-window', '0.3', start + 1)], coverage: [{ start, end: completedEnd }], complete: false });
+    return new Promise(() => {});
+  };
+  await f.connect('bybit');
+  let funding = JSON.parse(f.stored('bybit').snapshot).funding;
+  assert.equal(funding.events.length, 1);
+  assert.equal(funding.coverage[0].end, completedEnd);
+  assert.match(funding.error, /Bybit.*超时/);
+  await f.reopen();
+  assert.match(f.app.trading.state().accounts[1].funding.error, /Bybit.*超时/);
+  f.handlers.bybit.funding = async (_secret, { start, end }) => {
+    assert.equal(start, completedEnd);
+    return { fetchedAt: stamp(f.now), events: [], coverage: [{ start, end }], complete: true };
+  };
+  f.advance(6000); await f.app.trading.refresh({ force: true });
+  funding = JSON.parse(f.stored('bybit').snapshot).funding;
+  assert.equal(funding.events.length, 1);
+  assert.equal(funding.error, null);
+  f.app.trading.disconnect('bybit', 1);
+  await progress({ fetchedAt: stamp(f.now), events: [], coverage: [], complete: false });
+  assert.equal(f.stored('bybit').snapshot, null);
+});
+
+test('partial funding diagnostics survive restart while arbitrary text never reaches state', async t => {
+  const f = await fixture(t);
+  f.handlers.bybit.funding = async () => ({ fetchedAt: stamp(f.now), events: [], coverage: [], complete: false,
+    error: 'private-secret-in-upstream-message', diagnostic: { version: 1, exchange: 'bybit', accountMode: 'unified', operation: 'funding', code: 'api', providerCode: 10005, message: 'private-secret-in-diagnostic' } });
+  await f.connect('bybit');
+  const error = f.app.trading.state().accounts[1].funding.error;
+  assert.match(error, /Bybit 10005/);
+  assert.equal(JSON.stringify(f.app.trading.state()).includes('private-secret'), false);
+  assert.equal(f.stored('bybit').snapshot.includes('private-secret'), false);
+  await f.reopen();
+  assert.equal(f.app.trading.state().accounts[1].funding.error, error);
+});
+
+test('funding runtime accepts more than twelve thousand distinct receipts and deduplicates repeated reads', async t => {
+  const f = await fixture(t), initial = f.now;
+  const events = Array.from({ length: 12050 }, (_, i) => receipt('bybit', `ledger-${i}`, '0.01', initial - 1 - i));
+  f.handlers.bybit.funding = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events, coverage: [{ start, end }], complete: true });
+  await f.connect('bybit'); f.advance(6000); await f.app.trading.refresh({ force: true });
+  assert.equal(f.app.trading.state().funding.events.length, 12050);
+  assert.equal(f.app.trading.state().funding.net, '120.5');
+  assert.equal(f.app.trading.state().accounts[1].funding.error, null);
+});
+
+test('PnL records real snapshots, keeps decimal precision, recalculates late funding and survives restart without GET writes', async t => {
+  const f = await fixture(t), original = f.now;
+  f.rows.binance[0].unrealizedPnl = '0.1'; f.rows.binance[1].unrealizedPnl = '0.2';
+  f.rows.bybit[0].unrealizedPnl = '-0.3'; f.rows.bybit[1].unrealizedPnl = '0.000000000000000001';
+  const events = [receipt('bybit', 'older', '5', original - 10 * DAY), receipt('bybit', 'recent', '0.2', original - 1000)];
+  f.handlers.bybit.funding = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events: events.filter(row => Date.parse(row.time) >= start && Date.parse(row.time) < end), coverage: [{ start, end }], complete: true });
+  await f.connect('binance');
+  assert.equal(f.app.trading.state().pnl.points.length, 0);
+  await f.connect('bybit');
+  let seven = f.app.trading.state(7).pnl;
+  assert.equal(seven.pointCount, 1); assert.equal(seven.recordingStartedAt, original);
+  assert.equal(seven.latest.unrealizedPnl, '0.000000000000000001');
+  assert.equal(seven.latest.totalPnl, '0.200000000000000001');
+  assert.equal(f.app.trading.state(30).pnl.latest.totalPnl, '5.200000000000000001');
+  f.advance(20000);
+  for (let i = 0; i < 5; i++) assert.equal(f.app.trading.state().pnl.pointCount, 1);
+  events.push(receipt('bybit', 'late', '-0.1', original - 500));
+  f.advance(40000); await f.app.trading.refresh({ force: true });
+  seven = f.app.trading.state().pnl;
+  assert.equal(seven.pointCount, 2);
+  assert.equal(seven.points[0].totalPnl, '0.100000000000000001');
+  await f.reopen(); assert.deepEqual(f.app.trading.state().pnl, seven);
+});
+
+test('PnL distinguishes confirmed empty positions, missing fields, stale sources, downtime and new account revisions', async t => {
+  const f = await fixture(t);
+  f.rows.binance = []; f.rows.bybit = [];
+  await f.connect('binance'); await f.connect('bybit');
+  assert.equal(f.app.trading.state().pnl.latest.totalPnl, '0');
+  f.advance(76000);
+  assert.equal(f.app.trading.state().pnl.latest.unrealizedPnl, null);
+  assert.equal(f.app.trading.state().pnl.pointCount, 1);
+  f.rows.bybit = [position('bybit', 'CLUSDT', 'long', { unrealizedPnl: null })];
+  await f.app.trading.refresh({ force: true });
+  assert.equal(f.app.trading.state().pnl.latest.unrealizedPnl, null);
+  f.rows.bybit = []; f.advance(60000); await f.app.trading.refresh({ force: true });
+  assert.equal(f.app.trading.state().pnl.latest.totalPnl, '0');
+  f.advance(10 * 60000); await f.app.trading.refresh({ force: true });
+  assert.ok(f.app.trading.state().pnl.points.slice(-2, -1).every(row => row.totalPnl === null));
+  f.app.trading.disconnect('binance', 1);
+  assert.equal(f.app.trading.state().pnl.points.length, 0);
+  f.advance(1000); await f.connect('binance', credentials('replacement'));
+  assert.equal(f.app.trading.state().pnl.pointCount, 1);
+  assert.equal(f.app.trading.state().pnl.recordingStartedAt, f.now);
+});
+
+test('PnL never treats missing funding coverage as zero or combines position snapshots too far apart', async t => {
+  const f = await fixture(t);
+  f.handlers.bybit.funding = async () => ({ fetchedAt: stamp(f.now), events: [], coverage: [], complete: false });
+  await f.connect('binance'); await f.connect('bybit');
+  assert.equal(f.app.trading.state().pnl.latest.unrealizedPnl, '0');
+  assert.equal(f.app.trading.state().pnl.latest.totalPnl, null);
+  f.handlers.binance.positions = async () => ({ fetchedAt: stamp(f.now - 50000), positions: [] });
+  f.advance(60000); await f.app.trading.refresh({ force: true });
+  assert.equal(f.app.trading.state().pnl.latest.unrealizedPnl, null);
+});

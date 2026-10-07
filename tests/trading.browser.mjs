@@ -9,6 +9,7 @@ async (page) => {
   let scenario = 'empty', hedge = false, refreshing = false, rejectSave = false, expire = false, readFailure = false;
   let revisions = { binance: 0, bybit: 0 };
   let configured = { binance: false, bybit: false };
+  let pnlMode = 'history';
   const state = days => {
     const start = days === 30 ? '2026-09-07T04:00:00.000Z' : '2026-09-30T04:00:00.000Z';
     const partial = scenario === 'partial';
@@ -26,10 +27,12 @@ async (page) => {
       if (hedge && exchange === 'bybit' && symbol === 'CLUSDT') { position.mode = 'hedge'; positions.push({ ...position, id: `${exchange}-${symbol}-long`, side: 'long', quantity: '2', notional: '162.3' }); }
       return { id: `${exchange}-${symbol}`, exchange, symbol, name: `${exchange} ${symbol}`, state: account.positions.state, fetchedAt: account.positions.fetchedAt, positions, grossNotional: configured[exchange] ? '1001.851852735' : null, netNotional: configured[exchange] ? side === 'long' ? '1001.851852735' : '-1001.851852735' : null, unrealizedPnl: configured[exchange] ? position.unrealizedPnl : null, fundingNet: configured[exchange] ? '3.1' : null, fundingComplete: account.funding.complete };
     }));
+    const points = accounts.every(account => account.connected) ? Array.from({ length: pnlMode === 'single' ? 1 : 60 }, (_, i) => ({ time: Date.parse(fixedTime) - (59 - i) * 60000, unrealizedPnl: i === 20 ? null : String(i - 30), fundingPnl: partial || i === 20 ? null : days === 30 ? '30.123456789012345678' : '3.123456789012345678', totalPnl: partial || i === 20 ? null : `${i - (days === 30 ? 0 : 27)}.123456789012345678` })) : [];
+    const pnl = { currency: 'USDT', intervalMs: 60000, cumulativeStart: Date.parse(start), end: Date.parse(fixedTime), recordingStartedAt: points[0]?.time ?? null, pointCount: points.length, points, latest: points.at(-1) ?? null, status: points.length ? partial ? 'incomplete' : 'ready' : 'collecting' };
     const any = accounts.some(account => account.connected);
     const complete = accounts.every(account => account.funding.complete);
     const events = any ? Array.from({ length: 63 }, (_, index) => ({ id: `receipt-${index}`, exchange: index % 2 ? 'bybit' : 'binance', symbol: index % 3 ? 'CLUSDT' : 'BZUSDT', time: new Date(Date.parse(fixedTime) - index * 3600000).toISOString(), amount: index % 2 ? '-0.12345678' : '0.52345678', currency: 'USDT' })).filter(event => configured[event.exchange]) : [];
-    return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, period: { days, start, end: fixedTime }, accounts, legs, structure: { state: !any ? 'unknown' : hedge ? 'mixed' : partial ? 'incomplete' : 'opposed', message: !any ? '连接账户后检查同品种的跨所持仓方向。' : hedge ? 'CLUSDT 同时存在双向持仓，请分别核对。' : partial ? '部分仓位状态未能确认，暂不能判断完整结构。' : 'CLUSDT 与 BZUSDT 均为跨交易所反向持仓。' }, funding: { complete, income: any ? days === 30 ? '95.4' : '18.6' : null, expense: any ? '6.2' : null, net: any ? days === 30 ? '89.2' : '12.4' : null, currency: 'USDT', events, daily: any ? Array.from({ length: days + 1 }, (_, index) => ({ date: new Date(Date.parse(fixedTime) - (days - index) * 86400000).toISOString().slice(0, 10), income: partial && index === 2 ? null : index % 3 ? '1.7' : '0', expense: partial && index === 2 ? null : index % 4 ? '0' : '0.7', net: partial && index === 2 ? null : index % 3 ? '1.7' : '-0.7', complete: !partial })) : [] } };
+    return { mode: 'read-only', pnl, strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, period: { days, start, end: fixedTime }, accounts, legs, structure: { state: !any ? 'unknown' : hedge ? 'mixed' : partial ? 'incomplete' : 'opposed', message: !any ? '连接账户后检查同品种的跨所持仓方向。' : hedge ? 'CLUSDT 同时存在双向持仓，请分别核对。' : partial ? '部分仓位状态未能确认，暂不能判断完整结构。' : 'CLUSDT 与 BZUSDT 均为跨交易所反向持仓。' }, funding: { complete, income: any ? days === 30 ? '95.4' : '18.6' : null, expense: any ? '6.2' : null, net: any ? days === 30 ? '89.2' : '12.4' : null, currency: 'USDT', events, daily: any ? Array.from({ length: days + 1 }, (_, index) => ({ date: new Date(Date.parse(fixedTime) - (days - index) * 86400000).toISOString().slice(0, 10), income: partial && index === 2 ? null : index % 3 ? '1.7' : '0', expense: partial && index === 2 ? null : index % 4 ? '0' : '0.7', net: partial && index === 2 ? null : index % 3 ? '1.7' : '-0.7', complete: !partial })) : [] } };
   };
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url()), method = request.method();
@@ -63,6 +66,7 @@ async (page) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${origin}/?view=trading`);
   await waitForText('连接账户，查看四腿的真实仓位');
+  await page.getByText('连接两所并取得完整仓位后开始记录，历史浮盈亏无法回补。', { exact: true }).waitFor();
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'empty fixture retains four defined legs');
   assert((await page.locator('.trading-funding-summary strong').allTextContents()).every(text => text === '—'), 'unconfigured funding must remain missing, never zero');
   await page.getByRole('button', { name: '连接只读账户', exact: true }).click();
@@ -72,7 +76,17 @@ async (page) => {
 
   configured = { binance: true, bybit: true }; revisions = { binance: 4, bybit: 8 }; scenario = 'live';
   await refreshCache(); await waitForText('CLUSDT 与 BZUSDT 均为跨交易所反向持仓。');
+  assert(await binanceForm.getByLabel('API Key', { exact: true }).inputValue() === '', 'changed connection revision clears stale credential draft');
+  await binanceForm.getByLabel('API Key', { exact: true }).fill('draft-keep');
+  await binanceForm.getByLabel('API Secret', { exact: true }).fill('draft-secret');
+  await refreshCache();
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'live fixture displays four legs');
+  const pnlPath = await page.locator('[data-series="totalPnl"]').getAttribute('d');
+  assert((pnlPath.match(/M/g) || []).length === 2, 'PnL path breaks at missing sample');
+  assert((await page.locator('.trading-pnl-latest').innerText()).includes('32.123456789012345678'), 'exact PnL decimals survive rendering');
+  const slider = page.getByRole('slider', { name: '选择盈亏采样时刻' });
+  await slider.focus(); await page.keyboard.press('ArrowLeft');
+  assert((await page.locator('.trading-pnl-inspect').innerText()).includes('31.123456789012345678'), 'keyboard selects exact previous PnL sample');
   assert(await binanceForm.getByLabel('API Key', { exact: true }).inputValue() === 'draft-keep', 'cache refresh must preserve key draft');
   assert((await page.locator('.trading-funding-summary strong').allTextContents()).join('|') === '18.6|6.2|+12.4', 'income, positive expense and signed net use correct units');
   await page.locator('.trading-connections > summary').click();
@@ -106,6 +120,8 @@ async (page) => {
 
   scenario = 'partial';
   await refreshCache(); await waitForText('Bybit 部分账本未能读取');
+  assert(await page.locator('[data-series="totalPnl"]').getAttribute('d') === Array(60).fill('').join(' '), 'missing funding never produces a total PnL line');
+  assert((await page.locator('[data-series="unrealizedPnl"]').getAttribute('d')).includes('M'), 'floating PnL stays visible while funding is incomplete');
   await page.getByRole('heading', { name: '已获取的资金费', exact: true }).waitFor();
   assert(await page.locator('.trading-status.stale').count() > 0, 'stale data is visibly labelled');
   assert(await page.locator('.trading-status.error').count() > 0, 'single-exchange read error is visible');
@@ -139,6 +155,10 @@ async (page) => {
   readFailure = false;
 
   configured = { binance: true, bybit: true }; scenario = 'live'; hedge = false;
+  pnlMode = 'single';
+  await refreshCache(); await waitForText('已取得首个采样点');
+  assert(await page.locator('.trading-pnl-plot circle').count() === 2, 'single sample displays visible points');
+  pnlMode = 'history';
   await refreshCache(); await waitForText('CLUSDT 与 BZUSDT 均为跨交易所反向持仓。');
   await page.locator('.trading-connections > summary').click();
   await page.setViewportSize({ width: 390, height: 844 });
@@ -150,6 +170,7 @@ async (page) => {
   while (await page.locator('.trading-page details[open] > summary').count()) await page.locator('.trading-page details[open] > summary').first().click();
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: 'output/playwright/trading-mobile.png', fullPage: true });
+  await page.locator('.trading-pnl').screenshot({ path: 'output/playwright/trading-pnl-mobile.png' });
   await page.getByRole('button', { name: '账户连接', exact: true }).click();
   await binanceForm.getByLabel('API Key', { exact: true }).focus();
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'expanded phone connection form has no horizontal overflow');
@@ -173,5 +194,5 @@ async (page) => {
   assert(requests.filter(request => request.path.startsWith('/api/trading') && request.method !== 'GET').every(request => request.path === '/api/trading/refresh' && request.method === 'POST' || /^\/api\/trading\/accounts\/(binance|bybit)$/.test(request.path) && ['PUT', 'DELETE'].includes(request.method)), 'UI issues only read-only account and refresh operations');
   assert(!requests.some(request => /order|trade|execute/i.test(request.path)), 'no trading operation endpoint called');
   assert(!pageErrors.length, `No uncaught browser errors: ${pageErrors.join('; ')}`);
-  return { passed: true, scenarios: ['empty', 'four legs', 'hedged positions', 'partial and stale', 'read failure', '7/30 and history', 'refresh preserves drafts', 'account save/reject/disconnect', '390px mobile', 'offline and hidden polling', '401 expiry', 'no trade actions'], tradingRequests: requests.filter(request => request.path.startsWith('/api/trading')).length };
+  return { passed: true, scenarios: ['empty', 'PnL gaps and exact values', 'PnL keyboard inspection', 'single PnL sample', 'partial funding PnL', 'four legs', 'hedged positions', 'partial and stale', 'read failure', '7/30 and history', 'refresh preserves drafts', 'account save/reject/disconnect', '390px mobile', 'offline and hidden polling', '401 expiry', 'no trade actions'], tradingRequests: requests.filter(request => request.path.startsWith('/api/trading')).length };
 }

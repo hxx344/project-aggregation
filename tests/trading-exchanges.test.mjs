@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { createTradingExchangeClient, TradingExchangeError } from '../server/trading-exchanges.mjs';
+import { createTradingExchangeClient, TradingExchangeError, MAX_FUNDING_EVENTS } from '../server/trading-exchanges.mjs';
 import { decimal, addDecimals, negateDecimal, compareDecimals } from '../server/trading-decimal.mjs';
+import { normalizeTradingDiagnostic, formatTradingDiagnostic } from '../server/trading-diagnostics.mjs';
 
 const NOW = Date.parse('2026-10-07T12:00:00Z');
 const DAY = 86_400_000;
@@ -36,6 +37,10 @@ function harness(exchange, handler, options = {}) {
       } else {
         assert.equal(init.headers['X-BAPI-API-KEY'], credentials.apiKey);
         assert.equal(init.headers['X-BAPI-SIGN'], createHmac('sha256', credentials.apiSecret).update(String(NOW) + credentials.apiKey + '5000' + parsed.searchParams.toString()).digest('hex'));
+        if (parsed.pathname.endsWith('transaction-log')) {
+          assert.ok(['CL', 'BZ'].includes(parsed.searchParams.get('baseCoin')));
+          assert.equal(parsed.searchParams.has('symbol'), false);
+        }
       }
       const result = await handler(parsed, init, calls);
       if (result instanceof Response) return result;
@@ -80,6 +85,7 @@ for (const exchange of ['binance', 'bybit']) {
     assert.ok(calls.some(call => call.url.pathname.endsWith(exchange === 'binance' ? '/income' : 'transaction-log')));
     assert.ok(!JSON.stringify(result).includes('never-return-this'));
     assert.ok(calls.filter(call => call.url.pathname.endsWith(exchange === 'binance' ? '/income' : 'transaction-log')).every(call => call.url.searchParams.get('limit') === '1'));
+    if (exchange === 'bybit') assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('transaction-log')).map(call => call.url.searchParams.get('baseCoin')), ['CL', 'BZ']);
   });
 }
 
@@ -152,12 +158,17 @@ test('wrong position identities, modes, currencies, malformed amounts and missin
 });
 
 test('Bybit uses funding sign unchanged and ignores cashFlow, fee, change and other symbols', async () => {
-  const { client, calls } = harness('bybit', url => url.pathname.endsWith('transaction-log') ? { list: [settlement('CLUSDT', NOW - 100, { funding: '0.125' }), settlement('BZUSDT', NOW - 99, { funding: '-0.025' }), settlement('BTCUSDT', NOW - 98, { funding: '9999' })], nextPageCursor: '' } : undefined);
+  const { client, calls } = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return;
+    const row = url.searchParams.get('baseCoin') === 'CL' ? settlement('CLUSDT', NOW - 100, { funding: '0.125' }) : settlement('BZUSDT', NOW - 99, { funding: '-0.025' });
+    return { list: [row, settlement('BTCUSDT', NOW - 98, { funding: '9999' })], nextPageCursor: '' };
+  });
   const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
   assert.equal(result.complete, true); assert.equal(addDecimals(result.events.map(row => row.amount)), '0.1');
   assert.deepEqual(result.events.map(row => row.amount), ['0.125', '-0.025']); assert.deepEqual(result.coverage, [{ start: NOW - DAY, end: NOW }]);
   const query = calls.find(call => call.url.pathname.endsWith('transaction-log')).url.searchParams;
   assert.equal(query.get('type'), 'SETTLEMENT'); assert.equal(query.get('symbol'), null); assert.equal(query.get('endTime'), String(NOW - 1));
+  assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('transaction-log')).map(call => call.url.searchParams.get('baseCoin')), ['CL', 'BZ']);
 });
 
 test('Binance keeps large int64 ids losslessly and separates symbol identities', async () => {
@@ -190,11 +201,12 @@ test('Bybit funding follows cursor, deduplicates in-window records and separates
   const { client, calls } = harness('bybit', url => {
     if (!url.pathname.endsWith('transaction-log')) return;
     assert.ok(Number(url.searchParams.get('endTime')) - Number(url.searchParams.get('startTime')) < 7 * DAY);
+    if (url.searchParams.get('baseCoin') === 'BZ') return { list: Number(url.searchParams.get('startTime')) === boundary ? [] : [second], nextPageCursor: '' };
     if (Number(url.searchParams.get('startTime')) === boundary) return { list: [third, third], nextPageCursor: '' };
-    return url.searchParams.has('cursor') ? { list: [first, second], nextPageCursor: '' } : { list: [first], nextPageCursor: 'abc%3A/+=1' };
+    return url.searchParams.has('cursor') ? { list: [first, first], nextPageCursor: '' } : { list: [first], nextPageCursor: 'abc%3A/+=1' };
   });
   const result = await client.funding(credentials, { start, end: NOW });
-  assert.equal(result.complete, true); assert.equal(result.events.length, 3); assert.equal(addDecimals(result.events.map(row => row.amount)), '0.4'); assert.deepEqual(result.coverage, [{ start, end: boundary }, { start: boundary, end: NOW }]); assert.equal(calls.filter(call => call.url.pathname.endsWith('transaction-log')).length, 3);
+  assert.equal(result.complete, true); assert.equal(result.events.length, 3); assert.equal(addDecimals(result.events.map(row => row.amount)), '0.4'); assert.deepEqual(result.coverage, [{ start, end: boundary }, { start: boundary, end: NOW }]); assert.equal(calls.filter(call => call.url.pathname.endsWith('transaction-log')).length, 5);
 });
 
 test('ledger records from the next window cannot establish current-window coverage', async () => {
@@ -217,7 +229,7 @@ test('old boundary duplicates reject the later window while preserving prior com
   for (const exchange of ['binance', 'bybit']) {
     const { client } = harness(exchange, url => {
       if (url.pathname.endsWith('/income')) return [income(url.searchParams.get('symbol'), boundary - 1)];
-      if (url.pathname.endsWith('transaction-log')) return { list: [settlement('CLUSDT', boundary - 1)], nextPageCursor: '' };
+      if (url.pathname.endsWith('transaction-log')) return { list: url.searchParams.get('baseCoin') === 'CL' ? [settlement('CLUSDT', boundary - 1)] : [], nextPageCursor: '' };
     });
     const result = await client.funding(credentials, { start, end: NOW });
     assert.equal(result.complete, false); assert.match(result.error, /超出请求时间范围/);
@@ -437,4 +449,147 @@ test('account mode is validated before HTTP and remains request-local on a share
   await Promise.all([client.positions(credentials, { accountMode: 'portfolio-margin' }), client.positions(credentials, { accountMode: 'standard' })]);
   assert.equal(calls.filter(({ url }) => url.hostname === 'papi.binance.com').length, 2);
   assert.equal(calls.filter(({ url }) => url.hostname === 'fapi.binance.com').length, 2);
+});
+
+test('Bybit verification requires successful funding probes for both base coins', async () => {
+  const { client, calls } = harness('bybit', url => {
+    if (url.pathname.endsWith('position/list')) return { category: 'linear', list: [], nextPageCursor: '' };
+    if (!url.pathname.endsWith('transaction-log')) return;
+    assert.equal(url.searchParams.get('limit'), '1');
+    return url.searchParams.get('baseCoin') === 'CL' ? { list: [], nextPageCursor: '' } : json({ retCode: 10005, retMsg: credentials.apiSecret }, 403);
+  });
+  await assert.rejects(client.verify(credentials), error => {
+    assert.deepEqual(error.diagnostic, { version: 1, exchange: 'bybit', operation: 'funding', accountMode: 'unified', code: 'http', httpStatus: 403, providerCode: 10005 });
+    assert.equal(error.message, formatTradingDiagnostic(error.diagnostic));
+    assert.ok(!JSON.stringify(error).includes(credentials.apiSecret));
+    return true;
+  });
+  assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('transaction-log')).map(call => call.url.searchParams.get('baseCoin')), ['CL', 'BZ']);
+});
+
+test('Bybit does not cover a window until both base coins finish every page', async () => {
+  const progress = [];
+  const { client, calls } = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return;
+    assert.equal(url.searchParams.get('limit'), '50');
+    const baseCoin = url.searchParams.get('baseCoin');
+    if (url.searchParams.has('cursor')) return json({ retCode: 10006, retMsg: `${credentials.apiSecret} signed-url` }, 429);
+    return { list: [settlement(baseCoin + 'USDT', NOW - 1)], nextPageCursor: baseCoin === 'BZ' ? 'BZ/next%+' : '' };
+  });
+  const result = await client.funding(credentials, { start: NOW - DAY, end: NOW, onProgress: value => progress.push(value) });
+  assert.equal(result.complete, false); assert.equal(result.events.length, 2);
+  assert.deepEqual(result.coverage, []); assert.deepEqual(progress, []);
+  assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('transaction-log')).map(call => [call.url.searchParams.get('baseCoin'), call.url.searchParams.get('cursor')]), [['CL', null], ['BZ', null], ['BZ', 'BZ/next%+']]);
+  assert.deepEqual(result.diagnostic, { version: 1, exchange: 'bybit', operation: 'funding', accountMode: 'unified', code: 'http', httpStatus: 429, providerCode: 10006 });
+  assert.equal(result.error, formatTradingDiagnostic(result.diagnostic));
+  assert.ok(!JSON.stringify(result).includes(credentials.apiSecret));
+});
+
+test('Bybit rejects another oil symbol returned for the selected base coin', async () => {
+  const { client } = harness('bybit', url => url.pathname.endsWith('transaction-log') ? { list: [settlement('BZUSDT', NOW - 1)], nextPageCursor: '' } : undefined);
+  const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+  assert.equal(result.complete, false); assert.deepEqual(result.coverage, []); assert.deepEqual(result.events, []);
+  assert.equal(result.diagnostic.code, 'invalid_data');
+});
+
+test('funding awaits cumulative completed-window progress and isolates callback snapshots', async () => {
+  const start = NOW - 8 * DAY, boundary = start + 7 * DAY;
+  let release, reached;
+  const gate = new Promise(resolve => { release = resolve; });
+  const firstProgress = new Promise(resolve => { reached = resolve; });
+  const progress = [];
+  const { client, calls } = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return;
+    const from = Number(url.searchParams.get('startTime'));
+    return { list: [settlement(url.searchParams.get('baseCoin') + 'USDT', from)], nextPageCursor: '' };
+  });
+  const pending = client.funding(credentials, { start, end: NOW, onProgress: async snapshot => {
+    progress.push(structuredClone(snapshot));
+    if (progress.length === 1) {
+      snapshot.events[0].amount = '999'; snapshot.coverage[0].start = start - 1;
+      reached(); await gate;
+    }
+  } });
+  await firstProgress;
+  assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('transaction-log')).map(call => Number(call.url.searchParams.get('startTime'))), [start, start]);
+  assert.equal(progress[0].events.length, 2);
+  assert.deepEqual(progress[0].coverage, [{ start, end: boundary }]);
+  assert.equal(progress[0].complete, false); assert.equal(progress[0].error, null); assert.equal(progress[0].diagnostic, null);
+  release();
+  const result = await pending;
+  assert.equal(progress.length, 2); assert.equal(progress[1].events.length, 4);
+  assert.deepEqual(progress[1].coverage, [{ start, end: boundary }, { start: boundary, end: NOW }]);
+  assert.equal(result.complete, true); assert.equal(result.diagnostic, null);
+  assert.equal(addDecimals(result.events.map(row => row.amount)), '0.4');
+  assert.deepEqual(result.coverage, progress[1].coverage);
+});
+
+test('completed-window progress survives a later failure without marking the next window complete', async () => {
+  const start = NOW - 8 * DAY, boundary = start + 7 * DAY, progress = [];
+  const { client } = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return;
+    const from = Number(url.searchParams.get('startTime'));
+    if (from === boundary && url.searchParams.get('baseCoin') === 'BZ') return json({ retCode: 10016, retMsg: credentials.apiSecret }, 503);
+    return { list: [settlement(url.searchParams.get('baseCoin') + 'USDT', from)], nextPageCursor: '' };
+  });
+  const result = await client.funding(credentials, { start, end: NOW, onProgress: snapshot => progress.push(snapshot) });
+  assert.equal(progress.length, 1); assert.equal(progress[0].events.length, 2);
+  assert.equal(result.complete, false); assert.equal(result.events.length, 3);
+  assert.deepEqual(result.coverage, [{ start, end: boundary }]);
+  assert.deepEqual(result.diagnostic, { version: 1, exchange: 'bybit', operation: 'funding', accountMode: 'unified', code: 'http', httpStatus: 503, providerCode: 10016 });
+  assert.ok(!JSON.stringify(result).includes(credentials.apiSecret));
+});
+
+test('abort during an awaited funding progress callback prevents further requests', async () => {
+  const controller = new AbortController();
+  let reached, release;
+  const reachedProgress = new Promise(resolve => { reached = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const { client, calls } = harness('bybit', url => url.pathname.endsWith('transaction-log') ? { list: [], nextPageCursor: '' } : undefined);
+  const pending = client.funding(credentials, { start: NOW - 8 * DAY, end: NOW, signal: controller.signal, onProgress: async () => { reached(); await gate; } });
+  await reachedProgress;
+  controller.abort(new Error(credentials.apiSecret)); release();
+  await assert.rejects(pending, error => error.name === 'AbortError' && !error.message.includes(credentials.apiSecret));
+  assert.equal(calls.filter(call => call.url.pathname.endsWith('transaction-log')).length, 2);
+});
+
+test('trading diagnostics persist only enumerated metadata and numeric provider codes', () => {
+  const valid = { version: 1, exchange: 'bybit', operation: 'funding', accountMode: 'unified', code: 'http', httpStatus: 401, providerCode: 10005 };
+  const tainted = { ...valid, message: credentials.apiSecret, url: 'https://private.invalid?signature=private', headers: { key: credentials.apiKey } };
+  assert.deepEqual(normalizeTradingDiagnostic(tainted), valid);
+  assert.equal(formatTradingDiagnostic(JSON.parse(JSON.stringify(tainted))), 'Bybit 资金费读取失败（HTTP 401，Bybit 10005），请检查账户模式、API 读取权限、IP 白名单与服务器时间');
+  for (const invalid of [null, [], {}, { ...valid, version: 2 }, { ...valid, exchange: 'constructor' }, { ...valid, operation: { toString: 0 } }, { ...valid, operation: credentials.apiSecret }, { ...valid, accountMode: 'portfolio-margin' }, { ...valid, code: credentials.apiSecret }]) {
+    assert.equal(normalizeTradingDiagnostic(invalid), null); assert.equal(formatTradingDiagnostic(invalid), null);
+  }
+  for (const optional of [{ httpStatus: 99, providerCode: credentials.apiSecret }, { httpStatus: 600, providerCode: Number.MAX_SAFE_INTEGER + 1 }, { httpStatus: '401', providerCode: {} }]) {
+    assert.deepEqual(normalizeTradingDiagnostic({ ...valid, ...optional }), { version: 1, exchange: 'bybit', operation: 'funding', accountMode: 'unified', code: 'http' });
+  }
+});
+
+test('funding diagnostics retain permission, currency, range and pagination failure categories', async () => {
+  const cases = [
+    { code: 'permissions', operation: 'permissions', handler: () => ({ readOnly: 0 }) },
+    { code: 'currency', operation: 'funding', handler: url => url.pathname.endsWith('transaction-log') ? { list: [settlement('CLUSDT', NOW - 1, { currency: 'USDC' })], nextPageCursor: '' } : undefined },
+    { code: 'window_range', operation: 'funding', handler: url => url.pathname.endsWith('transaction-log') ? { list: [settlement('CLUSDT', NOW)], nextPageCursor: '' } : undefined },
+    { code: 'pagination', operation: 'funding', handler: url => url.pathname.endsWith('transaction-log') ? { list: [settlement('CLUSDT', NOW - 1)], nextPageCursor: 'repeat' } : undefined },
+  ];
+  for (const { code, operation, handler } of cases) {
+    const { client } = harness('bybit', handler);
+    const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, false); assert.deepEqual(result.coverage, []);
+    assert.deepEqual(result.diagnostic, { version: 1, exchange: 'bybit', operation, accountMode: 'unified', code });
+    assert.equal(result.error, formatTradingDiagnostic(result.diagnostic));
+  }
+});
+
+test('funding uses the exported record cap and never marks a capped window complete', async () => {
+  const start = NOW - DAY;
+  const { client } = harness('binance', url => {
+    if (!url.pathname.endsWith('/income')) return;
+    const page = Number(url.searchParams.get('page'));
+    return Array.from({ length: 1000 }, (_, index) => income('CLUSDT', start + (page - 1) * 1000 + index));
+  });
+  const result = await client.funding(credentials, { start, end: NOW });
+  assert.equal(MAX_FUNDING_EVENTS, 50_000); assert.equal(result.events.length, MAX_FUNDING_EVENTS);
+  assert.equal(result.complete, false); assert.deepEqual(result.coverage, []); assert.equal(result.diagnostic.code, 'record_limit');
 });
