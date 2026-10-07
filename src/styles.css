@@ -39,3 +39,4 @@
 .project-screen[hidden]{display:none}
 
 .toast{align-items:flex-start;width:max-content;max-width:min(560px,calc(100vw - 32px));max-height:calc(100dvh - 50px)}.toast-content{min-width:0;overflow:auto;max-height:calc(100dvh - 82px);overflow-wrap:anywhere;white-space:pre-wrap}.toast-content strong{font-weight:500}.toast-content p{margin-top:6px;line-height:1.6;color:#e1e8f0}.toast>svg,.toast>button{margin-top:2px}.toast>button{flex-shrink:0}.toast.warning>svg{color:#ffd38c}.toast.error>svg{color:#ffb4ad}.toast.info>svg{color:#bdd6f1}.connection-details{margin-top:8px;max-width:320px;overflow-wrap:anywhere;font-size:.75rem}.connection-details summary{cursor:pointer;color:#9b642d}.connection-details p{margin-top:6px;line-height:1.6;color:#69758a;white-space:pre-wrap}.project-table-row>div{min-width:0}
+.nav-readonly { margin-left: auto; font-size: 10px; color: #acd4d2; border: 1px solid #ffffff26; border-radius: 4px; padding: 2px 5px; line-height: 1.4; }

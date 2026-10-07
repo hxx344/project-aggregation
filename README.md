@@ -11,9 +11,30 @@
 - 接入管理：新增、编辑、停用、删除项目，配置页面访问方式、接口地址、适配器、Asset 后台同步和数据过期阈值。
 - 工作台后端按来源时限读取已启用项目的现有数据（最多间隔 30 秒）；启用 Asset 后台同步时，每 60 秒调用原项目的同步接口。浏览器关闭后仍会执行。
 - 独立的工作台密码登录、服务器端会话和本地 SQLite 持久化。
+- 原生“交易”模块：以只读 API 查看 Binance / Bybit 原油四腿真实仓位和已结算资金费。
 - 五个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
 
 工作台的自动任务不会下单、启停策略或转账；Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
+
+## 只读交易与原油四腿
+
+左侧“交易”或 `/?view=trading` 打开内置原油四腿资金费套利页。四腿为 Binance、Bybit 各自的 `CLUSDT` 和 `BZUSDT`；多空方向直接读取实际仓位。同品种跨所方向相反时显示结构状态，数量和名义金额仍逐腿列出，不把方向相反等同于完全对冲。同一合约多空并存时保留两条仓位，空仓与尚未读取到数据分别显示。
+
+在页内“账户连接”分别填写国际站的只读 HMAC API Key 和 API Secret。Binance 使用 USDⓈ-M 账户查询，要求读取权限开启、交易及划转提现等写权限关闭；Bybit 需要统一账户和 `readOnly=1`。保存前验证只读权限及仓位、资金费账本的实际读取能力；验证失败保留旧连接。密钥仅在服务器使用工作台现有密钥加密保存，不返回页面，也不从 Asset Ledger 搬运凭据。当前模块仅包含固定的交易所 GET 接口，没有下单、撤单、杠杆调整或转账功能。
+
+仓位每 30 秒读取，资金费每 5 分钟同步，页面每 5 秒读取本地缓存；关闭页面后后台继续同步。首次回补最近 30 天，之后补齐缺口并重读最近 24 小时以获取延迟记录。两所按同一批次截止时间统计，支持近 7 天、近 30 天（`tradingDays=7|30`）；日期和按日收付使用北京时间，首尾日按所选滚动区间截取。接口查询覆盖不保证交易所没有延迟或遗漏；分页未完成、单所失败或数据过期时保留已取得记录，合计明确标为已获取金额，未取得的数据不填零。
+
+资金费使用账户已结算的收付：Binance 的 `FUNDING_FEE` 收益记录、Bybit 统一账户 `SETTLEMENT` 中的 `funding` 字段；正值为收取、负值为支付，净额为有符号合计，金额按精确十进制运算。历史资金费按账户和合约归属，不根据当前持仓方向重新计算，不混入交易手续费或已实现价格盈亏；同账户同合约混有其他策略时，不能据此分摊策略收益。已平仓合约的区间记录继续展示。Bybit 升级统一账户前的旧账本不在首版范围内。
+
+仓位、资金费各自保留采集时间；仓位上的交易所更新时间不当作本次读取时间。断开连接会删除该交易账户的凭据及当前缓存，重新连接后重新回补；替换密钥后旧请求不能写入新连接。交易模块不重复计入资产账本总额。
+
+本次只更新工作台即可，沿用现有数据目录与增量安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only hub
+```
+
+接口参考：[Binance 只读权限](https://developers.binance.com/docs/wallet/account/api-key-permission)、[仓位](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Position-Information-V3)、[实际收益流水](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Get-Income-History)；[Bybit API 权限](https://bybit-exchange.github.io/docs/v5/user/apikey-info)、[仓位](https://bybit-exchange.github.io/docs/v5/position)、[实际交易账本](https://bybit-exchange.github.io/docs/v5/account/transaction-log)。真实账户需要用户在页面填写只读凭据后验证；开发与浏览器验收使用合成账户数据。
 
 ## 原有三个项目的统一界面
 
