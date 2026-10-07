@@ -1,5 +1,8 @@
 const OPERATIONS = Object.freeze({ permissions: '只读权限检查', account: '账户检查', positions: '仓位读取', funding: '资金费读取' });
 const CODES = new Set(['upstream', 'transport', 'http', 'api', 'timeout', 'response_limit', 'permissions', 'account_mode', 'credentials', 'invalid_data', 'pagination', 'page_limit', 'record_limit', 'duplicate', 'duplicate_conflict', 'window_range', 'currency', 'range']);
+const FIELDS = new Set(['result', 'list', 'record', 'symbol', 'transactionTime', 'type', 'category', 'funding', 'id', 'nextPageCursor']);
+const VALUE_TYPES = Object.freeze({ missing: '缺失', null: '空值', string: '字符串', number: '数字', boolean: '布尔值', array: '数组', object: '对象' });
+const REASONS = Object.freeze({ format: '格式无效', empty: '为空', type: '类型不符', unexpected: '与请求不符', limit: '超过支持范围' });
 
 // Persist only bounded protocol metadata. Upstream messages, URLs and credentials
 // are never part of this schema, including when restoring old disk snapshots.
@@ -10,6 +13,11 @@ export function normalizeTradingDiagnostic(value) {
   const result = { version: 1, exchange: value.exchange, operation: value.operation, accountMode: value.accountMode, code: value.code };
   if (Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599) result.httpStatus = value.httpStatus;
   if (Number.isSafeInteger(value.providerCode)) result.providerCode = value.providerCode;
+  if (value.exchange === 'bybit' && value.operation === 'funding' && value.code === 'invalid_data' && FIELDS.has(value.field)) {
+    result.field = value.field;
+    if (typeof value.valueType === 'string' && Object.hasOwn(VALUE_TYPES, value.valueType)) result.valueType = value.valueType;
+    if (typeof value.reason === 'string' && Object.hasOwn(REASONS, value.reason)) result.reason = value.reason;
+  }
   return result;
 }
 
@@ -30,7 +38,9 @@ export function formatTradingDiagnostic(value) {
     case 'permissions': return `${name} API 无法确认只读权限，请使用只读密钥`;
     case 'account_mode': return exchange === 'bybit' ? 'Bybit 账户模式无效，请使用统一交易账户' : 'Binance 账户模式无效，请选择普通 U 本位或组合保证金';
     case 'credentials': return 'API Key 与 Secret 无效或为空';
-    case 'invalid_data': return `${label}返回的数据不完整或格式无效`;
+    case 'invalid_data': return diagnostic.field
+      ? `${label}返回字段 ${diagnostic.field} ${REASONS[diagnostic.reason] || '格式无效'}${diagnostic.valueType ? `（收到${VALUE_TYPES[diagnostic.valueType]}）` : ''}`
+      : `${label}返回的数据不完整或格式无效`;
     case 'pagination': return `${label}分页未取得进展，当前结果不完整`;
     case 'page_limit': return `${label}达到请求或分页上限，当前结果不完整`;
     case 'record_limit': return '资金费记录达到读取上限，当前结果不完整';

@@ -30,7 +30,11 @@ export class TradingExchangeError extends Error {
   constructor(message, code = 'upstream', diagnostic = null) { super(message); this.name = 'TradingExchangeError'; this.code = code; this.diagnostic = normalizeTradingDiagnostic(diagnostic); }
 }
 
-const invalidData = () => new TradingExchangeError('交易所返回的数据不完整或格式无效', 'invalid_data');
+function invalidData(field, value, reason = 'format') {
+  const error = new TradingExchangeError('交易所返回的数据不完整或格式无效', 'invalid_data');
+  if (field) Object.assign(error, { field, reason, valueType: value === undefined ? 'missing' : value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value });
+  return error;
+}
 function abortError() { return new DOMException('读取已取消', 'AbortError'); }
 function checkAbort(signal) { if (signal?.aborted) throw abortError(); }
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
@@ -51,14 +55,46 @@ function rowId(value) {
   if (typeof value !== 'string' || !value || value.length > 200 || !/^[A-Za-z0-9_.:-]+$/.test(value)) throw invalidData();
   return value;
 }
-function cursorOf(data) {
+function cursorOf(data, funding = false) {
+  // An explicit null is an absent next-page token, not an unread page.
+  if (funding && data.nextPageCursor === null) return '';
   if (data.nextPageCursor === undefined) return '';
-  if (typeof data.nextPageCursor !== 'string' || data.nextPageCursor.length > 2000 || /[\r\n\0]/.test(data.nextPageCursor)) throw invalidData();
+  if (typeof data.nextPageCursor !== 'string' || data.nextPageCursor.length > 2000 || /[\r\n\0]/.test(data.nextPageCursor)) throw invalidData(funding ? 'nextPageCursor' : undefined, data.nextPageCursor);
   return data.nextPageCursor;
 }
 function requireList(data, limit, category = false) {
   if (!object(data) || !Array.isArray(data.list) || data.list.length > limit || (category && data.category !== 'linear')) throw invalidData();
   return data.list;
+}
+function fundingList(data, limit) {
+  if (!object(data)) throw invalidData('result', data, 'type');
+  if (!Array.isArray(data.list)) throw invalidData('list', data.list, 'type');
+  if (data.list.length > limit) throw invalidData('list', data.list, 'limit');
+  return data.list;
+}
+function receiptField(field, value, parse) {
+  try { return parse(value); }
+  catch { throw invalidData(field, value, value === '' ? 'empty' : 'format'); }
+}
+function bybitReceiptId(value) {
+  if (typeof value === 'number' && Number.isSafeInteger(value)) value = String(value);
+  // The provider defines id as a string, not a locally generated identifier.
+  // Preserve opaque punctuation verbatim for deduplication, never in diagnostics.
+  if (typeof value !== 'string' || !value.trim() || value.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(value)) throw invalidData();
+  return value;
+}
+function bybitFundingAmount(value) {
+  if (typeof value !== 'string') return decimal(value);
+  if (value.length > 100) throw invalidData();
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d{1,3}))?$/.exec(value);
+  if (!match) throw invalidData();
+  const exponent = Number(match[4] || 0);
+  if (Math.abs(exponent) > 100) throw invalidData();
+  // Move the decimal point as text. Do not round through Number or toFixed.
+  const digits = match[2] + (match[3] || ''), point = match[2].length + exponent;
+  const integer = (point <= 0 ? '0' : digits.slice(0, point).padEnd(point, '0')).replace(/^0+(?=\d)/, '');
+  const fraction = (point <= 0 ? '0'.repeat(-point) + digits : digits.slice(point)).replace(/0+$/, '');
+  return decimal(`${match[1] === '-' ? '-' : ''}${integer}${fraction ? '.' + fraction : ''}`);
 }
 
 // Node >=24 provides the original numeric token to JSON.parse revivers. Keeping
@@ -137,20 +173,22 @@ function normalizePosition(exchange, row, symbol, accountMode) {
 }
 
 function normalizeReceipt(exchange, row, { symbol, start, end }) {
-  if (!object(row)) throw invalidData();
-  if (typeof row.symbol !== 'string' || !/^[A-Z0-9_-]{1,80}$/.test(row.symbol)) throw invalidData();
   const binance = exchange === 'binance';
-  const time = timestamp(binance ? row.time : row.transactionTime);
+  if (!object(row)) throw invalidData(binance ? undefined : 'record', row, 'type');
+  if (typeof row.symbol !== 'string' || !/^[A-Z0-9_-]{1,80}$/.test(row.symbol)) throw invalidData(binance ? undefined : 'symbol', row.symbol);
+  const time = binance ? timestamp(row.time) : receiptField('transactionTime', row.transactionTime, timestamp);
   // Requests use inclusive endTime=end-1. A record at end belongs to the next
   // window; records from adjacent windows cannot prove this window complete.
   // Validate even filtered Bybit symbols so an ignored time filter is visible.
   if (time < start || time >= end) throw new TradingExchangeError('资金费记录超出请求时间范围，当前结果不完整', 'window_range');
   if (exchange === 'bybit' && !SYMBOLS.includes(row.symbol)) return null;
-  if (symbol !== undefined && row.symbol !== symbol) throw invalidData();
-  if ((binance && row.incomeType !== 'FUNDING_FEE') || (!binance && (row.type !== 'SETTLEMENT' || row.category !== 'linear'))) throw invalidData();
+  if (symbol !== undefined && row.symbol !== symbol) throw invalidData(binance ? undefined : 'symbol', row.symbol, 'unexpected');
+  if (binance && row.incomeType !== 'FUNDING_FEE') throw invalidData();
+  if (!binance && row.type !== 'SETTLEMENT') throw invalidData('type', row.type, 'unexpected');
+  if (!binance && row.category !== 'linear') throw invalidData('category', row.category, 'unexpected');
   if ((binance ? row.asset : row.currency) !== 'USDT') throw new TradingExchangeError('原油资金费返回了非 USDT 币种，本次账本不完整', 'currency');
-  const value = amount(binance ? row.income : row.funding);
-  const identifier = rowId(binance ? row.tranId : row.id);
+  const value = binance ? amount(row.income) : receiptField('funding', row.funding, bybitFundingAmount);
+  const identifier = binance ? rowId(row.tranId) : receiptField('id', row.id, bybitReceiptId);
   // Ledger amounts already carry their cashflow sign: do not apply the current
   // position direction, funding rate, Bybit fee, cashFlow, or change fields.
   return { id: `${exchange}:${row.symbol}:${binance ? 'FUNDING_FEE:' : ''}${identifier}`, exchange, symbol: row.symbol, time: new Date(time).toISOString(), amount: value, currency: 'USDT' };
@@ -178,7 +216,8 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     const diagnostic = normalizeTradingDiagnostic(error?.diagnostic);
     if (diagnostic && diagnostic.exchange === exchange && diagnostic.accountMode === accountMode) return error;
     if (error instanceof TradingExchangeError) {
-      error.diagnostic = diagnosticFor(operation, accountMode, error.code);
+      error.diagnostic = diagnosticFor(operation, accountMode, error.code, { field: error.field, valueType: error.valueType, reason: error.reason });
+      if (error.diagnostic?.field) error.message = formatTradingDiagnostic(error.diagnostic);
       return error;
     }
     return errorFor(operation, accountMode, 'transport');
@@ -326,7 +365,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
       } else {
         for (const symbol of SYMBOLS) {
           const data = await request('funding', credentials, { accountType: 'UNIFIED', category: 'linear', baseCoin: BYBIT_BASE_COINS[symbol], currency: 'USDT', type: 'SETTLEMENT', startTime: String(start), endTime: String(end - 1), limit: '1' }, signal, undefined, accountMode);
-          for (const row of requireList(data, 1)) normalizeReceipt(exchange, row, { symbol, start, end });
+          for (const row of fundingList(data, 1)) normalizeReceipt(exchange, row, { symbol, start, end });
         }
       }
     } catch (error) { throw withDiagnostic(error, 'funding', accountMode); }
@@ -383,12 +422,12 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
             const cursors = new Set(), pages = new Set();
             do {
               const data = await request('funding', credentials, { accountType: 'UNIFIED', category: 'linear', baseCoin: BYBIT_BASE_COINS[symbol], currency: 'USDT', type: 'SETTLEMENT', ...timeParams, limit: '50', ...(cursor ? { cursor } : {}) }, signal, budget, accountMode);
-              const rows = requireList(data, 50);
+              const rows = fundingList(data, 50);
               const fingerprint = JSON.stringify(rows);
               if (rows.length && pages.has(fingerprint)) throw new TradingExchangeError('资金费分页未取得进展，当前结果不完整', 'pagination');
               if (rows.length) pages.add(fingerprint);
               for (const row of rows) collect(row, symbol, windowStart, windowEnd);
-              cursor = cursorOf(data);
+              cursor = cursorOf(data, true);
               if (cursor) {
                 if (cursors.has(cursor) || rows.length === 0) throw new TradingExchangeError('资金费分页未取得进展，当前结果不完整', 'pagination');
                 cursors.add(cursor);

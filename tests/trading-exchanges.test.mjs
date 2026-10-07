@@ -593,3 +593,107 @@ test('funding uses the exported record cap and never marks a capped window compl
   assert.equal(MAX_FUNDING_EVENTS, 50_000); assert.equal(result.events.length, MAX_FUNDING_EVENTS);
   assert.equal(result.complete, false); assert.deepEqual(result.coverage, []); assert.equal(result.diagnostic.code, 'record_limit');
 });
+
+test('Bybit accepts null final cursors for empty and populated pages without skipping either base coin', async () => {
+  for (const populated of [false, true]) {
+    const { client, calls } = harness('bybit', url => {
+      if (!url.pathname.endsWith('transaction-log')) return;
+      return { list: populated ? [settlement(url.searchParams.get('baseCoin') + 'USDT', NOW - 1)] : [], nextPageCursor: null };
+    });
+    const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, true); assert.equal(result.error, null);
+    assert.equal(result.events.length, populated ? 2 : 0);
+    assert.deepEqual(result.coverage, [{ start: NOW - DAY, end: NOW }]);
+    assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('transaction-log')).map(call => call.url.searchParams.get('baseCoin')), ['CL', 'BZ']);
+  }
+});
+
+test('Bybit keeps opaque receipt IDs intact and deduplicates them across pages', async () => {
+  const id = 'fixture/settlement+entry=7,part%2F@a';
+  const { client } = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return;
+    const row = settlement(url.searchParams.get('baseCoin') + 'USDT', NOW - 1, { id });
+    return { list: [row], nextPageCursor: url.searchParams.has('cursor') ? null : 'next' };
+  });
+  // A repeat-only page is still invalid; use an additional record to establish progress.
+  const first = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+  assert.equal(first.complete, false); assert.equal(first.diagnostic.code, 'pagination');
+  assert.equal(first.events[0].id, `bybit:CLUSDT:${id}`);
+  const complete = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return;
+    const row = settlement(url.searchParams.get('baseCoin') + 'USDT', NOW - 1, { id });
+    return { list: url.searchParams.has('cursor') ? [row, { ...row, id: id + '/2' }] : [row], nextPageCursor: url.searchParams.has('cursor') ? null : 'next' };
+  });
+  const result = await complete.client.funding(credentials, { start: NOW - DAY, end: NOW });
+  assert.equal(result.complete, true); assert.equal(result.events.length, 4);
+  assert.equal(addDecimals(result.events.map(row => row.amount)), '0.4');
+  assert.ok(result.events.every(row => row.id.includes(id)));
+});
+
+test('Bybit expands scientific funding strings exactly without changing the shared decimal contract', async () => {
+  const cases = [['1e-8', '0.00000001'], ['-2.5E-7', '-0.00000025'], ['+3E2', '300'], ['1.2300e+3', '1230'], ['0E-18', '0'], ['0001e-18', '0.000000000000000001'], ['12345678901234567890123456789e-18', '12345678901.234567890123456789'], ['1.00000000000000000000000', '1']];
+  for (const [input, expected] of cases) {
+    const { client } = harness('bybit', url => url.pathname.endsWith('transaction-log') ? { list: [settlement(url.searchParams.get('baseCoin') + 'USDT', NOW - 1, { funding: input })], nextPageCursor: null } : undefined);
+    const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, true, input);
+    assert.deepEqual(result.events.map(row => row.amount), [expected, expected]);
+  }
+  assert.throws(() => decimal('1e-8'));
+});
+
+test('Bybit still rejects missing or imprecise funding amounts and names only the failing field', async () => {
+  for (const input of [undefined, null, '', ' ', false, 0.1, '1e-19', '1e100', '1e9999999', 'NaN', 'Infinity', '1.2.3', credentials.apiSecret]) {
+    const { client } = harness('bybit', url => url.pathname.endsWith('transaction-log') ? { list: [settlement('CLUSDT', NOW - 1, { funding: input })], nextPageCursor: null } : undefined);
+    const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, false); assert.deepEqual(result.events, []); assert.deepEqual(result.coverage, []);
+    assert.equal(result.diagnostic.field, 'funding'); assert.equal(result.diagnostic.code, 'invalid_data');
+    assert.match(result.error, /字段 funding/); assert.equal(result.error.includes(credentials.apiSecret), false);
+    assert.equal(result.error, formatTradingDiagnostic(JSON.parse(JSON.stringify(result.diagnostic))));
+  }
+});
+
+test('Bybit malformed ledger shapes report bounded field and type diagnostics without response contents', async () => {
+  const secret = credentials.apiSecret;
+  const cases = [
+    ['list', { list: secret }, 'string'],
+    ['list', { list: null }, 'null'],
+    ['list', { list: Array.from({ length: 51 }, () => ({})) }, 'array'],
+    ['record', { list: [null] }, 'null'],
+    ['symbol', { list: [settlement(null, NOW - 1)] }, 'null'],
+    ['transactionTime', { list: [settlement('CLUSDT', NOW - 1, { transactionTime: secret })] }, 'string'],
+    ['type', { list: [settlement('CLUSDT', NOW - 1, { type: 'TRADE' })] }, 'string'],
+    ['category', { list: [settlement('CLUSDT', NOW - 1, { category: undefined })] }, 'missing'],
+    ['id', { list: [settlement('CLUSDT', NOW - 1, { id: secret + '\n' })] }, 'string'],
+    ['id', { list: [settlement('CLUSDT', NOW - 1, { id: 'x'.repeat(201) })] }, 'string'],
+    ['nextPageCursor', { list: [], nextPageCursor: { secret } }, 'object'],
+  ];
+  for (const [field, response, valueType] of cases) {
+    const { client } = harness('bybit', url => url.pathname.endsWith('transaction-log') ? response : undefined);
+    const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, false); assert.deepEqual(result.coverage, []);
+    assert.equal(result.diagnostic.field, field); assert.equal(result.diagnostic.valueType, valueType);
+    assert.ok(result.error.includes(`字段 ${field}`)); assert.equal(result.error.includes(secret), false);
+    assert.equal(JSON.stringify(result.diagnostic).includes(secret), false);
+  }
+});
+
+test('Bybit verification uses the same amount compatibility and field diagnostics as funding refresh', async () => {
+  for (const funding of ['-1.25E-8', null]) {
+    const { client } = harness('bybit', url => {
+      if (url.pathname.endsWith('position/list')) return { category: 'linear', list: [] };
+      if (url.pathname.endsWith('transaction-log')) return { list: [settlement(url.searchParams.get('baseCoin') + 'USDT', NOW - 1, { funding })], nextPageCursor: null };
+    });
+    if (funding === null) await assert.rejects(client.verify(credentials), error => error.diagnostic.field === 'funding' && error.message.includes('字段 funding'));
+    else assert.deepEqual((await client.verify(credentials)).positions, []);
+  }
+});
+
+test('field diagnostics accept only fixed metadata for Bybit funding format failures', () => {
+  const base = { version: 1, exchange: 'bybit', operation: 'funding', accountMode: 'unified', code: 'invalid_data' };
+  const fields = { field: 'funding', valueType: 'string', reason: 'empty' };
+  assert.deepEqual(normalizeTradingDiagnostic({ ...base, ...fields, value: credentials.apiSecret, message: credentials.apiSecret }), { ...base, ...fields });
+  assert.match(formatTradingDiagnostic({ ...base, ...fields }), /字段 funding 为空（收到字符串）/);
+  for (const field of ['__proto__', 'constructor', credentials.apiSecret, { toString: 0 }]) assert.deepEqual(normalizeTradingDiagnostic({ ...base, ...fields, field }), base);
+  for (const extras of [{ reason: credentials.apiSecret, valueType: credentials.apiSecret }, { reason: { toString: 0 }, valueType: { toString: 0 } }]) assert.deepEqual(normalizeTradingDiagnostic({ ...base, field: 'funding', ...extras }), { ...base, field: 'funding' });
+  assert.deepEqual(normalizeTradingDiagnostic({ ...base, ...fields, code: 'api' }), { ...base, code: 'api' });
+});
