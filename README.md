@@ -30,13 +30,13 @@ Asset 导入是一次性复制，之后两边独立管理；Asset 更换或删�
 
 仓位、资金费各自保留采集时间；仓位上的交易所更新时间不当作本次读取时间。断开连接会删除该交易账户的凭据及当前缓存，重新连接后重新回补；替换密钥后旧请求不能写入新连接。交易模块不重复计入资产账本总额。
 
-本次只更新工作台即可，沿用现有数据目录与增量安装：
+启用 Asset 导入时，两端一起更新，沿用现有数据目录与增量安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only hub
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub
 ```
 
-接口参考：[Binance 只读权限](https://developers.binance.com/docs/wallet/account/api-key-permission)、[仓位](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Position-Information-V3)、[实际收益流水](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Get-Income-History)；[Bybit API 权限](https://bybit-exchange.github.io/docs/v5/user/apikey-info)、[仓位](https://bybit-exchange.github.io/docs/v5/position)、[实际交易账本](https://bybit-exchange.github.io/docs/v5/account/transaction-log)。真实账户需要用户在页面填写只读凭据后验证；开发与浏览器验收使用合成账户数据。
+接口参考：[Binance 只读权限](https://developers.binance.com/docs/wallet/account/api-key-permission)、[仓位](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Position-Information-V3)、[实际收益流水](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Get-Income-History)；[Bybit API 权限](https://bybit-exchange.github.io/docs/v5/user/apikey-info)、[仓位](https://bybit-exchange.github.io/docs/v5/position)、[实际交易账本](https://bybit-exchange.github.io/docs/v5/account/transaction-log)。真实账户需要用户在页面填写或从 Asset 导入只读凭据后验证；开发与浏览器验收使用合成账户数据。
 
 ## 原有三个项目的统一界面
 
