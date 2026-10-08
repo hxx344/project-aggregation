@@ -138,7 +138,7 @@ test('CrossEx and Variational proxy presets keep paper metrics outside the real 
   const projects = (await f.request('/api/projects')).data.projects;
   assert.deepEqual(projects.map(project => project.id), ['aster', 'monitor', 'asset', 'crossex', 'variational']);
   assert.match(projects[3].revision, /^[a-f0-9]{64}$/);
-  assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false, revision: projects[3].revision });
+  assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '跨交易所永续手动实盘与持仓观察', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false, revision: projects[3].revision });
   assert.equal(projects[4].description, 'Lighter QQQ / Variational US100 对冲剥头皮模拟');
   const asset = await f.app.check('asset');
   const simulation = await f.app.check('crossex');
@@ -180,6 +180,20 @@ test('the CrossEx migration preserves an existing same-id project, credentials a
   await f.reopen(db => { saved = db.prepare("SELECT * FROM projects WHERE id='crossex'").get(); db.exec("DELETE FROM settings WHERE key='seeded-crossex-v1'"); });
   assert.deepEqual((await f.request('/api/overview')).data.projects.find(item => item.project.id === 'crossex'), before);
   await f.reopen(db => { assert.deepEqual(db.prepare("SELECT * FROM projects WHERE id='crossex'").get(), saved); });
+});
+
+test('CrossEx live description migration only replaces the old default and preserves connection data', async t => {
+  const f = await fixture(t); await f.login();
+  await f.request('/api/projects/crossex', { method: 'PUT', body: { description: '同币种跨交易所永续价差套利模拟', apiUrl: 'http://127.0.0.1:9320', password: 'crossex-keep-this-password' } });
+  let credentials;
+  await f.reopen(db => { credentials = db.prepare("SELECT credentials FROM projects WHERE id='crossex'").get().credentials; db.exec("DELETE FROM settings WHERE key='updated-crossex-live-description-v1'"); });
+  const project = (await f.request('/api/projects')).data.projects.find(p => p.id === 'crossex');
+  assert.equal(project.description, '跨交易所永续手动实盘与持仓观察');
+  assert.equal(project.apiUrl, 'http://127.0.0.1:9320');
+  await f.reopen(db => assert.equal(db.prepare("SELECT credentials FROM projects WHERE id='crossex'").get().credentials, credentials));
+  await f.request('/api/projects/crossex', { method: 'PUT', body: { description: '我的自定义交易终端' } });
+  await f.reopen(db => db.exec("DELETE FROM settings WHERE key='updated-crossex-live-description-v1'"));
+  assert.equal((await f.request('/api/projects')).data.projects.find(p => p.id === 'crossex').description, '我的自定义交易终端');
 });
 
 test('CrossEx migration respects the 30-project limit and does not retry after a full installation frees a slot', async t => {

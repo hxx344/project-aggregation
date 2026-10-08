@@ -27,7 +27,7 @@ const defaults = [
   { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:8765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
   { id: 'monitor', name: 'Market Monitor', description: '原油价差与市场监控', category: 'monitoring', adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=oil', apiUrl: 'http://127.0.0.1:3000', staleAfterSeconds: 120 },
   { id: 'asset', name: 'Asset Ledger', description: '资产账本、持有金额与历史变化', category: 'assets', adapter: 'asset', url: 'http://127.0.0.1:5678', apiUrl: 'http://127.0.0.1:5678', staleAfterSeconds: 900 },
-  { id: 'crossex', name: 'Gate CrossEx', description: '同币种跨交易所永续价差套利模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
+  { id: 'crossex', name: 'Gate CrossEx', description: '跨交易所永续手动实盘与持仓观察', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
   { id: 'variational', name: 'Variational Grid', description: 'Lighter QQQ / Variational US100 对冲剥头皮模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:9876', apiUrl: 'http://127.0.0.1:9876', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
 ].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));
 
@@ -81,6 +81,19 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       // Keep existing connections intact; the marker also preserves a later user deletion.
       db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
       db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run(marker, '1');
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  if (!getSetting('updated-crossex-live-description-v1')) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = db.prepare('SELECT json FROM projects WHERE id=?').get('crossex');
+      const project = row ? JSON.parse(row.json) : null;
+      if (project?.description === '同币种跨交易所永续价差套利模拟') {
+        project.description = defaults.find(item => item.id === 'crossex').description;
+        db.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'crossex');
+      }
+      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-crossex-live-description-v1', '1');
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }

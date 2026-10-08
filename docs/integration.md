@@ -30,7 +30,7 @@ Gate CrossEx 是第四个预置入口：`id=crossex`、`category=trading`、`ada
 
 旧数据库通过独立 `seeded-crossex-v1` 标记在事务内一次性 `INSERT OR IGNORE` 补充入口，不改写同标识的已有项目、凭据或快照，也不恢复已删除的旧预置。删除 CrossEx 后重启不再添加；升级时已满 30 个项目会记录迁移完成并跳过添加，之后可腾出名额手动接入。
 
-CrossEx 第一版仅模拟同币种跨交易所永续价差套利。Monitor 作为发现数据源，在 CrossEx 页面配置来源地址和来源凭据；这些凭据与工作台保存的 CrossEx 登录凭据独立。模拟余额、收益及趋势只属于该标准项目，不进入 Asset Ledger 资产总额与曲线。
+CrossEx 通过 Gate CrossEx 连接真实账户，仅支持手动预览确认开平仓，账户持仓与订单在原页面观察。Monitor 作为发现数据源，在 CrossEx 页面配置来源地址和凭据；这些凭据、Gate API 凭据与工作台保存的 CrossEx 网页登录信息各自独立。CrossEx 账户余额及盈亏不重复进入 Asset Ledger 资产总额与曲线。旧模拟数据不再运行或展示；工作台仅更新旧默认项目说明，保留自定义说明与全部连接配置。
 
 ## Variational Grid 预置接入
 
