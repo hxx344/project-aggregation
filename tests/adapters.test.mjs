@@ -283,6 +283,13 @@ test('asset freshness follows dynamic mode rows and preserves manual valuation d
   assert.equal(oldBinance.updatedAt, old); assert.equal(oldBinance.freshness, undefined);
   const failedBinance = await read([{ ...dynamic, mode: 'binance', error: '同步失败' }]);
   assert.equal(failedBinance.partial, true); assert.doesNotMatch(failedBinance.message, /未识别/);
+  const okx = await read([manual, { ...dynamic, id: 'okx', project: 'OKX', mode: 'okx' }]);
+  assert.equal(okx.partial, false); assert.equal(okx.updatedAt, now); assert.equal(okx.freshness, undefined);
+  assert.equal(okx.metrics.find(metric => metric.key === 'ledger_total').value, 150);
+  const oldOkx = await read([{ ...dynamic, mode: 'okx', updatedAt: old }]);
+  assert.equal(oldOkx.updatedAt, old); assert.equal(oldOkx.freshness, undefined);
+  const failedOkx = await read([{ ...dynamic, mode: 'okx', error: '同步失败' }]);
+  assert.equal(failedOkx.partial, true); assert.doesNotMatch(failedOkx.message, /未识别/);
   const staticOnly = await read([manual]);
   assert.equal(staticOnly.freshness, 'static'); assert.equal(staticOnly.updatedAt, old); assert.match(staticOnly.message, /静态估值/);
   const unknown = await read([{ ...manual, mode: 'new-source' }]);

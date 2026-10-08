@@ -4,6 +4,8 @@
 
 工作台独立运行，通过一个 SSH 转发端口查看摘要并打开五个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量、CrossEx 的账户余额与持仓盈亏均不会重复计入资产。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
 
+Asset 支持 OKX 只读账户资产：在 Asset 的“交易所连接”填写国际站 API Key、Secret 和 Passphrase，验证后按 OKX 返回的美元总资产估值入账，并展示账户分项。工作台同步识别 OKX 来源，保留其源时间及失败旧值。升级两端可执行 `curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
+
 ## 首版提供什么
 
 - 总览：资产账本摘要与历史曲线、交易账户和占用保证金、原油价差、连接与数据时效。
