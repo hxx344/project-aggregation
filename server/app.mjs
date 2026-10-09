@@ -17,6 +17,7 @@ import { createTradingImporter } from './trading-import.mjs';
 import { createTradingExecution } from './trading-execution.mjs';
 import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
+import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -46,7 +47,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
   mkdirSync(resolvedData, { recursive: true, mode: 0o700 });
@@ -116,6 +117,10 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
   const trading = createTrading({ db, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs });
   const execution = createTradingExecution({ db, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, isSessionActive: id => !!db.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
+  const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
+    readMaintenance: () => getSetting('updates-maintenance') === '1',
+    writeMaintenance: active => db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
+  });
   const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
   const getProjects = () => db.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
@@ -279,13 +284,30 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
     if (pathname === '/api/logout' && req.method === 'POST') { db.prepare('DELETE FROM sessions WHERE id=?').run(current.id); publishOverview(); send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` }); return; }
+    if (pathname === '/api/system/updates' || pathname.startsWith('/api/system/updates/')) {
+      if (url.search) throw new HttpError(400, '更新接口不接受查询参数');
+      if (pathname === '/api/system/updates' && req.method === 'GET') { send(res, 200, await updates.status()); return; }
+      const action = pathname === '/api/system/updates/check' ? 'check' : pathname === '/api/system/updates/apply' ? 'apply' : null;
+      if (action && req.method === 'POST') {
+        const body = await bodyOf(req); validateUpdateBody(action, body);
+        const authorize = () => {
+          const latest = session(req);
+          if (!latest || latest.id !== current.id) throw new HttpError(401, '登录已失效，请重新登录');
+          sameOrigin(req);
+          if (req.headers['x-csrf-token'] !== latest.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试');
+        };
+        authorize();
+        send(res, 202, action === 'check' ? await updates.check() : await updates.apply(body.planId, authorize)); return;
+      }
+      throw new HttpError(404, '更新接口不存在');
+    }
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && req.method === 'GET') { send(res, 200, execution.state()); return; }
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
-      if (account && req.method === 'PUT') { send(res, 200, await execution.connect(account[1], await bodyOf(req), current.id)); return; }
-      if (account && req.method === 'DELETE') { send(res, 200, execution.disconnect(account[1], await bodyOf(req), current.id)); return; }
-      if (pathname === '/api/trading/execution/preview' && req.method === 'POST') { send(res, 200, await execution.preview(await bodyOf(req), current.id)); return; }
-      if (pathname === '/api/trading/execution/jobs' && req.method === 'POST') { send(res, 202, execution.start(await bodyOf(req), current.id)); return; }
+      if (account && req.method === 'PUT') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.connect(account[1], body, current.id))); return; }
+      if (account && req.method === 'DELETE') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.disconnect(account[1], body, current.id))); return; }
+      if (pathname === '/api/trading/execution/preview' && req.method === 'POST') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.preview(body, current.id))); return; }
+      if (pathname === '/api/trading/execution/jobs' && req.method === 'POST') { const body = await bodyOf(req); send(res, 202, await updates.withExecutionEntry(() => execution.start(body, current.id))); return; }
       const job = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/(stop|reconcile)$/);
       if (job && req.method === 'POST') { const body = await bodyOf(req); send(res, 200, job[2] === 'stop' ? execution.stop(job[1], body, current.id) : await execution.reconcile(job[1], body, current.id)); return; }
       throw new HttpError(404, '实盘执行接口不存在');
@@ -382,7 +404,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (!existsSync(filename) || !statSync(filename).isFile()) { if (path.extname(decoded)) throw new HttpError(404, '文件不存在'); filename = path.join(distDir, 'index.html'); }
       if (!existsSync(filename)) { send(res, 503, { error: '前端尚未构建，请先执行 npm run build' }); return; }
       await serveStatic(req, res, filename, { 'Content-Type': mime[path.extname(filename)] || 'application/octet-stream', 'Cache-Control': path.basename(filename) === 'index.html' ? 'no-cache' : 'public, max-age=3600' });
-    } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError ? error.status : 500, { error: error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
+    } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError || error instanceof UpdateError ? error.status : 500, { error: error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError || error instanceof UpdateError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
   });
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;

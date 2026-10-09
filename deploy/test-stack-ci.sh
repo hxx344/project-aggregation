@@ -20,6 +20,7 @@ new_run() {
 ci_release_resolve() {
   [[ ! -f "$fixture/no-manifest-${1##*/}" ]] || return 1
   CI_RELEASE_REPOSITORY=$1
+  CI_RELEASE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   CI_RELEASE_TAG=deploy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   CI_RELEASE_FILE=fixture.tar.gz
   mkdir -p "$2"
@@ -45,8 +46,9 @@ curl() {
     return
   fi
   for item in "${STACK_ORDER[@]}"; do
-    [[ "$url" != "https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$item]}/main/${STACK_PATHS[$item]}" ]] || break
+    [[ "$url" != "https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$item]}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/${STACK_PATHS[$item]}" ]] || break
   done
+  [[ "$url" == "https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$item]}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/${STACK_PATHS[$item]}" ]] || return 23
   cat > "$output" <<SCRIPT
 #!/usr/bin/env bash
 set -Eeuo pipefail

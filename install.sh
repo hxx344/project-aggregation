@@ -12,6 +12,13 @@ REPOSITORY=https://github.com/hxx344/project-aggregation.git
 BRANCH=main
 NODE_VERSION=24.15.0
 INSTALL_REVISION=2
+UPDATER_DIR=/usr/local/lib/project-aggregation-updater
+UPDATER_STATE_DIR=/var/lib/project-aggregation-updater
+UPDATER_RUN_DIR=/run/project-aggregation-updater
+UPDATER_SERVICE=project-aggregation-updater
+UPDATER_WORKER_SERVICE=project-aggregation-update-worker
+UPDATER_UNIT_FILE=/etc/systemd/system/project-aggregation-updater.service
+UPDATER_WORKER_UNIT_FILE=/etc/systemd/system/project-aggregation-update-worker.service
 PROJECT_DEPLOY_TESTS=${PROJECT_DEPLOY_TESTS-0}
 PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-ci}
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
@@ -265,17 +272,17 @@ rollback() {
 }
 ensure_tools() {
   local missing=() tool
-  local tools=(curl xz)
-  if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then tools+=(python3); else tools+=(git); fi
+  local tools=(curl xz python3)
+  if [[ "$PROJECT_DEPLOY_MODE" == source ]]; then tools+=(git); fi
   for tool in "${tools[@]}"; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
+    if ! command -v "$tool" >/dev/null 2>&1 || [[ "$tool" == python3 && ! -x /usr/bin/python3 ]]; then
       case "$tool" in xz) missing+=(xz-utils) ;; *) missing+=("$tool") ;; esac
     fi
   done
   [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
   if ! command -v flock >/dev/null 2>&1 || ! command -v runuser >/dev/null 2>&1; then missing+=(util-linux); fi
   if ((${#missing[@]})); then
-    command -v apt-get >/dev/null 2>&1 || fail '缺少依赖且没有 apt-get；请安装 curl git xz-utils ca-certificates util-linux 后重试。'
+    command -v apt-get >/dev/null 2>&1 || fail '缺少依赖且没有 apt-get；请安装 curl git xz-utils python3 ca-certificates util-linux 后重试。'
     log "安装缺少的系统依赖：${missing[*]}"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
@@ -486,6 +493,223 @@ prepare_ci_application() {
   log 'CI 部署包准备完成；服务器跳过 npm 安装、类型检查、测试及前端构建。'
 }
 
+# Every helper path is a fixed installer constant, never a client/environment input.
+# Root-owned sticky ancestors allow isolated /tmp fixtures without allowing their
+# children to be replaced by another user. No symlink is followed, including parents.
+updater_safe_path() {
+  local path=$1 cursor=$1 mode owner
+  [[ "$path" =~ ^/[A-Za-z0-9_./-]+$ && "$path" != / && "$path" != *'/../'* && "$path" != */.. &&
+     "$path" != *'/./'* && "$path" != */. && "$path" != *'//'* ]] || { fail "更新服务路径无效：$path"; return 1; }
+  while [[ "$cursor" != / ]]; do
+    [[ ! -L "$cursor" ]] || { fail "更新服务路径不能包含符号链接：$cursor"; return 1; }
+    if [[ -e "$cursor" ]]; then
+      owner=$(stat -c %u "$cursor") || return 1
+      mode=$(stat -c %a "$cursor") || return 1
+      [[ "$owner" == 0 ]] || { fail "更新服务路径必须由 root 拥有：$cursor"; return 1; }
+      if (( (8#$mode & 0022) != 0 )); then
+        [[ "$cursor" != "$path" && -d "$cursor" ]] && (( (8#$mode & 01000) != 0 )) || {
+          fail "更新服务路径不能允许其他用户写入：$cursor"; return 1;
+        }
+      fi
+    fi
+    cursor=${cursor%/*}
+    [[ -n "$cursor" ]] || cursor=/
+  done
+}
+updater_managed_directory() {
+  local directory=$1
+  updater_safe_path "$directory" || return 1
+  if [[ -e "$directory" ]]; then
+    [[ -d "$directory" && -f "$directory/.managed-install" && ! -L "$directory/.managed-install" ]] || {
+      fail "更新服务目录已存在且不属于本安装器：$directory"; return 1;
+    }
+    updater_safe_path "$directory/.managed-install" || return 1
+    [[ $(cat "$directory/.managed-install") == project-aggregation-updater-v1 ]] || {
+      fail "更新服务目录的管理标记不匹配：$directory"; return 1;
+    }
+  fi
+}
+updater_managed_unit() {
+  local unit=$1 name=$2 fragment dropins
+  updater_safe_path "$unit" || return 1
+  if [[ -e "$unit" ]]; then
+    [[ -f "$unit" ]] && grep -qx '# Managed by project-aggregation updater installer' "$unit" || {
+      fail "同名更新服务已存在且不属于本安装器：$unit"; return 1;
+    }
+  fi
+  fragment=$(systemctl show --property=FragmentPath --value "$name" 2>/dev/null) || return 1
+  dropins=$(systemctl show --property=DropInPaths --value "$name" 2>/dev/null) || return 1
+  [[ -z "$fragment" || ( "$fragment" == "$unit" && -f "$unit" ) ]] || {
+    fail "同名更新服务来自其他位置，已停止覆盖：$name"; return 1;
+  }
+  [[ -z "$dropins" ]] || { fail "更新服务存在额外覆盖配置，已停止覆盖：$name"; return 1; }
+}
+write_updater_units() {
+  cat > "$work_dir/updater.service" <<EOF || return 1
+# Managed by project-aggregation updater installer
+[Unit]
+Description=Project Aggregation stable update control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=$SERVICE_USER
+ExecStart=/usr/bin/python3 -I $UPDATER_DIR/updater.py serve
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RuntimeDirectory=project-aggregation-updater
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=$UPDATER_STATE_DIR $UPDATER_RUN_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$work_dir/updater-worker.service" <<EOF
+# Managed by project-aggregation updater installer
+[Unit]
+Description=Project Aggregation stable update worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I $UPDATER_DIR/updater.py run
+TimeoutStartSec=infinity
+UMask=0077
+PrivateTmp=true
+EOF
+}
+ensure_update_service() {
+  local source_release=$1 source file name directory mode temporary fingerprint unit_changed=0 code_changed=0 existing=0
+  source="$source_release/server/update-service"
+  if [[ ! -e "$source" && ! -L "$source" ]]; then
+    log '当前发布包尚未包含在线更新服务，跳过注册。'
+    return 0
+  fi
+  updater_safe_path "$source" || return 1
+  [[ -d "$source" ]] || { fail '发布包中的在线更新服务目录无效。'; return 1; }
+  [[ -f "$source_release/.managed-release" ]] || { fail '在线更新服务必须来自已验证的发布目录。'; return 1; }
+  updater_safe_path "$source_release/.managed-release" || return 1
+  for name in updater.py registry.py releases.py; do
+    [[ -s "$source/$name" && -f "$source/$name" ]] || { fail "发布包缺少在线更新文件：$name"; return 1; }
+  done
+  local -a files=()
+  for file in "$source/"*.py; do
+    name=${file##*/}
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*\.py$ && -f "$file" ]] || { fail '在线更新服务包含无效程序文件。'; return 1; }
+    updater_safe_path "$file" || return 1
+    files+=("$file")
+  done
+  updater_managed_directory "$UPDATER_DIR" || return 1
+  updater_managed_directory "$UPDATER_STATE_DIR" || return 1
+  updater_safe_path "$UPDATER_DIR/.service-ready" || return 1
+  [[ ! -e "$UPDATER_DIR/.service-ready" || -f "$UPDATER_DIR/.service-ready" ]] || { fail '更新服务完成记录不是普通文件。'; return 1; }
+  [[ ! -d "$UPDATER_DIR" ]] || existing=1
+  updater_safe_path "$UPDATER_RUN_DIR" || return 1
+  if [[ -e "$UPDATER_RUN_DIR" ]]; then
+    [[ -d "$UPDATER_RUN_DIR" ]] || { fail '在线更新运行目录不是普通目录。'; return 1; }
+    # systemd recreates /run after a reboot. An existing managed installation may
+    # have only its own socket here; a first install must not claim another path.
+    (( existing )) || { fail "在线更新运行目录已存在：$UPDATER_RUN_DIR"; return 1; }
+    for file in "$UPDATER_RUN_DIR/"* "$UPDATER_RUN_DIR/".[!.]*; do
+      [[ -e "$file" || -L "$file" ]] || continue
+      [[ "${file##*/}" == control.sock && -S "$file" && ! -L "$file" && $(stat -c %u "$file") == 0 ]] || {
+        fail "在线更新运行目录包含未知文件：$file"; return 1;
+      }
+    done
+  fi
+  updater_managed_unit "$UPDATER_UNIT_FILE" "$UPDATER_SERVICE" || return 1
+  updater_managed_unit "$UPDATER_WORKER_UNIT_FILE" "$UPDATER_WORKER_SERVICE" || return 1
+  for file in "${files[@]}"; do
+    name=${file##*/}
+    updater_safe_path "$UPDATER_DIR/$name" || return 1
+    [[ ! -e "$UPDATER_DIR/$name" || -f "$UPDATER_DIR/$name" ]] || { fail "更新程序目标不是普通文件：$name"; return 1; }
+    if ! cmp -s "$file" "$UPDATER_DIR/$name"; then code_changed=1; fi
+  done
+  [[ -x /usr/bin/python3 ]] || { fail '在线更新服务需要 /usr/bin/python3。'; return 1; }
+  if (( code_changed )); then
+    /usr/bin/python3 -I - "${files[@]}" <<'UPDATER_CHECK_PY' || return 1
+from pathlib import Path
+import sys
+for name in sys.argv[1:]:
+    compile(Path(name).read_bytes(), name, 'exec')
+UPDATER_CHECK_PY
+  fi
+  write_updater_units || return 1
+  fingerprint=$(sha256sum "${files[@]}" "$work_dir/updater.service" "$work_dir/updater-worker.service" | sed 's|  .*/|  |' | hash) || return 1
+  # A previous attempt may have copied files before service activation failed.
+  # Its missing/stale receipt forces reconciliation instead of claiming a no-op.
+  if [[ ! -f "$UPDATER_DIR/.service-ready" || $(cat "$UPDATER_DIR/.service-ready") != "$fingerprint" ]]; then
+    code_changed=1
+    unit_changed=1
+  fi
+  for directory in "$UPDATER_DIR" "$UPDATER_STATE_DIR"; do
+    mode=0755
+    [[ "$directory" != "$UPDATER_STATE_DIR" ]] || mode=0700
+    install -d -m "$mode" -o root -g root "$directory" || return 1
+    if [[ ! -e "$directory/.managed-install" ]]; then
+      printf 'project-aggregation-updater-v1\n' > "$directory/.managed-install" || return 1
+      chmod 0600 "$directory/.managed-install" || return 1
+    fi
+  done
+  install -d -m 0750 -o root -g "$SERVICE_USER" "$UPDATER_RUN_DIR" || return 1
+  for file in "${files[@]}"; do
+    name=${file##*/}
+    if ! cmp -s "$file" "$UPDATER_DIR/$name"; then
+      temporary=$(mktemp "$UPDATER_DIR/.incoming.XXXXXXXX") || return 1
+      if ! install -m 0644 -o root -g root "$file" "$temporary" || ! mv -f -- "$temporary" "$UPDATER_DIR/$name"; then
+        rm -f -- "$temporary"
+        return 1
+      fi
+    fi
+  done
+  if ! cmp -s "$work_dir/updater.service" "$UPDATER_UNIT_FILE"; then
+    install -m 0644 -o root -g root "$work_dir/updater.service" "$UPDATER_UNIT_FILE" || return 1
+    unit_changed=1
+  fi
+  if ! cmp -s "$work_dir/updater-worker.service" "$UPDATER_WORKER_UNIT_FILE"; then
+    install -m 0644 -o root -g root "$work_dir/updater-worker.service" "$UPDATER_WORKER_UNIT_FILE" || return 1
+    unit_changed=1
+  fi
+  if (( unit_changed )); then systemctl daemon-reload || return 1; fi
+  if ! systemctl is-enabled --quiet "$UPDATER_SERVICE"; then systemctl enable "$UPDATER_SERVICE" >/dev/null || return 1; fi
+  if systemctl is-active --quiet "$UPDATER_SERVICE"; then
+    if (( code_changed || unit_changed )); then systemctl restart "$UPDATER_SERVICE" || return 1; fi
+  else
+    systemctl start "$UPDATER_SERVICE" || return 1
+  fi
+  systemctl is-active --quiet "$UPDATER_SERVICE" || { fail '在线更新服务未能启动，工作台已安装的健康版本保持运行。'; return 1; }
+  if [[ ! -f "$UPDATER_DIR/.service-ready" || $(cat "$UPDATER_DIR/.service-ready") != "$fingerprint" ]]; then
+    temporary=$(mktemp "$UPDATER_DIR/.ready.XXXXXXXX") || return 1
+    if ! printf '%s\n' "$fingerprint" > "$temporary" || ! chmod 0600 "$temporary" || ! mv -f -- "$temporary" "$UPDATER_DIR/.service-ready"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+  fi
+  if (( code_changed || unit_changed )); then
+    log '在线更新服务已更新；执行任务服务保持独立，未停止或重启正在执行的更新。'
+  else
+    log '在线更新服务内容未变化，跳过复制、服务配置重载和重启；已确认控制服务运行。'
+  fi
+}
+finish_update_service() {
+  if ! ensure_update_service "$1"; then
+    fail '工作台已健康运行，但在线更新服务安装未完成；请修复以上错误后重新执行安装命令。'
+    return 1
+  fi
+}
+
 write_unit() {
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
@@ -604,6 +828,7 @@ main() {
         "$deployed_state" == "$commit $deployment_key" ]] && healthy; then
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
+    finish_update_service "$old_release"
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -625,6 +850,7 @@ main() {
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
     log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
+    finish_update_service "$release"
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -647,6 +873,7 @@ main() {
   atomic_record "$release/.install-ready" "$application_key"
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"
   if [[ -n "$previous_release" && "$previous_release" != "$release" ]]; then atomic_link "$previous_release" "$APP_DIR/previous"; fi
+  finish_update_service "$release"
   prune_releases
   rm -rf -- "$work_dir"
   trap - ERR INT TERM

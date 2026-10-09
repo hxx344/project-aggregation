@@ -295,8 +295,18 @@ stack_cache_valid() {
 
 stack_fetch() {
   local item=$1 directory="$STACK_CACHE/$1" staged="$stack_run/$1.download" code
-  local url="https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$1]}/main/${STACK_PATHS[$1]}"
+  local revision=main url
   local -a conditional=()
+  if [[ "$stack_mode" == ci ]]; then
+    ci_release_resolve "hxx344/${STACK_REPOS[$item]}" "$stack_run/$item.release" || return 1
+    revision=$CI_RELEASE_COMMIT
+    curl --fail --silent --show-error --head --location --proto '=https' --tlsv1.2 \
+      --retry 2 --connect-timeout 15 --max-time 90 \
+      "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" >/dev/null || {
+        stack_fail "${STACK_NAMES[$item]} 对应架构的正式部署包不可下载，尚未开始部署。"; return 1;
+      }
+  fi
+  url="https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$1]}/$revision/${STACK_PATHS[$1]}"
   stack_private_dir "$directory"
   mkdir "$staged"
   : > "$staged/etag"
@@ -329,13 +339,7 @@ stack_fetch() {
   rm -f -- "$staged/install.sh" "$staged/etag"
   rmdir "$staged"
   if [[ "$stack_mode" == ci ]]; then
-    ci_release_resolve "hxx344/${STACK_REPOS[$item]}" "$stack_run/$item.release" || return 1
-    curl --fail --silent --show-error --head --location --proto '=https' --tlsv1.2 \
-      --retry 2 --connect-timeout 15 --max-time 90 \
-      "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" >/dev/null || {
-        stack_fail "${STACK_NAMES[$item]} 对应架构的 CI 部署包不可下载，尚未开始部署。"; return 1;
-      }
-    stack_log "${STACK_NAMES[$item]}：CI 清单与部署包已就绪。"
+    stack_log "${STACK_NAMES[$item]}：正式部署包及同提交安装器已就绪。"
   fi
 }
 

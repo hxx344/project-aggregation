@@ -54,16 +54,24 @@ jobs:
         run: |
           python3 deploy/test-release.py -v
           python3 deploy/test-publish.py -v
+          python3 deploy/test-promote.py -v
       - name: Check installer syntax
         run: |
           bash -n install.sh
           bash -n install-all.sh
+          bash -n deploy/test-update-service.sh
+          bash -n deploy/test-update-systemd.sh
           bash -n deploy/test-all.sh
           bash -n deploy/test-install.sh
           bash -n deploy/test-environment.sh
           bash -n deploy/test-inputs.sh
           bash -n deploy/test-incremental.sh
           bash -n deploy/test-workspace.sh
+      - name: Verify privileged update coordinator and service bootstrap
+        run: |
+          sudo python3 deploy/test-updater.py -v
+          sudo bash deploy/test-update-service.sh
+          sudo env AGG_UPDATER_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-update-systemd.sh
       - name: Check configuration, atomic activation, cleanup boundaries, and rollback
         run: bash deploy/test-install.sh
       - name: Classify real git inputs including compiler and build environment

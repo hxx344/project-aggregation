@@ -49,24 +49,12 @@ if release:
         print('Identical deployment release already published; skipped.')
         sys.exit(0)
 else:
-    gh('release', 'create', tag, '--repo', repository, '--target', commit, '--draft', '--title', f'Deployment {commit[:12]}',
+    gh('release', 'create', tag, '--repo', repository, '--target', commit, '--draft', '--title', f'Candidate {commit[:12]}',
        '--notes', f'CI-verified deployment packages for commit {commit}. Existing configuration and data remain on the server.')
 # Each synchronous upload must finish before publication. Do not re-read a
 # potentially cached REST release list immediately after creating a draft.
 for name in assets + ['release-manifest.json']:
     gh('release', 'upload', tag, '--repo', repository, '--clobber', str(directory / name))
-# Jobs share a repository-wide publication lock. A later failing main build must
-# not suppress this verified release, nor may an older job move latest backwards.
-latest = gh('api', f'repos/{repository}/releases/latest', check=False)
-promote = True
-if latest.returncode == 0:
-    latest_tag = json.loads(latest.stdout)['tag_name']
-    if not re.fullmatch(r'deploy-[a-f0-9]{40}', latest_tag):
-        raise ValueError('Latest release is outside the deployment channel')
-    previous = latest_tag.removeprefix('deploy-')
-    comparison = json.loads(gh('api', f'repos/{repository}/compare/{previous}...{commit}').stdout)
-    promote = comparison['status'] in ('ahead', 'identical')
-elif '404' not in latest.stderr:
-    raise RuntimeError(latest.stderr)
-gh('release', 'edit', tag, '--repo', repository, '--draft=false', '--latest=' + str(promote).lower())
-print('Published complete deployment release: ' + tag)
+# CI publishes candidates only. Stable promotion is a separate explicit workflow.
+gh('release', 'edit', tag, '--repo', repository, '--draft=false', '--prerelease=true', '--latest=false')
+print('Published CI candidate (not a stable update): ' + tag)
