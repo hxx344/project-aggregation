@@ -34,7 +34,7 @@ CrossEx 通过 Gate CrossEx 连接真实账户，仅支持手动预览确认开�
 
 ## Variational Grid 预置接入
 
-第五个预置为 `id=variational`、`name=Variational Grid`、`adapter=standard`、`category=trading`、`accessMode=proxy`、`autoSync=false`、`order=4`，页面和接口使用 `http://127.0.0.1:9876`，工作台阈值 120 秒。独立 `seeded-variational-v1` 迁移遵循同样的一次性添加、同标识保留及 30 项上限规则。
+第六个预置为 `id=variational`、`name=Variational Grid`、`adapter=standard`、`category=trading`、`accessMode=proxy`、`autoSync=false`、`order=4`，页面和接口使用 `http://127.0.0.1:9876`，工作台阈值 120 秒。独立 `seeded-variational-v1` 迁移遵循同样的一次性添加、同标识保留及 30 项上限规则。
 
 默认说明为“Lighter QQQ / Variational US100 对冲剥头皮模拟”。独立 `updated-variational-description-v1` 迁移在事务内仅替换 `variational` 精确匹配的旧默认说明“CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟”，保留自定义说明、名称、连接配置、凭据、禁用状态和快照，不恢复已删除项目；记录完成后不再改写。
 
@@ -43,6 +43,14 @@ CrossEx 通过 Gate CrossEx 连接真实账户，仅支持手动预览确认开�
 `/api/hub/summary` 和 `?schemaVersion=2` 都返回 v2；仅查询共同采样库的 runtime 和末条 summary，不读取历史或各组仓位库，不调用交易所。CL/BZ、库存组合及压缩/旧格式 QQQ 采样均受支持。显示独立组的本轮模拟盈亏 USDC，不相加；无效数值为 null。来源时间取采样时间；QQQ 还受行情源及已持有 US100 仓位估值时间限制。过期阈值沿用模块 `max(60, poll_seconds * 3)`，工作台采用与本地设置较短者。无样本或重置中使用 null 时间；暂停/降级为 partial，停止为 offline，过期为 stale，合成行情标明演示。
 
 模块页面均支持 `activity`；只接受精确宿主来源与父窗口的握手。新版工作台允许已加载页面在后台低频 GET，离线时暂停，重新激活时补查；不影响后台模拟或自动重试写请求。
+
+## Greeks 接入
+
+第六个预置为 `id=greeks`、`name=Greeks · BTC 期权`、`adapter=standard`、`category=trading`、`accessMode=proxy`、`autoSync=false`、`order=5`，页面与接口均使用 `http://127.0.0.1:8000`，工作台过期阈值 30 秒。独立 `seeded-greeks-v1` 迁移仅补充缺失入口；不覆盖同标识配置与凭据，不恢复删除项，遵守 30 项上限。
+
+`GET /api/hub/summary`（可带 `schemaVersion=2`）受 Greeks 原有 HTTP Basic 和来源校验保护。摘要只读取现有行情与策略/对账状态，不查询交易所、重算收益历史或写交易状态；真实行情和必要对账时间决定新鲜度，缺失为 `null`。模拟、测试网、实盘分别标明；正常等待合约上市为 `notice`，未决订单、存储故障与对账异常保留诊断。资金、收益不计入 Asset 汇总。
+
+页面遵循下方 `activity` 协议，独立打开保留原功能；工作台预加载只准备页面，收到可信活动授权后才读取数据。原交易确认、风控、后台执行和对账保持原有规则。服务端密码留在工作台和 Greeks 各自的配置中，代理沿用现有 Basic 预检及来源转换。
 
 ## 摘要接口
 
@@ -161,11 +169,11 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 ## 页面活动与查看条件联动
 
-工作台最多保留五个确认支持 `activity` 的代理 iframe，按插入顺序保持 DOM 稳定，切换项目不移动已有 iframe。登录并取得项目配置后，可见且联网持续 200 ms 即开始依次预加载五个内置模块；只接受已启用、配置了 `apiUrl` 且 ID 与适配器匹配的代理接入（`aster/aster`、`monitor/monitor`、`asset/asset`、`crossex/standard`、`variational/standard`）。直接接入和自定义模块仍由点击打开。
+工作台最多保留六个确认支持 `activity` 的代理 iframe，按插入顺序保持 DOM 稳定，切换项目不移动已有 iframe。登录并取得项目配置后，可见且联网持续 200 ms 即开始依次预加载六个内置模块；只接受已启用、配置了 `apiUrl` 且 ID 与适配器匹配的代理接入（`aster/aster`、`monitor/monitor`、`asset/asset`、`crossex/standard`、`variational/standard`、`greeks/standard`）。直接接入和自定义模块仍由点击打开。
 
 后台一次准备一个模块，点击选择的项目立即打开；快速切换时最多保留当前项目和一个后台项目的未完成加载。悬停或键盘聚焦只调整尚未开始的队列顺序。每个 revision 自动尝试一次，失败、超时或文档加载后 3 秒仍未确认 `activity` 的隐藏页面会卸载并释放队列，用户点击可重新尝试；不循环签发 launch。首次授权仍在创建 iframe 后立即消费原有一次性 ticket，不缓存 ticket 或改变授权有效期。退出登录卸载全部页面；项目配置或凭据 revision 改变时撤销旧页面并重新授权，停用或移除项目会清理相应预加载。
 
-五个内置模块在代理 iframe 中默认 inactive，先准备界面与脚本，收到可信宿主 activity 后才允许数据读取。新版宿主附加 `backgroundUpdates:true`，使隐藏或 `active=false` 的已加载页面继续低频更新，一般每 30 秒读取；Asset 沿用原有每 60 秒的 `POST /api/sync` 更新估值与历史，并保持同步单飞，恢复时不取消重发正在进行的同步。离线时停止页面刷新。恢复窗口、页面或网络时立即补查，迟到的旧读取不能覆盖新数据。旧宿主不传该字段时保留原活动状态限制，独立打开支持后台更新。浏览器冻结/丢弃标签页仍可能推迟计时器；服务器交易、采集和同步独立运行。预加载不延长行情有效期，也不保证刚登录后立即点击的模块已经加载完成。
+六个内置模块在代理 iframe 中默认 inactive，先准备界面与脚本，收到可信宿主 activity 后才允许数据读取。新版宿主附加 `backgroundUpdates:true`，使隐藏或 `active=false` 的已加载页面继续低频更新，一般每 30 秒读取；Asset 沿用原有每 60 秒的 `POST /api/sync` 更新估值与历史，并保持同步单飞，恢复时不取消重发正在进行的同步。离线时停止页面刷新。恢复窗口、页面或网络时立即补查，迟到的旧读取不能覆盖新数据。旧宿主不传该字段时保留原活动状态限制，独立打开支持后台更新。浏览器冻结/丢弃标签页仍可能推迟计时器；服务器交易、采集和同步独立运行。预加载不延长行情有效期，也不保证刚登录后立即点击的模块已经加载完成。
 
 消息统一使用 `{channel:"project-hub", version:1, type:...}`。工作台发 `ready`（`role:"host"`），模块确认 `ready`（`role:"module", capabilities:["activity","navigate","changed"]`）。模块可以先发无能力的 `ready` 探测，工作台回握手后才确认能力。`activity` 携带布尔 `active` 表示页面可见，以及可选布尔 `backgroundUpdates` 授权后台只读刷新；不改变隐藏导航和交易交互限制。实际写入成功后可发 `changed, scope:"summary"`，工作台合并短时间重复通知，只刷新相应项目。
 

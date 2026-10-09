@@ -79,12 +79,19 @@ if [[ $(uname -s) != Linux ]]; then
 fi
 
 stack_parse
-[[ ${stack_selected[*]} == 'aster monitor asset crossex variational hub' ]]
+[[ ${stack_selected[*]} == 'aster monitor asset crossex variational greeks hub' ]]
 stack_parse --only hub,monitor,monitor,aster
 [[ ${stack_selected[*]} == 'aster monitor hub' ]]
 stack_parse --only hub,variational
 [[ ${stack_selected[*]} == 'variational hub' ]]
 [[ ${STACK_REPOS[variational]} == variational-grid && ${STACK_PATHS[variational]} == install.sh ]]
+stack_parse --only hub,greeks
+[[ ${stack_selected[*]} == 'greeks hub' ]]
+[[ ${STACK_REPOS[greeks]} == greeks && ${STACK_PATHS[greeks]} == install.sh ]]
+if stack_greeks_preflight ubuntu:22.04; then echo 'Unsupported Greeks OS accepted' >&2; exit 1; fi
+stack_greeks_preflight ubuntu:24.04
+stack_greeks_preflight debian:12
+stack_greeks_preflight debian:13
 # Capability failures are detected before dependencies/downloads or earlier modules run.
 (
   stack_variational_python_ready() { return 1; }
@@ -135,7 +142,7 @@ cmp "$test_root/expected" "$test_root/executed"
 : > "$test_root/downloads"
 new_run
 stack_prefetch
-[[ $(grep -c $'\t.*/etag$' "$test_root/downloads") == 6 ]]
+[[ $(grep -c $'\t.*/etag$' "$test_root/downloads") == 7 ]]
 for item in "${STACK_ORDER[@]}"; do grep -q '复用缓存' "$stack_run/$item.download.log"; done
 stack_run_installers
 cmp "$test_root/expected" "$test_root/executed"

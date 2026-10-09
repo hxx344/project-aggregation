@@ -100,7 +100,7 @@ test('authentication gates private data, enforces Origin/CSRF, and logout revoke
   assert.equal((await f.login('wrong-password')).status, 401);
   const logged = await f.login();
   assert.equal(logged.status, 200); assert.match(logged.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
-  assert.equal((await f.request('/api/projects')).data.projects.length, 5);
+  assert.equal((await f.request('/api/projects')).data.projects.length, 6);
   assert.equal((await f.request('/api/logout', { method: 'POST', csrfHeader: '' })).status, 403);
   assert.equal((await f.request('/api/logout', { method: 'POST', originHeader: 'https://evil.example' })).status, 403);
   assert.equal((await f.request('/api/logout', { method: 'POST' })).status, 200);
@@ -128,15 +128,15 @@ test('login lasts seven days across restarts and expires without sliding renewal
   assert.equal((await f.login()).status, 200);
 });
 
-test('CrossEx and Variational proxy presets keep paper metrics outside the real asset snapshot', async t => {
+test('standard proxy presets keep project metrics outside the real asset snapshot', async t => {
   let requested;
   const f = await fixture(t, { summaryReader: async project => {
-    if (['crossex', 'variational'].includes(project.id)) { requested = project; return { ...summary(), metrics: [{ key: 'sim_equity', label: '模拟权益', value: 100000, unit: 'USDT', detail: '模拟账本，不计入真实资产' }] }; }
+    if (['crossex', 'variational', 'greeks'].includes(project.id)) { requested = project; return { ...summary(), metrics: [{ key: 'sim_equity', label: '模拟权益', value: 100000, unit: 'USDT', detail: '模拟账本，不计入真实资产' }] }; }
     return summary();
   } });
   await f.login();
   const projects = (await f.request('/api/projects')).data.projects;
-  assert.deepEqual(projects.map(project => project.id), ['aster', 'monitor', 'asset', 'crossex', 'variational']);
+  assert.deepEqual(projects.map(project => project.id), ['aster', 'monitor', 'asset', 'crossex', 'variational', 'greeks']);
   assert.match(projects[3].revision, /^[a-f0-9]{64}$/);
   assert.deepEqual(projects[3], { id: 'crossex', name: 'Gate CrossEx', description: '跨交易所永续手动实盘与持仓观察', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120, authOrigin: '', mode: 'external', enabled: true, order: 3, hasCredentials: false, revision: projects[3].revision });
   assert.equal(projects[4].description, 'Lighter QQQ / Variational US100 对冲剥头皮模拟');
@@ -150,6 +150,12 @@ test('CrossEx and Variational proxy presets keep paper metrics outside the real 
   assert.equal(requested.accessMode, 'proxy');
   assert.equal(requested.autoSync, false);
   assert.equal(grid.metrics[0].value, 100000);
+  await f.app.check('greeks');
+  assert.equal(requested.adapter, 'standard');
+  assert.equal(requested.apiUrl, 'http://127.0.0.1:8000');
+  assert.equal(requested.accessMode, 'proxy');
+  assert.equal(requested.autoSync, false);
+  assert.equal(requested.staleAfterSeconds, 30);
   const snapshots = (await f.request('/api/overview')).data.projects;
   assert.deepEqual(snapshots.find(item => item.project.id === 'asset').metrics, asset.metrics);
   assert.equal(snapshots.find(item => item.project.id === 'asset').metrics[0].value, 42);
@@ -164,12 +170,12 @@ test('an existing installation gains CrossEx once without restoring deleted pres
   const before = (await f.request('/api/overview')).data.projects.filter(item => item.project.id !== 'crossex');
   await f.reopen(db => db.exec("DELETE FROM projects WHERE id='crossex'; DELETE FROM settings WHERE key='seeded-crossex-v1';"));
   const upgraded = (await f.request('/api/overview')).data.projects;
-  assert.equal(upgraded.length, 4);
+  assert.equal(upgraded.length, 5);
   assert.deepEqual(upgraded.filter(item => item.project.id !== 'crossex'), before);
   assert.equal(upgraded.find(item => item.project.id === 'crossex').project.accessMode, 'proxy');
   assert.equal((await f.request('/api/projects/crossex', { method: 'DELETE' })).status, 200);
   await f.reopen();
-  assert.deepEqual((await f.request('/api/projects')).data.projects.map(item => item.id), ['aster', 'asset', 'variational']);
+  assert.deepEqual((await f.request('/api/projects')).data.projects.map(item => item.id), ['aster', 'asset', 'variational', 'greeks']);
 });
 
 test('the CrossEx migration preserves an existing same-id project, credentials and cached summary', async t => {
@@ -202,7 +208,7 @@ test('CrossEx migration respects the 30-project limit and does not retry after a
     await f.reopen(db => {
       db.exec("DELETE FROM projects WHERE id='crossex'; DELETE FROM settings WHERE key='seeded-crossex-v1';");
       const template = JSON.parse(db.prepare("SELECT json FROM projects WHERE id='aster'").get().json);
-      for (let index = 4; index < size; index++) {
+      for (let index = 5; index < size; index++) {
         const project = { ...template, id: `custom-${index}`, name: `Custom ${index}`, adapter: 'link', enabled: false, order: index + 10 };
         db.prepare('INSERT INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project));
       }
@@ -211,7 +217,7 @@ test('CrossEx migration respects the 30-project limit and does not retry after a
     assert.equal(projects.length, 30);
     assert.equal(projects.some(item => item.id === 'crossex'), size === 29);
     assert.equal((await f.request('/api/projects', { method: 'POST', body: { id: 'over-limit', name: 'Extra' } })).status, 400);
-    const removed = size === 29 ? 'crossex' : 'custom-4';
+    const removed = size === 29 ? 'crossex' : 'custom-5';
     assert.equal((await f.request(`/api/projects/${removed}`, { method: 'DELETE' })).status, 200);
     await f.reopen();
     const restarted = (await f.request('/api/projects')).data.projects;
@@ -229,12 +235,12 @@ test('an existing installation gains Variational once without restoring deleted 
   const before = (await f.request('/api/overview')).data.projects.filter(item => item.project.id !== 'variational');
   await f.reopen(db => db.exec("DELETE FROM projects WHERE id='variational'; DELETE FROM settings WHERE key='seeded-variational-v1';"));
   const upgraded = (await f.request('/api/overview')).data.projects;
-  assert.equal(upgraded.length, 4);
+  assert.equal(upgraded.length, 5);
   assert.deepEqual(upgraded.filter(item => item.project.id !== 'variational'), before);
   assert.equal(upgraded.find(item => item.project.id === 'variational').project.accessMode, 'proxy');
   assert.equal((await f.request('/api/projects/variational', { method: 'DELETE' })).status, 200);
   await f.reopen();
-  assert.deepEqual((await f.request('/api/projects')).data.projects.map(item => item.id), ['aster', 'asset', 'crossex']);
+  assert.deepEqual((await f.request('/api/projects')).data.projects.map(item => item.id), ['aster', 'asset', 'crossex', 'greeks']);
 });
 
 test('the Variational migration preserves an existing same-id project, credentials and cached summary', async t => {
@@ -310,7 +316,7 @@ test('Variational migration respects the 30-project limit and does not retry aft
     await f.reopen(db => {
       db.exec("DELETE FROM projects WHERE id='variational'; DELETE FROM settings WHERE key='seeded-variational-v1';");
       const template = JSON.parse(db.prepare("SELECT json FROM projects WHERE id='aster'").get().json);
-      for (let index = 4; index < size; index++) {
+      for (let index = 5; index < size; index++) {
         const project = { ...template, id: `custom-${index}`, name: `Custom ${index}`, adapter: 'link', enabled: false, order: index + 10 };
         db.prepare('INSERT INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project));
       }
@@ -319,12 +325,63 @@ test('Variational migration respects the 30-project limit and does not retry aft
     assert.equal(projects.length, 30);
     assert.equal(projects.some(item => item.id === 'variational'), size === 29);
     assert.equal((await f.request('/api/projects', { method: 'POST', body: { id: 'over-limit', name: 'Extra' } })).status, 400);
-    const removed = size === 29 ? 'variational' : 'custom-4';
+    const removed = size === 29 ? 'variational' : 'custom-5';
     assert.equal((await f.request(`/api/projects/${removed}`, { method: 'DELETE' })).status, 200);
     await f.reopen();
     const restarted = (await f.request('/api/projects')).data.projects;
     assert.equal(restarted.length, 29);
     assert.equal(restarted.some(item => item.id === 'variational'), false);
+  });
+});
+
+test('an existing installation gains Greeks once without restoring deleted presets or changing saved data', async t => {
+  const f = await fixture(t); await f.login();
+  await f.request('/api/projects/aster', { method: 'PUT', body: { name: 'My ASTER', apiUrl: 'http://127.0.0.1:9876', accessMode: 'direct', password: 'saved-upstream-password' } });
+  await f.request('/api/projects/asset', { method: 'PUT', body: { autoSync: false, staleAfterSeconds: 1800 } });
+  await f.request('/api/projects/monitor', { method: 'DELETE' });
+  await f.app.check('asset');
+  const before = (await f.request('/api/overview')).data.projects.filter(item => item.project.id !== 'greeks');
+  await f.reopen(db => db.exec("DELETE FROM projects WHERE id='greeks'; DELETE FROM settings WHERE key='seeded-greeks-v1';"));
+  const upgraded = (await f.request('/api/overview')).data.projects;
+  assert.equal(upgraded.length, 5);
+  assert.deepEqual(upgraded.filter(item => item.project.id !== 'greeks'), before);
+  assert.equal(upgraded.find(item => item.project.id === 'greeks').project.accessMode, 'proxy');
+  assert.equal((await f.request('/api/projects/greeks', { method: 'DELETE' })).status, 200);
+  await f.reopen();
+  assert.deepEqual((await f.request('/api/projects')).data.projects.map(item => item.id), ['aster', 'asset', 'crossex', 'variational']);
+});
+
+test('the Greeks migration preserves an existing same-id project, credentials and cached summary', async t => {
+  const f = await fixture(t); await f.login();
+  await f.request('/api/projects/greeks', { method: 'PUT', body: { name: 'Existing Greeks', apiUrl: 'http://127.0.0.1:9320', url: 'http://127.0.0.1:9320/custom', accessMode: 'direct', order: 12, username: 'custom-reader', password: 'saved-greeks-password' } });
+  const before = await f.app.check('greeks');
+  let saved;
+  await f.reopen(db => { saved = db.prepare("SELECT * FROM projects WHERE id='greeks'").get(); db.exec("DELETE FROM settings WHERE key='seeded-greeks-v1'"); });
+  assert.deepEqual((await f.request('/api/overview')).data.projects.find(item => item.project.id === 'greeks'), before);
+  await f.reopen(db => { assert.deepEqual(db.prepare("SELECT * FROM projects WHERE id='greeks'").get(), saved); });
+});
+
+test('Greeks migration respects the 30-project limit and does not retry after a full installation frees a slot', async t => {
+  for (const size of [29, 30]) await t.test(`${size} existing projects`, async t => {
+    const f = await fixture(t); await f.login();
+    await f.reopen(db => {
+      db.exec("DELETE FROM projects WHERE id='greeks'; DELETE FROM settings WHERE key='seeded-greeks-v1';");
+      const template = JSON.parse(db.prepare("SELECT json FROM projects WHERE id='aster'").get().json);
+      for (let index = 5; index < size; index++) {
+        const project = { ...template, id: `custom-${index}`, name: `Custom ${index}`, adapter: 'link', enabled: false, order: index + 10 };
+        db.prepare('INSERT INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project));
+      }
+    });
+    const projects = (await f.request('/api/projects')).data.projects;
+    assert.equal(projects.length, 30);
+    assert.equal(projects.some(item => item.id === 'greeks'), size === 29);
+    assert.equal((await f.request('/api/projects', { method: 'POST', body: { id: 'over-limit', name: 'Extra' } })).status, 400);
+    const removed = size === 29 ? 'greeks' : 'custom-5';
+    assert.equal((await f.request(`/api/projects/${removed}`, { method: 'DELETE' })).status, 200);
+    await f.reopen();
+    const restarted = (await f.request('/api/projects')).data.projects;
+    assert.equal(restarted.length, 29);
+    assert.equal(restarted.some(item => item.id === 'greeks'), false);
   });
 });
 
@@ -462,7 +519,6 @@ test('saving while a check is running discards the old response without blocking
   const result = (await f.request('/api/overview')).data.projects.find(item => item.project.id === 'aster');
   assert.equal(result.project.name, '新配置'); assert.equal(result.state, 'disabled'); assert.deepEqual(result.metrics, []);
 });
-
 
 test('concurrent partial login bodies reserve quota before await and success releases only itself', async t => {
   const f = await fixture(t);

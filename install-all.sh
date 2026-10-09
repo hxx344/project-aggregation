@@ -5,18 +5,18 @@ set -Eeuo pipefail
 STACK_CACHE=/var/cache/project-aggregation-stack
 STACK_LOGS=/var/log/project-aggregation-stack
 STACK_LOCK=/run/lock/project-aggregation-stack.lock
-STACK_ORDER=(aster monitor asset crossex variational hub)
+STACK_ORDER=(aster monitor asset crossex variational greeks hub)
 declare -A STACK_REPOS=(
   [aster]=aster_5x [monitor]=market-spread-monitor [asset]=asset-ledger
-  [variational]=variational-grid [crossex]=gate-crossex-arbitrage [hub]=project-aggregation
+  [variational]=variational-grid [crossex]=gate-crossex-arbitrage [greeks]=greeks [hub]=project-aggregation
 )
 declare -A STACK_PATHS=(
   [aster]=install-trading.sh [monitor]=deploy/install.sh [asset]=install.sh
-  [variational]=install.sh [crossex]=install.sh [hub]=install.sh
+  [variational]=install.sh [crossex]=install.sh [greeks]=install.sh [hub]=install.sh
 )
 declare -A STACK_NAMES=(
   [aster]='ASTER 5X' [monitor]='Market Monitor' [asset]='Asset Ledger'
-  [variational]='Variational Grid' [crossex]='Gate CrossEx' [hub]='Project Aggregation'
+  [variational]='Variational Grid' [crossex]='Gate CrossEx' [greeks]='Greeks · BTC 期权' [hub]='Project Aggregation'
 )
 declare -A stack_status=() stack_seconds=()
 stack_selected=()
@@ -28,12 +28,13 @@ stack_log() { printf '[总部署] %s\n' "$*"; }
 stack_fail() { stack_log "错误：$*" >&2; return 1; }
 stack_usage() {
   cat <<'HELP'
-用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,variational,hub] [--refresh]
-默认安装或升级五个模块及平台；已有配置、密码和数据由各自安装器保留。
+用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,variational,greeks,hub] [--refresh]
+默认安装或升级六个模块及平台；已有配置、密码和数据由各自安装器保留。
 支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，需 systemd。
   Variational 需要 Python 3.11+；Ubuntu 22.04 默认 Python 不满足要求。
   Variational 不要求部署时输入 vr-token；缺失或失效不阻止安装。
   默认 QQQ 模式可在页面“更新 Var token”，认证恢复前暂停相关模拟活动。
+  Greeks 支持 Ubuntu 24.04、Debian 12/13，默认模拟；面板密码保存在 /etc/greeks/greeks.env。
   --only     只检查和部署指定项目，始终按上述顺序执行，平台最后部署。
   --refresh  重新下载安装器；不强制重装应用依赖、构建或重启。
   --help     查看说明，无需 root。
@@ -59,7 +60,7 @@ stack_parse() {
   IFS=, read -r -a items <<< "$only"
   for item in "${items[@]}"; do
     # Validate before using a user-supplied associative array subscript.
-    case "$item" in aster|monitor|asset|crossex|variational|hub) requested[$item]=1 ;;
+    case "$item" in aster|monitor|asset|crossex|variational|greeks|hub) requested[$item]=1 ;;
       *) stack_fail "未知项目：$item"; return 1 ;; esac
   done
   stack_selected=()
@@ -79,6 +80,7 @@ stack_preflight() {
     *) stack_fail '支持 Ubuntu 22.04/24.04、Debian 12/13。'; return 1 ;; esac
   case $(uname -m) in x86_64|aarch64|arm64) ;; *) stack_fail '仅支持 x64 或 arm64。'; return 1 ;; esac
   if [[ " ${stack_selected[*]} " == *' variational '* ]]; then stack_variational_preflight "$ID:$VERSION_ID"; fi
+  if [[ " ${stack_selected[*]} " == *' greeks '* ]]; then stack_greeks_preflight "$ID:$VERSION_ID"; fi
   command -v apt-get >/dev/null && command -v dpkg-query >/dev/null && command -v flock >/dev/null || {
     stack_fail '需要 apt-get、dpkg-query 和 util-linux 的 flock。'; return 1;
   }
@@ -91,6 +93,10 @@ stack_variational_preflight() {
   fi
 }
 
+stack_greeks_preflight() {
+  [[ $1 != ubuntu:22.04 ]] || { stack_fail 'Greeks 需要 Python 3.11+，支持 Debian 12/13 或 Ubuntu 24.04；Ubuntu 22.04 请用 --only 选择其他模块。'; return 1; }
+}
+
 stack_ensure_tools() {
   local item package
   local -a packages=(ca-certificates curl) missing=()
@@ -99,6 +105,7 @@ stack_ensure_tools() {
     case "$item" in
       aster) packages+=(python3 python3-venv tar xz-utils util-linux passwd) ;;
       variational) packages+=(python3 git util-linux passwd) ;;
+      greeks) packages+=(python3 python3-venv git tar util-linux passwd) ;;
       monitor) packages+=(python3 xz-utils util-linux passwd iproute2) ;;
       asset|crossex|hub) packages+=(git xz-utils tar util-linux passwd) ;;
     esac

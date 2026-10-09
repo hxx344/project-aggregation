@@ -1,8 +1,8 @@
 # Project Aggregation · 项目工作台
 
-把 ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx 和 Variational Grid 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
+把 ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx、Variational Grid 和 Greeks 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
 
-工作台独立运行，通过一个 SSH 转发端口查看摘要并打开五个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量、CrossEx 的账户余额与持仓盈亏均不会重复计入资产。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
+工作台独立运行，通过一个 SSH 转发端口查看摘要并打开六个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量、CrossEx 的账户余额与持仓盈亏均不会重复计入资产。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
 
 Asset 支持 OKX 只读账户资产：在 Asset 的“交易所连接”填写国际站 API Key、Secret 和 Passphrase，验证后按 OKX 返回的美元总资产估值入账，并展示账户分项。工作台同步识别 OKX 来源，保留其源时间及失败旧值。升级两端可执行 `curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
 
@@ -14,7 +14,7 @@ Asset 支持 OKX 只读账户资产：在 Asset 的“交易所连接”填写�
 - 工作台后端按来源时限读取已启用项目的现有数据（最多间隔 30 秒）；启用 Asset 后台同步时，每 60 秒调用原项目的同步接口。浏览器关闭后仍会执行。
 - 独立的工作台密码登录、服务器端会话和本地 SQLite 持久化。
 - 原生“交易”模块：查看 Binance / Bybit 原油四腿仓位、资金费与盈亏，使用独立实盘连接执行四腿及两腿限价开平仓。
-- 五个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
+- 六个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
 
 工作台的定时读取和 Asset 同步不会下单、启停策略或转账；实盘任务只在用户预览并确认后执行。Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
 
@@ -68,33 +68,33 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/ins
 
 ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
 
-样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。使用下方总部署命令可同时安装或升级五个模块与平台；后续项目可复用 [界面样式约定](docs/workspace-style.md)。
+样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。使用下方总部署命令可同时安装或升级六个模块与平台；后续项目可复用 [界面样式约定](docs/workspace-style.md)。
 
-## 一键部署五个模块与平台
+## 一键部署六个模块与平台
 
-在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx、Variational Grid 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
+在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx、Variational Grid、Greeks 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash
 ```
 
-完整部署支持 Ubuntu 24.04、Debian 12/13，x64/arm64，使用 systemd。Variational Grid 要求 `/usr/bin/python3` 3.11+；Ubuntu 22.04 默认 Python 不满足要求，可用 `--only aster,monitor,asset,crossex,hub` 更新其余项目。脚本在安装任何项目之前检查此条件。下载命令需要系统已有 curl 和 CA 证书；极简新系统若缺少它们，先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`，以后无需重复。脚本合并安装其他缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
+完整部署支持 Ubuntu 24.04、Debian 12/13，x64/arm64，使用 systemd。Variational Grid 和 Greeks 要求 Python 3.11+；Greeks 不支持 Ubuntu 22.04，可用 `--only aster,monitor,asset,crossex,hub` 更新其余项目。脚本在安装任何项目之前检查此条件。下载命令需要系统已有 curl 和 CA 证书；极简新系统若缺少它们，先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`，以后无需重复。脚本合并安装其他缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
 
 部署时实时显示进度，每个项目完成后显示耗时，最后汇总结果。完整日志保存在 `/var/log/project-aggregation-stack/`，仅 root 可读。某个项目失败立即停止后续部署，保留之前成功的项目；修复原因后重跑同一命令即可。重跑仍检查每个项目，不会因历史成功记录而漏掉配置修改或服务停止。
 
-只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,variational,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
+只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,variational,greeks,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
 
 部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
 
 ## 性能与模块联动
 
-升级五个模块后，工作台优先读取轻量摘要：ASTER 使用已发布快照和报告缓存，Asset 读取当前资产与最近 90 个北京时间日期的趋势，Monitor / CrossEx 使用已有行情状态。只有接口不存在（404/405）才回退旧接口；登录失败或无效响应不会触发更重的读取。
+升级六个模块后，工作台优先读取轻量摘要：ASTER 使用已发布快照和报告缓存，Asset 读取当前资产与最近 90 个北京时间日期的趋势，Monitor / CrossEx 使用已有行情状态。只有接口不存在（404/405）才回退旧接口；登录失败或无效响应不会触发更重的读取。
 
 工作台通过 SSE 推送摘要，连接中断时每 30 秒补查；行情按源时间本地判断过期，采用模块与工作台阈值中较短者。CrossEx 的 10 秒阈值不会被工作台默认 120 秒覆盖。摘要读取按来源时限调整频率，最快每秒、最慢每 30 秒；资产同步仍独立每分钟运行。
 
 首页“当前关注”只显示需要人工处理的问题和持续两分钟的故障；恢复后自动清除，再次出现重新计时。统计延迟、正常历史订单观察等提示保留在项目页及项目管理的“运行详情”，不将缺失数值补成零。ASTER 同一配对组只显示一条合并诊断，已暂停组的人工处理问题仍会提醒。完整分类需同时更新 ASTER 和工作台；旧源缺少可靠分类时仍保守提示故障。
 
-登录后，工作台在可见且联网时依次预加载 ASTER、Monitor、Asset、CrossEx、Variational Grid 的代理页面，最多保留五个已确认支持活动状态协议的页面，保留筛选和滚动位置。后台一次准备一个模块；直接点击立即优先打开，不必等后台队列。两端升级后，已加载模块切到后台仍会低频更新：一般每 30 秒读取，Asset 沿用每 60 秒同步，进入时立即补查；Asset 已在进行的同步会继续复用，避免重复发起。总览在后台继续接收推送，断流时每 30 秒读取缓存，离线时暂停。预加载失败或未升级的模块不会自动反复重试，可点击重新打开；修改连接配置、凭据或停用项目会撤销旧页面。浏览器冻结或丢弃标签页可能推迟页面刷新，恢复窗口、页面或网络后立即补查；服务器交易引擎、行情采集和资产同步独立运行。
+登录后，工作台在可见且联网时依次预加载 ASTER、Monitor、Asset、CrossEx、Variational Grid、Greeks 的代理页面，最多保留六个已确认支持活动状态协议的页面，保留筛选和滚动位置。后台一次准备一个模块；直接点击立即优先打开，不必等后台队列。两端升级后，已加载模块切到后台仍会低频更新：一般每 30 秒读取，Asset 沿用每 60 秒同步，进入时立即补查；Asset 已在进行的同步会继续复用，避免重复发起。总览在后台继续接收推送，断流时每 30 秒读取缓存，离线时暂停。预加载失败或未升级的模块不会自动反复重试，可点击重新打开；修改连接配置、凭据或停用项目会撤销旧页面。浏览器冻结或丢弃标签页可能推迟页面刷新，恢复窗口、页面或网络后立即补查；服务器交易引擎、行情采集和资产同步独立运行。
 
 Monitor 与 CrossEx 可以携带币种、做多和做空交易所跳转定位；ASTER 提供到账本的入口，不根据钱包地址猜测对应资产账户。联动只调整查看条件。代理仅缓存上游明确标记为公开且不可变、带构建哈希的 JS/CSS；页面、接口及携带会话的响应继续不缓存。符合此条件且上游未压缩的静态资源会按浏览器支持启用 gzip 流式传输，减少首次打开 ASTER 时的脚本下载等待；不压缩交易接口或流式行情，也不改变已有会话校验。[限速验收记录](docs/aster-loading-2026-09-23.md)。
 
@@ -128,9 +128,23 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/ins
 
 各组模拟盈亏独立显示，单位 USDC，不相加、不计入资产账本。来源暂停、进程停止、旧样本和合成行情均明确标记；摘要沿用真实采样及持仓估值时间。网页支持预加载，隐藏时继续低频读取，重新进入时补查；后台模拟继续运行。
 
+## 接入 Greeks · BTC 期权
+
+[Greeks](https://github.com/hxx344/greeks) 是 Bybit BTC 铁鹰期权面板。安装或更新两端：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only greeks,hub
+```
+
+Greeks 安装器支持 Debian 12/13、Ubuntu 24.04，使用单进程 `greeks.service`，仅监听 `127.0.0.1:8000`。新安装默认 `dry-run`，不自动开仓；升级保留 `/etc/greeks/greeks.env` 中的模式、交易密钥和面板密码，以及 `/var/lib/greeks` 中的状态。无变化时复用依赖和验证结果，服务健康则不重启；安装日志列出更新与跳过项。
+
+工作台会一次性添加 `Greeks · BTC 期权`，使用 `standard` 摘要及 `proxy` 页面。在“项目管理”填写 Greeks 的 `DASHBOARD_USERNAME`（默认 `admin`）与 `DASHBOARD_PASSWORD`。安装器生成的独立密码保存在服务器 `/etc/greeks/greeks.env`，可用 `sudo grep '^DASHBOARD_' /etc/greeks/greeks.env` 查看；只将面板密码填入工作台。已有同标识连接保留，删除后不自动重加，满 30 项时跳过添加。仍只需 SSH 转发工作台 `3100`。
+
+摘要只读取 Greeks 已有内存快照，展示运行模式、BTC 行情、策略跟踪与对账状态；保留真实来源时间，等待周日合约上线作为运行提示，过期和异常另行标记。Greeks 的账户资产与策略收益不叠加到账本。预加载和后台刷新不会发送开平仓或 RFQ 写请求；原页面保留完整功能，后台采集、对账和收益采样独立运行。
+
 ## 单独安装或更新工作台
 
-适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。这一入口仅部署工作台，五个模块继续使用原来的端口。需要一起安装或升级时使用上方总部署命令。以下同一条命令用于工作台的首次安装和后续更新：
+适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。这一入口仅部署工作台，六个模块继续使用原来的端口。需要一起安装或升级时使用上方总部署命令。以下同一条命令用于工作台的首次安装和后续更新：
 
 ```bash
 sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install.sh -o "$f"; bash "$f"; rm -f "$f"'
@@ -154,7 +168,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或 DNS；单端口原页面代理当前支持这种 SSH 本地访问方式，不承诺 Safari 或通用域名代理。[浏览器兼容说明](https://learn.microsoft.com/en-us/aspnet/core/test/localhost-tld?view=aspnetcore-10.0)
 
-## 连接五个项目
+## 连接六个项目
 
 以下是首启时预置的配置。进入“项目管理”，为已设登录保护的项目填写现有页面的密码；monitor 若启用 HTTP Basic，还要填写用户名，CrossEx 用户名为 `admin`。保存一次后，通过工作台打开项目即可自动登录。这里填写的是原项目登录凭据，不是交易所 API Key。
 
@@ -165,8 +179,9 @@ Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或
 | Asset Ledger | `http://127.0.0.1:5678/` | `http://127.0.0.1:5678` | `asset` |
 | Gate CrossEx | `http://127.0.0.1:3200/` | `http://127.0.0.1:3200` | `standard` |
 | Variational Grid | `http://127.0.0.1:9876/` | `http://127.0.0.1:9876` | `standard` |
+| Greeks · BTC 期权 | `http://127.0.0.1:8000/` | `http://127.0.0.1:8000` | `standard` |
 
-升级时，缺少 `accessMode` 的三个原有内置项目默认采用 `proxy`；CrossEx 与 Variational Grid 预置显式使用 `proxy`。缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
+升级时，缺少 `accessMode` 的三个原有内置项目默认采用 `proxy`；CrossEx、Variational Grid 与 Greeks 预置显式使用 `proxy`。缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
 
 接口地址不会自动迁移。若现有 ASTER 接口地址仍是 `http://127.0.0.1:18765`，请在“项目管理”中改为 `http://127.0.0.1:8765`，重新填写 ASTER 网页登录密码并保存。工作台不会自动改端口或把旧密码搬到新目标。采用 `proxy` 时，旧页面地址中的 `18765` 不作为连接目标，可以保留或改为上表地址。
 
