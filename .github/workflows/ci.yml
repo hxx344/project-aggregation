@@ -37,12 +37,21 @@ jobs:
         if: matrix.os != 'ubuntu-latest' || matrix.node != '24.15.0'
       - name: Check and build with immutable dependencies as the service account
         if: matrix.os == 'ubuntu-latest' && matrix.node == '24.15.0'
-        run: sudo env INSTALL_TEST_NODE="$(command -v node)" bash deploy/test-workspace.sh
+        run: sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" bash deploy/test-workspace.sh
+      - name: Keep the verified deployment package
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24.15.0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package
+          path: output/release/*
+          if-no-files-found: error
   installer:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      - name: Check release download, integrity, extraction and cache boundaries
+        run: python3 deploy/test-release.py -v
       - name: Check installer syntax
         run: |
           bash -n install.sh
@@ -59,7 +68,29 @@ jobs:
         run: bash deploy/test-inputs.sh
       - name: Verify incremental changes, isolated validation and recovery
         run: sudo bash deploy/test-incremental.sh
+      - name: Verify CI package migration, no-op, integrity and rollback
+        run: sudo bash deploy/test-ci-install.sh
       - name: Verify failed configuration changes restore the previous port
         run: bash deploy/test-environment.sh
       - name: Check stack caching, dependency batching, failure recovery and signals
         run: sudo bash deploy/test-all.sh
+
+  release:
+    needs: [app, installer]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: deployment-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: output/release
+      - name: Publish the complete verified deployment package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 deploy/publish-release.py

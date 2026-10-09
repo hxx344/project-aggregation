@@ -13,6 +13,7 @@ BRANCH=main
 NODE_VERSION=24.15.0
 INSTALL_REVISION=2
 PROJECT_DEPLOY_TESTS=${PROJECT_DEPLOY_TESTS-0}
+PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-source}
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
 RUNTIME_DEPENDENCIES=0
 activation_started=0
@@ -21,6 +22,134 @@ old_unit_backup=
 old_environment=
 old_health_url=
 work_dir=
+
+# BEGIN CI RELEASE HELPERS -- keep embedded copies identical to deploy/release-common.sh
+# Only discovery uses latest; the archive is always fetched from its immutable commit tag.
+ci_release_resolve() {
+  local repository=$1 workspace=$2 manifest values
+  [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  CI_RELEASE_REPOSITORY=$repository
+  CI_RELEASE_WORK=$workspace
+  mkdir -p -- "$workspace" || return 1
+  manifest="$workspace/release-manifest.json"
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 3 --connect-timeout 15 --max-time 90 --max-filesize 1048576 \
+    "https://github.com/$repository/releases/latest/download/release-manifest.json" -o "$manifest"; then
+    printf '[CI] %s 暂无可用部署清单或下载失败；现有服务保持原样。\n' "$repository" >&2
+    return 1
+  fi
+  values=$(python3 - "$manifest" "$repository" "$(uname -m)" <<'CI_MANIFEST_PY'
+import json, re, sys
+from pathlib import Path
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    architecture = {'x86_64': 'linux-x64', 'aarch64': 'linux-arm64', 'arm64': 'linux-arm64'}[sys.argv[3]]
+    require(type(data['schema']) is int and data['schema'] == 1 and data['repository'] == sys.argv[2], 'repository/schema mismatch')
+    commit = data['commit']
+    require(re.fullmatch(r'[a-f0-9]{40}', commit), 'invalid commit')
+    require(data['tag'] == 'deploy-' + commit, 'tag/commit mismatch')
+    item = data['artifacts'][architecture]
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz', item['file']), 'invalid archive name')
+    for key in ('sha256', 'application_key'):
+        require(re.fullmatch(r'[a-f0-9]{64}', item[key]), 'invalid ' + key)
+    node = data.get('node_version', '')
+    require(not node or re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', node), 'invalid Node version')
+    print('\n'.join([commit, data['tag'], item['file'], item['sha256'], item['application_key'], node]))
+except (OSError, ValueError, KeyError, TypeError, AssertionError) as error:
+    print('[CI] Invalid deployment manifest: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+CI_MANIFEST_PY
+  ) || return 1
+  local -a fields
+  mapfile -t fields <<< "$values"
+  CI_RELEASE_COMMIT=${fields[0]}
+  CI_RELEASE_TAG=${fields[1]}
+  CI_RELEASE_FILE=${fields[2]}
+  CI_RELEASE_SHA256=${fields[3]}
+  CI_RELEASE_APPLICATION_KEY=${fields[4]}
+  CI_RELEASE_NODE_VERSION=${fields[5]:-}
+  printf '[CI] %s 最新可用部署包：%s。\n' "$repository" "${CI_RELEASE_COMMIT:0:12}"
+}
+
+ci_release_extract() {
+  local cache=$1 destination=$2 archive temporary actual
+  [[ ! -L "$cache" && ( ! -e "$cache" || -d "$cache" ) ]] || { printf '[CI] Invalid archive cache.\n' >&2; return 1; }
+  mkdir -p -- "$cache" || return 1
+  [[ $(stat -c %u "$cache") == "$EUID" ]] || { printf '[CI] Archive cache has an unexpected owner.\n' >&2; return 1; }
+  archive="$cache/$CI_RELEASE_SHA256.tar.gz"
+  [[ ! -L "$archive" && ( ! -e "$archive" || -f "$archive" ) ]] || return 1
+  actual=''
+  if [[ -f "$archive" ]]; then actual=$(sha256sum "$archive" | cut -d ' ' -f1) || return 1; fi
+  if [[ "$actual" != "$CI_RELEASE_SHA256" ]]; then
+    temporary=$(mktemp "$cache/.download.XXXXXXXX") || return 1
+    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --retry 3 --connect-timeout 15 --max-time 600 --max-filesize 2147483648 \
+      "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" -o "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    actual=$(sha256sum "$temporary" | cut -d ' ' -f1) || { rm -f -- "$temporary"; return 1; }
+    if [[ "$actual" != "$CI_RELEASE_SHA256" ]]; then
+      printf '[CI] 部署包校验失败；现有服务保持原样。\n' >&2
+      rm -f -- "$temporary"
+      return 1
+    fi
+    chmod 0644 "$temporary" || { rm -f -- "$temporary"; return 1; }
+    mv -f -- "$temporary" "$archive" || return 1
+  else
+    printf '[CI] 部署包已缓存且校验通过，跳过下载。\n'
+  fi
+  python3 - "$archive" "$destination" "$CI_RELEASE_COMMIT" "$CI_RELEASE_APPLICATION_KEY" <<'CI_EXTRACT_PY'
+import os, shutil, sys, tarfile
+from pathlib import Path, PurePosixPath
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+try:
+    destination = Path(sys.argv[2])
+    require(not destination.is_symlink(), 'destination cannot be a symlink')
+    destination.mkdir(parents=True, exist_ok=True)
+    require(not any(destination.iterdir()), 'destination must be empty')
+    with tarfile.open(sys.argv[1], 'r:gz') as archive:
+        members = []
+        names, total = set(), 0
+        for member in archive:
+            require(len(members) < 200000, 'too many archive entries')
+            path = PurePosixPath(member.name)
+            require(not path.is_absolute() and '..' not in path.parts and '\\' not in member.name and ':' not in member.name, 'unsafe archive path')
+            require(member.isdir() or member.isfile(), 'archive links and special files are forbidden')
+            name = str(path)
+            require(name not in names, 'duplicate archive entry')
+            names.add(name)
+            total += member.size
+            require(0 <= member.size and total <= 2147483648, 'archive too large')
+            members.append(member)
+        for member in members:
+            path = destination.joinpath(*PurePosixPath(member.name).parts)
+            if member.isdir():
+                path.mkdir(parents=True, exist_ok=True)
+                path.chmod(0o755)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.extractfile(member) as source, path.open('xb') as target:
+                    shutil.copyfileobj(source, target)
+                path.chmod(0o755 if member.mode & 0o111 else 0o644)
+    destination.chmod(0o755)
+    for directory in destination.rglob('*'):
+        if directory.is_dir():
+            directory.chmod(0o755)
+    require((destination / '.release-commit').read_text().strip() == sys.argv[3], 'archive commit mismatch')
+    require((destination / '.release-application-key').read_text().strip() == sys.argv[4], 'archive application key mismatch')
+except (OSError, ValueError, EOFError, tarfile.TarError, AssertionError) as error:
+    print('[CI] Invalid deployment archive: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+CI_EXTRACT_PY
+}
+# END CI RELEASE HELPERS
+
 
 log() { printf '[project-aggregation] %s\n' "$*"; }
 fail() { log "错误：$*" >&2; return 1; }
@@ -126,7 +255,9 @@ rollback() {
 }
 ensure_tools() {
   local missing=() tool
-  for tool in curl git xz; do
+  local tools=(curl xz)
+  if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then tools+=(python3); else tools+=(git); fi
+  for tool in "${tools[@]}"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       case "$tool" in xz) missing+=(xz-utils) ;; *) missing+=("$tool") ;; esac
     fi
@@ -312,6 +443,39 @@ prepare_application() {
   atomic_record "$work_dir/publish/.application-key" "$application_key"
   mv -- "$work_dir/publish" "$release"
 }
+prepare_ci_application() {
+  application_key=$CI_RELEASE_APPLICATION_KEY
+  if [[ -n "$old_release" && -f "$old_release/.install-ready" && -f "$old_release/.ci-package-sha256" &&
+        -f "$old_release/.application-key" && "$(cat "$old_release/.application-key")" == "$application_key" &&
+        -s "$old_release/dist/index.html" && -f "$old_release/server/app.mjs" ]]; then
+    if (( ! RUNTIME_DEPENDENCIES )) || [[ -f "$old_release/node_modules/ws/package.json" && -f "$old_release/node_modules/decimal.js/package.json" ]]; then
+      release=$old_release
+      log 'CI 运行内容未变化，复用当前版本；跳过部署包下载、依赖和构建。'
+      return
+    fi
+  fi
+  release="$APP_DIR/releases/${commit:0:12}-${application_key:0:16}"
+  if [[ -e "$release" ]]; then
+    [[ ! -L "$release" && -f "$release/.managed-release" && "$(cat "$release/.managed-release")" == "$commit" &&
+       -f "$release/.ci-package-sha256" && "$(cat "$release/.ci-package-sha256")" == "$CI_RELEASE_SHA256" &&
+       -s "$release/dist/index.html" && -f "$release/server/app.mjs" ]] || fail '候选 CI 版本目录已有未知或不完整内容。'
+    return
+  fi
+  ci_release_extract "$APP_DIR/cache/archives" "$work_dir/publish"
+  [[ -s "$work_dir/publish/dist/index.html" && -f "$work_dir/publish/server/app.mjs" && -f "$work_dir/publish/package.json" ]] || fail '部署包缺少运行文件。'
+  if (( RUNTIME_DEPENDENCIES )); then
+    [[ -f "$work_dir/publish/node_modules/ws/package.json" && -f "$work_dir/publish/node_modules/decimal.js/package.json" ]] || fail '部署包缺少后端依赖。'
+  fi
+  atomic_record "$work_dir/publish/.managed-release" "$commit"
+  atomic_record "$work_dir/publish/.source-sha" "$commit"
+  atomic_record "$work_dir/publish/.application-key" "$application_key"
+  atomic_record "$work_dir/publish/.ci-package-sha256" "$CI_RELEASE_SHA256"
+  chown -R root:root "$work_dir/publish"
+  chmod -R a+rX,go-w "$work_dir/publish"
+  mv -- "$work_dir/publish" "$release"
+  log 'CI 部署包准备完成；服务器跳过 npm 安装、类型检查、测试及前端构建。'
+}
+
 write_unit() {
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
@@ -351,6 +515,7 @@ prune_releases() {
   done < <(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d ' ' -f 2-)
 }
 main() {
+  case "$PROJECT_DEPLOY_MODE" in source|ci) ;; *) fail 'PROJECT_DEPLOY_MODE 必须是 ci 或 source。'; return 1 ;; esac
   case "$PROJECT_DEPLOY_TESTS" in
     0|1) ;;
     *) fail 'PROJECT_DEPLOY_TESTS 必须是 0 或 1。'; return 1 ;;
@@ -403,18 +568,29 @@ main() {
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/build-home"
   HEALTH_URL=$(health_url "$HOST_VALUE" "$PORT_VALUE")
   ensure_node
+  if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
+    runtime_key=$(printf '%s\n%s\n' "$("$NODE_BIN" --version)" "$(uname -m)" | hash)
+    build_environment=ci-v1
+  else
   NPM_BIN="$(dirname "$NODE_BIN")/npm"
   [[ -x "$NPM_BIN" ]] || fail '当前 Node.js 没有对应 npm，请安装完整 Node.js 24 运行时。'
   runtime_key=$(printf '%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$("$NODE_BIN" "$NPM_BIN" --version)" "$(uname -m)" | hash)
   build_environment=$("$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key.startsWith("VITE_")).sort(([a], [b]) => a.localeCompare(b))))')
+  fi
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
+  if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
+    ci_release_resolve hxx344/project-aggregation "$work_dir"
+    commit=$CI_RELEASE_COMMIT
+    [[ "$CI_RELEASE_NODE_VERSION" == "$NODE_VERSION" ]] || fail '部署包的 Node.js 版本与安装器不匹配，请获取最新版安装器。'
+  else
   log '检查远端版本。'
   commit=$(git ls-remote --exit-code "$REPOSITORY" "refs/heads/$BRANCH" | cut -f 1)
   [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail '无法确定远端 main 的提交。'
+  fi
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
-  if [[ "$PROJECT_DEPLOY_TESTS" == 0 && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
+  if [[ ( "$PROJECT_DEPLOY_MODE" == ci || "$PROJECT_DEPLOY_TESTS" == 0 ) && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
         "$deployed_state" == "$commit $deployment_key" ]] && healthy; then
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
@@ -422,6 +598,10 @@ main() {
     trap - ERR INT TERM
     return
   fi
+  if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
+    prepare_ci_application
+    run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
+  else
   if [[ ! -d "$APP_DIR/repository.git" ]]; then git init --bare -q "$APP_DIR/repository.git"; fi
   if ! git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit^{commit}" 2>/dev/null; then
     git --git-dir="$APP_DIR/repository.git" fetch --quiet --depth=1 "$REPOSITORY" "$commit"
@@ -430,6 +610,7 @@ main() {
   fi
   input_keys
   prepare_application
+  fi
   if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] && healthy; then
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment

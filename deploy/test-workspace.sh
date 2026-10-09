@@ -32,3 +32,10 @@ fi
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
 [[ ! -d "$dependencies/node_modules/.vite-temp" ]]
 printf 'Real non-root build and backend import passed with immutable shared dependencies.\n'
+
+if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
+  python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --repository "$repository" --output "$repository/output/release"
+  mkdir "$test_root/package"
+  tar -xzf "$repository/output/release/"*-linux-any.tar.gz -C "$test_root/package"
+  "$NODE_BIN" "$repository/deploy/test-package.mjs" "$test_root/package"
+fi

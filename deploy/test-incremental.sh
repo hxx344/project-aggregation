@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Full installer decision paths with local git and isolated, fake runtimes/services.
 set -Eeuo pipefail
+export PROJECT_DEPLOY_MODE=source
 [[ $(uname -s) == Linux && $EUID == 0 ]] || { echo 'Run this fixture with sudo on Linux.' >&2; exit 1; }
 repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
 fixture=$(mktemp -d)
