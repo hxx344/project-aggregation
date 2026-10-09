@@ -22,14 +22,16 @@ declare -A stack_status=() stack_seconds=()
 stack_selected=()
 stack_workers=()
 stack_refresh=0 stack_run='' stack_active='' stack_child='' stack_viewer=''
+stack_with_tests=0
   stack_started=$SECONDS
 
 stack_log() { printf '[总部署] %s\n' "$*"; }
 stack_fail() { stack_log "错误：$*" >&2; return 1; }
 stack_usage() {
   cat <<'HELP'
-用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,variational,greeks,hub] [--refresh]
+用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,variational,greeks,hub] [--refresh] [--with-tests]
 默认安装或升级六个模块及平台；已有配置、密码和数据由各自安装器保留。
+默认跳过工作台和 CrossEx 的完整行为测试；保留类型检查、构建、配置和健康检查，CI 继续测试。
 支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，需 systemd。
   Variational 需要 Python 3.11+；Ubuntu 22.04 默认 Python 不满足要求。
   Variational 不要求部署时输入 vr-token；缺失或失效不阻止安装。
@@ -37,6 +39,7 @@ stack_usage() {
   Greeks 支持 Ubuntu 24.04、Debian 12/13，默认模拟；面板密码保存在 /etc/greeks/greeks.env。
   --only     只检查和部署指定项目，始终按上述顺序执行，平台最后部署。
   --refresh  重新下载安装器；不强制重装应用依赖、构建或重启。
+  --with-tests  开启工作台和 CrossEx 的部署行为测试，相同内容的成功结果仍可复用。
   --help     查看说明，无需 root。
 失败后修复原因并重复原命令；已完成项目仍会检查配置和服务健康。
 HELP
@@ -45,15 +48,21 @@ HELP
 stack_parse() {
   local only='' item
   local -A requested=()
+  stack_with_tests=${PROJECT_DEPLOY_TESTS-0}
   while (($#)); do
     case "$1" in
       --only)
         (($# >= 2)) && [[ -n "$2" && -z "$only" ]] || { stack_fail '--only 需要一个非空列表，且只能指定一次。'; return 1; }
         only=$2; shift 2 ;;
       --refresh) stack_refresh=1; shift ;;
+      --with-tests) stack_with_tests=1; shift ;;
       *) stack_fail "未知参数：$1；使用 --help 查看说明。"; return 1 ;;
     esac
   done
+  case "$stack_with_tests" in
+    0|1) ;;
+    *) stack_fail 'PROJECT_DEPLOY_TESTS 必须是 0 或 1。'; return 1 ;;
+  esac
   if [[ -z "$only" ]]; then stack_selected=("${STACK_ORDER[@]}"); return; fi
   [[ "$only" != ,* && "$only" != *, && "$only" != *,,* ]] || { stack_fail '项目列表不能含空项。'; return 1; }
   local -a items
@@ -241,6 +250,7 @@ stack_stream() {
 
 stack_run_installers() {
   local item started result
+  local -a installer_env
   for item in "${stack_selected[@]}"; do
     stack_active=$item
     stack_status[$item]='运行中'
@@ -249,7 +259,13 @@ stack_run_installers() {
     # Do not use 'if bash ...' or source the installer: preserve its own errexit and traps.
     # Log directly to disk; a broken console/tee must not abort a service activation.
     : > "$stack_run/$item.log"
-    setsid bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
+    # Only these installers consume the test switch. Do not change unrelated
+    # modules' build-environment fingerprints by forwarding it to every child.
+    case "$item" in
+      hub|crossex) installer_env=("PROJECT_DEPLOY_TESTS=$stack_with_tests") ;;
+      *) installer_env=(-u PROJECT_DEPLOY_TESTS) ;;
+    esac
+    setsid env "${installer_env[@]}" bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
     stack_child=$!
     stack_stream "$stack_child" "$stack_run/$item.log" &
     stack_viewer=$!

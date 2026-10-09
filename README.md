@@ -88,6 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/ins
 
 只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,variational,greeks,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
 
+服务器部署默认跳过工作台和 CrossEx 的完整行为测试，GitHub CI 继续执行测试；类型检查、构建、配置和服务健康检查保留。需要部署时补测，把命令末尾改为 `sudo bash -s -- --with-tests`；已通过且内容未变的测试结果仍复用。单独运行这两个项目的安装器时，可用 `sudo env PROJECT_DEPLOY_TESTS=1 bash install.sh` 开启。
+
 部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
 
 ## 性能与模块联动
@@ -272,7 +274,7 @@ sudo systemctl status project-aggregation
 sudo journalctl -u project-aggregation -f
 ```
 
-更新没有变化且服务健康时，会跳过源码下载、依赖安装、检查、构建和重启。仅文档变化会跳过应用更新；依赖不变复用安装结果，前端内容不变复用构建结果。新版本必须通过类型检查、行为测试、构建和健康检查，才记录为已部署。启动失败自动恢复前一程序版本、systemd 配置及上次健康启动的环境配置，并按旧地址和端口检查恢复结果。用户本次修改的配置另存为 `/etc/project-aggregation.env.failed-时间-PID`（仅 root 可读），可以修正后重新使用；首次安装失败保持当前配置原样。不会把持久数据恢复成旧副本，也不会删除未知目录。
+更新没有变化且服务健康时，会跳过源码下载、依赖安装、检查、构建和重启。仅文档变化会跳过应用更新；依赖不变复用安装结果，前端内容不变复用构建结果。新版本保留类型检查、构建和健康检查，完整行为测试默认由 CI 执行；部署时显式开启的测试失败仍会阻止发布，跳过不会写入测试成功缓存。同一版本事后补测不重建、不重启服务。启动失败自动恢复前一程序版本、systemd 配置及上次健康启动的环境配置，并按旧地址和端口检查恢复结果。用户本次修改的配置另存为 `/etc/project-aggregation.env.failed-时间-PID`（仅 root 可读），可以修正后重新使用；首次安装失败保持当前配置原样。不会把持久数据恢复成旧副本，也不会删除未知目录。
 
 备份时停止服务，保存完整的数据目录与环境文件，再启动服务。`hub.sqlite` 和 `credentials.key` 必须一起保留；运行中的 SQLite 还可能有 WAL 文件，不要只复制单个数据库文件。密钥丢失时服务器会拒绝启动，防止已有凭据被错误覆盖。
 

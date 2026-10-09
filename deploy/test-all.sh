@@ -31,6 +31,7 @@ original_private_dir=$(declare -f stack_private_dir)
 stack_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
 export STACK_TEST_ROOT="$test_root"
 unset VARIATIONAL_SESSION_STDIN
+unset PROJECT_DEPLOY_TESTS
 for item in "${STACK_ORDER[@]}"; do
   cat > "$test_root/upstream/$item.sh" <<EOF
 #!/usr/bin/env bash
@@ -39,6 +40,7 @@ set -Eeuo pipefail
 [[ ! -t 0 && \$# == 0 && ! -v VARIATIONAL_SESSION_STDIN ]]
 if read -r -t 1 unexpected_input; then exit 24; else [[ \$? == 1 ]]; fi
 printf '%s\\n' '$item' >> "\$STACK_TEST_ROOT/executed"
+printf '%s=%s\\n' '$item' "\${PROJECT_DEPLOY_TESTS-unset}" >> "\$STACK_TEST_ROOT/test-modes"
 printf 'Checked $item configuration and health; unchanged inputs are skipped.\\n'
 if [[ -f "\$STACK_TEST_ROOT/fail-$item" ]]; then exit 23; fi
 EOF
@@ -84,6 +86,16 @@ fi
 
 stack_parse
 [[ ${stack_selected[*]} == 'aster monitor asset crossex variational greeks hub' ]]
+[[ $stack_with_tests == 0 ]]
+PROJECT_DEPLOY_TESTS=1 stack_parse
+[[ $stack_with_tests == 1 ]]
+PROJECT_DEPLOY_TESTS=0 stack_parse --with-tests
+[[ $stack_with_tests == 1 ]]
+stack_parse
+[[ $stack_with_tests == 0 ]]
+for invalid_mode in '' 2 true invalid; do
+  if (PROJECT_DEPLOY_TESTS=$invalid_mode stack_parse); then echo 'Invalid test mode accepted' >&2; exit 1; fi
+done
 stack_parse --only hub,monitor,monitor,aster
 [[ ${stack_selected[*]} == 'aster monitor hub' ]]
 stack_parse --only hub,variational
@@ -142,9 +154,28 @@ for item in "${STACK_ORDER[@]}"; do assert stack_cache_valid "$STACK_CACHE/$item
 stack_run_installers <<< 'Coordinator input must never reach a module installer.'
 printf '%s\n' "${STACK_ORDER[@]}" > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/executed"
+for item in "${STACK_ORDER[@]}"; do
+  case "$item" in hub|crossex) expected_mode=0 ;; *) expected_mode=unset ;; esac
+  grep -qx "$item=$expected_mode" "$test_root/test-modes"
+done
 stack_summary > "$test_root/success-summary"
 grep -Fq "$greeks_credentials_command" "$test_root/success-summary"
 grep -Fq '项目管理 → Greeks · BTC 期权' "$test_root/success-summary"
+
+# Opting in only reaches supported installers; inherited controls must not
+# change other modules' build-environment fingerprints or stdin/argv behavior.
+(
+  export PROJECT_DEPLOY_TESTS=1
+  new_run
+  stack_parse --with-tests
+  stack_prefetch
+  : > "$test_root/test-modes"
+  stack_run_installers
+  for item in "${STACK_ORDER[@]}"; do
+    case "$item" in hub|crossex) expected_mode=1 ;; *) expected_mode=unset ;; esac
+    grep -qx "$item=$expected_mode" "$test_root/test-modes"
+  done
+)
 
 # A cached script is revalidated and still executed: configuration/health must never be skipped.
 : > "$test_root/executed"

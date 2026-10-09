@@ -97,9 +97,21 @@ expect_counts() {
     cat "$fixture/npm.calls" "$fixture/systemctl.calls" >&2; return 1;
   }
 }
+# Default deployment builds and starts without running tests or inventing a
+# successful test stamp. Explicit validation of the same commit must still run.
+unset PROJECT_DEPLOY_TESTS
+run_install
+expect_counts 1 1 0 1 1
+[[ -z $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' -print -quit) ]]
+initial=$(readlink "$fixture/application/current")
+run_install
+expect_counts 1 1 0 1 1
+if PROJECT_DEPLOY_TESTS=invalid run_install; then echo 'Invalid test mode accepted' >&2; exit 1; fi
+expect_counts 1 1 0 1 1
+export PROJECT_DEPLOY_TESTS=1
 run_install
 expect_counts 1 1 1 1 1
-initial=$(readlink "$fixture/application/current")
+[[ $(readlink "$fixture/application/current") == "$initial" && $(releases) == 1 ]]
 initial_sha=$(cat "$initial/.source-sha")
 run_install
 expect_counts 1 1 1 1 1
@@ -126,8 +138,14 @@ expect_counts 1 2 4 2 4
 # Failed test: no new release or cache success, then only that test is retried.
 echo failed >> "$fixture/source/tests/app.test.mjs"; commit_source fail-test
 touch "$fixture/fail-test"
+verified_before=$(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' | wc -l)
+PROJECT_DEPLOY_TESTS=0 run_install
+expect_counts 1 2 4 2 4
+[[ $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' | wc -l) == "$verified_before" ]]
+[[ $(readlink "$fixture/application/current") == "$current" ]]
 if run_install; then echo 'Failed test was accepted' >&2; exit 1; fi
 expect_counts 1 2 5 2 4
+[[ $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' | wc -l) == "$verified_before" ]]
 [[ $(readlink "$fixture/application/current") == "$current" && $(releases) == 2 ]]
 rm "$fixture/fail-test"
 run_install

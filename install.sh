@@ -12,6 +12,7 @@ REPOSITORY=https://github.com/hxx344/project-aggregation.git
 BRANCH=main
 NODE_VERSION=24.15.0
 INSTALL_REVISION=2
+PROJECT_DEPLOY_TESTS=${PROJECT_DEPLOY_TESTS-0}
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
 RUNTIME_DEPENDENCIES=0
 activation_started=0
@@ -258,13 +259,15 @@ prepare_application() {
   local reuse=0 need_build=1
   if application_ready; then reuse=1; fi
   if (( reuse )) || [[ -f "$built/.complete" && -s "$built/dist/index.html" ]]; then need_build=0; fi
-  if [[ ! -f "$typecheck_stamp" || ! -f "$test_stamp" ]] || (( need_build )); then prepare_workspace; fi
+  if [[ ! -f "$typecheck_stamp" || ( "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" ) ]] || (( need_build )); then prepare_workspace; fi
   if [[ ! -f "$typecheck_stamp" ]]; then
     log '类型检查输入变化，执行一次类型检查。'
     (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run check)
     atomic_record "$typecheck_stamp" "$typecheck_key"
   else log '类型检查输入未变化，复用验证结果。'; fi
-  if [[ ! -f "$test_stamp" ]]; then
+  if [[ "$PROJECT_DEPLOY_TESTS" == 0 ]]; then
+    log '跳过完整行为测试；CI 继续验证，设置 PROJECT_DEPLOY_TESTS=1 可在部署时补测。'
+  elif [[ ! -f "$test_stamp" ]]; then
     log '测试或相关源码变化，在隔离目录执行行为测试。'
     (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" test)
     atomic_record "$test_stamp" "$test_key"
@@ -348,6 +351,10 @@ prune_releases() {
   done < <(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d ' ' -f 2-)
 }
 main() {
+  case "$PROJECT_DEPLOY_TESTS" in
+    0|1) ;;
+    *) fail 'PROJECT_DEPLOY_TESTS 必须是 0 或 1。'; return 1 ;;
+  esac
   [[ "$(uname -s)" == Linux ]] || fail '安装脚本仅用于 Linux；开发环境请使用 npm 命令。'
   [[ "$EUID" == 0 ]] || fail '请使用 sudo bash install.sh。'
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || fail '需要正在运行 systemd 的 Linux 主机。'
@@ -407,7 +414,7 @@ main() {
   [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail '无法确定远端 main 的提交。'
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
-  if [[ -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
+  if [[ "$PROJECT_DEPLOY_TESTS" == 0 && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
         "$deployed_state" == "$commit $deployment_key" ]] && healthy; then
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
