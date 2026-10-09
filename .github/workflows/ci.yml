@@ -51,7 +51,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check release download, integrity, extraction and cache boundaries
-        run: python3 deploy/test-release.py -v
+        run: |
+          python3 deploy/test-release.py -v
+          python3 deploy/test-publish.py -v
       - name: Check installer syntax
         run: |
           bash -n install.sh

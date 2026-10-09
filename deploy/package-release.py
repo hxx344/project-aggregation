@@ -27,7 +27,8 @@ def main():
     commit = subprocess.check_output(['git', '-c', f'safe.directory={repository.as_posix()}', '-C', str(repository), 'rev-parse', 'HEAD'], text=True).strip()
     inputs = ['server', 'src', 'public', 'package.json', 'package-lock.json', 'index.html',
               'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
-              '.npmrc', '.env', '.env.production', 'deploy/package-release.py', 'LICENSE', 'NOTICE.md']
+              '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',
+              'deploy/package-release.py', 'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md']
     tree = subprocess.check_output(['git', '-c', f'safe.directory={repository.as_posix()}', '-C', str(repository), 'ls-tree', '-r', 'HEAD', '--', *inputs])
     application_key = hashlib.sha256(b'ci-node-runtime-v1\n24.15.0\n' + tree).hexdigest()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -38,7 +39,7 @@ def main():
         shutil.copytree(source / 'dist', stage / 'dist')
         shutil.copytree(source / 'server', stage / 'server', ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copy2(source / 'package.json', stage / 'package.json')
-        for notice in ('LICENSE', 'NOTICE.md'):
+        for notice in ('LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md'):
             if (source / notice).is_file():
                 shutil.copy2(source / notice, stage / notice)
         if name == 'gate-crossex-arbitrage':

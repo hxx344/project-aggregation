@@ -114,6 +114,13 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         (self.root / 'fail-download').touch()
         self.run_helper(False)
 
+    def test_pinned_manifest_does_not_rediscover_latest(self):
+        self.run_helper(PROJECT_DEPLOY_MANIFEST_FILE=(self.root / 'manifest.json').as_posix())
+        urls = (self.root / 'urls').read_text().splitlines()
+        self.assertEqual(len(urls), 1)
+        self.assertIn('/releases/download/deploy-' + self.commit + '/', urls[0])
+        self.run_helper(False, PROJECT_DEPLOY_MANIFEST_FILE=(self.root / 'missing.json').as_posix())
+
     def test_unsafe_archive_types_and_paths(self):
         cases = []
         for name in ('../outside', '/absolute', 'a/../../outside', 'C:/outside', 'a\\outside'):
