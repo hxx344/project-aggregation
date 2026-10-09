@@ -390,6 +390,86 @@ class CoordinatorTests(RootFixture):
         restarted = self.make_coordinator(); restarted.recover(starting=True)
         self.assertFalse(restarted.status()['checking']); self.assertIsNone(restarted.status()['planId'])
 
+    def test_automatic_check_is_due_every_180_seconds_and_survives_restart(self):
+        self.assertEqual(self.coordinator.next_check_delay(), 0)
+        self.check()
+        self.assertEqual(self.coordinator.next_check_delay(), 180)
+        calls = len(self.network.calls)
+        self.clock += 179
+        restarted = self.make_coordinator(); restarted.recover(starting=True)
+        self.assertEqual(restarted.next_check_delay(), 1)
+        self.assertFalse(restarted.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
+        self.assertEqual(len(self.network.calls), calls)
+        self.clock += 1
+        self.assertTrue(restarted.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
+        restarted.check_thread.join(5)
+        self.assertGreater(len(self.network.calls), calls)
+        self.assertEqual(restarted.next_check_delay(), 180)
+
+    def test_scheduler_starts_without_http_and_does_not_duplicate_or_reenter(self):
+        entered = threading.Event(); release = threading.Event()
+        original = self.coordinator.inspect
+        self.coordinator.inspect = lambda: (entered.set(), release.wait(5), original())[-1]
+        try:
+            self.coordinator.start_scheduler()
+            thread = self.coordinator.scheduler_thread
+            self.coordinator.start_scheduler()
+            self.assertIs(self.coordinator.scheduler_thread, thread)
+            self.assertTrue(entered.wait(5))
+            check_thread = self.coordinator.check_thread
+            self.assertEqual(self.coordinator.next_check_delay(), 5)
+            self.coordinator.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)
+            self.assertIs(self.coordinator.check_thread, check_thread)
+        finally:
+            self.coordinator.stop_scheduler(); release.set()
+            if self.coordinator.check_thread:
+                self.coordinator.check_thread.join(5)
+        self.assertFalse(thread.is_alive())
+        plan = self.coordinator.status()['planId']
+        self.coordinator.apply(plan)
+        self.clock += 181
+        self.assertEqual(self.coordinator.next_check_delay(), 5)
+        self.assertFalse(self.coordinator.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
+
+    def test_auto_retry_after_failure_preserves_no_failed_plan(self):
+        plan = self.prepare(); self.clock += 180
+        self.network.values['hub']['metadata']['prerelease'] = True
+        state = self.check()
+        self.assertIsNone(state['planId']); self.assertIsNotNone(state['checkError'])
+        with self.assertRaises(updater.UpdateError):
+            self.coordinator.apply(plan)
+        self.assertEqual(self.coordinator.next_check_delay(), 180)
+        self.network.values['hub']['metadata']['prerelease'] = False
+        self.clock += 180
+        self.assertIsNotNone(self.check()['planId'])
+
+    def test_unchanged_plan_survives_check_without_extending_expiry(self):
+        plan = self.prepare(); expires = self.coordinator.status()['expiresAt']
+        self.clock += 180
+        release = threading.Event(); original = self.coordinator.inspect
+        self.coordinator.inspect = lambda: (release.wait(5), original())[-1]
+        try:
+            started = self.coordinator.check()
+            self.assertEqual(started['planId'], plan)
+            with self.assertRaises(updater.UpdateError):
+                self.coordinator.apply(plan)
+        finally:
+            release.set(); self.coordinator.check_thread.join(5)
+            self.coordinator.inspect = original
+        state = self.coordinator.status()
+        self.assertEqual(state['planId'], plan); self.assertEqual(state['expiresAt'], expires)
+        self.assertEqual(len(list(self.coordinator.plans.iterdir())), 1)
+        self.clock += updater.PLAN_TTL
+        self.assertNotEqual(self.prepare(), plan)
+
+    def test_changed_candidate_identity_or_content_replaces_reviewed_plan(self):
+        plan = self.prepare(); self.clock += 180
+        self.installed[0]['identity'] = 'f' * 64
+        changed = self.prepare(); self.assertNotEqual(changed, plan)
+        self.clock += 180
+        self.network.values['hub']['manifest']['node_version'] = '24.15.0'
+        self.assertNotEqual(self.prepare(), changed)
+
     def test_concurrent_double_click_launches_one_worker_and_other_plan_is_rejected(self):
         plan = self.prepare()
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -513,8 +593,10 @@ class CoordinatorTests(RootFixture):
             self.assertEqual(stat.S_IMODE(endpoint_dir.stat().st_mode), 0o750)
         with patch.object(updater, 'SOCKET_DIR', endpoint_dir), patch.object(updater, 'Coordinator', return_value=self.coordinator), \
                 patch.object(sys, 'argv', ['updater.py', 'serve']), patch('grp.getgrnam', return_value=SimpleNamespace(gr_gid=0)), \
-                patch.object(updater.Server, 'serve_forever', side_effect=inspect_socket):
+                patch.object(updater.Server, 'serve_forever', side_effect=inspect_socket), \
+                patch.object(self.coordinator, 'start_scheduler') as start, patch.object(self.coordinator, 'stop_scheduler') as stop:
             updater.main()
+        start.assert_called_once(); stop.assert_called_once()
 
     @unittest.skipUnless(LINUX_ROOT, 'Unix socket and root permission checks run in Linux CI')
     def test_unix_http_rejects_extra_inputs_and_worker_survives_control_shutdown(self):

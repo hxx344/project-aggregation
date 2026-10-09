@@ -33,6 +33,7 @@ WORKER = 'project-aggregation-update-worker.service'
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 PLAN_TTL = 30 * 60
 CHECK_MIN_INTERVAL = 60
+AUTO_CHECK_INTERVAL = 180
 ACTIVE = {'queued', 'running'}
 TOKEN = re.compile(r'[a-f0-9]{32}')
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason')
@@ -166,6 +167,8 @@ class Coordinator:
         self.stack_lock = stack_lock
         self.thread_lock = threading.RLock()
         self.check_thread = None
+        self.scheduler_stop = threading.Event()
+        self.scheduler_thread = None
         with self.lock():
             if not (directory / 'state.json').exists():
                 self.save({'schema': 1, 'checking': False, 'checkedAt': None, 'checkError': None,
@@ -226,18 +229,52 @@ class Coordinator:
                 self.save(state)
             return self.public(state)
 
-    def check(self):
+    def check(self, minimum_interval=CHECK_MIN_INTERVAL):
         with self.lock():
             state = self.load()
             if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
                 return self.public(state)
-            if state.get('lastCheckStarted') and self.clock() - state['lastCheckStarted'] < CHECK_MIN_INTERVAL:
+            last_started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
+            if last_started and self.clock() - last_started < minimum_interval:
                 return self.public(state)
-            state.update(checking=True, checkError=None, planId=None, expiresAt=None, lastCheckStarted=self.clock())
+            state.update(checking=True, checkError=None, lastCheckStarted=self.clock())
             self.save(state)
             self.check_thread = threading.Thread(target=self.perform_check, daemon=True, name='stable-release-check')
             self.check_thread.start()
             return self.public(state)
+
+    def next_check_delay(self):
+        with self.lock():
+            state = self.load()
+            if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
+                return 5
+            started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
+            return max(0, min(AUTO_CHECK_INTERVAL, AUTO_CHECK_INTERVAL - (self.clock() - started))) if started else 0
+
+    def start_scheduler(self):
+        # Only the control service calls this; a standalone installer worker never schedules checks.
+        with self.thread_lock:
+            if self.scheduler_thread and self.scheduler_thread.is_alive():
+                return
+            self.scheduler_stop.clear()
+            def schedule():
+                while not self.scheduler_stop.is_set():
+                    try:
+                        self.recover()
+                        if self.scheduler_stop.wait(self.next_check_delay()):
+                            return
+                        self.check(minimum_interval=AUTO_CHECK_INTERVAL)
+                    except Exception:
+                        # A transient local read failure must not terminate future checks or spin.
+                        if self.scheduler_stop.wait(AUTO_CHECK_INTERVAL):
+                            return
+            self.scheduler_thread = threading.Thread(target=schedule, daemon=True, name='stable-release-scheduler')
+            self.scheduler_thread.start()
+
+    def stop_scheduler(self):
+        self.scheduler_stop.set()
+        if self.scheduler_thread:
+            self.scheduler_thread.join(timeout=2)
 
     def _candidate(self, installed):
         item = dict(installed)
@@ -285,17 +322,27 @@ class Coordinator:
             expires = None
             # A partial check never silently drops an installed module from the plan.
             if candidates and not failed:
-                plan_id = uuid.uuid4().hex
-                plan_directory = private_directory(self.plans / plan_id)
-                expires = iso(self.clock() + PLAN_TTL)
                 entries = []
                 for item, release in candidates:
                     entry = {key: release[key] for key in ('releaseId', 'commit', 'tag', 'version', 'manifestHash', 'installerHash', 'applicationKey')}
                     entry.update(id=item['id'], installedIdentity=item['identity'])
-                    write_bytes(plan_directory / (item['id'] + '.manifest.json'), release['manifestBytes'])
-                    write_bytes(plan_directory / (item['id'] + '.install.sh'), release['installer'])
                     entries.append(entry)
-                write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
+                with self.lock():
+                    previous = self.load().get('planId')
+                    try:
+                        plan = self.read_plan(previous) if previous else None
+                    except (UpdateError, OSError, ValueError):
+                        plan = None
+                    if plan and plan['entries'] == entries:
+                        plan_id, expires = plan['id'], plan['expiresAt']
+                if not plan_id:
+                    plan_id = uuid.uuid4().hex
+                    plan_directory = private_directory(self.plans / plan_id)
+                    expires = iso(self.clock() + PLAN_TTL)
+                    for item, release in candidates:
+                        write_bytes(plan_directory / (item['id'] + '.manifest.json'), release['manifestBytes'])
+                        write_bytes(plan_directory / (item['id'] + '.install.sh'), release['installer'])
+                    write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
             with self.lock():
                 state = self.load()
                 state.update(checking=False, checkedAt=iso(self.clock()), checkError='部分模块检查失败，暂不能开始更新' if failed else None,
@@ -344,7 +391,7 @@ class Coordinator:
                 if state.get('jobPlanId') == plan_id:
                     return self.public(state)
                 raise UpdateError(409, '已有更新任务正在执行')
-            if state['checking'] or not plan_id or state['planId'] != plan_id:
+            if state['checking'] or state.get('checkError') or not plan_id or state['planId'] != plan_id:
                 raise UpdateError(409, '更新计划已改变，请重新检查')
             try:
                 plan = self.read_plan(plan_id)
@@ -553,7 +600,11 @@ def main():
     with Server(endpoint, coordinator) as server:
         os.chown(endpoint, 0, group)
         os.chmod(endpoint, 0o660)
-        server.serve_forever(poll_interval=0.5)
+        coordinator.start_scheduler()
+        try:
+            server.serve_forever(poll_interval=0.5)
+        finally:
+            coordinator.stop_scheduler()
 
 
 if __name__ == '__main__':

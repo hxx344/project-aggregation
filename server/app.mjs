@@ -18,6 +18,7 @@ import { createTradingExecution } from './trading-execution.mjs';
 import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
+import { createUpdateStream } from './update-stream.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -128,6 +129,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set(); const loginAttempts = new Map();
   let closed = false;
+  const updateStream = createUpdateStream({ readState: updates.status,
+    isSessionActive: id => !closed && !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+  });
   let assetSync = null;
   const streams = new Map();
   const serveStatic = createStaticResponder();
@@ -285,10 +289,15 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
-    if (pathname === '/api/logout' && req.method === 'POST') { db.prepare('DELETE FROM sessions WHERE id=?').run(current.id); publishOverview(); send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` }); return; }
+    if (pathname === '/api/logout' && req.method === 'POST') { db.prepare('DELETE FROM sessions WHERE id=?').run(current.id); publishOverview(); updateStream.revalidate(); send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` }); return; }
     if (pathname === '/api/system/updates' || pathname.startsWith('/api/system/updates/')) {
       if (url.search) throw new HttpError(400, '更新接口不接受查询参数');
       if (pathname === '/api/system/updates' && req.method === 'GET') { send(res, 200, await updates.status()); return; }
+      if (pathname === '/api/system/updates/events' && req.method === 'GET') {
+        if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台订阅状态');
+        if (req.headers.origin) sameOrigin(req);
+        updateStream.subscribe(res, current.id); return;
+      }
       const action = pathname === '/api/system/updates/check' ? 'check' : pathname === '/api/system/updates/apply' ? 'apply' : null;
       if (action && req.method === 'POST') {
         const body = await bodyOf(req); validateUpdateBody(action, body);
@@ -299,7 +308,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
           if (req.headers['x-csrf-token'] !== latest.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试');
         };
         authorize();
-        send(res, 202, action === 'check' ? await updates.check() : await updates.apply(body.planId, authorize)); return;
+        try { send(res, 202, action === 'check' ? await updates.check() : await updates.apply(body.planId, authorize)); }
+        finally { void updateStream.refresh(); }
+        return;
       }
       throw new HttpError(404, '更新接口不存在');
     }
@@ -429,7 +440,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   return {
     server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
-    async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await execution.close(); await tradingImporter.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

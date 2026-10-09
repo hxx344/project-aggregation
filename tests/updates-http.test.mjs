@@ -88,7 +88,7 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
 
 test('update HTTP routes require login, Origin and CSRF and accept only their fixed inputs', async t => {
   const f = await fixture(t);
-  for (const [route, method] of [[PREFIX, 'GET'], [`${PREFIX}/check`, 'POST'], [`${PREFIX}/apply`, 'POST']]) {
+  for (const [route, method] of [[PREFIX, 'GET'], [`${PREFIX}/events`, 'GET'], [`${PREFIX}/check`, 'POST'], [`${PREFIX}/apply`, 'POST']]) {
     assert.equal((await f.request(route, { method, ...(method === 'POST' ? { body: {} } : {}) })).status, 401);
   }
   await f.login();
@@ -109,6 +109,31 @@ test('update HTTP routes require login, Origin and CSRF and accept only their fi
   const status = await f.request(PREFIX); assert.equal(status.status, 200); assert.equal(status.headers.get('cache-control'), 'no-store');
   assert.equal((await f.request(`${PREFIX}/check`, { method: 'POST', body: {} })).status, 202);
   assert.deepEqual(f.calls.map(row => row.method), ['status', 'check']);
+});
+
+test('update stream requires same-origin login, filters state, shares reads and closes revoked sessions', async t => {
+  const f = await fixture(t); await f.login();
+  assert.equal((await f.request(`${PREFIX}/events?url=other`)).status, 400);
+  assert.equal((await f.request(`${PREFIX}/events`, { originHeader: 'https://other.example' })).status, 403);
+  const crossSite = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, 'Sec-Fetch-Site': 'cross-site' } });
+  assert.equal(crossSite.status, 403);
+  f.state = { ...f.state, command: 'private-command', modules: f.state.modules.map(row => ({ ...row, path: '/private/path' })) };
+  const abort = new AbortController(); t.after(() => abort.abort());
+  const response = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, Origin: f.origin }, signal: abort.signal });
+  assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /^text\/event-stream/);
+  assert.equal(response.headers.get('x-accel-buffering'), 'no');
+  const reader = response.body.getReader(); let received = '';
+  while (!received.includes('"snapshot"')) received += new TextDecoder().decode((await reader.read()).value);
+  assert.equal(received.includes('private'), false);
+  assert.equal(f.calls.filter(row => row.method === 'status').length, 1);
+  assert.equal(f.calls.filter(row => row.method !== 'status').length, 0);
+  // A cached display snapshot must never satisfy the live-entry maintenance check.
+  f.state = { ...f.state, job: job() };
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+  assert.equal(f.calls.filter(row => row.method === 'status').length, 2);
+  await f.request('/api/logout', { method: 'POST', body: {} });
+  let done = false; while (!done) ({ done } = await reader.read());
+  assert.equal(done, true);
 });
 
 test('concurrent identical applies share acceptance and atomically block live entry while stop/reconcile remain available', async t => {

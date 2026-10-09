@@ -70,6 +70,7 @@ jobs:
       - name: Verify privileged update coordinator and service bootstrap
         run: |
           sudo python3 deploy/test-updater.py -v
+          python3 deploy/test-release-cache.py -v
           sudo bash deploy/test-update-service.sh
           sudo env AGG_UPDATER_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-update-systemd.sh
       - name: Check configuration, atomic activation, cleanup boundaries, and rollback

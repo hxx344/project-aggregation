@@ -5,7 +5,7 @@ import { api, ApiError } from './api';
 import type { UpdateJob, UpdateModule, UpdateState } from './update-types';
 import './updates.css';
 
-const CHECK_INTERVAL = 900_000;
+const STREAM_TIMEOUT = 45_000;
 const moduleLabels = { current: '已是最新', available: '可更新', unavailable: '检查未完成', unmanaged: '需手动更新' };
 const jobLabels = { queued: '更新已排队', running: '正在更新', succeeded: '更新已完成', failed: '更新未完成', interrupted: '更新已中断' };
 const stepLabels = { pending: '等待', running: '进行中', succeeded: '已完成', failed: '失败', skipped: '已跳过' };
@@ -36,26 +36,55 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const [uncertain, setUncertain] = useState(false);
   const [open, setOpen] = useState(false);
   const [review, setReview] = useState<{ planId: string; modules: UpdateModule[] } | null>(null);
+  const [, setClock] = useState(0);
   const snapshotRef = useRef<UpdateState | null>(null);
-  const requestRef = useRef<AbortController | null>(null);
-  const lastCheckAttempt = useRef(0);
+  const requestRef = useRef<{ controller: AbortController; kind: 'read' | 'check' | 'apply' } | null>(null);
+  const stateVersion = useRef(0);
+  const sessionExpired = useRef(false);
   const failedCheckAt = useRef<string | null | undefined>(undefined);
   const submittedPlan = useRef<string | null>(null);
-  const uncertainRef = useRef<{ previousJobId: string | null } | null>(null);
-  const reviewRef = useRef(false);
+  const uncertainRef = useRef<{ previousJobId: string | null; failed: boolean } | null>(null);
+  const refreshFallback = useRef<() => void>(() => {});
   const reviewElement = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
 
-  const request = useCallback(async (kind: 'read' | 'check' | 'apply', planId?: string) => {
+  const accept = useCallback((data: UpdateState, confirmMissingJob = false) => {
+    stateVersion.current++;
+    if (data.checking || (failedCheckAt.current !== undefined && data.checkedAt !== failedCheckAt.current)) {
+      failedCheckAt.current = undefined;
+      setCheckRequestFailed(false);
+    }
+    const attempt = uncertainRef.current;
+    const foundJob = !!data.job && data.job.id !== attempt?.previousJobId;
+    if (attempt && (foundJob || (attempt.failed && confirmMissingJob))) {
+      if (!foundJob && !running(data.job)) setActionNotice('已恢复连接。未发现新的更新任务，请重新检查版本后再试。');
+      uncertainRef.current = null;
+      setUncertain(false);
+    }
+    snapshotRef.current = data;
+    setSnapshot(data);
+    setUnavailable(false);
+    setNetworkError('');
+  }, []);
+
+  const request = useCallback(async (kind: 'read' | 'check' | 'apply', planId?: string, replaceRead = false) => {
+    if (sessionExpired.current || !navigator.onLine) return null;
+    if (replaceRead && requestRef.current?.kind === 'read') {
+      requestRef.current.controller.abort();
+      requestRef.current = null;
+    }
     if (requestRef.current) return null;
     const controller = new AbortController();
-    requestRef.current = controller;
+    requestRef.current = { controller, kind };
+    const version = stateVersion.current;
+    const previousJobId = snapshotRef.current?.job?.id || null;
+    const previousCheckedAt = snapshotRef.current?.checkedAt;
     setPending(kind);
-    if (kind === 'check') { lastCheckAttempt.current = Date.now(); setActionNotice(''); }
+    if (kind === 'check') setActionNotice('');
     if (kind === 'apply') {
       submittedPlan.current = planId || null;
-      uncertainRef.current = { previousJobId: snapshotRef.current?.job?.id || null };
+      uncertainRef.current = { previousJobId, failed: false };
       setActionNotice('');
     }
     try {
@@ -65,24 +94,23 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
       });
       if (controller.signal.aborted) return null;
       if (!validState(data)) throw new ApiError('更新功能尚未安装', 404);
-      if (kind === 'check' || data.checking || (failedCheckAt.current !== undefined && data.checkedAt !== failedCheckAt.current)) {
+      if (kind === 'check') {
         failedCheckAt.current = undefined;
         setCheckRequestFailed(false);
       }
-      if (kind === 'read' && uncertainRef.current) {
-        if ((!running(data.job) && data.job?.id === uncertainRef.current.previousJobId) || !data.job) setActionNotice('已恢复连接。未发现新的更新任务，请重新检查版本后再试。');
-        uncertainRef.current = null;
-        setUncertain(false);
-      }
       if (kind === 'apply') { uncertainRef.current = null; setUncertain(false); }
-      snapshotRef.current = data;
-      setSnapshot(data);
-      setUnavailable(false);
-      setNetworkError('');
-      return data;
+      // A stream snapshot received after dispatch is newer than this HTTP response.
+      if (version === stateVersion.current) accept(data, kind === 'read');
+      return snapshotRef.current;
     } catch (error) {
       if (controller.signal.aborted) return null;
-      if (error instanceof ApiError && error.status === 401) { onExpired(); return null; }
+      if (error instanceof ApiError && error.status === 401) { sessionExpired.current = true; onExpired(); return null; }
+      if (kind === 'read' && version !== stateVersion.current) return snapshotRef.current;
+      const latest = snapshotRef.current;
+      if (kind === 'check' && version !== stateVersion.current && (latest?.checking || latest?.checkedAt !== previousCheckedAt)) return latest;
+      if (kind === 'apply' && latest?.job && latest.job.id !== previousJobId) {
+        uncertainRef.current = null; setUncertain(false); return latest;
+      }
       if (error instanceof ApiError && (error.status === 404 || error.status === 501)) {
         setUnavailable(true);
         setNetworkError('');
@@ -91,44 +119,105 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
         setUncertain(false);
         setActionNotice(error.message);
         setReview(null);
-        reviewRef.current = false;
       } else {
         if (kind === 'check') { failedCheckAt.current = snapshotRef.current?.checkedAt || null; setCheckRequestFailed(true); }
-        if (kind === 'apply') { setUncertain(true); setReview(null); reviewRef.current = false; }
+        if (kind === 'apply') { uncertainRef.current = { previousJobId, failed: true }; setUncertain(true); setReview(null); }
         setNetworkError(kind === 'check' ? '检查失败，暂时无法连接更新服务。' : kind === 'apply' || running(snapshotRef.current?.job) ? '连接暂时中断，正在重连并核实更新进度。' : '暂时无法连接更新服务，正在重连。');
       }
       return null;
     } finally {
-      if (requestRef.current === controller) { requestRef.current = null; if (!controller.signal.aborted) setPending(null); }
+      if (requestRef.current?.controller === controller) { requestRef.current = null; if (!controller.signal.aborted) setPending(null); }
     }
-  }, [onExpired]);
+  }, [accept, onExpired]);
 
-  useEffect(() => () => { requestRef.current?.abort(); requestRef.current = null; }, []);
-  const active = !!snapshot?.checking || running(snapshot?.job) || uncertain;
+  useEffect(() => () => { requestRef.current?.controller.abort(); requestRef.current = null; }, []);
   useEffect(() => {
     let disposed = false;
     let ticking = false;
-    let timer: ReturnType<typeof setTimeout>;
+    let stream: EventSource | null = null;
+    let streamLive = false;
+    let receivedAt = performance.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       if (disposed || ticking) return;
       ticking = true;
       clearTimeout(timer);
       try {
-        if (navigator.onLine && (!document.hidden || active)) {
-          const data = await request('read');
-          if (!disposed && data?.enabled && !data.checking && !running(data.job) && !uncertainRef.current && !reviewRef.current && !document.hidden && Date.now() - lastCheckAttempt.current >= CHECK_INTERVAL && (!data.checkedAt || Date.now() - Date.parse(data.checkedAt) >= CHECK_INTERVAL)) await request('check');
-        }
+        if (navigator.onLine && (!streamLive || uncertainRef.current?.failed)) await request('read');
       } finally {
         ticking = false;
-        if (!disposed) timer = setTimeout(() => void tick(), active ? 2_000 : 60_000);
+        const active = snapshotRef.current?.checking || running(snapshotRef.current?.job) || uncertainRef.current;
+        if (!disposed) timer = setTimeout(() => void tick(), active ? 2_000 : 15_000);
       }
     };
-    const resume = () => { if (!document.hidden && navigator.onLine) void tick(); };
+    const disconnect = () => { stream?.close(); stream = null; streamLive = false; clearTimeout(retry); };
+    const failed = () => {
+      const wasLive = streamLive;
+      disconnect();
+      if (wasLive) void tick();
+      if (!disposed && navigator.onLine && !sessionExpired.current) retry = setTimeout(connect, 5_000);
+    };
+    const connect = () => {
+      disconnect();
+      if (disposed || !navigator.onLine || sessionExpired.current) return;
+      receivedAt = performance.now();
+      try {
+        const current = new EventSource('/api/system/updates/events');
+        stream = current;
+        current.onmessage = event => {
+          if (disposed || stream !== current || sessionExpired.current) return;
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === 'snapshot' && validState(message.state)) {
+              accept(message.state);
+              streamLive = true;
+            } else if (message.type !== 'heartbeat') throw new Error('Invalid update event');
+            receivedAt = performance.now();
+          } catch { failed(); }
+        };
+        current.onerror = () => { if (!disposed && stream === current) failed(); };
+      } catch { failed(); }
+    };
+    const resume = () => {
+      if (!navigator.onLine || disposed) return;
+      if (!stream || performance.now() - receivedAt >= STREAM_TIMEOUT) connect();
+      void request('read', undefined, true);
+    };
+    const visible = () => { if (!document.hidden) resume(); };
+    const offline = () => {
+      disconnect();
+      if (requestRef.current?.kind === 'read') { requestRef.current.controller.abort(); requestRef.current = null; setPending(null); }
+      setNetworkError('暂时无法连接更新服务，正在重连。');
+    };
+    refreshFallback.current = () => void tick();
     void tick();
-    document.addEventListener('visibilitychange', resume);
+    connect();
+    const health = setInterval(() => {
+      if (navigator.onLine && stream && performance.now() - receivedAt >= STREAM_TIMEOUT) failed();
+    }, 5_000);
+    document.addEventListener('visibilitychange', visible);
     window.addEventListener('online', resume);
-    return () => { disposed = true; clearTimeout(timer); document.removeEventListener('visibilitychange', resume); window.removeEventListener('online', resume); };
-  }, [request, active]);
+    window.addEventListener('offline', offline);
+    window.addEventListener('focus', resume);
+    window.addEventListener('pageshow', resume);
+    return () => {
+      disposed = true; disconnect(); clearTimeout(timer); clearInterval(health);
+      refreshFallback.current = () => {};
+      document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume);
+      window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume);
+    };
+  }, [accept, request]);
+
+  const active = !!snapshot?.checking || running(snapshot?.job) || uncertain;
+  useEffect(() => { if (active) refreshFallback.current(); }, [active]);
+
+  useEffect(() => {
+    const expiresIn = snapshot?.expiresAt ? Date.parse(snapshot.expiresAt) - Date.now() : 0;
+    if (expiresIn <= 0 || !Number.isFinite(expiresIn)) return;
+    const timer = setTimeout(() => setClock(value => value + 1), Math.min(expiresIn, 2_147_483_647));
+    return () => clearTimeout(timer);
+  }, [snapshot?.expiresAt]);
 
   useEffect(() => {
     if (!open) return;
@@ -149,23 +238,25 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const updating = running(snapshot?.job) || pending === 'apply';
   const needsSetup = unavailable || snapshot?.enabled === false;
   const expired = !snapshot?.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now();
+  const reviewInvalid = !!review && (review.planId !== snapshot?.planId || expired);
   const blocked = !snapshot?.enabled || !snapshot.planId || expired || !!snapshot.checkError || checkRequestFailed || !!networkError || pending !== null || updating || checking || uncertain || !changes.length || snapshot.planId === submittedPlan.current;
   const summary = networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? `${changes.length} 个可用更新` : incomplete ? '部分模块待处理' : snapshot?.checkedAt && modules.length ? '已是最新正式版' : snapshot ? '尚无检查结果' : '正在读取状态';
   const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete ? 'attention' : changes.length ? 'available' : '';
-  const close = () => { setOpen(false); setReview(null); reviewRef.current = false; requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
+  const close = () => { setOpen(false); setReview(null); requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
   const show = () => { onOpen?.(); setOpen(true); void request('read'); };
   const prepare = () => {
     if (blocked || !snapshot?.planId) return;
     setReview({ planId: snapshot.planId, modules: changes });
-    reviewRef.current = true;
   };
   const apply = async () => {
-    if (!review || blocked || review.planId !== snapshot?.planId || !snapshot.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now()) {
+    if (!review) return;
+    if (review.planId !== snapshot?.planId || !snapshot.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now()) {
       setActionNotice('版本检查结果已变化或过期，请重新检查后确认。');
-      setReview(null); reviewRef.current = false; return;
+      setReview(null); return;
     }
+    if (blocked) return;
     const data = await request('apply', review.planId);
-    if (data) { setReview(null); reviewRef.current = false; }
+    if (data) setReview(null);
   };
 
   return <><button ref={trigger} className={`nav-item update-nav ${tone}`} aria-label={`系统更新：${summary}`} aria-haspopup="dialog" onClick={show}>{updating || checking || uncertain ? <LoaderCircle size={19} className="spin" /> : <Download size={19} />}<span>系统更新<small>{summary}</small></span><ChevronRight size={15} /></button>{open ? createPortal(<dialog ref={dialog} className="update-dialog" aria-labelledby="update-title" aria-describedby="update-description" onCancel={event => { event.preventDefault(); close(); }}><div className="update-dialog-content"><header className="update-header"><div><h2 id="update-title">系统更新</h2><p id="update-description">工作台与本机已安装模块 · 仅正式版本</p></div><button className="icon-button" aria-label="关闭系统更新" onClick={close}><X size={21} /></button></header><div className="update-body">
@@ -175,6 +266,6 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}
     {modules.length ? <section aria-labelledby="update-modules-title"><div className="update-section-heading"><h3 id="update-modules-title">本机模块</h3><span>{modules.length} 个已安装</span></div><ul className="update-modules">{modules.map(module => <ModuleRow key={module.id} module={module} />)}</ul></section> : snapshot?.enabled && !checking ? <p className="update-empty">尚未识别到可更新的本机模块，请重新检查。</p> : null}
-    {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3><p>将更新 {review.modules.map(module => module.name).join('、')}，共 {review.modules.length} 个模块。</p><p>变更模块会短暂重启。请先完成这些模块中正在进行的操作。</p>{blocked || review.planId !== snapshot?.planId ? <p role="alert">版本检查结果已变化或过期，请返回重新检查。</p> : null}</section> : changes.length && !updating ? <p className="update-footnote">仅更新有新正式版本的模块；变更模块会短暂重启。</p> : null}
-  </div><footer className="update-footer">{review ? <><button className="button secondary" disabled={pending === 'apply'} onClick={() => { setReview(null); reviewRef.current = false; }}>返回</button><button className="button primary" disabled={blocked || review.planId !== snapshot?.planId} onClick={() => void apply()}>{pending === 'apply' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}确认更新 {review.modules.length} 个模块</button></> : <><button className="button secondary" disabled={pending !== null || checking || updating || uncertain || needsSetup} onClick={() => void request('check')}><RefreshCw size={16} className={checking ? 'spin' : ''} />{checking ? '正在检查' : '检查更新'}</button>{changes.length ? <button className="button primary" disabled={blocked} onClick={prepare}>{updating ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{updating ? '正在更新' : expired || snapshot?.planId === submittedPlan.current ? '请先重新检查' : '查看更新'}</button> : <span className="update-channel">正式版本</span>}</>}</footer></div></dialog>, document.body) : null}</>;
+    {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3><p>将更新 {review.modules.map(module => module.name).join('、')}，共 {review.modules.length} 个模块。</p><p>变更模块会短暂重启。请先完成这些模块中正在进行的操作。</p>{reviewInvalid ? <p role="alert">版本检查结果已变化或过期，请返回重新检查。</p> : null}</section> : changes.length && !updating ? <p className="update-footnote">仅更新有新正式版本的模块；变更模块会短暂重启。</p> : null}
+  </div><footer className="update-footer">{review ? <><button className="button secondary" disabled={pending === 'apply'} onClick={() => setReview(null)}>返回</button><button className="button primary" disabled={blocked || reviewInvalid} onClick={() => void apply()}>{pending === 'apply' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}确认更新 {review.modules.length} 个模块</button></> : <><button className="button secondary" disabled={pending !== null || checking || updating || uncertain || needsSetup} onClick={() => void request('check')}><RefreshCw size={16} className={checking ? 'spin' : ''} />{checking ? '正在检查' : '检查更新'}</button>{changes.length ? <button className="button primary" disabled={blocked} onClick={prepare}>{updating ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{updating ? '正在更新' : expired || snapshot?.planId === submittedPlan.current ? '请先重新检查' : '查看更新'}</button> : <span className="update-channel">正式版本</span>}</>}</footer></div></dialog>, document.body) : null}</>;
 }

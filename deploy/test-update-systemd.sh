@@ -90,6 +90,22 @@ systemctl is-active --quiet "$UPDATER_SERVICE"
 api_pid=$(systemctl show --property=MainPID --value "$UPDATER_SERVICE")
 [[ "$api_pid" =~ ^[1-9][0-9]*$ ]]
 
+# The root service performs its first check even before a browser or socket client connects.
+/usr/bin/python3 -I - <<'PY'
+import json, time
+from pathlib import Path
+state_file = Path('/var/lib/project-aggregation-updater/state.json')
+for attempt in range(50):
+    if state_file.exists():
+        state = json.loads(state_file.read_text())
+        if state.get('checkedAt') and not state['checking']:
+            assert state['modules'] == [] and state['job'] is None, state
+            break
+    if attempt == 49:
+        raise AssertionError('The root scheduler did not check without a connected client')
+    time.sleep(0.1)
+PY
+
 # Only an AF_UNIX connection is constructed; GET /status cannot initiate version checks or installers.
 runuser -u project-aggregation -- /usr/bin/python3 -I - <<'PY'
 import http.client, json, socket, time
@@ -131,4 +147,4 @@ systemctl is-active --quiet "$UPDATER_SERVICE"
 [[ $(systemctl show --property=MainPID --value "$UPDATER_SERVICE") == "$api_pid" ]]
 ensure_update_service "$fixture/release"
 [[ $(systemctl show --property=MainPID --value "$UPDATER_SERVICE") == "$api_pid" ]]
-printf 'Real updater systemd startup, socket authorization, worker isolation and no-op update passed.\n'
+printf 'Real updater systemd startup, autonomous check, socket authorization, worker isolation and no-op update passed.\n'
