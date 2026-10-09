@@ -76,6 +76,8 @@ jobs:
         run: bash deploy/test-environment.sh
       - name: Check stack caching, dependency batching, failure recovery and signals
         run: sudo bash deploy/test-all.sh
+      - name: Check CI stack preflight and selected release pinning
+        run: sudo bash deploy/test-stack-ci.sh
 
   release:
     needs: [app, installer]

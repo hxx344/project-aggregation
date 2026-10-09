@@ -82,13 +82,13 @@ ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash
 ```
 
-完整部署支持 Ubuntu 24.04、Debian 12/13，x64/arm64，使用 systemd。Variational Grid 和 Greeks 要求 Python 3.11+；Greeks 不支持 Ubuntu 22.04，可用 `--only aster,monitor,asset,crossex,hub` 更新其余项目。脚本在安装任何项目之前检查此条件。下载命令需要系统已有 curl 和 CA 证书；极简新系统若缺少它们，先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`，以后无需重复。脚本合并安装其他缺失的系统依赖，最多并发准备三个小安装器，全部下载和语法检查完成后才逐个执行，平台最后部署。安装器使用条件请求与本地校验缓存；未变化时复用脚本，依赖齐全时跳过系统包更新和安装。各项目按自己的版本、配置、运行环境和健康检查决定是否需要下载源码、安装依赖、构建或重启。
+完整部署支持 Ubuntu 24.04、Debian 12/13，x64/arm64，使用 systemd。Variational Grid 和 Greeks 要求 Python 3.11+；Ubuntu 22.04 可用 `--only aster,monitor,asset,crossex,hub` 更新其余项目。脚本在部署前检查系统条件、全部所选安装器与 CI 部署包是否就绪，最多并发准备三个项目，平台最后部署。下载命令需要系统已有 curl 和 CA 证书；极简新系统缺少时先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`。其他系统依赖只在缺少时安装。
 
 部署时实时显示进度，每个项目完成后显示耗时，最后汇总结果。完整日志保存在 `/var/log/project-aggregation-stack/`，仅 root 可读。某个项目失败立即停止后续部署，保留之前成功的项目；修复原因后重跑同一命令即可。重跑仍检查每个项目，不会因历史成功记录而漏掉配置修改或服务停止。
 
 只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,variational,greeks,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
 
-服务器部署默认跳过工作台和 CrossEx 的完整行为测试，GitHub CI 继续执行测试；类型检查、构建、配置和服务健康检查保留。需要部署时补测，把命令末尾改为 `sudo bash -s -- --with-tests`；已通过且内容未变的测试结果仍复用。单独运行这两个项目的安装器时，可用 `sudo env PROJECT_DEPLOY_TESTS=1 bash install.sh` 开启。
+默认使用 GitHub CI 已验证并发布的部署包：服务器下载与校验成品，不运行 npm 安装、类型检查、测试或前端编译。Node/Python 运行环境仍按需准备，Python 依赖按锁定内容和环境缓存。相同应用内容、配置与运行环境且健康时跳过下载及重启；CI 尚未发布新包时继续使用上次成功发布版本，首次没有可用包则停止。原配置、密码和数据库保留。开发排查可显式设置 `PROJECT_DEPLOY_MODE=source` 恢复源码部署；`--with-tests` / `PROJECT_DEPLOY_TESTS=1` 仅在此模式补测工作台与 CrossEx，在 CI 模式不重复测试。
 
 部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
 
@@ -156,7 +156,7 @@ Greeks 安装器支持 Debian 12/13、Ubuntu 24.04，使用单进程 `greeks.ser
 sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install.sh -o "$f"; bash "$f"; rm -f "$f"'
 ```
 
-脚本安装缺失依赖，复用可用的 Node.js 24.15.0 或更高的 24.x 版本；需要安装时，从 Node.js 官方下载固定版本并核验官方 SHA-256。构建与服务使用专用 `project-aggregation` 用户。工作台默认仅监听 `127.0.0.1:3100`。
+脚本安装缺失依赖，复用可用的 Node.js 24.15.0 或更高的 24.x 版本；需要安装时，从 Node.js 官方下载固定版本并核验官方 SHA-256。CI 完成构建，服务器以专用 `project-aggregation` 用户运行程序。工作台默认仅监听 `127.0.0.1:3100`。
 
 首次登录密码只在第一次启动时写入服务日志，在服务器查看：
 
@@ -245,7 +245,7 @@ Asset 后台同步可在项目设置中开关。启用、项目未停用且已�
 | `/opt/project-aggregation/current` | 当前程序版本的符号链接。 |
 | `/opt/project-aggregation/previous` | 上一个成功版本；更新完成后保留当前和前一版本。 |
 | `/opt/project-aggregation/.last-successful.env` | 上次健康启动的环境配置快照，仅 root 可读，供失败回滚使用。 |
-| `/opt/project-aggregation/cache` | 按内容和运行环境缓存依赖、前端构建及验证结果。 |
+| `/opt/project-aggregation/cache` | 按 SHA-256 缓存 CI 部署包；显式源码模式仍保留独立构建缓存。 |
 | `/etc/systemd/system/project-aggregation.service` | 自动管理的服务配置；使用环境文件修改监听地址等选项。 |
 
 环境文件使用无引号的 `KEY=value`：
@@ -274,7 +274,7 @@ sudo systemctl status project-aggregation
 sudo journalctl -u project-aggregation -f
 ```
 
-更新没有变化且服务健康时，会跳过源码下载、依赖安装、检查、构建和重启。仅文档变化会跳过应用更新；依赖不变复用安装结果，前端内容不变复用构建结果。新版本保留类型检查、构建和健康检查，完整行为测试默认由 CI 执行；部署时显式开启的测试失败仍会阻止发布，跳过不会写入测试成功缓存。同一版本事后补测不重建、不重启服务。启动失败自动恢复前一程序版本、systemd 配置及上次健康启动的环境配置，并按旧地址和端口检查恢复结果。用户本次修改的配置另存为 `/etc/project-aggregation.env.failed-时间-PID`（仅 root 可读），可以修正后重新使用；首次安装失败保持当前配置原样。不会把持久数据恢复成旧副本，也不会删除未知目录。
+更新没有变化且服务健康时，跳过部署包下载和重启；仅文档或测试变化不更新运行产物。新应用包通过固定提交地址下载并校验 SHA-256、路径及包内版本，准备成功后才原子切换。配置变化复用当前程序。启动失败自动恢复前一程序版本、systemd 配置及上次健康配置，并按旧地址和端口检查恢复结果；未生效的新配置另存为 `/etc/project-aggregation.env.failed-时间-PID`（仅 root 可读）。首次安装失败保持已有配置和数据，不删除未知目录。
 
 备份时停止服务，保存完整的数据目录与环境文件，再启动服务。`hub.sqlite` 和 `credentials.key` 必须一起保留；运行中的 SQLite 还可能有 WAL 文件，不要只复制单个数据库文件。密钥丢失时服务器会拒绝启动，防止已有凭据被错误覆盖。
 
@@ -294,4 +294,4 @@ npm start
 
 生产启动默认地址为 [http://127.0.0.1:3100](http://127.0.0.1:3100)。完整原页面代理请先构建，再通过 3100 验证。仅开发工作台界面时，在后端环境设置 `PUBLIC_ORIGIN=http://127.0.0.1:5173`，然后在两个终端分别运行 `npm run dev:server` 和 `npm run dev`；Vite 位于 [http://127.0.0.1:5173](http://127.0.0.1:5173)，代理摘要和管理接口到后端。Vite 预览不提供原项目页面代理。开发数据默认放在未提交的 `.data/`。
 
-GitHub Actions 在 Windows（Node 24.x）、Ubuntu（Node 24.15.0 和 24.x）分别执行类型检查、行为测试和构建；另一个 Ubuntu job 检查安装脚本语法、原子切换、清理边界、程序回滚及端口配置冲突后的恢复。测试使用模拟上游，不等于连接了你的 Linux 服务器或真实交易账户。是否真实连通，以部署后页面的状态和源数据时间为准。本项目不使用 WSL 验证。
+GitHub Actions 在 Windows（Node 24.x）、Ubuntu（Node 24.15.0 和 24.x）分别执行类型检查、行为测试和构建；另一个 Ubuntu job 检查安装脚本、CI 包校验、从源码部署迁移、无变化跳过、损坏包拒绝及启动失败后的恢复。必要任务全部成功后自动发布 `deploy-提交号` Release；真实构建产物复用，不为打包重复编译。测试使用模拟上游，不等于连接了你的 Linux 服务器或真实交易账户。是否真实连通，以部署后页面的状态和源数据时间为准。本项目不使用 WSL 验证。

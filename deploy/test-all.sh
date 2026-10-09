@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Contract tests for orchestration; no real network, package install or service changes.
 set -Eeuo pipefail
+export PROJECT_DEPLOY_MODE=source
 AGG_STACK_SOURCE_ONLY=1 source "$(dirname "$0")/../install-all.sh"
 test_parent=$(realpath "${TMPDIR:-/tmp}")
 test_root=$(mktemp -d "$test_parent/project-stack-test.XXXXXXXX")

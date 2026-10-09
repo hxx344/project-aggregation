@@ -160,7 +160,7 @@ legacy=$(readlink "$fixture/application/current")
 cp "$fixture/environment" "$fixture/original.env"
 printf 'keep this data\n' > "$fixture/data/keep.txt"
 make_package initial
-export PROJECT_DEPLOY_MODE=ci
+unset PROJECT_DEPLOY_MODE
 run_install
 expect_counts 1 1 0 1 2
 [[ $(readlink "$fixture/application/current") != "$legacy" && $(archives) == 1 ]]
