@@ -6,6 +6,8 @@
 
 Asset 支持 OKX 只读账户资产：在 Asset 的“交易所连接”填写国际站 API Key、Secret 和 Passphrase，验证后按 OKX 返回的美元总资产估值入账，并展示账户分项。工作台同步识别 OKX 来源，保留其源时间及失败旧值。升级两端可执行 `curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
 
+Asset 新增 Var / Variational 真实账户资产：在 Asset“交易所连接”的 Var 卡片填写 Omni 网页 `vr-token`，按账户总权益与 USDC/USD 汇率入账；会话令牌加密保存，账本仅读取固定资产接口。工作台识别 `variational` 来源，失败保留旧值和更新时间；Var 模拟策略数据仍不计入资产。该功能随 Asset 与工作台对应正式版发布后，可使用上面的两端升级命令安装。
+
 ## 首版提供什么
 
 - 总览：资产账本摘要与历史曲线、交易账户和占用保证金、原油价差、连接与数据时效。
