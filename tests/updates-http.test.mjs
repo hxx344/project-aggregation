@@ -19,7 +19,7 @@ const state = () => ({ enabled: true, checking: false, checkedAt: stamp, checkEr
 const job = (status = 'running') => ({ id: 'update-job', status, startedAt: stamp, finishedAt: status === 'running' ? null : stamp, activeModule: null, steps: [], message: '更新状态' });
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
-async function fixture(t, { client, initialMaintenance = false } = {}) {
+async function fixture(t, { client, initialMaintenance = false, initialPendingPlanId = null } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-updates-http-'));
   const calls = [], jobs = [], handlers = {};
   let current = null, value = state();
@@ -31,12 +31,15 @@ async function fixture(t, { client, initialMaintenance = false } = {}) {
   }]));
   const app = await createApp({ dataDir, initialPassword: PASSWORD, refreshInterval: 0, assetSyncIntervalMs: 0,
     tradingRefreshIntervalMs: 0, executionIntervalMs: 0, updatesClient, secureCookies: false, publicOrigin: '', logger: () => {} });
-  if (initialMaintenance) {
+  const restart = initialMaintenance || initialPendingPlanId;
+  if (restart) {
     await app.close();
     const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
-    db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updates-maintenance', '1'); db.close();
+    db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updates-maintenance', initialMaintenance ? '1' : '0');
+    if (initialPendingPlanId) db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updates-pending-plan', initialPendingPlanId);
+    db.close();
   }
-  const live = initialMaintenance ? await createApp({ dataDir, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0,
+  let live = restart ? await createApp({ dataDir, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0,
     executionIntervalMs: 0, updatesClient, secureCookies: false, publicOrigin: '', logger: () => {} }) : app;
   const executionCalls = [];
   live.execution.state = () => ({ jobs: structuredClone(jobs) });
@@ -47,7 +50,7 @@ async function fixture(t, { client, initialMaintenance = false } = {}) {
     return { jobs: structuredClone(jobs) };
   };
   await new Promise(resolve => live.server.listen(0, '127.0.0.1', resolve));
-  const origin = `http://127.0.0.1:${live.server.address().port}`;
+  let origin = `http://127.0.0.1:${live.server.address().port}`;
   t.after(async () => {
     await live.close();
     const target = path.resolve(dataDir); assert.equal(path.dirname(target), path.resolve(os.tmpdir()));
@@ -68,7 +71,18 @@ async function fixture(t, { client, initialMaintenance = false } = {}) {
     const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'), { readOnly: true });
     try { return db.prepare('SELECT value FROM settings WHERE key=?').get('updates-maintenance')?.value === '1'; } finally { db.close(); }
   }
-  return { app: live, calls, jobs, handlers, executionCalls, request, login, origin, maintenance,
+  function pendingPlanId() {
+    const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'), { readOnly: true });
+    try { return db.prepare('SELECT value FROM settings WHERE key=?').get('updates-pending-plan')?.value || null; } finally { db.close(); }
+  }
+  async function restartApp() {
+    await live.close();
+    live = await createApp({ dataDir, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0,
+      executionIntervalMs: 0, updatesClient, secureCookies: false, publicOrigin: '', logger: () => {} });
+    await new Promise(resolve => live.server.listen(0, '127.0.0.1', resolve));
+    origin = `http://127.0.0.1:${live.server.address().port}`;
+  }
+  return { get app() { return live; }, calls, jobs, handlers, executionCalls, request, login, get origin() { return origin; }, maintenance, pendingPlanId, restartApp,
     get session() { return current; }, set state(next) { value = next; }, get state() { return value; } };
 }
 
@@ -183,6 +197,108 @@ test('uncertain update acceptance retains the gate and a definitive failed conne
   assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 503); assert.equal(f.maintenance(), true);
   f.state = unavailableUpdateState();
   assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+});
+
+test('a timed-out queued apply keeps every live entry blocked through idle and old terminal states until its plan clears', async t => {
+  const f = await fixture(t); await f.login();
+  const releaseRoot = deferred(), accepted = deferred();
+  f.handlers.apply = requested => {
+    void releaseRoot.promise.then(() => {
+      if (f.state.planId === requested) f.state = { ...f.state, job: job() };
+      accepted.resolve();
+    });
+    throw new UpdateError(503, '连接后等待更新结果超时', { uncertain: true });
+  };
+  const entries = [[`${EXECUTION}/jobs`, 'POST'], [`${EXECUTION}/preview`, 'POST'],
+    [`${EXECUTION}/accounts/binance`, 'PUT'], [`${EXECUTION}/accounts/binance`, 'DELETE']];
+  async function assertBlocked() {
+    for (const [route, method] of entries) assert.equal((await f.request(route, { method, body: {} })).status, 409);
+    assert.equal(f.maintenance(), true); assert.equal(f.pendingPlanId(), planId);
+    assert.equal(f.executionCalls.length, 0);
+  }
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 503);
+  for (const previous of [null, { ...job('succeeded'), id: 'previous-job' }, { ...job('failed'), id: 'previous-job' }]) {
+    f.state = { ...f.state, job: previous };
+    assert.equal((await f.request(PREFIX)).status, 200);
+    assert.equal((await f.request(`${PREFIX}/check`, { method: 'POST', body: {} })).status, 202);
+    await assertBlocked();
+  }
+  releaseRoot.resolve(); await accepted.promise;
+  assert.equal(f.state.job.status, 'running'); await assertBlocked();
+  f.state = { ...f.state, planId: null, expiresAt: null, job: job('succeeded') };
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 202);
+  assert.equal(f.maintenance(), false); assert.equal(f.pendingPlanId(), null);
+});
+
+test('a pending plan survives restart even if the maintenance flag write had not completed', async t => {
+  for (const initialMaintenance of [true, false]) {
+    const f = await fixture(t, { initialMaintenance, initialPendingPlanId: planId }); await f.login();
+    f.state = { ...f.state, job: { ...job('succeeded'), id: 'previous-job' } };
+    assert.equal((await f.request(PREFIX)).status, 200);
+    assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+    assert.equal(f.pendingPlanId(), planId); assert.equal(f.executionCalls.length, 0);
+    f.state = { ...f.state, planId: null, expiresAt: null };
+    assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 202);
+    assert.equal(f.pendingPlanId(), null);
+  }
+});
+
+test('recovering a pending plan persists maintenance before an accepted retry clears the pending setting', async t => {
+  const f = await fixture(t, { initialMaintenance: false, initialPendingPlanId: planId }); await f.login();
+  assert.equal(f.maintenance(), true, 'pending restoration must repair the durable maintenance flag');
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 202);
+  assert.equal(f.state.job.status, 'running');
+  assert.equal(f.maintenance(), true); assert.equal(f.pendingPlanId(), null);
+  f.state = unavailableUpdateState();
+  await f.restartApp();
+  assert.equal((await f.request(PREFIX)).data.enabled, false);
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+  assert.equal(f.maintenance(), true); assert.equal(f.pendingPlanId(), null);
+});
+
+test('a newly checked plan invalidates delayed acceptance and safely releases the pending latch', async t => {
+  const f = await fixture(t); await f.login();
+  const releaseRoot = deferred(), settled = deferred();
+  let accepted = false;
+  f.handlers.apply = requested => {
+    void releaseRoot.promise.then(() => {
+      if (f.state.planId === requested) { accepted = true; f.state = { ...f.state, job: job() }; }
+      settled.resolve();
+    });
+    throw new UpdateError(503, '连接后等待更新结果超时', { uncertain: true });
+  };
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 503);
+  assert.equal(f.pendingPlanId(), planId);
+  f.handlers.check = () => { f.state = { ...f.state, planId: 'b'.repeat(64) }; return f.state; };
+  assert.equal((await f.request(`${PREFIX}/check`, { method: 'POST', body: {} })).status, 202);
+  assert.equal(f.pendingPlanId(), null); assert.equal(f.maintenance(), false);
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 202);
+  releaseRoot.resolve(); await settled.promise;
+  assert.equal(accepted, false); assert.equal(f.state.job, null);
+});
+
+test('a definitive retry failure restores an older pending plan instead of discarding its maintenance guard', async t => {
+  const f = await fixture(t, { initialMaintenance: true, initialPendingPlanId: planId }); await f.login();
+  f.handlers.apply = () => { throw new UpdateError(503, '连接更新服务失败', { uncertain: false }); };
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 503);
+  assert.equal(f.pendingPlanId(), planId); assert.equal(f.maintenance(), true);
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+});
+
+test('a different apply cannot replace an unresolved plan until root confirms the original plan is invalid', async t => {
+  const f = await fixture(t, { initialMaintenance: true, initialPendingPlanId: planId }); await f.login();
+  const nextPlanId = 'b'.repeat(64);
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId: nextPlanId } })).status, 409);
+  assert.equal(f.calls.filter(call => call.method === 'apply').length, 0);
+  assert.equal(f.pendingPlanId(), planId); assert.equal(f.maintenance(), true);
+  assert.equal((await f.request(PREFIX)).status, 200);
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+  f.state = { ...f.state, planId: nextPlanId };
+  assert.equal((await f.request(`${PREFIX}/check`, { method: 'POST', body: {} })).status, 202);
+  assert.equal(f.pendingPlanId(), null); assert.equal(f.maintenance(), false);
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId: nextPlanId } })).status, 202);
+  assert.deepEqual(f.calls.filter(call => call.method === 'apply').map(call => call.args), [[nextPlanId]]);
+  assert.equal(f.maintenance(), true);
 });
 
 test('an uninstalled helper does not prevent normal startup or existing live entry', async t => {

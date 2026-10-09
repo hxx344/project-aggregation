@@ -94,11 +94,19 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {} }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {} }) {
+  let pendingPlanId = readPendingPlanId();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
   function remember(value) { if (maintenance !== value) { writeMaintenance(value); maintenance = value; } }
+  function rememberPending(value) { if (pendingPlanId !== value) { writePendingPlanId(value); pendingPlanId = value; } }
+  if (pendingPlanId) remember(true);
   function observe(state) {
-    if (state.enabled) remember(ACTIVE.has(state.job?.status));
+    if (state.enabled) {
+      // A timed-out request may still be waiting for root's lock. Idle state is
+      // conclusive only after that request's plan can no longer be accepted.
+      if (ACTIVE.has(state.job?.status) || pendingPlanId && state.planId === pendingPlanId) remember(true);
+      else { rememberPending(null); remember(false); }
+    }
     return state;
   }
   async function status() {
@@ -129,9 +137,12 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       if (applying.planId !== planId) throw new UpdateError(409, MAINTENANCE);
       return applying.promise;
     }
+    if (pendingPlanId && pendingPlanId !== planId) throw new UpdateError(409, MAINTENANCE);
     if (entries || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status))) throw new UpdateError(409, '请先停止所有实盘任务并完成委托核对，再更新系统');
     generation += 1;
-    const previous = maintenance;
+    const previous = { maintenance, pendingPlanId };
+    // Persist the plan first; restoration also treats a pending plan as maintenance.
+    rememberPending(planId);
     remember(true);
     const pending = { planId, promise: null };
     applying = pending;
@@ -140,11 +151,12 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
         // Run authorization again immediately before sending the privileged request.
         authorize();
         const state = publicUpdateState(await client.apply(planId));
+        rememberPending(null);
         observe(state);
         return state;
       } catch (error) {
         // A timeout may follow successful acceptance. Keep the durable latch until status confirms completion.
-        if (error instanceof UpdateError && !error.uncertain) remember(previous);
+        if (error instanceof UpdateError && !error.uncertain) { rememberPending(previous.pendingPlanId); remember(previous.maintenance); }
         throw error;
       } finally { if (applying === pending) { generation += 1; applying = null; } }
     })();
