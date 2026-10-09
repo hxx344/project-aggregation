@@ -205,6 +205,10 @@ stack_summary() {
   done
   stack_log "总耗时：$((SECONDS - stack_started)) 秒"
   [[ -z "$stack_run" ]] || stack_log "本次日志：$stack_run（仅 root 可读，可能含首次登录信息）"
+  if [[ " ${stack_selected[*]} " == *' greeks '* && ${stack_status[greeks]:-} == '完成检查/部署' ]]; then
+    stack_log "Greeks 登录用户名和密码查看命令：sudo grep '^DASHBOARD_' /etc/greeks/greeks.env"
+    stack_log '在工作台“项目管理 → Greeks · BTC 期权”中填写该命令显示的 DASHBOARD_USERNAME 和 DASHBOARD_PASSWORD。'
+  fi
 }
 
 stack_signal() {

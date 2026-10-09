@@ -31,6 +31,8 @@ Variational Grid 使用独立安装器 `hxx344/variational-grid/main/install.sh`
 
 Greeks 使用 `hxx344/greeks/main/install.sh`，总部署名称为 `greeks`，可通过 `--only greeks,hub` 更新两端。支持 Debian 12/13、Ubuntu 24.04，默认回环端口 `8000`、单进程 `greeks.service`，配置位于 `/etc/greeks/greeks.env`、状态位于 `/var/lib/greeks`。Ubuntu 22.04 选择 Greeks 时在安装前拒绝，需选择其他模块。新安装生成独立面板密码，默认模拟且不自动开仓；已有交易模式、凭据及状态保留。工作台项目管理保存其面板 Basic 凭据后即可自动登录。重复执行按变化更新，健康失败恢复上一程序版本，具体更新和跳过项见安装日志。
 
+Greeks 本次完成检查或部署后，总部署最终摘要会提示运行 `sudo grep '^DASHBOARD_' /etc/greeks/greeks.env` 查看用户名和密码，并说明在“项目管理”填写；即使后续工作台部署失败，该提示仍会保留在终端和 `summary.txt`。Greeks 未选择、未执行或失败时不显示此成功提示。
+
 ## 目录与更新行为
 
 安装器仅管理 `/opt/project-aggregation` 内自己标记的程序版本及固定名称的 systemd 服务。初次发现非空且没有管理标记的目录或同名未知服务时停止，不覆盖现有内容。

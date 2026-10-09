@@ -17,6 +17,10 @@ mkdir -p "$STACK_CACHE" "$STACK_LOGS" "$test_root/upstream"
 umask 077
 
 assert() { "$@" || { printf 'Assertion failed: %s\n' "$*" >&2; exit 1; }; }
+greeks_credentials_command="sudo grep '^DASHBOARD_' /etc/greeks/greeks.env"
+assert_no_greeks_credentials_hint() {
+  if grep -Fq "$greeks_credentials_command" "$1"; then echo 'Greeks credential hint without successful deployment' >&2; exit 1; fi
+}
 new_run() {
   stack_run=$(mktemp -d "$STACK_LOGS/run.XXXXXX")
   stack_status=() stack_seconds=() stack_workers=()
@@ -129,13 +133,18 @@ grep -q 'install .*curl' "$test_root/apt"
 grep -q 'install .*python3-venv' "$test_root/apt"
 rm "$test_root/missing-packages"
 
-# Fresh deployment prefetches every script and runs all six, with the hub last.
+# Fresh deployment prefetches every script and runs all seven, with the hub last.
 new_run
+stack_summary > "$test_root/not-run-summary"
+assert_no_greeks_credentials_hint "$test_root/not-run-summary"
 stack_prefetch
 for item in "${STACK_ORDER[@]}"; do assert stack_cache_valid "$STACK_CACHE/$item"; done
 stack_run_installers <<< 'Coordinator input must never reach a module installer.'
 printf '%s\n' "${STACK_ORDER[@]}" > "$test_root/expected"
 cmp "$test_root/expected" "$test_root/executed"
+stack_summary > "$test_root/success-summary"
+grep -Fq "$greeks_credentials_command" "$test_root/success-summary"
+grep -Fq '项目管理 → Greeks · BTC 期权' "$test_root/success-summary"
 
 # A cached script is revalidated and still executed: configuration/health must never be skipped.
 : > "$test_root/executed"
@@ -197,12 +206,37 @@ if stack_run_installers; then echo 'Installer failure accepted' >&2; exit 1; els
 printf 'aster\nmonitor\n' > "$test_root/expected-failure"
 cmp "$test_root/expected-failure" "$test_root/executed"
 [[ ! -e "$stack_run/asset.log" && ! -e "$stack_run/hub.log" ]]
+stack_summary > "$test_root/early-failure-summary"
+assert_no_greeks_credentials_hint "$test_root/early-failure-summary"
 rm "$test_root/fail-monitor"
 : > "$test_root/executed"
 new_run
 stack_prefetch
 stack_run_installers
 cmp "$test_root/expected" "$test_root/executed"
+
+# The EXIT summary preserves Greeks login guidance even when a later installer fails.
+for failing in hub greeks; do
+  new_run
+  stack_parse --only greeks,hub
+  stack_prefetch
+  touch "$test_root/fail-$failing"
+  set +e
+  (set -e; trap stack_finish EXIT; stack_run_installers) > "$test_root/credentials-$failing.log" 2>&1
+  result=$?
+  set -e
+  [[ $result == 23 ]]
+  if [[ "$failing" == hub ]]; then
+    grep -Fq "$greeks_credentials_command" "$test_root/credentials-$failing.log"
+    grep -Fq "$greeks_credentials_command" "$stack_run/summary.txt"
+    grep -Fq '项目管理 → Greeks · BTC 期权' "$stack_run/summary.txt"
+  else
+    assert_no_greeks_credentials_hint "$test_root/credentials-$failing.log"
+    assert_no_greeks_credentials_hint "$stack_run/summary.txt"
+    [[ ! -e "$stack_run/hub.log" ]]
+  fi
+  rm "$test_root/fail-$failing"
+done
 
 # Targeted deployment keeps canonical order and only fetches/runs selected modules.
 : > "$test_root/executed"
@@ -215,6 +249,8 @@ printf 'crossex\nhub\n' > "$test_root/expected-subset"
 cmp "$test_root/expected-subset" "$test_root/executed"
 [[ $(wc -l < "$test_root/downloads") == 2 ]]
 grep -q $'^hub\t$' "$test_root/downloads"
+stack_summary > "$test_root/unselected-summary"
+assert_no_greeks_credentials_hint "$test_root/unselected-summary"
 
 if [[ $(uname -s) == Linux ]]; then
   [[ $(stat -c %a "$stack_run") == 700 && $(stat -c %a "$stack_run/hub.log") == 600 ]]
