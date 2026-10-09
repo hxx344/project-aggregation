@@ -31,6 +31,7 @@ cat > "$fixture/runtime/node" <<'NODE'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 if [[ $1 == --version ]]; then cat "$FIXTURE_ROOT/node-version"; exit; fi
+if [[ $1 == --input-type=module ]]; then shift; fi
 if [[ $1 == -e ]]; then
   if [[ -n ${VITE_FIXTURE_VALUE:-} ]]; then printf '[["VITE_FIXTURE_VALUE","%s"]]\n' "$VITE_FIXTURE_VALUE"; else printf '[]\n'; fi
   exit

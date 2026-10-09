@@ -4,6 +4,7 @@ ci_release_resolve() {
   local repository=$1 workspace=$2 manifest values
   [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
   CI_RELEASE_REPOSITORY=$repository
+  # shellcheck disable=SC2034 # Part of the shared installer interface.
   CI_RELEASE_WORK=$workspace
   mkdir -p -- "$workspace" || return 1
   manifest="$workspace/release-manifest.json"
@@ -45,6 +46,7 @@ CI_MANIFEST_PY
   CI_RELEASE_FILE=${fields[2]}
   CI_RELEASE_SHA256=${fields[3]}
   CI_RELEASE_APPLICATION_KEY=${fields[4]}
+  # shellcheck disable=SC2034 # Python applications do not consume the Node version.
   CI_RELEASE_NODE_VERSION=${fields[5]:-}
   printf '[CI] %s 最新可用部署包：%s。\n' "$repository" "${CI_RELEASE_COMMIT:0:12}"
 }
