@@ -3,8 +3,45 @@ import { addDecimals, compareDecimals, decimal } from './trading-decimal.mjs';
 const DAY = 86_400_000;
 export const PNL_INTERVAL = 60_000;
 const MAX_AGE = 75_000, MAX_SKEW = 45_000;
+const EXCHANGES = ['binance', 'bybit', 'okx'];
 const validTime = value => Number.isSafeInteger(value) && value >= 0;
 const stamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
+
+function pairSource(entries) {
+  if (entries.length !== 2) throw new TypeError('PnL requires exactly two exchanges');
+  // Older callers supplied Binance and Bybit in that order without exchange IDs.
+  const sources = entries.map((entry, index) => ({ entry, exchange: entry.row.exchange ?? EXCHANGES[index] }));
+  if (sources.some(({ exchange }) => !EXCHANGES.includes(exchange)) || sources[0].exchange === sources[1].exchange) throw new TypeError('PnL requires two distinct supported exchanges');
+  sources.sort((a, b) => EXCHANGES.indexOf(a.exchange) - EXCHANGES.indexOf(b.exchange));
+  return {
+    entries: sources.map(({ entry }) => entry),
+    pairKey: sources.map(({ exchange }) => exchange).join(':'),
+    revisionKey: JSON.stringify(sources.map(({ entry, exchange }) => [exchange, entry.row.revision])),
+  };
+}
+
+function migrateSamples(db) {
+  // A persistent marker prevents retained legacy rows from resurrecting samples
+  // that have since expired or belonged to a replaced account revision.
+  db.exec('SAVEPOINT trading_pnl_v2_migration');
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples (time INTEGER NOT NULL, binance_revision INTEGER NOT NULL, bybit_revision INTEGER NOT NULL, binance_at INTEGER, bybit_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (binance_revision, bybit_revision, time))');
+    db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples_v2 (pair_key TEXT NOT NULL, revision_key TEXT NOT NULL, time INTEGER NOT NULL, first_at INTEGER, second_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (pair_key, revision_key, time))');
+    db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_migrations (id TEXT PRIMARY KEY)');
+    if (!db.prepare('SELECT id FROM trading_pnl_migrations WHERE id=?').get('pair_samples_v2')) {
+      const insert = db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)');
+      for (const row of db.prepare('SELECT * FROM trading_pnl_samples').iterate()) {
+        insert.run('binance:bybit', JSON.stringify([['binance', row.binance_revision], ['bybit', row.bybit_revision]]), row.time, row.binance_at, row.bybit_at, row.unrealized_pnl);
+      }
+      db.prepare('INSERT INTO trading_pnl_migrations (id) VALUES (?)').run('pair_samples_v2');
+    }
+    db.exec('RELEASE SAVEPOINT trading_pnl_v2_migration');
+  } catch (error) {
+    db.exec('ROLLBACK TO SAVEPOINT trading_pnl_v2_migration');
+    db.exec('RELEASE SAVEPOINT trading_pnl_v2_migration');
+    throw error;
+  }
+}
 
 // Reduce continuous runs independently. Keep every gap boundary, even if highly
 // intermittent data needs more than the usual 1,200 display points.
@@ -33,27 +70,30 @@ export function reducePnlPoints(points) {
 }
 
 export function createTradingPnl(db) {
-  db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples (time INTEGER NOT NULL, binance_revision INTEGER NOT NULL, bybit_revision INTEGER NOT NULL, binance_at INTEGER, bybit_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (binance_revision, bybit_revision, time))');
-  const revisions = entries => entries.map(({ row }) => row.revision);
-  const latestRow = entries => db.prepare('SELECT * FROM trading_pnl_samples WHERE binance_revision=? AND bybit_revision=? ORDER BY time DESC LIMIT 1').get(...revisions(entries));
+  migrateSamples(db);
+  const latestRow = ({ pairKey, revisionKey }) => db.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? ORDER BY time DESC LIMIT 1').get(pairKey, revisionKey);
   function record(entries, current) {
+    const pair = pairSource(entries);
+    entries = pair.entries;
     if (entries.some(({ row }) => !row.credentials)) return false;
     const sources = entries.map(({ snapshot }) => stamp(snapshot.positions.fetchedAt));
     const rows = entries.flatMap(({ snapshot }) => snapshot.positions.rows);
     const good = entries.every(({ snapshot }, index) => !snapshot.positions.error && validTime(sources[index]) && sources[index] <= current && current - sources[index] <= MAX_AGE)
       && Math.max(...sources) - Math.min(...sources) <= MAX_SKEW && rows.every(row => row.unrealizedPnl !== null);
     const time = good ? Math.max(...sources) : current;
-    const previous = latestRow(entries);
+    const previous = latestRow(pair);
     if (previous && (time <= previous.time || Math.floor(time / PNL_INTERVAL) === Math.floor(previous.time / PNL_INTERVAL) && (previous.unrealized_pnl !== null) === good)) return false;
     const value = good ? addDecimals(rows.map(row => row.unrealizedPnl)) : null;
-    db.prepare('INSERT OR IGNORE INTO trading_pnl_samples VALUES (?,?,?,?,?,?)').run(time, ...revisions(entries), ...sources.map(value => validTime(value) ? value : null), value);
-    db.prepare('DELETE FROM trading_pnl_samples WHERE time < ? OR binance_revision != ? OR bybit_revision != ?').run(current - 31 * DAY, ...revisions(entries));
+    db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)').run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value);
+    db.prepare('DELETE FROM trading_pnl_samples_v2 WHERE pair_key=? AND (time < ? OR revision_key != ?)').run(pair.pairKey, current - 31 * DAY, pair.revisionKey);
     return true;
   }
   function read(entries, start, current) {
+    const pair = pairSource(entries);
+    entries = pair.entries;
     const connected = entries.every(({ row }) => !!row.credentials);
-    const records = connected ? db.prepare('SELECT * FROM trading_pnl_samples WHERE binance_revision=? AND bybit_revision=? AND time>=? AND time<=? ORDER BY time').all(...revisions(entries), start, current) : [];
-    const first = connected ? db.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples WHERE binance_revision=? AND bybit_revision=? AND unrealized_pnl IS NOT NULL').get(...revisions(entries)).time : null;
+    const records = connected ? db.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time').all(pair.pairKey, pair.revisionKey, start, current) : [];
+    const first = connected ? db.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND unrealized_pnl IS NOT NULL').get(pair.pairKey, pair.revisionKey).time : null;
     const events = entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) >= start).sort((a, b) => stamp(a.time) - stamp(b.time));
     let eventIndex = 0, accumulated = '0';
     const points = [], gap = time => ({ time, unrealizedPnl: null, fundingPnl: null, totalPnl: null });
@@ -72,5 +112,5 @@ export function createTradingPnl(db) {
       pointCount: records.length, points: reducePnlPoints(points), latest,
       status: !records.some(row => row.unrealized_pnl !== null) ? 'collecting' : latest?.totalPnl === null ? 'incomplete' : 'ready' };
   }
-  return { record, read, sourceKey: entries => latestRow(entries)?.time ?? null };
+  return { record, read, sourceKey: entries => latestRow(pairSource(entries))?.time ?? null };
 }

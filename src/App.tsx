@@ -180,7 +180,7 @@ export default function App() {
   useEffect(() => { if (!notice || notice.tone === 'warning' || notice.tone === 'error') return; const timer = window.setTimeout(() => setNotice(null), 5000); return () => clearTimeout(timer); }, [notice]);
   const navigate = (next: Route) => {
     const params = new URLSearchParams(); if (next.view !== 'overview') params.set('view', next.view); if (next.view === 'project') params.set('id', next.id);
-    if (next.view === 'trading') params.set('tradingDays', String(tradingCache.selection().days));
+    if (next.view === 'trading') { params.set('tradingDays', String(tradingCache.selection().days)); params.set('tradingPair', tradingCache.selection().pair); }
     if (next.view === 'project' && next.query) for (const [key, value] of Object.entries(next.query)) params.set(key, value);
     history.pushState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}`); setRoute(next); setMenuOpen(false); if (menuOpen) mobileMenuButton.current?.focus(); window.scrollTo(0, 0);
   };

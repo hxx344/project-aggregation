@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, ensureNoExternalOrders, checkChildQuantity, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
+import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
+import { TRADING_NAMES } from './trading-markets.mjs';
 
 const iso = time => new Date(time).toISOString();
 const FINAL = new Set(['completed', 'stopped']);
@@ -11,7 +12,7 @@ class NotSubmittedError extends ExecutionError { constructor(message) { super(40
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
 const validRevision = value => Number.isSafeInteger(value) && value >= 0;
 const modeOf = (exchange, mode) => {
-  if (!(exchange === 'binance' ? ['standard', 'portfolio-margin'] : ['unified']).includes(mode)) throw new ExecutionError(400, '请选择正确的实盘账户模式');
+  if (!(exchange === 'binance' ? ['standard', 'portfolio-margin'] : exchange === 'okx' ? ['cross', 'isolated'] : ['unified']).includes(mode)) throw new ExecutionError(400, '请选择正确的实盘账户模式');
   return mode;
 };
 
@@ -27,7 +28,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     CREATE TABLE IF NOT EXISTS execution_locks (resource TEXT PRIMARY KEY, job_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires INTEGER NOT NULL);
   `);
-  for (const exchange of EXECUTION_EXCHANGES) db.prepare('INSERT OR IGNORE INTO execution_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, exchange === 'binance' ? 'standard' : 'unified');
+  for (const exchange of EXECUTION_EXCHANGES) db.prepare('INSERT OR IGNORE INTO execution_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified');
   const owner = randomUUID(), clients = new Map(EXECUTION_EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const pending = new Set(), controllers = new Set(), busyJobs = new Set(), connecting = new Set();
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
@@ -99,7 +100,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     if (!row.credentials || (revision !== undefined && row.revision !== revision)) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
     const credentials = decrypt(row.credentials);
     if (!credentials || credentials.exchange !== exchange || credentials.purpose !== 'execution') throw new ExecutionError(503, '实盘凭据无法解密，请重新连接');
-    return { row, credentials: { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret }, client: clients.get(exchange), options: { accountMode: row.account_mode, beforeMutation: requireLease } };
+    return { row, credentials: { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, ...(exchange === 'okx' ? { passphrase: credentials.passphrase } : {}) }, client: clients.get(exchange), options: { accountMode: row.account_mode, beforeMutation: requireLease } };
   }
   async function call(fn) {
     const controller = new AbortController(); controllers.add(controller);
@@ -135,14 +136,15 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     if (locked(exchange)) throw new ExecutionError(409, '该交易所有未结束任务，先停止并完成委托核对后再更换连接');
   }
   async function connect(exchange, body, session) {
-    exactKeys(body, ['revision', 'accountMode', 'apiKey', 'apiSecret']); checkSession(session); checkAvailable(exchange, body.revision);
+    exactKeys(body, ['revision', 'accountMode', 'apiKey', 'apiSecret', ...(exchange === 'okx' ? ['passphrase'] : [])]); checkSession(session); checkAvailable(exchange, body.revision);
     const mode = modeOf(exchange, body.accountMode);
     const valid = value => typeof value === 'string' && value.length >= 8 && value.length <= 512 && /^[A-Za-z0-9_-]+$/.test(value);
     if (!valid(body.apiKey) || !valid(body.apiSecret)) throw new ExecutionError(400, '请填写有效的 HMAC 实盘 API Key 和 Secret');
+    if (exchange === 'okx' && (typeof body.passphrase !== 'string' || body.passphrase.length < 8 || body.passphrase.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(body.passphrase))) throw new ExecutionError(400, '请填写有效的 OKX Passphrase');
     if (connecting.has(exchange)) throw new ExecutionError(409, '此交易所正在验证实盘连接');
     connecting.add(exchange);
     try {
-      const credentials = { apiKey: body.apiKey, apiSecret: body.apiSecret }, client = clients.get(exchange);
+      const credentials = { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
       const result = await call(async signal => { const verified = await client.verify(credentials, { accountMode: mode, signal }); const account = await client.account(credentials, { accountMode: mode, signal }); return { verified, account }; });
       checkSession(session); checkAvailable(exchange, body.revision);
       db.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=?,account_mode=?,identity=?,key_label=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(
@@ -261,7 +263,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
   }
   async function amendOrder(job, leg, order, market) {
     writable();
-    if (order.exchange !== 'binance' || !order.remoteId || order.settled || order.unknown || order.amendPending) throw new ExecutionError(409, '原订单尚未确认，禁止追价');
+    if (!['binance', 'okx'].includes(order.exchange) || !order.remoteId || order.settled || order.unknown || order.amendPending) throw new ExecutionError(409, '原订单尚未确认，禁止追价');
     if ((order.amendCount ?? 0) >= 9000) throw new ExecutionError(409, '原订单已达到追价次数上限，请停止后重新预览');
     const ctx = context(order.exchange, order.accountRevision);
     // Amend the original total, never its remainder. Existing fills continue to
@@ -293,7 +295,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
         current.unknown = !(error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain);
         current.state = current.unknown ? 'unknown' : 'working'; saveOrder(current);
       }
-      pause(job.id, `Binance ${leg.symbol} 原生追价结果：${safeError(error)}`);
+      pause(job.id, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 原生追价结果：${safeError(error)}`);
     }
   }
   async function submit(job, leg, quantity, market) {
@@ -303,7 +305,8 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     if (all.length >= 4000) throw new ExecutionError(409, '已达到本任务委托次数上限，请停止后另建任务');
     if (all.some(order => order.legId === leg.id && !order.settled)) throw new ExecutionError(409, '前一委托尚未结束，禁止重复下单');
     const ctx = context(leg.exchange, leg.accountRevision), localId = randomUUID();
-    const spec = { symbol: leg.symbol, side: leg.orderSide, positionSide: positionSide(leg), quantity, reduceOnly: job.plan.action === 'close', clientId: 'h' + createHash('sha256').update(localId).digest('hex').slice(0, 30), stopPrice: leg.stopPrice };
+    const spec = { symbol: leg.symbol, side: leg.orderSide, positionSide: positionSide(leg), quantity, reduceOnly: job.plan.action === 'close', clientId: 'h' + createHash('sha256').update(localId).digest('hex').slice(0, 30), stopPrice: leg.stopPrice,
+      ...(leg.exchange === 'okx' ? { contractSize: leg.rule.contractSize, instrumentId: leg.rule.instrumentId } : {}) };
     const order = { localId, jobId: job.id, legId: leg.id, exchange: leg.exchange, accountRevision: leg.accountRevision, phase: job.phase, batch: job.batchIndex,
       kind: leg.exchange === 'bybit' ? 'strategy' : 'order', remoteId: null, spec, state: 'submitting', unknown: true, settled: false, filledQuantity: '0', price: null, lastCheckedAt: null, createdAt: iso(now()), cancelRequestedAt: null };
     // Persist intent before the network call. On restart an unanswered intent is uncertain.
@@ -360,8 +363,9 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
           }
           if (order.state === 'paused' || order.state === 'terminal') throw new ExecutionError(409, '交易所策略暂停或子单尚未结束，暂停其余交易腿');
           const market = normalizeMarket(await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })), leg.symbol, now());
+          checkContract(leg, market);
           if (stopReached(leg, market)) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 已达到追价停止价`);
-          if (leg.exchange === 'binance' && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= job.plan.repriceIntervalMs
+          if (['binance', 'okx'].includes(leg.exchange) && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= job.plan.repriceIntervalMs
               && (order.price === null || compareDecimals(order.price, leg.orderSide === 'buy' ? market.bid : market.ask) !== 0)) {
             await amendOrder(job, leg, order, market);
             if (jobFor(id).status === 'stopping') break;
@@ -386,6 +390,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       const { snapshots, markets } = await collect(candidates.map(item => item.leg));
       for (const { leg, quantity } of candidates) {
         const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now());
+        checkContract(leg, market);
         checkPosition(snapshots.get(leg.exchange), leg, job.plan.action, quantity);
         // Candidates have no unsettled order on this symbol. Any remaining venue
         // order (including eventually consistent own orders) blocks a new submit.
@@ -424,7 +429,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     const order = orders(id).filter(item => item.legId === body.legId && !item.settled).at(-1);
     if (!order) throw new ExecutionError(409, '该交易腿没有待核对委托');
     if (order.exchange === 'bybit' && !order.remoteId && (body.acknowledge !== true || typeof body.strategyId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(body.strategyId))) throw new ExecutionError(400, '请核对并填写交易所显示的原生追价策略编号');
-    if (order.exchange !== 'bybit' && body.strategyId !== undefined) throw new ExecutionError(400, 'Binance 按本任务客户订单号核对');
+    if (order.exchange !== 'bybit' && body.strategyId !== undefined) throw new ExecutionError(400, '此交易所按本任务客户订单号核对');
     busyJobs.add(id);
     try {
       await inspectOrder(order, order.exchange === 'bybit' && !order.remoteId ? body.strategyId : undefined);

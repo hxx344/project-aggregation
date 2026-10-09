@@ -1,8 +1,9 @@
 import { requestAuthenticatedJson, requestJson } from './adapters.mjs';
 import { TradingError, accountModeOf } from './trading.mjs';
 
-const EXCHANGES = ['binance', 'bybit'];
+const EXCHANGES = ['binance', 'bybit', 'okx'];
 const CATALOG = '/api/hub/trading-connections';
+const CATALOG_READ = CATALOG + '?include=okx';
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const changed = () => new TradingError(409, 'Asset 来源连接或项目配置已变更，请刷新来源后重试');
@@ -18,9 +19,11 @@ function sourceError(error) {
   return new TradingError(400, '无法读取 Asset 连接，请检查服务地址和连接状态');
 }
 function catalogOf(data) {
-  if (!object(data) || data.schemaVersion !== 1 || !Array.isArray(data.connections) || data.connections.length !== 2) throw malformed();
+  if (!object(data) || data.schemaVersion !== 1 || !Array.isArray(data.connections) || ![2, 3].includes(data.connections.length)
+      || data.connections.some(row => !EXCHANGES.includes(row?.exchange))) throw malformed();
   return EXCHANGES.map(exchange => {
     const rows = data.connections.filter(row => row?.exchange === exchange);
+    if (exchange === 'okx' && rows.length === 0 && data.connections.length === 2) return { exchange, configured: false, supported: false, revision: null, label: null, updatedAt: null, reason: '此 Asset 尚不支持 OKX 导入，请更新 Asset 或手工连接' };
     if (rows.length !== 1) throw malformed();
     const row = rows[0];
     if (typeof row.configured !== 'boolean' || typeof row.supported !== 'boolean'
@@ -31,7 +34,7 @@ function catalogOf(data) {
     // Never forward arbitrary provider diagnostics or other upstream fields to the browser.
     return { exchange, configured: row.configured, supported: row.supported, revision: row.revision,
       label: row.label, updatedAt: row.updatedAt,
-      reason: row.supported ? (row.configured ? null : 'Asset 尚未配置此交易所连接') : '此连接不可导入；仅支持全球站的 Binance、Bybit HMAC API' };
+      reason: row.supported ? (row.configured ? null : 'Asset 尚未配置此交易所连接') : '此连接不可导入；仅支持全球站的 Binance、Bybit、OKX API' };
   });
 }
 
@@ -73,7 +76,7 @@ export function createTradingImporter({ listTargets, trading, request = requestJ
           const position = index++, target = selected[position], project = target.project;
           const base = { projectId: project.id, name: project.name, projectRevision: target.revision };
           if (!project.apiUrl || !target.credentials?.password) { sources[position] = { ...base, status: 'unconfigured', error: '请在项目设置中保存 Asset 服务地址和登录密码', connections: [] }; continue; }
-          try { sources[position] = { ...base, status: 'ready', error: null, connections: catalogOf(await read(target, CATALOG, controller.signal, { deadline })) }; }
+          try { sources[position] = { ...base, status: 'ready', error: null, connections: catalogOf(await read(target, CATALOG_READ, controller.signal, { deadline })) }; }
           catch (error) { sources[position] = { ...base, status: 'unavailable', error: sourceError(error).message, connections: [] }; }
         }
       };
@@ -93,12 +96,12 @@ export function createTradingImporter({ listTargets, trading, request = requestJ
       await trading.connect(exchange, { revision: body.revision, accountMode }, {
         signal: controller.signal, timeoutMs: importTimeoutMs,
         credentialReader: async signal => {
-          const rows = catalogOf(await read(target, CATALOG, signal));
+          const rows = catalogOf(await read(target, CATALOG_READ, signal));
           const row = rows.find(item => item.exchange === exchange);
           if (!row.configured || !row.supported || row.revision !== body.sourceRevision) throw changed();
           const data = await read(target, CATALOG + '/export', signal, { method: 'POST', body: { exchange, revision: row.revision, password: target.credentials.password } });
           if (!object(data) || data.schemaVersion !== 1 || data.exchange !== exchange || data.revision !== row.revision || data.region !== 'global' || !object(data.credentials)) throw malformed();
-          return { apiKey: data.credentials.apiKey, apiSecret: data.credentials.apiSecret };
+          return { apiKey: data.credentials.apiKey, apiSecret: data.credentials.apiSecret, ...(exchange === 'okx' ? { passphrase: data.credentials.passphrase } : {}) };
         },
         beforeSave: () => { current(body.projectId, body.projectRevision); },
       });

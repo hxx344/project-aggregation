@@ -2,20 +2,21 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
-import { ageTradingData, tradingCacheNow } from './trading-cache';
+import { ageTradingData, normalizeTradingPair, pairExchanges, tradingCacheNow } from './trading-cache';
 import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
 import TradingPnlChart from './TradingPnlChart';
 import TradingExecution from './TradingExecution';
-import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPosition, TradingReadState, TradingState } from './trading-types';
+import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPair, TradingPosition, TradingReadState, TradingState } from './trading-types';
 import './trading.css';
 
-const exchangeNames = { binance: 'Binance', bybit: 'Bybit' };
-const accountModeNames: Record<TradingAccountMode, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金（Portfolio Margin）', unified: '统一交易账户' };
+const exchangeNames = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
+const accountModeNames: Record<TradingAccountMode, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金（Portfolio Margin）', unified: '统一交易账户', cross: '全仓', isolated: '逐仓' };
 type ImportRequest = TradingImportSelection & { revision: number; accountMode: TradingAccountMode };
 const stateNames: Record<TradingReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const readDays = (): 7 | 30 => new URLSearchParams(location.search).get('tradingDays') === '30' ? 30 : 7;
+const readPair = () => normalizeTradingPair(new URLSearchParams(location.search).get('tradingPair'));
 const formatDate = (value: string | null) => value && Number.isFinite(new Date(value).getTime()) ? dateFormat.format(new Date(value)) : '尚未同步';
 
 // Keep decimal strings intact. Positions and receipts can exceed Number precision.
@@ -33,18 +34,20 @@ function ReadStatus({ state }: { state: TradingReadState }) { return <span class
 function PositionDetails({ position }: { position: TradingPosition }) {
   return <details className="trading-position-details"><summary>仓位详情<ChevronDown size={13} /></summary><dl>
     <div><dt>持仓模式</dt><dd>{position.mode === 'hedge' ? '双向持仓' : '单向持仓'}</dd></div>
+    {position.marginMode ? <div><dt>保证金模式</dt><dd>{accountModeNames[position.marginMode]}</dd></div> : null}
+    {position.contractSize ? <div><dt>合约乘数 · 底层单位/张</dt><dd>{amount(position.contractSize)}</dd></div> : null}
     <div><dt>杠杆</dt><dd>{amount(position.leverage)}{position.leverage !== null ? '×' : ''}</dd></div>
-    <div><dt>强平价 · USDT/合约单位</dt><dd>{amount(position.liquidationPrice)}</dd></div>
+    <div><dt>强平价 · USDT/底层单位</dt><dd>{amount(position.liquidationPrice)}</dd></div>
     <div><dt>交易所仓位变更时间</dt><dd>{position.sourceUpdatedAt ? formatDate(position.sourceUpdatedAt) : '交易所未提供'}</dd></div>
   </dl></details>;
 }
 function PositionRow({ leg, position, first }: { leg: TradingLeg; position: TradingPosition | null; first: boolean }) {
   return <tr className={first ? 'trading-leg-start' : ''} data-leg={leg.id}>
-    <th scope="row" className="trading-leg-name"><strong>{leg.symbol}</strong><span>{exchangeNames[leg.exchange]}</span>{first ? <ReadStatus state={leg.state} /> : <small>同一合约的另一方向</small>}</th>
+    <th scope="row" className="trading-leg-name"><strong>{position?.instrumentId ?? leg.symbol}</strong><span>{exchangeNames[leg.exchange]}</span>{first ? <ReadStatus state={leg.state} /> : <small>同一合约的另一仓位</small>}</th>
     <td data-label="方向">{position ? <span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span> : <span className="trading-muted">{leg.state === 'live' ? '无持仓' : '暂无仓位数据'}</span>}</td>
-    <td data-label="合约数量">{amount(position?.quantity ?? null)}</td>
-    <td data-label="开仓均价 · USDT/合约单位">{amount(position?.entryPrice ?? null)}</td>
-    <td data-label="标记价格 · USDT/合约单位">{amount(position?.markPrice ?? null)}</td>
+    <td data-label="合约数量">{amount(position?.quantity ?? null)}{position && leg.exchange === 'okx' ? ' 张' : ''}</td>
+    <td data-label="开仓均价 · USDT/底层单位">{amount(position?.entryPrice ?? null)}</td>
+    <td data-label="标记价格 · USDT/底层单位">{amount(position?.markPrice ?? null)}</td>
     <td data-label="名义价值 · USDT">{amount(position?.notional ?? null)}</td>
     <td data-label="未实现盈亏 · USDT" className={polarity(position?.unrealizedPnl ?? null)}>{amount(position?.unrealizedPnl ?? null, true)}</td>
     <td className="trading-details-cell">{position ? <PositionDetails position={position} /> : null}</td>
@@ -58,6 +61,7 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
 }) {
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
+  const [apiPassphrase, setApiPassphrase] = useState('');
   const [accountMode, setAccountMode] = useState<TradingAccountMode>(account.accountMode ?? (account.exchange === 'binance' ? 'standard' : 'unified'));
   const [selection, setSelection] = useState<TradingImportSelection | null>(null);
   const choices = (sources ?? []).map(source => {
@@ -74,14 +78,16 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
   }
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (await mutate(account.exchange, 'PUT', { revision: account.revision, accountMode, apiKey: apiKey.trim(), apiSecret: apiSecret.trim() })) { setApiKey(''); setApiSecret(''); }
+    const body = { revision: account.revision, accountMode, apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), ...(account.exchange === 'okx' ? { passphrase: apiPassphrase.trim() } : {}) };
+    setApiPassphrase('');
+    if (await mutate(account.exchange, 'PUT', body)) { setApiKey(''); setApiSecret(''); }
   }
   async function disconnect() {
-    if (await mutate(account.exchange, 'DELETE', { revision: account.revision })) { setApiKey(''); setApiSecret(''); }
+    if (await mutate(account.exchange, 'DELETE', { revision: account.revision })) { setApiKey(''); setApiSecret(''); setApiPassphrase(''); }
   }
   async function importSelected() {
     if (!chosen || !selection || busy || sourcesLoading) return;
-    if (await importAccount(account.exchange, { revision: account.revision, accountMode, ...selection })) { setApiKey(''); setApiSecret(''); }
+    if (await importAccount(account.exchange, { revision: account.revision, accountMode, ...selection })) { setApiKey(''); setApiSecret(''); setApiPassphrase(''); }
   }
   return <form className="trading-account-form" onSubmit={save} aria-label={`${exchangeNames[account.exchange]} 账户连接`}>
     <div className="trading-account-form-heading"><h3>{exchangeNames[account.exchange]}</h3><span>{account.connected ? '已连接' : '未连接'}</span></div>
@@ -96,7 +102,8 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
     <p>{account.connected ? '填写新的只读密钥可替换当前连接。' : '连接后读取 CLUSDT、BZUSDT 仓位和资金费账单。'}</p>
     <label htmlFor={`trading-key-${account.exchange}`}>API Key<input id={`trading-key-${account.exchange}`} type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={event => setApiKey(event.target.value)} required disabled={busy} /></label>
     <label htmlFor={`trading-secret-${account.exchange}`}>API Secret<input id={`trading-secret-${account.exchange}`} type="password" autoComplete="off" spellCheck={false} value={apiSecret} onChange={event => setApiSecret(event.target.value)} required disabled={busy} /></label>
-    <div className="trading-form-actions"><button className="button primary" type="submit" disabled={busy || !apiKey.trim() || !apiSecret.trim()}><Link2 size={16} />{account.connected ? '验证并替换连接' : '验证并连接'}</button>{account.connected ? <button className="button secondary trading-disconnect" type="button" disabled={busy} onClick={() => void disconnect()}><Unplug size={16} />断开连接</button> : null}</div>
+    {account.exchange === 'okx' ? <label htmlFor="trading-passphrase-okx">Passphrase<input id="trading-passphrase-okx" type="password" autoComplete="off" spellCheck={false} value={apiPassphrase} onChange={event => setApiPassphrase(event.target.value)} required disabled={busy} /></label> : null}
+    <div className="trading-form-actions"><button className="button primary" type="submit" disabled={busy || !apiKey.trim() || !apiSecret.trim() || account.exchange === 'okx' && !apiPassphrase.trim()}><Link2 size={16} />{account.connected ? '验证并替换连接' : '验证并连接'}</button>{account.connected ? <button className="button secondary trading-disconnect" type="button" disabled={busy} onClick={() => void disconnect()}><Unplug size={16} />断开连接</button> : null}</div>
     {account.verifiedAt ? <small>密钥验证：{formatDate(account.verifiedAt)}（北京时间）</small> : null}
   </form>;
 }
@@ -104,6 +111,7 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
 export default function TradingPage({ cache, onExpired }: { cache: TradingCache; onExpired: () => void }) {
   useSyncExternalStore(cache.subscribe, cache.getVersion);
   const [days, setDays] = useState<7 | 30>(readDays);
+  const [pair, setPair] = useState<TradingPair>(readPair);
   const [reading, setReading] = useState(false);
   const [, setClock] = useState(0);
   const busy = cache.busy();
@@ -111,8 +119,8 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   const [operationError, setOperationError] = useState('');
   const [notice, setNotice] = useState('');
   const [offline, setOffline] = useState(!navigator.onLine);
-  const [page, setPage] = useState(() => cache.selection().days === days ? cache.selection().page : 0);
-  const entry = cache.get(days, page) ?? cache.latest();
+  const [page, setPage] = useState(() => cache.selection().days === days && cache.selection().pair === pair ? cache.selection().page : 0);
+  const entry = cache.get(days, page, pair) ?? cache.latest(pair);
   const now = entry ? tradingCacheNow(entry) : 0;
   const data = entry ? ageTradingData(entry, now, offline || !!error) : null;
   const oldCache = !!entry && (offline || !!error || entry.failed || !entry.data.cache.builtAt || now - Date.parse(entry.data.cache.builtAt) > 75_000);
@@ -122,6 +130,7 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   const [sourcesError, setSourcesError] = useState('');
   const daysRef = useRef(days);
   const pageRef = useRef(page);
+  const pairRef = useRef(pair);
   const expiredRef = useRef(onExpired);
   const mounted = useRef(false);
   const sequence = useRef(0);
@@ -157,7 +166,8 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
     // bounded cache reads there, without triggering any exchange collection.
     if (!force && document.hidden && lastReadAt.current !== null && performance.now() - lastReadAt.current < 30_000) return Promise.resolve();
     if (force) cancelRead();
-    const request = cache.beginRead(), controller = request.controller;
+    const requestedPair = pairRef.current;
+    const request = cache.beginRead(requestedPair), controller = request.controller;
     const version = ++sequence.current;
     const requestedDays = daysRef.current;
     const requestedPage = pageRef.current;
@@ -165,11 +175,11 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
     setReading(true);
     const promise = (async () => {
       try {
-        const next = await api<TradingState>(`/api/trading?days=${requestedDays}&page=${requestedPage}`, { signal: controller.signal, timeoutMs: 12_000 });
+        const next = await api<TradingState>(`/api/trading?days=${requestedDays}&page=${requestedPage}&pair=${requestedPair}`, { signal: controller.signal, timeoutMs: 12_000 });
         if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
         if (cache.accept(request, next)) {
           setError('');
-          if (requestedDays === daysRef.current && requestedPage === pageRef.current && next.funding.pagination.page !== requestedPage) setPage(next.funding.pagination.page);
+          if (requestedPair === pairRef.current && requestedDays === daysRef.current && requestedPage === pageRef.current && next.funding.pagination.page !== requestedPage) setPage(next.funding.pagination.page);
         }
       } catch (cause) {
         if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
@@ -203,13 +213,19 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
       window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume);
     };
   }, [cancelRead, cancelSources, load]);
-  useEffect(() => { daysRef.current = days; pageRef.current = page; cache.select(days, page); setError(''); void load(true); }, [cache, days, page, load]);
+  useEffect(() => { daysRef.current = days; pageRef.current = page; pairRef.current = pair; cache.select(days, page, pair); setError(''); void load(true); }, [cache, days, page, pair, load]);
   useEffect(() => { if (!busy) void load(); }, [busy, load]);
   useEffect(() => { if (connectionsOpen) void loadSources(); }, [connectionsOpen, loadSources]);
   useEffect(() => {
-    const back = () => { setDays(readDays()); setPage(0); };
+    const back = () => { cancelRead(); pairRef.current = readPair(); setPair(pairRef.current); setDays(readDays()); setPage(0); setOperationError(''); setNotice(''); };
     window.addEventListener('popstate', back); return () => window.removeEventListener('popstate', back);
-  }, []);
+  }, [cancelRead]);
+  function changePair(next: TradingPair) {
+    if (next === pair) return;
+    cancelRead(); pairRef.current = next; pageRef.current = 0;
+    const url = new URL(location.href); url.searchParams.set('tradingPair', next);
+    history.pushState(null, '', url); setPair(next); setPage(0); setError(''); setOperationError(''); setNotice('');
+  }
   function changeDays(next: 7 | 30) {
     if (next === days) return;
     const url = new URL(location.href); url.searchParams.set('tradingDays', String(next));
@@ -217,17 +233,18 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   }
   async function write(path: string, method: 'POST' | 'PUT' | 'DELETE', body: object, label: string, importing = false) {
     if (!navigator.onLine) return false;
-    const request = cache.beginMutation(label);
+    const requestedPair = pairRef.current;
+    const request = cache.beginMutation(label, requestedPair);
     if (!request) return false;
     const controller = request.controller;
     const requestedDays = daysRef.current;
     cancelRead(); cancelSources(); setSourcesLoading(false); setReading(false); setOperationError(''); setNotice('');
     let succeeded = false;
     try {
-      const next = await api<TradingState>(`${path}?days=${requestedDays}&page=0`, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: importing ? 65_000 : method === 'PUT' ? 45_000 : 15_000 });
+      const next = await api<TradingState>(`${path}?days=${requestedDays}&page=0&pair=${requestedPair}`, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: importing ? 65_000 : method === 'PUT' ? 45_000 : 15_000 });
       if (!cache.accept(request, next, label !== 'refresh')) return false;
       succeeded = true;
-      if (mounted.current) {
+      if (mounted.current && requestedPair === pairRef.current) {
         setPage(0); setError('');
         setNotice(importing ? '已从 Asset 导入并验证只读密钥，正在同步账户数据。' : method === 'DELETE' ? '账户已断开，已清除该账户的当前缓存。' : method === 'PUT' ? '只读密钥已验证，正在同步账户数据。' : '已请求同步，已有数据会保留到同步完成。');
       }
@@ -242,8 +259,10 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   }
   const mutateAccount = (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => write(`/api/trading/accounts/${exchange}`, method, body, exchange);
   const importAccount = (exchange: TradingExchange, body: ImportRequest) => write(`/api/trading/accounts/${exchange}/import`, 'POST', body, exchange, true);
-  const connected = data?.accounts.some(account => account.connected) ?? false;
-  const refreshing = data?.accounts.some(account => account.refreshing) ?? false;
+  const exchanges = pairExchanges(pair);
+  const selectedAccounts = data?.accounts.filter(account => exchanges.includes(account.exchange)) ?? [];
+  const connected = selectedAccounts.some(account => account.connected);
+  const refreshing = selectedAccounts.some(account => account.refreshing);
   const events = data?.funding.events ?? [];
   const pageCount = Math.max(1, data?.funding.pagination.pages ?? 1);
   const currentPage = data?.funding.pagination.page ?? 0;
@@ -254,8 +273,9 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
   };
 
   return <div className="trading-page">
-    <header className="trading-heading"><div><div className="trading-title-line"><h1>原油四腿资金费套利</h1></div><p>Binance 与 Bybit · CLUSDT / BZUSDT</p></div><button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button></header>
-    <TradingExecution onExpired={onExpired} />
+    <header className="trading-heading"><div><div className="trading-title-line"><h1>原油四腿资金费套利</h1></div><p>{exchanges.map(exchange => exchangeNames[exchange]).join(" 与 ")} · CL / BZ 永续合约</p></div><button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button></header>
+    <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div>
+    <TradingExecution pair={pair} onExpired={onExpired} />
     {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
     {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}
@@ -263,11 +283,11 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
     {data ? <div className={`trading-notice trading-cache-status${oldCache ? ' warning' : ''}`} role="status"><span>{oldCache ? '当前显示旧缓存，等待更新。' : data.cache.rebuilding ? '后台正在更新缓存，当前显示上次数据。' : reading ? '已显示缓存，正在检查更新。' : '已显示缓存。'} 缓存生成：{formatDate(data.cache.builtAt)}{data.cache.builtAt ? '（北京时间）' : ''}</span></div> : null}
     {!data ? <div className="trading-initial" role="status">{reading ? <><LoaderCircle className="spin" size={22} /><span>正在读取交易账户状态…</span></> : <span>尚未获取交易数据</span>}</div> : <>
       <section className="trading-panel trading-positions" aria-labelledby="trading-positions-title">
-        <div className="trading-panel-heading"><div><h2 id="trading-positions-title">四腿仓位</h2><p>按实际持仓显示方向 · 数量为各交易所原生合约单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
-        <div className="trading-account-statuses">{data.accounts.map(account => <div className="trading-account-status" key={account.exchange}><div><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.positions.state} />{account.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div><p>仓位读取：{formatDate(account.positions.fetchedAt)}{account.positions.fetchedAt ? '（北京时间）' : ''}</p>{account.positions.error ? <p className="trading-warning">{account.positions.error}</p> : null}</div>)}</div>
-        {!connected ? <div className="trading-connect-empty"><ShieldCheck size={27} /><h3>连接账户，查看四腿的真实仓位</h3><p>使用 Binance 和 Bybit 的 HMAC 只读密钥。连接后，这里会显示持仓方向、名义价值和资金费账单。</p><button className="button primary" onClick={openConnections}>连接只读账户</button></div> : null}
+        <div className="trading-panel-heading"><div><h2 id="trading-positions-title">四腿仓位</h2><p>按实际持仓显示方向 · OKX 数量为张，价格为 USDT/底层单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
+        <div className="trading-account-statuses">{selectedAccounts.map(account => <div className="trading-account-status" key={account.exchange}><div><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.positions.state} />{account.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div><p>仓位读取：{formatDate(account.positions.fetchedAt)}{account.positions.fetchedAt ? '（北京时间）' : ''}</p>{account.positions.error ? <p className="trading-warning">{account.positions.error}</p> : null}</div>)}</div>
+        {!connected ? <div className="trading-connect-empty"><ShieldCheck size={27} /><h3>连接账户，查看四腿的真实仓位</h3><p>使用所选两家交易所的只读密钥。连接后，这里会显示持仓方向、名义价值和资金费账单。</p><button className="button primary" onClick={openConnections}>连接只读账户</button></div> : null}
         <div className={`trading-structure ${data.structure.state}`}><span>跨所方向</span><strong>{data.structure.message}</strong></div>
-        <div className="trading-position-scroll"><table className="trading-position-table"><thead><tr><th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">合约数量</th><th scope="col">开仓均价<small>USDT/合约单位</small></th><th scope="col">标记价格<small>USDT/合约单位</small></th><th scope="col">名义价值<small>USDT</small></th><th scope="col">未实现盈亏<small>USDT</small></th><th scope="col"><span className="visually-hidden">仓位详情</span></th></tr></thead><tbody>{data.legs.flatMap(leg => leg.positions.length ? leg.positions.map((position, index) => <PositionRow key={`${leg.id}-${position.id}`} leg={leg} position={position} first={index === 0} />) : [<PositionRow key={leg.id} leg={leg} position={null} first />])}</tbody></table></div>
+        <div className="trading-position-scroll"><table className="trading-position-table"><thead><tr><th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">合约数量</th><th scope="col">开仓均价<small>USDT/底层单位</small></th><th scope="col">标记价格<small>USDT/底层单位</small></th><th scope="col">名义价值<small>USDT</small></th><th scope="col">未实现盈亏<small>USDT</small></th><th scope="col"><span className="visually-hidden">仓位详情</span></th></tr></thead><tbody>{data.legs.flatMap(leg => leg.positions.length ? leg.positions.map((position, index) => <PositionRow key={`${leg.id}-${position.id}`} leg={leg} position={position} first={index === 0} />) : [<PositionRow key={leg.id} leg={leg} position={null} first />])}</tbody></table></div>
         <details className="trading-leg-totals"><summary>查看每腿名义价值与资金费</summary><div className="trading-table-scroll" tabIndex={0} role="region" aria-label="每腿汇总"><table><thead><tr><th scope="col">合约 / 交易所</th><th scope="col">总名义价值 · USDT</th><th scope="col">净名义价值 · USDT</th><th scope="col">区间资金费净额 · USDT</th><th scope="col">资金费记录</th></tr></thead><tbody>{data.legs.map(leg => <tr key={leg.id}><th scope="row">{exchangeNames[leg.exchange]} {leg.symbol}</th><td>{amount(leg.grossNotional)}</td><td>{amount(leg.netNotional, true)}</td><td className={polarity(leg.fundingNet)}>{amount(leg.fundingNet, true)}</td><td>{leg.fundingComplete ? '完整' : '部分 / 尚未获取'}</td></tr>)}</tbody></table></div></details>
         <p className="trading-footnote">方向仅反映当前持仓结构；不同交易所的合约数量不直接等同，不代表完全对冲。</p>
       </section>
@@ -283,7 +303,7 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
       <section className="trading-panel trading-funding" aria-labelledby="trading-funding-title">
         <div className="trading-panel-heading"><div><h2 id="trading-funding-title">{data.funding.complete ? '区间资金费' : '已获取的资金费'}</h2><p>{formatDate(data.period.start)} — {formatDate(data.period.end)}（北京时间）· 与上方曲线共用近{data.period.days}天区间</p></div></div>
         <div className="trading-funding-summary"><div><span>{data.funding.complete ? '收入' : '已获取收入'}<small>USDT</small></span><strong className="trading-positive">{amount(data.funding.income)}</strong></div><div><span>{data.funding.complete ? '支出' : '已获取支出'}<small>USDT</small></span><strong className="trading-negative">{amount(data.funding.expense)}</strong></div><div><span>{data.funding.complete ? '净额' : '已获取净额'}<small>USDT</small></span><strong className={polarity(data.funding.net)}>{amount(data.funding.net, true)}</strong></div></div>
-        <div className="trading-funding-coverage">{!data.funding.complete ? <p className="trading-warning"><CircleAlert size={15} />部分记录：当前汇总不代表整个区间的完整实收。</p> : null}{data.accounts.map(account => <div key={account.exchange}><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.funding.state} /><span>资金费截至：{account.funding.coverageEnd ? formatDate(account.funding.coverageEnd) : '尚未同步'}</span>{account.funding.error ? <p className="trading-warning">{account.funding.error}</p> : null}</div>)}</div>
+        <div className="trading-funding-coverage">{!data.funding.complete ? <p className="trading-warning"><CircleAlert size={15} />部分记录：当前汇总不代表整个区间的完整实收。</p> : null}{selectedAccounts.map(account => <div key={account.exchange}><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.funding.state} /><span>资金费截至：{account.funding.coverageEnd ? formatDate(account.funding.coverageEnd) : '尚未同步'}</span>{account.funding.error ? <p className="trading-warning">{account.funding.error}</p> : null}</div>)}</div>
         <TradingFundingChart daily={data.funding.daily} />
         <p className="trading-footnote">资金费按账户与合约归属，可能包含其他策略；区间账单不等于当前持仓周期收益。</p>
       </section>
@@ -293,7 +313,7 @@ export default function TradingPage({ cache, onExpired }: { cache: TradingCache;
         {events.length ? <><div className="trading-table-scroll trading-ledger-scroll" tabIndex={0} role="region" aria-label="资金费流水明细"><table><thead><tr><th scope="col">时间（北京时间）</th><th scope="col">交易所</th><th scope="col">合约</th><th scope="col">收付</th><th scope="col">金额 · USDT</th></tr></thead><tbody>{events.map(event => <tr key={`${event.exchange}-${event.id}`}><td>{formatDate(event.time)}</td><td>{exchangeNames[event.exchange]}</td><td>{event.symbol}</td><td>{!/[1-9]/.test(event.amount) ? '零额' : event.amount.startsWith('-') ? '支出' : '收入'}</td><td className={polarity(event.amount)}>{amount(event.amount, true)}</td></tr>)}</tbody></table></div><div className="trading-pagination"><span>第 {currentPage + 1} / {pageCount} 页 · 每页最多 50 条</span><div><button className="button secondary" disabled={pendingPage || currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button><button className="button secondary" disabled={pendingPage || currentPage + 1 >= pageCount} onClick={() => setPage(currentPage + 1)}>下一页</button></div></div></> : <div className="trading-ledger-empty">{data.funding.complete ? '所选区间没有资金费流水。' : '尚无已获取的资金费流水；连接账户并完成同步后显示。'}</div>}
       </section>
 
-      <details ref={connectionsRef} className="trading-panel trading-connections" open={connectionsOpen} onToggle={event => setConnectionsOpen(event.currentTarget.open)}><summary><span><Link2 size={18} /><strong>账户连接</strong><small>{data.accounts.filter(account => account.connected).length} / 2 已连接</small></span><ChevronDown size={18} /></summary><div className="trading-connections-body">
+      <details ref={connectionsRef} className="trading-panel trading-connections" open={connectionsOpen} onToggle={event => setConnectionsOpen(event.currentTarget.open)}><summary><span><Link2 size={18} /><strong>账户连接</strong><small>{data.accounts.filter(account => account.connected).length} / {data.accounts.length} 已连接</small></span><ChevronDown size={18} /></summary><div className="trading-connections-body">
         <p className="trading-connection-note">仅支持 HMAC 只读密钥，请关闭交易和提现权限。密钥在服务器保存，保存后不回显。</p>
         <div className="trading-import-sources">
           <div className="trading-import-heading"><h3>从 Asset 导入</h3><button className="button secondary" type="button" disabled={!!busy || offline || sourcesLoading} onClick={() => void loadSources()}>{sourcesLoading ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}刷新来源</button></div>

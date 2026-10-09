@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ageTradingData, createTradingCache, tradingCacheNow } from '../src/trading-cache.ts';
+import { ageTradingData, createTradingCache, normalizeTradingPair, tradingCacheNow } from '../src/trading-cache.ts';
 
 const time = '2026-10-07T04:00:00.000Z';
 const state = (days = 7, page = 0, revision = 1) => ({
@@ -22,7 +22,7 @@ test('session cache reuses exact range and server page without expanding ledger 
   assert.equal(cache.get(7, 1).data, second);
   assert.equal(cache.get(30, 0).data, month);
   assert.equal(cache.get(7, 1).data.funding.events.length, 13);
-  cache.select(7, 1); assert.deepEqual(cache.selection(), { days: 7, page: 1 });
+  cache.select(7, 1); assert.deepEqual(cache.selection(), { days: 7, page: 1, pair: 'binance,bybit' });
 });
 
 test('LRU holds at most twelve pages and preserves both range landing pages', () => {
@@ -145,4 +145,59 @@ test('an expired empty range no longer presents confirmed zero funding totals', 
     assert.equal(aged.funding[key], null); assert.equal(aged.funding.daily[0][key], null);
   }
   assert.ok(aged.legs.every(leg => !leg.fundingComplete && leg.fundingNet === null));
+});
+
+test('pair pages, latest fallbacks and selection never expose another pair', () => {
+  const cache = createTradingCache();
+  for (const pair of ['binance,bybit', 'binance,okx', 'bybit,okx']) {
+    assert.equal(cache.get(7, 0, pair), null);
+    assert.equal(cache.latest(pair), null);
+    const data = { ...state(), exchanges: pair.split(',') };
+    data.accounts = ['binance', 'bybit', 'okx'].map(exchange => ({ ...data.accounts[0], exchange }));
+    const request = cache.beginRead(pair);
+    assert.equal(cache.accept(request, data), true); cache.finish(request);
+    assert.equal(cache.get(7, 0, pair).data, data);
+    assert.equal(cache.latest(pair).data, data);
+  }
+  cache.select(30, 3, 'binance,okx');
+  assert.deepEqual(cache.selection(), { days: 30, page: 3, pair: 'binance,okx' });
+  assert.deepEqual(cache.latest('binance,bybit').data.exchanges, ['binance', 'bybit']);
+  const wrong = cache.beginRead('bybit,okx');
+  assert.equal(cache.accept(wrong, { ...state(), exchanges: ['binance', 'okx'] }), false);
+  cache.clear();
+  for (const pair of ['binance,bybit', 'binance,okx', 'bybit,okx']) assert.equal(cache.latest(pair), null);
+});
+
+test('replacing an account invalidates all pairs and old pair responses', () => {
+  const cache = createTradingCache();
+  for (const pair of ['binance,bybit', 'binance,okx']) {
+    const data = { ...state(), exchanges: pair.split(',') };
+    const request = cache.beginRead(pair); assert.equal(cache.accept(request, data), true); cache.finish(request);
+  }
+  const pending = cache.beginRead('binance,bybit');
+  const mutation = cache.beginMutation('okx', 'binance,okx');
+  assert.equal(cache.accept(mutation, { ...state(), exchanges: ['binance', 'okx'] }, true), true);
+  assert.equal(cache.latest('binance,bybit'), null);
+  assert.equal(cache.get(7, 0, 'binance,bybit'), null);
+  assert.equal(cache.accept(pending, state()), false);
+  assert.ok(cache.latest('binance,okx'));
+});
+
+test('the third unconfigured account does not degrade selected funding, positions or structure', () => {
+  const cache = createTradingCache(), data = state();
+  data.exchanges = ['binance', 'bybit'];
+  data.accounts.push({ exchange: 'okx', connected: false, revision: 0,
+    positions: { state: 'unconfigured', fetchedAt: null }, funding: { state: 'unconfigured', fetchedAt: null, complete: false } });
+  read(cache, data);
+  const aged = ageTradingData(cache.latest(), Date.parse(time));
+  assert.equal(aged.funding.complete, true);
+  assert.equal(aged.funding.daily[0].complete, true);
+  assert.equal(aged.structure.state, 'opposed');
+  assert.equal(aged.accounts[2].positions.state, 'unconfigured');
+});
+
+test('URL pair selection uses canonical exchange order and safe defaults', () => {
+  assert.equal(normalizeTradingPair('okx,binance'), 'binance,okx');
+  assert.equal(normalizeTradingPair('okx,bybit'), 'bybit,okx');
+  for (const pair of [null, '', 'okx', 'binance,binance', 'binance,bybit,okx', 'unknown,okx']) assert.equal(normalizeTradingPair(pair), 'binance,bybit');
 });

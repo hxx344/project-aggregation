@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
+import { createOkxExecutionClient } from './trading-okx-execution.mjs';
 
 /**
  * Restricted live execution protocol. No caller-supplied host, path, order type,
@@ -15,9 +16,9 @@ import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-
  *     filledQuantity, price, averagePrice, terminal, childrenSettled,
  *     symbol, side, reduceOnly, positionSide, createdAt
  *   }
- *   amend(credentials, { ...spec, id: string }, options) -> same as inspect (Binance only)
+ *   amend(credentials, { ...spec, id: string }, options) -> same as inspect (Binance / OKX)
  *   stop(credentials, { ...spec, id: string | null }, options) -> void (ACK only)
- * options = { accountMode: 'standard' | 'portfolio-margin' | 'unified', signal,
+ * options = { accountMode: 'standard' | 'portfolio-margin' | 'unified' | 'cross' | 'isolated', signal,
  *   beforeMutation?: () => void } (the guard is an internal service callback).
  * spec = { symbol, side: 'buy' | 'sell', positionSide: 'BOTH' | 'LONG' | 'SHORT',
  *          quantity: decimal string, reduceOnly: boolean, clientId: string <= 32,
@@ -232,6 +233,7 @@ function upstreamFailure(exchange, status, data, mutation) {
 }
 
 export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000 } = {}) {
+  if (exchange === 'okx') return createOkxExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
   if (!['binance', 'bybit'].includes(exchange) || typeof fetchImpl !== 'function' || typeof now !== 'function'
       || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) fail('configuration');
   let timeOffset = 0;

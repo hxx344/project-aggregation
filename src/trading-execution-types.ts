@@ -21,6 +21,7 @@ export type ExecutionPreviewLeg = ExecutionLegInput & {
   id: string; orderSide: 'buy' | 'sell'; positionMode: 'one-way' | 'hedge'; accountRevision: number;
   currentQuantity: string; batchQuantities: string[]; estimatedNotional: string;
   bid: string; ask: string; quoteAt: string;
+  rule?: { instrumentId?: string; quantityUnit?: string; contractSize?: string };
 };
 export type ExecutionPreview = {
   id: string; expiresAt: string; preset: ExecutionPreset; action: ExecutionAction; resumeJobId?: string | null;

@@ -1,8 +1,17 @@
-import type { TradingReadState, TradingState } from './trading-types';
+import type { TradingExchange, TradingPair, TradingReadState, TradingState } from './trading-types';
+
+export const DEFAULT_TRADING_PAIR: TradingPair = 'binance,bybit';
+export function normalizeTradingPair(value: string | null | undefined): TradingPair {
+  const exchanges = value?.split(',');
+  if (!exchanges || exchanges.length !== 2 || new Set(exchanges).size !== 2) return DEFAULT_TRADING_PAIR;
+  const pair = ['binance', 'bybit', 'okx'].filter(exchange => exchanges.includes(exchange)).join(',');
+  return pair === 'binance,okx' || pair === 'bybit,okx' || pair === DEFAULT_TRADING_PAIR ? pair : DEFAULT_TRADING_PAIR;
+}
+export const pairExchanges = (pair: TradingPair) => pair.split(',') as [TradingExchange, TradingExchange];
 
 export type TradingCacheEntry = { data: TradingState; receivedAt: number; requestId: number; failed: boolean };
-type Request = { controller: AbortController; session: number; generation: number; id: number; kind: 'read' | 'mutation' | 'source' };
-const key = (days: 7 | 30, page: number) => `${days}:${page}`;
+type Request = { controller: AbortController; session: number; generation: number; id: number; kind: 'read' | 'mutation' | 'source'; pair: TradingPair };
+const key = (days: 7 | 30, page: number, pair: TradingPair) => `${pair}:${days}:${page}`;
 const MAX_PAGES = 12;
 
 // The owner is one App login session. No account data or credentials enter browser storage.
@@ -11,25 +20,28 @@ export function createTradingCache() {
   const requests = new Set<Request>();
   const listeners = new Set<() => void>();
   let session = 0, generation = 0, requestId = 0, version = 0;
-  let latest: TradingCacheEntry | null = null;
-  let selection: { days: 7 | 30; page: number } = { days: 7, page: 0 };
+  const latest = new Map<TradingPair, TradingCacheEntry>();
+  let selection: { days: 7 | 30; page: number; pair: TradingPair } = { days: 7, page: 0, pair: DEFAULT_TRADING_PAIR };
+  let latestAccounts: TradingState['accounts'] | undefined;
   let mutation: { request: Request; label: string } | null = null;
   const notify = () => { version++; listeners.forEach(listener => listener()); };
   const valid = (request: Request) => request.session === session && !request.controller.signal.aborted && (request.kind !== 'read' || request.generation === generation);
   const cancelReads = () => { for (const request of requests) if (request.kind === 'read') { request.controller.abort(); requests.delete(request); } };
-  const invalidate = () => { generation++; cancelReads(); pages.clear(); latest = null; };
+  const invalidate = () => { generation++; cancelReads(); pages.clear(); latest.clear(); };
   const touch = (pageKey: string, entry: TradingCacheEntry) => { pages.delete(pageKey); pages.set(pageKey, entry); };
-  const begin = (kind: Request['kind']): Request => {
-    const request = { controller: new AbortController(), session, generation, id: ++requestId, kind };
+  const begin = (kind: Request['kind'], pair = DEFAULT_TRADING_PAIR): Request => {
+    const request = { controller: new AbortController(), session, generation, id: ++requestId, kind, pair };
     requests.add(request); return request;
   };
   const accept = (request: Request, data: TradingState, replace = false) => {
     if (!valid(request)) return false;
-    const previousAccounts = latest?.data.accounts;
+    const responsePair = normalizeTradingPair(data.exchanges?.join(','));
+    if (responsePair !== request.pair) return false;
+    const previousAccounts = latestAccounts;
     // A delayed response from an older account revision cannot resurrect its positions.
     if (previousAccounts?.some(previous => data.accounts.some(account => account.exchange === previous.exchange && account.revision < previous.revision))) return false;
     const changed = previousAccounts?.some(previous => !data.accounts.some(account => account.exchange === previous.exchange && account.revision === previous.revision && account.connected === previous.connected));
-    const pageKey = key(data.period.days, data.funding.pagination.page);
+    const pageKey = key(data.period.days, data.funding.pagination.page, responsePair);
     const previous = pages.get(pageKey);
     if (!replace && !changed && previous && request.id < previous.requestId) return false;
     if (replace || changed) invalidate();
@@ -38,33 +50,36 @@ export function createTradingCache() {
     // Keep both range landing pages; evict the least recently used other page.
     for (const candidate of pages.keys()) {
       if (pages.size <= MAX_PAGES) break;
-      if (candidate !== key(7, 0) && candidate !== key(30, 0)) pages.delete(candidate);
+      if (!candidate.endsWith(':7:0') && !candidate.endsWith(':30:0')) pages.delete(candidate);
     }
-    latest = entry; notify(); return true;
+    latestAccounts = data.accounts;
+    const latestEntry = latest.get(responsePair);
+    if (!latestEntry || request.id >= latestEntry.requestId) latest.set(responsePair, entry);
+    notify(); return true;
   };
   return {
-    get(days: 7 | 30, page: number) {
-      const pageKey = key(days, page), entry = pages.get(pageKey);
+    get(days: 7 | 30, page: number, pair = DEFAULT_TRADING_PAIR) {
+      const pageKey = key(days, page, pair), entry = pages.get(pageKey);
       if (entry) touch(pageKey, entry);
       return entry ?? null;
     },
-    latest: () => latest,
+    latest: (pair = DEFAULT_TRADING_PAIR) => latest.get(pair) ?? null,
     selection: () => selection,
-    select: (days: 7 | 30, page: number) => { selection = { days, page }; },
+    select: (days: 7 | 30, page: number, pair = DEFAULT_TRADING_PAIR) => { selection = { days, page, pair }; },
     subscribe: (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     getVersion: () => version,
     busy: () => mutation?.label ?? null,
     valid,
-    beginRead: () => begin('read'),
+    beginRead: (pair = DEFAULT_TRADING_PAIR) => begin('read', pair),
     beginSource: () => begin('source'),
-    beginMutation(label: string) {
+    beginMutation(label: string, pair = DEFAULT_TRADING_PAIR) {
       if (mutation) return null;
-      cancelReads(); mutation = { request: begin('mutation'), label }; notify(); return mutation.request;
+      cancelReads(); mutation = { request: begin('mutation', pair), label }; notify(); return mutation.request;
     },
     accept,
-    fail(request: Request, days: 7 | 30, page: number) {
+    fail(request: Request, days: 7 | 30, page: number, pair = request.pair) {
       if (!valid(request)) return;
-      const entry = pages.get(key(days, page));
+      const entry = pages.get(key(days, page, pair));
       if (entry) entry.failed = true;
       notify();
     },
@@ -75,7 +90,7 @@ export function createTradingCache() {
     clear() {
       session++; generation++;
       for (const request of requests) request.controller.abort();
-      requests.clear(); pages.clear(); latest = null; mutation = null; selection = { days: 7, page: 0 }; notify();
+      requests.clear(); pages.clear(); latest.clear(); latestAccounts = undefined; mutation = null; selection = { days: 7, page: 0, pair: DEFAULT_TRADING_PAIR }; notify();
     },
   };
 }
@@ -96,20 +111,21 @@ export function ageTradingData(entry: TradingCacheEntry, now: number, unavailabl
     };
   });
   const noReceipts = data.funding.pagination.total === 0;
+  const selectedAccounts = accounts.filter(account => (data.exchanges ?? pairExchanges(DEFAULT_TRADING_PAIR)).includes(account.exchange));
   const legs = data.legs.map(leg => {
     const account = accounts.find(account => account.exchange === leg.exchange);
     const fundingComplete = leg.fundingComplete && !!account?.funding.complete;
     return { ...leg, state: age(leg.state, leg.fetchedAt, 75_000), fundingComplete,
       fundingNet: !fundingComplete && noReceipts ? null : leg.fundingNet };
   });
-  const allFundingFresh = accounts.every(account => account.funding.state === 'live');
-  const complete = data.funding.complete && accounts.every(account => account.funding.complete);
+  const allFundingFresh = selectedAccounts.length === 2 && selectedAccounts.every(account => account.funding.state === 'live');
+  const complete = data.funding.complete && selectedAccounts.length === 2 && selectedAccounts.every(account => account.funding.complete);
   const last = data.pnl?.latest;
   const expiredPnl = last && (unavailable || entry.failed || now - last.time > 75_000) && (last.unrealizedPnl !== null || last.totalPnl !== null);
   const gap = expiredPnl ? { time: Math.max(now, last.time + 1), unrealizedPnl: null, fundingPnl: null, totalPnl: null } : null;
   return {
     ...data, accounts, legs,
-    structure: accounts.some(account => account.positions.state !== 'live') || legs.some(leg => leg.state !== 'live')
+    structure: selectedAccounts.length !== 2 || selectedAccounts.some(account => account.positions.state !== 'live') || legs.some(leg => leg.state !== 'live')
       ? { state: 'unknown', message: '等待两所最新仓位，暂不判断四腿结构' } : data.structure,
     funding: { ...data.funding, complete,
       ...(!complete && noReceipts ? { income: null, expense: null, net: null } : {}),

@@ -17,14 +17,14 @@ async function fixture(t, options = {}) {
   const db = new DatabaseSync(':memory:');
   let time = baseTime, serial = 0, instance;
   const records = new Map(), calls = [], handlers = {}, markets = {};
-  const accounts = Object.fromEntries(['binance', 'bybit'].map(exchange => [exchange, { identity: exchange === 'bybit' ? 'fixture-uid' : null, modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
+  const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map(exchange => [exchange, { identity: exchange === 'binance' ? null : 'fixture-uid', modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
   const factory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
     if (handlers[`${exchange}:${method}`]) return handlers[`${exchange}:${method}`](...args);
     if (method === 'verify') return { identity: accounts[exchange].identity };
     if (method === 'account') return structuredClone(accounts[exchange]);
-    if (method === 'market') return { ...market(args[0]), ...markets[exchange] };
+    if (method === 'market') { const value = market(args[0]); return { ...value, ...(exchange === 'okx' ? { rule: { ...value.rule, quantityStep: '1', minQuantity: '1', contractSize: args[0] === 'CLUSDT' ? '0.1' : '0.01', instrumentId: args[0] === 'CLUSDT' ? 'CL-USDT-SWAP' : 'BZ-USDT-SWAP', quantityUnit: '张', minNotional: '0' } } : {}), ...markets[exchange] }; }
     const spec = args[1];
     if (method === 'create') {
       const id = String(++serial), record = { ...spec, id, kind: exchange === 'bybit' ? 'strategy' : 'order', status: 'working', terminal: false, childrenSettled: false, filledQuantity: '0', price: '70', averagePrice: null, createdAt: new Date(time).toISOString() };
@@ -35,7 +35,7 @@ async function fixture(t, options = {}) {
     if (method === 'inspect') return structuredClone(record);
     if (method === 'amend') {
       args[2].beforeMutation();
-      assert.equal(exchange, 'binance'); assert.equal(spec.quantity, record.quantity);
+      assert.ok(['binance', 'okx'].includes(exchange)); assert.equal(spec.quantity, record.quantity);
       record.price = (markets[exchange] ?? market(spec.symbol))[spec.side === 'buy' ? 'bid' : 'ask'];
       return structuredClone(record);
     }
@@ -44,7 +44,7 @@ async function fixture(t, options = {}) {
   const create = () => createTradingExecution({ db, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, ...options });
   instance = create();
   t.after(async () => { await instance.close(); db.close(); });
-  for (const exchange of ['binance', 'bybit']) await instance.connect(exchange, { revision: 0, accountMode: exchange === 'binance' ? 'standard' : 'unified', apiKey: 'fixture_key', apiSecret: 'fixture_secret' });
+  for (const exchange of ['binance', 'bybit', 'okx']) await instance.connect(exchange, { revision: 0, accountMode: exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified', apiKey: 'fixture_key', apiSecret: 'fixture_secret', ...(exchange === 'okx' ? { passphrase: 'fixture_private_passphrase' } : {}) });
   return { db, records, calls, accounts, handlers, markets, create, get service() { return instance; }, set service(value) { instance = value; }, get time() { return time; }, advance(value) { time += value; },
     async preview(body = intent(), session = 'session-a') { return instance.preview(body, session); },
     start(preview, requestId = randomUUID(), session = 'session-a') { return instance.start({ previewId: preview.id, requestId, confirmLive: true }, session); },
@@ -81,6 +81,52 @@ test('four-leg preset validates opposite directions and auto-splits to a shared 
   for (const leg of preview.legs) assert.deepEqual(leg.batchQuantities, ['0.667', '0.667', '0.666']);
   f.start(preview); await f.service.tick(); assert.equal(f.creates.length, 4);
   assert.equal(f.job.legs.length, 4);
+});
+
+test('every two-exchange four-leg combination uses native quantities and OKX contract notionals', async t => {
+  for (const pair of [['binance', 'bybit'], ['binance', 'okx'], ['bybit', 'okx']]) {
+    const f = await fixture(t);
+    const body = intent({ preset: 'four-leg', batchCount: 1, legs: pair.flatMap((exchange, index) => ['CLUSDT', 'BZUSDT'].map((symbol, oil) => {
+      const side = index === oil ? 'long' : 'short';
+      return { exchange, symbol, side, quantity: exchange === 'okx' ? (oil ? '200' : '20') : '2', stopPrice: side === 'long' ? '90' : '50' };
+    })) });
+    const preview = await f.preview(body);
+    assert.equal(preview.legs.length, 4); assert.deepEqual([...new Set(preview.legs.map(leg => leg.exchange))], pair);
+    for (const leg of preview.legs.filter(leg => leg.exchange === 'okx')) {
+      assert.equal(leg.rule.quantityUnit, '张'); assert.equal(leg.estimatedNotional, leg.orderSide === 'buy' ? '140' : '140.02');
+      assert.equal(leg.rule.contractSize, leg.symbol === 'CLUSDT' ? '0.1' : '0.01');
+    }
+    f.start(preview); await f.service.tick(); assert.equal(f.creates.length, 4);
+    for (const call of f.creates.filter(call => call.exchange === 'okx')) assert.ok(call.args[1].contractSize && call.args[1].instrumentId);
+  }
+  const mixed = intent({ preset: 'four-leg', legs: [...intent().legs, { exchange: 'okx', symbol: 'CLUSDT', side: 'long', quantity: '20', stopPrice: '90' }, { exchange: 'okx', symbol: 'BZUSDT', side: 'short', quantity: '200', stopPrice: '50' }] });
+  assert.throws(() => normalizeIntent(mixed), /两个不同/);
+});
+
+test('OKX native amendment retains original identity and total after partial fills', async t => {
+  const f = await fixture(t);
+  const body = intent({ batchCount: 1, legs: intent().legs.map(leg => leg.exchange === 'binance' ? { ...leg, exchange: 'okx', quantity: '20' } : leg) });
+  f.start(await f.preview(body)); await f.service.tick();
+  const order = [...f.records.values()].find(row => row.kind === 'order'); order.filledQuantity = '5';
+  f.markets.okx = { bid: '71', ask: '71.01' }; f.advance(1000); await f.service.tick();
+  const amendments = f.calls.filter(call => call.method === 'amend');
+  assert.equal(amendments.length, 1); assert.equal(amendments[0].exchange, 'okx');
+  assert.equal(amendments[0].args[1].id, order.id); assert.equal(amendments[0].args[1].quantity, '20');
+  assert.equal(f.creates.length, 2); assert.equal(f.job.legs.find(leg => leg.exchange === 'okx').filledQuantity, '5');
+  for (const row of f.records.values()) f.fill(row.id);
+  await f.service.tick(); assert.equal(f.job.status, 'completed');
+});
+
+test('changed OKX contract multiplier blocks all submission and max notional applies per contract size', async t => {
+  const f = await fixture(t);
+  const body = intent({ batchCount: 1, legs: intent().legs.map(leg => leg.exchange === 'binance' ? { ...leg, exchange: 'okx', quantity: '20' } : leg) });
+  const preview = await f.preview(body), leg = preview.legs.find(leg => leg.exchange === 'okx');
+  f.markets.okx = { rule: { ...leg.rule, maxNotional: '141' } };
+  assert.equal((await f.preview(body)).legs.find(leg => leg.exchange === 'okx').estimatedNotional, '140');
+  f.markets.okx.rule.maxNotional = '139'; await assert.rejects(f.preview(body), /名义金额/);
+  f.markets.okx.rule = { ...leg.rule, contractSize: '0.2' };
+  f.start(preview); await f.service.tick();
+  assert.equal(f.creates.length, 0); assert.equal(f.job.status, 'paused'); assert.match(f.job.reason, /乘数/);
 });
 
 test('batch barrier waits for all legs and all native children, then starts next batch after interval', async t => {

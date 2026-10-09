@@ -33,7 +33,7 @@ async function fixture(t, count = 63) {
 
 test('paged cached reads do not scan histories, calculate PnL, write storage or contact exchanges', async t => {
   const f = await fixture(t); await f.connect();
-  const reads = f.calls.length, stored = f.db.prepare('SELECT * FROM trading_views ORDER BY days').all();
+  const reads = f.calls.length, stored = f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all();
   f.queries.length = 0;
   for (let i = 0; i < 5; i++) {
     const first = f.trading.state(7, { page: 0 }), second = f.trading.state(7, { page: 1 }), last = f.trading.state(7, { page: 1999 });
@@ -45,30 +45,30 @@ test('paged cached reads do not scan histories, calculate PnL, write storage or 
   }
   assert.equal(f.calls.length, reads);
   assert.ok(f.queries.every(sql => /^SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts/.test(sql)), f.queries.join('\n'));
-  assert.deepEqual(f.db.prepare('SELECT * FROM trading_views ORDER BY days').all(), stored);
+  assert.deepEqual(f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all(), stored);
   for (const page of [-1, 2000, 1.2, '1', NaN]) assert.throws(() => f.trading.state(7, { page }), error => error.status === 400);
 });
 
 test('disk views restore without rebuilding or waiting for exchange data', async t => {
   const f = await fixture(t); await f.connect();
   const before = f.trading.state(30, { page: 1 }), reads = f.calls.length;
-  const persisted = f.db.prepare('SELECT json FROM trading_views WHERE days=30').get().json;
+  const persisted = f.db.prepare('SELECT json FROM trading_views_v2 WHERE days=30').get().json;
   assert.equal(persisted.includes('fixture_only'), false);
   assert.equal(persisted.includes('ledger-'), false, 'large ledger remains only in its original persisted snapshot');
   f.queries.length = 0; await f.reopen();
   assert.equal(f.calls.length, reads);
-  assert.equal(f.queries.some(sql => /INSERT INTO trading_views/.test(sql)), false, 'matching view must be loaded rather than rebuilt');
+  assert.equal(f.queries.some(sql => /INSERT INTO trading_views_v2/.test(sql)), false, 'matching view must be loaded rather than rebuilt');
   assert.equal(f.queries.some(sql => /SELECT \* FROM trading_pnl_samples.*time>=/.test(sql)), false, 'restart does not rescan historical PnL');
   assert.deepEqual(f.trading.state(30, { page: 1 }), before);
 });
 
 test('invalid, older-version or source-mismatched disk views rebuild from local snapshots', async t => {
   const f = await fixture(t); await f.connect();
-  for (const damage of ["UPDATE trading_views SET json='broken'", 'UPDATE trading_views SET version=999', "UPDATE trading_views SET source_key='wrong-account'"]) {
+  for (const damage of ["UPDATE trading_views_v2 SET json='broken'", 'UPDATE trading_views_v2 SET version=999', "UPDATE trading_views_v2 SET source_key='wrong-account'"]) {
     f.db.exec(damage); f.queries.length = 0; const reads = f.calls.length;
     await f.reopen();
     assert.equal(f.calls.length, reads);
-    assert.ok(f.queries.some(sql => /INSERT INTO trading_views/.test(sql)));
+    assert.ok(f.queries.some(sql => /INSERT INTO trading_views_v2/.test(sql)));
     assert.equal(f.trading.state(7, { page: 0 }).funding.net, '6.3');
   }
 });
@@ -81,7 +81,7 @@ test('cached values keep their original time and degrade freshness without rebui
   assert.equal(stale.generatedAt, before.generatedAt);
   assert.equal(stale.cache.builtAt, before.cache.builtAt);
   assert.equal(stale.cache.servedAt, new Date(f.now).toISOString());
-  assert.ok(stale.accounts.every(account => account.positions.state === 'stale'));
+  assert.ok(stale.accounts.filter(account => stale.exchanges.includes(account.exchange)).every(account => account.positions.state === 'stale'));
   assert.equal(stale.pnl.latest.totalPnl, null);
   f.advance(900000);
   const expired = f.trading.state();
@@ -107,12 +107,12 @@ test('account replacement and disconnect immediately discard both cached ranges 
 
 test('position-only refresh reuses derived history until a new minute sample is recorded', async t => {
   const f = await fixture(t); await f.connect();
-  const stored = f.db.prepare('SELECT * FROM trading_views ORDER BY days').all();
+  const stored = f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all();
   f.advance(31000); await f.trading.refresh();
-  assert.deepEqual(f.db.prepare('SELECT * FROM trading_views ORDER BY days').all(), stored);
+  assert.deepEqual(f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all(), stored);
   assert.equal(f.trading.state().accounts[0].positions.fetchedAt, new Date(f.now).toISOString());
   f.queries.length = 0; await f.reopen();
-  assert.equal(f.queries.some(sql => /INSERT INTO trading_views/.test(sql)), false);
+  assert.equal(f.queries.some(sql => /INSERT INTO trading_views_v2/.test(sql)), false);
   f.advance(31000); await f.trading.refresh();
   assert.notEqual(f.trading.state().cache.builtAt, JSON.parse(stored[0].json).generatedAt);
   assert.equal(f.trading.state().pnl.pointCount, 2);

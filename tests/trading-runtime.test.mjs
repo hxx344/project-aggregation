@@ -26,10 +26,11 @@ function receipt(exchange, id, amount, time, symbol = 'CLUSDT') {
 async function fixture(t, overrides = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-trading-runtime-'));
   let clock = INITIAL_TIME, cookie = '', csrf = '', app, origin, closed = false;
-  const calls = [], handlers = { binance: {}, bybit: {} };
+  const calls = [], handlers = { binance: {}, bybit: {}, okx: {} };
   const rows = {
     binance: [position('binance', 'CLUSDT', 'long'), position('binance', 'BZUSDT', 'short')],
     bybit: [position('bybit', 'CLUSDT', 'short'), position('bybit', 'BZUSDT', 'long')],
+    okx: [position('okx', 'CLUSDT', 'short', { marginMode: 'cross', contractSize: '0.1' }), position('okx', 'BZUSDT', 'long', { marginMode: 'cross', contractSize: '0.01' })],
   };
   const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'funding'].map(method => [method, async (secret, options) => {
     calls.push({ exchange, method, secret, ...options });
@@ -106,8 +107,60 @@ test('private trading routes require login, Origin, CSRF and JSON; disconnected 
   assert.equal(response.data.structure.state, 'unknown');
   assert.equal(response.data.funding.net, null);
   assert.equal(response.data.funding.complete, false);
-  assert.deepEqual(response.data.accounts.map(row => [row.exchange, row.accountMode]), [['binance', 'standard'], ['bybit', 'unified']]);
+  assert.deepEqual(response.data.accounts.map(row => [row.exchange, row.accountMode]), [['binance', 'standard'], ['bybit', 'unified'], ['okx', 'unified']]);
   assert.equal(f.calls.length, 0);
+});
+
+test('selected exchange pairs isolate four legs, funding and PnL across restarts and account changes', async t => {
+  const f = await fixture(t); await f.login();
+  const amounts = { binance: '1', bybit: '10', okx: '100' };
+  for (const exchange of Object.keys(amounts)) {
+    f.rows[exchange][0].unrealizedPnl = amounts[exchange]; f.rows[exchange][1].unrealizedPnl = '0';
+    f.handlers[exchange].funding = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now),
+      events: [receipt(exchange, `${exchange}-funding`, amounts[exchange], end - 1)], coverage: [{ start, end }], complete: true });
+    await f.connect(exchange, { ...credentials(exchange), ...(exchange === 'okx' ? { passphrase: 'private_fixture_passphrase' } : {}) });
+  }
+  const expected = [['binance,bybit', '11'], ['binance,okx', '101'], ['bybit,okx', '110']];
+  for (const [pair, sum] of expected) {
+    const { status, data } = await f.request(`/api/trading?pair=${pair}`);
+    assert.equal(status, 200); assert.deepEqual(data.exchanges, pair.split(',')); assert.equal(data.accounts.length, 3);
+    assert.equal(data.legs.length, 4); assert.ok(data.legs.every(leg => data.exchanges.includes(leg.exchange)));
+    assert.equal(data.funding.net, sum); assert.equal(data.funding.complete, true);
+    assert.equal(data.pnl.latest.unrealizedPnl, sum);
+    assert.equal(data.funding.events.length, 2); assert.ok(data.funding.events.every(event => data.exchanges.includes(event.exchange)));
+  }
+  const before = f.app.trading.state(30, { pair: 'binance,okx' }), calls = f.calls.length;
+  await f.reopen(); assert.equal(f.calls.length, calls);
+  assert.deepEqual(f.app.trading.state(30, { pair: 'okx,binance' }), before);
+  f.app.trading.disconnect('bybit', 1);
+  const unrelated = f.app.trading.state(30, { pair: 'binance,okx' });
+  assert.deepEqual(unrelated.pnl, before.pnl); assert.deepEqual(unrelated.funding, before.funding);
+  f.app.trading.disconnect('okx', 1);
+  const changed = f.app.trading.state(30, { pair: 'binance,okx' });
+  assert.deepEqual(changed.pnl.points, []); assert.equal(changed.funding.complete, false);
+  assert.ok(changed.funding.events.every(event => event.exchange === 'binance'));
+});
+
+test('invalid pair fails before account changes, and OKX Passphrase stays encrypted and off responses', async t => {
+  const f = await fixture(t); await f.login();
+  const secret = { ...credentials('okx'), passphrase: 'private_fixture_passphrase' };
+  for (const pair of ['okx', 'okx,okx', 'binance,bybit,okx', 'binance,unknown', '']) {
+    assert.equal((await f.request(`/api/trading?pair=${pair}`)).status, 400);
+    assert.equal((await f.request(`/api/trading/accounts/okx?pair=${pair}`, { method: 'PUT', body: { revision: 0, ...secret } })).status, 400);
+  }
+  assert.equal(f.calls.length, 0);
+  assert.equal((await f.request('/api/trading/accounts/okx', { method: 'PUT', body: { revision: 0, ...credentials('okx') } })).status, 400);
+  const connected = await f.request('/api/trading/accounts/okx?pair=binance,okx', { method: 'PUT', body: { revision: 0, ...secret } });
+  assert.equal(connected.status, 202); await f.app.trading.refresh();
+  assert.deepEqual(connected.data.exchanges, ['binance', 'okx']);
+  assert.ok(f.calls.filter(call => call.exchange === 'okx').every(call => call.secret.passphrase === secret.passphrase));
+  for (const response of [connected.data, (await f.request('/api/trading?pair=binance,okx')).data, (await f.request('/api/overview')).data]) {
+    for (const value of Object.values(secret)) assert.equal(JSON.stringify(response).includes(value), false);
+  }
+  for (const filename of (await readdir(f.dataDir)).filter(name => /^hub\.sqlite/.test(name))) {
+    const file = await readFile(path.join(f.dataDir, filename));
+    for (const value of Object.values(secret)) assert.equal(file.includes(Buffer.from(value)), false);
+  }
 });
 
 test('connection API encrypts credentials and a failed mode switch preserves the verified account and funding ledger', async t => {

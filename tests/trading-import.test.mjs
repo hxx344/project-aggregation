@@ -11,12 +11,13 @@ import { createApp } from '../server/app.mjs';
 const HUB_PASSWORD = 'hub-import-test-password';
 const ASSET_PASSWORD = 'asset-import-test-password';
 const CATALOG = '/api/hub/trading-connections';
+const CATALOG_READ = CATALOG + '?include=okx';
 const SOURCES = '/api/trading/import-sources';
 const STAMP = '2026-10-07T00:00:00.000Z';
 const NOW = Date.parse(STAMP);
-const exchanges = ['binance', 'bybit'];
-const revisions = { binance: 'a'.repeat(64), bybit: 'b'.repeat(64) };
-const credentials = suffix => ({ apiKey: `fixture_api_key_${suffix}`, apiSecret: `fixture_api_secret_${suffix}` });
+const exchanges = ['binance', 'bybit', 'okx'];
+const revisions = { binance: 'a'.repeat(64), bybit: 'b'.repeat(64), okx: 'e'.repeat(64) };
+const credentials = suffix => ({ apiKey: `fixture_api_key_${suffix}`, apiSecret: `fixture_api_secret_${suffix}`, ...(suffix.includes('okx') ? { passphrase: 'fixture_private_passphrase' } : {}) });
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const importRoute = exchange => `/api/trading/accounts/${exchange}/import`;
 const send = (res, status, data, headers = {}) => {
@@ -24,7 +25,8 @@ const send = (res, status, data, headers = {}) => {
   res.writeHead(status, { 'Content-Type': 'application/json', ...headers }); res.end(JSON.stringify(data));
 };
 const positions = (exchange, quantity = '2') => ({ fetchedAt: STAMP, positions: [{ exchange, symbol: 'CLUSDT', side: 'long', mode: 'one-way',
-  quantity, entryPrice: '70', markPrice: '71', notional: '142', unrealizedPnl: '2', leverage: '2', liquidationPrice: null, sourceUpdatedAt: STAMP }] });
+  quantity, entryPrice: '70', markPrice: '71', notional: '142', unrealizedPnl: '2', leverage: '2', liquidationPrice: null, sourceUpdatedAt: STAMP,
+  ...(exchange === 'okx' ? { marginMode: 'cross', contractSize: '0.1' } : {}) }] });
 
 async function fixture(t, overrides = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-trading-import-'));
@@ -47,7 +49,7 @@ async function fixture(t, overrides = {}) {
       if (!new RegExp(`(?:^|;\\s*)asset_session=fixture-${loginCount}(?:;|$)`).test(req.headers.cookie || '') || !loginCount) {
         send(res, 401, { error: 'Asset session required' }); return;
       }
-      const stage = req.url === CATALOG && req.method === 'GET' ? 'catalog' : req.url === CATALOG + '/export' && req.method === 'POST' ? 'export' : null;
+      const stage = req.url === CATALOG_READ && req.method === 'GET' ? 'catalog' : req.url === CATALOG + '/export' && req.method === 'POST' ? 'export' : null;
       if (!stage) { send(res, 404, { error: 'Unexpected test route' }); return; }
       if (stage === 'export' && (req.headers['content-type'] !== 'application/json' || call.body.password !== ASSET_PASSWORD)) {
         send(res, 403, { error: 'Asset export password required' }); return;
@@ -144,7 +146,7 @@ test('import HTTP routes require Hub login, same Origin, CSRF and JSON, and reje
   assert.equal(f.calls.length, before); assert.equal(f.clientCalls.length, 0); assert.equal(f.stored().revision, 0);
 });
 
-test('real HTTP Asset imports both exchanges through session and password export, sanitizes sources and encrypts copies', async t => {
+test('real HTTP Asset imports all three exchanges through session and password export, sanitizes sources and encrypts copies', async t => {
   const f = await fixture(t);
   const privateDetail = 'provider-private-diagnostic';
   f.catalog.password = ASSET_PASSWORD;
@@ -171,7 +173,7 @@ test('real HTTP Asset imports both exchanges through session and password export
     assert.equal(exported.headers.origin, f.assetOrigin); assert.equal(exported.headers['content-type'], 'application/json');
   }
   assert.equal(f.calls.filter(row => row.route === '/api/login').length, 1);
-  assert.ok(f.calls.every(row => ['/api/login', CATALOG, CATALOG + '/export'].includes(row.route)));
+  assert.ok(f.calls.every(row => ['/api/login', CATALOG_READ, CATALOG + '/export'].includes(row.route)));
   assert.ok(f.clientCalls.every(row => ['verify', 'positions', 'funding'].includes(row.method)));
   responses.push(await f.request('/api/trading'), await f.request('/api/overview'));
   const sensitive = [ASSET_PASSWORD, privateDetail, ...Object.values(f.secrets).flatMap(Object.values)];
@@ -199,6 +201,28 @@ test('source discovery includes only enabled Asset projects and configured legal
     apiUrl: f.assetOrigin, password: ASSET_PASSWORD } })).status, 201);
   const imported = await f.request(importRoute('bybit'), { method: 'POST', body: await f.body('bybit', legalId) });
   assert.equal(imported.status, 202, JSON.stringify(imported.data));
+});
+
+test('legacy two-exchange Asset catalog remains importable and marks only OKX unsupported', async t => {
+  const f = await fixture(t);
+  f.catalog.connections = f.catalog.connections.filter(row => row.exchange !== 'okx');
+  const listed = await f.request(SOURCES);
+  assert.equal(listed.data.sources[0].status, 'ready');
+  const okx = listed.data.sources[0].connections.find(row => row.exchange === 'okx');
+  assert.equal(okx.configured, false); assert.equal(okx.supported, false); assert.equal(okx.revision, null);
+  assert.match(okx.reason, /更新 Asset/);
+  assert.equal((await f.request(importRoute('bybit'), { method: 'POST', body: await f.body('bybit') })).status, 202);
+  const attempted = { ...(await f.body('binance')), sourceRevision: revisions.okx };
+  assert.equal((await f.request(importRoute('okx'), { method: 'POST', body: attempted })).status, 409);
+  assert.equal(f.calls.some(row => row.route === CATALOG + '/export' && row.body.exchange === 'okx'), false);
+});
+
+test('OKX import requires its Passphrase and never replaces a verified connection on malformed exports', async t => {
+  const f = await fixture(t), previous = await f.connectOriginal('okx'), input = await f.body('okx');
+  f.assetHandlers.export = () => ({ data: { schemaVersion: 1, exchange: 'okx', revision: revisions.okx, region: 'global', credentials: credentials('missing_passphrase') } });
+  const failed = await f.request(importRoute('okx'), { method: 'POST', body: input });
+  assert.equal(failed.status, 400); assert.deepEqual(f.stored('okx'), previous);
+  assert.equal(f.clientCalls.filter(row => row.exchange === 'okx' && row.method === 'verify').length, 1);
 });
 
 test('old Asset, unsafe HTTP, malformed catalogs and non-global exports never replace the current account', async t => {

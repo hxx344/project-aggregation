@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { decimal, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
+import { createOkxTradingClient } from './trading-okx-readonly.mjs';
 
 const SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
 const BYBIT_BASE_COINS = Object.freeze({ CLUSDT: 'CL', BZUSDT: 'BZ' });
@@ -195,6 +196,7 @@ function normalizeReceipt(exchange, row, { symbol, start, end }) {
 }
 
 export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000 } = {}) {
+  if (exchange === 'okx') return createOkxTradingClient({ fetchImpl, now, timeoutMs, ErrorClass: TradingExchangeError });
   if (!Object.hasOwn(ENDPOINTS, exchange)) throw new TradingExchangeError('不支持的交易所', 'exchange');
   if (typeof fetchImpl !== 'function' || typeof now !== 'function' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new TradingExchangeError('交易所读取配置无效', 'configuration');
   const clock = () => timestamp(now());

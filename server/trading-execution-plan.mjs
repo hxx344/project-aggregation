@@ -1,7 +1,8 @@
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
+import { TRADING_EXCHANGES, TRADING_NAMES } from './trading-markets.mjs';
 
 const SCALE = 10n ** 18n;
-export const EXECUTION_EXCHANGES = ['binance', 'bybit'];
+export const EXECUTION_EXCHANGES = TRADING_EXCHANGES;
 export const EXECUTION_SYMBOLS = ['CLUSDT', 'BZUSDT'];
 export const MAX_BATCHES = 200;
 export const QUOTE_MAX_AGE = 10_000;
@@ -31,9 +32,9 @@ export function fromUnits(value) {
   return sign + String(magnitude / SCALE) + (fraction ? '.' + fraction : '');
 }
 export const subtract = (left, right) => fromUnits(units(left) - units(right));
-export const notional = (quantity, price) => fromUnits(units(quantity) * units(price) / SCALE);
+export const notional = (quantity, price, contractSize = '1') => fromUnits(units(quantity) * units(price) * units(contractSize) / (SCALE * SCALE));
 export const isMultiple = (value, step) => units(step) > 0n && units(value) % units(step) === 0n;
-const compareNotional = (quantity, price, bound) => units(quantity) * units(price) - units(bound) * SCALE;
+const compareNotional = (quantity, price, bound, contractSize = '1') => units(quantity) * units(price) * units(contractSize) - units(bound) * SCALE * SCALE;
 function integer(value, min, max, name) {
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new ExecutionError(400, `${name}须在 ${min} 至 ${max} 之间`);
   return value;
@@ -56,7 +57,9 @@ export function normalizeIntent(body) {
     return { exchange: value.exchange, symbol: value.symbol, side: value.side, quantity: positive(value.quantity), stopPrice: positive(value.stopPrice, '追价停止价') };
   }).sort((a, b) => legId(a).localeCompare(legId(b)));
   if (body.preset === 'four-leg') {
-    for (const exchange of EXECUTION_EXCHANGES) {
+    const exchanges = [...new Set(legs.map(leg => leg.exchange))];
+    if (exchanges.length !== 2) throw new ExecutionError(400, '四腿预设需要选择两个不同的交易所');
+    for (const exchange of exchanges) {
       const pair = legs.filter(leg => leg.exchange === exchange);
       if (pair.length !== 2 || pair[0].side === pair[1].side) throw new ExecutionError(400, '四腿预设要求每所 CL/BZ 方向相反');
     }
@@ -68,7 +71,7 @@ export function normalizeIntent(body) {
   return { preset: body.preset, action: body.action, legs,
     batchCount: integer(body.batchCount, 1, MAX_BATCHES, '批次数'),
     batchIntervalMs: integer(body.batchIntervalMs, 0, 600_000, '批次间隔毫秒数'),
-    repriceIntervalMs: integer(body.repriceIntervalMs, 1000, 60_000, 'Binance 追价间隔毫秒数'),
+    repriceIntervalMs: integer(body.repriceIntervalMs, 1000, 60_000, '本地追价间隔毫秒数'),
     timeoutMs: integer(body.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数') };
 }
 
@@ -80,6 +83,12 @@ export function normalizeMarket(value, symbol, now) {
   if (compareDecimals(bid, ask) >= 0) throw new ExecutionError(502, '交易所盘口交叉，暂不下单');
   const rule = {};
   for (const field of ['tickSize', 'quantityStep', 'minQuantity', 'maxQuantity']) rule[field] = positive(value.rule[field], '合约规则');
+  if (value.rule.contractSize !== undefined) rule.contractSize = positive(value.rule.contractSize, '每张合约乘数');
+  if (value.rule.instrumentId !== undefined) {
+    if (typeof value.rule.instrumentId !== 'string' || !/^[A-Z0-9-]{1,64}$/.test(value.rule.instrumentId)) throw new ExecutionError(502, '合约代码无效');
+    rule.instrumentId = value.rule.instrumentId;
+  }
+  if (value.rule.quantityUnit === '张') rule.quantityUnit = '张';
   try {
     rule.minNotional = decimal(value.rule.minNotional, { nonnegative: true });
     rule.maxNotional = value.rule.maxNotional === null || value.rule.maxNotional === undefined ? null : decimal(value.rule.maxNotional, { positive: true });
@@ -100,8 +109,13 @@ export function checkChildQuantity(quantity, market, action) {
   const { rule } = market;
   if (!isMultiple(quantity, rule.quantityStep)) throw new ExecutionError(409, `下单数量须按 ${rule.quantityStep} 的步长填写`);
   if (compareDecimals(quantity, rule.minQuantity) < 0 || compareDecimals(quantity, rule.maxQuantity) > 0) throw new ExecutionError(409, `单批数量须在 ${rule.minQuantity} 至 ${rule.maxQuantity} 之间`);
-  if (action === 'open' && compareNotional(quantity, market.bid, rule.minNotional) < 0n) throw new ExecutionError(409, `单批名义金额低于 ${rule.minNotional} USDT`);
-  if (rule.maxNotional !== null && compareNotional(quantity, market.ask, rule.maxNotional) > 0n) throw new ExecutionError(409, '单批名义金额超过合约允许值');
+  if (action === 'open' && compareNotional(quantity, market.bid, rule.minNotional, rule.contractSize) < 0n) throw new ExecutionError(409, `单批名义金额低于 ${rule.minNotional} USDT`);
+  if (rule.maxNotional !== null && compareNotional(quantity, market.ask, rule.maxNotional, rule.contractSize) > 0n) throw new ExecutionError(409, '单批名义金额超过合约允许值');
+}
+export function checkContract(leg, market) {
+  if (leg.exchange !== 'okx') return;
+  if (!leg.rule?.contractSize || !market.rule.contractSize || leg.rule.instrumentId !== market.rule.instrumentId
+    || compareDecimals(leg.rule.contractSize, market.rule.contractSize) !== 0) throw new ExecutionError(409, 'OKX 合约乘数或代码已改变，请重新预览');
 }
 export function stopReached(leg, market) {
   const price = leg.orderSide === 'buy' ? market.bid : market.ask;
@@ -148,11 +162,11 @@ export function buildPlan(intent, snapshots, markets, connections, now) {
   const legs = prepared.map(({ market, ...leg }) => {
     const batchQuantities = splitQuantity(leg.quantity, count, market.rule.quantityStep);
     for (const quantity of batchQuantities) checkChildQuantity(quantity, market, intent.action);
-    return { ...leg, batchQuantities, estimatedNotional: notional(leg.quantity, leg.orderSide === 'buy' ? market.bid : market.ask), bid: market.bid, ask: market.ask, quoteAt: market.at, rule: market.rule };
+    return { ...leg, batchQuantities, estimatedNotional: notional(leg.quantity, leg.orderSide === 'buy' ? market.bid : market.ask, market.rule.contractSize), bid: market.bid, ask: market.ask, quoteAt: market.at, rule: market.rule };
   });
   return { ...intent, batchCount: count, legs,
     notes: [
-      'Bybit 使用交易所原生追逐限价策略（PostOnly）；Binance 使用 LIMIT / GTX / QUEUE 同向一档，由服务按设定间隔调用原生改单接口追价，保留原订单号与总数量。',
+      `本次交易所：${[...new Set(legs.map(leg => leg.exchange))].map(exchange => TRADING_NAMES[exchange]).join(' / ')}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量。`,
       '停止价用于触达后停止追价并撤销余单，不是对所有成交价格的硬保证；不发送市价单，不用市价补齐或回滚。',
       '同一批所有腿完成且委托终结后才进入下一批；任一腿失败会暂停后续批次并撤销余单，已成交仓位不会自动撤回。',
       ...(count > intent.batchCount ? [`按交易所单笔数量上限，批次数已从 ${intent.batchCount} 增加至 ${count}，请核对预览。`] : []),

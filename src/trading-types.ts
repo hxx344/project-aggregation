@@ -1,5 +1,6 @@
-export type TradingExchange = 'binance' | 'bybit';
-export type TradingAccountMode = 'standard' | 'portfolio-margin' | 'unified';
+export type TradingExchange = 'binance' | 'bybit' | 'okx';
+export type TradingPair = 'binance,bybit' | 'binance,okx' | 'bybit,okx';
+export type TradingAccountMode = 'standard' | 'portfolio-margin' | 'unified' | 'cross' | 'isolated';
 export type OilSymbol = 'CLUSDT' | 'BZUSDT';
 export type TradingReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
 export type TradingImportSource = {
@@ -18,6 +19,8 @@ export type TradingPosition = {
   notional: string | null; unrealizedPnl: string | null;
   leverage: string | null; liquidationPrice: string | null;
   sourceUpdatedAt: string | null;
+  instrumentId?: string; quantityUnit?: string; contractSize?: string;
+  marginMode?: 'cross' | 'isolated';
 };
 export type FundingReceipt = {
   id: string; exchange: TradingExchange; symbol: OilSymbol;
@@ -47,6 +50,7 @@ export type TradingState = {
   generatedAt: string; period: { days: 7 | 30; start: string; end: string };
   cache: { builtAt: string | null; servedAt: string; rebuilding: boolean };
   accounts: TradingAccount[]; legs: TradingLeg[];
+  exchanges: TradingExchange[];
   pnl: TradingPnl;
   structure: { state: 'unknown' | 'incomplete' | 'opposed' | 'same-direction' | 'mixed'; message: string };
   funding: {

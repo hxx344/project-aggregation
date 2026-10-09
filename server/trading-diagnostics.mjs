@@ -8,7 +8,7 @@ const REASONS = Object.freeze({ format: '格式无效', empty: '为空', type: '
 // are never part of this schema, including when restoring old disk snapshots.
 export function normalizeTradingDiagnostic(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== 1
-    || !['binance', 'bybit'].includes(value.exchange) || typeof value.operation !== 'string' || !Object.hasOwn(OPERATIONS, value.operation) || !CODES.has(value.code)
+    || !['binance', 'bybit', 'okx'].includes(value.exchange) || typeof value.operation !== 'string' || !Object.hasOwn(OPERATIONS, value.operation) || !CODES.has(value.code)
     || !(value.exchange === 'binance' ? ['standard', 'portfolio-margin'] : ['unified']).includes(value.accountMode)) return null;
   const result = { version: 1, exchange: value.exchange, operation: value.operation, accountMode: value.accountMode, code: value.code };
   if (Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599) result.httpStatus = value.httpStatus;
@@ -25,7 +25,7 @@ export function formatTradingDiagnostic(value) {
   const diagnostic = normalizeTradingDiagnostic(value);
   if (!diagnostic) return null;
   const { exchange, accountMode, operation, code, httpStatus, providerCode } = diagnostic;
-  const name = exchange === 'binance' ? 'Binance' : 'Bybit';
+  const name = exchange === 'binance' ? 'Binance' : exchange === 'okx' ? 'OKX' : 'Bybit';
   const label = exchange === 'binance' ? `${name} ${accountMode === 'portfolio-margin' ? '组合保证金' : '普通 U 本位'}${OPERATIONS[operation]}` : `${name} ${OPERATIONS[operation]}`;
   const details = [];
   if (httpStatus !== undefined) details.push(`HTTP ${httpStatus}`);
@@ -36,8 +36,8 @@ export function formatTradingDiagnostic(value) {
     case 'timeout': return `${label}超时，请稍后重试`;
     case 'response_limit': return `${label}响应超过大小限制`;
     case 'permissions': return `${name} API 无法确认只读权限，请使用只读密钥`;
-    case 'account_mode': return exchange === 'bybit' ? 'Bybit 账户模式无效，请使用统一交易账户' : 'Binance 账户模式无效，请选择普通 U 本位或组合保证金';
-    case 'credentials': return 'API Key 与 Secret 无效或为空';
+    case 'account_mode': return exchange !== 'binance' ? `${name} 账户模式无效，请使用支持合约的统一交易账户` : 'Binance 账户模式无效，请选择普通 U 本位或组合保证金';
+    case 'credentials': return exchange === 'okx' ? 'API Key、Secret 或 Passphrase 无效或为空' : 'API Key 与 Secret 无效或为空';
     case 'invalid_data': return diagnostic.field
       ? `${label}返回字段 ${diagnostic.field} ${REASONS[diagnostic.reason] || '格式无效'}${diagnostic.valueType ? `（收到${VALUE_TYPES[diagnostic.valueType]}）` : ''}`
       : `${label}返回的数据不完整或格式无效`;

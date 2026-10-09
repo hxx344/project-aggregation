@@ -1,9 +1,8 @@
 import { decimal } from './trading-decimal.mjs';
+import { normalizeTradingPair, DEFAULT_TRADING_PAIR } from './trading-markets.mjs';
 
-export const TRADING_VIEW_VERSION = 1;
+export const TRADING_VIEW_VERSION = 2;
 const DAY = 86_400_000;
-const EXCHANGES = ['binance', 'bybit'];
-const LEG_IDS = EXCHANGES.flatMap(exchange => ['CLUSDT', 'BZUSDT'].map(symbol => `${exchange}:${symbol}`));
 const integer = (value, maximum = Number.MAX_SAFE_INTEGER) => {
   if (!Number.isSafeInteger(value) || value < 0 || value > maximum) throw new Error('Invalid view integer');
   return value;
@@ -20,7 +19,7 @@ const cash = value => ({ income: money(value.income), expense: money(value.expen
 // Persist the expensive derived values only. Ledger rows already live in account
 // snapshots; credentials, errors and arbitrary descriptive strings never belong here.
 export function packTradingView(state) {
-  return JSON.stringify({ generatedAt: state.generatedAt, period: state.period,
+  return JSON.stringify({ exchanges: state.exchanges ?? DEFAULT_TRADING_PAIR, generatedAt: state.generatedAt, period: state.period,
     accounts: state.accounts.map(account => ({ exchange: account.exchange, funding: {
       fetchedAt: account.funding.fetchedAt, coverageStart: account.funding.coverageStart, coverageEnd: account.funding.coverageEnd, complete: account.funding.complete,
     } })),
@@ -29,16 +28,18 @@ export function packTradingView(state) {
   });
 }
 
-export function unpackTradingView(serialized, days, current) {
+export function unpackTradingView(serialized, days, current, pair = DEFAULT_TRADING_PAIR) {
   if (typeof serialized !== 'string' || serialized.length > 20_000_000) throw new Error('Invalid view size');
   const value = JSON.parse(serialized), generatedAt = timestamp(value.generatedAt);
+  const exchanges = normalizeTradingPair(pair);
+  if (JSON.stringify(value.exchanges) !== JSON.stringify(exchanges)) throw new Error('Invalid view pair');
   const start = timestamp(value.period.start), end = timestamp(value.period.end);
   if (value.period.days !== days || Date.parse(end) - Date.parse(start) !== days * DAY || Date.parse(generatedAt) > current + 60_000 || Date.parse(end) > current + 60_000) throw new Error('Invalid view period');
-  const accounts = EXCHANGES.map(exchange => {
+  const accounts = exchanges.map(exchange => {
     const funding = value.accounts.find(account => account.exchange === exchange).funding;
     return { exchange, funding: { fetchedAt: optionalTime(funding.fetchedAt), coverageStart: optionalTime(funding.coverageStart), coverageEnd: optionalTime(funding.coverageEnd), complete: boolean(funding.complete) } };
   });
-  const legs = LEG_IDS.map(id => {
+  const legs = exchanges.flatMap(exchange => ['CLUSDT', 'BZUSDT'].map(symbol => `${exchange}:${symbol}`)).map(id => {
     const leg = value.legs.find(leg => leg.id === id);
     return { id, fundingNet: money(leg.fundingNet), fundingReceiptCount: integer(leg.fundingReceiptCount, 100_000) };
   });
@@ -61,5 +62,5 @@ export function unpackTradingView(serialized, days, current) {
   const pnl = { currency: 'USDT', intervalMs: 60000, cumulativeStart: Date.parse(start), end: pnlEnd,
     recordingStartedAt: source.recordingStartedAt === null ? null : integer(source.recordingStartedAt), pointCount: integer(source.pointCount, 100_000),
     points, latest: source.latest === null ? null : point(source.latest), status: source.status };
-  return { generatedAt, period: { days, start, end }, accounts, legs, funding: { complete: boolean(value.funding.complete), ...cash(value.funding), currency: 'USDT', daily, events: [] }, pnl };
+  return { exchanges, generatedAt, period: { days, start, end }, accounts, legs, funding: { complete: boolean(value.funding.complete), ...cash(value.funding), currency: 'USDT', daily, events: [] }, pnl };
 }

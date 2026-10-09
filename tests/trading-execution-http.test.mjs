@@ -27,7 +27,7 @@ async function fixture(t) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-execution-http-'));
   let clock = INITIAL_TIME, currentSession = null, serial = 0;
   const calls = [], readOnlyCalls = [], records = new Map(), handlers = {};
-  const accounts = Object.fromEntries(['binance', 'bybit'].map(exchange => [exchange, {
+  const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map(exchange => [exchange, {
     identity: exchange === 'bybit' ? 'fixture-uid' : null,
     modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [],
   }]));
@@ -112,6 +112,7 @@ async function fixture(t) {
 test('execution HTTP routes require a session, same Origin and CSRF; state GET performs no exchange calls', async t => {
   const f = await fixture(t), job = randomUUID();
   const mutations = [[`${PREFIX}/accounts/binance`, 'PUT'], [`${PREFIX}/accounts/bybit`, 'DELETE'],
+    [`${PREFIX}/accounts/okx`, 'PUT'], [`${PREFIX}/accounts/okx`, 'DELETE'],
     [`${PREFIX}/preview`, 'POST'], [`${PREFIX}/jobs`, 'POST'], [`${PREFIX}/jobs/${job}/stop`, 'POST'], [`${PREFIX}/jobs/${job}/reconcile`, 'POST']];
   for (const [route, method] of [[PREFIX, 'GET'], ...mutations]) {
     assert.equal((await f.request(route, { method, ...(method === 'GET' ? {} : { body: {} }) })).status, 401);
@@ -128,6 +129,33 @@ test('execution HTTP routes require a session, same Origin and CSRF; state GET p
   assert.deepEqual(state.data.jobs, []);
   assert.ok(state.data.connections.every(row => !row.connected));
   assert.equal(f.calls.length, 0); assert.equal(f.readOnlyCalls.length, 0);
+});
+
+test('OKX execution connection requires a Passphrase, persists isolated mode and hides all credentials', async t => {
+  const f = await fixture(t); await f.login();
+  const live = { ...credentials('okx_exec'), passphrase: 'private_http_okx_passphrase' };
+  const body = { revision: 0, accountMode: 'isolated', ...live }, route = `${PREFIX}/accounts/okx`;
+  for (const patch of [{ passphrase: undefined }, { passphrase: 'short' }, { passphrase: 'unsafe\nline' }, { accountMode: 'unified' }, { accountMode: 'portfolio-margin' }]) {
+    assert.equal((await f.request(route, { method: 'PUT', body: { ...body, ...patch } })).status, 400);
+  }
+  assert.equal(f.calls.length, 0);
+  const connected = await f.request(route, { method: 'PUT', body });
+  assert.equal(connected.status, 200);
+  const view = connected.data.connections.find(row => row.exchange === 'okx');
+  assert.equal(view.accountMode, 'isolated'); assert.equal(view.connected, true); assert.equal(view.revision, 1);
+  assert.ok(f.calls.every(call => call.args[0].passphrase === live.passphrase && call.args[1].accountMode === 'isolated'));
+  const original = f.rows('SELECT * FROM execution_accounts WHERE exchange=?', 'okx')[0];
+  f.handlers['okx:verify'] = () => { throw new Error(live.passphrase); };
+  const failed = await f.request(route, { method: 'PUT', body: { ...body, revision: 1, accountMode: 'cross' } });
+  assert.equal(failed.status, 400); assert.deepEqual(f.rows('SELECT * FROM execution_accounts WHERE exchange=?', 'okx')[0], original);
+  for (const response of [connected, failed, await f.request(PREFIX), await f.request('/api/trading'), await f.request('/api/overview')]) {
+    for (const secret of Object.values(live)) assert.equal(JSON.stringify(response.data).includes(secret), false);
+  }
+  for (const filename of (await readdir(f.dataDir)).filter(name => /^hub\.sqlite/.test(name))) {
+    const content = await readFile(path.join(f.dataDir, filename));
+    for (const secret of Object.values(live)) assert.equal(content.includes(Buffer.from(secret)), false);
+  }
+  assert.equal(f.readOnlyCalls.length, 0); assert.equal(f.mutations.length, 0);
 });
 
 test('execution HTTP rejects market-order fields, injected internal options and malformed JSON before exchange reads', async t => {

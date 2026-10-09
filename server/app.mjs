@@ -16,6 +16,7 @@ import { snapshotDiagnostics } from './diagnostics.mjs';
 import { createTradingImporter } from './trading-import.mjs';
 import { createTradingExecution } from './trading-execution.mjs';
 import { ExecutionError } from './trading-execution-plan.mjs';
+import { normalizeTradingPair } from './trading-markets.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -280,7 +281,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (pathname === '/api/logout' && req.method === 'POST') { db.prepare('DELETE FROM sessions WHERE id=?').run(current.id); publishOverview(); send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` }); return; }
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && req.method === 'GET') { send(res, 200, execution.state()); return; }
-      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit)$/);
+      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
       if (account && req.method === 'PUT') { send(res, 200, await execution.connect(account[1], await bodyOf(req), current.id)); return; }
       if (account && req.method === 'DELETE') { send(res, 200, execution.disconnect(account[1], await bodyOf(req), current.id)); return; }
       if (pathname === '/api/trading/execution/preview' && req.method === 'POST') { send(res, 200, await execution.preview(await bodyOf(req), current.id)); return; }
@@ -296,14 +297,16 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       const pageValue = url.searchParams.get('page') || '0';
       if (!/^(?:0|[1-9]\d{0,3})$/.test(pageValue) || Number(pageValue) > 1999) throw new HttpError(400, '流水页码无效');
       const page = Number(pageValue);
-      if (pathname === '/api/trading' && req.method === 'GET') { send(res, 200, trading.state(days, { page })); return; }
+      let pair;
+      try { pair = normalizeTradingPair(url.searchParams.get('pair') ?? undefined); } catch { throw new HttpError(400, '请选择两个不同的交易所'); }
+      if (pathname === '/api/trading' && req.method === 'GET') { send(res, 200, trading.state(days, { page, pair })); return; }
       if (pathname === '/api/trading/import-sources' && req.method === 'GET') { send(res, 200, await tradingImporter.sources()); return; }
-      const importedAccount = pathname.match(/^\/api\/trading\/accounts\/(binance|bybit)\/import$/);
-      if (importedAccount && req.method === 'POST') { await tradingImporter.importAccount(importedAccount[1], await bodyOf(req)); send(res, 202, trading.state(days, { page })); return; }
-      if (pathname === '/api/trading/refresh' && req.method === 'POST') { await bodyOf(req); void trading.refresh({ force: true }); send(res, 202, trading.state(days, { page })); return; }
-      const account = pathname.match(/^\/api\/trading\/accounts\/(binance|bybit)$/);
-      if (account && req.method === 'PUT') { await trading.connect(account[1], await bodyOf(req)); send(res, 202, trading.state(days, { page })); return; }
-      if (account && req.method === 'DELETE') { const body = await bodyOf(req); trading.disconnect(account[1], body.revision); send(res, 200, trading.state(days, { page })); return; }
+      const importedAccount = pathname.match(/^\/api\/trading\/accounts\/(binance|bybit|okx)\/import$/);
+      if (importedAccount && req.method === 'POST') { await tradingImporter.importAccount(importedAccount[1], await bodyOf(req)); send(res, 202, trading.state(days, { page, pair })); return; }
+      if (pathname === '/api/trading/refresh' && req.method === 'POST') { await bodyOf(req); void trading.refresh({ force: true }); send(res, 202, trading.state(days, { page, pair })); return; }
+      const account = pathname.match(/^\/api\/trading\/accounts\/(binance|bybit|okx)$/);
+      if (account && req.method === 'PUT') { await trading.connect(account[1], await bodyOf(req)); send(res, 202, trading.state(days, { page, pair })); return; }
+      if (account && req.method === 'DELETE') { const body = await bodyOf(req); trading.disconnect(account[1], body.revision); send(res, 200, trading.state(days, { page, pair })); return; }
       throw new HttpError(404, '交易模块仅提供只读查询和账户连接管理');
     }
     if (pathname === '/api/projects' && req.method === 'GET') { send(res, 200, { projects: getProjects() }); return; }

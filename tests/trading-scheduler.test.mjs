@@ -69,7 +69,7 @@ test('default automatic collection stays fresh for ten minutes without manual re
 
 test('restarting the collector restores stored views and resumes automatic collection after downtime', async t => {
   const f = await fixture(t); await f.connect(); await f.advance(60_000);
-  const before = f.trading.state(30), persisted = f.db.prepare('SELECT * FROM trading_views ORDER BY days').all();
+  const before = f.trading.state(30), persisted = f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all();
   await f.stop(); const stoppedCalls = f.calls.length;
   await f.advance(360_000);
   assert.equal(f.calls.length, stoppedCalls, 'closing the collector stops all scheduled exchange calls');
@@ -77,19 +77,19 @@ test('restarting the collector restores stored views and resumes automatic colle
   const restored = f.trading.state(30);
   assert.equal(f.calls.length, stoppedCalls, 'opening exposes persisted data before any exchange request');
   assert.equal(restored.cache.builtAt, before.cache.builtAt);
-  assert.deepEqual(f.db.prepare('SELECT * FROM trading_views ORDER BY days').all(), persisted);
-  assert.ok(restored.accounts.every(account => account.positions.state === 'stale'));
+  assert.deepEqual(f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all(), persisted);
+  assert.ok(restored.accounts.filter(account => account.exchange !== 'okx').every(account => account.positions.state === 'stale'));
   await f.advance(1000);
   const resumed = f.trading.state(30);
-  assert.ok(resumed.accounts.every(account => account.positions.state === 'live' && account.positions.fetchedAt === stamp()));
-  assert.ok(resumed.accounts.every(account => account.funding.fetchedAt === stamp()));
+  assert.ok(resumed.accounts.filter(account => account.exchange !== 'okx').every(account => account.positions.state === 'live' && account.positions.fetchedAt === stamp()));
+  assert.ok(resumed.accounts.filter(account => account.exchange !== 'okx').every(account => account.funding.fetchedAt === stamp()));
   assert.notEqual(resumed.cache.builtAt, before.cache.builtAt);
   assert.ok(resumed.pnl.pointCount > before.pnl.pointCount);
   const afterResume = f.calls.length;
   await f.advance(29_000);
   assert.equal(f.calls.length, afterResume, 'restart does not bypass the normal per-account cooldown');
   await f.advance(1000);
-  assert.ok(f.trading.state().accounts.every(account => account.positions.fetchedAt === stamp()));
+  assert.ok(f.trading.state().accounts.filter(account => account.exchange !== 'okx').every(account => account.positions.fetchedAt === stamp()));
 });
 
 test('automatic collection isolates a timeout and failure, then recovers without a manual refresh', async t => {
@@ -120,7 +120,7 @@ test('automatic collection isolates a timeout and failure, then recovers without
   await f.advance(30_000);
   current = f.trading.state();
   assert.equal(attempts, 3, 'failed requests retry on schedule rather than on every scheduler tick');
-  assert.ok(current.accounts.every(account => account.positions.state === 'live' && account.positions.fetchedAt === stamp()));
+  assert.ok(current.accounts.filter(account => account.exchange !== 'okx').every(account => account.positions.state === 'live' && account.positions.fetchedAt === stamp()));
   assert.equal(current.accounts[0].positions.error, null);
   assert.ok(current.legs.filter(leg => leg.exchange === 'binance').every(leg => leg.positions.length === 0), 'recovered snapshots replace the retained positions');
   assert.equal(current.cache.builtAt, stamp());
