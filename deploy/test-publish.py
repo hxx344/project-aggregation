@@ -38,8 +38,11 @@ class PublishRelease(unittest.TestCase):
         self.calls.append(args)
         self.assertEqual(args[0], 'gh')
         code, stdout, stderr = 0, '', ''
-        if args[1:4] == ['api', '--paginate', '--slurp']:
-            stdout = json.dumps([[self.release] if self.release else []])
+        if args[1:3] == ['release', 'view']:
+            if self.release:
+                stdout = json.dumps({'isDraft': self.release['draft'], 'assets': self.release['assets']})
+            else:
+                code, stderr = 1, 'release not found'
         elif args[1] == 'api' and args[2].endswith('/releases/latest'):
             if self.latest:
                 stdout = json.dumps({'tag_name': self.latest})

@@ -26,9 +26,14 @@ for entry in manifest['artifacts'].values():
     if hashlib.sha256((directory / entry['file']).read_bytes()).hexdigest() != entry['sha256']:
         raise ValueError('Artifact hash mismatch')
 def find_release():
-    # The by-tag endpoint can return 404 for drafts whose tag is not published.
-    pages = json.loads(gh('api', '--paginate', '--slurp', f'repos/{repository}/releases?per_page=100').stdout)
-    return next((release for page in pages for release in page if release['tag_name'] == tag), None)
+    # gh resolves unpublished drafts as well as public tags.
+    result = gh('release', 'view', tag, '--repo', repository, '--json', 'isDraft,assets', check=False)
+    if result.returncode:
+        if 'not found' in result.stderr.lower() or '404' in result.stderr:
+            return None
+        raise RuntimeError(result.stderr)
+    data = json.loads(result.stdout)
+    return {'draft': data['isDraft'], 'assets': data['assets']}
 
 
 release = find_release()
@@ -43,16 +48,13 @@ if release:
             raise ValueError('Published release is incomplete; refusing to modify it')
         print('Identical deployment release already published; skipped.')
         sys.exit(0)
-    gh('release', 'upload', tag, '--repo', repository, '--clobber', *[str(directory / name) for name in assets + ['release-manifest.json']])
 else:
     gh('release', 'create', tag, '--repo', repository, '--target', commit, '--draft', '--title', f'Deployment {commit[:12]}',
-       '--notes', f'CI-verified deployment packages for commit {commit}. Existing configuration and data remain on the server.',
-       *[str(directory / name) for name in assets + ['release-manifest.json']])
-release = find_release()
-if not release or not release['draft']:
-    raise ValueError('Expected the complete deployment draft before publication')
-if not set(assets + ['release-manifest.json']) <= {asset['name'] for asset in release['assets']}:
-    raise ValueError('Draft is missing an asset')
+       '--notes', f'CI-verified deployment packages for commit {commit}. Existing configuration and data remain on the server.')
+# Each synchronous upload must finish before publication. Do not re-read a
+# potentially cached REST release list immediately after creating a draft.
+for name in assets + ['release-manifest.json']:
+    gh('release', 'upload', tag, '--repo', repository, '--clobber', str(directory / name))
 # Jobs share a repository-wide publication lock. A later failing main build must
 # not suppress this verified release, nor may an older job move latest backwards.
 latest = gh('api', f'repos/{repository}/releases/latest', check=False)
