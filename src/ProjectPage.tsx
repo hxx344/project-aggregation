@@ -27,7 +27,7 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
   const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
   function synchronize() {
     if (!connected.current) return;
-    post({ type: 'activity', active: latest.current.active && document.visibilityState === 'visible' });
+    post({ type: 'activity', active: latest.current.active && document.visibilityState === 'visible', backgroundUpdates: true });
     const next = latest.current.query;
     const key = next === undefined ? '' : JSON.stringify(next);
     if (!latest.current.active) { sentNavigation.current = ''; return; }

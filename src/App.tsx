@@ -87,7 +87,7 @@ export default function App() {
   const mobileMenuButton = useRef<HTMLButtonElement>(null);
   const sidebar = useRef<HTMLElement>(null);
   const requestVersion = useRef(0);
-  const pendingLoad = useRef<{ promise: Promise<void>; signal: AbortSignal } | null>(null);
+  const pendingLoad = useRef<{ promise: Promise<void>; signal: AbortSignal; controller: AbortController } | null>(null);
   useEffect(() => {
     if (!menuOpen) return;
     const first = sidebar.current?.querySelector<HTMLButtonElement>('button'); first?.focus();
@@ -102,16 +102,18 @@ export default function App() {
     document.addEventListener('keydown', onKey); return () => document.removeEventListener('keydown', onKey);
   }, [menuOpen]);
 
-  const expire = useCallback(() => { tradingCache.clear(); requestVersion.current++; pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
+  const expire = useCallback(() => { tradingCache.clear(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
   useEffect(() => {
     const controller = new AbortController();
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { if (controller.signal.aborted) return; setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (!controller.signal.aborted && e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
     return () => controller.abort();
   }, []);
   const accept = useCallback((data: Overview) => { receivedAt.current = performance.now(); setOverview(data); setError(''); }, []);
-  const load = useCallback((signal?: AbortSignal) => {
-    if (pendingLoad.current && !pendingLoad.current.signal.aborted) return pendingLoad.current.promise;
-    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
+  const load = useCallback((signal?: AbortSignal, force = false) => {
+    if (pendingLoad.current && !pendingLoad.current.signal.aborted && !force) return pendingLoad.current.promise;
+    pendingLoad.current?.controller.abort();
+    const controller = new AbortController();
+    const requestSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]);
     const version = ++requestVersion.current;
     setLoading(true);
     const promise = (async () => {
@@ -119,16 +121,15 @@ export default function App() {
       catch (e) { if (version !== requestVersion.current) return; if (e instanceof ApiError && e.status === 401) expire(); else if (e instanceof Error && e.name !== 'AbortError') setError(e.message); }
       finally { if (version === requestVersion.current) setLoading(false); }
     })().finally(() => { if (pendingLoad.current?.promise === promise) pendingLoad.current = null; });
-    pendingLoad.current = { promise, signal: requestSignal }; return promise;
+    pendingLoad.current = { promise, signal: requestSignal, controller }; return promise;
   }, [expire, accept]);
   useEffect(() => {
     if (!authenticated) return;
     const controller = new AbortController();
-    const refresh = () => { if (document.visibilityState === 'visible' && navigator.onLine && !streamLive.current) void load(controller.signal); };
+    const refresh = () => { if (navigator.onLine && !streamLive.current) void load(controller.signal); };
     const first = window.setTimeout(refresh, 1500);
     const interval = window.setInterval(refresh, 30_000);
-    document.addEventListener('visibilitychange', refresh); window.addEventListener('online', refresh);
-    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); document.removeEventListener('visibilitychange', refresh); window.removeEventListener('online', refresh); };
+    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); };
   }, [authenticated, load]);
   useEffect(() => {
     if (!authenticated) return;
@@ -138,28 +139,35 @@ export default function App() {
     const controller = new AbortController();
     const connect = () => {
       stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry);
-      if (document.hidden || !navigator.onLine) return;
+      if (controller.signal.aborted || !navigator.onLine) return;
       watchdog = createStreamWatchdog();
       const decode = createOverviewDecoder();
       const current = new EventSource('/api/overview/events?protocol=2'); stream = current;
       current.onmessage = event => {
-        if (controller.signal.aborted || stream !== current || document.hidden) return;
+        if (controller.signal.aborted || stream !== current) return;
         try { const data = decode(event.data); watchdog.received(); streamLive.current = true; if (data) { requestVersion.current++; setLoading(false); accept(data); } }
         catch { streamLive.current = false; current.close(); stream = null; void load(controller.signal); retry = setTimeout(connect, 5000); }
       };
-      current.onerror = () => { if (controller.signal.aborted || stream !== current || document.hidden) return; streamLive.current = false; void load(controller.signal); };
+      current.onerror = () => { if (controller.signal.aborted || stream !== current) return; streamLive.current = false; void load(controller.signal); };
     };
+    const resume = () => {
+      if (!navigator.onLine) return;
+      if (!stream || watchdog.expired()) connect();
+      void load(controller.signal, true);
+    };
+    const visible = () => { if (!document.hidden) resume(); };
+    const offline = () => { connect(); pendingLoad.current?.controller.abort(); };
     connect();
-    document.addEventListener('visibilitychange', connect); window.addEventListener('online', connect); window.addEventListener('offline', connect);
-    const health = window.setInterval(() => { if (!document.hidden && navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
-    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearInterval(health); document.removeEventListener('visibilitychange', connect); window.removeEventListener('online', connect); window.removeEventListener('offline', connect); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
+    document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
+    window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
+    const health = window.setInterval(() => { if (navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
+    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
   }, [authenticated, accept, load]);
   useEffect(() => {
     if (!overview || !authenticated) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const schedule = () => {
       clearTimeout(timer);
-      if (document.hidden) return;
       const now = Date.parse(overview.generatedAt) + performance.now() - receivedAt.current;
       const expiry = nextSnapshotExpiry(overview.projects, now);
       if (expiry !== null) timer = setTimeout(() => setClock(value => value + 1), Math.min(expiry - now, 2_147_483_647));
