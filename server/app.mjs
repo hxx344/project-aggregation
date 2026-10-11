@@ -128,7 +128,11 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
   const getProjects = () => db.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
-  const states = new Map(); const pending = new Map(); const controllers = new Set(); const loginAttempts = new Map();
+  const states = new Map(); const pending = new Map(); const controllers = new Set();
+  const loginAttempts = new Map(); // IP-based rate limiting
+  const accountLockouts = new Map(); // Account-level lockout: tracks failed password attempts
+  const ACCOUNT_LOCKOUT_THRESHOLD = 5; // Lock after 5 failed attempts
+  const ACCOUNT_LOCKOUT_DURATION = 30 * 60000; // 30 minutes lockout
   let closed = false;
   const updateStream = createUpdateStream({ readState: updates.status,
     isSessionActive: id => !closed && !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
@@ -275,18 +279,51 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (pathname === '/api/login' && req.method === 'POST') {
       sameOrigin(req);
       const ip = req.socket.remoteAddress || 'unknown'; const now = Date.now();
+
+      // Clean up expired rate limit entries
       for (const [address, attempt] of loginAttempts) if (attempt.until < now) loginAttempts.delete(address);
+      for (const [account, lockout] of accountLockouts) if (lockout.until < now) accountLockouts.delete(account);
+
+      // Check account-level lockout first (prevents brute force even from distributed IPs)
+      const accountId = 'global'; // Single-account system, use 'global' as identifier
+      const lockout = accountLockouts.get(accountId);
+      if (lockout && lockout.until > now) {
+        const remainingMinutes = Math.ceil((lockout.until - now) / 60000);
+        throw new HttpError(429, `账户已被锁定，请 ${remainingMinutes} 分钟后重试`);
+      }
+
+      // Check IP-based rate limiting
       const attempt = loginAttempts.get(ip) || { count: 0, until: now + loginWindowMs };
       if (attempt.count >= 10) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
+
       // Reserve before reading the body: partial concurrent requests share one quota.
       attempt.count += 1; loginAttempts.set(ip, attempt);
       const body = await bodyOf(req);
       const passwordVersion = getSetting('password');
-      if (typeof body.password !== 'string' || body.password.length > 1024 || !await passwordMatches(body.password, passwordVersion) || getSetting('password') !== passwordVersion) throw new HttpError(401, '登录密码不正确');
-      // Release only this successful attempt, retaining concurrent and failed attempts.
+
+      // Verify password
+      const passwordValid = typeof body.password === 'string' && body.password.length <= 1024 && await passwordMatches(body.password, passwordVersion) && getSetting('password') === passwordVersion;
+
+      if (!passwordValid) {
+        // Track failed attempts for account lockout
+        const failedAttempts = (lockout?.failedAttempts || 0) + 1;
+        if (failedAttempts >= ACCOUNT_LOCKOUT_THRESHOLD) {
+          accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
+          throw new HttpError(429, `连续登录失败过多，账户已被锁定 30 分钟`);
+        } else {
+          accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
+        }
+        throw new HttpError(401, '登录密码不正确');
+      }
+
+      // Successful login: clear account lockout and release IP quota
+      accountLockouts.delete(accountId);
       if (loginAttempts.get(ip) === attempt) { attempt.count -= 1; if (attempt.count === 0) loginAttempts.delete(ip); }
+
       db.prepare('DELETE FROM sessions WHERE expires<=?').run(now);
+      // Security: Always delete old session and generate new ID on login to prevent session fixation
       if (current) db.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
+      // Always generate a fresh session ID and CSRF token after successful authentication
       const raw = token(); const csrf = token();
       db.prepare('INSERT INTO sessions(id,csrf,expires) VALUES (?,?,?)').run(hash(raw), csrf, now + SESSION_AGE);
       send(res, 200, { authenticated: true, csrfToken: csrf }, { 'Set-Cookie': `hub_session=${raw}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_AGE / 1000}${secureCookies ? '; Secure' : ''}` }); return;

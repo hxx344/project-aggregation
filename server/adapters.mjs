@@ -53,18 +53,23 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
   const timer = setTimeout(abort, remaining);
   const hostname = target.hostname.replace(/^\[|\]$/g, '');
   try {
+    // Security: Resolve DNS and validate addresses before making the request
+    // This prevents DNS rebinding attacks by pinning the resolved address
     const addresses = await Promise.race([
       lookup(hostname, { all: true }),
       new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new UpstreamError('timeout', '服务响应超时')), { once: true })),
     ]);
     if (!addresses.length || addresses.some(({ address }) => blockedAddress(address))) throw new UpstreamError('invalid', '服务地址解析到不允许访问的地址');
     if (requireSecureTransport && target.protocol !== 'https:' && addresses.some(({ address }) => !loopbackAddress(address))) throw new UpstreamError('insecure_transport', '从 Asset 导入需要 HTTPS 或本机回环地址');
-    const address = addresses[0];
+
+    // Pin the first validated address for this request to prevent TOCTOU attacks
+    const pinnedAddress = addresses[0];
     const serialized = body === undefined ? undefined : JSON.stringify(body);
     return await new Promise((resolve, reject) => {
       const req = (target.protocol === 'https:' ? https : http).request(target, {
         method, signal: controller.signal,
-        lookup: (_name, options, callback) => options.all ? callback(null, [address]) : callback(null, address.address, address.family),
+        // Force Node.js to use the pinned address; prevents re-resolution during the request
+        lookup: (_name, options, callback) => options.all ? callback(null, [pinnedAddress]) : callback(null, pinnedAddress.address, pinnedAddress.family),
         headers: { Accept: 'application/json', ...headers, ...(serialized ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(serialized) } : {}) },
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(new UpstreamError('invalid', '服务返回重定向，请配置最终服务地址')); return; }
