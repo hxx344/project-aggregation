@@ -21,7 +21,6 @@ import { normalizeTradingPair } from './trading-markets.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
 import { createUpdateStream } from './update-stream.mjs';
 import { RateLimiter } from './rate-limiter.mjs';
-import { sendCompressed } from './compression.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -263,7 +262,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     const expected = `${secureCookies || req.socket.encrypted ? 'https' : 'http'}://${req.headers.host}`;
     if (origin !== expected || req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, '请求来源校验失败，请从工作台页面操作');
   }
-  const send = async (req, res, status, data, headers = {}) => await sendCompressed(req, res, status, data, headers);
+  const send = (res, status, data, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers }); res.end(JSON.stringify(data)); };
   async function bodyOf(req) {
     if (!req.headers['content-type']?.startsWith('application/json')) throw new HttpError(415, '请求需使用 JSON');
     const chunks = []; let bytes = 0;
