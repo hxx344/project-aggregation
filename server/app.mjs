@@ -143,7 +143,20 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   let assetSync = null;
   const streams = new Map();
   const serveStatic = createStaticResponder();
-  const overview = () => ({ projects: getProjects().map(snapshot), generatedAt: new Date().toISOString() });
+  const overview = () => {
+    // Performance: Batch load all snapshots upfront to avoid N+1 queries
+    const allSnapshots = db.prepare('SELECT * FROM snapshots').all();
+    const snapshotMap = new Map(allSnapshots.map(row => [row.id, JSON.parse(row.json)]));
+
+    // Pre-populate states cache with DB snapshots
+    for (const [id, json] of snapshotMap) {
+      if (!states.has(id)) {
+        states.set(id, json);
+      }
+    }
+
+    return { projects: getProjects().map(snapshot), generatedAt: new Date().toISOString() };
+  };
   function publishOverview() {
     let message, data;
     for (const [res, current] of streams) {
