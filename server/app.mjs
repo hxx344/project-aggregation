@@ -311,7 +311,8 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
           accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
           throw new HttpError(429, `连续登录失败过多，账户已被锁定 30 分钟`);
         } else {
-          accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
+          // Track failed attempts but don't set 'until' yet (no lockout until threshold reached)
+          accountLockouts.set(accountId, { failedAttempts, until: 0 });
         }
         throw new HttpError(401, '登录密码不正确');
       }
