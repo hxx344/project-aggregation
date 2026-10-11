@@ -305,7 +305,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       // Check account-level lockout first (prevents brute force even from distributed IPs)
       const accountId = 'global'; // Single-account system, use 'global' as identifier
       const lockout = accountLockouts.get(accountId);
-      if (lockout && lockout.until > now) {
+      if (lockout && lockout.until > 0 && lockout.until > now) {
         const remainingMinutes = Math.ceil((lockout.until - now) / 60000);
         throw new HttpError(429, `账户已被锁定，请 ${remainingMinutes} 分钟后重试`);
       }
@@ -323,15 +323,18 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       const passwordValid = typeof body.password === 'string' && body.password.length <= 1024 && await passwordMatches(body.password, passwordVersion) && getSetting('password') === passwordVersion;
 
       if (!passwordValid) {
-        // Track failed attempts for account lockout
-        const failedAttempts = (lockout?.failedAttempts || 0) + 1;
+        // Increment failed attempts counter
+        const currentFailedAttempts = lockout?.failedAttempts || 0;
+        const failedAttempts = currentFailedAttempts + 1;
         log.warn({ ip, failedAttempts, type: 'auth_failed' }, '登录失败');
+
+        // Check if THIS failure triggers lockout (check AFTER incrementing)
         if (failedAttempts >= ACCOUNT_LOCKOUT_THRESHOLD) {
           accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
           log.error({ ip, failedAttempts, type: 'account_locked' }, '账户已被锁定');
           throw new HttpError(429, `连续登录失败过多，账户已被锁定 30 分钟`);
         } else {
-          // Track failed attempts but don't set 'until' yet (no lockout until threshold reached)
+          // Track failed attempts but don't set lockout time yet
           accountLockouts.set(accountId, { failedAttempts, until: 0 });
         }
         throw new HttpError(401, '登录密码不正确');
