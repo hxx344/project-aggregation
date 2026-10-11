@@ -20,6 +20,8 @@ import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
 import { createUpdateStream } from './update-stream.mjs';
+import { RateLimiter } from './rate-limiter.mjs';
+import { sendCompressed } from './compression.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -64,7 +66,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   if (key.length !== 32) throw new Error('凭据密钥文件长度不正确');
   if (process.platform !== 'win32') chmodSync(keyPath, 0o600);
   const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL);');
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);');
   if (process.platform !== 'win32') chmodSync(dbPath, 0o600);
   const getSetting = name => db.prepare('SELECT value FROM settings WHERE key=?').get(name)?.value;
   if (!getSetting('password')) {
@@ -129,6 +131,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const getProjects = () => db.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set(); const loginAttempts = new Map();
+  const rateLimiter = new RateLimiter();
   let closed = false;
   const updateStream = createUpdateStream({ readState: updates.status,
     isSessionActive: id => !closed && !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
@@ -260,7 +263,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     const expected = `${secureCookies || req.socket.encrypted ? 'https' : 'http'}://${req.headers.host}`;
     if (origin !== expected || req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, '请求来源校验失败，请从工作台页面操作');
   }
-  const send = (res, status, data, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers }); res.end(JSON.stringify(data)); };
+  const send = async (req, res, status, data, headers = {}) => await sendCompressed(req, res, status, data, headers);
   async function bodyOf(req) {
     if (!req.headers['content-type']?.startsWith('application/json')) throw new HttpError(415, '请求需使用 JSON');
     const chunks = []; let bytes = 0;
@@ -270,6 +273,21 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   async function api(req, res, url) {
     const pathname = url.pathname;
     if (pathname === '/api/health' && req.method === 'GET') { send(res, 200, { status: 'ok' }); return; }
+
+    // Global rate limiting (exclude health check)
+    const ip = req.socket.remoteAddress || 'unknown';
+    const rateLimit = rateLimiter.check(ip, { maxRequests: 100, windowMs: 60000 });
+    if (!rateLimit.allowed) {
+      res.writeHead(429, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Retry-After': Math.ceil((rateLimit.resetAt - Date.now()) / 1000),
+        'X-RateLimit-Limit': '100',
+        'X-RateLimit-Remaining': '0',
+        'X-RateLimit-Reset': Math.floor(rateLimit.resetAt / 1000)
+      });
+      res.end(JSON.stringify({ error: '请求过于频繁，请稍后重试' }));
+      return;
+    }
     const current = session(req);
     if (pathname === '/api/session' && req.method === 'GET') { send(res, 200, current ? { authenticated: true, csrfToken: current.csrf } : { authenticated: false }); return; }
     if (pathname === '/api/login' && req.method === 'POST') {
@@ -453,6 +471,6 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   return {
     server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); rateLimiter.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

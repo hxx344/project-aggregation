@@ -24,6 +24,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     CREATE TABLE IF NOT EXISTS execution_orders (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS execution_orders_job ON execution_orders(job_id);
     CREATE TABLE IF NOT EXISTS execution_previews (id TEXT PRIMARY KEY, session TEXT NOT NULL, expires INTEGER NOT NULL, json TEXT NOT NULL, consumed TEXT);
+    CREATE INDEX IF NOT EXISTS idx_execution_previews_expires ON execution_previews(expires) WHERE consumed IS NULL;
     CREATE TABLE IF NOT EXISTS execution_requests (id TEXT PRIMARY KEY, preview_id TEXT NOT NULL, job_id TEXT NOT NULL, session TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_locks (resource TEXT PRIMARY KEY, job_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires INTEGER NOT NULL);
