@@ -49,17 +49,18 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = { info: console.log, warn: console.warn, error: console.error, debug: console.debug }, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
-  logger.info({ dataDir: resolvedData, type: 'startup' }, '初始化数据目录');
+  const log = typeof logger === 'function' ? { info: logger, warn: logger, error: logger, debug: logger } : logger;
+  log.info({ dataDir: resolvedData, type: 'startup' }, '初始化数据目录');
   mkdirSync(resolvedData, { recursive: true, mode: 0o700 });
   if (process.platform !== 'win32') chmodSync(resolvedData, 0o700);
   const keyPath = path.join(resolvedData, 'credentials.key');
   const dbPath = path.join(resolvedData, 'hub.sqlite');
   if (!existsSync(keyPath)) {
     if (existsSync(dbPath)) throw new Error('凭据密钥文件缺失，请恢复 credentials.key 后再启动');
-    logger.info({ type: 'security' }, '生成新的凭据加密密钥');
+    log.info({ type: 'security' }, '生成新的凭据加密密钥');
     writeFileSync(keyPath, randomBytes(32), { flag: 'wx', mode: 0o600 });
   }
   const key = readFileSync(keyPath);
@@ -68,13 +69,13 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);');
   if (process.platform !== 'win32') chmodSync(dbPath, 0o600);
-  logger.info({ dbPath, type: 'startup' }, '数据库初始化完成');
+  log.info({ dbPath, type: 'startup' }, '数据库初始化完成');
   const getSetting = name => db.prepare('SELECT value FROM settings WHERE key=?').get(name)?.value;
   if (!getSetting('password')) {
     const password = initialPassword || randomBytes(18).toString('base64url');
     if (password.length < 12 || password.length > 1024) { db.close(); throw new Error('INITIAL_PASSWORD 必须为 12 至 1024 个字符'); }
     db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('password', await passwordRecord(password));
-    if (!initialPassword) logger.info({ type: 'security' }, `工作台初始登录密码：${password}\n请保存此密码；只在首次启动显示。重置请运行 node server/setup.mjs --reset-password`);
+    if (!initialPassword) log.info({ type: 'security' }, `工作台初始登录密码：${password}\n请保存此密码；只在首次启动显示。重置请运行 node server/setup.mjs --reset-password`);
   }
   if (!getSetting('seeded')) {
     db.exec('BEGIN IMMEDIATE');
@@ -298,7 +299,8 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
 
       // Clean up expired rate limit entries
       for (const [address, attempt] of loginAttempts) if (attempt.until < now) loginAttempts.delete(address);
-      for (const [account, lockout] of accountLockouts) if (lockout.until < now) accountLockouts.delete(account);
+      // Only delete lockouts that have expired (until > 0 and until < now), keep tracking failed attempts
+      for (const [account, lockout] of accountLockouts) if (lockout.until > 0 && lockout.until < now) accountLockouts.delete(account);
 
       // Check account-level lockout first (prevents brute force even from distributed IPs)
       const accountId = 'global'; // Single-account system, use 'global' as identifier
@@ -323,10 +325,10 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       if (!passwordValid) {
         // Track failed attempts for account lockout
         const failedAttempts = (lockout?.failedAttempts || 0) + 1;
-        logger.warn({ ip, failedAttempts, type: 'auth_failed' }, '登录失败');
+        log.warn({ ip, failedAttempts, type: 'auth_failed' }, '登录失败');
         if (failedAttempts >= ACCOUNT_LOCKOUT_THRESHOLD) {
           accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
-          logger.error({ ip, failedAttempts, type: 'account_locked' }, '账户已被锁定');
+          log.error({ ip, failedAttempts, type: 'account_locked' }, '账户已被锁定');
           throw new HttpError(429, `连续登录失败过多，账户已被锁定 30 分钟`);
         } else {
           // Track failed attempts but don't set 'until' yet (no lockout until threshold reached)
@@ -336,7 +338,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       }
 
       // Successful login: clear account lockout and release IP quota
-      logger.info({ ip, type: 'auth_success' }, '登录成功');
+      log.info({ ip, type: 'auth_success' }, '登录成功');
       accountLockouts.delete(accountId);
       if (loginAttempts.get(ip) === attempt) { attempt.count -= 1; if (attempt.count === 0) loginAttempts.delete(ip); }
 
@@ -351,7 +353,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
     if (pathname === '/api/logout' && req.method === 'POST') {
-      logger.info({ ip: req.socket.remoteAddress, type: 'auth_logout' }, '用户登出');
+      log.info({ ip: req.socket.remoteAddress, type: 'auth_logout' }, '用户登出');
       db.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
       publishOverview();
       updateStream.revalidate();
