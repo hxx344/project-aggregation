@@ -165,6 +165,8 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   const hash = value => createHash('sha256').update(value || '').digest('hex');
   const fundingHash = funding => hash(JSON.stringify([funding.fetchedAt, funding.requestedEnd, funding.events, funding.coverage]));
   const snapshotHashes = new Map(EXCHANGES.map(exchange => [exchange, fundingHash(cache.get(exchange).funding)]));
+  // Performance: Track serialized snapshots to avoid redundant serialization
+  const serializedCache = new Map(storedRows.map(row => [row.exchange, row.snapshot]));
   const pnl = createTradingPnl(db);
   const entriesFor = (pair = EXCHANGES) => pair.map(exchange => ({ row: rowFor(exchange), snapshot: cache.get(exchange) }));
   const recordPnl = () => TRADING_PAIRS.map(pair => pnl.record(entriesFor(pair), now())).some(Boolean);
@@ -176,11 +178,17 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   let fundingBatchEnd = Math.max(0, ...EXCHANGES.map(exchange => cache.get(exchange).funding.requestedEnd || 0));
   function write(exchange, revision, change) {
     if (closed || rowFor(exchange).revision !== revision) return false;
-    const next = change(cache.get(exchange));
-    const serialized = JSON.stringify(next);
-    if (!db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(serialized, exchange, revision).changes) return false;
     const previous = cache.get(exchange);
+    const next = change(previous);
+
+    // Performance: Only serialize and write if data actually changed
+    const previousSerialized = serializedCache.get(exchange);
+    const serialized = JSON.stringify(next);
+    if (serialized === previousSerialized) return true; // No change, skip DB write
+
+    if (!db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(serialized, exchange, revision).changes) return false;
     cache.set(exchange, next);
+    serializedCache.set(exchange, serialized); // Update serialized cache
     if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage || previous.funding.requestedEnd !== next.funding.requestedEnd) snapshotHashes.set(exchange, fundingHash(next.funding));
     if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage) invalidateViews();
     return true;
