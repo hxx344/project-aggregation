@@ -77,7 +77,7 @@ async (page) => {
   };
   const waitForText = text => page.getByText(text, { exact: false }).first().waitFor();
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading`);
+  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await waitForText('连接账户，查看四腿的真实仓位');
   await page.getByText('连接两所并取得完整仓位后开始记录，历史浮盈亏无法回补。', { exact: true }).waitFor();
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'empty fixture retains four defined legs');
@@ -122,6 +122,7 @@ async (page) => {
   holdReads = true;
   await page.getByRole('button', { name: '总览', exact: true }).click();
   await page.getByRole('button', { name: '交易', exact: true }).click();
+  await page.getByRole('button', { name: '原油四腿套利', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.trading-funding-summary')?.textContent.includes('12.4'));
   assert(await page.locator('.trading-initial').count() === 0, 'returning to trading displays the cached page before a held GET completes');
   await page.getByRole('button', { name: '近30天', exact: true }).click();

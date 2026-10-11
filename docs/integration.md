@@ -161,6 +161,14 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 通过工作台打开 Asset 原页面时，已开启后台同步且已保存密码的 `/api/sync` 请求与后台共用一次同步。代理使用当前页面授权保存在服务器上的 Asset 会话，先验证账本访问权限，同步完成后再读取真实账本，避免同时刷新造成锁冲突；不要求浏览器持有原站会话 Cookie。页面授权或上游认证无效时不能读取，同步失败不伪装为成功。关闭后台同步后，原页面同步请求照常转发。
 
+## Asset 交易所只读仓位
+
+工作台 `GET /api/trading/positions` 通过独立服务器会话读取已启用 Asset 项目的固定 `GET /api/hub/positions`，返回 `sources[]`，每个来源含 `projectId`、`name`、`status`、`error`、`checkedAt` 和 `data`。接口受工作台登录保护；不接受任意目标地址、交易所凭据或查询参数，返回前再次检查登录状态。源请求使用 HTTPS 或实际解析到本机回环的 HTTP 地址，禁跟随重定向、响应上限 2 MiB、单次超时 12 秒；相同来源请求合并，Hub 结果缓存 5 秒。
+
+Asset 响应为 `schemaVersion: 1`、`generatedAt`、`exchanges[]`。每个交易所有 `id/name/accounts[]`，每个账户有 `id/name/configured/revision/scopes[]`，每个产品范围有 `id/label/status/refreshing/fetchedAt/error/positions[]`。状态支持 `unconfigured/loading/live/stale/error/unsupported`。仓位明确 `instrumentId`、`side`、`quantity/quantityUnit`、`contractSize`、`entryPrice/markPrice/priceCurrency`、`notional/notionalCurrency`、`unrealizedPnl/pnlCurrency`、`leverage/marginMode/liquidationPrice` 和 `sourceUpdatedAt`；数值为十进制字符串，未知字段为 `null`。目录由 Asset 维护，工作台不硬编码交易所列表，也不调用旧密钥导出接口。
+
+工作台只保留经过字段校验的响应和受控错误消息，不透传上游原始对象、诊断或凭据。只有 `live` 的空列表表示已确认空仓；范围超过 90 秒未更新即过期，来源失败保留同一项目配置版本的旧快照并降级状态。项目配置改变、停用或删除立即中止旧请求并清除缓存，迟到响应不能恢复旧数据。`generatedAt` 与 `checkedAt` 不替代仓位实际读取时间。
+
 ## 资产新鲜度补充
 
 资产适配器使用原账本的 `mode` 分类：`manual` 为手工估值，`market`、`bybit`、`aster` 为动态数据。混合账本的 `updatedAt` 取所有非 `manual` 行最早更新时间，并通过 `manual_valuation_at` 指标单独保留手工行最早估值时间。缺少或未知 `mode` 按动态行处理并提示数据不完整，避免误判为不会过期。

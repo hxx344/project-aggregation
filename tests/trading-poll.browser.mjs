@@ -66,7 +66,7 @@ async (page) => {
     else await page.waitForTimeout(20);
     assert(reads.length - before === expectedReads, `${elapsed}ms: expected ${expectedReads} reads, received ${reads.length - before}`);
   };
-  await page.goto(`${origin}/?view=trading`);
+  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await page.locator('.trading-position-table').waitFor();
   await checkFresh();
   const initialReads = reads.length;

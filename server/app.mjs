@@ -14,6 +14,7 @@ import { createStaticResponder } from './static-response.mjs';
 import { createTrading, TradingError } from './trading.mjs';
 import { snapshotDiagnostics } from './diagnostics.mjs';
 import { createTradingImporter } from './trading-import.mjs';
+import { createAssetPositions } from './asset-positions.mjs';
 import { createTradingExecution } from './trading-execution.mjs';
 import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
@@ -48,7 +49,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console.log, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
   mkdirSync(resolvedData, { recursive: true, mode: 0o700 });
@@ -148,6 +149,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   }
   const projectRevision = id => { const row = db.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
   const tradingImporter = createTradingImporter({ trading, request: tradingImportRequest, sourceTimeoutMs: tradingImportSourceTimeoutMs, importTimeoutMs: tradingImportTimeoutMs,
+    listTargets: () => db.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+  });
+  const assetPositions = createAssetPositions({ request: assetPositionsRequest, cacheMs: assetPositionsCacheMs, timeoutMs: assetPositionsTimeoutMs, now: assetPositionsNow,
     listTargets: () => db.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
   });
   const portal = createPortal({
@@ -314,6 +318,13 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       }
       throw new HttpError(404, '更新接口不存在');
     }
+    if (pathname === '/api/trading/positions') {
+      if (req.method !== 'GET') throw new HttpError(405, '仓位接口仅支持只读查询');
+      if (url.search) throw new HttpError(400, '仓位接口不接受查询参数');
+      const data = await assetPositions.state();
+      if (session(req)?.id !== current.id) throw new HttpError(401, '请先登录工作台');
+      send(res, 200, data); return;
+    }
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && req.method === 'GET') { send(res, 200, execution.state()); return; }
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
@@ -385,12 +396,13 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         const credentials = body.password ? encrypt({ password: body.password, username: body.username ?? previous?.username ?? '' }) : previous ? encrypt({ ...previous, username: body.username ?? previous.username }) : null;
         const inFlight = pending.get(id);
         db.prepare('UPDATE projects SET json=?,credentials=? WHERE id=?').run(JSON.stringify(value), credentials, id);
+        assetPositions.invalidate(id);
         if (boundaryChanged || prior.enabled !== value.enabled || prior.staleAfterSeconds !== value.staleAfterSeconds || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) db.prepare('DELETE FROM snapshots WHERE id=?').run(id);
         states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { project: publicProject(rowFor(id)) });
         if (inFlight) void inFlight.finally(() => { if (!closed && db.prepare('SELECT id FROM projects WHERE id=?').get(id)) void check(id).catch(() => {}); }).catch(() => {});
         else void check(id).catch(() => {}); return;
       }
-      if (!match[2] && req.method === 'DELETE') { db.prepare('DELETE FROM projects WHERE id=?').run(id); states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
+      if (!match[2] && req.method === 'DELETE') { db.prepare('DELETE FROM projects WHERE id=?').run(id); assetPositions.invalidate(id); states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
     }
     throw new HttpError(404, '接口不存在');
   }
@@ -441,6 +453,6 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   return {
     server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

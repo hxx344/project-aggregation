@@ -100,7 +100,7 @@ async (page) => {
     }
   };
   await page.setViewportSize({ width: 1440, height: 1100 });
-  await page.goto(`${origin}/?view=trading`);
+  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await panel.getByRole('heading', { name: '组合交易', exact: true }).waitFor();
   assert(await panel.getByRole('button', { name: '预览开仓组合' }).isDisabled(), 'unconnected execution cannot preview');
   assert(await panel.getByRole('combobox', { name: '开仓方向', exact: true }).inputValue() === '', 'direction starts unselected');
