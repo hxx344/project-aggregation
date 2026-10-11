@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "统一项目工作台，聚合交易状态、市场监控与资产账本",
-  "engines": { "node": ">=24.15.0" },
+  "engines": {
+    "node": ">=24.15.0"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "dev:server": "node --watch server/index.mjs",
@@ -16,6 +18,8 @@
   },
   "dependencies": {
     "lucide-react": "1.31.0",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "recharts": "3.8.0"
