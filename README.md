@@ -1,319 +1,230 @@
-# Project Aggregation · 项目工作台
+# 项目工作台 · Project Aggregation
 
-把 ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx、Variational Grid 和 Greeks 放进一个入口：查看摘要、判断数据是否过期、进入原项目，并继续接入新的工具。
+统一管理多个交易和监控项目的入口，提供摘要总览、健康监控、统一登录和原生交易功能。
 
-工作台独立运行，通过一个 SSH 转发端口查看摘要并打开六个完整原页面，也可在页面关闭后继续触发 Asset 后台同步。资产以 Asset Ledger 为单一来源，ASTER 的保证金和成交量、CrossEx 的账户余额与持仓盈亏均不会重复计入资产。项目不可用时保留上次成功的数据并明确标注状态；未取得的数据不会填成零或展示虚构行情。
+## 核心功能
 
-Asset 支持 OKX 只读账户资产：在 Asset 的“交易所连接”填写国际站 API Key、Secret 和 Passphrase，验证后按 OKX 返回的美元总资产估值入账，并展示账户分项。工作台同步识别 OKX 来源，保留其源时间及失败旧值。升级两端可执行 `curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
+### 📊 总览看板
+- **资产摘要** - 实时资产账本、保证金占用、持仓盈亏
+- **健康监控** - 各项目连接状态、数据时效、诊断信息
+- **历史曲线** - 资产和盈亏趋势可视化
 
-Asset 新增 Var / Variational 真实账户资产：在 Asset“交易所连接”的 Var 卡片填写 Omni 网页 `vr-token`，按账户总权益与 USDC/USD 汇率入账；会话令牌加密保存，账本仅读取固定资产接口。工作台识别 `variational` 来源，失败保留旧值和更新时间；Var 模拟策略数据仍不计入资产。该功能随 Asset 与工作台对应正式版发布后，可使用上面的两端升级命令安装。
+### 🔗 项目集成
+支持以下项目的统一接入：
+- ASTER 5X - 交易工作台
+- Market Monitor - 市场监控
+- Asset Ledger - 资产账本
+- Gate CrossEx - 跨交易所套利
+- Variational Grid - 策略网格
+- Greeks - 期权分析
 
-## 首版提供什么
+### 💼 交易中心
 
-- 总览：资产账本摘要与历史曲线、交易账户和占用保证金、原油价差、连接与数据时效。
-- 项目入口：点击左侧项目，内容区直接显示原始页面；保存原项目凭据后自动登录。总览保留跨项目摘要，项目管理负责连接设置。
-- 接入管理：新增、编辑、停用、删除项目，配置页面访问方式、接口地址、适配器、Asset 后台同步和数据过期阈值。
-- 工作台后端按来源时限读取已启用项目的现有数据（最多间隔 30 秒）；启用 Asset 后台同步时，每 60 秒调用原项目的同步接口。浏览器关闭后仍会执行。
-- 独立的工作台密码登录、服务器端会话和本地 SQLite 持久化。
-- 原生“交易”模块：默认查看 Asset 提供的各交易所只读仓位；原油四腿资金费套利作为独立子板块，保留资金费、盈亏及四腿/两腿限价开平仓功能。
-- 六个模块加平台的统一增量一键部署、systemd 服务、健康检查和启动失败后的程序回滚。
+#### 交易所仓位
+- 统一查看 Binance、Bybit、OKX、Aster、Variational 的真实仓位
+- 按交易所、账户、产品筛选
+- 前台 5 秒刷新，后台 30 秒刷新
+- 数据来源于 Asset 项目，无需重复配置密钥
 
-工作台的定时读取和 Asset 同步不会下单、启停策略或转账；实盘任务只在用户预览并确认后执行。Asset 同步只调用原项目已有的资产同步功能，会更新估值和历史记录。原页面的操作仍由原项目处理；页面访问使用独立会话，不与后台读取或同步共用。
+#### 原油四腿套利
+- 支持 Binance/Bybit、Binance/OKX、Bybit/OKX 组合
+- 四腿、同所两腿、跨所两腿预设策略
+- 批次拆分、追价执行、止损保护
+- 幂等性保证、断电恢复、状态持久化
 
-## 交易中心与交易所仓位
+**交易所原生支持：**
+- Binance - 普通 U 本位 & Portfolio Margin，使用 `LIMIT + GTX + priceMatch=QUEUE`
+- Bybit - 统一账户，使用原生 `chaseOrder` 追价
+- OKX - 单/多币种保证金，使用 `post_only` + `amend-order`
 
-左侧“交易”或 `/?view=trading` 默认打开“交易所仓位”。交易所目录、账户连接和真实仓位均来自工作台中已启用的 Asset 项目；当前目录包含 Binance、Bybit、OKX、Aster 和 Variational，Aster 的多个账户分别显示。可按 Asset 来源、交易所和账户筛选，具体支持的账户模式与产品范围在各账户下展示。只有某个范围成功读取且没有持仓时才显示“无持仓”；尚未连接、读取中、不支持、失败和过期分别标注。
+### 🔐 安全特性
+- 独立密码登录，7 天会话有效期
+- 凭据 AES-256-GCM 加密存储
+- 会话固定漏洞防护
+- 账户级登录限流（5 次失败锁定 30 分钟）
+- DNS 重绑定攻击防护
+- CSRF 令牌保护
 
-连接在 Asset 管理，这个仓位板块不复制交易所密钥，也不提供下单操作。数量保留交易所原生单位，报价、名义价值和未实现盈亏各自显示币种，不合并不同币种金额。读取失败保留同一连接上次成功的仓位及其原始时间；更换或删除来源连接后清除旧账户数据。页面前台每 5 秒检查，后台降低到每 30 秒检查，回到页面或网络恢复后立即更新；Asset 缓存约 30 秒，超过 90 秒的数据标记过期。
+### 📈 性能优化
+- 结构化日志（Pino）
+- 批量查询消除 N+1 问题
+- 数据库索引优化
+- 冗余序列化缓存
+- SQLite WAL 模式
 
-此功能需要同时更新 Asset 和工作台。旧 Asset 返回接口不支持时，页面会提示升级，不回退到密钥导出或把余额当成仓位。沿用增量安装命令：`curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
+## 快速开始
 
-## 原油四腿交易
-
-交易页可选择 Binance / Bybit、Binance / OKX、Bybit / OKX 三种组合。上方提供四腿、同交易所 CL/BZ 两腿、同品种跨交易所两腿预设，可选择开仓或平仓、反转方向、逐腿填写原生合约数量与追价停止价，并设置拆批数、批次间隔、本地追价间隔和最长执行时间。四腿与跨所两腿使用当前组合；同所两腿可选择任一家。切换组合会清除待确认预览，已有执行任务仍全部显示。预览会读取最新盘口、合约规则、持仓模式和实际仓位；按交易所单笔数量上限自动增加批次，保留精确数量和步长。预览有效 30 秒，核对账户、方向、数量与批次后点击确认实盘执行。预览、刷新、页面轮询均不会下单。
-
-实盘连接与下方只读观察连接独立保存。实盘密钥须具有合约交易权限，并关闭提现、划转等无关写权限；Binance 支持普通 U 本位和 Portfolio Margin，Bybit 支持统一账户。OKX 需要 Key、Secret、Passphrase，仅接受读取与交易权限，执行账户支持单币种或多币种保证金模式，可选全仓或逐仓；检测到原油持仓与所选保证金模式冲突时拒绝执行，不自动更改交易所账户设置。实盘密钥同样加密保存、不回显，不会从 Asset 或只读连接自动复用。页面显示实盘连接版本、密钥尾号和可取得的账户 UID；Binance 查询接口没有可靠 UID，显示为不可核实。下方观察账户可能与执行账户不同；预览中的持仓来自所选执行连接。每次开始新的批次或补单前重新核对权限、持仓模式、盘口、数量与外部普通/条件委托；同合约存在外部委托时拒绝开始。
-
-OKX 使用 `CL-USDT-SWAP` 与 `BZ-USDT-SWAP`，数量单位是“张”。每张合约乘数、最小量与步长从交易所规则读取；名义金额为“张数 × 每张乘数 × 价格”，不直接与其他交易所的数量比较。页面和预览展示乘数与合约代码；若提交或追价前乘数发生变化，暂停任务并要求重新预览。
-
-Bybit 直接创建交易所原生 `chaseOrder`（零偏移、默认 PostOnly），跟随同方向买一/卖一，不使用本地普通限价单模拟追逐。Binance 固定使用 `LIMIT + GTX + priceMatch=QUEUE` 同向一档，由服务按设定间隔调用原生改单接口追价：普通 U 本位为 `PUT /fapi/v1/order`，Portfolio Margin 为 `PUT /papi/v1/um/order`。改单保留原订单号、客户订单号和原始总数量，部分成交后仍传原总量，成交累计只记在同一订单；价格未变化时跳过改单。三个交易所均不提供市价单、吃单限价或市价补齐。追价停止价是触达后停止追价并撤销余单的触发值，盘口检查与交易所处理之间存在时间差，因此它不是所有成交价格的硬上限/下限。[Bybit 原生追逐接口](https://bybit-exchange.github.io/docs/v5/strategy/create-strategy)、[Binance U 本位原生改单](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Modify-Order)、[Binance Portfolio Margin 原生改单](https://developers.binance.com/docs/derivatives/portfolio-margin/trade/Modify-UM-Order)。
-
-Binance 原生改单是单次改价，持续追价由本服务定时调用；交易所接收后重新排队并保留原单 GTX 属性。若新价格会立即成交，交易所会取消该 GTX 订单，任务随即暂停并核对其余腿，不撤单重建来替代追价。改单被拒绝不代表原订单结束；超时、拒绝或回执不匹配都会暂停并核对、撤销原单，禁止盲目重发或自动创建替代订单。
-
-OKX 使用 `post_only` 挂同方向买一/卖一，定时调用 `/api/v5/trade/amend-order`，仅改变价格，保留原订单号和原始总张数；不通过撤单重建追价。改单设置 `cxlOnFail=false`，接受回执后仍查询原单确认；响应不明时暂停、核对并撤销余单，不盲目重发。单向模式平仓带 `reduceOnly`，双向模式按 `posSide` 与相反买卖方向显式平仓，并先核对可平张数。[OKX 下单与改单文档](https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order)。
-
-同一批所有交易腿全部成交，并确认委托及原生策略子单结束后才进入下一批。任一腿失败、报价过期、策略暂停、达到停止价或执行期限，都会暂停后续批次并撤销余单；已成交仓位保留，不自动反向回滚。停止任务也只撤余单。多腿成交并非原子操作，执行表逐腿显示已成交与剩余数量；恢复必须重新预览剩余量。平仓使用 reduce-only 或对应持仓方向的减仓语义，单向模式下已有反向仓位时拒绝用“开仓”隐式平仓。不调整杠杆、保证金或持仓模式。
-
-任务、提交和改单意图、订单编号、成交累计、连接版本和合约锁写入 SQLite。重复确认复用请求标识；重启先核对并撤销未结束委托，暂停后等待重新预览。撤单回执不等于撤单已完成；只有查询确认结束才允许重新预览剩余量。Binance、OKX 建单响应不明时按唯一客户订单号查询，改单响应不明时核对原订单号，查不到也不会盲目重发。Bybit 原生追逐没有已记录的客户端幂等键，创建结果不明时冻结该任务，需在 Bybit 核对并填写实际策略 ID；服务还会比对方向、数量、创建时间及子单，随后停止该策略余单。无法确认时保留任务和连接锁，不猜测或忽略未知订单。
-
-执行由服务器持续运行，关闭页面或退出登录不会替用户取消已经确认的任务；在页面点击“停止并撤销余单”才会主动停止。更新/重启服务会暂停未结束任务。若进程失去运行锁或锁超时，该实例停止写入和下单，需重启服务后核对任务，不会自行重新接管旧调用。首次使用需自行连接实盘密钥并核对交易所的权限、资金及合约可交易状态；开发验证仅使用协议和账户模拟数据，没有向真实账户发送测试订单。
-
-### 只读观察与资金费
-
-在交易模块选择“原油四腿资金费套利”，或通过 `/?view=trading&tradingSection=oil` 打开原油子板块。四腿为所选两家各自的 CL 与 BZ；默认 Binance / Bybit，地址参数 `tradingPair=binance,okx` 或 `tradingPair=bybit,okx` 可直达其他组合。未指定 `tradingSection` 的旧链接带有 `tradingPair` 或 `tradingDays` 时仍直接打开原油子板块。API 使用 `pair=binance,okx`，省略时保持原默认。多空方向直接读取实际仓位。同品种跨所方向相反时显示结构状态，数量和名义金额仍逐腿列出，不把方向相反等同于完全对冲。同一合约多空并存时保留各条仓位，OKX 全仓与逐仓也分别展示，空仓与尚未读取到数据分别显示。
-
-在页内只读“账户连接”分别填写国际站的只读 HMAC API Key 和 API Secret，OKX 另填 Passphrase；也可选择“从 Asset 导入”，从工作台中已启用的 Asset 项目选择对应交易所连接。Binance 先选择“普通 U 本位”或“组合保证金（Portfolio Margin）”，分别使用 FAPI 或 PAPI UM 的仓位与资金费查询；选择同时适用于 Asset 导入和手工连接，验证成功后随连接保存。已有连接默认普通 U 本位；验证失败保留旧连接、账户模式及账本，不按错误自动切换接口。Binance 要求读取权限开启、交易及划转提现等写权限关闭；Bybit 需要统一账户和 `readOnly=1`；OKX 要求权限恰为 `read_only`。保存前验证只读权限及仓位、资金费账本的实际读取能力。密钥与 Passphrase 仅在服务器使用工作台现有密钥加密保存，不返回页面。观察连接仍仅包含固定的交易所 GET 接口，与上方实盘执行连接隔离。
-
-Asset 余额同步成功只说明钱包接口可读，不能证明合约仓位接口可读。交易接口失败时显示账户模式、失败步骤、HTTP 状态和交易所数值错误码，不回显上游错误原文或签名链接。Portfolio Margin 的接口与字段依据 [Binance 官方账户文档](https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/account)。
-
-Asset 导入是一次性复制，之后两边独立管理；Asset 更换或删除连接不会自动更新交易模块。导入要求 Asset 项目已保存服务地址及登录密码，服务间使用 HTTPS 或实际解析到本机回环的 HTTP 地址（同机部署默认 `127.0.0.1` 可直接使用）。来源列表仅含交易所、密钥尾号和版本；后台验证 Asset 密码后读取选定密钥，再重新检查交易所只读权限。支持全球站 Binance、Bybit HMAC 连接及 OKX Key/Secret/Passphrase；Aster 和其他地区连接不可导入。导入期间来源配置或目标连接发生变化时拒绝保存。旧版 Asset 的 Binance/Bybit 导入继续可用；OKX 导入需同时升级 Asset。新版 Asset 默认保留旧两所目录，工作台通过 `?include=okx` 请求三所目录：`curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub`。
-
-仓位每 30 秒读取，资金费每 5 分钟同步；页面在前台每 5 秒读取本地缓存，隐藏时降为每 30 秒尝试一次（浏览器可能进一步限制后台计时）。切回窗口、页面恢复或网络重连时立即重新读取，并取消之前挂起的读取请求；关闭页面后服务器继续同步。首次回补最近 30 天，之后补齐缺口并重读最近 24 小时以获取延迟记录。两所按同一批次截止时间统计，支持近 7 天、近 30 天（`tradingDays=7|30`）；日期和按日收付使用北京时间，首尾日按所选滚动区间截取。接口查询覆盖不保证交易所没有延迟或遗漏；分页未完成、单所失败或数据过期时保留已取得记录，合计明确标为已获取金额，未取得的数据不填零。
-
-交易页直接读取后台预先生成的展示缓存。近 7/30 天资金费汇总与盈亏曲线保存在 SQLite，重启时按版本、账户连接与数据来源校验后恢复；缺失或损坏时只用本地原始快照重建，不等待交易所。后台合并资金费回补进度，并在账本或盈亏采样变化后重新计算；普通读取不扫描完整历史、不重新累计资金费。流水由服务器每页返回 50 条（`/api/trading?days=7&page=0`），汇总始终针对整个所选区间。本次登录内切回交易页、切换已读区间或分页会先显示已取得缓存，再检查更新；会话缓存限定 12 页，退出登录或账户变更时清空，不写入浏览器持久存储。数据读取时间、缓存生成时间和过期状态分别保留，旧缓存不会被标成新数据。
-
-资金费使用账户已结算的收付：Binance 的 `FUNDING_FEE` 收益记录、Bybit 统一账户 `SETTLEMENT` 中的 `funding` 字段、OKX 账户账单 `173/174`（资金费支出/收入）的有符号 `pnl` 字段；正值为收取、负值为支付，净额为有符号合计，金额按精确十进制运算。OKX 仅纳入两个目标合约的 USDT 账单，不使用公开资金费率估算实际收付。历史资金费按账户和合约归属，不根据当前持仓方向重新计算，不混入交易手续费或已实现价格盈亏；同账户同合约混有其他策略时，不能据此分摊策略收益。已平仓合约的区间记录继续展示。Bybit 升级统一账户前的旧账本不在首版范围内。
-
-Bybit 按 CL、BZ 分别读取，避免其他合约的结算流水占用分页；每个 7 天窗口在两币种全部分页完成后立即保存，超时后从已保存覆盖继续回补。读取失败保留安全诊断（阶段、HTTP 状态、交易所数字错误码），重启后仍可查看，不保存或回显上游原始错误正文。
-
-四腿总盈亏曲线按后台每分钟的真实仓位快照记录，保留最近 31 天，关闭页面和服务重启不丢失已有记录。每点为“当时四腿持仓浮盈亏＋所选近 7/30 天区间起点至该点的已结算资金费”；切换区间会改变累计起点，资金费延迟回补后历史点重新计算。历史浮盈亏不能倒推，升级后才开始积累。缺失字段、两所读取时间相差过大、读取失败、过期及停机区间会断线；资金费覆盖不足时仅显示浮盈亏。图形长区间保留连续段首尾及峰谷，数值明细仍为精确小数字符串。换账户或模式后新建记录段，不拼接不同连接；曲线不包括平仓已实现盈亏、交易手续费或其他币种资产变动。
-
-三种组合的资金费汇总、盈亏采样和 7/30 天缓存按组合独立保存，沿用已有 Binance/Bybit 盈亏历史。未选中的第三家未连接或读取失败，不影响所选组合的完整性；选择不同组合不会拼接其他组合的曲线。仓位、资金费各自保留采集时间；仓位上的交易所更新时间不当作本次读取时间。断开连接会删除该交易账户的凭据及当前缓存，重新连接后重新回补；替换密钥后旧请求不能写入新连接。交易模块不重复计入资产账本总额。
-
-启用 Asset 导入时，两端一起更新，沿用现有数据目录与增量安装：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub
-```
-
-接口参考：[Binance 只读权限](https://developers.binance.com/docs/wallet/account/api-key-permission)、[仓位](https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Position-Information-V3)、[实际收益流水](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Get-Income-History)；[Bybit API 权限](https://bybit-exchange.github.io/docs/v5/user/apikey-info)、[仓位](https://bybit-exchange.github.io/docs/v5/position)、[实际交易账本](https://bybit-exchange.github.io/docs/v5/account/transaction-log)。真实账户需要用户在页面填写或从 Asset 导入只读凭据后验证；开发与浏览器验收使用合成账户数据。
-
-## 原有三个项目的统一界面
-
-ASTER、Monitor 和 Asset 的原始前端采用同一套浅色青绿样式：顶部显示项目名称及操作，横向导航切换项目内部功能，表格、表单、图表和弹窗保持一致。工作台保留左侧项目栏；Asset 原来的内部侧栏改为横向导航。原站单独打开时也使用相同布局，所有功能、数据口径和登录保护继续由原项目提供。
-
-样式直接维护在各自仓库里，工作台不会向原页面注入 CSS。使用下方总部署命令可同时安装或升级六个模块与平台；后续项目可复用 [界面样式约定](docs/workspace-style.md)。
-
-## 一键部署六个模块与平台
-
-在同一台服务器执行以下命令，自动安装或升级 **ASTER 5X、Market Monitor、Asset Ledger、Gate CrossEx、Variational Grid、Greeks 和 Project Aggregation**。首次安装和以后更新都使用同一条命令，已有配置、密码与数据由各项目安装器保留。
-
+### 一键安装
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash
 ```
 
-完整部署支持 Ubuntu 24.04、Debian 12/13，x64/arm64，使用 systemd。Variational Grid 和 Greeks 要求 Python 3.11+；Ubuntu 22.04 可用 `--only aster,monitor,asset,crossex,hub` 更新其余项目。脚本在部署前检查系统条件、全部所选安装器与 CI 部署包是否就绪，最多并发准备三个项目，平台最后部署。下载命令需要系统已有 curl 和 CA 证书；极简新系统缺少时先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`。其他系统依赖只在缺少时安装。
-
-部署时实时显示进度，每个项目完成后显示耗时，最后汇总结果。完整日志保存在 `/var/log/project-aggregation-stack/`，仅 root 可读。某个项目失败立即停止后续部署，保留之前成功的项目；修复原因后重跑同一命令即可。重跑仍检查每个项目，不会因历史成功记录而漏掉配置修改或服务停止。
-
-只更新部分项目时，将命令末尾的 `sudo bash` 改为 `sudo bash -s -- --only monitor,crossex,hub`；可用名称为 `aster,monitor,asset,crossex,variational,greeks,hub`。`--refresh` 仅重新获取安装器，不强制重建应用。单独更新平台仍可使用下方原有 `install.sh` 入口。
-
-默认使用经过 CI 验证并明确发布为正式版的部署包：服务器下载与校验成品，不运行 npm 安装、类型检查、测试或前端编译。Node/Python 运行环境仍按需准备，Python 依赖按锁定内容和环境缓存。相同应用内容、配置与运行环境且健康时跳过下载及重启；尚未发布新正式版时继续使用现有正式版，首次没有可用正式包则停止。原配置、密码和数据库保留。开发排查可显式设置 `PROJECT_DEPLOY_MODE=source` 恢复源码部署；`--with-tests` / `PROJECT_DEPLOY_TESTS=1` 仅在此模式补测工作台与 CrossEx，在 CI 模式不重复测试。
-
-各仓库分别在自身 `main` CI 通过全部检查后，只发布 `deploy-<完整提交号>` 候选 Release（`prerelease`），不改变当前正式版。发布者在对应仓库的 GitHub Actions 选择 **[Publish stable release](.github/workflows/promote-release.yml)**，分支选 `main`，在 `commit` 中填写该仓库已通过 CI 的完整 40 位提交 SHA 后运行；流程核验清单和部署包后，将该候选晋级为最新正式版。默认一键部署与工作台前端更新只使用正式版，未晋级的候选不会自动安装。
-
-部署完成后只需转发 `3100` 并在“项目管理”保存各模块自己的网页登录凭据；已有连接配置保留。首次登录密码的查看方式见下方各项目说明和本次安装日志。[部署行为与恢复说明](docs/deployment.md#总部署入口)。
-
-### 在工作台检查与更新
-
-点击左侧“系统更新”入口，打开的面板显示本机已安装的工作台及受支持模块、当前版本、最新正式版和检查时间，不会安装尚未部署的模块。可点击“检查更新”，再通过“查看更新”核对变更范围并确认执行；检查失败时会保留失败提示，不把旧记录显示为已是最新。仅有变化的模块会短暂重启，配置与数据沿用原安装器的保留规则。
-
-服务器独立每 3 分钟检查正式版本，浏览器关闭、离线或切到后台都不影响检查；服务器本身需要能访问 GitHub。已打开的页面通过推送同步状态，连接恢复后自动补读。相同且未过期的更新计划保持不变，检查期间暂时不能确认执行。检查复用已验证且内容未变的发布文件，减少重复下载与 API 查询；真正执行前仍重新核验所有所选发布和安装文件。
-
-更新进度由服务器保存，关闭面板、刷新页面或工作台短暂重启后可继续查看，不必重复提交。工作台内置实盘任务尚未结束或委托仍需核对时拒绝更新，请先停止任务并完成核对；更新期间暂停新增实盘任务、预览及实盘连接修改，停止和核对操作仍可继续。独立模块中的策略与操作仍在原页面处理。
-
-已有部署首次启用此功能时，需要先在服务器重新运行原一键部署命令一次；只升级工作台可在总部署命令末尾使用 `sudo bash -s -- --only hub`。包含在线更新功能的正式包会安装独立的 root 更新服务，之后即可在前端更新。工作台本身仍以 `project-aggregation` 专用用户运行，不需要 root 或 sudo 权限；更新执行服务与工作台、更新控制服务独立，界面重启不会中断已接受的更新任务。
-
-## 性能与模块联动
-
-升级六个模块后，工作台优先读取轻量摘要：ASTER 使用已发布快照和报告缓存，Asset 读取当前资产与最近 90 个北京时间日期的趋势，Monitor / CrossEx 使用已有行情状态。只有接口不存在（404/405）才回退旧接口；登录失败或无效响应不会触发更重的读取。
-
-工作台通过 SSE 推送摘要，连接中断时每 30 秒补查；行情按源时间本地判断过期，采用模块与工作台阈值中较短者。CrossEx 的 10 秒阈值不会被工作台默认 120 秒覆盖。摘要读取按来源时限调整频率，最快每秒、最慢每 30 秒；资产同步仍独立每分钟运行。
-
-首页“当前关注”只显示需要人工处理的问题和持续两分钟的故障；恢复后自动清除，再次出现重新计时。统计延迟、正常历史订单观察等提示保留在项目页及项目管理的“运行详情”，不将缺失数值补成零。ASTER 同一配对组只显示一条合并诊断，已暂停组的人工处理问题仍会提醒。完整分类需同时更新 ASTER 和工作台；旧源缺少可靠分类时仍保守提示故障。
-
-登录后，工作台在可见且联网时依次预加载 ASTER、Monitor、Asset、CrossEx、Variational Grid、Greeks 的代理页面，最多保留六个已确认支持活动状态协议的页面，保留筛选和滚动位置。后台一次准备一个模块；直接点击立即优先打开，不必等后台队列。两端升级后，已加载模块切到后台仍会低频更新：一般每 30 秒读取，Asset 沿用每 60 秒同步，进入时立即补查；Asset 已在进行的同步会继续复用，避免重复发起。总览在后台继续接收推送，断流时每 30 秒读取缓存，离线时暂停。预加载失败或未升级的模块不会自动反复重试，可点击重新打开；修改连接配置、凭据或停用项目会撤销旧页面。浏览器冻结或丢弃标签页可能推迟页面刷新，恢复窗口、页面或网络后立即补查；服务器交易引擎、行情采集和资产同步独立运行。
-
-Monitor 与 CrossEx 可以携带币种、做多和做空交易所跳转定位；ASTER 提供到账本的入口，不根据钱包地址猜测对应资产账户。联动只调整查看条件。代理仅缓存上游明确标记为公开且不可变、带构建哈希的 JS/CSS；页面、接口及携带会话的响应继续不缓存。符合此条件且上游未压缩的静态资源会按浏览器支持启用 gzip 流式传输，减少首次打开 ASTER 时的脚本下载等待；不压缩交易接口或流式行情，也不改变已有会话校验。[限速验收记录](docs/aster-loading-2026-09-23.md)。
-
-## 接入 Gate CrossEx 手动实盘
-
-Gate CrossEx 独立运行，通过 Gate CrossEx API 连接真实账户，提供手动开仓、平仓、订单查询及持仓观察。Market Monitor 只提供机会发现；每次下单必须在 CrossEx 页面预览并明确确认，没有自动开平仓、补腿或止盈止损。模拟入口已移除，旧模拟记录保留在原数据库中，退出运行与展示。上方总部署入口已包含 CrossEx；也可用 `--only monitor,crossex,hub` 只处理这三个项目。
-
-工作台升级后会一次性补充 `Gate CrossEx` 入口，默认通过代理访问服务器 `127.0.0.1:3200`。在“项目管理 → Gate CrossEx”填写用户名 `admin` 和 **CrossEx 自己的网页登录密码**，该密码与工作台密码独立，首次启动时记录在 `gate-crossex-arbitrage` 服务日志中。保存后点击左侧入口即可自动登录，仍只需转发工作台的 `3100`。
-
+### 仅安装特定模块
 ```bash
-sudo journalctl -u gate-crossex-arbitrage --no-pager -n 30
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only asset,hub
 ```
 
-Monitor 数据源地址及其 Basic 凭据在 **CrossEx 页面**配置；同机默认来源为 `http://127.0.0.1:3000`。Gate API Key / Secret 也仅在 CrossEx 的“连接与设置”中保存并由 CrossEx 加密管理。工作台保存的项目登录信息不会自动传给 CrossEx 的数据源或交易账户设置。
-
-升级保留已有项目连接和凭据，仅把 CrossEx 的旧默认模拟说明更新为手动实盘说明，自定义说明保持不变。手动删除入口后重启不会重新添加。首次升级时已满 30 个项目则跳过自动添加并记为已处理；腾出名额后可手动添加 `standard` 项目，使用 `proxy`、端口 `3200`、过期阈值 `120` 秒。
-
-## 接入 Variational Grid
-
-[Variational Grid](https://github.com/hxx344/variational-grid) 默认提供 Lighter QQQ / Variational US100 对冲剥头皮模拟；旧 CL/BZ 模式仅保留历史兼容入口，不与 QQQ 同时启动。仓库原名 `variational-cl-bz-grid`；升级时安装器会迁移已知旧仓库地址，保留 `/etc/variational-grid`、`/var/lib/variational-grid`、原服务名和已选择的策略模式。
-
-只升级这个模块和工作台：
-
+### 手动安装
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only variational,hub
-```
+# 克隆仓库
+git clone https://github.com/hxx344/project-aggregation.git
+cd project-aggregation
 
-工作台升级后一次性添加 `Variational Grid`，使用 `standard` 摘要、`proxy` 页面和服务器 `127.0.0.1:9876`。无需在“项目管理”填写用户名、密码或 `vr-token`；仍只转发工作台的 `3100`。模块保持仅监听本机，由工作台登录和页面授权保护代理访问。已有同标识 `variational` 的连接配置不会被覆盖；精确匹配的旧内置介绍一次性更新为 QQQ / US100，自定义介绍保留。删除后不重加，满 30 项时跳过自动添加。
+# 安装依赖
+npm install
 
-首次安装默认使用 QQQ / US100 的三组止盈对照；已有部署继续保留模式。原模块显式使用 `--qqq-hedge` 可切换到 QQQ，沿用同一对模拟和网页服务，保留旧账本。部署不要求交互式终端，也不询问 `vr-token`；token 缺失或失效均不阻止安装。默认 QQQ 模式的页面仍可访问，需要认证的模拟活动暂停，在模块原页面使用“更新 Var token”补填有效 token 后自动恢复，无需重新部署。旧 `run` / `compare` / `inventory` 模式沿用各自的会话导入方式，不提供这一网页补填入口。工作台摘要只读取本地已发布的模拟采样，不访问交易所或读取 token。
-
-各组模拟盈亏独立显示，单位 USDC，不相加、不计入资产账本。来源暂停、进程停止、旧样本和合成行情均明确标记；摘要沿用真实采样及持仓估值时间。网页支持预加载，隐藏时继续低频读取，重新进入时补查；后台模拟继续运行。
-
-## 接入 Greeks · BTC 期权
-
-[Greeks](https://github.com/hxx344/greeks) 是 Bybit BTC 铁鹰期权面板。安装或更新两端：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only greeks,hub
-```
-
-Greeks 安装器支持 Debian 12/13、Ubuntu 24.04，使用单进程 `greeks.service`，仅监听 `127.0.0.1:8000`。新安装默认 `dry-run`，不自动开仓；升级保留 `/etc/greeks/greeks.env` 中的模式、交易密钥和面板密码，以及 `/var/lib/greeks` 中的状态。无变化时复用依赖和验证结果，服务健康则不重启；安装日志列出更新与跳过项。
-
-工作台会一次性添加 `Greeks · BTC 期权`，使用 `standard` 摘要及 `proxy` 页面。在“项目管理”填写 Greeks 的 `DASHBOARD_USERNAME`（默认 `admin`）与 `DASHBOARD_PASSWORD`。安装器生成的独立密码保存在服务器 `/etc/greeks/greeks.env`，可用 `sudo grep '^DASHBOARD_' /etc/greeks/greeks.env` 查看；只将面板密码填入工作台。已有同标识连接保留，删除后不自动重加，满 30 项时跳过添加。仍只需 SSH 转发工作台 `3100`。
-
-摘要只读取 Greeks 已有内存快照，展示运行模式、BTC 行情、策略跟踪与对账状态；保留真实来源时间，等待周日合约上线作为运行提示，过期和异常另行标记。Greeks 的账户资产与策略收益不叠加到账本。预加载和后台刷新不会发送开平仓或 RFQ 写请求；原页面保留完整功能，后台采集、对账和收益采样独立运行。
-
-## 单独安装或更新工作台
-
-适用于使用 systemd 的 Debian / Ubuntu，支持 x64、arm64。这一入口仅部署工作台，六个模块继续使用原来的端口。需要一起安装或升级时使用上方总部署命令。以下同一条命令用于工作台的首次安装和后续更新：
-
-```bash
-sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-get install -y curl ca-certificates; }; f=$(mktemp); curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install.sh -o "$f"; bash "$f"; rm -f "$f"'
-```
-
-脚本安装缺失依赖，复用可用的 Node.js 24.15.0 或更高的 24.x 版本；需要安装时，从 Node.js 官方下载固定版本并核验官方 SHA-256。CI 完成构建，服务器以专用 `project-aggregation` 用户运行程序。工作台默认仅监听 `127.0.0.1:3100`。
-
-首次登录密码只在第一次启动时写入服务日志，在服务器查看：
-
-```bash
-sudo journalctl -u project-aggregation --no-pager -n 30
-```
-
-在自己的电脑运行以下一条 SSH 命令，把 `user@server` 替换为服务器登录地址，然后打开 [工作台](http://127.0.0.1:3100)：
-
-```bash
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
-```
-
-保持这个终端运行。打开 `http://127.0.0.1:3100` 会跳转到 `http://hub.localhost:3100`；从工作台进入项目时，工作台为各项目生成独立的 `.localhost` 子域，仍使用 `3100`。无需再转发各原项目端口。
-
-Chrome / Edge 会把 `.localhost` 子域解析到本机，无需修改 hosts 或 DNS；单端口原页面代理当前支持这种 SSH 本地访问方式，不承诺 Safari 或通用域名代理。[浏览器兼容说明](https://learn.microsoft.com/en-us/aspnet/core/test/localhost-tld?view=aspnetcore-10.0)
-
-## 连接六个项目
-
-以下是首启时预置的配置。进入“项目管理”，为已设登录保护的项目填写现有页面的密码；monitor 若启用 HTTP Basic，还要填写用户名，CrossEx 用户名为 `admin`。保存一次后，通过工作台打开项目即可自动登录。这里填写的是原项目登录凭据，不是交易所 API Key。
-
-| 项目 | 页面地址：提供入口路径和查询参数 | 接口地址：工作台服务器访问 | 适配器 |
-| --- | --- | --- | --- |
-| ASTER 5X | `http://127.0.0.1:8765/` | `http://127.0.0.1:8765` | `aster` |
-| Market Monitor | `http://127.0.0.1:3000/?monitor=oil` | `http://127.0.0.1:3000` | `monitor` |
-| Asset Ledger | `http://127.0.0.1:5678/` | `http://127.0.0.1:5678` | `asset` |
-| Gate CrossEx | `http://127.0.0.1:3200/` | `http://127.0.0.1:3200` | `standard` |
-| Variational Grid | `http://127.0.0.1:9876/` | `http://127.0.0.1:9876` | `standard` |
-| Greeks · BTC 期权 | `http://127.0.0.1:8000/` | `http://127.0.0.1:8000` | `standard` |
-
-升级时，缺少 `accessMode` 的三个原有内置项目默认采用 `proxy`；CrossEx、Variational Grid 与 Greeks 预置显式使用 `proxy`。缺少 `autoSync` 的 Asset 默认开启后台同步，其他项目默认关闭。已保存的显式设置继续保留。
-
-接口地址不会自动迁移。若现有 ASTER 接口地址仍是 `http://127.0.0.1:18765`，请在“项目管理”中改为 `http://127.0.0.1:8765`，重新填写 ASTER 网页登录密码并保存。工作台不会自动改端口或把旧密码搬到新目标。采用 `proxy` 时，旧页面地址中的 `18765` 不作为连接目标，可以保留或改为上表地址。
-
-`proxy` 仅连接 `apiUrl` 指定的服务器接口地址，页面地址 `url` 只提供路径和查询参数；例如 monitor 的 `?monitor=oil` 会保留。`direct` 则让浏览器直接打开 `url`，需要该地址本身可达。接口地址不含查询参数；同机部署时，上表的 `127.0.0.1` 指 Linux 服务器。
-
-如果 ASTER 的 `ASTER_PUBLIC_ORIGIN` 或 Asset 的 `PUBLIC_ORIGIN` 设置了外部地址，在“登录来源地址（可选）”填写同一个来源地址，例如 `https://asset.example.com`；其余情况留空，默认使用接口服务的来源。接口请求仍访问配置的本机接口地址。
-
-保存后如果接口地址、适配器或登录来源地址发生变化，需要重新输入凭据。密码空白表示保留已保存的密码；清除凭据使用页面的专门选项。服务器加密保存上游密码，读取项目配置的接口不会返回密码。
-
-保存的密码、Basic 认证信息和上游会话只留在工作台服务器。通过工作台打开 ASTER 或 Asset 时，每次页面授权都建立独立的原项目登录会话，不与摘要读取及 Asset 后台同步共用。monitor 使用保存的 Basic 凭据，先读取 `/api/monitors` 验证；采用 `proxy` 的 `standard` 则使用已有的 `/api/hub/summary` 做同样的只读预检。浏览器只接收工作台的页面授权 Cookie，不接收上游密码或会话。
-
-尚未保存凭据时，仍可进入原站登录页，也可以回“项目管理”保存一次。自动登录失败或会话过期时，回工作台重新打开项目；密码已变更时先更新保存的信息。`direct` 以及 `link` 项目仍按原站方式自行登录。
-
-页面访问使用一次性授权票据和绑定工作台会话的 host-only Cookie。在原项目退出登录会撤销当前页面授权；退出工作台会撤销全部页面授权，修改项目配置也会使该项目已有授权失效。
-
-代理模式下，点击左侧项目即自动载入原始页面，不再经过摘要详情或手动载入。原页面占满内容区，顶部保留“重新载入”“单独打开”和“连接设置”；原有 `mode=external` 配置也直接采用此方式，无需改数据库。后台摘要刷新不会重新载入正在操作的页面。代理允许原页面嵌入工作台：代理将 `X-Frame-Options` 和 CSP 的 `frame-ancestors` 统一为仅允许当前工作台嵌入，保留其余 CSP 限制。也可以用“单独打开”独立操作。直接访问模式仍受原页面自身的嵌入策略限制。
-
-## 数据怎样计算
-
-| 数据 | 来源和口径 |
-| --- | --- |
-| 资产表内总额 | `asset /api/ledger` 中所有资产行的 `value` 之和，单位 USD，包含原账本的“出金”行。 |
-| 当前持有 | 表内总额减去项目名为“出金”的行。不叠加 ASTER 的余额、保证金或 CrossEx 账户余额。 |
-| 资产历史 | 原账本已经保存的历史总额，最多最近 90 个有效日期；排除未来与归档记录，同日优先日快照。日期按北京时间展示。这是资产金额历史，不是收益率或回测曲线，入金和出金也会改变它。 |
-| 资产更新时间 | 动态资产行更新时间中的最早值，明确标记 `mode=manual` 的手工行不参与实时过期计算；手工行最早估值记录时间单独展示。纯手工账本标记“静态估值”，保留估值记录时间。后台同步状态在项目管理中单独展示，不代替资产源时间。 |
-| 交易概览 | `aster /api/state?compact=true`，统计启用账户及实盘账户。保证金、今日成交量使用上游 USD1 单位；今日成交量按上游 UTC 日口径，不做人民币换算。演示数据会有明确提示。 |
-| 交易更新时间 | 实盘账户快照中的最早时间；快照缺失不会当成刚刚更新。 |
-| 原油监控 | monitor 模块的 Binance 标记价格；价差 = (布伦特 − WTI) ÷ WTI × 100%，以 WTI 为基准；两腿价格仍为 USDT/桶。 |
-| 监控时效 | 使用报价的源更新时间并保留采集器的过期/部分失败状态；工作台成功连通不代表行情新鲜。 |
-| Variational 模拟摘要 | `standard /api/hub/summary`，各组本轮累计模拟盈亏，单位 USDC；不汇总成真实资产。仅查询最新已发布采样。 |
-| CrossEx 实盘摘要 | `standard /api/hub/summary`，展示手动实盘连接、真实持仓及数据时效，不重复计入资产总额或历史。账户连接、预览确认、开平仓和订单处理在 CrossEx 原页面进行；工作台摘要读取不会下单。 |
-
-`checkedAt` 是工作台最近一次检查时间，`updatedAt` 是数据源实际更新时间；纯手工账本对应手工估值记录时间。默认 aster / monitor 超过 120 秒、asset 动态资产超过 900 秒标记过期，可按项目调整为 30–86400 秒。只有所有资产行都明确为 `mode=manual` 才按静态估值处理，不因记录较早就判定实时报价过期；未知或缺失分类按动态数据处理并提示不完整。单次上游读取总时限默认 5 秒；一个项目超时不会阻塞其他项目。
-
-Asset 后台同步可在项目设置中开关。启用、项目未停用且已保存原项目登录凭据时，服务器每 60 秒调用 `POST /api/sync`，即使原页面关闭、浏览器退出或 SSH 断开也会继续运行。单次同步最多等待 60 秒，不阻塞其他项目的摘要读取。同步调用原有资产同步功能，会写入估值和历史，不执行下单或转账。关闭此开关后，工作台仍定期读取账本；原页面自身的同步功能不受影响。同步失败会保留旧数据；“最近同步尝试”或成功响应不代表每个来源都已更新，应同时查看源数据时间和错误状态。
-
-首次没有数据时显示等待、未连接或需要认证。读到部分异常数据时提示不完整；读取失败时保留旧值和源时间。上游提供的账本示例数据也会标明，不能作为真实资产结果。
-
-通过工作台打开 Asset 原页面时，已开启后台同步且已保存密码的 `/api/sync` 请求与后台共用一次同步。代理使用当前页面授权保存在服务器上的 Asset 会话，先验证账本访问权限，同步完成后再读取真实账本，避免同时刷新造成锁冲突；不要求浏览器持有原站会话 Cookie。页面授权或上游认证无效时不能读取，同步失败不伪装为成功。关闭后台同步后，原页面同步请求照常转发。
-
-## 接入后续项目
-
-1. 只需要入口：在项目管理选择 `link`，默认 `direct`，填写浏览器可访问的页面地址。若需要通过工作台访问，可改为 `proxy` 并填写接口地址；链接模式不会采集摘要。
-2. 需要摘要：选择 `standard`，让新项目实现 `GET /api/hub/summary`。可选 HTTP Basic 认证，填写用户名与密码；页面默认 `direct`。改为 `proxy` 后，工作台会用该接口验证保存的 Basic 凭据，再自动认证页面请求。
-3. 旧系统接口不符合标准：在 `server/adapters.mjs` 增加适配器，同时更新前后端允许的适配器列表，并补充行为测试。
-
-标准接口 `schemaVersion: 2` 的健康状态、时间约束及旧版兼容方式见 [扩展协议](docs/integration.md)。当前最多接入 30 个项目，单个摘要最多 24 个指标、366 个趋势点。接入配置保存在本机数据库里，重启或升级后保留。
-
-## 维护、配置和恢复
-
-| 路径 | 用途 |
-| --- | --- |
-| `/etc/project-aggregation.env` | 服务配置；重复安装保留现有内容。 |
-| `/var/lib/project-aggregation/` | 数据库 `hub.sqlite`、SQLite 日志及 `credentials.key`；不随程序版本清理。 |
-| `/opt/project-aggregation/current` | 当前程序版本的符号链接。 |
-| `/opt/project-aggregation/previous` | 上一个成功版本；更新完成后保留当前和前一版本。 |
-| `/opt/project-aggregation/.last-successful.env` | 上次健康启动的环境配置快照，仅 root 可读，供失败回滚使用。 |
-| `/opt/project-aggregation/cache` | 按 SHA-256 缓存 CI 部署包；显式源码模式仍保留独立构建缓存。 |
-| `/etc/systemd/system/project-aggregation.service` | 自动管理的服务配置；使用环境文件修改监听地址等选项。 |
-
-环境文件使用无引号的 `KEY=value`：
-
-```dotenv
-HOST=127.0.0.1
-PORT=3100
-DATA_DIR=/var/lib/project-aggregation
-NODE_ENV=production
-```
-
-修改配置后重复执行安装命令。数据目录应是专用目录，安装器接受 `/var/lib/project-aggregation`、其子目录、`/srv/project-aggregation/` 下的子目录或 `/opt/project-aggregation-data`；改目录前自行迁移完整旧数据。直接改路径会使用新目录，不会自动移动旧数据。
-
-工作台登录后固定有效 7 天，到期需重新输入密码；期间访问或重启服务不会延长有效期。升级后重新登录即可使用 7 天有效期，已登录会话保留原到期时间。退出登录或重置密码会立即撤销相应会话。
-
-忘记工作台密码时，在默认数据目录下运行：
-
-```bash
-sudo -u project-aggregation env DATA_DIR=/var/lib/project-aggregation "$(cat /opt/project-aggregation/.node-path)" /opt/project-aggregation/current/server/setup.mjs --reset-password
-```
-
-这会显示新密码并撤销原有工作台会话。自定义了 `DATA_DIR` 时，命令也要使用相同的目录。
-
-```bash
-sudo systemctl status project-aggregation
-sudo journalctl -u project-aggregation -f
-```
-
-更新没有变化且服务健康时，跳过部署包下载和重启；仅文档或测试变化不更新运行产物。新应用包通过固定提交地址下载并校验 SHA-256、路径及包内版本，准备成功后才原子切换。配置变化复用当前程序。启动失败自动恢复前一程序版本、systemd 配置及上次健康配置，并按旧地址和端口检查恢复结果；未生效的新配置另存为 `/etc/project-aggregation.env.failed-时间-PID`（仅 root 可读）。首次安装失败保持已有配置和数据，不删除未知目录。
-
-备份时停止服务，保存完整的数据目录与环境文件，再启动服务。`hub.sqlite` 和 `credentials.key` 必须一起保留；运行中的 SQLite 还可能有 WAL 文件，不要只复制单个数据库文件。密钥丢失时服务器会拒绝启动，防止已有凭据被错误覆盖。
-
-如果已有 HTTPS 反向代理，可把工作台代理到 `127.0.0.1:3100`，传递原始 `Host`，并设置 `PUBLIC_ORIGIN=https://hub.example.com` 和 `COOKIE_SECURE=true`；前者将该工作台入口加入允许来源。这个配置不提供通用域名下的原页面代理；完整原页面的单端口访问仍以 SSH 和 `.localhost` 为支持方式。HTTPS 入口可使用 `direct` 项目链接，详情见 [部署说明](docs/deployment.md)。
-
-## 本地开发和验证
-
-要求 Node.js 24.15.0+；Linux 安装器复用 24.x，CI 使用 Node 24。无需数据库服务。
-
-```bash
-npm ci
-npm run check
-npm test
+# 构建前端
 npm run build
+
+# 启动服务
 npm start
 ```
 
-生产启动默认地址为 [http://127.0.0.1:3100](http://127.0.0.1:3100)。完整原页面代理请先构建，再通过 3100 验证。仅开发工作台界面时，在后端环境设置 `PUBLIC_ORIGIN=http://127.0.0.1:5173`，然后在两个终端分别运行 `npm run dev:server` 和 `npm run dev`；Vite 位于 [http://127.0.0.1:5173](http://127.0.0.1:5173)，代理摘要和管理接口到后端。Vite 预览不提供原项目页面代理。开发数据默认放在未提交的 `.data/`。
+服务默认运行在 `http://127.0.0.1:3100`
 
-GitHub Actions 在 Windows（Node 24.x）、Ubuntu（Node 24.15.0 和 24.x）分别执行类型检查、行为测试和构建；另一个 Ubuntu job 检查安装脚本、CI 包校验、从源码部署迁移、无变化跳过、损坏包拒绝及启动失败后的恢复。`main` 的必要任务全部成功后自动发布 `deploy-提交号` 候选 Release（`prerelease`）；正式版须按上方流程明确晋级。真实构建产物复用，不为打包重复编译。测试使用模拟上游，不等于连接了你的 Linux 服务器或真实交易账户。是否真实连通，以部署后页面的状态和源数据时间为准。本项目不使用 WSL 验证。
+### 初始密码
+首次启动会生成随机密码并显示在控制台，请妥善保存。
+
+重置密码：
+```bash
+node server/setup.mjs --reset-password
+```
+
+## 系统要求
+
+- Node.js >= 24.15.0
+- 支持 Linux/macOS/Windows
+- 推荐 2GB+ 内存
+
+## 项目配置
+
+### 接入新项目
+1. 登录工作台
+2. 点击"项目管理"
+3. 填写项目信息：
+   - 项目 ID（唯一标识）
+   - 名称和描述
+   - 接口地址（如 `http://127.0.0.1:3200`）
+   - 适配器类型
+   - 数据过期阈值（秒）
+
+### 适配器类型
+- `aster` - ASTER 交易工作台
+- `monitor` - Market Monitor
+- `asset` - 资产账本
+- `standard` - 标准概览接口
+- `link` - 仅网页入口
+
+### Asset 后台同步
+启用后，工作台每 60 秒调用 Asset 同步接口更新资产数据，浏览器关闭后仍会执行。
+
+## 交易执行
+
+### 配置实盘连接
+1. 进入"交易中心"
+2. 选择交易所组合
+3. 填写 API 密钥：
+   - **Binance** - API Key + Secret
+   - **Bybit** - API Key + Secret
+   - **OKX** - API Key + Secret + Passphrase
+
+**权限要求：**
+- ✅ 合约交易（必需）
+- ❌ 提现/划转（禁止）
+
+### 执行流程
+1. 选择策略（四腿/两腿）
+2. 填写数量和价格参数
+3. 点击"预览"查看执行计划
+4. 核对账户、方向、数量
+5. 确认后开始实盘执行
+
+**安全机制：**
+- 预览 30 秒有效期
+- 持仓模式冲突检测
+- 外部委托冲突检测
+- 追价停止价保护
+- 断电恢复机制
+
+## 架构设计
+
+### 后端
+- **框架** - Node.js + ESM
+- **数据库** - SQLite (WAL 模式)
+- **日志** - Pino 结构化日志
+- **加密** - AES-256-GCM
+
+### 前端
+- **框架** - React 19 + TypeScript
+- **构建** - Vite 8
+- **图表** - Recharts 3
+
+### 部署
+- **服务管理** - systemd
+- **健康检查** - `/api/health`
+- **自动更新** - 内置更新检查和应用
+
+## 开发
+
+### 运行测试
+```bash
+npm test
+```
+
+### TypeScript 检查
+```bash
+npm run check
+```
+
+### 开发模式
+```bash
+npm run dev
+```
+
+## 数据安全
+
+- **凭据加密** - 使用 32 字节随机密钥（`credentials.key`）
+- **会话管理** - SHA-256 哈希，HttpOnly + SameSite=Strict cookies
+- **数据目录** - 默认 `.data/`，权限 `0o700`
+- **备份建议** - 定期备份 `.data/hub.sqlite` 和 `.data/credentials.key`
+
+⚠️ **重要提示：** 丢失 `credentials.key` 会导致无法解密已保存的凭据
+
+## 故障排查
+
+### 项目显示"数据已过期"
+- 检查项目接口地址是否可访问
+- 检查项目是否正常运行
+- 查看诊断信息中的具体错误
+
+### 交易执行失败
+- 核对 API 密钥权限
+- 检查账户余额和保证金
+- 查看执行任务的详细错误信息
+- 确认交易所账户模式与设置一致
+
+### 无法登录
+- 检查密码是否正确
+- 查看是否触发账户锁定（30 分钟）
+- 必要时重置密码
+
+## 更新日志
+
+### 最近更新
+- ✅ 安全修复：会话固定、账户锁定、DNS 重绑定防护
+- ✅ 性能优化：N+1 查询消除、序列化缓存
+- ✅ 可观测性：结构化日志系统
+- ✅ 代码重构：前端组件拆分、后端模块化
+- ✅ 测试增强：日志和会话管理单元测试
+
+## 许可证
+
+MIT
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request
+
+## 联系方式
+
+- GitHub: https://github.com/hxx344/project-aggregation
