@@ -5,6 +5,23 @@ import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
+// HTTP Keep-Alive connection pools to reuse TCP connections
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 10,
+  maxFreeSockets: 5,
+  timeout: 60000,
+  keepAliveMsecs: 30000
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 10,
+  maxFreeSockets: 5,
+  timeout: 60000,
+  keepAliveMsecs: 30000
+});
+
 // DNS cache to reduce redundant lookups for frequently accessed domains
 const dnsCache = new Map(); // hostname -> { addresses, expiresAt }
 const DNS_TTL = 30_000; // 30 seconds
@@ -93,9 +110,10 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
     return await new Promise((resolve, reject) => {
       const req = (target.protocol === 'https:' ? https : http).request(target, {
         method, signal: controller.signal,
+        agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
         // Force Node.js to use the pinned address; prevents re-resolution during the request
         lookup: (_name, options, callback) => options.all ? callback(null, [pinnedAddress]) : callback(null, pinnedAddress.address, pinnedAddress.family),
-        headers: { Accept: 'application/json', ...headers, ...(serialized ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(serialized) } : {}) },
+        headers: { Accept: 'application/json', Connection: 'keep-alive', ...headers, ...(serialized ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(serialized) } : {}) },
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(new UpstreamError('invalid', '服务返回重定向，请配置最终服务地址')); return; }
         if ([401, 403, 429].includes(res.statusCode)) { res.destroy(); reject(new UpstreamError('unauthorized', res.statusCode === 429 ? '上游登录限流，请稍后重试' : '需要有效的网页登录凭据，请检查项目设置', res.statusCode)); return; }
