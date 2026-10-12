@@ -161,6 +161,10 @@ small{font-size:.8125rem}
 .connection-details p{margin-top:8px}
 .connection-details small{display:block;margin-top:10px;color:var(--text-tertiary);font-size:.75rem}
 .connection-details .connection-problem{color:var(--error)}
+.connection-route{padding-left:7px;border-left:1px solid var(--surface-5);color:var(--text-secondary)}
+.connection-route.verified{color:var(--emerald)}
+.local-route-details{border-top:1px solid var(--surface-5);margin-top:12px;padding-top:12px}
+.local-route-details code{display:block;white-space:normal;overflow-wrap:anywhere;margin-top:8px;font-size:.6875rem;color:var(--text-primary)}
 .refresh-label{font-size:.8125rem;color:var(--text-tertiary)}
 .main-content{padding:31px 34px 42px;max-width:1610px;width:100%;margin:0 auto;flex:1}
 .page-heading{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}

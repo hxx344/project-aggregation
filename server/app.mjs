@@ -476,7 +476,8 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     try { if ((!configuredOrigin || req.headers.host !== new URL(configuredOrigin).host) && await portal.handle(req, res)) return; }
     catch { if (!res.headersSent) send(res, 502, { error: '项目页面暂时不可用，请从工作台重新打开' }); else res.destroy(); return; }
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src http: https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    const localRouteSource = req.headers.host === 'hub.localhost:3100' && !secureCookies && !req.socket.encrypted ? ' http://127.0.0.1:3101' : '';
+    res.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'${localRouteSource}; frame-src http: https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`);
     try {
       if (!req.url.startsWith('/') || req.url.startsWith('//')) throw new HttpError(400, '请求地址格式不正确');
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
