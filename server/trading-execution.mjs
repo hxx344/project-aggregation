@@ -19,7 +19,11 @@ const modeOf = (exchange, mode) => {
 
 /** Durable, explicit live execution. Read endpoints never submit exchange requests. */
 export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true } = {}) {
-  if (!stmt) stmt = createStatementCache(db);
+  // If stmt is explicitly null, use raw db.prepare (for tests that mock db.prepare)
+  // If stmt is undefined, create a cached version for production
+  // If stmt is provided, use it
+  if (stmt === undefined) stmt = createStatementCache(db);
+  else if (stmt === null) stmt = db;
   db.exec(`
     CREATE TABLE IF NOT EXISTS execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT);
     CREATE TABLE IF NOT EXISTS execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL);

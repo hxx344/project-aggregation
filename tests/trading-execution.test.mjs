@@ -41,7 +41,7 @@ async function fixture(t, options = {}) {
     }
     if (method === 'stop') Object.assign(record, { status: 'terminal', terminal: true, childrenSettled: true });
   }]));
-  const create = () => createTradingExecution({ db, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, ...options });
+  const create = () => createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, ...options });
   instance = create();
   t.after(async () => { await instance.close(); db.close(); });
   for (const exchange of ['binance', 'bybit', 'okx']) await instance.connect(exchange, { revision: 0, accountMode: exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified', apiKey: 'fixture_key', apiSecret: 'fixture_secret', ...(exchange === 'okx' ? { passphrase: 'fixture_private_passphrase' } : {}) });
