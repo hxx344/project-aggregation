@@ -151,7 +151,7 @@ function structure(legs) {
 
 /** Account reads only. This service deliberately has no exchange mutation operation. */
 export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000 } = {}) {
-  const stmt = createStatementCache(db);
+  if (!stmt) stmt = createStatementCache(db);
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec("CREATE TABLE IF NOT EXISTS trading_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, verified_at TEXT, snapshot TEXT, account_mode TEXT NOT NULL DEFAULT 'standard')");
