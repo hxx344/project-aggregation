@@ -275,8 +275,8 @@ class CoordinatorTests(RootFixture):
                      identity=hashlib.sha256((key + NEW).encode()).hexdigest())
         return 0
 
-    def check(self):
-        self.coordinator.check()
+    def check(self, minimum_interval=updater.CHECK_MIN_INTERVAL):
+        self.coordinator.check(minimum_interval=minimum_interval)
         if self.coordinator.check_thread:
             self.coordinator.check_thread.join(5)
             self.assertFalse(self.coordinator.check_thread.is_alive(), 'version check did not finish')
@@ -429,12 +429,12 @@ class CoordinatorTests(RootFixture):
         restarted = self.make_coordinator(); restarted.recover(starting=True)
         self.assertFalse(restarted.status()['checking']); self.assertIsNone(restarted.status()['planId'])
 
-    def test_automatic_check_is_due_every_180_seconds_and_survives_restart(self):
+    def test_automatic_check_is_due_every_30_seconds_and_survives_restart(self):
         self.assertEqual(self.coordinator.next_check_delay(), 0)
         self.check()
-        self.assertEqual(self.coordinator.next_check_delay(), 180)
+        self.assertEqual(self.coordinator.next_check_delay(), 30)
         calls = len(self.network.calls)
-        self.clock += 179
+        self.clock += 29
         restarted = self.make_coordinator(); restarted.recover(starting=True)
         self.assertEqual(restarted.next_check_delay(), 1)
         self.assertFalse(restarted.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
@@ -443,7 +443,7 @@ class CoordinatorTests(RootFixture):
         self.assertTrue(restarted.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
         restarted.check_thread.join(5)
         self.assertGreater(len(self.network.calls), calls)
-        self.assertEqual(restarted.next_check_delay(), 180)
+        self.assertEqual(restarted.next_check_delay(), 30)
 
     def test_scheduler_starts_without_http_and_does_not_duplicate_or_reenter(self):
         entered = threading.Event(); release = threading.Event()
@@ -466,21 +466,21 @@ class CoordinatorTests(RootFixture):
         self.assertFalse(thread.is_alive())
         plan = self.coordinator.status()['planId']
         self.coordinator.apply(plan)
-        self.clock += 181
+        self.clock += 31
         self.assertEqual(self.coordinator.next_check_delay(), 5)
         self.assertFalse(self.coordinator.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
 
     def test_auto_retry_after_failure_preserves_no_failed_plan(self):
-        plan = self.prepare(); self.clock += 180
+        plan = self.prepare(); self.clock += 30
         self.network.values['hub']['metadata']['prerelease'] = True
-        state = self.check()
+        state = self.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)
         self.assertIsNone(state['planId']); self.assertIsNotNone(state['checkError'])
         with self.assertRaises(updater.UpdateError):
             self.coordinator.apply(plan)
-        self.assertEqual(self.coordinator.next_check_delay(), 180)
+        self.assertEqual(self.coordinator.next_check_delay(), 30)
         self.network.values['hub']['metadata']['prerelease'] = False
-        self.clock += 180
-        self.assertIsNotNone(self.check()['planId'])
+        self.clock += 30
+        self.assertIsNotNone(self.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['planId'])
 
     def test_unchanged_plan_survives_check_without_extending_expiry(self):
         plan = self.prepare(); expires = self.coordinator.status()['expiresAt']
