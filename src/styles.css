@@ -393,13 +393,14 @@ small{font-size:.8125rem}
 .stat-value{font-size:1.75rem;font-weight:600;color:var(--text-primary)}
 .stat-value.error{color:var(--error)}
 
-.diagnostic-endpoints,.diagnostic-logs{background:var(--surface-2);border-radius:var(--radius-md);padding:var(--space-lg)}
+.diagnostic-endpoints,.diagnostic-logs{background:var(--surface-2);border-radius:var(--radius-md);padding:var(--space-lg);overflow-x:auto;min-width:0}
+.diagnostic-explanation{color:var(--text-tertiary);font-size:.8125rem;line-height:1.7;margin:0}
 .diagnostic-endpoints h3,.diagnostic-logs h3{margin:0 0 var(--space-md);font-size:1rem;color:var(--text-primary);display:flex;align-items:center;gap:var(--space-sm)}
 .log-count{font-size:0.875rem;color:var(--text-tertiary);font-weight:400}
 
-.diagnostic-table{width:100%;border-collapse:collapse;font-size:0.875rem}
+.diagnostic-table{width:100%;min-width:520px;border-collapse:collapse;font-size:0.875rem}
 .diagnostic-table thead{border-bottom:2px solid var(--surface-4)}
-.diagnostic-table th{text-align:left;padding:var(--space-sm);font-weight:600;color:var(--text-secondary);font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em}
+.diagnostic-table th{text-align:left;padding:var(--space-sm);font-weight:600;color:var(--text-secondary);font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap}
 .diagnostic-table td{padding:var(--space-sm);border-top:1px solid var(--surface-3);color:var(--text-secondary)}
 .diagnostic-table tbody tr:hover{background:var(--surface-3)}
 .diagnostic-table code{background:var(--surface-4);padding:2px 6px;border-radius:4px;font-size:0.8125rem;color:var(--accent)}

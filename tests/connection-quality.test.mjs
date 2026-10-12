@@ -48,7 +48,7 @@ test('displayed latency agrees with the quality band just above each threshold',
   }
 });
 
-test('health probes require a valid status and request a fresh, non-redirected response with a 3 s deadline', async () => {
+test('health probes require a valid status and request a fresh, non-redirected response with a 5 s deadline', async () => {
   const controller = new AbortController();
   const calls = [];
   await checkConnectionHealth(async (url, options) => {
@@ -56,7 +56,7 @@ test('health probes require a valid status and request a fresh, non-redirected r
     return { status: 'ok', uptime: 30 };
   }, controller.signal);
   assert.deepEqual(calls, [{ url: '/api/health', options: {
-    signal: controller.signal, timeoutMs: 3000, cache: 'no-store', redirect: 'error',
+    signal: controller.signal, timeoutMs: 5000, cache: 'no-store', redirect: 'error',
   } }]);
   for (const response of [undefined, null, true, 'ok', [], {}, { status: null }, { status: 'OK' }, { status: 'degraded' }]) {
     await assert.rejects(checkConnectionHealth(async () => response, controller.signal), /Invalid health response/);
@@ -77,7 +77,7 @@ test('health probes preserve API and transport failures and reject malformed or 
 });
 
 for (const bodyHangs of [false, true]) {
-  test(`health deadline aborts a hanging ${bodyHangs ? 'response body' : 'transport'} at 3 s without retry`, async t => {
+  test(`health deadline aborts a hanging ${bodyHangs ? 'response body' : 'transport'} at 5 s without retry`, async t => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const pending = deferred();
     let signal, calls = 0, settled = false;
@@ -89,7 +89,7 @@ for (const bodyHangs of [false, true]) {
     result.then(() => { settled = true; }, () => { settled = true; });
     const rejected = assert.rejects(result, { name: 'TimeoutError' });
     await flush();
-    t.mock.timers.tick(2999); await flush();
+    t.mock.timers.tick(4999); await flush();
     assert.equal(settled, false);
     t.mock.timers.tick(1); await rejected;
     assert.equal(signal.aborted, true);
@@ -105,10 +105,10 @@ test('monitor measures RTT and discards the last latency when a later probe fail
   assert.deepEqual(latest(), { quality: 'checking', latencyMs: null, checkedAt: null });
   t.mock.timers.tick(150); requests[0].resolve(); await flush();
   assert.deepEqual(latest(), { quality: 'good', latencyMs: 150, checkedAt: Date.now() });
-  t.mock.timers.tick(10000);
+  t.mock.timers.tick(15000);
   requests[1].reject(new Error('Service unavailable')); await flush();
   assert.deepEqual(latest(), { quality: 'unreachable', latencyMs: null, checkedAt: Date.now() });
-  t.mock.timers.tick(10000);
+  t.mock.timers.tick(15000);
   t.mock.timers.tick(501); requests[2].resolve(); await flush();
   assert.equal(latest().quality, 'slow');
   monitor.sync({ online: false, visible: true });
@@ -124,7 +124,7 @@ test('probes stay serial and the next interval begins after the previous probe s
   t.mock.timers.tick(30000);
   assert.equal(requests.length, 1);
   requests[0].resolve(); await flush();
-  t.mock.timers.tick(9999);
+  t.mock.timers.tick(14999);
   assert.equal(requests.length, 1);
   t.mock.timers.tick(1);
   assert.equal(requests.length, 2);
@@ -148,7 +148,7 @@ test('hidden pages cancel probes, resume with fresh checking state, and ignore s
   assert.equal(states.length, beforeStaleResult);
   t.mock.timers.tick(300); requests[1].resolve(); await flush();
   assert.deepEqual(latest(), { quality: 'fair', latencyMs: 300, checkedAt: Date.now() });
-  t.mock.timers.tick(10000);
+  t.mock.timers.tick(15000);
   assert.equal(requests.length, 3);
 });
 
@@ -168,7 +168,7 @@ test('late failure from an offline request cannot overwrite the recovered connec
   t.mock.timers.tick(5000); requests[0].reject(new Error('Late failure')); await flush();
   assert.equal(states.length, count);
   assert.equal(latest(), recovered);
-  t.mock.timers.tick(5000);
+  t.mock.timers.tick(10000);
   assert.equal(requests.length, 3);
   t.mock.timers.tick(5000);
   assert.equal(requests.length, 3);

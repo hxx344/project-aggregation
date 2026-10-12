@@ -65,7 +65,7 @@ async (page) => {
   await page.waitForTimeout(100);
   mode = 'hang'; await refresh();
   await page.waitForFunction(() => !document.querySelector('.connection-latency'));
-  await page.waitForTimeout(3200);
+  await page.waitForTimeout(5200);
   await quality('unreachable');
   assert(held.length === 1, 'only one health request is active');
   await releaseHeld();

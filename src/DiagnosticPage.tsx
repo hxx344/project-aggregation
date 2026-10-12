@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Activity, Download, Pause, Play, RotateCcw } from 'lucide-react';
+import { createDiagnosticFetch } from './request-diagnostics';
 
 interface RequestLog {
   id: number;
@@ -8,7 +9,7 @@ interface RequestLog {
   status: number;
   duration: number;
   timestamp: number;
-  size: number;
+  size: number | null;
 }
 
 interface RequestStats {
@@ -24,57 +25,22 @@ export default function DiagnosticPage() {
   const [monitoring, setMonitoring] = useState(false);
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const idCounter = useRef(0);
-  const originalFetch = useRef<typeof fetch | null>(null);
 
   useEffect(() => {
     if (!monitoring) return;
 
-    // 拦截 fetch
-    if (!originalFetch.current) {
-      originalFetch.current = window.fetch;
-    }
-
-    window.fetch = async (...args) => {
-      const startTime = performance.now();
-      const url = typeof args[0] === 'string' ? args[0] : args[0] instanceof Request ? args[0].url : args[0].toString();
-      const method = typeof args[0] === 'string' ? (args[1]?.method || 'GET') : args[0] instanceof Request ? args[0].method : 'GET';
-
-      try {
-        const response = await originalFetch.current!(...args);
-        const cloned = response.clone();
-        const blob = await cloned.blob();
-
-        const log: RequestLog = {
-          id: ++idCounter.current,
-          url,
-          method,
-          status: response.status,
-          duration: Math.round(performance.now() - startTime),
-          timestamp: Date.now(),
-          size: blob.size,
-        };
-
-        setLogs(prev => [log, ...prev].slice(0, 100)); // 只保留最近 100 条
-        return response;
-      } catch (error) {
-        const log: RequestLog = {
-          id: ++idCounter.current,
-          url,
-          method,
-          status: 0,
-          duration: Math.round(performance.now() - startTime),
-          timestamp: Date.now(),
-          size: 0,
-        };
-        setLogs(prev => [log, ...prev].slice(0, 100));
-        throw error;
-      }
-    };
+    let active = true;
+    const originalFetch = window.fetch;
+    const observedFetch = createDiagnosticFetch(originalFetch.bind(window), entry => {
+      if (!active) return;
+      const log = { ...entry, id: ++idCounter.current };
+      setLogs(prev => [log, ...prev].slice(0, 100));
+    });
+    window.fetch = observedFetch;
 
     return () => {
-      if (originalFetch.current) {
-        window.fetch = originalFetch.current;
-      }
+      active = false;
+      if (window.fetch === observedFetch) window.fetch = originalFetch;
     };
   }, [monitoring]);
 
@@ -93,7 +59,7 @@ export default function DiagnosticPage() {
     if (log.status === 0 || log.status >= 400) acc.failed++;
     acc.avgDuration = (acc.avgDuration * (acc.total - 1) + log.duration) / acc.total;
     acc.maxDuration = Math.max(acc.maxDuration, log.duration);
-    acc.totalSize += log.size;
+    acc.totalSize += log.size ?? 0;
 
     return acc;
   }, { total: 0, failed: 0, avgDuration: 0, maxDuration: 0, totalSize: 0, byEndpoint: {} } as RequestStats);
@@ -101,6 +67,7 @@ export default function DiagnosticPage() {
   const exportData = () => {
     const data = {
       capturedAt: new Date().toISOString(),
+      measurement: { duration: 'fetch start to response headers; excludes body transfer', size: 'Content-Length when provided; null means unknown', scope: 'latest 100 completed fetch calls in the workbench window' },
       duration: logs.length > 0 ? (logs[0].timestamp - logs[logs.length - 1].timestamp) / 1000 : 0,
       stats,
       logs: logs.map(l => ({
@@ -157,9 +124,10 @@ export default function DiagnosticPage() {
       {monitoring && (
         <div className="diagnostic-notice">
           <Activity size={18} className="pulse" />
-          <span>正在监控所有 HTTP 请求…</span>
+          <span>正在记录工作台页面的 fetch 请求；切换页面后继续监控。</span>
         </div>
       )}
+      <p className="diagnostic-explanation">显示最近 100 条记录。等待时间截至收到响应头，不含正文下载；大小取响应声明值，未提供时显示 —。不含内嵌项目、EventSource 和 WebSocket 流量。</p>
 
       <div className="diagnostic-stats">
         <div className="stat-card">
@@ -171,15 +139,15 @@ export default function DiagnosticPage() {
           <span className="stat-value error">{stats.failed}</span>
         </div>
         <div className="stat-card">
-          <span className="stat-label">平均延迟</span>
+          <span className="stat-label">平均响应等待</span>
           <span className="stat-value">{stats.total > 0 ? formatTime(Math.round(stats.avgDuration)) : '—'}</span>
         </div>
         <div className="stat-card">
-          <span className="stat-label">最大延迟</span>
+          <span className="stat-label">最大响应等待</span>
           <span className="stat-value">{stats.maxDuration > 0 ? formatTime(stats.maxDuration) : '—'}</span>
         </div>
         <div className="stat-card">
-          <span className="stat-label">总流量</span>
+          <span className="stat-label">已知声明大小合计</span>
           <span className="stat-value">{formatSize(stats.totalSize)}</span>
         </div>
       </div>
@@ -193,7 +161,7 @@ export default function DiagnosticPage() {
                 <th>接口</th>
                 <th>请求数</th>
                 <th>失败数</th>
-                <th>平均延迟</th>
+                <th>平均响应等待</th>
               </tr>
             </thead>
             <tbody>
@@ -227,8 +195,8 @@ export default function DiagnosticPage() {
                 <th>方法</th>
                 <th>URL</th>
                 <th>状态</th>
-                <th>耗时</th>
-                <th>大小</th>
+                <th>响应等待</th>
+                <th>声明大小</th>
               </tr>
             </thead>
             <tbody>
@@ -243,7 +211,7 @@ export default function DiagnosticPage() {
                   <td className={log.duration > 3000 ? 'error' : log.duration > 1000 ? 'warning' : ''}>
                     {formatTime(log.duration)}
                   </td>
-                  <td>{formatSize(log.size)}</td>
+                  <td>{log.size === null ? '—' : formatSize(log.size)}</td>
                 </tr>
               ))}
             </tbody>
