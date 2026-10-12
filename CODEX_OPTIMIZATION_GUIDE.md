@@ -7,7 +7,7 @@
 | 项目 | 路径 | 优化类型 | 优先级 |
 |------|------|---------|--------|
 | **Market Monitor** | `D:\project_monitor` | 数据库缓存 + 前端优化 | ⭐⭐⭐ 高 |
-| **Asset Ledger** | `D:\project_assest` | 数据库缓存补充 | ⭐⭐ 中 |
+| **Asset Ledger** | `D:\project_asset` | 数据库缓存补充 | ⭐⭐ 中 |
 | **Gate CrossEx** | `D:\project_crossex` | 已完成 ✅ | - |
 | **ASTER 5X** | `D:\project_aster_5x` | 前端组件优化 | ⭐⭐ 中 |
 | **Variational Grid** | `D:\project_variational` | 前端组件优化 | ⭐ 低 |
@@ -396,7 +396,7 @@ cd D:\project_monitor
 
 ---
 
-### 2. Asset Ledger (project_assest)
+### 2. Asset Ledger (project_asset)
 
 **优先级：⭐⭐ 中**
 

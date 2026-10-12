@@ -122,9 +122,9 @@ Tokens 定义:        30+
   • 图表容器美化 ✓
 ```
 
-### ✅ Asset Management (project_assest)
+### ✅ Asset Management (project_asset)
 ```
-位置: /d/project_assest/app/
+位置: /d/project_asset/app/
 状态: 已完成
 
 修改:
@@ -332,7 +332,7 @@ project_monitor/app/
 ├── design-tokens.css             [已复制]
 └── dark-theme.css                [已创建]
 
-project_assest/app/
+project_asset/app/
 ├── globals.css                   [已更新]
 ├── design-tokens.css             [已复制]
 └── dark-theme.css                [已创建]
