@@ -1,4 +1,6 @@
 import { addDecimals, compareDecimals, decimal } from './trading-decimal.mjs';
+import { createStatementCache } from './db-cache.mjs';
+
 
 const DAY = 86_400_000;
 export const PNL_INTERVAL = 60_000;
@@ -20,20 +22,24 @@ function pairSource(entries) {
   };
 }
 
-function migrateSamples(db) {
+function migrateSamples(db, stmt) {
   // A persistent marker prevents retained legacy rows from resurrecting samples
   // that have since expired or belonged to a replaced account revision.
   db.exec('SAVEPOINT trading_pnl_v2_migration');
   try {
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples (time INTEGER NOT NULL, binance_revision INTEGER NOT NULL, bybit_revision INTEGER NOT NULL, binance_at INTEGER, bybit_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (binance_revision, bybit_revision, time))');
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples_v2 (pair_key TEXT NOT NULL, revision_key TEXT NOT NULL, time INTEGER NOT NULL, first_at INTEGER, second_at INTEGER, unrealized_pnl TEXT, cumulative_funding_pnl TEXT, PRIMARY KEY (pair_key, revision_key, time))');
+    // Add cumulative_funding_pnl column to existing tables that don't have it
+    if (!stmt.prepare('PRAGMA table_info(trading_pnl_samples_v2)').all().some(col => col.name === 'cumulative_funding_pnl')) {
+      db.exec('ALTER TABLE trading_pnl_samples_v2 ADD COLUMN cumulative_funding_pnl TEXT');
+    }
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_migrations (id TEXT PRIMARY KEY)');
-    if (!db.prepare('SELECT id FROM trading_pnl_migrations WHERE id=?').get('pair_samples_v2')) {
-      const insert = db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)');
-      for (const row of db.prepare('SELECT * FROM trading_pnl_samples').iterate()) {
+    if (!stmt.prepare('SELECT id FROM trading_pnl_migrations WHERE id=?').get('pair_samples_v2')) {
+      const insert = stmt.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)');
+      for (const row of stmt.prepare('SELECT * FROM trading_pnl_samples').iterate()) {
         insert.run('binance:bybit', JSON.stringify([['binance', row.binance_revision], ['bybit', row.bybit_revision]]), row.time, row.binance_at, row.bybit_at, row.unrealized_pnl);
       }
-      db.prepare('INSERT INTO trading_pnl_migrations (id) VALUES (?)').run('pair_samples_v2');
+      stmt.prepare('INSERT INTO trading_pnl_migrations (id) VALUES (?)').run('pair_samples_v2');
     }
     db.exec('RELEASE SAVEPOINT trading_pnl_v2_migration');
   } catch (error) {
@@ -69,10 +75,19 @@ export function reducePnlPoints(points) {
   return result;
 }
 
-export function createTradingPnl(db) {
-  migrateSamples(db);
-  const latestRow = ({ pairKey, revisionKey }) => db.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? ORDER BY time DESC LIMIT 1').get(pairKey, revisionKey);
+export function createTradingPnl(db, stmt) {
+  if (!stmt) stmt = createStatementCache(db);
+  migrateSamples(db, stmt);
+
+  // Lazy-load prepared statements to avoid triggering them during initialization
+  const latestRow = ({ pairKey, revisionKey }) => stmt.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? ORDER BY time DESC LIMIT 1').get(pairKey, revisionKey);
+  let insertSample, deleteSamples, selectSamples, selectFirstTime;
+
   function record(entries, current) {
+    if (!insertSample) {
+      insertSample = stmt.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl,cumulative_funding_pnl) VALUES (?,?,?,?,?,?,?)');
+      deleteSamples = stmt.prepare('DELETE FROM trading_pnl_samples_v2 WHERE pair_key=? AND (time < ? OR revision_key != ?)');
+    }
     const pair = pairSource(entries);
     entries = pair.entries;
     if (entries.some(({ row }) => !row.credentials)) return false;
@@ -92,16 +107,20 @@ export function createTradingPnl(db) {
       ? entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) <= time).sort((a, b) => stamp(a.time) - stamp(b.time)).reduce((sum, event) => addDecimals([sum, event.amount]), '0')
       : null;
 
-    db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl,cumulative_funding_pnl) VALUES (?,?,?,?,?,?,?)').run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value, cumulativeFunding);
-    db.prepare('DELETE FROM trading_pnl_samples_v2 WHERE pair_key=? AND (time < ? OR revision_key != ?)').run(pair.pairKey, current - 31 * DAY, pair.revisionKey);
+    insertSample.run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value, cumulativeFunding);
+    deleteSamples.run(pair.pairKey, current - 31 * DAY, pair.revisionKey);
     return true;
   }
   function read(entries, start, current) {
+    if (!selectSamples) {
+      selectSamples = stmt.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time');
+      selectFirstTime = stmt.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND unrealized_pnl IS NOT NULL');
+    }
     const pair = pairSource(entries);
     entries = pair.entries;
     const connected = entries.every(({ row }) => !!row.credentials);
-    const records = connected ? db.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time').all(pair.pairKey, pair.revisionKey, start, current) : [];
-    const first = connected ? db.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND unrealized_pnl IS NOT NULL').get(pair.pairKey, pair.revisionKey).time : null;
+    const records = connected ? selectSamples.all(pair.pairKey, pair.revisionKey, start, current) : [];
+    const first = connected ? selectFirstTime.get(pair.pairKey, pair.revisionKey).time : null;
     const events = entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) >= start).sort((a, b) => stamp(a.time) - stamp(b.time));
     let eventIndex = 0, accumulated = '0';
     const points = [], gap = time => ({ time, unrealizedPnl: null, fundingPnl: null, totalPnl: null });

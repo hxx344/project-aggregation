@@ -169,7 +169,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   const snapshotHashes = new Map(EXCHANGES.map(exchange => [exchange, fundingHash(cache.get(exchange).funding)]));
   // Performance: Track serialized snapshots to avoid redundant serialization
   const serializedCache = new Map(storedRows.map(row => [row.exchange, row.snapshot]));
-  const pnl = createTradingPnl(db);
+  const pnl = createTradingPnl(db, stmt);
   const entriesFor = (pair = EXCHANGES) => pair.map(exchange => ({ row: rowFor(exchange), snapshot: cache.get(exchange) }));
   const recordPnl = () => TRADING_PAIRS.map(pair => pnl.record(entriesFor(pair), now())).some(Boolean);
   const clients = new Map(EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
