@@ -36,7 +36,7 @@ Thumbs.db
 
 # Temporary documentation and previews
 *-preview.html
-design-tokens.css
+/design-tokens.css
 diagnose-*.html
 
 # Temporary analysis and completed work records

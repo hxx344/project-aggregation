@@ -217,6 +217,10 @@ new_run
 stack_prefetch
 stack_run_installers
 cmp "$test_root/expected" "$test_root/executed"
+[[ -f "$stack_run/hub.log" ]]
+if [[ $(uname -s) == Linux ]]; then
+  [[ $(stat -c %a "$stack_run") == 700 && $(stat -c %a "$stack_run/hub.log") == 600 ]]
+fi
 
 # --refresh does not alter the selected application or its behavior switches.
 : > "$test_root/downloads"
@@ -227,7 +231,6 @@ stack_prefetch
 grep -q $'^hub\t$' "$test_root/downloads"
 
 if [[ $(uname -s) == Linux ]]; then
-  [[ $(stat -c %a "$stack_run") == 700 && $(stat -c %a "$stack_run/hub.log") == 600 ]]
   # Real signal/lock test, with no actual application or system services.
   cat > "$test_root/signal-installer.sh" <<'SH'
 #!/usr/bin/env bash

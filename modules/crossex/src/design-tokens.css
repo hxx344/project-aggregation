@@ -1,0 +1,27 @@
+/* Shared dark palette; layout and component rules remain in styles.css. */
+:root {
+  /* ===== Color Palette ===== */
+  /* Surface Layers - Deep teal-tinted dark palette (6 layers) */
+  --surface-0: #05080C;  /* Darkest - main background */
+  --surface-1: #0A0F14;  /* Navigation, secondary backgrounds */
+  --surface-2: #0F151C;  /* Cards, panels */
+  --surface-3: #161E26;  /* Hover states, overlays */
+  --surface-4: #1E2831;  /* Borders, dividers */
+  --surface-5: #28333D;  /* Darker borders */
+  --surface-6: #323F4A;  /* Deep shadows */
+
+  /* Accent Colors */
+  --accent: #38BDF8;           /* Primary action - bright cyan */
+  --accent-dim: #0EA5E9;       /* Hover state */
+  --accent-subtle: #1E3A52;    /* Background tint */
+  --emerald: #6EE7B7;          /* Success - bright teal-green */
+  --emerald-dim: #34D399;      /* Hover state */
+  --warning: #FBBF24;          /* Alert - amber */
+  --error: #F87171;            /* Danger - red */
+
+  /* Text Colors - High contrast for accessibility */
+  --text-primary: #F0F4F8;     /* Primary text */
+  --text-secondary: #B0BEC8;   /* Secondary text */
+  --text-tertiary: #7A8A98;    /* Tertiary/muted text */
+
+}

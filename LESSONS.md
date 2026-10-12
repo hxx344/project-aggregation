@@ -126,6 +126,20 @@
 
 **事件记录：** `embedded-topology-commit-20261013`；本轮连续修补归为一次已核实事件。
 
+### L011：源码导入后检查 Git 实际交付的构建输入
+
+**适用条件：** 将已有项目源码导入带有历史忽略规则的仓库。
+
+**根因：** 根目录 `.gitignore` 中未锚定路径的 `design-tokens.css` 同时忽略了嵌入模块的必需样式；本地文件存在，因此本地构建通过，从 Git 提交归档的 CI 却缺少文件。
+
+**以后做法：** 临时文件规则限定在其实际目录；导入后核对被忽略的文件与构建输入。干净 Git 归档的构建结果才覆盖正式交付文件的完整性。
+
+**证据：** project-aggregation `e478da63` 的 [CI](https://github.com/hxx344/project-aggregation/actions/runs/38307546837) 在两个架构均因 `modules/monitor/app/design-tokens.css` 缺失失败；同一规则也漏掉 `modules/crossex/src/design-tokens.css`。二者属于同一导入事件。
+
+**如何验证：** 用 `git ls-files --error-unmatch` 确认两个样式文件已跟踪，再由干净归档的模块构建验证引用。无需因忽略规则修复重复运行无关业务回归。
+
+**事件记录：** `embedded-import-ignore-20261013`；本轮一次已核实事件。
+
 ### L006：保持语义的算法优化要有参考结果与规模检查
 
 **适用条件：** 承诺保持输出语义的采样或图表算法优化；涉及重复解析热点时增加与规模相称的检查。

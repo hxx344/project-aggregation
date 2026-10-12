@@ -1,0 +1,41 @@
+/* Shared by the React workspace, SVG charts and inherited oil Shadow DOM. */
+:root {
+  color-scheme: dark;
+  --background: #05080c;
+  --foreground: #f0f4f8;
+  --card: #0f151c;
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: #38bdf8;
+  --primary-hover: #7dd3fc;
+  --primary-foreground: #05080c;
+  --primary-border: #32617e;
+  --active-surface: #102d40;
+  --surface-hover: #1e2b36;
+  --secondary: #161e26;
+  --secondary-foreground: var(--foreground);
+  --muted: #161e26;
+  --muted-foreground: #a0b1bf;
+  --accent: var(--active-surface);
+  --accent-foreground: var(--primary);
+  --positive: #6ee7b7;
+  --positive-surface: #102d26;
+  --negative: #fb8c8c;
+  --negative-surface: #321e25;
+  --negative-border: #693b45;
+  --destructive: var(--negative);
+  --warning: #fbbf24;
+  --warning-surface: #322b17;
+  --warning-border: #6b5525;
+  --border: #334553;
+  --input: var(--border);
+  --ring: var(--primary);
+  --shadow-color: #00000066;
+  --radius: .625rem;
+  --chart-1: var(--primary);
+  --chart-2: #93b9ff;
+  --chart-3: var(--warning);
+  --chart-4: var(--negative);
+  --chart-5: #c4a2f5;
+}
