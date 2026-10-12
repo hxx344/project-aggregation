@@ -42,9 +42,14 @@ def main():
         for notice in ('LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md'):
             if (source / notice).is_file():
                 shutil.copy2(source / notice, stage / notice)
-        if name == 'gate-crossex-arbitrage':
+        # Package runtime dependencies for each project
+        runtime_deps = {
+            'gate-crossex-arbitrage': ('ws', 'decimal.js'),
+            'project-aggregation': ('pino', 'pino-pretty')
+        }
+        if name in runtime_deps:
             lock = json.loads((source / 'package-lock.json').read_text())
-            for dependency in ('ws', 'decimal.js'):
+            for dependency in runtime_deps[name]:
                 installed = source / 'node_modules' / dependency
                 version = json.loads((installed / 'package.json').read_text())['version']
                 if version != lock['packages']['node_modules/' + dependency]['version']:
