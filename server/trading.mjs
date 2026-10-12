@@ -430,6 +430,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       const saved = db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), serialized, exchange, revision);
       if (!saved.changes) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
       cancel(exchange); cache.set(exchange, snapshot);
+      serializedCache.set(exchange, serialized); // Update serialization cache
       snapshotHashes.set(exchange, fundingHash(snapshot.funding));
       recordPnl();
       resetViews();
@@ -444,7 +445,10 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     exchangeOf(exchange); revisionOf(revision);
     if (rowFor(exchange).revision !== revision) throw new TradingError(409, '连接已被更新，请刷新后重试');
     db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=? AND revision=?').run(exchange, revision);
-    validations.get(exchange)?.abort(); cancel(exchange); cache.set(exchange, emptySnapshot(exchange));
+    validations.get(exchange)?.abort(); cancel(exchange);
+    const emptySnap = emptySnapshot(exchange);
+    cache.set(exchange, emptySnap);
+    serializedCache.set(exchange, JSON.stringify(emptySnap)); // Update serialization cache
     snapshotHashes.set(exchange, fundingHash(cache.get(exchange).funding)); resetViews();
   }
   if (!restoreViews()) { viewsDirty = true; flushViews(); }
