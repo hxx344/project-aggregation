@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('output/release'))
     args = parser.parse_args()
     source, repository = args.source.resolve(), args.repository.resolve()
-    package = json.loads((source / 'package.json').read_text())
+    package = json.loads((source / 'package.json').read_text(encoding='utf-8'))
     name = package['name']
     if name not in ('project-aggregation', 'gate-crossex-arbitrage'):
         raise ValueError('Unsupported application')
@@ -48,7 +48,7 @@ def main():
             'project-aggregation': ('pino', 'pino-pretty')
         }
         if name in runtime_deps:
-            lock = json.loads((source / 'package-lock.json').read_text())
+            lock = json.loads((source / 'package-lock.json').read_text(encoding='utf-8'))
             # Collect all transitive dependencies by walking package-lock.json
             to_copy = set()
             def collect_deps(pkg_name):
@@ -69,7 +69,7 @@ def main():
                 installed = source / 'node_modules' / dependency
                 if not installed.exists():
                     continue  # Optional peer dependency
-                version = json.loads((installed / 'package.json').read_text())['version']
+                version = json.loads((installed / 'package.json').read_text(encoding='utf-8'))['version']
                 expected = lock['packages']['node_modules/' + dependency]['version']
                 if version != expected:
                     raise ValueError(f'Runtime dependency version mismatch: {dependency} (installed: {version}, expected: {expected})')
