@@ -5,6 +5,7 @@ import { createTradingPnl } from './trading-pnl.mjs';
 import { createHash } from 'node:crypto';
 import { TRADING_VIEW_VERSION, packTradingView, unpackTradingView } from './trading-view-cache.mjs';
 import { TRADING_EXCHANGES as EXCHANGES, TRADING_SYMBOLS as SYMBOLS, TRADING_NAMES as NAMES, TRADING_PAIRS, DEFAULT_TRADING_PAIR, normalizeTradingPair, tradingPairKey } from './trading-markets.mjs';
+import { createStatementCache } from './db-cache.mjs';
 
 const DAY = 86_400_000;
 const POSITION_INTERVAL = 30_000, FUNDING_INTERVAL = 300_000;
@@ -149,18 +150,19 @@ function structure(legs) {
 }
 
 /** Account reads only. This service deliberately has no exchange mutation operation. */
-export function createTrading({ db, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000 } = {}) {
+export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000 } = {}) {
+  const stmt = createStatementCache(db);
   db.exec('BEGIN IMMEDIATE');
   try {
     db.exec("CREATE TABLE IF NOT EXISTS trading_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, verified_at TEXT, snapshot TEXT, account_mode TEXT NOT NULL DEFAULT 'standard')");
-    if (!db.prepare('PRAGMA table_info(trading_accounts)').all().some(column => column.name === 'account_mode')) {
+    if (!stmt.prepare('PRAGMA table_info(trading_accounts)').all().some(column => column.name === 'account_mode')) {
       db.exec("ALTER TABLE trading_accounts ADD COLUMN account_mode TEXT NOT NULL DEFAULT 'standard'; UPDATE trading_accounts SET account_mode='unified' WHERE exchange IN ('bybit','okx')");
     }
-    for (const exchange of EXCHANGES) db.prepare('INSERT OR IGNORE INTO trading_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, accountModeOf(exchange));
+    for (const exchange of EXCHANGES) stmt.prepare('INSERT OR IGNORE INTO trading_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, accountModeOf(exchange));
     db.exec('COMMIT');
   } catch (error) { db.exec('ROLLBACK'); throw error; }
-  const rowFor = exchange => db.prepare('SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
-  const storedRows = db.prepare('SELECT * FROM trading_accounts ORDER BY exchange').all();
+  const rowFor = exchange => stmt.prepare('SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
+  const storedRows = stmt.prepare('SELECT * FROM trading_accounts ORDER BY exchange').all();
   const cache = new Map(storedRows.map(row => [row.exchange, parseSnapshot(row)]));
   const hash = value => createHash('sha256').update(value || '').digest('hex');
   const fundingHash = funding => hash(JSON.stringify([funding.fetchedAt, funding.requestedEnd, funding.events, funding.coverage]));
@@ -186,7 +188,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     const serialized = JSON.stringify(next);
     if (serialized === previousSerialized) return true; // No change, skip DB write
 
-    if (!db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(serialized, exchange, revision).changes) return false;
+    if (!stmt.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(serialized, exchange, revision).changes) return false;
     cache.set(exchange, next);
     serializedCache.set(exchange, serialized); // Update serialized cache
     if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage || previous.funding.requestedEnd !== next.funding.requestedEnd) snapshotHashes.set(exchange, fundingHash(next.funding));
@@ -329,7 +331,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
     }
     db.exec('BEGIN IMMEDIATE');
     try {
-      const save = db.prepare('INSERT INTO trading_views_v2(pair_key,days,version,source_key,json) VALUES (?,?,?,?,?) ON CONFLICT(pair_key,days) DO UPDATE SET version=excluded.version,source_key=excluded.source_key,json=excluded.json');
+      const save = stmt.prepare('INSERT INTO trading_views_v2(pair_key,days,version,source_key,json) VALUES (?,?,?,?,?) ON CONFLICT(pair_key,days) DO UPDATE SET version=excluded.version,source_key=excluded.source_key,json=excluded.json');
       for (const value of next.values()) { const pairKey = tradingPairKey(value.exchanges); save.run(pairKey, value.period.days, TRADING_VIEW_VERSION, keys.get(pairKey), packTradingView(value)); }
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -337,13 +339,13 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   }
   function resetViews() {
     views.clear();
-    db.prepare('DELETE FROM trading_views_v2').run();
+    stmt.prepare('DELETE FROM trading_views_v2').run();
     invalidateViews(); flushViews();
   }
   function restoreViews() {
     const restored = new Map();
     for (const pair of TRADING_PAIRS) for (const days of [7, 30]) {
-      const pairKey = tradingPairKey(pair), saved = db.prepare('SELECT * FROM trading_views_v2 WHERE pair_key=? AND days=?').get(pairKey, days);
+      const pairKey = tradingPairKey(pair), saved = stmt.prepare('SELECT * FROM trading_views_v2 WHERE pair_key=? AND days=?').get(pairKey, days);
       if (!saved || saved.version !== TRADING_VIEW_VERSION || saved.source_key !== sourceKey(pair)) return false;
       try {
         const value = unpackTradingView(saved.json, days, now(), pair);
@@ -427,7 +429,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
       snapshot.positions = { ...snapshot.positions, ...positions, lastAttemptAt: iso(now()) };
       const encrypted = encrypt({ exchange, ...credentials });
       const serialized = JSON.stringify(snapshot);
-      const saved = db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), serialized, exchange, revision);
+      const saved = stmt.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=?,account_mode=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(encrypted, accountMode, iso(now()), serialized, exchange, revision);
       if (!saved.changes) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
       cancel(exchange); cache.set(exchange, snapshot);
       serializedCache.set(exchange, serialized); // Update serialization cache
@@ -444,7 +446,7 @@ export function createTrading({ db, encrypt, decrypt, clientFactory = createTrad
   function disconnect(exchange, revision) {
     exchangeOf(exchange); revisionOf(revision);
     if (rowFor(exchange).revision !== revision) throw new TradingError(409, '连接已被更新，请刷新后重试');
-    db.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=? AND revision=?').run(exchange, revision);
+    stmt.prepare('UPDATE trading_accounts SET revision=revision+1,credentials=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=? AND revision=?').run(exchange, revision);
     validations.get(exchange)?.abort(); cancel(exchange);
     const emptySnap = emptySnapshot(exchange);
     cache.set(exchange, emptySnap);

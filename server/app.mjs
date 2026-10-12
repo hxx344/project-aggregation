@@ -20,6 +20,7 @@ import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
 import { createUpdateStream } from './update-stream.mjs';
+import { createStatementCache } from './db-cache.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -70,16 +71,17 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);');
   if (process.platform !== 'win32') chmodSync(dbPath, 0o600);
   log.info({ dbPath, type: 'startup' }, '数据库初始化完成');
-  const getSetting = name => db.prepare('SELECT value FROM settings WHERE key=?').get(name)?.value;
+  const stmt = createStatementCache(db);
+  const getSetting = name => stmt.prepare('SELECT value FROM settings WHERE key=?').get(name)?.value;
   if (!getSetting('password')) {
     const password = initialPassword || randomBytes(18).toString('base64url');
     if (password.length < 12 || password.length > 1024) { db.close(); throw new Error('INITIAL_PASSWORD 必须为 12 至 1024 个字符'); }
-    db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('password', await passwordRecord(password));
+    stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('password', await passwordRecord(password));
     if (!initialPassword) log.info({ type: 'security' }, `工作台初始登录密码：${password}\n请保存此密码；只在首次启动显示。重置请运行 node server/setup.mjs --reset-password`);
   }
   if (!getSetting('seeded')) {
     db.exec('BEGIN IMMEDIATE');
-    try { for (const project of defaults) db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
+    try { for (const project of defaults) stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
   for (const id of ['crossex', 'variational', 'greeks']) {
     const marker = `seeded-${id}-v1`;
@@ -88,50 +90,50 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     try {
       const project = defaults.find(item => item.id === id);
       // Keep existing connections intact; the marker also preserves a later user deletion.
-      db.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
-      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run(marker, '1');
+      stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
+      stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run(marker, '1');
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
   if (!getSetting('updated-crossex-live-description-v1')) {
     db.exec('BEGIN IMMEDIATE');
     try {
-      const row = db.prepare('SELECT json FROM projects WHERE id=?').get('crossex');
+      const row = stmt.prepare('SELECT json FROM projects WHERE id=?').get('crossex');
       const project = row ? JSON.parse(row.json) : null;
       if (project?.description === '同币种跨交易所永续价差套利模拟') {
         project.description = defaults.find(item => item.id === 'crossex').description;
-        db.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'crossex');
+        stmt.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'crossex');
       }
-      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-crossex-live-description-v1', '1');
+      stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-crossex-live-description-v1', '1');
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
   if (!getSetting('updated-variational-description-v1')) {
     db.exec('BEGIN IMMEDIATE');
     try {
-      const row = db.prepare('SELECT json FROM projects WHERE id=?').get('variational');
+      const row = stmt.prepare('SELECT json FROM projects WHERE id=?').get('variational');
       const project = row ? JSON.parse(row.json) : null;
       if (project?.description === 'CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟') {
         project.description = defaults.find(item => item.id === 'variational').description;
-        db.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'variational');
+        stmt.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'variational');
       }
-      db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-variational-description-v1', '1');
+      stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-variational-description-v1', '1');
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
   const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64'); };
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
-  const trading = createTrading({ db, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs });
-  const execution = createTradingExecution({ db, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, isSessionActive: id => !!db.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
+  const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs });
+  const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
     readMaintenance: () => getSetting('updates-maintenance') === '1',
-    writeMaintenance: active => db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
+    writeMaintenance: active => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
-    writePendingPlanId: planId => db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-plan', planId || ''),
+    writePendingPlanId: planId => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-plan', planId || ''),
   });
   const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
-  const getProjects = () => db.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-  const rowFor = id => { const row = db.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
+  const getProjects = () => stmt.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+  const rowFor = id => { const row = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   const loginAttempts = new Map(); // IP-based rate limiting
   const accountLockouts = new Map(); // Account-level lockout: tracks failed password attempts
@@ -139,7 +141,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const ACCOUNT_LOCKOUT_DURATION = 30 * 60000; // 30 minutes lockout
   let closed = false;
   const updateStream = createUpdateStream({ readState: updates.status,
-    isSessionActive: id => !closed && !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+    isSessionActive: id => !closed && !!stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
   });
   let assetSync = null;
   const streams = new Map();
@@ -151,24 +153,24 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   function publishOverview() {
     let message, data;
     for (const [res, current] of streams) {
-      if (closed || !db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(current.id, Date.now())) { res.end(); streams.delete(res); continue; }
+      if (closed || !stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(current.id, Date.now())) { res.end(); streams.delete(res); continue; }
       if (res.writableLength > 256 * 1024) { res.destroy(); streams.delete(res); continue; }
       data ??= overview();
       if (current.encode) res.write(`data: ${JSON.stringify(current.encode(data))}\n\n`);
       else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
     }
   }
-  const projectRevision = id => { const row = db.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
+  const projectRevision = id => { const row = stmt.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
   const tradingImporter = createTradingImporter({ trading, request: tradingImportRequest, sourceTimeoutMs: tradingImportSourceTimeoutMs, importTimeoutMs: tradingImportTimeoutMs,
-    listTargets: () => db.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
   });
   const assetPositions = createAssetPositions({ request: assetPositionsRequest, cacheMs: assetPositionsCacheMs, timeoutMs: assetPositionsTimeoutMs, now: assetPositionsNow,
-    listTargets: () => db.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
   });
   const portal = createPortal({
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
     getProjectRevision: projectRevision,
-    isSessionValid: id => !!db.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+    isSessionValid: id => !!stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
     authenticateProject: async ({ projectId, revision, deadline, signal }) => {
       if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
       const row = rowFor(projectId);
@@ -185,7 +187,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
 
   function snapshot(project) {
     let state = states.get(project.id);
-    if (!state) { const saved = db.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); state = saved ? JSON.parse(saved.json) : null; }
+    if (!state) { const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); state = saved ? JSON.parse(saved.json) : null; }
     const base = { project, state: 'unconfigured', message: '等待首次读取数据', checkedAt: null, updatedAt: null, latencyMs: null, metrics: [], ...(project.adapter === 'asset' ? { sync: assetSync?.getStatus(project.id) || null } : {}) };
     if (!project.enabled) return { ...base, state: 'disabled', message: '项目已停用' };
     if (!project.apiUrl && project.adapter !== 'link') return { ...base, message: '请配置接口地址' };
@@ -194,7 +196,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     const diagnostics = snapshotDiagnostics(state, project);
     if (JSON.stringify(diagnostics) !== JSON.stringify(state.diagnostics)) {
       state = { ...state, diagnostics };
-      db.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(project.id, JSON.stringify(state));
+      stmt.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(project.id, JSON.stringify(state));
       states.set(project.id, state);
     }
     const { sourceDiagnostics, sourceState, sourceMessage, transportError, ...visible } = state;
@@ -211,22 +213,22 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     const controller = new AbortController(); controllers.add(controller);
     const run = (async () => {
       const start = Date.now(); const checkedAt = new Date(start).toISOString();
-      const saved = db.prepare('SELECT json FROM snapshots WHERE id=?').get(id);
+      const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(id);
       const previous = saved ? JSON.parse(saved.json) : null;
       try {
         const data = await summaryReader(project, decrypt(row.credentials), { deadline: start + timeoutMs, signal: controller.signal });
         if (closed) return null;
-        const latest = db.prepare('SELECT * FROM projects WHERE id=?').get(id);
+        const latest = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id);
         if (!latest) return null;
         if (latest.json !== row.json || latest.credentials !== row.credentials) return snapshot(publicProject(latest));
         const value = { state: data.state || (data.stale ? 'stale' : data.partial ? 'partial' : 'online'), message: data.message, checkedAt, lastSuccessAt: new Date(Date.now()).toISOString(), updatedAt: data.updatedAt || null, latencyMs: Date.now() - start, metrics: data.metrics, ...(data.staleAfterSeconds ? { staleAfterSeconds: data.staleAfterSeconds } : {}), ...(data.freshness === 'static' ? { freshness: 'static' } : {}), ...(data.trend ? { trend: data.trend } : {}) };
         value.sourceState = value.state; value.sourceMessage = value.message;
         if (Array.isArray(data.diagnostics)) value.sourceDiagnostics = data.diagnostics.map(({ id, kind, message }) => ({ id, kind, message }));
         value.diagnostics = snapshotDiagnostics({ ...value, diagnostics: states.get(id)?.diagnostics || previous?.diagnostics }, project);
-        db.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
+        stmt.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
       } catch (error) {
         if (closed) return null;
-        const latest = db.prepare('SELECT * FROM projects WHERE id=?').get(id);
+        const latest = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id);
         if (!latest) return null;
         if (latest.json !== row.json || latest.credentials !== row.credentials) return snapshot(publicProject(latest));
         const unauthorized = error instanceof UpstreamError && error.code === 'unauthorized';
@@ -234,7 +236,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         const message = error instanceof UpstreamError ? error.message : '无法读取项目摘要';
         const value = { ...(previous || {}), sourceState: previous?.sourceState || (hasData ? previous.state : 'online'), sourceMessage: previous?.sourceMessage || previous?.message, lastSuccessAt: hasData ? previous.lastSuccessAt || previous.checkedAt : null, transportError: { code: unauthorized ? 'unauthorized' : 'connection', message }, state: unauthorized ? 'unauthorized' : hasData ? 'stale' : 'offline', message: `${message}${hasData ? '；保留上次成功数据' : ''}`, checkedAt, latencyMs: Date.now() - start, updatedAt: previous?.updatedAt || null, metrics: previous?.metrics || [] };
         value.diagnostics = snapshotDiagnostics({ ...value, diagnostics: states.get(id)?.diagnostics || value.diagnostics }, project);
-        db.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
+        stmt.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
       }
       return snapshot(publicProject(rowFor(id)));
     })().finally(() => { pending.delete(id); controllers.delete(controller); if (!closed) publishOverview(); });
@@ -263,7 +265,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   function session(req) {
     const cookie = (req.headers.cookie || '').split(';').map(part => part.trim()).find(part => part.startsWith('hub_session='))?.slice(12);
     if (!cookie || !/^[A-Za-z0-9_-]{43}$/.test(cookie)) return null;
-    const row = db.prepare('SELECT * FROM sessions WHERE id=? AND expires>?').get(hash(cookie), Date.now());
+    const row = stmt.prepare('SELECT * FROM sessions WHERE id=? AND expires>?').get(hash(cookie), Date.now());
     return row || null;
   }
   function sameOrigin(req) {
@@ -335,19 +337,19 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       accountLockouts.delete(accountId);
       if (loginAttempts.get(ip) === attempt) { attempt.count -= 1; if (attempt.count === 0) loginAttempts.delete(ip); }
 
-      db.prepare('DELETE FROM sessions WHERE expires<=?').run(now);
+      stmt.prepare('DELETE FROM sessions WHERE expires<=?').run(now);
       // Security: Always delete old session and generate new ID on login to prevent session fixation
-      if (current) db.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
+      if (current) stmt.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
       // Always generate a fresh session ID and CSRF token after successful authentication
       const raw = token(); const csrf = token();
-      db.prepare('INSERT INTO sessions(id,csrf,expires) VALUES (?,?,?)').run(hash(raw), csrf, now + SESSION_AGE);
+      stmt.prepare('INSERT INTO sessions(id,csrf,expires) VALUES (?,?,?)').run(hash(raw), csrf, now + SESSION_AGE);
       send(res, 200, { authenticated: true, csrfToken: csrf }, { 'Set-Cookie': `hub_session=${raw}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_AGE / 1000}${secureCookies ? '; Secure' : ''}` }); return;
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
     if (pathname === '/api/logout' && req.method === 'POST') {
       log.info({ ip: req.socket.remoteAddress, type: 'auth_logout' }, '用户登出');
-      db.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
+      stmt.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
       publishOverview();
       updateStream.revalidate();
       send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` });
@@ -429,9 +431,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       const body = await bodyOf(req);
       if (getProjects().length >= MAX_PROJECTS) throw new HttpError(400, `最多接入 ${MAX_PROJECTS} 个项目`);
       const value = validateProject(body); value.id = body.id || randomBytes(8).toString('hex');
-      if (db.prepare('SELECT id FROM projects WHERE id=?').get(value.id)) throw new HttpError(409, '项目标识已存在');
+      if (stmt.prepare('SELECT id FROM projects WHERE id=?').get(value.id)) throw new HttpError(409, '项目标识已存在');
       const credentials = body.password ? encrypt({ password: body.password, username: body.username || '' }) : null;
-      db.prepare('INSERT INTO projects(id,json,credentials) VALUES (?,?,?)').run(value.id, JSON.stringify(value), credentials);
+      stmt.prepare('INSERT INTO projects(id,json,credentials) VALUES (?,?,?)').run(value.id, JSON.stringify(value), credentials);
       send(res, 201, { project: publicProject(rowFor(value.id)) }); void check(value.id).catch(() => {}); if (assetSyncIntervalMs > 0) void assetSync.refresh(); return;
     }
     const match = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)(\/(?:check|launch|sync))?$/);
@@ -454,14 +456,14 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
         const previous = boundaryChanged || body.clearCredentials ? null : decrypt(row.credentials);
         const credentials = body.password ? encrypt({ password: body.password, username: body.username ?? previous?.username ?? '' }) : previous ? encrypt({ ...previous, username: body.username ?? previous.username }) : null;
         const inFlight = pending.get(id);
-        db.prepare('UPDATE projects SET json=?,credentials=? WHERE id=?').run(JSON.stringify(value), credentials, id);
+        stmt.prepare('UPDATE projects SET json=?,credentials=? WHERE id=?').run(JSON.stringify(value), credentials, id);
         assetPositions.invalidate(id);
-        if (boundaryChanged || prior.enabled !== value.enabled || prior.staleAfterSeconds !== value.staleAfterSeconds || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) db.prepare('DELETE FROM snapshots WHERE id=?').run(id);
+        if (boundaryChanged || prior.enabled !== value.enabled || prior.staleAfterSeconds !== value.staleAfterSeconds || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) stmt.prepare('DELETE FROM snapshots WHERE id=?').run(id);
         states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { project: publicProject(rowFor(id)) });
-        if (inFlight) void inFlight.finally(() => { if (!closed && db.prepare('SELECT id FROM projects WHERE id=?').get(id)) void check(id).catch(() => {}); }).catch(() => {});
+        if (inFlight) void inFlight.finally(() => { if (!closed && stmt.prepare('SELECT id FROM projects WHERE id=?').get(id)) void check(id).catch(() => {}); }).catch(() => {});
         else void check(id).catch(() => {}); return;
       }
-      if (!match[2] && req.method === 'DELETE') { db.prepare('DELETE FROM projects WHERE id=?').run(id); assetPositions.invalidate(id); states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
+      if (!match[2] && req.method === 'DELETE') { stmt.prepare('DELETE FROM projects WHERE id=?').run(id); assetPositions.invalidate(id); states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
     }
     throw new HttpError(404, '接口不存在');
   }
@@ -493,7 +495,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
   assetSync = createAssetSync({
-    listTargets: () => db.prepare('SELECT * FROM projects').all().map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => stmt.prepare('SELECT * FROM projects').all().map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
     intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
     autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader,
     onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
@@ -511,7 +513,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   return {
     server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
-    async resetPassword() { const password = randomBytes(18).toString('base64url'); db.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
+    async resetPassword() { const password = randomBytes(18).toString('base64url'); stmt.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
     async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

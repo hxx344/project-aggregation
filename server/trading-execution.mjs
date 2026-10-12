@@ -17,7 +17,7 @@ const modeOf = (exchange, mode) => {
 };
 
 /** Durable, explicit live execution. Read endpoints never submit exchange requests. */
-export function createTradingExecution({ db, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true } = {}) {
+export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true } = {}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT);
     CREATE TABLE IF NOT EXISTS execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL);
@@ -29,7 +29,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     CREATE TABLE IF NOT EXISTS execution_locks (resource TEXT PRIMARY KEY, job_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires INTEGER NOT NULL);
   `);
-  for (const exchange of EXECUTION_EXCHANGES) db.prepare('INSERT OR IGNORE INTO execution_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified');
+  for (const exchange of EXECUTION_EXCHANGES) stmt.prepare('INSERT OR IGNORE INTO execution_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified');
   const owner = randomUUID(), clients = new Map(EXECUTION_EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const pending = new Set(), controllers = new Set(), busyJobs = new Set(), connecting = new Set();
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
@@ -40,24 +40,24 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
   const transaction = operation => { db.exec('BEGIN IMMEDIATE'); try { const result = operation(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; } };
   const accountRow = exchange => {
     if (!EXECUTION_EXCHANGES.includes(exchange)) throw new ExecutionError(404, '交易所不存在');
-    return db.prepare('SELECT * FROM execution_accounts WHERE exchange=?').get(exchange);
+    return stmt.prepare('SELECT * FROM execution_accounts WHERE exchange=?').get(exchange);
   };
-  const jobs = () => db.prepare('SELECT json FROM execution_jobs').all().map(row => JSON.parse(row.json));
-  const jobFor = id => { const row = db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(id); if (!row) throw new ExecutionError(404, '执行任务不存在'); return JSON.parse(row.json); };
+  const jobs = () => stmt.prepare('SELECT json FROM execution_jobs').all().map(row => JSON.parse(row.json));
+  const jobFor = id => { const row = stmt.prepare('SELECT json FROM execution_jobs WHERE id=?').get(id); if (!row) throw new ExecutionError(404, '执行任务不存在'); return JSON.parse(row.json); };
   const saveJob = job => {
     job.updatedAt = iso(now());
-    const result = db.prepare('INSERT INTO execution_jobs(id,json) SELECT ?,? WHERE EXISTS(SELECT 1 FROM execution_lease WHERE id=1 AND owner=? AND expires>?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(job.id, JSON.stringify(job), owner, now());
+    const result = stmt.prepare('INSERT INTO execution_jobs(id,json) SELECT ?,? WHERE EXISTS(SELECT 1 FROM execution_lease WHERE id=1 AND owner=? AND expires>?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(job.id, JSON.stringify(job), owner, now());
     if (!result.changes) lostLease();
     return job;
   };
-  const orders = jobId => db.prepare('SELECT json FROM execution_orders WHERE job_id=? ORDER BY rowid').all(jobId).map(row => JSON.parse(row.json));
+  const orders = jobId => stmt.prepare('SELECT json FROM execution_orders WHERE job_id=? ORDER BY rowid').all(jobId).map(row => JSON.parse(row.json));
   const saveOrder = order => {
-    const result = db.prepare('INSERT INTO execution_orders(id,job_id,json) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM execution_lease WHERE id=1 AND owner=? AND expires>?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(order.localId, order.jobId, JSON.stringify(order), owner, now());
+    const result = stmt.prepare('INSERT INTO execution_orders(id,job_id,json) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM execution_lease WHERE id=1 AND owner=? AND expires>?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(order.localId, order.jobId, JSON.stringify(order), owner, now());
     if (!result.changes) lostLease();
   };
-  const orderFor = id => { const row = db.prepare('SELECT json FROM execution_orders WHERE id=?').get(id); return row ? JSON.parse(row.json) : null; };
+  const orderFor = id => { const row = stmt.prepare('SELECT json FROM execution_orders WHERE id=?').get(id); return row ? JSON.parse(row.json) : null; };
   const event = (job, message) => { job.events.push({ time: iso(now()), message }); job.events = job.events.slice(-80); };
-  const locked = exchange => !!db.prepare('SELECT 1 FROM execution_locks WHERE resource LIKE ? LIMIT 1').get(`${exchange}:%`);
+  const locked = exchange => !!stmt.prepare('SELECT 1 FROM execution_locks WHERE resource LIKE ? LIMIT 1').get(`${exchange}:%`);
   function pause(id, reason, target = 'paused') {
     const job = jobFor(id);
     if (FINAL.has(job.status)) return;
@@ -70,23 +70,23 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     if (closed || retired) return false;
     const wasLeader = leader;
     leader = transaction(() => {
-      const row = db.prepare('SELECT * FROM execution_lease WHERE id=1').get();
+      const row = stmt.prepare('SELECT * FROM execution_lease WHERE id=1').get();
       // One instance owns at most one continuous lease. Never revive callbacks
       // from an earlier lease after another process has reconciled their intents.
       if (heldLease && (!row || row.owner !== owner || row.expires <= now())) { retired = true; return false; }
       if (row && row.owner !== owner && row.expires > now()) return false;
-      db.prepare('INSERT INTO execution_lease(id,owner,expires) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires=excluded.expires').run(owner, now() + LEASE_TTL);
+      stmt.prepare('INSERT INTO execution_lease(id,owner,expires) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires=excluded.expires').run(owner, now() + LEASE_TTL);
       heldLease = true;
       if (!wasLeader || (row && row.expires <= now())) {
         for (const job of jobs()) if (ACTIVE.has(job.status)) pause(job.id, '服务恢复：已暂停后续下单，正在核对并撤销未结束委托');
-        for (const job of jobs()) if (FINAL.has(job.status)) db.prepare('DELETE FROM execution_locks WHERE job_id=?').run(job.id);
+        for (const job of jobs()) if (FINAL.has(job.status)) stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(job.id);
       }
       return true;
     });
     return leader;
   }
   function requireLease() {
-    const row = db.prepare('SELECT * FROM execution_lease WHERE id=1').get();
+    const row = stmt.prepare('SELECT * FROM execution_lease WHERE id=1').get();
     if (retired || heldLease && (!row || row.owner !== owner || row.expires <= now())) lostLease();
     if (closed || !leader || row?.owner !== owner || row.expires <= now()) throw new ExecutionError(503, '执行服务暂未取得运行锁，请稍后重试');
   }
@@ -148,7 +148,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       const credentials = { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
       const result = await call(async signal => { const verified = await client.verify(credentials, { accountMode: mode, signal }); const account = await client.account(credentials, { accountMode: mode, signal }); return { verified, account }; });
       checkSession(session); checkAvailable(exchange, body.revision);
-      db.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=?,account_mode=?,identity=?,key_label=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(
+      stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=?,account_mode=?,identity=?,key_label=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(
         encrypt({ purpose: 'execution', exchange, ...credentials }), mode, result.verified.identity ?? null, body.apiKey.slice(-4), iso(now()), JSON.stringify({ at: iso(now()), account: result.account }), exchange, body.revision);
       return state();
     } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
@@ -156,7 +156,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
   }
   function disconnect(exchange, body, session) {
     exactKeys(body, ['revision']); checkSession(session); checkAvailable(exchange, body.revision);
-    db.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
+    stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
     return state();
   }
   async function collect(legs) {
@@ -169,7 +169,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
       snapshots.set(exchange, account); connections.set(exchange, connection(ctx.row));
-      db.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify({ account, at: iso(now()) }), exchange, ctx.row.revision);
+      stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify({ account, at: iso(now()) }), exchange, ctx.row.revision);
     }));
     await Promise.all(legs.map(async leg => {
       const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })); markets.set(`${leg.exchange}:${leg.symbol}`, value);
@@ -188,32 +188,32 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       intent = { ...job.plan, batchCount: Math.max(1, job.plan.batchCount - job.batchIndex), legs: view.legs.filter(leg => compareDecimals(leg.remainingQuantity, '0') > 0).map(leg => ({ exchange: leg.exchange, symbol: leg.symbol, side: leg.side, quantity: leg.remainingQuantity, stopPrice: leg.stopPrice })) };
     } else intent = normalizeIntent(body);
     for (const leg of intent.legs) {
-      const lock = db.prepare('SELECT job_id FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`);
+      const lock = stmt.prepare('SELECT job_id FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`);
       if (lock && lock.job_id !== resumeJobId) throw new ExecutionError(409, '所选合约已有未结束任务');
     }
     let collected;
     try { collected = await collect(intent.legs); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
     const plan = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now());
     const value = { ...plan, id: randomUUID(), expiresAt: iso(now() + PREVIEW_TTL), resumeJobId, connections: [...collected.connections.values()] };
-    writable(); checkSession(session); db.prepare('DELETE FROM execution_previews WHERE expires<? AND consumed IS NULL').run(now());
-    db.prepare('INSERT INTO execution_previews(id,session,expires,json) VALUES (?,?,?,?)').run(value.id, session, now() + PREVIEW_TTL, JSON.stringify(value));
+    writable(); checkSession(session); stmt.prepare('DELETE FROM execution_previews WHERE expires<? AND consumed IS NULL').run(now());
+    stmt.prepare('INSERT INTO execution_previews(id,session,expires,json) VALUES (?,?,?,?)').run(value.id, session, now() + PREVIEW_TTL, JSON.stringify(value));
     return value;
   }
   function start(body, session) {
     exactKeys(body, ['previewId', 'requestId', 'confirmLive']); writable(); checkSession(session);
     if (body.confirmLive !== true || typeof body.previewId !== 'string' || !/^[0-9a-f-]{36}$/i.test(body.requestId)) throw new ExecutionError(400, '请从有效预览明确确认实盘执行');
     return transaction(() => {
-      const request = db.prepare('SELECT * FROM execution_requests WHERE id=?').get(body.requestId);
+      const request = stmt.prepare('SELECT * FROM execution_requests WHERE id=?').get(body.requestId);
       if (request) {
         if (request.preview_id !== body.previewId || request.session !== session) throw new ExecutionError(409, '请求标识已被使用');
         return state();
       }
-      const record = db.prepare('SELECT * FROM execution_previews WHERE id=?').get(body.previewId);
+      const record = stmt.prepare('SELECT * FROM execution_previews WHERE id=?').get(body.previewId);
       if (!record || record.session !== session || record.expires <= now() || record.consumed) throw new ExecutionError(409, '预览已过期或已提交，请重新预览');
       const plan = JSON.parse(record.json);
       for (const leg of plan.legs) {
         context(leg.exchange, leg.accountRevision);
-        const lock = db.prepare('SELECT job_id FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`);
+        const lock = stmt.prepare('SELECT job_id FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`);
         if (lock && lock.job_id !== plan.resumeJobId) throw new ExecutionError(409, '所选合约已有未结束任务');
       }
       let job;
@@ -225,9 +225,9 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       } else job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [] };
       Object.assign(job, { status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) });
       event(job, plan.resumeJobId ? '已确认剩余数量，等待重新核对账户与盘口' : '已确认实盘预览，等待核对账户与盘口'); saveJob(job);
-      for (const leg of plan.legs) db.prepare('INSERT OR IGNORE INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
-      db.prepare('UPDATE execution_previews SET consumed=? WHERE id=?').run(job.id, plan.id);
-      db.prepare('INSERT INTO execution_requests(id,preview_id,job_id,session) VALUES (?,?,?,?)').run(body.requestId, plan.id, job.id, session);
+      for (const leg of plan.legs) stmt.prepare('INSERT OR IGNORE INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
+      stmt.prepare('UPDATE execution_previews SET consumed=? WHERE id=?').run(job.id, plan.id);
+      stmt.prepare('INSERT INTO execution_requests(id,preview_id,job_id,session) VALUES (?,?,?,?)').run(body.requestId, plan.id, job.id, session);
       return state();
     });
   }
@@ -338,7 +338,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
     if (all.every(order => order.settled)) {
       latest.status = latest.stopTarget === 'stopped' ? 'stopped' : 'paused';
       event(latest, latest.status === 'stopped' ? '所有已知委托已结束；任务停止，已成交仓位保留' : '余单已核对结束；保留已成交仓位，继续需重新预览剩余数量');
-      transaction(() => { saveJob(latest); if (latest.status === 'stopped') db.prepare('DELETE FROM execution_locks WHERE job_id=?').run(job.id); });
+      transaction(() => { saveJob(latest); if (latest.status === 'stopped') stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(job.id); });
     } else {
       latest.status = 'attention'; latest.reason = '仍有委托结果未确认；已停止后续下单，请核对策略编号或重试撤单'; saveJob(latest);
     }
@@ -382,7 +382,7 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       if (remaining.every(item => item.quantity === '0') && all.every(order => order.settled)) {
         job.batchIndex += 1;
         event(job, `第 ${job.batchIndex} / ${job.plan.batchCount} 批全部成交且委托已结束`);
-        if (job.batchIndex >= job.plan.batchCount) { job.status = 'completed'; job.reason = null; transaction(() => { saveJob(job); db.prepare('DELETE FROM execution_locks WHERE job_id=?').run(id); }); return; }
+        if (job.batchIndex >= job.plan.batchCount) { job.status = 'completed'; job.reason = null; transaction(() => { saveJob(job); stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(id); }); return; }
         job.nextBatchAt = now() + job.plan.batchIntervalMs; saveJob(job); return;
       }
       if (now() < job.nextBatchAt) return;
@@ -451,6 +451,6 @@ export function createTradingExecution({ db, encrypt, decrypt, clientFactory = c
       try {
         await Promise.allSettled([...(ticking ? [ticking] : []), ...pending]);
         if (ownsLease) await Promise.allSettled(jobs().filter(job => job.status === 'stopping').map(job => runJob(job.id)));
-      } finally { clearTimeout(timeout); closed = true; db.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner); }
+      } finally { clearTimeout(timeout); closed = true; stmt.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner); }
     } };
 }
