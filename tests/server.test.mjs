@@ -107,6 +107,23 @@ test('authentication gates private data, enforces Origin/CSRF, and logout revoke
   assert.equal((await f.request('/api/projects')).status, 401);
 });
 
+test('local route CSP only permits the fixed helper for the supported local HTTP workbench', async t => {
+  for (const [host, secureCookies, allowed] of [
+    ['hub.localhost:3100', false, true], ['hub.localhost:3100', true, false],
+    ['hub.localhost:3102', false, false], ['hub.example.com', false, false],
+  ]) {
+    const f = await fixture(t, { publicOrigin: `${secureCookies ? 'https' : 'http'}://${host}`, secureCookies });
+    const response = await new Promise((resolve, reject) => {
+      http.get(`${f.origin}/api/health`, { headers: { Host: host } }, res => { res.resume(); res.on('end', () => resolve(res)); }).on('error', reject);
+    });
+    assert.equal(response.statusCode, 200);
+    const csp = response.headers['content-security-policy'];
+    const connect = csp.split(';').map(part => part.trim()).find(part => part.startsWith('connect-src'));
+    assert.equal(connect, allowed ? "connect-src 'self' http://127.0.0.1:3101" : "connect-src 'self'");
+    assert.match(csp, /script-src 'self';/);
+  }
+});
+
 test('login lasts seven days across restarts and expires without sliding renewal', async t => {
   const f = await fixture(t);
   const loggedAt = Date.now(); let now = loggedAt;
