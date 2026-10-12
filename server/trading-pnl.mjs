@@ -26,7 +26,7 @@ function migrateSamples(db) {
   db.exec('SAVEPOINT trading_pnl_v2_migration');
   try {
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples (time INTEGER NOT NULL, binance_revision INTEGER NOT NULL, bybit_revision INTEGER NOT NULL, binance_at INTEGER, bybit_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (binance_revision, bybit_revision, time))');
-    db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples_v2 (pair_key TEXT NOT NULL, revision_key TEXT NOT NULL, time INTEGER NOT NULL, first_at INTEGER, second_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (pair_key, revision_key, time))');
+    db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples_v2 (pair_key TEXT NOT NULL, revision_key TEXT NOT NULL, time INTEGER NOT NULL, first_at INTEGER, second_at INTEGER, unrealized_pnl TEXT, cumulative_funding_pnl TEXT, PRIMARY KEY (pair_key, revision_key, time))');
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_migrations (id TEXT PRIMARY KEY)');
     if (!db.prepare('SELECT id FROM trading_pnl_migrations WHERE id=?').get('pair_samples_v2')) {
       const insert = db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)');
@@ -84,7 +84,12 @@ export function createTradingPnl(db) {
     const previous = latestRow(pair);
     if (previous && (time <= previous.time || Math.floor(time / PNL_INTERVAL) === Math.floor(previous.time / PNL_INTERVAL) && (previous.unrealized_pnl !== null) === good)) return false;
     const value = good ? addDecimals(rows.map(row => row.unrealizedPnl)) : null;
-    db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)').run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value);
+
+    // Calculate cumulative funding PnL up to this time
+    const events = entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) <= time).sort((a, b) => stamp(a.time) - stamp(b.time));
+    const cumulativeFunding = events.reduce((sum, event) => addDecimals([sum, event.amount]), '0');
+
+    db.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl,cumulative_funding_pnl) VALUES (?,?,?,?,?,?,?)').run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value, cumulativeFunding);
     db.prepare('DELETE FROM trading_pnl_samples_v2 WHERE pair_key=? AND (time < ? OR revision_key != ?)').run(pair.pairKey, current - 31 * DAY, pair.revisionKey);
     return true;
   }
@@ -94,16 +99,15 @@ export function createTradingPnl(db) {
     const connected = entries.every(({ row }) => !!row.credentials);
     const records = connected ? db.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time').all(pair.pairKey, pair.revisionKey, start, current) : [];
     const first = connected ? db.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND unrealized_pnl IS NOT NULL').get(pair.pairKey, pair.revisionKey).time : null;
-    const events = entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) >= start).sort((a, b) => stamp(a.time) - stamp(b.time));
-    let eventIndex = 0, accumulated = '0';
+
     const points = [], gap = time => ({ time, unrealizedPnl: null, fundingPnl: null, totalPnl: null });
     for (const row of records) {
       const previous = points.at(-1);
       if (previous && row.time - previous.time > PNL_INTERVAL * 2.5) points.push(gap(previous.time + PNL_INTERVAL));
-      while (eventIndex < events.length && stamp(events[eventIndex].time) < row.time) accumulated = addDecimals([accumulated, events[eventIndex++].amount]);
+
       const known = entries.every(({ snapshot }) => snapshot.funding.coverage.some(range => range.start <= start && range.end >= row.time));
       const unrealizedPnl = row.unrealized_pnl === null ? null : decimal(row.unrealized_pnl);
-      const fundingPnl = known ? accumulated : null;
+      const fundingPnl = known && row.cumulative_funding_pnl !== null ? decimal(row.cumulative_funding_pnl) : null;
       points.push({ time: row.time, unrealizedPnl, fundingPnl, totalPnl: unrealizedPnl !== null && fundingPnl !== null ? addDecimals([unrealizedPnl, fundingPnl]) : null });
     }
     if (points.length && current - points.at(-1).time > MAX_AGE) points.push(gap(current));
