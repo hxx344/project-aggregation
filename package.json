@@ -1,6 +1,6 @@
 {
   "name": "project-aggregation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "统一项目工作台，聚合交易状态、市场监控与资产账本",
