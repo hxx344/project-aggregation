@@ -5,6 +5,31 @@ import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
+// DNS cache to reduce redundant lookups for frequently accessed domains
+const dnsCache = new Map(); // hostname -> { addresses, expiresAt }
+const DNS_TTL = 30_000; // 30 seconds
+
+async function cachedLookup(hostname) {
+  const now = Date.now();
+  const cached = dnsCache.get(hostname);
+
+  if (cached && cached.expiresAt > now) {
+    return cached.addresses;
+  }
+
+  const addresses = await lookup(hostname, { all: true });
+  dnsCache.set(hostname, { addresses, expiresAt: now + DNS_TTL });
+
+  // Clean up expired entries periodically (simple strategy)
+  if (dnsCache.size > 100) {
+    for (const [key, value] of dnsCache.entries()) {
+      if (value.expiresAt <= now) dnsCache.delete(key);
+    }
+  }
+
+  return addresses;
+}
+
 export class UpstreamError extends Error {
   constructor(code, message, statusCode) { super(message); this.code = code; if (statusCode !== undefined) this.statusCode = statusCode; }
 }
@@ -56,7 +81,7 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
     // Security: Resolve DNS and validate addresses before making the request
     // This prevents DNS rebinding attacks by pinning the resolved address
     const addresses = await Promise.race([
-      lookup(hostname, { all: true }),
+      cachedLookup(hostname),
       new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new UpstreamError('timeout', '服务响应超时')), { once: true })),
     ]);
     if (!addresses.length || addresses.some(({ address }) => blockedAddress(address))) throw new UpstreamError('invalid', '服务地址解析到不允许访问的地址');
