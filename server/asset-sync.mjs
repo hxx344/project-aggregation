@@ -87,6 +87,7 @@ export function createAssetSync({
           controller.signal.addEventListener('abort', aborted, { once: true });
         });
         timeout = setTimeout(() => controller.abort(), timeLimit);
+        timeout.unref?.(); // Allow process to exit gracefully
         result = await Promise.race([
           Promise.resolve().then(() => {
             if (controller.signal.aborted || closed) throw new UpstreamError('timeout', '资产同步已停止');
