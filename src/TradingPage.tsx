@@ -7,6 +7,12 @@ import './trading-center.css';
 const OilTradingPage = lazy(() => import('./OilTradingPage'));
 type TradingSection = 'positions' | 'oil';
 
+// Preload trigger for hover optimization
+let preloadPromise: Promise<any> | null = null;
+function preloadOilPage() {
+  if (!preloadPromise) preloadPromise = import('./OilTradingPage');
+}
+
 function readSection(): TradingSection {
   const params = new URLSearchParams(location.search);
   const section = params.get('tradingSection');
@@ -39,7 +45,7 @@ export default function TradingPage({ cache, onExpired, onProject, navigationSea
   return <div className="trading-center">
     <nav className="trading-sections" aria-label="交易模块">
       <button type="button" aria-current={section === 'positions' ? 'page' : undefined} onClick={() => select('positions')}><Wallet size={17} />交易所仓位</button>
-      <button type="button" aria-current={section === 'oil' ? 'page' : undefined} onClick={() => select('oil')}><Gauge size={17} />原油四腿套利</button>
+      <button type="button" aria-current={section === 'oil' ? 'page' : undefined} onClick={() => select('oil')} onMouseEnter={preloadOilPage}><Gauge size={17} />原油四腿套利</button>
     </nav>
     {section === 'positions' ? <TradingPositions onExpired={onExpired} onProject={onProject} navigationSearch={navigationSearch} /> : <Suspense fallback={<div className="positions-empty" role="status"><LoaderCircle className="spin" size={22} /><p>正在加载原油套利…</p></div>}><OilTradingPage cache={cache} onExpired={onExpired} /></Suspense>}
   </div>;
