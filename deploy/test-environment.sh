@@ -108,9 +108,21 @@ printf 'Environment rollback regression checks passed.\n'
 )
 printf 'Activation record failures preserve the migration rollback boundary.\n'
 
+# A conditional caller disables errexit in its functions. A partial write must
+# still fail explicitly without replacing the previous durable record.
+printf 'previous\n' > "$test_root/durable-record"
+cp "$test_root/durable-record" "$test_root/expected-record"
+(
+  printf() { builtin printf 'partial'; return 28; }
+  mv() { : > "$test_root/record-move-called"; command mv "$@"; }
+  if atomic_record "$test_root/durable-record" candidate; then echo 'Partial record write was accepted' >&2; exit 1; fi
+  [[ ! -e "$test_root/record-move-called" ]]
+  cmp -s "$test_root/expected-record" "$test_root/durable-record"
+)
+
 # A later record/commit failure must restore both the running environment and
 # the durable snapshot, even though remember_environment already succeeded.
-for fail_record in python migration; do
+for fail_record in python migration migration-ack historic-commit; do
   (
     test_root="$test_root/commitpoint-$fail_record"
     APP_DIR="$test_root/application"
@@ -133,19 +145,39 @@ for fail_record in python migration; do
     module_migration_helper=fixture-migration.py
     DATA_PATH="$test_root/data"
     GREEKS_PYTHON_PATH=fixture-python
+    printf 'pending\n' > "$test_root/migration-status"
     atomic_record() { [[ "$fail_record" != python ]] || return 1; printf '%s\n' "$2" > "$1"; }
     python3() {
       printf '%s\n' "$2" >> "$test_root/migration.calls"
-      [[ "$2" != commit || "$fail_record" != migration ]]
+      case "$2" in
+        status) cat "$test_root/migration-status" ;;
+        commit)
+          if [[ "$fail_record" == migration-ack ]]; then printf 'committed\n' > "$test_root/migration-status"; return 1; fi
+          [[ "$fail_record" != migration ]]
+          ;;
+      esac
     }
-    if finish_activation; then echo 'Activation failure was ignored' >&2; exit 1; fi
+    if [[ "$fail_record" == historic-commit ]]; then
+      # An ordinary upgrade fails health before this attempt starts committing.
+      printf 'committed\n' > "$test_root/migration-status"
+      [[ "$migration_commit_started" == 0 ]]
+    else
+      if finish_activation; then echo 'Activation failure was ignored' >&2; exit 1; fi
+      cmp -s "$ENV_FILE" "$APP_DIR/.last-successful.env"
+    fi
     [[ "$activation_started" == 1 ]]
-    cmp -s "$ENV_FILE" "$APP_DIR/.last-successful.env"
     set +e
     ( rollback 37 )
     rollback_status=$?
     set -e
     [[ "$rollback_status" == 37 ]]
+    if [[ "$fail_record" == migration-ack ]]; then
+      [[ ! -e "$test_root/systemctl.calls" && ! -e "$test_root/current.target" ]]
+      cmp -s "$test_root/expected-candidate.env" "$ENV_FILE"
+      cmp -s "$test_root/expected-candidate.env" "$APP_DIR/.last-successful.env"
+      if grep -q '^rollback$' "$test_root/migration.calls"; then echo 'Committed topology was rolled back' >&2; exit 1; fi
+      exit 0
+    fi
     cmp -s "$test_root/expected-good.env" "$ENV_FILE"
     cmp -s "$test_root/expected-good.env" "$APP_DIR/.last-successful.env"
     grep -q '^rollback$' "$test_root/migration.calls"

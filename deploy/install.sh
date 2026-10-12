@@ -24,6 +24,7 @@ PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-ci}
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
 RUNTIME_DEPENDENCIES=0
 activation_started=0
+migration_commit_started=0
 old_release=
 old_unit_backup=
 old_environment=
@@ -249,6 +250,19 @@ rollback() {
   trap - ERR INT TERM
   set +e
   if [[ "$activation_started" == 1 ]]; then
+    # A signal/error can arrive after the journal commits but before Python
+    # returns. Check only this attempt's commit window, never a historic receipt.
+    if [[ "$migration_commit_started" == 1 && -n "$module_migration_helper" ]]; then
+      local migration_status
+      if ! migration_status=$(python3 "$module_migration_helper" status --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json"); then
+        log '无法确认迁移提交结果；保留当前服务，请检查迁移日志后重试。'
+        exit "$exit_code"
+      fi
+      if [[ "$migration_status" == committed ]]; then
+        log '模块迁移已提交，保留已通过健康检查的新服务；重试安装可补齐剩余记录。'
+        exit "$exit_code"
+      fi
+    fi
     # Stop every embedded writer before re-enabling its standalone predecessor.
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     if [[ -n "$module_migration_helper" ]]; then
@@ -340,8 +354,8 @@ run_as_service() {
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
 atomic_record() {
   local destination=$1 value=$2 temporary="${1}.new.$$"
-  printf '%s\n' "$value" > "$temporary"
-  mv -f -- "$temporary" "$destination"
+  printf '%s\n' "$value" > "$temporary" || return 1
+  mv -f -- "$temporary" "$destination" || return 1
 }
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
@@ -822,6 +836,7 @@ prepare_greeks_runtime() {
 }
 migrate_embedded_modules() {
   module_migration_helper="$1/deploy/migrate-modules.py"
+  migration_commit_started=0
   # The migration helper uses a root-only journal and never modifies old data.
   # Stop the hub first so neither old nor new in-process writers race the copy.
   if systemctl is-active --quiet "$SERVICE"; then systemctl stop "$SERVICE"; fi
@@ -832,6 +847,7 @@ finish_activation() {
   remember_environment || return 1
   atomic_record "$APP_DIR/.greeks-python-path" "$GREEKS_PYTHON_PATH" || return 1
   if [[ -n "$module_migration_helper" ]]; then
+    migration_commit_started=1
     python3 "$module_migration_helper" commit --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json" || return 1
   fi
   # A committed migration is the topology commit point. Later bookkeeping must

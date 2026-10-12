@@ -91,6 +91,17 @@ class MigrationTests(unittest.TestCase):
         self.migration.rollback()
         self.assertEqual((existing / 'config.json').read_text(), 'existing')
 
+    def test_status_reads_durable_receipt_without_service_changes(self):
+        self.assertEqual(self.migration.status(), 'absent')
+        self.migration.begin()
+        before = list(self.calls)
+        self.assertEqual(self.migration.status(), 'pending')
+        self.migration.commit()
+        self.assertEqual(self.migration.status(), 'committed')
+        self.migration.rollback()
+        self.assertEqual(self.migration.status(), 'committed')
+        self.assertEqual(self.calls, before)
+
     def test_incomplete_encrypted_store_is_rejected_and_can_be_recovered(self):
         self.put('var/lib/gate-crossex-arbitrage/crossex.sqlite', 'encrypted-data')
         with self.assertRaisesRegex(ValueError, 'credentials.key'):

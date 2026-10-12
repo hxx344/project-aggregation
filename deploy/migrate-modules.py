@@ -163,6 +163,14 @@ class Migration:
             state['status'] = 'committed'
             self.save(state)
 
+    def status(self):
+        state = self.load()
+        if not state:
+            return 'absent'
+        if state['data'] != str(self.data) or state['status'] not in ('pending', 'committed', 'rolled-back'):
+            raise ValueError('Migration journal does not match this installation')
+        return state['status']
+
     def rollback(self):
         state = self.load()
         if not state or state['status'] != 'pending':
@@ -200,7 +208,7 @@ class Migration:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('begin', 'commit', 'rollback'))
+    parser.add_argument('operation', choices=('begin', 'commit', 'rollback', 'status'))
     parser.add_argument('--data', required=True, type=Path)
     parser.add_argument('--journal', required=True, type=Path)
     parser.add_argument('--user')
@@ -211,7 +219,9 @@ def main():
         account = pwd.getpwnam(args.user)
         uid, gid = account.pw_uid, account.pw_gid
     migration = Migration(args.data, args.journal, uid, gid)
-    getattr(migration, args.operation)()
+    result = getattr(migration, args.operation)()
+    if args.operation == 'status':
+        print(result)
 
 
 if __name__ == '__main__':

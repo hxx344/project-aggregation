@@ -16,7 +16,6 @@ git -C "$fixture/repository" commit -qm pinned
 git clone -q --bare "$fixture/repository" "$APP_DIR/repository.git"
 commit=$(git -C "$fixture/repository" rev-parse HEAD)
 printf '/tmp/service-controlled/evil.tar.gz --hash=sha256:valid-attacker-hash\n' > "$work_dir/source/modules/greeks/requirements.lock"
-original_safe_path=$(declare -f updater_safe_path)
 original_prepare=$(declare -f prepare_greeks_runtime)
 if [[ $(uname -s) != Linux ]]; then
   updater_safe_path() { :; } # Windows has no Unix UID/mode semantics.
