@@ -4,17 +4,40 @@
 
 将 Market Monitor、Asset Ledger、Gate CrossEx、Greeks 四个独立服务迁移到 project-aggregation 工作台中，作为内嵌模块统一运行在端口 3100。
 
+**重要提醒**：
+- ⚠️ 本迁移必须在 **Linux 服务器** 上执行
+- ⚠️ 不要在 Windows 本地执行
+- ⚠️ 先通过 SSH 连接到服务器，再开始迁移
+
 ## 执行前须知
 
-### 假设条件
-- 当前目录：`/d/project_aggregation`
+### 环境说明
+- **开发机**：Windows（你当前所在的环境）
+- **生产服务器**：Linux（实际运行服务的地方）
+- **源代码位置**：在服务器上，需要你确认路径
+
+### 执行方式
+本迁移应该在 **Linux 服务器** 上执行，不是在 Windows 本地。
+
+请通过以下方式之一连接到服务器：
+```bash
+# SSH 连接到服务器
+ssh user@your-server-ip
+
+# 切换到项目目录
+cd /path/to/project_aggregation
+```
+
+### 假设条件（在服务器上）
+- 当前目录：`/home/user/project_aggregation`（需要你确认实际路径）
 - 源代码位置（需要你确认）：
-  - Market Monitor: `../market-spread-monitor`
-  - Asset Ledger: `../asset-ledger`
-  - Gate CrossEx: `../gate-crossex-arbitrage`
-  - Greeks: `../greeks`
-- 操作系统：Linux (Windows Git Bash 环境)
+  - Market Monitor: `../market-spread-monitor` 或 `/path/to/market-spread-monitor`
+  - Asset Ledger: `../asset-ledger` 或 `/path/to/asset-ledger`
+  - Gate CrossEx: `../gate-crossex-arbitrage` 或 `/path/to/gate-crossex-arbitrage`
+  - Greeks: `../greeks` 或 `/path/to/greeks`
+- 操作系统：Linux
 - Node.js: >= 24.15.0
+- Shell: bash
 
 ### 最终架构
 ```
@@ -37,7 +60,17 @@ project-aggregation (单一服务，端口 3100)
 
 ### Step 1: 准备工作（必做）
 
+**在开始之前，确认你已经 SSH 连接到 Linux 服务器！**
+
 ```bash
+# 0. 确认在服务器上（显示服务器主机名）
+hostname
+uname -a
+
+# 0.1 确认在正确的项目目录
+pwd
+# 应该显示类似：/home/user/project_aggregation 或 /root/project_aggregation
+
 # 1.1 创建备份
 mkdir -p backups/current
 cp -r data backups/current/
