@@ -19,7 +19,7 @@ async (page) => {
     Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => window.__hidden ? 'hidden' : 'visible' });
     Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => window.__online });
     window.EventSource = class {
-      constructor() { this.closed = false; window.__streams.push(this); }
+      constructor(url) { this.closed = false; if (url.startsWith('/api/overview/events')) window.__streams.push(this); }
       close() { this.closed = true; }
       emit(value) { if (!this.closed) this.onmessage?.({ data: JSON.stringify(value) }); }
     };
@@ -44,6 +44,8 @@ async (page) => {
     const send = (body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) }).catch(() => {});
     if (request.method() !== 'GET') writes.push(url.pathname);
     if (url.pathname === '/api/session') return send({ authenticated: true, csrfToken: 'fixture' });
+    if (url.pathname === '/api/health') return send({ status: 'ok' });
+    if (url.pathname === '/api/system/updates') return send({ enabled: true, checking: false, modules: [], job: null });
     const launch = url.pathname.match(/^\/api\/projects\/([^/]+)\/launch$/);
     if (launch) { launches.set(launch[1], (launches.get(launch[1]) || 0) + 1); return send({ url: `${origin}/fixtures/${launch[1]}` }); }
     if (url.pathname === '/api/overview') {
@@ -62,6 +64,7 @@ async (page) => {
   const readNow = async event => {
     const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/overview');
     await page.evaluate(event => window.dispatchEvent(new Event(event)), event);
+    await advance(1_100);
     await (await response).finished(); await page.waitForTimeout(30);
   };
   await page.goto(origin);
@@ -103,6 +106,7 @@ async (page) => {
   for (const event of ['focus', 'pageshow', 'online']) {
     hold = true;
     await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await advance(1_100);
     for (let i = 0; i < 20 && !held.length; i++) await page.waitForTimeout(10);
     assert(held.length === 1, 'old read remains in flight');
     sample++; await readNow(event);
@@ -116,6 +120,7 @@ async (page) => {
   sample++; await readNow('online');
   response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/overview');
   await page.evaluate(() => { window.__hidden = false; document.dispatchEvent(new Event('visibilitychange')); });
+  await advance(1_100);
   await (await response).finished();
   expire = true; await readNow('focus');
   await page.getByRole('heading', { name: '进入工作台', exact: true }).waitFor();

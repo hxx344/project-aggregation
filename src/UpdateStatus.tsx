@@ -147,6 +147,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     let receivedAt = performance.now();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let resumeTimer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       if (disposed || ticking) return;
       ticking = true;
@@ -164,7 +165,6 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
       const wasLive = streamLive;
       disconnect();
       if (wasLive) void tick();
-      // Increased retry delay for SSH tunnel scenarios: 5s → 10s
       if (!disposed && navigator.onLine && !sessionExpired.current) retry = setTimeout(connect, 10_000);
     };
     const connect = () => {
@@ -189,17 +189,20 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
       } catch { failed(); }
     };
     const resume = () => {
+      clearTimeout(resumeTimer);
       if (!navigator.onLine || disposed) return;
       if (!stream || performance.now() - receivedAt >= STREAM_TIMEOUT) connect();
-      // Wait for EventSource to establish before polling
-      setTimeout(() => {
-        if (!disposed && !streamLive) {
-          void request('read', undefined, true);
+      const previousRead = requestRef.current;
+      // Reuse reads started during the grace period; replace only the old read.
+      resumeTimer = setTimeout(() => {
+        if (!disposed && navigator.onLine && !streamLive) {
+          void request('read', undefined, previousRead !== null && requestRef.current === previousRead);
         }
       }, 1000);
     };
     const visible = () => { if (!document.hidden) resume(); };
     const offline = () => {
+      clearTimeout(resumeTimer);
       disconnect();
       if (requestRef.current?.kind === 'read') { requestRef.current.controller.abort(); requestRef.current = null; setPending(null); }
       setNetworkError('暂时无法连接更新服务，正在重连。');
@@ -216,7 +219,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     window.addEventListener('focus', resume);
     window.addEventListener('pageshow', resume);
     return () => {
-      disposed = true; disconnect(); clearTimeout(timer); clearInterval(health);
+      disposed = true; disconnect(); clearTimeout(timer); clearTimeout(resumeTimer); clearInterval(health);
       refreshFallback.current = () => {};
       document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume);
       window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume);

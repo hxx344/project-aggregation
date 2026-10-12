@@ -27,6 +27,7 @@ async (page) => {
   const readNow = async (event = 'online') => {
     const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/system/updates');
     await page.evaluate(event => window.dispatchEvent(new Event(event)), event);
+    await advance(1_100);
     await (await response).finished(); await page.waitForTimeout(40);
   };
   const emit = async () => {
@@ -126,18 +127,20 @@ async (page) => {
   await advance(15_000);
   assert(reads === beforeFallback + 1, 'repeated stream failures retain one idle fallback read per fifteen seconds');
   assert(checks.length === 0, 'stream reconnection and fallback never check releases');
-  await page.evaluate(() => { window.__updateFailConnect = false; }); await advance(5_000);
+  await page.evaluate(() => { window.__updateFailConnect = false; }); await advance(10_000);
   await emit();
+  const beforeVisible = reads;
   await page.evaluate(() => { window.__updateHidden = false; document.dispatchEvent(new Event('visibilitychange')); });
-  await page.waitForTimeout(40);
-  assert(reads > beforeFallback, 'visible page refreshes the server state');
+  await advance(1_100);
+  assert(reads === beforeVisible, 'a healthy stream supplies state without a redundant wake read');
 
   // A newly pushed plan wins over a GET that was already in flight.
   await openUpdates();
   await page.waitForTimeout(40);
   holdRead = true;
-  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await streamError();
   await waitHeld(heldReads);
+  await advance(10_000);
   await makeAvailable('stream-newer-than-get'); state.modules[0].latestVersion = 'v1.2.0'; state.modules[0].releaseNotes = '新版本的更新说明'; await emit();
   heldReads.shift()(); await page.waitForTimeout(40);
   assert((await page.locator('.update-modules').innerText()).includes('v1.2.0'), 'an old GET cannot replace the pushed version');
@@ -156,7 +159,9 @@ async (page) => {
   await advance(60_000);
   assert(reads === beforeOffline, 'offline pauses fallback reads');
   await page.evaluate(() => { window.__updateOnline = true; }); await readNow(); await emit();
-  await readNow('pageshow');
+  const beforePageshow = reads;
+  await page.evaluate(() => window.dispatchEvent(new Event('pageshow'))); await advance(1_100);
+  assert(reads === beforePageshow, 'restoring a page with a healthy stream needs no extra read');
   assert(checks.length === 0, 'offline recovery and page restoration stay read-only');
 
   await makeAvailable('plan-one');
@@ -218,7 +223,7 @@ async (page) => {
   await page.reload(); await emit(); await openUpdates();
   await page.getByRole('button', { name: '检查更新', exact: true }).click();
   await page.getByText('上次检查请求未完成，当前显示的是已有记录。', { exact: true }).waitFor();
-  await readNow();
+  await streamError(); await page.waitForTimeout(40);
   assert((await page.locator('.update-summary').innerText()).includes('检查失败'), 'reading an old cache cannot erase a failed check request');
   await page.getByRole('button', { name: '检查更新', exact: true }).click();
   state.checking = false; state.checkedAt = await now(); await emit();

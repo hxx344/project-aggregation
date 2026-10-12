@@ -8,4 +8,6 @@ output/
 .playwright-cli/
 *.log
 *.tsbuildinfo
+__pycache__/
+*.py[cod]
 .DS_Store

@@ -3,9 +3,6 @@ import { Activity } from 'lucide-react';
 import { api } from './api';
 import { checkConnectionHealth, createConnectionMonitor, initialConnectionState } from './connection-quality';
 import type { ConnectionQuality } from './connection-quality';
-// Local route detection disabled: SSH tunnel users don't need this feature
-// import { createLocalRouteMonitor, initialLocalRoute, LOCAL_ROUTE_ORIGIN } from './local-route';
-// import LocalRouteDetails, { localRouteLabel } from './LocalRouteDetails';
 
 const labels: Record<ConnectionQuality, string> = {
   checking: '检测中', good: '良好', fair: '一般', slow: '较慢', unreachable: '无法连接', offline: '本机离线', paused: '已暂停',

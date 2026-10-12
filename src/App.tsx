@@ -131,18 +131,16 @@ export default function App() {
   useEffect(() => {
     if (!authenticated) return;
     const controller = new AbortController();
-    const refresh = () => { if (navigator.onLine && !streamLive.current && !document.hidden) void load(controller.signal); };
+    const refresh = () => { if (navigator.onLine && !streamLive.current) void load(controller.signal); };
     const first = window.setTimeout(refresh, 1500);
     const interval = window.setInterval(refresh, 30_000);
-    // Stop polling when page is hidden
-    const visibilityHandler = () => { if (!document.hidden) refresh(); };
-    document.addEventListener('visibilitychange', visibilityHandler);
-    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); document.removeEventListener('visibilitychange', visibilityHandler); };
+    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); };
   }, [authenticated, load]);
   useEffect(() => {
     if (!authenticated) return;
     let stream: EventSource | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    let resumeTimer: ReturnType<typeof setTimeout> | undefined;
     let watchdog = createStreamWatchdog();
     const controller = new AbortController();
     const connect = () => {
@@ -159,24 +157,25 @@ export default function App() {
       current.onerror = () => { if (controller.signal.aborted || stream !== current) return; streamLive.current = false; void load(controller.signal); };
     };
     const resume = () => {
-      if (!navigator.onLine) return;
+      clearTimeout(resumeTimer);
+      if (!navigator.onLine || controller.signal.aborted) return;
       if (!stream || watchdog.expired()) connect();
-      // Wait for EventSource to establish before polling
-      // This prevents failed requests when returning from background
-      setTimeout(() => {
-        if (!controller.signal.aborted && !streamLive.current) {
-          void load(controller.signal, true);
+      const previousRead = pendingLoad.current;
+      // Coalesce wake events and give the stream a chance to supply fresh data.
+      resumeTimer = setTimeout(() => {
+        if (!controller.signal.aborted && navigator.onLine && !streamLive.current) {
+          void load(controller.signal, previousRead !== null && pendingLoad.current === previousRead);
         }
       }, 1000);
     };
     const visible = () => { if (!document.hidden) resume(); };
-    const offline = () => { connect(); pendingLoad.current?.controller.abort(); };
+    const offline = () => { clearTimeout(resumeTimer); connect(); pendingLoad.current?.controller.abort(); };
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
-    // Health check: extended to 30s for SSH tunnel scenarios (was 5s)
-    const health = window.setInterval(() => { if (navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 30_000);
-    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
+    // This local timer only sends requests when the stream heartbeat has expired.
+    const health = window.setInterval(() => { if (navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
+    return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearTimeout(resumeTimer); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
   }, [authenticated, accept, load]);
   useEffect(() => {
     if (!overview || !authenticated) return;
