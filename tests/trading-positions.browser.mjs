@@ -53,7 +53,7 @@ async (page) => {
   const release = () => { holdRead = false; for (const resume of heldReads.splice(0)) resume(); };
   const refresh = async () => {
     const response = page.waitForResponse(value => new URL(value.url()).pathname === '/api/trading/positions');
-    await page.evaluate(() => window.dispatchEvent(new Event('online'))); await (await response).finished();
+    await page.evaluate(() => window.dispatchEvent(new Event('online'))); await page.clock.runFor(1_000); await (await response).finished();
   };
   const positionsReads = () => requests.filter(request => request.path === '/api/trading/positions').length;
   const oilReads = () => requests.filter(request => request.path === '/api/trading' || request.path.startsWith('/api/trading/execution')).length;
@@ -149,6 +149,7 @@ async (page) => {
   assert(positionsReads() === hiddenReads + 1, 'hidden page still checks every thirty seconds');
   const visibleRead = page.waitForResponse(value => new URL(value.url()).pathname === '/api/trading/positions');
   await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); document.dispatchEvent(new Event('visibilitychange')); });
+  elapsed += 1_000; await page.clock.runFor(1_000);
   await visibleRead;
   holdRead = true; elapsed += 100_000; await page.clock.runFor(100_000);
   await page.waitForFunction(() => !document.querySelector('[data-scope="linear"] .positions-status.live'));
@@ -160,8 +161,9 @@ async (page) => {
   assert(positionsReads() === offlineReads, 'offline page stops polling');
   const reconnect = page.waitForResponse(value => new URL(value.url()).pathname === '/api/trading/positions');
   await page.evaluate(() => { Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => true }); window.dispatchEvent(new Event('online')); });
+  elapsed += 1_000; await page.clock.runFor(1_000);
   await reconnect;
-  assert(positionsReads() > offlineReads, 'reconnect reads immediately');
+  assert(positionsReads() > offlineReads, 'reconnect reads after the coalesced recovery window');
   const storage = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }));
   assert(!storage.includes('btc-long') && !storage.includes('0.123456789012345678'), 'positions never persist in browser storage');
   noSources = true; await refresh(); await page.getByRole('heading', { name: '尚未接入 Asset 来源', exact: true }).waitFor();

@@ -46,7 +46,9 @@
 
 **证据：** 本仓 `c41ce40` 修改 [App](src/App.tsx) 与 [UpdateStatus](src/UpdateStatus.tsx)；`3f63db5`、`9382521` 补充恢复事件合并与新请求保护。`fc94b0a` 是保留的历史对象，其三个交易页源文件内容对应主线 `3a2cf14`，不能算成两次事件。[TradingPositions](src/TradingPositions.tsx)、[OilTradingPage](src/OilTradingPage.tsx)、[TradingExecution](src/TradingExecution.tsx) 使用延迟轮询，不具备这里所述的 EventSource live 判断。旧说明的“约 40% 失败”和“接近 0%”没有附带可复核测量，不作为结论或验收标准。
 
-**如何验证：** [恢复交互检查](tests/resume-refresh.browser.mjs) 覆盖 App/UpdateStatus 的事件突发合并、流先到取消兜底、离线取消、重新联网、新请求保留和退出清理。改动交易页时须按其实际轮询路径验证，不能声称该脚本已经覆盖所有页面。
+**本轮补充证据：** 2026-10-13 对 `3a2cf14` 的局部审查确认：三个交易页每次恢复都另建延迟回调，`TradingExecution` 还会重复启动递归轮询链。当前修复合并恢复回调、保留窗口中新读取，并在离线和卸载时取消延迟任务。独立复核另以虚拟时钟复现：隐藏页每 10 秒收到一次焦点事件时，若每次重置后台计时器，60 秒内没有后续读取；修复改为只补建缺失计时器。以上属于本轮连续修补，不增加独立事件计数。
+
+**如何验证：** [恢复交互检查](tests/resume-refresh.browser.mjs) 覆盖 App/UpdateStatus 的事件突发合并、流先到取消兜底、离线取消、重新联网、新请求保留和退出清理。[交易恢复检查](tests/trading-resume.browser.mjs) 直接覆盖三个交易页的事件合并、旧请求替换、组合切换中新读取保留、离线取消、单一执行轮询链、隐藏重连及卸载清理，并确认自动恢复不发送写请求；隐藏事件连发用例已在修复前构建上复现失败。按改动范围选取 [观察页轮询](tests/trading-poll.browser.mjs)、[仓位](tests/trading-positions.browser.mjs) 和 [执行交互](tests/trading-execution.browser.mjs) 回归，不将任何单一脚本描述为全页面覆盖。
 
 **事件记录：** `legacy-resume-20261013`；历史复盘 2026-10-13（Seen 1×）；同轮补丁和跨页面推广不重复计数，实际独立事件边界待核实。
 

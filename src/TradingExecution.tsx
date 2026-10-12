@@ -146,27 +146,44 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
     } finally { if (readController.current === controller) { readController.current = null; if (mounted.current) setReading(false); } }
   }, [acceptState, expire]);
   useEffect(() => {
+    let disposed = false;
     mounted.current = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = () => { void load(); timer = setTimeout(poll, document.hidden ? 30_000 : 3000); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+    const cancelResume = () => { clearTimeout(resumeTimer); resumeTimer = undefined; };
+    const schedulePoll = () => {
+      clearTimeout(timer); timer = undefined;
+      if (!disposed) timer = setTimeout(poll, document.hidden ? 30_000 : 3000);
+    };
+    const poll = () => {
+      if (disposed) return;
+      if (resumeTimer === undefined) void load();
+      schedulePoll();
+    };
     const wake = () => {
+      if (disposed) return;
       setOffline(!navigator.onLine);
-      if (navigator.onLine && !document.hidden) {
-        clearTimeout(timer);
-        // Delay polling to let SSH tunnel stabilize after tab switch
-        setTimeout(() => {
-          if (mounted.current) {
-            void load(true);
-            timer = setTimeout(poll, 3000);
-          }
+      if (document.hidden) { cancelResume(); if (timer === undefined) schedulePoll(); return; }
+      if (navigator.onLine && resumeTimer === undefined) {
+        clearTimeout(timer); timer = undefined;
+        const previousRead = readController.current;
+        // Replace only the read that predates this coalesced recovery window.
+        resumeTimer = setTimeout(() => {
+          resumeTimer = undefined;
+          if (disposed) return;
+          if (navigator.onLine) void load(previousRead !== null && readController.current === previousRead);
+          schedulePoll();
         }, 1000);
       }
     };
-    const disconnected = () => { setOffline(true); readController.current?.abort(); };
+    const disconnected = () => {
+      if (disposed) return;
+      cancelResume(); setOffline(true); readController.current?.abort(); schedulePoll();
+    };
     poll();
-    const clock = setInterval(() => setClock(value => value + 1), 3000);
+    const clock = setInterval(() => { if (!disposed) setClock(value => value + 1); }, 3000);
     document.addEventListener('visibilitychange', wake); window.addEventListener('focus', wake); window.addEventListener('pageshow', wake); window.addEventListener('online', wake); window.addEventListener('offline', disconnected);
-    return () => { mounted.current = false; clearTimeout(timer); clearInterval(clock); readController.current?.abort(); writeController.current?.abort(); document.removeEventListener('visibilitychange', wake); window.removeEventListener('focus', wake); window.removeEventListener('pageshow', wake); window.removeEventListener('online', wake); window.removeEventListener('offline', disconnected); };
+    return () => { disposed = true; mounted.current = false; cancelResume(); clearTimeout(timer); clearInterval(clock); readController.current?.abort(); writeController.current?.abort(); document.removeEventListener('visibilitychange', wake); window.removeEventListener('focus', wake); window.removeEventListener('pageshow', wake); window.removeEventListener('online', wake); window.removeEventListener('offline', disconnected); };
   }, [load]);
   useEffect(() => { if (review) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [review?.preview.id]);
 

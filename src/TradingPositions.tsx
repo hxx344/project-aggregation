@@ -97,24 +97,34 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
     pending.current = { controller, promise }; return promise;
   }, [cancel]);
   useEffect(() => {
+    let disposed = false;
+    let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+    const cancelResume = () => { clearTimeout(resumeTimer); resumeTimer = undefined; };
     mounted.current = true; void load();
     const resume = () => {
+      if (disposed) return;
       setOffline(!navigator.onLine); setClock(value => value + 1);
-      if (!navigator.onLine) { cancel(); setReading(false); }
-      else {
-        // Delay polling to let SSH tunnel stabilize after tab switch
-        setTimeout(() => {
-          if (mounted.current) void load(true);
+      if (!navigator.onLine) { cancelResume(); cancel(); setReading(false); }
+      else if (resumeTimer === undefined) {
+        const previousRead = pending.current;
+        // Coalesce wake events and preserve reads started during the grace period.
+        resumeTimer = setTimeout(() => {
+          resumeTimer = undefined;
+          if (!disposed && navigator.onLine) void load(!pending.current || pending.current === previousRead);
         }, 1000);
       }
     };
     const visible = () => { if (!document.hidden) resume(); };
-    const timer = window.setInterval(() => { setClock(value => value + 1); void load(); }, 5000);
+    const timer = window.setInterval(() => {
+      if (disposed) return;
+      setClock(value => value + 1);
+      if (resumeTimer === undefined) void load();
+    }, 5000);
     document.addEventListener('visibilitychange', visible);
     window.addEventListener('online', resume); window.addEventListener('offline', resume);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
     return () => {
-      mounted.current = false; cancel(); clearInterval(timer);
+      disposed = true; mounted.current = false; cancelResume(); cancel(); clearInterval(timer);
       document.removeEventListener('visibilitychange', visible);
       window.removeEventListener('online', resume); window.removeEventListener('offline', resume);
       window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume);

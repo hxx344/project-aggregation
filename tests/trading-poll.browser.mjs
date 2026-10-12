@@ -55,7 +55,7 @@ async (page) => {
   const tradingResponse = () => page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading', { timeout: 10_000 });
   const settle = async response => { await (await response).finished(); await page.waitForTimeout(20); };
   const checkFresh = async () => {
-    assert(await page.locator('[data-label="标记价格 · USDT/合约单位"]').first().innerText() === marker(), 'latest server sample is visible');
+    assert(await page.locator('[data-label="标记价格 · USDT/底层单位"]').first().innerText() === marker(), 'latest server sample is visible');
     assert((await page.locator('.trading-account-status .trading-status').allTextContents()).every(value => value === '已同步'), 'both exchanges remain fresh');
   };
   const advance = async (ms, expectedReads) => {
@@ -85,10 +85,12 @@ async (page) => {
   // Recovery must replace a pending GET; its delayed response cannot overwrite the newer sample.
   for (const event of ['focus', 'pageshow', 'visibilitychange']) {
     holdNext = true;
-    const started = page.waitForRequest(request => new URL(request.url()).pathname === '/api/trading', { timeout: 10_000 });
-    elapsed += 30_000;
-    await page.clock.runFor(30_000);
-    await started; await page.waitForTimeout(20);
+    // The grace period can shift the last read off the five-second timer grid.
+    for (let tick = 0; tick < 7 && held.length === 0; tick++) {
+      elapsed += 5000;
+      await page.clock.runFor(5000);
+      await page.waitForTimeout(20);
+    }
     assert(held.length === 1, `${event}: old request is still pending`);
     sampleOffset += 100;
     const before = reads.length, response = tradingResponse();
@@ -98,8 +100,9 @@ async (page) => {
         document.dispatchEvent(new Event(event));
       } else window.dispatchEvent(new Event(event));
     }, event);
+    elapsed += 1_000; await page.clock.runFor(1_000);
     await settle(response);
-    assert(reads.length === before + 1, `${event}: recovery immediately starts a new read`);
+    assert(reads.length === before + 1, `${event}: recovery starts one read after the grace period`);
     await checkFresh();
     held.shift()();
     await page.waitForTimeout(20);
@@ -111,6 +114,7 @@ async (page) => {
   await page.getByText('网络已断开，当前显示最后读取的数据；连接恢复后自动更新。', { exact: true }).waitFor();
   const onlineResponse = tradingResponse();
   await page.evaluate(() => { Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => true }); window.dispatchEvent(new Event('online')); });
+  elapsed += 1_000; await page.clock.runFor(1_000);
   await settle(onlineResponse); await checkFresh();
   await advance(5000, 1); await checkFresh();
   await page.screenshot({ path: 'output/playwright/trading-poll-recovered.png', fullPage: false });
@@ -121,13 +125,18 @@ async (page) => {
   await page.evaluate(() => { window.dispatchEvent(new Event('focus')); window.dispatchEvent(new Event('pageshow')); document.dispatchEvent(new Event('visibilitychange')); });
   await advance(5000, 0);
   const returning = tradingResponse();
-  await page.getByRole('button', { name: /^交易\s*只读$/ }).click();
+  await page.getByRole('button', { name: '交易', exact: true }).click();
+  await page.getByRole('button', { name: '原油四腿套利', exact: true }).click();
   await settle(returning); await checkFresh();
   expire = true;
-  await advance(5000, 1);
+  const expiredReads = reads.length, expiredResponse = tradingResponse();
+  elapsed += 5000; await page.clock.runFor(5000); await expiredResponse;
+  // Session expiry unmounts the page and can abort transport completion.
   await page.getByRole('heading', { name: '进入工作台', exact: true }).waitFor();
+  assert(reads.length === expiredReads + 1, 'one expired read removes the trading session');
   await advance(30_000, 0);
   assert(writes.length === 0, `automatic updates never require a POST: ${writes.join(', ')}`);
   assert(pageErrors.length === 0, `no uncaught browser errors: ${pageErrors.join('; ')}`);
+  await page.clock.resume();
   return { passed: true, foregroundReads: 120, hiddenReads: 4, recoveryEvents: ['focus', 'pageshow', 'visibilitychange'], tradingGets: reads.length, mutationRequests: writes.length, scenarios: ['ten-minute automatic polling', 'hidden thirty-second polling', 'replace held reads on recovery', 'ignore delayed old responses', 'offline and online', 'navigation cleanup', 'expired-session cleanup'] };
 }
