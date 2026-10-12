@@ -49,11 +49,30 @@ def main():
         }
         if name in runtime_deps:
             lock = json.loads((source / 'package-lock.json').read_text())
+            # Collect all transitive dependencies by walking package-lock.json
+            to_copy = set()
+            def collect_deps(pkg_name):
+                if pkg_name in to_copy:
+                    return
+                to_copy.add(pkg_name)
+                pkg_path = 'node_modules/' + pkg_name
+                pkg_info = lock['packages'].get(pkg_path)
+                if pkg_info and 'dependencies' in pkg_info:
+                    for dep_name in pkg_info['dependencies']:
+                        collect_deps(dep_name)
+
             for dependency in runtime_deps[name]:
+                collect_deps(dependency)
+
+            # Copy all collected dependencies with version verification
+            for dependency in sorted(to_copy):
                 installed = source / 'node_modules' / dependency
+                if not installed.exists():
+                    continue  # Optional peer dependency
                 version = json.loads((installed / 'package.json').read_text())['version']
-                if version != lock['packages']['node_modules/' + dependency]['version']:
-                    raise ValueError('Runtime dependency does not match lockfile: ' + dependency)
+                expected = lock['packages']['node_modules/' + dependency]['version']
+                if version != expected:
+                    raise ValueError(f'Runtime dependency version mismatch: {dependency} (installed: {version}, expected: {expected})')
                 shutil.copytree(installed, stage / 'node_modules' / dependency)
         (stage / '.release-commit').write_text(commit + '\n')
         (stage / '.release-application-key').write_text(application_key + '\n')
