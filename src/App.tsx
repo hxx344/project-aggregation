@@ -161,7 +161,13 @@ export default function App() {
     const resume = () => {
       if (!navigator.onLine) return;
       if (!stream || watchdog.expired()) connect();
-      void load(controller.signal, true);
+      // Wait for EventSource to establish before polling
+      // This prevents failed requests when returning from background
+      setTimeout(() => {
+        if (!controller.signal.aborted && !streamLive.current) {
+          void load(controller.signal, true);
+        }
+      }, 1000);
     };
     const visible = () => { if (!document.hidden) resume(); };
     const offline = () => { connect(); pendingLoad.current?.controller.abort(); };

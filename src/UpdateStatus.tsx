@@ -191,7 +191,12 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     const resume = () => {
       if (!navigator.onLine || disposed) return;
       if (!stream || performance.now() - receivedAt >= STREAM_TIMEOUT) connect();
-      void request('read', undefined, true);
+      // Wait for EventSource to establish before polling
+      setTimeout(() => {
+        if (!disposed && !streamLive) {
+          void request('read', undefined, true);
+        }
+      }, 1000);
     };
     const visible = () => { if (!document.hidden) resume(); };
     const offline = () => {
