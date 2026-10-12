@@ -30,9 +30,21 @@ class PublishRelease(unittest.TestCase):
         self.calls = []
         self.upload_failure = False
         self.remote_manifest = self.manifest
+        self.message = '更新面板显示具体变更 🚀\n\n保留提交正文的换行。\n- 显示更新内容\n- 保留已有配置\n'
+        self.git_failure = False
+        self.notes_files = []
 
-    def fake_gh(self, args, **kwargs):
+    def fake_command(self, args, **kwargs):
         self.calls.append(args)
+        if args[0] == 'git':
+            self.assertEqual(args, ['git', 'log', '-1', '--format=%B', self.commit])
+            self.assertIs(kwargs.get('shell'), False)
+            self.assertEqual(kwargs.get('encoding'), 'utf-8')
+            self.assertTrue(kwargs.get('text'))
+            self.assertTrue(kwargs.get('check'))
+            if self.git_failure:
+                raise subprocess.CalledProcessError(1, args, '', 'fixture git failure')
+            return subprocess.CompletedProcess(args, 0, self.message, '')
         self.assertEqual(args[0], 'gh')
         self.assertNotIn('shell', kwargs)
         code, stdout, stderr = 0, '', ''
@@ -44,7 +56,8 @@ class PublishRelease(unittest.TestCase):
                 code, stderr = 1, 'release not found'
         elif operation == ['release', 'create']:
             self.assertIn('--draft', args)
-            self.release = {'tag_name': self.tag, 'draft': True, 'prerelease': True, 'assets': []}
+            self.release = {'tag_name': self.tag, 'draft': True, 'prerelease': True, 'assets': [],
+                            'body': self.read_notes(args)}
         elif operation == ['release', 'upload']:
             self.assertTrue(self.release['draft'])
             if self.upload_failure:
@@ -57,7 +70,7 @@ class PublishRelease(unittest.TestCase):
             self.assertIn('--draft=false', args)
             self.assertIn('--prerelease=true', args)
             self.assertIn('--latest=false', args)
-            self.release.update(draft=False, prerelease=True)
+            self.release.update(draft=False, prerelease=True, body=self.read_notes(args))
         elif operation == ['release', 'download']:
             directory = Path(args[args.index('--dir') + 1]); name = args[args.index('--pattern') + 1]
             if name == 'release-manifest.json':
@@ -70,11 +83,19 @@ class PublishRelease(unittest.TestCase):
             raise subprocess.CalledProcessError(code, args, stdout, stderr)
         return subprocess.CompletedProcess(args, code, stdout, stderr)
 
+    def read_notes(self, args):
+        self.assertNotIn('--notes', args)
+        self.assertIn('--notes-file', args)
+        source = Path(args[args.index('--notes-file') + 1])
+        self.assertTrue(source.is_file())
+        self.notes_files.append(source)
+        return source.read_bytes().decode('utf-8')
+
     def publish(self):
         environment = {'GITHUB_REPOSITORY': self.repo, 'GITHUB_SHA': self.commit,
                        'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'push'}
         with patch.dict(os.environ, environment), patch.object(sys, 'argv', [str(PUBLISHER), str(self.root)]), \
-                patch('subprocess.run', self.fake_gh):
+                patch('subprocess.run', self.fake_command):
             try:
                 runpy.run_path(str(PUBLISHER), run_name='__main__')
             except SystemExit as error:
@@ -89,13 +110,22 @@ class PublishRelease(unittest.TestCase):
         self.assertEqual({item['name'] for item in self.release['assets']}, {'fixture.tar.gz', 'release-manifest.json'})
         self.assertEqual(self.calls[-1][1:3], ['release', 'edit'])
         self.assertFalse(any(call[1] == 'api' for call in self.calls))
+        self.assertTrue(self.release['body'].startswith(self.message + '\n'))
+        self.assertIn('发布提交：' + self.commit, self.release['body'])
+        self.assertIn('不是跨版本累计变更', self.release['body'])
+        self.assertIn('保留服务器已有配置与数据', self.release['body'])
+        self.assertEqual(len(self.notes_files), 2)
+        self.assertFalse(any(path.exists() for path in self.notes_files))
 
     def test_retry_completes_draft_before_publishing_candidate(self):
-        self.release = {'tag_name': self.tag, 'draft': True, 'assets': []}
+        self.release = {'tag_name': self.tag, 'draft': True, 'assets': [], 'body': 'Old generic notes'}
         self.publish()
         self.assertFalse(any(call[1:3] == ['release', 'create'] for call in self.calls))
         self.assertEqual(sum(call[1:3] == ['release', 'upload'] for call in self.calls), 2)
         self.assertTrue(self.release['prerelease'])
+        self.assertTrue(self.release['body'].startswith(self.message + '\n'))
+        self.assertEqual(len(self.notes_files), 1)
+        self.assertFalse(self.notes_files[0].exists())
 
     def test_upload_failure_leaves_draft_unpublished(self):
         self.upload_failure = True
@@ -103,16 +133,36 @@ class PublishRelease(unittest.TestCase):
             self.publish()
         self.assertTrue(self.release['draft'])
         self.assertFalse(any(call[1:3] == ['release', 'edit'] for call in self.calls))
+        self.assertFalse(any(path.exists() for path in self.notes_files))
+
+    def test_git_failure_prevents_creating_or_publishing_a_candidate(self):
+        for draft in [None, {'tag_name': self.tag, 'draft': True, 'assets': [], 'body': 'Existing draft notes'}]:
+            with self.subTest(draft=bool(draft)):
+                self.calls.clear(); self.release = draft; self.git_failure = True
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.publish()
+                self.assertEqual(self.writes(), [])
+                self.assertEqual(self.release, draft)
+
+    def test_empty_commit_message_prevents_publication(self):
+        self.message = '\n \n'
+        with self.assertRaisesRegex(ValueError, 'no update description'):
+            self.publish()
+        self.assertEqual(self.writes(), [])
 
     def test_rerunning_public_candidate_or_stable_release_makes_no_changes(self):
         for prerelease in [True, False]:
             with self.subTest(prerelease=prerelease):
                 self.calls.clear()
                 self.release = {'tag_name': self.tag, 'draft': False, 'prerelease': prerelease,
-                                'assets': [{'name': 'fixture.tar.gz'}, {'name': 'release-manifest.json'}]}
+                                'assets': [{'name': 'fixture.tar.gz'}, {'name': 'release-manifest.json'}],
+                                'body': 'Already published notes'}
+                self.git_failure = True
                 self.publish()
                 self.assertEqual(self.writes(), [])
                 self.assertEqual(self.release['prerelease'], prerelease)
+                self.assertEqual(self.release['body'], 'Already published notes')
+                self.assertFalse(any(call[0] == 'git' for call in self.calls))
 
     def test_incomplete_or_different_public_release_is_never_modified(self):
         for assets, remote in [([], self.manifest), ([{'name': 'fixture.tar.gz'}, {'name': 'release-manifest.json'}], {**self.manifest, 'commit': 'a' * 40})]:
@@ -125,6 +175,14 @@ class PublishRelease(unittest.TestCase):
     def test_checksum_failure_prevents_all_github_operations(self):
         (self.root / 'fixture.tar.gz').write_bytes(b'corrupt')
         with self.assertRaises(ValueError):
+            self.publish()
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_commit_prevents_all_commands(self):
+        self.commit = 'main'
+        self.manifest.update(commit=self.commit, tag='deploy-' + self.commit)
+        (self.root / 'release-manifest.json').write_text(json.dumps(self.manifest), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'identity'):
             self.publish()
         self.assertEqual(self.calls, [])
 

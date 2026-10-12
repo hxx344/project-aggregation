@@ -14,6 +14,9 @@ export class UpdateError extends Error {
 export const unavailableUpdateState = () => ({ enabled: false, reason: UNAVAILABLE, checking: false, checkedAt: null, checkError: null, planId: null, expiresAt: null, modules: [], job: null });
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value, max = 500) => typeof value === 'string' && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+// Release descriptions are display-only. Bad optional metadata must not block an update.
+const releaseNotes = value => typeof value === 'string' && value.isWellFormed() && Buffer.byteLength(value, 'utf8') <= 6000
+  && !/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e-\u200f\u202a-\u202e\u2066-\u2069]/.test(value) ? value.trim() : '';
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const timestamp = value => text(value, 40) && /^\d{4}-\d\d-\d\dT/.test(value) && Number.isFinite(Date.parse(value));
 const nullable = (value, valid) => value === null || valid(value);
@@ -29,8 +32,10 @@ export function publicUpdateState(value) {
     if (!object(row) || !identifier(row.id) || !text(row.name, 120) || !['current', 'available', 'unavailable', 'unmanaged'].includes(row.state)
       || !['currentVersion', 'latestVersion', 'currentCommit', 'latestCommit'].every(key => nullable(row[key], value => text(value, 128)))
       || row.reason !== undefined && !text(row.reason)) invalid();
+    const notes = releaseNotes(row.releaseNotes);
     return { id: row.id, name: row.name, state: row.state, currentVersion: row.currentVersion, latestVersion: row.latestVersion,
-      currentCommit: row.currentCommit, latestCommit: row.latestCommit, ...(row.reason === undefined ? {} : { reason: row.reason }) };
+      currentCommit: row.currentCommit, latestCommit: row.latestCommit, ...(row.reason === undefined ? {} : { reason: row.reason }),
+      ...(notes ? { releaseNotes: notes } : {}) };
   });
   let job = null;
   if (value.job !== null) {

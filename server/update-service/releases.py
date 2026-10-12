@@ -22,6 +22,9 @@ MAX_INSTALLER = 2 * 1024 * 1024
 MAX_RELEASE_CACHE = 16
 MAX_INSTALLER_CACHE = 16
 MAX_COMPARISON_CACHE = 64
+MAX_RELEASE_NOTES = 6000
+RELEASE_NOTES_TRUNCATED = '\n（更新内容过长，已截断）'
+RELEASE_NOTES_CONTROLS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]')
 RELEASE_CACHE_TTL = 30 * 60
 # Shared by all repositories; cold checks add at most two network workers.
 ARTIFACT_CHECKS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='release-artifact')
@@ -102,6 +105,18 @@ def decode_json(data):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def release_notes(value):
+    """Keep release prose as bounded text; it never participates in an update plan."""
+    if not isinstance(value, str):
+        return ''
+    value = RELEASE_NOTES_CONTROLS.sub('', value.replace('\r\n', '\n').replace('\r', '\n')).strip()
+    encoded = value.encode('utf-8')
+    if len(encoded) <= MAX_RELEASE_NOTES:
+        return value
+    budget = MAX_RELEASE_NOTES - len(RELEASE_NOTES_TRUNCATED.encode('utf-8'))
+    return encoded[:budget].decode('utf-8', errors='ignore') + RELEASE_NOTES_TRUNCATED
 
 
 def architecture():
@@ -243,6 +258,7 @@ class Releases:
             installer = self.installer(module, manifest['commit'], fresh=True)
         return {'releaseId': release['id'], 'commit': manifest['commit'], 'tag': tag,
                 'version': manifest['commit'][:12], 'publishedAt': release['published_at'],
+                'releaseNotes': release_notes(release.get('body')),
                 'manifest': manifest, 'manifestHash': digest(manifest_bytes), 'manifestBytes': manifest_bytes,
                 'installer': installer, 'installerHash': digest(installer), 'applicationKey': item['application_key']}
 

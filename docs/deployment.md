@@ -19,6 +19,8 @@ GitHub Actions 完成必要测试、类型检查、构建和部署包启动验�
 
 服务器默认 `PROJECT_DEPLOY_MODE=ci`，不执行前端 npm 安装、类型检查、完整行为测试或编译。Node/Python 运行环境仍需按需准备；前端编译参数由 CI 决定，服务器配置用于运行时。CI 运行中、失败或候选尚未晋级时，latest 均保持现有正式版；首次没有可用正式包会明确停止。配置、密码、API 凭据和数据库不包含在部署包中，继续保存在各项目原目录。
 
+前端更新面板显示最新正式版 Release 的更新说明。工作台候选版本的说明取自清单所固定提交的标题与正文，并附部署说明；这只描述该发布提交，不是当前版本到最新版本之间的累计变更，因此发布提交应写清用户能理解的具体改动。候选晋级正式版时保留说明，已公开版本重跑发布不会改写说明；草稿重试会补齐说明。后端按纯文本返回最多 6000 个 UTF-8 字节，沿用 30 分钟更新检查缓存。
+
 参数：`--only aster,monitor,asset,crossex,variational,greeks,hub` 选择项目；`--refresh` 重新获取小安装器，不强制重新下载应用包或重启。原管道命令不变，参数放在 `sudo bash -s --` 后。开发排查可显式设置 `PROJECT_DEPLOY_MODE=source`，使用原源码安装流程；`--with-tests` / `PROJECT_DEPLOY_TESTS=1` 仅在 source 模式开启工作台和 CrossEx 的部署测试，CI 模式不会重复执行。
 
 各仓独立发布和部署，不提供七项目整体回滚。下载的安装器副本及预检的发布清单在本次运行内固定；子安装器复用对应清单，不重复查询 latest，避免预检后发布的新版本改变本轮目标。安装器缓存位于 `/var/cache/project-aggregation-stack/`，日志位于 `/var/log/project-aggregation-stack/时间.随机串/`，仅 root 可读；`summary.txt` 记录结果和耗时。日志可能包含首次登录信息。总部署锁为 `/run/lock/project-aggregation-stack.lock`，子安装器继续使用各自部署锁；“完成检查/部署”表示安装器成功退出，实际更新或跳过以模块日志为准。

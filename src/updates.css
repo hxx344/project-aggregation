@@ -53,6 +53,9 @@
 .update-version small{font-size:.6875rem;color:var(--text-tertiary)}
 
 .update-module-note{font-size:.75rem;color:var(--text-tertiary);margin-top:9px;line-height:1.65;overflow-wrap:anywhere}
+.update-release-notes{min-width:0;margin-top:12px;padding-top:4px;border-top:1px solid var(--surface-4)}
+.update-release-notes summary{padding:8px 0;min-height:36px;color:var(--accent);font-size:.8125rem;cursor:pointer}
+.update-release-notes p{margin:8px 0 4px;font-size:.8125rem;line-height:1.75;color:var(--text-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
 
 .update-progress{--text-tertiary:var(--text-secondary);margin-bottom:22px;padding:16px 18px;border:1px solid var(--accent);border-radius:var(--radius-md);background:var(--accent-subtle)}
 .update-progress-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}

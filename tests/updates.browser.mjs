@@ -3,12 +3,13 @@ async (page) => {
   const origin = 'http://127.0.0.1:4175';
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const errors = [], applies = [], checks = [];
+  const releaseNotes = '系统更新可查看具体变更 📝\n- 保留多行说明\n<img src=x onerror="window.__releaseNoteExecuted=true">\n' + '完整说明文本：' + 'x'.repeat(240);
   let reads = 0, unavailable = false, disconnected = false, expireSession = false, loseApplyResponse = false, loseCheckResponse = false;
   let holdRead = false, holdCheck = false, holdApply = false;
   const heldReads = [], heldChecks = [], heldApplies = [];
   const initial = () => ({ enabled: true, checking: false, checkedAt: '2026-10-09T04:00:00.000Z', checkError: null,
     planId: null, expiresAt: '2026-10-09T06:00:00.000Z',
-    modules: [{ id: 'workbench', name: '集序工作台', state: 'current', currentVersion: 'v1.0.0', latestVersion: 'v1.0.0', currentCommit: '1111111111111111111111111111111111111111', latestCommit: '1111111111111111111111111111111111111111' }], job: null });
+    modules: [{ id: 'workbench', name: '集序工作台', state: 'current', currentVersion: 'v1.0.0', latestVersion: 'v1.0.0', currentCommit: '1111111111111111111111111111111111111111', latestCommit: '1111111111111111111111111111111111111111', releaseNotes }], job: null });
   let state = initial();
   const now = async () => new Date(await page.evaluate(() => Date.now())).toISOString();
   const makeAvailable = async id => {
@@ -98,6 +99,15 @@ async (page) => {
   await page.getByRole('button', { name: '系统更新：已是最新正式版', exact: true }).waitFor();
   await emit();
   await openUpdates();
+  const notes = page.locator('.update-release-notes').first();
+  assert(await notes.locator('p').isHidden(), 'release notes start collapsed');
+  await notes.locator('summary').focus();
+  await page.keyboard.press('Enter');
+  assert(await notes.locator('p').isVisible(), 'release notes can be opened by keyboard');
+  assert(await notes.locator('p').textContent() === releaseNotes, 'multiline release notes are shown verbatim as text');
+  assert(await notes.locator('img').count() === 0 && !await page.evaluate(() => window.__releaseNoteExecuted), 'release HTML is never interpreted');
+  await page.screenshot({ path: 'output/playwright/updates-notes-desktop.png' });
+  await notes.locator('summary').click();
   assert(await page.getByText('最新正式版', { exact: true }).count() === 1, 'current and stable target versions are shown');
   assert(checks.length === 0, 'opening the page never triggers a remote check');
   await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
@@ -128,9 +138,11 @@ async (page) => {
   holdRead = true;
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   await waitHeld(heldReads);
-  await makeAvailable('stream-newer-than-get'); state.modules[0].latestVersion = 'v1.2.0'; await emit();
+  await makeAvailable('stream-newer-than-get'); state.modules[0].latestVersion = 'v1.2.0'; state.modules[0].releaseNotes = '新版本的更新说明'; await emit();
   heldReads.shift()(); await page.waitForTimeout(40);
   assert((await page.locator('.update-modules').innerText()).includes('v1.2.0'), 'an old GET cannot replace the pushed version');
+  assert(await page.locator('.update-release-notes p').textContent() === '新版本的更新说明', 'notes stay with the latest pushed version');
+  assert(await page.getByText('该版本未提供更新内容。', { exact: true }).count() === 1, 'legacy releases have a clear missing-notes fallback');
   await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
 
   // A silent open socket is unhealthy even while the browser stays hidden.
@@ -231,6 +243,12 @@ async (page) => {
   assert(await page.evaluate(() => !!document.querySelector('.update-dialog')?.contains(document.activeElement)), 'keyboard focus stays inside the update dialog');
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'mobile page has no horizontal overflow');
   assert(await page.locator('.update-dialog').evaluate(element => element.scrollWidth <= element.clientWidth), 'seven-module dialog has no horizontal overflow');
+  await page.locator('.update-release-notes summary').click();
+  assert(await page.locator('.update-release-notes p').isVisible(), 'mobile release notes expand');
+  assert(await page.locator('.update-dialog').evaluate(element => element.scrollWidth <= element.clientWidth), 'long notes and unbroken text stay within the mobile dialog');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'expanded mobile notes have no page overflow');
+  await page.screenshot({ path: 'output/playwright/updates-notes-mobile.png' });
+  await page.locator('.update-release-notes summary').click();
   await page.screenshot({ path: 'output/playwright/updates-mobile.png' });
   await page.getByRole('button', { name: '查看更新', exact: true }).click();
   assert(await page.locator('.update-review').evaluate(element => { const item = element.getBoundingClientRect(), body = element.closest('.update-body').getBoundingClientRect(); return item.top >= body.top && item.bottom <= body.bottom; }), 'confirmation details scroll into view for seven-module mobile lists');
@@ -257,5 +275,5 @@ async (page) => {
   assert(await page.evaluate(() => window.__updateStreams.every(stream => stream.closed)), 'session expiry closes all update streams');
   assert(errors.length === 0, `browser errors: ${errors.join('; ')}`);
   assert(checks.length === 3, 'only the three explicit manual clicks send check requests');
-  return { passed: true, reads, checks: checks.length, confirmedUpdates: applies.length, scenarios: ['stable versions', 'no automatic checks', 'hidden stream', 'hidden fallback', 'heartbeat timeout', 'offline recovery', 'stale GET isolation', 'two-step confirmation', 'unchanged plan while checking', 'double-click protection', 'late apply response', 'structured progress', 'restart reconnect', 'refresh recovery', 'lost apply response', 'late check response', 'failed check with old cache', 'check failure', 'legacy setup', 'mobile focus', 'seven-module confirmation', 'stale plan', 'plan expiry', 'session expiry'], screenshots: ['updates-desktop.png', 'updates-review.png', 'updates-progress.png', 'updates-mobile.png', 'updates-mobile-review.png'] };
+  return { passed: true, reads, checks: checks.length, confirmedUpdates: applies.length, scenarios: ['stable versions', 'release notes keyboard disclosure and plain text', 'release notes freshness and legacy fallback', 'mobile long release notes', 'no automatic checks', 'hidden stream', 'hidden fallback', 'heartbeat timeout', 'offline recovery', 'stale GET isolation', 'two-step confirmation', 'unchanged plan while checking', 'double-click protection', 'late apply response', 'structured progress', 'restart reconnect', 'refresh recovery', 'lost apply response', 'late check response', 'failed check with old cache', 'check failure', 'legacy setup', 'mobile focus', 'seven-module confirmation', 'stale plan', 'plan expiry', 'session expiry'], screenshots: ['updates-desktop.png', 'updates-review.png', 'updates-progress.png', 'updates-mobile.png', 'updates-mobile-review.png', 'updates-notes-desktop.png', 'updates-notes-mobile.png'] };
 }

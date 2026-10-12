@@ -36,7 +36,7 @@ CHECK_MIN_INTERVAL = 60
 AUTO_CHECK_INTERVAL = 180
 ACTIVE = {'queued', 'running'}
 TOKEN = re.compile(r'[a-f0-9]{32}')
-PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason')
+PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes')
 ENVIRONMENT = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8',
                'PYTHONDONTWRITEBYTECODE': '1', 'DEBIAN_FRONTEND': 'noninteractive'}
 
@@ -289,7 +289,8 @@ class Coordinator:
                     # Some installers correctly retain older equivalent runtime bytes.
                     item.update(currentCommit=receipt['commit'], currentVersion=receipt['commit'][:12])
             release = self.releases.read(module)
-            item.update(latestVersion=release['version'], latestCommit=release['commit'])
+            item.update(latestVersion=release['version'], latestCommit=release['commit'],
+                        releaseNotes=release.get('releaseNotes', ''))
             current = item['currentCommit']
             same_application = item.get('applicationKey') == release['applicationKey']
             same_installer = current == release['commit']

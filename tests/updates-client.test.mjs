@@ -76,3 +76,37 @@ test('updater state rejects malformed schemas, unsafe types and oversized fields
     { ...state(), job: { id: '1', status: 'arbitrary', startedAt: now, finishedAt: null, activeModule: null, steps: [], message: 'x' } }];
   for (const value of invalid) assert.throws(() => publicUpdateState(value), error => error.status === 503);
 });
+
+test('release notes cross the public client as bounded multiline Unicode text', async t => {
+  const notes = '改进系统更新 📝\n- 显示具体变更\n\t<img src=x onerror=alert(1)> 按文本显示';
+  const client = await fixture(t, (req, res) => {
+    const value = state();
+    value.modules[0].releaseNotes = notes;
+    value.modules[0].installer = 'private-command';
+    res.end(JSON.stringify(value));
+  });
+  for (const value of [await client.status(), await client.check(), await client.apply(planId)]) {
+    assert.equal(value.modules[0].releaseNotes, notes);
+    assert.equal(value.modules[0].installer, undefined);
+  }
+  const value = state();
+  value.modules[0].releaseNotes = '😀'.repeat(1500);
+  assert.equal(publicUpdateState(value).modules[0].releaseNotes, value.modules[0].releaseNotes, '6000 UTF-8 bytes are accepted');
+});
+
+test('missing or malformed optional release notes do not disable an otherwise valid update', () => {
+  for (const notes of [undefined, null, {}, 123, true, '', ' \t\n ', '😀'.repeat(1500) + 'x', '中'.repeat(2001),
+    'bad\u0000text', 'bad\u001btext', 'bad\u007ftext', 'bad\u0085text', 'bad\u061ctext', 'bad\u200etext',
+    'bad\u202etext', 'bad\u2066text', 'bad\ud800text']) {
+    const value = state();
+    value.modules[0].releaseNotes = notes;
+    const result = publicUpdateState(value);
+    assert.equal(result.enabled, true);
+    assert.equal(result.planId, planId);
+    assert.equal(result.modules[0].state, 'available');
+    assert.equal(result.modules[0].releaseNotes, undefined);
+  }
+  const value = state();
+  value.modules[0].reason = '仍不允许\n多行错误信息';
+  assert.throws(() => publicUpdateState(value), error => error.status === 503, 'existing message validation is unchanged');
+});

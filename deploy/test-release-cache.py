@@ -111,14 +111,52 @@ class ReleaseCacheTests(unittest.TestCase):
         self.value = self.entry['releases'][NEW]
 
     def test_repeated_check_revalidates_discovery_manifest_and_artifact_only(self):
+        self.value['metadata']['body'] = '修复版本检查\n保留更新内容 🚀'
         first = self.reader.read(self.module)
+        self.value['metadata']['body'] = '同一版本的说明稍后才刷新'
         second = self.reader.read(self.module)
         self.assertEqual(first, second)
+        self.assertEqual(second['releaseNotes'], '修复版本检查\n保留更新内容 🚀')
         self.assertEqual(self.network.counts(), {'discovery': 2, 'manifest': 2, 'artifact': 2,
                                                  'metadata': 1, 'installer': 1})
         first['manifest']['repository'] = 'changed-by-caller'
         second['manifest']['artifacts'].clear()
         self.assertEqual(self.reader.read(self.module)['manifest'], self.value['manifest'])
+
+    def test_release_notes_preserve_plain_text_and_normalize_controls(self):
+        self.value['metadata']['body'] = (' \r\n## 更新内容\r\n- 中文与表情 👩‍💻\r'
+                                          '\t<script>alert("text")</script>\n'
+                                          '\x00\x08\x0b\x0c\x1b\x7f\x85\u061c\u200e\u200f'
+                                          '\u202a\u202e\u2066\u2069\ud800结束\udfff \n')
+        result = self.reader.read(self.module)
+        self.assertEqual(result['releaseNotes'], '## 更新内容\n- 中文与表情 👩‍💻\n'
+                                                '\t<script>alert("text")</script>\n结束')
+        self.assertEqual(result['commit'], NEW)
+
+    def test_missing_invalid_or_whitespace_release_notes_do_not_block_checks(self):
+        self.assertEqual(self.reader.read(self.module)['releaseNotes'], '')
+        for body in (None, False, 123, [], {'text': 'not a string'}, ' \r\n\t\x00 '):
+            with self.subTest(body=body):
+                self.value['metadata']['body'] = body
+                result = self.reader.read(self.module, self.value['metadata']['id'])
+                self.assertEqual(result['releaseNotes'], '')
+                self.assertEqual(result['commit'], NEW)
+
+    def test_release_notes_limit_utf8_bytes_without_splitting_unicode(self):
+        for body in ('a' * 6000, '中' * 2000, '🚀' * 1500):
+            with self.subTest(boundary=body[:1]):
+                self.value['metadata']['body'] = body
+                result = self.reader.read(self.module, self.value['metadata']['id'])
+                self.assertEqual(result['releaseNotes'], body)
+        for body in ('a' * 6001, '中' * 3000, '🚀' * 2000):
+            with self.subTest(truncated=body[:1]):
+                self.value['metadata']['body'] = body
+                text = self.reader.read(self.module, self.value['metadata']['id'])['releaseNotes']
+                self.assertLessEqual(len(text.encode('utf-8')), 6000)
+                self.assertTrue(text.endswith('\n（更新内容过长，已截断）'))
+                prefix = text.removesuffix('\n（更新内容过长，已截断）')
+                self.assertTrue(body.startswith(prefix))
+                self.assertNotIn('\ufffd', text)
 
     def test_changed_manifest_revalidates_eligibility_and_manifest_with_pinned_installer_cache(self):
         first = self.reader.read(self.module)
@@ -134,9 +172,11 @@ class ReleaseCacheTests(unittest.TestCase):
         self.assertFalse(self.reader._releases)
 
     def test_cache_expiry_refreshes_recreated_release_id_without_leaking_timestamps(self):
+        self.value['metadata']['body'] = '最初的更新内容'
         first = self.reader.read(self.module)
         self.value['metadata']['id'] = 2
         self.value['metadata']['published_at'] = '2026-10-10T12:00:00Z'
+        self.value['metadata']['body'] = '已修订的更新内容'
         self.clock += releases.RELEASE_CACHE_TTL - 1
         self.assertEqual(self.reader.read(self.module), first)
         self.assertEqual(self.network.counts()['metadata'], 1)
@@ -144,8 +184,9 @@ class ReleaseCacheTests(unittest.TestCase):
         refreshed = self.reader.read(self.module)
         self.assertEqual(refreshed['releaseId'], 2)
         self.assertEqual(refreshed['publishedAt'], self.value['metadata']['published_at'])
+        self.assertEqual(refreshed['releaseNotes'], '已修订的更新内容')
         self.assertEqual(refreshed['manifestHash'], first['manifestHash'])
-        self.assertEqual(set(refreshed), {'releaseId', 'commit', 'tag', 'version', 'publishedAt', 'manifest',
+        self.assertEqual(set(refreshed), {'releaseId', 'commit', 'tag', 'version', 'publishedAt', 'releaseNotes', 'manifest',
                                          'manifestHash', 'manifestBytes', 'installer', 'installerHash', 'applicationKey'})
         self.assertEqual(self.network.counts()['metadata'], 2)
         self.assertEqual(self.network.counts()['installer'], 1)
@@ -165,11 +206,13 @@ class ReleaseCacheTests(unittest.TestCase):
         self.assertEqual(self.network.counts()['metadata'], 2)
 
     def test_new_tag_fetches_new_metadata_installer_and_artifact(self):
-        self.reader.read(self.module)
+        self.value['metadata']['body'] = '旧版本的更新内容'
+        self.assertEqual(self.reader.read(self.module)['releaseNotes'], '旧版本的更新内容')
         self.network.add(self.module, NEXT, 2)
         self.entry['latest'] = NEXT
         result = self.reader.read(self.module)
         self.assertEqual(result['commit'], NEXT)
+        self.assertEqual(result['releaseNotes'], '')
         self.assertEqual(self.network.counts(), {'discovery': 2, 'manifest': 2, 'artifact': 2,
                                                  'metadata': 2, 'installer': 2})
 

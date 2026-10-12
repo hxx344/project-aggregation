@@ -6,6 +6,7 @@ export type UpdateModule = {
   latestVersion: string | null;
   currentCommit: string | null;
   latestCommit: string | null;
+  releaseNotes?: string;
   reason?: string;
 };
 

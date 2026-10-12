@@ -289,6 +289,45 @@ class CoordinatorTests(RootFixture):
         self.assertIsNotNone(result['planId'], result)
         return result['planId']
 
+    def test_release_notes_are_public_but_never_change_the_reviewed_plan(self):
+        self.network.values['hub']['metadata']['body'] = '修复检查\r\n<script>仅作文本</script> 🚀'
+        first = self.check()
+        self.assertEqual(first['modules'][-1]['releaseNotes'], '修复检查\n<script>仅作文本</script> 🚀')
+        self.assertEqual(first['modules'][-1]['state'], 'available')
+        plan_id = first['planId']
+        plan = self.coordinator.read_plan(plan_id)
+        self.assertNotIn('releaseNotes', json.dumps(plan))
+        self.assertNotIn('修复检查', json.dumps(plan, ensure_ascii=False))
+        self.clock += 180
+        self.network.values['hub']['metadata']['body'] = '更正说明内容'
+        second = self.check()
+        self.assertEqual(second['modules'][-1]['releaseNotes'], '更正说明内容')
+        self.assertEqual(second['planId'], plan_id)
+        self.assertEqual(self.coordinator.read_plan(plan_id), plan)
+        self.network.values['hub']['metadata']['body'] = '执行时再次修改说明'
+        self.coordinator.apply(plan_id)
+        self.coordinator.run()
+        self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
+
+    def test_legacy_release_and_saved_module_without_notes_remain_compatible(self):
+        original = self.reader.read
+        def legacy_read(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result.pop('releaseNotes')
+            return result
+        with patch.object(self.reader, 'read', side_effect=legacy_read):
+            result = self.check()
+        self.assertIsNotNone(result['planId'])
+        self.assertTrue(all(item['releaseNotes'] == '' for item in result['modules']))
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            for item in state['modules']:
+                item.pop('releaseNotes')
+            self.coordinator.save(state)
+        public = self.coordinator.status()
+        self.assertEqual(public['planId'], result['planId'])
+        self.assertTrue(all('releaseNotes' not in item for item in public['modules']))
+
     def test_doc_only_changes_are_current_and_installer_changes_apply_once(self):
         self.installed = [self.installed[-1]]
         self.installed[0]['applicationKey'] = NEW_KEY
