@@ -157,19 +157,20 @@ export default function App() {
       current.onerror = () => { if (controller.signal.aborted || stream !== current) return; streamLive.current = false; void load(controller.signal); };
     };
     const resume = () => {
-      clearTimeout(resumeTimer);
       if (!navigator.onLine || controller.signal.aborted) return;
       if (!stream || watchdog.expired()) connect();
+      if (resumeTimer !== undefined) return;
       const previousRead = pendingLoad.current;
       // Coalesce wake events and give the stream a chance to supply fresh data.
       resumeTimer = setTimeout(() => {
+        resumeTimer = undefined;
         if (!controller.signal.aborted && navigator.onLine && !streamLive.current) {
           void load(controller.signal, previousRead !== null && pendingLoad.current === previousRead);
         }
       }, 1000);
     };
     const visible = () => { if (!document.hidden) resume(); };
-    const offline = () => { clearTimeout(resumeTimer); connect(); pendingLoad.current?.controller.abort(); };
+    const offline = () => { clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);

@@ -81,14 +81,19 @@ async (page) => {
   changes = (await reads()).slice(before);
   assert(paths.every(path => changes.filter(read => read.path === path).length === 1), 'network recovery reads each endpoint once');
 
-  // A fallback started after the wake event must be reused, not cancelled at 1s.
+  // A fallback between separate wake events must not become an "old" read.
   hold = true; before = (await reads()).length;
-  await burst();
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await advance(100);
   await page.evaluate(() => window.__streams.findLast(stream => !stream.closed && stream.url.includes('/overview/')).onerror?.());
+  await page.getByRole('button', { name: /^系统更新：/ }).click();
+  await advance(100);
+  await page.evaluate(() => window.dispatchEvent(new Event('pageshow')));
   await advance(1_100);
   changes = (await reads()).slice(before);
   assert(paths.every(path => changes.filter(read => read.path === path).length === 1) && changes.every(read => !read.aborted), 'wake reuses fallback reads started during the grace period');
   hold = false; held.splice(0).forEach(resolve => resolve()); await page.waitForTimeout(50);
+  await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
 
   before = (await reads()).length;
   await burst();

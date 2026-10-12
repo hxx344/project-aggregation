@@ -189,12 +189,13 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
       } catch { failed(); }
     };
     const resume = () => {
-      clearTimeout(resumeTimer);
       if (!navigator.onLine || disposed) return;
       if (!stream || performance.now() - receivedAt >= STREAM_TIMEOUT) connect();
+      if (resumeTimer !== undefined) return;
       const previousRead = requestRef.current;
       // Reuse reads started during the grace period; replace only the old read.
       resumeTimer = setTimeout(() => {
+        resumeTimer = undefined;
         if (!disposed && navigator.onLine && !streamLive) {
           void request('read', undefined, previousRead !== null && requestRef.current === previousRead);
         }
@@ -203,6 +204,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     const visible = () => { if (!document.hidden) resume(); };
     const offline = () => {
       clearTimeout(resumeTimer);
+      resumeTimer = undefined;
       disconnect();
       if (requestRef.current?.kind === 'read') { requestRef.current.controller.abort(); requestRef.current = null; setPending(null); }
       setNetworkError('暂时无法连接更新服务，正在重连。');
