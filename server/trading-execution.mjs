@@ -3,7 +3,7 @@ import { createExecutionExchangeClient, ExecutionExchangeError } from './trading
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
 import { TRADING_NAMES } from './trading-markets.mjs';
-import { createStatementCache } from './trading-db.mjs';
+import { createStatementCache } from './db-cache.mjs';
 
 const iso = time => new Date(time).toISOString();
 const FINAL = new Set(['completed', 'stopped']);
