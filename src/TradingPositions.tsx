@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, ChevronDown, CircleAlert, LoaderCircle, RefreshCw, ShieldCheck, Wallet } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { AssetPosition, PositionAccount, PositionScope, PositionScopeStatus, PositionSource, TradingPositionsResponse } from './trading-positions-types';
@@ -28,7 +28,7 @@ function amount(value: string | null, signed = false) {
 function Money({ value, currency, signed = false }: { value: string | null; currency: string | null; signed?: boolean }) {
   return <>{amount(value, signed)}{value !== null ? <small className="positions-unit">{currency || '币种未提供'}</small> : null}</>;
 }
-function PositionRow({ position }: { position: AssetPosition }) {
+const PositionRow = memo(function PositionRow({ position }: { position: AssetPosition }) {
   const pnlClass = position.unrealizedPnl && /[1-9]/.test(position.unrealizedPnl) ? position.unrealizedPnl.startsWith('-') ? 'positions-negative' : 'positions-positive' : '';
   const quantityUnit = position.quantityUnit === 'contracts' ? '张' : position.quantityUnit;
   return <tr data-position-id={position.id}>
@@ -48,8 +48,8 @@ function PositionRow({ position }: { position: AssetPosition }) {
       <div><dt>交易所变更时间 · 北京时间</dt><dd>{position.sourceUpdatedAt ? formatDate(position.sourceUpdatedAt) : '未提供'}</dd></div>
     </dl></details></td>
   </tr>;
-}
-function ScopePositions({ scope, stale, now, context }: { scope: PositionScope; stale: boolean; now: number; context: string }) {
+});
+const ScopePositions = memo(function ScopePositions({ scope, stale, now, context }: { scope: PositionScope; stale: boolean; now: number; context: string }) {
   const status = scope.status === 'live' && (stale || oldTime(scope.fetchedAt, now)) ? 'stale' : scope.status;
   const emptyText = status === 'live' ? '当前无持仓' : status === 'unconfigured' ? '在 Asset 配置此账户后显示仓位。' : status === 'unsupported' ? 'Asset 暂不支持读取此产品范围。' : status === 'loading' ? '正在首次读取，尚未确认仓位。' : '尚无可确认的仓位数据。';
   return <section className="positions-scope" data-scope={scope.id}>
@@ -57,7 +57,7 @@ function ScopePositions({ scope, stale, now, context }: { scope: PositionScope; 
     {scope.error ? <p className="positions-warning"><CircleAlert size={15} />{scope.error}</p> : null}
     {scope.positions.length ? <div className="positions-table-scroll" role="region" tabIndex={0} aria-label={`${context} · ${scope.label}仓位`}><table className="positions-table"><thead><tr><th scope="col">合约</th><th scope="col">方向</th><th scope="col">数量 / 单位</th><th scope="col">开仓均价</th><th scope="col">标记价格</th><th scope="col">名义价值</th><th scope="col">未实现盈亏</th><th scope="col"><span className="visually-hidden">仓位详情</span></th></tr></thead><tbody>{scope.positions.map(position => <PositionRow key={position.id} position={position} />)}</tbody></table></div> : <p className={`positions-scope-empty ${status === 'live' ? 'confirmed' : ''}`}>{emptyText}</p>}
   </section>;
-}
+});
 
 export default function TradingPositions({ onExpired, onProject, navigationSearch }: { onExpired: () => void; onProject: (id: string) => void; navigationSearch: string }) {
   const [data, setData] = useState<TradingPositionsResponse | null>(null);

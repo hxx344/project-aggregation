@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
@@ -31,7 +31,7 @@ function amount(value: string | null, signed = false) {
 function polarity(value: string | null) { return value === null || !/[1-9]/.test(value) ? '' : value.startsWith('-') ? 'trading-negative' : 'trading-positive'; }
 function ReadStatus({ state }: { state: TradingReadState }) { return <span className={`trading-status ${state}`}><i aria-hidden="true" />{stateNames[state]}</span>; }
 
-function PositionDetails({ position }: { position: TradingPosition }) {
+const PositionDetails = memo(function PositionDetails({ position }: { position: TradingPosition }) {
   return <details className="trading-position-details"><summary>仓位详情<ChevronDown size={13} /></summary><dl>
     <div><dt>持仓模式</dt><dd>{position.mode === 'hedge' ? '双向持仓' : '单向持仓'}</dd></div>
     {position.marginMode ? <div><dt>保证金模式</dt><dd>{accountModeNames[position.marginMode]}</dd></div> : null}
@@ -40,8 +40,8 @@ function PositionDetails({ position }: { position: TradingPosition }) {
     <div><dt>强平价 · USDT/底层单位</dt><dd>{amount(position.liquidationPrice)}</dd></div>
     <div><dt>交易所仓位变更时间</dt><dd>{position.sourceUpdatedAt ? formatDate(position.sourceUpdatedAt) : '交易所未提供'}</dd></div>
   </dl></details>;
-}
-function PositionRow({ leg, position, first }: { leg: TradingLeg; position: TradingPosition | null; first: boolean }) {
+});
+const PositionRow = memo(function PositionRow({ leg, position, first }: { leg: TradingLeg; position: TradingPosition | null; first: boolean }) {
   return <tr className={first ? 'trading-leg-start' : ''} data-leg={leg.id}>
     <th scope="row" className="trading-leg-name"><strong>{position?.instrumentId ?? leg.symbol}</strong><span>{exchangeNames[leg.exchange]}</span>{first ? <ReadStatus state={leg.state} /> : <small>同一合约的另一仓位</small>}</th>
     <td data-label="方向">{position ? <span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span> : <span className="trading-muted">{leg.state === 'live' ? '无持仓' : '暂无仓位数据'}</span>}</td>
@@ -52,7 +52,7 @@ function PositionRow({ leg, position, first }: { leg: TradingLeg; position: Trad
     <td data-label="未实现盈亏 · USDT" className={polarity(position?.unrealizedPnl ?? null)}>{amount(position?.unrealizedPnl ?? null, true)}</td>
     <td className="trading-details-cell">{position ? <PositionDetails position={position} /> : null}</td>
   </tr>;
-}
+});
 function AccountConnection({ account, busy, mutate, sources, sourcesLoading, importAccount }: {
   account: TradingAccount; busy: boolean;
   mutate: (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => Promise<boolean>;

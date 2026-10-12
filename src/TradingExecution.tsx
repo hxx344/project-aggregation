@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { ArrowRightLeft, ChevronDown, CircleAlert, Clock3, Link2, LoaderCircle, RefreshCw, Square, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
@@ -39,7 +39,7 @@ function structure(preset: ExecutionPreset, exchange: TradingExchange, symbol: O
   return [{ exchange: left, symbol: 'CLUSDT', side: first }, { exchange: left, symbol: 'BZUSDT', side: second }, { exchange: right, symbol: 'CLUSDT', side: second }, { exchange: right, symbol: 'BZUSDT', side: first }];
 }
 
-function ConnectionForm({ connection, disabled, write }: { connection: ExecutionConnection; disabled: boolean; write: Write }) {
+const ConnectionForm = memo(function ConnectionForm({ connection, disabled, write }: { connection: ExecutionConnection; disabled: boolean; write: Write }) {
   const [mode, setMode] = useState<TradingAccountMode>(connection.exchange === 'okx' ? connection.accountMode === 'isolated' ? 'isolated' : 'cross' : connection.accountMode);
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
@@ -64,9 +64,9 @@ function ConnectionForm({ connection, disabled, write }: { connection: Execution
       <div className="execution-actions"><button className="button primary" type="submit" disabled={!apiKey.trim() || !apiSecret.trim() || connection.exchange === 'okx' && !passphrase.trim()}><Link2 size={15} />{connection.connected ? '验证并替换实盘连接' : '验证并连接实盘账户'}</button>{connection.connected ? <button className="button secondary" type="button" onClick={() => { setPassphrase(''); void write(`/accounts/${connection.exchange}`, { revision: connection.revision }, 'DELETE'); }}><Unplug size={15} />断开</button> : null}</div>
     </fieldset>
   </form>;
-}
+});
 
-function JobCard({ job, disabled, canPreview, write, resume }: { job: ExecutionJob; disabled: boolean; canPreview: boolean; write: Write; resume: (id: string) => void }) {
+const JobCard = memo(function JobCard({ job, disabled, canPreview, write, resume }: { job: ExecutionJob; disabled: boolean; canPreview: boolean; write: Write; resume: (id: string) => void }) {
   const [strategyIds, setStrategyIds] = useState<Record<string, string>>({});
   const [acknowledged, setAcknowledged] = useState<Record<string, boolean>>({});
   return <article className={`execution-job ${job.status}`} aria-label={`${PRESETS[job.preset]}${job.action === 'open' ? '开仓' : '平仓'} ${STATUS[job.status]}`}>
@@ -89,9 +89,9 @@ function JobCard({ job, disabled, canPreview, write, resume }: { job: ExecutionJ
     <footer><span>停止只撤销余单，已成交仓位保留。</span>{job.canResume ? <button className="button secondary" type="button" disabled={disabled || !canPreview} onClick={() => resume(job.id)}>预览继续剩余</button> : null}</footer>
     <details className="execution-events"><summary>执行记录与编号</summary><p>执行编号：{job.id} · 最晚结束：{date(job.deadlineAt)}（北京时间）</p><ul>{job.events.map((event, index) => <li key={`${event.time}-${index}`}><time>{date(event.time)}</time><span>{event.message}</span></li>)}</ul></details>
   </article>;
-}
+});
 
-function Preview({ preview, expired, disabled, uncertain, onSubmit, onEdit }: { preview: ExecutionPreview; expired: boolean; disabled: boolean; uncertain: boolean; onSubmit: () => void; onEdit: () => void }) {
+const Preview = memo(function Preview({ preview, expired, disabled, uncertain, onSubmit, onEdit }: { preview: ExecutionPreview; expired: boolean; disabled: boolean; uncertain: boolean; onSubmit: () => void; onEdit: () => void }) {
   return <section className="execution-review" aria-labelledby="execution-review-title" tabIndex={-1}>
     <div className="execution-review-title"><div><h3 id="execution-review-title">确认{preview.resumeJobId ? '剩余数量的' : ''}{PRESETS[preview.preset]}{preview.action === 'open' ? '开仓' : '平仓'}</h3><p>预览有效至 {date(preview.expiresAt)}（北京时间）</p></div><span className="execution-badge connected">限价 · 仅挂单</span></div>
     <div className="execution-review-accounts">{preview.connections.map(connection => <p key={connection.exchange}><strong>{EXCHANGES[connection.exchange]}</strong> {MODES[connection.accountMode]} · UID {connection.identity ?? '未返回'} · 密钥尾号 {connection.keyLabel ?? '未返回'}</p>)}</div>
@@ -104,7 +104,7 @@ function Preview({ preview, expired, disabled, uncertain, onSubmit, onEdit }: { 
     {uncertain ? <p className="execution-warning" role="alert">本次提交结果尚未确认。请用下方按钮核对同一次提交，不要重复创建组合。</p> : expired ? <p className="execution-warning" role="status">预览已过期，请重新获取盘口与持仓后确认。</p> : null}
     <div className="execution-actions"><button className="button primary" type="button" disabled={disabled || expired && !uncertain} onClick={onSubmit}>{disabled ? <LoaderCircle size={16} className="spin" /> : <ArrowRightLeft size={16} />}{uncertain ? '重新核对本次提交' : `确认并一键${preview.action === 'open' ? '开仓' : '平仓'}`}</button><button className="button secondary" type="button" disabled={disabled || uncertain} onClick={onEdit}>返回修改参数</button></div>
   </section>;
-}
+});
 
 export default function TradingExecution({ pair, onExpired }: { pair: TradingPair; onExpired: () => void }) {
   const [state, setState] = useState<ExecutionState | null>(null);
