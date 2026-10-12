@@ -1,0 +1,8 @@
+node_modules/
+.next/
+next-env.d.ts
+lib/imported-ledger.json
+*.tsbuildinfo
+.data/
+.env*
+dist/

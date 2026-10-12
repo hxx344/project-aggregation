@@ -21,13 +21,13 @@ git -C "$fixture/source" config user.name fixture
 git -C "$fixture/source" config user.email fixture@example.invalid
 commit_source() { git -C "$fixture/source" add .; git -C "$fixture/source" commit -qm "$1"; }
 commit_source initial
-service=$(sed -n 's/^SERVICE=//p' "$repository/install.sh")
+service=$(sed -n 's/^SERVICE=//p' "$repository/deploy/install.sh")
 sed -e "s|/opt/$service|$fixture/application|g" \
     -e "s|/var/lib/$service|$fixture/data|g" \
     -e "s|/etc/$service.env|$fixture/environment|g" \
     -e "s|/etc/systemd/system/$service.service|$fixture/unit|g" \
     -e "s|/run/lock/$service-install.lock|$fixture/install.lock|g" \
-    -e "s|/run/systemd/system|$fixture|g" "$repository/install.sh" > "$fixture/installer.sh"
+    -e "s|/run/systemd/system|$fixture|g" "$repository/deploy/install.sh" > "$fixture/installer.sh"
 cat > "$fixture/runtime/node" <<'NODE'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -72,6 +72,9 @@ AGG_INSTALL_SOURCE_ONLY=1 source "$FIXTURE_ROOT/installer.sh"
 REPOSITORY="$FIXTURE_ROOT/source"
 SERVICE_USER=root
 ensure_tools() { :; }
+validate_embedded_runtime() { :; }
+prepare_greeks_runtime() { :; }
+migrate_embedded_modules() { :; }
 ensure_node() { NODE_BIN="$FIXTURE_ROOT/runtime/node"; }
 run_as_service() { "$@"; }
 systemctl() {

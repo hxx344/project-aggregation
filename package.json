@@ -13,6 +13,9 @@
     "check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
     "build:bundle": "vite build",
+    "install:modules": "node scripts/modules.mjs install",
+    "build:modules": "node scripts/modules.mjs build",
+    "build:all": "npm run build && npm run build:modules",
     "start": "node server/index.mjs",
     "test": "node --test tests/*.test.mjs"
   },

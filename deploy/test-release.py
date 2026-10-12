@@ -107,6 +107,14 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         self.save_manifest()
         self.run_helper(False, TEST_ARCH='riscv64')
 
+    def test_architecture_package_accepts_regular_native_runtime_binaries(self):
+        content = b'platform-specific-native-runtime'
+        member = tarfile.TarInfo('modules/asset/node_modules/native/binding.node')
+        member.size, member.mode = len(content), 0o755
+        self.archive(extra=(member, content))
+        self.run_helper()
+        self.assertEqual((self.root / 'extracted' / member.name).read_bytes(), content)
+
     def test_corrupt_download_and_failure(self):
         (self.root / 'archive.tar.gz').write_bytes(b'corrupt download')
         self.run_helper(False)

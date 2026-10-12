@@ -2,7 +2,7 @@
 # The shared release helper is tested separately; exercise orchestration before any mutation.
 set -Eeuo pipefail
 unset PROJECT_DEPLOY_MODE PROJECT_DEPLOY_TESTS
-AGG_STACK_SOURCE_ONLY=1 source "$(dirname "$0")/../install-all.sh"
+AGG_STACK_SOURCE_ONLY=1 source "$(dirname "$0")/install-all.sh"
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 export STACK_CI_FIXTURE=$fixture
@@ -62,7 +62,7 @@ SCRIPT
 stack_parse
 [[ "$stack_mode" == ci ]]
 if PROJECT_DEPLOY_MODE=invalid stack_parse; then echo 'Invalid mode accepted' >&2; exit 1; fi
-stack_parse --only monitor,hub
+stack_parse --only hub
 dpkg-query() { printf '%s\n' "${@: -1}" >> "$fixture/packages"; printf 'install ok installed'; }
 apt-get() { echo 'Unexpected package reinstall' >&2; return 90; }
 stack_ensure_tools
@@ -91,6 +91,6 @@ new_run
 stack_prefetch
 [[ $(wc -l < "$fixture/manifests") -ge 2 && $(wc -l < "$fixture/heads") -ge 2 ]]
 stack_run_installers
-printf 'monitor\nhub\n' > "$fixture/expected"
+printf 'hub\n' > "$fixture/expected"
 cmp "$fixture/expected" "$fixture/executed"
 printf 'CI stack preflight, failure isolation, runtime dependencies and mode propagation passed.\n'

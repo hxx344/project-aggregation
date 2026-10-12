@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node", "vite/client"],
+    "tsBuildInfoFile": ".build-cache/tsconfig.tsbuildinfo"
+  },
+  "exclude": [
+    "node_modules",
+    "examples",
+    "build",
+    "db",
+    "cloudflare-env.d.ts",
+    "drizzle.config.ts"
+  ]
+}

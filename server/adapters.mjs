@@ -4,6 +4,7 @@ const loginSessions = new Map();
 import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import { moduleTransport } from './modules/transport.mjs';
 
 // HTTP Keep-Alive connection pools to reuse TCP connections
 const httpAgent = new http.Agent({
@@ -95,10 +96,11 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
   const timer = setTimeout(abort, remaining);
   const hostname = target.hostname.replace(/^\[|\]$/g, '');
   try {
+    const transport = moduleTransport(target);
     // Security: Resolve DNS and validate addresses before making the request
     // This prevents DNS rebinding attacks by pinning the resolved address
     const addresses = await Promise.race([
-      cachedLookup(hostname),
+      transport ? Promise.resolve([{ address: '127.0.0.1', family: 4 }]) : cachedLookup(hostname),
       new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(new UpstreamError('timeout', '服务响应超时')), { once: true })),
     ]);
     if (!addresses.length || addresses.some(({ address }) => blockedAddress(address))) throw new UpstreamError('invalid', '服务地址解析到不允许访问的地址');
@@ -110,10 +112,11 @@ export async function requestJson(base, path, { method = 'GET', headers = {}, bo
     return await new Promise((resolve, reject) => {
       const req = (target.protocol === 'https:' ? https : http).request(target, {
         method, signal: controller.signal,
-        agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
+        agent: transport ? false : target.protocol === 'https:' ? httpsAgent : httpAgent,
+        ...(transport ? { socketPath: transport.socketPath } : {}),
         // Force Node.js to use the pinned address; prevents re-resolution during the request
         lookup: (_name, options, callback) => options.all ? callback(null, [pinnedAddress]) : callback(null, pinnedAddress.address, pinnedAddress.family),
-        headers: { Accept: 'application/json', Connection: 'keep-alive', ...headers, ...(serialized ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(serialized) } : {}) },
+        headers: { Accept: 'application/json', Connection: 'keep-alive', ...headers, ...(transport ? { 'x-workspace-key': transport.secret } : {}), ...(serialized ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(serialized) } : {}) },
       }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400) { res.destroy(); reject(new UpstreamError('invalid', '服务返回重定向，请配置最终服务地址')); return; }
         if ([401, 403, 429].includes(res.statusCode)) { res.destroy(); reject(new UpstreamError('unauthorized', res.statusCode === 429 ? '上游登录限流，请稍后重试' : '需要有效的网页登录凭据，请检查项目设置', res.statusCode)); return; }
@@ -259,6 +262,7 @@ function waitWithin(promise, deadline, signal) {
 }
 async function authenticatedSession(project, credentials, { request, deadline, signal, sessionScope = '' }) {
   const authOrigin = project.authOrigin || new URL(project.apiUrl).origin;
+  if (project.embedded) return { headers: { Origin: authOrigin } };
   if (!credentials?.password) return { headers: { Origin: authOrigin } };
   const key = createHash('sha256').update(JSON.stringify([project.apiUrl, project.adapter, authOrigin, credentials.password, sessionScope])).digest('hex');
   const now = Date.now();

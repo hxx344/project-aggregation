@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real git trees; runs on native Git Bash as well as Linux without services/symlinks.
 set -Eeuo pipefail
-AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/../install.sh"
+AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/install.sh"
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 APP_DIR="$fixture/application"
@@ -54,6 +54,13 @@ capture
 echo dependency >> "$source_dir/package-lock.json"; refresh; compare 1 1 1 1 1
 capture
 runtime_key=another-node; input_keys; compare 1 1 1 1 1
+capture
+mkdir -p "$source_dir/modules/monitor"
+echo module > "$source_dir/modules/monitor/package.json"; refresh; compare 0 1 1 1 1
+capture
+echo lock > "$source_dir/modules/monitor/package-lock.json"; refresh; compare 0 1 1 1 1
+capture
+echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 1 1 1 1
 commit=invalid-source
 if input_keys 2>/dev/null; then echo 'Invalid git source was silently hashed' >&2; exit 1; fi
 printf 'Git input classification passed, including tsconfig, Vite env and failed reads.\n'

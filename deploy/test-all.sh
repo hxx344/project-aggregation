@@ -2,7 +2,7 @@
 # Contract tests for orchestration; no real network, package install or service changes.
 set -Eeuo pipefail
 export PROJECT_DEPLOY_MODE=source
-AGG_STACK_SOURCE_ONLY=1 source "$(dirname "$0")/../install-all.sh"
+AGG_STACK_SOURCE_ONLY=1 source "$(dirname "$0")/install-all.sh"
 test_parent=$(realpath "${TMPDIR:-/tmp}")
 test_root=$(mktemp -d "$test_parent/project-stack-test.XXXXXXXX")
 test_cleanup() {
@@ -86,46 +86,24 @@ if [[ $(uname -s) != Linux ]]; then
 fi
 
 stack_parse
-[[ ${stack_selected[*]} == 'aster monitor asset crossex variational greeks hub' ]]
-[[ $stack_with_tests == 0 ]]
+[[ ${stack_selected[*]} == hub && $stack_with_tests == 0 ]]
 PROJECT_DEPLOY_TESTS=1 stack_parse
 [[ $stack_with_tests == 1 ]]
 PROJECT_DEPLOY_TESTS=0 stack_parse --with-tests
 [[ $stack_with_tests == 1 ]]
 stack_parse
 [[ $stack_with_tests == 0 ]]
+for invalid in aster monitor asset crossex greeks variational unknown ',hub' 'hub,' 'hub,,hub'; do
+  if (stack_parse --only "$invalid"); then echo "Invalid selection accepted: $invalid" >&2; exit 1; fi
+done
 for invalid_mode in '' 2 true invalid; do
   if (PROJECT_DEPLOY_TESTS=$invalid_mode stack_parse); then echo 'Invalid test mode accepted' >&2; exit 1; fi
 done
-stack_parse --only hub,monitor,monitor,aster
-[[ ${stack_selected[*]} == 'aster monitor hub' ]]
-stack_parse --only hub,variational
-[[ ${stack_selected[*]} == 'variational hub' ]]
-[[ ${STACK_REPOS[variational]} == variational-grid && ${STACK_PATHS[variational]} == install.sh ]]
-stack_parse --only hub,greeks
-[[ ${stack_selected[*]} == 'greeks hub' ]]
-[[ ${STACK_REPOS[greeks]} == greeks && ${STACK_PATHS[greeks]} == install.sh ]]
-if stack_greeks_preflight ubuntu:22.04; then echo 'Unsupported Greeks OS accepted' >&2; exit 1; fi
-stack_greeks_preflight ubuntu:24.04
-stack_greeks_preflight debian:12
-stack_greeks_preflight debian:13
-# Capability failures are detected before dependencies/downloads or earlier modules run.
-(
-  stack_variational_python_ready() { return 1; }
-  if stack_variational_preflight ubuntu:22.04; then exit 1; fi
-  stack_variational_python_ready() { return 0; }
-  # No terminal or saved session must not gate deployment. These legacy boundary
-  # stubs also catch a regression that reintroduces the old prerequisite checks.
-  stack_open_terminal() { return 1; }
-  stack_variational_session_ready() { return 1; }
-  stack_variational_preflight ubuntu:22.04 </dev/null
-)
-for invalid in unknown ',hub' 'hub,' 'aster,,hub'; do
-  if (stack_parse --only "$invalid"); then echo "Invalid selection accepted: $invalid" >&2; exit 1; fi
-done
-if (stack_parse --only); then echo 'Missing selection accepted' >&2; exit 1; fi
-if (stack_parse --only hub --only asset); then echo 'Duplicate option accepted' >&2; exit 1; fi
-if (stack_parse --bogus); then echo 'Unknown option accepted' >&2; exit 1; fi
+stack_parse --only hub,hub
+[[ ${stack_selected[*]} == hub && ${STACK_PATHS[hub]} == deploy/install.sh ]]
+if (stack_parse --only); then exit 1; fi
+if (stack_parse --only hub --only hub); then exit 1; fi
+if (stack_parse --bogus); then exit 1; fi
 
 # All dependencies present means zero apt traffic; multiple missing packages are batched once.
 dpkg-query() {
@@ -146,7 +124,7 @@ grep -q 'install .*curl' "$test_root/apt"
 grep -q 'install .*python3-venv' "$test_root/apt"
 rm "$test_root/missing-packages"
 
-# Fresh deployment prefetches every script and runs all seven, with the hub last.
+# Fresh deployment prefetches the unified installer and deploys one application.
 new_run
 stack_summary > "$test_root/not-run-summary"
 assert_no_greeks_credentials_hint "$test_root/not-run-summary"
@@ -160,8 +138,7 @@ for item in "${STACK_ORDER[@]}"; do
   grep -qx "$item=$expected_mode" "$test_root/test-modes"
 done
 stack_summary > "$test_root/success-summary"
-grep -Fq "$greeks_credentials_command" "$test_root/success-summary"
-grep -Fq '项目管理 → Greeks · BTC 期权' "$test_root/success-summary"
+assert_no_greeks_credentials_hint "$test_root/success-summary"
 
 # Opting in only reaches supported installers; inherited controls must not
 # change other modules' build-environment fingerprints or stdin/argv behavior.
@@ -183,29 +160,26 @@ grep -Fq '项目管理 → Greeks · BTC 期权' "$test_root/success-summary"
 : > "$test_root/downloads"
 new_run
 stack_prefetch
-[[ $(grep -c $'\t.*/etag$' "$test_root/downloads") == 7 ]]
+[[ $(grep -c $'\t.*/etag$' "$test_root/downloads") == 1 ]]
 for item in "${STACK_ORDER[@]}"; do grep -q '复用缓存' "$stack_run/$item.download.log"; done
 stack_run_installers
 cmp "$test_root/expected" "$test_root/executed"
 
-# A single installer change refreshes only that body; corrupt/missing caches force a full GET.
-printf '\n# updated installer\n' >> "$test_root/upstream/monitor.sh"
+# Refresh changed installer bodies and reject corrupt cached bodies.
+printf '\n# updated installer\n' >> "$test_root/upstream/hub.sh"
 new_run
 stack_prefetch
-grep -q '获取并校验' "$stack_run/monitor.download.log"
-grep -q '复用缓存' "$stack_run/asset.download.log"
+grep -q '获取并校验' "$stack_run/hub.download.log"
 printf '\n# tampered\n' >> "$STACK_CACHE/hub/install.sh"
-rm "$STACK_CACHE/asset/install.sh"
 : > "$test_root/downloads"
 new_run
 stack_prefetch
 grep -q $'^hub\t$' "$test_root/downloads"
-grep -q $'^asset\t$' "$test_root/downloads"
 assert stack_cache_valid "$STACK_CACHE/hub"
 
 # Network errors fail closed before any installer runs and preserve the previous usable cache.
 : > "$test_root/executed"
-touch "$test_root/network-crossex"
+touch "$test_root/network-hub"
 new_run
 # Use the production errexit context, not an 'if function' that disables Bash errexit.
 rm "$test_root/executed"
@@ -214,8 +188,8 @@ set +e
 result=$?
 set -e
 [[ $result != 0 && ! -e "$test_root/executed" ]]
-assert stack_cache_valid "$STACK_CACHE/crossex"
-rm "$test_root/network-crossex"
+assert stack_cache_valid "$STACK_CACHE/hub"
+rm "$test_root/network-hub"
 
 # Reject malformed downloads without poisoning an already valid cache.
 cp "$test_root/upstream/hub.sh" "$test_root/good-hub"
@@ -229,60 +203,28 @@ set -e
 assert stack_cache_valid "$STACK_CACHE/hub"
 mv "$test_root/good-hub" "$test_root/upstream/hub.sh"
 
-# Failure exit code is preserved, later modules never run, retry checks successful ones again.
-touch "$test_root/fail-monitor"
+# Failure propagates the only installer's exit code; retry reuses its checked cache.
+touch "$test_root/fail-hub"
 new_run
 stack_prefetch
 if stack_run_installers; then echo 'Installer failure accepted' >&2; exit 1; else result=$?; fi
-[[ $result == 23 && ${stack_status[monitor]} == '失败（23）' ]]
-printf 'aster\nmonitor\n' > "$test_root/expected-failure"
+[[ $result == 23 && ${stack_status[hub]} == '失败（23）' ]]
+printf 'hub\n' > "$test_root/expected-failure"
 cmp "$test_root/expected-failure" "$test_root/executed"
-[[ ! -e "$stack_run/asset.log" && ! -e "$stack_run/hub.log" ]]
-stack_summary > "$test_root/early-failure-summary"
-assert_no_greeks_credentials_hint "$test_root/early-failure-summary"
-rm "$test_root/fail-monitor"
+rm "$test_root/fail-hub"
 : > "$test_root/executed"
 new_run
 stack_prefetch
 stack_run_installers
 cmp "$test_root/expected" "$test_root/executed"
 
-# The EXIT summary preserves Greeks login guidance even when a later installer fails.
-for failing in hub greeks; do
-  new_run
-  stack_parse --only greeks,hub
-  stack_prefetch
-  touch "$test_root/fail-$failing"
-  set +e
-  (set -e; trap stack_finish EXIT; stack_run_installers) > "$test_root/credentials-$failing.log" 2>&1
-  result=$?
-  set -e
-  [[ $result == 23 ]]
-  if [[ "$failing" == hub ]]; then
-    grep -Fq "$greeks_credentials_command" "$test_root/credentials-$failing.log"
-    grep -Fq "$greeks_credentials_command" "$stack_run/summary.txt"
-    grep -Fq '项目管理 → Greeks · BTC 期权' "$stack_run/summary.txt"
-  else
-    assert_no_greeks_credentials_hint "$test_root/credentials-$failing.log"
-    assert_no_greeks_credentials_hint "$stack_run/summary.txt"
-    [[ ! -e "$stack_run/hub.log" ]]
-  fi
-  rm "$test_root/fail-$failing"
-done
-
-# Targeted deployment keeps canonical order and only fetches/runs selected modules.
-: > "$test_root/executed"
+# --refresh does not alter the selected application or its behavior switches.
 : > "$test_root/downloads"
 new_run
-stack_parse --only hub,crossex --refresh
+stack_parse --only hub --refresh
 stack_prefetch
-stack_run_installers
-printf 'crossex\nhub\n' > "$test_root/expected-subset"
-cmp "$test_root/expected-subset" "$test_root/executed"
-[[ $(wc -l < "$test_root/downloads") == 2 ]]
+[[ $(wc -l < "$test_root/downloads") == 1 ]]
 grep -q $'^hub\t$' "$test_root/downloads"
-stack_summary > "$test_root/unselected-summary"
-assert_no_greeks_credentials_hint "$test_root/unselected-summary"
 
 if [[ $(uname -s) == Linux ]]; then
   [[ $(stat -c %a "$stack_run") == 700 && $(stat -c %a "$stack_run/hub.log") == 600 ]]

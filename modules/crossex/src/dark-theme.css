@@ -1,0 +1,10 @@
+/* Bind the shared palette to the terminal's existing semantic variables. */
+:root {
+  --bg: var(--surface-0);
+  --panel: var(--surface-2);
+  --line: var(--surface-4);
+  --muted: var(--text-tertiary);
+  --green: var(--emerald);
+  --red: var(--error);
+  --amber: var(--warning);
+}

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 [[ $(uname -s) == Linux && $EUID == 0 ]] || { echo 'Run this fixture with sudo on Linux.' >&2; exit 1; }
 repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
-AGG_INSTALL_SOURCE_ONLY=1 source "$repository/install.sh"
+AGG_INSTALL_SOURCE_ONLY=1 source "$repository/deploy/install.sh"
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 chmod 0755 "$test_root"
@@ -27,7 +27,13 @@ if runuser -u "$SERVICE_USER" -- test -w "$dependencies/node_modules/react/packa
   echo 'The build account can modify shared packages' >&2; exit 1
 fi
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" "$NPM_BIN" run check)
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$NPM_BIN" run install:modules)
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$NPM_BIN" run build:modules)
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python"
+run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
+run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
+(cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" "$NODE_BIN" "$NPM_BIN" test)
 (cd "$work_dir/source"; run_as_service env NODE_ENV=production "$NODE_BIN" "$NPM_BIN" run build:bundle)
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
 [[ ! -d "$dependencies/node_modules/.vite-temp" ]]
@@ -36,6 +42,6 @@ printf 'Real non-root build and backend import passed with immutable shared depe
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
   python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --repository "$repository" --output "$repository/output/release"
   mkdir "$test_root/package"
-  tar -xzf "$repository/output/release/"*-linux-any.tar.gz -C "$test_root/package"
-  "$NODE_BIN" "$repository/deploy/test-package.mjs" "$test_root/package"
+  tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
+  run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$test_root/package"
 fi

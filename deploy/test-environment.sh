@@ -2,7 +2,7 @@
 # Regression: a failed PORT change must restore the previously healthy environment.
 # The service and pointer operations are mocked; no real systemd or symlinks are needed.
 set -Eeuo pipefail
-AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/../install.sh"
+AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/install.sh"
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 APP_DIR="$test_root/application"
@@ -83,3 +83,75 @@ old_release="$test_root/application/old-release"
 if prepare_environment_rollback; then echo 'Missing successful configuration was accepted' >&2; exit 1; fi
 cmp -s "$ENV_FILE" "$test_root/expected-first.env"
 printf 'Environment rollback regression checks passed.\n'
+
+# Fallible activation records must precede the irreversible migration receipt.
+(
+  activation_started=1
+  module_migration_helper=fixture-migration.py
+  DATA_PATH="$test_root/data"
+  GREEKS_PYTHON_PATH=fixture-python
+  remember_environment() { printf 'environment\n' >> "$test_root/order"; [[ ${fail_record:-} != environment ]]; }
+  atomic_record() { printf 'python-path\n' >> "$test_root/order"; [[ ${fail_record:-} != python ]]; }
+  python3() { printf 'commit\n' >> "$test_root/order"; }
+  for fail_record in environment python; do
+    : > "$test_root/order"
+    if finish_activation; then echo 'Failed activation record was ignored' >&2; exit 1; fi
+    [[ $activation_started == 1 ]]
+    if grep -q '^commit$' "$test_root/order"; then echo 'Migration committed before fallible records' >&2; exit 1; fi
+  done
+  fail_record=
+  : > "$test_root/order"
+  finish_activation
+  [[ $activation_started == 0 ]]
+  printf 'environment\npython-path\ncommit\n' > "$test_root/expected-order"
+  cmp "$test_root/expected-order" "$test_root/order"
+)
+printf 'Activation record failures preserve the migration rollback boundary.\n'
+
+# A later record/commit failure must restore both the running environment and
+# the durable snapshot, even though remember_environment already succeeded.
+for fail_record in python migration; do
+  (
+    test_root="$test_root/commitpoint-$fail_record"
+    APP_DIR="$test_root/application"
+    ENV_FILE="$test_root/environment"
+    UNIT_FILE="$test_root/current.service"
+    work_dir="$test_root/work"
+    old_release="$APP_DIR/old-release"
+    release="$APP_DIR/new-release"
+    old_unit_backup="$work_dir/previous.service"
+    mkdir -p "$old_release" "$release" "$work_dir"
+    printf 'previous service\n' > "$old_unit_backup"
+    printf 'candidate service\n' > "$UNIT_FILE"
+    printf 'HOST=127.0.0.1\nPORT=3100\n' > "$ENV_FILE"
+    cp "$ENV_FILE" "$test_root/expected-good.env"
+    remember_environment
+    printf 'HOST=0.0.0.0\nPORT=4200\n' > "$ENV_FILE"
+    cp "$ENV_FILE" "$test_root/expected-candidate.env"
+    prepare_environment_rollback
+    activation_started=1
+    module_migration_helper=fixture-migration.py
+    DATA_PATH="$test_root/data"
+    GREEKS_PYTHON_PATH=fixture-python
+    atomic_record() { [[ "$fail_record" != python ]] || return 1; printf '%s\n' "$2" > "$1"; }
+    python3() {
+      printf '%s\n' "$2" >> "$test_root/migration.calls"
+      [[ "$2" != commit || "$fail_record" != migration ]]
+    }
+    if finish_activation; then echo 'Activation failure was ignored' >&2; exit 1; fi
+    [[ "$activation_started" == 1 ]]
+    cmp -s "$ENV_FILE" "$APP_DIR/.last-successful.env"
+    set +e
+    ( rollback 37 )
+    rollback_status=$?
+    set -e
+    [[ "$rollback_status" == 37 ]]
+    cmp -s "$test_root/expected-good.env" "$ENV_FILE"
+    cmp -s "$test_root/expected-good.env" "$APP_DIR/.last-successful.env"
+    grep -q '^rollback$' "$test_root/migration.calls"
+    # The next attempt must still capture the old healthy environment.
+    prepare_environment_rollback
+    cmp -s "$test_root/expected-good.env" "$old_environment"
+  )
+done
+printf 'Activation rollback restores the durable successful environment snapshot.\n'

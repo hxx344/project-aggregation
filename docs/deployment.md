@@ -1,135 +1,69 @@
-# 部署说明
+# 统一部署与迁移
 
-## 总部署入口
+工作台保留原生交易功能，同时内置 Market Monitor、Asset Ledger、Gate CrossEx 与 Greeks。四个模块的源码、页面和后端均随本仓库统一构建、验证、安装与更新。它们不再作为独立网站或独立 systemd 服务运行。
 
-推荐使用 [README 的一键命令](../README.md#一键部署六个模块与平台)，运行本仓库 `install-all.sh`，一次安装或更新六个模块与平台。原 `install.sh` 继续只管理工作台，兼容已有用法。
+## 安装与升级
 
-在线更新服务以 30 秒为间隔自动检查各已安装模块的正式版本，无需保持工作台页面打开。上一轮检查或更新尚未完成时不会重复启动；结果显示时间还包括发布信息读取和校验耗时。更新到包含此设置的工作台正式版后生效。
+支持 Ubuntu 24.04、Debian 12/13，x64/arm64，需 systemd 和 Python 3.11+：
 
-完整总部署支持 Ubuntu 24.04、Debian 12/13 的 x64/arm64 systemd 主机；Ubuntu 22.04 默认 Python 不满足 Variational 要求，可选择仅更新其余模块。首次安装自动创建各项目的默认配置和独立登录凭据，无需逐个运行安装命令。已有配置、端口、密码和数据库由各项目原安装器保留；工作台的项目登录凭据仍需首次在“项目管理”保存。总部署不会自动设置交易所 API Key、实盘开关或项目间的数据源凭据。
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
+```
 
-| 环节 | 执行规则 |
+同一命令可重复执行。兼容入口 `deploy/install-all.sh` 只协调工作台安装器 `deploy/install.sh`，在线更新也只有 `hub` 一个目标。`--only hub` 继续可用，内置模块不支持独立安装或更新；旧的其他 `--only` 选项会明确拒绝。`--refresh` 只重新获取安装器，`--with-tests` 仅用于显式 `PROJECT_DEPLOY_MODE=source` 的排查部署。
+
+默认从正式 Release 下载已经验证的对应架构运行包。Node.js 自动准备为 24.15 或更高的 24.x；Greeks 依赖由 `modules/greeks/requirements.lock` 固定版本与哈希，虚拟环境以锁文件、Python 版本和架构为键缓存。无变化且健康时，跳过应用包下载、依赖安装、构建、完整验证与服务重启。
+
+## 服务与数据
+
+只有 `project-aggregation.service` 对外提供业务 HTTP，默认绑定 `127.0.0.1:3100`。模块由工作台管理独立 Node worker；Greeks 通过 Python 标准输入输出桥运行，不另开 TCP 端口。在线更新控制服务继续使用 Unix socket。所有模块沿用工作台鉴权，进入模块页面无需再保存独立网站登录凭据。
+
+| 路径 | 用途 |
 | --- | --- |
-| 系统依赖 | 只安装缺少的运行环境和下载工具；齐全时跳过 apt。CI 模式不要求 Git 或前端开发依赖。 |
-| 部署前准备 | 最多并发准备三个安装器，使用 ETag、SHA-256 和 Bash 语法检查；确认全部所选项目的 CI 清单和对应架构资产可下载后才开始部署。 |
-| 应用部署 | ASTER → Monitor → Asset → CrossEx → Variational → Greeks → 工作台，逐个校验、准备并切换版本。 |
-| 增量更新 | 按运行内容、配置、运行环境与健康状态决定是否下载或重启；文档提交不会强制替换相同运行产物。 |
-| 失败重试 | 包缺失或前置检查失败时不开始应用部署；执行过程中失败则由当前项目恢复，后续项目不执行，之前成功的项目保留。 |
-| 中断 | 转发终止信号并等待当前安装器完成恢复流程，再释放总部署锁。 |
+| `/etc/project-aggregation.env` | 工作台配置、监听与数据目录 |
+| `/var/lib/project-aggregation` | 默认工作台数据目录，保留原生交易数据 |
+| `$DATA_DIR/modules/monitor` | Monitor 状态与迁移的 `.env` |
+| `$DATA_DIR/modules/asset` | Asset `config.json`、SQLite 数据与附件 |
+| `$DATA_DIR/modules/crossex` | CrossEx SQLite 数据及 `credentials.key` |
+| `$DATA_DIR/modules/greeks` | Greeks `engine_state.json` 与迁移的 `.env` |
+| `/opt/project-aggregation/releases` | root 只读运行版本 |
+| `/opt/project-aggregation/python` | 按内容缓存的 Greeks Python 环境 |
 
-GitHub Actions 完成必要测试、类型检查、构建和部署包启动验收后，只发布 `deploy-<完整提交号>` 候选 Release（`prerelease`）；发布者需在对应仓库的 **Publish stable release** 工作流选择 `main`，输入已通过 CI 的完整 40 位提交 SHA，核验后明确晋级为最新正式版。`release-manifest.json` 记录仓库、提交、架构、文件名、运行内容指纹及 SHA-256。默认安装器和前端更新只通过正式版 latest 发现清单，随后固定到该清单的提交标签下载包；已发布的同提交包不覆盖。包经完整性和路径检查后才写入新版本目录。Asset 使用原生 x64/arm64 构建，其他不含平台二进制的包可在两种架构共用；Python 项目的锁定依赖仍由服务器缓存安装。
+安装完成后查看首次工作台登录信息：
 
-服务器默认 `PROJECT_DEPLOY_MODE=ci`，不执行前端 npm 安装、类型检查、完整行为测试或编译。Node/Python 运行环境仍需按需准备；前端编译参数由 CI 决定，服务器配置用于运行时。CI 运行中、失败或候选尚未晋级时，latest 均保持现有正式版；首次没有可用正式包会明确停止。配置、密码、API 凭据和数据库不包含在部署包中，继续保存在各项目原目录。
+```bash
+sudo journalctl -u project-aggregation --no-pager -n 30
+```
 
-前端更新面板显示最新正式版 Release 的更新说明。工作台候选版本的说明取自清单所固定提交的标题与正文，并附部署说明；这只描述该发布提交，不是当前版本到最新版本之间的累计变更，因此发布提交应写清用户能理解的具体改动。候选晋级正式版时保留说明，已公开版本重跑发布不会改写说明；草稿重试会补齐说明。后端按纯文本返回最多 6000 个 UTF-8 字节，沿用 30 分钟更新检查缓存。
-
-参数：`--only aster,monitor,asset,crossex,variational,greeks,hub` 选择项目；`--refresh` 重新获取小安装器，不强制重新下载应用包或重启。原管道命令不变，参数放在 `sudo bash -s --` 后。开发排查可显式设置 `PROJECT_DEPLOY_MODE=source`，使用原源码安装流程；`--with-tests` / `PROJECT_DEPLOY_TESTS=1` 仅在 source 模式开启工作台和 CrossEx 的部署测试，CI 模式不会重复执行。
-
-各仓独立发布和部署，不提供七项目整体回滚。下载的安装器副本及预检的发布清单在本次运行内固定；子安装器复用对应清单，不重复查询 latest，避免预检后发布的新版本改变本轮目标。安装器缓存位于 `/var/cache/project-aggregation-stack/`，日志位于 `/var/log/project-aggregation-stack/时间.随机串/`，仅 root 可读；`summary.txt` 记录结果和耗时。日志可能包含首次登录信息。总部署锁为 `/run/lock/project-aggregation-stack.lock`，子安装器继续使用各自部署锁；“完成检查/部署”表示安装器成功退出，实际更新或跳过以模块日志为准。
-
-Variational Grid 使用独立安装器 `hxx344/variational-grid/main/install.sh`，总部署名称为 `variational`，不传策略切换参数。它要求 Python 3.11+；Ubuntu 22.04 默认环境选择此模块会在所有安装操作之前失败，可使用 `--only aster,monitor,asset,crossex,hub` 跳过。总部署不检查行情会话、不打开终端，也不询问 `vr-token`；所有子安装器都通过 `setsid` 运行，标准输入为 `/dev/null`。token 缺失或失效不阻止首次安装和升级。
-
-首次安装默认使用 QQQ 模式：缺少有效认证时，网页服务继续可用，需要认证的模拟活动暂停；在原页面点击“更新 Var token”补填有效 token 后自动恢复，无需重跑部署。已有 `run` / `compare` / `inventory` 模式保留原模式和数据，仍沿用各自的会话导入方式，不提供 QQQ 的网页补填入口。
-
-旧 Variational 仓库地址只在匹配已知旧地址时迁移；原配置、账本、服务名和已选模式继续保留。其页面 `127.0.0.1:9876` 通过工作台授权代理，不需工作台保存行情 token。升级工作台一次性添加 `variational`，同标识已有配置和用户删除决定保留。摘要仅显示独立模拟结果，不纳入资产账本。
-
-Greeks 使用 `hxx344/greeks/main/install.sh`，总部署名称为 `greeks`，可通过 `--only greeks,hub` 更新两端。支持 Debian 12/13、Ubuntu 24.04，默认回环端口 `8000`、单进程 `greeks.service`，配置位于 `/etc/greeks/greeks.env`、状态位于 `/var/lib/greeks`。Ubuntu 22.04 选择 Greeks 时在安装前拒绝，需选择其他模块。新安装生成独立面板密码，默认模拟且不自动开仓；已有交易模式、凭据及状态保留。工作台项目管理保存其面板 Basic 凭据后即可自动登录。重复执行按变化更新，健康失败恢复上一程序版本，具体更新和跳过项见安装日志。
-
-Greeks 本次完成检查或部署后，总部署最终摘要会提示运行 `sudo grep '^DASHBOARD_' /etc/greeks/greeks.env` 查看用户名和密码，并说明在“项目管理”填写；即使后续工作台部署失败，该提示仍会保留在终端和 `summary.txt`。Greeks 未选择、未执行或失败时不显示此成功提示。
-
-## 目录与更新行为
-
-安装器仅管理 `/opt/project-aggregation` 内自己标记的程序版本及固定名称的 systemd 服务。初次发现非空且没有管理标记的目录或同名未知服务时停止，不覆盖现有内容。
-
-每次更新查询最近成功发布的部署清单，比较运行内容、服务配置和 Node 环境：
-
-| 变化 | 服务器执行内容 |
-| --- | --- |
-| 没有变化且健康 | 只检查清单、配置和健康，跳过应用包下载、依赖、编译与重启。 |
-| 仅文档或测试 | 运行内容指纹相同，记录已检查提交，不替换当前版本。 |
-| 服务配置或 Node 环境 | 复用当前运行包，更新服务定义并检查健康。 |
-| 前后端或运行依赖变化 | 下载并校验 CI 成品，准备新目录后切换和检查健康。 |
-
-工作台包包含 `server/`、`dist/`、`package.json`，后端无需 node_modules。运行文件归 root 所有且服务用户不可写；开发源码模式继续保留既有隔离依赖缓存。`.deployed-state` 记录已检查的发布提交，`.source-sha` 记录实际运行产物提交，两者可因仅文档变化而不同。
-
-激活前保留上次成功的环境配置，使用原子符号链接切换。启动失败时先把本次配置另存为 `/etc/project-aggregation.env.failed-时间-PID`，再恢复旧配置、旧程序和旧服务定义，并按旧 HOST / PORT 检查恢复结果。成功配置快照位于 `/opt/project-aggregation/.last-successful.env`，快照和失败候选均为 root 的 0600 文件。首次失败保留配置和数据；旧部署缺少成功快照时在激活前停止。持久数据库不回滚，程序回滚不代替未来不兼容数据库迁移的恢复方案。
-
-成功后保留当前及前一个版本，清理只针对安装器标记且路径满足约束的旧版本。可重复利用的依赖、构建缓存保留；失败工作目录保留用于排查，不删除用户未知目录。
-
-单独使用工作台 `install.sh` 不会修改或重启服务器上的 3000、3200、5678、8000、8765、9876 原项目服务。健康检查只确认工作台可响应，不证明原项目已连接或数据新鲜。六个模块和平台的连续安装或更新使用上方总部署入口。
-
-## 浏览器入口与服务器接口
-
-工作台与六个项目部署在同一台服务器时，服务器直接访问 `127.0.0.1:3000`（monitor）、`127.0.0.1:3200`（CrossEx）、`127.0.0.1:5678`（Asset）、`127.0.0.1:8765`（ASTER）和 `127.0.0.1:9876`（Variational）、`127.0.0.1:8000`（Greeks）。电脑只需转发工作台的 `3100`：
+电脑只需转发工作台端口：
 
 ```bash
 ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 ```
 
-把 `user@server` 替换为服务器登录地址并保持终端运行。浏览器打开 `http://127.0.0.1:3100` 后跳转到 `http://hub.localhost:3100`。在工作台打开项目时，会进入该项目独立的 `.localhost` 子域，端口仍为 `3100`。Chrome / Edge 自动把这些名称解析到本机，无需配置 hosts 或 DNS；当前不承诺 Safari 支持。[浏览器兼容说明](https://learn.microsoft.com/en-us/aspnet/core/test/localhost-tld?view=aspnetcore-10.0)
+## 从旧独立服务迁移
 
-点击左侧项目会直接显示原始页面，无需先进入摘要页或再点“载入”。内容区保留原项目功能，支持重新载入、单独打开和连接设置；总览仍提供摘要。升级无需修改旧 `mode` 设置，摘要刷新不会打断原页面操作。
+迁移在候选运行包及 Python 环境准备完成后进行。先停止工作台，再停止旧模块的写入进程，随后复制完整数据目录（包含 SQLite WAL/SHM）与配置。CrossEx 数据库缺失配套 `credentials.key` 时会停止迁移，不生成新密钥替代旧密钥。已有内置模块目录不覆盖。
 
-三个内置项目默认使用 `accessMode=proxy`，旧记录缺少该字段时也使用此默认值。代理目标仅由 `apiUrl` 决定；`url` 提供页面入口路径及查询参数，因此 monitor 的 `?monitor=oil` 等参数会保留。选择 `direct` 时浏览器直接打开 `url`，该地址需自行可达；`standard` 和 `link` 默认使用 `direct`，也可配置接口地址后改为 `proxy`。
+| 模块 | 默认旧配置 | 默认旧数据 |
+| --- | --- | --- |
+| Monitor | `/etc/market-spread-monitor.env` | `/var/lib/market-spread-monitor` |
+| Asset | 服务单元中的 `ASSET_DATA_DIR`、数据中的 `config.json` | `/var/lib/asset-ledger` |
+| CrossEx | `/etc/gate-crossex-arbitrage.env` | `/var/lib/gate-crossex-arbitrage` |
+| Greeks | `/etc/greeks/greeks.env` | `/var/lib/greeks` |
 
-CrossEx 的第四预置入口使用标准接口，但显式设为 `proxy`。在“项目管理”填写用户名 `admin` 和 CrossEx 独立密码（首次启动在 `sudo journalctl -u gate-crossex-arbitrage --no-pager -n 30` 查看），即可复用标准接口预检与代理自动登录。进入 CrossEx 页面后配置 Monitor 数据源和 Gate CrossEx API 连接；工作台不会代填。CrossEx 仅在用户预览确认后手动执行实盘订单，账户金额不重复计入工作台资产。
+原配置中明确指定的绝对数据路径会沿用为复制来源，Greeks 自定义 `STATE_FILE` 会复制为内置模块的 `engine_state.json`。复制后的模块由工作台数据目录定位，旧服务目录、配置文件和凭据均保留。迁移拒绝符号链接、特殊文件和过宽的数据目录，发现这种布局时不会猜测来源。
 
-升级只会一次性补充缺失的 `crossex` 入口，不覆盖已有配置；手动删除后重启不重加。已满 30 个项目时跳过补充并标记完成，需腾出名额后手动新增。该迁移仅增加项目及设置行，旧版仍可读取，程序回滚不删除已有项目。
+成功后，`market-spread-monitor`、`asset-ledger`、`gate-crossex-arbitrage`、`greeks`、`aster-desk` 和 `variational-grid` 旧服务保持停止与禁用。ASTER 和独立 Variational 的配置与数据不搬迁、不删除；Asset 内部账户接入不受此入口调整影响。原生交易模块仍由工作台运行。
 
-新实例预置 ASTER 页面与接口地址为 `http://127.0.0.1:8765`。升级不改写旧接口地址；现有项目若误填为 `http://127.0.0.1:18765`，应在“项目管理”改为 `http://127.0.0.1:8765`，重新输入 ASTER 网页登录密码并保存。工作台不会自动换端口或搬用旧密码。代理模式不使用旧页面地址的主机与端口作为目标。
+安装器记录旧服务的运行及开机启动状态。候选启动失败时，先停止新工作台，隔离本次新建的模块数据，再恢复旧服务状态、旧程序和工作台配置。失败候选的数据保留在 `/opt/project-aggregation/failed-module-migration-*` 供排查；下一次重试会重新复制旧服务恢复运行后的最新数据。迁移记录位于 root 私有的 `.module-migration.json`，成功记录使后续更新跳过复制。
 
-在“项目管理”保存原项目登录凭据后，通过工作台打开 ASTER、Asset 和 monitor 即可自动登录。每次 ASTER / Asset 页面授权建立独立的原项目会话，不与后台读取及同步共用；monitor 用保存的 Basic 凭据预检 `/api/monitors`。`standard` 采用 `proxy` 时，以已有的 `/api/hub/summary` 预检 Basic 凭据。密码、Basic 认证信息和上游会话只留在服务器，浏览器只持有工作台的页面授权 Cookie。
+## 发布、验证与失败恢复
 
-没有保存凭据时，仍可在原站登录，也可回“项目管理”保存一次。登录失败或会话过期时，回工作台重新打开项目；原站密码变更后需更新保存的信息。`direct` 和 `link` 项目仍自行登录原站。在原项目退出会撤销当前页面授权；退出工作台会撤销全部页面授权，修改项目配置也会撤销该项目已有授权。
+GitHub Actions 分别在原生 Linux x64 和 arm64 构建，运行包包含完整 Next 运行依赖与对应架构原生库，不标记为通用 `linux-any`。解压后的包需要启动工作台及四个模块完成验收。两个架构及安装器检查均通过后，发布 `deploy-<完整提交号>` 候选版本；沿用 **Publish stable release** 工作流将已验证候选晋级为正式版本。正式发布不会自动更新服务器。
 
-工作台通过一次性票据授予页面访问，随后使用绑定工作台会话和独立项目主机的 host-only Cookie。代理将原页面的嵌入限制调整为仅允许当前工作台，保留其余 CSP；原页面的根路径、登录跳转和 monitor 实时流通过代理保留。
+manifest 固定提交、架构、运行内容指纹和 SHA-256；安装器先核验，再解压到独立发布目录。源代码、模块锁文件、模块构建脚本及迁移工具均计入运行内容指纹。服务器默认不再执行 npm 安装、前端构建或完整测试；Python 只在依赖或解释器环境变化时安装。
 
-## Asset 后台同步
+切换前保留上次成功的环境配置；新版本健康检查需要工作台及全部内置模块启动完成。失败时恢复旧程序、systemd 单元和环境，失败的新配置另存为 `/etc/project-aggregation.env.failed-*`。程序回滚不撤销成功迁移之后的业务数据库写入。成功后保留当前及前一运行版本，用户数据与未知目录不参与版本清理。
 
-启用项目的 `autoSync` 并保存原项目登录凭据后，工作台服务器每 60 秒调用 Asset 的 `POST /api/sync`，不依赖浏览器、原页面或 SSH 连接是否保持打开。旧 Asset 配置缺少此字段时默认开启，其他适配器默认关闭；项目设置可随时开关。普通摘要仍每 30 秒读取 `GET /api/ledger`，单次同步最多等待 60 秒，不阻塞其他项目读取。
-
-同步会更新原资产项目的估值及历史，不执行下单或转账。后台同步状态与源数据时间分别展示；上游部分来源失败时可能仍返回账本，因此同步请求完成不表示所有来源已更新。失败保留上次数据与真实时间。关闭后台同步后，账本摘要读取和原页面自己的同步功能继续按各自设置运行。
-
-通过工作台打开 Asset 原页面时，已开启后台同步且已保存密码的 `/api/sync` 请求与后台共用一次同步。代理使用当前页面授权保存在服务器上的 Asset 会话，先验证账本访问权限，同步完成后再读取真实账本，避免同时刷新造成锁冲突；不要求浏览器持有原站会话 Cookie。页面授权或上游认证无效时不能读取，同步失败不伪装为成功。关闭后台同步后，原页面同步请求照常转发。
-
-## 可选 HTTPS 反向代理
-
-如果服务器已经有 nginx 和证书，可用以下 server 块提供工作台 HTTPS 入口，替换域名与证书路径。首次使用可直接采用上述 SSH 转发，工作台无需公开监听。
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name hub.example.com;
-    ssl_certificate /path/to/fullchain.pem;
-    ssl_certificate_key /path/to/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:3100;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_read_timeout 30s;
-    }
-}
-```
-
-在 `/etc/project-aggregation.env` 中添加以下无引号配置，然后重跑安装命令：
-
-```dotenv
-PUBLIC_ORIGIN=https://hub.example.com
-COOKIE_SECURE=true
-```
-
-`PUBLIC_ORIGIN` 将这个完整来源加入工作台允许入口，保留外部 `Host` 对来源检查是必要的。安装器保留该字段，并将环境文件整体纳入变更检测与失败恢复。工作台不直接信任任意客户端传入的 `X-Forwarded-Proto`，HTTPS Cookie 由配置确定。
-
-这一配置只提供工作台 HTTPS 入口，不承诺在任意域名下代理完整原页面。单端口原页面代理当前以 SSH 和 `.localhost` 为支持方式；使用 HTTPS 工作台时，可将项目设为 `direct`，指向各项目已有的浏览器可达地址。嵌入仍受原页面安全策略及 HTTPS 混合内容规则影响。
-
-## 验收范围
-
-本地 Windows 可运行应用检查、构建和模拟上游测试；Git Bash 可做安装脚本语法检查。这些不替代 Linux 的服务安装验收。GitHub Actions 在 Windows Node 24.x、Ubuntu Node 24.15.0 和 24.x 上运行完整应用检查、测试及构建。Ubuntu 最低支持 Node 版本额外用非 root 账户对只读依赖缓存实际执行类型检查、后端导入和 Vite 构建。独立 Ubuntu 安装检查覆盖文档、测试、后端、前端、依赖、构建环境和配置的增量路径，以及脚本语法、路径边界、原子切换、模拟失败回滚，以及从 3100 改为冲突端口后恢复旧配置和旧健康检查地址的回归，不安装到真实生产服务器，也不读取真实项目凭据。
-
-总部署使用 `bash deploy/test-all.sh` 做契约回归：首次执行、缓存命中、单脚本更新、缓存缺失/损坏、下载/语法失败保护、依赖合并安装、失败停止后续、重跑重新检查及模块选择。Windows 原生 Git Bash 使用模拟系统边界；Ubuntu Actions 额外验证真实进程组的信号转发、锁释放以及日志权限。测试不执行生产模块安装，也不使用 WSL。
-
-服务器上的最终验收：只保留 3100 转发；工作台可登录，保存原项目凭据后六个原页面能自动登录、加载资源和操作；monitor 实时数据持续更新；CrossEx 配好 Monitor 与 Gate 账户后可读取机会、观察真实持仓并预览手动订单，摘要读取不会下单，账户金额不重复计入资产账本；关闭 Asset 原页面后后台同步仍执行，状态与源时间分别显示；关闭后台同步后不再自动触发同步；原站退出使当前页面授权失效，工作台退出使全部页面授权失效；更新凭据后从工作台重新打开能恢复访问。重复运行安装命令确认显示跳过项，保存的配置与数据仍在。尚未连接目标服务器时，不应报告这些实机验收已经通过。
-
-原页面入口的浏览器回归检查：保留旧 `mode=external` 配置，点击各代理项目应立即进入原页面；刷新总览时保留原页面未保存的输入；模拟一个入口请求挂起后切换项目，迟到响应不能替换当前页面；停用项目后不再签发页面入口；重新载入取得新的入口；手机宽度下内容区不出现横向溢出。直接访问项目仍按其 `mode` 选择新窗口入口或嵌入。
+本地 Windows 检查使用原生 Python、Node.js 和 Git Bash；Linux 权限、systemd 与完整安装验收在 CI 执行，不使用 WSL。

@@ -4,7 +4,7 @@ export type Project = {
   id: string; name: string; description: string; category: Category; adapter: Adapter;
   url: string; apiUrl: string; authOrigin?: string; accessMode?: 'proxy' | 'direct'; autoSync?: boolean; mode: 'external' | 'embed'; enabled: boolean;
   staleAfterSeconds: number; order: number; hasCredentials: boolean; username?: string;
-  revision?: string;
+  revision?: string; embedded?: boolean;
 };
 export type Metric = { key: string; label: string; value: number | string | null; unit?: string; detail?: string };
 export type Diagnostic = { id: string; kind: 'action' | 'fault' | 'notice'; message: string; firstSeenAt: string };

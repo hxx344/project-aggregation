@@ -21,6 +21,8 @@ import { normalizeTradingPair } from './trading-markets.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
 import { createUpdateStream } from './update-stream.mjs';
 import { createStatementCache } from './db-cache.mjs';
+import { moduleCatalog, moduleIds } from './modules/catalog.mjs';
+import { createModuleUpdateGuard } from './modules/updates.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -50,7 +52,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS) } = {}) {
+export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS) } = {}) {
   if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
   if (!Array.isArray(warmupProjects) || warmupProjects.some(id => typeof id !== 'string')) throw new TypeError('warmupProjects 必须为项目 ID 字符串数组');
   const warmupProjectIds = new Set(warmupProjects.map(id => id.trim()).filter(Boolean));
@@ -84,14 +86,19 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   }
   if (!getSetting('seeded')) {
     db.exec('BEGIN IMMEDIATE');
-    try { for (const project of defaults) stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
+    try { for (const project of (embeddedModules ? moduleCatalog : defaults)) stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
-  for (const id of ['crossex', 'variational', 'greeks']) {
+  if (embeddedModules) {
+    // Fixed modules are always present, even when a previous external preset
+    // was deleted or a legacy installation already used all project slots.
+    for (const project of moduleCatalog) stmt.prepare('INSERT OR IGNORE INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project));
+  }
+  for (const id of (embeddedModules ? moduleIds : ['crossex', 'variational', 'greeks'])) {
     const marker = `seeded-${id}-v1`;
     if (getSetting(marker)) continue;
     db.exec('BEGIN IMMEDIATE');
     try {
-      const project = defaults.find(item => item.id === id);
+      const project = (embeddedModules ? moduleCatalog : defaults).find(item => item.id === id);
       // Keep existing connections intact; the marker also preserves a later user deletion.
       stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
       stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run(marker, '1');
@@ -111,7 +118,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
-  if (!getSetting('updated-variational-description-v1')) {
+  if (!embeddedModules && !getSetting('updated-variational-description-v1')) {
     db.exec('BEGIN IMMEDIATE');
     try {
       const row = stmt.prepare('SELECT json FROM projects WHERE id=?').get('variational');
@@ -128,15 +135,24 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs });
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
+  const moduleUpdateGuard = embeddedModules ? createModuleUpdateGuard() : null;
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
+    ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, prepareApply: moduleUpdateGuard.prepareApply } : {}),
     readMaintenance: () => getSetting('updates-maintenance') === '1',
     writeMaintenance: active => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
     writePendingPlanId: planId => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-plan', planId || ''),
   });
-  const publicProject = row => { const project = JSON.parse(row.json); const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
-  const getProjects = () => stmt.prepare('SELECT * FROM projects').all().map(publicProject).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-  const rowFor = id => { const row = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
+  const publicProject = row => { const project = JSON.parse(row.json);
+    if (embeddedModules) {
+      const module = moduleCatalog.find(item => item.id === project.id);
+      if (!module) return null;
+      const preferences = JSON.parse(getSetting('module-preferences:' + module.id) || '{}');
+      return { ...module, ...preferences, revision: hash(JSON.stringify([module, preferences])) };
+    }
+    const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
+  const getProjects = () => stmt.prepare('SELECT * FROM projects').all().map(publicProject).filter(Boolean).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+  const rowFor = id => { if (embeddedModules && !moduleIds.includes(id)) throw new HttpError(404, '模块已移除'); const row = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   const loginAttempts = new Map(); // IP-based rate limiting
   const accountLockouts = new Map(); // Account-level lockout: tracks failed password attempts
@@ -163,21 +179,22 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
     }
   }
-  const projectRevision = id => { const row = stmt.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
+  const projectRevision = id => { if (embeddedModules) return getProjects().find(item => item.id === id)?.revision || null; const row = stmt.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
   const tradingImporter = createTradingImporter({ trading, request: tradingImportRequest, sourceTimeoutMs: tradingImportSourceTimeoutMs, importTimeoutMs: tradingImportTimeoutMs,
-    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = embeddedModules ? publicProject(row) : JSON.parse(row.json); return project?.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
   });
   const assetPositions = createAssetPositions({ request: assetPositionsRequest, cacheMs: assetPositionsCacheMs, timeoutMs: assetPositionsTimeoutMs, now: assetPositionsNow,
-    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = JSON.parse(row.json); return project.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = embeddedModules ? publicProject(row) : JSON.parse(row.json); return project?.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
   });
   const portal = createPortal({
+    ...(embeddedModules ? { withMutation: updates.withExecutionEntry } : {}),
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
     getProjectRevision: projectRevision,
     isSessionValid: id => !!stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
     authenticateProject: async ({ projectId, revision, deadline, signal }) => {
       if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
       const row = rowFor(projectId);
-      const auth = await loginForPortal(publicProject(row), decrypt(row.credentials), { deadline, signal });
+      const auth = embeddedModules ? null : await loginForPortal(publicProject(row), decrypt(row.credentials), { deadline, signal });
       if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
       return auth;
     },
@@ -219,7 +236,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(id);
       const previous = saved ? JSON.parse(saved.json) : null;
       try {
-        const data = await summaryReader(project, decrypt(row.credentials), { deadline: start + timeoutMs, signal: controller.signal });
+        const data = await summaryReader(project, embeddedModules ? null : decrypt(row.credentials), { deadline: start + timeoutMs, signal: controller.signal });
         if (closed) return null;
         const latest = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id);
         if (!latest) return null;
@@ -431,6 +448,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
       res.once('close', () => streams.delete(res)); return;
     }
     if (pathname === '/api/projects' && req.method === 'POST') {
+      if (embeddedModules) throw new HttpError(405, '工作台只运行内嵌模块');
       const body = await bodyOf(req);
       if (getProjects().length >= MAX_PROJECTS) throw new HttpError(400, `最多接入 ${MAX_PROJECTS} 个项目`);
       const value = validateProject(body); value.id = body.id || randomBytes(8).toString('hex');
@@ -442,6 +460,19 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     const match = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)(\/(?:check|launch|sync))?$/);
     if (match) {
       const id = match[1]; const row = rowFor(id);
+      if (embeddedModules && !match[2]) {
+        if (req.method !== 'PUT') throw new HttpError(405, '内嵌模块不能删除');
+        const body = await bodyOf(req);
+        if (Object.keys(body).some(key => !['autoSync', 'staleAfterSeconds', 'order'].includes(key))) throw new HttpError(400, '仅可修改模块显示与同步设置');
+        if (body.autoSync !== undefined && (id !== 'asset' || typeof body.autoSync !== 'boolean')) throw new HttpError(400, '同步设置无效');
+        if (body.staleAfterSeconds !== undefined && (!Number.isInteger(body.staleAfterSeconds) || body.staleAfterSeconds < 30 || body.staleAfterSeconds > 86400)) throw new HttpError(400, '数据过期时间无效');
+        if (body.order !== undefined && (!Number.isInteger(body.order) || body.order < 0 || body.order > 9999)) throw new HttpError(400, '排列顺序无效');
+        const preferences = { ...JSON.parse(getSetting('module-preferences:' + id) || '{}'), ...body };
+        stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('module-preferences:' + id, JSON.stringify(preferences));
+        states.delete(id); publishOverview();
+        if (assetSyncIntervalMs > 0) void assetSync.refresh();
+        send(res, 200, { project: publicProject(row) }); return;
+      }
       if (match[2] === '/check' && req.method === 'POST') { send(res, 200, { snapshot: await check(id) }); return; }
       if (match[2] === '/launch' && req.method === 'POST') {
         const project = publicProject(row);
@@ -499,7 +530,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
   assetSync = createAssetSync({
-    listTargets: () => stmt.prepare('SELECT * FROM projects').all().map(row => ({ project: publicProject(row), credentials: decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => !embeddedModules || moduleIds.includes(row.id)).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
     intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
     autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader,
     onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
@@ -517,6 +548,7 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
   interval?.unref();
   const heartbeat = setInterval(publishOverview, 15000); heartbeat.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
+  await updates.initialize();
   return {
     server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); stmt.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },

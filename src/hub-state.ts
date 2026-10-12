@@ -39,9 +39,9 @@ export function navigationQuery(value: unknown): NavigationQuery | null {
 export function navigation(value: unknown): { projectId: string; query: NavigationQuery } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const message = value as Record<string, unknown>;
-  if (!['aster', 'asset', 'monitor', 'crossex'].includes(String(message.projectId))) return null;
+  if (!['asset', 'monitor', 'crossex', 'greeks'].includes(String(message.projectId))) return null;
   const query = navigationQuery(message.query);
-  if (!query || (['aster', 'asset'].includes(String(message.projectId)) && Object.keys(query).length)) return null;
+  if (!query || (['greeks', 'asset'].includes(String(message.projectId)) && Object.keys(query).length)) return null;
   return { projectId: String(message.projectId), query };
 }
 export const projectKey = (project: Project) => `${project.id}:${project.revision || JSON.stringify(project)}`;
@@ -77,7 +77,7 @@ export function nextSnapshotExpiry(snapshots: Snapshot[], now: number): number |
 export type FramePhase = 'loading' | 'ready' | 'failed' | 'unsupported';
 export type WorkspacePlan = { frames: { key: string; phase: FramePhase }[]; attempted: string[]; recent: string[] };
 export const emptyWorkspacePlan = (): WorkspacePlan => ({ frames: [], attempted: [], recent: [] });
-const preloadAdapters: Record<string, string> = { aster: 'aster', monitor: 'monitor', asset: 'asset', crossex: 'standard', variational: 'standard', greeks: 'standard' };
+const preloadAdapters: Record<string, string> = { monitor: 'monitor', asset: 'asset', crossex: 'standard', greeks: 'standard' };
 const workspaceCapacity = Object.keys(preloadAdapters).length;
 export function canPreload(project: Project) {
   return project.enabled && project.accessMode === 'proxy' && !!project.apiUrl && Object.hasOwn(preloadAdapters, project.id) && preloadAdapters[project.id] === project.adapter;

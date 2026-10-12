@@ -8,7 +8,7 @@ set -Eeuo pipefail
 [[ $(cat /proc/1/comm) == systemd ]] || { echo 'A real systemd PID 1 is required.' >&2; exit 1; }
 umask 022
 source_root=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
-AGG_INSTALL_SOURCE_ONLY=1 source "$source_root/install.sh"
+AGG_INSTALL_SOURCE_ONLY=1 source "$source_root/deploy/install.sh"
 
 # Guard exact fixed destinations before any mutation, including units loaded from other search paths.
 [[ "$UPDATER_DIR" == /usr/local/lib/project-aggregation-updater && "$UPDATER_STATE_DIR" == /var/lib/project-aggregation-updater &&

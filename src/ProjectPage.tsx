@@ -80,7 +80,7 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
       setLoading(false);
       latest.current.onStatus('failed');
       if (reason instanceof ApiError && reason.status === 401) onExpired();
-      else setError(reason instanceof Error ? reason.message : '项目页面暂时无法打开，请重试或检查连接设置。');
+      else setError(reason instanceof Error ? reason.message : '项目页面暂时无法打开，请重试或检查模块设置。');
     });
     return () => controller.abort();
   }, [accessible, embedded, proxied, project.id, project.url, attempt, onExpired]);
@@ -137,14 +137,14 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
       <div className="original-page-actions">
         {accessible && embedded ? <button className="button ghost" onClick={() => setAttempt(value => value + 1)}><RefreshCw size={16} />重新载入</button> : null}
         {accessible ? <button className="button ghost" disabled={openingTab} onClick={() => void openInTab()}>{openingTab ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}单独打开</button> : null}
-        <button className="button ghost" onClick={onEdit}><Settings2 size={16} />连接设置</button>
+        <button className="button ghost" onClick={onEdit}><Settings2 size={16} />模块设置</button>
       </div>
     </div>
     {snapshot ? <DiagnosticDetails snapshot={snapshot} now={now} /> : null}
     {error ? <div className="error-box original-page-error" role="alert">{error}</div> : null}
-    {!accessible ? <div className="empty-state original-page-placeholder"><FolderKanban size={32} /><h2>{project.enabled ? '请先设置项目地址' : '项目已停用'}</h2><p>{project.enabled ? '保存连接设置后，即可在这里打开原始页面。' : '在连接设置中启用后，可继续访问原始页面。'}</p><button className="button secondary" onClick={onEdit}>连接设置</button></div>
+    {!accessible ? <div className="empty-state original-page-placeholder"><FolderKanban size={32} /><h2>{project.enabled ? '请先设置项目地址' : '项目已停用'}</h2><p>{project.enabled ? '保存模块设置后，即可在这里打开原始页面。' : '在模块设置中启用后，可继续访问原始页面。'}</p><button className="button secondary" onClick={onEdit}>模块设置</button></div>
       : !embedded ? <div className="empty-state original-page-placeholder"><ExternalLink size={32} /><h2>{project.name}</h2><p>此项目设为在新窗口打开。</p><button className="button primary" disabled={openingTab} onClick={() => void openInTab()}>打开原始页面</button></div>
-        : source ? <iframe ref={frame} key={`${source.attempt}:${source.url}`} className="original-project-frame" title={project.name + '原始页面'} src={source.url} loading="eager" referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" onLoad={loaded} />
+        : source ? <iframe ref={frame} key={`${source.attempt}:${source.url}`} className="original-project-frame" title={project.name + '模块'} src={source.url} loading="eager" referrerPolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" onLoad={loaded} />
           : <div className="empty-state original-page-placeholder">{loading ? <LoaderCircle size={28} className="spin" /> : <button className="button secondary" onClick={() => setAttempt(value => value + 1)}>重新载入</button>}</div>}
   </section>;
 }

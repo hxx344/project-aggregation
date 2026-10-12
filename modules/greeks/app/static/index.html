@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#05080c" />
+  <title>CONDOR · BTC 期权策略台</title>
+  <link rel="stylesheet" href="/static/style.css?v=20261012-1" />
+</head>
+<body>
+  <a class="skip-link" href="#overview">跳转到策略总览</a>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="CONDOR 策略总览">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><path d="M5 23 11 9h10l6 14M8 18h16M12 23l4-9 4 9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span><strong>CONDOR<span class="brand-dot">.</span></strong><small>OPTIONS WORKSPACE</small></span>
+    </a>
+    <nav class="top-nav" aria-label="页面导航"><a href="#overview">总览</a><a href="#position-payoff">持仓</a><a href="#account">账户</a><a href="#market">期权链</a><a href="#orders">组合执行</a><a href="#performance">收益</a><a href="#rfq">组合询价</a></nav>
+    <div class="top-meta"><span id="environment" class="status-chip">连接中</span><span id="clock" class="clock">--:--:-- UTC</span></div>
+  </header>
+  <main class="shell" id="overview">
+    <section class="intro" aria-labelledby="pageTitle">
+      <div><div class="kicker"><span class="eyebrow-line"></span>BTC / OPTIONS STRATEGIES</div><h1 id="pageTitle">BTC 期权执行台<span class="heading-dot">.</span></h1><p><a href="#orders" id="heroExecution">正在恢复执行状态…</a></p></div>
+      <div class="intro-actions"><span class="update-state"><i id="updateDot"></i><span id="updateText">行情同步中</span></span><button id="refresh" class="button ghost"><svg class="icon" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16 8a6.2 6.2 0 1 0-.4 5M16 3v5h-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>立即刷新</button></div>
+    </section>
+    <section class="panel position-payoff-panel" id="position-payoff" aria-labelledby="positionPayoffTitle">
+      <div class="panel-head"><div><div class="kicker">POSITION / EXPIRY PAYOFF</div><h2 id="positionPayoffTitle">持仓到期盈亏<span class="heading-detail">当前所处阶段</span></h2></div><span id="positionPayoffCount" class="source-tag">等待同步</span></div>
+      <div id="positionPayoffContent"><div class="empty">等待持仓同步…</div></div>
+      <p class="pp-note">假设当前剩余持仓持有至到期，按开仓均价计算；不含交易与交割手续费、已平仓盈亏。不同到期日、结算币种分别展示。现价标记表示“若以此价格到期”的情景，实际交割以结算价为准。<a href="https://www.bybit.com/en/help-center/article/P-L-Calculations-Options" target="_blank" rel="noopener noreferrer">计算口径 ↗</a></p>
+    </section>
+    <section class="stats" aria-label="策略指标">
+      <article class="metric-featured"><span>净权利金 <small>NET CREDIT</small></span><strong id="creditValue">--</strong><small>每组策略 · USD</small></article>
+      <article><span>最大亏损 <small>MAX LOSS</small></span><strong id="lossValue">--</strong><small id="riskSub">风险上限 --</small></article>
+      <article><span>保证金需求 <small>INITIAL MARGIN</small></span><strong id="marginValue">--</strong><small id="marginSub">官方公式估算</small></article>
+      <article><span>维护保证金 <small>MAINTENANCE</small></span><strong id="maintenanceValue">--</strong><small>短期权 MM</small></article>
+      <article><span>交易成本 <small>EST. FEES</small></span><strong id="costValue">--</strong><small id="feeSub">手续费率 --</small></article>
+      <article class="metric-status"><span>行情状态 <small>MARKET STATUS</small></span><strong id="statusValue">准备中</strong><small id="statusSub">等待行情</small></article>
+    </section>
+    <section class="health panel" id="account" aria-labelledby="healthTitle">
+      <div class="health-head"><div><div class="kicker">01 / ACCOUNT</div><h2 id="healthTitle">账户保证金健康度</h2></div><span id="healthMode" class="source-tag">未连接账户</span></div>
+      <div id="healthUnavailable" class="health-unavailable">连接账户后，将显示余额、保证金和风险指标。</div>
+      <div id="healthContent" class="health-content" style="display:none">
+        <div class="health-values"><div class="balance-featured"><span>可用余额</span><strong id="availableBalance">--</strong><small>AVAILABLE BALANCE · USD</small></div><div><span>保证金余额</span><strong id="marginBalance">--</strong><small>MARGIN BALANCE · USD</small></div><div><span>总权益</span><strong id="totalEquity">--</strong><small>TOTAL EQUITY · USD</small></div></div>
+        <div class="health-metric"><div><span>初始保证金率</span><b id="imRate">--</b></div><div class="progress"><i id="imBar"></i></div></div>
+        <div class="health-metric"><div><span>维护保证金率</span><b id="mmRate">--</b></div><div class="progress danger"><i id="mmBar"></i></div></div>
+        <div class="health-account-mode"><span>账户模式</span><strong id="accountMode">--</strong></div>
+      </div>
+    </section>
+    <section class="workspace" id="market" aria-label="盘口与执行">
+      <div class="panel chain-panel" id="chainPanel" data-depth="compact">
+        <div class="panel-head"><div><div class="kicker">02 / MARKET</div><h2>期权链<span class="heading-detail">双侧盘口</span></h2></div><div class="head-right"><span class="spot-tag">BTC <b id="btcPrice">--</b></span><span id="chainSource" class="source-tag">--</span><span id="expiry" class="expiry-tag">到期 --</span></div></div>
+        <p id="marketNotice" class="market-notice" role="status" hidden></p>
+        <div class="chain-toolbar"><span>到期日 <b id="targetDate">--</b></span><span>每 <b id="refreshRate">10</b> 秒更新</span><span id="legSummary" class="leg-summary">BUY 2 · SELL 2</span><button id="toggleDepth" class="table-toggle" type="button" aria-pressed="false">完整盘口 ↗</button><span class="legend"><i class="legend-buy"></i>Bid 买价<i class="legend-sell"></i>Ask 卖价</span></div>
+        <div class="chain-wrap" tabindex="0" role="region" aria-label="双侧期权盘口，可横向滚动">
+          <table class="chain-table" aria-label="BTC 期权链">
+            <thead><tr><th colspan="5" class="call-head" scope="colgroup">CALLS <span>看涨期权</span></th><th class="strike-head" scope="col">STRIKE</th><th colspan="5" class="put-head" scope="colgroup"><span>看跌期权</span> PUTS</th></tr><tr><th scope="col">24H VOL</th><th scope="col">OI</th><th scope="col">DELTA</th><th scope="col">BID SIZE</th><th scope="col">BID</th><th scope="col">MARK</th><th scope="col">ASK</th><th scope="col">ASK SIZE</th><th scope="col">LEG</th><th scope="col">行权价</th><th scope="col">LEG</th><th scope="col">ASK SIZE</th><th scope="col">ASK</th><th scope="col">MARK</th><th scope="col">BID</th><th scope="col">BID SIZE</th><th scope="col">DELTA</th><th scope="col">OI</th><th scope="col">24H VOL</th></tr></thead>
+            <tbody id="chain"></tbody>
+          </table>
+        </div>
+        <div class="chain-foot"><span id="chainCount">等待合约数据</span><span>高亮为策略腿 <span class="text-divider">·</span> B 买入 / S 卖出</span></div>
+      </div>
+      <aside class="panel execution" aria-labelledby="executionTitle">
+        <div class="panel-head"><div><div class="kicker">EXECUTION</div><h2 id="executionTitle">执行控制</h2></div><span class="lock-badge">LIMIT / BBO</span></div>
+        <div class="mode-box" id="modeBox"><span class="mode-icon" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><path d="m10 2 6 2.5v5c0 4-6 7-6 7s-6-3-6-7v-5L10 2Z" stroke="currentColor" stroke-width="1.3"/><path d="m7 9 2 2 4-4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span><div><strong id="modeTitle">模拟模式</strong><p id="modeText">不会向交易所发送订单。</p></div></div>
+        <div class="execution-inputs">
+          <div class="field"><label for="strategyMode">开仓结构 <span>STRATEGY</span></label><select id="strategyMode" aria-describedby="strategyScope strategyRisk"><option value="iron_condor">四腿铁鹰 · 带保护腿</option><option value="short_strangle">双腿卖出 · 无保护腿</option></select><small id="strategyScope" class="field-hint">仅影响本页预览、手动开仓和新 RFQ；已有询价保留原结构。</small><small id="strategyRisk" class="field-hint strategy-risk" role="status">买入远端保护腿，按最大亏损控制风险。</small></div>
+          <div class="field"><label for="quantityPreset">每腿数量 <span>BTC</span></label><div class="quantity-row"><select id="quantityPreset" aria-label="每腿数量预设"><option value="0.01">0.01</option><option value="0.05">0.05</option><option value="0.1">0.10</option><option value="0.25">0.25</option><option value="0.5">0.50</option><option value="1" selected>1.00</option><option value="custom">自定义</option></select><input id="quantity" aria-label="自定义每腿数量" type="number" min="0.01" step="0.01" value="1" /></div><small class="field-hint">调整数量后，自动重算保证金与交易成本。</small></div>
+        </div>
+        <label class="confirm"><input id="confirm" type="checkbox" /><span id="confirmText">我已核对四腿、报价和风险上限</span></label>
+        <button id="openTrade" class="button primary" disabled>模拟开仓四腿</button><button id="closeTrade" class="button close-button">模拟平仓已跟踪持仓</button>
+        <p class="microcopy">开仓与平仓先核对固定方案，再独立确认提交。上方风险勾选用于创建新 RFQ。</p>
+        <div class="schedule"><span>计划开仓 <small id="automaticMode">自动任务模式待同步</small></span><strong id="nextOpen">周五 21:00 UTC</strong></div>
+      </aside>
+    </section>
+    <section class="panel orders-panel" id="orders" aria-labelledby="ordersTitle" data-state="loading">
+      <div class="panel-head"><div><div class="kicker">EXECUTION / LIVE ORDERS</div><h2 id="ordersTitle">组合执行<span class="heading-detail">当前进度与净额</span></h2></div><span id="ordersSyncState" class="source-tag">等待同步</span></div>
+      <div class="orders-toolbar"><span id="ordersSummary">正在读取委托记录…</span><span id="ordersSnapshotTime">服务器快照 --</span><span>前台每 1 秒 · 后台至少 30 秒</span></div>
+      <p id="ordersNotice" class="orders-notice" role="status" aria-live="polite" hidden></p>
+      <p id="executionPending" class="orders-notice" role="status" aria-live="polite" hidden></p>
+      <div id="activeExecutions" class="execution-groups"></div>
+      <div id="ordersEmpty" class="empty">等待执行任务同步…</div>
+      <details id="executionHistory" class="execution-history" hidden><summary id="executionHistorySummary">最近结束的组合</summary><div id="executionHistoryBody" class="execution-groups"></div></details>
+      <details id="legacyOrders" class="execution-history" hidden><summary>独立委托与历史明细</summary>
+      <div id="ordersTableWrap" class="orders-table-wrap" tabindex="0" role="region" aria-label="执行挂单记录，可滚动查看" hidden>
+        <table class="orders-table" role="table" aria-label="执行挂单，价格单位 USD，数量单位 BTC，时间为 UTC">
+          <thead role="rowgroup"><tr role="row"><th scope="col">合约 / 订单标识</th><th scope="col">执行</th><th scope="col">价格 <small>USD</small></th><th scope="col">数量 <small>BTC</small></th><th scope="col">状态阶段</th><th scope="col">时间 <small>UTC</small></th></tr></thead>
+          <tbody id="ordersBody" role="rowgroup"></tbody>
+        </table>
+      </div>
+      </details>
+      <p class="orders-note">每次开仓或平仓按一笔组合跟踪。各腿数量单位 BTC；成交净额与手续费按实际币种展示，缺失金额待核对。RFQ 见组合询价。停止只撤未成交委托，已成交部分保留。</p>
+    </section>
+    <section class="bottom-grid" aria-label="策略与活动">
+      <div class="panel strategy-panel">
+        <div class="panel-head"><div><div class="kicker">03 / STRATEGY</div><h2>组合结构</h2></div><span id="strategyDescription" class="muted">双侧卖出 · 远端保护</span></div>
+        <div id="legs" class="legs"></div>
+        <div class="payoff"><div class="payoff-title"><span>到期盈亏曲线 <small>USD</small></span><span class="muted">按当前报价估算</span></div><div class="payoff-chart-wrap"><canvas id="payoffChart" aria-label="到期盈亏曲线，非当前持仓浮动盈亏" aria-describedby="payoffRisk"></canvas><p id="payoffRisk" class="payoff-risk" hidden></p></div><div id="payoffStats" class="payoff-stats"></div></div>
+      </div>
+      <div class="panel activity-panel">
+        <div class="panel-head"><div><div class="kicker">ACTIVITY</div><h2>仓位与事件</h2></div><button id="reloadPositions" class="link-button">刷新 ↗</button></div>
+        <div class="subhead">当前仓位<span>POSITIONS</span></div><div id="positions" class="positions empty">暂无持仓</div>
+        <div class="subhead log-title">系统日志<span>EVENT LOG</span></div><div id="logs" class="logs"></div>
+        <div class="subhead log-title">成交与手续费<span>FILLS</span></div><div id="executions" class="executions empty">暂无成交记录</div>
+      </div>
+    </section>
+    <section class="panel performance-panel" id="performance" aria-labelledby="performanceTitle">
+      <div class="panel-head"><div><div class="kicker">PERFORMANCE / LIVE STRATEGY</div><h2 id="performanceTitle">策略实盘收益<span class="heading-detail">按每次组合开仓累计</span></h2></div><span id="performanceMode" class="source-tag">等待同步</span></div>
+      <div class="performance-toolbar"><p id="performanceStatus">正在同步收益台账…</p><select id="performanceCurrency" aria-label="收益结算币种"><option value="USDT">USDT</option></select><button id="reloadPerformance" class="link-button">刷新收益 ↗</button></div>
+      <div class="performance-summary"><div><span>到期组合综合净收益</span><strong id="performanceTotal">--</strong></div><div><span>纳入统计的到期组合</span><strong id="performanceClosed">0</strong></div><div><span>到期组合胜率</span><strong id="performanceWinRate">--</strong></div><div><span>到期组合采样最大回撤</span><strong id="performanceDrawdown">--</strong></div></div>
+      <div id="performanceChart" class="pp-chart"><div class="empty">等待实盘收益记录</div></div>
+      <div class="performance-list-head"><h3>每次开仓收益详情</h3><span id="performanceCoverage">等待同步</span></div>
+      <div id="performanceGroups"><div class="empty">等待组合记录</div></div>
+      <p class="pp-note">综合统计仅纳入已核实持有至到期的组合，提前平仓或部分减仓的整组均不纳入。持仓期间定时保存真实盈亏采样；到期后将采样路径与最终净收益纳入综合曲线，包含已知交易费用和最终交割手续费。历史未采样时段不补造数据，断网缺口断开显示。按结算币种分别统计，不含账户充值、提现和无关交易。台账持续保存，历史覆盖范围以同步起点为准。<a href="https://bybit-exchange.github.io/docs/v5/position/close-position" target="_blank" rel="noopener noreferrer">交易所收益记录 ↗</a></p>
+    </section>
+    <section class="panel rfq-panel" id="rfq" aria-labelledby="rfqTitle">
+      <div class="panel-head"><div><div class="kicker">04 / BLOCK TRADING</div><h2 id="rfqTitle">组合询价<span class="heading-detail">RFQ</span></h2></div><span id="rfqStatus" class="source-tag">未创建</span></div>
+      <div class="rfq-controls"><p>按所选开仓结构发送组合询价<span>比较本次询价的整组报价，再确认执行。</span></p><input id="rfqCounterparties" type="hidden" /><button id="rfqCreate" class="button ghost" disabled>创建 RFQ ↗</button><button id="rfqCancel" class="button close-button">取消询价</button></div>
+      <div class="rfq-meta"><span>询价 ID <b id="rfqId">--</b></span><span>类型 <b id="rfqType">--</b></span><span>有效期 <b id="rfqExpires">--</b></span><span>报价数 <b id="rfqQuoteCount">0</b></span></div>
+      <div id="rfqQuotes" class="rfq-quotes empty">暂无报价</div>
+    </section>
+    <footer class="page-footer"><span>CONDOR<span class="brand-dot">.</span><small>BTC OPTIONS WORKSPACE</small></span><span>周五开仓 <span class="text-divider">/</span> 周日到期 <span class="text-divider">/</span> UTC</span><a href="#overview">返回顶部 ↑</a></footer>
+  </main>
+  <dialog id="tradePlanDialog" class="trade-dialog" aria-labelledby="planTitle" aria-describedby="planRisk">
+    <div class="dialog-head"><div><div class="kicker">确认固定交易方案</div><h2 id="planTitle">核对方案</h2></div><button id="planCancel" class="link-button" type="button">关闭</button></div>
+    <p id="planEnvironment" class="plan-environment"></p><p id="planExpiry" class="plan-expiry" role="timer" aria-live="off"></p>
+    <div id="planLegs" class="plan-legs"></div><div id="planAmounts" class="plan-amounts"></div>
+    <label id="planNetLabel" for="planNetLimit">净价限制 · USD</label><input id="planNetLimit" name="net_limit" type="number" step="any" inputmode="decimal" autocomplete="off" aria-describedby="planRisk planError" />
+    <p id="planRisk" class="execution-caveat"></p><p id="planError" class="loss" role="status"></p>
+    <label class="confirm"><input id="planConfirm" type="checkbox" /><span id="planConfirmText">我已核对以上固定方案。</span></label>
+    <button id="planSubmit" class="button primary" type="button" disabled>确认执行</button>
+  </dialog>
+  <dialog id="rfqConfirmDialog" class="trade-dialog" aria-labelledby="rfqConfirmTitle">
+    <div class="dialog-head"><h2 id="rfqConfirmTitle">核对本次 RFQ 报价</h2><button id="rfqConfirmCancel" class="link-button" type="button">关闭</button></div>
+    <div id="rfqConfirmSummary"></div><p id="rfqConfirmError" class="loss" role="status"></p>
+    <p class="execution-caveat">确认后提交本次报价。取消询价不能撤回已提交的执行。</p>
+    <label class="confirm"><input id="rfqConfirm" type="checkbox" /><span>我确认以上合约、方向、数量、整组报价和风险。</span></label>
+    <button id="rfqConfirmSubmit" class="button primary" type="button" disabled>确认并执行报价</button>
+  </dialog>
+  <aside id="notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden><div><strong id="noticeTitle">操作结果</strong><button id="dismissNotice" class="notice-dismiss" aria-label="关闭操作提示">×</button></div><p id="noticeText"></p></aside>
+  <script src="/static/hub.js?v=20261009-1"></script>
+  <script src="/static/position-payoff.js?v=20261010-1"></script>
+  <script src="/static/performance.js?v=20261009-1"></script>
+  <script src="/static/app.js?v=20261010-4"></script>
+</body>
+</html>

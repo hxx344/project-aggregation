@@ -50,7 +50,7 @@ export function createTradingImporter({ listTargets, trading, request = requestJ
   function current(id, revision) {
     const target = targets().find(row => row.project.id === id);
     if (!target || target.revision !== revision) throw changed();
-    if (!target.project.apiUrl || !target.credentials?.password) throw new TradingError(400, '请先在 Asset 项目设置中保存服务地址和登录密码');
+    if (!target.project.apiUrl || (!target.project.embedded && !target.credentials?.password)) throw new TradingError(400, '请先在 Asset 项目设置中保存服务地址和登录密码');
     return target;
   }
   async function read(target, path, signal, { method = 'GET', body, deadline = Date.now() + sourceTimeoutMs } = {}) {
@@ -75,7 +75,7 @@ export function createTradingImporter({ listTargets, trading, request = requestJ
         while (index < selected.length) {
           const position = index++, target = selected[position], project = target.project;
           const base = { projectId: project.id, name: project.name, projectRevision: target.revision };
-          if (!project.apiUrl || !target.credentials?.password) { sources[position] = { ...base, status: 'unconfigured', error: '请在项目设置中保存 Asset 服务地址和登录密码', connections: [] }; continue; }
+          if (!project.apiUrl || (!project.embedded && !target.credentials?.password)) { sources[position] = { ...base, status: 'unconfigured', error: '请在项目设置中保存 Asset 服务地址和登录密码', connections: [] }; continue; }
           try { sources[position] = { ...base, status: 'ready', error: null, connections: catalogOf(await read(target, CATALOG_READ, controller.signal, { deadline })) }; }
           catch (error) { sources[position] = { ...base, status: 'unavailable', error: sourceError(error).message, connections: [] }; }
         }
@@ -99,7 +99,7 @@ export function createTradingImporter({ listTargets, trading, request = requestJ
           const rows = catalogOf(await read(target, CATALOG_READ, signal));
           const row = rows.find(item => item.exchange === exchange);
           if (!row.configured || !row.supported || row.revision !== body.sourceRevision) throw changed();
-          const data = await read(target, CATALOG + '/export', signal, { method: 'POST', body: { exchange, revision: row.revision, password: target.credentials.password } });
+          const data = await read(target, CATALOG + '/export', signal, { method: 'POST', body: { exchange, revision: row.revision, ...(target.project.embedded ? {} : { password: target.credentials.password }) } });
           if (!object(data) || data.schemaVersion !== 1 || data.exchange !== exchange || data.revision !== row.revision || data.region !== 'global' || !object(data.credentials)) throw malformed();
           return { apiKey: data.credentials.apiKey, apiSecret: data.credentials.apiSecret, ...(exchange === 'okx' ? { passphrase: data.credentials.passphrase } : {}) };
         },

@@ -11,7 +11,7 @@ UNIT_FILE=/etc/systemd/system/project-aggregation.service
 REPOSITORY=https://github.com/hxx344/project-aggregation.git
 BRANCH=main
 NODE_VERSION=24.15.0
-INSTALL_REVISION=2
+INSTALL_REVISION=3
 UPDATER_DIR=/usr/local/lib/project-aggregation-updater
 UPDATER_STATE_DIR=/var/lib/project-aggregation-updater
 UPDATER_RUN_DIR=/run/project-aggregation-updater
@@ -29,6 +29,8 @@ old_unit_backup=
 old_environment=
 old_health_url=
 work_dir=
+module_migration_helper=
+GREEKS_PYTHON_PATH=
 
 # BEGIN CI RELEASE HELPERS -- keep embedded copies identical to deploy/release-common.sh
 # Only discovery uses latest; the archive is always fetched from its immutable commit tag.
@@ -187,8 +189,8 @@ health_url() {
 remember_environment() {
   # main runs as root; a root-only snapshot may include INITIAL_PASSWORD.
   local temporary="$APP_DIR/.last-successful.env.new.$$"
-  install -m 0600 "$ENV_FILE" "$temporary"
-  mv -f -- "$temporary" "$APP_DIR/.last-successful.env"
+  install -m 0600 "$ENV_FILE" "$temporary" || return 1
+  mv -f -- "$temporary" "$APP_DIR/.last-successful.env" || return 1
 }
 prepare_environment_rollback() {
   old_environment=
@@ -213,6 +215,9 @@ restore_environment() {
     mv -f -- "$temporary" "$ENV_FILE" || return 1
     log "未生效的新配置已保存：$failed_environment"
   fi
+  # Activation records may already contain the failed candidate. Restore the
+  # durable snapshot too, so a later deployment cannot roll back to that state.
+  remember_environment || return 1
   HEALTH_URL=$old_health_url
 }
 healthy() {
@@ -244,6 +249,14 @@ rollback() {
   trap - ERR INT TERM
   set +e
   if [[ "$activation_started" == 1 ]]; then
+    # Stop every embedded writer before re-enabling its standalone predecessor.
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    if [[ -n "$module_migration_helper" ]]; then
+      if ! python3 "$module_migration_helper" rollback --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json"; then
+        log '旧模块服务恢复未完成；工作台保持停止，请检查迁移日志后重试。'
+        exit "$exit_code"
+      fi
+    fi
     log '新版本启动失败，正在恢复之前的程序和服务配置。'
     if [[ -n "$old_unit_backup" && -f "$old_unit_backup" ]]; then
       cp -- "$old_unit_backup" "$UNIT_FILE"
@@ -279,6 +292,7 @@ ensure_tools() {
       case "$tool" in xz) missing+=(xz-utils) ;; *) missing+=("$tool") ;; esac
     fi
   done
+  if ! /usr/bin/python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then missing+=(python3-venv); fi
   [[ -s /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
   if ! command -v flock >/dev/null 2>&1 || ! command -v runuser >/dev/null 2>&1; then missing+=(util-linux); fi
   if ((${#missing[@]})); then
@@ -289,6 +303,7 @@ ensure_tools() {
   else
     log '系统依赖已齐全，跳过安装。'
   fi
+  /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || fail '内置 Greeks 需要 Python 3.11+；请使用 Debian 12/13 或 Ubuntu 24.04。'
 }
 ensure_node() {
   local candidate machine archive runtime_dir checksum
@@ -330,12 +345,13 @@ atomic_record() {
 }
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
-  local dependency_tree typecheck_tree test_tree build_tree runtime_tree
+  local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree
   dependency_tree=$(tree_hash package.json package-lock.json .npmrc) || return
-  typecheck_tree=$(tree_hash src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
-  test_tree=$(tree_hash src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
-  build_tree=$(tree_hash src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
-  runtime_tree=$(tree_hash server package.json) || return
+  typecheck_tree=$(tree_hash modules scripts/modules.mjs src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
+  test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
+  build_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/migrate-modules.py src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
+  runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py) || return
+  embedded_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/migrate-modules.py) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf 'dependencies-v2\n%s\n%s' "$dependency_tree" "$runtime_key" | hash)
   typecheck_key=$(printf 'typecheck-v2\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
@@ -347,6 +363,8 @@ input_keys() {
   built="$APP_DIR/cache/build-$build_key"
   typecheck_stamp="$APP_DIR/cache/typechecked-$typecheck_key"
   test_stamp="$APP_DIR/cache/tested-$test_key"
+  embedded_key=$(printf 'embedded-build-v1\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" | hash)
+  embedded="$APP_DIR/cache/embedded-$embedded_key"
 }
 application_ready() {
   [[ -n "$old_release" && -f "$old_release/.install-ready" && -f "$old_release/.application-key" &&
@@ -408,6 +426,11 @@ prepare_application() {
   if application_ready; then reuse=1; fi
   if (( reuse )) || [[ -f "$built/.complete" && -s "$built/dist/index.html" ]]; then need_build=0; fi
   if [[ ! -f "$typecheck_stamp" || ( "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" ) ]] || (( need_build )); then prepare_workspace; fi
+  if [[ "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" && -d "$work_dir/source/modules" ]]; then
+    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run install:modules)
+    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run build:modules)
+    prepare_source_greeks_runtime
+  fi
   if [[ ! -f "$typecheck_stamp" ]]; then
     log '类型检查输入变化，执行一次类型检查。'
     (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run check)
@@ -417,7 +440,7 @@ prepare_application() {
     log '跳过完整行为测试；CI 继续验证，设置 PROJECT_DEPLOY_TESTS=1 可在部署时补测。'
   elif [[ ! -f "$test_stamp" ]]; then
     log '测试或相关源码变化，在隔离目录执行行为测试。'
-    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" test)
+    (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" "$NODE_BIN" "$NPM_BIN" test)
     atomic_record "$test_stamp" "$test_key"
   else log '行为测试输入未变化，复用验证结果。'; fi
   if (( need_build )); then
@@ -427,6 +450,39 @@ prepare_application() {
     [[ ! -e "$built" ]] || fail '构建缓存目录不完整，请检查后重试。'
     mkdir "$work_dir/build"
     cp -a "$work_dir/source/dist" "$work_dir/build/dist"
+    if [[ -d "$work_dir/source/modules" ]]; then
+      if [[ -f "$embedded/.complete" && -d "$embedded/modules" ]]; then
+        log '内置模块源码与依赖未变化，复用模块产物并跳过模块安装、构建。'
+      else
+        [[ ! -e "$embedded" ]] || fail '内置模块构建缓存不完整，请检查后重试。'
+        (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run install:modules)
+        (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run build:modules)
+        # Build output belongs to the unprivileged account. Freeze it, then
+        # restore all executable runtime/helper source from the pinned git tree.
+        # In particular, never execute its writable packaging script as root.
+        chown -R root:root "$work_dir/source"
+        chmod -R go-w "$work_dir/source"
+        mkdir "$work_dir/trusted-runtime"
+        git --git-dir="$APP_DIR/repository.git" archive "$commit" server modules package.json package-lock.json deploy/package-release.py deploy/migrate-modules.py | tar -x -C "$work_dir/trusted-runtime"
+        cp -a "$work_dir/source/dist" "$work_dir/trusted-runtime/dist"
+        ln -s "$dependencies/node_modules" "$work_dir/trusted-runtime/node_modules"
+        local module artifact
+        for module in monitor asset crossex; do
+          ln -s "$work_dir/source/modules/$module/node_modules" "$work_dir/trusted-runtime/modules/$module/node_modules"
+          for artifact in dist .next; do
+            if [[ -d "$work_dir/source/modules/$module/$artifact" ]]; then
+              cp -a "$work_dir/source/modules/$module/$artifact" "$work_dir/trusted-runtime/modules/$module/$artifact"
+            fi
+          done
+        done
+        python3 "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --stage-only "$work_dir/embedded-runtime"
+        chown -R root:root "$work_dir/embedded-runtime"
+        chmod -R a+rX,go-w "$work_dir/embedded-runtime"
+        atomic_record "$work_dir/embedded-runtime/.complete" "$embedded_key"
+        mv -- "$work_dir/embedded-runtime" "$embedded"
+      fi
+      cp -a "$embedded/modules" "$embedded/node_modules" "$embedded/deploy" "$work_dir/build/"
+    fi
     chown -R root:root "$work_dir/build"
     atomic_record "$work_dir/build/.complete" "$build_key"
     mv -- "$work_dir/build" "$built"
@@ -451,6 +507,9 @@ prepare_application() {
   # Re-extract runtime source as root; tests/builds cannot modify published code.
   git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$work_dir/publish"
   cp -a "$built/dist" "$work_dir/publish/dist"
+  if [[ -d "$built/modules" ]]; then
+    cp -a "$built/modules" "$built/node_modules" "$built/deploy" "$work_dir/publish/"
+  fi
   if (( RUNTIME_DEPENDENCIES )); then
     prepare_dependencies
     ln -s "$dependencies/node_modules" "$work_dir/publish/node_modules"
@@ -710,6 +769,76 @@ finish_update_service() {
   fi
 }
 
+validate_embedded_runtime() {
+  local root=$1 file
+  for file in modules/monitor/dist/client/index.html modules/asset/.next/BUILD_ID modules/crossex/dist/index.html modules/greeks/requirements.lock server/modules/greeks-bridge.py deploy/migrate-modules.py; do
+    [[ -s "$root/$file" ]] || { fail "统一部署包缺少模块文件：$file"; return 1; }
+  done
+}
+prepare_source_greeks_runtime() {
+  local trusted_root="$work_dir/python-lock" lockfile="$work_dir/python-lock/modules/greeks/requirements.lock"
+  [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || { fail 'Greeks 依赖需要固定提交。'; return 1; }
+  updater_safe_path "$APP_DIR/repository.git" || return 1
+  updater_safe_path "$lockfile" || return 1
+  mkdir -p "$trusted_root/modules/greeks"
+  # Never use or freeze a lockfile from the service-owned test/build workspace.
+  # Retrieve its bytes independently from the already-pinned repository object.
+  git --git-dir="$APP_DIR/repository.git" show "$commit:modules/greeks/requirements.lock" > "$lockfile" || return 1
+  chmod 0600 "$lockfile"
+  prepare_greeks_runtime "$trusted_root"
+}
+prepare_greeks_runtime() {
+  local root=$1 fingerprint runtime lockfile="$1/modules/greeks/requirements.lock"
+  # Both source-mode testing and CI activation share this privileged boundary.
+  # A protected leaf under a service-writable ancestor is still untrusted.
+  updater_safe_path "$lockfile" || return 1
+  [[ -s "$lockfile" && -f "$lockfile" ]] || { fail '缺少可信 Greeks 依赖锁文件。'; return 1; }
+  updater_safe_path "$APP_DIR/python" || return 1
+  fingerprint=$({ cat "$lockfile"; /usr/bin/python3 -VV; uname -m; } | hash)
+  runtime="$APP_DIR/python/$fingerprint"
+  updater_safe_path "$runtime" || return 1
+  if [[ -x "$runtime/bin/python" && -f "$runtime/.complete" ]]; then
+    GREEKS_PYTHON_PATH="$runtime/bin/python"
+    log 'Greeks 依赖与 Python 环境未变化，复用已验证虚拟环境。'
+    return
+  fi
+  if [[ -d "$runtime" && ! -L "$runtime" && -f "$runtime/.building" && "$(cat "$runtime/.building")" == "$fingerprint" ]]; then
+    [[ "$(realpath -e "$runtime")" == "$APP_DIR/python/$fingerprint" ]] || return 1
+    rm -rf -- "$runtime"
+  fi
+  [[ ! -e "$runtime" ]] || { fail "Greeks 虚拟环境不完整：$runtime"; return 1; }
+  mkdir -p "$APP_DIR/python"
+  mkdir "$runtime"
+  atomic_record "$runtime/.building" "$fingerprint"
+  # Build at its final path: Python's scripts contain the absolute venv location.
+  /usr/bin/python3 -m venv "$runtime"
+  "$runtime/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$lockfile"
+  "$runtime/bin/python" -c 'import fastapi, httpx, pydantic_settings'
+  chmod -R a+rX,go-w "$runtime"
+  atomic_record "$runtime/.complete" "$fingerprint"
+  rm -f -- "$runtime/.building"
+  GREEKS_PYTHON_PATH="$runtime/bin/python"
+  log 'Greeks Python 依赖已按锁定版本安装并验证。'
+}
+migrate_embedded_modules() {
+  module_migration_helper="$1/deploy/migrate-modules.py"
+  # The migration helper uses a root-only journal and never modifies old data.
+  # Stop the hub first so neither old nor new in-process writers race the copy.
+  if systemctl is-active --quiet "$SERVICE"; then systemctl stop "$SERVICE"; fi
+  python3 "$module_migration_helper" begin --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json" --user "$SERVICE_USER"
+}
+finish_activation() {
+  # Finish fallible records while the migration can still restore old services.
+  remember_environment || return 1
+  atomic_record "$APP_DIR/.greeks-python-path" "$GREEKS_PYTHON_PATH" || return 1
+  if [[ -n "$module_migration_helper" ]]; then
+    python3 "$module_migration_helper" commit --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json" || return 1
+  fi
+  # A committed migration is the topology commit point. Later bookkeeping must
+  # never restart the old hub with its now-retired standalone modules.
+  activation_started=0
+}
+
 write_unit() {
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
@@ -725,9 +854,10 @@ Group=$SERVICE_USER
 WorkingDirectory=$APP_DIR/current
 ExecStart=$NODE_BIN $APP_DIR/current/server/index.mjs
 EnvironmentFile=$ENV_FILE
+Environment=GREEKS_PYTHON=$GREEKS_PYTHON_PATH
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=20
+TimeoutStopSec=45
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -811,6 +941,7 @@ main() {
   runtime_key=$(printf '%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$("$NODE_BIN" "$NPM_BIN" --version)" "$(uname -m)" | hash)
   build_environment=$("$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key.startsWith("VITE_")).sort(([a], [b]) => a.localeCompare(b))))')
   fi
+  if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
@@ -835,6 +966,7 @@ main() {
   fi
   if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
     prepare_ci_application
+    validate_embedded_runtime "$release"
     run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
   else
   if [[ ! -d "$APP_DIR/repository.git" ]]; then git init --bare -q "$APP_DIR/repository.git"; fi
@@ -845,7 +977,11 @@ main() {
   fi
   input_keys
   prepare_application
+  validate_embedded_runtime "$release"
   fi
+  prepare_greeks_runtime "$release"
+  write_unit
+  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] && healthy; then
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
@@ -859,6 +995,7 @@ main() {
   if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
   prepare_environment_rollback
   activation_started=1
+  migrate_embedded_modules "$release"
   if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
   if [[ ! -f "$UNIT_FILE" ]] || ! cmp -s "$work_dir/service" "$UNIT_FILE"; then
     install -m 0644 "$work_dir/service" "$UNIT_FILE"
@@ -867,8 +1004,7 @@ main() {
   systemctl enable "$SERVICE" >/dev/null
   systemctl restart "$SERVICE"
   wait_healthy || fail '服务未在 30 次健康检查内就绪。'
-  remember_environment
-  activation_started=0
+  finish_activation
   atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
   atomic_record "$release/.install-ready" "$application_key"
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"

@@ -25,6 +25,10 @@ output/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.next/
+.build-cache/
+.module-cache/
+.venv/
 
 # OS
 .DS_Store

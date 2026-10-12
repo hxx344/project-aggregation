@@ -1,23 +1,14 @@
 #!/usr/bin/env bash
-# Coordinate existing installers without taking ownership of their data or services.
+# Compatibility entry point for the single unified application installer.
 set -Eeuo pipefail
 
 STACK_CACHE=/var/cache/project-aggregation-stack
 STACK_LOGS=/var/log/project-aggregation-stack
 STACK_LOCK=/run/lock/project-aggregation-stack.lock
-STACK_ORDER=(aster monitor asset crossex variational greeks hub)
-declare -A STACK_REPOS=(
-  [aster]=aster_5x [monitor]=market-spread-monitor [asset]=asset-ledger
-  [variational]=variational-grid [crossex]=gate-crossex-arbitrage [greeks]=greeks [hub]=project-aggregation
-)
-declare -A STACK_PATHS=(
-  [aster]=install-trading.sh [monitor]=deploy/install.sh [asset]=install.sh
-  [variational]=install.sh [crossex]=install.sh [greeks]=install.sh [hub]=install.sh
-)
-declare -A STACK_NAMES=(
-  [aster]='ASTER 5X' [monitor]='Market Monitor' [asset]='Asset Ledger'
-  [variational]='Variational Grid' [crossex]='Gate CrossEx' [greeks]='Greeks · BTC 期权' [hub]='Project Aggregation'
-)
+STACK_ORDER=(hub)
+declare -A STACK_REPOS=([hub]=project-aggregation)
+declare -A STACK_PATHS=([hub]=deploy/install.sh)
+declare -A STACK_NAMES=([hub]='Project Aggregation（四个内置模块与交易）')
 declare -A stack_status=() stack_seconds=()
 stack_selected=()
 stack_workers=()
@@ -166,19 +157,17 @@ stack_log() { printf '[总部署] %s\n' "$*"; }
 stack_fail() { stack_log "错误：$*" >&2; return 1; }
 stack_usage() {
   cat <<'HELP'
-用法：sudo bash install-all.sh [--only aster,monitor,asset,crossex,variational,greeks,hub] [--refresh] [--with-tests]
-默认安装或升级六个模块及平台；已有配置、密码和数据由各自安装器保留。
-默认下载 GitHub CI 已验证的部署包；服务器只检查配置和健康，不运行前端构建或完整测试。
-支持 Ubuntu 22.04/24.04、Debian 12/13，x64/arm64，需 systemd。
-  Variational 需要 Python 3.11+；Ubuntu 22.04 默认 Python 不满足要求。
-  Variational 不要求部署时输入 vr-token；缺失或失效不阻止安装。
-  默认 QQQ 模式可在页面“更新 Var token”，认证恢复前暂停相关模拟活动。
-  Greeks 支持 Ubuntu 24.04、Debian 12/13，默认模拟；面板密码保存在 /etc/greeks/greeks.env。
-  --only     只检查和部署指定项目，始终按上述顺序执行，平台最后部署。
-  --refresh  重新下载安装器；不强制重装应用依赖、构建或重启。
-  --with-tests  仅显式 PROJECT_DEPLOY_MODE=source 时开启工作台/CrossEx 部署测试；CI 模式忽略。
-  --help     查看说明，无需 root。
-失败后修复原因并重复原命令；已完成项目仍会检查配置和服务健康。
+用法：sudo bash install-all.sh [--only hub] [--refresh] [--with-tests]
+统一安装工作台、Market Monitor、Asset Ledger、Gate CrossEx、Greeks，并保留原生交易模块。
+只部署一个工作台服务，业务模块不再单独安装、更新或监听 TCP 端口。
+默认使用 GitHub CI 已验证的 x64/arm64 部署包；Python 需要 3.11+。
+旧独立服务会停止并禁用；配置与数据复制到工作台数据目录，原文件保留。
+新版本不健康时恢复旧服务和配置；重复执行复用未变化的依赖、产物和配置。
+  --only hub    兼容原总部署入口；各内置模块不再支持独立部署。
+  --refresh     重新获取安装器，不强制构建、重装或重启。
+  --with-tests  仅源码部署时补做行为测试。
+  --help        查看说明，无需 root。
+
 HELP
 }
 
@@ -208,7 +197,7 @@ stack_parse() {
   IFS=, read -r -a items <<< "$only"
   for item in "${items[@]}"; do
     # Validate before using a user-supplied associative array subscript.
-    case "$item" in aster|monitor|asset|crossex|variational|greeks|hub) requested[$item]=1 ;;
+    case "$item" in hub) requested[$item]=1 ;;
       *) stack_fail "未知项目：$item"; return 1 ;; esac
   done
   stack_selected=()
@@ -227,37 +216,17 @@ stack_preflight() {
   case "$ID:$VERSION_ID" in ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;;
     *) stack_fail '支持 Ubuntu 22.04/24.04、Debian 12/13。'; return 1 ;; esac
   case $(uname -m) in x86_64|aarch64|arm64) ;; *) stack_fail '仅支持 x64 或 arm64。'; return 1 ;; esac
-  if [[ " ${stack_selected[*]} " == *' variational '* ]]; then stack_variational_preflight "$ID:$VERSION_ID"; fi
-  if [[ " ${stack_selected[*]} " == *' greeks '* ]]; then stack_greeks_preflight "$ID:$VERSION_ID"; fi
+  [[ $ID:$VERSION_ID != ubuntu:22.04 ]] || { stack_fail '内置 Greeks 需要 Python 3.11+，请使用 Ubuntu 24.04 或 Debian 12/13。'; return 1; }
   command -v apt-get >/dev/null && command -v dpkg-query >/dev/null && command -v flock >/dev/null || {
     stack_fail '需要 apt-get、dpkg-query 和 util-linux 的 flock。'; return 1;
   }
-}
-
-stack_variational_python_ready() { /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1; }
-stack_variational_preflight() {
-  if [[ $1 == ubuntu:22.04 || -x /usr/bin/python3 ]]; then
-    stack_variational_python_ready || { stack_fail 'Variational Grid 需要 /usr/bin/python3 3.11+；请使用 Debian 12/13 或 Ubuntu 24.04，或用 --only aster,monitor,asset,crossex,hub 跳过此模块。'; return 1; }
-  fi
-}
-
-stack_greeks_preflight() {
-  [[ $1 != ubuntu:22.04 ]] || { stack_fail 'Greeks 需要 Python 3.11+，支持 Debian 12/13 或 Ubuntu 24.04；Ubuntu 22.04 请用 --only 选择其他模块。'; return 1; }
 }
 
 stack_ensure_tools() {
   local item package
   local -a packages=(ca-certificates curl) missing=()
   local -A wanted=([ca-certificates]=1 [curl]=1)
-  for item in "${stack_selected[@]}"; do
-    case "$item" in
-      aster) packages+=(python3 python3-venv tar xz-utils util-linux passwd) ;;
-      variational) packages+=(python3 git util-linux passwd) ;;
-      greeks) packages+=(python3 python3-venv git tar util-linux passwd) ;;
-      monitor) packages+=(python3 xz-utils util-linux passwd iproute2) ;;
-      asset|crossex|hub) packages+=(git xz-utils tar util-linux passwd) ;;
-    esac
-  done
+  packages+=(python3 python3-venv git xz-utils tar util-linux passwd)
   if [[ "$stack_mode" == ci ]]; then packages+=(python3 tar); fi
   for package in "${packages[@]}"; do
     [[ "$stack_mode" != ci || "$package" != git ]] || continue
@@ -370,10 +339,7 @@ stack_summary() {
   done
   stack_log "总耗时：$((SECONDS - stack_started)) 秒"
   [[ -z "$stack_run" ]] || stack_log "本次日志：$stack_run（仅 root 可读，可能含首次登录信息）"
-  if [[ " ${stack_selected[*]} " == *' greeks '* && ${stack_status[greeks]:-} == '完成检查/部署' ]]; then
-    stack_log "Greeks 登录用户名和密码查看命令：sudo grep '^DASHBOARD_' /etc/greeks/greeks.env"
-    stack_log '在工作台“项目管理 → Greeks · BTC 期权”中填写该命令显示的 DASHBOARD_USERNAME 和 DASHBOARD_PASSWORD。'
-  fi
+
 }
 
 stack_signal() {
@@ -419,7 +385,7 @@ stack_run_installers() {
     # modules' build-environment fingerprints by forwarding it to every child.
     installer_env=(-u PROJECT_DEPLOY_MANIFEST_FILE)
     case "$item" in
-      hub|crossex) installer_env+=("PROJECT_DEPLOY_TESTS=$stack_with_tests") ;;
+      hub) installer_env+=("PROJECT_DEPLOY_TESTS=$stack_with_tests") ;;
       *) installer_env+=(-u PROJECT_DEPLOY_TESTS) ;;
     esac
     installer_env+=("PROJECT_DEPLOY_MODE=$stack_mode")
@@ -472,7 +438,7 @@ stack_main() {
   stack_run_installers
   stack_log '所选项目均已完成检查或部署；更新与跳过项见各项目日志。'
   if [[ " ${stack_selected[*]} " == *' hub '* ]]; then
-    stack_log '默认工作台端口为 3100；已有自定义端口保留。首次连接原项目仍需在项目管理中保存各自网页登录凭据。'
+    stack_log '工作台统一使用 3100 端口；四个业务模块沿用工作台鉴权，配置与数据已保留。'
   fi
 }
 

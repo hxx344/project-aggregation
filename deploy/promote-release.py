@@ -9,9 +9,7 @@ import tempfile
 
 
 WORKFLOWS = {
-    'project-aggregation': 'ci.yml', 'gate-crossex-arbitrage': 'ci.yml',
-    'market-spread-monitor': 'linux.yml', 'asset-ledger': 'verify.yml',
-    'aster_5x': 'deployment.yml', 'variational-grid': 'test.yml', 'greeks': 'tests.yml',
+    'project-aggregation': 'ci.yml',
 }
 
 

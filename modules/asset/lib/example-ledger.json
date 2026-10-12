@@ -1,0 +1,27 @@
+{
+  "source": "示例数据（非真实资产）",
+  "sheet": "Example",
+  "startedAt": "2026-09-19",
+  "baselineId": "E1",
+  "baselineDate": "2026-09-19",
+  "fx": 7,
+  "periods": [
+    {
+      "id": "E1",
+      "date": "2026-09-19",
+      "total": 3610,
+      "fx": 7,
+      "cny": 25270,
+      "rows": [
+        {"id":"row-2","project":"virtual","kind":"资产","quantity":100,"price":1,"value":100,"cell":"E2","formula":"=C2*D2"},
+        {"id":"row-3","project":"bybit","kind":"资产","quantity":1000,"price":1,"value":1000,"cell":"E3","formula":"=C3*D3"},
+        {"id":"row-4","project":"aster","kind":"资产","quantity":2000,"price":1,"value":2000,"cell":"E4","formula":"=C4*D4"},
+        {"id":"row-5","project":"手动资产示例","kind":"资产","quantity":500,"price":1,"value":500,"cell":"E5","formula":"=C5*D5"},
+        {"id":"row-6","project":"积分示例","kind":"积分","quantity":1000,"price":0.01,"value":10,"cell":"E6","formula":"=C6*D6"}
+      ],
+      "future": false,
+      "rowSum": 3610,
+      "difference": 0
+    }
+  ]
+}

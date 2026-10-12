@@ -3,7 +3,7 @@ import { requestAuthenticatedJson, UpstreamError } from './adapters.mjs';
 // Asset's existing route refreshes saved quotes and read-only exchange balances.
 export async function syncAsset(project, credentials, { deadline = Date.now() + 60000, signal, request } = {}) {
   if (project.adapter !== 'asset') throw new UpstreamError('invalid', '仅资产项目支持自动同步');
-  if (!credentials?.password) throw new UpstreamError('unauthorized', '请先保存资产项目的网页登录密码');
+  if (!project.embedded && !credentials?.password) throw new UpstreamError('unauthorized', '请先保存资产项目的网页登录密码');
   const response = await requestAuthenticatedJson(project, credentials, '/api/sync', {
     ...(request ? { request } : {}), deadline, signal, method: 'POST', body: {}, retryUnauthorized: true,
   });
@@ -33,7 +33,7 @@ export function createAssetSync({
   let timer;
   const targets = () => new Map(listTargets().filter(target => target?.project?.id).map(target => [target.project.id, target]));
   const eligible = target => target?.project.adapter === 'asset' && target.project.enabled !== false &&
-    target.project.autoSync !== false && !!target.project.apiUrl && !!target.credentials?.password;
+    target.project.autoSync !== false && !!target.project.apiUrl && (!!target.project.embedded || !!target.credentials?.password);
   const current = (id, revision) => {
     if (closed) return false;
     const target = targets().get(id);
@@ -55,7 +55,7 @@ export function createAssetSync({
     if (!target || target.project.adapter !== 'asset') return null;
     if (target.project.enabled === false || target.project.autoSync === false) return baseStatus('disabled', '资产自动同步已关闭');
     if (!target.project.apiUrl) return baseStatus('unconfigured', '请先配置资产项目的接口地址');
-    if (!target.credentials?.password) return baseStatus('unconfigured', '请先保存资产项目的网页登录密码');
+    if (!target.project.embedded && !target.credentials?.password) return baseStatus('unconfigured', '请先保存资产项目的网页登录密码');
     const stored = statuses.get(id);
     if (stored?.revision === target.revision) return { ...stored.status };
     return baseStatus('idle', '等待后台同步', lastStarts.has(id) ? asTime(lastStarts.get(id) + period) : null);

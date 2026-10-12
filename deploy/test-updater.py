@@ -123,14 +123,14 @@ class RegistryTests(RootFixture):
         unit.write_text(f'# Managed by {module.service} installer\n[Service]\nUser={module.user}\nWorkingDirectory={current_path}{module.working_suffix}\nExecStart={command}\n', encoding='utf8')
         return root, release, unit
 
-    def test_all_seven_installer_identities_and_local_only_discovery(self):
+    def test_only_unified_installer_identity_and_local_only_discovery(self):
         self.assertEqual(registry.inventory(self.root), [])
         for module in registry.MODULES:
             self.install(module)
         (self.root / 'opt/unknown-remote-project').mkdir()
         values = registry.inventory(self.root)
         self.assertEqual([row['id'] for row in values], [module.id for module in registry.MODULES])
-        self.assertEqual(len(values), 7)
+        self.assertEqual(len(values), 1)
         for row in values:
             with self.subTest(module=row['id']):
                 self.assertEqual(row['state'], 'unavailable')
@@ -196,7 +196,7 @@ class ReleaseTests(unittest.TestCase):
         result = self.release.read(self.module)
         self.assertEqual(result['commit'], NEW)
         self.assertEqual(result['installerHash'], hashlib.sha256(INSTALLER).hexdigest())
-        self.assertIn((f'https://raw.githubusercontent.com/hxx344/project-aggregation/{NEW}/install.sh', 'GET'), self.network.calls)
+        self.assertIn((f'https://raw.githubusercontent.com/hxx344/project-aggregation/{NEW}/deploy/install.sh', 'GET'), self.network.calls)
         self.assertFalse(any('attacker.example' in url or '/main/' in url for url, _ in self.network.calls))
 
     def test_only_published_stable_metadata_is_eligible(self):
@@ -408,7 +408,7 @@ class CoordinatorTests(RootFixture):
     def test_partial_check_never_silently_omits_an_unavailable_installed_module(self):
         self.network.values['hub']['metadata']['prerelease'] = True
         result = self.check()
-        self.assertTrue(any(item['state'] == 'available' for item in result['modules']))
+        self.assertFalse(any(item['state'] == 'available' for item in result['modules']))
         self.assertEqual(result['modules'][-1]['state'], 'unavailable')
         self.assertIsNone(result['planId'])
         self.assertIsNotNone(result['checkError'])
@@ -541,7 +541,7 @@ class CoordinatorTests(RootFixture):
             with real_lock(path, blocking=blocking):
                 yield
         def install(key):
-            if key == 'aster':
+            if key == 'hub':
                 entered.set(); self.assertTrue(release.wait(5))
             return 0
         self.installer_hook = install
@@ -575,14 +575,14 @@ class CoordinatorTests(RootFixture):
         self.assertNotIn('installedIdentity', json.dumps(state))
 
     def test_partial_failure_preserves_success_and_never_leaks_raw_logs(self):
-        self.installer_hook = lambda key: 17 if key == 'asset' else 0
+        self.installer_hook = lambda key: 17 if key == 'hub' else 0
         plan = self.prepare(); self.coordinator.apply(plan); self.coordinator.run()
         state = self.coordinator.status()
-        self.assertEqual(self.executed, ['aster', 'monitor', 'asset'])
-        self.assertEqual([step['status'] for step in state['job']['steps']], ['succeeded', 'succeeded', 'failed', 'skipped', 'skipped', 'skipped', 'skipped'])
+        self.assertEqual(self.executed, ['hub'])
+        self.assertEqual([step['status'] for step in state['job']['steps']], ['failed'])
         self.assertEqual(state['job']['status'], 'failed')
         self.assertNotIn('PRIVATE_DEPLOYMENT_CREDENTIAL', json.dumps(state))
-        self.assertEqual(state['modules'][0]['currentCommit'], NEW)
+        self.assertEqual(state['modules'][0]['currentCommit'], OLD)
 
     def test_daemon_restart_marks_abandoned_queued_and_running_jobs_interrupted(self):
         for status in ['queued', 'running']:
@@ -591,7 +591,7 @@ class CoordinatorTests(RootFixture):
                 with self.coordinator.lock():
                     value = self.coordinator.load(); value['job']['status'] = status
                     if status == 'running':
-                        value['job']['steps'][0]['status'] = 'succeeded'; value['job']['steps'][1]['status'] = 'running'
+                        value['job']['steps'][0]['status'] = 'running'
                     self.coordinator.save(value)
                 self.clock += 31
                 restarted = self.make_coordinator(); restarted.recover(starting=True)
@@ -599,8 +599,7 @@ class CoordinatorTests(RootFixture):
                 self.assertEqual(result['job']['status'], 'interrupted')
                 self.assertIsNone(result['planId'])
                 if status == 'running':
-                    self.assertEqual(result['job']['steps'][0]['status'], 'succeeded')
-                    self.assertEqual(result['job']['steps'][1]['status'], 'failed')
+                    self.assertEqual(result['job']['steps'][0]['status'], 'failed')
 
     def test_control_restart_keeps_active_worker_and_does_not_launch_another(self):
         plan = self.prepare(); self.coordinator.apply(plan); self.alive = True; self.clock += 31
@@ -642,7 +641,7 @@ class CoordinatorTests(RootFixture):
         plan = self.prepare(); endpoint = self.root / 'control.sock'
         entered = threading.Event(); resume = threading.Event(); workers = []
         def installer(key):
-            if key == 'aster':
+            if key == 'hub':
                 entered.set(); self.assertTrue(resume.wait(5))
             return 0
         self.installer_hook = installer
@@ -672,7 +671,7 @@ class CoordinatorTests(RootFixture):
             for worker in workers:
                 worker.join(5); self.assertFalse(worker.is_alive())
             self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
-            self.assertEqual(len(self.executed), 7)
+            self.assertEqual(len(self.executed), 1)
         finally:
             resume.set()
             if thread.is_alive():

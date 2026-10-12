@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/hxx344/market-spread-monitor.git",
+  "commit": "60fa2ef3b40732595791b4351f80d4ad2ed06e37",
+  "importedAt": "2026-10-13",
+  "scope": "Tracked runtime, frontend, tests and build inputs only; no runtime data, credentials or local environment.",
+  "bundledPublicSnapshots": [
+    "data/archive.json",
+    "data/hynix-funding.json",
+    "public/oil/data/binance-15m.json",
+    "public/oil/data/binance-2026.json",
+    "public/oil/data/binance-funding-2026.json",
+    "public/oil/data/hyperliquid-15m.json",
+    "public/oil/data/hyperliquid-2026.json",
+    "public/oil/data/hyperliquid-funding-2026.json"
+  ]
+}

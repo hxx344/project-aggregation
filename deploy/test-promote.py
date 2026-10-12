@@ -89,12 +89,15 @@ class StablePromotion(unittest.TestCase):
             self.promote()
         self.assertEqual(self.writes(), [])
 
-    def test_explicit_dispatch_promotes_checked_assets_for_all_seven_fixed_repositories(self):
+    def test_explicit_dispatch_promotes_only_the_unified_repository(self):
         for repository, workflow in WORKFLOWS.items():
             with self.subTest(repository=repository):
                 self.setUp(); self.repository = 'hxx344/' + repository
                 self.environment['GITHUB_REPOSITORY'] = self.repository
                 self.manifest['repository'] = self.repository; self.run['path'] = '.github/workflows/' + workflow
+                if repository != 'project-aggregation':
+                    self.reject()
+                    continue
                 self.promote()
                 self.assertEqual(len(self.writes()), 1)
                 self.assertFalse(self.release['prerelease'])

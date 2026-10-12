@@ -7,6 +7,7 @@ import { pipeline } from 'node:stream';
 import { validateUrl, validateAuthOrigin, blockedAddress } from './adapters.mjs';
 import { cachePolicy } from './static-cache.mjs';
 import { prepareAssetCompression } from './portal-compression.mjs';
+import { moduleTransport } from './modules/transport.mjs';
 
 export const HUB_HOST = 'hub.localhost';
 export const PORTAL_COOKIE = 'hub_portal';
@@ -41,6 +42,7 @@ function checkedProxyPath(raw) {
   checkedPath(raw);
   let pathname = raw.split('?')[0];
   for (let round = 0; round < 6; round++) { const next = decodeURIComponent(pathname); if (next === pathname) break; pathname = next; }
+  if (/(?:^|\/)__workspace(?:\/|$)/.test(pathname.replace(/\/+/g, '/'))) throw new PortalError(403, '不允许访问模块内部管理接口');
   if (/(?:^|\/)api\/hub\/trading-connections\/export\/?$/.test(pathname.replace(/\/+/g, '/'))) throw new PortalError(403, '请从交易模块导入账户连接');
   return raw;
 }
@@ -74,7 +76,7 @@ function framePolicy(value, hubOrigin) {
  * Client cancellation never cancels that shared background promise.
  * createLaunch is called only by the authenticated, CSRF-protected hub API.
  */
-export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
+export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function')) throw new Error('项目代理需要项目、版本和会话校验回调');
   const tickets = new Map(); const grants = new Map(); const active = new Set(); const syncFlights = new Map();
   let closed = false;
@@ -218,6 +220,8 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
   }
   async function targetFor(project) {
     const base = new URL(validateUrl(project.apiUrl, { api: true }));
+    const transport = moduleTransport(base);
+    if (transport) return { base, transport, address: { address: '127.0.0.1', family: 4 }, authOrigin: base.origin };
     const hostname = base.hostname.replace(/^\[|\]$/g, '');
     let timer;
     try {
@@ -229,6 +233,8 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
 
   function requestHeaders(req, context, target, websocket, grant) {
     const headers = cleanHeaders(req.headers);
+    delete headers['x-workspace-key'];
+    if (target.transport) headers['x-workspace-key'] = target.transport.secret;
     for (const name of Object.keys(headers)) if (/^(?:forwarded|x-forwarded-.*|x-real-ip|proxy-.*)$/i.test(name)) delete headers[name];
     headers.host = target.base.host;
     let cookies = cleanCookies(req.headers.cookie, grant?.auth);
@@ -305,7 +311,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
       for (const key of ['content-length', 'content-type', 'content-encoding', 'expect', 'if-modified-since', 'if-none-match', 'range']) delete headers[key];
       const route = '/api/ledger';
       return new Promise((resolve, reject) => {
-        const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: 'GET', path: target.base.pathname.replace(/\/$/, '') + route, headers, lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
+        const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { ...(target.transport ? { socketPath: target.transport.socketPath, agent: false } : {}), method: 'GET', path: target.base.pathname.replace(/\/$/, '') + route, headers, lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
         transports.add(upstream);
         const connectionTimer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务连接超时')), connectTimeoutMs);
         upstream.once('socket', socket => { if (!socket.connecting) clearTimeout(connectionTimer); else socket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });
@@ -364,7 +370,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     if (coordinateAssetSync && project.adapter === 'asset' && project.autoSync !== false && project.hasCredentials && req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/sync') { await coordinatedSync(req, res, context, project, grant, target); return; }
     const prefix = target.base.pathname.replace(/\/$/, '');
     const path = checkedProxyPath(prefix + checkedPath(req.url));
-    const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: req.method, path, headers: requestHeaders(req, context, target, false, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
+    const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { ...(target.transport ? { socketPath: target.transport.socketPath, agent: false } : {}), method: req.method, path, headers: requestHeaders(req, context, target, false, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
     const timer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务响应超时')), responseHeaderTimeoutMs);
     const connectionTimer = setTimeout(() => upstream.destroy(new PortalError(504, '项目服务连接超时')), connectTimeoutMs);
     upstream.once('socket', socket => { if (!socket.connecting) clearTimeout(connectionTimer); else socket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });
@@ -422,7 +428,15 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
       if (url.pathname.startsWith('/__hub/')) throw new PortalError(404, '项目代理接口不存在');
       browserBoundary(req, context);
       const grant = authorized(req, context, project);
-      await proxy(req, res, context, project, grant);
+      if (withMutation && project.embedded && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        try {
+          await withMutation(() => new Promise((resolve, reject) => {
+            const finish = () => { res.removeListener('close', finish); resolve(); };
+            res.once('close', finish);
+            proxy(req, res, context, project, grant).catch(error => { res.removeListener('close', finish); reject(error); });
+          }));
+        } catch (error) { throw error instanceof PortalError ? error : new PortalError([400, 401, 403, 409, 503].includes(error.status) ? error.status : 503, error.message || '模块暂时不可写入'); }
+      } else await proxy(req, res, context, project, grant);
     } catch (error) { sendError(res, error); }
     return true;
   }
@@ -440,7 +454,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
       const target = await targetFor(project);
       if (!liveGrant(grant) || req.aborted || socket.destroyed) throw new PortalError(401, '项目访问授权已失效');
       const path = checkedProxyPath(target.base.pathname.replace(/\/$/, '') + req.url);
-      const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { method: 'GET', path, headers: requestHeaders(req, context, target, true, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
+      const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { ...(target.transport ? { socketPath: target.transport.socketPath, agent: false } : {}), method: 'GET', path, headers: requestHeaders(req, context, target, true, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
       const timer = setTimeout(() => upstream.destroy(), responseHeaderTimeoutMs);
       const connectionTimer = setTimeout(() => upstream.destroy(), connectTimeoutMs);
       upstream.once('socket', peerSocket => { if (!peerSocket.connecting) clearTimeout(connectionTimer); else peerSocket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });

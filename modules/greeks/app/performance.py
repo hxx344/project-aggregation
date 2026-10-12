@@ -1,0 +1,417 @@
+"""Persistent exchange fills and conservative, per-opening strategy attribution.
+
+Closed position totalPnl is already net of fees:
+https://bybit-exchange.github.io/docs/v5/position/close-position
+"""
+import asyncio
+import re
+from itertools import groupby
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+
+from .models import ExecutionRecord, PerformanceSample
+
+
+ZERO = Decimal(0)
+EPS = Decimal("0.00000001")
+
+
+def number(value):
+    result = Decimal(str(value))
+    if not result.is_finite():
+        raise ValueError("Non-finite performance value")
+    return result
+
+
+def stamp(value):
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Performance timestamp needs timezone")
+    return parsed
+
+
+def amount(value):
+    return float(value.quantize(EPS)) if value is not None else None
+
+
+def settlement_currency(symbol):
+    return "USDT" if symbol.endswith("-USDT") else "USDC"
+
+
+def option_expiry(symbol):
+    match = re.fullmatch(r"BTC-(\d{1,2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})-\d+(?:\.\d+)?-[CP](?:-USDT|-USDC)?", symbol.upper())
+    if not match:
+        return None
+    months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+    try:
+        return datetime(2000 + int(match[3]), months.index(match[2]) + 1, int(match[1]), 8, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def build_performance(groups, executions, links, journal, positions=(), positions_available=False, samples=None, sample_seconds=60):
+    """Only uniquely attributable, completely reconciled round trips enter the curve."""
+    # These indexes live for one report only; corrected history and current
+    # position availability are reconsidered on every call.
+    expiries_by_symbol = {}
+
+    def expiry_for(symbol):
+        if symbol not in expiries_by_symbol:
+            expiries_by_symbol[symbol] = option_expiry(symbol)
+        return expiries_by_symbol[symbol]
+
+    journal_by_group, pending_closes = {}, set()
+    for link, entry in journal.items():
+        group_id = links.get(link)
+        journal_by_group.setdefault(group_id, []).append(entry)
+        if group_id in groups and not entry.get("terminal"):
+            pending_closes.add(groups[group_id].get("opening_group"))
+    buckets = {}
+    for key, group in groups.items():
+        if group.get("type") == "open":
+            buckets[key] = dict(id=key, meta=group, lots=[], closes=[], issues=[], open_fee=ZERO, close_fee=ZERO,
+                                premium=ZERO, realized=ZERO, opened=None, closed=None, currencies=set())
+    ordered = sorted({item.exec_id: item for item in executions}.values(), key=lambda item: (item.exec_time, item.exec_id))
+    unassigned = 0
+    for execution in ordered:
+        group_id = links.get(execution.order_link_id) or execution.execution_group
+        if not group_id and execution.order_link_id.startswith("ic-"):
+            parts = execution.order_link_id.split("-")
+            if len(parts) >= 3 and parts[1] not in {"close", "mkt"}:
+                group_id = parts[1]
+        meta = groups.get(group_id, {})
+        is_close = execution.reduce_only or meta.get("type") == "close" or execution.order_link_id.startswith("ic-close-") or (execution.closed_size or 0) > 0
+        if not is_close and not group_id:
+            continue  # Account transfers and unrelated trades are not strategy returns.
+        if execution.exec_type not in {"Trade", "BlockTrade"}:
+            continue  # Delivery is taken from verified closed-position evidence.
+        try:
+            qty, price, fee = number(execution.exec_qty), number(execution.exec_price), number(execution.exec_fee)
+            if qty <= 0 or price < 0 or execution.side not in {"Buy", "Sell"} or not execution.symbol.startswith("BTC-"):
+                raise ValueError("Invalid execution")
+            if execution.exec_time.tzinfo is None:
+                raise ValueError("Missing execution timezone")
+        except (ValueError, InvalidOperation):
+            if group_id in buckets:
+                buckets[group_id]["issues"].append("成交数据不完整")
+            continue
+        currency = settlement_currency(execution.symbol)
+        currency_ok = execution.fee_currency == currency or (not execution.fee_currency and fee == 0)
+        if not is_close:
+            bucket = buckets.setdefault(group_id, dict(id=group_id, meta={}, lots=[], closes=[], issues=[], open_fee=ZERO,
+                                                        close_fee=ZERO, premium=ZERO, realized=ZERO, opened=None, closed=None, currencies=set()))
+            if not currency_ok:
+                bucket["issues"].append("手续费币种无法换算")
+            bucket["currencies"].add(currency)
+            bucket["lots"].append(dict(execution=execution, remaining=qty, qty=qty, price=price, fee=fee))
+            bucket["open_fee"] += fee
+            bucket["premium"] += (1 if execution.side == "Sell" else -1) * qty * price
+            bucket["opened"] = min(bucket["opened"] or execution.exec_time, execution.exec_time)
+            continue
+        opening = meta.get("opening_group") or execution.opening_group
+        if not opening:
+            # A matching symbol alone cannot prove that an external/manual close
+            # belongs to this strategy rather than another account position.
+            unassigned += 1
+            continue
+        bucket = buckets.get(opening)
+        lots = [lot for lot in bucket["lots"] if lot["execution"].symbol == execution.symbol
+                and lot["execution"].side != execution.side and lot["remaining"] > EPS] if bucket is not None else []
+        if not lots:
+            if opening in buckets:
+                buckets[opening]["issues"].append("平仓成交缺少对应开仓记录")
+            unassigned += 1
+            continue
+        if sum((lot["remaining"] for lot in lots), ZERO) + EPS < qty or (execution.closed_size is not None and abs(number(execution.closed_size) - qty) > EPS):
+            bucket["issues"].append("平仓数量与开仓记录不符")
+            continue
+        if not currency_ok:
+            bucket["issues"].append("手续费币种无法换算")
+        remaining = qty
+        pnl = -fee
+        for lot in lots:
+            matched = min(remaining, lot["remaining"])
+            pnl += (1 if execution.side == "Sell" else -1) * (price - lot["price"]) * matched - lot["fee"] * matched / lot["qty"]
+            lot["remaining"] -= matched
+            remaining -= matched
+            if remaining <= EPS:
+                break
+        bucket["realized"] += pnl
+        bucket["close_fee"] += fee
+        bucket["closes"].append(execution)
+        bucket["closed"] = execution.exec_time
+
+    early_groups = set()
+    for item in ordered:
+        opening = item.opening_group or groups.get(links.get(item.order_link_id) or item.execution_group, {}).get("opening_group")
+        if opening in buckets and (expiry := expiry_for(item.symbol)) and item.exec_time < expiry:
+            early_groups.add(opening)
+    rows, evidence_owners, remaining_owners, positions_by_leg = [], {}, {}, {}
+    for key, bucket in buckets.items():
+        for lot in bucket["lots"]:
+            if lot["remaining"] > EPS:
+                leg = (lot["execution"].symbol, lot["execution"].side)
+                remaining_owners.setdefault(leg, set()).add(key)
+    if positions_available:
+        for position in positions:
+            if position.source == "bybit":
+                positions_by_leg.setdefault((position.symbol, position.side), []).append(position)
+    for key, group in groups.items():
+        for evidence in group.get("closure_evidence", {}).values():
+            for row in evidence:
+                identity = (row.get("symbol"), row.get("side"), row.get("openTime"), row.get("closeTime"))
+                evidence_owners.setdefault(identity, set()).add(key)
+    for key, bucket in buckets.items():
+        meta, lots = bucket["meta"], bucket["lots"]
+        actual = {}
+        for lot in lots:
+            leg = (lot["execution"].symbol, lot["execution"].side)
+            actual[leg] = actual.get(leg, ZERO) + lot["qty"]
+        expected = {}
+        for entry in journal_by_group.get(key, ()):
+            if not entry["reduce_only"]:
+                leg = (entry["symbol"], entry["side"])
+                expected[leg] = expected.get(leg, ZERO) + number(entry.get("filledQty", 0))
+                if not entry.get("terminal"):
+                    bucket["issues"].append("开仓成交仍待确认")
+        if not expected and meta.get("legs"):
+            expected = {(symbol, leg["side"]): number(leg["qty"]) for symbol, leg in meta["legs"].items() if "qty" in leg and "side" in leg}
+        for leg, qty in expected.items():
+            if abs(actual.get(leg, ZERO) - qty) > EPS:
+                bucket["issues"].append("开仓成交历史尚未补齐")
+        closed = bool(lots) and all(lot["remaining"] <= EPS for lot in lots)
+        source, delivery_fee = "executions", ZERO
+        early_close = any(expiry_for(item.symbol) and item.exec_time < expiry_for(item.symbol) for item in bucket["closes"])
+        # Even an unmatched partial fill is evidence of an early reduction.
+        early_close = early_close or key in early_groups
+        verified_expiry = False
+        # Exchange closure evidence replaces, never adds to, fill-based P&L.
+        evidence = meta.get("closure_evidence", {})
+        targets = expected or actual or {(symbol, leg["side"]): number(leg["qty"]) for symbol, leg in meta.get("legs", {}).items() if "qty" in leg and "side" in leg}
+        if evidence and targets:
+            try:
+                net, opening_fee, closing_fee, delivery, premium = ZERO, ZERO, ZERO, ZERO, ZERO
+                opened_times, closed_times, currencies, seen = [], [], set(), set()
+                expiry_verified, evidence_early = True, False
+                for (symbol, side), qty in targets.items():
+                    if qty <= EPS:
+                        continue
+                    rows_for_leg = evidence.get(f"{symbol}|{side}", [])
+                    total = ZERO
+                    for row in rows_for_leg:
+                        identity = (row.get("symbol"), row.get("side"), row.get("openTime"), row.get("closeTime"))
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        if row.get("symbol") != symbol or row.get("side") != side or evidence_owners.get(identity) != {key}:
+                            raise ValueError("Ambiguous closure evidence")
+                        opened_at = datetime.fromtimestamp(int(row["openTime"]) / 1000, timezone.utc)
+                        closed_at = datetime.fromtimestamp(int(row["closeTime"]) / 1000, timezone.utc)
+                        if closed_at < opened_at or (meta.get("created_at") and opened_at < stamp(meta["created_at"])):
+                            raise ValueError("Invalid closure times")
+                        expiry = expiry_for(symbol)
+                        evidence_early = evidence_early or bool(expiry and closed_at < expiry) or number(row["totalCloseFee"]) != 0
+                        expiry_verified = expiry_verified and expiry is not None and closed_at >= expiry
+                        total += number(row["qty"])
+                        net += number(row["totalPnl"])
+                        opening_fee += number(row["totalOpenFee"])
+                        closing_fee += number(row["totalCloseFee"])
+                        delivery += number(row["deliveryFee"])
+                        premium += (1 if side == "Sell" else -1) * number(row["avgEntryPrice"]) * number(row["qty"])
+                        opened_times.append(opened_at)
+                        closed_times.append(closed_at)
+                        currencies.add(settlement_currency(symbol))
+                    if abs(total - qty) > EPS:
+                        raise ValueError("Closure quantity mismatch")
+                if not closed_times:
+                    raise ValueError("No closure amounts")
+                bucket.update(realized=net, open_fee=opening_fee, close_fee=closing_fee, premium=premium,
+                              opened=min(opened_times), closed=max(closed_times), currencies=currencies, issues=[])
+                closed, source, delivery_fee = True, "exchange_closed_positions", delivery
+                early_close = early_close or evidence_early
+                verified_expiry = expiry_verified and not early_close
+            except (ValueError, KeyError, TypeError, InvalidOperation, OverflowError):
+                if not closed:
+                    bucket["issues"].append("交割或平仓收益待核对")
+        if meta.get("status") == "closed" and not closed:
+            bucket["issues"].append("已结束组合的成交或交割记录不完整")
+        if not lots and source == "executions":
+            bucket["issues"].append("等待实际开仓成交记录")
+        if len(bucket["currencies"]) != 1:
+            bucket["issues"].append("结算币种待核对")
+        if key in pending_closes:
+            bucket["issues"].append("平仓成交仍待确认")
+        issues = list(dict.fromkeys(bucket["issues"]))
+        floating = None
+        if positions_available and not closed and lots and not issues:
+            residuals = {}
+            for lot in lots:
+                leg = (lot["execution"].symbol, lot["execution"].side)
+                residuals[leg] = residuals.get(leg, ZERO) + lot["remaining"]
+            total_float = ZERO
+            for (symbol, side), qty in residuals.items():
+                if qty <= EPS:
+                    continue
+                matches = [p for p in positions_by_leg.get((symbol, side), ()) if abs(number(p.size) - qty) <= EPS]
+                owners = remaining_owners.get((symbol, side), ())
+                if len(matches) != 1 or len(owners) != 1:
+                    break
+                # Use this combination's cost, not an unrelated account-wide average.
+                total_float += sum(((1 if side == "Buy" else -1) * (number(matches[0].mark_price) - lot["price"]) * lot["remaining"] for lot in lots if lot["execution"].symbol == symbol and lot["execution"].side == side), ZERO)
+            else:
+                floating = amount(total_float)
+        currency = next(iter(bucket["currencies"])) if len(bucket["currencies"]) == 1 else "待确认"
+        expiries = {expiry_for(symbol) for symbol, _ in (actual or targets)}
+        expiry = next(iter(expiries)) if len(expiries) == 1 else None
+        eligible = closed and not issues and verified_expiry and expiry is not None
+        closure_kind = "early" if early_close else "expiry" if eligible else "unknown" if closed else "holding"
+        exclusion = "" if eligible else "有提前平仓（含部分减仓），整组不纳入综合统计" if early_close else "到期结算证据待核实" if closed else "持仓尚未到期结束"
+        remaining_fees = sum((lot["fee"] * lot["remaining"] / lot["qty"] for lot in lots), ZERO)
+        sampled_pnl = amount(bucket["realized"] + number(floating) - remaining_fees) if floating is not None and not issues else None
+        rows.append(dict(id=key, opened_at=(bucket["opened"].isoformat() if bucket["opened"] else meta.get("created_at")),
+                         strategy_mode=meta.get("strategy_mode", "iron_condor"),
+                         closed_at=bucket["closed"].isoformat() if closed and bucket["closed"] else None,
+                         currency=currency, status="pending" if issues else "closed" if closed else "open", issues=issues,
+                         leg_count=len(actual or targets), open_premium=amount(bucket["premium"]) if lots or source != "executions" else None,
+                         open_fee=amount(bucket["open_fee"]) if lots or source != "executions" else None,
+                         close_fee=amount(bucket["close_fee"]) if lots or source != "executions" else None, delivery_fee=amount(delivery_fee),
+                         net_pnl=None if issues else amount(bucket["realized"]), floating_pnl=floating,
+                         mark_to_market_pnl=sampled_pnl, expiry=expiry.isoformat() if expiry else None, eligible=eligible,
+                         closure_kind=closure_kind, exclusion_reason=exclusion,
+                         remaining_qty=amount(sum((lot["remaining"] for lot in lots), ZERO)) if not closed else 0,
+                         source=source, fills=[item.model_dump(mode="json") for item in [*(lot["execution"] for lot in lots), *bucket["closes"]]]))
+    rows.sort(key=lambda row: (row["opened_at"] or "", row["id"]), reverse=True)
+    for row in rows:
+        history = sorted((sample.model_dump(mode="json") if isinstance(sample, PerformanceSample) else dict(sample)
+                          for sample in (samples or {}).get(row["id"], [])), key=lambda sample: sample["time"])
+        if row["status"] == "closed" and row["closed_at"]:
+            history = [sample for sample in history if not sample.get("terminal") and stamp(sample["time"]) < stamp(row["closed_at"])]
+            history.append(dict(time=row["closed_at"], pnl=row["net_pnl"], terminal=True))
+        row["samples"] = history
+        row["sample_count"] = sum(not point.get("terminal") for point in history)
+    series = []
+    for currency in sorted({row["currency"] for row in rows if row["eligible"]}):
+        completed = sorted((row for row in rows if row["eligible"] and row["currency"] == currency), key=lambda row: (row["closed_at"], row["id"]))
+        total, peak, drawdown = ZERO, ZERO, ZERO
+        timeline = sorted((dict(point, group_id=row["id"]) for row in completed for point in row["samples"]), key=lambda point: (stamp(point["time"]), point["group_id"]))
+        points, latest = [], {}
+        for _, simultaneous in groupby(timeline, key=lambda point: stamp(point["time"])):
+            for point in simultaneous:
+                total += number(point["pnl"]) - latest.get(point["group_id"], ZERO)
+                latest[point["group_id"]] = number(point["pnl"])
+            peak = max(peak, total)
+            drawdown = max(drawdown, peak - total)
+            points.append(dict(point, cumulative=amount(total)))
+        series.append(dict(currency=currency, points=points, total_pnl=amount(total), closed_count=len(completed),
+                           wins=sum(row["net_pnl"] > 0 for row in completed), max_drawdown=amount(drawdown),
+                           sample_seconds=sample_seconds,
+                           sampled_count=sum(row["sample_count"] for row in completed), unsampled_count=sum(row["sample_count"] == 0 for row in completed)))
+    return dict(groups=rows, series=series, unassigned_closes=unassigned)
+
+
+class PerformanceMixin:
+    async def sample_performance(self):
+        now = datetime.now(timezone.utc)
+        if self.state_error or self.lock.locked() or (self.performance_sampled_at and
+                (now - self.performance_sampled_at).total_seconds() < self.settings.performance_sample_seconds):
+            return
+        async with self.lock:
+            try:
+                positions, available = [], False
+                if self.settings.bybit_api_key and self.settings.bybit_api_secret:
+                    positions = self._parse_positions(await self.client.positions())
+                    await self.load_recent_executions()
+                    available = True
+                sampled_at = datetime.now(timezone.utc)
+                report = build_performance(self.execution_groups, self.performance_executions.values(), self.execution_group_links,
+                                           self.order_journal, positions, available)
+                changed = False
+                for row in report["groups"]:
+                    history = self.performance_samples.get(row["id"], [])
+                    if row["status"] == "closed" and row["closed_at"]:
+                        point = PerformanceSample(time=stamp(row["closed_at"]), pnl=row["net_pnl"], terminal=True)
+                        updated = [sample for sample in history if not sample.terminal and sample.time < point.time] + [point]
+                    elif row["status"] == "open" and row["mark_to_market_pnl"] is not None and row["expiry"] and sampled_at < stamp(row["expiry"]):
+                        if history and (sampled_at - history[-1].time).total_seconds() < self.settings.performance_sample_seconds:
+                            continue
+                        updated = history + [PerformanceSample(time=sampled_at, pnl=row["mark_to_market_pnl"])]
+                    else:
+                        continue
+                    if updated != history:
+                        self.performance_samples[row["id"]] = updated
+                        changed = True
+                if changed:
+                    self._save_state()
+                self.performance_sampled_at = sampled_at
+                self.performance_sample_error = None
+            except Exception as exc:
+                self.performance_sample_error = "持仓盈亏采样失败，保留已有采样；缺失时段不补造数据"
+                self.log("WARNING", f"Performance sampling failed: {type(exc).__name__}")
+
+    def _archive_performance(self, records):
+        changed = False
+        for record in records:
+            previous = self.performance_executions.get(record.exec_id)
+            if previous:
+                record = record.model_copy(update={field: getattr(previous, field) for field in (
+                    "execution_group", "opening_group", "closed_size", "chain_price_at_create", "chain_price_diff") if getattr(record, field) is None})
+            if record.exec_id and self.performance_executions.get(record.exec_id) != record:
+                self.performance_executions[record.exec_id] = record
+                changed = True
+        if changed and not self.state_error:
+            self._save_state()
+
+    async def sync_performance(self):
+        if self.performance_lock.locked():
+            return
+        if not self.settings.bybit_api_key or not self.settings.bybit_api_secret or self.state_error:
+            return
+        async with self.performance_lock:
+            try:
+                now = datetime.now(timezone.utc)
+                now_ms = int(now.timestamp() * 1000)
+                if self.performance_cursor_ms is None:
+                    dates = [stamp(group["created_at"]) for group in self.execution_groups.values() if group.get("created_at")]
+                    dates.extend(item.exec_time for item in self.performance_executions.values())
+                    start = max(now - timedelta(days=729), min(dates) - timedelta(days=1) if dates else now - timedelta(days=7))
+                    self.performance_start_ms = int(start.timestamp() * 1000)
+                    self.performance_cursor_ms = self.performance_start_ms
+                # One paginated week per refresh; overlap catches late fills without duplication.
+                overlap_ms = 86400000 if now_ms - self.performance_cursor_ms < 120000 else 60000
+                start_ms = max(self.performance_start_ms, self.performance_cursor_ms - overlap_ms)
+                end_ms = min(now_ms, start_ms + 7 * 86400000 - 1)
+                raw = await self.client.execution_history(start_ms, end_ms)
+                records = []
+                for row in raw:
+                    qty, price, fee = (number(row[field]) for field in ("execQty", "execPrice", "execFee"))
+                    if not row.get("execId") or qty <= 0 or price < 0 or row.get("side") not in {"Buy", "Sell"}:
+                        raise ValueError("Invalid execution history")
+                    records.append(ExecutionRecord(symbol=row["symbol"], side=row["side"], order_id=row.get("orderId", ""),
+                        order_link_id=row.get("orderLinkId", ""), exec_id=row["execId"], exec_fee=float(fee), fee_currency=row.get("feeCurrency", ""),
+                        exec_price=float(price), exec_qty=float(qty), exec_time=datetime.fromtimestamp(int(row["execTime"]) / 1000, timezone.utc),
+                        closed_size=float(number(row["closedSize"])) if row.get("closedSize") not in (None, "") else None, exec_type=row.get("execType") or "Trade"))
+                self._archive_performance(records)
+                self.performance_cursor_ms = end_ms
+                self.performance_updated_at = now.isoformat()
+                self.performance_error = None
+                self._save_state()
+            except Exception as exc:
+                self.performance_error = "成交历史同步失败，已保留本地台账，下次刷新重试"
+                self.log("WARNING", f"Performance history sync failed: {type(exc).__name__}")
+
+    async def performance_loop(self):
+        while True:
+            await self.sync_performance()
+            await self.sample_performance()
+            await asyncio.sleep(min(30, self.settings.performance_sample_seconds))
+
+    def performance_report(self, positions_available=False, positions=None):
+        report = build_performance(self.execution_groups, self.performance_executions.values(), self.execution_group_links,
+                                   self.order_journal, self.positions if positions is None else positions, positions_available,
+                                   self.performance_samples, self.settings.performance_sample_seconds)
+        return {**report, "network": "testnet" if self.settings.private_testnet else "mainnet", "updated_at": self.performance_updated_at,
+                "history_start_ms": self.performance_start_ms, "history_cursor_ms": self.performance_cursor_ms,
+                "syncing": self.performance_cursor_ms is not None and self.performance_cursor_ms < int(datetime.now(timezone.utc).timestamp() * 1000) - 120000,
+                "error": self.state_error or self.performance_error or self.performance_sample_error,
+                "sample_seconds": self.settings.performance_sample_seconds,
+                "credentials_available": bool(self.settings.bybit_api_key and self.settings.bybit_api_secret)}

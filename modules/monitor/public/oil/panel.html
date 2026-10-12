@@ -1,0 +1,59 @@
+<div class="oil-panel">
+    <a class="skip-link" href="#chart-panel" data-local-anchor>跳至走势图</a>
+
+    <main>
+      <section class="page-heading" aria-labelledby="oil-monitor-title">
+        <div><p class="eyebrow">BINANCE USDT PERPETUALS</p><h1 id="oil-monitor-title">布伦特 / WTI 价差</h1><p class="heading-description">BZUSDT 与 CLUSDT 永续合约 · 15 分钟 K 线</p></div>
+        <div class="data-stamp"><span class="stamp-label" id="connection-status">正在连接</span><span id="data-through">正在读取行情</span><span class="stamp-source">Binance · 报价每 10 秒读取 · 历史每 60 秒更新</span><button id="refresh-data" class="refresh-data">刷新数据 <span aria-hidden="true">↻</span></button></div>
+      </section>
+
+      <div id="data-notice" class="data-notice" hidden></div>
+      <div id="loading" class="loading" role="status">正在载入原油历史数据…</div>
+      <div id="error" class="error" role="alert" hidden><strong>暂时无法加载数据</strong><p>请检查网络后重试。</p><button id="retry" class="retry">重新加载</button></div>
+
+      <div id="dashboard" hidden>
+        <section class="metrics" aria-label="最新价格概览">
+          <article class="metric featured"><div class="metric-label"><span>当前标记价差</span><span class="metric-tag">相对 WTI</span></div><div class="metric-number" id="latest-spread"></div><div class="metric-foot" id="spread-change"></div></article>
+          <article class="metric"><div class="metric-label"><span><i class="legend-dot brent"></i>布伦特原油</span><span class="ticker">BZUSDT</span></div><div class="metric-number" id="latest-brent"></div><div class="metric-foot"><a href="https://www.binance.com/en/futures/BZUSDT" target="_blank" rel="noreferrer">Binance 永续 · 标记价格 ↗</a></div></article>
+          <article class="metric"><div class="metric-label"><span><i class="legend-dot wti"></i>WTI 原油</span><span class="ticker">CLUSDT</span></div><div class="metric-number" id="latest-wti"></div><div class="metric-foot"><a href="https://www.binance.com/en/futures/CLUSDT" target="_blank" rel="noreferrer">Binance 永续 · 标记价格 ↗</a></div></article>
+          <article class="metric"><div class="metric-label"><span>共同区间价差变化</span><span class="ticker">15 MIN</span></div><div class="metric-number" id="ytd-change"></div><div class="metric-foot" id="ytd-reference"></div></article>
+        </section>
+
+        <section class="funding-panel panel" aria-labelledby="funding-title">
+          <div class="funding-header"><div><p class="eyebrow">SHORT BRENT / LONG WTI</p><h2 id="funding-title">做空价差 · 资金费率</h2><p class="funding-subtitle">空布伦特、多 WTI。正值收款，负值付款。</p></div><div class="funding-basis" role="group" aria-label="资金费配仓口径"><button data-basis="quantity" aria-pressed="true">等桶数 1:1</button><button data-basis="notional" aria-pressed="false">等USDT名义</button></div></div>
+          <div class="funding-metrics" aria-live="polite"><article><p>预计净小时费率 <span class="funding-badge" id="funding-direction"></span></p><strong class="funding-value" id="funding-net"></strong><span>以两腿总名义金额为分母</span></article><article><p>每 10,000 USDT 总名义 / 小时</p><strong class="funding-value" id="funding-cash"></strong><span id="funding-cash-caption"></span></article><article><p>按当前费率简单年化</p><strong class="funding-value" id="funding-annual"></strong><span>净小时费率 × 24 × 365</span></article></div>
+          <div class="funding-legs"><div><span><i class="legend-dot brent"></i> 空 BZUSDT</span><strong id="brent-funding"></strong><span id="brent-payment"></span></div><div><span><i class="legend-dot wti"></i> 多 CLUSDT</span><strong id="wti-funding"></strong><span id="wti-payment"></span></div></div>
+          <div class="funding-explanation"><p id="funding-formula"></p><p id="funding-basis-note"></p><p>当前费率按每腿实际结算周期折算小时率；两合约目前每 4 小时结算。结算金额由实际费率与标记价格确定。年化为线性换算，不代表已实现收益。</p><p id="funding-timestamp"></p></div>
+        </section>
+
+        <section class="chart-panel panel" id="chart-panel" aria-label="原油价格与价差走势">
+          <div class="chart-toolbar"><div class="view-tabs" role="tablist" aria-label="图表内容"><button role="tab" aria-selected="true" aria-controls="chart-content" id="spread-tab" data-view="spread" tabindex="0">价差走势</button><button role="tab" aria-selected="false" aria-controls="chart-content" id="prices-tab" data-view="prices" tabindex="-1">原油价格</button></div><div class="range-buttons" role="group" aria-label="时间范围"><button data-range="1d" aria-pressed="false">1 天</button><button data-range="1w" aria-pressed="true">1 周</button><button data-range="1m" aria-pressed="false">1 月</button><button data-range="all" aria-pressed="false">全部</button></div></div>
+          <div class="chart-layout" id="chart-content" role="tabpanel" aria-labelledby="spread-tab">
+            <div class="plot-section"><div class="plot-heading"><div><h2 id="chart-title">布伦特相对 WTI 价差</h2><p id="range-caption"></p></div><div id="chart-legend" class="chart-legend"><span><i class="legend-line brent"></i>15 分钟价差</span><span><i class="legend-line average"></i>区间均值</span></div></div>
+              <div class="chart-area" id="chart-area"><span class="axis-unit" id="chart-axis-unit">%</span><svg id="main-chart" viewBox="0 0 1000 340" role="img" aria-label="布伦特与WTI原油15分钟K线收盘价差走势"></svg><div class="chart-tooltip" id="chart-tooltip" hidden></div><input id="chart-cursor" class="chart-cursor" type="range" min="0" max="1" value="1" aria-label="按15分钟查看图表数值" /></div>
+              <div class="chart-footer"><span id="chart-hint">在图表上移动查看每15分钟的收盘价格；键盘 Tab 后可用方向键查看。</span><span id="observation-count"></span></div>
+              <section class="funding-history-section" aria-labelledby="funding-history-title">
+                <div class="plot-heading"><div><h2 id="funding-history-title">历史多空资金费率</h2><p>已结算资金费 · 两腿等名义</p></div><div class="chart-legend history-legend"><span><i class="legend-line funding-long"></i>做多价差</span><span><i class="legend-line funding-short"></i>做空价差</span></div></div>
+                <div class="funding-history-returns" aria-label="区间累计资金费与年化"><article><p><i class="legend-line funding-long"></i>做多价差 <small>多布伦特、空 WTI</small></p><span>区间累计年化</span><strong id="funding-history-long-annual">—</strong><p>累计资金费 <b id="funding-history-long-cumulative">—</b></p></article><article><p><i class="legend-line funding-short"></i>做空价差 <small>空布伦特、多 WTI</small></p><span>区间累计年化</span><strong id="funding-history-short-annual">—</strong><p>累计资金费 <b id="funding-history-short-cumulative">—</b></p></article></div>
+                <div class="funding-history-controls"><div class="range-buttons" role="group" aria-label="历史资金费指标"><button data-funding-view="annualized" aria-pressed="true">累计年化</button><button data-funding-view="rate" aria-pressed="false">日均小时率</button></div><p id="funding-history-range"></p></div>
+                <div class="funding-history-area" id="funding-history-area"><span class="axis-unit" id="funding-history-unit">% / 年 · 简单年化</span><svg id="funding-history-chart" viewBox="0 0 1000 210" role="img" aria-label="历史做多与做空价差的累计年化资金费率"></svg><div class="chart-tooltip" id="funding-history-tooltip" hidden></div><input id="funding-history-cursor" class="chart-cursor" type="range" min="0" max="1" value="1" aria-label="按日期查看历史做多做空资金费率" /><p id="funding-history-empty" class="funding-history-empty" role="status">正在读取历史结算费率…</p></div>
+                <div class="chart-footer history-footer"><span>正值收款 · 负值付款</span><span id="funding-history-count"></span></div>
+                <p class="funding-history-method">每次做空净结算率＝(布伦特费率 − WTI 费率) ÷ 2，做多取相反数，以两腿总名义为分母。累计年化＝区间累计净结算率 ÷（有效结算次数 × 4 小时）× 8,760，不复利。按上方选定的精确时间范围统计每 4 小时的实际结算；曲线按 UTC 日汇总并标在区间内当日最后一次结算的位置，展示截至该点的累计年化，切换上方时间范围会重新累计；日均小时率＝当日净结算率之和 ÷（有效结算次数 × 4）。缺失日期断线，不完整日用圆点标记，缺失结算不补零。历史口径独立于上方当前预估的配仓选项，只统计资金费，不含展期等因素带来的价格盈亏。</p>
+                <p id="funding-history-status" class="funding-history-status"></p>
+              </section>
+            </div>
+            <aside class="range-summary"><div class="summary-heading"><h3>区间速览</h3><span id="summary-range">近 1 周</span></div><div class="summary-average"><p>平均价差</p><div id="average-spread"></div><span>%</span></div><div class="summary-extremes"><div><span>最高价差</span><strong id="max-spread"></strong><small id="max-date"></small></div><div><span>最低价差</span><strong id="min-spread"></strong><small id="min-date"></small></div></div><div class="range-track" aria-hidden="true"><span id="range-marker"></span></div><p class="range-description" id="range-description"></p><div class="summary-note"><span class="note-symbol" aria-hidden="true">↗</span><p>价差为正，表示布伦特较 WTI 溢价；价差上升，表示两者价差扩大。</p></div></aside>
+          </div>
+        </section>
+
+        <section class="bottom-grid">
+          <article class="panel monthly-panel"><div class="section-heading"><div><h2>月度价差</h2><p>各月 15 分钟百分比价差的平均值</p></div><span class="unit-label">%</span></div><div id="monthly-chart" class="monthly-chart" role="list" aria-label="月度平均价差"></div><p class="monthly-note" id="monthly-note"></p></article>
+          <article class="panel methodology"><p class="eyebrow">READING THE SPREAD</p><h2>如何读这条价差？</h2><p>价差＝(布伦特 − WTI) ÷ WTI × 100%，以 WTI 为基准。历史使用同一 UTC 15 分钟时段已收盘 K 线，顶部行情使用当前标记价格。</p><div class="formula"><span>(BZUSDT − CLUSDT) ÷ CLUSDT</span><b>× 100%</b></div><p class="methodology-fine">做空价差对应空布伦特、多 WTI。百分比价差反映相对价格；等桶数配仓的价格损益仍取决于绝对价差变化，资金费另行计算。Binance 合约代码分别为 BZUSDT 与 CLUSDT，报价币种为 USDT。</p><p class="methodology-fine">底层期货按 Binance 规则自动展期，两腿可能对应不同交割月；价差包含换月与期限结构影响，资金费年化不包含这些价格盈亏。<a href="https://www.binance.com/en/support/faq/detail/0675298e133640f48aab7e3bb4ae1d38" target="_blank" rel="noreferrer">展期规则 ↗</a></p></article>
+        </section>
+
+        <details class="data-details panel"><summary><span>15 分钟价格与资金费明细 <span id="table-count" class="table-count"></span></span><span class="details-arrow" aria-hidden="true">＋</span></summary><nav class="table-pagination" aria-label="明细翻页"><span id="table-page-status" aria-live="polite"></span><div><button id="table-prev" type="button">上一页</button><button id="table-next" type="button">下一页</button></div></nav><div class="table-scroll" tabindex="0" role="region" aria-label="原油价格与资金费明细"><table><caption>按 K 线起始时间倒序（北京时间），每页 200 条，可翻页查看全部记录。价格：USDT/桶；价差：%；价差变化：百分点。仅每 4 小时结算时点的 K 线显示同一时间实际结算资金费，其他时段为 —。资金费按两腿总名义，正值收款。</caption><thead><tr><th scope="col">时间 · 北京时间</th><th scope="col">布伦特</th><th scope="col">WTI</th><th scope="col">价差 (%)</th><th scope="col">较上根 K 线 (百分点)</th><th scope="col">做多资金费 / 次</th><th scope="col">做空资金费 / 次</th><th scope="col">结算状态</th></tr></thead><tbody id="data-table"></tbody></table></div></details>
+      </div>
+      <footer><div class="footer-brand">OIL SPREAD<span>2026</span></div><p>来源：<a href="https://www.binance.com/en/futures/BZUSDT" target="_blank" rel="noreferrer">Binance BZUSDT ↗</a><span class="footer-divider">/</span><a href="https://www.binance.com/en/futures/CLUSDT" target="_blank" rel="noreferrer">CLUSDT ↗</a><span class="footer-divider">/</span><a href="https://www.binance.com/en/support/faq/detail/360033525031" target="_blank" rel="noreferrer">资金费规则 ↗</a><span class="footer-divider">/</span><a href="https://www.binance.com/en/support/announcement/detail/e7a10ca855524655ab3dea73add40ef4" target="_blank" rel="noreferrer">合约规格 ↗</a></p><p class="footer-note" id="source-note">仅使用两合约同一时段已收盘的 15 分钟 K 线。缺失时段断线，不补值。</p></footer>
+    </main>
+
+  </div>

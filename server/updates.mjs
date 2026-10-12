@@ -99,9 +99,14 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {} }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, setModuleMaintenance = async () => {}, prepareApply = async () => {} }) {
   let pendingPlanId = readPendingPlanId();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
+  let moduleSync = Promise.resolve();
+  const synchronizeModules = () => {
+    const next = moduleSync.catch(() => {}).then(() => setModuleMaintenance(maintenance));
+    moduleSync = next; return next;
+  };
   function remember(value) { if (maintenance !== value) { writeMaintenance(value); maintenance = value; } }
   function rememberPending(value) { if (pendingPlanId !== value) { writePendingPlanId(value); pendingPlanId = value; } }
   if (pendingPlanId) remember(true);
@@ -118,12 +123,14 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     const version = generation;
     const state = publicUpdateState(await client.status());
     if (!applying && version === generation) observe(state);
+    await synchronizeModules();
     return state;
   }
   async function check() {
     const version = generation;
     const state = publicUpdateState(await client.check());
     if (!applying && version === generation) observe(state);
+    await synchronizeModules();
     return state;
   }
   async function withExecutionEntry(operation) {
@@ -153,6 +160,8 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     applying = pending;
     pending.promise = (async () => {
       try {
+        await synchronizeModules();
+        await prepareApply();
         // Run authorization again immediately before sending the privileged request.
         authorize();
         const state = publicUpdateState(await client.apply(planId));
@@ -163,9 +172,12 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
         // A timeout may follow successful acceptance. Keep the durable latch until status confirms completion.
         if (error instanceof UpdateError && !error.uncertain) { rememberPending(previous.pendingPlanId); remember(previous.maintenance); }
         throw error;
-      } finally { if (applying === pending) { generation += 1; applying = null; } }
+      } finally {
+        if (applying === pending) { generation += 1; applying = null; }
+        await synchronizeModules();
+      }
     })();
     return pending.promise;
   }
-  return { status, check, apply, withExecutionEntry };
+  return { status, check, apply, withExecutionEntry, initialize: synchronizeModules };
 }

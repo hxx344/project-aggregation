@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux CI helpers: no package installation, systemd changes, or network access.
 set -Eeuo pipefail
-AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/../install.sh"
+AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/install.sh"
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 APP_DIR="$test_root/application"

@@ -25,27 +25,8 @@ class Module:
 
 
 MODULES = (
-    Module('aster', 'ASTER 5X', 'aster_5x', 'aster-desk', 'aster-desk', 'aster-desk',
-           'install-trading.sh', r'release-\d{8}T\d{6}Z-[A-Za-z0-9]{6}',
-           ('.install-owned', '.install-ready'), '.install-revision'),
-    Module('monitor', 'Market Monitor', 'market-spread-monitor', 'market-spread-monitor',
-           'market-spread-monitor', 'spread-monitor', 'deploy/install.sh',
-           r'(?:[a-f0-9]{12}|local-[a-f0-9]{6})-[A-Za-z0-9]{8}',
-           ('.install-owned', '.install-root-owned', '.install-ready'), '.install-checked-source', '.install-source'),
-    Module('asset', 'Asset Ledger', 'asset-ledger', 'asset-ledger', 'asset-ledger', 'asset-ledger',
-           'install.sh', r'[a-f0-9]{12}\.[A-Za-z0-9]{6}', ('.install-owned', '.install-ready'),
-           artifact='.install-artifact-commit', working_suffix='/.next/standalone'),
-    Module('crossex', 'Gate CrossEx', 'gate-crossex-arbitrage', 'gate-crossex-arbitrage',
-           'gate-crossex-arbitrage', 'gate-crossex-arbitrage', 'install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
-           ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True),
-    Module('variational', 'Variational Grid', 'variational-grid', 'variational-grid',
-           'variational-grid', 'variational-grid', 'install.sh', r'[a-f0-9]{40}(?:-ci)?',
-           ('.install-owned', '.install-ready')),
-    Module('greeks', 'Greeks · BTC 期权', 'greeks', 'greeks', 'greeks', 'greeks',
-           'install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}', ('.managed-release', '.install-ready'),
-           '@.deployed-state', '.managed-release', True),
-    Module('hub', '工作台', 'project-aggregation', 'project-aggregation', 'project-aggregation',
-           'project-aggregation', 'install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
+    Module('hub', '工作台（包含四个内置模块）', 'project-aggregation', 'project-aggregation', 'project-aggregation',
+           'project-aggregation', 'deploy/install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
            ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True),
 )
 BY_ID = {module.id: module for module in MODULES}

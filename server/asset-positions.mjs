@@ -102,7 +102,7 @@ export function createAssetPositions({ listTargets, request = requestJson, now =
   const entries = new Map();
   let closed = false;
   const targets = () => listTargets().filter(target => target.project.enabled && target.project.adapter === 'asset');
-  const usable = target => !!target.project.apiUrl && !!target.credentials?.password;
+  const usable = target => !!target.project.apiUrl && (!!target.project.embedded || !!target.credentials?.password);
   const present = target => !closed && targets().some(current => current.project.id === target.project.id && current.revision === target.revision && usable(current));
   const secureRequest = (base, path, options) => request(base, path, { ...options, requireSecureTransport: true, limit: 2 * 1024 * 1024 });
   function invalidate(id) {

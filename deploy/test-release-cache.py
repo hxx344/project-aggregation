@@ -1,5 +1,6 @@
 """Deterministic public-release discovery, cache and worker freshness tests."""
 from collections import Counter
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -309,7 +310,7 @@ class ReleaseCacheTests(unittest.TestCase):
             self.reader.read(self.module, self.value['metadata']['id'])
 
     def test_commit_comparisons_and_installers_are_bounded_and_repository_scoped(self):
-        other = registry.BY_ID['aster']
+        other = replace(self.module, id='fixture-other', repository='fixture-other')
         self.network = FakeNetwork([self.module, other])
         self.reader = releases.Releases(self.network, arch='linux-x64')
         for module in (self.module, other):
@@ -351,14 +352,15 @@ class ReleaseCacheTests(unittest.TestCase):
         self.reader.read(self.module)
         self.assertEqual(self.network.counts()['metadata'], 2)
         self.assertEqual(self.network.counts()['installer'], 1)
-        self.network = FakeNetwork(registry.MODULES)
+        fixtures = [replace(self.module, id=f'fixture-{i}', repository=f'fixture-{i}') for i in range(3)]
+        self.network = FakeNetwork(fixtures)
         self.reader = releases.Releases(self.network, arch='linux-x64')
         with patch.object(releases, 'MAX_RELEASE_CACHE', 2):
-            for module in registry.MODULES:
+            for module in fixtures:
                 self.reader.read(module)
             self.assertEqual(len(self.reader._releases), 2)
             before = self.network.counts()['metadata']
-            self.reader.read(registry.MODULES[0])
+            self.reader.read(fixtures[0])
             self.assertEqual(self.network.counts()['metadata'], before + 1)
 
     def test_request_only_adapters_keep_complete_uncached_validation(self):

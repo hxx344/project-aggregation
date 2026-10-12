@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 [[ $(uname -s) == Linux && $EUID == 0 ]] || { echo 'Run this fixture with sudo on Linux (not WSL).' >&2; exit 1; }
 umask 022
-AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/../install.sh"
+AGG_INSTALL_SOURCE_ONLY=1 source "$(dirname "$0")/install.sh"
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 SERVICE_USER=root

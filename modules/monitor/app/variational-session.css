@@ -1,0 +1,19 @@
+.variational-session-trigger{display:inline-flex;align-items:center;gap:5px;min-height:44px;margin-top:5px;padding:5px 0;border:0;background:transparent;color:var(--primary);font-size:12px;text-align:left}
+.variational-session-trigger[aria-expanded=true] svg{transform:rotate(180deg)}
+.exchange-table .variational-session-row>td{padding:0 22px 20px;text-align:left;white-space:normal}
+.variational-session{padding:16px;border:1px solid var(--border);border-radius:7px;background:var(--muted);min-width:0;scroll-margin-block:16px}
+.variational-session-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.variational-session-heading h3{margin:0;color:var(--foreground);font-size:15px;font-weight:600}
+.variational-session p{margin:6px 0 0;color:var(--muted-foreground);font-size:12px;line-height:1.7;overflow-wrap:anywhere}
+.variational-session-close{flex:none;min-height:44px;padding:6px 10px;border:0;background:transparent;color:var(--muted-foreground);font-size:12px}
+.variational-session-status{margin:10px 0 14px}
+.variational-session-form label{display:block;color:var(--foreground);font-size:12px;margin-bottom:7px}
+.variational-session-fields{display:flex;align-items:center;gap:10px}
+.variational-session-fields input{flex:1;min-width:0;width:100%;height:44px;padding:10px 12px;border:1px solid var(--border);border-radius:5px;background:var(--card);color:var(--foreground);font:inherit}
+.variational-session-fields button{flex:none;min-height:44px;border:1px solid var(--primary);border-radius:5px;padding:9px 14px;background:var(--primary);color:var(--primary-foreground);font-size:12px}
+.variational-session-fields .variational-session-reload{border-color:var(--border);background:var(--card);color:var(--foreground)}
+.variational-session-fields button:disabled{cursor:default}
+.variational-session input:focus-visible,.variational-session button:focus-visible,.variational-session-trigger:focus-visible{outline:2px solid var(--ring);outline-offset:3px}
+.variational-session .variational-session-warning{color:var(--warning)}
+.variational-session .variational-session-success{color:var(--positive)}
+@media(max-width:780px){.exchange-table .variational-session-row{display:block;padding:0 16px 14px;border-top:0}.exchange-table .variational-session-row>td{padding:0}.exchange-table .variational-session-row>td::before{display:none}.variational-session{padding:14px}.variational-session-heading{gap:8px}.variational-session-fields{flex-wrap:wrap}.variational-session-fields input{flex-basis:100%;font-size:16px}.variational-session-fields button{flex:1}.variational-session p{font-size:12px}}
