@@ -30,17 +30,17 @@ export default memo(function TradingFundingChart({ daily }: { daily: TradingStat
     <p id={descriptionId} className="trading-caption">收入在零线上方，支出在下方；首尾日按区间截取。虚线标记记录不完整，缺失值不绘制。</p>
     <div ref={container} className="trading-chart-plot">
       {values.length ? <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`按日资金费收付，共 ${points.length} 天`} aria-describedby={descriptionId}>
-        {[top, baseline, bottom].map((y, index) => <g key={y}><line x1={left} x2={width - right} y1={y} y2={y} stroke={index === 1 ? '#9aabba' : '#e7edf3'} strokeDasharray={index === 1 ? undefined : '3 4'} /><text x={left - 7} y={y + 4} textAnchor="end" fill="#66748a" fontSize="11">{index === 1 ? '0' : `${index === 2 ? '−' : ''}${compact.format(maximum)}`}</text></g>)}
+        {[top, baseline, bottom].map((y, index) => <g key={y}><line x1={left} x2={width - right} y1={y} y2={y} stroke={index === 1 ? 'var(--text-tertiary)' : 'var(--surface-5)'} strokeDasharray={index === 1 ? undefined : '3 4'} /><text x={left - 7} y={y + 4} textAnchor="end" fill="var(--text-secondary)" fontSize="11">{index === 1 ? '0' : `${index === 2 ? '−' : ''}${compact.format(maximum)}`}</text></g>)}
         {points.map((point, index) => {
           const x = left + band * (index + .5);
           const income = point.income === null ? null : Number(point.income);
           const expense = point.expense === null ? null : Number(point.expense);
           return <g key={point.date}>
             <title>{`${point.date}：收入 ${exact(point.income)} USDT，支出 ${exact(point.expense)} USDT，净额 ${exact(point.net)} USDT${point.complete ? '' : '，部分记录'}`}</title>
-            {income !== null && Number.isFinite(income) && income > 0 ? <rect x={x - barWidth - 1} y={baseline - scale(income)} width={barWidth} height={scale(income)} fill="#147d64" rx="1" /> : null}
-            {expense !== null && Number.isFinite(expense) && expense > 0 ? <rect x={x + 1} y={baseline} width={barWidth} height={scale(expense)} fill="#c64b55" rx="1" /> : null}
-            {!point.complete ? <line x1={x} x2={x} y1={top} y2={bottom} stroke="#9a6718" strokeDasharray="2 5" opacity=".65" /> : null}
-            {labels.has(index) ? <text x={x} y={height - 8} fill="#66748a" fontSize="11" textAnchor="middle">{point.date.slice(5).replace('-', '/')}</text> : null}
+            {income !== null && Number.isFinite(income) && income > 0 ? <rect x={x - barWidth - 1} y={baseline - scale(income)} width={barWidth} height={scale(income)} fill="var(--emerald)" rx="1" /> : null}
+            {expense !== null && Number.isFinite(expense) && expense > 0 ? <rect x={x + 1} y={baseline} width={barWidth} height={scale(expense)} fill="var(--error)" rx="1" /> : null}
+            {!point.complete ? <line x1={x} x2={x} y1={top} y2={bottom} stroke="var(--warning)" strokeDasharray="2 5" opacity=".65" /> : null}
+            {labels.has(index) ? <text x={x} y={height - 8} fill="var(--text-secondary)" fontSize="11" textAnchor="middle">{point.date.slice(5).replace('-', '/')}</text> : null}
           </g>;
         })}
       </svg> : <div className="trading-chart-empty">尚无可绘制的资金费记录</div>}
