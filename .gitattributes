@@ -1,3 +1,31 @@
-* text=auto eol=lf
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Explicitly declare text files
+*.md text
+*.js text
+*.mjs text
+*.ts text
+*.tsx text
+*.json text
+*.css text
+*.html text
 *.sh text eol=lf
-*.mjs text eol=lf
+*.bash text eol=lf
+
+# PowerShell scripts should use CRLF on Windows
+*.ps1 text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary

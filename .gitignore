@@ -1,13 +1,48 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+.tsbuildinfo
+*.tsbuildinfo
+
+# Data directories
 .data*/
+
+# Environment
 .env
 .env.*
 !.env.example
+
+# Output and temporary directories
 output/
-.playwright-cli/
 *.log
-*.tsbuildinfo
+
+# Playwright
+.playwright-cli/
+
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Temporary documentation and previews
+*-preview.html
+design-tokens.css
+diagnose-*.html
+
+# Temporary analysis and completed work records
+BEFORE_AFTER.md
+DIAGNOSIS.md
+improvements-completed.md
+optimization-analysis.md
+security-performance-audit.md
+REFACTOR_PROGRESS.md
+VISUAL_COMPARISON.md
+
+# Archive - keep in git history but not in working tree
+docs/archive/

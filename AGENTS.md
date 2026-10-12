@@ -31,6 +31,9 @@
 | `docs/code-standards.md` | 满足升级条件的规范及其依据 |
 | `daily-review-prompt.md` | 增量复盘、事件去重和检查点更新流程 |
 | `docs/review-state.json` | 已完成检查点和未完成复盘的报告位置 |
+| `docs/FILE_ORGANIZATION.md` | 文件组织与命名规范 |
 | `CLAUDE.md`、`.cursorrules`、`.github/copilot-instructions.md` | 工具入口，只引用上述权威文件 |
 
 根目录 `code-standards.md` 仅保留兼容链接。工具入口和使用说明不维护业务规则副本；权威文件路径变化时同步更新引用。
+
+临时分析、已完成指南和演示文件移入 `docs/archive/` 后通过 `.gitignore` 从工作树移除，但保留在 git 历史中。
