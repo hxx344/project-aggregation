@@ -235,6 +235,6 @@ chmod +x find-assest-references.sh
 
 ---
 
-**生成时间**: 2024-10-13  
+**生成时间**: 2026-10-13  
 **创建者**: Claude Opus 5.5  
 **用途**: 指导 Codex 理解并执行文件夹重命名操作

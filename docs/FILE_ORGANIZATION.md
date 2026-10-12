@@ -25,17 +25,21 @@ project_aggregation/
 - `AGENTS.md` - 项目规则与文档索引
 - `LESSONS.md` - 项目经验记录
 - `daily-review-prompt.md` - 复盘流程
-- `QUICK_START.md`, `QUICK_REFERENCE.md` - 快速入门文档
-- `CODEX_OPTIMIZATION_GUIDE.md`, `README_CODEX.md` - 优化指南
-- `package.json`, `tsconfig.json` 等配置文件
+- `code-standards.md` - 代码规范兼容链接
+- `package.json`, `tsconfig.json`, `vite.config.ts` 等配置文件
 
-### 根目录脚本文件
+### scripts/ 目录
+运维和辅助脚本：
 - `check-server.sh` - 服务器检查脚本
 - `wait-and-release.sh` - 等待和释放脚本
 - `ssh-tunnel-optimized.ps1` - SSH 隧道管理
-- `install.sh`, `install-all.sh` - 安装脚本
+- `local-route-helper.mjs`, `start-local-route.ps1` - 本地路由
+- `benchmark-overview.mjs` - 性能基准测试
 
-较大或专用的脚本应移至 `scripts/` 目录。
+### deploy/ 目录
+部署和安装脚本：
+- `install.sh`, `install-all.sh` - 安装脚本
+- 发布和测试相关脚本
 
 ### docs/ 目录
 - **持久性技术文档**：`deployment.md`, `integration.md`, `local-route.md`
@@ -98,7 +102,7 @@ project_aggregation/
 ## 根目录文件控制目标
 
 保持根目录简洁：
-- **Markdown 文档**：≤ 10 个（核心文档）
-- **脚本文件**：≤ 5 个（顶层命令）
+- **Markdown 文档**：≤ 6 个（核心文档）
+- **脚本文件**：0 个（全部在 scripts/ 或 deploy/）
 - **配置文件**：必需的项目配置（package.json, tsconfig.json 等）
 - **临时文件**：0 个（通过 gitignore 自动排除）

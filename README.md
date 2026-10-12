@@ -9,7 +9,7 @@ npm install
 npm run dev
 ```
 
-详见 [QUICK_START.md](QUICK_START.md)
+访问 http://localhost:5173
 
 ## 项目结构
 
@@ -33,8 +33,6 @@ project_aggregation/
 ## 文档导航
 
 ### 开发指南
-- [快速开始](QUICK_START.md)
-- [快速参考](QUICK_REFERENCE.md)
 - [代码规范](docs/code-standards.md)
 - [文件组织规范](docs/FILE_ORGANIZATION.md)
 
@@ -47,10 +45,6 @@ project_aggregation/
 - [协作规则](AGENTS.md) - 项目规则与文档入口
 - [项目经验](LESSONS.md) - 已验证的开发经验
 - [复盘流程](daily-review-prompt.md) - 增量复盘指南
-
-### 优化指南
-- [Codex 优化](CODEX_OPTIMIZATION_GUIDE.md)
-- [README Codex](README_CODEX.md)
 
 ## 测试
 

@@ -36,4 +36,4 @@
 
 根目录 `code-standards.md` 仅保留兼容链接。工具入口和使用说明不维护业务规则副本；权威文件路径变化时同步更新引用。
 
-临时分析、已完成指南和演示文件移入 `docs/archive/` 后通过 `.gitignore` 从工作树移除，但保留在 git 历史中。
+已完成任务的指南、临时分析和演示文件移入 `docs/archive/` 后通过 `.gitignore` 从工作树移除，但保留在 git 历史中。所有脚本移至 `scripts/` 或 `deploy/` 目录。
