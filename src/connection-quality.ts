@@ -1,5 +1,5 @@
-export const CONNECTION_INTERVAL_MS = 10_000;
-export const CONNECTION_TIMEOUT_MS = 3_000;
+export const CONNECTION_INTERVAL_MS = 15_000; // SSH 隧道场景降低频率
+export const CONNECTION_TIMEOUT_MS = 5_000;  // 增加超时容忍度
 
 export type ConnectionQuality = 'checking' | 'good' | 'fair' | 'slow' | 'unreachable' | 'offline' | 'paused';
 export type ConnectionState = { quality: ConnectionQuality; latencyMs: number | null; checkedAt: number | null };
@@ -43,7 +43,7 @@ export function createConnectionMonitor({ probe, onChange, now = () => performan
       await probe(controller.signal);
       if (disposed || current !== controller) return;
       const elapsed = now() - started;
-      publish(latencyQuality(elapsed), Math.max(1, Math.round(elapsed)), Date.now());
+      publish(latencyQuality(elapsed), Math.max(1, Math.ceil(elapsed)), Date.now());
     } catch {
       if (disposed || current !== controller) return;
       publish('unreachable', null, Date.now());

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>工作台请求诊断工具</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #0a0d12; color: #e4e7eb; }
+    h1 { color: #38bdf8; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin: 20px 0; }
+    .card { background: #0f131c; border: 1px solid #1e2636; border-radius: 8px; padding: 15px; }
+    .card h3 { margin-top: 0; color: #6ee7b7; }
+    .metric { display: flex; justify-content: space-between; margin: 8px 0; }
+    .metric .label { color: #9ca3af; }
+    .metric .value { color: #fbbf24; font-weight: bold; }
+    .high { color: #ef4444 !important; }
+    .requests { margin-top: 20px; }
+    .request { padding: 8px; border-bottom: 1px solid #1e2636; font-size: 12px; }
+    .request .time { color: #6b7280; }
+    .request .url { color: #38bdf8; }
+    .request .duration { color: #fbbf24; }
+    button { background: #38bdf8; color: #0a0d12; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin: 5px; }
+    button:hover { background: #0ea5e9; }
+  </style>
+</head>
+<body>
+  <h1>🔍 工作台请求诊断</h1>
+  <div>
+    <button onclick="start()">开始监控</button>
+    <button onclick="stop()">停止监控</button>
+    <button onclick="clear()">清空数据</button>
+    <button onclick="exportData()">导出分析</button>
+  </div>
+
+  <div class="stats" id="stats"></div>
+  <div class="requests" id="requests"></div>
+
+  <script>
+    const requests = [];
+    let monitoring = false;
+    const originalFetch = window.fetch;
+
+    function start() {
+      if (monitoring) return;
+      monitoring = true;
+      window.fetch = function(...args) {
+        const url = typeof args[0] === 'string' ? args[0] : args[0].url;
+        const started = performance.now();
+        return originalFetch.apply(this, args).then(response => {
+          const duration = performance.now() - started;
+          requests.push({ time: new Date(), url, duration, status: response.status });
+          update();
+          return response;
+        }).catch(err => {
+          const duration = performance.now() - started;
+          requests.push({ time: new Date(), url, duration, status: 'ERROR', error: err.message });
+          update();
+          throw err;
+        });
+      };
+      console.log('✅ 开始监控请求');
+    }
+
+    function stop() {
+      monitoring = false;
+      window.fetch = originalFetch;
+      console.log('⏹️ 停止监控');
+    }
+
+    function clear() {
+      requests.length = 0;
+      update();
+    }
+
+    function update() {
+      const now = Date.now();
+      const last60s = requests.filter(r => now - r.time < 60000);
+      const byUrl = {};
+      last60s.forEach(r => {
+        const key = r.url.split('?')[0];
+        if (!byUrl[key]) byUrl[key] = { count: 0, totalDuration: 0, errors: 0 };
+        byUrl[key].count++;
+        byUrl[key].totalDuration += r.duration;
+        if (r.status === 'ERROR' || r.status >= 400) byUrl[key].errors++;
+      });
+
+      const totalRequests = last60s.length;
+      const avgDuration = totalRequests > 0 ? (last60s.reduce((sum, r) => sum + r.duration, 0) / totalRequests).toFixed(0) : 0;
+      const errors = last60s.filter(r => r.status === 'ERROR' || r.status >= 400).length;
+
+      document.getElementById('stats').innerHTML = `
+        <div class="card">
+          <h3>📊 总体统计（最近 60 秒）</h3>
+          <div class="metric"><span class="label">总请求数</span><span class="value ${totalRequests > 60 ? 'high' : ''}">${totalRequests}</span></div>
+          <div class="metric"><span class="label">平均耗时</span><span class="value">${avgDuration} ms</span></div>
+          <div class="metric"><span class="label">错误数</span><span class="value ${errors > 0 ? 'high' : ''}">${errors}</span></div>
+          <div class="metric"><span class="label">频率</span><span class="value">${(totalRequests / 60).toFixed(1)} 次/秒</span></div>
+        </div>
+        ${Object.entries(byUrl).sort((a, b) => b[1].count - a[1].count).map(([url, stats]) => `
+          <div class="card">
+            <h3>${url}</h3>
+            <div class="metric"><span class="label">次数</span><span class="value">${stats.count}</span></div>
+            <div class="metric"><span class="label">平均耗时</span><span class="value">${(stats.totalDuration / stats.count).toFixed(0)} ms</span></div>
+            <div class="metric"><span class="label">总耗时</span><span class="value">${stats.totalDuration.toFixed(0)} ms</span></div>
+            <div class="metric"><span class="label">错误</span><span class="value ${stats.errors > 0 ? 'high' : ''}">${stats.errors}</span></div>
+          </div>
+        `).join('')}
+      `;
+
+      const recent = requests.slice(-30).reverse();
+      document.getElementById('requests').innerHTML = `
+        <h3>最近 30 次请求</h3>
+        ${recent.map(r => `
+          <div class="request">
+            <span class="time">${r.time.toLocaleTimeString()}</span>
+            <span class="url">${r.url}</span>
+            <span class="duration">${r.duration.toFixed(0)}ms</span>
+            <span style="color: ${r.status === 'ERROR' || r.status >= 400 ? '#ef4444' : '#6ee7b7'}">${r.status}</span>
+          </div>
+        `).join('')}
+      `;
+    }
+
+    function exportData() {
+      const analysis = {
+        totalRequests: requests.length,
+        timeRange: `${requests[0]?.time} ~ ${requests[requests.length - 1]?.time}`,
+        byEndpoint: {}
+      };
+      requests.forEach(r => {
+        const key = r.url.split('?')[0];
+        if (!analysis.byEndpoint[key]) {
+          analysis.byEndpoint[key] = { count: 0, durations: [], errors: 0 };
+        }
+        analysis.byEndpoint[key].count++;
+        analysis.byEndpoint[key].durations.push(r.duration);
+        if (r.status === 'ERROR' || r.status >= 400) analysis.byEndpoint[key].errors++;
+      });
+      Object.values(analysis.byEndpoint).forEach(stat => {
+        stat.avgDuration = (stat.durations.reduce((a, b) => a + b, 0) / stat.count).toFixed(2);
+        stat.maxDuration = Math.max(...stat.durations).toFixed(2);
+        stat.p95Duration = stat.durations.sort((a, b) => a - b)[Math.floor(stat.count * 0.95)]?.toFixed(2) || 0;
+        delete stat.durations;
+      });
+      console.log('📈 请求分析报告：', analysis);
+      alert('分析数据已输出到控制台，按 F12 查看');
+    }
+
+    setInterval(() => { if (monitoring) update(); }, 2000);
+  </script>
+</body>
+</html>

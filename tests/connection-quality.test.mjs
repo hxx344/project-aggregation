@@ -32,6 +32,22 @@ test('latency bands include 150 ms and 500 ms at their documented boundaries', (
   }
 });
 
+test('displayed latency agrees with the quality band just above each threshold', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const [elapsed, latencyMs, quality] of [[150.1, 151, 'fair'], [500.1, 501, 'slow']]) {
+    let now = 0;
+    const states = [];
+    const monitor = createConnectionMonitor({ now: () => now, probe: async () => {}, onChange: state => states.push(state) });
+    t.after(() => monitor.dispose());
+    monitor.sync({ online: true, visible: true });
+    now = elapsed;
+    await flush();
+    assert.equal(states.at(-1).latencyMs, latencyMs);
+    assert.equal(states.at(-1).quality, quality);
+    assert.equal(latencyQuality(states.at(-1).latencyMs), states.at(-1).quality);
+  }
+});
+
 test('health probes require a valid status and request a fresh, non-redirected response with a 3 s deadline', async () => {
   const controller = new AbortController();
   const calls = [];

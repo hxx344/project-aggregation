@@ -5,7 +5,7 @@ async (page) => {
   const errors = [], held = [];
   let mode = 'good', healthCalls = 0;
   const project = { id: 'fixture', name: '连接质量验收项目', description: '', category: 'other', adapter: 'standard',
-    enabled: true, accessMode: 'proxy', apiUrl: '', url: '', mode: 'embed', hasCredentials: true,
+    enabled: true, accessMode: 'proxy', apiUrl: `${origin}/fixtures/module`, url: `${origin}/fixtures/module`, mode: 'embed', hasCredentials: true,
     revision: 'one', staleAfterSeconds: 120, order: 0 };
   page.on('pageerror', error => errors.push(error.message));
   await page.clock.install();
@@ -96,6 +96,11 @@ async (page) => {
   await page.locator('.connection-status summary').click();
   await page.setViewportSize({ width: 320, height: 740 }); await noOverflow();
   await page.goto(origin); await quality('good'); await noOverflow();
+  await page.locator('.connection-status summary').click();
+  assert(await page.locator('.connection-details').evaluate(el => {
+    const rect = el.getBoundingClientRect(); return rect.x >= 0 && rect.right <= innerWidth;
+  }), '320px overview details stay inside the viewport');
+  await page.locator('.connection-status summary').click();
   await page.getByRole('button', { name: '打开导航', exact: true }).click();
   await page.getByRole('button', { name: '退出登录', exact: true }).click();
   await page.getByRole('heading', { name: '进入工作台' }).waitFor();
