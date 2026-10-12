@@ -38,3 +38,12 @@ try {
   await app?.close();
   await rm(dataDir, { recursive: true, force: true });
 }
+
+// Verify the production entry point can load all its runtime dependencies
+try {
+  await import(pathToFileURL(path.join(root, 'server/logger.mjs')));
+  console.log('Production entry point dependencies: logger module loaded successfully.');
+} catch (error) {
+  console.error('Production entry point failed to load:', error);
+  process.exit(1);
+}
