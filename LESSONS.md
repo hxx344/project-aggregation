@@ -1,43 +1,115 @@
 # Lessons from merged work
 
-hxx344 仓库的代码由日常复盘审过再合入。每晚回顾过去一天的提交：哪些又修了一次、哪些不该合、哪些验证太薄。学到的写在这里。改代码前先读。每条教训先是规则，再是原因与证据。"Seen" 计有多少个不同复盘日发现过它。同一教训在 3 个及以上不同日期出现后，迁入 [docs/code-standards.md](docs/code-standards.md)。
+这里保存 project-aggregation 的项目经验，以及有明确来源的外仓参考。改动前按适用条件读取；每条先给规则，再给原因、证据与验证方法。升级条件统一见 [代码规范](docs/code-standards.md#升级规则)。
 
-2026-10-12 在 hxx344 多个仓库（project-aggregation、asset-ledger、market-spread-monitor、gate-crossex-arbitrage、variational-grid、greeks、aster_5x）共约 61 次提交。多数是性能与深色主题；反复出现的是账户锁定边界、金融 read 语义、SQLite statement 复用，以及半完成拆分与 React.memo 失效。
+历史材料来自 2026-10-12/13 的复盘，涉及 project-aggregation、asset-ledger、market-spread-monitor、gate-crossex-arbitrage、variational-grid、greeks、aster_5x。原记录称 10-12 共约 61 次提交；该统计本次未重算。原 “Seen 1×” 表示一次复盘日记录，不代表已核实的独立复发事件。本次只校准经验文档及本仓证据，没有重新执行下列业务测试，也没有完成全历史复盘。
+
+每条历史线索保留稳定 ID、原复盘日期和全部原有证据。实际发生日期、独立事件边界未完成核实时，不计入规范升级；后续核实时沿用 ID 或明确关联正式事件，避免重复统计。外仓证据标注“未核验”，不将其实现或测试描述为本仓已有能力。
 
 ## Correctness at the boundary
 
-**账户锁定：先自增失败次数，再比阈值；`until=0` 只表示「有计数、未锁定」。**
-- `7543c3a1` 引入锁定后，`023eaac3` / `8e272fd3` / `5b148191` 连修：未达阈值勿写截止时间、清理勿删 `until=0`、off-by-one。最终以「失败则 `failedAttempts += 1`，之后再判断 `>= threshold`；清理只删 `until > 0 && until < now`」收敛，并用 `tests/account-lockout.test.mjs` 覆盖 1–5 次与成功清零。
-- Seen 1× (2026-10-12).
+### L001：累计失败与锁定状态分别处理
 
-**金融 / 覆盖类 `read()` 不可用采样时缓存列代替按当前 coverage 重算。**
-- `32578ed6` 写入 `cumulative_funding_pnl`；`4ea30289` 恢复 `read()` 从当前 events 累加。预计算可加速写路径，但覆盖事后更新或测试改 coverage 时，用采样行缓存列会读出错误 PnL。
-- Seen 1× (2026-10-12).
+**适用条件：** 使用失败次数与截止时间表示账户锁定的路径；具体阈值以当前配置为准。
 
-**标签页从后台回来时：先等 EventSource / 隧道 live，再决定是否兜底轮询；不要在 visibility/focus/pageshow 上立刻打 API。**
-- `c41ce40` / `fc94b0a`：background 返回时多事件同时触发请求，但流尚未重连，约 40% 失败。正确做法：延迟约 1s 后若 stream 仍未 live 再轮询。适用于 App、TradingPositions、OilTradingPage、TradingExecution 等带轮询页。
-- Seen 1× (2026-10-13).
+**根因：** 未达阈值就写入锁定时间会提前拒绝登录；把 `until=0` 当成过期记录删除，会丢失累计失败次数。
+
+**以后做法：** 新增一次失败后再判断是否达到阈值。当前实现中 `until=0` 表示仅计数、未锁定，清理只处理 `until > 0 && until < now`；成功登录按契约清零。
+
+**证据：** 本仓 `7543c3a1` 引入锁定；`023eaac3` 修复未达阈值误设截止时间；`8e272fd3` 修复清理误删未锁定计数；`5b148191` 增加专项测试。后者父版本已先自增再比较，不能仅凭提交标题把它算成另一次 off-by-one 缺陷。
+
+**如何验证：** 涉及这一路径时运行 [账户锁定测试](tests/account-lockout.test.mjs)，确认当前阈值 5 下前四次失败、第五次锁定、锁定中正确密码仍被拒绝及成功后清零。5 次是本项目当前配置，不推广成通用阈值。
+
+**事件记录：** `legacy-lockout-20261012`；历史复盘 2026-10-12（Seen 1×）；实际发生日期及独立性待核实，暂不计入升级。
+
+### L002：缓存必须保持当前 coverage 的读取语义
+
+**适用条件：** 接口约定按当前 funding coverage/events 计算的 [收益读取路径](server/trading-pnl.mjs)，包括记录样本后仍会补录覆盖与事件的场景。
+
+**根因：** 采样时预计算的列无法反映后来更新的 coverage/events，直接用它替代当前计算会返回过期收益。
+
+**以后做法：** 保持当前读取契约。若引入缓存，应有覆盖更新时的失效或重算机制；不能把所有金融读取一概判定为不可缓存。
+
+**证据：** 本仓 `32578ed6` 将 funding 计算移入 `record()`，试图用写入时预计算加速读取；`4ea30289` 恢复按当前 events/coverage 计算。它们属于同一优化与修复链。
+
+**如何验证：** [收益配对测试](tests/trading-pnl-pairs.test.mjs) 包含记录样本后补 coverage/funding event 的场景；不重写样本，读取仍应反映新覆盖。选取相关用例，不因此机械运行所有交易模块测试。
+
+**事件记录：** `legacy-funding-read-20261012`；历史复盘 2026-10-12（Seen 1×）；实际发生日期及独立性待核实，暂不计入升级。
+
+### L003：合并恢复事件，按页面连接方式保留兜底读取
+
+**适用条件：** `visibilitychange`、`focus`、`pageshow`、网络恢复等事件可能成组触发的页面。
+
+**根因：** 多个恢复事件会重复发起读取，流重连和请求取消可能交错；后到的事件还可能误取消恢复窗口中新启动的请求。仅轮询的页面没有可等待的 EventSource 状态。
+
+**以后做法：** 合并重复恢复工作，区分旧请求与本轮新请求，按页面实际连接方式保留必要的兜底。使用推送流的页面检查流是否已提供可用更新；离线与卸载时取消延迟工作。延迟长短由连接与交互需求确定，不能将当前的 1000ms 作为所有页面的永久规则。
+
+**证据：** 本仓 `c41ce40` 修改 [App](src/App.tsx) 与 [UpdateStatus](src/UpdateStatus.tsx)；`3f63db5`、`9382521` 补充恢复事件合并与新请求保护。`fc94b0a` 是保留的历史对象，其三个交易页源文件内容对应主线 `3a2cf14`，不能算成两次事件。[TradingPositions](src/TradingPositions.tsx)、[OilTradingPage](src/OilTradingPage.tsx)、[TradingExecution](src/TradingExecution.tsx) 使用延迟轮询，不具备这里所述的 EventSource live 判断。旧说明的“约 40% 失败”和“接近 0%”没有附带可复核测量，不作为结论或验收标准。
+
+**如何验证：** [恢复交互检查](tests/resume-refresh.browser.mjs) 覆盖 App/UpdateStatus 的事件突发合并、流先到取消兜底、离线取消、重新联网、新请求保留和退出清理。改动交易页时须按其实际轮询路径验证，不能声称该脚本已经覆盖所有页面。
+
+**事件记录：** `legacy-resume-20261013`；历史复盘 2026-10-13（Seen 1×）；同轮补丁和跨页面推广不重复计数，实际独立事件边界待核实。
 
 ## Fix the class, not the sample
 
-**SQLite：缓存的是编译后的 Statement，不是绑定结果；要有界、按连接、可交错。**
-- project-aggregation：`c838aca4` / `4b4e5bbe`；asset-ledger：`5ea37c8f`（上限 128 + 测试）；market-spread-monitor：`c307a33c`；gate-crossex-arbitrage：`281813a2`。热路径反复 `db.prepare(相同 SQL)` 浪费编译；各调用方仍各自 bind；close 后缓存失效；多 reader/generator 不可共享同一 cursor。
-- Seen 1× (2026-10-12)（同日跨四仓出现，仍计一个日期）。
+### L004：Statement 复用按连接与使用方式划定边界
 
-**半完成的文件拆分等于死代码：同一提交完成接线，或同一审查周期内删除。**
-- `0d04b671` 抽出 Brand/Status 等未改 `App.tsx` import；`8e272fd3` 审查后删除未引用文件。只拆不接线会增加噪音并误导后续审查。
-- Seen 1× (2026-10-12).
+**适用条件：** 同一 SQLite 连接内反复执行固定 SQL 的热路径；SQL 种类、连接生命周期或交错游标会影响缓存策略。
+
+**根因：** 反复 prepare 相同 SQL 重复编译；共享编译结果不等于共享参数、结果或一个正在遍历的游标。
+
+**以后做法：** 在同一连接内复用编译后的 Statement，每次执行分别传参。SQL 种类无界时考虑有界淘汰，连接更换或关闭时处理缓存生命周期，交错 reader/generator 验证游标隔离；这些是相应场景的要求，不能声称现有缓存已经全部实现。
+
+**证据：** 本仓 `c838aca4`、`4b4e5bbe` 接入缓存；`536103b7`、`7a2edd6d`、`55ea4486` 是该轮接入中的 import、默认初始化和重复声明修复链。[db-cache.mjs](server/db-cache.mjs) 当前提供按 SQL 的 Map、clear/size，没有有界淘汰或关闭状态包装器。外仓历史记录：asset-ledger `5ea37c8f`（上限 128 与测试）、market-spread-monitor `c307a33c`、gate-crossex-arbitrage `281813a2`；这些外仓内容本次未核验。
+
+**如何验证：** 对涉及的缓存路径计数 prepare：同一连接、同一 SQL、未清理或淘汰期间只编译一次，不同参数结果互不串。若改动生命周期或交错游标，再验证对应边界。旧记录的 `loadQualitySamples` 属外仓线索，不是本仓已有测试。
+
+**事件记录：** `legacy-sqlite-cache-20261012`；历史复盘 2026-10-12（Seen 1×，含同日跨仓线索）；独立事件未拆分核实，不能按 SHA 或仓库数量增加升级计数。
+
+### L005：模块拆分交付要完成调用方迁移
+
+**适用条件：** 以完成模块拆分、替换旧实现为目标的重构。
+
+**根因：** 只新增模块、不迁移调用方，会留下未启用的实现，使后续开发误判实际执行路径。
+
+**以后做法：** 接通新模块并移除被替代的重复实现。若明确采用分阶段迁移，说明当前入口与未完成工作，不把未接线的模块描述为重构已完成。
+
+**证据：** 本仓 `0d04b671` 新增 Brand/Status 等六个文件但未修改 `App.tsx` 引用；`8e272fd3` 删除这些未接线文件。该证据不说明未引用文件必然增加最终构建产物。
+
+**如何验证：** 搜索新模块引用并确认实际调用方已迁移，再做相关类型或构建检查。单独构建成功不能证明模块被使用。
+
+**事件记录：** `legacy-module-wiring-20261012`；历史复盘 2026-10-12（Seen 1×）；实际发生日期及独立性待核实，暂不计入升级。
 
 ## Verification
 
-**采样 / 图表算法优化用旧实现作 oracle，并钉死解析预算；不 mutate 输入。**
-- variational-grid `50ef16fc`：`reduce_points` 单遍扫描 + `tests/test_history_reduction.py` 与旧实现逐点对齐，并列取首次索引。greeks `160e9329`：图表预解析时间戳，`Date.parse` 线性预算（如 1000 点 `dateParseCalls <= n+3`）。
-- Seen 1× (2026-10-12).
+### L006：保持语义的算法优化要有参考结果与规模检查
 
-**`React.memo` 子树必须配合稳定回调，并把高频可变状态（如时钟 tick）与稳定历史表拆开。**
-- asset-ledger `8bafa81b`：`AssetTrend` memo + 稳定 `openHistory`；aster_5x `dc998c59` / `92aee006`：历史表与 quality 面板 memo。父组件每次新建内联 `() => …` 会使 memo 失效。
-- Seen 1× (2026-10-12).
+**适用条件：** 承诺保持输出语义的采样或图表算法优化；涉及重复解析热点时增加与规模相称的检查。
+
+**根因：** 遍历顺序、并列值和缓存改动可能悄悄改变输出；小样本结果正确也不能证明消除了大数据上的重复计算。
+
+**以后做法：** 用旧实现或独立参考结果覆盖相关输入边界，检查输入未被意外修改。若同时改变语义，先定义新预期；解析预算应根据实际算法推导。
+
+**证据：** 外仓历史记录、本次未核验：variational-grid `50ef16fc` 的 `reduce_points` 与 `tests/test_history_reduction.py`；greeks `160e9329` 的时间戳预解析。原记录的“并列极值取首次索引”和“1000 点 `dateParseCalls <= n+3`”属于对应实现契约，不推广成所有图表的要求。
+
+**如何验证：** 在实际受影响项目中检查空输入、边界规模、并列值及相关宽度/采样参数，并测量解析次数随输入规模的增长。执行前先核实外仓契约和测试位置。
+
+**事件记录：** `legacy-chart-optimization-20261012`；历史复盘 2026-10-12（Seen 1×）；外仓证据和独立事件均待核实，暂不计入升级。
+
+### L007：memo 优化先确认输入稳定性与必要更新
+
+**适用条件：** 用 `React.memo` 避免父组件无关更新导致重复渲染的组件边界。
+
+**根因：** 每轮创建的函数、对象等 props 可能使浅比较失效；同时，真实数据、组件 state/context 或时间变化仍可能需要更新。
+
+**以后做法：** 检查全部输入的预期稳定性。确有需要时使用 `useCallback`、提升函数位置或调整组件边界，并保留正确依赖。高频时间更新可与稳定历史内容拆开，但过期状态等依赖当前时间的内容仍须更新。
+
+**证据：** 本仓 `402be956` 给交易页增加 memo，不能仅凭它证明已测得收益或稳定了全部回调。外仓历史记录、本次未核验：asset-ledger `8bafa81b` 的 AssetTrend/openHistory；aster_5x `dc998c59`、`92aee006` 的历史表及 quality 面板。
+
+**如何验证：** 用 Profiler 或渲染计数检查具体的无关父状态变化，同时确认回调能读取最新状态、真实数据与过期显示正常更新。不能以“完全不重渲”为普遍目标，也不要求每个 memo 组件机械添加 useCallback。
+
+**事件记录：** `legacy-memo-props-20261012`；历史复盘 2026-10-12（Seen 1×）；外仓证据和独立事件待核实，暂不计入升级。
 
 ## Moved to the code standards
 
-尚无。同一教训在三个及以上不同复盘日出现后再迁入 `docs/code-standards.md`，并在此留下索引。
+尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目归档到本节，保留证据与规范链接；不按重复复盘次数自动升级。

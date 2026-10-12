@@ -1,0 +1,3 @@
+# GitHub Copilot 项目指引
+
+开始任务前，读取项目根目录的 [AGENTS.md](../AGENTS.md)，并按其中的指引读取和遵循相关引用文件。
