@@ -164,7 +164,8 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
       const wasLive = streamLive;
       disconnect();
       if (wasLive) void tick();
-      if (!disposed && navigator.onLine && !sessionExpired.current) retry = setTimeout(connect, 5_000);
+      // Increased retry delay for SSH tunnel scenarios: 5s → 10s
+      if (!disposed && navigator.onLine && !sessionExpired.current) retry = setTimeout(connect, 10_000);
     };
     const connect = () => {
       disconnect();

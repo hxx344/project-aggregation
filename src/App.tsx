@@ -131,10 +131,13 @@ export default function App() {
   useEffect(() => {
     if (!authenticated) return;
     const controller = new AbortController();
-    const refresh = () => { if (navigator.onLine && !streamLive.current) void load(controller.signal); };
+    const refresh = () => { if (navigator.onLine && !streamLive.current && !document.hidden) void load(controller.signal); };
     const first = window.setTimeout(refresh, 1500);
     const interval = window.setInterval(refresh, 30_000);
-    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); };
+    // Stop polling when page is hidden
+    const visibilityHandler = () => { if (!document.hidden) refresh(); };
+    document.addEventListener('visibilitychange', visibilityHandler);
+    return () => { controller.abort(); clearTimeout(first); clearInterval(interval); document.removeEventListener('visibilitychange', visibilityHandler); };
   }, [authenticated, load]);
   useEffect(() => {
     if (!authenticated) return;
@@ -165,7 +168,8 @@ export default function App() {
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
-    const health = window.setInterval(() => { if (navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
+    // Health check: extended to 30s for SSH tunnel scenarios (was 5s)
+    const health = window.setInterval(() => { if (navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 30_000);
     return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
   }, [authenticated, accept, load]);
   useEffect(() => {
