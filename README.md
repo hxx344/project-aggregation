@@ -118,6 +118,26 @@ node server/setup.mjs --reset-password
 ### Asset 后台同步
 启用后，工作台每 60 秒调用 Asset 同步接口更新资产数据，浏览器关闭后仍会执行。
 
+### 应用预热
+
+预热与摘要刷新共用调度、请求去重和关闭清理。服务启动约 100 毫秒后首次读取所有已启用且有接口地址的应用，之后按摘要刷新周期或所选应用的预热间隔中较短者检查；`link` 入口不参与。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WARMUP_ENABLED` | `true` | 设为 `false` 关闭预热加速，正常摘要刷新继续 |
+| `WARMUP_PROJECTS` | `aster,monitor,asset` | 逗号分隔的项目 ID，自动去空白和重复项；空值不选择任何项目 |
+| `WARMUP_INTERVAL_MS` | `90000` | 毫秒，必须为 `1000` 至 `2147483647` 的整数；无效值会阻止启动并提示修正 |
+
+默认摘要刷新间隔最多 30 秒，已比默认预热间隔更短，因此默认配置不会增加请求量。需要更频繁触达指定应用时，可设置更短间隔，例如在 Linux 上运行：
+
+```bash
+WARMUP_PROJECTS=aster,crossex WARMUP_INTERVAL_MS=10000 npm start
+```
+
+一键安装的服务可在 `/etc/project-aggregation.env` 中设置这些变量，重启 `project-aggregation` 服务后生效。调试日志使用 `LOG_LEVEL=debug`。代码调用 `createApp({ refreshInterval: 0 })` 时，自动摘要刷新和预热均关闭。
+
+预热通过现有摘要接口触达上游，实际能否避免休眠取决于上游服务；不会提前建立浏览器页面或登录会话。打开速度需在实际部署中测量，不能据此保证固定提速比例。
+
 ## 交易执行
 
 ### 配置实盘连接

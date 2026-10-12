@@ -50,7 +50,10 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist') } = {}) {
+export async function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS) } = {}) {
+  if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
+  if (!Array.isArray(warmupProjects) || warmupProjects.some(id => typeof id !== 'string')) throw new TypeError('warmupProjects 必须为项目 ID 字符串数组');
+  const warmupProjectIds = new Set(warmupProjects.map(id => id.trim()).filter(Boolean));
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
   const resolvedData = path.resolve(dataDir);
   const log = typeof logger === 'function' ? { info: logger, warn: logger, error: logger, debug: logger } : logger;
@@ -504,7 +507,9 @@ export async function createApp({ dataDir = process.env.DATA_DIR || path.join(ro
     if (!project.enabled || !project.apiUrl || project.adapter === 'link') return false;
     if (!dueOnly) return true;
     const state = states.get(project.id);
-    const period = Math.max(1000, Math.min(refreshInterval, (state?.staleAfterSeconds || project.staleAfterSeconds) * 500));
+    // Share the summary schedule so faster refreshes already keep the app warm.
+    const warmupPeriod = warmupEnabled && warmupProjectIds.has(project.id) ? warmupIntervalMs : Infinity;
+    const period = Math.max(1000, Math.min(refreshInterval, (state?.staleAfterSeconds || project.staleAfterSeconds) * 500, warmupPeriod));
     return !state?.checkedAt || Date.now() - new Date(state.checkedAt).getTime() >= period;
   }).map(project => check(project.id))); }
   const interval = refreshInterval > 0 ? setInterval(() => { if (!closed) void refresh(true); }, Math.min(refreshInterval, 1000)) : null;
