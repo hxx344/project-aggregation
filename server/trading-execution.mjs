@@ -3,6 +3,7 @@ import { createExecutionExchangeClient, ExecutionExchangeError } from './trading
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
 import { TRADING_NAMES } from './trading-markets.mjs';
+import { createStatementCache } from './trading-db.mjs';
 
 const iso = time => new Date(time).toISOString();
 const FINAL = new Set(['completed', 'stopped']);
@@ -18,6 +19,7 @@ const modeOf = (exchange, mode) => {
 
 /** Durable, explicit live execution. Read endpoints never submit exchange requests. */
 export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true } = {}) {
+  if (!stmt) stmt = createStatementCache(db);
   db.exec(`
     CREATE TABLE IF NOT EXISTS execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT);
     CREATE TABLE IF NOT EXISTS execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL);
