@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>集序工作台 · 设计重构预览</title>
+  <style>
+    /* ========== Design Tokens ========== */
+    :root {
+      /* Surface ladder: deep teal-tinted near-blacks rising to cool mid-tones */
+      --surface-0: #05080C;
+      --surface-1: #0A0F14;
+      --surface-2: #0F151C;
+      --surface-3: #161E26;
+      --surface-4: #1E2831;
+      --surface-5: #28333D;
+      --surface-6: #323F4A;
+
+      /* Luminous accent: cyan for data/trading domain */
+      --accent: #38BDF8;
+      --accent-dim: #0EA5E9;
+      --accent-subtle: #1E3A52;
+
+      /* Supporting tint: emerald for success/growth */
+      --emerald: #6EE7B7;
+      --emerald-dim: #34D399;
+
+      /* Semantic colors */
+      --warning: #FBBF24;
+      --error: #F87171;
+
+      /* Text on dark */
+      --text-primary: #F0F4F8;
+      --text-secondary: #B0BEC8;
+      --text-tertiary: #7A8A98;
+
+      /* Spacing scale */
+      --space-xs: 0.5rem;
+      --space-sm: 0.75rem;
+      --space-md: 1rem;
+      --space-lg: 1.5rem;
+      --space-xl: 2rem;
+      --space-2xl: 3rem;
+
+      /* Radius tokens */
+      --radius-sm: 0.5rem;
+      --radius-md: 0.75rem;
+      --radius-lg: 1rem;
+      --radius-pill: 999px;
+      --radius-circle: 50%;
+
+      /* Shadows */
+      --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+      --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+      --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.5);
+
+      /* Typography */
+      --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --font-body: var(--font-display);
+      --font-mono: "SF Mono", "Cascadia Code", "Consolas", monospace;
+    }
+
+    /* ========== Fluid Typography ========== */
+    html {
+      font-size: clamp(14px, 0.875rem + 0.2vw, 16px);
+      font-family: var(--font-body);
+      background: var(--surface-0);
+      color: var(--text-primary);
+      line-height: 1.6;
+    }
+
+    h1 {
+      font-size: clamp(1.75rem, 2vw + 1rem, 2.5rem);
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      line-height: 1.2;
+    }
+
+    h2 {
+      font-size: clamp(1.25rem, 1.5vw + 0.75rem, 1.75rem);
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.3;
+    }
+
+    h3 {
+      font-size: clamp(1rem, 1vw + 0.5rem, 1.25rem);
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      line-height: 1.4;
+    }
+
+    body {
+      margin: 0;
+      font-size: clamp(0.875rem, 0.75vw + 0.5rem, 1rem);
+      line-height: 1.7;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    /* ========== Layout Grid System ========== */
+    .container {
+      max-width: 1600px;
+      margin: 0 auto;
+      padding: var(--space-xl);
+    }
+
+    .grid {
+      display: grid;
+      gap: var(--space-lg);
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .grid-sidebar {
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 0;
+      min-height: 100vh;
+    }
+
+    /* ========== Component Tokens ========== */
+    .card {
+      background: var(--surface-2);
+      border: 1px solid var(--surface-4);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .card-elevated {
+      background: var(--surface-3);
+      box-shadow: var(--shadow-md);
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-xs);
+      padding: 0.75rem 1.5rem;
+      border: 2px solid transparent;
+      border-radius: var(--radius-pill);
+      font-weight: 600;
+      font-size: 0.9375rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      font-family: var(--font-body);
+    }
+
+    .button-primary {
+      background: var(--accent);
+      color: var(--surface-0);
+      border-color: var(--accent);
+    }
+
+    .button-primary:hover {
+      background: var(--accent-dim);
+      border-color: var(--accent-dim);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(56, 189, 248, 0.3);
+    }
+
+    .button-secondary {
+      background: transparent;
+      color: var(--text-primary);
+      border-color: var(--surface-5);
+    }
+
+    .button-secondary:hover {
+      background: var(--surface-3);
+      border-color: var(--accent);
+    }
+
+    /* ========== Badge & Status ========== */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.375rem 0.75rem;
+      border-radius: var(--radius-pill);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+
+    .badge-online {
+      background: rgba(110, 231, 183, 0.15);
+      color: var(--emerald);
+    }
+
+    .badge-warning {
+      background: rgba(251, 191, 36, 0.15);
+      color: var(--warning);
+    }
+
+    .badge-offline {
+      background: rgba(248, 113, 113, 0.15);
+      color: var(--error);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: var(--radius-circle);
+      background: currentColor;
+    }
+
+    /* ========== Preview Sections ========== */
+    .preview-header {
+      background: linear-gradient(135deg, var(--surface-1) 0%, var(--surface-2) 100%);
+      border-bottom: 1px solid var(--surface-4);
+      padding: var(--space-2xl) var(--space-xl);
+      text-align: center;
+    }
+
+    .preview-header h1 {
+      background: linear-gradient(135deg, var(--accent) 0%, var(--emerald) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: var(--space-md);
+    }
+
+    .preview-header p {
+      color: var(--text-secondary);
+      font-size: clamp(1rem, 1vw + 0.5rem, 1.125rem);
+      max-width: 600px;
+      margin: 0 auto;
+    }
+
+    .section-title {
+      color: var(--text-secondary);
+      font-size: 0.875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin: var(--space-2xl) 0 var(--space-lg);
+      font-weight: 700;
+    }
+
+    /* ========== Sidebar ========== */
+    .sidebar {
+      background: var(--surface-1);
+      border-right: 1px solid var(--surface-4);
+      padding: var(--space-xl) var(--space-md);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-xl);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: var(--space-md);
+      color: var(--text-primary);
+      font-weight: 700;
+      font-size: 1.25rem;
+    }
+
+    .brand-mark {
+      width: 40px;
+      height: 40px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+
+    .brand-mark div {
+      border-radius: 4px;
+      background: var(--accent);
+    }
+
+    .brand-mark div:last-child {
+      background: var(--emerald);
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      padding: 0.875rem var(--space-md);
+      border-radius: var(--radius-md);
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.9375rem;
+      font-weight: 500;
+      transition: all 0.2s ease;
+      border: 0;
+      background: transparent;
+      width: 100%;
+      text-align: left;
+      cursor: pointer;
+      font-family: var(--font-body);
+    }
+
+    .nav-item:hover {
+      background: var(--surface-3);
+      color: var(--text-primary);
+    }
+
+    .nav-item.active {
+      background: var(--accent-subtle);
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .nav-icon {
+      width: 20px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    /* ========== Project Cards ========== */
+    .project-card {
+      background: var(--surface-2);
+      border: 1px solid var(--surface-4);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      transition: all 0.3s ease;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .project-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--accent) 0%, var(--emerald) 100%);
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .project-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }
+
+    .project-card:hover::before {
+      opacity: 1;
+    }
+
+    .project-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: var(--space-md);
+    }
+
+    .project-icon-wrapper {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 48px;
+      height: 48px;
+      border-radius: var(--radius-circle);
+      background: var(--accent-subtle);
+      color: var(--accent);
+    }
+
+    .project-title {
+      font-size: 1.125rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin: var(--space-md) 0 var(--space-xs);
+    }
+
+    .project-desc {
+      color: var(--text-tertiary);
+      font-size: 0.875rem;
+      line-height: 1.6;
+      margin-bottom: var(--space-lg);
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: var(--space-md);
+      margin-bottom: var(--space-lg);
+    }
+
+    .metric {
+      background: var(--surface-3);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+    }
+
+    .metric-label {
+      color: var(--text-tertiary);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+
+    .metric-value {
+      color: var(--text-primary);
+      font-size: 1.5rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+
+    .metric-unit {
+      font-size: 0.875rem;
+      color: var(--text-tertiary);
+      font-weight: 400;
+      margin-left: 0.25rem;
+    }
+
+    /* ========== Stat Tiles ========== */
+    .stat-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--space-lg);
+      margin-bottom: var(--space-xl);
+    }
+
+    .stat-tile {
+      background: var(--surface-2);
+      border: 1px solid var(--surface-4);
+      border-radius: var(--radius-lg);
+      padding: var(--space-lg);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-sm);
+    }
+
+    .stat-tile-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .stat-tile-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border-radius: var(--radius-md);
+      background: var(--accent-subtle);
+      color: var(--accent);
+    }
+
+    .stat-tile-label {
+      color: var(--text-tertiary);
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+
+    .stat-tile-value {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat-tile-change {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--emerald);
+    }
+
+    .stat-tile-change.negative {
+      color: var(--error);
+    }
+
+    /* ========== Attention Panel ========== */
+    .attention-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-md);
+    }
+
+    .attention-item {
+      background: var(--surface-3);
+      border: 1px solid var(--surface-5);
+      border-left: 3px solid var(--warning);
+      border-radius: var(--radius-md);
+      padding: var(--space-md);
+      display: flex;
+      gap: var(--space-md);
+      align-items: flex-start;
+    }
+
+    .attention-item-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border-radius: var(--radius-circle);
+      background: rgba(251, 191, 36, 0.15);
+      color: var(--warning);
+      flex-shrink: 0;
+    }
+
+    .attention-item-content h4 {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 0.25rem;
+    }
+
+    .attention-item-content p {
+      font-size: 0.8125rem;
+      color: var(--text-tertiary);
+      line-height: 1.6;
+    }
+
+    /* ========== Trading Sections ========== */
+    .trading-nav {
+      display: flex;
+      gap: var(--space-xs);
+      background: var(--surface-2);
+      border-radius: var(--radius-pill);
+      padding: 0.375rem;
+      margin-bottom: var(--space-xl);
+    }
+
+    .trading-nav button {
+      flex: 1;
+      padding: 0.75rem 1.5rem;
+      border: 0;
+      background: transparent;
+      color: var(--text-secondary);
+      border-radius: var(--radius-pill);
+      font-weight: 600;
+      font-size: 0.9375rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      font-family: var(--font-body);
+    }
+
+    .trading-nav button:hover {
+      color: var(--text-primary);
+    }
+
+    .trading-nav button.active {
+      background: var(--accent);
+      color: var(--surface-0);
+    }
+
+    /* ========== Responsive ========== */
+    @media (max-width: 960px) {
+      .grid-2, .grid-3 {
+        grid-template-columns: 1fr;
+      }
+
+      .grid-sidebar {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid var(--surface-4);
+      }
+
+      .container {
+        padding: var(--space-lg);
+      }
+    }
+
+    /* ========== Demo Content ========== */
+    .demo-main {
+      padding: var(--space-xl);
+      background: var(--surface-0);
+      overflow-y: auto;
+    }
+
+    .color-palette {
+      display: flex;
+      gap: var(--space-sm);
+      margin: var(--space-lg) 0;
+    }
+
+    .color-swatch {
+      flex: 1;
+      height: 80px;
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      border: 1px solid var(--surface-4);
+    }
+
+    .component-showcase {
+      display: grid;
+      gap: var(--space-2xl);
+      margin-top: var(--space-2xl);
+    }
+
+    .showcase-section {
+      background: var(--surface-1);
+      border: 1px solid var(--surface-4);
+      border-radius: var(--radius-lg);
+      padding: var(--space-xl);
+    }
+
+    .showcase-section h2 {
+      margin-bottom: var(--space-lg);
+      padding-bottom: var(--space-md);
+      border-bottom: 1px solid var(--surface-4);
+    }
+
+    .button-row {
+      display: flex;
+      gap: var(--space-md);
+      flex-wrap: wrap;
+      margin-top: var(--space-lg);
+    }
+
+    .badge-row {
+      display: flex;
+      gap: var(--space-md);
+      flex-wrap: wrap;
+      margin-top: var(--space-lg);
+    }
+
+    /* SVG Icons */
+    .icon {
+      width: 20px;
+      height: 20px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
+    code {
+      background: var(--surface-3);
+      color: var(--accent);
+      padding: 0.25rem 0.5rem;
+      border-radius: 0.25rem;
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+    }
+
+    pre {
+      background: var(--surface-3);
+      border: 1px solid var(--surface-5);
+      border-radius: var(--radius-md);
+      padding: var(--space-lg);
+      overflow-x: auto;
+      margin: var(--space-lg) 0;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="preview-header">
+    <h1>集序工作台 · 设计重构</h1>
+    <p>深色主题，流畅交互，统一的设计语言</p>
+  </div>
+
+  <div class="container">
+    <h2 class="section-title">设计系统 / Design Tokens</h2>
+
+    <div class="showcase-section">
+      <h2>配色方案</h2>
+      <p style="color: var(--text-secondary); margin-bottom: var(--space-lg);">
+        深色阶梯式表面，青色主色调（数据/交易领域），翠绿辅助色
+      </p>
+
+      <h3 style="margin-top: var(--space-xl); margin-bottom: var(--space-md); color: var(--text-secondary); font-size: 0.875rem;">Surface Layers</h3>
+      <div class="color-palette">
+        <div class="color-swatch" style="background: var(--surface-0);">surface-0</div>
+        <div class="color-swatch" style="background: var(--surface-1);">surface-1</div>
+        <div class="color-swatch" style="background: var(--surface-2);">surface-2</div>
+        <div class="color-swatch" style="background: var(--surface-3);">surface-3</div>
+        <div class="color-swatch" style="background: var(--surface-4);">surface-4</div>
+        <div class="color-swatch" style="background: var(--surface-5);">surface-5</div>
+      </div>
+
+      <h3 style="margin-top: var(--space-xl); margin-bottom: var(--space-md); color: var(--text-secondary); font-size: 0.875rem;">Accent Colors</h3>
+      <div class="color-palette">
+        <div class="color-swatch" style="background: var(--accent); color: var(--surface-0);">Cyan Accent</div>
+        <div class="color-swatch" style="background: var(--emerald); color: var(--surface-0);">Emerald</div>
+        <div class="color-swatch" style="background: var(--warning); color: var(--surface-0);">Warning</div>
+        <div class="color-swatch" style="background: var(--error); color: var(--surface-0);">Error</div>
+      </div>
+
+      <pre><code>--surface-0: #05080C; /* 基础背景 */
+--surface-2: #0F151C; /* 卡片背景 */
+--surface-4: #1E2831; /* 边框 */
+--accent: #38BDF8;    /* 主色调 */
+--emerald: #6EE7B7;   /* 成功/增长 */</code></pre>
+    </div>
+
+    <div class="showcase-section">
+      <h2>组件展示</h2>
+
+      <h3 style="margin-top: var(--space-lg); margin-bottom: var(--space-md);">按钮 / Buttons</h3>
+      <div class="button-row">
+        <button class="button button-primary">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14m7-7H5"/></svg>
+          添加项目
+        </button>
+        <button class="button button-secondary">查看详情</button>
+        <button class="button button-secondary">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/><path d="M9 12l2 2 4-4"/></svg>
+          检查连接
+        </button>
+      </div>
+
+      <h3 style="margin-top: var(--space-2xl); margin-bottom: var(--space-md);">状态标记 / Status Badges</h3>
+      <div class="badge-row">
+        <div class="badge badge-online">
+          <div class="status-dot"></div>
+          运行中
+        </div>
+        <div class="badge badge-warning">
+          <div class="status-dot"></div>
+          连接超时
+        </div>
+        <div class="badge badge-offline">
+          <div class="status-dot"></div>
+          离线
+        </div>
+      </div>
+    </div>
+
+    <h2 class="section-title">界面预览 / UI Mockups</h2>
+
+    <div class="showcase-section">
+      <h2>主界面布局</h2>
+      <div class="grid-sidebar" style="height: 600px; border: 1px solid var(--surface-4); border-radius: var(--radius-lg); overflow: hidden;">
+        <aside class="sidebar">
+          <div class="brand">
+            <div class="brand-mark">
+              <div></div>
+              <div></div>
+              <div></div>
+              <div></div>
+            </div>
+            <span>集序</span>
+          </div>
+
+          <nav style="display: flex; flex-direction: column; gap: 0.25rem;">
+            <button class="nav-item active">
+              <svg class="icon nav-icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+              总览
+            </button>
+            <button class="nav-item">
+              <svg class="icon nav-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+              交易
+            </button>
+            <button class="nav-item">
+              <svg class="icon nav-icon" viewBox="0 0 24 24"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+              Aster 交易
+            </button>
+            <button class="nav-item">
+              <svg class="icon nav-icon" viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+              市场监控
+            </button>
+            <button class="nav-item">
+              <svg class="icon nav-icon" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v16"/></svg>
+              资产账本
+            </button>
+          </nav>
+        </aside>
+
+        <main class="demo-main">
+          <h1 style="margin-bottom: var(--space-md);">项目总览</h1>
+          <p style="color: var(--text-secondary); margin-bottom: var(--space-2xl);">先看当前状态，再进入需要处理的项目</p>
+
+          <div class="stat-row">
+            <div class="stat-tile">
+              <div class="stat-tile-header">
+                <div class="stat-tile-icon">
+                  <svg class="icon" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                </div>
+              </div>
+              <div class="stat-tile-label">活跃项目</div>
+              <div class="stat-tile-value">6</div>
+              <div class="stat-tile-change">+2 本周</div>
+            </div>
+
+            <div class="stat-tile">
+              <div class="stat-tile-header">
+                <div class="stat-tile-icon">
+                  <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+                </div>
+              </div>
+              <div class="stat-tile-label">运行时长</div>
+              <div class="stat-tile-value">24h</div>
+              <div class="stat-tile-change">无故障</div>
+            </div>
+
+            <div class="stat-tile">
+              <div class="stat-tile-header">
+                <div class="stat-tile-icon">
+                  <svg class="icon" viewBox="0 0 24 24"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+                </div>
+              </div>
+              <div class="stat-tile-label">资产总额</div>
+              <div class="stat-tile-value">$127.5K</div>
+              <div class="stat-tile-change">+3.2%</div>
+            </div>
+          </div>
+
+          <h2 style="margin-bottom: var(--space-lg);">项目工作区</h2>
+          <div class="grid grid-3">
+            <div class="project-card">
+              <div class="project-header">
+                <div class="project-icon-wrapper">
+                  <svg class="icon" viewBox="0 0 24 24"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
+                </div>
+                <div class="badge badge-online">
+                  <div class="status-dot"></div>
+                  运行中
+                </div>
+              </div>
+              <h3 class="project-title">Aster 交易工作台</h3>
+              <p class="project-desc">实时监控交易执行，管理多账户策略</p>
+              <div class="metrics-grid">
+                <div class="metric">
+                  <div class="metric-label">持仓总额</div>
+                  <div class="metric-value">
+                    $45.2K
+                    <span class="metric-unit">USD</span>
+                  </div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">今日盈亏</div>
+                  <div class="metric-value" style="color: var(--emerald);">
+                    +$1.2K
+                  </div>
+                </div>
+              </div>
+              <button class="button button-primary" style="width: 100%;">进入项目</button>
+            </div>
+
+            <div class="project-card">
+              <div class="project-header">
+                <div class="project-icon-wrapper">
+                  <svg class="icon" viewBox="0 0 24 24"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+                </div>
+                <div class="badge badge-online">
+                  <div class="status-dot"></div>
+                  运行中
+                </div>
+              </div>
+              <h3 class="project-title">市场监控</h3>
+              <p class="project-desc">追踪价格变化，捕捉套利机会</p>
+              <div class="metrics-grid">
+                <div class="metric">
+                  <div class="metric-label">监控品种</div>
+                  <div class="metric-value">24</div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">价格更新</div>
+                  <div class="metric-value">
+                    2s
+                    <span class="metric-unit">前</span>
+                  </div>
+                </div>
+              </div>
+              <button class="button button-primary" style="width: 100%;">进入项目</button>
+            </div>
+
+            <div class="project-card">
+              <div class="project-header">
+                <div class="project-icon-wrapper">
+                  <svg class="icon" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v16"/></svg>
+                </div>
+                <div class="badge badge-warning">
+                  <div class="status-dot"></div>
+                  同步中
+                </div>
+              </div>
+              <h3 class="project-title">资产账本</h3>
+              <p class="project-desc">汇总所有账户，记录资产变化</p>
+              <div class="metrics-grid">
+                <div class="metric">
+                  <div class="metric-label">表内总额</div>
+                  <div class="metric-value">
+                    $127.5K
+                    <span class="metric-unit">USD</span>
+                  </div>
+                </div>
+                <div class="metric">
+                  <div class="metric-label">最近同步</div>
+                  <div class="metric-value">
+                    15m
+                    <span class="metric-unit">前</span>
+                  </div>
+                </div>
+              </div>
+              <button class="button button-primary" style="width: 100%;">进入项目</button>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <div class="showcase-section">
+      <h2>交易模块</h2>
+      <div style="background: var(--surface-0); border: 1px solid var(--surface-4); border-radius: var(--radius-lg); padding: var(--space-xl);">
+        <div class="trading-nav">
+          <button class="active">
+            <svg class="icon" style="width: 16px; height: 16px; margin-right: 4px;" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v16"/></svg>
+            交易所仓位
+          </button>
+          <button>
+            <svg class="icon" style="width: 16px; height: 16px; margin-right: 4px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+            原油四腿套利
+          </button>
+        </div>
+
+        <div class="stat-row">
+          <div class="stat-tile">
+            <div class="stat-tile-label">总持仓</div>
+            <div class="stat-tile-value">$45.2K</div>
+            <div class="stat-tile-change">3 个交易所</div>
+          </div>
+
+          <div class="stat-tile">
+            <div class="stat-tile-label">今日盈亏</div>
+            <div class="stat-tile-value" style="color: var(--emerald);">+$1.2K</div>
+            <div class="stat-tile-change">+2.7%</div>
+          </div>
+
+          <div class="stat-tile">
+            <div class="stat-tile-label">活跃策略</div>
+            <div class="stat-tile-value">5</div>
+            <div class="stat-tile-change">运行正常</div>
+          </div>
+        </div>
+
+        <h3 style="margin-top: var(--space-2xl); margin-bottom: var(--space-lg);">当前关注</h3>
+        <div class="attention-list">
+          <div class="attention-item">
+            <div class="attention-item-icon">
+              <svg class="icon" style="width: 18px; height: 18px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+            </div>
+            <div class="attention-item-content">
+              <h4>Binance 资金费率异常</h4>
+              <p>BTC-PERP 资金费率达到 0.05%，建议关注持仓成本</p>
+            </div>
+          </div>
+
+          <div class="attention-item" style="border-left-color: var(--accent);">
+            <div class="attention-item-icon" style="background: rgba(56, 189, 248, 0.15); color: var(--accent);">
+              <svg class="icon" style="width: 18px; height: 18px;" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            </div>
+            <div class="attention-item-content">
+              <h4>原油价差扩大</h4>
+              <p>WTI-Brent 价差达到 $3.2，可考虑建立套利仓位</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h2 class="section-title">设计特点 / Design Highlights</h2>
+
+    <div class="showcase-section">
+      <h2>核心改进</h2>
+      <div class="grid grid-2" style="margin-top: var(--space-lg);">
+        <div class="card">
+          <h3 style="margin-bottom: var(--space-md);">🎨 统一的深色主题</h3>
+          <ul style="color: var(--text-secondary); line-height: 2; list-style: none;">
+            <li>• 阶梯式表面层次（6级深度）</li>
+            <li>• 青色主色调契合数据/交易场景</li>
+            <li>• 翠绿辅助色表示增长/成功</li>
+            <li>• 所有颜色通过 CSS 变量集中管理</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-bottom: var(--space-md);">📏 流畅的布局系统</h3>
+          <ul style="color: var(--text-secondary); line-height: 2; list-style: none;">
+            <li>• CSS Grid 主导页面框架</li>
+            <li>• 流式字体大小（clamp）</li>
+            <li>• 完全圆角设计（pill/circle tokens）</li>
+            <li>• 一致的间距节奏（spacing scale）</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-bottom: var(--space-md);">✨ 精致的交互</h3>
+          <ul style="color: var(--text-secondary); line-height: 2; list-style: none;">
+            <li>• 卡片悬停提升效果</li>
+            <li>• 按钮点击状态反馈</li>
+            <li>• 渐变色顶部装饰条</li>
+            <li>• 平滑的过渡动画</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-bottom: var(--space-md);">♿ 可访问性</h3>
+          <ul style="color: var(--text-secondary); line-height: 2; list-style: none;">
+            <li>• WCAG AA 级对比度</li>
+            <li>• 语义化 HTML 结构</li>
+            <li>• 键盘导航友好</li>
+            <li>• 响应式断点设计</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="showcase-section">
+      <h2>实现方式</h2>
+      <p style="color: var(--text-secondary); margin-bottom: var(--space-lg);">
+        采用 Design Tokens 方法，所有设计决策通过 CSS 自定义属性声明，组件只引用 token 而不硬编码值。
+      </p>
+
+      <pre><code>/* 声明 tokens */
+:root {
+  --surface-2: #0F151C;
+  --accent: #38BDF8;
+  --space-lg: 1.5rem;
+  --radius-lg: 1rem;
+}
+
+/* 组件消费 tokens */
+.card {
+  background: var(--surface-2);
+  padding: var(--space-lg);
+  border-radius: var(--radius-lg);
+}</code></pre>
+
+      <p style="color: var(--text-secondary); margin-top: var(--space-lg);">
+        这种方法让整个系统保持一致的视觉节奏，修改 token 值即可全局更新，避免重复硬编码。
+      </p>
+    </div>
+
+    <div style="text-align: center; margin: var(--space-2xl) 0; padding: var(--space-2xl); border-top: 1px solid var(--surface-4);">
+      <p style="color: var(--text-tertiary); font-size: 0.875rem;">
+        这是重构后的视觉效果预览。实际实现时会保留现有功能逻辑，只替换样式层。
+      </p>
+      <button class="button button-primary" style="margin-top: var(--space-lg);">
+        开始重构
+      </button>
+    </div>
+  </div>
+</body>
+</html>
