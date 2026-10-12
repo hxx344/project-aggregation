@@ -101,7 +101,12 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
     const resume = () => {
       setOffline(!navigator.onLine); setClock(value => value + 1);
       if (!navigator.onLine) { cancel(); setReading(false); }
-      else void load(true);
+      else {
+        // Delay polling to let SSH tunnel stabilize after tab switch
+        setTimeout(() => {
+          if (mounted.current) void load(true);
+        }, 1000);
+      }
     };
     const visible = () => { if (!document.hidden) resume(); };
     const timer = window.setInterval(() => { setClock(value => value + 1); void load(); }, 5000);

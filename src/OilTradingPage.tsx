@@ -200,7 +200,12 @@ export default function OilTradingPage({ cache, onExpired }: { cache: TradingCac
       setOffline(!navigator.onLine);
       setClock(value => value + 1);
       if (!navigator.onLine) { cancelRead(); setReading(false); cancelSources(); setSourcesLoading(false); }
-      else void load(true);
+      else {
+        // Delay polling to let SSH tunnel stabilize after tab switch
+        setTimeout(() => {
+          if (mounted.current) void load(true);
+        }, 1000);
+      }
     };
     const timer = window.setInterval(() => { setClock(value => value + 1); void load(); }, 5000);
     document.addEventListener('visibilitychange', resume);

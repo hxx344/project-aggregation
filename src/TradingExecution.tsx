@@ -149,7 +149,19 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
     mounted.current = true;
     let timer: ReturnType<typeof setTimeout>;
     const poll = () => { void load(); timer = setTimeout(poll, document.hidden ? 30_000 : 3000); };
-    const wake = () => { setOffline(!navigator.onLine); if (navigator.onLine && !document.hidden) { clearTimeout(timer); void load(true); timer = setTimeout(poll, 3000); } };
+    const wake = () => {
+      setOffline(!navigator.onLine);
+      if (navigator.onLine && !document.hidden) {
+        clearTimeout(timer);
+        // Delay polling to let SSH tunnel stabilize after tab switch
+        setTimeout(() => {
+          if (mounted.current) {
+            void load(true);
+            timer = setTimeout(poll, 3000);
+          }
+        }, 1000);
+      }
+    };
     const disconnected = () => { setOffline(true); readController.current?.abort(); };
     poll();
     const clock = setInterval(() => setClock(value => value + 1), 3000);
