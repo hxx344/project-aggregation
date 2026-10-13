@@ -39,22 +39,28 @@ if (!child) {
 
 const dataDir = resolve(process.argv[3]);
 assert.equal(resolve(process.env.ASSET_DATA_DIR), dataDir);
-const gateUrl = 'https://api.gateio.ws/api/v4/wallet/total_balance?currency=USD';
+const gateUrl = 'https://api.gateio.ws/api/v4/wallet/total_balance?currency=USDT';
+const primaryQuoteUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd&include_last_updated_at=true';
+const fallbackQuoteUrl = 'https://api.coinbase.com/v2/exchange-rates?currency=USDT';
+const usdtUsd = 0.98;
+const expectedUsd = 125.5 * usdtUsd;
 const credentials = { exchange: 'gate', apiKey: 'synthetic-gate-key', apiSecret: 'synthetic-gate-secret' };
 const replacement = { exchange: 'gate', apiKey: 'synthetic-gate-key-replacement', apiSecret: 'synthetic-gate-secret-replacement' };
 const secrets = [credentials.apiKey, credentials.apiSecret, replacement.apiKey, replacement.apiSecret];
 const sensitiveDetails = secrets.join(' ') + ' signature=private-signature https://evil.example signed-request';
 const emptyHash = createHash('sha512').update('').digest('hex');
 const payload = {
-  total: { amount: '125.50', currency: 'USD' },
-  details: { spot: { amount: '100', currency: 'USD' }, futures: { amount: '25.50', currency: 'USD' } },
+  total: { amount: '125.50', currency: 'USDT' },
+  details: { spot: { amount: '100', currency: 'USDT' }, futures: { amount: '25.50', currency: 'USDT' } },
 };
 let gateFailure = null;
+let quoteFailure = false;
 let gateCalls = 0;
+let quoteCalls = 0;
 let externalFailures = 0;
 const transportViolations = [];
 
-// No fallback to native fetch: every non-Gate external request fails locally.
+// No fallback to native fetch: only Gate and its dedicated quote receive fixtures.
 // Record assertion failures separately because production readers sanitize them.
 globalThis.fetch = async (input, init = {}) => {
   try {
@@ -65,7 +71,20 @@ globalThis.fetch = async (input, init = {}) => {
     if (url.hostname !== 'api.gateio.ws') {
       assert.equal(headers.get('KEY'), null, 'Gate credentials must not reach quote providers');
       assert.equal(headers.get('SIGN'), null, 'Gate signatures must not reach quote providers');
+      assert.equal(headers.get('Timestamp'), null, 'Gate authentication timestamps must not reach quote providers');
       for (const secret of secrets) assert.ok(!url.href.includes(secret), 'Credentials must not appear in a request URL');
+      if ([primaryQuoteUrl, fallbackQuoteUrl].includes(url.href)) {
+        quoteCalls++;
+        assert.equal(method, 'GET');
+        assert.equal(init.redirect ?? request?.redirect, 'manual');
+        assert.equal(init.cache ?? request?.cache, 'no-store');
+        assert.equal(init.body ?? request?.body ?? undefined, undefined);
+        assert.deepEqual([...headers.keys()], ['accept']);
+        assert.equal(headers.get('Accept'), 'application/json');
+        if (quoteFailure) return new Response(sensitiveDetails, { status: 503 });
+        assert.equal(url.href, primaryQuoteUrl, 'Fresh primary pricing must not request the backup');
+        return Response.json({ tether: { usd: usdtUsd, last_updated_at: Math.floor(Date.now() / 1000) } });
+      }
       externalFailures++;
       return new Response('', { status: 503 });
     }
@@ -83,7 +102,7 @@ globalThis.fetch = async (input, init = {}) => {
     assert.match(timestamp, /^\d+$/);
     assert.ok(Math.abs(Date.now() - Number(timestamp) * 1000) < 30_000);
     const expected = createHmac('sha512', signedWith.apiSecret)
-      .update(['GET', '/api/v4/wallet/total_balance', 'currency=USD', emptyHash, timestamp].join('\n')).digest('hex');
+      .update(['GET', '/api/v4/wallet/total_balance', 'currency=USDT', emptyHash, timestamp].join('\n')).digest('hex');
     assert.equal(headers.get('SIGN'), expected, 'Sign the exact method, path, query, empty payload hash and timestamp');
     for (const secret of secrets) assert.ok(!url.href.includes(secret));
     // Return a rejected promise without awaiting it so this intentional transport
@@ -173,17 +192,18 @@ function balanceUnchanged(actual, expected) {
   for (const key of ['id', 'quantity', 'price', 'value', 'details', 'updatedAt']) assert.deepEqual(actual[key], expected[key], `Preserve Gate ${key}`);
 }
 function assertBalance(asset, since) {
-  assert.equal(asset.value, 125.5);
-  assert.equal(asset.quantity, 125.5);
+  assert.equal(asset.value, expectedUsd);
+  assert.equal(asset.quantity, expectedUsd);
   assert.equal(asset.price, 1);
   assert.ok(!asset.error);
-  assert.ok(Date.parse(asset.updatedAt) >= since && Date.parse(asset.updatedAt) <= Date.now(), 'Use local retrieval time');
+  assert.ok(Date.parse(asset.updatedAt) >= Math.floor(since / 1000) * 1000 && Date.parse(asset.updatedAt) <= Date.now(), 'Use the older of account retrieval and quote time');
   assert.equal(asset.details.length, 2);
-  assert.deepEqual(asset.details.map(detail => detail.value).sort((a, b) => a - b), [25.5, 100]);
+  assert.deepEqual(asset.details.map(detail => detail.quantity).sort((a, b) => a - b), [25.5, 100]);
+  assert.deepEqual(asset.details.map(detail => detail.value).sort((a, b) => a - b), [25.5 * usdtUsd, 100 * usdtUsd]);
   for (const detail of asset.details) {
-    assert.equal(detail.coin, 'USD');
-    assert.equal(detail.quantity, detail.value);
-    assert.equal(detail.price, 1);
+    assert.equal(detail.coin, 'USDT');
+    assert.equal(detail.value, detail.quantity * usdtUsd);
+    assert.equal(detail.price, usdtUsd);
   }
 }
 
@@ -233,11 +253,25 @@ try {
   }
 
   gateFailure = null;
+  assert.equal(quoteCalls, 0, 'An invalid Gate response must not trigger a public quote');
+  quoteFailure = true;
+  const firstQuoteFailure = await rejected('/api/connections', { method: 'POST', body: credentials });
+  assert.match(firstQuoteFailure.error, /^Gate .*USDT\/USD/);
+  assert.match(firstQuoteFailure.error, /保留|未更新/);
+  assert.equal(gateCalls, ++expectedGateCalls);
+  assert.equal(quoteCalls, 2, 'Unavailable primary and backup prices must not become a one-dollar rate');
+  assert.equal(storedCredential(), undefined, 'A missing conversion rate must not save a first credential');
+  assert.deepEqual(storedAssets(), originalAssets, 'A missing conversion rate must not create a first asset');
+  const firstQuoteLedger = await success('/api/ledger');
+  assert.equal(firstQuoteLedger.connections.gate.configured, false);
+  assert.equal(firstQuoteLedger.connections.gate.lastSync, null);
+  quoteFailure = false;
   let since = Date.now();
   let ledger = await success('/api/connections', { method: 'POST', body: credentials });
   assert.equal(gateCalls, ++expectedGateCalls);
   let asset = gateAsset(ledger);
   assertBalance(asset, since);
+  assertBalance(JSON.parse(storedAssets().find(row => row.id === asset.id).data), since);
   assert.equal(ledger.assets.length, initial.assets.length + 1);
   assert.equal(ledger.connections.gate.configured, true);
   const createdId = asset.id;
@@ -276,6 +310,19 @@ try {
     assert.equal(afterReplacementFailure.connections.gate.lastSync, lastSync);
   }
 
+  gateFailure = null;
+  quoteFailure = true;
+  const beforeReplacementQuotes = quoteCalls;
+  const replacementQuoteFailure = await rejected('/api/connections', { method: 'POST', body: replacement });
+  assert.match(replacementQuoteFailure.error, /^Gate .*USDT\/USD/);
+  assert.equal(gateCalls, ++expectedGateCalls);
+  assert.equal(quoteCalls, beforeReplacementQuotes + 2);
+  assert.deepEqual(storedCredential(), savedConnection, 'Failed pricing must preserve the previous encrypted credentials');
+  const afterReplacementQuoteFailure = await success('/api/ledger');
+  balanceUnchanged(gateAsset(afterReplacementQuoteFailure), asset);
+  assert.equal(afterReplacementQuoteFailure.connections.gate.lastSync, lastSync);
+  quoteFailure = false;
+
   for (const [failure, checks] of [
     [{ status: 403, label: 'INVALID_SIGNATURE' }, [/HTTP 403.*INVALID_SIGNATURE/, /同一组|配对/]],
     [{ status: 400, label: 'BAD_REQUEST' }, [/HTTP 400.*BAD_REQUEST/]],
@@ -294,6 +341,20 @@ try {
   }
 
   gateFailure = null;
+  quoteFailure = true;
+  clearRefreshThrottle();
+  const beforeRefreshQuotes = quoteCalls;
+  ledger = await success('/api/sync', { method: 'POST', body: {} });
+  assert.equal(gateCalls, ++expectedGateCalls);
+  assert.equal(quoteCalls, beforeRefreshQuotes + 2);
+  balanceUnchanged(gateAsset(ledger), asset);
+  balanceUnchanged(JSON.parse(storedAssets().find(row => row.id === asset.id).data), asset);
+  assert.match(gateAsset(ledger).status, /失败.*旧值/);
+  assert.match(gateAsset(ledger).error, /^Gate .*USDT\/USD/);
+  assert.equal(gateAsset(ledger).error, ledger.connections.gate.error);
+  assert.equal(ledger.connections.gate.lastSync, lastSync, 'Missing pricing must preserve the last successful sync time');
+  assert.deepEqual(storedCredential(), savedConnection);
+  quoteFailure = false;
   clearRefreshThrottle();
   const beforeQuoteFailures = externalFailures;
   since = Date.now();
@@ -326,7 +387,7 @@ try {
     assert.equal(gateCalls, ++expectedGateCalls);
     assert.equal(gateAsset(ledger).id, manual.id, 'Adopt the existing manual alias row');
     assert.equal(ledger.assets.length, initial.assets.length + 1);
-    assert.equal(gateAsset(ledger).value, 125.5);
+    assert.equal(gateAsset(ledger).value, expectedUsd);
     ledger = await success('/api/connections', { method: 'DELETE', body: { exchange: 'gate' } });
   }
 
@@ -364,11 +425,11 @@ try {
   balanceUnchanged({ ...importedAsset, id: asset.id }, asset);
   assert.equal(ledger.connections.gate.configured, true);
   assert.deepEqual(storedCredential(), beforeImportConnection);
-  assert.equal(gateAsset(await success('/api/ledger')).value, 125.5);
+  assert.equal(gateAsset(await success('/api/ledger')).value, expectedUsd);
   assert.ok(existsSync(join(dataDir, 'backups', imported.backupName)));
   assert.equal(gateCalls, expectedGateCalls, 'Import must preserve balances without querying Gate');
   assert.deepEqual(transportViolations, [], 'All outbound Gate requests must satisfy the signed GET contract');
-  console.log('Gate production smoke passed: signed JSON GET, safe HTTP 400 response diagnostics, encrypted credentials, atomic connect/replace, independent refresh, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
+  console.log('Gate production smoke passed: signed USDT GET, non-parity USD conversion, safe HTTP and quote diagnostics, encrypted credentials, atomic connect/replace, independent pricing, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

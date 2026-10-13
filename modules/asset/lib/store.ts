@@ -146,7 +146,7 @@ export async function connect(owner:string,input:Credentials){
     })();
     const now=new Date().toISOString();
     const updatedAt='updatedAt' in result?result.updatedAt:now;
-    const next={...asset,mode:input.exchange,quantity:result.total,price:1,value:result.total,status:input.exchange==='variational'||input.exchange==='gate'?'只读同步 · 获取时间':'只读同步',updatedAt,error:undefined,details:result.details};
+    const next={...asset,mode:input.exchange,quantity:result.total,price:1,value:result.total,status:input.exchange==='gate'?'只读同步 · 估值时间':input.exchange==='variational'?'只读同步 · 获取时间':'只读同步',updatedAt,error:undefined,details:result.details};
     const status={configured:true,lastSync:now,error:null,scope:ledger.connections[input.exchange].scope,...(input.exchange==='variational'?{}:{label:input.apiKey.slice(-4)})};
     // Persist a verified connection and its balance together; failed verification changes neither.
     await db().batch([
@@ -292,9 +292,9 @@ export async function refresh(owner:string){
       try{
         if(!asset)throw new Error('Gate 资产记录不存在，请更新连接');
         const credentials=await unseal(row.encrypted,owner+':gate');
-        // Gate returns USD estimates directly; public quote failures must not block this read.
+        // Gate USDT estimates require a valid dedicated USDT/USD quote before saving.
         const result=await syncGate(credentials),now=new Date().toISOString();
-        await saveAsset(owner,{...asset,quantity:result.total,price:1,value:result.total,details:result.details,updatedAt:result.updatedAt,status:'只读同步 · 获取时间',error:undefined});
+        await saveAsset(owner,{...asset,quantity:result.total,price:1,value:result.total,details:result.details,updatedAt:result.updatedAt,status:'只读同步 · 估值时间',error:undefined});
         await setting(owner,'gate-status',{...ledger.connections.gate,lastSync:now,error:null});
       }catch(e){
         const error=e instanceof Error&&e.message.startsWith('Gate ')?e.message:'Gate 同步失败，请更新连接或稍后重试；已保留上次数据';

@@ -6,13 +6,13 @@
 
 ## 估值口径
 
-使用 Gate 的 `GET /api/v4/wallet/total_balance?currency=USD`。账本总额仅采用响应中的 `total.amount`；明细展示各账户折合 USD 的金额，既不把分项重复加到总额，也不另行加减保证金、浮动盈亏或借贷。金额是 Gate 官方估值，不代表实际 USD 持仓。覆盖范围以该接口为准，不自动汇总子账户；官方文档没有明确所有账户模式下总额与借贷、浮盈的计算公式，因此不将其标为净权益。
+使用 Gate 的 `GET /api/v4/wallet/total_balance?currency=USDT`。账本总额采用响应中的 `total.amount` 乘以 USDT/USD 汇率；明细保留各账户折合 USDT 的金额，同时显示换算后的美元价值。既不把分项重复加到总额，也不另行加减保证金、浮动盈亏或借贷。折合金额不代表实际 USDT 持仓。覆盖范围以该接口为准，不自动汇总子账户；官方文档没有明确所有账户模式下总额与借贷、浮盈的计算公式，因此不将其标为净权益。
 
-Gate 的余额与换算价格最多可能缓存 1 分钟，接口不提供源数据时刻；页面标注的是获取时间。Gate 同步独立于公共币价接口；读取失败或数据不完整时保留旧值及上次成功时间，并展示错误状态。金额和同步状态会进入账本快照、资产曲线及工作台首页摘要。
+Gate 的余额与内部换算价格最多可能缓存 1 分钟，接口不提供源数据时刻。平台只读取所需的 USDT/USD 行情，优先使用 CoinGecko；报价超过 15 分钟或超前 1 分钟时拒绝使用，并尝试 Coinbase。Coinbase 未提供源时间，采用获取时间。页面估值时间取账户获取时间与汇率时间中较早者，不按 USDT 与 USD 固定 1:1 处理。无有效汇率、账户读取失败或数据不完整时，保留旧值及上次成功时间，并展示错误状态。旧记录的折合币种以明细行内标识为准。金额和同步状态会进入账本快照、资产曲线及工作台首页摘要。
 
 ## 权限与支持范围
 
-本程序只向固定 Gate 官方地址发送上述 GET 请求，不提供交易、划转或提现操作。Gate 当前账户信息接口未提供可可靠核验当前密钥完整权限的字段，因此连接成功只表示余额可读，不表示密钥的只读权限已自动核验。请在 Gate 控制台核对权限。
+本程序只向固定 Gate 官方地址发送上述认证 GET 请求，不提供交易、划转或提现操作。公开汇率请求不携带 Gate 密钥或签名。Gate 当前账户信息接口未提供可可靠核验当前密钥完整权限的字段，因此连接成功只表示余额可读，不表示密钥的只读权限已自动核验。请在 Gate 控制台核对权限。
 
 本次支持资产估值；Gate 密钥不进入工作台交易凭据导出或仓位读取目录。
 
@@ -22,7 +22,8 @@ Gate 的余额与换算价格最多可能缓存 1 分钟，接口不提供源数
 
 | 错误码或现象 | 检查内容 |
 | --- | --- |
-| `INVALID_PARAM_VALUE`、`INVALID_ARGUMENT`、`MISSING_REQUIRED_PARAM`、`INVALID_CURRENCY` | 请求参数被拒绝；平台固定使用官方支持的 `currency=USD`，反馈错误码检查接口兼容性，无需扩大 API 权限 |
+| `INVALID_PARAM_VALUE`、`INVALID_ARGUMENT`、`MISSING_REQUIRED_PARAM`、`INVALID_CURRENCY` | 请求参数被拒绝；平台使用 `currency=USDT`，反馈错误码检查接口兼容性，无需扩大 API 权限 |
+| `USDT/USD 汇率读取失败或已过期` | USDT 美元报价不可用；检查服务器到 CoinGecko、Coinbase 的连接后重试，不会把 USDT 数量直接计为美元 |
 | `INVALID_CONTENT_TYPE`、`NOT_ACCEPTABLE` | 平台按官方 SDK 显式发送 JSON 请求头；检查服务器代理是否改写请求头 |
 | `INVALID_PROTOCOL`、`INVALID_REQUEST_BODY`、`BAD_REQUEST`、`METHOD_NOT_ALLOWED`、`NOT_FOUND` | 请求格式、方法或地址被拒绝；反馈错误码检查 API 接入和代理配置 |
 | `ACCOUNT_EXCEPTION`、`MARGIN_BALANCE_EXCEPTION` | 在 Gate 核对账户或杠杆账户状态，持续出现时联系 Gate 支持 |

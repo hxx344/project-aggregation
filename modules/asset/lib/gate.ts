@@ -7,6 +7,9 @@ type Fetcher = typeof fetch;
 
 const BALANCE_PATH = '/api/v4/wallet/total_balance';
 const QUERY = 'currency=USDT';
+const COINGECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd&include_last_updated_at=true';
+const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDT';
+const QUOTE_FAILED = 'Gate USDT/USD 汇率读取失败或已过期；本次未更新资产数据';
 const EMPTY_PAYLOAD_HASH = createHash('sha512').update('').digest('hex');
 const ACCOUNT_NAMES = {
   cross_margin: '全仓杠杆账户',
@@ -145,7 +148,7 @@ function isObject(value: unknown): value is Json {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function usdAmount(account: unknown): number {
+function usdtAmount(account: unknown): number {
   if (!isObject(account)) throw new Error(INCOMPLETE);
   if (account.currency !== 'USDT') throw new Error('Gate 返回的估值币种不是 USDT；已保留上次数据');
   const amount = account.amount;
@@ -153,6 +156,65 @@ function usdAmount(account: unknown): number {
   const result = Number(amount);
   if (!Number.isFinite(result) || (result === 0 && /[1-9]/.test(amount))) throw new Error('Gate USDT 估值不是有效数值；已保留上次数据');
   return result === 0 ? 0 : result;
+}
+
+async function quoteJson(url: string, fetcher: Fetcher): Promise<Json> {
+  // Public pricing requests are constructed separately and never receive Gate headers.
+  const response = await fetcher(url, {
+    method: 'GET', headers: { Accept: 'application/json' },
+    redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(12000),
+  });
+  const limit = 128 * 1024;
+  if (!response.ok || response.redirected || Number(response.headers.get('content-length')) > limit || !response.body) {
+    void response.body?.cancel().catch(() => {});
+    throw new Error(QUOTE_FAILED);
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        void reader.cancel().catch(() => {});
+        throw new Error(QUOTE_FAILED);
+      }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const data: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (!isObject(data)) throw new Error(QUOTE_FAILED);
+  return data;
+}
+
+async function usdtQuote(fetcher: Fetcher): Promise<{ price: number; at: number }> {
+  try {
+    const data = await quoteJson(COINGECKO, fetcher);
+    const coin = data.tether;
+    if (!isObject(coin) || typeof coin.usd !== 'number' || !Number.isFinite(coin.usd) || coin.usd <= 0 || typeof coin.last_updated_at !== 'number') throw new Error(QUOTE_FAILED);
+    const at = coin.last_updated_at * 1000;
+    if (!Number.isSafeInteger(at) || at <= 0 || Date.now() - at > 900000 || at - Date.now() > 60000) throw new Error(QUOTE_FAILED);
+    return { price: coin.usd, at };
+  } catch {
+    try {
+      const data = await quoteJson(COINBASE, fetcher);
+      if (!isObject(data.data) || data.data.currency !== 'USDT' || !isObject(data.data.rates)) throw new Error(QUOTE_FAILED);
+      const rate = data.data.rates.USD;
+      if (typeof rate !== 'string' || !/^\d+(?:\.\d+)?$/.test(rate)) throw new Error(QUOTE_FAILED);
+      const price = Number(rate);
+      if (!Number.isFinite(price) || price <= 0) throw new Error(QUOTE_FAILED);
+      // Coinbase publishes no rate timestamp here; retain the local retrieval time.
+      return { price, at: Date.now() };
+    } catch { throw new Error(QUOTE_FAILED); }
+  }
+}
+
+function usdValue(quantity: number, price: number): number {
+  const value = quantity * price;
+  if (!Number.isFinite(value) || (value === 0 && quantity !== 0)) throw new Error('Gate 美元换算结果无效；本次未更新资产数据');
+  return value === 0 ? 0 : value;
 }
 
 export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher = fetch): Promise<Json> {
@@ -197,17 +259,25 @@ export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher 
 export async function syncGate(c: GateCredential, fetcher: Fetcher = fetch): Promise<{ total: number; details: Balance[]; updatedAt: string }> {
   // This GET reads balances only. Gate's account/detail contract cannot verify key permissions.
   const data = await gateGet(c, BALANCE_PATH, fetcher);
-  const total = usdAmount(data.total);
+  const fetchedAt = Date.now();
+  const quantity = usdtAmount(data.total);
   if (!isObject(data.details) || Object.keys(data.details).length === 0) throw new Error(INCOMPLETE);
   const details: Balance[] = [];
   let otherAccounts = 0;
   for (const [key, account] of Object.entries(data.details)) {
-    const value = usdAmount(account);
+    const amount = usdtAmount(account);
     // Account types are an open map. Preserve new accounts without reflecting upstream names.
     const name = Object.hasOwn(ACCOUNT_NAMES, key) ? ACCOUNT_NAMES[key as keyof typeof ACCOUNT_NAMES] : `其他账户 ${++otherAccounts}`;
-    details.push({ coin: 'USDT', account: `${name}（USDT 估值）`, quantity: value, price: 1, value });
+    details.push({ coin: 'USDT', account: `${name}（USDT 估值）`, quantity: amount, price: 0, value: 0 });
+  }
+  // Fetch only the required conversion after validating every account; USDT is not USD.
+  const quote = await usdtQuote(fetcher);
+  const total = usdValue(quantity, quote.price);
+  for (const detail of details) {
+    detail.price = quote.price;
+    detail.value = usdValue(detail.quantity, quote.price);
   }
   // Gate defines no net-equity formula here: never add P&L, subtract debt or sum details into total.
-  // There is no source timestamp; this is retrieval time, and Gate may cache values for one minute.
-  return { total, details, updatedAt: new Date().toISOString() };
+  // Gate may cache values for one minute. A new balance cannot refresh an older price timestamp.
+  return { total, details, updatedAt: new Date(Math.min(fetchedAt, quote.at)).toISOString() };
 }

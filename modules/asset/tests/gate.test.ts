@@ -6,13 +6,44 @@ import { connectionSchema } from '../lib/validation.ts';
 
 const credential: GateCredential = { apiKey: 'gate-fixture-key', apiSecret: 'gate-fixture-secret' };
 const balancePath = '/api/v4/wallet/total_balance';
+const primaryQuoteUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd&include_last_updated_at=true';
+const fallbackQuoteUrl = 'https://api.coinbase.com/v2/exchange-rates?currency=USDT';
 const emptyHash = 'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e';
 function account(amount: unknown = '0', currency: unknown = 'USDT') { return { amount, currency }; }
 function valuation() { return { total: account('120.5'), details: { spot: account('100'), finance: account('25.5'), futures: account('-5') } }; }
+function quote(price: unknown = 1, at: unknown = Math.floor(Date.now() / 1000)) { return { tether: { usd: price, last_updated_at: at } }; }
+function publicRequest(url: URL, init: RequestInit) {
+  assert.ok([primaryQuoteUrl, fallbackQuoteUrl].includes(url.href), 'Only fixed public quote endpoints are allowed');
+  assert.equal(init.method, 'GET');
+  assert.equal(init.redirect, 'manual');
+  assert.equal(init.cache, 'no-store');
+  assert.equal(init.body, undefined);
+  assert.ok(init.signal instanceof AbortSignal);
+  const headers = new Headers(init.headers);
+  assert.deepEqual([...headers.keys()], ['accept'], 'Gate headers must never reach public quote providers');
+  assert.equal(headers.get('Accept'), 'application/json');
+  for (const secret of Object.values(credential)) assert.equal(url.href.includes(secret), false);
+}
 function mock(handler: (url: URL, init: RequestInit) => unknown): typeof fetch {
-  return (async (url: RequestInfo | URL, init: RequestInit = {}) => Response.json(handler(new URL(String(url)), init))) as typeof fetch;
+  return (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    if (url.hostname !== 'api.gateio.ws') {
+      publicRequest(url, init);
+      assert.equal(url.href, primaryQuoteUrl);
+      return Response.json(quote());
+    }
+    return Response.json(handler(url, init));
+  }) as typeof fetch;
 }
 function response(value: unknown): typeof fetch { return mock(() => value); }
+function quotedResponse(value: unknown, handler: (url: URL, init: RequestInit) => Response | Promise<Response>): typeof fetch {
+  return (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    if (url.hostname === 'api.gateio.ws') return Response.json(value);
+    publicRequest(url, init);
+    return handler(url, init);
+  }) as typeof fetch;
+}
 const sensitive = Object.values(credential).join(' ') + ' signature=private-signature https://evil.example signed-request';
 function diagnostic(error: unknown, checks: readonly RegExp[] = []): boolean {
   assert.ok(error instanceof Error);
@@ -24,7 +55,18 @@ function diagnostic(error: unknown, checks: readonly RegExp[] = []): boolean {
   for (const check of checks) assert.match(error.message, check);
   return true;
 }
-function streamedResponse(chunks: Uint8Array[], headers: HeadersInit = {}) {
+function quoteDiagnostic(error: unknown): boolean {
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /^Gate /);
+  assert.match(error.message, /USDT\/USD/);
+  assert.match(error.message, /保留|未更新/);
+  for (const secret of [...Object.values(credential), 'signature=', 'private-signature', 'evil.example', 'signed-request']) {
+    assert.equal(error.message.includes(secret), false, 'Public quote failures must not expose untrusted details');
+  }
+  assert.doesNotMatch(error.message, /api\.coingecko\.com|api\.coinbase\.com|ENOTFOUND|timeout|network|aborted/i);
+  return true;
+}
+function streamedResponse(chunks: Uint8Array[], headers: HeadersInit = {}, status = 403) {
   let reads = 0, canceled = false;
   const body = new ReadableStream<Uint8Array>({
     pull(controller) {
@@ -33,7 +75,7 @@ function streamedResponse(chunks: Uint8Array[], headers: HeadersInit = {}) {
     },
     cancel() { canceled = true; },
   }, { highWaterMark: 0 });
-  return { response: new Response(body, { status: 403, headers }), reads: () => reads, canceled: () => canceled };
+  return { response: new Response(body, { status, headers }), reads: () => reads, canceled: () => canceled };
 }
 
 test('Gate connection credentials trim values and reject malformed or extra request fields', () => {
@@ -50,7 +92,7 @@ test('Gate connection credentials trim values and reject malformed or extra requ
 });
 
 test('Gate signs the exact fixed USDT GET using SHA512 and HMAC-SHA512 and sends credentials only in headers', async t => {
-  const now = 1791840123456;
+  const now = 1791840123000;
   t.mock.timers.enable({ apis: ['Date'], now });
   const controller = new AbortController();
   const timeoutCalls: number[] = [];
@@ -76,7 +118,7 @@ test('Gate signs the exact fixed USDT GET using SHA512 and HMAC-SHA512 and sends
     return valuation();
   }));
   assert.equal(calls.length, 1);
-  assert.deepEqual(timeoutCalls, [12000]);
+  assert.deepEqual(timeoutCalls, [12000, 12000]);
   assert.equal(result.total, 120.5);
   assert.deepEqual(result.details.map(row => row.value), [100, 25.5, -5]);
   assert.ok(result.details.every(row => row.coin === 'USDT' && row.quantity === row.value && row.price === 1));
@@ -116,15 +158,189 @@ test('Gate preserves every documented account and new account type with fixed sa
   for (const unsafe of unsafeNames) assert.equal(JSON.stringify(result).includes(unsafe), false);
 });
 
-test('Gate records retrieval time after a validated response, ignoring undocumented upstream timestamps', async t => {
-  const now = 1791840123456;
+test('Gate uses validated account retrieval time when it precedes the quote, ignoring undocumented upstream timestamps', async t => {
+  const now = 1791840123000;
   t.mock.timers.enable({ apis: ['Date'], now });
-  const result = await syncGate(credential, async () => {
+  const result = await syncGate(credential, async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.hostname !== 'api.gateio.ws') {
+      publicRequest(url, init);
+      return Response.json(quote(1, (now + 7000) / 1000));
+    }
     const response = Response.json(valuation());
     response.json = async () => { t.mock.timers.setTime(now + 6000); return { ...valuation(), ts: '1', updated_at: 'invalid' }; };
     return response;
   });
   assert.equal(result.updatedAt, new Date(now + 6000).toISOString());
+});
+
+test('Gate converts the official USDT total and each detail with a non-parity USD rate and preserves the older quote time', async t => {
+  const now = 1791840123000, quotedAt = now - 120000;
+  t.mock.timers.enable({ apis: ['Date'], now });
+  const calls: string[] = [];
+  const result = await syncGate(credential, quotedResponse({
+    total: { ...account('100'), unrealised_pnl: '15', borrowed: '30' },
+    details: { spot: account('900'), futures: { ...account('200'), unrealised_pnl: '80' }, margin: account('-5') },
+  }, url => {
+    calls.push(url.href);
+    return Response.json(quote(0.98, quotedAt / 1000));
+  }));
+  assert.deepEqual(calls, [primaryQuoteUrl]);
+  assert.equal(result.total, 98, 'Convert total.amount once; never sum account details or add P&L');
+  assert.deepEqual(result.details.map(row => [row.coin, row.quantity, row.price, row.value]),
+    [900, 200, -5].map(quantity => ['USDT', quantity, 0.98, quantity * 0.98]));
+  assert.equal(result.updatedAt, new Date(quotedAt).toISOString());
+});
+
+test('Gate accepts only fresh positive numeric primary prices and does not manufacture a one-dollar rate', async t => {
+  const now = 1791840123000;
+  t.mock.timers.enable({ apis: ['Date'], now });
+  for (const at of [now - 900000, now + 60000]) {
+    const result = await syncGate(credential, quotedResponse(valuation(), url => {
+      assert.equal(url.href, primaryQuoteUrl, 'Valid freshness boundaries need no fallback');
+      return Response.json(quote(0.98, at / 1000));
+    }));
+    assert.equal(result.total, 120.5 * 0.98);
+    assert.equal(result.updatedAt, new Date(Math.min(now, at)).toISOString());
+  }
+  const invalid = [
+    null, [], {}, { tether: null },
+    ...[0, -1, Infinity, NaN, '1', null, false].map(price => quote(price, now / 1000)),
+    ...[undefined, null, '1791840123', 0, NaN, (now - 900001) / 1000, (now + 60001) / 1000]
+      .map(at => ({ tether: { usd: 0.98, last_updated_at: at } })),
+  ];
+  for (const primary of invalid) {
+    const calls: string[] = [];
+    await assert.rejects(syncGate(credential, quotedResponse(valuation(), url => {
+      calls.push(url.href);
+      return url.href === primaryQuoteUrl ? Response.json(primary) : new Response(sensitive, { status: 503 });
+    })), quoteDiagnostic);
+    assert.deepEqual(calls, [primaryQuoteUrl, fallbackQuoteUrl]);
+  }
+});
+
+test('Gate falls back once to Coinbase USDT-to-USD multiplication and keeps the account retrieval time', async t => {
+  const now = 1791840123000;
+  t.mock.timers.enable({ apis: ['Date'], now });
+  for (const invalidPrimary of [new Response(sensitive, { status: 503 }), Response.json(quote(1, (now - 901000) / 1000))]) {
+    t.mock.timers.setTime(now);
+    const calls: string[] = [];
+    const result = await syncGate(credential, quotedResponse(valuation(), url => {
+      calls.push(url.href);
+      if (url.href === primaryQuoteUrl) return invalidPrimary;
+      t.mock.timers.setTime(now + 5000);
+      return Response.json({ data: { currency: 'USDT', rates: { USD: '1.02' } } });
+    }));
+    assert.deepEqual(calls, [primaryQuoteUrl, fallbackQuoteUrl]);
+    assert.equal(result.total, 120.5 * 1.02);
+    assert.ok(result.details.every(row => row.price === 1.02 && row.value === row.quantity * 1.02));
+    assert.equal(result.updatedAt, new Date(now).toISOString());
+  }
+  const invalidFallbacks = [
+    null, [], {}, { data: { currency: 'USD', rates: { USD: '1.02' } } },
+    { data: { currency: 'USDT ', rates: { USD: '1.02' } } },
+    ...[undefined, null, 1, '', ' ', ' 1.02', '1.02 ', '-1', '0', '0x1', '+1', '1e3', 'Infinity', 'NaN', '9'.repeat(400), '0.' + '0'.repeat(400) + '1']
+      .map(rate => ({ data: { currency: 'USDT', rates: { USD: rate } } })),
+  ];
+  for (const fallback of invalidFallbacks) {
+    await assert.rejects(syncGate(credential, quotedResponse(valuation(), url =>
+      url.href === primaryQuoteUrl ? new Response(sensitive, { status: 503 }) : Response.json(fallback))), quoteDiagnostic);
+  }
+});
+
+test('Gate validates every account currency and amount before requesting a public quote', async () => {
+  for (const payload of [
+    { ...valuation(), total: account('10', 'USD') },
+    { ...valuation(), details: { spot: account('10'), futures: account('1', 'USD') } },
+    { ...valuation(), details: { spot: account('10'), futures: account('bad') } },
+  ]) {
+    let quoteCalls = 0;
+    await assert.rejects(syncGate(credential, quotedResponse(payload, () => {
+      quoteCalls++;
+      return Response.json(quote());
+    })), /币种不是 USDT|不是有效数值/);
+    assert.equal(quoteCalls, 0);
+  }
+});
+
+test('Gate bounds public quote bodies at 128 KiB and cancels declared or streamed excess', async () => {
+  const limit = 128 * 1024;
+  const base = { ...quote(0.98), padding: '' };
+  const body = Buffer.from(JSON.stringify({ ...base, padding: 'x'.repeat(limit - Buffer.byteLength(JSON.stringify(base))) }));
+  assert.equal(body.byteLength, limit);
+  const exact = streamedResponse([body], { 'content-length': String(limit) }, 200);
+  const result = await syncGate(credential, quotedResponse(valuation(), url => {
+    assert.equal(url.href, primaryQuoteUrl);
+    return exact.response;
+  }));
+  assert.equal(result.total, 120.5 * 0.98);
+  assert.equal(exact.canceled(), false);
+  for (const declared of [true, false]) {
+    const oversized = streamedResponse([body, Buffer.from(' '), Buffer.from(sensitive)],
+      declared ? { 'content-length': String(limit + 1) } : { 'content-length': '1' }, 200);
+    await assert.rejects(syncGate(credential, quotedResponse(valuation(), url =>
+      url.href === primaryQuoteUrl ? oversized.response : new Response(sensitive, { status: 503 }))), quoteDiagnostic);
+    assert.equal(oversized.reads(), declared ? 0 : 2);
+    assert.equal(oversized.canceled(), true);
+  }
+});
+
+test('Gate never follows public price redirects or exposes malformed and failed quote responses', async () => {
+  let bodyReads = 0;
+  const calls: string[] = [];
+  await assert.rejects(syncGate(credential, quotedResponse(valuation(), url => {
+    calls.push(url.href);
+    return new Response(new ReadableStream({ pull() { bodyReads++; } }, { highWaterMark: 0 }),
+      { status: 302, headers: { location: 'https://evil.example/' + credential.apiSecret } });
+  })), quoteDiagnostic);
+  assert.deepEqual(calls, [primaryQuoteUrl, fallbackQuoteUrl]);
+  assert.equal(bodyReads, 0);
+  for (const makeResponse of [
+    () => new Response('<html>' + sensitive),
+    () => new Response('{"broken":' + sensitive),
+    () => Response.json({ ...quote(), message: sensitive, tether: { usd: sensitive, last_updated_at: 1 } }),
+    () => { const result = Response.json(quote()); Object.defineProperty(result, 'redirected', { value: true }); return result; },
+  ]) {
+    await assert.rejects(syncGate(credential, quotedResponse(valuation(), () => makeResponse())), quoteDiagnostic);
+  }
+  await assert.rejects(syncGate(credential, quotedResponse(valuation(), () => {
+    throw new Error('network timeout aborted ' + sensitive, { cause: { code: 'ENOTFOUND', message: sensitive } });
+  })), quoteDiagnostic);
+});
+
+test('Gate gives each public quote request a 12-second abort signal and sanitizes aborted stream failures', async t => {
+  const controllers: AbortController[] = [];
+  const timeouts: number[] = [];
+  t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
+    timeouts.push(milliseconds);
+    const controller = new AbortController();
+    controllers.push(controller);
+    return controller.signal;
+  });
+  const calls: string[] = [];
+  await assert.rejects(syncGate(credential, quotedResponse(valuation(), (url, init) => {
+    calls.push(url.href);
+    const controller = controllers.at(-1)!;
+    assert.equal(init.signal, controller.signal);
+    return new Response(new ReadableStream({ pull(stream) {
+      controller.abort(new Error(sensitive));
+      stream.error(new Error(sensitive));
+    } }, { highWaterMark: 0 }));
+  })), quoteDiagnostic);
+  assert.deepEqual(calls, [primaryQuoteUrl, fallbackQuoteUrl]);
+  assert.deepEqual(timeouts, [12000, 12000, 12000]);
+  assert.notEqual(controllers[1].signal, controllers[2].signal);
+});
+
+test('Gate rejects overflow and nonzero-to-zero underflow in both converted totals and details', async () => {
+  for (const [amount, price] of [['9'.repeat(308), 2], ['0.' + '0'.repeat(199) + '1', 1e-200]] as const) {
+    for (const payload of [
+      { ...valuation(), total: account(amount) },
+      { ...valuation(), details: { spot: account('1'), futures: account(amount) } },
+    ]) {
+      await assert.rejects(syncGate(credential, quotedResponse(payload, () => Response.json(quote(price)))), /Gate.*美元.*无效/);
+    }
+  }
 });
 
 test('Gate rejects incomplete wrappers, total objects and detail structures instead of treating them as zero', async () => {
