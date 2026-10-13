@@ -27,6 +27,7 @@ export type UpdateJob = {
 
 export type UpdateState = {
   enabled: boolean;
+  githubToken?: { configured: boolean };
   reason?: string;
   checking: boolean;
   checkedAt: string | null;

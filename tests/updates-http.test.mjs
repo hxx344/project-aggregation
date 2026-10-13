@@ -23,10 +23,11 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-updates-http-'));
   const calls = [], jobs = [], handlers = {};
   let current = null, value = state();
-  const updatesClient = client || Object.fromEntries(['status', 'check', 'apply'].map(method => [method, async (...args) => {
+  const updatesClient = client || Object.fromEntries(['status', 'check', 'apply', 'token'].map(method => [method, async (...args) => {
     calls.push({ method, args });
     if (handlers[method]) return handlers[method](...args);
     if (method === 'apply') value = { ...value, job: job() };
+    if (method === 'token') value = { ...value, githubToken: { configured: !!args[0] } };
     return structuredClone(value);
   }]));
   const app = await createApp({ dataDir, initialPassword: PASSWORD, refreshInterval: 0, assetSyncIntervalMs: 0,
@@ -88,12 +89,12 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
 
 test('update HTTP routes require login, Origin and CSRF and accept only their fixed inputs', async t => {
   const f = await fixture(t);
-  for (const [route, method] of [[PREFIX, 'GET'], [`${PREFIX}/events`, 'GET'], [`${PREFIX}/check`, 'POST'], [`${PREFIX}/apply`, 'POST']]) {
+  for (const [route, method] of [[PREFIX, 'GET'], [`${PREFIX}/events`, 'GET'], [`${PREFIX}/check`, 'POST'], [`${PREFIX}/apply`, 'POST'], [`${PREFIX}/token`, 'POST']]) {
     assert.equal((await f.request(route, { method, ...(method === 'POST' ? { body: {} } : {}) })).status, 401);
   }
   await f.login();
-  for (const action of ['check', 'apply']) {
-    const body = action === 'check' ? {} : { planId };
+  for (const action of ['check', 'apply', 'token']) {
+    const body = action === 'check' ? {} : action === 'token' ? { token: 'github_pat_' + 'fixture'.repeat(6) } : { planId };
     for (const override of [{ originHeader: '' }, { originHeader: 'https://other.example' }, { csrfHeader: '' }, { csrfHeader: 'wrong' }]) {
       assert.equal((await f.request(`${PREFIX}/${action}`, { method: 'POST', body, ...override })).status, 403);
     }
@@ -117,7 +118,7 @@ test('update stream requires same-origin login, filters state, shares reads and 
   assert.equal((await f.request(`${PREFIX}/events`, { originHeader: 'https://other.example' })).status, 403);
   const crossSite = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, 'Sec-Fetch-Site': 'cross-site' } });
   assert.equal(crossSite.status, 403);
-  f.state = { ...f.state, command: 'private-command', modules: f.state.modules.map(row => ({ ...row, path: '/private/path' })) };
+  f.state = { ...f.state, command: 'private-command', token: 'private-token', githubToken: { configured: true, token: 'private-token' }, modules: f.state.modules.map(row => ({ ...row, path: '/private/path' })) };
   const abort = new AbortController(); t.after(() => abort.abort());
   const response = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, Origin: f.origin }, signal: abort.signal });
   assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /^text\/event-stream/);
@@ -125,6 +126,7 @@ test('update stream requires same-origin login, filters state, shares reads and 
   const reader = response.body.getReader(); let received = '';
   while (!received.includes('"snapshot"')) received += new TextDecoder().decode((await reader.read()).value);
   assert.equal(received.includes('private'), false);
+  assert.ok(received.includes('"githubToken":{"configured":true}'));
   assert.equal(f.calls.filter(row => row.method === 'status').length, 1);
   assert.equal(f.calls.filter(row => row.method !== 'status').length, 0);
   // A cached display snapshot must never satisfy the live-entry maintenance check.
@@ -348,4 +350,55 @@ test('logout while an apply body is arriving revokes authorization before the pr
   assert.equal((await f.request('/api/logout', { method: 'POST', body: {} })).status, 200);
   sender.end(JSON.stringify(planId) + '}');
   assert.equal(await response, 401); assert.equal(f.calls.length, 0); assert.equal(f.maintenance(), false);
+});
+
+test('token configuration uses the authenticated fixed route without entering trading maintenance', async t => {
+  const f = await fixture(t); await f.login();
+  const secret = 'github_pat_' + 'fixture'.repeat(6);
+  f.jobs.push({ id: 'existing-trading-job', status: 'running' });
+  for (const token of [secret, 'ghp_' + 'replacement'.repeat(4), '']) {
+    const result = await f.request(`${PREFIX}/token`, { method: 'POST', body: { token } });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.data.githubToken, { configured: !!token });
+    assert.equal(JSON.stringify(result.data).includes(secret), false);
+    assert.equal(result.headers.get('cache-control'), 'no-store');
+    assert.equal(f.maintenance(), false);
+    assert.equal(f.pendingPlanId(), null);
+  }
+  assert.deepEqual(f.calls.filter(call => call.method === 'token').map(call => call.args), [[secret], ['ghp_' + 'replacement'.repeat(4)], ['']]);
+  assert.equal(f.executionCalls.length, 0);
+  for (const body of [{}, { token: null }, { token: 1 }, { token: 'x' }, { token: secret + '\n' }, { token: 'a'.repeat(256) }, { token: secret, path: '/tmp/credential' }]) {
+    assert.equal((await f.request(`${PREFIX}/token`, { method: 'POST', body })).status, 400);
+  }
+  assert.equal((await f.request(`${PREFIX}/token?token=private`, { method: 'POST', body: { token: secret } })).status, 400);
+  for (const method of ['GET', 'PUT', 'DELETE']) assert.equal((await f.request(`${PREFIX}/token`, { method })).status, 404);
+  assert.equal(f.calls.filter(call => call.method === 'token').length, 3);
+});
+
+test('token failure cannot release an existing update maintenance latch', async t => {
+  const f = await fixture(t, { initialMaintenance: true, initialPendingPlanId: planId }); await f.login();
+  f.state = { ...f.state, job: job() };
+  f.handlers.token = () => { throw new UpdateError(409, '正在检查版本或执行更新，请完成后再修改 GitHub Token'); };
+  const result = await f.request(`${PREFIX}/token`, { method: 'POST', body: { token: '' } });
+  assert.equal(result.status, 409); assert.match(result.data.error, /Token/);
+  assert.equal(f.maintenance(), true);
+  assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
+  assert.equal(f.executionCalls.length, 0);
+});
+
+test('logout during a token request body prevents the privileged credential write', async t => {
+  const f = await fixture(t); await f.login();
+  let sender;
+  const response = new Promise((resolve, reject) => {
+    sender = http.request(f.origin + `${PREFIX}/token`, { method: 'POST', headers: {
+      Cookie: f.session.cookie, Origin: f.origin, 'X-CSRF-Token': f.session.csrf, 'Content-Type': 'application/json',
+    } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    sender.on('error', reject); sender.write('{"token":');
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await f.request('/api/logout', { method: 'POST', body: {} })).status, 200);
+  sender.end(JSON.stringify('github_pat_' + 'fixture'.repeat(6)) + '}');
+  assert.equal(await response, 401);
+  assert.equal(f.calls.filter(call => call.method === 'token').length, 0);
+  assert.equal(f.maintenance(), false);
 });

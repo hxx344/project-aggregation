@@ -383,7 +383,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         if (req.headers.origin) sameOrigin(req);
         updateStream.subscribe(res, current.id); return;
       }
-      const action = pathname === '/api/system/updates/check' ? 'check' : pathname === '/api/system/updates/apply' ? 'apply' : null;
+      const action = pathname === '/api/system/updates/check' ? 'check' : pathname === '/api/system/updates/apply' ? 'apply' : pathname === '/api/system/updates/token' ? 'token' : null;
       if (action && req.method === 'POST') {
         const body = await bodyOf(req); validateUpdateBody(action, body);
         const authorize = () => {
@@ -393,7 +393,10 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
           if (req.headers['x-csrf-token'] !== latest.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试');
         };
         authorize();
-        try { send(res, 202, action === 'check' ? await updates.check() : await updates.apply(body.planId, authorize)); }
+        try {
+          const state = action === 'check' ? await updates.check() : action === 'token' ? await updates.token(body.token, authorize) : await updates.apply(body.planId, authorize);
+          send(res, action === 'token' ? 200 : 202, state);
+        }
         finally { void updateStream.refresh(); }
         return;
       }

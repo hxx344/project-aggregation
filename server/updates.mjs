@@ -6,6 +6,9 @@ const MAINTENANCE = '系统正在更新或等待确认更新结果，暂不能�
 const ACTIVE = new Set(['queued', 'running']);
 const FINAL_EXECUTION = new Set(['completed', 'stopped']);
 const PLAN_ID = /^[A-Za-z0-9_-]{16,128}$/;
+const GITHUB_TOKEN = /^[A-Za-z0-9_]{20,255}$/;
+const TOKEN_BUSY = '正在检查版本或执行更新，请完成后再修改 GitHub Token';
+const TOKEN_INVALID = 'GitHub Token 格式无效，请粘贴完整 Token，且不要包含空格或换行';
 
 export class UpdateError extends Error {
   constructor(status, message, { uncertain = false } = {}) { super(message); this.status = status; this.uncertain = uncertain; }
@@ -28,6 +31,7 @@ export function publicUpdateState(value) {
     || !nullable(value.checkedAt, timestamp) || !nullable(value.checkError, text)
     || !nullable(value.planId, value => typeof value === 'string' && PLAN_ID.test(value)) || !nullable(value.expiresAt, timestamp)
     || !Array.isArray(value.modules) || value.modules.length > 32 || value.reason !== undefined && !text(value.reason)) invalid();
+  if (value.githubToken !== undefined && (!object(value.githubToken) || typeof value.githubToken.configured !== 'boolean')) invalid();
   const modules = value.modules.map(row => {
     if (!object(row) || !identifier(row.id) || !text(row.name, 120) || !['current', 'available', 'unavailable', 'unmanaged'].includes(row.state)
       || !['currentVersion', 'latestVersion', 'currentCommit', 'latestCommit'].every(key => nullable(row[key], value => text(value, 128)))
@@ -51,12 +55,15 @@ export function publicUpdateState(value) {
     job = { id: row.id, status: row.status, startedAt: row.startedAt, finishedAt: row.finishedAt, activeModule: row.activeModule, steps, message: row.message };
   }
   return { enabled: value.enabled, ...(value.reason === undefined ? {} : { reason: value.reason }), checking: value.checking,
-    checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job };
+    checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job,
+    ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }) };
 }
 
 export function validateUpdateBody(action, body) {
-  if (!object(body) || Object.keys(body).some(key => action === 'apply' ? key !== 'planId' : true)) throw new UpdateError(400, '更新请求包含不支持的字段');
+  const field = action === 'apply' ? 'planId' : action === 'token' ? 'token' : null;
+  if (!['check', 'apply', 'token'].includes(action) || !object(body) || Object.keys(body).some(key => key !== field)) throw new UpdateError(400, '更新请求包含不支持的字段');
   if (action === 'apply' && (typeof body.planId !== 'string' || !PLAN_ID.test(body.planId))) throw new UpdateError(400, '更新计划无效，请重新检查更新');
+  if (action === 'token' && (typeof body.token !== 'string' || body.token !== '' && (!GITHUB_TOKEN.test(body.token) || body.token.trim() !== body.token))) throw new UpdateError(400, TOKEN_INVALID);
 }
 
 /** socketPath is a test dependency only; production does not read a URL/path from env or requests. */
@@ -64,29 +71,37 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
   function request(method, route, body) {
     return new Promise((resolve, reject) => {
       let settled = false, connected = false;
+      const tokenRequest = route === '/token';
+      const unavailable = uncertain => new UpdateError(503, tokenRequest && uncertain ? 'GitHub Token 保存结果尚未确认，请刷新配置状态后核对' : UNAVAILABLE, { uncertain });
       const content = body === undefined ? null : Buffer.from(JSON.stringify(body));
       const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); if (error) reject(error); else resolve(value); };
       const req = http.request({ socketPath, path: route, method, agent: false,
         headers: content ? { 'Content-Type': 'application/json', 'Content-Length': content.length } : {} }, res => {
         const chunks = []; let size = 0;
-        const fail = () => { finish(new UpdateError(503, UNAVAILABLE, { uncertain: method === 'POST' })); res.destroy(); req.destroy(); };
+        const fail = () => { finish(unavailable(method === 'POST')); res.destroy(); req.destroy(); };
         res.on('data', chunk => { size += chunk.length; if (size > 1024 * 1024) fail(); else chunks.push(chunk); });
         res.on('aborted', fail); res.on('error', fail);
         res.on('end', () => {
           if (settled) return;
           if (res.statusCode < 200 || res.statusCode >= 300) {
             const status = [400, 409, 429, 503].includes(res.statusCode) ? res.statusCode : 503;
-            const message = status === 409 ? '更新计划已改变或已有更新任务，请刷新后重试' : status === 400 ? '更新计划无效，请重新检查更新' : status === 429 ? '更新请求过于频繁，请稍后重试' : UNAVAILABLE;
+            const message = status === 409 ? tokenRequest ? TOKEN_BUSY : '更新计划已改变或已有更新任务，请刷新后重试'
+              : status === 400 ? tokenRequest ? TOKEN_INVALID : '更新计划无效，请重新检查更新'
+                : status === 429 ? '更新请求过于频繁，请稍后重试'
+                  : tokenRequest ? 'GitHub Token 保存结果尚未确认，请刷新配置状态后核对' : UNAVAILABLE;
             finish(new UpdateError(status, message, { uncertain: method === 'POST' && status === 503 })); return;
           }
-          try { finish(null, publicUpdateState(JSON.parse(Buffer.concat(chunks).toString('utf8')))); }
-          catch { finish(new UpdateError(503, UNAVAILABLE, { uncertain: method === 'POST' })); }
+          try {
+            const value = publicUpdateState(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            if (tokenRequest && value.githubToken === undefined) throw new Error('Missing token configuration status');
+            finish(null, value);
+          } catch { finish(unavailable(method === 'POST')); }
         });
       });
       req.on('socket', socket => { if (!socket.connecting) connected = true; else socket.once('connect', () => { connected = true; }); });
-      req.on('error', () => finish(new UpdateError(503, UNAVAILABLE, { uncertain: method === 'POST' && connected })));
+      req.on('error', () => finish(unavailable(method === 'POST' && connected)));
       // Wall-clock deadline also bounds slow trickle responses, not just idle sockets.
-      const timer = setTimeout(() => { finish(new UpdateError(503, UNAVAILABLE, { uncertain: method === 'POST' && connected })); req.destroy(); }, timeoutMs);
+      const timer = setTimeout(() => { finish(unavailable(method === 'POST' && connected)); req.destroy(); }, timeoutMs);
       timer.unref?.();
       req.end(content);
     });
@@ -95,6 +110,7 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
     async status() { try { return await request('GET', '/status'); } catch { return unavailableUpdateState(); } },
     check() { return request('POST', '/check', {}); },
     apply(planId) { validateUpdateBody('apply', { planId }); return request('POST', '/apply', { planId }); },
+    token(token) { validateUpdateBody('token', { token }); return request('POST', '/token', { token }); },
   };
 }
 
@@ -132,6 +148,12 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     if (!applying && version === generation) observe(state);
     await synchronizeModules();
     return state;
+  }
+  async function token(value, authorize) {
+    authorize();
+    if (applying) throw new UpdateError(409, TOKEN_BUSY);
+    // Credential writes do not enter or clear the trading maintenance gate.
+    return publicUpdateState(await client.token(value));
   }
   async function withExecutionEntry(operation) {
     if (applying) throw new UpdateError(409, MAINTENANCE);
@@ -179,5 +201,5 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     })();
     return pending.promise;
   }
-  return { status, check, apply, withExecutionEntry, initialize: synchronizeModules };
+  return { status, check, apply, token, withExecutionEntry, initialize: synchronizeModules };
 }

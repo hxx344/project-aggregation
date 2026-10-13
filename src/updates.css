@@ -34,6 +34,27 @@
 .update-section-heading h3{font-size:.875rem;color:var(--text-primary)}
 .update-section-heading>span{font-size:.75rem;color:var(--text-tertiary)}
 
+.update-token{margin-bottom:22px;padding:16px 18px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2)}
+.update-token .update-section-heading{flex-wrap:wrap;margin-bottom:8px}
+.update-token .update-token-status.configured{color:var(--emerald)}
+.update-token-help,.update-token-remove p,.update-token-error,.update-token-notice{font-size:.75rem;line-height:1.75;overflow-wrap:anywhere;color:var(--text-secondary)}
+.update-token-help+.update-token-help{margin-top:5px}
+.update-token a{color:var(--accent);margin-left:5px;text-decoration:underline;text-underline-offset:3px}
+.update-token form{margin-top:13px}
+.update-token label{display:block;margin-bottom:6px;font-size:.8125rem;color:var(--text-primary)}
+.update-token input{display:block;box-sizing:border-box;width:100%;min-width:0;padding:10px 12px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--text-primary);font:inherit;font-size:.8125rem}
+.update-token input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.update-token input:disabled{opacity:.6}
+.update-token-actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:10px}
+.update-token .button{font-size:.8125rem;padding:8px 12px;min-height:36px}
+.update-token .text-button{font-size:.8125rem;min-height:36px;color:var(--text-secondary)}
+.update-token .text-button:disabled{opacity:.5;cursor:not-allowed}
+.update-token-remove{margin-top:13px;padding-top:12px;border-top:1px solid var(--surface-4)}
+.update-token-error,.update-token-notice{margin-top:10px}
+.update-token-error{color:var(--warning)}
+.update-token-notice{color:var(--emerald)}
+.update-token .update-token-refresh{margin-top:4px;color:var(--accent)}
+
 .update-modules{padding:0;margin:0;list-style:none;border:1px solid var(--surface-4);border-radius:var(--radius-md);overflow:hidden}
 .update-module{padding:16px 18px;background:var(--surface-2)}
 .update-module+.update-module{border-top:1px solid var(--surface-4)}
@@ -101,6 +122,7 @@
   .update-footer{padding:15px 18px;gap:8px}
   .update-footer .button{font-size:.8125rem;padding:9px 10px}
   .update-progress{padding:14px}
+  .update-token{padding:14px}
   .update-progress-heading{align-items:flex-start;flex-direction:column;gap:5px}
   .update-summary{padding-bottom:18px}
 }

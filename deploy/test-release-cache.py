@@ -5,6 +5,7 @@ from email.message import Message
 from email.utils import formatdate
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -23,6 +24,7 @@ OLD = 'b' * 40
 NEW = 'a' * 40
 NEXT = 'c' * 40
 INSTALLER = b'#!/usr/bin/env bash\n# CI RELEASE HELPERS\n: "${PROJECT_DEPLOY_MANIFEST_FILE}"\n'
+GITHUB_TOKEN = 'github_pat_' + 'A1b2c3d4' * 8
 
 
 def encoded(value):
@@ -452,8 +454,8 @@ class ReleaseCacheTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
-    def http_error(self, code, headers=None, url='https://api.github.com/repos/hxx344/project-aggregation/releases/latest'):
-        network = releases.Network()
+    def http_error(self, code, headers=None, url='https://api.github.com/repos/hxx344/project-aggregation/releases/latest', token=''):
+        network = releases.Network(token_provider=lambda: token)
         network.opener = unittest.mock.Mock()
         response_headers = Message()
         for key, value in (headers or {}).items():
@@ -465,7 +467,79 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(body.closed)
         self.assertNotIn('private', str(caught.exception))
         self.assertNotIn('secret', str(caught.exception))
+        self.assertNotIn(GITHUB_TOKEN, str(caught.exception))
         return caught.exception
+
+    def test_authentication_headers_only_reach_https_github_api_and_are_read_per_request(self):
+        provider = unittest.mock.Mock(side_effect=[GITHUB_TOKEN, 'R' * 20, ''])
+        network = releases.Network(token_provider=provider)
+        network.opener = unittest.mock.Mock()
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {}
+        response.read.return_value = b'{}'
+        network.opener.open.return_value = response
+        for host in ('github.com', 'raw.githubusercontent.com', 'release-assets.githubusercontent.com', 'objects.githubusercontent.com'):
+            response.url = f'https://{host}/fixed-path'
+            network.request(response.url)
+            self.assertIsNone(network.opener.open.call_args.args[0].get_header('Authorization'))
+        provider.assert_not_called()
+        for url, token in (('https://api.github.com/repos/fixed', GITHUB_TOKEN),
+                           ('https://api.github.com:443/repos/fixed', 'R' * 20),
+                           ('https://api.github.com/repos/fixed', '')):
+            response.url = url
+            network.request(url)
+            self.assertEqual(network.opener.open.call_args.args[0].get_header('Authorization'),
+                             'Bearer ' + token if token else None)
+        self.assertEqual(provider.call_count, 3)
+        for url in ('http://api.github.com/fixed', 'https://api.github.com:444/fixed',
+                    'https://api.github.com.attacker.example/fixed', 'https://user@api.github.com/fixed'):
+            with self.assertRaises(releases.ReleaseError):
+                network.request(url)
+        self.assertEqual(provider.call_count, 3)
+
+    def test_environment_tokens_are_ignored_and_provider_errors_fail_closed(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': GITHUB_TOKEN, 'GH_TOKEN': GITHUB_TOKEN}):
+            self.assertEqual(releases.Network().token_provider(), '')
+        for provider in (lambda: GITHUB_TOKEN + '\r\nHeader: bad', lambda: 123,
+                         unittest.mock.Mock(side_effect=OSError(GITHUB_TOKEN))):
+            network = releases.Network(token_provider=provider)
+            network.opener = unittest.mock.Mock()
+            with self.assertRaises(releases.ReleaseError) as caught:
+                network.request('https://api.github.com/repos/fixed')
+            self.assertNotIn(GITHUB_TOKEN, str(caught.exception))
+            network.opener.open.assert_not_called()
+
+    def test_redirects_strip_all_authorization_variants_and_never_restore_them(self):
+        redirect = releases.SafeRedirect()
+        for key in ('Authorization', 'authorization', 'AUTHORIZATION', 'aUtHoRiZaTiOn'):
+            with self.subTest(key=key):
+                request = urllib.request.Request('https://api.github.com/repos/fixed')
+                request.headers[key] = 'Bearer ' + GITHUB_TOKEN
+                request.unredirected_hdrs[key] = 'Bearer ' + GITHUB_TOKEN
+                same_origin = redirect.redirect_request(request, None, 302, '', {}, 'https://api.github.com:443/repos/moved')
+                self.assertTrue(any(k.lower() == 'authorization' for k in same_origin.headers))
+                redirected = redirect.redirect_request(request, None, 302, '', {}, 'https://github.com/releases/fixed')
+                self.assertFalse(any(k.lower() == 'authorization' for k in dict(redirected.header_items())))
+                back_to_api = redirect.redirect_request(redirected, None, 302, '', {}, 'https://api.github.com/repos/returned')
+                self.assertFalse(any(k.lower() == 'authorization' for k in dict(back_to_api.header_items())))
+                for target in ('http://api.github.com/repos/fixed', 'https://api.github.com:8443/fixed', 'https://attacker.example/fixed'):
+                    with self.assertRaises(releases.ReleaseError):
+                        redirect.redirect_request(request, None, 302, '', {}, target)
+
+    def test_invalid_token_and_authenticated_quota_have_specific_safe_errors(self):
+        error = self.http_error(401, token=GITHUB_TOKEN)
+        self.assertIn('GitHub Token 无效或已过期', str(error))
+        self.assertFalse(error.transient)
+        self.assertIsNone(error.retry_at)
+        for code in (403, 429):
+            error = self.http_error(code, {'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1800001200'}, token=GITHUB_TOKEN)
+            self.assertIn('认证请求额度已用尽', str(error))
+            self.assertNotIn('匿名', str(error))
+            self.assertEqual(error.retry_at, 1800001200)
+            self.assertTrue(error.transient)
+        error = self.http_error(401, url='https://github.com/fixed', token=GITHUB_TOKEN)
+        self.assertNotIn('Token', str(error))
 
     def test_primary_limit_reports_api_quota_and_server_reset(self):
         error = self.http_error(403, {'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1800001200'})

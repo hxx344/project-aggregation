@@ -159,50 +159,23 @@ except ReleaseError as error:
 
 ---
 
-### 方案 C：启用 GitHub Token 认证（长期方案）
+### 方案 C：通过更新面板配置 GitHub Token
 
-**目标**：将 API 限额从 60次/小时提升到 5000次/小时。
+**目标**：使用个人 Token 的认证额度降低匿名 API 限流概率；普通账号通常为共享的 5000 次/小时，仍受 GitHub 限流规则约束。
 
-#### C1. 在服务器配置中添加 Token
+#### C1. 在工作台配置
 
-```bash
-# 在服务器上创建环境变量文件
-echo "GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx" >> /etc/project-aggregation/updater.env
-chmod 600 /etc/project-aggregation/updater.env
-```
+1. 在 GitHub 创建 fine-grained personal access token，公开仓库只读访问即可，不需要写权限。
+2. 打开工作台“系统更新”，在“GitHub Token”区域粘贴 Token 并保存。已有配置可替换或移除，旧 Token 不回显。
+3. 保存后，后续实际访问 GitHub API 时使用新 Token，并报告无效或过期等错误；缓存命中时可能不发起 API 请求。保存操作只确认配置已写入，不表示已通过 GitHub 验证。
 
-#### C2. 修改 `releases.py` 使用 Token
+旧更新服务不支持配置时，面板会提示通过原一键部署命令升级一次。检查或更新期间不能修改 Token。保存、更换、移除和服务重启都不会清除已有的限流等待。
 
-```python
-# releases.py:87-105 修改 Network 类
-class Network:
-    def __init__(self, token=None):
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), SafeRedirect())
-        self.token = token or os.environ.get('GITHUB_TOKEN')
-    
-    def _request(self, url, maximum=MAX_JSON, method='GET', final_url=False):
-        allowed_url(url)
-        api = urllib.parse.urlsplit(url).hostname == 'api.github.com'
-        headers = {
-            'User-Agent': 'project-aggregation-stable-updater/1',
-            'Accept': 'application/vnd.github+json' if api else '*/*',
-            'Cache-Control': 'no-cache'
-        }
-        # 添加认证头
-        if api and self.token:
-            headers['Authorization'] = f'Bearer {self.token}'
-        
-        request = urllib.request.Request(url, method=method, headers=headers)
-        # ... 其余代码不变
-```
+#### C2. 配置与认证边界
 
-**优点**：
-- 根本解决限流问题
-- 支持私有仓库（如果将来需要）
+Token 经工作台登录、同源与 CSRF 校验后，通过固定 Unix socket 写入 `/var/lib/project-aggregation-updater/credentials.json`。目录为 root/0700，文件为 root/0600，原子保存并随升级保留。控制服务与独立更新 worker 按请求读取，不需要设置 `GITHUB_TOKEN` 环境变量或重启服务。
 
-**缺点**：
-- 需要创建和管理 GitHub Token
-- Token 泄露风险（需要妥善保护）
+公开状态仅包含是否配置。认证头仅发送给 `api.github.com`，跨域重定向会移除；Token 不进入安装脚本环境、更新计划、事件流或日志。此实现仍只支持现有公开仓库发布流程，不包含私有仓库下载支持。部署说明见 [deployment.md](deployment.md)。
 
 ---
 
@@ -235,11 +208,7 @@ class Network:
 
 ### 测试 C：Token 认证
 
-```bash
-# 1. 配置 GITHUB_TOKEN
-# 2. 检查请求头是否包含 Authorization
-# 3. 验证限额提升到 5000/小时
-```
+通过更新面板保存、替换和移除 Token，确认状态不回显凭据、关闭面板清空输入。自动化测试模拟 GitHub 响应，检查认证头只发往 API、跨域重定向移除认证，以及无效 Token 的脱敏提示；Linux CI 检查权限和重复部署保留。使用真实 Token 时可按实际 API 响应头核实认证额度。
 
 ---
 
@@ -257,7 +226,7 @@ class Network:
 1. **方案 A 不改变现有行为**，只是暴露隐藏的状态
 2. **方案 B 需要仔细测试**退避逻辑，避免引入新的边界问题
 3. **方案 C 的 Token 必须妥善保护**，不能提交到代码仓库
-4. 所有方案都应补充到 `deploy/test-updater.py` 中的单元测试
+4. Token 的持久化与服务边界由 `deploy/test-updater.py` 覆盖，出站认证由 `deploy/test-release-cache.py` 覆盖，工作台接口和页面另有对应验收
 
 ---
 

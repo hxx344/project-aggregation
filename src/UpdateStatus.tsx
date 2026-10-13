@@ -6,6 +6,7 @@ import type { UpdateJob, UpdateModule, UpdateState } from './update-types';
 import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
+type RequestKind = 'read' | 'check' | 'apply' | 'token';
 const moduleLabels = { current: '已是最新', available: '可更新', unavailable: '检查未完成', unmanaged: '需手动更新' };
 const jobLabels = { queued: '更新已排队', running: '正在更新', succeeded: '更新已完成', failed: '更新未完成', interrupted: '更新已中断' };
 const stepLabels = { pending: '等待', running: '进行中', succeeded: '已完成', failed: '失败', skipped: '已跳过' };
@@ -49,13 +50,18 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const [networkError, setNetworkError] = useState('');
   const [checkRequestFailed, setCheckRequestFailed] = useState(false);
   const [actionNotice, setActionNotice] = useState('');
-  const [pending, setPending] = useState<'read' | 'check' | 'apply' | null>(null);
+  const [pending, setPending] = useState<RequestKind | null>(null);
+  const [token, setToken] = useState('');
+  const [tokenError, setTokenError] = useState('');
+  const [tokenNotice, setTokenNotice] = useState('');
+  const [tokenResultUncertain, setTokenResultUncertain] = useState(false);
+  const [removeToken, setRemoveToken] = useState(false);
   const [uncertain, setUncertain] = useState(false);
   const [open, setOpen] = useState(false);
   const [review, setReview] = useState<{ planId: string; modules: UpdateModule[] } | null>(null);
   const [, setClock] = useState(0);
   const snapshotRef = useRef<UpdateState | null>(null);
-  const requestRef = useRef<{ controller: AbortController; kind: 'read' | 'check' | 'apply' } | null>(null);
+  const requestRef = useRef<{ controller: AbortController; kind: RequestKind } | null>(null);
   const stateVersion = useRef(0);
   const sessionExpired = useRef(false);
   const failedCheckAt = useRef<string | null | undefined>(undefined);
@@ -85,8 +91,12 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     setNetworkError('');
   }, []);
 
-  const request = useCallback(async (kind: 'read' | 'check' | 'apply', planId?: string, replaceRead = false) => {
-    if (sessionExpired.current || !navigator.onLine) return null;
+  const request = useCallback(async (kind: RequestKind, value?: string, replaceRead = false) => {
+    if (sessionExpired.current) return null;
+    if (!navigator.onLine) {
+      if (kind === 'token') setTokenError('当前处于离线状态，请恢复连接后再保存。');
+      return null;
+    }
     if (replaceRead && requestRef.current?.kind === 'read') {
       requestRef.current.controller.abort();
       requestRef.current = null;
@@ -100,28 +110,51 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     setPending(kind);
     if (kind === 'check') setActionNotice('');
     if (kind === 'apply') {
-      submittedPlan.current = planId || null;
+      submittedPlan.current = value || null;
       uncertainRef.current = { previousJobId, failed: false };
       setActionNotice('');
     }
     try {
       const data = await api<UpdateState>(`/api/system/updates${kind === 'read' ? '' : `/${kind}`}`, {
         signal: controller.signal,
-        ...(kind === 'read' ? {} : { method: 'POST', body: JSON.stringify(kind === 'apply' ? { planId } : {}) }),
+        ...(kind === 'read' ? {} : { method: 'POST', body: JSON.stringify(kind === 'apply' ? { planId: value } : kind === 'token' ? { token: value } : {}) }),
       });
       if (controller.signal.aborted) return null;
-      if (!validState(data)) throw new ApiError('更新功能尚未安装', 404);
+      if (!validState(data)) {
+        if (kind === 'token') throw new Error('Token 配置响应无法确认');
+        throw new ApiError('更新功能尚未安装', 404);
+      }
       if (kind === 'check') {
         failedCheckAt.current = undefined;
         setCheckRequestFailed(false);
       }
       if (kind === 'apply') { uncertainRef.current = null; setUncertain(false); }
+      if (kind === 'token') {
+        // HTTP success confirms the write even when a newer stream snapshot wins.
+        setToken('');
+        setRemoveToken(false);
+        setTokenError('');
+        setTokenResultUncertain(false);
+        setTokenNotice(value ? 'Token 已保存，下次检查时生效；已有重试等待会保留。' : 'Token 已移除，下次检查将使用公开访问；已有重试等待会保留。');
+      }
       // A stream snapshot received after dispatch is newer than this HTTP response.
       if (version === stateVersion.current) accept(data, kind === 'read');
       return snapshotRef.current;
     } catch (error) {
       if (controller.signal.aborted) return null;
       if (error instanceof ApiError && error.status === 401) { sessionExpired.current = true; onExpired(); return null; }
+      if (kind === 'token') {
+        const status = error instanceof ApiError ? error.status : 0;
+        setTokenNotice('');
+        setTokenError(status === 400 ? 'Token 格式不正确，请粘贴 20–255 位字母、数字或下划线。'
+          : status === 403 ? '保存未获授权，请刷新页面后重试。'
+          : status === 409 ? '正在检查版本或执行更新，请等待完成后再修改 Token。'
+          : status === 404 || status === 501 ? '当前更新服务暂不支持 Token 配置，请在服务器上重新运行原一键部署命令升级。'
+          : status >= 400 && status < 500 ? 'Token 配置未保存，请刷新页面后重试。'
+          : '保存结果尚未确认，请先刷新配置状态核对，确认后再操作。');
+        setTokenResultUncertain(!status || status >= 500 && status !== 501);
+        return null;
+      }
       if (kind === 'read' && version !== stateVersion.current) return snapshotRef.current;
       const latest = snapshotRef.current;
       if (kind === 'check' && version !== stateVersion.current && (latest?.checking || latest?.checkedAt !== previousCheckedAt)) return latest;
@@ -267,12 +300,15 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const checking = !!snapshot?.checking || pending === 'check';
   const updating = running(snapshot?.job) || pending === 'apply';
   const needsSetup = unavailable || snapshot?.enabled === false;
+  const tokenSupported = typeof snapshot?.githubToken?.configured === 'boolean';
+  const tokenConfigured = snapshot?.githubToken?.configured === true;
+  const tokenBlocked = !tokenSupported || needsSetup || pending !== null || checking || updating || uncertain || tokenResultUncertain;
   const expired = !snapshot?.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now();
   const reviewInvalid = !!review && (review.planId !== snapshot?.planId || expired);
   const blocked = !snapshot?.enabled || !snapshot.planId || expired || !!snapshot.checkError || checkRequestFailed || !!networkError || pending !== null || updating || checking || uncertain || !changes.length || snapshot.planId === submittedPlan.current;
   const summary = networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? `${changes.length} 个可用更新` : incomplete ? '部分模块待处理' : different ? '当前版本与正式版不同' : unconfirmed ? '版本待确认' : snapshot?.checkedAt && modules.length ? '已是最新正式版' : snapshot ? '尚无检查结果' : '正在读取状态';
   const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete || different || unconfirmed ? 'attention' : changes.length ? 'available' : '';
-  const close = () => { setOpen(false); setReview(null); requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
+  const close = () => { setOpen(false); setReview(null); setToken(''); setTokenNotice(''); setRemoveToken(false); requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
   const show = () => { onOpen?.(); setOpen(true); void request('read'); };
   const prepare = () => {
     if (blocked || !snapshot?.planId) return;
@@ -288,6 +324,21 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     const data = await request('apply', review.planId);
     if (data) setReview(null);
   };
+  const saveToken = async (remove = false) => {
+    if (tokenBlocked) return;
+    const value = remove ? '' : token.trim();
+    setTokenNotice('');
+    if (!remove && !/^[A-Za-z0-9_]{20,255}$/.test(value)) {
+      setTokenError('请粘贴 20–255 位字母、数字或下划线组成的 Token。');
+      return;
+    }
+    setTokenError('');
+    await request('token', value);
+  };
+  const refreshToken = async () => {
+    const data = await request('read');
+    if (data) { setTokenResultUncertain(false); setTokenError(''); setTokenNotice('已刷新服务器上的 Token 配置状态。'); }
+  };
 
   return <><button ref={trigger} className={`nav-item update-nav ${tone}`} aria-label={`系统更新：${summary}`} aria-haspopup="dialog" onClick={show}>{updating || checking || uncertain ? <LoaderCircle size={19} className="spin" /> : <Download size={19} />}<span>系统更新<small>{summary}</small></span><ChevronRight size={15} /></button>{open ? createPortal(<dialog ref={dialog} className="update-dialog" aria-labelledby="update-title" aria-describedby="update-description" onCancel={event => { event.preventDefault(); close(); }}><div className="update-dialog-content"><header className="update-header"><div><h2 id="update-title">系统更新</h2><p id="update-description">工作台与本机已安装模块 · 仅正式版本</p></div><button className="icon-button" aria-label="关闭系统更新" onClick={close}><X size={21} /></button></header><div className="update-body">
     {needsSetup ? <div className="update-message setup"><CircleAlert size={20} /><div><strong>先启用在线更新</strong><p>请在服务器上重新运行原一键部署命令，升级一次后即可在这里更新。</p>{snapshot?.reason ? <p>{snapshot.reason}</p> : null}</div></div> : <div className={`update-summary ${tone}`}><span className="update-summary-icon">{updating || checking || uncertain || !snapshot ? <LoaderCircle size={22} className="spin" /> : snapshot.checkError || checkRequestFailed || networkError || incomplete || different || unconfirmed ? <CircleAlert size={22} /> : changes.length ? <Download size={22} /> : <Check size={22} />}</span><div><strong>{summary}</strong><p>{snapshot?.checkedAt ? `上次检查 ${dateTime(snapshot.checkedAt)}` : '检查本机模块可用的正式版本'}</p></div></div>}
@@ -295,6 +346,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {snapshot?.checkError || checkRequestFailed ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{snapshot?.checkError || '上次检查请求未完成，当前显示的是已有记录。'}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}
+    {snapshot?.enabled && !needsSetup ? <section className="update-token" aria-labelledby="update-token-title"><div className="update-section-heading"><h3 id="update-token-title">GitHub Token</h3>{tokenSupported ? <span className={`update-token-status ${tokenConfigured ? 'configured' : ''}`}>{tokenConfigured ? '已配置' : '未配置（可选）'}</span> : <span>需升级更新服务</span>}</div>{tokenSupported ? <><p className="update-token-help" id="update-token-help">用于读取公开仓库的正式版本，只需公开仓库只读权限。<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 GitHub Token</a></p><p className="update-token-help">Token 仅保存在服务器，不会回显。保存后下次检查生效，已有重试等待会保留。</p><form onSubmit={event => { event.preventDefault(); void saveToken(); }}><label htmlFor="update-github-token">{tokenConfigured ? '替换 Token' : '配置 Token'}</label><input id="update-github-token" type="password" autoComplete="off" autoCapitalize="none" spellCheck={false} value={token} disabled={tokenBlocked} aria-describedby="update-token-help" placeholder={tokenConfigured ? '粘贴新的 Token' : '粘贴 GitHub Token'} onChange={event => { setToken(event.target.value); setTokenError(''); setTokenNotice(''); }} /><div className="update-token-actions"><button type="submit" className="button secondary" disabled={tokenBlocked || !token.trim()}>{pending === 'token' ? <LoaderCircle size={15} className="spin" /> : null}{tokenConfigured ? '替换 Token' : '保存 Token'}</button>{tokenConfigured && !removeToken ? <button type="button" className="text-button" disabled={tokenBlocked} onClick={() => { setRemoveToken(true); setTokenNotice(''); }}>移除 Token</button> : null}</div></form>{removeToken && tokenConfigured ? <div className="update-token-remove"><p>确认移除已保存的 Token？后续检查将使用公开访问额度。</p><div className="update-token-actions"><button type="button" className="button secondary" disabled={tokenBlocked} onClick={() => void saveToken(true)}>确认移除</button><button type="button" className="text-button" disabled={pending === 'token'} onClick={() => setRemoveToken(false)}>取消移除</button></div></div> : null}{tokenError ? <p className="update-token-error" role="alert">{tokenError}</p> : null}{tokenResultUncertain ? <button className="text-button update-token-refresh" disabled={pending !== null || checking || updating || uncertain} onClick={() => void refreshToken()}>刷新配置状态</button> : null}{tokenNotice ? <p className="update-token-notice" role="status">{tokenNotice}</p> : null}</> : <p className="update-token-help">当前更新服务暂不支持 Token 配置。请在服务器上重新运行原一键部署命令升级，之后即可在这里配置。</p>}</section> : null}
     {modules.length ? <section aria-labelledby="update-modules-title"><div className="update-section-heading"><h3 id="update-modules-title">本机模块</h3><span>{modules.length} 个已安装</span></div><ul className="update-modules">{modules.map(module => <ModuleRow key={module.id} module={module} />)}</ul></section> : snapshot?.enabled && !checking ? <p className="update-empty">尚未识别到可更新的本机模块，请重新检查。</p> : null}
     {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3><p>将更新 {review.modules.map(module => module.name).join('、')}，共 {review.modules.length} 个模块。</p><p>变更模块会短暂重启。请先完成这些模块中正在进行的操作。</p>{reviewInvalid ? <p role="alert">版本检查结果已变化或过期，请返回重新检查。</p> : null}</section> : changes.length && !updating ? <p className="update-footnote">仅更新有新正式版本的模块；变更模块会短暂重启。</p> : null}
   </div><footer className="update-footer">{review ? <><button className="button secondary" disabled={pending === 'apply'} onClick={() => setReview(null)}>返回</button><button className="button primary" disabled={blocked || reviewInvalid} onClick={() => void apply()}>{pending === 'apply' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}确认更新 {review.modules.length} 个模块</button></> : <><button className="button secondary" disabled={pending !== null || checking || updating || uncertain || needsSetup} onClick={() => void request('check')}><RefreshCw size={16} className={checking ? 'spin' : ''} />{checking ? '正在检查' : '检查更新'}</button>{changes.length ? <button className="button primary" disabled={blocked} onClick={prepare}>{updating ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{updating ? '正在更新' : expired || snapshot?.planId === submittedPlan.current ? '请先重新检查' : '查看更新'}</button> : <span className="update-channel">正式版本</span>}</>}</footer></div></dialog>, document.body) : null}</>;

@@ -25,7 +25,7 @@ import time
 import uuid
 
 from registry import BY_ID, MODULES, inventory, text_file, trusted
-from releases import Releases, ReleaseError, digest
+from releases import Network, Releases, ReleaseError, digest, valid_github_token
 
 
 STATE_DIR = Path('/var/lib/project-aggregation-updater')
@@ -38,6 +38,7 @@ AUTO_CHECK_INTERVAL = 5 * 60
 CHECK_RETRY_MAX_INTERVAL = 30 * 60
 ACTIVE = {'queued', 'running'}
 TOKEN = re.compile(r'[a-f0-9]{32}')
+MAX_CREDENTIALS = 1024
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes')
 ENVIRONMENT = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8',
                'PYTHONDONTWRITEBYTECODE': '1', 'DEBIAN_FRONTEND': 'noninteractive'}
@@ -95,6 +96,15 @@ def read_json(path):
     result = json.loads(text_file(path, 2 * 1024 * 1024))
     if not isinstance(result, dict):
         raise ValueError('Invalid updater state')
+    return result
+
+
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('Duplicate JSON property')
+        result[key] = value
     return result
 
 
@@ -159,7 +169,7 @@ class Coordinator:
         self.directory = private_directory(directory)
         self.plans = private_directory(directory / 'plans')
         self.jobs = private_directory(directory / 'jobs')
-        self.releases = releases or Releases()
+        self.releases = releases or Releases(Network(token_provider=self.read_token))
         self.inspect = inspect or inventory
         self.launch = launch or start_worker
         self.alive = alive or worker_alive
@@ -193,10 +203,68 @@ class Coordinator:
     def save(self, state):
         write_json(self.directory / 'state.json', state)
 
+    def _credentials_path(self):
+        info = trusted(self.directory, directory=True)
+        if os.name != 'nt' and info.st_mode & 0o077:
+            raise ValueError('Updater state directory must be private')
+        path = self.directory / 'credentials.json'
+        try:
+            info = trusted(path)
+        except FileNotFoundError:
+            return path
+        if os.name != 'nt' and info.st_mode & 0o077:
+            raise ValueError('Updater credentials must be private')
+        return path
+
+    def read_token(self):
+        # Both control and worker processes read the current private file for
+        # every API request. Only a genuinely absent file means anonymous use.
+        try:
+            path = self._credentials_path()
+            try:
+                descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+            except FileNotFoundError:
+                return ''
+            with os.fdopen(descriptor, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CREDENTIALS or
+                        os.name != 'nt' and (info.st_uid != 0 or info.st_mode & 0o077)):
+                    raise ValueError('Invalid credential file')
+                data = source.read(MAX_CREDENTIALS + 1)
+            if len(data) > MAX_CREDENTIALS:
+                raise ValueError('Credential file is too large')
+            value = json.loads(data, object_pairs_hook=unique_json_object)
+            if (not isinstance(value, dict) or set(value) != {'schema', 'token'} or
+                    type(value['schema']) is not int or value['schema'] != 1 or not valid_github_token(value['token'])):
+                raise ValueError('Invalid credential configuration')
+            return value['token']
+        except (OSError, ValueError, UnicodeError):
+            raise ReleaseError('GitHub Token 配置不可读取，请检查服务器配置和权限') from None
+
+    def set_token(self, token):
+        if not valid_github_token(token):
+            raise UpdateError(400, 'GitHub Token 格式无效')
+        with self.lock():
+            state = self.load()
+            if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
+                raise UpdateError(409, '版本检查或更新正在进行，请结束后再修改 GitHub Token')
+            try:
+                path = self._credentials_path()
+                if token:
+                    write_json(path, {'schema': 1, 'token': token})
+                else:
+                    path.unlink(missing_ok=True)
+                # Credentials do not change the reviewed release identity or
+                # override an existing rate-limit deadline. No probe is sent.
+                return self.public(state)
+            except (OSError, ValueError, ReleaseError):
+                raise UpdateError(503, 'GitHub Token 配置保存失败，请检查服务器配置和权限') from None
+
     def public(self, state):
         result = {'enabled': True, **{key: state.get(key) for key in
                 ('checking', 'checkedAt', 'checkError', 'planId', 'expiresAt', 'job')},
-                'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']]}
+                'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']],
+                'githubToken': {'configured': bool(self.read_token())}}
         remaining = state.get('nextCheckNotBefore', 0) - self.clock()
         if result['checkError'] and remaining > 0:
             result['checkError'] += f'；已暂停重试，约 {math.ceil(remaining / 60)} 分钟后自动重试'
@@ -539,7 +607,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *_args):
-        pass  # Requests contain no secrets, but raw deployment logs are never returned here.
+        pass  # Never log request content or return raw deployment logs.
 
     def answer(self, status, value):
         data = json.dumps(value, ensure_ascii=False).encode()
@@ -558,7 +626,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.command == 'GET' and self.path == '/status':
                 self.answer(200, self.server.coordinator.status())
                 return
-            if self.command != 'POST' or self.path not in ('/check', '/apply'):
+            if self.command != 'POST' or self.path not in ('/check', '/apply', '/token'):
                 raise UpdateError(404, '更新接口不存在')
             if self.headers.get('Transfer-Encoding') is not None:
                 raise UpdateError(400, '不支持该请求格式')
@@ -567,12 +635,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise UpdateError(400, '请求内容无效')
             if self.headers.get_content_type() != 'application/json':
                 raise UpdateError(415, '请求需使用 JSON')
-            body = json.loads(self.rfile.read(int(length)))
-            expected = set() if self.path == '/check' else {'planId'}
+            body = json.loads(self.rfile.read(int(length)), object_pairs_hook=unique_json_object)
+            expected = {'/check': set(), '/apply': {'planId'}, '/token': {'token'}}[self.path]
             if not isinstance(body, dict) or set(body) != expected:
                 raise UpdateError(400, '更新参数无效')
-            result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(body['planId'])
-            self.answer(202, result)
+            if self.path == '/token':
+                self.answer(200, self.server.coordinator.set_token(body['token']))
+            else:
+                result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(body['planId'])
+                self.answer(202, result)
         except UpdateError as error:
             self.answer(error.status, {'error': str(error)})
         except (ValueError, UnicodeError, TimeoutError):

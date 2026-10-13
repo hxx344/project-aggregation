@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createUpdateClient, publicUpdateState, unavailableUpdateState, UpdateError } from '../server/updates.mjs';
+import { createUpdateClient, publicUpdateState, unavailableUpdateState, validateUpdateBody, UpdateError } from '../server/updates.mjs';
 
 const planId = 'a'.repeat(64);
 const now = '2026-10-09T12:00:00.000Z';
@@ -109,4 +109,51 @@ test('missing or malformed optional release notes do not disable an otherwise va
   const value = state();
   value.modules[0].reason = '仍不允许\n多行错误信息';
   assert.throws(() => publicUpdateState(value), error => error.status === 503, 'existing message validation is unchanged');
+});
+
+test('token settings expose only capability and configured status, including legacy compatibility', async t => {
+  const secret = 'github_pat_' + 'fixture'.repeat(6), calls = [];
+  const client = await fixture(t, async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    calls.push({ method: req.method, url: req.url, body });
+    res.end(JSON.stringify({ ...state(), token: secret, credentials: { token: secret },
+      githubToken: { configured: !!body.token, token: secret, suffix: secret.slice(-4), path: '/private/file' } }));
+  });
+  for (const token of [secret, 'ghp_' + 'replacement'.repeat(4), '']) {
+    const result = await client.token(token);
+    assert.deepEqual(result.githubToken, { configured: !!token });
+    assert.equal(JSON.stringify(result).includes(secret), false);
+    assert.equal(JSON.stringify(result).includes('private'), false);
+    assert.deepEqual(calls.at(-1), { method: 'POST', url: '/token', body: { token } });
+  }
+  assert.equal(publicUpdateState(state()).githubToken, undefined, 'older helpers remain compatible');
+  for (const githubToken of [null, [], true, {}, { configured: 'true' }]) {
+    assert.throws(() => publicUpdateState({ ...state(), githubToken }), error => error.status === 503);
+  }
+});
+
+test('token requests reject malformed values and flexible configuration before opening the socket', async t => {
+  let calls = 0;
+  const client = await fixture(t, (req, res) => { calls++; res.end(JSON.stringify(state())); });
+  for (const token of [null, true, {}, [], 123, 'short', 'a'.repeat(256), 'a'.repeat(20) + '\n',
+    'a'.repeat(20) + '\r', 'a'.repeat(20) + '\u2028', 'a'.repeat(20) + ' ', 'a'.repeat(20) + '\0', 'a'.repeat(20) + '/']) {
+    assert.throws(() => client.token(token), error => error.status === 400 && error.message === 'GitHub Token 格式无效，请粘贴完整 Token，且不要包含空格或换行');
+  }
+  for (const body of [{}, { token: '', path: '/tmp/other' }, { token: '', url: 'https://other.example' }, { token: '', command: 'id' }]) {
+    assert.throws(() => validateUpdateBody('token', body), error => error.status === 400);
+  }
+  assert.equal(calls, 0);
+});
+
+test('token failures use fixed configuration errors and never forward upstream secrets', async t => {
+  let code = 400;
+  const client = await fixture(t, (req, res) => { res.writeHead(code); res.end(JSON.stringify({ error: 'private-token-secret' })); });
+  for (const [status, message] of [[400, /Token 格式/], [409, /检查版本或执行更新/], [503, /保存结果尚未确认/]]) {
+    code = status;
+    await assert.rejects(client.token('a'.repeat(20)), error => error.status === status && message.test(error.message)
+      && !error.message.includes('private') && error.uncertain === (status === 503));
+  }
+  const legacy = await fixture(t, (req, res) => res.end(JSON.stringify(state())));
+  await assert.rejects(legacy.token('a'.repeat(20)), error => error.status === 503 && error.uncertain, 'missing confirmation cannot claim a saved token');
 });

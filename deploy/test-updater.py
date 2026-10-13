@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import http.client
+import http.server
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,8 @@ OLD = 'b' * 40
 NEW = 'a' * 40
 OLD_KEY = '1' * 64
 NEW_KEY = '2' * 64
+GITHUB_TOKEN = 'github_pat_' + 'A1b2c3d4' * 8
+REPLACEMENT_TOKEN = 'ghp_' + 'X9y8z7w6' * 5
 INSTALLER = b'#!/usr/bin/env bash\n# CI RELEASE HELPERS\n: "${PROJECT_DEPLOY_MANIFEST_FILE}"\n'
 OLD_INSTALLER = INSTALLER + b'# earlier installer\n'
 LINUX_ROOT = sys.platform == 'linux' and hasattr(os, 'geteuid') and os.geteuid() == 0
@@ -288,6 +291,207 @@ class CoordinatorTests(RootFixture):
         result = self.check()
         self.assertIsNotNone(result['planId'], result)
         return result['planId']
+
+    def test_token_save_replace_remove_and_restart_expose_only_configured(self):
+        self.assertEqual(self.coordinator.status()['githubToken'], {'configured': False})
+        initial_state = self.coordinator.load()
+        for token in (GITHUB_TOKEN, REPLACEMENT_TOKEN, ''):
+            with self.subTest(configured=bool(token)):
+                public = self.coordinator.set_token(token)
+                self.assertEqual(public['githubToken'], {'configured': bool(token)})
+                self.assertEqual(self.coordinator.read_token(), token)
+                self.assertEqual(self.make_coordinator().status(), public)
+                self.assertEqual(self.coordinator.load(), initial_state)
+                for secret in (GITHUB_TOKEN, REPLACEMENT_TOKEN, hashlib.sha256(GITHUB_TOKEN.encode()).hexdigest()):
+                    self.assertNotIn(secret, json.dumps(public))
+                    self.assertNotIn(secret, (self.coordinator.directory / 'state.json').read_text())
+                self.assertFalse(self.network.calls)
+        self.assertFalse((self.coordinator.directory / 'credentials.json').exists())
+
+    def test_token_changes_preserve_reviewed_plan_and_retry_deadline(self):
+        plan = self.prepare()
+        before = self.coordinator.load()
+        plan_bytes = (self.coordinator.plans / plan / 'plan.json').read_bytes()
+        calls = list(self.network.calls)
+        self.coordinator.set_token(GITHUB_TOKEN)
+        self.assertEqual(self.coordinator.load(), before)
+        self.assertEqual((self.coordinator.plans / plan / 'plan.json').read_bytes(), plan_bytes)
+        with self.coordinator.lock():
+            before.update(checkError='GitHub API匿名请求额度已用尽', failureCount=2,
+                          nextCheckNotBefore=self.clock + 1200)
+            self.coordinator.save(before)
+        for token in (REPLACEMENT_TOKEN, ''):
+            self.coordinator.set_token(token)
+            self.assertEqual(self.coordinator.load(), before)
+            self.coordinator.check()
+            self.assertEqual(self.coordinator.load(), before)
+            self.assertEqual(self.network.calls, calls)
+
+    def test_token_busy_conflicts_cannot_replace_existing_configuration(self):
+        self.coordinator.set_token(GITHUB_TOKEN)
+        for checking, status in ((True, None), (False, 'queued'), (False, 'running')):
+            with self.subTest(checking=checking, status=status):
+                with self.coordinator.lock():
+                    state = self.coordinator.load()
+                    state.update(checking=checking, job={'status': status} if status else None)
+                    self.coordinator.save(state)
+                for token in (REPLACEMENT_TOKEN, ''):
+                    with self.assertRaises(updater.UpdateError) as caught:
+                        self.coordinator.set_token(token)
+                    self.assertEqual(caught.exception.status, 409)
+                    self.assertEqual(self.coordinator.read_token(), GITHUB_TOKEN)
+                    self.assertEqual(self.coordinator.load(), state)
+
+    def test_token_validation_rejects_injection_types_and_unbounded_input(self):
+        for token in (None, True, 123, {}, [], 'short', 'a' * 256, 'a' * 19, ' ' + GITHUB_TOKEN,
+                      GITHUB_TOKEN + '\n', GITHUB_TOKEN + '\r\nX-Evil: value', 'é' * 20, 'a-' * 20):
+            with self.subTest(token_type=type(token).__name__):
+                with self.assertRaises(updater.UpdateError) as caught:
+                    self.coordinator.set_token(token)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertNotIn(GITHUB_TOKEN, str(caught.exception))
+                self.assertEqual(self.coordinator.read_token(), '')
+        for token in ('a' * 20, 'Z9_' * 85):
+            self.coordinator.set_token(token)
+            self.assertEqual(self.coordinator.read_token(), token)
+
+    def test_invalid_credentials_fail_closed_without_anonymous_requests_or_secret_errors(self):
+        worker = updater.Coordinator(directory=self.coordinator.directory)
+        worker.releases.network.opener = unittest.mock.Mock()
+        path = self.coordinator.directory / 'credentials.json'
+        for data in (b'{', encoded([]), encoded({'schema': 1, 'token': GITHUB_TOKEN, 'extra': True}),
+                     encoded({'schema': True, 'token': GITHUB_TOKEN}), encoded({'schema': 1, 'token': None}),
+                     encoded({'schema': 1, 'token': GITHUB_TOKEN + '\n'}), b'x' * 1025,
+                     b'{"schema":1,"token":"","token":"' + GITHUB_TOKEN.encode() + b'"}'):
+            with self.subTest(size=len(data)):
+                updater.write_bytes(path, data)
+                with self.assertRaises(releases.ReleaseError) as caught:
+                    worker.releases.network.request('https://api.github.com/repos/hxx344/project-aggregation/releases/latest')
+                self.assertNotIn(GITHUB_TOKEN, str(caught.exception))
+                with self.assertRaises(releases.ReleaseError):
+                    worker.status()
+        worker.releases.network.opener.open.assert_not_called()
+        with patch.object(updater.os, 'open', side_effect=PermissionError(GITHUB_TOKEN)):
+            with self.assertRaises(releases.ReleaseError) as caught:
+                self.coordinator.read_token()
+            self.assertNotIn(GITHUB_TOKEN, str(caught.exception))
+
+    def test_atomic_token_write_failure_keeps_previous_value_and_removes_temporary_file(self):
+        self.coordinator.set_token(GITHUB_TOKEN)
+        with patch.object(updater.os, 'replace', side_effect=OSError(REPLACEMENT_TOKEN)):
+            with self.assertRaises(updater.UpdateError) as caught:
+                self.coordinator.set_token(REPLACEMENT_TOKEN)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertNotIn(REPLACEMENT_TOKEN, str(caught.exception))
+        self.assertEqual(self.coordinator.read_token(), GITHUB_TOKEN)
+        self.assertEqual(list(self.coordinator.directory.glob('.write-*')), [])
+
+    def test_credentials_reject_links_and_nonregular_objects(self):
+        path = self.coordinator.directory / 'credentials.json'
+        outside = self.root / 'outside.json'
+        updater.write_json(outside, {'schema': 1, 'token': GITHUB_TOKEN})
+        original = outside.read_bytes()
+        self.link(outside, path)
+        for action in (self.coordinator.read_token, lambda: self.coordinator.set_token(REPLACEMENT_TOKEN),
+                       lambda: self.coordinator.set_token('')):
+            with self.assertRaises((releases.ReleaseError, updater.UpdateError)):
+                action()
+        self.assertEqual(outside.read_bytes(), original)
+        path.unlink()
+        path.mkdir(mode=0o700)
+        with self.assertRaises(releases.ReleaseError):
+            self.coordinator.read_token()
+        with self.assertRaises(updater.UpdateError):
+            self.coordinator.set_token(GITHUB_TOKEN)
+
+    @unittest.skipUnless(LINUX_ROOT, 'Root ownership and private file modes run in Linux CI')
+    def test_credentials_require_root_private_file_and_directory_permissions(self):
+        self.coordinator.set_token(GITHUB_TOKEN)
+        path = self.coordinator.directory / 'credentials.json'
+        self.assertEqual(path.stat().st_uid, 0)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        for mode in (0o640, 0o604, 0o660, 0o601):
+            path.chmod(mode)
+            with self.assertRaises(releases.ReleaseError):
+                self.coordinator.read_token()
+            with self.assertRaises(updater.UpdateError):
+                self.coordinator.set_token('')
+        path.chmod(0o600)
+        os.chown(path, 65534, 65534)
+        try:
+            with self.assertRaises(releases.ReleaseError):
+                self.coordinator.read_token()
+            with self.assertRaises(updater.UpdateError):
+                self.coordinator.set_token(REPLACEMENT_TOKEN)
+        finally:
+            os.chown(path, 0, 0)
+        self.coordinator.directory.chmod(0o750)
+        try:
+            with self.assertRaises(releases.ReleaseError):
+                self.coordinator.read_token()
+        finally:
+            self.coordinator.directory.chmod(0o700)
+
+    def test_default_control_and_worker_read_current_token_for_each_api_request(self):
+        control = updater.Coordinator(directory=self.coordinator.directory)
+        worker = updater.Coordinator(directory=self.coordinator.directory)
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.url = 'https://api.github.com/repos/hxx344/project-aggregation/releases/latest'
+        response.headers = {}
+        response.read.return_value = b'{}'
+        for coordinator in (control, worker):
+            coordinator.releases.network.opener = unittest.mock.Mock()
+            coordinator.releases.network.opener.open.return_value = response
+        for token in (GITHUB_TOKEN, REPLACEMENT_TOKEN, ''):
+            control.set_token(token)
+            for coordinator in (control, worker):
+                network = coordinator.releases.network
+                self.assertEqual(network.request(response.url), b'{}')
+                request = network.opener.open.call_args.args[0]
+                self.assertEqual(request.get_header('Authorization'), 'Bearer ' + token if token else None)
+        self.assertNotIn('GITHUB_TOKEN', updater.ENVIRONMENT)
+        self.assertNotIn('GH_TOKEN', updater.ENVIRONMENT)
+
+    def test_token_http_contract_is_bounded_and_never_echoes_credentials(self):
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), updater.Handler)
+        server.coordinator = self.coordinator
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05})
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(server.shutdown)
+        def request(body, route='/token', headers=None):
+            connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+            try:
+                connection.request('POST', route, body=body, headers=headers or {'Content-Type': 'application/json'})
+                response = connection.getresponse()
+                data = response.read()
+                self.assertNotIn(GITHUB_TOKEN.encode(), data)
+                self.assertEqual(response.getheader('Cache-Control'), 'no-store')
+                return response.status, json.loads(data)
+            finally:
+                connection.close()
+        status, public = request(encoded({'token': GITHUB_TOKEN}))
+        self.assertEqual(status, 200)
+        self.assertEqual(public, self.coordinator.status())
+        self.assertEqual(public['githubToken'], {'configured': True})
+        for body in (encoded({}), encoded({'token': GITHUB_TOKEN, 'url': 'https://attacker.example'}),
+                     encoded({'token': 123}), encoded({'token': GITHUB_TOKEN + '\n'}), encoded([]),
+                     b'{"token":"","token":"' + GITHUB_TOKEN.encode() + b'"}', b'x' * 1025, b'{'):
+            self.assertEqual(request(body)[0], 400)
+            self.assertEqual(self.coordinator.read_token(), GITHUB_TOKEN)
+        self.assertEqual(request(encoded({'token': GITHUB_TOKEN}), headers={'Content-Type': 'text/plain'})[0], 415)
+        self.assertEqual(request(encoded({'token': GITHUB_TOKEN}), '/token?extra=1')[0], 404)
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state['checking'] = True
+            self.coordinator.save(state)
+        self.assertEqual(request(encoded({'token': ''}))[0], 409)
+        with self.coordinator.lock():
+            state['checking'] = False
+            self.coordinator.save(state)
+        self.assertEqual(request(encoded({'token': ''}))[1]['githubToken'], {'configured': False})
 
     def test_release_notes_are_public_but_never_change_the_reviewed_plan(self):
         self.network.values['hub']['metadata']['body'] = '修复检查\r\n<script>仅作文本</script> 🚀'

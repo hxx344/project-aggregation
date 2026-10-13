@@ -79,9 +79,14 @@ grep -qx "ReadWritePaths=$UPDATER_STATE_DIR $UPDATER_RUN_DIR" "$UPDATER_UNIT_FIL
 grep -qx 'Type=oneshot' "$UPDATER_WORKER_UNIT_FILE"
 grep -qx "ExecStart=/usr/bin/python3 -I $UPDATER_DIR/updater.py run" "$UPDATER_WORKER_UNIT_FILE"
 ! grep -q '^\[Install\]' "$UPDATER_WORKER_UNIT_FILE"
+printf '{"schema":1,"token":"github_pat_fixture_preserved_by_upgrade"}\n' > "$UPDATER_STATE_DIR/credentials.json"
+chmod 0600 "$UPDATER_STATE_DIR/credentials.json"
+credentials_hash=$(sha256sum "$UPDATER_STATE_DIR/credentials.json")
 inode=$(stat -c %i "$UPDATER_DIR/updater.py")
 ensure_update_service "$case_root/release"
 [[ $(stat -c %i "$UPDATER_DIR/updater.py") == "$inode" ]]
+[[ $(sha256sum "$UPDATER_STATE_DIR/credentials.json") == "$credentials_hash" ]]
+[[ $(stat -c '%u:%g:%a' "$UPDATER_STATE_DIR/credentials.json") == 0:0:600 ]]
 [[ $(count daemon-reload) == 1 && $(count "start $UPDATER_SERVICE") == 1 && $(count "restart $UPDATER_SERVICE") == 0 && $(count "enable $UPDATER_SERVICE") == 1 ]]
 
 # A root-owned live/stale socket is the only allowed runtime entry.
@@ -94,6 +99,8 @@ SOCKET
 printf '# changed application\n' >> "$case_root/release/server/update-service/updater.py"
 ensure_update_service "$case_root/release"
 [[ $(count "restart $UPDATER_SERVICE") == 1 && $(count daemon-reload) == 2 ]]
+[[ $(sha256sum "$UPDATER_STATE_DIR/credentials.json") == "$credentials_hash" ]]
+[[ $(stat -c '%u:%g:%a' "$UPDATER_STATE_DIR/credentials.json") == 0:0:600 ]]
 no_worker_mutations
 rm -- "$active_file"
 ensure_update_service "$case_root/release"

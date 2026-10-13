@@ -28,6 +28,7 @@ RELEASE_NOTES_TRUNCATED = '\n（更新内容过长，已截断）'
 RELEASE_NOTES_CONTROLS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]')
 RELEASE_CACHE_TTL = 30 * 60
 MAX_RETRY_DELAY = 24 * 60 * 60
+GITHUB_TOKEN = re.compile(r'[A-Za-z0-9_]{20,255}')
 # Shared by all repositories; cold checks add at most two network workers.
 ARTIFACT_CHECKS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='release-artifact')
 
@@ -78,16 +79,34 @@ def allowed_url(url):
         raise ReleaseError('发布文件地址无效，已停止检查')
 
 
+def valid_github_token(value):
+    return isinstance(value, str) and (value == '' or GITHUB_TOKEN.fullmatch(value) is not None)
+
+
+def origin(url):
+    value = urllib.parse.urlsplit(url)
+    return value.scheme, value.hostname, value.port or 443
+
+
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, target):
         allowed_url(target)
-        return super().redirect_request(request, response, code, message, headers, target)
+        redirected = super().redirect_request(request, response, code, message, headers, target)
+        if redirected is not None and origin(request.full_url) != origin(target):
+            # urllib can preserve caller headers across hosts. Once removed,
+            # credentials must not reappear on a later redirect back to the API.
+            for values in (redirected.headers, redirected.unredirected_hdrs):
+                for key in list(values):
+                    if key.lower() == 'authorization':
+                        del values[key]
+        return redirected
 
 
 class Network:
-    def __init__(self):
+    def __init__(self, token_provider=None):
         # Do not inherit a proxy or credentials from a service environment.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), SafeRedirect())
+        self.token_provider = token_provider or (lambda: '')
 
     def request(self, url, maximum=MAX_JSON, method='GET'):
         return self._request(url, maximum, method)
@@ -103,6 +122,17 @@ class Network:
             'User-Agent': 'project-aggregation-stable-updater/1',
             'Accept': 'application/vnd.github+json' if api else '*/*',
             'Cache-Control': 'no-cache'})
+        authenticated = False
+        if api:
+            try:
+                token = self.token_provider()
+                if not valid_github_token(token):
+                    raise ValueError()
+            except Exception:
+                raise ReleaseError('GitHub Token 配置不可读取，请检查服务器配置和权限') from None
+            if token:
+                request.add_header('Authorization', 'Bearer ' + token)
+                authenticated = True
         try:
             with self.opener.open(request, timeout=25) as response:
                 allowed_url(response.url)
@@ -124,9 +154,11 @@ class Network:
             error.close()
             if error.code == 404:
                 raise ReleaseError(f'{endpoint}未找到正式版本或发布文件（HTTP 404）') from None
+            if error.code == 401 and authenticated and urllib.parse.urlsplit(error.url).hostname == 'api.github.com':
+                raise ReleaseError('GitHub Token 无效或已过期，请更换后重试（HTTP 401）') from None
             if error.code in (403, 429):
                 if urllib.parse.urlsplit(error.url).hostname == 'api.github.com' and headers.get('X-RateLimit-Remaining') == '0':
-                    reason = '匿名请求额度已用尽'
+                    reason = '认证请求额度已用尽' if authenticated else '匿名请求额度已用尽'
                 elif error.code == 429 or headers.get('Retry-After'):
                     reason = '请求频率受限'
                 else:
