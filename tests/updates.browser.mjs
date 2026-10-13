@@ -111,6 +111,24 @@ async (page) => {
   await notes.locator('summary').click();
   assert(await page.getByText('最新正式版', { exact: true }).count() === 1, 'current and stable target versions are shown');
   assert(checks.length === 0, 'opening the page never triggers a remote check');
+  // Older services also use current for equivalent content and locally newer commits.
+  state.modules[0] = { ...state.modules[0], latestVersion: 'v1.0.1', latestCommit: '2222222222222222222222222222222222222222', reason: '应用内容与正式版本一致' };
+  await emit();
+  assert(await page.locator('.update-summary strong').textContent() === '当前版本与正式版不同', 'different release identities never claim the latest version');
+  assert(await page.locator('.update-tag').textContent() === '版本不同', 'a legacy current row must show the version difference');
+  assert(await page.getByText('应用内容与正式版本一致', { exact: true }).isVisible(), 'the service explanation remains visible');
+  assert(await page.getByRole('button', { name: '查看更新', exact: true }).count() === 0, 'the client cannot invent an update plan');
+  await page.screenshot({ path: 'output/playwright/updates-version-difference.png' });
+  state.modules[0].reason = '本机版本领先于当前正式版本，不自动降级'; await emit();
+  assert(await page.locator('.update-tag').textContent() === '版本不同', 'a locally newer version also does not claim release identity equality');
+  state.modules[0].currentCommit = null; state.modules[0].currentVersion = state.modules[0].latestVersion; await emit();
+  assert(await page.locator('.update-summary strong').textContent() === '版本待确认', 'one missing commit cannot be masked by equal display versions');
+  assert(await page.locator('.update-tag').textContent() === '版本待确认', 'missing identity is explicit on the module row');
+  state.modules[0].latestCommit = null; await emit();
+  assert(await page.locator('.update-summary strong').textContent() === '已是最新正式版', 'legacy versions without commits remain comparable');
+  state.modules[0].currentVersion = null; state.modules[0].latestVersion = null; await emit();
+  assert(await page.locator('.update-summary strong').textContent() === '版本待确认', 'an empty identity is never latest');
+  state = initial(); await emit();
   await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
   const beforeHidden = reads;
   await page.evaluate(() => { window.__updateHidden = true; document.dispatchEvent(new Event('visibilitychange')); });

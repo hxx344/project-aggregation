@@ -323,12 +323,8 @@ class Coordinator:
             item.update(latestVersion=release['version'], latestCommit=release['commit'],
                         releaseNotes=release.get('releaseNotes', ''))
             current = item['currentCommit']
-            same_application = item.get('applicationKey') == release['applicationKey']
-            same_installer = current == release['commit']
-            if same_application and not same_installer and current:
-                same_installer = digest(self.releases.installer(module, current)) == release['installerHash']
-            if current == release['commit'] or same_application and same_installer:
-                item.update(state='current', reason='应用内容与正式版本一致' if current != release['commit'] else '已是最新正式版本')
+            if current == release['commit']:
+                item.update(state='current', reason='已是最新正式版本')
                 return item, None
             if current and not self.releases.is_newer(module, current, release['commit']):
                 item.update(state='current', reason='本机版本领先于当前正式版本，不自动降级')

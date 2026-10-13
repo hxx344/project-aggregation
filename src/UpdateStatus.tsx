@@ -11,6 +11,12 @@ const jobLabels = { queued: '更新已排队', running: '正在更新', succeede
 const stepLabels = { pending: '等待', running: '进行中', succeeded: '已完成', failed: '失败', skipped: '已跳过' };
 const running = (job: UpdateJob | null | undefined) => job?.status === 'queued' || job?.status === 'running';
 const validState = (value: UpdateState) => value && typeof value.enabled === 'boolean' && typeof value.checking === 'boolean' && Array.isArray(value.modules);
+function matchesLatest(module: UpdateModule): boolean | null {
+  if (module.currentCommit || module.latestCommit) {
+    return module.currentCommit && module.latestCommit ? module.currentCommit === module.latestCommit : null;
+  }
+  return module.currentVersion && module.latestVersion ? module.currentVersion === module.latestVersion : null;
+}
 function dateTime(value: string | null) {
   if (!value || !Number.isFinite(Date.parse(value))) return '尚未检查';
   return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(value));
@@ -19,8 +25,11 @@ function Version({ version, commit }: { version: string | null; commit: string |
   return <span className="update-version"><strong>{version || (commit ? commit.slice(0, 8) : '尚未识别')}</strong>{version && commit ? <small>{commit.slice(0, 8)}</small> : null}</span>;
 }
 function ModuleRow({ module }: { module: UpdateModule }) {
+  const match = matchesLatest(module);
+  const unconfirmed = module.state === 'current' && match !== true;
+  const label = unconfirmed ? match === false ? '版本不同' : '版本待确认' : moduleLabels[module.state];
   return <li className="update-module">
-    <div className="update-module-heading"><h3>{module.name}</h3><span className={`update-tag ${module.state}`}>{moduleLabels[module.state]}</span></div>
+    <div className="update-module-heading"><h3>{module.name}</h3><span className={`update-tag ${unconfirmed ? 'unavailable' : module.state}`}>{label}</span></div>
     <div className="update-versions"><div><span>当前版本</span><Version version={module.currentVersion} commit={module.currentCommit} /></div>{module.latestVersion || module.latestCommit ? <><ArrowRight size={16} aria-hidden="true" /><div><span>最新正式版</span><Version version={module.latestVersion} commit={module.latestCommit} /></div></> : null}</div>
     {module.reason ? <p className="update-module-note">{module.reason}</p> : null}
     {module.latestVersion || module.latestCommit ? module.releaseNotes ? <details className="update-release-notes"><summary>该版本更新内容</summary><p>{module.releaseNotes}</p></details> : <p className="update-module-note">该版本未提供更新内容。</p> : null}
@@ -253,14 +262,16 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const modules = snapshot?.modules || [];
   const changes = modules.filter(module => module.state === 'available');
   const incomplete = modules.some(module => module.state === 'unavailable' || module.state === 'unmanaged');
+  const different = modules.some(module => module.state === 'current' && matchesLatest(module) === false);
+  const unconfirmed = modules.some(module => module.state === 'current' && matchesLatest(module) === null);
   const checking = !!snapshot?.checking || pending === 'check';
   const updating = running(snapshot?.job) || pending === 'apply';
   const needsSetup = unavailable || snapshot?.enabled === false;
   const expired = !snapshot?.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now();
   const reviewInvalid = !!review && (review.planId !== snapshot?.planId || expired);
   const blocked = !snapshot?.enabled || !snapshot.planId || expired || !!snapshot.checkError || checkRequestFailed || !!networkError || pending !== null || updating || checking || uncertain || !changes.length || snapshot.planId === submittedPlan.current;
-  const summary = networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? `${changes.length} 个可用更新` : incomplete ? '部分模块待处理' : snapshot?.checkedAt && modules.length ? '已是最新正式版' : snapshot ? '尚无检查结果' : '正在读取状态';
-  const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete ? 'attention' : changes.length ? 'available' : '';
+  const summary = networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? `${changes.length} 个可用更新` : incomplete ? '部分模块待处理' : different ? '当前版本与正式版不同' : unconfirmed ? '版本待确认' : snapshot?.checkedAt && modules.length ? '已是最新正式版' : snapshot ? '尚无检查结果' : '正在读取状态';
+  const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete || different || unconfirmed ? 'attention' : changes.length ? 'available' : '';
   const close = () => { setOpen(false); setReview(null); requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
   const show = () => { onOpen?.(); setOpen(true); void request('read'); };
   const prepare = () => {
@@ -279,7 +290,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   };
 
   return <><button ref={trigger} className={`nav-item update-nav ${tone}`} aria-label={`系统更新：${summary}`} aria-haspopup="dialog" onClick={show}>{updating || checking || uncertain ? <LoaderCircle size={19} className="spin" /> : <Download size={19} />}<span>系统更新<small>{summary}</small></span><ChevronRight size={15} /></button>{open ? createPortal(<dialog ref={dialog} className="update-dialog" aria-labelledby="update-title" aria-describedby="update-description" onCancel={event => { event.preventDefault(); close(); }}><div className="update-dialog-content"><header className="update-header"><div><h2 id="update-title">系统更新</h2><p id="update-description">工作台与本机已安装模块 · 仅正式版本</p></div><button className="icon-button" aria-label="关闭系统更新" onClick={close}><X size={21} /></button></header><div className="update-body">
-    {needsSetup ? <div className="update-message setup"><CircleAlert size={20} /><div><strong>先启用在线更新</strong><p>请在服务器上重新运行原一键部署命令，升级一次后即可在这里更新。</p>{snapshot?.reason ? <p>{snapshot.reason}</p> : null}</div></div> : <div className={`update-summary ${tone}`}><span className="update-summary-icon">{updating || checking || uncertain || !snapshot ? <LoaderCircle size={22} className="spin" /> : snapshot.checkError || checkRequestFailed || networkError || incomplete ? <CircleAlert size={22} /> : changes.length ? <Download size={22} /> : <Check size={22} />}</span><div><strong>{summary}</strong><p>{snapshot?.checkedAt ? `上次检查 ${dateTime(snapshot.checkedAt)}` : '检查本机模块可用的正式版本'}</p></div></div>}
+    {needsSetup ? <div className="update-message setup"><CircleAlert size={20} /><div><strong>先启用在线更新</strong><p>请在服务器上重新运行原一键部署命令，升级一次后即可在这里更新。</p>{snapshot?.reason ? <p>{snapshot.reason}</p> : null}</div></div> : <div className={`update-summary ${tone}`}><span className="update-summary-icon">{updating || checking || uncertain || !snapshot ? <LoaderCircle size={22} className="spin" /> : snapshot.checkError || checkRequestFailed || networkError || incomplete || different || unconfirmed ? <CircleAlert size={22} /> : changes.length ? <Download size={22} /> : <Check size={22} />}</span><div><strong>{summary}</strong><p>{snapshot?.checkedAt ? `上次检查 ${dateTime(snapshot.checkedAt)}` : '检查本机模块可用的正式版本'}</p></div></div>}
     {networkError ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>{networkError}</strong><p>恢复连接后会自动读取服务器记录。</p><button className="text-button" disabled={pending !== null} onClick={() => void request('read')}>重新连接</button></div></div> : null}
     {snapshot?.checkError || checkRequestFailed ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{snapshot?.checkError || '上次检查请求未完成，当前显示的是已有记录。'}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}

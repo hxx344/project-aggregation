@@ -328,30 +328,87 @@ class CoordinatorTests(RootFixture):
         self.assertEqual(public['planId'], result['planId'])
         self.assertTrue(all('releaseNotes' not in item for item in public['modules']))
 
-    def test_doc_only_changes_are_current_and_installer_changes_apply_once(self):
+    def test_same_content_release_is_available_and_successful_receipt_prevents_repeated_updates(self):
         self.installed = [self.installed[-1]]
         self.installed[0]['applicationKey'] = NEW_KEY
         self.network.values['hub']['oldInstaller'] = INSTALLER
         result = self.check()
-        self.assertEqual(result['modules'][0]['state'], 'current')
-        self.assertIsNone(result['planId'])
+        self.assertEqual(result['modules'][0]['state'], 'available')
+        self.assertEqual(result['modules'][0]['currentCommit'], OLD)
+        self.assertEqual(result['modules'][0]['latestCommit'], NEW)
+        self.assertIsNotNone(result['planId'])
 
-        self.clock += 61
-        self.network.values['hub']['oldInstaller'] = OLD_INSTALLER
-        plan = self.prepare(); self.coordinator.apply(plan); self.coordinator.run()
-        self.assertEqual(self.executed, ['hub'])
-        self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
         # An incremental installer may retain the app-identical previous source.
-        self.installed[0]['currentCommit'] = OLD
-        self.installed[0]['currentVersion'] = OLD[:12]
+        with patch.object(self.coordinator, 'installer', return_value=0) as install:
+            self.coordinator.apply(result['planId']); self.coordinator.run()
+            install.assert_called_once()
+        self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
+        self.assertEqual(self.installed[0]['currentCommit'], OLD)
+        receipt = updater.read_json(self.coordinator.directory / 'hub.receipt.json')
+        self.assertEqual(receipt['identity'], self.installed[0]['identity'])
+        self.assertEqual(receipt['commit'], NEW)
         self.clock += 61
         result = self.check()
         self.assertEqual(result['modules'][0]['state'], 'current')
+        self.assertEqual(result['modules'][0]['currentCommit'], NEW)
+        self.assertEqual(result['modules'][0]['latestCommit'], NEW)
         self.assertIsNone(result['planId'])
         self.installed[0]['identity'] = 'f' * 64
         self.clock += 61
         result = self.check()
         self.assertEqual(result['modules'][0]['state'], 'available', 'a receipt must not authorize a changed installation')
+        self.assertEqual(result['modules'][0]['currentCommit'], OLD)
+        self.assertIsNotNone(result['planId'])
+
+    def test_matching_release_commit_is_current_without_ancestry_comparison(self):
+        self.installed[0].update(currentCommit=NEW, currentVersion=NEW[:12])
+        with patch.object(self.reader, 'is_newer', wraps=self.reader.is_newer) as compare:
+            result = self.check()
+            compare.assert_not_called()
+        self.assertEqual(result['modules'][0]['state'], 'current')
+        self.assertEqual(result['modules'][0]['reason'], '已是最新正式版本')
+        self.assertIsNone(result['planId'])
+        self.assertIsNone(result['checkError'])
+
+    def test_equivalent_content_cannot_bypass_release_ancestry(self):
+        self.installed[0]['applicationKey'] = NEW_KEY
+        self.network.values['hub']['oldInstaller'] = INSTALLER
+        cases = [('ahead', 'available', '正式版本可用'),
+                 ('behind', 'current', '本机版本领先于当前正式版本，不自动降级'),
+                 ('diverged', 'unavailable', '本机与正式版本的来源不同，请通过命令检查后更新'),
+                 ('unknown', 'unavailable', '无法确认正式版本的更新顺序')]
+        for comparison, expected_state, reason in cases:
+            with self.subTest(comparison=comparison):
+                self.clock += 301
+                self.network.values['hub']['comparison'] = {'status': comparison}
+                with patch.object(self.reader, 'is_newer', wraps=self.reader.is_newer) as compare:
+                    result = self.check()
+                    compare.assert_called_once_with(registry.BY_ID['hub'], OLD, NEW)
+                self.assertEqual(result['modules'][0]['state'], expected_state)
+                self.assertEqual(result['modules'][0]['reason'], reason)
+                self.assertEqual(result['modules'][0]['currentCommit'], OLD)
+                self.assertEqual(result['modules'][0]['latestCommit'], NEW)
+                self.assertEqual(result['planId'] is not None, expected_state == 'available')
+                self.assertEqual(result['checkError'] is not None, expected_state == 'unavailable')
+
+    def test_comparison_failure_with_equivalent_content_invalidates_previous_plan(self):
+        self.installed[0]['applicationKey'] = NEW_KEY
+        self.network.values['hub']['oldInstaller'] = INSTALLER
+        self.prepare()
+        self.clock += 61
+        original = self.network.request
+        def fail_comparison(url, *args, **kwargs):
+            if '/compare/' in url:
+                raise releases.ReleaseError('版本比较暂时不可用', transient=True)
+            return original(url, *args, **kwargs)
+        with patch.object(self.network, 'request', side_effect=fail_comparison) as request:
+            result = self.check()
+            request.assert_any_call(self.reader.api(registry.BY_ID['hub'], f'compare/{OLD}...{NEW}'))
+        self.assertEqual(result['modules'][0]['state'], 'unavailable')
+        self.assertEqual(result['modules'][0]['reason'], '版本比较暂时不可用')
+        self.assertIsNone(result['planId'])
+        self.assertIsNotNone(result['checkError'])
+        self.assertEqual(self.launches, [])
 
     def test_legacy_missing_application_key_requires_one_proven_ci_migration(self):
         self.installed = [self.installed[-1]]
