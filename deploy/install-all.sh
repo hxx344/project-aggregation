@@ -160,7 +160,7 @@ stack_usage() {
 用法：sudo bash install-all.sh [--only hub] [--refresh] [--with-tests]
 统一安装工作台、Market Monitor、Asset Ledger、Gate CrossEx、Greeks，并保留原生交易模块。
 只部署一个工作台服务，业务模块不再单独安装、更新或监听 TCP 端口。
-默认使用 GitHub CI 已验证的 x64/arm64 部署包；Python 需要 3.11+。
+默认使用 GitHub CI 在 Ubuntu 24.04 验证的 x64 部署包；当前不发布 ARM64 包，Python 需要 3.11+。
 旧独立服务会停止并禁用；配置与数据复制到工作台数据目录，原文件保留。
 新版本不健康时恢复旧服务和配置；重复执行复用未变化的依赖、产物和配置。
   --only hub    兼容原总部署入口；各内置模块不再支持独立部署。

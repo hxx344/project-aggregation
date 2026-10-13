@@ -4,13 +4,13 @@
 
 ## 一键安装与升级
 
-在 Ubuntu 24.04 或 Debian 12/13（x64/arm64，systemd）执行：
+当前正式发布针对 Ubuntu 24.04 LTS（x64 / x86_64，systemd）构建并验收。在该服务器上执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
 ```
 
-重复执行会增量升级，保留已有配置与数据。安装器使用 GitHub 已验证的对应架构正式发布包；自动准备 Node.js 24.15+ 和 Greeks 的 Python 3.11+ 锁定依赖，不在服务器编译前端。
+重复执行会增量升级，保留已有配置与数据。安装器使用 GitHub 已验证的 x64 正式发布包；自动准备 Node.js 24.15+ 和 Greeks 的 Python 3.11+ 锁定依赖，不在服务器编译前端。当前 CI 不构建或发布 ARM64 包。
 
 首次从独立服务升级时，会停止旧服务并复制配置、数据库与密钥到工作台数据目录，旧文件保留；启动失败会恢复旧服务。ASTER 和独立 Variational 暂停使用，数据不删除。原生交易模块继续保留。详见 [部署与迁移说明](docs/deployment.md)。
 

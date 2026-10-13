@@ -4,7 +4,7 @@
 
 ## 安装与升级
 
-支持 Ubuntu 24.04、Debian 12/13，x64/arm64，需 systemd 和 Python 3.11+：
+当前正式发布针对实际服务器 Ubuntu 24.04 LTS（当前为 24.04.4）、x64 / x86_64 构建并验收，需 systemd 和 Python 3.11+：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 
 同一命令可重复执行。兼容入口 `deploy/install-all.sh` 只协调工作台安装器 `deploy/install.sh`，在线更新也只有 `hub` 一个目标。`--only hub` 继续可用，内置模块不支持独立安装或更新；旧的其他 `--only` 选项会明确拒绝。`--refresh` 只重新获取安装器，`--with-tests` 仅用于显式 `PROJECT_DEPLOY_MODE=source` 的排查部署。
 
-默认从正式 Release 下载已经验证的对应架构运行包。Node.js 自动准备为 24.15 或更高的 24.x；Greeks 依赖由 `modules/greeks/requirements.lock` 固定版本与哈希，虚拟环境以锁文件、Python 版本和架构为键缓存。无变化且健康时，跳过应用包下载、依赖安装、构建、完整验证与服务重启。
+默认从正式 Release 下载已经验证的 x64 运行包。当前 CI 不构建或发布 ARM64 包；安装器保留 Debian 12/13 与 ARM64 的通用识别能力，但不代表这些环境已通过当前发布验收，ARM64 主机不能安装仅含 x64 的新版本。Node.js 自动准备为 24.15 或更高的 24.x；Greeks 依赖由 `modules/greeks/requirements.lock` 固定版本与哈希，虚拟环境以锁文件、Python 版本和架构为键缓存。无变化且健康时，跳过应用包下载、依赖安装、构建、完整验证与服务重启。
 
 ## 服务与数据
 
@@ -60,7 +60,9 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 ## 发布、验证与失败恢复
 
-GitHub Actions 分别在原生 Linux x64 和 arm64 构建，运行包包含完整 Next 运行依赖与对应架构原生库，不标记为通用 `linux-any`。解压后的包需要启动工作台及四个模块完成验收。两个架构及安装器检查均通过后，发布 `deploy-<完整提交号>` 候选版本；沿用 **Publish stable release** 工作流将已验证候选晋级为正式版本。正式发布不会自动更新服务器。
+GitHub Actions 只在 `ubuntu-24.04` 原生 x64 runner 构建一次，使用 Node.js 24.15.0 和 Python 3.12，与当前服务器的系统系列和 CPU 架构匹配。运行包包含完整 Next 运行依赖与 x64 原生库，不标记为通用 `linux-any`。解压后的包需要启动工作台及四个模块完成验收。独立的安装器任务同样固定在 `ubuntu-24.04`，负责权限、systemd、增量更新与失败恢复检查，不再构建第二份应用。
+
+x64 应用验收及安装器检查均通过后，发布 `deploy-<完整提交号>` 候选版本；发布清单必须且只能包含 `linux-x64`。沿用 **Publish stable release** 工作流将已验证候选晋级为正式版本，继续校验提交、CI 结果、文件完整性和版本前进关系。当前晋级流程仅接受 x64 候选，历史双架构 Release 保留。正式发布不会自动更新服务器。
 
 manifest 固定提交、架构、运行内容指纹和 SHA-256；安装器先核验，再解压到独立发布目录。源代码、模块锁文件、模块构建脚本及迁移工具均计入运行内容指纹。服务器默认不再执行 npm 安装、前端构建或完整测试；Python 只在依赖或解释器环境变化时安装。
 

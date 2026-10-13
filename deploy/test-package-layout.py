@@ -46,20 +46,35 @@ class RuntimeDependencyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'version mismatch'):
             module.copy_runtime_dependencies(self.source, self.target)
 
-    def test_native_manifests_merge_only_matching_release_identities(self):
+    def test_x64_manifest_becomes_the_complete_release_manifest(self):
         directory = Path(self.temp.name)
-        base = {'schema': 1, 'repository': 'hxx344/project-aggregation', 'commit': 'a' * 40,
-                'tag': 'deploy-' + 'a' * 40, 'node_version': '24.15.0'}
-        for architecture in ('x64', 'arm64'):
-            manifest = {**base, 'artifacts': {'linux-' + architecture: {'file': architecture + '.tar.gz'}}}
-            (directory / f'release-manifest-{architecture}.json').write_text(json.dumps(manifest))
+        manifest = {'schema': 1, 'repository': 'hxx344/project-aggregation', 'commit': 'a' * 40,
+                    'tag': 'deploy-' + 'a' * 40, 'node_version': '24.15.0',
+                    'artifacts': {'linux-x64': {'file': 'x64.tar.gz'}}}
+        (directory / 'release-manifest-x64.json').write_text(json.dumps(manifest))
         script = Path(__file__).with_name('merge-release-manifests.py')
-        subprocess.run([sys.executable, str(script), str(directory)], check=True, capture_output=True)
-        self.assertEqual(set(json.loads((directory / 'release-manifest.json').read_text())['artifacts']), {'linux-x64', 'linux-arm64'})
-        path = directory / 'release-manifest-arm64.json'
-        manifest = json.loads(path.read_text()); manifest['commit'] = 'b' * 40; path.write_text(json.dumps(manifest))
-        failed = subprocess.run([sys.executable, str(script), str(directory)], capture_output=True)
+        subprocess.run([sys.executable, '-X', 'utf8', '-B', str(script), str(directory)], check=True, capture_output=True)
+        self.assertEqual(json.loads((directory / 'release-manifest.json').read_text()), manifest)
+
+    def test_missing_x64_manifest_cannot_publish_an_arm64_manifest(self):
+        directory = Path(self.temp.name)
+        (directory / 'release-manifest-arm64.json').write_text(json.dumps({
+            'artifacts': {'linux-arm64': {'file': 'arm64.tar.gz'}}}))
+        script = Path(__file__).with_name('merge-release-manifests.py')
+        failed = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(script), str(directory)], capture_output=True)
         self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse((directory / 'release-manifest.json').exists())
+
+    def test_release_manifest_requires_exactly_the_x64_artifact(self):
+        directory = Path(self.temp.name)
+        script = Path(__file__).with_name('merge-release-manifests.py')
+        for architectures in ((), ('linux-arm64',), ('linux-x64', 'linux-arm64'), ('linux-x64', 'windows-x64')):
+            with self.subTest(architectures=architectures):
+                manifest = {'artifacts': {arch: {'file': arch + '.tar.gz'} for arch in architectures}}
+                (directory / 'release-manifest-x64.json').write_text(json.dumps(manifest))
+                failed = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(script), str(directory)], capture_output=True)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertFalse((directory / 'release-manifest.json').exists())
 
     def test_runtime_dependency_links_cannot_copy_an_external_tree(self):
         self.package('external')

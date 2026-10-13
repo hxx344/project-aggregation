@@ -22,10 +22,11 @@ class StablePromotion(unittest.TestCase):
     def setUp(self):
         self.commit = 'b' * 40; self.previous = 'a' * 40; self.tag = 'deploy-' + self.commit
         self.repository = 'hxx344/project-aggregation'
-        self.content = {'runtime-linux-x64.tar.gz': b'x64 verified archive', 'runtime-linux-arm64.tar.gz': b'arm64 verified archive'}
+        filename = 'runtime-linux-x64.tar.gz'
+        self.content = {filename: b'x64 verified archive'}
         self.manifest = {'schema': 1, 'repository': self.repository, 'commit': self.commit, 'tag': self.tag,
-                         'artifacts': {arch: {'file': name, 'sha256': hashlib.sha256(self.content[name]).hexdigest(), 'application_key': 'c' * 64}
-                                       for arch, name in zip(['linux-x64', 'linux-arm64'], self.content)}}
+                         'artifacts': {'linux-x64': {'file': filename, 'sha256': hashlib.sha256(self.content[filename]).hexdigest(),
+                                                     'application_key': 'c' * 64}}}
         self.release = {'id': 42, 'draft': False, 'prerelease': True, 'tag_name': self.tag,
                         'assets': [{'name': name, 'state': 'uploaded', 'size': len(content)} for name, content in self.content.items()]}
         self.release['assets'].append({'name': 'release-manifest.json', 'state': 'uploaded', 'size': 500})
@@ -131,16 +132,21 @@ class StablePromotion(unittest.TestCase):
                 if scenario == 'commit': self.tag_commit = self.previous
                 self.reject()
 
-    def test_manifest_identity_architectures_and_downloaded_hashes_must_match(self):
-        for scenario in ['schema', 'repository', 'commit', 'tag', 'missing-arch', 'extra-arch', 'path', 'sha', 'application-key', 'missing-asset', 'unfinished-asset', 'corrupt-archive']:
+    def test_manifest_requires_exactly_the_x64_artifact(self):
+        for architectures in ((), ('linux-arm64',), ('linux-x64', 'linux-arm64'), ('linux-x64', 'windows-x64')):
+            with self.subTest(architectures=architectures):
+                self.setUp(); item = self.manifest['artifacts']['linux-x64']
+                self.manifest['artifacts'] = {arch: copy.deepcopy(item) for arch in architectures}
+                self.reject()
+
+    def test_manifest_identity_and_downloaded_hashes_must_match(self):
+        for scenario in ['schema', 'repository', 'commit', 'tag', 'path', 'sha', 'application-key', 'missing-asset', 'unfinished-asset', 'corrupt-archive']:
             with self.subTest(scenario=scenario):
                 self.setUp(); item = self.manifest['artifacts']['linux-x64']
                 if scenario == 'schema': self.manifest['schema'] = True
                 if scenario == 'repository': self.manifest['repository'] = 'hxx344/other'
                 if scenario == 'commit': self.manifest['commit'] = self.previous
                 if scenario == 'tag': self.manifest['tag'] = 'deploy-' + self.previous
-                if scenario == 'missing-arch': del self.manifest['artifacts']['linux-arm64']
-                if scenario == 'extra-arch': self.manifest['artifacts']['windows-x64'] = copy.deepcopy(item)
                 if scenario == 'path': item['file'] = '../other.tar.gz'
                 if scenario == 'sha': item['sha256'] = 'invalid'
                 if scenario == 'application-key': item['application_key'] = 'invalid'

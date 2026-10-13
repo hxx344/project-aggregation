@@ -405,6 +405,21 @@ class ReleaseCacheTests(unittest.TestCase):
             self.reader.read(fixtures[0])
             self.assertEqual(self.network.counts()['metadata'], before + 1)
 
+    def test_x64_only_release_is_readable_but_cannot_supply_an_arm_reader(self):
+        removed = self.value['manifest']['artifacts'].pop('linux-arm64')
+        self.value['metadata']['assets'] = [asset for asset in self.value['metadata']['assets']
+                                            if asset['name'] != removed['file']]
+        result = self.reader.read(self.module)
+        self.assertEqual(result['commit'], NEW)
+        self.assertEqual(set(result['manifest']['artifacts']), {'linux-x64'})
+        before = self.network.counts()
+        self.reader.arch = 'linux-arm64'
+        with self.assertRaisesRegex(releases.ReleaseError, '缺少匹配本机的完整部署包'):
+            self.reader.read(self.module)
+        self.assertNotIn((self.module.repository, 'linux-arm64'), self.reader._releases)
+        self.assertEqual(self.network.counts()['artifact'], before['artifact'])
+        self.assertEqual(self.network.counts()['installer'], before['installer'])
+
     def test_request_only_adapters_keep_complete_uncached_validation(self):
         reader = releases.Releases(SimpleNamespace(request=self.network.request), arch='linux-x64')
         reader.read(self.module)

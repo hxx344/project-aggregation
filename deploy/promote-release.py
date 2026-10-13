@@ -48,7 +48,7 @@ def main():
         manifest = json.loads((directory / 'release-manifest.json').read_text(encoding='utf-8'))
         if (type(manifest['schema']) is not int or manifest['schema'] != 1 or
                 manifest['repository'] != repository or manifest['commit'] != commit or manifest['tag'] != tag or
-                set(manifest['artifacts']) != {'linux-x64', 'linux-arm64'}):
+                set(manifest['artifacts']) != {'linux-x64'}):
             raise ValueError('Candidate manifest identity or architecture set is invalid')
         assets = {item['name']: item for item in release['assets']}
         downloaded = set()

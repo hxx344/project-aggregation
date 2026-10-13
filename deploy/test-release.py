@@ -107,6 +107,18 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         self.save_manifest()
         self.run_helper(False, TEST_ARCH='riscv64')
 
+    def test_x64_only_release_installs_on_x64_and_rejects_arm_without_using_cached_archive(self):
+        del self.manifest['artifacts']['linux-arm64']
+        self.save_manifest()
+        self.run_helper()
+        self.assertEqual((self.root / 'extracted/server/index.mjs').read_text(), 'export {};')
+        shutil.rmtree(self.root / 'extracted')
+        result = self.run_helper(False, TEST_ARCH='aarch64')
+        self.assertIn('linux-arm64', result.stderr)
+        self.assertFalse((self.root / 'extracted').exists())
+        urls = (self.root / 'urls').read_text().splitlines()
+        self.assertEqual(sum('/releases/download/deploy-' in url for url in urls), 1)
+
     def test_architecture_package_accepts_regular_native_runtime_binaries(self):
         content = b'platform-specific-native-runtime'
         member = tarfile.TarInfo('modules/asset/node_modules/native/binding.node')

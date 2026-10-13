@@ -24,7 +24,7 @@ class PublishRelease(unittest.TestCase):
         archive = self.root / 'fixture.tar.gz'; archive.write_bytes(b'fixture archive')
         item = {'file': archive.name, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'application_key': 'c' * 64}
         self.manifest = {'schema': 1, 'repository': self.repo, 'commit': self.commit, 'tag': self.tag,
-                         'artifacts': {'linux-x64': item, 'linux-arm64': item}}
+                         'artifacts': {'linux-x64': item}}
         (self.root / 'release-manifest.json').write_text(json.dumps(self.manifest), encoding='utf8')
         self.release = None
         self.calls = []
