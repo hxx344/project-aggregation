@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 export const EXAMPLE_SOURCE = '示例数据（非真实资产）';
 export const isVariationalProject = (project: string) => ['var', 'variational'].includes(project.trim().toLowerCase());
+export const isGateProject = (project: string) => ['gate', 'gate.io'].includes(project.trim().toLowerCase());
 export const IMPORT_MAX_BYTES = 5 * 1024 * 1024;
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
   const parsed = new Date(value + 'T00:00:00Z');
@@ -41,6 +42,7 @@ export function parseSource(input: unknown): SourceLedger {
   }
   if (baseline.rows.filter(r => r.project.trim().toLowerCase() === 'binance').length > 1) throw new Error('原表最多包含一条 Binance 资产，避免重复计入');
   if (baseline.rows.filter(r => r.project.trim().toLowerCase() === 'okx').length > 1) throw new Error('原表最多包含一条 OKX 资产，避免重复计入');
+  if (baseline.rows.filter(r => isGateProject(r.project)).length > 1) throw new Error('原表最多包含一条 Gate / Gate.io 资产，避免重复计入');
   if (baseline.rows.filter(r => isVariationalProject(r.project)).length > 1) throw new Error('原表最多包含一条 Var / Variational 资产，避免重复计入');
   return source;
 }

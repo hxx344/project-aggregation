@@ -4,6 +4,7 @@ export const fxSchema=z.object({fx:z.number().finite().gt(0).max(1000)}).strict(
 export const connectionSchema=z.discriminatedUnion('exchange',[
   z.object({exchange:z.literal('variational'),vrToken:z.string().trim().min(5).max(4096).regex(/^[A-Za-z0-9._~-]+$/)}).strict(),
   z.object({exchange:z.literal('okx'),apiKey:z.string().trim().min(5).max(256),apiSecret:z.string().trim().min(5).max(256),passphrase:z.string().trim().min(1).max(256)}).strict(),
+  z.object({exchange:z.literal('gate'),apiKey:z.string().trim().min(5).max(256).regex(/^[A-Za-z0-9_-]+$/),apiSecret:z.string().trim().min(5).max(256).regex(/^[A-Za-z0-9_-]+$/)}).strict(),
   z.object({exchange:z.literal('binance'),apiKey:z.string().trim().min(5).max(256),apiSecret:z.string().trim().min(5).max(256)}).strict(),
   z.object({exchange:z.literal('bybit'),apiKey:z.string().min(5).max(256),apiSecret:z.string().min(5).max(256),region:z.enum(['global','nl','tr','kz','ge','ae','eu']).default('global')}).strict(),
   z.object({exchange:z.literal('aster'),walletAddress:z.string().trim().regex(/^0x[0-9a-fA-F]{40}$/),privateKey:z.string().trim().regex(/^(0x)?[0-9a-fA-F]{64}$/),includeSpot:z.boolean().default(false)}).strict(),

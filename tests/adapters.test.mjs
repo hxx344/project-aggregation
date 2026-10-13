@@ -290,6 +290,13 @@ test('asset freshness follows dynamic mode rows and preserves manual valuation d
   assert.equal(oldOkx.updatedAt, old); assert.equal(oldOkx.freshness, undefined);
   const failedOkx = await read([{ ...dynamic, mode: 'okx', error: '同步失败' }]);
   assert.equal(failedOkx.partial, true); assert.doesNotMatch(failedOkx.message, /未识别/);
+  const gate = await read([manual, { ...dynamic, id: 'gate', project: 'Gate', mode: 'gate' }]);
+  assert.equal(gate.partial, false); assert.equal(gate.updatedAt, now); assert.equal(gate.freshness, undefined);
+  assert.equal(gate.metrics.find(metric => metric.key === 'ledger_total').value, 150);
+  const oldGate = await read([{ ...dynamic, mode: 'gate', updatedAt: old }]);
+  assert.equal(oldGate.updatedAt, old); assert.equal(oldGate.freshness, undefined);
+  const failedGate = await read([{ ...dynamic, mode: 'gate', error: 'Gate 读取失败' }]);
+  assert.equal(failedGate.partial, true); assert.doesNotMatch(failedGate.message, /未识别/);
     const variational = await read([manual, { ...dynamic, id: 'var', project: 'Var', mode: 'variational' }]);
     assert.equal(variational.partial, false); assert.equal(variational.updatedAt, now); assert.equal(variational.freshness, undefined);
     assert.equal(variational.metrics.find(metric => metric.key === 'ledger_total').value, 150);

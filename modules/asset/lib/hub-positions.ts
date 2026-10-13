@@ -28,6 +28,7 @@ async function defaultRead(credentials: Credentials, scope: string, signal: Abor
     case 'okx': return readOkxPositions(credentials, scope as 'SWAP' | 'FUTURES', fetch, signal);
     case 'aster': return readAsterPositions(credentials, fetch, signal);
     case 'variational': return readVariationalPythonPositions(credentials, signal);
+    default: throw new Error(POSITIONS_FAILED);
   }
 }
 

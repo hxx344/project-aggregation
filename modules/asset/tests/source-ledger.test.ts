@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { parseSource } from '../lib/source-ledger.ts';
+import { parseSource, isGateProject } from '../lib/source-ledger.ts';
 const example = () => JSON.parse(readFileSync(new URL('../lib/example-ledger.json', import.meta.url), 'utf8'));
 test('import validates baseline totals and recalculates future/difference flags', () => {
   const input = example();
@@ -55,4 +55,16 @@ test('Var and Variational aliases identify the same optional account', () => {
   assert.equal(parseSource(input).periods[0].rows.length,6);
   input.periods[0].rows.push({id:'row-8',project:'VARIATIONAL',kind:'资产',quantity:0,price:1,value:0,cell:'E8'});
   assert.throws(()=>parseSource(input),/Var/);
+});
+
+test('Gate and Gate.io identify one optional account and duplicate aliases are rejected', () => {
+  for (const name of ['Gate', 'gate', ' GATE.IO ']) {
+    assert.equal(isGateProject(name), true);
+    const input = example();
+    input.periods[0].rows.push({ id: 'row-7', project: name, kind: '资产', quantity: 0, price: 1, value: 0, cell: 'E7' });
+    assert.equal(parseSource(input).periods[0].rows.length, 6);
+    input.periods[0].rows.push({ id: 'row-8', project: 'gate.io', kind: '资产', quantity: 0, price: 1, value: 0, cell: 'E8' });
+    assert.throws(() => parseSource(input), /Gate/);
+  }
+  for (const name of ['gate futures', 'gateway', 'gate.io.example']) assert.equal(isGateProject(name), false);
 });

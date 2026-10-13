@@ -44,6 +44,21 @@ test('OKX balances are known dynamic assets and retain stale/error states', () =
   assert.doesNotMatch(failed.health.message,/未识别/);
 });
 
+test('Gate USD estimates count once and retain source failure and age in the summary', () => {
+  const read = (row: ReturnType<typeof asset> & {error?: string}) => buildHubSummary({...input(),assets:[row]},now).data;
+  const current = read(asset('gate',fresh,125.5));
+  assert.equal(current.health.state,'online');
+  assert.equal(current.metrics[0].value,125.5);
+  assert.equal(current.metrics.find(metric => metric.key === 'holdings')?.value,125.5);
+  assert.equal(current.freshness,undefined);
+  assert.equal(read(asset('gate','2020-01-01T00:00:00Z')).health.state,'stale');
+  assert.equal(read(asset('gate',fresh,0)).metrics[0].value,0);
+  assert.equal(read(asset('gate',fresh,null)).health.state,'partial');
+  const failed = read({...asset('gate'),error:'Gate 读取失败'});
+  assert.equal(failed.health.state,'partial');
+  assert.doesNotMatch(failed.health.message,/未识别/);
+});
+
 test('summary preserves ledger totals, withdrawals, oldest dynamic time and CNY/USD units', () => {
   const result = buildHubSummary({ ...input(), assets: [asset('market', fresh), asset('aster', '2026-09-22T16:58:00Z', 200), { ...asset('manual', '2020-01-01T00:00:00Z', 25), project: ' 出金 ' }] }, now);
   assert.equal(result.schemaVersion, 2);

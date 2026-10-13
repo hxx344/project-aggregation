@@ -85,6 +85,7 @@ test('extended catalog includes OKX owner metadata without key, secret or passph
   const { database, save } = fixture();
   try {
     const input = await save('owner', 'okx', okxCredential);
+    await save('owner', 'gate', { exchange: 'gate', apiKey: 'gate-asset-key', apiSecret: 'gate-asset-secret' });
     await save('other', 'binance');
     await save('other', 'okx', { ...okxCredential, passphrase: 'other-owner-passphrase' });
     const calls: string[] = [];
@@ -129,7 +130,7 @@ test('export requires password and matching owner, and returns only the exact gl
 
 test('strict export input rejects Aster, extra fields, malformed revisions, and invalid passwords', () => {
   const input = { exchange: 'binance', revision: 'a'.repeat(64), password };
-  for (const invalid of [null, [], {}, { ...input, exchange: 'aster' }, { ...input, owner: 'other' },
+  for (const invalid of [null, [], {}, { ...input, exchange: 'aster' }, { ...input, exchange: 'gate' }, { ...input, owner: 'other' },
     { ...input, region: 'global' }, { ...input, revision: 'g'.repeat(64) }, { ...input, password: '' },
     { ...input, password: 1 }, { ...input, password: 'p'.repeat(257) }]) {
     assert.throws(() => parseTradingExportInput(invalid), status(400));

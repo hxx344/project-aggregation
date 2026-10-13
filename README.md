@@ -47,6 +47,7 @@ python -m venv .venv
 `npm run check` 执行工作台类型检查，`npm test` 运行 Node 行为测试；模块集成测试需要先完成模块依赖安装与构建，并配置 Greeks Python 环境。Linux 安装、systemd 恢复与 x64/arm64 部署包验收由 GitHub Actions 执行。
 
 - [部署与迁移](docs/deployment.md)
+- [Gate 资产连接](docs/gate-assets.md)
 - [本地路由配置](docs/local-route.md)
 - [协作规则](AGENTS.md)、[经验记录](LESSONS.md)、[代码规范](docs/code-standards.md)
 - [文件组织](docs/FILE_ORGANIZATION.md)

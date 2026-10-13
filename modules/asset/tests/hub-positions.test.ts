@@ -25,8 +25,9 @@ function fixture() {
 
 test('Asset catalog includes all five exchanges before setup and never exposes credentials', async t => {
   const f = fixture(); t.after(() => f.database.close());
+  await f.save('owner', 'gate', { exchange: 'gate', apiKey: 'gate-asset-key', apiSecret: 'gate-asset-secret' });
   const service = createPositionsService({ read: async () => assert.fail('unconfigured must not read') });
-  const report = await service.read(f.database, 'owner', async () => assert.fail('unconfigured must not decrypt'));
+  const report = await service.read(f.database, 'owner', async () => assert.fail('asset-only Gate and unconfigured accounts must not decrypt'));
   assert.deepEqual(report.exchanges.map(item => item.id), ['binance', 'bybit', 'okx', 'aster', 'variational']);
   for (const exchange of report.exchanges) for (const account of exchange.accounts) {
     assert.equal(account.configured, false); assert.equal(account.revision, null);
