@@ -27,8 +27,8 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
           const point = payload?.[0]?.payload as typeof first | undefined;
           return active && point ? <div className="trend-tooltip"><strong>{point.date}</strong><div>实际持有：$ {money(point.held)}</div><div>累计出金：$ {money(point.withdrawn)}</div><div>剔除出金影响：$ {money(point.adjusted)}</div>{point.partial && <p>此快照含旧值或缺失行情</p>}{!!point.difference && <p>原表合计差异：$ {money(point.difference)}</p>}</div> : null;
         }}/>
-        <Line type="linear" name="剔除出金影响" dataKey="adjusted" stroke="var(--chart-1)" strokeWidth={2.5} dot={history.length === 1 ? { r: 4 } : false} activeDot={{ r: 5 }} isAnimationActive={false}/>
-        <Line type="linear" name="实际持有资产" dataKey="held" stroke="var(--chart-2)" strokeWidth={2} strokeDasharray="6 4" dot={history.length === 1 ? { r: 3 } : false} isAnimationActive={false}/>
+        <Line type="monotoneX" strokeLinecap="round" strokeLinejoin="round" name="剔除出金影响" dataKey="adjusted" stroke="var(--chart-1)" strokeWidth={2.5} dot={history.length === 1 ? { r: 4 } : false} activeDot={{ r: 5 }} isAnimationActive={false}/>
+        <Line type="monotoneX" strokeLinecap="round" strokeLinejoin="round" name="实际持有资产" dataKey="held" stroke="var(--chart-2)" strokeWidth={2} strokeDasharray="6 4" dot={history.length === 1 ? { r: 3 } : false} isAnimationActive={false}/>
       </LineChart></ResponsiveContainer>
     </div> : <div className="empty-state">刷新资产后生成第一条日快照</div>}
     <p className="chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。连线仅连接已有记录，不代表缺失日期的估值。{history.some(point => point.partial) && <strong> 含旧值快照，详见历史记录。</strong>}<button className="text-button" onClick={onHistory}>查看记录</button></p>
