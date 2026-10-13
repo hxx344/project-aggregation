@@ -4,6 +4,7 @@ import { AppError, defaults, configuration, validateFeed, validSignal, validManu
 import { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCrossexQuote, resolveManualQuote } from './clients.mjs';
 import { D, Decimal } from './money.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
+import { fundingOpportunities } from './funding-opportunities.mjs';
 
 const CONFIG_KEYS = ['entryPaused', 'monitorUrl', 'monitorUsername', 'notionalPerLeg', 'maxOpen', 'maxTotalNotional', 'feeBps', 'feeSchedule', 'slippageBps', 'minNetBps', 'cooldownSeconds'];
 const safeMessage = error => error instanceof AppError ? error.message : '行情读取失败，请检查来源连接';
@@ -227,7 +228,11 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError },
       venues: SUPPORTED_VENUES.map(id => ({ id, state: live ? feedIndex.venues.get(id) ?? 'unavailable' : 'offline', quoteCount: feedIndex.counts.get(id) || 0 })),
       fx: ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (e) { return { currency, state: 'unavailable', error: safeMessage(e) }; } }),
-      opportunities: includeOpportunities ? candidates() : [] };
+      opportunities: includeOpportunities ? candidates() : [],
+      fundingOpportunities: includeOpportunities ? fundingOpportunities(feed, { now, ruleFor: manualRuleFor,
+        sourceReason: live ? '' : sourceError || '价差数据已过期', entryPaused: config().entryPaused, entryPolicyKnown,
+        catalogExpiresAt: catalog.at + 900000,
+        signals: feedIndex.signals.values(), signalValid: signal => indexedValidSignal(signal, feed, feedIndex, now) }) : [] };
   }
   async function booksAndFx(quotes, requireFx = true, reader = depthReader) {
     const [books, fx] = await Promise.all([

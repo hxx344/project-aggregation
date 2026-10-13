@@ -1,5 +1,6 @@
 import type { State } from './types';
 import type { LiveConfig } from './SettingsForm';
+import type { FundingOpportunity } from './funding-opportunities';
 
 export type LivePosition = {
   id: string; symbol: string; exchange: string; side: string;
@@ -43,7 +44,7 @@ export type LiveView = {
   accountBookAsOf?: number | null; accountBookError?: string | null; feesAsOf?: number | null; feesError?: string | null;
 };
 export type LiveState = Pick<State, 'now' | 'csrfToken' | 'venues' | 'fx' | 'source' | 'catalog' | 'opportunities'> & {
-  mode: 'live'; config: LiveConfig; live: LiveView;
+  mode: 'live'; config: LiveConfig; live: LiveView; fundingOpportunities: FundingOpportunity[];
 };
 export type LiveBootstrap = { now: number; config: LiveConfig; connection: LiveView['connection']; csrfToken: string };
 

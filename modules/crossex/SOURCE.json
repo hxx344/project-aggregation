@@ -2,5 +2,12 @@
   "repository": "https://github.com/hxx344/gate-crossex-arbitrage.git",
   "commit": "804d284ec4ebd80c45c6a6ed50b7192e7af66f5d",
   "importedAt": "2026-10-13",
-  "scope": "Tracked runtime, frontend, tests and build inputs only; no runtime data, credentials or local environment."
+  "scope": "Tracked runtime, frontend, tests and build inputs only; no runtime data, credentials or local environment.",
+  "appliedPatches": [
+    {
+      "commit": "640df2f8c81990cf48e9bac1b2a6101fcafb8483",
+      "appliedAt": "2026-10-14",
+      "scope": "Funding opportunities: server, frontend and targeted tests. Standalone README excluded; workspace authorization, private transports and maintenance controls preserved."
+    }
+  ]
 }

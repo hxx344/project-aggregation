@@ -19,3 +19,4 @@
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation-duration:.01ms!important;animation-iteration-count:1!important}}
 
 .numeric-value{font-variant-numeric:tabular-nums;white-space:nowrap;overflow-wrap:normal;word-break:normal}.numeric-full{white-space:normal;overflow-wrap:anywhere}
+.opportunity-switch{display:flex;gap:6px;margin-top:10px}.opportunity-switch button{font-size:11px;padding:6px 11px}.opportunity-switch button[aria-pressed=true]{color:var(--green);border-color:#345c50;background:#122720}.funding-rate{display:flex;flex-direction:column;gap:3px;margin:5px 0 9px}.funding-rate strong{color:#c8d6e4;font-weight:500}.funding-table td{vertical-align:top}.funding-table td small{white-space:normal}.funding-table th{white-space:nowrap}.funding-table td:nth-child(6){max-width:220px}
