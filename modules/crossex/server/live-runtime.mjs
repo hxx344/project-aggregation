@@ -3,6 +3,7 @@ import { AppError } from './model.mjs';
 import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
+import { isBaseBlocked } from '../../../server/asset-identity.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
 const ACTIVE = new Set(['NEW', 'OPEN', 'PARTIALLY_FILLED']);
@@ -316,7 +317,10 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function checkCooldown(plan) {
     const cooldown = Number(plan.limits?.cooldownSeconds || 0) * 1000;
-    if (cooldown > 0 && executionRecords().some(e => e.base === plan.base && clock() - e.createdAt < cooldown)) fail('此资产仍在手动交易冷却期');
+    // Historical executions have no venue field. Conservatively retain the
+    // cooldown across verified alias spellings without rewriting native orders.
+    const bases = new Set([plan.base]);
+    if (cooldown > 0 && executionRecords().some(e => isBaseBlocked(bases, e.base) && clock() - e.createdAt < cooldown)) fail('此资产仍在手动交易冷却期');
   }
   async function positionsNotional(cache) {
     const held = cache.positions.filter(p => !D(p.position_qty).isZero());

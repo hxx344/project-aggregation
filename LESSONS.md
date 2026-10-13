@@ -291,7 +291,7 @@
 
 **证据：** `project-aggregation`，事件 `crossex-base-alias-20261014`。2026-10-14 核实 [Binance Terra 2.0 公告](https://www.binance.com/en/support/announcement/detail/2806253154aa4c36bffdfe60c6afc85e)、[Gate LUNA 合约公告](https://www.gate.com/pt/announcements/article/26708) 与 [OKX 合约单位](https://www.okx.com/en-eu/help/okx-to-list-usdt-margined-perpetual-for-luna)，并读取当前原生及 CrossEx 公共目录确认可用符号。修复集中于 [统一身份](server/asset-identity.mjs)、[Monitor 目录](modules/monitor/modules/perpetual/exchanges.mjs)、[CrossEx 核验](modules/crossex/server/model.mjs) 和 [原生读取](modules/crossex/server/clients.mjs)。LUNC 保持独立；文档中的 Bitget/FUTU 示例不属于本次已确认范围。
 
-**如何验证：** [别名回归](tests/crossex-base-matching.test.mjs) 覆盖已核实及伪造映射、旧报价、原生目录与筛选；[工作台资金费集成](tests/embedded-funding.test.mjs) 从真实市场发现到工作台机会及双腿只读预览保留原生代码；[模拟仓位检查](modules/crossex/tests/engine.test.mjs) 覆盖旧别名仓位平仓、重复开仓与冷却期。针对性测试与本次差异审查即可，不推进主线复盘检查点。
+**如何验证：** [别名回归](tests/crossex-base-matching.test.mjs) 覆盖已核实及伪造映射、旧报价、原生目录与筛选；[工作台资金费集成](tests/embedded-funding.test.mjs) 从真实市场发现到工作台机会及双腿只读预览保留原生代码；[模拟仓位检查](modules/crossex/tests/engine.test.mjs) 覆盖旧别名仓位平仓、重复开仓与冷却期。生产入口使用 `live-runtime.mjs`，须另用[实盘回归](modules/crossex/tests/live-runtime.test.mjs) 验证历史别名记录在预览、确认和容量查询中保持冷却限制；`47be9dd` 的模拟引擎检查不能代替该路径。针对性测试与本次差异审查即可，不推进主线复盘检查点。
 
 **事件记录：** `crossex-base-alias-20261014`；本轮身份、匹配与兼容修复归为同一事件，不增加复发次数。
 
