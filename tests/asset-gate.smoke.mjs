@@ -43,12 +43,13 @@ const gateUrl = 'https://api.gateio.ws/api/v4/wallet/total_balance?currency=USD'
 const credentials = { exchange: 'gate', apiKey: 'synthetic-gate-key', apiSecret: 'synthetic-gate-secret' };
 const replacement = { exchange: 'gate', apiKey: 'synthetic-gate-key-replacement', apiSecret: 'synthetic-gate-secret-replacement' };
 const secrets = [credentials.apiKey, credentials.apiSecret, replacement.apiKey, replacement.apiSecret];
+const sensitiveDetails = secrets.join(' ') + ' signature=private-signature https://evil.example signed-request';
 const emptyHash = createHash('sha512').update('').digest('hex');
 const payload = {
   total: { amount: '125.50', currency: 'USD' },
   details: { spot: { amount: '100', currency: 'USD' }, futures: { amount: '25.50', currency: 'USD' } },
 };
-let gateFailure = false;
+let gateFailure = null;
 let gateCalls = 0;
 let externalFailures = 0;
 const transportViolations = [];
@@ -83,7 +84,11 @@ globalThis.fetch = async (input, init = {}) => {
       .update(['GET', '/api/v4/wallet/total_balance', 'currency=USD', emptyHash, timestamp].join('\n')).digest('hex');
     assert.equal(headers.get('SIGN'), expected, 'Sign the exact method, path, query, empty payload hash and timestamp');
     for (const secret of secrets) assert.ok(!url.href.includes(secret));
-    if (gateFailure) return Response.json({ label: 'INVALID_KEY', message: `${apiKey} ${signedWith.apiSecret}` }, { status: 403 });
+    // Return a rejected promise without awaiting it so this intentional transport
+    // failure does not enter the assertion-violation catch below.
+    if (gateFailure === 'dns') return Promise.reject(new Error('fetch failed ' + sensitiveDetails, { cause: { code: 'ENOTFOUND', message: sensitiveDetails } }));
+    if (gateFailure === 'unknown403') return new Response('<html>' + sensitiveDetails + '</html>', { status: 403 });
+    if (gateFailure) return Response.json({ label: gateFailure, message: sensitiveDetails, detail: sensitiveDetails }, { status: 403 });
     return Response.json(payload);
   } catch (error) {
     transportViolations.push(error);
@@ -103,6 +108,7 @@ function noCredentials(value) {
   const serialized = typeof value === 'string' ? value : JSON.stringify(value);
   for (const secret of secrets) assert.ok(!serialized.includes(secret), 'Public responses and stored metadata must not contain credentials');
   assert.doesNotMatch(serialized, /"(?:apiKey|apiSecret|encrypted)"\s*:/);
+  assert.doesNotMatch(serialized, /private-signature|evil\.example|signed-request/);
 }
 
 function request(path, { method = 'GET', body } = {}) {
@@ -193,15 +199,27 @@ try {
   assert.equal(owner, 'owner', 'Managed Asset signs the owner session');
   const originalAssets = storedAssets();
 
-  gateFailure = true;
-  let expectedGateCalls = 1;
-  await rejected('/api/connections', { method: 'POST', body: credentials });
-  assert.equal(gateCalls, expectedGateCalls);
-  assert.equal(storedCredential(), undefined, 'First failure must not save credentials');
-  assert.deepEqual(storedAssets(), originalAssets, 'First failure must not create an asset');
-  assert.equal((await success('/api/ledger')).connections.gate.configured, false);
+  let expectedGateCalls = 0;
+  for (const [failure, checks] of [
+    ['IP_FORBIDDEN', [/HTTP 403/, /IP_FORBIDDEN/, /服务器.*出口/, /白名单/]],
+    ['unknown403', [/HTTP 403/, /未返回可识别的.*错误码/, /权限|访问限制/]],
+    ['dns', [/DNS.*解析|解析.*DNS/, /检查|重试/]],
+  ]) {
+    gateFailure = failure;
+    const diagnostic = await rejected('/api/connections', { method: 'POST', body: credentials });
+    assert.match(diagnostic.error, /^Gate 读取失败/, 'Detailed diagnostics must survive the production API failure filter');
+    assert.match(diagnostic.error, /本次未更新资产数据/);
+    for (const check of checks) assert.match(diagnostic.error, check);
+    if (failure === 'dns') assert.doesNotMatch(diagnostic.error, /HTTP|ENOTFOUND|fetch failed/);
+    assert.equal(gateCalls, ++expectedGateCalls);
+    assert.equal(storedCredential(), undefined, 'First failure must not save credentials');
+    assert.deepEqual(storedAssets(), originalAssets, 'First failure must not create an asset');
+    const failedLedger = await success('/api/ledger');
+    assert.equal(failedLedger.connections.gate.configured, false);
+    assert.equal(failedLedger.connections.gate.lastSync, null);
+  }
 
-  gateFailure = false;
+  gateFailure = null;
   let since = Date.now();
   let ledger = await success('/api/connections', { method: 'POST', body: credentials });
   assert.equal(gateCalls, ++expectedGateCalls);
@@ -229,21 +247,30 @@ try {
   balanceUnchanged(gateAsset(await success('/api/ledger')), asset);
 
   const savedConnection = storedCredential();
-  gateFailure = true;
-  await rejected('/api/connections', { method: 'POST', body: replacement });
+  const lastSync = ledger.connections.gate.lastSync;
+  gateFailure = 'FORBIDDEN';
+  const replacementError = await rejected('/api/connections', { method: 'POST', body: replacement });
+  assert.match(replacementError.error, /HTTP 403.*FORBIDDEN/);
+  assert.match(replacementError.error, /钱包.*读取/);
   assert.equal(gateCalls, ++expectedGateCalls);
   assert.deepEqual(storedCredential(), savedConnection, 'Failed replacement must preserve the previous encrypted credentials');
-  balanceUnchanged(gateAsset(await success('/api/ledger')), asset);
+  const afterReplacementFailure = await success('/api/ledger');
+  balanceUnchanged(gateAsset(afterReplacementFailure), asset);
+  assert.equal(afterReplacementFailure.connections.gate.lastSync, lastSync);
 
+  gateFailure = 'INVALID_SIGNATURE';
   clearRefreshThrottle();
   ledger = await success('/api/sync', { method: 'POST', body: {} });
   assert.equal(gateCalls, ++expectedGateCalls);
   balanceUnchanged(gateAsset(ledger), asset);
   assert.match(gateAsset(ledger).status, /失败.*旧值/);
-  assert.ok(gateAsset(ledger).error && ledger.connections.gate.error);
+  assert.match(gateAsset(ledger).error, /HTTP 403.*INVALID_SIGNATURE/);
+  assert.match(ledger.connections.gate.error, /同一组|配对/);
+  assert.equal(gateAsset(ledger).error, ledger.connections.gate.error);
+  assert.equal(ledger.connections.gate.lastSync, lastSync, 'Failed refresh must preserve the last successful sync time');
   assert.deepEqual(storedCredential(), savedConnection);
 
-  gateFailure = false;
+  gateFailure = null;
   clearRefreshThrottle();
   const beforeQuoteFailures = externalFailures;
   since = Date.now();
@@ -318,7 +345,7 @@ try {
   assert.ok(existsSync(join(dataDir, 'backups', imported.backupName)));
   assert.equal(gateCalls, expectedGateCalls, 'Import must preserve balances without querying Gate');
   assert.deepEqual(transportViolations, [], 'All outbound Gate requests must satisfy the signed GET contract');
-  console.log('Gate production smoke passed: signed GET, encrypted credentials, atomic connect/replace, independent refresh, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
+  console.log('Gate production smoke passed: signed GET, safe detailed API diagnostics, encrypted credentials, atomic connect/replace, independent refresh, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

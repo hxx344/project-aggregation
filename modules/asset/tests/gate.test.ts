@@ -13,6 +13,28 @@ function mock(handler: (url: URL, init: RequestInit) => unknown): typeof fetch {
   return (async (url: RequestInfo | URL, init: RequestInit = {}) => Response.json(handler(new URL(String(url)), init))) as typeof fetch;
 }
 function response(value: unknown): typeof fetch { return mock(() => value); }
+const sensitive = Object.values(credential).join(' ') + ' signature=private-signature https://evil.example signed-request';
+function diagnostic(error: unknown, checks: readonly RegExp[] = []): boolean {
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /^Gate 读取失败/);
+  assert.match(error.message, /本次未更新资产数据/);
+  for (const secret of [...Object.values(credential), 'signature=', 'private-signature', 'evil.example', 'signed-request']) {
+    assert.equal(error.message.includes(secret), false, 'Diagnostics must not expose untrusted response or transport details');
+  }
+  for (const check of checks) assert.match(error.message, check);
+  return true;
+}
+function streamedResponse(chunks: Uint8Array[], headers: HeadersInit = {}) {
+  let reads = 0, canceled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const chunk = chunks[reads++];
+      if (chunk) controller.enqueue(chunk); else controller.close();
+    },
+    cancel() { canceled = true; },
+  }, { highWaterMark: 0 });
+  return { response: new Response(body, { status: 403, headers }), reads: () => reads, canceled: () => canceled };
+}
 
 test('Gate connection credentials trim values and reject malformed or extra request fields', () => {
   const input = { exchange: 'gate', ...credential };
@@ -142,22 +164,133 @@ test('Gate rejects all paths except the balance endpoint and rejects empty crede
   assert.equal(calls, 0);
 });
 
-test('Gate sanitizes network failures, error labels, raw bodies and JSON parse failures', async () => {
-  const sensitive = Object.values(credential).join(' ') + ' signature=private-signature https://evil.example';
-  const safeError = (error: unknown) => {
-    assert.ok(error instanceof Error);
-    assert.match(error.message, /Gate 读取失败/);
-    for (const secret of [...Object.values(credential), 'signature=', 'private-signature', 'evil.example']) assert.equal(error.message.includes(secret), false);
-    return true;
-  };
-  for (const label of ['INVALID_SIGNATURE', 'FORBIDDEN', sensitive, null, {}, '']) {
-    await assert.rejects(syncGate(credential, response({ ...valuation(), label, message: sensitive, detail: sensitive })), safeError);
+test('Gate maps known authentication labels to safe actionable diagnostics with the actual HTTP status', async () => {
+  const cases = [
+    ['INVALID_CREDENTIALS', [/凭据|密钥/, /Key|Secret|重新/]],
+    ['INVALID_KEY', [/Key|密钥/, /无效|失效|识别/]],
+    ['IP_FORBIDDEN', [/服务器.*出口/, /IPv4/, /白名单/]],
+    ['READ_ONLY', [/只读/, /账户|API/]],
+    ['INVALID_SIGNATURE', [/签名/, /同一组|配对/, /Key.*Secret/]],
+    ['MISSING_REQUIRED_HEADER', [/请求头|认证头/]],
+    ['REQUEST_EXPIRED', [/时间|时钟/, /同步/, /60/]],
+    ['ACCOUNT_LOCKED', [/锁定/, /账户/]],
+    ['FORBIDDEN', [/钱包.*读取/, /权限/]],
+  ] as const;
+  for (const [label, checks] of cases) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 403 })), error => {
+      diagnostic(error, [/HTTP 403/, new RegExp(label), ...checks]);
+      if (label === 'READ_ONLY') assert.doesNotMatch((error as Error).message, /请.{0,12}(开启|启用).{0,8}(写入|交易|提现)/);
+      return true;
+    });
   }
-  for (const fetcher of [
-    (async () => { throw new Error(sensitive); }) as typeof fetch,
-    (async () => new Response(sensitive, { status: 200 })) as typeof fetch,
-    ...[401, 403, 429, 500, 503].map(status => (async () => new Response(sensitive, { status })) as typeof fetch),
-  ]) await assert.rejects(syncGate(credential, fetcher), safeError);
+});
+
+test('Gate maps known rate and server labels without reflecting provider explanations', async () => {
+  for (const [label, status, reason] of [
+    ['TOO_MANY_REQUESTS', 429, /频率|限流/], ['TOO_BUSY', 503, /繁忙/],
+    ['INTERNAL', 500, /服务/], ['SERVER_ERROR', 502, /服务/], ['INTERNAL_SERVER_ERROR', 503, /服务/],
+  ] as const) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status })),
+      error => diagnostic(error, [new RegExp(`HTTP ${status}`), new RegExp(label), reason, /稍后|重试/]));
+  }
+});
+
+test('Gate only recognizes exact own allowlisted labels and falls back safely for unknown or malformed bodies', async () => {
+  for (const label of ['FUTURE_GATE_ERROR', 'constructor', '__proto__', 'toString', 'forbidden', 'FORBIDDEN ', 'INVALID_SIGNATURE\n', sensitive, '', null, 1, false, {}, []]) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 403 })), error => {
+      diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/, /权限/, /IP|白名单/]);
+      if (typeof label === 'string' && label) assert.equal((error as Error).message.includes(label), false);
+      return true;
+    });
+  }
+  for (const body of ['', '<html>' + sensitive + '</html>', '{"label":"FORBIDDEN",broken:' + sensitive, JSON.stringify({ message: sensitive }), 'null', '[]', '"FORBIDDEN"']) {
+    await assert.rejects(syncGate(credential, async () => new Response(body, { status: 403 })),
+      error => diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/, /访问|限制/]));
+  }
+  for (const [status, reason] of [[401, /认证/], [429, /频率|限流/], [500, /服务/], [502, /服务/], [503, /服务/], [400, /未返回可识别的.*错误码/]] as const) {
+    await assert.rejects(syncGate(credential, async () => new Response(sensitive, { status })),
+      error => diagnostic(error, [new RegExp(`HTTP ${status}`), reason]));
+  }
+});
+
+test('Gate never treats a 2xx error label or invalid JSON as a successful balance', async () => {
+  for (const label of ['FORBIDDEN', 'INVALID_SIGNATURE', sensitive, null, {}, '']) {
+    await assert.rejects(syncGate(credential, response({ ...valuation(), label, message: sensitive, detail: sensitive })), error => {
+      diagnostic(error, [/HTTP 200/]);
+      if (label === 'FORBIDDEN') assert.match((error as Error).message, /FORBIDDEN.*钱包|钱包.*读取/);
+      return true;
+    });
+  }
+  await assert.rejects(syncGate(credential, async () => new Response(sensitive, { status: 200 })), error => diagnostic(error));
+});
+
+test('Gate limits error bodies to 16 KiB of declared and actual bytes and cancels oversized streams', async () => {
+  const limit = 16 * 1024;
+  const wrapperSize = Buffer.byteLength(JSON.stringify({ label: 'FORBIDDEN', message: '' }));
+  const boundary = Buffer.from(JSON.stringify({ label: 'FORBIDDEN', message: 'x'.repeat(limit - wrapperSize) }));
+  assert.equal(boundary.byteLength, limit);
+  const exact = streamedResponse([boundary], { 'content-length': String(limit) });
+  await assert.rejects(syncGate(credential, async () => exact.response), error => diagnostic(error, [/FORBIDDEN/, /钱包.*读取/]));
+  assert.equal(exact.canceled(), false);
+
+  const declared = streamedResponse([boundary], { 'content-length': String(limit + 1) });
+  await assert.rejects(syncGate(credential, async () => declared.response), error => diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/]));
+  assert.equal(declared.reads(), 0, 'An oversized declared body must not be read');
+  assert.equal(declared.canceled(), true);
+
+  for (const headers of [new Headers(), new Headers({ 'content-length': '1' })]) {
+    const oversized = streamedResponse([boundary, Buffer.from(' '), Buffer.from(sensitive)], headers);
+    await assert.rejects(syncGate(credential, async () => oversized.response), error => {
+      diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/]);
+      assert.doesNotMatch((error as Error).message, /FORBIDDEN/);
+      return true;
+    });
+    assert.equal(oversized.reads(), 2, 'Stop as soon as the first excess byte arrives');
+    assert.equal(oversized.canceled(), true);
+  }
+  const unicode = JSON.stringify({ label: 'FORBIDDEN', message: '中'.repeat(6000) });
+  assert.ok(unicode.length < limit && Buffer.byteLength(unicode) > limit);
+  const multibyte = streamedResponse([Buffer.from(unicode)]);
+  await assert.rejects(syncGate(credential, async () => multibyte.response), error => diagnostic(error, [/未返回可识别的.*错误码/]));
+  assert.equal(multibyte.canceled(), true, 'The cap is measured in UTF-8 bytes, not characters');
+});
+
+test('Gate retains safe status diagnostics when the error response stream fails', async () => {
+  let reads = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (reads++ === 0) controller.enqueue(Buffer.from('{"label":"FORBIDDEN","message":"'));
+      else controller.error(new Error(sensitive));
+    },
+  }, { highWaterMark: 0 });
+  await assert.rejects(syncGate(credential, async () => new Response(body, { status: 403 })),
+    error => diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/]));
+});
+
+test('Gate classifies known transport causes without exposing causes, codes, signed requests or URLs', async () => {
+  const cases = [
+    ['ENOTFOUND', /DNS.*解析|解析.*DNS/], ['EAI_AGAIN', /DNS.*解析|解析.*DNS/],
+    ['CERT_HAS_EXPIRED', /证书/], ['DEPTH_ZERO_SELF_SIGNED_CERT', /证书/], ['ERR_TLS_CERT_ALTNAME_INVALID', /证书/],
+    ['ECONNREFUSED', /无法.*连接|连接.*失败/], ['ENETUNREACH', /无法.*连接|连接.*失败/], ['EHOSTUNREACH', /无法.*连接|连接.*失败/],
+    ['ECONNRESET', /连接.*中断/], ['UND_ERR_SOCKET', /连接.*中断/],
+    ['ETIMEDOUT', /超时/], ['UND_ERR_CONNECT_TIMEOUT', /超时/],
+  ] as const;
+  for (const [code, reason] of cases) {
+    const error = new Error(sensitive, { cause: { code, message: sensitive, hostname: 'evil.example' } });
+    await assert.rejects(syncGate(credential, async () => { throw error; }), failure => {
+      diagnostic(failure, [reason, /检查|重试|稍后/]);
+      assert.doesNotMatch((failure as Error).message, /HTTP|12\s*秒/);
+      assert.equal((failure as Error).message.includes(code), false);
+      return true;
+    });
+  }
+  for (const error of [new Error(sensitive), Object.assign(new Error('timeout network aborted ' + sensitive), { name: 'AbortError' }), new Error(sensitive, { cause: { code: sensitive } })]) {
+    await assert.rejects(syncGate(credential, async () => { throw error; }), failure => {
+      diagnostic(failure, [/网络/]);
+      assert.doesNotMatch((failure as Error).message, /HTTP|超时|timeout|network|aborted/i);
+      return true;
+    });
+  }
 });
 
 test('Gate aborts timed out requests and does not expose abort reasons', async t => {
@@ -169,19 +302,37 @@ test('Gate aborts timed out requests and does not expose abort reasons', async t
     return new Promise<Response>((_resolve, reject) => init.signal!.addEventListener('abort', () => reject(new Error(credential.apiSecret)), { once: true }));
   }) as typeof fetch);
   controller.abort();
-  await assert.rejects(result, error => error instanceof Error && /Gate 读取失败/.test(error.message) && !error.message.includes(credential.apiSecret));
+  await assert.rejects(result, error => diagnostic(error, [/超时/, /12\s*秒/, /检查|重试/]));
   assert.equal(calls, 1);
+});
+
+test('Gate identifies a timeout while reading either a success or error body without exposing the stream error', async t => {
+  for (const status of [200, 403]) {
+    const controller = new AbortController();
+    t.mock.method(AbortSignal, 'timeout', () => controller.signal);
+    const body = new ReadableStream<Uint8Array>({
+      pull(stream) {
+        controller.abort(new Error(sensitive));
+        stream.error(new Error(sensitive));
+      },
+    }, { highWaterMark: 0 });
+    await assert.rejects(syncGate(credential, async () => new Response(body, { status })),
+      error => diagnostic(error, [new RegExp(`HTTP ${status}`), /超时/, /12\s*秒/]));
+  }
 });
 
 test('Gate refuses redirects without forwarding authenticated headers to another host', async () => {
   let calls = 0;
+  let bodyReads = 0;
   const redirect = (async (_url: unknown, init: RequestInit) => {
     calls++;
     assert.equal(init.redirect, 'manual');
-    return new Response('', { status: 302, headers: { location: 'https://evil.example' } });
+    return new Response(new ReadableStream({ pull() { bodyReads++; assert.fail('Redirect bodies must not be read'); } }, { highWaterMark: 0 }),
+      { status: 302, headers: { location: 'https://evil.example/' + credential.apiSecret } });
   }) as typeof fetch;
-  await assert.rejects(syncGate(credential, redirect), /HTTP 302/);
+  await assert.rejects(syncGate(credential, redirect), error => diagnostic(error, [/HTTP 302/, /重定向/]));
   assert.equal(calls, 1);
+  assert.equal(bodyReads, 0);
   const followed = (async () => {
     const result = Response.json(valuation());
     Object.defineProperty(result, 'redirected', { value: true });
