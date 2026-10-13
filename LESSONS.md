@@ -281,6 +281,20 @@
 
 **事件记录：** `pnpm-immutable-auto-install-20261014`；迁移 CI 中一次已核实缺陷，后续连续修补不增加事件数。
 
+### L020：统一标的与原生合约身份分别保留
+
+**适用条件：** 不同交易所对同一加密标的使用不同币名，且行情配对、CrossEx 目录和原生深度读取共用报价对象。
+
+**根因：** `base` 用于标的比较，`rawBase` 保存交易所原始币名；本仓 `35396d4` 尚未归一 Gate/OKX 的 `LUNA` 与 Binance/Bybit 的 `LUNA2`，身份校验又一概拒绝两字段不同。把 `rawBase` 当归一字段替换分组键无法修复，按归一字段拼接原生合约则会请求错误目录。
+
+**以后做法：** 仅接入有官方身份及单位证据的交易所限定别名；保留原生 `symbol`、`rawBase` 和 CrossEx 目录代码。身份校验、只读预览、旧仓平仓、屏蔽名单与冷却期须使用一致语义。旧原生 `base` 表达仍可核验，但不得接受任意自报别名、倍率归一或股票代币替代关系。
+
+**证据：** `project-aggregation`，事件 `crossex-base-alias-20261014`。2026-10-14 核实 [Binance Terra 2.0 公告](https://www.binance.com/en/support/announcement/detail/2806253154aa4c36bffdfe60c6afc85e)、[Gate LUNA 合约公告](https://www.gate.com/pt/announcements/article/26708) 与 [OKX 合约单位](https://www.okx.com/en-eu/help/okx-to-list-usdt-margined-perpetual-for-luna)，并读取当前原生及 CrossEx 公共目录确认可用符号。修复集中于 [统一身份](server/asset-identity.mjs)、[Monitor 目录](modules/monitor/modules/perpetual/exchanges.mjs)、[CrossEx 核验](modules/crossex/server/model.mjs) 和 [原生读取](modules/crossex/server/clients.mjs)。LUNC 保持独立；文档中的 Bitget/FUTU 示例不属于本次已确认范围。
+
+**如何验证：** [别名回归](tests/crossex-base-matching.test.mjs) 覆盖已核实及伪造映射、旧报价、原生目录与筛选；[工作台资金费集成](tests/embedded-funding.test.mjs) 从真实市场发现到工作台机会及双腿只读预览保留原生代码；[模拟仓位检查](modules/crossex/tests/engine.test.mjs) 覆盖旧别名仓位平仓、重复开仓与冷却期。针对性测试与本次差异审查即可，不推进主线复盘检查点。
+
+**事件记录：** `crossex-base-alias-20261014`；本轮身份、匹配与兼容修复归为同一事件，不增加复发次数。
+
 ## Moved to the code standards
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目归档到本节，保留证据与规范链接；不按重复复盘次数自动升级。

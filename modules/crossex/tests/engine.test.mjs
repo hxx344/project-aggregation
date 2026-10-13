@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, feed, book, quote, epoch } from './fixtures.mjs';
+import { pairKey } from '../server/model.mjs';
 
 test('manual open/close records equal fills and correct PnL with all four fees', async t => {
   const f = fixture(t); await f.engine.tick();
@@ -11,6 +12,29 @@ test('manual open/close records equal fills and correct PnL with all four fees',
   const expectedGross = p.quantity * 2, expectedFees = p.quantity * (100 + 102 + 101 + 101) * 6 / 10000;
   assert.ok(Math.abs(closed.result.net - (expectedGross - expectedFees)) < 1e-10);
   assert.equal(closed.fundingPnl, null); assert.equal(f.engine.view().totals.closedCount, 1);
+});
+
+test('legacy alias positions close after normalization and retain active-base and cooldown protection', async t => {
+  const f = fixture(t), template = feed();
+  const nativeLeg = (exchange, bid, ask) => quote(exchange, epoch, {
+    base: 'LUNA', rawBase: 'LUNA', symbol: exchange === 'gate' ? 'LUNA_USDT' : 'LUNA-USDT-SWAP',
+    settlementCurrency: 'USDT', counterCurrency: 'USDT', contractKind: 'linear', bid, ask,
+    crossexSymbol: `${exchange.toUpperCase()}_FUTURE_LUNA_USDT`,
+  });
+  const original = [nativeLeg('gate', 99, 100), nativeLeg('okx', 102, 103)];
+  const snapshot = (quotes, id) => {
+    const signal = { ...template.signals[0], id, base: quotes[0].base, long: quotes[0], short: quotes[1] };
+    return { ...template, schemaVersion: 2, quotes, exchanges: quotes.map(q => ({ id: q.exchange, status: 'live' })),
+      signals: [{ ...signal, pairKey: pairKey(signal) }] };
+  };
+  f.setCatalog(original.map(q => ({ symbol: q.crossexSymbol, exchange_type: q.exchange.toUpperCase(), business_type: 'FUTURE',
+    state: 'live', delist_time: '0', min_size: '0.001', lot_size: '0.001', tick_size: '0.01', min_notional: '5', max_market_size: '10000' })));
+  f.setFeed(snapshot(original, 'alias-old')); await f.engine.tick();
+  const position = await f.engine.open('alias-old', 'alias-open-original');
+  f.setFeed(snapshot(original.map(q => ({ ...q, base: 'LUNA2' })), 'alias-new')); await f.engine.tick();
+  await assert.rejects(f.engine.open('alias-new', 'alias-open-duplicate'), /已有模拟持仓/);
+  assert.equal((await f.engine.closePosition(position.id, 'alias-close-original')).status, 'closed');
+  await assert.rejects(f.engine.open('alias-new', 'alias-open-cooldown'), /冷却期/);
 });
 test('concurrent retry, repeated signal, active base and restart all preserve dedup', async t => {
   const f = fixture(t); await f.engine.tick();

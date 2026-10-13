@@ -78,3 +78,53 @@ test('embedded funding rows become read-only when rate data expires or required 
   assert.deepEqual(f.stats.privateClients, []);
   assert.equal(f.crossex.store.prepare('SELECT count(*) AS count FROM live_orders').get().count, 0);
 });
+
+test('embedded funding aliases preserve native contracts through discovery and read-only pair preview', async t => {
+  const f = await createEmbeddedFundingFixture({ alias: true }); t.after(() => f.close());
+  await f.login(); const module = await f.launch();
+  const response = await module.request('/api/state');
+  assert.equal(response.status, 200, response.text);
+  assert.equal(response.data.fundingOpportunities.length, 1);
+  const row = response.data.fundingOpportunities[0];
+  assert.equal(row.base, 'LUNA2');
+  assert.equal(row.long.exchange, 'gate');
+  assert.equal(row.long.symbol, 'GATE_FUTURE_LUNA_USDT');
+  assert.equal(row.short.exchange, 'binance');
+  assert.equal(row.short.symbol, 'BINANCE_FUTURE_LUNA2_USDT');
+  assert.equal(row.long.normalized8hBps, 2);
+  assert.equal(row.short.normalized8hBps, 8);
+  assert.equal(row.equivalent8hBps, 6);
+  assert.equal(row.eligible, true, row.reason);
+  assert.ok(row.grossBps < 0);
+  assert.equal(f.feed.signals.length, 1);
+  assert.equal(f.feed.signals[0].base, 'LUNA2');
+  assert.equal(f.feed.signals[0].long.exchange, 'binance');
+  assert.equal(f.feed.signals[0].short.exchange, 'gate');
+  assert.deepEqual(f.feed.quotes.map(q => ({ exchange: q.exchange, base: q.base, rawBase: q.rawBase,
+    symbol: q.symbol, crossexSymbol: q.crossexSymbol, multiplier: q.multiplier })), [
+    { exchange: 'binance', base: 'LUNA2', rawBase: 'LUNA2', symbol: 'LUNA2USDT', crossexSymbol: 'BINANCE_FUTURE_LUNA2_USDT', multiplier: 1 },
+    { exchange: 'gate', base: 'LUNA2', rawBase: 'LUNA', symbol: 'LUNA_USDT', crossexSymbol: 'GATE_FUTURE_LUNA_USDT', multiplier: 1 },
+  ]);
+
+  // Use the exact symbols returned to the workbench for prefill. The market
+  // preview is read-only and requires no private account connection.
+  const plan = await f.crossex.market.previewPair({ longSymbol: row.long.symbol, shortSymbol: row.short.symbol, quantity: '200' });
+  assert.equal(plan.source, 'pair');
+  assert.equal(plan.base, 'LUNA2');
+  assert.deepEqual(plan.legs.map(leg => ({ symbol: leg.symbol, side: leg.side, quantity: leg.quantity,
+    nativeSymbol: leg.quote.symbol, rawBase: leg.quote.rawBase, base: leg.quote.base,
+    multiplier: leg.quote.multiplier, nativeUnit: leg.quote.nativeUnit, referencePrice: leg.referencePrice })), [
+    { symbol: 'GATE_FUTURE_LUNA_USDT', side: 'BUY', quantity: '200', nativeSymbol: 'LUNA_USDT', rawBase: 'LUNA',
+      base: 'LUNA2', multiplier: 1, nativeUnit: '1', referencePrice: '0.0511' },
+    { symbol: 'BINANCE_FUTURE_LUNA2_USDT', side: 'SELL', quantity: '200', nativeSymbol: 'LUNA2USDT', rawBase: 'LUNA2',
+      base: 'LUNA2', multiplier: 1, nativeUnit: '1', referencePrice: '0.0499' },
+  ]);
+  assert.ok(f.stats.publicHttp.some(call => new URL(call.url).pathname === '/api/v4/futures/usdt/contracts'));
+  assert.ok(f.stats.publicHttp.some(call => new URL(call.url).pathname === '/api/v4/futures/usdt/contracts/LUNA_USDT'));
+  assert.ok(f.stats.publicHttp.some(call => new URL(call.url).searchParams.get('contract') === 'LUNA_USDT'));
+  assert.ok(f.stats.publicHttp.some(call => new URL(call.url).searchParams.get('symbol') === 'LUNA2USDT'));
+  assert.ok(f.stats.publicHttp.every(call => call.method === 'GET'));
+  assert.ok(f.stats.crossex.every(call => call.method === 'GET' || call.path === '/__workspace/maintenance'));
+  assert.deepEqual(f.stats.privateClients, []);
+  assert.equal(f.crossex.store.prepare('SELECT count(*) AS count FROM live_orders').get().count, 0);
+});

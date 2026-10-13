@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
+import { isBaseBlocked } from '../../../server/asset-identity.mjs';
 import { AppError, configuration, validateFeed, validSignal, pairKey, quoteKey, contractIdentity, freshQuote, quoteTime, catalogRule, commonQuantity, validateBooks, fill, partialFill, pnl, fxRate, referencePrice, notionalUSDT, storedNotional, settlement, SUPPORTED_VENUES } from './model.mjs';
 import { loadCatalog, loadFeed, loadDepth, loadFx } from './clients.mjs';
 import { D } from './money.mjs';
@@ -234,8 +235,8 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     const active = store.positions('open'), positions = [...active, ...store.positions('closed', 200)];
     if (active.length >= c.maxOpen) throw new AppError('已达到最大持仓数量');
     if (store.hasSignal(signalId)) throw new AppError('这份信号已执行过模拟', 409);
-    if (active.some(p => p.base === candidate.base)) throw new AppError('该币种已有模拟持仓，不重复或反向开仓', 409);
-    if (store.coolingBases(clock() - c.cooldownSeconds * 1000).includes(candidate.base)) throw new AppError('该币种仍在开仓冷却期');
+    if (isBaseBlocked(new Set(active.map(p => p.base)), candidate.base)) throw new AppError('该币种已有模拟持仓，不重复或反向开仓', 409);
+    if (isBaseBlocked(new Set(store.coolingBases(clock() - c.cooldownSeconds * 1000)), candidate.base)) throw new AppError('该币种仍在开仓冷却期');
     const rules = [catalogRule(candidate.long, catalog.items), catalogRule(candidate.short, catalog.items)];
     const legs = [candidate.long, candidate.short];
     const [books, fx] = await Promise.all([Promise.all(legs.map(q => depthReader(q))), legs.every(q => q.quoteCurrency === 'USDT' && settlement(q) === 'USDT') ? null : fxReader()]);
@@ -319,7 +320,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
       const active = store.positions('open');
       const busyBases = new Set([...active.map(p => p.base), ...store.coolingBases(clock() - config().cooldownSeconds * 1000)]);
       for (const [key, until] of retryAfter) if (until <= clock()) retryAfter.delete(key);
-      const candidate = active.length < config().maxOpen ? candidates().find(s => s.eligible && !busyBases.has(s.base) && !store.hasSignal(s.id) && !retryAfter.has(s.pairKey)) : null;
+      const candidate = active.length < config().maxOpen ? candidates().find(s => s.eligible && !isBaseBlocked(busyBases, s.base) && !store.hasSignal(s.id) && !retryAfter.has(s.pairKey)) : null;
       if (candidate) { try { await open(candidate.id, `auto-open:${createHash('sha256').update(candidate.id).digest('hex')}`); } catch (error) { retryAfter.set(candidate.pairKey, clock() + 30000); recordFailure(`${candidate.base} 自动开仓未完成：${safeMessage(error)}`); } }
     }
     const sampled = store.positions('open').map(p => ({ ...p, valuation: valuation(p) }));

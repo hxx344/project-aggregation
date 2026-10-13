@@ -1,4 +1,5 @@
 // Public Kraken Multi-M perpetual feeds only. No account or trading endpoints.
+import { canonicalBase } from '../../../../server/asset-identity.mjs';
 // https://docs.kraken.com/api-reference/instrument-details/get-instruments
 // https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker
 // https://support.kraken.com/articles/4844429542676-trading-multi-collateral-derivatives
@@ -6,7 +7,7 @@ export const KRAKEN_EXCHANGE = Object.freeze({ id: 'kraken', name: 'Kraken', typ
 const API = 'https://futures.kraken.com/derivatives/api/v3/instruments';
 const finite = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)) ? Number(value) : null;
 const positive = value => { const result = finite(value); return result !== null && result > 0 ? result : null; };
-const baseAlias = base => base === 'XBT' ? 'BTC' : base;
+const baseAlias = base => canonicalBase('kraken', base);
 const validTime = (value, now) => { const result = positive(value); return Number.isSafeInteger(result) && result >= 1e12 && result <= now + 5_000 ? result : null; };
 
 export async function discoverKrakenMarkets({ fetchImpl = fetch, signal, now = Date.now() } = {}) {

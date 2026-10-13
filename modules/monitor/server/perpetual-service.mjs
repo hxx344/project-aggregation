@@ -16,6 +16,7 @@ import { createPerpetualMarketMetricsService } from './perpetual-market-metrics.
 import { createPerpetualScannerDataService } from './perpetual-scanner-data.mjs';
 import { perpetualPriceIdentity } from '../lib/perpetual-price-history.ts';
 import { STREAM_OBSERVATION_MS, MARKET_CATALOG_MS, MARKET_METRICS_POLL_MS, AUXILIARY_BOOK_POLL_MS } from '../modules/perpetual/collection-policy.mjs';
+import { isBaseBlocked } from '../../../server/asset-identity.mjs';
 
 export const PERPETUAL_STALE_MS = 30_000;
 const MAX_FUTURE_MS = 5_000;
@@ -493,7 +494,7 @@ export function createPerpetualService({ store, exchanges = EXCHANGES, discover 
       let fresh = 0, quoteUpdatedAt = null;
       for (const quote of quotes.values()) {
         const at = quote.bidAskAt;
-        if (!blocked.has(quote.base)) bases.add(quote.base);
+        if (!isBaseBlocked(blocked, quote.base)) bases.add(quote.base);
         const book = quote.bid > 0 && quote.ask >= quote.bid && Number.isFinite(at) && at <= now + MAX_FUTURE_MS;
         const mark = quote.mark > 0 && Number.isFinite(quote.markAt) && quote.markAt <= now + MAX_FUTURE_MS;
         // Funding and receipt timestamps must never renew retained price observations.

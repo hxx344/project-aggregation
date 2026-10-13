@@ -6,6 +6,7 @@
 import { ADDITIONAL_EXCHANGES, discoverAdditionalMarkets, createAdditionalSubscriptions, parseAdditionalMessage, getAdditionalControlResponse } from './additional-exchanges.mjs';
 import { KRAKEN_EXCHANGE, discoverKrakenMarkets, createKrakenSubscriptions, parseKrakenMessage } from './kraken.mjs';
 import { AUXILIARY_BOOK_POLL_MS, BULK_BOOK_CONFIRM_MS, LIGHTER_BOOK_CONFIRM_MS } from './collection-policy.mjs';
+import { canonicalBase } from '../../../../server/asset-identity.mjs';
 
 export const EXCHANGES = Object.freeze([
   { id: 'binance', name: 'Binance', type: 'cex', website: 'https://www.binance.com', docsUrl: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
@@ -49,7 +50,7 @@ export function normalizeUnderlying(rawBase, exchange = '') {
   const match = raw.toUpperCase().match(/^(1000|10000|100000|1000000|10000000)([A-Z][A-Z0-9]*)$/);
   if (match && SCALED_BASES.has(match[2])) return { base: match[2], multiplier: Number(match[1]) };
   // Preserve namespaces, e.g. HIP-3 assets, instead of guessing equivalence.
-  return { base: raw.toUpperCase(), multiplier: 1 };
+  return { base: canonicalBase(exchange, raw.toUpperCase()), multiplier: 1 };
 }
 
 function market(exchange, symbol, rawBase, quoteCurrency, extra = {}) {

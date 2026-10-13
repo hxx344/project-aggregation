@@ -1,4 +1,5 @@
 import { D, Decimal } from './money.mjs';
+import { canonicalBase, crossexBase, isBaseBlocked, validBaseMapping } from '../../../server/asset-identity.mjs';
 
 export class AppError extends Error { constructor(message, status = 400) { super(message); this.status = status; } }
 export const defaults = Object.freeze({ enabled: false, entryPaused: false, monitorUrl: 'http://127.0.0.1:3000', monitorUsername: 'admin', notionalPerLeg: 100, maxOpen: 3, maxTotalNotional: 1000, feeBps: 6, feeSchedule: Object.freeze([]), slippageBps: 5, minNetBps: 20, takeProfitBps: 10, stopLossBps: 100, maxHoldMinutes: 60, cooldownSeconds: 60, executionMode: 'atomic', executionScenario: 'normal', executionSeed: 1, executionDelayMs: 250, clipNotional: 25, partialFillPct: 50, repairAttempts: 3, fundingEnabled: true, depthRefreshSeconds: 15, historySampleSeconds: 15 });
@@ -41,7 +42,7 @@ export const pairKey = s => JSON.stringify([s.base, quoteKey(s.long), quoteKey(s
 export const SUPPORTED_VENUES = Object.freeze(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter', 'deribit']);
 export const settlement = q => q?.settlementCurrency ?? q?.quoteCurrency ?? 'USDT';
 export function contractIdentity(q) {
-  return JSON.stringify([q.exchange, q.symbol, q.base, q.rawBase ?? q.base, q.quoteCurrency, settlement(q), q.collateralCurrency, q.multiplier, q.contractKind ?? 'linear', q.counterCurrency ?? q.quoteCurrency, q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_${q.quoteCurrency}`, q.marketId ?? null, q.identityScope ?? 'comparable', q.nativeUnit ?? null, q.assetClass, q.comparable ?? true]);
+  return JSON.stringify([q.exchange, q.symbol, canonicalBase(q.exchange, q.base), q.rawBase ?? q.base, q.quoteCurrency, settlement(q), q.collateralCurrency, q.multiplier, q.contractKind ?? 'linear', q.counterCurrency ?? q.quoteCurrency, q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${crossexBase(q.exchange, q.rawBase ?? q.base)}_${q.quoteCurrency}`, q.marketId ?? null, q.identityScope ?? 'comparable', q.nativeUnit ?? null, q.assetClass, q.comparable ?? true]);
 }
 export function validIdentity(q) {
   if (!q || q.identityScope !== undefined && q.identityScope !== 'comparable' || q.assetClass !== 'crypto' || q.comparable === false) return false;
@@ -52,27 +53,27 @@ export function validIdentity(q) {
 export function validManualIdentity(q) {
   if (!q || q.identityScope !== 'manual' || q.identitySource !== 'exchange-instrument-metadata'
     || !['crypto', 'stock', 'commodity', 'forex', 'bond', 'index'].includes(q.assetClass)
-    || q.rawBase !== q.base || typeof q.nativeUnit !== 'string' || !positive(Number(q.nativeUnit)) || typeof q.comparable !== 'boolean') return false;
+    || typeof q.rawBase !== 'string' || typeof q.nativeUnit !== 'string' || !positive(Number(q.nativeUnit)) || typeof q.comparable !== 'boolean') return false;
   return identityShape(q, true);
 }
 export function validManualPair(left, right) {
   const comparable = q => validManualIdentity(q) ? q.assetClass === 'crypto' && q.comparable === true && identityShape(q) : validIdentity(q);
-  return comparable(left) && comparable(right) && left.base === right.base && left.exchange !== right.exchange;
+  return comparable(left) && comparable(right) && canonicalBase(left.exchange, left.base) === canonicalBase(right.exchange, right.base) && left.exchange !== right.exchange;
 }
 function identityShape(q, manual = false) {
-  if (!q || !SUPPORTED_VENUES.includes(q.exchange) || !/^[A-Z0-9]{1,30}$/.test(q.base) || (q.rawBase !== undefined && q.rawBase !== q.base) || q.multiplier !== 1 || q.identityVerified !== true || typeof q.identitySource !== 'string' || !q.identitySource) return false;
-  const currency = q.quoteCurrency, base = q.base;
+  if (!q || !SUPPORTED_VENUES.includes(q.exchange) || !validBaseMapping(q.exchange, q.base, q.rawBase) || q.multiplier !== 1 || q.identityVerified !== true || typeof q.identitySource !== 'string' || !q.identitySource) return false;
+  const currency = q.quoteCurrency, base = q.rawBase ?? q.base;
   let symbol, counter = currency, settle = currency, collateral = currency, kind = 'linear';
   if (['binance', 'bybit', 'okx'].includes(q.exchange)) {
     if (!['USDT', 'USDC'].includes(currency)) return false;
     symbol = q.exchange === 'okx' ? `${base}-${currency}-SWAP` : q.exchange === 'bybit' && currency === 'USDC' ? `${base}PERP` : `${base}${currency}`;
   } else if (q.exchange === 'gate') { if (currency !== 'USDT' || !manual && base === 'EDGE') return false; symbol = `${base}_USDT`; }
-  else if (q.exchange === 'kraken') { if (currency !== 'USD') return false; symbol = `PF_${base === 'BTC' ? 'XBT' : base}USD`; collateral = 'MULTI'; }
+  else if (q.exchange === 'kraken') { if (currency !== 'USD') return false; symbol = `PF_${canonicalBase('kraken', base) === 'BTC' ? 'XBT' : base}USD`; collateral = 'MULTI'; }
   else if (q.exchange === 'hyperliquid') { if (currency !== (['HYPE', 'PURR'].includes(base) ? 'USDC' : 'USDT')) return false; symbol = base; settle = collateral = counter = 'USDC'; kind = currency === 'USDC' ? 'linear' : 'quanto'; }
   else if (q.exchange === 'deribit') { if (currency !== 'USDC') return false; symbol = `${base}_USDC-PERPETUAL`; }
   else { if (currency !== 'USDC' || !manual && base === 'AI' || !Number.isInteger(q.marketId) || q.marketId < 0) return false; symbol = base; }
   const legacy = !manual && ['binance', 'bybit'].includes(q.exchange) && currency === 'USDT' && q.settlementCurrency === undefined && q.contractKind === undefined && q.crossexSymbol === undefined;
-  return q.symbol === symbol && q.collateralCurrency === collateral && (legacy || (q.settlementCurrency === settle && q.contractKind === kind && q.counterCurrency === counter && q.crossexSymbol === `${q.exchange.toUpperCase()}_FUTURE_${base}_${counter}`));
+  return q.symbol === symbol && q.collateralCurrency === collateral && (legacy || (q.settlementCurrency === settle && q.contractKind === kind && q.counterCurrency === counter && q.crossexSymbol === `${q.exchange.toUpperCase()}_FUTURE_${crossexBase(q.exchange, base)}_${counter}`));
 }
 export function fxRate(currency, fx, now) {
   if (currency === 'USDT') return { bid: 1, ask: 1, at: now, source: 'USDT 计价基准' };
@@ -100,7 +101,7 @@ export function transferEligibility(signal, feed, now) {
   if (policy !== undefined && (!policy || typeof policy.requireSpotTransfer !== 'boolean' || !Array.isArray(policy.blockedBases)
     || policy.blockedBases.length > 200 || policy.blockedBases.some(base => typeof base !== 'string' || !/^[A-Z0-9][A-Z0-9._-]{0,39}$/.test(base))
     || (policy.revision !== undefined && (!Number.isSafeInteger(policy.revision) || policy.revision < 0)))) return blocked('Monitor 新仓筛选策略无效，等待重新核验');
-  if (policy?.blockedBases.includes(signal?.base)) return blocked('该币种已被 Monitor 屏蔽，停止新仓');
+  if (isBaseBlocked(new Set(policy?.blockedBases), signal?.base)) return blocked('该币种已被 Monitor 屏蔽，停止新仓');
   const evidence = signal?.spotTransfer;
   if (evidence === undefined && !policy?.requireSpotTransfer) return { state: policy ? 'disabled' : 'unverified', reason: policy ? '现货与充提筛选未启用' : '来源未提供现货与充提策略', networks: [], checkedAt: null, expiresAt: null };
   if (!evidence || !Array.isArray(evidence.networks) || !evidence.networks.length || evidence.networks.length > 100
@@ -125,12 +126,12 @@ export function validateFeed(feed, now) {
 }
 export function catalogRule(q, catalog) {
   if (!validIdentity(q)) throw new AppError('仅支持身份明确、单位为 1 的普通加密永续');
-  const symbol = q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_USDT`;
+  const symbol = q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${crossexBase(q.exchange, q.rawBase ?? q.base)}_USDT`;
   return displayCatalogRule(symbol, catalog);
 }
 export function manualCatalogRule(q, catalog) {
   if (!validManualIdentity(q) && !validIdentity(q)) throw new AppError('合约原生身份或数量单位未确认');
-  return displayCatalogRule(q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_USDT`, catalog);
+  return displayCatalogRule(q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${crossexBase(q.exchange, q.rawBase ?? q.base)}_USDT`, catalog);
 }
 export function displayCatalogRule(symbol, catalog) {
   const match = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_([A-Z0-9]{1,30})_(USDT|USDC|USD)$/.exec(symbol);

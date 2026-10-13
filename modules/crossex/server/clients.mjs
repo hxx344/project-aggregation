@@ -3,6 +3,7 @@ import { AppError, monitorUrl, validIdentity, validManualIdentity } from './mode
 import { publicSnapshot } from './public-snapshot.mjs';
 import { D } from './money.mjs';
 import { createEmbeddedRequest, MONITOR_ORIGIN } from './embedded-request.mjs';
+import { canonicalBase } from '../../../server/asset-identity.mjs';
 
 export const CATALOG_URL = 'https://api.gateio.ws/api/v4/crossex/rule/symbols';
 const HYPERLIQUID_INFO = 'https://api.hyperliquid.xyz/info';
@@ -19,7 +20,6 @@ const BINANCE_MARKETS = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
 const MAX_BYTES = 8 * 1024 * 1024, FX_MAX_AGE = 180_000;
 const positive = value => (typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) && Number(value) > 0;
 const failure = message => new AppError(message, 502);
-const baseName = name => name === 'XBT' ? 'BTC' : name;
 // Native classifications, documented by OKX /public/instruments and Gate
 // /futures/{settle}/contracts (checked 2026-10-09). Unknown classes stay blocked.
 const okxClasses = new Map([['1', 'crypto'], ['3', 'stock'], ['4', 'commodity'], ['5', 'forex'], ['6', 'bond']]);
@@ -101,7 +101,8 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
     metadata.set(key, entry); return entry.flight;
   }
   async function contract(quote, manual = false, refresh = false) {
-    const { exchange, symbol, base, quoteCurrency } = quote, rawBase = quote.rawBase ?? base;
+    const { exchange, symbol, quoteCurrency } = quote, rawBase = quote.rawBase ?? quote.base;
+    const baseName = name => canonicalBase(exchange, name), base = baseName(quote.base);
     const settle = quote.settlementCurrency ?? quote.collateralCurrency, encoded = encodeURIComponent(symbol);
     const native = (key, loader) => cached(key, loader, refresh);
     let row, unit = 1, assetClass = 'crypto';
@@ -257,7 +258,7 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
       : exchange === 'gate' ? `${base}_USDT`
       : exchange === 'deribit' ? `${base}_USDC-PERPETUAL`
       : exchange === 'kraken' ? `PF_${base === 'BTC' ? 'XBT' : base}USD` : base;
-    const q = { exchange, symbol, base, rawBase: base, quoteCurrency, counterCurrency,
+    const q = { exchange, symbol, base: canonicalBase(exchange, base), rawBase: base, quoteCurrency, counterCurrency,
       settlementCurrency: counterCurrency, collateralCurrency: exchange === 'kraken' ? 'MULTI' : counterCurrency,
       contractKind: exchange === 'hyperliquid' && quoteCurrency !== counterCurrency ? 'quanto' : 'linear',
       crossexSymbol, multiplier: 1, assetClass: 'crypto', identityVerified: true, identitySource: 'exchange-instrument-metadata',

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { perpetualSpreadKey, quotePriceTime, rankPerpetualSpreads } from '../lib/perpetual-spreads.ts';
 import { quoteCurrencyFx } from '../lib/perpetual-fx.ts';
 import { CROSS_EX_MAX_QUOTES, CROSS_EX_MAX_SIGNALS, CROSS_EX_STALE_MS } from '../lib/perpetual-opportunities.ts';
+import { crossexBase } from '../../../server/asset-identity.mjs';
 
 export const CROSSEX_VENUES = Object.freeze(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter']);
 
@@ -31,7 +32,7 @@ function enrich(quote, market) {
     identityVerified: true, identitySource: market.identitySource, comparable: true,
     settlementCurrency, collateralCurrency: kraken ? 'MULTI' : settlementCurrency,
     contractKind: special && market.quoteCurrency !== 'USDC' ? 'quanto' : 'linear', counterCurrency: settlementCurrency,
-    crossexSymbol: `${market.exchange.toUpperCase()}_FUTURE_${market.base}_${settlementCurrency}`,
+    crossexSymbol: `${market.exchange.toUpperCase()}_FUTURE_${crossexBase(market.exchange, market.rawBase ?? market.base)}_${settlementCurrency}`,
     ...(market.exchange === 'lighter' ? { marketId: market.marketId } : {}),
     delisting: market.delisting, delistingAt: market.delistingAt,
   };

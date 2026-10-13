@@ -12,22 +12,19 @@ import { unavailableUpdateState } from '../../server/updates.mjs';
 import { createApp as createCrossEx } from '../../modules/crossex/server/app.mjs';
 import { createPublicClients, CATALOG_URL } from '../../modules/crossex/server/clients.mjs';
 import { createPerpetualOpportunitiesV2 } from '../../modules/monitor/server/perpetual-opportunities-v2.mjs';
+import { discoverMarkets } from '../../modules/monitor/modules/perpetual/exchanges.mjs';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
-const venues = ['binance', 'bybit'];
 const listen = (server, ...args) => new Promise((resolve, reject) => {
   server.once('error', reject);
   server.listen(...args, () => { server.off('error', reject); resolve(); });
 });
 const pipe = (directory, id) => process.platform === 'win32'
   ? `\\\\.\\pipe\\embedded-funding-${id}-${randomUUID()}` : path.join(directory, `${id}.sock`);
-const catalog = venues.map(exchange => ({ symbol: `${exchange.toUpperCase()}_FUTURE_BTC_USDT`,
-  exchange_type: exchange.toUpperCase(), business_type: 'FUTURE', state: 'live', delist_time: '0',
-  min_size: '0.001', lot_size: '0.001', tick_size: '0.01', min_notional: '5', max_market_size: '10000', max_limit_size: '10000' }));
-
-function quote(exchange, now, mode) {
-  return { exchange, symbol: 'BTCUSDT', base: 'BTC', rawBase: 'BTC', quoteCurrency: 'USDT', multiplier: 1,
-    bid: exchange === 'binance' ? 99 : 102, ask: exchange === 'binance' ? 100 : 103,
+function quote(exchange, now, mode, market, alias) {
+  return { exchange, symbol: 'BTCUSDT', base: 'BTC', rawBase: 'BTC', quoteCurrency: 'USDT', multiplier: 1, ...market,
+    bid: alias ? exchange === 'binance' ? 0.0499 : 0.051 : exchange === 'binance' ? 99 : 102,
+    ask: alias ? exchange === 'binance' ? 0.05 : 0.0511 : exchange === 'binance' ? 100 : 103,
     mark: null, last: null, bidAskAt: now, sourceTime: now, receivedAt: now, transport: 'rest',
     // Equal raw rates with different periods prove normalization precedes direction selection.
     fundingRate: 0.0001, fundingIntervalHours: exchange === 'binance' ? 1 : 4,
@@ -35,19 +32,28 @@ function quote(exchange, now, mode) {
 }
 
 /** Real Hub -> private CrossEx -> private Monitor projection; all venue IO is fake. */
-export async function createEmbeddedFundingFixture() {
+export async function createEmbeddedFundingFixture({ alias = false } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'embedded-funding-'));
   const password = 'embedded-funding-test-password';
+  const venues = alias ? ['binance', 'gate'] : ['binance', 'bybit'];
+  const binanceBase = alias ? 'LUNA2' : 'BTC', binanceSymbol = `${binanceBase}USDT`;
+  const catalog = venues.map(exchange => ({ symbol: `${exchange.toUpperCase()}_FUTURE_${exchange === 'gate' ? 'LUNA' : binanceBase}_USDT`,
+    exchange_type: exchange.toUpperCase(), business_type: 'FUTURE', state: 'live', delist_time: '0',
+    min_size: alias ? '1' : '0.001', lot_size: alias ? '1' : '0.001', tick_size: alias ? '0.00001' : '0.01',
+    min_notional: '5', max_market_size: '10000', max_limit_size: '10000' }));
+  const gateInstrument = { name: 'LUNA_USDT', type: 'direct', contract_type: '', status: 'trading',
+    in_delisting: false, is_pre_market: false, quanto_multiplier: '1', funding_interval: 14400 };
   const stats = { monitor: [], crossex: [], publicHttp: [], terminalWs: [], privateClients: [] };
   const removers = [];
-  let mode = 'live', latestFeed, hub, crossex, monitor, greeks, refreshTimer, closed = false, port, cookie, csrf;
+  let mode = 'live', latestFeed, discoveredMarkets = [], hub, crossex, monitor, greeks, refreshTimer, closed = false, port, cookie, csrf;
   const monitorSecret = randomUUID(), crossexSecret = randomUUID();
 
   function project() {
-    const now = Date.now(), quotes = venues.map(exchange => quote(exchange, now, mode));
+    const now = Date.now(), quotes = venues.map(exchange => quote(exchange, now, mode, discoveredMarkets.find(row => row.exchange === exchange), alias));
     const snapshot = { schemaVersion: 1, monitorId: 'perpetual', status: 'live', generatedAt: now, staleAfterMs: 30000, quotes,
       exchanges: venues.map(id => ({ id, name: id, kind: 'cex', status: 'live', marketCount: 1, quoteCount: 1, lastMessageAt: now, error: null })) };
     const market = (exchange, symbol) => {
+      if (alias) return discoveredMarkets.find(row => row.exchange === exchange && row.symbol === symbol);
       const current = quotes.find(q => q.exchange === exchange && q.symbol === symbol);
       return current && { ...current, assetClass: 'crypto', comparable: true, identityVerified: true, crossexVerified: true,
         identitySource: 'isolated-official-directory', delisting: false, delistingAt: null };
@@ -67,17 +73,27 @@ export async function createEmbeddedFundingFixture() {
     let value;
     if (url.href === CATALOG_URL) value = catalog;
     else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/exchangeInfo') value = { symbols: [{
-      symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', marginAsset: 'USDT', contractType: 'PERPETUAL',
+      symbol: binanceSymbol, baseAsset: binanceBase, quoteAsset: 'USDT', marginAsset: 'USDT', contractType: 'PERPETUAL',
       status: 'TRADING', underlyingType: 'COIN', underlyingSubType: [],
     }] };
+    else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/fundingInfo') value = [];
     else if (url.origin === 'https://api.bybit.com' && url.pathname === '/v5/market/instruments-info') value = {
       retCode: 0, result: { category: 'linear', list: [{ symbol: 'BTCUSDT', baseCoin: 'BTC', quoteCoin: 'USDT', settleCoin: 'USDT',
         contractType: 'LinearPerpetual', status: 'Trading', isPreListing: false, deliveryTime: '0', symbolType: 'crypto' }] },
     };
-    else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/depth') value = { T: Date.now(), bids: [['99', '100']], asks: [['100', '100']] };
+    else if (alias && url.origin === 'https://api.gateio.ws' && url.pathname === '/api/v4/futures/usdt/contracts') value = [gateInstrument];
+    else if (alias && url.origin === 'https://api.gateio.ws' && url.pathname === '/api/v4/futures/usdt/contracts/LUNA_USDT') value = gateInstrument;
+    else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/depth') {
+      assert.equal(url.searchParams.get('symbol'), binanceSymbol);
+      value = { T: Date.now(), bids: [[alias ? '0.0499' : '99', alias ? '10000' : '100']], asks: [[alias ? '0.05' : '100', alias ? '10000' : '100']] };
+    }
     else if (url.origin === 'https://api.bybit.com' && url.pathname === '/v5/market/orderbook') value = {
       retCode: 0, result: { s: 'BTCUSDT', cts: Date.now(), b: [['102', '100']], a: [['103', '100']] },
     };
+    else if (alias && url.origin === 'https://api.gateio.ws' && url.pathname === '/api/v4/futures/usdt/order_book') {
+      assert.equal(url.searchParams.get('contract'), 'LUNA_USDT');
+      value = { update: Date.now() / 1000, bids: [{ p: '0.051', s: '10000' }], asks: [{ p: '0.0511', s: '10000' }] };
+    }
     else throw new Error(`Unconfigured fixture HTTP source: ${url.href}`);
     return new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
@@ -110,6 +126,9 @@ export async function createEmbeddedFundingFixture() {
   }
 
   try {
+    // Alias inputs enter through the same native instrument discovery and
+    // normalization as production, never through a pre-canonicalized fixture.
+    if (alias) discoveredMarkets = (await Promise.all(venues.map(exchange => discoverMarkets(exchange, { fetchImpl: fetcher })))).flat();
     const monitorPath = pipe(directory, 'monitor');
     monitor = http.createServer((req, res) => {
       stats.monitor.push({ method: req.method, path: req.url, host: req.headers.host,

@@ -1,4 +1,5 @@
 // Public, unauthenticated data only. See docs/CROSSEX_SIGNALS.md for coverage.
+import { canonicalBase, validBaseMapping } from '../../../server/asset-identity.mjs';
 export const SPOT_TRANSFER_TTL_MS = 180_000;
 export const SPOT_TRANSFER_SOURCES = Object.freeze({
   binance: ['https://api.binance.com/api/v3/exchangeInfo?permissions=SPOT&showPermissionSets=false', 'https://www.binance.com/bapi/capital/v1/public/capital/getNetworkCoinAll'],
@@ -102,10 +103,10 @@ export function createSpotTransferReader({ fetchImpl = fetch, clock = Date.now }
 }
 
 export function spotTransferEvidence(long, short, metadata, now) {
-  if (!Number.isFinite(now) || now <= 0 || !baseName(long.base) || long.base !== short.base || long.exchange === short.exchange) return null;
+  if (!Number.isFinite(now) || now <= 0 || !baseName(long.base) || canonicalBase(long.exchange, long.base) !== canonicalBase(short.exchange, short.base) || long.exchange === short.exchange) return null;
   const legs = [long, short].map(q => {
-    const data = metadata.get(q.exchange), asset = data?.assets?.get(q.base);
-    if (data?.error || !Number.isFinite(data?.at) || data.at <= 0 || data.at > now || now - data.at >= SPOT_TRANSFER_TTL_MS || !asset?.spotSymbols?.length || asset.base !== q.base || q.multiplier !== 1) return null;
+    const nativeBase = q.rawBase ?? q.base, data = metadata.get(q.exchange), asset = data?.assets?.get(nativeBase);
+    if (!validBaseMapping(q.exchange, q.base, nativeBase) || data?.error || !Number.isFinite(data?.at) || data.at <= 0 || data.at > now || now - data.at >= SPOT_TRANSFER_TTL_MS || !asset?.spotSymbols?.length || asset.base !== nativeBase || q.multiplier !== 1) return null;
     return { ...asset, at: data.at };
   });
   if (legs.some(leg => !leg)) return null;

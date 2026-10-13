@@ -5,6 +5,7 @@ import { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCross
 import { D, Decimal } from './money.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
 import { fundingOpportunities } from './funding-opportunities.mjs';
+import { crossexBase } from '../../../server/asset-identity.mjs';
 
 const CONFIG_KEYS = ['entryPaused', 'monitorUrl', 'monitorUsername', 'notionalPerLeg', 'maxOpen', 'maxTotalNotional', 'feeBps', 'feeSchedule', 'slippageBps', 'minNetBps', 'cooldownSeconds'];
 const safeMessage = error => error instanceof AppError ? error.message : '行情读取失败，请检查来源连接';
@@ -186,7 +187,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
   function validatedRule(q, validator) {
     if (!catalogAvailable()) throw new AppError('CrossEx 合约目录未就绪或已过期');
     const exchange = typeof q?.exchange === 'string' ? q.exchange.toUpperCase() : null;
-    const symbol = q?.crossexSymbol ?? (exchange ? `${exchange}_FUTURE_${q.base}_USDT` : null);
+    const symbol = q?.crossexSymbol ?? (exchange ? `${exchange}_FUTURE_${crossexBase(q.exchange, q.rawBase ?? q.base)}_USDT` : null);
     const match = catalogIndex?.get(catalogKey(symbol, exchange, 'FUTURE'));
     return finishRule(validator(q, catalogIndex ? match ? [match] : [] : catalog.items));
   }

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { D } from './money.mjs';
 import { contractIdentity, freshQuote, fxRate, quoteTime, referencePrice, settlement, transferEligibility, validIdentity, validSignal } from './model.mjs';
+import { canonicalBase, isBaseBlocked } from '../../../server/asset-identity.mjs';
 
 const FUNDING_TTL_MS = 300000, QUOTE_TTL_MS = 10000;
 const finite = value => typeof value === 'number' && Number.isFinite(value);
@@ -35,15 +36,16 @@ export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', en
   for (const quote of feed.quotes) {
     // Unknown intervals must not be silently treated as eight-hour contracts.
     if (!finite(quote.fundingRate) || !finite(quote.fundingIntervalHours) || quote.fundingIntervalHours <= 0 || quote.fundingIntervalHours > 168
-      || !finite(quote.fundingAt) || quote.fundingAt <= 0 || blocked.has(quote.base)
+      || !finite(quote.fundingAt) || quote.fundingAt <= 0 || isBaseBlocked(blocked, quote.base)
       || !validIdentity(quote) || (quote.contractKind ?? 'linear') !== 'linear' || quote.delisting || quote.delistingAt) continue;
     let rule;
     try { rule = ruleFor(quote); } catch { continue; }
     const leg = fundingLeg(quote, rule, now);
     if (!finite(leg.normalized8hBps)) continue;
     const entry = { quote, leg, identity: contractIdentity(quote) };
-    if (!groups.has(quote.base)) groups.set(quote.base, []);
-    groups.get(quote.base).push(entry);
+    const base = canonicalBase(quote.exchange, quote.base);
+    if (!groups.has(base)) groups.set(base, []);
+    groups.get(base).push(entry);
   }
   const result = [];
   for (const [base, quotes] of groups) for (let i = 0; i < quotes.length; i++) for (let j = i + 1; j < quotes.length; j++) {

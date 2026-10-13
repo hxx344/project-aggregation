@@ -1,4 +1,5 @@
 import { initialCrossExSettings, validateCrossExConfig } from './perpetual-crossex-store.mjs';
+import { isBaseBlocked } from '../../../server/asset-identity.mjs';
 import { createSpotTransferReader, SPOT_TRANSFER_SOURCES, SPOT_TRANSFER_TTL_MS, TRANSFER_UNAVAILABLE, spotTransferEvidence } from './perpetual-spot-transfer.mjs';
 
 /** Auxiliary polling never runs on the signal request path. Metadata is not restored as fresh after restart. */
@@ -23,7 +24,7 @@ export function createCrossExFilterService({ store, clock = Date.now, read = cre
       const longExchange = exchanges[i], shortExchange = exchanges[j];
       if (status(longExchange, now) !== 'live' || status(shortExchange, now) !== 'live') continue;
       for (const base of metadata.get(longExchange).assets.keys()) {
-        if (blocked.has(base)) continue;
+        if (isBaseBlocked(blocked, base)) continue;
         const evidence = spotTransferEvidence({ base, exchange: longExchange, multiplier: 1 }, { base, exchange: shortExchange, multiplier: 1 }, metadata, now);
         if (evidence) pairs.push({ base, exchanges: [longExchange, shortExchange], ...evidence });
       }
@@ -72,7 +73,7 @@ export function createCrossExFilterService({ store, clock = Date.now, read = cre
       const now = clock(), required = enabled(), blockedSnapshot = blocked;
       return { enabled: required || blockedSnapshot.size > 0, requireSpotTransfer: required, blockedBases: [...blockedSnapshot], revision: state.revision,
         version: version(now),
-        evaluate: (long, short, at) => blockedSnapshot.has(long.base) || blockedSnapshot.has(short.base) ? null : !required ? {} : storageError ? null : spotTransferEvidence(long, short, metadata, at),
+        evaluate: (long, short, at) => isBaseBlocked(blockedSnapshot, long.base) || isBaseBlocked(blockedSnapshot, short.base) ? null : !required ? {} : storageError ? null : spotTransferEvidence(long, short, metadata, at),
       };
     },
     update(input) {
