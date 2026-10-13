@@ -2,7 +2,6 @@
 .perp-scanner .scanner-chart-link { display: block; width: 100%; min-height: 44px; margin: 0; padding: 0; border: 0; border-radius: 2px; background: transparent; color: inherit; text-align: left; }
 .perp-scanner .scanner-chart-link:hover .scanner-symbol { color: var(--scanner-focus); }
 .perp-scanner .scanner-chart-row > :not(.perp-expand-cell) { cursor: pointer; }
-.hub-tabs.hub-perpetual-active:has(.perp-scanner) { width: 100%; max-width: none; min-width: 0; }
 
 .perpetual-panel.perp-scanner {
   --scanner-bg: var(--card);
@@ -24,7 +23,7 @@
   max-width: none;
   min-width: 0;
   margin: 0;
-  padding: 16px 22px 24px;
+  padding-block: 16px 24px;
   background: var(--scanner-bg);
   color: var(--scanner-text);
   color-scheme: dark;
@@ -507,7 +506,7 @@
 .perp-scanner > .perp-fx-details strong { color: var(--scanner-text); }
 
 @media (max-width: 1080px) {
-  .perpetual-panel.perp-scanner { padding: 14px 16px 22px; }
+  .perpetual-panel.perp-scanner { padding-block: 14px 22px; }
   .perp-scanner > .perp-heading { gap: 14px; margin-right: 16px; }
   .perp-scanner .perp-heading p { display: none; }
   .perp-scanner .perp-heading-actions { gap: 4px; }
@@ -522,7 +521,7 @@
 @media (max-width: 700px) {
   .perp-scanner .scanner-metric-evidence { width: calc(100vw - 24px); padding: 12px 14px; }
   .perp-scanner .scanner-metric-close { min-height: 36px; margin-top: -6px; padding: 8px; }
-  .perpetual-panel.perp-scanner { grid-template-columns: minmax(0, 1fr); padding: 12px 10px 18px; }
+  .perpetual-panel.perp-scanner { grid-template-columns: minmax(0, 1fr); padding-block: 12px 18px; }
   .perp-scanner > .perp-heading { grid-column: 1; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 5px; }
   .perp-scanner .perp-heading > div:first-child { flex: 1 1 auto; }
   .perp-scanner .perp-heading h2 { font-size: 18px; }
