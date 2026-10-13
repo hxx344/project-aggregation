@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import http.server
 import json
+import math
 import os
 import re
 import socket
@@ -33,7 +34,8 @@ WORKER = 'project-aggregation-update-worker.service'
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 PLAN_TTL = 30 * 60
 CHECK_MIN_INTERVAL = 60
-AUTO_CHECK_INTERVAL = 30
+AUTO_CHECK_INTERVAL = 5 * 60
+CHECK_RETRY_MAX_INTERVAL = 30 * 60
 ACTIVE = {'queued', 'running'}
 TOKEN = re.compile(r'[a-f0-9]{32}')
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes')
@@ -172,6 +174,7 @@ class Coordinator:
         with self.lock():
             if not (directory / 'state.json').exists():
                 self.save({'schema': 1, 'checking': False, 'checkedAt': None, 'checkError': None,
+                           'failureCount': 0, 'nextCheckNotBefore': 0,
                            'planId': None, 'expiresAt': None, 'modules': [], 'job': None})
 
     @contextmanager
@@ -183,23 +186,53 @@ class Coordinator:
         result = read_json(self.directory / 'state.json')
         if result.get('schema') != 1:
             raise ValueError('Unsupported updater state')
+        result.setdefault('failureCount', 0)
+        result.setdefault('nextCheckNotBefore', 0)
         return result
 
     def save(self, state):
         write_json(self.directory / 'state.json', state)
 
-    @staticmethod
-    def public(state):
-        return {'enabled': True, **{key: state.get(key) for key in
+    def public(self, state):
+        result = {'enabled': True, **{key: state.get(key) for key in
                 ('checking', 'checkedAt', 'checkError', 'planId', 'expiresAt', 'job')},
                 'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']]}
+        remaining = state.get('nextCheckNotBefore', 0) - self.clock()
+        if result['checkError'] and remaining > 0:
+            result['checkError'] += f'；已暂停重试，约 {math.ceil(remaining / 60)} 分钟后自动重试'
+        return result
+
+    def _record_check_failure(self, state, message, retry_at=0):
+        count = state.get('failureCount', 0)
+        count = count + 1 if type(count) is int and count >= 0 else 1
+        delay = min(CHECK_RETRY_MAX_INTERVAL, AUTO_CHECK_INTERVAL * 2 ** min(count - 1, 3))
+        now = self.clock()
+        state.update(checking=False, checkedAt=iso(now), checkError=message,
+                     failureCount=count, nextCheckNotBefore=max(now + delay, retry_at),
+                     planId=None, expiresAt=None)
+
+    def _check_delay(self, state, minimum_interval):
+        now = self.clock()
+        started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
+        deadline = state.get('nextCheckNotBefore', 0)
+        if started > now:
+            # Rebase once when the wall clock moves backwards, preserving the
+            # original retry duration rather than blocking until the old date.
+            retry_started = timestamp(state.get('checkedAt')) or started
+            if deadline and retry_started > now:
+                deadline = now + max(0, deadline - retry_started)
+            state.update(lastCheckStarted=now, nextCheckNotBefore=deadline)
+            self.save(state)
+            started = now
+        interval_delay = minimum_interval - (now - started) if started else 0
+        return max(0, interval_delay, deadline - now)
 
     def recover(self, starting=False):
         with self.lock():
             state = self.load()
             changed = False
             if state['checking'] and starting:
-                state.update(checking=False, checkError='上次版本检查已中断，请重新检查', planId=None, expiresAt=None)
+                self._record_check_failure(state, '上次版本检查已中断')
                 changed = True
             job = state['job']
             if job and job['status'] in ACTIVE and self.clock() - timestamp(job['startedAt']) > 30:
@@ -234,8 +267,7 @@ class Coordinator:
             state = self.load()
             if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
                 return self.public(state)
-            last_started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
-            if last_started and self.clock() - last_started < minimum_interval:
+            if self._check_delay(state, minimum_interval) > 0:
                 return self.public(state)
             state.update(checking=True, checkError=None, lastCheckStarted=self.clock())
             self.save(state)
@@ -248,8 +280,7 @@ class Coordinator:
             state = self.load()
             if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
                 return 5
-            started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
-            return max(0, min(AUTO_CHECK_INTERVAL, AUTO_CHECK_INTERVAL - (self.clock() - started))) if started else 0
+            return min(AUTO_CHECK_INTERVAL, self._check_delay(state, AUTO_CHECK_INTERVAL))
 
     def start_scheduler(self):
         # Only the control service calls this; a standalone installer worker never schedules checks.
@@ -306,6 +337,9 @@ class Coordinator:
             return item, release
         except ReleaseError as error:
             item.update(state='unavailable', reason=str(error))
+            retry_at = error.retry_at
+            if type(retry_at) in (int, float) and math.isfinite(retry_at):
+                item['retryAt'] = retry_at
             return item, None
         except Exception:
             item.update(state='unavailable', reason='正式版本检查未完成，请稍后重试')
@@ -317,6 +351,7 @@ class Coordinator:
             with ThreadPoolExecutor(max_workers=3) as pool:
                 results = list(pool.map(self._candidate, installations))
             modules = [item for item, _ in results]
+            retry_at = max((item.pop('retryAt', 0) for item in modules), default=0)
             candidates = [(item, release) for item, release in results if release]
             failed = any(item['state'] == 'unavailable' for item in modules)
             plan_id = None
@@ -346,13 +381,17 @@ class Coordinator:
                     write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
             with self.lock():
                 state = self.load()
-                state.update(checking=False, checkedAt=iso(self.clock()), checkError='部分模块检查失败，暂不能开始更新' if failed else None,
-                             planId=plan_id, expiresAt=expires, modules=modules)
+                state.update(modules=modules)
+                if failed:
+                    self._record_check_failure(state, '部分模块检查失败，暂不能开始更新', retry_at)
+                else:
+                    state.update(checking=False, checkedAt=iso(self.clock()), checkError=None,
+                                 failureCount=0, nextCheckNotBefore=0, planId=plan_id, expiresAt=expires)
                 self.save(state)
         except Exception:
             with self.lock():
                 state = self.load()
-                state.update(checking=False, checkError='版本检查未完成，请稍后重新检查', planId=None, expiresAt=None)
+                self._record_check_failure(state, '版本检查未完成')
                 self.save(state)
 
     def read_plan(self, plan_id):

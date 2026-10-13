@@ -1,12 +1,16 @@
 """Deterministic public-release discovery, cache and worker freshness tests."""
 from collections import Counter
 from dataclasses import replace
+from email.message import Message
+from email.utils import formatdate
+import io
 import json
 from pathlib import Path
 import sys
 import threading
 from types import SimpleNamespace
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
@@ -283,6 +287,44 @@ class ReleaseCacheTests(unittest.TestCase):
             self.reader.read(self.module)
         self.assertFalse(self.reader._releases)
 
+    def test_transient_probe_failure_preserves_metadata_but_never_returns_success(self):
+        self.reader.read(self.module)
+        original = self.network.request
+        artifact = self.reader.download(self.module, 'deploy-' + NEW,
+                                        self.value['manifest']['artifacts']['linux-x64']['file'])
+        for url in (self.reader.download(self.module, 'deploy-' + NEW, 'release-manifest.json'), artifact):
+            with self.subTest(url=url):
+                def unavailable(target, *args, **kwargs):
+                    if target == url:
+                        raise releases.ReleaseError('temporary failure', transient=True)
+                    return original(target, *args, **kwargs)
+                with patch.object(self.network, 'request', side_effect=unavailable):
+                    with self.assertRaises(releases.ReleaseError):
+                        self.reader.read(self.module)
+                self.assertTrue(self.reader._releases)
+                before = self.network.counts()
+                self.reader.read(self.module)
+                self.assertEqual(self.network.counts() - before, {'discovery': 1, 'manifest': 1, 'artifact': 1})
+        with patch.object(self.network, 'redirect', side_effect=releases.ReleaseError('temporary', transient=True)):
+            with self.assertRaises(releases.ReleaseError):
+                self.reader.read(self.module)
+        self.clock += releases.RELEASE_CACHE_TTL
+        self.value['metadata']['prerelease'] = True
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.read(self.module)
+        self.assertFalse(self.reader._releases)
+
+    def test_recovery_after_transient_failure_still_checks_changed_manifest(self):
+        self.reader.read(self.module)
+        with patch.object(self.network, 'redirect', side_effect=releases.ReleaseError('temporary', transient=True)):
+            with self.assertRaises(releases.ReleaseError):
+                self.reader.read(self.module)
+        self.value['manifest']['node_version'] = '24.15.0'
+        self.value['metadata']['prerelease'] = True
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.read(self.module)
+        self.assertFalse(self.reader._releases)
+
     def test_explicit_release_id_bypasses_all_caches_and_latest_discovery(self):
         self.reader.read(self.module)
         self.entry['target'] = 'https://github.com/unusable'
@@ -395,6 +437,72 @@ class ReleaseCacheTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def http_error(self, code, headers=None, url='https://api.github.com/repos/hxx344/project-aggregation/releases/latest'):
+        network = releases.Network()
+        network.opener = unittest.mock.Mock()
+        response_headers = Message()
+        for key, value in (headers or {}).items():
+            response_headers[key] = value
+        body = io.BytesIO(b'private upstream details must not be shown')
+        network.opener.open.side_effect = urllib.error.HTTPError(url, code, 'private reason', response_headers, body)
+        with self.assertRaises(releases.ReleaseError) as caught, patch.object(releases.time, 'time', return_value=1800000000):
+            network.request(url)
+        self.assertTrue(body.closed)
+        self.assertNotIn('private', str(caught.exception))
+        self.assertNotIn('secret', str(caught.exception))
+        return caught.exception
+
+    def test_primary_limit_reports_api_quota_and_server_reset(self):
+        error = self.http_error(403, {'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1800001200'})
+        self.assertIn('GitHub API匿名请求额度已用尽', str(error))
+        self.assertIn('HTTP 403', str(error))
+        self.assertEqual(error.retry_at, 1800001200)
+        self.assertTrue(error.transient)
+
+    def test_secondary_limit_honors_seconds_or_http_date_and_later_reset(self):
+        for headers, deadline in [({'Retry-After': '90'}, 1800000090),
+                                  ({'Retry-After': formatdate(1800000300, usegmt=True)}, 1800000300),
+                                  ({'Retry-After': '60', 'X-RateLimit-Remaining': '0',
+                                    'X-RateLimit-Reset': '1800001200'}, 1800001200)]:
+            with self.subTest(headers=headers):
+                error = self.http_error(429, headers)
+                self.assertEqual(error.retry_at, deadline)
+                self.assertTrue(error.transient)
+
+    def test_plain_forbidden_is_not_misreported_as_api_rate_limit(self):
+        for host, label in [('api.github.com', 'GitHub API'), ('github.com', 'GitHub 发布服务'),
+                            ('release-assets.githubusercontent.com', 'GitHub 发布文件服务')]:
+            error = self.http_error(403, url=f'https://{host}/download?secret=signed-query')
+            self.assertIn(label + '拒绝访问', str(error))
+            self.assertNotIn('额度', str(error))
+            self.assertIsNone(error.retry_at)
+            self.assertTrue(error.transient)
+
+    def test_invalid_past_and_excessive_retry_headers_are_bounded(self):
+        for value in ('-1', 'NaN', 'Infinity', 'bad date', '999999999999999999999', formatdate(1799999999, usegmt=True)):
+            with self.subTest(value=value):
+                self.assertIsNone(self.http_error(429, {'Retry-After': value}).retry_at)
+        self.assertEqual(self.http_error(429, {'Retry-After': '9999999999'}).retry_at,
+                         1800000000 + releases.MAX_RETRY_DELAY)
+        self.assertIsNone(self.http_error(403, {'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1799999999'}).retry_at)
+
+    def test_missing_and_server_errors_have_distinct_cache_policy(self):
+        self.assertFalse(self.http_error(404).transient)
+        error = self.http_error(503, {'Retry-After': '120'})
+        self.assertTrue(error.transient)
+        self.assertEqual(error.retry_at, 1800000120)
+        self.assertIn('HTTP 503', str(error))
+
+    def test_transport_failure_identifies_endpoint_without_raw_error_details(self):
+        network = releases.Network()
+        network.opener = unittest.mock.Mock()
+        network.opener.open.side_effect = urllib.error.URLError('private proxy credentials')
+        with self.assertRaises(releases.ReleaseError) as caught:
+            network.request('https://raw.githubusercontent.com/hxx344/project-aggregation/fixed/deploy/install.sh')
+        self.assertIn('安装器源码服务', str(caught.exception))
+        self.assertNotIn('private', str(caught.exception))
+        self.assertTrue(caught.exception.transient)
+
     def test_head_discovery_returns_final_url_and_request_remains_bytes(self):
         final = 'https://github.com/hxx344/project-aggregation/releases/tag/deploy-' + NEW
         response = unittest.mock.MagicMock()
@@ -409,9 +517,11 @@ class TransportTests(unittest.TestCase):
         request = network.opener.open.call_args.args[0]
         self.assertEqual(request.get_method(), 'HEAD')
         self.assertEqual(request.get_header('Cache-control'), 'no-cache')
+        self.assertEqual(request.get_header('Accept'), '*/*')
         self.assertEqual(network.opener.open.call_args.kwargs['timeout'], 25)
         response.read.assert_not_called()
         self.assertEqual(network.request('https://api.github.com/repos/hxx344/project-aggregation/releases/latest'), b'{}')
+        self.assertEqual(network.opener.open.call_args.args[0].get_header('Accept'), 'application/vnd.github+json')
         self.assertEqual(network.request(final, method='HEAD'), b'')
         response.url = 'https://attacker.example/release'
         with self.assertRaises(releases.ReleaseError):

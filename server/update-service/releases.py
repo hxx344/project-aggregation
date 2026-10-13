@@ -2,6 +2,7 @@
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import platform
@@ -26,13 +27,44 @@ MAX_RELEASE_NOTES = 6000
 RELEASE_NOTES_TRUNCATED = '\n（更新内容过长，已截断）'
 RELEASE_NOTES_CONTROLS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]')
 RELEASE_CACHE_TTL = 30 * 60
+MAX_RETRY_DELAY = 24 * 60 * 60
 # Shared by all repositories; cold checks add at most two network workers.
 ARTIFACT_CHECKS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='release-artifact')
 
 
 class ReleaseError(Exception):
-    def __init__(self, message='正式版本检查失败，请稍后重新检查'):
+    def __init__(self, message='正式版本检查失败，请稍后重新检查', *, retry_at=None, transient=False):
         super().__init__(message)
+        self.retry_at = retry_at
+        self.transient = transient
+
+
+def retry_deadline(headers, now):
+    """Read bounded server deadlines without exposing response bodies or URLs."""
+    deadlines = []
+    remaining = headers.get('X-RateLimit-Remaining')
+    reset = headers.get('X-RateLimit-Reset', '')
+    if remaining == '0' and re.fullmatch(r'[0-9]{1,12}', reset):
+        deadlines.append(int(reset))
+    retry = headers.get('Retry-After', '')
+    if re.fullmatch(r'[0-9]{1,10}', retry):
+        deadlines.append(now + int(retry))
+    elif retry:
+        try:
+            value = parsedate_to_datetime(retry)
+            if value.tzinfo is not None:
+                deadlines.append(value.timestamp())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    future = [min(deadline, now + MAX_RETRY_DELAY) for deadline in deadlines if deadline > now]
+    return max(future) if future else None
+
+
+def endpoint_name(url):
+    # Only a fixed host label is public; signed redirect queries remain private.
+    host = urllib.parse.urlsplit(url).hostname
+    return {'api.github.com': 'GitHub API', 'github.com': 'GitHub 发布服务',
+            'raw.githubusercontent.com': 'GitHub 安装器源码服务'}.get(host, 'GitHub 发布文件服务')
 
 
 def allowed_url(url):
@@ -66,8 +98,10 @@ class Network:
 
     def _request(self, url, maximum=MAX_JSON, method='GET', final_url=False):
         allowed_url(url)
+        api = urllib.parse.urlsplit(url).hostname == 'api.github.com'
         request = urllib.request.Request(url, method=method, headers={
-            'User-Agent': 'project-aggregation-stable-updater/1', 'Accept': 'application/vnd.github+json',
+            'User-Agent': 'project-aggregation-stable-updater/1',
+            'Accept': 'application/vnd.github+json' if api else '*/*',
             'Cache-Control': 'no-cache'})
         try:
             with self.opener.open(request, timeout=25) as response:
@@ -84,13 +118,24 @@ class Network:
                     raise ReleaseError('发布文件超出允许大小')
                 return data
         except urllib.error.HTTPError as error:
+            endpoint = endpoint_name(error.url)
+            headers = error.headers or {}
+            deadline = retry_deadline(headers, time.time())
+            error.close()
             if error.code == 404:
-                raise ReleaseError('尚无可用正式版本，或发布文件不完整') from None
+                raise ReleaseError(f'{endpoint}未找到正式版本或发布文件（HTTP 404）') from None
             if error.code in (403, 429):
-                raise ReleaseError('GitHub 查询暂时受限，请稍后重新检查') from None
-            raise ReleaseError('正式版本下载暂时不可用，请稍后重新检查') from None
+                if urllib.parse.urlsplit(error.url).hostname == 'api.github.com' and headers.get('X-RateLimit-Remaining') == '0':
+                    reason = '匿名请求额度已用尽'
+                elif error.code == 429 or headers.get('Retry-After'):
+                    reason = '请求频率受限'
+                else:
+                    reason = '拒绝访问，请检查服务器的 GitHub 网络访问'
+                raise ReleaseError(f'{endpoint}{reason}（HTTP {error.code}）', retry_at=deadline, transient=True) from None
+            raise ReleaseError(f'{endpoint}暂时不可用（HTTP {error.code}）',
+                               retry_at=deadline, transient=500 <= error.code < 600) from None
         except (OSError, TimeoutError, urllib.error.URLError):
-            raise ReleaseError('无法连接正式版本发布服务，请稍后重新检查') from None
+            raise ReleaseError(f'无法连接{endpoint_name(url)}，请检查服务器网络', transient=True) from None
 
 
 def decode_json(data):
@@ -215,10 +260,13 @@ class Releases:
             # release. Periodically renew its ID and formal-release eligibility.
             self._remember(self._releases, key, (self.clock(), copy.deepcopy(result)), MAX_RELEASE_CACHE)
             return result
-        except ReleaseError:
-            # A failed current check never exposes the last successful result.
-            with self._lock:
-                self._releases.pop(key, None)
+        except ReleaseError as error:
+            # Never return stale success. A transient failure need not discard
+            # verified metadata; recovery still probes tag/manifest/artifact and
+            # respects its original TTL. Invalid content always clears it.
+            if not error.transient:
+                with self._lock:
+                    self._releases.pop(key, None)
             raise
 
     def _verified(self, module, release, manifest_bytes, fresh=False):
