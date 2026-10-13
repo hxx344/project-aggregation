@@ -25,7 +25,8 @@ test('administrative actions use the newest authoritative CSRF/configuration', (
 
 test('heavy opportunities and the instrument catalogue are requested only by relevant views', () => {
   assert.equal(stateReadPath('hedge'), '/api/state');
-  for (const tab of ['trade', 'positions', 'orders', 'settings']) assert.equal(stateReadPath(tab), '/api/state?opportunities=0');
+  assert.equal(stateReadPath('positions'), '/api/state?opportunities=0&funding=1');
+  for (const tab of ['trade', 'orders', 'settings']) assert.equal(stateReadPath(tab), '/api/state?opportunities=0');
   for (const tab of ['trade', 'positions', 'hedge']) assert.equal(needsCatalog(tab), true);
   for (const tab of ['settings', 'orders']) assert.equal(needsCatalog(tab), false);
 });

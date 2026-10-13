@@ -79,7 +79,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
       if (route === '/api/bootstrap' && req.method === 'GET') return json(res, 200, {
         now: Date.now(), config: { ...market.config(), hasMonitorPassword: !!store.get('monitorPassword') }, connection: live.connectionView(), csrfToken: csrf,
       });
-      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...live.view({ includeOpportunities: url.searchParams.get('opportunities') !== '0' }), csrfToken: csrf });
+      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...live.view({ includeOpportunities: url.searchParams.get('opportunities') !== '0', ...(url.searchParams.get('funding') === '1' ? { includeFundingOpportunities: true } : {}) }), csrfToken: csrf });
       if (route === '/api/hub/summary' && req.method === 'GET') {
         const { updatedAt, metrics, health } = live.summary();
         if (url.searchParams.get('schemaVersion') === '2') return json(res, 200, { schemaVersion: 2, data: { updatedAt, metrics, health } });

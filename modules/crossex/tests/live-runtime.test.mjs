@@ -501,17 +501,23 @@ test('native position amounts and negative SINGLE direction map without fabricat
   const f = fixture(t); f.account({ position_mode: 'SINGLE' });
   f.positions([{ position_id: 'signed-short', symbol: symbols[0], position_side: 'NONE', position_qty: '-2', avg_price: '99', mark_price: '100',
     position_value: '-200', upnl: '-2', upnl_rate: '-0.01', initial_margin: '20', maintenance_margin: '3', leverage: '10', max_leverage: '100',
-    risk_limit: '100000', fee: '-0.2', funding_fee: '0.4', funding_time: epoch - 1000, closed_pnl: '7', liq_price: '120', update_time: epoch - 10 }]);
+    risk_limit: '100000', fee: '-0.2', funding_fee: '0.4', funding_time: epoch - 1000, closed_pnl: '7', liq_price: '120', create_time: String(epoch - 86400000), update_time: epoch - 10 }]);
   f.client.getAdlRanks = async () => [{ symbol: symbols[0], crossex_adl_rank: 2, exchange_adl_rank: 3 }];
   await f.connect(); await f.runtime.refreshDetails();
   const p = f.runtime.view().live.positions[0];
   assert.equal(p.side, 'SHORT'); assert.equal(p.directionSource, 'quantity_sign'); assert.equal(p.signedQuantity, '-2'); assert.equal(p.quantity, '2');
   assert.equal(p.entryPrice, '99'); assert.equal(p.notional, '200'); assert.equal(p.positionValue, '-200'); assert.equal(p.unrealizedPnlRate, '-0.01');
   assert.equal(p.maintenanceMargin, '3'); assert.equal(p.fundingFee, '0.4'); assert.equal(p.realizedPnl, '7'); assert.equal(p.crossExAdlRank, 2); assert.equal(p.sourceAt, epoch - 10);
+  assert.equal(p.openedAt, epoch - 86400000);
   const preview = await f.runtime.preview({ kind: 'close', positionId: p.id, quantity: '0.25' });
   await f.confirm(preview); assert.equal(f.calls.create[0].side, 'BUY'); assert.equal(f.calls.create[0].position_side, 'NONE');
   f.positions([{ position_id: 'sparse', symbol: symbols[0], position_side: 'NONE', position_qty: '-1' }]); await f.runtime.refresh();
   const sparse = f.runtime.view().live.positions[0]; assert.equal(sparse.unrealizedPnl, null); assert.equal(sparse.notional, null); assert.equal(sparse.liquidationPrice, null);
+  assert.equal(sparse.openedAt, null);
+  for (const create_time of ['0', String(epoch + 1), String(epoch - 5)]) {
+    f.positions([{ position_id: 'invalid-time', symbol: symbols[0], position_side: 'LONG', position_qty: '1', create_time, update_time: epoch - 10 }]);
+    await f.runtime.refresh(); assert.equal(f.runtime.view().live.positions[0].openedAt, null);
+  }
 });
 
 test('supplemental records deduplicate, preserve known details, survive restart and isolate connection versions', async t => {

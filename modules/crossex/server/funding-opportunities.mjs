@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { D } from './money.mjs';
 import { contractIdentity, freshQuote, fxRate, quoteTime, referencePrice, settlement, transferEligibility, validIdentity, validSignal } from './model.mjs';
-import { canonicalBase, isBaseBlocked } from '../../../server/asset-identity.mjs';
+import { canonicalBase, crossexBase, isBaseBlocked } from '../../../server/asset-identity.mjs';
 
 const FUNDING_TTL_MS = 300000, QUOTE_TTL_MS = 10000;
 const finite = value => typeof value === 'number' && Number.isFinite(value);
@@ -14,6 +14,31 @@ function fundingLeg(quote, rule, now) {
     normalized8hBps: D(quote.fundingRate).times(80000).div(quote.fundingIntervalHours).toNumber(),
     nextFundingAt: finite(quote.nextFundingAt) && quote.nextFundingAt > now ? quote.nextFundingAt : null,
     fundingAt: quote.fundingAt };
+}
+
+/** Current rates for actual held contracts, independent of new-entry discovery or policy. */
+export function positionFundingRates(feed, { now, ruleFor, symbols = [], sourceReason = '', catalogExpiresAt = Infinity } = {}) {
+  if (!feed || sourceReason || !finite(now) || !finite(feed.generatedAt) || feed.generatedAt <= 0
+    || feed.generatedAt > now + 1000 || feed.generatedAt + QUOTE_TTL_MS <= now || catalogExpiresAt <= now
+    || !Array.isArray(feed.quotes) || !Array.isArray(feed.exchanges) || typeof ruleFor !== 'function') return [];
+  const held = new Set(symbols), result = [];
+  if (!held.size) return result;
+  const liveVenues = new Set(feed.exchanges.filter(venue => venue.status === 'live').map(venue => venue.id));
+  for (const quote of feed.quotes) {
+    const symbol = quote?.crossexSymbol ?? (typeof quote?.exchange === 'string'
+      ? `${quote.exchange.toUpperCase()}_FUTURE_${crossexBase(quote.exchange, quote.rawBase ?? quote.base)}_${quote.quoteCurrency}` : null);
+    if (!held.has(symbol) || !liveVenues.has(quote.exchange) || !validIdentity(quote)
+      || (quote.contractKind ?? 'linear') !== 'linear' || quote.delisting || quote.delistingAt
+      || !finite(quote.fundingRate) || !finite(quote.fundingIntervalHours) || quote.fundingIntervalHours <= 0 || quote.fundingIntervalHours > 168
+      || !finite(quote.fundingAt) || quote.fundingAt <= 0 || quote.fundingAt > now + 1000 || quote.fundingAt + FUNDING_TTL_MS <= now) continue;
+    let rule;
+    try { rule = ruleFor(quote); } catch { continue; }
+    if (rule?.symbol !== symbol) continue;
+    const leg = fundingLeg(quote, rule, now);
+    const expiresAt = Math.min(catalogExpiresAt, feed.generatedAt + QUOTE_TTL_MS, quote.fundingAt + FUNDING_TTL_MS);
+    if (finite(leg.normalized8hBps) && finite(expiresAt) && expiresAt > now) result.push({ ...leg, expiresAt });
+  }
+  return result;
 }
 
 /** Pure discovery from complete Monitor quotes; never fetches data or authorizes an order. */
