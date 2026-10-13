@@ -43,7 +43,7 @@ pnpm test
 
 ## CI 与发布包
 
-GitHub Actions 先安装固定 pnpm 并执行 `pnpm install --frozen-lockfile`，随后在 Ubuntu x64 上验收服务账号构建与安装器。依赖缓存冻结为 root 只读；每个 importer 使用可写 `node_modules` 外壳，使 Vite/Next 临时文件与共享包内容分离。
+GitHub Actions 先安装固定 pnpm 并执行 `pnpm install --frozen-lockfile`，随后在 Ubuntu x64 上验收服务账号构建与安装器。依赖缓存冻结为 root 只读；每个 importer 使用可写 `node_modules` 外壳，使 Vite/Next 临时文件与共享包内容分离。该受控环境禁止 pnpm 在运行脚本前隐式重装，依赖安装只发生在显式 frozen 准备步骤。
 
 打包器从锁定安装图提取生产依赖，处理当前平台可选依赖、peer、版本冲突与依赖循环；发布包不包含 pnpm 的外部链接，也不需要开发机或 CI 缓存才能运行。打包后从工作台实际入口验证四个模块页面、静态资源与汇总接口。
 

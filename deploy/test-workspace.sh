@@ -30,6 +30,7 @@ chown -R root:root "$dependencies"
 chmod -R go-w "$dependencies"
 dependency_key=fixture-workspace
 printf '%s\n' "$dependency_key" > "$dependencies/.complete"
+cache_modules_hash=$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)
 prepare_workspace
 for importer in . modules/monitor modules/asset modules/crossex; do
   [[ ! -L "$work_dir/source/$importer/node_modules" && -L "$work_dir/source/$importer/node_modules/react" ]]
@@ -50,6 +51,7 @@ run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-versi
 for importer in . modules/monitor modules/asset modules/crossex; do
   [[ ! -d "$dependencies/$importer/node_modules/.vite-temp" ]]
 done
+[[ "$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)" == "$cache_modules_hash" ]]
 printf 'Real non-root build and backend import passed with immutable shared dependencies.\n'
 
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then

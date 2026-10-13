@@ -380,7 +380,9 @@ PNPM_INTEGRITY_PY
 run_as_service() {
   local manager_path=
   [[ -z ${PNPM_BIN:-} ]] || manager_path="$(dirname "$PNPM_BIN"):"
-  runuser -u "$SERVICE_USER" -- env "HOME=$APP_DIR/build-home" "PATH=$(dirname "$NODE_BIN"):${manager_path}/usr/local/bin:/usr/bin:/bin" "$@"
+  # These commands use a separately verified, frozen dependency cache. pnpm 11
+  # must not reinstall it because its recorded install directory has moved.
+  runuser -u "$SERVICE_USER" -- env pnpm_config_verify_deps_before_run=false "HOME=$APP_DIR/build-home" "PATH=$(dirname "$NODE_BIN"):${manager_path}/usr/local/bin:/usr/bin:/bin" "$@"
 }
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
 read_build_environment() {

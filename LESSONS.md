@@ -267,6 +267,20 @@
 
 **事件记录：** `pnpm-cli-entry-20261014`；迁移开发阶段一次已核实审查发现，连续修补不重复计数。
 
+### L019：不可变依赖缓存禁止脚本入口隐式重装
+
+**适用条件：** 安装器先校验并冻结依赖，再通过可写外壳链接到构建工作区的流程。
+
+**根因：** pnpm 11 的 `verifyDepsBeforeRun` 默认执行安装；缓存搬移及链接后的 workspace 状态与原安装位置不同，普通 `pnpm run check` 也会尝试重建依赖目录，破坏安装和构建的职责边界。
+
+**以后做法：** 只在安装器的服务账号执行环境中禁止脚本前自动安装；依赖准备仍显式执行固定版本的 frozen 安装，并保留缓存来源、输入哈希、只读权限与实际构建验证。不要用自动确认目录删除修复该失败。
+
+**证据：** 本仓 `1cd309f` 的 [Linux CI](https://github.com/hxx344/project-aggregation/actions/runs/38454566071) 安装器检查通过，但 [非 root 构建检查](deploy/test-workspace.sh) 在首个 `pnpm run check` 触发 `runDepsStatusCheck` 的隐式安装，报 `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`。
+
+**如何验证：** 在链接到冻结缓存的 workspace 中实际构建，确认缓存元数据不变、服务账号不能改包内容，随后执行独立发布包验收。本地普通可写 workspace 构建不能代替该 Linux 权限路径。
+
+**事件记录：** `pnpm-immutable-auto-install-20261014`；迁移 CI 中一次已核实缺陷，后续连续修补不增加事件数。
+
 ## Moved to the code standards
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目归档到本节，保留证据与规范链接；不按重复复盘次数自动升级。
