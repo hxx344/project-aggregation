@@ -19,13 +19,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24.15.0'
-          cache: npm
+      - uses: pnpm/action-setup@v4
+        id: pnpm
+      - name: Locate pnpm content store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-11.25.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-11.25.0-${{ runner.os }}-${{ runner.arch }}-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: npm ci
+      - run: pnpm install --frozen-lockfile
       - name: Check and build with immutable dependencies as the service account
-        run: sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PYTHON="$(command -v python)" bash deploy/test-workspace.sh
+        run: sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" bash deploy/test-workspace.sh
       - name: Keep the verified deployment package
         uses: actions/upload-artifact@v4
         with:

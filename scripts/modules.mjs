@@ -7,12 +7,29 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const action = process.argv[2];
 if (!['install', 'build'].includes(action)) throw new Error('Usage: node scripts/modules.mjs install|build');
-const npm = process.env.npm_execpath;
-if (!npm || !existsSync(npm)) throw new Error('Run through npm run install:modules or npm run build:modules');
-const environment = `${process.version}:${process.platform}:${process.arch}:${process.env.NODE_ENV || ''}`;
+const pnpm = process.env.npm_execpath;
+if (!pnpm || !existsSync(pnpm) || !process.env.npm_config_user_agent?.startsWith('pnpm/')) {
+  throw new Error('Run through pnpm run install:modules or pnpm run build:modules');
+}
+const manifests = ['package.json', ...['monitor', 'asset', 'crossex'].map(id => `modules/${id}/package.json`)];
+const sharedInputs = [...manifests, 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'scripts/modules.mjs'];
+const environment = JSON.stringify({
+  node: process.version, platform: process.platform, arch: process.arch,
+  manager: process.env.npm_config_user_agent.split(' ')[0],
+  variables: Object.entries(process.env).filter(([name]) => name === 'NODE_ENV' || /^(VITE_|NEXT_PUBLIC_)/.test(name)).sort(([a], [b]) => a.localeCompare(b)),
+});
 const ignored = new Set(['node_modules', 'dist', '.next', '.build-cache', '.module-cache', '.git', '__pycache__', '.pytest_cache', '.venv', '.data', 'output']);
 function digest(directory, files) {
-  const hash = createHash('sha256').update('embedded-build-v1:' + environment);
+  const hash = createHash('sha256').update('embedded-workspace-build-v2:' + environment);
+  for (const relative of sharedInputs) {
+    const file = path.join(root, relative);
+    hash.update(relative).update(existsSync(file) ? readFileSync(file) : '<absent>');
+  }
+  // Environment files are build inputs, but their contents never enter logs/stamps.
+  for (const base of [root, directory]) for (const name of ['.env', '.env.local', '.env.production', '.env.production.local']) {
+    const file = path.join(base, name);
+    hash.update(file).update(existsSync(file) ? readFileSync(file) : '<absent>');
+  }
   function visit(relative) {
     const file = path.join(directory, relative);
     if (!existsSync(file)) return;
@@ -30,16 +47,21 @@ function digest(directory, files) {
   return hash.digest('hex');
 }
 const run = (directory, args) => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [npm, ...args], { cwd: directory, stdio: 'inherit', windowsHide: true });
+  const child = spawn(process.execPath, [pnpm, ...args], { cwd: directory, stdio: 'inherit', windowsHide: true });
   child.once('error', reject);
-  child.once('exit', code => code === 0 ? resolve() : reject(new Error(`npm ${args.join(' ')} failed (${code})`)));
+  child.once('exit', code => code === 0 ? resolve() : reject(new Error(`pnpm ${args.join(' ')} failed (${code})`)));
 });
+if (action === 'install') {
+  console.log('[modules] Installing all workspace dependencies with the frozen lockfile');
+  await run(root, ['install', '--frozen-lockfile']);
+  process.exit(0);
+}
 for (const id of ['monitor', 'asset', 'crossex']) {
   const directory = path.join(root, 'modules', id), cache = path.join(directory, '.module-cache');
   mkdirSync(cache, { recursive: true });
-  const key = digest(directory, action === 'install' ? ['package.json', 'package-lock.json'] : undefined);
+  const key = digest(directory);
   const stamp = path.join(cache, `${action}.json`);
-  const artifact = path.join(directory, action === 'install' ? 'node_modules/.package-lock.json' : id === 'asset' ? '.next/BUILD_ID' : id === 'monitor' ? 'dist/build-manifest.json' : 'dist/index.html');
+  const artifact = path.join(directory, id === 'asset' ? '.next/BUILD_ID' : id === 'monitor' ? 'dist/build-manifest.json' : 'dist/index.html');
   let saved;
   try { saved = JSON.parse(readFileSync(stamp, 'utf8')); } catch { /* first run or invalid cache */ }
   const artifactHash = () => createHash('sha256').update(readFileSync(artifact)).digest('hex');
@@ -47,8 +69,9 @@ for (const id of ['monitor', 'asset', 'crossex']) {
     console.log(`[modules] ${id}: ${action} unchanged; skipped`); continue;
   }
   console.log(`[modules] ${id}: ${action}`);
-  await run(directory, action === 'install' ? ['ci', '--no-audit', '--no-fund'] : ['run', 'build']);
+  if (id === 'asset') await run(directory, ['run', 'prepare']);
+  await run(directory, ['run', 'build']);
   if (!existsSync(artifact)) throw new Error(`${id} did not produce ${artifact}`);
   // Recalculate because a preparation step may create a required source input.
-  writeFileSync(stamp, JSON.stringify({ key: digest(directory, action === 'install' ? ['package.json', 'package-lock.json'] : undefined), artifact: artifactHash() }) + '\n');
+  writeFileSync(stamp, JSON.stringify({ key: digest(directory), artifact: artifactHash() }) + '\n');
 }

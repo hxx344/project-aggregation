@@ -253,6 +253,20 @@
 
 **事件记录：** `embedded-funding-delivery-20261014`；2026-10-14 用户纠正后核实，补丁移植和发布验证均归为同一次事件，不推进主线复盘检查点。
 
+### L018：固定 Node 执行包管理器时必须取得 JavaScript 入口
+
+**适用条件：** CI 或安装器使用 `node <package-manager>`，以固定 Node 版本运行包管理器。
+
+**根因：** `command -v pnpm` 可能返回 `.bin` 中的 shell shim；`realpath` 只能解析文件链接，不能把 shell 包装器变成 JavaScript。将该路径交给 Node 会在安装或构建前报语法错误。
+
+**以后做法：** 明确取得所安装包的 JavaScript 入口，并用指定 Node 验证包管理器版本；若直接执行 shell shim，则另行确认其实际 Node 选择。不能假设 `pnpm exec` 总会提供 `npm_execpath`。
+
+**证据：** 本仓基于 `35396d4` 的 2026-10-14 pnpm 迁移工作区中，[CI](.github/workflows/ci.yml) 最初把 `command -v pnpm` 传给 [非 root 构建检查](deploy/test-workspace.sh)，后者再通过 Node 执行。审查对照 `pnpm/action-setup@v4` 的 `.bin` 安装路径确认不匹配，首次提交前改为 action 安装目录下的 `pnpm/bin/pnpm.mjs`；本地 `pnpm exec node -p process.env.npm_execpath` 实际返回 `undefined`。这不是基线提交已有的 pnpm 缺陷。
+
+**如何验证：** CI fixture 先以 `INSTALL_TEST_NODE` 执行入口并断言 pnpm 版本，再完成真实非 root 构建；仅 `bash -n` 不能覆盖入口类型错误。
+
+**事件记录：** `pnpm-cli-entry-20261014`；迁移开发阶段一次已核实审查发现，连续修补不重复计数。
+
 ## Moved to the code standards
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目归档到本节，保留证据与规范链接；不按重复复盘次数自动升级。

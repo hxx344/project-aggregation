@@ -18,18 +18,18 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 
 ## 本地开发
 
-使用 Node.js 24.15+、Python 3.11+：
+使用 Node.js 24.15+、pnpm 11.25.0、Python 3.11+：
 
 ```bash
-npm ci
-npm run install:modules
-npm run build:all
+npm install -g pnpm@11.25.0
+pnpm install --frozen-lockfile
+pnpm run build:all
 python -m venv .venv
 # Windows 使用 .venv/Scripts/python.exe；Linux/macOS 使用 .venv/bin/python
 .venv/Scripts/python.exe -m pip install --require-hashes -r modules/greeks/requirements.lock
 ```
 
-将 `GREEKS_PYTHON` 设置为虚拟环境 Python 的绝对路径后运行 `npm start`。开发工作台前端可额外运行 `npm run dev`。模块依赖和构建按源码、锁文件与 Node 环境缓存，无变化时跳过。
+将 `GREEKS_PYTHON` 设置为虚拟环境 Python 的绝对路径后运行 `pnpm start`。开发工作台前端可额外运行 `pnpm run dev`。一次安装覆盖根目录与三个 Node 模块，共享版本由 workspace catalog 维护，`pnpm-lock.yaml` 提交到仓库。模块构建按源码、workspace 依赖和构建环境缓存，无变化时跳过。详见 [pnpm workspace 说明](docs/pnpm-workspace-migration.md)。
 
 ## 项目结构
 
@@ -46,7 +46,7 @@ python -m venv .venv
 
 ## 检查与文档
 
-`npm run check` 执行工作台类型检查，`npm test` 运行 Node 行为测试；模块集成测试需要先完成模块依赖安装与构建，并配置 Greeks Python 环境。Linux 安装、systemd 恢复与 x64/arm64 部署包验收由 GitHub Actions 执行。
+`pnpm run check` 执行工作台类型检查，`pnpm test` 运行 Node 行为测试；模块集成测试需要先完成 workspace 安装与模块构建，并配置 Greeks Python 环境。Linux 安装、systemd 恢复与 x64 部署包验收由 GitHub Actions 执行。
 
 - [部署与迁移](docs/deployment.md)
 - [Gate 资产连接](docs/gate-assets.md)

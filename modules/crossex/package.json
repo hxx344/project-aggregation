@@ -5,7 +5,9 @@
   "license": "AGPL-3.0-only",
   "type": "module",
   "description": "Gate CrossEx 手动实盘交易与持仓观察工作台",
-  "engines": { "node": ">=24.15.0" },
+  "engines": {
+    "node": ">=24.15.0"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "dev:server": "node --watch server/index.mjs",
@@ -17,18 +19,18 @@
   },
   "dependencies": {
     "decimal.js": "10.6.0",
-    "lucide-react": "1.31.0",
-    "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "recharts": "3.8.0",
-    "ws": "8.21.3"
+    "lucide-react": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "recharts": "catalog:",
+    "ws": "catalog:"
   },
   "devDependencies": {
-    "@types/node": "24.12.0",
-    "@types/react": "19.2.14",
-    "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.2",
-    "typescript": "5.9.3",
-    "vite": "8.2.2"
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:"
   }
 }

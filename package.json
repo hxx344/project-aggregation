@@ -15,24 +15,26 @@
     "build:bundle": "vite build",
     "install:modules": "node scripts/modules.mjs install",
     "build:modules": "node scripts/modules.mjs build",
-    "build:all": "npm run build && npm run build:modules",
+    "build:all": "pnpm run build && pnpm run build:modules",
     "start": "node server/index.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "lucide-react": "1.31.0",
+    "lucide-react": "catalog:",
     "pino": "^10.4.0",
     "pino-pretty": "^13.2.0",
-    "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "recharts": "3.8.0"
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "recharts": "catalog:"
   },
   "devDependencies": {
-    "@types/node": "24.12.0",
-    "@types/react": "19.2.14",
-    "@types/react-dom": "19.2.3",
-    "@vitejs/plugin-react": "6.0.2",
-    "typescript": "5.9.3",
-    "vite": "8.2.2"
-  }
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "yaml": "2.9.1"
+  },
+  "packageManager": "pnpm@11.25.0"
 }

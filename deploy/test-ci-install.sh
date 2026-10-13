@@ -8,7 +8,8 @@ trap 'rm -rf -- "$fixture"' EXIT
 export FIXTURE_ROOT=$fixture
 mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/runtime"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
-printf '{}\n' > "$fixture/source/package-lock.json"
+printf '{}\n' > "$fixture/source/pnpm-lock.yaml"
+printf 'packages: []\n' > "$fixture/source/pnpm-workspace.yaml"
 printf '{}\n' > "$fixture/source/tsconfig.json"
 printf 'frontend\n' > "$fixture/source/src/app.ts"
 printf 'backend\n' > "$fixture/source/server/index.mjs"
@@ -36,35 +37,35 @@ if [[ $1 == -e ]]; then
   if [[ -n ${VITE_FIXTURE_VALUE:-} ]]; then printf '[["VITE_FIXTURE_VALUE","%s"]]\n' "$VITE_FIXTURE_VALUE"; else printf '[]\n'; fi
   exit
 fi
-shift # npm path
-if [[ $1 == --version ]]; then printf '11.0.0\n'; exit; fi
+shift # pnpm path
+if [[ $1 == --version ]]; then printf '11.25.0\n'; exit; fi
 case "$1 ${2:-}" in
-  'ci '*)
-    echo ci >> "$FIXTURE_ROOT/npm.calls"
+  'install --frozen-lockfile')
+    echo install >> "$FIXTURE_ROOT/pnpm.calls"
     mkdir -p node_modules/.bin node_modules/example
     printf 'immutable package\n' > node_modules/example/index.js
     ;;
   'run check')
-    echo check >> "$FIXTURE_ROOT/npm.calls"
+    echo check >> "$FIXTURE_ROOT/pnpm.calls"
     [[ ! -f "$FIXTURE_ROOT/fail-check" ]] || exit 41
     ;;
   'test ')
-    echo test >> "$FIXTURE_ROOT/npm.calls"
+    echo test >> "$FIXTURE_ROOT/pnpm.calls"
     [[ -L node_modules/example && -r node_modules/example/index.js ]]
     [[ ! -f "$FIXTURE_ROOT/fail-test" ]] || exit 42
     ;;
   'run build:bundle')
-    echo build >> "$FIXTURE_ROOT/npm.calls"
+    echo build >> "$FIXTURE_ROOT/pnpm.calls"
     mkdir -p node_modules/.vite-temp dist
     printf 'workspace only\n' > node_modules/.vite-temp/build.mjs
     [[ ! -f "$FIXTURE_ROOT/fail-build" ]] || exit 43
     printf '<html>built</html>\n' > dist/index.html
     ;;
-  *) printf 'Unexpected npm call: %s\n' "$*" >&2; exit 1 ;;
+  *) printf 'Unexpected pnpm call: %s\n' "$*" >&2; exit 1 ;;
 esac
 NODE
 chmod +x "$fixture/runtime/node"
-cp "$fixture/runtime/node" "$fixture/runtime/npm"
+cp "$fixture/runtime/node" "$fixture/runtime/pnpm"
 cat > "$fixture/run.sh" <<'RUN'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -81,6 +82,7 @@ validate_embedded_runtime() { :; }
 prepare_greeks_runtime() { :; }
 migrate_embedded_modules() { :; }
 ensure_node() { NODE_BIN="$FIXTURE_ROOT/runtime/node"; }
+ensure_pnpm() { [[ "$PROJECT_DEPLOY_MODE" == source ]] || { echo "Unexpected pnpm preparation" >&2; return 92; }; PNPM_BIN="$FIXTURE_ROOT/runtime/pnpm"; }
 run_as_service() { "$@"; }
 systemctl() {
   printf '%s\n' "$*" >> "$FIXTURE_ROOT/systemctl.calls"
@@ -122,12 +124,12 @@ fi
 main
 RUN
 run_install() { bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || { cat "$fixture/last.log"; return 1; }; }
-count() { grep -c "^$1$" "$fixture/npm.calls" || true; }
+count() { grep -c "^$1$" "$fixture/pnpm.calls" || true; }
 restarts() { grep -c '^restart ' "$fixture/systemctl.calls" || true; }
 releases() { find "$fixture/application/releases" -mindepth 1 -maxdepth 1 -type d | wc -l; }
 expect_counts() {
-  [[ $(count ci) == "$1" && $(count check) == "$2" && $(count test) == "$3" && $(count build) == "$4" && $(restarts) == "$5" ]] || {
-    cat "$fixture/npm.calls" "$fixture/systemctl.calls" >&2; return 1;
+  [[ $(count install) == "$1" && $(count check) == "$2" && $(count test) == "$3" && $(count build) == "$4" && $(restarts) == "$5" ]] || {
+    cat "$fixture/pnpm.calls" "$fixture/systemctl.calls" >&2; return 1;
   }
 }
 
@@ -183,7 +185,7 @@ expect_counts 1 1 0 1 2
 PROJECT_DEPLOY_TESTS=1 run_install
 expect_counts 1 1 0 1 2
 
-# A new application is downloaded and activated, without npm/git/build.
+# A new application is downloaded and activated, without pnpm/git/build.
 echo changed >> "$fixture/source/server/index.mjs"; commit_source changed
 make_package upgraded
 run_install

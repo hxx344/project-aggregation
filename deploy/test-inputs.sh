@@ -11,14 +11,16 @@ git -C "$source_dir" init -q -b main
 git -C "$source_dir" config core.autocrlf false
 git -C "$source_dir" config user.name fixture
 git -C "$source_dir" config user.email fixture@example.invalid
-for file in package.json package-lock.json tsconfig.json src/app.ts server/index.mjs tests/app.test.mjs; do
+for file in package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json src/app.ts server/index.mjs tests/app.test.mjs; do
   printf '{}\n' > "$source_dir/$file"
 done
 git -C "$source_dir" add .
 git -C "$source_dir" commit -qm initial
 git clone -q --bare "$source_dir" "$APP_DIR/repository.git"
 runtime_key=fixture-node
-build_environment='[]'
+NODE_BIN=$(command -v node)
+build_environment=$(NODE_ENV=production VITE_FIXTURE_VALUE=initial NEXT_PUBLIC_FIXTURE_VALUE=initial read_build_environment)
+[[ "$build_environment" == *'["NODE_ENV","production"]'* && "$build_environment" == *'["VITE_FIXTURE_VALUE","initial"]'* && "$build_environment" == *'["NEXT_PUBLIC_FIXTURE_VALUE","initial"]'* ]]
 refresh() {
   git -C "$source_dir" add .
   if ! git -C "$source_dir" diff --cached --quiet; then git -C "$source_dir" commit -qm change; fi
@@ -49,18 +51,40 @@ echo config >> "$source_dir/tsconfig.json"; refresh; compare 0 1 1 1 1
 capture
 echo VITE_PUBLIC=fixture > "$source_dir/.env.production"; refresh; compare 0 0 0 1 1
 capture
-build_environment='[["VITE_PUBLIC","new"]]'; input_keys; compare 0 0 0 1 1
+build_environment=$(NODE_ENV=production VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=initial read_build_environment); input_keys; compare 0 0 0 1 1
 capture
-echo dependency >> "$source_dir/package-lock.json"; refresh; compare 1 1 1 1 1
+build_environment=$(NODE_ENV=production VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=changed read_build_environment); input_keys; compare 0 0 0 1 1
+capture
+build_environment=$(NODE_ENV=development VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=changed read_build_environment); input_keys; compare 0 0 0 1 1
+capture
+build_environment=$(NODE_ENV=development VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=changed UNRELATED_FIXTURE_VALUE=changed read_build_environment); input_keys; compare 0 0 0 0 0
+capture
+echo dependency >> "$source_dir/pnpm-lock.yaml"; refresh; compare 1 1 1 1 1
+capture
+echo catalog >> "$source_dir/pnpm-workspace.yaml"; refresh; compare 1 1 1 1 1
+capture
+echo settings >> "$source_dir/.npmrc"; refresh; compare 1 1 1 1 1
+capture
+PNPM_VERSION=changed-pnpm; input_keys; compare 1 1 1 1 1
 capture
 runtime_key=another-node; input_keys; compare 1 1 1 1 1
 capture
-mkdir -p "$source_dir/modules/monitor"
-echo module > "$source_dir/modules/monitor/package.json"; refresh; compare 0 1 1 1 1
+for importer in monitor asset crossex; do
+  mkdir -p "$source_dir/modules/$importer"
+  echo module > "$source_dir/modules/$importer/package.json"; refresh; compare 1 1 1 1 1
+  capture
+done
+echo settings >> "$source_dir/modules/asset/.npmrc"; refresh; compare 1 1 1 1 1
 capture
-echo lock > "$source_dir/modules/monitor/package-lock.json"; refresh; compare 0 1 1 1 1
+mkdir -p "$source_dir/modules/asset/scripts" "$source_dir/modules/asset/lib"
+echo prepare > "$source_dir/modules/asset/scripts/prepare-ledger.mjs"; refresh; compare 1 1 1 1 1
+capture
+echo example > "$source_dir/modules/asset/lib/example-ledger.json"; refresh; compare 1 1 1 1 1
 capture
 echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 1 1 1 1
+capture
+mkdir -p "$source_dir/deploy"
+echo helper > "$source_dir/deploy/pnpm-runtime-lock.mjs"; refresh; compare 0 0 0 1 1
 commit=invalid-source
 if input_keys 2>/dev/null; then echo 'Invalid git source was silently hashed' >&2; exit 1; fi
 printf 'Git input classification passed, including tsconfig, Vite env and failed reads.\n'

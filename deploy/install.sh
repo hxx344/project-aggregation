@@ -11,7 +11,9 @@ UNIT_FILE=/etc/systemd/system/project-aggregation.service
 REPOSITORY=https://github.com/hxx344/project-aggregation.git
 BRANCH=main
 NODE_VERSION=24.15.0
-INSTALL_REVISION=3
+PNPM_VERSION=11.25.0
+PNPM_INTEGRITY=XN6SW08HX3Jetx+64YpC/+eEUkeJ8ZthxzHLhyHsKKruFg4BqNWvT+2ypCzb8wDv4j2zVrDUoXtNY+EfirfJVg==
+INSTALL_REVISION=4
 UPDATER_DIR=/usr/local/lib/project-aggregation-updater
 UPDATER_STATE_DIR=/var/lib/project-aggregation-updater
 UPDATER_RUN_DIR=/run/project-aggregation-updater
@@ -348,10 +350,42 @@ ensure_node() {
   NODE_BIN="$runtime_dir/bin/node"
   node_supported "$NODE_BIN" || fail 'Node.js 版本不满足 24.15.0 或更高的 24.x 版本要求。'
 }
+ensure_pnpm() {
+  local runtime_dir="$APP_DIR/runtime/pnpm-$PNPM_VERSION" archive="$work_dir/pnpm.tgz" staging="$work_dir/pnpm"
+  PNPM_BIN="$runtime_dir/bin/pnpm.mjs"
+  if [[ -f "$PNPM_BIN" ]]; then
+    updater_safe_path "$PNPM_BIN"
+    [[ "$("$NODE_BIN" "$PNPM_BIN" --version)" == "$PNPM_VERSION" ]] || fail '已缓存 pnpm 版本不匹配。'
+    return
+  fi
+  [[ ! -e "$runtime_dir" ]] || fail 'pnpm 运行时目录不完整，请检查后重试。'
+  log "准备固定版本 pnpm $PNPM_VERSION 并校验官方包 SHA-512。"
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 \
+    "https://registry.npmjs.org/pnpm/-/pnpm-$PNPM_VERSION.tgz" -o "$archive"
+  python3 - "$archive" "$PNPM_INTEGRITY" <<'PNPM_INTEGRITY_PY'
+import base64, hashlib, sys
+from pathlib import Path
+actual = base64.b64encode(hashlib.sha512(Path(sys.argv[1]).read_bytes()).digest()).decode()
+if actual != sys.argv[2]:
+    raise SystemExit('pnpm package integrity mismatch')
+PNPM_INTEGRITY_PY
+  mkdir -p "$APP_DIR/runtime" "$staging"
+  tar -xzf "$archive" -C "$staging" --strip-components=1 --no-same-owner
+  [[ "$("$NODE_BIN" "$staging/bin/pnpm.mjs" --version)" == "$PNPM_VERSION" ]] || fail 'pnpm 下载包版本不匹配。'
+  ln -s pnpm.mjs "$staging/bin/pnpm"
+  chown -R root:root "$staging"
+  chmod -R a+rX,go-w "$staging"
+  mv -- "$staging" "$runtime_dir"
+}
 run_as_service() {
-  runuser -u "$SERVICE_USER" -- env "HOME=$APP_DIR/build-home" "PATH=$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin" "$@"
+  local manager_path=
+  [[ -z ${PNPM_BIN:-} ]] || manager_path="$(dirname "$PNPM_BIN"):"
+  runuser -u "$SERVICE_USER" -- env "HOME=$APP_DIR/build-home" "PATH=$(dirname "$NODE_BIN"):${manager_path}/usr/local/bin:/usr/bin:/bin" "$@"
 }
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
+read_build_environment() {
+  "$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key === "NODE_ENV" || /^(VITE_|NEXT_PUBLIC_)/.test(key)).sort(([a], [b]) => a.localeCompare(b))))'
+}
 atomic_record() {
   local destination=$1 value=$2 temporary="${1}.new.$$"
   printf '%s\n' "$value" > "$temporary" || return 1
@@ -360,14 +394,17 @@ atomic_record() {
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree
-  dependency_tree=$(tree_hash package.json package-lock.json .npmrc) || return
+  dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
+    modules/monitor/package.json modules/asset/package.json modules/crossex/package.json \
+    modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc \
+    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json) || return
   typecheck_tree=$(tree_hash modules scripts/modules.mjs src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
-  build_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/migrate-modules.py src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
+  build_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
   runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py) || return
-  embedded_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/migrate-modules.py) || return
+  embedded_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
-  dependency_key=$(printf 'dependencies-v2\n%s\n%s' "$dependency_tree" "$runtime_key" | hash)
+  dependency_key=$(printf 'pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger\n%s\n%s\n%s' "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
   typecheck_key=$(printf 'typecheck-v2\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
   test_key=$(printf 'tests-v2\n%s\n%s' "$test_tree" "$dependency_key" | hash)
   # Vite may inline build-time environment; keep those inputs out of runtime config.
@@ -396,7 +433,8 @@ prepare_source() {
   chown -R "$SERVICE_USER:$SERVICE_USER" "$work_dir/source"
 }
 prepare_dependencies() {
-  if [[ -f "$dependencies/.complete" && -d "$dependencies/node_modules" ]]; then
+  if [[ -f "$dependencies/.complete" && -d "$dependencies/node_modules" && "$(cat "$dependencies/.complete")" == "$dependency_key" ]]; then
+    updater_safe_path "$dependencies/.complete"
     log '依赖与运行环境未变化，复用 root 只读依赖缓存。'
     return
   fi
@@ -405,14 +443,23 @@ prepare_dependencies() {
   local staging="$work_dir/dependencies"
   mkdir "$staging"
   local name
-  for name in package.json package-lock.json .npmrc; do
+  for name in package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
+    modules/monitor/package.json modules/asset/package.json modules/crossex/package.json \
+    modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc \
+    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json; do
     git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:$name" 2>/dev/null || continue
+    mkdir -p "$(dirname "$staging/$name")"
     git --git-dir="$APP_DIR/repository.git" show "$commit:$name" > "$staging/$name"
   done
+  [[ -f "$staging/package.json" && -f "$staging/pnpm-lock.yaml" && -f "$staging/pnpm-workspace.yaml" ]] || fail '固定源码缺少 pnpm 工作区安装输入。'
   chmod 0755 "$work_dir"
   chown -R "$SERVICE_USER:$SERVICE_USER" "$staging"
-  (cd "$staging" && run_as_service env NODE_ENV=development "$NODE_BIN" "$NPM_BIN" ci --include=dev --no-audit --no-fund)
+  (cd "$staging" && run_as_service env NODE_ENV=development CI=true "$NODE_BIN" "$PNPM_BIN" install --frozen-lockfile --prod=false --package-import-method=copy --store-dir "$APP_DIR/build-home/pnpm-store")
   [[ -d "$staging/node_modules" ]] || fail '依赖安装未生成 node_modules。'
+  local importer
+  for importer in modules/monitor modules/asset modules/crossex; do
+    [[ ! -f "$staging/$importer/package.json" || -d "$staging/$importer/node_modules" ]] || fail "依赖安装缺少工作区 importer：$importer"
+  done
   # Freeze once. Neither the running service nor later tests/builds can edit packages.
   chown -R root:root "$staging"
   chmod -R go-w "$staging"
@@ -421,19 +468,24 @@ prepare_dependencies() {
 }
 prepare_workspace() {
   prepare_source
-  [[ ! -d "$work_dir/source/node_modules" ]] || return 0
   prepare_dependencies
-  local entry name modules="$work_dir/source/node_modules"
-  mkdir "$modules"
-  # Only top-level links: packages stay immutable, while Vite's .vite-temp/.vite
-  # are created in this private workspace. No dependency copy or recursive chown.
-  for entry in "$dependencies/node_modules/"* "$dependencies/node_modules/".[!.]*; do
-    [[ -e "$entry" || -L "$entry" ]] || continue
-    name=${entry##*/}
-    case "$name" in .vite|.vite-temp) continue ;; esac
-    ln -s "$entry" "$modules/$name"
+  local importer entry name modules
+  # Every importer needs its own writable shell for Vite and other build caches.
+  # Link each entry to the matching frozen importer so pnpm's relative package
+  # links keep resolving through the cache's single virtual store.
+  for importer in . modules/monitor modules/asset modules/crossex; do
+    [[ -d "$dependencies/$importer/node_modules" ]] || continue
+    modules="$work_dir/source/$importer/node_modules"
+    [[ ! -d "$modules" ]] || continue
+    mkdir -p "$modules"
+    for entry in "$dependencies/$importer/node_modules/"* "$dependencies/$importer/node_modules/".[!.]*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      name=${entry##*/}
+      case "$name" in .vite|.vite-temp|.cache) continue ;; esac
+      ln -s "$entry" "$modules/$name"
+    done
+    chown "$SERVICE_USER:$SERVICE_USER" "$modules"
   done
-  chown "$SERVICE_USER:$SERVICE_USER" "$modules"
 }
 prepare_application() {
   local reuse=0 need_build=1
@@ -441,25 +493,24 @@ prepare_application() {
   if (( reuse )) || [[ -f "$built/.complete" && -s "$built/dist/index.html" ]]; then need_build=0; fi
   if [[ ! -f "$typecheck_stamp" || ( "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" ) ]] || (( need_build )); then prepare_workspace; fi
   if [[ "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" && -d "$work_dir/source/modules" ]]; then
-    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run install:modules)
-    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run build:modules)
+    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
     prepare_source_greeks_runtime
   fi
   if [[ ! -f "$typecheck_stamp" ]]; then
     log '类型检查输入变化，执行一次类型检查。'
-    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run check)
+    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
     atomic_record "$typecheck_stamp" "$typecheck_key"
   else log '类型检查输入未变化，复用验证结果。'; fi
   if [[ "$PROJECT_DEPLOY_TESTS" == 0 ]]; then
     log '跳过完整行为测试；CI 继续验证，设置 PROJECT_DEPLOY_TESTS=1 可在部署时补测。'
   elif [[ ! -f "$test_stamp" ]]; then
     log '测试或相关源码变化，在隔离目录执行行为测试。'
-    (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" "$NODE_BIN" "$NPM_BIN" test)
+    (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" "$NODE_BIN" "$PNPM_BIN" test)
     atomic_record "$test_stamp" "$test_key"
   else log '行为测试输入未变化，复用验证结果。'; fi
   if (( need_build )); then
     log '前端内容或运行环境变化，构建页面。'
-    (cd "$work_dir/source" && run_as_service env NODE_ENV=production "$NODE_BIN" "$NPM_BIN" run build:bundle)
+    (cd "$work_dir/source" && run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
     [[ -s "$work_dir/source/dist/index.html" ]] || fail '构建缺少 dist/index.html。'
     [[ ! -e "$built" ]] || fail '构建缓存目录不完整，请检查后重试。'
     mkdir "$work_dir/build"
@@ -469,27 +520,24 @@ prepare_application() {
         log '内置模块源码与依赖未变化，复用模块产物并跳过模块安装、构建。'
       else
         [[ ! -e "$embedded" ]] || fail '内置模块构建缓存不完整，请检查后重试。'
-        (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run install:modules)
-        (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$NPM_BIN" run build:modules)
+        (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
         # Build output belongs to the unprivileged account. Freeze it, then
         # restore all executable runtime/helper source from the pinned git tree.
         # In particular, never execute its writable packaging script as root.
         chown -R root:root "$work_dir/source"
         chmod -R go-w "$work_dir/source"
         mkdir "$work_dir/trusted-runtime"
-        git --git-dir="$APP_DIR/repository.git" archive "$commit" server modules package.json package-lock.json deploy/package-release.py deploy/migrate-modules.py | tar -x -C "$work_dir/trusted-runtime"
+        git --git-dir="$APP_DIR/repository.git" archive "$commit" server modules package.json pnpm-lock.yaml pnpm-workspace.yaml deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py | tar -x -C "$work_dir/trusted-runtime"
         cp -a "$work_dir/source/dist" "$work_dir/trusted-runtime/dist"
-        ln -s "$dependencies/node_modules" "$work_dir/trusted-runtime/node_modules"
         local module artifact
         for module in monitor asset crossex; do
-          ln -s "$work_dir/source/modules/$module/node_modules" "$work_dir/trusted-runtime/modules/$module/node_modules"
           for artifact in dist .next; do
             if [[ -d "$work_dir/source/modules/$module/$artifact" ]]; then
               cp -a "$work_dir/source/modules/$module/$artifact" "$work_dir/trusted-runtime/modules/$module/$artifact"
             fi
           done
         done
-        python3 "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --stage-only "$work_dir/embedded-runtime"
+        python3 "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --dependency-root "$dependencies" --node "$NODE_BIN" --stage-only "$work_dir/embedded-runtime"
         chown -R root:root "$work_dir/embedded-runtime"
         chmod -R a+rX,go-w "$work_dir/embedded-runtime"
         atomic_record "$work_dir/embedded-runtime/.complete" "$embedded_key"
@@ -563,7 +611,7 @@ prepare_ci_application() {
   chown -R root:root "$work_dir/publish"
   chmod -R a+rX,go-w "$work_dir/publish"
   mv -- "$work_dir/publish" "$release"
-  log 'CI 部署包准备完成；服务器跳过 npm 安装、类型检查、测试及前端构建。'
+  log 'CI 部署包准备完成；服务器跳过 pnpm 安装、类型检查、测试及前端构建。'
 }
 
 # Every helper path is a fixed installer constant, never a client/environment input.
@@ -900,7 +948,7 @@ main() {
     0|1) ;;
     *) fail 'PROJECT_DEPLOY_TESTS 必须是 0 或 1。'; return 1 ;;
   esac
-  [[ "$(uname -s)" == Linux ]] || fail '安装脚本仅用于 Linux；开发环境请使用 npm 命令。'
+  [[ "$(uname -s)" == Linux ]] || fail '安装脚本仅用于 Linux；开发环境请使用 pnpm 命令。'
   [[ "$EUID" == 0 ]] || fail '请使用 sudo bash install.sh。'
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || fail '需要正在运行 systemd 的 Linux 主机。'
   umask 022
@@ -952,10 +1000,9 @@ main() {
     runtime_key=$(printf '%s\n%s\n' "$("$NODE_BIN" --version)" "$(uname -m)" | hash)
     build_environment=ci-v1
   else
-  NPM_BIN="$(dirname "$NODE_BIN")/npm"
-  [[ -x "$NPM_BIN" ]] || fail '当前 Node.js 没有对应 npm，请安装完整 Node.js 24 运行时。'
-  runtime_key=$(printf '%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$("$NODE_BIN" "$NPM_BIN" --version)" "$(uname -m)" | hash)
-  build_environment=$("$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key.startsWith("VITE_")).sort(([a], [b]) => a.localeCompare(b))))')
+  ensure_pnpm
+  runtime_key=$(printf '%s\n%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$PNPM_VERSION" "$(uname -s)" "$(uname -m)" | hash)
+  build_environment=$(read_build_environment)
   fi
   if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
   write_unit

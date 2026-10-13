@@ -1,7 +1,11 @@
 """Production dependencies must not silently disappear from deployment archives."""
 import importlib.util
+import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 import tempfile
 import unittest
 import subprocess
@@ -15,36 +19,268 @@ spec.loader.exec_module(module)
 class RuntimeDependencyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self.cleanup)
         self.source = Path(self.temp.name) / 'source'
         self.target = Path(self.temp.name) / 'target'
         self.source.mkdir()
+        self.install_root = self.source
+        self.lock = {'lockfileVersion': '9.0', 'importers': {}, 'packages': {}, 'snapshots': {}}
+        self.packages = {}
 
-    def package(self, name, **metadata):
-        package = self.source / 'node_modules' / name
+    def link(self, path, target):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.symlink_to(os.path.relpath(target, path.parent), target_is_directory=target.is_dir())
+        except OSError:
+            if os.name == 'nt' and target.is_dir():
+                import _winapi
+                _winapi.CreateJunction(str(target.resolve()), str(path))
+                return
+            self.skipTest('Symbolic links require Windows privileges; Linux CI covers this boundary')
+
+    @staticmethod
+    def unlink(path):
+        if os.name == 'nt' and not path.is_symlink() and stat.S_ISDIR(path.lstat().st_mode):
+            path.rmdir()
+        else:
+            path.unlink()
+
+    def cleanup(self):
+        # Python 3.11's rmtree leaves dangling junctions behind after a source
+        # directory is moved. Remove only links inside this fixture first.
+        root = Path(self.temp.name).resolve()
+        for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+            for name in names[:] + files:
+                entry = Path(directory) / name
+                if module.is_link(entry):
+                    self.assertTrue(entry.is_relative_to(root))
+                    self.unlink(entry)
+                    if name in names:
+                        names.remove(name)
+        self.temp.cleanup()
+
+    def move(self, path):
+        target = path.with_name(path.name + '-moved')
+        path.rename(target)
+        self.addCleanup(target.rename, path)
+
+    def package(self, name, version='1.0.0', context='', code=None):
+        key = f'{name}@{version}{context}'
+        package = self.install_root / 'node_modules/.pnpm' / hashlib.sha256(key.encode()).hexdigest()[:12] / 'node_modules' / name
         package.mkdir(parents=True)
-        (package / 'package.json').write_text(json.dumps({'name': name, 'version': '1.0.0'}))
-        return {'version': '1.0.0', **metadata}
+        (package / 'package.json').write_text(json.dumps({'name': name, 'version': version}))
+        (package / 'index.js').write_text(code or f'module.exports = {json.dumps(version)};')
+        self.lock['packages'][f'{name}@{version}'] = {}
+        self.lock['snapshots'][key] = {}
+        self.packages[key] = package
+        return key
 
-    def test_includes_native_production_transitives_and_excludes_dev_dependencies(self):
-        packages = {'node_modules/runtime': self.package('runtime'),
-                    'node_modules/@vendor/native': self.package('@vendor/native', optional=True),
-                    'node_modules/compiler': self.package('compiler', dev=True),
-                    'node_modules/other-platform': {'version': '1.0.0', 'optional': True}}
-        (self.source / 'node_modules/@vendor/native/binding.node').write_bytes(b'native-runtime')
-        (self.source / 'package-lock.json').write_text(json.dumps({'packages': packages}))
-        module.copy_runtime_dependencies(self.source, self.target)
+    def connect(self, parent, child, name=None, optional=False, peer=False, installed=True):
+        name = name or json.loads((self.packages[child] / 'package.json').read_text())['name']
+        group = 'optionalDependencies' if optional and not peer else 'dependencies'
+        self.lock['snapshots'][parent].setdefault(group, {})[name] = child
+        file = self.packages[parent] / 'package.json'
+        manifest = json.loads(file.read_text())
+        manifest.setdefault('peerDependencies' if peer else group, {})[name] = '*'
+        if peer and optional:
+            manifest.setdefault('peerDependenciesMeta', {})[name] = {'optional': True}
+        file.write_text(json.dumps(manifest))
+        if installed:
+            self.link(self.packages[parent].parent / name, self.packages[child])
+
+    def importer(self, dependencies, optional=None, dev=None, importer='.'):
+        entry, manifest = {}, {}
+        for group, values in (('dependencies', dependencies), ('optionalDependencies', optional), ('devDependencies', dev)):
+            if values:
+                entry[group] = {name: {'specifier': '*', 'version': key} for name, key in values.items()}
+                manifest[group] = {name: '*' for name in values}
+                for name, key in values.items():
+                    self.link(self.source / importer / 'node_modules' / name, self.packages[key])
+        directory = self.source / importer
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'package.json').write_text(json.dumps(manifest))
+        self.lock['importers'][importer] = entry
+
+    def copy(self, dependency_roots=()):
+        module.copy_runtime_dependencies(self.source, self.target, dependency_roots, lock=self.lock,
+                                         importers=tuple(self.lock['importers']))
+
+    def run_node(self, script, cwd=None):
+        return subprocess.run(['node', '-e', script], cwd=cwd or self.target, check=True, text=True, capture_output=True).stdout.strip()
+
+    def test_native_optional_transitive_peer_and_development_closure(self):
+        runtime = self.package('runtime')
+        native = self.package('@vendor/native')
+        other_platform = self.package('@vendor/other-platform')
+        peer = self.package('react')
+        compiler = self.package('compiler')
+        compiler_child = self.package('compiler-helper')
+        self.connect(runtime, native, optional=True)
+        self.connect(runtime, other_platform, optional=True, installed=False)
+        self.connect(runtime, peer, peer=True)
+        self.connect(compiler, compiler_child)
+        (self.packages[native] / 'binding.node').write_bytes(b'native-runtime')
+        self.importer({'runtime': runtime}, dev={'compiler': compiler})
+        self.copy()
         self.assertTrue((self.target / 'node_modules/@vendor/native/binding.node').is_file())
-        self.assertFalse((self.target / 'node_modules/compiler').exists())
+        self.assertTrue((self.target / 'node_modules/react/package.json').is_file())
+        for name in ('compiler', 'compiler-helper', '@vendor/other-platform', '.pnpm'):
+            self.assertFalse((self.target / 'node_modules' / name).exists())
+        self.assertFalse(any(module.is_link(path) for path in self.target.rglob('*')))
 
-    def test_missing_required_or_wrong_version_dependencies_fail_packaging(self):
-        (self.source / 'package-lock.json').write_text(json.dumps({'packages': {'node_modules/missing': {'version': '1.0.0'}}}))
-        with self.assertRaisesRegex(ValueError, 'Missing production'):
-            module.copy_runtime_dependencies(self.source, self.target)
-        self.package('missing')
-        (self.source / 'node_modules/missing/package.json').write_text('{"version":"2.0.0"}')
-        with self.assertRaisesRegex(ValueError, 'version mismatch'):
-            module.copy_runtime_dependencies(self.source, self.target)
+    def test_missing_required_direct_and_transitive_dependencies_fail(self):
+        runtime, child = self.package('runtime'), self.package('required-child')
+        self.connect(runtime, child)
+        self.importer({'runtime': runtime})
+        direct = self.source / 'node_modules/runtime'
+        self.unlink(direct)
+        with self.assertRaisesRegex(ValueError, 'Missing production dependency: runtime'):
+            self.copy()
+        self.link(direct, self.packages[runtime])
+        self.unlink(self.packages[runtime].parent / 'required-child')
+        with self.assertRaisesRegex(ValueError, 'Missing production dependency: required-child'):
+            self.copy()
+
+    def test_wrong_name_or_version_cannot_be_copied(self):
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        for name, version in (('different', '1.0.0'), ('runtime', '2.0.0')):
+            with self.subTest(name=name, version=version):
+                (self.packages[runtime] / 'package.json').write_text(json.dumps({'name': name, 'version': version}))
+                with self.assertRaisesRegex(ValueError, 'name/version mismatch'):
+                    self.copy()
+
+    def test_version_conflicts_and_peer_contexts_resolve_after_source_moves(self):
+        shared1, shared2 = self.package('shared'), self.package('shared', '2.0.0')
+        code = 'module.exports = require("shared");'
+        first = self.package('consumer', context='(shared@1.0.0)', code=code)
+        second = self.package('consumer', context='(shared@2.0.0)', code=code)
+        self.connect(first, shared1, peer=True)
+        self.connect(second, shared2, peer=True)
+        self.importer({'consumer': first, 'shared': shared1})
+        self.importer({'consumer': second, 'shared': shared2}, importer='modules/asset')
+        self.copy()
+        self.move(self.source)
+        self.assertEqual(self.run_node('console.log(require("consumer"))'), '1.0.0')
+        self.assertEqual(self.run_node('console.log(require("consumer"))', self.target / 'modules/asset'), '2.0.0')
+        self.assertFalse(any(module.is_link(path) for path in self.target.rglob('*')))
+
+    def test_shared_importers_copy_one_package(self):
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        self.importer({'runtime': runtime}, importer='modules/asset')
+        self.copy()
+        self.assertEqual(len(list(self.target.rglob('package.json'))), 1)
+        self.assertFalse((self.target / 'modules/asset/node_modules/runtime').exists())
+
+    def test_cycles_terminate_and_preserve_node_resolution(self):
+        first = self.package('first', code='exports.name="first"; exports.other=()=>require("second").name;')
+        second = self.package('second', code='exports.name="second"; exports.other=()=>require("first").name;')
+        self.connect(first, second)
+        self.connect(second, first)
+        self.importer({'first': first})
+        self.copy()
+        self.move(self.source)
+        self.assertEqual(self.run_node('console.log(require("first").other(), require("second").other())'), 'second first')
+        self.assertEqual(len(list(self.target.rglob('package.json'))), 2)
+
+    def test_conflicting_cycles_fail_with_bounded_expansion(self):
+        a1, a2 = self.package('a'), self.package('a', '2.0.0')
+        b1, b2 = self.package('b'), self.package('b', '2.0.0')
+        for parent, child in ((a1, b1), (b1, a2), (a2, b2), (b2, a1)):
+            self.connect(parent, child)
+        self.importer({'a': a1, 'b': b1})
+        with self.assertRaisesRegex(ValueError, 'Conflicting dependency cycle'):
+            self.copy()
+        self.assertLess(len(list(self.target.rglob('package.json'))), 15)
+
+    def test_external_cache_is_allowed_only_when_explicitly_trusted(self):
+        cache = self.source.with_name('dependency-cache')
+        cache.mkdir()
+        self.install_root = cache
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        self.link(cache / 'node_modules/runtime', self.packages[runtime])
+        with self.assertRaisesRegex(ValueError, 'escapes trusted roots'):
+            self.copy()
+        self.copy([cache])
+        self.move(cache)
+        self.move(self.source)
+        self.assertEqual(self.run_node('console.log(require("runtime"))'), '1.0.0')
+
+    def test_explicit_cache_works_without_source_dependency_links(self):
+        cache = self.source.with_name('dependency-cache')
+        cache.mkdir()
+        self.install_root = cache
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        self.unlink(self.source / 'node_modules/runtime')
+        self.link(cache / 'node_modules/runtime', self.packages[runtime])
+        self.copy([cache])
+        self.assertEqual(self.run_node('console.log(require("runtime"))'), '1.0.0')
+
+    def test_transitive_dependency_cannot_escape_trusted_roots(self):
+        runtime = self.package('runtime')
+        external = self.source.with_name('outside')
+        external.mkdir()
+        self.install_root = external
+        child = self.package('child')
+        self.connect(runtime, child)
+        self.importer({'runtime': runtime})
+        with self.assertRaisesRegex(ValueError, 'escapes trusted roots'):
+            self.copy()
+
+    def test_unsafe_scoped_name_cannot_escape_package_directory(self):
+        for name in ('../escape', '@scope/..', '@scope/.', '/absolute', 'name/subpath'):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'Invalid runtime package name'):
+                module.RuntimeDependencies.package_name(name)
+
+    def test_lock_parser_reads_from_trusted_build_dependency(self):
+        (self.source / 'pnpm-lock.yaml').write_text(json.dumps(self.lock))
+        repository = Path(__file__).resolve().parent.parent
+        if not (repository / 'node_modules/yaml/package.json').is_file():
+            self.skipTest('Lock parser integration is covered by the app job after pnpm install')
+        self.assertEqual(module.read_runtime_lock(self.source, [repository], 'node'), self.lock)
+
+    def test_package_content_links_and_special_manifest_links_are_rejected(self):
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        real_file = self.packages[runtime] / 'index.js'
+        link = self.packages[runtime] / 'unexpected.js'
+        self.link(link, real_file)
+        with self.assertRaisesRegex(ValueError, 'link or special file'):
+            self.copy()
+
+    def test_internal_directory_cycle_and_external_payload_links_are_rejected(self):
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        link = self.packages[runtime] / 'loop'
+        self.link(link, self.packages[runtime])
+        with self.assertRaisesRegex(ValueError, 'link or special file'):
+            self.copy()
+        self.unlink(link)
+        if self.target.exists():
+            shutil.rmtree(self.target)
+        self.link(link, self.source.parent)
+        with self.assertRaisesRegex(ValueError, 'link or special file'):
+            self.copy()
+
+    def test_missing_peer_or_missing_locked_manifest_dependency_fails(self):
+        runtime, peer = self.package('runtime'), self.package('peer')
+        self.connect(runtime, peer, peer=True, installed=False)
+        self.importer({'runtime': runtime})
+        with self.assertRaisesRegex(ValueError, 'Missing production dependency: peer'):
+            self.copy()
+        self.lock['snapshots'][runtime]['dependencies'].clear()
+        with self.assertRaisesRegex(ValueError, 'snapshot misses required'):
+            self.copy()
+
+    def test_importer_manifest_must_match_lock(self):
+        runtime = self.package('runtime')
+        self.importer({'runtime': runtime})
+        (self.source / 'package.json').write_text('{"dependencies":{"extra":"*"}}')
+        with self.assertRaisesRegex(ValueError, 'importer dependency mismatch'):
+            self.copy()
 
     def test_x64_manifest_becomes_the_complete_release_manifest(self):
         directory = Path(self.temp.name)
@@ -75,18 +311,6 @@ class RuntimeDependencyTests(unittest.TestCase):
                 failed = subprocess.run([sys.executable, '-X', 'utf8', '-B', str(script), str(directory)], capture_output=True)
                 self.assertNotEqual(failed.returncode, 0)
                 self.assertFalse((directory / 'release-manifest.json').exists())
-
-    def test_runtime_dependency_links_cannot_copy_an_external_tree(self):
-        self.package('external')
-        target = self.source / 'node_modules/linked'
-        try:
-            target.symlink_to(self.source / 'node_modules/external', target_is_directory=True)
-        except OSError:
-            self.skipTest('Symbolic links require Windows privileges; Linux CI covers this boundary')
-        (self.source / 'package-lock.json').write_text(json.dumps({'packages': {'node_modules/linked': {'version': '1.0.0'}}}))
-        with self.assertRaisesRegex(ValueError, 'cannot be a link'):
-            module.copy_runtime_dependencies(self.source, self.target)
-
 
 if __name__ == '__main__':
     unittest.main()
