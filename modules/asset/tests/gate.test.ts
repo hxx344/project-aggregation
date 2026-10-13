@@ -7,7 +7,7 @@ import { connectionSchema } from '../lib/validation.ts';
 const credential: GateCredential = { apiKey: 'gate-fixture-key', apiSecret: 'gate-fixture-secret' };
 const balancePath = '/api/v4/wallet/total_balance';
 const emptyHash = 'cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e';
-function account(amount: unknown = '0', currency: unknown = 'USD') { return { amount, currency }; }
+function account(amount: unknown = '0', currency: unknown = 'USDT') { return { amount, currency }; }
 function valuation() { return { total: account('120.5'), details: { spot: account('100'), finance: account('25.5'), futures: account('-5') } }; }
 function mock(handler: (url: URL, init: RequestInit) => unknown): typeof fetch {
   return (async (url: RequestInfo | URL, init: RequestInit = {}) => Response.json(handler(new URL(String(url)), init))) as typeof fetch;
@@ -49,7 +49,7 @@ test('Gate connection credentials trim values and reject malformed or extra requ
   }
 });
 
-test('Gate signs the exact fixed USD GET using SHA512 and HMAC-SHA512 and sends credentials only in headers', async t => {
+test('Gate signs the exact fixed USDT GET using SHA512 and HMAC-SHA512 and sends credentials only in headers', async t => {
   const now = 1791840123456;
   t.mock.timers.enable({ apis: ['Date'], now });
   const controller = new AbortController();
@@ -58,7 +58,7 @@ test('Gate signs the exact fixed USD GET using SHA512 and HMAC-SHA512 and sends 
   const calls: string[] = [];
   const result = await syncGate(credential, mock((url, init) => {
     calls.push(url.href);
-    assert.equal(url.href, 'https://api.gateio.ws/api/v4/wallet/total_balance?currency=USD');
+    assert.equal(url.href, 'https://api.gateio.ws/api/v4/wallet/total_balance?currency=USDT');
     assert.equal(init.method, 'GET');
     assert.equal(init.redirect, 'manual');
     assert.equal(init.body, undefined);
@@ -79,7 +79,7 @@ test('Gate signs the exact fixed USD GET using SHA512 and HMAC-SHA512 and sends 
   assert.deepEqual(timeoutCalls, [12000]);
   assert.equal(result.total, 120.5);
   assert.deepEqual(result.details.map(row => row.value), [100, 25.5, -5]);
-  assert.ok(result.details.every(row => row.coin === 'USD' && row.quantity === row.value && row.price === 1));
+  assert.ok(result.details.every(row => row.coin === 'USDT' && row.quantity === row.value && row.price === 1));
   assert.equal(result.updatedAt, new Date(now).toISOString());
 });
 
@@ -109,10 +109,10 @@ test('Gate preserves every documented account and new account type with fixed sa
   assert.equal(result.total, 153);
   assert.equal(result.details.length, 17);
   assert.deepEqual(result.details.map(row => row.value), Array.from({ length: 17 }, (_, i) => i + 1));
-  assert.equal(result.details[0].account, '全仓杠杆账户（USD 估值）');
-  assert.equal(result.details[9].account, 'Alpha 账户（USD 估值）');
-  assert.equal(result.details[11].account, '支付账户（USD 估值）');
-  assert.deepEqual(result.details.slice(12).map(row => row.account), [1, 2, 3, 4, 5].map(i => `其他账户 ${i}（USD 估值）`));
+  assert.equal(result.details[0].account, '全仓杠杆账户（USDT 估值）');
+  assert.equal(result.details[9].account, 'Alpha 账户（USDT 估值）');
+  assert.equal(result.details[11].account, '支付账户（USDT 估值）');
+  assert.deepEqual(result.details.slice(12).map(row => row.account), [1, 2, 3, 4, 5].map(i => `其他账户 ${i}（USDT 估值）`));
   for (const unsafe of unsafeNames) assert.equal(JSON.stringify(result).includes(unsafe), false);
 });
 
@@ -132,22 +132,22 @@ test('Gate rejects incomplete wrappers, total objects and detail structures inst
     await assert.rejects(syncGate(credential, response(invalid)), /数据不完整|读取失败/);
   }
   for (const invalid of [undefined, null, false, '', [], {}, { spot: null }, { spot: [] }, { spot: false }, { spot: '0' }, { spot: {} }]) {
-    await assert.rejects(syncGate(credential, response({ total: account('0'), details: invalid })), /数据不完整|币种不是 USD/);
+    await assert.rejects(syncGate(credential, response({ total: account('0'), details: invalid })), /数据不完整|币种不是 USDT/);
   }
-  await assert.rejects(syncGate(credential, response({ total: account('1'), details: { spot: account('1'), future_account: {} } })), /币种不是 USD/);
+  await assert.rejects(syncGate(credential, response({ total: account('1'), details: { spot: account('1'), future_account: {} } })), /币种不是 USDT/);
 });
 
-test('Gate requires explicit USD in the total and every account without silently converting other currencies', async () => {
-  for (const currency of [undefined, null, false, 0, '', 'USD ', 'usd', 'USDT', 'BTC', {}, ['USD']]) {
+test('Gate requires explicit USDT in the total and every account without silently converting other currencies', async () => {
+  for (const currency of [undefined, null, false, 0, '', 'USDT ', 'usdt', 'USD', 'BTC', {}, ['USDT']]) {
     const invalid = { amount: '1', currency };
-    await assert.rejects(syncGate(credential, response({ ...valuation(), total: invalid })), /币种不是 USD/);
-    for (const name of ['spot', 'unknown']) await assert.rejects(syncGate(credential, response({ ...valuation(), details: { [name]: invalid } })), /币种不是 USD/);
+    await assert.rejects(syncGate(credential, response({ ...valuation(), total: invalid })), /币种不是 USDT/);
+    for (const name of ['spot', 'unknown']) await assert.rejects(syncGate(credential, response({ ...valuation(), details: { [name]: invalid } })), /币种不是 USDT/);
   }
 });
 
 test('Gate rejects invalid, overflowing and underflowing monetary values in totals and all details', async () => {
   for (const invalid of [undefined, null, false, 0, 1, [], {}, '', ' ', ' 1', '1 ', 'NaN', 'Infinity', '-Infinity', '0x10', '1e3', '+1', '1,000', '.1', '1.', '9'.repeat(400), '0.' + '0'.repeat(400) + '1']) {
-    const invalidAccount = { currency: 'USD', amount: invalid };
+    const invalidAccount = { currency: 'USDT', amount: invalid };
     await assert.rejects(syncGate(credential, response({ ...valuation(), total: invalidAccount })), /不是有效数值/);
     for (const name of ['spot', 'unknown']) await assert.rejects(syncGate(credential, response({ ...valuation(), details: { [name]: invalidAccount } })), /不是有效数值/);
   }
@@ -156,7 +156,7 @@ test('Gate rejects invalid, overflowing and underflowing monetary values in tota
 test('Gate rejects all paths except the balance endpoint and rejects empty credentials before network access', async () => {
   let calls = 0;
   const never = mock(() => { calls++; return {}; });
-  for (const path of ['/api/v4/spot/orders', '/api/v4/wallet/transfers', '/api/v4/withdrawals', '/api/v4/account/detail', '/api/v4/account/main_keys', '/api/v4/spot/accounts', 'constructor', 'https://evil.example' + balancePath, balancePath + '?currency=USD', balancePath + '?currency=BTC', balancePath + '/../transfers', balancePath + '#anything']) {
+  for (const path of ['/api/v4/spot/orders', '/api/v4/wallet/transfers', '/api/v4/withdrawals', '/api/v4/account/detail', '/api/v4/account/main_keys', '/api/v4/spot/accounts', 'constructor', 'https://evil.example' + balancePath, balancePath + '?currency=USDT', balancePath + '?currency=BTC', balancePath + '/../transfers', balancePath + '#anything']) {
     await assert.rejects(gateGet(credential, path, never), /只读账户接口/);
   }
   for (const key of ['apiKey', 'apiSecret']) {
@@ -201,7 +201,7 @@ test('Gate maps official request, currency and account labels on HTTP 400 withou
     ['INVALID_PARAM_VALUE', /参数/], ['INVALID_PROTOCOL', /协议|请求格式/], ['INVALID_ARGUMENT', /参数/],
     ['INVALID_REQUEST_BODY', /请求体|请求格式|请求正文/], ['MISSING_REQUIRED_PARAM', /参数/], ['BAD_REQUEST', /请求/],
     ['INVALID_CONTENT_TYPE', /Content-Type|内容类型/], ['NOT_ACCEPTABLE', /响应格式|Accept|接受/],
-    ['METHOD_NOT_ALLOWED', /请求方法|GET/], ['NOT_FOUND', /接口|路径/], ['INVALID_CURRENCY', /币种|USD/],
+    ['METHOD_NOT_ALLOWED', /请求方法|GET/], ['NOT_FOUND', /接口|路径/], ['INVALID_CURRENCY', /币种|USDT/],
     ['ACCOUNT_EXCEPTION', /账户/], ['MARGIN_BALANCE_EXCEPTION', /杠杆|余额/],
   ] as const;
   for (const [label, reason] of cases) {

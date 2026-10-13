@@ -6,7 +6,7 @@ type Json = Record<string, unknown>;
 type Fetcher = typeof fetch;
 
 const BALANCE_PATH = '/api/v4/wallet/total_balance';
-const QUERY = 'currency=USD';
+const QUERY = 'currency=USDT';
 const EMPTY_PAYLOAD_HASH = createHash('sha512').update('').digest('hex');
 const ACCOUNT_NAMES = {
   cross_margin: '全仓杠杆账户',
@@ -25,7 +25,7 @@ const ACCOUNT_NAMES = {
 const INCOMPLETE = 'Gate 返回的账户数据不完整；已保留上次数据';
 const MAX_ERROR_BYTES = 16 * 1024;
 const ERROR_HINTS = {
-  INVALID_PARAM_VALUE: 'Gate 拒绝了请求参数；本程序固定请求 currency=USD，请反馈此错误码检查接口兼容性，无需增加 API 权限',
+  INVALID_PARAM_VALUE: 'Gate 拒绝了请求参数；本程序固定请求 currency=USDT，请反馈此错误码检查接口兼容性，无需增加 API 权限',
   INVALID_PROTOCOL: 'Gate 拒绝了请求格式；请反馈此错误码检查 API 接入及服务器代理配置',
   INVALID_ARGUMENT: 'Gate 拒绝了请求参数；请反馈此错误码检查接口兼容性，无需增加 API 权限',
   INVALID_REQUEST_BODY: 'Gate 拒绝了请求正文；本程序使用无正文 GET 请求，请检查服务器代理是否改写请求',
@@ -35,7 +35,7 @@ const ERROR_HINTS = {
   NOT_ACCEPTABLE: 'Gate 拒绝了 Accept 请求头；本程序请求 application/json，请检查服务器代理是否改写请求头',
   METHOD_NOT_ALLOWED: 'Gate 不允许当前请求方法；本程序仅使用 GET，请检查服务器代理是否改写请求',
   NOT_FOUND: 'Gate 未找到总资产接口；请反馈此错误码检查 API 接入地址及服务器代理配置',
-  INVALID_CURRENCY: 'Gate 拒绝了估值币种；本程序固定使用官方支持的 USD，请反馈此错误码检查接口兼容性',
+  INVALID_CURRENCY: 'Gate 拒绝了估值币种；本程序固定使用官方支持的 USDT，请反馈此错误码检查接口兼容性',
   ACCOUNT_EXCEPTION: 'Gate 报告账户异常；请在 Gate 核对账户状态，持续出现时联系 Gate 支持',
   MARGIN_BALANCE_EXCEPTION: 'Gate 报告杠杆账户余额异常；请在 Gate 核对杠杆账户状态，持续出现时联系 Gate 支持',
   INVALID_CREDENTIALS: 'API 凭据认证失败；请核对同一组 API v4 Key 和 Secret，并确认使用 Gate 国际站实盘密钥',
@@ -147,11 +147,11 @@ function isObject(value: unknown): value is Json {
 
 function usdAmount(account: unknown): number {
   if (!isObject(account)) throw new Error(INCOMPLETE);
-  if (account.currency !== 'USD') throw new Error('Gate 返回的估值币种不是 USD；已保留上次数据');
+  if (account.currency !== 'USDT') throw new Error('Gate 返回的估值币种不是 USDT；已保留上次数据');
   const amount = account.amount;
-  if (typeof amount !== 'string' || !/^-?\d+(?:\.\d+)?$/.test(amount)) throw new Error('Gate 美元估值不是有效数值；已保留上次数据');
+  if (typeof amount !== 'string' || !/^-?\d+(?:\.\d+)?$/.test(amount)) throw new Error('Gate USDT 估值不是有效数值；已保留上次数据');
   const result = Number(amount);
-  if (!Number.isFinite(result) || (result === 0 && /[1-9]/.test(amount))) throw new Error('Gate 美元估值不是有效数值；已保留上次数据');
+  if (!Number.isFinite(result) || (result === 0 && /[1-9]/.test(amount))) throw new Error('Gate USDT 估值不是有效数值；已保留上次数据');
   return result === 0 ? 0 : result;
 }
 
@@ -205,7 +205,7 @@ export async function syncGate(c: GateCredential, fetcher: Fetcher = fetch): Pro
     const value = usdAmount(account);
     // Account types are an open map. Preserve new accounts without reflecting upstream names.
     const name = Object.hasOwn(ACCOUNT_NAMES, key) ? ACCOUNT_NAMES[key as keyof typeof ACCOUNT_NAMES] : `其他账户 ${++otherAccounts}`;
-    details.push({ coin: 'USD', account: `${name}（USD 估值）`, quantity: value, price: 1, value });
+    details.push({ coin: 'USDT', account: `${name}（USDT 估值）`, quantity: value, price: 1, value });
   }
   // Gate defines no net-equity formula here: never add P&L, subtract debt or sum details into total.
   // There is no source timestamp; this is retrieval time, and Gate may cache values for one minute.
