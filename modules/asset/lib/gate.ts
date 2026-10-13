@@ -25,6 +25,19 @@ const ACCOUNT_NAMES = {
 const INCOMPLETE = 'Gate 返回的账户数据不完整；已保留上次数据';
 const MAX_ERROR_BYTES = 16 * 1024;
 const ERROR_HINTS = {
+  INVALID_PARAM_VALUE: 'Gate 拒绝了请求参数；本程序固定请求 currency=USD，请反馈此错误码检查接口兼容性，无需增加 API 权限',
+  INVALID_PROTOCOL: 'Gate 拒绝了请求格式；请反馈此错误码检查 API 接入及服务器代理配置',
+  INVALID_ARGUMENT: 'Gate 拒绝了请求参数；请反馈此错误码检查接口兼容性，无需增加 API 权限',
+  INVALID_REQUEST_BODY: 'Gate 拒绝了请求正文；本程序使用无正文 GET 请求，请检查服务器代理是否改写请求',
+  MISSING_REQUIRED_PARAM: 'Gate 报告缺少请求参数；请反馈此错误码检查接口兼容性，无需增加 API 权限',
+  BAD_REQUEST: 'Gate 判定请求无效；请反馈此错误码检查请求格式及服务器代理配置',
+  INVALID_CONTENT_TYPE: 'Gate 拒绝了 Content-Type 请求头；本程序使用 application/json，请检查服务器代理是否改写请求头',
+  NOT_ACCEPTABLE: 'Gate 拒绝了 Accept 请求头；本程序请求 application/json，请检查服务器代理是否改写请求头',
+  METHOD_NOT_ALLOWED: 'Gate 不允许当前请求方法；本程序仅使用 GET，请检查服务器代理是否改写请求',
+  NOT_FOUND: 'Gate 未找到总资产接口；请反馈此错误码检查 API 接入地址及服务器代理配置',
+  INVALID_CURRENCY: 'Gate 拒绝了估值币种；本程序固定使用官方支持的 USD，请反馈此错误码检查接口兼容性',
+  ACCOUNT_EXCEPTION: 'Gate 报告账户异常；请在 Gate 核对账户状态，持续出现时联系 Gate 支持',
+  MARGIN_BALANCE_EXCEPTION: 'Gate 报告杠杆账户余额异常；请在 Gate 核对杠杆账户状态，持续出现时联系 Gate 支持',
   INVALID_CREDENTIALS: 'API 凭据认证失败；请核对同一组 API v4 Key 和 Secret，并确认使用 Gate 国际站实盘密钥',
   INVALID_KEY: 'API v4 Key 无效或已失效；请确认使用 Gate 国际站实盘 Key 并重新复制，新建或修改后最多等待 5 分钟再试',
   IP_FORBIDDEN: '服务器出口 IP 不在 API Key 白名单中；请填写运行平台的服务器出口 IPv4，修改后最多等待 5 分钟再试',
@@ -41,24 +54,40 @@ const ERROR_HINTS = {
   INTERNAL_SERVER_ERROR: 'Gate 服务内部异常；请稍后重试',
 } as const;
 type ErrorLabel = keyof typeof ERROR_HINTS;
+const RESPONSE_HINTS = {
+  API_CODE_UNKNOWN: '已收到 JSON 错误响应，但 API 错误码尚未收录；请反馈此诊断代号，暂不能确定具体原因',
+  API_CODE_MISSING: '已收到 JSON 响应，但未包含有效的 API 错误码；请反馈此诊断代号，暂不能确定具体原因',
+  RESPONSE_EMPTY: '收到空错误响应，无法取得 Gate 错误码；请检查服务器到 Gate API 的网络或代理后重试',
+  RESPONSE_HTML: '收到 HTML 页面，未取得可识别的 API 错误响应；请检查服务器出口网络、代理或访问限制',
+  RESPONSE_NON_JSON: '错误响应不是有效 JSON，无法取得 Gate 错误码；请检查服务器网络或代理后重试',
+  RESPONSE_TOO_LARGE: '错误响应超过 16 KiB，已停止读取；请检查服务器代理或访问限制并反馈此诊断代号',
+  RESPONSE_READ_FAILED: '错误响应读取中断，无法取得完整错误码；请检查服务器网络或代理后重试',
+} as const;
+type ResponseCode = keyof typeof RESPONSE_HINTS;
+type ErrorResponse = { kind: 'known'; label: ErrorLabel } | { kind: 'response'; code: ResponseCode };
 
-function readFailure(reason: string, status?: number, label?: ErrorLabel): Error {
+function readFailure(reason: string, status?: number, label?: ErrorLabel | ResponseCode): Error {
   const parts = [typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? `HTTP ${status}` : '', label].filter(Boolean);
   return new Error(`Gate 读取失败${parts.length ? `（${parts.join(' · ')}）` : ''}：${reason}；本次未更新资产数据`);
 }
 
-function apiFailure(status: number, label: unknown): Error {
-  // Only exact, code-owned labels may reach the UI. Never reflect message/detail or unknown labels.
-  if (typeof label === 'string' && Object.hasOwn(ERROR_HINTS, label)) {
-    const known = label as ErrorLabel;
-    return readFailure(ERROR_HINTS[known], status, known);
+function classifyError(data: unknown): ErrorResponse {
+  if (isObject(data) && Object.hasOwn(data, 'label') && typeof data.label === 'string' && data.label.trim()) {
+    if (Object.hasOwn(ERROR_HINTS, data.label)) return { kind: 'known', label: data.label as ErrorLabel };
+    return { kind: 'response', code: 'API_CODE_UNKNOWN' };
   }
-  const unknown = '未返回可识别的 API 错误码，具体原因尚未确定';
-  if (status === 401) return readFailure(`身份认证未通过，${unknown}；请核对国际站实盘 API v4 Key 及对应 Secret`, status);
-  if (status === 403) return readFailure(`访问被拒绝，${unknown}；请核对钱包读取权限、服务器出口 IP 白名单及访问限制`, status);
-  if (status === 429) return readFailure('请求受到限流；请稍后重试并减少手动刷新次数', status);
-  if (status >= 500 && status <= 599) return readFailure('Gate 或其网关服务暂时不可用；请稍后重试', status);
-  return readFailure(`${unknown}；请稍后重试，持续出现时反馈此提示`, status);
+  return { kind: 'response', code: 'API_CODE_MISSING' };
+}
+
+function apiFailure(status: number, error: ErrorResponse): Error {
+  // Only exact, code-owned API labels or response classifications may reach the UI.
+  if (error.kind === 'known') return readFailure(ERROR_HINTS[error.label], status, error.label);
+  const detail = RESPONSE_HINTS[error.code];
+  if (status === 401) return readFailure(`身份认证未通过；${detail}`, status, error.code);
+  if (status === 403) return readFailure(`访问被拒绝；${detail}`, status, error.code);
+  if (status === 429) return readFailure(`请求受到限流；请稍后重试并减少手动刷新次数；${detail}`, status, error.code);
+  if (status >= 500 && status <= 599) return readFailure(`Gate 或其网关服务暂时不可用；${detail}`, status, error.code);
+  return readFailure(detail, status, error.code);
 }
 
 function transportFailure(error: unknown, signal?: AbortSignal): Error {
@@ -75,16 +104,16 @@ function transportFailure(error: unknown, signal?: AbortSignal): Error {
   return readFailure('网络请求未完成；请检查运行平台的服务器网络、DNS 或代理配置后重试');
 }
 
-async function errorLabel(response: Response): Promise<unknown> {
+async function errorResponse(response: Response): Promise<ErrorResponse> {
   const reader = response.body?.getReader();
-  if (!reader) return undefined;
+  if (!reader) return { kind: 'response', code: 'RESPONSE_EMPTY' };
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
     const length = response.headers.get('content-length');
     if (length && /^\d+$/.test(length) && Number(length) > MAX_ERROR_BYTES) {
       void reader.cancel().catch(() => {});
-      return undefined;
+      return { kind: 'response', code: 'RESPONSE_TOO_LARGE' };
     }
     for (;;) {
       const { done, value } = await reader.read();
@@ -92,15 +121,21 @@ async function errorLabel(response: Response): Promise<unknown> {
       size += value.byteLength;
       if (size > MAX_ERROR_BYTES) {
         void reader.cancel().catch(() => {});
-        return undefined;
+        return { kind: 'response', code: 'RESPONSE_TOO_LARGE' };
       }
       chunks.push(value);
     }
-    const data: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    return isObject(data) && Object.hasOwn(data, 'label') ? data.label : undefined;
+    const content = Buffer.concat(chunks).toString('utf8').trim();
+    if (!content) return { kind: 'response', code: 'RESPONSE_EMPTY' };
+    try { return classifyError(JSON.parse(content)); }
+    catch {
+      const html = /^<(?:!doctype\s+html\b|html\b|head\b|body\b)/i.test(content)
+        || response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() === 'text/html';
+      return { kind: 'response', code: html ? 'RESPONSE_HTML' : 'RESPONSE_NON_JSON' };
+    }
   } catch {
-    // Invalid JSON and transport errors may contain secrets. Fall back to the HTTP status.
-    return undefined;
+    // The original body, headers and transport errors never cross the diagnostic boundary.
+    return { kind: 'response', code: 'RESPONSE_READ_FAILED' };
   } finally {
     reader.releaseLock();
   }
@@ -132,7 +167,7 @@ export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher 
     const signature = createHmac('sha512', c.apiSecret).update(payload).digest('hex');
     response = await fetcher('https://api.gateio.ws' + BALANCE_PATH + '?' + QUERY, {
       method: 'GET',
-      headers: { Accept: 'application/json', KEY: c.apiKey, Timestamp: timestamp, SIGN: signature },
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', KEY: c.apiKey, Timestamp: timestamp, SIGN: signature },
       redirect: 'manual',
       signal,
     });
@@ -144,9 +179,9 @@ export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher 
     throw readFailure('官方 API 请求返回重定向，已停止请求以保护密钥；请检查服务器网络或代理配置', response.status);
   }
   if (!response.ok) {
-    const label = await errorLabel(response);
+    const error = await errorResponse(response);
     if (signal?.aborted) throw readFailure('读取错误响应超时（12 秒）；请检查服务器到 Gate API 的网络连接后重试', response.status);
-    throw apiFailure(response.status, label);
+    throw apiFailure(response.status, error);
   }
   let data: unknown;
   try { data = await response.json(); }
@@ -155,7 +190,7 @@ export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher 
     throw readFailure('账户响应无法解析为 JSON；请检查服务器网络或代理，稍后重试', response.status);
   }
   if (!isObject(data)) throw new Error(INCOMPLETE);
-  if (Object.hasOwn(data, 'label')) throw apiFailure(response.status, data.label);
+  if (Object.hasOwn(data, 'label')) throw apiFailure(response.status, classifyError(data));
   return data;
 }
 

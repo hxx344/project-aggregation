@@ -64,8 +64,9 @@ test('Gate signs the exact fixed USD GET using SHA512 and HMAC-SHA512 and sends 
     assert.equal(init.body, undefined);
     assert.equal(init.signal, controller.signal);
     const headers = new Headers(init.headers);
-    assert.deepEqual([...headers.keys()].sort(), ['accept', 'key', 'sign', 'timestamp']);
+    assert.deepEqual([...headers.keys()].sort(), ['accept', 'content-type', 'key', 'sign', 'timestamp']);
     assert.equal(headers.get('Accept'), 'application/json');
+    assert.equal(headers.get('Content-Type'), 'application/json');
     assert.equal(headers.get('KEY'), credential.apiKey);
     assert.equal(headers.get('Timestamp'), '1791840123');
     const signingInput = `GET\n${url.pathname}\n${url.search.slice(1)}\n${emptyHash}\n1791840123`;
@@ -195,28 +196,76 @@ test('Gate maps known rate and server labels without reflecting provider explana
   }
 });
 
-test('Gate only recognizes exact own allowlisted labels and falls back safely for unknown or malformed bodies', async () => {
-  for (const label of ['FUTURE_GATE_ERROR', 'constructor', '__proto__', 'toString', 'forbidden', 'FORBIDDEN ', 'INVALID_SIGNATURE\n', sensitive, '', null, 1, false, {}, []]) {
-    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 403 })), error => {
-      diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/, /权限/, /IP|白名单/]);
-      if (typeof label === 'string' && label) assert.equal((error as Error).message.includes(label), false);
+test('Gate maps official request, currency and account labels on HTTP 400 without leaking provider details', async () => {
+  const cases = [
+    ['INVALID_PARAM_VALUE', /参数/], ['INVALID_PROTOCOL', /协议|请求格式/], ['INVALID_ARGUMENT', /参数/],
+    ['INVALID_REQUEST_BODY', /请求体|请求格式|请求正文/], ['MISSING_REQUIRED_PARAM', /参数/], ['BAD_REQUEST', /请求/],
+    ['INVALID_CONTENT_TYPE', /Content-Type|内容类型/], ['NOT_ACCEPTABLE', /响应格式|Accept|接受/],
+    ['METHOD_NOT_ALLOWED', /请求方法|GET/], ['NOT_FOUND', /接口|路径/], ['INVALID_CURRENCY', /币种|USD/],
+    ['ACCOUNT_EXCEPTION', /账户/], ['MARGIN_BALANCE_EXCEPTION', /杠杆|余额/],
+  ] as const;
+  for (const [label, reason] of cases) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 400 })),
+      error => diagnostic(error, [/HTTP 400/, new RegExp(label), reason]));
+  }
+});
+
+test('Gate distinguishes unknown codes from absent or malformed JSON labels using fixed safe diagnostics', async () => {
+  for (const label of ['FUTURE_GATE_ERROR', 'constructor', '__proto__', 'toString', 'forbidden', 'FORBIDDEN ', 'INVALID_SIGNATURE\n', sensitive]) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 400 })), error => {
+      diagnostic(error, [/HTTP 400/, /API_CODE_UNKNOWN/, /错误码/]);
+      assert.equal((error as Error).message.includes(label), false);
       return true;
     });
   }
-  for (const body of ['', '<html>' + sensitive + '</html>', '{"label":"FORBIDDEN",broken:' + sensitive, JSON.stringify({ message: sensitive }), 'null', '[]', '"FORBIDDEN"']) {
-    await assert.rejects(syncGate(credential, async () => new Response(body, { status: 403 })),
-      error => diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/, /访问|限制/]));
+  for (const label of ['', ' \t ', null, 1, false, {}, []]) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 400 })),
+      error => diagnostic(error, [/HTTP 400/, /API_CODE_MISSING/, /错误码/]));
   }
-  for (const [status, reason] of [[401, /认证/], [429, /频率|限流/], [500, /服务/], [502, /服务/], [503, /服务/], [400, /未返回可识别的.*错误码/]] as const) {
+  for (const body of [JSON.stringify({ message: sensitive }), 'null', '[]', '"FORBIDDEN"', '0', 'true']) {
+    await assert.rejects(syncGate(credential, async () => new Response(body, { status: 400 })),
+      error => diagnostic(error, [/HTTP 400/, /API_CODE_MISSING/]));
+  }
+});
+
+test('Gate recognizes known JSON error labels even when the response media type is absent, incorrect or malicious', async () => {
+  for (const mediaType of [null, 'text/plain', 'text/html; charset=utf-8', 'application/json; charset=' + sensitive, sensitive]) {
+    const headers = new Headers();
+    if (mediaType !== null) headers.set('content-type', mediaType);
+    const result = new Response(Buffer.from(JSON.stringify({ label: 'INVALID_CONTENT_TYPE', message: sensitive, detail: sensitive })), { status: 400, headers });
+    if (mediaType === null) assert.equal(result.headers.get('content-type'), null);
+    await assert.rejects(syncGate(credential, async () => result), error => diagnostic(error, [/HTTP 400/, /INVALID_CONTENT_TYPE/]));
+  }
+});
+
+test('Gate gives fixed safe diagnostics for empty, HTML and non-JSON error bodies', async () => {
+  for (const body of [null, '', ' \r\n\t ']) {
+    await assert.rejects(syncGate(credential, async () => new Response(body, { status: 400 })),
+      error => diagnostic(error, [/HTTP 400/, /RESPONSE_EMPTY/]));
+  }
+  for (const body of ['<!DOCTYPE html>', '  <HTML>', '\n<head>', '\t<body>']) {
+    await assert.rejects(syncGate(credential, async () => new Response(body + sensitive, { status: 400 })),
+      error => diagnostic(error, [/HTTP 400/, /RESPONSE_HTML/]));
+  }
+  for (const mediaType of ['text/html; charset=' + sensitive, 'TEXT/HTML; charset=' + sensitive]) {
+    await assert.rejects(syncGate(credential, async () => new Response(sensitive, { status: 400, headers: { 'content-type': mediaType } })),
+      error => diagnostic(error, [/HTTP 400/, /RESPONSE_HTML/]));
+  }
+  for (const body of [sensitive, '{"label":"FORBIDDEN",broken:' + sensitive]) {
+    await assert.rejects(syncGate(credential, async () => new Response(body, { status: 400, headers: { 'content-type': sensitive } })),
+      error => diagnostic(error, [/HTTP 400/, /RESPONSE_NON_JSON/]));
+  }
+  for (const [status, reason] of [[401, /认证/], [403, /访问被拒绝/], [429, /频率|限流/], [500, /服务/], [502, /服务/], [503, /服务/]] as const) {
     await assert.rejects(syncGate(credential, async () => new Response(sensitive, { status })),
-      error => diagnostic(error, [new RegExp(`HTTP ${status}`), reason]));
+      error => diagnostic(error, [new RegExp(`HTTP ${status}`), /RESPONSE_NON_JSON/, reason]));
   }
 });
 
 test('Gate never treats a 2xx error label or invalid JSON as a successful balance', async () => {
-  for (const label of ['FORBIDDEN', 'INVALID_SIGNATURE', sensitive, null, {}, '']) {
+  for (const label of ['FORBIDDEN', 'INVALID_SIGNATURE', 'INVALID_CONTENT_TYPE', sensitive, null, {}, '']) {
     await assert.rejects(syncGate(credential, response({ ...valuation(), label, message: sensitive, detail: sensitive })), error => {
-      diagnostic(error, [/HTTP 200/]);
+      const code = label === sensitive ? 'API_CODE_UNKNOWN' : (typeof label !== 'string' || label === '') ? 'API_CODE_MISSING' : label;
+      diagnostic(error, [/HTTP 200/, new RegExp(code)]);
       if (label === 'FORBIDDEN') assert.match((error as Error).message, /FORBIDDEN.*钱包|钱包.*读取/);
       return true;
     });
@@ -234,14 +283,14 @@ test('Gate limits error bodies to 16 KiB of declared and actual bytes and cancel
   assert.equal(exact.canceled(), false);
 
   const declared = streamedResponse([boundary], { 'content-length': String(limit + 1) });
-  await assert.rejects(syncGate(credential, async () => declared.response), error => diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/]));
+  await assert.rejects(syncGate(credential, async () => declared.response), error => diagnostic(error, [/HTTP 403/, /RESPONSE_TOO_LARGE/]));
   assert.equal(declared.reads(), 0, 'An oversized declared body must not be read');
   assert.equal(declared.canceled(), true);
 
   for (const headers of [new Headers(), new Headers({ 'content-length': '1' })]) {
     const oversized = streamedResponse([boundary, Buffer.from(' '), Buffer.from(sensitive)], headers);
     await assert.rejects(syncGate(credential, async () => oversized.response), error => {
-      diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/]);
+      diagnostic(error, [/HTTP 403/, /RESPONSE_TOO_LARGE/]);
       assert.doesNotMatch((error as Error).message, /FORBIDDEN/);
       return true;
     });
@@ -251,7 +300,7 @@ test('Gate limits error bodies to 16 KiB of declared and actual bytes and cancel
   const unicode = JSON.stringify({ label: 'FORBIDDEN', message: '中'.repeat(6000) });
   assert.ok(unicode.length < limit && Buffer.byteLength(unicode) > limit);
   const multibyte = streamedResponse([Buffer.from(unicode)]);
-  await assert.rejects(syncGate(credential, async () => multibyte.response), error => diagnostic(error, [/未返回可识别的.*错误码/]));
+  await assert.rejects(syncGate(credential, async () => multibyte.response), error => diagnostic(error, [/RESPONSE_TOO_LARGE/]));
   assert.equal(multibyte.canceled(), true, 'The cap is measured in UTF-8 bytes, not characters');
 });
 
@@ -264,7 +313,7 @@ test('Gate retains safe status diagnostics when the error response stream fails'
     },
   }, { highWaterMark: 0 });
   await assert.rejects(syncGate(credential, async () => new Response(body, { status: 403 })),
-    error => diagnostic(error, [/HTTP 403/, /未返回可识别的.*错误码/]));
+    error => diagnostic(error, [/HTTP 403/, /RESPONSE_READ_FAILED/]));
 });
 
 test('Gate classifies known transport causes without exposing causes, codes, signed requests or URLs', async () => {
@@ -316,8 +365,11 @@ test('Gate identifies a timeout while reading either a success or error body wit
         stream.error(new Error(sensitive));
       },
     }, { highWaterMark: 0 });
-    await assert.rejects(syncGate(credential, async () => new Response(body, { status })),
-      error => diagnostic(error, [new RegExp(`HTTP ${status}`), /超时/, /12\s*秒/]));
+    await assert.rejects(syncGate(credential, async () => new Response(body, { status })), error => {
+      diagnostic(error, [new RegExp(`HTTP ${status}`), /超时/, /12\s*秒/]);
+      assert.doesNotMatch((error as Error).message, /RESPONSE_READ_FAILED/);
+      return true;
+    });
   }
 });
 

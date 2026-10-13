@@ -22,6 +22,10 @@ Gate 的余额与换算价格最多可能缓存 1 分钟，接口不提供源数
 
 | 错误码或现象 | 检查内容 |
 | --- | --- |
+| `INVALID_PARAM_VALUE`、`INVALID_ARGUMENT`、`MISSING_REQUIRED_PARAM`、`INVALID_CURRENCY` | 请求参数被拒绝；平台固定使用官方支持的 `currency=USD`，反馈错误码检查接口兼容性，无需扩大 API 权限 |
+| `INVALID_CONTENT_TYPE`、`NOT_ACCEPTABLE` | 平台按官方 SDK 显式发送 JSON 请求头；检查服务器代理是否改写请求头 |
+| `INVALID_PROTOCOL`、`INVALID_REQUEST_BODY`、`BAD_REQUEST`、`METHOD_NOT_ALLOWED`、`NOT_FOUND` | 请求格式、方法或地址被拒绝；反馈错误码检查 API 接入和代理配置 |
+| `ACCOUNT_EXCEPTION`、`MARGIN_BALANCE_EXCEPTION` | 在 Gate 核对账户或杠杆账户状态，持续出现时联系 Gate 支持 |
 | `IP_FORBIDDEN` | 白名单填写运行平台的服务器出口 IPv4；修改后等待生效 |
 | `FORBIDDEN` | 钱包（Wallet）读取权限及 Gate 账户限制 |
 | `INVALID_KEY`、`INVALID_CREDENTIALS` | 国际站实盘 API v4 Key 是否有效，Key 与 Secret 是否配对 |
@@ -33,6 +37,18 @@ Gate 的余额与换算价格最多可能缓存 1 分钟，接口不提供源数
 | HTTP 5xx、服务繁忙或内部异常 | 稍后重试 |
 | DNS、TLS 证书、连接中断或超时 | 检查服务器网络、时间、证书信任或代理配置 |
 
-若 Gate 或网关没有返回可识别错误码，提示会明确说明原因尚未确定；仅凭 HTTP 403 不能判断密钥版本、权限或网络限制。程序只展示已知错误码及固定说明，不回显原始错误正文、签名或密钥；错误正文超过 16 KiB 时降级为 HTTP 状态提示。连接验证失败不会保存新密钥，刷新失败保留上次成功金额与时间。
+若未取得已收录的错误码，提示会附带固定诊断代号，区分具体情况：
+
+| 诊断代号 | 含义 |
+| --- | --- |
+| `API_CODE_UNKNOWN` | JSON 包含尚未收录的错误码，并不表示 Gate 没有返回错误码 |
+| `API_CODE_MISSING` | JSON 没有有效的错误码字段 |
+| `RESPONSE_EMPTY` | 空响应 |
+| `RESPONSE_HTML` | 收到 HTML 页面，不能仅凭格式认定是哪家网关或具体拦截原因 |
+| `RESPONSE_NON_JSON` | 其他非 JSON 或非法 JSON 响应 |
+| `RESPONSE_TOO_LARGE` | 错误响应超过 16 KiB，已停止读取 |
+| `RESPONSE_READ_FAILED` | 错误响应读取中断 |
+
+反馈时提供安装版本、发生时间和页面上的错误提示即可，不需要提供 Key、Secret 或原始响应。仅凭 HTTP 400/403 不能判断密钥、权限或网络限制。程序只展示已知错误码、固定诊断代号和说明，不回显原始错误正文、未知错误码、响应头、签名或密钥。添加 `Content-Type: application/json` 与 [Gate 官方 SDK](https://github.com/gateio/gateapi-python/blob/master/gate_api/rest.py) 保持一致，不据此断言它就是所有 HTTP 400 的原因。连接验证失败不会保存新密钥，刷新失败保留上次成功金额与时间。
 
 接口依据（核对日期：2026-10-14）：[余额接口](https://www.gate.com/docs/developers/apiv4/en/wallet/)、[签名规则](https://www.gate.com/docs/developers/apiv4/en/#api-signature-string-generation)、[错误码](https://www.gate.com/docs/developers/apiv4/en/#label-list)、[账户信息接口](https://www.gate.com/docs/developers/apiv4/en/account/)。

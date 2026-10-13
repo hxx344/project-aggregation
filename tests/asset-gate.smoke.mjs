@@ -74,6 +74,8 @@ globalThis.fetch = async (input, init = {}) => {
     assert.equal(method, 'GET');
     assert.equal(init.redirect ?? request?.redirect, 'manual');
     assert.equal(init.body ?? request?.body ?? undefined, undefined);
+    assert.equal(headers.get('Accept'), 'application/json');
+    assert.equal(headers.get('Content-Type'), 'application/json');
     const apiKey = headers.get('KEY');
     const signedWith = apiKey === replacement.apiKey ? replacement : credentials;
     assert.equal(apiKey, signedWith.apiKey);
@@ -87,8 +89,12 @@ globalThis.fetch = async (input, init = {}) => {
     // Return a rejected promise without awaiting it so this intentional transport
     // failure does not enter the assertion-violation catch below.
     if (gateFailure === 'dns') return Promise.reject(new Error('fetch failed ' + sensitiveDetails, { cause: { code: 'ENOTFOUND', message: sensitiveDetails } }));
-    if (gateFailure === 'unknown403') return new Response('<html>' + sensitiveDetails + '</html>', { status: 403 });
-    if (gateFailure) return Response.json({ label: gateFailure, message: sensitiveDetails, detail: sensitiveDetails }, { status: 403 });
+    if (gateFailure) {
+      const options = { status: gateFailure.status, headers: gateFailure.headers };
+      if (gateFailure.readFailed) return new Response(new ReadableStream({ pull(controller) { controller.error(new Error(sensitiveDetails)); } }), options);
+      if (Object.hasOwn(gateFailure, 'body')) return new Response(gateFailure.body, options);
+      return Response.json({ label: gateFailure.label, message: sensitiveDetails, detail: sensitiveDetails }, options);
+    }
     return Response.json(payload);
   } catch (error) {
     transportViolations.push(error);
@@ -201,8 +207,15 @@ try {
 
   let expectedGateCalls = 0;
   for (const [failure, checks] of [
-    ['IP_FORBIDDEN', [/HTTP 403/, /IP_FORBIDDEN/, /服务器.*出口/, /白名单/]],
-    ['unknown403', [/HTTP 403/, /未返回可识别的.*错误码/, /权限|访问限制/]],
+    [{ status: 403, label: 'IP_FORBIDDEN' }, [/HTTP 403/, /IP_FORBIDDEN/, /服务器.*出口/, /白名单/]],
+    [{ status: 400, label: 'INVALID_CONTENT_TYPE' }, [/HTTP 400/, /INVALID_CONTENT_TYPE/, /Content-Type|内容类型/]],
+    [{ status: 400, label: sensitiveDetails }, [/HTTP 400/, /API_CODE_UNKNOWN/]],
+    [{ status: 400, body: JSON.stringify({ message: sensitiveDetails }) }, [/HTTP 400/, /API_CODE_MISSING/]],
+    [{ status: 400, body: '' }, [/HTTP 400/, /RESPONSE_EMPTY/]],
+    [{ status: 400, body: '<html>' + sensitiveDetails, headers: { 'content-type': 'text/html; charset=' + sensitiveDetails } }, [/HTTP 400/, /RESPONSE_HTML/]],
+    [{ status: 400, body: sensitiveDetails }, [/HTTP 400/, /RESPONSE_NON_JSON/]],
+    [{ status: 400, body: sensitiveDetails, headers: { 'content-length': String(16 * 1024 + 1) } }, [/HTTP 400/, /RESPONSE_TOO_LARGE/]],
+    [{ status: 400, readFailed: true }, [/HTTP 400/, /RESPONSE_READ_FAILED/]],
     ['dns', [/DNS.*解析|解析.*DNS/, /检查|重试/]],
   ]) {
     gateFailure = failure;
@@ -248,27 +261,37 @@ try {
 
   const savedConnection = storedCredential();
   const lastSync = ledger.connections.gate.lastSync;
-  gateFailure = 'FORBIDDEN';
-  const replacementError = await rejected('/api/connections', { method: 'POST', body: replacement });
-  assert.match(replacementError.error, /HTTP 403.*FORBIDDEN/);
-  assert.match(replacementError.error, /钱包.*读取/);
-  assert.equal(gateCalls, ++expectedGateCalls);
-  assert.deepEqual(storedCredential(), savedConnection, 'Failed replacement must preserve the previous encrypted credentials');
-  const afterReplacementFailure = await success('/api/ledger');
-  balanceUnchanged(gateAsset(afterReplacementFailure), asset);
-  assert.equal(afterReplacementFailure.connections.gate.lastSync, lastSync);
+  for (const [failure, checks] of [
+    [{ status: 403, label: 'FORBIDDEN' }, [/HTTP 403.*FORBIDDEN/, /钱包.*读取/]],
+    [{ status: 400, label: 'INVALID_CONTENT_TYPE' }, [/HTTP 400.*INVALID_CONTENT_TYPE/]],
+    [{ status: 400, label: sensitiveDetails }, [/HTTP 400.*API_CODE_UNKNOWN/]],
+  ]) {
+    gateFailure = failure;
+    const replacementError = await rejected('/api/connections', { method: 'POST', body: replacement });
+    for (const check of checks) assert.match(replacementError.error, check);
+    assert.equal(gateCalls, ++expectedGateCalls);
+    assert.deepEqual(storedCredential(), savedConnection, 'Failed replacement must preserve the previous encrypted credentials');
+    const afterReplacementFailure = await success('/api/ledger');
+    balanceUnchanged(gateAsset(afterReplacementFailure), asset);
+    assert.equal(afterReplacementFailure.connections.gate.lastSync, lastSync);
+  }
 
-  gateFailure = 'INVALID_SIGNATURE';
-  clearRefreshThrottle();
-  ledger = await success('/api/sync', { method: 'POST', body: {} });
-  assert.equal(gateCalls, ++expectedGateCalls);
-  balanceUnchanged(gateAsset(ledger), asset);
-  assert.match(gateAsset(ledger).status, /失败.*旧值/);
-  assert.match(gateAsset(ledger).error, /HTTP 403.*INVALID_SIGNATURE/);
-  assert.match(ledger.connections.gate.error, /同一组|配对/);
-  assert.equal(gateAsset(ledger).error, ledger.connections.gate.error);
-  assert.equal(ledger.connections.gate.lastSync, lastSync, 'Failed refresh must preserve the last successful sync time');
-  assert.deepEqual(storedCredential(), savedConnection);
+  for (const [failure, checks] of [
+    [{ status: 403, label: 'INVALID_SIGNATURE' }, [/HTTP 403.*INVALID_SIGNATURE/, /同一组|配对/]],
+    [{ status: 400, label: 'BAD_REQUEST' }, [/HTTP 400.*BAD_REQUEST/]],
+    [{ status: 400, body: '<html>' + sensitiveDetails }, [/HTTP 400.*RESPONSE_HTML/]],
+  ]) {
+    gateFailure = failure;
+    clearRefreshThrottle();
+    ledger = await success('/api/sync', { method: 'POST', body: {} });
+    assert.equal(gateCalls, ++expectedGateCalls);
+    balanceUnchanged(gateAsset(ledger), asset);
+    assert.match(gateAsset(ledger).status, /失败.*旧值/);
+    for (const check of checks) assert.match(gateAsset(ledger).error, check);
+    assert.equal(gateAsset(ledger).error, ledger.connections.gate.error);
+    assert.equal(ledger.connections.gate.lastSync, lastSync, 'Failed refresh must preserve the last successful sync time');
+    assert.deepEqual(storedCredential(), savedConnection);
+  }
 
   gateFailure = null;
   clearRefreshThrottle();
@@ -345,7 +368,7 @@ try {
   assert.ok(existsSync(join(dataDir, 'backups', imported.backupName)));
   assert.equal(gateCalls, expectedGateCalls, 'Import must preserve balances without querying Gate');
   assert.deepEqual(transportViolations, [], 'All outbound Gate requests must satisfy the signed GET contract');
-  console.log('Gate production smoke passed: signed GET, safe detailed API diagnostics, encrypted credentials, atomic connect/replace, independent refresh, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
+  console.log('Gate production smoke passed: signed JSON GET, safe HTTP 400 response diagnostics, encrypted credentials, atomic connect/replace, independent refresh, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
 } catch (error) {
   console.error(error);
   process.exitCode = 1;
