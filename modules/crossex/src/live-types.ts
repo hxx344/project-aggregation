@@ -42,6 +42,7 @@ export type LiveView = {
   recentTrades?: Record<string, unknown>[]; accountBook?: Record<string, unknown>[]; fees?: Record<string, unknown>[];
   recentTradesAsOf?: number | null; recentTradesError?: string | null;
   accountBookAsOf?: number | null; accountBookError?: string | null; feesAsOf?: number | null; feesError?: string | null;
+  adlAsOf?: number | null; adlError?: string | null;
 };
 export type LiveState = Pick<State, 'now' | 'csrfToken' | 'venues' | 'fx' | 'source' | 'catalog' | 'opportunities'> & {
   mode: 'live'; config: LiveConfig; live: LiveView; fundingOpportunities: FundingOpportunity[];
