@@ -1,13 +1,15 @@
 import type { State } from './types';
 import type { LiveConfig } from './SettingsForm';
-import type { FundingOpportunity } from './funding-opportunities';
+import type { FundingLeg, FundingOpportunity } from './funding-opportunities';
+export type { PositionGroup, PositionMetrics, PositionMetricsOptions } from './position-view';
+export type PositionFundingRate = FundingLeg & { expiresAt: number };
 
 export type LivePosition = {
   id: string; symbol: string; exchange: string; side: string;
   quantity: string; baseQuantity: string | null; baseCurrency: string; quoteCurrency: string;
   entryPrice: string | null; markPrice: string | null; unrealizedPnl: string | null; pnlCurrency: string;
   margin: string | null; marginCurrency: string; liquidationPrice: string | null;
-  external: boolean; updatedAt: number | null;
+  external: boolean; updatedAt: number | null; openedAt?: number | null;
   signedQuantity?: string | null; notional?: string | null; positionValue?: string | null; realizedPnl?: string | null;
   fundingFee?: string | null; fee?: string | null; leverage?: string | null;
   maxLeverage?: string | null; riskLimit?: string | null; maintenanceMargin?: string | null; directionSource?: string;
@@ -46,6 +48,7 @@ export type LiveView = {
 };
 export type LiveState = Pick<State, 'now' | 'csrfToken' | 'venues' | 'fx' | 'source' | 'catalog' | 'opportunities'> & {
   mode: 'live'; config: LiveConfig; live: LiveView; fundingOpportunities: FundingOpportunity[];
+  positionFundingRates?: PositionFundingRate[];
 };
 export type LiveBootstrap = { now: number; config: LiveConfig; connection: LiveView['connection']; csrfToken: string };
 

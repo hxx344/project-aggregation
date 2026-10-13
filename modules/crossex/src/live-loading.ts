@@ -2,7 +2,7 @@ import type { LiveBootstrap, LiveState } from './live-types';
 
 export const CATALOG_CACHE_MS = 5 * 60_000;
 export const BOOTSTRAP_REFRESH_MS = 30_000;
-export const stateReadPath = (tab: string) => tab === 'hedge' ? '/api/state' : '/api/state?opportunities=0';
+export const stateReadPath = (tab: string) => tab === 'hedge' ? '/api/state' : tab === 'positions' ? '/api/state?opportunities=0&funding=1' : '/api/state?opportunities=0';
 export const needsCatalog = (tab: string) => ['trade', 'hedge', 'positions'].includes(tab);
 export const readRetryDelay = (failures: number) => Math.min(30_000, 3000 * 2 ** Math.max(0, Math.min(failures - 1, 4)));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);

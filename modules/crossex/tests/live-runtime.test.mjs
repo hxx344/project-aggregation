@@ -71,6 +71,93 @@ test('connection encrypts credentials and previews/background reads never write 
   assert.ok(!readFileSync(join(f.directory, 'crossex.sqlite')).includes(Buffer.from('test-secret-5678')));
 });
 
+function cooldownFixture(t, venue = 'gate', base = 'LUNA2') {
+  const f = fixture(t, { ownerLeaseMs: 120000 });
+  const nativeBase = base === 'LUNA2' ? 'LUNA' : base;
+  const selected = [`${venue.toUpperCase()}_FUTURE_${nativeBase}_USDT`, `BINANCE_FUTURE_${base}_USDT`];
+  const limits = { maxOpen: 3, notionalPerLeg: 100, maxTotalNotional: '2000', cooldownSeconds: 60 };
+  let capacityReads = 0;
+  f.market.config = () => limits;
+  f.market.previewOpen = async signalId => ({ kind: 'open', signalId, base, expiresAt: f.now + 30000, warnings: [], limits,
+    legs: selected.map((symbol, i) => ({ symbol, exchange: i ? 'binance' : venue, side: i ? 'SELL' : 'BUY',
+      positionSide: i ? 'SHORT' : 'LONG', quantity: '200', price: '0.05', quoteCurrency: 'USDT', notionalUSDT: '10' })) });
+  f.market.openCapacityContext = async request => {
+    capacityReads++;
+    return { base, config: limits, sourceAt: f.now, expiresAt: f.now + 10000, notes: [],
+      legs: request.requests.map(leg => ({ ...leg, quoteCurrency: 'USDT', price: '0.05', budgetPrice: '0.05', fxRate: '1', depthQuantity: '10000',
+        rule: { min_size: '1', lot_size: '1', min_notional: '5', max_market_size: '10000', max_limit_size: '10000' } })) };
+  };
+  f.client.getRiskLimits = async selected => selected.map(symbol => ({ symbol,
+    tiers: [{ min_risk_limit_value: '0', max_risk_limit_value: '1000000', leverage_max: '100' }] }));
+  return { ...f, selected, get capacityReads() { return capacityReads; },
+    capacity: () => f.runtime.openCapacity({ pair: { longSymbol: selected[0], shortSymbol: selected[1], quantity: '200' } }),
+    history(historyBase) {
+      const id = `history-${historyBase}`;
+      // Persist the legacy shape: there is no exchange field on an execution.
+      f.store.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(id, `preview-${id}`, f.now,
+        JSON.stringify({ id, kind: 'open', base: historyBase, createdAt: f.now, updatedAt: f.now }));
+    } };
+}
+
+test('alias cooldown blocks new LUNA2 previews from legacy LUNA history and expires without changing orders', async t => {
+  for (const venue of ['gate', 'okx']) {
+    const f = cooldownFixture(t, venue); await f.connect(); f.history('LUNA');
+    await assert.rejects(f.preview(), /冷却期/);
+    assert.deepEqual(f.calls.create, []);
+    assert.equal(f.store.prepare('SELECT count(*) n FROM live_previews').get().n, 0);
+    f.advance(60000);
+    const preview = await f.preview();
+    assert.equal(preview.base, 'LUNA2');
+    assert.equal((await f.confirm(preview)).state, 'completed');
+    assert.deepEqual(f.calls.create.map(({ symbol, qty, price, side }) => ({ symbol, qty, price, side })), [
+      { symbol: f.selected[0], qty: '200', price: '0.05', side: 'BUY' },
+      { symbol: f.selected[1], qty: '200', price: '0.05', side: 'SELL' },
+    ]);
+  }
+});
+
+test('alias cooldown rechecks legacy LUNA history added after a LUNA2 preview before confirming', async t => {
+  for (const venue of ['gate', 'okx']) {
+    const f = cooldownFixture(t, venue); await f.connect(); const preview = await f.preview();
+    f.history('LUNA');
+    await assert.rejects(f.confirm(preview), /冷却期/);
+    assert.deepEqual(f.calls.create, []);
+    assert.equal(f.store.prepare('SELECT count(*) n FROM live_orders').get().n, 0);
+    assert.equal(f.store.prepare('SELECT count(*) n FROM live_requests').get().n, 0);
+    assert.equal(f.store.prepare('SELECT consumed FROM live_previews WHERE id=?').get(preview.id).consumed, 0);
+  }
+});
+
+test('alias cooldown blocks native LUNA capacity from canonical LUNA2 history and recovers at expiry', async t => {
+  for (const venue of ['gate', 'okx']) {
+    const f = cooldownFixture(t, venue); await f.connect(); f.history('LUNA2');
+    const blocked = await f.capacity();
+    assert.equal(blocked.status, 'blocked');
+    assert.match(blocked.reason, /冷却期/);
+    assert.equal(blocked.maxQuantity, '0');
+    assert.equal(f.capacityReads, 0, 'cooldown must stop capacity before public market and risk reads');
+    f.advance(60000); await f.runtime.refresh({ includeView: false });
+    const ready = await f.capacity();
+    assert.equal(ready.status, 'ready', ready.reason);
+    assert.equal(ready.inputWithinCapacity, true);
+    assert.deepEqual(ready.legs.map(leg => leg.symbol), f.selected);
+    assert.deepEqual(f.calls.create, []);
+    for (const table of ['live_previews', 'live_orders', 'live_requests']) assert.equal(f.store.prepare(`SELECT count(*) n FROM ${table}`).get().n, 0);
+  }
+});
+
+test('alias cooldown keeps Terra Classic LUNC separate in both directions', async t => {
+  for (const [base, history] of [['LUNA2', 'LUNC'], ['LUNC', 'LUNA2']]) {
+    const f = cooldownFixture(t, 'gate', base); await f.connect(); f.history(history);
+    const preview = await f.preview(), capacity = await f.capacity();
+    assert.equal(preview.canConfirm, true);
+    assert.equal(preview.base, base);
+    assert.equal(capacity.status, 'ready', capacity.reason);
+    assert.equal(capacity.inputWithinCapacity, true);
+    assert.deepEqual(f.calls.create, []);
+  }
+});
+
 test('confirmation applies refreshed valuations to total, margin and risk-tier checks before any write', async t => {
   for (const scenario of ['total', 'margin', 'tier']) {
     const f = fixture(t), previewOpen = f.market.previewOpen;
@@ -414,17 +501,23 @@ test('native position amounts and negative SINGLE direction map without fabricat
   const f = fixture(t); f.account({ position_mode: 'SINGLE' });
   f.positions([{ position_id: 'signed-short', symbol: symbols[0], position_side: 'NONE', position_qty: '-2', avg_price: '99', mark_price: '100',
     position_value: '-200', upnl: '-2', upnl_rate: '-0.01', initial_margin: '20', maintenance_margin: '3', leverage: '10', max_leverage: '100',
-    risk_limit: '100000', fee: '-0.2', funding_fee: '0.4', funding_time: epoch - 1000, closed_pnl: '7', liq_price: '120', update_time: epoch - 10 }]);
+    risk_limit: '100000', fee: '-0.2', funding_fee: '0.4', funding_time: epoch - 1000, closed_pnl: '7', liq_price: '120', create_time: String(epoch - 86400000), update_time: epoch - 10 }]);
   f.client.getAdlRanks = async () => [{ symbol: symbols[0], crossex_adl_rank: 2, exchange_adl_rank: 3 }];
   await f.connect(); await f.runtime.refreshDetails();
   const p = f.runtime.view().live.positions[0];
   assert.equal(p.side, 'SHORT'); assert.equal(p.directionSource, 'quantity_sign'); assert.equal(p.signedQuantity, '-2'); assert.equal(p.quantity, '2');
   assert.equal(p.entryPrice, '99'); assert.equal(p.notional, '200'); assert.equal(p.positionValue, '-200'); assert.equal(p.unrealizedPnlRate, '-0.01');
   assert.equal(p.maintenanceMargin, '3'); assert.equal(p.fundingFee, '0.4'); assert.equal(p.realizedPnl, '7'); assert.equal(p.crossExAdlRank, 2); assert.equal(p.sourceAt, epoch - 10);
+  assert.equal(p.openedAt, epoch - 86400000);
   const preview = await f.runtime.preview({ kind: 'close', positionId: p.id, quantity: '0.25' });
   await f.confirm(preview); assert.equal(f.calls.create[0].side, 'BUY'); assert.equal(f.calls.create[0].position_side, 'NONE');
   f.positions([{ position_id: 'sparse', symbol: symbols[0], position_side: 'NONE', position_qty: '-1' }]); await f.runtime.refresh();
   const sparse = f.runtime.view().live.positions[0]; assert.equal(sparse.unrealizedPnl, null); assert.equal(sparse.notional, null); assert.equal(sparse.liquidationPrice, null);
+  assert.equal(sparse.openedAt, null);
+  for (const create_time of ['0', String(epoch + 1), String(epoch - 5)]) {
+    f.positions([{ position_id: 'invalid-time', symbol: symbols[0], position_side: 'LONG', position_qty: '1', create_time, update_time: epoch - 10 }]);
+    await f.runtime.refresh(); assert.equal(f.runtime.view().live.positions[0].openedAt, null);
+  }
 });
 
 test('supplemental records deduplicate, preserve known details, survive restart and isolate connection versions', async t => {

@@ -35,6 +35,20 @@ test('Hub-launched embedded CrossEx receives normalized funding opportunities fr
   assert.equal(light.status, 200);
   assert.deepEqual(light.data.opportunities, []);
   assert.deepEqual(light.data.fundingOpportunities, []);
+  const heldAt = Date.now();
+  // Seed the read-only position snapshot without creating a private account client.
+  f.crossex.store.prepare('INSERT INTO live_cache(singleton,json) VALUES (1,?)').run(JSON.stringify({
+    account: null, openOrders: [], asOf: heldAt, error: null,
+    positions: ['BINANCE', 'BYBIT'].map((exchange, i) => ({ position_id: `held-${i}`, symbol: `${exchange}_FUTURE_BTC_USDT`, position_side: i ? 'SHORT' : 'LONG', position_qty: '1', create_time: String(heldAt - 86400000), update_time: String(heldAt) })),
+  }));
+  const portfolio = await module.request('/api/state?opportunities=0&funding=1');
+  assert.equal(portfolio.status, 200);
+  assert.deepEqual(portfolio.data.opportunities, []);
+  assert.deepEqual(portfolio.data.fundingOpportunities, []);
+  assert.equal(portfolio.data.positionFundingRates.length, 2, 'positions receive exact held rates without evaluating opportunity rankings');
+  assert.equal(portfolio.data.positionFundingRates.find(item => item.exchange === 'binance').normalized8hBps, 8);
+  assert.equal(portfolio.data.positionFundingRates.find(item => item.exchange === 'bybit').normalized8hBps, 2);
+  assert.equal(portfolio.data.live.positions[0].openedAt, heldAt - 86400000);
 
   // Fetch the actual HTML entry and its referenced build artifact through the
   // launch portal, catching delivery of an older embedded frontend.

@@ -3,6 +3,7 @@ import { AppError } from './model.mjs';
 import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
+import { isBaseBlocked } from '../../../server/asset-identity.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
 const ACTIVE = new Set(['NEW', 'OPEN', 'PARTIALLY_FILLED']);
@@ -316,7 +317,10 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function checkCooldown(plan) {
     const cooldown = Number(plan.limits?.cooldownSeconds || 0) * 1000;
-    if (cooldown > 0 && executionRecords().some(e => e.base === plan.base && clock() - e.createdAt < cooldown)) fail('此资产仍在手动交易冷却期');
+    // Historical executions have no venue field. Conservatively retain the
+    // cooldown across verified alias spellings without rewriting native orders.
+    const bases = new Set([plan.base]);
+    if (cooldown > 0 && executionRecords().some(e => isBaseBlocked(bases, e.base) && clock() - e.createdAt < cooldown)) fail('此资产仍在手动交易冷却期');
   }
   async function positionsNotional(cache) {
     const held = cache.positions.filter(p => !D(p.position_qty).isZero());
@@ -652,6 +656,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const parts = p.symbol.split('_'), side = direction(p), quantity = D(p.position_qty).abs().toString();
     const directionSource = ['LONG', 'SHORT'].includes(p.position_side) ? 'exchange' : side ? 'quantity_sign' : 'unknown';
     const sourceAt = Number(p.update_time) > 0 ? Number(p.update_time) : null, rank = adl.find(r => r.symbol === p.symbol);
+    const createdAt = Number(p.create_time);
+    const openedAt = Number.isSafeInteger(createdAt) && createdAt > 0 && createdAt <= Math.min(sourceAt ?? at, at) ? createdAt : null;
     return { ...p, id: positionKey(p), exchange: exchangeOf(p.symbol), side: side || 'UNKNOWN', directionSource, quantity, baseQuantity: quantity,
       signedQuantity: side ? D(quantity).times(side === 'SHORT' ? -1 : 1).toString() : null,
       baseCurrency: parts[2] || '', quoteCurrency: parts.slice(3).join('_'), entryPrice: p.avg_price ?? p.entry_price ?? null,
@@ -660,7 +666,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       maintenanceMargin: p.maintenance_margin ?? null, leverage: p.leverage ?? null, maxLeverage: p.max_leverage ?? null, riskLimit: p.risk_limit ?? null,
       fee: p.fee ?? null, fundingFee: p.funding_fee ?? null, fundingTime: p.funding_time ?? null, realizedPnl: p.closed_pnl ?? null,
       marginCurrency: p.currency || parts.at(-1), liquidationPrice: p.liq_price ?? null, crossExAdlRank: rank?.crossex_adl_rank ?? null, exchangeAdlRank: rank?.exchange_adl_rank ?? null,
-      source: 'gate_crossex_authenticated_rest', sourceAt, external: true, updatedAt: sourceAt ?? at };
+      source: 'gate_crossex_authenticated_rest', sourceAt, openedAt, external: true, updatedAt: sourceAt ?? at };
   }
   function orderView(order, external = false) {
     return { ...order, id: external ? String(order.order_id) : order.id, orderId: external ? String(order.order_id) : order.orderId,
@@ -678,6 +684,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function view(options) {
     const record = connectionRecord(), cache = cacheRecord(), tracked = orderRecords(), details = supplementalRecord(record?.version);
+    const held = cache.positions.filter(p => !D(p.position_qty).isZero());
     const current = tracked.filter(o => o.version === record?.version), unknown = current.some(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state));
     const stale = !cache.asOf || clock() - cache.asOf > freshnessMs || cache.asOf > clock() + 1000;
     const connected = !!record?.enabled, partial = connected && (!!cache.error || unknown);
@@ -696,11 +703,12 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       if (!byExecution.has(order.executionId)) byExecution.set(order.executionId, []);
       byExecution.get(order.executionId).push(order);
     }
-    return { ...market.view(options), mode: 'live', live: {
+    return { ...market.view({ ...options, includeFundingOpportunities: options?.includeOpportunities === false ? false : options?.includeFundingOpportunities,
+      includePositionFunding: options?.includeFundingOpportunities === true, positionSymbols: held.map(p => p.symbol) }), mode: 'live', live: {
       connection: connectionView(record, cache),
       status: freshnessState, freshnessState, stale, partial, asOf: cache.asOf, tradingAllowed: connected && !stale && !partial && knownMode && record?.tradePermission !== 'denied' && owns(), reasons,
       account: cache.account, balances: Array.isArray(cache.account?.assets) ? cache.account.assets : [],
-      positions: cache.positions.filter(p => !D(p.position_qty).isZero()).map(p => positionView(p, cache.asOf, details.adl || [])),
+      positions: held.map(p => positionView(p, cache.asOf, details.adl || [])),
       orders: [...current.map(o => orderView(o)), ...externalOrders.map(o => orderView(o, true))].slice(0, 300),
       recentTrades: historyRows('live_trades', record?.version), recentTradesAsOf: details.recentTradesAsOf ?? null, recentTradesError: details.recentTradesError ?? null,
       accountBook: historyRows('live_account_book', record?.version), accountBookAsOf: details.accountBookAsOf ?? null, accountBookError: details.accountBookError ?? null,

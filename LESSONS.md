@@ -291,7 +291,7 @@
 
 **证据：** `project-aggregation`，事件 `crossex-base-alias-20261014`。2026-10-14 核实 [Binance Terra 2.0 公告](https://www.binance.com/en/support/announcement/detail/2806253154aa4c36bffdfe60c6afc85e)、[Gate LUNA 合约公告](https://www.gate.com/pt/announcements/article/26708) 与 [OKX 合约单位](https://www.okx.com/en-eu/help/okx-to-list-usdt-margined-perpetual-for-luna)，并读取当前原生及 CrossEx 公共目录确认可用符号。修复集中于 [统一身份](server/asset-identity.mjs)、[Monitor 目录](modules/monitor/modules/perpetual/exchanges.mjs)、[CrossEx 核验](modules/crossex/server/model.mjs) 和 [原生读取](modules/crossex/server/clients.mjs)。LUNC 保持独立；文档中的 Bitget/FUTU 示例不属于本次已确认范围。
 
-**如何验证：** [别名回归](tests/crossex-base-matching.test.mjs) 覆盖已核实及伪造映射、旧报价、原生目录与筛选；[工作台资金费集成](tests/embedded-funding.test.mjs) 从真实市场发现到工作台机会及双腿只读预览保留原生代码；[模拟仓位检查](modules/crossex/tests/engine.test.mjs) 覆盖旧别名仓位平仓、重复开仓与冷却期。针对性测试与本次差异审查即可，不推进主线复盘检查点。
+**如何验证：** [别名回归](tests/crossex-base-matching.test.mjs) 覆盖已核实及伪造映射、旧报价、原生目录与筛选；[工作台资金费集成](tests/embedded-funding.test.mjs) 从真实市场发现到工作台机会及双腿只读预览保留原生代码；[模拟仓位检查](modules/crossex/tests/engine.test.mjs) 覆盖旧别名仓位平仓、重复开仓与冷却期。生产入口使用 `live-runtime.mjs`，须另用[实盘回归](modules/crossex/tests/live-runtime.test.mjs) 验证历史别名记录在预览、确认和容量查询中保持冷却限制；`47be9dd` 的模拟引擎检查不能代替该路径。针对性测试与本次差异审查即可，不推进主线复盘检查点。
 
 **事件记录：** `crossex-base-alias-20261014`；本轮身份、匹配与兼容修复归为同一事件，不增加复发次数。
 
@@ -308,6 +308,33 @@
 **如何验证：** 使用本仓生产构建，从工作台进入市场监控；在宽屏和窄屏依次切换原油、合约机会、图表、持仓、机会及其他市场，比较公共导航、行情卡片与容器边界。确认上限保持 1560px、合约横向留白按模块视口沿用 32px/16px、宽表格内部滚动，父页面与 iframe 均无横向溢出。本轮已覆盖 2100、1280、800、390px 外层视口；行情接口使用隔离夹具，不把布局验收描述为行情或交易验收。
 
 **事件记录：** `monitor-scanner-shell-width-20261014`；一次已核实布局缺陷，多个视口及子标签页不重复计数。
+### L022：页面时钟不套用原始时间戳的整数约束
+
+**适用条件：** 页面用服务器时间加 `performance.now()` 增量计算持仓时长或数据过期。
+
+**根因：** 单调时钟增量包含小数毫秒。对当前计算时钟使用 `Number.isSafeInteger` 会让真实页面的时间失效，而只用整数的单测仍通过。
+
+**以后做法：** 分别验证原始来源时间和计算时钟；后者接受有限正数，并用含小数毫秒的实际时钟输入覆盖时长、年化和过期路径。
+
+**证据：** 本仓基于 `47be9dd` 的持仓指标开发阶段，[指标计算](modules/crossex/src/position-view.ts) 首版在 `now + 12.5ms` 下将时长、资金费差和健康度全部置为未知；只读复核复现后在首次提交前修复。[页面时钟](modules/crossex/src/freshness.ts) 使用单调增量，基线不含此次新增指标缺陷。
+
+**如何验证：** [指标测试](modules/crossex/tests/position-metrics.test.mjs) 的小数时钟用例，以及[工作台浏览器检查](tests/crossex-position-metrics.browser.mjs) 的独立过期与倒计时场景。
+
+**事件记录：** `crossex-metric-clock-20261014`；本轮提交前一次已核实审查发现。
+
+### L023：持仓观察不依赖机会排行榜的筛选结果
+
+**适用条件：** 机会榜与已持仓面板复用资金费数据，但榜单会过滤零差值、按收益排名截断，或应用开仓资格。
+
+**根因：** 机会筛选将已知的零费差和榜外持仓移除，持仓面板因此把真实可用数据显示为未知。
+
+**以后做法：** 机会发现与持仓读取使用各自投影；后者按真实非零持仓的原生合约身份匹配，独立核验目录、来源与资金费时效，不用开仓策略掩盖持仓数据。空结果仍表示缺失，不补零。
+
+**证据：** 本仓基于 `47be9dd` 的持仓指标开发阶段，首次接线复用[机会榜](modules/crossex/server/funding-opportunities.mjs)，审查以相同费率和超过 200 个组合复现缺失。首次提交前改为独立 `positionFundingRates`；原机会榜过滤行为本身未改变。
+
+**如何验证：** [资金费投影测试](modules/crossex/tests/funding-opportunities.test.mjs) 覆盖零值、等费差、榜外、开仓策略及失效数据；[真实工作台入口](tests/embedded-funding.test.mjs) 验证 API 仅投影持仓对应费率并保留真实开仓时间。
+
+**事件记录：** `crossex-held-funding-projection-20261014`；与页面时钟问题为两个独立审查发现。
 
 ## Moved to the code standards
 

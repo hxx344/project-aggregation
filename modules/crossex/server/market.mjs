@@ -4,7 +4,7 @@ import { AppError, defaults, configuration, validateFeed, validSignal, validManu
 import { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCrossexQuote, resolveManualQuote } from './clients.mjs';
 import { D, Decimal } from './money.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
-import { fundingOpportunities } from './funding-opportunities.mjs';
+import { fundingOpportunities, positionFundingRates } from './funding-opportunities.mjs';
 import { crossexBase } from '../../../server/asset-identity.mjs';
 
 const CONFIG_KEYS = ['entryPaused', 'monitorUrl', 'monitorUsername', 'notionalPerLeg', 'maxOpen', 'maxTotalNotional', 'feeBps', 'feeSchedule', 'slippageBps', 'minNetBps', 'cooldownSeconds'];
@@ -218,7 +218,8 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       return { ...signal, transfer: entry.transfer, grossBps, netBps, feeSnapshot: fees, eligible: !reason, reason, warnings };
     }).sort((a, b) => Number(b.eligible) - Number(a.eligible) || (b.netBps ?? -Infinity) - (a.netBps ?? -Infinity));
   }
-  function view({ includeOpportunities = true } = {}) {
+  function view({ includeOpportunities = true, includeFundingOpportunities = includeOpportunities,
+    includePositionFunding = false, positionSymbols = [] } = {}) {
     const now = clock(), live = sourceLive(now), latestFresh = latestAtOrBefore(feedIndex.freshTimes, now + 1000);
     const hasFresh = latestFresh !== null && now - latestFresh <= 10000;
     return { now, config: { ...config(), hasMonitorPassword: !!store.get('monitorPassword') },
@@ -230,7 +231,9 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       venues: SUPPORTED_VENUES.map(id => ({ id, state: live ? feedIndex.venues.get(id) ?? 'unavailable' : 'offline', quoteCount: feedIndex.counts.get(id) || 0 })),
       fx: ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (e) { return { currency, state: 'unavailable', error: safeMessage(e) }; } }),
       opportunities: includeOpportunities ? candidates() : [],
-      fundingOpportunities: includeOpportunities ? fundingOpportunities(feed, { now, ruleFor: manualRuleFor,
+      positionFundingRates: includePositionFunding ? positionFundingRates(feed, { now, ruleFor: manualRuleFor, symbols: positionSymbols,
+        sourceReason: live ? '' : sourceError || '价差数据已过期', catalogExpiresAt: catalog.at + 900000 }) : [],
+      fundingOpportunities: includeFundingOpportunities ? fundingOpportunities(feed, { now, ruleFor: manualRuleFor,
         sourceReason: live ? '' : sourceError || '价差数据已过期', entryPaused: config().entryPaused, entryPolicyKnown,
         catalogExpiresAt: catalog.at + 900000,
         signals: feedIndex.signals.values(), signalValid: signal => indexedValidSignal(signal, feed, feedIndex, now) }) : [] };

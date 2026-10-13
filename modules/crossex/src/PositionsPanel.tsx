@@ -1,24 +1,36 @@
 // Layout informed by your-quantguy/gate-crossex at 423356d89e5c8f41d9d9033f4db1f40299774ec0.
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Search, Layers3 } from 'lucide-react';
-import type { CloseLeg, Instrument, LivePosition, LiveView } from './live-types';
+import type { CloseLeg, Instrument, LivePosition, LiveView, PositionFundingRate } from './live-types';
 import { amountClass, liquidationPrice, positiveQuantity, sideLabel } from './live-display';
 import DecimalValue from './DecimalValue';
 import AdlIndicator from './AdlIndicator';
 import { fractionQuantity, groupPositions } from './position-view';
 import type { CurrencyAmount } from './position-view';
+import type { FundingOpportunity } from './funding-opportunities';
+import { PositionMetricsSummary, PositionMetricsDetails } from './PositionMetrics';
+import { positionHistorySamples, updatePositionHistory } from './position-history';
+import type { PositionHistoryState } from './position-history';
 import { time, venue } from './display';
 
-export default function PositionsPanel({ live, instruments, disabled, close }: {
+export default function PositionsPanel({ live, instruments, disabled, close, now, fundingOpportunities, positionFundingRates, marketStale }: {
   live: LiveView; instruments: Instrument[]; disabled: boolean; close: (positions: CloseLeg[]) => Promise<boolean>;
+  now: number; positionFundingRates?: PositionFundingRate[]; fundingOpportunities: FundingOpportunity[]; marketStale: boolean;
 }) {
   const [search, setSearch] = useState(''), [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [closing, setClosing] = useState<LivePosition[] | null>(null), [page, setPage] = useState(0);
-  const groups = useMemo(() => groupPositions(live.positions).filter(group => `${group.base} ${group.legs.map(p => p.exchange + ' ' + p.symbol).join(' ')}`.toUpperCase().includes(search.trim().toUpperCase())), [live.positions, search]);
+  const stale = live.stale || !live.connection.connected || !live.asOf || now - live.asOf > 15_000 || live.asOf > now + 1000;
+  const scope = JSON.stringify([live.connection.accountId, live.connection.version]);
+  const allGroups = useMemo(() => groupPositions(live.positions, { now, fundingOpportunities, positionFundingRates, marketStale, stale, partial: live.partial }), [live.positions, now, fundingOpportunities, positionFundingRates, marketStale, stale, live.partial]);
+  const groups = useMemo(() => allGroups.filter(group => `${group.base} ${group.legs.map(p => p.exchange + ' ' + p.symbol).join(' ')}`.toUpperCase().includes(search.trim().toUpperCase())), [allGroups, search]);
+  const [history, setHistory] = useState<PositionHistoryState | null>(null);
+  useEffect(() => {
+    setHistory(previous => updatePositionHistory(previous, allGroups, { scope, at: live.asOf, now, stale, partial: live.partial }));
+  }, [allGroups, scope, live.asOf, now, stale, live.partial]);
   const pages = Math.max(1, Math.ceil(groups.length / 20)), shownPage = Math.min(page, pages - 1), shown = groups.slice(shownPage * 20, (shownPage + 1) * 20);
   const toggle = (base: string) => setExpanded(previous => { const next = new Set(previous); if (next.has(base)) next.delete(base); else next.add(base); return next; });
   return <section className="panel positions-panel">
-    <div className="section-heading"><div><h2>持仓组合 <span className="count">{groups.length}</span></h2><p>{live.positions.length} 条真实持仓腿 · 点击币种展开单腿风险</p></div><label className="search-field"><Search size={14}/><input aria-label="搜索持仓币种或交易所" placeholder="搜索币种 / 交易所" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}/></label></div>
+    <div className="section-heading"><div><h2>持仓组合 <span className="count">{groups.length}</span></h2><p>{live.positions.length} 条真实持仓腿 · 点击币种展开价差、资金费与单腿风险</p></div><label className="search-field"><Search size={14}/><input aria-label="搜索持仓币种或交易所" placeholder="搜索币种 / 交易所" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}/></label></div>
     {live.partial && <p className="inline-state warning">持仓数据不完整，保留已知仓位；汇总可能不完整，暂不可交易。</p>}
     {shown.length ? <div className="position-groups"><div className="group-columns"><span>币种 / 交易所</span><span>净数量 / 总名义额</span><span>加权开仓 / 标记价</span><span>未实现盈亏</span><span>已实现 / 资金费</span><span>操作</span></div>{shown.map(group => <article className={'position-group ' + (expanded.has(group.base) ? 'expanded' : '')} key={group.base}>
       <div className="group-row"><button className="group-identity" onClick={() => toggle(group.base)} aria-expanded={expanded.has(group.base)} aria-label={`${expanded.has(group.base) ? '收起' : '展开'} ${group.base} 持仓`}>
@@ -27,6 +39,8 @@ export default function PositionsPanel({ live, instruments, disabled, close }: {
       <div data-label="加权开仓 / 标记价"><strong><DecimalValue value={group.entry?.value} kind="price"/> <small>{group.entry?.currency}</small></strong><small><DecimalValue value={group.mark?.value} kind="price"/> {group.mark?.currency}</small></div>
       <div data-label="未实现盈亏"><NativeValues values={group.pnl} signed/></div><div data-label="已实现 / 资金费"><NativeValues values={group.realized} signed/><NativeValues values={group.funding} signed subtle/></div>
       <div className="group-actions"><button className="danger-quiet" disabled={disabled || group.legs.length > 16} onClick={() => setClosing(group.legs)}>平仓组合</button>{group.legs.length > 16 && <small>每次最多 16 腿，请逐腿操作</small>}</div></div>
+      <PositionMetricsSummary group={group} stale={stale || live.partial}/>
+      {expanded.has(group.base) && <PositionMetricsDetails group={group} now={now} samples={positionHistorySamples(history, group, scope)} stale={stale || live.partial}/>}
       {expanded.has(group.base) && <div className="position-leg-list">{group.legs.map(p => <div className="position-leg" key={p.id}><div className="leg-identity"><span className={'side-badge ' + p.side.toLowerCase()}>{sideLabel(p.side)}</span><strong>{venue(p.exchange)}</strong><span>{p.symbol}</span><span className="muted"><DecimalValue value={p.leverage} kind="rate"/>×</span><button className="danger-quiet" disabled={disabled} onClick={() => setClosing([p])}>平此腿</button></div>
         <dl className="leg-values"><div><dt>持仓数量</dt><dd><DecimalValue value={p.baseQuantity}/> <small>{p.baseCurrency}</small></dd></div><div><dt>开仓均价 / 标记价</dt><dd><DecimalValue value={p.entryPrice} kind="price"/> / <DecimalValue value={p.markPrice} kind="price"/> <small>{p.quoteCurrency}</small></dd></div><div><dt>未实现盈亏</dt><dd className={amountClass(p.unrealizedPnl)}><DecimalValue value={p.unrealizedPnl} kind="amount" signed/> <small>{p.pnlCurrency}</small></dd></div><div><dt>初始 / 维持保证金</dt><dd><DecimalValue value={p.margin} kind="amount"/> / <DecimalValue value={p.maintenanceMargin} kind="amount"/> <small>{p.marginCurrency}</small></dd></div><div><dt>强平价</dt><dd>{liquidationPrice(p.liquidationPrice) ? <DecimalValue value={p.liquidationPrice} kind="price"/> : '未提供或不适用'} <small>{liquidationPrice(p.liquidationPrice) ? p.quoteCurrency : ''}</small></dd></div><div><dt>已实现 / 资金费 / 交易费</dt><dd><DecimalValue value={p.realizedPnl} kind="amount"/> / <DecimalValue value={p.fundingFee} kind="amount"/> / <DecimalValue value={p.fee} kind="amount"/> <small>{p.pnlCurrency}</small></dd></div><div><dt>方向来源</dt><dd>{p.directionSource === 'quantity_sign' ? '方向由数量符号推导' : p.directionSource === 'position_side' ? '交易所持仓方向' : '交易所返回值'}</dd></div><div><dt>ADL 减仓优先级</dt><dd><AdlIndicator exchange={p.exchange} internalRank={p.crossExAdlRank} exchangeRank={p.exchangeAdlRank} stale={live.stale || !!live.adlError || !live.connection.connected} asOf={live.adlAsOf}/></dd></div><div><dt>最大杠杆 / 风险限额</dt><dd><DecimalValue value={p.maxLeverage} kind="rate"/>× / <DecimalValue value={p.riskLimit} kind="amount"/></dd></div><div><dt>来源时间</dt><dd>{time(p.updatedAt)}</dd></div></dl>
       </div>)}</div>}
