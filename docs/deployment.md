@@ -2,6 +2,8 @@
 
 工作台保留原生交易功能，同时内置 Market Monitor、Asset Ledger、Gate CrossEx、Greeks 与 ASTER。五个模块的源码、页面和后端均随本仓库统一构建、验证、安装与更新。它们不再作为独立网站或独立 systemd 服务运行。
 
+Aster 的公共额度中继可以单独运行在另一台服务器，使用本仓库的[独立中继安装与接入流程](aster-relay.md)。它不属于工作台业务模块安装，也不需要交易账户凭据。
+
 ## 安装与升级
 
 当前正式发布针对实际服务器 Ubuntu 24.04 LTS（当前为 24.04.4）、x64 / x86_64 构建并验收，需 systemd 和 Python 3.11+：

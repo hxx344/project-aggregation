@@ -120,6 +120,8 @@
 
 **事件记录：** `embedded-python-provenance-20261013`、`aster-migration-file-provenance-20261014`；两次独立事件，分别涉及特权依赖安装和外部文件读取。
 
+2026-10-14 独立中继安装入口接入本仓时，提交前检查发现：即使源码文件已校验归属，root 运行的 `python3 -c`、`python3 -` 仍可能从调用目录或 `PYTHONPATH` 导入同名模块。`deploy/install-aster-relay.sh` 与 `deploy/aster-capacity-relay` 的特权 Python 入口使用 `-I`；业务模块需要工作目录导入时，只从受信运行目录启动，并清除 `PYTHONPATH`、`PYTHONHOME`。工作台连接导入的管道命令同样使用 `python3 -I -`。证据为基于 `9ad1bff` 的本轮新增安装器（首次提交前修正），不是该基线已有缺陷；[中继安装检查](deploy/test-aster-relay-install.py) 使用伪造 `json.py`、`pathlib.py` 和解释器环境变量覆盖该入口。事件 ID：`relay-python-import-provenance-20261014`，属于解释器启动输入的独立边界问题，不因多个调用点重复计数。
+
 ### L010：拓扑迁移的提交点必须覆盖必要持久化记录
 
 **适用条件：** 升级同时切换程序与独立服务拓扑，并通过迁移日志控制回滚。
