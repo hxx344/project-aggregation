@@ -75,9 +75,16 @@ type Props = {
   setNotice: (message: string) => void;
 };
 const EMPTY_PAIRS: Pair[] = [];
+type PairSymbolsProps = {
+  catalog: ReturnType<typeof usePairSymbols>;
+  loadSymbols: () => void;
+};
 
 export function PairsWorkspace({ pairs, ...props }: Props) {
   const [selected, setSelected] = useState('');
+  const [symbolsRequested, setSymbolsRequested] = useState(false);
+  const catalog = usePairSymbols(symbolsRequested && !props.connectionError);
+  const loadSymbols = () => setSymbolsRequested(true);
   const items = pairs ?? EMPTY_PAIRS;
   const pair = items.find((item) => item.id === selected) ?? items[0];
   const offline = Boolean(props.connectionError);
@@ -150,6 +157,8 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
           <CreatePair
             {...props}
             pairs={items}
+            catalog={catalog}
+            loadSymbols={loadSymbols}
             supported={pairs !== undefined}
             selectPair={setSelected}
           />
@@ -160,6 +169,8 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
           {...props}
           pairs={items}
           pair={pair}
+          catalog={catalog}
+          loadSymbols={loadSymbols}
           noticeHistory={noticeHistories.get(pair.id)}
           clearNotices={() =>
             setNoticeState((previous) => {
@@ -203,14 +214,16 @@ function CreatePair({
   setNotice,
   supported,
   selectPair,
-}: Omit<Props, 'pairs'> & {
-  pairs: Pair[];
-  supported: boolean;
-  selectPair: (id: string) => void;
-}) {
+  catalog,
+  loadSymbols,
+}: Omit<Props, 'pairs'> &
+  PairSymbolsProps & {
+    pairs: Pair[];
+    supported: boolean;
+    selectPair: (id: string) => void;
+  }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(pairDraft);
-  const catalog = usePairSymbols(open && !connectionError);
   const canCreate =
     supported && availablePairAccounts(accounts, pairs).length >= 2;
   const locked = busy || Boolean(connectionError);
@@ -220,6 +233,7 @@ function CreatePair({
       onOpenChange={(next) => {
         if (!busy) {
           setOpen(next);
+          if (next) loadSymbols();
           setError('');
         }
       }}
@@ -312,17 +326,21 @@ function PairDetail({
   ready,
   now,
   connectionError,
+  error,
   action,
   setError,
   setNotice,
   noticeHistory,
   clearNotices,
-}: Omit<Props, 'pairs'> & {
-  pairs: Pair[];
-  pair: Pair;
-  noticeHistory?: PairNoticeHistory;
-  clearNotices: () => void;
-}) {
+  catalog,
+  loadSymbols,
+}: Omit<Props, 'pairs'> &
+  PairSymbolsProps & {
+    pairs: Pair[];
+    pair: Pair;
+    noticeHistory?: PairNoticeHistory;
+    clearNotices: () => void;
+  }) {
   const draft = useAccountDraft(pair.id, pairDraft(pair));
   const [deleteOpen, setDeleteOpen] = useState(false);
   const snapshots = pair.state?.snapshots;
@@ -739,10 +757,35 @@ function PairDetail({
           )}
         />
       </details>
-      <details className="disclosure panel settings-panel pair-config">
+      <details
+        className="disclosure panel settings-panel pair-config"
+        onToggle={(event) => {
+          if (event.currentTarget.open) loadSymbols();
+        }}
+      >
         <summary>配对组设置{draft.dirty ? ' · 未保存' : ''}</summary>
         {configurationLock ? (
           <p className="settings-lock amber">{configurationLock}</p>
+        ) : null}
+        {error ? (
+          <p className="message message-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        {catalog.loading ? (
+          <output className="muted">正在读取可用配对标的…</output>
+        ) : catalog.error ? (
+          <div className="message message-error" role="alert">
+            <p>{catalog.error}；仍可保留原标的并保存其他设置。</p>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={busy || offline}
+              onClick={catalog.retry}
+            >
+              重试读取标的
+            </Button>
+          </div>
         ) : null}
         <PairSettings
           draft={draft.value}
@@ -751,11 +794,18 @@ function PairDetail({
           pairs={pairs}
           editing
           locked={locked}
+          symbols={catalog.symbols}
           cancel={draft.clear}
           submit={async () => {
             try {
               const config = pairConfigurationChanges(
-                parsePairDraft(draft.value, accounts, pairs, pair.id),
+                parsePairDraft(
+                  draft.value,
+                  accounts,
+                  pairs,
+                  pair.id,
+                  catalog.symbols,
+                ),
               );
               if (await action(`/api/pairs/${pair.id}`, config, 'PATCH')) {
                 draft.clear();

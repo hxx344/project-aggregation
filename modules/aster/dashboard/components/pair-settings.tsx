@@ -61,6 +61,12 @@ export function PairSettings({
     (account) => account.id === draft.short_account_id,
   );
   const symbolConfig = symbols.find((item) => item.symbol === draft.symbol);
+  const symbolChoices: [string, string][] = symbols.map((item) => [
+    item.symbol,
+    item.display_name,
+  ]);
+  if (editing && !symbolConfig)
+    symbolChoices.unshift([draft.symbol, draft.symbol]);
   const choices = (side: 'long' | 'short'): [string, string][] =>
     eligible
       .filter((account) => {
@@ -123,21 +129,25 @@ export function PairSettings({
         <ConfigurationField
           id={`${formId}-pair-symbol`}
           label="交易标的"
-          items={
-            editing
-              ? [[draft.symbol, symbolConfig?.display_name ?? draft.symbol]]
-              : symbols.map((item) => [item.symbol, item.display_name])
-          }
+          items={symbolChoices}
           value={draft.symbol}
           display={symbolConfig?.display_name ?? draft.symbol}
-          disabled={locked || editing}
+          disabled={locked || !symbols.length}
           onValueChange={(symbol) => {
             const selected = symbols.find((item) => item.symbol === symbol);
-            if (selected && !editing)
-              setDraft(selectPairSymbol(draft, selected, symbols));
+            if (selected)
+              setDraft(
+                selectPairSymbol(draft, selected, symbols, {
+                  applyDefaults: !editing,
+                }),
+              );
           }}
         >
-          <small>标的创建后固定；切换标的需新建配对组。</small>
+          <small>
+            {editing
+              ? '切换前须暂停配对组、两侧完全空仓，且无待核对订单或划转；保存后保持暂停，金额及其他设置保留。'
+              : '创建后保持暂停；两侧完全空仓且无待核对订单或划转时，可在设置中切换标的。'}
+          </small>
         </ConfigurationField>
         <ConfigurationField
           id={`${formId}-pair-mode`}

@@ -447,3 +447,16 @@
 ## Moved to the code standards
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目归档到本节，保留证据与规范链接；不按重复复盘次数自动升级。
+### L031：共享 SQLite 连接的事务校验不能嵌套连接上下文
+
+**适用条件：** `Store.connection_scope()` 复用同一 SQLite 连接，写事务在比较持久状态后调用额外校验回调。
+
+**根因：** 回调若再通过 `Store.connect()` 读取数据，嵌套连接上下文退出时可能提前提交外层事务，令后续配置、运行日志和归档写入失去整体回滚能力。
+
+**以后做法：** 在当前事务内直接读取和比较所需持久记录；最终回调只核验已经取得的连接身份、快照版本和时效，不再次进入 Store 连接上下文。
+
+**如何验证：** [配对标的切换测试](modules/aster/tests/test_pair_symbol_change.py) 的配置写入后失败场景，同时覆盖独立连接和 `connection_scope()`，确认最终校验后事务仍开启，失败后配置、运行记录及归档全部回滚。
+
+**证据：** 本仓基于 `4cc7f3d` 的 2026-10-15 配对标的编辑工作区，首版 `PairManager._switch_symbol` 在事务回调中调用 `PairTrader._members`，间接读取 Store。提交前改为直接核对已捕获的 broker 与身份；[专用提交事务](modules/aster/trading/store.py) 保留持久状态比较。此为本轮新增实现中的缺陷，基线未包含该切换路径。
+
+**事件记录：** `pair-symbol-switch-scoped-transaction-20261015`。

@@ -143,7 +143,7 @@ test('symbol selection follows catalog defaults without overwriting edited amoun
   );
 });
 
-test('saved silver groups remain editable without a catalog and their symbol is immutable', () => {
+test('saved silver groups keep their symbol and remain editable without a catalog', () => {
   const saved = {
     ...parsePairDraft(
       selectPairSymbol(draft(), silver, catalog),
@@ -159,7 +159,8 @@ test('saved silver groups remain editable without a catalog and their symbol is 
   assert.equal(parsed.symbol, 'XAGUSD1');
   assert.equal(parsed.cycle.symbol, 'XAGUSD1');
   const changes = pairConfigurationChanges(parsed);
-  assert.equal(Object.hasOwn(changes, 'symbol'), false);
+  assert.equal(changes.name, '白银组改名');
+  assert.equal(changes.symbol, 'XAGUSD1');
   assert.equal(changes.cycle.symbol, 'XAGUSD1');
   assert.throws(
     () =>
@@ -168,10 +169,134 @@ test('saved silver groups remain editable without a catalog and their symbol is 
         accounts,
         [saved],
         saved.id,
-        catalog,
+        [],
       ),
-    /不能更改交易标的/,
+    /支持的配对标的/,
   );
+});
+
+test('switching a saved pair preserves all settings and PATCH excludes its identity and activation', () => {
+  const customSilver = {
+    ...silver,
+    default_order_notional: '1500',
+    default_threshold: '12000',
+    default_spread_limit: '0.0004',
+  };
+  const choices = [DEFAULT_PAIR_SYMBOL, customSilver];
+  for (const mode of ['monitor', 'ordinary', 'cycle']) {
+    const saved = {
+      ...parsePairDraft(
+        {
+          ...draft(),
+          name: '保留组名称',
+          mode,
+          margin_enabled: true,
+          balance_threshold: '25.125',
+          max_transfer: '2500',
+          cycle: {
+            ...draft().cycle,
+            min_notional: '1600',
+            max_notional: '2600',
+            daily_volume_limit: '15000',
+          },
+        },
+        accounts,
+        [],
+        undefined,
+        choices,
+      ),
+      enabled: false,
+    };
+    const original = pairDraft(saved);
+    const selected = selectPairSymbol(original, customSilver, choices, {
+      applyDefaults: false,
+    });
+    assert.deepEqual(selected, {
+      ...original,
+      symbol: 'XAGUSD1',
+      cycle: { ...original.cycle, symbol: 'XAGUSD1' },
+    });
+    assert.deepEqual(pairDraft(saved), original);
+    const parsed = parsePairDraft(
+      selected,
+      accounts,
+      [saved],
+      saved.id,
+      choices,
+    );
+    const request = JSON.parse(
+      JSON.stringify(pairConfigurationChanges(parsed)),
+    );
+    assert.deepEqual(request, {
+      name: saved.name,
+      symbol: 'XAGUSD1',
+      ordinary: saved.ordinary,
+      cycle: { ...saved.cycle, symbol: 'XAGUSD1' },
+      margin: saved.margin,
+    });
+    assert.equal(parsed.id, saved.id);
+    assert.equal(parsed.long_account_id, saved.long_account_id);
+    assert.equal(parsed.short_account_id, saved.short_account_id);
+    assert.equal(
+      parsePairDraft(
+        selectPairSymbol(selected, DEFAULT_PAIR_SYMBOL, choices, {
+          applyDefaults: false,
+        }),
+        accounts,
+        [saved],
+        saved.id,
+        choices,
+      ).symbol,
+      'XAUUSD1',
+    );
+  }
+});
+
+test('saved pairs reject unknown changes and mismatched cycle symbols even in monitor mode', () => {
+  const saved = {
+    ...parsePairDraft(draft(), accounts, [], undefined, catalog),
+    enabled: false,
+  };
+  for (const mode of ['monitor', 'ordinary', 'cycle']) {
+    const original = { ...pairDraft(saved), mode };
+    assert.throws(
+      () =>
+        parsePairDraft(
+          {
+            ...original,
+            symbol: 'UNKNOWN',
+            cycle: { ...original.cycle, symbol: 'UNKNOWN' },
+          },
+          accounts,
+          [saved],
+          saved.id,
+          catalog,
+        ),
+      /支持的配对标的/,
+    );
+    assert.throws(
+      () =>
+        parsePairDraft(
+          { ...original, symbol: 'XAGUSD1' },
+          accounts,
+          [saved],
+          saved.id,
+          catalog,
+        ),
+      /必须与配对组一致/,
+    );
+    assert.throws(
+      () =>
+        parsePairDraft(
+          { ...original, cycle: { ...original.cycle, symbol: 'XAGUSD1' } },
+          accounts,
+          [saved],
+          saved.id,
+          [],
+        ),
+      /必须与配对组一致/,
+    );
+  }
 });
 
 test('pair/cycle mismatches and unknown symbols are rejected, including disabled cycles', () => {

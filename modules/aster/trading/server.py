@@ -312,6 +312,7 @@ class NewPair(BaseModel):
 class PairEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str | None = Field(default=None, min_length=1, max_length=50)
+    symbol: PairSymbol | None = None
     ordinary: PairOrdinaryEdit | None = None
     cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None

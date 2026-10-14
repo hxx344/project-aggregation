@@ -181,12 +181,17 @@ export function selectPairSymbol(
   draft: PairDraft,
   selected: PairSymbol,
   symbols: readonly PairSymbol[],
+  { applyDefaults = true }: { applyDefaults?: boolean } = {},
 ): PairDraft {
-  const previous = symbols.find((item) => item.symbol === draft.symbol);
-  return {
+  const next = {
     ...draft,
     symbol: selected.symbol,
     cycle: { ...draft.cycle, symbol: selected.symbol },
+  };
+  if (!applyDefaults) return next;
+  const previous = symbols.find((item) => item.symbol === draft.symbol);
+  return {
+    ...next,
     threshold:
       draft.threshold === previous?.default_threshold
         ? selected.default_threshold
@@ -275,8 +280,6 @@ export function parsePairDraft(
   const symbol = draft.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
   const current = pairs.find((pair) => pair.id === currentId);
   const savedSymbol = current?.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
-  if (current && symbol !== savedSymbol)
-    throw new Error('配对组创建后不能更改交易标的');
   const symbolConfig = symbols.find((item) => item.symbol === symbol);
   if (!symbolConfig && (!current || symbol !== savedSymbol))
     throw new Error('请选择目录中支持的配对标的');
@@ -382,8 +385,8 @@ export function parsePairDraft(
 export function pairConfigurationChanges(
   config: ReturnType<typeof parsePairDraft>,
 ) {
-  const { name, ordinary, cycle, margin } = config;
-  return { name, ordinary, cycle, margin };
+  const { name, symbol, ordinary, cycle, margin } = config;
+  return { name, symbol, ordinary, cycle, margin };
 }
 
 export function pairDataFresh(

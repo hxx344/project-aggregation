@@ -1,4 +1,4 @@
-"""Pair catalogue, immutable identity and silver account binding through the API."""
+"""Pair catalogue, immutable membership and safe symbol edits through the API."""
 from copy import deepcopy
 import os
 import unittest
@@ -66,19 +66,45 @@ class PairSymbolApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, status, response.text)
         self.assertEqual(self.f.store.pairs(), [])
 
-    def test_symbol_is_immutable_and_partial_cycle_edits_keep_silver(self):
+    def test_symbol_switch_preserves_members_and_partial_cycle_edits(self):
         self.login()
         pair = self.create_silver()
         response = self.client.patch("/api/pairs/silver", json={"symbol": "XAUUSD1"})
-        self.assertEqual(response.status_code, 422)
-        with self.assertRaises(TradingError):
-            self.engine.pairs.configure("silver", {"symbol": "XAUUSD1"})
-        self.assertEqual(self.f.store.pair("silver"), pair)
+        self.assertEqual(response.status_code, 200, response.text)
+        changed = response.json()["pair"]
+        self.assertEqual(changed["cycle"]["symbol"], "XAUUSD1")
+        for key in ("id", "long_account_id", "short_account_id", "ordinary", "margin"):
+            self.assertEqual(changed[key], pair[key])
+        response = self.client.patch("/api/pairs/silver", json={"symbol": "XAGUSD1"})
+        self.assertEqual(response.status_code, 200, response.text)
         response = self.client.patch("/api/pairs/silver", json={"cycle": {"hold_seconds": 90}})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["pair"]["cycle"]["symbol"], "XAGUSD1")
         response = self.client.patch("/api/pairs/silver", json={"cycle": {"symbol": "XAUUSD1"}})
         self.assertEqual(response.status_code, 409)
+
+    def test_symbol_edits_reject_unknown_null_conflicts_and_member_changes(self):
+        self.login()
+        pair = self.create_silver()
+        for changes, status in (({"symbol": None}, 422), ({"symbol": "BTCUSD1"}, 422),
+                                ({"symbol": "xauusd1"}, 422), ({"long_account_id": "third"}, 422),
+                                ({"id": "other"}, 422),
+                                ({"symbol": "XAUUSD1", "cycle": {"symbol": "XAGUSD1"}}, 409)):
+            with self.subTest(changes=changes):
+                response = self.client.patch("/api/pairs/silver", json=changes)
+                self.assertEqual(response.status_code, status, response.text)
+                self.assertEqual(self.f.store.pair("silver"), pair)
+
+    def test_same_symbol_save_avoids_remote_reads_and_running_switch_is_rejected(self):
+        self.login()
+        self.create_silver()
+        with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("unexpected read")):
+            response = self.client.patch("/api/pairs/silver", json={"symbol": "XAGUSD1", "name": "白银新名称"})
+            self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.client.post("/api/pairs/silver/enable").status_code, 200)
+        response = self.client.patch("/api/pairs/silver", json={"symbol": "XAUUSD1"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.f.store.pair("silver")["symbol"], "XAGUSD1")
 
     def test_silver_start_adopts_only_silver_positions_and_reconcile_clears_them(self):
         self.login()

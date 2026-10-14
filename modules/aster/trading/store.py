@@ -389,6 +389,47 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             return self._save_pair(db, pair, create=create)
 
+    def switch_pair_symbol(self, pair, runtime, *, expected_pair, expected_runtime,
+                           expected_margin, accounts, check_current):
+        """Atomically replace a verified flat symbol, retaining its old journal."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
+            if (not row or json.loads(row[0]) != expected_pair
+                    or expected_pair.get("enabled") is not False or pair.get("enabled") is not False
+                    or pair.get("symbol") == expected_pair.get("symbol")):
+                raise TradingError("切换标的期间配对组状态已变化，请重新核对")
+            for key, expected in (("pair_runtime:" + pair["id"], expected_runtime),
+                                  ("pair_margin:" + pair["id"], expected_margin)):
+                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                if (json.loads(row[0]) if row else {}) != expected:
+                    raise TradingError("切换标的期间订单或划转记录已变化，请重新核对")
+            for account in accounts:
+                row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
+                binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
+                side = "LONG" if account["id"] == expected_pair["long_account_id"] else "SHORT"
+                if not row or json.loads(row[0]) != account or not binding or tuple(binding) != (pair["id"], side):
+                    raise TradingError("切换标的期间子账户配置或绑定已变化，请重新核对")
+                for prefix in ("post_fill_check:", "cycle:"):
+                    row = db.execute("SELECT data FROM kv WHERE key=?", (prefix + account["id"],)).fetchone()
+                    legacy = json.loads(row[0]) if row else {}
+                    if ((prefix == "post_fill_check:" and legacy)
+                            or (prefix == "cycle:" and any(dec(qty) for qty in legacy.get("quantities", {}).values()))):
+                        raise TradingError("切换标的期间子账户出现未完成批次，请重新核对")
+            # The database writer may have waited beyond the snapshot deadline.
+            # Recheck identity and revocable read authority under that same lock.
+            check_current()
+            saved = self._save_pair(db, pair, allow_symbol_change=True)
+            archive = {"pair": expected_pair, "runtime": expected_runtime,
+                       "new_symbol": saved["symbol"], "changed_at": time.time()}
+            db.execute("INSERT INTO kv(key,data) VALUES(?,?)", (
+                f"pair_symbol_change:{pair['id']}:{saved['revision']}", dumps(archive)))
+            db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       ("pair_runtime:" + pair["id"], dumps(runtime)))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                       (pair["id"], "pair", runtime["reason"] + "；本次切换未下单、撤单、调杠杆或划转", time.time()))
+            return saved
+
     def activate_pair(self, pair, runtime, *, expected_runtime, expected_margin, accounts, check_current, message):
         """Commit an explicitly paused start and its verified baseline together."""
         with self.connect() as db:
@@ -446,7 +487,7 @@ class Store:
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
                        (pair["id"], "pair", message + "；本次核对未下单或划转", time.time()))
 
-    def _save_pair(self, db, pair, *, create=False):
+    def _save_pair(self, db, pair, *, create=False, allow_symbol_change=False):
         row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
         if create and row:
             raise TradingError("配对组标识已使用")
@@ -455,8 +496,10 @@ class Store:
         previous = json.loads(row[0]) if row else None
         if previous and pair.get("revision") != previous.get("revision"):
             raise TradingError("配对组配置已变化，请刷新后重试")
-        if previous and any(previous[key] != pair[key] for key in ("long_account_id", "short_account_id", "symbol")):
-            raise TradingError("配对组账户及方向不可变更；空仓解除绑定后重新建组")
+        if previous and any(previous[key] != pair[key] for key in ("long_account_id", "short_account_id")):
+            raise TradingError("配对组账户及方向不可变更")
+        if previous and previous["symbol"] != pair["symbol"] and not allow_symbol_change:
+            raise TradingError("交易标的只能通过暂停后的空仓核验切换")
         members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]
         if members[0][0] == members[1][0]:
             raise TradingError("配对组需要两个不同账户")

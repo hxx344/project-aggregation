@@ -130,9 +130,11 @@ class PairManager:
                 raise TradingError("原账户循环仍有新增持仓，请先完成原循环")
         return accounts
 
-    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False):
+    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False, runtime=None):
         from .pair_planning import require_runtime_symbols
-        require_runtime_symbols(pair, self.store.get("pair_runtime:" + pair["id"]) or {})
+        if runtime is None:
+            runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
+        require_runtime_symbols(pair, runtime)
         symbol = validate_symbol(pair["symbol"])
         accounts = self._members(pair)
         brokers = {account["id"]: self.engine.broker(account) for account in accounts}
@@ -145,7 +147,7 @@ class PairManager:
                     # Ownership verification rereads each child account.
                     budgets[budget] += 5
         if startup:
-            watch = (self.store.get("pair_runtime:" + pair["id"], {}) or {}).get("recovery_watch")
+            watch = runtime.get("recovery_watch")
             batches = watch.get("batches", []) if isinstance(watch, dict) else []
             for batch in batches if isinstance(batches, list) else []:
                 for leg in batch.get("legs", []) if isinstance(batch, dict) else []:
@@ -196,7 +198,6 @@ class PairManager:
         guards = {account["id"]: row[1] for account, row in zip(accounts, rows)}
         with self._current_members(guards):
             pass
-        runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
         owned = runtime.get("owned") or {"LONG": "0", "SHORT": "0"}
         for side, snapshot in zip(("LONG", "SHORT"), snapshots):
             snapshot.require_fresh()
@@ -264,31 +265,93 @@ class PairManager:
         if not can_resume and (margin.get("pending") is not None or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
             raise TradingError("保证金划转结果尚未核实，暂不能启动、修改设置、核对空仓或删除；请查看保证金平衡中的核对状态")
         if require_flat and any(dec(qty) for qty in (runtime.get("owned") or {}).values()):
-            raise TradingError("配对组仍有普通策略底仓，完全平仓并核对后才能解除绑定")
+            raise TradingError("配对组仍有普通策略底仓，完全平仓并核对后才能更换标的或解除绑定")
         return runtime
 
     def configure(self, pair_id, changes):
         previous = self.store.pair(pair_id)
         if not previous:
             raise TradingError("配对组不存在")
-        if not isinstance(changes, dict) or not changes or set(changes) - {"name", "ordinary", "cycle", "margin"}:
-            raise TradingError("仅可修改组名称及策略配置，账户方向固定，交易标的创建后固定")
+        if not isinstance(changes, dict) or not changes or set(changes) - {"name", "symbol", "ordinary", "cycle", "margin"}:
+            raise TradingError("仅可修改组名称、交易标的及策略配置，账户方向固定")
         with self.locked(previous):
             pair = self.store.pair(pair_id)
+            if pair is None:
+                raise TradingError("配对组不存在")
             self._idle(pair)
             updated = deepcopy(pair)
             for key, value in changes.items():
-                if key == "name":
+                if key in ("name", "symbol"):
                     updated[key] = value
                 elif not isinstance(value, dict) or not value:
                     raise TradingError("请提供有效的配对策略配置")
                 else:
                     updated[key] = {**updated[key], **value}
+            switching = updated["symbol"] != pair["symbol"]
+            if switching and "symbol" not in changes.get("cycle", {}):
+                updated["cycle"]["symbol"] = updated["symbol"]
             updated = validate_pair(updated)
+            if switching:
+                return self._switch_symbol(pair, updated)
             self._members(updated)
             saved = self.store.save_pair(updated)
             self._changed(saved)
             return saved
+
+    def _switch_symbol(self, pair, updated):
+        """Only a fresh, fully flat read can replace a paused symbol's journal."""
+        from .pair_execution import PairTrader, empty_progress, runtime_default
+        from .pair_planning import require_runtime_symbols
+        original = self._idle(pair, require_flat=True)
+        require_runtime_symbols(pair, original)
+        if original.get("recovery_watch") is not None:
+            raise TradingError("人工归档订单仍需按原标的跟踪，暂不能修改交易标的；请保留原配对组记录")
+        margin = self.store.get("pair_margin:" + pair["id"], {})
+        if (not isinstance(margin, dict) or margin.get("pending") is not None
+                or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
+            raise TradingError("保证金划转结果尚未核实，暂不能修改交易标的")
+        accounts = self._members(pair)
+        trader = PairTrader(self.engine)
+        _, brokers, identities = trader._members(pair, read_only=True)
+        if original.get("identities") and original["identities"] != identities:
+            raise TradingError("配对组凭据指向的真实账户发生变化，不能修改交易标的，请先核对账户身份")
+        runtime = runtime_default()
+        runtime.update(symbol=updated["symbol"], identities=identities,
+            progress=empty_progress(completed=(original.get("progress") or {}).get("completed_cycles", 0)),
+            reason=f"交易标的已从 {pair['symbol']} 切换为 {updated['symbol']}，两侧已核实空仓；配对组保持暂停，请核对设置后启动",
+            updated_at=time.time())
+        for key in ("daily_volume", "volume_unknown", "volume_unknown_until_utc"):
+            if key in original:
+                runtime[key] = deepcopy(original[key])
+        # The old durable journal remains untouched throughout all remote reads.
+        # An explicit empty journal authorizes only the new symbol's flat check.
+        _, guards = self._read_members(updated, flat=True, runtime=runtime)
+
+        def check_current():
+            # Account configuration and bindings are compared inside the writer
+            # transaction. Do not nest Store reads here: a scoped connection's
+            # nested context could commit that transaction before its writes.
+            for key, account in zip(("long", "short"), accounts):
+                with self.engine.lock:
+                    broker = self.engine.brokers.get(account["id"])
+                if broker is not brokers[key]:
+                    raise TradingError("切换标的核验期间账户连接已变化，请重新核对")
+                if isinstance(broker, LiveBroker):
+                    credentials = broker.api.credentials
+                    if any(credentials[field].lower() != identities[key][field] for field in ("user", "signer")):
+                        raise TradingError("切换标的核验期间账户身份已变化，请重新核对")
+            for _, current in guards.values():
+                current()
+
+        updated.pop("pause_reason", None)
+        with self._current_members(guards):
+            saved = self.store.switch_pair_symbol(updated, runtime, expected_pair=pair,
+                expected_runtime=original, expected_margin=margin, accounts=accounts,
+                check_current=check_current)
+        self.recovery.previews.pop(pair["id"], None)
+        self.recovery.baseline_previews.pop(pair["id"], None)
+        self._changed(saved)
+        return saved
 
     def enable(self, pair_id, enabled):
         original = self.store.pair(pair_id)

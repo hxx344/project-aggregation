@@ -78,6 +78,7 @@ test('pair requests preserve decimal strings and fixed roles without enabling th
     'margin',
     'name',
     'ordinary',
+    'symbol',
   ]);
 });
 
@@ -529,6 +530,25 @@ test('unknown orders and transfers block edits/deletion without claiming complet
   assert.match(
     pairConfigurationLock(pair({ progress: { quantities: { LONG: '0.01' } } })),
     /基线/,
+  );
+});
+
+test('ordinary baseline holdings do not lock unrelated configuration edits', () => {
+  assert.equal(
+    pairConfigurationLock(
+      pair({
+        owned: { LONG: '1', SHORT: '1' },
+        progress: {
+          baseline: { LONG: '1', SHORT: '1' },
+          quantities: { LONG: '0', SHORT: '0' },
+        },
+        snapshots: {
+          long: snapshot([position('LONG', '1')]),
+          short: snapshot([position('SHORT', '1')]),
+        },
+      }),
+    ),
+    '',
   );
 });
 
