@@ -118,6 +118,11 @@ curl() {
     [[ -f "$FIXTURE_ROOT/running-port" && "$url" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/health" ]]
   fi
 }
+ci_release_download() {
+  mkdir -p -- "$1"
+  if [[ -f "$1/$3.tar.gz" && $(sha256sum "$1/$3.tar.gz" | cut -d ' ' -f1) == "$3" ]]; then return; fi
+  curl "$2" -o "$1/$3.tar.gz"
+}
 wait_healthy() { healthy; }
 if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
   git() { echo 'Unexpected server-side git invocation' >&2; return 91; }

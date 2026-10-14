@@ -16,6 +16,8 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 
 默认从正式 Release 下载已经验证的 x64 运行包。当前 CI 不构建或发布 ARM64 包；安装器保留 Debian 12/13 与 ARM64 的通用识别能力，但不代表这些环境已通过当前发布验收，ARM64 主机不能安装仅含 x64 的新版本。Node.js 自动准备为 24.15 或更高的 24.x；Greeks 与 ASTER 分别使用 `modules/greeks/requirements.lock` 和 `modules/aster/requirements.lock` 固定版本与哈希，独立虚拟环境以各自锁文件、Python 版本和架构为键缓存。无变化且健康时，跳过应用包下载、依赖安装、构建、完整验证与服务重启。
 
+需要下载时，安装器先验证下载地址是否支持 HTTP Range；支持时按 8 MiB 分段，最多 4 路并发，不支持或返回异常分段响应时自动改用单连接。日志持续显示已下载大小、进度、速度和耗时。分段下载失败后再次运行同一命令，可复用属于同一发布包的有效片段；不支持分段的单连接重试会重新下载。此前旧安装器留下的 `.download.*` 文件不会被接续或自动删除。所有下载都在完整 SHA-256 校验通过后才进入解包和切换服务。并发能否提速取决于服务器到 GitHub 的实际带宽与连接限制。
+
 ## 服务与数据
 
 只有 `project-aggregation.service` 对外提供业务 HTTP，默认绑定 `127.0.0.1:3100`。模块由工作台管理独立 Node worker；Greeks 与 ASTER 通过 Python 标准输入输出桥运行，不另开 TCP 端口。在线更新控制服务继续使用 Unix socket。所有模块沿用工作台鉴权，进入模块页面无需再保存独立网站登录凭据。

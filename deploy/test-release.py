@@ -1,4 +1,4 @@
-"""Exercise the actual embedded downloader with local archives and a fake network."""
+"""Exercise release resolution and extraction; download protocol has its own tests."""
 import copy
 import hashlib
 import io
@@ -49,12 +49,25 @@ curl() {
     *) return 23 ;;
   esac
 }
+ci_release_download() {
+  mkdir -p -- "$1"
+  if [[ -f "$1/$3.tar.gz" && $(sha256sum "$1/$3.tar.gz" | cut -d ' ' -f1) == "$3" ]]; then return; fi
+  curl "$2" -o "$1/$3.tar.gz"
+}
 ci_release_resolve hxx344/fixture "$FIXTURE/work"
 ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
 ''', encoding='utf-8', newline='\n')
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_embedded_helpers_match_source(self):
+        helper = (ROOT / 'deploy/release-common.sh').read_text(encoding='utf-8').strip()
+        for name in ('install.sh', 'install-all.sh'):
+            installer = (ROOT / 'deploy' / name).read_text(encoding='utf-8')
+            start = installer.index('# BEGIN CI RELEASE HELPERS')
+            end = installer.index('# END CI RELEASE HELPERS', start) + len('# END CI RELEASE HELPERS')
+            self.assertEqual(installer[start:end], helper, name)
 
     def archive(self, extra=None, wrong_commit=False):
         entries = [('.release-commit', ('c' * 40 if wrong_commit else self.commit).encode()),
@@ -78,7 +91,8 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
     def run_helper(self, success=True, **environment):
         result = subprocess.run([BASH, str(self.root / 'run.sh')], env={**os.environ,
             'HELPER': (ROOT / 'deploy/release-common.sh').as_posix(), 'TEST_PYTHON': Path(sys.executable).as_posix(),
-            'FIXTURE': self.root.as_posix(), **environment}, text=True, encoding='utf-8', capture_output=True)
+            'FIXTURE': self.root.as_posix(), **environment}, cwd=self.root,
+            text=True, encoding='utf-8', capture_output=True)
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return result
 
@@ -106,6 +120,11 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
             self.manifest = original
         self.save_manifest()
         self.run_helper(False, TEST_ARCH='riscv64')
+
+    def test_privileged_python_ignores_caller_import_paths(self):
+        for name in ('json.py', 'pathlib.py', 'tarfile.py', 'hashlib.py'):
+            (self.root / name).write_text('raise RuntimeError("untrusted caller module imported")\n', encoding='utf-8')
+        self.run_helper(PYTHONPATH=self.root.as_posix(), PYTHONHOME=(self.root / 'untrusted-python').as_posix())
 
     def test_x64_only_release_installs_on_x64_and_rejects_arm_without_using_cached_archive(self):
         del self.manifest['artifacts']['linux-arm64']

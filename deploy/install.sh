@@ -60,7 +60,7 @@ ci_release_resolve() {
     printf '[CI] %s 暂无可用部署清单或下载失败；现有服务保持原样。\n' "$repository" >&2
     return 1
   fi
-  values=$(python3 - "$manifest" "$repository" "$(uname -m)" <<'CI_MANIFEST_PY'
+  values=$(python3 -I - "$manifest" "$repository" "$(uname -m)" <<'CI_MANIFEST_PY'
 import json, re, sys
 from pathlib import Path
 def require(condition, message):
@@ -97,46 +97,574 @@ CI_MANIFEST_PY
   printf '[CI] %s 最新可用部署包：%s。\n' "$repository" "${CI_RELEASE_COMMIT:0:12}"
 }
 
+ci_release_download() {
+  python3 -I - "$1" "$2" "$3" <<'CI_DOWNLOAD_PY'
+import concurrent.futures
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import ssl
+import stat
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BLOCK = 8 * 1024 * 1024
+MAX_SIZE = 2 * 1024 * 1024 * 1024
+WORKERS = 4
+ATTEMPTS = 3
+SOCKET_TIMEOUT = 20
+RANGE_DEADLINE = 180
+SINGLE_DEADLINE = 1800
+
+
+class DownloadError(Exception):
+    pass
+
+
+class Cancelled(DownloadError):
+    pass
+
+
+class RangeRejected(DownloadError):
+    pass
+
+
+class Retryable(DownloadError):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise DownloadError(message)
+
+
+def https_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    require(parsed.scheme == 'https' and parsed.hostname and
+            parsed.username is None and parsed.password is None,
+            'download and redirect URLs must use HTTPS without credentials')
+    return url
+
+
+class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+    max_repeats = 2
+
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        https_url(newurl)
+        return super().redirect_request(request, fp, code, message, headers, newurl)
+
+
+def secure_directory(path):
+    """All parents must resist replacement by another user, including on cache hits."""
+    path = Path(os.path.abspath(path))
+    uid = os.geteuid() if hasattr(os, 'geteuid') else None
+    for directory in reversed((path, *path.parents)):
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            directory.mkdir(mode=0o700)
+            info = directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not directory.is_symlink(),
+                'cache directory cannot contain links or special files')
+        if uid is not None:
+            require(info.st_uid in (0, uid), 'cache ancestor has an unexpected owner')
+            sticky_parent = directory != path and info.st_uid in (0, uid) and info.st_mode & stat.S_ISVTX
+            require(not info.st_mode & 0o022 or sticky_parent,
+                    'cache ancestor is writable by another user')
+    if uid is not None:
+        require(path.stat().st_uid == uid, 'cache directory has an unexpected owner')
+    path.chmod(0o700)
+    return path
+
+
+def secure_open(path, flags=os.O_RDONLY):
+    """Never truncate before checking the opened inode (including hard links)."""
+    try:
+        before = path.lstat()
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
+                'cache file must be a regular file with one link')
+    except FileNotFoundError:
+        before = None
+    descriptor = os.open(path, flags | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                'cache file must be a regular file with one link')
+        if hasattr(os, 'geteuid'):
+            require(info.st_uid == os.geteuid() and not info.st_mode & 0o022,
+                    'cache file has an unsafe owner or permissions')
+        if before is not None:
+            require((before.st_dev, before.st_ino) == (info.st_dev, info.st_ino), 'cache file changed while opening')
+        return os.fdopen(descriptor, 'r+b' if flags & os.O_RDWR else 'rb')
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def secure_unlink(path):
+    try:
+        with secure_open(path):
+            pass
+    except FileNotFoundError:
+        return
+    path.unlink()
+
+
+def digest_file(stream):
+    stream.seek(0)
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+class Downloader:
+    def __init__(self, cache, url, expected):
+        require(re.fullmatch(r'[a-f0-9]{64}', expected) is not None, 'invalid archive SHA256')
+        self.url, self.expected = https_url(url), expected
+        self.cache = secure_directory(cache)
+        self.archive = self.cache / (expected + '.tar.gz')
+        self.parts = self.cache / ('.' + expected + '.parts')
+        self.opener = urllib.request.build_opener(HTTPSRedirect())
+        self.cancelled = threading.Event()
+        self.phase_stop = threading.Event()
+        self.active = set()
+        self.active_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.progress_stop = threading.Event()
+        self.started = time.monotonic()
+        self.received, self.total, self.positions = 0, None, {}
+        self.mode = '检测'
+
+    def check_cancel(self):
+        if self.cancelled.is_set() or self.phase_stop.is_set():
+            raise Cancelled('download cancelled')
+
+    def progress(self):
+        with self.progress_lock:
+            current = sum(self.positions.values())
+            elapsed = max(time.monotonic() - self.started, 0.001)
+            percent = '%.1f%%' % (min(current / self.total, 1) * 100) if self.total else '?%'
+            total = '%.1f' % (self.total / 1048576) if self.total else '?'
+            print('[CI] 下载 %s: %s %.1f/%s MiB | %.2f MiB/s | %.0fs' %
+                  (self.mode, percent, current / 1048576, total,
+                   self.received / elapsed / 1048576, elapsed), file=sys.stderr, flush=True)
+
+    def set_mode(self, mode, total, positions=None):
+        with self.progress_lock:
+            self.mode, self.total = mode, total
+            self.positions = positions or {}
+        self.progress()
+
+    def monitor(self):
+        while not self.progress_stop.wait(5):
+            self.progress()
+
+    def record(self, key, position, received=0):
+        with self.progress_lock:
+            self.positions[key] = position
+            self.received += received
+
+    def _open_request(self, request):
+        # Tests override only this transport; production never accepts HTTP or a TLS bypass.
+        return self.opener.open(request, timeout=SOCKET_TIMEOUT)
+
+    def request(self, start=None, end=None):
+        self.check_cancel()
+        headers = {'Accept-Encoding': 'identity', 'User-Agent': 'project-aggregation-installer'}
+        if start is not None:
+            headers['Range'] = 'bytes=%d-%d' % (start, end)
+        try:
+            response = self._open_request(urllib.request.Request(self.url, headers=headers))
+        except urllib.error.HTTPError as error:
+            code = error.code
+            error.close()
+            if code in (408, 429) or 500 <= code <= 599:
+                raise Retryable('HTTP %s' % code) from error
+            if start is not None and code == 416:
+                raise RangeRejected('server rejected byte ranges') from error
+            raise DownloadError('download failed: HTTP %s' % code) from error
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            if isinstance(error, ssl.SSLCertVerificationError) or isinstance(getattr(error, 'reason', None), ssl.SSLCertVerificationError):
+                raise DownloadError('TLS certificate verification failed') from error
+            raise Retryable('connection failed: %s' % error) from error
+        with self.active_lock:
+            self.active.add(response)
+        try:
+            self.check_cancel()
+        except BaseException:
+            self.close_response(response)
+            raise
+        return response
+
+    def close_response(self, response):
+        try:
+            response.close()
+        finally:
+            with self.active_lock:
+                self.active.discard(response)
+
+    def stop_workers(self):
+        self.phase_stop.set()
+        with self.active_lock:
+            responses = list(self.active)
+        # Shutdown sockets before close: close alone can wait on a blocked BufferedReader.
+        for response in responses:
+            try:
+                raw = getattr(getattr(response, 'fp', None), 'raw', None)
+                connection = getattr(raw, '_sock', None)
+                if connection is not None:
+                    connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for response in responses:
+            self.close_response(response)
+
+    def pause_retry(self, attempt):
+        self.check_cancel()
+        if attempt + 1 >= ATTEMPTS:
+            return False
+        if self.phase_stop.wait(min(2 ** attempt, 4)):
+            self.check_cancel()
+        self.check_cancel()
+        return True
+
+    @staticmethod
+    def length(response):
+        value = response.headers.get('Content-Length')
+        if value is None:
+            return None
+        if not re.fullmatch(r'[0-9]+', value):
+            raise RangeRejected('invalid Content-Length')
+        return int(value)
+
+    @staticmethod
+    def identity(response):
+        if response.headers.get('Content-Encoding', 'identity').strip().lower() != 'identity':
+            raise RangeRejected('unexpected Content-Encoding')
+
+    def range_headers(self, response, start, end, total):
+        self.identity(response)
+        if response.status != 206 or response.headers.get('Content-Range') != 'bytes %d-%d/%d' % (start, end, total):
+            raise RangeRejected('server returned an inconsistent byte range')
+        if self.length(response) != end - start + 1:
+            raise RangeRejected('server returned an inconsistent range length')
+
+    def read(self, response, amount, deadline):
+        self.check_cancel()
+        if time.monotonic() >= deadline:
+            raise Retryable('request deadline exceeded')
+        try:
+            return response.read1(amount)
+        except (OSError, http.client.HTTPException) as error:
+            self.check_cancel()
+            raise Retryable('connection interrupted') from error
+
+    def probe(self):
+        for attempt in range(ATTEMPTS):
+            response = None
+            try:
+                response = self.request(0, 0)
+                content_range = re.fullmatch(r'bytes 0-0/([0-9]+)', response.headers.get('Content-Range', ''))
+                if response.status != 206 or content_range is None:
+                    return None
+                total = int(content_range[1])
+                if not 0 < total <= MAX_SIZE:
+                    raise DownloadError('archive exceeds size limit')
+                self.range_headers(response, 0, 0, total)
+                # The byte value is irrelevant; only this exact response's shape enables ranges.
+                if len(self.read(response, 2, time.monotonic() + RANGE_DEADLINE)) == 1:
+                    return total
+                raise Retryable('incomplete range probe')
+            except RangeRejected:
+                return None
+            except Retryable as error:
+                print('[CI] Range 检测失败（%d/%d）：%s' % (attempt + 1, ATTEMPTS, error), file=sys.stderr, flush=True)
+                if not self.pause_retry(attempt):
+                    raise
+            finally:
+                if response is not None:
+                    self.close_response(response)
+
+    def invalidate_parts(self):
+        # Only names created by this implementation are ever removed.
+        for index in range(MAX_SIZE // BLOCK):
+            secure_unlink(self.parts / ('part-%03d' % index))
+        for name in ('metadata.json', 'metadata.json.new', 'assembly.part', 'single.part'):
+            secure_unlink(self.parts / name)
+
+    def save_state(self):
+        path = self.parts / 'metadata.json.new'
+        with secure_open(path, os.O_RDWR | os.O_CREAT) as target:
+            target.truncate(0)
+            target.write(json.dumps(self.state, sort_keys=True).encode('utf-8'))
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(path, self.parts / 'metadata.json')
+
+    def prepare_parts(self, total):
+        identity = {'version': 1, 'url': self.url, 'sha256': self.expected, 'size': total, 'block': BLOCK}
+        saved = {}
+        try:
+            with secure_open(self.parts / 'metadata.json') as source:
+                require(os.fstat(source.fileno()).st_size <= 65536, 'oversized download metadata')
+                saved = json.load(source)
+        except (FileNotFoundError, ValueError, UnicodeError):
+            pass
+        if not isinstance(saved, dict) or any(saved.get(key) != value for key, value in identity.items()):
+            self.invalidate_parts()
+            saved = {}
+        completed = saved.get('completed', {})
+        if not isinstance(completed, dict):
+            completed = {}
+        self.state = dict(identity, completed={})
+        pending, positions = [], {}
+        for index, start in enumerate(range(0, total, BLOCK)):
+            size = min(BLOCK, total - start)
+            path = self.parts / ('part-%03d' % index)
+            with secure_open(path, os.O_RDWR | os.O_CREAT) as part:
+                length = os.fstat(part.fileno()).st_size
+                if length == size and completed.get(str(index)) == digest_file(part):
+                    self.state['completed'][str(index)] = completed[str(index)]
+                else:
+                    if length >= size:
+                        part.truncate(0)
+                        length = 0
+                    pending.append((index, start, size))
+                positions[index] = length
+        self.save_state()
+        return pending, positions
+
+    def part(self, index, start, size):
+        path = self.parts / ('part-%03d' % index)
+        for attempt in range(ATTEMPTS):
+            response = None
+            try:
+                self.check_cancel()
+                with secure_open(path, os.O_RDWR) as target:
+                    offset = os.fstat(target.fileno()).st_size
+                    response = self.request(start + offset, start + size - 1)
+                    self.range_headers(response, start + offset, start + size - 1, self.total)
+                    target.seek(offset)
+                    deadline = time.monotonic() + RANGE_DEADLINE
+                    while offset < size:
+                        data = self.read(response, min(65536, size - offset), deadline)
+                        if not data:
+                            raise Retryable('incomplete byte range')
+                        target.write(data)
+                        offset += len(data)
+                        self.record(index, offset, len(data))
+                    target.flush()
+                    os.fsync(target.fileno())
+                    digest = digest_file(target)
+                with self.state_lock:
+                    self.state['completed'][str(index)] = digest
+                    self.save_state()
+                return
+            except Retryable as error:
+                print('[CI] 分块 %d 失败（%d/%d）：%s' % (index + 1, attempt + 1, ATTEMPTS, error), file=sys.stderr, flush=True)
+                if not self.pause_retry(attempt):
+                    raise
+            finally:
+                if response is not None:
+                    self.close_response(response)
+
+    def parallel(self, total):
+        pending, positions = self.prepare_parts(total)
+        self.set_mode('并发（最多 4 路，可续传）', total, positions)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS)
+        futures = []
+        try:
+            futures = [executor.submit(self.part, *item) for item in pending]
+            waiting = set(futures)
+            while waiting:
+                self.check_cancel()
+                done, waiting = concurrent.futures.wait(waiting, timeout=0.25,
+                                                       return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+        finally:
+            self.stop_workers()
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True)
+        self.phase_stop.clear()
+        path = self.parts / 'assembly.part'
+        with secure_open(path, os.O_RDWR | os.O_CREAT) as target:
+            target.truncate(0)
+            for index in range((total + BLOCK - 1) // BLOCK):
+                self.check_cancel()
+                with secure_open(self.parts / ('part-%03d' % index)) as source:
+                    for data in iter(lambda: source.read(1024 * 1024), b''):
+                        target.write(data)
+            target.flush()
+            os.fsync(target.fileno())
+        return path
+
+    def single(self):
+        self.phase_stop.clear()
+        self.check_cancel()
+        path = self.parts / 'single.part'
+        self.set_mode('单连接', None)
+        for attempt in range(ATTEMPTS):
+            response = None
+            try:
+                response = self.request()
+                require(response.status == 200, 'unexpected single-stream response')
+                self.identity(response)
+                total = self.length(response)
+                require(total is None or 0 < total <= MAX_SIZE, 'archive exceeds size limit')
+                self.set_mode('单连接', total)
+                with secure_open(path, os.O_RDWR | os.O_CREAT) as target:
+                    target.truncate(0)
+                    count = 0
+                    deadline = time.monotonic() + SINGLE_DEADLINE
+                    while True:
+                        data = self.read(response, min(65536, MAX_SIZE + 1 - count), deadline)
+                        if not data:
+                            break
+                        count += len(data)
+                        require(count <= MAX_SIZE, 'archive exceeds size limit')
+                        target.write(data)
+                        self.record('single', count, len(data))
+                    if total is not None and count != total:
+                        raise Retryable('incomplete single-stream response')
+                    target.flush()
+                    os.fsync(target.fileno())
+                return path
+            except Retryable as error:
+                print('[CI] 单连接失败（%d/%d）：%s' % (attempt + 1, ATTEMPTS, error), file=sys.stderr, flush=True)
+                if not self.pause_retry(attempt):
+                    raise
+            finally:
+                if response is not None:
+                    self.close_response(response)
+
+    def locked_download(self):
+        try:
+            with secure_open(self.archive) as source:
+                if digest_file(source) == self.expected:
+                    print('[CI] 部署包已缓存且校验通过，跳过下载。', file=sys.stderr, flush=True)
+                    return self.archive
+            secure_unlink(self.archive)
+        except FileNotFoundError:
+            pass
+        self.parts = secure_directory(self.parts)
+        monitor = threading.Thread(target=self.monitor, daemon=True)
+        monitor.start()
+        try:
+            self.progress()
+            total = self.probe()
+            try:
+                candidate = self.parallel(total) if total is not None else self.single()
+            except RangeRejected:
+                print('[CI] 服务器分块响应不一致，已停止并发，改用单连接。', file=sys.stderr, flush=True)
+                candidate = self.single()
+            for clean_attempt in range(2):
+                with secure_open(candidate) as source:
+                    verified = digest_file(source) == self.expected
+                if verified:
+                    self.check_cancel()
+                    # The cache directory and candidate are private and the per-hash lock remains held.
+                    os.replace(candidate, self.archive)
+                    self.invalidate_parts()
+                    self.progress()
+                    return self.archive
+                self.invalidate_parts()
+                require(clean_attempt == 0, 'archive SHA256 mismatch after clean download')
+                print('[CI] 部署包 SHA256 不匹配，清理本包分块后重新单连接下载。', file=sys.stderr, flush=True)
+                candidate = self.single()
+        finally:
+            self.stop_workers()
+            self.progress_stop.set()
+            monitor.join()
+
+    def run(self):
+        handlers = {}
+
+        def interrupt(number, frame):
+            if not self.cancelled.is_set():
+                self.cancelled.set()
+                raise Cancelled('download interrupted by signal %s' % number)
+
+        try:
+            if threading.current_thread() is threading.main_thread():
+                for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+                    number = getattr(signal, name, None)
+                    if number is not None:
+                        handlers[number] = signal.signal(number, interrupt)
+            with secure_open(self.cache / ('.' + self.expected + '.lock'), os.O_RDWR | os.O_CREAT) as lock:
+                if os.name == 'posix':
+                    import fcntl
+                    while True:
+                        self.check_cancel()
+                        try:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            self.cancelled.wait(0.25)
+                return self.locked_download()
+        finally:
+            for number, handler in handlers.items():
+                signal.signal(number, handler)
+
+
+if __name__ == '__main__':
+    try:
+        Downloader(*sys.argv[1:]).run()
+    except (DownloadError, OSError, ValueError) as error:
+        print('[CI] 部署包下载失败：' + str(error), file=sys.stderr, flush=True)
+        sys.exit(1)
+CI_DOWNLOAD_PY
+}
+
 ci_release_extract() {
-  local cache=$1 destination=$2 archive temporary actual
-  [[ ! -L "$cache" && ( ! -e "$cache" || -d "$cache" ) ]] || { printf '[CI] Invalid archive cache.\n' >&2; return 1; }
-  mkdir -p -- "$cache" || return 1
-  [[ $(stat -c %u "$cache") == "$EUID" ]] || { printf '[CI] Archive cache has an unexpected owner.\n' >&2; return 1; }
+  local cache=$1 destination=$2 archive
+  ci_release_download "$cache" \
+    "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" \
+    "$CI_RELEASE_SHA256" || return 1
   archive="$cache/$CI_RELEASE_SHA256.tar.gz"
-  [[ ! -L "$archive" && ( ! -e "$archive" || -f "$archive" ) ]] || return 1
-  actual=''
-  if [[ -f "$archive" ]]; then actual=$(sha256sum "$archive" | cut -d ' ' -f1) || return 1; fi
-  if [[ "$actual" != "$CI_RELEASE_SHA256" ]]; then
-    temporary=$(mktemp "$cache/.download.XXXXXXXX") || return 1
-    if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-      --retry 3 --connect-timeout 15 --max-time 600 --max-filesize 2147483648 \
-      "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" -o "$temporary"; then
-      rm -f -- "$temporary"
-      return 1
-    fi
-    actual=$(sha256sum "$temporary" | cut -d ' ' -f1) || { rm -f -- "$temporary"; return 1; }
-    if [[ "$actual" != "$CI_RELEASE_SHA256" ]]; then
-      printf '[CI] 部署包校验失败；现有服务保持原样。\n' >&2
-      rm -f -- "$temporary"
-      return 1
-    fi
-    chmod 0644 "$temporary" || { rm -f -- "$temporary"; return 1; }
-    mv -f -- "$temporary" "$archive" || return 1
-  else
-    printf '[CI] 部署包已缓存且校验通过，跳过下载。\n'
-  fi
-  python3 - "$archive" "$destination" "$CI_RELEASE_COMMIT" "$CI_RELEASE_APPLICATION_KEY" <<'CI_EXTRACT_PY'
-import os, shutil, sys, tarfile
+  python3 -I - "$archive" "$destination" "$CI_RELEASE_COMMIT" "$CI_RELEASE_APPLICATION_KEY" "$CI_RELEASE_SHA256" <<'CI_EXTRACT_PY'
+import hashlib, os, shutil, stat, sys, tarfile
 from pathlib import Path, PurePosixPath
 def require(condition, message):
     if not condition:
         raise ValueError(message)
 try:
+    archive_path = Path(sys.argv[1])
+    before = archive_path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, 'archive must be a regular file with one link')
+    descriptor = os.open(archive_path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    source = os.fdopen(descriptor, 'rb')
+    info = os.fstat(source.fileno())
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'archive must be a regular file with one link')
+    require(not hasattr(os, 'geteuid') or info.st_uid == os.geteuid(), 'archive has an unexpected owner')
+    digest = hashlib.sha256()
+    for block in iter(lambda: source.read(1024 * 1024), b''):
+        digest.update(block)
+    if digest.hexdigest() != sys.argv[5]:
+        source.close()
+        current = archive_path.lstat()
+        if (info.st_dev, info.st_ino) == (current.st_dev, current.st_ino):
+            archive_path.unlink()
+        raise ValueError('archive SHA256 mismatch')
+    source.seek(0)
     destination = Path(sys.argv[2])
     require(not destination.is_symlink(), 'destination cannot be a symlink')
     destination.mkdir(parents=True, exist_ok=True)
     require(not any(destination.iterdir()), 'destination must be empty')
-    with tarfile.open(sys.argv[1], 'r:gz') as archive:
+    with source, tarfile.open(fileobj=source, mode='r:gz') as archive:
         members = []
         names, total = set(), 0
         for member in archive:

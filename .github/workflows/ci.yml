@@ -49,6 +49,7 @@ jobs:
       - name: Check release download, integrity, extraction and cache boundaries
         run: |
           python3 deploy/test-release.py -v
+          sudo python3 deploy/test-release-download.py -v
           python3 deploy/test-publish.py -v
           python3 deploy/test-promote.py -v
           python3 deploy/test-migration.py -v
