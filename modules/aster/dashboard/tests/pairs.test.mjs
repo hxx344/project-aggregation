@@ -7,6 +7,7 @@ import {
   pairDataFresh,
   pairDeletionBlock,
   pairDraft,
+  pairExecutionPhaseLabel,
   pairHasPending,
   pairMarginStatus,
   pairNetQuantity,
@@ -29,6 +30,32 @@ test('transfer submission is distinct from order submission and margin checks ne
   );
   assert.equal(pairPhaseLabel('margin_wait'), '保证金检查阻止新增');
   assert.equal(pairHasPending({ state: { phase: 'margin_wait' } }), false);
+});
+
+test('leverage confirmation is distinct from order reconciliation without changing pending locks', () => {
+  for (const phase of ['leverage', 'reconciling']) {
+    const fixture = pair({
+      phase,
+      pending: { id: 'leverage-one', kind: 'leverage' },
+    });
+    assert.equal(pairExecutionPhaseLabel(fixture), '杠杆设置确认中');
+    assert.equal(pairHasPending(fixture), true);
+    assert.ok(pairConfigurationLock(fixture));
+    assert.ok(pairStartRecoveryBlock(fixture));
+    assert.ok(pairDeletionBlock(fixture, 100));
+  }
+  assert.equal(
+    pairExecutionPhaseLabel(
+      pair({ phase: 'reconciling', pending: { kind: 'ordinary' } }),
+    ),
+    '订单结果核对中',
+  );
+  assert.equal(
+    pairExecutionPhaseLabel(
+      pair({ phase: 'attention', pending: { kind: 'leverage' } }),
+    ),
+    '需要处理',
+  );
 });
 
 const accounts = [

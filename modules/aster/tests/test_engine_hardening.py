@@ -210,6 +210,41 @@ class EngineHardeningTests(unittest.TestCase):
         self.assertTrue(self.f.store.get("post_fill_check:test"))
         self.assertIn("快照已过期", self.engine.state()["accounts"][0]["reason"])
 
+    def test_maintenance_finishes_post_fill_read_without_starting_new_work(self):
+        self.engine.workspace.set_maintenance(True)
+        for over_limit in (False, True):
+            with self.subTest(over_limit=over_limit):
+                self.f.store.save_account(self.f.account)
+                self.f.store.put("post_fill_check:test", True)
+                snapshot = self.f.broker.snapshot(["XAUUSD1"])
+                if over_limit:
+                    snapshot = replace(snapshot, equity=dec(0))
+                with patch.object(self.f.broker, "snapshot", return_value=snapshot) as read, \
+                     patch.object(self.f.broker, "submit", side_effect=AssertionError("maintenance must not trade")), \
+                     patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("maintenance must not change leverage")), \
+                     patch.object(self.engine, "capacities", side_effect=AssertionError("maintenance must not plan new work")):
+                    self.engine.tick_account("test")
+                read.assert_called_once()
+                self.assertIsNone(self.f.store.get("post_fill_check:test"))
+                self.assertIsNone(self.f.store.intent("test"))
+                self.assertEqual(self.f.store.account("test")["enabled"], not over_limit)
+
+    def test_maintenance_keeps_post_fill_marker_when_read_fails(self):
+        self.engine.workspace.set_maintenance(True)
+        self.f.store.put("post_fill_check:test", True)
+        with patch.object(self.f.broker, "snapshot", side_effect=TradingError("读取暂不可用")) as read, \
+             patch.object(self.f.broker, "submit", side_effect=AssertionError("maintenance must not trade")), \
+             patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("maintenance must not change leverage")):
+            self.engine.tick_account("test")
+        read.assert_called_once()
+        self.assertTrue(self.f.store.get("post_fill_check:test"))
+        self.assertIsNone(self.f.store.intent("test"))
+
+    def test_maintenance_does_not_start_reads_without_recovery_work(self):
+        self.engine.workspace.set_maintenance(True)
+        with patch.object(self.f.broker, "snapshot", side_effect=AssertionError("no recovery work")):
+            self.engine.tick_account("test")
+
     def test_state_does_not_hold_global_view_lock_during_database_reads(self):
         def read_accounts():
             acquired = threading.Event()

@@ -1578,7 +1578,8 @@ class Engine:
             account = self.store.account(account_id)
             if not account:
                 return 5
-            if self.workspace.active and not self.store.intent(account_id):
+            if (self.workspace.active and not self.store.intent(account_id)
+                    and not self.store.get("post_fill_check:" + account_id)):
                 return 5
             pending = None
             cycle_context = False
@@ -1673,6 +1674,10 @@ class Engine:
                 if self.shutdown.is_set():
                     return 5
                 if (not pending or pending["kind"] != "migration") and self.store.get("post_fill_check:" + account_id) and self.check_post_fill_occupancy(account, snapshot):
+                    return 5
+                if self.workspace.active and not pending:
+                    # Finish an existing post-fill read during maintenance,
+                    # then yield before planning or journaling any new work.
                     return 5
                 pause_reason = account.get("pause_reason") if not account["enabled"] else None
                 self.view(account_id, status="running" if account["enabled"] else "attention" if pause_reason else "paused",

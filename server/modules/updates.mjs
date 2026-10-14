@@ -19,7 +19,7 @@ export function createModuleUpdateGuard({ request = requestJson } = {}) {
       try { ({ data } = await request(moduleOrigin(id), '/__workspace/update-status', { deadline: Date.now() + (id === 'aster' ? 60_000 : 10_000) })); }
       catch { throw new UpdateError(503, `无法确认 ${names[id]} 的委托状态，请稍后重试`); }
       const detail = id === 'aster' && typeof data?.reason === 'string' && data.reason.length <= 200 ? `：${data.reason}` : '';
-      if (typeof data?.busy !== 'boolean' || data.busy) throw new UpdateError(409, `${names[id]} 尚有任务或委托需要核对，暂不能更新${detail}`);
+      if (typeof data?.busy !== 'boolean' || data.busy) throw new UpdateError(409, `${names[id]} 尚未满足安全停机条件，暂不能更新${detail}`);
     }));
     const failure = results.find(result => result.status === 'rejected');
     if (failure) throw failure.reason;

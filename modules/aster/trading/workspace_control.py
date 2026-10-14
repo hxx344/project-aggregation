@@ -1,12 +1,21 @@
 """Process-local maintenance admission and fresh, fail-closed update evidence."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack
+from copy import deepcopy
+import json
 import os
 import threading
 import time
 
 from .exchange import RequestNotSent, LiveBroker, credentials_for
-from .pair_recovery import require_archived_orders_clear
+from .margin_balance import MarginBalancer
+from .models import dec
+from .pair_planning import require_runtime_symbols
+from .pair_recovery import MAX_WATCH_BATCHES
+
+
+class UpdateEvidenceError(ValueError):
+    """A local, non-sensitive reason why restart evidence is incomplete."""
 
 
 class WorkspaceControl:
@@ -63,25 +72,135 @@ class WorkspaceControl:
         except OSError:
             return False
 
-    def _local_pending(self, accounts, pairs):
-        store = self.engine.store
-        # Inspect the complete intent inventory, including any orphaned account.
-        with store.connect() as db:
-            if db.execute("SELECT 1 FROM intents WHERE status NOT IN ('complete','aborted') LIMIT 1").fetchone():
-                return True
-        for account in accounts:
-            if store.get("post_fill_check:" + account["id"]):
-                return True
-        for pair in pairs:
-            runtime = store.get("pair_runtime:" + pair["id"], {})
-            margin = store.get("pair_margin:" + pair["id"], {})
-            if not isinstance(runtime, dict) or not isinstance(margin, dict):
-                return True
-            if runtime.get("pending") is not None:
-                return True
-            if margin.get("pending") is not None or margin.get("status") in {"submitting", "accepted", "acknowledged", "unknown"}:
-                return True
-        return False
+    def _durable_inventory(self, accounts, pairs):
+        # Read one SQLite snapshot, including records whose owner no longer
+        # appears in the configuration. Never repair or clear recovery state.
+        try:
+            with self.engine.store.read_snapshot() as reader:
+                if reader.accounts() != accounts or reader.pairs() != pairs:
+                    raise UpdateEvidenceError("读取恢复记录期间账户或配对配置发生变化，请重试")
+                with reader.connect() as db:
+                    intents = tuple(tuple(row) for row in db.execute(
+                        "SELECT id,account_id,status,data FROM intents WHERE status NOT IN ('complete','aborted') ORDER BY id"))
+                    records = tuple(tuple(row) for row in db.execute(
+                        "SELECT key,data FROM kv WHERE key GLOB 'post_fill_check:*' OR key GLOB 'pair_runtime:*' "
+                        "OR key GLOB 'pair_margin:*' OR key GLOB 'pair_deleted:*' ORDER BY key"))
+                    deleted_accounts = tuple(tuple(row) for row in db.execute(
+                        "SELECT id,data,deleted_at FROM deleted_accounts ORDER BY id"))
+            return intents, records, deleted_accounts
+        except UpdateEvidenceError:
+            raise
+        except Exception:
+            raise UpdateEvidenceError("持久化恢复记录读取失败，无法确认更新后可继续恢复") from None
+
+    def _recovery_identities(self, inventory, accounts, pairs, brokers):
+        """Validate local journal ownership, without querying historical orders."""
+        account_map = {account["id"]: account for account in accounts}
+        pair_map = {pair["id"]: pair for pair in pairs}
+        extra_credentials = {}
+        try:
+            intents, records, deleted_accounts = inventory
+            deleted_accounts = {row[0] for row in deleted_accounts}
+            deleted_pairs = {key.split(":", 1)[1] for key, raw in records if key.startswith("pair_deleted:")
+                             and isinstance(json.loads(raw), dict) and json.loads(raw).get("deleted_at")}
+            for intent_id, account_id, status, raw in intents:
+                if account_id not in account_map:
+                    raise UpdateEvidenceError("未完成批次属于已不存在的账户，无法覆盖完整挂单检查")
+                intent = json.loads(raw)
+                if not isinstance(intent, dict) or any(intent.get(key) != value for key, value in
+                        (("id", intent_id), ("account_id", account_id), ("status", status))):
+                    raise UpdateEvidenceError("未完成批次的持久化账户标识或状态不一致")
+            for record_key, raw in records:
+                kind, owner = record_key.split(":", 1)
+                state = json.loads(raw)
+                if kind == "pair_deleted":
+                    continue
+                if kind == "post_fill_check":
+                    # Normal deletion retains empty recovery keys and history.
+                    if (state is False or state in (None, {})) and (owner in account_map or owner in deleted_accounts):
+                        continue
+                    if owner not in account_map:
+                        raise UpdateEvidenceError("成交后检查属于已不存在的账户，无法覆盖完整挂单检查")
+                    # The occupancy reconciler still supports old boolean
+                    # markers; preserve them without inventing missing fields.
+                    if type(state) is bool:
+                        continue
+                    if state is not None and (not isinstance(state, dict) or not isinstance(state.get("symbol"), str)
+                            or state.get("account_id", owner) != owner):
+                        raise UpdateEvidenceError("成交后检查记录格式或账户标识无效")
+                    continue
+                if not isinstance(state, dict):
+                    raise UpdateEvidenceError("配对恢复记录格式无效，无法确认更新后可继续恢复")
+                pending, watch = state.get("pending"), state.get("recovery_watch")
+                if owner not in pair_map:
+                    if owner in deleted_pairs and pending is None and watch is None:
+                        if kind == "pair_runtime" and not any(dec(qty) for qty in
+                                list((state.get("owned") or {}).values()) +
+                                list((state.get("progress") or {}).get("quantities", {}).values())):
+                            continue
+                        if kind == "pair_margin" and state.get("status") not in {
+                                "submitting", "accepted", "acknowledged", "unknown"}:
+                            continue
+                    raise UpdateEvidenceError("恢复记录属于已不存在的配对组，无法覆盖完整挂单检查")
+                if pending is None and watch is None:
+                    if kind == "pair_margin" and state.get("status") in {"submitting", "accepted", "acknowledged", "unknown"}:
+                        raise UpdateEvidenceError("待核对划转缺少持久化请求记录")
+                    # Inactive history is not an account authorization. New
+                    # trading retains its own identity/configuration guards.
+                    continue
+                pair = pair_map[owner]
+                members = {side: account_map[pair[side + "_account_id"]] for side in ("long", "short")}
+                if (members["long"]["id"] == members["short"]["id"]
+                        or members["long"]["mode"] != members["short"]["mode"]):
+                    raise UpdateEvidenceError("配对恢复记录的账户身份无效")
+                identities, children = {}, {}
+                for side, member in members.items():
+                    identity = {"account_id": member["id"], "env_prefix": member["env_prefix"],
+                                "mode": member["mode"], "side": side.upper()}
+                    if member["mode"] == "live":
+                        child = brokers[member["id"]].api.credentials
+                        children[side] = child
+                        identity.update(user=child["user"].lower(), signer=child["signer"].lower())
+                    identities[side] = identity
+                if children and children["long"]["user"].lower() == children["short"]["user"].lower():
+                    raise UpdateEvidenceError("配对恢复记录的两个方向指向同一个真实账户")
+                if kind == "pair_runtime":
+                    require_runtime_symbols(pair, state)
+                    if "identities" in state and state["identities"] != identities:
+                        raise UpdateEvidenceError("配对恢复记录与当前账户身份不一致")
+                    if pending is not None and (not isinstance(pending, dict) or not pending.get("id")
+                            or pending.get("identities") != identities or pending.get("pair_id", owner) != owner):
+                        raise UpdateEvidenceError("未完成配对批次格式或账户身份不一致")
+                    if watch is not None:
+                        batches = watch.get("batches") if isinstance(watch, dict) else None
+                        if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
+                            raise UpdateEvidenceError("历史订单观察记录格式无效")
+                        for batch in batches:
+                            if not isinstance(batch, dict) or batch.get("identities") != identities:
+                                raise UpdateEvidenceError("历史订单观察记录与当前账户身份不一致")
+                            legs = batch.get("legs")
+                            if (not isinstance(legs, list) or len(legs) != 2
+                                    or any(not isinstance(leg, dict) for leg in legs)
+                                    or {leg.get("key") for leg in legs} != {"long", "short"}
+                                    or any(not isinstance(leg.get("order"), dict)
+                                           or not leg["order"].get("newClientOrderId") for leg in legs)):
+                                raise UpdateEvidenceError("历史订单观察明细无效")
+                elif pending is not None:
+                    if not MarginBalancer._valid_pending(pending) or not children:
+                        raise UpdateEvidenceError("待核对划转记录格式或账户身份无效")
+                    prefix = pair["margin"]["master_env_prefix"]
+                    if not prefix or prefix in {member["env_prefix"] for member in members.values()}:
+                        raise UpdateEvidenceError("待核对划转的主账户凭据配置无效")
+                    master = deepcopy(credentials_for(prefix))
+                    if (master["user"].lower() in {child["user"].lower() for child in children.values()}
+                            or pending["identity"] != MarginBalancer._fingerprint(pair, members, children, master)):
+                        raise UpdateEvidenceError("待核对划转记录与当前账户身份不一致")
+                    extra_credentials[prefix] = master
+            return extra_credentials
+        except UpdateEvidenceError:
+            raise
+        except Exception:
+            raise UpdateEvidenceError("持久化恢复记录格式、账户身份或凭据无法核实") from None
 
     def update_status(self):
         result = {"busy": True, "maintenance": self.active}
@@ -101,9 +220,7 @@ class WorkspaceControl:
                     if not lock.acquire(blocking=False):
                         return {**result, "reason": "账户执行仍在进行，请等待本轮核对完成"}
                     stack.callback(lock.release)
-                if self._local_pending(accounts, pairs):
-                    return {**result, "reason": "仍有未完成订单或待核实划转，请完成核对后再更新"}
-                states = {pair["id"]: self.engine.store.get("pair_runtime:" + pair["id"], {}) for pair in pairs}
+                inventory = self._durable_inventory(accounts, pairs)
                 live = [account for account in accounts if account["mode"] == "live"]
                 with self.engine.lock:
                     # A configured live account must also be checked after a
@@ -117,21 +234,17 @@ class WorkspaceControl:
                     broker = brokers[account["id"]]
                     if not isinstance(broker, LiveBroker):
                         raise ValueError("live broker unavailable")
-                    credentials = credentials_for(account["env_prefix"])
+                    credentials = deepcopy(credentials_for(account["env_prefix"]))
                     if credentials != broker.api.credentials:
                         raise ValueError("account identity changed")
                     with broker._snapshot_lock:
                         version = broker._snapshot_generation
                     evidence.append((account, broker, version, credentials))
-                # The oldest original-order read and every full inventory share
-                # one freshness window. A slow watch cannot renew earlier proof.
+                extra_credentials = self._recovery_identities(inventory, accounts, pairs, brokers)
+                # Restart preserves pending recovery. Admission needs quiescent
+                # workers and fresh complete open orders, not historical finality.
                 started = time.monotonic()
                 deadline = started + 30
-                def check_watch(pair):
-                    state = states[pair["id"]]
-                    if state.get("recovery_watch") is not None:
-                        require_archived_orders_clear(self.engine, pair, state=state,
-                                                      read_only=True, deadline=deadline)
                 def read(account):
                     broker = brokers[account["id"]]
                     timeout = min(8, deadline - time.monotonic())
@@ -143,31 +256,28 @@ class WorkspaceControl:
                     if not isinstance(orders, list) or orders:
                         raise ValueError("open orders unknown or nonempty")
                 with ThreadPoolExecutor(max_workers=4, thread_name_prefix="aster-update") as pool:
-                    # Watch records survive updates. Never authorize from the
-                    # display-only diagnostic cache or delete a cleared watch.
-                    try:
-                        list(pool.map(check_watch, pairs))
-                    except Exception:
-                        return {**result, "reason": "历史原订单核查未通过，可能存在成交、活动回执或读取异常；请核对后重试"}
                     list(pool.map(read, live))
                 for _, broker, _, _ in evidence:
                     stack.enter_context(broker._snapshot_lock)
                 for account, broker, version, credentials in evidence:
                     if broker._snapshot_generation != version:
                         return {**result, "reason": "核查期间账户版本发生变化，请等待新快照后重试"}
-                    if credentials_for(account["env_prefix"]) != credentials:
+                    if credentials_for(account["env_prefix"]) != credentials or broker.api.credentials != credentials:
                         return {**result, "reason": "账户凭据发生变化，请重新核对"}
                     if self.engine.brokers.get(account["id"]) is not broker:
                         return {**result, "reason": "账户执行所有权发生变化，请重新核对"}
+                if any(credentials_for(prefix) != credentials for prefix, credentials in extra_credentials.items()):
+                    return {**result, "reason": "划转主账户凭据发生变化，请重新核对"}
                 with self.lock:
                     if (not self.active or self.generation != generation or self.inflight or not self._owned()
                             or self.engine.store.accounts() != accounts or self.engine.store.pairs() != pairs
-                            or any(self.engine.store.get("pair_runtime:" + pair["id"], {}) != states[pair["id"]] for pair in pairs)
-                            or self._local_pending(accounts, pairs)):
+                            or self._durable_inventory(accounts, pairs) != inventory):
                         return {**result, "reason": "核查期间维护状态、账户配置或执行状态发生变化"}
                     if not 0 <= time.monotonic() - started <= 30:
                         return {**result, "reason": "订单核查结果已过期，请重新核对"}
                 return {"busy": False, "maintenance": True, "checkedAccounts": len(live)}
+        except UpdateEvidenceError as exc:
+            return {**result, "reason": str(exc)}
         except Exception:
             return {**result, "reason": "实盘账户委托读取失败、凭据变更或存在活动订单，暂不能更新"}
         finally:

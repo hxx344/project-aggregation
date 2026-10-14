@@ -1,7 +1,7 @@
 import {
   pairDataFresh,
+  pairExecutionPhaseLabel,
   pairHasPending,
-  pairPhaseLabel,
   pairStartRecoveryBlock,
   pairTransferStatus,
   type PairApiNotice,
@@ -24,6 +24,45 @@ export type PairNoticeHistory = {
   entries: PairNoticeEntry[];
 };
 export const PAIR_NOTICE_LIMIT = 8;
+
+function pendingIssue(
+  pending: Record<string, unknown> | null | undefined,
+): string {
+  const record = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const results = record(pending?.results);
+  const reasons =
+    pending?.kind === 'leverage'
+      ? Object.values(results ?? {}).map((value) => {
+          const result = record(value);
+          return result?.unknown || result?.rejected
+            ? result.reason
+            : undefined;
+        })
+      : [pending?.legs, pending?.repairs].flatMap((legs) =>
+          Array.isArray(legs) ? legs.map((leg) => record(leg)?.error) : [],
+        );
+  return [
+    ...new Set(
+      reasons.filter(
+        (reason): reason is string =>
+          typeof reason === 'string' && Boolean(reason.trim()),
+      ),
+    ),
+  ].join('；');
+}
+
+const acknowledgedWaitReasons = new Set([
+  '交易所已确认划转，系统继续读取两侧最新余额；刷新前不开始新开仓或新划转',
+  '交易所已确认划转，等待两侧 WebSocket 余额；最多 2 秒后改用 REST 刷新',
+  '交易所已确认划转，继续刷新两侧余额',
+  '交易所回执确认，两侧 WebSocket 余额已核对；等待下一轮账户快照',
+  '交易所回执确认，余额已刷新；等待下一轮账户快照',
+]);
+const scheduledTransferWait =
+  /^等待下一次划转只读核对(?:（本次检查时剩余约 \d+ 秒）)?；保留原请求，期间不开始新开仓或新划转$/;
 
 function apiNotice(
   current: PairApiNotice | null | undefined,
@@ -164,15 +203,39 @@ export function pairStatusNotices(
       )
         ? transfer
         : null;
+    const issue = pendingIssue(pendingOrder);
+    const submitting =
+      Boolean(pendingOrder && Object.keys(pendingOrder).length) &&
+      ['submitting', 'leverage'].includes(pair.state?.phase ?? '');
     const reason =
+      (submitting ? issue : '') ||
       (trackedTransfer ? pair.state?.margin?.reason : undefined) ||
       pair.state?.reason ||
+      issue ||
       pair.pause_reason;
     const apiReason =
       reason === pairApiNotice?.text || reason === marginApiNotice?.text;
+    // A pending intent still locks controls. Only its concrete problem belongs
+    // in notice history; normal progress remains in the live status panels.
+    const routineTransfer =
+      trackedTransfer?.status === 'acknowledged' &&
+      !['unknown', 'attention', 'error', 'blocked'].includes(
+        pair.state?.margin?.status ?? '',
+      ) &&
+      Boolean(
+        reason &&
+        (acknowledgedWaitReasons.has(reason) ||
+          scheduledTransferWait.test(reason)),
+      );
+    const showExecution =
+      typeof reason === 'string' &&
+      Boolean(reason.trim()) &&
+      !apiReason &&
+      (!submitting || Boolean(issue)) &&
+      !routineTransfer;
     const label = trackedTransfer
       ? pairTransferStatus(trackedTransfer)
-      : pairPhaseLabel(pair.state?.phase);
+      : pairExecutionPhaseLabel(pair);
     const text =
       `${label}${reason && !apiReason ? ` · ${reason}` : ''}` +
       (canCheckAtStart
@@ -180,7 +243,7 @@ export function pairStatusNotices(
           ? ' · 可重新启动；启动时重新核验账户，交易额外预留未知转出金额，原划转不重发。'
           : ' · 启动时会自动核验原单与补偿单；全部结束且账户检查通过后，保留实际平衡底仓，无需减回旧底仓。'
         : '');
-    if (trackedTransfer) {
+    if (showExecution && trackedTransfer) {
       // A retry countdown is still the same transfer and stage. Its current
       // text may change without creating another event or hiding other intents.
       notices.push({
@@ -188,7 +251,7 @@ export function pairStatusNotices(
         kind: 'execution',
         text,
       });
-    } else {
+    } else if (showExecution) {
       add('execution', text);
     }
   }

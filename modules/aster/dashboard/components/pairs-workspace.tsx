@@ -48,6 +48,7 @@ import {
   pairDataFresh,
   pairDeletionBlock,
   pairDraft,
+  pairExecutionPhaseLabel,
   pairHasPending,
   pairMarginStatus,
   pairNetQuantity,
@@ -472,7 +473,7 @@ function PairDetail({
         </div>
         <div className="cycle-live-state">
           <p className={pending ? 'amber' : ''} aria-live="polite">
-            {pairPhaseLabel(pair.state?.phase)}
+            {pairExecutionPhaseLabel(pair)}
             {reason ? ` · ${reason}` : ''}
           </p>
           <PairOrderDiagnostics pair={pair} />

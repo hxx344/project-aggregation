@@ -427,9 +427,133 @@ test('unknown order or transfer outcomes stay pending and use the available reas
     pair({ phase: 'reconciling', reason: '', pending: { id: 'demo-order' } }),
     100,
   );
-  assert.equal(withoutReason[0].text, '订单结果核对中');
+  assert.deepEqual(withoutReason, []);
   for (const phase of ['waiting', 'error', 'attention']) {
     assert.deepEqual(pairStatusNotices(pair({ phase, pending: {} }), 100), []);
+  }
+});
+
+test('routine order submission and leverage progress do not create notice history', () => {
+  for (const [phase, pending] of [
+    [
+      'submitting',
+      {
+        id: 'order-one',
+        kind: 'ordinary',
+        legs: [{ dispatch: 'sending', receipt: null }],
+      },
+    ],
+    ['leverage', { id: 'leverage-one', kind: 'leverage', results: {} }],
+  ]) {
+    const fixture = pair({ phase, reason: '系统正在提交请求', pending });
+    const history = recordPairNotices(
+      undefined,
+      pairStatusNotices(fixture, 100),
+      100,
+    );
+    assert.deepEqual(history, emptyHistory);
+    assert.equal(fixture.state.pending, pending);
+  }
+  for (const reason of [undefined, '', '   ']) {
+    assert.deepEqual(
+      pairStatusNotices(
+        pair({ phase: 'reconciling', reason, pending: { id: 'order-one' } }),
+        100,
+      ),
+      [],
+    );
+  }
+});
+
+test('concrete execution problems remain visible including errors during submission', () => {
+  for (const phase of ['unknown', 'attention', 'reconciling']) {
+    const notices = pairStatusNotices(
+      pair({
+        phase,
+        reason: '两侧实际杠杆不一致，账户查询失败',
+        pending: { id: 'leverage-one', kind: 'leverage' },
+      }),
+      100,
+    );
+    assert.equal(notices.length, 1);
+    assert.match(notices[0].text, /两侧实际杠杆不一致，账户查询失败/);
+    if (phase === 'reconciling')
+      assert.match(notices[0].text, /^杠杆设置确认中/);
+  }
+  for (const [phase, pending, reason] of [
+    [
+      'submitting',
+      {
+        id: 'order-one',
+        kind: 'ordinary',
+        legs: [{ error: '原订单查询失败' }],
+      },
+      '原订单查询失败',
+    ],
+    [
+      'leverage',
+      {
+        id: 'leverage-one',
+        kind: 'leverage',
+        results: { long: { unknown: true, reason: '杠杆请求结果未知' } },
+      },
+      '杠杆请求结果未知',
+    ],
+  ]) {
+    const notices = pairStatusNotices(
+      pair({ phase, reason: '系统正在提交请求', pending }),
+      100,
+    );
+    assert.equal(notices.length, 1);
+    assert.ok(notices[0].text.endsWith(reason));
+  }
+});
+
+test('confirmed transfer balance refresh waits stay live without entering history', () => {
+  for (const reason of [
+    '交易所已确认划转，系统继续读取两侧最新余额；刷新前不开始新开仓或新划转',
+    '交易所已确认划转，等待两侧 WebSocket 余额；最多 2 秒后改用 REST 刷新',
+    '交易所已确认划转，继续刷新两侧余额',
+    '交易所回执确认，两侧 WebSocket 余额已核对；等待下一轮账户快照',
+    '交易所回执确认，余额已刷新；等待下一轮账户快照',
+    '等待下一次划转只读核对（本次检查时剩余约 4 秒）；保留原请求，期间不开始新开仓或新划转',
+  ]) {
+    const pending = { request_id: 'transfer-one', status: 'acknowledged' };
+    const fixture = pair({
+      phase: 'margin_wait',
+      margin: { status: 'acknowledged', pending, reason },
+    });
+    assert.deepEqual(
+      recordPairNotices(undefined, pairStatusNotices(fixture, 100), 100),
+      emptyHistory,
+    );
+    assert.equal(fixture.state.margin.pending, pending);
+    fixture.state.margin.pending.status = 'unknown';
+    assert.equal(
+      pairStatusNotices(fixture, 100)[0].key,
+      'execution:margin:["transfer-one","unknown"]',
+    );
+  }
+  for (const reason of [
+    '交易所已确认划转，但两侧余额尚未完成刷新；继续只读重试，不重新划转；最近反馈：HTTP 502',
+    '保证金日志或账户读取失败，禁止新划转',
+  ]) {
+    const notices = pairStatusNotices(
+      pair({
+        phase: 'margin_wait',
+        margin: {
+          pending: { request_id: 'transfer-one', status: 'acknowledged' },
+          reason,
+        },
+      }),
+      100,
+    );
+    assert.equal(notices.length, 1);
+    assert.equal(
+      notices[0].key,
+      'execution:margin:["transfer-one","acknowledged"]',
+    );
+    assert.ok(notices[0].text.endsWith(reason));
   }
 });
 
@@ -576,7 +700,7 @@ test('API countdown updates keep one full latest message and count only real rea
   for (const [index, notices] of observations.entries()) {
     history = recordPairNotices(history, notices, 100 + index / 10);
   }
-  assert.equal(history.entries.length, 2);
+  assert.equal(history.entries.length, 1);
   const current = history.entries.find(({ kind }) => kind === 'api');
   assert.equal(current.firstSeen, 100);
   assert.equal(current.lastSeen, 101.1);
@@ -586,8 +710,8 @@ test('API countdown updates keep one full latest message and count only real rea
     observations.at(-1).find(({ kind }) => kind === 'api').text,
   );
   assert.equal(
-    history.entries.find(({ kind }) => kind === 'execution').text,
-    '订单结果核对中',
+    history.entries.some(({ kind }) => kind === 'execution'),
+    false,
   );
   history = recordPairNotices(history, [], 102);
   history = recordPairNotices(history, observations[0], 103);
@@ -681,7 +805,7 @@ test('a pending order keeps its own reason when a transfer is also present', () 
   assert.ok(!notices[0].key.startsWith('execution:margin:'));
 });
 
-test('transfer API waits remain separate from the stable transfer stage', () => {
+test('transfer API waits do not create a duplicate stage-only notice', () => {
   const text = '本地执行 API 请求权重预算不足';
   const notices = pairStatusNotices(
     pair({
@@ -694,10 +818,9 @@ test('transfer API waits remain separate from the stable transfer stage', () => 
     }),
     100,
   );
-  assert.equal(notices.length, 2);
-  assert.equal(notices[0].text, '交易所已确认 · 等待余额刷新');
-  assert.equal(notices[1].key, 'api:margin:budget');
-  assert.equal(notices[1].text, text);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].key, 'api:margin:budget');
+  assert.equal(notices[0].text, text);
 });
 
 test('continuous polling and repeated StrictMode updates count one occurrence', () => {

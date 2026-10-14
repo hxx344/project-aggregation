@@ -569,10 +569,17 @@ export const PAIR_PHASES: Record<string, string> = {
   skipped: '核对已跳过 · 结果未确认',
   margin_wait: '保证金检查阻止新增',
   submitting: '并行提交两侧市价单',
-  leverage: '共同升杠杆核对',
+  leverage: '杠杆设置确认中',
 };
 export function pairPhaseLabel(phase?: string): string {
   return phase ? (PAIR_PHASES[phase] ?? phase) : '等待状态';
+}
+
+export function pairExecutionPhaseLabel(pair: Pair): string {
+  return pair.state?.phase === 'reconciling' &&
+    pair.state.pending?.kind === 'leverage'
+    ? PAIR_PHASES.leverage
+    : pairPhaseLabel(pair.state?.phase);
 }
 
 export function pairTransferStatus(transfer: PairTransfer): string {
