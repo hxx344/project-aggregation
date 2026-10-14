@@ -94,14 +94,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Check standalone relay installation and connection configuration
+      - name: Check relay syntax and connection configuration
         run: |
           bash -n deploy/install-aster-relay.sh
           bash -n deploy/aster-capacity-relay
           bash -n deploy/test-aster-relay-systemd.sh
           sudo /usr/bin/python3 -I deploy/test-aster-relay-config.py -v
-          sudo /usr/bin/python3 -I deploy/test-aster-relay-install.py -v
+      - name: Check relay installer boundaries and incremental behavior
+        if: ${{ !cancelled() }}
+        run: sudo /usr/bin/python3 -I deploy/test-aster-relay-install.py -v
       - name: Verify real systemd installation, TLS, no-op updates and rollback
+        if: ${{ !cancelled() }}
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_RELAY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-aster-relay-systemd.sh
 
   release:

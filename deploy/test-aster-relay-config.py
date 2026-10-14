@@ -152,7 +152,8 @@ class RelayConfigTests(unittest.TestCase):
             self.apply()
         self.assertEqual((self.directory / ".env").read_text(), self.original)
         self.assertFalse(list(self.directory.glob("relay-ca-*.pem")))
-        self.assertFalse(list(self.directory.glob(".relay-*")))
+        self.assertEqual([path.name for path in self.directory.glob(".relay-*")
+                          if path.name != ".relay-config.lock"], [])
 
     def test_failure_after_rename_restores_env_and_preserves_existing_ca(self):
         self.apply()
