@@ -460,3 +460,17 @@
 **证据：** 本仓基于 `4cc7f3d` 的 2026-10-15 配对标的编辑工作区，首版 `PairManager._switch_symbol` 在事务回调中调用 `PairTrader._members`，间接读取 Store。提交前改为直接核对已捕获的 broker 与身份；[专用提交事务](modules/aster/trading/store.py) 保留持久状态比较。此为本轮新增实现中的缺陷，基线未包含该切换路径。
 
 **事件记录：** `pair-symbol-switch-scoped-transaction-20261015`。
+
+### L032：跨升级的构建复用必须覆盖实际安装入口与临时目录
+
+**适用条件：** 将正式包部署改为服务器源码构建，或在每次更新的全新 Git 归档中复用模块产物。
+
+**根因：** 只改底层安装器默认值，一键入口和更新器仍可显式选择旧模式。原安装器又将整个 `modules` 树纳入主站与模块公共构建键，临时归档不携带 `.module-cache`；模块脚本还把环境文件的绝对路径加入键，换目录后无法复用。
+
+**以后做法：** 从一键命令和网页更新器追踪固定正式提交，统一传递发布清单，不用 `main` 代替所选版本。主站页面、单个模块产物和运行时组装分别确定输入；跨升级缓存由安装器保存在工作区外，并验证全部产物文件。root 执行的脚本和运行源码从固定 Git 对象重新提取；向服务账号可写的构建目录恢复产物时使用该账号。
+
+**如何验证：** [入口检查](deploy/test-stack-ci.sh) 和 [源码安装检查](deploy/test-incremental.sh) 覆盖正式提交固定及分支变化；[模块安装检查](deploy/test-module-incremental.sh) 覆盖新临时目录、单模块重建、非入口文件损坏和失败不切服；[缓存检查](deploy/test-build-artifact-cache.py) 校验完整性与文件边界。[真实工作区检查](deploy/test-workspace.sh) 在 Linux CI 覆盖服务账号构建、组装和跨目录复用。按本次变化选取检查，不把 Windows 夹具结果作为 Linux 部署验收。
+
+**证据：** 本仓 `c506a0a` 基线及 2026-10-15 用户要求改用源码部署的工作区，`deploy/install-all.sh` 与 `server/update-service/updater.py` 仍指定 `ci`，`deploy/install.sh` 重新归档后共享模块构建键失效，`scripts/modules.mjs` 使用绝对环境文件路径。模块选择及迁移目录的原生 Node 回归验证了修正后的复用行为。
+
+**事件记录：** `source-deploy-entrypoint-cache-scope-20261015`；一次已核实的入口与缓存接入问题，后续同轮修正不重复计数。

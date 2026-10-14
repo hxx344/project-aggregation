@@ -688,7 +688,8 @@ stack_usage() {
 用法：sudo bash install-all.sh [--only hub] [--refresh] [--with-tests]
 统一安装工作台、Market Monitor、Asset Ledger、Gate CrossEx、Greeks，并保留原生交易模块。
 只部署一个工作台服务，业务模块不再单独安装、更新或监听 TCP 端口。
-默认使用 GitHub CI 在 Ubuntu 24.04 验证的 x64 部署包；当前不发布 ARM64 包，Python 需要 3.11+。
+默认锁定 GitHub 正式版本的源码，在服务器按需构建；设置 PROJECT_DEPLOY_MODE=ci 可使用预构建包。
+正式版本当前仅支持 x64，Python 需要 3.11+。
 旧独立服务会停止并禁用；配置与数据复制到工作台数据目录，原文件保留。
 新版本不健康时恢复旧服务和配置；重复执行复用未变化的依赖、产物和配置。
   --only hub    兼容原总部署入口；各内置模块不再支持独立部署。
@@ -703,7 +704,7 @@ stack_parse() {
   local only='' item
   local -A requested=()
   stack_with_tests=${PROJECT_DEPLOY_TESTS-0}
-  stack_mode=${PROJECT_DEPLOY_MODE-ci}
+  stack_mode=${PROJECT_DEPLOY_MODE-source}
   case "$stack_mode" in ci|source) ;; *) stack_fail 'PROJECT_DEPLOY_MODE 必须是 ci 或 source。'; return 1 ;; esac
   while (($#)); do
     case "$1" in
@@ -792,11 +793,11 @@ stack_cache_valid() {
 
 stack_fetch() {
   local item=$1 directory="$STACK_CACHE/$1" staged="$stack_run/$1.download" code
-  local revision=main url
+  local revision url
   local -a conditional=()
+  ci_release_resolve "hxx344/${STACK_REPOS[$item]}" "$stack_run/$item.release" || return 1
+  revision=$CI_RELEASE_COMMIT
   if [[ "$stack_mode" == ci ]]; then
-    ci_release_resolve "hxx344/${STACK_REPOS[$item]}" "$stack_run/$item.release" || return 1
-    revision=$CI_RELEASE_COMMIT
     curl --fail --silent --show-error --head --location --proto '=https' --tlsv1.2 \
       --retry 2 --connect-timeout 15 --max-time 90 \
       "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" >/dev/null || {
@@ -837,6 +838,8 @@ stack_fetch() {
   rmdir "$staged"
   if [[ "$stack_mode" == ci ]]; then
     stack_log "${STACK_NAMES[$item]}：部署包下载地址预检通过，同提交安装器已就绪；接下来按需下载部署包。"
+  else
+    stack_log "${STACK_NAMES[$item]}：正式版本 ${revision:0:12} 的安装器已就绪；接下来按需获取源码并构建。"
   fi
 }
 
@@ -855,7 +858,7 @@ stack_prefetch() {
     for ((index=offset; index<offset+3 && index<${#stack_selected[@]}; index++)); do
       cat "$stack_run/${stack_selected[index]}.download.log"
     done
-    (( result == 0 )) || { stack_fail '安装器或 CI 部署包准备失败，尚未运行任何项目安装器；等待 CI 发布成功或修复下载问题后重试。'; return 1; }
+    (( result == 0 )) || { stack_fail '正式版本或安装器准备失败，尚未运行任何项目安装器；等待正式发布成功或修复下载问题后重试。'; return 1; }
   done
 }
 
@@ -917,7 +920,7 @@ stack_run_installers() {
       *) installer_env+=(-u PROJECT_DEPLOY_TESTS) ;;
     esac
     installer_env+=("PROJECT_DEPLOY_MODE=$stack_mode")
-    if [[ "$stack_mode" == ci ]]; then installer_env+=("PROJECT_DEPLOY_MANIFEST_FILE=$stack_run/$item.release/release-manifest.json"); fi
+    installer_env+=("PROJECT_DEPLOY_MANIFEST_FILE=$stack_run/$item.release/release-manifest.json")
     setsid env "${installer_env[@]}" bash "$stack_run/$item.sh" </dev/null > "$stack_run/$item.log" 2>&1 &
     stack_child=$!
     stack_stream "$stack_child" "$stack_run/$item.log" &

@@ -12,7 +12,7 @@
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
 ```
 
-重复执行会增量升级，保留已有配置与数据。安装器使用 GitHub 已验证的 x64 正式发布包；自动准备 Node.js 24.15+ 及 Greeks、ASTER 的独立 Python 3.11+ 锁定依赖，不在服务器编译前端。当前 CI 不构建或发布 ARM64 包。
+重复执行会增量升级，保留已有配置与数据。默认拉取通过 CI 的正式版本源码，在服务器按需构建，不下载完整预构建运行包；一键入口和网页更新均锁定所选正式提交。依赖、工作台前端及各模块产物分别缓存，无变化时跳过安装、构建和重启。自动准备 Node.js 24.15+ 及 Greeks、ASTER 的独立 Python 3.11+ 锁定依赖。当前正式发布与部署验收针对 x64；预构建包保留为显式 `PROJECT_DEPLOY_MODE=ci` 备用模式。
 
 首次从独立服务升级时，会停止旧服务并复制配置、数据库与密钥到工作台数据目录，旧文件保留；启动失败会恢复旧服务。已迁移四模块的工作台会补迁移 ASTER，失败仅恢复本次涉及的旧服务；独立 Variational 继续暂停使用，数据不删除。原生交易模块继续保留。详见 [部署与迁移说明](docs/deployment.md)。
 

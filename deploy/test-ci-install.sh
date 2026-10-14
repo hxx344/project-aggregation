@@ -6,7 +6,8 @@ repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 export FIXTURE_ROOT=$fixture
-mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/runtime"
+mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/source/deploy" "$fixture/runtime"
+cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-artifact-cache.py"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
 printf '{}\n' > "$fixture/source/pnpm-lock.yaml"
 printf 'packages: []\n' > "$fixture/source/pnpm-workspace.yaml"
@@ -165,13 +166,13 @@ archives() { grep -c '/releases/download/' "$fixture/download.calls" || true; }
 
 # First migrate an existing source deployment; its configuration/data survive.
 export PROJECT_DEPLOY_MODE=source PROJECT_DEPLOY_TESTS=0
+make_package initial
 run_install
 expect_counts 1 1 0 1 1
 legacy=$(readlink "$fixture/application/current")
 cp "$fixture/environment" "$fixture/original.env"
 printf 'keep this data\n' > "$fixture/data/keep.txt"
-make_package initial
-unset PROJECT_DEPLOY_MODE
+export PROJECT_DEPLOY_MODE=ci
 run_install
 expect_counts 1 1 0 1 2
 [[ $(readlink "$fixture/application/current") != "$legacy" && $(archives) == 1 ]]

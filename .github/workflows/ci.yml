@@ -33,6 +33,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: pnpm install --frozen-lockfile
+      - name: Verify module selection and cache relocation
+        run: node --test deploy/test-module-builds.mjs
       - name: Check and build with immutable dependencies as the service account
         run: sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" bash deploy/test-workspace.sh
       - name: Keep the verified deployment package
@@ -54,6 +56,7 @@ jobs:
           python3 deploy/test-promote.py -v
           python3 deploy/test-migration.py -v
           python3 deploy/test-package-layout.py -v
+          python3 deploy/test-build-artifact-cache.py -v
       - name: Check installer syntax
         run: |
           bash -n deploy/install.sh
@@ -66,6 +69,7 @@ jobs:
           bash -n deploy/test-inputs.sh
           bash -n deploy/test-incremental.sh
           bash -n deploy/test-workspace.sh
+          bash -n deploy/test-module-incremental.sh
       - name: Verify privileged update coordinator and service bootstrap
         run: |
           sudo python3 deploy/test-updater.py -v
@@ -79,7 +83,9 @@ jobs:
       - name: Verify privileged Python dependency provenance
         run: sudo bash deploy/test-python-lock.sh
       - name: Verify incremental changes, isolated validation and recovery
-        run: sudo bash deploy/test-incremental.sh
+        run: |
+          sudo bash deploy/test-incremental.sh
+          sudo bash deploy/test-module-incremental.sh
       - name: Verify CI package migration, no-op, integrity and rollback
         run: sudo bash deploy/test-ci-install.sh
       - name: Verify failed configuration changes restore the previous port

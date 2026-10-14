@@ -84,10 +84,26 @@ capture
 mkdir -p "$source_dir/modules/aster/trading"
 echo cycle > "$source_dir/modules/aster/trading/cycle-config.json"; refresh; compare 1 1 1 1 1
 capture
-echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 1 1 1 1
+module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 0 1 0 1
+[[ ${module_build_keys[monitor]} != "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
+   ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} == "${module_before[3]}" ]]
 capture
 mkdir -p "$source_dir/deploy"
-echo helper > "$source_dir/deploy/pnpm-runtime-lock.mjs"; refresh; compare 0 0 0 1 1
+module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+echo helper > "$source_dir/deploy/pnpm-runtime-lock.mjs"; refresh; compare 0 0 0 0 1
+[[ ${module_build_keys[monitor]} == "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
+   ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} == "${module_before[3]}" ]]
+capture
+echo frontend >> "$source_dir/src/app.ts"; refresh; compare 0 1 1 1 1
+[[ ${module_build_keys[monitor]} == "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
+   ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} == "${module_before[3]}" ]]
+capture
+embedded_before=$embedded_key
+echo helper > "$source_dir/deploy/build-artifact-cache.py"; refresh; compare 0 0 0 1 1
+[[ $embedded_key != "$embedded_before" && ${module_build_keys[monitor]} != "${module_before[0]}" &&
+   ${module_build_keys[asset]} != "${module_before[1]}" && ${module_build_keys[crossex]} != "${module_before[2]}" &&
+   ${module_build_keys[aster]} != "${module_before[3]}" ]]
 commit=invalid-source
 if input_keys 2>/dev/null; then echo 'Invalid git source was silently hashed' >&2; exit 1; fi
 printf 'Git input classification passed, including tsconfig, Vite env and failed reads.\n'

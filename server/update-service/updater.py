@@ -148,7 +148,7 @@ def start_worker():
 
 
 def run_installer(script, manifest, log):
-    environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'ci', 'PROJECT_DEPLOY_TESTS': '0',
+    environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'source', 'PROJECT_DEPLOY_TESTS': '0',
                    'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest)}
     # No caller-supplied arguments, environment, cwd or shell command string.
     with log.open('xb') as output:

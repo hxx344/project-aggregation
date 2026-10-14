@@ -9,11 +9,10 @@ SERVICE=project-aggregation
 SERVICE_USER=project-aggregation
 UNIT_FILE=/etc/systemd/system/project-aggregation.service
 REPOSITORY=https://github.com/hxx344/project-aggregation.git
-BRANCH=main
 NODE_VERSION=24.15.0
 PNPM_VERSION=11.25.0
 PNPM_INTEGRITY=XN6SW08HX3Jetx+64YpC/+eEUkeJ8ZthxzHLhyHsKKruFg4BqNWvT+2ypCzb8wDv4j2zVrDUoXtNY+EfirfJVg==
-INSTALL_REVISION=5
+INSTALL_REVISION=6
 UPDATER_DIR=/usr/local/lib/project-aggregation-updater
 UPDATER_STATE_DIR=/var/lib/project-aggregation-updater
 UPDATER_RUN_DIR=/run/project-aggregation-updater
@@ -22,7 +21,7 @@ UPDATER_WORKER_SERVICE=project-aggregation-update-worker
 UPDATER_UNIT_FILE=/etc/systemd/system/project-aggregation-updater.service
 UPDATER_WORKER_UNIT_FILE=/etc/systemd/system/project-aggregation-update-worker.service
 PROJECT_DEPLOY_TESTS=${PROJECT_DEPLOY_TESTS-0}
-PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-ci}
+PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-source}
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
 RUNTIME_DEPENDENCIES=0
 activation_started=0
@@ -35,6 +34,11 @@ work_dir=
 module_migration_helper=
 GREEKS_PYTHON_PATH=
 ASTER_PYTHON_PATH=
+MODULE_BUILD_IDS=(monitor asset crossex aster)
+declare -A MODULE_BUILD_OUTPUTS=([monitor]=modules/monitor/dist [asset]=modules/asset/.next [crossex]=modules/crossex/dist [aster]=modules/aster/dashboard/dist)
+declare -A MODULE_BUILD_ENTRIES=([monitor]=client/index.html [asset]=BUILD_ID [crossex]=index.html [aster]=client/index.html)
+declare -A module_build_keys=()
+modules_prepared=0
 
 # BEGIN CI RELEASE HELPERS -- keep embedded copies identical to deploy/release-common.sh
 # Only discovery uses latest; the archive is always fetched from its immutable commit tag.
@@ -946,29 +950,34 @@ atomic_record() {
 }
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
-  local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree
+  local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree module module_tree
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
     modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json) || return
-  typecheck_tree=$(tree_hash modules scripts/modules.mjs src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
+  typecheck_tree=$(tree_hash src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
-  build_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
+  build_tree=$(tree_hash src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
   runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py) || return
-  embedded_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py) || return
+  embedded_tree=$(tree_hash modules scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py .env .env.local .env.production .env.production.local) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf 'pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger\n%s\n%s\n%s' "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
-  typecheck_key=$(printf 'typecheck-v2\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
+  typecheck_key=$(printf 'typecheck-v3\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
   test_key=$(printf 'tests-v2\n%s\n%s' "$test_tree" "$dependency_key" | hash)
   # Vite may inline build-time environment; keep those inputs out of runtime config.
-  build_key=$(printf 'build-v2\n%s\n%s\n%s' "$build_tree" "$dependency_key" "$build_environment" | hash)
-  application_key=$(printf 'application-v2\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$RUNTIME_DEPENDENCIES" | hash)
+  build_key=$(printf 'hub-build-v3\n%s\n%s\n%s' "$build_tree" "$dependency_key" "$build_environment" | hash)
+  embedded_key=$(printf 'embedded-runtime-v2\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" | hash)
+  application_key=$(printf 'application-v3\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$RUNTIME_DEPENDENCIES" | hash)
   dependencies="$APP_DIR/cache/dependencies-$dependency_key"
   built="$APP_DIR/cache/build-$build_key"
   typecheck_stamp="$APP_DIR/cache/typechecked-$typecheck_key"
   test_stamp="$APP_DIR/cache/tested-$test_key"
-  embedded_key=$(printf 'embedded-build-v1\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" | hash)
   embedded="$APP_DIR/cache/embedded-$embedded_key"
+  for module in "${MODULE_BUILD_IDS[@]}"; do
+    # Conservative within a module; changing one module never rebuilds its peers.
+    module_tree=$(tree_hash "modules/$module" scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
+    module_build_keys[$module]=$(printf 'module-artifacts-v1\n%s\n%s\n%s\n%s' "$module" "$module_tree" "$dependency_key" "$build_environment" | hash)
+  done
 }
 application_ready() {
   [[ -n "$old_release" && -f "$old_release/.install-ready" && -f "$old_release/.application-key" &&
@@ -1040,13 +1049,82 @@ prepare_workspace() {
     chown "$SERVICE_USER:$SERVICE_USER" "$modules"
   done
 }
+prepare_build_cache_helper() {
+  [[ ! -f "$work_dir/build-artifact-cache.py" ]] || return 0
+  # The helper executes as root, so never read it from the build account's tree.
+  git --git-dir="$APP_DIR/repository.git" show "$commit:deploy/build-artifact-cache.py" > "$work_dir/build-artifact-cache.py"
+  chmod 0644 "$work_dir/build-artifact-cache.py"
+}
+build_artifact_cache() {
+  python3 -I "$work_dir/build-artifact-cache.py" "$@"
+}
+artifact_cache_ready() {
+  updater_safe_path "$1" || return 1
+  [[ -d "$1" ]] || return 1
+  build_artifact_cache verify "$1" "$2"
+}
+prepare_module_builds() {
+  (( ! modules_prepared )) || return 0
+  local module key cache artifact
+  for module in "${MODULE_BUILD_IDS[@]}"; do
+    key=${module_build_keys[$module]}
+    cache="$APP_DIR/cache/module-$module-$key"
+    artifact="$work_dir/source/${MODULE_BUILD_OUTPUTS[$module]}"
+    updater_safe_path "$cache"
+    if artifact_cache_ready "$cache" "$key"; then
+      log "$module 构建输入未变化，校验并复用模块产物。"
+      # The build tree is writable by the service account. Restore there with
+      # that account too; privileged copies only target root-owned trees.
+      run_as_service /usr/bin/python3 -I "$work_dir/build-artifact-cache.py" restore "$cache" "$key" "$artifact"
+    else
+      log "$module 构建输入变化或缓存不完整，仅构建该模块。"
+      (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules "$module")
+      [[ -s "$artifact/${MODULE_BUILD_ENTRIES[$module]}" ]] || fail "$module 构建缺少必要入口。"
+      build_artifact_cache store "$artifact" "$cache" "$key"
+      chown -R root:root "$cache"
+      chmod -R a+rX,go-w "$cache"
+    fi
+  done
+  modules_prepared=1
+}
+prepare_embedded_runtime() {
+  prepare_module_builds
+  # Re-extract executable sources and packaging helpers from the pinned Git
+  # object. Only the declared, fully verified build outputs come from caches.
+  mkdir "$work_dir/trusted-runtime"
+  git --git-dir="$APP_DIR/repository.git" archive "$commit" server modules package.json pnpm-lock.yaml pnpm-workspace.yaml deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py | tar -x -C "$work_dir/trusted-runtime"
+  build_artifact_cache restore "$built" "$build_key" "$work_dir/trusted-runtime/dist"
+  local module key
+  for module in "${MODULE_BUILD_IDS[@]}"; do
+    key=${module_build_keys[$module]}
+    build_artifact_cache restore "$APP_DIR/cache/module-$module-$key" "$key" "$work_dir/trusted-runtime/${MODULE_BUILD_OUTPUTS[$module]}"
+  done
+  python3 -I "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --dependency-root "$dependencies" --node "$NODE_BIN" --stage-only "$work_dir/embedded-runtime"
+  mkdir "$work_dir/embedded-cache"
+  mv "$work_dir/embedded-runtime/modules" "$work_dir/embedded-runtime/node_modules" "$work_dir/embedded-runtime/deploy" "$work_dir/embedded-cache/"
+  chown -R root:root "$work_dir/embedded-cache"
+  chmod -R a+rX,go-w "$work_dir/embedded-cache"
+  atomic_record "$work_dir/embedded-cache/.complete" "$embedded_key"
+  mv -- "$work_dir/embedded-cache" "$embedded"
+}
 prepare_application() {
-  local reuse=0 need_build=1
+  local reuse=0 need_build=0 need_embedded=0 has_modules=0
   if application_ready; then reuse=1; fi
-  if (( reuse )) || [[ -f "$built/.complete" && -s "$built/dist/index.html" ]]; then need_build=0; fi
-  if [[ ! -f "$typecheck_stamp" || ( "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" ) ]] || (( need_build )); then prepare_workspace; fi
-  if [[ "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" && -d "$work_dir/source/modules" ]]; then
-    (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
+  prepare_build_cache_helper
+  if git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:modules" 2>/dev/null; then has_modules=1; fi
+  if (( ! reuse )); then
+    if ! artifact_cache_ready "$built" "$build_key"; then need_build=1; fi
+    if (( has_modules )); then
+      updater_safe_path "$embedded"
+      if [[ ! -f "$embedded/.complete" || "$(cat "$embedded/.complete")" != "$embedded_key" || ! -d "$embedded/modules" ]]; then
+        [[ ! -e "$embedded" ]] || fail '内置模块运行缓存不完整，请检查后重试。'
+        need_embedded=1
+      fi
+    fi
+  fi
+  if [[ ! -f "$typecheck_stamp" || ( "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" ) ]] || (( need_build || need_embedded )); then prepare_workspace; fi
+  if [[ "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" ]] && (( has_modules )); then
+    prepare_module_builds
     prepare_source_greeks_runtime
     prepare_source_aster_runtime
   fi
@@ -1063,47 +1141,15 @@ prepare_application() {
     atomic_record "$test_stamp" "$test_key"
   else log '行为测试输入未变化，复用验证结果。'; fi
   if (( need_build )); then
-    log '前端内容或运行环境变化，构建页面。'
+    log '工作台前端内容或运行环境变化，仅构建工作台页面。'
     (cd "$work_dir/source" && run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
     [[ -s "$work_dir/source/dist/index.html" ]] || fail '构建缺少 dist/index.html。'
-    [[ ! -e "$built" ]] || fail '构建缓存目录不完整，请检查后重试。'
-    mkdir "$work_dir/build"
-    cp -a "$work_dir/source/dist" "$work_dir/build/dist"
-    if [[ -d "$work_dir/source/modules" ]]; then
-      if [[ -f "$embedded/.complete" && -d "$embedded/modules" ]]; then
-        log '内置模块源码与依赖未变化，复用模块产物并跳过模块安装、构建。'
-      else
-        [[ ! -e "$embedded" ]] || fail '内置模块构建缓存不完整，请检查后重试。'
-        (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
-        # Build output belongs to the unprivileged account. Freeze it, then
-        # restore all executable runtime/helper source from the pinned git tree.
-        # In particular, never execute its writable packaging script as root.
-        chown -R root:root "$work_dir/source"
-        chmod -R go-w "$work_dir/source"
-        mkdir "$work_dir/trusted-runtime"
-        git --git-dir="$APP_DIR/repository.git" archive "$commit" server modules package.json pnpm-lock.yaml pnpm-workspace.yaml deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py | tar -x -C "$work_dir/trusted-runtime"
-        cp -a "$work_dir/source/dist" "$work_dir/trusted-runtime/dist"
-        local module artifact
-        for module in monitor asset crossex; do
-          for artifact in dist .next; do
-            if [[ -d "$work_dir/source/modules/$module/$artifact" ]]; then
-              cp -a "$work_dir/source/modules/$module/$artifact" "$work_dir/trusted-runtime/modules/$module/$artifact"
-            fi
-          done
-        done
-        cp -a "$work_dir/source/modules/aster/dashboard/dist" "$work_dir/trusted-runtime/modules/aster/dashboard/dist"
-        python3 "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --dependency-root "$dependencies" --node "$NODE_BIN" --stage-only "$work_dir/embedded-runtime"
-        chown -R root:root "$work_dir/embedded-runtime"
-        chmod -R a+rX,go-w "$work_dir/embedded-runtime"
-        atomic_record "$work_dir/embedded-runtime/.complete" "$embedded_key"
-        mv -- "$work_dir/embedded-runtime" "$embedded"
-      fi
-      cp -a "$embedded/modules" "$embedded/node_modules" "$embedded/deploy" "$work_dir/build/"
-    fi
-    chown -R root:root "$work_dir/build"
-    atomic_record "$work_dir/build/.complete" "$build_key"
-    mv -- "$work_dir/build" "$built"
-  else log '前端内容未变化，复用页面产物。'; fi
+    build_artifact_cache store "$work_dir/source/dist" "$built" "$build_key"
+    chown -R root:root "$built"
+    chmod -R a+rX,go-w "$built"
+  else log '工作台前端未变化，复用页面产物。'; fi
+  if (( need_embedded )); then prepare_embedded_runtime
+  elif (( has_modules )); then log '内置模块运行内容未变化，复用组装结果。'; fi
   if (( reuse )); then
     release=$old_release
     log '运行代码未变化，复用当前版本；未创建发布目录。'
@@ -1123,9 +1169,9 @@ prepare_application() {
   mkdir "$work_dir/publish"
   # Re-extract runtime source as root; tests/builds cannot modify published code.
   git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$work_dir/publish"
-  cp -a "$built/dist" "$work_dir/publish/dist"
-  if [[ -d "$built/modules" ]]; then
-    cp -a "$built/modules" "$built/node_modules" "$built/deploy" "$work_dir/publish/"
+  build_artifact_cache restore "$built" "$build_key" "$work_dir/publish/dist"
+  if (( has_modules )); then
+    cp -a "$embedded/modules" "$embedded/node_modules" "$embedded/deploy" "$work_dir/publish/"
   fi
   if (( RUNTIME_DEPENDENCIES )); then
     prepare_dependencies
@@ -1610,15 +1656,11 @@ main() {
   if [[ -f "$APP_DIR/.aster-python-path" ]]; then ASTER_PYTHON_PATH=$(cat "$APP_DIR/.aster-python-path"); fi
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
-  if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
-    ci_release_resolve hxx344/project-aggregation "$work_dir"
-    commit=$CI_RELEASE_COMMIT
-    [[ "$CI_RELEASE_NODE_VERSION" == "$NODE_VERSION" ]] || fail '部署包的 Node.js 版本与安装器不匹配，请获取最新版安装器。'
-  else
-  log '检查远端版本。'
-  commit=$(git ls-remote --exit-code "$REPOSITORY" "refs/heads/$BRANCH" | cut -f 1)
-  [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail '无法确定远端 main 的提交。'
-  fi
+  # Both deployment modes consume exactly the selected stable release. The
+  # coordinator passes a pinned manifest; direct installs discover stable once.
+  ci_release_resolve hxx344/project-aggregation "$work_dir"
+  commit=$CI_RELEASE_COMMIT
+  [[ "$CI_RELEASE_NODE_VERSION" == "$NODE_VERSION" ]] || fail '正式版本的 Node.js 基线与安装器不匹配，请获取最新版安装器。'
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
   if [[ ( "$PROJECT_DEPLOY_MODE" == ci || "$PROJECT_DEPLOY_TESTS" == 0 ) && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
@@ -1635,6 +1677,8 @@ main() {
     validate_embedded_runtime "$release"
     run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
   else
+  log "准备正式版本 ${commit:0:12} 的源码；不下载预构建运行包。"
+  updater_safe_path "$APP_DIR/repository.git"
   if [[ ! -d "$APP_DIR/repository.git" ]]; then git init --bare -q "$APP_DIR/repository.git"; fi
   if ! git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit^{commit}" 2>/dev/null; then
     git --git-dir="$APP_DIR/repository.git" fetch --quiet --depth=1 "$REPOSITORY" "$commit"

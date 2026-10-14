@@ -7,7 +7,8 @@ repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 export FIXTURE_ROOT=$fixture
-mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/runtime"
+mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/source/deploy" "$fixture/runtime"
+cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-artifact-cache.py"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
 printf '{}\n' > "$fixture/source/pnpm-lock.yaml"
 printf 'packages: []\n' > "$fixture/source/pnpm-workspace.yaml"
@@ -20,7 +21,11 @@ printf 'v24.15.0\n' > "$fixture/node-version"
 git -C "$fixture/source" init -q -b main
 git -C "$fixture/source" config user.name fixture
 git -C "$fixture/source" config user.email fixture@example.invalid
-commit_source() { git -C "$fixture/source" add .; git -C "$fixture/source" commit -qm "$1"; }
+commit_source() {
+  git -C "$fixture/source" add .
+  git -C "$fixture/source" commit -qm "$1"
+  git -C "$fixture/source" rev-parse HEAD > "$fixture/stable-commit"
+}
 commit_source initial
 service=$(sed -n 's/^SERVICE=//p' "$repository/deploy/install.sh")
 sed -e "s|/opt/$service|$fixture/application|g" \
@@ -44,6 +49,9 @@ case "$1 ${2:-}" in
     echo install >> "$FIXTURE_ROOT/pnpm.calls"
     mkdir -p node_modules/.bin node_modules/example
     printf 'immutable package\n' > node_modules/example/index.js
+    for importer in modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
+      if [[ -f "$importer/package.json" ]]; then mkdir -p "$importer/node_modules"; fi
+    done
     ;;
   'run check')
     echo check >> "$FIXTURE_ROOT/pnpm.calls"
@@ -60,6 +68,22 @@ case "$1 ${2:-}" in
     printf 'workspace only\n' > node_modules/.vite-temp/build.mjs
     [[ ! -f "$FIXTURE_ROOT/fail-build" ]] || exit 43
     printf '<html>built</html>\n' > dist/index.html
+    ;;
+  'run build:modules')
+    module=${3:?Expected one module id}
+    printf '%s\n' "$module" >> "$FIXTURE_ROOT/module.calls"
+    printf '%s\n' "$PWD" >> "$FIXTURE_ROOT/module-workspaces"
+    [[ ! -f "$FIXTURE_ROOT/fail-module-$module" ]] || exit 44
+    case "$module" in
+      monitor) artifact=modules/monitor/dist; entry=client/index.html ;;
+      asset) artifact=modules/asset/.next; entry=BUILD_ID ;;
+      crossex) artifact=modules/crossex/dist; entry=index.html ;;
+      aster) artifact=modules/aster/dashboard/dist; entry=client/index.html ;;
+      *) exit 45 ;;
+    esac
+    mkdir -p "$artifact/$(dirname "$entry")" "$artifact/assets"
+    printf '%s entry\n' "$module" > "$artifact/$entry"
+    printf '%s chunk\n' "$module" > "$artifact/assets/chunk.js"
     ;;
   *) printf 'Unexpected pnpm call: %s\n' "$*" >&2; exit 1 ;;
 esac
@@ -112,6 +136,22 @@ migrate_embedded_modules() { :; }
 ensure_node() { NODE_BIN="$FIXTURE_ROOT/runtime/node"; }
 ensure_pnpm() { [[ "$PROJECT_DEPLOY_MODE" == source ]] || { echo "Unexpected pnpm preparation" >&2; return 92; }; PNPM_BIN="$FIXTURE_ROOT/runtime/pnpm"; }
 run_as_service() { "$@"; }
+ci_release_resolve() {
+  [[ ! -f "$FIXTURE_ROOT/fail-release" ]] || return 70
+  CI_RELEASE_COMMIT=$(cat "$FIXTURE_ROOT/stable-commit")
+  CI_RELEASE_NODE_VERSION=$NODE_VERSION
+  printf '%s\n' "$CI_RELEASE_COMMIT" > "$FIXTURE_ROOT/selected-commit"
+  if [[ -f "$FIXTURE_ROOT/advance-main-on-resolve" ]]; then
+    printf 'main moved after release selection\n' >> "$FIXTURE_ROOT/source/src/app.ts"
+    command git -C "$FIXTURE_ROOT/source" add src/app.ts
+    command git -C "$FIXTURE_ROOT/source" commit -qm moving-main
+    rm "$FIXTURE_ROOT/advance-main-on-resolve"
+  fi
+}
+git() {
+  [[ "$1" != ls-remote ]] || { echo 'Source deployment must not resolve a branch' >&2; return 91; }
+  command git "$@"
+}
 systemctl() {
   printf '%s\n' "$*" >> "$FIXTURE_ROOT/systemctl.calls"
   case "$1" in
@@ -136,13 +176,33 @@ expect_counts() {
     cat "$fixture/pnpm.calls" "$fixture/systemctl.calls" >&2; return 1;
   }
 }
+# The module fixture reuses this isolated installer harness, then adds its own sources and assertions.
+if [[ ${INCREMENTAL_SETUP_ONLY:-0} == 1 ]]; then return 0; fi
+
 # Default deployment builds and starts without running tests or inventing a
 # successful test stamp. Explicit validation of the same commit must still run.
 unset PROJECT_DEPLOY_TESTS
+stable=$(cat "$fixture/stable-commit")
+printf 'unpublished frontend\n' >> "$fixture/source/src/app.ts"
+git -C "$fixture/source" add src/app.ts
+git -C "$fixture/source" commit -qm unpublished-main
+touch "$fixture/advance-main-on-resolve"
 run_install
 expect_counts 1 1 0 1 1
 [[ -z $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' -print -quit) ]]
 initial=$(readlink "$fixture/application/current")
+[[ $(cat "$initial/.source-sha") == "$stable" && $(cat "$fixture/selected-commit") == "$stable" ]]
+[[ $(git -C "$fixture/source" rev-parse HEAD) != "$stable" ]]
+# Keep the later incremental scenarios on the original source tree without publishing the branch-only commits.
+git -C "$fixture/source" restore --source="$stable" src/app.ts
+git -C "$fixture/source" commit -qam restore-unpublished-frontend
+touch "$fixture/fail-release"
+cp "$fixture/application/.deployed-state" "$fixture/success-state"
+if run_install; then echo 'Missing stable release fell back to main' >&2; exit 1; fi
+expect_counts 1 1 0 1 1
+[[ $(readlink "$fixture/application/current") == "$initial" ]]
+cmp "$fixture/success-state" "$fixture/application/.deployed-state"
+rm "$fixture/fail-release"
 run_install
 expect_counts 1 1 0 1 1
 if PROJECT_DEPLOY_TESTS=invalid run_install; then echo 'Invalid test mode accepted' >&2; exit 1; fi

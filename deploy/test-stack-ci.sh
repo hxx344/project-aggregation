@@ -16,15 +16,17 @@ new_run() {
   stack_run=$(mktemp -d "$STACK_LOGS/run.XXXXXXXX")
   stack_workers=() stack_status=() stack_seconds=()
   stack_active='' stack_child='' stack_viewer=''
+  printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$fixture/latest"
+  printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$fixture/main"
 }
 ci_release_resolve() {
   [[ ! -f "$fixture/no-manifest-${1##*/}" ]] || return 1
   CI_RELEASE_REPOSITORY=$1
-  CI_RELEASE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-  CI_RELEASE_TAG=deploy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  CI_RELEASE_COMMIT=$(cat "$fixture/latest")
+  CI_RELEASE_TAG=deploy-$CI_RELEASE_COMMIT
   CI_RELEASE_FILE=fixture.tar.gz
   mkdir -p "$2"
-  printf '%s\n' "$1" > "$2/release-manifest.json"
+  printf '%s %s\n' "$1" "$CI_RELEASE_COMMIT" > "$2/release-manifest.json"
   printf '%s\n' "$1" >> "$fixture/manifests"
 }
 curl() {
@@ -39,6 +41,10 @@ curl() {
       https://*) url=$argument ;;
     esac
   done
+  printf '%s\n' "$url" >> "$fixture/requests"
+  # The mutable release and branch advance after resolution, before any installer runs.
+  printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb > "$fixture/latest"
+  printf '%s\n' cccccccccccccccccccccccccccccccccccccccc > "$fixture/main"
   if (( head )); then
     printf '%s\n' "$url" >> "$fixture/heads"
     [[ "$url" == */releases/download/deploy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/fixture.tar.gz ]]
@@ -52,30 +58,60 @@ curl() {
   cat > "$output" <<SCRIPT
 #!/usr/bin/env bash
 set -Eeuo pipefail
-[[ \$PROJECT_DEPLOY_MODE == ci && \$# == 0 ]]
-[[ -f \$PROJECT_DEPLOY_MANIFEST_FILE && \$(cat "\$PROJECT_DEPLOY_MANIFEST_FILE") == 'hxx344/${STACK_REPOS[$item]}' ]]
+[[ \$PROJECT_DEPLOY_MODE == '$stack_mode' && \$# == 0 ]]
+[[ -f \$PROJECT_DEPLOY_MANIFEST_FILE && \$(cat "\$PROJECT_DEPLOY_MANIFEST_FILE") == 'hxx344/${STACK_REPOS[$item]} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ]]
 printf '%s\\n' '$item' >> "\$STACK_CI_FIXTURE/executed"
 SCRIPT
   printf '"fixture"\n' > "$etag"
   printf 200
 }
 stack_parse
-[[ "$stack_mode" == ci ]]
+[[ "$stack_mode" == source ]]
 if PROJECT_DEPLOY_MODE=invalid stack_parse; then echo 'Invalid mode accepted' >&2; exit 1; fi
 stack_parse --only hub
 dpkg-query() { printf '%s\n' "${@: -1}" >> "$fixture/packages"; printf 'install ok installed'; }
 apt-get() { echo 'Unexpected package reinstall' >&2; return 90; }
 stack_ensure_tools
 grep -qx python3 "$fixture/packages"
-if grep -qx git "$fixture/packages"; then echo 'CI mode requested git' >&2; exit 1; fi
+grep -qx git "$fixture/packages"
 
+# Source mode must fail before fetching main or running any installer when the release is unavailable.
 new_run
 touch "$fixture/no-manifest-project-aggregation"
+: > "$fixture/requests"
 set +e
 (set -e; stack_prefetch; stack_run_installers)
 status=$?
 set -e
-[[ "$status" != 0 && ! -e "$fixture/executed" ]]
+[[ "$status" != 0 && ! -e "$fixture/executed" && ! -s "$fixture/requests" ]]
+rm "$fixture/no-manifest-project-aggregation"
+
+# Source deployment needs the verified manifest, but never requests the large package URL.
+new_run
+touch "$fixture/missing-asset"
+stack_prefetch
+[[ ! -e "$fixture/heads" && $(cat "$fixture/latest") == bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ]]
+[[ $(cat "$fixture/main") == cccccccccccccccccccccccccccccccccccccccc ]]
+PROJECT_DEPLOY_MANIFEST_FILE="$fixture/untrusted-inherited-manifest" stack_run_installers
+printf 'hub\n' > "$fixture/expected"
+cmp "$fixture/expected" "$fixture/executed"
+rm "$fixture/executed" "$fixture/missing-asset"
+
+# Explicit CI mode retains package availability checks and excludes Git from system dependencies.
+PROJECT_DEPLOY_MODE=ci stack_parse --only hub
+[[ "$stack_mode" == ci ]]
+: > "$fixture/packages"
+stack_ensure_tools
+grep -qx python3 "$fixture/packages"
+if grep -qx git "$fixture/packages"; then echo 'CI mode requested git' >&2; exit 1; fi
+new_run
+touch "$fixture/no-manifest-project-aggregation"
+: > "$fixture/requests"
+set +e
+(set -e; stack_prefetch; stack_run_installers)
+status=$?
+set -e
+[[ "$status" != 0 && ! -e "$fixture/executed" && ! -s "$fixture/requests" ]]
 rm "$fixture/no-manifest-project-aggregation"
 
 new_run
@@ -91,6 +127,5 @@ new_run
 stack_prefetch
 [[ $(wc -l < "$fixture/manifests") -ge 2 && $(wc -l < "$fixture/heads") -ge 2 ]]
 stack_run_installers
-printf 'hub\n' > "$fixture/expected"
 cmp "$fixture/expected" "$fixture/executed"
-printf 'CI stack preflight, failure isolation, runtime dependencies and mode propagation passed.\n'
+printf 'Source/CI release pinning, failure isolation, package preflight and mode propagation passed.\n'

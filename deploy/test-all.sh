@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Contract tests for orchestration; no real network, package install or service changes.
 set -Eeuo pipefail
-export PROJECT_DEPLOY_MODE=source
+unset PROJECT_DEPLOY_MODE
 AGG_STACK_SOURCE_ONLY=1 source "$(dirname "$0")/install-all.sh"
 test_parent=$(realpath "${TMPDIR:-/tmp}")
 test_root=$(mktemp -d "$test_parent/project-stack-test.XXXXXXXX")
@@ -39,6 +39,8 @@ for item in "${STACK_ORDER[@]}"; do
 set -Eeuo pipefail
 # Every module receives EOF, no strategy switch, and no legacy token-input flag.
 [[ ! -t 0 && \$# == 0 && ! -v VARIATIONAL_SESSION_STDIN ]]
+[[ \$PROJECT_DEPLOY_MODE == source && -f \$PROJECT_DEPLOY_MANIFEST_FILE ]]
+[[ \$(cat "\$PROJECT_DEPLOY_MANIFEST_FILE") == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]
 if read -r -t 1 unexpected_input; then exit 24; else [[ \$? == 1 ]]; fi
 printf '%s\\n' '$item' >> "\$STACK_TEST_ROOT/executed"
 printf '%s=%s\\n' '$item' "\${PROJECT_DEPLOY_TESTS-unset}" >> "\$STACK_TEST_ROOT/test-modes"
@@ -46,6 +48,13 @@ printf 'Checked $item configuration and health; unchanged inputs are skipped.\\n
 if [[ -f "\$STACK_TEST_ROOT/fail-$item" ]]; then exit 23; fi
 EOF
 done
+
+# Resolve a fixed formal release before fetching any installer, including source mode.
+ci_release_resolve() {
+  CI_RELEASE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  mkdir -p "$2"
+  printf '%s\n' "$CI_RELEASE_COMMIT" > "$2/release-manifest.json"
+}
 
 # Mock only curl's boundary, preserving real cached files, hash checks and bash -n.
 curl() {
@@ -61,8 +70,9 @@ curl() {
     esac
   done
   for item in "${STACK_ORDER[@]}"; do
-    if [[ "$url" == "https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$item]}/main/${STACK_PATHS[$item]}" ]]; then break; fi
+    if [[ "$url" == "https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$item]}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/${STACK_PATHS[$item]}" ]]; then break; fi
   done
+  [[ "$url" == "https://raw.githubusercontent.com/hxx344/${STACK_REPOS[$item]}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/${STACK_PATHS[$item]}" ]] || return 23
   printf '%s\t%s\n' "$item" "$compare" >> "$test_root/downloads"
   if [[ -f "$test_root/network-$item" ]]; then
     printf 'partial download' > "$output"
@@ -86,7 +96,7 @@ if [[ $(uname -s) != Linux ]]; then
 fi
 
 stack_parse
-[[ ${stack_selected[*]} == hub && $stack_with_tests == 0 ]]
+[[ ${stack_selected[*]} == hub && $stack_with_tests == 0 && $stack_mode == source ]]
 PROJECT_DEPLOY_TESTS=1 stack_parse
 [[ $stack_with_tests == 1 ]]
 PROJECT_DEPLOY_TESTS=0 stack_parse --with-tests

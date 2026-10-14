@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const action = process.argv[2];
 if (!['install', 'build'].includes(action)) throw new Error('Usage: node scripts/modules.mjs install|build');
+const selected = process.argv.slice(3);
 const pnpm = process.env.npm_execpath;
 if (!pnpm || !existsSync(pnpm) || !process.env.npm_config_user_agent?.startsWith('pnpm/')) {
   throw new Error('Run through pnpm run install:modules or pnpm run build:modules');
@@ -17,6 +18,9 @@ const builds = [
   { id: 'crossex', importer: 'modules/crossex', artifact: 'dist/index.html' },
   { id: 'aster', importer: 'modules/aster/dashboard', artifact: 'dist/client/index.html' },
 ];
+if (selected.some(id => !builds.some(build => build.id === id)) || new Set(selected).size !== selected.length || (action === 'install' && selected.length)) {
+  throw new Error('Select each build module at most once: monitor, asset, crossex, aster');
+}
 const manifests = ['package.json', ...builds.map(({ importer }) => `${importer}/package.json`)];
 const sharedInputs = [...manifests, 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'scripts/modules.mjs'];
 const environment = JSON.stringify({
@@ -34,7 +38,7 @@ function digest(directory, buildDirectory) {
   // Environment files are build inputs, but their contents never enter logs/stamps.
   for (const base of new Set([root, directory, buildDirectory])) for (const name of ['.env', '.env.local', '.env.production', '.env.production.local']) {
     const file = path.join(base, name);
-    hash.update(file).update(existsSync(file) ? readFileSync(file) : '<absent>');
+    hash.update(path.relative(root, file).replaceAll('\\', '/')).update(existsSync(file) ? readFileSync(file) : '<absent>');
   }
   function visit(relative) {
     const file = path.join(directory, relative);
@@ -61,8 +65,10 @@ if (action === 'install') {
   await run(root, ['install', '--frozen-lockfile']);
   process.exit(0);
 }
-for (const { id, importer, artifact: output } of builds) {
+for (const { id, importer, artifact: output } of builds.filter(build => !selected.length || selected.includes(build.id))) {
   const directory = path.join(root, 'modules', id), buildDirectory = path.join(root, importer), cache = path.join(directory, '.module-cache');
+  // Prepare deterministic build inputs before computing the cache key.
+  if (id === 'asset') await run(buildDirectory, ['run', 'prepare']);
   mkdirSync(cache, { recursive: true });
   const key = digest(directory, buildDirectory);
   const stamp = path.join(cache, `${action}.json`);
@@ -74,7 +80,6 @@ for (const { id, importer, artifact: output } of builds) {
     console.log(`[modules] ${id}: ${action} unchanged; skipped`); continue;
   }
   console.log(`[modules] ${id}: ${action}`);
-  if (id === 'asset') await run(buildDirectory, ['run', 'prepare']);
   await run(buildDirectory, ['run', 'build']);
   if (!existsSync(artifact)) throw new Error(`${id} did not produce ${artifact}`);
   // Recalculate because a preparation step may create a required source input.

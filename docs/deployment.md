@@ -12,11 +12,21 @@ Aster 的公共额度中继可以单独运行在另一台服务器，使用本�
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
 ```
 
-同一命令可重复执行。兼容入口 `deploy/install-all.sh` 只协调工作台安装器 `deploy/install.sh`，在线更新也只有 `hub` 一个目标。`--only hub` 继续可用，内置模块不支持独立安装或更新；旧的其他 `--only` 选项会明确拒绝。`--refresh` 只重新获取安装器，`--with-tests` 仅用于显式 `PROJECT_DEPLOY_MODE=source` 的排查部署。
+同一命令可重复执行。兼容入口 `deploy/install-all.sh` 只协调工作台安装器 `deploy/install.sh`，在线更新也只有 `hub` 一个目标。`--only hub` 继续可用，内置模块不支持独立安装或更新；旧的其他 `--only` 选项会明确拒绝。`--refresh` 只重新获取安装器，`--with-tests` 在源码部署时额外运行行为测试；正式版本发布前已由 CI 验证。
 
-默认从正式 Release 下载已经验证的 x64 运行包。当前 CI 不构建或发布 ARM64 包；安装器保留 Debian 12/13 与 ARM64 的通用识别能力，但不代表这些环境已通过当前发布验收，ARM64 主机不能安装仅含 x64 的新版本。Node.js 自动准备为 24.15 或更高的 24.x；Greeks 与 ASTER 分别使用 `modules/greeks/requirements.lock` 和 `modules/aster/requirements.lock` 固定版本与哈希，独立虚拟环境以各自锁文件、Python 版本和架构为键缓存。无变化且健康时，跳过应用包下载、依赖安装、构建、完整验证与服务重启。
+默认使用 `source` 模式：先读取正式 Release 清单，再只拉取清单中固定提交的源码，在服务器按需构建。一键命令和新版网页更新器传递同一份固定清单；执行期间出现新的正式版或 `main` 前进，也不会改变本次安装目标。发布解析失败会终止更新，不回退到主线。CI 继续执行验证、构建候选版和正式发布，服务器默认不下载完整预构建运行包。
 
-需要下载时，安装器先验证下载地址是否支持 HTTP Range；支持时按 8 MiB 分段，最多 4 路并发，不支持或返回异常分段响应时自动改用单连接。日志持续显示已下载大小、进度、速度和耗时。分段下载失败后再次运行同一命令，可复用属于同一发布包的有效片段；不支持分段的单连接重试会重新下载。此前旧安装器留下的 `.download.*` 文件不会被接续或自动删除。所有下载都在完整 SHA-256 校验通过后才进入解包和切换服务。并发能否提速取决于服务器到 GitHub 的实际带宽与连接限制。
+依赖、工作台前端、Monitor、Asset、CrossEx 和 ASTER 前端分别缓存。单个模块源码变化只重建该模块，主站页面变化不重建模块；共享依赖、构建环境或相应构建配方变化会使相关缓存失效。每个模块内部先按完整模块源码判断变化，尚未细分前端、后端、测试和文档。缓存包含全部交付文件的摘要，非入口文件损坏也会拒绝复用并重建对应产物。无变化且服务健康时，跳过源码下载、依赖安装、验证、构建及重启；同内容的新正式提交会更新版本记录而不重启。所有构建完成后才停服切换，构建失败保持旧服务运行，切换失败沿用现有回滚流程。
+
+Node.js 自动准备为 24.15 或更高的 24.x，pnpm 固定为 11.25.0。Greeks 与 ASTER 分别使用 `modules/greeks/requirements.lock` 和 `modules/aster/requirements.lock` 固定版本与哈希，独立虚拟环境以各自锁文件、Python 版本和架构为键缓存。首次源码部署需安装开发依赖并构建全部前端；实际耗时取决于网络、CPU、内存及缓存命中，不能由包体积直接推算。当前 CI 仅构建并验收 x64，源码模式仍要求正式清单含匹配架构，不扩大 ARM64 支持范围。
+
+预构建运行包保留为备用方式，显式选择：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo env PROJECT_DEPLOY_MODE=ci bash
+```
+
+该模式保留分段并发下载、有效片段复用和整包 SHA-256 校验。旧版网页更新器可能仍显式选择 `ci`；运行本节开头的默认一键命令更新安装器后，网页后续更新也使用正式源码模式。
 
 ## 服务与数据
 

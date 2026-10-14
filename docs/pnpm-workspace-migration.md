@@ -31,6 +31,7 @@ pnpm run build:all
 ```bash
 pnpm run build          # 工作台类型检查与构建
 pnpm run build:modules  # 按缓存增量构建四个 Node 模块
+pnpm run build:modules crossex  # 只检查并构建指定模块，可列出多个模块
 pnpm run check
 pnpm test
 ```
@@ -49,7 +50,7 @@ GitHub Actions 先安装固定 pnpm 并执行 `pnpm install --frozen-lockfile`�
 
 打包器从锁定安装图提取生产依赖，处理当前平台可选依赖、peer、版本冲突与依赖循环；发布包不包含 pnpm 的外部链接，也不需要开发机或 CI 缓存才能运行。打包后从工作台实际入口验证五个模块页面、静态资源与汇总接口。
 
-默认 Linux 一键更新继续下载验证后的正式包，保留配置和数据，不安装 pnpm、不编译前端。显式源码部署才自动准备固定 pnpm，并以完整 workspace 依赖输入缓存安装结果。重复执行复用有效依赖、构建和检查结果。
+默认 Linux 一键更新与新版网页更新使用已通过 CI 的正式提交源码，保留配置和数据。安装器自动准备固定 pnpm，并以完整 workspace 依赖输入缓存安装结果；工作台页面与四个模块的产物分别保存到 root 管理的缓存目录，按完整文件摘要校验后跨升级复用。模块缓存使用 Git 输入键，不依赖临时工作区中的本地缓存标记。仅受影响的前端需要构建；相同内容无需重启。显式 `PROJECT_DEPLOY_MODE=ci` 仍可下载已验证的预构建包。部署入口和模式切换见[部署说明](deployment.md)。
 
 ## 依赖更新
 

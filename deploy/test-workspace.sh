@@ -16,11 +16,14 @@ PNPM_BIN=$(realpath "${INSTALL_TEST_PNPM:?Pass the pnpm JavaScript entry file (n
   exit 1
 }
 work_dir="$test_root/work"
-dependencies="$test_root/dependencies"
-mkdir -p "$APP_DIR/build-home" "$work_dir" "$dependencies"
+mkdir -p "$APP_DIR/build-home" "$APP_DIR/cache" "$APP_DIR/releases" "$work_dir"
 chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/build-home"
 git -c safe.directory="$repository" -c safe.directory="$repository/.git" clone -q --bare "$repository" "$APP_DIR/repository.git"
 commit=$(git --git-dir="$APP_DIR/repository.git" rev-parse HEAD)
+runtime_key=$(printf '%s\n%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$PNPM_VERSION" "$(uname -s)" "$(uname -m)" | hash)
+build_environment=$(read_build_environment)
+input_keys
+mkdir -p "$dependencies"
 cp -a --reflink=auto "$repository/node_modules" "$dependencies/node_modules"
 for importer in monitor asset crossex aster/dashboard; do
   mkdir -p "$dependencies/modules/$importer"
@@ -28,7 +31,6 @@ for importer in monitor asset crossex aster/dashboard; do
 done
 chown -R root:root "$dependencies"
 chmod -R go-w "$dependencies"
-dependency_key=fixture-workspace
 printf '%s\n' "$dependency_key" > "$dependencies/.complete"
 cache_modules_hash=$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)
 prepare_workspace
@@ -40,10 +42,12 @@ for importer in . modules/monitor modules/asset modules/crossex modules/aster/da
   run_as_service test -w "$work_dir/source/$importer/node_modules"
 done
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
+atomic_record "$typecheck_stamp" "$typecheck_key"
 (cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run typecheck)
 (cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run lint)
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" --test modules/aster/dashboard/tests/*.test.mjs)
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
+prepare_build_cache_helper
+prepare_module_builds
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python"
 run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
@@ -53,7 +57,9 @@ run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/py
 run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
 (cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_pair_symbol_api tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
 (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
-(cd "$work_dir/source"; run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
+prepare_application
+validate_embedded_runtime "$release"
+run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$release"
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
 for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
   [[ ! -d "$dependencies/$importer/node_modules/.vite-temp" ]]
@@ -71,3 +77,25 @@ if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
   tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
   run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$test_root/package"
 fi
+
+# A fresh extraction on the next upgrade must hydrate all four module outputs
+# without invoking a compiler, and the service account cannot edit the caches.
+work_dir="$test_root/reuse-work"
+mkdir "$work_dir"
+modules_prepared=0
+prepare_build_cache_helper
+prepare_workspace
+run_as_service() {
+  [[ "$1" == /usr/bin/python3 && "$2" == -I ]] || { echo 'Unexpected rebuild while reusing verified module artifacts' >&2; return 91; }
+  runuser -u "$SERVICE_USER" -- "$@"
+}
+prepare_module_builds
+for module in "${MODULE_BUILD_IDS[@]}"; do
+  cache="$APP_DIR/cache/module-$module-${module_build_keys[$module]}"
+  build_artifact_cache verify "$cache" "${module_build_keys[$module]}"
+  [[ -s "$work_dir/source/${MODULE_BUILD_OUTPUTS[$module]}/${MODULE_BUILD_ENTRIES[$module]}" ]]
+  if runuser -u "$SERVICE_USER" -- test -w "$cache/artifact/${MODULE_BUILD_ENTRIES[$module]}"; then
+    echo 'The build account can modify a published artifact cache' >&2; exit 1
+  fi
+done
+printf 'Real source deployment and cross-workspace module reuse passed.\n'

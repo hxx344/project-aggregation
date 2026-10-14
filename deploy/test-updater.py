@@ -1016,6 +1016,30 @@ class CoordinatorTests(RootFixture):
         self.assertNotIn('shell', run.call_args.kwargs)
         self.assertEqual(run.call_args.kwargs['env'], updater.ENVIRONMENT)
 
+    def test_installer_uses_source_mode_pinned_manifest_and_clean_environment(self):
+        script = self.root / 'hub.install.sh'
+        manifest = self.root / 'hub.release-manifest.json'
+        log = self.root / 'hub.install.log'
+        script.write_bytes(INSTALLER)
+        manifest.write_bytes(encoded(self.network.values['hub']['manifest']))
+        inherited = {'PROJECT_DEPLOY_MODE': 'ci', 'PROJECT_DEPLOY_TESTS': '1',
+                     'PROJECT_DEPLOY_MANIFEST_FILE': '/untrusted/manifest.json',
+                     'GITHUB_TOKEN': GITHUB_TOKEN, 'VITE_UNTRUSTED': 'inherited', 'BASH_ENV': '/untrusted/shell'}
+        with patch.dict(os.environ, inherited), patch.object(updater.subprocess, 'run', return_value=SimpleNamespace(returncode=23)) as run:
+            self.assertEqual(updater.run_installer(script, manifest, log), 23)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ['/bin/bash', str(script)])
+        self.assertEqual(run.call_args.kwargs['env'], {
+            **updater.ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'source', 'PROJECT_DEPLOY_TESTS': '0',
+            'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest)})
+        self.assertEqual(run.call_args.kwargs['cwd'], '/')
+        self.assertEqual(run.call_args.kwargs['stdin'], updater.subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs['stderr'], updater.subprocess.STDOUT)
+        self.assertEqual(Path(run.call_args.kwargs['stdout'].name), log)
+        self.assertNotIn('shell', run.call_args.kwargs)
+        self.assertFalse(run.call_args.kwargs['check'])
+        self.assertEqual(json.loads(manifest.read_text())['commit'], NEW)
+
     @unittest.skipUnless(LINUX_ROOT, 'Unix socket and root permission checks run in Linux CI')
     def test_main_creates_root_owned_group_only_control_socket(self):
         endpoint_dir = self.root / 'run'; endpoint_dir.mkdir(mode=0o700)
