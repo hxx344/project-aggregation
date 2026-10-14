@@ -4,6 +4,8 @@
 
 历史材料来自 2026-10-12/13 的复盘，涉及 project-aggregation、asset-ledger、market-spread-monitor、gate-crossex-arbitrage、variational-grid、greeks、aster_5x。原记录称 10-12 共约 61 次提交；该统计本次未重算。原 “Seen 1×” 表示一次复盘日记录，不代表已核实的独立复发事件。本次只校准经验文档及本仓证据，没有重新执行下列业务测试，也没有完成全历史复盘。
 
+2026-10-14 日复盘覆盖此前 L012 合入之后的约 27 个提交，审到主线 `f7485bb7`。范围包括 Gate 资产估值、发布身份、pnpm workspace、Crossex 别名/资金费/ADL/流水，以及更新器 token。本轮新增 L024–L026。这三条各自只有 2026-10-14 一个复盘日，未达到 [升级条件](docs/code-standards.md#升级规则)，仍留在本文件。全历史复盘尚未完成，`docs/review-state.json` 的完成检查点保持未建立；本仓库不使用 `reviewed-through` 注释。
+
 每条历史线索保留稳定 ID、原复盘日期和全部原有证据。实际发生日期、独立事件边界未完成核实时，不计入规范升级；后续核实时沿用 ID 或明确关联正式事件，避免重复统计。外仓证据标注“未核验”，不将其实现或测试描述为本仓已有能力。
 
 ## Correctness at the boundary
@@ -335,6 +337,48 @@
 **如何验证：** [资金费投影测试](modules/crossex/tests/funding-opportunities.test.mjs) 覆盖零值、等费差、榜外、开仓策略及失效数据；[真实工作台入口](tests/embedded-funding.test.mjs) 验证 API 仅投影持仓对应费率并保留真实开仓时间。
 
 **事件记录：** `crossex-held-funding-projection-20261014`；与页面时钟问题为两个独立审查发现。
+
+### L024：ADL 交易所原始等级映射
+
+**适用条件：** 多个交易所的 ADL/减仓优先级要统一成同一套 UI（如红灯数）展示。
+
+**根因：** 各所原生等级刻度不同甚至相反（Gate 5→1 越高越前；Binance 0→4；Kraken 100/80/…；OKX/Bybit 含 0 档）。若直接显示原值或套用他所刻度，会把高优先级画成低优先级。
+
+**以后做法：** 按已核实的交易所契约做显式映射表；未知/未核实交易所返回 unknown（灰灯），禁止借用他所刻度；缺失与畸形值不得显示为低优先级。
+
+**证据：** 本仓 `015a363a` 新增 [adl-indicator.ts](modules/crossex/src/adl-indicator.ts)、[AdlIndicator.tsx](modules/crossex/src/AdlIndicator.tsx) 与 [ADL 映射测试](tests/crossex-adl-indicator.test.mjs)（Gate/Kraken 反向、OKX/Bybit 零档、未核实所返回 null）。
+
+**如何验证：** 运行 [ADL 映射测试](tests/crossex-adl-indicator.test.mjs)。Gate `5,4,3,2,1` 与 Kraken `100,80,60,40,20` 映射为递增红灯；OKX/Bybit 的 `0` 保持零档；缺失、畸形和越界保持 `null`，不得画成低优先级；未核实交易所对 `1` 和 `5` 都返回 `null`，界面用灰灯表示 unknown。
+
+**事件记录：** `crossex-adl-mapping-20261014`；Seen 1×（2026-10-14）。
+
+### L025：账户流水按委托聚合时严格限定可聚合类型
+
+**适用条件：** 成交/资金流水按 order_id 或 business_id 聚合展示。
+
+**根因：** Gate account book 里只有 TRANSACTION / TRADING_FEE / LIQUIDATION_FEE 的 business_id 才是委托号；资金费结算、划转及无委托号若强行按同 ID/时间合并，会把无关流水并进一笔委托。
+
+**以后做法：** 仅对官方标明与委托绑定的类型按委托聚合；资金费、划转、缺 ID 保持独立记录；缺失金额用 unknown 而非 0；手续费按币种分别合计。
+
+**证据：** 本仓 `bb296a89` 的 [account-history.ts](modules/crossex/src/account-history.ts) 与 [账户流水测试](tests/crossex-account-history.test.mjs)（funding/transfer 不继承委托、缺金额为 null）。
+
+**如何验证：** 运行 [账户流水聚合测试](tests/crossex-account-history.test.mjs)。`FUNDING_FEE`、划转和空 `business_id` 即使标识或时间与成交相同也各自成组；缺金额为 `null`；手续费按币种分别合计。
+
+**事件记录：** `crossex-account-history-group-20261014`；Seen 1×（2026-10-14）。
+
+### L026：匿名额度耗尽时提供可配置的认证读取路径
+
+**适用条件：** 更新检查依赖 GitHub Releases/API，匿名额度会被耗尽（见既有 L013）。
+
+**根因：** 仅退避重试仍无法在额度耗尽时继续可靠读发布；需要用户侧提供 token，且必须经工作台安全配置、不进前端明文日志。
+
+**以后做法：** 在工作台提供 GitHub token 配置入口；服务端用该凭证读发布并遵守 L013 的退避与身份校验；无 token 时行为与诊断仍清晰（额度耗尽 vs 拒绝）。
+
+**证据：** 本仓 `f7485bb7` 改 [更新调度器](server/update-service/updater.py)、[发布读取器](server/update-service/releases.py) 与 [UpdateStatus.tsx](src/UpdateStatus.tsx)，新增 [更新 token 浏览器检查](tests/update-token.browser.mjs) 等。
+
+**如何验证：** [发布读取检查](deploy/test-release-cache.py) 区分匿名额度耗尽、认证额度耗尽和 Token 无效；[更新协调器检查](deploy/test-updater.py) 覆盖保存、更换、移除，对外只暴露是否已配置，并保留 L013 的重试截止时间。[更新 token 浏览器检查](tests/update-token.browser.mjs) 确认凭据不进入页面正文或浏览器存储。无 token 时仍按匿名额度耗尽与拒绝分别诊断。
+
+**事件记录：** `updater-github-token-20261014`；Seen 1×（2026-10-14）。关联 L013，不合并为同一事件。
 
 ## Moved to the code standards
 
