@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
+from time import perf_counter
 
 MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
 # ASTER's dashboard is prebuilt static content served by its Python bridge.
@@ -337,10 +338,15 @@ def main():
     archive_path = args.output / filename
     with tempfile.TemporaryDirectory() as temporary:
         stage = Path(temporary)
+        started = perf_counter()
         stage_runtime(source, stage, args.dependency_root, args.node, args.parser_user)
+        print(f'[package] Runtime staging: {perf_counter() - started:.1f}s', flush=True)
         (stage / '.release-commit').write_text(commit + '\n')
         (stage / '.release-application-key').write_text(application_key + '\n')
-        with archive_path.open('wb') as output, gzip.GzipFile(fileobj=output, mode='wb', filename='', mtime=0) as compressed:
+        # Level 6 avoids the expensive maximum-compression pass while retaining
+        # deterministic gzip metadata and the same verified runtime contents.
+        started = perf_counter()
+        with archive_path.open('wb') as output, gzip.GzipFile(fileobj=output, mode='wb', filename='', mtime=0, compresslevel=6) as compressed:
             with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
                 for path in sorted(stage.rglob('*')):
                     if is_link(path):
@@ -351,6 +357,7 @@ def main():
                     content = path.read_bytes()
                     info.size, info.mode, info.mtime = len(content), 0o755 if path.stat().st_mode & 0o111 else 0o644, 0
                     archive.addfile(info, io.BytesIO(content))
+        print(f'[package] Archive compression (gzip 6): {perf_counter() - started:.1f}s', flush=True)
     artifact = {'file': filename, 'sha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(), 'application_key': application_key}
     manifest = {'schema': 1, 'repository': 'hxx344/' + name, 'commit': commit, 'tag': 'deploy-' + commit,
                 'node_version': '24.15.0', 'artifacts': {'linux-' + architecture: artifact}}

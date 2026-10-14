@@ -43,6 +43,8 @@ jobs:
           name: deployment-package-x64
           path: output/release/*
           if-no-files-found: error
+          # The runtime tarball is already gzip-compressed.
+          compression-level: 0
   installer:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -70,7 +72,11 @@ jobs:
           bash -n deploy/test-inputs.sh
           bash -n deploy/test-incremental.sh
           bash -n deploy/test-workspace.sh
+          bash -n deploy/workspace-test-jobs.sh
+          bash -n deploy/test-workspace-parallel.sh
           bash -n deploy/test-module-incremental.sh
+      - name: Verify parallel workspace failures and process cleanup
+        run: bash deploy/test-workspace-parallel.sh
       - name: Verify privileged update coordinator and service bootstrap
         run: |
           sudo python3 deploy/test-updater.py -v

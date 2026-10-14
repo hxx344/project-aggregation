@@ -4,8 +4,11 @@ set -Eeuo pipefail
 [[ $(uname -s) == Linux && $EUID == 0 ]] || { echo 'Run this fixture with sudo on Linux.' >&2; exit 1; }
 repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
 AGG_INSTALL_SOURCE_ONLY=1 source "$repository/deploy/install.sh"
+source "$repository/deploy/workspace-test-jobs.sh"
 test_root=$(mktemp -d)
-trap 'rm -rf -- "$test_root"' EXIT
+trap workspace_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 chmod 0755 "$test_root"
 APP_DIR="$test_root/application"
 SERVICE_USER=${SUDO_USER:?Run through sudo from the CI account}
@@ -41,25 +44,39 @@ for importer in . modules/monitor modules/asset modules/crossex modules/aster/da
   fi
   run_as_service test -w "$work_dir/source/$importer/node_modules"
 done
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
-atomic_record "$typecheck_stamp" "$typecheck_key"
-(cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run typecheck)
-(cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run lint)
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" --test modules/aster/dashboard/tests/*.test.mjs)
+workspace_frontend_checks() {
+  (cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
+  atomic_record "$typecheck_stamp" "$typecheck_key"
+  (cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run typecheck)
+  (cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run lint)
+  (cd "$work_dir/source"; run_as_service "$NODE_BIN" --test modules/aster/dashboard/tests/*.test.mjs)
+  prepare_module_builds
+}
+workspace_python_checks() {
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python"
+  run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
+  run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python-aster"
+  run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
+  run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
+  (cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_pair_symbol_api tests.test_pair_symbol_change tests.test_pair_symbol_history tests.test_pair_symbol_watch tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
+}
 prepare_build_cache_helper
-prepare_module_builds
+workspace_start_job python-setup/tests workspace_python_checks
+workspace_start_job frontend-checks/builds workspace_frontend_checks
+workspace_wait_jobs
+# The frontend lane published verified artifacts and its stamp to disk. This is
+# the only in-memory prepare_module_builds result needed by prepare_application.
+modules_prepared=1
+stage_started=$SECONDS
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python"
-run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
-run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python-aster"
-run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
-run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
-(cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_pair_symbol_api tests.test_pair_symbol_change tests.test_pair_symbol_history tests.test_pair_symbol_watch tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
 (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
+printf '[workspace] root-behavior-tests: %ss\n' "$((SECONDS - stage_started))"
+stage_started=$SECONDS
 prepare_application
 validate_embedded_runtime "$release"
 run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$release"
+printf '[workspace] source-assembly-and-package-check: %ss\n' "$((SECONDS - stage_started))"
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
 for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
   [[ ! -d "$dependencies/$importer/node_modules/.vite-temp" ]]
@@ -68,6 +85,7 @@ done
 printf 'Real non-root build and backend import passed with immutable shared dependencies.\n'
 
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
+  stage_started=$SECONDS
   # Optimize release size before packaging
   printf 'Optimizing release package size...\n'
   bash "$repository/scripts/optimize-release-size.sh" || true
@@ -76,6 +94,7 @@ if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
   mkdir "$test_root/package"
   tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
   run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$test_root/package"
+  printf '[workspace] archive-and-unpack-check: %ss\n' "$((SECONDS - stage_started))"
 fi
 
 # A fresh extraction on the next upgrade must hydrate all four module outputs
