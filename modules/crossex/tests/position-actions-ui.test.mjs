@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
-import { addFractionQuantity, addQuantityFromTotal, commonQuantityStep, estimatePositionDelta, legQuantityDiff, planPositionAction,
+import { actionDecimal, addFractionQuantity, addQuantityFromTotal, commonQuantityStep, estimatePositionDelta, legQuantityDiff, planPositionAction,
   positionActionInput, positionPairProblem, positionPreviewChanged, positionSnapshotChanged, sharedAvailableMargin, spreadDeviation } from '../src/position-actions.ts';
 
 const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
@@ -145,8 +145,30 @@ test('only fresh shared CROSS_EXCHANGE margin is displayed; isolated, absent and
 
 test('spread warning measures absolute deviation and cannot divide by zero', () => {
   const selected = group();
-  assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: '0.1', currentSpread: '0.06' } }), '0.4');
-  assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: '-0.1', currentSpread: '0.1' } }), '2');
+  assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: '0.1', currentSpread: '0.06' } })?.toFixed(), '0.4');
+  assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: '-0.1', currentSpread: '0.1' } })?.toFixed(), '2');
   assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: '0', currentSpread: '0.1' } }), null);
   assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: null, currentSpread: '0.1' } }), null);
+});
+
+test('recurring spread deviation stays comparable without passing through the external input limit', () => {
+  const selected = group([long({ entryPrice: '100', markPrice: '100' }), short({ entryPrice: '103', markPrice: '104' })]);
+  const deviation = spreadDeviation(selected);
+  assert.ok(deviation.gt('0.3333') && deviation.lt('0.3334'));
+  assert.equal(deviation.gt('0.3'), true);
+  for (const [currentSpread, expected] of [['0.039', false], ['0.039000000000000000001', true], ['0.038999999999999999999', false]]) {
+    assert.equal(spreadDeviation({ ...selected, metrics: { entrySpread: '0.03', currentSpread } }).gt('0.3'), expected);
+  }
+  assert.equal(actionDecimal('0.' + '1'.repeat(159)), null, 'external input length remains bounded');
+});
+
+test('a valid balance plan can estimate a calculated delta longer than the original inputs', () => {
+  const selected = group([long({ baseQuantity: '1e100' }), short({ baseQuantity: '1e-100' })]);
+  const rules = instruments([{}, {}].map(() => ({ lot_size: '1e-100', min_size: '1e-100', max_limit_size: null })));
+  const plan = planPositionAction(selected, rules, 'balance', '', 'reduce');
+  assert.deepEqual(plan.errors, []);
+  assert.equal(plan.legs[0].quantity.length > 160, true);
+  const estimate = estimatePositionDelta(plan.legs[0]);
+  assert.ok(estimate.marginChange.startsWith('-'));
+  assert.equal(estimate.projectedNotional, '0.' + '0'.repeat(97) + '1');
 });

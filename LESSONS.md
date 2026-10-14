@@ -554,3 +554,17 @@
 **证据：** 本仓 `b9692d2` 的 [CI 中继检查](https://github.com/hxx344/project-aggregation/actions/runs/38622433981/job/116053055716) 在退出 WebSocket 上下文后观察到连接数仍为 1；该路径自 `0cde1afd` 引入。[中继处理器](modules/aster/trading/capacity_relay_server.py) 的确定性 Windows 回归进一步复现处理器已取消、接收任务已结束但名额未释放，排除了单纯断言过早。
 
 **事件记录：** `relay-cancelled-cleanup-slot-leak-20261015`；发布检查暴露的一次连接清理缺陷。
+
+### L038：内部十进制计算结果不重新套用输入长度限制
+
+**适用条件：** 前端使用高精度 Decimal 计算价差、保证金或持仓调整量，并在渲染时再次解析计算结果。
+
+**根因：** 外部输入限制为 160 字符，但 200 位精度的除法可产生更长的循环小数。加仓弹窗把内部价差结果当外部输入重解析，得到 `null` 后仍调用 `.gt()`，导致整个 CrossEx 界面卸载；保证金汇总也会因此漏掉不足提示。原浏览器价格组合恰好得到较短结果，未覆盖此边界。
+
+**以后做法：** 内部运算和比较保留 Decimal 实例，仅在展示时转字符串；已经验证的计划自产差额不再经过外部输入长度校验。外部输入限制继续保留，不能只用可选链隐藏错误而丢失有效警告。
+
+**如何验证：** [持仓操作测试](modules/crossex/tests/position-actions-ui.test.mjs) 覆盖循环价差、30% 边界、零价差和长差额；[工作台浏览器回归](tests/crossex-position-actions.browser.mjs) 使用开仓价 100/103、标记价 100/104，确认点击加仓正常展示 33.3333% 偏离提示，并用 7 倍杠杆、可用保证金 30 覆盖循环保证金汇总和预留不足提示。
+
+**证据：** project-aggregation `6ba3eec` 引入的 [加仓弹窗](modules/crossex/src/PositionActionDialog.tsx) 与 [计算辅助](modules/crossex/src/position-actions.ts)，2026-10-15 用户报告点击加仓后黑屏。基于 `96debc6` 的原生 Windows 浏览器回归在修复前构建 `index-rW2drLUC.js` 上复现 `Cannot read properties of null (reading 'gt')`；直接计算 `0.03 → 0.04` 产生 202 字符的 `1/3`。
+
+**事件记录：** `crossex-derived-decimal-dialog-crash-20261015`；一次用户反馈及同根因修复，不推进主线复盘检查点。

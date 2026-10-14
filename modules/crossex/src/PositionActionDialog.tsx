@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import Decimal from 'decimal.js';
 import type { Instrument, LiveView, PreviewInput } from './live-types';
 import type { PositionGroup } from './position-view';
 import type { CapacityContext } from './use-open-capacity';
@@ -39,11 +40,11 @@ export default function PositionActionDialog({ selection, live, instruments, dis
   const marginCurrencies = [...new Set(estimates.map(row => row.leg.position.marginCurrency || '币种未知'))];
   const marginTotals = marginCurrencies.map(currency => {
     const rows = estimates.filter(row => (row.leg.position.marginCurrency || '币种未知') === currency);
-    const sum = (values: (string | null)[]) => values.some(value => value === null) ? null : values.reduce((total, value) => total!.add(value!), actionDecimal('0'))!.toFixed();
+    const sum = (values: (string | null)[]) => values.some(value => value === null) ? null : values.reduce((total, value) => total.add(value!), actionDecimal('0')!);
     return { currency, change: sum(rows.map(row => row.marginChange)), required: sum(rows.filter(row => !row.leg.reduceOnly).map(row => row.marginChange)) };
   });
   const available = sharedAvailableMargin(capacityContext.live, capacityContext.now);
-  const usdtRequired = actionDecimal(marginTotals.find(row => row.currency === 'USDT')?.required), availableAmount = actionDecimal(available);
+  const usdtRequired = marginTotals.find(row => row.currency === 'USDT')?.required, availableAmount = actionDecimal(available);
   const insufficient = !!usdtRequired && !!availableAmount && usdtRequired.mul('1.10').gt(availableAmount);
   const openingProblem = plan.hasIncrease ? entryPaused ? '新开仓已暂停；平衡时可选择仅减少仓位的目标。'
     : catalogError ? `合约目录不可用：${catalogError}` : '' : '';
@@ -85,13 +86,13 @@ export default function PositionActionDialog({ selection, live, instruments, dis
         <div><dt>本次名义额 / 调整后名义额</dt><dd><DecimalValue value={notional} kind="amount"/> / <DecimalValue value={projectedNotional} kind="amount"/> {leg.position.quoteCurrency}</dd></div>
         <div><dt>预计保证金变化</dt><dd><DecimalValue value={marginChange} kind="amount" signed/> {leg.position.marginCurrency || '币种未知'}</dd></div>
         <div><dt>预计 Taker 手续费</dt><dd><DecimalValue value={fee} kind="amount"/> {leg.position.quoteCurrency}</dd></div>
-      </dl>{!leg.reduceOnly && !leg.unchanged && leg.position.quoteCurrency === 'USDT' && actionDecimal(notional)?.gt(budget) && <p className="warning">本次单腿名义额估算超过预算，服务端将按最新保护价复核。</p>}</div>)}
-        <dl className="ticket-details"><div><dt>单腿订单预算</dt><dd><DecimalValue value={String(budget)} kind="amount"/> USDT</dd></div>{marginTotals.map(total => <div key={total.currency}><dt>保证金增加需求 / 净变化</dt><dd><DecimalValue value={total.required} kind="amount"/> / <DecimalValue value={total.change} kind="amount" signed/> {total.currency}</dd></div>)}<div><dt>账户共享可用保证金</dt><dd><DecimalValue value={available} kind="amount"/> USDT</dd></div></dl>
+      </dl>{!leg.reduceOnly && !leg.unchanged && leg.position.quoteCurrency === 'USDT' && notional !== null && new Decimal(notional).gt(budget) && <p className="warning">本次单腿名义额估算超过预算，服务端将按最新保护价复核。</p>}</div>)}
+        <dl className="ticket-details"><div><dt>单腿订单预算</dt><dd><DecimalValue value={String(budget)} kind="amount"/> USDT</dd></div>{marginTotals.map(total => <div key={total.currency}><dt>保证金增加需求 / 净变化</dt><dd><DecimalValue value={total.required?.toFixed()} kind="amount"/> / <DecimalValue value={total.change?.toFixed()} kind="amount" signed/> {total.currency}</dd></div>)}<div><dt>账户共享可用保证金</dt><dd><DecimalValue value={available} kind="amount"/> USDT</dd></div></dl>
         {available === null && <p className="muted">可用保证金未知：仅显示新鲜 CROSS_EXCHANGE 账户共享额度；隔离账户由服务端逐交易所核验。</p>}
         {insufficient && <p className="warning">按 10% 保证金预留估算，可用保证金不足；最终结果以服务端预览为准。</p>}
         <p className="muted">价格与杠杆按打开时持仓估算；手续费来源 {time(feesFresh ? live.feesAsOf : null)}。金额按币种分别列示；非 USDT 名义额未作预算换汇。减少仓位预计释放的保证金不抵扣本次增仓需求。</p>
       </section>
-      {action === 'add' && (deviation === null ? <p className="muted">开仓与当前价差的偏离程度未知。</p> : actionDecimal(deviation)!.gt('0.3') && <p className="warning">当前价差较开仓价差偏离 {percentage(deviation)}，已超过 30%，加仓成交价格与持仓均价可能不同。</p>)}
+      {action === 'add' && (deviation === null ? <p className="muted">开仓与当前价差的偏离程度未知。</p> : deviation.gt('0.3') && <p className="warning">当前价差较开仓价差偏离 {percentage(deviation.toFixed())}，已超过 30%，加仓成交价格与持仓均价可能不同。</p>)}
       {snapshotInvalid && <p role="alert" className="inline-state warning">持仓数量、方向或账户已变化。请关闭并重新打开对话框，重新核对目标。</p>}
       {disabled && !busy && <p className="warning">账户数据待更新、操作处理中或存在待确认请求，暂不可预览。</p>}
       {openingProblem && <p role="alert" className="warning">{openingProblem}</p>}

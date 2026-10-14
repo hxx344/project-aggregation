@@ -123,7 +123,8 @@ export function positionPreviewChanged(input: PositionActionInput, live: LiveVie
 }
 
 export function estimatePositionDelta(leg: PositionDelta, takerRate: string | null = null) {
-  const mark = positive(leg.position.markPrice), leverage = positive(leg.position.leverage), quantity = actionDecimal(leg.quantity)!;
+  // The plan already validated the inputs. Its calculated delta can be longer than either input.
+  const mark = positive(leg.position.markPrice), leverage = positive(leg.position.leverage), quantity = new D(leg.quantity);
   const linear = leg.position.quoteCurrency === leg.position.pnlCurrency && ['USDT', 'USDC', 'USD'].includes(leg.position.quoteCurrency);
   const notional = linear && mark ? quantity.mul(mark) : null;
   const margin = notional && leverage && leg.position.marginCurrency === leg.position.quoteCurrency ? notional.div(leverage) : null;
@@ -140,7 +141,7 @@ export function sharedAvailableMargin(live: LiveView, now: number): string | nul
   return actionDecimal(live.account.available_margin)?.toFixed() ?? null;
 }
 
-export function spreadDeviation(group: PositionGroup): string | null {
+export function spreadDeviation(group: PositionGroup): Decimal | null {
   const entry = actionDecimal(group.metrics.entrySpread), current = actionDecimal(group.metrics.currentSpread);
-  return entry && !entry.isZero() && current ? current.sub(entry).abs().div(entry.abs()).toFixed() : null;
+  return entry && !entry.isZero() && current ? current.sub(entry).abs().div(entry.abs()) : null;
 }

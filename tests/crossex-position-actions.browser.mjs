@@ -11,12 +11,12 @@ async (page) => {
   let paused = false, partial = false, stale = false, holdPreview = false, releasePreview = null, previewFailure = '', executions = [];
   const symbol = exchange => `${exchange.toUpperCase()}_FUTURE_BTC_USDT`;
   const held = [
-    { id: 'btc-long', symbol: symbol('binance'), exchange: 'binance', side: 'LONG', quantity: '1', baseQuantity: '1', markPrice: '100', entryPrice: '99' },
-    { id: 'btc-short', symbol: symbol('bybit'), exchange: 'bybit', side: 'SHORT', quantity: '1', baseQuantity: '1', markPrice: '101', entryPrice: '102' },
+    { id: 'btc-long', symbol: symbol('binance'), exchange: 'binance', side: 'LONG', quantity: '1', baseQuantity: '1', markPrice: '100', entryPrice: '100' },
+    { id: 'btc-short', symbol: symbol('bybit'), exchange: 'bybit', side: 'SHORT', quantity: '1', baseQuantity: '1', markPrice: '104', entryPrice: '103' },
   ];
   const positions = () => held.map(p => ({ ...p, baseCurrency: 'BTC', quoteCurrency: 'USDT', pnlCurrency: 'USDT', marginCurrency: 'USDT',
     unrealizedPnl: '1', fundingFee: '0.1', realizedPnl: '0', fee: '0.01', margin: '20', maintenanceMargin: '1',
-    leverage: '5', liquidationPrice: null, external: true, updatedAt: now, openedAt: now - 86400000, directionSource: 'exchange' }));
+    leverage: '7', liquidationPrice: null, external: true, updatedAt: now, openedAt: now - 86400000, directionSource: 'exchange' }));
   const config = () => ({ entryPaused: paused, monitorUrl: 'module://monitor', monitorUsername: '', hasMonitorPassword: false,
     notionalPerLeg: 500, maxOpen: 10, maxTotalNotional: 10000, feeBps: 5, feeSchedule: [], slippageBps: 5, minNetBps: 1, cooldownSeconds: 0 });
   const connection = { configured: true, connected: true, status: 'connected', accountId: 'fixture', keySuffix: 'TEST', version: 'position-actions-1',
@@ -30,7 +30,7 @@ async (page) => {
   const state = () => ({ now, csrfToken: 'position-actions-fixture', mode: 'live', config: config(), venues: [], fx: [], opportunities: [], fundingOpportunities: [], positionFundingRates: [],
     source: { state: 'live', error: null, updatedAt: now, generatedAt: now, checkedAt: now, quoteCount: 2 }, catalog: { state: 'ready', count: 2, updatedAt: now, error: null },
     live: { connection, status: 'live', freshnessState: 'fresh', stale, partial, asOf: now, tradingAllowed: !partial && !stale, reasons: [],
-      account: { account_mode: 'CROSS_EXCHANGE', available_margin: '5000', margin_balance: '10000', initial_margin: '40', maintenance_margin: '2' },
+      account: { account_mode: 'CROSS_EXCHANGE', available_margin: '30', margin_balance: '10000', initial_margin: '40', maintenance_margin: '2' },
       balances: [], positions: positions(), orders: [], executions, alerts: [], recentTrades: [], accountBook: [], fees: [], adlAsOf: now, adlError: null } });
   const instruments = positions().map((p, i) => ({ symbol: p.symbol, exchange: p.exchange, base: 'BTC', quoteCurrency: 'USDT', settlementCurrency: 'USDT',
     lot_size: i ? '0.005' : '0.002', tick_size: '0.01', min_size: i ? '0.005' : '0.002', min_notional: '0.1', max_limit_size: '100', max_market_size: '100', contract_size: '0.001', state: 'live' }));
@@ -119,7 +119,11 @@ async (page) => {
     assert(await addButton.isEnabled(), 'equal pair can be increased');
     assert(await balanceButton.isDisabled(), 'equal pair does not need balancing');
     await addButton.click();
-    let picker = dialog('BTC · 加仓持仓组合'); await picker.waitFor();
+    let picker = dialog('BTC · 加仓持仓组合'); await picker.waitFor({ timeout: 10000 });
+    assert((await picker.innerText()).includes('当前价差较开仓价差偏离 33.3333%'), 'recurring spread deviation renders the warning without unmounting the module');
+    assert((await picker.innerText()).includes('按 10% 保证金预留估算，可用保证金不足'), 'recurring margin estimates retain the insufficient-margin warning');
+    await page.clock.runFor(200);
+    await page.screenshot({ path: 'output/playwright/crossex-position-actions-crash-fixed.png', fullPage: true });
     await picker.getByRole('button', { name: '25%', exact: true }).click();
     assert((await picker.innerText()).includes('0.25'), 'percentage selects a common-step quantity');
     await picker.getByRole('textbox', { name: '自定义加仓数量', exact: true }).fill('0.003');
@@ -214,7 +218,7 @@ async (page) => {
     assert(unexpected.length === 0, `unexpected requests: ${unexpected.join('; ')}`);
     assert(errors.length === 0, `uncaught browser errors: ${errors.join('; ')}`);
     return { passed: true, previews: previews.length, confirmations: confirmations.length, liveOrders: 0,
-      scenarios: ['real Hub entry', 'common lot-size validation', 'add percentage and exact request', 'preview lock', 'confirm and refresh',
+      scenarios: ['real Hub entry', 'recurring spread and margin warnings', 'common lot-size validation', 'add percentage and exact request', 'preview lock', 'confirm and refresh',
         'reduce', 'increase', 'custom mixed target', 'mobile dialog', 'entry pause', 'server error in modal', 'review invalidation', 'snapshot changes', 'partial/stale account', 'close selection account scope'] };
   } finally { releasePreview?.(); await page.clock.resume(); }
 }
