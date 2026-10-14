@@ -39,21 +39,79 @@ for importer in . modules/monitor modules/asset modules/crossex modules/aster/da
   fi
   run_as_service test -w "$work_dir/source/$importer/node_modules"
 done
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
-(cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run typecheck)
-(cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run lint)
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" --test modules/aster/dashboard/tests/*.test.mjs)
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
+
+# ========== OPTIMIZED PARALLEL EXECUTION ==========
+# Phase 1: Parallel static checks (no dependencies)
+printf '=== Phase 1: Running static checks in parallel ===\n'
+check_failed=0
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run check) &
+check_pid=$!
+(cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run typecheck) &
+typecheck_pid=$!
+(cd "$work_dir/source/modules/aster/dashboard"; run_as_service "$NODE_BIN" "$PNPM_BIN" run lint) &
+lint_pid=$!
+
+wait $check_pid || check_failed=1
+wait $typecheck_pid || check_failed=1
+wait $lint_pid || check_failed=1
+[[ $check_failed == 0 ]] || { echo 'Static checks failed' >&2; exit 1; }
+printf '✓ Static checks passed\n\n'
+
+# Phase 2: Parallel Python environment setup (independent)
+printf '=== Phase 2: Setting up Python environments in parallel ===\n'
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python"
-run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
-run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python-aster"
-run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
-run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
-(cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_pair_symbol_api tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
+
+python_failed=0
+(
+  run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
+  run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
+) &
+greeks_pid=$!
+
+(
+  run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
+  run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
+) &
+aster_pid=$!
+
+wait $greeks_pid || python_failed=1
+wait $aster_pid || python_failed=1
+[[ $python_failed == 0 ]] || { echo 'Python environment setup failed' >&2; exit 1; }
+printf '✓ Python environments ready\n\n'
+
+# Phase 3: Build modules (required by subsequent steps)
+printf '=== Phase 3: Building modules ===\n'
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
+printf '✓ Modules built\n\n'
+
+# Phase 4: Parallel tests and runtime checks (depend on build)
+printf '=== Phase 4: Running tests in parallel ===\n'
+test_failed=0
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" --test modules/aster/dashboard/tests/*.test.mjs) &
+node_test_pid=$!
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")') &
+import_pid=$!
+(cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_pair_symbol_api tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q) &
+python_test_pid=$!
+
+wait $node_test_pid || test_failed=1
+wait $import_pid || test_failed=1
+wait $python_test_pid || test_failed=1
+[[ $test_failed == 0 ]] || { echo 'Tests failed' >&2; exit 1; }
+printf '✓ Tests passed\n\n'
+
+# Phase 5: Integration tests (requires all Python environments)
+printf '=== Phase 5: Running integration tests ===\n'
 (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
+printf '✓ Integration tests passed\n\n'
+
+# Phase 6: Production build (final step)
+printf '=== Phase 6: Building production bundle ===\n'
 (cd "$work_dir/source"; run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
+printf '✓ Production build complete\n\n'
+# ========== END OPTIMIZED PARALLEL EXECUTION ==========
+
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
 for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
   [[ ! -d "$dependencies/$importer/node_modules/.vite-temp" ]]
@@ -62,10 +120,6 @@ done
 printf 'Real non-root build and backend import passed with immutable shared dependencies.\n'
 
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
-  # Optimize release size before packaging
-  printf 'Optimizing release package size...\n'
-  bash "$repository/scripts/optimize-release-size.sh" || true
-
   python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --repository "$repository" --output "$repository/output/release"
   mkdir "$test_root/package"
   tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
