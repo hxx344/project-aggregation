@@ -417,7 +417,7 @@ class PublicDepthLifecycleTests(unittest.TestCase):
         self.assertTrue(socket.receiving.wait(1))
         connect.assert_called_once()
         self.assertEqual(connect.call_args.args[0].split("streams=")[1].split("/"),
-                         ["xauusd1@depth@100ms", "spcxusd1@depth@100ms", "clusd1@depth@100ms"])
+                         ["xauusd1@depth@100ms", "spcxusd1@depth@100ms", "clusd1@depth@100ms", "xagusd1@depth@100ms"])
         self.assertEqual(connect.call_args.kwargs["max_size"], stream._MAX_MESSAGE_BYTES)
         self.assertEqual(connect.call_args.kwargs["max_queue"], 16)
         old = synchronized(stream)

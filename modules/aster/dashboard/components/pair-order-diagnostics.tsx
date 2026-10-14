@@ -5,6 +5,7 @@ import {
   pendingOrderDiagnostics,
 } from '@/lib/pair-order-diagnostics';
 import type { Pair } from '@/lib/pairs';
+import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 
 export function PairOrderDiagnostics({ pair }: { pair: Pair }) {
   if (!hasPendingPairOrders(pair)) return null;
@@ -27,7 +28,8 @@ export function PairOrderDiagnostics({ pair }: { pair: Pair }) {
               <strong>{order.sideLabel}</strong> · {order.stageLabel}
             </p>
             <p className={order.terminal ? '' : 'amber'}>
-              回执记录：{order.statusLabel} · 累计成交 {order.executedQty} XAU
+              回执记录：{order.statusLabel} · 累计成交 {order.executedQty}{' '}
+              {pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol}
             </p>
             <p className="muted small-note">
               原客户端订单编号：{order.clientOrderId}

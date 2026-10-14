@@ -26,6 +26,7 @@ from .engine import Engine
 from .cycle import CYCLE_MAXIMUM
 from .hub_summary import hub_summary
 from .models import TIERS, TradingError
+from .pair_symbols import DEFAULT_PAIR_SYMBOL, PairSymbol, supported_symbols_list
 from .store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -291,16 +292,20 @@ class PairMarginEdit(BaseModel):
     cooldown_seconds: StrictInt | None = None
 
 
+class PairCycleEdit(CycleEdit):
+    symbol: PairSymbol | None = None
+
+
 class NewPair(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     id: str = Field(min_length=1, max_length=32)
     name: str = Field(min_length=1, max_length=50)
     long_account_id: str = Field(min_length=1, max_length=32)
     short_account_id: str = Field(min_length=1, max_length=32)
-    symbol: Literal["XAUUSD1"] = "XAUUSD1"
+    symbol: PairSymbol = DEFAULT_PAIR_SYMBOL
     enabled: bool = False
     ordinary: PairOrdinaryEdit | None = None
-    cycle: CycleEdit | None = None
+    cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None
 
 
@@ -308,7 +313,7 @@ class PairEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str | None = Field(default=None, min_length=1, max_length=50)
     ordinary: PairOrdinaryEdit | None = None
-    cycle: CycleEdit | None = None
+    cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None
 
     @model_validator(mode="before")
@@ -480,6 +485,10 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     def pairs():
         with engine.store.read_snapshot() as reader:
             return {"pairs": engine.pairs.states(reader)}
+
+    @app.get("/api/pairs/supported-symbols", dependencies=[Depends(authenticated)])
+    def pair_symbols():
+        return {"symbols": supported_symbols_list()}
 
     @app.post("/api/pairs", dependencies=write_dependencies)
     def create_pair(body: NewPair):

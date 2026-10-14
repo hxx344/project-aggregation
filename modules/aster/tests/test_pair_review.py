@@ -45,10 +45,10 @@ class PairReviewTests(TestCase):
         original = self.trader._read
         reads = 0
 
-        def read(brokers, **kwargs):
+        def read(brokers, symbol, **kwargs):
             nonlocal reads
             reads += 1
-            snapshots, guards = original(brokers, **kwargs)
+            snapshots, guards = original(brokers, symbol, **kwargs)
             if reads == 2:
                 guards["long"] = lambda: (_ for _ in ()).throw(TradingError("账户快照已撤销"))
             return snapshots, guards
@@ -71,7 +71,7 @@ class PairReviewTests(TestCase):
                    "before": {"LONG": "0", "SHORT": "0"}, "target_leverage": 5,
                    "previous_leverage": 2, "results": {}}
         state["pending"] = pending
-        snapshots, guards = self.trader._read(self.brokers)
+        snapshots, guards = self.trader._read(self.brokers, "XAUUSD1")
         guards["short"] = lambda: (_ for _ in ()).throw(TradingError("账户快照已撤销"))
         with patch.object(self.trader, "_read", return_value=(snapshots, guards)):
             with self.assertRaisesRegex(TradingError, "已撤销"):
@@ -84,10 +84,10 @@ class PairReviewTests(TestCase):
         original_read = self.trader._read
         reads = 0
 
-        def read(brokers, **kwargs):
+        def read(brokers, symbol, **kwargs):
             nonlocal reads
             reads += 1
-            snapshots, guards = original_read(brokers, **kwargs)
+            snapshots, guards = original_read(brokers, symbol, **kwargs)
             if reads == 2:
                 snapshots = {key: replace(snapshot, positions=[replace(p, qty=dec(0)) for p in snapshot.positions])
                              for key, snapshot in snapshots.items()}

@@ -8,12 +8,12 @@ import re
 import threading
 import time
 
-from .cycle import DEFAULT_CYCLE, validate_cycle
+from .cycle import validate_cycle
 from .exchange import LiveBroker
 from .margin_balance import DEFAULT_MARGIN, validate_margin
 from .models import AccountModeError, TradingError, dec, positive, wire
 
-SYMBOL = "XAUUSD1"
+from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, get_symbol_config, validate_symbol
 DEFAULT_ORDINARY = {"enabled": False, "threshold": "10000", "order_notional": "1000",
                     "min_open_leverage": 5, "margin_limit": "0.5", "spread_limit": "0.0005"}
 PAIR_FIELDS = {"id", "name", "long_account_id", "short_account_id", "symbol", "enabled",
@@ -38,30 +38,40 @@ def validate_pair(value):
         raise TradingError("配对组需要两个不同子账户")
     if not isinstance(pair.get("name"), str) or not 1 <= len(pair["name"].strip()) <= 50:
         raise TradingError("配对组名称需为 1 至 50 个字符")
-    pair.setdefault("symbol", SYMBOL)
+    pair.setdefault("symbol", DEFAULT_PAIR_SYMBOL)
+    symbol = validate_symbol(pair["symbol"])
+    symbol_config = get_symbol_config(symbol)
     pair.setdefault("enabled", False)
-    if pair["symbol"] != SYMBOL or type(pair["enabled"]) is not bool:
-        raise TradingError("配对组仅支持 XAUUSD1，运行开关必须为布尔值")
+    if type(pair["enabled"]) is not bool:
+        raise TradingError("配对组运行开关必须为布尔值")
     ordinary = pair.get("ordinary", {})
     margin = pair.get("margin", {})
     if not isinstance(ordinary, dict) or set(ordinary) - set(DEFAULT_ORDINARY):
         raise TradingError("配对普通策略配置字段无效")
     if not isinstance(margin, dict) or set(margin) - set(DEFAULT_MARGIN):
         raise TradingError("保证金均衡配置字段无效")
-    ordinary = {**DEFAULT_ORDINARY, **ordinary}
+    ordinary = {**DEFAULT_ORDINARY,
+                "threshold": symbol_config["default_threshold"],
+                "order_notional": symbol_config["default_order_notional"],
+                "spread_limit": symbol_config["default_spread_limit"], **ordinary}
     margin = {**DEFAULT_MARGIN, **margin}
     if type(ordinary["enabled"]) is not bool or type(margin["enabled"]) is not bool:
         raise TradingError("策略开关必须为布尔值")
     _decimal_fields(ordinary, ("threshold", "order_notional", "margin_limit", "spread_limit"))
-    if not 0 <= dec(ordinary["threshold"]) <= 1000000000 or not 500 <= dec(ordinary["order_notional"]) <= 1000000:
+    if not 0 <= dec(ordinary["threshold"]) <= 1000000000 or not dec(symbol_config["min_notional"]) <= dec(ordinary["order_notional"]) <= 1000000:
         raise TradingError("普通额度阈值应在 0 至 1000000000，单边批次金额应在 500 至 1000000 USD1")
     if type(ordinary["min_open_leverage"]) is not int or ordinary["min_open_leverage"] not in (5, 10, 20):
         raise TradingError("普通最低开仓杠杆仅支持 5x、10x、20x")
     if not 0 < dec(ordinary["margin_limit"]) <= 1 or not 0 < dec(ordinary["spread_limit"]) <= dec("0.0005"):
         raise TradingError("保证金上限须大于 0 且不超过 100%，普通价差上限须大于 0 且不超过万 5")
-    cycle = validate_cycle(pair.get("cycle"))
-    if cycle["symbol"] != SYMBOL:
-        raise TradingError("配对循环仅支持 XAUUSD1")
+    cycle_config = pair.get("cycle")
+    if cycle_config is None:
+        cycle_config = {}
+    if not isinstance(cycle_config, dict):
+        raise TradingError("配对循环配置字段无效")
+    cycle = validate_cycle({"symbol": symbol, **cycle_config}, symbols=SUPPORTED_SYMBOLS)
+    if cycle["symbol"] != symbol:
+        raise TradingError("循环策略标的必须与配对组标的一致")
     if ordinary["enabled"] and cycle["enabled"]:
         raise TradingError("同一配对组不能同时启用普通加仓和独立循环")
     margin = validate_margin(margin)
@@ -121,13 +131,16 @@ class PairManager:
         return accounts
 
     def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False):
+        from .pair_planning import require_runtime_symbols
+        require_runtime_symbols(pair, self.store.get("pair_runtime:" + pair["id"]) or {})
+        symbol = validate_symbol(pair["symbol"])
         accounts = self._members(pair)
         brokers = {account["id"]: self.engine.broker(account) for account in accounts}
         budgets = {}
         for broker in brokers.values():
             if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
                 budget = broker.api.budget
-                budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight([SYMBOL], fresh_modes=True) + 40
+                budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight([symbol], fresh_modes=True) + 40
                 if startup:
                     # Ownership verification rereads each child account.
                     budgets[budget] += 5
@@ -160,12 +173,12 @@ class PairManager:
         def read_broker(broker):
             if hasattr(broker, "reload"):
                 broker.reload()
-            snapshot = broker.snapshot([SYMBOL], fresh_modes=True)
+            snapshot = broker.snapshot([symbol], fresh_modes=True)
             current = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
             guard = (broker._snapshot_lock if isinstance(broker, LiveBroker) else None, current)
             snapshot.require_fresh()
-            snapshot.require_modes([SYMBOL])
-            snapshot.pair(SYMBOL)
+            snapshot.require_modes([symbol])
+            snapshot.pair(symbol)
             if not snapshot.can_trade:
                 raise TradingError("子账户没有交易权限")
             if not flat and snapshot.equity <= 0:
@@ -188,14 +201,14 @@ class PairManager:
         for side, snapshot in zip(("LONG", "SHORT"), snapshots):
             snapshot.require_fresh()
             for position in snapshot.positions:
-                if position.qty and (position.symbol != SYMBOL or position.side != side):
-                    raise TradingError("每个配对子账户只能持有 XAUUSD1 的指定方向，请先处理原有仓位")
-                if position.symbol == SYMBOL and position.side == side:
+                if position.qty and (position.symbol != symbol or position.side != side):
+                    raise TradingError(f"每个配对子账户只能持有 {symbol} 的指定方向，请先处理原有仓位")
+                if position.symbol == symbol and position.side == side:
                     expected = dec("0") if flat else dec(owned.get(side, "0"))
                     if position.qty != expected and (flat or not adopt):
                         raise TradingError("子账户实际仓位与配对组记录不一致，禁止自动采纳外部持仓")
-        if snapshots[0].pair(SYMBOL)[0].leverage != snapshots[1].pair(SYMBOL)[0].leverage:
-            raise TradingError("两个子账户的 XAUUSD1 实际杠杆必须相同")
+        if snapshots[0].pair(symbol)[0].leverage != snapshots[1].pair(symbol)[0].leverage:
+            raise TradingError(f"两个子账户的 {symbol} 实际杠杆必须相同")
         return dict(zip(("long", "short"), snapshots)), guards
 
     @contextmanager
@@ -259,7 +272,7 @@ class PairManager:
         if not previous:
             raise TradingError("配对组不存在")
         if not isinstance(changes, dict) or not changes or set(changes) - {"name", "ordinary", "cycle", "margin"}:
-            raise TradingError("仅可修改组名称及策略配置，账户方向固定")
+            raise TradingError("仅可修改组名称及策略配置，账户方向固定，交易标的创建后固定")
         with self.locked(previous):
             pair = self.store.pair(pair_id)
             self._idle(pair)
@@ -296,6 +309,8 @@ class PairManager:
                     pair = self.store.pair(pair_id)
                 margin = self.store.get("pair_margin:" + pair_id, {})
                 original_runtime = self._idle(pair, resume_unknown=True)
+                from .pair_planning import require_runtime_symbols
+                require_runtime_symbols(pair, original_runtime)
                 if not any(pair[key]["enabled"] for key in ("ordinary", "cycle", "margin")):
                     raise TradingError("请先选择普通策略、独立循环或保证金均衡")
                 accounts = self._members(pair)
@@ -310,7 +325,7 @@ class PairManager:
                     from .pair_recovery import require_archived_orders_clear
                     require_archived_orders_clear(self.engine, pair, state=original_runtime)
                     for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1)):
-                        if snapshots[key].pair(SYMBOL)[index].qty != dec(original_runtime["owned"][side]):
+                        if snapshots[key].pair(pair["symbol"])[index].qty != dec(original_runtime["owned"][side]):
                             raise TradingError("人工归档后实际仓位发生变化；请点击“核对并采纳当前底仓”，核对旧订单后确认当前持仓，再启动")
                 from .margin_balance import MarginBalancer
                 balancer = MarginBalancer(self.engine)
@@ -319,24 +334,24 @@ class PairManager:
                     balancer.risk_snapshots(pair, snapshots)
                 if trader._members(pair)[2] != identities:
                     raise TradingError("启动核验期间账户身份已变化，请重新核对")
-                owned = {side: wire(snapshots[key].pair(SYMBOL)[index].qty)
+                owned = {side: wire(snapshots[key].pair(pair["symbol"])[index].qty)
                          for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1))}
                 runtime = deepcopy(original_runtime)
                 previous_owned = runtime.get("owned") or {"LONG": "0", "SHORT": "0"}
                 changed = any(dec(previous_owned.get(side, "0")) != dec(qty) for side, qty in owned.items())
-                reason = (f"启动时已核验并采纳实际底仓：多 {owned['LONG']}、空 {owned['SHORT']} XAU；后续循环仅处理本轮新增仓位"
+                reason = (f"启动时已核验并采纳实际底仓：多 {owned['LONG']}、空 {owned['SHORT']} {pair['symbol']}；后续循环仅处理本轮新增仓位"
                           if changed else "两侧实际底仓与账户身份已核验，系统开始检查所选策略和保证金条件")
-                runtime.update(owned=owned, pending=None,
+                runtime.update(symbol=pair["symbol"], owned=owned, pending=None,
                     progress=empty_progress(owned, (runtime.get("progress") or {}).get("completed_cycles", 0)),
                     identities=identities, phase="waiting", reason=reason,
-                    snapshots={side: snapshot_json(snapshot, [SYMBOL]) for side, snapshot in snapshots.items()},
+                    snapshots={side: snapshot_json(snapshot, [pair["symbol"]]) for side, snapshot in snapshots.items()},
                     updated_at=time.time())
                 runtime.pop("attention", None)
                 runtime.pop("retry_after", None)
                 pair.pop("pause_reason", None)
                 pair["enabled"] = True
                 message = (f"配对组已启动；实际持仓已采纳为底仓：多 {previous_owned.get('LONG', '0')} → {owned['LONG']}，"
-                           f"空 {previous_owned.get('SHORT', '0')} → {owned['SHORT']} XAU；采纳本身未下单或划转"
+                           f"空 {previous_owned.get('SHORT', '0')} → {owned['SHORT']} {pair['symbol']}；采纳本身未下单或划转"
                            if changed else "配对组已启动，系统开始检查所选策略和保证金条件")
                 def check_current():
                     for _, current in guards.values():
@@ -424,11 +439,11 @@ class PairManager:
             from .engine import snapshot_json
             from .store import dumps
             zeros = {"LONG": "0", "SHORT": "0"}
-            runtime = {**original, "owned": zeros.copy(), "pending": None,
+            runtime = {**original, "symbol": pair["symbol"], "owned": zeros.copy(), "pending": None,
                        "progress": {"phase": "waiting_open", "baseline": zeros.copy(), "quantities": zeros.copy(),
                                     "completed_cycles": (original.get("progress") or {}).get("completed_cycles", 0)},
                        "phase": "paused", "reason": "已只读核实两子账户完全空仓，组底仓记录已清零",
-                       "snapshots": {side: snapshot_json(snapshot, [SYMBOL]) for side, snapshot in snapshots.items()},
+                       "snapshots": {side: snapshot_json(snapshot, [pair["symbol"]]) for side, snapshot in snapshots.items()},
                        "updated_at": time.time()}
             runtime.pop("attention", None)
             with self._current_members(guards), self.store.connect() as db:

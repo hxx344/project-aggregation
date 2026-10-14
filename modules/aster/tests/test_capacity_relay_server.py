@@ -45,7 +45,7 @@ class Clock:
 class RelayConfigTests(unittest.TestCase):
     def test_defaults_extensions_and_numeric_settings_are_validated_without_secrets(self):
         config = RelayConfig.from_env({"ASTER_RELAY_TOKEN": TOKEN})
-        self.assertEqual((config.host, config.port, config.symbols), ("0.0.0.0", 8766, (SYMBOL,)))
+        self.assertEqual((config.host, config.port, config.symbols), ("0.0.0.0", 8766, (SYMBOL, "XAGUSD1")))
         self.assertNotIn(TOKEN, repr(config))
         extended = RelayConfig.from_env({"ASTER_RELAY_TOKEN": TOKEN, "ASTER_RELAY_SYMBOLS": "XAUUSD1, BTCUSD1"})
         self.assertEqual(extended.symbols, (SYMBOL, "BTCUSD1"))
@@ -121,7 +121,7 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json=payload(kind, symbol))
 
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-        self.collector = RelayCollector(RelayConfig(TOKEN), http=self.http,
+        self.collector = RelayCollector(RelayConfig(TOKEN, symbols=(SYMBOL,)), http=self.http,
             clock=lambda: self.clock.utc, monotonic=lambda: self.clock.mono)
 
     async def asyncTearDown(self):
@@ -263,7 +263,7 @@ class RelayAPITests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.http = Mock()
-        self.collector = RelayCollector(RelayConfig(TOKEN), http=self.http,
+        self.collector = RelayCollector(RelayConfig(TOKEN, symbols=(SYMBOL,)), http=self.http,
             clock=lambda: self.clock.utc, monotonic=lambda: self.clock.mono)
         self.app = create_app(collector=self.collector, start_collector=False)
         self.client = TestClient(self.app)

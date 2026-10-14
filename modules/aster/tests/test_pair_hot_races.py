@@ -34,7 +34,7 @@ class PairHotRaceTests(TestCase):
             self.publish(key)
         self.state = runtime_default()
         self.state["identities"] = self.trader._members(self.pair)[2]
-        self.snapshots, self.guards = self.trader._read(self.brokers, hot=True)
+        self.snapshots, self.guards = self.trader._read(self.brokers, "XAUUSD1", hot=True)
         capacity = self.engine.require_cycle_open_capacity(self.pair["cycle"], 5)
         self.plan = plan_paired_cycle(self.pair, self.snapshots, self.engine.cycle_book(SYMBOL),
             self.engine.cycle_depth(SYMBOL), self.market.rules[SYMBOL], self.state["progress"], capacity=capacity)

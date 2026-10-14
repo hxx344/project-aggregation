@@ -3,7 +3,7 @@ import json
 import re
 import time
 
-from .models import SYMBOLS, TradingError
+from .models import MARKET_SYMBOLS, SYMBOLS, TradingError
 
 KEY = "monitoring_settings"
 DEFAULTS = {
@@ -87,7 +87,7 @@ def validate_symbol(db, symbol):
     state = db.execute("SELECT data FROM kv WHERE key='usd1_listings'").fetchone()
     rows = json.loads(state[0]).get("rows", {}) if state else {}
     if (not isinstance(symbol, str) or not re.fullmatch(r"[\w.-]{1,80}", symbol)
-            or symbol not in set(SYMBOLS) | set(rows)):
+            or symbol not in set(MARKET_SYMBOLS) | set(rows)):
         raise TradingError("请选择列表中已有的交易对")
 
 

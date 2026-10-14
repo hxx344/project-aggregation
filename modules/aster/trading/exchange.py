@@ -26,7 +26,7 @@ from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
 from .ws_evidence import PrivateEventEvidence
 from .request_timing import transport_stage
-from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, MARKET_SYMBOLS, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
 
 BASE = "https://fapi.asterdex.com"
 PUBLIC_BRACKETS_REFRESH_INTERVAL = 60
@@ -518,11 +518,11 @@ class MarketData:
         self.book_guard = threading.Lock()
         self.marks, self.mark_locks = {}, {}
         self.mark_guard = threading.Lock()
-        self.depth_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
+        self.depth_locks = {symbol: threading.Lock() for symbol in MARKET_SYMBOLS}
         self.depth_retry_at = {}
         self.public_brackets = {}
         self.public_bracket_guard = threading.Lock()
-        self.public_bracket_locks = {symbol: threading.Lock() for symbol in SYMBOLS}
+        self.public_bracket_locks = {symbol: threading.Lock() for symbol in MARKET_SYMBOLS}
         self.public_sample_guard = threading.Lock()
         self.public_samples, self.public_sample_reads = {}, {}
 
@@ -621,6 +621,32 @@ class MarketData:
                 self.assets = assets
             return self.assets.get(symbol)
 
+    @classmethod
+    def _market_rule(cls, row):
+        order_types = row.get("orderTypes", row.get("OrderType"))
+        if order_types is not None:
+            if not isinstance(order_types, list) or any(not isinstance(kind, str) for kind in order_types):
+                raise TradingError("交易订单类型响应无效")
+            if "MARKET" not in order_types:
+                return None
+        if not isinstance(row.get("filters"), list):
+            raise TradingError("交易过滤器响应无效")
+        filters = {}
+        for constraint in row["filters"]:
+            if not isinstance(constraint, dict) or not isinstance(constraint.get("filterType"), str):
+                raise TradingError("交易过滤器响应无效")
+            kind = constraint["filterType"]
+            if kind in filters:
+                raise TradingError("交易过滤器重复，无法确认市价数量规则")
+            filters[kind] = constraint
+        lot, price = filters.get("LOT_SIZE"), filters.get("PRICE_FILTER")
+        notional = filters.get("MIN_NOTIONAL", filters.get("NOTIONAL", {}))
+        if lot and price and ("notional" in notional or "minNotional" in notional):
+            step, minimum, maximum = cls.market_quantity_limits(lot, filters.get("MARKET_LOT_SIZE"))
+            return Rules(row["symbol"], step, positive(price["tickSize"]), minimum, maximum,
+                positive(notional.get("notional", notional.get("minNotional")), True), row["marginAsset"])
+        return None
+
     def load_rules(self):
         data = self.api.call("GET", "/fapi/v3/exchangeInfo")
         assets = self._margin_assets(data)
@@ -628,30 +654,18 @@ class MarketData:
         for row in data["symbols"]:
             # All assets are needed to account for outside holdings, but only the
             # configured strategy universe needs executable MARKET quantity rules.
-            if row.get("status") != "TRADING" or row["symbol"] not in SYMBOLS:
+            if row.get("status") != "TRADING" or row["symbol"] not in MARKET_SYMBOLS:
                 continue
-            order_types = row.get("orderTypes", row.get("OrderType"))
-            if order_types is not None:
-                if not isinstance(order_types, list) or any(not isinstance(kind, str) for kind in order_types):
-                    raise TradingError("交易订单类型响应无效")
-                if "MARKET" not in order_types:
-                    continue
-            if not isinstance(row.get("filters"), list):
-                raise TradingError("交易过滤器响应无效")
-            filters = {}
-            for constraint in row["filters"]:
-                if not isinstance(constraint, dict) or not isinstance(constraint.get("filterType"), str):
-                    raise TradingError("交易过滤器响应无效")
-                kind = constraint["filterType"]
-                if kind in filters:
-                    raise TradingError("交易过滤器重复，无法确认市价数量规则")
-                filters[kind] = constraint
-            lot, price = filters.get("LOT_SIZE"), filters.get("PRICE_FILTER")
-            notional = filters.get("MIN_NOTIONAL", filters.get("NOTIONAL", {}))
-            if lot and price and ("notional" in notional or "minNotional" in notional):
-                step, minimum, maximum = self.market_quantity_limits(lot, filters.get("MARKET_LOT_SIZE"))
-                rules[row["symbol"]] = Rules(row["symbol"], step, positive(price["tickSize"]), minimum, maximum,
-                    positive(notional.get("notional", notional.get("minNotional")), True), row["marginAsset"])
+            try:
+                rule = self._market_rule(row)
+            except (TradingError, KeyError, ValueError, TypeError):
+                if row["symbol"] in SYMBOLS:
+                    raise
+                # An unavailable pair-only contract disables its own execution,
+                # not startup or rules for the existing account strategies.
+                continue
+            if rule is not None:
+                rules[row["symbol"]] = rule
         with self.assets_lock:
             self.rules, self.assets = rules, assets
         for rate in data.get("rateLimits", []):
@@ -805,7 +819,7 @@ class MarketData:
 
     def depth(self, symbol):
         """Read shared WS depth, obtaining REST only to seed a connected stream."""
-        if symbol not in SYMBOLS:
+        if symbol not in MARKET_SYMBOLS:
             raise TradingError("不支持的深度市场")
         depth = self.depth_stream.snapshot(symbol)
         if depth is not None:
@@ -844,7 +858,7 @@ class MarketData:
 
     def cycle_depth(self, symbol):
         """Read local bridged depth without starting a REST seed on demand."""
-        if symbol not in SYMBOLS:
+        if symbol not in MARKET_SYMBOLS:
             raise TradingError("不支持的深度市场")
         depth = self.depth_stream.snapshot(symbol)
         if depth is None:

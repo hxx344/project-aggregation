@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from .models import MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
+from .models import MARKET_SYMBOLS, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
 from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations, pair_cost
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
@@ -24,7 +24,7 @@ from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, ident
 
 
 CAPACITY_ALERT_MAX_AGE = 8
-CAPACITY_ALERT_KEYS = frozenset(f"capacity_alert:{symbol}:{tier}" for symbol in SYMBOLS for tier in TIERS)
+CAPACITY_ALERT_KEYS = frozenset(f"capacity_alert:{symbol}:{tier}" for symbol in MARKET_SYMBOLS for tier in TIERS)
 
 
 def dumps(value):
@@ -558,7 +558,7 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             state = listing_alerts.read(db, "usd1_listings", {})
-            config = monitoring.register_symbols(db, set(SYMBOLS) | set(state.get("rows", {})))
+            config = monitoring.register_symbols(db, set(MARKET_SYMBOLS) | set(state.get("rows", {})))
             if symbol is not None:
                 monitoring.validate_symbol(db, symbol)
                 options = config["symbols"][symbol]
@@ -1344,7 +1344,7 @@ class Store:
 
     @staticmethod
     def capacity_alert_key(symbol, leverage):
-        if symbol not in SYMBOLS or type(leverage) is not int or leverage not in TIERS:
+        if symbol not in MARKET_SYMBOLS or type(leverage) is not int or leverage not in TIERS:
             raise TradingError("额度提醒市场或杠杆档位无效")
         return f"capacity_alert:{symbol}:{leverage}"
 

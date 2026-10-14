@@ -14,7 +14,7 @@ import time
 from websockets.sync.client import connect as websocket_connect
 
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DepthSnapshot
-from .models import SYMBOLS, TradingError, positive
+from .models import MARKET_SYMBOLS, TradingError, positive
 
 
 _LOG = logging.getLogger(__name__)
@@ -109,7 +109,7 @@ class PublicDepthStream:
     _MAX_UPDATE_LEVELS = 2000
     _MAX_LEVELS = DEPTH_LIMIT
 
-    def __init__(self, symbols=SYMBOLS, *, connect=None, clock=None, monotonic=None):
+    def __init__(self, symbols=MARKET_SYMBOLS, *, connect=None, clock=None, monotonic=None):
         self.symbols = tuple(dict.fromkeys(symbols))
         if not self.symbols or len(self.symbols) > 100 or any(
             not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]{1,32}", symbol)

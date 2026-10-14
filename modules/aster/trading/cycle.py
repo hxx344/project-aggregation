@@ -50,7 +50,7 @@ class CyclePlan:
     capacity_notional: Decimal | None = None
 
 
-def validate_cycle(config=None):
+def validate_cycle(config=None, *, symbols=SYMBOLS):
     if config is None:
         config = {}
     if not isinstance(config, dict) or set(config) - set(DEFAULT_CYCLE):
@@ -58,8 +58,8 @@ def validate_cycle(config=None):
     result = {**DEFAULT_CYCLE, **config}
     if type(result["enabled"]) is not bool:
         raise TradingError("循环开关必须为布尔值")
-    if result["symbol"] not in SYMBOLS:
-        raise TradingError("循环品种仅支持 XAUUSD1、SPCXUSD1、CLUSD1")
+    if result["symbol"] not in symbols:
+        raise TradingError("循环品种仅支持 " + "、".join(symbols))
     if type(result["leverage"]) is not int or not 1 <= result["leverage"] <= CYCLE_MAXIMUM["leverage"]:
         raise TradingError("循环杠杆必须为 1 至 125 的整数")
     if type(result["hold_seconds"]) is not int or not 1 <= result["hold_seconds"] <= CYCLE_MAXIMUM["hold_seconds"]:
@@ -89,7 +89,7 @@ def cycle_symbols(account):
     return [config["symbol"]] if config["enabled"] else migration_symbols(account)
 
 
-def _state(account, progress):
+def _state(account, progress, *, symbols=SYMBOLS):
     if progress is None:
         progress = {}
     if not isinstance(progress, dict):
@@ -97,11 +97,11 @@ def _state(account, progress):
     phase = progress.get("phase", "waiting_open")
     if phase not in ("waiting_open", "holding", "waiting_close"):
         raise CyclePositionError("循环阶段无效，需先核对未完成批次")
-    config = validate_cycle(account.get("cycle"))
+    config = validate_cycle(account.get("cycle"), symbols=symbols)
     if phase != "waiting_open":
         if not isinstance(progress.get("config"), dict):
             raise CyclePositionError("循环持仓缺少冻结配置，需核对后恢复")
-        config = validate_cycle(progress["config"])
+        config = validate_cycle(progress["config"], symbols=symbols)
     quantities = progress.get("quantities", {})
     if not isinstance(quantities, dict) or set(quantities) - set(SIDES):
         raise CyclePositionError("循环记录的多空数量无效")
@@ -117,9 +117,9 @@ def _state(account, progress):
     return config, phase, tracked
 
 
-def validate_cycle_positions(account, snapshot, progress=None):
+def validate_cycle_positions(account, snapshot, progress=None, *, symbols=SYMBOLS):
     """Track only the increment above the frozen original position."""
-    config, phase, tracked = _state(account, progress)
+    config, phase, tracked = _state(account, progress, symbols=symbols)
     try:
         pair = snapshot.pair(config["symbol"])
     except TradingError as exc:
@@ -147,10 +147,10 @@ def cycle_baseline(progress):
         raise CyclePositionError("循环原始持仓记录无效，需核对后恢复") from exc
 
 
-def cycle_config(account, snapshot, progress=None):
-    config, phase, _ = _state(account, progress)
+def cycle_config(account, snapshot, progress=None, *, symbols=SYMBOLS):
+    config, phase, _ = _state(account, progress, symbols=symbols)
     if phase == "waiting_open":
-        pair = validate_cycle_positions(account, snapshot, progress)
+        pair = validate_cycle_positions(account, snapshot, progress, symbols=symbols)
         config = {**config, "leverage": pair[0].leverage}
     return config
 
@@ -285,7 +285,7 @@ def _minimum_diagnostic(title, *, config, now, bids, asks, step, minimum_qty,
 
 
 def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *, daily_remaining=None,
-               market_capacity=None, opening_gate=None):
+               market_capacity=None, opening_gate=None, symbols=SYMBOLS):
     """Maximize one exact pair, or close precisely the recorded completed pair.
 
     The configured reference amount sweeps each side separately. Its VWAP
@@ -293,15 +293,15 @@ def plan_cycle(account, snapshot, book, depth, rule, progress=None, now=None, *,
     Opening margin uses gross exposure at the conservative marginal price;
     reductions remain possible when account equity or opening capacity falls.
     """
-    config, phase, tracked = _state(account, progress)
-    config = cycle_config(account, snapshot, progress)
-    if not validate_cycle(account.get("cycle"))["enabled"] or not config["enabled"]:
+    config, phase, tracked = _state(account, progress, symbols=symbols)
+    config = cycle_config(account, snapshot, progress, symbols=symbols)
+    if not validate_cycle(account.get("cycle"), symbols=symbols)["enabled"] or not config["enabled"]:
         raise TradingError("独立多空循环未开启")
     if rule.symbol != config["symbol"] or rule.margin_asset != "USD1":
         raise TradingError("循环交易规则必须对应所选 USD1 保证金品种")
     started_at = time.monotonic()
     now = time.time() if now is None else now
-    pair = validate_cycle_positions(account, snapshot, progress)
+    pair = validate_cycle_positions(account, snapshot, progress, symbols=symbols)
     # All cycle orders are tracked MARKET batches. The durable intent/recovery
     # gate owns in-flight orders; an external open-order inventory is not read.
     snapshot.require_fresh(now)

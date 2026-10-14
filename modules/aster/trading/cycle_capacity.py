@@ -4,25 +4,25 @@ import math
 
 from .cycle import validate_cycle
 from .cycle_diagnostics import diagnostic_error, diagnostic_number
-from .models import TradingError, dec, positive, wire
+from .models import SYMBOLS, TradingError, dec, positive, wire
 
 
 CYCLE_CAPACITY_MAX_AGE = 1
 
 
-def capacity_target(config):
-    config = validate_cycle(config)
+def capacity_target(config, *, symbols=SYMBOLS):
+    config = validate_cycle(config, symbols=symbols)
     target = Fraction(dec(config["max_notional"])) * (2 if config["notional_scope"] == "per_side" else 1)
     return target, target * Fraction(dec(config["capacity_multiplier"]))
 
 
-def require_cycle_capacity(config, leverage, row, *, now, minimum_notional=0):
+def require_cycle_capacity(config, leverage, row, *, now, minimum_notional=0, symbols=SYMBOLS):
     """Missing, failed or stale samples never authorize new exposure.
 
     The target is the configured upper amount, expressed as both legs combined;
     account risk checks may subsequently size the order below that target.
     """
-    target, required = capacity_target(config)
+    target, required = capacity_target(config, symbols=symbols)
     required = max(required, Fraction(positive(minimum_notional, True)))
     stamp = row.get("capacity_checked_at", {}).get(str(leverage), row.get("checked_at"))
     fresh = (type(stamp) in (int, float) and math.isfinite(stamp)

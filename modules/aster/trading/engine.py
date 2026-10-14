@@ -38,7 +38,7 @@ from .lock import ProcessLock
 from .listings import ListingMonitor, POLL_SECONDS as LISTING_POLL_SECONDS, STALE_SECONDS as LISTING_STALE_SECONDS
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
-from .models import AccountModeError, Book, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, ordinary_leverage_wait, plan_pair, positive, wire
+from .models import AccountModeError, Book, MARKET_SYMBOLS, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, ordinary_leverage_wait, plan_pair, positive, wire
 from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
 from .scheduling import AccountWork, OrdinaryRead, PollBackoff
@@ -55,7 +55,7 @@ ACCOUNT_LIST_INTERVAL = 1
 CAPACITY_POLL_INTERVAL = 2
 FAST_CAPACITY_POLL_INTERVAL = .2
 CAPACITY_MONITOR_RESERVE = 60 // CAPACITY_POLL_INTERVAL + 1
-PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_RESYNC_INTERVAL
+PUBLIC_POLL_ALLOWANCE = CAPACITY_MONITOR_RESERVE + 120 + len(MARKET_SYMBOLS) * DEPTH_WEIGHT * 60 // DEPTH_RESYNC_INTERVAL
 PRIORITY_TIERS = (10, 20)
 DEFAULT_POLICY = {"symbols": list(SYMBOLS), "threshold": "10000", "order_notional": "1000", "margin_limit": "0.5",
                   "spread_limit": "0.0005", "min_open_leverage": MIN_OPEN_LEVERAGE, "ordinary_symbol": "all"}
@@ -299,7 +299,7 @@ class Engine:
                 existing.stop_cycle_hot_data()
             return 30
         broker = self.broker(account)
-        hot_symbol = "XAUUSD1" if paired else account["cycle"]["symbol"]
+        hot_symbol = paired.get("symbol", "XAUUSD1") if paired else account["cycle"]["symbol"]
         with self.lock:
             work = self.work(account_id)
             if work.hot_listener is None:
@@ -413,7 +413,7 @@ class Engine:
 
     def on_cycle_market_update(self, symbol, source, received_at, received_monotonic):
         """The WS receiver only replaces a bounded signal and wakes scheduling."""
-        if self.shutdown.is_set() or symbol not in SYMBOLS or source not in ("bbo", "depth"):
+        if self.shutdown.is_set() or symbol not in MARKET_SYMBOLS or source not in ("bbo", "depth"):
             return
         if any(type(value) not in (int, float) or not math.isfinite(value)
                for value in (received_at, received_monotonic)):
@@ -434,7 +434,7 @@ class Engine:
     @staticmethod
     def fresh_cycle_signal(signal):
         return (isinstance(signal, dict) and signal.get("source") in ("bbo", "depth")
-                and signal.get("symbol") in SYMBOLS
+                and signal.get("symbol") in MARKET_SYMBOLS
                 and all(type(signal.get(key)) in (int, float) and math.isfinite(signal[key])
                         for key in ("received_at", "received_monotonic"))
                 and -1 <= time.time() - signal["received_at"] <= CYCLE_SIGNAL_MAX_AGE
@@ -649,10 +649,11 @@ class Engine:
             else:
                 work.priority_levels.pop(intent["symbol"], None)
 
-    def require_cycle_open_capacity(self, config, leverage, *, minimum_notional=0):
+    def require_cycle_open_capacity(self, config, leverage, *, minimum_notional=0, symbols=SYMBOLS):
         with self.lock:
             row = self.markets.get(config["symbol"], {}).copy()
-        return require_cycle_capacity(config, leverage, row, now=time.time(), minimum_notional=minimum_notional)
+        return require_cycle_capacity(config, leverage, row, now=time.time(), minimum_notional=minimum_notional,
+                                      symbols=symbols)
 
     def cycle_capacity_targets(self, accounts):
         targets = {}
@@ -711,6 +712,7 @@ class Engine:
         for pair in self.store.pairs() if pairs is None else pairs:
             if not pair["enabled"]:
                 continue
+            symbol = pair.get("symbol", "XAUUSD1")
             runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
             # The durable intent precedes dispatch and survives unknown results,
             # repairs and restarts. Only this consumer yields its fast feed.
@@ -732,20 +734,20 @@ class Engine:
                         broker = self.brokers.get(member["id"])
                     if member["mode"] == "live":
                         try:
-                            leverage = broker.cycle_cache.current_leverage("XAUUSD1") if isinstance(broker, LiveBroker) else None
+                            leverage = broker.cycle_cache.current_leverage(symbol) if isinstance(broker, LiveBroker) else None
                         except TradingError:
                             leverage = None
                     else:
                         snapshot = snapshots.get(side, {})
                         stamp = snapshot.get("timestamp")
-                        actual = {row["leverage"] for row in snapshot.get("positions", []) if row["symbol"] == "XAUUSD1"}
+                        actual = {row["leverage"] for row in snapshot.get("positions", []) if row["symbol"] == symbol}
                         leverage = next(iter(actual)) if (len(actual) == 1 and type(stamp) in (int, float)
                             and math.isfinite(stamp) and -1 <= time.time() - stamp <= 8) else None
                     levels.append(leverage)
                 if len(set(levels)) == 1 and type(levels[0]) is int and 1 <= levels[0] <= 125:
-                    targets.setdefault("XAUUSD1", set()).add(levels[0])
+                    targets.setdefault(symbol, set()).add(levels[0])
             elif pair["ordinary"]["enabled"]:
-                targets.setdefault("XAUUSD1", set()).update(leverage_candidates(pair["ordinary"]["min_open_leverage"]))
+                targets.setdefault(symbol, set()).update(leverage_candidates(pair["ordinary"]["min_open_leverage"]))
         return targets
 
     def capacity_interval(self, symbol):
@@ -780,15 +782,13 @@ class Engine:
                 required.setdefault(symbol, []).append(account["name"])
         for pair in reader.pairs():
             if pair_active(pair, reader.get("pair_runtime:" + pair["id"])):
-                required.setdefault("XAUUSD1", []).append(pair["name"])
+                required.setdefault(pair.get("symbol", "XAUUSD1"), []).append(pair["name"])
         return required
 
     def monitored_market_symbols(self, accounts=None):
         with self.store.read_snapshot() as reader:
             config = reader.monitoring_settings()
             selected = {symbol for symbol in SYMBOLS if monitoring.monitored(config, symbol)}
-            if len(selected) == len(SYMBOLS):
-                return selected
             return selected | self.required_monitoring_symbols(reader, accounts).keys()
 
     def capacity_market_symbols(self, accounts=None):
@@ -812,13 +812,13 @@ class Engine:
         listings = reader.get("usd1_listings") or {}
         watched = set(reader.listing_watch_symbols())
         required = self.required_monitoring_symbols(reader, accounts)
-        symbols = set(SYMBOLS) | set(listings.get("rows", {})) | config["symbols"].keys()
+        symbols = set(MARKET_SYMBOLS) | set(listings.get("rows", {})) | config["symbols"].keys()
         return {"settings": {key: config[key] for key in monitoring.DEFAULTS},
                 "revision": config["revision"],
                 "strategy_capacity_environment_enabled": os.environ.get("ASTER_CAPACITY_ALERT_ENABLED", "1").strip() == "1",
                 "symbols": [{"symbol": symbol, **monitoring.symbol_options(config, symbol),
                     "max_capacity_alert": symbol in watched, "can_watch": symbol in listings.get("rows", {}),
-                    "strategy_market": symbol in SYMBOLS, "required_by": required.get(symbol, []),
+                    "strategy_market": symbol in MARKET_SYMBOLS, "required_by": required.get(symbol, []),
                     "effective_monitor": not self.demo and (monitoring.monitored(config, symbol) or symbol in required),
                     "detail_enabled": not self.demo and monitoring.monitored(config, symbol),
                     "status": listings.get("rows", {}).get(symbol, {}).get("status", "TRADING")}
@@ -832,7 +832,7 @@ class Engine:
             # Reading the relay's cache spends no Aster weight on this host.
             # Keep consumption cadence independent of the local IP's budget.
             self.market.api.budget.configure_capacity_reserve(0)
-            intervals = dict.fromkeys(SYMBOLS, CAPACITY_POLL_INTERVAL)
+            intervals = dict.fromkeys(MARKET_SYMBOLS, CAPACITY_POLL_INTERVAL)
             intervals.update(dict.fromkeys(targets, FAST_CAPACITY_POLL_INTERVAL))
             return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL, bool(symbols)
         count = len(targets)
@@ -842,9 +842,9 @@ class Engine:
             self.market.api.budget.configure_capacity_reserve(math.ceil(allowance))
             allowance = self.market.api.budget.snapshot()["capacity_reserve"]
         if allowance <= 0:
-            return dict.fromkeys(SYMBOLS, 60), 60, False
+            return dict.fromkeys(MARKET_SYMBOLS, 60), 60, False
         scale = max(1, baseline / allowance)
-        intervals = dict.fromkeys(SYMBOLS, CAPACITY_POLL_INTERVAL * scale)
+        intervals = dict.fromkeys(MARKET_SYMBOLS, CAPACITY_POLL_INTERVAL * scale)
         if count and scale == 1:
             remaining = allowance - baseline + count * 60 / CAPACITY_POLL_INTERVAL
             interval = max(FAST_CAPACITY_POLL_INTERVAL, 60 / math.floor(remaining / count))
@@ -2654,7 +2654,7 @@ class Engine:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=4 * MAX_ACCOUNTS + 4 * len(SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=4 * MAX_ACCOUNTS + 4 * len(MARKET_SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 self._ordinary_pool = pool
                 try:
                     while not self.shutdown.is_set():
@@ -2765,7 +2765,7 @@ class Engine:
                             self.capacity_targets, self.capacity_accounts = targets, saved_accounts
                             self.capacity_intervals = intervals
                             self.capacity_brackets_interval, self.capacity_poll_enabled = brackets_interval, poll_enabled
-                        for symbol in SYMBOLS:
+                        for symbol in MARKET_SYMBOLS:
                             if targets.get(symbol) != old_targets.get(symbol) or intervals[symbol] != old_intervals.get(symbol, CAPACITY_POLL_INTERVAL):
                                 key = "market:" + symbol
                                 interval = intervals[symbol]

@@ -80,9 +80,9 @@ class PairBudgetTests(TestCase):
 
     def test_ordinary_polls_reuse_modes_and_events_revoke_cached_authority(self):
         self.live_brokers()
-        self.trader._read(self.brokers)
+        self.trader._read(self.brokers, "XAUUSD1")
         before = self.budget.snapshot()["used"]
-        snapshots, guards = self.trader._read(self.brokers)
+        snapshots, guards = self.trader._read(self.brokers, "XAUUSD1")
         self.assertEqual(self.budget.snapshot()["used"] - before, 20)
         for broker in self.brokers.values():
             self.assertEqual(sum(path == DUAL for _, path, _ in broker.api.calls), 1)
@@ -92,7 +92,7 @@ class PairBudgetTests(TestCase):
         broker._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
         with self.assertRaises(TradingError):
             guards["long"]()
-        fresh, _ = self.trader._read(self.brokers)
+        fresh, _ = self.trader._read(self.brokers, "XAUUSD1")
         with self.assertRaises(AccountModeError):
             fresh["long"].require_modes([SYMBOL])
         self.assertEqual(sum(path == DUAL for _, path, _ in broker.api.calls), 2)
@@ -101,8 +101,8 @@ class PairBudgetTests(TestCase):
         self.live_brokers()
         self.budget.reserve(1500)
         with self.assertRaises(BudgetWait):
-            self.trader._read(self.brokers)
-        snapshots, guards = self.trader._read(self.brokers, reconciliation=True)
+            self.trader._read(self.brokers, "XAUUSD1")
+        snapshots, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertEqual(set(snapshots), {"long", "short"})
         self.assertEqual(self.budget.snapshot()["used"], 1642)
         for broker in self.brokers.values():
@@ -184,7 +184,7 @@ class PairBudgetTests(TestCase):
                 else:
                     self.budget.block(30, reason="HTTP 429")
                 with self.assertRaises(RequestNotSent):
-                    self.trader._read(self.brokers, reconciliation=True)
+                    self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
                 legs = self.legs(reducing=True)
                 self.trader._dispatch(self.pair, runtime_default(), self.brokers, legs, reconciliation=True)
                 self.assertTrue(all(leg["receipt"]["local_not_sent"] for leg in legs))

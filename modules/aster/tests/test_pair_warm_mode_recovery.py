@@ -33,7 +33,7 @@ class PairWarmModeRecoveryTests(TestCase):
             broker.api.calls.clear()
 
     def warm(self):
-        result = self.trader._read(self.brokers)
+        result = self.trader._read(self.brokers, "XAUUSD1")
         self.clear_calls()
         return result
 
@@ -45,7 +45,7 @@ class PairWarmModeRecoveryTests(TestCase):
         stamps = {key: dict(broker.cached_at) for key, broker in self.brokers.items()}
         self.paper["long"].submit([Executor.order(SYMBOL, "LONG", "BUY", dec("0.001"), "external")])
         before = self.budget.snapshot()["used"]
-        snapshots, guards = self.trader._read(self.brokers, reconciliation=True)
+        snapshots, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertEqual(self.budget.snapshot()["used"] - before, 20)
         self.assertEqual(snapshots["long"].pair(SYMBOL)[0].qty, dec("0.001"))
         for key, broker in self.brokers.items():
@@ -58,33 +58,33 @@ class PairWarmModeRecoveryTests(TestCase):
         self.warm()
         with self.budget.reconciliation():
             self.budget.reserve(self.budget.limit - 24 - self.budget.snapshot()["used"])
-        self.trader._read(self.brokers, reconciliation=True)
+        self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertEqual(self.budget.snapshot()["used"], self.budget.limit - 4)
         self.clear_calls()
         with self.assertRaises(BudgetWait):
-            self.trader._read(self.brokers, reconciliation=True)
+            self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertTrue(all(not self.paths(key) for key in self.brokers))
 
     def test_dual_expires_at_fifteen_seconds_but_multi_at_ten_minutes(self):
         self.warm()
         started = self.ticks
         self.ticks += 14.999
-        self.trader._read(self.brokers, reconciliation=True)
+        self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertTrue(all(DUAL not in self.paths(key) and MULTI not in self.paths(key) for key in self.brokers))
         self.clear_calls()
         self.ticks += 0.002
-        self.trader._read(self.brokers, reconciliation=True)
+        self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         for key in self.brokers:
             self.assertEqual(self.paths(key), [DUAL, ACCOUNT, RISK])
         self.clear_calls()
         self.ticks = started + 599.999
-        self.trader._read(self.brokers, reconciliation=True)
+        self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         for key, broker in self.brokers.items():
             self.assertNotIn(MULTI, self.paths(key))
             self.assertEqual(broker.cached_at["multi"], started)
         self.clear_calls()
         self.ticks = started + 600.001
-        self.trader._read(self.brokers, reconciliation=True)
+        self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         for key in self.brokers:
             self.assertEqual(self.paths(key), [MULTI, ACCOUNT, RISK])
 
@@ -92,7 +92,7 @@ class PairWarmModeRecoveryTests(TestCase):
         self.warm()
         self.brokers["long"].cached_at["dual"] -= 15
         before = self.budget.snapshot()["used"]
-        self.trader._read(self.brokers, reconciliation=True)
+        self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertEqual(self.budget.snapshot()["used"] - before, 50)
         self.assertEqual(self.paths("long"), [DUAL, ACCOUNT, RISK])
         self.assertEqual(self.paths("short"), [ACCOUNT, RISK])
@@ -104,7 +104,7 @@ class PairWarmModeRecoveryTests(TestCase):
                 self.brokers["long"]._cycle_account_event(event)
                 with self.assertRaises(TradingError):
                     guards["long"]()
-                _, guards = self.trader._read(self.brokers, reconciliation=True)
+                _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
                 self.assertEqual(self.paths("long"), [ACCOUNT, RISK])
                 self.clear_calls()
 
@@ -115,7 +115,7 @@ class PairWarmModeRecoveryTests(TestCase):
         broker.api.hedge = False
         with self.assertRaises(TradingError):
             guards["long"]()
-        snapshots, _ = self.trader._read(self.brokers, reconciliation=True)
+        snapshots, _ = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertEqual(self.paths("long"), [DUAL, MULTI, ACCOUNT, RISK])
         self.assertEqual(self.paths("short"), [ACCOUNT, RISK])
         with self.assertRaises(AccountModeError):
@@ -133,7 +133,7 @@ class PairWarmModeRecoveryTests(TestCase):
             return value
 
         with patch.object(broker.api, "call", side_effect=changed), self.assertRaises(SnapshotSuperseded):
-            self.trader._read(self.brokers, reconciliation=True)
+            self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
         self.assertNotIn(DUAL, self.paths("long"))
         self.assertNotIn(MULTI, self.paths("long"))
 
@@ -202,7 +202,7 @@ class PairWarmModeRecoveryTests(TestCase):
             streams[0].on_state(False)
             with self.assertRaises(TradingError):
                 guards["long"]()
-            _, guards = self.trader._read(self.brokers, reconciliation=True)
+            _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.assertEqual(self.paths("long"), [DUAL, MULTI, ACCOUNT, RISK])
             # Offline REST evidence stays usable until expiry; retries do not
             # repeatedly throw it away and trigger another pair of 30-weight GETs.
@@ -212,17 +212,17 @@ class PairWarmModeRecoveryTests(TestCase):
             streams[0].on_state(True)
             with self.assertRaises(TradingError):
                 guards["long"]()
-            _, guards = self.trader._read(self.brokers, reconciliation=True)
+            _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.assertEqual(self.paths("long"), [DUAL, MULTI, ACCOUNT, RISK])
             broker.stop_cycle_hot_data()
             with self.assertRaises(TradingError):
                 guards["long"]()
             broker.start_cycle_hot_data([SYMBOL])
-            _, guards = self.trader._read(self.brokers, reconciliation=True)
+            _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.clear_calls()
             streams[0].on_state(False)
             streams[0].on_event("ACCOUNT_CONFIG_UPDATE")
             guards["long"]()
-            self.trader._read(self.brokers, reconciliation=True)
+            self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.assertEqual(self.paths("long"), [ACCOUNT, RISK])
             broker.stop_cycle_hot_data()

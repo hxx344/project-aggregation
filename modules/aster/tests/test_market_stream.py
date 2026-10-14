@@ -374,6 +374,7 @@ class PublicQuoteLifecycleTests(unittest.TestCase):
         self.assertEqual(url.split("streams=")[1].split("/"), [
             "xauusd1@bookTicker", "xauusd1@markPrice@1s", "spcxusd1@bookTicker",
             "spcxusd1@markPrice@1s", "clusd1@bookTicker", "clusd1@markPrice@1s",
+            "xagusd1@bookTicker", "xagusd1@markPrice@1s",
         ])
         self.assertEqual(connect.call_args.kwargs["open_timeout"], 3)
         self.assertEqual(connect.call_args.kwargs["close_timeout"], 1)

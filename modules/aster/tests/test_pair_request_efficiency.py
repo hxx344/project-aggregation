@@ -78,7 +78,11 @@ class PairRequestEfficiencyTests(TestCase):
         self.trader.tick(self.pair)
         self.assertEqual(self.read_count(), 4)
         self.store.put("pair_margin:gold", {"pending": {"status": "unknown"}})
-        self.assertEqual(self.trader.tick(self.pair)["phase"], "margin_wait")
+        # Base setup stubs all balance checks as nonblocking. This scheduler
+        # case needs the unresolved-transfer result that its marker represents.
+        with patch("trading.margin_balance.MarginBalancer.tick", return_value={"blocks_trading": True}) as balance:
+            self.assertEqual(self.trader.tick(self.pair)["phase"], "margin_wait")
+        balance.assert_called_once()
         self.assertEqual(self.read_count(), 4)  # Reconciliation has no snapshot consumer.
         self.store.put("pair_margin:gold", {})
         self.trader.tick(self.pair)  # The old negative observation was revoked.

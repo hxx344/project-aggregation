@@ -15,6 +15,11 @@ import {
   percentFromMarginLimit,
   parseMinimumLeverage,
 } from './policy.ts';
+import {
+  DEFAULT_PAIR_SYMBOL,
+  LEGACY_PAIR_SYMBOLS,
+  type PairSymbol,
+} from './pair-symbols.ts';
 
 export type PairSnapshot = NonNullable<Account['snapshot']>;
 export type PairApiNotice = {
@@ -53,7 +58,7 @@ export type Pair = {
   name: string;
   long_account_id: string;
   short_account_id: string;
-  symbol: 'XAUUSD1';
+  symbol: string;
   enabled: boolean;
   revision?: number;
   pause_reason?: string;
@@ -118,6 +123,7 @@ export type PairDraft = {
   name: string;
   long_account_id: string;
   short_account_id: string;
+  symbol: string;
   mode: 'monitor' | 'ordinary' | 'cycle';
   threshold: string;
   order_notional: string;
@@ -136,24 +142,30 @@ export type PairDraft = {
 };
 
 export function pairDraft(pair?: Pair): PairDraft {
+  const symbol = pair?.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
   return {
     id: pair?.id ?? '',
     name: pair?.name ?? '',
     long_account_id: pair?.long_account_id ?? '',
     short_account_id: pair?.short_account_id ?? '',
+    symbol,
     mode: pair?.ordinary.enabled
       ? 'ordinary'
       : pair?.cycle.enabled
         ? 'cycle'
         : 'monitor',
-    threshold: pair?.ordinary.threshold ?? '10000',
-    order_notional: pair?.ordinary.order_notional ?? '1000',
+    threshold:
+      pair?.ordinary.threshold ?? DEFAULT_PAIR_SYMBOL.default_threshold,
+    order_notional:
+      pair?.ordinary.order_notional ??
+      DEFAULT_PAIR_SYMBOL.default_order_notional,
     min_open_leverage: String(pair?.ordinary.min_open_leverage ?? 5),
     margin_percent: percentFromMarginLimit(
       pair?.ordinary.margin_limit ?? '0.5',
     ),
-    spread_limit: pair?.ordinary.spread_limit ?? '0.0005',
-    cycle: cycleDraft(pair?.cycle),
+    spread_limit:
+      pair?.ordinary.spread_limit ?? DEFAULT_PAIR_SYMBOL.default_spread_limit,
+    cycle: { ...cycleDraft(pair?.cycle), symbol: pair?.cycle.symbol ?? symbol },
     margin_enabled: pair?.margin.enabled ?? false,
     master_env_prefix: pair?.margin.master_env_prefix ?? '',
     check_interval_seconds: String(pair?.margin.check_interval_seconds ?? 5),
@@ -162,6 +174,31 @@ export function pairDraft(pair?: Pair): PairDraft {
     max_transfer: pair?.margin.max_transfer ?? '1000',
     buffer_percent: percentFromMarginLimit(pair?.margin.buffer_ratio ?? '0.05'),
     cooldown_seconds: String(pair?.margin.cooldown_seconds ?? 30),
+  };
+}
+
+export function selectPairSymbol(
+  draft: PairDraft,
+  selected: PairSymbol,
+  symbols: readonly PairSymbol[],
+): PairDraft {
+  const previous = symbols.find((item) => item.symbol === draft.symbol);
+  return {
+    ...draft,
+    symbol: selected.symbol,
+    cycle: { ...draft.cycle, symbol: selected.symbol },
+    threshold:
+      draft.threshold === previous?.default_threshold
+        ? selected.default_threshold
+        : draft.threshold,
+    order_notional:
+      draft.order_notional === previous?.default_order_notional
+        ? selected.default_order_notional
+        : draft.order_notional,
+    spread_limit:
+      draft.spread_limit === previous?.default_spread_limit
+        ? selected.default_spread_limit
+        : draft.spread_limit,
   };
 }
 
@@ -229,11 +266,24 @@ export function parsePairDraft(
   accounts: Account[],
   pairs: Pair[],
   currentId?: string,
+  symbols: readonly PairSymbol[] = LEGACY_PAIR_SYMBOLS,
 ) {
   if (!/^[a-z0-9_-]{1,32}$/.test(draft.id))
     throw new Error('组标识只允许 1–32 位小写字母、数字、下划线或短横线');
   const name = draft.name.trim();
   if (!name || name.length > 50) throw new Error('组名称须为 1–50 个字符');
+  const symbol = draft.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
+  const current = pairs.find((pair) => pair.id === currentId);
+  const savedSymbol = current?.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
+  if (current && symbol !== savedSymbol)
+    throw new Error('配对组创建后不能更改交易标的');
+  const symbolConfig = symbols.find((item) => item.symbol === symbol);
+  if (!symbolConfig && (!current || symbol !== savedSymbol))
+    throw new Error('请选择目录中支持的配对标的');
+  if (draft.cycle.symbol !== symbol)
+    throw new Error('循环策略标的必须与配对组一致');
+  const minNotional =
+    symbolConfig?.min_notional ?? DEFAULT_PAIR_SYMBOL.min_notional;
   const available = availablePairAccounts(accounts, pairs, currentId);
   const long = available.find(
     (account) => account.id === draft.long_account_id,
@@ -280,10 +330,10 @@ export function parsePairDraft(
   if (compareAmounts(threshold, '1000000000') > 0)
     throw new Error('公共额度门槛不能超过 1000000000 USD1');
   if (
-    compareAmounts(notional, '500') < 0 ||
+    compareAmounts(notional, minNotional) < 0 ||
     compareAmounts(notional, '1000000') > 0
   )
-    throw new Error('每侧开仓金额须为 500–1000000 USD1');
+    throw new Error(`每侧开仓金额须为 ${minNotional}–1000000 USD1`);
   if (compareAmounts(spread, '0.0005') > 0)
     throw new Error('普通开仓价差比例不能超过 0.0005');
   if (compareAmounts(balanceThreshold, '1000000000') > 0)
@@ -296,7 +346,7 @@ export function parsePairDraft(
     name,
     long_account_id: long.id,
     short_account_id: short.id,
-    symbol: 'XAUUSD1' as const,
+    symbol,
     ordinary: {
       enabled: draft.mode === 'ordinary',
       threshold,
@@ -305,11 +355,10 @@ export function parsePairDraft(
       margin_limit: marginLimitFromPercent(draft.margin_percent),
       spread_limit: spread,
     },
-    cycle: parseCycleDraft({
-      ...draft.cycle,
-      symbol: 'XAUUSD1',
-      enabled: draft.mode === 'cycle',
-    }),
+    cycle: parseCycleDraft(
+      { ...draft.cycle, enabled: draft.mode === 'cycle' },
+      [symbol],
+    ),
     margin: {
       enabled: draft.margin_enabled,
       master_env_prefix: prefix,
@@ -450,6 +499,7 @@ export function pairNetQuantity(
   snapshots:
     | { long?: PairSnapshot | null; short?: PairSnapshot | null }
     | undefined,
+  symbol = DEFAULT_PAIR_SYMBOL.symbol,
 ): string | null {
   if (
     !snapshots?.long ||
@@ -461,7 +511,7 @@ export function pairNetQuantity(
   const values: { units: bigint; scale: number; sign: bigint }[] = [];
   for (const side of ['long', 'short'] as const) {
     for (const position of snapshots[side]!.positions) {
-      if (position.symbol !== 'XAUUSD1') continue;
+      if (position.symbol !== symbol) continue;
       const parsed = quantityUnits(position.qty);
       if (!parsed || !['LONG', 'SHORT'].includes(position.side)) return null;
       values.push({

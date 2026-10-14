@@ -14,7 +14,7 @@ from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
-SYMBOL = "XAUUSD1"
+from .pair_planning import require_runtime_symbols
 SIDES = (("long", "LONG"), ("short", "SHORT"))
 MIN_AGE = 120
 PREVIEW_TTL = 300
@@ -23,7 +23,7 @@ MAX_WATCH_BATCHES = 8
 
 def _query(broker, order):
     try:
-        row = broker.query(SYMBOL, order["newClientOrderId"])
+        row = broker.query(order["symbol"], order["newClientOrderId"])
     except PaperOrderAbsent:
         if isinstance(broker, PaperBroker):
             return None
@@ -66,6 +66,7 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
     """Only new writes use this guard; reductions and existing recovery remain possible."""
     from .pair_execution import PairTrader
     state = engine.store.get("pair_runtime:" + pair["id"], {}) if state is None else state
+    require_runtime_symbols(pair, state)
     watch = state.get("recovery_watch")
     if watch is None:
         return
@@ -125,7 +126,9 @@ class PairOrderRecovery:
         pair = self.store.pair(pair_id)
         if pair is None:
             raise TradingError("配对组不存在")
+        symbol = pair["symbol"]
         state = self.manager._idle(pair)
+        require_runtime_symbols(pair, state)
         if state.get("recovery_watch") is None:
             raise TradingError("当前没有人工归档订单，无需重新确认底仓")
         progress = state.get("progress")
@@ -145,14 +148,14 @@ class PairOrderRecovery:
                 if isinstance(broker, LiveBroker):
                     budget.enter_context(broker.reconciliation_budget())
             MarginBalancer(self.engine).verify_members(pair)
-        actual = {side: wire(snapshots[key].pair(SYMBOL)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
-        leverage = snapshots["long"].pair(SYMBOL)[0].leverage
+        actual = {side: wire(snapshots[key].pair(symbol)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
+        leverage = snapshots["long"].pair(symbol)[0].leverage
         with self.manager._current_members(guards):
             if PairTrader(self.engine)._members(pair)[2] != identities:
                 raise TradingError("核对期间账户身份变化，请重新核对")
         return {"pair": pair, "state": state, "margin": margin, "accounts": accounts,
             "identities": identities, "guards": guards, "snapshots": snapshots,
-            "view_snapshots": {key: snapshot_json(snapshot, [SYMBOL]) for key, snapshot in snapshots.items()},
+            "view_snapshots": {key: snapshot_json(snapshot, [symbol]) for key, snapshot in snapshots.items()},
             "actual": actual, "leverage": leverage, "orders": orders,
             "fingerprint": self._baseline_fingerprint(pair, state, margin, accounts)}
 
@@ -207,15 +210,17 @@ class PairOrderRecovery:
 
     @staticmethod
     def _eligible(pair, state, margin, *, archive=True, background=False, allow_cycle_unknown=False):
+        symbol = pair["symbol"]
         from .pairing import has_cycle_quantity
         if pair.get("enabled") is not False and not background:
             raise TradingError("请先暂停配对组，再核对遗留订单与持仓")
         if not isinstance(state, dict) or not isinstance(margin, dict):
             raise TradingError("配对或划转记录无效，不能人工归档")
+        require_runtime_symbols(pair, state)
         pending = state.get("pending")
         kinds = {"ordinary", "cycle"} if allow_cycle_unknown else {"ordinary"}
         if (not isinstance(pending, dict) or pending.get("kind") not in kinds or pending.get("phase") != "open"
-                or pending.get("symbol") != SYMBOL):
+                or pending.get("symbol") != symbol):
             raise TradingError("此恢复入口仅支持符合条件的开仓未决批次；减仓和杠杆调整须继续原恢复流程")
         cycle_unknown = pending["kind"] == "cycle"
         progress = state.get("progress")
@@ -267,7 +272,7 @@ class PairOrderRecovery:
             order = leg.get("order")
             if not isinstance(order, dict):
                 raise TradingError(f"{label}：原委托记录缺失，无法核对")
-            expected = {"symbol": SYMBOL, "positionSide": side,
+            expected = {"symbol": symbol, "positionSide": side,
                         "side": "BUY" if side == "LONG" else "SELL", "type": "MARKET"}
             for field, value in expected.items():
                 if order.get(field) != value:
@@ -302,7 +307,7 @@ class PairOrderRecovery:
             if not isinstance(leg, dict) or leg.get("key") not in {"long", "short"}:
                 raise TradingError("补偿订单账户方向无效，无法核对")
             order, side = leg.get("order"), leg["key"].upper()
-            if (not isinstance(order, dict) or order.get("symbol") != SYMBOL
+            if (not isinstance(order, dict) or order.get("symbol") != symbol
                     or order.get("positionSide") != side or order.get("side") != ("SELL" if side == "LONG" else "BUY")
                     or order.get("type") != "MARKET" or leg.get("dispatch") not in {"prepared", "sending"}
                     or not 0 < positive(order.get("quantity")) <= qty):
@@ -422,6 +427,7 @@ class PairOrderRecovery:
 
     def reconcile_positions(self, trader, pair, state, *, source, member_read=None):
         """Preserve verified balanced ordinary positions without inventing receipts."""
+        symbol = pair["symbol"]
         from .pair_execution import empty_progress
         from .pair_planning import PairRecoveryConflict, PairPositionError, positions
         background = source == "automatic_positions"
@@ -452,7 +458,7 @@ class PairOrderRecovery:
         observed_quantities = {}
         for key, side in SIDES:
             observed = [row for row in state.get("snapshots", {}).get(key, {}).get("positions", [])
-                        if row.get("symbol") == SYMBOL and row.get("side") == side]
+                        if row.get("symbol") == symbol and row.get("side") == side]
             if len(observed) != 1:
                 return False
             observed_quantities[side] = Fraction(dec(observed[0].get("qty")))
@@ -470,7 +476,7 @@ class PairOrderRecovery:
         accounts = self.manager._members(pair)
         snapshots, guards = member_read if member_read is not None else self.manager._read_members(
             pair, adopt=True, reconciliation=True)
-        held = positions(snapshots)
+        held = positions(snapshots, symbol)
         actual = {side: Fraction(held[side].qty) for _, side in SIDES}
         if not acceptable(actual) or any(pos.leverage != pending["leverage"] for pos in held.values()):
             raise PairPositionError("仓位核对未通过：需两侧数量相等或分别回到原底仓，且杠杆不变；"
@@ -492,7 +498,7 @@ class PairOrderRecovery:
             "external_reduction": {side: wire(max(Fraction(0), expected[side] - actual[side])) for _, side in SIDES},
         }
         reconciled.update(owned=owned, progress=empty_progress(owned, state["progress"].get("completed_cycles", 0)))
-        trader._publish_snapshots(reconciled, snapshots)
+        trader._publish_snapshots(reconciled, snapshots, symbol)
         def check_current(db):
             # The database writer lock can wait beyond the snapshot lifetime.
             # Check CAS inside the transaction, not just before BEGIN IMMEDIATE.
@@ -523,20 +529,24 @@ class PairOrderRecovery:
         return True
 
     def _history(self, broker, pending):
+        symbol = pending["symbol"]
         start, end = int((pending["created_at"] - 60) * 1000), int(time.time() * 1000)
         if isinstance(broker, LiveBroker):
             with broker.reconciliation_budget():
                 rows = broker.api.call("GET", "/fapi/v3/allOrders", {
-                    "symbol": SYMBOL, "startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=5)
+                    "symbol": symbol, "startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=5)
         elif isinstance(broker, PaperBroker):
             broker.reload()
-            rows = list(broker.state["orders"].values())
+            # Match the live endpoint's symbol scope. Closed orders from a
+            # previously used pair must not contaminate this recovery window.
+            rows = [row for row in broker.state["orders"].values()
+                    if not isinstance(row, dict) or row.get("symbol") in (None, symbol)]
         else:
             raise TradingError("当前账户不支持完整历史订单核对")
         if not isinstance(rows, list) or len(rows) >= 1000:
             raise TradingError("历史订单响应不完整或达到 1000 条上限，不能将未找到视为核对依据")
         for row in rows:
-            if (not isinstance(row, dict) or row.get("symbol") != SYMBOL
+            if (not isinstance(row, dict) or row.get("symbol") != symbol
                     or not isinstance(row.get("clientOrderId"), str) or not row["clientOrderId"]):
                 raise TradingError("历史订单响应字段无效，不能人工归档")
         return rows, {"start_time": start, "end_time": end, "rows": len(rows)}
@@ -547,6 +557,7 @@ class PairOrderRecovery:
         pair = self.store.pair(pair_id)
         if pair is None:
             raise TradingError("配对组不存在")
+        symbol = pair["symbol"]
         state, margin = self.store.get("pair_runtime:" + pair_id, {}), self.store.get("pair_margin:" + pair_id, {})
         pending = self._eligible(pair, state, margin, allow_cycle_unknown=True)
         accounts = self.manager._members(pair)
@@ -585,11 +596,11 @@ class PairOrderRecovery:
                     budget.enter_context(broker.reconciliation_budget())
             MarginBalancer(self.engine).verify_members(pair)
         snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True)
-        actual = {side: wire(snapshots[key].pair(SYMBOL)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
+        actual = {side: wire(snapshots[key].pair(symbol)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
         if not found:
             if any(dec(actual[side]) != dec(pending["before"][side]) for _, side in SIDES):
                 raise TradingError("实际持仓未回到本批开仓前底仓；即使两侧数量相等，也不能归档此未决批次")
-            if any(snapshot.pair(SYMBOL)[0].leverage != pending["leverage"] for snapshot in snapshots.values()):
+            if any(snapshot.pair(symbol)[0].leverage != pending["leverage"] for snapshot in snapshots.values()):
                 raise TradingError("实际杠杆与原批次不一致，不能人工归档")
             require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers)
         if PairTrader(self.engine)._members(pair)[2] != identities:
@@ -660,7 +671,8 @@ class PairOrderRecovery:
         watches = deepcopy((runtime.get("recovery_watch") or {}).get("batches", []))
         if len(watches) >= MAX_WATCH_BATCHES:
             raise TradingError("待观察的人工归档批次已达上限，请先处理原订单记录")
-        watches.append({"id": pending["id"], "created_at": pending["created_at"], "identities": read["identities"],
+        watches.append({"id": pending["id"], "symbol": read["pair"]["symbol"],
+                        "created_at": pending["created_at"], "identities": read["identities"],
                         "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])} for leg in pending["legs"]]})
         kind = "循环" if pending["kind"] == "cycle" else "普通"
         message = f"已人工归档未取得回执的{kind}开仓批次，底仓保留；配对组仍暂停，可点击启动重新核验"
@@ -668,7 +680,7 @@ class PairOrderRecovery:
                  "preview": deepcopy(preview["review"]), "confirmation": read["evidence"], "actual": read["actual"]}
         runtime.update(pending=None, phase="paused", reason=message, recovery_watch={"batches": watches},
             progress=empty_progress(runtime["owned"], (runtime.get("progress") or {}).get("completed_cycles", 0)),
-            snapshots={key: snapshot_json(snapshot, [SYMBOL]) for key, snapshot in read["snapshots"].items()},
+            snapshots={key: snapshot_json(snapshot, [read["pair"]["symbol"]]) for key, snapshot in read["snapshots"].items()},
             updated_at=time.time())
         runtime.pop("attention", None)
         runtime.pop("retry_after", None)

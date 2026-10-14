@@ -51,7 +51,7 @@ run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-versi
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python-aster"
 run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
 run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
-(cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
+(cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_pair_margin tests.test_pair_trading tests.test_pair_symbol_api tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
 (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
 (cd "$work_dir/source"; run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]

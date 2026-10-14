@@ -16,6 +16,9 @@ MIN_BATCH_NOTIONAL = Decimal("500")
 TAKER_FEE_ESTIMATE = Decimal("0.0004")
 EXTRA_MARGIN_ALLOWANCE = Fraction(1, 20)
 SYMBOLS = ("XAUUSD1", "SPCXUSD1", "CLUSD1")
+# Market infrastructure also serves pair-only symbols. Keep the single-account
+# strategy universe separate so an existing "all" policy never gains exposure.
+MARKET_SYMBOLS = (*SYMBOLS, "XAGUSD1")
 
 
 class TradingError(Exception):

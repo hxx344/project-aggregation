@@ -131,7 +131,10 @@ class PairRecoverySkipTests(TestCase):
 
     def test_existing_watch_survives_and_wait_flags_are_cleared(self):
         original = self.seed()
-        original.update(recovery_watch={'batches': [{'id': 'older'}]}, attention='old',
+        watch = {'id': 'older', 'identities': deepcopy(original['identities']),
+                 'legs': [{'key': leg['key'], 'order': deepcopy(leg['order'])}
+                          for leg in original['pending']['legs']]}
+        original.update(recovery_watch={'batches': [watch]}, attention='old',
                         api_notice={'kind': 'budget'}, retry_after=10, retry_at=9999999999, failure_count=4)
         self.f.store.put('pair_runtime:gold', original)
         self.skip()

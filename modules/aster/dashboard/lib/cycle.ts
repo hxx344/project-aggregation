@@ -288,9 +288,12 @@ export function cycleHoldSeconds(
   return Number(units / divisor);
 }
 
-export function parseCycleDraft(draft: CycleDraft): CycleConfig {
+export function parseCycleDraft(
+  draft: CycleDraft,
+  supportedSymbols: readonly string[] = ['XAUUSD1', 'SPCXUSD1', 'CLUSD1'],
+): CycleConfig {
   const maximum = CYCLE_MAXIMUM;
-  if (!['XAUUSD1', 'SPCXUSD1', 'CLUSD1'].includes(draft.symbol))
+  if (!supportedSymbols.includes(draft.symbol))
     throw new Error('请选择支持的循环品种');
   if (
     !/^\d+$/.test(draft.leverage) ||
@@ -354,7 +357,8 @@ const PHASES: Record<string, { label: string; reason: string }> = {
   },
   paused: {
     label: '已暂停',
-    reason: '已有仓位保留，暂停期间持仓时长继续累计；启动账户后重新检查平仓条件',
+    reason:
+      '已有仓位保留，暂停期间持仓时长继续累计；启动账户后重新检查平仓条件',
   },
   attention: { label: '需要处理', reason: '请核对当前批次，确认成交后再继续' },
   waiting_open: {

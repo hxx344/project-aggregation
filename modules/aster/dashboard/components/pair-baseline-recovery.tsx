@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/table';
 import type { DeskAction } from '@/lib/desk-types';
 import type { Pair } from '@/lib/pairs';
+import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import {
   pairBaselineRecoveryBlock,
   parsePairBaselineReview,
@@ -139,7 +140,10 @@ export function PairBaselineRecovery({
           showCloseButton={!loading}
         >
           <DialogHeader>
-            <DialogTitle>核对并采纳当前底仓 · {pair.name}</DialogTitle>
+            <DialogTitle>
+              核对并采纳当前底仓 · {pair.name} ·{' '}
+              {pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol}
+            </DialogTitle>
             <DialogDescription>
               人工归档后手动调整了仓位时，在这里确认当前底仓。采纳后保持暂停，不下单、不减仓、不划转。
             </DialogDescription>
@@ -159,8 +163,8 @@ export function PairBaselineRecovery({
                 <TableHeader>
                   <TableRow>
                     <TableHead>方向</TableHead>
-                    <TableHead>原底仓（XAU）</TableHead>
-                    <TableHead>采纳数量（XAU）</TableHead>
+                    <TableHead>原底仓数量</TableHead>
+                    <TableHead>采纳数量</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>

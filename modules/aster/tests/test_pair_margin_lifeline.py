@@ -76,11 +76,11 @@ class PairMarginLifelineTests(TestCase):
         self.wallet("short", 24000)
         original = self.trader._read
 
-        def read(brokers, **options):
+        def read(brokers, symbol, **options):
             if options.get("hot"):
                 raise RequestNotSent("hot data unavailable", retry_after=60)
             self.assertTrue(options.get("margin"))
-            return original(brokers, **options)
+            return original(brokers, symbol, **options)
 
         with patch.object(self.trader, "_read", side_effect=read) as reads:
             self.assertEqual(self.engine.pairs.tick("gold"), 5)
@@ -150,10 +150,10 @@ class PairMarginLifelineTests(TestCase):
                 if failure == "read":
                     original = self.trader._read
 
-                    def read(brokers, **options):
+                    def read(brokers, symbol, **options):
                         if options.get("reconciliation"):
                             raise TradingError("close read unavailable")
-                        return original(brokers, **options)
+                        return original(brokers, symbol, **options)
 
                     mock = patch.object(self.trader, "_read", side_effect=read)
                 elif failure == "market":
@@ -178,8 +178,8 @@ class PairMarginLifelineTests(TestCase):
                 self.store.put("pair_runtime:gold", {})
                 self.store.put("pair_margin:gold", {})
 
-                def read(brokers, **options):
-                    snapshots, guards = original(brokers, **options)
+                def read(brokers, symbol, **options):
+                    snapshots, guards = original(brokers, symbol, **options)
                     snapshot = snapshots["long"]
                     if mode == "isolated":
                         snapshots["long"] = replace(snapshot, positions=[replace(position, isolated=True)

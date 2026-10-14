@@ -1,13 +1,13 @@
-"""Exact XAU plans with separate collateral budgets for the two subaccounts."""
+"""Exact pair plans with separate collateral budgets for the two subaccounts."""
 from fractions import Fraction
 import time
 
 from .cycle import CyclePlan, plan_cycle
-from .models import (AccountSnapshot, TradingError, MIN_BATCH_NOTIONAL, TIERS, dec,
+from .models import (AccountSnapshot, TradingError, TIERS, dec,
                      decimal_value, leverage_cap, opening_margin_limit, cycle_margin_limit,
                      positive, wire)
 
-SYMBOL = "XAUUSD1"
+from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, get_symbol_config, validate_symbol
 SIDES = (("long", "LONG"), ("short", "SHORT"))
 
 
@@ -19,56 +19,119 @@ class PairRecoveryConflict(TradingError):
     """A newer durable state must never be overwritten by a stale recovery."""
 
 
-def positions(snapshots, *, equal_leverage=True):
+def require_runtime_symbols(pair, state):
+    """Bind every executable journal to the pair before querying or writing.
+
+    Historical gold runtimes have no top-level symbol. Their orders and frozen
+    cycle configuration still carry their own symbols and must agree.
+    """
+    symbol = validate_symbol(pair["symbol"])
+
+    def record(value, label, *, required=False, explicit=False):
+        if not isinstance(value, dict):
+            raise PairPositionError(f"{label}记录无效，停止配对交易并等待核对")
+        actual = value.get("symbol") if explicit else value.get("symbol", DEFAULT_PAIR_SYMBOL if required else symbol)
+        if actual != symbol:
+            raise PairPositionError(f"{label}标的 {actual} 与配对组 {symbol} 不一致，停止交易并等待核对")
+
+    record(pair.get("cycle", {}), "配对循环配置", required=True)
+    record(state, "配对运行状态")
+    if symbol != DEFAULT_PAIR_SYMBOL and "symbol" not in state:
+        owned = state.get("owned") or {}
+        if not isinstance(owned, dict) or any(positive(qty, True) for qty in owned.values()):
+            raise PairPositionError(f"配对底仓缺少 {symbol} 标的记录，停止交易并等待核对")
+    progress = state.get("progress")
+    if progress is not None:
+        record(progress, "循环进度")
+        if progress.get("config") is not None:
+            record(progress["config"], "循环冻结配置", required=True)
+        elif progress.get("phase") in ("holding", "waiting_close"):
+            raise PairPositionError("循环持仓缺少冻结标的配置，停止交易并等待核对")
+    pending = state.get("pending")
+    if pending is not None:
+        record(pending, "未完成批次", required=True)
+        if pending.get("config") is not None:
+            record(pending["config"], "未完成批次配置", required=True)
+        for field in ("legs", "repairs"):
+            legs = pending.get(field, [])
+            if not isinstance(legs, list):
+                raise PairPositionError("未完成批次订单记录无效，停止交易并等待核对")
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    raise PairPositionError("未完成批次订单记录无效，停止交易并等待核对")
+                record(leg.get("order"), "未完成订单", explicit=True)
+                if leg.get("receipt") is not None:
+                    record(leg["receipt"], "未完成订单回执", explicit=True)
+    watch = state.get("recovery_watch")
+    if watch is not None:
+        record(watch, "归档订单观察")
+        batches = watch.get("batches")
+        if not isinstance(batches, list):
+            raise PairPositionError("归档订单观察记录无效，停止交易并等待核对")
+        for batch in batches:
+            record(batch, "归档批次")
+            legs = batch.get("legs")
+            if not isinstance(legs, list):
+                raise PairPositionError("归档批次订单记录无效，停止交易并等待核对")
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    raise PairPositionError("归档批次订单记录无效，停止交易并等待核对")
+                record(leg.get("order"), "归档订单", explicit=True)
+    return symbol
+
+
+def positions(snapshots, symbol, *, equal_leverage=True):
+    validate_symbol(symbol)
     result = {}
     for key, side in SIDES:
         snapshot = snapshots[key]
         snapshot.require_fresh()
-        snapshot.require_modes([SYMBOL])
+        snapshot.require_modes([symbol])
         if not snapshot.can_trade or snapshot.open_orders:
             raise PairPositionError("子账户没有交易权限或仍有外部挂单")
-        long, short = snapshot.pair(SYMBOL)
+        long, short = snapshot.pair(symbol)
         selected, opposite = (long, short) if side == "LONG" else (short, long)
-        if opposite.qty or any(p.qty and p.symbol != SYMBOL for p in snapshot.positions):
-            raise PairPositionError(f"{key} 子账户存在非本组方向或非 XAU 仓位，请先核对")
+        if opposite.qty or any(p.qty and p.symbol != symbol for p in snapshot.positions):
+            raise PairPositionError(f"{key} 子账户存在非本组方向或非 {symbol} 仓位，请先核对")
         result[side] = selected
     if equal_leverage and result["LONG"].leverage != result["SHORT"].leverage:
-        raise PairPositionError(f"两个子账户的 XAU 实际杠杆不一致（做多账户 {result['LONG'].leverage}x、做空账户 {result['SHORT'].leverage}x），停止新交易，请核对")
+        raise PairPositionError(f"两个子账户的 {symbol} 实际杠杆不一致（做多账户 {result['LONG'].leverage}x、做空账户 {result['SHORT'].leverage}x），停止新交易，请核对")
     return result
 
 
-def require_quantities(snapshots, quantities, *, equal_leverage=True):
-    pair = positions(snapshots, equal_leverage=equal_leverage)
+def require_quantities(snapshots, symbol, quantities, *, equal_leverage=True):
+    pair = positions(snapshots, symbol, equal_leverage=equal_leverage)
     if any(pair[side].qty != positive(quantities[side], True) for _, side in SIDES):
         raise PairPositionError("实际仓位与配对组账本不一致，停止新交易并等待核对")
     return pair
 
 
-def current_cap(snapshot, leverage):
-    row = snapshot.current_leverage_caps.get(SYMBOL)
+def current_cap(snapshot, symbol, leverage):
+    row = snapshot.current_leverage_caps.get(symbol)
     if row is not None:
         if len(row) != 2 or type(row[0]) is not int or row[0] != leverage:
             raise TradingError("子账户可开额度与实际杠杆不匹配")
         return Fraction(positive(row[1], True))
-    return Fraction(leverage_cap(snapshot.brackets.get(SYMBOL, []), leverage))
+    return Fraction(leverage_cap(snapshot.brackets.get(symbol, []), leverage))
 
 
-def combine(snapshots, *, opening=True):
-    held = positions(snapshots)
+def combine(snapshots, symbol, *, opening=True):
+    held = positions(snapshots, symbol)
     long, short = (snapshots[key] for key, _ in SIDES)
     return AccountSnapshot(
         long.equity + short.equity, long.maintenance + short.maintenance,
         long.available + short.available, long.wallet + short.wallet,
         long.unrealized + short.unrealized, [held["LONG"], held["SHORT"]], [],
         True, False, True, min(long.timestamp, short.timestamp),
-        fees={SYMBOL: max(positive(s.fees.get(SYMBOL), True) for s in snapshots.values())} if opening else {},
-        current_leverage_caps={SYMBOL: (held["LONG"].leverage, decimal_value(
-            sum((current_cap(s, held["LONG"].leverage) for s in snapshots.values()), Fraction(0)), exact=True))} if opening else {},
+        fees={symbol: max(positive(s.fees.get(symbol), True) for s in snapshots.values())} if opening else {},
+        current_leverage_caps={symbol: (held["LONG"].leverage, decimal_value(
+            sum((current_cap(s, symbol, held["LONG"].leverage) for s in snapshots.values()), Fraction(0)), exact=True))} if opening else {},
     )
 
 
 def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None):
-    held = positions(snapshots)
+    symbol = pair["symbol"]
+    held = positions(snapshots, symbol)
     leverage = held["LONG"].leverage
     policy = pair["ordinary"]
     limit = Fraction(cycle_margin_limit(policy) if cycling else opening_margin_limit(policy, leverage))
@@ -77,14 +140,14 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
     budgets = []
     for key, side in SIDES:
         snap, pos = snapshots[key], held[side]
-        fee = Fraction(positive(snap.fees.get(SYMBOL), True))
+        fee = Fraction(positive(snap.fees.get(symbol), True))
         if fee > 1:
             raise TradingError("子账户手续费率无效")
         old_qty, old_mark = Fraction(pos.qty), Fraction(pos.mark)
         pnl_change = old_qty * (mark - old_mark) * (1 if side == "LONG" else -1)
         loss = max(Fraction(0), -pnl_change)
         budget = None if daily_remaining is None else daily_remaining.get(key)
-        budgets.append((side, snap, pos, fee, loss, current_cap(snap, leverage),
+        budgets.append((side, snap, pos, fee, loss, current_cap(snap, symbol, leverage),
                         None if budget is None else Fraction(positive(budget, True))))
 
     def allowed(qty, buy, sell, high_price):
@@ -109,6 +172,7 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
 
 def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
     """Describe upgrade blockers from the same inputs, without another API read."""
+    symbol = pair["symbol"]
     old, policy = held["LONG"].leverage, pair["ordinary"]
     minimum = policy["min_open_leverage"]
     state = (f"两账户当前均为 {old}x，低于普通开仓最低 {minimum}x" if old < minimum else
@@ -126,7 +190,7 @@ def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
         else:
             blocked = ["做多账户" if key == "long" else "做空账户" for key, side in SIDES
                        if Fraction(held[side].qty) * max(Fraction(held[side].mark), Fraction(book.mark))
-                       > Fraction(leverage_cap(snapshots[key].brackets.get(SYMBOL, []), target))]
+                       > Fraction(leverage_cap(snapshots[key].brackets.get(symbol, []), target))]
             detail = ("公开额度已满足，但" + "、".join(blocked) + "的现有持仓超过该档账户持仓上限"
                       if blocked else "公开额度及账户持仓上限已满足，可申请自动升档")
         details.append(f"{target}x：{detail}")
@@ -134,7 +198,10 @@ def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
 
 
 def plan_ordinary(pair, snapshots, book, rule, capacities):
-    held = positions(snapshots)
+    symbol = pair["symbol"]
+    if rule.symbol != symbol or rule.margin_asset != "USD1":
+        raise PairPositionError("普通开仓交易规则与配对组标的不一致")
+    held = positions(snapshots, symbol)
     leverage, policy = held["LONG"].leverage, pair["ordinary"]
     book.require_fresh()
     if leverage not in TIERS or leverage < policy["min_open_leverage"]:
@@ -142,7 +209,7 @@ def plan_ordinary(pair, snapshots, book, rule, capacities):
     if held["LONG"].qty != held["SHORT"].qty:
         raise PairPositionError("配对组已有数量不等，停止新增")
     if book.spread_exact > Fraction(dec(policy["spread_limit"])):
-        raise TradingError(f"XAU 买一卖一价差超过普通开仓设置上限 {wire(Fraction(dec(policy['spread_limit'])) * 10000)} bp，等待价差回落")
+        raise TradingError(f"{symbol} 买一卖一价差超过普通开仓设置上限 {wire(Fraction(dec(policy['spread_limit'])) * 10000)} bp，等待价差回落")
     capacity = Fraction(positive(capacities.get(leverage), True))
     if capacity <= Fraction(dec(policy["threshold"])):
         raise TradingError(f"当前 {leverage}x 公开可用额度未严格超过普通开仓门槛 {wire(policy['threshold'])} USD1，等待公开额度恢复")
@@ -161,14 +228,17 @@ def plan_ordinary(pair, snapshots, book, rule, capacities):
         else:
             maximum = mid - 1
     qty = low * step
-    if qty < Fraction(rule.min_qty) or qty * mark < max(rule.min_notional, MIN_BATCH_NOTIONAL) or not qty:
-        raise TradingError(f"按两账户各自余额、持仓上限、保证金占用、公开额度、盘口及配置的单批金额上限计算后，共同可开数量不足以满足最小下单量及按标记价计算的每边名义金额至少 {wire(max(rule.min_notional, MIN_BATCH_NOTIONAL))} USD1，暂不新增")
-    return CyclePlan("open", SYMBOL, decimal_value(qty, exact=True), leverage,
+    minimum = max(rule.min_notional, dec(get_symbol_config(symbol)["min_notional"]))
+    if qty < Fraction(rule.min_qty) or qty * mark < minimum or not qty:
+        raise TradingError(f"按两账户各自余额、持仓上限、保证金占用、公开额度、盘口及配置的单批金额上限计算后，共同可开数量不足以满足最小下单量及按标记价计算的每边名义金额至少 {wire(minimum)} USD1，暂不新增")
+    return CyclePlan("open", symbol, decimal_value(qty, exact=True), leverage,
                      decimal_value(qty * ask, exact=True), decimal_value(qty * bid, exact=True),
                      decimal_value(book.spread_exact * 10000), capacity_notional=decimal_value(2 * qty * high, exact=True))
 
 
 def plan_paired_cycle(pair, snapshots, book, depth, rule, progress, *, capacity=None, daily_remaining=None, paused=False):
+    symbol = pair["symbol"]
+    require_runtime_symbols(pair, {"symbol": symbol, "progress": progress})
     config = {**pair["cycle"], "enabled": True}
     progress = dict(progress)
     if paused and progress.get("phase") in ("holding", "waiting_close"):
@@ -177,14 +247,15 @@ def plan_paired_cycle(pair, snapshots, book, depth, rule, progress, *, capacity=
         progress["opened_at"] = min(progress["opened_at"], time.time() - 2)
     account = {"id": pair["id"], "policy": pair["ordinary"], "cycle": config}
     opening = progress.get("phase", "waiting_open") == "waiting_open"
-    snapshot = combine(snapshots, opening=opening)
+    snapshot = combine(snapshots, symbol, opening=opening)
     gate = resource_gate(pair, snapshots, book, cycling=True, daily_remaining=daily_remaining) if opening else None
     return plan_cycle(account, snapshot, book, depth, rule, progress,
-                      market_capacity=capacity, opening_gate=gate)
+                      market_capacity=capacity, opening_gate=gate, symbols=SUPPORTED_SYMBOLS)
 
 
 def ordinary_upgrade(pair, snapshots, book, capacities):
-    held = positions(snapshots)
+    symbol = pair["symbol"]
+    held = positions(snapshots, symbol)
     old = held["LONG"].leverage
     threshold = Fraction(dec(pair["ordinary"]["threshold"]))
     for target in TIERS:
@@ -193,7 +264,7 @@ def ordinary_upgrade(pair, snapshots, book, capacities):
         if target not in capacities or Fraction(positive(capacities[target], True)) <= threshold:
             continue
         if all(Fraction(p.qty) * max(Fraction(p.mark), Fraction(book.mark))
-               <= Fraction(leverage_cap(snapshots[key].brackets.get(SYMBOL, []), target))
+               <= Fraction(leverage_cap(snapshots[key].brackets.get(symbol, []), target))
                for key, side in SIDES for p in [held[side]]):
             return target
     return None

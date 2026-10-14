@@ -15,8 +15,9 @@ from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, wire, cycle_margin_limit, opening_margin_limit
 from .paper import PaperOrderAbsent
-from .pair_planning import (SYMBOL, SIDES, PairPositionError, PairRecoveryConflict, positions, require_quantities,
-                            plan_ordinary, plan_paired_cycle, ordinary_upgrade)
+from .pair_symbols import SUPPORTED_SYMBOLS
+from .pair_planning import (SIDES, PairPositionError, PairRecoveryConflict, positions, require_quantities,
+                            plan_ordinary, plan_paired_cycle, ordinary_upgrade, require_runtime_symbols)
 from .store import dumps
 from . import pair_quality
 
@@ -57,6 +58,7 @@ class PairTrader:
 
     def _ordinary_wait(self, pair, state, identities, margin_state):
         """Reuse recent reads only to reject work, never to authorize a write."""
+        symbol = pair["symbol"]
         if not pair["enabled"] or not pair["ordinary"]["enabled"] or state.get("attention"):
             return None
         if pair["margin"]["enabled"] and time.time() >= max(
@@ -76,16 +78,16 @@ class PairTrader:
         try:
             for guard in guards.values():
                 guard()
-            require_quantities(snapshots, self._expected(state))
+            require_quantities(snapshots, symbol, self._expected(state))
         except TradingError:
             return None
         try:
-            capacities = self.engine.capacities(SYMBOL)
-            book = self.market.book(SYMBOL)
+            capacities = self.engine.capacities(symbol)
+            book = self.market.book(symbol)
             book.require_fresh()
             if ordinary_upgrade(pair, snapshots, book, capacities) is not None:
                 return None
-            plan_ordinary(pair, snapshots, book, self.market.rules[SYMBOL], capacities)
+            plan_ordinary(pair, snapshots, book, self.market.rules[symbol], capacities)
         except PairPositionError:
             return None
         except TradingError as exc:
@@ -127,7 +129,7 @@ class PairTrader:
             raise PairPositionError("两个方向不能使用同一个真实账户")
         return accounts, brokers, identities
 
-    def _read(self, brokers, *, hot=False, reconciliation=False, fresh_modes=False, margin=False):
+    def _read(self, brokers, symbol, *, hot=False, reconciliation=False, fresh_modes=False, margin=False):
         # Recovery priority does not require reloading unchanged account modes.
         # Recovery uses their normal TTL; configuration confirmation can force GETs.
         reuse_account_mode = not reconciliation and not fresh_modes
@@ -136,8 +138,8 @@ class PairTrader:
             for broker in brokers.values():
                 if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
                     budget = broker.api.budget
-                    weight = (broker.margin_snapshot_weight([SYMBOL], reuse_account_mode=reuse_account_mode)
-                              if margin else broker.snapshot_weight([SYMBOL], fresh_modes=fresh_modes,
+                    weight = (broker.margin_snapshot_weight([symbol], reuse_account_mode=reuse_account_mode)
+                              if margin else broker.snapshot_weight([symbol], fresh_modes=fresh_modes,
                                                                    reuse_account_mode=reuse_account_mode))
                     budgets[budget] = budgets.get(budget, 0) + weight
             # Check the complete shared-budget read before either worker starts;
@@ -151,14 +153,14 @@ class PairTrader:
             budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
             with budget:
                 if hot and isinstance(broker, LiveBroker):
-                    lease = broker.cycle_hot_snapshot([SYMBOL])
+                    lease = broker.cycle_hot_snapshot([symbol])
                     lease.require_fresh()
                     return lease.snapshot, lease.require_fresh
                 # Ordinary polling retains the broker's mode TTL; account events
                 # still revoke these reads and mode changes clear its cache.
                 options = {"reuse_account_mode": reuse_account_mode} if isinstance(broker, LiveBroker) else {}
-                snapshot = (broker.margin_snapshot([SYMBOL], **options) if margin and isinstance(broker, LiveBroker)
-                            else broker.snapshot([SYMBOL], fresh_modes=fresh_modes, **options))
+                snapshot = (broker.margin_snapshot([symbol], **options) if margin and isinstance(broker, LiveBroker)
+                            else broker.snapshot([symbol], fresh_modes=fresh_modes, **options))
                 guard = (lambda: broker.require_snapshot_current(snapshot)) if isinstance(broker, LiveBroker) else snapshot.require_fresh
                 return snapshot, guard
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-read") as pool:
@@ -169,6 +171,7 @@ class PairTrader:
         return {key: row[0] for key, row in rows.items()}, {key: row[1] for key, row in rows.items()}
 
     def _balance(self, pair, state, brokers, identities, snapshots=None, guards=None, *, pending_orders=False):
+        symbol = pair["symbol"]
         from .margin_balance import MarginBalancer
 
         def load():
@@ -181,8 +184,8 @@ class PairTrader:
             except TradingError:
                 # One ordinary-budget REST attempt, only when the balancer's
                 # own check is due. These reads never enter the order planner.
-                current, checks = self._read(brokers, margin=True)
-                self._publish_snapshots(state, current)
+                current, checks = self._read(brokers, symbol, margin=True)
+                self._publish_snapshots(state, current, symbol)
 
             def check(side):
                 self._config_guard(pair, identities, opening=False)
@@ -196,7 +199,7 @@ class PairTrader:
         result = balancer.tick(pair, snapshots or {}, pending_orders=pending_orders,
             snapshot_guards=guards, snapshot_loader=load)
         if balancer.refreshed_snapshots is not None:
-            self._publish_snapshots(state, balancer.refreshed_snapshots)
+            self._publish_snapshots(state, balancer.refreshed_snapshots, symbol)
         state["margin"] = result
         return result
 
@@ -215,9 +218,9 @@ class PairTrader:
                 guard()
             yield
 
-    def _publish_snapshots(self, state, snapshots):
+    def _publish_snapshots(self, state, snapshots, symbol):
         from .engine import snapshot_json
-        state["snapshots"] = {key: snapshot_json(value, [SYMBOL]) for key, value in snapshots.items()}
+        state["snapshots"] = {key: snapshot_json(value, [symbol]) for key, value in snapshots.items()}
 
     @staticmethod
     def _expected(state):
@@ -238,6 +241,7 @@ class PairTrader:
             require_archived_orders_clear(self.engine, current)
 
     def tick(self, pair):
+        symbol = pair["symbol"]
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
         pending_at_entry = state.get("pending")
         margin_waiting = False
@@ -248,9 +252,9 @@ class PairTrader:
         state.pop("_trading_write_started", None)
         state["api_notice"] = None
         save_state = True
-        if not isinstance(state.get("progress"), dict):
-            state["progress"] = empty_progress(state["owned"])
         try:
+            require_runtime_symbols(pair, state)
+            state["symbol"] = symbol
             accounts, brokers, identities = self._members(pair)
             if state.get("identities") and state["identities"] != identities:
                 raise PairPositionError("配对组凭据指向的真实账户发生变化，等待人工核对")
@@ -336,8 +340,8 @@ class PairTrader:
             # quota. Read fresh positions with the repair reserve when closing.
             hot = not closing_due and bool(pair["enabled"] and pair["cycle"]["enabled"] or holding)
             trade_work = True
-            snapshots, guards = self._read(brokers, hot=hot, reconciliation=closing_due)
-            self._publish_snapshots(state, snapshots)
+            snapshots, guards = self._read(brokers, symbol, hot=hot, reconciliation=closing_due)
+            self._publish_snapshots(state, snapshots, symbol)
             if not pair["ordinary"]["enabled"] and not pair["cycle"]["enabled"] and not holding:
                 if len(self._margin_observations) >= 16:
                     self._margin_observations.clear()
@@ -364,7 +368,7 @@ class PairTrader:
                     state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
                     margin_delay = max(0, margin.get("retry_after", 0))
                     return state
-            held = require_quantities(snapshots, self._expected(state))
+            held = require_quantities(snapshots, symbol, self._expected(state))
             if not pair["enabled"] and not holding:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
@@ -375,19 +379,20 @@ class PairTrader:
                 state.update(phase="waiting", reason="上批已核对结束，当前底仓保留；开仓冷却结束后系统重新检查开仓条件")
                 return state
             risk_snapshots = self._risk_snapshots(pair, snapshots) if not holding else snapshots
-            book = self.engine.cycle_book(SYMBOL) if pair["cycle"]["enabled"] or holding else self.market.book(SYMBOL)
-            rule = self.market.rules[SYMBOL]
+            book = self.engine.cycle_book(symbol) if pair["cycle"]["enabled"] or holding else self.market.book(symbol)
+            rule = self.market.rules[symbol]
             if holding or pair["cycle"]["enabled"]:
                 capacity = None
                 if not holding:
-                    capacity = self.engine.require_cycle_open_capacity(pair["cycle"], held["LONG"].leverage)
-                depth = self.engine.cycle_depth(SYMBOL)
+                    capacity = self.engine.require_cycle_open_capacity(pair["cycle"], held["LONG"].leverage,
+                                                                       symbols=SUPPORTED_SYMBOLS)
+                depth = self.engine.cycle_depth(symbol)
                 remaining = self._daily_remaining(pair, state) if not holding else None
                 plan = plan_paired_cycle(pair, risk_snapshots, book, depth, rule, state["progress"],
                                          capacity=capacity, daily_remaining=remaining, paused=not pair["enabled"])
                 self._start(pair, state, brokers, snapshots, guards, plan, kind="cycle", quality_depth=depth)
             elif pair["ordinary"]["enabled"]:
-                capacities = self.engine.capacities(SYMBOL)
+                capacities = self.engine.capacities(symbol)
                 target = ordinary_upgrade(pair, risk_snapshots, book, capacities)
                 if target is not None:
                     self._leverage(pair, state, brokers, snapshots, guards, target)
@@ -454,23 +459,28 @@ class PairTrader:
         return {key: wire(max(dec(0), limit - dec(used.get(key, "0")))) for key, _ in SIDES}
 
     def _start(self, pair, state, brokers, snapshots, guards, plan, *, kind, quality_depth=None):
+        symbol = pair["symbol"]
+        require_runtime_symbols(pair, state)
+        if plan.symbol != symbol:
+            raise PairPositionError("下单计划标的与配对组不一致，停止交易并等待核对")
+        state["symbol"] = symbol
         opening = plan.phase == "open"
         identities = state["identities"]
         self._config_guard(pair, identities, opening=opening)
         for guard in guards.values():
             guard()
         before = self._expected(state)
-        require_quantities(snapshots, before)
+        require_quantities(snapshots, symbol, before)
         token = uuid.uuid4().hex
         legs = []
         for key, side in SIDES:
             buy = (side == "LONG") == opening
-            order = Executor.order(SYMBOL, side, "BUY" if buy else "SELL", plan.qty, side[0] + token[:28])
+            order = Executor.order(symbol, side, "BUY" if buy else "SELL", plan.qty, side[0] + token[:28])
             legs.append({"key": key, "order": order, "receipt": None, "dispatch": "prepared"})
         target = {side: wire(dec(before[side]) + (plan.qty if opening else -plan.qty)) for _, side in SIDES}
         if any(dec(q) < dec(state["owned"][side]) for side, q in target.items()):
             raise PairPositionError("平仓数量会侵占配对组原始底仓")
-        pending = {"id": token, "pair_id": pair["id"], "kind": kind, "phase": plan.phase, "symbol": SYMBOL,
+        pending = {"id": token, "pair_id": pair["id"], "kind": kind, "phase": plan.phase, "symbol": symbol,
                    "identities": deepcopy(identities), "created_at": time.time(), "quantity": wire(plan.qty),
                    "before": before, "target": target, "leverage": plan.leverage, "legs": legs,
                    "repairs": [], "repair_attempts": 0, "config": {**pair["cycle"], "leverage": plan.leverage}}
@@ -484,20 +494,21 @@ class PairTrader:
                     self._config_guard(pair, identities, opening=opening)
                     for guard in guards.values():
                         guard()
-                    require_quantities(snapshots, before)
+                    require_quantities(snapshots, symbol, before)
                     risk_snapshots = self._risk_snapshots(pair, snapshots) if opening else snapshots
-                    book = self.engine.cycle_book(SYMBOL) if kind == "cycle" else self.market.book(SYMBOL)
+                    book = self.engine.cycle_book(symbol) if kind == "cycle" else self.market.book(symbol)
                     if kind == "cycle":
                         capacity = self.engine.require_cycle_open_capacity(pair["cycle"], plan.leverage,
-                            minimum_notional=plan.capacity_notional or 0) if opening else None
-                        depth = self.engine.cycle_depth(SYMBOL)
-                        latest = plan_paired_cycle(pair, risk_snapshots, book, depth, self.market.rules[SYMBOL],
+                            minimum_notional=plan.capacity_notional or 0, symbols=SUPPORTED_SYMBOLS) if opening else None
+                        depth = self.engine.cycle_depth(symbol)
+                        latest = plan_paired_cycle(pair, risk_snapshots, book, depth, self.market.rules[symbol],
                                                    state["progress"], capacity=capacity, daily_remaining=self._daily_remaining(pair, state) if opening else None,
                                                    paused=not pair["enabled"])
                         pair_quality.prepare(pending, pair["id"], depth, final=True)
                     else:
-                        latest = plan_ordinary(pair, risk_snapshots, book, self.market.rules[SYMBOL], self.engine.capacities(SYMBOL))
-                    if latest.phase != plan.phase or latest.qty < plan.qty or latest.leverage != plan.leverage:
+                        latest = plan_ordinary(pair, risk_snapshots, book, self.market.rules[symbol], self.engine.capacities(symbol))
+                    if (latest.symbol != symbol or latest.phase != plan.phase
+                            or latest.qty < plan.qty or latest.leverage != plan.leverage):
                         raise RequestNotSent("发单前两账户风险、盘口或额度已变化")
                     for guard in guards.values():
                         guard()
@@ -513,8 +524,8 @@ class PairTrader:
                     # One complete local re-read/replan, before either send.
                     # Keep the durable client IDs and quantity; a real event,
                     # disconnect or expired read never qualifies for this retry.
-                    snapshots, guards = self._read(brokers, hot=True)
-                    self._publish_snapshots(state, snapshots)
+                    snapshots, guards = self._read(brokers, symbol, hot=True)
+                    self._publish_snapshots(state, snapshots, symbol)
         except TradingError as exc:
             self._retry_delay(state, exc)
             for leg in legs:
@@ -548,6 +559,9 @@ class PairTrader:
         return evidence
 
     def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False):
+        require_runtime_symbols(pair, state)
+        if any(leg.get("order", {}).get("symbol") != pair["symbol"] for leg in legs):
+            raise PairPositionError("待发送订单标的与配对组不一致，停止交易并等待核对")
         state["_trading_write_started"] = True
         pending = state.get("pending") or {}
         observe = pending.get("kind") == "cycle" and legs is pending.get("legs")
@@ -632,13 +646,15 @@ class PairTrader:
         if original_reason not in (reason, reason.replace("You've", "You’ve")):
             return None
         order = leg["order"]
-        if (order.get("symbol") != SYMBOL or order.get("type") != "MARKET"
+        if (order.get("symbol") != pending["symbol"] or order.get("type") != "MARKET"
                 or (order.get("positionSide"), order.get("side")) not in {("LONG", "BUY"), ("SHORT", "SELL")}):
             return None
         return {**self._absent(order, original_reason, local=False), "reject_code": -2029,
                 "recovered_from_submit_error": True}
 
     def _query(self, pair, state, brokers):
+        symbol = pair["symbol"]
+        require_runtime_symbols(pair, state)
         pending = state["pending"]
         for leg in pending["legs"] + pending["repairs"]:
             receipt, order = leg.get("receipt"), leg["order"]
@@ -653,7 +669,7 @@ class PairTrader:
                 broker = brokers[leg["key"]]
                 row = broker.order_event_receipt(order) if isinstance(broker, LiveBroker) else None
                 if not isinstance(row, dict):
-                    row = broker.query(SYMBOL, order["newClientOrderId"])
+                    row = broker.query(symbol, order["newClientOrderId"])
                 Executor.validate_receipt(order, row)
                 if receipt and dec(row["executedQty"]) < dec(receipt["executedQty"]):
                     raise PairPositionError("订单查询累计成交数量倒退")
@@ -674,6 +690,8 @@ class PairTrader:
                    for leg in pending["legs"] + pending["repairs"])
 
     def _recover(self, pair, state, brokers, *, read_only=False, recovery_source=None):
+        symbol = pair["symbol"]
+        require_runtime_symbols(pair, state)
         pending = state["pending"]
         if pending["kind"] == "leverage":
             return self._recover_leverage(pair, state, brokers)
@@ -686,8 +704,8 @@ class PairTrader:
                 pending["observation_attempt_at"] = now
                 self._save(pair, state)
                 try:
-                    snapshots, _ = self._read(brokers, reconciliation=True)
-                    self._publish_snapshots(state, snapshots)
+                    snapshots, _ = self._read(brokers, symbol, reconciliation=True)
+                    self._publish_snapshots(state, snapshots, symbol)
                 except TradingError as exc:
                     self._retry_delay(state, exc)
                     notice = api_wait_notice(exc)
@@ -703,9 +721,9 @@ class PairTrader:
             snapshots, member_guards = member_read
             guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
         else:
-            snapshots, guards = self._read(brokers, reconciliation=True)
-        self._publish_snapshots(state, snapshots)
-        held = positions(snapshots)
+            snapshots, guards = self._read(brokers, symbol, reconciliation=True)
+        self._publish_snapshots(state, snapshots, symbol)
+        held = positions(snapshots, symbol)
         actual = {side: held[side].qty for _, side in SIDES}
         expected = {side: dec(pending["before"][side]) for _, side in SIDES}
         for leg in pending["legs"] + pending["repairs"]:
@@ -756,14 +774,14 @@ class PairTrader:
             state.update(phase="repairing", reason="本地请求预算不足，系统等待预算恢复后重试尚未发送的减仓；已发送订单只查询原编号")
             return
         repairs = []
-        rule = self.market.rules[SYMBOL]
+        rule = self.market.rules[symbol]
         for key, side in SIDES:
             qty = actual[side] - dec(desired[side])
             if not qty:
                 continue
             if qty % rule.step or qty < rule.min_qty or qty > rule.max_qty:
                 raise PairPositionError("本批残余数量不符合市价减仓步长或限额，等待人工核对")
-            order = Executor.order(SYMBOL, side, "SELL" if side == "LONG" else "BUY", qty, "R" + uuid.uuid4().hex[:28])
+            order = Executor.order(symbol, side, "SELL" if side == "LONG" else "BUY", qty, "R" + uuid.uuid4().hex[:28])
             repairs.append({"key": key, "order": order, "receipt": None, "dispatch": "prepared"})
         pending["repair_attempts"] += 1
         pending["repairs"].extend(repairs)
@@ -778,6 +796,7 @@ class PairTrader:
             self._save(pair, state)
 
     def _finish(self, pair, state, pending, *, completed, check_current=None):
+        symbol = pair["symbol"]
         published = state
         state = deepcopy(state)
         state.pop("attention", None)
@@ -808,8 +827,8 @@ class PairTrader:
         audit = pending.get("manual_position_reconciliation")
         if audit:
             automatic = audit["source"] == "automatic_positions"
-            reason = (f"自动核对完成，保留实际底仓：多 {state['owned']['LONG']}、空 {state['owned']['SHORT']} XAU；本批已结束" if automatic else
-                      f"已核验并保留实际底仓：多 {state['owned']['LONG']}、空 {state['owned']['SHORT']} XAU；遗留批次已结束，本次未下单或划转")
+            reason = (f"自动核对完成，保留实际底仓：多 {state['owned']['LONG']}、空 {state['owned']['SHORT']} {symbol}；本批已结束" if automatic else
+                      f"已核验并保留实际底仓：多 {state['owned']['LONG']}、空 {state['owned']['SHORT']} {symbol}；遗留批次已结束，本次未下单或划转")
             state.update(phase="waiting" if pair["enabled"] else "paused",
                          reason=reason + "；原成交记录保留，外部增减仓未计入程序成交量")
         rejection_notes = [f"{'A 多侧' if leg['key'] == 'long' else 'B 空侧'}：{exchange_reason(leg['receipt']['reject_reason'])}"
@@ -827,7 +846,7 @@ class PairTrader:
                 db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
             for key, _ in SIDES:
                 db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
-                           (pair[key + "_account_id"], "order", f"配对组 {pair['name']}：{state['reason']}；XAUUSD1 本批每边委托 {pending['quantity']}{rejection_text}", time.time()))
+                           (pair[key + "_account_id"], "order", f"配对组 {pair['name']}：{state['reason']}；{symbol} 本批每边委托 {pending['quantity']}{rejection_text}", time.time()))
         # The outer tick always persists its state, even after an exception.
         # Publish only after the history and lifecycle transaction commits.
         published.clear()
@@ -871,12 +890,14 @@ class PairTrader:
         state["daily_volume"] = {day: daily[day] for day in sorted(daily)[-8:]}
 
     def _leverage(self, pair, state, brokers, snapshots, guards, target):
+        symbol = pair["symbol"]
+        require_runtime_symbols(pair, state)
         self._config_guard(pair, state["identities"], opening=True)
         for guard in guards.values():
             guard()
-        pending = {"id": uuid.uuid4().hex, "kind": "leverage", "identities": deepcopy(state["identities"]),
+        pending = {"id": uuid.uuid4().hex, "kind": "leverage", "symbol": symbol, "identities": deepcopy(state["identities"]),
                    "created_at": time.time(), "before": self._expected(state), "target_leverage": target,
-                   "previous_leverage": positions(snapshots)["LONG"].leverage, "results": {}}
+                   "previous_leverage": positions(snapshots, symbol)["LONG"].leverage, "results": {}}
         state.update(pending=pending, phase="leverage",
                      reason=f"系统正在将两个子账户从 {pending['previous_leverage']}x 共同升至 {target}x；两侧实际杠杆确认前不下单")
         self._save(pair, state)
@@ -886,13 +907,13 @@ class PairTrader:
                 self._config_guard(pair, pending["identities"], opening=True)
                 if isinstance(broker, LiveBroker):
                     def check(snapshot):
-                        snapshot.require_modes([SYMBOL])
-                        rows = snapshot.pair(SYMBOL)
+                        snapshot.require_modes([symbol])
+                        rows = snapshot.pair(symbol)
                         side = "LONG" if key == "long" else "SHORT"
                         if any(p.qty != dec(pending["before"][side]) if p.side == side else p.qty != 0 for p in rows):
                             raise PairPositionError("升杠杆前仓位已变化")
-                    return {"response": broker.set_leverage(SYMBOL, target, checked_snapshot=snapshots[key], before_submit=check)}
-                return {"response": broker.set_leverage(SYMBOL, target)}
+                    return {"response": broker.set_leverage(symbol, target, checked_snapshot=snapshots[key], before_submit=check)}
+                return {"response": broker.set_leverage(symbol, target)}
             except (RequestNotSent, LeverageRejected) as exc:
                 return {"rejected": True, "reason": str(exc)}
             except Exception:
@@ -906,10 +927,12 @@ class PairTrader:
         self._recover_leverage(pair, state, brokers)
 
     def _recover_leverage(self, pair, state, brokers):
+        symbol = pair["symbol"]
+        require_runtime_symbols(pair, state)
         pending = state["pending"]
-        snapshots, guards = self._read(brokers, reconciliation=True, fresh_modes=True)
-        self._publish_snapshots(state, snapshots)
-        held = require_quantities(snapshots, pending["before"], equal_leverage=False)
+        snapshots, guards = self._read(brokers, symbol, reconciliation=True, fresh_modes=True)
+        self._publish_snapshots(state, snapshots, symbol)
+        held = require_quantities(snapshots, symbol, pending["before"], equal_leverage=False)
         with self._confirmed(pair, brokers, guards):
             if all(p.leverage == pending["target_leverage"] for p in held.values()):
                 state.update(pending=None, phase="waiting", reason=f"两子账户实际杠杆均已确认 {pending['target_leverage']}x；系统下一轮重新检查额度、余额、价差及风险条件后才开仓")

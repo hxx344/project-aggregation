@@ -220,8 +220,8 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.store.put("pair_margin:gold", {"next_check_at": self.wall + 120})
         publish = self.trader._publish_snapshots
 
-        def account_changes_after_read(state, snapshots):
-            publish(state, snapshots)
+        def account_changes_after_read(state, snapshots, symbol):
+            publish(state, snapshots, symbol)
             self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
 
         with patch.object(self.trader, "_publish_snapshots", side_effect=account_changes_after_read):

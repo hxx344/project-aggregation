@@ -1,5 +1,7 @@
 # Aster 5x 配对开仓可选标的 - 快速摘要
 
+> 本文为设计阶段摘要。当前已实现黄金 XAUUSD1、白银 XAGUSD1，实际范围与使用说明见 [README](README.md)；容量协议支持多标的不等于调度和中继默认订阅已自动支持。
+
 **完整文档**: [pair-symbol-selection-implementation.md](pair-symbol-selection-implementation.md)
 
 ## 核心改动

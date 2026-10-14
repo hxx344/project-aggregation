@@ -4,7 +4,17 @@ import { ConfigurationField } from '@/components/configuration-fields';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import type { Account } from '@/lib/desk-types';
-import { availablePairAccounts, type Pair, type PairDraft } from '@/lib/pairs';
+import {
+  availablePairAccounts,
+  selectPairSymbol,
+  type Pair,
+  type PairDraft,
+} from '@/lib/pairs';
+import {
+  DEFAULT_PAIR_SYMBOL,
+  LEGACY_PAIR_SYMBOLS,
+  type PairSymbol,
+} from '@/lib/pair-symbols';
 
 export function PairSettings({
   draft,
@@ -15,6 +25,7 @@ export function PairSettings({
   locked,
   submit,
   cancel,
+  symbols = LEGACY_PAIR_SYMBOLS,
 }: {
   draft: PairDraft;
   setDraft: (draft: PairDraft) => void;
@@ -24,6 +35,7 @@ export function PairSettings({
   locked: boolean;
   submit: () => Promise<void>;
   cancel: () => void;
+  symbols?: readonly PairSymbol[];
 }) {
   const formId = useId();
   const field = <K extends keyof PairDraft>(key: K, value: PairDraft[K]) =>
@@ -48,6 +60,7 @@ export function PairSettings({
   const short = accounts.find(
     (account) => account.id === draft.short_account_id,
   );
+  const symbolConfig = symbols.find((item) => item.symbol === draft.symbol);
   const choices = (side: 'long' | 'short'): [string, string][] =>
     eligible
       .filter((account) => {
@@ -104,9 +117,28 @@ export function PairSettings({
           placeholder="选择子账户 B"
         />
         <p className="muted">
-          固定 XAUUSD1。A 与 B 须属于同一主账户，方向固定。保留交易所 Hedge
+          A 与 B 须属于同一主账户，方向固定。保留交易所 Hedge
           Mode，仅核验；旧反向仓位需先处理。
         </p>
+        <ConfigurationField
+          id={`${formId}-pair-symbol`}
+          label="交易标的"
+          items={
+            editing
+              ? [[draft.symbol, symbolConfig?.display_name ?? draft.symbol]]
+              : symbols.map((item) => [item.symbol, item.display_name])
+          }
+          value={draft.symbol}
+          display={symbolConfig?.display_name ?? draft.symbol}
+          disabled={locked || editing}
+          onValueChange={(symbol) => {
+            const selected = symbols.find((item) => item.symbol === symbol);
+            if (selected && !editing)
+              setDraft(selectPairSymbol(draft, selected, symbols));
+          }}
+        >
+          <small>标的创建后固定；切换标的需新建配对组。</small>
+        </ConfigurationField>
         <ConfigurationField
           id={`${formId}-pair-mode`}
           label="组执行模式"
@@ -146,7 +178,7 @@ export function PairSettings({
             id={`${formId}-pair-order`}
             label="每侧单批名义金额上限"
             unit="USD1"
-            min="500"
+            min={symbolConfig?.min_notional ?? DEFAULT_PAIR_SYMBOL.min_notional}
             max="1000000"
             {...textField('order_notional')}
             disabled={locked}

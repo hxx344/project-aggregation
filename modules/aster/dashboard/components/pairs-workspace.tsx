@@ -37,6 +37,8 @@ import { ExecutionEvents } from '@/components/execution-events';
 import type { Account, DeskAction } from '@/lib/desk-types';
 import type { ExecutionEvent } from '@/lib/cycle-events';
 import { useAccountDraft } from '@/lib/use-account-draft';
+import { usePairSymbols } from '@/lib/use-pair-symbols';
+import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { clock, fmt, pct } from '@/lib/desk-format';
 import { migrationMarginLimit } from '@/lib/policy';
 import {
@@ -109,7 +111,10 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
     <div className="feature-stack pair-workspace">
       <div className="pair-workspace-heading">
         <div>
-          <h2>两子账户配对 · XAUUSD1</h2>
+          <h2>
+            两子账户配对
+            {pair ? ` · ${pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol}` : ''}
+          </h2>
           <p className="muted">
             A 固定只多 · B 固定只空 · 共同执行与独立风险核验
           </p>
@@ -128,12 +133,15 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
               }}
             >
               <SelectTrigger aria-label="选择配对组">
-                <SelectValue>{pair.name}</SelectValue>
+                <SelectValue>
+                  {pair.name} · {pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol}
+                </SelectValue>
               </SelectTrigger>
               <SelectContent>
                 {items.map((item) => (
                   <SelectItem key={item.id} value={item.id}>
-                    {item.name} · {item.enabled ? '执行已启用' : '执行已暂停'}
+                    {item.name} · {item.symbol ?? DEFAULT_PAIR_SYMBOL.symbol} ·{' '}
+                    {item.enabled ? '执行已启用' : '执行已暂停'}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -202,6 +210,7 @@ function CreatePair({
 }) {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(pairDraft);
+  const catalog = usePairSymbols(open && !connectionError);
   const canCreate =
     supported && availablePairAccounts(accounts, pairs).length >= 2;
   const locked = busy || Boolean(connectionError);
@@ -243,17 +252,39 @@ function CreatePair({
             {error || connectionError}
           </p>
         ) : null}
+        {catalog.loading ? (
+          <output className="muted">正在读取可用配对标的…</output>
+        ) : catalog.error ? (
+          <div className="message message-error" role="alert">
+            <p>{catalog.error}</p>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={locked}
+              onClick={catalog.retry}
+            >
+              重试读取标的
+            </Button>
+          </div>
+        ) : null}
         <PairSettings
           draft={draft}
           setDraft={setDraft}
           accounts={accounts}
           pairs={pairs}
           editing={false}
-          locked={locked}
+          locked={locked || catalog.loading || !catalog.symbols.length}
+          symbols={catalog.symbols}
           cancel={() => setDraft(pairDraft())}
           submit={async () => {
             try {
-              const config = parsePairDraft(draft, accounts, pairs);
+              const config = parsePairDraft(
+                draft,
+                accounts,
+                pairs,
+                undefined,
+                catalog.symbols,
+              );
               if (await action('/api/pairs', config)) {
                 selectPair(config.id);
                 setOpen(false);
@@ -295,6 +326,7 @@ function PairDetail({
   const draft = useAccountDraft(pair.id, pairDraft(pair));
   const [deleteOpen, setDeleteOpen] = useState(false);
   const snapshots = pair.state?.snapshots;
+  const symbol = pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
   const long = accounts.find((account) => account.id === pair.long_account_id);
   const short = accounts.find(
     (account) => account.id === pair.short_account_id,
@@ -305,7 +337,7 @@ function PairDetail({
     pairDataFresh(pair.state?.updated_at, now, offline) &&
     pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
     pairDataFresh(snapshots?.short?.timestamp, now, offline);
-  const net = pairNetQuantity(snapshots);
+  const net = pairNetQuantity(snapshots, symbol);
   const pending = pairHasPending(pair);
   const margin = pair.state?.margin;
   const reservedTransferOnly =
@@ -449,6 +481,7 @@ function PairDetail({
       <div className="pair-sides">
         <PairSide
           side="long"
+          symbol={symbol}
           account={long}
           snapshot={snapshots?.long}
           now={now}
@@ -459,6 +492,7 @@ function PairDetail({
         />
         <PairSide
           side="short"
+          symbol={symbol}
           account={short}
           snapshot={snapshots?.short}
           now={now}
@@ -484,11 +518,11 @@ function PairDetail({
         </div>
         <dl className="cycle-key-values">
           <div>
-            <dt>XAU 净数量 · 多 − 空</dt>
+            <dt>{symbol} 净数量 · 多 − 空</dt>
             <dd className={net !== null && Number(net) !== 0 ? 'amber' : ''}>
               {net ?? '—'}
             </dd>
-            <small>两子账户 XAUUSD1 实际仓位；缺失不按零计算</small>
+            <small>两子账户 {symbol} 实际仓位；缺失不按零计算</small>
           </div>
           <div>
             <dt>本轮循环状态</dt>
@@ -795,6 +829,7 @@ function PairDetail({
 
 function PairSide({
   side,
+  symbol,
   account,
   snapshot,
   now,
@@ -804,6 +839,7 @@ function PairSide({
   scheduledWait,
 }: {
   side: 'long' | 'short';
+  symbol: string;
   account?: Account;
   snapshot?: PairSnapshot | null;
   now: number;
@@ -814,7 +850,7 @@ function PairSide({
 }) {
   const fresh = pairDataFresh(snapshot?.timestamp, now, offline);
   const positions = snapshot?.positions.filter(
-    (position) => position.symbol === 'XAUUSD1' && Number(position.qty) !== 0,
+    (position) => position.symbol === symbol && Number(position.qty) !== 0,
   );
   const reverse = positions?.some(
     (position) => position.side !== (side === 'long' ? 'LONG' : 'SHORT'),
@@ -877,7 +913,7 @@ function PairSide({
       </dl>
       <div className="cycle-live-state">
         <p className="muted">
-          XAU 持仓：
+          {symbol} 持仓：
           {positions === undefined
             ? '等待数据'
             : positions.length

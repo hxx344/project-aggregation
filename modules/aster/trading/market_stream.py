@@ -11,7 +11,7 @@ import time
 
 from websockets.sync.client import connect as websocket_connect
 
-from .models import Book, MarkPrice, SYMBOLS, TradingError, positive
+from .models import Book, MarkPrice, MARKET_SYMBOLS, TradingError, positive
 
 
 _LOG = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ class PublicQuoteStream:
     _MAX_AGE = 3
     _FUTURE_ALLOWANCE = 1
 
-    def __init__(self, symbols=SYMBOLS, *, connect=None, clock=None, monotonic=None):
+    def __init__(self, symbols=MARKET_SYMBOLS, *, connect=None, clock=None, monotonic=None):
         self.symbols = tuple(dict.fromkeys(symbols))
         if not self.symbols or len(self.symbols) > 100 or any(
             not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]{1,32}", symbol)

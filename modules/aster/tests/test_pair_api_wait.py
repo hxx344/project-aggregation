@@ -30,13 +30,13 @@ class PairAPIWaitTests(TestCase):
         self.budget.reserve(1400)  # One cold read fits, two do not.
         before = self.budget.local_weight
         with self.assertRaises(BudgetWait):
-            self.trader._read(self.brokers)
+            self.trader._read(self.brokers, "XAUUSD1")
         self.assertEqual(self.budget.local_weight, before)
         self.assertFalse(any(b.api.calls for b in self.brokers.values()))
 
     def test_paired_mode_evidence_does_not_reserve_an_unneeded_dual_query(self):
         self.ordinary()
-        self.trader._read(self.brokers)
+        self.trader._read(self.brokers, "XAUUSD1")
         broker = self.brokers["long"]
         broker.cached_at["dual"] = time.monotonic() - 20
         self.assertEqual(broker.snapshot_weight(["XAUUSD1"]) -
