@@ -11,9 +11,9 @@ import {
 
 const emptyHistory = { activeKeys: [], entries: [] };
 const staleText =
-  '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。 等待有效快照后才能新增开仓。';
+  '两侧数据未齐或已过期，当前数值仅作最近记录。 等待有效快照后才能新增开仓。';
 const pausedStaleText =
-  '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。';
+  '两侧数据未齐或已过期，当前数值仅作最近记录。 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。';
 const offlineText = '连接中断，保留最近记录。 等待有效快照后才能新增开仓。';
 
 test('paused unknown transfer explains reserved restart even when displayed snapshots are stale', () => {
@@ -141,6 +141,39 @@ test('scheduled check grace requires a live runtime and preserves overdue or off
       pairStatusNotices(fixture, now, offline).some(
         ({ kind }) => kind === 'data',
       ),
+    );
+  }
+});
+
+test('account cadence cannot hide a stalled pair runtime behind scheduled margin waiting', () => {
+  const fixture = marginPair();
+  assert.ok(pairScheduledMarginWait(fixture, 117.999, false, 60));
+  assert.equal(pairScheduledMarginWait(fixture, 118, false, 60), null);
+  assert.ok(
+    pairStatusNotices(fixture, 118, false, 60).some(
+      ({ kind }) => kind === 'data',
+    ),
+  );
+});
+
+test('current data notices and recorded histories share the same freshness boundary', () => {
+  const fixture = pair();
+  let histories = new Map();
+  for (const now of [107.999, 108, 120]) {
+    const current = pairStatusNotices(fixture, now, false, 60);
+    histories = updatePairNoticeHistories(histories, [fixture], now, false);
+    const history = histories.get(fixture.id);
+    assert.deepEqual(
+      history.activeKeys,
+      current.map(({ key }) => key),
+    );
+    assert.deepEqual(
+      recordPairNotices(history, current, now).entries,
+      history.entries,
+    );
+    assert.equal(
+      current.some(({ kind }) => kind === 'data'),
+      now >= 108,
     );
   }
 });

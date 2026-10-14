@@ -584,3 +584,17 @@
 **证据：** 本仓 `8bce5ca` 的 [普通执行](modules/aster/trading/execution.py)、[循环执行](modules/aster/trading/cycle_execution.py)、[迁移执行](modules/aster/trading/migration_execution.py)在未知单超过 120 秒后仍保留 pending；[配对执行](modules/aster/trading/pair_execution.py)在原单查询失败时到不了仓位采纳；[保证金平衡](modules/aster/trading/margin_balance.py)的旧 `accepted` 状态无历史查询出口。2026-10-15 用户明确要求清理同类永久核对，本次根据源码和离线回归修复；120 秒是转入现实核验的等待窗口，不是订单未成交的证明。
 
 **事件记录：** `bounded-unknown-execution-recovery-20261015`；本次跨执行器的同类根因修复，不按文件或路径重复计数。
+
+### L040：显示调度周期不能延长配对快照有效期
+
+**适用条件：** ASTER 配对页根据账户刷新间隔调整过期提示、保证金等待或删除拦截，且当前提示与历史记录分别计算。
+
+**根因：** 单账户 `snapshot_refresh.interval_seconds` 仅描述显示调度，不属于配对运行状态或源快照。配对任务的 `poll_interval` 同样不保证每轮刷新快照；暂停且无循环持仓时可以直接返回。把两侧账户间隔最大值加容差作为有效期，既会掩盖停止更新的配对状态，也会让旧非零仓位继续阻止服务端重新核验删除；只改当前提示还会让固定 8 秒的历史记录制造假恢复和重复告警。
+
+**以后做法：** 配对快照和运行状态保持现有 8 秒判断；保证金定时等待沿用有明确检查期限、运行状态新鲜且无待确认操作的显示分支。当前提示与历史记录共用相同判断。显示调度不能延长操作拦截依据，也不代替服务端在锁内重新读取与验证。
+
+**如何验证：** [配对测试](modules/aster/dashboard/tests/pairs.test.mjs) 在 8 秒边界确认旧非零仓位交由服务端重新核验；[提示测试](modules/aster/dashboard/tests/pair-notices.test.mjs) 覆盖停止更新的运行状态不能继续显示计划等待，以及当前提示与历史一致。回放原补丁中的 30/60 秒显示间隔和非有限值，确认其不能放宽配对有效期。
+
+**证据：** project-aggregation 基于 `f2f1c36` 的 2026-10-15 未提交补丁修改了配对页四个文件，阈值改为账户间隔加 3 秒并限制到 70 秒。审查新增的三个定向回归在该补丁上全部失败；撤销错误间隔透传后复核。依据为 [账户状态输出](modules/aster/trading/engine.py)、[配对调度](modules/aster/trading/pairing.py)、[配对执行](modules/aster/trading/pair_execution.py) 与 [提示历史](modules/aster/dashboard/lib/pair-notices.ts)。该补丁未发布；启动按钮本来不使用此有效期，不能将本事件描述成绕过交易授权。
+
+**事件记录：** `pair-display-cadence-freshness-20261015`；一次未提交补丁审查与连续修正，不推进主线复盘检查点。

@@ -389,6 +389,8 @@ export function pairConfigurationChanges(
   return { name, symbol, ordinary, cycle, margin };
 }
 
+// Account display cadence does not describe pair snapshots or runtime health.
+// Keep this bound shared by current notices, their history and deletion guards.
 export function pairDataFresh(
   timestamp: number | undefined,
   now: number,

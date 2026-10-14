@@ -178,7 +178,7 @@ export function pairStatusNotices(
       'data',
       (offline
         ? '连接中断，保留最近记录。'
-        : '两侧数据未齐或已超过 8 秒，当前数值仅作最近记录。') +
+        : '两侧数据未齐或已过期，当前数值仅作最近记录。') +
         (!pair.enabled && !offline
           ? pairHasPending(pair)
             ? canCheckAtStart

@@ -510,6 +510,33 @@ test('snapshot freshness handles exact 8-second boundary, offline and invalid cl
   assert.match(pairSnapshotStatus(snapshot(), 101, true), /连接中断/);
 });
 
+test('account display cadence cannot extend pair snapshot freshness or a cached deletion block', () => {
+  const occupied = pair({
+    snapshots: {
+      long: snapshot([position('LONG', '1')]),
+      short: snapshot(),
+    },
+  });
+  // Replay the proposed cadence argument: it is display metadata, not evidence
+  // that a pair snapshot remains current after the eight-second boundary.
+  for (const interval of [30, 60, Infinity]) {
+    assert.equal(pairDataFresh(100, 107.999, false, interval), true);
+    assert.match(
+      pairDeletionBlock(occupied, 107.999, false, interval),
+      /所有仓位/,
+    );
+    for (const now of [108, 120, 160]) {
+      assert.equal(pairDataFresh(100, now, false, interval), false);
+      assert.match(
+        pairSnapshotStatus(snapshot(), now, false, interval),
+        /过期/,
+      );
+      assert.equal(pairDeletionBlock(occupied, now, false, interval), '');
+    }
+    assert.match(pairDeletionBlock(occupied, 120, true, interval), /连接恢复/);
+  }
+});
+
 test('quantity difference stays exact and missing side never becomes zero', () => {
   assert.equal(pairNetQuantity({ long: snapshot(), short: null }), null);
   assert.equal(pairNetQuantity({ long: {}, short: snapshot() }), null);
