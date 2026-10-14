@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 import httpx
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 import monitor
 from trading.capacity_relay_server import (MAX_CONNECTIONS, MAX_REQUESTS_PER_MINUTE, RelayCollector,
@@ -365,6 +365,64 @@ class RelayAPITests(unittest.TestCase):
                         pass
                 self.assertEqual(caught.exception.code, 1013)
                 self.assertEqual(len(self.collector.subscribers), 1)
+
+
+class RelayCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_websocket_cleanup_releases_slot_before_task_join(self):
+        collector = RelayCollector(RelayConfig(TOKEN, symbols=(SYMBOL,)), http=Mock())
+        self.addAsyncCleanup(collector.stop)
+        app = create_app(collector=collector, start_collector=False)
+        stream = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/v1/stream")
+        receive_started, child_cleanup = asyncio.Event(), asyncio.Event()
+        never = asyncio.Event()
+        receiver_tasks = []
+
+        def socket(*, interrupted):
+            connected = False
+            sent = []
+
+            async def receive():
+                nonlocal connected
+                if not connected:
+                    connected = True
+                    return {"type": "websocket.connect"}
+                if not interrupted:
+                    return {"type": "websocket.disconnect", "code": 1000}
+                receiver_tasks.append(asyncio.current_task())
+                receive_started.set()
+                try:
+                    await never.wait()
+                finally:
+                    child_cleanup.set()
+                    await never.wait()
+
+            async def send(message):
+                sent.append(message)
+
+            return WebSocket({"type": "websocket", "path": "/v1/stream", "query_string": b"",
+                              "headers": [(b"authorization", ("Bearer " + TOKEN).encode())]}, receive, send), sent
+
+        with patch("trading.capacity_relay_server.MAX_CONNECTIONS", 1):
+            websocket, _ = socket(interrupted=True)
+            handler = asyncio.create_task(stream(websocket))
+            await asyncio.wait_for(receive_started.wait(), timeout=1)
+            subscriber = next(iter(collector.subscribers))
+            handler.cancel()
+            await asyncio.wait_for(child_cleanup.wait(), timeout=1)
+            # A second cancellation interrupts the task join in the handler's
+            # finally, as a cancelled ASGI scope can do at its next await.
+            handler.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(handler, timeout=1)
+            self.assertTrue(handler.cancelled())
+            self.assertTrue(all(task.done() for task in receiver_tasks))
+            self.assertEqual(collector.status()["connections"], 0)
+            self.assertTrue(subscriber.closed)
+
+            replacement, sent = socket(interrupted=False)
+            await asyncio.wait_for(stream(replacement), timeout=1)
+            self.assertTrue(any(message["type"] == "websocket.accept" for message in sent))
+            self.assertEqual(collector.status()["connections"], 0)
 
 
 class SubscriberTests(unittest.IsolatedAsyncioTestCase):

@@ -538,3 +538,17 @@
 **证据：** project-aggregation `3be993fea8985d3e21c2fa3b5090f9d5b7dae288` 的 `server/app.mjs`、`server/update-service/progress.py`、`deploy/release-common.sh` 与 `tests/update-progress.browser.mjs`；2026-10-15 在 `74fc675` 工作区审查核实。另用当前任务夹具复现 3001 字节嵌套 JSON 令 `status()` 抛 `RecursionError`，本轮补齐容错与回归。旧版首次升级没有新进度详情不等于不能升级，应保留旧状态通道兼容。
 
 **事件记录：** `update-progress-runtime-channel-20261015`；同一进度交付缺陷及连续修复，不按路径或测试数量重复计数。
+
+### L037：异步连接清理先释放同步资源，再等待子任务结束
+
+**适用条件：** WebSocket 处理器注册连接名额，并在 `finally` 中取消、等待收发子任务后注销订阅。
+
+**根因：** `finally` 中的 `await asyncio.gather(...)` 仍可被取消；如果同步的 `unsubscribe` 在其后，处理器和子任务都已结束，订阅却仍占用连接名额。仅延长测试等待不能修复资源泄漏。
+
+**以后做法：** 取消子任务后，先同步注销订阅、清空队列并释放名额，再等待子任务收尾；保留取消传播，不用吞掉取消异常或放宽连接上限解决问题。
+
+**如何验证：** [中继取消回归](modules/aster/tests/test_capacity_relay_server.py) 用事件控制第二次取消发生在收尾等待期间，确认任务已结束时连接数归零且新订阅可用；运行相关中继 API 测试，并由现有 Ubuntu 26.04 CI 验证实际 systemd、TLS 与更新恢复。
+
+**证据：** 本仓 `b9692d2` 的 [CI 中继检查](https://github.com/hxx344/project-aggregation/actions/runs/38622433981/job/116053055716) 在退出 WebSocket 上下文后观察到连接数仍为 1；该路径自 `0cde1afd` 引入。[中继处理器](modules/aster/trading/capacity_relay_server.py) 的确定性 Windows 回归进一步复现处理器已取消、接收任务已结束但名额未释放，排除了单纯断言过早。
+
+**事件记录：** `relay-cancelled-cleanup-slot-leak-20261015`；发布检查暴露的一次连接清理缺陷。

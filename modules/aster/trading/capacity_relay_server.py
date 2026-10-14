@@ -460,8 +460,9 @@ def create_app(config=None, *, collector=None, http=None, clock=None, monotonic=
         finally:
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Release the slot before another cancellation can interrupt the join.
             collector.unsubscribe(subscriber)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     return app
 
