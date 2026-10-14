@@ -151,6 +151,24 @@ test('update stream requires same-origin login, filters state, shares reads and 
   assert.equal(done, true);
 });
 
+test('installer progress reaches authenticated status and the real events route without a second stream', async t => {
+  const f = await fixture(t); await f.login();
+  const progress = { stage: 'download', progress: 0.4, downloaded: 40, total: 100, timestamp: Date.parse(stamp) };
+  f.state = { ...f.state, job: { ...job(), progress: { ...progress, path: '/private/path', error: 'private-log' } } };
+  const result = await f.request(PREFIX);
+  assert.deepEqual(result.data.job.progress, progress);
+  assert.equal((await f.request(`${PREFIX}/progress`)).status, 404);
+  const abort = new AbortController();
+  const response = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, Origin: f.origin }, signal: abort.signal });
+  try {
+    const reader = response.body.getReader(); let received = '';
+    while (!received.includes('"snapshot"')) received += new TextDecoder().decode((await reader.read()).value);
+    const line = received.split('\n').find(value => value.includes('"snapshot"'));
+    assert.deepEqual(JSON.parse(line.slice(6)).state.job.progress, progress);
+    assert.equal(received.includes('private'), false);
+  } finally { abort.abort(); }
+});
+
 test('concurrent identical applies share acceptance and atomically block live entry while stop/reconcile remain available', async t => {
   const f = await fixture(t); await f.login();
   const entered = deferred(), release = deferred();

@@ -233,6 +233,26 @@ class DownloadTests(unittest.TestCase):
             self.assertIn('4 路', self.output.getvalue())
             self.assertIn('MiB/s', self.output.getvalue())
 
+    def test_progress_reports_measured_download_and_verified_hash_without_extracting(self):
+        events = []
+        with mock.patch.object(core, 'write_progress_file', side_effect=lambda *args, **kwargs: events.append((args, kwargs))), \
+                Fixture(data_bytes(100000)) as fixture:
+            result = self.downloader(fixture).run()
+            self.assertEqual(result.read_bytes(), fixture.payload)
+            stages = [args[0] if args else kwargs['stage'] for args, kwargs in events]
+            self.assertIn('download', stages)
+            self.assertEqual(stages[-1], 'verify')
+            self.assertTrue(set(stages) <= {'download', 'verify'})
+            self.assertEqual(events[-1][0], ('verify', 1.0))
+            events.clear()
+            self.downloader(fixture).run()
+            self.assertEqual([args[0] for args, _ in events], ['verify', 'verify'])
+
+    def test_unconfigured_progress_never_opens_any_path(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(core.os, 'open', side_effect=AssertionError('unexpected progress file')):
+            core.write_progress_file('build')
+
     def test_range_failures_use_clean_single_stream(self):
         for mode in ('ignored', 'late_ignored', 'wrong_range', 'wrong_length', 'wrong_total', 'encoded', 'range_416'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir=self.root) as directory:

@@ -48,6 +48,31 @@ test('updater client bounds response bytes and never exposes unexpected service 
   await assert.rejects(client.apply(planId), error => error instanceof UpdateError && error.status === 503 && error.uncertain && !error.message.includes('sensitive'));
 });
 
+test('job progress crosses the local client only through its optional display schema', async t => {
+  const sample = { stage: 'download', progress: 0.5, downloaded: 50, total: 100, speed: 10, eta: 5, timestamp: Date.parse(now) };
+  let progress = sample, status = 'running';
+  const client = await fixture(t, (_req, res) => res.end(JSON.stringify({ ...state(), job: {
+    id: 'current-job', status, startedAt: now, finishedAt: null, activeModule: 'hub', message: '正在更新', steps: [],
+    progress: { ...progress, log: 'private-command-output', token: 'private-token', path: '/private/path' },
+  } })));
+  assert.deepEqual((await client.status()).job.progress, sample);
+  progress = { stage: 'build', timestamp: Date.parse(now), speed: 10, eta: 5 };
+  assert.deepEqual((await client.status()).job.progress, { stage: 'build', timestamp: Date.parse(now) });
+  for (const invalid of [null, {}, { ...sample, stage: 'unknown' }, { ...sample, timestamp: Date.parse(now) - 1 },
+    { ...sample, progress: -0.1 }, { ...sample, progress: 1.1 }, { ...sample, progress: '0.5' },
+    { ...sample, speed: -1 }, { ...sample, downloaded: 101 }, { ...sample, eta: true }]) {
+    progress = invalid;
+    const value = await client.status();
+    assert.equal(value.enabled, true, 'optional progress cannot break control status');
+    assert.equal(value.job.progress, undefined);
+  }
+  progress = sample;
+  for (const final of ['queued', 'succeeded', 'failed', 'interrupted']) {
+    status = final;
+    assert.equal((await client.status()).job.progress, undefined);
+  }
+});
+
 test('updater client bounds total request time including a trickling response', async t => {
   const client = await fixture(t, (req, res) => {
     res.write('{'); const timer = setInterval(() => res.write(' '), 10);

@@ -1135,6 +1135,7 @@ class CoordinatorTests(RootFixture):
         manifest.write_bytes(encoded(self.network.values['hub']['manifest']))
         inherited = {'PROJECT_DEPLOY_MODE': 'ci', 'PROJECT_DEPLOY_TESTS': '1',
                      'PROJECT_DEPLOY_MANIFEST_FILE': '/untrusted/manifest.json',
+                     'PROJECT_UPDATE_PROGRESS_FILE': '/untrusted/progress.json',
                      'GITHUB_TOKEN': GITHUB_TOKEN, 'VITE_UNTRUSTED': 'inherited', 'BASH_ENV': '/untrusted/shell'}
         with patch.dict(os.environ, inherited), patch.object(updater.subprocess, 'run', return_value=SimpleNamespace(returncode=23)) as run:
             self.assertEqual(updater.run_installer(script, manifest, log), 23)
@@ -1142,7 +1143,8 @@ class CoordinatorTests(RootFixture):
         self.assertEqual(run.call_args.args[0], ['/bin/bash', str(script)])
         self.assertEqual(run.call_args.kwargs['env'], {
             **updater.ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'source', 'PROJECT_DEPLOY_TESTS': '0',
-            'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest)})
+            'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest),
+            'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json')})
         self.assertEqual(run.call_args.kwargs['cwd'], '/')
         self.assertEqual(run.call_args.kwargs['stdin'], updater.subprocess.DEVNULL)
         self.assertEqual(run.call_args.kwargs['stderr'], updater.subprocess.STDOUT)
@@ -1150,6 +1152,49 @@ class CoordinatorTests(RootFixture):
         self.assertNotIn('shell', run.call_args.kwargs)
         self.assertFalse(run.call_args.kwargs['check'])
         self.assertEqual(json.loads(manifest.read_text())['commit'], NEW)
+
+    def test_progress_is_bound_to_running_job_and_never_changes_its_result(self):
+        plan = self.prepare(); accepted = self.coordinator.apply(plan)
+        job_id = accepted['job']['id']
+        sample_path = self.coordinator.jobs / job_id / 'progress.json'
+        sample = {'stage': 'build', 'timestamp': self.clock * 1000}
+        updater.write_json(sample_path, sample)
+        self.assertNotIn('progress', self.coordinator.status()['job'], 'queued is not an executing installer')
+        def inspect_progress(_key):
+            self.assertEqual(self.coordinator.status()['job']['progress'], sample)
+            self.assertEqual(self.make_coordinator().status()['job']['progress'], sample,
+                             'control and worker read the same private job directory after restart')
+            self.assertNotIn('progress', self.coordinator.load()['job'], 'samples are not persisted in authoritative job state')
+            for malformed in ('{invalid', '[' * 1500 + '0' + ']' * 1500):
+                sample_path.write_text(malformed, encoding='utf8')
+                self.assertNotIn('progress', self.coordinator.status()['job'])
+            updater.write_json(sample_path, sample)
+        self.installer_hook = inspect_progress
+        self.coordinator.run()
+        finished = self.coordinator.status()['job']
+        self.assertEqual(finished['status'], 'succeeded')
+        self.assertNotIn('progress', finished)
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state['job'].update(id='f' * 32, status='running')
+            self.coordinator.save(state)
+        self.assertNotIn('progress', self.coordinator.status()['job'], 'a different job cannot reuse the old path')
+
+    @unittest.skipUnless(LINUX_ROOT, 'Unix socket and root permission checks run in Linux CI')
+    def test_removed_progress_route_does_not_hold_control_connection_slots(self):
+        endpoint = self.root / 'progress-control.sock'
+        server = updater.Server(endpoint, self.coordinator)
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}); thread.start()
+        try:
+            for route, expected in [('/progress', 404)] * 20 + [('/status', 200)]:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(2); connection.connect(str(endpoint))
+                    connection.sendall(f'GET {route} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.encode())
+                    response = http.client.HTTPResponse(connection); response.begin()
+                    self.assertEqual(response.status, expected)
+                    json.loads(response.read())
+        finally:
+            server.shutdown(); server.server_close(); thread.join(5)
 
     @unittest.skipUnless(LINUX_ROOT, 'Unix socket and root permission checks run in Linux CI')
     def test_main_creates_root_owned_group_only_control_socket(self):

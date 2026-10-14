@@ -1,145 +1,100 @@
-#!/usr/bin/env python3
-"""Tests for update progress tracking and SSE streaming."""
+"""Display-only progress parsing; Linux ownership checks also run in root CI."""
 import json
+import os
+from pathlib import Path
 import sys
 import tempfile
-import time
-from pathlib import Path
+import unittest
 
-# Test needs the progress module
-sys.path.insert(0, str(Path(__file__).parent.parent / 'server' / 'update-service'))
-
-from progress import get_progress, PROGRESS_FILE, PROGRESS_TIMEOUT
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server/update-service'))
+from progress import get_progress, STAGES
 
 
-def test_progress_file_parsing():
-    """Test reading and validating progress file."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        test_file = Path(f.name)
+class ProgressTests(unittest.TestCase):
+    def setUp(self):
+        if os.name != 'nt' and os.geteuid() != 0:
+            self.skipTest('Run as root for protected progress metadata')
+        self.temporary = tempfile.TemporaryDirectory(prefix='updater-progress-')
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.directory.chmod(0o700)
+        self.path = self.directory / 'progress.json'
+        self.now = 1800000000
+        self.started = (self.now - 30) * 1000
+        self.sample = {'stage': 'download', 'progress': 0.5, 'downloaded': 50,
+                       'total': 100, 'speed': 10, 'eta': 5, 'timestamp': self.now * 1000}
 
-        # Valid progress data
-        data = {
-            'stage': 'download',
-            'progress': 0.45,
-            'downloaded': 48952341,
-            'total': 108630372,
-            'speed': 2457600,
-            'eta': 24,
-            'timestamp': int(time.time() * 1000)
-        }
-        json.dump(data, f)
+    def write(self, sample):
+        self.path.write_text(json.dumps(sample), encoding='utf8')
+        self.path.chmod(0o600)
 
-    # Temporarily replace PROGRESS_FILE
-    import progress
-    original_file = progress.PROGRESS_FILE
-    progress.PROGRESS_FILE = test_file
+    def read(self):
+        return get_progress(self.path, self.started, self.now)
 
-    try:
-        result = get_progress()
-        assert result is not None
-        assert result['stage'] == 'download'
-        assert result['progress'] == 0.45
-        assert result['downloaded'] == 48952341
-        assert result['total'] == 108630372
-        assert result['speed'] == 2457600
-        assert result['eta'] == 24
-    finally:
-        progress.PROGRESS_FILE = original_file
-        test_file.unlink()
+    def test_valid_download_and_unknown_duration_stages(self):
+        self.write(self.sample)
+        self.assertEqual(self.read(), self.sample)
+        for stage in STAGES:
+            sample = {'stage': stage, 'timestamp': self.now * 1000}
+            self.write(sample)
+            self.assertEqual(self.read(), sample)
 
+    def test_only_public_fields_survive_and_download_details_do_not_leak_to_other_stages(self):
+        self.write({**self.sample, 'error': 'private-output', 'path': '/private/path', 'token': 'private-token'})
+        self.assertEqual(self.read(), self.sample)
+        self.write({**self.sample, 'stage': 'build'})
+        self.assertEqual(self.read(), {'stage': 'build', 'progress': 0.5, 'timestamp': self.now * 1000})
 
-def test_progress_timeout_detection():
-    """Test that old progress data is marked as timed out."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        test_file = Path(f.name)
+    def test_missing_corrupt_oversized_old_future_or_previous_job_sample_is_ignored(self):
+        self.assertIsNone(self.read())
+        for raw in ('{', '[]', 'null', ' ' * 4097, '[' * 1500 + '0' + ']' * 1500):
+            self.path.write_text(raw, encoding='utf8'); self.path.chmod(0o600)
+            self.assertIsNone(self.read())
+        for stamp in (0, True, None, 'now', self.started - 1, (self.now + 2) * 1000, float('inf'), float('nan')):
+            self.write({**self.sample, 'timestamp': stamp})
+            self.assertIsNone(self.read(), str(stamp))
+        self.write(self.sample)
+        self.assertIsNone(get_progress(self.path, self.started, self.now + 301))
 
-        # Old timestamp (6 minutes ago)
-        old_time = int((time.time() - 360) * 1000)
-        data = {
-            'stage': 'download',
-            'progress': 0.5,
-            'timestamp': old_time
-        }
-        json.dump(data, f)
+    def test_malformed_optional_data_cannot_reach_public_state(self):
+        for stage in ('unknown', None, {}, ['download']):
+            self.write({**self.sample, 'stage': stage}); self.assertIsNone(self.read())
+        for progress in (-1, 1.01, True, None, '0.5', float('nan'), float('inf'), 10 ** 1000):
+            self.write({**self.sample, 'progress': progress}); self.assertIsNone(self.read())
+        for field in ('speed', 'eta', 'total', 'downloaded'):
+            for value in (-1, True, '1', float('inf'), 2 ** 53):
+                self.write({**self.sample, field: value}); self.assertIsNone(self.read())
+        self.write({**self.sample, 'downloaded': 101}); self.assertIsNone(self.read())
 
-    import progress
-    original_file = progress.PROGRESS_FILE
-    progress.PROGRESS_FILE = test_file
-
-    try:
-        result = get_progress()
-        assert result is not None
-        assert 'error' in result
-        assert 'timeout' in result['error'].lower()
-    finally:
-        progress.PROGRESS_FILE = original_file
-        test_file.unlink()
-
-
-def test_missing_progress_file():
-    """Test handling of missing progress file."""
-    import progress
-    original_file = progress.PROGRESS_FILE
-    progress.PROGRESS_FILE = Path('/nonexistent/progress.json')
-
-    try:
-        result = get_progress()
-        assert result is None
-    finally:
-        progress.PROGRESS_FILE = original_file
-
-
-def test_invalid_json():
-    """Test handling of corrupted progress file."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        test_file = Path(f.name)
-        f.write('{ invalid json }')
-
-    import progress
-    original_file = progress.PROGRESS_FILE
-    progress.PROGRESS_FILE = test_file
-
-    try:
-        result = get_progress()
-        assert result is not None
-        assert 'error' in result
-    finally:
-        progress.PROGRESS_FILE = original_file
-        test_file.unlink()
-
-
-def test_all_stages():
-    """Test progress data for all stages."""
-    stages = ['preflight', 'download', 'verify', 'extract', 'switch']
-
-    for stage in stages:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            test_file = Path(f.name)
-            data = {
-                'stage': stage,
-                'progress': 0.5,
-                'timestamp': int(time.time() * 1000)
-            }
-            json.dump(data, f)
-
-        import progress
-        original_file = progress.PROGRESS_FILE
-        progress.PROGRESS_FILE = test_file
-
+    def test_links_and_nonregular_files_are_ignored(self):
+        target = self.directory / 'target.json'
+        target.write_text(json.dumps(self.sample), encoding='utf8'); target.chmod(0o600)
+        os.link(target, self.path)
+        self.assertIsNone(self.read())
+        self.path.unlink()
         try:
-            result = get_progress()
-            assert result is not None
-            assert result['stage'] == stage
-            assert result['progress'] == 0.5
-        finally:
-            progress.PROGRESS_FILE = original_file
-            test_file.unlink()
+            self.path.symlink_to(target)
+        except OSError as error:
+            if os.name == 'nt' and getattr(error, 'winerror', None) == 1314:
+                self.skipTest('Symlink privilege unavailable; covered in Linux CI')
+            raise
+        self.assertIsNone(self.read())
+        self.path.unlink(); self.path.mkdir()
+        self.assertIsNone(self.read())
+
+    @unittest.skipIf(os.name == 'nt', 'Unix permission checks run in Linux CI')
+    def test_public_or_writable_file_and_nonprivate_parent_are_ignored(self):
+        self.write(self.sample)
+        for mode in (0o644, 0o620):
+            self.path.chmod(mode); self.assertIsNone(self.read())
+        self.path.chmod(0o600)
+        self.directory.chmod(0o755)
+        self.assertIsNone(self.read())
+        self.directory.chmod(0o700)
+        os.chown(self.path, 65534, 65534)
+        self.assertIsNone(self.read())
 
 
 if __name__ == '__main__':
-    test_progress_file_parsing()
-    test_progress_timeout_detection()
-    test_missing_progress_file()
-    test_invalid_json()
-    test_all_stages()
-    print('[PASS] All progress tests passed')
+    unittest.main(verbosity=2)

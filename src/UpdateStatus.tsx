@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowRight, Check, ChevronRight, CircleAlert, Download, LoaderCircle, RefreshCw, X } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { UpdateJob, UpdateModule, UpdateState, UpdateProgress, CombinedProgress } from './update-types';
-import { calculateCombinedProgress } from './update-progress';
+import type { UpdateJob, UpdateModule, UpdateState, UpdateProgressView } from './update-types';
+import { getUpdateProgress } from './update-progress';
 import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
@@ -48,7 +48,8 @@ function JobProgress({ job, modules }: { job: UpdateJob; modules: UpdateModule[]
   return <section className={`update-progress ${job.status}`} aria-labelledby="update-progress-title"><div className="update-progress-heading"><h3 id="update-progress-title">{running(job) ? <LoaderCircle size={18} className="spin" /> : job.status === 'succeeded' ? <Check size={18} /> : <CircleAlert size={18} />}{jobLabels[job.status]}</h3><span>{dateTime(job.finishedAt || job.startedAt)}</span></div><p role="status">{job.message || (running(job) && activeName ? `正在处理${activeName}` : unfinished(job) ? hasFailedSteps ? '上次任务有步骤未完成，请查看服务器部署日志。' : '上次任务未完成全部安装与检查。' : '进度会自动更新。')}</p>{unfinished(job) ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方“本机模块”。</p> : null}{job.steps.length ? <ol className="update-steps" aria-label="更新进度">{job.steps.map(step => <li className={step.status} key={step.id}><span className="update-step-mark" aria-hidden="true">{step.status === 'running' ? <LoaderCircle size={15} className="spin" /> : step.status === 'succeeded' ? <Check size={14} /> : step.status === 'failed' ? <X size={14} /> : <span />}</span><div><strong>{step.name}</strong>{step.message ? <p>{step.message}</p> : null}</div><span>{stepLabels[step.status]}</span></li>)}</ol> : null}{running(job) ? <small className="update-progress-note">可以关闭此面板；更新会继续，重新打开即可查看进度。</small> : null}</section>;
 }
 
-function DownloadProgress({ progress }: { progress: CombinedProgress }) {
+function DownloadProgress({ progress }: { progress: UpdateProgressView }) {
+  const percent = progress.stageProgress === undefined ? null : Math.round(progress.stageProgress * 100);
   return (
     <div className="download-progress">
       <div className="download-progress-header">
@@ -58,16 +59,16 @@ function DownloadProgress({ progress }: { progress: CombinedProgress }) {
         )}
       </div>
 
-      <div className="download-progress-bar-container">
+      {percent !== null ? <div className="download-progress-bar-container" role="progressbar" aria-label={progress.message} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} aria-valuetext={`本阶段 ${percent}%`}>
         <div
           className="download-progress-bar-fill"
-          style={{ width: `${progress.overall * 100}%` }}
+          style={{ width: `${progress.stageProgress! * 100}%` }}
         />
-      </div>
+      </div> : null}
 
       <div className="download-progress-footer">
         <span className="download-progress-percent">
-          {Math.round(progress.overall * 100)}%
+          {percent === null ? '进行中' : `本阶段 ${percent}%`}
         </span>
         {progress.eta && (
           <span className="download-progress-eta">剩余约 {progress.eta}</span>
@@ -92,7 +93,6 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const [uncertain, setUncertain] = useState(false);
   const [open, setOpen] = useState(false);
   const [review, setReview] = useState<{ planId: string; modules: UpdateModule[] } | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState<CombinedProgress | null>(null);
   const [, setClock] = useState(0);
   const snapshotRef = useRef<UpdateState | null>(null);
   const requestRef = useRef<{ controller: AbortController; kind: RequestKind } | null>(null);
@@ -105,7 +105,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const reviewElement = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
-  const progressSourceRef = useRef<EventSource | null>(null);
+  const downloadProgress = getUpdateProgress(snapshot?.job);
 
   const accept = useCallback((data: UpdateState, confirmMissingJob = false) => {
     stateVersion.current++;
@@ -220,62 +220,6 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   }, [accept, onExpired]);
 
   useEffect(() => () => { requestRef.current?.controller.abort(); requestRef.current = null; }, []);
-
-  // Subscribe to download progress via SSE
-  useEffect(() => {
-    const shouldSubscribe = running(snapshot?.job);
-
-    if (!shouldSubscribe) {
-      if (progressSourceRef.current) {
-        progressSourceRef.current.close();
-        progressSourceRef.current = null;
-      }
-      setDownloadProgress(null);
-      return;
-    }
-
-    // Don't resubscribe if already connected
-    if (progressSourceRef.current) return;
-
-    const eventSource = new EventSource('/api/system/updates/progress');
-    progressSourceRef.current = eventSource;
-
-    eventSource.onmessage = (event) => {
-      try {
-        const raw: UpdateProgress = JSON.parse(event.data);
-
-        if (raw.error) {
-          setDownloadProgress(null);
-          return;
-        }
-
-        const combined = calculateCombinedProgress(raw);
-        setDownloadProgress(combined);
-
-        // Close stream on completion
-        const isComplete = raw.stage === 'switch' && raw.progress >= 1.0;
-        if (isComplete) {
-          eventSource.close();
-          progressSourceRef.current = null;
-          // Clear progress after a brief delay to show 100%
-          setTimeout(() => setDownloadProgress(null), 1000);
-        }
-      } catch (error) {
-        // Invalid progress data, ignore
-      }
-    };
-
-    eventSource.onerror = () => {
-      eventSource.close();
-      progressSourceRef.current = null;
-      setDownloadProgress(null);
-    };
-
-    return () => {
-      eventSource.close();
-      progressSourceRef.current = null;
-    };
-  }, [snapshot?.job]);
 
   useEffect(() => {
     let disposed = false;

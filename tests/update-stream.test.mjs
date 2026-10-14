@@ -51,6 +51,29 @@ test('refresh after a mutation discards an earlier pending state and reads again
   assert.equal(calls, 2); assert.equal(res.snapshots().at(-1).state.checking, true);
 });
 
+test('progress-only changes use the existing shared stream and terminal jobs drop details', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const stamp = '2026-10-15T08:00:00.000Z';
+  let progress = { stage: 'download', progress: 0.2, timestamp: Date.parse(stamp) }, status = 'running', reads = 0;
+  const stream = createUpdateStream({ readState: async () => {
+    reads++;
+    return { ...value(), job: { id: 'job', status, startedAt: stamp, finishedAt: null, activeModule: 'hub', steps: [], message: '正在更新', progress } };
+  }, isSessionActive: () => true });
+  t.after(() => stream.close());
+  const one = new Response(), two = new Response();
+  stream.subscribe(one, 'one'); stream.subscribe(two, 'two'); await turn();
+  assert.equal(reads, 1);
+  assert.equal(one.snapshots().at(-1).state.job.progress.progress, 0.2);
+  progress = { ...progress, progress: 0.8 };
+  t.mock.timers.tick(2000); await turn();
+  assert.equal(reads, 2);
+  assert.equal(two.snapshots().at(-1).state.job.progress.progress, 0.8);
+  status = 'failed'; t.mock.timers.tick(2000); await turn();
+  assert.equal(one.snapshots().at(-1).state.job.status, 'failed');
+  assert.equal(one.snapshots().at(-1).state.job.progress, undefined);
+  one.end(); two.end(); t.mock.timers.tick(30000); await turn(); assert.equal(reads, 3);
+});
+
 test('heartbeat rechecks sessions, limits connections, disconnects slow readers and cleans close', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   let allowed = true;

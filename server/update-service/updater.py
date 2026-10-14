@@ -26,6 +26,7 @@ import uuid
 
 from registry import BY_ID, MODULES, inventory, text_file, trusted
 from releases import Network, Releases, ReleaseError, digest, valid_github_token
+from progress import get_progress
 
 
 STATE_DIR = Path('/var/lib/project-aggregation-updater')
@@ -149,7 +150,8 @@ def start_worker():
 
 def run_installer(script, manifest, log):
     environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'source', 'PROJECT_DEPLOY_TESTS': '0',
-                   'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest)}
+                   'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest),
+                   'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json')}
     # No caller-supplied arguments, environment, cwd or shell command string.
     with log.open('xb') as output:
         os.chmod(log, 0o600)
@@ -265,6 +267,15 @@ class Coordinator:
                 ('checking', 'checkedAt', 'checkError', 'planId', 'expiresAt', 'job')},
                 'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']],
                 'githubToken': {'configured': bool(self.read_token())}}
+        if result['job']:
+            # Keep samples out of state.json and never forward them after the
+            # task finishes. Each accepted job already owns a private directory.
+            job = result['job'] = {key: value for key, value in result['job'].items() if key != 'progress'}
+            if job['status'] == 'running' and TOKEN.fullmatch(job['id']):
+                progress = get_progress(self.jobs / job['id'] / 'progress.json',
+                                        timestamp(job['startedAt']) * 1000, self.clock())
+                if progress is not None:
+                    job['progress'] = progress
         remaining = state.get('nextCheckNotBefore', 0) - self.clock()
         if result['checkError'] and remaining > 0:
             result['checkError'] += f'；已暂停重试，约 {math.ceil(remaining / 60)} 分钟后自动重试'
@@ -651,32 +662,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
         self.close_connection = True
 
-    def stream_progress(self):
-        """Stream download progress via Server-Sent Events."""
-        from progress import stream_progress
-
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'keep-alive')
-        self.end_headers()
-
-        try:
-            for chunk in stream_progress():
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # Client disconnected
-
     def dispatch(self):
         try:
             self.connection.settimeout(5)
             if self.command == 'GET' and self.path == '/status':
                 self.answer(200, self.server.coordinator.status())
-                return
-            if self.command == 'GET' and self.path == '/progress':
-                self.connection.settimeout(None)  # SSE needs long timeout
-                self.stream_progress()
                 return
             if self.command != 'POST' or self.path not in ('/check', '/apply', '/token'):
                 raise UpdateError(404, '更新接口不存在')

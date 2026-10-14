@@ -24,6 +24,7 @@ export type UpdateJob = {
     message?: string;
   }>;
   message: string;
+  progress?: UpdateProgress;
 };
 
 export type UpdateState = {
@@ -42,25 +43,26 @@ export type UpdateState = {
 export type UpdateStage =
   | 'preflight'
   | 'download'
+  | 'prepare'
+  | 'build'
   | 'verify'
   | 'extract'
-  | 'switch';
+  | 'switch'
+  | 'finalize';
 
 export interface UpdateProgress {
   stage: UpdateStage;
-  progress: number;  // 0-1
+  progress?: number;  // Measured progress within this stage, 0-1; absent when unknown.
   downloaded?: number;
   total?: number;
   speed?: number;  // bytes/sec
   eta?: number;  // seconds
-  error?: string;
   timestamp: number;
 }
 
-export interface CombinedProgress {
-  overall: number;  // 0-1, combined progress
+export interface UpdateProgressView {
   stage: UpdateStage;
-  stageProgress: number;  // progress within current stage
+  stageProgress?: number;
   message: string;
   speed?: string;
   eta?: string;

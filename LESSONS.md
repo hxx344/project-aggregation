@@ -524,3 +524,17 @@
 **证据：** 本仓 `74fc675` 的 [配对规划](modules/aster/trading/pair_planning.py) 在 2026-10-15 原生 Windows 回归中复现：当前 10x、两侧各 `100 × 100 = 10000 USD1`、门槛 `10000 USD1`，目标 20x 公开额度为 `15000` 或 `20000 USD1` 时仍返回 20x。截图中的持续核对来自 [配对执行](modules/aster/trading/pair_execution.py)；截图本身不足以证明原请求已被明确拒绝。
 
 **事件记录：** `pair-upgrade-shared-capacity-20261015`；一次用户反馈与同轮防护修复。
+
+### L036：更新进度必须经过真实任务与部署通道
+
+**适用条件：** 特权更新进程、控制服务和网页分别运行，需要展示安装阶段或下载量的路径。
+
+**根因：** `3be993f` 在 Node 路由直接导入 Python，独立的 `/progress` SSE 没有接通；控制服务和 worker 各自启用 `PrivateTmp`，固定 `/tmp` 文件无法共享。写入仅覆盖 CI 下载器，而网页升级默认走源码安装。新增浏览器文件未接入执行入口，模拟的状态 URL 也与产品不符，因而构建和孤立测试没有发现链路断点。
+
+**以后做法：** 由当前任务的私有目录保存可选进度，经现有状态白名单与 SSE 输出，沿用会话校验、限额、重连和轮询。按实际安装分支上报阶段；只有可测量的阶段显示百分比。样本需有界读取并校验任务时间、字段和文件边界，损坏、过期或深层 JSON 只能隐藏详情，不影响权威任务结果与维护门。文件写入校验可信父目录，独占创建随机临时文件，禁止使用固定共享临时路径。
+
+**如何验证：** [进度读取](deploy/test-progress.py)、[协调器](deploy/test-updater.py) 覆盖坏数据、任务隔离与重启；[HTTP](tests/updates-http.test.mjs)、[状态流](tests/update-stream.test.mjs) 验证真实路由和公共过滤；[浏览器脚本](tests/update-progress.browser.mjs) 从实际前端入口验证断线恢复、终态与会话清理。Linux CI 使用 [写入边界](deploy/test-release-progress.py)、[源码增量安装](deploy/test-incremental.sh) 与 [systemd](deploy/test-update-systemd.sh) 检查真实平台权限、升级和隔离，不用模拟文件解析代替完整链路。
+
+**证据：** project-aggregation `3be993fea8985d3e21c2fa3b5090f9d5b7dae288` 的 `server/app.mjs`、`server/update-service/progress.py`、`deploy/release-common.sh` 与 `tests/update-progress.browser.mjs`；2026-10-15 在 `74fc675` 工作区审查核实。另用当前任务夹具复现 3001 字节嵌套 JSON 令 `status()` 抛 `RecursionError`，本轮补齐容错与回归。旧版首次升级没有新进度详情不等于不能升级，应保留旧状态通道兼容。
+
+**事件记录：** `update-progress-runtime-channel-20261015`；同一进度交付缺陷及连续修复，不按路径或测试数量重复计数。

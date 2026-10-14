@@ -23,6 +23,22 @@ const releaseNotes = value => typeof value === 'string' && value.isWellFormed() 
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const timestamp = value => text(value, 40) && /^\d{4}-\d\d-\d\dT/.test(value) && Number.isFinite(Date.parse(value));
 const nullable = (value, valid) => value === null || valid(value);
+const PROGRESS_STAGES = new Set(['preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize']);
+const progressNumber = (value, maximum = Number.MAX_SAFE_INTEGER) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= maximum;
+
+function publicProgress(value, job) {
+  if (job.status !== 'running' || !object(value) || !PROGRESS_STAGES.has(value.stage)
+    || !progressNumber(value.timestamp) || value.timestamp <= 0 || value.timestamp < Date.parse(job.startedAt)
+    || value.progress !== undefined && !progressNumber(value.progress, 1)
+    || ['downloaded', 'total', 'speed', 'eta'].some(key => value[key] !== undefined && !progressNumber(value[key]))
+    || value.downloaded !== undefined && value.total !== undefined && value.downloaded > value.total) return null;
+  const result = { stage: value.stage, timestamp: value.timestamp };
+  if (value.progress !== undefined) result.progress = value.progress;
+  if (value.stage === 'download') for (const key of ['downloaded', 'total', 'speed', 'eta']) {
+    if (value[key] !== undefined) result[key] = value[key];
+  }
+  return result;
+}
 
 /** Explicit public schema: never forward command output, paths or unknown fields. */
 export function publicUpdateState(value) {
@@ -54,6 +70,8 @@ export function publicUpdateState(value) {
       return { id: step.id, name: step.name, status: step.status, ...(step.message === undefined ? {} : { message: step.message }) };
     });
     job = { id: row.id, status: row.status, startedAt: row.startedAt, finishedAt: row.finishedAt, activeModule: row.activeModule, steps, message: row.message };
+    const progress = publicProgress(row.progress, row);
+    if (progress) job.progress = progress;
   }
   return { enabled: value.enabled, ...(value.reason === undefined ? {} : { reason: value.reason }), checking: value.checking,
     checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job,

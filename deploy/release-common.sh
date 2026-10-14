@@ -68,6 +68,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import ssl
@@ -86,7 +87,6 @@ ATTEMPTS = 3
 SOCKET_TIMEOUT = 20
 RANGE_DEADLINE = 180
 SINGLE_DEADLINE = 1800
-PROGRESS_FILE = Path('/tmp/project-aggregation-update-progress.json')
 PROGRESS_UPDATE_INTERVAL = 0.5  # Update progress file every 500ms
 
 
@@ -192,14 +192,27 @@ def digest_file(stream):
     return digest.hexdigest()
 
 
-def write_progress_file(stage, progress, downloaded=None, total=None, speed=None, error=None):
-    """Write progress update to shared file for SSE streaming."""
+def write_progress_file(stage, progress=None, downloaded=None, total=None, speed=None):
+    """Publish optional detail only in the coordinator's protected job directory."""
+    filename = os.environ.get('PROJECT_UPDATE_PROGRESS_FILE', '')
+    if not filename or not hasattr(os, 'geteuid') or os.geteuid() != 0:
+        return
+    directory = None
+    temporary = None
     try:
+        parts = filename.split('/')
+        if parts[0] or any(part in ('', '.', '..') for part in parts[1:]):
+            return
+        if stage not in ('preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize'):
+            return
         data = {
             'stage': stage,
-            'progress': max(0.0, min(1.0, float(progress))),
             'timestamp': int(time.time() * 1000),
         }
+        if progress is not None:
+            if not isinstance(progress, (int, float)) or not 0 <= progress <= 1:
+                return
+            data['progress'] = float(progress)
         if downloaded is not None:
             data['downloaded'] = int(downloaded)
         if total is not None:
@@ -209,26 +222,45 @@ def write_progress_file(stage, progress, downloaded=None, total=None, speed=None
             if downloaded is not None and total is not None and downloaded < total:
                 remaining = total - downloaded
                 data['eta'] = int(remaining / speed)
-        if error:
-            data['error'] = str(error)
-
-        temp_file = PROGRESS_FILE.with_suffix('.tmp')
-        with open(temp_file, 'w', encoding='utf-8') as f:
+        # Open every ancestor without following links. Keep the verified parent
+        # descriptor for all file operations so no path lookup can swap it later.
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory = os.open('/', flags)
+        for part in [None, *parts[1:-1]]:
+            if part is not None:
+                child = os.open(part, flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            info = os.fstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                return
+        try:
+            current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (not stat.S_ISREG(current.st_mode) or current.st_uid != 0 or
+                                    current.st_nlink != 1 or current.st_mode & 0o077):
+            return
+        candidate = '.progress-' + secrets.token_hex(16)
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        temporary = candidate
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_file, PROGRESS_FILE)
-    except (OSError, ValueError):
+        os.replace(temporary, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = None
+    except (OSError, ValueError, TypeError):
         pass  # Progress write failure should not block download
-
-
-def clear_progress_file():
-    """Remove progress file after completion."""
-    try:
-        if PROGRESS_FILE.exists():
-            PROGRESS_FILE.unlink()
-    except OSError:
-        pass
+    finally:
+        if directory is not None:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except OSError:
+                    pass
+            os.close(directory)
 
 
 class Downloader:
@@ -249,6 +281,7 @@ class Downloader:
         self.started = time.monotonic()
         self.received, self.total, self.positions = 0, None, {}
         self.mode = '检测'
+        self.stage = 'download'
         self.last_progress_write = 0
 
     def check_cancel(self):
@@ -267,7 +300,7 @@ class Downloader:
 
             # Write progress file for SSE streaming (rate-limited)
             now = time.time()
-            if self.total and now - self.last_progress_write >= PROGRESS_UPDATE_INTERVAL:
+            if self.stage == 'download' and self.total and now - self.last_progress_write >= PROGRESS_UPDATE_INTERVAL:
                 speed = int(self.received / elapsed) if elapsed > 0 else 0
                 write_progress_file(
                     stage='download',
@@ -280,6 +313,7 @@ class Downloader:
 
     def set_mode(self, mode, total, positions=None):
         with self.progress_lock:
+            self.stage = 'download'
             self.mode, self.total = mode, total
             self.positions = positions or {}
         self.progress()
@@ -389,7 +423,7 @@ class Downloader:
             raise Retryable('connection interrupted') from error
 
     def probe(self):
-        write_progress_file('preflight', 0.0)
+        write_progress_file('download')
         for attempt in range(ATTEMPTS):
             response = None
             try:
@@ -403,7 +437,6 @@ class Downloader:
                 self.range_headers(response, 0, 0, total)
                 # The byte value is irrelevant; only this exact response's shape enables ranges.
                 if len(self.read(response, 2, time.monotonic() + RANGE_DEADLINE)) == 1:
-                    write_progress_file('preflight', 1.0, total=total)
                     return total
                 raise Retryable('incomplete range probe')
             except RangeRejected:
@@ -573,9 +606,9 @@ class Downloader:
     def locked_download(self):
         try:
             with secure_open(self.archive) as source:
+                write_progress_file('verify')
                 if digest_file(source) == self.expected:
                     print('[CI] 部署包已缓存且校验通过，跳过下载。', file=sys.stderr, flush=True)
-                    write_progress_file('download', 1.0)
                     write_progress_file('verify', 1.0)
                     return self.archive
             secure_unlink(self.archive)
@@ -593,20 +626,19 @@ class Downloader:
                 print('[CI] 服务器分块响应不一致，已停止并发，改用单连接。', file=sys.stderr, flush=True)
                 candidate = self.single()
 
-            # Verification phase
-            write_progress_file('verify', 0.0, total=total)
             for clean_attempt in range(2):
+                with self.progress_lock:
+                    self.stage = 'verify'
+                write_progress_file('verify', total=total)
                 with secure_open(candidate) as source:
                     verified = digest_file(source) == self.expected
-                write_progress_file('verify', 0.5 if not verified and clean_attempt == 0 else 1.0, total=total)
                 if verified:
                     self.check_cancel()
                     # The cache directory and candidate are private and the per-hash lock remains held.
-                    write_progress_file('extract', 0.5, total=total)
                     os.replace(candidate, self.archive)
                     self.invalidate_parts()
                     self.progress()
-                    write_progress_file('extract', 1.0, total=total)
+                    write_progress_file('verify', 1.0, total=total)
                     return self.archive
                 self.invalidate_parts()
                 require(clean_attempt == 0, 'archive SHA256 mismatch after clean download')
@@ -649,14 +681,20 @@ class Downloader:
 
 if __name__ == '__main__':
     try:
-        result = Downloader(*sys.argv[1:]).run()
-        clear_progress_file()
-        print(result)
+        if sys.argv[1] == '--progress':
+            write_progress_file(sys.argv[2], float(sys.argv[3]) if sys.argv[3] else None)
+        else:
+            print(Downloader(*sys.argv[1:]).run())
     except (DownloadError, OSError, ValueError) as error:
-        write_progress_file('download', 0, error=str(error))
         print('[CI] 部署包下载失败：' + str(error), file=sys.stderr, flush=True)
         sys.exit(1)
 CI_DOWNLOAD_PY
+}
+
+ci_update_progress() {
+  # Old workers and direct installs omit this optional, root-controlled path.
+  [[ -n ${PROJECT_UPDATE_PROGRESS_FILE:-} ]] || return 0
+  ci_release_download --progress "$1" "${2:-}" >/dev/null 2>&1 || true
 }
 
 ci_release_extract() {
@@ -665,6 +703,7 @@ ci_release_extract() {
     "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" \
     "$CI_RELEASE_SHA256" || return 1
   archive="$cache/$CI_RELEASE_SHA256.tar.gz"
+  ci_update_progress extract
   python3 -I - "$archive" "$destination" "$CI_RELEASE_COMMIT" "$CI_RELEASE_APPLICATION_KEY" "$CI_RELEASE_SHA256" <<'CI_EXTRACT_PY'
 import hashlib, os, shutil, stat, sys, tarfile
 from pathlib import Path, PurePosixPath

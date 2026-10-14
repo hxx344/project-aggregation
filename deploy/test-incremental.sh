@@ -165,9 +165,10 @@ systemctl() {
 }
 curl() { [[ -f "$FIXTURE_ROOT/running-port" && "${@: -1}" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/health" ]]; }
 wait_healthy() { healthy; }
+ci_update_progress() { printf '%s\n' "$1" >> "$FIXTURE_ROOT/progress.calls"; }
 main
 RUN
-run_install() { bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || { cat "$fixture/last.log"; return 1; }; }
+run_install() { : > "$fixture/progress.calls"; bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || { cat "$fixture/last.log"; return 1; }; }
 count() { grep -c "^$1$" "$fixture/pnpm.calls" || true; }
 restarts() { grep -c '^restart ' "$fixture/systemctl.calls" || true; }
 releases() { find "$fixture/application/releases" -mindepth 1 -maxdepth 1 -type d | wc -l; }
@@ -189,6 +190,10 @@ git -C "$fixture/source" commit -qm unpublished-main
 touch "$fixture/advance-main-on-resolve"
 run_install
 expect_counts 1 1 0 1 1
+for stage in preflight download extract prepare verify build switch finalize; do
+  grep -qx "$stage" "$fixture/progress.calls"
+done
+[[ $(tail -n1 "$fixture/progress.calls") == finalize ]]
 [[ -z $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' -print -quit) ]]
 initial=$(readlink "$fixture/application/current")
 [[ $(cat "$initial/.source-sha") == "$stable" && $(cat "$fixture/selected-commit") == "$stable" ]]
@@ -205,6 +210,7 @@ cmp "$fixture/success-state" "$fixture/application/.deployed-state"
 rm "$fixture/fail-release"
 run_install
 expect_counts 1 1 0 1 1
+[[ $(cat "$fixture/progress.calls") == $'preflight\nfinalize' ]]
 if PROJECT_DEPLOY_TESTS=invalid run_install; then echo 'Invalid test mode accepted' >&2; exit 1; fi
 expect_counts 1 1 0 1 1
 export PROJECT_DEPLOY_TESTS=1
@@ -253,6 +259,8 @@ expect_counts 1 2 6 2 4
 echo failed >> "$fixture/source/src/app.ts"; commit_source fail-build
 touch "$fixture/fail-build"
 if run_install; then echo 'Failed build was accepted' >&2; exit 1; fi
+[[ $(tail -n1 "$fixture/progress.calls") == build ]]
+! grep -Eq '^(switch|finalize)$' "$fixture/progress.calls"
 expect_counts 1 3 7 3 4
 [[ $(readlink "$fixture/application/current") == "$current" ]]
 rm "$fixture/fail-build"

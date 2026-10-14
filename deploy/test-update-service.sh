@@ -16,6 +16,7 @@ fresh_case() {
   printf 'print("fixture updater")\n' > "$case_root/release/server/update-service/updater.py"
   printf 'MODULES = ()\n' > "$case_root/release/server/update-service/registry.py"
   printf 'RELEASE = "stable"\n' > "$case_root/release/server/update-service/releases.py"
+  printf 'def get_progress(*args): return None\n' > "$case_root/release/server/update-service/progress.py"
   printf 'EXTRA = True\n' > "$case_root/release/server/update-service/utility.py"
   printf 'not a runtime file\n' > "$case_root/release/server/update-service/README.txt"
   chmod 0644 "$case_root/release/.managed-release" "$case_root/release/server/update-service/"*
@@ -69,6 +70,7 @@ ensure_update_service "$case_root/release"
 [[ $(stat -c '%u:%g:%a' "$UPDATER_STATE_DIR") == 0:0:700 ]]
 [[ $(stat -c '%u:%g:%a' "$UPDATER_RUN_DIR") == 0:0:750 ]]
 [[ $(stat -c '%u:%g:%a' "$UPDATER_DIR/updater.py") == 0:0:644 ]]
+[[ $(stat -c '%u:%g:%a' "$UPDATER_DIR/progress.py") == 0:0:644 ]]
 [[ -f "$UPDATER_DIR/utility.py" && ! -e "$UPDATER_DIR/README.txt" ]]
 [[ $(count daemon-reload) == 1 && $(count "start $UPDATER_SERVICE") == 1 && $(count "enable $UPDATER_SERVICE") == 1 ]]
 grep -qx "ExecStart=/usr/bin/python3 -I $UPDATER_DIR/updater.py serve" "$UPDATER_UNIT_FILE"
@@ -135,6 +137,11 @@ expect_rejected 'unknown runtime directory'
 fresh_case incomplete
 rm -- "$case_root/release/server/update-service/registry.py"
 expect_rejected 'incomplete release'
+[[ ! -e "$UPDATER_DIR" ]]
+
+fresh_case incomplete-progress
+rm -- "$case_root/release/server/update-service/progress.py"
+expect_rejected 'missing progress dependency'
 [[ ! -e "$UPDATER_DIR" ]]
 
 fresh_case invalid-python

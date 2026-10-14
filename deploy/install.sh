@@ -110,6 +110,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import socket
 import ssl
@@ -128,7 +129,6 @@ ATTEMPTS = 3
 SOCKET_TIMEOUT = 20
 RANGE_DEADLINE = 180
 SINGLE_DEADLINE = 1800
-PROGRESS_FILE = Path('/tmp/project-aggregation-update-progress.json')
 PROGRESS_UPDATE_INTERVAL = 0.5  # Update progress file every 500ms
 
 
@@ -234,14 +234,27 @@ def digest_file(stream):
     return digest.hexdigest()
 
 
-def write_progress_file(stage, progress, downloaded=None, total=None, speed=None, error=None):
-    """Write progress update to shared file for SSE streaming."""
+def write_progress_file(stage, progress=None, downloaded=None, total=None, speed=None):
+    """Publish optional detail only in the coordinator's protected job directory."""
+    filename = os.environ.get('PROJECT_UPDATE_PROGRESS_FILE', '')
+    if not filename or not hasattr(os, 'geteuid') or os.geteuid() != 0:
+        return
+    directory = None
+    temporary = None
     try:
+        parts = filename.split('/')
+        if parts[0] or any(part in ('', '.', '..') for part in parts[1:]):
+            return
+        if stage not in ('preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize'):
+            return
         data = {
             'stage': stage,
-            'progress': max(0.0, min(1.0, float(progress))),
             'timestamp': int(time.time() * 1000),
         }
+        if progress is not None:
+            if not isinstance(progress, (int, float)) or not 0 <= progress <= 1:
+                return
+            data['progress'] = float(progress)
         if downloaded is not None:
             data['downloaded'] = int(downloaded)
         if total is not None:
@@ -251,26 +264,45 @@ def write_progress_file(stage, progress, downloaded=None, total=None, speed=None
             if downloaded is not None and total is not None and downloaded < total:
                 remaining = total - downloaded
                 data['eta'] = int(remaining / speed)
-        if error:
-            data['error'] = str(error)
-
-        temp_file = PROGRESS_FILE.with_suffix('.tmp')
-        with open(temp_file, 'w', encoding='utf-8') as f:
+        # Open every ancestor without following links. Keep the verified parent
+        # descriptor for all file operations so no path lookup can swap it later.
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory = os.open('/', flags)
+        for part in [None, *parts[1:-1]]:
+            if part is not None:
+                child = os.open(part, flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            info = os.fstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                return
+        try:
+            current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (not stat.S_ISREG(current.st_mode) or current.st_uid != 0 or
+                                    current.st_nlink != 1 or current.st_mode & 0o077):
+            return
+        candidate = '.progress-' + secrets.token_hex(16)
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        temporary = candidate
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_file, PROGRESS_FILE)
-    except (OSError, ValueError):
+        os.replace(temporary, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = None
+    except (OSError, ValueError, TypeError):
         pass  # Progress write failure should not block download
-
-
-def clear_progress_file():
-    """Remove progress file after completion."""
-    try:
-        if PROGRESS_FILE.exists():
-            PROGRESS_FILE.unlink()
-    except OSError:
-        pass
+    finally:
+        if directory is not None:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except OSError:
+                    pass
+            os.close(directory)
 
 
 class Downloader:
@@ -291,6 +323,7 @@ class Downloader:
         self.started = time.monotonic()
         self.received, self.total, self.positions = 0, None, {}
         self.mode = '检测'
+        self.stage = 'download'
         self.last_progress_write = 0
 
     def check_cancel(self):
@@ -309,7 +342,7 @@ class Downloader:
 
             # Write progress file for SSE streaming (rate-limited)
             now = time.time()
-            if self.total and now - self.last_progress_write >= PROGRESS_UPDATE_INTERVAL:
+            if self.stage == 'download' and self.total and now - self.last_progress_write >= PROGRESS_UPDATE_INTERVAL:
                 speed = int(self.received / elapsed) if elapsed > 0 else 0
                 write_progress_file(
                     stage='download',
@@ -322,6 +355,7 @@ class Downloader:
 
     def set_mode(self, mode, total, positions=None):
         with self.progress_lock:
+            self.stage = 'download'
             self.mode, self.total = mode, total
             self.positions = positions or {}
         self.progress()
@@ -431,7 +465,7 @@ class Downloader:
             raise Retryable('connection interrupted') from error
 
     def probe(self):
-        write_progress_file('preflight', 0.0)
+        write_progress_file('download')
         for attempt in range(ATTEMPTS):
             response = None
             try:
@@ -445,7 +479,6 @@ class Downloader:
                 self.range_headers(response, 0, 0, total)
                 # The byte value is irrelevant; only this exact response's shape enables ranges.
                 if len(self.read(response, 2, time.monotonic() + RANGE_DEADLINE)) == 1:
-                    write_progress_file('preflight', 1.0, total=total)
                     return total
                 raise Retryable('incomplete range probe')
             except RangeRejected:
@@ -615,9 +648,9 @@ class Downloader:
     def locked_download(self):
         try:
             with secure_open(self.archive) as source:
+                write_progress_file('verify')
                 if digest_file(source) == self.expected:
                     print('[CI] 部署包已缓存且校验通过，跳过下载。', file=sys.stderr, flush=True)
-                    write_progress_file('download', 1.0)
                     write_progress_file('verify', 1.0)
                     return self.archive
             secure_unlink(self.archive)
@@ -635,20 +668,19 @@ class Downloader:
                 print('[CI] 服务器分块响应不一致，已停止并发，改用单连接。', file=sys.stderr, flush=True)
                 candidate = self.single()
 
-            # Verification phase
-            write_progress_file('verify', 0.0, total=total)
             for clean_attempt in range(2):
+                with self.progress_lock:
+                    self.stage = 'verify'
+                write_progress_file('verify', total=total)
                 with secure_open(candidate) as source:
                     verified = digest_file(source) == self.expected
-                write_progress_file('verify', 0.5 if not verified and clean_attempt == 0 else 1.0, total=total)
                 if verified:
                     self.check_cancel()
                     # The cache directory and candidate are private and the per-hash lock remains held.
-                    write_progress_file('extract', 0.5, total=total)
                     os.replace(candidate, self.archive)
                     self.invalidate_parts()
                     self.progress()
-                    write_progress_file('extract', 1.0, total=total)
+                    write_progress_file('verify', 1.0, total=total)
                     return self.archive
                 self.invalidate_parts()
                 require(clean_attempt == 0, 'archive SHA256 mismatch after clean download')
@@ -691,14 +723,20 @@ class Downloader:
 
 if __name__ == '__main__':
     try:
-        result = Downloader(*sys.argv[1:]).run()
-        clear_progress_file()
-        print(result)
+        if sys.argv[1] == '--progress':
+            write_progress_file(sys.argv[2], float(sys.argv[3]) if sys.argv[3] else None)
+        else:
+            print(Downloader(*sys.argv[1:]).run())
     except (DownloadError, OSError, ValueError) as error:
-        write_progress_file('download', 0, error=str(error))
         print('[CI] 部署包下载失败：' + str(error), file=sys.stderr, flush=True)
         sys.exit(1)
 CI_DOWNLOAD_PY
+}
+
+ci_update_progress() {
+  # Old workers and direct installs omit this optional, root-controlled path.
+  [[ -n ${PROJECT_UPDATE_PROGRESS_FILE:-} ]] || return 0
+  ci_release_download --progress "$1" "${2:-}" >/dev/null 2>&1 || true
 }
 
 ci_release_extract() {
@@ -707,6 +745,7 @@ ci_release_extract() {
     "https://github.com/$CI_RELEASE_REPOSITORY/releases/download/$CI_RELEASE_TAG/$CI_RELEASE_FILE" \
     "$CI_RELEASE_SHA256" || return 1
   archive="$cache/$CI_RELEASE_SHA256.tar.gz"
+  ci_update_progress extract
   python3 -I - "$archive" "$destination" "$CI_RELEASE_COMMIT" "$CI_RELEASE_APPLICATION_KEY" "$CI_RELEASE_SHA256" <<'CI_EXTRACT_PY'
 import hashlib, os, shutil, stat, sys, tarfile
 from pathlib import Path, PurePosixPath
@@ -936,6 +975,7 @@ ensure_tools() {
   if ! command -v flock >/dev/null 2>&1 || ! command -v runuser >/dev/null 2>&1; then missing+=(util-linux); fi
   if ((${#missing[@]})); then
     command -v apt-get >/dev/null 2>&1 || fail '缺少依赖且没有 apt-get；请安装 curl git xz-utils python3 ca-certificates util-linux 后重试。'
+    ci_update_progress prepare
     log "安装缺少的系统依赖：${missing[*]}"
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
@@ -960,6 +1000,7 @@ ensure_node() {
   archive="node-v${NODE_VERSION}-linux-${machine}.tar.xz"
   runtime_dir="$APP_DIR/runtime/node-v${NODE_VERSION}-linux-${machine}"
   if [[ ! -x "$runtime_dir/bin/node" ]] || ! node_supported "$runtime_dir/bin/node"; then
+    ci_update_progress prepare
     log "下载 Node.js $NODE_VERSION 并核验官方 SHA-256。"
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o "$work_dir/SHASUMS256.txt"
     curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 "https://nodejs.org/dist/v${NODE_VERSION}/${archive}" -o "$work_dir/$archive"
@@ -982,6 +1023,7 @@ ensure_pnpm() {
     return
   fi
   [[ ! -e "$runtime_dir" ]] || fail 'pnpm 运行时目录不完整，请检查后重试。'
+  ci_update_progress prepare
   log "准备固定版本 pnpm $PNPM_VERSION 并校验官方包 SHA-512。"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 \
     "https://registry.npmjs.org/pnpm/-/pnpm-$PNPM_VERSION.tgz" -o "$archive"
@@ -1058,6 +1100,7 @@ application_ready() {
 }
 prepare_source() {
   [[ ! -d "$work_dir/source" ]] || return 0
+  ci_update_progress extract
   mkdir "$work_dir/source"
   git --git-dir="$APP_DIR/repository.git" archive "$commit" | tar -x -C "$work_dir/source"
   chmod 0755 "$work_dir"
@@ -1070,6 +1113,7 @@ prepare_dependencies() {
     return
   fi
   [[ ! -e "$dependencies" ]] || fail '依赖缓存目录不完整，请检查后重试。'
+  ci_update_progress prepare
   log '依赖内容或运行环境变化，安装依赖。'
   local staging="$work_dir/dependencies"
   mkdir "$staging"
@@ -1146,6 +1190,7 @@ prepare_module_builds() {
       # that account too; privileged copies only target root-owned trees.
       run_as_service /usr/bin/python3 -I "$work_dir/build-artifact-cache.py" restore "$cache" "$key" "$artifact"
     else
+      ci_update_progress build
       log "$module 构建输入变化或缓存不完整，仅构建该模块。"
       (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules "$module")
       [[ -s "$artifact/${MODULE_BUILD_ENTRIES[$module]}" ]] || fail "$module 构建缺少必要入口。"
@@ -1158,6 +1203,7 @@ prepare_module_builds() {
 }
 prepare_embedded_runtime() {
   prepare_module_builds
+  ci_update_progress prepare
   # Re-extract executable sources and packaging helpers from the pinned Git
   # object. Only the declared, fully verified build outputs come from caches.
   mkdir "$work_dir/trusted-runtime"
@@ -1198,6 +1244,7 @@ prepare_application() {
     prepare_source_aster_runtime
   fi
   if [[ ! -f "$typecheck_stamp" ]]; then
+    ci_update_progress verify
     log '类型检查输入变化，执行一次类型检查。'
     (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
     atomic_record "$typecheck_stamp" "$typecheck_key"
@@ -1205,11 +1252,13 @@ prepare_application() {
   if [[ "$PROJECT_DEPLOY_TESTS" == 0 ]]; then
     log '跳过完整行为测试；CI 继续验证，设置 PROJECT_DEPLOY_TESTS=1 可在部署时补测。'
   elif [[ ! -f "$test_stamp" ]]; then
+    ci_update_progress verify
     log '测试或相关源码变化，在隔离目录执行行为测试。'
     (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" ASTER_PYTHON="$ASTER_PYTHON_PATH" "$NODE_BIN" "$PNPM_BIN" test)
     atomic_record "$test_stamp" "$test_key"
   else log '行为测试输入未变化，复用验证结果。'; fi
   if (( need_build )); then
+    ci_update_progress build
     log '工作台前端内容或运行环境变化，仅构建工作台页面。'
     (cd "$work_dir/source" && run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
     [[ -s "$work_dir/source/dist/index.html" ]] || fail '构建缺少 dist/index.html。'
@@ -1237,6 +1286,7 @@ prepare_application() {
     return
   fi
   mkdir "$work_dir/publish"
+  ci_update_progress extract
   # Re-extract runtime source as root; tests/builds cannot modify published code.
   git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$work_dir/publish"
   build_artifact_cache restore "$built" "$build_key" "$work_dir/publish/dist"
@@ -1423,7 +1473,7 @@ ensure_update_service() {
   [[ -d "$source" ]] || { fail '发布包中的在线更新服务目录无效。'; return 1; }
   [[ -f "$source_release/.managed-release" ]] || { fail '在线更新服务必须来自已验证的发布目录。'; return 1; }
   updater_safe_path "$source_release/.managed-release" || return 1
-  for name in updater.py registry.py releases.py; do
+  for name in updater.py registry.py releases.py progress.py; do
     [[ -s "$source/$name" && -f "$source/$name" ]] || { fail "发布包缺少在线更新文件：$name"; return 1; }
   done
   local -a files=()
@@ -1526,6 +1576,7 @@ UPDATER_CHECK_PY
   fi
 }
 finish_update_service() {
+  ci_update_progress finalize
   if ! ensure_update_service "$1"; then
     fail '工作台已健康运行，但在线更新服务安装未完成；请修复以上错误后重新执行安装命令。'
     return 1
@@ -1570,6 +1621,7 @@ prepare_greeks_runtime() {
     rm -rf -- "$runtime"
   fi
   [[ ! -e "$runtime" ]] || { fail "Greeks 虚拟环境不完整：$runtime"; return 1; }
+  ci_update_progress prepare
   mkdir -p "$APP_DIR/python"
   mkdir "$runtime"
   atomic_record "$runtime/.building" "$fingerprint"
@@ -1615,6 +1667,7 @@ prepare_aster_runtime() {
     rm -rf -- "$runtime"
   fi
   [[ ! -e "$runtime" ]] || { fail "ASTER 虚拟环境不完整：$runtime"; return 1; }
+  ci_update_progress prepare
   mkdir -p "$APP_DIR/python-aster"
   mkdir "$runtime"
   atomic_record "$runtime/.building" "$fingerprint"
@@ -1758,6 +1811,7 @@ main() {
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   # Both deployment modes consume exactly the selected stable release. The
   # coordinator passes a pinned manifest; direct installs discover stable once.
+  ci_update_progress preflight
   ci_release_resolve hxx344/project-aggregation "$work_dir"
   commit=$CI_RELEASE_COMMIT
   [[ "$CI_RELEASE_NODE_VERSION" == "$NODE_VERSION" ]] || fail '正式版本的 Node.js 基线与安装器不匹配，请获取最新版安装器。'
@@ -1774,6 +1828,7 @@ main() {
   fi
   if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
     prepare_ci_application
+    ci_update_progress verify
     validate_embedded_runtime "$release"
     run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
   else
@@ -1781,12 +1836,15 @@ main() {
   updater_safe_path "$APP_DIR/repository.git"
   if [[ ! -d "$APP_DIR/repository.git" ]]; then git init --bare -q "$APP_DIR/repository.git"; fi
   if ! git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit^{commit}" 2>/dev/null; then
+    ci_update_progress download
     git --git-dir="$APP_DIR/repository.git" fetch --quiet --depth=1 "$REPOSITORY" "$commit"
   else
     log '源码已缓存，跳过下载。'
   fi
   input_keys
+  ci_update_progress prepare
   prepare_application
+  ci_update_progress verify
   validate_embedded_runtime "$release"
   fi
   prepare_greeks_runtime "$release"
@@ -1805,6 +1863,7 @@ main() {
   previous_release=$old_release
   if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
   prepare_environment_rollback
+  ci_update_progress switch
   activation_started=1
   migrate_embedded_modules "$release"
   if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
