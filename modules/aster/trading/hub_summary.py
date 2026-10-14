@@ -77,7 +77,7 @@ def _pair_diagnostics(pair, runtime, observation, accounts):
         return result or ([("fault", "配对运行记录缺失或无效")] if pair.get("enabled") else [])
     if runtime.get("attention") or runtime.get("phase") == "attention":
         result.append(("action", _text(runtime.get("attention") or runtime.get("reason"), "配对组需要人工核对")))
-    elif _pair_orders_unresolved({**runtime, "recovery_watch": None}):
+    elif _pair_orders_unresolved(runtime):
         result.append(("fault", "配对订单正在自动核对，等待原流程完成"))
     watch = runtime.get("recovery_watch")
     if watch is not None:
@@ -88,10 +88,11 @@ def _pair_diagnostics(pair, runtime, observation, accounts):
                  and observation.get("members") == members)
         if match and observation.get("status") == "action":
             result.append(("action", _text(observation.get("message"), "历史订单出现新异常，需要人工核对")))
-        elif match and observation.get("accounts") == configs and observation.get("status") == "clear":
-            result.append(("notice", "历史订单继续观察，既有检查未发现新增成交或活动订单"))
-        elif pair.get("enabled"):
-            result.append(("fault", "历史订单观察检查未完成，等待原流程重试"))
+        elif (match and pair.get("enabled") and observation.get("accounts") == configs
+              and observation.get("status") == "failed"):
+            result.append(("fault", "历史订单自动检查失败，等待原流程重试"))
+        # A retained archive or an absent display cache is not a current fault.
+        # The existing execution guards still perform their own fresh checks.
     return result
 
 
@@ -106,8 +107,7 @@ def _snapshot(now, *candidates):
 
 
 def _pair_orders_unresolved(runtime):
-    if (runtime.get("recovery_watch") is not None or runtime.get("attention")
-            or runtime.get("phase") in ("attention", "reconciling", "repairing")):
+    if runtime.get("attention") or runtime.get("phase") in ("attention", "reconciling", "repairing"):
         return True
     pending = runtime.get("pending")
     if pending is None:

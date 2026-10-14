@@ -291,7 +291,6 @@ class HubSummaryTests(TestCase):
             ({"updated_at": self.now + 1}, "缺少有效更新时间"),
             ({"updated_at": self.now - 120}, "配对成交统计已过期"),
             ({"pending": {"kind": "cycle"}}, "配对订单尚待核对"),
-            ({"recovery_watch": {"batches": []}}, "配对订单尚待核对"),
             ({"phase": "attention"}, "配对订单尚待核对"),
             ({"attention": "仓位待核对"}, "配对订单尚待核对"),
             ({"phase": "reconciling"}, "配对订单尚待核对"),
@@ -361,7 +360,8 @@ class HubSummaryTests(TestCase):
         self.now = (int(self.now // 86400) + 1) * 86400 - 1
         runtime = self.pair()
         yesterday = datetime.fromtimestamp(self.now, timezone.utc).date().isoformat()
-        runtime.update(volume_unknown=True, volume_unknown_until_utc=yesterday)
+        runtime.update(volume_unknown=True, volume_unknown_until_utc=yesterday,
+                       recovery_watch={"batches": [{"id": "archived"}]})
         self.f.store.put("pair_runtime:gold", runtime)
         self.assertIsNone(self.metrics(hub_summary(self.engine, now=self.now))["daily_volume"])
         result = hub_summary(self.engine, now=self.now + 2)
@@ -600,17 +600,28 @@ class HubWatchDiagnosticTests(TestCase):
         self.assertEqual({aid: broker.api.calls for aid, broker in self.live.items()}, calls)
         return result
 
-    def assert_kind(self, kind):
+    def assert_kind(self, kind=None, *, volume=0):
         result = self.summary()
-        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]], [("pair:gold", kind)])
-        self.assertIsNone(next(row["value"] for row in result["data"]["metrics"] if row["key"] == "daily_volume"))
+        expected = [("pair:gold", kind)] if kind else []
+        self.assertEqual([(row["id"], row["kind"]) for row in result["data"]["diagnostics"]], expected)
+        self.assertEqual(next(row["value"] for row in result["data"]["metrics"] if row["key"] == "daily_volume"), volume)
         return result
 
-    def test_successful_enable_preserves_healthy_watch_notice_across_revision_and_time(self):
+    def test_archived_watch_keeps_confirmed_volume_without_an_observation_notice(self):
         self.activate_watch()
-        self.assert_kind("notice")
+        self.assert_kind()
         self.engine.pair_watch_diagnostics["gold"]["checked_at"] -= 3600
-        self.assert_kind("notice")
+        self.assert_kind()
+        runtime = self.state()
+        today = datetime.now(timezone.utc).date().isoformat()
+        runtime["daily_volume"][today] = {"long": "100", "short": "120"}
+        self.f.store.put("pair_runtime:gold", runtime)
+        result = self.assert_kind(volume=220)
+        self.assertEqual(result["data"]["health"]["state"], "online")
+        self.assertIn("配对仅统计已核对成交", result["data"]["metrics"][-1]["detail"])
+        runtime["volume_unknown"] = True
+        self.f.store.put("pair_runtime:gold", runtime)
+        self.assert_kind("notice", volume=None)
 
     def test_failed_watch_check_is_fault_and_observed_new_activity_is_action(self):
         self.activate_watch()
@@ -633,26 +644,43 @@ class HubWatchDiagnosticTests(TestCase):
         self.assert_kind("action")
         self.assertEqual(self.state(), original)
 
-    def test_restarted_or_changed_watch_and_account_config_require_existing_guard_evidence(self):
+    def test_restarted_or_changed_watch_and_account_config_do_not_invent_failures(self):
         self.activate_watch()
         self.engine.pair_watch_diagnostics.clear()
-        self.assert_kind("fault")
+        self.assert_kind()
         with self.no_writes():
             counts = {aid: len(broker.api.calls) for aid, broker in self.live.items()}
             evidence = require_archived_orders_clear(self.engine, self.f.store.pair("gold"))
         self.assertEqual(len(evidence), 2)
         self.assertEqual({aid: len(broker.api.calls) - counts[aid] for aid, broker in self.live.items()},
                          {"test": 1, "second": 1})
-        self.assert_kind("notice")
+        self.assert_kind()
         runtime = self.state()
         original = deepcopy(runtime)
         runtime["recovery_watch"]["changed"] = True
         self.f.store.put("pair_runtime:gold", runtime)
-        self.assert_kind("fault")
+        self.assert_kind()
         self.f.store.put("pair_runtime:gold", original)
         saved = self.f.store.account("test")
         self.f.store.save_account({**saved, "env_prefix": "ASTER_REPLACEMENT"})
+        self.assert_kind()
+
+    def test_failed_observation_is_only_reported_for_its_current_watch_and_accounts(self):
+        self.activate_watch()
+        pair = self.f.store.pair("gold")
+        with self.no_writes(), patch.object(self.broker(), "query", side_effect=ExchangeError("offline")):
+            with self.assertRaises(TradingError):
+                require_archived_orders_clear(self.engine, pair)
         self.assert_kind("fault")
+        runtime = self.state()
+        original = deepcopy(runtime)
+        runtime["recovery_watch"]["changed"] = True
+        self.f.store.put("pair_runtime:gold", runtime)
+        self.assert_kind()
+        self.f.store.put("pair_runtime:gold", original)
+        saved = self.f.store.account("test")
+        self.f.store.save_account({**saved, "env_prefix": "ASTER_REPLACEMENT"})
+        self.assert_kind()
 
     def test_diagnostic_publication_failure_does_not_change_guard_result(self):
         self.activate_watch()

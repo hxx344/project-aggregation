@@ -173,7 +173,6 @@ test('legacy ASTER distinguishes confirmed zero pair volume from missing or unce
     [{ volume_unknown: true, volume_unknown_until_utc: f.day }, /成交时间或金额尚未核实/],
     [{ volume_unknown: true, volume_unknown_until_utc: '2000-99-00' }, /未知日期无效/],
     [{ pending: { kind: 'cycle' } }, /订单尚待核对/],
-    [{ recovery_watch: { batches: ['old'] } }, /订单尚待核对/],
   ];
   for (const [changes, reason] of cases) await t.test(JSON.stringify(changes), async () => {
     const current = pairedAsterFixture(); Object.assign(current.state, changes);
@@ -186,8 +185,35 @@ test('legacy ASTER distinguishes confirmed zero pair volume from missing or unce
   assert.equal((await f.read()).values.daily_volume, null);
 });
 
+test('legacy ASTER archived watches retain confirmed ledgers and preserve volume uncertainty', async () => {
+  const f = pairedAsterFixture();
+  f.state.recovery_watch = { batches: ['old'] };
+  let result = await f.read();
+  assert.equal(result.values.daily_volume, 220); assert.equal(result.partial, false); assert.deepEqual(result.diagnostics, []);
+  f.state.daily_volume = {};
+  result = await f.read();
+  assert.equal(result.values.daily_volume, 0); assert.equal(result.partial, false); assert.deepEqual(result.diagnostics, []);
+  f.state.volume_unknown = true;
+  for (const until of [undefined, f.day, '2000-99-00']) {
+    f.state.volume_unknown_until_utc = until;
+    result = await f.read();
+    assert.equal(result.values.daily_volume, null); assert.equal(result.partial, true);
+    assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'notice');
+  }
+  f.state.volume_unknown_until_utc = '2000-01-01';
+  result = await f.read();
+  assert.equal(result.values.daily_volume, 0); assert.equal(result.partial, false); assert.deepEqual(result.diagnostics, []);
+  f.state.pending = { kind: 'cycle' };
+  result = await f.read();
+  assert.equal(result.values.daily_volume, null); assert.equal(result.diagnostics[0].kind, 'fault');
+  assert.match(result.diagnostics[0].message, /订单正在核对或修复/);
+  assert.doesNotMatch(result.diagnostics[0].message, /历史订单观察/);
+  assert.deepEqual(f.state.recovery_watch, { batches: ['old'] });
+});
+
 test('legacy ASTER keeps confirmed volume during normal submissions and leverage changes', async () => {
   const f = pairedAsterFixture();
+  f.state.recovery_watch = { batches: ['old'] };
   f.state.phase = 'submitting';
   f.state.pending = { kind: 'cycle', phase: 'open', legs: [{ receipt: null, dispatch: 'sending' }, { receipt: { status: 'FILLED' } }], repairs: [] };
   let result = await f.read();
@@ -357,8 +383,11 @@ test('legacy ASTER merges pair diagnostics by stable ID and uses runtime evidenc
   f.data.pairs[0].name = '改名'; f.state.reason = '新文案';
   result = await f.read(); assert.equal(result.diagnostics[0].id, id);
   f.state.phase = 'holding'; delete f.state.attention; f.state.recovery_watch = { batches: ['old'] };
+  result = await f.read(); assert.deepEqual(result.diagnostics, []);
+  delete f.state.reason; f.state.error = '运行记录读取失败';
   result = await f.read(); assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'fault');
-  delete f.state.recovery_watch; f.state.volume_unknown = true;
+  assert.match(result.diagnostics[0].message, /运行记录读取失败/);
+  delete f.state.error; delete f.state.recovery_watch; f.state.volume_unknown = true;
   result = await f.read(); assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'notice');
   assert.equal(result.values.daily_volume, null);
   f.state.volume_unknown = false;

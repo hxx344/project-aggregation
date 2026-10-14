@@ -159,7 +159,7 @@ function diagnosticMessage(base, reasons) {
 
 function asterPairOrdersUnresolved(state) {
   const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-  if (state.recovery_watch != null || state.attention || ['attention', 'reconciling', 'repairing'].includes(state.phase)) return true;
+  if (state.attention || ['attention', 'reconciling', 'repairing'].includes(state.phase)) return true;
   const pending = state.pending;
   if (pending == null) return false;
   if (!record(pending)) return true;
@@ -198,10 +198,8 @@ function asterRuntimeKind(state) {
   if (!state || typeof state !== 'object') return null;
   if (state.attention || state.phase === 'attention' || state.pending?.status === 'attention') return 'action';
   if (state.error || ['reconciling', 'repairing'].includes(state.phase)) return 'fault';
-  // Compact legacy payloads do not publish the archived-order guard result.
-  // A watch alone cannot prove that the current live position is safe.
-  if (state.pending && asterPairOrdersUnresolved({ ...state, recovery_watch: null })) return 'fault';
-  return state.recovery_watch != null ? 'fault' : null;
+  if (state.pending && asterPairOrdersUnresolved(state)) return 'fault';
+  return null;
 }
 
 function asterDiagnosticCollector() {
@@ -400,7 +398,7 @@ export async function readSummary(project, credentials, { request = requestJson,
       };
       const runtime = pair?.state || account.cycle_state;
       const runtimeKind = asterRuntimeKind(runtime);
-      if (runtimeKind === 'fault') diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, runtimeKind, `${pair ? pair.label : label}：${diagnosticText(runtime?.reason || runtime?.error, runtime?.recovery_watch != null ? '历史订单观察结果待确认，请升级源模块获取分类结果' : '订单正在核对或修复')}`);
+      if (runtimeKind === 'fault') diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, runtimeKind, `${pair ? pair.label : label}：${diagnosticText(runtime?.reason || runtime?.error, '订单正在核对或修复')}`);
       if (account.error) add(`账户读取失败：${diagnosticText(account.error, '上游未提供具体原因')}`);
       if (!account.snapshot) add('缺少账户快照');
       else {
