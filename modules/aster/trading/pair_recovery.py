@@ -4,21 +4,166 @@ from copy import deepcopy
 from fractions import Fraction
 import math
 import json
+import hashlib
 import re
 import time
 import uuid
 
-from .exchange import AmbiguousOrder, ExchangeError, LiveBroker, api_wait_notice
+from .exchange import AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, api_wait_notice
 from .exchange_messages import exchange_reason
 from .execution import Executor, TERMINAL
-from .models import TradingError, dec, positive, require_supported_leverage, wire
+from .models import TradingError, dec, positive, require_supported_leverage, opening_margin_limit, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
 from .pair_planning import require_runtime_symbols
 SIDES = (("long", "LONG"), ("short", "SHORT"))
 MIN_AGE = 120
 PREVIEW_TTL = 300
-MAX_WATCH_BATCHES = 8
+MAX_WATCH_BATCHES = 8  # Active index size, not an admission cap on durable archives.
+MIN_QUERY_ATTEMPTS = 3
+
+
+def record_query_attempt(record, error=None):
+    """Only an actually attempted exchange read consumes the durable budget."""
+    if isinstance(error, RequestNotSent) or getattr(error, "local_cooldown", False):
+        return
+    record["recovery_query_attempts"] = min(MIN_QUERY_ATTEMPTS,
+        max(0, record.get("recovery_query_attempts", 0)) + 1)
+
+
+def recovery_ready(pending):
+    if pending.get("kind") == "leverage" or pending.get("terminal_position_recovery"):
+        records = [pending]
+    else:
+        records = [leg for leg in pending.get("legs", []) + pending.get("repairs", [])
+                   if not leg.get("receipt") or leg["receipt"].get("status") not in TERMINAL]
+    if not records:
+        return False
+    gate = pending.setdefault("bounded_recovery", {"observed_at": time.time()})
+    if not isinstance(gate, dict):
+        raise TradingError("恢复等待记录无效")
+    if gate.get("stage") == "positions":
+        return True
+    now = time.time()
+    # New records timestamp every possible write. Legacy records start a fresh
+    # conservative window when first observed, regardless of old created_at.
+    anchors = [gate.get("observed_at"), pending.get("last_possible_send_at", gate.get("observed_at"))]
+    if any(type(value) not in (int, float) or not math.isfinite(value) for value in anchors):
+        raise TradingError("恢复等待时间无效")
+    anchor = max(anchors)
+    if not 0 <= now - anchor:
+        gate["observed_at"] = now
+        return False
+    if (records and all(record.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS for record in records)
+            and now - anchor >= MIN_AGE):
+        gate["stage"] = "positions"
+        return True
+    return False
+
+
+def active_watch_batches(watch):
+    """Bound original-ID work; retired archives require full current-account reads."""
+    batches = watch.get("batches", []) if isinstance(watch, dict) else []
+    return [batch for batch in batches[-MAX_WATCH_BATCHES:]
+            if isinstance(batch, dict) and not batch.get("bounded_queries_complete")] if isinstance(batches, list) else []
+
+
+def _watch_evidence_key(pair_id, batch):
+    fingerprint = hashlib.sha256(json.dumps({"identities": batch["identities"], "legs": batch["legs"]},
+        sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    return "pair_watch_evidence:" + pair_id + ":" + fingerprint
+
+
+def _append_watch(store, pair_id, watch, batch):
+    result = deepcopy(watch or {"batches": []})
+    batches = result["batches"] + [batch]
+    dropped = batches[:-MAX_WATCH_BATCHES]
+    if dropped:
+        identities = batch["identities"]
+        if (any(row.get("identities") != identities for row in dropped)
+                or result.get("retired_identities", identities) != identities):
+            raise TradingError("历史归档账户身份不一致，不能更新观察索引")
+        for row in dropped:
+            created = row.get("created_at")
+            now = time.time()
+            if (type(created) not in (int, float) or not math.isfinite(created) or not 0 < created <= now):
+                # Older/imported indexes may omit their creation time. Start a
+                # durable conservative window instead of making the ninth batch
+                # permanently inadmissible; the current full-account check is
+                # still mandatory before the runtime/archive transaction.
+                key = _watch_evidence_key(pair_id, row)
+                observed = store.get(key, {}) or {}
+                created = observed.get("first_observed_at")
+                if type(created) not in (int, float) or not math.isfinite(created) or not 0 < created <= now:
+                    created = now
+                    observed["first_observed_at"] = created
+                    store.put(key, observed)
+            if now - created < MIN_AGE:
+                raise TradingError("历史归档尚未满足等待窗口，不能压缩观察索引")
+            key = _watch_evidence_key(pair_id, row)
+            observed = store.get(key, {}) or {}
+            if observed.get("retired_batch") != row:
+                observed["retired_batch"] = deepcopy(row)
+                store.put(key, observed)
+        result["retired_identities"] = deepcopy(identities)
+        result["retired_symbols"] = sorted(set(result.get("retired_symbols", [])) |
+            {row.get("symbol", row["legs"][0]["order"]["symbol"]) for row in dropped})
+    result["batches"] = batches[-MAX_WATCH_BATCHES:]
+    return result
+
+
+def _commit_runtime(engine, pair, runtime, *, expected, margin, accounts, identities, guards,
+                    batch=None, audit=None):
+    """CAS and all recovery outputs commit together, without nesting store calls."""
+    from .pair_planning import PairRecoveryConflict
+    from .store import dumps
+    with engine.pairs._current_members(guards), engine.store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        for table, column, key, value in (
+                ("pairs", "id", pair["id"], pair),
+                ("kv", "key", "pair_runtime:" + pair["id"], expected),
+                ("kv", "key", "pair_margin:" + pair["id"], margin),
+                *(("accounts", "id", account["id"], account) for account in accounts)):
+            row = db.execute(f"SELECT data FROM {table} WHERE {column}=?", (key,)).fetchone()
+            if (json.loads(row[0]) if row else {}) != value:
+                raise PairRecoveryConflict("现实核对期间账户、配置或运行记录变化，已保留最新状态")
+        for key, side in SIDES:
+            aid = pair[key + "_account_id"]
+            binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (aid,)).fetchone()
+            if not binding or tuple(binding) != (pair["id"], side):
+                raise PairRecoveryConflict("现实核对期间账户归属变化，已保留最新状态")
+            with engine.lock:
+                broker = engine.brokers.get(aid)
+            if (broker is None or identities[key].get("mode") == "live" and
+                    (not isinstance(broker, LiveBroker) or broker._snapshot_lock is not guards[aid][0])):
+                raise PairRecoveryConflict("现实核对期间账户连接变化，已保留最新状态")
+            if isinstance(broker, LiveBroker) and any(
+                    broker.api.credentials[field].lower() != identities[key].get(field)
+                    for field in ("user", "signer")):
+                raise PairRecoveryConflict("现实核对期间账户身份变化，已保留最新状态")
+        for _, check in guards.values():
+            check()
+        entries = [("pair_runtime:" + pair["id"], runtime)]
+        if batch is not None:
+            entries.append(("pair_batch:" + batch["id"], batch))
+        if audit is not None:
+            entries.append(("pair_order_recovery:" + pair["id"] + ":" + audit["pending"]["id"], audit))
+        for key, value in entries:
+            db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
+
+
+def _safe_reality(engine, pair, state, *, reconciliation=True):
+    from .pair_planning import positions, PairPositionError
+    from .pair_execution import PairTrader
+    snapshots, guards = engine.pairs._read_members(pair, adopt=True, reconciliation=reconciliation, runtime=state)
+    held = positions(snapshots, pair["symbol"])
+    leverage = held["LONG"].leverage
+    require_supported_leverage(leverage)
+    risk = PairTrader(engine)._risk_snapshots(pair, snapshots, recovery=True)
+    if any(snapshot.equity <= 0 or snapshot.margin_exceeds(opening_margin_limit(pair["ordinary"], leverage))
+           for snapshot in risk.values()):
+        raise PairPositionError("实际仓位保证金风险仍超限，保留恢复记录并停止新增")
+    return snapshots, guards, {side: wire(held[side].qty) for _, side in SIDES}, leverage
 
 
 def _query(broker, order, *, timeout=None):
@@ -63,7 +208,8 @@ def _publish_archived_diagnostic(engine, pair, watch, accounts, status, message)
         pass
 
 
-def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, read_only=False, deadline=None):
+def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, read_only=False, deadline=None,
+                                 adopt_positions=True, expected_quantities=None, retire_for_deletion=False):
     """Check durable watches for new writes or a fresh read-only maintenance check."""
     from .pair_execution import PairTrader
     state = engine.store.get("pair_runtime:" + pair["id"], {}) if state is None else state
@@ -80,7 +226,7 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, rea
 
     try:
         batches = watch.get("batches") if isinstance(watch, dict) else None
-        if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
+        if not isinstance(batches, list) or not batches:
             raise action("人工归档订单跟踪记录无效，禁止新开仓与划转")
         # Maintenance can inspect configured live accounts with execution disabled.
         # Default callers still require live execution permission before new work.
@@ -88,26 +234,133 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, rea
         accounts, current_brokers, identities = PairTrader(engine)._members(pair, **member_options)
         brokers = current_brokers if brokers is None else brokers
         evidence = []
+        retired = watch.get("retired_identities")
+        if retired is not None and retired != identities:
+            raise action("已退役观察的账户身份已变化，禁止新开仓与划转")
+        if retire_for_deletion:
+            # Deletion also covers archives removed from the bounded hot index.
+            # Their original records remain durable even after index compaction.
+            prefix = "pair_watch_evidence:" + pair["id"] + ":"
+            with engine.store.connect() as db:
+                preserved = [json.loads(row[0]) for row in db.execute(
+                    "SELECT data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))]
+            archived = [row["retired_batch"] for row in preserved if row.get("retired_batch")]
+            if retired is not None and not archived:
+                raise action("压缩观察的原始记录不完整，不能解除绑定")
+            batches = list(batches)
+            for batch in archived:
+                if batch not in batches:
+                    batches.append(batch)
+        active = ([batch for batch in batches if isinstance(batch, dict) and not batch.get("bounded_queries_complete")]
+                  if retire_for_deletion else active_watch_batches(watch))
+        all_retired = True
+        needs_reality = retired is not None or len(batches) > MAX_WATCH_BATCHES or expected_quantities is not None
         for batch in batches:
             if not isinstance(batch, dict) or batch.get("identities") != identities:
                 raise action("人工归档订单的账户身份已变化，禁止新开仓与划转")
             legs = batch.get("legs")
-            if (not isinstance(legs, list) or len(legs) != 2 or any(not isinstance(leg, dict) for leg in legs)
+            if (not isinstance(legs, list) or len(legs) < 2 or any(not isinstance(leg, dict) for leg in legs)
                     or {leg.get("key") for leg in legs} != {"long", "short"}
                     or any(not isinstance(leg.get("order"), dict) for leg in legs)):
                 raise action("人工归档订单明细无效，禁止新开仓与划转")
+            # Supplementary observations do not rewrite the archived journal or
+            # invalidate configuration/start previews. Every archive stays in DB.
+            observation_key = _watch_evidence_key(pair["id"], batch)
+            observed = engine.store.get(observation_key, {}) or {}
+            if observed.get("retired") or batch not in active:
+                needs_reality = True
+                evidence.extend(observed.get("orders", []))
+                continue
+            observed.setdefault("first_observed_at", time.time())
+            observations = observed.setdefault("legs", {})
+            batch_evidence, failure = [], None
             for leg in legs:
                 timeout = None if deadline is None else min(8, deadline - time.monotonic())
                 if timeout is not None and timeout <= 0:
                     raise TradingError("历史订单核查超过本次更新检查时限，请稍后重试")
-                row = _query(brokers[leg["key"]], leg["order"], timeout=timeout)
-                if row is not None and (row["status"] not in TERMINAL or dec(row["executedQty"]) != 0):
-                    raise action("已人工归档的原订单出现成交或活动回执，停止新开仓与划转；请核对原订单和实际仓位")
-                evidence.append({"batch_id": batch.get("id"), "side": leg["key"].upper(),
-                    "client_order_id": leg["order"]["newClientOrderId"],
+                cid = leg["order"]["newClientOrderId"]
+                record = observations.setdefault(cid, {})
+                row = record.get("receipt")
+                try:
+                    if record.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS:
+                        if record.get("error"):
+                            failure = TradingError(record["error"])
+                    else:
+                        row = _query(brokers[leg["key"]], leg["order"], timeout=timeout)
+                        record_query_attempt(record)
+                        record.pop("error", None)
+                except RequestNotSent:
+                    # Local admission failures cannot exhaust recovery.
+                    engine.store.put(observation_key, observed)
+                    raise
+                except ExchangeError as exc:
+                    record_query_attempt(record, exc)
+                    record["error"] = str(exc)
+                    failure = exc
+                else:
+                    if row is not None:
+                        record["receipt"] = deepcopy(row)
+                        if row["status"] not in TERMINAL or dec(row["executedQty"]) != 0:
+                            needs_reality = True
+                            if row["status"] not in TERMINAL:
+                                failure = action("归档原订单仍有活动回执，等待完整挂单及实际仓位核对")
+                                record["error"] = str(failure)
+                batch_evidence.append({"batch_id": batch.get("id"), "side": leg["key"].upper(),
+                    "client_order_id": cid,
                     "status": row["status"] if row is not None else "UNKNOWN",
                     "executed_qty": wire(dec(row["executedQty"])) if row is not None else None})
-        status, message = "clear", "历史订单继续观察，既有检查未发现新增成交或活动订单"
+            elapsed = time.time() - observed["first_observed_at"]
+            exhausted = (elapsed >= MIN_AGE and all(
+                observations[leg["order"]["newClientOrderId"]].get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS
+                for leg in legs))
+            observed.update(orders=batch_evidence, checked_at=time.time(), retired=exhausted)
+            engine.store.put(observation_key, observed)
+            all_retired = all_retired and exhausted
+            if failure is not None and not exhausted:
+                raise failure
+            needs_reality = needs_reality or exhausted
+            evidence.extend(batch_evidence)
+        if retire_for_deletion:
+            if not all_retired:
+                raise action("历史订单尚未完成三次实际核查及 120 秒等待，暂不能解除绑定")
+            # This is only the historical gate. PairManager must independently
+            # prove fresh full-account flatness, then CAS these rows and clear
+            # the watch together with deletion in one transaction.
+            with engine.store.connect() as db:
+                return {row[0]: json.loads(row[1]) for row in db.execute(
+                    "SELECT key,data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))}
+        if needs_reality:
+            from .pair_planning import PairPositionError, PairRecoveryConflict
+            snapshots, guards, actual, _ = _safe_reality(engine, pair, state, reconciliation=False)
+            expected = expected_quantities if expected_quantities is not None else PairTrader._expected(state)
+            if any(dec(actual[side]) != dec(expected[side]) for _, side in SIDES):
+                if (state.get("pending") or any(dec(qty) for qty in state["progress"]["quantities"].values())
+                        or dec(actual["LONG"]) != dec(actual["SHORT"])):
+                    raise action("历史订单补证后实际仓位仍不平衡或与活动批次不符，停止新增及划转")
+                if adopt_positions:
+                    persisted = engine.store.get("pair_runtime:" + pair["id"], {})
+                    if persisted != state:
+                        raise PairRecoveryConflict("历史观察核对期间运行状态变化，请按最新记录重新核验")
+                    margin = engine.store.get("pair_margin:" + pair["id"], {}) or {}
+                    if margin.get("pending") is not None:
+                        raise PairPositionError("仍有未决划转，不能采纳历史订单后的实际底仓")
+                    from .pair_execution import empty_progress
+                    adopted = deepcopy(state)
+                    adopted.update(owned=actual, progress=empty_progress(actual, state["progress"].get("completed_cycles", 0)),
+                        updated_at=time.time(), reason="历史订单补证后已采纳两侧平衡的实际底仓，重新检查交易条件")
+                    adopted.pop("attention", None)
+                    PairTrader(engine)._publish_snapshots(adopted, snapshots, pair["symbol"])
+                    _commit_runtime(engine, pair, adopted, expected=persisted, margin=margin,
+                        accounts=list(accounts.values()), identities=identities, guards=guards)
+                    # Every caller must discard its pre-adoption snapshots/state.
+                    raise PairRecoveryConflict("已采纳历史订单后的实际底仓，下一轮使用新记录继续")
+            with engine.pairs._current_members(guards):
+                _, current, actual_identities = PairTrader(engine)._members(pair, **member_options)
+                if actual_identities != identities or any(
+                        isinstance(current[key], LiveBroker) and current[key]._snapshot_lock is not guards[pair[key + "_account_id"]][0]
+                        for key, _ in SIDES):
+                    raise action("历史观察现实核对期间账户身份变化，停止新增及划转")
+        status, message = "clear", "历史订单已有限补证，当前检查未发现活动挂单或未处理仓位变化"
         return evidence
     finally:
         _publish_archived_diagnostic(engine, pair, watch, accounts, status, message)
@@ -118,6 +371,110 @@ class PairOrderRecovery:
         self.manager, self.engine, self.store = manager, manager.engine, manager.store
         self.previews = {}
         self.baseline_previews = {}
+
+    def adopt_unknown(self, trader, pair, state):
+        """End exhausted recovery from fresh reality, keeping every unknown fill."""
+        from .pair_execution import empty_progress
+        from .pair_planning import PairRecoveryConflict, PairPositionError
+        pending = state["pending"]
+        if not recovery_ready(pending):
+            return False
+        require_runtime_symbols(pair, state)
+        if pending.get("kind") not in {"ordinary", "cycle", "leverage"}:
+            raise PairPositionError("未完成批次类型无效，不能自动接管仓位")
+        created = pending.get("created_at")
+        if (not isinstance(pending.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pending["id"])
+                or type(created) not in (int, float) or not math.isfinite(created) or not 0 < created <= time.time()):
+            raise PairPositionError("原批次编号或时间无效，不能自动接管")
+        margin = self.store.get("pair_margin:" + pair["id"], {}) or {}
+        if margin.get("pending") is not None or margin.get("status") in {"submitting", "acknowledged", "accepted", "unknown"}:
+            raise TradingError("仍有未决划转，暂不结束订单恢复")
+        if not isinstance(pending.get("before"), dict) or set(pending["before"]) != {"LONG", "SHORT"}:
+            raise PairPositionError("原批次底仓记录不完整，不能自动接管")
+        before = {side: wire(positive(pending["before"][side], True)) for _, side in SIDES}
+        if pending["kind"] != "leverage":
+            if pending.get("phase") not in {"open", "close"}:
+                raise PairPositionError("原订单阶段无效，不能自动接管")
+            legs, repairs = pending.get("legs"), pending.get("repairs")
+            if (not isinstance(legs, list) or len(legs) != 2 or not isinstance(repairs, list)
+                    or {leg.get("key") for leg in legs if isinstance(leg, dict)} != {"long", "short"}):
+                raise PairPositionError("原订单或补偿记录不完整，不能自动接管")
+            cids = set()
+            for leg in legs + repairs:
+                order = leg.get("order") if isinstance(leg, dict) else None
+                if not isinstance(order, dict) or leg.get("key") not in {"long", "short"}:
+                    raise PairPositionError("原订单方向记录无效，不能自动接管")
+                side = leg["key"].upper()
+                adding = leg in legs and pending["phase"] == "open"
+                if (order.get("positionSide") != side or order.get("type") != "MARKET"
+                        or order.get("side") != ("BUY" if (side == "LONG") == adding else "SELL")
+                        or leg.get("dispatch") not in {"prepared", "sending"}):
+                    raise PairPositionError("原委托字段无效，不能自动接管")
+                positive(order.get("quantity"))
+                cid = order.get("newClientOrderId")
+                if not isinstance(cid, str) or not re.fullmatch(r"[.A-Za-z0-9_:/-]{1,36}", cid) or cid in cids:
+                    raise PairPositionError("原客户端订单编号无效，不能自动接管")
+                cids.add(cid)
+                if leg.get("receipt") is not None:
+                    Executor.validate_receipt(order, leg["receipt"])
+        persisted = self.store.get("pair_runtime:" + pair["id"], {})
+        # The stage is set immediately after the last query's durable save.
+        # Compare the actual journal without treating that local marker as a race.
+        original_pending, current_pending = deepcopy(persisted.get("pending")), deepcopy(pending)
+        for value in (original_pending, current_pending):
+            if isinstance(value, dict):
+                value.pop("bounded_recovery", None)
+        if original_pending != current_pending or any(persisted.get(key) != state.get(key)
+                for key in ("owned", "progress", "recovery_watch", "daily_volume")):
+            raise PairRecoveryConflict("现实核对期间批次变化，已保留最新记录")
+        accounts = self.manager._members(pair)
+        _, brokers, identities = trader._members(pair)
+        if identities != pending.get("identities") or identities != state.get("identities"):
+            raise PairPositionError("原批次与当前账户身份不一致，不能自动接管")
+        snapshots, guards, actual, leverage = _safe_reality(self.engine, pair, state)
+        balanced = dec(actual["LONG"]) == dec(actual["SHORT"])
+        baseline = all(dec(actual[side]) == dec(before[side]) for _, side in SIDES)
+        if not balanced and not (pending["kind"] != "cycle" and baseline):
+            raise PairPositionError("实际仓位仍单边或不等量，保留原批次；需两侧平衡或分别回到原底仓")
+        now = time.time()
+        reconciled = deepcopy(state)
+        resolution = ("leverage_positions_verified" if pending["kind"] == "leverage" else
+                      "terminal_positions_adopted" if pending.get("terminal_position_recovery") else
+                      "positions_adopted_unknown")
+        if pending["kind"] == "leverage":
+            if leverage != pending["target_leverage"]:
+                reconciled["leverage_recovery_cooldown"] = {
+                    "symbol": pair["symbol"], "target": pending["target_leverage"],
+                    "identities": deepcopy(identities), "ordinary": deepcopy(pair["ordinary"]),
+                    "until": now + 300, "actual_leverage": leverage}
+        else:
+            trader._account_volume(reconciled, pending)
+            watch = {"id": pending["id"], "symbol": pair["symbol"],
+                "created_at": pending["created_at"], "identities": deepcopy(identities),
+                "positions_verified_at": now, "bounded_queries_complete": True,
+                "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])}
+                         for leg in pending["legs"] + pending["repairs"]]}
+            reconciled["recovery_watch"] = _append_watch(self.store, pair["id"], reconciled.get("recovery_watch"), watch)
+        message = (f"原记录有限核对后已验证实际仓位与 {leverage}x 杠杆安全，采纳底仓：多 {actual['LONG']}、空 {actual['SHORT']}；"
+                   "旧批次已结束，原成交记录保留，下一轮重新检查交易条件")
+        reconciled.update(pending=None, owned=actual,
+            progress=empty_progress(actual, state.get("progress", {}).get("completed_cycles", 0)),
+            phase="waiting" if pair["enabled"] else "paused", reason=message, updated_at=now,
+            last_batch={"id": pending["id"], "kind": pending["kind"], "phase": pending.get("phase"),
+                        "completed": False, "status": "aborted", "at": now, "resolution": resolution, "positions_verified": True})
+        for key in ("attention", "retry_after", "retry_at", "failure_count", "api_notice", "trade_retry"):
+            reconciled.pop(key, None)
+        trader._publish_snapshots(reconciled, snapshots, pair["symbol"])
+        audit = {"status": resolution, "pending": deepcopy(pending), "confirmed_at": now,
+                 "actual": actual, "leverage": leverage, "identities": deepcopy(identities)}
+        batch = {**deepcopy(pending), "completed": False, "status": "aborted", "finished_at": now,
+                 "resolution": resolution, "positions_verified": True, "actual": actual}
+        _commit_runtime(self.engine, pair, trader._durable(reconciled), expected=persisted, margin=margin,
+            accounts=accounts, identities=identities, guards=guards, batch=batch, audit=audit)
+        state.clear()
+        state.update(reconciled)
+        trader._wake_hot_data(pair)
+        return True
 
     @staticmethod
     def _baseline_fingerprint(pair, state, margin, accounts):
@@ -149,7 +506,7 @@ class PairOrderRecovery:
         if state.get("identities") != identities:
             raise TradingError("归档后的账户身份已变化，不能采纳底仓")
         snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True, startup=True)
-        orders = require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers)
+        orders = require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers, adopt_positions=False)
         with ExitStack() as budget:
             for broker in brokers.values():
                 if isinstance(broker, LiveBroker):
@@ -211,8 +568,10 @@ class PairOrderRecovery:
             value.pop(key, None)
         # A display-only observation does not change order or position authority.
         value["pending"].pop("observation_attempt_at", None)
+        value["pending"].pop("bounded_recovery", None)
         for leg in value["pending"]["legs"]:
             leg.pop("error", None)
+            leg.pop("recovery_query_attempts", None)
         return {"pair": pair, "state": value, "margin": margin, "accounts": accounts}
 
     @staticmethod
@@ -492,9 +851,10 @@ class PairOrderRecovery:
         reconciled = deepcopy(state)
         owned = {side: wire(value) for side, value in actual.items()}
         if state.get("recovery_watch") is not None:
-            require_archived_orders_clear(self.engine, pair, state=state)
-            if actual != before:
-                raise PairPositionError("仍有人工归档未知订单跟踪，不能将变化后的仓位采纳为新底仓")
+            # This batch's terminal receipts and balanced quantities have been
+            # checked above. The historical guard must compare against that
+            # verified result, not the old pre-batch owned baseline.
+            require_archived_orders_clear(self.engine, pair, state=state, expected_quantities=owned)
         reconciled["pending"]["manual_position_reconciliation"] = {
             "source": source, "checked_at": time.time(),
             "identities": deepcopy(pending["identities"]),
@@ -675,17 +1035,15 @@ class PairOrderRecovery:
         from .engine import snapshot_json
         from .pair_execution import empty_progress
         runtime, pending = deepcopy(read["state"]), read["state"]["pending"]
-        watches = deepcopy((runtime.get("recovery_watch") or {}).get("batches", []))
-        if len(watches) >= MAX_WATCH_BATCHES:
-            raise TradingError("待观察的人工归档批次已达上限，请先处理原订单记录")
-        watches.append({"id": pending["id"], "symbol": read["pair"]["symbol"],
+        watch = {"id": pending["id"], "symbol": read["pair"]["symbol"],
                         "created_at": pending["created_at"], "identities": read["identities"],
-                        "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])} for leg in pending["legs"]]})
+                        "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])} for leg in pending["legs"]]}
         kind = "循环" if pending["kind"] == "cycle" else "普通"
         message = f"已人工归档未取得回执的{kind}开仓批次，底仓保留；配对组仍暂停，可点击启动重新核验"
         audit = {"status": "manual_archived_unresolved", "pending": deepcopy(pending), "confirmed_at": time.time(),
                  "preview": deepcopy(preview["review"]), "confirmation": read["evidence"], "actual": read["actual"]}
-        runtime.update(pending=None, phase="paused", reason=message, recovery_watch={"batches": watches},
+        runtime.update(pending=None, phase="paused", reason=message,
+            recovery_watch=_append_watch(self.store, read["pair"]["id"], runtime.get("recovery_watch"), watch),
             progress=empty_progress(runtime["owned"], (runtime.get("progress") or {}).get("completed_cycles", 0)),
             snapshots={key: snapshot_json(snapshot, [read["pair"]["symbol"]]) for key, snapshot in read["snapshots"].items()},
             updated_at=time.time())

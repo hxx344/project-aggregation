@@ -255,10 +255,10 @@ class PairUpgradeExecutionTests(TestCase):
             for _ in range(2):
                 state = self.tick()
                 self.assertEqual(state["phase"], "reconciling", state)
-                self.assertEqual(state["pending"], pending)
+                self.assertEqual({key: state["pending"][key] for key in pending}, pending)
         for write in writes:
             write.assert_not_called()
-        self.assertEqual(self.store.get("pair_runtime:gold")["pending"], pending)
+        self.assertEqual({key: self.store.get("pair_runtime:gold")["pending"][key] for key in pending}, pending)
 
     def test_live_token_fallback_rechecks_last_snapshot_mark_before_post(self):
         self.live_brokers()
@@ -347,10 +347,13 @@ class PairUpgradeExecutionTests(TestCase):
                     for _ in range(2):
                         recovered = self.tick()
                         self.assertEqual(recovered["phase"], "reconciling", recovered)
-                        self.assertEqual(recovered["pending"], pending)
+                        self.assertEqual({key: value for key, value in recovered["pending"].items()
+                                          if key != "recovery_query_attempts"},
+                                         {key: value for key, value in pending.items()
+                                          if key != "recovery_query_attempts"})
                 for write in writes:
                     write.assert_not_called()
-                self.assertEqual(self.store.get("pair_runtime:gold")["pending"], pending)
+                self.assertEqual(self.store.get("pair_runtime:gold")["pending"], recovered["pending"])
                 for key, broker in self.brokers.items():
                     self.assertEqual([(method, path) for method, path, _ in broker.api.calls if method == "POST"],
                                      [("POST", "/fapi/v3/leverage")] if key == "long" else [])

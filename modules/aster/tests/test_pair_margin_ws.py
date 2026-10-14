@@ -222,12 +222,13 @@ class PairMarginWebSocketTests(unittest.TestCase):
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "unknown")
         self.ready()
-        with patch.object(self.balancer, "_refresh_acknowledged_ws", side_effect=AssertionError("unknown must use income")):
+        with patch.object(self.balancer, "_refresh_acknowledged_ws", side_effect=AssertionError("unknown must use fresh balances")):
             retry = self.balancer.tick(self.pair, snapshots)
-        self.assertEqual(retry["status"], "unknown")
-        self.assertIsNotNone(retry["pending"])
+        self.assertEqual(retry["status"], "skipped")
+        self.assertIsNone(retry["pending"])
+        self.assertNotIn("confirmed_at", retry["last_transfer"])
         self.assertTrue(retry["blocks_trading"])
-        self.assertEqual(self.refreshed, [])
+        self.assertEqual(self.refreshed, ["long", "short"])
         self.assertEqual(len(self.transfers), 1)
 
     def test_legacy_zero_success_code_keeps_ack_and_original_rest_refresh(self):
@@ -238,7 +239,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
         self.assertEqual(result["status"], "acknowledged")
         self.assert_rest(result)
 
-    def test_legacy_accepted_and_submitting_still_require_income_reconciliation(self):
+    def test_legacy_accepted_checks_history_and_submitting_uses_fresh_balances(self):
         for status in ("accepted", "submitting"):
             with self.subTest(status=status):
                 self.store.put("pair_margin:gold", {})
@@ -251,9 +252,13 @@ class PairMarginWebSocketTests(unittest.TestCase):
                 self.emit(journal["pending"])
                 with patch.object(self.balancer, "_refresh_acknowledged_ws", side_effect=AssertionError("legacy must use income")):
                     result = self.balancer.tick(self.pair, snapshots)
-                self.assertEqual(result["status"], "unknown" if status == "submitting" else status)
-                self.assertIsNotNone(result["pending"])
-                self.assertEqual(self.refreshed, [])
+                self.assertEqual(result["status"], "skipped" if status == "submitting" else status)
+                if status == "submitting":
+                    self.assertIsNone(result["pending"])
+                    self.assertNotIn("confirmed_at", result["last_transfer"])
+                else:
+                    self.assertIsNotNone(result["pending"])
+                self.assertEqual(self.refreshed, ["long", "short"] if status == "submitting" else [])
                 self.assertEqual(len(self.transfers), 1)
 
     def test_new_event_revokes_balance_guards_before_journal_commit(self):

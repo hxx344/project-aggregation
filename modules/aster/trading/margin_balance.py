@@ -31,6 +31,8 @@ DEFAULT_MARGIN = {"enabled": False, "master_env_prefix": "", "check_interval_sec
 TRANSFER_TYPES = frozenset({"TRANSFER", "SUBUSER_ASSET_TRANSFER"})
 TRANSFER_UNIT = Fraction(Decimal("0.00000001"))
 TRANSFER_WS_GRACE_SECONDS = 2
+TRANSFER_HISTORY_QUERY_LIMIT = 3
+TRANSFER_HISTORY_WAIT_SECONDS = 120
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
     -1102, -1103, -1104, -1105, -1106, -1111, -1130, -2014, -2015, -2019})
 
@@ -294,18 +296,26 @@ class MarginBalancer:
                 weights[side] += self.engine.broker(member).snapshot_weight([pair.get("symbol", "XAUUSD1")])
         watch = (self.store.get("pair_runtime:" + pair["id"], {}) or {}).get("recovery_watch")
         if watch is not None:
-            from .pair_recovery import MAX_WATCH_BATCHES
+            from .pair_recovery import active_watch_batches
             batches = watch.get("batches") if isinstance(watch, dict) else None
-            if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
+            if not isinstance(batches, list) or not batches:
                 raise TradingError("人工归档订单跟踪记录无效，禁止新开仓与划转")
+            active = active_watch_batches(watch)
             for batch in batches:
                 legs = batch.get("legs") if isinstance(batch, dict) else None
-                if (not isinstance(legs, list) or len(legs) != 2
+                if (not isinstance(legs, list) or len(legs) < 2
                         or any(not isinstance(leg, dict) for leg in legs)
                         or {leg.get("key") for leg in legs} != {"long", "short"}):
                     raise TradingError("人工归档订单明细无效，禁止新开仓与划转")
-                for leg in legs:
-                    weights[leg["key"]] += 1
+                if batch in active:
+                    for leg in legs:
+                        weights[leg["key"]] += 1
+            # An exhausted historical watch uses a full current-state read.
+            # Admit that whole fallback before starting transfer preparation;
+            # new transfers cannot borrow the reserved recovery allowance.
+            for side, member in members.items():
+                broker = self.engine.broker(member)
+                weights[side] += broker.snapshot_weight([pair.get("symbol", "XAUUSD1")], fresh_modes=True) + 40
         return weights
 
     @contextmanager
@@ -532,7 +542,7 @@ class MarginBalancer:
             if MarginBalancer.resume_ready(journal) and (not journal.get("blocked_reason") or journal.get("retry_without_blocking")):
                 return view("unknown", f"等待重新读取两侧余额后跳过旧划转；读取成功前仍预留 {pending['amount']} USD1，不重发原请求")
             reasons = {"unknown": "划转结果未知，等待重新读取两侧余额后自动跳过旧核对；原请求会归档，不会重发或标记为成功",
-                "accepted": "划转请求已受理，系统继续查询两侧 USD1 流水；核实前不开始新开仓或新划转",
+                "accepted": "划转请求已受理，系统有限次查询两侧 USD1 流水；仍无法匹配时重新读取两侧余额并归档旧请求",
                 "acknowledged": "交易所已确认划转，系统继续读取两侧最新余额；刷新前不开始新开仓或新划转"}
             return view(status, journal.get("blocked_reason") or reasons[status], blocks=True)
         if not config["enabled"]:
@@ -563,15 +573,29 @@ class MarginBalancer:
         return view("waiting", "等待系统下一次保证金检查" + _remaining_time(journal.get("next_check_at"), time.time())
                     + "；满足余额差额及安全可划条件后才发起划转")
 
-    def _income(self, members, start, end, *, reconciliation=False):
+    def _income(self, members, start, end, *, reconciliation=False, observation=None):
         self._require_budget(members, {side: 30 for side in members}, reconciliation=reconciliation)
         result = {}
         for side, member in members.items():
             broker = self.engine.broker(member)
             priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
             with priority:
-                rows = broker.api.call("GET", "/fapi/v3/income",
-                    {"startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=30)
+                try:
+                    rows = broker.api.call("GET", "/fapi/v3/income",
+                        {"startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=30)
+                except RequestNotSent:
+                    raise
+                except ExchangeError as exc:
+                    # A local cooldown has not made a historical query. An
+                    # actual network failure still consumes one bounded round.
+                    notice = api_wait_notice(exc)
+                    if observation is not None and not (notice and notice["kind"] == "cooldown"
+                            and exc.http_status is None and exc.code is None):
+                        observation["queried"] = True
+                    raise
+                else:
+                    if observation is not None:
+                        observation["queried"] = True
             if not isinstance(rows, list) or len(rows) >= 1000 or any(not isinstance(row, dict) for row in rows):
                 raise TradingError("划转流水不完整，无法核对")
             result[side] = rows
@@ -585,9 +609,35 @@ class MarginBalancer:
             self.store.put("pair_margin:" + pair["id"], state)
         if pending.get("status") == "unknown":
             return self._resume_unknown(pair, members, state, config)
+        recovery = pending.setdefault("history_recovery", {"first_observed_at": time.time(), "query_rounds": 0})
+        if (not isinstance(recovery, dict) or type(recovery.get("query_rounds")) is not int
+                or not 0 <= recovery["query_rounds"] <= TRANSFER_HISTORY_QUERY_LIMIT
+                or type(recovery.get("first_observed_at")) not in (int, float)
+                or not math.isfinite(recovery["first_observed_at"])):
+            raise TradingError("划转历史核对进度无效，保留原请求")
+        # Old records have no durable dispatch boundary: allow a full recovery
+        # window after first observation, including across process restarts.
+        deadline = max(pending["created_at"], recovery["first_observed_at"]) + TRANSFER_HISTORY_WAIT_SECONDS
+        self.store.put("pair_margin:" + pair["id"], state)
+        if recovery["query_rounds"] >= TRANSFER_HISTORY_QUERY_LIMIT:
+            if time.time() >= deadline:
+                return self._resume_unknown(pair, members, state, config)
+            return self._view(state, config, "accepted", "旧划转流水已完成有限次核对，等待恢复观察窗口结束"
+                + _remaining_time(deadline, time.time()) + "后重新读取两侧余额；不再重复查询旧流水", blocks=True)
         start = int(pending["created_at"] * 1000) // 1000 * 1000
         end = int((pending["created_at"] + 90) * 1000)
-        rows = self._income(members, start, end, reconciliation=True)
+        observation = {}
+        try:
+            rows = self._income(members, start, end, reconciliation=True, observation=observation)
+        except TradingError:
+            if observation.get("queried"):
+                recovery["query_rounds"] += 1
+                self.store.put("pair_margin:" + pair["id"], state)
+                if recovery["query_rounds"] >= TRANSFER_HISTORY_QUERY_LIMIT and time.time() >= deadline:
+                    return self._resume_unknown(pair, members, state, config)
+            raise
+        if observation.get("queried"):
+            recovery["query_rounds"] += 1
         self._record_success(pair, state)
         matches = []
         for side, sign in ((pending["source"], -1), (pending["destination"], 1)):
@@ -613,7 +663,9 @@ class MarginBalancer:
             matches.append(found)
         common = matches[0] & matches[1]
         if len(common) != 1 or any(len(values) != 1 for values in matches):
-            return self._view(state, config, pending["status"], "系统继续只读查询两侧 USD1 划转流水，需交易编号相同、金额对应且均在核对时间范围内；确认前不开始新开仓或新划转")
+            if recovery["query_rounds"] >= TRANSFER_HISTORY_QUERY_LIMIT and time.time() >= deadline:
+                return self._resume_unknown(pair, members, state, config)
+            return self._view(state, config, pending["status"], "两侧 USD1 划转流水尚未匹配；有限次核对后将以新余额归档旧请求，期间不开始新开仓或新划转")
         kind, txn = common.pop()
         done = {**pending, "status": "confirmed", "confirmed_at": time.time(), "transaction_id": txn, "income_type": kind}
         state.update(pending=None, last_transfer=done)

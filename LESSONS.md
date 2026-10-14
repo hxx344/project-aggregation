@@ -568,3 +568,19 @@
 **证据：** project-aggregation `6ba3eec` 引入的 [加仓弹窗](modules/crossex/src/PositionActionDialog.tsx) 与 [计算辅助](modules/crossex/src/position-actions.ts)，2026-10-15 用户报告点击加仓后黑屏。基于 `96debc6` 的原生 Windows 浏览器回归在修复前构建 `index-rW2drLUC.js` 上复现 `Cannot read properties of null (reading 'gt')`；直接计算 `0.03 → 0.04` 产生 202 字符的 `1/3`。
 
 **事件记录：** `crossex-derived-decimal-dialog-crash-20261015`；一次用户反馈及同根因修复，不推进主线复盘检查点。
+
+### L039：未知请求的恢复必须能转入当前状态核验
+
+**适用条件：** 交易订单、升杠杆或划转已持久化，但原请求一直没有可用回执，或合法终态回执与当前实际持仓持续不符；也适用于人工归档后的历史观察。
+
+**根因：** 原路径超时只改成 `attention` 或暂停，仍保留未完成请求并无限查询；部分恢复还要求实际杠杆必须等于目标、两侧旧流水编号必须相同。把未知单移入每次交易前都查询的历史观察，同样会永久挡住后续操作。
+
+**以后做法：** 持久记录实际查询次数和最近可能发送的时间。旧订单及待匹配历史流水最多查询三次，经过 120 秒观察窗口后转为新鲜的完整账户核验；订单恢复还须独立核验完整挂单。预算等待不计次数，补偿请求重新计算等待窗口。仓位、身份、模式、杠杆和风险满足策略约束时，在同一事务归档旧请求并采纳现实基线；保留原始委托与未知成交，不重发旧请求，也不伪造零成交或成功回执。真实活动挂单、失衡仓位及读取失败继续阻止恢复，并给出当前原因。
+
+历史观察有限补证后由当前风险检查决定是否继续，不能把归档索引上限或已空仓后的解绑变成新的永久阻塞。解绑仍须在观察完成后读取完整空仓证据，并原子归档历史观察及解除账户归属。升档请求结束后按标的、目标、身份与配置设置冷却，冷却期间继续评估当前档位。自动暂停必须记录来源；无论正常回执完成还是按现实归档，仅解除同一请求造成、且未被用户操作或其他风险暂停覆盖的暂停。用户控制与清除恢复来源必须原子提交。成交结果仍未知时保留相应统计语义，不将估计金额写成真实成交。
+
+**如何验证：** [单账户有界恢复](modules/aster/tests/test_bounded_recovery.py)、[配对有界恢复](modules/aster/tests/test_pair_bounded_recovery.py)覆盖查询上限、观察窗口、重启、补偿、完整现实证据与事务竞态；[调度衔接](modules/aster/tests/test_recovery_engine.py)验证冷却后仍按当前档位交易及用户暂停优先；[历史划转出口](modules/aster/tests/test_pair_margin_bounded_recovery.py)覆盖流水一直不匹配、网络失败、预算等待、新余额失败与恢复，不发送第二次划转。相关恢复与成交账本测试按影响范围复用。
+
+**证据：** 本仓 `8bce5ca` 的 [普通执行](modules/aster/trading/execution.py)、[循环执行](modules/aster/trading/cycle_execution.py)、[迁移执行](modules/aster/trading/migration_execution.py)在未知单超过 120 秒后仍保留 pending；[配对执行](modules/aster/trading/pair_execution.py)在原单查询失败时到不了仓位采纳；[保证金平衡](modules/aster/trading/margin_balance.py)的旧 `accepted` 状态无历史查询出口。2026-10-15 用户明确要求清理同类永久核对，本次根据源码和离线回归修复；120 秒是转入现实核验的等待窗口，不是订单未成交的证明。
+
+**事件记录：** `bounded-unknown-execution-recovery-20261015`；本次跨执行器的同类根因修复，不按文件或路径重复计数。

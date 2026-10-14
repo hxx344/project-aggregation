@@ -11,7 +11,6 @@ from .exchange import RequestNotSent, LiveBroker, credentials_for
 from .margin_balance import MarginBalancer
 from .models import dec
 from .pair_planning import require_runtime_symbols
-from .pair_recovery import MAX_WATCH_BATCHES
 
 
 class UpdateEvidenceError(ValueError):
@@ -173,13 +172,15 @@ class WorkspaceControl:
                         raise UpdateEvidenceError("未完成配对批次格式或账户身份不一致")
                     if watch is not None:
                         batches = watch.get("batches") if isinstance(watch, dict) else None
-                        if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
+                        if not isinstance(batches, list) or not batches:
                             raise UpdateEvidenceError("历史订单观察记录格式无效")
+                        if watch.get("retired_identities", identities) != identities:
+                            raise UpdateEvidenceError("已退役历史观察记录与当前账户身份不一致")
                         for batch in batches:
                             if not isinstance(batch, dict) or batch.get("identities") != identities:
                                 raise UpdateEvidenceError("历史订单观察记录与当前账户身份不一致")
                             legs = batch.get("legs")
-                            if (not isinstance(legs, list) or len(legs) != 2
+                            if (not isinstance(legs, list) or len(legs) < 2
                                     or any(not isinstance(leg, dict) for leg in legs)
                                     or {leg.get("key") for leg in legs} != {"long", "short"}
                                     or any(not isinstance(leg.get("order"), dict)

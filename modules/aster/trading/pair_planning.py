@@ -72,6 +72,11 @@ def require_runtime_symbols(pair, state):
         batches = watch.get("batches")
         if not isinstance(batches, list):
             raise PairPositionError("归档订单观察记录无效，停止交易并等待核对")
+        if "retired_identities" in watch:
+            retired_symbols = watch.get("retired_symbols")
+            if (not isinstance(watch["retired_identities"], dict) or not isinstance(retired_symbols, list)
+                    or not retired_symbols or any(value not in SUPPORTED_SYMBOLS for value in retired_symbols)):
+                raise PairPositionError("已退役观察的账户或标的记录无效，停止交易并等待核对")
         for batch in batches:
             if not isinstance(batch, dict):
                 raise PairPositionError("归档批次记录无效，停止交易并等待核对")
@@ -277,13 +282,19 @@ def plan_paired_cycle(pair, snapshots, book, depth, rule, progress, *, capacity=
                       market_capacity=capacity, opening_gate=gate, symbols=SUPPORTED_SYMBOLS)
 
 
-def ordinary_upgrade(pair, snapshots, book, capacities):
+def ordinary_upgrade(pair, snapshots, book, capacities, *, runtime=None):
     symbol = pair["symbol"]
     held = positions(snapshots, symbol)
     book.require_fresh()
     old = held["LONG"].leverage
     for target in TIERS:
         if target <= old or target < pair["ordinary"]["min_open_leverage"]:
+            continue
+        cooldown = (runtime or {}).get("leverage_recovery_cooldown") or {}
+        if (cooldown.get("symbol") == symbol and cooldown.get("target") == target
+                and cooldown.get("identities") == (runtime or {}).get("identities")
+                and cooldown.get("ordinary") == pair["ordinary"]
+                and time.time() < cooldown.get("until", 0)):
             continue
         if ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target) is None:
             return target

@@ -358,7 +358,7 @@ class Store:
             row = db.execute("SELECT data FROM accounts WHERE id=?", (account_id,)).fetchone()
             return self.account_defaults(json.loads(row[0])) if row else None
 
-    def save_account(self, account):
+    def save_account(self, account, *, user_control=False):
         account = self.account_defaults(account)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -367,6 +367,8 @@ class Store:
             if account.get("enabled") and db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (account["id"],)).fetchone():
                 raise TradingError("配对组成员不能启用单账户策略")
             db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(account)))
+            if user_control:
+                db.execute("DELETE FROM kv WHERE key=?", ("recovery_auto_pause:" + account["id"],))
 
     def pairs(self):
         with self.connect() as db:
@@ -521,17 +523,21 @@ class Store:
                        (aid, pair["id"], direction))
         return saved_pair
 
-    def delete_pair(self, pair_id):
+    def delete_pair(self, pair_id, *, expected_pair=None, expected_runtime=None, expected_margin=None,
+                    accounts=None, check_current=None, watch_evidence=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
             if row is None:
                 raise TradingError("配对组不存在")
-            if json.loads(row[0]).get("enabled"):
+            pair = json.loads(row[0])
+            if pair.get("enabled"):
                 raise TradingError("请先暂停配对组")
             runtime_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_runtime:" + pair_id,)).fetchone()
             runtime = json.loads(runtime_row[0]) if runtime_row else {}
-            if runtime.get("recovery_watch") is not None:
+            if runtime.get("recovery_watch") is not None and (
+                    expected_pair is None or expected_runtime is None or expected_margin is None
+                    or accounts is None or check_current is None or watch_evidence is None):
                 raise TradingError("人工归档订单仍需跟踪，不能解除子账户绑定；请保留此配对组")
             if runtime.get("pending"):
                 raise TradingError("配对组仍有未完成批次")
@@ -540,12 +546,35 @@ class Store:
                 raise TradingError("配对组仍有记录持仓")
             margin_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_margin:" + pair_id,)).fetchone()
             margin = json.loads(margin_row[0]) if margin_row else {}
-            if margin.get("pending") or margin.get("status") in ("submitting", "accepted", "unknown"):
+            if margin.get("pending") or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown"):
                 raise TradingError("保证金划转结果尚未核实")
+            if expected_pair is not None:
+                if pair != expected_pair or runtime != expected_runtime or margin != expected_margin:
+                    raise TradingError("解除绑定期间配置、订单或划转记录已变化，请重新核对")
+                for account in accounts:
+                    row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
+                    binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
+                    side = "LONG" if account["id"] == pair["long_account_id"] else "SHORT"
+                    if not row or json.loads(row[0]) != account or not binding or tuple(binding) != (pair_id, side):
+                        raise TradingError("解除绑定期间子账户配置或归属已变化，请重新核对")
+                if watch_evidence is not None:
+                    prefix = "pair_watch_evidence:" + pair_id + ":"
+                    saved_evidence = {row[0]: json.loads(row[1]) for row in db.execute(
+                        "SELECT key,data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))}
+                    if saved_evidence != watch_evidence:
+                        raise TradingError("解除绑定期间历史观察证据已变化，请重新核对")
+                check_current()
+            deleted_at = time.time()
+            if runtime.get("recovery_watch") is not None:
+                archive = {"watch": runtime["recovery_watch"], "evidence": watch_evidence,
+                           "identities": runtime.get("identities"), "flat_verified_at": deleted_at}
+                db.execute("INSERT INTO kv VALUES (?,?)", ("pair_deleted_watch:" + pair_id, dumps(archive)))
+                runtime.pop("recovery_watch")
+                db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(runtime), "pair_runtime:" + pair_id))
             db.execute("DELETE FROM pair_members WHERE pair_id=?", (pair_id,))
             db.execute("DELETE FROM pairs WHERE id=?", (pair_id,))
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                       ("pair_deleted:" + pair_id, dumps({"deleted_at": time.time()})))
+                       ("pair_deleted:" + pair_id, dumps({"deleted_at": deleted_at})))
 
     def account_id_used(self, account_id):
         with self.connect() as db:
@@ -575,7 +604,118 @@ class Store:
 
     def pause_account(self, account, reason):
         account.update(enabled=False, pause_reason=reason)
-        self.save_account(account)
+        # A risk/user pause supersedes any older automatic recovery pause.
+        self.save_account(account, user_control=True)
+
+    def pause_intent(self, account, intent, reason):
+        """Only this intent's own automatic pause may later be resumed."""
+        aid = account["id"]
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+            current = self.account_defaults(json.loads(row[0])) if row else None
+            if current is None:
+                raise TradingError("批次暂停期间账户已不存在")
+            same_account = current == self.account_defaults(account)
+            saved = db.execute("SELECT status FROM intents WHERE id=? AND account_id=?", (intent["id"], aid)).fetchone()
+            if not saved or saved[0] in ("complete", "aborted"):
+                raise TradingError("批次已经结束，不能重新暂停账户")
+            key = "recovery_auto_pause:" + aid
+            row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+            marker = json.loads(row[0]) if row else None
+            paused = {**current, "enabled": False, "pause_reason": reason}
+            if same_account and (current.get("enabled") or (isinstance(marker, dict) and marker.get("intent_id") == intent["id"]
+                                          and marker.get("paused_account") == current)):
+                marker = {"intent_id": intent["id"], "paused_account": paused,
+                          "paused_at": (marker or {}).get("paused_at", time.time())}
+                db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(marker)))
+            else:
+                db.execute("DELETE FROM kv WHERE key=?", (key,))
+            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(paused), aid))
+            db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (intent["status"], dumps(intent), intent["id"]))
+            self._index_cycle_volume(db, intent)
+        account.clear()
+        account.update(paused)
+
+    def _resume_intent_pause(self, db, intent):
+        """Release only the exact automatic pause owned by this terminal intent."""
+        aid, key = intent["account_id"], "recovery_auto_pause:" + intent["account_id"]
+        row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+        marker = json.loads(row[0]) if row else None
+        if not isinstance(marker, dict) or marker.get("intent_id") != intent["id"]:
+            return False
+        row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+        current = self.account_defaults(json.loads(row[0])) if row else None
+        terminal = db.execute("SELECT status FROM intents WHERE id=? AND account_id=?", (intent["id"], aid)).fetchone()
+        resumed = bool(current and terminal and terminal[0] in ("complete", "aborted")
+            and marker.get("paused_account") == current and not current.get("enabled")
+            and not db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (aid,)).fetchone()
+            and not db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone())
+        if resumed:
+            current["enabled"] = True
+            current.pop("pause_reason", None)
+            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(current), aid))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                       (aid, "recovery", "旧批次已正常核对完成，解除该批次自动暂停并恢复原策略运行", time.time()))
+        db.execute("DELETE FROM kv WHERE key=?", (key,))
+        return resumed
+
+    def archive_recovered_intent(self, intent, account, *, expected_state, replacements,
+                                 check_current, resolution, cooldown=None):
+        """Atomically retire unknown execution without fabricating a receipt."""
+        aid, now = account["id"], time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+            if not row or self.account_defaults(json.loads(row[0])) != account:
+                raise TradingError("恢复核验期间账户配置已变化")
+            rows = db.execute("SELECT id,data FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchall()
+            if len(rows) != 1 or rows[0][0] != intent["id"] or json.loads(rows[0][1]) != intent:
+                raise TradingError("恢复核验期间批次记录已变化")
+            if db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (aid,)).fetchone():
+                raise TradingError("恢复核验期间账户已绑定配对组")
+            for key, expected in expected_state.items():
+                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                if (json.loads(row[0]) if row else None) != expected:
+                    raise TradingError("恢复核验期间持仓或暂停记录已变化")
+            # The callback uses captured broker evidence only, never Store reads.
+            check_current()
+            completed = {**intent, "status": "aborted", "completed_at": now,
+                         "resolution": {**resolution, "previous_status": intent["status"]}}
+            marker = expected_state.get("recovery_auto_pause:" + aid)
+            resumed = (isinstance(marker, dict) and marker.get("intent_id") == intent["id"]
+                       and marker.get("paused_account") == account)
+            updated_account = dict(account)
+            if resumed:
+                updated_account["enabled"] = True
+                updated_account.pop("pause_reason", None)
+                db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(updated_account), aid))
+            db.execute("DELETE FROM kv WHERE key=?", ("recovery_auto_pause:" + aid,))
+            db.execute("UPDATE intents SET status='aborted',data=? WHERE id=?", (dumps(completed), intent["id"]))
+            self._index_cycle_volume(db, completed)
+            quantities = resolution.get("known_quantities")
+            if (intent.get("kind") == "pair" and resolution.get("execution_result_unknown") is False
+                    and quantities and any(dec(quantities[key]) for key in ("long_qty", "short_qty"))):
+                key = "campaign:" + aid
+                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                campaign = json.loads(row[0]) if row else {"id": intent["id"], "batches": [], "started_at": now}
+                campaign["batches"].append({"symbol": intent["symbol"], "quantities": quantities, "leverage": intent["leverage"]})
+                campaign["last_fill_at"] = now
+                db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(campaign)))
+            for key, value in replacements.items():
+                if value is None:
+                    db.execute("DELETE FROM kv WHERE key=?", (key,))
+                else:
+                    db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
+            if cooldown is not None:
+                db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                           (f"recovery_leverage_cooldown:{aid}:{intent['symbol']}", dumps(cooldown)))
+            audit = {"intent": intent, "previous_state": expected_state, "resolution": completed["resolution"],
+                     "resumed": resumed, "next_state": replacements}
+            db.execute("INSERT INTO kv VALUES (?,?)", (f"intent_recovery:{aid}:{intent['id']}", dumps(audit)))
+            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                       (aid, "recovery", resolution["reason"] + ("；恢复原策略运行" if resumed else "；保留当前账户运行开关"), now))
+        return completed, updated_account
 
     def get(self, key, default=None):
         with self.connect() as db:
@@ -1147,6 +1287,7 @@ class Store:
             rows = db.execute("""SELECT i.data FROM cycle_volume_sync v JOIN intents i ON i.id=v.intent_id
                 WHERE v.account_id=? AND v.synced_at IS NULL AND v.status IN ('complete','aborted')
                 AND i.account_id=v.account_id AND i.status IN ('complete','aborted')
+                AND COALESCE(json_extract(i.data,'$.resolution.kind'),'')!='unknown_current_state'
                 AND (v.created_at>=? OR v.completed_at>=? OR v.completed_at IS NULL)
                 """ + (" AND json_extract(i.data,'$.symbol')=?" if symbol is not None else "")
                 + " ORDER BY COALESCE(v.completed_at,v.created_at,0) DESC,v.intent_id DESC LIMIT ?",
@@ -1231,12 +1372,13 @@ class Store:
         intent.update(status="complete", confirmed_leverage=actual)
         with self.connect() as db:
             row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
-            if row and row[0] == "complete":
+            if row and row[0] in ("complete", "aborted"):
                 return
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
             if intent.get("purpose") != "migration":
                 key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
                 db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
+            self._resume_intent_pause(db, intent)
 
     def complete_cycle(self, intent, progress):
         """Commit cycle ownership/timing and the terminal receipt together once."""
@@ -1259,6 +1401,7 @@ class Store:
             db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(progress), key))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
                        (intent["account_id"], "cycle", progress.get("reason", "多空循环批次已核对"), time.time()))
+            self._resume_intent_pause(db, intent)
 
     def confirm_cycle_recovery(self, account, previous, progress, review):
         """Archive the acknowledged state and reset tracking atomically, without trading."""
@@ -1315,12 +1458,13 @@ class Store:
                        ("post_fill_check:" + intent["account_id"], dumps({"kind": "migration", "symbol": intent["target_symbol"], "leverage": intent["target_leverage"]})))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
                        (intent["account_id"], "migration", progress["reason"], time.time()))
+            self._resume_intent_pause(db, intent)
 
     def complete_pair(self, intent, quantities):
         """Commit the acknowledgement and aggregate progress in one transaction."""
         with self.connect() as db:
             row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
-            if row and row[0] == "complete":
+            if row and row[0] in ("complete", "aborted"):
                 return
             intent["status"] = "complete"
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
@@ -1335,6 +1479,7 @@ class Store:
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(campaign)))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (
                 intent["account_id"], "fill", f"{intent['symbol']} {intent['leverage']}x 本批成交已核对，多头增加 {quantities['long_qty']}，空头增加 {quantities['short_qty']}" + capacity_timing_text(intent), time.time()))
+            self._resume_intent_pause(db, intent)
 
     def abort_pair(self, intent):
         """Even a fully repaired batch may have reduced equity through fees."""
@@ -1346,6 +1491,7 @@ class Store:
             db.execute("UPDATE intents SET status='aborted',data=? WHERE id=?", (dumps(completed), intent["id"]))
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                        ("post_fill_check:" + intent["account_id"], dumps({"symbol": intent["symbol"], "leverage": intent.get("leverage")})))
+            self._resume_intent_pause(db, completed)
         intent.update(completed)
 
     def finish_campaign(self, account, reason, ratio):

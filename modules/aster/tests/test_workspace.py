@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 import httpx
 
 from tests.helpers import account
+from tests.test_exchange_hardening import account_responses
 from trading.engine import Engine
 from trading.exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RateBudget, RequestNotSent
 from trading.execution import Executor
@@ -60,6 +61,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def archived_pair(self):
         self.requests, self.outcomes, self.inventories = [], {}, {}
+        self.reality_responses = {}
         self.before_response = lambda side, request: None
         self.credentials = {
             "ASTER_" + side.upper(): {"user": side + "-user", "signer": side + "-signer", "private_key": "test-key"}
@@ -96,6 +98,8 @@ class WorkspaceTests(unittest.TestCase):
                 raise AssertionError("update checks must not write to the exchange")
             if request.url.path == "/fapi/v3/openOrders":
                 return httpx.Response(200, json=self.inventories.get(side, []))
+            if request.url.path in self.reality_responses.get(side, {}):
+                return httpx.Response(200, json=self.reality_responses[side][request.url.path])
             if request.url.path != "/fapi/v3/order":
                 raise AssertionError("unexpected exchange read")
             outcome = self.outcomes.get(side)
@@ -509,6 +513,24 @@ class WorkspaceTests(unittest.TestCase):
                 for _, request in inventory:
                     self.assertNotIn("symbol", request.url.params)
 
+    def test_large_archived_index_and_repair_legs_do_not_block_safe_restart(self):
+        _, state = self.archived_pair()
+        batch = state["recovery_watch"]["batches"][0]
+        batch["legs"].append(deepcopy(batch["legs"][0]))
+        batch["legs"][-1]["order"]["newClientOrderId"] = "archived-repair"
+        state["recovery_watch"].update(batches=[{**deepcopy(batch), "id": str(index)} for index in range(9)],
+            retired_identities=deepcopy(state["identities"]), retired_symbols=["XAUUSD1"])
+        self.store.put("pair_runtime:gold", state)
+        result = self.engine.workspace.update_status()
+        self.assertFalse(result["busy"], result)
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.store.get("pair_runtime:gold"), state)
+        state["recovery_watch"]["retired_identities"]["long"]["user"] = "other-user"
+        self.store.put("pair_runtime:gold", state)
+        self.requests.clear()
+        self.assertTrue(self.engine.workspace.update_status()["busy"])
+        self.assertEqual(self.requests, [])
+
     def test_historical_outcomes_do_not_block_restart_or_trigger_recovery(self):
         self.archived_pair()
         cases = {
@@ -678,15 +700,28 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(restarted.workspace.update_status()["busy"])
         restarted.workspace.set_maintenance(False)
         pair = reopened.save_pair({**pair, "enabled": True})
+        for side in ("long", "short"):
+            responses = account_responses()
+            for path in ("/fapi/v3/accountWithJoinMargin", "/fapi/v3/positionRisk"):
+                rows = responses[path]["positions"] if path.endswith("accountWithJoinMargin") else responses[path]
+                for row in rows:
+                    row.update(positionAmt="0.2" if side == "long" and row["positionSide"] == "LONG" else "0",
+                               entryPrice="4412.015", leverage="5")
+                    if path.endswith("positionRisk"):
+                        row["markPrice"] = "4412.015"
+            responses["/fapi/v3/accountWithJoinMargin"]["assets"][0].update(
+                crossWalletBalance="10000", availableBalance="9000")
+            self.reality_responses[side] = responses
         self.requests.clear()
         with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "1"}):
-            with self.assertRaisesRegex(TradingError, "成交或活动回执"):
+            with self.assertRaisesRegex(TradingError, "实际仓位仍不平衡"):
                 PairTrader(restarted)._config_guard(pair, original["identities"], opening=True)
             # This is also the guard immediately before a margin transfer is journaled.
-            with self.assertRaisesRegex(TradingError, "成交或活动回执"):
+            with self.assertRaisesRegex(TradingError, "实际仓位仍不平衡"):
                 require_archived_orders_clear(restarted, pair)
         self.assertEqual(reopened.get("pair_runtime:gold"), original)
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(sum(request.url.path == "/fapi/v3/order" for _, request in self.requests), 4)
+        self.assertEqual(sum(request.url.path == "/fapi/v3/openOrders" for _, request in self.requests), 4)
         self.assertTrue(all(request.method == "GET" for _, request in self.requests))
 
     def test_pair_and_margin_scheduling_do_not_mutate_enabled_configuration(self):

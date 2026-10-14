@@ -451,6 +451,13 @@ class PairOrderRecoveryTests(unittest.TestCase):
         pair = self.f.store.pair("gold")
         pair = self.f.store.save_pair({**pair, "enabled": True})
         trader = PairTrader(self.engine)
+        with patch.object(self.broker(), "query", return_value=receipt_for(original["pending"]["legs"][0])):
+            trader._config_guard(pair, original["identities"], opening=True)
+        # A late receipt blocks on its real single-sided exposure. Historical
+        # filled receipts alone are no longer a permanent veto.
+        broker = self.broker()
+        broker.state["positions"][SYMBOL + ":LONG"]["qty"] = "3.239"
+        broker.save()
         for outcome in (receipt_for(original["pending"]["legs"][0], status="FILLED", qty="0.2"),
                         receipt_for(original["pending"]["legs"][0], status="NEW"),
                         ExchangeError("query unavailable")):
@@ -458,8 +465,6 @@ class PairOrderRecoveryTests(unittest.TestCase):
             with self.subTest(outcome=str(outcome)), patch.object(self.broker(), "query", **options):
                 with self.no_writes(), self.assertRaises(TradingError):
                     trader._config_guard(pair, original["identities"], opening=True)
-        with patch.object(self.broker(), "query", return_value=receipt_for(original["pending"]["legs"][0])):
-            trader._config_guard(pair, original["identities"], opening=True)
 
     def test_invalid_watch_legs_fail_closed_with_domain_error(self):
         from trading.pair_recovery import require_archived_orders_clear

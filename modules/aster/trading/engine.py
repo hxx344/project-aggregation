@@ -39,6 +39,7 @@ from .listings import ListingMonitor, POLL_SECONDS as LISTING_POLL_SECONDS, STAL
 from .migration import DEFAULT_MIGRATION, migration_symbols, plan_migration, validate_migration
 from .migration_execution import MigrationExecutor
 from .models import AccountModeError, Book, MARKET_SYMBOLS, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, migration_margin_limit, minimum_open_leverage, next_leverage, opening_margin_limit, ordinary_leverage_wait, plan_pair, positive, wire
+from .recovery import leverage_cooldown_active, migration_planning_progress
 from .paper import DemoMarket, PaperBroker
 from .report_cache import ReportCache
 from .scheduling import AccountWork, OrdinaryRead, PollBackoff
@@ -609,6 +610,10 @@ class Engine:
             self.store.put(key, None)
             return
         if intent["status"] != "aborted":
+            return
+        if (intent.get("resolution") or {}).get("kind") in {"unknown_current_state", "current_state_adopted"}:
+            # Current balanced holdings ended recovery; missing historical
+            # fills do not prove an empty/rejected batch or warrant backoff.
             return
         previous = self.store.get(key) or {}
         count = min(5, previous.get("failures", 0) + 1)
@@ -1208,7 +1213,11 @@ class Engine:
                 book = self.market.book(target)
                 plan = plan_migration(account, snapshot, source_book, book, depths[source], depths[target],
                                       self.market.rules[source], self.market.rules[target],
-                                      {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], progress)
+                                      {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], migration_planning_progress(progress))
+                if (snapshot.pair(target)[0].leverage < plan.target_leverage
+                        and leverage_cooldown_active(self.store, account, broker, target, plan.target_leverage)):
+                    reasons.append(f"{target} 旧杠杆请求已结束，目标 {plan.target_leverage}x 冷却后重新评估")
+                    continue
                 candidates.append((plan, book))
             except TradingError as exc:
                 reasons.append(f"{target}：{exc}")
@@ -1258,7 +1267,7 @@ class Engine:
             current = plan_migration(account, fresh, current_source_book, current_target_book,
                                      current_source_depth, current_target_depth,
                                      self.market.rules[source], self.market.rules[target],
-                                     {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], progress)
+                                     {str(k): v for k, v in self.capacities(target).items()}, progress["source_leverage"], migration_planning_progress(progress))
             if (current.target_qty != plan.target_qty or current.source_quantities != plan.source_quantities
                     or current.target_leverage != plan.target_leverage or current.source_leverage != plan.source_leverage):
                 raise TradingError("迁移计划因账户或额度变化需要重新计算")
@@ -1757,10 +1766,13 @@ class Engine:
                         first_add = long.leverage >= minimum and self.store.get(f"open_after_leverage:{account_id}:{symbol}") == long.leverage and current_available
                         if first_add and priority and long.leverage not in PRIORITY_TIERS:
                             high_target = self.select_leverage(snapshot, symbol, capacities, book, policy, True)
-                            if high_target in PRIORITY_TIERS:
+                            if (high_target in PRIORITY_TIERS
+                                    and not leverage_cooldown_active(self.store, account, broker, symbol, high_target)):
                                 first_add = False
                         if not first_add:
                             target = self.select_leverage(snapshot, symbol, capacities, book, policy, priority)
+                            if target is not None and leverage_cooldown_active(self.store, account, broker, symbol, target):
+                                target = None
                         if target is not None:
                             candidates.append(MarketCandidate(symbol, long.leverage, book, target))
                             continue
@@ -1805,6 +1817,8 @@ class Engine:
                         book.require_fresh()
                         capacities = self.capacities(symbol)
                         if target is not None:
+                            if leverage_cooldown_active(self.store, account, broker, symbol, target):
+                                continue
                             if self.select_leverage(snapshot, symbol, capacities, book, policy, priority) != target:
                                 last_reason = "可用杠杆档位已变化，等待下一轮比较"
                                 self.strategy(account_id, symbol, last_reason)
@@ -2007,7 +2021,7 @@ class Engine:
                               and changes["migration"]["enabled"] is False)
             if stop_migration:
                 account.update(enabled=False, migration={**account.get("migration", DEFAULT_MIGRATION), "enabled": False})
-                self.store.save_account(account)
+                self.store.save_account(account, user_control=True)
                 self.revoke_cycle_hot_data(account_id, "账户已暂停")
                 with self.lock:
                     self.work(account_id).wake = True
@@ -2044,7 +2058,7 @@ class Engine:
             validate_account(account)
             if "min_open_leverage" in changes:
                 account.pop("leverage_setting_required", None)
-            self.store.save_account(account)
+            self.store.save_account(account, user_control=True)
             self.revoke_cycle_hot_data(account_id, "账户配置已更新")
             with self.lock:
                 self.work(account_id).capacity_available.clear()
@@ -2110,7 +2124,7 @@ class Engine:
             account["enabled"] = enabled
             if enabled:
                 account.pop("pause_reason", None)
-            self.store.save_account(account)
+            self.store.save_account(account, user_control=True)
             self.revoke_cycle_hot_data(account_id, "账户运行状态已更新")
             with self.lock:
                 self.work(account_id).capacity_available.clear()

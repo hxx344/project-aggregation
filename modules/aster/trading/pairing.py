@@ -492,11 +492,36 @@ class PairManager:
         with self.locked(pair), self.engine.registration_lock:
             pair = self.store.pair(pair_id)
             runtime = self._idle(pair, require_flat=True)
+            margin = self.store.get("pair_margin:" + pair_id, {})
+            accounts = self._members(pair)
+            from .pair_execution import PairTrader
+            _, brokers, identities = PairTrader(self.engine)._members(pair, read_only=True)
+            if runtime.get("identities") and runtime["identities"] != identities:
+                raise TradingError("配对组账户身份已变化，不能解除绑定")
+            evidence = None
             if runtime.get("recovery_watch") is not None:
-                raise TradingError("人工归档订单仍需跟踪，不能解除子账户绑定；请保留此配对组")
-            _, guards = self._read_members(pair, flat=True)
+                from .pair_recovery import require_archived_orders_clear
+                evidence = require_archived_orders_clear(self.engine, pair, state=runtime,
+                    brokers=brokers, read_only=True, retire_for_deletion=True)
+            _, guards = self._read_members(pair, flat=True, runtime=runtime)
+
+            def check_current():
+                for key, account in zip(("long", "short"), accounts):
+                    with self.engine.lock:
+                        broker = self.engine.brokers.get(account["id"])
+                    if broker is not brokers[key]:
+                        raise TradingError("解除绑定核验期间账户连接已变化，请重新核对")
+                    if isinstance(broker, LiveBroker) and any(
+                            broker.api.credentials[field].lower() != identities[key][field]
+                            for field in ("user", "signer")):
+                        raise TradingError("解除绑定核验期间账户身份已变化，请重新核对")
+                for _, current in guards.values():
+                    current()
+
             with self._current_members(guards):
-                self.store.delete_pair(pair_id)
+                self.store.delete_pair(pair_id, expected_pair=pair, expected_runtime=runtime,
+                    expected_margin=margin, accounts=accounts, check_current=check_current,
+                    watch_evidence=evidence)
             self.store.event(pair_id, "pair", "配对组已空仓解除绑定，历史执行记录保留")
             self._changed(pair)
 

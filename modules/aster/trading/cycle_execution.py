@@ -17,6 +17,7 @@ from .execution import Executor, TERMINAL
 from .models import AccountModeError, TradingError, cycle_margin_limit, dec, floor_step, positive, wire
 from .paper import PaperBroker, PaperOrderAbsent
 from .request_timing import observe_database, transport_stage
+from . import recovery
 
 
 SIDES = ("LONG", "SHORT")
@@ -154,6 +155,10 @@ class CycleExecutor(Executor):
         """Idempotently account known fills; missing details never block reductions."""
         if intent.get("kind") != "cycle":
             return True
+        if (intent.get("resolution") or {}).get("kind") == "unknown_current_state":
+            # Retired originals are no longer a background query source. Any
+            # already recorded fills remain; missing amounts stay unknown.
+            return False
         if intent.get("account_id") != account["id"]:
             intent["volume_error"] = "循环成交补账的账户不一致"
             return False
@@ -440,12 +445,18 @@ class CycleExecutor(Executor):
         if intent.get("status") in ("complete", "aborted"):
             self._sync_local_volume(account, intent)
             return "独立循环批次已结束"
+        self._observe_recovery(account, intent)
+        waiting = self._current_recovery_wait(account, intent)
+        if waiting:
+            return waiting
         if intent["kind"] == "cycle_leverage":
             return self._reconcile_leverage(account, intent)
         if intent["kind"] != "cycle":
             raise TradingError("独立循环不能处理其他策略批次")
         if isinstance(self.broker, PaperBroker):
             self.broker.reload()
+        if recovery.due(intent, self._unresolved_ids(intent)):
+            return self._recover_current(account, intent)
         orders = intent["orders"] + intent["repairs"]
         unresolved = []
         for order in orders:
@@ -457,8 +468,11 @@ class CycleExecutor(Executor):
                 except TradingError as exc:
                     return self.attention(account, intent, str(exc))
                 continue
+            if not recovery.can_query(intent, cid):
+                unresolved.append(cid)
+                continue
             try:
-                row = self.broker.query(intent["symbol"], cid)
+                row = recovery.query(self.broker, intent, order)
                 self.validate_receipt(order, row)
                 intent["receipts"][cid] = row
                 if row["status"] not in TERMINAL:
@@ -485,6 +499,8 @@ class CycleExecutor(Executor):
                 absent_repair = True
         self.store.save_intent(intent)
         if unresolved:
+            if recovery.due(intent, unresolved):
+                return self._recover_current(account, intent)
             self._sync_local_volume(account, intent)
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "独立循环订单结果仍不确定，已暂停；请核对未完成批次")
@@ -504,8 +520,6 @@ class CycleExecutor(Executor):
         except AccountModeError as exc:
             return self.attention(account, intent, str(exc))
         long, short = snapshot.pair(intent["symbol"])
-        if long.leverage != intent["leverage"]:
-            return self.attention(account, intent, "独立循环实际杠杆被改变，已暂停并等待核对")
         original = {side: Fraction(0) for side in SIDES}
         repaired = {side: Fraction(0) for side in SIDES}
         for order in intent["orders"]:
@@ -527,6 +541,8 @@ class CycleExecutor(Executor):
         if any(expected[side] < floor[side] for side in SIDES):
             # An impossible receipt-derived balance is not exchange read lag.
             return self.attention(account, intent, "独立循环回执推算持仓低于原始持仓，已暂停并等待核对")
+        if long.leverage != intent["leverage"]:
+            return self._recover_known_state(account, intent, "独立循环实际杠杆已变化，暂停并有限次核对当前仓位")
         if any(actual[side] != expected[side] for side in SIDES):
             if isinstance(self.broker, LiveBroker):
                 checked_at = time.time()
@@ -537,11 +553,13 @@ class CycleExecutor(Executor):
                     "actual": {side: wire(actual[side]) for side in SIDES},
                 }
                 if sync["checks"] < POSITION_SYNC_CHECKS:
+                    intent["bounded_recovery"]["current_state"] = True
+                    recovery.checked(intent, "current_state")
                     self.store.save_intent(intent)
                     return self._position_sync_reason(sync)
             details = "；".join(f"{label}预期 {wire(expected[side])}、实际 {wire(actual[side])}"
                                for side, label in (("LONG", "多头"), ("SHORT", "空头")))
-            return self.attention(account, intent,
+            return self._recover_known_state(account, intent,
                 "独立循环持仓变化与回执不一致，禁止处理外部仓位；已暂停并等待核对（" + intent["symbol"] + "；" + details + "）")
         # A later repair has its own expected balance and synchronization window.
         if intent.pop("position_sync", None) is not None:
@@ -597,7 +615,7 @@ class CycleExecutor(Executor):
         if absent_repair:
             return "模拟循环减仓未写入账本，稍后重新核对并重试"
         if intent["repair_attempts"] >= 3:
-            return self.attention(account, intent, "独立循环减仓补偿尚未完成，已暂停；请核对剩余持仓")
+            return self._recover_known_state(account, intent, "独立循环减仓补偿已达上限，暂停并有限次核对当前仓位")
         book = self.market.book(intent["symbol"])
         book.require_fresh()
         snapshot.require_fresh()
@@ -631,19 +649,26 @@ class CycleExecutor(Executor):
                 f"约 {POSITION_SYNC_INTERVAL} 秒后重查）")
 
     def _reconcile_leverage(self, account, intent):
-        snapshot = self.broker.cycle_snapshot([intent["symbol"]], fresh_modes=True)
+        if recovery.due(intent, ["leverage"]):
+            return self._recover_current(account, intent)
+        if not recovery.can_query(intent, "leverage"):
+            return "旧循环杠杆请求已完成有限次核对，等待安全观察窗口后读取当前账户"
+        snapshot = self._read_recovery_snapshot(intent,
+            lambda: self.broker.cycle_snapshot([intent["symbol"]], fresh_modes=True))
         try:
             long, short = self._ready(snapshot, intent["symbol"])
         except TradingError as exc:
             return self.attention(account, intent, str(exc))
         if long.qty or short.qty:
             return self.attention(account, intent, "独立循环杠杆核对期间发现外部仓位，已暂停")
-        if long.leverage == intent["target"]:
+        if long.leverage >= intent["target"]:
             return self._finish(intent, intent["progress"], snapshot, f"独立循环实际杠杆已核实为 {long.leverage}x")
         if isinstance(self.broker, PaperBroker) and long.leverage == intent["previous"]:
             intent["status"] = "aborted"
             return self._finish(intent, intent["progress"], snapshot, "模拟循环杠杆调整未写入账本，等待重新检查")
         if time.time() - intent["created_at"] > 120:
+            if recovery.due(intent, ["leverage"]):
+                return self._recover_current(account, intent)
             return self.attention(account, intent, f"独立循环杠杆调整结果仍不确定：目标 {intent['target']}x，实际 {long.leverage}x；已暂停且不重复提交")
         return f"等待账户确认独立循环 {intent['symbol']} 目标 {intent['target']}x，实际 {long.leverage}x"
 

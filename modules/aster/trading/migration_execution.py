@@ -8,6 +8,7 @@ from .exchange import ExchangeError, RequestNotSent
 from .execution import Executor, TERMINAL
 from .models import MIN_BATCH_NOTIONAL, SYMBOLS, TradingError, dec, floor_step, hedge_balanced, positive, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
+from . import recovery
 
 
 SIDES = ("LONG", "SHORT")
@@ -70,6 +71,7 @@ class MigrationExecutor(Executor):
         orders = [self.order(target, s, "BUY" if s == "LONG" else "SELL", qty,
                              "M" + s[0] + token[:26]) for s in SIDES]
         progress = self.store.get("migration:" + account["id"], {}) or {}
+        planning_progress = recovery.migration_planning_progress(progress)
         intent = {"id": token, "kind": "migration", "version": 1, "account_id": account["id"],
                   "symbol": target, "source_symbol": source, "target_symbol": target,
                   "run_id": run_id or progress.get("run_id") or token,
@@ -79,8 +81,8 @@ class MigrationExecutor(Executor):
                   "target_leverage": plan.target_leverage, "source_close_budget": source_budget,
                   "target_open_budget": wire(qty), "notional_tolerance": wire(tolerance),
                   "policy_snapshot": deepcopy(account.get("migration", {})),
-                  "progress_source": deepcopy(progress.get("migrated_notional", dict.fromkeys(SIDES, "0"))),
-                  "progress_delta": deepcopy(progress.get("cumulative_notional_delta", dict.fromkeys(SIDES, "0"))),
+                  "progress_source": deepcopy(planning_progress.get("migrated_notional", dict.fromkeys(SIDES, "0"))),
+                  "progress_delta": deepcopy(planning_progress.get("cumulative_notional_delta", dict.fromkeys(SIDES, "0"))),
                   "orders": deepcopy(orders), "order_roles": {o["newClientOrderId"]: "open_target" for o in orders},
                   "order_times": {o["newClientOrderId"]: time.time() for o in orders},
                   "receipts": {}, "repairs": [], "repair_attempts": 0, "attempts": {}, "reduction_batches": []}
@@ -100,6 +102,8 @@ class MigrationExecutor(Executor):
         return qty
 
     def _resolve(self, account, intent):
+        if recovery.due(intent, self._unresolved_ids(intent)):
+            return self._recover_current(account, intent)
         unresolved = []
         for order in intent["orders"]:
             cid = order["newClientOrderId"]
@@ -107,8 +111,11 @@ class MigrationExecutor(Executor):
             if row and row.get("status") in TERMINAL:
                 self.validate_receipt(order, row)
                 continue
+            if not recovery.can_query(intent, cid):
+                unresolved.append(cid)
+                continue
             try:
-                row = self.broker.query(order["symbol"], cid)
+                row = recovery.query(self.broker, intent, order)
                 self.validate_receipt(order, row)
                 intent["receipts"][cid] = row
                 if row["status"] not in TERMINAL:
@@ -132,6 +139,8 @@ class MigrationExecutor(Executor):
                 batch["counted"] = False
         self.store.save_intent(intent)
         if unresolved:
+            if recovery.due(intent, unresolved):
+                return self._recover_current(account, intent)
             if any(time.time() - intent["order_times"][cid] > 120 for cid in unresolved):
                 return self.attention(account, intent, "迁移订单结果仍不确定，暂停等待核对；不会重复提交")
             return "正在核对迁移订单回执，不重复提交"
@@ -184,9 +193,9 @@ class MigrationExecutor(Executor):
             for side, position in zip(SIDES, pair):
                 delta = ledger["target_qty"][side] if symbol == target else -ledger["source_qty"][side]
                 if Fraction(position.qty) != Fraction(dec(intent["baseline"][symbol][side])) + delta:
-                    raise TradingError("迁移持仓变化与回执不一致，可能有外部成交或 ADL")
+                    raise recovery.CurrentStateMismatch("迁移持仓变化与回执不一致，可能有外部成交或 ADL")
                 if position.leverage != intent["leverages"][symbol]:
-                    raise TradingError("迁移期间实际杠杆发生变化，暂停核对")
+                    raise recovery.CurrentStateMismatch("迁移期间实际杠杆发生变化，暂停核对")
         return snapshot
 
     def _advance(self, intent, phase):
@@ -197,7 +206,7 @@ class MigrationExecutor(Executor):
         symbol = intent["source_symbol"] if role in ("close_source", "balance_source") else intent["target_symbol"]
         count = intent["attempts"].get(role, 0)
         if count >= MAX_REDUCTION_ATTEMPTS:
-            return self.attention(account, intent, "迁移减仓修复达到重试上限，暂停等待核对")
+            return self._recover_known_state(account, intent, "迁移减仓修复达到重试上限，暂停并有限次核对当前仓位")
         book = self.market.book(symbol)
         book.require_fresh()
         snapshot.require_fresh()
@@ -317,8 +326,14 @@ class MigrationExecutor(Executor):
         intent = intent or self.store.intent(account["id"])
         if not intent:
             return "没有未完成迁移批次"
+        if intent.get("status") in ("complete", "aborted"):
+            return "迁移批次已结束"
         if intent.get("kind") != "migration" or intent.get("version") != 1:
             return self.attention(account, intent, "迁移批次类型或版本无效")
+        self._observe_recovery(account, intent)
+        waiting = self._current_recovery_wait(account, intent)
+        if waiting:
+            return waiting
         try:
             # A normal full fill takes four iterations. Partial reductions have
             # independent bounded counters and resume in a later engine tick.
@@ -394,5 +409,7 @@ class MigrationExecutor(Executor):
             return "迁移正在分步核对，等待下一轮继续减仓收尾"
         except RequestNotSent:
             raise
+        except recovery.CurrentStateMismatch as exc:
+            return self._recover_known_state(account, intent, str(exc))
         except TradingError as exc:
             return self.attention(account, intent, str(exc))

@@ -152,6 +152,11 @@ class PairSymbolWatchTests(WatchFixture):
             receipt_for(leg, client_id="unrelated-order"),
         )
         for outcome in outcomes:
+            self.move_positions(SILVER, TARGET)
+            if isinstance(outcome, dict) and outcome.get("status") == "FILLED":
+                broker = self.broker()
+                broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
+                broker.save()
             options = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
             with self.subTest(outcome=str(outcome)), patch.object(self.broker(), "query", **options):
                 with self.assertRaises(TradingError):
@@ -196,12 +201,18 @@ class PairSymbolWatchTests(WatchFixture):
         self.switch()
         before = self.state()
         row = receipt_for(self.submitted["pending"]["legs"][0], status="FILLED", qty="0.2")
+        broker = self.broker()
+        broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
+        broker.save()
         with patch.object(self.broker(), "query", return_value=row), self.assertRaises(TradingError):
             self.engine.pairs.enable("gold", True)
         self.assertEqual(self.state(), before)
         self.assertFalse(self.f.store.pair("gold")["enabled"])
+        self.move_positions(SILVER, TARGET)
         pair = self.engine.pairs.enable("gold", True)
         trader = PairTrader(self.engine)
+        broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
+        broker.save()
         with patch.object(self.broker(), "query", return_value=row) as query:
             with self.assertRaises(TradingError):
                 require_archived_orders_clear(self.engine, pair)

@@ -86,7 +86,7 @@ class PairTrader:
             capacities = self.engine.capacities(symbol)
             book = self.market.book(symbol)
             book.require_fresh()
-            if ordinary_upgrade(pair, snapshots, book, capacities) is not None:
+            if ordinary_upgrade(pair, snapshots, book, capacities, runtime=state) is not None:
                 return None
             plan_ordinary(pair, snapshots, book, self.market.rules[symbol], capacities)
         except PairPositionError:
@@ -266,6 +266,8 @@ class PairTrader:
             holding = any(dec(qty) for qty in state["progress"]["quantities"].values())
             closing_due = holding and (not pair["enabled"] or time.time() >=
                 state["progress"]["opened_at"] + state["progress"]["config"]["hold_seconds"])
+            if state.get("volume_unknown") and not state.get("volume_unknown_until_utc"):
+                state["volume_unknown_until_utc"] = datetime.now(timezone.utc).date().isoformat()
             if state.get("volume_unknown_until_utc"):
                 state["volume_unknown"] = datetime.now(timezone.utc).date().isoformat() <= state["volume_unknown_until_utc"]
             margin_state = self.store.get("pair_margin:" + pair["id"], {})
@@ -369,7 +371,20 @@ class PairTrader:
                     state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
                     margin_delay = max(0, margin.get("retry_after", 0))
                     return state
-            held = require_quantities(snapshots, symbol, self._expected(state))
+            try:
+                held = require_quantities(snapshots, symbol, self._expected(state))
+            except PairPositionError:
+                if state.get("recovery_watch") is not None:
+                    # A late fill can precede the normal opening guard. Let the
+                    # archive's full fresh check adopt a balanced new baseline;
+                    # its CAS conflict makes this tick discard old snapshots.
+                    from .pair_recovery import require_archived_orders_clear
+                    require_archived_orders_clear(self.engine, pair)
+                raise
+            if state.get("attention") and state.get("recovery_watch") is not None:
+                from .pair_recovery import require_archived_orders_clear
+                require_archived_orders_clear(self.engine, pair)
+                state.pop("attention", None)
             if not pair["enabled"] and not holding:
                 state.update(phase="paused", reason=pair.get("pause_reason") or "配对组已暂停，不开始新开仓或新划转；已有普通策略底仓保留，需点击启动后重新检查执行条件")
                 return state
@@ -394,7 +409,7 @@ class PairTrader:
                 self._start(pair, state, brokers, snapshots, guards, plan, kind="cycle", quality_depth=depth)
             elif pair["ordinary"]["enabled"]:
                 capacities = self.engine.capacities(symbol)
-                target = ordinary_upgrade(pair, risk_snapshots, book, capacities)
+                target = ordinary_upgrade(pair, risk_snapshots, book, capacities, runtime=state)
                 if target is not None:
                     self._leverage(pair, state, brokers, snapshots, guards, target)
                 else:
@@ -577,6 +592,10 @@ class PairTrader:
             # Persist before HTTP: only older records may use the narrow legacy
             # rejection recovery below, never a new ambiguous submission.
             leg["submit_evidence_version"] = 2
+        # Persist a new safety window before every possible HTTP write, including
+        # repairs. A batch's old creation time cannot age a new repair request.
+        state["pending"]["last_possible_send_at"] = time.time()
+        state["pending"].pop("bounded_recovery", None)
         self._save(pair, state)
         def send(leg):
             order, broker = leg["order"], brokers[leg["key"]]
@@ -665,12 +684,25 @@ class PairTrader:
                     continue
             if leg.get("dispatch") == "prepared":
                 leg["receipt"] = self._absent(order, "重启确认该订单尚未进入发送阶段")
+                self._save(pair, state)
+                continue
+            from .pair_recovery import MIN_QUERY_ATTEMPTS
+            if leg.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS:
                 continue
             try:
                 broker = brokers[leg["key"]]
                 row = broker.order_event_receipt(order) if isinstance(broker, LiveBroker) else None
                 if not isinstance(row, dict):
-                    row = broker.query(symbol, order["newClientOrderId"])
+                    from .pair_recovery import record_query_attempt
+                    try:
+                        row = broker.query(symbol, order["newClientOrderId"])
+                    except RequestNotSent:
+                        raise
+                    except Exception as exc:
+                        record_query_attempt(leg, exc)
+                        raise
+                    else:
+                        record_query_attempt(leg)
                 Executor.validate_receipt(order, row)
                 if receipt and dec(row["executedQty"]) < dec(receipt["executedQty"]):
                     raise PairPositionError("订单查询累计成交数量倒退")
@@ -696,10 +728,21 @@ class PairTrader:
         pending = state["pending"]
         if pending["kind"] == "leverage":
             return self._recover_leverage(pair, state, brokers)
+        from .pair_recovery import recovery_ready
+        # Once bounded original-ID queries are exhausted, read current reality
+        # directly. Failed reality checks retain this stage across restarts.
+        if recovery_ready(pending):
+            return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
+        from .pair_recovery import MIN_QUERY_ATTEMPTS, record_query_attempt
+        if pending.get("terminal_position_recovery") and pending.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS:
+            state.update(phase="reconciling", reason="原终态回执与仓位已核对三次，等待最后请求满 120 秒后按完整账户现实核验恢复")
+            return
         if not self._query(pair, state, brokers):
-            state.update(phase="reconciling", reason="至少一条市价单结果未确定，系统按原订单编号继续查询；禁止重发、新开仓及划转")
-            # Observation is for visibility only. Even balanced positions never
-            # replace a terminal receipt, especially with external manual trades.
+            if recovery_ready(pending):
+                return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
+            state.update(phase="reconciling", reason="至少一条市价单结果未确定；原编号最多核对三次，等待最后请求满 120 秒后按实际仓位恢复，期间禁止重发、新开仓及划转")
+            # Before the bounded handoff, these ordinary observations only
+            # refresh the display; only the full-account check can adopt reality.
             now = time.time()
             if not state.get("retry_after") and not 0 <= now - pending.get("observation_attempt_at", 0) < 3:
                 pending["observation_attempt_at"] = now
@@ -716,15 +759,32 @@ class PairTrader:
             return
         member_read = None
         margin_pending = (self.store.get("pair_margin:" + pair["id"], {}) or {}).get("pending") is not None
-        if (not margin_pending and pending["kind"] == "ordinary" and pending["phase"] == "open"
-                and pending.get("position_review")):
-            member_read = self.engine.pairs._read_members(pair, adopt=True, reconciliation=True)
-            snapshots, member_guards = member_read
-            guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
-        else:
-            snapshots, guards = self._read(brokers, symbol, reconciliation=True)
+        try:
+            if (not margin_pending and pending["kind"] == "ordinary" and pending["phase"] == "open"
+                    and pending.get("position_review")):
+                member_read = self.engine.pairs._read_members(pair, adopt=True, reconciliation=True)
+                snapshots, member_guards = member_read
+                guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
+            else:
+                snapshots, guards = self._read(brokers, symbol, reconciliation=True,
+                    fresh_modes=bool(pending.get("terminal_position_recovery")))
+        except TradingError as exc:
+            if pending.get("terminal_position_recovery"):
+                record_query_attempt(pending, exc)
+            raise
+        if pending.get("terminal_position_recovery"):
+            record_query_attempt(pending)
+            if recovery_ready(pending):
+                self._save(pair, state)
+                return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
+            state.update(phase="reconciling", reason="终态回执与仓位恢复进入有限核对；等待三次实际读取及 120 秒窗口后按完整账户现实核验，不再追加修复委托")
+            return
         self._publish_snapshots(state, snapshots, symbol)
-        held = positions(snapshots, symbol)
+        try:
+            held = positions(snapshots, symbol)
+        except PairPositionError:
+            self._begin_terminal_position_recovery(pending)
+            raise
         actual = {side: held[side].qty for _, side in SIDES}
         expected = {side: dec(pending["before"][side]) for _, side in SIDES}
         for leg in pending["legs"] + pending["repairs"]:
@@ -743,6 +803,7 @@ class PairTrader:
                     self, pair, state, source=recovery_source or "automatic_positions", member_read=member_read)):
             return
         if actual != expected or any(pos.leverage != pending["leverage"] for pos in held.values()):
+            self._begin_terminal_position_recovery(pending)
             detail = "；".join(
                 f"{'A 多侧' if key == 'long' else 'B 空侧'}实际 {wire(actual[side])} / {held[side].leverage}x，"
                 f"按回执应为 {wire(expected[side])} / {pending['leverage']}x，本批前底仓 {pending['before'][side]}"
@@ -760,6 +821,7 @@ class PairTrader:
                 pending["last_error"] = "成交后子账户保证金超限，撤回本批新增量"
         desired = pending["target"] if pending["phase"] == "close" or original_full and not pending["repairs"] else pending["before"]
         if any(actual[side] < dec(desired[side]) for _, side in SIDES):
+            self._begin_terminal_position_recovery(pending)
             raise PairPositionError("实际仓位低于恢复目标，禁止通过反向加仓修复；请人工核对两侧实际仓位与本批成交")
         if all(actual[side] == dec(desired[side]) for _, side in SIDES):
             with self._confirmed(pair, brokers, guards):
@@ -767,6 +829,7 @@ class PairTrader:
                              or pending["phase"] == "close")
             return
         if pending["repair_attempts"] >= 3:
+            self._begin_terminal_position_recovery(pending)
             raise PairPositionError("减仓恢复已尝试三次，仍有本批残余仓位；系统停止继续自动减仓，请人工核对两侧持仓与成交")
         if read_only:
             state.update(phase="repairing", reason="原订单与持仓已核对，本批仍需减仓回到恢复目标；本次手动核对未发单，后台继续原减仓恢复流程")
@@ -781,6 +844,7 @@ class PairTrader:
             if not qty:
                 continue
             if qty % rule.step or qty < rule.min_qty or qty > rule.max_qty:
+                self._begin_terminal_position_recovery(pending)
                 raise PairPositionError("本批残余数量不符合市价减仓步长或限额，等待人工核对")
             order = Executor.order(symbol, side, "SELL" if side == "LONG" else "BUY", qty, "R" + uuid.uuid4().hex[:28])
             repairs.append({"key": key, "order": order, "receipt": None, "dispatch": "prepared"})
@@ -795,6 +859,15 @@ class PairTrader:
             pending["repair_attempts"] -= 1
             pending["repair_retry_at"] = time.time() + max(leg["receipt"].get("retry_after", 1) for leg in repairs)
             self._save(pair, state)
+
+    @staticmethod
+    def _begin_terminal_position_recovery(pending):
+        """Terminal receipts stay authoritative; bound failed position recovery."""
+        if not pending.get("terminal_position_recovery"):
+            from .pair_recovery import record_query_attempt, recovery_ready
+            pending["terminal_position_recovery"] = True
+            record_query_attempt(pending)
+            recovery_ready(pending)
 
     def _finish(self, pair, state, pending, *, completed, check_current=None):
         symbol = pair["symbol"]
@@ -864,7 +937,12 @@ class PairTrader:
             state["volume_unknown"] = True
             state["volume_unknown_until_utc"] = datetime.now(timezone.utc).date().isoformat()
         for leg in pending["legs"] + pending["repairs"]:
-            row = leg["receipt"]
+            row = leg.get("receipt")
+            if row is None:
+                unknown()
+                continue
+            if row.get("status") not in TERMINAL:
+                unknown()
             qty = dec(row["executedQty"])
             if not qty:
                 continue
@@ -910,6 +988,7 @@ class PairTrader:
         pending = {"id": uuid.uuid4().hex, "kind": "leverage", "symbol": symbol, "identities": deepcopy(state["identities"]),
                    "created_at": time.time(), "before": before, "target_leverage": target,
                    "previous_leverage": positions(snapshots, symbol)["LONG"].leverage, "results": {}}
+        pending["last_possible_send_at"] = time.time()
         state.update(pending=pending, phase="leverage",
                      reason=f"系统正在将两个子账户从 {pending['previous_leverage']}x 共同升至 {target}x；两侧实际杠杆确认前不下单")
         self._save(pair, state)
@@ -944,7 +1023,24 @@ class PairTrader:
         symbol = pair["symbol"]
         require_runtime_symbols(pair, state)
         pending = state["pending"]
-        snapshots, guards = self._read(brokers, symbol, reconciliation=True, fresh_modes=True)
+        from .pair_recovery import recovery_ready, record_query_attempt
+        if recovery_ready(pending):
+            return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
+        from .pair_recovery import MIN_QUERY_ATTEMPTS
+        if pending.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS:
+            state.update(phase="reconciling", reason="杠杆已完成三次核对，等待最后请求满 120 秒后核验实际仓位与设置")
+            return
+        try:
+            snapshots, guards = self._read(brokers, symbol, reconciliation=True, fresh_modes=True)
+        except RequestNotSent:
+            raise
+        except TradingError as exc:
+            record_query_attempt(pending, exc)
+            raise
+        record_query_attempt(pending)
+        if recovery_ready(pending):
+            self._save(pair, state)
+            return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
         self._publish_snapshots(state, snapshots, symbol)
         held = require_quantities(snapshots, symbol, pending["before"], equal_leverage=False)
         with self._confirmed(pair, brokers, guards):

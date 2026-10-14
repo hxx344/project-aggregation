@@ -67,6 +67,9 @@ class ArchivedBaselineTests(TestCase):
     def test_active_late_filled_and_failed_queries_cannot_adopt(self):
         original = self.archive()
         leg = original["recovery_watch"]["batches"][0]["legs"][0]
+        broker = self.broker()
+        broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "4.2"
+        broker.save()
         for status, qty in (("NEW", "0"), ("PARTIALLY_FILLED", "0.1"), ("FILLED", "0.2"), ("CANCELED", "0.1")):
             with self.subTest(status=status), self.no_writes(), patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status=status, qty=qty)):
                 with self.assertRaises(TradingError):
@@ -81,6 +84,9 @@ class ArchivedBaselineTests(TestCase):
         self.archive()
         self.confirm(self.preview()["token"])
         leg = self.state()["recovery_watch"]["batches"][0]["legs"][0]
+        broker = self.broker()
+        broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "4.2"
+        broker.save()
         with self.no_writes(), patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status="FILLED", qty="0.2")):
             with self.assertRaises(TradingError):
                 self.engine.pairs.enable("gold", True)

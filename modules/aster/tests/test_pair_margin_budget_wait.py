@@ -99,7 +99,8 @@ class PairMarginBudgetWaitTests(TestCase):
     def test_new_transfer_admission_rejects_whole_80_weight_group_without_requests(self):
         self.budget.reserve(1060)  # 77 ordinary weight remains, less than 80.
         result = self.tick()
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["status"], "waiting")
+        self.assertFalse(result["blocks_trading"])
         self.assertEqual(result["api_notice"]["kind"], "budget")
         self.assertIn("80", result["api_notice"]["text"])
         self.assertEqual(self.requests, [])
@@ -126,29 +127,41 @@ class PairMarginBudgetWaitTests(TestCase):
     def test_preflight_includes_archived_order_checks(self):
         self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": [{"legs": [
             {"key": "long"}, {"key": "short"}]}]}})
-        self.budget.reserve(1056)  # 81 remains; two watch queries need 82.
+        self.budget.reserve(832)  # 305 remains; history and fresh reality checks need 306.
         result = self.tick()
         self.assertEqual(result["api_notice"]["kind"], "budget")
-        self.assertIn("82", result["api_notice"]["text"])
+        self.assertIn("306", result["api_notice"]["text"])
         self.assertEqual(self.requests, [])
 
     def test_archived_order_query_cannot_borrow_recovery_reserve_for_new_transfer(self):
         self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": [{"legs": [
             {"key": "long"}, {"key": "short"}]}]}})
-        self.budget.reserve(1055)  # The complete 82-weight preparation fits.
+        self.budget.reserve(831)  # The complete 306-weight preparation fits.
 
         def guard(engine, pair):
-            self.budget.reserve(7)  # Other work fills the limit after preparation.
+            self.budget.reserve(231)  # Other work fills the limit after preparation.
             with self.brokers["long"].reconciliation_budget():
                 self.record("long", "archived-order-query", 1)
 
         with patch("trading.pair_recovery.require_archived_orders_clear", side_effect=guard):
             result = self.tick()
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["status"], "waiting")
+        self.assertFalse(result["blocks_trading"])
         self.assertEqual(result["api_notice"]["kind"], "budget")
         self.assertEqual(sum(request[2] for request in self.requests), 75)
         self.assertFalse(any(path == "archived-order-query" for _, path, _, _ in self.requests))
         self.assertEqual(self.budget.snapshot()["used"], 1137)
+
+    def test_large_watch_history_has_a_bounded_preflight_budget(self):
+        batches = [{"id": str(index), "legs": [{"key": "long"}, {"key": "short"}]} for index in range(100)]
+        self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": batches}})
+        weights = self.balancer._live_budget_weights(self.pair, self.members, self.snapshots)
+        self.assertEqual(sum(weights.values()), 80 + 16 + 224)
+        for batch in batches:
+            batch["bounded_queries_complete"] = True
+        self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": batches}})
+        weights = self.balancer._live_budget_weights(self.pair, self.members, self.snapshots)
+        self.assertEqual(sum(weights.values()), 80 + 224)
         self.assertEqual(self.transfers, [])
 
     def test_new_transfer_uses_ordinary_budget_then_confirmation_uses_reserve(self):
@@ -256,7 +269,7 @@ class PairMarginBudgetWaitTests(TestCase):
         self.assertEqual(self.tick()["retry_after"], 29)
         self.assertEqual(sum(row[2] for row in self.requests), 75)
 
-    def test_unknown_rate_limited_post_stays_pending_and_is_never_repeated(self):
+    def test_unknown_rate_limited_post_waits_then_archives_with_fresh_balances(self):
         self.response = AmbiguousOrder("rate limited", retry_after=90, http_status=429)
         result = self.tick()
         self.assertEqual(result["status"], "unknown")
@@ -265,9 +278,11 @@ class PairMarginBudgetWaitTests(TestCase):
         requests = list(self.requests)
         self.advance(91)
         result = self.tick()
-        self.assertEqual(result["status"], "unknown")
-        self.assertIsNotNone(result["pending"])
-        self.assertEqual(self.requests, requests)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIsNone(result["pending"])
+        self.assertEqual(self.requests[:len(requests)], requests)
+        self.assertEqual([row[1] for row in self.requests[len(requests):]], ["snapshot", "snapshot"])
+        self.assertNotIn("confirmed_at", result["last_transfer"])
         self.assertEqual(len(self.transfers), 1)
 
     def test_paused_disabled_and_waiting_views_preserve_notice_until_successful_check(self):

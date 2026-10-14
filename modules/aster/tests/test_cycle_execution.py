@@ -382,7 +382,7 @@ class CycleLiveBrokerTests(unittest.TestCase):
         with self.assertRaises(TradingError):
             self.live.set_leverage("XAUUSD1", 2)
 
-    def test_unknown_leverage_mutation_is_never_retried(self):
+    def test_legacy_lower_leverage_target_accepts_current_higher_tier_without_write(self):
         snapshot = self.f.broker.snapshot(["XAUUSD1"])
         account = self.f.account
         account["cycle"] = {**DEFAULT_CYCLE, "enabled": True}
@@ -398,12 +398,9 @@ class CycleLiveBrokerTests(unittest.TestCase):
                 "run_id": progress["run_id"], "symbol": "XAUUSD1", "previous": 5, "target": 2,
                 "status": "pending", "created_at": time.time(), "progress": progress})
             executor.reconcile(account)
-            pending = self.f.store.intent("test")
-            pending["created_at"] -= 130
-            self.f.store.save_intent(pending)
-            executor.reconcile(account)
         mutate.assert_not_called()
-        self.assertEqual(self.f.store.intent("test")["status"], "attention")
+        self.assertIsNone(self.f.store.intent("test"))
+        self.assertEqual(executor.last_snapshot.pair("XAUUSD1")[0].leverage, 5)
 
 
 if __name__ == "__main__":

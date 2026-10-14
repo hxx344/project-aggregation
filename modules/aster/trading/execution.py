@@ -1,15 +1,17 @@
 """Crash-recoverable hedge execution. All mutations have durable intent IDs."""
 import time
 import uuid
+from copy import deepcopy
 from contextlib import nullcontext
 from fractions import Fraction
 
 from .cycle_guard import cycle_add_block_reason, ordinary_add_block_reason
 from .exchange import AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
-from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, ordinary_leverage_wait, positive, require_non_decreasing_leverage, require_supported_leverage, wire
+from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, cycle_margin_limit, dec, floor_step, hedge_balanced, migration_margin_limit, minimum_open_leverage, opening_margin_limit, ordinary_leverage_wait, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
 from .capacity_timing import initial_timing, observe_capacity_submit, capacity_timing_text
+from . import recovery
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
 
@@ -69,6 +71,9 @@ class Executor:
                 "quantity": wire(qty), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
 
     def send(self, intent, orders, *, repair=False, capacity_observation=None):
+        account = self.store.account(intent["account_id"])
+        recovery.mark_send(intent, account, self.broker, orders)
+        self.store.save_intent(intent)  # Also persist a repair's new settling window before send.
         not_sent = None
         rejections = []
         try:
@@ -176,6 +181,7 @@ class Executor:
                   "previous": old, "target": target, "created_at": time.time(), "status": "pending"}
         if purpose is not None:
             intent.update(purpose=purpose, symbols=list(symbols))
+        recovery.mark_send(intent, latest, self.broker)
         self.store.save_intent(intent)
         try:
             if isinstance(self.broker, LiveBroker):
@@ -216,8 +222,171 @@ class Executor:
         if intent.get("status") != "attention" or intent.get("last_error") != reason:
             self.store.event(account["id"], "error", reason)
         intent.update(status="attention", last_error=reason)
+        self.store.pause_intent(account, intent, reason)
+        return reason
+
+    def _observe_recovery(self, account, intent):
+        recovery.observe(intent, self.store.account(account["id"]), self.broker)
         self.store.save_intent(intent)
-        self.store.pause_account(account, reason)
+
+    def _read_recovery_snapshot(self, intent, read):
+        try:
+            snapshot = read()
+        except TradingError as exc:
+            recovery.checked(intent, "leverage", exc)
+            self.store.save_intent(intent)
+            raise
+        recovery.checked(intent, "leverage")
+        self.store.save_intent(intent)
+        return snapshot
+
+    @staticmethod
+    def _unresolved_ids(intent):
+        return [order["newClientOrderId"] for order in intent.get("orders", []) + intent.get("repairs", [])
+                if intent.get("receipts", {}).get(order["newClientOrderId"], {}).get("status") not in TERMINAL]
+
+    def _validate_known_terminal(self, intent):
+        for order in intent.get("orders", []) + intent.get("repairs", []):
+            receipt = intent.get("receipts", {}).get(order["newClientOrderId"])
+            self.validate_receipt(order, receipt)
+            if receipt["status"] not in TERMINAL:
+                raise TradingError("原批次尚有未终结回执，不能按已知结果采纳仓位")
+
+    def _current_recovery_wait(self, account, intent):
+        if not intent["bounded_recovery"].get("current_state"):
+            return None
+        if recovery.due(intent, ["current_state"]):
+            return self._recover_current(account, intent)
+        if not recovery.can_query(intent, "current_state"):
+            return "旧批次与实际持仓已完成有限次核对，等待安全观察窗口后按现实重新核验"
+        return None
+
+    def _recover_known_state(self, account, intent, reason):
+        self._validate_known_terminal(intent)
+        intent["bounded_recovery"]["current_state"] = True
+        recovery.checked(intent, "current_state")
+        self.store.save_intent(intent)
+        if recovery.due(intent, ["current_state"]):
+            return self._recover_current(account, intent)
+        return self.attention(account, intent, reason)
+
+    def _recover_current(self, account, intent):
+        """Abandon only old request tracking; actual holdings stay untouched."""
+        current_account = self.store.account(account["id"])
+        recovery.observe(intent, current_account, self.broker)
+        self.store.save_intent(intent)
+        aid, kind = account["id"], intent["kind"]
+        result_known = bool(intent["bounded_recovery"].get("current_state"))
+        for order in intent.get("orders", []) + intent.get("repairs", []):
+            cid = order["newClientOrderId"]
+            if cid in intent.get("receipts", {}):
+                self.validate_receipt(order, intent["receipts"][cid])
+        if result_known:
+            self._validate_known_terminal(intent)
+        symbols = list(dict.fromkeys([*current_account["policy"]["symbols"],
+            *intent.get("symbols", []), intent["symbol"],
+            *([intent["source_symbol"], intent["target_symbol"]] if kind == "migration" else [])]))
+        keys = ["recovery_auto_pause:" + aid, "post_fill_check:" + aid,
+                f"open_after_leverage:{aid}:{intent['symbol']}"]
+        progress_key = ("cycle:" + aid if kind in ("cycle", "cycle_leverage") else
+                        "migration:" + aid if kind == "migration" else None)
+        if progress_key:
+            keys.append(progress_key)
+        if isinstance(self.broker, PaperBroker):
+            keys.append("paper:" + aid)
+        expected = {key: self.store.get(key) for key in keys}
+        snapshot, actual, check_current, lock = recovery.safe_snapshot(current_account, self.broker, symbols)
+        actual_leverage = actual[intent["symbol"]]["leverage"]
+        if kind in ("cycle", "cycle_leverage"):
+            from .cycle import validate_cycle
+            validate_cycle({**current_account["cycle"], "leverage": actual_leverage})
+            margin_limit = cycle_margin_limit(current_account["policy"])
+        else:
+            require_supported_leverage(actual_leverage)
+            margin_limit = (migration_margin_limit(current_account["policy"])
+                            if kind == "migration" or intent.get("purpose") == "migration" else
+                            opening_margin_limit(current_account["policy"], actual_leverage))
+        if snapshot.margin_exceeds(margin_limit):
+            raise TradingError("当前保证金占用率超过策略上限，暂不自动结束旧批次核对")
+        now = time.time()
+        reason = (f"{intent['symbol']} 已依据本轮完整挂单及实际平衡仓位结束旧批次跟踪；"
+                  + ("已知成交回执保留，当前仓位作为新基线" if result_known else "历史成交结果保留未知")
+                  + "，未重发原请求或下单")
+        replacements = {"post_fill_check:" + aid: None,
+                        f"open_after_leverage:{aid}:{intent['symbol']}": None}
+        if progress_key:
+            previous = expected[progress_key]
+            if not isinstance(previous, dict) or previous.get("run_id") != intent.get("run_id"):
+                raise TradingError("当前策略周期与旧批次不一致，不能自动结束跟踪")
+            if kind in ("cycle", "cycle_leverage"):
+                from .cycle import validate_cycle
+                config = validate_cycle(current_account.get("cycle"))
+                if config["symbol"] != intent["symbol"]:
+                    raise TradingError("循环标的已变化，不能自动采纳旧标的持仓")
+                position = actual[intent["symbol"]]
+                replacements[progress_key] = {"run_id": uuid.uuid4().hex, "phase": "waiting_open",
+                    "config": {**config, "leverage": position["leverage"]},
+                    "baseline": {side: position[side] for side in ("LONG", "SHORT")},
+                    "quantities": {"LONG": "0", "SHORT": "0"}, "opened_at": None,
+                    "close_eligible_at": None, "active_batch": None,
+                    "completed_cycles": previous.get("completed_cycles", 0), "updated_at": now, "reason": reason}
+            else:
+                remaining = {side: actual[intent["source_symbol"]][side] for side in ("LONG", "SHORT")}
+                known_totals = {field: deepcopy(previous.get(field, {"LONG": "0", "SHORT": "0"}))
+                                for field in ("migrated_notional", "cumulative_notional_delta")}
+                if result_known:
+                    ledger = self._ledger(intent)
+                    for side in ("LONG", "SHORT"):
+                        known_totals["migrated_notional"][side] = wire(Fraction(dec(known_totals["migrated_notional"][side]))
+                                                                     + ledger["source_notional"][side])
+                        known_totals["cumulative_notional_delta"][side] = wire(Fraction(dec(known_totals["cumulative_notional_delta"][side]))
+                            + ledger["target_notional"][side] - ledger["source_notional"][side])
+                replacements[progress_key] = {**previous, "source_remaining_qty": remaining,
+                    "source_leverage": actual[intent["source_symbol"]]["leverage"],
+                    "target_symbol": intent["target_symbol"],
+                    "target_leverage": actual[intent["target_symbol"]]["leverage"],
+                    "required_leverage": actual[intent["target_symbol"]]["leverage"],
+                    "active_batch": None, "phase": "waiting" if any(dec(qty) for qty in remaining.values()) else "complete",
+                    **known_totals, "totals_incomplete": bool(previous.get("totals_incomplete")) or not result_known,
+                    "unknown_batch_ids": [*previous.get("unknown_batch_ids", []), *([] if result_known else [intent["id"]])],
+                    "recovery_origin": deepcopy(known_totals),
+                    "updated_at": now, "reason": reason}
+        cooldown = None
+        if kind in ("leverage", "cycle_leverage"):
+            cooldown = {"identity": recovery.broker_identity(current_account, self.broker),
+                "config": recovery.recovery_config(current_account), "target": intent["target"],
+                "actual": actual[intent["symbol"]]["leverage"], "until": now + recovery.LEVERAGE_COOLDOWN_SECONDS,
+                "intent_id": intent["id"]}
+        known_quantities = None
+        if result_known and kind == "pair":
+            filled = {side: Fraction(0) for side in ("LONG", "SHORT")}
+            amounts = filled.copy()
+            reduced = filled.copy()
+            for order in intent["orders"]:
+                receipt = intent["receipts"][order["newClientOrderId"]]
+                side, qty = order["positionSide"], Fraction(dec(receipt["executedQty"]))
+                filled[side] += qty
+                if qty:
+                    amounts[side] += qty * Fraction(dec(receipt["avgPrice"]))
+            for order in intent["repairs"]:
+                reduced[order["positionSide"]] += Fraction(dec(intent["receipts"][order["newClientOrderId"]]["executedQty"]))
+            net = {side: filled[side] - reduced[side] for side in filled}
+            if any(qty < 0 for qty in net.values()):
+                raise TradingError("本批已知减仓超过新增量，不能归档为正常成交")
+            known_quantities = {"long_qty": wire(net["LONG"]), "short_qty": wire(net["SHORT"]),
+                "notional": wire(sum((amounts[side] * net[side] / filled[side] for side in filled if filled[side]), Fraction(0)))}
+        with lock:
+            completed, saved_account = self.store.archive_recovered_intent(intent, current_account,
+                expected_state=expected, replacements=replacements, check_current=check_current,
+                resolution={"kind": "current_state_adopted" if result_known else "unknown_current_state",
+                            "execution_result_unknown": not result_known, "known_quantities": known_quantities,
+                            "checked_at": now, "actual": actual, "reason": reason},
+                cooldown=cooldown)
+        intent.clear()
+        intent.update(completed)
+        account.clear()
+        account.update(saved_account)
+        self.last_snapshot, self.last_completed_intent = snapshot, deepcopy(completed)
         return reason
 
     def reconcile(self, account, intent=None):
@@ -230,19 +399,31 @@ class Executor:
         intent = intent or self.store.intent(account["id"])
         if not intent:
             return "没有未完成批次"
+        if intent.get("status") in ("complete", "aborted"):
+            return "批次已结束"
+        self._observe_recovery(account, intent)
+        waiting = self._current_recovery_wait(account, intent)
+        if waiting:
+            return waiting
         if intent["kind"] == "leverage":
-            if intent["target"] < intent["previous"]:
-                return self.attention(account, intent, "发现旧降杠杆批次，全局禁止继续执行；请核对实际杠杆")
+            if recovery.due(intent, ["leverage"]):
+                return self._recover_current(account, intent)
+            if not recovery.can_query(intent, "leverage"):
+                return "旧杠杆请求已完成有限次核对，等待安全观察窗口后读取当前账户"
             if isinstance(self.broker, PaperBroker):
                 self.broker.reload()
             symbols = intent.get("symbols", account["policy"]["symbols"])
-            snapshot = self.broker.snapshot(symbols)
+            snapshot = self._read_recovery_snapshot(intent, lambda: self.broker.snapshot(symbols, fresh_modes=True))
             snapshot.require_fresh()
             try:
                 snapshot.require_modes(symbols)
             except AccountModeError as exc:
                 return self.attention(account, intent, str(exc))
             long, short = snapshot.pair(intent["symbol"])
+            if intent["target"] < intent["previous"]:
+                if recovery.due(intent, ["leverage"]):
+                    return self._recover_current(account, intent)
+                return self.attention(account, intent, "旧降杠杆请求仅核对实际账户，不会重复提交；等待安全观察窗口")
             if long.leverage == short.leverage and long.leverage >= intent["target"]:
                 self.store.complete_leverage(intent, long.leverage)
                 self.store.event(account["id"], "leverage", f"{intent['symbol']} 已核实实际杠杆 {long.leverage}x（目标 {intent['target']}x）；按实际档位准备开仓，禁止降档")
@@ -255,6 +436,8 @@ class Executor:
                 self.store.save_intent(intent)
                 return reason
             if time.time() - intent["created_at"] > 120:
+                if recovery.due(intent, ["leverage"]):
+                    return self._recover_current(account, intent)
                 reason = (f"{intent['symbol']} 杠杆变更尚未确认：{intent['previous']}x→{intent['target']}x，"
                           f"实际仍为 {long.leverage}x；请核对账户后重新检查")
                 if intent.get("submission_error"):
@@ -266,6 +449,8 @@ class Executor:
                 return self.attention(account, intent, reason)
             return f"等待账户确认 {intent['symbol']} 目标 {intent['target']}x，实际 {long.leverage}x"
 
+        if recovery.due(intent, self._unresolved_ids(intent)):
+            return self._recover_current(account, intent)
         orders = intent["orders"] + intent["repairs"]
         unresolved = []
         for order in orders:
@@ -277,8 +462,11 @@ class Executor:
                 except TradingError as exc:
                     return self.attention(account, intent, str(exc))
                 continue
+            if not recovery.can_query(intent, cid):
+                unresolved.append(cid)
+                continue
             try:
-                row = self.broker.query(intent["symbol"], cid)
+                row = recovery.query(self.broker, intent, order)
                 self.validate_receipt(order, row)
                 intent["receipts"][cid] = row
                 if row["status"] not in TERMINAL:
@@ -300,6 +488,8 @@ class Executor:
                 return self.attention(account, intent, str(exc))
         self.store.save_intent(intent)
         if unresolved:
+            if recovery.due(intent, unresolved):
+                return self._recover_current(account, intent)
             if time.time() - intent["created_at"] > 120:
                 return self.attention(account, intent, "订单结果仍不确定，已暂停新开仓；请核对未完成批次")
             return "核对订单回执中，不重复提交"
@@ -325,13 +515,15 @@ class Executor:
             repaired[order["positionSide"]] += Fraction(dec(intent["receipts"][order["newClientOrderId"]]["executedQty"]))
         net = {side: filled[side] - repaired[side] for side in filled}
         actual = {"LONG": Fraction(long.qty), "SHORT": Fraction(short.qty)}
-        if any(actual[s] != Fraction(dec(intent["baseline"][s])) + net[s] or net[s] < 0 for s in actual):
-            return self.attention(account, intent, "持仓变化与本批回执不一致，暂停并等待核对（可能有外部成交或 ADL）")
+        if any(net[s] < 0 for s in actual):
+            return self.attention(account, intent, "本批减仓回执超过已知新增量，暂停并等待核对")
+        if any(actual[s] != Fraction(dec(intent["baseline"][s])) + net[s] for s in actual):
+            return self._recover_known_state(account, intent, "持仓变化与本批回执不一致，已暂停并有限次核对当前仓位")
         if not hedge_balanced(long.qty, short.qty):
             if not snapshot.can_trade or snapshot.open_orders:
                 return self.attention(account, intent, "账户交易权限或未完成挂单不符合补偿条件，等待核对")
             if intent["repair_attempts"] >= 3:
-                return self.attention(account, intent, "单腿补偿尚未完成，已暂停新开仓；请核对并重试补偿")
+                return self._recover_known_state(account, intent, "单腿补偿已达上限，暂停并核对当前仓位")
             side = "LONG" if long.qty > short.qty else "SHORT"
             book = self.market.book(intent["symbol"])
             book.require_fresh()

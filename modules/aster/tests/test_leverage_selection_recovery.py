@@ -26,7 +26,7 @@ class HigherLeverageSelectionTests(unittest.TestCase):
         self.addCleanup(self.f.close)
         self.f.account["policy"].update(symbols=list(SYMBOLS), min_open_leverage=5)
         self.f.store.save_account(self.f.account)
-        self.f.broker.state["leverages"] = dict.fromkeys(SYMBOLS, 2)
+        self.f.broker.state["leverages"].update(dict.fromkeys(SYMBOLS, 2))
         self.f.broker.save()
         self.engine = Engine(self.f.store, market=self.f.market)
         self.engine.brokers["test"] = self.f.broker

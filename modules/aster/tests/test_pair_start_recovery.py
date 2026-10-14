@@ -251,20 +251,23 @@ class PairStartRecoveryTests(unittest.TestCase):
         self.assertEqual(self.state()["daily_volume"], saved["daily_volume"])
         self.assertEqual(self.f.store.get("pair_batch:" + batch["id"]), batch)
 
-    def test_archived_unknown_order_watch_still_blocks_changed_baseline(self):
+    def test_archived_unknown_watch_allows_verified_terminal_balanced_batch(self):
         self.seed()
-        self.balance()
+        self.balance("3")
         state = self.state()
         legs = [{"key": leg["key"], "order": {**leg["order"],
                  "newClientOrderId": "archived-" + leg["key"]}} for leg in state["pending"]["legs"]]
         state["recovery_watch"] = {"batches": [{"id": "archived", "identities": state["identities"], "legs": legs}]}
         self.f.store.put("pair_runtime:gold", state)
         with self.no_writes():
-            self.assertFalse(self.engine.pairs.check_recovery("gold")["completed"])
-            with self.assertRaises(TradingError):
-                self.engine.pairs.enable("gold", True)
-        self.assert_retained(state)
-        self.assert_positions("10")
+            result = self.engine.pairs.check_recovery("gold")
+            self.assertTrue(result["completed"], result["message"])
+            self.assertEqual(self.state()["recovery_watch"], state["recovery_watch"])
+            self.engine.pairs.enable("gold", True)
+        self.assertIsNone(self.state()["pending"])
+        self.assertEqual({side: dec(qty) for side, qty in self.state()["owned"].items()},
+                         {"LONG": dec("3"), "SHORT": dec("3")})
+        self.assert_positions("3")
 
     def test_history_failure_rolls_back_baseline_batch_and_volume(self):
         original = self.seed()

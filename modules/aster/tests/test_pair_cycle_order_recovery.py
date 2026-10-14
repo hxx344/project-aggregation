@@ -157,6 +157,9 @@ class PairCycleOrderRecoveryTests(TestCase):
         pair = self.f.store.save_pair({**self.f.store.pair("gold"), "enabled": True})
         # Rebuild the trader: protection comes from the durable watcher.
         trader = PairTrader(self.engine)
+        broker = self.broker()
+        broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "3.239"
+        broker.save()
         for status, qty in (("NEW", "0"), ("FILLED", "0.2")):
             row = receipt_for(original["pending"]["legs"][0], status=status, qty=qty)
             with self.subTest(status=status), self.no_writes(), patch.object(self.broker(), "query", return_value=row):
