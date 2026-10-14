@@ -5,7 +5,7 @@ import { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCross
 import { D, Decimal } from './money.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
 import { fundingOpportunities, positionFundingRates } from './funding-opportunities.mjs';
-import { crossexBase } from '../../../server/asset-identity.mjs';
+import { canonicalBase, crossexBase } from '../../../server/asset-identity.mjs';
 
 const CONFIG_KEYS = ['entryPaused', 'monitorUrl', 'monitorUsername', 'notionalPerLeg', 'maxOpen', 'maxTotalNotional', 'feeBps', 'feeSchedule', 'slippageBps', 'minNetBps', 'cooldownSeconds'];
 const safeMessage = error => error instanceof AppError ? error.message : '行情读取失败，请检查来源连接';
@@ -425,6 +425,68 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
     return true;
   }
+  async function resolvePositionPair(positions) {
+    const resolved = await Promise.all(positions.map(p => resolveSymbol(p.symbol)));
+    // Hyperliquid metadata retains a USDT reference quote for BTC while its
+    // verified CrossEx contract and settlement counter currency are USDC.
+    const counter = quote => quote.counterCurrency ?? quote.quoteCurrency;
+    if (resolved.length !== 2 || !validManualPair(resolved[0].quote, resolved[1].quote)
+      || counter(resolved[0].quote) !== counter(resolved[1].quote)) throw new AppError('持仓双腿须为身份可比、同一资产及计价币的不同交易所合约');
+    return resolved;
+  }
+  function positionValue(leg, reference, fx, budget) {
+    if (!leg.reduceOnly) return budgetValue(leg, reference, fx, clock(), budget);
+    let notionalUSDT = null;
+    try { notionalUSDT = D(leg.quantity).times(leg.price).times(fxRate(leg.settlementCurrency, fx, clock()).ask).toString(); } catch { /* Reducing exposure does not require FX availability. */ }
+    return { referencePrice: reference, notionalUSDT };
+  }
+  async function previewPosition({ positions, targetQuantity, action, strategy }) {
+    const c = config(), marketRevision = revision(), increasing = positions.some(p => D(targetQuantity).gt(p.heldQuantity));
+    if (increasing && c.entryPaused) throw new AppError('新开仓已暂停，仅允许减少持仓');
+    const resolved = await resolvePositionPair(positions);
+    const { books, fx } = await booksAndFx(resolved.map(r => r.quote), increasing, manualDepthReader);
+    if (marketRevision !== revision()) throw new AppError('设置已变化，请重新预览', 409);
+    const legs = positions.flatMap((p, i) => {
+      const { quote, rule } = resolved[i], delta = D(targetQuantity).minus(p.heldQuantity);
+      // The target is a base quantity, as are position_qty and CrossEx lot_size.
+      // Native contract multipliers must not be applied a second time.
+      if (!D(targetQuantity).mod(rule.lot_size).isZero()) throw new AppError('目标数量未满足双腿合约步长');
+      if (delta.isZero()) return [];
+      const reduceOnly = delta.lt(0), quantity = delta.abs().toString(), side = (p.positionSide === 'LONG') !== reduceOnly ? 'BUY' : 'SELL';
+      const leg = { ...buildLeg(quote, side, p.positionSide, rule, books[i]), positionId: p.positionId,
+        heldQuantity: p.heldQuantity, targetQuantity, quantity, reduceOnly, orderType: 'LIMIT', timeInForce: 'IOC' };
+      checkPrice(leg.price, rule); checkQuantity(quantity, leg.price, rule);
+      const estimate = depthEstimate(books[i], side, quantity, leg.price);
+      checkQuantity(quantity, estimate.price, rule);
+      return [{ ...leg, ...positionValue(leg, estimate.price, fx, c.notionalPerLeg), notional: D(quantity).times(leg.price).toString(), sourceAt: books[i].at }];
+    }).toSorted((a, b) => Number(b.reduceOnly) - Number(a.reduceOnly));
+    return { kind: 'position', action, ...(strategy ? { strategy } : {}), source: 'position', targetQuantity,
+      base: canonicalBase(resolved[0].quote.exchange, resolved[0].quote.base), marketRevision, positionQuotes: resolved.map(r => r.quote),
+      sourceAt: Math.min(...books.map(b => b.at)), expiresAt: clock() + 30000, legs,
+      limits: { maxOpen: c.maxOpen, maxTotalNotional: c.maxTotalNotional, cooldownSeconds: c.cooldownSeconds },
+      warnings: [...new Set(resolved.flatMap(r => r.rule.unverifiedConstraints)),
+        '持仓调整使用保护限价 IOC；先减后增，前腿未全成则后腿不发送，不自动补单'] };
+  }
+  async function revalidatePosition(plan) {
+    const c = config(), increasing = plan.legs.some(leg => !leg.reduceOnly);
+    if (revision() !== plan.marketRevision || increasing && c.entryPaused) throw new AppError('设置或开仓状态已变化，请重新预览', 409);
+    const resolved = await resolvePositionPair(plan.positions);
+    for (const [index, item] of resolved.entries()) {
+      if (contractIdentity(item.quote) !== contractIdentity(plan.positionQuotes[index])) throw new AppError('合约身份已变化，请重新预览');
+      if (!D(plan.targetQuantity).mod(item.rule.lot_size).isZero()) throw new AppError('目标数量未满足双腿合约步长');
+    }
+    const { books, fx } = await booksAndFx(resolved.map(r => r.quote), increasing, manualDepthReader);
+    const values = plan.legs.map(leg => {
+      const index = plan.positions.findIndex(p => p.positionId === leg.positionId), { rule } = resolved[index];
+      checkPrice(leg.price, rule); checkQuantity(leg.quantity, leg.price, rule);
+      const estimate = depthEstimate(books[index], leg.side, leg.quantity, leg.price);
+      checkQuantity(leg.quantity, estimate.price, rule);
+      return positionValue(leg, estimate.price, fx, c.notionalPerLeg);
+    });
+    if (revision() !== plan.marketRevision || increasing && config().entryPaused) throw new AppError('设置或开仓状态已变化，请重新预览', 409);
+    plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
+    return true;
+  }
   async function previewClose(position, requestedQuantity) {
     await refreshCatalog();
     if (!position || typeof position.symbol !== 'string' || !['LONG', 'SHORT'].includes(position.position_side)) throw new AppError('持仓合约或方向无效');
@@ -496,6 +558,6 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     }
     return view({ includeOpportunities: false });
   }
-  return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, resolveDisplaySymbol, openCapacityContext, previewDirect, previewPair, previewOpen, revalidateOpen, previewClose, revalidateClose, positionsNotional, positionsValuation, settings,
+  return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, resolveDisplaySymbol, openCapacityContext, previewDirect, previewPair, previewOpen, revalidateOpen, previewPosition, revalidatePosition, previewClose, revalidateClose, positionsNotional, positionsValuation, settings,
     async stop() { stopping = true; await Promise.all([sourceFlight, catalogFlight]); } };
 }

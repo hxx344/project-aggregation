@@ -3,7 +3,8 @@ import { AlertCircle, ArrowLeftRight, RefreshCw, LayoutDashboard, CandlestickCha
 import { createLatestRead } from './latest-read';
 import { createServerClock, sourceIsStale, STATE_POLL_MS } from './freshness';
 import { cleanHubQuery, hubChanged, hubNavigate, observeReadWake, readPollDelay, useHubBridge } from './hub-bridge';
-import type { LiveBootstrap, LiveExecution, LiveOrder, LivePreview, LiveState, PreviewInput } from './live-types';
+import type { LiveBootstrap, LiveExecution, LiveOrder, LivePreview, LiveState, PositionActionInput, PreviewInput } from './live-types';
+import { positionPreviewChanged } from './position-actions';
 import { BOOTSTRAP_REFRESH_MS, latestBootstrap, needsCatalog, parseBootstrap, readRetryDelay, stateReadPath, validCsrf } from './live-loading';
 import { time } from './display';
 import { executionStatus, liveStatus, stateIsUncertain } from './live-display';
@@ -32,6 +33,7 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [pair, setPair] = useState<{ longExchange?: string; shortExchange?: string }>({});
   const [preview, setPreview] = useState<LivePreview | null>(null), [cancelOrder, setCancelOrder] = useState<LiveOrder | null>(null);
+  const [positionPreview, setPositionPreview] = useState<PositionActionInput | null>(null), [previewInvalidated, setPreviewInvalidated] = useState(false);
   const [requestStore] = useState(() => { let storage: Storage | null = null; try { storage = window.sessionStorage; } catch { /* Writes stay blocked when their identity cannot survive reload. */ } return { storage, key: requestStorageKey(location.pathname) }; });
   const [pendingRequest, setPendingRequest] = useState<PendingRequest | null>(() => readPendingRequest(requestStore.storage, requestStore.key)), [now, setNow] = useState(0);
   const pendingRef = useRef(pendingRequest);
@@ -190,11 +192,11 @@ export default function App() {
   };
   const previewOrder = async (input: PreviewInput) => {
     const data = await mutate<LivePreview | { preview: LivePreview }>('/api/live/preview', input);
-    if (data) setPreview('preview' in data ? data.preview : data);
+    if (data) { setPreview('preview' in data ? data.preview : data); setPositionPreview(input.kind === 'position' ? input : null); setPreviewInvalidated(false); }
     return !!data;
   };
   const confirmOrder = async () => {
-    if (!preview) return;
+    if (!preview || positionPreviewInvalid || tradingDisabled || preview.legs.some(leg => !leg.reduceOnly) && openingDisabled) return;
     const current = preview;
     const data = await mutate<LiveExecution | { execution: LiveExecution }>('/api/live/confirm', { previewId: current.id }, 'POST', 'confirm:' + current.id);
     setPreview(null); go('orders');
@@ -210,6 +212,8 @@ export default function App() {
   const accountStale = !online || !live || live.stale || live.partial || !live.asOf || now - live.asOf > 15_000 || live.asOf > now + 1000;
   const tradingDisabled = busy || !live?.tradingAllowed || accountStale || !!pendingRequest;
   const openingDisabled = tradingDisabled || !!state?.config.entryPaused;
+  const positionPreviewInvalid = !!preview && !!positionPreview && (previewInvalidated || !live || positionPreviewChanged(positionPreview, live));
+  useEffect(() => { if (positionPreviewInvalid) setPreviewInvalidated(true); }, [positionPreviewInvalid]);
   const capacityContext = live && state ? { live: { ...live, stale: accountStale }, active: hub.readActive, background: hub.background,
     csrfToken: connectionInfo?.csrfToken || state.csrfToken, now, readNow: serverClock.current.now,
     revision: JSON.stringify([state.config, !!pendingRequest, live.orders.map(o => [o.id, o.status, o.filledQuantity]), live.positions.map(p => [p.id, p.quantity])]) } : null;
@@ -228,7 +232,7 @@ export default function App() {
       {(accountStale && live.connection.configured || live.reasons.length > 0 || live.connection.error) && <div className="notice warning"><AlertCircle size={15}/><span>{[...(accountStale && live.connection.configured ? [live.partial ? '账户数据不完整，保留上次已知数据，暂停交易。' : '账户数据待更新，保留上次已知数据，暂停交易。'] : []), ...live.reasons, ...(live.connection.error ? [live.connection.error] : [])].filter((item, index, all) => all.indexOf(item) === index).join(' ')}</span></div>}
       {extraAlerts.length > 0 && <div className="notice warning" role="status"><AlertCircle size={15}/><span>{extraAlerts.join(' ')}</span></div>}
       {state.config.entryPaused && (tab === 'trade' || tab === 'hedge') && <p className="inline-state warning">新开仓已暂停，可在设置中恢复；仍可手动平仓和撤单。</p>}
-      {tab === 'positions' && <><div className="view-heading portfolio-heading"><div><span className="eyebrow">PORTFOLIO</span><h2>投资组合</h2><p>统一保证金概览与跨交易所真实持仓</p></div><div className="portfolio-count"><strong>{new Set(live.positions.map(p => p.baseCurrency || p.symbol)).size}</strong><span>个币种 <b>·</b> {live.positions.length} 条持仓腿</span></div></div><AccountOverview live={live}/><PortfolioPanel positionFundingRates={state.positionFundingRates} now={now} fundingOpportunities={state.fundingOpportunities || []} marketStale={marketStale} live={{ ...live, stale: accountStale }} instruments={instruments.items} disabled={tradingDisabled} close={positions => previewOrder({ kind: 'close', positions })}/></>}
+      {tab === 'positions' && <><div className="view-heading portfolio-heading"><div><span className="eyebrow">PORTFOLIO</span><h2>投资组合</h2><p>统一保证金概览与跨交易所真实持仓</p></div><div className="portfolio-count"><strong>{new Set(live.positions.map(p => p.baseCurrency || p.symbol)).size}</strong><span>个币种 <b>·</b> {live.positions.length} 条持仓腿</span></div></div><AccountOverview live={live}/><PortfolioPanel positionFundingRates={state.positionFundingRates} now={now} fundingOpportunities={state.fundingOpportunities || []} marketStale={marketStale} live={{ ...live, stale: accountStale }} instruments={instruments.items} disabled={tradingDisabled || !!preview} preview={previewOrder} previewError={error} budget={state.config.notionalPerLeg} entryPaused={!!state.config.entryPaused} capacityContext={capacityContext!} catalogError={instruments.error} close={positions => previewOrder({ kind: 'close', positions })}/></>}
       {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} preview={previewOrder} capacityContext={capacityContext!}/>}
       {tab === 'hedge' && <ManualHedgePanel key={[search, pair.longExchange, pair.shortExchange].join(':')} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} opportunities={state.opportunities} fundingOpportunities={state.fundingOpportunities || []} now={now} initial={{ base: search, ...pair }} monitorStale={marketStale} preview={previewOrder} capacityContext={capacityContext!}/>}
       {tab === 'orders' && <><div className="view-heading"><div><span className="eyebrow">ORDERS & EXECUTIONS</span><h2>订单与操作记录</h2><p>核对真实成交状态，管理尚未成交的委托</p></div></div><HistoryPanel live={live} disabled={tradingDisabled} querying={busy} query={() => void queryAccount()} cancel={setCancelOrder}/></>}
@@ -236,7 +240,7 @@ export default function App() {
     </>}
     <footer className="app-footer"><span><i className="status-dot"/>手动实盘 · 北京时间 · 2 秒状态刷新</span><span><a href="https://github.com/hxx344/gate-crossex-arbitrage" target="_blank" rel="noreferrer">源代码</a><b>·</b><a href="https://github.com/your-quantguy/gate-crossex" target="_blank" rel="noreferrer">参考 your-quantguy/gate-crossex</a><b>·</b><a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">AGPL-3.0-only</a></span></footer>
   </main>
-  {preview && <TradeReview key={preview.id} preview={preview} now={now} busy={busy} disabled={preview.kind === 'open' ? openingDisabled : tradingDisabled} close={() => setPreview(null)} confirm={() => void confirmOrder()}/>}
+  {preview && <TradeReview key={preview.id} preview={preview} now={now} busy={busy} disabled={positionPreviewInvalid || (preview.legs.some(leg => !leg.reduceOnly) ? openingDisabled : tradingDisabled)} invalidReason={positionPreviewInvalid ? '持仓数量、方向或账户已变化，请关闭并重新预览。' : undefined} close={() => setPreview(null)} confirm={() => void confirmOrder()}/>}
   {cancelOrder && <CancelReview order={cancelOrder} busy={busy} disabled={tradingDisabled} close={() => setCancelOrder(null)} confirm={() => void confirmCancel()}/>}
   </div>;
 }

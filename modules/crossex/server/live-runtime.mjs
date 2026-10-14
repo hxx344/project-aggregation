@@ -4,6 +4,7 @@ import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
 import { isBaseBlocked } from '../../../server/asset-identity.mjs';
+import { bindPositionAction, positionKey, positionDirection, validatePositionLegs } from './position-actions.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
 const ACTIVE = new Set(['NEW', 'OPEN', 'PARTIALLY_FILLED']);
@@ -17,7 +18,7 @@ const positive = value => numeric(value)?.gt(0) === true;
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const requestKey = value => { if (typeof value !== 'string' || !/^[A-Za-z0-9_.:-]{8,128}$/.test(value)) fail('请求标识无效，请刷新页面重试', 400); return value; };
 const exchangeOf = symbol => String(symbol || '').split('_')[0].toLowerCase();
-const positionKey = p => p.position_id ? String(p.position_id) : `${p.symbol}:${p.position_side}`;
+const increasingLegs = plan => plan.kind === 'open' ? plan.legs : plan.kind === 'position' ? plan.legs.filter(leg => !leg.reduceOnly) : [];
 const credentialError = () => new AppError('账户验证未完成，请核对 API 凭据和 CrossEx 读取权限', 400);
 
 /** Private reads are automatic. Every exchange write requires a fresh manual API action. */
@@ -313,7 +314,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function checkPositionLimit(plan, cache) {
     const held = cache.positions.filter(p => !D(p.position_qty).isZero());
-    if (Number.isFinite(plan.limits?.maxOpen) && held.length + plan.legs.length > plan.limits.maxOpen * 2) fail('实际持仓数量已达到上限');
+    if (Number.isFinite(plan.limits?.maxOpen) && held.length + (plan.kind === 'position' ? 0 : plan.legs.length) > plan.limits.maxOpen * 2) fail('实际持仓数量已达到上限');
   }
   function checkCooldown(plan) {
     const cooldown = Number(plan.limits?.cooldownSeconds || 0) * 1000;
@@ -336,24 +337,24 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return total;
   }
   async function validateLimits(plan, cache) {
-    if (plan.kind !== 'open') return;
+    const additions = increasingLegs(plan);
+    if (!additions.length) return;
     checkPositionLimit(plan, cache);
     let total = await positionsNotional(cache);
-    for (const leg of plan.legs) { if (!positive(leg.notionalUSDT)) fail('订单名义额无效'); total = total.plus(leg.notionalUSDT); }
+    // Reductions are not filled yet: do not spend their anticipated released capacity.
+    for (const leg of additions) { if (!positive(leg.notionalUSDT)) fail('订单名义额无效'); total = total.plus(leg.notionalUSDT); }
     if (!positive(plan.limits?.maxTotalNotional) || total.gt(plan.limits.maxTotalNotional)) fail('订单超过账户总名义额上限');
     checkCooldown(plan);
   }
   function checkConflicts(plan, cache) {
     if (activeOrders().some(o => ['UNKNOWN', 'INVALID', 'SENDING', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state))) fail('存在未知或待确认订单，暂停新的交易');
-    if (plan.kind === 'open' && (activeOrders().length || cache.openOrders.some(o => !TERMINAL.has(o.state)))) fail('账户仍有活动委托，请先核实或撤销挂单后再新开仓');
+    if (['open', 'position'].includes(plan.kind) && (activeOrders().length || cache.openOrders.some(o => !TERMINAL.has(o.state)))) fail('账户仍有活动委托，请先核实或撤销挂单后再调整仓位');
     const symbols = new Set(plan.legs.map(l => l.symbol));
     if (activeOrders().some(o => symbols.has(o.symbol)) || cache.openOrders.some(o => symbols.has(o.symbol) && !TERMINAL.has(o.state))) fail('同一合约已有挂单，请先核实或手动撤单');
     if (plan.kind === 'open' && cache.positions.some(p => symbols.has(p.symbol) && !D(p.position_qty).isZero())) fail('同一合约已有实际持仓，请先管理现有敞口');
   }
   function direction(p, mode = cacheRecord().account?.position_mode) {
-    if (['LONG', 'SHORT'].includes(p.position_side)) return p.position_side;
-    if (mode === 'SINGLE' && p.position_side === 'NONE' && numeric(p.position_qty) && !D(p.position_qty).isZero()) return D(p.position_qty).gt(0) ? 'LONG' : 'SHORT';
-    return null;
+    return positionDirection(p, mode);
   }
   // Capacity reads do not enter the execution queue. Capture balances as well as
   // positions/orders: the preview fingerprint deliberately excludes balances.
@@ -436,8 +437,9 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return bounded(pending, capacityTimeoutMs).catch(() => capacityResult(request, clock(), version, 'unavailable', '容量读取超时，请稍后重试'));
   }
   async function riskPreview(plan, record, cache) {
-    if (plan.kind !== 'open') return null;
-    const client = getClient(record), symbols = [...new Set(plan.legs.map(l => l.symbol))];
+    const additions = increasingLegs(plan);
+    if (!additions.length) return null;
+    const client = getClient(record), symbols = [...new Set(additions.map(l => l.symbol))];
     if (typeof client.getLeverages !== 'function' || typeof client.getRiskLimits !== 'function') fail('缺少杠杆或风险档位读取能力，暂不能新开仓');
     try {
       const [leverageRows, limits] = await Promise.all([
@@ -445,7 +447,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       ]);
       if (!Array.isArray(limits)) throw new Error('INVALID_RISK_LIMITS');
       const leverages = Object.assign({}, ...leverageRows), requirements = new Map();
-      const legs = plan.legs.map(leg => {
+      const legs = additions.map(leg => {
         const leverage = numeric(leverages[leg.symbol]);
         if (!leverage?.gt(0) || !positive(leg.notionalUSDT)) throw new Error('LEVERAGE_UNKNOWN');
         const eligible = (limits.find(r => r.symbol === leg.symbol)?.tiers || []).filter(tier => numeric(tier.leverage_max)?.gte(leverage) && positive(tier.max_risk_limit_value));
@@ -495,7 +497,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   async function previewInternal(input) {
     assertOwner();
-    if (!object(input) || !['open', 'close'].includes(input.kind)) fail('预览类型无效', 400);
+    if (!object(input) || !['open', 'close', 'position'].includes(input.kind)) fail('预览类型无效', 400);
     await refreshInternal({ includeView: false });
     const { record, cache } = freshCache();
     let plan;
@@ -503,6 +505,11 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (input.kind === 'open') {
       if ([input.order, input.pair, input.signalId].filter(v => v !== undefined).length !== 1) fail('请选择一种开仓方式', 400);
       plan = input.order !== undefined ? await market.previewDirect(input.order) : input.pair !== undefined ? await market.previewPair(input.pair) : await market.previewOpen(input.signalId);
+    } else if (input.kind === 'position') {
+      const binding = bindPositionAction(input, cache, record.version);
+      plan = await market.previewPosition({ ...binding, action: input.action, strategy: input.strategy });
+      plan.positionRequest = copy(input);
+      selected.push(...binding.positions);
     } else {
       const selections = input.positions === undefined ? [{ positionId: input.positionId, quantity: input.quantity, positionSide: input.positionSide }] : input.positions;
       if (!Array.isArray(selections) || !selections.length || selections.length > 16 || new Set(selections.map(s => s?.positionId)).size !== selections.length) fail('请选择 1–16 个不同的真实持仓', 400);
@@ -527,18 +534,20 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!Array.isArray(plan.legs) || !plan.legs.length || plan.legs.length > (input.kind === 'close' ? 16 : 2)) fail('交易计划不完整');
     for (const leg of plan.legs) {
       if (!positive(leg.quantity) || !positive(leg.price) || !['BUY', 'SELL'].includes(leg.side) || !['LONG', 'SHORT'].includes(leg.positionSide)) fail('订单数量、价格或方向无效');
-      leg.orderType ||= 'LIMIT'; leg.timeInForce ||= 'IOC'; leg.reduceOnly = input.kind === 'close';
+      leg.orderType ||= 'LIMIT'; leg.timeInForce ||= 'IOC';
+      if (input.kind !== 'position') leg.reduceOnly = input.kind === 'close';
       if (!['LIMIT', 'MARKET'].includes(leg.orderType) || !['GTC', 'IOC', 'FOK', 'POC'].includes(leg.timeInForce)) fail('订单类型或生效方式无效');
       if (input.kind === 'open' && plan.legs.length === 2 && (leg.orderType !== 'LIMIT' || leg.timeInForce !== 'IOC')) fail('双腿开仓必须使用保护限价 IOC');
       if (cache.account.position_mode === 'SINGLE') leg.positionSide = 'NONE';
     }
+    if (input.kind === 'position') validatePositionLegs(plan, { positions: selected }, cache.account.position_mode);
     checkConflicts(plan, cache); await validateLimits(plan, cache);
     const risk = await riskPreview(plan, record, cache);
     const preview = { ...plan, id: id(), createdAt: clock(), expiresAt: Math.min(plan.expiresAt || Infinity, clock() + 30000),
       connectionVersion: record.version, accountUid: record.accountUid, accountFingerprint: accountFingerprint(cache), configFingerprint: configFingerprint(), positionId: selected.length === 1 ? selected[0].positionId : null,
       selectedPositionSide: selected.length === 1 ? selected[0].positionSide : null, positions: selected, risk, feeEstimate: feeEstimate(plan, record.version), canConfirm: true,
       warnings: [...(plan.warnings || []), '这是实盘订单，交易权限未能预先核实，最终由 Gate 校验',
-        ...(selected.some(p => p.directionSource === 'quantity_sign') ? ['单向净仓方向按持仓数量符号推导；所有平仓单仅减仓，不跨过零仓位'] : []),
+        ...(selected.some(p => p.directionSource === 'quantity_sign') ? ['单向净仓方向按持仓数量符号推导；减仓单仅减少持仓，不跨过零仓位'] : []),
         ...(input.kind === 'open' && plan.legs.length === 2 ? ['两腿依次提交；第一腿未在本次确认中全成则不发送第二腿，可能留下单边敞口，需手动处理'] : []),
         ...(input.kind === 'close' && plan.legs.length > 1 ? ['所选持仓分别提交一次减仓单；其中一腿未成交时，其他腿仍按本次确认提交，不自动补单'] : [])] };
     store.prepare('INSERT INTO live_previews(id,expires_at,json) VALUES (?,?,?)').run(preview.id, preview.expiresAt, JSON.stringify(preview));
@@ -563,19 +572,21 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const { record, cache } = freshCache();
     if (record.version !== plan.connectionVersion || record.accountUid !== plan.accountUid || accountFingerprint(cache) !== plan.accountFingerprint || configFingerprint() !== plan.configFingerprint) fail('账户、持仓或设置已变化，请重新预览');
     if (record.tradePermission === 'denied') fail('此凭据没有交易权限');
+    if (plan.kind === 'position') validatePositionLegs(plan, bindPositionAction(plan.positionRequest, cache, record.version), cache.account.position_mode);
     checkConflicts(plan, cache);
     // Market refreshes valuation without changing the user's quantity or order price.
     // Every financial check must run afterwards; otherwise it would use stale amounts.
-    await withinDeadline(() => plan.kind === 'open' ? market.revalidateOpen(plan) : market.revalidateClose(plan), deadline);
+    await withinDeadline(() => plan.kind === 'open' ? market.revalidateOpen(plan) : plan.kind === 'position' ? market.revalidatePosition(plan) : market.revalidateClose(plan), deadline);
+    if (plan.kind === 'position') validatePositionLegs(plan, bindPositionAction(plan.positionRequest, cache, record.version), cache.account.position_mode);
     await withinDeadline(() => validateLimits(plan, cache), deadline);
     const currentRisk = await withinDeadline(() => riskPreview(plan, record, cache), deadline);
     if (currentRisk && plan.risk && hash(currentRisk.legs.map(l => [l.symbol, l.leverage])) !== hash(plan.risk.legs.map(l => [l.symbol, l.leverage]))) fail('账户杠杆已变化，请重新预览');
     assertOwner();
     if (remaining(deadline) <= 0 || clock() >= plan.expiresAt || connectionRecord()?.version !== record.version || configFingerprint() !== plan.configFingerprint) fail('预览或连接已变化，请重新预览');
-    const execution = { id: id(), requestId, previewId: plan.id, kind: plan.kind, base: plan.base, accountUid: record.accountUid, connectionVersion: record.version, createdAt: clock(), updatedAt: clock() };
+    const execution = { id: id(), requestId, previewId: plan.id, kind: plan.kind, ...(plan.kind === 'position' ? { action: plan.action, strategy: plan.strategy, targetQuantity: plan.targetQuantity } : {}), base: plan.base, accountUid: record.accountUid, connectionVersion: record.version, createdAt: clock(), updatedAt: clock() };
     const legs = plan.legs.map((leg, index) => ({ id: id(), executionId: execution.id, index, text: `cx-${id()}`, version: record.version, status: 'PREPARED',
       symbol: leg.symbol, exchange: leg.exchange, side: leg.side, positionSide: leg.positionSide, quantity: D(leg.quantity).toString(), price: D(leg.price).toString(),
-      reduceOnly: plan.kind === 'close', orderType: leg.orderType || 'LIMIT', timeInForce: leg.timeInForce || 'IOC', executedQty: '0', orderId: null, createdAt: clock(), updatedAt: clock(), error: null }));
+      reduceOnly: plan.kind === 'position' ? leg.reduceOnly : plan.kind === 'close', orderType: leg.orderType || 'LIMIT', timeInForce: leg.timeInForce || 'IOC', executedQty: '0', orderId: null, createdAt: clock(), updatedAt: clock(), error: null }));
     store.transaction(() => {
       store.prepare('UPDATE live_previews SET consumed=1 WHERE id=?').run(plan.id);
       store.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(execution.id, plan.id, clock(), JSON.stringify(execution));
@@ -585,9 +596,9 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const client = getClient(record);
     const confirmationStarted = performance.now();
     for (const [index, order] of legs.entries()) {
-      const legStarted = performance.now(), legPollMs = plan.kind === 'open' && legs.length > 1 ? confirmationPollMs : Math.min(confirmationPollMs, legs.length > 1 ? 1000 : 1500);
+      const legStarted = performance.now(), legPollMs = ['open', 'position'].includes(plan.kind) && legs.length > 1 ? confirmationPollMs : Math.min(confirmationPollMs, legs.length > 1 ? 1000 : 1500);
       const currentConnection = connectionRecord();
-      if (plan.kind === 'open' && index && legs[index - 1].status !== 'FILLED' || remaining(deadline) <= 0 || clock() >= plan.expiresAt || !owns()
+      if (['open', 'position'].includes(plan.kind) && index && legs[index - 1].status !== 'FILLED' || remaining(deadline) <= 0 || clock() >= plan.expiresAt || !owns()
         || !currentConnection?.enabled || currentConnection.version !== record.version || currentConnection.accountUid !== record.accountUid || configFingerprint() !== plan.configFingerprint) {
         if (owns()) { order.status = 'UNSENT'; order.error = '前腿未全成、确认超时或设置/连接已变化，此腿没有发送；请管理实际敞口'; writeOrder(order); } continue;
       }

@@ -12,15 +12,20 @@ import { PositionMetricsSummary, PositionMetricsDetails } from './PositionMetric
 import { positionHistorySamples, updatePositionHistory } from './position-history';
 import type { PositionHistoryState } from './position-history';
 import { time, venue } from './display';
+import PositionActionDialog from './PositionActionDialog';
+import type { PositionActionProps, PositionActionSelection } from './PositionActionDialog';
+import { legQuantityDiff } from './position-actions';
 
-export default function PositionsPanel({ live, instruments, disabled, close, now, fundingOpportunities, positionFundingRates, marketStale }: {
+export default function PositionsPanel({ live, instruments, disabled, close, now, fundingOpportunities, positionFundingRates, marketStale, ...actionProps }: PositionActionProps & {
   live: LiveView; instruments: Instrument[]; disabled: boolean; close: (positions: CloseLeg[]) => Promise<boolean>;
   now: number; positionFundingRates?: PositionFundingRate[]; fundingOpportunities: FundingOpportunity[]; marketStale: boolean;
 }) {
   const [search, setSearch] = useState(''), [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [closing, setClosing] = useState<LivePosition[] | null>(null), [page, setPage] = useState(0);
+  const [action, setAction] = useState<PositionActionSelection | null>(null);
   const stale = live.stale || !live.connection.connected || !live.asOf || now - live.asOf > 15_000 || live.asOf > now + 1000;
   const scope = JSON.stringify([live.connection.accountId, live.connection.version]);
+  useEffect(() => { setClosing(null); }, [scope]);
   const allGroups = useMemo(() => groupPositions(live.positions, { now, fundingOpportunities, positionFundingRates, marketStale, stale, partial: live.partial }), [live.positions, now, fundingOpportunities, positionFundingRates, marketStale, stale, live.partial]);
   const groups = useMemo(() => allGroups.filter(group => `${group.base} ${group.legs.map(p => p.exchange + ' ' + p.symbol).join(' ')}`.toUpperCase().includes(search.trim().toUpperCase())), [allGroups, search]);
   const [history, setHistory] = useState<PositionHistoryState | null>(null);
@@ -29,6 +34,7 @@ export default function PositionsPanel({ live, instruments, disabled, close, now
   }, [allGroups, scope, live.asOf, now, stale, live.partial]);
   const pages = Math.max(1, Math.ceil(groups.length / 20)), shownPage = Math.min(page, pages - 1), shown = groups.slice(shownPage * 20, (shownPage + 1) * 20);
   const toggle = (base: string) => setExpanded(previous => { const next = new Set(previous); if (next.has(base)) next.delete(base); else next.add(base); return next; });
+  const actionDisabled = disabled || stale || live.partial || !!closing || !!action;
   return <section className="panel positions-panel">
     <div className="section-heading"><div><h2>持仓组合 <span className="count">{groups.length}</span></h2><p>{live.positions.length} 条真实持仓腿 · 点击币种展开价差、资金费与单腿风险</p></div><label className="search-field"><Search size={14}/><input aria-label="搜索持仓币种或交易所" placeholder="搜索币种 / 交易所" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}/></label></div>
     {live.partial && <p className="inline-state warning">持仓数据不完整，保留已知仓位；汇总可能不完整，暂不可交易。</p>}
@@ -38,7 +44,7 @@ export default function PositionsPanel({ live, instruments, disabled, close, now
       </button><div data-label="净数量 / 总名义额"><strong className={amountClass(group.net)}><DecimalValue value={group.net} signed/> <small>{group.base}</small></strong><NativeValues values={group.notional}/></div>
       <div data-label="加权开仓 / 标记价"><strong><DecimalValue value={group.entry?.value} kind="price"/> <small>{group.entry?.currency}</small></strong><small><DecimalValue value={group.mark?.value} kind="price"/> {group.mark?.currency}</small></div>
       <div data-label="未实现盈亏"><NativeValues values={group.pnl} signed/></div><div data-label="已实现 / 资金费"><NativeValues values={group.realized} signed/><NativeValues values={group.funding} signed subtle/></div>
-      <div className="group-actions"><button className="danger-quiet" disabled={disabled || group.legs.length > 16} onClick={() => setClosing(group.legs)}>平仓组合</button>{group.legs.length > 16 && <small>每次最多 16 腿，请逐腿操作</small>}</div></div>
+      <div className="group-actions"><button className="danger-quiet" disabled={disabled || !!action || group.legs.length > 16} onClick={() => setClosing(group.legs)}>平仓组合</button><button className="primary-quiet" aria-label={`${group.base} 加仓`} title={!group.metrics.applicable ? '加仓需要严格等量且有效的双腿组合' : actionProps.entryPaused ? '新开仓已暂停' : actionProps.catalogError || '双腿等量加仓'} disabled={actionDisabled || actionProps.entryPaused || !!actionProps.catalogError || !group.metrics.applicable || !legQuantityDiff(group.legs).equal} onClick={() => setAction({ action: 'add', group, connectionVersion: live.connection.version, accountId: live.connection.accountId })}>加仓</button><button className="secondary-quiet" aria-label={`${group.base} 平衡双腿`} title={legQuantityDiff(group.legs).problem || '数量差异超过双腿均值的 0.1% 时可平衡'} disabled={actionDisabled || !legQuantityDiff(group.legs).needsBalance} onClick={() => setAction({ action: 'balance', group, connectionVersion: live.connection.version, accountId: live.connection.accountId })}>平衡双腿</button>{group.legs.length > 16 && <small>每次最多 16 腿，请逐腿操作</small>}</div></div>
       <PositionMetricsSummary group={group} stale={stale || live.partial}/>
       {expanded.has(group.base) && <PositionMetricsDetails group={group} now={now} samples={positionHistorySamples(history, group, scope)} stale={stale || live.partial}/>}
       {expanded.has(group.base) && <div className="position-leg-list">{group.legs.map(p => <div className="position-leg" key={p.id}><div className="leg-identity"><span className={'side-badge ' + p.side.toLowerCase()}>{sideLabel(p.side)}</span><strong>{venue(p.exchange)}</strong><span>{p.symbol}</span><span className="muted"><DecimalValue value={p.leverage} kind="rate"/>×</span><button className="danger-quiet" disabled={disabled} onClick={() => setClosing([p])}>平此腿</button></div>
@@ -47,6 +53,7 @@ export default function PositionsPanel({ live, instruments, disabled, close, now
     </article>)}</div> : <div className="empty"><Layers3 size={28}/><h3>{search ? '没有匹配的持仓' : !live.connection.configured ? '连接账户后查看持仓组合' : live.stale || live.partial ? '持仓数据尚未完整读取' : '当前没有持仓'}</h3><p>同币种仓位按交易所分组，已有仓位会在账户同步后显示。</p></div>}
     <div className="table-footer"><span>同基础币汇总净数量；金额按原币种汇总，缺失值显示「—」。</span><div><button disabled={shownPage === 0} onClick={() => setPage(shownPage - 1)}>上一页</button><span>{shownPage + 1} / {pages}</span><button disabled={shownPage + 1 >= pages} onClick={() => setPage(shownPage + 1)}>下一页</button></div></div>
     {closing && <ClosePositionDialog key={closing.map(p => p.id).join(':')} positions={closing} instruments={instruments} disabled={disabled} dismiss={() => setClosing(null)} preview={async legs => { if (await close(legs)) setClosing(null); }}/>}
+    {action && <PositionActionDialog selection={action} live={live} instruments={instruments} disabled={disabled || stale || live.partial} {...actionProps} dismiss={() => setAction(null)}/>}
   </section>;
 }
 

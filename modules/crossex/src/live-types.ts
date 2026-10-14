@@ -22,14 +22,16 @@ export type LiveOrder = {
 };
 export type LiveExecution = {
   id: string; requestId?: string; kind: string; state: string; createdAt?: number; updatedAt?: number;
+  action?: 'add' | 'balance'; strategy?: 'reduce' | 'increase' | 'target'; targetQuantity?: string;
   error?: string; legs: { exchange?: string; symbol?: string; side?: string; state?: string; status?: string; orderId?: string; quantity?: string; filledQuantity?: string | null; error?: string }[];
 };
 export type LivePreview = {
-  id: string; kind: 'open' | 'close'; createdAt: number; expiresAt: number; connectionVersion: string | number;
+  id: string; kind: 'open' | 'close' | 'position'; createdAt: number; expiresAt: number; connectionVersion: string | number;
+  action?: 'add' | 'balance'; strategy?: 'reduce' | 'increase' | 'target'; targetQuantity?: string;
   accountUid: string | null; warnings: string[]; canConfirm: boolean; source?: string;
   risk?: { requiredMargin: string; availableMargin: string; marginCurrency: string; reserveFactor: string; accountMode?: string; asOf?: number; legs: { symbol: string; leverage: string; requiredMargin: string; maxPositionNotional: string; projectedNotional: string; quoteCurrency: string }[] } | null;
   feeEstimate?: { asOf: number | null; error?: string | null; legs: { symbol: string; makerRate: string | null; takerRate: string | null; assumedRate: string | null; estimatedFee: string | null; currency: string; source: string }[] } | null;
-  legs: { exchange: string; symbol: string; side: string; positionSide: string; quantity: string; price?: string | null; referencePrice?: string | null; notionalUSDT?: string | null; singleLegBudgetUSDT?: string; budgetPrice?: string; budgetFxRate?: string; orderType: string; timeInForce: string; reduceOnly: boolean; base?: string; baseCurrency?: string; quoteCurrency?: string }[];
+  legs: { exchange: string; symbol: string; side: string; positionSide: string; quantity: string; heldQuantity?: string; targetQuantity?: string; price?: string | null; referencePrice?: string | null; notionalUSDT?: string | null; singleLegBudgetUSDT?: string; budgetPrice?: string; budgetFxRate?: string; orderType: string; timeInForce: string; reduceOnly: boolean; base?: string; baseCurrency?: string; quoteCurrency?: string }[];
 };
 export type LiveView = {
   connection: {
@@ -53,10 +55,13 @@ export type LiveState = Pick<State, 'now' | 'csrfToken' | 'venues' | 'fx' | 'sou
 export type LiveBootstrap = { now: number; config: LiveConfig; connection: LiveView['connection']; csrfToken: string };
 
 export type CloseLeg = { positionId: string; quantity?: string; positionSide?: 'LONG' | 'SHORT' };
+export type PositionActionInput = { kind: 'position'; action: 'add' | 'balance'; connectionVersion: string | number;
+  positions: { positionId: string; expectedQuantity: string; expectedSide: 'LONG' | 'SHORT' }[];
+  quantity?: string; strategy?: 'reduce' | 'increase' | 'target'; targetQuantity?: string };
 export type PreviewInput = { kind: 'open'; signalId: string }
   | { kind: 'open'; order: { symbol: string; side: 'BUY' | 'SELL'; quantity: string; orderType: 'LIMIT' | 'MARKET'; price?: string; timeInForce: 'GTC' | 'IOC' | 'FOK' | 'POC' } }
   | { kind: 'open'; pair: { longSymbol: string; shortSymbol: string; quantity: string } }
-  | ({ kind: 'close' } & CloseLeg) | { kind: 'close'; positions: CloseLeg[] };
+  | ({ kind: 'close' } & CloseLeg) | { kind: 'close'; positions: CloseLeg[] } | PositionActionInput;
 
 export type Instrument = {
   symbol: string; exchange: string; base: string; quoteCurrency: string; settlementCurrency: string;

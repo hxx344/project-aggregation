@@ -1,0 +1,19 @@
+.position-action-dialog{width:min(790px,calc(100vw - 36px))}
+.position-action-dialog .dialog-content{display:grid;gap:18px;min-width:0}
+.position-action-current,.position-action-input,.position-action-estimates{display:grid;gap:12px;min-width:0}
+.position-action-current .review-legs{margin:0}.position-action-current .review-leg{min-width:0;overflow-wrap:anywhere}
+.position-action-current .review-leg p{font-size:10px;margin-bottom:12px;overflow-wrap:anywhere}
+.position-action-dialog .review-leg dd{text-align:right}.position-action-dialog .ticket-details{min-width:0}
+.position-action-dialog .ticket-details dd{text-align:right;overflow-wrap:anywhere;min-width:0}
+.position-input-modes{display:flex;gap:7px}.position-input-modes button[aria-pressed=true]{color:var(--accent);border-color:var(--accent)}
+.position-action-dialog .percentage-controls{margin:0}.position-action-dialog p{font-size:12px}
+.position-quantity-comparison{display:grid;gap:12px}.position-quantity-comparison>div>div:first-child{display:flex;flex-wrap:wrap;justify-content:space-between;gap:7px;font-size:12px;margin-bottom:6px}
+.position-quantity-track{height:8px;background:var(--surface-3);border-radius:4px;overflow:hidden}.position-quantity-track>span{display:block;height:100%;background:var(--accent);border-radius:4px;max-width:100%}
+.position-quantity-comparison>div:nth-child(2) .position-quantity-track>span{background:var(--amber)}
+.position-strategies{border:1px solid var(--line);border-radius:6px;padding:12px;margin:0;display:grid;gap:12px;min-width:0}
+.position-strategies legend{padding:0 5px;color:var(--text-secondary)}.position-strategies label{display:flex;align-items:center;gap:10px}
+.position-strategies input{width:15px;height:15px;flex:0 0 15px;accent-color:var(--accent);padding:0}.position-strategies label>span{display:grid;gap:4px}
+.position-estimate-leg{border:1px solid var(--line);border-radius:6px;padding:13px;display:grid;gap:12px;min-width:0}
+.position-estimate-leg>strong{font-size:12px}.position-action-dialog .muted{font-size:11px}
+.group-actions .primary-quiet{color:var(--accent);border-color:#315948;background:#10271f}.group-actions .secondary-quiet{font-size:12px}
+@media(max-width:600px){.position-action-dialog{width:calc(100vw - 22px)}.position-action-dialog .dialog-content{gap:16px}.position-action-dialog .ticket-details>div{align-items:flex-start;gap:10px}.position-action-dialog .ticket-details dd{max-width:58%}.position-action-current .review-legs{grid-template-columns:1fr}.group-row>.group-actions{display:flex;flex-wrap:wrap;gap:7px}.group-row>.group-actions button{width:auto;flex:1}.group-row>.group-actions small{flex-basis:100%}}

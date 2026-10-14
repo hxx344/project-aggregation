@@ -384,6 +384,34 @@
 
 **事件记录：** `updater-github-token-20261014`；Seen 1×（2026-10-14）。关联 L013，不合并为同一事件。
 
+### L027：持仓配对核对 CrossEx 合约计价字段
+
+**适用条件：** 真实持仓通过 CrossEx 合约代码配对，再解析原生交易所报价身份；尤其报价币与合约结算币不同的已支持合约。
+
+**根因：** 原生身份的 `quoteCurrency` 不一定等于 CrossEx 合约后缀。Hyperliquid BTC 的已验证身份使用 USDT 报价、USDC 合约计价与结算；与 Bybit BTC USDC 持仓比较原生 `quoteCurrency`，会误拒绝原本可配对的持仓。
+
+**以后做法：** 区分原生报价币、CrossEx `counterCurrency` 与结算币。已有持仓的同计价检查使用已验证的 CrossEx 合约身份，并继续执行 `validManualPair`；不能删除身份校验或假设所有币种字段可互换。
+
+**证据：** 本仓基于 `25b2883d` 的 2026-10-14 持仓操作开发工作区，独立审查用真实 `bindPositionAction` 和 `createMarket` 复现：`HYPERLIQUID_FUTURE_BTC_USDC` 与 `BYBIT_FUTURE_BTC_USDC` 均通过身份与双腿校验，但新增比较原生报价币的条件拒绝加仓。错误条件在首次提交前修复；基线不包含新持仓操作。相关路径：[身份解析](modules/crossex/server/clients.mjs)、[持仓市场预览](modules/crossex/server/market.mjs)。
+
+**如何验证：** [持仓操作集成测试](modules/crossex/tests/position-actions-runtime.test.mjs) 使用上述不同原生报价币、相同 CrossEx USDC 合约的组合，验证预览与确认；继续拒绝真实 CrossEx 计价不同或身份不匹配的组合。无需扩大到无关交易所接口回归。
+
+**事件记录：** `crossex-position-counter-currency-20261014`；一次已核实的提交前审查发现，不推进主线复盘检查点。
+
+### L028：移除账户组件重建时保留旧操作状态的失效边界
+
+**适用条件：** 移除由账户或连接版本决定的 React `key`，以保留新功能对话框或页面状态。
+
+**根因：** 原组件依靠重建清理旧账户的操作选择。去掉 `key` 后，只给新增对话框做快照失效处理，会留下既有平仓等对话框继续使用旧选择。
+
+**以后做法：** 核对组件内全部操作状态的账户作用域；账户或连接版本变化时，清除不再适用的旧选择，或显式禁用并要求重新预览。保留只读页面状态不代表保留交易意图。
+
+**证据：** 本仓基于 `25b2883d` 的 2026-10-14 持仓操作开发工作区，[PortfolioPanel](modules/crossex/src/PortfolioPanel.tsx) 移除连接版本 `key` 后，浏览器夹具切换连接版本，旧平仓弹窗仍保留。修复在 [PositionsPanel](modules/crossex/src/PositionsPanel.tsx) 的账户作用域变化时清除 `closing`；同一用例在修复前构建失败、修复后通过。此为首次提交前的局部回归，最终订单仍有服务端预览和人工确认，并非鉴权绕过。
+
+**如何验证：** [持仓操作浏览器验收](tests/crossex-position-actions.browser.mjs) 覆盖旧平仓选择清除，以及新增对话框和确认页的持仓快照失效。
+
+**事件记录：** `crossex-position-dialog-account-scope-20261014`；一次已核实的提交前审查发现。
+
 ## Moved to the code standards
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目归档到本节，保留证据与规范链接；不按重复复盘次数自动升级。
