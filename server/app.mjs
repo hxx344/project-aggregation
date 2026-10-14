@@ -383,6 +383,26 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         if (req.headers.origin) sameOrigin(req);
         updateStream.subscribe(res, current.id); return;
       }
+      if (pathname === '/api/system/updates/progress' && req.method === 'GET') {
+        if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台订阅进度');
+        if (req.headers.origin) sameOrigin(req);
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+        const { streamProgress } = await import('./update-service/progress.py');
+        try {
+          for await (const chunk of streamProgress()) {
+            res.write(chunk);
+          }
+        } catch (error) {
+          log.error({ err: error }, '进度流推送失败');
+        } finally {
+          res.end();
+        }
+        return;
+      }
       const action = pathname === '/api/system/updates/check' ? 'check' : pathname === '/api/system/updates/apply' ? 'apply' : pathname === '/api/system/updates/token' ? 'token' : null;
       if (action && req.method === 'POST') {
         const body = await bodyOf(req); validateUpdateBody(action, body);

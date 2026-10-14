@@ -651,11 +651,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
         self.close_connection = True
 
+    def stream_progress(self):
+        """Stream download progress via Server-Sent Events."""
+        from progress import stream_progress
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.end_headers()
+
+        try:
+            for chunk in stream_progress():
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected
+
     def dispatch(self):
         try:
             self.connection.settimeout(5)
             if self.command == 'GET' and self.path == '/status':
                 self.answer(200, self.server.coordinator.status())
+                return
+            if self.command == 'GET' and self.path == '/progress':
+                self.connection.settimeout(None)  # SSE needs long timeout
+                self.stream_progress()
                 return
             if self.command != 'POST' or self.path not in ('/check', '/apply', '/token'):
                 raise UpdateError(404, '更新接口不存在')

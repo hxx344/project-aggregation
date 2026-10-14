@@ -38,3 +38,30 @@ export type UpdateState = {
   modules: UpdateModule[];
   job: UpdateJob | null;
 };
+
+export type UpdateStage =
+  | 'preflight'
+  | 'download'
+  | 'verify'
+  | 'extract'
+  | 'switch';
+
+export interface UpdateProgress {
+  stage: UpdateStage;
+  progress: number;  // 0-1
+  downloaded?: number;
+  total?: number;
+  speed?: number;  // bytes/sec
+  eta?: number;  // seconds
+  error?: string;
+  timestamp: number;
+}
+
+export interface CombinedProgress {
+  overall: number;  // 0-1, combined progress
+  stage: UpdateStage;
+  stageProgress: number;  // progress within current stage
+  message: string;
+  speed?: string;
+  eta?: string;
+}

@@ -97,6 +97,17 @@
 .update-steps p{margin-top:3px;font-size:.75rem;line-height:1.65;overflow-wrap:anywhere;color:var(--text-secondary)}
 .update-steps>li>span:last-child{white-space:nowrap;padding-top:1px}
 
+.download-progress{margin-bottom:22px;padding:20px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-1)}
+.download-progress-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.download-progress-message{font-size:.875rem;font-weight:500;color:var(--text-primary)}
+.download-progress-speed{font-size:.8125rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.download-progress-bar-container{height:6px;background:var(--surface-2);border-radius:999px;overflow:hidden;margin-bottom:8px}
+.download-progress-bar-fill{height:100%;background:var(--accent);border-radius:999px;transition:width .3s ease-out}
+.download-progress-footer{display:flex;align-items:center;justify-content:space-between}
+.download-progress-percent{font-size:.8125rem;font-weight:500;color:var(--text-primary);font-variant-numeric:tabular-nums}
+.download-progress-eta{font-size:.75rem;color:var(--text-secondary)}
+
+
 .update-progress-note{display:block;font-size:.75rem;color:var(--text-tertiary);margin-top:12px;line-height:1.65}
 
 .update-review{scroll-margin-block:8px;border:1px solid var(--accent);background:var(--accent-subtle);padding:15px 17px;border-radius:var(--radius-md);margin-top:18px;color:var(--accent)}

@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowRight, Check, ChevronRight, CircleAlert, Download, LoaderCircle, RefreshCw, X } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { UpdateJob, UpdateModule, UpdateState } from './update-types';
+import type { UpdateJob, UpdateModule, UpdateState, UpdateProgress, CombinedProgress } from './update-types';
+import { calculateCombinedProgress } from './update-progress';
 import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
@@ -47,6 +48,35 @@ function JobProgress({ job, modules }: { job: UpdateJob; modules: UpdateModule[]
   return <section className={`update-progress ${job.status}`} aria-labelledby="update-progress-title"><div className="update-progress-heading"><h3 id="update-progress-title">{running(job) ? <LoaderCircle size={18} className="spin" /> : job.status === 'succeeded' ? <Check size={18} /> : <CircleAlert size={18} />}{jobLabels[job.status]}</h3><span>{dateTime(job.finishedAt || job.startedAt)}</span></div><p role="status">{job.message || (running(job) && activeName ? `正在处理${activeName}` : unfinished(job) ? hasFailedSteps ? '上次任务有步骤未完成，请查看服务器部署日志。' : '上次任务未完成全部安装与检查。' : '进度会自动更新。')}</p>{unfinished(job) ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方“本机模块”。</p> : null}{job.steps.length ? <ol className="update-steps" aria-label="更新进度">{job.steps.map(step => <li className={step.status} key={step.id}><span className="update-step-mark" aria-hidden="true">{step.status === 'running' ? <LoaderCircle size={15} className="spin" /> : step.status === 'succeeded' ? <Check size={14} /> : step.status === 'failed' ? <X size={14} /> : <span />}</span><div><strong>{step.name}</strong>{step.message ? <p>{step.message}</p> : null}</div><span>{stepLabels[step.status]}</span></li>)}</ol> : null}{running(job) ? <small className="update-progress-note">可以关闭此面板；更新会继续，重新打开即可查看进度。</small> : null}</section>;
 }
 
+function DownloadProgress({ progress }: { progress: CombinedProgress }) {
+  return (
+    <div className="download-progress">
+      <div className="download-progress-header">
+        <span className="download-progress-message">{progress.message}</span>
+        {progress.speed && (
+          <span className="download-progress-speed">{progress.speed}</span>
+        )}
+      </div>
+
+      <div className="download-progress-bar-container">
+        <div
+          className="download-progress-bar-fill"
+          style={{ width: `${progress.overall * 100}%` }}
+        />
+      </div>
+
+      <div className="download-progress-footer">
+        <span className="download-progress-percent">
+          {Math.round(progress.overall * 100)}%
+        </span>
+        {progress.eta && (
+          <span className="download-progress-eta">剩余约 {progress.eta}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onOpen?: () => void }) {
   const [snapshot, setSnapshot] = useState<UpdateState | null>(null);
   const [unavailable, setUnavailable] = useState(false);
@@ -62,6 +92,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const [uncertain, setUncertain] = useState(false);
   const [open, setOpen] = useState(false);
   const [review, setReview] = useState<{ planId: string; modules: UpdateModule[] } | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<CombinedProgress | null>(null);
   const [, setClock] = useState(0);
   const snapshotRef = useRef<UpdateState | null>(null);
   const requestRef = useRef<{ controller: AbortController; kind: RequestKind } | null>(null);
@@ -74,6 +105,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const reviewElement = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const progressSourceRef = useRef<EventSource | null>(null);
 
   const accept = useCallback((data: UpdateState, confirmMissingJob = false) => {
     stateVersion.current++;
@@ -188,6 +220,63 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   }, [accept, onExpired]);
 
   useEffect(() => () => { requestRef.current?.controller.abort(); requestRef.current = null; }, []);
+
+  // Subscribe to download progress via SSE
+  useEffect(() => {
+    const shouldSubscribe = running(snapshot?.job);
+
+    if (!shouldSubscribe) {
+      if (progressSourceRef.current) {
+        progressSourceRef.current.close();
+        progressSourceRef.current = null;
+      }
+      setDownloadProgress(null);
+      return;
+    }
+
+    // Don't resubscribe if already connected
+    if (progressSourceRef.current) return;
+
+    const eventSource = new EventSource('/api/system/updates/progress');
+    progressSourceRef.current = eventSource;
+
+    eventSource.onmessage = (event) => {
+      try {
+        const raw: UpdateProgress = JSON.parse(event.data);
+
+        if (raw.error) {
+          setDownloadProgress(null);
+          return;
+        }
+
+        const combined = calculateCombinedProgress(raw);
+        setDownloadProgress(combined);
+
+        // Close stream on completion
+        const isComplete = raw.stage === 'switch' && raw.progress >= 1.0;
+        if (isComplete) {
+          eventSource.close();
+          progressSourceRef.current = null;
+          // Clear progress after a brief delay to show 100%
+          setTimeout(() => setDownloadProgress(null), 1000);
+        }
+      } catch (error) {
+        // Invalid progress data, ignore
+      }
+    };
+
+    eventSource.onerror = () => {
+      eventSource.close();
+      progressSourceRef.current = null;
+      setDownloadProgress(null);
+    };
+
+    return () => {
+      eventSource.close();
+      progressSourceRef.current = null;
+    };
+  }, [snapshot?.job]);
+
   useEffect(() => {
     let disposed = false;
     let ticking = false;
@@ -355,6 +444,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {networkError ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>{networkError}</strong><p>恢复连接后会自动读取服务器记录。</p><button className="text-button" disabled={pending !== null} onClick={() => void request('read')}>重新连接</button></div></div> : null}
     {snapshot?.checkError || checkRequestFailed ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{snapshot?.checkError || '上次检查请求未完成，当前显示的是已有记录。'}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
+    {downloadProgress ? <DownloadProgress progress={downloadProgress} /> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}
     {snapshot?.enabled && !needsSetup ? <section className="update-token" aria-labelledby="update-token-title"><div className="update-section-heading"><h3 id="update-token-title">GitHub Token</h3>{tokenSupported ? <span className={`update-token-status ${tokenConfigured ? 'configured' : ''}`}>{tokenConfigured ? '已配置' : '未配置（可选）'}</span> : <span>需升级更新服务</span>}</div>{tokenSupported ? <><p className="update-token-help" id="update-token-help">用于读取公开仓库的正式版本，只需公开仓库只读权限。<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 GitHub Token</a></p><p className="update-token-help">Token 仅保存在服务器，不会回显。保存后下次检查生效，已有重试等待会保留。</p><form onSubmit={event => { event.preventDefault(); void saveToken(); }}><label htmlFor="update-github-token">{tokenConfigured ? '替换 Token' : '配置 Token'}</label><input id="update-github-token" type="password" autoComplete="off" autoCapitalize="none" spellCheck={false} value={token} disabled={tokenBlocked} aria-describedby="update-token-help" placeholder={tokenConfigured ? '粘贴新的 Token' : '粘贴 GitHub Token'} onChange={event => { setToken(event.target.value); setTokenError(''); setTokenNotice(''); }} /><div className="update-token-actions"><button type="submit" className="button secondary" disabled={tokenBlocked || !token.trim()}>{pending === 'token' ? <LoaderCircle size={15} className="spin" /> : null}{tokenConfigured ? '替换 Token' : '保存 Token'}</button>{tokenConfigured && !removeToken ? <button type="button" className="text-button" disabled={tokenBlocked} onClick={() => { setRemoveToken(true); setTokenNotice(''); }}>移除 Token</button> : null}</div></form>{removeToken && tokenConfigured ? <div className="update-token-remove"><p>确认移除已保存的 Token？后续检查将使用公开访问额度。</p><div className="update-token-actions"><button type="button" className="button secondary" disabled={tokenBlocked} onClick={() => void saveToken(true)}>确认移除</button><button type="button" className="text-button" disabled={pending === 'token'} onClick={() => setRemoveToken(false)}>取消移除</button></div></div> : null}{tokenError ? <p className="update-token-error" role="alert">{tokenError}</p> : null}{tokenResultUncertain ? <button className="text-button update-token-refresh" disabled={pending !== null || checking || updating || uncertain} onClick={() => void refreshToken()}>刷新配置状态</button> : null}{tokenNotice ? <p className="update-token-notice" role="status">{tokenNotice}</p> : null}</> : <p className="update-token-help">当前更新服务暂不支持 Token 配置。请在服务器上重新运行原一键部署命令升级，之后即可在这里配置。</p>}</section> : null}
     {modules.length ? <section aria-labelledby="update-modules-title"><div className="update-section-heading"><h3 id="update-modules-title">本机模块</h3><span>{modules.length} 个已安装</span></div><ul className="update-modules">{modules.map(module => <ModuleRow key={module.id} module={module} unfinishedJob={unfinishedJob} />)}</ul></section> : snapshot?.enabled && !checking ? <p className="update-empty">尚未识别到可更新的本机模块，请重新检查。</p> : null}
