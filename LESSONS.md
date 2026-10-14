@@ -510,3 +510,17 @@
 **证据：** 本仓 `203515f` 部署的 2026-10-15 用户日志明确显示工作台健康运行后，`/opt/project-aggregation/releases/203515f0bee5-33025824d38fdd0a/server/update-service` 因允许其他用户写入被拒绝；固定该提交的真实 `git archive` 目录模式为 `0775`。相关路径：[源码安装器](deploy/install.sh)、[更新协调器](server/update-service/updater.py)、[系统更新页面](src/UpdateStatus.tsx)。
 
 **事件记录：** `source-release-permissions-post-activation-failure-20261015`；一次已核实的用户故障与同轮状态恢复修复。
+
+### L035：配对升杠杆须用共享公开额度覆盖两侧现有持仓
+
+**适用条件：** ASTER 配对普通策略从当前杠杆升至更高档位，目标档有公开额度但已有底仓较大。
+
+**根因：** 配对升档只检查公开额度超过配置门槛，以及各子账户的私有持仓上限，漏掉单账户升档已有的总名义持仓比较；两侧分别不过限也不能证明共享公开额度足够。
+
+**以后做法：** 按两侧 `qty × max(仓位标记价, 当前标记价)` 求和，不抵消多空、不使用保证金金额。目标公开额度须严格超过总名义持仓与配置门槛，各账户仍分别满足私有档位上限。候选选择、等待原因与发送前检查复用同一判断，最后账户快照刷新后再次检查。额度变化不能作为清除已发送且结果未知请求的依据。
+
+**如何验证：** [配对升档额度测试](modules/aster/tests/test_pair_upgrade_capacity.py) 覆盖低于、等于、精确略高于总持仓，双侧合计、价格变化、私有上限与发送前变化；确认跳过升档后仍可按当前档位评估开仓，并保留未知请求核对保护。[开仓提示测试](modules/aster/tests/test_opening_messages.py) 确认诊断与资格判断一致。
+
+**证据：** 本仓 `74fc675` 的 [配对规划](modules/aster/trading/pair_planning.py) 在 2026-10-15 原生 Windows 回归中复现：当前 10x、两侧各 `100 × 100 = 10000 USD1`、门槛 `10000 USD1`，目标 20x 公开额度为 `15000` 或 `20000 USD1` 时仍返回 20x。截图中的持续核对来自 [配对执行](modules/aster/trading/pair_execution.py)；截图本身不足以证明原请求已被明确拒绝。
+
+**事件记录：** `pair-upgrade-shared-capacity-20261015`；一次用户反馈与同轮防护修复。

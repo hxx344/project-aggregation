@@ -17,7 +17,8 @@ from .models import TradingError, dec, positive, wire, cycle_margin_limit, openi
 from .paper import PaperOrderAbsent
 from .pair_symbols import SUPPORTED_SYMBOLS
 from .pair_planning import (SIDES, PairPositionError, PairRecoveryConflict, positions, require_quantities,
-                            plan_ordinary, plan_paired_cycle, ordinary_upgrade, require_runtime_symbols)
+                            plan_ordinary, plan_paired_cycle, ordinary_upgrade, ordinary_upgrade_blocker,
+                            require_runtime_symbols)
 from .store import dumps
 from . import pair_quality
 
@@ -895,8 +896,19 @@ class PairTrader:
         self._config_guard(pair, state["identities"], opening=True)
         for guard in guards.values():
             guard()
+        before = self._expected(state)
+        def check_capacity(current, *, equal_leverage):
+            held = require_quantities(current, symbol, before, equal_leverage=equal_leverage)
+            book = self.market.book(symbol)
+            book.require_fresh()
+            reason = ordinary_upgrade_blocker(pair, current, book, self.engine.capacities(symbol), held, target)
+            if reason:
+                raise RequestNotSent(f"{target}x：{reason}")
+        # Recheck cached market inputs after the configuration/account guards,
+        # before recording an intent that might otherwise wait for confirmation.
+        check_capacity(snapshots, equal_leverage=True)
         pending = {"id": uuid.uuid4().hex, "kind": "leverage", "symbol": symbol, "identities": deepcopy(state["identities"]),
-                   "created_at": time.time(), "before": self._expected(state), "target_leverage": target,
+                   "created_at": time.time(), "before": before, "target_leverage": target,
                    "previous_leverage": positions(snapshots, symbol)["LONG"].leverage, "results": {}}
         state.update(pending=pending, phase="leverage",
                      reason=f"系统正在将两个子账户从 {pending['previous_leverage']}x 共同升至 {target}x；两侧实际杠杆确认前不下单")
@@ -905,14 +917,16 @@ class PairTrader:
             broker = brokers[key]
             try:
                 self._config_guard(pair, pending["identities"], opening=True)
+                def check(snapshot):
+                    try:
+                        # The broker may have refreshed its account snapshot.
+                        # Revalue both holdings against the latest public quota.
+                        check_capacity({**snapshots, key: snapshot}, equal_leverage=False)
+                    except TradingError as exc:
+                        raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
                 if isinstance(broker, LiveBroker):
-                    def check(snapshot):
-                        snapshot.require_modes([symbol])
-                        rows = snapshot.pair(symbol)
-                        side = "LONG" if key == "long" else "SHORT"
-                        if any(p.qty != dec(pending["before"][side]) if p.side == side else p.qty != 0 for p in rows):
-                            raise PairPositionError("升杠杆前仓位已变化")
                     return {"response": broker.set_leverage(symbol, target, checked_snapshot=snapshots[key], before_submit=check)}
+                check(broker.snapshot([symbol]))
                 return {"response": broker.set_leverage(symbol, target)}
             except (RequestNotSent, LeverageRejected) as exc:
                 return {"rejected": True, "reason": str(exc)}

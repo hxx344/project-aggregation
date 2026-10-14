@@ -183,9 +183,29 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
     return allowed
 
 
+def ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target):
+    """Use shared public capacity and each member's own holding limit."""
+    threshold = Fraction(dec(pair["ordinary"]["threshold"]))
+    if target not in capacities:
+        return "缺少公开额度数据"
+    capacity = Fraction(positive(capacities[target], True))
+    if capacity <= threshold:
+        return f"公开额度未严格超过 {wire(threshold)} USD1"
+    notionals = {side: Fraction(held[side].qty) * max(Fraction(held[side].mark), Fraction(book.mark))
+                 for _, side in SIDES}
+    # Both sides consume the same public quota; opposite positions never net.
+    gross = sum(notionals.values(), Fraction(0))
+    if capacity <= gross:
+        return f"公开额度 {wire(capacity)} USD1 未超过两账户现有持仓总价值 {wire(gross)} USD1，跳过升档"
+    blocked = ["做多账户" if key == "long" else "做空账户" for key, side in SIDES
+               if notionals[side] > Fraction(leverage_cap(snapshots[key].brackets.get(pair["symbol"], []), target))]
+    if blocked:
+        return "公开额度已满足，但" + "、".join(blocked) + "的现有持仓超过该档账户持仓上限"
+    return None
+
+
 def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
     """Describe upgrade blockers from the same inputs, without another API read."""
-    symbol = pair["symbol"]
     old, policy = held["LONG"].leverage, pair["ordinary"]
     minimum = policy["min_open_leverage"]
     state = (f"两账户当前均为 {old}x，低于普通开仓最低 {minimum}x" if old < minimum else
@@ -193,19 +213,10 @@ def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
     targets = [tier for tier in TIERS if tier > old and tier >= minimum]
     if not targets:
         return state + "；停止新增，程序不会自动降杠杆，请暂停配对组后核对实际杠杆设置"
-    threshold = Fraction(dec(policy["threshold"]))
     details = []
     for target in targets:
-        if target not in capacities:
-            detail = "缺少公开额度数据"
-        elif Fraction(positive(capacities[target], True)) <= threshold:
-            detail = f"公开额度未严格超过 {wire(threshold)} USD1"
-        else:
-            blocked = ["做多账户" if key == "long" else "做空账户" for key, side in SIDES
-                       if Fraction(held[side].qty) * max(Fraction(held[side].mark), Fraction(book.mark))
-                       > Fraction(leverage_cap(snapshots[key].brackets.get(symbol, []), target))]
-            detail = ("公开额度已满足，但" + "、".join(blocked) + "的现有持仓超过该档账户持仓上限"
-                      if blocked else "公开额度及账户持仓上限已满足，可申请自动升档")
+        detail = (ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target)
+                  or "公开额度及账户持仓上限已满足，可申请自动升档")
         details.append(f"{target}x：{detail}")
     return state + "；" + "；".join(details) + "。程序会自动选择满足条件的更高档位，两账户升档确认后再检查开仓条件"
 
@@ -269,15 +280,11 @@ def plan_paired_cycle(pair, snapshots, book, depth, rule, progress, *, capacity=
 def ordinary_upgrade(pair, snapshots, book, capacities):
     symbol = pair["symbol"]
     held = positions(snapshots, symbol)
+    book.require_fresh()
     old = held["LONG"].leverage
-    threshold = Fraction(dec(pair["ordinary"]["threshold"]))
     for target in TIERS:
         if target <= old or target < pair["ordinary"]["min_open_leverage"]:
             continue
-        if target not in capacities or Fraction(positive(capacities[target], True)) <= threshold:
-            continue
-        if all(Fraction(p.qty) * max(Fraction(p.mark), Fraction(book.mark))
-               <= Fraction(leverage_cap(snapshots[key].brackets.get(symbol, []), target))
-               for key, side in SIDES for p in [held[side]]):
+        if ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target) is None:
             return target
     return None
