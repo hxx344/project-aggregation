@@ -368,6 +368,53 @@ class RelayAPITests(unittest.TestCase):
 
 
 class RelayCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_cleanup_preserves_parent_cancellation_identity(self):
+        collector = RelayCollector(RelayConfig(TOKEN, symbols=(SYMBOL,)), http=Mock())
+        self.addAsyncCleanup(collector.stop)
+        app = create_app(collector=collector, start_collector=False)
+        stream = next(route.endpoint for route in app.routes if getattr(route, "path", "") == "/v1/stream")
+        sender_started, sender_cleanup = asyncio.Event(), asyncio.Event()
+        never = asyncio.Event()
+        sender_tasks = []
+        connected = False
+
+        async def next_sample(subscriber):
+            sender_tasks.append(asyncio.current_task())
+            sender_started.set()
+            try:
+                await never.wait()
+            finally:
+                sender_cleanup.set()
+                await never.wait()
+
+        async def receive():
+            nonlocal connected
+            if not connected:
+                connected = True
+                return {"type": "websocket.connect"}
+            await sender_started.wait()
+            return {"type": "websocket.disconnect", "code": 1000}
+
+        async def send(message):
+            pass
+
+        websocket = WebSocket({"type": "websocket", "path": "/v1/stream", "query_string": b"",
+                               "headers": [(b"authorization", ("Bearer " + TOKEN).encode())]}, receive, send)
+        with patch.object(Subscriber, "next", next_sample):
+            handler = asyncio.create_task(stream(websocket))
+            await asyncio.wait_for(sender_cleanup.wait(), timeout=1)
+            # The receiver has completed normally. A cancelled gather must not
+            # replace the parent's cancellation with that child's empty reason.
+            marker = "Cancelled via cancel scope relay-cleanup-test"
+            handler.cancel(marker)
+            with self.assertRaises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(handler, timeout=1)
+            await asyncio.wait_for(asyncio.gather(*sender_tasks, return_exceptions=True), timeout=1)
+            self.assertEqual(caught.exception.args, (marker,))
+            self.assertTrue(handler.cancelled())
+            self.assertTrue(all(task.done() for task in sender_tasks))
+            self.assertEqual(collector.status()["connections"], 0)
+
     async def test_cancelled_websocket_cleanup_releases_slot_before_task_join(self):
         collector = RelayCollector(RelayConfig(TOKEN, symbols=(SYMBOL,)), http=Mock())
         self.addAsyncCleanup(collector.stop)

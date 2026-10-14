@@ -553,6 +553,8 @@
 
 **证据：** 本仓 `b9692d2` 的 [CI 中继检查](https://github.com/hxx344/project-aggregation/actions/runs/38622433981/job/116053055716) 在退出 WebSocket 上下文后观察到连接数仍为 1；该路径自 `0cde1afd` 引入。[中继处理器](modules/aster/trading/capacity_relay_server.py) 的确定性 Windows 回归进一步复现处理器已取消、接收任务已结束但名额未释放，排除了单纯断言过早。
 
+**同轮补充：** `c826f18` 的 [Ubuntu 26.04 CI](https://github.com/hxx344/project-aggregation/actions/runs/38635180672/job/116096379982) 在连接上限测试退出时抛出 `CancelledError`。事件控制的 Windows 回归确认：接收任务正常结束、发送任务停在收尾时，取消父处理器会让 `gather` 用最后一个子任务的空取消信息替代父信息，导致 AnyIO 无法识别自己的取消范围。先释放名额后用 `shield` 隔离等待，遇到父取消时再次取消子任务并原样抛出，保留父取消身份；不吞取消，也不留后台子任务。新增回归断言取消信息、子任务结束和名额归零，并保留原双重取消用例；Ubuntu 26.04 的真实 systemd/TLS 检查仍须通过。
+
 **事件记录：** `relay-cancelled-cleanup-slot-leak-20261015`；发布检查暴露的一次连接清理缺陷。
 
 ### L038：内部十进制计算结果不重新套用输入长度限制

@@ -462,7 +462,17 @@ def create_app(config=None, *, collector=None, http=None, clock=None, monotonic=
                 task.cancel()
             # Release the slot before another cancellation can interrupt the join.
             collector.unsubscribe(subscriber)
-            await asyncio.gather(*tasks, return_exceptions=True)
+            joined = asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                # gather may replace a parent's cancellation with a completed
+                # child's empty reason, breaking the enclosing ASGI cancel scope.
+                await asyncio.shield(joined)
+            except asyncio.CancelledError:
+                # Interrupt child cleanup as well, but preserve the parent's
+                # original cancellation identity rather than raising from gather.
+                for task in tasks:
+                    task.cancel()
+                raise
 
     return app
 
