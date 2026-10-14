@@ -46,6 +46,10 @@ class RelayConfigTests(unittest.TestCase):
     def test_defaults_extensions_and_numeric_settings_are_validated_without_secrets(self):
         config = RelayConfig.from_env({"ASTER_RELAY_TOKEN": TOKEN})
         self.assertEqual((config.host, config.port, config.symbols), ("0.0.0.0", 8766, (SYMBOL, "XAGUSD1")))
+        self.assertEqual((config.interval, config.effective_interval, config.brackets_interval), (0.4, 0.4, 60))
+        self.assertEqual(RelayConfig(TOKEN).interval, 0.4)
+        overridden = RelayConfig.from_env({"ASTER_RELAY_TOKEN": TOKEN, "ASTER_RELAY_INTERVAL": "0.2"})
+        self.assertEqual(overridden.effective_interval, 0.2)
         self.assertNotIn(TOKEN, repr(config))
         extended = RelayConfig.from_env({"ASTER_RELAY_TOKEN": TOKEN, "ASTER_RELAY_SYMBOLS": "XAUUSD1, BTCUSD1"})
         self.assertEqual(extended.symbols, (SYMBOL, "BTCUSD1"))
@@ -244,8 +248,19 @@ class CollectorTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json=payload("oi"))
         self.reply = response
         await self.collector.tick()
+        self.assertAlmostEqual(await self.collector.tick(), 0.4)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_default_sampling_waits_four_hundred_milliseconds_between_requests(self):
+        self.collector._due[("brackets", SYMBOL)] = self.clock.mono + 60
+        await self.collector.tick()
+        self.clock.advance(0.2)
         self.assertAlmostEqual(await self.collector.tick(), 0.2)
         self.assertEqual(len(self.calls), 1)
+        self.clock.advance(0.2)
+        await self.collector.tick()
+        self.assertEqual(len(self.calls), 2)
+        self.assertAlmostEqual(self.calls[1][0] - self.calls[0][0], 0.4)
 
     async def test_start_stop_is_single_background_task_and_cancels_promptly(self):
         await self.collector.start()

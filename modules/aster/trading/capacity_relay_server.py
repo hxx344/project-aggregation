@@ -49,7 +49,7 @@ class RelayConfig:
     host: str = "0.0.0.0"
     port: int = 8766
     symbols: tuple[str, ...] = ("XAUUSD1", "XAGUSD1")
-    interval: float = 0.2
+    interval: float = 0.4
     brackets_interval: float = 60.0
     cert_file: str = ""
     key_file: str = field(default="", repr=False)
@@ -89,7 +89,7 @@ class RelayConfig:
             return cls(token=env.get("ASTER_RELAY_TOKEN", ""), host=env.get("ASTER_RELAY_HOST", "0.0.0.0"),
                 port=int(env.get("ASTER_RELAY_PORT", "8766")),
                 symbols=tuple(part.strip() for part in env.get("ASTER_RELAY_SYMBOLS", "XAUUSD1,XAGUSD1").split(",")),
-                interval=float(env.get("ASTER_RELAY_INTERVAL", "0.2")),
+                interval=float(env.get("ASTER_RELAY_INTERVAL", "0.4")),
                 brackets_interval=float(env.get("ASTER_RELAY_BRACKETS_INTERVAL", "60")),
                 cert_file=env.get("ASTER_RELAY_CERT_FILE", ""), key_file=env.get("ASTER_RELAY_KEY_FILE", ""))
         except RelayConfigError:

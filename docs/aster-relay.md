@@ -13,7 +13,7 @@ RELEASE_COMMIT='<正式发布的40位提交号>'
 curl -fsSL "https://raw.githubusercontent.com/hxx344/project-aggregation/$RELEASE_COMMIT/deploy/install-aster-relay.sh" | sudo bash -s -- --address <中继公网IP>
 ```
 
-安装器自动准备缺少的依赖、独立服务账号、连接令牌、包含该 IP 的自签证书、systemd 服务及管理命令。默认端口 `8766`，默认订阅黄金 `XAUUSD1` 和白银 `XAGUSD1`。云安全组和系统防火墙需要允许工作台服务器访问中继的 TCP `8766`；限制来源时使用工作台实际出口 IP。
+安装器自动准备缺少的依赖、独立服务账号、连接令牌、包含该 IP 的自签证书、systemd 服务及管理命令。默认端口 `8766`，默认订阅黄金 `XAUUSD1` 和白银 `XAGUSD1`；每个标的的公开额度采集间隔为 `0.4` 秒，风险档位采集间隔为 `60` 秒。云安全组和系统防火墙需要允许工作台服务器访问中继的 TCP `8766`；限制来源时使用工作台实际出口 IP。
 
 安装入口固定到已正式发布的提交。安装器通过正式发布清单发现稳定版本，从同一固定提交的本仓源码中只提取中继所需文件，再运行该版本安装逻辑。不会下载原独立仓库代码，也不会安装 Node.js 或工作台前端。
 
@@ -64,5 +64,13 @@ sudo aster-capacity-relay restart
 | `aster-capacity-relay.service` | 独立中继 systemd 服务 |
 
 已有配置只订阅黄金时，在 `environment` 中将 `ASTER_RELAY_SYMBOLS` 改为 `XAUUSD1,XAGUSD1` 后重启中继；升级不会覆盖显式订阅值。已有服务器的 `--address` 必须与原 IP 一致，避免悄悄改变证书和连接身份。换机后使用新机器导出的连接重新接入工作台。
+
+已有服务器也会保留 `ASTER_RELAY_INTERVAL`，因此升级不会自动把原来的 `0.2` 秒改为 `0.4` 秒。在副服务器执行以下命令即可将公开额度采集频率减半并重启中继，无需升级代码。如果状态仍显示限流退避，等 `backoff_seconds=0` 后再重启，避免清除尚未结束的退避计时。
+
+```bash
+sudo sed -i 's/^ASTER_RELAY_INTERVAL=.*/ASTER_RELAY_INTERVAL=0.4/' /etc/aster-capacity-relay/environment && sudo aster-capacity-relay restart
+```
+
+启动后运行 `sudo aster-capacity-relay status`，确认 `effective_interval_seconds` 为 `0.4`；服务刚启动时若暂未连接成功，隔几秒重查。该命令适用于安装器生成、已包含 `ASTER_RELAY_INTERVAL` 的配置；不会重启工作台。风险档位采集间隔、样本有效期及限流退避规则保持原有设置。
 
 安装与连接测试在 `deploy/test-aster-relay-install.py`、`deploy/test-aster-relay-config.py`；真实 Linux 验收在 `deploy/test-aster-relay-systemd.sh`。这些检查是正式发布的必要条件，不在 WSL 中执行。

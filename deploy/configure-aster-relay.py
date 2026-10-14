@@ -301,7 +301,7 @@ def prepare_server(directory, address):
             store.write("environment", "# Relay settings; preserved on upgrades.\n" + "\n".join([
                 "ASTER_RELAY_TOKEN=" + secrets.token_urlsafe(32),
                 "ASTER_RELAY_HOST=" + ("::" if ":" in address else "0.0.0.0"), "ASTER_RELAY_PORT=8766",
-                "ASTER_RELAY_SYMBOLS=XAUUSD1,XAGUSD1", "ASTER_RELAY_INTERVAL=0.2", "ASTER_RELAY_BRACKETS_INTERVAL=60",
+                "ASTER_RELAY_SYMBOLS=XAUUSD1,XAGUSD1", "ASTER_RELAY_INTERVAL=0.4", "ASTER_RELAY_BRACKETS_INTERVAL=60",
                 "ASTER_RELAY_CERT_FILE=" + json.dumps(str(cert_file)), "ASTER_RELAY_KEY_FILE=" + json.dumps(str(key_file)), ""]))
         config = server_connection(directory)
         encoded = (json.dumps(config, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")

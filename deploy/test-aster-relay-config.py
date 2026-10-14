@@ -84,7 +84,7 @@ class RelayConfigTests(unittest.TestCase):
     def test_defaults_use_both_symbols_and_preserve_credentials_on_repeat(self):
         env = configuration.read_environment(self.server / "environment")
         self.assertEqual(env["ASTER_RELAY_SYMBOLS"], "XAUUSD1,XAGUSD1")
-        self.assertEqual((env["ASTER_RELAY_PORT"], env["ASTER_RELAY_INTERVAL"], env["ASTER_RELAY_BRACKETS_INTERVAL"]), ("8766", "0.2", "60"))
+        self.assertEqual((env["ASTER_RELAY_PORT"], env["ASTER_RELAY_INTERVAL"], env["ASTER_RELAY_BRACKETS_INTERVAL"]), ("8766", "0.4", "60"))
         paths = [self.server / name for name in ("environment", "address", "server.key", "server.crt", "connection.json")]
         before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         configuration.prepare_server(self.server, "")
