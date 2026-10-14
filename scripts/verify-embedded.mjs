@@ -35,7 +35,7 @@ try {
   const login = await request('/api/login', { method: 'POST', body: { password } });
   assert.equal(login.status, 200); cookie = login.headers['set-cookie'][0].split(';')[0]; csrf = login.data.csrfToken;
   const projects = (await request('/api/projects')).data.projects;
-  assert.deepEqual(projects.map(item => item.id), ['monitor', 'asset', 'crossex', 'greeks']);
+  assert.deepEqual(projects.map(item => item.id), ['monitor', 'asset', 'crossex', 'greeks', 'aster']);
   assert.equal((await request('/api/trading')).status, 200, 'Original trading module remains available');
   const hubPage = await request('/'); assert.equal(hubPage.status, 200); assert.match(hubPage.text, /<html/);
   const hubAssets = [...hubPage.text.matchAll(/(?:src|href)="(\/assets\/[^"?#]+)"/g)].map(match => match[1]);
@@ -58,6 +58,13 @@ try {
     for (const asset of [...new Set(assets)].slice(0, 6)) assert.equal((await request(asset, settings)).status, 200, `${project.id}: ${asset}`);
     const summary = await request('/api/hub/summary?schemaVersion=2', settings);
     assert.equal(summary.status, 200, `${project.id} summary: ${summary.text.slice(0, 300)}`);
+    if (project.id === 'aster') {
+      const state = await request('/api/state', settings);
+      assert.equal(state.status, 200, state.text.slice(0, 300));
+      assert.equal(state.data.workspaceManaged, true);
+      assert.equal((await request('/api/login', { ...settings, method: 'POST', body: { password } })).status, 409);
+      assert.equal((await request('/api/logout', { ...settings, method: 'POST', body: {} })).status, 409);
+    }
     const normalized = await readSummary(modules.projects.find(item => item.id === project.id), null, { deadline: Date.now() + 30_000 });
     assert.ok(Array.isArray(normalized.metrics), `${project.id}: summary is accepted by the real hub adapter`);
     assert.equal((await request('/__workspace/update-status', settings)).status, 403);
@@ -67,7 +74,7 @@ try {
   for (const settings of grants) assert.equal((await request('/', settings)).status, 401);
   assert.equal(failure, undefined, failure?.message);
   await import(pathToFileURL(path.join(root, 'server/logger.mjs')));
-  console.log('Complete deployment package passed: four real modules + native trading, one port, one login, logout revocation.');
+  console.log('Complete deployment package passed: five real modules + native trading, one port, one login, logout revocation.');
 } finally {
   await app?.close();
   await modules?.close();

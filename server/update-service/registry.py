@@ -25,7 +25,7 @@ class Module:
 
 
 MODULES = (
-    Module('hub', '工作台（包含四个内置模块）', 'project-aggregation', 'project-aggregation', 'project-aggregation',
+    Module('hub', '工作台（包含五个内置模块）', 'project-aggregation', 'project-aggregation', 'project-aggregation',
            'project-aggregation', 'deploy/install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
            ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True),
 )

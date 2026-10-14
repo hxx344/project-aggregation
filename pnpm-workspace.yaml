@@ -2,6 +2,7 @@ packages:
   - 'modules/monitor'
   - 'modules/asset'
   - 'modules/crossex'
+  - 'modules/aster/dashboard'
 
 # Keep direct dependency declarations in each importer; unify versions here.
 catalog:
@@ -26,6 +27,16 @@ catalog:
   'typescript': '5.9.3'
   'vite': '8.2.2'
   'ws': '8.21.3'
+
+# Keep ASTER's RSC runtime trio on the version verified by its upstream build.
+catalogs:
+  aster-react:
+    'react': '19.2.8'
+    'react-dom': '19.2.8'
+    'react-server-dom-webpack': '19.2.8'
+
+overrides:
+  'vinext>sharp': '0.35.4'
 
 # Native/build hooks are explicit and reproducible on developer and CI hosts.
 allowBuilds:

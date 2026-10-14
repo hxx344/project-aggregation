@@ -4,7 +4,7 @@
 
 ## 开发与发布范围
 
-- 工作台及其内置模块的修改、验证、提交、推送和正式发布统一在本仓库完成；模块业务代码直接修改 `modules/monitor`、`modules/asset`、`modules/crossex`、`modules/greeks` 中的内置版本。
+- 工作台及其内置模块的修改、验证、提交、推送和正式发布统一在本仓库完成；模块业务代码直接修改 `modules/monitor`、`modules/asset`、`modules/crossex`、`modules/greeks`、`modules/aster` 中的内置版本。
 - 原独立仓库仅作为历史和上游参考，不再修改、提交、推送或发布；只有用户当次明确要求时才例外。`SOURCE.json` 仅记录来源，不代表自动同步或另一个交付目标。
 - 验收使用工作台实际入口与本仓库发布包；各内置模块随工作台统一更新。服务器仍由用户自行更新，除非当次明确授权部署。
 

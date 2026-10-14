@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/hxx344/aster_5x",
+  "commit": "92aee006cc0c5d08bcdee61bb4bcfd206aebf99d",
+  "release": "deploy-92aee006cc0c5d08bcdee61bb4bcfd206aebf99d",
+  "importedPaths": [
+    "trading",
+    "dashboard",
+    "tests",
+    "monitor.py",
+    "config.json",
+    "requirements.txt",
+    "requirements.lock"
+  ],
+  "note": "Vendored runtime source; maintained and released only in project-aggregation. Standalone deployment/build tests, Sites metadata and the npm lockfile are excluded; this workspace owns those pipelines."
+}

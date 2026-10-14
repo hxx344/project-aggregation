@@ -28,9 +28,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .next/
+.vinext/
+.wrangler/
 .build-cache/
 .module-cache/
 .venv/
+.venv-aster/
 
 # OS
 .DS_Store

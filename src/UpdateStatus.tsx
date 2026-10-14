@@ -117,6 +117,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     try {
       const data = await api<UpdateState>(`/api/system/updates${kind === 'read' ? '' : `/${kind}`}`, {
         signal: controller.signal,
+        ...(kind === 'apply' ? { timeoutMs: 120_000 } : {}),
         ...(kind === 'read' ? {} : { method: 'POST', body: JSON.stringify(kind === 'apply' ? { planId: value } : kind === 'token' ? { token: value } : {}) }),
       });
       if (controller.signal.aborted) return null;

@@ -24,7 +24,7 @@ export async function startModules({ dataDir, root = repository, logger = consol
     closing = (async () => {
       await Promise.all(children.map(child => new Promise(resolve => {
         if (!child.pid || child.exitCode !== null || child.signalCode) return resolve();
-        const timer = setTimeout(() => child.kill('SIGKILL'), 32_000).unref();
+        const timer = setTimeout(() => child.kill('SIGKILL'), child.moduleId === 'aster' ? 115_000 : 32_000).unref();
         child.once('close', () => { clearTimeout(timer); resolve(); });
         if (child.connected) child.send({ type: 'shutdown' }, () => {}); else child.kill();
       })));
@@ -51,6 +51,7 @@ export async function startModules({ dataDir, root = repository, logger = consol
       const child = spawn(locking ? 'flock' : process.execPath,
         locking ? ['--no-fork', '--nonblock', '--conflict-exit-code', '75', path.join(moduleData, 'instance.lock'), process.execPath, ...args] : args,
         { cwd: moduleRoot, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      child.moduleId = id;
       children.push(child);
       child.stdout.on('data', data => logger.info(`[${id}] ${String(data).trimEnd()}`));
       child.stderr.on('data', data => logger.warn(`[${id}] ${String(data).trimEnd()}`));

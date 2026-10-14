@@ -13,7 +13,7 @@ BRANCH=main
 NODE_VERSION=24.15.0
 PNPM_VERSION=11.25.0
 PNPM_INTEGRITY=XN6SW08HX3Jetx+64YpC/+eEUkeJ8ZthxzHLhyHsKKruFg4BqNWvT+2ypCzb8wDv4j2zVrDUoXtNY+EfirfJVg==
-INSTALL_REVISION=4
+INSTALL_REVISION=5
 UPDATER_DIR=/usr/local/lib/project-aggregation-updater
 UPDATER_STATE_DIR=/var/lib/project-aggregation-updater
 UPDATER_RUN_DIR=/run/project-aggregation-updater
@@ -34,6 +34,7 @@ old_health_url=
 work_dir=
 module_migration_helper=
 GREEKS_PYTHON_PATH=
+ASTER_PYTHON_PATH=
 
 # BEGIN CI RELEASE HELPERS -- keep embedded copies identical to deploy/release-common.sh
 # Only discovery uses latest; the archive is always fetched from its immutable commit tag.
@@ -198,6 +199,14 @@ remember_environment() {
 prepare_environment_rollback() {
   old_environment=
   old_health_url=
+  local module
+  for module in greeks aster; do
+    if [[ -f "$APP_DIR/.$module-python-path" ]]; then
+      install -m 0600 "$APP_DIR/.$module-python-path" "$work_dir/previous-$module-python-path" || return 1
+    else
+      touch "$work_dir/previous-$module-python-path.absent" || return 1
+    fi
+  done
   [[ -n "$old_release" ]] || return 0
   if [[ ! -f "$APP_DIR/.last-successful.env" ]]; then
     fail '缺少上次成功的环境配置快照，已在切换版本前停止；现有服务保持运行。'
@@ -206,6 +215,16 @@ prepare_environment_rollback() {
   old_environment="$work_dir/previous.env"
   install -m 0600 "$APP_DIR/.last-successful.env" "$old_environment"
   old_health_url=$(health_url "$(read_setting HOST 127.0.0.1 "$old_environment")" "$(read_setting PORT 3100 "$old_environment")")
+}
+restore_python_paths() {
+  local module
+  for module in greeks aster; do
+    if [[ -f "$work_dir/previous-$module-python-path" ]]; then
+      install -m 0600 "$work_dir/previous-$module-python-path" "$APP_DIR/.$module-python-path" || return 1
+    elif [[ -f "$work_dir/previous-$module-python-path.absent" ]]; then
+      rm -f -- "$APP_DIR/.$module-python-path" || return 1
+    fi
+  done
 }
 restore_environment() {
   [[ -n "$old_environment" && -f "$old_environment" ]] || return 1
@@ -281,6 +300,10 @@ rollback() {
       systemctl disable "$SERVICE" >/dev/null 2>&1 || true
       if [[ -f "$UNIT_FILE" ]] && grep -q '^# Managed by project-aggregation installer$' "$UNIT_FILE"; then rm -f -- "$UNIT_FILE"; fi
     fi
+    if ! restore_python_paths; then
+      log '无法恢复上次成功的 Python 路径记录；工作台保持停止，请检查磁盘权限。'
+      exit "$exit_code"
+    fi
     if [[ -n "$old_release" && -d "$old_release" ]]; then
       if ! restore_environment; then
         log '无法保留候选配置或恢复上次成功配置；未再次重启服务，请检查配置文件和磁盘空间。'
@@ -319,7 +342,7 @@ ensure_tools() {
   else
     log '系统依赖已齐全，跳过安装。'
   fi
-  /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || fail '内置 Greeks 需要 Python 3.11+；请使用 Debian 12/13 或 Ubuntu 24.04。'
+  /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' || fail '内置 Greeks 与 ASTER 需要 Python 3.11+；请使用 Debian 12/13 或 Ubuntu 24.04。'
 }
 ensure_node() {
   local candidate machine archive runtime_dir checksum
@@ -397,9 +420,9 @@ input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
-    modules/monitor/package.json modules/asset/package.json modules/crossex/package.json \
-    modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc \
-    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json) || return
+    modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
+    modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
+    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json) || return
   typecheck_tree=$(tree_hash modules scripts/modules.mjs src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash modules scripts/modules.mjs deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
@@ -446,9 +469,9 @@ prepare_dependencies() {
   mkdir "$staging"
   local name
   for name in package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
-    modules/monitor/package.json modules/asset/package.json modules/crossex/package.json \
-    modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc \
-    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json; do
+    modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
+    modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
+    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json; do
     git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:$name" 2>/dev/null || continue
     mkdir -p "$(dirname "$staging/$name")"
     git --git-dir="$APP_DIR/repository.git" show "$commit:$name" > "$staging/$name"
@@ -459,7 +482,7 @@ prepare_dependencies() {
   (cd "$staging" && run_as_service env NODE_ENV=development CI=true "$NODE_BIN" "$PNPM_BIN" install --frozen-lockfile --prod=false --package-import-method=copy --store-dir "$APP_DIR/build-home/pnpm-store")
   [[ -d "$staging/node_modules" ]] || fail '依赖安装未生成 node_modules。'
   local importer
-  for importer in modules/monitor modules/asset modules/crossex; do
+  for importer in modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
     [[ ! -f "$staging/$importer/package.json" || -d "$staging/$importer/node_modules" ]] || fail "依赖安装缺少工作区 importer：$importer"
   done
   # Freeze once. Neither the running service nor later tests/builds can edit packages.
@@ -475,7 +498,7 @@ prepare_workspace() {
   # Every importer needs its own writable shell for Vite and other build caches.
   # Link each entry to the matching frozen importer so pnpm's relative package
   # links keep resolving through the cache's single virtual store.
-  for importer in . modules/monitor modules/asset modules/crossex; do
+  for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
     [[ -d "$dependencies/$importer/node_modules" ]] || continue
     modules="$work_dir/source/$importer/node_modules"
     [[ ! -d "$modules" ]] || continue
@@ -497,6 +520,7 @@ prepare_application() {
   if [[ "$PROJECT_DEPLOY_TESTS" == 1 && ! -f "$test_stamp" && -d "$work_dir/source/modules" ]]; then
     (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules)
     prepare_source_greeks_runtime
+    prepare_source_aster_runtime
   fi
   if [[ ! -f "$typecheck_stamp" ]]; then
     log '类型检查输入变化，执行一次类型检查。'
@@ -507,7 +531,7 @@ prepare_application() {
     log '跳过完整行为测试；CI 继续验证，设置 PROJECT_DEPLOY_TESTS=1 可在部署时补测。'
   elif [[ ! -f "$test_stamp" ]]; then
     log '测试或相关源码变化，在隔离目录执行行为测试。'
-    (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" "$NODE_BIN" "$PNPM_BIN" test)
+    (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" ASTER_PYTHON="$ASTER_PYTHON_PATH" "$NODE_BIN" "$PNPM_BIN" test)
     atomic_record "$test_stamp" "$test_key"
   else log '行为测试输入未变化，复用验证结果。'; fi
   if (( need_build )); then
@@ -539,6 +563,7 @@ prepare_application() {
             fi
           done
         done
+        cp -a "$work_dir/source/modules/aster/dashboard/dist" "$work_dir/trusted-runtime/modules/aster/dashboard/dist"
         python3 "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --dependency-root "$dependencies" --node "$NODE_BIN" --stage-only "$work_dir/embedded-runtime"
         chown -R root:root "$work_dir/embedded-runtime"
         chmod -R a+rX,go-w "$work_dir/embedded-runtime"
@@ -835,7 +860,7 @@ finish_update_service() {
 
 validate_embedded_runtime() {
   local root=$1 file
-  for file in modules/monitor/dist/client/index.html modules/asset/.next/BUILD_ID modules/crossex/dist/index.html modules/greeks/requirements.lock server/modules/greeks-bridge.py deploy/migrate-modules.py; do
+  for file in modules/monitor/dist/client/index.html modules/asset/.next/BUILD_ID modules/crossex/dist/index.html modules/greeks/requirements.lock server/modules/greeks-bridge.py modules/aster/requirements.lock modules/aster/dashboard/dist/client/index.html server/modules/aster.mjs server/modules/python-module.mjs deploy/migrate-modules.py; do
     [[ -s "$root/$file" ]] || { fail "统一部署包缺少模块文件：$file"; return 1; }
   done
 }
@@ -861,7 +886,7 @@ prepare_greeks_runtime() {
   fingerprint=$({ cat "$lockfile"; /usr/bin/python3 -VV; uname -m; } | hash)
   runtime="$APP_DIR/python/$fingerprint"
   updater_safe_path "$runtime" || return 1
-  if [[ -x "$runtime/bin/python" && -f "$runtime/.complete" ]]; then
+  if [[ -x "$runtime/bin/python" && -f "$runtime/.complete" && "$(cat "$runtime/.complete")" == "$fingerprint" ]]; then
     GREEKS_PYTHON_PATH="$runtime/bin/python"
     log 'Greeks 依赖与 Python 环境未变化，复用已验证虚拟环境。'
     return
@@ -884,6 +909,51 @@ prepare_greeks_runtime() {
   GREEKS_PYTHON_PATH="$runtime/bin/python"
   log 'Greeks Python 依赖已按锁定版本安装并验证。'
 }
+prepare_source_aster_runtime() {
+  local trusted_root="$work_dir/python-lock" lockfile="$work_dir/python-lock/modules/aster/requirements.lock"
+  [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || { fail 'ASTER 依赖需要固定提交。'; return 1; }
+  updater_safe_path "$APP_DIR/repository.git" || return 1
+  updater_safe_path "$lockfile" || return 1
+  mkdir -p "$trusted_root/modules/aster"
+  # Never use or freeze a lockfile from the service-owned test/build workspace.
+  # Retrieve its bytes independently from the already-pinned repository object.
+  git --git-dir="$APP_DIR/repository.git" show "$commit:modules/aster/requirements.lock" > "$lockfile" || return 1
+  chmod 0600 "$lockfile"
+  prepare_aster_runtime "$trusted_root"
+}
+prepare_aster_runtime() {
+  local root=$1 fingerprint runtime lockfile="$1/modules/aster/requirements.lock"
+  # Both source-mode testing and CI activation share this privileged boundary.
+  # A protected leaf under a service-writable ancestor is still untrusted.
+  updater_safe_path "$lockfile" || return 1
+  [[ -s "$lockfile" && -f "$lockfile" ]] || { fail '缺少可信 ASTER 依赖锁文件。'; return 1; }
+  updater_safe_path "$APP_DIR/python-aster" || return 1
+  fingerprint=$({ cat "$lockfile"; /usr/bin/python3 -VV; uname -m; } | hash)
+  runtime="$APP_DIR/python-aster/$fingerprint"
+  updater_safe_path "$runtime" || return 1
+  if [[ -x "$runtime/bin/python" && -f "$runtime/.complete" && "$(cat "$runtime/.complete")" == "$fingerprint" ]]; then
+    ASTER_PYTHON_PATH="$runtime/bin/python"
+    log 'ASTER 依赖与 Python 环境未变化，复用已验证虚拟环境。'
+    return
+  fi
+  if [[ -d "$runtime" && ! -L "$runtime" && -f "$runtime/.building" && "$(cat "$runtime/.building")" == "$fingerprint" ]]; then
+    [[ "$(realpath -e "$runtime")" == "$APP_DIR/python-aster/$fingerprint" ]] || return 1
+    rm -rf -- "$runtime"
+  fi
+  [[ ! -e "$runtime" ]] || { fail "ASTER 虚拟环境不完整：$runtime"; return 1; }
+  mkdir -p "$APP_DIR/python-aster"
+  mkdir "$runtime"
+  atomic_record "$runtime/.building" "$fingerprint"
+  # Build at its final path: Python's scripts contain the absolute venv location.
+  /usr/bin/python3 -m venv "$runtime"
+  "$runtime/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$lockfile"
+  "$runtime/bin/python" -c 'import fastapi, httpx, eth_account, eth_abi, websockets'
+  chmod -R a+rX,go-w "$runtime"
+  atomic_record "$runtime/.complete" "$fingerprint"
+  rm -f -- "$runtime/.building"
+  ASTER_PYTHON_PATH="$runtime/bin/python"
+  log 'ASTER Python 依赖已按锁定版本安装并验证。'
+}
 migrate_embedded_modules() {
   module_migration_helper="$1/deploy/migrate-modules.py"
   migration_commit_started=0
@@ -896,6 +966,7 @@ finish_activation() {
   # Finish fallible records while the migration can still restore old services.
   remember_environment || return 1
   atomic_record "$APP_DIR/.greeks-python-path" "$GREEKS_PYTHON_PATH" || return 1
+  atomic_record "$APP_DIR/.aster-python-path" "$ASTER_PYTHON_PATH" || return 1
   if [[ -n "$module_migration_helper" ]]; then
     migration_commit_started=1
     python3 "$module_migration_helper" commit --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json" || return 1
@@ -921,9 +992,10 @@ WorkingDirectory=$APP_DIR/current
 ExecStart=$NODE_BIN $APP_DIR/current/server/index.mjs
 EnvironmentFile=$ENV_FILE
 Environment=GREEKS_PYTHON=$GREEKS_PYTHON_PATH
+Environment=ASTER_PYTHON=$ASTER_PYTHON_PATH
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=45
+TimeoutStopSec=150
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -1007,6 +1079,7 @@ main() {
   build_environment=$(read_build_environment)
   fi
   if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
+  if [[ -f "$APP_DIR/.aster-python-path" ]]; then ASTER_PYTHON_PATH=$(cat "$APP_DIR/.aster-python-path"); fi
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   if [[ "$PROJECT_DEPLOY_MODE" == ci ]]; then
@@ -1045,6 +1118,7 @@ main() {
   validate_embedded_runtime "$release"
   fi
   prepare_greeks_runtime "$release"
+  prepare_aster_runtime "$release"
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] && healthy; then

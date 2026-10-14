@@ -8,7 +8,7 @@ STACK_LOCK=/run/lock/project-aggregation-stack.lock
 STACK_ORDER=(hub)
 declare -A STACK_REPOS=([hub]=project-aggregation)
 declare -A STACK_PATHS=([hub]=deploy/install.sh)
-declare -A STACK_NAMES=([hub]='Project Aggregation（四个内置模块与交易）')
+declare -A STACK_NAMES=([hub]='Project Aggregation（五个内置模块与交易）')
 declare -A stack_status=() stack_seconds=()
 stack_selected=()
 stack_workers=()
@@ -438,7 +438,7 @@ stack_main() {
   stack_run_installers
   stack_log '所选项目均已完成检查或部署；更新与跳过项见各项目日志。'
   if [[ " ${stack_selected[*]} " == *' hub '* ]]; then
-    stack_log '工作台统一使用 3100 端口；四个业务模块沿用工作台鉴权，配置与数据已保留。'
+    stack_log '工作台统一使用 3100 端口；五个业务模块沿用工作台鉴权，配置与数据已保留。'
   fi
 }
 

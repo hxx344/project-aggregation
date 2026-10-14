@@ -77,7 +77,7 @@ export function nextSnapshotExpiry(snapshots: Snapshot[], now: number): number |
 export type FramePhase = 'loading' | 'ready' | 'failed' | 'unsupported';
 export type WorkspacePlan = { frames: { key: string; phase: FramePhase }[]; attempted: string[]; recent: string[] };
 export const emptyWorkspacePlan = (): WorkspacePlan => ({ frames: [], attempted: [], recent: [] });
-const preloadAdapters: Record<string, string> = { monitor: 'monitor', asset: 'asset', crossex: 'standard', greeks: 'standard' };
+const preloadAdapters: Record<string, string> = { monitor: 'monitor', asset: 'asset', crossex: 'standard', greeks: 'standard', aster: 'aster' };
 const workspaceCapacity = Object.keys(preloadAdapters).length;
 export function canPreload(project: Project) {
   return project.enabled && project.accessMode === 'proxy' && !!project.apiUrl && Object.hasOwn(preloadAdapters, project.id) && preloadAdapters[project.id] === project.adapter;

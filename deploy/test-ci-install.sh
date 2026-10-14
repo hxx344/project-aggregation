@@ -80,6 +80,7 @@ fi
 ensure_tools() { :; }
 validate_embedded_runtime() { :; }
 prepare_greeks_runtime() { :; }
+prepare_aster_runtime() { :; }
 migrate_embedded_modules() { :; }
 ensure_node() { NODE_BIN="$FIXTURE_ROOT/runtime/node"; }
 ensure_pnpm() { [[ "$PROJECT_DEPLOY_MODE" == source ]] || { echo "Unexpected pnpm preparation" >&2; return 92; }; PNPM_BIN="$FIXTURE_ROOT/runtime/pnpm"; }

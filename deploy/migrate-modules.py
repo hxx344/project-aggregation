@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 
@@ -20,14 +21,24 @@ LEGACY = {
     'asset': ('/etc/asset-ledger.env', 'ASSET_DATA_DIR', '/var/lib/asset-ledger'),
     'crossex': ('/etc/gate-crossex-arbitrage.env', 'DATA_DIR', '/var/lib/gate-crossex-arbitrage'),
     'greeks': ('/etc/greeks/greeks.env', 'STATE_FILE', '/var/lib/greeks/engine_state.json'),
+    'aster': ('/etc/aster-desk/environment', 'ASTER_TRADING_RUNTIME', '/var/lib/aster-desk'),
 }
+V1_MODULES = ('monitor', 'asset', 'crossex', 'greeks')
+MODULE_SERVICES = dict(zip(LEGACY, SERVICES))
+ASTER_FILE_SETTINGS = ('ASTER_CAPACITY_RELAY_CA_FILE',)
+
+
+def is_link(path):
+    return path.is_symlink() or bool(path.exists() and getattr(path.lstat(), 'st_file_attributes', 0)
+                                     & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
 
 
 def read_env(path):
     values = {}
     if not path.exists():
         return values
-    if path.is_symlink() or not path.is_file():
+    no_links(path, recursive=False)
+    if not path.is_file():
         raise ValueError('Environment file must be a regular file: ' + str(path))
     for line in path.read_text(encoding='utf-8').splitlines():
         stripped = line.strip()
@@ -45,11 +56,11 @@ def read_env(path):
 
 def no_links(path, recursive=True):
     for parent in (path, *path.parents):
-        if parent.is_symlink():
+        if is_link(parent):
             raise ValueError('Migration path cannot contain links: ' + str(path))
     if recursive and path.exists():
         for entry in path.rglob('*') if path.is_dir() else (path,):
-            if entry.is_symlink() or not (entry.is_file() or entry.is_dir()):
+            if is_link(entry) or not (entry.is_file() or entry.is_dir()):
                 raise ValueError('Migration refuses links and special files: ' + str(entry))
 
 
@@ -88,20 +99,42 @@ class Migration:
             if self.uid is not None and hasattr(os, 'chown'):
                 os.chown(path, self.uid, self.gid)
 
+    def require_root_environment(self, path):
+        no_links(path, recursive=False)
+        if os.name == 'posix':
+            for entry in (path, *path.parents):
+                metadata = os.stat(entry, follow_symlinks=False)
+                if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                    raise ValueError('ASTER environment and its parents must be root-owned and not writable by other users: ' + str(entry))
+                if entry == self.filesystem:
+                    break
+
     def begin(self):
         no_links(self.data, recursive=False)
         state = self.load()
-        if state and state['status'] == 'committed':
-            return False
+        if state and (state['data'] != str(self.data) or state['status'] not in ('pending', 'committed', 'rolled-back')):
+            raise ValueError('Migration journal does not match this installation')
         if state and state['status'] == 'pending':
             raise ValueError('An interrupted migration exists; recover it before retrying')
+        completed = list(state.get('completed', V1_MODULES if state['status'] == 'committed' else ())) if state else []
+        if any(name not in LEGACY for name in completed):
+            raise ValueError('Invalid completed module in migration journal')
+        selected = [name for name in LEGACY if name not in completed]
+        if not selected:
+            return False
         modules = self.data / 'modules'
         modules.mkdir(mode=0o700, exist_ok=True)
         no_links(modules, recursive=False)
         if self.uid is not None and hasattr(os, 'chown'):
             os.chown(modules, self.uid, self.gid)
-        state = {'status': 'pending', 'services': {}, 'created': [], 'data': str(self.data)}
-        for service in SERVICES:
+        # A v1 committed receipt retired the four original modules. Extending it
+        # must never restore those services or quarantine their existing data.
+        state = {'schema': 2, 'status': 'pending', 'services': {}, 'created': [],
+                 'completed': completed, 'selected': selected, 'data': str(self.data)}
+        services = [MODULE_SERVICES[name] for name in selected]
+        if not completed:
+            services.append('variational-grid')  # Preserve first-migration retirement.
+        for service in services:
             if self.control('show', service, '--property=LoadState', '--value', check=False) != 'not-found':
                 state['services'][service] = {
                     'active': self.control('is-active', service, check=False) in ('active', 'activating', 'reloading'),
@@ -115,11 +148,16 @@ class Migration:
                 raise RuntimeError('Legacy service did not stop: ' + service)
             if state['services'][service]['enabled'] in ('enabled', 'enabled-runtime'):
                 self.control('disable', *(['--runtime'] if state['services'][service]['enabled'] == 'enabled-runtime' else []), service)
-        for module, (environment, variable, default) in LEGACY.items():
+        for module in selected:
+            environment, variable, default = LEGACY[module]
             target = modules / module
+            no_links(target, recursive=False)
             if target.exists():
                 continue  # Existing embedded-module data always wins.
             env_path = self.path(environment)
+            trusted_aster_environment = module == 'aster' and env_path.exists()
+            if trusted_aster_environment:
+                self.require_root_environment(env_path)
             values = read_env(env_path)
             # Asset's original installer stores its override in the service unit.
             if module == 'asset':
@@ -134,9 +172,10 @@ class Migration:
             source = old_path.parent if module == 'greeks' else old_path
             no_links(source)
             # Only dedicated persistent directories are candidates, never / or /etc.
-            if len(source.parts) < len(self.filesystem.parts) + 3:
+            if len(source.parts) < len(self.filesystem.parts) + 3 or source == self.data or self.data.is_relative_to(source):
                 raise ValueError('Legacy data directory is not dedicated: ' + str(source))
             stage = modules / ('.migrating-' + module)
+            no_links(stage, recursive=False)
             if stage.exists():
                 raise ValueError('Unexpected migration staging directory: ' + str(stage))
             state['created'].append(module)
@@ -149,6 +188,34 @@ class Migration:
                 raise ValueError('CrossEx database exists without credentials.key; refusing a partial migration')
             if env_path.is_file():
                 shutil.copy2(env_path, stage / '.env')
+            if module == 'aster':
+                module_env = stage / '.env'
+                runtime_values = read_env(module_env)
+                for setting in ASTER_FILE_SETTINGS:
+                    if runtime_values.get(setting) and not trusted_aster_environment:
+                        raise ValueError('ASTER referenced files require trusted /etc/aster-desk/environment: ' + setting)
+                updates = {'ASTER_TRADING_RUNTIME': str(target)}
+                # The hub account cannot rely on files readable only by the old
+                # service. Only the root-controlled external configuration may
+                # authorize privileged reads; never trust a copied runtime .env.
+                for setting in ASTER_FILE_SETTINGS:
+                    if not values.get(setting):
+                        continue
+                    reference = self.path(values[setting])
+                    no_links(reference)
+                    if not reference.is_file():
+                        raise ValueError('ASTER referenced file is missing: ' + setting)
+                    certificate = stage / 'migration-files' / (setting.lower() + '.pem')
+                    certificate.parent.mkdir(mode=0o700, exist_ok=True)
+                    shutil.copy2(reference, certificate)
+                    updates[setting] = str(target / certificate.relative_to(stage))
+                # Preserve all unrelated dotenv values byte-for-byte. Shell
+                # re-quoting would corrupt apostrophes when Node parseEnv reads
+                # a relay token (shell quote concatenation is not dotenv).
+                lines = module_env.read_text(encoding='utf-8').splitlines() if module_env.is_file() else []
+                lines = [line for line in lines if line.strip().removeprefix('export ').partition('=')[0].strip() not in updates]
+                lines.extend(f'{key}={shlex.quote(value)}' for key, value in updates.items())
+                module_env.write_text('\n'.join(lines) + '\n', encoding='utf-8')
             if module == 'greeks' and old_path.is_file() and old_path.name != 'engine_state.json':
                 shutil.copy2(old_path, stage / 'engine_state.json')
             # Runtime adapters replace old absolute data paths with their dataDir.
@@ -160,6 +227,7 @@ class Migration:
     def commit(self):
         state = self.load()
         if state and state['status'] == 'pending':
+            state['completed'] = list(dict.fromkeys([*state.get('completed', ()), *state.get('selected', V1_MODULES)]))
             state['status'] = 'committed'
             self.save(state)
 

@@ -12,9 +12,11 @@ let app, modules, closing = false;
 async function shutdown(code = 0) {
   if (closing) return;
   closing = true;
-  await app?.close();
-  await modules?.close();
-  process.exit(code);
+  // Begin every engine's shutdown together, within the service stop budget.
+  // Failure in one close path must not leave another trading worker running.
+  const results = await Promise.allSettled([app?.close(), modules?.close()]);
+  for (const result of results) if (result.status === 'rejected') logger.error({ err: result.reason }, '关闭组件失败');
+  process.exit(results.some(result => result.status === 'rejected') ? 1 : code);
 }
 try {
   modules = await startModules({ dataDir, logger, onFailure: error => { logger.error({ err: error }, '内嵌模块已停止，正在关闭工作台'); void shutdown(1); } });

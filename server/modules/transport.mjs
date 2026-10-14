@@ -1,6 +1,6 @@
 // Only the supervisor can register a transport. Browser project settings never
 // supply pipe names or credentials; virtual origins fail closed when stopped.
-const ids = new Set(['monitor', 'asset', 'crossex', 'greeks']);
+const ids = new Set(['monitor', 'asset', 'crossex', 'greeks', 'aster']);
 const transports = new Map();
 export const moduleOrigin = id => {
   if (!ids.has(id)) throw new Error('Unknown embedded module');

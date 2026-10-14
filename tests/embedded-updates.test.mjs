@@ -5,7 +5,7 @@ import { createUpdateCoordinator, UpdateError, unavailableUpdateState } from '..
 
 const planId = 'embedded-update-plan-1234';
 const stamp = '2026-10-13T01:00:00.000Z';
-const modules = ['crossex', 'greeks'];
+const modules = ['crossex', 'greeks', 'aster'];
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const state = (status = null) => ({ enabled: true, checking: false, checkedAt: stamp, checkError: null,
   planId, expiresAt: stamp, modules: [], job: status ? { id: 'managed-update', status, startedAt: stamp,
@@ -13,12 +13,12 @@ const state = (status = null) => ({ enabled: true, checking: false, checkedAt: s
 
 function fixture({ maintenance = false, pendingPlanId = null } = {}) {
   const persisted = { maintenance, pendingPlanId };
-  const active = { crossex: null, greeks: null }, events = [], handlers = {}, calls = [];
+  const active = { crossex: null, greeks: null, aster: null }, events = [], handlers = {}, calls = [];
   let updaterState = state('running');
   const request = async (origin, route, options) => {
     const id = modules.find(id => origin === `http://${id}.workspace.internal`);
     assert.ok(id, 'guard must use one of the fixed private module origins');
-    assert.ok(options.deadline >= Date.now() && options.deadline <= Date.now() + 10_000, 'module requests have a bounded deadline');
+    assert.ok(options.deadline >= Date.now() && options.deadline <= Date.now() + (id === 'aster' && route.endsWith('update-status') ? 60_000 : 10_000), 'module requests have a bounded deadline');
     if (route === '/__workspace/maintenance') {
       assert.equal(options.method, 'POST');
       assert.deepEqual(Object.keys(options.body), ['active']);
@@ -69,16 +69,16 @@ test('coordinator initialization synchronizes each module with durable maintenan
       const f = fixture(initial);
       await f.coordinator.initialize();
       const expected = initial.maintenance || Boolean(initial.pendingPlanId);
-      assert.deepEqual(f.active, { crossex: expected, greeks: expected });
+      assert.deepEqual(f.active, { crossex: expected, greeks: expected, aster: expected });
       assert.equal(f.persisted.maintenance, expected);
       assert.equal(f.persisted.pendingPlanId, initial.pendingPlanId);
       assert.deepEqual(f.calls, [], 'initialization must not clear a durable latch by consulting a stale updater status');
-      assert.equal(f.events.filter(value => value.startsWith('gate:') && value.endsWith(':done')).length, 2);
+      assert.equal(f.events.filter(value => value.startsWith('gate:') && value.endsWith(':done')).length, 3);
     });
   }
 });
 
-test('apply waits for both module gates, then both busy checks, before privileged updater submission', async () => {
+test('apply waits for all module gates, then all busy checks, before privileged updater submission', async () => {
   const f = fixture(), gateEntered = deferred(), gateRelease = deferred(), statusEntered = deferred(), statusRelease = deferred();
   f.handlers['gate:greeks'] = async active => {
     if (active) { gateEntered.resolve(); await gateRelease.promise; }
@@ -90,7 +90,7 @@ test('apply waits for both module gates, then both busy checks, before privilege
   assert.deepEqual(f.persisted, { maintenance: true, pendingPlanId: planId });
   assert.equal(f.events.includes('prepare'), false); assert.deepEqual(f.calls, []);
   gateRelease.resolve(); await statusEntered.promise;
-  assert.deepEqual(f.active, { crossex: true, greeks: true });
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
   assert.deepEqual(f.calls, []);
   statusRelease.resolve(); assert.equal((await result).job.status, 'running');
   const prepare = f.events.indexOf('prepare'), apply = f.events.indexOf('updater:apply');
@@ -102,7 +102,7 @@ test('apply waits for both module gates, then both busy checks, before privilege
   assert.equal(f.events[apply - 1], 'authorize', 'authorization is rechecked after module readiness, immediately before apply');
   assert.deepEqual(f.calls, ['apply']);
   assert.deepEqual(f.persisted, { maintenance: true, pendingPlanId: null });
-  assert.deepEqual(f.active, { crossex: true, greeks: true });
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
 });
 
 test('busy, unknown and failed module checks never submit updates and restore the prior maintenance state', async t => {
@@ -121,7 +121,7 @@ test('busy, unknown and failed module checks never submit updates and restore th
       await assert.rejects(f.apply(), error => error instanceof UpdateError && error.status === status && !error.uncertain);
       assert.deepEqual(f.calls, []);
       assert.deepEqual(f.persisted, initial);
-      assert.deepEqual(f.active, { crossex: previous, greeks: previous });
+      assert.deepEqual(f.active, { crossex: previous, greeks: previous, aster: previous });
       assert.equal(f.events.some(value => value.includes('private transport failure')), false);
     });
   }
@@ -136,24 +136,46 @@ test('definitive updater rejection restores module gates and the exact previous 
       await assert.rejects(f.apply(), error => error.status === 409);
       assert.deepEqual(f.calls, ['apply']);
       assert.deepEqual(f.persisted, initial);
-      assert.deepEqual(f.active, { crossex: initial.maintenance, greeks: initial.maintenance });
+      assert.deepEqual(f.active, { crossex: initial.maintenance, greeks: initial.maintenance, aster: initial.maintenance });
     });
   }
 });
 
-test('uncertain updater acceptance keeps both module gates across unavailable status and restart initialization', async () => {
+test('independent module evidence runs concurrently and rollback waits for every pending read', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  f.handlers['status:crossex'] = () => ({ data: { busy: true } });
+  f.handlers['status:aster'] = async () => { entered.resolve(); await release.promise; return { data: { busy: false } }; };
+  const result = f.apply();
+  const rejected = assert.rejects(result, error => error.status === 409);
+  await entered.promise;
+  for (const id of modules) assert.ok(f.events.includes(`status:${id}:start`));
+  assert.equal(f.persisted.maintenance, true);
+  assert.equal(f.events.some(value => value.includes(':false:')), false);
+  release.resolve(); await rejected;
+  assert.deepEqual(f.active, { crossex: false, greeks: false, aster: false });
+  assert.deepEqual(f.calls, []);
+});
+
+test('Aster verification failures explain which account evidence must be restored', async () => {
+  const f = fixture();
+  f.handlers['status:aster'] = () => ({ data: { busy: true, reason: '实盘账户缺少有效凭据，无法核查完整挂单；请配置凭据后重试' } });
+  await assert.rejects(f.apply(), error => error.status === 409 && error.message.includes('请配置凭据后重试'));
+  assert.deepEqual(f.calls, []);
+});
+
+test('uncertain updater acceptance keeps all module gates across unavailable status and restart initialization', async () => {
   const f = fixture();
   f.handlers.apply = () => { throw new UpdateError(503, '等待更新结果超时', { uncertain: true }); };
   await assert.rejects(f.apply(), error => error.uncertain === true);
   assert.deepEqual(f.persisted, { maintenance: true, pendingPlanId: planId });
-  assert.deepEqual(f.active, { crossex: true, greeks: true });
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
   f.updaterState = unavailableUpdateState();
   await f.coordinator.status();
   assert.deepEqual(f.persisted, { maintenance: true, pendingPlanId: planId });
-  assert.deepEqual(f.active, { crossex: true, greeks: true });
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
   const restarted = fixture(f.persisted);
   await restarted.coordinator.initialize();
-  assert.deepEqual(restarted.active, { crossex: true, greeks: true });
+  assert.deepEqual(restarted.active, { crossex: true, greeks: true, aster: true });
   assert.equal(f.events.some(value => value.startsWith('gate:') && value.includes(':false:')), false);
 });
 
@@ -176,7 +198,7 @@ test('one failed module maintenance call waits for the other result and prevents
   release.resolve(); await rejected;
   assert.deepEqual(f.calls, []);
   assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
-  assert.deepEqual(f.active, { crossex: false, greeks: false });
+  assert.deepEqual(f.active, { crossex: false, greeks: false, aster: false });
 });
 
 test('failed module synchronization rejects initialization and live-entry operations closed', async () => {

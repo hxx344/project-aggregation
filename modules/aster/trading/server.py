@@ -1,0 +1,634 @@
+"""Authenticated local HTTP API and static dashboard, deployed behind HTTPS."""
+import argparse
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
+import hashlib
+import hmac
+import json
+import logging
+import os
+from pathlib import Path
+import secrets
+import re
+import socket
+import threading
+from time import monotonic
+from typing import Literal
+
+import anyio
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from starlette.datastructures import MutableHeaders
+
+from .engine import Engine
+from .cycle import CYCLE_MAXIMUM
+from .hub_summary import hub_summary
+from .models import TIERS, TradingError
+from .store import Store
+
+ROOT = Path(__file__).resolve().parents[1]
+MAX_BODY_BYTES = 16384
+BODY_TIMEOUT_SECONDS = 10
+SESSION_SECONDS = 43200
+MAX_SESSIONS = 1024
+LOGIN_WINDOW_SECONDS = 300
+MAX_LOGIN_CLIENTS = 1024
+
+
+class DashboardStaticFiles(StaticFiles):
+    """Cache only hashed public JS/CSS listed in this build's own manifest."""
+
+    def __init__(self, directory):
+        super().__init__(directory=directory, html=True)
+        self.immutable_paths = set()
+        try:
+            manifest = json.loads((Path(directory) / ".vite" / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(manifest, dict):
+            return
+        for entry in manifest.values():
+            if not isinstance(entry, dict):
+                continue
+            css = entry.get("css")
+            for path in [entry.get("file"), *(css if isinstance(css, list) else [])]:
+                if isinstance(path, str) and re.fullmatch(r"_next/static/(?:chunks|css)/[^/\\]+[-.][A-Za-z0-9_-]{8,}\.(?:js|css)", path):
+                    self.immutable_paths.add(path)
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 304) and path.replace("\\", "/") in self.immutable_paths:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
+class RequestSecurityMiddleware:
+    """Bound actual request bytes before parsing, including chunked requests."""
+
+    def __init__(self, app, workspace_secret=None):
+        self.app = app
+        self.workspace_secret = workspace_secret
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        if self.workspace_secret is not None:
+            keys = [value for key, value in scope["headers"] if key.lower() == b"x-workspace-key"]
+            if len(keys) != 1 or not hmac.compare_digest(keys[0], self.workspace_secret.encode()):
+                return await Response(status_code=403)(scope, receive, send)
+
+        async def secure_send(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["X-Frame-Options"] = "SAMEORIGIN" if self.workspace_secret is not None else "DENY"
+                headers["Referrer-Policy"] = "same-origin"
+                if scope["path"].startswith("/api/"):
+                    headers["Cache-Control"] = "no-store"
+            await send(message)
+
+        lengths = [value for key, value in scope["headers"] if key.lower() == b"content-length"]
+        declared = None
+        if lengths:
+            value = lengths[0]
+            # Bound digit conversion too: huge integers and duplicate lengths are invalid.
+            if len(lengths) != 1 or not value.isdigit() or len(value) > 20:
+                return await Response(status_code=413)(scope, receive, secure_send)
+            declared = int(value)
+            if declared > MAX_BODY_BYTES:
+                return await Response(status_code=413)(scope, receive, secure_send)
+
+        body = bytearray()
+        try:
+            with anyio.fail_after(BODY_TIMEOUT_SECONDS):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    chunk = message.get("body", b"")
+                    if len(body) + len(chunk) > MAX_BODY_BYTES:
+                        return await Response(status_code=413)(scope, receive, secure_send)
+                    body.extend(chunk)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            return await Response(status_code=408)(scope, receive, secure_send)
+        if declared is not None and declared != len(body):
+            return await Response(status_code=400)(scope, receive, secure_send)
+
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay_receive, secure_send)
+
+
+class Login(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class CycleRecoveryConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    token: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class PairRecoveryConfirmation(CycleRecoveryConfirmation):
+    acknowledge_unknown: Literal[True]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_acknowledgement(cls, values):
+        if not isinstance(values, dict) or values.get("acknowledge_unknown") is not True:
+            raise ValueError("请明确确认未知订单归档")
+        return values
+
+
+class PairRecoverySkip(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    batch_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    acknowledge_skip: Literal[True]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_explicit_acknowledgement(cls, values):
+        if not isinstance(values, dict) or values.get("acknowledge_skip") is not True:
+            raise ValueError("请明确确认跳过本批持仓核对")
+        return values
+
+
+class NewAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
+    name: str = Field(min_length=1, max_length=50)
+    env_prefix: str = Field(pattern=r"^[A-Z][A-Z0-9_]{1,40}$")
+    mode: Literal["paper", "live"]
+
+
+class ListingWatchEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool
+
+
+class MonitoringEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    monitoring_enabled: bool | None = None
+    discovery_enabled: bool | None = None
+    auto_monitor_new: bool | None = None
+    feishu_enabled: bool | None = None
+    new_listing_alerts: bool | None = None
+    strategy_capacity_alerts: bool | None = None
+    listing_capacity_alerts: bool | None = None
+    trade_summary_alerts: bool | None = None
+    hourly_summary_alerts: bool | None = None
+    hourly_summary_interval_minutes: StrictInt | None = Field(default=None, ge=1, le=1440)
+    relay_health_alerts: bool | None = None
+    position_imbalance_alerts: bool | None = None
+
+    @model_validator(mode="after")
+    def nonempty_settings(self):
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("请提交至少一个有效监控设置")
+        return self
+
+
+class MonitoringSymbolEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    monitor: bool | None = None
+    alerts: bool | None = None
+    max_capacity_alert: bool | None = None
+
+    @model_validator(mode="after")
+    def nonempty_booleans(self):
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("请提交至少一个有效开关")
+        return self
+
+
+class MigrationEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
+    batch_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    notional_tolerance: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_present_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的迁移配置字段")
+        return values
+
+
+class CycleEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    symbol: Literal["XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
+    leverage: StrictInt | None = Field(default=None, ge=1, le=CYCLE_MAXIMUM["leverage"])
+    spread_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
+    min_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    max_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    capacity_multiplier: str | None = Field(default=None, min_length=1, max_length=40)
+    daily_volume_limit: str | None = Field(default=None, min_length=1, max_length=40)
+    notional_scope: Literal["per_side", "gross"] | None = None
+    hold_seconds: StrictInt | None = Field(default=None, ge=1, le=CYCLE_MAXIMUM["hold_seconds"])
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_present_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的多空循环配置字段")
+        return values
+
+
+class PolicyEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    ordinary_symbol: Literal["all", "XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
+    threshold: str | None = Field(default=None, min_length=1, max_length=40)
+    order_notional: str | None = Field(default=None, min_length=1, max_length=40)
+    margin_limit: str | None = Field(default=None, min_length=1, max_length=128)
+    min_open_leverage: StrictInt | None = Field(default=None, ge=5, le=20, json_schema_extra={"enum": list(TIERS)})
+    migration: MigrationEdit | None = None
+    cycle: CycleEdit | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_present_values(cls, values):
+        if isinstance(values, dict) and "min_open_leverage" in values and values["min_open_leverage"] not in TIERS:
+            raise ValueError("最低开仓杠杆仅支持 5x、10x、20x")
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的策略配置字段")
+        return values
+
+
+class PairOrdinaryEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    threshold: str | None = Field(default=None, max_length=40)
+    order_notional: str | None = Field(default=None, max_length=40)
+    min_open_leverage: StrictInt | None = None
+    margin_limit: str | None = Field(default=None, max_length=128)
+    spread_limit: str | None = Field(default=None, max_length=128)
+
+
+class PairMarginEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    master_env_prefix: str | None = Field(default=None, max_length=41)
+    check_interval_seconds: StrictInt | None = None
+    threshold: str | None = Field(default=None, max_length=40)
+    min_transfer: str | None = Field(default=None, max_length=40)
+    max_transfer: str | None = Field(default=None, max_length=40)
+    buffer_ratio: str | None = Field(default=None, max_length=128)
+    cooldown_seconds: StrictInt | None = None
+
+
+class NewPair(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    id: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=50)
+    long_account_id: str = Field(min_length=1, max_length=32)
+    short_account_id: str = Field(min_length=1, max_length=32)
+    symbol: Literal["XAUUSD1"] = "XAUUSD1"
+    enabled: bool = False
+    ordinary: PairOrdinaryEdit | None = None
+    cycle: CycleEdit | None = None
+    margin: PairMarginEdit | None = None
+
+
+class PairEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str | None = Field(default=None, min_length=1, max_length=50)
+    ordinary: PairOrdinaryEdit | None = None
+    cycle: CycleEdit | None = None
+    margin: PairMarginEdit | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的配对组配置")
+        return values
+
+
+def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=None):
+    if workspace_secret is not None and (not isinstance(workspace_secret, str) or len(workspace_secret) < 12):
+        raise ValueError("Missing workspace secret")
+    if engine is None:
+        runtime = Path(os.environ.get("ASTER_TRADING_RUNTIME", ROOT / "runtime" / ("demo" if demo else "trading")))
+        store = Store(runtime / "trading.sqlite3", demo=demo)
+        engine = Engine(store, demo=demo)
+    else:
+        # Injected Engines can bypass the default path selection, but must not
+        # publish an authenticated or unclassified ledger through demo's API.
+        engine.store.bind_runtime_mode(demo=engine.demo)
+    password = os.environ.get("ASTER_DASHBOARD_PASSWORD", "")
+    password_digest = hashlib.sha256(password.encode()).digest()
+    failures, fail_lock = OrderedDict(), threading.Lock()
+    sessions, session_lock = OrderedDict(), threading.Lock()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        if start_engine:
+            engine.start()
+        try:
+            yield
+        finally:
+            if start_engine:
+                await anyio.to_thread.run_sync(engine.stop)
+
+    app = FastAPI(title="Aster Account Desk", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.engine = engine
+    if workspace_secret is not None:
+        def begin_workspace_shutdown():
+            # Close admission before waiting for cancelled synchronous HTTP
+            # reads. Keep ProcessLock until normal Engine.stop has joined work.
+            engine.workspace.set_maintenance(True)
+            engine.shutdown.set()
+            engine.scheduler_event.set()
+        app.state.begin_workspace_shutdown = begin_workspace_shutdown
+    app.add_middleware(RequestSecurityMiddleware, workspace_secret=workspace_secret)
+
+    def session_token(previous):
+        # Server-side expiry makes logout and login rotation revoke copied cookies too.
+        token = secrets.token_urlsafe(32)
+        with session_lock:
+            now = monotonic()
+            while sessions and next(iter(sessions.values())) <= now:
+                sessions.popitem(last=False)
+            sessions.pop(previous, None)
+            while len(sessions) >= MAX_SESSIONS:
+                sessions.popitem(last=False)
+            sessions[token] = now + SESSION_SECONDS
+        return token
+
+    async def authenticated(request: Request):
+        if workspace_secret is not None:
+            return  # The outer ASGI middleware authenticated the parent secret.
+        if engine.demo:
+            return
+        token = request.cookies.get("aster_session", "")
+        with session_lock:
+            expires = sessions.get(token)
+            if expires is None or expires <= monotonic():
+                sessions.pop(token, None)
+                raise HTTPException(401, "请登录交易管理")
+
+    async def origin_check(request: Request):
+        expected = (str(request.base_url).rstrip("/") if workspace_secret is not None
+                    else os.environ.get("ASTER_PUBLIC_ORIGIN", str(request.base_url).rstrip("/")))
+        allowed = {expected}
+        if engine.demo:
+            allowed.update({"http://127.0.0.1:3000", "http://localhost:3000"})
+        if request.headers.get("origin") not in allowed:
+            raise HTTPException(403, "请求来源不匹配")
+
+    @app.exception_handler(TradingError)
+    async def trading_error(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_input(request, exc):
+        from fastapi.responses import JSONResponse
+        # Do not echo arbitrary submitted fields or passwords in validation errors.
+        return JSONResponse({"detail": "输入字段或格式无效"}, status_code=422)
+
+    @app.get("/api/health")
+    async def health(response: Response):
+        thread = engine.thread if start_engine else None
+        if engine.shutdown.is_set() or (start_engine and (thread is None or not thread.is_alive())):
+            response.status_code = 503
+            return {"status": "unavailable", "demo": engine.demo}
+        return {"status": "ok" if engine.ready else "starting", "demo": engine.demo}
+
+    @app.post("/api/login", dependencies=[Depends(origin_check)])
+    def login(body: Login, request: Request, response: Response):
+        if workspace_secret is not None:
+            raise HTTPException(409, "登录由工作台统一管理")
+        if len(password) < 16:
+            raise HTTPException(503, "请先在服务器设置至少 16 字符的 ASTER_DASHBOARD_PASSWORD")
+        client = request.client.host if request.client else "unknown"
+        with fail_lock:
+            now = monotonic()
+            # Ordered by last failure; expired clients are removed once, not scanned
+            # on every attempt. Each remaining client holds at most five timestamps.
+            while failures and next(iter(failures.values()))[-1] <= now - LOGIN_WINDOW_SECONDS:
+                failures.popitem(last=False)
+            attempts = failures.get(client, deque())
+            while attempts and attempts[0] <= now - LOGIN_WINDOW_SECONDS:
+                attempts.popleft()
+            if len(attempts) >= 5:
+                raise HTTPException(429, "登录失败次数过多，请 5 分钟后重试")
+            valid = hmac.compare_digest(password_digest, hashlib.sha256(body.password.encode()).digest())
+            if not valid:
+                if client not in failures and len(failures) >= MAX_LOGIN_CLIENTS:
+                    raise HTTPException(429, "登录请求过多，请稍后重试")
+                attempts.append(now)
+                failures[client] = attempts
+                failures.move_to_end(client)
+                raise HTTPException(401, "访问密码不正确")
+            failures.pop(client, None)
+        response.set_cookie("aster_session", session_token(request.cookies.get("aster_session", "")), httponly=True,
+                            secure=request.url.scheme == "https", samesite="strict", max_age=SESSION_SECONDS, path="/")
+        return {"ok": True}
+
+    @app.post("/api/logout", dependencies=[Depends(origin_check)])
+    def logout(request: Request, response: Response):
+        if workspace_secret is not None:
+            raise HTTPException(409, "退出由工作台统一管理")
+        with session_lock:
+            sessions.pop(request.cookies.get("aster_session", ""), None)
+        response.delete_cookie("aster_session", path="/", secure=request.url.scheme == "https", httponly=True, samesite="strict")
+        return {"ok": True}
+
+    @app.get("/api/state", dependencies=[Depends(authenticated)])
+    def state(compact: bool = False, history_account: str = Query("", max_length=32),
+              history_revision: str = Query("", max_length=64)):
+        return {**engine.state(background_reports=True, compact=compact,
+                            history_account=history_account, history_revision=history_revision),
+                "workspaceManaged": workspace_secret is not None}
+
+    if workspace_secret is not None:
+        class Maintenance(BaseModel):
+            model_config = ConfigDict(extra="forbid", strict=True)
+            active: bool
+
+        @app.post("/__workspace/maintenance")
+        def maintenance(body: Maintenance):
+            return engine.workspace.set_maintenance(body.active)
+
+        @app.get("/__workspace/update-status")
+        def update_status():
+            return engine.workspace.update_status()
+
+    @app.get("/api/hub/summary", dependencies=[Depends(authenticated)])
+    def summary(schema_version: int = Query(2, alias="schemaVersion", ge=2, le=2), diagnostics: bool = False):
+        return hub_summary(engine, diagnostics=diagnostics)
+
+    write_dependencies = [Depends(authenticated), Depends(origin_check)]
+
+    @app.get("/api/pairs", dependencies=[Depends(authenticated)])
+    def pairs():
+        with engine.store.read_snapshot() as reader:
+            return {"pairs": engine.pairs.states(reader)}
+
+    @app.post("/api/pairs", dependencies=write_dependencies)
+    def create_pair(body: NewPair):
+        return {"ok": True, "pair": engine.pairs.create(body.model_dump(exclude_unset=True))}
+
+    @app.patch("/api/pairs/{pair_id}", dependencies=write_dependencies)
+    def configure_pair(pair_id: str, body: PairEdit):
+        return {"ok": True, "pair": engine.pairs.configure(pair_id, body.model_dump(exclude_unset=True))}
+
+    @app.post("/api/pairs/{pair_id}/enable", dependencies=write_dependencies)
+    def enable_pair(pair_id: str):
+        return {"ok": True, "pair": engine.pairs.enable(pair_id, True)}
+
+    @app.post("/api/pairs/{pair_id}/pause", dependencies=write_dependencies)
+    def pause_pair(pair_id: str):
+        return {"ok": True, "pair": engine.pairs.enable(pair_id, False)}
+
+    @app.post("/api/pairs/{pair_id}/recovery-preview", dependencies=write_dependencies)
+    def preview_pair_recovery(pair_id: str):
+        return engine.pairs.preview_recovery(pair_id)
+
+    @app.post("/api/pairs/{pair_id}/recovery-check", dependencies=write_dependencies)
+    def check_pair_recovery(pair_id: str):
+        return engine.pairs.check_recovery(pair_id)
+
+    @app.post("/api/pairs/{pair_id}/recovery-confirm", dependencies=write_dependencies)
+    def confirm_pair_recovery(pair_id: str, body: PairRecoveryConfirmation):
+        return engine.pairs.confirm_recovery(pair_id, body.token, body.acknowledge_unknown)
+
+    @app.post("/api/pairs/{pair_id}/recovery-skip", dependencies=write_dependencies)
+    def skip_pair_recovery(pair_id: str, body: PairRecoverySkip):
+        return engine.pairs.skip_recovery(pair_id, body.batch_id, body.acknowledge_skip)
+
+    @app.post("/api/pairs/{pair_id}/baseline-preview", dependencies=write_dependencies)
+    def preview_pair_baseline(pair_id: str):
+        return engine.pairs.preview_baseline(pair_id)
+
+    @app.post("/api/pairs/{pair_id}/baseline-confirm", dependencies=write_dependencies)
+    def confirm_pair_baseline(pair_id: str, body: PairRecoveryConfirmation):
+        return engine.pairs.confirm_baseline(pair_id, body.token, body.acknowledge_unknown)
+
+    @app.delete("/api/pairs/{pair_id}", dependencies=write_dependencies)
+    def delete_pair(pair_id: str):
+        engine.pairs.delete(pair_id)
+        return {"ok": True}
+
+    @app.post("/api/pairs/{pair_id}/reconcile-flat", dependencies=write_dependencies)
+    def reconcile_pair_flat(pair_id: str):
+        engine.pairs.reconcile_flat(pair_id)
+        return {"ok": True}
+
+    @app.get("/api/monitoring", dependencies=[Depends(authenticated)])
+    def monitoring_settings():
+        with engine.store.read_snapshot() as reader:
+            return engine.monitoring_state(reader)
+
+    @app.patch("/api/monitoring", dependencies=write_dependencies)
+    def edit_monitoring(body: MonitoringEdit):
+        engine.edit_monitoring(body.model_dump(exclude_unset=True))
+        return {"ok": True}
+
+    @app.patch("/api/monitoring/symbols/{symbol}", dependencies=write_dependencies)
+    def edit_monitoring_symbol(symbol: str, body: MonitoringSymbolEdit):
+        engine.edit_monitoring(body.model_dump(exclude_unset=True), symbol=symbol)
+        return {"ok": True}
+
+    @app.patch("/api/listings/{symbol}/capacity-alert", dependencies=write_dependencies)
+    def listing_capacity_alert(symbol: str, body: ListingWatchEdit):
+        if engine.demo:
+            raise TradingError("模拟环境不运行额度提醒")
+        engine.store.set_listing_watch(symbol, body.enabled)
+        return {"ok": True}
+
+    @app.post("/api/accounts", dependencies=write_dependencies)
+    def add_account(body: NewAccount):
+        engine.add_account(body.model_dump())
+        return {"ok": True}
+
+    @app.patch("/api/accounts/{account_id}", dependencies=write_dependencies)
+    def configure(account_id: str, body: PolicyEdit):
+        engine.configure(account_id, body.model_dump(exclude_unset=True))
+        return {"ok": True}
+
+    @app.delete("/api/accounts/{account_id}", dependencies=write_dependencies)
+    def delete_account(account_id: str):
+        engine.delete_account(account_id)
+        return {"ok": True}
+
+    @app.post("/api/accounts/{account_id}/enable", dependencies=write_dependencies)
+    def enable(account_id: str):
+        engine.enable(account_id, True)
+        return {"ok": True}
+
+    @app.post("/api/accounts/{account_id}/pause", dependencies=write_dependencies)
+    def pause(account_id: str):
+        engine.enable(account_id, False)
+        return {"ok": True}
+
+    @app.post("/api/accounts/{account_id}/retry", dependencies=write_dependencies)
+    def retry(account_id: str):
+        engine.retry(account_id)
+        return {"ok": True}
+
+    @app.post("/api/accounts/{account_id}/cycle/recovery-preview", dependencies=write_dependencies)
+    def preview_cycle_recovery(account_id: str):
+        return engine.preview_cycle_recovery(account_id)
+
+    @app.post("/api/accounts/{account_id}/cycle/recovery-confirm", dependencies=write_dependencies)
+    def confirm_cycle_recovery(account_id: str, body: CycleRecoveryConfirmation):
+        engine.confirm_cycle_recovery(account_id, body.token)
+        return {"ok": True}
+
+    output = Path(os.environ.get("ASTER_DASHBOARD_DIR", ROOT / "dashboard" / "dist" / "client"))
+    if output.exists():
+        app.mount("/", DashboardStaticFiles(output), name="dashboard")
+    else:
+        @app.get("/")
+        def missing_dashboard():
+            raise HTTPException(503, "前端尚未构建，请完成安装或执行前端构建")
+    return app
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--demo", action="store_true", help="Isolated paper-only demonstration")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=8765, type=int)
+    args = parser.parse_args()
+    if args.demo and args.host not in ("127.0.0.1", "localhost"):
+        parser.error("Demo mode is restricted to loopback")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Signed query URLs must not be emitted by an HTTP client's diagnostic logger.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    import uvicorn
+    # Reserve the listening address before any persisted strategy can resume.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Rebind after a Linux service restart even if accepted connections remain
+        # in TIME_WAIT. Windows SO_REUSEADDR can allow taking an occupied address.
+        if os.name != "nt":
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((args.host, args.port))
+        config = uvicorn.Config(create_app(demo=args.demo), host=args.host, port=args.port,
+                                proxy_headers=True, forwarded_allow_ips="127.0.0.1", access_log=False)
+        uvicorn.Server(config).run(sockets=[listener])
+    finally:
+        listener.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -90,10 +90,11 @@ printf 'Environment rollback regression checks passed.\n'
   module_migration_helper=fixture-migration.py
   DATA_PATH="$test_root/data"
   GREEKS_PYTHON_PATH=fixture-python
+  ASTER_PYTHON_PATH=fixture-aster-python
   remember_environment() { printf 'environment\n' >> "$test_root/order"; [[ ${fail_record:-} != environment ]]; }
-  atomic_record() { printf 'python-path\n' >> "$test_root/order"; [[ ${fail_record:-} != python ]]; }
+  atomic_record() { printf '%s\n' "${1##*/}" >> "$test_root/order"; [[ ${fail_record:-} != "${1##*/}" ]]; }
   python3() { printf 'commit\n' >> "$test_root/order"; }
-  for fail_record in environment python; do
+  for fail_record in environment .greeks-python-path .aster-python-path; do
     : > "$test_root/order"
     if finish_activation; then echo 'Failed activation record was ignored' >&2; exit 1; fi
     [[ $activation_started == 1 ]]
@@ -103,7 +104,7 @@ printf 'Environment rollback regression checks passed.\n'
   : > "$test_root/order"
   finish_activation
   [[ $activation_started == 0 ]]
-  printf 'environment\npython-path\ncommit\n' > "$test_root/expected-order"
+  printf 'environment\n.greeks-python-path\n.aster-python-path\ncommit\n' > "$test_root/expected-order"
   cmp "$test_root/expected-order" "$test_root/order"
 )
 printf 'Activation record failures preserve the migration rollback boundary.\n'
@@ -122,7 +123,7 @@ cp "$test_root/durable-record" "$test_root/expected-record"
 
 # A later record/commit failure must restore both the running environment and
 # the durable snapshot, even though remember_environment already succeeded.
-for fail_record in python migration migration-ack historic-commit; do
+for fail_record in python aster-python migration migration-ack historic-commit; do
   (
     test_root="$test_root/commitpoint-$fail_record"
     APP_DIR="$test_root/application"
@@ -135,6 +136,8 @@ for fail_record in python migration migration-ack historic-commit; do
     mkdir -p "$old_release" "$release" "$work_dir"
     printf 'previous service\n' > "$old_unit_backup"
     printf 'candidate service\n' > "$UNIT_FILE"
+    printf 'previous-greeks\n' > "$APP_DIR/.greeks-python-path"
+    if [[ "$fail_record" != aster-python ]]; then printf 'previous-aster\n' > "$APP_DIR/.aster-python-path"; fi
     printf 'HOST=127.0.0.1\nPORT=3100\n' > "$ENV_FILE"
     cp "$ENV_FILE" "$test_root/expected-good.env"
     remember_environment
@@ -145,8 +148,13 @@ for fail_record in python migration migration-ack historic-commit; do
     module_migration_helper=fixture-migration.py
     DATA_PATH="$test_root/data"
     GREEKS_PYTHON_PATH=fixture-python
+    ASTER_PYTHON_PATH=fixture-aster-python
     printf 'pending\n' > "$test_root/migration-status"
-    atomic_record() { [[ "$fail_record" != python ]] || return 1; printf '%s\n' "$2" > "$1"; }
+    atomic_record() {
+      [[ "$fail_record" != python ]] || return 1
+      [[ "$fail_record" != aster-python || "$1" != "$APP_DIR/.aster-python-path" ]] || return 1
+      printf '%s\n' "$2" > "$1"
+    }
     python3() {
       printf '%s\n' "$2" >> "$test_root/migration.calls"
       case "$2" in
@@ -175,11 +183,15 @@ for fail_record in python migration migration-ack historic-commit; do
       [[ ! -e "$test_root/systemctl.calls" && ! -e "$test_root/current.target" ]]
       cmp -s "$test_root/expected-candidate.env" "$ENV_FILE"
       cmp -s "$test_root/expected-candidate.env" "$APP_DIR/.last-successful.env"
+      [[ $(cat "$APP_DIR/.greeks-python-path") == fixture-python && $(cat "$APP_DIR/.aster-python-path") == fixture-aster-python ]]
       if grep -q '^rollback$' "$test_root/migration.calls"; then echo 'Committed topology was rolled back' >&2; exit 1; fi
       exit 0
     fi
     cmp -s "$test_root/expected-good.env" "$ENV_FILE"
     cmp -s "$test_root/expected-good.env" "$APP_DIR/.last-successful.env"
+    [[ $(cat "$APP_DIR/.greeks-python-path") == previous-greeks ]]
+    if [[ "$fail_record" == aster-python ]]; then [[ ! -e "$APP_DIR/.aster-python-path" ]];
+    else [[ $(cat "$APP_DIR/.aster-python-path") == previous-aster ]]; fi
     grep -q '^rollback$' "$test_root/migration.calls"
     # The next attempt must still capture the old healthy environment.
     prepare_environment_rollback

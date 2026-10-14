@@ -69,7 +69,7 @@ PNPM_VERSION=changed-pnpm; input_keys; compare 1 1 1 1 1
 capture
 runtime_key=another-node; input_keys; compare 1 1 1 1 1
 capture
-for importer in monitor asset crossex; do
+for importer in monitor asset crossex aster/dashboard; do
   mkdir -p "$source_dir/modules/$importer"
   echo module > "$source_dir/modules/$importer/package.json"; refresh; compare 1 1 1 1 1
   capture
@@ -80,6 +80,9 @@ mkdir -p "$source_dir/modules/asset/scripts" "$source_dir/modules/asset/lib"
 echo prepare > "$source_dir/modules/asset/scripts/prepare-ledger.mjs"; refresh; compare 1 1 1 1 1
 capture
 echo example > "$source_dir/modules/asset/lib/example-ledger.json"; refresh; compare 1 1 1 1 1
+capture
+mkdir -p "$source_dir/modules/aster/trading"
+echo cycle > "$source_dir/modules/aster/trading/cycle-config.json"; refresh; compare 1 1 1 1 1
 capture
 echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 1 1 1 1
 capture

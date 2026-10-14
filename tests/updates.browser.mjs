@@ -1,6 +1,6 @@
 // Run with playwright-cli run-code --filename against the isolated production preview.
 async (page) => {
-  const origin = 'http://127.0.0.1:4175';
+  const origin = 'http://hub.localhost:4175';
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const errors = [], applies = [], checks = [];
   const releaseNotes = '系统更新可查看具体变更 📝\n- 保留多行说明\n<img src=x onerror="window.__releaseNoteExecuted=true">\n' + '完整说明文本：' + 'x'.repeat(240);
@@ -200,6 +200,11 @@ async (page) => {
   await page.getByRole('button', { name: '确认更新 1 个模块', exact: true }).click({ clickCount: 2 });
   await waitHeld(heldApplies);
   assert(applies.length === 1 && applies[0].csrf === 'update-fixture-csrf', 'single confirmed update retains CSRF protection');
+  // Fresh Aster order evidence can outlast the ordinary API timeout. Advancing
+  // the browser clock must not turn an in-flight precheck into a lost response.
+  await advance(105_000);
+  assert(await page.getByText('连接暂时中断，正在重连并核实更新进度。', { exact: true }).count() === 0, 'bounded module prechecks remain pending until the apply deadline');
+  assert(applies.length === 1, 'a slow precheck never resubmits the update');
   state.job.status = 'running'; state.job.activeModule = 'workbench'; state.job.steps[0].status = 'running'; state.job.message = '正在安装集序工作台';
   await emit();
   heldApplies.shift()(); await page.waitForTimeout(40);

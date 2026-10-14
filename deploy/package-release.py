@@ -1,4 +1,4 @@
-"""Package the unified application and its four embedded module runtimes."""
+"""Package the unified application and its five embedded module runtimes."""
 import argparse
 import gzip
 import hashlib
@@ -14,9 +14,11 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-MODULES = ('monitor', 'asset', 'crossex', 'greeks')
+MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
+# ASTER's dashboard is prebuilt static content served by its Python bridge.
+# Its vinext/React build graph must not become server runtime dependencies.
 IMPORTERS = ('.', 'modules/monitor', 'modules/asset', 'modules/crossex')
-EXCLUDED = {'node_modules', '.git', '.venv', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',
+EXCLUDED = {'node_modules', '.git', '.venv', '.venv-aster', '.vinext', '.wrangler', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',
             '.mypy_cache', 'tests', 'test-results', 'output', 'runtime-data', '.data',
             '.env', '.env.local', '.env.production', '.env.production.local', '.env.linux'}
 
@@ -256,7 +258,8 @@ def stage_runtime(source, stage, dependency_roots=(), node='node'):
     copy_runtime_dependencies(source, stage, dependency_roots, node)
     for relative in ('modules/monitor/dist/client/index.html', 'modules/asset/.next/BUILD_ID',
                      'modules/crossex/dist/index.html', 'modules/greeks/requirements.lock',
-                     'server/modules/greeks-bridge.py'):
+                     'server/modules/greeks-bridge.py', 'modules/aster/requirements.lock',
+                     'modules/aster/dashboard/dist/client/index.html', 'server/modules/aster.mjs', 'server/modules/python-module.mjs'):
         if not (stage / relative).is_file():
             raise ValueError('Missing module runtime/build output: ' + relative)
     (stage / 'deploy').mkdir()

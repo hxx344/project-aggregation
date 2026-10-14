@@ -1,11 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 import { chmodSync } from 'node:fs';
 
-let application, closing = false;
+let application, closing = false, closeTimeoutMs = 30_000;
 async function close(code = 0) {
   if (closing) return;
   closing = true;
-  const deadline = setTimeout(() => process.exit(1), 30_000).unref();
+  const deadline = setTimeout(() => process.exit(1), closeTimeoutMs).unref();
   try { await application?.close(); }
   finally { clearTimeout(deadline); process.exit(code); }
 }
@@ -19,7 +19,8 @@ process.on('message', async message => {
   if (message?.type !== 'start' || application || closing) return;
   try {
     const { id, root, dataDir, secret, socketPath, environment, transports } = message;
-    if (!['monitor', 'asset', 'crossex', 'greeks'].includes(id)) throw new Error('Invalid module');
+    if (!['monitor', 'asset', 'crossex', 'greeks', 'aster'].includes(id)) throw new Error('Invalid module');
+    closeTimeoutMs = id === 'aster' ? 110_000 : 30_000;
     process.chdir(root);
     const { createModule } = await import(`./${id}.mjs`);
     application = await createModule({ root, dataDir, secret, environment, transports });

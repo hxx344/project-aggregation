@@ -155,8 +155,8 @@ export async function createEmbeddedFundingFixture({ alias = false } = {}) {
     await listen(crossex.server, crossexPath);
     removers.push(registerModuleTransport('crossex', { socketPath: crossexPath, secret: crossexSecret }));
     await crossex.market.refresh();
-    // Hub startup releases maintenance on both trading modules. The unrelated
-    // Greeks module exposes only that local control, never an exchange client.
+    // Hub startup releases maintenance on every trading module. The unrelated
+    // Greeks/Aster fixtures share only this local control, never an exchange client.
     const greeksPath = pipe(directory, 'greeks'), greeksSecret = randomUUID();
     greeks = http.createServer(async (req, res) => {
       if (req.headers['x-workspace-key'] !== greeksSecret) { res.writeHead(401); res.end(); return; }
@@ -167,6 +167,7 @@ export async function createEmbeddedFundingFixture({ alias = false } = {}) {
     });
     await listen(greeks, greeksPath);
     removers.push(registerModuleTransport('greeks', { socketPath: greeksPath, secret: greeksSecret }));
+    removers.push(registerModuleTransport('aster', { socketPath: greeksPath, secret: greeksSecret }));
     // Keep UI sessions fresh without account polling or any order operation.
     refreshTimer = setInterval(() => { if (!closed) void crossex.market.refreshSource(); }, 2000); refreshTimer.unref();
     hub = await createHub({ embeddedModules: true, dataDir: path.join(directory, 'hub'), distDir: path.join(root, 'dist'),

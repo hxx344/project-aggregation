@@ -70,7 +70,7 @@ async function fixture(t, { existing = false } = {}) {
   return { request, login, launch, calls, dataDir, app };
 }
 
-test('migration exposes exactly four built-ins, keeps the native trading module and preserves old configuration', async t => {
+test('migration exposes exactly five built-ins, keeps the native trading module and preserves old configuration', async t => {
   const f = await fixture(t, { existing: true });
   assert.equal((await f.request('/api/projects')).status, 401);
   await f.login();
@@ -79,7 +79,7 @@ test('migration exposes exactly four built-ins, keeps the native trading module 
   assert.ok(projects.every(project => project.embedded && project.accessMode === 'proxy'));
   assert.equal((await f.request('/api/trading')).status, 200);
   assert.equal((await f.request('/api/trading/execution')).status, 200);
-  assert.equal((await f.request('/api/projects/aster/launch', { method: 'POST' })).status, 404);
+  assert.equal((await f.request('/api/projects/variational/launch', { method: 'POST' })).status, 404);
   assert.equal((await f.request('/api/projects', { method: 'POST', body: { id: 'other' } })).status, 405);
   assert.equal((await f.request('/api/projects/monitor', { method: 'PUT', body: { apiUrl: 'http://127.0.0.1:3000' } })).status, 400);
   assert.equal((await f.request('/api/projects/asset', { method: 'PUT', body: { autoSync: false, order: 7 } })).status, 200);
@@ -88,7 +88,7 @@ test('migration exposes exactly four built-ins, keeps the native trading module 
   assert.equal(db.prepare('SELECT count(*) AS count FROM projects WHERE id LIKE ?').get('saved-%').count, 26); db.close();
 });
 
-test('one hub login reaches all four modules on one TCP port; private controls and export stay backend-only', async t => {
+test('one hub login reaches all five modules on one TCP port; private controls and export stay backend-only', async t => {
   const f = await fixture(t); await f.login();
   for (const id of moduleIds) {
     const module = await f.launch(id);

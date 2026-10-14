@@ -128,6 +128,31 @@ class RuntimeDependencyTests(unittest.TestCase):
             self.assertFalse((self.target / 'node_modules' / name).exists())
         self.assertFalse(any(module.is_link(path) for path in self.target.rglob('*')))
 
+    def test_five_module_package_includes_aster_static_and_python_without_vinext(self):
+        from unittest.mock import patch
+        runtime, vinext = self.package('runtime'), self.package('vinext')
+        for importer in module.IMPORTERS:
+            self.importer({'runtime': runtime}, importer=importer)
+        self.importer({'vinext': vinext}, importer='modules/aster/dashboard')
+        for name in module.MODULES:
+            (self.source / 'modules' / name).mkdir(parents=True, exist_ok=True)
+        required = ('dist/index.html', 'server/modules/greeks-bridge.py', 'server/modules/aster.mjs', 'server/modules/python-module.mjs',
+                    'modules/monitor/dist/client/index.html', 'modules/asset/.next/BUILD_ID',
+                    'modules/crossex/dist/index.html', 'modules/greeks/requirements.lock',
+                    'modules/aster/dashboard/dist/client/index.html', 'modules/aster/requirements.lock',
+                    'modules/aster/trading/server.py', 'deploy/migrate-modules.py')
+        for name in required:
+            file = self.source / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text('runtime')
+        with patch.object(module, 'read_runtime_lock', return_value=self.lock):
+            module.stage_runtime(self.source, self.target)
+        for name in required:
+            self.assertTrue((self.target / name).is_file(), name)
+        self.assertFalse((self.target / 'node_modules/vinext').exists())
+        self.assertFalse((self.target / 'modules/aster/dashboard/node_modules').exists())
+        self.assertTrue((self.target / 'node_modules/runtime/package.json').is_file())
+
     def test_missing_required_direct_and_transitive_dependencies_fail(self):
         runtime, child = self.package('runtime'), self.package('required-child')
         self.connect(runtime, child)
