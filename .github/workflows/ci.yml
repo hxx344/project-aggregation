@@ -94,6 +94,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare privileged installation paths on the disposable runner
+        run: |
+          # Hosted tool-cache directories may be runner-owned or group-writable.
+          # Match a fresh server without weakening the installer's trust checks.
+          for path in /opt /usr/local /usr/local/bin; do
+            test -d "$path" && test ! -L "$path"
+            stat -c '%U:%G:%a %n' "$path"
+            sudo chown root:root "$path"
+            sudo chmod go-w "$path"
+          done
       - name: Check relay syntax and connection configuration
         run: |
           bash -n deploy/install-aster-relay.sh
