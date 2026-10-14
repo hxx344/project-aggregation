@@ -166,6 +166,9 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
         setUnavailable(true);
         setNetworkError('');
       } else if (kind === 'apply' && error instanceof ApiError && error.status >= 400 && error.status < 500) {
+        // A definite rejection did not accept this attempt. Checks may reuse the
+        // same valid plan, so only unresolved or accepted attempts stay locked.
+        submittedPlan.current = null;
         uncertainRef.current = null;
         setUncertain(false);
         setActionNotice(error.message);
