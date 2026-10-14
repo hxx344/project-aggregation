@@ -111,6 +111,26 @@ test('missing or malformed optional release notes do not disable an otherwise va
   assert.throws(() => publicUpdateState(value), error => error.status === 503, 'existing message validation is unchanged');
 });
 
+test('recovery status crosses the local client without broadening public metadata', async t => {
+  const client = await fixture(t, (_req, res) => {
+    const value = state();
+    value.modules[0] = { ...value.modules[0], recovery: true, installedIdentity: 'private-identity', installerHash: 'private-hash' };
+    res.end(JSON.stringify(value));
+  });
+  for (const value of [await client.status(), await client.check(), await client.apply(planId)]) {
+    assert.equal(value.modules[0].recovery, true);
+    assert.equal(JSON.stringify(value).includes('private-'), false);
+  }
+  const value = state();
+  assert.equal(publicUpdateState(value).modules[0].recovery, undefined);
+  value.modules[0].recovery = false;
+  assert.equal(publicUpdateState(value).modules[0].recovery, false);
+  for (const recovery of [null, 'true', 1, {}, []]) {
+    value.modules[0].recovery = recovery;
+    assert.throws(() => publicUpdateState(value), error => error.status === 503);
+  }
+});
+
 test('token settings expose only capability and configured status, including legacy compatibility', async t => {
   const secret = 'github_pat_' + 'fixture'.repeat(6), calls = [];
   const client = await fixture(t, async (req, res) => {

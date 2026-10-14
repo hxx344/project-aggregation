@@ -39,7 +39,7 @@ CHECK_RETRY_MAX_INTERVAL = 30 * 60
 ACTIVE = {'queued', 'running'}
 TOKEN = re.compile(r'[a-f0-9]{32}')
 MAX_CREDENTIALS = 1024
-PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes')
+PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes', 'recovery')
 ENVIRONMENT = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8',
                'PYTHONDONTWRITEBYTECODE': '1', 'DEBIAN_FRONTEND': 'noninteractive'}
 
@@ -375,12 +375,29 @@ class Coordinator:
         if self.scheduler_thread:
             self.scheduler_thread.join(timeout=2)
 
-    def _candidate(self, installed):
+    def recovery_targets(self):
+        with self.lock():
+            state = self.load()
+            job = state.get('job')
+            if not job or job.get('status') not in ('failed', 'interrupted'):
+                return {}
+            try:
+                # An expired, protected plan identifies a failed target only.
+                # It never authorizes apply/run; those require a fresh plan.
+                plan = self.read_plan(state.get('jobPlanId'), allow_expired=True)
+            except (UpdateError, OSError, ValueError):
+                return {}
+            unfinished = {step['id'] for step in job['steps'] if step['status'] != 'succeeded'}
+            return {entry['id']: {**entry, 'jobId': job['id'], 'startedAt': job['startedAt']}
+                    for entry in plan['entries'] if entry['id'] in unfinished}
+
+    def _candidate(self, installed, recovery=None):
         item = dict(installed)
         if item['state'] == 'unmanaged':
             return item, None
         module = BY_ID[item['id']]
         try:
+            receipt = None
             receipt_path = self.directory / (module.id + '.receipt.json')
             if receipt_path.exists() or receipt_path.is_symlink():
                 receipt = read_json(receipt_path)
@@ -392,6 +409,15 @@ class Coordinator:
                         releaseNotes=release.get('releaseNotes', ''))
             current = item['currentCommit']
             if current == release['commit']:
+                completed = (receipt and receipt.get('identity') == item.get('identity') and
+                             all(receipt.get(key) == release[key] for key in
+                                 ('commit', 'releaseId', 'applicationKey', 'installerHash')) and
+                             recovery and (receipt.get('jobId') == recovery['jobId'] or
+                                 not receipt.get('jobId') and timestamp(receipt.get('completedAt')) > timestamp(recovery['startedAt'])))
+                if recovery and recovery['commit'] == current and not completed:
+                    item.update(state='available', recovery=True,
+                                reason='版本已对齐，但上次更新未确认完成；可重新确认并恢复更新')
+                    return item, release
                 item.update(state='current', reason='已是最新正式版本')
                 return item, None
             if current and not self.releases.is_newer(module, current, release['commit']):
@@ -412,8 +438,9 @@ class Coordinator:
     def perform_check(self):
         try:
             installations = self.inspect()
+            recovery = self.recovery_targets()
             with ThreadPoolExecutor(max_workers=3) as pool:
-                results = list(pool.map(self._candidate, installations))
+                results = list(pool.map(lambda item: self._candidate(item, recovery.get(item['id'])), installations))
             modules = [item for item, _ in results]
             retry_at = max((item.pop('retryAt', 0) for item in modules), default=0)
             candidates = [(item, release) for item, release in results if release]
@@ -458,13 +485,13 @@ class Coordinator:
                 self._record_check_failure(state, '版本检查未完成')
                 self.save(state)
 
-    def read_plan(self, plan_id):
+    def read_plan(self, plan_id, *, allow_expired=False):
         if not isinstance(plan_id, str) or not TOKEN.fullmatch(plan_id):
             raise UpdateError(400, '更新计划格式无效')
         directory = self.plans / plan_id
         trusted(directory, directory=True)
         plan = read_json(directory / 'plan.json')
-        if plan.get('schema') != 1 or plan.get('id') != plan_id or timestamp(plan.get('expiresAt')) <= self.clock():
+        if plan.get('schema') != 1 or plan.get('id') != plan_id or not allow_expired and timestamp(plan.get('expiresAt')) <= self.clock():
             raise UpdateError(409, '更新计划已过期，请重新检查')
         entries = plan.get('entries')
         ids = [entry.get('id') for entry in entries] if isinstance(entries, list) else []
@@ -514,6 +541,9 @@ class Coordinator:
                 self.launch()
             except Exception:
                 state['job'].update(status='failed', finishedAt=iso(self.clock()), message='无法启动更新服务，请检查服务器服务状态')
+                for step in state['job']['steps']:
+                    step.update(status='skipped', message='尚未执行')
+                state.update(planId=None, expiresAt=None)
                 self.save(state)
                 raise UpdateError(503, '更新服务未能启动') from None
             return self.public(state)
@@ -574,13 +604,14 @@ class Coordinator:
                     if not observed or observed['state'] == 'unmanaged' or not (
                             observed.get('applicationKey') == entry['applicationKey'] or observed.get('currentCommit') == entry['commit']):
                         raise UpdateError(500, BY_ID[key].name + ' 的安装结果尚未确认，请查看服务器部署日志')
-                    receipt = {'commit': entry['commit'], 'releaseId': entry['releaseId'], 'applicationKey': entry['applicationKey'],
+                    receipt = {'jobId': job_id, 'commit': entry['commit'], 'releaseId': entry['releaseId'], 'applicationKey': entry['applicationKey'],
                                'installerHash': entry['installerHash'], 'identity': observed['identity'], 'completedAt': iso(self.clock())}
                     write_json(self.directory / (key + '.receipt.json'), receipt)
                     def succeeded(state, job):
                         next(step for step in job['steps'] if step['id'] == key).update(status='succeeded', message='已完成更新与健康检查')
                         module = next((item for item in state['modules'] if item['id'] == key), None)
                         if module:
+                            module.pop('recovery', None)
                             module.update(state='current', currentCommit=entry['commit'], currentVersion=entry['version'], reason='已是所选正式版本')
                     self.progress(job_id, succeeded)
                 def finish(state, job):

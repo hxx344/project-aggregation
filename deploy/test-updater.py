@@ -982,6 +982,117 @@ class CoordinatorTests(RootFixture):
         self.assertNotIn('PRIVATE_DEPLOYMENT_CREDENTIAL', json.dumps(state))
         self.assertEqual(state['modules'][0]['currentCommit'], OLD)
 
+    def fail_after_deployment(self):
+        def fail(_key):
+            self.installed[0].update(currentCommit=NEW, currentVersion=NEW[:12], applicationKey=NEW_KEY,
+                                     identity='e' * 64)
+            return 17  # Application activation succeeded; updater bootstrap did not.
+        self.installer_hook = fail
+        plan = self.prepare(); self.coordinator.apply(plan); self.coordinator.run()
+        self.assertEqual(self.coordinator.status()['job']['status'], 'failed')
+        self.assertEqual(self.installed[0]['currentCommit'], NEW)
+        self.installer_hook = None
+        return plan
+
+    def test_post_activation_failure_requires_fresh_pinned_recovery_plan_even_after_expiry(self):
+        failed_plan = self.fail_after_deployment()
+        old = self.coordinator.read_plan(failed_plan)
+        self.clock += updater.PLAN_TTL + 1
+        self.network.values['hub']['manifest']['node_version'] = '24.15.0'
+        state = self.check()
+        self.assertIsNotNone(state['planId'])
+        self.assertNotEqual(state['planId'], failed_plan)
+        self.assertEqual(state['modules'][0]['state'], 'available')
+        self.assertTrue(state['modules'][0]['recovery'])
+        self.assertEqual(state['modules'][0]['currentCommit'], NEW)
+        fresh = self.coordinator.read_plan(state['planId'])
+        self.assertEqual(fresh['entries'][0]['installedIdentity'], 'e' * 64)
+        self.assertNotEqual(fresh['entries'][0]['manifestHash'], old['entries'][0]['manifestHash'])
+        with self.assertRaises(updater.UpdateError):
+            self.coordinator.apply(failed_plan)
+        with self.assertRaises(updater.UpdateError):
+            self.coordinator.read_plan(failed_plan)
+        self.coordinator.apply(state['planId']); self.coordinator.run()
+        result = self.coordinator.status()
+        self.assertEqual(result['job']['status'], 'succeeded')
+        self.assertNotIn('recovery', result['modules'][0])
+        self.clock += 61
+        self.assertIsNone(self.check()['planId'])
+
+    def test_interrupted_post_activation_attempt_also_offers_recovery(self):
+        plan = self.prepare(); self.coordinator.apply(plan)
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state['job']['status'] = 'running'; state['job']['steps'][0]['status'] = 'running'
+            self.coordinator.save(state)
+        self.installed[0].update(currentCommit=NEW, identity='e' * 64)
+        self.clock += 61
+        self.coordinator.recover(starting=True)
+        state = self.check()
+        self.assertEqual(state['job']['status'], 'interrupted')
+        self.assertTrue(state['modules'][0]['recovery'])
+        self.assertNotEqual(state['planId'], plan)
+
+    def test_matching_success_receipt_suppresses_recovery_when_final_job_write_was_interrupted(self):
+        plan = self.prepare(); self.coordinator.apply(plan); self.coordinator.run()
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state['job']['status'] = 'interrupted'; state['job']['steps'][0]['status'] = 'failed'
+            self.coordinator.save(state)
+        self.clock += 61
+        result = self.check()
+        self.assertEqual(result['modules'][0]['state'], 'current')
+        self.assertNotIn('recovery', result['modules'][0])
+        self.assertIsNone(result['planId'])
+
+    def test_older_success_receipt_cannot_hide_new_failed_attempt(self):
+        self.fail_after_deployment()
+        release = self.reader.read(registry.BY_ID['hub'])
+        receipt = {key: release[key] for key in ('commit', 'releaseId', 'applicationKey', 'installerHash')}
+        receipt.update(identity=self.installed[0]['identity'], jobId='f' * 32, completedAt=updater.iso(self.clock - 1))
+        updater.write_json(self.coordinator.directory / 'hub.receipt.json', receipt)
+        self.clock += 61
+        self.assertTrue(self.check()['modules'][0]['recovery'])
+
+    def test_newer_installed_release_does_not_recover_old_failed_target(self):
+        self.fail_after_deployment()
+        future = 'c' * 40
+        release = self.reader.read(registry.BY_ID['hub'])
+        release.update(commit=future, tag='deploy-' + future)
+        self.installed[0].update(currentCommit=future, identity='d' * 64)
+        self.clock += 61
+        with patch.object(self.reader, 'read', return_value=release):
+            state = self.check()
+        self.assertEqual(state['modules'][0]['state'], 'current')
+        self.assertNotIn('recovery', state['modules'][0])
+        self.assertIsNone(state['planId'])
+        self.assertEqual(state['job']['status'], 'failed', 'version checks must preserve historical task results')
+
+    def test_changed_protected_old_plan_cannot_authorize_recovery(self):
+        plan = self.fail_after_deployment()
+        updater.write_bytes(self.coordinator.plans / plan / 'hub.install.sh', b'changed')
+        self.clock += 61
+        result = self.check()
+        self.assertIsNone(result['planId'])
+        self.assertNotIn('recovery', result['modules'][0])
+
+    def test_worker_launch_failure_invalidates_accepted_plan_for_explicit_retry(self):
+        plan = self.prepare()
+        with patch.object(self.coordinator, 'launch', side_effect=OSError('private output')):
+            with self.assertRaises(updater.UpdateError) as error:
+                self.coordinator.apply(plan)
+        self.assertEqual(error.exception.status, 503)
+        failed = self.coordinator.status()
+        self.assertEqual(failed['job']['status'], 'failed')
+        self.assertEqual(failed['job']['steps'][0]['status'], 'skipped')
+        self.assertIsNone(failed['planId'])
+        self.assertIsNone(failed['expiresAt'])
+        self.clock += 61
+        fresh = self.check()['planId']
+        self.assertNotEqual(fresh, plan)
+        self.coordinator.apply(fresh)
+        self.assertEqual(len(self.launches), 1)
+
     def test_daemon_restart_marks_abandoned_queued_and_running_jobs_interrupted(self):
         for status in ['queued', 'running']:
             with self.subTest(status=status):

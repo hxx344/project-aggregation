@@ -112,13 +112,25 @@ test('update HTTP routes require login, Origin and CSRF and accept only their fi
   assert.deepEqual(f.calls.map(row => row.method), ['status', 'check']);
 });
 
+test('recovery metadata reaches the authenticated HTTP status, check and apply responses', async t => {
+  const f = await fixture(t); await f.login();
+  f.state.modules[0].recovery = true;
+  f.state.modules[0].currentCommit = f.state.modules[0].latestCommit;
+  for (const [route, options] of [[PREFIX, {}], [`${PREFIX}/check`, { method: 'POST', body: {} }],
+    [`${PREFIX}/apply`, { method: 'POST', body: { planId } }]]) {
+    const response = await f.request(route, options);
+    assert.equal(response.status, options.method ? 202 : 200);
+    assert.equal(response.data.modules[0].recovery, true);
+  }
+});
+
 test('update stream requires same-origin login, filters state, shares reads and closes revoked sessions', async t => {
   const f = await fixture(t); await f.login();
   assert.equal((await f.request(`${PREFIX}/events?url=other`)).status, 400);
   assert.equal((await f.request(`${PREFIX}/events`, { originHeader: 'https://other.example' })).status, 403);
   const crossSite = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, 'Sec-Fetch-Site': 'cross-site' } });
   assert.equal(crossSite.status, 403);
-  f.state = { ...f.state, command: 'private-command', token: 'private-token', githubToken: { configured: true, token: 'private-token' }, modules: f.state.modules.map(row => ({ ...row, path: '/private/path' })) };
+  f.state = { ...f.state, command: 'private-command', token: 'private-token', githubToken: { configured: true, token: 'private-token' }, modules: f.state.modules.map(row => ({ ...row, recovery: true, path: '/private/path' })) };
   const abort = new AbortController(); t.after(() => abort.abort());
   const response = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, Origin: f.origin }, signal: abort.signal });
   assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /^text\/event-stream/);
@@ -127,6 +139,7 @@ test('update stream requires same-origin login, filters state, shares reads and 
   while (!received.includes('"snapshot"')) received += new TextDecoder().decode((await reader.read()).value);
   assert.equal(received.includes('private'), false);
   assert.ok(received.includes('"githubToken":{"configured":true}'));
+  assert.ok(received.includes('"recovery":true'));
   assert.equal(f.calls.filter(row => row.method === 'status').length, 1);
   assert.equal(f.calls.filter(row => row.method !== 'status').length, 0);
   // A cached display snapshot must never satisfy the live-entry maintenance check.

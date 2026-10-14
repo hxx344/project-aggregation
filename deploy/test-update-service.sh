@@ -195,4 +195,81 @@ rm -- "$case_root/release/server/update-service/"*
 rmdir "$case_root/release/server/update-service"
 ensure_update_service "$case_root/release"
 [[ ! -e "$UPDATER_DIR" && ! -s "$case_root/systemctl.calls" ]]
+
+# Exercise the producer and privileged consumer together. Git archives carry
+# 0775/0664 by default, and root tar preserves them even with umask 022.
+fresh_case source-publication
+repository=$(cd -- "$(dirname "$0")/.." && pwd)
+APP_DIR="$case_root/application"
+source_dir="$case_root/source"
+mkdir -p "$APP_DIR/releases" "$APP_DIR/cache" "$source_dir/server/update-service" "$source_dir/deploy" "$source_dir/dist"
+cp "$case_root/release/server/update-service/"*.py "$source_dir/server/update-service/"
+cp "$repository/deploy/build-artifact-cache.py" "$source_dir/deploy/build-artifact-cache.py"
+printf '{"name":"source-permission-fixture"}\n' > "$source_dir/package.json"
+printf '#!/bin/sh\nexit 0\n' > "$source_dir/server/executable.sh"
+chmod 0755 "$source_dir/server/executable.sh"
+printf '<html>verified cached build</html>\n' > "$source_dir/dist/index.html"
+git -C "$source_dir" init -q -b main
+git -C "$source_dir" config user.name fixture
+git -C "$source_dir" config user.email fixture@example.invalid
+git -C "$source_dir" add server package.json deploy
+git -C "$source_dir" commit -qm source-permission-fixture
+git clone -q --bare "$source_dir" "$APP_DIR/repository.git"
+git --git-dir="$APP_DIR/repository.git" config tar.umask 0002
+commit=$(git -C "$source_dir" rev-parse HEAD)
+runtime_key=fixture-runtime
+build_environment=fixture-build-environment
+RUNTIME_DEPENDENCIES=0
+PROJECT_DEPLOY_TESTS=0
+input_keys
+prepare_build_cache_helper
+build_artifact_cache store "$source_dir/dist" "$built" "$build_key"
+atomic_record "$typecheck_stamp" "$typecheck_key"
+cache_inode=$(stat -c %i "$built/artifact/index.html")
+prepare_workspace() { echo 'Cached source publication unexpectedly requested a build workspace' >&2; return 1; }
+
+# Reproduce a prior install that became healthy before updater bootstrap failed.
+# Its packaging key must no longer qualify for the current-release fast path.
+runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py)
+legacy_key=$(printf 'application-v3\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$RUNTIME_DEPENDENCIES" | hash)
+old_release="$APP_DIR/releases/${commit:0:12}-${legacy_key:0:16}"
+mkdir "$old_release"
+git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$old_release"
+mkdir "$old_release/dist"
+cp "$source_dir/dist/index.html" "$old_release/dist/index.html"
+atomic_record "$old_release/.managed-release" "$commit"
+atomic_record "$old_release/.source-sha" "$commit"
+atomic_record "$old_release/.application-key" "$legacy_key"
+atomic_record "$old_release/.install-ready" "$legacy_key"
+[[ $(stat -c %a "$old_release/server/update-service") == 775 ]]
+[[ $(stat -c %a "$old_release/server/update-service/updater.py") == 664 ]]
+if application_ready; then echo 'Legacy writable source release was reused' >&2; exit 1; fi
+legacy_release=$old_release
+
+prepare_application
+[[ "$release" != "$legacy_release" && $(stat -c %a "$legacy_release/server/update-service") == 775 ]]
+[[ $(stat -c '%u:%g:%a' "$release/server/update-service") == 0:0:755 ]]
+[[ $(stat -c '%u:%g:%a' "$release/server/update-service/updater.py") == 0:0:644 ]]
+[[ $(stat -c '%u:%g:%a' "$release/server/executable.sh") == 0:0:755 ]]
+finish_update_service "$release"
+[[ -f "$UPDATER_DIR/.service-ready" && $(count "start $UPDATER_SERVICE") == 1 ]]
+no_worker_mutations
+atomic_record "$release/.install-ready" "$application_key"
+old_release=$release
+ready_release=$release
+inode=$(stat -c %i "$UPDATER_DIR/updater.py")
+prepare_application
+finish_update_service "$release"
+[[ "$release" == "$ready_release" && $(stat -c %i "$UPDATER_DIR/updater.py") == "$inode" ]]
+[[ $(stat -c %i "$built/artifact/index.html") == "$cache_inode" ]]
+[[ $(count "start $UPDATER_SERVICE") == 1 && $(count "restart $UPDATER_SERVICE") == 0 ]]
+[[ $(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d | wc -l) == 2 ]]
+
+# A later candidate with writable updater sources is rejected without changing
+# permissions or copying its code into the privileged updater installation.
+chmod 0775 "$ready_release/server/update-service"
+old_release=
+if prepare_application; then echo 'Writable existing source candidate was accepted' >&2; exit 1; fi
+[[ $(stat -c %a "$ready_release/server/update-service") == 775 ]]
+[[ $(stat -c %i "$UPDATER_DIR/updater.py") == "$inode" ]]
 printf 'Update service ownership, isolation, idempotence, recovery and rejection fixtures passed.\n'

@@ -8,6 +8,7 @@ export type UpdateModule = {
   latestCommit: string | null;
   releaseNotes?: string;
   reason?: string;
+  recovery?: boolean;
 };
 
 export type UpdateJob = {

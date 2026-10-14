@@ -35,11 +35,12 @@ export function publicUpdateState(value) {
   const modules = value.modules.map(row => {
     if (!object(row) || !identifier(row.id) || !text(row.name, 120) || !['current', 'available', 'unavailable', 'unmanaged'].includes(row.state)
       || !['currentVersion', 'latestVersion', 'currentCommit', 'latestCommit'].every(key => nullable(row[key], value => text(value, 128)))
-      || row.reason !== undefined && !text(row.reason)) invalid();
+      || row.reason !== undefined && !text(row.reason)
+      || row.recovery !== undefined && typeof row.recovery !== 'boolean') invalid();
     const notes = releaseNotes(row.releaseNotes);
     return { id: row.id, name: row.name, state: row.state, currentVersion: row.currentVersion, latestVersion: row.latestVersion,
       currentCommit: row.currentCommit, latestCommit: row.latestCommit, ...(row.reason === undefined ? {} : { reason: row.reason }),
-      ...(notes ? { releaseNotes: notes } : {}) };
+      ...(notes ? { releaseNotes: notes } : {}), ...(row.recovery === undefined ? {} : { recovery: row.recovery }) };
   });
   let job = null;
   if (value.job !== null) {

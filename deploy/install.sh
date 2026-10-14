@@ -12,7 +12,7 @@ REPOSITORY=https://github.com/hxx344/project-aggregation.git
 NODE_VERSION=24.15.0
 PNPM_VERSION=11.25.0
 PNPM_INTEGRITY=XN6SW08HX3Jetx+64YpC/+eEUkeJ8ZthxzHLhyHsKKruFg4BqNWvT+2ypCzb8wDv4j2zVrDUoXtNY+EfirfJVg==
-INSTALL_REVISION=6
+INSTALL_REVISION=7
 UPDATER_DIR=/usr/local/lib/project-aggregation-updater
 UPDATER_STATE_DIR=/var/lib/project-aggregation-updater
 UPDATER_RUN_DIR=/run/project-aggregation-updater
@@ -967,7 +967,7 @@ input_keys() {
   # Vite may inline build-time environment; keep those inputs out of runtime config.
   build_key=$(printf 'hub-build-v3\n%s\n%s\n%s' "$build_tree" "$dependency_key" "$build_environment" | hash)
   embedded_key=$(printf 'embedded-runtime-v2\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" | hash)
-  application_key=$(printf 'application-v3\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$RUNTIME_DEPENDENCIES" | hash)
+  application_key=$(printf 'application-v4:root-owned,no-go-write\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$RUNTIME_DEPENDENCIES" | hash)
   dependencies="$APP_DIR/cache/dependencies-$dependency_key"
   built="$APP_DIR/cache/build-$build_key"
   typecheck_stamp="$APP_DIR/cache/typechecked-$typecheck_key"
@@ -986,6 +986,7 @@ application_ready() {
     [[ -f "$dependencies/.complete" && -d "$dependencies/node_modules" &&
        -L "$old_release/node_modules" && "$(readlink "$old_release/node_modules")" == "$dependencies/node_modules" ]] || return 1
   fi
+  published_source_safe "$old_release"
 }
 prepare_source() {
   [[ ! -d "$work_dir/source" ]] || return 0
@@ -1164,6 +1165,7 @@ prepare_application() {
       prepare_dependencies
       [[ -L "$release/node_modules" && "$(readlink "$release/node_modules")" == "$dependencies/node_modules" ]] || fail '候选版本依赖链接不正确。'
     fi
+    published_source_safe "$release" || return 1
     return
   fi
   mkdir "$work_dir/publish"
@@ -1180,6 +1182,12 @@ prepare_application() {
   atomic_record "$work_dir/publish/.managed-release" "$commit"
   atomic_record "$work_dir/publish/.source-sha" "$commit"
   atomic_record "$work_dir/publish/.application-key" "$application_key"
+  # Root tar preserves Git archive's group-write bits despite the process umask.
+  # Only normalize this freshly assembled tree from the pinned Git object and
+  # verified caches; an existing writable release must never regain trust here.
+  chown -hR root:root "$work_dir/publish"
+  chmod -R a+rX,go-w "$work_dir/publish"
+  published_source_safe "$work_dir/publish"
   mv -- "$work_dir/publish" "$release"
 }
 prepare_ci_application() {
@@ -1188,6 +1196,7 @@ prepare_ci_application() {
         -f "$old_release/.application-key" && "$(cat "$old_release/.application-key")" == "$application_key" &&
         -s "$old_release/dist/index.html" && -f "$old_release/server/app.mjs" ]]; then
     if (( ! RUNTIME_DEPENDENCIES )) || [[ -f "$old_release/node_modules/ws/package.json" && -f "$old_release/node_modules/decimal.js/package.json" ]]; then
+      published_source_safe "$old_release" || return 1
       release=$old_release
       log 'CI 运行内容未变化，复用当前版本；跳过部署包下载、依赖和构建。'
       return
@@ -1198,6 +1207,7 @@ prepare_ci_application() {
     [[ ! -L "$release" && -f "$release/.managed-release" && "$(cat "$release/.managed-release")" == "$commit" &&
        -f "$release/.ci-package-sha256" && "$(cat "$release/.ci-package-sha256")" == "$CI_RELEASE_SHA256" &&
        -s "$release/dist/index.html" && -f "$release/server/app.mjs" ]] || fail '候选 CI 版本目录已有未知或不完整内容。'
+    published_source_safe "$release" || return 1
     return
   fi
   ci_release_extract "$APP_DIR/cache/archives" "$work_dir/publish"
@@ -1236,6 +1246,28 @@ updater_safe_path() {
     fi
     cursor=${cursor%/*}
     [[ -n "$cursor" ]] || cursor=/
+  done
+}
+published_source_safe() {
+  local directory=$1 path
+  [[ -d "$directory/server" && -f "$directory/package.json" && -f "$directory/.managed-release" &&
+     -f "$directory/.source-sha" && -f "$directory/.application-key" ]] || {
+    fail '发布目录缺少受信运行源码或标记。'; return 1;
+  }
+  for path in "$directory" "$directory/server" "$directory/package.json" \
+      "$directory/.managed-release" "$directory/.source-sha" "$directory/.application-key" "$directory/.install-ready"; do
+    updater_safe_path "$path" || return 1
+  done
+  # Only these sources will be copied into the privileged updater. Existing
+  # candidates are checked, never repaired or chmodded into trusted input.
+  path="$directory/server/update-service"
+  [[ -e "$path" || -L "$path" ]] || return 0
+  updater_safe_path "$path" || return 1
+  [[ -d "$path" ]] || { fail '发布包中的在线更新服务目录无效。'; return 1; }
+  for path in "$path/"*.py; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    updater_safe_path "$path" || return 1
+    [[ -f "$path" ]] || { fail '发布包中的在线更新服务文件无效。'; return 1; }
   done
 }
 updater_managed_directory() {

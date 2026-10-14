@@ -490,3 +490,17 @@
 **证据：** 本仓 `c506a0a` 的 [切换入口](modules/aster/trading/pairing.py) 同时要求 `require_flat=True` 并拒绝所有 `recovery_watch`；2026-10-15 用户截图显示历史归档提示，随后明确实际已手动开 `XAGUSD1`、组仍配置 `XAUUSD1`。修复基于 `4239c81`，仅支持按目标实际仓位采纳，不扩展为同组自动管理多个标的。
 
 **事件记录：** `pair-symbol-manual-holdings-adoption-20261015`；同一功能的用户反馈与连续修复。
+
+### L034：源码发布权限与完整更新结果分别验收
+
+**适用条件：** root 从 Git 归档组装源码发布目录，并在应用健康检查之后安装在线更新服务。
+
+**根因：** Git 默认 tar 归档可带有 `0775` 目录和 `0664` 文件；源码组装漏掉 CI 包安装已有的 root 归属与去除组/其他用户写权限步骤，导致 `updater_safe_path` 拒绝后置安装。应用已切换且部署记录已写入，因此版本相等不能证明整次更新完成；页面忽略失败任务，出现绿色“已是最新”与更新失败同时显示。
+
+**以后做法：** 对固定 Git 对象新组装的目录规范权限后发布，保留执行位与安全路径检查；更新组装配方版本并检查复用候选，不把旧可写代码简单改权限后继续信任。将版本对齐与上次任务结果分别呈现。失败目标仍为当前正式版本时，旧受保护计划只识别目标，重新检查生成固定摘要和当前安装身份的新恢复计划，再由用户确认执行。
+
+**如何验证：** [更新服务安装检查](deploy/test-update-service.sh) 从真实 Git 归档检查源码发布权限、后置安装及重复运行；[协调器检查](deploy/test-updater.py) 覆盖切服后失败、过期计划恢复、完成回执、旧失败目标和 worker 启动失败后重试；[更新结果界面检查](tests/updates-result-status.browser.mjs) 覆盖版本对齐后的失败/中断提示与恢复确认，[HTTP 检查](tests/updates-http.test.mjs) 确认恢复标记穿过公共状态白名单并抵达 HTTP/SSE。Linux 权限与服务行为由现有 CI 验证，不用 Windows 结果代替。
+
+**证据：** 本仓 `203515f` 部署的 2026-10-15 用户日志明确显示工作台健康运行后，`/opt/project-aggregation/releases/203515f0bee5-33025824d38fdd0a/server/update-service` 因允许其他用户写入被拒绝；固定该提交的真实 `git archive` 目录模式为 `0775`。相关路径：[源码安装器](deploy/install.sh)、[更新协调器](server/update-service/updater.py)、[系统更新页面](src/UpdateStatus.tsx)。
+
+**事件记录：** `source-release-permissions-post-activation-failure-20261015`；一次已核实的用户故障与同轮状态恢复修复。
