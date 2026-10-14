@@ -41,12 +41,39 @@ def checked_ignore(excluded=()):
     return ignore
 
 
-def read_runtime_lock(source, dependency_roots, node):
+def runtime_parser_credentials(parser_user):
+    """The installed YAML package may contain code written by the build account."""
+    if os.name != 'posix':
+        if parser_user is not None:
+            raise ValueError('--parser-user requires POSIX user switching')
+        return {}
+    if parser_user is None:
+        if os.geteuid() == 0:
+            raise ValueError('Root packaging requires an explicit non-root --parser-user')
+        return {}
+    import pwd
+    account_name = str(parser_user)
+    try:
+        account = pwd.getpwuid(int(account_name)) if account_name.isdecimal() else pwd.getpwnam(account_name)
+    except (KeyError, ValueError, OverflowError) as error:
+        raise ValueError('Unknown runtime lock parser account: ' + account_name) from error
+    if account.pw_uid == 0 or account.pw_gid == 0:
+        raise ValueError('Runtime lock parser account and primary group must be non-root')
+    if os.geteuid() != 0:
+        if account.pw_uid != os.geteuid() or account.pw_gid != os.getegid():
+            raise ValueError('Cannot select another runtime lock parser account without root')
+        return {}
+    return {'user': account.pw_uid, 'group': account.pw_gid, 'extra_groups': []}
+
+
+def read_runtime_lock(source, dependency_roots, node, parser_user=None):
+    credentials = runtime_parser_credentials(parser_user)
     helper = Path(__file__).with_name('pnpm-runtime-lock.mjs')
     if is_link(source / 'pnpm-lock.yaml'):
         raise ValueError('Runtime lockfile cannot be a link')
     result = subprocess.run([str(node), str(helper), str(source / 'pnpm-lock.yaml'),
-                             *map(str, dependency_roots)], capture_output=True, text=True)
+                             *map(str, dependency_roots)], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, **credentials)
     if result.returncode:
         raise ValueError('Cannot parse pnpm runtime lockfile: ' + result.stderr.strip())
     return json.loads(result.stdout)
@@ -232,16 +259,17 @@ class RuntimeDependencies:
                     raise ValueError('Final runtime importer resolution mismatch: ' + importer + '/' + name)
 
 
-def copy_runtime_dependencies(source, destination, dependency_roots=(), node='node', lock=None, importers=IMPORTERS):
+def copy_runtime_dependencies(source, destination, dependency_roots=(), node='node', lock=None, importers=IMPORTERS,
+                              parser_user=None):
     roots = tuple(dict.fromkeys([Path(root).resolve() for root in dependency_roots] + [source.resolve()]))
     if lock is None:
-        lock = read_runtime_lock(source, roots, node)
+        lock = read_runtime_lock(source, roots, node, parser_user)
     graph = RuntimeDependencies(source, destination, lock, dependency_roots)
     graph.collect(importers)
     graph.materialize()
 
 
-def stage_runtime(source, stage, dependency_roots=(), node='node'):
+def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=None):
     for relative in ('dist', 'server'):
         if is_link(source / relative):
             raise ValueError('Runtime directory cannot be a link: ' + relative)
@@ -255,7 +283,7 @@ def stage_runtime(source, stage, dependency_roots=(), node='node'):
         if is_link(origin) or not origin.is_dir():
             raise ValueError('Missing embedded module: ' + module)
         shutil.copytree(origin, target, ignore=checked_ignore(EXCLUDED))
-    copy_runtime_dependencies(source, stage, dependency_roots, node)
+    copy_runtime_dependencies(source, stage, dependency_roots, node, parser_user=parser_user)
     for relative in ('modules/monitor/dist/client/index.html', 'modules/asset/.next/BUILD_ID',
                      'modules/crossex/dist/index.html', 'modules/greeks/requirements.lock',
                      'server/modules/greeks-bridge.py', 'modules/aster/requirements.lock',
@@ -276,11 +304,13 @@ def main():
     parser.add_argument('--dependency-root', type=Path, action='append', default=[],
                         help='Trusted installed pnpm workspace root (may be repeated)')
     parser.add_argument('--node', default=os.environ.get('NODE_BIN', 'node'))
+    parser.add_argument('--parser-user', help='Non-root username or UID for dependency lock parsing; required when running as root')
     args = parser.parse_args()
+    runtime_parser_credentials(args.parser_user)
     source, repository = args.source.resolve(), args.repository.resolve()
     if args.stage_only:
         args.stage_only.mkdir(parents=True, exist_ok=True)
-        stage_runtime(source, args.stage_only, args.dependency_root, args.node)
+        stage_runtime(source, args.stage_only, args.dependency_root, args.node, args.parser_user)
         return
     architecture = args.architecture or {'x86_64': 'x64', 'AMD64': 'x64', 'aarch64': 'arm64'}.get(platform.machine())
     if platform.system() != 'Linux' or not architecture:
@@ -307,7 +337,7 @@ def main():
     archive_path = args.output / filename
     with tempfile.TemporaryDirectory() as temporary:
         stage = Path(temporary)
-        stage_runtime(source, stage, args.dependency_root, args.node)
+        stage_runtime(source, stage, args.dependency_root, args.node, args.parser_user)
         (stage / '.release-commit').write_text(commit + '\n')
         (stage / '.release-application-key').write_text(application_key + '\n')
         with archive_path.open('wb') as output, gzip.GzipFile(fileobj=output, mode='wb', filename='', mtime=0) as compressed:

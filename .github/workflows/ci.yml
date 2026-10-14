@@ -57,6 +57,7 @@ jobs:
           python3 deploy/test-migration.py -v
           python3 deploy/test-package-layout.py -v
           python3 deploy/test-build-artifact-cache.py -v
+          sudo env RUNTIME_LOCK_TEST_NODE="$(command -v node)" python3 -I deploy/test-runtime-lock-parser.py -v
       - name: Check installer syntax
         run: |
           bash -n deploy/install.sh

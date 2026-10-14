@@ -72,7 +72,7 @@ if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
   printf 'Optimizing release package size...\n'
   bash "$repository/scripts/optimize-release-size.sh" || true
 
-  python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --repository "$repository" --output "$repository/output/release"
+  python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --parser-user "$SERVICE_USER" --repository "$repository" --output "$repository/output/release"
   mkdir "$test_root/package"
   tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
   run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$test_root/package"

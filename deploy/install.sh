@@ -1099,7 +1099,7 @@ prepare_embedded_runtime() {
     key=${module_build_keys[$module]}
     build_artifact_cache restore "$APP_DIR/cache/module-$module-$key" "$key" "$work_dir/trusted-runtime/${MODULE_BUILD_OUTPUTS[$module]}"
   done
-  python3 -I "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --dependency-root "$dependencies" --node "$NODE_BIN" --stage-only "$work_dir/embedded-runtime"
+  python3 -I "$work_dir/trusted-runtime/deploy/package-release.py" --source "$work_dir/trusted-runtime" --dependency-root "$dependencies" --node "$NODE_BIN" --parser-user "$SERVICE_USER" --stage-only "$work_dir/embedded-runtime"
   mkdir "$work_dir/embedded-cache"
   mv "$work_dir/embedded-runtime/modules" "$work_dir/embedded-runtime/node_modules" "$work_dir/embedded-runtime/deploy" "$work_dir/embedded-cache/"
   chown -R root:root "$work_dir/embedded-cache"

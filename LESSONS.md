@@ -110,15 +110,17 @@
 
 **根因：** 哈希锁文件与归属校验解决不同问题。服务账号可同时替换依赖内容和哈希；root 随后读取该锁文件安装依赖，仍可能执行被替换的构建代码。只保护文件本身而不保护父目录也不能防止替换。
 
-**以后做法：** 从固定 Git 提交或已核验的发布包独立取得特权步骤所需输入，验证文件及整条父目录的归属、权限和链接边界；不把可写构建目录作为可信源。
+**以后做法：** 从固定 Git 提交或已核验的发布包独立取得特权步骤所需输入，验证文件及整条父目录的归属、权限和链接边界；不把可写构建目录作为可信源。冻结依赖目录的所有权不等于验证其代码来源；需要加载构建依赖的解析器以明确的非 root UID/GID、无补充组运行，root 仅消费结构化结果并核对包名、版本与复制边界。
 
 **证据：** project-aggregation 基于 `929b28d9` 的本轮迁移工作区中，[源码安装路径](deploy/install.sh) 曾在服务账号构建后将该工作树的 Greeks 锁文件传给 root pip。审查确认路径后在首次提交前改为从固定 Git 对象单独读取；基线提交不包含此新增路径。
 
 2026-10-14 基于 `1850752c` 的 ASTER 迁移工作区中，[迁移器](deploy/migrate-modules.py) 在 `/etc/aster-desk/environment` 缺失时曾读取旧服务可写的运行目录 `.env`，再以 root 复制其中指定的 CA 路径并转移文件归属。隔离文件系统夹具复现了合成私有文件被复制；修复后仅可信外部配置可以授权外部文件读取。此问题在本轮提交前修复，不表示基线已有该路径。
 
-**如何验证：** [Python 依赖来源检查](deploy/test-python-lock.sh) 覆盖工作树锁文件被替换、父目录可写及链接路径；[迁移测试](deploy/test-migration.py) 覆盖运行目录配置不能授权 root 读取外部文件、可信配置正常迁移及所有权和父目录权限。Linux 归属与权限检查在 CI 执行。
+**如何验证：** [Python 依赖来源检查](deploy/test-python-lock.sh) 覆盖工作树锁文件被替换、父目录可写及链接路径；[迁移测试](deploy/test-migration.py) 覆盖运行目录配置不能授权 root 读取外部文件、可信配置正常迁移及所有权和父目录权限；[解析器权限检查](deploy/test-runtime-lock-parser.py) 验证恶意依赖不能写 root 私有目录或恢复 root 身份。Linux 归属与权限检查在 CI 执行。
 
 **事件记录：** `embedded-python-provenance-20261013`、`aster-migration-file-provenance-20261014`；两次独立事件，分别涉及特权依赖安装和外部文件读取。
+
+2026-10-15 审查 `4239c81` 默认源码部署变更时确认：`deploy/package-release.py:read_runtime_lock` 以 root 加载服务账号安装的 YAML 模块。仅 chown/chmod 冻结不能阻止冻结前植入的代码。此路径自 `1cd309f`（2026-10-14）引入，原显式源码模式已有该问题，本次将其变为默认更新路径。原提交的原生 Node 复现确认可执行被替换的依赖；修正为只将解析子进程降权，保留可信 Python 的文件复制和边界校验。事件 ID：`source-parser-privilege-20261014`，发现日期不作为新的独立发生日期。
 
 2026-10-14 独立中继安装入口接入本仓时，提交前检查发现：即使源码文件已校验归属，root 运行的 `python3 -c`、`python3 -` 仍可能从调用目录或 `PYTHONPATH` 导入同名模块。`deploy/install-aster-relay.sh` 与 `deploy/aster-capacity-relay` 的特权 Python 入口使用 `-I`；业务模块需要工作目录导入时，只从受信运行目录启动，并清除 `PYTHONPATH`、`PYTHONHOME`。工作台连接导入的管道命令同样使用 `python3 -I -`。证据为基于 `9ad1bff` 的本轮新增安装器（首次提交前修正），不是该基线已有缺陷；[中继安装检查](deploy/test-aster-relay-install.py) 使用伪造 `json.py`、`pathlib.py` 和解释器环境变量覆盖该入口。事件 ID：`relay-python-import-provenance-20261014`，属于解释器启动输入的独立边界问题，不因多个调用点重复计数。
 
