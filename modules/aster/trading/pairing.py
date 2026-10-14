@@ -299,13 +299,12 @@ class PairManager:
             return saved
 
     def _switch_symbol(self, pair, updated):
-        """Only a fresh, fully flat read can replace a paused symbol's journal."""
+        """Adopt the target symbol's verified positions without placing orders."""
         from .pair_execution import PairTrader, empty_progress, runtime_default
         from .pair_planning import require_runtime_symbols
-        original = self._idle(pair, require_flat=True)
+        from .pair_recovery import require_archived_orders_clear
+        original = self._idle(pair)
         require_runtime_symbols(pair, original)
-        if original.get("recovery_watch") is not None:
-            raise TradingError("人工归档订单仍需按原标的跟踪，暂不能修改交易标的；请保留原配对组记录")
         margin = self.store.get("pair_margin:" + pair["id"], {})
         if (not isinstance(margin, dict) or margin.get("pending") is not None
                 or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
@@ -316,16 +315,27 @@ class PairManager:
         if original.get("identities") and original["identities"] != identities:
             raise TradingError("配对组凭据指向的真实账户发生变化，不能修改交易标的，请先核对账户身份")
         runtime = runtime_default()
-        runtime.update(symbol=updated["symbol"], identities=identities,
-            progress=empty_progress(completed=(original.get("progress") or {}).get("completed_cycles", 0)),
-            reason=f"交易标的已从 {pair['symbol']} 切换为 {updated['symbol']}，两侧已核实空仓；配对组保持暂停，请核对设置后启动",
-            updated_at=time.time())
+        runtime.update(symbol=updated["symbol"], identities=identities)
         for key in ("daily_volume", "volume_unknown", "volume_unknown_until_utc"):
             if key in original:
                 runtime[key] = deepcopy(original[key])
+        if original.get("recovery_watch") is not None:
+            runtime["recovery_watch"] = deepcopy(original["recovery_watch"])
+            for batch in runtime["recovery_watch"]["batches"]:
+                # Unmarked legacy batches were checked against the old symbol.
+                # Make that binding durable before changing the active symbol.
+                batch.setdefault("symbol", pair["symbol"])
         # The old durable journal remains untouched throughout all remote reads.
-        # An explicit empty journal authorizes only the new symbol's flat check.
-        _, guards = self._read_members(updated, flat=True, runtime=runtime)
+        # Only the target symbol's fresh positions become its new owned baseline.
+        snapshots, guards = self._read_members(updated, adopt=True, runtime=runtime)
+        owned = {side: wire(snapshots[key].pair(updated["symbol"])[index].qty)
+                 for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1))}
+        runtime.update(owned=owned,
+            progress=empty_progress(owned, (original.get("progress") or {}).get("completed_cycles", 0)),
+            reason=(f"交易标的已从 {pair['symbol']} 切换为 {updated['symbol']}，已核验并采纳实际底仓："
+                    f"多 {owned['LONG']}、空 {owned['SHORT']}；配对组保持暂停，请核对设置后启动"),
+            updated_at=time.time())
+        require_archived_orders_clear(self.engine, updated, state=runtime, brokers=brokers, read_only=True)
 
         def check_current():
             # Account configuration and bindings are compared inside the writer

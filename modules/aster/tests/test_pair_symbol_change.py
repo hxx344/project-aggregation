@@ -1,4 +1,4 @@
-"""Symbol replacement needs fresh flat account evidence and an atomic journal."""
+"""Symbol edits adopt verified target holdings and preserve an atomic journal."""
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
@@ -13,7 +13,7 @@ from tests.test_exchange_hardening import FixtureAPI
 from trading.engine import Engine
 from trading.exchange import ExchangeError, LiveBroker
 from trading.models import TradingError, dec
-from trading.pair_execution import PairTrader, runtime_default
+from trading.pair_execution import PairTrader, empty_progress, runtime_default
 from trading.paper import PAPER_BRACKETS
 from trading.store import Store
 
@@ -109,10 +109,32 @@ class PairSymbolChangeTests(unittest.TestCase):
         for aid in ("test", "second"):
             self.assertEqual(restarted.store.pair_for_account(aid), pair)
 
-    def test_owned_cycle_pending_and_watch_block_before_remote_reads(self):
-        variants = [{"owned": {"LONG": "1", "SHORT": "0"}},
-                    {"progress": {"quantities": {"LONG": "0", "SHORT": "1"}}},
-                    {"pending": {}}, {"recovery_watch": {"batches": []}},
+    def set_target_positions(self, long="2", short="3"):
+        for aid, side, qty in (("test", "LONG", long), ("second", "SHORT", short)):
+            broker = self.engine.broker(self.f.store.account(aid))
+            broker.state["positions"][SILVER + ":" + side].update(qty=qty, entry="30")
+            broker.save()
+
+    def test_manual_target_holdings_replace_old_symbol_quantity_without_trading(self):
+        self.original.update(owned={"LONG": "99", "SHORT": "88"})
+        self.original["progress"] = empty_progress(self.original["owned"], completed=5)
+        self.f.store.put("pair_runtime:gold", self.original)
+        self.set_target_positions()
+        pair = self.switch()
+        state = self.f.store.get("pair_runtime:gold")
+        self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
+        self.assertEqual(state["progress"], empty_progress(state["owned"], completed=5))
+        self.assertEqual(state["phase"], "paused")
+        self.assertFalse(pair["enabled"])
+        self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
+        restarted = Engine(Store(self.f.store.path), market=self.f.market)
+        self.addCleanup(restarted.dashboard_reports.close)
+        self.assertEqual(restarted.store.get("pair_runtime:gold")["owned"], state["owned"])
+        self.assertEqual(restarted.store.pair("gold")["symbol"], SILVER)
+
+    def test_cycle_pending_and_malformed_state_block_before_remote_reads(self):
+        variants = [{"progress": {"quantities": {"LONG": "0", "SHORT": "1"}}},
+                    {"pending": {}}, {"recovery_watch": {"batches": "invalid"}},
                     {"symbol": SILVER}, {"progress": {"config": {"symbol": SILVER}}}]
         for change in variants:
             with self.subTest(change=change):
@@ -135,10 +157,13 @@ class PairSymbolChangeTests(unittest.TestCase):
 
     def test_transfer_appearing_after_idle_check_is_not_accepted_as_the_expected_margin(self):
         original = self.engine.pairs._idle
+        calls = 0
 
         def idle(*args, **kwargs):
+            nonlocal calls
             result = original(*args, **kwargs)
-            if kwargs.get("require_flat"):
+            calls += 1
+            if calls == 2:
                 self.f.store.put("pair_margin:gold", {"status": "unknown", "pending": {"id": "race"}})
             return result
 
@@ -146,9 +171,9 @@ class PairSymbolChangeTests(unittest.TestCase):
             self.switch()
         self.assert_no_change()
 
-    def test_all_markets_and_both_directions_must_be_flat(self):
+    def test_other_markets_and_wrong_target_direction_are_still_rejected(self):
         broker = self.engine.broker(self.f.store.account("test"))
-        for symbol, side in ((GOLD, "LONG"), (SILVER, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
+        for symbol, side in ((GOLD, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
             with self.subTest(symbol=symbol, side=side):
                 row = broker.state["positions"][symbol + ":" + side]
                 row.update(qty="1", entry="1")
@@ -250,11 +275,20 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
     def tearDown(self):
         self.assertTrue(all(call[0] == "GET" for broker in self.live.values() for call in broker.api.calls))
 
+    def set_target_positions(self, long="2", short="3"):
+        for aid, side, qty in (("test", "LONG", long), ("second", "SHORT", "-" + short)):
+            api = self.live[aid].api
+            for row in api.responses[ACCOUNT]["positions"]:
+                if row["symbol"] == SILVER and row["positionSide"] == side:
+                    row.update(positionAmt=qty, entryPrice="30")
+            api.responses[RISK] = [risk_row(row, mark="30" if row["symbol"] == SILVER else "100")
+                                   for row in api.responses[ACCOUNT]["positions"]]
+
     # The account payload test below covers holdings for live adapters.
-    def test_all_markets_and_both_directions_must_be_flat(self):
+    def test_other_markets_and_wrong_target_direction_are_still_rejected(self):
         api = self.live["test"].api
         original = deepcopy(api.responses[ACCOUNT]["positions"])
-        for symbol, side in ((GOLD, "LONG"), (SILVER, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
+        for symbol, side in ((GOLD, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
             with self.subTest(symbol=symbol, side=side):
                 rows = deepcopy(original)
                 rows = [row for row in rows if (row["symbol"], row["positionSide"]) != (symbol, side)]

@@ -23,7 +23,8 @@ def require_runtime_symbols(pair, state):
     """Bind every executable journal to the pair before querying or writing.
 
     Historical gold runtimes have no top-level symbol. Their orders and frozen
-    cycle configuration still carry their own symbols and must agree.
+    cycle configuration still carry their own symbols and must agree. Archived
+    watches keep each batch's original symbol across active-symbol edits.
     """
     symbol = validate_symbol(pair["symbol"])
 
@@ -64,19 +65,31 @@ def require_runtime_symbols(pair, state):
                     record(leg["receipt"], "未完成订单回执", explicit=True)
     watch = state.get("recovery_watch")
     if watch is not None:
-        record(watch, "归档订单观察")
+        if not isinstance(watch, dict):
+            raise PairPositionError("归档订单观察记录无效，停止交易并等待核对")
+        if "symbol" in watch and (not isinstance(watch["symbol"], str) or watch["symbol"] not in SUPPORTED_SYMBOLS):
+            raise PairPositionError("归档订单观察标的无效，停止交易并等待核对")
         batches = watch.get("batches")
         if not isinstance(batches, list):
             raise PairPositionError("归档订单观察记录无效，停止交易并等待核对")
         for batch in batches:
-            record(batch, "归档批次")
+            if not isinstance(batch, dict):
+                raise PairPositionError("归档批次记录无效，停止交易并等待核对")
+            # Historical watches remain bound to their own market after an
+            # active-symbol edit. Unmarked legacy batches still use this pair's
+            # current symbol until the edit explicitly freezes that old symbol.
+            watched_symbol = batch.get("symbol", symbol)
+            if not isinstance(watched_symbol, str) or watched_symbol not in SUPPORTED_SYMBOLS:
+                raise PairPositionError("归档批次标的无效，停止交易并等待核对")
             legs = batch.get("legs")
             if not isinstance(legs, list):
                 raise PairPositionError("归档批次订单记录无效，停止交易并等待核对")
             for leg in legs:
                 if not isinstance(leg, dict):
                     raise PairPositionError("归档批次订单记录无效，停止交易并等待核对")
-                record(leg.get("order"), "归档订单", explicit=True)
+                order = leg.get("order")
+                if not isinstance(order, dict) or order.get("symbol") != watched_symbol:
+                    raise PairPositionError(f"归档订单标的与归档批次 {watched_symbol} 不一致，停止交易并等待核对")
     return symbol
 
 

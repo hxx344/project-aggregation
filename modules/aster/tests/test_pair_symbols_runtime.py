@@ -258,13 +258,35 @@ class PairSymbolsRuntimeTests(TestCase):
         with self.no_writes():
             self.assertEqual(self.tick()["phase"], "attention")
 
-    def test_archived_gold_order_cannot_be_queried_for_silver(self):
+    def test_unmarked_legacy_gold_order_cannot_be_reinterpreted_as_silver(self):
         pair = self.create()
         state = {**runtime_default(), "recovery_watch": {"batches": [
             {"legs": [{"key": "long", "order": {"symbol": "XAUUSD1"}}]}]}}
         with self.no_writes(), patch.object(self.trader, "_members", side_effect=AssertionError("no broker read")):
             with self.assertRaisesRegex(PairPositionError, "标的"):
                 require_archived_orders_clear(self.engine, pair, state=state)
+
+    def test_archived_batches_bind_orders_to_their_own_symbols(self):
+        pair = self.create()
+        state = {**runtime_default(), "symbol": "XAGUSD1", "recovery_watch": {"batches": [
+            {"symbol": symbol, "legs": [{"key": key, "order": {"symbol": symbol}}
+                                       for key in ("long", "short")]}
+            for symbol in ("XAUUSD1", "XAGUSD1")]}}
+        for top_symbol in (None, "XAUUSD1", "XAGUSD1"):
+            with self.subTest(top_symbol=top_symbol):
+                checked = deepcopy(state)
+                if top_symbol is not None:
+                    checked["recovery_watch"]["symbol"] = top_symbol
+                self.assertEqual(require_runtime_symbols(pair, checked), "XAGUSD1")
+        for change in (lambda watch: watch["batches"][0].update(symbol="XAGUSD1"),
+                       lambda watch: watch["batches"][0].update(symbol="CLUSD1"),
+                       lambda watch: watch["batches"][0].update(symbol=None),
+                       lambda watch: watch["batches"][0]["legs"][0]["order"].update(symbol="XAGUSD1"),
+                       lambda watch: watch.update(symbol=[])):
+            changed = deepcopy(state)
+            change(changed["recovery_watch"])
+            with self.assertRaisesRegex(PairPositionError, "标的"):
+                require_runtime_symbols(pair, changed)
 
     def test_wrong_plan_or_market_rules_cannot_authorize_submission(self):
         pair = self.create(kind="ordinary")

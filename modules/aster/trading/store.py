@@ -391,7 +391,7 @@ class Store:
 
     def switch_pair_symbol(self, pair, runtime, *, expected_pair, expected_runtime,
                            expected_margin, accounts, check_current):
-        """Atomically replace a verified flat symbol, retaining its old journal."""
+        """Atomically adopt a verified target symbol, retaining its old journal."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
