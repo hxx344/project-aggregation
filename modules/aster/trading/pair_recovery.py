@@ -21,9 +21,10 @@ PREVIEW_TTL = 300
 MAX_WATCH_BATCHES = 8
 
 
-def _query(broker, order):
+def _query(broker, order, *, timeout=None):
     try:
-        row = broker.query(order["symbol"], order["newClientOrderId"])
+        options = {"timeout": timeout} if timeout is not None and isinstance(broker, LiveBroker) else {}
+        row = broker.query(order["symbol"], order["newClientOrderId"], **options)
     except PaperOrderAbsent:
         if isinstance(broker, PaperBroker):
             return None
@@ -62,8 +63,8 @@ def _publish_archived_diagnostic(engine, pair, watch, accounts, status, message)
         pass
 
 
-def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
-    """Only new writes use this guard; reductions and existing recovery remain possible."""
+def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, read_only=False, deadline=None):
+    """Check durable watches for new writes or a fresh read-only maintenance check."""
     from .pair_execution import PairTrader
     state = engine.store.get("pair_runtime:" + pair["id"], {}) if state is None else state
     require_runtime_symbols(pair, state)
@@ -81,7 +82,10 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
         batches = watch.get("batches") if isinstance(watch, dict) else None
         if not isinstance(batches, list) or not 1 <= len(batches) <= MAX_WATCH_BATCHES:
             raise action("人工归档订单跟踪记录无效，禁止新开仓与划转")
-        accounts, current_brokers, identities = PairTrader(engine)._members(pair)
+        # Maintenance can inspect configured live accounts with execution disabled.
+        # Default callers still require live execution permission before new work.
+        member_options = {"read_only": True} if read_only else {}
+        accounts, current_brokers, identities = PairTrader(engine)._members(pair, **member_options)
         brokers = current_brokers if brokers is None else brokers
         evidence = []
         for batch in batches:
@@ -93,7 +97,10 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None):
                     or any(not isinstance(leg.get("order"), dict) for leg in legs)):
                 raise action("人工归档订单明细无效，禁止新开仓与划转")
             for leg in legs:
-                row = _query(brokers[leg["key"]], leg["order"])
+                timeout = None if deadline is None else min(8, deadline - time.monotonic())
+                if timeout is not None and timeout <= 0:
+                    raise TradingError("历史订单核查超过本次更新检查时限，请稍后重试")
+                row = _query(brokers[leg["key"]], leg["order"], timeout=timeout)
                 if row is not None and (row["status"] not in TERMINAL or dec(row["executedQty"]) != 0):
                     raise action("已人工归档的原订单出现成交或活动回执，停止新开仓与划转；请核对原订单和实际仓位")
                 evidence.append({"batch_id": batch.get("id"), "side": leg["key"].upper(),

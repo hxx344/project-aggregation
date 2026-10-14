@@ -1959,9 +1959,10 @@ class LiveBroker:
             return [self._cycle_write("POST", "/fapi/v3/order", orders[0], **options)]
         return self._cycle_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5, **options)
 
-    def query(self, symbol, client_id):
+    def query(self, symbol, client_id, *, timeout=None):
         with self.reconciliation_budget():
-            return self.api.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
+            options = {"timeout": timeout} if timeout is not None else {}
+            return self.api.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True, **options)
 
     def cancel(self, symbol, client_id):
         with self.reconciliation_budget():

@@ -110,11 +110,11 @@ class PairTrader:
         if type(delay) in (int, float) and math.isfinite(delay) and delay > 0:
             state["retry_after"] = max(state.get("retry_after", 0), delay)
 
-    def _members(self, pair):
+    def _members(self, pair, *, read_only=False):
         accounts, brokers, identities = {}, {}, {}
         for key, side in SIDES:
             account = self.store.account(pair[key + "_account_id"])
-            if not account or not self.engine.live_allowed(account):
+            if not account or (not read_only and not self.engine.live_allowed(account)):
                 raise PairPositionError("配对组子账户不存在或实盘执行未启用")
             broker = self.engine.broker(account)
             accounts[key], brokers[key] = account, broker

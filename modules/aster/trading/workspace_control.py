@@ -6,6 +6,7 @@ import threading
 import time
 
 from .exchange import RequestNotSent, LiveBroker, credentials_for
+from .pair_recovery import require_archived_orders_clear
 
 
 class WorkspaceControl:
@@ -76,7 +77,7 @@ class WorkspaceControl:
             margin = store.get("pair_margin:" + pair["id"], {})
             if not isinstance(runtime, dict) or not isinstance(margin, dict):
                 return True
-            if runtime.get("pending") is not None or runtime.get("recovery_watch") is not None:
+            if runtime.get("pending") is not None:
                 return True
             if margin.get("pending") is not None or margin.get("status") in {"submitting", "accepted", "acknowledged", "unknown"}:
                 return True
@@ -101,7 +102,8 @@ class WorkspaceControl:
                         return {**result, "reason": "账户执行仍在进行，请等待本轮核对完成"}
                     stack.callback(lock.release)
                 if self._local_pending(accounts, pairs):
-                    return {**result, "reason": "仍有未完成订单、历史订单观察或待核实划转，请完成核对后再更新"}
+                    return {**result, "reason": "仍有未完成订单或待核实划转，请完成核对后再更新"}
+                states = {pair["id"]: self.engine.store.get("pair_runtime:" + pair["id"], {}) for pair in pairs}
                 live = [account for account in accounts if account["mode"] == "live"]
                 with self.engine.lock:
                     # A configured live account must also be checked after a
@@ -110,7 +112,8 @@ class WorkspaceControl:
                         brokers = {account["id"]: self.engine.broker(account) for account in live}
                     except Exception:
                         return {**result, "reason": "实盘账户缺少有效凭据，无法核查完整挂单；请配置凭据后重试"}
-                def read(account):
+                evidence = []
+                for account in live:
                     broker = brokers[account["id"]]
                     if not isinstance(broker, LiveBroker):
                         raise ValueError("live broker unavailable")
@@ -119,30 +122,51 @@ class WorkspaceControl:
                         raise ValueError("account identity changed")
                     with broker._snapshot_lock:
                         version = broker._snapshot_generation
-                    started = time.monotonic()
+                    evidence.append((account, broker, version, credentials))
+                # The oldest original-order read and every full inventory share
+                # one freshness window. A slow watch cannot renew earlier proof.
+                started = time.monotonic()
+                deadline = started + 30
+                def check_watch(pair):
+                    state = states[pair["id"]]
+                    if state.get("recovery_watch") is not None:
+                        require_archived_orders_clear(self.engine, pair, state=state,
+                                                      read_only=True, deadline=deadline)
+                def read(account):
+                    broker = brokers[account["id"]]
+                    timeout = min(8, deadline - time.monotonic())
+                    if timeout <= 0:
+                        raise ValueError("update evidence deadline exceeded")
                     # No symbol filter: this is the account's complete current
                     # exchange inventory. Ordinary/cycle snapshots omit orders.
-                    orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40, timeout=8)
+                    orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40, timeout=timeout)
                     if not isinstance(orders, list) or orders:
                         raise ValueError("open orders unknown or nonempty")
-                    return account, broker, version, started, credentials
                 with ThreadPoolExecutor(max_workers=4, thread_name_prefix="aster-update") as pool:
-                    evidence = list(pool.map(read, live))
-                now = time.monotonic()
-                for _, broker, _, _, _ in evidence:
+                    # Watch records survive updates. Never authorize from the
+                    # display-only diagnostic cache or delete a cleared watch.
+                    try:
+                        list(pool.map(check_watch, pairs))
+                    except Exception:
+                        return {**result, "reason": "历史原订单核查未通过，可能存在成交、活动回执或读取异常；请核对后重试"}
+                    list(pool.map(read, live))
+                for _, broker, _, _ in evidence:
                     stack.enter_context(broker._snapshot_lock)
-                for account, broker, version, started, credentials in evidence:
+                for account, broker, version, credentials in evidence:
                     if broker._snapshot_generation != version:
                         return {**result, "reason": "核查期间账户版本发生变化，请等待新快照后重试"}
-                    if not 0 <= now - started <= 30 or credentials_for(account["env_prefix"]) != credentials:
-                        return {**result, "reason": "挂单核查结果已过期或账户凭据发生变化，请重新核对"}
+                    if credentials_for(account["env_prefix"]) != credentials:
+                        return {**result, "reason": "账户凭据发生变化，请重新核对"}
                     if self.engine.brokers.get(account["id"]) is not broker:
                         return {**result, "reason": "账户执行所有权发生变化，请重新核对"}
                 with self.lock:
                     if (not self.active or self.generation != generation or self.inflight or not self._owned()
                             or self.engine.store.accounts() != accounts or self.engine.store.pairs() != pairs
+                            or any(self.engine.store.get("pair_runtime:" + pair["id"], {}) != states[pair["id"]] for pair in pairs)
                             or self._local_pending(accounts, pairs)):
                         return {**result, "reason": "核查期间维护状态、账户配置或执行状态发生变化"}
+                    if not 0 <= time.monotonic() - started <= 30:
+                        return {**result, "reason": "订单核查结果已过期，请重新核对"}
                 return {"busy": False, "maintenance": True, "checkedAccounts": len(live)}
         except Exception:
             return {**result, "reason": "实盘账户委托读取失败、凭据变更或存在活动订单，暂不能更新"}
