@@ -96,7 +96,12 @@ test('BZ endpoints and tier states stay separate from existing CL settings throu
     const headers = { Authorization: `Basic ${Buffer.from('test:test-password').toString('base64')}`, 'Content-Type': 'application/json', Origin: base };
     const gold = services.get('cl-xau');
     const initial = await readInitialMarket(services); assert.equal(initial['cl-xau'].quote.ratio, 50); assert.equal(initial['cl-xau'].bz.quote.ratio, 40);
-    assert.equal(initial['cl-xau'].bz.history.points[0].oil, 100); assert.equal(initial['cl-xau'].bz.funding.points[0].oil, 0.0002);
+    assert.equal(initial['cl-xau'].bz.history, null); assert.equal(initial['cl-xau'].bz.funding, null);
+    assert.equal(initial['cl-xau'].trend.points[0].value, 50); assert.equal(initial['cl-xau'].bz.trend.points[0].value, 40);
+    assert.equal(initial['cl-xau'].bz.trend.fetchedAt, snapshots(now, 'bz').history.fetchedAt);
+    assert.equal(initial['cl-xau'].bz.trend.unit, '桶/盎司');
+    assert.equal((await gold.handle('bz/history', 'GET')).points[0].oil, 100);
+    assert.equal((await gold.handle('bz/funding', 'GET')).points[0].oil, 0.0002);
     assert.equal((await readHubSummary(services, now, 'cl-xau', 'bz')).metrics[0].value, 40);
     const hub = await (await fetch(`${base}/api/hub/summary?monitor=cl-xau&goldOil=bz&schemaVersion=2`, { headers })).json();
     assert.equal(hub.data.metrics[0].label, '金油比 XAU / BZ'); assert.equal(hub.data.metrics[0].value, 40);

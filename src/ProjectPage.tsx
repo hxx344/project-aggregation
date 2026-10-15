@@ -6,6 +6,9 @@ import DiagnosticDetails from './DiagnosticDetails';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
 
+const PAGE_LOAD_TIMEOUT_MS = 30_000;
+const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
+
 export default function ProjectPage({ project, snapshot, now, active, query, onEdit, onExpired, onStatus, onChanged, onNavigate }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
   const proxied = project.accessMode === 'proxy';
   const embedded = proxied || project.mode === 'embed';
@@ -48,7 +51,8 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
         if (!supportsActivity) { connected.current = false; sentNavigation.current = ''; setBridgeReady(false); }
         if (acknowledge) { acknowledged.current = true; post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] }); }
         if (!supportsActivity) return;
-        connected.current = true; setBridgeReady(true); setLoading(false); latest.current.onStatus('ready');
+        connected.current = true; setBridgeReady(true); setLoading(false);
+        setError(value => value === PAGE_LOAD_TIMEOUT ? '' : value); latest.current.onStatus('ready');
         synchronize();
       } else if (connected.current && data.type === 'changed' && data.scope === 'summary') latest.current.onChanged();
       else if (connected.current && latest.current.active && document.visibilityState === 'visible' && data.type === 'navigate') {
@@ -87,21 +91,24 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
 
   useEffect(() => {
     if (!source || !loading) return;
-    const timer = setTimeout(() => { setLoading(false); setError('项目页面加载超时，请重新载入或检查该项目服务。'); latest.current.onStatus('failed'); }, 30_000);
+    const timer = setTimeout(() => { setLoading(false); setError(PAGE_LOAD_TIMEOUT); latest.current.onStatus('failed'); }, PAGE_LOAD_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [source, loading]);
   useEffect(() => {
     if (!documentLoad || bridgeReady) return;
-    const timer = setTimeout(() => latest.current.onStatus('unsupported'), proxied ? 3000 : 0);
+    // Known built-in modules can hydrate after the native document load. Keep
+    // that document for a bounded readiness window instead of discarding it.
+    const grace = proxied ? project.embedded ? PAGE_LOAD_TIMEOUT_MS : 3000 : 0;
+    const timer = setTimeout(() => latest.current.onStatus('unsupported'), grace);
     return () => clearTimeout(timer);
-  }, [documentLoad, bridgeReady, proxied]);
+  }, [documentLoad, bridgeReady, proxied, project.embedded]);
 
   function loaded() {
     setLoading(false); setDocumentLoad(value => value + 1);
     // WindowProxy survives iframe navigation: revalidate this document even
     // when an earlier document (or its ready-before-load event) was connected.
     connected.current = false; acknowledged.current = false; sentNavigation.current = ''; setBridgeReady(false);
-    setError(value => value === '项目页面加载超时，请重新载入或检查该项目服务。' ? '' : value);
+    setError(value => value === PAGE_LOAD_TIMEOUT ? '' : value);
     post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] });
   }
 

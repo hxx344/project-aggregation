@@ -704,3 +704,31 @@
 **证据：** project-aggregation `9f956497` 的 [MarketPanel](modules/aster/dashboard/components/market-panel.tsx) 两处直接索引可缺失的 `capacities`；[行情采样](modules/aster/trading/engine.py) 的 `poll_market`、`poll_book`、`poll_depth` 会合法生成上述部分对象。2026-10-15 用户反馈勾选监控后整页报错，实际工作台浏览器捕获 `Cannot read properties of undefined (reading '5')`，堆栈定位到同版本 `page-ItLLfWRP.js:2:1633` 的额度单元格渲染。
 
 **事件记录：** `aster-partial-market-hidden-panel-crash-20261015`；一次用户反馈和实际浏览器定位，不推进主线复盘检查点。
+
+### L047：首屏概览与完整历史使用独立的数据契约
+
+**适用条件：** 多个市场共用一个服务端渲染页面，概览只显示短期趋势，但详情需要全部历史和资金费统计。
+
+**根因：** 首屏把四组金油比完整历史和资金费一起写入 HTML，历史增长后拖慢整个页面接收与初始化。2026-10-15 实际工作台读取的内嵌 JSON 达 7,690,553 字符，HTML 即使压缩后仍约 1.92 MB，接收耗时约 69 秒，超过工作台 30 秒加载期限。
+
+**以后做法：** 概览只传报价和独立的七天趋势，保留时间、缺口、单位与源状态；完整历史和资金费在打开对应详情时读取，并使用现有压缩协商。不能把截短历史放回完整历史字段，否则会误算全历史统计，并阻止详情立即加载。读取失败保留旧趋势及其真实时间，不能刷新源时间来掩盖过期。
+
+**如何验证：** [首屏测试](modules/monitor/tests/initial-market.test.mjs) 用四组各两万点的历史验证有界体积、七天边界、零值、缺口、源对象不变及失败恢复；[HTTP 测试](modules/monitor/tests/hub-summary.test.mjs) 验证历史响应 gzip 协商及解压后的完整字段；[浏览器回归](modules/monitor/tests/gold-oil-loading.browser.mjs) 经真实工作台入口验证详情按需读取和统计恢复。
+
+**证据：** project-aggregation 基线 `6026760` 的 [首屏读取](modules/monitor/server/initial-market.mjs) 序列化四组完整历史；用户实际工作台网络记录显示文档状态为 200、gzip 仍传输 1,919,809 字节，并在约 69 秒后才完成。四组历史分别有约 1.49 万至 1.97 万个点，是主要体积来源。
+
+**事件记录：** `monitor-initial-history-payload-20261015`；一次实际慢加载定位，不推进主线复盘检查点。
+
+### L048：迟到的模块就绪消息仍需完成加载恢复
+
+**适用条件：** 工作台通过原生 iframe load 和模块消息共同判断就绪，并保留后台预加载页面。
+
+**根因：** 有效 ready 消息更新了连接状态，却未清除已有加载超时；内置模块在原生 load 后仍需初始化时，后台三秒兜底又会过早丢弃该页面。两个失败路径均在修复前的生产构建上复现。
+
+**以后做法：** 经既有来源和当前窗口校验后的 ready 同步清除对应加载超时。对已知内置模块保留有界初始化窗口；真正无响应仍释放后台队列，旧窗口或错误来源不能恢复当前页面，不能自动反复重新载入。
+
+**如何验证：** [加载浏览器回归](tests/project-load.browser.mjs) 用真实 iframe 与 postMessage 覆盖超时后恢复、错误来源与已销毁窗口拒绝、延迟初始化后复用，以及持续无响应时释放队列；[预加载状态测试](tests/workspace-preload.test.mjs) 核对缓存和队列边界。
+
+**证据：** project-aggregation 基线 `6026760` 的 [ProjectPage](src/ProjectPage.tsx) 在 ready 路径未清除加载错误，且代理页面原生 load 后统一只等待三秒。上述浏览器回归在基线上分别因残留超时、后台 iframe 提前移除失败。
+
+**事件记录：** `hub-late-ready-recovery-20261015`；同一加载状态链的回归修复，不推进主线复盘检查点。

@@ -55,7 +55,7 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
   const [hynix, setHynix] = useState(() => initialSummaries(initial).hynix);
   const [goldOilMarkets, setGoldOilMarkets] = useState(() => Object.fromEntries(GOLD_OIL_VARIANTS.map(({ oilType, exchange }) => {
     const seed = initialGoldOilMarket(initial, oilType, exchange);
-    return [goldOilVariantKey(oilType, exchange), goldOilSummary(seed?.quote ?? null, false, goldOilTrend(seed?.history ?? null, false, oilType, exchange), oilType, exchange)];
+    return [goldOilVariantKey(oilType, exchange), goldOilSummary(seed?.quote ?? null, false, seed?.trend ?? goldOilTrend(seed?.history ?? null, false, oilType, exchange), oilType, exchange)];
   })) as Record<string, MonitorSummary>);
   const setGoldOil = useCallback((summary: MonitorSummary) => setGoldOilMarkets(previous => ({ ...previous, [goldOilKey]: summary })), [goldOilKey]);
   const perpetual = usePerpetualSummary(hub.readActive && enabled('perpetual'));

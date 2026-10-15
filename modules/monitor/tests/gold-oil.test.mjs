@@ -122,7 +122,8 @@ test('resident APIs read only caches, expose ratio summary and pause independent
     const before = services.market.status(); await assert.rejects(services.get('cl-xau').handle('quote', 'GET'), /尚未收到/);
     const initial = (await readInitialMarket(services))['cl-xau'];
     assert.equal(initial.quote, null); assert.equal(initial.history, null);
-    assert.deepEqual(initial.funding.points, savedFunding.points, 'Funding comes from persisted data before any browser read');
+    assert.equal(initial.funding, null, 'Complete funding remains available through its detail API');
+    assert.equal(initial.trend, undefined, 'No saved price history means no fabricated overview trend');
     assert.deepEqual(services.market.status(), before);
     assert.equal((await readHubSummary(services, now, 'cl-xau')).health.state, 'offline');
     assert.deepEqual((await services.get('cl-xau').handle('funding', 'GET')).points, savedFunding.points);
@@ -131,7 +132,7 @@ test('resident APIs read only caches, expose ratio summary and pause independent
     assert.equal(services.get('oil').runtime().enabled, true);
     await services.get('cl-xau').handle('runtime', 'PUT', { enabled: true, revision: 1 }); assert.equal(services.get('cl-xau').runtime().enabled, true);
   } finally { await Promise.all([...services.values()].map(service => service.stop())); await services.market.stop(); await services.notifications.stop(); }
-  const cached = new Map([['cl-xau', { handle: async () => quote() }]]), summary = await readHubSummary(cached, now, 'cl-xau');
+  const cached = new Map([['cl-xau', { handle: async action => { if (action === 'quote') return quote(); throw Error('No cached detail'); } }]]), summary = await readHubSummary(cached, now, 'cl-xau');
   assert.equal(summary.health.state, 'online'); assert.deepEqual(summary.metrics[0], { key: 'ratio', label: '金油比 XAU / CL', value: 50, unit: '桶/盎司' });
   assert.equal((await readHubSummary(cached, now + 76_000, 'cl-xau')).health.state, 'stale'); assert.equal((await readInitialMarket(cached))['cl-xau'].quote.ratio, 50);
 });

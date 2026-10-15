@@ -6,8 +6,8 @@ import Chart, { FundingChart } from './gold-oil-svg-chart';
 import { GOLD_OIL_STALE_MS, GOLD_OIL_INTERVAL_MS, GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, goldOilVariantKey, goldOilUnits, goldOilChartPoints, type GoldOilType, type GoldOilExchange, type GoldOilPoint } from '../lib/gold-oil';
 import { currentGoldOilFunding, analyzeAvailableGoldOilFunding, type GoldOilFundingHistory } from '../lib/gold-oil-funding';
 import { goldOilStatistics, sampleGoldOilPoints, adjacentRatioChange } from '../lib/gold-oil-analysis';
-import { goldOilSummary, goldOilTrend, summaryTimestamp, type SummaryProps } from '../lib/monitor-summary';
-import type { InitialMarketData } from '../lib/initial-market';
+import { goldOilSummary, summaryTimestamp, type SummaryProps } from '../lib/monitor-summary';
+import { goldOilOverviewTrend, initialGoldOilMarket, type InitialMarketData } from '../lib/initial-market';
 import { useGoldOilFeed } from '../hooks/use-gold-oil-feed';
 
 const ranges = [{ days: 1, label: '1 天' }, { days: 7, label: '1 周' }, { days: '1m' as const, label: '1 月' }, { days: 0, label: '全部' }];
@@ -60,7 +60,8 @@ export default function GoldOilPanel({ initial, active = true, summaryActive = t
   const [page, setPage] = useState(0), [cursor, setCursor] = useState<number | null>(null), [now, setNow] = useState(initial?.renderedAt ?? 0);
   const [selectionMarket, setSelectionMarket] = useState(marketKey);
   if (selectionMarket !== marketKey) { setSelectionMarket(marketKey); setPage(0); setCursor(null); }
-  const trend = useMemo(() => goldOilTrend(history, historyError, oilType, exchange), [history, historyError, oilType, exchange]);
+  const seedTrend = initialGoldOilMarket(initial, oilType, exchange)?.trend;
+  const trend = useMemo(() => goldOilOverviewTrend(history, historyError, seedTrend, oilType, exchange), [history, historyError, seedTrend, oilType, exchange]);
   useEffect(() => { onSummary?.(goldOilSummary(quote, quoteError, trend, oilType, exchange)); }, [quote, quoteError, trend, onSummary, oilType, exchange]);
   useEffect(() => { if (!active) return; const timer = setInterval(() => setNow(Date.now()), 10_000); return () => clearInterval(timer); }, [active]);
   const points = useMemo(() => goldOilChartPoints(history, days), [history, days]);

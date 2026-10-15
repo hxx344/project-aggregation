@@ -2,9 +2,12 @@
 // Run after build:linux: node tests/gold-oil-loading-server.mjs
 // No collectors, notifications, network data sources or persistent files.
 import { createServer } from 'node:http';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPageHandler } from '../server/page-handler.mjs';
 
-const now = Date.now(), end = Math.floor(now / 900000) * 900000, start = end - 672 * 900000;
+export function createGoldOilLoadingFixture(now = Date.now()) {
+const end = Math.floor(now / 900000) * 900000, start = end - 672 * 900000;
 const common = { source: 'Binance', currency: 'USDT', priceBasis: 'mark', status: 'live', fetchedAt: new Date(now).toISOString() };
 const history = { ...common, interval: '15m', coverageStart: start, points: Array.from({ length: 672 }, (_, index) => {
   const cl = 80 + Math.sin(index / 20), xau = index === 660 ? null : 4000 + index / 10;
@@ -31,7 +34,12 @@ const bybitMarket = (market, oilType) => {
 const bybit = { ...bybitMarket({ quote, history, funding }, 'cl'), bz: bybitMarket(bz, 'bz') };
 const snapshots = { quote, history, funding, bz, bybit };
 const services = new Map([['cl-xau', { handle(action) { const exchange = action.startsWith('bybit/') ? bybit : snapshots, name = action.replace(/^bybit\//, ''); return name.startsWith('bz/') ? exchange.bz[name.slice(3)] : exchange[name]; } }]]);
-const app = await createPageHandler({ services });
+return { snapshots, services };
+}
+
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+const { snapshots, services } = createGoldOilLoadingFixture();
+const app = await createPageHandler({ services, root: fileURLToPath(new URL('..', import.meta.url)) });
 const handler = app.handle;
 const server = createServer((request, response) => {
   if (request.url === '/__fixture') { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(snapshots)); return; }
@@ -47,3 +55,4 @@ console.log('Seeded chart fixture ready at http://127.0.0.1:3190');
 async function stop() { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await app.close(); }
 process.once('SIGINT', () => void stop());
 process.once('SIGTERM', () => void stop());
+}

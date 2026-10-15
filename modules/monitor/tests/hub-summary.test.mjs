@@ -38,13 +38,20 @@ test('selected module summaries preserve legacy keys, units and source time with
   await assert.rejects(readHubSummary(services(), now, 'unknown'), /不存在/);
 });
 
-for (const action of ['opportunities-v2', 'quote']) test(`${action} compression negotiates gzip and preserves source times and the full JSON envelope`, async t => {
-  const payload = { schemaVersion: action === 'quote' ? 1 : 2, generatedAt: now, monitorId: 'perpetual', staleAfterMs: 30000,
-    exchanges: [{ id: 'binance', status: 'live' }], quotes: Array.from({ length: 200 }, (_, i) => ({ symbol: `BTC${i}`, bid: 100, ask: 101, bidAskAt: now - 1000 })), signals: [] };
-  const server = createServer(createHandler({ services: new Map([['perpetual', { actions: { [action]: ['GET'] }, handle: async () => payload }]]), username: 'test', password: 'test-password', nextHandler: (_q, r) => r.end() }));
+const compressedRoutes = [
+  ['perpetual', 'opportunities-v2'], ['perpetual', 'quote'],
+  ['oil', 'history'], ['oil', 'candles/15m'], ['hynix', 'history'], ['hynix', 'funding'],
+  ...['', 'bz/', 'bybit/', 'bybit/bz/'].flatMap(prefix => ['history', 'funding'].map(action => ['cl-xau', prefix + action])),
+];
+for (const [id, action] of compressedRoutes) test(`${id}/${action} compression negotiates gzip and preserves source times and the full JSON envelope`, async t => {
+  const payload = { schemaVersion: action === 'quote' ? 1 : 2, generatedAt: now, monitorId: id, staleAfterMs: 30000,
+    exchanges: [{ id: 'binance', status: 'live' }], quotes: Array.from({ length: 200 }, (_, i) => ({ symbol: `BTC${i}`, bid: 100, ask: 101, bidAskAt: now - 1000 })), signals: [],
+    fetchedAt: timestamp, status: 'snapshot', coverageStart: now - 200 * 900000,
+    points: Array.from({ length: 200 }, (_, i) => ({ time: now - (200 - i) * 900000, oil: i === 1 ? null : 0, xau: i / 10000, ratio: i === 1 ? null : 50 })) };
+  const server = createServer(createHandler({ services: new Map([[id, { actions: { [action]: ['GET'] }, handle: async () => payload }]]), username: 'test', password: 'test-password', nextHandler: (_q, r) => r.end() }));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
-  const url = `http://127.0.0.1:${server.address().port}/api/monitors/perpetual/${action}`;
+  const url = `http://127.0.0.1:${server.address().port}/api/monitors/${id}/${action}`;
   const read = encoding => new Promise((resolve, reject) => get(url, { headers: { Authorization: `Basic ${Buffer.from('test:test-password').toString('base64')}`, ...(encoding ? { 'Accept-Encoding': encoding } : {}) } }, response => { const chunks = []; response.on('data', chunk => chunks.push(chunk)); response.on('end', () => resolve({ headers: response.headers, body: Buffer.concat(chunks) })); }).on('error', reject));
   const zipped = await read('gzip'); assert.equal(zipped.headers['content-encoding'], 'gzip'); assert.equal(zipped.headers.vary, 'Accept-Encoding');
   assert.deepEqual(JSON.parse(gunzipSync(zipped.body)), payload);
