@@ -762,6 +762,9 @@ class Store:
             monitoring.write(db, config)
             if previous_watch != desired_watch:
                 listing_alerts.set_watch(db, symbol, desired_watch, time.time())
+            elif symbol is not None and not listing_alerts.same_rule(
+                    listing_alerts.rule(previous, symbol), listing_alerts.rule(config, symbol)):
+                listing_alerts.refresh_rule(db, symbol, time.time())
             monitoring.cancel_disabled(db, config)
             if any(previous[key] != config[key] for key in
                    ("feishu_enabled", "hourly_summary_alerts", "hourly_summary_interval_minutes")):

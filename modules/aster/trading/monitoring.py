@@ -4,6 +4,7 @@ import re
 import time
 from copy import deepcopy
 
+import monitor
 from .models import MARKET_SYMBOLS, SYMBOLS, TradingError
 
 KEY = "monitoring_settings"
@@ -25,7 +26,8 @@ NOTIFICATION_TYPES = ("new_listing", "listing_capacity", "strategy_capacity", "t
 DEFAULTS = {**LEGACY_DEFAULTS, "schema_version": 2, "auto_discover": True,
             "default_notification_types": [kind for kind in NOTIFICATION_TYPES if kind != "listing_capacity"]}
 GLOBAL_FIELDS = set(DEFAULTS) - {"schema_version"}
-SYMBOL_FIELDS = {"monitor_enabled", "notification_types", "monitor", "alerts", "max_capacity_alert"}
+CAPACITY_DEFAULTS = {"listing_capacity_leverage": None, "listing_capacity_threshold": "0"}
+SYMBOL_FIELDS = {"monitor_enabled", "notification_types", "monitor", "alerts", "max_capacity_alert", *CAPACITY_DEFAULTS}
 CATEGORIES = set(NOTIFICATION_TYPES) | {"hourly_summary", "relay_health"}
 
 
@@ -92,7 +94,7 @@ def write(db, config):
 
 def symbol_options(config, symbol):
     monitor_enabled = symbol in SYMBOLS or config["auto_monitor_new"]
-    options = {"monitor": monitor_enabled, "monitor_enabled": monitor_enabled, "alerts": True,
+    options = {**CAPACITY_DEFAULTS, "monitor": monitor_enabled, "monitor_enabled": monitor_enabled, "alerts": True,
                "notification_types": applicable_types(config["default_notification_types"], symbol),
                **config["symbols"].get(symbol, {})}
     return {**options, "monitor": options["monitor_enabled"],
@@ -136,11 +138,30 @@ def message_allowed(db, item, config=None):
     return allowed(config or read(db), category, symbols)
 
 
+def validate_capacity_threshold(value):
+    """Use the editor's decimal grammar without converting amounts to floats."""
+    if type(value) is not str:
+        raise TradingError("额度通知阈值必须为非负十进制字符串")
+    text = value.strip()
+    if not re.fullmatch(r"\+?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", text):
+        raise TradingError("额度通知阈值必须为有效的非负十进制数")
+    try:
+        monitor.number(text)
+    except monitor.MonitorError:
+        raise TradingError("额度通知阈值必须为有效的非负十进制数") from None
+    return text
+
+
 def validate_edit(changes, fields):
     if not changes or set(changes) - set(fields):
         raise TradingError("请提交有效的监控或告警开关")
     for field, value in changes.items():
-        if field == "hourly_summary_interval_minutes":
+        if field == "listing_capacity_leverage":
+            if value is not None and (type(value) is not int or not 1 <= value <= 10000):
+                raise TradingError("额度通知杠杆必须为 1–10000 的整数或最大杠杆")
+        elif field == "listing_capacity_threshold":
+            validate_capacity_threshold(value)
+        elif field == "hourly_summary_interval_minutes":
             if type(value) is not int or not 1 <= value <= 1440:
                 raise TradingError("摘要发送间隔必须为 1–1440 的整数分钟")
         elif field in ("notification_types", "default_notification_types"):
@@ -160,6 +181,17 @@ def validate_edit(changes, fields):
 
 def edit_symbol(config, symbol, changes, watch_enabled):
     options = config["symbols"][symbol]
+    for key, default in CAPACITY_DEFAULTS.items():
+        if key in changes:
+            before, after = options.get(key, default), changes[key]
+            if key == "listing_capacity_threshold":
+                after = validate_capacity_threshold(after)
+            # Equivalent decimal spellings and the first default save must not
+            # reset an existing notification episode or raise the revision.
+            changed = (monitor.number(before) != monitor.number(after)
+                       if key == "listing_capacity_threshold" else before != after)
+            if changed:
+                options[key] = after
     if "monitor_enabled" in changes or "monitor" in changes:
         options["monitor_enabled"] = changes.get("monitor_enabled", changes.get("monitor"))
         options["monitor"] = options["monitor_enabled"]

@@ -1,4 +1,4 @@
-"""Selected USD1 maximum-leverage alerts, updated inside Store transactions."""
+"""Per-symbol public capacity alerts, updated inside Store transactions."""
 from datetime import datetime, timezone
 import json
 import math
@@ -25,25 +25,53 @@ def write(db, key, value):
                (key, json.dumps(value, ensure_ascii=False, separators=(",", ":"))))
 
 
-def sample(state, row, now, *, require_catalog_fresh=True):
+def rule(config, symbol):
+    options = monitoring.symbol_options(config, symbol)
+    return {"leverage": options["listing_capacity_leverage"], "threshold": options["listing_capacity_threshold"]}
+
+
+def same_rule(previous, current):
+    # Missing fingerprints are the original maximum-leverage, >0 policy.
+    previous = previous or {"leverage": None, "threshold": "0"}
+    return (previous.get("leverage") == current["leverage"]
+            and monitor.number(previous.get("threshold", "0")) == monitor.number(current["threshold"]))
+
+
+def sample(state, row, now, *, require_catalog_fresh=True, requested_leverage=None):
     """Unknown never means zero, including when only the leverage read succeeded."""
-    if not state.get("initialized") or (require_catalog_fresh and state.get("error")) or not row or row.get("error") or row.get("status") != "TRADING":
+    if not state.get("initialized") or (require_catalog_fresh and state.get("error")) or not row or row.get("status") != "TRADING":
         return None
-    stamps = [row.get("checked_at"), row.get("brackets_checked_at")]
+    if "capacity_alert_sample" in row:
+        source = row["capacity_alert_sample"]
+        if not isinstance(source, dict) or "requested_leverage" not in source:
+            return None
+        requested = source["requested_leverage"]
+        if requested is not None and type(requested) is not int:
+            return None
+        if requested != requested_leverage:
+            return None
+        leverage = source.get("leverage")
+    elif requested_leverage is None:
+        source, leverage = row, row.get("max_leverage")
+    else:
+        return None
+    if source.get("error"):
+        return None
+    stamps = [source.get("checked_at"), source.get("brackets_checked_at")]
     if require_catalog_fresh:
         stamps.append(state.get("checked_at"))
     if any(type(stamp) not in (int, float) or not math.isfinite(stamp) or not -1 <= now - stamp < STALE_SECONDS for stamp in stamps):
         return None
-    leverage = row.get("max_leverage")
-    if type(leverage) is not int or not 1 <= leverage <= 10000:
+    if (type(leverage) is not int or not 1 <= leverage <= 10000
+            or requested_leverage is not None and leverage != requested_leverage):
         return None
     try:
-        amount, remaining, cap = (monitor.number(row.get(key)) for key in ("capacity", "remaining", "bracket_cap"))
+        amount, remaining, cap = (monitor.number(source.get(key)) for key in ("capacity", "remaining", "bracket_cap"))
     except monitor.MonitorError:
         return None
     if amount != min(remaining, cap):
         return None
-    return leverage, amount, row["checked_at"], min(stamps) + STALE_SECONDS
+    return leverage, amount, source["checked_at"], min(stamps) + STALE_SECONDS
 
 
 def cancel(db, gate, *, forget=False):
@@ -55,13 +83,22 @@ def cancel(db, gate, *, forget=False):
 
 def observe(db, symbol, gate, state, now):
     config = monitoring.read(db)
+    current_rule = rule(config, symbol)
+    if not same_rule(gate.get("rule"), current_rule):
+        cancel(db, gate, forget=True)
+        gate.update(rule=current_rule, notified=False)
+        gate.pop("leverage", None)
+        gate.pop("checked_at", None)
+        # Persist the new episode even while its requested sample is absent.
+        write(db, WATCH_PREFIX + symbol, gate)
     if not monitoring.allowed(config, "listing_capacity", [symbol]):
         cancel(db, gate, forget=True)
         gate.update(notified=False, resume_after=time.time())
         write(db, WATCH_PREFIX + symbol, gate)
         return
     row = state.get("rows", {}).get(symbol)
-    current = sample(state, row, now, require_catalog_fresh=config["discovery_enabled"])
+    current = sample(state, row, now, require_catalog_fresh=config["discovery_enabled"],
+                     requested_leverage=current_rule["leverage"])
     if not current or current[2] < gate.get("checked_at", 0) or current[2] <= gate.get("resume_after", 0):
         cancel(db, gate)
         return
@@ -70,15 +107,19 @@ def observe(db, symbol, gate, state, now):
         cancel(db, gate, forget=True)
         gate["notified"] = False
     gate.update(leverage=leverage, checked_at=checked_at)
-    if amount == 0:
+    threshold = monitor.number(current_rule["threshold"])
+    if amount <= threshold:
         cancel(db, gate, forget=True)
         gate["notified"] = False
     elif not gate.get("notified"):
         stamp = datetime.fromtimestamp(checked_at, timezone.utc).isoformat()
-        message = (f"ASTER USD1 最大杠杆额度提醒\n交易对：{symbol}\n最大杠杆：{leverage}x\n"
-                   f"该杠杆公开可用额度：{amount} USD1\n触发条件：> 0 USD1\n"
-                   f"公开剩余额度：{row['remaining']} USD1\n该杠杆档位上限：{row['bracket_cap']} USD1\n"
+        source = row.get("capacity_alert_sample", row)
+        mode = "最大杠杆" if current_rule["leverage"] is None else "指定杠杆"
+        message = (f"ASTER USD1 {mode}额度提醒\n交易对：{symbol}\n{mode}：{leverage}x\n"
+                   f"该杠杆公开可用额度：{amount} USD1\n触发条件：> {current_rule['threshold']} USD1\n"
+                   f"公开剩余额度：{source['remaining']} USD1\n该杠杆档位上限：{source['bracket_cap']} USD1\n"
                    f"额度采样时间：{stamp}\n"
+                   f"档位采样时间：{datetime.fromtimestamp(source['brackets_checked_at'], timezone.utc).isoformat()}\n"
                    "公开可用额度取公开剩余额度与档位上限的较小值，非账户可开额度。")
         if gate.get("pending_id"):
             # A recovered sample revives this episode without erasing retry backoff.
@@ -89,6 +130,13 @@ def observe(db, symbol, gate, state, now):
             db.execute("INSERT INTO outbox(id,message,due_at,expires_at) VALUES (?,?,?,?)",
                        (gate["pending_id"], message, now, expires_at))
     write(db, WATCH_PREFIX + symbol, gate)
+
+
+def refresh_rule(db, symbol, now):
+    """A config transaction invalidates old work before publishing its new rule."""
+    gate = read(db, WATCH_PREFIX + symbol, {})
+    if gate.get("enabled"):
+        observe(db, symbol, gate, read(db, STATE_KEY, {}), now)
 
 
 def observe_all(db, state, now):
@@ -131,10 +179,15 @@ def deliverable(db, item, now):
     gate = read(db, WATCH_PREFIX + symbol, {}) if symbol else {}
     if not gate.get("enabled") or gate.get("notified") or gate.get("pending_id") != item["id"]:
         return False
+    config = monitoring.read(db)
+    current_rule = rule(config, symbol)
+    if not same_rule(gate.get("rule"), current_rule):
+        return False
     state = read(db, STATE_KEY, {})
     current = sample(state, state.get("rows", {}).get(symbol), now,
-                     require_catalog_fresh=monitoring.read(db)["discovery_enabled"])
-    return bool(current and current[1] > 0 and current[0] == gate.get("leverage") and current[2] == gate.get("checked_at"))
+                     require_catalog_fresh=config["discovery_enabled"], requested_leverage=current_rule["leverage"])
+    return bool(current and current[1] > monitor.number(current_rule["threshold"])
+                and current[0] == gate.get("leverage") and current[2] == gate.get("checked_at"))
 
 
 def delivered(db, item):
@@ -143,7 +196,7 @@ def delivered(db, item):
         return
     key = WATCH_PREFIX + symbol
     gate = read(db, key, {})
-    # Every zero, leverage change, or re-selection uses a new message id. A late
+    # Every threshold fall, rule change, or re-selection uses a new message id. A late
     # success from an old in-flight request cannot consume a new episode.
     if gate.get("enabled") and gate.get("pending_id") == item["id"]:
         gate.update(notified=True, pending_id=None)

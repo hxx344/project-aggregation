@@ -112,6 +112,29 @@ class MonitoringMigrationTests(unittest.TestCase):
         self.assertEqual(restarted.listing_watch_symbols(), [])
         self.assertNotIn("listing_capacity", restarted.monitoring_settings()["symbols"]["OLDUSD1"]["notification_types"])
 
+    def test_v1_and_existing_v2_project_default_capacity_rule_without_rearming(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.store.put("usd1_listings", catalog("BTCUSD1"))
+                old = {"revision": 17, "symbols": {"BTCUSD1": {"monitor": True, "alerts": True}}}
+                if version == 2:
+                    old = monitoring.migrate_v1_to_v2(old)
+                    old["symbols"]["BTCUSD1"].update(monitor_enabled=True,
+                        notification_types=["listing_capacity"])
+                gate = {"enabled": True, "notified": True, "pending_id": None, "leverage": 200, "checked_at": 1}
+                self.store.put(monitoring.KEY, old)
+                self.store.put("usd1_watch:BTCUSD1", gate)
+                restarted = Store(self.store.path)
+                config = restarted.monitoring_settings()
+                options = monitoring.symbol_options(config, "BTCUSD1")
+                self.assertIsNone(options["listing_capacity_leverage"])
+                self.assertEqual(options["listing_capacity_threshold"], "0")
+                before = deepcopy(config)
+                restarted.edit_monitoring({"listing_capacity_leverage": None,
+                    "listing_capacity_threshold": "0.000"}, symbol="BTCUSD1")
+                self.assertEqual(restarted.monitoring_settings(), before)
+                self.assertEqual(restarted.get("usd1_watch:BTCUSD1"), gate)
+
 
 class MonitoringV2Tests(unittest.TestCase):
     def setUp(self):
@@ -263,6 +286,64 @@ class MonitoringV2Tests(unittest.TestCase):
             self.assertEqual(self.store.monitoring_settings(), before)
             self.assertEqual(self.store.listing_watch_symbols(), [])
         self.assertEqual(self.store.due_notifications(), [])
+
+    def test_capacity_rule_precision_restart_and_semantic_same_value_are_preserved(self):
+        threshold = "12345678901234567890.12345678901234567890"
+        self.store.edit_monitoring({"listing_capacity_leverage": 37,
+            "listing_capacity_threshold": threshold}, symbol="BTCUSD1")
+        before = self.store.monitoring_settings()
+        self.assertEqual(Store(self.store.path).monitoring_settings(), before)
+        self.assertEqual(self.options()["listing_capacity_threshold"], threshold)
+        self.assertEqual(self.store.edit_monitoring({"listing_capacity_leverage": 37,
+            "listing_capacity_threshold": threshold + "0"}, symbol="BTCUSD1"), before)
+        self.assertEqual(self.options("ETHUSD1")["listing_capacity_threshold"], "0")
+        self.assertIsNone(self.options("ETHUSD1")["listing_capacity_leverage"])
+        self.store.edit_monitoring({"listing_capacity_leverage": None}, symbol="BTCUSD1")
+        self.assertIsNone(self.options()["listing_capacity_leverage"])
+        self.assertEqual(self.options()["listing_capacity_threshold"], threshold)
+
+    def test_rule_and_types_save_together_and_legacy_same_value_preserves_them(self):
+        self.store.edit_monitoring({"notification_types": ["listing_capacity"],
+            "listing_capacity_leverage": 10, "listing_capacity_threshold": "12.500"}, symbol="BTCUSD1")
+        before = self.store.monitoring_settings()
+        self.assertEqual(self.options()["listing_capacity_leverage"], 10)
+        self.assertEqual(self.options()["listing_capacity_threshold"], "12.500")
+        self.assertEqual(self.store.set_listing_watch("BTCUSD1", True), before)
+        self.assertEqual(self.store.edit_monitoring({"alerts": True,
+            "listing_capacity_threshold": "1.25e1"}, symbol="BTCUSD1"), before)
+        self.store.edit_monitoring({"monitor_enabled": False}, symbol="BTCUSD1")
+        self.assertEqual(self.options()["listing_capacity_leverage"], 10)
+        self.assertEqual(self.options()["listing_capacity_threshold"], "12.500")
+
+    def test_strict_capacity_rule_inputs_are_rejected_without_partial_type_changes(self):
+        before = self.store.monitoring_settings()
+        invalid = [{"listing_capacity_leverage": value} for value in (True, False, "20", 20.0, 0, -1, 10001)]
+        invalid += [{"listing_capacity_threshold": value} for value in
+                    (None, True, 0, 2.5, "", "NaN", "Infinity", "-1", "1e101", "1e-101", "1" * 129,
+                     "1_000", "١٢", "１２", "1e１", "-0", "-0.00")]
+        for changes in invalid:
+            with self.subTest(changes=changes), self.assertRaises(TradingError):
+                self.store.edit_monitoring({"notification_types": ["listing_capacity"], **changes}, symbol="BTCUSD1")
+            self.assertEqual(self.store.monitoring_settings(), before)
+            self.assertEqual(self.store.listing_watch_symbols(), [])
+
+    def test_capacity_threshold_ascii_decimal_grammar_trims_only_outer_space(self):
+        for value in ("  +1.25e2  ", ".5", "5.", "1E-100", "+0", "9" * 128):
+            with self.subTest(value=value):
+                self.store.edit_monitoring({"listing_capacity_threshold": value}, symbol="BTCUSD1")
+                self.assertEqual(self.options()["listing_capacity_threshold"], value.strip())
+
+    def test_concurrent_rule_and_other_fields_merge_without_lost_updates(self):
+        with ThreadPoolExecutor(2) as pool:
+            jobs = [pool.submit(Store(self.store.path).edit_monitoring, changes, symbol="BTCUSD1") for changes in
+                    ({"listing_capacity_leverage": 20, "listing_capacity_threshold": "5.125"},
+                     {"notification_types": ["trade_summary"], "monitor_enabled": False})]
+            for job in jobs:
+                job.result(timeout=10)
+        self.assertEqual(self.options()["listing_capacity_leverage"], 20)
+        self.assertEqual(self.options()["listing_capacity_threshold"], "5.125")
+        self.assertEqual(self.options()["notification_types"], ["trade_summary"])
+        self.assertFalse(self.options()["monitor_enabled"])
 
 
 if __name__ == "__main__":

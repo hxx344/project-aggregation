@@ -275,9 +275,15 @@ export function SymbolMonitorCenter({
                         disabled={disabled}
                         strategyMarket={control.strategy_market}
                         canWatch={control.can_watch}
+                        capacityRule={{
+                          listing_capacity_leverage:
+                            control.listing_capacity_leverage ?? null,
+                          listing_capacity_threshold:
+                            control.listing_capacity_threshold ?? '0',
+                        }}
                         hint="上新与额度提醒需要监控开启；成交汇总与仓位不平衡不受采样开关影响。"
-                        save={(value) =>
-                          save({ notification_types: value }, symbol)
+                        save={(value, rule) =>
+                          save({ notification_types: value, ...rule }, symbol)
                         }
                       />
                     ) : (

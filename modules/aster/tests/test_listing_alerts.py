@@ -42,6 +42,17 @@ class ListingAlertTests(unittest.TestCase):
     def select(self, enabled=True, symbol="BTCUSD1"):
         self.store.set_listing_watch(symbol, enabled)
 
+    def observe_rule(self, amount, *, requested=20, leverage=None, symbol="BTCUSD1", sample_fields=None, **fields):
+        source = {"requested_leverage": requested, "leverage": requested if leverage is None else leverage,
+                  "capacity": amount, "remaining": amount, "bracket_cap": "1e100",
+                  "checked_at": self.now, "brackets_checked_at": self.now, "error": None,
+                  **(sample_fields or {})}
+        self.observe("999", symbol=symbol, capacity_alert_sample=source, **fields)
+
+    def configure_rule(self, leverage=20, threshold="100", symbol="BTCUSD1"):
+        return self.store.edit_monitoring({"notification_types": ["listing_capacity"],
+            "listing_capacity_leverage": leverage, "listing_capacity_threshold": threshold}, symbol=symbol)
+
     def gate(self, symbol="BTCUSD1"):
         return self.store.get(WATCH_PREFIX + symbol)
 
@@ -257,6 +268,182 @@ class ListingAlertTests(unittest.TestCase):
         self.select(False)
         self.assertEqual(self.store.listing_watch_symbols(), [])
 
+    def test_fixed_10_20_and_arbitrary_tiers_use_exact_requested_sample(self):
+        for leverage in (10, 20, 37):
+            with self.subTest(leverage=leverage):
+                self.configure_rule(leverage)
+                self.assertEqual(self.store.due_notifications(), [])
+                self.observe_rule("101", requested=leverage, error="maximum tier unavailable")
+                item = self.send()
+                self.assertIn(f"指定杠杆：{leverage}x", item["message"])
+                self.assertIn("触发条件：> 100 USD1", item["message"])
+                self.assertIn("额度采样时间：", item["message"])
+                self.assertIn("档位采样时间：", item["message"])
+
+    def test_decimal_equality_and_strict_exceed_preserve_precision_and_rearm(self):
+        threshold = "9007199254740993.0000000000000000000001"
+        above = "9007199254740993.0000000000000000000002"
+        self.configure_rule(threshold=threshold)
+        self.observe_rule(threshold)
+        self.assertEqual(self.outbox(), [])
+        self.observe_rule(above)
+        self.send()
+        self.observe_rule("9007199254740994")
+        self.assertEqual(len(self.outbox()), 1)
+        self.observe_rule(threshold)
+        self.assertFalse(self.gate()["notified"])
+        self.observe_rule(above)
+        self.assertEqual(len(self.outbox()), 2)
+
+    def test_threshold_change_rechecks_matching_fresh_sample_and_old_ack_is_isolated(self):
+        self.observe_rule("101")
+        self.configure_rule(threshold="100")
+        old = self.store.due_notifications()[0]
+        self.configure_rule(threshold="99")
+        new = self.store.due_notifications()[0]
+        self.assertNotEqual(old["id"], new["id"])
+        self.assertIsNone(self.store.notification_for_delivery(old["id"]))
+        self.store.notification_result(old, True)
+        self.assertEqual(self.gate()["pending_id"], new["id"])
+        self.assertFalse(self.gate()["notified"])
+        self.send()
+        self.configure_rule(threshold="102")
+        self.assertEqual(self.store.due_notifications(), [])
+        self.observe_rule("103")
+        self.assertEqual(len(self.store.due_notifications()), 1)
+
+    def test_leverage_change_waits_for_matching_sample_and_rejects_old_poll(self):
+        self.observe_rule("101")
+        self.configure_rule()
+        old = self.store.due_notifications()[0]
+        old_state = deepcopy(self.state)
+        revision = self.store.monitoring_settings()["revision"]
+        self.configure_rule(leverage=10)
+        self.assertIsNone(self.store.notification_for_delivery(old["id"]))
+        self.store.save_listing_state(old_state, policy_revision=revision)
+        self.assertEqual(self.store.due_notifications(), [])
+        self.observe_rule("101", requested=10)
+        current = self.store.due_notifications()[0]
+        self.store.notification_result(old, True)
+        self.assertEqual(self.gate()["pending_id"], current["id"])
+        self.assertFalse(self.gate()["notified"])
+
+    def test_default_mode_only_falls_back_when_independent_sample_is_absent(self):
+        self.configure_rule(leverage=None, threshold="100")
+        self.observe("101")
+        self.send()
+        self.observe("0", capacity_alert_sample=None)
+        self.assertTrue(self.gate()["notified"])
+        self.observe_rule("0", requested=None, leverage=200, sample_fields={"error": "failed"})
+        self.assertTrue(self.gate()["notified"])
+        self.observe_rule("0", requested=20)
+        self.assertTrue(self.gate()["notified"])
+        self.observe_rule("0", requested=None, leverage=200)
+        self.assertFalse(self.gate()["notified"])
+        self.observe_rule("101", requested=None, leverage=200, error="legacy row failed")
+        self.assertEqual(len(self.store.due_notifications()), 1)
+
+    def test_fixed_rule_cannot_use_legacy_maximum_or_malformed_independent_samples(self):
+        self.configure_rule()
+        self.observe("1000", leverage=20)
+        self.assertEqual(self.outbox(), [])
+        for fields in ({"requested_leverage": None}, {"requested_leverage": True},
+                       {"requested_leverage": "20"}, {"leverage": 10}, {"leverage": True},
+                       {"capacity": None}, {"capacity": "0"}, {"remaining": None},
+                       {"error": "missing exact tier"}, {"checked_at": self.now - 180},
+                       {"brackets_checked_at": self.now - 180}, {"checked_at": self.now + 2}):
+            with self.subTest(fields=fields):
+                self.observe_rule("101", sample_fields=fields)
+                self.assertEqual(self.outbox(), [])
+
+    def test_unknown_custom_sample_does_not_rearm_and_recovery_preserves_backoff(self):
+        self.configure_rule()
+        self.observe_rule("101")
+        old = self.store.due_notifications()[0]
+        self.store.notification_result(old, False)
+        before = self.outbox()[0]
+        self.store = Store(self.path)
+        self.now += 1
+        self.observe_rule("0", sample_fields={"error": "network"})
+        self.assertEqual(self.store.due_notifications(), [])
+        self.observe_rule("102")
+        after = self.outbox()[0]
+        self.assertEqual((after["id"], after["attempts"], after["due_at"]),
+                         (before["id"], 1, before["due_at"]))
+        self.now = before["due_at"]
+        self.send()
+        self.observe_rule("0", sample_fields={"error": "network"})
+        self.observe_rule("0", sample_fields={"checked_at": self.now - 180})
+        self.assertTrue(self.gate()["notified"])
+        self.observe_rule("102")
+        self.assertEqual(self.store.due_notifications(), [])
+
+    def test_custom_sample_is_rechecked_at_delivery_and_threshold_edit_cannot_freshen_it(self):
+        self.configure_rule()
+        self.observe_rule("101")
+        old = self.store.due_notifications()[0]
+        self.now += 180
+        self.assertIsNone(self.store.notification_for_delivery(old["id"]))
+        self.configure_rule(threshold="1")
+        self.assertEqual(self.store.due_notifications(), [])
+        self.assertIsNone(self.gate()["pending_id"])
+        self.observe_rule("2")
+        self.assertEqual(len(self.store.due_notifications()), 1)
+
+    def test_each_symbol_rule_and_notification_episode_are_independent(self):
+        self.observe_rule("101")
+        self.observe_rule("51", requested=10, symbol="ETHUSD1")
+        self.configure_rule()
+        self.configure_rule(leverage=10, threshold="50", symbol="ETHUSD1")
+        messages = self.store.due_notifications()
+        self.assertEqual(len(messages), 2)
+        eth_gate = self.gate("ETHUSD1")
+        self.configure_rule(threshold="102")
+        self.assertEqual(self.gate("ETHUSD1"), eth_gate)
+        self.assertEqual(len(self.store.due_notifications()), 1)
+        self.assertIn("ETHUSD1", self.store.due_notifications()[0]["message"])
+
+    def test_rule_change_and_new_pending_are_atomic_on_enqueue_failure(self):
+        self.observe_rule("101")
+        self.configure_rule()
+        before_config, before_gate, before_outbox = self.store.monitoring_settings(), self.gate(), self.outbox()
+        with self.store.connect() as db:
+            db.execute("CREATE TRIGGER fail_rule BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'test'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.configure_rule(threshold="99")
+        self.assertEqual(self.store.monitoring_settings(), before_config)
+        self.assertEqual(self.gate(), before_gate)
+        self.assertEqual(self.outbox(), before_outbox)
+
+    def test_equivalent_rules_keep_pending_backoff_and_delivered_episode_across_restart(self):
+        self.observe_rule("101")
+        self.configure_rule(threshold="100.00")
+        old = self.store.due_notifications()[0]
+        self.store.notification_result(old, False)
+        before_config, before_gate, before_outbox = self.store.monitoring_settings(), self.gate(), self.outbox()
+        self.configure_rule(threshold="1e2")
+        self.assertEqual(self.store.monitoring_settings(), before_config)
+        self.assertEqual(self.gate(), before_gate)
+        self.assertEqual(self.outbox(), before_outbox)
+        self.store = Store(self.path)
+        self.now = before_outbox[0]["due_at"]
+        self.observe_rule("102")
+        self.assertEqual(self.send()["id"], old["id"])
+        self.configure_rule(threshold="100.000")
+        self.observe_rule("103")
+        self.assertTrue(self.gate()["notified"])
+        self.assertEqual(len(self.outbox()), 1)
+
+    def test_legacy_gate_missing_fingerprint_keeps_its_episode_with_new_default_sample(self):
+        self.observe("1")
+        self.select()
+        self.send()
+        self.assertNotIn("rule", self.gate())
+        self.store = Store(self.path)
+        self.observe_rule("2", requested=None, leverage=200)
+        self.assertTrue(self.gate()["notified"])
+        self.assertEqual(len(self.outbox()), 1)
+
 
 class ListingAlertAPITests(unittest.TestCase):
     def setUp(self):
@@ -308,3 +495,46 @@ class ListingAlertAPITests(unittest.TestCase):
         self.engine.demo = True
         self.assertEqual(self.client.patch(self.url, json={"enabled": True}).status_code, 409)
         self.assertEqual(self.store.listing_watch_symbols(), [])
+
+    def test_capacity_rule_api_saves_decimal_strings_and_explicit_maximum_null(self):
+        self.login()
+        url = "/api/monitoring/symbols/BTCUSD1"
+        body = {"notification_types": ["listing_capacity"], "listing_capacity_leverage": 37,
+                "listing_capacity_threshold": "9007199254740993.00000000000000000001"}
+        self.assertEqual(self.client.patch(url, json=body).status_code, 200)
+        state = self.client.get("/api/monitoring").json()
+        row = next(row for row in state["symbols"] if row["symbol"] == "BTCUSD1")
+        for key, value in body.items():
+            self.assertEqual(row[key], value)
+        before = self.store.monitoring_settings()
+        self.assertEqual(self.client.patch(url, json={"listing_capacity_threshold": body["listing_capacity_threshold"] + "0"}).status_code, 200)
+        self.assertEqual(self.store.monitoring_settings(), before)
+        self.assertEqual(self.client.patch(url, json={"listing_capacity_leverage": None}).status_code, 200)
+        self.assertIsNone(self.store.monitoring_settings()["symbols"]["BTCUSD1"]["listing_capacity_leverage"])
+        self.assertEqual(self.client.patch(self.url, json={"enabled": True}).status_code, 200)
+        self.assertEqual(self.store.monitoring_settings()["symbols"]["BTCUSD1"]["listing_capacity_threshold"], body["listing_capacity_threshold"])
+
+    def test_capacity_rule_api_rejects_invalid_inputs_atomically(self):
+        self.login()
+        url = "/api/monitoring/symbols/BTCUSD1"
+        before = self.store.monitoring_settings()
+        invalid = [{"listing_capacity_leverage": value} for value in (True, False, "10", 10.0, 0, -1, 10001)]
+        invalid += [{"listing_capacity_threshold": value} for value in
+                    (None, True, 0, 2.5, "", "NaN", "Infinity", "-1", "1e101", "1e-101", "1" * 129,
+                     "1_000", "١٢", "１２", "1e１", "-0", "-0.00")]
+        invalid += [{"listing_capacity_leverage": None, "notification_types": None},
+                    {"listing_capacity_leverage": None, "monitor_enabled": None}]
+        for body in invalid:
+            with self.subTest(body=body):
+                response = self.client.patch(url, json={"notification_types": ["listing_capacity"], **body})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(self.store.monitoring_settings(), before)
+                self.assertEqual(self.store.listing_watch_symbols(), [])
+
+    def test_capacity_rule_api_uses_same_trimmed_ascii_decimal_grammar_as_store(self):
+        self.login()
+        url = "/api/monitoring/symbols/BTCUSD1"
+        for value in ("  +1.25e2  ", ".5", "5.", "1E-100", "+0", " " + "9" * 128 + " "):
+            with self.subTest(value=value):
+                self.assertEqual(self.client.patch(url, json={"listing_capacity_threshold": value}).status_code, 200)
+                self.assertEqual(self.store.monitoring_settings()["symbols"]["BTCUSD1"]["listing_capacity_threshold"], value.strip())

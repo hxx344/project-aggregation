@@ -210,6 +210,19 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
                 self.assertEqual(len(self.aster_requests), 2 * index)
         self.assertEqual(self.relay_requests, [])
 
+    def test_custom_notification_tier_uses_relay_source_times_without_extra_reads(self):
+        self.started.update(oi=self.wall - .25, brackets=self.wall - 45)
+        detail = self.market.listing_detail(SYMBOL, alert_leverage=7)
+        sample = detail["capacity_alert_sample"]
+        self.assertEqual((sample["requested_leverage"], sample["leverage"], sample["capacity"]), (7, 7, "4000"))
+        self.assertAlmostEqual(sample["checked_at"], self.started["oi"], places=5)
+        self.assertAlmostEqual(sample["brackets_checked_at"], self.started["brackets"], places=5)
+        self.advance(.1)
+        self.assertEqual(self.market.listing_detail(SYMBOL, alert_leverage=7)["capacity_alert_sample"], sample)
+        self.assertEqual(len(self.relay_requests), 2)
+        self.assertEqual(self.aster_requests, [])
+        self.assertEqual(self.budget.snapshot()["used"], 0)
+
     def test_display_tiers_keep_both_remote_source_times_when_maximum_is_missing(self):
         self.rows["brackets"]["data"]["brackets"][0]["riskBrackets"][0]["maxOpenPosLeverage"] = 100
         self.rows["oi"]["data"]["leverageOiRemainingMap"]["50"] = "0"

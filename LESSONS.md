@@ -658,3 +658,17 @@
 **证据：** project-aggregation `f01d20d` 的 [公开采样](modules/aster/trading/exchange.py) 及 [调度](modules/aster/trading/engine.py) 按中继是否存在统一分流和清零预算。2026-10-15 用户明确要求仅金银走副服务器，其他币种走主服务器；本轮修正统一覆盖实际读取与混合预算，并补充上述定向回归。
 
 **事件记录：** `aster-capacity-per-symbol-source-20261015`；一次用户纠正及相关调用链修正，不推进主线复盘检查点。
+
+### L044：持久金额条件的前后端输入语法保持一致
+
+**适用条件：** 前端编辑、后端持久化同一十进制金额字符串，且保存后需要再次打开或与其他设置一起提交。
+
+**根因：** Python `Decimal` 接受下划线、Unicode 数字和负零等写法，前端金额编辑器只接受普通 ASCII 十进制；仅核对数值是否有效，会留下能写入却无法重新编辑保存的配置。
+
+**以后做法：** 明确并统一输入语法、长度和指数边界，后端 API 与存储入口共用校验；金额仍保留十进制字符串，不能转成浮点数统一格式。数值等价的重复保存保留原通知状态，不因金额写法改变而重新触发。
+
+**如何验证：** [额度通知测试](modules/aster/tests/test_listing_alerts.py) 与 [前端条件测试](modules/aster/dashboard/tests/monitoring-notifications.test.mjs) 覆盖普通小数、科学计数、精度边界及下划线、Unicode 数字、负零拒绝；[配置迁移测试](modules/aster/tests/test_monitoring_migration.py) 验证等值写法不改变版本或待发通知。
+
+**证据：** project-aggregation 基于 `b1426b4` 的 2026-10-15 单币额度条件开发中，只读联检确认首版 [后端校验](modules/aster/trading/monitoring.py) 直接使用 `monitor.number`，与 [前端条件解析](modules/aster/dashboard/lib/monitoring-notifications.ts) 语法不同。该首版未提交；已统一校验并增加 API、Store 和前端回归。
+
+**事件记录：** `aster-capacity-condition-input-grammar-20261015`；一次首次提交前审查发现，不推进主线复盘检查点。

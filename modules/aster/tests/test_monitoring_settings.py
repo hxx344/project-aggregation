@@ -57,7 +57,8 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.assertFalse(restarted.monitoring_settings()["feishu_enabled"])
         self.assertEqual(restarted.listing_watch_symbols(), ["BTCUSD1"])
         self.assertEqual(restarted.monitoring_settings()["symbols"]["ETHUSD1"],
-                         {"monitor": False, "monitor_enabled": False, "alerts": False, "notification_types": []})
+                         {**monitoring.CAPACITY_DEFAULTS, "monitor": False, "monitor_enabled": False,
+                          "alerts": False, "notification_types": []})
 
     def test_new_default_only_changes_future_symbols(self):
         self.store.edit_monitoring({"auto_monitor_new": False})
@@ -75,7 +76,8 @@ class MonitoringSettingsTests(unittest.TestCase):
             for task in tasks:
                 task.result()
         self.assertEqual(self.store.monitoring_settings()["symbols"]["BTCUSD1"],
-                         {"monitor": False, "monitor_enabled": False, "alerts": False, "notification_types": []})
+                         {**monitoring.CAPACITY_DEFAULTS, "monitor": False, "monitor_enabled": False,
+                          "alerts": False, "notification_types": []})
 
     def test_repeated_saves_do_not_create_a_new_policy_revision(self):
         self.store.edit_monitoring({"feishu_enabled": False})

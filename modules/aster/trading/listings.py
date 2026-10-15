@@ -129,17 +129,28 @@ class ListingMonitor:
         config = self.store.monitoring_settings()
         if not monitoring.monitored(config, symbol):
             return 1
+        alert_leverage = monitoring.symbol_options(config, symbol).get("listing_capacity_leverage")
         try:
-            detail = self.market.listing_detail(symbol)
+            detail = (self.market.listing_detail(symbol, alert_leverage=alert_leverage)
+                      if alert_leverage is not None else self.market.listing_detail(symbol))
             if detail.get("tier_error"):
                 # Overall read failure must not erase or renew the last valid
                 # display sample; per-tier missing values instead replace it.
                 detail = {key: value for key, value in detail.items()
                           if key not in ("tier_capacities", "tier_checked_at", "tier_brackets_checked_at")}
+            alert_sample = detail.get("capacity_alert_sample")
+            if alert_sample and alert_sample.get("error") and alert_sample.get("checked_at") is None:
+                # A transport failure must not renew either source clock or
+                # rewrite the identity of the last notification sample.
+                detail["capacity_alert_sample"] = {**(row.get("capacity_alert_sample") or alert_sample),
+                                                   "error": alert_sample["error"]}
             row.update(detail)
         except Exception:
             row["error"] = "公开杠杆或额度暂不可用，等待重试"
             row["tier_error"] = "公开档位额度暂不可用，保留上次结果并等待重试"
+            row["capacity_alert_sample"] = {**(row.get("capacity_alert_sample") or
+                                               {"requested_leverage": alert_leverage}),
+                                            "error": "通知档位公开额度暂不可用，等待重试"}
         # Failure retains the old sample and its timestamp. Only a successful
         # exact-tier read can complete a previously incomplete notification.
         phase = row.get("notification_phase")

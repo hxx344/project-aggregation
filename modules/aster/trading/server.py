@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from starlette.datastructures import MutableHeaders
 
+from . import monitoring
 from .engine import Engine
 from .cycle import CYCLE_MAXIMUM
 from .hub_summary import hub_summary
@@ -209,11 +210,19 @@ class MonitoringSymbolEdit(BaseModel):
     max_capacity_alert: bool | None = None
     monitor_enabled: bool | None = None
     notification_types: list[Literal["new_listing", "listing_capacity", "strategy_capacity", "trade_summary", "position_imbalance"]] | None = None
+    listing_capacity_leverage: StrictInt | None = Field(default=None, ge=1, le=10000)
+    listing_capacity_threshold: str | None = None
 
     @model_validator(mode="after")
     def nonempty_booleans(self):
-        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set):
-            raise ValueError("请提交至少一个有效开关")
+        if not self.model_fields_set or any(getattr(self, field) is None for field in self.model_fields_set
+                                            if field != "listing_capacity_leverage"):
+            raise ValueError("请提交至少一个有效币种通知设置")
+        if "listing_capacity_threshold" in self.model_fields_set:
+            try:
+                self.listing_capacity_threshold = monitoring.validate_capacity_threshold(self.listing_capacity_threshold)
+            except TradingError as exc:
+                raise ValueError(str(exc)) from None
         return self
 
 

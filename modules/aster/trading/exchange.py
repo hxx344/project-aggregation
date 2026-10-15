@@ -885,8 +885,10 @@ class MarketData:
     def listing_symbols(self):
         return self.api.call("GET", "/fapi/v3/exchangeInfo")
 
-    def listing_detail(self, symbol):
+    def listing_detail(self, symbol, *, alert_leverage=None):
         from .listings import maximum_leverage
+        if alert_leverage is not None and (type(alert_leverage) is not int or not 1 <= alert_leverage <= 10000):
+            raise TradingError("通知杠杆必须为 1–10000 的整数或最大杠杆")
         _, brackets_checked_at, brackets = self._public_sample(
             monitor.BRACKETS_PATH, symbol, brackets=True, priority=False)
         try:
@@ -895,11 +897,17 @@ class MarketData:
             raise ExchangeError("公开杠杆档位数据无效") from None
         detail = {"max_leverage": leverage, "bracket_cap": str(cap), "brackets_checked_at": brackets_checked_at,
                   "capacity": None, "remaining": None, "checked_at": None, "error": None}
+        alert_sample = {"requested_leverage": alert_leverage,
+                        "leverage": alert_leverage if alert_leverage is not None else leverage,
+                        "capacity": None, "remaining": None, "bracket_cap": None,
+                        "checked_at": None, "brackets_checked_at": None, "error": None}
+        detail["capacity_alert_sample"] = alert_sample
         try:
             _, checked_at, oi = self._public_sample(monitor.OI_PATH, symbol, priority=False)
         except (monitor.MonitorError, ExchangeError):
             detail["error"] = "最大杠杆对应的公开额度暂不可用，等待重试"
             detail["tier_error"] = "公开档位额度暂不可用，保留上次结果并等待重试"
+            alert_sample["error"] = "通知档位公开额度暂不可用，等待重试"
             return detail
         # Display tiers share the exact same source samples as the maximum-tier
         # notification. An unavailable tier is unknown, never a substitute zero.
@@ -912,6 +920,12 @@ class MarketData:
                 tier_capacities[str(tier)] = None
         detail.update(tier_capacities=tier_capacities, tier_checked_at=checked_at,
                       tier_brackets_checked_at=brackets_checked_at, tier_error=None)
+        alert_sample.update(checked_at=checked_at, brackets_checked_at=brackets_checked_at)
+        try:
+            amount, remaining, alert_cap = monitor.extract_capacity(oi, brackets, symbol, alert_sample["leverage"])
+            alert_sample.update(capacity=str(amount), remaining=str(remaining), bracket_cap=str(alert_cap))
+        except monitor.MonitorError:
+            alert_sample["error"] = "所选杠杆的公开额度暂不可用，等待重试"
         try:
             capacity, remaining, cap = monitor.extract_capacity(oi, brackets, symbol, leverage)
         except monitor.MonitorError:

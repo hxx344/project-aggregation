@@ -159,6 +159,8 @@ export type MonitoredSymbol = {
   symbol: string;
   monitor_enabled: boolean;
   notification_types: NotificationType[];
+  listing_capacity_leverage?: number | null;
+  listing_capacity_threshold?: string;
   monitor: boolean;
   alerts: boolean;
   max_capacity_alert: boolean;
@@ -168,6 +170,10 @@ export type MonitoredSymbol = {
   effective_monitor: boolean;
   detail_enabled: boolean;
   status: string;
+};
+export type ListingCapacityRule = {
+  listing_capacity_leverage: number | null;
+  listing_capacity_threshold: string;
 };
 export type Monitoring = {
   settings: MonitoringSettings;

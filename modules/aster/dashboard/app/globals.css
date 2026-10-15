@@ -481,14 +481,15 @@
   margin: 0;
   overflow-wrap: anywhere;
 }
+.notification-picker-dialog {
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+}
 .notification-picker-editor {
-  width: 330px;
-  max-width: 100%;
-  margin-top: 12px;
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--card);
+  min-width: 0;
+  margin: 0;
   white-space: normal;
 }
 .notification-picker-editor fieldset {
@@ -539,6 +540,41 @@
   margin-top: 10px;
   font-size: 12px;
   color: var(--danger);
+}
+.notification-capacity-summary {
+  margin: 8px 0 0;
+  max-width: 310px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.notification-capacity-fields {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.notification-capacity-fields label {
+  font-size: 12px;
+}
+.notification-capacity-fields select {
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--foreground);
+}
+.notification-capacity-fields p {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.7;
 }
 .monitor-channels-grid {
   display: grid;
