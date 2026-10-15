@@ -1023,6 +1023,35 @@ td:last-child {
   font-size: 12px;
   margin-top: 6px;
 }
+.position-market {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.position-strategy-badge {
+  color: var(--primary);
+  border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent);
+  border-radius: 4px;
+  padding: 2px 5px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.position-managed-direction {
+  color: var(--muted-foreground);
+}
+.pair-account-positions {
+  min-width: 0;
+}
+.pair-account-positions .section-head,
+.pair-account-positions .section-head h2 {
+  flex-wrap: wrap;
+}
+.pair-positions-empty {
+  margin: 0;
+  padding: 0 22px 22px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
 .empty-state {
   display: flex;
   flex-direction: column;

@@ -1,12 +1,8 @@
 'use client';
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+  AccountPositionsTable,
+  type PositionStrategy,
+} from '@/components/account-positions-table';
 import { Button } from '@/components/ui/button';
 import {
   ConfigurationField,
@@ -14,16 +10,14 @@ import {
 } from '@/components/configuration-fields';
 import type { FeatureProps } from '@/lib/desk-types';
 import { useAccountDraft } from '@/lib/use-account-draft';
-import {
-  Layers3,
-  ShieldCheck,
-  ArrowUpRight,
-  ArrowDownLeft,
-} from 'lucide-react';
+import { Layers3, ShieldCheck, ArrowUpRight } from 'lucide-react';
 import { Progress } from '@/components/ui/progress';
 import { fmt, pct, clock } from '@/lib/desk-format';
 import { accountModeView, accountSnapshotView } from '@/lib/account-modes';
 import { accountConfigurationLock } from '@/lib/account-config';
+import { visiblePositions } from '@/lib/account-positions';
+import { pairMarginOnly, type Pair } from '@/lib/pairs';
+import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
 import {
   cycleMarginLimit,
@@ -39,12 +33,26 @@ export function AccountOverview({
   setNotice,
   now,
   connectionError,
-}: FeatureProps & { now: number; connectionError: string }) {
+  pair,
+}: FeatureProps & { now: number; connectionError: string; pair?: Pair }) {
   const snapshot = account.snapshot;
   const configurationLock = accountConfigurationLock(account);
   const locked = busy || Boolean(configurationLock);
-  const positions =
-    snapshot?.positions.filter((p) => Number(p.qty) !== 0) ?? [];
+  const positions = visiblePositions(snapshot);
+  const direction =
+    pair?.long_account_id === account.id
+      ? 'LONG'
+      : pair?.short_account_id === account.id
+        ? 'SHORT'
+        : undefined;
+  const positionStrategy: PositionStrategy | undefined =
+    pair && direction
+      ? {
+          symbol: pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol,
+          direction,
+          marginOnly: pairMarginOnly(pair),
+        }
+      : undefined;
   const ratio =
     snapshot?.ratio == null || pct(snapshot.ratio) === '—'
       ? null
@@ -134,58 +142,10 @@ export function AccountOverview({
               {snapshotView.label} {clock(snapshot?.timestamp)}
             </span>
           </div>
-          <div className="table-scroll">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>市场 / 方向</TableHead>
-                  <TableHead className="number">数量</TableHead>
-                  <TableHead className="number">开仓均价</TableHead>
-                  <TableHead className="number">标记价格</TableHead>
-                  <TableHead className="number">杠杆</TableHead>
-                  <TableHead className="number">名义价值</TableHead>
-                  <TableHead className="number">占用保证金</TableHead>
-                  <TableHead className="number">预估强平价</TableHead>
-                  <TableHead className="number">未实现盈亏</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {positions.map((p) => (
-                  <TableRow key={`${p.symbol}-${p.side}`}>
-                    <TableCell>
-                      <strong>{p.symbol}</strong>
-                      <span
-                        className={`direction ${p.side === 'LONG' ? 'mint' : 'danger'}`}
-                      >
-                        {p.side === 'LONG' ? (
-                          <ArrowUpRight size={14} />
-                        ) : (
-                          <ArrowDownLeft size={14} />
-                        )}{' '}
-                        {p.side === 'LONG' ? '多仓' : '空仓'}
-                      </span>
-                    </TableCell>
-                    <TableCell className="number">{fmt(p.qty, 4)}</TableCell>
-                    <TableCell className="number">{fmt(p.entry)}</TableCell>
-                    <TableCell className="number">{fmt(p.mark)}</TableCell>
-                    <TableCell className="number">{p.leverage}x</TableCell>
-                    <TableCell className="number">{fmt(p.notional)}</TableCell>
-                    <TableCell className="number">
-                      {fmt(p.occupied_margin)}
-                    </TableCell>
-                    <TableCell className="number">
-                      {Number(p.liquidation) > 0 ? fmt(p.liquidation) : '—'}
-                    </TableCell>
-                    <TableCell
-                      className={`number ${Number(p.unrealized) < 0 ? 'danger' : 'mint'}`}
-                    >
-                      {fmt(p.unrealized)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+          <AccountPositionsTable
+            positions={positions}
+            strategy={positionStrategy}
+          />
           {!positions.length && (
             <div className="empty-state">
               <Layers3 size={27} />

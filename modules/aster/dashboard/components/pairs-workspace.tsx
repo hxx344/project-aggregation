@@ -24,6 +24,7 @@ import { PairNotices } from '@/components/pair-notices';
 import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
 import { PairOrderRecovery } from '@/components/pair-order-recovery';
 import { PairBaselineRecovery } from '@/components/pair-baseline-recovery';
+import { PairAccountPositions } from '@/components/pair-account-positions';
 import { CycleQualityHistoryPanel } from '@/components/cycle-quality-history';
 import {
   pairScheduledMarginWait,
@@ -494,6 +495,8 @@ function PairDetail({
           dataWarning={noticeObservation?.data.short.confirmed ?? false}
         />
       </div>
+      <PairAccountPositions pair={pair} side="long" account={long} />
+      <PairAccountPositions pair={pair} side="short" account={short} />
       <section className="panel" aria-label="配对数量与执行进度">
         <div className="section-head">
           <h2>配对执行</h2>

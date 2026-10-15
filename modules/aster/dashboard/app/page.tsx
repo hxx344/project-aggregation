@@ -411,6 +411,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                   {...featureProps}
                   now={serverNow}
                   connectionError={connectionError}
+                  pair={binding}
                 />
               </TabsContent>
               <TabsContent value="monitoring">
