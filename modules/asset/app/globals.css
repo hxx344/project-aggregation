@@ -137,6 +137,43 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .page-heading{gap:20px}
 .page-heading p{line-height:1.7}
 .panel,.summary,.chart-grid>*,.connections-grid>*{min-width:0}
+
+/* Asset returns stay within the trend panel, including narrow embedded views. */
+.trend-panel .performance-metrics{margin:16px 24px 8px;padding:18px;background:var(--secondary);border:1px solid var(--border);border-radius:8px;min-width:0}
+.performance-heading{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.performance-heading h3{margin:0;font-size:.875rem;font-weight:600}
+.performance-heading>span{font-size:.6875rem;color:var(--muted-foreground)}
+.performance-annualized{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.performance-card{min-width:0;padding:14px;background:var(--card);border:1px solid var(--border);border-radius:6px}
+.performance-label{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--muted-foreground);font-size:.75rem}
+.performance-label small{font-size:.6875rem}
+.performance-card strong{display:block;margin:8px 0;font-size:1.6rem;font-weight:600;letter-spacing:-.025em;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.performance-card p,.performance-note,.performance-warning{font-size:.6875rem;line-height:1.7;overflow-wrap:anywhere}
+.performance-card p,.performance-note{color:var(--muted-foreground)}
+.performance-note{margin-top:12px}
+.performance-warning{color:var(--warning);margin-top:5px}
+.performance-positive{color:var(--positive)}
+.performance-negative{color:var(--destructive)}
+.performance-neutral{color:var(--muted-foreground)}
+.performance-monthly{margin-top:12px;border-top:1px solid var(--border)}
+.performance-monthly summary{min-height:44px;padding:12px 0;font-size:.8125rem;font-weight:500;cursor:pointer;list-style-position:inside}
+.performance-monthly summary>span{color:var(--muted-foreground);font-weight:400}
+.performance-monthly summary:hover{color:var(--primary)}
+.performance-monthly summary:focus-visible,.performance-table-scroll:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.performance-table-scroll{max-width:100%;overflow-x:auto;overscroll-behavior-x:contain}
+.performance-table{width:100%;border-collapse:collapse;font-size:.75rem;font-variant-numeric:tabular-nums}
+.performance-table caption{text-align:left;font-size:.6875rem;color:var(--muted-foreground);padding:0 0 12px;line-height:1.7}
+.performance-table th,.performance-table td{padding:12px 10px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
+.performance-table thead th{font-weight:500;color:var(--muted-foreground);font-size:.6875rem}
+.performance-table th:first-child{text-align:left;padding-left:0}
+.performance-table tbody th{font-weight:500}
+.performance-table tbody th small{display:block;font-size:.625rem;font-weight:400;color:var(--muted-foreground);margin-top:4px}
+.performance-table tbody th small.performance-warning{color:var(--warning)}
+.performance-table tr>*:last-child{padding-right:0}
+.performance-table tbody tr:last-child>*{border-bottom:0}
+.performance-table tbody tr:hover{background:var(--card)}
+.performance-month-state{display:inline-block;margin-left:8px;color:var(--muted-foreground);font-size:.625rem;font-weight:400}
+@media(max-width:600px){.trend-panel .performance-metrics{margin:14px 16px 8px;padding:14px}.performance-annualized{grid-template-columns:1fr}.performance-card strong{font-size:1.5rem}.performance-table th,.performance-table td{padding:10px 8px}}
 .holdings [data-slot=table-row]:hover{background:var(--secondary)}
 [data-slot=tabs-list]{background:var(--secondary);border-radius:7px}
 [data-slot=tabs-trigger]{min-height:36px}

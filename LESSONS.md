@@ -672,3 +672,17 @@
 **证据：** project-aggregation 基于 `b1426b4` 的 2026-10-15 单币额度条件开发中，只读联检确认首版 [后端校验](modules/aster/trading/monitoring.py) 直接使用 `monitor.number`，与 [前端条件解析](modules/aster/dashboard/lib/monitoring-notifications.ts) 语法不同。该首版未提交；已统一校验并增加 API、Store 和前端回归。
 
 **事件记录：** `aster-capacity-condition-input-grammar-20261015`；一次首次提交前审查发现，不推进主线复盘检查点。
+
+### L045：全历史收益必须核对服务端读取窗口
+
+**适用条件：** 基于最早和最新快照计算总体收益或年化，且数据读取可能带分页、数量上限或混合归档。
+
+**根因：** 前端接收的完整数组不等于完整历史。日快照和归档分别限制条数后再合并截断，会丢失最早有效日；较新的归档还会挤掉参与收益计算的快照。
+
+**以后做法：** 从指标反查数据库读取口径，全历史指标保留全部有效日快照，归档展示窗口独立限制。继续省略快照资产明细等大字段，保持账户隔离及旧数据兼容；不能仅扩大常数后声称覆盖全部历史。
+
+**如何验证：** [历史读取测试](modules/asset/tests/snapshot-history.test.ts) 用真实 SQLite 的 800 个日快照和 760 个归档核对最早有效日仍在、归档不挤占有效数据，并检查账户隔离、出金回填和资产明细未返回；[收益测试](modules/asset/tests/performance-metrics.test.ts) 核对首末快照和实际年化跨度。
+
+**证据：** project-aggregation 基线 `05ea772` 的 [store](modules/asset/lib/store.ts) 对日快照与归档分别 `LIMIT 730`，合并后再次 `slice(0,730)`；2026-10-15 月度表现开发中核实该路径不能支持规格的“全部历史总体年化”。读取迁至 [snapshot-history](modules/asset/lib/snapshot-history.ts)，取消有效日及合并截断，归档仍独立限制 730 条。
+
+**事件记录：** `asset-full-history-performance-window-20261015`；一次开发前核实的数据口径问题，不推进主线复盘检查点。

@@ -10,9 +10,10 @@ import { isVariationalProject, isGateProject } from './source-ledger';
 import { editValue, type Credentials, type WithdrawalInput, type AsterAccountInput } from './validation';
 import { asterKey, readAsterAccounts, aggregateAster } from './aster-accounts';
 import { embeddedWithdrawals } from './withdrawals';
+import { readSnapshotHistory } from './snapshot-history';
 import { yuanQuote } from './fx';
 import { mapConcurrent, settleIndependent } from './concurrency';
-import type { Asset, Ledger, Connection, Period, Withdrawal, FxStatus, AsterAccount } from './types';
+import type { Asset, Ledger, Connection, Withdrawal, FxStatus, AsterAccount } from './types';
 
 export const chinaDate=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});
 export async function initialize(owner:string){
@@ -26,23 +27,13 @@ export async function initialize(owner:string){
     db().prepare('INSERT OR IGNORE INTO settings(owner,key,value) VALUES(?,?,?)').bind(owner,'initialized','1'),
   ]);
 }
-async function readSnapshotHistory(owner:string):Promise<Period[]>{
-  // Daily keys are ISO dates. Imported archives have archive-* keys, so they
-  // cannot share the indexed date window without displacing recent snapshots.
-  const fields="json_remove(s.data, '$.assets') AS data, COALESCE(json_extract(s.data, '$.withdrawn'), (SELECT TOTAL(json_extract(a.value, '$.value')) FROM json_each(s.data, '$.assets') a WHERE trim(json_extract(a.value, '$.project')) = '出金')) AS withdrawn";
-  const rows=await Promise.all([
-    db().prepare(`SELECT ${fields} FROM snapshots s WHERE owner = ? AND date < 'a' ORDER BY date DESC LIMIT 730`).bind(owner).all<{data:string;withdrawn:number}>(),
-    db().prepare(`SELECT ${fields} FROM snapshots s WHERE owner = ? AND date >= 'a' ORDER BY json_extract(s.data, '$.date') DESC LIMIT 730`).bind(owner).all<{data:string;withdrawn:number}>(),
-  ]);
-  return rows.flatMap(result=>result.results.map(row=>({...JSON.parse(row.data),withdrawn:row.withdrawn} as Period))).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,730);
-}
 async function readLedger(owner:string,includeHistory:boolean):Promise<Ledger>{
   await initialize(owner);
   const [rows, settings, connectionRows, snapshotRows]=await Promise.all([
     db().prepare('SELECT data FROM assets WHERE owner = ?').bind(owner).all<{data:string}>(),
     db().prepare('SELECT key,value FROM settings WHERE owner = ?').bind(owner).all<{key:string,value:string}>(),
     db().prepare('SELECT exchange FROM connections WHERE owner = ?').bind(owner).all<{exchange:string}>(),
-    includeHistory ? readSnapshotHistory(owner) : Promise.resolve([]),
+    includeHistory ? readSnapshotHistory(db(),owner) : Promise.resolve([]),
   ]);
   const source=settings.results.find(s=>s.key==='source-ledger');
   const ledger=seedLedger(source?JSON.parse(source.value):readSource(),includeHistory);
