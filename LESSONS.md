@@ -688,3 +688,17 @@
 **证据：** project-aggregation 基线 `05ea772` 的 [store](modules/asset/lib/store.ts) 对日快照与归档分别 `LIMIT 730`，合并后再次 `slice(0,730)`；2026-10-15 月度表现开发中核实该路径不能支持规格的“全部历史总体年化”。读取迁至 [snapshot-history](modules/asset/lib/snapshot-history.ts)，取消有效日及合并截断，归档仍独立限制 730 条。
 
 **事件记录：** `asset-full-history-performance-window-20261015`；一次开发前核实的数据口径问题，不推进主线复盘检查点。
+
+### L046：独立采样的行情对象不保证已包含额度快照
+
+**适用条件：** 额度、盘口与深度分别更新同一行情对象，且相关 React 面板在其他标签页下仍保持挂载。
+
+**根因：** 首次额度采样失败只写入状态和错误；盘口或深度先完成也会建立没有 `capacities` 的行情对象。前端类型将额度字段声明为必填，渲染使用 `market?.capacities[tier]` 只保护了外层对象，读取第一档 `5` 时抛错。隐藏的普通开仓面板随状态更新仍会渲染，导致用户正在操作的监控页和整个 ASTER 工作区一起崩溃。
+
+**以后做法：** 类型按独立数据源的实际到达契约声明可选字段；读取额度时同时检查行情对象、额度映射与单档值。未采样或失败显示未知，不填零、不高亮达标，恢复后沿用原采样时间边界。排查跨标签页崩溃时检查仍挂载的组件，并读取实际浏览器异常栈。
+
+**如何验证：** [监控中心浏览器回归](tests/aster-monitor-center.browser.mjs) 从真实工作台入口加载有账户的页面，覆盖首采失败、仅盘口、仅深度、额度恢复与失败后保留旧值，确认监控切换和通知编辑仍可用、未知额度不达标；[普通开仓条件测试](modules/aster/dashboard/tests/ordinary-conditions.test.mjs) 保持缺失、失败和过期数据的判断。纯空账户夹具不能覆盖隐藏的账户面板。
+
+**证据：** project-aggregation `9f956497` 的 [MarketPanel](modules/aster/dashboard/components/market-panel.tsx) 两处直接索引可缺失的 `capacities`；[行情采样](modules/aster/trading/engine.py) 的 `poll_market`、`poll_book`、`poll_depth` 会合法生成上述部分对象。2026-10-15 用户反馈勾选监控后整页报错，实际工作台浏览器捕获 `Cannot read properties of undefined (reading '5')`，堆栈定位到同版本 `page-ItLLfWRP.js:2:1633` 的额度单元格渲染。
+
+**事件记录：** `aster-partial-market-hidden-panel-crash-20261015`；一次用户反馈和实际浏览器定位，不推进主线复盘检查点。

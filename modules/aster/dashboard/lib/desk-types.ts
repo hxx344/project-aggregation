@@ -106,10 +106,12 @@ export type Account = {
   >;
 };
 export type Market = {
-  status: string;
+  // Capacity, book and depth samples arrive independently. A first failure
+  // or a book/depth-only update does not contain a capacity snapshot yet.
+  status?: string;
   error?: string;
-  checked_at: number;
-  capacities: Record<string, string>;
+  checked_at?: number;
+  capacities?: Record<string, string>;
   capacity_checked_at?: Record<string, number>;
   poll_interval_ms?: number;
   fast_leverages?: number[];

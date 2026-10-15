@@ -4,7 +4,7 @@
 async (page) => {
   const origin = 'http://hub.localhost:39152';
   const assert = (value, message) => { if (!value) throw new Error(message); };
-  const errors = [], unexpectedWrites = [], external = [], writes = [], observations = [];
+  const errors = [], consoleErrors = [], unexpectedWrites = [], external = [], writes = [], observations = [];
   const defaults = ['new_listing', 'strategy_capacity', 'trade_summary', 'position_imbalance'];
   const settings = { schema_version: 2, monitoring_enabled: true, auto_discover: true, discovery_enabled: true,
     auto_monitor_new: true, feishu_enabled: true, default_notification_types: [...defaults],
@@ -19,6 +19,7 @@ async (page) => {
     detail_enabled: symbol !== 'ETHUSD1', status: symbol === 'SOLUSD1' ? 'CLOSE' : 'TRADING' }));
   let moduleOrigin, rejectNext = false, failReads = false, demo = false, withAccount = false, frozenAt;
   let revision = 0;
+  let marketState = () => ({});
   const state = () => {
     const now = Date.now() / 1000;
     return { workspaceManaged: true, ready: true, demo,
@@ -26,7 +27,7 @@ async (page) => {
         enabled: false, status: 'paused', reason: '', credential_ready: false, strategies: {},
         policy: { threshold: '50000', order_notional: '1000', margin_limit: '0.5', spread_limit: '0.1',
           min_open_leverage: 5, ordinary_symbol: 'all', symbols: ['XAUUSD1'] } }] : [],
-      pairs: [], markets: {}, events: [], updated_at: now,
+      pairs: [], markets: marketState(now), events: [], updated_at: now,
       monitoring: { settings, revision, symbols, strategy_capacity_environment_enabled: true },
       listings: { enabled: !demo, initialized: true, monitoring_enabled: settings.monitoring_enabled,
         discovery_enabled: settings.auto_discover, checked_at: now - 2, poll_seconds: 60, stale_seconds: 180,
@@ -42,7 +43,10 @@ async (page) => {
           next_due_at: now + 600, last_sent_at: now - 3000, pending: true } } };
   };
   await page.unrouteAll({ behavior: 'wait' });
-  page.on('pageerror', error => errors.push(error.message));
+  page.on('pageerror', error => errors.push(error.stack || error.message));
+  page.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
   await page.route('**/*', async route => {
     const req = route.request(), url = new URL(req.url());
     if (url.port !== '39152' || !(url.hostname === 'hub.localhost' || /^p-[a-f0-9]+\.hub\.localhost$/.test(url.hostname))) {
@@ -226,11 +230,64 @@ async (page) => {
     assert(await pickerButton.isDisabled(), 'demo writes are disabled');
     demo = false;
     withAccount = true;
+    // The account branch keeps the ordinary workspace mounted while monitoring
+    // is visible. Public feeds may create a market row before capacities exist.
+    marketState = () => ({ XAUUSD1: { status: 'error', error: '浏览器夹具：首次公开额度读取失败' } });
     await refresh();
     await app.getByRole('tab', { name: '币种监控中心', exact: true }).click();
     await app.getByRole('heading', { name: '币种监控中心', exact: true }).waitFor();
     assert(await app.getByRole('tab', { name: 'USD1 上新', exact: true }).count() === 0, 'account-present tab branch also unified');
     observations.push('real-clock expiry, reconnect, demo write guard, account-present entry');
+
+    const marketRow = app.locator('.market-table tbody tr').filter({ hasText: 'XAUUSD1' });
+    const verifyMarket = async (label, expected, highlighted) => {
+      await app.getByRole('heading', { name: '币种监控中心', exact: true }).waitFor();
+      await pickerButton.click();
+      await picker.waitFor();
+      await picker.getByRole('button', { name: '取消', exact: true }).click();
+      await app.getByRole('tab', { name: '普通开仓', exact: true }).click();
+      const marketDisclosure = app.locator('details').filter({ has: app.getByText('全部市场额度与深度', { exact: true }) });
+      if (await marketDisclosure.getAttribute('open') === null) {
+        await app.getByText('全部市场额度与深度', { exact: true }).click();
+      }
+      await marketRow.waitFor();
+      for (const [index, leverage] of [5, 10, 20].entries()) {
+        const cell = marketRow.locator('td').nth(index + 1);
+        assert((await cell.innerText()).trim().endsWith(expected[index]), `${label}: ${leverage}x capacity display`);
+        assert((await cell.getAttribute('class')).split(/\s+/).includes('mint') === highlighted[index], `${label}: ${leverage}x threshold highlight`);
+      }
+      await app.getByRole('tab', { name: '币种监控中心', exact: true }).click();
+      await app.getByRole('heading', { name: '币种监控中心', exact: true }).waitFor();
+    };
+    await verifyMarket('first capacity failure without a capacity map', ['—', '—', '—'], [false, false, false]);
+    const partialMarkets = [
+      ['book-only market row', now => ({ book: { bid: '100', ask: '100.01', mark: '100', spread: '0.0001', timestamp: now - 1 } })],
+      ['book-error-only market row', () => ({ book_error: '浏览器夹具：首次盘口读取失败' })],
+      ['depth-only market row', now => ({ depth: { timestamp: now - 1, levels_limit: 1000,
+        spreads: { '10000': { status: 'ok', buy_average: '100.01', sell_average: '100', spread: '0.0001' },
+          '50000': { status: 'insufficient', buy_average: null, sell_average: null, spread: null } } } })],
+      ['depth-error-only market row', () => ({ depth_error: '浏览器夹具：首次深度读取失败' })],
+    ];
+    for (const [label, market] of partialMarkets) {
+      marketState = now => ({ XAUUSD1: market(now) });
+      await refresh();
+      await verifyMarket(label, ['—', '—', '—'], [false, false, false]);
+    }
+    const recoveredMarket = now => ({ status: 'ok', checked_at: now - 1,
+      capacities: { '5': '75000', '10': '50000', '20': '25000' },
+      capacity_checked_at: { '5': now - 1, '10': now - 1, '20': now - 1 } });
+    marketState = now => ({ XAUUSD1: recoveredMarket(now) });
+    await refresh();
+    await verifyMarket('capacity recovery', ['75,000', '50,000', '25,000'], [true, false, false]);
+    marketState = now => ({ XAUUSD1: { status: 'ok', checked_at: now - 1,
+      capacities: { '5': '0', '10': '75000' } } });
+    await refresh();
+    await verifyMarket('zero capacity and a missing tier', ['0', '75,000', '—'], [false, true, false]);
+    marketState = now => ({ XAUUSD1: { ...recoveredMarket(now), status: 'error', error: '浏览器夹具：后续额度读取失败' } });
+    await refresh();
+    await verifyMarket('retained capacity after a failed read', ['—', '—', '—'], [false, false, false]);
+    observations.push('account-present first-capacity failure, independent book/depth success and failure, recovery threshold display and failed-read history never highlighted');
+
     await pickerButton.click();
     await page.waitForTimeout(200);
     await page.screenshot({ path: 'output/playwright/aster-monitor-center-desktop.png', fullPage: true });
@@ -260,6 +317,6 @@ async (page) => {
       tradingWrites: 0, browserErrors: 0, observations };
   } catch (error) {
     await page.screenshot({ path: 'output/playwright/aster-monitor-center-failure.png', fullPage: true });
-    throw error;
+    throw new Error(`${error.stack || error.message || String(error)}\nBrowser page errors:\n${errors.join('\n') || '(none)'}\nBrowser console errors:\n${consoleErrors.join('\n') || '(none)'}`, { cause: error });
   }
 }

@@ -69,6 +69,7 @@ export function MarketPanel({
               const live =
                 !connectionError &&
                 m?.status === 'ok' &&
+                typeof m.checked_at === 'number' &&
                 now - m.checked_at >= -1 &&
                 now - m.checked_at <= 8;
               const lev = snapshot?.positions.find(
@@ -105,10 +106,10 @@ export function MarketPanel({
                     return (
                       <TableCell
                         key={v}
-                        className={`number ${ordinaryCapacityReady(m?.capacities[v], account?.policy.threshold || '10000', tierLive, ordinaryBlock) ? 'mint' : ''}`}
+                        className={`number ${ordinaryCapacityReady(m?.capacities?.[v], account?.policy.threshold || '10000', tierLive, ordinaryBlock) ? 'mint' : ''}`}
                       >
                         <span className="mobile-cell-label">{v}x 额度</span>
-                        {tierLive ? fmt(m?.capacities[v], 0) : '—'}
+                        {tierLive ? fmt(m?.capacities?.[v], 0) : '—'}
                       </TableCell>
                     );
                   })}

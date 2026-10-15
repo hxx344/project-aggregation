@@ -4,7 +4,7 @@
 async (page) => {
   const origin = 'http://hub.localhost:39152';
   const assert = (value, message) => { if (!value) throw new Error(message); };
-  const errors = [], external = [], unexpectedWrites = [], observations = [];
+  const errors = [], consoleErrors = [], external = [], unexpectedWrites = [], observations = [];
   const settings = { schema_version: 2, monitoring_enabled: true, auto_discover: true,
     discovery_enabled: true, auto_monitor_new: true, feishu_enabled: false,
     default_notification_types: [], hourly_summary_alerts: false, relay_health_alerts: false,
@@ -45,7 +45,10 @@ async (page) => {
     };
   };
   await page.unrouteAll({ behavior: 'wait' });
-  page.on('pageerror', error => errors.push(error.message));
+  page.on('pageerror', error => errors.push(error.stack || error.message));
+  page.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url());
     if (url.port !== '39152' || !(url.hostname === 'hub.localhost' || /^p-[a-f0-9]+\.hub\.localhost$/.test(url.hostname))) {
@@ -164,6 +167,87 @@ async (page) => {
     await refresh();
     assert(await table.locator('tr[data-symbol]').count() === 0, 'empty selection has no capacity rows');
     assert(/暂无|尚未|没有/.test(await region.innerText()), 'empty selection has explanatory text');
+
+    const originalTierOverrides = tierOverrides;
+    const selectedSymbols = ['XAUUSD1', 'BTCUSD1', 'ETHUSD1'];
+    const unsampled = { tier_capacities: null, tier_checked_at: null,
+      tier_brackets_checked_at: null, tier_error: null };
+    tierOverrides = Object.fromEntries(selectedSymbols.map(symbol => [symbol, unsampled]));
+    const toggleSymbol = async (symbol, checked) => {
+      const response = page.waitForResponse(response => response.url() === `${moduleOrigin}/api/monitoring/symbols/${symbol}`
+        && response.request().method() === 'PATCH');
+      await app.getByRole('switch', { name: `${symbol} 监控`, exact: true }).click();
+      const saved = await response;
+      assert(saved.ok(), `${symbol} monitor switch saves successfully`);
+      await saved.finished();
+      await row(symbol).waitFor({ state: checked ? 'visible' : 'hidden' });
+      assert(symbols.find(control => control.symbol === symbol).monitor_enabled === checked, `${symbol} saved monitor selection`);
+      assert(await app.getByRole('switch', { name: `${symbol} 监控`, exact: true }).getAttribute('aria-checked') === String(checked), `${symbol} switch reflects saved selection`);
+    };
+    for (const symbol of selectedSymbols) {
+      await toggleSymbol(symbol, true);
+      await row(symbol).getByText('等待首次采样', { exact: true }).waitFor();
+      assert(await row(symbol).getByText('暂不可用', { exact: true }).count() === 3, `${symbol} waits for all three first samples`);
+      assert(await table.getByRole('columnheader', { name: '50x', exact: true }).count() === 1, 'capacity table remains usable after each new selection');
+    }
+    const freshTime = Date.now() / 1000 - 1;
+    tierOverrides = {
+      XAUUSD1: { tier_capacities: { '10': '1.234567e4', '20': '0', '50': null } },
+      BTCUSD1: { tier_capacities: { '10': '9007199254740993', '20': '1.00000000000000000002', '50': '1e-100' } },
+      ETHUSD1: { tier_capacities: { '10': '9007199254740992', '20': '1.00000000000000000001', '50': '2.5e3' } },
+    };
+    for (const override of Object.values(tierOverrides)) {
+      Object.assign(override, { tier_checked_at: freshTime, tier_brackets_checked_at: freshTime, tier_error: null });
+    }
+    await refresh();
+    for (const symbol of selectedSymbols) {
+      await row(symbol).getByText('有效采样', { exact: true }).waitFor();
+    }
+    assert((await row('XAUUSD1').innerText()).includes('12,345.67')
+      && (await row('XAUUSD1').innerText()).includes('0.00')
+      && (await row('XAUUSD1').innerText()).includes('暂不可用'), 'newly enabled sample handles scientific amounts, zero and missing tiers');
+    assert(await row('BTCUSD1').locator('[data-tier="20"]').innerText() === '1.00', 'high-precision amount uses the established two-decimal display');
+    assert(await row('BTCUSD1').locator('[data-tier="50"]').innerText() === '0.00', 'small scientific amount renders without throwing');
+    assert(await row('ETHUSD1').locator('[data-tier="50"]').innerText() === '2,500.00', 'scientific amount renders at its numeric magnitude');
+    await sortBy('20x', 'descending', ['BTCUSD1', 'ETHUSD1', 'XAUUSD1']);
+
+    await page.reload();
+    await page.locator('iframe[title="Aster 5x模块"]').waitFor();
+    await app.getByRole('tab', { name: '币种监控中心', exact: true }).click();
+    await region.waitFor();
+    assert(await table.locator('tr[data-symbol]').count() === selectedSymbols.length, 'reloading the workbench retains all saved monitoring selections');
+    for (const symbol of selectedSymbols) {
+      await row(symbol).getByText('有效采样', { exact: true }).waitFor();
+      assert(await app.getByRole('switch', { name: `${symbol} 监控`, exact: true }).getAttribute('aria-checked') === 'true', `${symbol} remains selected after reload`);
+    }
+    observations.push('empty-to-multiple real switch saves, first-sample waiting, scientific/high-precision/zero/missing amounts and saved selection after workbench reload');
+
+    const originalSymbolCount = symbols.length;
+    const extraSymbols = Array.from({ length: 250 }, (_, index) => ({
+      ...symbols.find(symbol => symbol.symbol === 'ETHUSD1'),
+      symbol: `TEST${String(index).padStart(3, '0')}USD1`,
+      notification_types: ['new_listing', 'listing_capacity'],
+      listing_capacity_leverage: null, listing_capacity_threshold: '0',
+      monitor_enabled: index < 247, monitor: index < 247,
+      effective_monitor: index < 247, detail_enabled: index < 247,
+    }));
+    symbols.push(...extraSymbols);
+    for (const control of extraSymbols.slice(-3)) tierOverrides[control.symbol] = unsampled;
+    await refresh();
+    await row(extraSymbols[246].symbol).waitFor();
+    assert(await table.locator('tr[data-symbol]').count() === selectedSymbols.length + 247, 'large monitoring selection renders before adding more symbols');
+    assert(await app.locator('.monitor-center-table .notification-capacity-summary').count() === extraSymbols.length, 'all catalog symbols retain their zero-threshold capacity notification summaries');
+    for (const control of extraSymbols.slice(-3)) {
+      await toggleSymbol(control.symbol, true);
+      await row(control.symbol).getByText('等待首次采样', { exact: true }).waitFor();
+    }
+    assert(await table.locator('tr[data-symbol]').count() === selectedSymbols.length + extraSymbols.length, 'adding more symbols to a large selection keeps the full capacity table available');
+    for (const control of extraSymbols.slice(-2)) await toggleSymbol(control.symbol, false);
+    assert(await table.locator('tr[data-symbol]').count() === selectedSymbols.length + extraSymbols.length - 2, 'large selection also permits removing monitored symbols');
+    assert(errors.length === 0, `large monitoring selection browser errors: ${errors.join('\n')}`);
+    observations.push('250 additional catalog symbols with capacity notifications and zero thresholds, 247 preselected plus three real switch enables and two disables');
+    symbols.splice(originalSymbolCount);
+    tierOverrides = originalTierOverrides;
     symbols.forEach((symbol, index) => { symbol.monitor_enabled = enabled[index]; });
     await refresh();
     await region.scrollIntoViewIfNeeded();
@@ -187,6 +271,6 @@ async (page) => {
     return { passed: true, entry: page.url(), moduleOrigin, tradingWrites: 0, browserErrors: 0, observations };
   } catch (error) {
     await page.screenshot({ path: 'output/playwright/aster-monitor-capacity-failure.png', fullPage: true });
-    throw error;
+    throw new Error(`${error.stack || error.message || String(error)}\nBrowser page errors:\n${errors.join('\n') || '(none)'}\nBrowser console errors:\n${consoleErrors.join('\n') || '(none)'}`, { cause: error });
   }
 }
