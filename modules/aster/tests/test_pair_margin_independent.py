@@ -124,9 +124,17 @@ class PairMarginIndependentTests(TestCase):
 
     def test_funds_checks_publish_both_inventories_to_state_without_refreshing_strategy_evidence(self):
         self.equal_balances()
+        unrealized = {"long": "1.25", "short": "-2.5"}
+        for side, paper in self.paper.items():
+            mark = paper.market.book(live.SYMBOL).mark
+            paper.state["positions"][live.SYMBOL + ":" + side.upper()].update(
+                qty="1", entry=wire(mark - dec(unrealized[side]) * (1 if side == "long" else -1)))
+            paper.save()
         old = {**runtime_default(), "snapshots": {
             side: {"timestamp": 1, "positions": [{"symbol": "OURAUSD1", "side": "LONG", "qty": "1000"}]}
             for side in self.brokers}}
+        old["owned"] = {"LONG": "0.25", "SHORT": "0.25"}
+        old["progress"].update(baseline=dict(old["owned"]), completed_cycles=3)
         self.store.put("pair_runtime:gold", old)
         rows = {"long": seven_position_response(),
                 "short": [{**display_position("BTCUSDT", "BOTH", "-0.2"), "isolated": True}]}
@@ -136,18 +144,27 @@ class PairMarginIndependentTests(TestCase):
             self.start()
             before = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
             state = self.tick()
-            self.assertEqual(state["snapshots"], old["snapshots"])
+            for field in ("snapshots", "owned", "progress"):
+                self.assertEqual(state[field], old[field])
             displays = state["display_positions"]
+            balances = state["margin_balances"]
             self.assertEqual(len(displays["long"]["snapshot"]["positions"]), 7)
             self.assertEqual(next(row["qty"] for row in displays["long"]["snapshot"]["positions"]
                                   if row["symbol"] == "OURAUSD1"), "1191.36")
             self.assertEqual(displays["short"]["snapshot"]["positions"][0]["side"], "SHORT")
             for side, broker in self.brokers.items():
+                self.assertEqual(balances[side]["unrealized"], unrealized[side])
+                self.assertEqual(balances[side]["timestamp"], displays[side]["snapshot"]["timestamp"])
+                self.assertGreater(balances[side]["timestamp"], old["snapshots"][side]["timestamp"])
                 calls = broker.api.calls[before[side]:]
                 self.assertEqual([(method, path) for method, path, _ in calls], [("GET", live.ACCOUNT)])
             before_state = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
             with patch.object(self.engine, "_load_dashboard_report", return_value={}):
-                view = self.engine.state()
+                view = self.engine.state(compact=True)
+            published = next(pair for pair in view["pairs"] if pair["id"] == self.pair["id"])["state"]
+            self.assertEqual(published["margin_balances"], balances)
+            for field in ("snapshots", "owned", "progress"):
+                self.assertEqual(published[field], old[field])
             accounts = {account["id"]: account for account in view["accounts"]}
             for side in self.brokers:
                 self.assertEqual(accounts[side]["display_positions"], displays[side])

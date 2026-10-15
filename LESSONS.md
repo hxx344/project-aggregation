@@ -633,6 +633,8 @@
 
 **顶部账户摘要补充：** 基线 `6026760` 在非配对页仍从历史交易快照绘制权益、可用余额、占用率及“更新延迟”，即使当前仅运行保证金平衡。顶部摘要按实际账户成员选择该侧 `margin_balances`，缺资金字段不回填旧交易值，占用率明确未采集，启停状态按配对组显示；原交易快照和操作权限保持不变。定时、冷却和暂停只能说明最近记录，不能修改源时间或掩盖真实错误。保证金只读状态单独投影持久失败原因，避免 HTTP 500 被 `waiting/blocks_trading=false` 误认为正常等待。[顶部摘要测试](modules/aster/dashboard/tests/account-summary.test.mjs) 覆盖新余额与三小时前旧快照、账户切换、失败恢复及真实过期；[状态投影测试](modules/aster/tests/test_pair_margin_status.py) 确认错误可见且不改变划转状态与权限。此为同一事件的页面入口补漏，不新增事件计数。
 
+**飞书摘要补充：** 基线 `947346e` 的 [飞书摘要](modules/aster/trading/hourly_summary.py) 仍只读取交易快照，导致仅保证金监控时通知持续显示数小时前的余额和浮盈亏。通知按严格资金模式选择两侧 `margin_balances`，合计与分账户卡片共用来源；复用已读取的 `unrealized` 字段，不额外请求交易所。持仓仅从独立 `display_positions` 展示，并保留自己的采样时间及失败信息；未采集的占用率不借旧值补齐。缺余额、缺浮盈亏、过期、定时等待、暂停与真实异常分别表达，不能借通知生成时间刷新源时间。[飞书汇总测试](modules/aster/tests/test_hourly_summary.py) 与 [通知链路测试](modules/aster/tests/test_hourly_notification_engine.py) 已在旧实现复现陈旧值，并覆盖 compact 状态到持久 outbox、模拟发送的完整路径和零额外交易所请求。此为同一事件的通知入口补漏，不新增事件计数。
+
 **事件记录：** `aster-transfer-strategy-coupling-20261015`；一次用户纠正及完整调用链修复，不推进主线复盘检查点。
 
 ### L042：旧配置的同值写入不能覆盖新模型的细分选择

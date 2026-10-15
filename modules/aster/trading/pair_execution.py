@@ -209,7 +209,7 @@ class PairTrader:
         # Transfer reads intentionally have no positions. Keep them separate
         # from position evidence so neither the planner nor UI can infer flatness.
         state["margin_balances"] = {side: {"timestamp": snapshot.timestamp,
-            **{field: wire(getattr(snapshot, field)) for field in ("equity", "available", "wallet")}}
+            **{field: wire(getattr(snapshot, field)) for field in ("equity", "available", "wallet", "unrealized")}}
             for side, snapshot in snapshots.items()}
         for side, snapshot in snapshots.items():
             display = getattr(snapshot, "display_positions", None)

@@ -18,6 +18,7 @@ PHASES = {
     "unknown": "结果未知", "accepted": "待核对", "acknowledged": "待刷新",
     "blocked": "已阻止", "cooldown": "冷却中", "confirmed": "已核实",
     "paper_confirmed": "模拟已核实", "rejected": "已拒绝", "submitting": "提交中",
+    "monitoring": "保证金监控", "margin_wait": "等待保证金检查",
 }
 ATTENTION = {"attention", "error", "reconciling", "unknown", "blocked", "rejected"}
 
@@ -112,16 +113,111 @@ def _snapshot_note(snapshot, now):
     return f"账户数据 {now - float(stamp):.0f} 秒前 · 待刷新" if not _fresh(stamp, now, 8) else None
 
 
-def _account_card(account, snapshot, label, progress, now, side=None):
+def _pair_sources(pair, accounts):
+    """Project display sources only; funds reads are never trading evidence."""
+    state = _map(pair.get("state"))
+    quantities = _map(_map(state.get("progress")).get("quantities"))
+    funds_only = (_map(pair.get("margin")).get("enabled") is True
+                  and _map(pair.get("ordinary")).get("enabled") is False
+                  and _map(pair.get("cycle")).get("enabled") is False
+                  and state.get("pending") is None
+                  and set(quantities) == {"LONG", "SHORT"}
+                  and all(_number(value) == 0 for value in quantities.values()))
+    snapshots, displays = {}, {}
+    for side in ("long", "short"):
+        account = accounts.get(pair.get(side + "_account_id"), {})
+        if funds_only:
+            # Missing funds fields must not borrow values from old trade data.
+            snapshots[side] = _map(_map(state.get("margin_balances")).get(side))
+            displays[side] = _map(_map(state.get("display_positions")).get(side)
+                                  or account.get("display_positions"))
+        else:
+            snapshots[side] = _latest_snapshot(account, _map(state.get("snapshots")).get(side))
+    return funds_only, snapshots, displays
+
+
+def _funds_errors(pair):
+    state = _map(pair.get("state"))
+    margin = _map(state.get("margin"))
+    errors = [margin.get("error"), _map(margin.get("api_notice")).get("text"),
+              _map(state.get("api_notice")).get("text")]
+    if margin.get("status") in ATTENTION:
+        errors.append(margin.get("reason") or "保证金检查尚未完成")
+    if state.get("phase") in ATTENTION:
+        errors.append(state.get("reason") or "配对组需要核对")
+    return list(dict.fromkeys(_text(error, "") for error in errors if _text(error, "")))
+
+
+def _funds_wait(pair, snapshots, now):
+    state = _map(pair.get("state"))
+    margin = _map(state.get("margin"))
+    if (not pair.get("enabled") or state.get("phase") != "monitoring"
+            or margin.get("enabled") is not True or margin.get("blocks_trading") is not False
+            or margin.get("status") not in {"waiting", "cooldown", "confirmed"}
+            or not _fresh(state.get("updated_at"), now, 8)
+            or state.get("pending") or margin.get("pending") or _funds_errors(pair)):
+        return None
+    checked = _number(margin.get("checked_at"))
+    next_check = _number(margin.get("next_check_at"))
+    cooldown = _number(margin.get("cooldown_until", 0))
+    stamps = [_number(snapshot.get("timestamp")) for snapshot in snapshots.values()]
+    if (checked is None or checked <= 0 or checked > now
+            or next_check is None or next_check <= checked
+            or cooldown is None or cooldown < 0
+            or any(stamp is None or stamp <= 0 or stamp > now for stamp in stamps)):
+        return None
+    deadline = max(next_check, cooldown)
+    if Decimal(str(now)) - deadline >= 8:
+        return None
+    return "冷却中" if cooldown > now else "正在检查余额" if now >= deadline else "定时检查"
+
+
+def _funds_note(pair, snapshot, snapshots, now):
+    stamp = _number(snapshot.get("timestamp"))
+    if stamp is None:
+        return "资金余额待同步"
+    if stamp <= 0 or stamp > now:
+        return "资金余额时间异常"
+    note = f"资金余额 {now - float(stamp):.0f} 秒前"
+    margin = _map(_map(pair.get("state")).get("margin"))
+    if _funds_errors(pair) or any(_number(snapshot.get(field)) is None for field in ("equity", "available")):
+        return note + " · 检查异常"
+    if not pair.get("enabled") and not margin.get("pending"):
+        return note + " · 已暂停"
+    wait = _funds_wait(pair, snapshots, now)
+    if wait in {"冷却中", "正在检查余额"}:
+        return note + " · " + wait
+    if _fresh(stamp, now, 8):
+        return note
+    return note + " · " + (wait or "待刷新")
+
+
+def _display_position_note(display, label, now):
+    stamp = _number(_map(display.get("snapshot")).get("timestamp"))
+    note = f"{label}持仓 "
+    if stamp is None:
+        note += "待同步"
+    elif stamp <= 0 or stamp > now:
+        note += "时间异常"
+    else:
+        note += f"{now - float(stamp):.0f} 秒前"
+        if not _fresh(stamp, now, 8):
+            note += " · 待刷新"
+    if display.get("error"):
+        note += " · " + _text(display["error"])
+    return note
+
+
+def _account_card(account, snapshot, label, progress, now, side=None, funds_note=None):
     mode = {"live": "实盘", "paper": "模拟"}.get(account.get("mode"), "模式待同步")
     color = "blue" if side == "long" else "red" if side == "short" else "default"
     # Feishu expects a named color, not an inline CSS rgba() expression.
     background = "red-50" if side == "short" else "blue-50"
     elements = [_label(f"{label} · {_text(account.get('name'))}（{mode}）", "heading", color),
                 _columns(_metric("可用保证金", _amount(snapshot.get("available"))),
-                         _metric("保证金占用率", _usage(snapshot)), background=background),
+                         _metric("保证金占用率", "未采集" if funds_note is not None else _usage(snapshot)), background=background),
                 _label(f"距交易量目标  {progress}")]
-    note = _snapshot_note(snapshot, now)
+    note = funds_note if funds_note is not None else _snapshot_note(snapshot, now)
     if note:
         elements.append(_label(note, "notation", "orange"))
     return _columns(elements, background=background, padding="12px")
@@ -162,13 +258,15 @@ def _capacity(pair, snapshots, markets, now):
     return f"公开额度 {key}x  {_amount(value)}"
 
 
-def _pair_block(pair, accounts, markets, now, utc_date):
+def _pair_block(pair, accounts, markets, now, utc_date, sources):
     state, config = _map(pair.get("state")), _map(pair.get("cycle"))
+    funds_only, snapshots, displays = sources
+    errors = _funds_errors(pair) if funds_only else []
     margin = _map(state.get("margin"))
     transfer = _map(margin.get("pending"))
     urgent = (state.get("phase") in ATTENTION or bool(pair.get("pause_reason"))
               or bool(state.get("pending")) or bool(state.get("volume_unknown")) or bool(transfer)
-              or margin.get("status") in ATTENTION)
+              or margin.get("status") in ATTENTION or bool(errors))
     phase = "已暂停" if not pair.get("enabled") else _phase(state.get("phase"))
     reason = _text(pair.get("pause_reason") or state.get("reason"), "")
     if (pair.get("enabled") and state.get("phase") in {"waiting", "waiting_open"}
@@ -177,20 +275,30 @@ def _pair_block(pair, accounts, markets, now, utc_date):
     elements = [_label(f"{_text(pair.get('name'))} · {_text(pair.get('symbol'))}  |  {phase}", "heading")]
     if urgent and reason:
         elements.append(_label(reason, color="orange"))
+    for error in errors:
+        if error != reason:
+            elements.append(_label(error, color="orange"))
     if state.get("pending"):
         elements.append(_label("订单 / 执行批次待核对", color="orange"))
     daily = _map(_map(state.get("daily_volume")).get(utc_date))
     known = not state.get("volume_unknown") and not state.get("pending") and _fresh(state.get("updated_at"), now, 120)
-    snapshots = {}
     for side, label in (("long", "A 多"), ("short", "B 空")):
         account = accounts.get(pair.get(side + "_account_id"), {})
-        snapshot = _latest_snapshot(account, _map(state.get("snapshots")).get(side))
-        snapshots[side] = snapshot
+        snapshot = snapshots[side]
         progress = _progress(daily.get(side), config.get("daily_volume_limit"), known) if config.get("enabled") else "循环未启用"
-        elements.append(_account_card(account, snapshot, label, progress, now, side))
-    positions = f"持仓  多 {_position_text(snapshots['long'], pair.get('symbol'), 'LONG')} / 空 {_position_text(snapshots['short'], pair.get('symbol'), 'SHORT')}"
+        note = _funds_note(pair, snapshot, snapshots, now) if funds_only else None
+        elements.append(_account_card(account, snapshot, label, progress, now, side, note))
+    positions_source = {side: _map(display.get("snapshot")) for side, display in displays.items()} if funds_only else snapshots
+    positions = f"持仓  多 {_position_text(positions_source['long'], pair.get('symbol'), 'LONG')} / 空 {_position_text(positions_source['short'], pair.get('symbol'), 'SHORT')}"
     elements.append(_label(positions, "notation"))
-    elements.append(_label(f"{_capacity(pair, snapshots, markets, now)} · 划转{_phase(margin.get('status'))}", "notation"))
+    capacity_source = positions_source
+    if funds_only:
+        for side, label in (("long", "A 多"), ("short", "B 空")):
+            elements.append(_label(_display_position_note(displays[side], label, now), "notation"))
+        if any(display.get("error") or not _fresh(positions_source[side].get("timestamp"), now, 8)
+               for side, display in displays.items()):
+            capacity_source = {}
+    elements.append(_label(f"{_capacity(pair, capacity_source, markets, now)} · 划转{_phase(margin.get('status'))}", "notation"))
     if transfer:
         directions = {"long": "A 多", "short": "B 空"}
         elements.append(_label(f"待核对划转 {directions.get(transfer.get('source'), '?')} → {directions.get(transfer.get('destination'), '?')}：{_amount(transfer.get('amount'))} USD1", color="orange"))
@@ -223,10 +331,11 @@ def format_hourly_summary(state, now):
     account_by_id = {a.get("id"): a for a in accounts}
     snapshots = {aid: _map(a.get("snapshot")) for aid, a in account_by_id.items()}
     bound = {p.get(key) for p in pairs for key in ("long_account_id", "short_account_id")}
-    for pair in pairs:
+    pair_sources = [_pair_sources(pair, account_by_id) for pair in pairs]
+    for pair, (_, selected, _) in zip(pairs, pair_sources):
         for side in ("long", "short"):
             aid = pair.get(side + "_account_id")
-            snapshots[aid] = _latest_snapshot({"snapshot": snapshots.get(aid)}, _map(_map(pair.get("state")).get("snapshots")).get(side))
+            snapshots[aid] = selected[side]
     live = [snapshots[a["id"]] for a in accounts if a.get("mode") == "live" and "id" in a]
     pnl_values = [_number(s.get("unrealized")) for s in live]
     pnl = sum(pnl_values, Decimal(0)) if pnl_values and all(v is not None for v in pnl_values) and not (bound - account_by_id.keys()) else None
@@ -241,7 +350,7 @@ def format_hourly_summary(state, now):
         if error:
             elements.append(_label("异常：" + _text(error), color="orange"))
     markets = _map(state.get("markets"))
-    blocks = [_pair_block(p, account_by_id, markets, now, utc_date) for p in pairs]
+    blocks = [_pair_block(p, account_by_id, markets, now, utc_date, sources) for p, sources in zip(pairs, pair_sources)]
     blocks += [_account_block(a, now, utc_date) for a in accounts if a.get("id") not in bound]
     blocks.sort(key=lambda block: not block[0])
     budget, relay = _map(state.get("request_budget")), _map(state.get("capacity_relay"))

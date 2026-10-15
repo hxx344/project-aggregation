@@ -30,6 +30,31 @@ def paired_state():
                   "margin": {"status": "waiting", "reason": "等待检查"}}}]}
 
 
+def margin_only_state(now=NOW):
+    """Recent funds and older independent inventory, with obsolete trade data."""
+    state = paired_state()
+    pair = state["pairs"][0]
+    pair.update(ordinary={"enabled": False}, cycle={"enabled": False},
+                margin={"enabled": True, "check_interval_seconds": 60})
+    runtime = pair["state"]
+    runtime.update(phase="monitoring", reason="等待下次保证金检查", updated_at=now,
+                   pending=None, progress={"quantities": {"LONG": "0", "SHORT": "0"}},
+                   margin={"enabled": True, "blocks_trading": False, "status": "waiting",
+                           "checked_at": now - 18, "next_check_at": now + 45, "cooldown_until": 0})
+    runtime["snapshots"], runtime["margin_balances"], runtime["display_positions"] = {}, {}, {}
+    for index, (row, side, position_side) in enumerate(zip(state["accounts"], ("long", "short"), ("LONG", "SHORT"))):
+        row["snapshot"].update(timestamp=now - 10800, available=str(index + 1), unrealized=str(-999 + index),
+                               positions=[{"symbol": "XAUUSD1", "side": position_side, "qty": str(91 + index), "leverage": 5}])
+        runtime["snapshots"][side] = deepcopy(row["snapshot"])
+        runtime["margin_balances"][side] = {"timestamp": now - (15 if side == "long" else 18),
+            "equity": "1000" if side == "long" else "900", "available": "812.34" if side == "long" else "623.45",
+            "unrealized": "12.5" if side == "long" else "-3.25"}
+        runtime["display_positions"][side] = {"checked_at": now - 2, "error": None, "snapshot": {
+            "timestamp": now - (75 if side == "long" else 80), "positions": [
+                {"symbol": "XAUUSD1", "side": position_side, "qty": "3.25" if side == "long" else "4.5", "leverage": 5}]}}
+    return state
+
+
 def card(state):
     return feishu_payload(format_hourly_summary(state, NOW), "", int(NOW))["card"]
 
@@ -261,6 +286,168 @@ class HourlySummaryTests(unittest.TestCase):
         self.assertIn("未就绪", text)
         self.assertIn("暂无采样", text)
         self.assertIn("尚未配置账户或配对组", text)
+
+
+class MarginOnlyHourlySummaryTests(unittest.TestCase):
+    def test_current_funds_replace_old_trade_balances_and_total_without_mutation(self):
+        state = margin_only_state()
+        original = deepcopy(state)
+        text = rendered(state)
+        self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
+        self.assertIn("可用保证金\n812.34", text)
+        self.assertIn("可用保证金\n623.45", text)
+        self.assertEqual(text.count("保证金占用率\n未采集"), 2)
+        self.assertIn("保证金监控", text)
+        self.assertIn("资金余额 15 秒前 · 定时检查", text)
+        self.assertIn("资金余额 18 秒前 · 定时检查", text)
+        self.assertNotIn("可用保证金\n1.00", text)
+        self.assertNotIn("-1,997.00", text)
+        self.assertNotIn("账户数据 10800 秒前", text)
+        self.assertEqual(state, original)
+
+    def test_positions_keep_their_own_source_timestamp_and_error(self):
+        state = margin_only_state()
+        runtime = state["pairs"][0]["state"]
+        runtime["display_positions"]["long"]["error"] = "展示持仓读取失败，保留上次完整清单"
+        # A successful balance read never refreshes an older inventory.
+        for balance in runtime["margin_balances"].values():
+            balance["timestamp"] = NOW - 2
+        text = rendered(state)
+        self.assertRegex(text, r"持仓[^\n]*多 3\.25[^\n]*空 4\.5")
+        self.assertIn("75 秒前", text)
+        self.assertIn("80 秒前", text)
+        self.assertIn("展示持仓读取失败", text)
+        self.assertIn("资金余额 2 秒前", text)
+        self.assertNotIn("多 91", text)
+        self.assertNotIn("空 92", text)
+
+    def test_absent_inventory_cannot_use_balances_to_claim_empty_or_old_holdings(self):
+        state = margin_only_state()
+        state["pairs"][0]["state"].pop("display_positions")
+        text = rendered(state)
+        self.assertRegex(text, r"持仓[^\n]*多 待同步[^\n]*空 待同步")
+        self.assertNotIn("多 91", text)
+        self.assertNotIn("空 92", text)
+        self.assertNotIn("空仓", text)
+
+    def test_missing_balance_or_pnl_stays_unknown_instead_of_falling_back(self):
+        for missing in ("balance", "available", "unrealized", "non_finite_pnl"):
+            with self.subTest(missing=missing):
+                state = margin_only_state()
+                balances = state["pairs"][0]["state"]["margin_balances"]
+                if missing == "balance":
+                    balances.pop("long")
+                elif missing == "non_finite_pnl":
+                    balances["long"]["unrealized"] = "NaN"
+                else:
+                    balances["long"].pop(missing)
+                text = rendered(state)
+                if missing in {"balance", "available"}:
+                    self.assertIn("可用保证金\n待同步", text)
+                if missing != "available":
+                    self.assertIn("实盘合计浮盈亏 · USD1\n待同步", text)
+                else:
+                    self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
+                self.assertNotIn("可用保证金\n1.00", text)
+                self.assertNotIn("-999.00", text)
+                self.assertEqual(text.count("保证金占用率\n未采集"), 2)
+
+    def test_paper_funds_do_not_join_live_pnl(self):
+        state = margin_only_state()
+        state["accounts"][1]["mode"] = "paper"
+        state["pairs"][0]["state"]["margin_balances"]["short"]["unrealized"] = "9999"
+        text = rendered(state)
+        self.assertIn("B 空 · short（模拟）", text)
+        self.assertIn("实盘合计浮盈亏 · USD1\n12.50", text)
+        self.assertNotIn("10,011.50", text)
+
+    def test_balance_age_distinguishes_fresh_scheduled_cooling_paused_and_overdue(self):
+        for status, age, suffix in (("fresh", 5, ""), ("scheduled", 15, " · 定时检查"),
+                                    ("cooldown", 60, " · 冷却中"), ("paused", 120, " · 已暂停"),
+                                    ("checking", 120, " · 正在检查余额"), ("overdue", 120, " · 待刷新")):
+            with self.subTest(status=status):
+                state = margin_only_state()
+                pair = state["pairs"][0]
+                for balance in pair["state"]["margin_balances"].values():
+                    balance["timestamp"] = NOW - age
+                if status == "cooldown":
+                    pair["state"]["margin"].update(status="cooldown", cooldown_until=NOW + 30)
+                elif status == "paused":
+                    pair["enabled"] = False
+                elif status in {"checking", "overdue"}:
+                    pair["state"]["margin"].update(next_check_at=NOW - (1 if status == "checking" else 9), cooldown_until=0)
+                labels = list(contents(card(state)))
+                self.assertEqual(labels.count(f"资金余额 {age} 秒前{suffix}"), 2)
+
+    def test_scheduled_balance_notes_do_not_hide_latest_failures(self):
+        for origin in ("margin_error", "margin_reason", "pair_notice", "margin_notice", "pair_reason"):
+            with self.subTest(origin=origin):
+                state = margin_only_state()
+                runtime = state["pairs"][0]["state"]
+                message = f"本轮保证金读取异常-{origin}"
+                if origin == "margin_error":
+                    runtime["margin"]["error"] = message
+                elif origin == "margin_reason":
+                    runtime["margin"].update(status="error", reason=message)
+                elif origin == "pair_notice":
+                    runtime["api_notice"] = {"kind": "budget", "text": message}
+                elif origin == "margin_notice":
+                    runtime["margin"]["api_notice"] = {"kind": "budget", "text": message}
+                else:
+                    runtime.update(phase="error", reason=message)
+                text = rendered(state)
+                self.assertIn(message, text)
+                self.assertIn("资金余额 15 秒前", text)
+
+    def test_stopped_runtime_or_invalid_check_times_cannot_claim_scheduled_wait(self):
+        for change in ("stopped", "missing_check", "future_check", "invalid_cooldown", "future_balance"):
+            with self.subTest(change=change):
+                state = margin_only_state()
+                runtime = state["pairs"][0]["state"]
+                if change == "stopped":
+                    runtime["updated_at"] = NOW - 8
+                elif change == "missing_check":
+                    runtime["margin"].pop("checked_at")
+                elif change == "future_check":
+                    runtime["margin"]["checked_at"] = NOW + 60
+                elif change == "invalid_cooldown":
+                    runtime["margin"]["cooldown_until"] = "NaN"
+                else:
+                    runtime["margin_balances"]["short"]["timestamp"] = NOW + 60
+                text = rendered(state)
+                self.assertIn("资金余额 15 秒前 · 待刷新", text)
+                self.assertNotIn("· 定时检查", text)
+                if change == "future_balance":
+                    self.assertIn("资金余额时间异常", text)
+
+    def test_account_ids_select_funds_and_old_inventory_cannot_supply_capacity(self):
+        state = margin_only_state()
+        state["accounts"].reverse()
+        state["markets"] = {"XAUUSD1": {"capacities": {"5": 12345}, "capacity_checked_at": {"5": NOW}}}
+        text = rendered(state)
+        self.assertIn("A 多 · long（实盘）\n可用保证金\n812.34", text)
+        self.assertIn("B 空 · short（实盘）\n可用保证金\n623.45", text)
+        self.assertIn("公开额度待同步", text)
+        self.assertNotIn("12,345.00", text)
+
+    def test_trade_modes_pending_and_nonzero_cycle_holdings_keep_trade_evidence(self):
+        for guard in ("ordinary", "cycle", "margin_disabled", "pending", "long_holding", "short_holding"):
+            with self.subTest(guard=guard):
+                state = margin_only_state()
+                pair = state["pairs"][0]
+                if guard in {"ordinary", "cycle"}:
+                    pair[guard]["enabled"] = True
+                elif guard == "margin_disabled":
+                    pair["margin"]["enabled"] = False
+                elif guard == "pending":
+                    pair["state"]["pending"] = {"id": "unfinished-order"}
+                else:
+                    pair["state"]["progress"]["quantities"]["LONG" if guard == "long_holding" else "SHORT"] = "0.01"
+                text = rendered(state)
+                self.assertIn("实盘合计浮盈亏 · USD1\n-1,997.00", text)
+                self.assertIn("可用保证金\n1.00", text)
+                self.assertIn("持仓  多 91 / 空 92", text)
+                self.assertNotIn("资金余额", text)
 
 
 if __name__ == "__main__":

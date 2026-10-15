@@ -1,5 +1,6 @@
 """Hourly notifications reuse local dashboard snapshots and the shared outbox."""
 from contextlib import ExitStack
+from copy import deepcopy
 import os
 import unittest
 from unittest.mock import patch
@@ -7,7 +8,10 @@ from unittest.mock import patch
 import monitor
 from trading.engine import Engine
 from trading.exchange import ExchangeError
-from tests.helpers import Fixture
+from trading.hourly_summary import format_hourly_summary
+from trading.pairing import validate_pair
+from tests.helpers import Fixture, account
+from tests.test_hourly_summary import NOW, contents, margin_only_state
 
 
 WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/test-hourly-summary"
@@ -67,6 +71,51 @@ class HourlyNotificationEngineTests(unittest.TestCase):
                 call.assert_not_called()
         self.sender.assert_called_once()
         self.assertIsNone(self.engine.hourly_summary_error)
+
+    def test_margin_only_cached_funds_survive_compact_state_and_outbox_without_exchange_reads(self):
+        self.now = NOW - 3600
+        self.engine.notify()
+        self.now = NOW
+        published = margin_only_state(self.now)
+        pair = published["pairs"][0]
+        for row in published["accounts"]:
+            saved = {**account(row["id"], "live"), "enabled": False, "name": row["name"]}
+            self.f.store.save_account(saved)
+            self.engine.views[row["id"]] = {"status": "waiting", "snapshot": deepcopy(row["snapshot"])}
+        self.f.store.save_pair(validate_pair({key: value for key, value in pair.items() if key != "state"}), create=True)
+        self.f.store.put("pair_runtime:" + pair["id"], pair["state"])
+        self.f.store.put("pair_margin:" + pair["id"], pair["state"]["margin"])
+        before_runtime = self.f.store.get("pair_runtime:" + pair["id"])
+        before_views = deepcopy(self.engine.views)
+        with ExitStack() as stack:
+            reads = [stack.enter_context(patch.object(self.f.market, method, side_effect=AssertionError("unexpected market read")))
+                     for method in ("load_rules", "book", "mark_price", "capacities", "depth")]
+            reads.append(stack.enter_context(patch.object(self.engine, "broker", side_effect=AssertionError("unexpected exchange read"))))
+            state = stack.enter_context(patch.object(self.engine, "state", wraps=self.engine.state))
+            formatter = stack.enter_context(patch("trading.engine.format_hourly_summary", wraps=format_hourly_summary))
+            self.engine.notify()
+            state.assert_called_once_with(background_reports=True, compact=True)
+            formatter.assert_called_once()
+            for read in reads:
+                read.assert_not_called()
+        self.sender.assert_called_once()
+        self.assertIsNone(self.engine.hourly_summary_error)
+        sent = monitor.feishu_payload(self.sender.call_args.args[1], "", int(self.now))["card"]
+        text = "\n".join(contents(sent))
+        self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
+        self.assertIn("可用保证金\n812.34", text)
+        self.assertIn("可用保证金\n623.45", text)
+        self.assertIn("资金余额 15 秒前", text)
+        self.assertIn("75 秒前", text)
+        self.assertRegex(text, r"持仓[^\n]*多 3\.25[^\n]*空 4\.5")
+        self.assertNotIn("-1,997.00", text)
+        compact = formatter.call_args.args[0]
+        compact_pair = next(row for row in compact["pairs"] if row["id"] == pair["id"])
+        self.assertEqual(compact_pair["state"]["margin_balances"], before_runtime["margin_balances"])
+        self.assertEqual(compact_pair["state"]["display_positions"], before_runtime["display_positions"])
+        self.assertEqual(self.f.store.get("pair_runtime:" + pair["id"]), before_runtime)
+        self.assertEqual(self.engine.views, before_views)
+        self.assertEqual(self.f.store.hourly_summary_status(available=True)["last_sent_at"], self.now)
 
     def test_demo_and_missing_webhook_never_build_or_send(self):
         self.at_hour()
