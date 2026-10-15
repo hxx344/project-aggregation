@@ -113,7 +113,7 @@ class PairMarginResumeExecutionTests(TestCase):
         original = self.unknown(ready=False)
         self.store.put("pair_margin:gold", {"pending": original, "next_check_at": 0})
         with ExitStack() as stack:
-            baseline_reads = [stack.enter_context(patch.object(broker, "margin_snapshot", wraps=broker.margin_snapshot))
+            baseline_reads = [stack.enter_context(patch.object(broker, "transfer_snapshot", wraps=broker.transfer_snapshot))
                               for broker in self.brokers.values()]
             transfer = stack.enter_context(patch("trading.margin_balance.TransferAPI",
                 side_effect=AssertionError("an unknown transfer must never be replayed")))
@@ -122,7 +122,7 @@ class PairMarginResumeExecutionTests(TestCase):
             self.assertEqual(self.posts(), [])
             self.assert_flat()
             self.assertTrue(all(read.call_count == 1 for read in baseline_reads))
-            self.assertTrue(all(read.call_args.kwargs["fresh_modes"] for read in baseline_reads))
+            self.assertTrue(all(read.call_args.args == () and read.call_args.kwargs == {} for read in baseline_reads))
             journal = self.store.get("pair_margin:gold")
             self.assertIsNone(journal["pending"])
             self.assertEqual(journal["last_transfer"]["status"], "skipped")

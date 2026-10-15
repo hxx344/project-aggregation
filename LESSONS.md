@@ -602,3 +602,17 @@
 **证据：** project-aggregation 基于 `f2f1c36` 的 2026-10-15 未提交补丁修改了配对页四个文件，阈值改为账户间隔加 3 秒并限制到 70 秒。审查新增的三个定向回归在该补丁上全部失败；撤销错误间隔透传后复核。依据为 [账户状态输出](modules/aster/trading/engine.py)、[配对调度](modules/aster/trading/pairing.py)、[配对执行](modules/aster/trading/pair_execution.py) 与 [提示历史](modules/aster/dashboard/lib/pair-notices.ts)。该补丁未发布；启动按钮本来不使用此有效期，不能将本事件描述成绕过交易授权。
 
 **事件记录：** `pair-display-cadence-freshness-20261015`；一次未提交补丁审查与连续修正，不推进主线复盘检查点。
+
+### L041：账户保证金平衡独立于持仓交易策略
+
+**适用条件：** ASTER 两个子账户之间按 USD1 可用余额自动平衡，包括仅保证金管理模式、其他标的或方向的手动持仓，以及策略订单仍在核对的情况。
+
+**根因：** 划转复用了交易快照、持仓匹配、普通开仓占用上限和历史订单核查。即使交易所允许转出，标的不同、行情缺失或无关历史查询失败仍会阻止补充保证金；创建与启动入口也强制策略仓位核验。
+
+**以后做法：** 划转单独读取账户 USD1 余额和交易所可划额度，不要求持仓标的、方向、模式或开仓状态匹配。金额按余额差的一半、实际可划额度、单次限额和现金保留确定。仅保证金启动保留原策略记录，不采纳或清空持仓；实际订单恢复及循环减仓继续按原路径处理。暂停、实盘授权、账户归属、发送前身份与快照代次检查、先持久化后发送和未知结果不重发仍保留。资金快照不提供持仓及杠杆授权，界面单独展示余额及原始读取时间。旧指纹与旧划转日志保持恢复兼容。
+
+**如何验证：** [专用资金快照](modules/aster/tests/test_transfer_account_snapshot.py) 验证只查询账户接口，缺失资金字段、过期与事件失效仍被拒绝；[独立入口](modules/aster/tests/test_pair_margin_independent.py) 验证其他标的持仓可启动平衡、保留策略记录、普通交易原限制和配置身份竞态；[划转测试](modules/aster/tests/test_pair_margin.py) 验证真实额度、现金保留、旧日志和防重发。恢复、预算及 WebSocket 测试按受影响路径选取，前端配对与提示测试验证余额状态不伪装为已确认空仓。
+
+**证据：** project-aggregation `63d621d` 的 [划转实现](modules/aster/trading/margin_balance.py) 在 `_check_snapshots` 限制指定标的和方向，`_plan` 使用 `ordinary.margin_limit`；[配对入口](modules/aster/trading/pairing.py) 及 [执行调度](modules/aster/trading/pair_execution.py) 先要求策略仓位和行情。2026-10-15 用户明确要求保证金平衡独立于持仓标的，本轮定向回归覆盖上述误阻断。
+
+**事件记录：** `aster-transfer-strategy-coupling-20261015`；一次用户纠正及完整调用链修复，不推进主线复盘检查点。

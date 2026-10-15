@@ -10,7 +10,6 @@ from trading.exchange import AmbiguousOrder, ExchangeError, RequestNotSent
 from trading.margin_balance import MarginBalancer
 from trading.models import TradingError, dec
 from trading.pair_execution import PairTrader
-from trading.pair_planning import PairRecoveryConflict
 
 
 class PairMarginLifelineTests(TestCase):
@@ -169,12 +168,12 @@ class PairMarginLifelineTests(TestCase):
                 self.assertEqual({side: len(broker.state["orders"]) for side, broker in self.brokers.items()}, counts)
                 self.wall += 5
 
-    def test_account_modes_and_open_orders_still_block_transfers(self):
-        self.wallet("long", 26000)
-        self.wallet("short", 24000)
+    def test_account_modes_and_open_orders_do_not_block_transfers(self):
         original = self.trader._read
         for mode in ("isolated", "hedge", "multi", "missing_symbol", "orders"):
             with self.subTest(mode=mode):
+                self.wallet("long", 26000)
+                self.wallet("short", 24000)
                 self.store.put("pair_runtime:gold", {})
                 self.store.put("pair_margin:gold", {})
 
@@ -197,27 +196,27 @@ class PairMarginLifelineTests(TestCase):
 
                 with patch.object(self.trader, "_read", side_effect=read):
                     state = self.tick()
-                self.assertEqual(state["margin"]["status"], "blocked", state)
-                self.assertEqual(self.brokers["long"].state["wallet"], "26000")
+                self.assert_transferred(state)
                 self.assert_no_orders()
 
-    def test_unknown_orders_publish_wait_without_transfer_or_repeated_orders(self):
+    def test_unknown_orders_allow_transfer_without_repeated_orders(self):
         with patch.object(self.brokers["long"], "submit", side_effect=AmbiguousOrder("unknown order")), \
              patch.object(self.brokers["long"], "query", side_effect=ExchangeError("unknown order", code=-2013)):
-            self.assertIsNotNone(self.tick()["pending"])
+            pending = self.tick()["pending"]
+            self.assertIsNotNone(pending)
             self.wallet("long", 26000)
             self.wallet("short", 24000)
-            with patch.object(MarginBalancer, "_paper", side_effect=AssertionError("no new transfer")), \
+            with patch.object(MarginBalancer, "_paper", wraps=MarginBalancer(self.engine)._paper) as transfers, \
                  patch.object(self.brokers["short"], "submit", side_effect=AssertionError("no repeated order")):
-                for _ in range(3):
-                    self.wall += 5
+                for index in range(3):
+                    self.wall += 5 if index == 0 else 1
                     state = self.tick()
                     self.assertIsNotNone(state["pending"])
-                    self.assertEqual(state["margin"]["status"], "waiting")
-                    self.assertIn("核对订单", state["margin"]["reason"])
-            self.assertEqual(self.brokers["long"].state["wallet"], "26000")
-            self.assertEqual(self.brokers["short"].state["wallet"], "24000")
-            self.assertIsNone(self.store.get("pair_margin:gold").get("last_transfer"))
+                    self.assertEqual(state["pending"]["id"], pending["id"])
+                self.assertEqual(transfers.call_count, 1)
+            self.assertLess(dec(self.brokers["long"].state["wallet"]), 26000)
+            self.assertGreater(dec(self.brokers["short"].state["wallet"]), 24000)
+            self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["status"], "paper_confirmed")
 
     def test_paused_pair_and_changed_identity_never_transfer(self):
         self.wallet("long", 26000)
@@ -234,17 +233,11 @@ class PairMarginLifelineTests(TestCase):
         self.assertEqual(self.brokers["long"].state["wallet"], "26000")
         self.assert_no_orders()
 
-    def test_margin_recovery_conflict_preserves_newer_runtime(self):
+    def test_margin_does_not_consult_or_adopt_archived_strategy_orders(self):
         self.wallet("long", 26000)
         self.wallet("short", 24000)
-        newer = {"phase": "attention", "reason": "late archived order", "pending": {"id": "newer"}}
-
-        def conflict(*args):
-            self.store.put("pair_runtime:gold", newer)
-            raise PairRecoveryConflict("late archived order")
-
-        with patch("trading.pair_recovery.require_archived_orders_clear", side_effect=conflict):
-            self.assertEqual(self.tick(), newer)
-        self.assertEqual(self.store.get("pair_runtime:gold"), newer)
-        self.assertEqual(self.brokers["long"].state["wallet"], "26000")
+        with patch("trading.pair_recovery.require_archived_orders_clear",
+                   side_effect=AssertionError("funds must not adopt archived strategy positions")) as history:
+            self.assert_transferred(self.tick())
+            history.assert_not_called()
         self.assert_no_orders()

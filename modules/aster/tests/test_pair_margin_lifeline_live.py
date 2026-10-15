@@ -196,7 +196,7 @@ class PairMarginLifelineLiveTests(TestCase):
             for broker in self.brokers.values():
                 with self.assertRaises(HotAccountUnavailable):
                     broker.cycle_hot_snapshot([SYMBOL])
-                reads.append(stack.enter_context(patch.object(broker, "margin_snapshot", wraps=broker.margin_snapshot)))
+                reads.append(stack.enter_context(patch.object(broker, "transfer_snapshot", wraps=broker.transfer_snapshot)))
             self.assert_transferred(self.tick())
             self.assertTrue(all(read.call_count >= 2 for read in reads))
         self.assertFalse(any(path == BRACKET for broker in self.brokers.values() for _, path, _ in broker.api.calls))
@@ -206,7 +206,7 @@ class PairMarginLifelineLiveTests(TestCase):
             reads = []
             for broker in self.brokers.values():
                 broker.api.fail_brackets = True
-                reads.append(stack.enter_context(patch.object(broker, "margin_snapshot", wraps=broker.margin_snapshot)))
+                reads.append(stack.enter_context(patch.object(broker, "transfer_snapshot", wraps=broker.transfer_snapshot)))
             self.assert_transferred(self.tick())
             self.assertTrue(all(read.call_count >= 2 for read in reads))
         self.assertTrue(any(path == BRACKET for broker in self.brokers.values() for _, path, _ in broker.api.calls))

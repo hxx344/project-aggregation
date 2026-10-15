@@ -84,6 +84,10 @@ def has_cycle_quantity(runtime):
     return any(dec(qty) for qty in progress.get("quantities", {}).values())
 
 
+def margin_only(pair):
+    return pair["margin"]["enabled"] and not pair["ordinary"]["enabled"] and not pair["cycle"]["enabled"]
+
+
 def pair_active(pair, runtime=None):
     return bool(pair.get("enabled") or (runtime or {}).get("pending") or has_cycle_quantity(runtime))
 
@@ -244,7 +248,12 @@ class PairManager:
             if (self.store.get("pair_runtime:" + pair["id"]) or self.store.get("pair_margin:" + pair["id"])
                     or self.store.get("pair_deleted:" + pair["id"])):
                 raise TradingError("配对组标识存在历史记录，请使用新标识")
-            _, guards = self._read_members(pair, flat=True)
+            if margin_only(pair):
+                # Funds ownership does not adopt or constrain strategy positions.
+                self._members(pair)
+                guards = {}
+            else:
+                _, guards = self._read_members(pair, flat=True)
             with self._current_members(guards):
                 pair = self.store.save_pair(pair, create=True)
             self.store.event(pair["id"], "pair", "双子账户配对组已建立，默认暂停")
@@ -374,6 +383,10 @@ class PairManager:
                 from .pair_execution import PairTrader, empty_progress
                 if pair["enabled"]:
                     raise TradingError("配对组已启动，无需重复启动")
+                if margin_only(pair):
+                    saved = self._enable_margin(pair)
+                    self._changed(saved)
+                    return saved
                 pending = (self.store.get("pair_runtime:" + pair_id, {}) or {}).get("pending")
                 if isinstance(pending, dict) and pending.get("kind") == "ordinary" and pending.get("phase") == "open":
                     result = self.recovery.check(pair_id, source="paused_start")
@@ -442,6 +455,47 @@ class PairManager:
                 self.store.event(pair_id, "pair", "配对组已暂停，停止新开仓和新划转；已提交订单及划转继续核对，循环新增仓位继续减回，普通底仓保留")
             self._changed(saved)
             return saved
+
+    def _enable_margin(self, pair):
+        """Start funds management without adopting or clearing strategy state."""
+        from .margin_balance import MarginBalancer
+        from .pair_execution import PairTrader, runtime_default
+        original = self.store.get("pair_runtime:" + pair["id"], {})
+        margin = self.store.get("pair_margin:" + pair["id"], {})
+        if not isinstance(original, dict) or not isinstance(margin, dict):
+            raise TradingError("配对组或保证金日志无效，请先核对")
+        accounts = self._members(pair)
+        trader = PairTrader(self.engine)
+        _, brokers, identities = trader._members(pair)
+        if original.get("identities") and original["identities"] != identities:
+            raise TradingError("配对组凭据指向的真实账户发生变化，请先核对账户身份")
+        pending = original.get("pending")
+        if pending and pending.get("identities") != identities:
+            raise TradingError("未完成批次的账户身份与当前凭据不一致")
+        MarginBalancer(self.engine).verify_members(pair)
+        if trader._members(pair)[2] != identities:
+            raise TradingError("启动核验期间账户身份已变化，请重新核对")
+        runtime = {**runtime_default(), **deepcopy(original)}
+        reason = "仅保证金管理已启动，按两侧 USD1 可用余额检查划转；原策略记录保留"
+        runtime.update(identities=identities, phase="monitoring", reason=reason, updated_at=time.time())
+        pair = {**pair, "enabled": True}
+        pair.pop("pause_reason", None)
+
+        def check_current():
+            # No Store reads inside activate_pair's database transaction.
+            for key, broker in brokers.items():
+                account = next(row for row in accounts if row["id"] == pair[key + "_account_id"])
+                if not self.engine.live_allowed(account):
+                    raise TradingError("服务器尚未启用实盘执行（ASTER_ALLOW_LIVE=1）")
+                if self.engine.brokers.get(account["id"]) is not broker:
+                    raise TradingError("启动核验期间账户连接已变化，请重新核对")
+                if isinstance(broker, LiveBroker):
+                    credentials = broker.api.credentials
+                    if any(credentials[field].lower() != identities[key][field] for field in ("user", "signer")):
+                        raise TradingError("启动核验期间账户身份已变化，请重新核对")
+
+        return self.store.activate_pair(pair, runtime, expected_runtime=original,
+            expected_margin=margin, accounts=accounts, check_current=check_current, message=reason)
 
     def preview_recovery(self, pair_id):
         pair = self.store.pair(pair_id)

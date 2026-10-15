@@ -1301,6 +1301,64 @@ class LiveBroker:
                                   reuse_account_mode=reuse_account_mode, include_brackets=False,
                                   authorize_leverage=False)
 
+    @staticmethod
+    def _transfer_wallet_equity(asset):
+        """Use the same wallet/PnL scope at preparation and final transfer reads."""
+        def amount(field):
+            try:
+                return dec(asset.get(field))
+            except TradingError as exc:
+                raise TradingError(f"USD1 划转余额（{field}）：{exc}") from None
+
+        # Keep total-wallet and cross-wallet PnL in their own accounting
+        # scopes. Mixing total wallet with cross PnL can hide isolated loss.
+        wallet_field, pnl_field = (("walletBalance", "unrealizedProfit") if "walletBalance" in asset
+                                   else ("crossWalletBalance", "crossUnPnl"))
+        wallet = amount(wallet_field)
+        if "marginBalance" in asset:
+            equity = amount("marginBalance")
+            unrealized = (amount(pnl_field) if pnl_field in asset else
+                          decimal_value(Fraction(equity) - Fraction(wallet), exact=True))
+        else:
+            unrealized = amount(pnl_field)
+            equity = decimal_value(Fraction(wallet) + Fraction(unrealized), exact=True)
+        return wallet, unrealized, equity
+
+    def transfer_snapshot_weight(self):
+        return 5
+
+    def transfer_snapshot(self):
+        """Read USD1 transfer balances without claiming any trading evidence.
+
+        Position rows, market metadata and account modes are deliberately not
+        interpreted. The exchange's withdrawal limit remains mandatory, and
+        account events/writes revoke this read just like an ordinary snapshot.
+        """
+        with self._ordinary_read_lock:
+            with self._snapshot_lock:
+                generation = self._snapshot_generation
+                self.leverage_snapshot = None
+            started = time.time()
+            account = self.api.call("GET", "/fapi/v3/accountWithJoinMargin", signed=True, weight=5)
+            asset = self._account_asset(account)
+            wallet, unrealized, equity = self._transfer_wallet_equity(asset)
+            try:
+                available = dec(asset.get("availableBalance"))
+            except TradingError as exc:
+                raise TradingError(f"USD1 划转余额（availableBalance）：{exc}") from None
+            snapshot = AccountSnapshot(equity,
+                positive(asset.get("maintMargin"), True, field="USD1 维持保证金（maintMargin）"),
+                available, wallet, unrealized, [], None, None, None,
+                account.get("canTrade") is True, started)
+            snapshot.transfer_withdrawable = positive(asset.get("maxWithdrawAmount"), True,
+                field="USD1 可划转额度（maxWithdrawAmount）")
+            with self._snapshot_lock:
+                if generation != self._snapshot_generation:
+                    raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
+                snapshot.require_fresh()
+                snapshot.account_read_generation = generation
+            return snapshot
+
     def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
         with self._snapshot_lock:
             return self._cycle_snapshot_weight(symbols, fresh_modes=fresh_modes)

@@ -22,6 +22,12 @@ import {
 } from './pair-symbols.ts';
 
 export type PairSnapshot = NonNullable<Account['snapshot']>;
+export type PairBalance = {
+  equity: string;
+  available: string;
+  wallet: string;
+  timestamp: number;
+};
 export type PairApiNotice = {
   kind: 'budget' | 'cooldown' | 'rate_limit';
   text: string;
@@ -89,6 +95,7 @@ export type Pair = {
     api_notice?: PairApiNotice | null;
     updated_at?: number;
     snapshots?: { long?: PairSnapshot | null; short?: PairSnapshot | null };
+    margin_balances?: { long?: PairBalance | null; short?: PairBalance | null };
     owned?: Partial<Record<'LONG' | 'SHORT', string>>;
     progress?: {
       phase?: string;
@@ -425,6 +432,9 @@ export function pairHasPending(pair: Pair): boolean {
   );
 }
 export function pairStartRecoveryBlock(pair: Pair): string {
+  // Starting funds management resumes its durable transfer checks; it never
+  // resubmits a pending write or authorizes a strategy order.
+  if (pairMarginOnly(pair)) return '';
   const margin = pair.state?.margin;
   if (
     (margin?.pending ||
@@ -455,6 +465,13 @@ export function pairStartRecoveryBlock(pair: Pair): string {
   // An ordinary opening may request reconciliation at start. Only the server
   // can validate receipts and current positions, then authorize activation.
   return '';
+}
+export function pairMarginOnly(pair: Pair): boolean {
+  return (
+    pair.margin?.enabled === true &&
+    pair.ordinary?.enabled === false &&
+    pair.cycle?.enabled === false
+  );
 }
 export function pairConfigurationLock(pair: Pair): string {
   if (pair.enabled) return '暂停配对组后可修改设置。';

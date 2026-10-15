@@ -113,7 +113,8 @@ class PairMarginPollEfficiencyTests(TestCase):
             self.advance(5)
         self.assertEqual(len(self.calls(ACCOUNT)), 2)
         self.assertEqual(self.calls(INCOME), [])
-        self.assertIn("long", state["snapshots"])
+        self.assertIn("long", state["margin_balances"])
+        self.assertEqual(state["snapshots"], {})
         self.assert_read_only()
         journal = self.store.get("pair_margin:gold")
         self.assertIsNone(journal["pending"])
@@ -155,9 +156,9 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.store.put("pair_margin:gold", {
             "cooldown_until" if cooldown else "next_check_at": self.wall + 120})
         self.assertEqual(self.tick()["phase"], "monitoring")
-        self.assertEqual(len(self.calls(ACCOUNT)), 2)
+        self.assertEqual(len(self.calls(ACCOUNT)), 0)
 
-    def test_monitor_only_retains_thirty_second_display_refresh_during_wait_and_cooldown(self):
+    def test_monitor_only_wait_and_cooldown_do_not_read_unused_strategy_snapshots(self):
         for cooldown in (False, True):
             with self.subTest(cooldown=cooldown):
                 for broker in self.brokers.values():
@@ -166,10 +167,10 @@ class PairMarginPollEfficiencyTests(TestCase):
                 for _ in range(5):
                     self.advance(5)
                     self.assertEqual(self.tick()["phase"], "monitoring")
-                self.assertEqual(len(self.calls(ACCOUNT)), 2)
+                self.assertEqual(len(self.calls(ACCOUNT)), 0)
                 self.advance(5)
                 self.tick()
-                self.assertEqual(len(self.calls(ACCOUNT)), 4)
+                self.assertEqual(len(self.calls(ACCOUNT)), 0)
                 self.assert_read_only()
 
     def test_due_check_does_not_use_display_observation_as_transfer_authority(self):
@@ -177,22 +178,22 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.store.put("pair_margin:gold", {"next_check_at": self.wall + 1})
         self.advance(1)
         state = self.tick()
-        self.assertEqual(len(self.calls(ACCOUNT)), 4)
+        self.assertEqual(len(self.calls(ACCOUNT)), 2)
         self.assertFalse(state["margin"]["blocks_trading"])
         self.assert_read_only()
 
-    def test_mode_revision_and_account_event_force_new_read_before_waiting(self):
+    def test_only_trading_enable_requires_position_read_during_funds_wait(self):
         self.monitor_wait()
         self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
         self.tick()
-        self.assertEqual(len(self.calls(ACCOUNT)), 4)
+        self.assertEqual(len(self.calls(ACCOUNT)), 0)
         self.pair = self.store.save_pair({**self.pair, "name": "updated monitoring"})
         self.tick()
-        self.assertEqual(len(self.calls(ACCOUNT)), 6)
+        self.assertEqual(len(self.calls(ACCOUNT)), 0)
         self.pair["ordinary"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
         self.tick()
-        self.assertEqual(len(self.calls(ACCOUNT)), 8)
+        self.assertEqual(len(self.calls(ACCOUNT)), 2)
         self.assert_read_only()
 
     def test_changed_identity_and_attention_remain_visible(self):
@@ -201,7 +202,7 @@ class PairMarginPollEfficiencyTests(TestCase):
         state = self.tick()
         self.assertEqual(state["phase"], "attention")
         self.assertIn("真实账户", state["reason"])
-        self.assertEqual(len(self.calls(ACCOUNT)), 2)
+        self.assertEqual(len(self.calls(ACCOUNT)), 0)
         self.assert_read_only()
 
     def test_pending_identity_mismatch_blocks_without_querying_another_account(self):
@@ -214,18 +215,22 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertIn("身份不一致", state["reason"])
         self.assertEqual(self.calls(), [])
 
-    def test_event_after_read_cannot_extend_display_wait_with_old_positions(self):
+    def test_event_after_balance_read_revokes_transfer_authority(self):
         self.pair["ordinary"]["enabled"] = False
         self.pair = self.store.save_pair(self.pair)
-        self.store.put("pair_margin:gold", {"next_check_at": self.wall + 120})
-        publish = self.trader._publish_snapshots
+        self.store.put("pair_margin:gold", {})
+        publish = self.trader._publish_balances
 
-        def account_changes_after_read(state, snapshots, symbol):
-            publish(state, snapshots, symbol)
+        def account_changes_after_read(state, snapshots):
+            publish(state, snapshots)
             self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
 
-        with patch.object(self.trader, "_publish_snapshots", side_effect=account_changes_after_read):
-            self.tick()
+        with patch.object(self.trader, "_publish_balances", side_effect=account_changes_after_read):
+            state = self.tick()
+        self.assertEqual(state["snapshots"], {})
+        self.assertIn("long", state["margin_balances"])
+        self.assertEqual(len(self.calls(ACCOUNT)), 2)
+        self.advance(5)
         self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), 4)
         self.assert_read_only()
@@ -282,7 +287,10 @@ class PairMarginPollEfficiencyTests(TestCase):
                 for side, broker in self.paper.items():
                     self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)
                 stored = self.store.get("pair_margin:gold")["pending"]
-                self.assertEqual(stored, record if status == "accepted" else None)
+                if status == "accepted":
+                    self.assertEqual({key: stored[key] for key in record}, record)
+                else:
+                    self.assertIsNone(stored)
                 if status == "unknown":
                     self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["request_id"], record["request_id"])
                 self.advance(5)
@@ -320,7 +328,7 @@ class PairMarginPollEfficiencyTests(TestCase):
         query.assert_called_once_with("XAUUSD1", order_id)
         self.assertIsNone(result["pending"], result)
         self.assertEqual(result["progress"]["completed_cycles"], 1)
-        self.assertEqual(result["margin"]["status"], "waiting")
+        self.assertEqual(result["margin"]["status"], "cooldown")
         self.assertFalse(result["margin"]["blocks_trading"])
         journal = self.store.get("pair_margin:gold")
         self.assertIsNone(journal["pending"])

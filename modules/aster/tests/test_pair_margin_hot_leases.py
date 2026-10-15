@@ -40,11 +40,11 @@ class PairMarginHotLeaseTests(TestCase):
     def tick(self):
         return self.balancer.tick(self.pair, self.snapshots, snapshot_guards=self.guards)
 
-    def test_hot_transfer_uses_80_weight_and_only_refreshes_after_acceptance(self):
-        # 80 fits while even one redundant 72-weight snapshot would be rejected.
+    def test_hot_transfer_uses_20_weight_and_only_refreshes_after_acceptance(self):
+        # 20 fits while even one redundant 5-weight balance read would not.
         from trading.exchange import RateBudget
         budget = RateBudget(capacity_reserve=363)
-        budget.reserve(1057)
+        budget.reserve(1117)
         for broker in self.brokers.values():
             broker.api.budget = budget
         result = self.tick()
@@ -53,7 +53,7 @@ class PairMarginHotLeaseTests(TestCase):
         self.assertEqual(self.refreshed, ["long", "short"])
         for broker in self.brokers.values():
             self.assertEqual([path for _, path, _ in broker.api.calls],
-                ["/fapi/v3/accountWithJoinMargin", "/fapi/v3/income"])
+                ["/fapi/v3/accountWithJoinMargin"])
         for guard in self.guards.values():
             with self.assertRaises(HotAccountUnavailable):
                 guard()
@@ -66,12 +66,12 @@ class PairMarginHotLeaseTests(TestCase):
         self.assertEqual(self.refreshed, [])
         self.assertEqual(self.transfers, [])
 
-    def test_mode_deadline_during_income_prevents_submission(self):
+    def test_lease_deadline_during_account_read_prevents_submission(self):
         original = self.brokers["short"].api.call
         with patch("time.monotonic", return_value=self.deadline - 1) as clock:
             def expire(method, path, *args, **kwargs):
                 response = original(method, path, *args, **kwargs)
-                if path.endswith("/income"):
+                if path.endswith("/accountWithJoinMargin"):
                     clock.return_value = self.deadline
                 return response
 

@@ -31,6 +31,8 @@ class PairMarginWebSocketTests(unittest.TestCase):
         for side, broker in self.brokers.items():
             if wallet:
                 broker.api.account["assets"][0]["walletBalance"] = str(snapshots[side].wallet)
+            else:
+                broker.api.account["assets"][0].pop("walletBalance", None)
             if connect:
                 self.connect(broker)
             snapshots[side].account_read_generation = broker._snapshot_generation
@@ -208,6 +210,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
                         broker = LiveBroker({}, self.market, api=previous.api)
                         broker.snapshot = previous.snapshot
                         broker.margin_snapshot = previous.margin_snapshot
+                        broker.transfer_snapshot = previous.transfer_snapshot
                         self.brokers[side] = broker
                         self.connect(broker)
                 self.ready()

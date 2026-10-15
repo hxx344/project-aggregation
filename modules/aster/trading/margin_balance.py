@@ -181,7 +181,11 @@ class MarginBalancer:
         if members["long"]["mode"] != "live":
             raise TradingError("模拟划转出现未完成日志，需要核对")
         with self._master(pair, members) as (_, master, children):
-            if pending.get("identity") != self._fingerprint(pair, members, children, master):
+            # Existing journals used a symbol-bound identity. Accept that exact
+            # legacy binding while new transfers belong only to the accounts.
+            identities = {self._fingerprint(pair, members, children, master),
+                          self._fingerprint(pair, members, children, master, legacy=True)}
+            if pending.get("identity") not in identities:
                 raise TradingError("划转待核对记录与当前账户身份不一致")
 
     def risk_snapshots(self, pair, snapshots, *, recovery=False):
@@ -219,15 +223,14 @@ class MarginBalancer:
         saved_pair = self.store.pair(pair["id"])
         if saved_pair is not None and saved_pair != pair:
             raise TradingError("配对组配置已变化，等待重新读取余额")
-        symbols = [pair.get("symbol", "XAUUSD1")]
         brokers = {side: self.engine.broker(member) for side, member in members.items()}
-        self._require_budget(members, {side: broker.margin_snapshot_weight(symbols, fresh_modes=True)
+        self._require_budget(members, {side: broker.transfer_snapshot_weight()
             for side, broker in brokers.items()}, reconciliation=True)
         started = time.time()
         snapshots = {}
         for side, broker in brokers.items():
             with getattr(broker, "reconciliation_budget", nullcontext)():
-                snapshots[side] = broker.margin_snapshot(symbols, fresh_modes=True)
+                snapshots[side] = broker.transfer_snapshot()
             snapshots[side].require_fresh()
             if snapshots[side].timestamp < max(started, pending["created_at"]):
                 raise TradingError("跳过旧划转前必须重新取得两侧余额，等待新快照")
@@ -288,34 +291,12 @@ class MarginBalancer:
 
     def _live_budget_weights(self, pair, members, snapshots, snapshot_guards=None):
         # Listing and POST use the long member's shared budget. Each member
-        # additionally needs its account and transfer income baseline (5+30).
-        weights = {"long": 45, "short": 35}
+        # additionally needs its fresh account withdrawal limit.
+        weights = {"long": 15, "short": 5}
         for side, member in members.items():
             if (type(getattr(snapshots[side], "account_read_generation", None)) is not int
                     and not callable((snapshot_guards or {}).get(side))):
-                weights[side] += self.engine.broker(member).snapshot_weight([pair.get("symbol", "XAUUSD1")])
-        watch = (self.store.get("pair_runtime:" + pair["id"], {}) or {}).get("recovery_watch")
-        if watch is not None:
-            from .pair_recovery import active_watch_batches
-            batches = watch.get("batches") if isinstance(watch, dict) else None
-            if not isinstance(batches, list) or not batches:
-                raise TradingError("人工归档订单跟踪记录无效，禁止新开仓与划转")
-            active = active_watch_batches(watch)
-            for batch in batches:
-                legs = batch.get("legs") if isinstance(batch, dict) else None
-                if (not isinstance(legs, list) or len(legs) < 2
-                        or any(not isinstance(leg, dict) for leg in legs)
-                        or {leg.get("key") for leg in legs} != {"long", "short"}):
-                    raise TradingError("人工归档订单明细无效，禁止新开仓与划转")
-                if batch in active:
-                    for leg in legs:
-                        weights[leg["key"]] += 1
-            # An exhausted historical watch uses a full current-state read.
-            # Admit that whole fallback before starting transfer preparation;
-            # new transfers cannot borrow the reserved recovery allowance.
-            for side, member in members.items():
-                broker = self.engine.broker(member)
-                weights[side] += broker.snapshot_weight([pair.get("symbol", "XAUUSD1")], fresh_modes=True) + 40
+                weights[side] += self.engine.broker(member).transfer_snapshot_weight()
         return weights
 
     @contextmanager
@@ -389,10 +370,12 @@ class MarginBalancer:
         return {"verified": True, "mode": "live"}
 
     @staticmethod
-    def _fingerprint(pair, members, children=None, master=None):
-        binding = {"pair": pair["id"], "symbol": pair.get("symbol", "XAUUSD1"),
+    def _fingerprint(pair, members, children=None, master=None, *, legacy=False):
+        binding = {"pair": pair["id"],
             "members": {side: {"id": member["id"], "mode": member["mode"], "prefix": member["env_prefix"]}
                         for side, member in members.items()}}
+        if legacy:
+            binding["symbol"] = pair.get("symbol", "XAUUSD1")
         if children is not None:
             binding["users"] = {side: value["user"].lower() for side, value in children.items()}
         if master is not None:
@@ -400,22 +383,12 @@ class MarginBalancer:
         return hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
 
     @staticmethod
-    def _check_snapshots(pair, snapshots, *, require_orders=False):
+    def _check_snapshots(pair, snapshots):
         if set(snapshots) != {"long", "short"}:
             raise TradingError("保证金平衡缺少两侧账户快照")
-        for side, snapshot in snapshots.items():
+        for snapshot in snapshots.values():
             snapshot.require_fresh()
-            snapshot.require_modes([pair.get("symbol", "XAUUSD1")])
-            if snapshot.hedge_mode is not True or snapshot.multi_assets is not False:
-                raise TradingError("保证金平衡要求双向持仓协议、USD1 单币全仓模式，每子账户只持指定方向")
-            if (not snapshot.can_trade or snapshot.equity <= 0 or snapshot.open_orders
-                    or (require_orders and snapshot.open_orders is None)):
-                raise TradingError("账户权限、权益或未完成委托不满足划转条件")
-            for position in snapshot.positions:
-                if dec(position.qty) < 0 or (position.qty and (position.symbol != pair.get("symbol", "XAUUSD1")
-                        or position.side != side.upper() or position.isolated)):
-                    raise TradingError("子账户存在隔离保证金、非指定品种或反向持仓")
-            for number in (snapshot.available, snapshot.wallet, snapshot.equity, snapshot.maintenance):
+            for number in (snapshot.available, snapshot.wallet, snapshot.equity):
                 dec(number)
 
     @staticmethod
@@ -425,7 +398,7 @@ class MarginBalancer:
     @staticmethod
     def _may_need_transfer(snapshots, config):
         # This upper bound can only skip a new transfer. A candidate still needs
-        # ownership, withdrawal, risk, order and revocable-read checks below.
+        # ownership, withdrawal, cash buffer and revocable-read checks below.
         difference = abs(MarginBalancer._balance_delta(snapshots))
         if difference <= Fraction(dec(config["threshold"])):
             return False
@@ -449,58 +422,39 @@ class MarginBalancer:
             elif diagnostics:
                 detail += "；" + diagnostics["reason"]
             else:
-                detail += (f"；来源账户按可划余额、单次限额、现金与风险缓冲共同约束后，"
+                detail += (f"；来源账户按可划余额、单次限额与现金保留共同约束后，"
                            f"按划转精度取整后的安全可划金额低于最小划转额 {_display_amount(minimum)} USD1")
         return detail + "；本次不划转，后续按检查间隔重新评估"
 
     @staticmethod
-    def _plan(pair, members, snapshots, config, withdrawable, *, occupied_floors=None, diagnostics=None):
+    def _plan(pair, members, snapshots, config, withdrawable, *, diagnostics=None):
         delta = MarginBalancer._balance_delta(snapshots)
         if abs(delta) <= dec(config["threshold"]):
             return None
         source, destination = ("long", "short") if delta > 0 else ("short", "long")
         snapshot = snapshots[source]
         buffer = Fraction(dec(config["buffer_ratio"]))
-        # Paired transfers use the group's policy, just like paired opening.
-        # Standalone account limits must not silently override group settings.
-        ordinary = pair.get("ordinary")
-        if not isinstance(ordinary, dict) or "margin_limit" not in ordinary:
-            raise TradingError("编组基础保证金占用上限缺失")
-        base_limit = positive(ordinary["margin_limit"])
-        if base_limit > 1:
-            raise TradingError("编组基础保证金占用上限不得超过 100%")
-        limit = Fraction(base_limit) - buffer
-        if limit <= 0:
-            raise TradingError("风险缓冲必须小于编组基础保证金占用上限")
-        equity = Fraction(positive(snapshot.equity))
-        # Keep both spare cash and enough post-transfer equity for ALL occupied
-        # margin. Available funds are not synonymous with safely transferable funds.
-        occupied = max(snapshot.occupied_margin_exact, (occupied_floors or {}).get(source, Fraction(0)))
-        risk_room = equity - max(occupied, Fraction(snapshot.maintenance)) / limit
+        # The exchange's withdrawal limit already accounts for positions and
+        # reserved funds. Opening-strategy limits do not govern a funds transfer.
+        equity = max(Fraction(0), Fraction(dec(snapshot.equity)))
         cash_room = Fraction(snapshot.available) - equity * buffer
         constraints = {"余额差的一半": Fraction(abs(delta)) / 2,
             "单次上限": Fraction(dec(config["max_transfer"])),
             "来源账户可划余额": Fraction(positive(withdrawable[source], True)),
-            "现金保留": cash_room, "风险缓冲": risk_room}
+            "现金保留": cash_room}
         amount = min(constraints.values())
         amount = max(Fraction(0), amount)
         units = amount // TRANSFER_UNIT
         rounded = Decimal(int(units)) * Decimal("0.00000001")
         if rounded < dec(config["min_transfer"]):
             if diagnostics is not None:
-                def percent(value):
-                    return wire(Decimal(int(Fraction(value) * 10000)) * Decimal("0.01"))
                 def cash(value):
                     return wire(Decimal(int(max(Fraction(0), value) // TRANSFER_UNIT)) * Decimal("0.00000001"))
                 limited = "、".join(f"{name}（可划 {cash(value)} USD1）" for name, value in constraints.items()
                     if max(Fraction(0), value) // TRANSFER_UNIT * TRANSFER_UNIT < dec(config["min_transfer"]))
                 side = "A 多侧" if source == "long" else "B 空侧"
-                maintenance = (f"，维持保证金率约 {percent(Fraction(snapshot.maintenance) / equity)}%"
-                    if Fraction(snapshot.maintenance) > occupied else "")
                 diagnostics["reason"] = (
-                    f"转出侧 {side}占用率约 {percent(occupied / equity)}%{maintenance}，"
-                    f"划转后占用上限 {percent(limit)}%（编组基础 {percent(base_limit)}%，再扣 {percent(buffer)} 个百分点；"
-                    "不含普通高杠杆或循环额外的 5 个百分点）；"
+                    f"转出侧 {side}；现金保留 {cash(equity * buffer)} USD1；"
                     f"限制项：{limited}；共同约束后的安全可划金额 {wire(rounded)} USD1，"
                     f"低于最小划转额 {_display_amount(Fraction(dec(config['min_transfer'])))} USD1")
             return None
@@ -685,7 +639,6 @@ class MarginBalancer:
         acknowledged_at = pending.get("acknowledged_at")
         if type(acknowledged_at) not in (int, float) or not math.isfinite(acknowledged_at):
             raise TradingError("划转成功回执缺少有效时间，保留待核对状态")
-        symbols = [pair.get("symbol", "XAUUSD1")]
         brokers = {side: self.engine.broker(member) for side, member in members.items()}
         done = self._refresh_acknowledged_ws(pair, members, brokers, state)
         if done is not None:
@@ -707,12 +660,12 @@ class MarginBalancer:
             self._record_success(pair, state)
             return self._view(state, config, "acknowledged", "交易所已确认划转，等待两侧 WebSocket 余额；最多 2 秒后改用 REST 刷新",
                 blocks=True)
-        self._require_budget(members, {side: broker.margin_snapshot_weight(symbols, fresh_modes=True)
+        self._require_budget(members, {side: broker.transfer_snapshot_weight()
                                      for side, broker in brokers.items()}, reconciliation=True)
         snapshots = {}
         for side, broker in brokers.items():
             with getattr(broker, "reconciliation_budget", nullcontext)():
-                current = broker.margin_snapshot(symbols, fresh_modes=True)
+                current = broker.transfer_snapshot()
                 current.require_fresh()
                 if current.timestamp < acknowledged_at:
                     raise TradingError("划转后的账户查询返回旧快照，继续等待新余额")
@@ -726,6 +679,7 @@ class MarginBalancer:
             done = {**pending, "refreshed_at": time.time(), "refresh_source": "rest"}
             state.update(pending=None, last_transfer=done)
             self._record_success(pair, state)
+            self.refreshed_snapshots = snapshots
         self._invalidate(members)
         return self._view(state, config, "acknowledged", "交易所回执确认，余额已刷新；等待下一轮账户快照", blocks=True,
             plan={key: done[key] for key in ("source", "destination", "amount")})
@@ -842,8 +796,6 @@ class MarginBalancer:
                 return self._view(state, config, "paused", "配对组已暂停，不发起新划转；已有划转仍继续只读核对，需启动配对组后才重新评估新划转")
             if any(not self.engine.live_allowed(member) for member in members.values()):
                 return self._view(state, config, "blocked", "实盘全局开关未开启，禁止划转", blocks=True)
-            if pending_orders:
-                return self._view(state, config, "waiting", "配对组正在核对订单或减回本轮仓位，暂不划转；完成后重新评估保证金")
             if state.get("api_notice") and now < state.get("next_check_at", 0):
                 return self._view(state, config, "waiting" if state.get("retry_without_blocking") else "blocked", state.get("blocked_reason") or
                     "等待 API 请求预算恢复后重新检查保证金", blocks=not state.get("retry_without_blocking"))
@@ -890,8 +842,6 @@ class MarginBalancer:
                 if plan is None:
                     self._record_success(pair, state)
                     return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
-                from .pair_recovery import require_archived_orders_clear
-                require_archived_orders_clear(self.engine, pair)
                 for guard in (snapshot_guards or {}).values():
                     guard()
                 pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": now, "status": "submitting"}
@@ -999,10 +949,9 @@ class MarginBalancer:
             elif type(getattr(originals[side], "account_read_generation", None)) is not int:
                 replacements.append(side)
         if replacements:
-            # Reuse the ordinary 15s mode cache; account events still invalidate
-            # it. Every read gets a new generation-checked balance/position view.
+            # Funds reads do not depend on trading modes, positions or markets.
             with ThreadPoolExecutor(max_workers=len(replacements), thread_name_prefix="margin-read") as pool:
-                reads = {side: pool.submit(brokers[side].snapshot, [pair.get("symbol", "XAUUSD1")], fresh_modes=False)
+                reads = {side: pool.submit(brokers[side].transfer_snapshot)
                          for side in replacements}
                 originals.update({side: future.result() for side, future in reads.items()})
         for side in brokers:
@@ -1028,46 +977,8 @@ class MarginBalancer:
         self._check_snapshots(pair, originals)
         return originals, require_current
 
-    @staticmethod
-    def _newer_occupied(snapshot, payload, asset):
-        rows = LiveBroker._position_rows(payload.get("positions"))
-        for row in rows.values():
-            leverage = dec(row.get("leverage"))
-            if leverage != leverage.to_integral_value() or not 1 <= leverage <= 125 or type(row.get("isolated")) is not bool:
-                raise TradingError("账户持仓杠杆或保证金模式字段无效，禁止划转")
-        positions = {(position.symbol, position.side): position for position in snapshot.positions}
-        if len(positions) != len(snapshot.positions):
-            raise TradingError("账户快照包含重复持仓，禁止划转")
-        if any(dec(row["positionAmt"]) and key not in positions for key, row in rows.items()):
-            raise TradingError("账户持仓在划转检查期间变化，等待新快照")
-        occupied = Fraction(0)
-        for key, position in positions.items():
-            row = rows.get(key)
-            if row is None:
-                if position.qty:
-                    raise TradingError("账户持仓在划转检查期间变化，等待新快照")
-                continue
-            if (dec(row["positionAmt"]).copy_abs() != position.qty
-                    or dec(row.get("leverage")) != position.leverage
-                    or type(row.get("isolated")) is not bool or row["isolated"] != position.isolated):
-                raise TradingError("账户持仓、杠杆或保证金模式在划转检查期间变化，等待新快照")
-            margin = position.occupied_margin_exact
-            if "markPrice" in row:
-                margin = max(margin, Fraction(position.qty) * Fraction(positive(row["markPrice"], True)) / position.leverage)
-            for field in ("initialMargin", "positionInitialMargin"):
-                if field in row:
-                    margin = max(margin, Fraction(positive(row[field], True)))
-            occupied += margin
-        # Newer exchange-reported occupation may rise without a user event
-        # (mark price movement). It must never increase transferable risk room.
-        for field in ("initialMargin", "positionInitialMargin"):
-            if field in asset:
-                occupied = max(occupied, Fraction(positive(asset[field], True)))
-        return occupied
-
     def _live(self, pair, members, snapshots, state, config, snapshot_guards=None):
-        # New transfers, including archived-order guards whose query method
-        # requests recovery priority, may never spend the recovery reserve.
+        # New transfers may never spend the recovery reserve.
         with ExitStack() as ordinary:
             seen = set()
             for member in members.values():
@@ -1090,13 +1001,9 @@ class MarginBalancer:
             listing = api.call("GET", "/fapi/v3/getSubAccountList", signed=True, weight=5)
             accounts = self._account_rows(members)
             self._verify(listing, children, accounts)
-            available, occupied, wallets = {}, {}, {}
+            available, wallets = {}, {}
             for side, payload in accounts.items():
-                rows = payload.get("assets")
-                assets = [row for row in rows if isinstance(row, dict) and row.get("asset") == "USD1"] if isinstance(rows, list) else []
-                if len(assets) != 1 or payload.get("canTrade") is not True:
-                    raise TradingError("账户缺少唯一的 USD1 资产或交易权限")
-                asset = assets[0]
+                asset = LiveBroker._account_asset(payload)
                 # ACCOUNT_UPDATE.wb is total wallet balance, not available or
                 # cross-wallet balance. Missing/invalid REST values disable
                 # this optional evidence path without inventing a baseline.
@@ -1105,36 +1012,24 @@ class MarginBalancer:
                 except TradingError:
                     pass
                 available[side] = positive(asset.get("maxWithdrawAmount"), True)
-                occupied[side] = self._newer_occupied(snapshots[side], payload, asset)
-                # Prices can move between two reads. Use the newer cash balance
-                # and the LOWER equity / HIGHER maintenance, never demand exact
-                # equality that would prevent transfers in a moving market.
-                equity = (dec(asset["marginBalance"]) if "marginBalance" in asset else
-                          dec(asset.get("crossWalletBalance")) + dec(asset.get("crossUnPnl")))
+                # Re-read the actual withdrawal ceiling and available balances
+                # immediately before planning. No position matching is needed.
+                _, _, equity = LiveBroker._transfer_wallet_equity(asset)
                 snapshots = {**snapshots, side: replace(snapshots[side], available=dec(asset.get("availableBalance")),
-                    equity=min(snapshots[side].equity, equity),
-                    maintenance=max(snapshots[side].maintenance, positive(asset.get("maintMargin"), True)))}
+                    equity=equity)}
             self._check_snapshots(pair, snapshots)
             require_current()
             diagnostics = {}
-            plan = self._plan(pair, members, snapshots, config, available,
-                occupied_floors=occupied, diagnostics=diagnostics)
+            plan = self._plan(pair, members, snapshots, config, available, diagnostics=diagnostics)
             if plan is None:
                 self._record_success(pair, state)
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
-            before_at = time.time()
-            before = self._income(members, int((before_at - 90) * 1000), int(before_at * 1000))
-            # This pair submits market orders. Pending batches are gated by
-            # PairTrader; archived orders are checked by their original IDs.
-            # Fresh account availability/withdrawal limits include reserved funds.
-            from .pair_recovery import require_archived_orders_clear
-            require_archived_orders_clear(self.engine, pair)
+            # The fresh exchange withdrawal limit includes reserved funds;
+            # trading recovery and archived orders cannot gate this transfer.
             require_current()
             created = time.time()
             pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": created, "status": "submitting",
-                "identity": self._fingerprint(pair, members, children, master),
-                "before_receipts": {side: [[row["incomeType"], _identifier(row.get("tranId"))] for row in rows
-                    if row.get("incomeType") in TRANSFER_TYPES and _identifier(row.get("tranId"))] for side, rows in before.items()}}
+                "identity": self._fingerprint(pair, members, children, master)}
             checkpoints = {}
             for side, wallet in wallets.items():
                 checkpoint = getattr(self.engine.broker(members[side]), "transfer_ws_checkpoint", None)

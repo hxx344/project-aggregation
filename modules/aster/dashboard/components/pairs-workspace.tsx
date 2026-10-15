@@ -51,6 +51,7 @@ import {
   pairExecutionPhaseLabel,
   pairHasPending,
   pairMarginStatus,
+  pairMarginOnly,
   pairNetQuantity,
   pairPhaseLabel,
   pairSnapshotStatus,
@@ -58,6 +59,7 @@ import {
   pairTransferStatus,
   parsePairDraft,
   type Pair,
+  type PairBalance,
   type PairSnapshot,
   type PairTransfer,
 } from '@/lib/pairs';
@@ -123,9 +125,7 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
             两子账户配对
             {pair ? ` · ${pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol}` : ''}
           </h2>
-          <p className="muted">
-            A 固定只多 · B 固定只空 · 共同执行与独立风险核验
-          </p>
+          <p className="muted">两子账户共同交易 · 保证金余额独立平衡</p>
         </div>
         <div className="account-controls">
           {pair ? (
@@ -345,6 +345,10 @@ function PairDetail({
   const draft = useAccountDraft(pair.id, pairDraft(pair));
   const [deleteOpen, setDeleteOpen] = useState(false);
   const snapshots = pair.state?.snapshots;
+  const marginOnly = pairMarginOnly(pair);
+  const displayedBalances = marginOnly
+    ? (pair.state?.margin_balances ?? snapshots)
+    : snapshots;
   const symbol = pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
   const long = accounts.find((account) => account.id === pair.long_account_id);
   const short = accounts.find(
@@ -354,8 +358,8 @@ function PairDetail({
   const scheduledMarginWait = pairScheduledMarginWait(pair, now, offline);
   const fresh =
     pairDataFresh(pair.state?.updated_at, now, offline) &&
-    pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
-    pairDataFresh(snapshots?.short?.timestamp, now, offline);
+    pairDataFresh(displayedBalances?.long?.timestamp, now, offline) &&
+    pairDataFresh(displayedBalances?.short?.timestamp, now, offline);
   const net = pairNetQuantity(snapshots, symbol);
   const pending = pairHasPending(pair);
   const margin = pair.state?.margin;
@@ -424,7 +428,9 @@ function PairDetail({
               disabled={busy || offline || Boolean(startBlock)}
               title={
                 startBlock ||
-                '自动核对原订单与实际持仓；核验通过后保留实际平衡底仓，再按已保存配置启动'
+                (marginOnly
+                  ? '核验账户归属与余额后启动保证金平衡'
+                  : '自动核对原订单与实际持仓；核验通过后保留实际平衡底仓，再按已保存配置启动')
               }
               onClick={() => void action(`/api/pairs/${pair.id}/enable`)}
             >
@@ -492,7 +498,9 @@ function PairDetail({
           </p>
           {!pair.enabled ? (
             <p className="muted">
-              启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未知划转重新读取两侧余额后自动归档跳过，不再额外预留旧金额；其他未决请求或循环仓位仍须先恢复。
+              {marginOnly
+                ? '启动时核验两个账户的归属与 USD1 余额；之后按余额差自动平衡，持仓标的和方向不影响划转。已有订单和划转记录继续按原编号核对。'
+                : '启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未知划转重新读取两侧余额后自动归档跳过，不再额外预留旧金额；其他未决请求或循环仓位仍须先恢复。'}
             </p>
           ) : null}
         </div>
@@ -503,6 +511,8 @@ function PairDetail({
           symbol={symbol}
           account={long}
           snapshot={snapshots?.long}
+          balance={displayedBalances?.long}
+          marginOnly={marginOnly}
           now={now}
           offline={offline}
           baseLimit={pair.ordinary.margin_limit}
@@ -514,6 +524,8 @@ function PairDetail({
           symbol={symbol}
           account={short}
           snapshot={snapshots?.short}
+          balance={displayedBalances?.short}
+          marginOnly={marginOnly}
           now={now}
           offline={offline}
           baseLimit={pair.ordinary.margin_limit}
@@ -536,13 +548,15 @@ function PairDetail({
           </span>
         </div>
         <dl className="cycle-key-values">
-          <div>
-            <dt>{symbol} 净数量 · 多 − 空</dt>
-            <dd className={net !== null && Number(net) !== 0 ? 'amber' : ''}>
-              {net ?? '—'}
-            </dd>
-            <small>两子账户 {symbol} 实际仓位；缺失不按零计算</small>
-          </div>
+          {!marginOnly ? (
+            <div>
+              <dt>{symbol} 净数量 · 多 − 空</dt>
+              <dd className={net !== null && Number(net) !== 0 ? 'amber' : ''}>
+                {net ?? '—'}
+              </dd>
+              <small>两子账户 {symbol} 实际仓位；缺失不按零计算</small>
+            </div>
+          ) : null}
           <div>
             <dt>本轮循环状态</dt>
             <dd>
@@ -572,15 +586,19 @@ function PairDetail({
                   : '等待状态'}
             </dd>
             <small>
-              {pending
-                ? reservedTransferOnly
-                  ? pair.enabled
-                    ? '交易按新余额及预留金额继续检查；原划转保留，不重复或新增划转'
-                    : '可重新启动并核验账户；交易继续预留未知转出金额'
-                  : !pair.enabled && !pairStartRecoveryBlock(pair)
-                    ? '可直接点击启动自动核对；原单全部结束后，保留已核验的实际平衡底仓'
-                    : '结果未明时停止新增，继续核对原订单与恢复状态'
-                : '单侧异常时由配对组统一处理'}
+              {marginOnly
+                ? pending
+                  ? '保证金管理可独立启动；已有请求继续核对，划转按最新余额单独评估'
+                  : '按两个账户的 USD1 可用余额独立平衡'
+                : pending
+                  ? reservedTransferOnly
+                    ? pair.enabled
+                      ? '交易按新余额及预留金额继续检查；原划转保留，不重复或新增划转'
+                      : '可重新启动并核验账户；交易继续预留未知转出金额'
+                    : !pair.enabled && !pairStartRecoveryBlock(pair)
+                      ? '可直接点击启动自动核对；原单全部结束后，保留已核验的实际平衡底仓'
+                      : '结果未明时停止新增，继续核对原订单与恢复状态'
+                  : '单侧异常时由配对组统一处理'}
             </small>
           </div>
         </dl>
@@ -724,13 +742,11 @@ function PairDetail({
             </dd>
           </div>
           <div>
-            <dt>转出侧风险与现金缓冲</dt>
+            <dt>转出侧现金保留</dt>
             <dd>
-              编组基础上限 {pct(pair.ordinary.margin_limit)} 扣减{' '}
-              {fmt(Number(pair.margin.buffer_ratio) * 100)} 个百分点
+              正权益 × {pct(pair.margin.buffer_ratio)}
               <small>
-                不含普通高杠杆或循环额外的 5 个百分点； 可用余额保留 ≥ 当前权益
-                × {pct(pair.margin.buffer_ratio)}
+                按交易所可划额度平衡 USD1 可用余额，与持仓标的和开仓占用上限无关
               </small>
             </dd>
           </div>
@@ -883,6 +899,8 @@ function PairSide({
   symbol,
   account,
   snapshot,
+  balance,
+  marginOnly,
   now,
   offline,
   baseLimit,
@@ -893,12 +911,50 @@ function PairSide({
   symbol: string;
   account?: Account;
   snapshot?: PairSnapshot | null;
+  balance?: PairBalance | null;
+  marginOnly: boolean;
   now: number;
   offline: boolean;
   baseLimit: string;
   cycle: boolean;
   scheduledWait: boolean;
 }) {
+  if (marginOnly) {
+    const fresh = pairDataFresh(balance?.timestamp, now, offline);
+    return (
+      <section
+        className="panel pair-side"
+        aria-label={side === 'long' ? 'A 账户保证金' : 'B 账户保证金'}
+      >
+        <div className="section-head">
+          <div>
+            <h2>
+              {side === 'long' ? 'A' : 'B'} · {account?.name ?? '账户待确认'}
+            </h2>
+            <p className={!fresh && !scheduledWait ? 'amber' : 'muted'}>
+              {scheduledWait
+                ? '上次余额检查'
+                : fresh
+                  ? '余额已更新'
+                  : '等待余额检查'}{' '}
+              · {clock(balance?.timestamp)}
+            </p>
+          </div>
+        </div>
+        <dl className="pair-risk-values">
+          <div>
+            <dt>权益 · USD1</dt>
+            <dd>{fmt(balance?.equity)}</dd>
+          </div>
+          <div>
+            <dt>可用 · USD1</dt>
+            <dd>{fmt(balance?.available)}</dd>
+          </div>
+        </dl>
+        <p className="muted">按账户可用余额平衡，不限制持仓标的和方向。</p>
+      </section>
+    );
+  }
   const fresh = pairDataFresh(snapshot?.timestamp, now, offline);
   const positions = snapshot?.positions.filter(
     (position) => position.symbol === symbol && Number(position.qty) !== 0,

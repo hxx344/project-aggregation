@@ -49,7 +49,8 @@ class OfflineAPI:
             return {"canTrade": True, "positions": positions,
                     "assets": [{"asset": "USD1", "crossWalletBalance": wire(snapshot.wallet),
                                 "crossUnPnl": wire(snapshot.unrealized), "maintMargin": wire(snapshot.maintenance),
-                                "availableBalance": wire(snapshot.available)}]}
+                                "availableBalance": wire(snapshot.available),
+                                "maxWithdrawAmount": wire(max(dec(0), snapshot.available))}]}
         if path == "/fapi/v3/positionRisk":
             return [{**row, "marginType": "cross", "unRealizedProfit": row["unrealizedProfit"],
                      "liquidationPrice": "0"} for row in positions]
@@ -131,7 +132,7 @@ class PairBudgetTests(TestCase):
         legs = self.legs()
         # Even a caller's ambient priority cannot leak to newly spawned workers.
         with self.budget.reconciliation():
-            self.trader._dispatch(self.pair, runtime_default(), self.brokers, legs)
+            self.trader._dispatch(self.pair, {**runtime_default(), "pending": {"legs": legs}}, self.brokers, legs)
         self.assertTrue(all(leg["receipt"]["local_not_sent"] for leg in legs))
         self.assertEqual(self.budget.snapshot()["used"], 1500)
         self.assertFalse(any(broker.api.calls for broker in self.brokers.values()))
@@ -186,7 +187,8 @@ class PairBudgetTests(TestCase):
                 with self.assertRaises(RequestNotSent):
                     self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
                 legs = self.legs(reducing=True)
-                self.trader._dispatch(self.pair, runtime_default(), self.brokers, legs, reconciliation=True)
+                self.trader._dispatch(self.pair, {**runtime_default(), "pending": {"repairs": legs}},
+                                      self.brokers, legs, reconciliation=True)
                 self.assertTrue(all(leg["receipt"]["local_not_sent"] for leg in legs))
                 self.assertFalse(any(broker.api.calls for broker in self.brokers.values()))
 

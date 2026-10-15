@@ -10,6 +10,7 @@ import {
   pairExecutionPhaseLabel,
   pairHasPending,
   pairMarginStatus,
+  pairMarginOnly,
   pairNetQuantity,
   pairPhaseLabel,
   pairSnapshotStatus,
@@ -17,6 +18,27 @@ import {
   pairTransferStatus,
   parsePairDraft,
 } from '../lib/pairs.ts';
+
+test('funds-only activation keeps pending recovery separate from trading activation', () => {
+  const fixture = {
+    ordinary: { enabled: false },
+    cycle: { enabled: false },
+    margin: { enabled: true },
+    state: {
+      pending: { kind: 'leverage' },
+      progress: { quantities: { LONG: '7' } },
+      margin: { status: 'unknown', pending: { request_id: 'original' } },
+    },
+  };
+  assert.equal(pairMarginOnly(fixture), true);
+  assert.equal(pairStartRecoveryBlock(fixture), '');
+  assert.match(pairConfigurationLock(fixture), /待核对/);
+  assert.match(pairDeletionBlock(fixture, 100), /等待确认/);
+  assert.match(
+    pairStartRecoveryBlock({ ...fixture, ordinary: { enabled: true } }),
+    /待核对/,
+  );
+});
 
 test('transfer submission is distinct from order submission and margin checks need no pending transfer', () => {
   assert.equal(pairPhaseLabel('submitting'), '并行提交两侧市价单');

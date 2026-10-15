@@ -16,6 +16,41 @@ const pausedStaleText =
   '两侧数据未齐或已过期，当前数值仅作最近记录。 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。';
 const offlineText = '连接中断，保留最近记录。 等待有效快照后才能新增开仓。';
 
+test('funds-only status uses balance freshness without inventing position snapshots', () => {
+  const fixture = marginPair();
+  fixture.state.snapshots = {};
+  fixture.state.margin_balances = {
+    long: { timestamp: 110, available: '120', equity: '300' },
+    short: { timestamp: 110, available: '80', equity: '100' },
+  };
+  assert.equal(
+    pairStatusNotices(fixture, 111).some((notice) => notice.kind === 'data'),
+    false,
+  );
+  fixture.state.updated_at = 120;
+  assert.ok(pairScheduledMarginWait(fixture, 120));
+  fixture.state.updated_at = 110;
+  const stale = pairStatusNotices(fixture, 140).filter(
+    (notice) => notice.kind === 'data',
+  );
+  assert.equal(stale.length, 1);
+  assert.match(stale[0].text, /余额检查/);
+  assert.doesNotMatch(stale[0].text, /开仓|底仓/);
+  assert.equal(pairScheduledMarginWait(fixture, 140), null);
+});
+
+test('funds-only pending recovery does not describe strategy matching as a start prerequisite', () => {
+  const fixture = marginPair();
+  fixture.enabled = false;
+  fixture.state.pending = { kind: 'leverage', id: 'old' };
+  fixture.state.reason = '旧请求仍在核对';
+  const text = pairStatusNotices(fixture, 111)
+    .map((notice) => notice.text)
+    .join('\n');
+  assert.match(text, /可启动保证金管理/);
+  assert.doesNotMatch(text, /全部结束且账户检查通过后|完成后才能启动/);
+});
+
 test('paused unknown transfer explains reserved restart even when displayed snapshots are stale', () => {
   const fixture = pair(
     {

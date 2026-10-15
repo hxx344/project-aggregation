@@ -29,6 +29,7 @@ class FakeAccountAPI:
         self.rows = []
         self.account = {"accountId": account_id, "canTrade": True, "assets": [{"asset": "USD1",
             "availableBalance": str(wallet), "maxWithdrawAmount": str(wallet), "marginBalance": str(wallet),
+            "walletBalance": str(wallet), "crossWalletBalance": str(wallet), "crossUnPnl": "0",
             "maintMargin": "0"}], "positions": []}
 
     def call(self, method, path, params=None, **kwargs):
@@ -101,6 +102,7 @@ class PairMarginTests(unittest.TestCase):
                 return current
             self.brokers[side].snapshot = fresh
             self.brokers[side].margin_snapshot = fresh
+            self.brokers[side].transfer_snapshot = lambda side=side: self.brokers[side].margin_snapshot([])
         self.listing = [{"accountId": 1, "parentAccount": True},
             {"accountId": 10, "parentAccount": False, "sourceAddr": self.creds["ASTER_LONG"]["user"]},
             {"accountId": 20, "parentAccount": False, "sourceAddr": self.creds["ASTER_SHORT"]["user"]}]
@@ -133,6 +135,12 @@ class PairMarginTests(unittest.TestCase):
                         asset = owner.brokers[side].api.account["assets"][0]
                         for field in ("marginBalance", "availableBalance"):
                             asset[field] = str(dec(asset[field]) + dec(persisted["amount"]) * sign)
+                        for field in ("walletBalance", "crossWalletBalance"):
+                            try:
+                                wallet = dec(asset.get(field))
+                            except TradingError:
+                                continue
+                            asset[field] = str(wallet + dec(persisted["amount"]) * sign)
                 return copy.deepcopy(owner.response)
 
         for target, value in (("credentials_for", lambda prefix: copy.deepcopy(self.creds[prefix])),
@@ -218,8 +226,13 @@ class PairMarginTests(unittest.TestCase):
         snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(100), dec(100), 3)]
         snapshots["short"].available = dec(0)
         plan = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
-        self.assertLessEqual(dec(plan["amount"]), dec("25.92592593"))
-        self.assertLessEqual(snapshots["long"].occupied_margin / (dec(100) - dec(plan["amount"])), dec("0.45"))
+        self.assertEqual(plan["amount"], "50.00000000")
+        config["threshold"] = "0"
+        snapshots["long"].available = dec("5.999999999")
+        self.assertIsNone(self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0}))
+        snapshots["long"].available = dec("6")
+        self.assertEqual(self.balancer._plan(self.pair, self.members, snapshots, config,
+            {"long": 100, "short": 0})["amount"], "1.00000000")
 
     def test_transfer_precheck_threshold_and_minimum_boundaries_are_exact(self):
         cases = [
@@ -286,11 +299,12 @@ class PairMarginTests(unittest.TestCase):
 
     def test_no_transfer_reason_keeps_combined_safety_constraints_after_plan(self):
         snapshots = self.snapshots()
-        snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(15000), dec(15000), 10)]
+        snapshots["long"].available = dec("150.999999999")
+        snapshots["short"].available = dec(0)
         before = {side: self.store.get("paper:" + side)["wallet"] for side in self.members}
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "waiting", result)
-        self.assertIn("两侧可用余额差 2000 USD1", result["reason"])
+        self.assertIn("两侧可用余额差 150.999999999 USD1", result["reason"])
         self.assertIn("共同约束", result["reason"])
         self.assertIn("低于最小划转额 1 USD1", result["reason"])
         self.assertFalse(result["blocks_trading"])
@@ -314,15 +328,15 @@ class PairMarginTests(unittest.TestCase):
         self.assertEqual(self.master_calls, [("GET", "/fapi/v3/getSubAccountList")])
         for broker in self.brokers.values():
             self.assertEqual([path for _, path, _ in broker.api.calls],
-                ["/fapi/v3/accountWithJoinMargin", "/fapi/v3/income"])
+                ["/fapi/v3/accountWithJoinMargin"])
         self.assertEqual(len(self.transfers), 1)
 
     def test_balanced_precheck_still_rejects_stale_invalid_or_revoked_snapshots(self):
         snapshots = self.live()
         snapshots["long"].available = snapshots["short"].available
         cases = [replace(snapshots["long"], timestamp=time.time() - 30),
-                 replace(snapshots["long"], hedge_mode=False),
-                 replace(snapshots["long"], available=dec("1000"), open_orders=[{"orderId": "external"}])]
+                 replace(snapshots["long"], available=Decimal("NaN")),
+                 replace(snapshots["long"], equity=Decimal("Infinity"))]
         for changed in cases:
             with self.subTest(changed=changed):
                 self.ready()
@@ -358,27 +372,27 @@ class PairMarginTests(unittest.TestCase):
                     self.assertIsNone(result["pending"])
                     self.assertEqual(self.refreshed[-2:], ["long", "short"])
 
-    def test_transfer_uses_pair_limit_independently_of_member_limit(self):
-        self.pair["ordinary"] = {"margin_limit": "0.3"}
+    def test_transfer_ignores_group_and_member_opening_limits(self):
         snapshots = {"long": snapshot(100), "short": snapshot(0)}
-        snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(100), dec(100), 5)]
+        snapshots["long"].positions = [Position("BTCUSD1", "SHORT", dec(100), dec(1000), dec(1000), 1, isolated=True)]
+        snapshots["long"].maintenance = dec(10000)
         config = validate_margin(self.pair["margin"])
-        plan = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
-        self.assertEqual(plan["amount"], "20.00000000")
-        self.pair["ordinary"]["margin_limit"] = "0.8"
-        for legacy_limit in ("0.1", "0.3", "0.5", "1"):
-            with self.subTest(legacy_limit=legacy_limit):
-                self.members["long"]["policy"]["margin_limit"] = legacy_limit
-                plan = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
-                self.assertEqual(plan["amount"], "50.00000000")
+        for ordinary in (None, {}, {"margin_limit": "0"}, {"margin_limit": "NaN"},
+                         {"margin_limit": "0.05"}, {"margin_limit": "0.3"}, {"margin_limit": "1.01"}):
+            for legacy_limit in ("0.1", "0.5", "1"):
+                with self.subTest(ordinary=ordinary, legacy_limit=legacy_limit):
+                    self.pair["ordinary"] = ordinary
+                    self.members["long"]["policy"]["margin_limit"] = legacy_limit
+                    plan = self.balancer._plan(self.pair, self.members, snapshots, config, {"long": 100, "short": 0})
+                    self.assertEqual(plan["amount"], "50.00000000")
 
-    def test_live_transfer_in_both_directions_obeys_only_group_limit(self):
+    def test_live_transfer_in_both_directions_ignores_opening_configuration(self):
         for source, destination in (("long", "short"), ("short", "long")):
-            for group_limit in ("0.6", "0.95"):
+            for group_limit in (None, "0.01", "0.6", "0.95"):
                 with self.subTest(source=source, group_limit=group_limit):
                     snapshots = self.live()
                     self.store.put("pair_margin:gold", {})
-                    self.pair["ordinary"]["margin_limit"] = group_limit
+                    self.pair["ordinary"] = None if group_limit is None else {"margin_limit": group_limit}
                     self.pair["margin"]["buffer_ratio"] = "0.01"
                     for side, equity, available in ((source, 3000, 900), (destination, 1000, 100)):
                         snapshots[side] = snapshot(equity)
@@ -386,44 +400,83 @@ class PairMarginTests(unittest.TestCase):
                         snapshots[side].account_read_generation = 0
                         self.brokers[side].api.account["assets"][0].update(marginBalance=str(equity),
                             availableBalance=str(available), maxWithdrawAmount=str(available))
-                    snapshots[source].positions = [Position("XAUUSD1", source.upper(), dec(105), dec(100), dec(100), 5)]
-                    self.brokers[source].api.account["positions"] = [{"symbol": "XAUUSD1", "positionSide": source.upper(),
-                        "positionAmt": "105", "leverage": "5", "isolated": False, "positionInitialMargin": "2100"}]
+                    snapshots[source].positions = [Position("BTCUSD1", "BOTH", dec(105), dec(100), dec(100), 5, isolated=True)]
+                    snapshots[source].maintenance = dec(10000)
+                    self.brokers[source].api.account["positions"] = [{"symbol": "BTCUSD1", "positionSide": "BOTH",
+                        "positionAmt": "105", "leverage": "5", "isolated": True, "positionInitialMargin": "99999"}]
                     result = self.balancer.tick(self.pair, snapshots)
-                    if group_limit == "0.6":
-                        self.assertEqual(result["status"], "waiting", result)
-                        self.assertIn("划转后占用上限 59.00%", result["reason"])
-                        self.assertEqual(self.transfers, [])
-                    else:
-                        self.assertEqual(result["status"], "acknowledged", result)
-                        self.assertEqual(result["plan"], {"source": source, "destination": destination, "amount": "400.00000000"})
-                        self.assertEqual(len(self.transfers), 1)
-                        self.assertEqual(self.transfers[0][2]["fromAccountAddress"], self.creds["ASTER_" + source.upper()]["user"])
+                    self.assertEqual(result["status"], "acknowledged", result)
+                    self.assertEqual(result["plan"], {"source": source, "destination": destination, "amount": "400.00000000"})
+                    self.assertEqual(len(self.transfers), 1)
+                    self.assertEqual(self.transfers[0][2]["fromAccountAddress"], self.creds["ASTER_" + source.upper()]["user"])
 
-    def test_invalid_group_limit_never_falls_back_to_account_limit(self):
-        for ordinary in (None, {}, {"margin_limit": "0"}, {"margin_limit": "NaN"},
-                         {"margin_limit": "1.01"}, {"margin_limit": "0.05"}):
-            with self.subTest(ordinary=ordinary):
-                self.ready()
-                self.pair["ordinary"] = ordinary
-                result = self.balancer.tick(self.pair, self.snapshots())
-                self.assertEqual(result["status"], "blocked", result)
-                self.assertFalse(self.state().get("last_transfer"))
-                self.assertEqual(self.brokers["long"].state["wallet"], "3000")
-                self.assertEqual(self.brokers["short"].state["wallet"], "1000")
+    def test_live_balance_only_endpoints_allow_any_trading_configuration(self):
+        snapshots = self.live()
+        self.pair["symbol"] = "NOT_A_LISTED_SYMBOL"
+        self.pair.pop("ordinary")
+        self.store.put("pair_runtime:gold", {"recovery_watch": {"unrelated": "historical order"}})
+        for broker in self.brokers.values():
+            broker.transfer_snapshot = LiveBroker.transfer_snapshot.__get__(broker, LiveBroker)
+            broker.snapshot = lambda *args, **kwargs: self.fail("position snapshot is not a transfer dependency")
+            broker.margin_snapshot = lambda *args, **kwargs: self.fail("margin snapshot is not a transfer dependency")
+            broker.api.account["positions"] = [{"symbol": "UNRELATED", "positionSide": "BOTH", "isolated": True}]
+        result = self.balancer.tick(self.pair, snapshots, pending_orders=True)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertIsNone(result["pending"])
+        self.assertEqual(result["plan"]["amount"], "1000.00000000")
+        self.assertEqual(len(self.transfers), 1)
+        for broker in self.brokers.values():
+            self.assertTrue(all(path == "/fapi/v3/accountWithJoinMargin" for _, path, _ in broker.api.calls))
 
-    def test_wrong_direction_isolated_modes_pending_orders_and_staleness_block(self):
-        valid = self.snapshots()
-        changes = [replace(valid["long"], hedge_mode=False), replace(valid["long"], multi_assets=True),
-            replace(valid["long"], timestamp=time.time() - 30), replace(valid["long"], open_orders=[{"orderId": "external"}]),
-            replace(valid["long"], positions=[Position("XAUUSD1", "SHORT", dec(1), dec(10), dec(10), 5)]),
-            replace(valid["long"], positions=[Position("XAUUSD1", "LONG", dec(1), dec(10), dec(10), 5, isolated=True)])]
-        for changed in changes:
-            self.ready()
-            result = self.balancer.tick(self.pair, {**valid, "long": changed})
-            self.assertTrue(result["blocks_trading"])
-        self.assertEqual(self.balancer.tick(self.pair, valid, pending_orders=True)["status"], "waiting")
-        self.assertFalse(self.state().get("last_transfer"))
+    def test_unavailable_income_history_cannot_block_new_balance_transfer(self):
+        snapshots = self.live()
+        for broker in self.brokers.values():
+            original = broker.api.call
+
+            def account_only(method, path, *args, original=original, **kwargs):
+                if path.endswith("/income"):
+                    raise ExchangeError("transfer history is unavailable")
+                return original(method, path, *args, **kwargs)
+
+            broker.api.call = account_only
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertIsNone(result["pending"])
+        self.assertEqual(result["plan"]["amount"], "1000.00000000")
+        self.assertEqual(len(self.transfers), 1)
+        self.assertNotIn("before_receipts", self.state()["last_transfer"])
+
+    def test_trading_modes_positions_and_open_orders_do_not_block_transfer(self):
+        variants = {"hedge_mode": False, "multi_assets": True, "open_orders": [{"orderId": "external"}],
+            "opposite": [Position("XAUUSD1", "SHORT", dec(1), dec(10), dec(10), 5)],
+            "isolated": [Position("BTCUSD1", "BOTH", dec(1), dec(10), dec(10), 5, isolated=True)]}
+        for variant, value in variants.items():
+            with self.subTest(variant=variant):
+                snapshots = self.live()
+                self.store.put("pair_margin:gold", {})
+                setattr(snapshots["long"], "positions" if variant in {"opposite", "isolated"} else variant, value)
+                result = self.balancer.tick(self.pair, snapshots, pending_orders=True)
+                self.assertEqual(result["status"], "acknowledged", result)
+                self.assertEqual(result["plan"]["amount"], "1000.00000000")
+                self.assertEqual(len(self.transfers), 1)
+
+    def test_negative_recipient_equity_can_receive_available_balance(self):
+        snapshots = self.live()
+        snapshots["short"].equity = dec(-500)
+        snapshots["short"].available = dec(-100)
+        self.brokers["short"].api.account["assets"][0].update(marginBalance="-500", availableBalance="-100")
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertEqual(result["plan"], {"source": "long", "destination": "short", "amount": "1000.00000000"})
+        self.assertEqual(len(self.transfers), 1)
+
+    def test_stale_snapshot_still_blocks_without_mutation(self):
+        snapshots = self.live()
+        snapshots["long"].timestamp = time.time() - 30
+        result = self.balancer.tick(self.pair, snapshots, pending_orders=True)
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertEqual(self.master_calls, [])
+        self.assertEqual(self.transfers, [])
 
     def test_ownership_is_verified_by_address_or_authenticated_account_id(self):
         self.live()
@@ -630,6 +683,35 @@ class PairMarginTests(unittest.TestCase):
         self.assertIn("身份不一致", result["reason"])
         self.assertEqual(len(self.transfers), 1)
 
+    def test_symbol_change_does_not_change_new_transfer_identity(self):
+        snapshots = self.live()
+        self.refresh_error = ExchangeError("test balance refresh failure")
+        self.balancer.tick(self.pair, snapshots)
+        self.pair["symbol"] = "BTCUSD1"
+        self.refresh_error = None
+        self.ready()
+        result = MarginBalancer(self.engine).tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertIsNone(result["pending"])
+        self.assertEqual(len(self.transfers), 1)
+
+    def test_legacy_symbol_bound_pending_recovers_without_second_transfer(self):
+        snapshots = self.live()
+        self.refresh_error = ExchangeError("test balance refresh failure")
+        self.balancer.tick(self.pair, snapshots)
+        children = {side: self.creds["ASTER_" + side.upper()] for side in self.members}
+        state = self.state()
+        state["pending"]["identity"] = MarginBalancer._fingerprint(self.pair, self.members,
+            children, self.creds["ASTER_MASTER"], legacy=True)
+        state["last_transfer"] = copy.deepcopy(state["pending"])
+        self.store.put("pair_margin:gold", state)
+        self.refresh_error = None
+        self.ready()
+        result = MarginBalancer(self.engine).tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertIsNone(result["pending"])
+        self.assertEqual(len(self.transfers), 1)
+
     def test_explicit_not_sent_releases_pending_but_cools_down(self):
         snapshots = self.live()
         self.response = RequestNotSent("test admission")
@@ -700,12 +782,38 @@ class PairMarginTests(unittest.TestCase):
         self.assertTrue(all(not path.endswith("/openOrders") for broker in self.brokers.values()
                             for _, path, _ in broker.api.calls))
 
-    def test_fresh_balance_movement_uses_lower_equity_and_new_available(self):
+    def test_fresh_balance_movement_uses_latest_equity_and_available(self):
         snapshots = self.live()
         self.brokers["long"].api.account["assets"][0].update(availableBalance="2000", marginBalance="2000")
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "acknowledged")
         self.assertEqual(result["plan"]["amount"], "500.00000000")
+
+    def test_increased_latest_equity_increases_cash_reserve(self):
+        snapshots = self.live()
+        self.brokers["long"].api.account["assets"][0].update(availableBalance="1200", marginBalance="23000")
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertEqual(result["plan"]["amount"], "50.00000000")
+
+    def test_final_transfer_read_keeps_total_equity_scope_without_margin_balance(self):
+        for include_cross in (True, False):
+            with self.subTest(include_cross=include_cross):
+                snapshots = self.live()
+                self.store.put("pair_margin:gold", {})
+                self.response = AmbiguousOrder("test stop after observing submitted amount")
+                asset = self.brokers["long"].api.account["assets"][0]
+                asset.pop("marginBalance")
+                asset.update(walletBalance="23000", unrealizedProfit="0", availableBalance="1200")
+                if include_cross:
+                    asset.update(crossWalletBalance="2000", crossUnPnl="0")
+                else:
+                    asset.pop("crossWalletBalance")
+                    asset.pop("crossUnPnl")
+                result = self.balancer.tick(self.pair, snapshots)
+                self.assertEqual(result["status"], "unknown", result)
+                # 23,000 * 5% cash reserve leaves only 50, not half the 200 gap.
+                self.assertEqual(self.transfers[0][2]["amount"], "50.00000000")
 
     def test_no_new_http_reads_until_check_interval_after_failed_ownership(self):
         snapshots = self.live()
@@ -724,25 +832,24 @@ class PairMarginTests(unittest.TestCase):
         self.assertEqual(self.master_calls, [])
         self.assertEqual(self.transfers, [])
 
-    def test_account_events_during_each_http_stage_prevent_transfer(self):
+    def test_account_events_during_each_account_read_prevent_transfer(self):
         for side in ("long", "short"):
-            for endpoint in ("accountWithJoinMargin", "income"):
-                with self.subTest(side=side, endpoint=endpoint):
-                    snapshots = self.live()
-                    self.store.put("pair_margin:gold", {})
-                    original = self.brokers[side].api.call
+            with self.subTest(side=side):
+                snapshots = self.live()
+                self.store.put("pair_margin:gold", {})
+                original = self.brokers[side].api.call
 
-                    def changed(method, path, *args, **kwargs):
-                        response = original(method, path, *args, **kwargs)
-                        if path.endswith("/" + endpoint):
-                            self.brokers[side]._cycle_account_event("ACCOUNT_UPDATE")
-                        return response
+                def changed(method, path, *args, **kwargs):
+                    response = original(method, path, *args, **kwargs)
+                    if path.endswith("/accountWithJoinMargin"):
+                        self.brokers[side]._cycle_account_event("ACCOUNT_UPDATE")
+                    return response
 
-                    with patch.object(self.brokers[side].api, "call", side_effect=changed):
-                        result = self.balancer.tick(self.pair, snapshots)
-                    self.assertEqual(result["status"], "blocked")
-                    self.assertEqual(self.transfers, [])
-                    self.assertIsNone(self.state().get("pending"))
+                with patch.object(self.brokers[side].api, "call", side_effect=changed):
+                    result = self.balancer.tick(self.pair, snapshots)
+                self.assertEqual(result["status"], "blocked")
+                self.assertEqual(self.transfers, [])
+                self.assertIsNone(self.state().get("pending"))
 
     def test_event_after_intent_commit_is_definitively_not_sent(self):
         snapshots = self.live()
@@ -797,36 +904,36 @@ class PairMarginTests(unittest.TestCase):
         self.assertEqual(self.refreshed[2:], ["long", "short"])
         self.assertEqual(len(self.transfers), 1)
 
-    def test_hot_snapshot_reads_are_parallel_and_keep_event_revocation(self):
+    def test_balance_snapshot_reads_are_parallel_and_keep_event_revocation(self):
         snapshots = self.live()
         barrier = threading.Barrier(2, timeout=3)
-        modes = []
+        reads = []
         for side, broker in self.brokers.items():
             del snapshots[side].account_read_generation
-            original = broker.snapshot
+            original = broker.transfer_snapshot
 
-            def fresh(symbols, fresh_modes=False, side=side, original=original):
-                modes.append((side, fresh_modes))
-                current = original(symbols, fresh_modes=fresh_modes)
+            def fresh(side=side, original=original):
+                reads.append(side)
+                current = original()
                 barrier.wait()
                 if side == "short":
                     self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
                 return current
 
-            broker.snapshot = fresh
+            broker.transfer_snapshot = fresh
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "blocked")
-        self.assertCountEqual(modes, [("long", False), ("short", False)])
+        self.assertCountEqual(reads, ["long", "short"])
         self.assertEqual(self.transfers, [])
 
-    def test_candidate_margin_polling_reuses_mode_ttl_within_default_budget(self):
+    def test_candidate_margin_polling_reads_only_balances_within_default_budget(self):
         self.live()
         now = [1000.0]
         calls = []
         with patch("time.time", side_effect=lambda: now[0]), patch("time.monotonic", side_effect=lambda: now[0]):
             budget = RateBudget()
             for broker in self.brokers.values():
-                broker.snapshot = LiveBroker.snapshot.__get__(broker, LiveBroker)
+                broker.transfer_snapshot = LiveBroker.transfer_snapshot.__get__(broker, LiveBroker)
                 broker.api.budget = budget
                 broker.api.account["assets"][0].update(availableBalance="2000", marginBalance="2000",
                     maxWithdrawAmount="2000", crossWalletBalance="2000", crossUnPnl="0")
@@ -839,17 +946,6 @@ class PairMarginTests(unittest.TestCase):
                     weight = kwargs.get("weight", 1)
                     budget.reserve(weight)
                     calls.append((path, weight))
-                    if path.endswith("/positionSide/dual"):
-                        return {"dualSidePosition": True}
-                    if path.endswith("/multiAssetsMargin"):
-                        return {"multiAssetsMargin": False}
-                    if path.endswith("/positionRisk"):
-                        return [{"symbol": "XAUUSD1", "positionSide": side, "positionAmt": "0",
-                            "entryPrice": "0", "markPrice": "100", "leverage": "5", "marginType": "cross",
-                            "unRealizedProfit": "0", "liquidationPrice": "0"} for side in ("LONG", "SHORT")]
-                    if path.endswith("/leverageBracket"):
-                        return {"symbol": "XAUUSD1", "brackets": [{"notionalFloor": "0", "notionalCap": "10000000",
-                            "maintMarginRatio": "0.005", "cum": "0", "initialLeverage": 125}]}
                     return original(method, path, params, **kwargs)
 
                 broker.api.call = call
@@ -865,49 +961,46 @@ class PairMarginTests(unittest.TestCase):
                     result = self.balancer.tick(self.pair, {"long": snapshot(3000), "short": snapshot(1000)})
                     self.assertEqual(result["status"], "waiting", result)
                     now[0] += 5
-            self.assertEqual(sum(weight for _, weight in calls), 744)
-            self.assertEqual(sum(path.endswith("/positionSide/dual") for path, _ in calls), 8)
-            self.assertEqual(sum(path.endswith("/multiAssetsMargin") for path, _ in calls), 2)
+            self.assertEqual(sum(weight for _, weight in calls), 300)
+            self.assertEqual(sum(path.endswith("/accountWithJoinMargin") for path, _ in calls), 48)
+            self.assertEqual(sum(path.endswith("/getSubAccountList") for path, _ in calls), 12)
+            self.assertTrue(all(path.endswith(("/accountWithJoinMargin", "/getSubAccountList")) for path, _ in calls))
             self.assertEqual(self.transfers, [])
-
-            # A mode-changing event evicts the reused modes before the next read.
-            self.brokers["long"]._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
-            self.assertNotIn("dual", self.brokers["long"].cached_at)
-            self.assertNotIn("multi", self.brokers["long"].cached_at)
 
     def test_generationless_replacement_read_cannot_authorize_transfer(self):
         snapshots = self.live()
         del snapshots["long"].account_read_generation
-        self.brokers["long"].snapshot = lambda *args, **kwargs: snapshot(3000)
+        self.brokers["long"].transfer_snapshot = lambda: snapshot(3000)
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(self.transfers, [])
 
-    def test_new_account_positions_cannot_be_ignored_without_an_event(self):
+    def test_new_account_positions_do_not_block_balance_transfer_without_an_event(self):
         snapshots = self.live()
         self.brokers["long"].api.account["positions"] = [{"symbol": "XAUUSD1", "positionSide": "LONG",
             "positionAmt": "10", "leverage": "5", "isolated": False, "positionInitialMargin": "2000"}]
         result = self.balancer.tick(self.pair, snapshots)
-        self.assertEqual(result["status"], "blocked")
-        self.assertIn("持仓", result["reason"])
-        self.assertEqual(self.transfers, [])
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertEqual(result["plan"]["amount"], "1000.00000000")
+        self.assertEqual(len(self.transfers), 1)
 
-    def test_changed_or_missing_position_fields_never_authorize_transfer(self):
-        snapshots = self.live()
-        snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(100), dec(100), 5)]
+    def test_changed_or_missing_position_fields_are_not_balance_dependencies(self):
         valid = {"symbol": "XAUUSD1", "positionSide": "LONG", "positionAmt": "1", "leverage": "5", "isolated": False}
         cases = [[{**valid, "positionAmt": "2"}], [{**valid, "leverage": "10"}], [{**valid, "isolated": True}], [], None]
         cases.extend([[{key: value for key, value in valid.items() if key != missing}]
                       for missing in ("symbol", "positionSide", "positionAmt", "leverage", "isolated")])
         for rows in cases:
             with self.subTest(rows=rows):
-                self.ready()
+                snapshots = self.live()
+                self.store.put("pair_margin:gold", {})
+                snapshots["long"].positions = [Position("XAUUSD1", "LONG", dec(1), dec(100), dec(100), 5)]
                 self.brokers["long"].api.account["positions"] = rows
                 result = self.balancer.tick(self.pair, snapshots)
-                self.assertEqual(result["status"], "blocked")
-                self.assertEqual(self.transfers, [])
+                self.assertEqual(result["status"], "acknowledged", result)
+                self.assertEqual(result["plan"]["amount"], "1000.00000000")
+                self.assertEqual(len(self.transfers), 1)
 
-    def test_newer_exchange_occupation_limits_transfer_despite_unchanged_quantity(self):
+    def test_newer_exchange_occupation_does_not_replace_withdrawal_limit(self):
         for source in ("positionInitialMargin", "initialMargin", "markPrice", "asset"):
             with self.subTest(source=source):
                 snapshots = self.live()
@@ -921,7 +1014,7 @@ class PairMarginTests(unittest.TestCase):
                 self.brokers["long"].api.account["positions"] = [row]
                 result = self.balancer.tick(self.pair, snapshots)
                 self.assertEqual(result["status"], "acknowledged")
-                self.assertEqual(result["plan"]["amount"], "500.00000000")
+                self.assertEqual(result["plan"]["amount"], "1000.00000000")
                 self.assertEqual(len(self.transfers), 1)
 
 

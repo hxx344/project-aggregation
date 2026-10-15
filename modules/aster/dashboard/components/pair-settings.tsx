@@ -106,7 +106,7 @@ export function PairSettings({
         />
         <ConfigurationField
           id={`${formId}-pair-long`}
-          label="A · 只持多仓"
+          label={draft.mode === 'monitor' ? '子账户 A' : 'A · 只持多仓'}
           items={choices('long')}
           {...textField('long_account_id')}
           display={long?.name}
@@ -115,7 +115,7 @@ export function PairSettings({
         />
         <ConfigurationField
           id={`${formId}-pair-short`}
-          label="B · 只持空仓"
+          label={draft.mode === 'monitor' ? '子账户 B' : 'B · 只持空仓'}
           items={choices('short')}
           {...textField('short_account_id')}
           display={short?.name}
@@ -123,32 +123,35 @@ export function PairSettings({
           placeholder="选择子账户 B"
         />
         <p className="muted">
-          A 与 B 须属于同一主账户，方向固定。保留交易所 Hedge
-          Mode，仅核验；旧反向仓位需先处理。
+          {draft.mode === 'monitor'
+            ? 'A 与 B 须属于同一主账户。保证金平衡不限制持仓标的、方向或持仓模式。'
+            : 'A 与 B 须属于同一主账户，方向固定。保留交易所 Hedge Mode，仅核验；旧反向仓位需先处理。'}
         </p>
-        <ConfigurationField
-          id={`${formId}-pair-symbol`}
-          label="交易标的"
-          items={symbolChoices}
-          value={draft.symbol}
-          display={symbolConfig?.display_name ?? draft.symbol}
-          disabled={locked || !symbols.length}
-          onValueChange={(symbol) => {
-            const selected = symbols.find((item) => item.symbol === symbol);
-            if (selected)
-              setDraft(
-                selectPairSymbol(draft, selected, symbols, {
-                  applyDefaults: !editing,
-                }),
-              );
-          }}
-        >
-          <small>
-            {editing
-              ? '暂停后可切换标的；已手动持有的新标的仓位会核对并采纳为底仓，无需先平仓。保存后保持暂停，金额及其他设置保留。'
-              : '创建后保持暂停；之后可在设置中切换标的，并核对采纳已手动持有的目标标的仓位。'}
-          </small>
-        </ConfigurationField>
+        {draft.mode !== 'monitor' ? (
+          <ConfigurationField
+            id={`${formId}-pair-symbol`}
+            label="交易标的"
+            items={symbolChoices}
+            value={draft.symbol}
+            display={symbolConfig?.display_name ?? draft.symbol}
+            disabled={locked || !symbols.length}
+            onValueChange={(symbol) => {
+              const selected = symbols.find((item) => item.symbol === symbol);
+              if (selected)
+                setDraft(
+                  selectPairSymbol(draft, selected, symbols, {
+                    applyDefaults: !editing,
+                  }),
+                );
+            }}
+          >
+            <small>
+              {editing
+                ? '暂停后可切换标的；已手动持有的新标的仓位会核对并采纳为底仓，无需先平仓。保存后保持暂停，金额及其他设置保留。'
+                : '创建后保持暂停；之后可在设置中切换标的，并核对采纳已手动持有的目标标的仓位。'}
+            </small>
+          </ConfigurationField>
+        ) : null}
         <ConfigurationField
           id={`${formId}-pair-mode`}
           label="组执行模式"
@@ -307,19 +310,21 @@ export function PairSettings({
           </p>
         </fieldset>
       ) : null}
-      <ConfigurationField
-        id={`${formId}-pair-margin-limit`}
-        label="每侧基础保证金占用上限"
-        unit="%"
-        max="100"
-        {...textField('margin_percent')}
-        disabled={locked}
-      >
-        <small>
-          普通 5x 使用基础上限；普通 10x / 20x 与循环额外加 5 个百分点，最高
-          100%。
-        </small>
-      </ConfigurationField>
+      {draft.mode !== 'monitor' ? (
+        <ConfigurationField
+          id={`${formId}-pair-margin-limit`}
+          label="每侧基础保证金占用上限"
+          unit="%"
+          max="100"
+          {...textField('margin_percent')}
+          disabled={locked}
+        >
+          <small>
+            普通 5x 使用基础上限；普通 10x / 20x 与循环额外加 5 个百分点，最高
+            100%。
+          </small>
+        </ConfigurationField>
+      ) : null}
       <fieldset disabled={locked} className="cycle-form-grid">
         <legend>主账户核验与自动保证金平衡</legend>
         <div className="migration-toggle">
@@ -374,17 +379,15 @@ export function PairSettings({
         />
         <ConfigurationField
           id={`${formId}-pair-buffer`}
-          label="转出侧风险与现金缓冲"
-          unit="百分点 / %"
+          label="转出侧现金保留比例"
+          unit="%"
           max="100"
           {...textField('buffer_percent')}
           disabled={locked}
         >
           <small>
-            划转使用本编组的基础占用上限，再扣所填百分点；不含普通 10x / 20x
-            或循环额外的 5 个百分点。同时保留不少于转出侧当前权益 ×
-            此比例的可用余额。例如基础上限 90%、缓冲 5%，划转后占用率须不超过
-            85%。
+            转出后保留不少于转出侧正权益 × 此比例的可用余额。
+            实际可划金额以交易所返回的额度为准。
           </small>
         </ConfigurationField>
         <ConfigurationField
@@ -408,7 +411,8 @@ export function PairSettings({
           disabled={locked}
         />
         <p className="muted">
-          只填写凭据前缀，密钥由服务器读取。组启用且自动平衡开启时，包括「保证金管理（不开仓）」模式在内，均可触发划转。以两侧可用余额差的一半为平衡目标，并受可划金额、单次限额及风险与现金缓冲约束。未知结果只读核对，缺少可靠结果时保留待确认状态，不重复划转。
+          只填写凭据前缀，密钥由服务器读取。组启用且自动平衡开启后，以两侧 USD1
+          可用余额差的一半为平衡目标，遵循交易所可划额度、单次限额和现金保留比例。持仓标的、方向及开仓策略不影响保证金平衡。未知结果重新读取余额并保留原记录，不重复发送。
         </p>
       </fieldset>
       <div className="form-actions">
