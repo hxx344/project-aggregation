@@ -1,7 +1,13 @@
 // Run against the isolated local Next preview on port 3191 with Playwright CLI run-code --filename.
+// Also run: node modules/monitor/tests/gold-oil-chart-projector-server.mjs
 // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- CLI evaluates this function.
-async page => {
+async (page, options = {}) => {
   const check = (value, message) => { if (!value) throw Error(message); };
+  const projectChart = async input => {
+    const response = await page.request.post(options.projectorUrl ?? 'http://127.0.0.1:3192/project', { data: input });
+    check(response.ok(), `Chart projector fixture failed: ${response.status()}`);
+    return response.json();
+  };
   const now = Date.UTC(2026, 9, 7, 17, 15), start = now - 30 * 86400000, errors = [];
   let complete = false, fail = false;
   const common = { oilType: 'bz', source: 'Binance', status: 'live', fetchedAt: new Date(now).toISOString() };
@@ -15,12 +21,15 @@ async page => {
   await page.goto('about:blank'); await page.unrouteAll({ behavior: 'wait' });
   await page.clock.install({ time: new Date(now - 1000) }); await page.clock.pauseAt(new Date(now));
   await page.route('**/api/**', async route => {
-    const path = new URL(route.request().url()).pathname;
+    const url = new URL(route.request().url()), path = url.pathname;
     if (path === '/api/monitors') return route.fulfill({ json: { schemaVersion: 1, monitors: ['oil', 'cl-xau', 'hynix', 'perpetual'].map(id => ({ id, runtime: { available: false } })) } });
     const action = path.replace('/api/monitors/cl-xau/bz/', '');
     if (action === 'status') return route.fulfill({ json: { available: false, reason: 'isolated fixture' } });
-    if (!['quote', 'history', 'funding'].includes(action)) return route.fulfill({ status: 503, json: { error: 'unrelated fixture' } });
-    return route.fulfill(fail && action === 'funding' ? { status: 503, json: { error: 'fixture outage' } } : { json: action === 'quote' ? quote : action === 'history' ? history : funding() });
+    if (action === 'quote') return route.fulfill({ json: quote });
+    if (action !== 'chart') return route.fulfill({ status: 503, json: { error: 'unrelated fixture' } });
+    return route.fulfill({ json: await projectChart({ history, funding: fail ? null : funding(), oilType: 'bz',
+      range: url.searchParams.get('range'), errors: fail ? { fundingError: 'fixture outage' } : {},
+    }) });
   });
   try {
     await page.setViewportSize({ width: 1440, height: 1000 });

@@ -139,13 +139,15 @@ test('Bybit readers traverse all reverse pages beyond 1000 candles and 200 settl
     assert.ok(xauEvents.length > 200); assert.ok(xauEvents[0].time < now - 200 * 4 * HOUR);
     assert.equal(logs.filter(url => url.pathname.endsWith('instruments-info')).length, 2);
     logs.length = 0;
-    assert.deepEqual(await reader.history(), h); assert.deepEqual(await reader.funding(), f);
+    const refreshed = await reader.history();
+    assert.deepEqual(refreshed, { ...h, historyRepair: refreshed.historyRepair }); assert.deepEqual(await reader.funding(), f);
     assert.equal(logs.filter(url => url.pathname.endsWith('mark-price-kline')).length, 2);
     assert.equal(logs.filter(url => url.pathname.endsWith('funding/history')).length, 2);
     assert.ok(logs.every(url => Number(url.searchParams.get(url.pathname.endsWith('mark-price-kline') ? 'start' : 'startTime')) >= now - 2 * 24 * HOUR));
     logs.length = 0;
     const gap = structuredClone(h); gap.points.splice(20, 1); gap.points[10].oil = null; if (oilType === 'cl') gap.points[10].cl = null;
-    assert.deepEqual(await reader.history(gap), h);
+    const repaired = await reader.history(gap);
+    assert.deepEqual(repaired, { ...h, historyRepair: repaired.historyRepair });
     assert.equal(Math.min(...logs.map(url => Number(url.searchParams.get('start')))), gap.points[10].time);
     logs.length = 0;
     assert.equal((await reader.funding({ ...f, coverageStart: now - 24 * HOUR, points: f.points.filter(row => row.time >= now - 24 * HOUR) })).coverageStart, start);

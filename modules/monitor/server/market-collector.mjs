@@ -104,7 +104,7 @@ export function createMarketCollector(store, { jobs = marketJobs(), clock = Date
     pending.set(key, operation);
     return operation;
   }
-  function schedule(job) {
+  function schedule(job, initialDelay = 0) {
     const generation = generations.get(job.id);
     const tick = async () => {
       scheduled.delete(job);
@@ -113,7 +113,28 @@ export function createMarketCollector(store, { jobs = marketJobs(), clock = Date
       await collect(job);
       if (running && !disabled.has(job.id) && generations.get(job.id) === generation) scheduled.set(job, timers.setTimeout(tick, Math.max(1000, job.intervalMs - (clock() - started))));
     };
-    void tick();
+    if (initialDelay > 0) scheduled.set(job, timers.setTimeout(tick, initialDelay));
+    else void tick();
+  }
+  function startSchedules(selected) {
+    // Source time survives restarts. Saving or restarting must not renew a
+    // dataset's lifetime; failed/seeded reads still need an upstream refresh.
+    let saved;
+    try { saved = new Map(store.status().map(row => [row.key, row])); }
+    catch { saved = new Map(); }
+    const now = clock();
+    let goldHistorySlot = 0;
+    for (const job of selected) {
+      const quote = job.action === 'quote' || job.action.endsWith('/quote');
+      if (quote) { schedule(job); continue; }
+      const row = saved.get(`${job.id}/${job.action}`);
+      const remaining = row?.success_ms != null && !row.error && Number.isFinite(row.source_ms) && row.source_ms <= now
+        ? Math.max(0, job.intervalMs - (now - row.source_ms)) : 0;
+      // Separate the four markets' history/funding starts without delaying
+      // live quotes or imposing a shared lock on unrelated collectors.
+      const stagger = job.id === 'cl-xau' ? goldHistorySlot++ * 350 : 0;
+      schedule(job, remaining + stagger);
+    }
   }
   return {
     collect,
@@ -124,13 +145,13 @@ export function createMarketCollector(store, { jobs = marketJobs(), clock = Date
     },
     resume(id) {
       if (!disabled.delete(id)) return;
-      if (running) for (const job of jobs) if (job.id === id) schedule(job);
+      if (running) startSchedules(jobs.filter(job => job.id === id));
     },
     healthy: () => storageFailures.size === 0,
     start() {
       if (running) return;
       running = true;
-      for (const job of jobs) if (!disabled.has(job.id)) schedule(job);
+      startSchedules(jobs.filter(job => !disabled.has(job.id)));
     },
     async stop() { running = false; for (const timer of scheduled.values()) timers.clearTimeout(timer); scheduled.clear(); await Promise.all(pending.values()); },
   };

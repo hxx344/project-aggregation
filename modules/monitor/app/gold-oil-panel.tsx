@@ -3,7 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import Chart, { FundingChart } from './gold-oil-svg-chart';
-import { GOLD_OIL_STALE_MS, GOLD_OIL_INTERVAL_MS, GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, goldOilVariantKey, goldOilUnits, goldOilChartPoints, type GoldOilType, type GoldOilExchange, type GoldOilPoint } from '../lib/gold-oil';
+import { GOLD_OIL_STALE_MS, GOLD_OIL_INTERVAL_MS, GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, goldOilVariantKey, goldOilUnits, type GoldOilType, type GoldOilExchange, type GoldOilPoint } from '../lib/gold-oil';
 import { currentGoldOilFunding, analyzeAvailableGoldOilFunding, type GoldOilFundingHistory } from '../lib/gold-oil-funding';
 import { goldOilStatistics, sampleGoldOilPoints, adjacentRatioChange } from '../lib/gold-oil-analysis';
 import { goldOilSummary, summaryTimestamp, type SummaryProps } from '../lib/monitor-summary';
@@ -11,6 +11,7 @@ import { goldOilOverviewTrend, initialGoldOilMarket, type InitialMarketData } fr
 import { useGoldOilFeed } from '../hooks/use-gold-oil-feed';
 
 const ranges = [{ days: 1, label: '1 天' }, { days: 7, label: '1 周' }, { days: '1m' as const, label: '1 月' }, { days: 0, label: '全部' }];
+const noPoints: GoldOilPoint[] = [];
 const format = (value: number | null | undefined, digits = 3) => value == null ? '—' : value.toFixed(digits);
 const percent = (value: number | null | undefined, digits = 4) => value == null ? '—' : `${value > 0 ? '+' : ''}${(value * 100).toFixed(digits)}%`;
 const signed = (value: number | null | undefined) => value == null ? '—' : `${value > 0 ? '+' : ''}${value.toFixed(3)}`;
@@ -49,26 +50,28 @@ const GoldOilDetails = memo(function GoldOilDetails({ points, fundingByCandle, f
 });
 
 export default function GoldOilPanel({ initial, active = true, summaryActive = true, onSummary, oilType = 'cl', onOilTypeChange, exchange = 'binance', onExchangeChange }: SummaryProps & { initial?: InitialMarketData | null; active?: boolean; summaryActive?: boolean; oilType?: GoldOilType; onOilTypeChange?: (value: GoldOilType) => void; exchange?: GoldOilExchange; onExchangeChange?: (value: GoldOilExchange) => void }) {
-  const feed = useGoldOilFeed(initial, active, summaryActive, oilType, exchange), { quote, history, funding, quoteError, historyError, fundingError } = feed;
+  const [days, setDays] = useState<number | '1m'>(7);
+  const range = days === 0 ? 'all' : days === '1m' ? '1m' : days === 1 ? '1d' : '7d';
+  const feed = useGoldOilFeed(initial, active, summaryActive, oilType, exchange, range), { quote, chart, history, funding, quoteError, historyError, fundingError } = feed;
   const instrument = GOLD_OIL_INSTRUMENTS[oilType], source = GOLD_OIL_EXCHANGES[exchange].name, marketKey = goldOilVariantKey(oilType, exchange), units = goldOilUnits(oilType, exchange);
   const contractUrl = (symbol: string) => exchange === 'bybit' ? `https://www.bybit.com/trade/usdt/${symbol}` : `https://www.binance.com/en/futures/${symbol}`;
   const [hasOpened, setHasOpened] = useState(active);
   if (active && !hasOpened) setHasOpened(true);
   const [root, setRoot] = useState<ShadowRoot | null>(null), [styled, setStyled] = useState(false);
   const mount = useCallback((node: HTMLDivElement | null) => { if (node) setRoot(node.shadowRoot ?? node.attachShadow({ mode: 'open' })); }, []);
-  const [days, setDays] = useState<number | '1m'>(7), [view, setView] = useState<'ratio' | 'prices'>('ratio'), [fundingView, setFundingView] = useState<'annualized' | 'rate'>('annualized');
+  const [view, setView] = useState<'ratio' | 'prices'>('ratio'), [fundingView, setFundingView] = useState<'annualized' | 'rate'>('annualized');
   const [page, setPage] = useState(0), [cursor, setCursor] = useState<number | null>(null), [now, setNow] = useState(initial?.renderedAt ?? 0);
   const [selectionMarket, setSelectionMarket] = useState(marketKey);
   if (selectionMarket !== marketKey) { setSelectionMarket(marketKey); setPage(0); setCursor(null); }
   const seedTrend = initialGoldOilMarket(initial, oilType, exchange)?.trend;
-  const trend = useMemo(() => goldOilOverviewTrend(history, historyError, seedTrend, oilType, exchange), [history, historyError, seedTrend, oilType, exchange]);
+  const trend = useMemo(() => feed.trend ?? goldOilOverviewTrend(null, historyError, seedTrend, oilType, exchange), [feed.trend, historyError, seedTrend, oilType, exchange]);
   useEffect(() => { onSummary?.(goldOilSummary(quote, quoteError, trend, oilType, exchange)); }, [quote, quoteError, trend, onSummary, oilType, exchange]);
   useEffect(() => { if (!active) return; const timer = setInterval(() => setNow(Date.now()), 10_000); return () => clearInterval(timer); }, [active]);
-  const points = useMemo(() => goldOilChartPoints(history, days), [history, days]);
+  const points = history?.points ?? noPoints;
   const sampled = useMemo(() => sampleGoldOilPoints(points), [points]);
   const stats = useMemo(() => goldOilStatistics(points), [points]);
-  const allStats = useMemo(() => goldOilStatistics(history?.points ?? []), [history]);
-  const start = points[0]?.time ?? 0, end = (points.at(-1)?.time ?? -GOLD_OIL_INTERVAL_MS) + GOLD_OIL_INTERVAL_MS;
+  const allStats = chart?.fullHistory ?? null;
+  const start = chart?.window?.start ?? 0, end = chart?.window?.end ?? 0;
   const fees = useMemo(() => analyzeAvailableGoldOilFunding(funding, start, end), [funding, start, end]);
   const fundingByCandle = useMemo(() => {
     const map = new Map<number, { net: number; oil: number; xau: number }>();
@@ -111,7 +114,7 @@ export default function GoldOilPanel({ initial, active = true, summaryActive = t
 
       <section className="chart-panel panel" aria-label="金油比历史走势"><div className="chart-toolbar"><div className="view-tabs" role="group" aria-label="图表内容"><button aria-pressed={view === 'ratio'} onClick={() => setView('ratio')}>金油比走势</button><button aria-pressed={view === 'prices'} onClick={() => setView('prices')}>黄金 / 原油价格</button></div><div className="range-buttons" role="group" aria-label="时间范围">{ranges.map(range => <button key={range.days} aria-pressed={days === range.days} onClick={() => selectRange(range.days)}>{range.label}</button>)}</div></div>
         <div className="chart-layout"><div className="plot-section"><div className="plot-heading"><div><h2>{view === 'ratio' ? '黄金相对原油 · 金油比' : '黄金与原油标记价格'}</h2><p>{time(start || undefined)} — {time(end || undefined)} 北京时间</p></div><div className="chart-legend">{view === 'ratio' ? <><span><i className="legend-line brent"/>15 分钟金油比</span><span><i className="legend-line average"/>区间均值</span></> : <><span><i className="legend-line brent"/>黄金 · 左轴 USDT/盎司</span><span><i className="legend-line wti"/>原油 · 右轴 {units.oil}</span></>}</div></div>
-          <div className="gold-chart" aria-label={`${rangeLabel}金油比，${stats?.count ?? 0} 个有效样本`}>{stats && hasOpened ? <Chart oilType={oilType} exchange={exchange} points={sampled} view={view} average={stats.average}/> : <div className="gold-empty">{historyError ? '历史行情暂不可用' : history ? '所选区间暂无有效共同历史' : '正在读取共同历史，首次采集需要回补…'}</div>}</div>
+          <div className="gold-chart" aria-label={`${rangeLabel}金油比，${stats?.count ?? 0} 个有效样本`}>{stats && hasOpened ? <Chart oilType={oilType} exchange={exchange} points={sampled} view={view} average={stats.average}/> : <div className="gold-empty">{!history && chart?.state === 'pending' && !feed.chartError ? '历史数据尚未就绪，后台采集中…' : historyError ? '历史行情暂不可用' : history ? '所选区间暂无有效共同历史' : '正在读取所选区间历史…'}</div>}</div>
           {points.length > 0 && <><input className="gold-cursor" type="range" min={0} max={points.length - 1} value={Math.min(cursor ?? points.length - 1, points.length - 1)} onChange={event => setCursor(Number(event.target.value))} aria-label="按15分钟查看图表数值"/><output className="gold-cursor-reading" aria-live="polite">{selectedPoint && `${time(selectedPoint.time)} 北京时间 · 金油比 ${format(selectedPoint.ratio)} ${units.ratio} · 黄金 ${format(selectedPoint.xau, 2)} USDT/盎司 · 原油 ${format(selectedPoint.oil)} ${units.oil}`}</output></>}
           <div className="chart-footer"><span>触摸或方向键查看完整记录 · 缺失时段断线</span><span>有效样本 {stats?.count ?? 0} / {points.length}</span></div>
           {sampled.length < points.length && <p className="gold-range-unit">绘图保留极值与缺口，共 {sampled.length} 个点；统计、滑块和明细使用全部记录。</p>}
@@ -123,7 +126,7 @@ export default function GoldOilPanel({ initial, active = true, summaryActive = t
             <div className="gold-funding-chart">{fees.covered && fees.oilCount > 0 && fees.xauCount > 0 && fees.points.length && hasOpened ? <FundingChart oilType={oilType} exchange={exchange} points={fees.points} view={fundingView}/> : <div className="gold-empty">{fundingError ? '资金费历史暂不可用' : !funding ? '正在读取结算记录…' : '所选区间查询覆盖或两腿记录不足，年化暂不可用'}</div>}</div>
             <div className="chart-footer"><span>正值收款 · 负值付款</span><span>XAU {fees.xauCount} 次 · {instrument.code} {fees.oilCount} 次</span></div>
             <p className="funding-history-method">做空净结算率＝黄金实际结算率之和 ÷ 2 − 原油实际结算率之和 ÷ 2，做多取反。两腿结算时间与周期分别保留。年化＝累计净结算率 ÷ 实际统计区间日历小时 × 8,760；统计从所选起点开始，截止不晚于已查询时间。按 UTC 日汇总的曲线使用截至当日结束（或统计截止）的日历小时。不复利，不含价格盈亏。无记录不显示零费率，API 查询覆盖不等于保证交易所记录无缺失。</p>
-            <p className={`funding-history-status ${fundingStale ? 'gold-data-stale' : ''}`}>{funding ? `${fundingStale ? '更新中断 · 保留记录。' : ''}API 查询覆盖：${time(funding.coverageStart)} — ${time(funding.coverageEnd)} 北京时间。${fees.selectedCovered ? '已覆盖所选区间。' : '所选区间未完全覆盖。'}最后更新 ${summaryTimestamp(funding.fetchedAt)}。` : '等待资金费数据。'}</p>
+            <p className={`funding-history-status ${fundingStale ? 'gold-data-stale' : ''}`}>{funding ? `${fundingStale ? '更新中断 · 保留记录。' : ''}API 查询覆盖：${time(chart?.fundingSourceCoverage?.start ?? funding.coverageStart)} — ${time(chart?.fundingSourceCoverage?.end ?? funding.coverageEnd)} 北京时间。${fees.selectedCovered ? '已覆盖所选区间。' : '所选区间未完全覆盖。'}最后更新 ${summaryTimestamp(funding.fetchedAt)}。` : '等待资金费数据。'}</p>
           </section>
         </div><aside className="range-summary"><div className="summary-heading"><h3>区间速览</h3><span>{rangeLabel}</span></div><div className="summary-average"><p>平均金油比</p><div>{format(stats?.average)}</div><span>{units.ratio}</span></div><div className="summary-extremes"><div><span>最高金油比</span><strong>{format(stats?.max.ratio)}</strong><small>{time(stats?.max.time)}</small></div><div><span>最低金油比</span><strong>{format(stats?.min.ratio)}</strong><small>{time(stats?.min.time)}</small></div></div><div className="range-track" aria-hidden="true"><span style={{ left: `${stats?.position ?? 50}%` }}/></div><p className="range-description">末值 {format(stats?.last.ratio)} · 区间变化 {signed(stats?.change)} {units.ratio}</p><div className="summary-note"><span className="note-symbol">↗</span><p>比值上升表示黄金相对原油走强；比值下降表示原油相对黄金走强。</p></div></aside></div>
       </section>

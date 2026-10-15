@@ -1,7 +1,13 @@
 // Requires tests/gold-oil-loading-server.mjs on localhost:3190 after a production build.
+// Also run: node modules/monitor/tests/gold-oil-chart-projector-server.mjs
 // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- Playwright CLI evaluates this function.
-async page => {
+async (page, options = {}) => {
   const check = (value, message) => { if (!value) throw Error(message); };
+  const projectChart = async input => {
+    const response = await page.request.post(options.projectorUrl ?? 'http://127.0.0.1:3192/project', { data: input });
+    check(response.ok(), `Chart projector fixture failed: ${response.status()}`);
+    return response.json();
+  };
   const seed = await (await page.request.get('http://127.0.0.1:3190/__fixture')).json();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -16,12 +22,15 @@ async page => {
       return original.call(this);
     };
   }, seed.history.points.at(-100).time);
-  await page.route('**/api/**', route => {
-    const path = new URL(route.request().url()).pathname, action = path.split('/').at(-1);
+  await page.route('**/api/**', async route => {
+    const url = new URL(route.request().url()), path = url.pathname, action = path.split('/').at(-1);
     const source = path.includes('/bybit/') ? seed.bybit : seed;
     const market = path.includes('/bz/') ? source.bz : source;
-    return route.fulfill(path.includes('/cl-xau/') && market[action]
-      ? { json: market[action] } : { status: 503, json: { error: 'unrelated fixture' } });
+    if (path.includes('/cl-xau/') && action === 'chart') return route.fulfill({ json: await projectChart({ history: market.history, funding: market.funding,
+      exchange: path.includes('/bybit/') ? 'bybit' : 'binance', oilType: path.includes('/bz/') ? 'bz' : 'cl', range: url.searchParams.get('range'),
+    }) });
+    return route.fulfill(path.includes('/cl-xau/') && action === 'quote'
+      ? { json: market.quote } : { status: 503, json: { error: 'unrelated fixture' } });
   });
   try {
     await page.goto('http://127.0.0.1:3190/?monitor=cl-xau&goldOil=cl&goldOilExchange=binance');
@@ -53,12 +62,15 @@ async page => {
     await panel.locator('tbody tr').first().getByText('未查询覆盖', { exact: true }).waitFor();
     await panel.getByRole('button', { name: '下一页', exact: true }).click();
     await panel.getByRole('button', { name: 'BZ · 布伦特原油', exact: true }).click();
+    await panel.locator('.gold-chart .gold-chart-svg').waitFor();
     check((await panel.locator('.table-pagination').innerText()).includes('第 1 / 4 页'), 'Market change resets page');
     check((await panel.locator('table caption').innerText()).includes('Binance'), 'Exchange caption remains accurate');
     check(await panel.getByRole('columnheader', { name: '布伦特原油', exact: true }).count() === 1, 'Market header updates');
     await panel.getByRole('button', { name: 'Bybit', exact: true }).click();
+    await panel.locator('.gold-chart .gold-chart-svg').waitFor();
     check((await panel.locator('table caption').innerText()).includes('原油 USDT/BZ，比值及变化为报价比'), 'Exchange change updates units');
     await panel.getByRole('button', { name: '1 天', exact: true }).click();
+    await panel.getByText('96 条', { exact: true }).waitFor();
     check(await panel.locator('tbody tr').count() === 96, 'Range change updates row count');
     check(errors.length === 0, `No browser exceptions: ${errors.join('; ')}`);
     return { passed: true, cursorAndFreshnessRowFormats: 0, pageSize: 200, changedPrice: 7777.77, changedShortFunding: '+0.0300%' };

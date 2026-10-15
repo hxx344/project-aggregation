@@ -22,6 +22,7 @@ import { exchangeFundingAction, fundingExchangeFromAction } from '../lib/exchang
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
 import { createVariationalSession, openVariationalSessionStore } from './variational-session.mjs';
 import { fetchVariational } from './variational-transport.mjs';
+import { parseGoldOilChartRange, readGoldOilChartData } from '../lib/gold-oil-chart-data.ts';
 
 const exchangeActions = market => Object.fromEntries(comparisonExchanges(market).map(exchange => [exchangeAction(exchange), ["GET"]]));
 const exchangeFundingActions = Object.fromEntries(comparisonExchanges('oil').map(exchange => [exchangeFundingAction(exchange), ['GET']]));
@@ -100,11 +101,12 @@ export async function createMonitorServices(directory, { externallyLocked = fals
         start() { goldOilRunning = true; for (const monitor of Object.values(goldOils)) monitor.start(); },
         async stop() { goldOilRunning = false; await Promise.all(Object.values(goldOils).map(monitor => monitor.stop())); },
         healthy: () => collector.healthy() && Object.values(goldOils).every(monitor => !monitor.storageError),
-        actions: Object.fromEntries(GOLD_OIL_VARIANTS.flatMap(({ oilType, exchange }) => ['quote', 'history', 'funding', 'status', 'config', 'events'].map(action => [goldOilAction(action, oilType, exchange), action === 'config' ? ['GET', 'PUT'] : ['GET']]))),
+        actions: Object.fromEntries(GOLD_OIL_VARIANTS.flatMap(({ oilType, exchange }) => ['quote', 'history', 'funding', 'chart', 'status', 'config', 'events'].map(action => [goldOilAction(action, oilType, exchange), action === 'config' ? ['GET', 'PUT'] : ['GET']]))),
         async handle(action, method, input) {
           const parsed = parseGoldOilAction(action);
           if (!parsed) throw Object.assign(Error('模块不支持此接口'), { status: 404 });
           const monitor = goldOils[goldOilVariantKey(parsed.oilType, parsed.exchange)], identity = { oilType: parsed.oilType, exchange: parsed.exchange, source: GOLD_OIL_EXCHANGES[parsed.exchange].name };
+          if (method === 'GET' && parsed.action === 'chart') return readGoldOilChartData(action => read('cl-xau', action), parseGoldOilChartRange(input?.range), parsed.oilType, parsed.exchange);
           if (method === 'GET' && ['quote', 'history', 'funding'].includes(parsed.action)) return read('cl-xau', action);
           if (parsed.action === 'status' && method === 'GET') return { ...monitor.status(), available: true, monitorId: 'cl-xau', ...identity };
           if (parsed.action === 'config' && method === 'GET') return { ...monitor.configuration(), ...identity };

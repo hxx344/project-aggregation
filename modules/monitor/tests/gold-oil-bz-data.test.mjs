@@ -115,7 +115,7 @@ test('CL and BZ readers isolate requested symbols, listings, histories and fundi
     const start = Number(url.searchParams.get('startTime'));
     if (url.pathname.endsWith('fundingRate')) return Response.json([event(symbol, now - HOUR, 0.0001)]);
     assert.equal(url.pathname, '/fapi/v1/markPriceKlines'); assert.equal(url.searchParams.get('interval'), '15m');
-    const count = Math.min(1000, (now - start) / STEP);
+    const count = Math.min(1000, (Number(url.searchParams.get('endTime')) + 1 - start) / STEP);
     return Response.json(Array.from({ length: count }, (_, index) => candle(start + index * STEP, price)));
   } });
   const [cl, bz] = await Promise.all(['cl', 'bz'].map(async oilType => {
@@ -143,7 +143,9 @@ test('CL and BZ readers isolate requested symbols, listings, histories and fundi
   const gap = structuredClone(bz.h); gap.points.splice(20, 1); gap.points[10].oil = null; gap.points[10].ratio = null;
   const repaired = await readers.bz.history(gap);
   assert.equal(repaired.points.length, 1500); assert.equal(repaired.points[10].oil, 100);
-  assert.equal(Number(logs.bz[0].searchParams.get('startTime')), gap.points[10].time);
+  assert.equal(logs.bz.length, 4);
+  assert.ok(Number(logs.bz[0].searchParams.get('startTime')) > now - 2 * 24 * HOUR);
+  assert.equal(Number(logs.bz[2].searchParams.get('startTime')), gap.points[10].time);
   logs.bz.length = 0;
   const extended = await readers.bz.funding({ ...bz.f, coverageStart: now - 24 * HOUR });
   assert.equal(extended.coverageStart, bz.f.coverageStart);

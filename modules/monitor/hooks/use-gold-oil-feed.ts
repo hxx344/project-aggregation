@@ -1,36 +1,36 @@
 "use client";
 
 import { useEffect, useRef, useState } from 'react';
-import { GOLD_OIL_QUOTE_MS, GOLD_OIL_HISTORY_MS, GOLD_OIL_FUNDING_MS, goldOilAction, goldOilVariantKey, GOLD_OIL_VARIANTS, validateGoldOilQuote, validateGoldOilHistory, type GoldOilType, type GoldOilExchange, type GoldOilQuote, type GoldOilHistory } from '../lib/gold-oil';
-import { validateGoldOilFunding, type GoldOilFundingHistory } from '../lib/gold-oil-funding';
+import { GOLD_OIL_QUOTE_MS, GOLD_OIL_HISTORY_MS, goldOilAction, goldOilVariantKey, GOLD_OIL_VARIANTS, validateGoldOilQuote, type GoldOilType, type GoldOilExchange, type GoldOilQuote } from '../lib/gold-oil';
+import { validateGoldOilChartData, type GoldOilChartData, type GoldOilChartRange } from '../lib/gold-oil-chart-data';
+import { mergeGoldOilChartData, goldOilChartOverviewTrend } from '../lib/gold-oil-chart-feed';
 import { initialGoldOilMarket, type InitialMarketData } from '../lib/initial-market';
+import type { MonitorTrend } from '../lib/monitor-trend';
 import { startActivityPolling } from '../lib/polling';
+import { backgroundReadDelay } from '../lib/read-activity';
 
-async function request(action: string, oilType: GoldOilType, exchange: GoldOilExchange, signal: AbortSignal) {
-  const response = await fetch(`/api/monitors/cl-xau/${goldOilAction(action, oilType, exchange)}`, { cache: 'no-store', signal });
+async function request(action: string, oilType: GoldOilType, exchange: GoldOilExchange, signal: AbortSignal, range?: GoldOilChartRange) {
+  const path = '/api/monitors/cl-xau/' + goldOilAction(action, oilType, exchange) + (range ? '?range=' + range : '');
+  const response = await fetch(path, { cache: 'no-store', signal });
   if (!response.ok) throw Error('金油比行情更新失败');
   return response.json() as Promise<unknown>;
 }
-type MarketCache = {
-  quote: GoldOilQuote | null; history: GoldOilHistory | null; funding: GoldOilFundingHistory | null;
-  quoteError: boolean; historyError: boolean; fundingError: boolean;
-  quoteReadAt: number; historyReadAt: number; fundingReadAt: number;
-};
+type MarketCache = { quote: GoldOilQuote | null; quoteError: boolean; quoteReadAt: number; trend?: MonitorTrend };
+type ChartCache = { data: GoldOilChartData | null; error: boolean; readAt: number };
 function initialCache(initial: InitialMarketData | null | undefined, oilType: GoldOilType, exchange: GoldOilExchange): MarketCache {
   const seed = initialGoldOilMarket(initial, oilType, exchange);
-  const normalize = <T,>(value: unknown, validate: (value: unknown, oilType: GoldOilType, exchange: GoldOilExchange) => T): T | null => {
-    if (!value) return null;
-    try { return validate(value, oilType, exchange); } catch { return null; }
-  };
-  const quote = normalize(seed?.quote, validateGoldOilQuote), history = normalize(seed?.history, validateGoldOilHistory), funding = normalize(seed?.funding, validateGoldOilFunding);
-  const readAt = initial?.renderedAt ?? 0;
-  return { quote, history, funding, quoteError: false, historyError: false, fundingError: false,
-    quoteReadAt: quote ? readAt : 0, historyReadAt: history ? readAt : 0, fundingReadAt: funding ? readAt : 0 };
+  let quote: GoldOilQuote | null = null;
+  try { if (seed?.quote) quote = validateGoldOilQuote(seed.quote, oilType, exchange); } catch { /* Invalid seeds are fetched again. */ }
+  return { quote, quoteError: false, quoteReadAt: quote ? initial?.renderedAt ?? 0 : 0, trend: seed?.trend };
 }
-export function useGoldOilFeed(initial: InitialMarketData | null | undefined, active: boolean, summaryActive: boolean, oilType: GoldOilType = 'cl', exchange: GoldOilExchange = 'binance') {
+
+export function useGoldOilFeed(initial: InitialMarketData | null | undefined, active: boolean, summaryActive: boolean, oilType: GoldOilType = 'cl', exchange: GoldOilExchange = 'binance', range: GoldOilChartRange = '7d') {
   const [markets, setMarkets] = useState<Record<string, MarketCache>>(() => Object.fromEntries(GOLD_OIL_VARIANTS.map(({ oilType, exchange }) => [goldOilVariantKey(oilType, exchange), initialCache(initial, oilType, exchange)])));
-  const key = goldOilVariantKey(oilType, exchange);
-  const cache = useRef(markets);
+  // Range payloads never enter the complete-history cache or another selection.
+  // Four variants times four supported ranges keep this per-panel cache bounded.
+  const [charts, setCharts] = useState<Record<string, ChartCache>>({});
+  const key = goldOilVariantKey(oilType, exchange), chartKey = key + '/' + range;
+  const cache = useRef(markets), chartCache = useRef(charts);
   const polls = useRef<Record<string, ReturnType<typeof startActivityPolling>>>({});
   useEffect(() => {
     if (!summaryActive) return;
@@ -45,20 +45,39 @@ export function useGoldOilFeed(initial: InitialMarketData | null | undefined, ac
   }, [summaryActive, oilType, exchange, key]);
   useEffect(() => {
     if (!active) return;
-    const controls = polls.current, current = cache.current[key];
-    const history = startActivityPolling({ intervalMs: GOLD_OIL_HISTORY_MS, timeoutMs: 60_000,
-      immediate: !current.history || current.historyError || Date.now() - current.historyReadAt >= GOLD_OIL_HISTORY_MS,
-      load: async signal => validateGoldOilHistory(await request('history', oilType, exchange, signal), oilType, exchange),
-      onData: value => { cache.current = { ...cache.current, [key]: { ...cache.current[key], history: value, historyError: false, historyReadAt: Date.now() } }; setMarkets(cache.current); },
-      onError: () => { cache.current = { ...cache.current, [key]: { ...cache.current[key], historyError: true } }; setMarkets(cache.current); } });
-    const funding = startActivityPolling({ intervalMs: GOLD_OIL_FUNDING_MS, timeoutMs: 60_000,
-      immediate: !current.funding || current.fundingError || Date.now() - current.fundingReadAt >= GOLD_OIL_FUNDING_MS,
-      load: async signal => validateGoldOilFunding(await request('funding', oilType, exchange, signal), oilType, exchange),
-      onData: value => { cache.current = { ...cache.current, [key]: { ...cache.current[key], funding: value, fundingError: false, fundingReadAt: Date.now() } }; setMarkets(cache.current); },
-      onError: () => { cache.current = { ...cache.current, [key]: { ...cache.current[key], fundingError: true } }; setMarkets(cache.current); } });
-    controls.history = history; controls.funding = funding;
-    return () => { delete controls.history; delete controls.funding; history.stop(); funding.stop(); };
-  }, [active, oilType, exchange, key]);
-  // Select during render; an effect-driven reset can briefly expose another exchange/oil combination's data.
-  return { ...markets[key], refresh: () => { for (const poll of Object.values(polls.current)) void poll.refresh(); } };
+    const controls = polls.current, current = chartCache.current[chartKey], retryUntil = Date.now() + 60_000;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const clearRetry = () => { clearTimeout(retry); retry = undefined; };
+    const poll = startActivityPolling({ intervalMs: GOLD_OIL_HISTORY_MS, timeoutMs: 60_000,
+      immediate: !current?.data || current.error || !current.data.history || !current.data.funding || Date.now() - current.readAt >= GOLD_OIL_HISTORY_MS,
+      load: async signal => validateGoldOilChartData(await request('chart', oilType, exchange, signal, range), range, oilType, exchange),
+      onData: value => {
+        clearRetry();
+        const previous = chartCache.current[chartKey]?.data, data = mergeGoldOilChartData(previous, value);
+        chartCache.current = { ...chartCache.current, [chartKey]: { data, error: false, readAt: Date.now() } }; setCharts(chartCache.current);
+        const trend = goldOilChartOverviewTrend(data, cache.current[key].trend);
+        if (trend !== cache.current[key].trend) { cache.current = { ...cache.current, [key]: { ...cache.current[key], trend } }; setMarkets(cache.current); }
+        // Quickly discover datasets committed just after startup. Persistent
+        // upstream failures return to the normal cadence after one minute.
+        if (Date.now() < retryUntil && ((!value.history && !previous?.history) || (!value.funding && !previous?.funding))) {
+          retry = setTimeout(() => { retry = undefined; void poll.refresh(); }, backgroundReadDelay(3000));
+        }
+      },
+      onError: () => {
+        clearRetry();
+        const old = chartCache.current[chartKey];
+        chartCache.current = { ...chartCache.current, [chartKey]: { data: old?.data ?? null, error: true, readAt: old?.readAt ?? 0 } };
+        setCharts(chartCache.current);
+        const trend = cache.current[key].trend;
+        if (trend && range !== '1d') { cache.current = { ...cache.current, [key]: { ...cache.current[key], trend: { ...trend, status: 'stale' } } }; setMarkets(cache.current); }
+      },
+    });
+    controls.chart = poll;
+    return () => { clearRetry(); delete controls.chart; poll.stop(); };
+  }, [active, oilType, exchange, range, key, chartKey]);
+  const selected = charts[chartKey], chart = selected?.data ?? null;
+  return { ...markets[key], chart, chartError: selected?.error ?? false,
+    history: chart?.history ?? null, funding: chart?.funding ?? null,
+    historyError: Boolean(selected?.error || chart?.historyError), fundingError: Boolean(selected?.error || chart?.fundingError),
+    refresh: () => { for (const poll of Object.values(polls.current)) void poll.refresh(); } };
 }

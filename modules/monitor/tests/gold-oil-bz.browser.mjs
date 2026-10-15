@@ -1,11 +1,17 @@
 // Production Next server: localhost:3189. Playwright CLI run-code --filename.
+// Also run: node modules/monitor/tests/gold-oil-chart-projector-server.mjs
 // Isolated fixtures exercise CL/BZ switching and never send notifications.
 // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- CLI evaluates this function.
-async page => {
+async (page, options = {}) => {
   const check = (value, message) => { if (!value) throw Error(message); };
+  const projectChart = async input => {
+    const response = await page.request.post(options.projectorUrl ?? 'http://127.0.0.1:3192/project', { data: input });
+    check(response.ok(), `Chart projector fixture failed: ${response.status()}`);
+    return response.json();
+  };
   const now = Date.UTC(2026, 9, 7, 12), interval = 900000, errors = [], pending = [], requests = [];
   let holdBz = true, failBz = false;
-  const counts = { cl: { quote: 0, history: 0, funding: 0 }, bz: { quote: 0, history: 0, funding: 0 } };
+  const counts = { cl: { quote: 0, chart: 0 }, bz: { quote: 0, chart: 0 } };
   const configs = { cl: { revision: 2, config: { enabled: false, rules: [] } }, bz: { revision: 8, config: { enabled: false, rules: [] } } };
   const saved = [];
   const runtime = Object.fromEntries(['oil', 'cl-xau', 'hynix', 'perpetual'].map(id => [id, { available: true, monitorId: id, enabled: true, running: true, revision: 0, error: '' }]));
@@ -32,9 +38,9 @@ async page => {
   await page.goto('about:blank'); await page.unrouteAll({ behavior: 'wait' });
   await page.clock.install({ time: new Date(now - 1000) }); await page.clock.pauseAt(new Date(now));
   await page.route('**/api/**', async route => {
-    const path = new URL(route.request().url()).pathname;
+    const url = new URL(route.request().url()), path = url.pathname;
     if (path === '/api/monitors') return route.fulfill({ json: { schemaVersion: 1, monitors: Object.entries(runtime).map(([id, value]) => ({ id, runtime: value })) } });
-    const match = path.match(/^\/api\/monitors\/cl-xau\/(bz\/)?(quote|history|funding|status|config|events)$/);
+    const match = path.match(/^\/api\/monitors\/cl-xau\/(bz\/)?(quote|chart|status|config|events)$/);
     if (!match) return route.fulfill({ status: 503, json: { error: 'unrelated fixture' } });
     const oilType = match[1] ? 'bz' : 'cl', action = match[2];
     requests.push({ oilType, action });
@@ -51,7 +57,9 @@ async page => {
     }
     counts[oilType][action]++;
     if (oilType === 'bz' && holdBz) await new Promise(resolve => pending.push(resolve));
-    return route.fulfill(oilType === 'bz' && failBz ? { status: 503, json: { error: 'BZ fixture outage' } } : { json: fixture[oilType][action] }).catch(() => {});
+    if (oilType === 'bz' && failBz) return route.fulfill({ status: 503, json: { error: 'BZ fixture outage' } }).catch(() => {});
+    const payload = action === 'chart' ? await projectChart({ ...fixture[oilType], oilType, range: url.searchParams.get('range') }) : fixture[oilType].quote;
+    return route.fulfill({ json: payload }).catch(() => {});
   });
   try {
     await page.setViewportSize({ width: 1440, height: 1050 });
@@ -74,7 +82,7 @@ async page => {
     await editor('cl').getByLabel('阈值（桶/盎司）').fill('50');
     const clReads = { ...counts.cl };
     await select('bz').click();
-    await panel.getByText('正在读取共同历史，首次采集需要回补…', { exact: true }).waitFor();
+    await panel.getByText('正在读取所选区间历史…', { exact: true }).waitFor();
     check(!(await metric.innerText()).includes('50.000'), 'BZ loading never displays CL quote');
     check(!(await overview.locator('.hub-card-metrics').innerText()).includes('50.000'), 'BZ overview never displays CL quote');
     check((await overview.locator('.hub-card-heading').innerText()).includes('XAU / BZ'), 'Overview subtitle follows BZ immediately');
@@ -123,7 +131,7 @@ async page => {
     await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
     await page.clock.runFor(30000);
     check(counts.bz.quote === beforeHidden.bz.quote + 1 && counts.cl.quote === beforeHidden.cl.quote, 'Only selected oil quote polls in the overview');
-    check(counts.bz.history === beforeHidden.bz.history && counts.cl.history === beforeHidden.cl.history, 'Hidden gold-oil panel pauses both histories');
+    check(counts.bz.chart === beforeHidden.bz.chart && counts.cl.chart === beforeHidden.cl.chart, 'Hidden gold-oil panel pauses both chart reads');
     await page.getByRole('tab', { name: '金油比', exact: true }).click();
     await page.setViewportSize({ width: 390, height: 844 }); await page.clock.runFor(100);
     check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'BZ chart and detail table fit mobile viewport');

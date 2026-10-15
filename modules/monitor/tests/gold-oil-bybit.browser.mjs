@@ -1,11 +1,17 @@
 // Production Next server: localhost:3189. Playwright CLI run-code --filename.
+// Also run: node modules/monitor/tests/gold-oil-chart-projector-server.mjs
 // All market/config endpoints are isolated fixtures; no real notifications or writes.
 // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- CLI evaluates this function.
-async page => {
+async (page, options = {}) => {
   const check = (value, message) => { if (!value) throw Error(message); };
+  const projectChart = async input => {
+    const response = await page.request.post(options.projectorUrl ?? 'http://127.0.0.1:3192/project', { data: input });
+    check(response.ok(), `Chart projector fixture failed: ${response.status()}`);
+    return response.json();
+  };
   const now = Date.UTC(2026, 9, 7, 12), interval = 900000, errors = [], pending = [], saved = [];
   const variants = ['binance/cl', 'binance/bz', 'bybit/cl', 'bybit/bz'];
-  const counts = Object.fromEntries(variants.map(key => [key, { quote: 0, history: 0, funding: 0 }]));
+  const counts = Object.fromEntries(variants.map(key => [key, { quote: 0, chart: 0 }]));
   const configs = Object.fromEntries(variants.map((key, index) => [key, { revision: index * 7 + 2, config: { enabled: false, rules: [] } }]));
   const originalRevisions = Object.fromEntries(variants.map(key => [key, configs[key].revision]));
   let hold = 'bybit/cl', wrongSource = '', failed = '';
@@ -30,9 +36,9 @@ async page => {
   await page.goto('about:blank'); await page.unrouteAll({ behavior: 'wait' });
   await page.clock.install({ time: new Date(now - 1000) }); await page.clock.pauseAt(new Date(now));
   await page.route('**/api/**', async route => {
-    const path = new URL(route.request().url()).pathname;
+    const url = new URL(route.request().url()), path = url.pathname;
     if (path === '/api/monitors') return route.fulfill({ json: { schemaVersion: 1, monitors: Object.entries(runtime).map(([id, value]) => ({ id, runtime: value })) } });
-    const match = path.match(/^\/api\/monitors\/cl-xau\/(bybit\/)?(bz\/)?(quote|history|funding|status|config|events)$/);
+    const match = path.match(/^\/api\/monitors\/cl-xau\/(bybit\/)?(bz\/)?(quote|chart|status|config|events)$/);
     if (!match) return route.fulfill({ status: 503, json: { error: 'unrelated fixture' } });
     const key = `${match[1] ? 'bybit' : 'binance'}/${match[2] ? 'bz' : 'cl'}`, action = match[3];
     if (action === 'status') return route.fulfill({ json: { ...identity(key), available: true, webhookConfigured: true, stale: false,
@@ -48,7 +54,8 @@ async page => {
     }
     counts[key][action]++;
     if (key === hold) await new Promise(resolve => pending.push(resolve));
-    const payload = wrongSource === key ? { ...fixture[key][action], source: identity(key).source === 'Bybit' ? 'Binance' : 'Bybit' } : fixture[key][action];
+    const valid = action === 'chart' ? await projectChart({ ...fixture[key], ...identity(key), range: url.searchParams.get('range') }) : fixture[key].quote;
+    const payload = wrongSource === key ? { ...valid, source: identity(key).source === 'Bybit' ? 'Binance' : 'Bybit' } : valid;
     return route.fulfill(key === failed ? { status: 503, json: { error: 'isolated outage' } } : { json: payload }).catch(() => {});
   });
   try {
@@ -79,7 +86,7 @@ async page => {
     await panel.getByRole('button', { name: '下一页', exact: true }).click();
     const originalReads = { ...counts['binance/cl'] };
     await sourceButton('bybit').click();
-    await panel.getByText('正在读取共同历史，首次采集需要回补…', { exact: true }).waitFor();
+    await panel.getByText('正在读取所选区间历史…', { exact: true }).waitFor();
     check(!(await metric.innerText()).includes('50.000'), 'Held Bybit request never exposes Binance quote');
     check(!(await overview.locator('.hub-card-metrics').innerText()).includes('50.000'), 'Held Bybit request never exposes Binance overview');
     await sourceButton('binance').click(); await expectMarket('binance/cl');
@@ -145,7 +152,7 @@ async page => {
     const hiddenReads = structuredClone(counts);
     await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click(); await page.clock.runFor(30000);
     check(counts['bybit/bz'].quote === hiddenReads['bybit/bz'].quote + 1, 'Selected Bybit BZ quote polls for overview');
-    check(variants.every(key => counts[key].history === hiddenReads[key].history && counts[key].funding === hiddenReads[key].funding), 'Hidden gold-oil panel pauses histories for all combinations');
+    check(variants.every(key => counts[key].chart === hiddenReads[key].chart), 'Hidden gold-oil panel pauses chart reads for all combinations');
     check(variants.filter(key => key !== 'bybit/bz').every(key => counts[key].quote === hiddenReads[key].quote), 'Unselected source/oil quotes do not poll');
     await page.getByRole('tab', { name: '金油比', exact: true }).click();
 

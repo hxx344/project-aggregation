@@ -26,13 +26,15 @@ export function goldOilAction(action: string, oilType: GoldOilType = 'cl', excha
 export function parseGoldOilAction(action: string): { oilType: GoldOilType; exchange: GoldOilExchange; action: string } | null {
   const exchange = action.startsWith('bybit/') ? 'bybit' : 'binance', path = exchange === 'bybit' ? action.slice(6) : action;
   const oilType = path.startsWith('bz/') ? 'bz' : 'cl', name = oilType === 'bz' ? path.slice(3) : path;
-  return ['quote', 'history', 'funding', 'status', 'config', 'events'].includes(name) ? { oilType, exchange, action: name } : null;
+  return ['quote', 'history', 'chart', 'funding', 'status', 'config', 'events'].includes(name) ? { oilType, exchange, action: name } : null;
 }
 type Leg = { symbol: string; price: number; updatedAt: string };
 export type GoldOilFundingLeg = { rate: number; intervalHours: number; nextFundingAt: string };
 export type GoldOilQuote = QuoteFreshness & { oilType: GoldOilType; source: GoldOilSource; currency: 'USDT'; priceBasis: 'mark'; fetchedAt: string; oil: Leg; cl?: Leg; xau: Leg; ratio: number; status: 'live' | 'snapshot'; funding: { oil: GoldOilFundingLeg; cl?: GoldOilFundingLeg; xau: GoldOilFundingLeg } | null };
 export type GoldOilPoint = { time: number; oil: number | null; cl?: number | null; xau: number | null; ratio: number | null };
-export type GoldOilHistory = { oilType: GoldOilType; source: GoldOilSource; currency: 'USDT'; priceBasis: 'mark'; interval: '15m'; fetchedAt: string; status: 'live' | 'snapshot'; points: GoldOilPoint[]; coverageStart?: number };
+/** Advisory repair scheduling only; this does not certify missing observations. */
+export type GoldOilHistoryRepair = { cursor: number; nextCheckAt: number };
+export type GoldOilHistory = { oilType: GoldOilType; source: GoldOilSource; currency: 'USDT'; priceBasis: 'mark'; interval: '15m'; fetchedAt: string; status: 'live' | 'snapshot'; points: GoldOilPoint[]; coverageStart?: number; historyRepair?: GoldOilHistoryRepair };
 
 /** Only historic Binance CL payloads may omit the variant. */
 export function validateGoldOilIdentity(value: Record<string, unknown>, expectedOil: GoldOilType, expectedExchange: GoldOilExchange = 'binance') {
@@ -115,7 +117,13 @@ export function validateGoldOilHistory(input: unknown, expectedOil: GoldOilType 
   if (Date.parse(base.fetchedAt) - points[0].time > 100_000 * GOLD_OIL_INTERVAL_MS) throw Error('Gold/oil history span is too large');
   const coverageStart = value.coverageStart;
   if (coverageStart !== undefined && (typeof coverageStart !== 'number' || !Number.isSafeInteger(coverageStart) || coverageStart <= 0 || coverageStart > points[0].time)) throw Error('Invalid gold/oil history coverage');
-  return { ...base, oilType: expectedOil, interval: '15m', points, ...(typeof coverageStart === 'number' ? { coverageStart } : {}) };
+  let historyRepair: GoldOilHistoryRepair | undefined;
+  if (value.historyRepair !== undefined) {
+    const state = object(value.historyRepair), cursor = state.cursor, nextCheckAt = state.nextCheckAt, fetchedAt = Date.parse(base.fetchedAt);
+    if (typeof cursor !== 'number' || !Number.isSafeInteger(cursor) || cursor <= 0 || cursor % GOLD_OIL_INTERVAL_MS || cursor > fetchedAt || typeof nextCheckAt !== 'number' || !Number.isSafeInteger(nextCheckAt) || nextCheckAt < 0 || nextCheckAt > fetchedAt + 86_400_000) throw Error('Invalid gold/oil history repair state');
+    historyRepair = { cursor, nextCheckAt };
+  }
+  return { ...base, oilType: expectedOil, interval: '15m', points, ...(typeof coverageStart === 'number' ? { coverageStart } : {}), ...(historyRepair ? { historyRepair } : {}) };
 }
 
 /** Include explicit nulls so charts cannot join across a missing period. */

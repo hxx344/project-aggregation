@@ -38,7 +38,7 @@ registerHooks({
 });
 
 export async function startFixtureModules() {
-  const { snapshots, services } = createGoldOilLoadingFixture();
+  const { snapshots, services, chartFixture } = createGoldOilLoadingFixture();
   const runtime = Object.fromEntries(monitors.map(({ id }) => [id, {
     monitorId: id, available: false, enabled: id === 'cl-xau', running: false,
     revision: 0, reason: 'Read-only seeded browser fixture',
@@ -86,6 +86,10 @@ export async function startFixtureModules() {
           return response.end(request.method === 'HEAD' ? undefined : '<!doctype html><title>Idle module fixture</title><p>Inactive browser fixture module</p>');
         }
         if (pathname === '/__fixture') return send(snapshots);
+        if (pathname === '/__chart-fixture') {
+          try { return send(chartFixture(Object.fromEntries(url.searchParams))); }
+          catch (error) { return send({ error: error.message }, 400); }
+        }
         if (pathname === '/api/monitors') return send({ schemaVersion: 1, monitors: monitors.map(monitor => ({ ...monitor, runtime: runtime[monitor.id] })) });
         if (pathname === '/api/hub/summary') {
           const summary = await readHubSummary(services, Date.now(), url.searchParams.get('monitor') || 'oil', url.searchParams.get('goldOil') || 'cl', url.searchParams.get('goldOilExchange') || 'binance');
@@ -97,7 +101,7 @@ export async function startFixtureModules() {
         if (pathname.startsWith('/api/monitors/cl-xau/')) {
           const action = pathname.slice('/api/monitors/cl-xau/'.length), parsed = parseGoldOilAction(action);
           if (!parsed) return send({ error: 'Unknown fixture action' }, 404);
-          if (['quote', 'history', 'funding'].includes(parsed.action)) return send(services.get('cl-xau').handle(action, 'GET'));
+          if (['quote', 'history', 'funding', 'chart'].includes(parsed.action)) return send(services.get('cl-xau').handle(action, 'GET', Object.fromEntries(url.searchParams)));
           const identity = { oilType: parsed.oilType, exchange: parsed.exchange, source: parsed.exchange === 'bybit' ? 'Bybit' : 'Binance' };
           if (parsed.action === 'status') return send({ ...identity, available: false, reason: 'Fixture alerts disabled', webhookConfigured: false,
             lastAttemptAt: null, lastSuccessAt: null, stale: false, error: '' });

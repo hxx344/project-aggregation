@@ -1,5 +1,6 @@
 import { GOLD_OIL_INSTRUMENTS, GOLD_OIL_INTERVAL_MS, GOLD_OIL_STALE_MS, GOLD_OIL_SYMBOLS, validateGoldOilQuote, validateGoldOilHistory, type GoldOilHistory, type GoldOilType } from './gold-oil.ts';
 import { validateGoldOilFunding, type FundingEvent, type GoldOilFundingHistory } from './gold-oil-funding.ts';
+import { repairGoldOilHistory } from './gold-oil-history-repair.ts';
 
 function number(value: unknown) {
   if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '' || !Number.isFinite(Number(value))) throw Error('Invalid Bybit number');
@@ -44,11 +45,11 @@ export function parseBybitGoldOilQuote(oilInput: unknown, xauInput: unknown, now
   } catch { return validateGoldOilQuote(base, oilType, 'bybit'); }
 }
 
-export function parseBybitGoldOilHistory(oilInput: unknown, xauInput: unknown, now = Date.now(), previous: GoldOilHistory | null = null, coverageStart?: number, oilType: GoldOilType = 'cl') {
+export function parseBybitGoldOilHistory(oilInput: unknown, xauInput: unknown, now = Date.now(), previous: GoldOilHistory | null = null, coverageStart?: number, oilType: GoldOilType = 'cl', allowEmpty = false) {
   if (previous) previous = validateGoldOilHistory(previous, oilType, 'bybit');
   const end = Math.floor(now / GOLD_OIL_INTERVAL_MS) * GOLD_OIL_INTERVAL_MS;
   const candles = (input: unknown) => {
-    if (!Array.isArray(input) || !input.length) throw Error('Missing Bybit candles');
+    if (!Array.isArray(input) || (!allowEmpty && !input.length)) throw Error('Missing Bybit candles');
     const values = new Map<number, number>(), seen = new Set<number>();
     for (const row of input) {
       if (!Array.isArray(row) || row.length < 5) throw Error('Invalid Bybit candle');
@@ -57,7 +58,7 @@ export function parseBybitGoldOilHistory(oilInput: unknown, xauInput: unknown, n
       seen.add(time);
       if (time < end) values.set(time, price);
     }
-    if (!values.size) throw Error('Missing completed Bybit candles');
+    if (!allowEmpty && !values.size) throw Error('Missing completed Bybit candles');
     return values;
   };
   const oil = candles(oilInput), xau = candles(xauInput);
@@ -67,7 +68,7 @@ export function parseBybitGoldOilHistory(oilInput: unknown, xauInput: unknown, n
     if (!xau.has(row.time) && row.xau !== null) xau.set(row.time, row.xau);
   }
   const points = [...new Set([...oil.keys(), ...xau.keys()])].sort((a, b) => a - b).map(time => ({ time, oil: oil.get(time) ?? null, xau: xau.get(time) ?? null }));
-  return validateGoldOilHistory({ oilType, source: 'Bybit', currency: 'USDT', priceBasis: 'mark', interval: '15m', status: 'live', fetchedAt: new Date(now).toISOString(), points, ...(coverageStart === undefined ? {} : { coverageStart: Math.min(coverageStart, previous?.coverageStart ?? coverageStart) }) }, oilType, 'bybit');
+  return validateGoldOilHistory({ oilType, source: 'Bybit', currency: 'USDT', priceBasis: 'mark', interval: '15m', status: 'live', fetchedAt: new Date(now).toISOString(), points, ...(coverageStart === undefined ? {} : { coverageStart: Math.min(coverageStart, previous?.coverageStart ?? coverageStart) }), ...(previous?.historyRepair ? { historyRepair: previous.historyRepair } : {}) }, oilType, 'bybit');
 }
 
 export function parseBybitGoldOilFunding(oilInput: unknown, xauInput: unknown, start: number, end: number, now: number, previous: GoldOilFundingHistory | null = null, oilType: GoldOilType = 'cl') {
@@ -140,11 +141,13 @@ export function createBybitGoldOilReader({ oilType = 'cl', fetcher = fetch, cloc
       if (previous) previous = validateGoldOilHistory(previous, oilType, 'bybit');
       await metadata();
       const now = clock(), end = Math.floor(now / GOLD_OIL_INTERVAL_MS) * GOLD_OIL_INTERVAL_MS;
-      let start = previous?.coverageStart !== undefined && previous.coverageStart <= commonStart ? Math.max(commonStart, previous.points.at(-1)!.time - 86_400_000) : commonStart;
-      let expected = commonStart;
-      for (const row of previous?.points ?? []) { if (row.time > expected) start = Math.min(start, expected); if (row.oil === null || row.xau === null) start = Math.min(start, row.time); expected = row.time + GOLD_OIL_INTERVAL_MS; }
+      const start = previous?.coverageStart !== undefined && previous.coverageStart <= commonStart ? Math.max(commonStart, previous.points.at(-1)!.time - 86_400_000) : commonStart;
       const [oil, xau] = await Promise.all(symbols.map(symbol => pages(symbol, start, end, true)));
-      latestHistory = parseBybitGoldOilHistory(oil, xau, now, previous, start, oilType);
+      const recent = parseBybitGoldOilHistory(oil, xau, now, previous, start, oilType);
+      latestHistory = start === commonStart ? recent : await repairGoldOilHistory(recent, commonStart, start, now, async (from, to) => {
+        const [oldOil, oldXau] = await Promise.all(symbols.map(symbol => pages(symbol, from, to, true)));
+        return parseBybitGoldOilHistory(oldOil, oldXau, now, recent, from, oilType, true);
+      });
       return latestHistory;
     },
     async funding(previous: GoldOilFundingHistory | null = null) {

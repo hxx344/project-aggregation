@@ -181,8 +181,8 @@ test('price history backfills past seven days with pagination, then requests onl
   const reader = createGoldOilReader({ clock: () => now, fetcher: async input => {
     const url = new URL(input);
     if (url.pathname.endsWith('exchangeInfo')) return Response.json(metadata());
-    const from = Number(url.searchParams.get('startTime')), symbol = url.searchParams.get('symbol'); requests.push(from);
-    const count = Math.min(1000, Math.max(0, (now - from) / STEP));
+    const from = Number(url.searchParams.get('startTime')), end = Number(url.searchParams.get('endTime')) + 1, symbol = url.searchParams.get('symbol'); requests.push(from);
+    const count = Math.min(1000, Math.max(0, (end - from) / STEP));
     return Response.json(Array.from({ length: count }, (_, index) => candle(from + index * STEP, symbol === 'CLUSDT' ? 80 : 4000)));
   } });
   const old = parseGoldOilHistory([candle(now - STEP, 80)], [candle(now - STEP, 4000)], now);
@@ -196,7 +196,9 @@ test('price history backfills past seven days with pagination, then requests onl
   const missingLeading = { ...first, points: first.points.slice(1) };
   assert.equal(goldOilChartPoints(missingLeading, 0)[0].ratio, null);
   assert.equal((await reader.history(missingLeading)).points.length, 2000);
-  assert.equal(requests[0], start, 'Leading missing candles are retried from the common start');
+  assert.equal(requests.length, 4);
+  assert.ok(requests[0] > now - 2 * 86400000, 'Recent candles refresh before repairing a leading gap');
+  assert.equal(requests[2], start, 'Leading missing candles are repaired in their own bounded window');
   for (const bad of ['duplicate', 'reverse', 'out-of-window']) {
     const broken = createGoldOilReader({ clock: () => now, fetcher: async input => {
       const url = new URL(input); if (url.pathname.endsWith('exchangeInfo')) return Response.json(metadata());
