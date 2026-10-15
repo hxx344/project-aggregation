@@ -19,6 +19,7 @@ import monitor
 from . import monitoring, notification_channels, position_observations
 from .monitoring_status import compute_symbol_view
 from .hourly_summary import format_hourly_summary
+from .capacity_relay_client import CAPACITY_RELAY_SYMBOLS
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_cache import AccountCacheUnavailable, HotAccountUnavailable
@@ -187,6 +188,7 @@ class Engine:
         self.capacity_intervals = {}
         self.capacity_brackets_interval = PUBLIC_BRACKETS_REFRESH_INTERVAL
         self.capacity_poll_enabled = True
+        self.local_capacity_poll_enabled = True
         self.capacity_full_checked = {}
         self.capacity_sample_started = {}
         self.listing_monitor = ListingMonitor(store, self.market, self.shutdown) if not demo and isinstance(self.market, MarketData) else None
@@ -545,11 +547,11 @@ class Engine:
         budget = self.market.api.budget.snapshot() if isinstance(self.market, MarketData) else {"ordinary_limit": 1500}
         # Reserve the capacity feed and ordinary quote fallback. Use cold
         # round costs; no private position or balance cache crosses a mutation.
-        capacity_symbols = self.capacity_market_symbols(accounts)
+        capacity_symbols = {symbol for symbol in self.capacity_market_symbols(accounts)
+                            if not self.uses_capacity_relay(symbol)}
         public_capacity_cost = (sum(60 / self.capacity_interval(symbol) for symbol in capacity_symbols)
-                                + len(capacity_symbols) * 60 / self.capacity_brackets_interval) if self.capacity_poll_enabled else 0
-        if isinstance(self.market, MarketData) and self.market.remote_capacity is True:
-            public_capacity_cost = 0
+                                + len(capacity_symbols) * 60 / self.capacity_brackets_interval
+                                ) if self.capacity_poll_enabled and self.local_capacity_poll_enabled else 0
         extra_capacity = public_capacity_cost - CAPACITY_MONITOR_RESERVE
         capacity = max(1, budget.get("execution_limit", budget["ordinary_limit"]) - PUBLIC_POLL_ALLOWANCE - extra_capacity)
         with self.lock:
@@ -757,7 +759,17 @@ class Engine:
         return targets
 
     def capacity_interval(self, symbol):
-        return self.capacity_intervals.get(symbol, FAST_CAPACITY_POLL_INTERVAL if symbol in self.capacity_targets else CAPACITY_POLL_INTERVAL)
+        fast = symbol in self.capacity_targets and symbol in CAPACITY_RELAY_SYMBOLS
+        return self.capacity_intervals.get(symbol, FAST_CAPACITY_POLL_INTERVAL if fast else CAPACITY_POLL_INTERVAL)
+
+    def uses_capacity_relay(self, symbol):
+        return isinstance(self.market, MarketData) and self.market.uses_capacity_relay(symbol)
+
+    def capacity_sampling_enabled(self, symbol):
+        return self.capacity_poll_enabled and (self.uses_capacity_relay(symbol) or self.local_capacity_poll_enabled)
+
+    def brackets_interval(self, symbol):
+        return PUBLIC_BRACKETS_REFRESH_INTERVAL if self.uses_capacity_relay(symbol) else self.capacity_brackets_interval
 
     def required_monitoring_symbols(self, reader=None, accounts=None):
         reader = reader or self.store
@@ -839,41 +851,42 @@ class Engine:
         """Fit all public quota samples, including brackets, into their real reserve."""
         symbols = self.capacity_market_symbols() if symbols is None else set(symbols)
         targets = {symbol: tiers for symbol, tiers in targets.items() if symbol in symbols}
-        if isinstance(self.market, MarketData) and self.market.remote_capacity is True:
-            # Reading the relay's cache spends no Aster weight on this host.
-            # Keep consumption cadence independent of the local IP's budget.
-            self.market.api.budget.configure_capacity_reserve(0)
-            intervals = dict.fromkeys(MARKET_SYMBOLS, CAPACITY_POLL_INTERVAL)
-            intervals.update(dict.fromkeys(targets, FAST_CAPACITY_POLL_INTERVAL))
-            return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL, bool(symbols)
-        count = len(targets)
-        baseline = len(symbols) * CAPACITY_MONITOR_RESERVE
+        remote_symbols = {symbol for symbol in symbols if self.uses_capacity_relay(symbol)}
+        local_symbols = symbols - remote_symbols
+        # Other markets use the main host's slow baseline even with active
+        # strategy consumers. Only gold/silver are eligible for fast sampling.
+        local_fast = local_symbols.intersection(targets, CAPACITY_RELAY_SYMBOLS)
+        count = len(local_fast)
+        baseline = len(local_symbols) * CAPACITY_MONITOR_RESERVE
         allowance = baseline + count * (60 / FAST_CAPACITY_POLL_INTERVAL - 60 / CAPACITY_POLL_INTERVAL)
         if isinstance(self.market, MarketData) and isinstance(self.market.api.budget, RateBudget):
             self.market.api.budget.configure_capacity_reserve(math.ceil(allowance))
             allowance = self.market.api.budget.snapshot()["capacity_reserve"]
-        if allowance <= 0:
-            return dict.fromkeys(MARKET_SYMBOLS, 60), 60, False
-        scale = max(1, baseline / allowance)
-        intervals = dict.fromkeys(MARKET_SYMBOLS, CAPACITY_POLL_INTERVAL * scale)
-        if count and scale == 1:
+        self.local_capacity_poll_enabled = bool(local_symbols) and allowance > 0
+        scale = max(1, baseline / allowance) if allowance > 0 else 1
+        intervals = dict.fromkeys(MARKET_SYMBOLS, CAPACITY_POLL_INTERVAL * scale if allowance > 0 else 60)
+        if count and allowance > 0 and scale == 1:
             remaining = allowance - baseline + count * 60 / CAPACITY_POLL_INTERVAL
             interval = max(FAST_CAPACITY_POLL_INTERVAL, 60 / math.floor(remaining / count))
-            intervals.update(dict.fromkeys(targets, interval))
-        return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL * scale, True
+            intervals.update(dict.fromkeys(local_fast, interval))
+        # Relay reads spend no local Aster weight and stay independent of a
+        # constrained main host, including when its reserve falls to zero.
+        intervals.update({symbol: FAST_CAPACITY_POLL_INTERVAL if symbol in targets else CAPACITY_POLL_INTERVAL
+                          for symbol in remote_symbols})
+        return intervals, PUBLIC_BRACKETS_REFRESH_INTERVAL * scale, bool(remote_symbols) or self.local_capacity_poll_enabled
 
     def poll_public_brackets(self, symbol):
-        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.capacity_market_symbols():
-            return self.capacity_brackets_interval
+        if self.shutdown.is_set() or not self.capacity_sampling_enabled(symbol) or symbol not in self.capacity_market_symbols():
+            return self.brackets_interval(symbol)
         try:
             self.market.refresh_public_brackets(symbol)
-            return self.capacity_brackets_interval
+            return self.brackets_interval(symbol)
         except (TradingError, KeyError, ValueError, TypeError) as exc:
-            floor = 1 if isinstance(self.market, MarketData) and self.market.remote_capacity is True else 10
+            floor = 1 if self.uses_capacity_relay(symbol) else 10
             return max(floor, getattr(exc, "retry_after", 0))
 
     def poll_market(self, symbol):
-        if self.shutdown.is_set() or not self.capacity_poll_enabled or symbol not in self.capacity_market_symbols():
+        if self.shutdown.is_set() or not self.capacity_sampling_enabled(symbol) or symbol not in self.capacity_market_symbols():
             return self.capacity_interval(symbol)
         try:
             with self.lock:
@@ -930,7 +943,7 @@ class Engine:
             self.scheduler_event.set()
             if isinstance(exc, PublicBracketsUnavailable):
                 return CAPACITY_POLL_INTERVAL
-            if isinstance(self.market, MarketData) and self.market.remote_capacity is True:
+            if self.uses_capacity_relay(symbol):
                 return PollBackoff(max(.5, getattr(exc, "retry_after", 0)))
             return PollBackoff(max(10, getattr(exc, "retry_after", 0)))
 
@@ -2672,7 +2685,7 @@ class Engine:
         try:
             self.dashboard_reports.start(self._dashboard_report_accounts)
             if isinstance(self.market, MarketData) and not self.shutdown.is_set():
-                self.market.api.budget.configure_capacity_reserve(0 if self.market.remote_capacity is True else CAPACITY_MONITOR_RESERVE)
+                self.capacity_poll_schedule({})
                 self.market.set_update_listener(self.on_cycle_market_update)
                 self.market.set_capacity_update_listener(lambda symbol, kind: self.scheduler_event.set())
                 try:

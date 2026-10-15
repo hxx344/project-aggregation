@@ -638,3 +638,17 @@
 **证据：** project-aggregation 基于 `91bc47e` 的 2026-10-15 监控简化工作区，首版 [兼容映射](modules/aster/trading/monitoring.py) 在上述两类请求中分别扩大及关闭通知范围；只读审查用纯内存复现，首次提交前在 [事务写入](modules/aster/trading/store.py) 修复并补回归。该缺陷属于本轮新实现，基线不含 v2 模型。
 
 **事件记录：** `aster-monitoring-legacy-idempotence-20261015`；一次首次提交前审查发现，不推进主线复盘检查点。
+
+### L043：混合行情来源按标的同步路由、预算与调度
+
+**适用条件：** 同一工作台中，部分币种从副服务器读取公开额度与杠杆档位，其他币种由主服务器直接请求交易所。
+
+**根因：** 全局“已配置中继”被同时用作所有币种的来源、免费请求和快采依据。中继只提供金银时，其他币种会一直读取失败；若只改请求路由，主服务器实际承担的请求仍会被按零成本、高频调度。
+
+**以后做法：** 用统一的按币种来源判断覆盖请求、预算与失败退避。只有金银可以使用中继，其他币种沿用主服务器低频读取。预算仅计入本机采样；本机额度不足不停止中继消费。忽略旧中继配置推送的其他币种，保留原采样时间、有效期和失败语义，不能通过放宽有效期掩盖降低频率。
+
+**如何验证：** [路由集成测试](modules/aster/tests/test_capacity_relay_integration.py) 验证金银与其他币种的真实请求目的地、权重和故障隔离；[混合调度测试](modules/aster/tests/test_capacity_source_scheduling.py) 验证低频、低/零预算、私有调度成本与限流退避；[中继客户端测试](modules/aster/tests/test_capacity_relay_client.py) 验证其他币种不能更新金银缓存、样本健康或触发调度。
+
+**证据：** project-aggregation `f01d20d` 的 [公开采样](modules/aster/trading/exchange.py) 及 [调度](modules/aster/trading/engine.py) 按中继是否存在统一分流和清零预算。2026-10-15 用户明确要求仅金银走副服务器，其他币种走主服务器；本轮修正统一覆盖实际读取与混合预算，并补充上述定向回归。
+
+**事件记录：** `aster-capacity-per-symbol-source-20261015`；一次用户纠正及相关调用链修正，不推进主线复盘检查点。

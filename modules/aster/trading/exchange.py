@@ -19,6 +19,7 @@ from eth_account.messages import encode_typed_data
 
 import monitor
 from .account_cache import CycleAccountCache, HotAccountUnavailable
+from .capacity_relay_client import CAPACITY_RELAY_SYMBOLS
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from .depth_stream import PublicDepthStream
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
@@ -530,6 +531,10 @@ class MarketData:
     def remote_capacity(self):
         return self.capacity_relay is not None
 
+    def uses_capacity_relay(self, symbol):
+        """Only gold and silver use the optional remote public-data source."""
+        return self.capacity_relay is not None and symbol in CAPACITY_RELAY_SYMBOLS
+
     def set_capacity_update_listener(self, listener):
         if self.capacity_relay is not None:
             self.capacity_relay.set_update_listener(listener)
@@ -901,7 +906,7 @@ class MarketData:
 
     def _public_sample(self, path, symbol, *, brackets=False, priority=True):
         """Share only unsigned public responses, with one in-flight read per key."""
-        if self.capacity_relay is not None:
+        if self.uses_capacity_relay(symbol):
             # Remote samples already carry their source age in local clock
             # coordinates. Neither receiving nor rereading may freshen them.
             sample = self.capacity_relay.sample("brackets" if brackets else "oi", symbol,

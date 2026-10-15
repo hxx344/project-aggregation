@@ -122,6 +122,56 @@ class RelayClientTests(unittest.TestCase):
         self.assertEqual(self.client.sample("oi", SYMBOL, 8), (97, 997, envelope["payload"]))
         self.assertEqual(len(self.requests), 2)
 
+    def test_only_gold_and_silver_samples_are_cached_and_return_original_age(self):
+        updates = []
+        self.client.set_update_listener(lambda symbol, kind: updates.append((symbol, kind)))
+        for symbol in ("XAUUSD1", "XAGUSD1"):
+            for kind in ("oi", "brackets"):
+                envelope = self.envelope(age=0.1, kind=kind, symbol=symbol)
+                self.assertTrue(self.client._accept(envelope))
+                started, checked, payload = self.client.sample(kind, symbol, 8)
+                self.assertAlmostEqual(started, 99.9)
+                self.assertAlmostEqual(checked, 999.9)
+                self.assertEqual(payload, envelope["payload"])
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.client.status()["cached_samples"], 4)
+        self.assertEqual(updates, [(symbol, kind) for symbol in ("XAUUSD1", "XAGUSD1")
+                                  for kind in ("oi", "brackets")])
+
+    def test_non_metal_reads_fail_before_http_or_shared_request_state_changes(self):
+        before = self.client.status()
+        for symbol in ("CLUSD1", "SPCXUSD1", "BTCUSD1", "XAUUSDT", "xauusd1"):
+            for kind in ("oi", "brackets"):
+                with self.subTest(symbol=symbol, kind=kind), self.assertRaises(TradingError):
+                    self.client.sample(kind, symbol, 8)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.client.status(), before)
+        self.assertEqual(self.client._last_attempt, {})
+        self.assertEqual(self.client._inflight, {})
+
+    def test_non_metal_push_cannot_replace_epoch_cache_health_or_notify_scheduler(self):
+        updates = []
+        self.client._connected = True
+        self.client._ws_connected_ticks = self.ticks
+        self.client.set_update_listener(lambda *args: updates.append(args))
+        self.assertTrue(self.client._accept(self.envelope(sequence=20)))
+        updates.clear()
+        self.advance(1)
+        self.client._last_error = "stream_unavailable"
+        before = self.client.status()
+        epoch, serial = self.client._epoch, self.client._epoch_serial
+        order = dict(self.client._order)
+        for symbol in ("CLUSD1", "SPCXUSD1", "BTCUSD1"):
+            for kind in ("oi", "brackets"):
+                with self.subTest(symbol=symbol, kind=kind):
+                    self.assertFalse(self.client._accept(self.envelope(
+                        age=0, sequence=100, symbol=symbol, kind=kind, epoch=str(uuid4()))))
+        self.assertEqual(self.client.status(), before)
+        self.assertEqual((self.client._epoch, self.client._epoch_serial), (epoch, serial))
+        self.assertEqual(self.client._retired_epochs, set())
+        self.assertEqual(self.client._order, order)
+        self.assertEqual(updates, [])
+
     def test_duplicate_and_out_of_order_samples_never_renew_age(self):
         self.assertTrue(self.client._accept(self.envelope(age=0.5, sequence=20)))
         original = self.client.sample("oi", SYMBOL, 8)
@@ -353,6 +403,71 @@ class RelayClientTests(unittest.TestCase):
         self.client.close()
         self.assertFalse(self.client._thread.is_alive())
         self.assertFalse(self.client.status()["connected"])
+
+    def test_websocket_ignores_old_extra_symbol_configuration_without_health_updates(self):
+        messages = queue.Queue()
+        processed = threading.Event()
+        checkpoint = object()
+        updates = []
+        class Connection:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def recv(self, timeout):
+                try:
+                    message = messages.get(timeout=timeout)
+                except queue.Empty:
+                    raise TimeoutError from None
+                if message is checkpoint:
+                    processed.set()
+                    raise TimeoutError
+                return message
+        self.client._connect = lambda *args, **kwargs: Connection()
+        self.client.set_update_listener(lambda *args: updates.append(args))
+        for symbol in ("CLUSD1", "SPCXUSD1", "BTCUSD1"):
+            for kind in ("oi", "brackets"):
+                messages.put(json.dumps(self.envelope(symbol=symbol, kind=kind)))
+        messages.put(checkpoint)
+        self.client.start()
+        self.assertTrue(processed.wait(2))
+        status = self.client.status()
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["cached_samples"], 0)
+        self.assertIsNone(status["ws"]["last_message_at"])
+        self.assertIsNone(status["ws"]["last_sample_at"])
+        self.assertIsNone(status["ws"]["last_oi_sample_at"])
+        self.assertFalse(status["ws"]["has_oi_sample"])
+        self.assertEqual(status["ws"]["failure_count"], 0)
+        self.assertIsNone(self.client._epoch)
+        self.assertEqual(updates, [])
+        for message in ("not-json", json.dumps({"kind": "oi"}),
+                        json.dumps({"symbol": None}), json.dumps({"symbol": []})):
+            with self.subTest(message=message):
+                processed.clear()
+                self.advance(0.1)
+                messages.put(message)
+                messages.put(checkpoint)
+                self.assertTrue(processed.wait(2))
+                status = self.client.status()
+                self.assertEqual(status["ws"]["last_message_at"], self.wall)
+                self.assertIsNone(status["ws"]["last_sample_at"])
+                self.assertIsNone(status["ws"]["last_oi_sample_at"])
+                self.assertFalse(status["ws"]["has_oi_sample"])
+                self.assertEqual(status["cached_samples"], 0)
+                self.assertEqual(updates, [])
+        processed.clear()
+        self.advance(0.25)
+        messages.put(json.dumps(self.envelope(symbol="XAGUSD1")))
+        messages.put(checkpoint)
+        self.assertTrue(processed.wait(2))
+        status = self.client.status()
+        self.assertEqual(status["cached_samples"], 1)
+        self.assertEqual(status["ws"]["last_message_at"], self.wall)
+        self.assertEqual(status["ws"]["last_oi_sample_at"], self.wall)
+        self.assertTrue(status["ws"]["has_oi_sample"])
+        self.assertEqual(updates, [("XAGUSD1", "oi")])
+        self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

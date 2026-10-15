@@ -8,7 +8,6 @@ import json
 import logging
 import math
 import os
-import re
 import ssl
 import threading
 import time
@@ -21,6 +20,9 @@ from websockets.sync.client import connect as websocket_connect
 from .models import TradingError
 
 
+CAPACITY_RELAY_SYMBOLS = frozenset(("XAUUSD1", "XAGUSD1"))
+
+
 @dataclass(frozen=True)
 class _Sample:
     started: float
@@ -31,7 +33,7 @@ class _Sample:
 
 
 class PublicCapacityRelayClient:
-    """A shared stream cache with deduplicated, rate-limited HTTP cache reads.
+    """Gold/silver stream cache with deduplicated, rate-limited HTTP cache reads.
 
     Construction performs no network I/O. Both transports verify certificates
     and hostnames using the same trust store. The relay token never enters URLs,
@@ -212,8 +214,10 @@ class PublicCapacityRelayClient:
 
     @staticmethod
     def _key(kind, symbol):
-        if kind not in ("oi", "brackets") or not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]{1,32}", symbol):
+        if kind not in ("oi", "brackets") or not isinstance(symbol, str):
             raise TradingError("容量中继采样类型或交易对无效")
+        if symbol not in CAPACITY_RELAY_SYMBOLS:
+            raise TradingError("容量中继仅支持 XAUUSD1 和 XAGUSD1")
         return kind, symbol
 
     @staticmethod
@@ -430,13 +434,21 @@ class PublicCapacityRelayClient:
                             message = connection.recv(timeout=self._RECV_TIMEOUT)
                         except TimeoutError:
                             continue
-                        with self._lock:
-                            if not self._stop.is_set() and generation == self._connection_generation:
-                                self._ws_last_message_at = self._clock()
                         try:
                             envelope = json.loads(message)
                         except (TypeError, ValueError, UnicodeError):
+                            envelope = None
+                        # Old relay installations may still push extra symbols.
+                        # Ignore them before transport/sample health or scheduling
+                        # state can be updated; only metals use this data source.
+                        symbol = envelope.get("symbol") if isinstance(envelope, dict) else None
+                        if isinstance(symbol, str) and symbol not in CAPACITY_RELAY_SYMBOLS:
                             continue
+                        # Unidentified/malformed frames still count as transport
+                        # activity, but _accept cannot make them valid samples.
+                        with self._lock:
+                            if not self._stop.is_set() and generation == self._connection_generation:
+                                self._ws_last_message_at = self._clock()
                         self._accept(envelope, generation=generation)
             except Exception:
                 with self._lock:
