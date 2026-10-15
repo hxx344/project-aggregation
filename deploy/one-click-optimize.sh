@@ -298,7 +298,7 @@ main() {
       echo ""
       print_warning "检测到下载速度较慢（${DOWNLOAD_SPEED} MB/s < ${SPEED_THRESHOLD} MB/s）"
       echo ""
-      read -p "是否立即部署 Nginx 镜像？(y/N) " -n 1 -r
+      read -p "是否立即部署 Nginx 镜像？(y/N) " -n 1 -r </dev/tty
       echo
       if [[ $REPLY =~ ^[Yy]$ ]]; then
         if deploy_nginx_mirror; then
