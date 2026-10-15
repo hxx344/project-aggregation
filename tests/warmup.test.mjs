@@ -97,6 +97,66 @@ test('custom targets accelerate only selected projects and preserve a faster sou
   for (const id of ['monitor', 'asset', 'variational', 'greeks']) assert.deepEqual(f.times(id), [100], id);
 });
 
+test('summary reads use the remaining source lifetime at the last check before cached data expires', async t => {
+  const f = await fixture(t, { warmupEnabled: false });
+  f.handlers.crossex = () => ({ ...summary(), state: 'online', staleAfterSeconds: 15,
+    updatedAt: new Date(Date.now() - 7900).toISOString() });
+  await f.advance(7500);
+  assert.deepEqual(f.times('crossex'), [100, 4000], 'the fixed check-time lifetime schedules one read, without a sliding deadline');
+  const saved = f.saved('crossex');
+  assert.equal(saved.updatedAt, new Date(INITIAL + 4000 - 7900).toISOString(), 'sampling must retain the real source timestamp');
+  assert.equal(saved.staleAfterSeconds, 15, 'sampling must not extend the source TTL');
+  assert.ok(Date.now() - Date.parse(saved.updatedAt) < saved.staleAfterSeconds * 1000);
+  await f.advance(500);
+  assert.deepEqual(f.times('crossex'), [100, 4000, 8000]);
+});
+
+test('partial dynamic summaries use the stricter project TTL and retain the one-second minimum', async t => {
+  const f = await fixture(t, { warmupEnabled: false });
+  f.configure('crossex', { staleAfterSeconds: 30 });
+  f.handlers.crossex = () => ({ ...summary(), state: 'partial', staleAfterSeconds: 60,
+    updatedAt: new Date(Date.now() - 20000).toISOString() });
+  await f.advance(5000);
+  assert.deepEqual(f.times('crossex'), [100]);
+  await f.advance(1000);
+  assert.deepEqual(f.times('crossex'), [100, 6000]);
+  f.handlers.crossex = () => ({ ...summary(), state: 'online', staleAfterSeconds: 15,
+    updatedAt: new Date(Date.now() - 14900).toISOString() });
+  await f.app.check('crossex');
+  await f.advance(999);
+  assert.deepEqual(f.times('crossex'), [100, 6000, 6000]);
+  await f.advance(1);
+  assert.deepEqual(f.times('crossex'), [100, 6000, 6000, 7000]);
+});
+
+test('static, failed and invalid source snapshots retain the normal summary cadence', async t => {
+  for (const [name, overrides] of [
+    ['static', { freshness: 'static' }],
+    ['offline', { state: 'offline' }],
+    ['stale', { state: 'stale' }],
+    ['missing source time', { updatedAt: null }],
+    ['invalid source time', { updatedAt: 'invalid' }],
+    ['already expired', { updatedAt: new Date(INITIAL - 20000).toISOString() }],
+    ['future source time', { updatedAt: new Date(INITIAL + 60000).toISOString() }],
+  ]) await t.test(name, async t => {
+    const f = await fixture(t, { warmupEnabled: false });
+    f.handlers.crossex = () => ({ ...summary(), state: 'online', staleAfterSeconds: 15,
+      updatedAt: new Date(Date.now() - 7900).toISOString(), ...overrides });
+    await f.advance(8000);
+    assert.deepEqual(f.times('crossex'), [100, 8000]);
+  });
+  await t.test('failed read retains the last successful summary without accelerating retries', async t => {
+    const f = await fixture(t, { warmupEnabled: false });
+    f.handlers.crossex = () => ({ ...summary(), state: 'online', staleAfterSeconds: 15,
+      updatedAt: new Date(Date.now() - 7900).toISOString() });
+    await f.advance(100);
+    f.handlers.crossex = () => { throw new Error('Synthetic summary failure'); };
+    await f.app.check('crossex');
+    await f.advance(7900);
+    assert.deepEqual(f.times('crossex'), [100, 100, 8000]);
+  });
+});
+
 test('environment targets are trimmed and empty entries removed; omitted targets use the defaults', async t => {
   for (const [name, targets, expected] of [
     ['explicit', ' asset, asset, , monitor, ', ['asset', 'monitor']],

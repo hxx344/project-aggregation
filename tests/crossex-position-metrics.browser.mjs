@@ -187,6 +187,7 @@ async (page) => {
     assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'missing funding cannot retain a healthy label');
     missingFunding = false; partial = true; await refresh();
     await module.getByText('持仓数据不完整', { exact: false }).first().waitFor();
+    await module.locator('.account-identity').getByText('数据不完整', { exact: true }).waitFor();
     assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'partial account evidence cannot retain a healthy label');
     partial = false; await refresh();
     await btc.locator('.position-health').filter({ hasText: '良好' }).waitFor();
@@ -237,11 +238,14 @@ async (page) => {
     now += 16_000;
     await page.clock.runFor(16_000);
     await btc.locator('.position-metrics-summary').getByText('数据待更新', { exact: true }).waitFor();
+    await module.locator('.account-identity').getByText('数据已过期', { exact: true }).waitFor();
+    assert(await module.locator('.account-identity').getByText('已同步', { exact: true }).count() === 0, 'cached live status cannot contradict local account expiry');
     assert(await btc.getByRole('button', { name: '平仓组合', exact: true }).isDisabled(), 'aged account data still disables closing');
     assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'expired evidence removes the healthy assessment');
     await page.setViewportSize({ width: 1440, height: 1050 });
     accountAt = now; fundingAt = now; await refresh();
     await btc.locator('.position-health').filter({ hasText: '良好' }).waitFor();
+    await module.locator('.account-identity').getByText('已同步', { exact: true }).waitFor();
 
     const mutations = requests.filter(r => r.method !== 'GET');
     assert(mutations.length === 1 && mutations[0].origin === origin && mutations[0].path === '/api/projects/crossex/launch', 'only the synthetic Hub launch POST is sent');

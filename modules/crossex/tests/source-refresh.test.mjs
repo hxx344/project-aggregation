@@ -17,9 +17,11 @@ function deferred(t) {
 }
 
 test('default source cadence keeps discovery quotes fresh across out-of-phase five-second upstream snapshots', async t => {
-  t.mock.timers.enable({ apis: ['setInterval'] });
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  let monotonicNow = 0;
+  t.mock.method(performance, 'now', () => monotonicNow);
   async function replay(pageIntervalMs, sourceIntervalMs) {
-    let now = epoch;
+    let now = epoch; monotonicNow = 0;
     const directory = mkdtempSync(join(tmpdir(), 'crossex-refresh-test-'));
     const app = createApp({ dataDir: directory, initialPassword: 'cadence-test-password',
       ...(sourceIntervalMs ? { sourceIntervalMs } : {}), logger() {},
@@ -35,7 +37,7 @@ test('default source cadence keeps discovery quotes fresh across out-of-phase fi
       await turn();
       let displayed = app.market.view().source, oldSamples = 0;
       for (let elapsed = 100; elapsed <= 30000; elapsed += 100) {
-        now = epoch + elapsed; t.mock.timers.tick(100); await turn();
+        now = epoch + elapsed; monotonicNow = elapsed; t.mock.timers.tick(100); await turn();
         // The browser reads just before the next backend poll; include 200 ms
         // of transit time in the display's conservative age calculation.
         if (elapsed % pageIntervalMs === pageIntervalMs - 100) displayed = app.market.view().source;
@@ -143,8 +145,9 @@ for (const update of ['identity', 'normal', 'offline']) test(`close rechecks ide
 });
 
 for (const blocked of ['catalog', 'account read']) test(`app keeps refreshing every interval while ${blocked} is blocked`, async t => {
-  t.mock.timers.enable({ apis: ['setInterval'] });
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
   const gate = deferred(t), entered = deferred(); let now = epoch, reads = 0, closed = false;
+  t.mock.method(performance, 'now', () => now - epoch);
   const directory = mkdtempSync(join(tmpdir(), 'crossex-refresh-test-'));
   const app = createApp({ dataDir: directory, initialPassword: 'source-refresh-test-password', intervalMs: 5000,
     engineOptions: {
@@ -152,7 +155,7 @@ for (const blocked of ['catalog', 'account read']) test(`app keeps refreshing ev
       feedReader: async () => { reads++; return feed(now); },
       catalogReader: async () => { if (blocked === 'catalog') { entered.resolve(); await gate.promise; } return catalog; },
       depthReader: async q => book(q, now),
-    }, liveOptions: { clock: () => now, clientFactory: () => ({
+    }, liveOptions: { clock: () => now, requestTimeoutMs: 60000, clientFactory: () => ({
       async getAccount() { if (blocked === 'account read') { entered.resolve(); await gate.promise; } return { user_id: '12345', position_mode: 'DUAL', account_mode: 'CROSS_EXCHANGE', assets: [] }; },
       async getPositions() { return []; }, async getOpenOrders() { return []; },
     }) }, logger() {},

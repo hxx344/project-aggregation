@@ -38,21 +38,31 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
   const terminal = createTerminalMarket({ ...terminalOptions, market });
   const csrf = randomBytes(32).toString('base64url');
   const auth = createAuthenticator({ getRecord: () => store.get('password') });
-  let runningTick = false, stopping = false, workspaceMaintenance = Boolean(authorizeRequest && initialWorkspaceMaintenance);
+  let accountTimer = null, stopping = false, workspaceMaintenance = Boolean(authorizeRequest && initialWorkspaceMaintenance);
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
-  const runTick = async () => {
+  const runTick = () => {
     if (stopping) return;
-    // Market discovery and account reconciliation are independent read-only lanes.
+    // Each market reader owns its in-flight request. Neither can delay accounts.
     void market.refreshSource();
-    if (runningTick) return;
-    runningTick = true;
-    try { await Promise.all([market.refreshCatalog(), live.refresh({ includeView: false })]); }
-    catch { logger('账户或行情本轮读取未完成，等待下一次检查'); }
-    finally { runningTick = false; }
+    void market.refreshCatalog();
+  };
+  const pollAccount = async () => {
+    if (stopping) return;
+    const startedAt = performance.now();
+    try { await live.refresh({ includeView: false }); }
+    catch { logger('账户本轮读取未完成，等待下一次检查'); }
+    finally {
+      // One chain prevents overlap; slow reads resume promptly instead of
+      // losing another full interval to a skipped fixed timer tick.
+      if (!stopping) {
+        accountTimer = setTimeout(pollAccount, Math.max(0, intervalMs - (performance.now() - startedAt)));
+        accountTimer.unref();
+      }
+    }
   };
   const timer = intervalMs > 0 ? setInterval(runTick, intervalMs) : null; timer?.unref();
   const sourceTimer = sourceIntervalMs > 0 ? setInterval(() => { if (!stopping) void market.refreshSource(); }, sourceIntervalMs) : null; sourceTimer?.unref();
-  if (intervalMs > 0) void runTick();
+  if (intervalMs > 0) { runTick(); void pollAccount(); }
   async function authenticate(req) {
     if (authorizeRequest) return authorizeRequest(req);
     return auth.authenticate(req.headers.authorization || '');
@@ -108,5 +118,5 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     } catch (error) { if (!res.headersSent) json(res, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : '操作未完成，请检查服务状态', ...(error.requestStatus === 'not_submitted' ? { requestStatus: 'not_submitted' } : {}) }); else res.end(); }
   });
   server.requestTimeout = 15000; server.headersTimeout = 10000;
-  return { server, market, live, terminal, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); auth.reset(); return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); await live.stop(); await terminal.stop(); await market.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
+  return { server, market, live, terminal, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); auth.reset(); return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); clearTimeout(accountTimer); await live.stop(); await terminal.stop(); await market.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
 }

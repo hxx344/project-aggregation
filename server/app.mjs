@@ -544,8 +544,15 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     const state = states.get(project.id);
     // Share the summary schedule so faster refreshes already keep the app warm.
     const warmupPeriod = warmupEnabled && warmupProjectIds.has(project.id) ? warmupIntervalMs : Infinity;
-    const period = Math.max(1000, Math.min(refreshInterval, (state?.staleAfterSeconds || project.staleAfterSeconds) * 500, warmupPeriod));
-    return !state?.checkedAt || Date.now() - new Date(state.checkedAt).getTime() >= period;
+    const ttlMs = Math.min(project.staleAfterSeconds, state?.staleAfterSeconds || project.staleAfterSeconds) * 1000;
+    const checkedAt = Date.parse(state?.checkedAt || ''), updatedAt = Date.parse(state?.updatedAt || '');
+    // A healthy source can already be several seconds old when sampled. Keep
+    // its next read inside the remaining lifetime, anchored to this check.
+    const remainingAtCheck = updatedAt + ttlMs - checkedAt;
+    const sourcePeriod = state?.freshness !== 'static' && ['online', 'partial'].includes(state?.state)
+      && Number.isFinite(remainingAtCheck) && remainingAtCheck > 0 ? remainingAtCheck / 2 : Infinity;
+    const period = Math.max(1000, Math.min(refreshInterval, ttlMs / 2, warmupPeriod, sourcePeriod));
+    return !state?.checkedAt || Date.now() - checkedAt >= period;
   }).map(project => check(project.id))); }
   const interval = refreshInterval > 0 ? setInterval(() => { if (!closed) void refresh(true); }, Math.min(refreshInterval, 1000)) : null;
   interval?.unref();
