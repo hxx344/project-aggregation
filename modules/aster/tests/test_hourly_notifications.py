@@ -215,7 +215,7 @@ class HourlyNotificationStoreTests(unittest.TestCase):
     def test_interval_change_cancels_only_summary_and_preserves_last_sent(self):
         old = self.queue()
         with self.store.connect() as db:
-            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('event','event',0,'trade_summary','[]')")
+            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('event','event',0,'trade_summary',?)", ('["XAUUSD1"]',))
         self.store.put("hourly_summary_schedule", {"next_due_at": 7200, "last_sent_at": 100})
         self.now = 3617
         self.store.edit_monitoring({"hourly_summary_interval_minutes": 15})

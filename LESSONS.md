@@ -624,3 +624,17 @@
 **证据：** project-aggregation `63d621d` 的 [划转实现](modules/aster/trading/margin_balance.py) 在 `_check_snapshots` 限制指定标的和方向，`_plan` 使用 `ordinary.margin_limit`；[配对入口](modules/aster/trading/pairing.py) 及 [执行调度](modules/aster/trading/pair_execution.py) 先要求策略仓位和行情。2026-10-15 用户明确要求保证金平衡独立于持仓标的，本轮定向回归覆盖上述误阻断。
 
 **事件记录：** `aster-transfer-strategy-coupling-20261015`；一次用户纠正及完整调用链修复，不推进主线复盘检查点。
+
+### L042：旧配置的同值写入不能覆盖新模型的细分选择
+
+**适用条件：** 配置从总开关迁移到逐项选择，且新旧客户端在过渡期共用写接口。
+
+**根因：** 先把旧开关转换为完整的新配置，再比较最终值，会把旧客户端的重复保存变成实质修改。新模型能够表达的细分选择多于旧开关，转换不是可逆操作。
+
+**以后做法：** 在执行兼容映射前按旧字段的现有值过滤同值写入，同一请求里的真实变更仍照常处理。新模型作为运行时依据，旧字段只承担明确的兼容操作；保留事务内通知取消、版本号和状态重置的幂等语义。
+
+**如何验证：** [监控迁移回归](modules/aster/tests/test_monitoring_migration.py) 交错使用新旧客户端：只选上新后重复保存旧告警开启，不能新增其他类型；旧全局额度开关关闭、新模型显式开启本币额度后，重复保存旧订阅开启，不能反向清空通知。另覆盖同值全局字段、顺序不同的同一类型集合，以及混合请求中真实变更仍生效。
+
+**证据：** project-aggregation 基于 `91bc47e` 的 2026-10-15 监控简化工作区，首版 [兼容映射](modules/aster/trading/monitoring.py) 在上述两类请求中分别扩大及关闭通知范围；只读审查用纯内存复现，首次提交前在 [事务写入](modules/aster/trading/store.py) 修复并补回归。该缺陷属于本轮新实现，基线不含 v2 模型。
+
+**事件记录：** `aster-monitoring-legacy-idempotence-20261015`；一次首次提交前审查发现，不推进主线复盘检查点。

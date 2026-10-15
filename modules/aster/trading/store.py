@@ -1,5 +1,6 @@
 """Durable execution intents and notification outbox, isolated per account."""
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 from fractions import Fraction
 import json
@@ -175,6 +176,7 @@ class Store:
                 if name not in columns:
                     db.execute(f"ALTER TABLE outbox ADD COLUMN {name} {kind}")
             db.execute("CREATE INDEX IF NOT EXISTS idx_outbox_category_pending ON outbox(category,expires_at) WHERE delivered_at IS NULL")
+            monitoring.initialize(db)
             event_columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
             if "cycle_check" not in event_columns:
                 db.execute("ALTER TABLE events ADD COLUMN cycle_check TEXT")
@@ -736,42 +738,43 @@ class Store:
             return monitoring.read(db)
 
     def edit_monitoring(self, changes, *, symbol=None):
-        fields = ("monitor", "alerts", "max_capacity_alert") if symbol is not None else monitoring.DEFAULTS
+        fields = monitoring.SYMBOL_FIELDS if symbol is not None else monitoring.GLOBAL_FIELDS
         monitoring.validate_edit(changes, fields)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             state = listing_alerts.read(db, "usd1_listings", {})
             config = monitoring.register_symbols(db, set(MARKET_SYMBOLS) | set(state.get("rows", {})))
+            previous = deepcopy(config)
+            previous_watch = desired_watch = False
             if symbol is not None:
                 monitoring.validate_symbol(db, symbol)
-                options = config["symbols"][symbol]
                 previous_watch = listing_alerts.read(db, listing_alerts.WATCH_PREFIX + symbol, {}).get("enabled", False)
-                if all(value == (previous_watch if key == "max_capacity_alert" else options[key]) for key, value in changes.items()):
-                    return config
-                options.update({key: value for key, value in changes.items() if key != "max_capacity_alert"})
+                effective_changes = {key: value for key, value in changes.items()
+                                     if key not in ("alerts", "max_capacity_alert") or value !=
+                                     (previous_watch if key == "max_capacity_alert" else config["symbols"][symbol][key])}
+                desired_watch = monitoring.edit_symbol(config, symbol, effective_changes, previous_watch)
             else:
-                if all(config[key] == value for key, value in changes.items()):
-                    return config
-                hourly_changed = any(key in changes and config[key] != changes[key]
-                                     for key in ("feishu_enabled", "hourly_summary_alerts", "hourly_summary_interval_minutes"))
-                relay_changed = any(key in changes and config[key] != changes[key]
-                                    for key in ("feishu_enabled", "relay_health_alerts"))
-                position_changed = any(key in changes and config[key] != changes[key]
-                                       for key in ("feishu_enabled", "position_imbalance_alerts"))
-                config.update(changes)
+                monitoring.edit_global(config, {key: value for key, value in changes.items() if config[key] != value},
+                                       set(listing_alerts.selected_symbols(db)))
+            if config == previous and previous_watch == desired_watch:
+                return config
             config["revision"] += 1
             monitoring.write(db, config)
-            if "max_capacity_alert" in changes:
-                listing_alerts.set_watch(db, symbol, changes["max_capacity_alert"], time.time())
+            if previous_watch != desired_watch:
+                listing_alerts.set_watch(db, symbol, desired_watch, time.time())
             monitoring.cancel_disabled(db, config)
-            if symbol is None and hourly_changed:
+            if any(previous[key] != config[key] for key in
+                   ("feishu_enabled", "hourly_summary_alerts", "hourly_summary_interval_minutes")):
                 hourly_notifications.reset(db, time.time(), monitoring.allowed(config, "hourly_summary", []))
-            if symbol is None and relay_changed:
+            if any(previous[key] != config[key] for key in ("feishu_enabled", "relay_health_alerts")):
                 relay_health_notifications.reset(db)
-            if symbol is None and position_changed:
+            if previous["feishu_enabled"] != config["feishu_enabled"]:
                 position_imbalance_notifications.reset(db)
-            elif symbol is not None and "alerts" in changes:
-                position_imbalance_notifications.reset(db, symbol=symbol)
+            else:
+                for name in config["symbols"]:
+                    if (("position_imbalance" in previous["symbols"][name]["notification_types"])
+                            != ("position_imbalance" in config["symbols"][name]["notification_types"])):
+                        position_imbalance_notifications.reset(db, symbol=name)
             return config
 
     def observe_position_imbalance(self, observations, *, available, revision, instance_id, now=None):
@@ -822,6 +825,10 @@ class Store:
                     row["notification_phase"] = "suppressed"
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                        ("usd1_listings", dumps(state)))
+            for symbol in state.get("rows", {}):
+                if ("listing_capacity" in config["symbols"][symbol]["notification_types"]
+                        and not listing_alerts.read(db, listing_alerts.WATCH_PREFIX + symbol, {}).get("enabled")):
+                    listing_alerts.set_watch(db, symbol, True, time.time())
             for notification_id, message in alerts:
                 item = {"id": notification_id}
                 if changed or not monitoring.message_allowed(db, item, config):
@@ -831,9 +838,7 @@ class Store:
             listing_alerts.observe_all(db, state, time.time())
 
     def set_listing_watch(self, symbol, enabled):
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            listing_alerts.set_watch(db, symbol, enabled, time.time())
+        return self.edit_monitoring({"max_capacity_alert": enabled}, symbol=symbol)
 
     def listing_watch_symbols(self):
         with self.connect() as db:

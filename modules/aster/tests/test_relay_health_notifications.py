@@ -269,7 +269,7 @@ class RelayHealthEngineTests(unittest.TestCase):
 
     def queue_trade(self):
         with self.store.connect() as db:
-            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('trade','trade',0,'trade_summary','[]')")
+            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('trade','trade',0,'trade_summary',?)", ('["XAUUSD1"]',))
 
     def test_health_delivery_reads_local_status_only(self):
         self.status = telemetry(count=3)

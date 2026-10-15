@@ -123,7 +123,7 @@ def observe(db, observations, *, available, revision, instance_id, now):
     config = monitoring.read(db)
     if revision != config["revision"]:
         return False
-    if not available or not monitoring.allowed(config, CATEGORY, []):
+    if not available or not config["feishu_enabled"]:
         reset(db)
         return False
     if not finite_time(now) or not isinstance(instance_id, str) or not instance_id:

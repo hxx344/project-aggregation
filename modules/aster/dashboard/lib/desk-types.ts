@@ -128,7 +128,16 @@ export type Listings = {
   rows: Record<string, Listing>;
   watched_symbols?: string[];
 };
+export type NotificationType =
+  | 'new_listing'
+  | 'listing_capacity'
+  | 'strategy_capacity'
+  | 'trade_summary'
+  | 'position_imbalance';
 export type MonitoringSettings = {
+  schema_version: 2;
+  auto_discover: boolean;
+  default_notification_types: NotificationType[];
   monitoring_enabled: boolean;
   discovery_enabled: boolean;
   auto_monitor_new: boolean;
@@ -144,6 +153,8 @@ export type MonitoringSettings = {
 };
 export type MonitoredSymbol = {
   symbol: string;
+  monitor_enabled: boolean;
+  notification_types: NotificationType[];
   monitor: boolean;
   alerts: boolean;
   max_capacity_alert: boolean;

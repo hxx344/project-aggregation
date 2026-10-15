@@ -1,0 +1,199 @@
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Run: playwright-cli -s=aster-monitor run-code --filename tests/aster-monitor-center.browser.mjs
+// Real Hub login/launch/proxy/iframe and built ASTER assets, with isolated API data.
+async (page) => {
+  const origin = 'http://hub.localhost:39152';
+  const assert = (value, message) => { if (!value) throw new Error(message); };
+  const errors = [], unexpectedWrites = [], external = [], writes = [], observations = [];
+  const defaults = ['new_listing', 'strategy_capacity', 'trade_summary', 'position_imbalance'];
+  const settings = { schema_version: 2, monitoring_enabled: true, auto_discover: true, discovery_enabled: true,
+    auto_monitor_new: true, feishu_enabled: true, default_notification_types: [...defaults],
+    hourly_summary_alerts: true, relay_health_alerts: true, hourly_summary_interval_minutes: 60,
+    new_listing_alerts: true, strategy_capacity_alerts: true, listing_capacity_alerts: true,
+    trade_summary_alerts: true, position_imbalance_alerts: true };
+  const symbols = ['XAUUSD1', 'BTCUSD1', 'ETHUSD1', 'SOLUSD1', 'XRPUSD1'].map(symbol => ({ symbol,
+    monitor_enabled: symbol !== 'ETHUSD1', monitor: symbol !== 'ETHUSD1', alerts: true,
+    notification_types: defaults.filter(type => type !== 'strategy_capacity' || symbol === 'XAUUSD1'),
+    max_capacity_alert: false, can_watch: true, strategy_market: symbol === 'XAUUSD1',
+    required_by: symbol === 'ETHUSD1' ? ['fixture-account'] : [], effective_monitor: true,
+    detail_enabled: symbol !== 'ETHUSD1', status: symbol === 'SOLUSD1' ? 'CLOSE' : 'TRADING' }));
+  let moduleOrigin, rejectNext = false, failReads = false, demo = false, withAccount = false, frozenAt;
+  let revision = 0;
+  const state = () => {
+    const now = Date.now() / 1000;
+    return { workspaceManaged: true, ready: true, demo,
+      accounts: withAccount ? [{ id: 'fixture-account', name: '浏览器隔离账户', mode: 'paper', env_prefix: 'FIXTURE',
+        enabled: false, status: 'paused', reason: '', credential_ready: false, strategies: {},
+        policy: { threshold: '50000', order_notional: '1000', margin_limit: '0.5', spread_limit: '0.1',
+          min_open_leverage: 5, ordinary_symbol: 'all', symbols: ['XAUUSD1'] } }] : [],
+      pairs: [], markets: {}, events: [], updated_at: now,
+      monitoring: { settings, revision, symbols, strategy_capacity_environment_enabled: true },
+      listings: { enabled: !demo, initialized: true, monitoring_enabled: settings.monitoring_enabled,
+        discovery_enabled: settings.auto_discover, checked_at: now - 2, poll_seconds: 60, stale_seconds: 180,
+        rows: Object.fromEntries(symbols.map((symbol, index) => [symbol.symbol, { symbol: symbol.symbol,
+          status: symbol.status, onboard_at: now - 86400 * (index + 1), detected_at: now - 3600,
+          max_leverage: 20, capacity: '150000', remaining: '200000', bracket_cap: '150000',
+          checked_at: symbol.symbol === 'BTCUSD1' ? now - 181 : symbol.symbol === 'XAUUSD1' && frozenAt ? frozenAt : now - 1,
+          brackets_checked_at: now - 2, error: symbol.symbol === 'XRPUSD1' ? '浏览器夹具：公开额度读取失败' : null }])) },
+      notification: { enabled: settings.feishu_enabled, configured: true, pending: 3, routing_mode: 'split',
+        channels: { event: { configured: true, source: 'dedicated', pending: 2 },
+          scheduled: { configured: true, source: 'dedicated', pending: 1, error: '浏览器夹具：定时机器人等待重试' } },
+        hourly_summary: { interval_seconds: settings.hourly_summary_interval_minutes * 60,
+          next_due_at: now + 600, last_sent_at: now - 3000, pending: true } } };
+  };
+  await page.unrouteAll({ behavior: 'wait' });
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route('**/*', async route => {
+    const req = route.request(), url = new URL(req.url());
+    if (url.port !== '39152' || !(url.hostname === 'hub.localhost' || /^p-[a-f0-9]+\.hub\.localhost$/.test(url.hostname))) {
+      external.push(url.href); return route.abort('blockedbyclient');
+    }
+    if (url.origin !== origin && url.pathname === '/api/state') {
+      moduleOrigin = url.origin;
+      return route.fulfill(failReads ? { status: 503, json: { detail: 'Fixture unavailable' } } : { status: 200, json: state() });
+    }
+    if (!['GET', 'HEAD'].includes(req.method())) {
+      if (url.origin === origin && (url.pathname === '/api/login' || /^\/api\/projects\/(?:aster|asset|monitor|crossex|greeks)\/launch$/.test(url.pathname))) return route.continue();
+      if (url.origin !== origin && req.method() === 'PATCH' && /^\/api\/monitoring(?:\/symbols\/[^/]+)?$/.test(url.pathname)) {
+        const body = req.postDataJSON(); writes.push({ path: url.pathname, body });
+        if (rejectNext) { rejectNext = false; return route.fulfill({ status: 409, json: { detail: '浏览器夹具：本次保存被拒绝' } }); }
+        const name = url.pathname.split('/')[4];
+        if (name) {
+          const row = symbols.find(item => item.symbol === name);
+          assert(row, 'only fixture symbols may be edited');
+          Object.assign(row, body);
+          row.monitor = row.monitor_enabled;
+        } else Object.assign(settings, body);
+        revision += 1;
+        return route.fulfill({ status: 200, json: { ok: true } });
+      }
+      unexpectedWrites.push(`${req.method()} ${url.href}`);
+      return route.fulfill({ status: 405, json: { detail: 'Trading writes forbidden' } });
+    }
+    return route.continue();
+  });
+  await page.setViewportSize({ width: 1440, height: 1100 });
+  try {
+    await page.goto(`${origin}/?view=project&id=aster`);
+    const password = page.getByRole('textbox', { name: '工作台密码', exact: true });
+    if (await password.isVisible()) {
+      await password.fill('aster-notices-browser-fixture');
+      await page.getByRole('button', { name: '登录', exact: true }).click();
+    }
+    const iframe = page.locator('iframe[title="Aster 5x模块"]');
+    await iframe.waitFor();
+    const app = page.frameLocator('iframe[title="Aster 5x模块"]');
+    await app.getByRole('tab', { name: '币种监控中心', exact: true }).click();
+    await app.getByRole('heading', { name: '币种监控中心', exact: true }).waitFor();
+    const frame = page.frames().find(frame => frame.url().startsWith(moduleOrigin));
+    assert(frame, 'actual module iframe loaded');
+    const table = app.locator('.monitor-center-table');
+    const row = symbol => table.locator(`tr[data-symbol="${symbol}"]`);
+    const refresh = async () => {
+      const response = page.waitForResponse(response => response.url().startsWith(`${moduleOrigin}/api/state`));
+      await app.getByRole('button', { name: '刷新数据', exact: true }).first().click();
+      await (await response).finished();
+      await page.waitForTimeout(100);
+    };
+    assert(await app.getByRole('tab', { name: 'USD1 上新', exact: true }).count() === 0, 'old listings tab removed');
+    assert(await app.getByRole('tab', { name: '监控与告警', exact: true }).count() === 0, 'old monitoring tab removed');
+    for (const [symbol, status] of [['XAUUSD1', '监控中'], ['BTCUSD1', '数据过期'], ['ETHUSD1', '已暂停'], ['SOLUSD1', '非交易中'], ['XRPUSD1', '采样失败']]) {
+      assert((await row(symbol).innerText()).includes(status), `${symbol}: ${status}`);
+    }
+    assert((await row('ETHUSD1').innerText()).includes('交易保留采样'), 'required sampling is separate from independent pause');
+    const channels = app.getByRole('region', { name: '通知通道状态', exact: true });
+    assert((await channels.innerText()).includes('2 条待发送') && (await channels.innerText()).includes('1 条待发送'), 'channel counts remain separate');
+    observations.push('unified account-free entry, all five statuses and separate notification channels');
+
+    const search = app.getByRole('textbox', { name: '搜索监控币种', exact: true });
+    await search.fill('xau');
+    assert(await table.locator('tr[data-symbol]').count() === 1, 'case-insensitive symbol search');
+    await search.fill('');
+    await app.getByRole('combobox', { name: '筛选监控状态', exact: true }).selectOption('paused');
+    assert(await table.locator('tr[data-symbol]').count() === 1, 'status filter');
+    await app.getByRole('combobox', { name: '筛选监控状态', exact: true }).selectOption('all');
+
+    const pickerButton = app.getByRole('button', { name: 'XAUUSD1 配置通知', exact: true });
+    const picker = app.getByRole('form', { name: 'XAUUSD1 配置通知', exact: true });
+    const before = writes.length;
+    await pickerButton.click();
+    await picker.getByRole('button', { name: '清空', exact: true }).click();
+    await picker.getByRole('button', { name: '取消', exact: true }).click();
+    assert(writes.length === before, 'cancel does not write');
+    await pickerButton.click();
+    assert(await picker.getByRole('checkbox', { checked: true }).count() === 4, 'reopen restores saved selections');
+    await picker.getByRole('button', { name: '清空', exact: true }).click();
+    rejectNext = true;
+    await picker.getByRole('button', { name: '应用', exact: true }).click();
+    await picker.getByRole('alert').waitFor();
+    assert(await picker.getByRole('checkbox', { checked: true }).count() === 0, 'failure preserves draft');
+    await picker.getByRole('button', { name: '全选', exact: true }).click();
+    await picker.getByRole('button', { name: '应用', exact: true }).click();
+    await picker.waitFor({ state: 'hidden' });
+    assert(symbols[0].notification_types.length === 5, 'success saves canonical notification_types');
+    await app.getByRole('button', { name: 'BTCUSD1 配置通知', exact: true }).click();
+    const btcPicker = app.getByRole('form', { name: 'BTCUSD1 配置通知', exact: true });
+    await btcPicker.getByRole('button', { name: '全选', exact: true }).click();
+    assert(await btcPicker.getByRole('checkbox', { checked: true }).count() === 4, 'non-strategy symbol cannot select strategy-only event');
+    await btcPicker.getByRole('button', { name: '取消', exact: true }).click();
+    observations.push('search/filter, picker cancel, rejected save preserves draft, valid all/select save');
+
+    await app.getByRole('switch', { name: 'XAUUSD1 监控', exact: true }).click();
+    await row('XAUUSD1').getByText('已暂停', { exact: true }).waitFor();
+    assert(symbols[0].monitor_enabled === false, 'monitor switch uses canonical field');
+    await app.getByRole('switch', { name: 'XAUUSD1 监控', exact: true }).click();
+    await row('XAUUSD1').getByText('监控中', { exact: true }).waitFor();
+    await app.getByRole('switch', { name: '独立币种监控', exact: true }).click();
+    await row('XAUUSD1').getByText('已暂停', { exact: true }).waitFor();
+    await app.getByRole('switch', { name: '独立币种监控', exact: true }).click();
+    await row('XAUUSD1').getByText('监控中', { exact: true }).waitFor();
+    await app.getByText('默认通知与定时设置', { exact: false }).first().click();
+    await app.getByRole('spinbutton', { name: '摘要间隔（分钟）', exact: true }).fill('30');
+    await app.getByRole('button', { name: '保存间隔', exact: true }).click();
+    await app.getByText('已保存：每 30 分钟发送一次。', { exact: true }).waitFor();
+    await app.getByRole('button', { name: '配置默认通知', exact: true }).click();
+    const defaultPicker = app.getByRole('form', { name: '配置默认通知', exact: true });
+    await defaultPicker.getByRole('button', { name: '清空', exact: true }).click();
+    await defaultPicker.getByRole('button', { name: '应用', exact: true }).click();
+    await defaultPicker.waitFor({ state: 'hidden' });
+    assert(settings.default_notification_types.length === 0 && symbols[0].notification_types.length === 5, 'default editor only sends the defaults field');
+    observations.push('single/global monitoring pause and resume, summary interval and future-symbol defaults');
+
+    frozenAt = Date.now() / 1000 - 178;
+    await refresh();
+    await row('XAUUSD1').getByText('监控中', { exact: true }).waitFor();
+    await row('XAUUSD1').getByText('数据过期', { exact: true }).waitFor({ timeout: 5000 });
+    frozenAt = undefined;
+    await refresh();
+    failReads = true;
+    await refresh();
+    await app.getByText('连接中断，显示上次数据；配置不可修改。', { exact: true }).waitFor();
+    assert(await pickerButton.isDisabled(), 'disconnected writes are disabled');
+    failReads = false;
+    await refresh();
+    demo = true;
+    await refresh();
+    assert(await pickerButton.isDisabled(), 'demo writes are disabled');
+    demo = false;
+    withAccount = true;
+    await refresh();
+    await app.getByRole('tab', { name: '币种监控中心', exact: true }).click();
+    await app.getByRole('heading', { name: '币种监控中心', exact: true }).waitFor();
+    assert(await app.getByRole('tab', { name: 'USD1 上新', exact: true }).count() === 0, 'account-present tab branch also unified');
+    observations.push('real-clock expiry, reconnect, demo write guard, account-present entry');
+    await page.screenshot({ path: 'output/playwright/aster-monitor-center-desktop.png', fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(200);
+    assert(await frame.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), 'module has no page-level horizontal overflow');
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), 'Hub has no page-level horizontal overflow');
+    await page.screenshot({ path: 'output/playwright/aster-monitor-center-mobile.png', fullPage: true });
+    assert(errors.length === 0, `browser errors: ${errors.join('; ')}`);
+    assert(unexpectedWrites.length === 0, `unexpected writes: ${unexpectedWrites.join('; ')}`);
+    assert(external.length === 0, `external requests: ${external.join('; ')}`);
+    return { passed: true, entry: page.url(), moduleOrigin, monitoringWrites: writes.length,
+      tradingWrites: 0, browserErrors: 0, observations };
+  } catch (error) {
+    await page.screenshot({ path: 'output/playwright/aster-monitor-center-failure.png', fullPage: true });
+    throw error;
+  }
+}

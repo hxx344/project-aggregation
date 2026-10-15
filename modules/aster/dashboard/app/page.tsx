@@ -32,8 +32,7 @@ import { MigrationPanel } from '@/components/migration-panel';
 import { AccountOverview } from '@/components/account-overview';
 import { RecordsWorkspace } from '@/components/records-workspace';
 import { AddAccountDialog } from '@/components/add-account-dialog';
-import { ListingsPanel } from '@/components/listings-panel';
-import { MonitoringPanel } from '@/components/monitoring-panel';
+import { SymbolMonitorCenter } from '@/components/symbol-monitor-center';
 import { PairsWorkspace } from '@/components/pairs-workspace';
 import { CapacityRelayPanel } from '@/components/capacity-relay-panel';
 import { notificationOverview } from '@/lib/notification-channels';
@@ -89,9 +88,9 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     setNotice,
   };
   const monitoringProps = {
-    monitoring: state?.monitoring,
-    notification: state?.notification,
-    demo: Boolean(state?.demo),
+    state,
+    now: serverNow,
+    refresh,
     busy,
     connectionError,
     action,
@@ -180,7 +179,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
           >
             <RefreshCw size={17} />
           </Button>
-
         </div>
       </header>
       <div className="workspace">
@@ -376,8 +374,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 <TabsTrigger value="migration" disabled={pairBound}>
                   仓位迁移{pairBound ? ' · 组管理' : ''}
                 </TabsTrigger>
-                <TabsTrigger value="listings">USD1 上新</TabsTrigger>
-                <TabsTrigger value="monitoring">监控与告警</TabsTrigger>
+                <TabsTrigger value="monitoring">币种监控中心</TabsTrigger>
                 <TabsTrigger value="account">账户</TabsTrigger>
                 <TabsTrigger value="records">记录</TabsTrigger>
               </TabsList>
@@ -416,19 +413,8 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                   connectionError={connectionError}
                 />
               </TabsContent>
-              <TabsContent value="listings">
-                <ListingsPanel
-                  action={action}
-                  busy={busy}
-                  listings={state?.listings}
-                  monitoring={state?.monitoring}
-                  notification={state?.notification}
-                  now={serverNow}
-                  connectionError={connectionError}
-                />
-              </TabsContent>
               <TabsContent value="monitoring">
-                <MonitoringPanel {...monitoringProps} />
+                <SymbolMonitorCenter {...monitoringProps} />
               </TabsContent>
               <TabsContent value="records">
                 <RecordsWorkspace
@@ -463,25 +449,13 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 className="workspace-navigation"
               >
                 <TabsTrigger value="pairs">配对组</TabsTrigger>
-                <TabsTrigger value="listings">USD1 上新</TabsTrigger>
-                <TabsTrigger value="monitoring">监控与告警</TabsTrigger>
+                <TabsTrigger value="monitoring">币种监控中心</TabsTrigger>
               </TabsList>
               <TabsContent value="pairs" keepMounted>
                 <PairsWorkspace {...pairProps} />
               </TabsContent>
-              <TabsContent value="listings">
-                <ListingsPanel
-                  action={action}
-                  busy={busy}
-                  listings={state?.listings}
-                  monitoring={state?.monitoring}
-                  notification={state?.notification}
-                  now={serverNow}
-                  connectionError={connectionError}
-                />
-              </TabsContent>
               <TabsContent value="monitoring">
-                <MonitoringPanel {...monitoringProps} />
+                <SymbolMonitorCenter {...monitoringProps} />
               </TabsContent>
             </Tabs>
             <section className="panel empty-state">

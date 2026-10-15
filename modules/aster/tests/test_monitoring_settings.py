@@ -56,7 +56,8 @@ class MonitoringSettingsTests(unittest.TestCase):
         restarted = Store(self.store.path)
         self.assertFalse(restarted.monitoring_settings()["feishu_enabled"])
         self.assertEqual(restarted.listing_watch_symbols(), ["BTCUSD1"])
-        self.assertEqual(restarted.monitoring_settings()["symbols"]["ETHUSD1"], {"monitor": False, "alerts": False})
+        self.assertEqual(restarted.monitoring_settings()["symbols"]["ETHUSD1"],
+                         {"monitor": False, "monitor_enabled": False, "alerts": False, "notification_types": []})
 
     def test_new_default_only_changes_future_symbols(self):
         self.store.edit_monitoring({"auto_monitor_new": False})
@@ -73,7 +74,8 @@ class MonitoringSettingsTests(unittest.TestCase):
                      for change in ({"monitor": False}, {"alerts": False})]
             for task in tasks:
                 task.result()
-        self.assertEqual(self.store.monitoring_settings()["symbols"]["BTCUSD1"], {"monitor": False, "alerts": False})
+        self.assertEqual(self.store.monitoring_settings()["symbols"]["BTCUSD1"],
+                         {"monitor": False, "monitor_enabled": False, "alerts": False, "notification_types": []})
 
     def test_repeated_saves_do_not_create_a_new_policy_revision(self):
         self.store.edit_monitoring({"feishu_enabled": False})
@@ -130,10 +132,7 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.assertEqual(sender.call_count, 1)
 
     def test_disabled_rows_cannot_starve_enabled_notifications(self):
-        config = self.store.monitoring_settings()
-        config["new_listing_alerts"] = False
-        with self.store.connect() as db:
-            monitoring.write(db, config)
+        self.store.edit_monitoring({"new_listing_alerts": False})
         # Include legacy rows inserted by an older process after the save.
         for index in range(8):
             self.queue("new_listing", ["BTCUSD1"], f"a-muted-{index}")
@@ -378,6 +377,63 @@ class MonitoringAPITests(unittest.TestCase):
         self.assertFalse(next(row for row in state["monitoring"]["symbols"] if row["symbol"] == "BTCUSD1")["max_capacity_alert"])
         self.engine.demo = True
         self.assertEqual(self.client.patch("/api/monitoring", json={"feishu_enabled": True}).status_code, 409)
+
+    def test_v2_api_settings_symbol_projection_and_legacy_aliases(self):
+        self.login()
+        response = self.client.patch("/api/monitoring", json={"auto_discover": False,
+            "default_notification_types": ["new_listing"]})
+        self.assertEqual(response.status_code, 200)
+        response = self.client.patch("/api/monitoring/symbols/BTCUSD1", json={
+            "monitor_enabled": False, "notification_types": ["trade_summary", "listing_capacity"]})
+        self.assertEqual(response.status_code, 200)
+        state = self.client.get("/api/monitoring").json()
+        self.assertEqual(state["settings"]["schema_version"], 2)
+        self.assertFalse(state["settings"]["discovery_enabled"])
+        self.assertEqual(state["settings"]["default_notification_types"], ["new_listing"])
+        row = next(row for row in state["symbols"] if row["symbol"] == "BTCUSD1")
+        self.assertFalse(row["monitor"])
+        self.assertFalse(row["monitor_enabled"])
+        self.assertTrue(row["max_capacity_alert"])
+        self.assertEqual(row["notification_types"], ["listing_capacity", "trade_summary"])
+        self.assertEqual(row["monitor_status"], "paused")
+        self.assertIn("freshness", row)
+        self.assertIn("required_by", row)
+        self.assertEqual(self.client.patch("/api/monitoring", json={"discovery_enabled": True}).status_code, 200)
+        self.assertTrue(self.client.get("/api/monitoring").json()["settings"]["auto_discover"])
+        self.assertEqual(self.client.patch("/api/listings/BTCUSD1/capacity-alert", json={"enabled": False}).status_code, 200)
+        self.assertEqual(self.store.monitoring_settings()["symbols"]["BTCUSD1"]["notification_types"], ["trade_summary"])
+
+    def test_v2_api_validation_rejects_unknown_null_and_conflicting_types_atomically(self):
+        self.login()
+        before = self.store.monitoring_settings()
+        cases = [
+            ("/api/monitoring", {"auto_discover": None}, 422),
+            ("/api/monitoring", {"auto_discover": 1}, 422),
+            ("/api/monitoring", {"default_notification_types": None}, 422),
+            ("/api/monitoring", {"default_notification_types": ["relay_health"]}, 422),
+            ("/api/monitoring", {"schema_version": 2}, 422),
+            ("/api/monitoring", {"auto_discover": False, "discovery_enabled": True}, 409),
+            ("/api/monitoring/symbols/BTCUSD1", {"notification_types": ["unknown"]}, 422),
+            ("/api/monitoring/symbols/BTCUSD1", {"notification_types": [1]}, 422),
+            ("/api/monitoring/symbols/BTCUSD1", {"notification_types": ["new_listing", "new_listing"]}, 409),
+            ("/api/monitoring/symbols/BTCUSD1", {"notification_types": ["strategy_capacity"]}, 409),
+            ("/api/monitoring/symbols/BTCUSD1", {"notification_types": [], "alerts": False}, 409),
+            ("/api/monitoring/symbols/BTCUSD1", {"monitor_enabled": True, "monitor": False}, 409),
+        ]
+        for path, body, status in cases:
+            with self.subTest(path=path, body=body):
+                self.assertEqual(self.client.patch(path, json=body).status_code, status)
+                self.assertEqual(self.store.monitoring_settings(), before)
+
+    def test_v2_get_is_readonly_and_symbol_notifications_require_auth_and_origin(self):
+        path = "/api/monitoring/symbols/BTCUSD1"
+        self.assertEqual(self.client.patch(path, json={"notification_types": []}).status_code, 401)
+        self.login()
+        self.assertEqual(self.client.patch(path, json={"notification_types": []},
+                                         headers={"origin": "https://bad.invalid"}).status_code, 403)
+        with patch("trading.monitoring.write", side_effect=AssertionError("GET wrote monitoring settings")):
+            self.assertEqual(self.client.get("/api/monitoring").status_code, 200)
+            self.assertEqual(self.client.get("/api/state").status_code, 200)
 
 
 if __name__ == "__main__":

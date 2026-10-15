@@ -182,6 +182,8 @@ class MonitoringEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     monitoring_enabled: bool | None = None
     discovery_enabled: bool | None = None
+    auto_discover: bool | None = None
+    default_notification_types: list[Literal["new_listing", "listing_capacity", "strategy_capacity", "trade_summary", "position_imbalance"]] | None = None
     auto_monitor_new: bool | None = None
     feishu_enabled: bool | None = None
     new_listing_alerts: bool | None = None
@@ -205,6 +207,8 @@ class MonitoringSymbolEdit(BaseModel):
     monitor: bool | None = None
     alerts: bool | None = None
     max_capacity_alert: bool | None = None
+    monitor_enabled: bool | None = None
+    notification_types: list[Literal["new_listing", "listing_capacity", "strategy_capacity", "trade_summary", "position_imbalance"]] | None = None
 
     @model_validator(mode="after")
     def nonempty_booleans(self):

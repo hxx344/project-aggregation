@@ -36,7 +36,7 @@ class HourlyNotificationEngineTests(unittest.TestCase):
 
     def queue_trade(self):
         with self.f.store.connect() as db:
-            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('trade','trade message',0,'trade_summary','[]')")
+            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('trade','trade message',0,'trade_summary',?)", ('["XAUUSD1"]',))
 
     def test_regular_ticks_only_check_timer_and_due_snapshot_is_compact(self):
         with patch.object(self.engine, "state", return_value={"snapshot": "cached"}) as state, \

@@ -17,6 +17,7 @@ import uuid
 
 import monitor
 from . import monitoring, notification_channels, position_observations
+from .monitoring_status import compute_symbol_view
 from .hourly_summary import format_hourly_summary
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
 from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
@@ -818,6 +819,7 @@ class Engine:
         watched = set(reader.listing_watch_symbols())
         required = self.required_monitoring_symbols(reader, accounts)
         symbols = set(MARKET_SYMBOLS) | set(listings.get("rows", {})) | config["symbols"].keys()
+        now = time.time()
         return {"settings": {key: config[key] for key in monitoring.DEFAULTS},
                 "revision": config["revision"],
                 "strategy_capacity_environment_enabled": os.environ.get("ASTER_CAPACITY_ALERT_ENABLED", "1").strip() == "1",
@@ -826,6 +828,10 @@ class Engine:
                     "strategy_market": symbol in MARKET_SYMBOLS, "required_by": required.get(symbol, []),
                     "effective_monitor": not self.demo and (monitoring.monitored(config, symbol) or symbol in required),
                     "detail_enabled": not self.demo and monitoring.monitored(config, symbol),
+                    **compute_symbol_view(monitoring.symbol_options(config, symbol),
+                        listings.get("rows", {}).get(symbol),
+                        {**listings, "discovery_enabled": config["auto_discover"]}, now,
+                        monitoring_enabled=config["monitoring_enabled"], demo=self.demo),
                     "status": listings.get("rows", {}).get(symbol, {}).get("status", "TRADING")}
                     for symbol in sorted(symbols)]}
 

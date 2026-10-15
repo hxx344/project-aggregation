@@ -71,14 +71,7 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         return item
 
     def policy(self, *, symbol=None, **changes):
-        with self.store.connect() as db:
-            config = monitoring.read(db)
-            if symbol:
-                config["symbols"].setdefault(symbol, {}).update(changes)
-            else:
-                config.update(changes)
-            config["revision"] += 1
-            monitoring.write(db, config)
+        self.store.edit_monitoring(changes, symbol=symbol)
 
     def test_fault_needs_two_new_samples_and_sixty_source_seconds(self):
         self.observe()
@@ -364,7 +357,8 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
                     self.assertFalse(self.observe(available=False))
                 else:
                     self.policy(**{mode: False})
-                    self.assertFalse(self.observe())
+                    self.assertEqual(self.observe(), mode == "position_imbalance_alerts")
+                    self.assertEqual(self.pending(), [])
                     self.policy(**{mode: True})
                 self.observe()
                 self.assertEqual(self.pending(), [])
@@ -399,6 +393,14 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         self.assertEqual(self.pending(), [])
         self.observe()
         self.assertEqual(self.state()["targets"], {})
+
+    def test_v2_selected_symbol_alert_runs_with_legacy_global_type_disabled(self):
+        self.store.edit_monitoring({"position_imbalance_alerts": False})
+        self.store.edit_monitoring({"default_notification_types": []})
+        self.store.edit_monitoring({"notification_types": ["position_imbalance"]}, symbol="XAUUSD1")
+        self.fault()
+        self.assertEqual(len(self.pending()), 1)
+        self.assertFalse(self.store.monitoring_settings()["position_imbalance_alerts"])
 
     def test_removed_target_is_cancelled_and_forgotten(self):
         self.fault()

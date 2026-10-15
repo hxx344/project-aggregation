@@ -263,7 +263,7 @@ class PositionObservationTests(unittest.TestCase):
         self.now += 60
         self.publish()
         with self.f.store.connect() as db:
-            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('first','trade',0,'trade_summary','[]')")
+            db.execute("INSERT INTO outbox(id,message,due_at,category,symbols) VALUES ('first','trade',0,'trade_summary',?)", ('["XAUUSD1"]',))
         self.sender.side_effect = lambda *_: self.f.store.save_intent(pending())
         self.engine.notify()
         self.sender.assert_called_once()
