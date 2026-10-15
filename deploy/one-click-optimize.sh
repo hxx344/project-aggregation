@@ -56,13 +56,13 @@ test_download_speed() {
   trap 'rm -rf "$WORK_DIR"' EXIT
 
   # 获取发布清单
-  MANIFEST="$WORK_DIR/manifest.json"
+  MANIFEST="$WORK_DIR/release-manifest.json"
   echo "正在获取最新发布信息..."
 
   START_MANIFEST=$(date +%s.%N)
   if ! curl --fail --silent --location --proto '=https' --tlsv1.2 \
     --connect-timeout 30 --max-time 60 \
-    "https://github.com/$REPOSITORY/releases/latest/download/manifest.json" \
+    "https://github.com/$REPOSITORY/releases/latest/download/release-manifest.json" \
     -o "$MANIFEST"; then
     print_error "无法获取发布清单"
     exit 1
