@@ -1098,6 +1098,62 @@ application_ready() {
   fi
   published_source_safe "$old_release"
 }
+source_fetch_retryable() {
+  local transcript=$1
+  # A transport-looking suffix (for example early EOF) must not hide a
+  # permanent permission, certificate, missing-ref, rate-limit or disk error.
+  if grep -Eiq 'authentication failed|could not read (Username|Password)|terminal prompts disabled|permission denied|repository .*not found|not our ref|couldn.t find remote ref|unadvertised object|requested URL returned error: (400|401|403|404|410|429)|SSL certificate|certificate verification|certificate problem|server certificate verification|no space left|disk quota exceeded|read-only file system|unable to create|cannot create|could not write|unable to write|error writing|out of memory|cannot allocate memory' "$transcript"; then
+    return 1
+  fi
+  grep -Eiq 'RPC failed; curl (5|6|7|18|28|35|52|55|56|92)([ ;:]|$)|could not resolve (host|proxy)|failed to connect|couldn.t connect|connection (reset|timed out|closed|refused)|recv failure|send failure|unexpected disconnect|early EOF|remote end hung up|TLS connection was non-properly terminated|operation (timed out|too slow)|timeout was reached|requested URL returned error: (408|500|502|503|504)' "$transcript"
+}
+fetch_source() {
+  local repository="$APP_DIR/repository.git" reference attempt transcript status delay
+  local -a options pipeline_status
+  [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || { log '错误：源码版本必须是固定的完整提交号。' >&2; return 1; }
+  reference="refs/project-aggregation/source/$commit"
+  updater_safe_path "$repository" || return
+  if [[ ! -d "$repository" ]]; then git init --bare -q "$repository" || return; fi
+  if git --git-dir="$repository" cat-file -e "$commit^{commit}" 2>/dev/null; then
+    # Retain objects fetched by older installers too; FETCH_HEAD alone is
+    # overwritten on the next update and is not a durable cache reference.
+    git --git-dir="$repository" update-ref "$reference" "$commit" || return
+    log '源码已缓存，跳过下载。'
+    return 0
+  fi
+  for attempt in 1 2 3; do
+    ci_update_progress download
+    transcript="$work_dir/source-fetch-$attempt.log"
+    # This is a stall guard, not a total transfer deadline. Do not interrupt
+    # a slow connection that is still making progress or change global config.
+    options=(-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60)
+    if (( attempt > 1 )); then options+=(-c http.version=HTTP/1.1); fi
+    log "获取固定版本 ${commit:0:12} 的源码（第 $attempt/3 次）；显示 Git 接收进度。"
+    if LC_ALL=C GIT_TERMINAL_PROMPT=0 git "${options[@]}" --git-dir="$repository" \
+        fetch --depth=1 --no-tags --progress "$REPOSITORY" "$commit:$reference" 2>&1 | tee "$transcript" >&2; then
+      if ! git --git-dir="$repository" cat-file -e "$commit^{commit}" 2>/dev/null; then
+        log '错误：Git 获取完成但缺少所选提交，停止更新。' >&2
+        return 1
+      fi
+      log "源码已获取并核对提交 ${commit:0:12}。"
+      return 0
+    else
+      pipeline_status=("${PIPESTATUS[@]}")
+      status=${pipeline_status[0]}
+    fi
+    # Preserve the actual Git/signal status; an output/log failure is not a
+    # retryable network error, even if its partial transcript looks like one.
+    case "$status" in 130|141|143) return "$status" ;; esac
+    if (( pipeline_status[1] != 0 )); then return "${pipeline_status[1]}"; fi
+    if (( attempt == 3 )) || ! source_fetch_retryable "$transcript"; then
+      log "错误：源码获取失败（退出码 $status）；尚未进入构建或服务切换，保留已有缓存。" >&2
+      return "$status"
+    fi
+    delay=$((attempt * 2))
+    log "源码连接暂时中断，${delay} 秒后使用 HTTP/1.1 重试同一提交；已有缓存保留。"
+    sleep "$delay" || return
+  done
+}
 prepare_source() {
   [[ ! -d "$work_dir/source" ]] || return 0
   ci_update_progress extract
@@ -1833,14 +1889,7 @@ main() {
     run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
   else
   log "准备正式版本 ${commit:0:12} 的源码；不下载预构建运行包。"
-  updater_safe_path "$APP_DIR/repository.git"
-  if [[ ! -d "$APP_DIR/repository.git" ]]; then git init --bare -q "$APP_DIR/repository.git"; fi
-  if ! git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit^{commit}" 2>/dev/null; then
-    ci_update_progress download
-    git --git-dir="$APP_DIR/repository.git" fetch --quiet --depth=1 "$REPOSITORY" "$commit"
-  else
-    log '源码已缓存，跳过下载。'
-  fi
+  fetch_source
   input_keys
   ci_update_progress prepare
   prepare_application

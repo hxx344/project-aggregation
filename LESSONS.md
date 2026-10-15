@@ -764,3 +764,17 @@
 **证据：** project-aggregation 基线 `2622586` 的 [报价读取](modules/monitor/lib/exchange-service.ts) 和 [采集器](modules/monitor/server/market-collector.mjs)。2026-10-15 用户报告原油价差频繁失败；旧实现的 502 后恢复探针只发起一次标记价格请求并失败。实际工作台 23:16–23:19 已恢复，主报价每约 30 秒更新；因原异常未保存，不能断言截图 23:13:57 的失败一定属于网络、超时或限流。本轮修复已确认的恢复与诊断缺口，不隐藏持续失败。
 
 **事件记录：** `monitor-binance-quote-transient-recovery-20261015`；一次用户反馈及请求链修正，不推进主线复盘检查点。
+
+### L051：固定版本的源码获取须有界恢复传输中断
+
+**适用条件：** 安装器按正式发布清单的固定提交，从远端 Git 仓库准备源码，并复用本地 bare 对象缓存。
+
+**根因：** 源码路径只执行一次静默浅层 fetch；连接重置或响应截断会直接终止更新，且没有接收进度。运行包下载器的恢复能力不覆盖这条路径。
+
+**以后做法：** 对明确瞬态传输错误最多尝试三次，保留原始退出码与 2/4 秒退避；认证、证书、限流、缺少版本、磁盘错误及中断直接退出。重试可局部使用 HTTP/1.1，但不能据连接重置推断 HTTP/2 是根因；60 秒近零流量检测不等于总下载时限。始终获取同一固定 SHA，以专用 ref 保留缓存对象，成功后确认目标提交存在。缓存命中跳过下载，不删除旧对象、不回退分支或未核验源码归档；最终失败发生在构建与服务切换之前。
+
+**如何验证：** [源码获取检查](deploy/test-source-fetch.py) 使用真实本地 Git 对象和故障注入覆盖恢复、耗尽、永久错误、中断、缓存命中、版本固定、假成功和日志失败；Windows 使用原生 Git Bash。[增量安装检查](deploy/test-incremental.sh) 在 Linux CI 确认源码失败不改变 current、部署记录、依赖或服务，恢复后仍复用增量结果。不把本地夹具描述为用户服务器网络已恢复。
+
+**证据：** project-aggregation `52e0463` 的用户更新截图显示 `curl 56 Recv failure: Connection reset by peer`、`early EOF`、`invalid index-pack output` 和 hub 退出码 128；基线 `d1ae400` 的 [源码安装器](deploy/install.sh) 仍只有一次 `git fetch --quiet --depth=1`。未取得服务端完整网络日志，不能断定断开由 GitHub、代理还是线路引起。
+
+**事件记录：** `source-fetch-reset-without-retry-20261015`；一次用户更新失败及源码获取链修复，不推进主线复盘检查点。

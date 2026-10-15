@@ -150,6 +150,14 @@ ci_release_resolve() {
 }
 git() {
   [[ "$1" != ls-remote ]] || { echo 'Source deployment must not resolve a branch' >&2; return 91; }
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == fetch && -f "$FIXTURE_ROOT/fail-fetch" ]]; then
+      printf 'fetch\n' >> "$FIXTURE_ROOT/failed-fetch.calls"
+      printf 'error: RPC failed; curl 56 Recv failure: Connection reset by peer\nfatal: early EOF\n' >&2
+      return 128
+    fi
+  done
   command git "$@"
 }
 systemctl() {
@@ -229,6 +237,17 @@ run_install
 expect_counts 1 1 2 1 1
 [[ $(releases) == 1 && $(readlink "$fixture/application/current") == "$initial" ]]
 echo extra >> "$fixture/source/server/index.mjs"; commit_source backend
+# Exhausted source retries must stop before dependencies, tests, builds or activation.
+touch "$fixture/fail-fetch"
+cp "$fixture/application/.deployed-state" "$fixture/success-state"
+if run_install; then echo 'Failed source fetch was accepted' >&2; exit 1; fi
+[[ $(wc -l < "$fixture/failed-fetch.calls") == 3 ]]
+expect_counts 1 1 2 1 1
+[[ $(readlink "$fixture/application/current") == "$initial" && $(releases) == 1 ]]
+cmp "$fixture/success-state" "$fixture/application/.deployed-state"
+! grep -Eq '^(prepare|verify|build|switch|finalize)$' "$fixture/progress.calls"
+rm "$fixture/fail-fetch"
+# Retrying the same install reuses dependencies and frontend build results.
 run_install
 expect_counts 1 1 3 1 2
 [[ $(releases) == 2 && $(readlink "$fixture/application/current") != "$initial" ]]
