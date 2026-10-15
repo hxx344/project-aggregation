@@ -15,6 +15,7 @@ async (page) => {
     notification_types: [], max_capacity_alert: false, can_watch: true, strategy_market: symbol === 'XAUUSD1',
     required_by: [], effective_monitor: symbol !== 'ETHUSD1', detail_enabled: symbol !== 'ETHUSD1', status: 'TRADING' }));
   let moduleOrigin, revision = 0, failReads = false;
+  let tierOverrides = {};
   const sampleTime = Date.now() / 1000 - 1;
   const state = () => {
     const now = Date.now() / 1000;
@@ -30,11 +31,13 @@ async (page) => {
           brackets_checked_at: sampleTime, error: symbol === 'XAUUSD1' ? '最大杠杆额度缺失' : null,
           ...(symbol === 'SOLUSD1' ? {} : {
             tier_capacities: symbol === 'XAUUSD1' ? { '10': '12345.67', '20': '0', '50': null }
+              : symbol === 'XRPUSD1' ? { '10': '5000', '20': '1000', '50': '500' }
               : { '10': '5000', '20': '2500', '50': '1000' },
             tier_checked_at: symbol === 'BTCUSD1' ? sampleTime - 200 : sampleTime,
             tier_brackets_checked_at: sampleTime,
             tier_error: symbol === 'XRPUSD1' ? '公开杠杆或额度暂不可用，等待重试' : null,
           }),
+          ...tierOverrides[symbol],
         }])) },
       notification: { enabled: false, configured: false, pending: 0,
         channels: { event: { configured: false, source: 'none', pending: 0 },
@@ -105,6 +108,42 @@ async (page) => {
     assert((await row('SOLUSD1').innerText()).includes('等待首次采样'), 'old records await first tier sample');
     observations.push('three exact leverage columns, enabled-only rows, independent tier health, zero/missing/stale/failure states');
 
+    const order = () => table.locator('tr[data-symbol]').evaluateAll(rows => rows.map(row => row.dataset.symbol));
+    const expectOrder = async (expected, message) => assert(JSON.stringify(await order()) === JSON.stringify(expected), message);
+    const sortBy = async (label, direction, expected) => {
+      await table.getByRole('button', { name: label, exact: true }).click();
+      assert(await table.locator(`th[aria-sort="${direction}"]`).count() === 1, `${label} ${direction} is announced`);
+      assert(await table.locator('th[aria-sort]').count() === 1, 'only the active column announces sorting');
+      await expectOrder(expected, `${label} ${direction} row order`);
+    };
+    const sortingRevision = revision;
+    await expectOrder(['BTCUSD1', 'SOLUSD1', 'XAUUSD1', 'XRPUSD1'], 'default symbol ascending');
+    await sortBy('币种', 'descending', ['XRPUSD1', 'XAUUSD1', 'SOLUSD1', 'BTCUSD1']);
+    await sortBy('币种', 'ascending', ['BTCUSD1', 'SOLUSD1', 'XAUUSD1', 'XRPUSD1']);
+    await sortBy('10x', 'descending', ['XAUUSD1', 'BTCUSD1', 'XRPUSD1', 'SOLUSD1']);
+    const ten = table.getByRole('button', { name: '10x', exact: true });
+    await ten.focus();
+    await ten.press('Enter');
+    assert(await table.getByRole('columnheader', { name: '10x', exact: true }).getAttribute('aria-sort') === 'ascending', 'Enter reverses sorting');
+    await expectOrder(['BTCUSD1', 'XRPUSD1', 'XAUUSD1', 'SOLUSD1'], 'keyboard ascending keeps missing last');
+    await ten.press('Space');
+    await expectOrder(['XAUUSD1', 'BTCUSD1', 'XRPUSD1', 'SOLUSD1'], 'Space reverses sorting');
+    tierOverrides = { BTCUSD1: { tier_capacities: { '10': '20000', '20': '2500', '50': '1000' } } };
+    await refresh();
+    await expectOrder(['BTCUSD1', 'XAUUSD1', 'XRPUSD1', 'SOLUSD1'], 'refresh reorders updated values without resetting the chosen column');
+    assert(await table.getByRole('columnheader', { name: '10x', exact: true }).getAttribute('aria-sort') === 'descending', 'refresh preserves direction');
+    tierOverrides = {};
+    await refresh();
+    await sortBy('20x', 'descending', ['BTCUSD1', 'XRPUSD1', 'XAUUSD1', 'SOLUSD1']);
+    await sortBy('20x', 'ascending', ['XAUUSD1', 'XRPUSD1', 'BTCUSD1', 'SOLUSD1']);
+    await sortBy('50x', 'descending', ['BTCUSD1', 'XRPUSD1', 'SOLUSD1', 'XAUUSD1']);
+    await sortBy('50x', 'ascending', ['XRPUSD1', 'BTCUSD1', 'SOLUSD1', 'XAUUSD1']);
+    await sortBy('采样时间', 'descending', ['XAUUSD1', 'XRPUSD1', 'BTCUSD1', 'SOLUSD1']);
+    await sortBy('采样时间', 'ascending', ['BTCUSD1', 'XAUUSD1', 'XRPUSD1', 'SOLUSD1']);
+    await sortBy('10x', 'descending', ['XAUUSD1', 'BTCUSD1', 'XRPUSD1', 'SOLUSD1']);
+    assert(revision === sortingRevision, 'sorting sends no monitoring writes');
+    observations.push('all column directions, keyboard Enter/Space, stable ties, missing-last ordering, sample-time sorting and refresh-preserved selection');
+
     await app.getByRole('switch', { name: 'XAUUSD1 监控', exact: true }).click();
     await row('XAUUSD1').waitFor({ state: 'hidden' });
     await app.getByRole('switch', { name: 'XAUUSD1 监控', exact: true }).click();
@@ -136,6 +175,9 @@ async (page) => {
     assert(await frame.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), 'module has no page-level horizontal overflow');
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), 'Hub has no page-level horizontal overflow');
     assert(await table.getByRole('columnheader', { name: '50x', exact: true }).count() === 1, 'all tier columns remain available on narrow screens');
+    await sortBy('50x', 'descending', ['BTCUSD1', 'XRPUSD1', 'SOLUSD1', 'XAUUSD1']);
+    await sortBy('50x', 'ascending', ['XRPUSD1', 'BTCUSD1', 'SOLUSD1', 'XAUUSD1']);
+    await sortBy('10x', 'descending', ['XAUUSD1', 'BTCUSD1', 'XRPUSD1', 'SOLUSD1']);
     await region.scrollIntoViewIfNeeded();
     await page.screenshot({ path: 'output/playwright/aster-monitor-capacity-mobile.png', fullPage: true });
     observations.push('empty selection and 390px layout retain readable values without page overflow');

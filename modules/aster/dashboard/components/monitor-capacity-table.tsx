@@ -1,10 +1,19 @@
+'use client';
+
+import { useState } from 'react';
 import type { Listings, Monitoring } from '@/lib/desk-types';
 import { fmt } from '@/lib/desk-format';
 import {
   monitoredCapacityRows,
   monitoredCapacityTiers,
+  nextMonitoredCapacitySort,
+  sortMonitoredCapacityRows,
 } from '@/lib/monitoring-capacities';
-import type { MonitoredCapacityStatus } from '@/lib/monitoring-capacities';
+import type {
+  MonitoredCapacitySort,
+  MonitoredCapacitySortKey,
+  MonitoredCapacityStatus,
+} from '@/lib/monitoring-capacities';
 import {
   FreshnessIndicator,
   monitoringDate,
@@ -27,6 +36,12 @@ const statusLabels: Record<MonitoredCapacityStatus, string> = {
   error: '采样失败',
 };
 
+const columns: { key: MonitoredCapacitySortKey; label: string }[] = [
+  { key: 'symbol', label: '币种' },
+  ...monitoredCapacityTiers.map((tier) => ({ key: tier, label: `${tier}x` })),
+  { key: 'sampleTime', label: '采样时间' },
+];
+
 export function MonitorCapacityTable({
   monitoring,
   listings,
@@ -40,11 +55,18 @@ export function MonitorCapacityTable({
   demo: boolean;
   connectionError: string;
 }) {
-  const rows = monitoredCapacityRows(monitoring.symbols, listings, now, {
-    monitoringEnabled: monitoring.settings.monitoring_enabled,
-    demo,
-    connectionError: Boolean(connectionError),
+  const [sort, setSort] = useState<MonitoredCapacitySort>({
+    key: 'symbol',
+    direction: 'ascending',
   });
+  const rows = sortMonitoredCapacityRows(
+    monitoredCapacityRows(monitoring.symbols, listings, now, {
+      monitoringEnabled: monitoring.settings.monitoring_enabled,
+      demo,
+      connectionError: Boolean(connectionError),
+    }),
+    sort,
+  );
   return (
     <section className="panel monitor-tier-panel" aria-label="监控额度">
       <div className="section-head">
@@ -68,13 +90,39 @@ export function MonitorCapacityTable({
           <Table className="monitor-tier-table">
             <TableHeader>
               <TableRow>
-                <TableHead scope="col">币种</TableHead>
-                {monitoredCapacityTiers.map((tier) => (
-                  <TableHead key={tier} scope="col" className="number">
-                    {tier}x
+                {columns.map(({ key, label }) => (
+                  <TableHead
+                    key={key}
+                    scope="col"
+                    className={
+                      key !== 'symbol' && key !== 'sampleTime'
+                        ? 'number'
+                        : undefined
+                    }
+                    aria-sort={sort.key === key ? sort.direction : undefined}
+                  >
+                    {key === 'sampleTime' ? '状态 / ' : null}
+                    <button
+                      type="button"
+                      className="monitor-tier-sort"
+                      title={`${key === 'sampleTime' ? '额度采样时间' : label}：点击${nextMonitoredCapacitySort(sort, key).direction === 'ascending' ? '升序' : '降序'}排列`}
+                      onClick={() =>
+                        setSort((current) =>
+                          nextMonitoredCapacitySort(current, key),
+                        )
+                      }
+                    >
+                      {label}
+                      <span aria-hidden="true">
+                        {sort.key === key
+                          ? sort.direction === 'ascending'
+                            ? '↑'
+                            : '↓'
+                          : '↕'}
+                      </span>
+                    </button>
                   </TableHead>
                 ))}
-                <TableHead scope="col">状态 / 采样时间</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -151,7 +199,7 @@ export function MonitorCapacityTable({
         </p>
       )}
       <p className="monitor-tier-footnote">
-        各档额度取公开剩余与该档位上限的较小值，不代表账户实际可开额度。缺少对应档位时显示暂不可用。
+        点击列名切换升降序；采样时间按额度来源时间排序，缺失值始终放末尾。各档额度取公开剩余与该档位上限的较小值，不代表账户实际可开额度。
       </p>
     </section>
   );

@@ -275,6 +275,30 @@
   min-width: 108px;
   padding-right: 20px;
 }
+.monitor-tier-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.monitor-tier-sort:hover,
+.monitor-tier-table th[aria-sort] .monitor-tier-sort {
+  color: var(--foreground);
+  background: var(--accent);
+}
+.monitor-tier-sort span {
+  color: var(--muted-foreground);
+}
+.monitor-tier-table th[aria-sort] .monitor-tier-sort span {
+  color: inherit;
+}
 .monitor-tier-sample {
   min-width: 235px;
 }
