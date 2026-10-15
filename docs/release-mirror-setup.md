@@ -18,7 +18,7 @@ bash deploy/test-mirror-performance.sh
 curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/one-click-optimize.sh | bash
 ```
 
-默认只测试，不安装服务或写入配置。入口在缺少同版本本地工具时，从官方正式清单锁定的提交获取辅助脚本；不会从镜像获取可执行代码。
+默认只测试，不安装服务或写入配置。入口优先使用可信路径中的本地工具；独立运行时，从官方正式清单锁定的提交获取辅助脚本。显式部署时另外核对本地部署脚本是否与该正式提交一致；不会从镜像获取可执行代码。
 
 测试取得官方清单后，按同一个提交、架构、文件和摘要比较 GitHub 与已配置镜像。成功必须下载完整正文并通过 SHA-256；失败、未配置、缓存命中分别显示。GitHub 基线失败时不计算提速倍数，超时的部分文件不算成功样本。重复测试可设置 `TEST_ITERATIONS`，单次超时可设置 `DOWNLOAD_TIMEOUT`。
 
