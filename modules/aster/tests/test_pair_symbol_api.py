@@ -1,4 +1,5 @@
 """Pair catalogue, immutable membership and safe symbol edits through the API."""
+from contextlib import ExitStack
 from copy import deepcopy
 import os
 import unittest
@@ -132,16 +133,38 @@ class PairSymbolApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/pairs/silver/reconcile-flat").status_code, 200)
         self.assertEqual(self.f.store.get("pair_runtime:silver")["owned"], {"LONG": "0", "SHORT": "0"})
 
-    def test_gold_holdings_block_silver_binding_without_mutating_account(self):
+    def test_gold_holdings_allow_silver_binding_without_mutating_account_strategy(self):
         self.login()
-        broker = self.engine.broker(self.f.store.account("test"))
+        brokers = {aid: self.engine.broker(self.f.store.account(aid)) for aid in ("test", "second")}
+        broker = brokers["test"]
         broker.state["positions"]["XAUUSD1:LONG"].update(qty="1", entry="4000")
         broker.save()
-        original = deepcopy(broker.state)
-        response = self.client.post("/api/pairs", json=pair_config(id="silver", symbol="XAGUSD1"))
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertEqual(broker.state, original)
-        self.assertIsNone(self.f.store.pair("silver"))
+        original = {aid: deepcopy(member.state) for aid, member in brokers.items()}
+        accounts = {aid: self.f.store.account(aid) for aid in brokers}
+        legacy = {"phase": "waiting_open", "completed_cycles": 2,
+                  "baseline": {"LONG": "1", "SHORT": "0"}, "quantities": {"LONG": "0", "SHORT": "0"}}
+        self.f.store.put("cycle:test", legacy)
+        with ExitStack() as stack:
+            for member in brokers.values():
+                for method in ("submit", "cancel", "set_leverage", "set_cycle_leverage"):
+                    stack.enter_context(patch.object(member, method, side_effect=AssertionError("binding must not trade")))
+            stack.enter_context(patch("trading.margin_balance.MarginBalancer.tick",
+                                     side_effect=AssertionError("binding must not transfer")))
+            silver = self.create_silver()
+            self.assertFalse(silver["enabled"])
+            self.assertEqual(silver["symbol"], "XAGUSD1")
+            response = self.client.post("/api/pairs/silver/enable")
+            self.assertEqual(response.status_code, 200, response.text)
+        runtime = self.f.store.get("pair_runtime:silver")
+        self.assertEqual(runtime["owned"], {"LONG": "0", "SHORT": "0"})
+        self.assertEqual(runtime["progress"]["baseline"], runtime["owned"])
+        self.assertEqual(runtime["progress"]["quantities"], runtime["owned"])
+        self.assertIsNone(runtime["pending"])
+        self.assertEqual(self.f.store.get("cycle:test"), legacy)
+        for aid, member in brokers.items():
+            self.assertEqual(member.state, original[aid])
+            self.assertEqual(self.f.store.account(aid), accounts[aid])
+            self.assertEqual(self.f.store.pair_for_account(aid)["id"], "silver")
 
     def test_single_account_cycle_does_not_gain_silver_permission(self):
         self.login()
