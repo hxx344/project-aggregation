@@ -200,15 +200,38 @@ deploy_nginx_mirror() {
     return 1
   fi
 
-  # 检查脚本是否存在
-  if [ ! -f "deploy/setup-release-mirror.sh" ]; then
-    print_error "找不到部署脚本: deploy/setup-release-mirror.sh"
-    echo "请确保在项目根目录运行此脚本"
+  # GitHub 仓库信息
+  REPO_OWNER="hxx344"
+  REPO_NAME="project-aggregation"
+  REPO_BRANCH="main"
+  BASE_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
+
+  # 创建临时目录
+  TEMP_DIR=$(mktemp -d)
+  trap "rm -rf $TEMP_DIR" EXIT
+
+  echo "正在下载部署脚本..."
+
+  # 下载 setup-release-mirror.sh
+  if ! curl -fsSL --max-time 30 \
+    "${BASE_URL}/deploy/setup-release-mirror.sh" \
+    -o "${TEMP_DIR}/setup-release-mirror.sh"; then
+    print_error "下载部署脚本失败"
     return 1
   fi
 
+  # 下载 configure-release-mirror.sh
+  if ! curl -fsSL --max-time 30 \
+    "${BASE_URL}/deploy/configure-release-mirror.sh" \
+    -o "${TEMP_DIR}/configure-release-mirror.sh"; then
+    print_error "下载配置脚本失败"
+    return 1
+  fi
+
+  chmod +x "${TEMP_DIR}"/*.sh
+
   echo "正在部署 Nginx 镜像..."
-  if bash deploy/setup-release-mirror.sh; then
+  if bash "${TEMP_DIR}/setup-release-mirror.sh"; then
     print_success "Nginx 镜像部署成功"
   else
     print_error "Nginx 镜像部署失败"
@@ -217,7 +240,7 @@ deploy_nginx_mirror() {
 
   echo ""
   echo "正在配置工作台使用镜像..."
-  if bash deploy/configure-release-mirror.sh; then
+  if bash "${TEMP_DIR}/configure-release-mirror.sh"; then
     print_success "工作台配置成功"
   else
     print_error "工作台配置失败"
@@ -229,13 +252,21 @@ deploy_nginx_mirror() {
 verify_mirror() {
   print_step "步骤 4: 验证镜像效果"
 
-  if [ ! -f "deploy/test-mirror-performance.sh" ]; then
-    print_warning "找不到性能测试脚本，跳过验证"
-    return 0
-  fi
+  # 简化验证：只检查镜像是否响应
+  echo "测试镜像连接..."
 
-  echo "运行性能对比测试..."
-  bash deploy/test-mirror-performance.sh
+  if curl -fsSL --max-time 10 http://localhost:8090/health > /dev/null 2>&1; then
+    print_success "镜像服务运行正常"
+
+    # 测试实际文件访问
+    if curl -fsSL --max-time 5 -I http://localhost:8090/releases/ > /dev/null 2>&1; then
+      print_success "镜像文件访问正常"
+    else
+      print_warning "镜像访问可能需要同步，请等待几分钟"
+    fi
+  else
+    print_warning "无法连接到镜像服务，可能需要检查 Nginx 配置"
+  fi
 }
 
 # 生成报告
