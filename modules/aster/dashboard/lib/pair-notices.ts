@@ -8,6 +8,7 @@ import {
   type PairApiNotice,
   type Pair,
 } from './pairs.ts';
+import { pairCostFresh } from './pair-cost.ts';
 
 export type PairNotice = {
   key: string;
@@ -25,6 +26,34 @@ export type PairNoticeHistory = {
   entries: PairNoticeEntry[];
 };
 export const PAIR_NOTICE_LIMIT = 8;
+export const PAIR_DATA_NOTICE_DELAY = 3;
+
+type DataSignal = {
+  since: number | null;
+  confirmed: boolean;
+};
+type DataSignals = Record<
+  'group' | 'long' | 'short' | 'runtime' | 'costs',
+  DataSignal
+>;
+export type PairNoticeState = {
+  current: PairNotice[];
+  history: PairNoticeHistory;
+  data: DataSignals;
+  observedAt?: number;
+};
+
+function delayedSignal(
+  previous: DataSignal | undefined,
+  abnormal: boolean,
+  observedAt: number,
+  clockReset: boolean,
+): DataSignal {
+  if (!abnormal) return { since: null, confirmed: false };
+  if (previous?.confirmed) return previous;
+  const since = clockReset ? observedAt : (previous?.since ?? observedAt);
+  return { since, confirmed: observedAt - since >= PAIR_DATA_NOTICE_DELAY };
+}
 
 function pendingIssue(
   pending: Record<string, unknown> | null | undefined,
@@ -342,25 +371,99 @@ export function recordPairNotices(
   return { activeKeys, entries };
 }
 
-export function updatePairNoticeHistories(
-  previous: ReadonlyMap<string, PairNoticeHistory>,
+// Observe display warnings without extending the underlying data's validity.
+// Elapsed time is monotonic; `now` remains the server clock used by snapshots
+// and human-readable history timestamps.
+export function observePairNotices(
+  previous: PairNoticeState | undefined,
+  pair: Pair,
+  now: number,
+  offline: boolean,
+  observedAt: number,
+): PairNoticeState {
+  const history = previous?.history ?? { activeKeys: [], entries: [] };
+  const raw = pairStatusNotices(pair, now, offline);
+  const scheduled = Boolean(pairScheduledMarginWait(pair, now, offline));
+  const snapshots = pairMarginOnly(pair)
+    ? (pair.state?.margin_balances ?? pair.state?.snapshots)
+    : pair.state?.snapshots;
+  const signals = {
+    group: raw.some(({ kind }) => kind === 'data'),
+    long:
+      !scheduled && !pairDataFresh(snapshots?.long?.timestamp, now, offline),
+    short:
+      !scheduled && !pairDataFresh(snapshots?.short?.timestamp, now, offline),
+    runtime: !pairDataFresh(pair.state?.updated_at, now, offline),
+    costs:
+      Boolean(pair.state?.cycle_costs) &&
+      !pairCostFresh(pair.state?.cycle_costs, now, offline),
+  };
+  const validClock =
+    Number.isFinite(now) &&
+    now > 0 &&
+    Number.isFinite(observedAt) &&
+    observedAt >= 0;
+  const clockReset =
+    previous?.observedAt === undefined || observedAt < previous.observedAt;
+  const data = Object.fromEntries(
+    Object.entries(signals).map(([name, abnormal]) => {
+      const old = previous?.data[name as keyof DataSignals];
+      return [
+        name,
+        validClock
+          ? delayedSignal(old, abnormal, observedAt, clockReset)
+          : { since: null, confirmed: old?.confirmed ?? false },
+      ];
+    }),
+  ) as DataSignals;
+  const current = validClock
+    ? raw.filter(({ kind }) => kind !== 'data' || data.group.confirmed)
+    : [
+        ...(previous?.current.filter(({ kind }) => kind === 'data') ?? []),
+        ...raw.filter(({ kind }) => kind !== 'data'),
+      ];
+  return {
+    current,
+    history: validClock ? recordPairNotices(history, current, now) : history,
+    data,
+    observedAt: validClock ? observedAt : undefined,
+  };
+}
+
+export function visiblePairNotices(
+  state: PairNoticeState | undefined,
+): PairNotice[] {
+  return state?.current ?? [];
+}
+
+export function nextPairNoticeDeadline(
+  states: ReadonlyMap<string, PairNoticeState>,
+): number | null {
+  let deadline = Infinity;
+  for (const state of states.values()) {
+    for (const signal of Object.values(state.data)) {
+      if (signal.since !== null && !signal.confirmed)
+        deadline = Math.min(deadline, signal.since + PAIR_DATA_NOTICE_DELAY);
+    }
+  }
+  return Number.isFinite(deadline) ? deadline : null;
+}
+
+export function updatePairNoticeStates(
+  previous: ReadonlyMap<string, PairNoticeState>,
   pairs: Pair[],
   now: number,
   offline: boolean,
-): ReadonlyMap<string, PairNoticeHistory> {
-  const next = new Map<string, PairNoticeHistory>();
-  let changed = previous.size !== pairs.length;
+  observedAt: number,
+): ReadonlyMap<string, PairNoticeState> {
+  const next = new Map<string, PairNoticeState>();
   for (const pair of pairs) {
-    const old = previous.get(pair.id);
-    const history = recordPairNotices(
-      old,
-      pairStatusNotices(pair, now, offline),
-      now,
+    next.set(
+      pair.id,
+      observePairNotices(previous.get(pair.id), pair, now, offline, observedAt),
     );
-    next.set(pair.id, history);
-    if (history !== old) changed = true;
   }
-  return changed ? next : previous;
+  return next;
 }
 
 export function clearPastPairNotices(

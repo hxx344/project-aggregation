@@ -6,7 +6,8 @@ import {
   pairScheduledMarginWait,
   pairStatusNotices,
   recordPairNotices,
-  updatePairNoticeHistories,
+  updatePairNoticeStates,
+  visiblePairNotices,
 } from '../lib/pair-notices.ts';
 
 const emptyHistory = { activeKeys: [], entries: [] };
@@ -191,13 +192,13 @@ test('account cadence cannot hide a stalled pair runtime behind scheduled margin
   );
 });
 
-test('current data notices and recorded histories share the same freshness boundary', () => {
+test('displayed data notices and recorded histories share the confirmation boundary', () => {
   const fixture = pair();
-  let histories = new Map();
-  for (const now of [107.999, 108, 120]) {
-    const current = pairStatusNotices(fixture, now, false, 60);
-    histories = updatePairNoticeHistories(histories, [fixture], now, false);
-    const history = histories.get(fixture.id);
+  let states = new Map();
+  for (const now of [107.999, 108, 110.999, 111, 120]) {
+    states = updatePairNoticeStates(states, [fixture], now, false, now - 100);
+    const history = states.get(fixture.id).history;
+    const current = visiblePairNotices(states.get(fixture.id));
     assert.deepEqual(
       history.activeKeys,
       current.map(({ key }) => key),
@@ -208,7 +209,7 @@ test('current data notices and recorded histories share the same freshness bound
     );
     assert.equal(
       current.some(({ kind }) => kind === 'data'),
-      now >= 108,
+      now >= 111,
     );
   }
 });
@@ -1054,50 +1055,58 @@ test('all pair groups retain independent histories and deleting a group drops on
   );
   const second = pair({}, { id: 'second' });
   const original = new Map();
-  const initial = updatePairNoticeHistories(
+  const initial = updatePairNoticeStates(
     original,
     [first, second],
     100,
     false,
+    0,
   );
   assert.equal(original.size, 0);
-  assert.equal(initial.get('first').entries.length, 1);
-  const secondInitially = initial.get('second');
+  assert.equal(initial.get('first').history.entries.length, 1);
+  const secondInitially = initial.get('second').history;
   assert.ok(!secondInitially || secondInitially.entries.length === 0);
 
-  const switched = updatePairNoticeHistories(
+  const pending = updatePairNoticeStates(
     initial,
-    [second, first],
+    [first, second],
     108,
     false,
+    8,
+  );
+  const switched = updatePairNoticeStates(
+    pending,
+    [second, first],
+    111,
+    false,
+    11,
   );
   assert.deepEqual(
-    new Set(switched.get('first').entries.map(({ kind }) => kind)),
+    new Set(switched.get('first').history.entries.map(({ kind }) => kind)),
     new Set(['data', 'execution']),
   );
   assert.deepEqual(
-    switched.get('second').entries.map(({ kind }) => kind),
+    switched.get('second').history.entries.map(({ kind }) => kind),
     ['data'],
   );
-  assert.equal(initial.get('first').entries.length, 1);
-  assert.ok(
-    !initial.get('second') || initial.get('second').entries.length === 0,
-  );
+  assert.equal(initial.get('first').history.entries.length, 1);
+  assert.ok(initial.get('second').history.entries.length === 0);
 
-  const removed = updatePairNoticeHistories(switched, [second], 109, false);
+  const removed = updatePairNoticeStates(switched, [second], 112, false, 12);
   assert.equal(removed.has('first'), false);
-  assert.equal(removed.get('second').entries[0].occurrences, 1);
+  assert.equal(removed.get('second').history.entries[0].occurrences, 1);
   assert.equal(switched.has('first'), true);
-  assert.equal(updatePairNoticeHistories(removed, [], 110, false).size, 0);
+  assert.equal(updatePairNoticeStates(removed, [], 113, false, 13).size, 0);
 });
 
 test('group updates preserve active notices when the current clock is invalid', () => {
-  const previous = updatePairNoticeHistories(new Map(), [pair()], 108, false);
+  const pending = updatePairNoticeStates(new Map(), [pair()], 108, false, 0);
+  const previous = updatePairNoticeStates(pending, [pair()], 111, false, 3);
   for (const now of [0, NaN, Infinity]) {
-    const unchanged = updatePairNoticeHistories(previous, [pair()], now, false);
+    const unchanged = updatePairNoticeStates(previous, [pair()], now, false, 4);
     assert.deepEqual(
-      unchanged.get('fixture-pair'),
-      previous.get('fixture-pair'),
+      unchanged.get('fixture-pair').history,
+      previous.get('fixture-pair').history,
     );
   }
 });

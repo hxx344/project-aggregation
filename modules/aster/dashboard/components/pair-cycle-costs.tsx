@@ -1,6 +1,5 @@
 import { cycleUtcTime } from '@/lib/cycle-daily';
 import {
-  pairCostFresh,
   pairCostPeriodView,
   type PairCostPeriod,
   type PairCycleCosts,
@@ -8,14 +7,11 @@ import {
 
 export function PairCycleCostsPanel({
   report,
-  now,
-  offline,
+  stale,
 }: {
   report?: PairCycleCosts | null;
-  now: number;
-  offline: boolean;
+  stale: boolean;
 }) {
-  const stale = Boolean(report) && !pairCostFresh(report, now, offline);
   return (
     <section className="panel pair-cycle-costs" aria-label="两侧循环花费">
       <div className="section-head">

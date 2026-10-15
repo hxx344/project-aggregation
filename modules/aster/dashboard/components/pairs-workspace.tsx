@@ -26,13 +26,10 @@ import { PairOrderRecovery } from '@/components/pair-order-recovery';
 import { PairBaselineRecovery } from '@/components/pair-baseline-recovery';
 import { CycleQualityHistoryPanel } from '@/components/cycle-quality-history';
 import {
-  clearPastPairNotices,
   pairScheduledMarginWait,
-  pairStatusNotices,
-  recordPairNotices,
-  updatePairNoticeHistories,
-  type PairNoticeHistory,
+  type PairNoticeState,
 } from '@/lib/pair-notices';
+import { usePairNotices } from '@/lib/use-pair-notices';
 import { ExecutionEvents } from '@/components/execution-events';
 import type { Account, DeskAction } from '@/lib/desk-types';
 import type { ExecutionEvent } from '@/lib/cycle-events';
@@ -91,32 +88,7 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
   const items = pairs ?? EMPTY_PAIRS;
   const pair = items.find((item) => item.id === selected) ?? items[0];
   const offline = Boolean(props.connectionError);
-  const [noticeState, setNoticeState] = useState(() => ({
-    items,
-    now: props.now,
-    offline,
-    histories: updatePairNoticeHistories(new Map(), items, props.now, offline),
-  }));
-  // Remember previous observations before rendering children. Unlike an effect,
-  // this cannot briefly paint a new warning alongside the previous history.
-  if (
-    noticeState.items !== items ||
-    !Object.is(noticeState.now, props.now) ||
-    noticeState.offline !== offline
-  ) {
-    setNoticeState({
-      items,
-      now: props.now,
-      offline,
-      histories: updatePairNoticeHistories(
-        noticeState.histories,
-        items,
-        props.now,
-        offline,
-      ),
-    });
-  }
-  const noticeHistories = noticeState.histories;
+  const notices = usePairNotices(items, props.now, offline);
   return (
     <div className="feature-stack pair-workspace">
       <div className="pair-workspace-heading">
@@ -172,23 +144,8 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
           pair={pair}
           catalog={catalog}
           loadSymbols={loadSymbols}
-          noticeHistory={noticeHistories.get(pair.id)}
-          clearNotices={() =>
-            setNoticeState((previous) => {
-              const next = new Map(previous.histories);
-              next.set(
-                pair.id,
-                clearPastPairNotices(
-                  recordPairNotices(
-                    previous.histories.get(pair.id),
-                    pairStatusNotices(pair, props.now, offline),
-                    props.now,
-                  ),
-                ),
-              );
-              return { ...previous, histories: next };
-            })
-          }
+          noticeObservation={notices.observations.get(pair.id)}
+          clearNotices={() => notices.clear(pair.id)}
         />
       ) : (
         <section className="panel empty-state">
@@ -331,7 +288,7 @@ function PairDetail({
   action,
   setError,
   setNotice,
-  noticeHistory,
+  noticeObservation,
   clearNotices,
   catalog,
   loadSymbols,
@@ -339,7 +296,7 @@ function PairDetail({
   PairSymbolsProps & {
     pairs: Pair[];
     pair: Pair;
-    noticeHistory?: PairNoticeHistory;
+    noticeObservation?: PairNoticeState;
     clearNotices: () => void;
   }) {
   const draft = useAccountDraft(pair.id, pairDraft(pair));
@@ -356,10 +313,7 @@ function PairDetail({
   );
   const offline = Boolean(connectionError);
   const scheduledMarginWait = pairScheduledMarginWait(pair, now, offline);
-  const fresh =
-    pairDataFresh(pair.state?.updated_at, now, offline) &&
-    pairDataFresh(displayedBalances?.long?.timestamp, now, offline) &&
-    pairDataFresh(displayedBalances?.short?.timestamp, now, offline);
+  const dataWarning = noticeObservation?.data.group.confirmed ?? false;
   const net = pairNetQuantity(snapshots, symbol);
   const pending = pairHasPending(pair);
   const margin = pair.state?.margin;
@@ -487,7 +441,12 @@ function PairDetail({
             pair={pair}
             now={now}
             offline={offline}
-            history={noticeHistory}
+            observation={noticeObservation}
+            dataPending={Boolean(
+              noticeObservation &&
+              noticeObservation.data.group.since !== null &&
+              !dataWarning,
+            )}
             clear={clearNotices}
           />
           {draft.dirty ? (
@@ -518,6 +477,7 @@ function PairDetail({
           baseLimit={pair.ordinary.margin_limit}
           cycle={pair.cycle.enabled}
           scheduledWait={Boolean(scheduledMarginWait)}
+          dataWarning={noticeObservation?.data.long.confirmed ?? false}
         />
         <PairSide
           side="short"
@@ -531,18 +491,17 @@ function PairDetail({
           baseLimit={pair.ordinary.margin_limit}
           cycle={pair.cycle.enabled}
           scheduledWait={Boolean(scheduledMarginWait)}
+          dataWarning={noticeObservation?.data.short.confirmed ?? false}
         />
       </div>
       <section className="panel" aria-label="配对数量与执行进度">
         <div className="section-head">
           <h2>配对执行</h2>
-          <span
-            className={`small-note ${!fresh && !scheduledMarginWait ? 'amber' : ''}`}
-          >
+          <span className={`small-note ${dataWarning ? 'amber' : ''}`}>
             组状态 {clock(pair.state?.updated_at)}
             {scheduledMarginWait
               ? ' · 按计划检查'
-              : !fresh
+              : dataWarning
                 ? ' · 过期或不完整'
                 : ''}
           </span>
@@ -640,8 +599,7 @@ function PairDetail({
       </section>
       <PairCycleCostsPanel
         report={pair.state?.cycle_costs}
-        now={now}
-        offline={offline}
+        stale={noticeObservation?.data.costs.confirmed ?? false}
       />
       <section className="panel" aria-label="配对组当日成交量">
         <div className="section-head">
@@ -760,7 +718,7 @@ function PairDetail({
           accountName={`配对组 · ${pair.name}`}
           quality={pair.state?.execution_quality}
           history={pair.state?.execution_quality_history}
-          stale={!pairDataFresh(pair.state?.updated_at, now, offline)}
+          stale={noticeObservation?.data.runtime.confirmed ?? false}
         />
       </details>
       <details className="disclosure panel">
@@ -906,6 +864,7 @@ function PairSide({
   baseLimit,
   cycle,
   scheduledWait,
+  dataWarning,
 }: {
   side: 'long' | 'short';
   symbol: string;
@@ -918,6 +877,7 @@ function PairSide({
   baseLimit: string;
   cycle: boolean;
   scheduledWait: boolean;
+  dataWarning: boolean;
 }) {
   if (marginOnly) {
     const fresh = pairDataFresh(balance?.timestamp, now, offline);
@@ -931,12 +891,14 @@ function PairSide({
             <h2>
               {side === 'long' ? 'A' : 'B'} · {account?.name ?? '账户待确认'}
             </h2>
-            <p className={!fresh && !scheduledWait ? 'amber' : 'muted'}>
+            <p className={dataWarning ? 'amber' : 'muted'}>
               {scheduledWait
                 ? '上次余额检查'
                 : fresh
                   ? '余额已更新'
-                  : '等待余额检查'}{' '}
+                  : dataWarning || !balance
+                    ? '等待余额检查'
+                    : '上次余额检查'}{' '}
               · {clock(balance?.timestamp)}
             </p>
           </div>
@@ -978,10 +940,12 @@ function PairSide({
             {side === 'long' ? 'A · 只多' : 'B · 只空'}{' '}
             <span className="muted">{account?.name ?? '账户待确认'}</span>
           </h2>
-          <p className={!fresh && !scheduledWait ? 'amber' : 'muted'}>
+          <p className={dataWarning ? 'amber' : 'muted'}>
             {scheduledWait
               ? '上次检查快照'
-              : pairSnapshotStatus(snapshot, now, offline)}{' '}
+              : !fresh && !dataWarning && snapshot
+                ? '最近记录'
+                : pairSnapshotStatus(snapshot, now, offline)}{' '}
             · {clock(snapshot?.timestamp)}
           </p>
         </div>

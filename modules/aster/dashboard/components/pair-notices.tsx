@@ -4,40 +4,44 @@ import { clock } from '@/lib/desk-format';
 import type { Pair } from '@/lib/pairs';
 import {
   pairScheduledMarginWait,
-  pairStatusNotices,
-  recordPairNotices,
+  visiblePairNotices,
   type PairNoticeEntry,
-  type PairNoticeHistory,
+  type PairNoticeState,
 } from '@/lib/pair-notices';
 
 export function PairNotices({
   pair,
   now,
   offline,
-  history,
+  observation,
+  dataPending,
   clear,
 }: {
   pair: Pair;
   now: number;
   offline: boolean;
-  history?: PairNoticeHistory;
+  observation?: PairNoticeState;
+  dataPending: boolean;
   clear: () => void;
 }) {
-  const notices = pairStatusNotices(pair, now, offline);
+  const history = observation?.history;
+  const notices = visiblePairNotices(observation);
   const scheduledWait = pairScheduledMarginWait(pair, now, offline);
   const currentKeys = new Set(notices.map((notice) => notice.key));
-  // Derive current warnings immediately; history never authorizes an action.
-  const entries = recordPairNotices(history, notices, now).entries;
+  // The parent observes and confirms data warnings once for every pair.
+  const entries = history?.entries ?? [];
   const latest = entries[0];
-  const visible = notices.map(
-    (notice) =>
-      entries.find((entry) => entry.key === notice.key) ?? {
-        ...notice,
-        firstSeen: now,
-        lastSeen: now,
-        occurrences: 1,
-      },
-  );
+  const visible = notices.map((notice) => {
+    const recorded = entries.find((entry) => entry.key === notice.key);
+    return recorded
+      ? { ...recorded, ...notice }
+      : {
+          ...notice,
+          firstSeen: now,
+          lastSeen: now,
+          occurrences: 1,
+        };
+  });
   if (latest && !currentKeys.has(latest.key)) visible.push(latest);
   const visibleKeys = new Set(visible.map((entry) => entry.key));
   const older = entries.filter((entry) => !visibleKeys.has(entry.key));
@@ -47,6 +51,7 @@ export function PairNotices({
     if (currentKeys.has(entry.key)) return '当前提示';
     if (
       entry.kind === 'data' &&
+      !dataPending &&
       !scheduledWait &&
       Number.isFinite(now) &&
       now > 0 &&
