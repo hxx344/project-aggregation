@@ -9,6 +9,7 @@ const PLAN_ID = /^[A-Za-z0-9_-]{16,128}$/;
 const GITHUB_TOKEN = /^[A-Za-z0-9_]{20,255}$/;
 const TOKEN_BUSY = '正在检查版本或执行更新，请完成后再修改 GitHub Token';
 const TOKEN_INVALID = 'GitHub Token 格式无效，请粘贴完整 Token，且不要包含空格或换行';
+const DEPLOYMENT_MODES = new Set(['source', 'ci']);
 
 export class UpdateError extends Error {
   constructor(status, message, { uncertain = false } = {}) { super(message); this.status = status; this.uncertain = uncertain; }
@@ -24,6 +25,13 @@ const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$
 const timestamp = value => text(value, 40) && /^\d{4}-\d\d-\d\dT/.test(value) && Number.isFinite(Date.parse(value));
 const nullable = (value, valid) => value === null || valid(value);
 const PROGRESS_STAGES = new Set(['preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize']);
+const PROGRESS_DETAILS = {
+  download: new Set(['source-receive', 'source-retry']),
+  prepare: new Set(['source-resolve', 'dependencies', 'runtime']),
+  build: new Set(['build-workbench', 'build-monitor', 'build-asset', 'build-crossex', 'build-aster']),
+  verify: new Set(['typecheck', 'tests']),
+  finalize: new Set(['healthcheck', 'updater']),
+};
 const progressNumber = (value, maximum = Number.MAX_SAFE_INTEGER) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= maximum;
 
 function publicProgress(value, job) {
@@ -33,6 +41,7 @@ function publicProgress(value, job) {
     || ['downloaded', 'total', 'speed', 'eta'].some(key => value[key] !== undefined && !progressNumber(value[key]))
     || value.downloaded !== undefined && value.total !== undefined && value.downloaded > value.total) return null;
   const result = { stage: value.stage, timestamp: value.timestamp };
+  if (PROGRESS_DETAILS[value.stage]?.has(value.detail)) result.detail = value.detail;
   if (value.progress !== undefined) result.progress = value.progress;
   if (value.stage === 'download') for (const key of ['downloaded', 'total', 'speed', 'eta']) {
     if (value[key] !== undefined) result[key] = value[key];
@@ -48,6 +57,9 @@ export function publicUpdateState(value) {
     || !nullable(value.planId, value => typeof value === 'string' && PLAN_ID.test(value)) || !nullable(value.expiresAt, timestamp)
     || !Array.isArray(value.modules) || value.modules.length > 32 || value.reason !== undefined && !text(value.reason)) invalid();
   if (value.githubToken !== undefined && (!object(value.githubToken) || typeof value.githubToken.configured !== 'boolean')) invalid();
+  if (value.deploymentModes !== undefined && (!Array.isArray(value.deploymentModes) || !value.deploymentModes.length
+    || value.deploymentModes.length > DEPLOYMENT_MODES.size || new Set(value.deploymentModes).size !== value.deploymentModes.length
+    || value.deploymentModes.some(mode => !DEPLOYMENT_MODES.has(mode)))) invalid();
   const modules = value.modules.map(row => {
     if (!object(row) || !identifier(row.id) || !text(row.name, 120) || !['current', 'available', 'unavailable', 'unmanaged'].includes(row.state)
       || !['currentVersion', 'latestVersion', 'currentCommit', 'latestCommit'].every(key => nullable(row[key], value => text(value, 128)))
@@ -63,25 +75,29 @@ export function publicUpdateState(value) {
     const row = value.job;
     if (!object(row) || !identifier(row.id) || !['queued', 'running', 'succeeded', 'failed', 'interrupted'].includes(row.status)
       || !timestamp(row.startedAt) || !nullable(row.finishedAt, timestamp) || !nullable(row.activeModule, identifier)
-      || !text(row.message) || !Array.isArray(row.steps) || row.steps.length > 128) invalid();
+      || !text(row.message) || !Array.isArray(row.steps) || row.steps.length > 128
+      || row.deployMode !== undefined && !DEPLOYMENT_MODES.has(row.deployMode)) invalid();
     const steps = row.steps.map(step => {
       if (!object(step) || !identifier(step.id) || !text(step.name, 120) || !['pending', 'running', 'succeeded', 'failed', 'skipped'].includes(step.status)
         || step.message !== undefined && !text(step.message)) invalid();
       return { id: step.id, name: step.name, status: step.status, ...(step.message === undefined ? {} : { message: step.message }) };
     });
     job = { id: row.id, status: row.status, startedAt: row.startedAt, finishedAt: row.finishedAt, activeModule: row.activeModule, steps, message: row.message };
+    if (row.deployMode !== undefined) job.deployMode = row.deployMode;
     const progress = publicProgress(row.progress, row);
     if (progress) job.progress = progress;
   }
   return { enabled: value.enabled, ...(value.reason === undefined ? {} : { reason: value.reason }), checking: value.checking,
     checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job,
+    ...(value.deploymentModes === undefined ? {} : { deploymentModes: [...value.deploymentModes] }),
     ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }) };
 }
 
 export function validateUpdateBody(action, body) {
-  const field = action === 'apply' ? 'planId' : action === 'token' ? 'token' : null;
-  if (!['check', 'apply', 'token'].includes(action) || !object(body) || Object.keys(body).some(key => key !== field)) throw new UpdateError(400, '更新请求包含不支持的字段');
+  const fields = action === 'apply' ? ['planId', 'deployMode'] : action === 'token' ? ['token'] : [];
+  if (!['check', 'apply', 'token'].includes(action) || !object(body) || Object.keys(body).some(key => !fields.includes(key))) throw new UpdateError(400, '更新请求包含不支持的字段');
   if (action === 'apply' && (typeof body.planId !== 'string' || !PLAN_ID.test(body.planId))) throw new UpdateError(400, '更新计划无效，请重新检查更新');
+  if (action === 'apply' && body.deployMode !== undefined && !DEPLOYMENT_MODES.has(body.deployMode)) throw new UpdateError(400, '更新模式无效');
   if (action === 'token' && (typeof body.token !== 'string' || body.token !== '' && (!GITHUB_TOKEN.test(body.token) || body.token.trim() !== body.token))) throw new UpdateError(400, TOKEN_INVALID);
 }
 
@@ -128,14 +144,19 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
   return {
     async status() { try { return await request('GET', '/status'); } catch { return unavailableUpdateState(); } },
     check() { return request('POST', '/check', {}); },
-    apply(planId) { validateUpdateBody('apply', { planId }); return request('POST', '/apply', { planId }); },
+    apply(planId, deployMode = 'source') {
+      validateUpdateBody('apply', { planId, deployMode });
+      // Keep source updates compatible with helpers installed before mode selection.
+      return request('POST', '/apply', { planId, ...(deployMode === 'source' ? {} : { deployMode }) });
+    },
     token(token) { validateUpdateBody('token', { token }); return request('POST', '/token', { token }); },
   };
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, setModuleMaintenance = async () => {}, prepareApply = async () => {} }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, prepareApply = async () => {} }) {
   let pendingPlanId = readPendingPlanId();
+  let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
   let moduleSync = Promise.resolve();
   const synchronizeModules = () => {
@@ -143,7 +164,13 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     moduleSync = next; return next;
   };
   function remember(value) { if (maintenance !== value) { writeMaintenance(value); maintenance = value; } }
-  function rememberPending(value) { if (pendingPlanId !== value) { writePendingPlanId(value); pendingPlanId = value; } }
+  function rememberPending(value, deployMode = 'source') {
+    const rememberMode = () => { if (pendingDeployMode !== deployMode) { writePendingDeployMode(deployMode); pendingDeployMode = deployMode; } };
+    // Record mode before a new plan, and clear the plan before resetting mode.
+    if (value) rememberMode();
+    if (pendingPlanId !== value) { writePendingPlanId(value); pendingPlanId = value; }
+    if (!value) rememberMode();
+  }
   if (pendingPlanId) remember(true);
   function observe(state) {
     if (state.enabled) {
@@ -184,20 +211,21 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       return await operation();
     } finally { entries -= 1; }
   }
-  function apply(planId, authorize) {
+  function apply(planId, authorize, deployMode = 'source') {
     authorize();
+    validateUpdateBody('apply', { planId, deployMode });
     if (applying) {
-      if (applying.planId !== planId) throw new UpdateError(409, MAINTENANCE);
+      if (applying.planId !== planId || applying.deployMode !== deployMode) throw new UpdateError(409, MAINTENANCE);
       return applying.promise;
     }
-    if (pendingPlanId && pendingPlanId !== planId) throw new UpdateError(409, MAINTENANCE);
+    if (pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
     if (entries || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status))) throw new UpdateError(409, '请先停止所有实盘任务并完成委托核对，再更新系统');
     generation += 1;
-    const previous = { maintenance, pendingPlanId };
+    const previous = { maintenance, pendingPlanId, pendingDeployMode };
     // Persist the plan first; restoration also treats a pending plan as maintenance.
-    rememberPending(planId);
+    rememberPending(planId, deployMode);
     remember(true);
-    const pending = { planId, promise: null };
+    const pending = { planId, deployMode, promise: null };
     applying = pending;
     pending.promise = (async () => {
       try {
@@ -205,13 +233,13 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
         await prepareApply();
         // Run authorization again immediately before sending the privileged request.
         authorize();
-        const state = publicUpdateState(await client.apply(planId));
+        const state = publicUpdateState(await client.apply(planId, deployMode));
         rememberPending(null);
         observe(state);
         return state;
       } catch (error) {
         // A timeout may follow successful acceptance. Keep the durable latch until status confirms completion.
-        if (error instanceof UpdateError && !error.uncertain) { rememberPending(previous.pendingPlanId); remember(previous.maintenance); }
+        if (error instanceof UpdateError && !error.uncertain) { rememberPending(previous.pendingPlanId, previous.pendingDeployMode); remember(previous.maintenance); }
         throw error;
       } finally {
         if (applying === pending) { generation += 1; applying = null; }

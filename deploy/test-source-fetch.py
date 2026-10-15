@@ -62,6 +62,9 @@ tee() {
   if [[ ${FAIL_TEE:-0} == 1 ]]; then cat; return 73; fi
   command tee "$@"
 }
+if [[ ${FAIL_PROGRESS:-0} == 1 ]]; then
+  ci_source_progress() { cat >&2; return 74; }
+fi
 trap 'status=$?; printf "%s\n" "$status" >> "$FIXTURE/rollback"; exit "$status"' ERR
 fetch_source
 printf 'continued\n' > "$FIXTURE/completed"
@@ -186,6 +189,11 @@ printf 'continued\n' > "$FIXTURE/completed"
 
     def test_log_write_failure_is_not_swallowed_or_retried(self):
         self.run_fetch(73, FAIL_TEE='1')
+        self.assert_fetches(1)
+        self.assertEqual(self.lines('delays'), [])
+
+    def test_progress_pipeline_failure_does_not_report_success_or_retry(self):
+        self.run_fetch(74, FAIL_PROGRESS='1')
         self.assert_fetches(1)
         self.assertEqual(self.lines('delays'), [])
 

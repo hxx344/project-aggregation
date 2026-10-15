@@ -41,11 +41,11 @@ function fixture({ maintenance = false, pendingPlanId = null } = {}) {
   const client = {
     async status() { calls.push('status'); return structuredClone(updaterState); },
     async check() { calls.push('check'); return structuredClone(updaterState); },
-    async apply(id) {
+    async apply(id, deployMode) {
       calls.push('apply'); events.push('updater:apply'); assert.equal(id, planId);
       assert.equal(persisted.maintenance, true, 'hub durable latch must precede updater submission');
       assert.equal(persisted.pendingPlanId, planId);
-      if (handlers.apply) return handlers.apply();
+      if (handlers.apply) return handlers.apply(deployMode);
       return state('running');
     },
   };
@@ -58,7 +58,7 @@ function fixture({ maintenance = false, pendingPlanId = null } = {}) {
     prepareApply: async () => { events.push('prepare'); await guard.prepareApply(); },
   });
   return { coordinator, guard, persisted, active, events, handlers, calls,
-    apply: () => coordinator.apply(planId, () => events.push('authorize')),
+    apply: deployMode => coordinator.apply(planId, () => events.push('authorize'), deployMode),
     set updaterState(value) { updaterState = value; } };
 }
 
@@ -78,15 +78,17 @@ test('coordinator initialization synchronizes each module with durable maintenan
   }
 });
 
-test('apply waits for all module gates, then all busy checks, before privileged updater submission', async () => {
+test('ci apply waits for all module gates, then all busy checks, before privileged updater submission', async () => {
   const f = fixture(), gateEntered = deferred(), gateRelease = deferred(), statusEntered = deferred(), statusRelease = deferred();
   f.handlers['gate:greeks'] = async active => {
     if (active) { gateEntered.resolve(); await gateRelease.promise; }
     return { data: { active } };
   };
   f.handlers['status:greeks'] = async () => { statusEntered.resolve(); await statusRelease.promise; return { data: { busy: false } }; };
-  const result = f.apply();
+  f.handlers.apply = mode => { assert.equal(mode, 'ci'); return state('running'); };
+  const result = f.apply('ci');
   await gateEntered.promise;
+  assert.throws(() => f.apply('source'), error => error.status === 409);
   assert.deepEqual(f.persisted, { maintenance: true, pendingPlanId: planId });
   assert.equal(f.events.includes('prepare'), false); assert.deepEqual(f.calls, []);
   gateRelease.resolve(); await statusEntered.promise;

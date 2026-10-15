@@ -8,7 +8,7 @@ import unittest
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server/update-service'))
-from progress import get_progress, STAGES
+from progress import get_progress, STAGES, DETAILS
 
 
 class ProgressTests(unittest.TestCase):
@@ -45,6 +45,20 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(self.read(), self.sample)
         self.write({**self.sample, 'stage': 'build'})
         self.assertEqual(self.read(), {'stage': 'build', 'progress': 0.5, 'timestamp': self.now * 1000})
+
+    def test_detail_is_optional_and_bound_to_its_stage(self):
+        for stage, details in DETAILS.items():
+            for detail in details:
+                sample = {'stage': stage, 'detail': detail, 'timestamp': self.now * 1000}
+                self.write(sample)
+                self.assertEqual(self.read(), sample)
+        for detail in ('build-workbench', 'private output', None, [], {}):
+            self.write({**self.sample, 'detail': detail})
+            self.assertEqual(self.read(), self.sample)
+        sample = {'stage': 'download', 'detail': 'source-receive', 'progress': 0.5,
+                  'downloaded': 1024, 'speed': 256, 'timestamp': self.now * 1000}
+        self.write(sample)
+        self.assertEqual(self.read(), sample)
 
     def test_missing_corrupt_oversized_old_future_or_previous_job_sample_is_ignored(self):
         self.assertIsNone(self.read())

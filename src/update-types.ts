@@ -11,6 +11,8 @@ export type UpdateModule = {
   recovery?: boolean;
 };
 
+export type UpdateDeployMode = 'source' | 'ci';
+
 export type UpdateJob = {
   id: string;
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted';
@@ -24,11 +26,13 @@ export type UpdateJob = {
     message?: string;
   }>;
   message: string;
+  deployMode?: UpdateDeployMode;
   progress?: UpdateProgress;
 };
 
 export type UpdateState = {
   enabled: boolean;
+  deploymentModes?: UpdateDeployMode[];
   githubToken?: { configured: boolean };
   reason?: string;
   checking: boolean;
@@ -52,6 +56,7 @@ export type UpdateStage =
 
 export interface UpdateProgress {
   stage: UpdateStage;
+  detail?: string;
   progress?: number;  // Measured progress within this stage, 0-1; absent when unknown.
   downloaded?: number;
   total?: number;
@@ -64,6 +69,10 @@ export interface UpdateProgressView {
   stage: UpdateStage;
   stageProgress?: number;
   message: string;
+  description: string;
+  progressLabel: string;
+  downloaded?: string;
+  total?: string;
   speed?: string;
   eta?: string;
 }

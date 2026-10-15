@@ -102,7 +102,7 @@ CI_MANIFEST_PY
 }
 
 ci_release_download() {
-  python3 -I - "$1" "$2" "$3" <<'CI_DOWNLOAD_PY'
+  python3 -I - "$@" <<'CI_DOWNLOAD_PY'
 import concurrent.futures
 import hashlib
 import http.client
@@ -131,6 +131,13 @@ SOCKET_TIMEOUT = 20
 RANGE_DEADLINE = 180
 SINGLE_DEADLINE = 1800
 PROGRESS_UPDATE_INTERVAL = 0.5  # Update progress file every 500ms
+PROGRESS_DETAILS = {
+    'download': {'source-receive', 'source-retry'},
+    'prepare': {'source-resolve', 'dependencies', 'runtime'},
+    'build': {'build-workbench', 'build-monitor', 'build-asset', 'build-crossex', 'build-aster'},
+    'verify': {'typecheck', 'tests'},
+    'finalize': {'healthcheck', 'updater'},
+}
 
 
 class DownloadError(Exception):
@@ -344,7 +351,7 @@ def digest_file(stream):
     return digest.hexdigest()
 
 
-def write_progress_file(stage, progress=None, downloaded=None, total=None, speed=None):
+def write_progress_file(stage, progress=None, downloaded=None, total=None, speed=None, detail=None):
     """Publish optional detail only in the coordinator's protected job directory."""
     filename = os.environ.get('PROJECT_UPDATE_PROGRESS_FILE', '')
     if not filename or not hasattr(os, 'geteuid') or os.geteuid() != 0:
@@ -361,6 +368,8 @@ def write_progress_file(stage, progress=None, downloaded=None, total=None, speed
             'stage': stage,
             'timestamp': int(time.time() * 1000),
         }
+        if isinstance(detail, str) and detail in PROGRESS_DETAILS.get(stage, set()):
+            data['detail'] = detail
         if progress is not None:
             if not isinstance(progress, (int, float)) or not 0 <= progress <= 1:
                 return
@@ -369,9 +378,9 @@ def write_progress_file(stage, progress=None, downloaded=None, total=None, speed
             data['downloaded'] = int(downloaded)
         if total is not None:
             data['total'] = int(total)
-        if speed is not None and speed > 0:
+        if speed is not None and speed >= 0:
             data['speed'] = int(speed)
-            if downloaded is not None and total is not None and downloaded < total:
+            if speed > 0 and downloaded is not None and total is not None and downloaded < total:
                 remaining = total - downloaded
                 data['eta'] = int(remaining / speed)
         # Open every ancestor without following links. Keep the verified parent
@@ -415,6 +424,60 @@ def write_progress_file(stage, progress=None, downloaded=None, total=None, speed
             os.close(directory)
 
 
+def source_progress_sample(line):
+    """Git's percentage counts objects, never bytes; do not infer a byte total/ETA."""
+    match = re.match(r'^(Receiving objects|Resolving deltas):\s*(\d{1,3})%\s*\((\d+)/(\d+)\)'
+                     r'(?:,\s*([0-9]+(?:\.[0-9]+)?)\s+(bytes|[KMGT]iB)'
+                     r'\s*\|\s*([0-9]+(?:\.[0-9]+)?)\s+(bytes|[KMGT]iB)/s)?', line)
+    if not match:
+        return None
+    operation, percent, completed, count, amount, unit, rate, rate_unit = match.groups()
+    completed, count = int(completed), int(count)
+    if not count or not 0 <= completed <= count <= 2 ** 53 - 1 or not 0 <= int(percent) <= 100:
+        return None
+    receiving = operation == 'Receiving objects'
+    sample = {'stage': 'download' if receiving else 'prepare', 'progress': completed / count,
+              'detail': 'source-receive' if receiving else 'source-resolve'}
+    if receiving and amount is not None:
+        units = {'bytes': 1, 'KiB': 1024, 'MiB': 1024 ** 2, 'GiB': 1024 ** 3, 'TiB': 1024 ** 4}
+        downloaded, speed = float(amount) * units[unit], float(rate) * units[rate_unit]
+        if not 0 <= downloaded <= 2 ** 53 - 1 or not 0 <= speed <= 2 ** 53 - 1:
+            return None
+        sample.update(downloaded=int(downloaded), speed=int(speed))
+    return sample
+
+
+def source_progress_stream(source, output):
+    """Relay the unchanged Git log while sampling bounded CR/LF progress records."""
+    pending, discard, latest, published = b'', False, None, None
+    last_write = 0
+    while True:
+        chunk = source.read1(4096)
+        if not chunk:
+            break
+        output.write(chunk)
+        output.flush()
+        for part in re.split(b'([\r\n])', chunk):
+            if part in (b'\r', b'\n'):
+                if not discard:
+                    sample = source_progress_sample(pending.decode('utf-8', errors='replace'))
+                    if sample:
+                        latest = sample
+                        now = time.monotonic()
+                        if now - last_write >= PROGRESS_UPDATE_INTERVAL or not published or sample['detail'] != published['detail']:
+                            write_progress_file(**sample)
+                            published, last_write = sample, now
+                pending, discard = b'', False
+            elif not discard:
+                pending += part
+                if len(pending) > 4096:
+                    pending, discard = b'', True
+    if pending and not discard:
+        latest = source_progress_sample(pending.decode('utf-8', errors='replace')) or latest
+    if latest and latest != published:
+        write_progress_file(**latest)
+
+
 class Downloader:
     def __init__(self, cache, url, expected, *, http_origin=None, timeout=None):
         require(re.fullmatch(r'[a-f0-9]{64}', expected) is not None, 'invalid archive SHA256')
@@ -456,12 +519,12 @@ class Downloader:
                    self.received / elapsed / 1048576, elapsed), file=sys.stderr, flush=True)
 
             # Write progress file for SSE streaming (rate-limited)
-            now = time.time()
-            if self.stage == 'download' and self.total and now - self.last_progress_write >= PROGRESS_UPDATE_INTERVAL:
+            now = time.monotonic()
+            if self.stage == 'download' and now - self.last_progress_write >= PROGRESS_UPDATE_INTERVAL:
                 speed = int(self.received / elapsed) if elapsed > 0 else 0
                 write_progress_file(
                     stage='download',
-                    progress=current / self.total,
+                    progress=min(current / self.total, 1) if self.total else None,
                     downloaded=current,
                     total=self.total,
                     speed=speed
@@ -881,7 +944,11 @@ def release_download(cache, url, expected, *, config_path=None):
 if __name__ == '__main__':
     try:
         if sys.argv[1] == '--progress':
-            write_progress_file(sys.argv[2], float(sys.argv[3]) if sys.argv[3] else None)
+            write_progress_file(sys.argv[2], float(sys.argv[3]) if sys.argv[3] else None,
+                                detail=sys.argv[4] if len(sys.argv) > 4 else None)
+        elif sys.argv[1] == '--source-progress':
+            with os.fdopen(3, 'rb') as source:
+                source_progress_stream(source, sys.stderr.buffer)
         else:
             print(release_download(*sys.argv[1:]))
     except (DownloadError, OSError, ValueError) as error:
@@ -893,7 +960,13 @@ CI_DOWNLOAD_PY
 ci_update_progress() {
   # Old workers and direct installs omit this optional, root-controlled path.
   [[ -n ${PROJECT_UPDATE_PROGRESS_FILE:-} ]] || return 0
-  ci_release_download --progress "$1" "${2:-}" >/dev/null 2>&1 || true
+  ci_release_download --progress "$1" "${2:-}" "${3:-}" >/dev/null 2>&1 || true
+}
+
+ci_source_progress() {
+  if [[ -z ${PROJECT_UPDATE_PROGRESS_FILE:-} ]]; then cat >&2; return; fi
+  # Python's stdin contains the trusted helper; fd 3 carries only Git's log.
+  ci_release_download --source-progress 3<&0
 }
 
 ci_release_extract() {
@@ -1287,7 +1360,7 @@ fetch_source() {
     if (( attempt > 1 )); then options+=(-c http.version=HTTP/1.1); fi
     log "获取固定版本 ${commit:0:12} 的源码（第 $attempt/3 次）；显示 Git 接收进度。"
     if LC_ALL=C GIT_TERMINAL_PROMPT=0 git "${options[@]}" --git-dir="$repository" \
-        fetch --depth=1 --no-tags --progress "$REPOSITORY" "$commit:$reference" 2>&1 | tee "$transcript" >&2; then
+        fetch --depth=1 --no-tags --progress "$REPOSITORY" "$commit:$reference" 2>&1 | tee "$transcript" | ci_source_progress; then
       if ! git --git-dir="$repository" cat-file -e "$commit^{commit}" 2>/dev/null; then
         log '错误：Git 获取完成但缺少所选提交，停止更新。' >&2
         return 1
@@ -1302,11 +1375,13 @@ fetch_source() {
     # retryable network error, even if its partial transcript looks like one.
     case "$status" in 130|141|143) return "$status" ;; esac
     if (( pipeline_status[1] != 0 )); then return "${pipeline_status[1]}"; fi
+    if (( pipeline_status[2] != 0 )); then return "${pipeline_status[2]}"; fi
     if (( attempt == 3 )) || ! source_fetch_retryable "$transcript"; then
       log "错误：源码获取失败（退出码 $status）；尚未进入构建或服务切换，保留已有缓存。" >&2
       return "$status"
     fi
     delay=$((attempt * 2))
+    ci_update_progress download '' source-retry
     log "源码连接暂时中断，${delay} 秒后使用 HTTP/1.1 重试同一提交；已有缓存保留。"
     sleep "$delay" || return
   done
@@ -1326,7 +1401,7 @@ prepare_dependencies() {
     return
   fi
   [[ ! -e "$dependencies" ]] || fail '依赖缓存目录不完整，请检查后重试。'
-  ci_update_progress prepare
+  ci_update_progress prepare '' dependencies
   log '依赖内容或运行环境变化，安装依赖。'
   local staging="$work_dir/dependencies"
   mkdir "$staging"
@@ -1403,7 +1478,7 @@ prepare_module_builds() {
       # that account too; privileged copies only target root-owned trees.
       run_as_service /usr/bin/python3 -I "$work_dir/build-artifact-cache.py" restore "$cache" "$key" "$artifact"
     else
-      ci_update_progress build
+      ci_update_progress build '' "build-$module"
       log "$module 构建输入变化或缓存不完整，仅构建该模块。"
       (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules "$module")
       [[ -s "$artifact/${MODULE_BUILD_ENTRIES[$module]}" ]] || fail "$module 构建缺少必要入口。"
@@ -1416,7 +1491,7 @@ prepare_module_builds() {
 }
 prepare_embedded_runtime() {
   prepare_module_builds
-  ci_update_progress prepare
+  ci_update_progress prepare '' runtime
   # Re-extract executable sources and packaging helpers from the pinned Git
   # object. Only the declared, fully verified build outputs come from caches.
   mkdir "$work_dir/trusted-runtime"
@@ -1457,7 +1532,7 @@ prepare_application() {
     prepare_source_aster_runtime
   fi
   if [[ ! -f "$typecheck_stamp" ]]; then
-    ci_update_progress verify
+    ci_update_progress verify '' typecheck
     log '类型检查输入变化，执行一次类型检查。'
     (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run check)
     atomic_record "$typecheck_stamp" "$typecheck_key"
@@ -1465,13 +1540,13 @@ prepare_application() {
   if [[ "$PROJECT_DEPLOY_TESTS" == 0 ]]; then
     log '跳过完整行为测试；CI 继续验证，设置 PROJECT_DEPLOY_TESTS=1 可在部署时补测。'
   elif [[ ! -f "$test_stamp" ]]; then
-    ci_update_progress verify
+    ci_update_progress verify '' tests
     log '测试或相关源码变化，在隔离目录执行行为测试。'
     (cd "$work_dir/source" && run_as_service env GREEKS_PYTHON="$GREEKS_PYTHON_PATH" ASTER_PYTHON="$ASTER_PYTHON_PATH" "$NODE_BIN" "$PNPM_BIN" test)
     atomic_record "$test_stamp" "$test_key"
   else log '行为测试输入未变化，复用验证结果。'; fi
   if (( need_build )); then
-    ci_update_progress build
+    ci_update_progress build '' build-workbench
     log '工作台前端内容或运行环境变化，仅构建工作台页面。'
     (cd "$work_dir/source" && run_as_service env NODE_ENV=production "$NODE_BIN" "$PNPM_BIN" run build:bundle)
     [[ -s "$work_dir/source/dist/index.html" ]] || fail '构建缺少 dist/index.html。'
@@ -1789,7 +1864,7 @@ UPDATER_CHECK_PY
   fi
 }
 finish_update_service() {
-  ci_update_progress finalize
+  ci_update_progress finalize '' updater
   if ! ensure_update_service "$1"; then
     fail '工作台已健康运行，但在线更新服务安装未完成；请修复以上错误后重新执行安装命令。'
     return 1
@@ -2079,6 +2154,7 @@ main() {
   fi
   systemctl enable "$SERVICE" >/dev/null
   systemctl restart "$SERVICE"
+  ci_update_progress finalize '' healthcheck
   wait_healthy || fail '服务未在 30 次健康检查内就绪。'
   finish_activation
   atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"

@@ -14,6 +14,13 @@ from registry import trusted
 
 
 STAGES = {'preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize'}
+DETAILS = {
+    'download': {'source-receive', 'source-retry'},
+    'prepare': {'source-resolve', 'dependencies', 'runtime'},
+    'build': {'build-workbench', 'build-monitor', 'build-asset', 'build-crossex', 'build-aster'},
+    'verify': {'typecheck', 'tests'},
+    'finalize': {'healthcheck', 'updater'},
+}
 PROGRESS_TIMEOUT = 300
 MAX_PROGRESS_BYTES = 4096
 MAX_NUMBER = 2 ** 53 - 1
@@ -55,6 +62,8 @@ def get_progress(path: Path, started_at: float, now=None):
         if 'downloaded' in data and 'total' in data and data['downloaded'] > data['total']:
             return None
         result = {'stage': data['stage'], 'timestamp': stamp}
+        if isinstance(data.get('detail'), str) and data['detail'] in DETAILS.get(data['stage'], set()):
+            result['detail'] = data['detail']
         if 'progress' in data:
             result['progress'] = data['progress']
         if data['stage'] == 'download':

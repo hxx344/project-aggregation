@@ -142,6 +142,8 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     writeMaintenance: active => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
     writePendingPlanId: planId => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-plan', planId || ''),
+    readPendingDeployMode: () => getSetting('updates-pending-deploy-mode') || 'source',
+    writePendingDeployMode: mode => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-deploy-mode', mode),
   });
   const publicProject = row => { const project = JSON.parse(row.json);
     if (embeddedModules) {
@@ -394,7 +396,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         };
         authorize();
         try {
-          const state = action === 'check' ? await updates.check() : action === 'token' ? await updates.token(body.token, authorize) : await updates.apply(body.planId, authorize);
+          const state = action === 'check' ? await updates.check() : action === 'token' ? await updates.token(body.token, authorize) : await updates.apply(body.planId, authorize, body.deployMode);
           send(res, action === 'token' ? 200 : 202, state);
         }
         finally { void updateStream.refresh(); }

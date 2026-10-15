@@ -34,6 +34,18 @@
 .update-section-heading h3{font-size:.875rem;color:var(--text-primary)}
 .update-section-heading>span{font-size:.75rem;color:var(--text-tertiary)}
 
+.update-mode{margin-bottom:22px}
+.update-mode h3{font-size:.875rem;margin-bottom:12px;color:var(--text-primary)}
+.update-mode fieldset{border:0;margin:0;padding:0;min-width:0}
+.update-mode-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.update-mode-option{display:flex;align-items:flex-start;gap:9px;padding:13px;border:1px solid var(--surface-5);border-radius:var(--radius-md);background:var(--surface-1);cursor:pointer}
+.update-mode-option.selected{border-color:var(--accent);background:var(--accent-subtle)}
+.update-mode-option input{margin:3px 0 0;accent-color:var(--accent);flex-shrink:0}
+.update-mode-option:focus-within{outline:2px solid var(--accent);outline-offset:2px}
+.update-mode-option strong{font-size:.8125rem;color:var(--text-primary);font-weight:500}
+.update-mode-option small,.update-mode-help{display:block;margin-top:5px;font-size:.75rem;color:var(--text-secondary);line-height:1.65;overflow-wrap:anywhere}
+.update-mode fieldset:disabled .update-mode-option{opacity:.6;cursor:not-allowed}
+
 .update-token{margin-bottom:22px;padding:16px 18px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2)}
 .update-token .update-section-heading{flex-wrap:wrap;margin-bottom:8px}
 .update-token .update-token-status.configured{color:var(--emerald)}
@@ -98,14 +110,19 @@
 .update-steps>li>span:last-child{white-space:nowrap;padding-top:1px}
 
 .download-progress{margin-bottom:22px;padding:20px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-1)}
-.download-progress-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.download-progress-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 12px;margin-bottom:12px}
 .download-progress-message{font-size:.875rem;font-weight:500;color:var(--text-primary)}
 .download-progress-speed{font-size:.8125rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
 .download-progress-bar-container{height:6px;background:var(--surface-2);border-radius:999px;overflow:hidden;margin-bottom:8px}
 .download-progress-bar-fill{height:100%;background:var(--accent);border-radius:999px;transition:width .3s ease-out}
-.download-progress-footer{display:flex;align-items:center;justify-content:space-between}
+.download-progress-bar-container.indeterminate .download-progress-bar-fill{width:35%;animation:update-progress-slide 1.6s ease-in-out infinite;transition:none}
+.download-progress-footer{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px 12px}
 .download-progress-percent{font-size:.8125rem;font-weight:500;color:var(--text-primary);font-variant-numeric:tabular-nums}
 .download-progress-eta{font-size:.75rem;color:var(--text-secondary)}
+.download-progress-bytes{margin-top:9px;font-size:.8125rem;color:var(--text-primary);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.download-progress-description{margin-top:8px;font-size:.75rem;color:var(--text-secondary);line-height:1.65;overflow-wrap:anywhere}
+@keyframes update-progress-slide{from{transform:translateX(-100%)}to{transform:translateX(386%)}}
+@media(prefers-reduced-motion:reduce){.download-progress-bar-fill{transition:none}.download-progress-bar-container.indeterminate .download-progress-bar-fill{animation:none;width:100%;opacity:.45}}
 
 
 .update-progress-note{display:block;font-size:.75rem;color:var(--text-tertiary);margin-top:12px;line-height:1.65}
@@ -133,6 +150,8 @@
   .update-footer{padding:15px 18px;gap:8px}
   .update-footer .button{font-size:.8125rem;padding:9px 10px}
   .update-progress{padding:14px}
+  .download-progress{padding:14px}
+  .update-mode-options{grid-template-columns:minmax(0,1fr)}
   .update-token{padding:14px}
   .update-progress-heading{align-items:flex-start;flex-direction:column;gap:5px}
   .update-summary{padding-bottom:18px}

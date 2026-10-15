@@ -56,6 +56,7 @@ async (page) => {
   assert(await page.locator('.download-progress-percent').innerText() === '本阶段 25%', 'HTTP status carries the measured download percentage');
   assert(await page.getByRole('progressbar').getAttribute('aria-valuenow') === '25', 'assistive technology receives measured progress');
   assert(await page.locator('.download-progress-speed').innerText() === '2.0 MiB/s', 'download speed uses binary byte units');
+  assert(await page.locator('.download-progress-bytes').innerText() === '已下载 1.0 KiB / 4.0 KiB', 'download byte counts are visible');
   assert((await page.locator('.download-progress-eta').innerText()).includes('21秒'), 'download ETA is shown');
   scenarios.push('initial HTTP progress and accessible measured percentage');
 
@@ -65,10 +66,26 @@ async (page) => {
     state.job.progress = { stage, timestamp }; await emit();
     assert(await page.locator('.download-progress-message').innerText(), `${stage} has a readable phase`);
     assert(await page.locator('.download-progress-percent').innerText() === '进行中', `${stage} does not invent a percentage`);
-    assert(await page.getByRole('progressbar').count() === 0, `${stage} without measurement has no determinate progress bar`);
-    assert(await page.locator('.download-progress-speed, .download-progress-eta').count() === 0, `${stage} clears old download details`);
+    assert(await page.getByRole('progressbar').getAttribute('aria-valuenow') === null, `${stage} has an indeterminate progress bar without an invented percentage`);
+    assert(await page.locator('.download-progress-bar-container.indeterminate').count() === 1, `${stage} keeps an active progress bar`);
+    assert(await page.locator('.download-progress-speed, .download-progress-eta, .download-progress-bytes').count() === 0, `${stage} clears old download details`);
   }
   scenarios.push('source installation stages without estimated totals');
+
+  state.job.progress = { stage: 'download', detail: 'source-receive', progress: 0.42, downloaded: 2097152, speed: 1024, eta: 30, timestamp }; await emit();
+  assert(await page.locator('.download-progress-percent').innerText() === '对象接收 42%', 'Git percentage explicitly counts objects');
+  assert(await page.locator('.download-progress-bytes').innerText() === '已下载 2.0 MiB', 'source bytes do not invent a total from object count');
+  assert(await page.locator('.download-progress-speed').innerText() === '1.0 KiB/s', 'source measured transfer speed stays visible');
+  assert(await page.locator('.download-progress-eta').count() === 0, 'unknown byte total suppresses ETA');
+  state.job.progress = { stage: 'download', detail: 'source-retry', timestamp }; await emit();
+  assert(await page.locator('.download-progress-message').innerText() === '正在重试源码下载…', 'retry reports the actual download phase');
+  assert(await page.locator('.download-progress-speed, .download-progress-eta, .download-progress-bytes').count() === 0, 'retry clears the preceding measured transfer');
+  for (const [stage, detail, message] of [['prepare', 'dependencies', '正在准备项目依赖…'], ['build', 'build-workbench', '正在构建工作台…'], ['build', 'build-aster', '正在构建 Aster 模块…'], ['verify', 'typecheck', '正在检查代码类型…'], ['finalize', 'updater', '正在安装更新服务…']]) {
+    state.job.progress = { stage, detail, timestamp }; await emit();
+    assert(await page.locator('.download-progress-message').innerText() === message, `${detail} reports the specific step`);
+    assert(await page.getByRole('progressbar').getAttribute('aria-valuenow') === null, `${detail} remains indeterminate`);
+  }
+  scenarios.push('source object receipt, measured bytes, unknown ETA, retries and detailed build steps');
 
   for (const progress of [{ stage: 'unknown', progress: 0.5, timestamp }, { stage: 'download', progress: 1.2, timestamp }, { stage: 'download', progress: 0.5, timestamp: Date.parse(startedAt) - 1 }]) {
     state.job.progress = progress; await emit();
@@ -90,7 +107,7 @@ async (page) => {
   scenarios.push('malformed samples, job replacement and terminal cleanup');
 
   state.job.status = 'running';
-  state.job.progress = { stage: 'download', progress: 0.6, speed: 512, eta: 0, timestamp: currentTimestamp };
+  state.job.progress = { stage: 'download', progress: 0.6, downloaded: 3072, total: 5120, speed: 512, eta: 0, timestamp: currentTimestamp };
   const beforeFallback = reads;
   await page.evaluate(() => window.__progressStreams.filter(stream => !stream.closed && stream.url === '/api/system/updates/events').at(-1).onerror());
   await page.waitForFunction(() => document.querySelector('.download-progress-percent')?.textContent === '本阶段 60%');

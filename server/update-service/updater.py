@@ -38,6 +38,7 @@ CHECK_MIN_INTERVAL = 60
 AUTO_CHECK_INTERVAL = 5 * 60
 CHECK_RETRY_MAX_INTERVAL = 30 * 60
 ACTIVE = {'queued', 'running'}
+DEPLOYMENT_MODES = ('source', 'ci')
 TOKEN = re.compile(r'[a-f0-9]{32}')
 MAX_CREDENTIALS = 1024
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes', 'recovery')
@@ -148,11 +149,17 @@ def start_worker():
                    capture_output=True, timeout=8, check=True)
 
 
-def run_installer(script, manifest, log):
-    environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'source', 'PROJECT_DEPLOY_TESTS': '0',
+def validate_deploy_mode(value):
+    if not isinstance(value, str) or value not in DEPLOYMENT_MODES:
+        raise UpdateError(400, '更新模式无效')
+    return value
+
+
+def run_installer(script, manifest, log, deploy_mode='source'):
+    environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': validate_deploy_mode(deploy_mode), 'PROJECT_DEPLOY_TESTS': '0',
                    'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest),
                    'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json')}
-    # No caller-supplied arguments, environment, cwd or shell command string.
+    # Only the validated mode enters the fixed environment; no shell command string.
     with log.open('xb') as output:
         os.chmod(log, 0o600)
         result = subprocess.run(['/bin/bash', str(script)], cwd='/', env=environment,
@@ -266,11 +273,12 @@ class Coordinator:
         result = {'enabled': True, **{key: state.get(key) for key in
                 ('checking', 'checkedAt', 'checkError', 'planId', 'expiresAt', 'job')},
                 'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']],
-                'githubToken': {'configured': bool(self.read_token())}}
+                'githubToken': {'configured': bool(self.read_token())}, 'deploymentModes': list(DEPLOYMENT_MODES)}
         if result['job']:
             # Keep samples out of state.json and never forward them after the
             # task finishes. Each accepted job already owns a private directory.
             job = result['job'] = {key: value for key, value in result['job'].items() if key != 'progress'}
+            job.setdefault('deployMode', 'source')
             if job['status'] == 'running' and TOKEN.fullmatch(job['id']):
                 progress = get_progress(self.jobs / job['id'] / 'progress.json',
                                         timestamp(job['startedAt']) * 1000, self.clock())
@@ -525,12 +533,13 @@ class Coordinator:
                     raise UpdateError(409, '计划文件校验失败，请重新检查')
         return plan
 
-    def apply(self, plan_id):
+    def apply(self, plan_id, deploy_mode='source'):
+        validate_deploy_mode(deploy_mode)
         with self.lock():
             state = self.load()
             job = state['job']
             if job and job['status'] in ACTIVE:
-                if state.get('jobPlanId') == plan_id:
+                if state.get('jobPlanId') == plan_id and job.get('deployMode', 'source') == deploy_mode:
                     return self.public(state)
                 raise UpdateError(409, '已有更新任务正在执行')
             if state['checking'] or state.get('checkError') or not plan_id or state['planId'] != plan_id:
@@ -544,7 +553,7 @@ class Coordinator:
                 raise UpdateError(409, '本机版本已改变，请重新检查')
             job_id = uuid.uuid4().hex
             private_directory(self.jobs / job_id)
-            state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'startedAt': iso(self.clock()),
+            state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'deployMode': deploy_mode, 'startedAt': iso(self.clock()),
                          'finishedAt': None, 'activeModule': None, 'message': '已提交，正在准备正式版本更新',
                          'steps': [{'id': entry['id'], 'name': BY_ID[entry['id']].name, 'status': 'pending'} for entry in plan['entries']]})
             self.save(state)
@@ -585,7 +594,9 @@ class Coordinator:
             if not state['job'] or state['job']['status'] != 'queued':
                 return
             job_id, plan_id = state['job']['id'], state['jobPlanId']
+            deploy_mode = state['job'].get('deployMode', 'source')
         try:
+            validate_deploy_mode(deploy_mode)
             with file_lock(self.stack_lock, blocking=False):
                 plan = self.read_plan(plan_id)
                 def begin(state, job):
@@ -608,7 +619,7 @@ class Coordinator:
                     self.progress(job_id, running)
                     plan_directory = self.plans / plan_id
                     code = self.installer(plan_directory / (key + '.install.sh'), plan_directory / (key + '.manifest.json'),
-                                          self.jobs / job_id / (key + '.log'))
+                                          self.jobs / job_id / (key + '.log'), deploy_mode)
                     if code != 0:
                         raise UpdateError(500, BY_ID[key].name + ' 更新失败；已完成的模块保留，恢复结果请查看服务器部署日志')
                     observed = next((item for item in self.inspect() if item['id'] == key), None)
@@ -678,13 +689,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.headers.get_content_type() != 'application/json':
                 raise UpdateError(415, '请求需使用 JSON')
             body = json.loads(self.rfile.read(int(length)), object_pairs_hook=unique_json_object)
-            expected = {'/check': set(), '/apply': {'planId'}, '/token': {'token'}}[self.path]
-            if not isinstance(body, dict) or set(body) != expected:
+            expected = {'/check': [set()], '/apply': [{'planId'}, {'planId', 'deployMode'}], '/token': [{'token'}]}[self.path]
+            if not isinstance(body, dict) or set(body) not in expected:
                 raise UpdateError(400, '更新参数无效')
             if self.path == '/token':
                 self.answer(200, self.server.coordinator.set_token(body['token']))
             else:
-                result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(body['planId'])
+                result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(body['planId'], body.get('deployMode', 'source'))
                 self.answer(202, result)
         except UpdateError as error:
             self.answer(error.status, {'error': str(error)})

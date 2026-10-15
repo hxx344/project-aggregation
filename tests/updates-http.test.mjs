@@ -19,7 +19,7 @@ const state = () => ({ enabled: true, checking: false, checkedAt: stamp, checkEr
 const job = (status = 'running') => ({ id: 'update-job', status, startedAt: stamp, finishedAt: status === 'running' ? null : stamp, activeModule: null, steps: [], message: '更新状态' });
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
-async function fixture(t, { client, initialMaintenance = false, initialPendingPlanId = null } = {}) {
+async function fixture(t, { client, initialMaintenance = false, initialPendingPlanId = null, initialPendingDeployMode = null } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-updates-http-'));
   const calls = [], jobs = [], handlers = {};
   let current = null, value = state();
@@ -32,12 +32,13 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
   }]));
   const app = await createApp({ dataDir, initialPassword: PASSWORD, refreshInterval: 0, assetSyncIntervalMs: 0,
     tradingRefreshIntervalMs: 0, executionIntervalMs: 0, updatesClient, secureCookies: false, publicOrigin: '', logger: () => {} });
-  const restart = initialMaintenance || initialPendingPlanId;
+  const restart = initialMaintenance || initialPendingPlanId || initialPendingDeployMode;
   if (restart) {
     await app.close();
     const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
     db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updates-maintenance', initialMaintenance ? '1' : '0');
     if (initialPendingPlanId) db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updates-pending-plan', initialPendingPlanId);
+    if (initialPendingDeployMode) db.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updates-pending-deploy-mode', initialPendingDeployMode);
     db.close();
   }
   let live = restart ? await createApp({ dataDir, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0,
@@ -105,6 +106,9 @@ test('update HTTP routes require login, Origin and CSRF and accept only their fi
   assert.equal((await f.request(`${PREFIX}?socketPath=other`)).status, 400);
   assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: {} })).status, 400);
   assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId: '../file' } })).status, 400);
+  for (const deployMode of [null, true, 123, {}, [], '', 'SOURCE', 'ci ', 'source;id', 'auto']) {
+    assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId, deployMode } })).status, 400);
+  }
   assert.equal((await f.request(`${PREFIX}/command`, { method: 'POST', body: {} })).status, 404);
   assert.equal(f.calls.length, 0);
   const status = await f.request(PREFIX); assert.equal(status.status, 200); assert.equal(status.headers.get('cache-control'), 'no-store');
@@ -153,10 +157,12 @@ test('update stream requires same-origin login, filters state, shares reads and 
 
 test('installer progress reaches authenticated status and the real events route without a second stream', async t => {
   const f = await fixture(t); await f.login();
-  const progress = { stage: 'download', progress: 0.4, downloaded: 40, total: 100, timestamp: Date.parse(stamp) };
-  f.state = { ...f.state, job: { ...job(), progress: { ...progress, path: '/private/path', error: 'private-log' } } };
+  const progress = { stage: 'download', detail: 'source-receive', progress: 0.4, downloaded: 40, total: 100, speed: 10, timestamp: Date.parse(stamp) };
+  f.state = { ...f.state, deploymentModes: ['source', 'ci'], job: { ...job(), deployMode: 'source', progress: { ...progress, path: '/private/path', error: 'private-log' } } };
   const result = await f.request(PREFIX);
   assert.deepEqual(result.data.job.progress, progress);
+  assert.deepEqual(result.data.deploymentModes, ['source', 'ci']);
+  assert.equal(result.data.job.deployMode, 'source');
   assert.equal((await f.request(`${PREFIX}/progress`)).status, 404);
   const abort = new AbortController();
   const response = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, Origin: f.origin }, signal: abort.signal });
@@ -173,8 +179,9 @@ test('concurrent identical applies share acceptance and atomically block live en
   const f = await fixture(t); await f.login();
   const entered = deferred(), release = deferred();
   f.handlers.apply = async () => { entered.resolve(); await release.promise; f.state = { ...f.state, job: job() }; return f.state; };
-  const first = f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } }); await entered.promise;
-  const second = f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } });
+  const first = f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId, deployMode: 'ci' } }); await entered.promise;
+  const second = f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId, deployMode: 'ci' } });
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 409, 'the default source request cannot join an active ci submission');
   assert.equal(f.maintenance(), true);
   for (const [route, method] of [[`${EXECUTION}/jobs`, 'POST'], [`${EXECUTION}/preview`, 'POST'], [`${EXECUTION}/accounts/binance`, 'PUT'], [`${EXECUTION}/accounts/binance`, 'DELETE']]) {
     assert.equal((await f.request(route, { method, body: {} })).status, 409);
@@ -183,6 +190,7 @@ test('concurrent identical applies share acceptance and atomically block live en
   assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId: 'b'.repeat(64) } })).status, 409);
   release.resolve(); assert.equal((await first).status, 202); assert.equal((await second).status, 202);
   assert.equal(f.calls.filter(row => row.method === 'apply').length, 1);
+  assert.deepEqual(f.calls.find(row => row.method === 'apply').args, [planId, 'ci']);
   assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 409);
   f.state = { ...f.state, job: job('succeeded') };
   assert.equal((await f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} })).status, 202);
@@ -301,6 +309,33 @@ test('a pending plan survives restart even if the maintenance flag write had not
   }
 });
 
+test('uncertain ci acceptance preserves mode across restart and rejects mismatched retries', async t => {
+  const f = await fixture(t); await f.login();
+  f.handlers.apply = () => { throw new UpdateError(503, '更新结果待确认', { uncertain: true }); };
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId, deployMode: 'ci' } })).status, 503);
+  assert.equal(f.pendingPlanId(), planId);
+  await f.restartApp();
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 409);
+  assert.equal(f.calls.filter(row => row.method === 'apply').length, 1);
+  assert.equal(f.maintenance(), true);
+  delete f.handlers.apply;
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId, deployMode: 'ci' } })).status, 202);
+  assert.deepEqual(f.calls.filter(row => row.method === 'apply').map(row => row.args), [[planId, 'ci'], [planId, 'ci']]);
+  assert.equal(f.pendingPlanId(), null);
+  assert.equal(f.maintenance(), true);
+});
+
+test('an obsolete saved mode is replaced before persisting a new source plan', async t => {
+  const f = await fixture(t, { initialPendingDeployMode: 'ci' }); await f.login();
+  f.handlers.apply = () => { throw new UpdateError(503, '更新结果待确认', { uncertain: true }); };
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 503);
+  await f.restartApp();
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId, deployMode: 'ci' } })).status, 409);
+  delete f.handlers.apply;
+  assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 202);
+  assert.deepEqual(f.calls.filter(row => row.method === 'apply').map(row => row.args), [[planId, 'source'], [planId, 'source']]);
+});
+
 test('recovering a pending plan persists maintenance before an accepted retry clears the pending setting', async t => {
   const f = await fixture(t, { initialMaintenance: false, initialPendingPlanId: planId }); await f.login();
   assert.equal(f.maintenance(), true, 'pending restoration must repair the durable maintenance flag');
@@ -355,7 +390,7 @@ test('a different apply cannot replace an unresolved plan until root confirms th
   assert.equal((await f.request(`${PREFIX}/check`, { method: 'POST', body: {} })).status, 202);
   assert.equal(f.pendingPlanId(), null); assert.equal(f.maintenance(), false);
   assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId: nextPlanId } })).status, 202);
-  assert.deepEqual(f.calls.filter(call => call.method === 'apply').map(call => call.args), [[nextPlanId]]);
+  assert.deepEqual(f.calls.filter(call => call.method === 'apply').map(call => call.args), [[nextPlanId, 'source']]);
   assert.equal(f.maintenance(), true);
 });
 

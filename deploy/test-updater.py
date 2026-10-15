@@ -254,7 +254,7 @@ class CoordinatorTests(RootFixture):
                            'latestVersion': None, 'currentCommit': OLD, 'latestCommit': None, 'applicationKey': OLD_KEY,
                            'artifactCommit': OLD, 'identity': hashlib.sha256(module.id.encode()).hexdigest()}
                           for module in registry.MODULES]
-        self.launches = []; self.executed = []; self.syntaxes = []
+        self.launches = []; self.executed = []; self.executed_modes = []; self.syntaxes = []
         self.installer_hook = None
         self.alive = False
         self.coordinator = self.make_coordinator()
@@ -265,9 +265,10 @@ class CoordinatorTests(RootFixture):
                                    alive=lambda: self.alive, installer=self.install, syntax=lambda p: self.syntaxes.append(p.stem),
                                    clock=lambda: self.clock, stack_lock=self.root / 'stack.lock')
 
-    def install(self, script, manifest, log):
+    def install(self, script, manifest, log, deploy_mode='source'):
         key = script.name.removesuffix('.install.sh')
         self.executed.append(key)
+        self.executed_modes.append(deploy_mode)
         log.write_text('api_secret=PRIVATE_DEPLOYMENT_CREDENTIAL\n', encoding='utf8')
         if self.installer_hook:
             code = self.installer_hook(key)
@@ -1119,6 +1120,88 @@ class CoordinatorTests(RootFixture):
         restarted.alive = lambda: (_ for _ in ()).throw(OSError('sensitive-systemctl-output'))
         self.assertEqual(restarted.status()['job']['status'], 'queued')
 
+    def test_ci_selection_is_durable_and_only_identical_mode_reenters_the_job(self):
+        plan = self.prepare()
+        accepted = self.coordinator.apply(plan, 'ci')
+        self.assertEqual(accepted['deploymentModes'], ['source', 'ci'])
+        self.assertEqual(accepted['job']['deployMode'], 'ci')
+        restarted = self.make_coordinator()
+        self.assertEqual(restarted.load()['job']['deployMode'], 'ci')
+        self.assertEqual(restarted.apply(plan, 'ci')['job']['id'], accepted['job']['id'])
+        with self.assertRaises(updater.UpdateError) as caught:
+            restarted.apply(plan)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(len(self.launches), 1)
+        restarted.run()
+        self.assertEqual(self.executed_modes, ['ci'])
+        self.assertEqual(restarted.status()['job']['status'], 'succeeded')
+        self.assertEqual(restarted.status()['job']['deployMode'], 'ci')
+
+    def test_default_and_legacy_jobs_use_source_and_reject_ci_reentry(self):
+        plan = self.prepare()
+        accepted = self.coordinator.apply(plan)
+        self.assertEqual(accepted['job']['deployMode'], 'source')
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            del state['job']['deployMode']
+            self.coordinator.save(state)
+        restarted = self.make_coordinator()
+        self.assertEqual(restarted.status()['job']['deployMode'], 'source')
+        self.assertEqual(restarted.apply(plan, 'source')['job']['id'], accepted['job']['id'])
+        with self.assertRaises(updater.UpdateError) as caught:
+            restarted.apply(plan, 'ci')
+        self.assertEqual(caught.exception.status, 409)
+        restarted.run()
+        self.assertEqual(self.executed_modes, ['source'])
+        self.assertEqual(restarted.status()['job']['status'], 'succeeded')
+
+    def test_invalid_modes_never_launch_and_corrupt_saved_mode_never_executes(self):
+        plan = self.prepare()
+        for mode in (None, True, 123, {}, [], '', 'SOURCE', 'ci ', 'source;id', 'auto'):
+            with self.subTest(mode=mode), self.assertRaises(updater.UpdateError) as caught:
+                self.coordinator.apply(plan, mode)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.launches, [])
+        self.assertIsNone(self.coordinator.status()['job'])
+        self.coordinator.apply(plan)
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state['job']['deployMode'] = 'source;id'
+            self.coordinator.save(state)
+        self.coordinator.run()
+        self.assertEqual(self.executed, [])
+        self.assertEqual(self.coordinator.status()['job']['status'], 'failed')
+
+    def test_apply_http_contract_accepts_only_optional_enumerated_deploy_mode(self):
+        plan = self.prepare()
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), updater.Handler)
+        server.coordinator = self.coordinator
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05})
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(server.shutdown)
+        def request(body):
+            connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+            try:
+                connection.request('POST', '/apply', body=body, headers={'Content-Type': 'application/json'})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+        for mode in (None, True, 123, {}, [], '', 'SOURCE', 'ci ', 'source;id', 'auto'):
+            self.assertEqual(request(encoded({'planId': plan, 'deployMode': mode}))[0], 400)
+        for body in ({'deployMode': 'ci'}, {'planId': plan, 'deployMode': 'ci', 'command': 'id'}):
+            self.assertEqual(request(encoded(body))[0], 400)
+        self.assertEqual(request(b'{"planId":"' + plan.encode() + b'","deployMode":"source","deployMode":"ci"}')[0], 400)
+        self.assertEqual(self.launches, [])
+        status, accepted = request(encoded({'planId': plan, 'deployMode': 'ci'}))
+        self.assertEqual(status, 202)
+        self.assertEqual(accepted['job']['deployMode'], 'ci')
+        self.assertEqual(request(encoded({'planId': plan}))[0], 409)
+        self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci'}))[1]['job']['id'], accepted['job']['id'])
+        self.assertEqual(len(self.launches), 1)
+
     def test_control_and_worker_use_separate_process_services_and_fixed_arguments(self):
         with patch.object(updater.subprocess, 'run') as run:
             updater.start_worker()
@@ -1152,6 +1235,24 @@ class CoordinatorTests(RootFixture):
         self.assertNotIn('shell', run.call_args.kwargs)
         self.assertFalse(run.call_args.kwargs['check'])
         self.assertEqual(json.loads(manifest.read_text())['commit'], NEW)
+
+    def test_installer_uses_selected_ci_mode_and_rejects_arbitrary_environment_values(self):
+        script = self.root / 'hub.install.sh'
+        manifest = self.root / 'hub.release-manifest.json'
+        log = self.root / 'hub.install.log'
+        with patch.dict(os.environ, {'PROJECT_DEPLOY_MODE': 'source', 'BASH_ENV': '/untrusted/shell'}), \
+                patch.object(updater.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(updater.run_installer(script, manifest, log, 'ci'), 0)
+        self.assertEqual(run.call_args.args[0], ['/bin/bash', str(script)])
+        self.assertEqual(run.call_args.kwargs['env'], {
+            **updater.ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'ci', 'PROJECT_DEPLOY_TESTS': '0',
+            'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest),
+            'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json')})
+        for mode in (None, {}, [], True, 'auto', 'ci;id'):
+            with patch.object(updater.subprocess, 'run') as run, self.assertRaises(updater.UpdateError):
+                updater.run_installer(script, manifest, self.root / 'invalid.log', mode)
+            run.assert_not_called()
+            self.assertFalse((self.root / 'invalid.log').exists())
 
     def test_progress_is_bound_to_running_job_and_never_changes_its_result(self):
         plan = self.prepare(); accepted = self.coordinator.apply(plan)

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowRight, Check, ChevronRight, CircleAlert, Download, LoaderCircle, RefreshCw, X } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { UpdateJob, UpdateModule, UpdateState, UpdateProgressView } from './update-types';
+import type { UpdateDeployMode, UpdateJob, UpdateModule, UpdateState, UpdateProgressView } from './update-types';
 import { getUpdateProgress } from './update-progress';
 import './updates.css';
 
@@ -11,6 +11,11 @@ type RequestKind = 'read' | 'check' | 'apply' | 'token';
 const moduleLabels = { current: '已是最新', available: '可更新', unavailable: '检查未完成', unmanaged: '需手动更新' };
 const jobLabels = { queued: '更新已排队', running: '正在更新', succeeded: '更新已完成', failed: '上次更新未完成', interrupted: '上次更新已中断' };
 const stepLabels = { pending: '等待', running: '进行中', succeeded: '已完成', failed: '失败', skipped: '已跳过' };
+const modeLabels: Record<UpdateDeployMode, string> = { source: '下载源码构建', ci: '下载 CI 构建包' };
+const modeDescriptions: Record<UpdateDeployMode, string> = {
+  source: '下载正式版本源码，在服务器按需安装依赖并构建。',
+  ci: '下载正式版本已构建的产物，减少服务器上的构建工作。',
+};
 const running = (job: UpdateJob | null | undefined) => job?.status === 'queued' || job?.status === 'running';
 const unfinished = (job: UpdateJob | null | undefined) => job?.status === 'failed' || job?.status === 'interrupted';
 const validState = (value: UpdateState) => value && typeof value.enabled === 'boolean' && typeof value.checking === 'boolean' && Array.isArray(value.modules);
@@ -45,11 +50,12 @@ function JobProgress({ job, modules }: { job: UpdateJob; modules: UpdateModule[]
   const failedSteps = job.steps.filter(step => step.status === 'failed');
   const hasFailedSteps = failedSteps.length > 0;
 
-  return <section className={`update-progress ${job.status}`} aria-labelledby="update-progress-title"><div className="update-progress-heading"><h3 id="update-progress-title">{running(job) ? <LoaderCircle size={18} className="spin" /> : job.status === 'succeeded' ? <Check size={18} /> : <CircleAlert size={18} />}{jobLabels[job.status]}</h3><span>{dateTime(job.finishedAt || job.startedAt)}</span></div><p role="status">{job.message || (running(job) && activeName ? `正在处理${activeName}` : unfinished(job) ? hasFailedSteps ? '上次任务有步骤未完成，请查看服务器部署日志。' : '上次任务未完成全部安装与检查。' : '进度会自动更新。')}</p>{unfinished(job) ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方“本机模块”。</p> : null}{job.steps.length ? <ol className="update-steps" aria-label="更新进度">{job.steps.map(step => <li className={step.status} key={step.id}><span className="update-step-mark" aria-hidden="true">{step.status === 'running' ? <LoaderCircle size={15} className="spin" /> : step.status === 'succeeded' ? <Check size={14} /> : step.status === 'failed' ? <X size={14} /> : <span />}</span><div><strong>{step.name}</strong>{step.message ? <p>{step.message}</p> : null}</div><span>{stepLabels[step.status]}</span></li>)}</ol> : null}{running(job) ? <small className="update-progress-note">可以关闭此面板；更新会继续，重新打开即可查看进度。</small> : null}</section>;
+  return <section className={`update-progress ${job.status}`} aria-labelledby="update-progress-title"><div className="update-progress-heading"><h3 id="update-progress-title">{running(job) ? <LoaderCircle size={18} className="spin" /> : job.status === 'succeeded' ? <Check size={18} /> : <CircleAlert size={18} />}{jobLabels[job.status]}</h3><span>{dateTime(job.finishedAt || job.startedAt)}</span></div><p role="status">{job.message || (running(job) && activeName ? `正在处理${activeName}` : unfinished(job) ? hasFailedSteps ? '上次任务有步骤未完成，请查看服务器部署日志。' : '上次任务未完成全部安装与检查。' : '进度会自动更新。')}</p>{job.deployMode === 'source' || job.deployMode === 'ci' ? <p className="update-job-mode">本次方式：{modeLabels[job.deployMode]}</p> : null}{unfinished(job) ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方“本机模块”。</p> : null}{job.steps.length ? <ol className="update-steps" aria-label="更新进度">{job.steps.map(step => <li className={step.status} key={step.id}><span className="update-step-mark" aria-hidden="true">{step.status === 'running' ? <LoaderCircle size={15} className="spin" /> : step.status === 'succeeded' ? <Check size={14} /> : step.status === 'failed' ? <X size={14} /> : <span />}</span><div><strong>{step.name}</strong>{step.message ? <p>{step.message}</p> : null}</div><span>{stepLabels[step.status]}</span></li>)}</ol> : null}{running(job) ? <small className="update-progress-note">可以关闭此面板；更新会继续，重新打开即可查看进度。</small> : null}</section>;
 }
 
 function DownloadProgress({ progress }: { progress: UpdateProgressView }) {
   const percent = progress.stageProgress === undefined ? null : Math.round(progress.stageProgress * 100);
+  const progressText = percent === null ? '进行中' : `${progress.progressLabel} ${percent}%`;
   return (
     <div className="download-progress">
       <div className="download-progress-header">
@@ -59,21 +65,23 @@ function DownloadProgress({ progress }: { progress: UpdateProgressView }) {
         )}
       </div>
 
-      {percent !== null ? <div className="download-progress-bar-container" role="progressbar" aria-label={progress.message} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} aria-valuetext={`本阶段 ${percent}%`}>
+      <div className={`download-progress-bar-container${percent === null ? ' indeterminate' : ''}`} role="progressbar" aria-label={progress.message} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={progressText}>
         <div
           className="download-progress-bar-fill"
-          style={{ width: `${progress.stageProgress! * 100}%` }}
+          style={percent === null ? undefined : { width: `${progress.stageProgress! * 100}%` }}
         />
-      </div> : null}
+      </div>
 
       <div className="download-progress-footer">
         <span className="download-progress-percent">
-          {percent === null ? '进行中' : `本阶段 ${percent}%`}
+          {progressText}
         </span>
         {progress.eta && (
           <span className="download-progress-eta">剩余约 {progress.eta}</span>
         )}
       </div>
+      {progress.downloaded || progress.total ? <p className="download-progress-bytes">{progress.downloaded ? `已下载 ${progress.downloaded}${progress.total ? ` / ${progress.total}` : ''}` : `文件总量 ${progress.total}`}</p> : null}
+      <p className="download-progress-description">{progress.description}</p>
     </div>
   );
 }
@@ -92,7 +100,8 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const [removeToken, setRemoveToken] = useState(false);
   const [uncertain, setUncertain] = useState(false);
   const [open, setOpen] = useState(false);
-  const [review, setReview] = useState<{ planId: string; modules: UpdateModule[] } | null>(null);
+  const [deployMode, setDeployMode] = useState<UpdateDeployMode>('source');
+  const [review, setReview] = useState<{ planId: string; modules: UpdateModule[]; deployMode: UpdateDeployMode; modeSupported: boolean } | null>(null);
   const [, setClock] = useState(0);
   const snapshotRef = useRef<UpdateState | null>(null);
   const requestRef = useRef<{ controller: AbortController; kind: RequestKind } | null>(null);
@@ -126,7 +135,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     setNetworkError('');
   }, []);
 
-  const request = useCallback(async (kind: RequestKind, value?: string, replaceRead = false) => {
+  const request = useCallback(async (kind: RequestKind, value?: string, replaceRead = false, mode?: UpdateDeployMode) => {
     if (sessionExpired.current) return null;
     if (!navigator.onLine) {
       if (kind === 'token') setTokenError('当前处于离线状态，请恢复连接后再保存。');
@@ -153,7 +162,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
       const data = await api<UpdateState>(`/api/system/updates${kind === 'read' ? '' : `/${kind}`}`, {
         signal: controller.signal,
         ...(kind === 'apply' ? { timeoutMs: 120_000 } : {}),
-        ...(kind === 'read' ? {} : { method: 'POST', body: JSON.stringify(kind === 'apply' ? { planId: value } : kind === 'token' ? { token: value } : {}) }),
+        ...(kind === 'read' ? {} : { method: 'POST', body: JSON.stringify(kind === 'apply' ? { planId: value, ...(mode ? { deployMode: mode } : {}) } : kind === 'token' ? { token: value } : {}) }),
       });
       if (controller.signal.aborted) return null;
       if (!validState(data)) {
@@ -342,12 +351,16 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const unconfirmed = modules.some(module => module.state === 'current' && matchesLatest(module) === null);
   const checking = !!snapshot?.checking || pending === 'check';
   const updating = running(snapshot?.job) || pending === 'apply';
+  const deploymentModes = Array.isArray(snapshot?.deploymentModes) ? snapshot.deploymentModes.filter((mode, index, modes) => (mode === 'source' || mode === 'ci') && modes.indexOf(mode) === index) : [];
+  const modeSupported = deploymentModes.length > 0;
+  const selectedMode = deploymentModes.includes(deployMode) ? deployMode : deploymentModes[0] || 'source';
   const needsSetup = unavailable || snapshot?.enabled === false;
   const tokenSupported = typeof snapshot?.githubToken?.configured === 'boolean';
   const tokenConfigured = snapshot?.githubToken?.configured === true;
   const tokenBlocked = !tokenSupported || needsSetup || pending !== null || checking || updating || uncertain || tokenResultUncertain;
   const expired = !snapshot?.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now();
-  const reviewInvalid = !!review && (review.planId !== snapshot?.planId || expired);
+  const reviewModeInvalid = !!review && (review.modeSupported !== modeSupported || modeSupported && !deploymentModes.includes(review.deployMode));
+  const reviewInvalid = !!review && (review.planId !== snapshot?.planId || expired || reviewModeInvalid);
   const blocked = !snapshot?.enabled || !snapshot.planId || expired || !!snapshot.checkError || checkRequestFailed || !!networkError || pending !== null || updating || checking || uncertain || !changes.length || snapshot.planId === submittedPlan.current;
   const summary = networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? recoveries.length === changes.length ? `${changes.length} 个待完成更新` : `${changes.length} 个可用更新${recoveries.length ? `（含 ${recoveries.length} 个待完成）` : ''}` : incomplete ? '部分模块待处理' : different ? '当前版本与正式版不同' : unconfirmed ? '版本待确认' : snapshot?.checkedAt && modules.length ? lastUpdateIssue ? `版本已对齐，${lastUpdateIssue}` : '已是最新正式版' : lastUpdateIssue || (snapshot ? '尚无检查结果' : '正在读取状态');
   const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete || different || unconfirmed || unfinishedJob ? 'attention' : changes.length ? 'available' : '';
@@ -355,16 +368,16 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const show = () => { onOpen?.(); setOpen(true); void request('read'); };
   const prepare = () => {
     if (blocked || !snapshot?.planId) return;
-    setReview({ planId: snapshot.planId, modules: changes });
+    setReview({ planId: snapshot.planId, modules: changes, deployMode: selectedMode, modeSupported });
   };
   const apply = async () => {
     if (!review) return;
-    if (review.planId !== snapshot?.planId || !snapshot.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now()) {
-      setActionNotice('版本检查结果已变化或过期，请重新检查后确认。');
+    if (reviewModeInvalid || review.planId !== snapshot?.planId || !snapshot.expiresAt || Date.parse(snapshot.expiresAt) <= Date.now()) {
+      setActionNotice(reviewModeInvalid ? '更新方式支持情况已变化，请返回重新确认。' : '版本检查结果已变化或过期，请重新检查后确认。');
       setReview(null); return;
     }
     if (blocked) return;
-    const data = await request('apply', review.planId);
+    const data = await request('apply', review.planId, false, review.modeSupported ? review.deployMode : undefined);
     if (data) setReview(null);
   };
   const saveToken = async (remove = false) => {
@@ -390,8 +403,15 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
     {downloadProgress ? <DownloadProgress progress={downloadProgress} /> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}
+    {snapshot?.enabled && !needsSetup && !review && !updating && !uncertain ? <section className="update-mode" aria-labelledby="update-mode-title">
+      <h3 id="update-mode-title">更新方式</h3>
+      {modeSupported ? <fieldset disabled={pending !== null || checking} aria-labelledby="update-mode-title"><div className="update-mode-options">{deploymentModes.map(mode => <label key={mode} className={`update-mode-option${selectedMode === mode ? ' selected' : ''}`}>
+        <input type="radio" name="update-deploy-mode" value={mode} checked={selectedMode === mode} onChange={() => setDeployMode(mode)} />
+        <span><strong>{modeLabels[mode]}</strong><small>{modeDescriptions[mode]}</small></span>
+      </label>)}</div></fieldset> : <p className="update-mode-help">当前使用下载源码构建。升级更新服务后可选择 CI 构建包。</p>}
+    </section> : null}
     {snapshot?.enabled && !needsSetup ? <section className="update-token" aria-labelledby="update-token-title"><div className="update-section-heading"><h3 id="update-token-title">GitHub Token</h3>{tokenSupported ? <span className={`update-token-status ${tokenConfigured ? 'configured' : ''}`}>{tokenConfigured ? '已配置' : '未配置（可选）'}</span> : <span>需升级更新服务</span>}</div>{tokenSupported ? <><p className="update-token-help" id="update-token-help">用于读取公开仓库的正式版本，只需公开仓库只读权限。<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 GitHub Token</a></p><p className="update-token-help">Token 仅保存在服务器，不会回显。保存后下次检查生效，已有重试等待会保留。</p><form onSubmit={event => { event.preventDefault(); void saveToken(); }}><label htmlFor="update-github-token">{tokenConfigured ? '替换 Token' : '配置 Token'}</label><input id="update-github-token" type="password" autoComplete="off" autoCapitalize="none" spellCheck={false} value={token} disabled={tokenBlocked} aria-describedby="update-token-help" placeholder={tokenConfigured ? '粘贴新的 Token' : '粘贴 GitHub Token'} onChange={event => { setToken(event.target.value); setTokenError(''); setTokenNotice(''); }} /><div className="update-token-actions"><button type="submit" className="button secondary" disabled={tokenBlocked || !token.trim()}>{pending === 'token' ? <LoaderCircle size={15} className="spin" /> : null}{tokenConfigured ? '替换 Token' : '保存 Token'}</button>{tokenConfigured && !removeToken ? <button type="button" className="text-button" disabled={tokenBlocked} onClick={() => { setRemoveToken(true); setTokenNotice(''); }}>移除 Token</button> : null}</div></form>{removeToken && tokenConfigured ? <div className="update-token-remove"><p>确认移除已保存的 Token？后续检查将使用公开访问额度。</p><div className="update-token-actions"><button type="button" className="button secondary" disabled={tokenBlocked} onClick={() => void saveToken(true)}>确认移除</button><button type="button" className="text-button" disabled={pending === 'token'} onClick={() => setRemoveToken(false)}>取消移除</button></div></div> : null}{tokenError ? <p className="update-token-error" role="alert">{tokenError}</p> : null}{tokenResultUncertain ? <button className="text-button update-token-refresh" disabled={pending !== null || checking || updating || uncertain} onClick={() => void refreshToken()}>刷新配置状态</button> : null}{tokenNotice ? <p className="update-token-notice" role="status">{tokenNotice}</p> : null}</> : <p className="update-token-help">当前更新服务暂不支持 Token 配置。请在服务器上重新运行原一键部署命令升级，之后即可在这里配置。</p>}</section> : null}
     {modules.length ? <section aria-labelledby="update-modules-title"><div className="update-section-heading"><h3 id="update-modules-title">本机模块</h3><span>{modules.length} 个已安装</span></div><ul className="update-modules">{modules.map(module => <ModuleRow key={module.id} module={module} unfinishedJob={unfinishedJob} />)}</ul></section> : snapshot?.enabled && !checking ? <p className="update-empty">尚未识别到可更新的本机模块，请重新检查。</p> : null}
-    {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3><p>将更新 {review.modules.map(module => module.name).join('、')}，共 {review.modules.length} 个模块。</p>{review.modules.some(module => module.recovery === true) ? <p>其中 {review.modules.filter(module => module.recovery === true).map(module => module.name).join('、')} 将恢复未完成的更新，重新完成安装与健康检查。</p> : null}<p>变更模块会短暂重启。请先完成这些模块中正在进行的操作。</p>{reviewInvalid ? <p role="alert">版本检查结果已变化或过期，请返回重新检查。</p> : null}</section> : changes.length && !updating ? <p className="update-footnote">{recoveries.length ? '本次包含未完成更新的恢复；相关模块会短暂重启。' : '仅更新有新正式版本的模块；变更模块会短暂重启。'}</p> : null}
+    {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3><p className="update-review-mode">更新方式：<strong>{modeLabels[review.deployMode]}</strong></p><p>{modeDescriptions[review.deployMode]}</p><p>将更新 {review.modules.map(module => module.name).join('、')}，共 {review.modules.length} 个模块。</p>{review.modules.some(module => module.recovery === true) ? <p>其中 {review.modules.filter(module => module.recovery === true).map(module => module.name).join('、')} 将恢复未完成的更新，重新完成安装与健康检查。</p> : null}<p>变更模块会短暂重启。请先完成这些模块中正在进行的操作。</p>{reviewInvalid ? <p role="alert">{reviewModeInvalid ? '更新方式支持情况已变化，请返回重新确认。' : '版本检查结果已变化或过期，请返回重新检查。'}</p> : null}</section> : changes.length && !updating ? <p className="update-footnote">{recoveries.length ? '本次包含未完成更新的恢复；相关模块会短暂重启。' : '仅更新有新正式版本的模块；变更模块会短暂重启。'}</p> : null}
   </div><footer className="update-footer">{review ? <><button className="button secondary" disabled={pending === 'apply'} onClick={() => setReview(null)}>返回</button><button className="button primary" disabled={blocked || reviewInvalid} onClick={() => void apply()}>{pending === 'apply' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}确认更新 {review.modules.length} 个模块</button></> : <><button className="button secondary" disabled={pending !== null || checking || updating || uncertain || needsSetup} onClick={() => void request('check')}><RefreshCw size={16} className={checking ? 'spin' : ''} />{checking ? '正在检查' : '检查更新'}</button>{changes.length ? <button className="button primary" disabled={blocked} onClick={prepare}>{updating ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{updating ? '正在更新' : expired || snapshot?.planId === submittedPlan.current ? '请先重新检查' : recoveries.length === changes.length ? '恢复未完成更新' : '查看更新'}</button> : <span className="update-channel">正式版本</span>}</>}</footer></div></dialog>, document.body) : null}</>;
 }

@@ -73,6 +73,56 @@ test('job progress crosses the local client only through its optional display sc
   }
 });
 
+test('progress detail accepts only the matching fixed stage and never breaks authoritative state', () => {
+  const details = { download: ['source-receive', 'source-retry'], prepare: ['source-resolve', 'dependencies', 'runtime'],
+    build: ['build-workbench', 'build-monitor', 'build-asset', 'build-crossex', 'build-aster'],
+    verify: ['typecheck', 'tests'], finalize: ['healthcheck', 'updater'] };
+  const value = { ...state(), job: { id: 'current-job', status: 'running', startedAt: now, finishedAt: null,
+    activeModule: 'hub', message: '正在更新', steps: [] } };
+  for (const [stage, allowed] of Object.entries(details)) for (const detail of allowed) {
+    value.job.progress = { stage, detail, timestamp: Date.parse(now) };
+    assert.deepEqual(publicUpdateState(value).job.progress, value.job.progress);
+  }
+  for (const detail of ['build-workbench', 'private command output', '/private/path', '', null, 1, {}, [], true]) {
+    value.job.progress = { stage: 'download', detail, timestamp: Date.parse(now) };
+    const result = publicUpdateState(value);
+    assert.equal(result.enabled, true);
+    assert.equal(result.job.status, 'running');
+    assert.deepEqual(result.job.progress, { stage: 'download', timestamp: Date.parse(now) });
+  }
+});
+
+test('deployment selection validates modes and preserves the legacy source request', async t => {
+  const calls = [];
+  const client = await fixture(t, async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString()); calls.push(body);
+    res.end(JSON.stringify({ ...state(), deploymentModes: ['source', 'ci'], job: {
+      id: 'current-job', status: 'queued', deployMode: body.deployMode || 'source', startedAt: now,
+      finishedAt: null, activeModule: null, message: '准备更新', steps: [],
+    } }));
+  });
+  for (const mode of [undefined, 'source', 'ci']) {
+    const result = await client.apply(planId, mode);
+    assert.deepEqual(result.deploymentModes, ['source', 'ci']);
+    assert.equal(result.job.deployMode, mode || 'source');
+  }
+  assert.deepEqual(calls, [{ planId }, { planId }, { planId, deployMode: 'ci' }]);
+  assert.equal(publicUpdateState(state()).deploymentModes, undefined, 'legacy status must not advertise mode support');
+  for (const mode of [null, true, 1, {}, [], '', 'SOURCE', 'ci ', 'source;id', 'auto']) {
+    assert.throws(() => client.apply(planId, mode), error => error.status === 400);
+    assert.throws(() => validateUpdateBody('apply', { planId, deployMode: mode }), error => error.status === 400);
+  }
+  assert.equal(calls.length, 3, 'invalid modes never reach the privileged socket');
+  for (const deploymentModes of [null, [], ['source', 'source'], ['source', 'auto'], ['source', 'ci', 'source'], 'ci']) {
+    assert.throws(() => publicUpdateState({ ...state(), deploymentModes }), error => error.status === 503);
+  }
+  assert.throws(() => publicUpdateState({ ...state(), job: {
+    id: 'current-job', status: 'queued', deployMode: 'arbitrary-command', startedAt: now,
+    finishedAt: null, activeModule: null, message: '准备更新', steps: [],
+  } }), error => error.status === 503);
+});
+
 test('updater client bounds total request time including a trickling response', async t => {
   const client = await fixture(t, (req, res) => {
     res.write('{'); const timer = setInterval(() => res.write(' '), 10);
