@@ -23,7 +23,7 @@ import { useAccountDraft } from '@/lib/use-account-draft';
 import { fmt, pct, clock } from '@/lib/desk-format';
 import { cycleDraft, cycleRecoveryReason } from '@/lib/cycle';
 import { accountRunScope } from '@/lib/account-scope';
-import { accountSnapshotView } from '@/lib/account-modes';
+import { accountSummaryView } from '@/lib/account-summary';
 import { cycleMarginLimit } from '@/lib/policy';
 import { CyclePanel } from '@/components/cycle-panel';
 import { CycleRecovery } from '@/components/cycle-recovery';
@@ -96,7 +96,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     action,
   };
   const cycle = useAccountDraft(selected, cycleDraft(account?.cycle));
-  const snapshot = account?.snapshot;
   const recoveryReason = cycleRecoveryReason(account, {
     accountId: errorAccountId,
     message: error,
@@ -119,13 +118,13 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     Boolean(connectionError) ||
     !state?.updated_at ||
     serverNow - state.updated_at >= 8;
-  const snapshotView = accountSnapshotView(
-    snapshot,
+  const snapshotView = accountSummaryView(
+    account,
+    binding,
     serverNow,
     connectionError,
-    account?.snapshot_refresh,
-    account?.status === 'error' ? account.reason : undefined,
   );
+  const snapshot = snapshotView.snapshot;
   const events =
     state?.events.filter(
       (event) =>
@@ -271,10 +270,16 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 <section className="account-bar" aria-label="账户状态与总开关">
                   <div className="account-run-state">
                     <span
-                      className={`run-indicator ${account.enabled ? 'mint' : 'muted'}`}
+                      className={`run-indicator ${(binding ? binding.enabled : account.enabled) ? 'mint' : 'muted'}`}
                     >
                       <i />
-                      {account.enabled ? '账户执行已启用' : '账户执行已暂停'}
+                      {binding
+                        ? binding.enabled
+                          ? '配对组已启用'
+                          : '配对组已暂停'
+                        : account.enabled
+                          ? '账户执行已启用'
+                          : '账户执行已暂停'}
                     </span>
                     <p>
                       {pairBound
@@ -338,7 +343,15 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                       <dd>{fmt(snapshot?.available)}</dd>
                     </div>
                     <div>
-                      <dt>保证金占用率</dt>
+                      <dt
+                        title={
+                          snapshotView.fundsOnly
+                            ? '仅保证金模式只检查账户余额，不重新计算持仓占用率'
+                            : undefined
+                        }
+                      >
+                        保证金占用率{snapshotView.fundsOnly ? ' · 未采集' : ''}
+                      </dt>
                       <dd className={marginTone}>{pct(snapshot?.ratio)}</dd>
                     </div>
                   </dl>
@@ -346,9 +359,9 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                     className={`snapshot-stamp ${snapshotView.warning ? 'amber' : ''}`}
                     title={snapshotView.notice}
                   >
-                    {snapshot
-                      ? `${snapshotView.label} ${clock(snapshot.timestamp)}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
-                      : '等待账户数据'}
+                    {snapshot && snapshotView.elapsed !== null
+                      ? `${snapshotView.label} ${new Date(snapshot.timestamp * 1000).toLocaleString('zh-CN', { hour12: false })}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
+                      : snapshotView.label}
                     {state?.demo ? ' · 模拟环境' : ''}
                   </span>
                 </section>

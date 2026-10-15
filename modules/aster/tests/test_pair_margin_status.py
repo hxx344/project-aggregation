@@ -43,6 +43,18 @@ class MarginStatusTests(TestCase):
         self.assertEqual(view["reason"], self.journal["blocked_reason"])
         self.assertTrue(view["blocks_trading"])
 
+    def test_soft_failure_is_exposed_without_changing_waiting_or_transfer_permissions(self):
+        self.journal.update(blocked_reason="本轮保证金检查已跳过；HTTP 500", retry_without_blocking=True)
+        before = deepcopy(self.journal)
+        view = self.view()
+        self.assertEqual(view["status"], "waiting")
+        self.assertFalse(view["blocks_trading"])
+        self.assertIsNone(view["api_notice"])
+        self.assertEqual(view["error"], self.journal["blocked_reason"])
+        self.assertEqual(self.journal, before)
+        self.journal.pop("blocked_reason")
+        self.assertIsNone(self.view()["error"])
+
     def test_disabled_or_paused_clears_nonpending_failure_only(self):
         self.journal["blocked_reason"] = "上次账户资格检查失败"
         self.pair["enabled"] = False

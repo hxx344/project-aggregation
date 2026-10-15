@@ -473,7 +473,8 @@ class MarginBalancer:
             "trading_resume_allowed": resumed, "checked_at": state.get("checked_at"),
             "pending": _public_record(state.get("pending")), "last_transfer": _public_record(state.get("last_transfer")),
             "plan": plan, "next_check_at": state.get("next_check_at", 0), "cooldown_until": state.get("cooldown_until", 0),
-            "api_notice": notice}
+            "api_notice": notice,
+            "error": state["blocked_reason"] if isinstance(state.get("blocked_reason"), str) and state["blocked_reason"].strip() else None}
         deadline = state.get("next_check_at", 0)
         if notice and type(deadline) in (int, float) and math.isfinite(deadline):
             result["retry_after"] = max(0, deadline - time.time())

@@ -49,6 +49,7 @@ export type PairMarginState = {
   enabled?: boolean;
   status?: string;
   reason?: string;
+  error?: string | null;
   api_notice?: PairApiNotice | null;
   blocks_trading?: boolean;
   trading_resume_allowed?: boolean;
