@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 测试从 GitHub 下载发布包的完整耗时
+# 测试从 GitHub 下载发布包的完整耗时（60 秒超时）
 set -Eeuo pipefail
 
 REPOSITORY=hxx344/project-aggregation
+DOWNLOAD_TIMEOUT=${DOWNLOAD_TIMEOUT:-60}  # 默认 60 秒超时
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -11,6 +12,7 @@ echo "测试环境信息"
 echo "========================================="
 echo "服务器架构: $(uname -m)"
 echo "操作系统: $(uname -s) $(uname -r)"
+echo "下载超时: ${DOWNLOAD_TIMEOUT} 秒"
 echo "工作目录: $WORK_DIR"
 echo ""
 
@@ -73,12 +75,12 @@ echo ""
 
 START_DOWNLOAD=$(date +%s.%N)
 
-# 使用 curl 的进度显示，并计算速度
+# 使用 curl 的进度显示，并计算速度（60 秒超时）
 if ! curl --fail --location --proto '=https' --tlsv1.2 \
-  --connect-timeout 30 --max-time 1800 \
+  --connect-timeout 30 --max-time $DOWNLOAD_TIMEOUT \
   --progress-bar \
   "$DOWNLOAD_URL" -o "$ARCHIVE"; then
-  echo "❌ 下载失败"
+  echo "❌ 下载失败或超时（>${DOWNLOAD_TIMEOUT}秒）"
   exit 1
 fi
 

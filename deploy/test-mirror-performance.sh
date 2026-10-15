@@ -6,7 +6,8 @@ set -Eeuo pipefail
 
 # 配置
 GITHUB_REPO="hxx344/project-aggregation"
-TEST_ITERATIONS=${TEST_ITERATIONS:-3}
+TEST_ITERATIONS=${TEST_ITERATIONS:-1}  # 默认只测试 1 次
+DOWNLOAD_TIMEOUT=${DOWNLOAD_TIMEOUT:-60}  # 60 秒超时
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
@@ -78,7 +79,7 @@ test_download() {
 
         # 下载并计时
         local start=$(date +%s.%N)
-        if curl --fail --silent --show-error --max-time 300 \
+        if curl --fail --silent --show-error --max-time $DOWNLOAD_TIMEOUT \
                 --write-out "\n%{http_code}\n%{size_download}\n%{speed_download}\n%{time_total}\n" \
                 "$url" -o "$output" > "$TEMP_DIR/curl_stats_${i}.txt" 2>&1; then
 
@@ -112,7 +113,16 @@ test_download() {
                 print_error "HTTP $http_code"
             fi
         else
-            print_error "下载失败"
+            # 下载失败：记录错误
+            local elapsed=$(echo "$(date +%s.%N) - $start" | bc)
+            local error_msg=$(tail -1 "$TEMP_DIR/curl_stats_${i}.txt" 2>/dev/null || echo "未知错误")
+
+            # 判断是超时还是其他错误
+            if echo "$error_msg" | grep -qi "timeout\|timed out\|Operation too slow"; then
+                error_msg="下载超时（>${DOWNLOAD_TIMEOUT}秒）"
+            fi
+
+            print_error "${error_msg}"
         fi
 
         # 短暂延迟避免请求过快
@@ -173,8 +183,13 @@ get_latest_release() {
 main() {
     print_header "发布包下载性能测试"
     echo "测试仓库: $GITHUB_REPO"
-    echo "测试次数: $TEST_ITERATIONS 次"
+    echo "测试次数: $TEST_ITERATIONS 次（每次最多 ${DOWNLOAD_TIMEOUT} 秒）"
     echo "测试时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    echo -e "${YELLOW}💡 提示: 可通过环境变量调整测试参数${NC}"
+    echo "  TEST_ITERATIONS=3     # 测试 3 次求平均值"
+    echo "  DOWNLOAD_TIMEOUT=120  # 超时时间 120 秒"
+    echo ""
 
     # 1. 获取发布信息
     get_latest_release
