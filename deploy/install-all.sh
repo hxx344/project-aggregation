@@ -107,6 +107,9 @@ SOCKET_TIMEOUT = 20
 RANGE_DEADLINE = 180
 SINGLE_DEADLINE = 1800
 PROGRESS_UPDATE_INTERVAL = 0.5  # Update progress file every 500ms
+PROGRESS_STAGES = {'preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize'}
+MAX_TIMINGS_BYTES = 16384
+MAX_TIMINGS_ENTRIES = 32
 PROGRESS_DETAILS = {
     'download': {'source-receive', 'source-retry'},
     'prepare': {'source-resolve', 'dependencies', 'runtime'},
@@ -327,18 +330,203 @@ def digest_file(stream):
     return digest.hexdigest()
 
 
-def write_progress_file(stage, progress=None, downloaded=None, total=None, speed=None, detail=None):
-    """Publish optional detail only in the coordinator's protected job directory."""
+def progress_directory():
+    """Pin the root-controlled job directory without following any ancestor link."""
     filename = os.environ.get('PROJECT_UPDATE_PROGRESS_FILE', '')
     if not filename or not hasattr(os, 'geteuid') or os.geteuid() != 0:
-        return
+        return None, None, None
     directory = None
-    temporary = None
     try:
         parts = filename.split('/')
         if parts[0] or any(part in ('', '.', '..') for part in parts[1:]):
+            return None, None, None
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory = os.open('/', flags)
+        for part in [None, *parts[1:-1]]:
+            if part is not None:
+                child = os.open(part, flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            info = os.fstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                return None, None, None
+        # Timings and their lock are private, just like the progress file.
+        if os.fstat(directory).st_mode & 0o077:
+            return None, None, None
+        result, directory = directory, None
+        return result, parts[-1], parts[-2]
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def private_progress_file(info):
+    return stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and not info.st_mode & 0o077
+
+
+def atomic_progress_json(directory, name, data, prefix, maximum=4096):
+    temporary = None
+    try:
+        encoded = json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        if len(encoded) > maximum:
             return
-        if stage not in ('preflight', 'download', 'prepare', 'build', 'verify', 'extract', 'switch', 'finalize'):
+        try:
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and not private_progress_file(current):
+            return
+        candidate = prefix + secrets.token_hex(16)
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        temporary = candidate
+        with os.fdopen(descriptor, 'wb') as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = None
+    finally:
+        if temporary is not None:
+            os.unlink(temporary, dir_fd=directory)
+
+
+def timing_integer(value, maximum=2 ** 53 - 1):
+    return type(value) is int and 0 <= value <= maximum
+
+
+def valid_stage_timings(data):
+    if (not isinstance(data, dict) or type(data.get('schema')) is not int or data['schema'] != 1
+            or not isinstance(data.get('jobId'), str) or re.fullmatch(r'[a-f0-9]{32}', data['jobId']) is None
+            or not timing_integer(data.get('createdAt')) or type(data.get('closed')) is not bool):
+        return False
+    entries = data.get('entries')
+    if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_TIMINGS_ENTRIES:
+        return False
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get('stage'), str) or entry['stage'] not in PROGRESS_STAGES:
+            return False
+        stage, detail = entry['stage'], entry.get('detail')
+        if 'detail' in entry and (not isinstance(detail, str) or detail not in PROGRESS_DETAILS.get(stage, set())):
+            return False
+        if 'durationMs' not in entry or entry['durationMs'] is not None and not timing_integer(entry['durationMs']):
+            return False
+        key = (stage, detail)
+        if key in seen:
+            return False
+        seen.add(key)
+    active = data.get('active')
+    if active is None:
+        return data['closed']
+    return (not data['closed'] and isinstance(active, dict) and {'index', 'bootId', 'monotonicNs'} <= active.keys()
+            and timing_integer(active.get('index'), len(entries) - 1)
+            and (active.get('bootId') is None or isinstance(active['bootId'], str) and
+                 re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', active['bootId']) is not None)
+            and (active.get('monotonicNs') is None or timing_integer(active['monotonicNs'], 2 ** 63 - 1)))
+
+
+def advance_stage_timings(data, stage, detail, stamp, monotonic_ns, boot_id, job_id, finish=False):
+    """Accumulate only explicit intervals; polling and wall-clock changes add no time."""
+    if not isinstance(job_id, str) or re.fullmatch(r'[a-f0-9]{32}', job_id) is None:
+        return None
+    if data is None:
+        if finish:
+            return None
+        data = {'schema': 1, 'jobId': job_id, 'createdAt': stamp, 'closed': False, 'entries': [], 'active': None}
+    elif not valid_stage_timings(data) or data['jobId'] != job_id or data['closed']:
+        return None
+    active = data['active']
+    if active is not None:
+        entry = data['entries'][active['index']]
+        if not finish and (entry['stage'], entry.get('detail')) == (stage, detail) and active['bootId'] == boot_id:
+            return None  # Byte/percentage refreshes never rewrite or split timing intervals.
+        previous = active['monotonicNs']
+        if (entry['durationMs'] is not None and boot_id is not None and active['bootId'] == boot_id
+                and previous is not None and monotonic_ns is not None and monotonic_ns >= previous):
+            duration = entry['durationMs'] + (monotonic_ns - previous) // 1000000
+            entry['durationMs'] = duration if timing_integer(duration) else None
+        else:
+            entry['durationMs'] = None
+    if finish:
+        data.update(active=None, closed=True)
+        return data
+    for index, entry in enumerate(data['entries']):
+        if (entry['stage'], entry.get('detail')) == (stage, detail):
+            break
+    else:
+        if len(data['entries']) >= MAX_TIMINGS_ENTRIES:
+            return None
+        index = len(data['entries'])
+        entry = {'stage': stage, 'durationMs': 0}
+        if detail is not None:
+            entry['detail'] = detail
+        data['entries'].append(entry)
+    data['active'] = {'index': index, 'bootId': boot_id, 'monotonicNs': monotonic_ns}
+    return data
+
+
+def write_stage_timings(directory, job_id, stage=None, detail=None, finish=False):
+    """The fixed sibling file survives old workers and control-service restarts."""
+    if not isinstance(job_id, str) or re.fullmatch(r'[a-f0-9]{32}', job_id) is None:
+        return
+    descriptor = None
+    try:
+        import fcntl
+        descriptor = os.open('stage-timings.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o600, dir_fd=directory)
+        if not private_progress_file(os.fstat(descriptor)):
+            return
+        # Display-only data must never wait behind a stalled writer.
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        data = None
+        try:
+            source_fd = os.open('stage-timings.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(source_fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if not private_progress_file(info) or info.st_size > MAX_TIMINGS_BYTES:
+                    return
+                raw = source.read(MAX_TIMINGS_BYTES + 1)
+            if len(raw) > MAX_TIMINGS_BYTES:
+                return
+            data = json.loads(raw)
+        try:
+            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+            if re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', boot_id) is None:
+                boot_id = None
+        except (OSError, UnicodeError):
+            boot_id = None
+        result = advance_stage_timings(data, stage, detail, int(time.time() * 1000), time.monotonic_ns(), boot_id, job_id, finish)
+        if result is not None:
+            atomic_progress_json(directory, 'stage-timings.json', result, '.stage-timings-', MAX_TIMINGS_BYTES)
+    except (ImportError, OSError, ValueError, TypeError, OverflowError, RecursionError):
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def finish_stage_timings():
+    directory = None
+    try:
+        directory, _name, job_id = progress_directory()
+        if directory is not None:
+            write_stage_timings(directory, job_id, finish=True)
+    except (OSError, ValueError, TypeError):
+        pass
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def write_progress_file(stage, progress=None, downloaded=None, total=None, speed=None, detail=None):
+    """Publish optional detail only in the coordinator's protected job directory."""
+    directory = None
+    try:
+        if stage not in PROGRESS_STAGES:
             return
         data = {
             'stage': stage,
@@ -359,44 +547,15 @@ def write_progress_file(stage, progress=None, downloaded=None, total=None, speed
             if speed > 0 and downloaded is not None and total is not None and downloaded < total:
                 remaining = total - downloaded
                 data['eta'] = int(remaining / speed)
-        # Open every ancestor without following links. Keep the verified parent
-        # descriptor for all file operations so no path lookup can swap it later.
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        directory = os.open('/', flags)
-        for part in [None, *parts[1:-1]]:
-            if part is not None:
-                child = os.open(part, flags, dir_fd=directory)
-                os.close(directory)
-                directory = child
-            info = os.fstat(directory)
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-                return
-        try:
-            current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            current = None
-        if current is not None and (not stat.S_ISREG(current.st_mode) or current.st_uid != 0 or
-                                    current.st_nlink != 1 or current.st_mode & 0o077):
+        directory, name, job_id = progress_directory()
+        if directory is None:
             return
-        candidate = '.progress-' + secrets.token_hex(16)
-        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600, dir_fd=directory)
-        temporary = candidate
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary, parts[-1], src_dir_fd=directory, dst_dir_fd=directory)
-        temporary = None
-    except (OSError, ValueError, TypeError):
+        write_stage_timings(directory, job_id, stage, data.get('detail'))
+        atomic_progress_json(directory, name, data, '.progress-')
+    except (OSError, ValueError, TypeError, OverflowError, RecursionError):
         pass  # Progress write failure should not block download
     finally:
         if directory is not None:
-            if temporary is not None:
-                try:
-                    os.unlink(temporary, dir_fd=directory)
-                except OSError:
-                    pass
             os.close(directory)
 
 
@@ -922,6 +1081,8 @@ if __name__ == '__main__':
         if sys.argv[1] == '--progress':
             write_progress_file(sys.argv[2], float(sys.argv[3]) if sys.argv[3] else None,
                                 detail=sys.argv[4] if len(sys.argv) > 4 else None)
+        elif sys.argv[1] == '--finish-progress':
+            finish_stage_timings()
         elif sys.argv[1] == '--source-progress':
             with os.fdopen(3, 'rb') as source:
                 source_progress_stream(source, sys.stderr.buffer)
@@ -937,6 +1098,11 @@ ci_update_progress() {
   # Old workers and direct installs omit this optional, root-controlled path.
   [[ -n ${PROJECT_UPDATE_PROGRESS_FILE:-} ]] || return 0
   ci_release_download --progress "$1" "${2:-}" "${3:-}" >/dev/null 2>&1 || true
+}
+
+ci_finish_progress() {
+  [[ -n ${PROJECT_UPDATE_PROGRESS_FILE:-} ]] || return 0
+  ci_release_download --finish-progress >/dev/null 2>&1 || true
 }
 
 ci_source_progress() {

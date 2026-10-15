@@ -174,9 +174,19 @@ systemctl() {
 curl() { [[ -f "$FIXTURE_ROOT/running-port" && "${@: -1}" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/health" ]]; }
 wait_healthy() { healthy; }
 ci_update_progress() { printf '%s\n' "$1" >> "$FIXTURE_ROOT/progress.calls"; }
+ci_finish_progress() { printf 'closed\n' >> "$FIXTURE_ROOT/timings.calls"; }
 main
 RUN
-run_install() { : > "$fixture/progress.calls"; bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || { cat "$fixture/last.log"; return 1; }; }
+run_install() {
+  local status=0
+  : > "$fixture/progress.calls"
+  : > "$fixture/timings.calls"
+  bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || status=$?
+  printf '%s\n' "$status" > "$fixture/last-exit"
+  if (( status != 0 )); then cat "$fixture/last.log"; return "$status"; fi
+  # Covers normal installation and both no-op returns through the real EXIT trap.
+  [[ $(cat "$fixture/timings.calls") == closed ]]
+}
 count() { grep -c "^$1$" "$fixture/pnpm.calls" || true; }
 restarts() { grep -c '^restart ' "$fixture/systemctl.calls" || true; }
 releases() { find "$fixture/application/releases" -mindepth 1 -maxdepth 1 -type d | wc -l; }
@@ -212,6 +222,8 @@ git -C "$fixture/source" commit -qam restore-unpublished-frontend
 touch "$fixture/fail-release"
 cp "$fixture/application/.deployed-state" "$fixture/success-state"
 if run_install; then echo 'Missing stable release fell back to main' >&2; exit 1; fi
+[[ $(cat "$fixture/last-exit") == 70 ]]
+[[ $(cat "$fixture/timings.calls") == closed ]] # rollback closes before cleanup and never counts recovery time
 expect_counts 1 1 0 1 1
 [[ $(readlink "$fixture/application/current") == "$initial" ]]
 cmp "$fixture/success-state" "$fixture/application/.deployed-state"
@@ -268,6 +280,7 @@ expect_counts 1 2 4 2 4
 [[ $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' | wc -l) == "$verified_before" ]]
 [[ $(readlink "$fixture/application/current") == "$current" ]]
 if run_install; then echo 'Failed test was accepted' >&2; exit 1; fi
+[[ $(cat "$fixture/last-exit") == 42 ]]
 expect_counts 1 2 5 2 4
 [[ $(find "$fixture/application/cache" -maxdepth 1 -name 'tested-*' | wc -l) == "$verified_before" ]]
 [[ $(readlink "$fixture/application/current") == "$current" && $(releases) == 2 ]]
@@ -278,6 +291,7 @@ expect_counts 1 2 6 2 4
 echo failed >> "$fixture/source/src/app.ts"; commit_source fail-build
 touch "$fixture/fail-build"
 if run_install; then echo 'Failed build was accepted' >&2; exit 1; fi
+[[ $(cat "$fixture/last-exit") == 43 ]]
 [[ $(tail -n1 "$fixture/progress.calls") == build ]]
 ! grep -Eq '^(switch|finalize)$' "$fixture/progress.calls"
 expect_counts 1 3 7 3 4

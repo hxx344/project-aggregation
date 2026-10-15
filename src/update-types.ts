@@ -28,6 +28,7 @@ export type UpdateJob = {
   message: string;
   deployMode?: UpdateDeployMode;
   progress?: UpdateProgress;
+  stageTimings?: { entries: Array<{ stage: UpdateStage; detail?: string; durationMs: number | null }> };
 };
 
 export type UpdateState = {

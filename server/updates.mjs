@@ -49,6 +49,22 @@ function publicProgress(value, job) {
   return result;
 }
 
+function publicStageTimings(value, job) {
+  if (!['succeeded', 'failed', 'interrupted'].includes(job.status) || !object(value)
+    || !Array.isArray(value.entries) || !value.entries.length || value.entries.length > 32) return null;
+  const entries = [], seen = new Set();
+  for (const row of value.entries) {
+    if (!object(row) || !PROGRESS_STAGES.has(row.stage)
+      || row.detail !== undefined && !PROGRESS_DETAILS[row.stage]?.has(row.detail)
+      || row.durationMs !== null && !progressNumber(row.durationMs)) return null;
+    const key = `${row.stage}:${row.detail ?? ''}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    entries.push({ stage: row.stage, ...(row.detail === undefined ? {} : { detail: row.detail }), durationMs: row.durationMs });
+  }
+  return { entries };
+}
+
 /** Explicit public schema: never forward command output, paths or unknown fields. */
 export function publicUpdateState(value) {
   const invalid = () => { throw new UpdateError(503, UNAVAILABLE); };
@@ -86,6 +102,8 @@ export function publicUpdateState(value) {
     if (row.deployMode !== undefined) job.deployMode = row.deployMode;
     const progress = publicProgress(row.progress, row);
     if (progress) job.progress = progress;
+    const stageTimings = publicStageTimings(row.stageTimings, row);
+    if (stageTimings) job.stageTimings = stageTimings;
   }
   return { enabled: value.enabled, ...(value.reason === undefined ? {} : { reason: value.reason }), checking: value.checking,
     checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job,

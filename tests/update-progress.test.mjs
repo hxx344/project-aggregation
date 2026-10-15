@@ -1,11 +1,48 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getUpdateProgress } from '../src/update-progress.ts';
+import { getUpdateProgress, getUpdateTimingSummary, formatUpdateDuration } from '../src/update-progress.ts';
 
 const startedAt = '2026-10-15T08:00:00.000Z';
 const timestamp = Date.parse(startedAt) + 1000;
 const progress = (changes = {}) => ({ stage: 'download', progress: 0.25, downloaded: 256, total: 1024, speed: 1536, eta: 21, timestamp, ...changes });
 const job = (data, changes = {}) => ({ id: 'update-1', status: 'running', startedAt, finishedAt: null, activeModule: 'workbench', steps: [], message: '', progress: data, ...changes });
+
+test('completed update durations keep seconds, minutes and hours without invented zeroes', () => {
+  for (const [value, expected] of [[0, '不足 1 秒'], [999.9, '不足 1 秒'], [1000, '1 秒'],
+    [61000, '1 分 1 秒'], [3600000, '1 小时'], [3661000, '1 小时 1 分 1 秒']]) {
+    assert.equal(formatUpdateDuration(value), expected);
+  }
+  const stageTimings = { entries: [
+    { stage: 'download', detail: 'source-receive', durationMs: 40000 },
+    { stage: 'build', detail: 'build-workbench', durationMs: 20000 },
+    { stage: 'finalize', detail: 'healthcheck', durationMs: null },
+  ] };
+  for (const status of ['succeeded', 'failed', 'interrupted']) {
+    const summary = getUpdateTimingSummary(job(undefined, { status, finishedAt: new Date(Date.parse(startedAt) + 61000).toISOString(), stageTimings }));
+    assert.equal(summary.total, '1 分 1 秒');
+    assert.deepEqual(summary.entries.map(({ label, duration }) => [label, duration]), [
+      ['源码接收', '40 秒'], ['工作台构建', '20 秒'], ['服务健康检查', '未完整记录'],
+    ]);
+  }
+  for (const status of ['queued', 'running']) assert.equal(getUpdateTimingSummary(job(undefined, { status, stageTimings })), null);
+  assert.equal(getUpdateTimingSummary(null), null);
+});
+
+test('legacy, skipped and invalid timing records never invent phase measurements', () => {
+  const finished = job(undefined, { status: 'succeeded', finishedAt: new Date(timestamp).toISOString() });
+  assert.deepEqual(getUpdateTimingSummary(finished), { total: '1 秒', entries: [] });
+  const row = { stage: 'download', durationMs: 0 };
+  const invalid = [null, [], {}, { entries: [] }, { entries: new Array(33).fill(row) },
+    { entries: [row, row] }, ...[undefined, -1, NaN, Infinity, true, '100', Number.MAX_SAFE_INTEGER + 1].map(durationMs => ({ entries: [{ ...row, durationMs }] })),
+    ...['unknown', '__proto__', 'constructor', null, {}].map(stage => ({ entries: [{ ...row, stage }] })),
+    ...['build-workbench', 'private-log', '__proto__', null, {}].map(detail => ({ entries: [{ ...row, detail }] }))];
+  for (const stageTimings of invalid) assert.deepEqual(getUpdateTimingSummary({ ...finished, stageTimings }), { total: '1 秒', entries: [] });
+  const summary = getUpdateTimingSummary({ ...finished, stageTimings: { entries: [row] } });
+  assert.deepEqual(summary.entries, [{ key: 'download:', label: '下载更新文件', duration: '不足 1 秒' }]);
+  for (const finishedAt of [null, 'invalid', new Date(Date.parse(startedAt) - 1).toISOString()]) {
+    assert.equal(getUpdateTimingSummary({ ...finished, finishedAt }).total, null);
+  }
+});
 
 test('shows measured stage progress and download units without estimating total completion', () => {
   const view = getUpdateProgress(job(progress()));

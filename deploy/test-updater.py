@@ -1281,6 +1281,51 @@ class CoordinatorTests(RootFixture):
             self.coordinator.save(state)
         self.assertNotIn('progress', self.coordinator.status()['job'], 'a different job cannot reuse the old path')
 
+    def test_terminal_timings_survive_old_worker_state_and_control_restart(self):
+        plan = self.prepare(); accepted = self.coordinator.apply(plan)
+        job_id = accepted['job']['id']
+        path = self.coordinator.jobs / job_id / 'stage-timings.json'
+        sample = {'schema': 1, 'jobId': job_id, 'createdAt': self.clock * 1000, 'closed': True, 'active': None,
+                  'entries': [{'stage': 'build', 'detail': 'build-workbench', 'durationMs': 1200},
+                              {'stage': 'finalize', 'detail': 'updater', 'durationMs': 20}]}
+        updater.write_json(path, sample)
+        self.assertNotIn('stageTimings', self.coordinator.status()['job'])
+        def inspect_timings(_key):
+            self.assertNotIn('stageTimings', self.coordinator.status()['job'])
+        self.installer_hook = inspect_timings
+        self.coordinator.run()
+        self.assertNotIn('stageTimings', self.coordinator.load()['job'])
+        expected = {'entries': sample['entries']}
+        self.assertEqual(self.coordinator.status()['job']['stageTimings'], expected)
+        self.clock -= 300
+        self.assertEqual(self.make_coordinator().status()['job']['stageTimings'], expected)
+        updater.write_json(path, {**sample, 'createdAt': self.clock * 1000})
+        self.assertEqual(self.make_coordinator().status()['job']['stageTimings'], expected)
+        self.clock += 86400
+        restarted = self.make_coordinator()
+        self.assertEqual(restarted.status()['job']['stageTimings'], expected)
+        for status in ('failed', 'interrupted'):
+            with self.coordinator.lock():
+                state = self.coordinator.load(); state['job']['status'] = status
+                # Untrusted/stale in-state display fields must not override the private projection.
+                state['job']['stageTimings'] = {'entries': [{'stage': 'secret', 'durationMs': 1}]}
+                self.coordinator.save(state)
+            self.assertEqual(restarted.status()['job']['stageTimings'], expected)
+            self.assertEqual(restarted.status()['job']['status'], status)
+        updater.write_json(path, {**sample, 'closed': False, 'active': {'index': 1}})
+        self.assertIsNone(restarted.status()['job']['stageTimings']['entries'][1]['durationMs'])
+        for invalid in ('{', '[' * 1500 + '0' + ']' * 1500):
+            path.write_text(invalid, encoding='utf8')
+            self.assertNotIn('stageTimings', restarted.status()['job'])
+            self.assertEqual(restarted.status()['job']['status'], 'interrupted')
+        updater.write_json(path, {**sample, 'jobId': 'f' * 32})
+        self.assertNotIn('stageTimings', restarted.status()['job'])
+        updater.write_json(path, sample)
+        with self.coordinator.lock():
+            state = self.coordinator.load(); state['job']['id'] = 'f' * 32
+            self.coordinator.save(state)
+        self.assertNotIn('stageTimings', restarted.status()['job'], 'a new task never reads an old task directory')
+
     @unittest.skipUnless(LINUX_ROOT, 'Unix socket and root permission checks run in Linux CI')
     def test_removed_progress_route_does_not_hold_control_connection_slots(self):
         endpoint = self.root / 'progress-control.sock'

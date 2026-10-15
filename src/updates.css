@@ -99,6 +99,15 @@
 .update-progress.failed h3,.update-progress.interrupted h3{color:var(--warning)}
 
 .update-steps{list-style:none;padding:0;margin:14px 0 0}
+.update-timings{margin-top:16px;padding-top:14px;border-top:1px solid var(--surface-4)}
+.update-timing-total{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:.8125rem;color:var(--text-secondary)}
+.update-timing-total strong{color:var(--text-primary);font-variant-numeric:tabular-nums;text-align:right}
+.update-timings h4{margin:14px 0 7px;font-size:.75rem;font-weight:500;color:var(--text-secondary)}
+.update-timings dl{margin:0;display:grid;gap:7px}
+.update-timings dl>div{display:flex;justify-content:space-between;align-items:baseline;gap:14px;font-size:.75rem;line-height:1.6}
+.update-timings dt{min-width:0;overflow-wrap:anywhere;color:var(--text-secondary)}
+.update-timings dd{margin:0;flex-shrink:0;color:var(--text-primary);font-variant-numeric:tabular-nums}
+.update-timings>p{margin-top:10px;font-size:.6875rem;line-height:1.65;color:var(--text-tertiary)}
 .update-steps>li{display:flex;align-items:flex-start;gap:9px;padding:10px 0;border-top:1px solid var(--surface-4);font-size:.75rem;color:var(--text-tertiary)}
 .update-step-mark{width:19px;height:19px;border:1px solid var(--surface-5);border-radius:var(--radius-circle);display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
 .update-steps .succeeded .update-step-mark{background:rgba(110,231,183,0.15);border-color:rgba(110,231,183,0.3);color:var(--emerald)}

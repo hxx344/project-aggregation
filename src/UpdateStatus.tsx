@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { ArrowRight, Check, ChevronRight, CircleAlert, Download, LoaderCircle, RefreshCw, X } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { UpdateDeployMode, UpdateJob, UpdateModule, UpdateState, UpdateProgressView } from './update-types';
-import { getUpdateProgress } from './update-progress';
+import { getUpdateProgress, getUpdateTimingSummary } from './update-progress';
 import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
@@ -45,12 +45,24 @@ function ModuleRow({ module, unfinishedJob }: { module: UpdateModule; unfinished
     {module.latestVersion || module.latestCommit ? module.releaseNotes ? <details className="update-release-notes"><summary>该版本更新内容</summary><p>{module.releaseNotes}</p></details> : <p className="update-module-note">该版本未提供更新内容。</p> : null}
   </li>;
 }
+function JobTimings({ job }: { job: UpdateJob }) {
+  const summary = getUpdateTimingSummary(job);
+  if (!summary) return null;
+  return <section className="update-timings" aria-label="本次更新耗时">
+    {summary.total ? <div className="update-timing-total"><span>任务总耗时</span><strong>{summary.total}</strong></div> : null}
+    {summary.entries.length ? <>
+      <h4>各阶段耗时</h4>
+      <dl>{summary.entries.map(entry => <div key={entry.key}><dt>{entry.label}</dt><dd>{entry.duration}</dd></div>)}</dl>
+      <p>仅列出实际记录的阶段；任务总耗时还包含排队与协调时间。</p>
+    </> : <p>本次任务未记录阶段耗时。</p>}
+  </section>;
+}
 function JobProgress({ job, modules }: { job: UpdateJob; modules: UpdateModule[] }) {
   const activeName = modules.find(module => module.id === job.activeModule)?.name;
   const failedSteps = job.steps.filter(step => step.status === 'failed');
   const hasFailedSteps = failedSteps.length > 0;
 
-  return <section className={`update-progress ${job.status}`} aria-labelledby="update-progress-title"><div className="update-progress-heading"><h3 id="update-progress-title">{running(job) ? <LoaderCircle size={18} className="spin" /> : job.status === 'succeeded' ? <Check size={18} /> : <CircleAlert size={18} />}{jobLabels[job.status]}</h3><span>{dateTime(job.finishedAt || job.startedAt)}</span></div><p role="status">{job.message || (running(job) && activeName ? `正在处理${activeName}` : unfinished(job) ? hasFailedSteps ? '上次任务有步骤未完成，请查看服务器部署日志。' : '上次任务未完成全部安装与检查。' : '进度会自动更新。')}</p>{job.deployMode === 'source' || job.deployMode === 'ci' ? <p className="update-job-mode">本次方式：{modeLabels[job.deployMode]}</p> : null}{unfinished(job) ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方“本机模块”。</p> : null}{job.steps.length ? <ol className="update-steps" aria-label="更新进度">{job.steps.map(step => <li className={step.status} key={step.id}><span className="update-step-mark" aria-hidden="true">{step.status === 'running' ? <LoaderCircle size={15} className="spin" /> : step.status === 'succeeded' ? <Check size={14} /> : step.status === 'failed' ? <X size={14} /> : <span />}</span><div><strong>{step.name}</strong>{step.message ? <p>{step.message}</p> : null}</div><span>{stepLabels[step.status]}</span></li>)}</ol> : null}{running(job) ? <small className="update-progress-note">可以关闭此面板；更新会继续，重新打开即可查看进度。</small> : null}</section>;
+  return <section className={`update-progress ${job.status}`} aria-labelledby="update-progress-title"><div className="update-progress-heading"><h3 id="update-progress-title">{running(job) ? <LoaderCircle size={18} className="spin" /> : job.status === 'succeeded' ? <Check size={18} /> : <CircleAlert size={18} />}{jobLabels[job.status]}</h3><span>{dateTime(job.finishedAt || job.startedAt)}</span></div><p role="status">{job.message || (running(job) && activeName ? `正在处理${activeName}` : unfinished(job) ? hasFailedSteps ? '上次任务有步骤未完成，请查看服务器部署日志。' : '上次任务未完成全部安装与检查。' : '进度会自动更新。')}</p>{job.deployMode === 'source' || job.deployMode === 'ci' ? <p className="update-job-mode">本次方式：{modeLabels[job.deployMode]}</p> : null}{unfinished(job) ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方“本机模块”。</p> : null}<JobTimings job={job} />{job.steps.length ? <ol className="update-steps" aria-label="更新进度">{job.steps.map(step => <li className={step.status} key={step.id}><span className="update-step-mark" aria-hidden="true">{step.status === 'running' ? <LoaderCircle size={15} className="spin" /> : step.status === 'succeeded' ? <Check size={14} /> : step.status === 'failed' ? <X size={14} /> : <span />}</span><div><strong>{step.name}</strong>{step.message ? <p>{step.message}</p> : null}</div><span>{stepLabels[step.status]}</span></li>)}</ol> : null}{running(job) ? <small className="update-progress-note">可以关闭此面板；更新会继续，重新打开即可查看进度。</small> : null}</section>;
 }
 
 function DownloadProgress({ progress }: { progress: UpdateProgressView }) {

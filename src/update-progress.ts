@@ -41,6 +41,51 @@ const DETAILS: Record<string, { stage: UpdateStage; message: string }> = {
 
 const nonnegative = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 
+const STAGE_LABELS: Record<UpdateStage, string> = {
+  preflight: '更新条件检查', download: '下载更新文件', prepare: '依赖与配置准备', build: '应用构建',
+  verify: '更新校验', extract: '解包与发布目录准备', switch: '服务切换', finalize: '安装收尾',
+};
+const DETAIL_LABELS: Record<string, string> = {
+  'source-receive': '源码接收', 'source-retry': '源码下载重试', 'source-resolve': '源码与版本解析',
+  dependencies: '项目依赖准备', runtime: '运行环境准备', 'build-workbench': '工作台构建',
+  'build-monitor': '市场监控构建', 'build-asset': '资产账本构建', 'build-crossex': '跨所交易构建',
+  'build-aster': 'Aster 模块构建', typecheck: '代码类型检查', tests: '更新测试',
+  healthcheck: '服务健康检查', updater: '更新服务安装',
+};
+
+export function formatUpdateDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return '不足 1 秒';
+  const seconds = Math.floor(milliseconds / 1000);
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds % 3600 / 60), rest = seconds % 60;
+  return [hours ? `${hours} 小时` : '', minutes ? `${minutes} 分` : '', rest ? `${rest} 秒` : ''].filter(Boolean).join(' ');
+}
+
+/** Completed-task measurements come from the installer; the browser never times phases. */
+export function getUpdateTimingSummary(job: UpdateJob | null | undefined) {
+  if (!job || !['succeeded', 'failed', 'interrupted'].includes(job.status)) return null;
+  const start = Date.parse(job.startedAt), end = job.finishedAt ? Date.parse(job.finishedAt) : NaN;
+  const total = Number.isFinite(start) && Number.isFinite(end) && end >= start ? formatUpdateDuration(end - start) : null;
+  const empty = { total, entries: [] as Array<{ key: string; label: string; duration: string }> };
+  const raw: unknown = job.stageTimings;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return empty;
+  const { entries } = raw as Record<string, unknown>;
+  if (!Array.isArray(entries) || !entries.length || entries.length > 32) return empty;
+  const result = [], seen = new Set<string>();
+  for (const row of entries) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return empty;
+    const { stage, detail, durationMs } = row as Record<string, unknown>;
+    if (typeof stage !== 'string' || !Object.hasOwn(STAGE_LABELS, stage)
+      || detail !== undefined && (typeof detail !== 'string' || !Object.hasOwn(DETAILS, detail) || DETAILS[detail].stage !== stage)
+      || durationMs !== null && (!nonnegative(durationMs) || durationMs > Number.MAX_SAFE_INTEGER)) return empty;
+    const key = `${stage}:${detail ?? ''}`;
+    if (seen.has(key)) return empty;
+    seen.add(key);
+    result.push({ key, label: typeof detail === 'string' ? DETAIL_LABELS[detail] : STAGE_LABELS[stage as UpdateStage],
+      duration: durationMs === null ? '未完整记录' : formatUpdateDuration(durationMs as number) });
+  }
+  return { total, entries: result };
+}
+
 /** Progress belongs to the current task; no UI state or estimated stage weights. */
 export function getUpdateProgress(job: UpdateJob | null | undefined): UpdateProgressView | null {
   if (!job || !['queued', 'running'].includes(job.status)) return null;

@@ -175,6 +175,27 @@ test('installer progress reaches authenticated status and the real events route 
   } finally { abort.abort(); }
 });
 
+test('completed stage timings survive authenticated status and events while live progress is cleared', async t => {
+  const f = await fixture(t); await f.login();
+  const stageTimings = { entries: [
+    { stage: 'download', durationMs: 4500 }, { stage: 'finalize', detail: 'healthcheck', durationMs: null },
+  ] };
+  f.state = { ...f.state, job: { ...job('succeeded'), stageTimings: { ...stageTimings, path: '/private/path' },
+    progress: { stage: 'download', timestamp: Date.parse(stamp) } } };
+  const result = await f.request(PREFIX);
+  assert.deepEqual(result.data.job.stageTimings, stageTimings);
+  assert.equal(result.data.job.progress, undefined);
+  const abort = new AbortController();
+  const response = await fetch(f.origin + `${PREFIX}/events`, { headers: { Cookie: f.session.cookie, Origin: f.origin }, signal: abort.signal });
+  try {
+    const reader = response.body.getReader(); let received = '';
+    while (!received.includes('"snapshot"')) received += new TextDecoder().decode((await reader.read()).value);
+    const line = received.split('\n').find(value => value.includes('"snapshot"'));
+    assert.deepEqual(JSON.parse(line.slice(6)).state.job.stageTimings, stageTimings);
+    assert.equal(received.includes('private'), false);
+  } finally { abort.abort(); }
+});
+
 test('concurrent identical applies share acceptance and atomically block live entry while stop/reconcile remain available', async t => {
   const f = await fixture(t); await f.login();
   const entered = deferred(), release = deferred();

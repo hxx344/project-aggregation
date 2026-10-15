@@ -551,7 +551,11 @@
 
 **证据：** project-aggregation `3be993fea8985d3e21c2fa3b5090f9d5b7dae288` 的 `server/app.mjs`、`server/update-service/progress.py`、`deploy/release-common.sh` 与 `tests/update-progress.browser.mjs`；2026-10-15 在 `74fc675` 工作区审查核实。另用当前任务夹具复现 3001 字节嵌套 JSON 令 `status()` 抛 `RecursionError`，本轮补齐容错与回归。旧版首次升级没有新进度详情不等于不能升级，应保留旧状态通道兼容。
 
-**事件记录：** `update-progress-runtime-channel-20261015`；同一进度交付缺陷及连续修复，不按路径或测试数量重复计数。
+**历史耗时补充：** 实时样本的过期规则不适用于已完成任务的历史计时。历史记录使用受保护任务目录中的固定任务身份绑定，阶段时长由单调时钟计算并核对开机身份；不能用 `createdAt` 相对任务开始或当前墙上时间的位置决定是否显示。系统校时可能回拨，未闭合区间也不能用恢复时间补算。
+
+**补充证据与验证：** 2026-10-16 基于本仓 `06042777` 增加阶段耗时的提交前审查，发现历史读取沿用 `createdAt >= startedAt` 和 `createdAt <= now + 1s`：校时发生在首次记录之后会暂时隐藏有效记录，发生在任务接受和首次记录之间则会持续隐藏。修正为固定任务身份校验，保留实时进度原有新鲜度规则；[进度读取测试](deploy/test-progress.py) 覆盖回拨、错任务记录与未闭合区间，[写入测试](deploy/test-release-progress.py) 覆盖单调计时及跨开机未知值。该问题在本轮首次提交前修正，不是基线已发布的历史计时缺陷。
+
+**事件记录：** `update-progress-runtime-channel-20261015`、`update-timings-wall-clock-20261016`；分别为进度链路和新增历史计时的独立问题，各自连续修复不重复计数。
 
 ### L037：异步连接清理先释放同步资源，再等待子任务结束
 

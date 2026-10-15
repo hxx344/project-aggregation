@@ -129,6 +129,51 @@ async (page) => {
   assert(await page.evaluate(() => window.__progressStreams.filter(stream => !stream.closed && stream.url.startsWith('/api/system/updates')).length === 1), 'closing and reopening does not add a progress stream');
   scenarios.push('reopen current progress and mobile layout');
 
+  state.job.stageTimings = { entries: [
+    { stage: 'preflight', durationMs: 500 }, { stage: 'download', detail: 'source-receive', durationMs: 20000 },
+    { stage: 'build', detail: 'build-workbench', durationMs: 40000 }, { stage: 'finalize', detail: 'healthcheck', durationMs: 500 },
+  ] };
+  await emit();
+  assert(await page.locator('.update-timings').count() === 0, 'running tasks do not present a completed timing summary');
+  state.job.status = 'succeeded';
+  state.job.message = '所选正式版本更新完成';
+  state.job.finishedAt = new Date(Date.parse(state.job.startedAt) + 61000).toISOString();
+  state.job.steps[0].status = 'succeeded';
+  await emit();
+  await expectNoProgress('completion clears live progress and retains measured stage timings');
+  assert(await page.locator('.update-timing-total strong').innerText() === '1 分 1 秒', 'task total uses durable start and finish timestamps');
+  assert(await page.locator('.update-timings dt').allTextContents().then(values => values.join('|')) === '更新条件检查|源码接收|工作台构建|服务健康检查', 'source completion displays recorded detail labels');
+  assert(await page.locator('.update-timings dd').allTextContents().then(values => values.join('|')) === '不足 1 秒|20 秒|40 秒|不足 1 秒', 'completed phases show their actual durations');
+  await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
+  await openUpdates();
+  assert(await page.locator('.update-timings dt').count() === 4, 'closing and reopening preserves timings');
+  await page.reload();
+  await openUpdates();
+  await page.locator('.update-timings').waitFor();
+  assert(await page.locator('.update-timing-total strong').innerText() === '1 分 1 秒', 'reload obtains the completed timing summary from status');
+  assert(await page.locator('.update-dialog').evaluate(element => element.scrollWidth <= element.clientWidth), 'mobile timing labels and durations stay inside the dialog');
+  await page.screenshot({ path: 'output/playwright/update-stage-timings-mobile.png', fullPage: true });
+  scenarios.push('terminal SSE summary, reopen, persisted HTTP reload and narrow timing layout');
+
+  state.job.deployMode = 'ci';
+  state.job.stageTimings = { entries: [{ stage: 'download', durationMs: 45000 }, { stage: 'verify', durationMs: 15000 }] };
+  await emit();
+  assert(await page.locator('.update-timings dt').count() === 2, 'CI results only list stages that were actually recorded');
+  assert(!(await page.locator('.update-timings').innerText()).includes('构建'), 'CI results do not invent a skipped build stage');
+  for (const status of ['failed', 'interrupted']) {
+    state.job.status = status;
+    state.job.message = status === 'failed' ? '更新未完成' : '更新进程已中断';
+    state.job.stageTimings.entries[1].durationMs = null;
+    await emit();
+    assert(await page.locator('.update-timings dd').last().innerText() === '未完整记录', 'unclosed timing is not zero or elapsed time until recovery');
+    assert(!(await page.locator('#update-progress-title').innerText()).includes('更新已完成'), 'failed and interrupted jobs remain unsuccessful');
+  }
+  delete state.job.stageTimings;
+  await emit();
+  assert(await page.locator('.update-timings dt').count() === 0, 'old tasks do not fabricate timing rows');
+  assert((await page.locator('.update-timings').innerText()).includes('本次任务未记录阶段耗时'), 'legacy task timing absence is explicit');
+  scenarios.push('CI skipped phases, partial failures and legacy completion');
+
   expired = true;
   await page.evaluate(() => window.__progressStreams.filter(stream => !stream.closed && stream.url === '/api/system/updates/events').at(-1).onerror());
   await page.getByRole('heading', { name: '进入工作台', exact: true }).waitFor();

@@ -26,7 +26,7 @@ import uuid
 
 from registry import BY_ID, MODULES, inventory, text_file, trusted
 from releases import Network, Releases, ReleaseError, digest, valid_github_token
-from progress import get_progress
+from progress import get_progress, get_stage_timings
 
 
 STATE_DIR = Path('/var/lib/project-aggregation-updater')
@@ -275,15 +275,20 @@ class Coordinator:
                 'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']],
                 'githubToken': {'configured': bool(self.read_token())}, 'deploymentModes': list(DEPLOYMENT_MODES)}
         if result['job']:
-            # Keep samples out of state.json and never forward them after the
-            # task finishes. Each accepted job already owns a private directory.
-            job = result['job'] = {key: value for key, value in result['job'].items() if key != 'progress'}
+            # Both display files stay outside authoritative state. Terminal
+            # timings also work when an older worker ran the new installer.
+            job = result['job'] = {key: value for key, value in result['job'].items()
+                                  if key not in ('progress', 'stageTimings')}
             job.setdefault('deployMode', 'source')
             if job['status'] == 'running' and TOKEN.fullmatch(job['id']):
                 progress = get_progress(self.jobs / job['id'] / 'progress.json',
                                         timestamp(job['startedAt']) * 1000, self.clock())
                 if progress is not None:
                     job['progress'] = progress
+            elif job['status'] in ('succeeded', 'failed', 'interrupted') and TOKEN.fullmatch(job['id']):
+                timings = get_stage_timings(self.jobs / job['id'] / 'stage-timings.json')
+                if timings is not None:
+                    job['stageTimings'] = timings
         remaining = state.get('nextCheckNotBefore', 0) - self.clock()
         if result['checkError'] and remaining > 0:
             result['checkError'] += f'；已暂停重试，约 {math.ceil(remaining / 60)} 分钟后自动重试'

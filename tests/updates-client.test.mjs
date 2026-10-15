@@ -92,6 +92,33 @@ test('progress detail accepts only the matching fixed stage and never breaks aut
   }
 });
 
+test('terminal stage timings are optional, bounded and retain only measured public fields', () => {
+  const entries = [{ stage: 'download', detail: 'source-receive', durationMs: 1234.5 },
+    { stage: 'build', detail: 'build-workbench', durationMs: 0 }, { stage: 'finalize', durationMs: null }];
+  const value = { ...state(), job: { id: 'timed-job', status: 'succeeded', startedAt: now, finishedAt: now,
+    activeModule: null, message: '已完成', steps: [], stageTimings: { entries } } };
+  for (const status of ['succeeded', 'failed', 'interrupted']) {
+    value.job.status = status;
+    value.job.stageTimings = { entries: entries.map(entry => ({ ...entry, log: 'private-output', path: '/private/path' })), bootId: 'private-boot' };
+    assert.deepEqual(publicUpdateState(value).job.stageTimings, { entries });
+  }
+  for (const status of ['queued', 'running']) {
+    value.job.status = status;
+    assert.equal(publicUpdateState(value).job.stageTimings, undefined);
+  }
+  value.job.status = 'succeeded';
+  for (const stageTimings of [undefined, null, [], {}, { entries: [] }, { entries: new Array(33).fill(entries[0]) },
+    { entries: [entries[0], entries[0]] }, { entries: [null] },
+    ...[undefined, -1, Infinity, NaN, true, '1', Number.MAX_SAFE_INTEGER + 1].map(durationMs => ({ entries: [{ ...entries[0], durationMs }] })),
+    ...['unknown', {}, null, '__proto__'].map(stage => ({ entries: [{ stage, durationMs: 10 }] })),
+    ...['build-workbench', 'private', {}, null].map(detail => ({ entries: [{ ...entries[0], detail }] }))]) {
+    value.job.stageTimings = stageTimings;
+    const result = publicUpdateState(value);
+    assert.equal(result.job.status, 'succeeded', 'bad display data cannot affect the update result');
+    assert.equal(result.job.stageTimings, undefined);
+  }
+});
+
 test('deployment selection validates modes and preserves the legacy source request', async t => {
   const calls = [];
   const client = await fixture(t, async (req, res) => {
