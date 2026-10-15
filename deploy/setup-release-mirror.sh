@@ -27,8 +27,9 @@ fi
 mkdir -p "$CACHE_DIR"
 chown www-data:www-data "$CACHE_DIR"
 
-# 3. 配置 Nginx 缓存代理
-cat > "$NGINX_CONF" <<'NGINX_CONFIG'
+# 3. 配置全局缓存和限速（放在 /etc/nginx/conf.d/）
+cat > /etc/nginx/conf.d/github-releases-cache.conf <<'NGINX_GLOBAL'
+# GitHub Releases 缓存配置
 proxy_cache_path /var/cache/github-releases
                  levels=1:2
                  keys_zone=github_releases:100m
@@ -36,12 +37,17 @@ proxy_cache_path /var/cache/github-releases
                  inactive=90d
                  use_temp_path=off;
 
+# 限速保护
+limit_req_zone $binary_remote_addr zone=download:10m rate=10r/s;
+NGINX_GLOBAL
+
+# 4. 配置代理服务器（放在 sites-available）
+cat > "$NGINX_CONF" <<'NGINX_CONFIG'
 server {
     listen 80;
     server_name DOMAIN_PLACEHOLDER;
 
-    # 限速保护
-    limit_req_zone $binary_remote_addr zone=download:10m rate=10r/s;
+    # 应用限速规则
     limit_req zone=download burst=20 nodelay;
 
     location / {
