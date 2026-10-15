@@ -180,6 +180,8 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
                 self.assertTrue(self.market.uses_capacity_relay(symbol))
                 detail = self.market.listing_detail(symbol)
                 self.assertEqual((detail["max_leverage"], detail["capacity"]), (20, "2000"))
+                self.assertEqual(detail["tier_capacities"], {"10": "3000", "20": "2000", "50": None})
+                self.assertIsNone(detail["tier_error"])
                 self.assertAlmostEqual(detail["checked_at"], self.started["oi"], places=5)
                 self.market.refresh_public_brackets(symbol)
                 self.assertEqual(self.market.capacities(symbol, [5, 7, 10]),
@@ -187,6 +189,7 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
         self.assertEqual({(request.url.params["kind"], request.url.params["symbol"]) for request in self.relay_requests},
                          {(kind, symbol) for kind in ("oi", "brackets") for symbol in ("XAUUSD1", "XAGUSD1")})
         self.assertEqual(self.aster_requests, [])
+        self.assertEqual(len(self.relay_requests), 4)
         self.assertEqual(self.budget.snapshot()["used"], 0)
 
     def test_other_symbols_read_capacity_and_leverage_locally_with_shared_budget(self):
@@ -195,6 +198,8 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
                 self.assertFalse(self.market.uses_capacity_relay(symbol))
                 detail = self.market.listing_detail(symbol)
                 self.assertEqual((detail["max_leverage"], detail["capacity"]), (20, "2000"))
+                self.assertEqual(detail["tier_capacities"], {"10": "3000", "20": "2000", "50": None})
+                self.assertEqual((detail["tier_checked_at"], detail["tier_brackets_checked_at"]), (self.wall, self.wall))
                 self.assertEqual((detail["checked_at"], detail["brackets_checked_at"]), (self.wall, self.wall))
                 self.assertEqual(self.budget.snapshot()["used"], 2 * index)
                 if symbol in ("SPCXUSD1", "CLUSD1"):
@@ -204,6 +209,25 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
                 self.assertEqual(self.market.listing_detail(symbol), detail)
                 self.assertEqual(len(self.aster_requests), 2 * index)
         self.assertEqual(self.relay_requests, [])
+
+    def test_display_tiers_keep_both_remote_source_times_when_maximum_is_missing(self):
+        self.rows["brackets"]["data"]["brackets"][0]["riskBrackets"][0]["maxOpenPosLeverage"] = 100
+        self.rows["oi"]["data"]["leverageOiRemainingMap"]["50"] = "0"
+        self.started.update(oi=self.wall - .25, brackets=self.wall - 45)
+        first = self.market.listing_detail(SYMBOL)
+        self.assertEqual(first["tier_capacities"], {"10": "3000", "20": "2000", "50": "0"})
+        self.assertTrue(first["error"])
+        self.assertIsNone(first["capacity"])
+        self.assertIsNone(first["tier_error"])
+        self.assertAlmostEqual(first["tier_checked_at"], self.started["oi"], places=5)
+        self.assertAlmostEqual(first["tier_brackets_checked_at"], self.started["brackets"], places=5)
+        self.advance(.1)
+        current = self.market.listing_detail(SYMBOL)
+        self.assertEqual(current["tier_checked_at"], first["tier_checked_at"])
+        self.assertEqual(current["tier_brackets_checked_at"], first["tier_brackets_checked_at"])
+        self.assertEqual(len(self.relay_requests), 2)
+        self.assertEqual(self.aster_requests, [])
+        self.assertEqual(self.budget.snapshot()["used"], 0)
 
     def test_relay_offline_cannot_disable_other_symbols_or_fall_back_for_metals(self):
         self.failure = 503

@@ -29,6 +29,7 @@ import {
   MonitorChannels,
   MonitorSettings,
 } from '@/components/monitor-settings';
+import { MonitorCapacityTable } from '@/components/monitor-capacity-table';
 
 const exchangeStatuses: Record<string, string> = {
   TRADING: '交易中',
@@ -131,6 +132,13 @@ export function SymbolMonitorCenter({
   const eventChannel = notificationChannel(state?.notification, 'event');
   return (
     <div className="monitoring-workspace symbol-monitor-center">
+      <MonitorCapacityTable
+        monitoring={monitoring}
+        listings={listings}
+        now={now}
+        demo={demo}
+        connectionError={connectionError}
+      />
       <MonitorSettings
         monitoring={monitoring}
         notification={state?.notification}

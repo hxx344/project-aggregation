@@ -131,9 +131,15 @@ class ListingMonitor:
             return 1
         try:
             detail = self.market.listing_detail(symbol)
+            if detail.get("tier_error"):
+                # Overall read failure must not erase or renew the last valid
+                # display sample; per-tier missing values instead replace it.
+                detail = {key: value for key, value in detail.items()
+                          if key not in ("tier_capacities", "tier_checked_at", "tier_brackets_checked_at")}
             row.update(detail)
         except Exception:
             row["error"] = "公开杠杆或额度暂不可用，等待重试"
+            row["tier_error"] = "公开档位额度暂不可用，保留上次结果并等待重试"
         # Failure retains the old sample and its timestamp. Only a successful
         # exact-tier read can complete a previously incomplete notification.
         phase = row.get("notification_phase")

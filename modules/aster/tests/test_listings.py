@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import httpx
 import monitor
 from trading.engine import Engine
-from trading.exchange import API, MarketData
+from trading.exchange import API, MarketData, RateBudget
 from trading.listings import ListingMonitor, maximum_leverage, parse_symbols
 from trading.models import SYMBOLS, TradingError
 from trading.store import Store
@@ -92,6 +92,88 @@ class ListingParsingTests(unittest.TestCase):
             self.assertIsNone(result["capacity"])
             self.assertIsNone(result["checked_at"])
             self.assertTrue(result["error"])
+
+    def test_display_tiers_use_exact_remaining_and_own_bracket_caps_with_two_requests(self):
+        caps = brackets()
+        caps["data"]["brackets"][0]["riskBrackets"] = [
+            {"minOpenPosLeverage": 1, "maxOpenPosLeverage": 10, "bracketNotionalCap": "100"},
+            {"minOpenPosLeverage": 11, "maxOpenPosLeverage": 20, "bracketNotionalCap": "80"},
+            {"minOpenPosLeverage": 21, "maxOpenPosLeverage": 50, "bracketNotionalCap": "900000000000000000"},
+            {"minOpenPosLeverage": 51, "maxOpenPosLeverage": 200, "bracketNotionalCap": "20"},
+        ]
+        remaining = oi(remaining="25")
+        precise = "123456789.123456789123456789"
+        remaining["data"]["leverageOiRemainingMap"].update({"10": "150", "20": "0", "50": precise})
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=caps if request.method == "POST" else remaining)
+        api = API(transport=httpx.MockTransport(handler), budget=RateBudget())
+        self.addCleanup(api.close)
+        result = MarketData(api).listing_detail("BTCUSD1")
+        self.assertEqual(result["tier_capacities"], {"10": "100", "20": "0", "50": precise})
+        self.assertEqual(result["capacity"], "20")
+        self.assertIsNone(result["tier_error"])
+        self.assertEqual(result["tier_checked_at"], result["checked_at"])
+        self.assertEqual(result["tier_brackets_checked_at"], result["brackets_checked_at"])
+        self.assertEqual([request.method for request in requests], ["POST", "GET"])
+        self.assertEqual(api.budget.snapshot()["used"], 2)
+
+    def test_missing_maximum_oi_does_not_block_display_tiers(self):
+        remaining = oi()
+        remaining["data"]["leverageOiRemainingMap"] = {"10": "5", "20": "6", "50": "7"}
+        api = API(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json=brackets() if request.method == "POST" else remaining)), budget=RateBudget())
+        self.addCleanup(api.close)
+        result = MarketData(api).listing_detail("BTCUSD1")
+        self.assertEqual(result["tier_capacities"], {"10": "5", "20": "6", "50": "7"})
+        self.assertIsNone(result["capacity"])
+        self.assertIsNone(result["checked_at"])
+        self.assertTrue(result["error"])
+        self.assertIsNone(result["tier_error"])
+        self.assertIsInstance(result["tier_checked_at"], float)
+
+    def test_missing_invalid_unsupported_or_ambiguous_display_tier_is_null(self):
+        for value in (None, True, "-1", "NaN", "Infinity", "1e101", "bad"):
+            with self.subTest(value=value):
+                remaining = oi(remaining="1")
+                remaining["data"]["leverageOiRemainingMap"].update({"10": value, "20": "0", "49": "99"})
+                api = API(transport=httpx.MockTransport(lambda request: httpx.Response(
+                    200, json=brackets() if request.method == "POST" else remaining)), budget=RateBudget())
+                self.addCleanup(api.close)
+                result = MarketData(api).listing_detail("BTCUSD1")
+                self.assertEqual(result["tier_capacities"], {"10": None, "20": "0", "50": None})
+                self.assertIsNone(result["tier_error"])
+        remaining = oi(leverage="20", remaining="7")
+        remaining["data"]["leverageOiRemainingMap"].update({"10": "5", "50": "9"})
+        api = API(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json=brackets(maximum=20) if request.method == "POST" else remaining)), budget=RateBudget())
+        self.addCleanup(api.close)
+        self.assertEqual(MarketData(api).listing_detail("BTCUSD1")["tier_capacities"],
+                         {"10": "5", "20": "7", "50": None})
+        ambiguous = brackets()
+        ambiguous["data"]["brackets"][0]["riskBrackets"].append(
+            {"minOpenPosLeverage": 20, "maxOpenPosLeverage": 20, "bracketNotionalCap": "5"})
+        api = API(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json=ambiguous if request.method == "POST" else remaining)), budget=RateBudget())
+        self.addCleanup(api.close)
+        self.assertEqual(MarketData(api).listing_detail("BTCUSD1")["tier_capacities"],
+                         {"10": "5", "20": None, "50": "9"})
+
+    def test_overall_oi_failure_returns_no_new_display_sample(self):
+        invalid_map = oi()
+        invalid_map["data"]["leverageOiRemainingMap"] = []
+        for response in (httpx.Response(503), httpx.Response(200, json=oi("ETHUSD1")),
+                         httpx.Response(200, json=invalid_map), httpx.Response(200, json={"success": False})):
+            with self.subTest(response=response):
+                api = API(transport=httpx.MockTransport(lambda request: httpx.Response(
+                    200, json=brackets()) if request.method == "POST" else response), budget=RateBudget())
+                self.addCleanup(api.close)
+                result = MarketData(api).listing_detail("BTCUSD1")
+                self.assertTrue(result["tier_error"])
+                self.assertTrue(result["error"])
+                for key in ("tier_capacities", "tier_checked_at", "tier_brackets_checked_at"):
+                    self.assertNotIn(key, result)
 
     def test_public_rate_limit_sets_shared_backoff(self):
         api = API(transport=httpx.MockTransport(lambda _: httpx.Response(429, headers={"Retry-After": "240"})))
@@ -196,6 +278,60 @@ class ListingMonitorTests(unittest.TestCase):
             self.monitor.poll()
         self.assertEqual(self.market.listing_symbols.call_count, 1)
         self.assertEqual(self.market.listing_detail.call_count, 1)
+
+    def test_failed_display_sample_preserves_values_and_both_source_timestamps(self):
+        values = {"10": "12", "20": "0", "50": "3.123456789"}
+        self.market.listing_detail.return_value = detail(tier_capacities=values, tier_checked_at=100,
+                                                        tier_brackets_checked_at=90, tier_error=None)
+        self.poll()
+        self.market.listing_detail.return_value = detail(None, error="OI unavailable", tier_error="unavailable",
+            tier_capacities=None, tier_checked_at=None, tier_brackets_checked_at=200)
+        current = self.poll()["rows"]["BTCUSD1"]
+        self.assertEqual(current["tier_capacities"], values)
+        self.assertEqual((current["tier_checked_at"], current["tier_brackets_checked_at"]), (100, 90))
+        self.assertTrue(current["tier_error"])
+        self.market.listing_detail.side_effect = TradingError("untrusted upstream details")
+        current = self.poll()["rows"]["BTCUSD1"]
+        self.assertEqual(current["tier_capacities"], values)
+        self.assertEqual((current["tier_checked_at"], current["tier_brackets_checked_at"]), (100, 90))
+        self.assertNotIn("untrusted", current["tier_error"])
+        self.market.listing_detail.side_effect = None
+        self.market.listing_detail.return_value = detail(None, error="max missing", tier_error=None,
+            tier_capacities={"10": None, "20": "8", "50": None}, tier_checked_at=300, tier_brackets_checked_at=280)
+        current = self.poll()["rows"]["BTCUSD1"]
+        self.assertEqual(current["tier_capacities"], {"10": None, "20": "8", "50": None})
+        self.assertEqual((current["tier_checked_at"], current["tier_brackets_checked_at"]), (300, 280))
+        self.assertIsNone(current["tier_error"])
+        self.assertTrue(current["error"])
+
+    def test_first_display_failure_does_not_create_zero_values_or_timestamps(self):
+        self.market.listing_detail.side_effect = TradingError("read failed")
+        row = self.poll()["rows"]["BTCUSD1"]
+        self.assertTrue(row["tier_error"])
+        for key in ("tier_capacities", "tier_checked_at", "tier_brackets_checked_at"):
+            self.assertIsNone(row.get(key))
+
+    def test_display_refresh_waits_full_sixty_seconds_and_disabled_symbols_do_not_read(self):
+        clock = [1000.0]
+        with patch("trading.listings.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("trading.listings.time.time", side_effect=lambda: clock[0]):
+            self.monitor.poll()
+            self.assertEqual(self.market.listing_detail.call_count, 1)
+            clock[0] = 1059.9
+            self.monitor.poll()
+            self.assertEqual(self.market.listing_detail.call_count, 1)
+            clock[0] = 1060
+            self.monitor.poll()
+            self.assertEqual(self.market.listing_detail.call_count, 2)
+            self.store.edit_monitoring({"monitor_enabled": False}, symbol="BTCUSD1")
+            clock[0] = 1120
+            self.monitor.poll()
+            self.assertEqual(self.market.listing_detail.call_count, 2)
+            self.store.edit_monitoring({"monitor_enabled": True}, symbol="BTCUSD1")
+            self.store.edit_monitoring({"monitoring_enabled": False})
+            clock[0] = 1180
+            self.monitor.poll()
+            self.assertEqual(self.market.listing_detail.call_count, 2)
 
     def test_alert_and_state_rollback_together(self):
         before = self.poll()

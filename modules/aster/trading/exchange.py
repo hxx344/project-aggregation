@@ -897,8 +897,24 @@ class MarketData:
                   "capacity": None, "remaining": None, "checked_at": None, "error": None}
         try:
             _, checked_at, oi = self._public_sample(monitor.OI_PATH, symbol, priority=False)
-            capacity, remaining, cap = monitor.extract_capacity(oi, brackets, symbol, leverage)
         except (monitor.MonitorError, ExchangeError):
+            detail["error"] = "最大杠杆对应的公开额度暂不可用，等待重试"
+            detail["tier_error"] = "公开档位额度暂不可用，保留上次结果并等待重试"
+            return detail
+        # Display tiers share the exact same source samples as the maximum-tier
+        # notification. An unavailable tier is unknown, never a substitute zero.
+        tier_capacities = {}
+        for tier in (10, 20, 50):
+            try:
+                capacity, _, _ = monitor.extract_capacity(oi, brackets, symbol, tier)
+                tier_capacities[str(tier)] = str(capacity)
+            except monitor.MonitorError:
+                tier_capacities[str(tier)] = None
+        detail.update(tier_capacities=tier_capacities, tier_checked_at=checked_at,
+                      tier_brackets_checked_at=brackets_checked_at, tier_error=None)
+        try:
+            capacity, remaining, cap = monitor.extract_capacity(oi, brackets, symbol, leverage)
+        except monitor.MonitorError:
             detail["error"] = "最大杠杆对应的公开额度暂不可用，等待重试"
             return detail
         detail.update(capacity=str(capacity), remaining=str(remaining), checked_at=checked_at)

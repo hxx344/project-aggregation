@@ -115,6 +115,10 @@ export type Listing = {
   checked_at?: number | null;
   brackets_checked_at?: number;
   error?: string | null;
+  tier_capacities?: Partial<Record<'10' | '20' | '50', string | null>>;
+  tier_checked_at?: number | null;
+  tier_brackets_checked_at?: number | null;
+  tier_error?: string | null;
 };
 export type Listings = {
   enabled: boolean;

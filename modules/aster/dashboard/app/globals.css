@@ -257,6 +257,72 @@
 .symbol-monitor-center {
   min-width: 0;
 }
+.monitor-tier-panel {
+  min-width: 0;
+}
+.monitor-tier-panel > .section-head {
+  flex-wrap: wrap;
+}
+.monitor-tier-table {
+  min-width: 720px;
+}
+.monitor-tier-table td {
+  vertical-align: top;
+  padding-top: 18px;
+  padding-bottom: 18px;
+}
+.monitor-tier-table .number {
+  min-width: 108px;
+  padding-right: 20px;
+}
+.monitor-tier-sample {
+  min-width: 235px;
+}
+.monitor-tier-state {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 7px;
+  font-size: 12px;
+}
+.monitor-tier-state .symbol-status {
+  margin-top: 0;
+}
+.monitor-tier-sample small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.monitor-tier-sample small.amber {
+  color: var(--warning);
+}
+.monitor-tier-error {
+  max-width: 300px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.monitor-tier-unavailable {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.monitor-tier-notice,
+.monitor-tier-empty,
+.monitor-tier-footnote {
+  margin: 0;
+  padding: 0 22px 18px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.monitor-tier-empty,
+.monitor-tier-footnote {
+  color: var(--muted-foreground);
+}
+.monitor-tier-footnote {
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
 .monitor-options,
 .monitor-help {
   border-top: 1px solid var(--border);
