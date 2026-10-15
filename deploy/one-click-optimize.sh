@@ -60,8 +60,8 @@ test_download_speed() {
   echo "正在获取最新发布信息..."
 
   START_MANIFEST=$(date +%s.%N)
-  if ! curl --fail --silent --location --proto '=https' --tlsv1.2 \
-    --connect-timeout 30 --max-time 60 \
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 3 --connect-timeout 15 --max-time 90 --max-filesize 1048576 \
     "https://github.com/$REPOSITORY/releases/latest/download/release-manifest.json" \
     -o "$MANIFEST"; then
     print_error "无法获取发布清单"
