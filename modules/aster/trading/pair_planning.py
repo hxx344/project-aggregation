@@ -12,7 +12,7 @@ SIDES = (("long", "LONG"), ("short", "SHORT"))
 
 
 class PairPositionError(TradingError):
-    """An unowned or externally changed position cannot authorize a new order."""
+    """Invalid or externally changed managed positions cannot authorize orders."""
 
 
 class PairRecoveryConflict(TradingError):
@@ -108,10 +108,7 @@ def positions(snapshots, symbol, *, equal_leverage=True):
         if not snapshot.can_trade or snapshot.open_orders:
             raise PairPositionError("子账户没有交易权限或仍有外部挂单")
         long, short = snapshot.pair(symbol)
-        selected, opposite = (long, short) if side == "LONG" else (short, long)
-        if opposite.qty or any(p.qty and p.symbol != symbol for p in snapshot.positions):
-            raise PairPositionError(f"{key} 子账户存在非本组方向或非 {symbol} 仓位，请先核对")
-        result[side] = selected
+        result[side] = long if side == "LONG" else short
     if equal_leverage and result["LONG"].leverage != result["SHORT"].leverage:
         raise PairPositionError(f"两个子账户的 {symbol} 实际杠杆不一致（做多账户 {result['LONG'].leverage}x、做空账户 {result['SHORT'].leverage}x），停止新交易，请核对")
     return result
@@ -157,25 +154,31 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
     # Capture validated exact values once, rather than parsing them in each search step.
     budgets = []
     for key, side in SIDES:
-        snap, pos = snapshots[key], held[side]
+        snap = snapshots[key]
         fee = Fraction(positive(snap.fees.get(symbol), True))
         if fee > 1:
             raise TradingError("子账户手续费率无效")
-        old_qty, old_mark = Fraction(pos.qty), Fraction(pos.mark)
-        pnl_change = old_qty * (mark - old_mark) * (1 if side == "LONG" else -1)
-        loss = max(Fraction(0), -pnl_change)
+        holdings = snap.pair(symbol)
+        # Existing opposite positions share this symbol's cap and respond to
+        # the same mark. Do not net their exposure or fund additions with an
+        # unconfirmed gain on the other direction.
+        loss = sum((max(Fraction(0), -Fraction(p.qty) * (mark - Fraction(p.mark)) *
+                       (1 if p.side == "LONG" else -1)) for p in holdings), Fraction(0))
+        valued = tuple((Fraction(p.qty), Fraction(p.mark), p.occupied_margin_exact) for p in holdings)
         budget = None if daily_remaining is None else daily_remaining.get(key)
-        budgets.append((side, snap, pos, fee, loss, current_cap(snap, symbol, leverage),
+        budgets.append((side, snap, valued, fee, loss, current_cap(snap, symbol, leverage),
                         None if budget is None else Fraction(positive(budget, True))))
 
     def allowed(qty, buy, sell, high_price):
-        for side, snap, pos, fee, loss, cap, daily in budgets:
+        for side, snap, valued, fee, loss, cap, daily in budgets:
             amount = buy if side == "LONG" else sell
             if daily is not None and 2 * amount > daily:
                 return False
-            high = max(high_price, Fraction(pos.mark))
-            occupied_delta = max(Fraction(0), Fraction(pos.qty) * high / leverage - pos.occupied_margin_exact)
-            if (Fraction(pos.qty) + qty) * high > cap:
+            high = max(high_price, *(old_mark for _, old_mark, _ in valued))
+            occupied_delta = sum((max(Fraction(0), old_qty * max(high_price, old_mark) / leverage - occupied)
+                                  for old_qty, old_mark, occupied in valued), Fraction(0))
+            gross = sum((old_qty * max(high_price, old_mark) for old_qty, old_mark, _ in valued), Fraction(0))
+            if gross + qty * high > cap:
                 return False
             fill_loss = max(Fraction(0), buy - qty * mark) if side == "LONG" else max(Fraction(0), qty * mark - sell)
             cost = amount * fee + fill_loss
@@ -190,6 +193,9 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
 
 def ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target):
     """Use shared public capacity and each member's own holding limit."""
+    symbol = pair["symbol"]
+    if any(snapshots[key].pair(symbol)[1 if side == "LONG" else 0].qty for key, side in SIDES):
+        return f"{symbol} 存在非本组方向仓位，保留当前杠杆；自动升档会同时改变该仓位杠杆"
     threshold = Fraction(dec(pair["ordinary"]["threshold"]))
     if target not in capacities:
         return "缺少公开额度数据"

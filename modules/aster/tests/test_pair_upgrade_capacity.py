@@ -84,6 +84,21 @@ class PairUpgradePlanningTests(TestCase):
         self.assertEqual(ordinary_upgrade(self.pair, snapshots, self.book,
                                          {20: dec("10000.000000000000000000000001")}), 20)
 
+    def test_other_symbol_holdings_do_not_block_this_symbols_upgrade(self):
+        snapshots = self.snapshots()
+        for snap in snapshots.values():
+            snap.positions = [replace(p, qty=dec("5")) if p.symbol == "XAGUSD1" else p
+                              for p in snap.positions]
+        self.assertEqual(ordinary_upgrade(self.pair, snapshots, self.book, {20: dec("50000")}), 20)
+
+    def test_opposite_holdings_keep_their_existing_symbol_leverage(self):
+        for key, opposite in (("long", "SHORT"), ("short", "LONG")):
+            with self.subTest(account=key):
+                snapshots = self.snapshots()
+                snapshots[key].positions = [replace(p, qty=dec("1")) if p.symbol == SYMBOL and p.side == opposite else p
+                                            for p in snapshots[key].positions]
+                self.assertIsNone(ordinary_upgrade(self.pair, snapshots, self.book, {20: dec("50000")}))
+
     def test_missing_or_below_threshold_capacity_cannot_authorize_upgrade(self):
         for capacities in ({}, {20: dec("9999")}, {20: dec("10000")}):
             with self.subTest(capacities=capacities):
@@ -171,6 +186,25 @@ class PairUpgradeExecutionTests(TestCase):
         for broker in self.brokers.values():
             self.assertEqual(broker.state["leverages"][SYMBOL], 10)
             self.assertEqual(len(broker.state["orders"]), 1)
+
+    def test_opposite_position_skips_upgrade_but_allows_ordinary_open_at_current_leverage(self):
+        broker = self.brokers["long"]
+        broker.state["positions"][SYMBOL + ":SHORT"].update(qty="1", entry=str(self.market.book(SYMBOL).mark))
+        external = deepcopy(broker.state["positions"][SYMBOL + ":SHORT"])
+        broker.save()
+        captured, saving = self.capture_pending()
+        with saving, ExitStack() as stack:
+            changes = [stack.enter_context(patch.object(item, "set_leverage", wraps=item.set_leverage))
+                       for item in self.brokers.values()]
+            state = self.tick()
+        self.assertEqual({pending["kind"] for pending in captured}, {"ordinary"})
+        self.assertIsNone(state["pending"], state)
+        self.assertGreater(dec(state["owned"]["LONG"]), 3)
+        self.assertEqual(broker.state["positions"][SYMBOL + ":SHORT"], external)
+        for change in changes:
+            change.assert_not_called()
+        for item in self.brokers.values():
+            self.assertEqual(item.state["leverages"][SYMBOL], 10)
 
     def test_execution_rechecks_capacity_before_creating_leverage_pending(self):
         self.publish("20000")
@@ -296,6 +330,31 @@ class PairUpgradeExecutionTests(TestCase):
             self.assertEqual([(method, path) for method, path, _ in broker.api.calls if method == "POST"],
                              [("POST", "/fapi/v3/leverage")])
             self.assertEqual(self.paper[key].state["leverages"][SYMBOL], 20)
+
+    def test_live_final_read_of_new_opposite_position_prevents_leverage_post(self):
+        self.live_brokers()
+        self.state["identities"] = self.trader._members(self.pair)[2]
+        snapshots, guards = self.trader._read(self.brokers, SYMBOL, fresh_modes=True)
+        for key, broker in self.brokers.items():
+            broker.leverage_snapshot = (snapshots[key], time.monotonic() - 2)
+        captured, saving = self.capture_pending()
+        with saving, ExitStack() as stack:
+            for key, broker in self.brokers.items():
+                original = broker.snapshot
+
+                def snapshot(*args, _read=original, _key=key, **kwargs):
+                    current = _read(*args, **kwargs)
+                    current.positions = [replace(p, qty=dec("0.1")) if p.symbol == SYMBOL and p.side != _key.upper() else p
+                                         for p in current.positions]
+                    return current
+
+                stack.enter_context(patch.object(broker, "snapshot", side_effect=snapshot))
+            self.trader._leverage(self.pair, self.state, self.brokers, snapshots, guards, 20)
+        self.assertTrue(all(not any(method == "POST" for method, _, _ in broker.api.calls)
+                            for broker in self.brokers.values()))
+        self.assertTrue(all(row.get("rejected") and "非本组方向仓位" in row["reason"]
+                            for row in captured[-1]["results"].values()))
+        self.assertIsNone(self.state["pending"], self.state)
 
     def test_one_live_upgrade_sent_before_capacity_loss_keeps_pending_without_replay(self):
         for outcome in ("unknown", "success"):

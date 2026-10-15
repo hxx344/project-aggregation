@@ -14,6 +14,7 @@ from tests.helpers import seed_cycle_capacity
 from tests.test_cycle_account_snapshot import ACCOUNT, RISK, SYMBOL, risk_row
 from trading.models import TradingError, dec
 from trading.pair_execution import PairTrader, empty_progress
+from trading.pair_planning import require_quantities
 from trading.store import Store
 
 
@@ -152,18 +153,38 @@ class PairPausedAdoptionTests(unittest.TestCase):
                 self.f.store.put("pair_margin:gold", margin)
                 self.assert_rejected_unchanged()
 
-    def test_opposite_and_other_symbol_positions_are_not_adopted(self):
+    def test_opposite_and_other_symbol_positions_remain_outside_adopted_baseline(self):
         self.seed_paused()
         self.positions("0.4", "0.6")
         broker = self.f.broker
         for symbol, side in ((SYMBOL, "SHORT"), ("SPCXUSD1", "LONG")):
-            with self.subTest(symbol=symbol, side=side):
-                row = broker.state["positions"][symbol + ":" + side]
-                row.update(qty="0.1", entry=str(self.f.market.book(symbol).mark))
-                broker.save()
-                self.assert_rejected_unchanged()
-                broker.state["positions"][symbol + ":" + side]["qty"] = "0"
-                broker.save()
+            broker.state["positions"][symbol + ":" + side].update(
+                qty="0.1", entry=str(self.f.market.book(symbol).mark))
+        broker.save()
+        holdings = deepcopy(broker.state["positions"])
+        with self.no_market_writes():
+            self.engine.pairs.enable("gold", True)
+        state = self.f.store.get("pair_runtime:gold")
+        self.assertEqual(state["owned"], {"LONG": "0.4", "SHORT": "0.6"})
+        self.assertEqual(state["progress"]["baseline"], state["owned"])
+        self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
+        self.assertEqual(broker.state["positions"], holdings)
+
+        # Running ownership checks permit external holdings to evolve without
+        # silently accepting a change to this group's selected quantities.
+        broker.state["positions"][SYMBOL + ":SHORT"]["qty"] = "0.2"
+        broker.state["positions"]["SPCXUSD1:LONG"]["qty"] = "0.3"
+        broker.save()
+        holdings = deepcopy(broker.state["positions"])
+        with self.no_market_writes():
+            snapshots, _ = self.engine.pairs._read_members(self.f.store.pair("gold"))
+            require_quantities(snapshots, SYMBOL, state["owned"])
+        self.assertEqual(self.f.store.get("pair_runtime:gold")["owned"], state["owned"])
+        self.assertEqual(broker.state["positions"], holdings)
+        self.positions("0.5", "0.6")
+        with self.no_market_writes(), self.assertRaisesRegex(TradingError, "实际仓位与配对组记录不一致"):
+            self.engine.pairs._read_members(self.f.store.pair("gold"))
+        self.assertEqual(self.f.store.get("pair_runtime:gold")["owned"], state["owned"])
 
     def test_modes_permissions_equity_orders_and_leverage_remain_required(self):
         self.seed_paused()
@@ -184,7 +205,7 @@ class PairPausedAdoptionTests(unittest.TestCase):
             with self.subTest(requirement=name), patch.object(broker, "snapshot", side_effect=lambda *args, **kwargs: transform(original(*args, **kwargs))):
                 self.assert_rejected_unchanged()
 
-    def test_creation_deletion_and_flat_reconciliation_keep_strict_positions(self):
+    def test_creation_deletion_and_flat_reconciliation_require_selected_legs_flat(self):
         self.positions("0.1", "0")
         with self.assertRaises(TradingError):
             self.create()

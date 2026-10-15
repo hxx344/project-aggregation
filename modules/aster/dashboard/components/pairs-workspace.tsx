@@ -216,7 +216,7 @@ function CreatePair({
         <DialogHeader>
           <DialogTitle>新建配对组</DialogTitle>
           <DialogDescription>
-            选择同一主账户下两个已暂停、完全空仓且无挂单的子账户。创建后需单独启动。
+            选择同一主账户下两个已暂停的子账户。其他标的和非本组方向的仓位可保留，创建后需单独启动。
           </DialogDescription>
         </DialogHeader>
         {error || connectionError ? (
@@ -420,10 +420,10 @@ function PairDetail({
             <Button
               variant="outline"
               disabled={busy || offline || Boolean(configurationLock)}
-              title="手动平仓后核对两侧完全空仓，并清除本组底仓记录"
+              title="手动平仓后核对本组指定方向为空，并清除本组底仓记录"
               onClick={async () => {
                 if (await action(`/api/pairs/${pair.id}/reconcile-flat`)) {
-                  setNotice('两侧完全空仓已核实，本组底仓记录已清除。');
+                  setNotice('本组仓位为空已核实，底仓记录已清除。');
                 }
               }}
             >
@@ -513,7 +513,7 @@ function PairDetail({
               <dd className={net !== null && Number(net) !== 0 ? 'amber' : ''}>
                 {net ?? '—'}
               </dd>
-              <small>两子账户 {symbol} 实际仓位；缺失不按零计算</small>
+              <small>本组指定方向的实际仓位；缺失不按零计算</small>
             </div>
           ) : null}
           <div>
@@ -798,7 +798,7 @@ function PairDetail({
         <summary>解除配对组</summary>
         <div className="pair-delete-content">
           <p className="muted">
-            删除配对组后释放两个账户，保留账户与历史记录。服务会重新读取两侧账户，确认组已暂停、两侧完全空仓，且无待确认订单或划转后才删除。
+            删除配对组后释放两个账户，保留账户与历史记录。服务会重新读取两侧账户，确认组已暂停、本组仓位为空，且无待确认订单或划转。仍保留旧订单观察时，还需核实两账户完全空仓后才能解除绑定。
           </p>
           {deletionBlock ? <p className="amber">{deletionBlock}</p> : null}
           <Button
@@ -937,7 +937,7 @@ function PairSide({
       <div className="section-head">
         <div>
           <h2>
-            {side === 'long' ? 'A · 只多' : 'B · 只空'}{' '}
+            {side === 'long' ? 'A · 本组做多' : 'B · 本组做空'}{' '}
             <span className="muted">{account?.name ?? '账户待确认'}</span>
           </h2>
           <p className={dataWarning ? 'amber' : 'muted'}>
@@ -997,8 +997,8 @@ function PairSide({
               : '无持仓'}
         </p>
         {reverse ? (
-          <p className="danger">
-            检测到旧反向仓位，须先处理，不能开始配对交易。
+          <p className="muted">
+            本组只管理指定方向；反向仓位保留，存在时不会自动升杠杆。
           </p>
         ) : null}
         {snapshot && !snapshot.mode_checks?.hedge ? (

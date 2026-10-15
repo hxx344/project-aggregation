@@ -318,7 +318,9 @@ export function parsePairBaselineReview(
             'EXPIRED_IN_MATCH',
           ].includes(String(order.status)) &&
             typeof order.executed_qty === 'string' &&
-            /^0(?:\.0+)?$/.test(order.executed_qty))),
+            order.executed_qty.length <= 128 &&
+            order.executed_qty.trim() === order.executed_qty &&
+            /^\d+(?:\.\d+)?$/.test(order.executed_qty))),
     ) ||
     new Set(data.orders.map((order) => order.side)).size !== 2
   )

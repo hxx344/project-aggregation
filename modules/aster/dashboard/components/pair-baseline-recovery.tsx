@@ -145,11 +145,11 @@ export function PairBaselineRecovery({
               {pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol}
             </DialogTitle>
             <DialogDescription>
-              人工归档后手动调整了仓位时，在这里确认当前底仓。采纳后保持暂停，不下单、不减仓、不划转。
+              人工归档后手动调整了仓位时，在这里确认当前底仓。只采纳本组标的在各账户指定方向的仓位，其他仓位保留。采纳后保持暂停，不下单、不减仓、不划转。
             </DialogDescription>
           </DialogHeader>
           <p>
-            将按原编号查询归档订单，并读取最新持仓与挂单。查不到的旧订单仍视为未知并继续跟踪；出现活动订单或迟到成交时，会阻止采纳。
+            将按原编号查询归档订单，并读取最新持仓与挂单。查不到的旧订单仍视为未知并继续跟踪；活动订单、查询异常或本组仓位未核清时，会阻止采纳。
           </p>
           {loading ? <output>正在核对旧订单与当前持仓…</output> : null}
           {error ? (
@@ -184,7 +184,7 @@ export function PairBaselineRecovery({
                   review.orders.filter((order) => order.status === 'UNKNOWN')
                     .length
                 }{' '}
-                笔仍未取得回执，其余均为零成交终态。原始归档记录全部保留。
+                笔仍未取得回执，其余已取得终态回执；底仓按本次读取的实际数量确认。原始归档记录全部保留。
               </p>
               <label className="pair-order-recovery-ack">
                 <input

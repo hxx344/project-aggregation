@@ -35,14 +35,17 @@ class PairMarginCreationTests(TestCase):
         self.assertEqual(first.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
         self.assertEqual(first.state["orders"], {})
 
-    def test_ordinary_and_cycle_creation_still_require_strategy_positions(self):
+    def test_ordinary_and_cycle_creation_allow_other_symbol_holdings(self):
         self.f.broker.state["positions"]["SPCXUSD1:SHORT"].update(qty="1", entry="724.185")
         self.f.broker.save()
         for ordinary in (True, False):
-            with self.subTest(ordinary=ordinary), self.assertRaisesRegex(TradingError, "原有仓位|外部持仓"):
-                self.engine.pairs.create(integration.pair_config(
+            with self.subTest(ordinary=ordinary):
+                pair = self.engine.pairs.create(integration.pair_config(id="ordinary" if ordinary else "cycle",
                     ordinary={"enabled": ordinary}, cycle={"enabled": not ordinary}, margin={"enabled": True}))
-        self.assertIsNone(self.f.store.pair("gold"))
+                self.assertFalse(pair["enabled"])
+                self.assertEqual(self.f.broker.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
+                self.engine.pairs.delete(pair["id"])
+        self.assertEqual(self.f.store.pairs(), [])
 
     def test_new_group_keeps_exclusive_ownership_and_legacy_recovery_guard(self):
         config = integration.pair_config(cycle={"enabled": False}, margin={"enabled": True})
@@ -82,6 +85,16 @@ class PairMarginIndependentTests(TestCase):
                     qty=qty, entry=wire(paper.market.book(symbol).mark))
             paper.state["leverages"]["XAUUSD1"] = 5 if side == "long" else 20
             paper.save()
+
+    def complete_strategy_orders(self):
+        # Strategy starts retain an independent, complete account-order read.
+        originals = {side: broker.api.call for side, broker in self.brokers.items()}
+        stack = ExitStack()
+        for side, broker in self.brokers.items():
+            def call(method, path, *args, side=side, **kwargs):
+                return [] if path == "/fapi/v3/openOrders" else originals[side](method, path, *args, **kwargs)
+            stack.enter_context(patch.object(broker.api, "call", side_effect=call))
+        return stack
 
     def test_start_and_signed_transfer_ignore_positions_market_tiers_and_history(self):
         self.mixed_positions()
@@ -202,21 +215,37 @@ class PairMarginIndependentTests(TestCase):
         self.assertTrue(self.store.get("pair_runtime:gold")["new_history"])
         self.assertEqual(self.sent, [])
 
-    def test_ordinary_and_cycle_start_still_reject_wrong_positions(self):
+    def test_ordinary_and_cycle_start_still_require_matching_selected_leverage(self):
         self.mixed_positions()
         for ordinary in (True, False):
             pair = self.store.pair("gold")
             pair["ordinary"]["enabled"] = ordinary
             pair["cycle"]["enabled"] = not ordinary
             self.pair = self.store.save_pair(pair)
-            # The complete open-order read is required for strategy starts.
-            originals = {side: broker.api.call for side, broker in self.brokers.items()}
-            with ExitStack() as stack:
-                for side, broker in self.brokers.items():
-                    def call(method, path, *args, side=side, **kwargs):
-                        return [] if path == "/fapi/v3/openOrders" else originals[side](method, path, *args, **kwargs)
-                    stack.enter_context(patch.object(broker.api, "call", side_effect=call))
-                with self.subTest(ordinary=ordinary), self.assertRaisesRegex(TradingError, "原有仓位"):
+            with self.complete_strategy_orders():
+                with self.subTest(ordinary=ordinary), self.assertRaisesRegex(TradingError, "实际杠杆必须相同"):
                     self.start()
             self.assertFalse(self.store.pair("gold")["enabled"])
+        self.assert_no_trades()
+
+    def test_ordinary_and_cycle_start_preserve_other_positions_at_common_leverage(self):
+        self.mixed_positions()
+        for paper in self.paper.values():
+            paper.state["leverages"]["XAUUSD1"] = 5
+            paper.save()
+        holdings = {side: deepcopy(paper.state["positions"]) for side, paper in self.paper.items()}
+        for ordinary in (True, False):
+            with self.subTest(ordinary=ordinary):
+                pair = self.store.pair("gold")
+                pair["ordinary"]["enabled"] = ordinary
+                pair["cycle"]["enabled"] = not ordinary
+                self.pair = self.store.save_pair(pair)
+                with self.complete_strategy_orders():
+                    state = self.start()
+                self.assertTrue(self.store.pair("gold")["enabled"])
+                self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+                self.assertEqual(state["progress"]["baseline"], state["owned"])
+                for side, paper in self.paper.items():
+                    self.assertEqual(paper.state["positions"], holdings[side])
+                self.engine.pairs.enable("gold", False)
         self.assert_no_trades()

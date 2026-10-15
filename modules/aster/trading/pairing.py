@@ -134,7 +134,8 @@ class PairManager:
                 raise TradingError("原账户循环仍有新增持仓，请先完成原循环")
         return accounts
 
-    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False, runtime=None):
+    def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False,
+                      runtime=None, full_account_flat=False):
         from .pair_planning import require_runtime_symbols
         if runtime is None:
             runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
@@ -205,13 +206,14 @@ class PairManager:
         owned = runtime.get("owned") or {"LONG": "0", "SHORT": "0"}
         for side, snapshot in zip(("LONG", "SHORT"), snapshots):
             snapshot.require_fresh()
-            for position in snapshot.positions:
-                if position.qty and (position.symbol != symbol or position.side != side):
-                    raise TradingError(f"每个配对子账户只能持有 {symbol} 的指定方向，请先处理原有仓位")
-                if position.symbol == symbol and position.side == side:
-                    expected = dec("0") if flat else dec(owned.get(side, "0"))
-                    if position.qty != expected and (flat or not adopt):
-                        raise TradingError("子账户实际仓位与配对组记录不一致，禁止自动采纳外部持仓")
+            if full_account_flat and any(position.qty for position in snapshot.positions):
+                raise TradingError("解除旧订单观察及账户绑定前，需确认两个子账户完全空仓")
+            # Ownership is scoped to this member's symbol and direction. Keep
+            # every other position in the snapshot for account-wide risk checks.
+            selected = snapshot.pair(symbol)[0 if side == "LONG" else 1]
+            expected = dec("0") if flat else dec(owned.get(side, "0"))
+            if selected.qty != expected and (flat or not adopt):
+                raise TradingError("子账户实际仓位与配对组记录不一致，禁止自动采纳外部持仓")
         if snapshots[0].pair(symbol)[0].leverage != snapshots[1].pair(symbol)[0].leverage:
             raise TradingError(f"两个子账户的 {symbol} 实际杠杆必须相同")
         return dict(zip(("long", "short"), snapshots)), guards
@@ -557,7 +559,8 @@ class PairManager:
                 from .pair_recovery import require_archived_orders_clear
                 evidence = require_archived_orders_clear(self.engine, pair, state=runtime,
                     brokers=brokers, read_only=True, retire_for_deletion=True)
-            _, guards = self._read_members(pair, flat=True, runtime=runtime)
+            _, guards = self._read_members(pair, flat=True, runtime=runtime,
+                full_account_flat=runtime.get("recovery_watch") is not None)
 
             def check_current():
                 for key, account in zip(("long", "short"), accounts):
@@ -576,7 +579,7 @@ class PairManager:
                 self.store.delete_pair(pair_id, expected_pair=pair, expected_runtime=runtime,
                     expected_margin=margin, accounts=accounts, check_current=check_current,
                     watch_evidence=evidence)
-            self.store.event(pair_id, "pair", "配对组已空仓解除绑定，历史执行记录保留")
+            self.store.event(pair_id, "pair", "已核实本组仓位为空并解除绑定，其他仓位及历史执行记录保留")
             self._changed(pair)
 
     def reconcile_flat(self, pair_id):
@@ -594,7 +597,7 @@ class PairManager:
             runtime = {**original, "symbol": pair["symbol"], "owned": zeros.copy(), "pending": None,
                        "progress": {"phase": "waiting_open", "baseline": zeros.copy(), "quantities": zeros.copy(),
                                     "completed_cycles": (original.get("progress") or {}).get("completed_cycles", 0)},
-                       "phase": "paused", "reason": "已只读核实两子账户完全空仓，组底仓记录已清零",
+                       "phase": "paused", "reason": "已只读核实本组标的在两子账户的指定方向为空，组底仓记录已清零",
                        "snapshots": {side: snapshot_json(snapshot, [pair["symbol"]]) for side, snapshot in snapshots.items()},
                        "updated_at": time.time()}
             runtime.pop("attention", None)

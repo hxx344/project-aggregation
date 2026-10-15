@@ -125,7 +125,7 @@ export function PairSettings({
         <p className="muted">
           {draft.mode === 'monitor'
             ? 'A 与 B 须属于同一主账户。保证金平衡不限制持仓标的、方向或持仓模式。'
-            : 'A 与 B 须属于同一主账户，方向固定。保留交易所 Hedge Mode，仅核验；旧反向仓位需先处理。'}
+            : 'A 与 B 须属于同一主账户，本组管理方向固定。仅核验交易所 Hedge Mode；其他仓位保留，账户风险一并计入。'}
         </p>
         {draft.mode !== 'monitor' ? (
           <ConfigurationField

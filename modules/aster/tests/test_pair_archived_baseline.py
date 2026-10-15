@@ -40,6 +40,12 @@ class ArchivedBaselineTests(TestCase):
     def test_changed_holdings_have_explicit_exit_preserving_unknown_watch_and_history(self):
         before = self.archive()
         audit = deepcopy(self.audit())
+        for key, symbol, side in (("long", "SPCXUSD1", "LONG"), ("long", "XAUUSD1", "SHORT"),
+                                  ("short", "CLUSD1", "SHORT"), ("short", "XAUUSD1", "LONG")):
+            broker = self.broker(key)
+            broker.state["positions"][symbol + ":" + side].update(
+                qty="0.1", entry=str(broker.market.book(symbol).mark))
+            broker.save()
         with self.no_writes():
             with self.assertRaisesRegex(TradingError, "核对并采纳"):
                 self.engine.pairs.enable("gold", True)
@@ -47,6 +53,13 @@ class ArchivedBaselineTests(TestCase):
             self.assertEqual(self.state(), before)
             self.assertEqual(review["actual"], {"LONG": "4", "SHORT": "4"})
             self.assertTrue(all(row["status"] == "UNKNOWN" for row in review["orders"]))
+            # External holdings may change while a preview is open; the
+            # confirmation still re-reads the account and adopts only its leg.
+            broker = self.broker()
+            broker.state["positions"]["SPCXUSD1:LONG"]["qty"] = "0.2"
+            broker.state["positions"]["XAUUSD1:SHORT"]["qty"] = "0.3"
+            broker.save()
+            holdings = {key: deepcopy(self.broker(key).state["positions"]) for key in ("long", "short")}
             self.confirm(review["token"])
             state = self.state()
             self.assertEqual(state["owned"], review["actual"])
@@ -63,6 +76,9 @@ class ArchivedBaselineTests(TestCase):
                 self.confirm(review["token"])
             self.engine.pairs.enable("gold", True)
         self.assertTrue(self.f.store.pair("gold")["enabled"])
+        self.assertEqual(self.state()["owned"], {"LONG": "4", "SHORT": "4"})
+        for key in ("long", "short"):
+            self.assertEqual(self.broker(key).state["positions"], holdings[key])
 
     def test_active_late_filled_and_failed_queries_cannot_adopt(self):
         original = self.archive()

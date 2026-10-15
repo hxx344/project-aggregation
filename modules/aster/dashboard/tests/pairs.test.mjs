@@ -545,7 +545,7 @@ test('account display cadence cannot extend pair snapshot freshness or a cached 
     assert.equal(pairDataFresh(100, 107.999, false, interval), true);
     assert.match(
       pairDeletionBlock(occupied, 107.999, false, interval),
-      /所有仓位/,
+      /指定方向仓位/,
     );
     for (const now of [108, 120, 160]) {
       assert.equal(pairDataFresh(100, now, false, interval), false);
@@ -574,14 +574,14 @@ test('quantity difference stays exact and missing side never becomes zero', () =
       long: snapshot([position('LONG', '1'), position('SHORT', '0.1')]),
       short: snapshot([position('SHORT', '1')]),
     }),
-    '-0.1',
+    '0',
   );
   assert.equal(
     pairNetQuantity({
       long: snapshot([position('LONG', '8', 'BTCUSDT')]),
       short: snapshot(),
     }),
-    '0',
+    null,
   );
   assert.equal(
     pairNetQuantity({
@@ -590,7 +590,68 @@ test('quantity difference stays exact and missing side never becomes zero', () =
     }),
     null,
   );
-  assert.equal(pairNetQuantity({ long: snapshot(), short: snapshot() }), '0');
+  assert.equal(pairNetQuantity({ long: snapshot(), short: snapshot() }), null);
+  assert.equal(
+    pairNetQuantity({
+      long: snapshot([position('LONG', '0')]),
+      short: snapshot([position('SHORT', '0')]),
+    }),
+    '0',
+  );
+});
+
+test('net quantity uses each assigned leg and ignores external positions in both accounts', () => {
+  const snapshots = {
+    long: snapshot([
+      position('LONG', '1.000000000000000001'),
+      position('SHORT', '20'),
+      position('LONG', '900', 'XAGUSD1'),
+    ]),
+    short: snapshot([
+      position('SHORT', '-1.1'),
+      position('LONG', '30'),
+      position('SHORT', '800', 'XAGUSD1'),
+    ]),
+  };
+  assert.equal(pairNetQuantity(snapshots), '-0.099999999999999999');
+  assert.equal(pairNetQuantity(snapshots, 'XAGUSD1'), '100');
+  snapshots.long.positions[1].qty = 'unknown';
+  snapshots.short.positions[1].qty = '1000';
+  assert.equal(pairNetQuantity(snapshots), '-0.099999999999999999');
+});
+
+test('missing, duplicate or malformed assigned legs keep net quantity unknown', () => {
+  for (const side of ['long', 'short']) {
+    const direction = side === 'long' ? 'LONG' : 'SHORT';
+    const opposite = side === 'long' ? 'SHORT' : 'LONG';
+    const missing = [
+      [],
+      [position(opposite, '0')],
+      [position(direction, '0', 'XAGUSD1')],
+      [position('BOTH', '0')],
+      [null],
+      [position(direction, '0'), position(direction, '0')],
+    ];
+    const invalid = [
+      'bad',
+      '',
+      'NaN',
+      'Infinity',
+      '1e-8',
+      undefined,
+      null,
+      0,
+      {},
+    ].map((qty) => [position(direction, qty)]);
+    for (const rows of [...missing, ...invalid]) {
+      const snapshots = {
+        long: snapshot([position('LONG', '0')]),
+        short: snapshot([position('SHORT', '0')]),
+      };
+      snapshots[side].positions = rows;
+      assert.equal(pairNetQuantity(snapshots), null);
+    }
+  }
 });
 
 test('unknown orders and transfers block edits/deletion without claiming completion', () => {
@@ -727,7 +788,7 @@ test('deletion blocks known positions and defers missing/stale snapshots to the 
     '',
   );
   assert.match(pairDeletionBlock(pair(), 100, true), /连接恢复/);
-  assert.match(
+  assert.equal(
     pairDeletionBlock(
       pair({
         snapshots: {
@@ -737,6 +798,54 @@ test('deletion blocks known positions and defers missing/stale snapshots to the 
       }),
       100,
     ),
-    /所有仓位/,
+    '',
   );
+});
+
+test('deletion scopes fresh positions to assigned legs unless a historical watch remains', () => {
+  for (const symbol of ['XAUUSD1', 'XAGUSD1']) {
+    const snapshots = {
+      long: snapshot([
+        position('LONG', '0', symbol),
+        position('SHORT', '5', symbol),
+        position('LONG', '8', 'BTCUSDT'),
+      ]),
+      short: snapshot([
+        position('SHORT', '0', symbol),
+        position('LONG', '7', symbol),
+        position('SHORT', '9', 'BTCUSDT'),
+      ]),
+    };
+    const fixture = { ...pair({ snapshots }), symbol };
+    assert.equal(pairDeletionBlock(fixture, 100), '');
+    const watched = {
+      ...fixture,
+      state: { ...fixture.state, recovery_watch: { batches: [{ id: 'old' }] } },
+    };
+    assert.match(pairDeletionBlock(watched, 100), /所有仓位/);
+    assert.equal(pairDeletionBlock(watched, 108), '');
+    for (const side of ['long', 'short']) {
+      snapshots[side].positions[0].qty = '0.000000000000000001';
+      assert.match(pairDeletionBlock(fixture, 100), /指定方向仓位/);
+      snapshots[side].positions[0].qty = '0';
+    }
+  }
+});
+
+test('deletion preserves unknown-data checks for scoped holdings and the default symbol', () => {
+  for (const side of ['long', 'short']) {
+    const direction = side === 'long' ? 'LONG' : 'SHORT';
+    for (const positions of [undefined, {}, [position(direction, 'unknown')]]) {
+      const fixture = pair({
+        snapshots: {
+          long: snapshot(),
+          short: snapshot(),
+          [side]: { positions, timestamp: 100 },
+        },
+      });
+      delete fixture.symbol;
+      assert.match(pairDeletionBlock(fixture, 100), /指定方向仓位/);
+      assert.equal(pairDeletionBlock(fixture, 108), '');
+    }
+  }
 });

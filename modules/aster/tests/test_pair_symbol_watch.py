@@ -143,25 +143,31 @@ class PairSymbolWatchTests(WatchFixture):
         for leg in self.submitted["pending"]["legs"]:
             queries[leg["key"]].assert_called_once_with(GOLD, leg["order"]["newClientOrderId"])
 
-    def test_active_late_fill_query_failure_and_wrong_receipt_preserve_original_state(self):
+    def test_active_orders_query_failure_and_wrong_receipt_preserve_original_state(self):
         leg = self.submitted["pending"]["legs"][0]
         outcomes = (
             receipt_for(leg, status="NEW"),
-            receipt_for(leg, status="FILLED", qty="0.2"),
             ExchangeError("offline query failure"),
             receipt_for(leg, client_id="unrelated-order"),
         )
         for outcome in outcomes:
             self.move_positions(SILVER, TARGET)
-            if isinstance(outcome, dict) and outcome.get("status") == "FILLED":
-                broker = self.broker()
-                broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
-                broker.save()
             options = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
             with self.subTest(outcome=str(outcome)), patch.object(self.broker(), "query", **options):
                 with self.assertRaises(TradingError):
                     self.switch()
                 self.assert_unchanged()
+
+    def test_terminal_old_symbol_fill_does_not_become_the_new_symbols_baseline(self):
+        leg = self.submitted["pending"]["legs"][0]
+        row = receipt_for(leg, status="FILLED", qty="0.2")
+        broker = self.broker()
+        broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
+        broker.save()
+        holdings = deepcopy(broker.state["positions"])
+        with patch.object(broker, "query", return_value=row):
+            self.assert_adopted(self.switch())
+        self.assertEqual(broker.state["positions"], holdings)
 
     def test_corrupt_watch_identity_shape_and_symbol_mismatch_never_commit(self):
         changes = {
@@ -197,30 +203,37 @@ class PairSymbolWatchTests(WatchFixture):
         self.assertEqual(self.state()["owned"], TARGET)
         self.assertEqual(self.f.store.get("pair_order_recovery:gold:" + BATCH_ID), self.audit)
 
-    def test_late_gold_fill_after_switch_blocks_start_and_new_opening(self):
+    def test_late_gold_fill_after_switch_keeps_current_baseline_and_old_watch(self):
         self.switch()
         before = self.state()
         row = receipt_for(self.submitted["pending"]["legs"][0], status="FILLED", qty="0.2")
         broker = self.broker()
         broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
         broker.save()
-        with patch.object(self.broker(), "query", return_value=row), self.assertRaises(TradingError):
+        with patch.object(self.broker(), "query", return_value=row):
             self.engine.pairs.enable("gold", True)
-        self.assertEqual(self.state(), before)
-        self.assertFalse(self.f.store.pair("gold")["enabled"])
-        self.move_positions(SILVER, TARGET)
-        pair = self.engine.pairs.enable("gold", True)
+        self.assertEqual(self.state()["owned"], TARGET)
+        self.assertTrue(self.f.store.pair("gold")["enabled"])
+        pair = self.f.store.pair("gold")
         trader = PairTrader(self.engine)
-        broker.state["positions"][GOLD + ":LONG"].update(qty="0.2", entry="4412")
-        broker.save()
         with patch.object(self.broker(), "query", return_value=row) as query:
-            with self.assertRaises(TradingError):
-                require_archived_orders_clear(self.engine, pair)
-            with self.assertRaises(TradingError):
-                trader._config_guard(pair, self.state()["identities"], opening=True)
+            require_archived_orders_clear(self.engine, pair)
+            trader._config_guard(pair, self.state()["identities"], opening=True)
             query.reset_mock()
             trader._config_guard(pair, self.state()["identities"], opening=False)
             query.assert_not_called()
+        self.assertEqual(self.state()["recovery_watch"], before["recovery_watch"])
+        self.assertEqual(self.state()["owned"], TARGET)
+        self.assertEqual(self.state()["daily_volume"], before["daily_volume"])
+        self.assertEqual(broker.state["positions"][GOLD + ":LONG"]["qty"], "0.2")
+        self.assertEqual(self.f.store.get("pair_order_recovery:gold:" + BATCH_ID), self.audit)
+        self.engine.pairs.enable("gold", False)
+        with patch.object(self.broker(), "query", return_value=row):
+            review = self.engine.pairs.preview_baseline("gold")
+            self.assertTrue(any(order["status"] == "FILLED" and order["executed_qty"] == "0.2"
+                                for order in review["orders"]))
+            self.engine.pairs.confirm_baseline("gold", review["token"], True)
+        self.assertEqual(self.state()["owned"], TARGET)
         self.assertEqual(self.state()["recovery_watch"], before["recovery_watch"])
 
     def test_watch_query_cannot_extend_the_target_snapshot_freshness(self):

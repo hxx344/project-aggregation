@@ -489,15 +489,21 @@
 
 **以后做法：** 从目标标的新鲜快照读取两侧指定方向的实际数量，建立新 `owned` 与循环底仓，保持暂停；原运行记录归档，不能以配置标的推断真实持仓归属。历史观察批次保留自身标的、客户端编号和账户身份，切换时重新核查，后续启动与写入继续核查。活动执行日志仍绑定当前标的，不因历史观察跨标的而放宽。
 
+配对归属只覆盖指定标的及各账户指定方向，其他标的或反向持仓可以继续存在，不采纳进本组账本，也不被本组减仓。采纳、启动、运行及恢复使用同一范围；完整账户快照仍用于风险计算，同标的两方向均计入持仓上限、行情变化浮亏和占用增量。旧标的终态成交在完整当前风险核验后不阻止新标的运行，也不改写新底仓或原始归档；活动订单、原编号回执不匹配及本组账本冲突仍须核对。存在同标的非本组方向仓位时保留当前杠杆，避免自动升档连带修改手动仓位。本组空仓核对只检查所属两腿；解除仍带旧订单观察的绑定时，继续独立验证全账户空仓。
+
 历史观察记录本身不代表当前未完成订单或统计不可用。汇总只在匹配的检查结果明确失败或发现活动回执时提示异常；重启丢失显示缓存、检查正常和单纯保留归档均不要求用户再次核查。配对成交量继续读取已核对账本，保留真实未决批次和 `volume_unknown` 的未知语义，不因旧观察记录永久阻塞，也不改写历史成交。
 
 **如何验证：** [标的切换测试](modules/aster/tests/test_pair_symbol_change.py) 覆盖目标标的非零、不等量手动底仓及原账本数量隔离；[历史观察切换测试](modules/aster/tests/test_pair_symbol_watch.py) 覆盖真实人工归档后切换、原标的查询、重启保留、迟到成交及查询竞态，确认切换不发送交易写入。
+
+[归档后底仓采纳](modules/aster/tests/test_pair_archived_baseline.py) 覆盖其他仓位存在时预览、确认及启动；[配对交易](modules/aster/tests/test_pair_trading.py) 验证循环只减回本组新增量；[仓位范围与风险](modules/aster/tests/test_pair_position_scope.py) 和 [升档检查](modules/aster/tests/test_pair_upgrade_capacity.py) 验证同标的总持仓上限、其他仓位占用、行情重估和发送前新增反向持仓不会触发杠杆写入。
 
 展示层改动运行 [ASTER 汇总测试](modules/aster/tests/test_hub_summary.py) 与 [适配器测试](tests/adapters.test.mjs)，覆盖旧观察记录、重启无缓存、实际检查失败、迟到成交、已确认合计及 UTC 跨日；确认读取汇总不新增交易所查询、不修改持久状态。
 
 **证据：** 本仓 `c506a0a` 的 [切换入口](modules/aster/trading/pairing.py) 同时要求 `require_flat=True` 并拒绝所有 `recovery_watch`；2026-10-15 用户截图显示历史归档提示，随后明确实际已手动开 `XAGUSD1`、组仍配置 `XAUUSD1`。修复基于 `4239c81`，仅支持按目标实际仓位采纳，不扩展为同组自动管理多个标的。
 
 同日用户在切换后指出历史订单重复核查提示冗余。基于 `3be993f` 的 [摘要](modules/aster/trading/hub_summary.py) 和 [兼容适配器](server/adapters.mjs) 将长期 `recovery_watch` 等同当前未决订单，Python 还把重启无缓存等同检查失败；上述回归在修复前复现观察提示、重启误报和跨日成交量仍为空。本次仅修正汇总语义，保留交易前自动检查与归档记录。
+
+同日基于 `65139ba`，用户截图显示“核对并采纳当前底仓”仍因其他仓位被拒绝。`PairManager._read_members` 与 `pair_planning.positions` 均将全账户持仓排他地绑定到本组方向，后者还覆盖运行与恢复；仅移除入口检查会在下一轮重新阻塞。修正两处范围后同步补齐同标的反向持仓的风险计算，保留原账户模式及未知订单保护，不扩展跨模式交易能力。
 
 **事件记录：** `pair-symbol-manual-holdings-adoption-20261015`；同一功能的用户反馈与连续修复。
 
@@ -613,7 +619,7 @@
 
 **以后做法：** 划转单独读取账户 USD1 余额和交易所可划额度，不要求持仓标的、方向、模式或开仓状态匹配。金额按余额差的一半、实际可划额度、单次限额和现金保留确定。仅保证金启动保留原策略记录，不采纳或清空持仓；实际订单恢复及循环减仓继续按原路径处理。暂停、实盘授权、账户归属、发送前身份与快照代次检查、先持久化后发送和未知结果不重发仍保留。资金快照不提供持仓及杠杆授权，界面单独展示余额及原始读取时间。旧指纹与旧划转日志保持恢复兼容。
 
-**如何验证：** [专用资金快照](modules/aster/tests/test_transfer_account_snapshot.py) 验证只查询账户接口，缺失资金字段、过期与事件失效仍被拒绝；[独立入口](modules/aster/tests/test_pair_margin_independent.py) 验证其他标的持仓可启动平衡、保留策略记录、普通交易原限制和配置身份竞态；[划转测试](modules/aster/tests/test_pair_margin.py) 验证真实额度、现金保留、旧日志和防重发。恢复、预算及 WebSocket 测试按受影响路径选取，前端配对与提示测试验证余额状态不伪装为已确认空仓。
+**如何验证：** [专用资金快照](modules/aster/tests/test_transfer_account_snapshot.py) 验证只查询账户接口，缺失资金字段、过期与事件失效仍被拒绝；[独立入口](modules/aster/tests/test_pair_margin_independent.py) 验证其他标的持仓可启动平衡、保留策略记录、普通交易仍核验本组底仓与实际杠杆，以及配置身份竞态；[划转测试](modules/aster/tests/test_pair_margin.py) 验证真实额度、现金保留、旧日志和防重发。恢复、预算及 WebSocket 测试按受影响路径选取，前端配对与提示测试验证余额状态不伪装为已确认空仓。
 
 **证据：** project-aggregation `63d621d` 的 [划转实现](modules/aster/trading/margin_balance.py) 在 `_check_snapshots` 限制指定标的和方向，`_plan` 使用 `ordinary.margin_limit`；[配对入口](modules/aster/trading/pairing.py) 及 [执行调度](modules/aster/trading/pair_execution.py) 先要求策略仓位和行情。2026-10-15 用户明确要求保证金平衡独立于持仓标的，本轮定向回归覆盖上述误阻断。
 

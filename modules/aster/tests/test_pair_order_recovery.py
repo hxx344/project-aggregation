@@ -337,7 +337,6 @@ class PairOrderRecoveryTests(unittest.TestCase):
             "orders": lambda snap: replace(snap, open_orders=[{"orderId": "external"}]),
             "unknown_orders": lambda snap: replace(snap, open_orders=None),
             "leverage": lambda snap: replace(snap, positions=[replace(p, leverage=10) if p.symbol == SYMBOL else p for p in snap.positions]),
-            "opposite": lambda snap: replace(snap, positions=[replace(p, qty=dec("0.1")) if p.symbol == SYMBOL and p.side == "SHORT" else p for p in snap.positions]),
         }
         for name, transform in changes.items():
             with self.subTest(mode=name), patch.object(broker, "snapshot", side_effect=lambda *a, **kw: transform(snapshot(*a, **kw))):
@@ -534,6 +533,37 @@ class PairOrderRecoveryTests(unittest.TestCase):
         self.assertEqual(self.audit(), audit)
         for aid in ("test", "second"):
             self.assertEqual(self.f.store.pair_for_account(aid)["id"], "gold")
+
+    def test_retired_watch_still_requires_all_account_holdings_flat_for_deletion(self):
+        self.seed({"LONG": "0", "SHORT": "0"})
+        self.confirm(self.preview()["token"])
+        state = self.state()
+        state["recovery_watch"]["batches"][0]["bounded_queries_complete"] = True
+        self.f.store.put("pair_runtime:gold", state)
+        watch, audit = deepcopy(state["recovery_watch"]), self.audit()
+        broker = self.broker()
+        for symbol, side in (("SPCXUSD1", "LONG"), (SYMBOL, "SHORT")):
+            with self.subTest(symbol=symbol, side=side):
+                broker.state["positions"][symbol + ":" + side].update(
+                    qty="0.1", entry=str(broker.market.book(symbol).mark))
+                broker.save()
+                holdings = deepcopy(broker.state["positions"])
+                with self.no_writes(), patch.object(broker, "query", side_effect=AssertionError("watch queries are exhausted")):
+                    self.engine.pairs.reconcile_flat("gold")
+                    with self.assertRaisesRegex(TradingError, "完全空仓"):
+                        self.engine.pairs.delete("gold")
+                self.assertEqual(self.state()["owned"], {"LONG": "0", "SHORT": "0"})
+                self.assertEqual(self.state()["recovery_watch"], watch)
+                self.assertEqual(self.audit(), audit)
+                self.assertEqual(broker.state["positions"], holdings)
+                self.assertEqual(self.f.store.pair_for_account("test")["id"], "gold")
+                broker.state["positions"][symbol + ":" + side].update(qty="0", entry="0")
+                broker.save()
+        with self.no_writes():
+            self.engine.pairs.delete("gold")
+        self.assertIsNone(self.f.store.pair("gold"))
+        self.assertEqual(self.f.store.get("pair_deleted_watch:gold")["watch"], watch)
+        self.assertEqual(self.audit(), audit)
 
     def test_flat_reconciliation_preserves_archive_watch_and_cannot_release_members(self):
         self.seed()

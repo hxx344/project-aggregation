@@ -492,6 +492,8 @@ export function pairDeletionBlock(
   if (offline) return '连接恢复后可删除配对组';
   if (pair.enabled) return '请先暂停配对组';
   if (pairHasPending(pair)) return '仍有订单或划转等待确认';
+  const symbol = pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
+  const fullAccount = pair.state?.recovery_watch != null;
   for (const side of ['long', 'short'] as const) {
     const snapshot = pair.state?.snapshots?.[side];
     // Paused groups may have no hot snapshot. DELETE re-reads both accounts
@@ -502,18 +504,28 @@ export function pairDeletionBlock(
       (!Array.isArray(snapshot.positions) ||
         snapshot.positions.some(
           (position) =>
-            !Number.isFinite(Number(position.qty)) ||
-            Number(position.qty) !== 0,
+            (fullAccount ||
+              (position.symbol === symbol &&
+                position.side === (side === 'long' ? 'LONG' : 'SHORT'))) &&
+            (!Number.isFinite(Number(position.qty)) ||
+              Number(position.qty) !== 0),
         ))
     )
-      return '两侧所有仓位完全减回后才能删除组';
+      return fullAccount
+        ? '保留旧订单观察的组，须确认两侧所有仓位完全减回后才能删除'
+        : '本组标的在两侧账户的指定方向仓位减回后才能删除组';
   }
   return '';
 }
 
 // Keep small quantity differences exact; missing/invalid source data remains unknown.
 function quantityUnits(value: string): { units: bigint; scale: number } | null {
-  if (!/^[+-]?\d+(?:\.\d+)?$/.test(value) || value.length > 128) return null;
+  if (
+    typeof value !== 'string' ||
+    !/^[+-]?\d+(?:\.\d+)?$/.test(value) ||
+    value.length > 128
+  )
+    return null;
   const [whole, decimal = ''] = value.replace(/^[+-]/, '').split('.');
   return { units: BigInt(whole + decimal), scale: decimal.length };
 }
@@ -532,15 +544,14 @@ export function pairNetQuantity(
     return null;
   const values: { units: bigint; scale: number; sign: bigint }[] = [];
   for (const side of ['long', 'short'] as const) {
-    for (const position of snapshots[side]!.positions) {
-      if (position.symbol !== symbol) continue;
-      const parsed = quantityUnits(position.qty);
-      if (!parsed || !['LONG', 'SHORT'].includes(position.side)) return null;
-      values.push({
-        ...parsed,
-        sign: position.side === 'LONG' ? BigInt(1) : BigInt(-1),
-      });
-    }
+    const direction = side === 'long' ? 'LONG' : 'SHORT';
+    const selected = snapshots[side]!.positions.filter(
+      (position) => position?.symbol === symbol && position.side === direction,
+    );
+    if (selected.length !== 1) return null;
+    const parsed = quantityUnits(selected[0].qty);
+    if (!parsed) return null;
+    values.push({ ...parsed, sign: side === 'long' ? BigInt(1) : BigInt(-1) });
   }
   const scale = Math.max(0, ...values.map((value) => value.scale));
   const total = values.reduce(

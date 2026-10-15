@@ -130,12 +130,30 @@ class PairTradingTests(TestCase):
         self.tick()
         self.assertEqual(len(self.brokers["long"].state["orders"]), count)
 
-    def test_external_opposite_position_blocks_all_new_writes(self):
-        self.brokers["long"].state["positions"]["XAUUSD1:SHORT"].update(qty="1", entry="4400")
-        self.brokers["long"].save()
-        with patch.object(self.brokers["short"], "submit", side_effect=AssertionError("blocked")):
-            state = self.tick()
-        self.assertEqual(state["phase"], "attention", state)
+    def test_cycle_only_opens_and_reduces_its_own_legs_with_other_positions_present(self):
+        external = {}
+        for key, other_side in (("long", "SHORT"), ("short", "LONG")):
+            broker = self.brokers[key]
+            for symbol in ("XAUUSD1", "XAGUSD1"):
+                position_key = symbol + ":" + other_side
+                broker.state["positions"][position_key].update(qty="1", entry=str(self.market.book(symbol).mark))
+                external[key, position_key] = deepcopy(broker.state["positions"][position_key])
+            broker.save()
+        state = self.tick()
+        self.assertEqual(state["phase"], "holding", state)
+        self.assertGreater(dec(state["progress"]["quantities"]["LONG"]), 0)
+        self.expire()
+        state = self.tick()
+        self.assertIsNone(state["pending"], state)
+        self.assertEqual(state["progress"]["completed_cycles"], 1)
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+        for (key, position_key), original in external.items():
+            self.assertEqual(self.brokers[key].state["positions"][position_key], original)
+        for key, broker in self.brokers.items():
+            self.assertEqual(len(broker.state["orders"]), 2)
+            self.assertEqual({(row["symbol"], row["positionSide"]) for row in broker.state["orders"].values()},
+                             {("XAUUSD1", key.upper())})
+            self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + key.upper()]["qty"]), 0)
 
     def test_weak_subaccount_limits_quantity_despite_large_combined_equity(self):
         self.brokers["long"].state["wallet"] = "50"

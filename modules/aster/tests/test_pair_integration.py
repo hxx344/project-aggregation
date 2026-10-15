@@ -53,17 +53,44 @@ class PairIntegrationTests(unittest.TestCase):
         member = next(row for row in state["accounts"] if row["id"] == "test")
         self.assertEqual(member["pair_direction"], "LONG")
 
-    def test_existing_positions_and_pending_legacy_intents_block_creation(self):
-        self.f.broker.state["positions"]["XAUUSD1:SHORT"].update(qty="1", entry="4412")
+    def test_existing_selected_position_and_pending_legacy_intents_block_creation(self):
+        self.f.broker.state["positions"]["XAUUSD1:LONG"].update(qty="1", entry="4412")
         self.f.store.put("paper:test", self.f.broker.state)
         with self.assertRaisesRegex(TradingError, "原有仓位|外部持仓"):
             self.create()
         self.assertIsNone(self.f.store.pair("gold"))
-        self.f.broker.state["positions"]["XAUUSD1:SHORT"]["qty"] = "0"
+        self.f.broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "0"
         self.f.store.put("paper:test", self.f.broker.state)
         self.f.store.save_intent({"id": "pending", "account_id": "test", "status": "pending", "kind": "leverage"})
         with self.assertRaisesRegex(TradingError, "未完成"):
             self.create()
+
+    def test_external_positions_survive_creation_flat_reconciliation_and_release(self):
+        brokers = {aid: self.engine.broker(self.f.store.account(aid)) for aid in ("test", "second")}
+        for aid, symbol, side in (("test", "XAUUSD1", "SHORT"), ("test", "CLUSD1", "LONG"),
+                                  ("second", "XAUUSD1", "LONG"), ("second", "SPCXUSD1", "SHORT")):
+            broker = brokers[aid]
+            broker.state["positions"][symbol + ":" + side].update(
+                qty="0.1", entry=str(self.f.market.book(symbol).mark))
+            broker.save()
+        holdings = {aid: deepcopy(broker.state["positions"]) for aid, broker in brokers.items()}
+        with patch("trading.paper.PaperBroker.submit", side_effect=AssertionError("read-only ownership checks")), \
+                patch("trading.paper.PaperBroker.set_leverage", side_effect=AssertionError("read-only ownership checks")):
+            self.create()
+            self.f.store.put("pair_runtime:gold", {"owned": {"LONG": "1", "SHORT": "2"},
+                "pending": None, "progress": {"quantities": {"LONG": "0", "SHORT": "0"}, "completed_cycles": 3},
+                "daily_volume": {"2026-09-29": {"long": "100", "short": "200"}}})
+            self.engine.pairs.reconcile_flat("gold")
+            state = self.f.store.get("pair_runtime:gold")
+            self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+            self.assertEqual(state["progress"]["baseline"], state["owned"])
+            self.assertEqual(state["progress"]["completed_cycles"], 3)
+            self.assertEqual(state["daily_volume"], {"2026-09-29": {"long": "100", "short": "200"}})
+            self.engine.pairs.delete("gold")
+        self.assertIsNone(self.f.store.pair("gold"))
+        for aid, broker in brokers.items():
+            self.assertIsNone(self.f.store.pair_for_account(aid))
+            self.assertEqual(broker.state["positions"], holdings[aid])
 
     def test_atomic_membership_excludes_overlapping_groups_from_other_store(self):
         other = Store(self.f.store.path)

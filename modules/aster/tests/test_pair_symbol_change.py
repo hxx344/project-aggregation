@@ -171,18 +171,22 @@ class PairSymbolChangeTests(unittest.TestCase):
             self.switch()
         self.assert_no_change()
 
-    def test_other_markets_and_wrong_target_direction_are_still_rejected(self):
+    def test_other_holdings_are_preserved_while_only_target_direction_is_adopted(self):
+        self.set_target_positions()
         broker = self.engine.broker(self.f.store.account("test"))
         for symbol, side in ((GOLD, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
-            with self.subTest(symbol=symbol, side=side):
-                row = broker.state["positions"][symbol + ":" + side]
-                row.update(qty="1", entry="1")
-                broker.save()
-                with self.assertRaises(TradingError):
-                    self.switch()
-                self.assert_no_change()
-                broker.state["positions"][symbol + ":" + side].update(qty="0", entry="0")
-                broker.save()
+            broker.state["positions"][symbol + ":" + side].update(
+                qty="1", entry=str(self.f.market.book(symbol).mark))
+        broker.save()
+        holdings = deepcopy(broker.state["positions"])
+        pair = self.switch()
+        state = self.f.store.get("pair_runtime:gold")
+        self.assertEqual(pair["symbol"], SILVER)
+        self.assertFalse(pair["enabled"])
+        self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
+        self.assertEqual(state["progress"]["baseline"], state["owned"])
+        self.assertEqual(broker.state["positions"], holdings)
+        self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
 
     def test_failed_or_stale_snapshot_keeps_old_configuration_and_runtime(self):
         broker = self.engine.broker(self.f.store.account("test"))
@@ -285,19 +289,25 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
                                    for row in api.responses[ACCOUNT]["positions"]]
 
     # The account payload test below covers holdings for live adapters.
-    def test_other_markets_and_wrong_target_direction_are_still_rejected(self):
+    def test_other_holdings_are_preserved_while_only_target_direction_is_adopted(self):
+        self.set_target_positions()
         api = self.live["test"].api
-        original = deepcopy(api.responses[ACCOUNT]["positions"])
+        rows = deepcopy(api.responses[ACCOUNT]["positions"])
         for symbol, side in ((GOLD, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
-            with self.subTest(symbol=symbol, side=side):
-                rows = deepcopy(original)
-                rows = [row for row in rows if (row["symbol"], row["positionSide"]) != (symbol, side)]
-                rows.append(account_row(symbol, side, amount="1" if side == "LONG" else "-1", entry="1"))
-                api.responses[ACCOUNT]["positions"] = rows
-                api.responses[RISK] = [risk_row(row) for row in rows]
-                with self.assertRaises(TradingError):
-                    self.switch()
-                self.assert_no_change()
+            rows = [row for row in rows if (row["symbol"], row["positionSide"]) != (symbol, side)]
+            rows.append(account_row(symbol, side, amount="1" if side == "LONG" else "-1",
+                                    entry=str(self.live["test"].market.book(symbol).mark)))
+        api.responses[ACCOUNT]["positions"] = rows
+        api.responses[RISK] = [risk_row(row, mark="30" if row["symbol"] == SILVER else "100") for row in rows]
+        holdings = deepcopy(rows)
+        pair = self.switch()
+        state = self.f.store.get("pair_runtime:gold")
+        self.assertEqual(pair["symbol"], SILVER)
+        self.assertFalse(pair["enabled"])
+        self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
+        self.assertEqual(state["progress"]["baseline"], state["owned"])
+        self.assertEqual(api.responses[ACCOUNT]["positions"], holdings)
+        self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
 
     def test_full_account_orders_and_unreadable_orders_block(self):
         for orders in ([{"symbol": "CLUSD1"}], {}, None, ExchangeError("orders unavailable")):

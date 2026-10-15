@@ -50,7 +50,7 @@ test('archived baseline remains reviewable without a pending batch', () => {
   );
 });
 
-test('baseline response must match pair and cannot turn unknown or filled orders into clear orders', () => {
+test('baseline response preserves unknown and verified terminal fills while rejecting active or invalid orders', () => {
   const review = {
     status: 'baseline_review',
     pair_id: pair.id,
@@ -71,6 +71,15 @@ test('baseline response must match pair and cannot turn unknown or filled orders
     parsePairBaselineReview(review, pair).orders[0].status,
     'UNKNOWN',
   );
+  const verified = {
+    ...review,
+    orders: review.orders.map((order) => ({
+      ...order,
+      status: 'FILLED',
+      executed_qty: '0.123456789123456789',
+    })),
+  };
+  assert.deepEqual(parsePairBaselineReview(verified, pair), verified);
   for (const change of [
     { pair_id: 'another' },
     { token: '' },
@@ -79,7 +88,7 @@ test('baseline response must match pair and cannot turn unknown or filled orders
       orders: review.orders.map((order) => ({
         ...order,
         status: 'FILLED',
-        executed_qty: '1',
+        executed_qty: '-1',
       })),
     },
     {
@@ -92,6 +101,28 @@ test('baseline response must match pair and cannot turn unknown or filled orders
   ]) {
     assert.throws(() =>
       parsePairBaselineReview({ ...review, ...change }, pair),
+    );
+  }
+  for (const quantity of [
+    'NaN',
+    'Infinity',
+    '1\n',
+    '',
+    '1'.repeat(129),
+    null,
+    1,
+  ]) {
+    assert.throws(() =>
+      parsePairBaselineReview(
+        {
+          ...verified,
+          orders: verified.orders.map((order) => ({
+            ...order,
+            executed_qty: quantity,
+          })),
+        },
+        pair,
+      ),
     );
   }
 });

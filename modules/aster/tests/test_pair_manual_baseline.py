@@ -226,7 +226,7 @@ class PairManualBaselineTests(unittest.TestCase):
             self.broker(side).set_leverage(SYMBOL, 10)
         self.assert_blocked(original)
 
-    def test_other_market_or_opposite_position_prevents_manual_adoption(self):
+    def test_other_market_or_opposite_position_does_not_change_manual_adoption(self):
         for symbol, side in (("SPCXUSD1", "LONG"), (SYMBOL, "SHORT")):
             with self.subTest(symbol=symbol, side=side):
                 original = self.seed()
@@ -234,7 +234,9 @@ class PairManualBaselineTests(unittest.TestCase):
                 broker = self.broker()
                 broker.submit([Executor.order(symbol, side, "BUY" if side == "LONG" else "SELL",
                                                dec("0.1"), "unrelated-" + symbol)])
-                self.assert_blocked(original)
+                holdings = deepcopy(broker.state["positions"])
+                self.assert_completed_at_baseline(original, {"LONG": dec(0), "SHORT": dec(QUANTITY)})
+                self.assertEqual(broker.state["positions"], holdings)
                 broker.state["positions"][symbol + ":" + side].update(qty="0", entry="0")
                 broker.save()
 
