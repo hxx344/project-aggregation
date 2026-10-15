@@ -5,6 +5,7 @@ The separate test-mirror-nginx.py covers actual nginx transport/cache behavior.
 """
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,9 @@ CAN_RUN = bool(BASH) and (WINDOWS or (os.geteuid() == 0 and 'microsoft' not in o
 
 class Harness:
     def __init__(self, test):
-        temporary = tempfile.TemporaryDirectory(prefix='mirror-setup-', dir=ROOT if WINDOWS else '/opt')
+        # Hosted runners may grant shared write access/default ACLs under /opt.
+        # Keep the fixture under the same root-controlled runtime parent as production.
+        temporary = tempfile.TemporaryDirectory(prefix='mirror-setup-', dir=ROOT if WINDOWS else '/run')
         test.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.commands = self.root / 'commands'
@@ -37,10 +40,15 @@ class Harness:
         for name in ('setup-release-mirror.sh', 'configure-release-mirror.sh'):
             text = (ROOT / 'deploy' / name).read_text(encoding='utf-8')
             text = text.replace('set -Eeuo pipefail', 'set -Eeuo pipefail\nexport PATH="$(cd -- "$MOCK_COMMANDS" && pwd):$PATH"')
-            text = text.replace('/etc/ssl/certs/ca-certificates.crt', (self.root / 'ca.pem').as_posix())
-            text = text.replace('/etc/', self.root.as_posix() + '/etc/')
-            text = text.replace('/var/cache/github-releases', self.root.as_posix() + '/cache/releases')
-            text = text.replace('/run/', self.root.as_posix() + '/run/')
+            replacements = {
+                '/etc/ssl/certs/ca-certificates.crt': (self.root / 'ca.pem').as_posix(),
+                '/etc/': self.root.as_posix() + '/etc/',
+                '/var/cache/github-releases': self.root.as_posix() + '/cache/releases',
+                '/run/': self.root.as_posix() + '/run/',
+            }
+            # One pass prevents a /run-based replacement from being remapped again.
+            text = re.sub('|'.join(re.escape(value) for value in replacements),
+                          lambda match: replacements[match[0]], text)
             # No interactive controlling terminal in this fixture, even when the runner has one.
             text = text.replace('</dev/tty', '</dev/null')
             if WINDOWS:

@@ -126,9 +126,11 @@ class NginxMirrorTests(unittest.TestCase):
         if self._testMethodName == 'test_upstream_certificate_name_is_verified':
             site = site.replace('proxy_ssl_name $mirror_upstream_host;', 'proxy_ssl_name wrong.example;')
         self.config = self.work / 'nginx.conf'
+        temporary_paths = ''.join(name + '_temp_path ' + (self.work / name).as_posix() + ';\n'
+                                  for name in ('client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi'))
         self.config.write_text('pid ' + (self.work / 'nginx.pid').as_posix() + ';\n'
                                'error_log ' + (self.work / 'error.log').as_posix() + ' info;\n'
-                               'events {}\nhttp {\naccess_log off;\n' + global_conf + site + '\n}\n', encoding='utf-8')
+                               'events {}\nhttp {\naccess_log off;\n' + temporary_paths + global_conf + site + '\n}\n', encoding='utf-8')
         command = [shutil.which('nginx'), '-p', str(self.work) + '/', '-c', str(self.config)]
         check = subprocess.run(command + ['-t'], capture_output=True, text=True)
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)

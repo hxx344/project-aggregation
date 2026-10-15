@@ -507,7 +507,9 @@ class Downloader:
         self.phase_stop.set()
         with self.active_lock:
             responses = list(self.active)
-        # Shutdown sockets before close: close alone can wait on a blocked BufferedReader.
+        # Wake blocked reads without closing HTTPResponse from another thread.
+        # Each request owner closes its response in finally; concurrent close/read1
+        # races inside CPython's HTTPResponse._close_conn on Linux.
         for response in responses:
             try:
                 raw = getattr(getattr(response, 'fp', None), 'raw', None)
@@ -516,8 +518,6 @@ class Downloader:
                     connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-        for response in responses:
-            self.close_response(response)
 
     def pause_retry(self, attempt):
         self.check_cancel()

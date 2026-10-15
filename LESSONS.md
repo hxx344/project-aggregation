@@ -805,4 +805,6 @@
 
 **证据：** project-aggregation `1229ebe` 引入镜像测速，`f9851a3` 引入镜像配置与同步；审查基线 `3e37bd4` 中 [测速脚本](deploy/test-mirror-performance.sh) 对本机 200/24 字节响应仍记录失败，302 夹具未请求正文；[Nginx 安装脚本](deploy/setup-release-mirror.sh) 在 `nginx -t` 返回失败的隔离用例中仍退出 0。[配置脚本](deploy/configure-release-mirror.sh) 的旧变量无生产消费者，默认更新入口仍指定 `source`；[OSS 同步器](deploy/sync-release-to-oss.py) 使用固定临时目录和跨版本同名缓存。2026-10-16 用户要求检查并修复，未取得服务器端速度证据。
 
+**补充证据：** 修复提交 `dfef0d2` 的 Linux CI `38776971057` 复现超时线程与读取线程同时关闭 `HTTPResponse`，在 Python 3.12 的 `read1` 中触发 `AttributeError` 并阻止回源。停止下载只跨线程 shutdown socket，由原请求线程在 finally 中关闭响应；超时回归同时断言关闭线程归属。该 CI 的 `/opt` 含宽写权限与默认 ACL，安装夹具因此迁入独立的 `/run` 临时目录，保留生产权限检查。
+
 **事件记录：** `release-mirror-unverified-download-wiring-20261016`；同一批镜像工具的审查与连续修复，关联 L009、L030、L032，不推进主线复盘检查点。

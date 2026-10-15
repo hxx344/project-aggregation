@@ -6,6 +6,7 @@ import io
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -131,13 +132,30 @@ class MirrorDownloads(unittest.TestCase):
                     self.assertEqual(len(self.attempts), 1)
 
     def test_mirror_deadline_closes_stalled_transfer_before_failover(self):
+        opened = Downloader._open_request
+        closed = Downloader.close_response
+        foreign_closes = []
+
+        def owned_request(downloader, request):
+            response = opened(downloader, request)
+            response.owner_thread = threading.get_ident()
+            return response
+
+        def owned_close(downloader, response):
+            if response.owner_thread != threading.get_ident():
+                foreign_closes.append(response.owner_thread)
+            return closed(downloader, response)
+
         with fixtures.Fixture(self.payload, 'stall') as mirror, fixtures.Fixture(self.payload) as origin:
             self.configure(f'http://127.0.0.1:{mirror.port}', timeout=1)
             start = time.monotonic()
-            self.assertEqual(self.download(origin).read_bytes(), self.payload)
+            with mock.patch.object(Downloader, '_open_request', owned_request), \
+                    mock.patch.object(Downloader, 'close_response', owned_close):
+                self.assertEqual(self.download(origin).read_bytes(), self.payload)
             self.assertLess(time.monotonic() - start, 4)
             self.assertTrue(mirror.started.is_set())
             self.assertTrue(origin.requests)
+            self.assertEqual(foreign_closes, [], 'only the reader may close its HTTPResponse')
 
     def test_http_is_an_explicit_same_origin_exception_only(self):
         for value in ('http://mirror.example', 'http://localhost:8090', 'http://127.0.0.2:8090',
