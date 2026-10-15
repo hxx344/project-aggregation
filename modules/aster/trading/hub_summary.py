@@ -4,6 +4,7 @@ import math
 import time
 
 from .report_cache import REPORT_MAX_AGE
+from .models import TradingError, dec
 
 
 STALE_AFTER_SECONDS = 120
@@ -106,6 +107,48 @@ def _snapshot(now, *candidates):
     return (candidates[0] if candidates else {}), None
 
 
+def _funds_only(pair, runtime):
+    """Only an idle funds manager has no current position evidence to report."""
+    if (not pair.get("enabled") or pair.get("margin", {}).get("enabled") is not True
+            or pair.get("ordinary", {}).get("enabled") is not False
+            or pair.get("cycle", {}).get("enabled") is not False
+            or not isinstance(runtime, dict) or runtime.get("pending") is not None):
+        return False
+    progress = runtime.get("progress")
+    quantities = progress.get("quantities") if isinstance(progress, dict) else None
+    if not isinstance(quantities, dict) or set(quantities) != {"LONG", "SHORT"}:
+        return False
+    try:
+        return all(dec(quantities.get(side)) == 0 for side in ("LONG", "SHORT"))
+    except TradingError:
+        return False
+
+
+def _funds_errors(runtime, journal):
+    """A recent successful read must not hide a later failed funds check."""
+    if not isinstance(journal, dict):
+        return ["保证金划转日志无效，等待核对"]
+    reasons = []
+    if any(field in journal and (type(journal[field]) not in (int, float) or not math.isfinite(journal[field]))
+           for field in ("checked_at", "next_check_at", "cooldown_until")):
+        reasons.append("保证金划转日志时间无效，等待核对")
+    if journal.get("blocked_reason"):
+        reasons.append(_text(journal["blocked_reason"], "保证金检查失败，等待重试"))
+    margin = runtime.get("margin")
+    margin = margin if isinstance(margin, dict) else {}
+    if margin.get("status") in ("blocked", "error"):
+        reasons.append(_text(margin.get("reason"), "保证金检查尚未完成，等待核对"))
+    for source in (runtime, margin, journal):
+        notice = source.get("api_notice")
+        if isinstance(notice, dict) and notice.get("text"):
+            reasons.append(_text(notice["text"], "保证金 API 暂不可用，等待重试"))
+    pending = journal.get("pending")
+    if (pending is not None and (not isinstance(pending, dict)
+            or pending.get("status") not in ("submitting", "acknowledged"))):
+        reasons.append("保证金划转尚待核对，保留原请求等待处理")
+    return list(dict.fromkeys(reasons))
+
+
 def _pair_orders_unresolved(runtime):
     if runtime.get("attention") or runtime.get("phase") in ("attention", "reconciling", "repairing"):
         return True
@@ -190,6 +233,8 @@ def hub_summary(engine, *, now=None, diagnostics=False):
             for side in ("long", "short"):
                 paired[pair[side + "_account_id"]] = (runtime, side)
                 pair_for_account[pair[side + "_account_id"]] = pair
+        funds_pairs = {pair["id"] for pair in pairs if _funds_only(pair, runtimes[pair["id"]])}
+        funds_journals = {identifier: reader.get("pair_margin:" + identifier, {}) for identifier in funds_pairs}
         if diagnostics:
             for pair in all_pairs:
                 if not pair.get("enabled"):
@@ -207,6 +252,7 @@ def hub_summary(engine, *, now=None, diagnostics=False):
             observations = dict(engine.pair_watch_diagnostics)
     live = [account for account in accounts if account.get("mode") == "live"]
     stamps, margins, volumes, reasons = [], [], [], []
+    required_margins, funds_errors, funds_accounts = [], [], []
 
     def account_diagnostic(account, area, kind, message):
         pair = pair_for_account.get(account["id"])
@@ -248,12 +294,38 @@ def hub_summary(engine, *, now=None, diagnostics=False):
             aid = account["id"]
             label = f"{_text(account.get('name'), '实盘账户')}（{_text(aid, '未知账户')}）"
             runtime, side = paired.get(aid, (None, None))
+            pair = pair_for_account.get(aid)
+            if pair and pair["id"] in funds_pairs:
+                # A funds-only tick intentionally publishes no positions. Use
+                # its real balance read time without renewing historical holdings
+                # or pretending their occupied margin is zero.
+                funds_accounts.append(aid)
+                balances = runtime.get("margin_balances")
+                snapshot, stamp = _snapshot(now, balances.get(side) if isinstance(balances, dict) else None)
+                stamps.append(stamp)
+                margins.append(None)
+                current = []
+                if not snapshot:
+                    current.append(f"{label}：缺少资金快照")
+                else:
+                    if stamp is None:
+                        current.append(f"{label}：资金快照缺少有效更新时间")
+                    elif now - stamp >= STALE_AFTER_SECONDS:
+                        current.append(f"{label}：资金快照已过期（超过 {STALE_AFTER_SECONDS} 秒）")
+                    if any(_number(snapshot.get(field)) is None for field in ("equity", "available", "wallet")):
+                        current.append(f"{label}：资金数据缺失或无效")
+                funds_errors.extend(current)
+                reasons.extend(current)
+                for reason in current:
+                    account_diagnostic(account, "snapshot", "fault", reason)
+                continue
             snapshots = runtime.get("snapshots") if isinstance(runtime, dict) else None
             snapshot, stamp = _snapshot(now,
                 snapshots.get(side) if isinstance(snapshots, dict) else None,
                 engine.views.get(aid, {}).get("snapshot"), engine.display_snapshots.get(aid))
             stamps.append(stamp)
             margins.append(_number(snapshot.get("occupied_margin")))
+            required_margins.append(margins[-1])
             first_reason = len(reasons)
             if not snapshot:
                 reasons.append(f"{label}：缺少账户快照")
@@ -266,6 +338,15 @@ def hub_summary(engine, *, now=None, diagnostics=False):
                     reasons.append(f"{label}：保证金数据缺失或无效")
             for reason in reasons[first_reason:]:
                 account_diagnostic(account, "snapshot", "fault", reason)
+        for pair in pairs:
+            if pair["id"] not in funds_pairs or not any(
+                    pair[side + "_account_id"] in funds_accounts for side in ("long", "short")):
+                continue
+            for reason in _funds_errors(runtimes[pair["id"]], funds_journals[pair["id"]]):
+                message = f"{_text(pair.get('name'), '配对组')}：保证金平衡：{reason}"
+                reasons.append(message)
+                funds_errors.append(message)
+                diagnostic.add(f"pair:{pair['id']}", "fault", message)
     utc_date = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
     reports = engine.dashboard_reports
     with reports.lock:
@@ -309,7 +390,8 @@ def hub_summary(engine, *, now=None, diagnostics=False):
     oldest = min(stamps) if stamps and all(stamp is not None for stamp in stamps) else None
     updated_at = (datetime.fromtimestamp(oldest, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
                   if oldest is not None else None)
-    partial = bool(error or not ready or any(value is None for value in [*stamps, *margins, *volumes]))
+    partial = bool(error or not ready or funds_errors
+                   or any(value is None for value in [*stamps, *required_margins, *volumes]))
     offline = engine.shutdown.is_set() or (engine.thread is not None and not engine.thread.is_alive())
     health = "offline" if offline else "stale" if oldest is not None and now - oldest >= STALE_AFTER_SECONDS else "partial" if partial else "online"
     if offline:
@@ -321,7 +403,8 @@ def hub_summary(engine, *, now=None, diagnostics=False):
     metrics = [
         {"key": "accounts", "label": "启用账户", "value": len(accounts), "unit": "个"},
         {"key": "live_accounts", "label": "实盘账户", "value": len(live), "unit": "个"},
-        {"key": "occupied_margin", "label": "实盘占用保证金", "value": _sum(margins), "unit": "USD1"},
+        {"key": "occupied_margin", "label": "实盘占用保证金", "value": _sum(margins), "unit": "USD1",
+         **({"detail": "仅保证金模式不采集完整持仓；当前占用保证金汇总暂不可用，不按零计入"} if funds_accounts else {})},
         {"key": "daily_volume", "label": "实盘今日成交量", "value": _sum(volumes), "unit": "USD1",
          "detail": "上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总" if any(account["id"] in paired for account in live)
                    else "上游 UTC 日口径；不计入资产汇总"},

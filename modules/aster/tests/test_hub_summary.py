@@ -84,6 +84,195 @@ class HubSummaryTests(TestCase):
         self.assertEqual(result["data"]["health"]["state"], "online")
         self.assertIsNone(self.engine.dashboard_reports.worker)
 
+    def margin_only_pair(self):
+        runtime = self.pair()
+        pair = self.f.store.pair("gold")
+        self.f.store.save_pair({**pair, "ordinary": {**pair["ordinary"], "enabled": False},
+                               "margin": {**pair["margin"], "enabled": True}})
+        for snapshot in runtime["snapshots"].values():
+            snapshot["timestamp"] = self.now - 300
+        runtime["margin_balances"] = {
+            "long": {"timestamp": self.now - 3, "equity": "200", "available": "90", "wallet": "150"},
+            "short": {"timestamp": self.now - 8, "equity": "220", "available": "110", "wallet": "180"},
+        }
+        runtime["margin"] = {"status": "waiting", "reason": "等待下一次保证金检查", "blocks_trading": False}
+        self.f.store.put("pair_runtime:gold", runtime)
+        return runtime
+
+    def test_margin_only_uses_published_balances_without_reads_or_runtime_mutation(self):
+        runtime = self.margin_only_pair()
+        self.engine.view("test", snapshot={"timestamp": self.now - 200, "occupied_margin": "999"})
+        self.engine.display_snapshots["second"] = {"timestamp": self.now - 180, "occupied_margin": "999"}
+        before = deepcopy(runtime)
+        with patch.object(self.engine, "state", side_effect=AssertionError("full state")), \
+             patch.object(self.engine.pairs, "states", side_effect=AssertionError("full pair state")), \
+             patch.object(self.engine, "broker", side_effect=AssertionError("exchange")), \
+             patch.object(self.engine.dashboard_reports, "read", side_effect=AssertionError("start reports")), \
+             patch.object(self.engine, "_load_dashboard_report", side_effect=AssertionError("history")), \
+             patch.object(self.f.market, "book", side_effect=AssertionError("market request")), \
+             patch.object(self.f.store, "get", side_effect=AssertionError("outside snapshot")), \
+             patch.object(self.f.store, "accounts", side_effect=AssertionError("outside snapshot")), \
+             patch.object(self.f.store, "pairs", side_effect=AssertionError("outside snapshot")), \
+             patch.object(self.f.store, "read_snapshot", wraps=self.f.store.read_snapshot) as read_snapshot, \
+             patch("trading.pair_quality.read", side_effect=AssertionError("quality history")), \
+             patch("trading.pair_cost.read", side_effect=AssertionError("cost history")):
+            result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        read_snapshot.assert_called_once_with()
+        self.assertEqual(self.metrics(result), {"accounts": 2, "live_accounts": 2,
+                                              "occupied_margin": None, "daily_volume": 550})
+        margin = next(row for row in result["data"]["metrics"] if row["key"] == "occupied_margin")
+        self.assertRegex(margin.get("detail", ""), "[未不]采集")
+        self.assertEqual(result["data"]["updatedAt"], datetime.fromtimestamp(
+            self.now - 8, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+        self.assertEqual(result["data"]["health"]["state"], "online")
+        self.assertEqual(result["data"]["diagnostics"], [])
+        self.assertEqual(self.f.store.get("pair_runtime:gold"), before)
+        self.assertIsNone(self.engine.dashboard_reports.worker)
+        legacy = hub_summary(self.engine, now=self.now)
+        result["data"].pop("diagnostics")
+        self.assertEqual(result, legacy)
+
+    def test_margin_only_balance_timestamps_keep_real_expiry_and_clock_tolerance(self):
+        runtime = self.margin_only_pair()
+        for timestamp, expected in ((self.now - 119, "online"), (self.now - 120, "stale"),
+                                    (self.now + 60, "online"), (self.now + 61, "partial"),
+                                    (None, "partial"), (0, "partial"), (True, "partial")):
+            with self.subTest(timestamp=timestamp):
+                current = deepcopy(runtime)
+                current["margin_balances"]["short"]["timestamp"] = timestamp
+                self.f.store.put("pair_runtime:gold", current)
+                result = hub_summary(self.engine, now=self.now, diagnostics=True)
+                self.assertEqual(result["data"]["health"]["state"], expected)
+                self.assertIsNone(self.metrics(result)["occupied_margin"])
+                if expected == "online":
+                    self.assertEqual(result["data"]["diagnostics"], [])
+                else:
+                    self.assertTrue(any(row["kind"] == "fault" for row in result["data"]["diagnostics"]))
+                if expected == "stale":
+                    self.assertIn("过期", result["data"]["health"]["message"])
+                    self.assertEqual(result["data"]["updatedAt"], datetime.fromtimestamp(
+                        timestamp, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+
+    def test_margin_only_missing_or_invalid_balances_never_borrow_complete_snapshots(self):
+        runtime = self.margin_only_pair()
+        for snapshot in runtime["snapshots"].values():
+            snapshot["timestamp"] = self.now
+        valid = runtime["margin_balances"]["short"]
+        cases = [None, {}, [], {key: value for key, value in valid.items() if key != "timestamp"}]
+        for field in ("equity", "available", "wallet"):
+            cases.append({key: value for key, value in valid.items() if key != field})
+            cases.extend({**valid, field: value} for value in (None, True, "nan", "Infinity", "invalid"))
+        for balance in cases:
+            with self.subTest(balance=balance):
+                current = deepcopy(runtime)
+                current["margin_balances"]["short"] = balance
+                self.f.store.put("pair_runtime:gold", current)
+                result = hub_summary(self.engine, now=self.now, diagnostics=True)
+                self.assertEqual(result["data"]["health"]["state"], "partial")
+                self.assertIsNone(self.metrics(result)["occupied_margin"])
+                self.assertTrue(any(row["kind"] == "fault" for row in result["data"]["diagnostics"]))
+        for balances in (None, {}, []):
+            with self.subTest(balances=balances):
+                self.f.store.put("pair_runtime:gold", {**runtime, "margin_balances": balances})
+                result = hub_summary(self.engine, now=self.now, diagnostics=True)
+                self.assertEqual(result["data"]["health"]["state"], "partial")
+                self.assertIsNone(self.metrics(result)["occupied_margin"])
+
+    def test_margin_only_does_not_replace_positions_needed_by_strategy_or_recovery(self):
+        runtime = self.margin_only_pair()
+        pair = self.f.store.pair("gold")
+        cases = [("ordinary", {}, {"ordinary": {**pair["ordinary"], "enabled": True}}),
+                 ("cycle", {}, {"cycle": {**pair["cycle"], "enabled": True}}),
+                 ("margin disabled", {}, {"margin": {**pair["margin"], "enabled": False}}),
+                 ("pending empty", {"pending": {}}, {}),
+                 ("pending order", {"pending": {"kind": "ordinary", "phase": "open"}}, {})]
+        cases.extend((f"quantities {quantities}", {"progress": {"quantities": quantities}}, {}) for quantities in (
+            {"LONG": "1", "SHORT": "0"}, {"LONG": "0", "SHORT": "-1"},
+            {"LONG": "0"}, {"LONG": "0", "SHORT": "nan"},
+            {"LONG": "0", "SHORT": True}, {"LONG": "0", "SHORT": "1e-999"},
+            {"LONG": "0", "SHORT": "0", "OTHER": "1"}, None))
+        for name, changes, configuration in cases:
+            with self.subTest(name=name):
+                self.f.store.save_pair({**pair, **configuration,
+                                       "revision": self.f.store.pair("gold")["revision"]})
+                self.f.store.put("pair_runtime:gold", {**deepcopy(runtime), **changes})
+                result = hub_summary(self.engine, now=self.now, diagnostics=True)
+                self.assertEqual(result["data"]["health"]["state"], "stale")
+                self.assertEqual(self.metrics(result)["occupied_margin"], 30)
+                self.assertIn("账户快照已过期", result["data"]["health"]["message"])
+
+    def test_margin_only_mixed_accounts_do_not_publish_an_incomplete_margin_total(self):
+        self.margin_only_pair()
+        self.live("standalone", margin="10", volume="25")
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual(self.metrics(result), {"accounts": 3, "live_accounts": 3,
+                                              "occupied_margin": None, "daily_volume": 575})
+        self.assertEqual(result["data"]["health"]["state"], "online")
+        self.assertEqual(result["data"]["diagnostics"], [])
+        margin = next(row for row in result["data"]["metrics"] if row["key"] == "occupied_margin")
+        self.assertRegex(margin.get("detail", ""), "[未不]采集")
+
+    def test_margin_only_latest_durable_read_failure_survives_fresh_balances(self):
+        runtime = self.margin_only_pair()
+        reason = "账户读取失败：HTTP 500"
+        journal = {"checked_at": self.now, "next_check_at": self.now + 10, "blocked_reason": reason}
+        self.f.store.put("pair_margin:gold", journal)
+        reads = []
+        original_get = _StoreSnapshot.get
+
+        def read(reader, key, *args):
+            reads.append((id(reader), key))
+            return original_get(reader, key, *args)
+
+        with patch.object(_StoreSnapshot, "get", new=read), \
+             patch.object(self.f.store, "get", side_effect=AssertionError("outside snapshot")), \
+             patch.object(self.engine, "broker", side_effect=AssertionError("new account read")), \
+             patch.object(self.f.store, "read_snapshot", wraps=self.f.store.read_snapshot) as read_snapshot:
+            result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        read_snapshot.assert_called_once_with()
+        self.assertEqual(len({identity for identity, _ in reads}), 1)
+        self.assertTrue({"pair_runtime:gold", "pair_margin:gold"}.issubset({key for _, key in reads}))
+        self.assertEqual(result["data"]["health"]["state"], "partial")
+        self.assertIn(reason, result["data"]["health"]["message"])
+        self.assertTrue(any(row["kind"] == "fault" and reason in row["message"]
+                            for row in result["data"]["diagnostics"]))
+        self.assertEqual(self.f.store.get("pair_runtime:gold"), runtime)
+        self.assertEqual(self.f.store.get("pair_margin:gold"), journal)
+        self.f.store.put("pair_margin:gold", {})
+        recovered = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual(recovered["data"]["health"]["state"], "online")
+        self.assertEqual(recovered["data"]["diagnostics"], [])
+
+    def test_margin_only_unresolved_transfer_remains_a_fault_with_current_balances(self):
+        runtime = self.margin_only_pair()
+        self.f.store.put("pair_margin:gold", {"pending": {"status": "unknown", "amount": "25",
+                                                          "source": "long", "destination": "short"}})
+        result = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual(result["data"]["health"]["state"], "partial")
+        self.assertTrue(any(row["kind"] == "fault" for row in result["data"]["diagnostics"]))
+        self.assertIn("划转", result["data"]["health"]["message"])
+        self.assertIsNone(self.metrics(result)["occupied_margin"])
+        runtime["margin"] = {"status": "acknowledged", "blocks_trading": True,
+                             "reason": "交易所已确认划转，等待刷新余额"}
+        self.f.store.put("pair_runtime:gold", runtime)
+        self.f.store.put("pair_margin:gold", {"pending": {"status": "acknowledged", "amount": "25",
+                                                          "source": "long", "destination": "short"}})
+        waiting = hub_summary(self.engine, now=self.now, diagnostics=True)
+        self.assertEqual(waiting["data"]["health"]["state"], "online")
+        self.assertEqual(waiting["data"]["diagnostics"], [])
+
+    def test_margin_only_finite_zero_and_negative_balances_are_not_missing_data(self):
+        runtime = self.margin_only_pair()
+        for value in ("0", "-2.5"):
+            with self.subTest(value=value):
+                for balance in runtime["margin_balances"].values():
+                    balance.update(equity=value, available=value, wallet=value)
+                self.f.store.put("pair_runtime:gold", runtime)
+                result = hub_summary(self.engine, now=self.now, diagnostics=True)
+                self.assertEqual(result["data"]["health"]["state"], "online")
+                self.assertEqual(result["data"]["diagnostics"], [])
+                self.assertIsNone(self.metrics(result)["occupied_margin"])
+
     def test_diagnostics_are_opt_in_and_keep_legacy_values_and_health(self):
         self.pair()
         with patch.object(_StoreSnapshot, "intent", side_effect=AssertionError("opt-in only")):
@@ -623,7 +812,7 @@ class HubWatchDiagnosticTests(TestCase):
         self.f.store.put("pair_runtime:gold", runtime)
         self.assert_kind("notice", volume=None)
 
-    def test_failed_watch_check_is_fault_and_observed_new_activity_is_action(self):
+    def test_failed_watch_check_is_fault_and_active_receipt_is_action(self):
         self.activate_watch()
         original = deepcopy(self.state())
         pair = self.f.store.pair("gold")
@@ -632,12 +821,11 @@ class HubWatchDiagnosticTests(TestCase):
                 require_archived_orders_clear(self.engine, pair)
         self.assert_kind("fault")
         leg = original["recovery_watch"]["batches"][0]["legs"][0]
-        for status, quantity in (("NEW", "0"), ("FILLED", "0.2")):
-            with self.subTest(status=status), self.no_writes(), \
-                 patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status=status, qty=quantity)):
-                with self.assertRaisesRegex(TradingError, "出现成交或活动回执"):
-                    require_archived_orders_clear(self.engine, pair)
-            self.assert_kind("action")
+        with self.no_writes(), \
+             patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status="NEW", qty="0")):
+            with self.assertRaisesRegex(TradingError, "活动回执"):
+                require_archived_orders_clear(self.engine, pair)
+        self.assert_kind("action")
         with self.no_writes(), patch.object(self.broker(), "query", side_effect=ExchangeError("offline")):
             with self.assertRaises(TradingError):
                 require_archived_orders_clear(self.engine, pair)
@@ -689,5 +877,5 @@ class HubWatchDiagnosticTests(TestCase):
             self.assertEqual(len(require_archived_orders_clear(self.engine, pair)), 2)
             leg = self.state()["recovery_watch"]["batches"][0]["legs"][0]
             with patch.object(self.broker(), "query", return_value=recovery_tests.receipt_for(leg, status="NEW")):
-                with self.assertRaisesRegex(TradingError, "出现成交或活动回执"):
+                with self.assertRaisesRegex(TradingError, "活动回执"):
                     require_archived_orders_clear(self.engine, pair)

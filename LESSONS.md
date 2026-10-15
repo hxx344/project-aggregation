@@ -627,6 +627,8 @@
 
 **证据：** project-aggregation `63d621d` 的 [划转实现](modules/aster/trading/margin_balance.py) 在 `_check_snapshots` 限制指定标的和方向，`_plan` 使用 `ordinary.margin_limit`；[配对入口](modules/aster/trading/pairing.py) 及 [执行调度](modules/aster/trading/pair_execution.py) 先要求策略仓位和行情。2026-10-15 用户明确要求保证金平衡独立于持仓标的，本轮定向回归覆盖上述误阻断。
 
+**汇总显示补充：** 2026-10-15 用户确认仅启用保证金平衡时仍报告账户与项目数据过期。基线 `a45e687` 的配对成员已跳过独立账户读取，资金任务只更新 `margin_balances`，但 [工作台摘要](modules/aster/trading/hub_summary.py) 仍按历史完整仓位快照判断时效。仅资金模式且无策略待处理批次、无循环持仓时，摘要改用两侧资金快照的真实读取时间；不采集的持仓占用返回未知并说明原因，不伪造零值，也不更新旧仓位时间。最新资金读取失败仍以持久划转日志为依据报告，正常发送与已确认后的余额刷新阶段不直接等同故障。[摘要测试](modules/aster/tests/test_hub_summary.py) 覆盖上述场景、真实余额过期及混合账户汇总，并确认不增加交易所请求。此为本事件的显示路径补全，不增加独立事件计数。
+
 **事件记录：** `aster-transfer-strategy-coupling-20261015`；一次用户纠正及完整调用链修复，不推进主线复盘检查点。
 
 ### L042：旧配置的同值写入不能覆盖新模型的细分选择
