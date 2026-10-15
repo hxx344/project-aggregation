@@ -12,6 +12,9 @@ import { createHandler } from '../server/http.mjs';
 import { createFundingSnapshot, fetchFundingSnapshot } from '../modules/oil/funding-history.mjs';
 import { createFundingSnapshot as createBinanceFundingSnapshot } from '../modules/oil/binance-funding-history.mjs';
 import { loadMarket, getMarketSnapshot } from '../lib/market-service.ts';
+import { createExchangeReader } from '../lib/exchange-service.ts';
+import { marketFromExchangeQuote } from '../modules/oil/binance.mjs';
+import { readHubSummary } from '../server/hub-summary.mjs';
 
 const NOW = Date.UTC(2026, 8, 16), HOUR = 3_600_000;
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -174,6 +177,69 @@ test('outages retain persisted data and receipt time, prohibit alerts, and recov
     assert.equal(await collector.collect({ id: 'hynix', action: 'quote', load: async previous => { assert.equal(previous.adr, 22); return quote(now, 23); } }), true);
     assert.equal(store.read('hynix', 'quote', { fresh: true }).adr, 23);
     assert.equal(store.read('hynix', 'quote').collection.error, null);
+  } finally { await collector.stop(); store.close(); }
+});
+
+test('oil retries a transient public quote read; persistent errors retain source time and reach the hub until a real recovery', async t => {
+  let now = NOW, priceCalls = 0, stored = 0, phase = 'initial';
+  const { store } = await database(t, () => now);
+  const sleeps = [];
+  const read = createExchangeReader({ clock: () => now, sleep: async ms => { sleeps.push(ms); }, fetcher: async input => {
+    const path = new URL(input).pathname;
+    if (path.endsWith('/exchangeInfo')) return Response.json({ symbols: ['BZ', 'CL'].map(baseAsset => ({
+      symbol: baseAsset + 'USDT', baseAsset, quoteAsset: 'USDT', marginAsset: 'USDT', status: 'TRADING', contractType: 'TRADIFI_PERPETUAL',
+    })) });
+    if (path.endsWith('/fundingInfo')) return Response.json([]);
+    priceCalls++;
+    if (phase === 'failed' || phase === 'transient' && priceCalls === 2) return new Response('PRIVATE_UPSTREAM_BODY', { status: 502 });
+    return Response.json(['BZ', 'CL'].map((base, index) => ({ symbol: base + 'USDT', markPrice: String(100 - index * 5),
+      lastFundingRate: '0', nextFundingTime: now + HOUR, time: phase === 'old' ? now - 121_000 : now - 2000 })));
+  } });
+  const job = { id: 'oil', action: 'quote', load: async () => marketFromExchangeQuote(await read('binance', 'oil')) };
+  const collector = createMarketCollector(store, { jobs: [], onStored: () => { stored++; } });
+  try {
+    assert.equal(await collector.collect(job), true);
+    await flush();
+    now += 30_000; phase = 'transient';
+    assert.equal(await collector.collect(job), true);
+    await flush();
+    assert.equal(priceCalls, 3, 'The one failed request was retried inside the same collection');
+    assert.deepEqual(sleeps, [300]);
+    const good = store.read('oil', 'quote', { fresh: true });
+    assert.equal(good.fetchedAt, new Date(now - 2000).toISOString());
+    assert.equal(stored, 2);
+
+    now += 30_000; phase = 'failed';
+    assert.equal(await collector.collect(job), false);
+    await flush();
+    assert.equal(priceCalls, 5, 'Persistent transport failures stop after two attempts');
+    assert.equal(stored, 2, 'Failed reads never notify alert consumers');
+    const retained = store.read('oil', 'quote');
+    assert.equal(retained.fetchedAt, good.fetchedAt);
+    assert.equal(retained.collection.lastSuccessAt, good.collection.lastSuccessAt);
+    assert.equal(retained.collection.lastAttemptAt, new Date(now).toISOString());
+    assert.match(retained.collection.error, /Binance 标记价格.*HTTP 502/);
+    assert.doesNotMatch(retained.collection.error, /PRIVATE_UPSTREAM_BODY/);
+    assert.throws(() => store.read('oil', 'quote', { fresh: true }));
+    const summary = await readHubSummary(new Map([['oil', { handle: () => retained }]]), now);
+    assert.equal(summary.health.state, 'stale');
+    assert.equal(summary.updatedAt, good.fetchedAt);
+    assert.match(summary.health.message, /Binance 标记价格.*HTTP 502/);
+
+    now += 30_000; phase = 'old';
+    assert.equal(await collector.collect(job), false);
+    assert.equal(priceCalls, 6, 'An old source timestamp is a validation error, not retryable transport');
+    assert.match(store.read('oil', 'quote').collection.error, /报价校验.*时间无效/);
+    assert.equal(store.raw('oil', 'quote').fetchedAt, good.fetchedAt);
+    assert.equal(stored, 2);
+
+    now += 30_000; phase = 'recovered';
+    assert.equal(await collector.collect(job), true);
+    await flush();
+    const recovered = store.read('oil', 'quote', { fresh: true });
+    assert.equal(recovered.collection.error, null);
+    assert.equal(recovered.fetchedAt, new Date(now - 2000).toISOString());
+    assert.equal(stored, 3);
   } finally { await collector.stop(); store.close(); }
 });
 

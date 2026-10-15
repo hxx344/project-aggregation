@@ -130,6 +130,122 @@ test('concurrent market reads share Bybit pagination and quote transport; expire
   now += 60000; await reader('bybit', 'hynix'); assert.equal(calls.length, 7);
 });
 
+test('concurrent Binance markets share one transient retry and preserve upstream timestamps', async () => {
+  let now = NOW;
+  const calls = { exchangeInfo: 0, premiumIndex: 0, fundingInfo: 0 }, sleeps = [], f = fixtures();
+  const reader = createExchangeReader({ clock: () => now, sleep: async delay => { sleeps.push(delay); now += delay; }, fetcher: async input => {
+    const endpoint = new URL(input).pathname.split('/').at(-1);
+    calls[endpoint]++;
+    if (endpoint === 'exchangeInfo') return Response.json(f.binanceInstruments);
+    if (endpoint === 'fundingInfo') return Response.json(f.binanceFunding);
+    if (calls.premiumIndex === 1) return new Response('temporary gateway failure', { status: 502 });
+    return Response.json(f.binanceTickers);
+  } });
+  const [oil, hynix] = await Promise.all(['oil', 'hynix'].map(id => reader('binance', id)));
+  assert.equal(oil.left.price, 104); assert.equal(hynix.left.price, 180);
+  assert.deepEqual(calls, { exchangeInfo: 1, premiumIndex: 2, fundingInfo: 1 });
+  assert.deepEqual(sleeps, [300]);
+  for (const value of [oil, hynix]) {
+    assert.equal(value.fetchedAt, new Date(NOW).toISOString());
+    assert.equal(value.fundingFetchedAt, new Date(NOW).toISOString());
+  }
+});
+
+test('persistent Binance failures are bounded, never return expired cached prices, and recover on a new read', async () => {
+  let now = NOW, unavailable = false, priceCalls = 0;
+  const sleeps = [];
+  const reader = createExchangeReader({ clock: () => now, sleep: async delay => { sleeps.push(delay); now += delay; }, fetcher: async input => {
+    const f = fixtures(now);
+    if (input.endsWith('/exchangeInfo')) return Response.json(f.binanceInstruments);
+    if (input.endsWith('/fundingInfo')) return Response.json(f.binanceFunding);
+    priceCalls++;
+    return unavailable ? new Response('private gateway details', { status: 503 }) : Response.json(f.binanceTickers);
+  } });
+  const original = await reader('binance', 'oil');
+  now += 1500; unavailable = true;
+  const failures = await Promise.allSettled(['oil', 'hynix'].map(id => reader('binance', id)));
+  assert.ok(failures.every(result => result.status === 'rejected' && result.reason.kind === 'http' && result.reason.httpStatus === 503));
+  assert.equal(priceCalls, 3); assert.deepEqual(sleeps, [300]);
+  assert.equal(original.fetchedAt, new Date(NOW).toISOString());
+  unavailable = false;
+  const recovered = await reader('binance', 'oil');
+  assert.equal(priceCalls, 4); assert.equal(recovered.fetchedAt, new Date(now).toISOString());
+});
+
+test('funding-only Binance rate limits preserve current prices and resume funding after cooldown', async () => {
+  let now = NOW, fundingCalls = 0, priceCalls = 0;
+  const sleeps = [];
+  const reader = createExchangeReader({ clock: () => now, sleep: async delay => { sleeps.push(delay); }, fetcher: async input => {
+    const f = fixtures(now);
+    if (input.endsWith('/exchangeInfo')) return Response.json(f.binanceInstruments);
+    if (input.endsWith('/premiumIndex')) { priceCalls++; return Response.json(f.binanceTickers); }
+    fundingCalls++;
+    return fundingCalls === 1 ? new Response('private funding limit details', { status: 429 }) : Response.json(f.binanceFunding);
+  } });
+  const initial = await Promise.all(['oil', 'hynix'].map(id => reader('binance', id)));
+  for (const value of initial) {
+    assert.equal(value.status, 'live'); assert.ok(value.left.price > 0);
+    assert.equal(value.fundingFetchedAt, null); assert.equal(calculateExchangeSpread(value).shortAnnualized, null);
+  }
+  now += 1500;
+  const duringCooldown = await reader('binance', 'oil');
+  assert.equal(duringCooldown.fetchedAt, new Date(now).toISOString());
+  assert.equal(fundingCalls, 1); assert.equal(priceCalls, 2); assert.deepEqual(sleeps, []);
+  now = NOW + 60_000;
+  const recovered = await reader('binance', 'hynix');
+  assert.equal(fundingCalls, 2); assert.equal(priceCalls, 3);
+  assert.equal(recovered.left.fundingIntervalHours, 8);
+  assert.equal(recovered.fundingFetchedAt, new Date(now).toISOString());
+});
+
+test('a Binance IP ban is shared across markets and expires before network reads resume', async () => {
+  let now = NOW, banned = true;
+  const calls = [], sleeps = [];
+  const reader = createExchangeReader({ clock: () => now, sleep: async delay => { sleeps.push(delay); }, fetcher: async input => {
+    const endpoint = new URL(input).pathname.split('/').at(-1); calls.push(endpoint);
+    const f = fixtures(now);
+    if (endpoint === 'premiumIndex' && banned) return new Response('private ban details', { status: 418 });
+    return Response.json(endpoint === 'exchangeInfo' ? f.binanceInstruments : endpoint === 'fundingInfo' ? f.binanceFunding : f.binanceTickers);
+  } });
+  const first = await Promise.allSettled(['oil', 'hynix'].map(id => reader('binance', id)));
+  assert.ok(first.every(result => result.status === 'rejected' && result.reason.httpStatus === 418));
+  const initialCount = calls.length;
+  now += 61_000; banned = false;
+  for (const id of ['oil', 'hynix']) await assert.rejects(reader('binance', id), error => error.httpStatus === 418);
+  assert.equal(calls.length, initialCount); assert.deepEqual(sleeps, []);
+  now = NOW + 120_000;
+  const recovered = await Promise.all(['oil', 'hynix'].map(id => reader('binance', id)));
+  assert.equal(calls.length, initialCount + 3);
+  assert.ok(recovered.every(value => value.fetchedAt === new Date(now).toISOString()));
+});
+
+test('invalid Binance quote data is not retried or repaired by a fresh local timestamp', async () => {
+  for (const corrupt of [
+    f => { f.binanceTickers[0].markPrice = ''; },
+    f => { f.binanceTickers.forEach(row => { row.time = NOW - 121_000; }); },
+  ]) {
+    const calls = [], sleeps = [], f = fixtures(); corrupt(f);
+    const reader = createExchangeReader({ clock: () => NOW, sleep: async delay => { sleeps.push(delay); }, fetcher: async input => {
+      const endpoint = new URL(input).pathname.split('/').at(-1); calls.push(endpoint);
+      return Response.json(endpoint === 'exchangeInfo' ? f.binanceInstruments : endpoint === 'fundingInfo' ? f.binanceFunding : f.binanceTickers);
+    } });
+    await assert.rejects(reader('binance', 'oil'), error => error.kind === 'invalid_data' && error.endpoint === 'quote');
+    assert.equal(calls.length, 3); assert.deepEqual(sleeps, []);
+  }
+});
+
+test('a malformed Binance oil pair does not suppress the concurrently requested Hynix quote', async () => {
+  const calls = [], f = fixtures(); f.binanceTickers[0].markPrice = '';
+  const reader = createExchangeReader({ clock: () => NOW, sleep: async () => assert.fail('invalid data must not retry'), fetcher: async input => {
+    const endpoint = new URL(input).pathname.split('/').at(-1); calls.push(endpoint);
+    return Response.json(endpoint === 'exchangeInfo' ? f.binanceInstruments : endpoint === 'fundingInfo' ? f.binanceFunding : f.binanceTickers);
+  } });
+  const [oil, hynix] = await Promise.allSettled(['oil', 'hynix'].map(id => reader('binance', id)));
+  assert.equal(oil.status, 'rejected'); assert.equal(oil.reason.kind, 'invalid_data');
+  assert.equal(hynix.status, 'fulfilled'); assert.equal(hynix.value.left.price, 180);
+  assert.equal(calls.length, 3);
+});
+
 test('malformed or unavailable Binance funding metadata preserves prices and retries without poisoning the cache', async () => {
   let now = NOW, fundingCalls = 0;
   const reader = createExchangeReader({ clock: () => now, fetcher: async input => {

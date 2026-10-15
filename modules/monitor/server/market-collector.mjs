@@ -16,6 +16,7 @@ import { exchangeFundingAction, HISTORY_REFRESH_MS } from '../lib/exchange-fundi
 import { createExchangeFundingReader } from '../lib/exchange-funding-service.ts';
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
 import { createOilHedgePricesReader } from '../lib/oil-hedge-price-service.ts';
+import { formatBinanceQuoteError } from '../lib/binance-quote-request.ts';
 
 export function seedMarketDatabase(store) {
   store.write('hynix', 'history', getMarketSnapshot(), { seed: true });
@@ -80,9 +81,10 @@ export function createMarketCollector(store, { jobs = marketJobs(), clock = Date
         next = await job.load(store.raw(job.id, job.action));
         if (cancelled()) return false;
         if (next?.status === 'snapshot') throw new Error('Upstream returned a retained snapshot');
-      } catch {
+      } catch (error) {
         if (cancelled()) return false;
-        try { store.fail(job.id, job.action, '采集暂时失败，保留上次成功数据；后台将自动重试。'); storageFailures.delete(key); }
+        const message = formatBinanceQuoteError(error) ?? '采集暂时失败，保留上次成功数据；后台将自动重试。';
+        try { store.fail(job.id, job.action, message); storageFailures.delete(key); }
         catch { storageFailures.add(key); }
         return false;
       }

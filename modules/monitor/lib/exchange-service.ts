@@ -3,6 +3,7 @@ import { fetchMarket as fetchHyperliquidOil } from '../modules/oil/hyperliquid.m
 import { createOilCexReader } from './oil-cex.ts';
 import { createOilDexReader } from './oil-dex.ts';
 import type { VariationalSession } from './variational-api.ts';
+import { BinanceQuoteError, createBinanceQuoteRequest } from './binance-quote-request.ts';
 
 type JsonObject = Record<string, unknown>;
 const obj = (value: unknown): JsonObject => { if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid exchange response"); return value as JsonObject; };
@@ -55,8 +56,9 @@ function finish(exchange: ExternalExchange, monitorId: SpreadMarket, fetchedAt: 
 }
 
 /** Share only transport requests; one unavailable pair cannot stop the other market. */
-export function createExchangeReader({ fetcher = fetch, clock = Date.now, variationalSession, variationalFetcher = fetcher }: { fetcher?: typeof fetch; clock?: () => number; variationalSession?: VariationalSession; variationalFetcher?: typeof fetch } = {}) {
+export function createExchangeReader({ fetcher = fetch, clock = Date.now, variationalSession, variationalFetcher = fetcher, sleep }: { fetcher?: typeof fetch; clock?: () => number; variationalSession?: VariationalSession; variationalFetcher?: typeof fetch; sleep?: (ms: number) => Promise<void> } = {}) {
   const cache = new Map<string, { value: unknown; until: number }>(), pending = new Map<string, Promise<unknown>>();
+  const requestBinance = createBinanceQuoteRequest({ fetcher, clock, sleep });
   async function request(url: string) {
     const response = await fetcher(url, { cache: "no-store", signal: AbortSignal.timeout(10_000) });
     if (!response.ok) throw new Error(`Exchange market HTTP ${response.status}`);
@@ -98,8 +100,9 @@ export function createExchangeReader({ fetcher = fetch, clock = Date.now, variat
       return parseBybitQuote(monitorId, metadata as JsonObject[], tickers, clock());
     }
     if (exchange === "binance") {
-      const [metadata, tickers, funding] = await Promise.all([shared("binance/instruments", 60_000, () => request("https://fapi.binance.com/fapi/v1/exchangeInfo")), shared("binance/tickers", 1000, () => request("https://fapi.binance.com/fapi/v1/premiumIndex")), shared("binance/funding", 15_000, async () => list(await request("https://fapi.binance.com/fapi/v1/fundingInfo"))).catch(() => null)]);
-      return parseBinanceQuote(monitorId, metadata, tickers, funding, clock());
+      const [metadata, tickers, funding] = await Promise.all([shared("binance/instruments", 60_000, () => requestBinance('exchangeInfo')), shared("binance/tickers", 1000, () => requestBinance('premiumIndex')), shared("binance/funding", 15_000, async () => list(await requestBinance('fundingInfo'))).catch(() => null)]);
+      try { return parseBinanceQuote(monitorId, metadata, tickers, funding, clock()); }
+      catch { throw new BinanceQuoteError('quote', 'invalid_data'); }
     }
     throw new Error("Unknown exchange");
   };
