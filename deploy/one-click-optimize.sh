@@ -100,20 +100,42 @@ MANIFEST_PY
 
   START_DOWNLOAD=$(date +%s.%N)
 
-  if ! curl --fail --location --proto '=https' --tlsv1.2 \
+  # 尝试下载，但不因失败而退出整个测试
+  set +e  # 临时允许命令失败
+  curl --fail --location --proto '=https' --tlsv1.2 \
     --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
     --progress-bar \
-    "$DOWNLOAD_URL" -o "$ARCHIVE" 2>&1; then
-    print_error "下载失败或超时"
-    DOWNLOAD_SUCCESS=false
-    DOWNLOAD_SPEED=0
-    return 1
-  fi
+    "$DOWNLOAD_URL" -o "$ARCHIVE" 2>&1
+  CURL_EXIT_CODE=$?
+  set -e  # 恢复严格模式
 
   END_DOWNLOAD=$(date +%s.%N)
   DOWNLOAD_TIME=$(echo "$END_DOWNLOAD - $START_DOWNLOAD" | bc)
 
-  # 计算速度
+  if [ $CURL_EXIT_CODE -ne 0 ]; then
+    # 下载失败或超时
+    FILE_SIZE=$(stat -c %s "$ARCHIVE" 2>/dev/null || stat -f %z "$ARCHIVE" 2>/dev/null || echo "0")
+    FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE / 1024 / 1024" | bc)
+
+    echo ""
+    print_error "下载失败或超时"
+    echo "  已下载: ${FILE_SIZE_MB} MB"
+    echo "  耗时: ${DOWNLOAD_TIME}s"
+
+    if [ "$FILE_SIZE" -gt 0 ]; then
+      # 部分下载，计算已下载部分的速度
+      DOWNLOAD_SPEED=$(echo "scale=2; $FILE_SIZE_MB / $DOWNLOAD_TIME" | bc)
+      echo "  部分速度: ${DOWNLOAD_SPEED} MB/s"
+    else
+      DOWNLOAD_SPEED=0
+    fi
+
+    DOWNLOAD_SUCCESS=false
+    NEEDS_OPTIMIZATION=true  # 超时说明需要镜像
+    return 0  # 不退出，继续执行
+  fi
+
+  # 下载成功
   FILE_SIZE=$(stat -c %s "$ARCHIVE" 2>/dev/null || stat -f %z "$ARCHIVE" 2>/dev/null)
   FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE / 1024 / 1024" | bc)
   DOWNLOAD_SPEED=$(echo "scale=2; $FILE_SIZE_MB / $DOWNLOAD_TIME" | bc)
@@ -222,7 +244,15 @@ generate_report() {
 
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  下载速度: ${DOWNLOAD_SPEED} MB/s"
+  if [ "$DOWNLOAD_SUCCESS" = "true" ]; then
+    echo "  下载状态: 成功"
+    echo "  下载速度: ${DOWNLOAD_SPEED} MB/s"
+  else
+    echo "  下载状态: 失败/超时"
+    if [ "$DOWNLOAD_SPEED" != "0" ]; then
+      echo "  部分速度: ${DOWNLOAD_SPEED} MB/s"
+    fi
+  fi
   echo "  速度阈值: ${SPEED_THRESHOLD} MB/s"
   echo "  需要优化: $NEEDS_OPTIMIZATION"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -231,7 +261,9 @@ generate_report() {
     print_success "下载速度良好，无需部署镜像"
     echo ""
     echo "当前速度已达标（≥ ${SPEED_THRESHOLD} MB/s）"
-    echo "预计更新耗时: 约 $(python3 -c "print(int(108 / $DOWNLOAD_SPEED))") 秒"
+    if [ "$DOWNLOAD_SUCCESS" = "true" ]; then
+      echo "预计更新耗时: 约 $(python3 -c "print(int(108 / $DOWNLOAD_SPEED))") 秒"
+    fi
   else
     if [ "$MIRROR_EXISTS" = true ]; then
       print_info "已部署镜像，但速度仍较慢"
@@ -247,12 +279,21 @@ generate_report() {
       print_success "已完成镜像部署"
       echo ""
       echo "优化效果："
-      echo "  首次更新: 仍需从 GitHub 下载（约 ${DOWNLOAD_TIME}s）"
+      if [ "$DOWNLOAD_SUCCESS" = "true" ]; then
+        echo "  首次更新: 仍需从 GitHub 下载（约 ${DOWNLOAD_TIME}s）"
+      else
+        echo "  首次更新: 仍需从 GitHub 下载（较慢）"
+      fi
       echo "  后续更新: 从本地镜像读取（预计 10-20s）"
       echo "  速度提升: 预计 5-10 倍"
     else
-      print_warning "下载速度较慢，建议部署镜像"
+      print_warning "下载速度较慢或失败，强烈建议部署镜像"
       echo ""
+      if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
+        echo "⚠️  当前网络无法稳定下载 GitHub 发布包"
+        echo "   部署本地镜像后，后续更新将从本地读取，避免下载超时"
+        echo ""
+      fi
       echo "要部署镜像，请以 root 权限运行："
       echo "  sudo $0"
       echo ""
@@ -276,11 +317,8 @@ main() {
   # 检查权限
   check_root
 
-  # 测试下载速度
-  if ! test_download_speed; then
-    print_error "下载测试失败，无法继续"
-    exit 1
-  fi
+  # 测试下载速度（即使失败也继续，可能仍需要部署镜像）
+  test_download_speed
 
   # 检查现有镜像
   if check_existing_mirror; then
@@ -296,7 +334,16 @@ main() {
   if [ "$NEEDS_OPTIMIZATION" = "true" ]; then
     if [ "$AUTO_DEPLOY" = "true" ] && [ "$CAN_DEPLOY" = "true" ]; then
       echo ""
-      print_warning "检测到下载速度较慢（${DOWNLOAD_SPEED} MB/s < ${SPEED_THRESHOLD} MB/s）"
+      if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
+        print_warning "检测到下载失败或超时"
+        echo ""
+        echo "⚠️  GitHub 下载不稳定，部署本地镜像可以："
+        echo "   • 首次更新：仍需从 GitHub 下载到本地"
+        echo "   • 后续更新：直接从本地镜像读取（10-20秒）"
+        echo "   • 避免后续更新超时问题"
+      else
+        print_warning "检测到下载速度较慢（${DOWNLOAD_SPEED} MB/s < ${SPEED_THRESHOLD} MB/s）"
+      fi
       echo ""
       read -p "是否立即部署 Nginx 镜像？(y/N) " -n 1 -r </dev/tty
       echo
