@@ -82,6 +82,7 @@ ci_release_download() {
 import concurrent.futures
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -112,7 +113,16 @@ class DownloadError(Exception):
     pass
 
 
+class LocalDownloadError(DownloadError):
+    """A local permission, configuration or cache error must never trigger failover."""
+    pass
+
+
 class Cancelled(DownloadError):
+    pass
+
+
+class MirrorTimeout(DownloadError):
     pass
 
 
@@ -129,6 +139,11 @@ def require(condition, message):
         raise DownloadError(message)
 
 
+def require_local(condition, message):
+    if not condition:
+        raise LocalDownloadError(message)
+
+
 def https_url(url):
     parsed = urllib.parse.urlsplit(url)
     require(parsed.scheme == 'https' and parsed.hostname and
@@ -137,12 +152,107 @@ def https_url(url):
     return url
 
 
+def mirror_base_url(value):
+    """Only an explicitly configured literal loopback endpoint may use HTTP."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = parsed.hostname or ''
+        try:
+            ipaddress.ip_address(host)
+            valid_host = True
+        except ValueError:
+            valid_host = (0 < len(host) <= 253 and all(re.fullmatch(
+                r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in host.split('.')))
+        valid = (isinstance(value, str) and value.isascii() and
+                 not any(ord(char) <= 32 or char == '\\' for char in value) and
+                 parsed.scheme in ('https', 'http') and parsed.hostname and
+                 parsed.username is None and parsed.password is None and
+                 parsed.path in ('', '/') and not parsed.query and not parsed.fragment and
+                 (parsed.port is None or 1 <= parsed.port <= 65535) and
+                 valid_host and '%' not in parsed.netloc and
+                 (parsed.scheme == 'https' or parsed.hostname in ('127.0.0.1', '::1')))
+    except (TypeError, ValueError):
+        valid = False
+    require_local(valid, 'mirror must be an HTTPS origin or explicit literal loopback HTTP origin')
+    return value.rstrip('/')
+
+
+def mirror_origin(url):
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == 'https' else 80)
+
+
+def download_url(url, http_origin=None):
+    if http_origin is not None:
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', '::1') and
+                parsed.username is None and parsed.password is None and
+                mirror_origin(url) == http_origin):
+            return url
+    return https_url(url)
+
+
+def read_mirror_config(path=Path('/etc/project-aggregation/release-mirror.conf')):
+    """Read root-controlled data, never shell code or the application environment."""
+    path = Path(path)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    uid = os.geteuid() if hasattr(os, 'geteuid') else None
+    for parent in reversed(path.parents):
+        info = parent.lstat()
+        require_local(stat.S_ISDIR(info.st_mode) and not parent.is_symlink(),
+                      'mirror configuration parent must be a real directory')
+        if uid is not None:
+            sticky = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            require_local(info.st_uid in (0, uid) and (not info.st_mode & 0o022 or sticky),
+                          'mirror configuration parent is not trusted')
+    with secure_open(path) as source:
+        require_local(os.fstat(source.fileno()).st_size <= 4096, 'oversized mirror configuration')
+        try:
+            content = source.read(4097).decode('utf-8')
+        except UnicodeError as error:
+            raise LocalDownloadError('mirror configuration is not UTF-8') from error
+    values = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        match = re.fullmatch(r'([A-Z][A-Z0-9_]*)=(?:"([^"\\]*)"|\'([^\'\\]*)\'|([A-Za-z0-9:/.[\]_-]*))', line)
+        require_local(match is not None, 'invalid mirror configuration assignment')
+        key = match[1]
+        require_local(key not in values, 'duplicate mirror configuration key')
+        values[key] = next(item for item in match.groups()[1:] if item is not None)
+    if 'RELEASE_MIRROR_URL' not in values and 'RELEASE_MIRROR_DOMAIN' in values:
+        print('[CI] 旧版镜像配置尚未接入下载器；本次使用 GitHub，请重新运行镜像配置工具。', file=sys.stderr)
+        return None
+    allowed = {'RELEASE_MIRROR_URL', 'RELEASE_MIRROR_KIND', 'RELEASE_MIRROR_PRIORITY', 'RELEASE_MIRROR_TIMEOUT'}
+    require_local(not (values.keys() - allowed), 'unknown mirror configuration key')
+    priority = values.get('RELEASE_MIRROR_PRIORITY', 'fallback')
+    require_local(priority in ('fallback', 'always', 'disabled'), 'invalid mirror priority')
+    if priority == 'disabled':
+        return None
+    base = mirror_base_url(values.get('RELEASE_MIRROR_URL', ''))
+    kind = values.get('RELEASE_MIRROR_KIND', 'github')
+    require_local(kind in ('github', 'oss'), 'invalid mirror kind')
+    timeout = values.get('RELEASE_MIRROR_TIMEOUT', '60')
+    require_local(re.fullmatch(r'[0-9]{1,3}', timeout) is not None and 1 <= int(timeout) <= 300,
+                  'mirror timeout must be between 1 and 300 seconds')
+    return {'url': base, 'kind': kind, 'priority': priority, 'timeout': int(timeout)}
+
+
 class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
     max_redirections = 5
     max_repeats = 2
 
+    def __init__(self, http_origin=None):
+        super().__init__()
+        self.http_origin = http_origin
+
     def redirect_request(self, request, fp, code, message, headers, newurl):
-        https_url(newurl)
+        # HTTPS requests cannot downgrade, even when the initial mirror is local HTTP.
+        download_url(newurl, self.http_origin if request.full_url.startswith('http://') else None)
         return super().redirect_request(request, fp, code, message, headers, newurl)
 
 
@@ -156,15 +266,15 @@ def secure_directory(path):
         except FileNotFoundError:
             directory.mkdir(mode=0o700)
             info = directory.lstat()
-        require(stat.S_ISDIR(info.st_mode) and not directory.is_symlink(),
+        require_local(stat.S_ISDIR(info.st_mode) and not directory.is_symlink(),
                 'cache directory cannot contain links or special files')
         if uid is not None:
-            require(info.st_uid in (0, uid), 'cache ancestor has an unexpected owner')
+            require_local(info.st_uid in (0, uid), 'cache ancestor has an unexpected owner')
             sticky_parent = directory != path and info.st_uid in (0, uid) and info.st_mode & stat.S_ISVTX
-            require(not info.st_mode & 0o022 or sticky_parent,
+            require_local(not info.st_mode & 0o022 or sticky_parent,
                     'cache ancestor is writable by another user')
     if uid is not None:
-        require(path.stat().st_uid == uid, 'cache directory has an unexpected owner')
+        require_local(path.stat().st_uid == uid, 'cache directory has an unexpected owner')
     path.chmod(0o700)
     return path
 
@@ -173,20 +283,20 @@ def secure_open(path, flags=os.O_RDONLY):
     """Never truncate before checking the opened inode (including hard links)."""
     try:
         before = path.lstat()
-        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
+        require_local(stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
                 'cache file must be a regular file with one link')
     except FileNotFoundError:
         before = None
     descriptor = os.open(path, flags | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         info = os.fstat(descriptor)
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+        require_local(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
                 'cache file must be a regular file with one link')
         if hasattr(os, 'geteuid'):
-            require(info.st_uid == os.geteuid() and not info.st_mode & 0o022,
+            require_local(info.st_uid == os.geteuid() and not info.st_mode & 0o022,
                     'cache file has an unsafe owner or permissions')
         if before is not None:
-            require((before.st_dev, before.st_ino) == (info.st_dev, info.st_ino), 'cache file changed while opening')
+            require_local((before.st_dev, before.st_ino) == (info.st_dev, info.st_ino), 'cache file changed while opening')
         return os.fdopen(descriptor, 'r+b' if flags & os.O_RDWR else 'rb')
     except BaseException:
         os.close(descriptor)
@@ -282,13 +392,13 @@ def write_progress_file(stage, progress=None, downloaded=None, total=None, speed
 
 
 class Downloader:
-    def __init__(self, cache, url, expected):
+    def __init__(self, cache, url, expected, *, http_origin=None, timeout=None):
         require(re.fullmatch(r'[a-f0-9]{64}', expected) is not None, 'invalid archive SHA256')
-        self.url, self.expected = https_url(url), expected
+        self.url, self.expected = download_url(url, http_origin), expected
         self.cache = secure_directory(cache)
         self.archive = self.cache / (expected + '.tar.gz')
         self.parts = self.cache / ('.' + expected + '.parts')
-        self.opener = urllib.request.build_opener(HTTPSRedirect())
+        self.opener = urllib.request.build_opener(HTTPSRedirect(http_origin))
         self.cancelled = threading.Event()
         self.phase_stop = threading.Event()
         self.active = set()
@@ -297,13 +407,18 @@ class Downloader:
         self.progress_lock = threading.Lock()
         self.progress_stop = threading.Event()
         self.started = time.monotonic()
+        self.deadline = self.started + timeout if timeout is not None else None
         self.received, self.total, self.positions = 0, None, {}
         self.mode = '检测'
         self.stage = 'download'
         self.last_progress_write = 0
 
     def check_cancel(self):
-        if self.cancelled.is_set() or self.phase_stop.is_set():
+        if self.cancelled.is_set():
+            raise Cancelled('download cancelled')
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise MirrorTimeout('mirror download deadline exceeded')
+        if self.phase_stop.is_set():
             raise Cancelled('download cancelled')
 
     def progress(self):
@@ -346,8 +461,12 @@ class Downloader:
             self.received += received
 
     def _open_request(self, request):
-        # Tests override only this transport; production never accepts HTTP or a TLS bypass.
-        return self.opener.open(request, timeout=SOCKET_TIMEOUT)
+        # Official downloads remain HTTPS-only; only a trusted mirror can opt into local HTTP.
+        timeout = SOCKET_TIMEOUT
+        if self.deadline is not None:
+            self.check_cancel()
+            timeout = min(timeout, max(0.001, self.deadline - time.monotonic()))
+        return self.opener.open(request, timeout=timeout)
 
     def request(self, start=None, end=None):
         self.check_cancel()
@@ -435,6 +554,11 @@ class Downloader:
         if time.monotonic() >= deadline:
             raise Retryable('request deadline exceeded')
         try:
+            if self.deadline is not None:
+                raw = getattr(getattr(response, 'fp', None), 'raw', None)
+                connection = getattr(raw, '_sock', None)
+                if connection is not None:
+                    connection.settimeout(min(SOCKET_TIMEOUT, max(0.001, self.deadline - time.monotonic())))
             return response.read1(amount)
         except (OSError, http.client.HTTPException) as error:
             self.check_cancel()
@@ -669,6 +793,7 @@ class Downloader:
 
     def run(self):
         handlers = {}
+        timer = None
 
         def interrupt(number, frame):
             if not self.cancelled.is_set():
@@ -676,6 +801,10 @@ class Downloader:
                 raise Cancelled('download interrupted by signal %s' % number)
 
         try:
+            if self.deadline is not None:
+                timer = threading.Timer(max(0, self.deadline - time.monotonic()), self.stop_workers)
+                timer.daemon = True
+                timer.start()
             if threading.current_thread() is threading.main_thread():
                 for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
                     number = getattr(signal, name, None)
@@ -693,8 +822,36 @@ class Downloader:
                             self.cancelled.wait(0.25)
                 return self.locked_download()
         finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join()
             for number, handler in handlers.items():
                 signal.signal(number, handler)
+
+
+def release_download(cache, url, expected, *, config_path=None):
+    """Only immutable archives use mirrors; discovery and executable sources stay official."""
+    https_url(url)
+    match = re.fullmatch(
+        r'https://github\.com/(hxx344/project-aggregation)/releases/download/'
+        r'(deploy-[a-f0-9]{40})/([A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz)', url)
+    config = (read_mirror_config() if config_path is None else read_mirror_config(config_path)) if match else None
+    if config is not None:
+        repository, tag, filename = match.groups()
+        suffix = (f'/{repository}/releases/download/{tag}/{filename}' if config['kind'] == 'github'
+                  else f'/releases/{repository}/{tag}/{filename}')
+        candidate = config['url'] + suffix
+        http_origin = mirror_origin(candidate) if candidate.startswith('http://') else None
+        print('[CI] 尝试已配置镜像下载固定版本包；仍按官方清单验证 SHA256。', file=sys.stderr, flush=True)
+        try:
+            return Downloader(cache, candidate, expected, http_origin=http_origin, timeout=config['timeout']).run()
+        except (Cancelled, LocalDownloadError):
+            raise
+        except DownloadError:
+            if config['priority'] == 'always':
+                raise
+            print('[CI] 镜像下载或完整性校验失败，回退 GitHub 固定版本。', file=sys.stderr, flush=True)
+    return Downloader(cache, url, expected).run()
 
 
 if __name__ == '__main__':
@@ -702,7 +859,7 @@ if __name__ == '__main__':
         if sys.argv[1] == '--progress':
             write_progress_file(sys.argv[2], float(sys.argv[3]) if sys.argv[3] else None)
         else:
-            print(Downloader(*sys.argv[1:]).run())
+            print(release_download(*sys.argv[1:]))
     except (DownloadError, OSError, ValueError) as error:
         print('[CI] 部署包下载失败：' + str(error), file=sys.stderr, flush=True)
         sys.exit(1)

@@ -792,3 +792,17 @@
 **证据：** project-aggregation 基线 `eb6aab1` 的 [Binance reader](modules/monitor/lib/gold-oil-service.ts) 与 [Bybit reader](modules/monitor/lib/gold-oil-bybit-service.ts) 将最早缺口与近期起点取最小值。2026-10-16 用户报告更新或重启后图表明显慢；Windows 原生两万根历史夹具中，正常近期更新为 2 次请求，增加单个早期永久缺口后每轮变为 40 次，修复后首次最多 4 次、冷却期每轮 2 次。同一图表夹具默认七天为 672 点、约 79 KB，全部为 20,000 点、约 2.32 MB；未取得用户服务器重启期间的网络记录，不能将所有图表延迟归为同一来源。
 
 **事件记录：** `monitor-history-gap-refresh-amplification-20261016`；一次用户反馈及历史采集与详情读取链修复，关联 L047 的契约边界，不推进主线复盘检查点。
+
+### L053：镜像测速须验证真实正文，并接通实际下载路径
+
+**适用条件：** 为固定版本发布包增加镜像、CDN、下载测速或一键配置，尤其默认更新仍采用源码 Git 获取的项目。
+
+**根因：** 测速把 curl 输出开头的空行当成 HTTP 状态，未跟随发布资产重定向；Nginx 只代理 GitHub 初始跳转，真实包离开缓存。配置写入应用服务，但生产下载器没有读取者；HTTP、HTTPS 与端口各用不同地址，检查失败仍输出成功。OSS 缓存以文件名复用，未按版本和摘要核验。上述缺陷让检查输出与实际下载、缓存和更新行为脱节。
+
+**以后做法：** 从官方来源固定清单身份和摘要，镜像只提供固定版本包；真实正文、最终状态和 SHA-256 同时通过才算成功。配置作为可信数据由实际包下载器读取，不执行 shell，不改变默认源码更新模式，不承诺未测量的提速。镜像失败按策略回源，取消、本地权限和磁盘错误直接失败；无变化复用已验证配置和包。Nginx 内部完成受限 HTTPS 资产跳转并缓存最终正文，失败恢复旧配置。OSS 缓存和对象按版本隔离并验证内容。
+
+**如何验证：** [测速与入口检查](deploy/test-mirror-tools.py) 覆盖 200、302、错误摘要和失败报告；[生产镜像下载检查](deploy/test-release-mirror.py) 覆盖实际下载器的优先级、回源、缓存、时限及可信配置；[安装与配置检查](deploy/test-mirror-setup.py) 覆盖失败保旧及幂等；[真实 Nginx 检查](deploy/test-mirror-nginx.py) 在 Linux CI 验证内部跳转、缓存命中和 Range，不把本机模拟当作服务器测速。复用 [发布协议回归](deploy/test-release-download.py) 与 [源码获取回归](deploy/test-source-fetch.py)，确认原有完整性和固定源码版本行为保持。
+
+**证据：** project-aggregation `1229ebe` 引入镜像测速，`f9851a3` 引入镜像配置与同步；审查基线 `3e37bd4` 中 [测速脚本](deploy/test-mirror-performance.sh) 对本机 200/24 字节响应仍记录失败，302 夹具未请求正文；[Nginx 安装脚本](deploy/setup-release-mirror.sh) 在 `nginx -t` 返回失败的隔离用例中仍退出 0。[配置脚本](deploy/configure-release-mirror.sh) 的旧变量无生产消费者，默认更新入口仍指定 `source`；[OSS 同步器](deploy/sync-release-to-oss.py) 使用固定临时目录和跨版本同名缓存。2026-10-16 用户要求检查并修复，未取得服务器端速度证据。
+
+**事件记录：** `release-mirror-unverified-download-wiring-20261016`；同一批镜像工具的审查与连续修复，关联 L009、L030、L032，不推进主线复盘检查点。

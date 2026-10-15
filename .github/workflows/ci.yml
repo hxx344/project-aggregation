@@ -55,6 +55,7 @@ jobs:
           python3 deploy/test-release.py -v
           python3 deploy/test-source-fetch.py -v
           sudo python3 deploy/test-release-download.py -v
+          sudo python3 deploy/test-release-mirror.py -v
           python3 deploy/test-publish.py -v
           python3 deploy/test-promote.py -v
           python3 deploy/test-migration.py -v
@@ -76,6 +77,11 @@ jobs:
           bash -n deploy/workspace-test-jobs.sh
           bash -n deploy/test-workspace-parallel.sh
           bash -n deploy/test-module-incremental.sh
+          bash -n deploy/test-mirror-performance.sh
+          bash -n deploy/one-click-optimize.sh
+          bash -n deploy/setup-release-mirror.sh
+          bash -n deploy/configure-release-mirror.sh
+          bash -n test-download-speed.sh
       - name: Verify parallel workspace failures and process cleanup
         run: bash deploy/test-workspace-parallel.sh
       - name: Verify privileged update coordinator and service bootstrap
@@ -136,8 +142,27 @@ jobs:
         if: ${{ !cancelled() }}
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_RELAY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-aster-relay-systemd.sh
 
+  release-mirror:
+    name: Release mirror (real Nginx and verified downloads)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify download reports, configuration and installation recovery
+        run: |
+          python3 deploy/test-mirror-tools.py -v
+          sudo python3 deploy/test-mirror-setup.py -v
+      - name: Prepare Nginx for the isolated transport integration
+        run: |
+          if ! command -v nginx >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y nginx
+          fi
+      - name: Verify redirected asset bytes, cache hits and byte ranges with real Nginx
+        run: python3 deploy/test-mirror-nginx.py -v
+
   release:
-    needs: [app, installer, aster-relay]
+    needs: [app, installer, aster-relay, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

@@ -30,6 +30,8 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 
 该模式保留分段并发下载、有效片段复用和整包 SHA-256 校验。旧版网页更新器可能仍显式选择 `ci`；运行本节开头的默认一键命令更新安装器后，网页后续更新也使用正式源码模式。
 
+需要比较预构建包下载源或配置固定版本包镜像时，使用[镜像与下载验证工具](release-mirror-setup.md)。镜像配置由包下载器直接读取，清单仍来自官方 HTTPS，包仍须通过官方 SHA-256；它不改变默认源码模式，也不加速 Git fetch。
+
 ## 服务与数据
 
 只有 `project-aggregation.service` 对外提供业务 HTTP，默认绑定 `127.0.0.1:3100`。模块由工作台管理独立 Node worker；Greeks 与 ASTER 通过 Python 标准输入输出桥运行，不另开 TCP 端口。在线更新控制服务继续使用 Unix socket。所有模块沿用工作台鉴权，进入模块页面无需再保存独立网站登录凭据。

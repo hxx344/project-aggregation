@@ -1,241 +1,110 @@
-# 发布包高速下载渠道搭建指南
+# 发布包镜像与下载验证
 
-## 背景
+工作台默认采用 `source` 部署：从正式版本锁定的 Git 提交获取源码，再按变化增量构建。这里的镜像只用于 **`PROJECT_DEPLOY_MODE=ci` 的预构建包下载**。测速结果不代表 Git fetch 的速度，配置镜像也不会改变网页更新的源码模式。
 
-当前工作台更新从 GitHub Releases 下载发布包（约 104MB），国内服务器访问速度约 0.5-2 MB/s，更新耗时 60-120 秒。通过在日本服务器搭建镜像，可以提升到 5-10 MB/s。
+官方发布清单与安装脚本仍从 GitHub HTTPS 获取。镜像只提供固定 `deploy-<完整提交号>` 下的压缩包，下载器使用官方清单中的 SHA-256 验证正文后才允许解包。镜像失败时按配置回源，取消操作、本地权限或磁盘错误直接返回失败。
 
-## 方案对比
+## 先测速
 
-| 方案 | 复杂度 | 下载速度 | 成本 | 推荐场景 |
-|------|--------|---------|------|---------|
-| **直连 GitHub** | ⭐ | 0.5-2 MB/s（国内）<br>5-10 MB/s（海外） | 免费 | 海外服务器 |
-| **Nginx 缓存代理** | ⭐⭐ | 5-10 MB/s | 日本 VPS (~$5/月) | 多台国内服务器 |
-| **阿里云 OSS CDN** | ⭐⭐⭐ | 10-50 MB/s | OSS + CDN 费用 | 大规模部署 |
-
-## 方案 1：Nginx 缓存代理（推荐）
-
-### 优点
-- 简单易用，一键部署
-- 自动缓存热门版本
-- 失败自动回退到 GitHub
-- 支持 HTTPS
-
-### 部署步骤
-
-#### 在日本服务器上：
+在仓库中执行：
 
 ```bash
-# 1. 下载脚本
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/setup-release-mirror.sh -o setup-mirror.sh
-
-# 2. 配置环境变量
-export RELEASE_MIRROR_DOMAIN="releases.yourdomain.com"  # 你的域名
-
-# 3. 运行部署
-sudo bash setup-mirror.sh
-
-# 4. 启用 HTTPS（推荐）
-sudo certbot --nginx -d releases.yourdomain.com
-
-# 5. 测试
-curl -I https://releases.yourdomain.com/hxx344/project-aggregation/releases/latest/download/project-aggregation-linux-x64.tar.gz
+bash deploy/test-mirror-performance.sh
 ```
 
-#### 在国内工作台服务器上：
+也可以从已发布的官方入口执行：
 
 ```bash
-# 1. 配置镜像源
-sudo bash deploy/configure-release-mirror.sh
-# 输入: releases.yourdomain.com
-
-# 2. 重启服务
-sudo systemctl restart project-aggregation
-
-# 3. 测试更新
-# 下次检查更新时会自动使用镜像
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/one-click-optimize.sh | bash
 ```
 
-### 性能优化
+默认只测试，不安装服务或写入配置。入口在缺少同版本本地工具时，从官方正式清单锁定的提交获取辅助脚本；不会从镜像获取可执行代码。
 
-编辑 `/etc/nginx/sites-available/release-mirror`：
-
-```nginx
-# 调整缓存大小
-proxy_cache_path /var/cache/github-releases
-                 max_size=50g;  # 默认 50GB，可调整
-
-# 调整缓存时间
-proxy_cache_valid 200 90d;  # 成功响应缓存 90 天
-```
-
-### 监控
+测试取得官方清单后，按同一个提交、架构、文件和摘要比较 GitHub 与已配置镜像。成功必须下载完整正文并通过 SHA-256；失败、未配置、缓存命中分别显示。GitHub 基线失败时不计算提速倍数，超时的部分文件不算成功样本。重复测试可设置 `TEST_ITERATIONS`，单次超时可设置 `DOWNLOAD_TIMEOUT`。
 
 ```bash
-# 查看缓存命中率
-curl http://localhost/cache-status
-
-# 查看缓存大小
-du -sh /var/cache/github-releases
-
-# 查看访问日志
-tail -f /var/log/nginx/access.log | grep release
+TEST_ITERATIONS=3 DOWNLOAD_TIMEOUT=120 bash deploy/test-mirror-performance.sh
 ```
 
-## 方案 2：阿里云 OSS CDN
+根目录 `test-download-speed.sh` 保留为 GitHub 下载检查的兼容入口。源码获取中断应查看安装器的 Git 重试日志，不能用这份预构建包测速报告判断是否恢复。
 
-### 优点
-- 国内访问速度最快（10-50 MB/s）
-- 自动 CDN 加速
-- 高可用性
+## 本机缓存的一键部署
 
-### 部署步骤
-
-#### 1. 准备阿里云 OSS
+需要缓存同一发布包的重复下载时，可明确选择部署：
 
 ```bash
-# 在阿里云控制台创建：
-# - Bucket: my-releases
-# - 地域: 日本（东京）
-# - 读写权限: 公共读
-# - CDN 加速: 开启
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/one-click-optimize.sh | sudo bash -s -- --deploy-local
 ```
 
-#### 2. 在日本服务器上配置同步
+默认监听 `http://127.0.0.1:8090`。只有缺少 Nginx 时才安装；配置无变化时跳过重载。配置发生变化后先检查 Nginx，再应用；失败返回非零状态并恢复旧配置。该流程不重启工作台，也不改变部署模式。
+
+同机缓存的首次下载仍需访问 GitHub；新版本的包也需要首次回源。只有相同版本的已缓存正文可以复用，不保证固定速度或提速倍数。部署验收必须实际下载并验证摘要，`/health` 返回成功不能代替文件验收。
+
+## 配置已有 HTTPS 镜像
 
 ```bash
-# 安装 ossutil
-wget http://gosspublic.alicdn.com/ossutil/1.7.15/ossutil64
-chmod 755 ossutil64
-sudo mv ossutil64 /usr/local/bin/ossutil
+sudo bash deploy/configure-release-mirror.sh \
+  --url https://releases.example.com \
+  --kind github \
+  --priority fallback \
+  --timeout 60
+```
 
-# 配置凭据
-export ALIYUN_OSS_BUCKET="my-releases"
-export ALIYUN_OSS_ENDPOINT="oss-ap-northeast-1.aliyuncs.com"
-export ALIYUN_ACCESS_KEY_ID="YOUR_ACCESS_KEY"
-export ALIYUN_ACCESS_KEY_SECRET="YOUR_SECRET"
+配置使用完整 URL。远端必须提供可验证证书的 HTTPS；HTTP 仅接受显式字面地址 `127.0.0.1` 或 `::1`。Nginx 部署脚本默认只开放本机端口，不自动安装证书工具。远端服务可由已有 HTTPS 入口转发到该端口。
 
-# 运行同步
+配置工具先验证真实发布包，再原子写入 `/etc/project-aggregation/release-mirror.conf`。验证失败保留旧配置；相同且已经验证的配置直接复用，追加 `--verify` 可以重新验收。配置是数据文件，不作为 Shell 脚本执行，也不注入应用服务环境。
+
+```text
+# release-mirror-config-v1
+RELEASE_MIRROR_URL=https://releases.example.com
+RELEASE_MIRROR_KIND=github
+RELEASE_MIRROR_PRIORITY=fallback
+RELEASE_MIRROR_TIMEOUT=60
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `RELEASE_MIRROR_URL` | 镜像源地址，包含协议与可选端口，不含路径、查询参数或凭据 |
+| `RELEASE_MIRROR_KIND` | `github` 使用固定发布路径；`oss` 使用下面的对象路径 |
+| `RELEASE_MIRROR_PRIORITY` | `fallback` 先镜像，失败回 GitHub；`always` 镜像失败即停止；`disabled` 禁用 |
+| `RELEASE_MIRROR_TIMEOUT` | 镜像下载时限，整数 1–300 秒 |
+
+下载器直接读取可信配置，不需要重启工作台。旧版只有 `RELEASE_MIRROR_DOMAIN` 的无效配置不会被当成已启用镜像；重新运行配置工具即可迁移。
+
+禁用镜像：
+
+```bash
+sudo bash deploy/configure-release-mirror.sh --priority disabled
+```
+
+## OSS 同步
+
+同步器使用已有 `ossutil`。配置 `ALIYUN_OSS_BUCKET`、`ALIYUN_OSS_ENDPOINT`、`ALIYUN_ACCESS_KEY_ID` 和 `ALIYUN_ACCESS_KEY_SECRET` 后执行：
+
+```bash
 python3 deploy/sync-release-to-oss.py
 ```
 
-#### 3. 设置定时同步（可选）
+上传前按官方清单核对文件摘要，缓存按版本隔离，不能复用另一版本的同名包。缺少配置或校验失败返回失败；已核实相同的对象可以跳过上传。
+
+对象路径统一为：
+
+```text
+releases/hxx344/project-aggregation/deploy-<40位提交号>/<发布包文件名>
+```
+
+工作台使用同一配置入口，指定 `--kind oss`；不要手工修改更新器代码或简单替换 GitHub 域名：
 
 ```bash
-# 添加 cron 任务
-crontab -e
-
-# 每小时同步一次
-0 * * * * cd /path/to/project && python3 deploy/sync-release-to-oss.py >> /var/log/release-sync.log 2>&1
+sudo bash deploy/configure-release-mirror.sh \
+  --url https://cdn.example.com --kind oss --priority fallback
 ```
 
-#### 4. 在工作台配置 OSS 源
+## 验证范围
 
-修改 `server/update-service/releases.py`：
+- `deploy/test-mirror-tools.py`：下载状态、重定向、摘要、报告和入口行为。
+- `deploy/test-release-mirror.py`：生产下载器镜像选择、回源、可信配置、缓存和取消边界。
+- `deploy/test-mirror-setup.py`：配置校验、幂等、失败恢复和非交互调用。
+- `deploy/test-mirror-nginx.py`：Linux CI 中的真实 Nginx、HTTPS 上游跳转、正文缓存及 Range 响应。
 
-```python
-# 添加 OSS 镜像配置
-RELEASE_MIRROR = os.getenv('RELEASE_MIRROR_DOMAIN')
-if RELEASE_MIRROR:
-    # 将 GitHub URL 替换为 OSS URL
-    url = url.replace('github.com', RELEASE_MIRROR)
-```
-
-## 性能对比实测
-
-### 测试环境
-- 发布包大小: 104 MB
-- 国内服务器: 200Mbps 带宽（理论 25MB/s）
-
-### 测试结果
-
-| 下载源 | 平均速度 | 下载耗时 | 命中率 |
-|--------|---------|---------|-------|
-| GitHub 直连 | 1.2 MB/s | 87 秒 | - |
-| Nginx 镜像（首次） | 1.2 MB/s | 87 秒 | 0% (MISS) |
-| Nginx 镜像（命中） | 8.5 MB/s | 12 秒 | 100% (HIT) |
-| 阿里云 OSS CDN | 15.3 MB/s | 7 秒 | - |
-
-### 结论
-
-- **首次访问**：与 GitHub 直连速度相同（需要回源）
-- **缓存命中**：速度提升 **7 倍**（87s → 12s）
-- **OSS CDN**：速度提升 **12 倍**（87s → 7s）
-
-## 维护
-
-### 清理缓存
-
-```bash
-# Nginx 缓存
-sudo rm -rf /var/cache/github-releases/*
-sudo systemctl reload nginx
-
-# OSS 缓存
-ossutil rm oss://my-releases/releases/ -r -f
-```
-
-### 切换回 GitHub 直连
-
-```bash
-# 编辑配置
-sudo vi /etc/project-aggregation/release-mirror.conf
-
-# 设置
-RELEASE_MIRROR_PRIORITY="disabled"
-
-# 重启服务
-sudo systemctl restart project-aggregation
-```
-
-## 故障排查
-
-### 问题 1：镜像健康检查失败
-
-```bash
-# 检查 Nginx 状态
-sudo systemctl status nginx
-
-# 检查端口监听
-sudo netstat -tlnp | grep :80
-
-# 测试健康检查
-curl -v http://localhost/health
-```
-
-### 问题 2：下载仍然很慢
-
-```bash
-# 检查 DNS 解析
-nslookup releases.yourdomain.com
-
-# 检查路由
-traceroute releases.yourdomain.com
-
-# 查看 Nginx 日志
-tail -f /var/log/nginx/error.log
-```
-
-### 问题 3：缓存不生效
-
-```bash
-# 检查缓存状态
-curl -I http://releases.yourdomain.com/test | grep X-Cache-Status
-# 应该看到 MISS（首次）或 HIT（命中）
-
-# 检查缓存目录权限
-ls -la /var/cache/github-releases
-# 应该是 www-data:www-data
-```
-
-## 安全建议
-
-1. **启用 HTTPS**：使用 Let's Encrypt 免费证书
-2. **限制访问**：配置 IP 白名单或认证
-3. **监控流量**：防止被滥用
-4. **定期更新**：保持 Nginx 和 OpenSSL 最新
-
-## 参考资料
-
-- [Nginx 代理缓存文档](http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache)
-- [阿里云 OSS 文档](https://help.aliyun.com/product/31815.html)
-- [GitHub Releases API](https://docs.github.com/en/rest/releases)
+测试使用本地夹具；服务器到 GitHub 或实际 CDN 的网络质量，需在目标服务器执行测速后判断。

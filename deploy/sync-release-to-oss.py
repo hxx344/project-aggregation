@@ -1,134 +1,119 @@
 #!/usr/bin/env python3
-"""
-在日本服务器上运行，自动同步 GitHub Releases 到阿里云 OSS
-提供国内高速下载渠道
-"""
-import hashlib
-import json
+"""Copy SHA256-verified immutable release artifacts to OSS; never reuse cross-tag files."""
 import os
-import subprocess
 import sys
+
+if __name__ == '__main__' and not sys.flags.isolated:
+    os.execv(sys.executable, [sys.executable, '-I', os.path.abspath(__file__), *sys.argv[1:]])
+
+import hashlib
+import importlib.util
 from pathlib import Path
-from urllib.request import urlopen, Request
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
 
-# 配置（从环境变量读取）
-GITHUB_REPO = os.getenv('GITHUB_REPO', 'hxx344/project-aggregation')
-ALIYUN_OSS_BUCKET = os.getenv('ALIYUN_OSS_BUCKET')  # 例如: my-releases
-ALIYUN_OSS_ENDPOINT = os.getenv('ALIYUN_OSS_ENDPOINT')  # 例如: oss-ap-northeast-1.aliyuncs.com
-ALIYUN_ACCESS_KEY_ID = os.getenv('ALIYUN_ACCESS_KEY_ID')
-ALIYUN_ACCESS_KEY_SECRET = os.getenv('ALIYUN_ACCESS_KEY_SECRET')
+spec = importlib.util.spec_from_file_location('mirror_tools', Path(__file__).with_name('mirror-tools.py'))
+mirror = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mirror)
 
-def get_latest_release():
-    """获取最新发布信息"""
-    url = f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest'
-    req = Request(url, headers={'Accept': 'application/vnd.github.v3+json'})
-    with urlopen(req, timeout=30) as response:
-        return json.loads(response.read())
 
-def download_asset(url, local_path):
-    """下载发布资源"""
-    print(f"下载: {url}")
-    req = Request(url, headers={'Accept': 'application/octet-stream'})
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    with urlopen(req, timeout=600) as response:
-        total = int(response.headers.get('Content-Length', 0))
-        downloaded = 0
 
-        with open(local_path, 'wb') as f:
-            while True:
-                chunk = response.read(1024 * 1024)  # 1MB chunks
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    percent = downloaded / total * 100
-                    print(f"  进度: {percent:.1f}% ({downloaded}/{total})", end='\r')
+def oss_configuration(work, environment=None):
+    environment = os.environ if environment is None else environment
+    keys = ('ALIYUN_OSS_BUCKET', 'ALIYUN_OSS_ENDPOINT', 'ALIYUN_ACCESS_KEY_ID', 'ALIYUN_ACCESS_KEY_SECRET')
+    values = {key: environment.get(key, '') for key in keys}
+    mirror.require(all(values.values()), '未配置完整 OSS 凭据，未执行同步')
+    mirror.require(all(not re.search(r'[\r\n\x00]', value) for value in values.values()), 'OSS 配置含无效字符')
+    bucket = values['ALIYUN_OSS_BUCKET']
+    mirror.require(re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', bucket), 'OSS bucket 无效')
+    endpoint = values['ALIYUN_OSS_ENDPOINT']
+    if '://' not in endpoint:
+        endpoint = 'https://' + endpoint
+    endpoint = mirror.validate_url(endpoint, base=True, official=True)
+    config = Path(work) / 'ossutil.conf'
+    config.write_text('[Credentials]\nlanguage = EN\nendpoint = ' + endpoint +
+                      '\naccessKeyID = ' + values['ALIYUN_ACCESS_KEY_ID'] +
+                      '\naccessKeySecret = ' + values['ALIYUN_ACCESS_KEY_SECRET'] + '\n', encoding='utf-8')
+    config.chmod(0o600)
+    return bucket, config
 
-    print(f"\n✅ 下载完成: {local_path}")
 
-def verify_sha256(file_path, expected_sha256):
-    """验证文件 SHA256"""
-    sha256 = hashlib.sha256()
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b''):
-            sha256.update(chunk)
+def oss_copy(source, destination, config):
+    # A private config avoids exposing AccessKeys in process arguments or exception text.
+    try:
+        result = subprocess.run(['ossutil', 'cp', str(source), str(destination), '--force',
+                                 '--config-file', str(config)], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=600)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
-    actual = sha256.hexdigest()
-    if actual != expected_sha256:
-        raise ValueError(f"SHA256 不匹配: 期望 {expected_sha256}, 实际 {actual}")
 
-    print(f"✅ SHA256 校验通过")
+def remote_matches(remote, expected, config, work):
+    destination = Path(work) / 'remote-check'
+    try:
+        return oss_copy(remote, destination, config) and sha256(destination) == expected
+    finally:
+        destination.unlink(missing_ok=True)
 
-def upload_to_oss(local_path, remote_path):
-    """上传到阿里云 OSS"""
-    if not all([ALIYUN_OSS_BUCKET, ALIYUN_OSS_ENDPOINT,
-                ALIYUN_ACCESS_KEY_ID, ALIYUN_ACCESS_KEY_SECRET]):
-        print("⚠️  未配置阿里云 OSS，跳过上传")
-        return
 
-    print(f"上传到 OSS: {remote_path}")
+def synchronize(manifest, manifest_path, bucket, config, work):
+    entries = [(item['file'], item['sha256'], item) for item in manifest['artifacts'].values()]
+    # Publish the manifest last, after every object is verified at its final remote path.
+    entries.append(('release-manifest.json', sha256(manifest_path), None))
+    uploaded = reused = 0
+    for filename, expected, item in entries:
+        remote = f"oss://{bucket}/releases/{mirror.REPOSITORY}/{manifest['tag']}/{filename}"
+        if remote_matches(remote, expected, config, work):
+            print(f'已核验远端内容，跳过上传: {filename}')
+            reused += 1
+            continue
+        local = Path(work) / filename
+        if item is not None:
+            mirror.download(mirror.artifact_url(manifest, item), local, expected, timeout=600, official=True)
+        else:
+            local = manifest_path
+        mirror.require(sha256(local) == expected, f'上传前 SHA256 校验失败: {filename}')
+        mirror.require(oss_copy(local, remote, config), f'OSS 上传失败: {filename}')
+        mirror.require(remote_matches(remote, expected, config, work), f'OSS 上传后校验失败: {filename}')
+        print(f'上传及远端 SHA256 校验通过: {filename}')
+        uploaded += 1
+    print(f'同步完成：上传 {uploaded} 个，复用已校验对象 {reused} 个。')
+    return 0
 
-    # 使用 ossutil（需要预先安装）
-    cmd = [
-        'ossutil', 'cp',
-        local_path,
-        f'oss://{ALIYUN_OSS_BUCKET}/{remote_path}',
-        f'--endpoint={ALIYUN_OSS_ENDPOINT}',
-        f'--access-key-id={ALIYUN_ACCESS_KEY_ID}',
-        f'--access-key-secret={ALIYUN_ACCESS_KEY_SECRET}',
-        '--force'
-    ]
-
-    subprocess.run(cmd, check=True)
-    print(f"✅ 上传完成")
-
-    # 生成 CDN URL
-    cdn_url = f"https://{ALIYUN_OSS_BUCKET}.{ALIYUN_OSS_ENDPOINT}/{remote_path}"
-    print(f"📦 CDN 地址: {cdn_url}")
 
 def main():
-    print("=" * 50)
-    print("GitHub Releases → 阿里云 OSS 同步器")
-    print("=" * 50)
-    print()
+    mirror.require(os.environ.get('GITHUB_REPO', mirror.REPOSITORY) == mirror.REPOSITORY,
+                   '本工具仅同步工作台官方仓库')
+    with tempfile.TemporaryDirectory(prefix='project-oss-release-') as temporary:
+        work = Path(temporary)
+        bucket, config = oss_configuration(work)
+        mirror.require(shutil.which('ossutil'), '需要预先安装 ossutil')
+        manifest, manifest_path = mirror.resolve_manifest(work)
+        print(f"固定发布: {manifest['tag']}")
+        return synchronize(manifest, manifest_path, bucket, config, work)
 
-    # 1. 获取最新发布
-    release = get_latest_release()
-    tag = release['tag_name']
-    print(f"最新版本: {tag}")
-    print(f"发布时间: {release['published_at']}")
-    print()
-
-    # 2. 下载和上传所有资源
-    cache_dir = Path('/tmp/release-mirror-cache')
-    cache_dir.mkdir(exist_ok=True)
-
-    for asset in release['assets']:
-        name = asset['name']
-        download_url = asset['browser_download_url']
-
-        print(f"处理: {name}")
-
-        # 下载到本地缓存
-        local_path = cache_dir / name
-        if not local_path.exists():
-            download_asset(download_url, local_path)
-        else:
-            print(f"  使用缓存: {local_path}")
-
-        # 上传到 OSS
-        remote_path = f"releases/{GITHUB_REPO}/{tag}/{name}"
-        upload_to_oss(local_path, remote_path)
-        print()
-
-    print("=" * 50)
-    print("✅ 同步完成")
-    print("=" * 50)
 
 if __name__ == '__main__':
+    def cancelled(signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, cancelled)
     try:
-        main()
-    except Exception as error:
-        print(f"❌ 错误: {error}", file=sys.stderr)
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('已取消；临时文件已清理。', file=sys.stderr)
+        sys.exit(130)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f'同步失败: {error}', file=sys.stderr)
         sys.exit(1)
