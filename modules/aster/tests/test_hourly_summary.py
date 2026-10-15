@@ -289,6 +289,44 @@ class HourlySummaryTests(unittest.TestCase):
 
 
 class MarginOnlyHourlySummaryTests(unittest.TestCase):
+    def test_margin_usage_uses_current_funds_occupied_margin_and_equity(self):
+        state = margin_only_state()
+        balances = state["pairs"][0]["state"]["margin_balances"]
+        balances["long"]["occupied_margin"] = "662.8176"
+        balances["short"]["occupied_margin"] = "0"
+        original = deepcopy(state)
+        text = rendered(state)
+        self.assertIn("保证金占用率\n66.28%", text)
+        self.assertIn("保证金占用率\n0.00%", text)
+        self.assertNotIn("保证金占用率\n30.00%", text)
+        self.assertNotIn("未采集", text)
+        self.assertIn("资金余额 15 秒前", text)
+        self.assertEqual(state, original)
+
+    def test_unknown_or_invalid_funds_margin_never_borrows_trade_or_position_values(self):
+        for changes in ({}, {"occupied_margin": None}, {"occupied_margin": "-1"},
+                        {"occupied_margin": "NaN"}, {"occupied_margin": "Infinity"},
+                        {"occupied_margin": True}, {"occupied_margin": False},
+                        {"occupied_margin": "10", "equity": "0"},
+                        {"occupied_margin": "10", "equity": "-1"},
+                        {"occupied_margin": "10", "equity": None},
+                        {"occupied_margin": "10", "equity": "NaN"}):
+            with self.subTest(changes=changes):
+                state = margin_only_state()
+                runtime = state["pairs"][0]["state"]
+                runtime["margin_balances"]["long"].update(changes)
+                runtime["margin_balances"]["short"]["occupied_margin"] = "0"
+                # Even fresher trade data and independent inventory cannot fill
+                # a missing value from the current funds reading.
+                state["accounts"][0]["snapshot"]["timestamp"] = NOW
+                runtime["display_positions"]["long"]["snapshot"]["positions"][0]["occupied_margin"] = "777"
+                text = rendered(state)
+                self.assertEqual(text.count("保证金占用率\n待同步"), 1)
+                self.assertIn("保证金占用率\n0.00%", text)
+                self.assertNotIn("保证金占用率\n30.00%", text)
+                self.assertNotIn("保证金占用率\n77.70%", text)
+                self.assertNotIn("未采集", text)
+
     def test_current_funds_replace_old_trade_balances_and_total_without_mutation(self):
         state = margin_only_state()
         original = deepcopy(state)
@@ -296,7 +334,7 @@ class MarginOnlyHourlySummaryTests(unittest.TestCase):
         self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
         self.assertIn("可用保证金\n812.34", text)
         self.assertIn("可用保证金\n623.45", text)
-        self.assertEqual(text.count("保证金占用率\n未采集"), 2)
+        self.assertEqual(text.count("保证金占用率\n待同步"), 2)
         self.assertIn("保证金监控", text)
         self.assertIn("资金余额 15 秒前 · 定时检查", text)
         self.assertIn("资金余额 18 秒前 · 定时检查", text)
@@ -350,7 +388,7 @@ class MarginOnlyHourlySummaryTests(unittest.TestCase):
                     self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
                 self.assertNotIn("可用保证金\n1.00", text)
                 self.assertNotIn("-999.00", text)
-                self.assertEqual(text.count("保证金占用率\n未采集"), 2)
+                self.assertEqual(text.count("保证金占用率\n待同步"), 2)
 
     def test_paper_funds_do_not_join_live_pnl(self):
         state = margin_only_state()

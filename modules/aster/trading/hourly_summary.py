@@ -215,7 +215,7 @@ def _account_card(account, snapshot, label, progress, now, side=None, funds_note
     background = "red-50" if side == "short" else "blue-50"
     elements = [_label(f"{label} · {_text(account.get('name'))}（{mode}）", "heading", color),
                 _columns(_metric("可用保证金", _amount(snapshot.get("available"))),
-                         _metric("保证金占用率", "未采集" if funds_note is not None else _usage(snapshot)), background=background),
+                         _metric("保证金占用率", _usage(snapshot)), background=background),
                 _label(f"距交易量目标  {progress}")]
     note = funds_note if funds_note is not None else _snapshot_note(snapshot, now)
     if note:

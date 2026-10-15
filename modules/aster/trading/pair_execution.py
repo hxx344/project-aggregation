@@ -212,6 +212,10 @@ class PairTrader:
             **{field: wire(getattr(snapshot, field)) for field in ("equity", "available", "wallet", "unrealized")}}
             for side, snapshot in snapshots.items()}
         for side, snapshot in snapshots.items():
+            # Keep optional display data separate from the snapshot's trading
+            # margin calculation; a missing new value must clear the old one.
+            occupied = getattr(snapshot, "display_occupied_margin", None)
+            state["margin_balances"][side]["occupied_margin"] = wire(occupied) if occupied is not None else None
             display = getattr(snapshot, "display_positions", None)
             if not isinstance(display, dict):
                 continue

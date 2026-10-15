@@ -86,6 +86,64 @@ class TransferAccountSnapshotTests(TestCase):
         with self.assertRaises(AccountModeError):
             snapshot.require_ready(SYMBOL)
 
+    def test_usd1_position_margin_is_display_only_and_excludes_orders_and_other_assets(self):
+        account = account_response()
+        account["assets"][0].update(positionInitialMargin="35.125", initialMargin="120.125",
+                                    openOrderInitialMargin="85")
+        account["assets"].insert(0, {"asset": "USDT", "positionInitialMargin": "999"})
+        account.update(totalPositionInitialMargin="999", totalInitialMargin="1500",
+                       positions=seven_position_response())
+        broker, api = self.broker(account)
+        snapshot = broker.transfer_snapshot()
+        self.assertEqual(snapshot.display_occupied_margin, dec("35.125"))
+        self.assertEqual((snapshot.available, snapshot.transfer_withdrawable), (dec(140), dec(130)))
+        self.assertEqual(snapshot.positions, [])
+        self.assertEqual(snapshot.occupied_margin, 0)
+        self.assertEqual(snapshot.ratio, 0)
+        self.assertIsNone(snapshot.open_orders)
+        self.assertIsNone(broker.leverage_snapshot)
+        with self.assertRaises(AccountModeError):
+            snapshot.require_ready(SYMBOL)
+        broker.require_snapshot_current(snapshot)
+        self.assertEqual(api.calls, [("GET", ACCOUNT, (), {"signed": True, "weight": 5})])
+
+    def test_zero_display_margin_is_collected_without_requiring_position_inventory(self):
+        for value in ("0", "0.000", 0):
+            with self.subTest(value=value):
+                account = account_response()
+                account["assets"][0]["positionInitialMargin"] = value
+                broker, api = self.broker(account)
+                snapshot = broker.transfer_snapshot()
+                self.assertEqual(snapshot.display_occupied_margin, dec(0))
+                self.assertTrue(snapshot.display_positions["error"])
+                self.assertEqual(snapshot.available, dec(140))
+                self.assertEqual(len(api.calls), 1)
+
+    def test_missing_or_invalid_display_margin_stays_unknown_without_blocking_balances(self):
+        for value in ("missing", None, "-1", "NaN", "Infinity", "-Infinity", True, False, "invalid"):
+            with self.subTest(value=value):
+                account = account_response()
+                asset = account["assets"][0]
+                asset.update(initialMargin="120", openOrderInitialMargin="85")
+                if value != "missing":
+                    asset["positionInitialMargin"] = value
+                account.update(totalPositionInitialMargin="999", positions=seven_position_response())
+                account["assets"].append({"asset": "USDT", "positionInitialMargin": "999"})
+                broker, api = self.broker(account)
+                snapshot = broker.transfer_snapshot()
+                self.assertIsNone(snapshot.display_occupied_margin)
+                self.assertEqual((snapshot.wallet, snapshot.equity, snapshot.available, snapshot.unrealized,
+                                  snapshot.maintenance, snapshot.transfer_withdrawable),
+                                 tuple(map(dec, (200, 175, 140, -25, 5, 130))))
+                self.assertEqual(snapshot.positions, [])
+                self.assertEqual(snapshot.occupied_margin, 0)
+                self.assertEqual(snapshot.ratio, 0)
+                self.assertIsNone(broker.leverage_snapshot)
+                with self.assertRaises(AccountModeError):
+                    snapshot.require_ready(SYMBOL)
+                broker.require_snapshot_current(snapshot)
+                self.assertEqual(api.calls, [("GET", ACCOUNT, (), {"signed": True, "weight": 5})])
+
     def test_display_inventory_accepts_unknown_one_way_isolated_and_other_margin_assets(self):
         account = account_response()
         account["positions"] = [

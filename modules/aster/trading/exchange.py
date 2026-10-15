@@ -1388,6 +1388,13 @@ class LiveBroker:
                 account.get("canTrade") is True, started)
             snapshot.transfer_withdrawable = positive(asset.get("maxWithdrawAmount"), True,
                 field="USD1 可划转额度（maxWithdrawAmount）")
+            # Display only: USD1 position margin from this same balance read.
+            # Do not infer it from empty trading positions, available balance,
+            # maintenance margin, or account-wide totals in another asset.
+            try:
+                snapshot.display_occupied_margin = positive(asset.get("positionInitialMargin"), True)
+            except TradingError:
+                snapshot.display_occupied_margin = None
             snapshot.display_positions = account_positions(account, started)
             with self._snapshot_lock:
                 if generation != self._snapshot_generation:

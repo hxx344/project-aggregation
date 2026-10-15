@@ -97,7 +97,7 @@ class PairMarginIndependentTests(TestCase):
             stack.enter_context(patch.object(broker.api, "call", side_effect=call))
         return stack
 
-    def display_responses(self, rows):
+    def display_responses(self, rows, asset_fields=None):
         # The funds fixture supplies balances; inventory can contain any market
         # independently of the strategy market known by the paper exchange.
         stack = ExitStack()
@@ -108,6 +108,8 @@ class PairMarginIndependentTests(TestCase):
                 result = original(method, path, *args, **kwargs)
                 if path == live.ACCOUNT:
                     result["positions"] = deepcopy(rows[side])
+                    if asset_fields is not None:
+                        result["assets"][0].update(asset_fields[side])
                 return result
 
             stack.enter_context(patch.object(broker.api, "call", side_effect=call))
@@ -138,7 +140,9 @@ class PairMarginIndependentTests(TestCase):
         self.store.put("pair_runtime:gold", old)
         rows = {"long": seven_position_response(),
                 "short": [{**display_position("BTCUSDT", "BOTH", "-0.2"), "isolated": True}]}
-        with self.display_responses(rows), ExitStack() as stack:
+        occupied = {"long": "750.125", "short": "0"}
+        asset_fields = {side: {"positionInitialMargin": value} for side, value in occupied.items()}
+        with self.display_responses(rows, asset_fields), ExitStack() as stack:
             for broker in self.brokers.values():
                 stack.enter_context(patch.object(broker, "snapshot", side_effect=AssertionError("no strategy read")))
             self.start()
@@ -154,6 +158,7 @@ class PairMarginIndependentTests(TestCase):
             self.assertEqual(displays["short"]["snapshot"]["positions"][0]["side"], "SHORT")
             for side, broker in self.brokers.items():
                 self.assertEqual(balances[side]["unrealized"], unrealized[side])
+                self.assertEqual(balances[side]["occupied_margin"], occupied[side])
                 self.assertEqual(balances[side]["timestamp"], displays[side]["snapshot"]["timestamp"])
                 self.assertGreater(balances[side]["timestamp"], old["snapshots"][side]["timestamp"])
                 calls = broker.api.calls[before[side]:]
@@ -171,6 +176,46 @@ class PairMarginIndependentTests(TestCase):
                 self.assertEqual(accounts[side]["snapshot"], old["snapshots"][side])
             self.assertEqual({side: len(broker.api.calls) for side, broker in self.brokers.items()}, before_state)
         self.assertEqual(self.sent, [])
+        self.assert_no_trades()
+
+    def test_latest_missing_or_invalid_funds_margin_clears_old_display_value(self):
+        self.equal_balances()
+        rows = {side: seven_position_response() for side in self.brokers}
+        asset_fields = {"long": {"positionInitialMargin": "750.125"},
+                        "short": {"positionInitialMargin": "0"}}
+        with self.display_responses(rows, asset_fields):
+            self.start()
+            first = self.tick()
+            self.assertEqual(first["margin_balances"]["long"]["occupied_margin"], "750.125")
+            self.assertEqual(first["margin_balances"]["short"]["occupied_margin"], "0")
+            asset_fields.update(long={}, short={"positionInitialMargin": "NaN"})
+            self.display_check_due()
+            before = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
+            second = self.tick()
+            for side, broker in self.brokers.items():
+                self.assertIsNone(second["margin_balances"][side]["occupied_margin"])
+                self.assertGreater(second["margin_balances"][side]["timestamp"],
+                                   first["margin_balances"][side]["timestamp"])
+                self.assertEqual([(method, path) for method, path, _ in broker.api.calls[before[side]:]],
+                                 [("GET", live.ACCOUNT)])
+            self.assertEqual(second["snapshots"], first["snapshots"])
+            self.assertFalse(self.store.get("pair_margin:gold").get("blocked_reason"))
+        self.assertEqual(self.sent, [])
+        self.assert_no_trades()
+
+    def test_full_paper_snapshot_does_not_supply_a_display_margin_fallback(self):
+        paper = self.paper["long"]
+        mark = paper.market.book(live.SYMBOL).mark
+        paper.state["positions"][live.SYMBOL + ":LONG"].update(qty="1", entry=wire(mark))
+        paper.save()
+        snapshot = paper.snapshot([live.SYMBOL])
+        self.assertGreater(snapshot.occupied_margin, 0)
+        self.assertFalse(hasattr(snapshot, "display_occupied_margin"))
+        state = {"margin_balances": {"long": {"occupied_margin": "999", "timestamp": 1}}}
+        self.trader._publish_balances(state, {"long": snapshot})
+        self.assertIsNone(state["margin_balances"]["long"]["occupied_margin"])
+        self.assertEqual(state["margin_balances"]["long"]["timestamp"], snapshot.timestamp)
+        self.assertGreater(snapshot.occupied_margin, 0)
         self.assert_no_trades()
 
     def test_one_invalid_inventory_keeps_its_previous_read_while_other_side_and_funds_update(self):
@@ -235,7 +280,8 @@ class PairMarginIndependentTests(TestCase):
 
     def test_invalid_display_inventories_do_not_block_the_existing_signed_transfer_flow(self):
         rows = {"long": None, "short": [{"symbol": "BTCUSDT", "positionSide": "BOTH", "positionAmt": "NaN"}]}
-        with self.display_responses(rows):
+        asset_fields = {"long": {"positionInitialMargin": "NaN"}, "short": {"positionInitialMargin": "-1"}}
+        with self.display_responses(rows, asset_fields):
             self.start()
             state = self.tick()
         self.assertEqual(len(self.sent), 1, state)
@@ -243,6 +289,8 @@ class PairMarginIndependentTests(TestCase):
         for display in state["display_positions"].values():
             self.assertTrue(display["error"])
             self.assertNotIn("snapshot", display)
+        for balance in state["margin_balances"].values():
+            self.assertIsNone(balance["occupied_margin"])
         self.assertEqual(state["snapshots"], {})
         self.assertTrue(all(path in (live.ACCOUNT, live.INCOME)
                             for broker in self.brokers.values() for _, path, _ in broker.api.calls))

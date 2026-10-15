@@ -635,6 +635,8 @@
 
 **飞书摘要补充：** 基线 `947346e` 的 [飞书摘要](modules/aster/trading/hourly_summary.py) 仍只读取交易快照，导致仅保证金监控时通知持续显示数小时前的余额和浮盈亏。通知按严格资金模式选择两侧 `margin_balances`，合计与分账户卡片共用来源；复用已读取的 `unrealized` 字段，不额外请求交易所。持仓仅从独立 `display_positions` 展示，并保留自己的采样时间及失败信息；未采集的占用率不借旧值补齐。缺余额、缺浮盈亏、过期、定时等待、暂停与真实异常分别表达，不能借通知生成时间刷新源时间。[飞书汇总测试](modules/aster/tests/test_hourly_summary.py) 与 [通知链路测试](modules/aster/tests/test_hourly_notification_engine.py) 已在旧实现复现陈旧值，并覆盖 compact 状态到持久 outbox、模拟发送的完整路径和零额外交易所请求。此为同一事件的通知入口补漏，不新增事件计数。
 
+**飞书占用率补充：** 2026-10-15 用户反馈保证金监控卡片一直显示“未采集”。基线 `fd3c283` 的 [资金读取](modules/aster/trading/exchange.py) 未透传 USD1 资产行的 `positionInitialMargin`，[余额发布](modules/aster/trading/pair_execution.py) 只有资金字段，飞书还按资金模式硬编码未知。现复用同一次账户读取，独立发布展示占用额，按同次 USD1 权益计算百分比；不使用包含挂单的 `initialMargin`、USDT 顶层总额、维持保证金或“权益减可用余额”替代。缺失、负数或非有限数只让该指标待同步，不阻断合法资金读取，不回填旧占用；真实零值可以显示 0%。资金快照的交易持仓、风控属性与授权保持不变。专用资金快照、配对发布、飞书汇总及通知链路测试覆盖同次读取、币种隔离、零值与异常值，以及 compact 状态和 outbox 的完整传递；通知不新增交易所请求。此为同一事件的显示能力补全，不新增独立事件计数。
+
 **事件记录：** `aster-transfer-strategy-coupling-20261015`；一次用户纠正及完整调用链修复，不推进主线复盘检查点。
 
 ### L042：旧配置的同值写入不能覆盖新模型的细分选择

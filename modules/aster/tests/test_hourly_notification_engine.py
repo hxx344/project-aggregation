@@ -78,6 +78,8 @@ class HourlyNotificationEngineTests(unittest.TestCase):
         self.now = NOW
         published = margin_only_state(self.now)
         pair = published["pairs"][0]
+        pair["state"]["margin_balances"]["long"]["occupied_margin"] = "662.8176"
+        pair["state"]["margin_balances"]["short"]["occupied_margin"] = "0"
         for row in published["accounts"]:
             saved = {**account(row["id"], "live"), "enabled": False, "name": row["name"]}
             self.f.store.save_account(saved)
@@ -87,6 +89,15 @@ class HourlyNotificationEngineTests(unittest.TestCase):
         self.f.store.put("pair_margin:" + pair["id"], pair["state"]["margin"])
         before_runtime = self.f.store.get("pair_runtime:" + pair["id"])
         before_views = deepcopy(self.engine.views)
+        queued_messages = []
+
+        def observe_persisted_summary(*_):
+            with self.f.store.connect() as db:
+                queued = db.execute("SELECT message FROM outbox WHERE category='hourly_summary'").fetchall()
+            self.assertEqual(len(queued), 1)
+            queued_messages.append(queued[0]["message"])
+
+        self.sender.side_effect = observe_persisted_summary
         with ExitStack() as stack:
             reads = [stack.enter_context(patch.object(self.f.market, method, side_effect=AssertionError("unexpected market read")))
                      for method in ("load_rules", "book", "mark_price", "capacities", "depth")]
@@ -105,6 +116,10 @@ class HourlyNotificationEngineTests(unittest.TestCase):
         self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
         self.assertIn("可用保证金\n812.34", text)
         self.assertIn("可用保证金\n623.45", text)
+        self.assertIn("保证金占用率\n66.28%", text)
+        self.assertIn("保证金占用率\n0.00%", text)
+        self.assertNotIn("保证金占用率\n30.00%", text)
+        self.assertNotIn("未采集", text)
         self.assertIn("资金余额 15 秒前", text)
         self.assertIn("75 秒前", text)
         self.assertRegex(text, r"持仓[^\n]*多 3\.25[^\n]*空 4\.5")
@@ -115,6 +130,7 @@ class HourlyNotificationEngineTests(unittest.TestCase):
         self.assertEqual(compact_pair["state"]["display_positions"], before_runtime["display_positions"])
         self.assertEqual(self.f.store.get("pair_runtime:" + pair["id"]), before_runtime)
         self.assertEqual(self.engine.views, before_views)
+        self.assertEqual(queued_messages, [self.sender.call_args.args[1]])
         self.assertEqual(self.f.store.hourly_summary_status(available=True)["last_sent_at"], self.now)
 
     def test_demo_and_missing_webhook_never_build_or_send(self):
