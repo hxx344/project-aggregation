@@ -18,7 +18,9 @@ echo ""
 # 1. 安装依赖
 if ! command -v nginx &>/dev/null; then
   echo "安装 Nginx..."
-  apt-get update && apt-get install -y nginx certbot python3-certbot-nginx
+  # 只安装 nginx，不安装 certbot（避免触发云安全告警）
+  # 本地镜像使用 HTTP 即可，不需要 HTTPS 证书
+  apt-get update && apt-get install -y nginx
 fi
 
 # 2. 创建缓存目录
@@ -108,7 +110,7 @@ echo "HTTP 地址: http://$DOMAIN"
 echo ""
 echo "下一步："
 echo "1. 配置 DNS: $DOMAIN → $(curl -s ifconfig.me)"
-echo "2. 启用 HTTPS: certbot --nginx -d $DOMAIN"
+echo "2. 如需 HTTPS，手动安装: apt-get install certbot python3-certbot-nginx && certbot --nginx -d $DOMAIN"
 echo "3. 测试下载: curl -I http://$DOMAIN/hxx344/project-aggregation/releases/latest/download/project-aggregation-linux-x64.tar.gz"
 echo ""
 echo "缓存统计: curl http://localhost/cache-status"
