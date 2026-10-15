@@ -22,6 +22,7 @@ from .account_cache import CycleAccountCache, HotAccountUnavailable
 from .capacity_relay_client import CAPACITY_RELAY_SYMBOLS
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from .depth_stream import PublicDepthStream
+from .display_positions import account_positions
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
@@ -1365,8 +1366,8 @@ class LiveBroker:
     def transfer_snapshot(self):
         """Read USD1 transfer balances without claiming any trading evidence.
 
-        Position rows, market metadata and account modes are deliberately not
-        interpreted. The exchange's withdrawal limit remains mandatory, and
+        Position rows supply a separate, optional display inventory only.
+        Market metadata and account modes are not required. The withdrawal limit remains mandatory, and
         account events/writes revoke this read just like an ordinary snapshot.
         """
         with self._ordinary_read_lock:
@@ -1387,6 +1388,7 @@ class LiveBroker:
                 account.get("canTrade") is True, started)
             snapshot.transfer_withdrawable = positive(asset.get("maxWithdrawAmount"), True,
                 field="USD1 可划转额度（maxWithdrawAmount）")
+            snapshot.display_positions = account_positions(account, started)
             with self._snapshot_lock:
                 if generation != self._snapshot_generation:
                     raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")

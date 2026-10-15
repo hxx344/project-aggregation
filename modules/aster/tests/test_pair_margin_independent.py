@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from tests import test_pair_integration as integration
 from tests import test_pair_margin_lifeline_live as live
+from tests.test_transfer_account_snapshot import display_position, seven_position_response
 from trading.models import TradingError, dec, wire
 from trading.pair_execution import runtime_default
 from trading.paper import DemoMarket
@@ -95,6 +96,140 @@ class PairMarginIndependentTests(TestCase):
                 return [] if path == "/fapi/v3/openOrders" else originals[side](method, path, *args, **kwargs)
             stack.enter_context(patch.object(broker.api, "call", side_effect=call))
         return stack
+
+    def display_responses(self, rows):
+        # The funds fixture supplies balances; inventory can contain any market
+        # independently of the strategy market known by the paper exchange.
+        stack = ExitStack()
+        for side, broker in self.brokers.items():
+            original = broker.api.call
+
+            def call(method, path, *args, side=side, original=original, **kwargs):
+                result = original(method, path, *args, **kwargs)
+                if path == live.ACCOUNT:
+                    result["positions"] = deepcopy(rows[side])
+                return result
+
+            stack.enter_context(patch.object(broker.api, "call", side_effect=call))
+        return stack
+
+    def display_check_due(self):
+        margin = self.store.get("pair_margin:gold") or {}
+        margin.update(next_check_at=0, cooldown_until=0)
+        self.store.put("pair_margin:gold", margin)
+
+    def equal_balances(self):
+        self.paper["short"].state["wallet"] = self.paper["long"].state["wallet"]
+        self.paper["short"].save()
+
+    def test_funds_checks_publish_both_inventories_to_state_without_refreshing_strategy_evidence(self):
+        self.equal_balances()
+        old = {**runtime_default(), "snapshots": {
+            side: {"timestamp": 1, "positions": [{"symbol": "OURAUSD1", "side": "LONG", "qty": "1000"}]}
+            for side in self.brokers}}
+        self.store.put("pair_runtime:gold", old)
+        rows = {"long": seven_position_response(),
+                "short": [{**display_position("BTCUSDT", "BOTH", "-0.2"), "isolated": True}]}
+        with self.display_responses(rows), ExitStack() as stack:
+            for broker in self.brokers.values():
+                stack.enter_context(patch.object(broker, "snapshot", side_effect=AssertionError("no strategy read")))
+            self.start()
+            before = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
+            state = self.tick()
+            self.assertEqual(state["snapshots"], old["snapshots"])
+            displays = state["display_positions"]
+            self.assertEqual(len(displays["long"]["snapshot"]["positions"]), 7)
+            self.assertEqual(next(row["qty"] for row in displays["long"]["snapshot"]["positions"]
+                                  if row["symbol"] == "OURAUSD1"), "1191.36")
+            self.assertEqual(displays["short"]["snapshot"]["positions"][0]["side"], "SHORT")
+            for side, broker in self.brokers.items():
+                calls = broker.api.calls[before[side]:]
+                self.assertEqual([(method, path) for method, path, _ in calls], [("GET", live.ACCOUNT)])
+            before_state = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
+            with patch.object(self.engine, "_load_dashboard_report", return_value={}):
+                view = self.engine.state()
+            accounts = {account["id"]: account for account in view["accounts"]}
+            for side in self.brokers:
+                self.assertEqual(accounts[side]["display_positions"], displays[side])
+                self.assertEqual(accounts[side]["snapshot"], old["snapshots"][side])
+            self.assertEqual({side: len(broker.api.calls) for side, broker in self.brokers.items()}, before_state)
+        self.assertEqual(self.sent, [])
+        self.assert_no_trades()
+
+    def test_one_invalid_inventory_keeps_its_previous_read_while_other_side_and_funds_update(self):
+        self.equal_balances()
+        rows = {side: seven_position_response() for side in self.brokers}
+        with self.display_responses(rows):
+            self.start()
+            first = self.tick()
+            original = deepcopy(first["display_positions"])
+            rows["long"] = [{**display_position("OURAUSD1", "LONG", "1191.36"), "positionAmt": "NaN"}]
+            rows["short"] = [display_position("NEWUSD1", "BOTH", "-9.125")]
+            self.display_check_due()
+            second = self.tick()
+            displays = second["display_positions"]
+            self.assertTrue(displays["long"]["error"])
+            self.assertEqual(displays["long"]["snapshot"], original["long"]["snapshot"])
+            self.assertGreater(displays["long"]["checked_at"], original["long"]["checked_at"])
+            self.assertIsNone(displays["short"]["error"])
+            self.assertEqual([(row["symbol"], row["side"], row["qty"])
+                              for row in displays["short"]["snapshot"]["positions"]], [("NEWUSD1", "SHORT", "9.125")])
+            self.assertGreater(displays["short"]["snapshot"]["timestamp"],
+                               original["short"]["snapshot"]["timestamp"])
+            for side in self.brokers:
+                self.assertGreater(second["margin_balances"][side]["timestamp"],
+                                   first["margin_balances"][side]["timestamp"])
+            self.assertFalse(self.store.get("pair_margin:gold").get("blocked_reason"))
+            self.assertFalse(second["margin"]["blocks_trading"])
+            rows.update(long=[], short=[])
+            self.display_check_due()
+            flat = self.tick()
+            for side in self.brokers:
+                self.assertIsNone(flat["display_positions"][side]["error"])
+                self.assertEqual(flat["display_positions"][side]["snapshot"]["positions"], [])
+                self.assertGreater(flat["display_positions"][side]["snapshot"]["timestamp"],
+                                   displays[side]["snapshot"]["timestamp"])
+        self.assertEqual(self.sent, [])
+        self.assert_no_trades()
+
+    def test_cooldown_and_pause_keep_inventory_source_time_without_any_extra_account_reads(self):
+        self.equal_balances()
+        rows = {side: seven_position_response() for side in self.brokers}
+        with self.display_responses(rows):
+            self.start()
+            first = self.tick()
+            displays = deepcopy(first["display_positions"])
+            margin = self.store.get("pair_margin:gold")
+            margin.update(cooldown_until=time.time() + 30, next_check_at=time.time() + 5)
+            self.store.put("pair_margin:gold", margin)
+            rows.update(long=[], short=[])
+            before = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
+            cooling = self.tick()
+            self.assertEqual(cooling["margin"]["status"], "cooldown")
+            self.assertEqual(cooling["display_positions"], displays)
+            self.assertEqual({side: len(broker.api.calls) for side, broker in self.brokers.items()}, before)
+            self.engine.pairs.enable("gold", False)
+            paused = self.tick()
+            self.assertEqual(paused["phase"], "paused")
+            self.assertEqual(paused["display_positions"], displays)
+            self.assertEqual({side: len(broker.api.calls) for side, broker in self.brokers.items()}, before)
+        self.assertEqual(self.sent, [])
+        self.assert_no_trades()
+
+    def test_invalid_display_inventories_do_not_block_the_existing_signed_transfer_flow(self):
+        rows = {"long": None, "short": [{"symbol": "BTCUSDT", "positionSide": "BOTH", "positionAmt": "NaN"}]}
+        with self.display_responses(rows):
+            self.start()
+            state = self.tick()
+        self.assertEqual(len(self.sent), 1, state)
+        self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["status"], "acknowledged")
+        for display in state["display_positions"].values():
+            self.assertTrue(display["error"])
+            self.assertNotIn("snapshot", display)
+        self.assertEqual(state["snapshots"], {})
+        self.assertTrue(all(path in (live.ACCOUNT, live.INCOME)
+                            for broker in self.brokers.values() for _, path, _ in broker.api.calls))
+        self.assert_no_trades()
 
     def test_start_and_signed_transfer_ignore_positions_market_tiers_and_history(self):
         self.mixed_positions()

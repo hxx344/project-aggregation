@@ -15,7 +15,10 @@ import { Progress } from '@/components/ui/progress';
 import { fmt, pct, clock } from '@/lib/desk-format';
 import { accountModeView, accountSnapshotView } from '@/lib/account-modes';
 import { accountConfigurationLock } from '@/lib/account-config';
-import { visiblePositions } from '@/lib/account-positions';
+import {
+  accountPositionsView,
+  visiblePositions,
+} from '@/lib/account-positions';
 import { pairMarginOnly, type Pair } from '@/lib/pairs';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
@@ -38,13 +41,30 @@ export function AccountOverview({
   const snapshot = account.snapshot;
   const configurationLock = accountConfigurationLock(account);
   const locked = busy || Boolean(configurationLock);
-  const positions = visiblePositions(snapshot);
   const direction =
     pair?.long_account_id === account.id
       ? 'LONG'
       : pair?.short_account_id === account.id
         ? 'SHORT'
         : undefined;
+  const positionsView = accountPositionsView({
+    account,
+    pair,
+    side:
+      direction === 'LONG'
+        ? 'long'
+        : direction === 'SHORT'
+          ? 'short'
+          : undefined,
+    now,
+    connectionError,
+  });
+  const { snapshot: positionsSnapshot, positions } = positionsView;
+  const positionsTime = positionsSnapshot
+    ? new Date(positionsSnapshot.timestamp * 1000).toLocaleString('zh-CN', {
+        hour12: false,
+      })
+    : '—';
   const positionStrategy: PositionStrategy | undefined =
     pair && direction
       ? {
@@ -124,24 +144,51 @@ export function AccountOverview({
         <Metric
           label="未实现盈亏"
           value={fmt(snapshot?.unrealized)}
-          sub={snapshot ? `${positions.length} 个方向持仓` : '等待账户仓位数据'}
+          sub={
+            snapshot
+              ? `${visiblePositions(snapshot).length} 个方向持仓 · 风险快照 ${clock(snapshot.timestamp)}`
+              : '等待账户仓位数据'
+          }
           accent={Number(snapshot?.unrealized) < 0 ? 'danger' : 'mint'}
           icon={<ArrowUpRight size={17} />}
         />
       </section>
+      {snapshot &&
+      positionsSnapshot &&
+      snapshot.timestamp !== positionsSnapshot.timestamp ? (
+        <p className="small-note">
+          风险汇总仍为 {modeView.recordedAt ?? '—'} 记录，以下持仓清单更新于{' '}
+          {positionsTime}。
+        </p>
+      ) : null}
       <div className="feature-grid">
         <div className="panel positions-panel">
           <div className="section-head">
-            <h2>当前持仓 · {snapshot ? positions.length : '—'}</h2>
+            <h2>当前持仓 · {positionsSnapshot ? positions.length : '—'}</h2>
             <span
               className={
-                snapshotView.warning ? 'small-note amber' : 'small-note'
+                positionsView.warning ? 'small-note amber' : 'small-note'
               }
-              title={snapshotView.notice}
+              title={positionsView.notice}
             >
-              {snapshotView.label} {clock(snapshot?.timestamp)}
+              {positionsView.label} {positionsTime}
             </span>
           </div>
+          {positionsView.sourceNote ? (
+            <p className="muted">{positionsView.sourceNote}</p>
+          ) : null}
+          {positionsView.fieldNotice ? (
+            <p className="muted">{positionsView.fieldNotice}</p>
+          ) : null}
+          {positionsView.notice ? (
+            <p
+              className={
+                positionsView.warning ? 'small-note amber' : 'small-note'
+              }
+            >
+              {positionsView.notice}
+            </p>
+          ) : null}
           <AccountPositionsTable
             positions={positions}
             strategy={positionStrategy}
@@ -149,8 +196,8 @@ export function AccountOverview({
           {!positions.length && (
             <div className="empty-state">
               <Layers3 size={27} />
-              <h3>{snapshotView.emptyTitle}</h3>
-              <p>{snapshotView.emptyNotice}</p>
+              <h3>{positionsView.emptyTitle}</h3>
+              <p>{positionsView.emptyNotice}</p>
             </div>
           )}
         </div>

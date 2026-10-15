@@ -2541,6 +2541,9 @@ class Engine:
                     pair_snapshot = owner["state"].get("snapshots", {}).get(direction)
                     if isinstance(pair_snapshot, dict):
                         account["snapshot"] = pair_snapshot
+                    display_positions = owner["state"].get("display_positions", {}).get(direction)
+                    if isinstance(display_positions, dict):
+                        account["display_positions"] = display_positions
                 # Display cadence only; this never extends a snapshot's
                 # eight-second execution authority or starts an exchange read.
                 hot_refresh = (account["mode"] == "live" and account["enabled"]

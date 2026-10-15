@@ -19,6 +19,21 @@ def account_response():
         "maintMargin": "5", "maxWithdrawAmount": "130"}]}
 
 
+def display_position(symbol, side, amount):
+    # Account inventory fields deliberately omit positionRisk-only prices.
+    return {"symbol": symbol, "positionSide": side, "positionAmt": amount,
+        "entryPrice": "12.345", "leverage": "5", "unrealizedProfit": "-2.75",
+        "notional": "1234.56", "positionInitialMargin": "246.912", "isolated": False}
+
+
+def seven_position_response():
+    return [display_position(symbol, side, amount) for symbol, side, amount in (
+        ("KORUUSD1", "SHORT", "-720.8"), ("CRCLUSD1", "SHORT", "-6.54"),
+        ("XAGUSD1", "LONG", "5348.110"), ("OURAUSD1", "LONG", "1191.36"),
+        ("SOXLUSD1", "SHORT", "-10"), ("QQQUSD1", "LONG", "0.69"),
+        ("SKHYNIXUSD1", "SHORT", "-60"))]
+
+
 class UnusedMarket:
     def __getattribute__(self, name):
         raise AssertionError("Transfer read must not access market data: " + name)
@@ -41,6 +56,112 @@ class TransferAccountSnapshotTests(TestCase):
         self.assertLessEqual(snapshot.timestamp, time.time())
         self.assertEqual(snapshot.account_read_generation, broker._snapshot_generation)
         broker.require_snapshot_current(snapshot)
+
+    def test_transfer_get_also_publishes_all_seven_holdings_without_trading_evidence(self):
+        account = account_response()
+        account["positions"] = seven_position_response()
+        broker, api = self.broker(account)
+        snapshot = broker.transfer_snapshot()
+        display = snapshot.display_positions
+        self.assertIsNone(display["error"])
+        self.assertEqual(display["checked_at"], snapshot.timestamp)
+        self.assertEqual(display["snapshot"]["timestamp"], snapshot.timestamp)
+        positions = display["snapshot"]["positions"]
+        self.assertEqual([(p["symbol"], p["side"], p["qty"]) for p in positions], [
+            ("KORUUSD1", "SHORT", "720.8"), ("CRCLUSD1", "SHORT", "6.54"),
+            ("XAGUSD1", "LONG", "5348.110"), ("OURAUSD1", "LONG", "1191.36"),
+            ("SOXLUSD1", "SHORT", "10"), ("QQQUSD1", "LONG", "0.69"),
+            ("SKHYNIXUSD1", "SHORT", "60")])
+        for position in positions:
+            self.assertEqual((position["entry"], position["notional"], position["occupied_margin"],
+                              position["unrealized"]), ("12.345", "1234.56", "246.912", "-2.75"))
+            self.assertIsNone(position["mark"])
+            self.assertIsNone(position["liquidation"])
+        self.assertEqual(api.calls, [("GET", ACCOUNT, (), {"signed": True, "weight": 5})])
+        self.assertEqual(snapshot.positions, [])
+        self.assertIsNone(snapshot.open_orders)
+        self.assertIsNone(snapshot.hedge_mode)
+        self.assertIsNone(snapshot.multi_assets)
+        self.assertIsNone(broker.leverage_snapshot)
+        with self.assertRaises(AccountModeError):
+            snapshot.require_ready(SYMBOL)
+
+    def test_display_inventory_accepts_unknown_one_way_isolated_and_other_margin_assets(self):
+        account = account_response()
+        account["positions"] = [
+            {**display_position("UNLISTED", "BOTH", "1.0000000000000000000000000001"), "isolated": True},
+            {**display_position("BTCUSDT", "BOTH", "-0.0000000000000000000000000001"), "isolated": True},
+            display_position("XAUUSD1", "SHORT", "2.25"),
+            display_position("FLATUSDT", "BOTH", "-0.000")]
+        broker, api = self.broker(account)
+        snapshot = broker.transfer_snapshot()
+        self.assertEqual([(row["symbol"], row["side"], row["qty"])
+                          for row in snapshot.display_positions["snapshot"]["positions"]], [
+            ("UNLISTED", "LONG", "1.0000000000000000000000000001"),
+            ("BTCUSDT", "SHORT", "0.0000000000000000000000000001"),
+            ("XAUUSD1", "SHORT", "2.25")])
+        self.assertEqual((snapshot.available, snapshot.transfer_withdrawable), (dec(140), dec(130)))
+        self.assertEqual(snapshot.positions, [])
+        self.assertEqual(len(api.calls), 1)
+
+    def test_optional_display_values_remain_unknown_without_price_or_risk_fallbacks(self):
+        account = account_response()
+        account["positions"] = [{"symbol": "NEWUSD1", "positionSide": "LONG", "positionAmt": "3",
+            "entryPrice": None, "markPrice": "0", "leverage": "NaN", "notional": "invalid",
+            "positionInitialMargin": "-1", "unrealizedProfit": True, "liquidationPrice": "0"}]
+        broker, api = self.broker(account)
+        snapshot = broker.transfer_snapshot()
+        display = snapshot.display_positions
+        self.assertIsNone(display["error"])
+        row = display["snapshot"]["positions"][0]
+        for field in ("entry", "mark", "leverage", "notional", "occupied_margin", "unrealized", "liquidation"):
+            self.assertIsNone(row[field], field)
+        self.assertEqual(row["qty"], "3")
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(snapshot.available, dec(140))
+
+    def test_invalid_inventory_never_becomes_empty_or_prevents_a_transfer_balance_read(self):
+        valid = display_position("XAGUSD1", "LONG", "5348.11")
+        invalid_rows = [None, {}, "not a list", [None],
+            [{**valid, "symbol": ""}], [{**valid, "positionSide": "INVALID"}],
+            [valid, copy.deepcopy(valid)],
+            [valid, display_position("XAGUSD1", "BOTH", "0")],
+            [display_position("XAGUSD1", "BOTH", "0"), valid]]
+        invalid_rows.extend([{**valid, "positionAmt": amount}] for amount in
+                            (None, True, "NaN", "Infinity", "invalid-private-value"))
+        for rows in invalid_rows:
+            with self.subTest(rows=rows):
+                account = account_response()
+                account["positions"] = rows
+                broker, api = self.broker(account)
+                snapshot = broker.transfer_snapshot()
+                display = snapshot.display_positions
+                self.assertTrue(display["error"])
+                self.assertNotIn("invalid-private-value", display["error"])
+                self.assertNotIn("snapshot", display)
+                self.assertEqual(display["checked_at"], snapshot.timestamp)
+                self.assertEqual((snapshot.available, snapshot.transfer_withdrawable), (dec(140), dec(130)))
+                broker.require_snapshot_current(snapshot)
+                self.assertEqual(len(api.calls), 1)
+
+    def test_successive_complete_inventory_reads_replace_closed_positions_and_allow_true_flatness(self):
+        account = account_response()
+        account["positions"] = seven_position_response()
+        broker, api = self.broker(account)
+        first = broker.transfer_snapshot().display_positions["snapshot"]
+        account["positions"] = [display_position("OURAUSD1", "LONG", "1191.3600000000000000000001"),
+                                display_position("NEWUSD1", "SHORT", "-4")]
+        second = broker.transfer_snapshot().display_positions["snapshot"]
+        self.assertEqual([row["symbol"] for row in first["positions"]],
+                         [row["symbol"] for row in seven_position_response()])
+        self.assertEqual([(row["symbol"], row["qty"]) for row in second["positions"]],
+                         [("OURAUSD1", "1191.3600000000000000000001"), ("NEWUSD1", "4")])
+        self.assertGreaterEqual(second["timestamp"], first["timestamp"])
+        account["positions"] = []
+        third = broker.transfer_snapshot().display_positions
+        self.assertIsNone(third["error"])
+        self.assertEqual(third["snapshot"]["positions"], [])
+        self.assertEqual(len(api.calls), 3)
 
     def test_estimate_is_constant_and_does_not_read_or_change_broker_state(self):
         broker, api = self.broker()

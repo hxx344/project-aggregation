@@ -211,6 +211,17 @@ class PairTrader:
         state["margin_balances"] = {side: {"timestamp": snapshot.timestamp,
             **{field: wire(getattr(snapshot, field)) for field in ("equity", "available", "wallet")}}
             for side, snapshot in snapshots.items()}
+        for side, snapshot in snapshots.items():
+            display = getattr(snapshot, "display_positions", None)
+            if not isinstance(display, dict):
+                continue
+            displays = state.setdefault("display_positions", {})
+            previous = displays.get(side, {})
+            if display["checked_at"] < previous.get("checked_at", 0):
+                continue
+            # A malformed inventory cannot erase the last complete reading or
+            # advance its timestamp. Neither result is execution evidence.
+            displays[side] = {**previous, **deepcopy(display)}
 
     @staticmethod
     def _expected(state):

@@ -3,25 +3,29 @@ import type { Account } from '@/lib/desk-types';
 import type { Pair } from '@/lib/pairs';
 import { pairMarginOnly } from '@/lib/pairs';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
-import {
-  latestPositionsSnapshot,
-  visiblePositions,
-} from '@/lib/account-positions';
+import { accountPositionsView } from '@/lib/account-positions';
 
 export function PairAccountPositions({
   pair,
   side,
   account,
+  now,
+  connectionError,
 }: {
   pair: Pair;
   side: 'long' | 'short';
   account?: Account;
+  now: number;
+  connectionError: string;
 }) {
-  const snapshot = latestPositionsSnapshot(
-    account?.snapshot,
-    pair.state?.snapshots?.[side],
-  );
-  const positions = visiblePositions(snapshot);
+  const view = accountPositionsView({
+    account,
+    pair,
+    side,
+    now,
+    connectionError,
+  });
+  const { snapshot, positions } = view;
   const symbol = pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
   const marginOnly = pairMarginOnly(pair);
   const name = side === 'long' ? 'A' : 'B';
@@ -42,11 +46,16 @@ export function PairAccountPositions({
               ? '仅保证金管理，当前不开仓'
               : `本组管理${side === 'long' ? '多仓' : '空仓'}，其余仓位保留`}
           </p>
+          {view.sourceNote ? <p>{view.sourceNote}</p> : null}
+          {view.fieldNotice ? <p>{view.fieldNotice}</p> : null}
+          {view.notice ? (
+            <p className={view.warning ? 'amber' : ''}>{view.notice}</p>
+          ) : null}
         </div>
-        <span className="small-note">
+        <span className={view.warning ? 'small-note amber' : 'small-note'}>
           {snapshot
-            ? `最近仓位快照 ${new Date(snapshot.timestamp * 1000).toLocaleString('zh-CN', { hour12: false })}`
-            : '等待完整仓位数据'}
+            ? `${view.label} · ${new Date(snapshot.timestamp * 1000).toLocaleString('zh-CN', { hour12: false })}`
+            : view.label}
         </span>
       </div>
       {positions.length ? (
@@ -60,11 +69,7 @@ export function PairAccountPositions({
           label={label}
         />
       ) : (
-        <p className="pair-positions-empty">
-          {snapshot
-            ? '这份账户快照中暂无持仓。'
-            : '尚未取得完整仓位快照，余额数据不代表账户为空仓。'}
-        </p>
+        <p className="pair-positions-empty">{view.emptyNotice}</p>
       )}
     </section>
   );

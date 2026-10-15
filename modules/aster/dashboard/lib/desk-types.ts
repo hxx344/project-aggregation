@@ -16,6 +16,27 @@ export type Position = {
   unrealized: string;
   liquidation: string | null;
 };
+export type DisplayPosition = {
+  symbol: string;
+  side: string;
+  qty: string;
+  entry: string | null;
+  mark: string | null;
+  leverage: string | number | null;
+  notional: string | null;
+  occupied_margin: string | null;
+  unrealized: string | null;
+  liquidation: string | null;
+};
+export type PositionsSnapshot = {
+  timestamp: number;
+  positions: DisplayPosition[];
+};
+export type PositionsDisplay = {
+  snapshot?: PositionsSnapshot;
+  checked_at: number;
+  error?: string | null;
+};
 export type Policy = {
   threshold: string;
   order_notional: string;
@@ -44,6 +65,7 @@ export type Account = {
   reason: string;
   credential_ready: boolean;
   snapshot_refresh?: { interval_seconds: number };
+  display_positions?: PositionsDisplay;
   policy: Policy;
   migration?: MigrationConfig;
   migration_state?: MigrationState;

@@ -1,4 +1,4 @@
-import type { Account } from './desk-types';
+import type { Account, PositionsDisplay } from './desk-types';
 import type { PairCycleCosts } from './pair-cost';
 import type {
   CycleExecutionQuality,
@@ -96,6 +96,10 @@ export type Pair = {
     updated_at?: number;
     snapshots?: { long?: PairSnapshot | null; short?: PairSnapshot | null };
     margin_balances?: { long?: PairBalance | null; short?: PairBalance | null };
+    display_positions?: {
+      long?: PositionsDisplay | null;
+      short?: PositionsDisplay | null;
+    };
     owned?: Partial<Record<'LONG' | 'SHORT', string>>;
     progress?: {
       phase?: string;

@@ -7,9 +7,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import type { Position } from '@/lib/desk-types';
+import type { DisplayPosition } from '@/lib/desk-types';
 import { fmt } from '@/lib/desk-format';
-import { strategyPositionLabel } from '@/lib/account-positions';
+import {
+  positionLeverageLabel,
+  positionProfitClass,
+  strategyPositionLabel,
+} from '@/lib/account-positions';
 
 export type PositionStrategy = {
   symbol: string;
@@ -22,7 +26,7 @@ export function AccountPositionsTable({
   strategy,
   label = '账户完整持仓',
 }: {
-  positions: Position[];
+  positions: DisplayPosition[];
   strategy?: PositionStrategy;
   label?: string;
 }) {
@@ -64,14 +68,18 @@ export function AccountPositionsTable({
                     ) : null}
                   </div>
                   <span
-                    className={`direction ${position.side === 'LONG' ? 'mint' : 'danger'}`}
+                    className={`direction ${position.side === 'LONG' ? 'mint' : position.side === 'SHORT' ? 'danger' : ''}`}
                   >
                     {position.side === 'LONG' ? (
                       <ArrowUpRight size={14} />
-                    ) : (
+                    ) : position.side === 'SHORT' ? (
                       <ArrowDownLeft size={14} />
-                    )}{' '}
-                    {position.side === 'LONG' ? '多仓' : '空仓'}
+                    ) : null}{' '}
+                    {position.side === 'LONG'
+                      ? '多仓'
+                      : position.side === 'SHORT'
+                        ? '空仓'
+                        : '方向未确认'}
                     {scope?.directionLabel ? (
                       <span className="position-managed-direction">
                         · {scope.directionLabel}
@@ -84,7 +92,9 @@ export function AccountPositionsTable({
                 </TableCell>
                 <TableCell className="number">{fmt(position.entry)}</TableCell>
                 <TableCell className="number">{fmt(position.mark)}</TableCell>
-                <TableCell className="number">{position.leverage}x</TableCell>
+                <TableCell className="number">
+                  {positionLeverageLabel(position.leverage)}
+                </TableCell>
                 <TableCell className="number">
                   {fmt(position.notional)}
                 </TableCell>
@@ -97,7 +107,7 @@ export function AccountPositionsTable({
                     : '—'}
                 </TableCell>
                 <TableCell
-                  className={`number ${Number(position.unrealized) < 0 ? 'danger' : 'mint'}`}
+                  className={`number ${positionProfitClass(position.unrealized)}`}
                 >
                   {fmt(position.unrealized)}
                 </TableCell>
