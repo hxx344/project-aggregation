@@ -151,12 +151,24 @@ class PairMarginWebSocketTests(unittest.TestCase):
         self.assertEqual(result["last_transfer"]["refresh_source"], "websocket")
         self.assertEqual(self.refreshed, [])
 
-    def test_invalid_wallet_baseline_does_not_authorize_ws_or_block_rest(self):
+    def test_invalid_account_wallet_blocks_submission_until_a_valid_balance_returns(self):
         snapshots = self.live()
         self.brokers["long"].api.account["assets"][0]["walletBalance"] = "NaN"
         result = self.balancer.tick(self.pair, snapshots)
-        self.assertNotIn("ws_checkpoints", self.submitted)
-        self.assert_rest(result)
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("walletBalance", result["reason"])
+        self.assertIsNone(result["pending"])
+        self.assertIsNone(self.submitted)
+        self.assertEqual(self.transfers, [])
+        self.assertEqual(self.refreshed, [])
+
+        self.brokers["long"].api.account["assets"][0]["walletBalance"] = str(snapshots["long"].wallet)
+        self.after_http = self.emit
+        self.ready()
+        recovered = self.balancer.tick(self.pair, snapshots)
+        self.assertIsNone(recovered["pending"], recovered)
+        self.assertEqual(recovered["last_transfer"]["refresh_source"], "websocket")
+        self.assertEqual(len(self.transfers), 1)
 
     def test_mismatched_or_one_sided_events_cannot_refresh(self):
         cases = {
