@@ -69,21 +69,28 @@ case "$1 ${2:-}" in
     [[ ! -f "$FIXTURE_ROOT/fail-build" ]] || exit 43
     printf '<html>built</html>\n' > dist/index.html
     ;;
-  'run build:modules')
-    module=${3:?Expected one module id}
-    printf '%s\n' "$module" >> "$FIXTURE_ROOT/module.calls"
-    printf '%s\n' "$PWD" >> "$FIXTURE_ROOT/module-workspaces"
-    [[ ! -f "$FIXTURE_ROOT/fail-module-$module" ]] || exit 44
-    case "$module" in
-      monitor) artifact=modules/monitor/dist; entry=client/index.html ;;
-      asset) artifact=modules/asset/.next; entry=BUILD_ID ;;
-      crossex) artifact=modules/crossex/dist; entry=index.html ;;
-      aster) artifact=modules/aster/dashboard/dist; entry=client/index.html ;;
-      *) exit 45 ;;
+  'run prepare')
+    [[ "$PWD" == */modules/asset ]] || { echo 'Prepare ran outside Asset' >&2; exit 46; }
+    printf 'asset\n' >> "$FIXTURE_ROOT/module-prepare.calls"
+    mkdir -p lib
+    printf 'prepared asset input\n' > lib/imported-ledger.json
+    ;;
+  'run build')
+    case "$PWD" in
+      */modules/monitor) module=monitor; artifact=dist; entry=client/index.html ;;
+      */modules/asset) module=asset; artifact=.next; entry=BUILD_ID
+        [[ -f lib/imported-ledger.json ]] || { echo 'Asset build omitted prepare' >&2; exit 47; } ;;
+      */modules/crossex) module=crossex; artifact=dist; entry=index.html ;;
+      */modules/aster/dashboard) module=aster; artifact=dist; entry=client/index.html ;;
+      *) echo "Module build used the wrong working directory: $PWD" >&2; exit 45 ;;
     esac
+    printf '%s\n' "$module" >> "$FIXTURE_ROOT/module.calls"
+    printf '%s\n' "${PWD%/modules/*}" >> "$FIXTURE_ROOT/module-workspaces"
+    [[ ! -f "$FIXTURE_ROOT/fail-module-$module" ]] || exit 44
     mkdir -p "$artifact/$(dirname "$entry")" "$artifact/assets"
     printf '%s entry\n' "$module" > "$artifact/$entry"
     printf '%s chunk\n' "$module" > "$artifact/assets/chunk.js"
+    if [[ $module == monitor ]]; then printf '{}\n' > "$artifact/build-manifest.json"; fi
     ;;
   *) printf 'Unexpected pnpm call: %s\n' "$*" >&2; exit 1 ;;
 esac

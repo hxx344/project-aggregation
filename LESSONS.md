@@ -859,4 +859,6 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **补充验证入口：** [依赖布局测试](deploy/test-package-layout.py) 覆盖无原构建树时固定链接的 CJS/ESM、共享与冲突版本解析；[模块安装回归](deploy/test-module-incremental.sh) 覆盖后端变化不编译、依赖缓存复用、固定旧版本链接及无效缓存拒绝；[真实工作区检查](deploy/test-workspace.sh) 直接验收源码链接布局和独立发布包。该反馈与修正沿用同一事件 ID。
 
+**缓存失效范围补充（2026-10-17）：** 用户更新到 `bfd4a2f0b693` 后报告源码更新 197 秒，其中 Asset 80 秒、Aster 18 秒，解包与运行环境准备均已降至 3 秒。核对 `c00f651..bfd4a2f`：依赖输入、Asset 与 Aster 模块源码均未变化；`fa5e09b` 为 Monitor/Crossex 增加导航依赖时改了公共 `scripts/modules.mjs`，该脚本全文却进入所有模块键，连带使无关模块失效。原生 Git 树复算确认这两个模块树的唯一变化是调度器 blob。源码安装器已有完整产物缓存，改为直接执行各 importer 的真实构建命令，保留 Asset prepare、源码链接拒绝和产物检查；将实际命令指纹传入模块、组装与应用键。仅对固定已审计旧调度器及等价命令允许完整校验后的旧键迁移，避免为缓存规则升级再次全量编译。[迁移回归](deploy/test-module-cache-migration.sh) 验证独立 v1 协议、无工作区迁移、跨目录恢复及损坏/未知规则回退。本次是同一构建优化事件的后续修正，不新增事件计数；截图前一版本未知，不据此承诺固定提速秒数。
+
 **共享依赖夹具补充（2026-10-17）：** 沿用 `monitor-crossex-import-identity-20261017`。本仓 `fa5e09b` 将导航解析器移至 `server/` 后，[CI 38954241655](https://github.com/hxx344/project-aggregation/actions/runs/38954241655) 的根项目冷类型检查报 `TS2307`：临时夹具只复制 `src`，遗漏新增跨目录依赖；CrossEx 的旧扁平夹具还会意外读到原仓共享文件。隔离类型检查须保留 importer 的仓库相对布局并复制直接共享源码，复用原有冷/热检查、新增类型错误与修复恢复场景验证，不以完整工作树的构建通过代替夹具验证。

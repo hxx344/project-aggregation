@@ -207,4 +207,15 @@ for state in missing redirected; do
   ln -s "$target" "$current/modules/asset/node_modules"
 done
 [[ $(wc -l < "$fixture/runtime-dependencies.calls") == 2 ]]
+
+# Direct dispatch must retain the old runner's rejection of module source links.
+# A rejected source cannot reach a compiler or change the running deployment.
+ln -s "$fixture/outside-source" "$fixture/source/modules/crossex/unsafe-source.ts"
+commit_source linked-source
+if run_install; then echo 'A module source link reached direct compilation' >&2; exit 1; fi
+expect_modules 4 2 3 4
+[[ $(stops) == "$saved_stops" && $(restarts) == 7 && $(readlink "$fixture/application/current") == "$current" ]]
+cmp "$fixture/success-state" "$fixture/application/.deployed-state"
+
+bash "$repository/deploy/test-module-cache-migration.sh"
 printf 'Module cache reuse, lazy workspaces, test hydration, complete artifact checks and pre-activation failure recovery passed.\n'

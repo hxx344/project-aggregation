@@ -28,12 +28,24 @@ refresh() {
   commit=$(git -C "$source_dir" rev-parse HEAD)
   input_keys
 }
-capture() { before=($dependency_key $typecheck_key $test_key $build_key $application_key); runtime_before=$runtime_dependency_key; }
+capture() {
+  before=($dependency_key $typecheck_key $test_key $build_key $application_key)
+  runtime_before=$runtime_dependency_key
+  module_inputs_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+}
 compare() {
   local after=($dependency_key $typecheck_key $test_key $build_key $application_key) index=0 changed
   for changed in "$@"; do
     if [[ $changed == 1 ]]; then [[ ${before[$index]} != "${after[$index]}" ]]
     else [[ ${before[$index]} == "${after[$index]}" ]]; fi
+    index=$((index + 1))
+  done
+}
+compare_module_inputs() {
+  local after=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]}) index=0 changed
+  for changed in "$@"; do
+    if [[ $changed == 1 ]]; then [[ ${module_inputs_before[$index]} != "${after[$index]}" ]]
+    else [[ ${module_inputs_before[$index]} == "${after[$index]}" ]]; fi
     index=$((index + 1))
   done
 }
@@ -50,28 +62,37 @@ capture
 echo config >> "$source_dir/tsconfig.json"; refresh; compare 0 1 1 1 1
 capture
 echo VITE_PUBLIC=fixture > "$source_dir/.env.production"; refresh; compare 0 0 0 1 1
+compare_module_inputs 1 1 1 1
 capture
 build_environment=$(NODE_ENV=production VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=initial read_build_environment); input_keys; compare 0 0 0 1 1
+compare_module_inputs 1 1 1 1
 capture
 build_environment=$(NODE_ENV=production VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=changed read_build_environment); input_keys; compare 0 0 0 1 1
+compare_module_inputs 1 1 1 1
 capture
 build_environment=$(NODE_ENV=development VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=changed read_build_environment); input_keys; compare 0 0 0 1 1
+compare_module_inputs 1 1 1 1
 capture
 build_environment=$(NODE_ENV=development VITE_FIXTURE_VALUE=changed NEXT_PUBLIC_FIXTURE_VALUE=changed UNRELATED_FIXTURE_VALUE=changed read_build_environment); input_keys; compare 0 0 0 0 0
+compare_module_inputs 0 0 0 0
 capture
 echo dependency >> "$source_dir/pnpm-lock.yaml"; refresh; compare 1 1 1 1 1
+compare_module_inputs 1 1 1 1
 capture
 echo catalog >> "$source_dir/pnpm-workspace.yaml"; refresh; compare 1 1 1 1 1
 capture
 echo settings >> "$source_dir/.npmrc"; refresh; compare 1 1 1 1 1
 capture
 PNPM_VERSION=changed-pnpm; input_keys; compare 1 1 1 1 1
+compare_module_inputs 1 1 1 1
 capture
 runtime_key=another-node; input_keys; compare 1 1 1 1 1
+compare_module_inputs 1 1 1 1
 capture
 for importer in monitor asset crossex aster/dashboard; do
   mkdir -p "$source_dir/modules/$importer"
   echo module > "$source_dir/modules/$importer/package.json"; refresh; compare 1 1 1 1 1
+  compare_module_inputs 1 1 1 1
   capture
 done
 echo settings >> "$source_dir/modules/asset/.npmrc"; refresh; compare 1 1 1 1 1
@@ -83,6 +104,21 @@ echo example > "$source_dir/modules/asset/lib/example-ledger.json"; refresh; com
 capture
 mkdir -p "$source_dir/modules/aster/trading"
 echo cycle > "$source_dir/modules/aster/trading/cycle-config.json"; refresh; compare 1 1 1 1 1
+capture
+mkdir -p "$source_dir/scripts" "$source_dir/modules/monitor/scripts"
+# Source deployment calls each importer directly. The optional local runner
+# cannot invalidate any module's compiled output when its dispatch changes.
+for change in initial changed; do
+  echo "$change dispatch" > "$source_dir/scripts/modules.mjs"; refresh
+  [[ $dependency_key == "${before[0]}" && $typecheck_key == "${before[1]}" && $build_key == "${before[3]}" ]]
+  compare_module_inputs 0 0 0 0
+  capture
+done
+echo build > "$source_dir/modules/monitor/scripts/build.mjs"; refresh; compare 0 0 1 0 1
+compare_module_inputs 1 0 0 0
+capture
+echo VITE_MODULE=changed > "$source_dir/modules/crossex/.env.production"; refresh; compare 0 0 1 0 1
+compare_module_inputs 0 0 1 0
 capture
 module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
 for file in hub-navigation.mjs hub-navigation.d.mts asset-identity.mjs asset-identity.d.mts; do
@@ -132,6 +168,18 @@ echo helper > "$source_dir/deploy/build-artifact-cache.py"; refresh; compare 0 0
 [[ $embedded_key != "$embedded_before" && ${module_build_keys[monitor]} != "${module_before[0]}" &&
    ${module_build_keys[asset]} != "${module_before[1]}" && ${module_build_keys[crossex]} != "${module_before[2]}" &&
    ${module_build_keys[aster]} != "${module_before[3]}" ]]
+capture
+embedded_before=$embedded_key
+# An actual compiler dispatch change invalidates both the module artifacts and
+# the assembled runtime; an existing embedded cache cannot bypass the new recipe.
+run_module_build() { printf 'changed build recipe\n'; }
+input_keys
+compare 0 0 0 0 1
+compare_module_inputs 1 1 1 1
+[[ $embedded_key != "$embedded_before" ]]
+for module in "${MODULE_BUILD_IDS[@]}"; do
+  [[ -z ${legacy_module_build_keys[$module]:-} ]]
+done
 commit=invalid-source
 if input_keys 2>/dev/null; then echo 'Invalid git source was silently hashed' >&2; exit 1; fi
-printf 'Git input classification passed, including tsconfig, Vite env and failed reads.\n'
+printf 'Git input classification passed, including module recipes, shared inputs, build env and failed reads.\n'

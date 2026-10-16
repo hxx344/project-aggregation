@@ -36,9 +36,21 @@ GREEKS_PYTHON_PATH=
 ASTER_PYTHON_PATH=
 MODULE_BUILD_IDS=(monitor asset crossex aster)
 RUNTIME_DEPENDENCY_IMPORTERS=(. modules/monitor modules/asset modules/crossex)
+declare -A MODULE_BUILD_IMPORTERS=([monitor]=modules/monitor [asset]=modules/asset [crossex]=modules/crossex [aster]=modules/aster/dashboard)
 declare -A MODULE_BUILD_OUTPUTS=([monitor]=modules/monitor/dist [asset]=modules/asset/.next [crossex]=modules/crossex/dist [aster]=modules/aster/dashboard/dist)
 declare -A MODULE_BUILD_ENTRIES=([monitor]=client/index.html [asset]=BUILD_ID [crossex]=index.html [aster]=client/index.html)
 declare -A module_build_keys=()
+declare -A module_build_recipes=()
+declare -A legacy_module_build_keys=()
+# Only this complete runner blob has been checked for equivalent direct build
+# commands. Recipe digests also bind that equivalence to this installer code.
+LEGACY_MODULE_RUNNER_BLOB=e7eb0c0c6bc14fb450bea423294fe56f75dbb768
+declare -A LEGACY_MODULE_BUILD_RECIPES=(
+  [monitor]=116f6e5a77bde31726c6084c3b572cfc1254b7823c8b4f119b65249249b0af5d
+  [asset]=261becfd83608074f1efea6eab6324b0de0b491dad66ac92ac01ece85f34ae60
+  [crossex]=60bcf7368d21d674d1f8ddc467093eac2432e31d7789028ccf90a88cab9925cb
+  [aster]=7ce9059ea460126de7b43456dda0e1591f28293f1198e64e9428547733ff1d56
+)
 # 0: unchecked, 1: caches ready, 2: outputs available to workspace tests.
 modules_prepared=0
 declare -A module_outputs_prepared=()
@@ -1452,6 +1464,35 @@ run_as_service() {
   runuser -u "$SERVICE_USER" -- env pnpm_config_verify_deps_before_run=false "HOME=$APP_DIR/build-home" "PATH=$(dirname "$NODE_BIN"):${manager_path}/usr/local/bin:/usr/bin:/bin" "$@"
 }
 tree_hash() { git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "$@" | hash; }
+validate_module_build_source() {
+  local module=$1 tree
+  # The old runner rejected source links before compilation. Inspect the fixed
+  # Git tree as data; never execute a verifier from the writable build tree.
+  tree=$(git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "modules/$module") || return
+  case "$tree" in
+    120000\ *|*$'\n120000 '*) fail "$module 源码包含符号链接，停止构建或缓存复用。"; return 1 ;;
+  esac
+}
+run_module_build() {
+  local module=$1 importer=${MODULE_BUILD_IMPORTERS[$1]}
+  (
+    cd "$work_dir/source/$importer" || return
+    if [[ "$module" == asset ]]; then
+      run_as_service "$NODE_BIN" "$PNPM_BIN" run prepare || return
+    fi
+    run_as_service "$NODE_BIN" "$PNPM_BIN" run build || return
+    if [[ "$module" == monitor && ! -f dist/build-manifest.json ]]; then
+      fail 'monitor 构建缺少 dist/build-manifest.json。'
+      return 1
+    fi
+  )
+}
+module_build_recipe() {
+  local module=$1 definitions
+  definitions=$(declare -f run_module_build validate_module_build_source) || return
+  printf 'direct-module-build-v1\n%s\n%s\n%s\n%s\n%s\n' "$definitions" "$module" \
+    "${MODULE_BUILD_IMPORTERS[$module]}" "${MODULE_BUILD_OUTPUTS[$module]}" "${MODULE_BUILD_ENTRIES[$module]}" | hash
+}
 read_build_environment() {
   "$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key === "NODE_ENV" || /^(VITE_|NEXT_PUBLIC_)/.test(key)).sort(([a], [b]) => a.localeCompare(b))))'
 }
@@ -1463,7 +1504,10 @@ atomic_record() {
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree runtime_dependency_tree module module_tree
+  local legacy_runner_blob legacy_tree module_recipe module_artifacts_key
   local -a navigation_inputs=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts)
+  local -a module_inputs
+  legacy_module_build_keys=()
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
@@ -1481,28 +1525,37 @@ input_keys() {
   test_key=$(printf 'tests-v2\n%s\n%s' "$test_tree" "$dependency_key" | hash)
   # Vite may inline build-time environment; keep those inputs out of runtime config.
   build_key=$(printf 'hub-build-v3\n%s\n%s\n%s' "$build_tree" "$dependency_key" "$build_environment" | hash)
-  embedded_key=$(printf 'embedded-runtime-v3:separate-production-dependencies\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" | hash)
-  application_key=$(printf 'application-v5:immutable-production-links\n%s\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$runtime_dependency_key" "$RUNTIME_DEPENDENCIES" | hash)
   dependencies="$APP_DIR/cache/dependencies-$dependency_key"
   runtime_dependencies="$APP_DIR/cache/runtime-dependencies-$runtime_dependency_key"
   built="$APP_DIR/cache/build-$build_key"
   typecheck_stamp="$APP_DIR/cache/typechecked-$typecheck_key"
   test_stamp="$APP_DIR/cache/tested-$test_key"
-  embedded="$APP_DIR/cache/embedded-$embedded_key"
+  legacy_runner_blob=$(git --git-dir="$APP_DIR/repository.git" rev-parse "$commit:scripts/modules.mjs" 2>/dev/null) || legacy_runner_blob=
   for module in "${MODULE_BUILD_IDS[@]}"; do
     # ASTER serves a static dashboard. Its Python runtime is not a frontend
     # input, except for the cycle configuration imported by the dashboard.
     if [[ "$module" == aster ]]; then
-      module_tree=$(tree_hash modules/aster/dashboard modules/aster/trading/cycle-config.json \
-        modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local \
-        scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
+      module_inputs=(modules/aster/dashboard modules/aster/trading/cycle-config.json \
+        modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local)
     elif [[ "$module" == monitor || "$module" == crossex ]]; then
-      module_tree=$(tree_hash "modules/$module" "${navigation_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
+      module_inputs=("modules/$module" "${navigation_inputs[@]}")
     else
-      module_tree=$(tree_hash "modules/$module" scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
+      module_inputs=("modules/$module")
     fi
-    module_build_keys[$module]=$(printf 'module-artifacts-v1\n%s\n%s\n%s\n%s' "$module" "$module_tree" "$dependency_key" "$build_environment" | hash)
+    module_inputs+=(deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local)
+    module_tree=$(tree_hash "${module_inputs[@]}") || return
+    module_recipe=$(module_build_recipe "$module") || return
+    module_build_recipes[$module]=$module_recipe
+    module_build_keys[$module]=$(printf 'module-artifacts-v2\n%s\n%s\n%s\n%s\n%s' "$module" "$module_tree" "$dependency_key" "$build_environment" "$module_recipe" | hash)
+    if [[ "$legacy_runner_blob" == "$LEGACY_MODULE_RUNNER_BLOB" && "$module_recipe" == "${LEGACY_MODULE_BUILD_RECIPES[$module]}" ]]; then
+      legacy_tree=$(tree_hash "${module_inputs[@]}" scripts/modules.mjs) || return
+      legacy_module_build_keys[$module]=$(printf 'module-artifacts-v1\n%s\n%s\n%s\n%s' "$module" "$legacy_tree" "$dependency_key" "$build_environment" | hash)
+    fi
   done
+  module_artifacts_key=$({ for module in "${MODULE_BUILD_IDS[@]}"; do printf '%s %s\n' "$module" "${module_build_keys[$module]}"; done; } | LC_ALL=C sort | hash)
+  embedded_key=$(printf 'embedded-runtime-v4:direct-module-builds\n%s\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" "$module_artifacts_key" | hash)
+  application_key=$(printf 'application-v5:immutable-production-links\n%s\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$runtime_dependency_key" "$RUNTIME_DEPENDENCIES" | hash)
+  embedded="$APP_DIR/cache/embedded-$embedded_key"
 }
 application_ready() {
   [[ -n "$old_release" && -f "$old_release/.install-ready" && -f "$old_release/.application-key" &&
@@ -1711,6 +1764,30 @@ artifact_cache_ready() {
   [[ -d "$1" ]] || return 1
   build_artifact_cache verify "$1" "$2"
 }
+migrate_module_build_cache() {
+  local module=$1 legacy_key=${legacy_module_build_keys[$1]:-} key=${module_build_keys[$1]} recipe
+  local old_cache cache stage artifact
+  [[ -n "$legacy_key" ]] || return 1
+  recipe=$(module_build_recipe "$module") || return
+  [[ "$recipe" == "${LEGACY_MODULE_BUILD_RECIPES[$module]}" && "$recipe" == "${module_build_recipes[$module]}" ]] || return 1
+  old_cache="$APP_DIR/cache/module-$module-$legacy_key"
+  cache="$APP_DIR/cache/module-$module-$key"
+  artifact_cache_ready "$old_cache" "$legacy_key" || return 1
+  updater_safe_path "$work_dir" || return 1
+  stage=$(mktemp -d "$work_dir/module-cache-migration-$module.XXXXXXXX") || return
+  artifact="$stage/${MODULE_BUILD_OUTPUTS[$module]##*/}"
+  # Re-key only fully verified bytes through a private root-owned tree. The
+  # old cache remains available to the previous installer and rollback.
+  if ! build_artifact_cache restore "$old_cache" "$legacy_key" "$artifact" ||
+      ! build_artifact_cache store "$artifact" "$cache" "$key"; then
+    rm -rf -- "$stage"
+    return 1
+  fi
+  chown -R root:root "$cache" || return
+  chmod -R a+rX,go-w "$cache" || return
+  rm -rf -- "$stage" || return
+  log "$module 已完整校验并迁移旧构建缓存，跳过编译。"
+}
 prepare_module_builds() {
   local mode=${1:-hydrate} required=2 module key cache artifact
   case "$mode" in
@@ -1720,11 +1797,12 @@ prepare_module_builds() {
   esac
   (( modules_prepared < required )) || return 0
   for module in "${MODULE_BUILD_IDS[@]}"; do
+    validate_module_build_source "$module" || return
     key=${module_build_keys[$module]}
     cache="$APP_DIR/cache/module-$module-$key"
     artifact="$work_dir/source/${MODULE_BUILD_OUTPUTS[$module]}"
     updater_safe_path "$cache"
-    if artifact_cache_ready "$cache" "$key"; then
+    if artifact_cache_ready "$cache" "$key" || migrate_module_build_cache "$module"; then
       log "$module 构建输入未变化，校验并复用模块产物。"
       if [[ "$mode" == hydrate && ${module_outputs_prepared[$module]:-} != "$key:$artifact" ]]; then
         prepare_workspace
@@ -1737,7 +1815,7 @@ prepare_module_builds() {
       prepare_workspace
       ci_update_progress build '' "build-$module"
       log "$module 构建输入变化或缓存不完整，仅构建该模块。"
-      (cd "$work_dir/source" && run_as_service "$NODE_BIN" "$PNPM_BIN" run build:modules "$module")
+      run_module_build "$module"
       [[ -s "$artifact/${MODULE_BUILD_ENTRIES[$module]}" ]] || fail "$module 构建缺少必要入口。"
       build_artifact_cache store "$artifact" "$cache" "$key"
       chown -R root:root "$cache"
