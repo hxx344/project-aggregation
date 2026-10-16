@@ -14,16 +14,23 @@ for (const importer of ['.', 'modules/crossex']) {
     // cannot be reached through a junction created in the system temp volume.
     const output = path.join(repository, 'output');
     mkdirSync(output, { recursive: true });
-    const directory = mkdtempSync(path.join(output, 'typecheck-cache-'));
+    const workspace = mkdtempSync(path.join(output, 'typecheck-cache-'));
+    const directory = path.join(workspace, importer);
+    mkdirSync(directory, { recursive: true });
     const dependencies = path.join(directory, 'node_modules');
     t.after(() => {
       try { unlinkSync(dependencies); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      assert.ok(directory.startsWith(output + path.sep));
-      rmSync(directory, { recursive: true, force: true });
+      assert.ok(workspace.startsWith(output + path.sep));
+      rmSync(workspace, { recursive: true, force: true });
     });
     const source = path.join(repository, importer);
     for (const name of ['src', 'tsconfig.json', 'vite.config.ts', 'package.json']) {
       cpSync(path.join(source, name), path.join(directory, name), { recursive: true });
+    }
+    // Preserve repository-relative imports without reading shared source outside the fixture.
+    mkdirSync(path.join(workspace, 'server'), { recursive: true });
+    for (const name of ['hub-navigation.mjs', 'hub-navigation.d.mts', 'asset-identity.mjs', 'asset-identity.d.mts']) {
+      cpSync(path.join(repository, 'server', name), path.join(workspace, 'server', name));
     }
     symlinkSync(path.join(source, 'node_modules'), dependencies, 'junction');
     const options = JSON.parse(readFileSync(path.join(directory, 'tsconfig.json'), 'utf8')).compilerOptions;
