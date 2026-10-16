@@ -6,6 +6,7 @@ import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import localcontext
+from fractions import Fraction
 
 from . import monitoring
 from .models import TradingError, hedge_balanced, positive
@@ -13,6 +14,8 @@ from .models import TradingError, hedge_balanced, positive
 KEY = "position_imbalance_notifications"
 CATEGORY = "position_imbalance"
 FAULT_SECONDS = 60
+PAIR_FAULT_SECONDS = 10
+PAIR_TOLERANCE = Fraction(1, 100)
 RECOVERY_SECONDS = 30
 SAMPLE_MAX_AGE = 8
 SAMPLE_FUTURE_ALLOWANCE = 1
@@ -69,6 +72,10 @@ def fresh_times(values, now):
                     for value in values))
 
 
+def paired(observation):
+    return str(observation.get("scope", "")).startswith("pair:")
+
+
 def snapshot(observation, now):
     times = observation.get("sample_times")
     if not fresh_times(times, now):
@@ -76,7 +83,11 @@ def snapshot(observation, now):
     try:
         long_qty = positive(observation.get("long_qty"), True)
         short_qty = positive(observation.get("short_qty"), True)
-        balanced = hedge_balanced(long_qty, short_qty)
+        if paired(observation):
+            long, short = Fraction(long_qty), Fraction(short_qty)
+            balanced = abs(long - short) <= max(long, short) * PAIR_TOLERANCE
+        else:
+            balanced = hedge_balanced(long_qty, short_qty)
     except TradingError:
         return None
     return long_qty, short_qty, list(times), balanced
@@ -114,6 +125,10 @@ def message(target, evidence, candidate, recovery):
             f"差额：{difference:f}；占较大一侧：{percent:.4f}%\n"
             f"样本时间（UTC）：{stamps}\n"
             f"连续观察：{duration:.1f} 秒（{candidate['count']} 个新样本）")
+    for member in target.get("member_quantities", []):
+        text += f"\n账户「{member['name']}」：多仓 {member['long_qty']}；空仓 {member['short_qty']}"
+    if target.get("paired"):
+        text += "\n配对告警条件：总多空数量差占较大一侧超过 1%，连续确认至少 10 秒。"
     if target.get("attention"):
         text += "\n自动处理已暂停，请核对实际持仓。"
     return text
@@ -136,6 +151,18 @@ def observe(db, observations, *, available, revision, instance_id, now):
     state.update(instance_id=instance_id, last_observed_at=now)
     observations = {item["key"]: item for item in observations}
 
+    # The previous pair key had no symbol. Preserve a delivered incident across
+    # upgrade, while requiring new evidence under the new threshold and timing.
+    for key, observation in observations.items():
+        if not paired(observation):
+            continue
+        legacy_key = key.removesuffix(":" + observation["symbol"])
+        legacy = targets.get(legacy_key)
+        if key not in targets and legacy and legacy["symbol"] == observation["symbol"]:
+            targets[key] = targets.pop(legacy_key)
+            cancel_target(db, legacy)
+            clear_window(legacy)
+
     for key, target in list(targets.items()):
         # Every pass revokes permission first. Only current valid evidence can
         # restore it, even if the persisted candidate has already matured.
@@ -154,16 +181,22 @@ def observe(db, observations, *, available, revision, instance_id, now):
         suppressed = observation.get("suppressed") is not False or not isinstance(activity, str)
         target.update(symbol=symbol, label=observation.get("label") or key, activity=activity,
                       suppressed=suppressed, attention=bool(observation.get("attention")),
-                      permitted_id=None, sample_times=None)
+                      permitted_id=None, sample_times=None, paired=paired(observation),
+                      member_quantities=observation.get("member_quantities", []))
         target["capture"] = ({"key": key, "scope": observation["scope"], "activity": activity,
                               "bindings": observation.get("bindings")} if observation.get("scope") else None)
+        if paired(observation):
+            target["capture"].update(symbol=symbol, configured_symbol=observation.get("configured_symbol"))
         if changed_instance or clock_reversed or changed_activity or suppressed or was_suppressed:
             clear_window(target)
         if suppressed:
             continue
 
         max_gap = observation.get("max_gap")
-        max_gap = min(180, max(20, max_gap)) if finite_time(max_gap) else 20
+        # Funds-only reads can be scheduled up to an hour apart. This bounds
+        # continuity between new samples; each sample still expires in 8s.
+        gap_limit = 7210 if paired(observation) else 180
+        max_gap = min(gap_limit, max(20, max_gap)) if finite_time(max_gap) else 20
         last_times = target.get("last_times")
         if last_times and now - min(last_times) > max_gap:
             # Silence is not recovery. A sent incident stays open, while its
@@ -201,7 +234,7 @@ def observe(db, observations, *, available, revision, instance_id, now):
             continue
         if (candidate is None or candidate["count"] < 2
                 or candidate["confirmed_at"] - candidate["started_at"]
-                < (RECOVERY_SECONDS if balanced else FAULT_SECONDS)):
+                < (RECOVERY_SECONDS if balanced else PAIR_FAULT_SECONDS if paired(observation) else FAULT_SECONDS)):
             continue
         # Repeated source timestamps do not grow a window, but a duplicate
         # fresh read can reauthorize an already-confirmed incident before send.

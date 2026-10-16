@@ -8,6 +8,7 @@ import math
 from .exchange import LiveBroker
 from .execution import Executor, TERMINAL
 from .models import SYMBOLS, TradingError, positive, wire
+from .position_imbalance_notifications import KEY as NOTIFICATIONS_KEY, finite_time
 
 ACTIVITY_PREFIX = "position_activity:"
 
@@ -84,11 +85,48 @@ def sample(row, snapshots, sides):
     row["suppressed"] |= any(bool(s.get("open_orders")) for s in snapshots)
 
 
+def pair_inventory(state, side, configured_symbol):
+    """Choose complete local holdings for alerts, never for trading authority."""
+    trading = state.get("snapshots", {}).get(side) or {}
+    display = state.get("display_positions", {}).get(side) or {}
+    displayed = display.get("snapshot") or {}
+    candidates = [(trading, False), (displayed, True)]
+    candidates = [(snapshot, complete) for snapshot, complete in candidates
+                  if finite_time(snapshot.get("timestamp"))]
+    if not candidates:
+        return None
+    snapshot, complete = max(candidates, key=lambda item: (item[0]["timestamp"], item[1]))
+    # A later failed inventory cannot be hidden by a still-fresh older success.
+    if (finite_time(display.get("checked_at")) and display["checked_at"] >= snapshot["timestamp"]
+            and (display.get("error") or not isinstance(displayed.get("positions"), list))):
+        return None
+    if not isinstance(snapshot.get("positions"), list):
+        return None
+    quantities = {}
+    try:
+        for position in snapshot["positions"]:
+            symbol, direction = position["symbol"], position["side"]
+            if (not isinstance(symbol, str) or not symbol.strip() or symbol != symbol.strip()
+                    or direction not in ("LONG", "SHORT") or (symbol, direction) in quantities):
+                return None
+            quantities[symbol, direction] = Fraction(positive(position.get("qty"), True))
+    except (TradingError, KeyError, TypeError):
+        return None
+    # Broker snapshots include every nonzero holding, but their configured
+    # market must still have explicit two-sided evidence. Display inventories
+    # are complete lists of nonzero holdings and may legitimately be empty.
+    if not complete and any((configured_symbol, direction) not in quantities for direction in ("LONG", "SHORT")):
+        return None
+    return snapshot, quantities
+
+
 def collect(engine):
     accounts, pairs = engine.store.accounts(), engine.store.pairs()
     members = {p[key] for p in pairs for key in ("long_account_id", "short_account_id")}
     modes = {a["id"]: a["mode"] for a in accounts}
     prefixes = {a["id"]: a.get("env_prefix") for a in accounts}
+    names = {a["id"]: a["name"] for a in accounts}
+    previous = engine.store.get(NOTIFICATIONS_KEY, {}).get("targets", {})
     schedules = engine.scheduling(accounts)
     result = []
     for pair in pairs:
@@ -97,11 +135,19 @@ def collect(engine):
             continue
         scope = "pair:" + pair["id"]
         bindings = {aid: prefixes[aid] for aid in aids}
-        row = {"key": scope + ":" + ":".join(aids + [str(prefixes[aid]) for aid in aids]),
-               "scope": scope, "bindings": bindings, "label": "配对组「" + pair["name"] + "」",
-               "symbol": pair["symbol"], "activity": activity(engine.store, scope), "sample_times": [], "suppressed": False,
-               "max_gap": 70, "attention": False}
-        result.append(row)
+        identity = scope + ":" + ":".join(aids + [str(prefixes[aid]) for aid in aids])
+        symbols = {pair["symbol"]} | {target["symbol"] for target in previous.values()
+                    if (target.get("capture") or {}).get("scope") == scope}
+        margin = pair.get("margin") or {}
+        interval = margin.get("check_interval_seconds", 5) if (margin.get("enabled")
+            and not (pair.get("ordinary") or {}).get("enabled")
+            and not (pair.get("cycle") or {}).get("enabled")) else 30
+        interval = min(3600, max(1, interval)) if finite_time(interval) else 30
+        base = {"scope": scope, "bindings": bindings, "label": "配对组「" + pair["name"] + "」",
+                "configured_symbol": pair["symbol"], "activity": activity(engine.store, scope),
+                "sample_times": [], "suppressed": True, "max_gap": max(70, 2 * interval + 10), "attention": False}
+        rows = {symbol: {**base, "key": identity + ":" + symbol, "symbol": symbol} for symbol in sorted(symbols)}
+        result.extend(rows.values())
         with ExitStack() as stack:
             if not acquire(stack, [engine.pairs.group_lock(pair["id"])] + [engine.account_lock(aid) for aid in sorted(aids)]):
                 continue
@@ -111,22 +157,30 @@ def collect(engine):
                     continue
                 state = store.get("pair_runtime:" + pair["id"], {}) or {}
                 pending = state.get("pending")
-                row["activity"] = activity(store, scope)
-                row["attention"] = settled_attention(pending, state.get("phase"))
+                base["activity"] = activity(store, scope)
+                base["attention"] = settled_attention(pending, state.get("phase"))
                 # Archived unknown orders cannot be inferred settled from holdings.
-                row["suppressed"] = bool(state.get("recovery_watch") or (pending and not row["attention"]))
-                snapshots = state.get("snapshots", {})
-                snapshots = [snapshots.get("long") or {}, snapshots.get("short") or {}]
-                row["sample_times"] = [s.get("timestamp") for s in snapshots]
-                row["suppressed"] |= any(bool(s.get("open_orders")) for s in snapshots)
-                try:
-                    # Include unexpected reverse-side holdings instead of hiding
-                    # them behind the group's intended A-long/B-short assignment.
+                base["suppressed"] = bool(state.get("recovery_watch") or (pending and not base["attention"]))
+                inventories = [pair_inventory(state, side, pair["symbol"]) for side in ("long", "short")]
+                if any(inventory is None for inventory in inventories):
+                    continue
+                snapshots, quantities = zip(*inventories)
+                base["sample_times"] = [s["timestamp"] for s in snapshots]
+                base["suppressed"] |= any(bool(s.get("open_orders")) for s in snapshots)
+                symbols |= {symbol for inventory in quantities for symbol, _ in inventory}
+                for symbol in sorted(symbols):
+                    if symbol not in rows:
+                        rows[symbol] = {"key": identity + ":" + symbol, "symbol": symbol}
+                        result.append(rows[symbol])
+                    row = rows[symbol]
+                    row.update(base)
+                    row["member_quantities"] = [{"name": names[aid], **{
+                        direction.lower() + "_qty": wire(inventory.get((symbol, direction), Fraction()))
+                        for direction in ("LONG", "SHORT")}} for aid, inventory in zip(aids, quantities)]
+                    # Include reverse-side holdings in the actual hedge totals.
                     row["long_qty"], row["short_qty"] = [wire(sum(
-                        (Fraction(positive(quantity(s, row["symbol"], side), True)) for s in snapshots), Fraction()))
-                        for side in ("LONG", "SHORT")]
-                except TradingError:
-                    row["long_qty"] = row["short_qty"] = None
+                        (inventory.get((symbol, direction), Fraction()) for inventory in quantities), Fraction()))
+                        for direction in ("LONG", "SHORT")]
     for account in accounts:
         aid = account["id"]
         if aid in members or account["mode"] != "live":
@@ -201,7 +255,10 @@ def current(db, row):
                 and not settled_attention(runtime["pending"], runtime.get("phase")))):
             return False
         return (set(row["bindings"]) == set(aids)
-                and row["key"] == scope + ":" + ":".join(aids + [str(row["bindings"][aid]) for aid in aids]))
+                and isinstance(row.get("symbol"), str) and bool(row["symbol"])
+                and pair["symbol"] == row.get("configured_symbol")
+                and row["key"] == scope + ":" + ":".join(aids + [str(row["bindings"][aid]) for aid in aids])
+                    + ":" + row["symbol"])
     intent = db.execute("SELECT data FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (identity,)).fetchone()
     check = db.execute("SELECT data FROM kv WHERE key=?", ("post_fill_check:" + identity,)).fetchone()
     if (intent and not settled_attention(json.loads(intent[0]))) or (check and json.loads(check[0])):

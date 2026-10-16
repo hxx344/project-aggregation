@@ -20,6 +20,10 @@ def snapshot(now, long="2", short="1", symbol="XAUUSD1", orders=None):
                           for side, qty in (("LONG", long), ("SHORT", short))]}
 
 
+def display_snapshot(now, positions):
+    return {"checked_at": now, "error": None, "snapshot": {"timestamp": now, "positions": positions}}
+
+
 def pending(status="pending", kind="pair"):
     order = {"symbol": "XAUUSD1", "positionSide": "LONG", "side": "BUY", "quantity": "1", "newClientOrderId": "leg"}
     return {"id": "intent", "account_id": "test", "status": status, "kind": kind, "symbol": "XAUUSD1",
@@ -167,13 +171,186 @@ class PositionObservationTests(unittest.TestCase):
 
     def test_pair_reverse_positions_are_included_in_actual_totals(self):
         self.pair()
-        for offset in (0, 60):
+        for offset in (0, 10):
             self.now += offset
-            self.pair_state(snapshots={"long": snapshot(self.now, "10", "3"), "short": snapshot(self.now, "0", "10")})
+            self.pair_state(snapshots={"long": snapshot(self.now, "10", "3"), "short": snapshot(self.now, "2", "10")})
             self.engine.notify()
         self.sender.assert_called_once()
         row = self.collect()[0]
-        self.assertEqual((row["long_qty"], row["short_qty"]), ("10", "13"))
+        self.assertEqual((row["long_qty"], row["short_qty"]), ("12", "13"))
+
+    def test_pair_selects_newest_position_source_independently_for_each_account(self):
+        self.pair()
+        self.pair_state(snapshots={"long": snapshot(self.now - 1, "10", "3"),
+            "short": snapshot(self.now, "2", "7")}, display_positions={
+                "long": display_snapshot(self.now, snapshot(self.now, "8", "1")["positions"]),
+                "short": display_snapshot(self.now - 1, snapshot(self.now - 1, "0", "1")["positions"])})
+        row = self.collect()[0]
+        self.assertEqual((row["long_qty"], row["short_qty"]), ("10", "8"))
+        self.assertEqual(row["sample_times"], [self.now, self.now])
+
+    def test_margin_only_complete_inventory_observes_other_symbol_without_exchange_reads(self):
+        self.pair()
+        with ExitStack() as stack:
+            calls = [stack.enter_context(patch.object(self.f.market, name,
+                side_effect=AssertionError("unexpected exchange read")))
+                for name in ("load_rules", "book", "mark_price", "capacities", "depth")]
+            calls.append(stack.enter_context(patch.object(self.engine, "broker",
+                side_effect=AssertionError("broker acquisition"))))
+            for offset in (0, 10):
+                self.now += offset
+                self.pair_state(snapshots={"long": snapshot(900, "1", "0"), "short": snapshot(900, "0", "1")},
+                    display_positions={
+                        "long": display_snapshot(self.now, [{"symbol": "BTCUSD1", "side": "LONG", "qty": "100"}]),
+                        "short": display_snapshot(self.now, [{"symbol": "BTCUSD1", "side": "SHORT", "qty": "98.9"}])})
+                self.engine.notify()
+            rows = {row["symbol"]: row for row in self.collect()}
+            self.assertEqual(set(rows), {"XAUUSD1", "BTCUSD1"})
+            self.assertEqual((rows["BTCUSD1"]["long_qty"], rows["BTCUSD1"]["short_qty"]), ("100", "98.9"))
+            self.assertEqual((rows["XAUUSD1"]["long_qty"], rows["XAUUSD1"]["short_qty"]), ("0", "0"))
+            self.assertTrue(all(row["key"].endswith(":" + row["symbol"]) for row in rows.values()))
+            self.sender.assert_called_once()
+            self.assertIn("BTCUSD1", self.sender.call_args.args[1])
+            for call in calls:
+                call.assert_not_called()
+
+    def test_margin_only_long_polling_intervals_confirm_only_after_two_fresh_inventories(self):
+        pair = self.pair()
+        for interval in (90, 300, 3600):
+            with self.subTest(interval=interval):
+                self.sender.reset_mock()
+                self.f.store.put("position_imbalance_notifications", {})
+                configured = {**pair, "ordinary": {"enabled": False}, "cycle": {"enabled": False},
+                    "margin": {"enabled": True, "check_interval_seconds": interval}}
+                with self.f.store.connect() as db:
+                    db.execute("UPDATE pairs SET data=? WHERE id='pair'", (dumps(configured),))
+                def publish():
+                    self.pair_state(snapshots={}, display_positions={
+                        "long": display_snapshot(self.now, [{"symbol": "CLUSD1", "side": "LONG", "qty": "100"}]),
+                        "short": display_snapshot(self.now, [{"symbol": "CLUSD1", "side": "SHORT", "qty": "98"}])})
+                publish()
+                self.engine.notify()
+                self.now += interval
+                self.engine.notify()
+                self.sender.assert_not_called()
+                publish()
+                self.engine.notify()
+                self.sender.assert_called_once()
+                self.assertIn("CLUSD1", self.sender.call_args.args[1])
+
+    def test_margin_only_interruption_beyond_polling_allowance_restarts_ten_second_confirmation(self):
+        pair = {**self.pair(), "ordinary": {"enabled": False}, "cycle": {"enabled": False},
+            "margin": {"enabled": True, "check_interval_seconds": 300}}
+        with self.f.store.connect() as db:
+            db.execute("UPDATE pairs SET data=? WHERE id='pair'", (dumps(pair),))
+        def publish():
+            self.pair_state(snapshots={}, display_positions={
+                "long": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "LONG", "qty": "100"}]),
+                "short": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "SHORT", "qty": "98"}])})
+            self.engine.notify()
+        publish()
+        self.now += 611
+        publish()
+        self.sender.assert_not_called()
+        self.now += 9
+        publish()
+        self.sender.assert_not_called()
+        self.now += 1
+        publish()
+        self.sender.assert_called_once()
+
+    def test_latest_display_failure_never_falls_back_to_older_successful_positions(self):
+        self.pair()
+        for offset in (0, 10):
+            self.now += offset
+            failed = display_snapshot(self.now - 1, snapshot(self.now - 1)["positions"])
+            failed.update(checked_at=self.now, error="账户持仓读取失败")
+            self.pair_state(snapshots={"long": snapshot(self.now - 2, "2", "0"),
+                "short": snapshot(self.now - 2, "0", "1")}, display_positions={
+                    "long": failed,
+                    "short": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "SHORT", "qty": "1"}])})
+            self.engine.notify()
+        self.sender.assert_not_called()
+
+    def test_missing_stale_or_invalid_inventory_cannot_confirm_pair_fault(self):
+        self.pair()
+        for failure in ("missing_side", "missing_positions", "stale", "invalid_quantity"):
+            with self.subTest(failure=failure):
+                for offset in (0, 10):
+                    self.now += offset
+                    positions = {"long": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "LONG", "qty": "2"}]),
+                        "short": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "SHORT", "qty": "1"}])}
+                    if failure == "missing_side":
+                        positions.pop("short")
+                    elif failure == "missing_positions":
+                        positions["short"]["snapshot"].pop("positions")
+                    elif failure == "stale":
+                        positions["short"]["snapshot"]["timestamp"] = self.now - 8.001
+                    else:
+                        positions["short"]["snapshot"]["positions"][0]["qty"] = "NaN"
+                    self.pair_state(snapshots={}, display_positions=positions)
+                    self.engine.notify()
+                self.sender.assert_not_called()
+                self.now += 100
+
+    def test_closed_other_symbol_is_retained_until_stable_recovery(self):
+        self.pair()
+        for offset in (0, 10):
+            self.now += offset
+            self.pair_state(snapshots={}, display_positions={
+                "long": display_snapshot(self.now, [{"symbol": "CLUSD1", "side": "LONG", "qty": "100"}]),
+                "short": display_snapshot(self.now, [{"symbol": "CLUSD1", "side": "SHORT", "qty": "98.9"}])})
+            self.engine.notify()
+        self.sender.assert_called_once()
+        for offset in (1, 29.999):
+            self.now += offset
+            self.pair_state(snapshots={}, display_positions={
+                side: display_snapshot(self.now, []) for side in ("long", "short")})
+            self.engine.notify()
+            self.sender.assert_called_once()
+        row = next(row for row in self.collect() if row["symbol"] == "CLUSD1")
+        self.assertEqual((row["long_qty"], row["short_qty"]), ("0", "0"))
+        self.now += .001
+        self.pair_state(snapshots={}, display_positions={
+            side: display_snapshot(self.now, []) for side in ("long", "short")})
+        self.engine.notify()
+        self.assertEqual(self.sender.call_count, 2)
+        self.assertIn("恢复", self.sender.call_args.args[1])
+        self.assertIn("CLUSD1", self.sender.call_args.args[1])
+
+    def test_pair_message_identifies_each_accounts_long_and_short_holdings(self):
+        self.pair()
+        for aid, name in (("test", "账户甲"), ("other", "账户乙")):
+            saved = self.f.store.account(aid)
+            self.f.store.save_account({**saved, "name": name})
+        for offset in (0, 10):
+            self.now += offset
+            self.pair_state(snapshots={"long": snapshot(self.now, "10", "3"), "short": snapshot(self.now, "2", "10")})
+            self.engine.notify()
+        self.sender.assert_called_once()
+        message = self.sender.call_args.args[1]
+        self.assertIn("总多仓：12", message)
+        self.assertIn("总空仓：13", message)
+        for name, long_qty, short_qty in (("账户甲", "10", "3"), ("账户乙", "2", "10")):
+            detail = next(line for line in message.splitlines() if name in line)
+            self.assertIn(long_qty, detail)
+            self.assertIn(short_qty, detail)
+            self.assertIn("多", detail)
+            self.assertIn("空", detail)
+
+    def test_pair_transactional_identity_binds_symbol_and_account_members(self):
+        self.pair()
+        self.pair_state()
+        row = self.collect()[0]
+        with self.f.store.connect() as db:
+            self.assertTrue(observations.current(db, row))
+            self.assertFalse(observations.current(db, {**row, "symbol": "CLUSD1"}))
+            self.assertFalse(observations.current(db, {**row, "key": row["key"] + ":CLUSD1"}))
+            self.assertFalse(observations.current(db, {**row, "bindings": {"test": "ASTER_TEST"}}))
+            changed = self.f.store.pair("pair")
+            changed["symbol"] = "CLUSD1"
+            db.execute("UPDATE pairs SET data=? WHERE id='pair'", (dumps(changed),))
+            self.assertFalse(observations.current(db, row))
 
     def test_no_fresh_pair_evidence_never_advances_confirmation(self):
         self.pair()

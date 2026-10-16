@@ -27,6 +27,11 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
                 "long_qty": "10", "short_qty": "9", "sample_times": [self.now, self.now],
                 "activity": "idle:0", "max_gap": 90, "suppressed": False, "attention": False, **changes}
 
+    def pair_observation(self, symbol="XAUUSD1", **changes):
+        return self.observation(key="pair:pair:a:b:ASTER_A:ASTER_B:" + symbol,
+            scope="pair:pair", bindings={"a": "ASTER_A", "b": "ASTER_B"},
+            label="配对组「测试配对」", symbol=symbol, configured_symbol="XAUUSD1", **changes)
+
     def observe(self, observations=None, *, available=True, revision=None, **changes):
         if observations is None:
             observations = [self.observation(**changes)]
@@ -455,6 +460,137 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         self.observe(scope="account:a", bindings=bindings, activity="idle:2")
         with self.store.connect() as db:
             self.assertIsNone(imbalance.delivery_observation(db, item))
+
+    def test_pair_one_percent_boundary_is_balanced_in_both_directions(self):
+        for long_qty, short_qty in (("100", "99"), ("99", "100"), ("0", "0")):
+            with self.subTest(long_qty=long_qty, short_qty=short_qty):
+                with self.store.connect() as db:
+                    imbalance.reset(db)
+                self.observe([self.pair_observation(long_qty=long_qty, short_qty=short_qty)])
+                self.now += 60
+                self.observe([self.pair_observation(long_qty=long_qty, short_qty=short_qty)])
+                self.assertEqual(self.rows(), [])
+
+    def test_pair_above_one_percent_confirms_at_ten_source_seconds(self):
+        def row():
+            return self.pair_observation(long_qty="100", short_qty="98.999999")
+        self.observe([row()])
+        self.now += 9.999
+        self.observe([row()])
+        self.assertEqual(self.pending(), [])
+        self.now += .001
+        self.observe([row()])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertIn("10.0 秒", self.pending()[0]["message"])
+
+    def test_pair_duplicate_or_one_sided_samples_cannot_fill_ten_second_window(self):
+        row = self.pair_observation()
+        key = row["key"]
+        self.observe([row])
+        self.now += 5
+        self.observe([self.pair_observation(sample_times=[self.now, 1000])])
+        self.assertEqual(self.state()["targets"][key]["candidate"]["count"], 1)
+        self.now = 1008
+        self.observe([self.pair_observation(sample_times=[1000, 1000])])
+        self.assertEqual(self.state()["targets"][key]["candidate"]["count"], 1)
+        self.now = 1010
+        self.observe([self.pair_observation(sample_times=[1010, 1005])])
+        self.assertEqual(self.pending(), [])
+        self.now += .001
+        self.observe([self.pair_observation()])
+        self.assertEqual(len(self.pending()), 1)
+
+    def test_pair_observation_gap_is_bounded_at_the_longest_supported_polling_interval(self):
+        def row():
+            return self.pair_observation(max_gap=100000)
+        self.observe([row()])
+        self.now += 7211
+        self.observe([row()])
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(self.state()["targets"][row()["key"]]["candidate"]["count"], 1)
+        self.now += 10
+        self.observe([row()])
+        self.assertEqual(len(self.pending()), 1)
+
+    def test_pair_residual_against_empty_side_alerts_and_recovery_still_takes_thirty_seconds(self):
+        self.observe([self.pair_observation(long_qty="0.00000001", short_qty="0")])
+        self.now += 10
+        self.observe([self.pair_observation(long_qty="0.00000001", short_qty="0")])
+        fault = self.pending()[0]
+        self.assertIn("100.0000%", fault["message"])
+        self.result(fault, True)
+        self.now += 1
+        self.observe([self.pair_observation(long_qty="0", short_qty="0")])
+        self.now += 29.999
+        self.observe([self.pair_observation(long_qty="0", short_qty="0")])
+        self.assertEqual(self.pending(), [])
+        self.now += .001
+        self.observe([self.pair_observation(long_qty="0", short_qty="0")])
+        self.assertIn("recovery", self.pending()[0]["id"])
+
+    def test_pair_symbols_have_independent_incidents_and_mute_switches(self):
+        def both():
+            return [self.pair_observation(), self.pair_observation("CLUSD1")]
+        self.observe(both())
+        self.now += 10
+        self.observe(both())
+        queued = self.pending()
+        self.assertEqual(len(queued), 2)
+        self.assertEqual(len({item["id"] for item in queued}), 2)
+        oil = next(item for item in queued if json.loads(item["symbols"]) == ["CLUSD1"])
+        self.result(oil, True)
+        self.policy(symbol="XAUUSD1", alerts=False)
+        self.observe(both())
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(set(self.state()["targets"]), {self.pair_observation("CLUSD1")["key"]})
+        self.policy(symbol="XAUUSD1", alerts=True)
+        self.observe(both())
+        self.now += 10
+        self.observe(both())
+        self.assertEqual(len(self.pending()), 1)
+        self.assertEqual(json.loads(self.pending()[0]["symbols"]), ["XAUUSD1"])
+        self.assertEqual(self.state()["targets"][self.pair_observation("CLUSD1")["key"]]
+            ["incident"]["fault_id"], oil["id"])
+
+    def test_pair_delivery_capture_includes_symbol_in_addition_to_bound_accounts(self):
+        self.observe([self.pair_observation("CLUSD1")])
+        self.now += 10
+        row = self.pair_observation("CLUSD1")
+        self.observe([row])
+        with self.store.connect() as db:
+            self.assertEqual(imbalance.delivery_observation(db, self.pending()[0]),
+                {name: row[name] for name in ("key", "scope", "activity", "bindings", "symbol", "configured_symbol")})
+
+    def test_legacy_sent_pair_target_migrates_without_repeated_fault_and_can_recover(self):
+        def legacy():
+            row = self.pair_observation()
+            row["key"] = row["key"].rsplit(":", 1)[0]
+            return row
+        self.observe([legacy()])
+        self.now += 60
+        self.observe([legacy()])
+        original = self.pending()[0]
+        self.result(original, True)
+        with self.store.connect() as db:
+            state = imbalance.read(db)
+            state["targets"][legacy()["key"]]["capture"].pop("symbol", None)
+            state["targets"][legacy()["key"]]["capture"].pop("configured_symbol", None)
+            imbalance.write(db, state)
+        self.instance = "instance-after-upgrade"
+        self.now += 1
+        self.observe([self.pair_observation()])
+        self.now += 10
+        self.observe([self.pair_observation()])
+        self.assertEqual(self.pending(), [])
+        target = self.state()["targets"][self.pair_observation()["key"]]
+        self.assertEqual(target["incident"]["fault_id"], original["id"])
+        self.assertNotIn(legacy()["key"], self.state()["targets"])
+        self.now += 1
+        self.observe([self.pair_observation(short_qty="10")])
+        self.now += 30
+        self.observe([self.pair_observation(short_qty="10")])
+        self.assertEqual(len(self.pending()), 1)
+        self.assertIn("recovery", self.pending()[0]["id"])
 
 
 if __name__ == "__main__":
