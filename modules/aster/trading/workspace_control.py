@@ -3,13 +3,14 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack
 from copy import deepcopy
 import json
+import math
 import os
 import threading
 import time
 
 from .exchange import RequestNotSent, LiveBroker, credentials_for
 from .margin_balance import MarginBalancer
-from .models import dec
+from .models import dec, positive
 from .pair_planning import require_runtime_symbols
 
 
@@ -83,7 +84,8 @@ class WorkspaceControl:
                         "SELECT id,account_id,status,data FROM intents WHERE status NOT IN ('complete','aborted') ORDER BY id"))
                     records = tuple(tuple(row) for row in db.execute(
                         "SELECT key,data FROM kv WHERE key GLOB 'post_fill_check:*' OR key GLOB 'pair_runtime:*' "
-                        "OR key GLOB 'pair_margin:*' OR key GLOB 'pair_deleted:*' ORDER BY key"))
+                        "OR key GLOB 'pair_margin:*' OR key GLOB 'pair_deleted:*' "
+                        "OR key GLOB 'adl_pair:*' ORDER BY key"))
                     deleted_accounts = tuple(tuple(row) for row in db.execute(
                         "SELECT id,data,deleted_at FROM deleted_accounts ORDER BY id"))
             return intents, records, deleted_accounts
@@ -91,6 +93,38 @@ class WorkspaceControl:
             raise
         except Exception:
             raise UpdateEvidenceError("持久化恢复记录读取失败，无法确认更新后可继续恢复") from None
+
+    @staticmethod
+    def _adl_recovery(state, owner, members, identities):
+        """Check recoverable local order keys; restarting never queries/resends them."""
+        if (not isinstance(state.get("id"), str) or not state["id"]
+                or state.get("pair_id") != owner or state.get("identities") != identities):
+            raise UpdateEvidenceError("ADL 恢复记录的配对标识或账户身份不一致")
+        frozen = state.get("accounts")
+        member_ids = {member["id"] for member in members.values()}
+        if not isinstance(frozen, dict) or set(frozen) != member_ids:
+            raise UpdateEvidenceError("ADL 恢复记录缺少完整的账户配置")
+        for member in members.values():
+            saved = frozen[member["id"]]
+            if not isinstance(saved, dict) or any(saved.get(key) != member[key] for key in ("id", "env_prefix", "mode")):
+                raise UpdateEvidenceError("ADL 恢复记录的冻结账户身份不一致")
+        events, batches, prior_orders = state.get("events"), state.get("batches"), state.get("prior_orders", [])
+        if (not isinstance(events, list) or any(not isinstance(event, dict)
+                or event.get("account_id") not in member_ids for event in events)
+                or not isinstance(batches, list) or not isinstance(prior_orders, list)):
+            raise UpdateEvidenceError("ADL 恢复事件或批次记录不完整")
+        for batch in batches + prior_orders:
+            if (not isinstance(batch, dict) or batch.get("account_id") not in member_ids
+                    or batch.get("state") not in {"sending", "terminal"}):
+                raise UpdateEvidenceError("ADL 恢复批次的账户或状态无效")
+            order, sent_at = batch.get("order"), batch.get("sent_at")
+            if (not isinstance(order, dict) or not isinstance(order.get("symbol"), str) or not order["symbol"]
+                    or not isinstance(order.get("newClientOrderId"), str) or not order["newClientOrderId"]
+                    or order.get("positionSide") not in {"LONG", "SHORT", "BOTH"}
+                    or order.get("side") not in {"BUY", "SELL"} or order.get("type") != "MARKET"
+                    or type(sent_at) not in (int, float) or not math.isfinite(sent_at) or sent_at < 0):
+                raise UpdateEvidenceError("ADL 恢复订单缺少原始查询标识或发送时间")
+            positive(order.get("quantity"))
 
     def _recovery_identities(self, inventory, accounts, pairs, brokers):
         """Validate local journal ownership, without querying historical orders."""
@@ -130,6 +164,13 @@ class WorkspaceControl:
                     continue
                 if not isinstance(state, dict):
                     raise UpdateEvidenceError("配对恢复记录格式无效，无法确认更新后可继续恢复")
+                if kind == "adl_pair":
+                    if state.get("status") not in {"active", "blocked", "completed"} or type(state.get("hold")) is not bool:
+                        raise UpdateEvidenceError("ADL 恢复记录状态无效")
+                    if state["status"] == "completed" and not state["hold"]:
+                        # Released history cannot authorize a future write and
+                        # must not bind updates to retired accounts/credentials.
+                        continue
                 pending, watch = state.get("pending"), state.get("recovery_watch")
                 if owner not in pair_map:
                     if owner in deleted_pairs and pending is None and watch is None:
@@ -141,7 +182,7 @@ class WorkspaceControl:
                                 "submitting", "accepted", "acknowledged", "unknown"}:
                             continue
                     raise UpdateEvidenceError("恢复记录属于已不存在的配对组，无法覆盖完整挂单检查")
-                if pending is None and watch is None:
+                if pending is None and watch is None and kind != "adl_pair":
                     if kind == "pair_margin" and state.get("status") in {"submitting", "accepted", "acknowledged", "unknown"}:
                         raise UpdateEvidenceError("待核对划转缺少持久化请求记录")
                     # Inactive history is not an account authorization. New
@@ -163,7 +204,9 @@ class WorkspaceControl:
                     identities[side] = identity
                 if children and children["long"]["user"].lower() == children["short"]["user"].lower():
                     raise UpdateEvidenceError("配对恢复记录的两个方向指向同一个真实账户")
-                if kind == "pair_runtime":
+                if kind == "adl_pair":
+                    self._adl_recovery(state, owner, members, identities)
+                elif kind == "pair_runtime":
                     require_runtime_symbols(pair, state)
                     if "identities" in state and state["identities"] != identities:
                         raise UpdateEvidenceError("配对恢复记录与当前账户身份不一致")

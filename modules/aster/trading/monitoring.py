@@ -106,7 +106,13 @@ def monitored(config, symbol):
 
 
 def allowed(config, category, symbols):
-    if category not in CATEGORIES or not config["feishu_enabled"]:
+    if not config["feishu_enabled"]:
+        return False
+    # ADL recovery reports cover every native symbol in a bound account pair.
+    # They have no optional per-symbol notification setting.
+    if category == "adl":
+        return True
+    if category not in CATEGORIES:
         return False
     if category in ("hourly_summary", "relay_health"):
         return config[category + "_alerts"]

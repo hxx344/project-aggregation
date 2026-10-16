@@ -1102,12 +1102,21 @@ class LiveBroker:
         self._cycle_stream_callback_lock = threading.RLock()
         self._cycle_stream_token = None
         self._cycle_stream_connected = None
+        self._adl_on_event = None
+        self._adl_on_reconnected = None
         self._private_evidence = PrivateEventEvidence()
         self._cycle_hot_closed = False
         self.cycle_cache = CycleAccountCache()
         self.cycle_stream = None
         self.leverage_snapshot = None
         self.cycle_trade_queries = {}
+
+    def set_adl_listener(self, *, on_event=None, on_reconnected=None):
+        """Attach local queue callbacks; they must never perform DB or HTTP work."""
+        if any(callback is not None and not callable(callback) for callback in (on_event, on_reconnected)):
+            raise ValueError("Invalid ADL listener")
+        with self._cycle_stream_callback_lock:
+            self._adl_on_event, self._adl_on_reconnected = on_event, on_reconnected
 
     def start_cycle_hot_data(self, symbols, *, on_invalidate=None):
         """Configure one private stream; neither construction nor start reads REST here."""
@@ -1152,12 +1161,15 @@ class LiveBroker:
             if token is self._cycle_stream_token:
                 # A stream gap may hide a mode change. Invalidate once per state
                 # transition, not on every disconnected retry callback.
-                if connected is not self._cycle_stream_connected:
+                changed = connected is not self._cycle_stream_connected
+                if changed:
                     with self._snapshot_lock:
                         self._cycle_stream_connected = connected
                         self._private_evidence.reset(connected)
                         self._invalidate_snapshot_reads(refresh_modes=True)
                 self.cycle_cache.set_connected(connected)
+                if changed and self._adl_on_reconnected is not None:
+                    self._adl_on_reconnected()
 
     def _cycle_stream_event(self, token, kind):
         with self._cycle_stream_callback_lock:
@@ -1169,6 +1181,8 @@ class LiveBroker:
             if token is self._cycle_stream_token:
                 with self._snapshot_lock:
                     self._private_evidence.payload(event)
+                if self._adl_on_event is not None:
+                    self._adl_on_event(event)
 
     def order_event_receipt(self, order):
         """Return only fresh terminal evidence; historical query() stays REST."""

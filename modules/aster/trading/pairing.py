@@ -262,7 +262,8 @@ class PairManager:
             self._changed(pair)
         return pair
 
-    def _idle(self, pair, *, require_flat=False, resume_unknown=False):
+    def _idle(self, pair, *, require_flat=False, resume_unknown=False, allow_adl_completed=False):
+        self.engine.adl.require_clear(pair["id"], allow_completed=allow_adl_completed)
         if pair["enabled"]:
             raise TradingError("请先暂停配对组")
         runtime = self.store.get("pair_runtime:" + pair["id"], {})
@@ -385,8 +386,10 @@ class PairManager:
                 from .pair_execution import PairTrader, empty_progress
                 if pair["enabled"]:
                     raise TradingError("配对组已启动，无需重复启动")
+                self.engine.adl.before_enable(pair)
                 if margin_only(pair):
                     saved = self._enable_margin(pair)
+                    self.engine.adl.after_enable(saved)
                     self._changed(saved)
                     return saved
                 pending = (self.store.get("pair_runtime:" + pair_id, {}) or {}).get("pending")
@@ -396,7 +399,7 @@ class PairManager:
                         raise TradingError("启动前自动核对尚未完成，仓位保持不变；" + result["message"])
                     pair = self.store.pair(pair_id)
                 margin = self.store.get("pair_margin:" + pair_id, {})
-                original_runtime = self._idle(pair, resume_unknown=True)
+                original_runtime = self._idle(pair, resume_unknown=True, allow_adl_completed=True)
                 from .pair_planning import require_runtime_symbols
                 require_runtime_symbols(pair, original_runtime)
                 if not any(pair[key]["enabled"] for key in ("ordinary", "cycle", "margin")):
@@ -449,9 +452,18 @@ class PairManager:
                     if margin.get("pending") is not None:
                         balancer.risk_snapshots(pair, snapshots)
                 with self._current_members(guards):
+                    self.engine.adl.require_clear(pair_id, allow_completed=True)
                     saved = self.store.activate_pair(pair, runtime, expected_runtime=original_runtime,
                         expected_margin=margin, accounts=accounts, check_current=check_current, message=message)
+                self.engine.adl.after_enable(saved)
             else:
+                if not pair["enabled"]:
+                    try:
+                        self.engine.adl.require_clear(pair_id)
+                    except TradingError:
+                        # ADL already paused this pair. A repeated user pause
+                        # must not change the incident's frozen config revision.
+                        return pair
                 pair["enabled"] = False
                 saved = self.store.save_pair(pair)
                 self.store.event(pair_id, "pair", "配对组已暂停，停止新开仓和新划转；已提交订单及划转继续核对，循环新增仓位继续减回，普通底仓保留")
@@ -496,6 +508,7 @@ class PairManager:
                     if any(credentials[field].lower() != identities[key][field] for field in ("user", "signer")):
                         raise TradingError("启动核验期间账户身份已变化，请重新核对")
 
+        self.engine.adl.require_clear(pair["id"], allow_completed=True)
         return self.store.activate_pair(pair, runtime, expected_runtime=original,
             expected_margin=margin, accounts=accounts, check_current=check_current, message=reason)
 
@@ -504,6 +517,7 @@ class PairManager:
         if pair is None:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
+            self.engine.adl.require_clear(pair_id)
             return self.recovery.preview(pair_id)
 
     def check_recovery(self, pair_id):
@@ -511,6 +525,7 @@ class PairManager:
         if pair is None:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
+            self.engine.adl.require_clear(pair_id)
             return self.recovery.check(pair_id)
 
     def confirm_recovery(self, pair_id, token, acknowledge_unknown=False):
@@ -518,6 +533,7 @@ class PairManager:
         if pair is None:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
+            self.engine.adl.require_clear(pair_id)
             return self.recovery.confirm(pair_id, token, acknowledge_unknown)
 
     def skip_recovery(self, pair_id, batch_id, acknowledge_skip=False):
@@ -525,6 +541,7 @@ class PairManager:
         if pair is None:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
+            self.engine.adl.require_clear(pair_id)
             return self.recovery.skip_positions(pair_id, batch_id, acknowledge_skip)
 
     def preview_baseline(self, pair_id):
@@ -532,6 +549,7 @@ class PairManager:
         if pair is None:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
+            self.engine.adl.require_clear(pair_id)
             return self.recovery.preview_baseline(pair_id)
 
     def confirm_baseline(self, pair_id, token, acknowledge_unknown=False):
@@ -539,6 +557,7 @@ class PairManager:
         if pair is None:
             raise TradingError("配对组不存在")
         with self.locked(pair), self.store.connection_scope():
+            self.engine.adl.require_clear(pair_id)
             return self.recovery.confirm_baseline(pair_id, token, acknowledge_unknown)
 
     def delete(self, pair_id):
@@ -658,6 +677,9 @@ class PairManager:
                 accounts = self._members(pair)
                 if any(not self.engine.live_allowed(account) for account in accounts):
                     raise TradingError("服务器未开放实盘执行，配对组仅保留现有记录")
+                adl_state = self.engine.adl.tick(pair)
+                if adl_state is not None:
+                    return max(1, adl_state.get("retry_after", 0))
                 if self.trader is None:
                     from .pair_execution import PairTrader
                     self.trader = PairTrader(self.engine)

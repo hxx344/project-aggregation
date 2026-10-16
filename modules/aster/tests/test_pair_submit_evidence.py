@@ -44,7 +44,7 @@ class PairSubmitEvidenceTests(TestCase):
                     state = f.tick()
                 self.assertIsNone(state["pending"], state)
                 self.assertFalse(state["last_batch"]["completed"])
-                self.assertEqual(reads.call_args.kwargs, {"reconciliation": True})
+                self.assertEqual(reads.call_args.kwargs, {"reconciliation": True, "fresh_modes": False})
                 self.assertEqual([send.call_count for send in sends], [1, 1])
                 batch = self.batch(f, state)
                 self.assertEqual(batch["kind"], kind)

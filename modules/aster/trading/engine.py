@@ -173,6 +173,9 @@ class Engine:
         self.pair_watch_diagnostic_lock = threading.Lock()
         self.dashboard_reports = ReportCache(self._load_dashboard_report)
         self.account_work = {}
+        self._adl_wakes = set()
+        from .adl import AdlController
+        self.adl = AdlController(self)
         self.cycle_market_updates, self.cycle_market_order = {}, {}
         self.cycle_recovery_previews = {}
         self.ready = False
@@ -240,6 +243,9 @@ class Engine:
                 if user in self.users and self.users[user] != aid:
                     raise TradingError("同一真实账户不能通过不同 API signer 重复接入")
                 broker = LiveBroker(creds, self.market)
+                broker.set_adl_listener(
+                    on_event=lambda event: self.adl.observe(aid, broker, event),
+                    on_reconnected=lambda: self.adl.reconnected(aid, broker))
                 self.signers[signer] = aid
                 self.users[user] = aid
                 self.brokers[aid] = broker
@@ -247,6 +253,22 @@ class Engine:
 
     def live_allowed(self, account):
         return account["mode"] == "paper" or (not self.demo and os.environ.get("ASTER_ALLOW_LIVE") == "1")
+
+    def wake_adl(self, account_id):
+        """Private callbacks enqueue work without reading storage or trading."""
+        if self.shutdown.is_set():
+            return
+        with self.lock:
+            self._adl_wakes.add(account_id)
+        self.scheduler_event.set()
+
+    def poll_adl(self, account_id):
+        account = self.store.account(account_id)
+        if (self.shutdown.is_set() or not account or account["mode"] != "live"
+                or not self.live_allowed(account) or not self.store.pair_for_account(account_id)):
+            return 30
+        delay = self.adl.poll(account)
+        return max(1, delay) if type(delay) in (int, float) and math.isfinite(delay) else 1
 
     def wake_cycle_hot_data(self, account_id):
         """A stream callback only queues refresh; it never takes the trade lock."""
@@ -286,13 +308,9 @@ class Engine:
     def poll_cycle_hot_data(self, account_id):
         """Refresh independently of the account execution slot and quote trigger."""
         account = self.store.account(account_id)
-        paired = self.pairs.active_for_account(account_id)
-        if paired is None:
-            candidate = self.store.pair_for_account(account_id)
-            if candidate and (self.store.get("pair_margin:" + candidate["id"]) or {}).get("pending"):
-                # A paused group still needs its private stream to finish an
-                # already acknowledged transfer. This never enables trading.
-                paired = candidate
+        # Pausing a pair cannot pause ADL detection. Ordinary and paused groups
+        # keep the private stream without repeatedly refreshing REST snapshots.
+        paired = self.store.pair_for_account(account_id)
         with self.lock:
             existing = self.brokers.get(account_id)
         active = (account and account["mode"] == "live"
@@ -303,6 +321,9 @@ class Engine:
                 existing.stop_cycle_hot_data()
             return 30
         broker = self.broker(account)
+        broker.set_adl_listener(
+            on_event=lambda event: self.adl.observe(account_id, broker, event),
+            on_reconnected=lambda: self.adl.reconnected(account_id, broker))
         hot_symbol = paired.get("symbol", "XAUUSD1") if paired else account["cycle"]["symbol"]
         with self.lock:
             work = self.work(account_id)
@@ -2681,6 +2702,7 @@ class Engine:
         rules_due = 0
         market_started, market_backoff = {}, {}
         cycle_job_due = {}
+        adl_wake_jobs = set()
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
         saved_accounts, saved_pairs, pair_revisions = [], [], {}
@@ -2815,6 +2837,17 @@ class Engine:
                             schedules = self.scheduling(saved_accounts)
                         cycle_candidates = self.cycle_wake_candidates(saved_accounts, pending)
                         with self.lock:
+                            for aid in tuple(self._adl_wakes):
+                                adl_wake_jobs.add("adl:" + aid)
+                                adl_wake_jobs.update("pair:" + pair["id"] for pair in saved_pairs
+                                                    if aid in (pair["long_account_id"], pair["short_account_id"]))
+                            self._adl_wakes.clear()
+                            # Consume each task's signal independently; a slow
+                            # history request cannot repeatedly wake its pair.
+                            # Running tasks retain their signal until completion.
+                            for key in adl_wake_jobs - pending.keys():
+                                due[key] = 0
+                                adl_wake_jobs.discard(key)
                             for aid, work in self.account_work.items():
                                 key = "cycle-data:" + aid
                                 if work.hot_wake and key not in pending and time.monotonic() >= work.hot_backoff:
@@ -2857,6 +2890,11 @@ class Engine:
                         if self.listing_monitor is not None:
                             jobs["listings"] = (self.listing_monitor.poll,)
                         live_ids = [a["id"] for a in saved_accounts if a["mode"] == "live"]
+                        bound_ids = {pair[key] for pair in saved_pairs
+                                     for key in ("long_account_id", "short_account_id")}
+                        jobs.update({"adl:" + account["id"]: (self.poll_adl, account["id"])
+                                     for account in saved_accounts if account["id"] in bound_ids
+                                     and account["mode"] == "live" and self.live_allowed(account)})
                         jobs.update({"cycle-data:" + aid: (self.poll_cycle_hot_data, aid) for aid in live_ids})
                         jobs.update({"cycle-history:" + aid: (self.poll_cycle_history, aid) for aid in live_ids})
                         ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts,

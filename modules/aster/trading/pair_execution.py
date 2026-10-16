@@ -153,6 +153,7 @@ class PairTrader:
         return {key: row[0] for key, row in rows.items()}, {key: row[1] for key, row in rows.items()}
 
     def _balance(self, pair, state, brokers, identities, snapshots=None, guards=None, *, pending_orders=False):
+        self.engine.adl.require_clear(pair["id"])
         symbol = pair["symbol"]
         from .margin_balance import MarginBalancer
 
@@ -233,6 +234,10 @@ class PairTrader:
         return {side: wire(dec(state["owned"][side]) + dec(progress["quantities"].get(side, "0"))) for _, side in SIDES}
 
     def _config_guard(self, pair, identities, *, opening):
+        try:
+            self.engine.adl.require_clear(pair["id"])
+        except TradingError as exc:
+            raise RequestNotSent(str(exc)) from None
         current = self.store.pair(pair["id"])
         if not current or current.get("revision") != pair.get("revision"):
             raise RequestNotSent("配对组配置已变化，取消本次提交")
@@ -246,6 +251,7 @@ class PairTrader:
             require_archived_orders_clear(self.engine, current)
 
     def tick(self, pair):
+        self.engine.adl.require_clear(pair["id"])
         symbol = pair["symbol"]
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
         pending_at_entry = state.get("pending")
@@ -445,6 +451,11 @@ class PairTrader:
                         "phase": state["phase"], "reason": state["reason"], "api_notice": state.get("api_notice")}
                 if margin_eligible and not margin_checked:
                     try:
+                        self.engine.adl.require_clear(pair["id"])
+                    except TradingError:
+                        margin_eligible = False
+                if margin_eligible and not margin_checked:
+                    try:
                         margin = self._balance(pair, state, brokers, identities, snapshots, guards,
                             pending_orders=bool(pending_at_entry or trading_attempted or state.get("pending")))
                         if not holding:
@@ -605,6 +616,7 @@ class PairTrader:
             order, broker = leg["order"], brokers[leg["key"]]
             evidence = {"kind": "unknown"}
             try:
+                self._config_guard(pair, state["identities"], opening=pending.get("phase") == "open")
                 if guards:
                     try:
                         guards[leg["key"]]()
@@ -727,6 +739,7 @@ class PairTrader:
                    for leg in pending["legs"] + pending["repairs"])
 
     def _recover(self, pair, state, brokers, *, read_only=False, recovery_source=None):
+        self.engine.adl.require_clear(pair["id"])
         symbol = pair["symbol"]
         require_runtime_symbols(pair, state)
         pending = state["pending"]
