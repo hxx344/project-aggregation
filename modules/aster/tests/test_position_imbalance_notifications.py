@@ -471,19 +471,22 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
                 self.observe([self.pair_observation(long_qty=long_qty, short_qty=short_qty)])
                 self.assertEqual(self.rows(), [])
 
-    def test_pair_above_one_percent_confirms_at_ten_source_seconds(self):
+    def test_pair_above_one_percent_confirms_at_twenty_source_seconds(self):
         def row():
             return self.pair_observation(long_qty="100", short_qty="98.999999")
         self.observe([row()])
+        self.now += 10
+        self.observe([row()])
+        self.assertEqual(self.pending(), [])
         self.now += 9.999
         self.observe([row()])
         self.assertEqual(self.pending(), [])
         self.now += .001
         self.observe([row()])
         self.assertEqual(len(self.pending()), 1)
-        self.assertIn("10.0 秒", self.pending()[0]["message"])
+        self.assertIn("20.0 秒", self.pending()[0]["message"])
 
-    def test_pair_duplicate_or_one_sided_samples_cannot_fill_ten_second_window(self):
+    def test_pair_duplicate_or_one_sided_samples_cannot_fill_twenty_second_window(self):
         row = self.pair_observation()
         key = row["key"]
         self.observe([row])
@@ -493,8 +496,8 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         self.now = 1008
         self.observe([self.pair_observation(sample_times=[1000, 1000])])
         self.assertEqual(self.state()["targets"][key]["candidate"]["count"], 1)
-        self.now = 1010
-        self.observe([self.pair_observation(sample_times=[1010, 1005])])
+        self.now = 1020
+        self.observe([self.pair_observation(sample_times=[1020, 1015])])
         self.assertEqual(self.pending(), [])
         self.now += .001
         self.observe([self.pair_observation()])
@@ -508,13 +511,13 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         self.observe([row()])
         self.assertEqual(self.pending(), [])
         self.assertEqual(self.state()["targets"][row()["key"]]["candidate"]["count"], 1)
-        self.now += 10
+        self.now += 20
         self.observe([row()])
         self.assertEqual(len(self.pending()), 1)
 
     def test_pair_residual_against_empty_side_alerts_and_recovery_still_takes_thirty_seconds(self):
         self.observe([self.pair_observation(long_qty="0.00000001", short_qty="0")])
-        self.now += 10
+        self.now += 20
         self.observe([self.pair_observation(long_qty="0.00000001", short_qty="0")])
         fault = self.pending()[0]
         self.assertIn("100.0000%", fault["message"])
@@ -532,7 +535,7 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         def both():
             return [self.pair_observation(), self.pair_observation("CLUSD1")]
         self.observe(both())
-        self.now += 10
+        self.now += 20
         self.observe(both())
         queued = self.pending()
         self.assertEqual(len(queued), 2)
@@ -545,7 +548,7 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         self.assertEqual(set(self.state()["targets"]), {self.pair_observation("CLUSD1")["key"]})
         self.policy(symbol="XAUUSD1", alerts=True)
         self.observe(both())
-        self.now += 10
+        self.now += 20
         self.observe(both())
         self.assertEqual(len(self.pending()), 1)
         self.assertEqual(json.loads(self.pending()[0]["symbols"]), ["XAUUSD1"])
@@ -554,7 +557,7 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
 
     def test_pair_delivery_capture_includes_symbol_in_addition_to_bound_accounts(self):
         self.observe([self.pair_observation("CLUSD1")])
-        self.now += 10
+        self.now += 20
         row = self.pair_observation("CLUSD1")
         self.observe([row])
         with self.store.connect() as db:
@@ -579,7 +582,7 @@ class PositionImbalanceNotificationsTests(unittest.TestCase):
         self.instance = "instance-after-upgrade"
         self.now += 1
         self.observe([self.pair_observation()])
-        self.now += 10
+        self.now += 20
         self.observe([self.pair_observation()])
         self.assertEqual(self.pending(), [])
         target = self.state()["targets"][self.pair_observation()["key"]]

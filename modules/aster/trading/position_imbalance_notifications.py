@@ -14,7 +14,7 @@ from .models import TradingError, hedge_balanced, positive
 KEY = "position_imbalance_notifications"
 CATEGORY = "position_imbalance"
 FAULT_SECONDS = 60
-PAIR_FAULT_SECONDS = 10
+PAIR_FAULT_SECONDS = 20
 PAIR_TOLERANCE = Fraction(1, 100)
 RECOVERY_SECONDS = 30
 SAMPLE_MAX_AGE = 8
@@ -128,7 +128,7 @@ def message(target, evidence, candidate, recovery):
     for member in target.get("member_quantities", []):
         text += f"\n账户「{member['name']}」：多仓 {member['long_qty']}；空仓 {member['short_qty']}"
     if target.get("paired"):
-        text += "\n配对告警条件：总多空数量差占较大一侧超过 1%，连续确认至少 10 秒。"
+        text += f"\n配对告警条件：总多空数量差占较大一侧超过 1%，连续确认至少 {PAIR_FAULT_SECONDS} 秒。"
     if target.get("attention"):
         text += "\n自动处理已暂停，请核对实际持仓。"
     return text

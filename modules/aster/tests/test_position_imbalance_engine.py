@@ -171,7 +171,7 @@ class PositionObservationTests(unittest.TestCase):
 
     def test_pair_reverse_positions_are_included_in_actual_totals(self):
         self.pair()
-        for offset in (0, 10):
+        for offset in (0, 20):
             self.now += offset
             self.pair_state(snapshots={"long": snapshot(self.now, "10", "3"), "short": snapshot(self.now, "2", "10")})
             self.engine.notify()
@@ -197,7 +197,7 @@ class PositionObservationTests(unittest.TestCase):
                 for name in ("load_rules", "book", "mark_price", "capacities", "depth")]
             calls.append(stack.enter_context(patch.object(self.engine, "broker",
                 side_effect=AssertionError("broker acquisition"))))
-            for offset in (0, 10):
+            for offset in (0, 20):
                 self.now += offset
                 self.pair_state(snapshots={"long": snapshot(900, "1", "0"), "short": snapshot(900, "0", "1")},
                     display_positions={
@@ -238,7 +238,7 @@ class PositionObservationTests(unittest.TestCase):
                 self.sender.assert_called_once()
                 self.assertIn("CLUSD1", self.sender.call_args.args[1])
 
-    def test_margin_only_interruption_beyond_polling_allowance_restarts_ten_second_confirmation(self):
+    def test_margin_only_interruption_beyond_polling_allowance_restarts_twenty_second_confirmation(self):
         pair = {**self.pair(), "ordinary": {"enabled": False}, "cycle": {"enabled": False},
             "margin": {"enabled": True, "check_interval_seconds": 300}}
         with self.f.store.connect() as db:
@@ -252,7 +252,7 @@ class PositionObservationTests(unittest.TestCase):
         self.now += 611
         publish()
         self.sender.assert_not_called()
-        self.now += 9
+        self.now += 19
         publish()
         self.sender.assert_not_called()
         self.now += 1
@@ -261,7 +261,7 @@ class PositionObservationTests(unittest.TestCase):
 
     def test_latest_display_failure_never_falls_back_to_older_successful_positions(self):
         self.pair()
-        for offset in (0, 10):
+        for offset in (0, 20):
             self.now += offset
             failed = display_snapshot(self.now - 1, snapshot(self.now - 1)["positions"])
             failed.update(checked_at=self.now, error="账户持仓读取失败")
@@ -276,7 +276,7 @@ class PositionObservationTests(unittest.TestCase):
         self.pair()
         for failure in ("missing_side", "missing_positions", "stale", "invalid_quantity"):
             with self.subTest(failure=failure):
-                for offset in (0, 10):
+                for offset in (0, 20):
                     self.now += offset
                     positions = {"long": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "LONG", "qty": "2"}]),
                         "short": display_snapshot(self.now, [{"symbol": "XAUUSD1", "side": "SHORT", "qty": "1"}])}
@@ -295,7 +295,7 @@ class PositionObservationTests(unittest.TestCase):
 
     def test_closed_other_symbol_is_retained_until_stable_recovery(self):
         self.pair()
-        for offset in (0, 10):
+        for offset in (0, 20):
             self.now += offset
             self.pair_state(snapshots={}, display_positions={
                 "long": display_snapshot(self.now, [{"symbol": "CLUSD1", "side": "LONG", "qty": "100"}]),
@@ -323,7 +323,7 @@ class PositionObservationTests(unittest.TestCase):
         for aid, name in (("test", "账户甲"), ("other", "账户乙")):
             saved = self.f.store.account(aid)
             self.f.store.save_account({**saved, "name": name})
-        for offset in (0, 10):
+        for offset in (0, 20):
             self.now += offset
             self.pair_state(snapshots={"long": snapshot(self.now, "10", "3"), "short": snapshot(self.now, "2", "10")})
             self.engine.notify()
