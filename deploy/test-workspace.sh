@@ -53,12 +53,17 @@ workspace_frontend_checks() {
   prepare_module_builds
 }
 workspace_python_checks() {
+  local pip_cache=${INSTALL_TEST_PIP_CACHE:-$APP_DIR/build-home/.cache/pip}
+  [[ "$pip_cache" == /* ]] || { echo 'INSTALL_TEST_PIP_CACHE must be an absolute directory.' >&2; return 1; }
+  run_as_service mkdir -p -- "$pip_cache"
+  run_as_service test -w "$pip_cache" || { echo 'The build account cannot write to the Python pip cache.' >&2; return 1; }
+  printf '[workspace] Python pip download cache: %s\n' "$pip_cache"
   install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python"
   run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python"
-  run_as_service "$test_root/python/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
+  run_as_service "$test_root/python/bin/python" -m pip --cache-dir "$pip_cache" install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/greeks/requirements.lock"
   install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$test_root/python-aster"
   run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
-  run_as_service "$test_root/python-aster/bin/python" -m pip install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
+  run_as_service "$test_root/python-aster/bin/python" -m pip --cache-dir "$pip_cache" install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
   (cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_workspace tests.test_server_security tests.test_server_runtime tests.test_hub_summary tests.test_transfer_account_snapshot tests.test_pair_margin_independent tests.test_pair_margin tests.test_pair_margin_status tests.test_pair_margin_bounded_recovery tests.test_pair_margin_budget_wait tests.test_pair_margin_ws tests.test_bounded_recovery tests.test_recovery_engine tests.test_pair_bounded_recovery tests.test_pair_trading tests.test_pair_position_scope tests.test_pair_archived_baseline tests.test_pair_paused_adoption tests.test_pair_symbol_api tests.test_pair_symbol_change tests.test_pair_symbol_history tests.test_pair_symbol_watch tests.test_pair_symbols_runtime tests.test_pair_market_symbols tests.test_pair_upgrade_capacity tests.test_opening_messages tests.test_risk_scenarios tests.test_cycle_engine tests.test_cycle_execution tests.test_migration_engine tests.test_migration_execution -q)
   (cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_monitoring_settings tests.test_monitoring_migration tests.test_listing_alerts tests.test_listings tests.test_capacity_notification_samples tests.test_capacity_relay_integration tests.test_public_data_sharing tests.test_hourly_summary tests.test_hourly_notification_engine tests.test_feishu_summary_cards -q)
   (cd "$work_dir/source/modules/aster"; run_as_service "$test_root/python-aster/bin/python" -m unittest tests.test_adl_events tests.test_adl_exchange tests.test_adl_controller tests.test_adl_recovery tests.test_adl_notifications tests.test_adl_integration tests.test_adl_monitoring tests.test_adl_workspace -q)
@@ -88,10 +93,6 @@ printf 'Real non-root build and backend import passed with immutable shared depe
 
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
   stage_started=$SECONDS
-  # Optimize release size before packaging
-  printf 'Optimizing release package size...\n'
-  bash "$repository/scripts/optimize-release-size.sh" || true
-
   python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --parser-user "$SERVICE_USER" --repository "$repository" --output "$repository/output/release"
   mkdir "$test_root/package"
   tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"

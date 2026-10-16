@@ -832,3 +832,17 @@
 **证据：** project-aggregation 基线 `0212f91a` 尚无 ADL 自动处理；2026-10-16 新功能开发中的离线故障注入在新增 [adl.py](modules/aster/trading/adl.py) 上复现“旧多空各 2、ADL 时间 1000、仓位更新时间 999”被提前标记完成，修正后等待持仓投影再执行。没有真实账户成交或服务器验收证据，不将离线结果描述为实盘验证。
 
 **事件记录：** `aster-adl-position-projection-20261016`；同一功能开发中的审查与连续修补，关联 L008、L031、L039、L040，不推进主线复盘检查点。
+
+### L055：构建优化必须覆盖冻结安装与真实缓存目录
+
+**适用条件：** 修改 workspace 依赖、编译器、CI 并行或缓存路径以加速构建。
+
+**根因：** 批量展开 catalog 并替换 React 插件后，锁文件和 Vite 导入仍保留旧契约；本地旧依赖可能掩盖失败。CI 实际在新 Git 归档和独立服务账号 HOME 中构建，checkout 的缓存不会自动被使用。旧的整文件替换模板还会删除后来增加的校验和失败清理。
+
+**以后做法：** 先核对固定包管理器下的冻结安装和实际调用入口。依赖、配置和锁文件一起变更；不把缺少验证的编译器迁移混入缓存优化。缓存显式接到真实消费者并保留来源与完整性验证；增量修改当前 CI，保留测试、进程清理、降权打包与跨目录复用验收。性能比例以实测为依据。
+
+**如何验证：** 固定 pnpm 执行冻结锁文件校验；[增量类型检查](deploy/test-typecheck-cache.mjs) 覆盖冷/热检查、缓存后新增错误和修复；[模块缓存检查](deploy/test-module-builds.mjs) 覆盖模块选择和搬移。Linux [真实工作区检查](deploy/test-workspace.sh) 核对服务账号实际 pip 缓存路径、不可变依赖、构建、解包和运行。按改动范围选择，不用 Windows 结果替代 Linux 权限验收。
+
+**证据：** project-aggregation `4197923` 基线上的 2026-10-16 构建优化工作区，五份 package 清单被改写而锁文件未变；固定 pnpm 11.25.0 的 `install --frozen-lockfile --lockfile-only --ignore-scripts --offline` 实际报 `ERR_PNPM_OUTDATED_LOCKFILE`，恢复 catalog 和已验证插件后通过。旧 `apply-ci-optimization-parallel.sh` 模板缺少当前打包器要求的 `--parser-user`；旧缓存草案没有向 `run_as_service` 的独立 HOME 传递 pip 路径。修正入口见 [构建说明](docs/build-performance.md)。这些草案未作为正式方案执行。
+
+**事件记录：** `build-optimization-entrypoint-20261016`；同一次构建优化审核中的关联问题，不推进主线复盘检查点。
