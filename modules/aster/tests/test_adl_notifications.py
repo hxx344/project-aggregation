@@ -32,6 +32,22 @@ def incident():
 
 
 class AdlReportTests(unittest.TestCase):
+    def test_recorded_config_controls_report_text_and_legacy_defaults(self):
+        legacy = "\n".join(notifications.format_messages(incident(), "detected"))
+        self.assertIn("本次自动减仓：开启", legacy)
+        self.assertIn("单批名义金额上限：1000", legacy)
+        item = incident()
+        item["config"] = {"enabled": False, "batch_notional": "250.5"}
+        item["batches"] = []
+        for phase in ("detected", "blocked", "completed"):
+            with self.subTest(phase=phase):
+                text = "\n".join(notifications.format_messages(item, phase))
+                self.assertIn("本次自动减仓：关闭", text)
+                self.assertIn("单批名义金额上限：250.5", text)
+                self.assertNotIn("将按实际多空残差分批减去多余持仓", text)
+        blocked = "\n".join(notifications.format_messages(item, "blocked"))
+        self.assertIn("不自动下单或撤单", blocked)
+
     def test_detected_reports_original_cumulative_reduction_and_source_time(self):
         item = incident()
         item.pop("after")

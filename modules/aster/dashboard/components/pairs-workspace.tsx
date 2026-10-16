@@ -1,5 +1,5 @@
 'use client';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { CirclePause, CirclePlay, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -19,6 +19,8 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { PairSettings } from '@/components/pair-settings';
+import { PairAdlPanel } from '@/components/pair-adl-panel';
+import { adlRecoveryBlock } from '@/lib/pair-adl';
 import { PairCycleCostsPanel } from '@/components/pair-cycle-costs';
 import { PairNotices } from '@/components/pair-notices';
 import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
@@ -32,7 +34,7 @@ import {
 } from '@/lib/pair-notices';
 import { usePairNotices } from '@/lib/use-pair-notices';
 import { ExecutionEvents } from '@/components/execution-events';
-import type { Account, DeskAction } from '@/lib/desk-types';
+import type { Account, DeskAction, State } from '@/lib/desk-types';
 import type { ExecutionEvent } from '@/lib/cycle-events';
 import { useAccountDraft } from '@/lib/use-account-draft';
 import { usePairSymbols } from '@/lib/use-pair-symbols';
@@ -74,6 +76,9 @@ type Props = {
   action: DeskAction;
   setError: (message: string) => void;
   setNotice: (message: string) => void;
+  notification?: State['notification'];
+  feishuEnabled?: boolean;
+  onNotificationSettings: () => void;
 };
 const EMPTY_PAIRS: Pair[] = [];
 type PairSymbolsProps = {
@@ -293,6 +298,9 @@ function PairDetail({
   clearNotices,
   catalog,
   loadSymbols,
+  notification,
+  feishuEnabled,
+  onNotificationSettings,
 }: Omit<Props, 'pairs'> &
   PairSymbolsProps & {
     pairs: Pair[];
@@ -302,6 +310,7 @@ function PairDetail({
   }) {
   const draft = useAccountDraft(pair.id, pairDraft(pair));
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const settings = useRef<HTMLDetailsElement>(null);
   const snapshots = pair.state?.snapshots;
   const marginOnly = pairMarginOnly(pair);
   const displayedBalances = marginOnly
@@ -324,6 +333,7 @@ function PairDetail({
     margin.trading_resume_allowed === true &&
     margin.blocks_trading === false;
   const configurationLock = pairConfigurationLock(pair);
+  const adlLock = adlRecoveryBlock(pair);
   const deletionBlock = pairDeletionBlock(pair, now, offline);
   const locked = busy || offline || Boolean(configurationLock);
   const mode = pair.ordinary.enabled
@@ -404,7 +414,9 @@ function PairDetail({
               <PairBaselineRecovery
                 key={pair.id}
                 pair={pair}
-                disabled={busy || offline || !ready || draft.dirty}
+                disabled={
+                  busy || offline || !ready || draft.dirty || Boolean(adlLock)
+                }
                 now={now}
                 action={action}
                 setNotice={setNotice}
@@ -412,7 +424,9 @@ function PairDetail({
             ) : (
               <PairOrderRecovery
                 pair={pair}
-                disabled={busy || offline || !ready || draft.dirty}
+                disabled={
+                  busy || offline || !ready || draft.dirty || Boolean(adlLock)
+                }
                 now={now}
                 action={action}
                 setNotice={setNotice}
@@ -454,7 +468,9 @@ function PairDetail({
             <p className="amber">设置有未保存修改，请保存或撤销后启动。</p>
           ) : null}
           <p className="muted">
-            组暂停会阻止新开仓和新划转；已成交循环继续减回本轮基线，既有订单与划转请求继续查询。
+            {adlLock
+              ? 'ADL 期间由应急处理接管核实与减仓，普通策略和新划转保持暂停。'
+              : '组暂停会阻止新开仓和新划转；已成交循环继续减回本轮基线，既有订单与划转请求继续查询。'}
           </p>
           {!pair.enabled ? (
             <p className="muted">
@@ -465,6 +481,25 @@ function PairDetail({
           ) : null}
         </div>
       </section>
+      <PairAdlPanel
+        pair={pair}
+        offline={offline}
+        notification={notification}
+        feishuEnabled={feishuEnabled}
+        onNotificationSettings={onNotificationSettings}
+        onSettings={() => {
+          if (settings.current) {
+            settings.current.open = true;
+            loadSymbols();
+            settings.current
+              .querySelector<HTMLElement>('.pair-adl-settings')
+              ?.scrollIntoView({ block: 'center' });
+            settings.current
+              .querySelector<HTMLInputElement>('[id$="-pair-adl-batch"]')
+              ?.focus({ preventScroll: true });
+          }
+        }}
+      />
       <div className="pair-sides">
         <PairSide
           side="long"
@@ -748,6 +783,7 @@ function PairDetail({
         />
       </details>
       <details
+        ref={settings}
         className="disclosure panel settings-panel pair-config"
         onToggle={(event) => {
           if (event.currentTarget.open) loadSymbols();

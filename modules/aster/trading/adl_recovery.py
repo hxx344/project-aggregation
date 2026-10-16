@@ -87,12 +87,13 @@ def _cancel(item, broker, persist, clock):
     return "terminal" if item["state"] == "terminal" else "waiting"
 
 
-def reconcile_order(item, broker, persist, *, now=None):
+def reconcile_order(item, broker, persist, *, now=None, allow_cancel=True):
     """Return terminal, waiting or reality without resending the original order.
 
     ``reality`` is only permission to obtain new complete positions/open orders.
     It never asserts that an unknown order was absent or filled, and leaves the
     caller responsible for persisting its independent reality resolution.
+    With allow_cancel=False, recovery only queries the existing order.
     """
     if item.get("resolution") == "positions_verified_unknown":
         return "reality"
@@ -130,7 +131,7 @@ def reconcile_order(item, broker, persist, *, now=None):
         return "waiting"
     if current < query_after:
         return "waiting"
-    if receipt and not item.get("cancel_requested") and current - sent_at >= CANCEL_SECONDS:
+    if allow_cancel and receipt and not item.get("cancel_requested") and current - sent_at >= CANCEL_SECONDS:
         return _cancel(item, broker, persist, clock)
     if count >= MAX_QUERIES:
         return "reality" if current - anchor >= OBSERVATION_SECONDS else "waiting"
@@ -153,6 +154,6 @@ def reconcile_order(item, broker, persist, *, now=None):
     if item["state"] == "terminal":
         return "terminal"
     current = _timestamp(clock())
-    if not item.get("cancel_requested") and current - sent_at >= CANCEL_SECONDS:
+    if allow_cancel and not item.get("cancel_requested") and current - sent_at >= CANCEL_SECONDS:
         return _cancel(item, broker, persist, clock)
     return "reality" if item[key] >= MAX_QUERIES and current - anchor >= OBSERVATION_SECONDS else "waiting"

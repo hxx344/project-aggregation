@@ -1,5 +1,12 @@
 import type { Account, PositionsDisplay } from './desk-types';
 import type { PairCycleCosts } from './pair-cost';
+import {
+  adlConfigurationLock,
+  adlStartBlock,
+  parseAdlConfig,
+  type AdlConfig,
+  type PairAdlState,
+} from './pair-adl.ts';
 import type {
   CycleExecutionQuality,
   CycleQualityHistory,
@@ -69,6 +76,7 @@ export type Pair = {
   enabled: boolean;
   revision?: number;
   pause_reason?: string;
+  adl?: AdlConfig;
   ordinary: {
     enabled: boolean;
     threshold: string;
@@ -89,6 +97,7 @@ export type Pair = {
     cooldown_seconds: number;
   };
   state?: {
+    adl?: PairAdlState;
     execution_quality?: CycleExecutionQuality | null;
     execution_quality_history?: CycleQualityHistory | null;
     phase?: string;
@@ -151,6 +160,8 @@ export type PairDraft = {
   max_transfer: string;
   buffer_percent: string;
   cooldown_seconds: string;
+  adl_enabled: boolean;
+  adl_batch_notional: string;
 };
 
 export function pairDraft(pair?: Pair): PairDraft {
@@ -186,6 +197,8 @@ export function pairDraft(pair?: Pair): PairDraft {
     max_transfer: pair?.margin.max_transfer ?? '1000',
     buffer_percent: percentFromMarginLimit(pair?.margin.buffer_ratio ?? '0.05'),
     cooldown_seconds: String(pair?.margin.cooldown_seconds ?? 30),
+    adl_enabled: pair?.adl?.enabled ?? true,
+    adl_batch_notional: pair?.adl?.batch_notional ?? '1000',
   };
 }
 
@@ -362,6 +375,7 @@ export function parsePairDraft(
     long_account_id: long.id,
     short_account_id: short.id,
     symbol,
+    adl: parseAdlConfig(draft.adl_enabled, draft.adl_batch_notional),
     ordinary: {
       enabled: draft.mode === 'ordinary',
       threshold,
@@ -397,8 +411,8 @@ export function parsePairDraft(
 export function pairConfigurationChanges(
   config: ReturnType<typeof parsePairDraft>,
 ) {
-  const { name, symbol, ordinary, cycle, margin } = config;
-  return { name, symbol, ordinary, cycle, margin };
+  const { name, symbol, ordinary, cycle, margin, adl } = config;
+  return { name, symbol, ordinary, cycle, margin, adl };
 }
 
 // Account display cadence does not describe pair snapshots or runtime health.
@@ -437,6 +451,8 @@ export function pairHasPending(pair: Pair): boolean {
   );
 }
 export function pairStartRecoveryBlock(pair: Pair): string {
+  const adlBlock = adlStartBlock(pair);
+  if (adlBlock) return adlBlock;
   // Starting funds management resumes its durable transfer checks; it never
   // resubmits a pending write or authorizes a strategy order.
   if (pairMarginOnly(pair)) return '';
@@ -479,6 +495,8 @@ export function pairMarginOnly(pair: Pair): boolean {
   );
 }
 export function pairConfigurationLock(pair: Pair): string {
+  const adlBlock = adlConfigurationLock(pair);
+  if (adlBlock) return adlBlock;
   if (pair.enabled) return '暂停配对组后可修改设置。';
   if (pairHasPending(pair)) return '订单或划转结果待核对，暂不能修改设置。';
   if (
@@ -495,6 +513,8 @@ export function pairDeletionBlock(
   offline = false,
 ): string {
   if (offline) return '连接恢复后可删除配对组';
+  const adlBlock = adlConfigurationLock(pair);
+  if (adlBlock) return adlBlock;
   if (pair.enabled) return '请先暂停配对组';
   if (pairHasPending(pair)) return '仍有订单或划转等待确认';
   const symbol = pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
@@ -611,6 +631,10 @@ export function pairPhaseLabel(phase?: string): string {
 }
 
 export function pairExecutionPhaseLabel(pair: Pair): string {
+  const adl = pair.state?.adl?.incident;
+  if (adl?.status === 'active') return 'ADL 应急处理中';
+  if (adl?.status === 'blocked') return 'ADL 处理受阻';
+  if (adl?.status === 'completed' && adl.hold) return 'ADL 处理完成 · 保持暂停';
   return pair.state?.phase === 'reconciling' &&
     pair.state.pending?.kind === 'leverage'
     ? PAIR_PHASES.leverage

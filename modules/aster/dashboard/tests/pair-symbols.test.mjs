@@ -233,6 +233,7 @@ test('switching a saved pair preserves all settings and PATCH excludes its ident
       ordinary: saved.ordinary,
       cycle: { ...saved.cycle, symbol: 'XAGUSD1' },
       margin: saved.margin,
+      adl: saved.adl,
     });
     assert.equal(parsed.id, saved.id);
     assert.equal(parsed.long_account_id, saved.long_account_id);

@@ -5,6 +5,8 @@ import json
 import math
 import time
 
+from .adl_config import validate_adl
+
 CATEGORY = "adl"
 MAX_MESSAGE_CHARS = 3000
 PHASE_TITLES = {"detected": "已确认", "blocked": "处理受阻", "completed": "补平完成"}
@@ -220,16 +222,22 @@ def format_messages(incident, phase, reason=None):
     if phase not in PHASE_TITLES:
         raise ValueError("Unsupported ADL notification phase")
     title = "ASTER ADL " + PHASE_TITLES[phase]
+    config = validate_adl(incident.get("config"))
     symbols, accounts = _symbols(incident), _accounts(incident)
     lines = [f"事件：{_text(incident.get('id'))}；配对组「{_text(incident.get('pair_name'))}」"
              f"({_text(incident.get('pair_id'))})",
-             f"开始时间（UTC）：{_timestamp(incident.get('created_at'))}"]
+             f"开始时间（UTC）：{_timestamp(incident.get('created_at'))}",
+             f"本次自动减仓：{'开启' if config['enabled'] else '关闭'}；"
+             f"单批名义金额上限：{config['batch_notional']}（合约计价币，按现场标记价计算）"]
     if incident.get("parent_id"):
         lines.append("关联前次事件：" + _text(incident["parent_id"]))
     if phase == "detected":
-        lines.append("已确认交易所 ADL 自动减仓；核对现场后，将按实际多空残差分批减去多余持仓。")
+        lines.append("已确认交易所 ADL 自动减仓；核对现场后，将按实际多空残差分批减去多余持仓。"
+                     if config["enabled"] else
+                     "已确认交易所 ADL 自动减仓；本次自动减仓已关闭，策略保持暂停，仅核实持仓并等待手工平衡。")
     elif phase == "blocked":
-        lines.append("自动分批减仓受阻；失败或结果未知的批次需核对。")
+        lines.append("自动分批减仓受阻；失败或结果未知的批次需核对。" if config["enabled"] else
+                     "本次自动减仓已关闭；仅核实持仓和原订单，不自动下单或撤单，等待手工平衡。")
     else:
         lines.append(f"完成时间（UTC）：{_timestamp(incident.get('completed_at'))}")
         orders = _rows(incident.get("prior_orders")) + _rows(incident.get("batches"))

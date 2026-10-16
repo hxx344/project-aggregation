@@ -76,6 +76,9 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
   const pairBound = Boolean(account?.pair_id);
   const pairProps = {
     pairs: state?.pairs,
+    notification: state?.notification,
+    feishuEnabled: state?.monitoring?.settings.feishu_enabled,
+    onNotificationSettings: () => setWorkspace('monitoring'),
     accounts: state?.accounts ?? [],
     events: state?.events ?? [],
     busy,

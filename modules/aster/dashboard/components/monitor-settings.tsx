@@ -102,6 +102,11 @@ export function MonitorSettings({
           onChange={(value) => void save({ auto_monitor_new: value })}
         />
       </div>
+      <p className="muted">
+        ADL
+        初报、受阻告警与处理报告使用飞书事件机器人，受飞书通知总开关控制。自动减仓和单批金额在“两子账户配对
+        → ADL 设置”中配置。
+      </p>
       {!settings.monitoring_enabled || !settings.feishu_enabled || demo ? (
         <p className="monitor-status amber">
           {demo ? (

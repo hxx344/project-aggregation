@@ -309,6 +309,19 @@ class PairCycleEdit(CycleEdit):
     symbol: PairSymbol | None = None
 
 
+class PairAdlEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool | None = None
+    batch_notional: str | None = Field(default=None, max_length=40)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_values(cls, values):
+        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
+            raise ValueError("请提供非空的 ADL 配置")
+        return values
+
+
 class NewPair(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     id: str = Field(min_length=1, max_length=32)
@@ -320,6 +333,14 @@ class NewPair(BaseModel):
     ordinary: PairOrdinaryEdit | None = None
     cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None
+    adl: PairAdlEdit | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_adl_object(cls, values):
+        if isinstance(values, dict) and "adl" in values and values["adl"] is None:
+            raise ValueError("ADL 配置必须为对象")
+        return values
 
 
 class PairEdit(BaseModel):
@@ -329,6 +350,7 @@ class PairEdit(BaseModel):
     ordinary: PairOrdinaryEdit | None = None
     cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None
+    adl: PairAdlEdit | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -503,6 +525,17 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     @app.get("/api/pairs/supported-symbols", dependencies=[Depends(authenticated)])
     def pair_symbols():
         return {"symbols": supported_symbols_list()}
+
+    @app.get("/api/pairs/{pair_id}/adl-report", dependencies=[Depends(authenticated)])
+    def pair_adl_report(pair_id: str):
+        from .adl_view import report_view
+        with engine.store.read_snapshot() as reader:
+            if reader.pair(pair_id) is None:
+                raise HTTPException(404, "配对组不存在")
+            report = report_view(reader, pair_id)
+            if report is None:
+                raise HTTPException(404, "该配对组暂无 ADL 处理报告")
+            return report
 
     @app.post("/api/pairs", dependencies=write_dependencies)
     def create_pair(body: NewPair):

@@ -17,9 +17,10 @@ import time
 import uuid
 
 from . import adl_events, adl_exchange, adl_notifications
+from .adl_config import validate_adl
 from .exchange import ExchangeError, AmbiguousOrder, RequestNotSent, ORDER_REJECTION_CODES
 from .execution import Executor, TERMINAL
-from .models import TradingError, dec, floor_step, wire
+from .models import TradingError, dec, floor_step, positive, wire
 from .store import dumps
 
 SCAN_SECONDS = 60
@@ -109,8 +110,9 @@ def imbalances(snapshots, symbols):
     return result
 
 
-def plan_reduction(snapshots, symbols, rules):
+def plan_reduction(snapshots, symbols, rules, batch_notional=BATCH_NOTIONAL):
     """Pick one strictly reducing batch; never round across equality."""
+    batch_notional = positive(batch_notional, field="ADL 单批金额上限")
     for symbol in sorted(symbols):
         holdings = [(aid, p) for aid, snapshot in snapshots.items() for p in snapshot.positions if p.symbol == symbol]
         totals = {side: sum((Fraction(p.quantity) for _, p in holdings if p.side == side), Fraction(0)) for side in ("LONG", "SHORT")}
@@ -121,9 +123,12 @@ def plan_reduction(snapshots, symbols, rules):
         rule = rules[symbol]
         candidates = sorted(((aid, p) for aid, p in holdings if p.side == direction),
                             key=lambda item: (-item[1].quantity, item[0], item[1].position_side))
+        cap_blocked = False
         for aid, position in candidates:
-            # A single valid lot can exceed the nominal monetary batch limit.
-            cap = max(Fraction(BATCH_NOTIONAL) / Fraction(position.mark), Fraction(rule.min_qty), Fraction(rule.step))
+            # Never enlarge a batch to meet the exchange's minimum order size.
+            # The hard nominal cap uses this freshly verified position mark.
+            cap = Fraction(batch_notional) / Fraction(position.mark)
+            cap_blocked = cap_blocked or floor_step(cap, rule.step) < rule.min_qty
             qty = floor_step(min(abs(excess), Fraction(position.quantity), Fraction(rule.max_qty), cap), rule.step)
             if qty < rule.min_qty:
                 continue
@@ -134,6 +139,9 @@ def plan_reduction(snapshots, symbols, rules):
                 order["reduceOnly"] = "true"
             return {"account_id": aid, "order": order, "position_before": wire(position.quantity),
                     "direction": direction, "excess_before": wire(abs(excess))}
+        if cap_blocked:
+            raise TradingError(f"{symbol} 单批金额上限 {wire(batch_notional)} {rule.quote_asset} "
+                               "不足以满足最小市价数量或步长，已停止减仓并保留现场")
         raise TradingError(f"{symbol} 剩余差额 {wire(abs(excess))} 小于可执行市价数量，已停止减仓并保留现场")
     return None
 
@@ -238,6 +246,8 @@ class AdlController:
                 if not any(start <= candidate[0] and finish >= candidate[1] for start, finish in windows):
                     windows.append(candidate)
             scan.update(target_ms=end, windows=windows)
+        scan["attempt_at"] = now
+        self.store.put(key, scan)
         with broker.reconciliation_budget():
             result = adl_events.scan_force_orders(broker.api, scan["windows"], request_limit=2)
         if self.store.account(aid) != account or self.engine.broker(account) is not broker or _owner(broker) != owner:
@@ -251,6 +261,8 @@ class AdlController:
                         retry_at=now + max(result.get("retry_after", 0), 10 if result.get("error") or result.get("blocked") else 1))
             if not scan["windows"]:
                 scan["cursor_ms"] = scan["target_ms"]
+                if not scan["error"]:
+                    scan["checked_at"] = time.time()
             _put(db, key, scan)
         with self.lock:
             if not scan["windows"]:
@@ -305,6 +317,7 @@ class AdlController:
         return by_id, by_broker, identities
 
     def _save(self, incident, *, phase=None):
+        incident["config"] = validate_adl(incident.get("config"))
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             _put(db, "adl_pair:" + incident["pair_id"], incident)
@@ -316,12 +329,13 @@ class AdlController:
         incident = {"id": uuid.uuid4().hex, "pair_id": pair["id"], "pair_name": pair["name"],
                     "status": "active", "hold": True, "created_at": time.time(), "events": [], "symbols": [],
                     "accounts": deepcopy(accounts), "identities": identities, "before": {}, "after": {}, "batches": [],
+                    "config": validate_adl(pair.get("adl")),
                     "strategy_status": "保持暂停", "reason": "已确认 ADL 成交，正在读取两个账户的真实现场"}
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             runtime = _get(db, "pair_runtime:" + pair["id"], {})
             incident["frozen_runtime"] = deepcopy(runtime)
-            saved = self.store._save_pair(db, {**pair, "enabled": False, "pause_reason": "ADL 应急减仓，完成后保持暂停"})
+            saved = self.store._save_pair(db, {**pair, "enabled": False, "pause_reason": "ADL 已确认，核实持仓后保持暂停"})
             incident["revision"] = saved["revision"]
             self._include(incident, records)
             _put(db, "adl_pair:" + pair["id"], incident)
@@ -371,7 +385,8 @@ class AdlController:
 
     def _settle(self, incident, item, broker):
         from .adl_recovery import reconcile_order
-        result = reconcile_order(item, broker, lambda: self._save(incident))
+        result = reconcile_order(item, broker, lambda: self._save(incident),
+                                 allow_cancel=validate_adl(incident.get("config"))["enabled"])
         item["reconciliation_phase"] = result
         self._save(incident)
         return result != "waiting"
@@ -462,7 +477,7 @@ class AdlController:
                 pair, incident = self._begin(pair, records, accounts, identities)
                 incident.update(parent_id=previous["id"],
                     prior_orders=deepcopy([item for item in self._order_items(previous) if item.get("resolution")]),
-                    reason="暂停观察期间再次出现净差，正在重新确认并分批减去多余仓位")
+                    reason="暂停观察期间再次出现净差，正在重新核实实际持仓")
                 self._save(incident)
                 return pair, incident, True
             incident["reason"] = "ADL 已按实际仓位完成平衡；原订单结果仍有未知，保持暂停并观察迟到持仓变化"
@@ -478,6 +493,8 @@ class AdlController:
         return pair, incident, False
 
     def _send(self, pair, incident, accounts, brokers, snapshots, batch):
+        if not validate_adl(incident.get("config"))["enabled"]:
+            raise TradingError("自动减仓已关闭，仅核实持仓并等待手工平衡")
         aid = batch["account_id"]
         batch.update(account_name=accounts[aid]["name"], sent_at=time.time(), state="sending")
         incident["batches"].append(batch)
@@ -545,7 +562,7 @@ class AdlController:
                 runtime = _get(db, "pair_runtime:" + pair["id"], {})
                 runtime.update(owned=owned, pending=None, symbol=pair["symbol"], identities=incident["identities"],
                                progress=empty_progress(owned, (runtime.get("progress") or {}).get("completed_cycles", 0)),
-                               phase="paused", reason="ADL 应急减仓完成，多空总数量已一致；策略保持暂停，请核对后手动启动",
+                               phase="paused", reason="ADL 持仓核实完成，多空总数量已一致；策略保持暂停，请核对后手动启动",
                                updated_at=time.time())
                 runtime.pop("attention", None)
                 incident.update(status="completed", completed_at=time.time(), reason=runtime["reason"], hold=True,
@@ -599,6 +616,8 @@ class AdlController:
         else:
             self._include(incident, records)
         try:
+            config = validate_adl(incident.get("config"))
+            incident["config"] = config
             if time.time() < incident.get("retry_at", 0):
                 return self._runtime(pair, incident)
             self._guard(pair, incident, accounts, brokers)
@@ -626,8 +645,6 @@ class AdlController:
             incident["after"] = scene_json(accounts, snapshots)
             require_adl_reflected(incident, snapshots)
             self._guard(pair, incident, accounts, brokers, snapshots)
-            if any(not snapshot.can_trade for snapshot in snapshots.values()):
-                raise TradingError("ADL 账户没有交易权限，已保存现场")
             self._reality(incident, snapshots)
             if incident["batches"]:
                 last = incident["batches"][-1]
@@ -649,12 +666,17 @@ class AdlController:
                                   if p.symbol == last["order"]["symbol"] and p.position_side == last["order"]["positionSide"] and p.side == last["direction"]), Fraction(0))
                     if not reflected and actual > Fraction(dec(last["position_before"])) - Fraction(filled):
                         raise TradingError("成交回执尚未反映在真实持仓，等待新的现场，禁止继续减仓")
-            rules = {symbol: adl_exchange.reduction_rule(self.engine.market, symbol)
-                     for symbol in imbalances(snapshots, incident["symbols"])}
-            batch = plan_reduction(snapshots, incident["symbols"], rules)
-            if batch is None:
+            residuals = imbalances(snapshots, incident["symbols"])
+            if not residuals:
                 self._complete(pair, incident, accounts, brokers, snapshots)
                 return self._runtime(pair, incident)
+            if not config["enabled"]:
+                self._blocked(incident, "自动减仓已关闭；配对策略保持暂停，仅核实实际持仓并等待手工平衡")
+                return self._runtime(pair, incident)
+            if any(not snapshot.can_trade for snapshot in snapshots.values()):
+                raise TradingError("ADL 账户没有交易权限，已保存现场")
+            rules = {symbol: adl_exchange.reduction_rule(self.engine.market, symbol) for symbol in residuals}
+            batch = plan_reduction(snapshots, incident["symbols"], rules, config["batch_notional"])
             if incident.get("halted"):
                 return self._runtime(pair, incident)
             if incident["batches"] and incident["batches"][-1].get("rejected"):

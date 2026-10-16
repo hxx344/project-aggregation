@@ -2508,6 +2508,57 @@ label input,
   max-height: min(90dvh, 980px);
   overflow-y: auto;
 }
+.pair-adl-panel p {
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.pair-adl-panel > :not(.section-head) {
+  margin-left: 22px;
+  margin-right: 22px;
+}
+.pair-adl-panel > .pair-adl-notification {
+  margin-bottom: 18px;
+}
+.pair-adl-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 16px;
+  margin: 16px 0;
+}
+.pair-adl-summary > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pair-adl-incident {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.pair-adl-notification {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.pair-adl-report {
+  max-width: 800px !important;
+  max-height: 90dvh;
+  overflow-y: auto;
+}
+.pair-adl-report-content {
+  min-width: 0;
+}
+.pair-adl-report-content pre {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
 .pair-delete-content {
   padding: 0 22px 22px;
 }
@@ -2516,6 +2567,10 @@ label input,
   margin: 0 0 12px;
 }
 @media (max-width: 640px) {
+  .pair-adl-panel > :not(.section-head) {
+    margin-left: 16px;
+    margin-right: 16px;
+  }
   .pair-sides {
     grid-template-columns: minmax(0, 1fr);
   }

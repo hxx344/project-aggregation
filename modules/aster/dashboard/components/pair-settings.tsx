@@ -41,7 +41,7 @@ export function PairSettings({
   const field = <K extends keyof PairDraft>(key: K, value: PairDraft[K]) =>
     setDraft({ ...draft, [key]: value });
   const textField = (
-    key: Exclude<keyof PairDraft, 'cycle' | 'margin_enabled'>,
+    key: Exclude<keyof PairDraft, 'cycle' | 'margin_enabled' | 'adl_enabled'>,
   ) => ({
     value: draft[key],
     onValueChange: (value: string) => setDraft({ ...draft, [key]: value }),
@@ -171,6 +171,38 @@ export function PairSettings({
             ['cycle', '两子账户多空循环'],
           ]}
         />
+      </fieldset>
+      <fieldset disabled={locked} className="cycle-form-grid pair-adl-settings">
+        <legend>ADL 应急处理</legend>
+        <div className="migration-toggle">
+          <label htmlFor={`${formId}-pair-adl-enabled`}>ADL 后自动减仓</label>
+          <Switch
+            id={`${formId}-pair-adl-enabled`}
+            checked={draft.adl_enabled}
+            disabled={locked}
+            onCheckedChange={(enabled) => field('adl_enabled', enabled)}
+          />
+        </div>
+        <ConfigurationField
+          id={`${formId}-pair-adl-batch`}
+          label="ADL 单批名义金额上限"
+          unit="各合约计价币种"
+          type="text"
+          inputMode="decimal"
+          min="1"
+          max="1000000"
+          maxLength={40}
+          {...textField('adl_batch_notional')}
+          disabled={locked}
+        >
+          <small>
+            每批按现场标记价折算，实际成交金额随市价变化；不足最小合法一手时停止并提示。
+          </small>
+        </ConfigurationField>
+        <p className="muted">
+          监测两账户全部原生合约，包含手工仓位。关闭自动减仓后仍监测、暂停策略并告警，等待手工处理；关闭时不下单或撤单。
+          设置保存后生效，事件发生时固定本次配置；处理完成后保持暂停。
+        </p>
       </fieldset>
       {draft.mode === 'ordinary' ? (
         <fieldset disabled={locked} className="cycle-form-grid">

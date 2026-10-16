@@ -123,6 +123,7 @@ test('pair requests preserve decimal strings and fixed roles without enabling th
   assert.equal(Object.hasOwn(config, 'enabled'), false);
   assert.equal(typeof config.margin.check_interval_seconds, 'number');
   assert.deepEqual(Object.keys(pairConfigurationChanges(config)).sort(), [
+    'adl',
     'cycle',
     'margin',
     'name',

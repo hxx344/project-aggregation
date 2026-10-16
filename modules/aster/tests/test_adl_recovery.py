@@ -218,6 +218,24 @@ class ADLRecoveryTests(unittest.TestCase):
         self.assertEqual(self.item["post_cancel_queries"], 3)
         self.assertEqual(len(broker.calls), 5)
 
+    def test_cancel_disabled_keeps_known_active_order_read_only_through_bounded_recovery(self):
+        self.item["receipt"] = self.receipt()
+        broker = Broker([self.receipt(), self.receipt(), self.receipt()])
+        for at in (1011, 1013, 1015):
+            self.assertEqual(reconcile_order(self.item, broker, self.persist, now=at, allow_cancel=False), "waiting")
+            self.restart()
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1120, allow_cancel=False), "reality")
+        self.assertEqual([call[0] for call in broker.calls], ["query"] * 3)
+        self.assertNotIn("cancel_requested", self.item)
+        self.assertEqual(self.item["state"], "sending")
+        self.assertEqual(self.item["receipt"]["status"], "NEW")
+
+    def test_cancel_disabled_does_not_write_after_first_late_active_query(self):
+        broker = Broker([self.receipt()])
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1011, allow_cancel=False), "waiting")
+        self.assertEqual([call[0] for call in broker.calls], ["query"])
+        self.assertNotIn("cancel_requested", self.saved())
+
     def test_cancel_proven_not_sent_can_retry_without_resetting_original_observation_window(self):
         self.item["receipt"] = self.receipt()
         broker = Broker(cancellations=[RequestNotSent("private cancellation budget"), self.receipt("CANCELED")])

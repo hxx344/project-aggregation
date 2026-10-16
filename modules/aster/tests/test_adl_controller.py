@@ -78,6 +78,18 @@ class ReductionPlanTests(unittest.TestCase):
         self.assertEqual(dec(planned["order"]["quantity"]), Decimal("1e-30"))
         self.assertEqual((planned["order"]["positionSide"], planned["order"]["side"]), ("SHORT", "BUY"))
 
+    def test_configured_notional_limit_is_exact_and_never_overridden_by_minimum_lot(self):
+        snapshots = {"a": SimpleNamespace(positions=(position("LONG", "3", mark="333"),)),
+                     "b": SimpleNamespace(positions=(position("SHORT", "1", mark="333"),))}
+        planned = adl.plan_reduction(snapshots, [SYMBOL], {SYMBOL: rule()}, "100")
+        self.assertEqual(dec(planned["order"]["quantity"]), dec("0.3"))
+        self.assertLessEqual(dec(planned["order"]["quantity"]) * dec("333"), dec("100"))
+        for limit in ("1", "33.299999999999999999999999999999"):
+            with self.subTest(limit=limit), self.assertRaisesRegex(TradingError, "单批金额上限.*最小市价数量"):
+                adl.plan_reduction(snapshots, [SYMBOL], {SYMBOL: rule()}, limit)
+        edge = adl.plan_reduction(snapshots, [SYMBOL], {SYMBOL: rule()}, "33.3")
+        self.assertEqual(dec(edge["order"]["quantity"]), dec("0.1"))
+
 
 class AdlControllerTests(unittest.TestCase):
     def setUp(self):
@@ -212,6 +224,163 @@ class AdlControllerTests(unittest.TestCase):
             self.assertEqual(persisted["batches"][-1]["state"], "sending")
             self.assertEqual(sent["order"]["symbol"], SYMBOL)
             self.assertNotIn("reduceOnly", sent["order"])
+
+    def test_configured_cap_is_frozen_for_the_incident_and_survives_restart(self):
+        self.store.save_pair({**self.store.pair("pair"), "adl": {"enabled": True, "batch_notional": "250"}})
+        self.observe()
+        self.tick()
+        self.assertEqual(self.state()["config"], {"enabled": True, "batch_notional": "250"})
+        self.assertEqual(dec(self.sent[0]["order"]["quantity"]), dec("0.2"))
+        self.controller = adl.AdlController(self.engine)
+        # A freshly read pair object cannot replace an existing incident policy.
+        pair = {**self.store.pair("pair"), "adl": {"enabled": False, "batch_notional": "1000"}}
+        self.now += 1
+        self.controller.tick(pair)
+        self.assertEqual(dec(self.sent[1]["order"]["quantity"]), dec("0.2"))
+        self.assertEqual(self.state()["config"], {"enabled": True, "batch_notional": "250"})
+
+    def test_disabled_automatic_reduction_still_pauses_reports_and_can_complete_after_manual_balance(self):
+        config = {"enabled": False, "batch_notional": "125"}
+        self.store.save_pair({**self.store.pair("pair"), "adl": config})
+        self.observe()
+        with patch("trading.adl.adl_exchange.reduction_rule") as rules:
+            self.tick()
+            self.assertEqual(self.state()["config"], config)
+            self.assertEqual(self.state()["status"], "blocked")
+            self.assertIn("自动减仓已关闭", self.state()["reason"])
+            self.assertFalse(self.store.pair("pair")["enabled"])
+            self.assertEqual(self.sent, [])
+            self.assertTrue(all(not broker.cancel.called for broker in self.brokers.values()))
+            self.assertTrue(self.state()["before"])
+            with self.store.connect() as db:
+                reports = [row[0] for row in db.execute("SELECT message FROM outbox WHERE category='adl'")]
+            self.assertTrue(any("ADL 已确认" in report for report in reports))
+            self.assertTrue(any("自动减仓：关闭" in report for report in reports))
+            self.tick(adl.MAX_SECONDS + 1)
+            self.assertFalse(self.state().get("halted", False))
+            self.holdings["b"] = [position("SHORT", "2")]
+            self.controller = adl.AdlController(self.engine)
+            original_snapshot = self.snapshot
+            with patch("trading.adl.adl_exchange.reduction_snapshot",
+                       side_effect=lambda broker: replace(original_snapshot(broker), can_trade=False)):
+                self.tick(10)
+            self.assertEqual(self.state()["status"], "completed")
+            self.assertTrue(self.state()["hold"])
+            self.assertEqual(self.sent, [])
+            rules.assert_not_called()
+
+    def test_disabled_automatic_reduction_queries_old_orders_without_cancel_and_preserves_unknown(self):
+        self.store.save_pair({**self.store.pair("pair"), "adl": {"enabled": False}})
+        runtime = self.archived_runtime()
+        for batch in runtime["recovery_watch"]["batches"]:
+            for leg in batch["legs"]:
+                leg["receipt"] = receipt(leg["order"], "0", status="NEW")
+        self.store.put("pair_runtime:pair", runtime)
+        self.query_visible = False
+        self.observe()
+        self.tick()
+        self.tick(2)
+        self.tick(2)
+        started = self.state()["created_at"]
+        self.controller = adl.AdlController(self.engine)
+        self.now = started + 120
+        self.tick()
+        self.assertEqual(self.state()["status"], "blocked")
+        self.assertIn("自动减仓已关闭", self.state()["reason"])
+        self.assertEqual(self.sent, [])
+        for broker in self.brokers.values():
+            self.assertEqual(broker.query.call_count, 3)
+            broker.cancel.assert_not_called()
+        for item in self.state()["prior_orders"]:
+            self.assertEqual(item["resolution"], "positions_verified_unknown")
+            self.assertEqual(item["state"], "sending")
+            self.assertEqual(item["receipt"]["status"], "NEW")
+        self.holdings["b"] = [position("SHORT", "2")]
+        self.tick(10)
+        self.assertEqual(self.state()["status"], "completed")
+        self.assertTrue(self.state()["watch_unknown"])
+
+    def test_legacy_incident_without_config_retains_default_execution_policy(self):
+        self.observe()
+        self.tick()
+        legacy = self.state()
+        legacy.pop("config")
+        self.store.put("adl_pair:pair", legacy)
+        self.controller = adl.AdlController(self.engine)
+        self.tick(1)
+        self.assertEqual(self.state()["status"], "completed")
+        self.assertEqual(self.state()["config"], {"enabled": True, "batch_notional": "1000"})
+
+    def test_smaller_than_minimum_notional_cap_blocks_without_sending_and_manual_balance_finishes(self):
+        self.store.save_pair({**self.store.pair("pair"), "adl": {"batch_notional": "99.99"}})
+        self.observe()
+        self.tick()
+        self.assertEqual(self.state()["status"], "blocked")
+        self.assertIn("单批金额上限 99.99 USDT", self.state()["reason"])
+        self.assertEqual(self.sent, [])
+        self.holdings["b"] = [position("SHORT", "2")]
+        self.tick(10)
+        self.assertEqual(self.state()["status"], "completed")
+
+    def test_scan_health_only_advances_after_complete_success_and_keeps_real_attempt_time(self):
+        account = self.store.account("a")
+        key = f"adl_scan:pair:a:{adl._owner(self.brokers['a'])}"
+        complete = {"events": [], "remaining": [], "error": None, "blocked": None, "retry_after": 0}
+
+        def finish_success(*args, **kwargs):
+            self.assertEqual(self.store.get(key)["attempt_at"], self.now)
+            self.now += 2
+            return deepcopy(complete)
+
+        with patch("trading.adl.adl_events.scan_force_orders", side_effect=finish_success):
+            self.controller.poll(account)
+        saved = self.store.get(key)
+        self.assertEqual(saved["attempt_at"], 1000)
+        self.assertEqual(saved["checked_at"], 1002)
+        self.now = 1003
+        with patch("trading.adl.adl_events.scan_force_orders") as scan:
+            self.controller.poll(account)
+            scan.assert_not_called()
+        self.assertEqual(self.store.get(key), saved)
+
+        self.now = 1060
+        failed = {**complete, "remaining": [[1000000, 1060000]], "error": "历史查询失败"}
+        with patch("trading.adl.adl_events.scan_force_orders", return_value=failed):
+            self.controller.poll(account)
+        failed_saved = self.store.get(key)
+        self.assertEqual(failed_saved["checked_at"], 1002)
+        self.assertEqual(failed_saved["attempt_at"], 1060)
+        self.assertEqual(failed_saved["error"], "历史查询失败")
+        self.controller = adl.AdlController(self.engine)
+        self.now = 1069
+        with patch("trading.adl.adl_events.scan_force_orders") as scan:
+            self.controller.poll(account)
+            scan.assert_not_called()
+        self.assertEqual(self.store.get(key), failed_saved)
+
+        self.now = 1070
+        partial = {**complete, "remaining": [[1030000, 1060000]]}
+        with patch("trading.adl.adl_events.scan_force_orders", return_value=partial):
+            self.controller.poll(account)
+        self.assertEqual(self.store.get(key)["checked_at"], 1002)
+        self.assertEqual(self.store.get(key)["attempt_at"], 1070)
+        self.now = 1071
+        with patch("trading.adl.adl_events.scan_force_orders", side_effect=finish_success):
+            self.controller.poll(account)
+        self.assertEqual(self.store.get(key)["checked_at"], 1073)
+        self.assertEqual(self.store.get(key)["attempt_at"], 1071)
+        self.assertIsNone(self.store.get(key)["error"])
+
+    def test_first_incomplete_or_blocked_scan_never_claims_successful_health(self):
+        account = self.store.account("a")
+        key = f"adl_scan:pair:a:{adl._owner(self.brokers['a'])}"
+        result = {"events": [], "remaining": [[1000000, 1000000]], "error": None,
+                  "blocked": "最小时间窗仍满页", "retry_after": 0}
+        with patch("trading.adl.adl_events.scan_force_orders", return_value=result):
+            self.controller.poll(account)
+        self.assertNotIn("checked_at", self.store.get(key))
+        self.assertEqual(self.store.get(key)["attempt_at"], 1000)
+        self.assertEqual(self.store.get(key)["error"], "最小时间窗仍满页")
 
     def test_unknown_result_is_never_resent_and_restart_queries_original_client_id(self):
         self.submit_unknown = True

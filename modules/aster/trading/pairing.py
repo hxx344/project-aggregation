@@ -9,6 +9,7 @@ import threading
 import time
 
 from .cycle import validate_cycle
+from .adl_config import validate_adl
 from .exchange import LiveBroker
 from .margin_balance import DEFAULT_MARGIN, validate_margin
 from .models import AccountModeError, TradingError, dec, positive, wire
@@ -17,7 +18,7 @@ from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, get_symbol_con
 DEFAULT_ORDINARY = {"enabled": False, "threshold": "10000", "order_notional": "1000",
                     "min_open_leverage": 5, "margin_limit": "0.5", "spread_limit": "0.0005"}
 PAIR_FIELDS = {"id", "name", "long_account_id", "short_account_id", "symbol", "enabled",
-               "ordinary", "cycle", "margin", "revision", "pause_reason"}
+               "ordinary", "cycle", "margin", "adl", "revision", "pause_reason"}
 
 
 def _decimal_fields(config, keys):
@@ -75,7 +76,9 @@ def validate_pair(value):
     if ordinary["enabled"] and cycle["enabled"]:
         raise TradingError("同一配对组不能同时启用普通加仓和独立循环")
     margin = validate_margin(margin)
-    pair.update(ordinary=ordinary, cycle=cycle, margin=margin)
+    if "adl" in pair and not isinstance(pair["adl"], dict):
+        raise TradingError("ADL 配置必须为对象")
+    pair.update(ordinary=ordinary, cycle=cycle, margin=margin, adl=validate_adl(pair.get("adl", {})))
     return pair
 
 
@@ -284,7 +287,7 @@ class PairManager:
         previous = self.store.pair(pair_id)
         if not previous:
             raise TradingError("配对组不存在")
-        if not isinstance(changes, dict) or not changes or set(changes) - {"name", "symbol", "ordinary", "cycle", "margin"}:
+        if not isinstance(changes, dict) or not changes or set(changes) - {"name", "symbol", "ordinary", "cycle", "margin", "adl"}:
             raise TradingError("仅可修改组名称、交易标的及策略配置，账户方向固定")
         with self.locked(previous):
             pair = self.store.pair(pair_id)
@@ -298,7 +301,7 @@ class PairManager:
                 elif not isinstance(value, dict) or not value:
                     raise TradingError("请提供有效的配对策略配置")
                 else:
-                    updated[key] = {**updated[key], **value}
+                    updated[key] = {**updated.get(key, {}), **value}
             switching = updated["symbol"] != pair["symbol"]
             if switching and "symbol" not in changes.get("cycle", {}):
                 updated["cycle"]["symbol"] = updated["symbol"]
@@ -639,6 +642,7 @@ class PairManager:
             self._changed(pair)
 
     def states(self, reader=None):
+        from .adl_view import status_view as adl_status_view
         from .pair_quality import read as read_quality
         from .pair_cost import read as read_cost
         from .margin_balance import MarginBalancer
@@ -651,6 +655,7 @@ class PairManager:
                      "updated_at": None, "snapshots": {}, "progress": None, "pending": None, **runtime}
             state["margin"] = MarginBalancer.status_view(pair,
                 reader.get("pair_margin:" + pair["id"], {}), state.get("margin"))
+            state["adl"] = adl_status_view(self.engine, reader, pair, runtime)
             state.update(read_quality(reader, pair["id"], runtime))
             try:
                 state["cycle_costs"] = read_cost(reader, pair, runtime)
@@ -658,7 +663,7 @@ class PairManager:
                 # Display-derived history must never disrupt execution or the
                 # rest of the dashboard, nor publish fabricated zero expenses.
                 state["cycle_costs"] = None
-            rows.append({**pair, "state": state})
+            rows.append({**pair, "adl": validate_adl(pair.get("adl")), "state": state})
         return rows
 
     def active_for_account(self, account_id):
