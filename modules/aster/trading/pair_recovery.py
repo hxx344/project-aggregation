@@ -21,6 +21,8 @@ MIN_AGE = 120
 PREVIEW_TTL = 300
 MAX_WATCH_BATCHES = 8  # Active index size, not an admission cap on durable archives.
 MIN_QUERY_ATTEMPTS = 3
+REALITY_RETRY_SECONDS = 30
+REALITY_RETRY_MAX_SECONDS = 60
 
 
 def record_query_attempt(record, error=None):
@@ -32,6 +34,11 @@ def record_query_attempt(record, error=None):
 
 
 def recovery_ready(pending):
+    if any(isinstance(leg.get("receipt"), dict) and leg["receipt"].get("status") not in TERMINAL
+           for leg in pending.get("legs", []) + pending.get("repairs", [])):
+        # A positive active receipt remains unresolved even after three reads
+        # or a previously persisted positions stage. Query that original ID.
+        return False
     if pending.get("kind") == "leverage" or pending.get("terminal_position_recovery"):
         records = [pending]
     else:
@@ -152,10 +159,11 @@ def _commit_runtime(engine, pair, runtime, *, expected, margin, accounts, identi
             db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
 
 
-def _safe_reality(engine, pair, state, *, reconciliation=True):
+def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=False):
     from .pair_planning import positions, PairPositionError
     from .pair_execution import PairTrader
-    snapshots, guards = engine.pairs._read_members(pair, adopt=True, reconciliation=reconciliation, runtime=state)
+    snapshots, guards = engine.pairs._read_members(pair, adopt=True, reconciliation=reconciliation, runtime=state,
+                                                 market_recovery=market_recovery)
     held = positions(snapshots, pair["symbol"])
     leverage = held["LONG"].leverage
     require_supported_leverage(leverage)
@@ -373,6 +381,46 @@ class PairOrderRecovery:
         self.baseline_previews = {}
 
     def adopt_unknown(self, trader, pair, state):
+        """Throttle full reality checks across automatic/manual calls and restarts."""
+        from .pair_planning import PairRecoveryConflict, PairPositionError
+        pending = state["pending"]
+        if not recovery_ready(pending):
+            return False
+        gate = pending["bounded_recovery"]
+        now = time.time()
+        deadline, attempted = gate.get("next_check_at", 0), gate.get("attempted_at", 0)
+        if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+               for value in (deadline, attempted)):
+            raise TradingError("现实核验重试时间无效，保留原批次")
+        # A backwards clock must not freeze a durable deadline indefinitely.
+        # Restart the whole saved delay so quota/cooldown waits are not shortened.
+        if now < attempted:
+            gate["attempted_at"] = now
+            deadline = gate["next_check_at"] = now + max(REALITY_RETRY_SECONDS, deadline - attempted)
+        if now < deadline:
+            state.update(phase=gate.get("phase", "reconciling"),
+                         reason=gate.get("reason", "等待下一次完整账户现实核验，保留原批次与上次持仓时间"),
+                         api_notice=deepcopy(gate.get("api_notice")))
+            state["retry_after"] = max(state.get("retry_after", 0), deadline - now)
+            return False
+        try:
+            return self._adopt_unknown(trader, pair, state)
+        except PairRecoveryConflict:
+            raise
+        except TradingError as exc:
+            failures = min(2, max(0, gate.get("failure_count", 0)) + 1)
+            delay = min(REALITY_RETRY_MAX_SECONDS, REALITY_RETRY_SECONDS * failures)
+            requested = getattr(exc, "retry_after", 0)
+            if type(requested) in (int, float) and math.isfinite(requested):
+                delay = max(delay, requested)
+            gate.update(attempted_at=time.time(), next_check_at=time.time() + delay,
+                        failure_count=failures, reason=exchange_reason(str(exc)),
+                        phase="attention" if isinstance(exc, PairPositionError) else "reconciling",
+                        api_notice=api_wait_notice(exc))
+            state["retry_after"] = max(state.get("retry_after", 0), delay)
+            raise
+
+    def _adopt_unknown(self, trader, pair, state):
         """End exhausted recovery from fresh reality, keeping every unknown fill."""
         from .pair_execution import empty_progress
         from .pair_planning import PairRecoveryConflict, PairPositionError
@@ -431,7 +479,8 @@ class PairOrderRecovery:
         _, brokers, identities = trader._members(pair)
         if identities != pending.get("identities") or identities != state.get("identities"):
             raise PairPositionError("原批次与当前账户身份不一致，不能自动接管")
-        snapshots, guards, actual, leverage = _safe_reality(self.engine, pair, state)
+        snapshots, guards, actual, leverage = _safe_reality(self.engine, pair, state,
+            market_recovery=pending["kind"] != "leverage")
         balanced = dec(actual["LONG"]) == dec(actual["SHORT"])
         baseline = all(dec(actual[side]) == dec(before[side]) for _, side in SIDES)
         if not balanced and not (pending["kind"] != "cycle" and baseline):
@@ -731,7 +780,7 @@ class PairOrderRecovery:
             try:
                 self._eligible(pair, state, self.store.get("pair_margin:" + pair_id, {}),
                                allow_cycle_unknown=source == "paused_manual_check")
-                archive_available, archive_reason = True, "两笔原订单仍无回执；可继续检查历史订单、实际底仓与挂单是否满足人工归档条件"
+                archive_available, archive_reason = True, "两笔原订单仍无回执；可继续检查历史订单与实际底仓是否满足人工归档条件"
             except TradingError as exc:
                 archive_reason = str(exc)
         rows = []
@@ -841,7 +890,7 @@ class PairOrderRecovery:
             pending["position_review"] = True
         accounts = self.manager._members(pair)
         snapshots, guards = member_read if member_read is not None else self.manager._read_members(
-            pair, adopt=True, reconciliation=True)
+            pair, adopt=True, reconciliation=True, market_recovery=True)
         held = positions(snapshots, symbol)
         actual = {side: Fraction(held[side].qty) for _, side in SIDES}
         if not acceptable(actual) or any(pos.leverage != pending["leverage"] for pos in held.values()):
@@ -962,7 +1011,7 @@ class PairOrderRecovery:
                 if isinstance(broker, LiveBroker):
                     budget.enter_context(broker.reconciliation_budget())
             MarginBalancer(self.engine).verify_members(pair)
-        snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True)
+        snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True, market_recovery=True)
         actual = {side: wire(snapshots[key].pair(symbol)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
         if not found:
             if any(dec(actual[side]) != dec(pending["before"][side]) for _, side in SIDES):
@@ -1014,7 +1063,7 @@ class PairOrderRecovery:
         review = {"status": "review", "token": token, "pair_id": pair_id, "batch_id": pending["id"],
             "created_at": pending["created_at"], "checked_at": time.time(), "before": pending["before"],
             "actual": read["actual"], "leverage": pending["leverage"], "orders": read["evidence"],
-            "message": "原编号和完整时间窗历史均未找到两笔订单，实际持仓等于本批前底仓且无挂单；可人工归档未知记录，保持暂停"}
+            "message": "原编号和完整时间窗历史均未找到两笔订单，实际持仓等于本批前底仓；可人工归档未知记录，保持暂停"}
         self.previews[pair_id] = {"token": token, "expires": time.monotonic() + PREVIEW_TTL,
             "fingerprint": read["fingerprint"], "review": deepcopy(review)}
         return review

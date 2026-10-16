@@ -290,8 +290,10 @@ class PairManualBaselineLiveTests(unittest.TestCase):
         self.assertEqual(self.state()["daily_volume"], original["daily_volume"])
         self.assertIsNone(self.f.store.get("pair_batch:" + original["pending"]["id"]))
 
-    def test_manual_adoption_reloads_modes_and_all_account_open_orders(self):
+    def test_manual_market_adoption_reloads_modes_without_open_order_inventory(self):
         self.seed()
+        for broker in self.live.values():
+            broker.api.calls.clear()
         with self.no_writes(), ExitStack() as stack:
             snapshots = [stack.enter_context(patch.object(broker, "snapshot", wraps=broker.snapshot))
                          for broker in self.live.values()]
@@ -301,19 +303,20 @@ class PairManualBaselineLiveTests(unittest.TestCase):
             self.assertTrue(any(call.kwargs.get("fresh_modes") is True for call in snapshot.call_args_list))
         for broker in self.live.values():
             reads = [call for call in broker.api.calls if call[1] == "/fapi/v3/openOrders"]
-            self.assertTrue(reads)
-            for method, _, args, kwargs in reads:
-                self.assertEqual(method, "GET")
-                self.assertTrue(kwargs["signed"])
-                self.assertFalse(args, "A symbol filter would miss other-market orders")
+            self.assertFalse(reads)
 
-    def test_other_market_open_order_blocks_adoption(self):
+    def test_market_recovery_does_not_query_unrelated_order_inventory(self):
         original = self.seed()
-        self.broker().api.responses["/fapi/v3/openOrders"] = [{"symbol": "SPCXUSD1", "orderId": "external"}]
+        for broker in self.live.values():
+            broker.api.calls.clear()
+            broker.api.responses["/fapi/v3/openOrders"] = AssertionError("market recovery does not read openOrders")
         with self.no_writes():
             result = self.engine.pairs.check_recovery("gold")
-        self.assertFalse(result["completed"])
-        self.assert_retained(original)
+        self.assertTrue(result["completed"], result)
+        self.assertIsNone(self.state()["pending"])
+        self.assertEqual(self.state()["owned"], original["owned"])
+        self.assertTrue(all(not any(call[1] == "/fapi/v3/openOrders" for call in broker.api.calls)
+                            for broker in self.live.values()))
 
     def test_account_event_after_final_reads_revokes_commit_guard(self):
         original = self.seed()

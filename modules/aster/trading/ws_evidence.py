@@ -130,7 +130,7 @@ class PrivateEventEvidence:
             # resurrect an already contradictory order within this session.
             self._remember(key, None)
 
-    def order_receipt(self, order):
+    def order_receipt(self, order, *, include_active=False):
         if not self.connected or not isinstance(order, dict):
             return None
         try:
@@ -138,7 +138,7 @@ class PrivateEventEvidence:
             if item is None or not self._fresh(item["stamps"], item["received_at"]):
                 return None
             receipt = item["receipt"]
-            if (receipt["status"] not in TERMINAL
+            if (not include_active and receipt["status"] not in TERMINAL
                     or any(receipt[field] != order[field] for field in ("symbol", "side", "positionSide"))
                     or receipt["origType"] != order["type"] or receipt["type"] != order["type"]
                     or dec(receipt["origQty"]) != positive(order["quantity"])):

@@ -1,10 +1,11 @@
 """A persisted review stage fits the reserve without repeated account reads."""
 from unittest import TestCase
 from unittest.mock import patch
+import time
 
 from tests import test_pair_manual_baseline as baseline
 from tests import test_pair_member_budget as members
-from trading.exchange import RateBudget
+from trading.exchange import BudgetWait
 from trading.pair_execution import PairTrader
 
 
@@ -31,30 +32,17 @@ class PairRecoveryBudgetTests(TestCase):
         with self.no_writes():
             return self.engine.pairs.check_recovery('gold')
 
-    def test_cold_retry_after_restart_completes_inside_300_reserve(self):
-        original, budget = self.prepare()
+    def test_cold_review_after_restart_completes_with_142_weight_and_no_open_orders(self):
+        original, budget = self.prepare(review=True)
         budget.reserve(1500)
-        result = self.check()
-        self.assertFalse(result['completed'])
-        self.assertTrue(self.state()['pending']['position_review'])
-        self.assertEqual(budget.snapshot()['used'], 1642)
-        self.assertTrue(all(not any(call[1].endswith('/openOrders') for call in broker.api.calls)
-                            for broker in self.live.values()))
-        # A new process/window retains only the durable review stage.
-        budget = RateBudget()
-        budget.reserve(1500)
-        for broker in self.live.values():
-            broker.api.budget = budget
-            broker.api.calls.clear()
-            broker.cached_at.clear()
         self.engine.pairs.trader = PairTrader(self.engine)
         result = self.check()
         self.assertTrue(result['completed'], result)
-        self.assertEqual(budget.snapshot()['used'], 1722)
+        self.assertEqual(budget.snapshot()['used'], 1642)
         for broker in self.live.values():
             paths = [call[1] for call in broker.api.calls]
             self.assertEqual(paths.count('/fapi/v3/accountWithJoinMargin'), 1)
-            self.assertEqual(paths.count('/fapi/v3/openOrders'), 1)
+            self.assertEqual(paths.count('/fapi/v3/openOrders'), 0)
         self.assertEqual(self.state()['owned'], original['owned'])
 
     def test_review_with_1724_used_does_not_spend_any_partial_read(self):
@@ -65,7 +53,26 @@ class PairRecoveryBudgetTests(TestCase):
         self.assertFalse(result['completed'])
         self.assertEqual(budget.snapshot()['used'], 1724)
         self.assertTrue(all(not broker.api.calls for broker in self.live.values()))
-        self.assertEqual(self.state()['pending'], original['pending'])
+        self.assertEqual(self.state()['pending']['legs'], original['pending']['legs'])
+        self.assertGreater(self.state()['pending']['position_review_retry_at'], time.time())
+
+    def test_failed_terminal_review_waits_before_manual_or_restarted_reads(self):
+        original, budget = self.prepare(review=True)
+        wall = time.time()
+        with patch('time.time', side_effect=lambda: wall), \
+                patch.object(self.engine.pairs, '_read_members', side_effect=BudgetWait('quota', retry_after=90)) as reads:
+            self.check()
+            wall += 30
+            self.engine.pairs.trader = PairTrader(self.engine)
+            self.check()
+            self.assertEqual(reads.call_count, 1)
+            wall += 59
+            self.check()
+            self.assertEqual(reads.call_count, 1)
+        self.assertEqual(self.state()['pending']['legs'], original['pending']['legs'])
+        wall += 1
+        with patch('time.time', side_effect=lambda: wall):
+            self.assertTrue(self.check()['completed'])
 
     def test_review_flag_does_not_replace_unknown_order_query(self):
         original, budget = self.prepare(review=True)
@@ -77,12 +84,14 @@ class PairRecoveryBudgetTests(TestCase):
         self.assertIsNotNone(self.state()['pending'])
         self.assertIn('/fapi/v3/order', [call[1] for call in self.broker().api.calls])
 
-    def test_review_still_rejects_foreign_open_orders(self):
+    def test_market_order_review_does_not_request_unrelated_open_orders(self):
         original, budget = self.prepare(review=True)
         self.broker().api.responses['/fapi/v3/openOrders'] = [{'symbol': 'SPCXUSD1'}]
-        self.assertFalse(self.check()['completed'])
+        self.assertTrue(self.check()['completed'])
         self.assertEqual(self.state()['owned'], original['owned'])
-        self.assertIsNotNone(self.state()['pending'])
+        self.assertIsNone(self.state()['pending'])
+        self.assertTrue(all(not any(call[1].endswith('/openOrders') for call in broker.api.calls)
+                            for broker in self.live.values()))
 
     def test_changed_positions_use_same_full_read_for_existing_repair_decision(self):
         from tests.test_cycle_account_snapshot import ACCOUNT, RISK, risk_row
@@ -96,5 +105,5 @@ class PairRecoveryBudgetTests(TestCase):
         self.assertFalse(result['completed'])
         self.assertEqual(self.state()['phase'], 'repairing')
         self.assertEqual(self.state()['pending']['repairs'], [])
-        self.assertEqual(budget.snapshot()['used'], 222)
+        self.assertEqual(budget.snapshot()['used'], 142)
         self.assertEqual(self.state()['owned'], original['owned'])

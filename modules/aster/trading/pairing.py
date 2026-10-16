@@ -138,8 +138,10 @@ class PairManager:
         return accounts
 
     def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False,
-                      runtime=None, full_account_flat=False):
+                      runtime=None, full_account_flat=False, market_recovery=False):
         from .pair_planning import require_runtime_symbols
+        if market_recovery and (not adopt or flat or full_account_flat):
+            raise TradingError("市价单恢复读取不能用于绑定或空仓核验")
         if runtime is None:
             runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
         require_runtime_symbols(pair, runtime)
@@ -150,7 +152,8 @@ class PairManager:
         for broker in brokers.values():
             if isinstance(broker, LiveBroker) and getattr(broker.api, "budget", None) is not None:
                 budget = broker.api.budget
-                budgets[budget] = budgets.get(budget, 0) + broker.snapshot_weight([symbol], fresh_modes=True) + 40
+                budgets[budget] = (budgets.get(budget, 0) + broker.snapshot_weight([symbol], fresh_modes=True)
+                                   + (0 if market_recovery else 40))
                 if startup:
                     # Ownership verification rereads each child account.
                     budgets[budget] += 5
@@ -168,8 +171,9 @@ class PairManager:
             # conservatively for each distinct budget in injected adapters.
             for budget in budgets:
                 budgets[budget] += 5
-        # Admit both fresh account reads and full-account open orders before
-        # starting either worker. Each request still reserves its own weight.
+        # Market recovery follows its original client IDs, not unrelated account
+        # orders. Binding/flat checks still require the full order inventory.
+        # Each request retains its own atomic weight admission.
         for budget, weight in budgets.items():
             with budget.reconciliation() if reconciliation else budget.cycle_accounting():
                 budget.require_available(weight)
@@ -193,11 +197,12 @@ class PairManager:
                 raise TradingError("子账户没有交易权限")
             if not flat and snapshot.equity <= 0:
                 raise TradingError("启用配对组前需要子账户具有正的 USD1 权益")
-            orders = snapshot.open_orders
-            if isinstance(broker, LiveBroker):
-                orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
-            if not isinstance(orders, list) or orders:
-                raise TradingError("配对组启用或绑定前需确认两个子账户都没有未完成挂单")
+            if not market_recovery:
+                orders = snapshot.open_orders
+                if isinstance(broker, LiveBroker):
+                    orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
+                if not isinstance(orders, list) or orders:
+                    raise TradingError("配对组启用或绑定前需确认两个子账户都没有未完成挂单")
             return snapshot, guard
 
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-check") as pool:
@@ -310,6 +315,37 @@ class PairManager:
                 return self._switch_symbol(pair, updated)
             self._members(updated)
             saved = self.store.save_pair(updated)
+            self._changed(saved)
+            return saved
+
+    def switch_to_margin_only(self, pair_id):
+        """Disable new strategy work without adopting or discarding recovery."""
+        previous = self.store.pair(pair_id)
+        if previous is None:
+            raise TradingError("配对组不存在")
+        with self.locked(previous):
+            pair = self.store.pair(pair_id)
+            if pair is None:
+                raise TradingError("配对组不存在")
+            self.engine.adl.require_clear(pair_id)
+            if pair["enabled"]:
+                raise TradingError("请先暂停配对组，再切换为仅保证金管理")
+            runtime = self.store.get("pair_runtime:" + pair_id, {})
+            margin = self.store.get("pair_margin:" + pair_id, {})
+            if not isinstance(runtime, dict) or not isinstance(margin, dict):
+                raise TradingError("配对组或保证金日志无效，请先核对")
+            self._members(pair)
+            if margin_only(pair):
+                return pair
+            updated = deepcopy(pair)
+            updated["ordinary"]["enabled"] = False
+            updated["cycle"]["enabled"] = False
+            updated["margin"]["enabled"] = True
+            # Pending batches and cycle quantities retain their original
+            # parameters. Only new strategy work is disabled; starting funds
+            # management still requires the existing activation checks.
+            saved = self.store.save_pair(validate_pair(updated))
+            self.store.event(pair_id, "pair", "已切换为仅保证金管理并保持暂停；原订单核对与必要减仓继续")
             self._changed(saved)
             return saved
 

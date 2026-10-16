@@ -13,7 +13,7 @@ from trading.exchange import BudgetWait, ExchangeError, RequestNotSent
 from trading.models import TradingError, dec
 from trading.pair_execution import PairTrader
 from trading.pair_planning import PairRecoveryConflict
-from trading.pair_recovery import _watch_evidence_key, require_archived_orders_clear
+from trading.pair_recovery import _watch_evidence_key, recovery_ready, require_archived_orders_clear
 from trading.store import Store
 
 
@@ -126,6 +126,35 @@ class PairBoundedRecoveryTests(unittest.TestCase):
                 self.engine.pairs.tick("gold")
         self.assertEqual([query.call_count for query in queries], [3, 3])
         self.assertIsNotNone(self.state()["pending"])
+
+    def test_active_receipt_cannot_enter_reality_stage_and_keeps_querying_original_id(self):
+        self.ready()
+        state = self.state()
+        state["pending"]["bounded_recovery"]["stage"] = "positions"
+        active, complete = state["pending"]["legs"]
+        active["receipt"] = fixtures.receipt_for(active, status="PARTIALLY_FILLED", qty="0.1")
+        complete["receipt"] = fixtures.receipt_for(complete, status="FILLED", qty="0.2")
+        saved_receipt = deepcopy(active["receipt"])
+        terminal = fixtures.receipt_for(active, status="FILLED", qty="0.2")
+        self.f.store.put("pair_runtime:gold", state)
+        self.quantities()
+        self.assertFalse(recovery_ready(state["pending"]))
+        wall = time.time()
+        with self.no_writes(), patch("time.time", side_effect=lambda: wall), \
+                patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("active order")), \
+                patch.object(self.broker(), "query", side_effect=[ExchangeError("not found", code=-2013), terminal]) as query:
+            self.engine.pairs.tick("gold")
+            self.assertEqual(self.state()["pending"]["legs"][0]["receipt"], saved_receipt)
+            self.engine.pairs.trader = PairTrader(self.engine)
+            wall += 29
+            self.engine.pairs.check_recovery("gold")
+            self.assertEqual(query.call_count, 1)
+            self.assertIsNotNone(self.state()["pending"])
+            wall += 1
+            self.engine.pairs.tick("gold")
+            self.assertEqual(query.call_count, 2)
+        self.assertIsNone(self.state()["pending"])
+        self.assertTrue(self.state()["last_batch"]["completed"])
 
     def test_recent_repair_resets_safety_window_even_for_an_old_batch(self):
         self.ready()
@@ -263,7 +292,9 @@ class PairBoundedRecoveryTests(unittest.TestCase):
         self.f.store.put(key, observed)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
         self.addCleanup(restarted.dashboard_reports.close)
-        restarted.pairs.tick("gold")
+        retry_at = self.state()["pending"]["bounded_recovery"]["next_check_at"]
+        with patch("time.time", return_value=retry_at):
+            restarted.pairs.tick("gold")
         self.assertIsNone(self.state()["pending"], self.state()["reason"])
         self.assertEqual(len(self.state()["recovery_watch"]["batches"]), 8)
         self.assertEqual(self.f.store.get(key)["retired_batch"]["id"], "legacy-0")
@@ -553,15 +584,19 @@ class PairBoundedLiveTests(unittest.TestCase):
             self.assertEqual(self.state(), before)
             self.assertIsNone(self.f.store.get("pair_deleted_watch:gold"))
 
-    def test_full_account_orders_must_be_complete_and_empty(self):
+    def test_market_recovery_never_queries_full_account_open_orders(self):
         from tests.test_cycle_account_snapshot import ORDERS
         for orders in (None, {"orders": []}, [{"symbol": "SPCXUSD1"}]):
             self.ready()
             self.broker().api.responses[ORDERS] = orders
+            for broker in self.live.values():
+                broker.api.calls.clear()
             with self.subTest(orders=orders), self.no_writes():
                 self.engine.pairs.tick("gold")
-            self.assertIsNotNone(self.state()["pending"])
-            self.assertIsNone(self.f.store.get("pair_batch:" + fixtures.BATCH_ID))
+            self.assertIsNone(self.state()["pending"], self.state()["reason"])
+            self.assertIsNotNone(self.f.store.get("pair_batch:" + fixtures.BATCH_ID))
+            self.assertTrue(all(not any(call[1] == ORDERS for call in broker.api.calls)
+                                for broker in self.live.values()))
 
     def test_fresh_full_account_reads_allow_unknown_adoption_without_requery(self):
         from tests.test_cycle_account_snapshot import ORDERS
@@ -572,7 +607,8 @@ class PairBoundedLiveTests(unittest.TestCase):
             self.engine.pairs.tick("gold")
         self.assertIsNone(self.state()["pending"], self.state()["reason"])
         for broker in self.live.values():
-            self.assertTrue(any(call[1] == ORDERS and not call[2] for call in broker.api.calls))
+            self.assertFalse(any(call[1] == ORDERS for call in broker.api.calls))
+            self.assertTrue(any(call[1].endswith("accountWithJoinMargin") for call in broker.api.calls))
             self.assertFalse(any(call[1] == "/fapi/v3/order" for call in broker.api.calls))
 
     def test_identity_change_or_account_event_after_read_keeps_unknown_batch(self):

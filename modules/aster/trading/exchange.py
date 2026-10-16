@@ -1184,10 +1184,10 @@ class LiveBroker:
                 if self._adl_on_event is not None:
                     self._adl_on_event(event)
 
-    def order_event_receipt(self, order):
-        """Return only fresh terminal evidence; historical query() stays REST."""
+    def order_event_receipt(self, order, *, include_active=False):
+        """Return fresh matching evidence; active receipts are an explicit opt-in."""
         with self._snapshot_lock:
-            return self._private_evidence.order_receipt(order)
+            return self._private_evidence.order_receipt(order, include_active=include_active)
 
     def transfer_ws_checkpoint(self, wallet):
         with self._snapshot_lock:

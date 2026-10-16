@@ -616,12 +616,17 @@ class PairTrader:
             order, broker = leg["order"], brokers[leg["key"]]
             evidence = {"kind": "unknown"}
             try:
-                self._config_guard(pair, state["identities"], opening=pending.get("phase") == "open")
-                if guards:
-                    try:
+                try:
+                    self._config_guard(pair, state["identities"],
+                                       opening=pending.get("phase") == "open" and not reconciliation)
+                    if guards:
                         guards[leg["key"]]()
-                    except TradingError as exc:
-                        raise RequestNotSent(str(exc)) from None
+                except RequestNotSent:
+                    raise
+                except TradingError as exc:
+                    # No submission has started: configuration/history guards
+                    # can fail too, not only the prepared snapshot lease.
+                    raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
                 budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
                 with budget, pair_quality.observe(observations.get(leg["key"]), quality_clocks, observe):
                     result = (broker.submit([order], timeout=3) if isinstance(broker, LiveBroker)
@@ -703,12 +708,26 @@ class PairTrader:
                 self._save(pair, state)
                 continue
             from .pair_recovery import MIN_QUERY_ATTEMPTS
-            if leg.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS:
-                continue
+            active = receipt is not None
             try:
                 broker = brokers[leg["key"]]
-                row = broker.order_event_receipt(order) if isinstance(broker, LiveBroker) else None
+                row = broker.order_event_receipt(order, include_active=True) if isinstance(broker, LiveBroker) else None
+                if isinstance(row, dict) and row.get("status") not in TERMINAL:
+                    Executor.validate_receipt(order, row)
+                    if receipt and dec(row["executedQty"]) < dec(receipt["executedQty"]):
+                        raise PairPositionError("订单查询累计成交数量倒退")
+                    # Keep positive activity even if REST now says -2013. It
+                    # prevents reality adoption but does not hide a later REST
+                    # terminal receipt when the original-ID check is due.
+                    leg["receipt"], receipt, active, row = row, row, True, None
                 if not isinstance(row, dict):
+                    if not active and (leg.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS
+                                       or pending.get("bounded_recovery", {}).get("stage") == "positions"):
+                        continue
+                    if active and leg.get("last_query_at", 0) <= time.time() < leg.get("next_query_at", 0):
+                        continue
+                    if active:
+                        leg.update(last_query_at=time.time(), next_query_at=time.time() + 30)
                     from .pair_recovery import record_query_attempt
                     try:
                         row = broker.query(symbol, order["newClientOrderId"])
@@ -724,9 +743,14 @@ class PairTrader:
                     raise PairPositionError("订单查询累计成交数量倒退")
                 leg["receipt"], leg["error"] = row, None
             except PaperOrderAbsent:
-                leg["receipt"] = self._absent(order, "模拟订单未写入持久账本")
+                if active:
+                    leg["error"] = "模拟订单账本暂未找到已有活动回执，继续核对原编号"
+                else:
+                    leg["receipt"] = self._absent(order, "模拟订单未写入持久账本")
             except TradingError as exc:
                 self._retry_delay(state, exc)
+                if active and state.get("retry_after", 0) > 0:
+                    leg["next_query_at"] = max(leg.get("next_query_at", 0), time.time() + state["retry_after"])
                 leg["error"] = str(exc)
                 notice = api_wait_notice(exc)
                 if notice is not None:
@@ -746,46 +770,69 @@ class PairTrader:
         if pending["kind"] == "leverage":
             return self._recover_leverage(pair, state, brokers)
         from .pair_recovery import recovery_ready
+        # Free terminal stream evidence can arrive after the last REST query.
+        # Exhausted unknowns still skip REST; known active receipts keep their
+        # own query cadence and must never enter current-position adoption.
+        terminal = self._query(pair, state, brokers)
         # Once bounded original-ID queries are exhausted, read current reality
         # directly. Failed reality checks retain this stage across restarts.
         if recovery_ready(pending):
             return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
         from .pair_recovery import MIN_QUERY_ATTEMPTS, record_query_attempt
-        if pending.get("terminal_position_recovery") and pending.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS:
+        active_receipts = any(leg.get("receipt") and leg["receipt"]["status"] not in TERMINAL
+                              for leg in pending["legs"] + pending["repairs"])
+        if (not active_receipts and pending.get("terminal_position_recovery")
+                and pending.get("recovery_query_attempts", 0) >= MIN_QUERY_ATTEMPTS):
             state.update(phase="reconciling", reason="原终态回执与仓位已核对三次，等待最后请求满 120 秒后按完整账户现实核验恢复")
             return
-        if not self._query(pair, state, brokers):
+        if not terminal:
             if recovery_ready(pending):
                 return self.engine.pairs.recovery.adopt_unknown(self, pair, state)
-            state.update(phase="reconciling", reason="至少一条市价单结果未确定；原编号最多核对三次，等待最后请求满 120 秒后按实际仓位恢复，期间禁止重发、新开仓及划转")
-            # Before the bounded handoff, these ordinary observations only
-            # refresh the display; only the full-account check can adopt reality.
-            now = time.time()
-            if not state.get("retry_after") and not 0 <= now - pending.get("observation_attempt_at", 0) < 3:
-                pending["observation_attempt_at"] = now
-                self._save(pair, state)
-                try:
-                    snapshots, _ = self._read(brokers, symbol, reconciliation=True)
-                    self._publish_snapshots(state, snapshots, symbol)
-                except TradingError as exc:
-                    self._retry_delay(state, exc)
-                    notice = api_wait_notice(exc)
-                    if notice is not None:
-                        state["api_notice"] = notice
-                    state["reason"] += "；账户仓位刷新暂未完成：" + exchange_reason(str(exc))
+            active_receipts = any(leg.get("receipt") and leg["receipt"]["status"] not in TERMINAL
+                                  for leg in pending["legs"] + pending["repairs"])
+            reason = ("原市价单仍有活动回执，每 30 秒继续按原编号核对终态，不采纳现实仓位结束该批次"
+                      if active_receipts else "至少一条市价单结果未确定；原编号最多核对三次，等待最后请求满 120 秒后按完整账户现实核验")
+            state.update(phase="reconciling", reason=reason + "；不重发原请求或新开仓，持仓展示保留上次读取时间")
+            # Display observations cannot resolve an unknown execution. Keep
+            # their original timestamps and preserve quota for the full check.
             return
+        if pending.get("position_review"):
+            deadline = pending.get("position_review_retry_at", 0)
+            attempted = pending.get("position_review_attempted_at", 0)
+            if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                   for value in (deadline, attempted)):
+                raise TradingError("持仓核验重试时间无效，保留原批次")
+            now = time.time()
+            if now < attempted:
+                pending["position_review_attempted_at"] = now
+                deadline = pending["position_review_retry_at"] = now + max(30, deadline - attempted)
+            if now < deadline:
+                state.update(phase="reconciling", reason=pending.get("position_review_error", "等待下一次持仓核验"),
+                             api_notice=pending.get("position_review_api_notice"))
+                state["retry_after"] = max(state.get("retry_after", 0), deadline - now)
+                return
         member_read = None
         margin_pending = (self.store.get("pair_margin:" + pair["id"], {}) or {}).get("pending") is not None
         try:
             if (not margin_pending and pending["kind"] == "ordinary" and pending["phase"] == "open"
                     and pending.get("position_review")):
-                member_read = self.engine.pairs._read_members(pair, adopt=True, reconciliation=True)
+                self.engine.pairs.recovery._eligible(pair, state,
+                    self.store.get("pair_margin:" + pair["id"], {}) or {},
+                    archive=False, background=not read_only)
+                member_read = self.engine.pairs._read_members(pair, adopt=True, reconciliation=True,
+                                                              market_recovery=True)
                 snapshots, member_guards = member_read
                 guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
             else:
                 snapshots, guards = self._read(brokers, symbol, reconciliation=True,
                     fresh_modes=bool(pending.get("terminal_position_recovery")))
         except TradingError as exc:
+            if pending.get("position_review"):
+                requested = getattr(exc, "retry_after", 0)
+                delay = max(30, requested) if type(requested) in (int, float) and math.isfinite(requested) else 30
+                pending.update(position_review_attempted_at=time.time(), position_review_retry_at=time.time() + delay,
+                               position_review_error=exchange_reason(str(exc)), position_review_api_notice=api_wait_notice(exc))
+                state["retry_after"] = max(state.get("retry_after", 0), delay)
             if pending.get("terminal_position_recovery"):
                 record_query_attempt(pending, exc)
             raise

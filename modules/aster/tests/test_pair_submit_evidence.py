@@ -2,13 +2,14 @@
 from contextlib import ExitStack
 from copy import deepcopy
 import json
+import threading
 from unittest import TestCase
 from unittest.mock import patch
 
 import httpx
 
 from tests import test_pair_notional_rejection as fixtures
-from trading.exchange import API, AmbiguousOrder, BudgetWait, ExchangeError, RateBudget, RequestNotSent
+from trading.exchange import API, AmbiguousOrder, BudgetWait, ExchangeError, RateBudget, RequestNotSent, SnapshotSuperseded
 from trading.pair_execution import PairTrader
 from trading.store import Store
 
@@ -162,6 +163,50 @@ class PairSubmitEvidenceTests(TestCase):
             self.assertEqual(leg["submit_evidence"], {"kind": "request_not_sent", "code": -5018, "retry_after": 3})
             self.assertTrue(leg["receipt"]["local_not_sent"])
             self.assertNotIn("reject_code", leg["receipt"])
+        f.assert_baseline()
+
+    def test_config_guard_failure_before_submit_is_known_not_sent_without_order_queries(self):
+        f = self.fixture()
+        original = f.trader._config_guard
+        def guard(*args, **kwargs):
+            if threading.current_thread().name.startswith("pair-order"):
+                raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
+            return original(*args, **kwargs)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(f.trader, "_config_guard", side_effect=guard))
+            for broker in f.brokers.values():
+                stack.enter_context(patch.object(broker, "submit", side_effect=AssertionError("preflight failed")))
+                stack.enter_context(patch.object(broker, "query", side_effect=AssertionError("never submitted")))
+            state = f.tick()
+        self.assertIsNone(state["pending"], state)
+        for leg in self.batch(f, state)["legs"]:
+            self.assertEqual(leg["submit_evidence"]["kind"], "request_not_sent")
+            self.assertTrue(leg["receipt"]["local_not_sent"])
+        f.assert_baseline()
+
+    def test_one_failed_preflight_reduces_only_the_other_legs_confirmed_fill(self):
+        f = self.fixture()
+        dispatch = f.trader._dispatch
+        def preflight(pair, state, brokers, legs, **kwargs):
+            if not kwargs.get("reconciliation"):
+                guards = dict(kwargs["guards"])
+                def fail():
+                    raise SnapshotSuperseded("账户快照已失效")
+                guards["long"] = fail
+                kwargs["guards"] = guards
+            return dispatch(pair, state, brokers, legs, **kwargs)
+        with patch.object(f.trader, "_dispatch", side_effect=preflight), \
+                patch.object(f.brokers["long"], "submit", side_effect=AssertionError("preflight failed")), \
+                patch.object(f.brokers["long"], "query", side_effect=AssertionError("never submitted")), \
+                patch.object(f.brokers["short"], "submit", wraps=f.brokers["short"].submit) as sends:
+            state = f.tick()
+            self.assertEqual(state["phase"], "repairing", state)
+            state = f.tick()
+        self.assertIsNone(state["pending"], state)
+        self.assertEqual([call.args[0][0]["side"] for call in sends.call_args_list], ["SELL", "BUY"])
+        leg = self.batch(f, state)["legs"][0]
+        self.assertEqual(leg["submit_evidence"]["kind"], "request_not_sent")
+        self.assertTrue(leg["receipt"]["local_not_sent"])
         f.assert_baseline()
 
     def test_unknown_error_code_cannot_be_classified_from_message(self):

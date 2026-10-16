@@ -343,6 +343,10 @@ class NewPair(BaseModel):
         return values
 
 
+class PairMarginOnly(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
 class PairEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str | None = Field(default=None, min_length=1, max_length=50)
@@ -548,6 +552,10 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     @app.post("/api/pairs/{pair_id}/enable", dependencies=write_dependencies)
     def enable_pair(pair_id: str):
         return {"ok": True, "pair": engine.pairs.enable(pair_id, True)}
+
+    @app.post("/api/pairs/{pair_id}/margin-only", dependencies=write_dependencies)
+    def switch_pair_to_margin_only(pair_id: str, body: PairMarginOnly):
+        return {"ok": True, "pair": engine.pairs.switch_to_margin_only(pair_id)}
 
     @app.post("/api/pairs/{pair_id}/pause", dependencies=write_dependencies)
     def pause_pair(pair_id: str):

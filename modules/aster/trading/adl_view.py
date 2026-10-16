@@ -127,9 +127,16 @@ def status_view(engine, reader, pair, runtime, *, now=None):
                       "batch_count": len(_rows(incident.get("batches"))), "config": validate_adl(incident.get("config"))}
     pending_event = _pending_event(engine, reader, pair, raw, incident)
     reason = _lock_reason(reader, pair, runtime, raw, pending_event)
+    from .pairing import margin_only
+    switch_allowed = (not pair.get("enabled") and not margin_only(pair) and not pending_event
+                      and (raw is None or isinstance(raw, dict)
+                           and raw.get("status") == "completed" and not raw.get("hold"))
+                      and isinstance(runtime, dict)
+                      and isinstance(reader.get("pair_margin:" + pair["id"], {}), dict))
     return {"monitoring": _monitoring(engine, reader, pair, now), "incident": projection,
             "report_available": incident is not None, "pending_event": pending_event,
-            "configuration_locked": bool(reason), "lock_reason": reason}
+            "configuration_locked": bool(reason), "lock_reason": reason,
+            "margin_only_switch_allowed": switch_allowed}
 
 
 def _report_evidence(incident):

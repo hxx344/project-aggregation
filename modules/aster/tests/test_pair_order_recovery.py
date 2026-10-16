@@ -268,7 +268,7 @@ class PairOrderRecoveryTests(unittest.TestCase):
             self.confirm(review["token"])
         self.assertIsNone(self.state()["pending"])
 
-    def test_real_background_observation_keeps_existing_archive_preview_valid(self):
+    def test_background_original_id_queries_keep_existing_archive_preview_valid(self):
         self.seed()
         with self.no_writes() as stack:
             for key in ("long", "short"):
@@ -276,10 +276,11 @@ class PairOrderRecoveryTests(unittest.TestCase):
                     ExchangeError("Order does not exist", code=-2013)))
             self.engine.pairs.tick("gold")
             review = self.preview()
-            previous = self.state()["pending"]["observation_attempt_at"]
-            self.change_state(lambda state: state["pending"].update(observation_attempt_at=previous - 4))
-            self.engine.pairs.tick("gold")
-            self.assertGreater(self.state()["pending"]["observation_attempt_at"], previous)
+            before = deepcopy(self.state())
+            with patch.object(self.engine.pairs.trader, "_read", side_effect=AssertionError("no display polling")):
+                self.engine.pairs.tick("gold")
+            self.assertEqual(self.state().get("snapshots"), before.get("snapshots"))
+            self.assertEqual(self.state()["pending"]["legs"][0]["recovery_query_attempts"], 2)
             self.assertIsNotNone(self.state()["pending"])
             self.confirm(review["token"])
         self.assertIsNone(self.state()["pending"])
@@ -326,7 +327,7 @@ class PairOrderRecoveryTests(unittest.TestCase):
         self.assertEqual(self.event_rows(), events)
         self.assertEqual(self.audit(), audit)
 
-    def test_account_modes_permissions_open_orders_and_original_leverage_are_required(self):
+    def test_account_modes_permissions_and_original_leverage_are_required(self):
         self.seed()
         broker = self.broker()
         snapshot = broker.snapshot
@@ -334,8 +335,6 @@ class PairOrderRecoveryTests(unittest.TestCase):
             "hedge": lambda snap: replace(snap, hedge_mode=False),
             "assets": lambda snap: replace(snap, multi_assets=True),
             "permission": lambda snap: replace(snap, can_trade=False),
-            "orders": lambda snap: replace(snap, open_orders=[{"orderId": "external"}]),
-            "unknown_orders": lambda snap: replace(snap, open_orders=None),
             "leverage": lambda snap: replace(snap, positions=[replace(p, leverage=10) if p.symbol == SYMBOL else p for p in snap.positions]),
         }
         for name, transform in changes.items():
@@ -625,11 +624,13 @@ class PairOrderRecoveryLiveReadTests(unittest.TestCase):
             self.confirm(self.preview()["token"])
         self.assertIn("/fapi/v3/order", observed)
         self.assertIn("/fapi/v3/allOrders", observed)
-        self.assertIn(ORDERS, observed)
+        self.assertNotIn(ORDERS, observed)
         self.assertIn(ACCOUNT, observed)
 
-    def test_live_evidence_reads_original_ids_history_and_all_account_open_orders(self):
+    def test_live_market_recovery_reads_original_ids_and_history_without_open_orders(self):
         original = self.seed()
+        for broker in self.live.values():
+            broker.api.calls.clear()
         with self.no_writes():
             review = self.preview()
             self.confirm(review["token"])
@@ -647,10 +648,7 @@ class PairOrderRecoveryLiveReadTests(unittest.TestCase):
                 self.assertEqual(args[0]["startTime"], int((original["pending"]["created_at"] - 60) * 1000))
                 self.assertLess(args[0]["endTime"] - args[0]["startTime"], 7 * 86400000)
                 self.assertEqual(kwargs, {"signed": True, "weight": 5})
-            self.assertGreaterEqual(sum(call[1] == ORDERS for call in calls), 2)
-            for call in calls:
-                if call[1] == ORDERS:
-                    self.assertFalse(call[2])  # Empty parameter list checks every symbol.
+            self.assertFalse(any(call[1] == ORDERS for call in calls))
         self.assertIsNone(self.state()["pending"])
 
     def test_live_history_missing_identity_duplicate_id_or_wrong_type_is_rejected(self):

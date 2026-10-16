@@ -92,7 +92,13 @@ class PairRecoveryCheckTests(unittest.TestCase):
     def test_existing_repair_receipt_can_complete_the_same_batch(self):
         self.seed()
         self.receipts(("FILLED", "EXPIRED"))
-        self.engine.pairs.tick("gold")
+        self.assertFalse(self.f.store.pair("gold")["enabled"])
+        with patch.object(self.broker(), "submit", wraps=self.broker().submit) as repair, \
+                patch.object(self.broker("short"), "submit", side_effect=AssertionError("cannot open missing leg")):
+            self.engine.pairs.tick("gold")
+        repair.assert_called_once()
+        order = repair.call_args.args[0][0]
+        self.assertEqual((order["positionSide"], order["side"], order["quantity"]), ("LONG", "SELL", "0.200"))
         self.assertEqual(len(self.state()["pending"]["repairs"]), 1)
         result = self.check()
         self.assertTrue(result["completed"])

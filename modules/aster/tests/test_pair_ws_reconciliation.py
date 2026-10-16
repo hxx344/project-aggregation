@@ -1,12 +1,13 @@
 """Private order events replace only CID queries, never post-fill risk reads."""
 import json
 import time
+from contextlib import ExitStack
 from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_warm_mode_recovery as warm_fixtures
 from tests import test_cycle_hot_engine as engine_fixtures
-from trading.exchange import AmbiguousOrder
+from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.models import dec
 from trading.user_stream import PrivateAccountStream
 
@@ -86,13 +87,67 @@ class PairWsReconciliationTests(TestCase):
         self.run_with_events(disconnect=True)
         self.assertEqual([self.order_gets(key) for key in self.brokers], [1, 1])
 
+    def active_event_blocks_reality(self, status):
+        self.connect()
+        state, snapshots, guards, plan = self.ordinary_plan()
+        receipts = {}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(self.trader, "_recover", return_value=None))
+            for key, broker in self.brokers.items():
+                original = broker.submit
+                def submit(orders, *, timeout=None, key=key, original=original):
+                    receipts[key] = original(orders, timeout=timeout)[0]
+                    raise AmbiguousOrder("offline acknowledgement lost")
+                stack.enter_context(patch.object(broker, "submit", side_effect=submit))
+            self.trader._start(self.pair, state, self.brokers, snapshots, guards, plan, kind="ordinary")
+        pending = state["pending"]
+        pending["bounded_recovery"] = {"observed_at": time.time() - 121, "stage": "positions"}
+        pending["last_possible_send_at"] = time.time() - 121
+        for leg in pending["legs"]:
+            leg["recovery_query_attempts"] = 3
+        self.trader._save(self.pair, state)
+        wall = time.time()
+        def publish(current_status):
+            for index, leg in enumerate(pending["legs"]):
+                key, order = leg["key"], leg["order"]
+                qty = ("0" if current_status == "NEW" else
+                       str(dec(order["quantity"]) / 2) if current_status == "PARTIALLY_FILLED" else order["quantity"])
+                stamp = int(wall * 1000)
+                event = {"e": "ORDER_TRADE_UPDATE", "E": stamp, "T": stamp,
+                    "o": {"s": SYMBOL, "c": order["newClientOrderId"], "S": order["side"],
+                        "ps": order["positionSide"], "o": "MARKET", "ot": "MARKET",
+                        "q": order["quantity"], "i": 123 + index, "X": current_status, "x": "TRADE",
+                        "z": qty, "ap": "0" if current_status == "NEW" else receipts[key]["avgPrice"], "T": stamp}}
+                self.brokers[key].cycle_stream._handle_message(json.dumps(event))
+        with patch("time.time", side_effect=lambda: wall), ExitStack() as stack:
+            queries = [stack.enter_context(patch.object(broker, "query", side_effect=ExchangeError("not found", code=-2013)))
+                       for broker in self.brokers.values()]
+            publish(status)
+            with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("active event blocks adoption")), \
+                    patch.object(self.trader, "_read", side_effect=AssertionError("active event blocks position completion")):
+                self.trader._recover(self.pair, state, self.brokers)
+            self.assertTrue(all(leg["receipt"]["status"] == status for leg in state["pending"]["legs"]))
+            self.assertEqual([query.call_count for query in queries], [1, 1])
+            wall += 1
+            publish("FILLED")
+            self.trader._recover(self.pair, state, self.brokers)
+            self.assertEqual([query.call_count for query in queries], [1, 1])
+        self.assertIsNone(state["pending"], state)
+        self.assertTrue(state["last_batch"]["completed"])
+
+    def test_cached_new_event_blocks_expired_unknown_adoption_until_terminal(self):
+        self.active_event_blocks_reality("NEW")
+
+    def test_cached_partial_event_blocks_expired_unknown_adoption_until_terminal(self):
+        self.active_event_blocks_reality("PARTIALLY_FILLED")
+
 
 class PausedTransferStreamTests(TestCase):
     setUp = engine_fixtures.CycleHotEngineTests.setUp
     warm = engine_fixtures.CycleHotEngineTests.warm
     publish = engine_fixtures.CycleHotEngineTests.publish
 
-    def test_only_pending_transfer_keeps_paused_group_stream_without_rest(self):
+    def test_paused_group_keeps_adl_stream_after_transfer_finishes_without_rest(self):
         row = self.f.store.account("test")
         row.update(enabled=False, cycle={**row["cycle"], "enabled": False})
         self.f.store.save_account(row)
@@ -108,5 +163,11 @@ class PausedTransferStreamTests(TestCase):
             self.assertFalse(self.f.store.account("test")["enabled"])
             self.f.store.put("pair_margin:gold", {})
             self.engine.poll_cycle_hot_data("test")
+            stop.assert_not_called()
+            self.broker.refresh_cycle_hot_snapshot.assert_not_called()
+            # Paused groups still monitor ADL; only removing the binding and
+            # leaving the independent account paused releases its stream.
+            with patch.object(self.f.store, "pair_for_account", return_value=None):
+                self.engine.poll_cycle_hot_data("test")
             stop.assert_called_once()
         self.api.call.assert_not_called()

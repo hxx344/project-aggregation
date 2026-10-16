@@ -793,6 +793,33 @@ function PairDetail({
         {configurationLock ? (
           <p className="settings-lock amber">{configurationLock}</p>
         ) : null}
+        {!marginOnly ? (
+          <div className="settings-lock">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={
+                busy ||
+                offline ||
+                !ready ||
+                pair.state?.adl?.margin_only_switch_allowed !== true
+              }
+              onClick={async () => {
+                if (await action(`/api/pairs/${pair.id}/margin-only`, {})) {
+                  draft.clear();
+                  setNotice(
+                    '已切换为仅保证金管理并保持暂停；点击“启动配对组”后才会按条件平衡保证金。原订单继续核对，已有循环仓位仍按原路径执行必要减仓。',
+                  );
+                }
+              }}
+            >
+              切换为仅保证金管理
+            </Button>
+            <p className="muted">
+              暂停后可关闭普通开仓与新循环、开启保证金管理；切换后仍保持暂停，未保存的设置草稿会撤销。原订单继续核对，已有循环仓位仍会执行必要减仓。
+            </p>
+          </div>
+        ) : null}
         {error ? (
           <p className="message message-error" role="alert">
             {error}

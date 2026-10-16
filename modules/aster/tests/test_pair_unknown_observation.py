@@ -1,5 +1,4 @@
-"""Unknown acknowledgments refresh visible positions without authorizing writes."""
-from copy import deepcopy
+"""Unknown acknowledgments retain display timestamps without extra REST reads."""
 from contextlib import ExitStack
 import time
 import unittest
@@ -26,40 +25,27 @@ class PairUnknownObservationTests(unittest.TestCase):
                 ExchangeError("Order does not exist", code=-2013)))
         return stack
 
-    def test_unknown_equal_positions_refresh_but_never_authorize_completion(self):
+    def test_observation_window_keeps_old_display_without_snapshot_requests(self):
         original = self.seed()
+        original["snapshots"] = {"long": {"timestamp": time.time() - 60, "positions": []}}
+        self.f.store.put("pair_runtime:gold", original)
         for side in ("long", "short"):
             broker = self.broker(side)
             broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"] = "12"
             broker.save()
         trader = PairTrader(self.engine)
         self.engine.pairs.trader = trader
-        with self.unknown(), patch.object(trader, "_read", wraps=trader._read) as read:
-            self.engine.pairs.tick("gold")
+        started = time.time()
+        with self.unknown(), patch.object(trader, "_read", side_effect=AssertionError("display must not read")):
+            for seconds in (0, 1, 3, 10, 30, 60, 119):
+                with patch("time.time", return_value=started + seconds):
+                    self.engine.pairs.tick("gold")
             current = self.state()
             self.assertIsNotNone(current["pending"])
             self.assertEqual(current["owned"], original["owned"])
-            for side in ("long", "short"):
-                self.assertTrue(any(row["qty"] == "12" for row in current["snapshots"][side]["positions"]))
-            first = deepcopy(current["snapshots"])
-            # Future-but-near timestamps avoid relying on test execution speed.
-            current["pending"]["observation_attempt_at"] = time.time() + 1
-            self.f.store.put("pair_runtime:gold", current)
-            # Backwards wall-clock movement must not freeze observations.
-            self.engine.pairs.tick("gold")
-            self.assertEqual(read.call_count, 2)
-            current = self.state()
-            with patch("trading.pair_execution.time.time", return_value=current["pending"]["observation_attempt_at"] + 1):
-                self.engine.pairs.tick("gold")
-            self.assertEqual(read.call_count, 2)
-            current = self.state()
-            current["pending"]["observation_attempt_at"] = time.time() - 4
-            self.f.store.put("pair_runtime:gold", current)
-            self.engine.pairs.tick("gold")
-            self.assertEqual(read.call_count, 3)
-            self.assertEqual(self.state()["pending"]["legs"], current["pending"]["legs"])
+            self.assertEqual(current["snapshots"], original["snapshots"])
+            self.assertEqual([leg["recovery_query_attempts"] for leg in current["pending"]["legs"]], [3, 3])
             self.assertIsNone(self.f.store.get("pair_batch:" + original["pending"]["id"]))
-            self.assertTrue(first)
 
     def test_query_budget_wait_does_not_spend_more_on_observations(self):
         self.seed()
@@ -71,7 +57,7 @@ class PairUnknownObservationTests(unittest.TestCase):
         self.assertEqual(self.state()["api_notice"]["kind"], "budget")
         self.assertNotIn("observation_attempt_at", self.state()["pending"])
 
-    def test_failed_observation_preserves_old_snapshot_and_known_receipt(self):
+    def test_unknown_peer_preserves_old_snapshot_and_known_receipt(self):
         original = self.seed()
         receipt = recovery.receipt_for(original["pending"]["legs"][0], status="REJECTED")
         original["pending"]["legs"][0]["receipt"] = receipt
@@ -79,12 +65,12 @@ class PairUnknownObservationTests(unittest.TestCase):
         self.f.store.put("pair_runtime:gold", original)
         trader = PairTrader(self.engine)
         self.engine.pairs.trader = trader
-        with self.unknown(), patch.object(trader, "_read", side_effect=BudgetWait("budget", retry_after=10)):
+        with self.unknown(), patch.object(trader, "_read", side_effect=AssertionError("display must not read")):
             self.engine.pairs.tick("gold")
         current = self.state()
         self.assertEqual(current["snapshots"], original["snapshots"])
         self.assertEqual(current["pending"]["legs"][0]["receipt"], receipt)
-        self.assertEqual(current["api_notice"]["kind"], "budget")
+        self.assertIsNone(current["api_notice"])
         self.assertEqual(current["pending"]["repairs"], [])
 
 
