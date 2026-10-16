@@ -894,3 +894,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `24bb935` 的 [原油图](modules/monitor/modules/oil/app.mjs) 在 `renderChart` 中直接以 `summary.average` 绘制水平线，[区间统计](modules/monitor/modules/oil/data-utils.mjs) 对可见样本只求一次平均。2026-10-17 用户截图指出应为滚动平均，并明确窗口随 1 天、1 周、1 月范围变化。
 
 **事件记录：** `oil-rolling-average-window-20261017`；一次用户纠正及修复，不推进主线复盘检查点。
+
+### L058：页面状态时效不能冒充服务器间 WS 连接状态
+
+**适用条件：** 浏览器通过定时 HTTP 快照展示服务器间的 WS 连接，且后台页面刷新频率低于快照有效期。
+
+**根因：** Aster 后台页面每约 30 秒读取状态，回到前台先更新页面时钟，再异步读取新快照。原界面把 8 秒页面时效、样本新鲜度、HTTP 补取错误与 WS 连接合并成一个颜色，旧快照可使“WS 已连接”短暂变黄，即使服务器间连接从未变化。
+
+**以后做法：** 连接徽标与数据摘要分别着色。过期的健康连接记录显示中性“WS 状态待更新”，不声称当前已连接或已断线；明确的 WS 异常继续告警，旧异常注明“最近记录”。样本过期、HTTP 错误及页面连接失败仍明确展示。保留源时间、8 秒时效和后端校验，不靠延长有效期或冻结页面时钟消除闪烁。
+
+**如何验证：** [连接展示测试](modules/aster/dashboard/tests/capacity-relay.test.mjs) 覆盖过期与恢复、未知时间、已知断连、HTTP 错误和样本时效独立性；[工作台浏览器回归](tests/aster-relay-status.browser.mjs) 在实际 iframe 入口固定 WS 连接事实，隐藏超过 8 秒后延迟恢复读取，检查待更新与恢复状态，并确认没有交易写请求。
+
+**证据：** project-aggregation 基线 `025884a` 的 [页面刷新](modules/aster/dashboard/lib/state-refresh.ts)、[状态展示](modules/aster/dashboard/lib/capacity-relay.ts) 和 [额度连接面板](modules/aster/dashboard/components/capacity-relay-panel.tsx)。2026-10-17 用户报告切回标签时黄色一闪后恢复绿色；源码确认上述路径可以独立触发该现象，未取得服务器现场日志，不推断每次黄灯均为页面时效所致。
+
+**事件记录：** `aster-relay-display-resume-20261017`；一次状态展示语义修正，不推进主线复盘检查点。

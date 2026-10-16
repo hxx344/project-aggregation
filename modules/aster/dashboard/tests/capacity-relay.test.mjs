@@ -46,6 +46,64 @@ const status = (values = {}) => ({
   ...values,
 });
 
+test('returning to an old healthy status waits for an update without implying a WS failure', () => {
+  const relay = status();
+  const before = structuredClone(relay);
+  for (const update of [
+    { now: timestamp + 8, updatedAt: timestamp },
+    { now: timestamp + 30, updatedAt: timestamp },
+    { ...options, connectionError: 'API unavailable' },
+  ]) {
+    const view = capacityRelayView(relay, update);
+    assert.equal(view.stale, true);
+    assert.equal(view.connectionTone, 'muted');
+    assert.equal(view.connection, 'WS 状态待更新');
+    assert.equal(view.dataTone, 'warning');
+    assert.match(view.data, /时效待更新/);
+    assert.equal(view.samples[0].tone, 'muted');
+  }
+  const recovered = capacityRelayView(
+    { ...relay, observed_at: timestamp + 30 },
+    { now: timestamp + 30, updatedAt: timestamp + 30 },
+  );
+  assert.equal(recovered.connectionTone, 'good');
+  assert.equal(recovered.connection, 'WS 已连接');
+  assert.equal(recovered.dataTone, 'good');
+  assert.deepEqual(relay, before);
+});
+
+test('sample and HTTP problems do not change a confirmed healthy WS connection', () => {
+  for (const values of [
+    { samples: [] },
+    { samples: [sample({ age_seconds: 2.8 })] },
+    { samples: [sample({ age_seconds: 9 })] },
+    { http: { ...status().http, last_error: 'snapshot_invalid' } },
+  ]) {
+    const view = capacityRelayView(status(values), options);
+    assert.equal(view.connectionTone, 'good');
+    assert.equal(view.connection, 'WS 已连接');
+    assert.equal(view.dataTone, 'warning');
+  }
+});
+
+test('known WS problems remain warnings even when their status is old', () => {
+  for (const values of [
+    { connected: false },
+    { running: false },
+    { ws: { ...status().ws, last_error: 'stream_unavailable' } },
+  ]) {
+    for (const age of [0, 8, 30]) {
+      const view = capacityRelayView(status(values), {
+        now: timestamp + age,
+        updatedAt: timestamp,
+      });
+      assert.equal(view.connectionTone, 'warning');
+      assert.notEqual(view.connection, 'WS 状态待更新');
+      if (age >= 8) assert.match(view.connection, /最近记录/);
+    }
+  }
+});
+
 test('unconfigured, unavailable legacy state and demo are distinct', () => {
   const unconfigured = capacityRelayView(null, options);
   const unsupported = capacityRelayView(undefined, options);
@@ -55,7 +113,7 @@ test('unconfigured, unavailable legacy state and demo are distinct', () => {
   assert.equal(demo.connection, '演示模式');
   assert.equal(demo.samples.length, 0);
   for (const view of [unconfigured, unsupported, demo])
-    assert.equal(view.tone, 'muted');
+    assert.equal(view.connectionTone, 'muted');
 });
 
 test('legacy basic connection fields cannot establish sample freshness', () => {
@@ -69,8 +127,9 @@ test('legacy basic connection fields cannot establish sample freshness', () => {
     options,
   );
   assert.equal(view.stale, true);
-  assert.equal(view.connection, '最近记录 · WS 已连接');
-  assert.notEqual(view.tone, 'good');
+  assert.equal(view.connection, 'WS 状态待更新');
+  assert.equal(view.connectionTone, 'muted');
+  assert.notEqual(view.dataTone, 'good');
   assert.match(view.note, /时间缺失或异常/);
   assert.equal(view.samples.length, 0);
 });
@@ -86,19 +145,20 @@ test('WS connection, received messages and accepted samples are separate facts',
   );
   assert.equal(view.connection, 'WS 已连接');
   assert.equal(view.data, '采集时 · 等待有效样本');
-  assert.notEqual(view.tone, 'good');
+  assert.notEqual(view.dataTone, 'good');
   const expired = capacityRelayView(
     status({ samples: [sample({ age_seconds: 9 })] }),
     options,
   );
   assert.equal(expired.connection, 'WS 已连接');
   assert.equal(expired.samples[0].freshness, '采集时 · 缓存已过期');
-  assert.notEqual(expired.tone, 'good');
+  assert.notEqual(expired.dataTone, 'good');
 });
 
 test('a current accepted OI sample displays its transport without claiming full coverage', () => {
   const view = capacityRelayView(status(), options);
-  assert.equal(view.tone, 'good');
+  assert.equal(view.connectionTone, 'good');
+  assert.equal(view.dataTone, 'good');
   assert.equal(view.data, '采集时 · 1 项缓存有效');
   assert.equal(view.samples[0].sourceLabel, 'WS 推送');
   assert.equal(view.samples[0].kindLabel, '公开额度');
@@ -122,7 +182,7 @@ test('HTTP activity or successful response alone does not prove usable HTTP data
       options,
     );
     assert.doesNotMatch(view.data, /样本有效|缓存有效/);
-    assert.notEqual(view.tone, 'good');
+    assert.notEqual(view.dataTone, 'good');
     if (http.inflight) assert.match(view.data, /HTTP 补取中/);
   }
   const retainedWs = capacityRelayView(
@@ -152,7 +212,8 @@ test('fresh HTTP samples can remain usable while WS is awaiting reconnection', (
   assert.match(view.data, /HTTP 补取样本有效/);
   assert.equal(view.wsError, 'WS 连接暂不可用');
   assert.equal(view.httpError, null);
-  assert.equal(view.tone, 'warning');
+  assert.equal(view.connectionTone, 'warning');
+  assert.equal(view.dataTone, 'good');
 });
 
 test('HTTP errors remain visible independently of a healthy WS stream', () => {
@@ -165,7 +226,7 @@ test('HTTP errors remain visible independently of a healthy WS stream', () => {
   assert.equal(view.connection, 'WS 已连接');
   assert.equal(view.wsError, null);
   assert.equal(view.httpError, 'HTTP 快照内容无效或已过期');
-  assert.notEqual(view.tone, 'good');
+  assert.notEqual(view.dataTone, 'good');
 });
 
 test('an explicit cleared transport error overrides a retained legacy error', () => {
@@ -185,14 +246,14 @@ test('an explicit cleared transport error overrides a retained legacy error', ()
   );
   assert.equal(httpRecovered.httpError, null);
   assert.equal(httpRecovered.wsError, null);
-  assert.equal(httpRecovered.tone, 'good');
+  assert.equal(httpRecovered.dataTone, 'good');
   assert.doesNotMatch(httpRecovered.data, /HTTP 补取样本有效/);
   const wsRecovered = capacityRelayView(
     status({ last_error: 'stream_unavailable' }),
     options,
   );
   assert.equal(wsRecovered.wsError, null);
-  assert.equal(wsRecovered.tone, 'good');
+  assert.equal(wsRecovered.connectionTone, 'good');
 });
 
 test('polling delay does not age the server sample or invent a cycle expiry', () => {
@@ -207,7 +268,7 @@ test('polling delay does not age the server sample or invent a cycle expiry', ()
   assert.equal(view.samples[0].freshness, '采集时 · 额度缓存有效 · 1 秒内');
   assert.equal(view.data, '采集时 · 1 项缓存有效');
   assert.equal(view.samples[0].tone, 'good');
-  assert.equal(view.tone, 'good');
+  assert.equal(view.dataTone, 'good');
   assert.deepEqual(relay, before);
 });
 
@@ -224,7 +285,7 @@ test('a sample already outside the cycle lifetime at observation remains explici
   );
   assert.match(view.data, /^采集时 · .*循环额度已过期/);
   assert.equal(view.samples[0].tone, 'warning');
-  assert.equal(view.tone, 'warning');
+  assert.equal(view.dataTone, 'warning');
 });
 
 test('OI cache lifetime and the shorter cycle lifetime keep their own boundaries', () => {
@@ -252,7 +313,7 @@ test('bracket freshness does not imply current OI or cycle readiness', () => {
   const view = capacityRelayView(relay, options);
   assert.equal(view.samples[0].freshness, '采集时 · 档位缓存有效');
   assert.match(view.data, /无有效公开额度/);
-  assert.notEqual(view.tone, 'good');
+  assert.notEqual(view.dataTone, 'good');
   const later = capacityRelayView(relay, {
     now: timestamp + 0.5,
     updatedAt: timestamp,
@@ -286,8 +347,9 @@ test('status ages of eight seconds or an API connection error suppress all green
       update,
     );
     assert.equal(view.stale, true);
-    assert.equal(view.tone, 'warning');
-    assert.match(view.connection, /最近记录/);
+    assert.equal(view.connectionTone, 'muted');
+    assert.equal(view.dataTone, 'warning');
+    assert.equal(view.connection, 'WS 状态待更新');
     assert.match(view.data, /最近记录/);
     for (const row of view.samples) {
       assert.equal(row.ageSeconds, 0.2);
@@ -322,7 +384,8 @@ test('unknown, nonfinite and future observation or API timestamps never appear c
       capacityRelayView(status(), { ...options, updatedAt: value }),
     ]) {
       assert.equal(view.stale, true);
-      assert.notEqual(view.tone, 'good');
+      assert.notEqual(view.connectionTone, 'good');
+      assert.notEqual(view.dataTone, 'good');
       assert.notEqual(view.samples[0].tone, 'good');
     }
   }
@@ -352,7 +415,7 @@ test('invalid sample age, receive time, kind, source or lifetime cannot be fresh
       options,
     );
     assert.equal(view.samples[0].freshness, '时效未知');
-    assert.notEqual(view.tone, 'good');
+    assert.notEqual(view.dataTone, 'good');
     assert.doesNotMatch(view.data, /缓存有效/);
   }
   const enlarged = capacityRelayView(
@@ -375,7 +438,7 @@ test('stopped and closed transports are never presented as connected', () => {
   ]) {
     const view = capacityRelayView(status(values), options);
     assert.equal(view.connection, label);
-    assert.notEqual(view.tone, 'good');
+    assert.notEqual(view.connectionTone, 'good');
     if (values.enabled === false || values.closed) {
       assert.doesNotMatch(view.data, /缓存有效/);
       assert.equal(view.samples[0].tone, 'muted');

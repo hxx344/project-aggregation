@@ -12,7 +12,8 @@ type RelaySampleView = {
   tone: RelayTone;
 };
 type RelayView = {
-  tone: RelayTone;
+  connectionTone: RelayTone;
+  dataTone: RelayTone;
   connection: string;
   data: string;
   stale: boolean;
@@ -164,7 +165,8 @@ export function capacityRelayView(
   if (demo)
     return {
       ...empty,
-      tone: 'muted',
+      connectionTone: 'muted',
+      dataTone: 'muted',
       connection: '演示模式',
       data: '无实时副服务器状态',
       stale: false,
@@ -177,7 +179,8 @@ export function capacityRelayView(
   if (relay === null || relay === undefined)
     return {
       ...empty,
-      tone: connectionError ? 'warning' : 'muted',
+      connectionTone: 'muted',
+      dataTone: connectionError ? 'warning' : 'muted',
       connection: `${stateStale ? '最近记录 · ' : ''}${relay === null ? '未配置副服务器' : '服务未提供状态'}`,
       data: relay === null ? '副服务器未启用' : '暂无连接详情',
       stale: stateStale,
@@ -210,6 +213,11 @@ export function capacityRelayView(
     'http',
   );
   const active = relay.enabled && !relay.closed;
+  // Page polling and sample freshness cannot establish a WS disconnection.
+  // Keep known transport failures visible, but do not present an old healthy
+  // observation as either a current connection or a new connection failure.
+  const wsProblem = !relay.running || !relay.connected || Boolean(wsError);
+  const awaitingStatus = active && !wsProblem && stale;
   const freshRows = records.filter((sample) => sample.cacheFresh);
   const freshHttp = freshRows.filter((sample) => sample.isHttp).length;
   const freshOi = freshRows.filter((sample) => sample.isOi).length;
@@ -251,19 +259,25 @@ export function capacityRelayView(
       ? `${observationAge === null || stateAge === null ? '状态时间缺失或异常' : '状态已超过 8 秒未更新'}，显示最近记录。${SAMPLE_NOTE}`
       : SAMPLE_NOTE;
   return {
-    tone: stale
+    connectionTone: !active
+      ? 'muted'
+      : wsProblem
+        ? 'warning'
+        : stale
+          ? 'muted'
+          : 'good',
+    dataTone: stale
       ? 'warning'
       : !active
         ? 'muted'
-        : relay.running &&
-            relay.connected &&
-            freshOi > 0 &&
+        : freshOi > 0 &&
             samples.every((sample) => sample.tone === 'good') &&
-            !wsError &&
             !httpError
           ? 'good'
           : 'warning',
-    connection: `${stale ? '最近记录 · ' : ''}${connection}`,
+    connection: awaitingStatus
+      ? 'WS 状态待更新'
+      : `${stale ? '最近记录 · ' : ''}${connection}`,
     data: `${stale ? '最近记录 · ' : active && relay.samples !== undefined ? '采集时 · ' : ''}${data}`,
     stale,
     note,

@@ -64,11 +64,15 @@ export function CapacityRelayPanel({
           <strong>副服务器额度连接</strong>
         </span>
         <span className="relay-status-overview">
-          <span className={`relay-status-label relay-tone-${view.tone}`}>
+          <span
+            className={`relay-status-label relay-tone-${view.connectionTone}`}
+          >
             <i aria-hidden="true" />
             {view.connection}
           </span>
-          <span className="relay-status-data">{view.data}</span>
+          <span className={`relay-status-data relay-tone-${view.dataTone}`}>
+            {view.data}
+          </span>
         </span>
         <span className="relay-status-toggle">
           <span className="relay-show-details">详情</span>
@@ -207,8 +211,8 @@ export function CapacityRelayPanel({
               分钟。连接正常或缓存新鲜不代表已通过开仓检查。
             </p>
             <p className="relay-status-footnote">
-              页面沿用约 3
-              秒一次的状态刷新；表格显示主服务器采集状态时的样本年龄，不叠加页面等待时间。两次页面刷新之间主服务器仍可接收新样本，实际开仓按当时最新样本校验。请求次数在主服务重启后重新计数。
+              页面前台约 3 秒刷新一次，后台刷新会放慢。WS
+              状态待更新表示页面尚未取得最新状态，不代表副服务器断线。表格显示主服务器采集状态时的样本年龄，不叠加页面等待时间。两次页面刷新之间主服务器仍可接收新样本，实际开仓按当时最新样本校验。请求次数在主服务重启后重新计数。
             </p>
           </>
         ) : null}
