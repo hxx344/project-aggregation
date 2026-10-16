@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { reconcileDiagnostics, snapshotDiagnostics } from '../server/diagnostics.mjs';
+import { buildHubSummary } from '../modules/asset/lib/hub-summary.ts';
 
 const now = Date.parse('2026-10-07T00:00:00Z');
 const project = { staleAfterSeconds: 120 };
@@ -35,4 +36,18 @@ test('legacy health is conservative while classified notices do not become fault
   assert.equal(notices.length, 1); assert.equal(notices[0].kind, 'notice');
   const failed = snapshotDiagnostics({ ...fresh, updatedAt: null, lastSuccessAt: null, transportError: { code: 'timeout', message: '超时' } }, project, now);
   assert.deepEqual(failed.map(item => item.id), ['hub:connection']);
+});
+
+test('disconnecting an expired Asset account clears both health and freshness diagnostics', () => {
+  const source = { assets: [{ project: 'var', mode: 'variational', value: 125, updatedAt: '2020-01-01T00:00:00Z', error: 'Var session failed' }],
+    fx: 7, fxStatus: { fetchedAt: new Date(now).toISOString() }, example: false, history: [] };
+  const state = connectedExchanges => {
+    const { data } = buildHubSummary({ ...source, connectedExchanges }, now);
+    return { ...data, sourceState: data.health.state, sourceMessage: data.health.message,
+      state: data.health.state, staleAfterSeconds: data.health.staleAfterSeconds, lastSuccessAt: new Date(now).toISOString() };
+  };
+  const failed = snapshotDiagnostics(state(['variational']), project, now);
+  assert.deepEqual(failed.map(item => item.id), ['hub:legacy-health', 'hub:data-freshness']);
+  assert.deepEqual(snapshotDiagnostics({ ...state([]), diagnostics: failed }, project, now), []);
+  assert.deepEqual(snapshotDiagnostics(state(['variational']), project, now).map(item => item.id), ['hub:legacy-health', 'hub:data-freshness']);
 });

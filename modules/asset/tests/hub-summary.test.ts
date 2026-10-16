@@ -59,6 +59,75 @@ test('Gate USD estimates count once and retain source failure and age in the sum
   assert.doesNotMatch(failed.health.message,/未识别/);
 });
 
+test('disconnected single-account exchanges retain valuations without a live freshness requirement', () => {
+  const old = '2020-01-01T00:00:00.000Z';
+  for (const mode of ['bybit', 'binance', 'okx', 'gate', 'variational']) {
+    const source = { ...input(), connectedExchanges: [], assets: [{ ...asset(mode, old, 123.45), error: 'Previous sync failed' }] };
+    const original = structuredClone(source);
+    const summary = buildHubSummary(source, now).data;
+    assert.equal(summary.health.state, 'online', mode);
+    assert.equal(summary.freshness, 'static');
+    assert.equal(summary.updatedAt, old, 'Do not turn disconnect time into a fresh valuation');
+    assert.equal(summary.metrics.find(metric => metric.key === 'ledger_total')?.value, 123.45);
+    assert.equal(summary.metrics.find(metric => metric.key === 'retained_valuation_at')?.value, old);
+    assert.match(summary.health.message, /未连接账户保留原估值/);
+    assert.doesNotMatch(summary.health.message, /更新失败|源时间已过期/);
+    assert.deepEqual(source, original);
+
+    const connected = buildHubSummary({ ...source, connectedExchanges: [mode] }, now).data;
+    assert.equal(connected.health.state, 'partial', 'Saved but expired credentials remain a failure');
+    assert.equal(connected.freshness, undefined);
+    assert.match(connected.health.message, /更新失败.*源时间已过期/);
+    assert.equal(buildHubSummary({ ...source, connectedExchanges: [mode], assets: [asset(mode, old)] }, now).data.health.state, 'stale');
+  }
+});
+
+test('retained valuations do not age active data or hide independent missing data and FX failures', () => {
+  const retained = asset('variational', '2020-01-01T00:00:00.000Z', 125);
+  const source = { ...input(), connectedExchanges: ['okx'], assets: [retained, asset('okx', fresh, 200)] };
+  const summary = buildHubSummary(source, now).data;
+  assert.equal(summary.health.state, 'online');
+  assert.equal(summary.freshness, undefined);
+  assert.equal(summary.updatedAt, fresh);
+  assert.equal(summary.metrics[0].value, 325);
+  assert.equal(buildHubSummary({ ...source, assets: [retained, asset('okx', null)] }, now).data.health.state, 'stale');
+  assert.equal(buildHubSummary({ ...source, assets: [{ ...retained, value: null }, asset('okx')] }, now).data.health.state, 'partial');
+  assert.equal(buildHubSummary({ ...source, fxStatus: { fetchedAt: fresh, error: 'FX failed' } }, now).data.health.state, 'partial');
+  assert.equal(buildHubSummary({ ...source, assets: [retained, asset('market', null)] }, now).data.health.state, 'stale');
+  assert.equal(buildHubSummary({ ...source, assets: [retained, asset('unrecognized')] }, now).data.health.state, 'partial');
+  assert.equal(buildHubSummary({ ...source, assets: [retained, asset('aster', null)] }, now).data.health.state, 'stale', 'Aster multi-account handling is unchanged');
+  assert.equal(buildHubSummary({ ...source, assets: [asset('variational', null)] }, now).data.health.state, 'partial', 'A retained record still needs a valid valuation time');
+});
+
+test('summary reads live owner-scoped connections so existing disconnected VAR records recover without a rewrite', async () => {
+  const database = openDatabase(':memory:');
+  try {
+    const row = { ...asset('variational', '2020-01-01T00:00:00.000Z', 125), status: '已断开 · 保留旧值' };
+    const persisted = JSON.stringify(row);
+    await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-var', persisted).run();
+    for (const [key, value] of Object.entries({ fx: '7', 'fx-status': JSON.stringify({ fetchedAt: fresh }), 'source-ledger': JSON.stringify({ source: 'personal', periods: [] }) })) {
+      await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', key, value).run();
+    }
+    await database.prepare('INSERT INTO connections(owner,exchange,encrypted,updated_at) VALUES(?,?,?,?)').bind('other-owner', 'variational', 'must-not-be-read', fresh).run();
+    const before = (await readHubSummary(database, 'owner', now)).data;
+    assert.equal(before.health.state, 'online');
+    assert.equal(before.freshness, 'static');
+    assert.equal(before.updatedAt, row.updatedAt);
+
+    await database.prepare('INSERT INTO connections(owner,exchange,encrypted,updated_at) VALUES(?,?,?,?)').bind('owner', 'variational', 'must-not-be-read', fresh).run();
+    const active = (await readHubSummary(database, 'owner', now)).data;
+    assert.equal(active.health.state, 'stale', 'The actual connection overrides the old status text');
+    assert.equal(active.freshness, undefined);
+    await database.prepare('DELETE FROM connections WHERE owner = ? AND exchange = ?').bind('owner', 'variational').run();
+    const disconnected = (await readHubSummary(database, 'owner', now)).data;
+    assert.equal(disconnected.health.state, 'online');
+    assert.equal(disconnected.freshness, 'static');
+    assert.equal(disconnected.metrics[0].value, 125);
+    assert.equal((await database.prepare('SELECT data FROM assets WHERE owner = ? AND id = ?').bind('owner', 'row-var').first<{ data: string }>())?.data, persisted);
+    assert.doesNotMatch(JSON.stringify(disconnected), /must-not-be-read|已断开/);
+  } finally { database.close(); }
+});
+
 test('summary preserves ledger totals, withdrawals, oldest dynamic time and CNY/USD units', () => {
   const result = buildHubSummary({ ...input(), assets: [asset('market', fresh), asset('aster', '2026-09-22T16:58:00Z', 200), { ...asset('manual', '2020-01-01T00:00:00Z', 25), project: ' 出金 ' }] }, now);
   assert.equal(result.schemaVersion, 2);

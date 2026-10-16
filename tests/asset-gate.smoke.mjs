@@ -373,6 +373,10 @@ try {
   assert.equal(storedCredential(), undefined);
   assert.match(gateAsset(ledger).status, /断开.*旧值/);
   assert.equal(gateCalls, expectedGateCalls);
+  clearRefreshThrottle();
+  ledger = await success('/api/sync', { method: 'POST', body: {} });
+  assert.equal(gateCalls, expectedGateCalls, 'Refreshing after disconnect must not request Gate');
+  balanceUnchanged(gateAsset(ledger), asset);
 
   // Old ledgers may contain either alias as a manual row. Set up that legacy
   // state directly; exercise adoption through the real connection endpoint.
@@ -428,8 +432,57 @@ try {
   assert.equal(gateAsset(await success('/api/ledger')).value, expectedUsd);
   assert.ok(existsSync(join(dataDir, 'backups', imported.backupName)));
   assert.equal(gateCalls, expectedGateCalls, 'Import must preserve balances without querying Gate');
+
+  // Isolate summary health from the original workbook's stale market rows and
+  // deliberately failing FX fixture. This temporary ledger is discarded below.
+  const staleGate = { ...importedAsset, updatedAt: '2020-01-01T00:00:00.000Z' };
+  database.prepare('DELETE FROM assets WHERE owner = ? AND id <> ?').run(owner, staleGate.id);
+  const saveSummaryAsset = database.prepare('UPDATE assets SET data = ? WHERE owner = ? AND id = ?');
+  saveSummaryAsset.run(JSON.stringify(staleGate), owner, staleGate.id);
+  const saveSetting = database.prepare('INSERT INTO settings(owner,key,value) VALUES(?,?,?) ON CONFLICT(owner,key) DO UPDATE SET value=excluded.value');
+  saveSetting.run(owner, 'fx', '7');
+  saveSetting.run(owner, 'fx-status', JSON.stringify({ source: 'saved', fetchedAt: new Date().toISOString(), error: null }));
+  let summary = (await success('/api/hub/summary?schemaVersion=2')).data;
+  assert.equal(summary.health.state, 'stale', 'A connected Gate account still requires a fresh source time');
+  assert.equal(summary.freshness, undefined);
+  assert.equal(summary.updatedAt, staleGate.updatedAt);
+  staleGate.error = 'Gate 同步失败，保留旧值';
+  saveSummaryAsset.run(JSON.stringify(staleGate), owner, staleGate.id);
+  assert.equal((await success('/api/hub/summary?schemaVersion=2')).data.health.state, 'partial', 'Connected account failures remain visible');
+
+  ledger = await success('/api/connections', { method: 'DELETE', body: { exchange: 'gate' } });
+  balanceUnchanged(gateAsset(ledger), staleGate);
+  summary = (await success('/api/hub/summary?schemaVersion=2')).data;
+  assert.equal(summary.health.state, 'online', 'An intentional disconnect must clear the runtime stale warning');
+  assert.equal(summary.freshness, 'static');
+  assert.equal(summary.updatedAt, staleGate.updatedAt, 'Static valuation retains the actual old source time');
+  assert.equal(summary.metrics.find(metric => metric.key === 'holdings').value, expectedUsd);
+  assert.equal(gateCalls, expectedGateCalls, 'Disconnect and summary reads must not refresh the account');
+
+  since = Date.now();
+  ledger = await success('/api/connections', { method: 'POST', body: credentials });
+  assert.equal(gateCalls, ++expectedGateCalls);
+  assertBalance(gateAsset(ledger), since);
+  summary = (await success('/api/hub/summary?schemaVersion=2')).data;
+  assert.equal(summary.health.state, 'online');
+  assert.equal(summary.freshness, undefined, 'Reconnecting restores dynamic freshness checks');
+  assert.equal(summary.updatedAt, gateAsset(ledger).updatedAt);
+
+  // A persisted, already-disconnected Var row must recover on a read alone,
+  // retaining its old value, timestamp and diagnostic without renewing Gate.
+  const disconnectedVar = { ...staleGate, id: 'row-900002', project: 'Var', mode: 'variational', quantity: 42, value: 42, error: 'Var 会话已失效' };
+  database.prepare('INSERT INTO assets(owner,id,data) VALUES(?,?,?)').run(owner, disconnectedVar.id, JSON.stringify(disconnectedVar));
+  const beforeSummaryRows = storedAssets();
+  const beforeSummaryRequests = [gateCalls, quoteCalls, externalFailures];
+  summary = (await success('/api/hub/summary?schemaVersion=2')).data;
+  assert.equal(summary.health.state, 'online', 'An old disconnected Var error must not degrade the active account');
+  assert.equal(summary.freshness, undefined);
+  assert.equal(summary.updatedAt, gateAsset(ledger).updatedAt, 'Only connected dynamic rows determine the source time');
+  assert.equal(summary.metrics.find(metric => metric.key === 'holdings').value, expectedUsd + 42);
+  assert.deepEqual(storedAssets(), beforeSummaryRows, 'Reading health must preserve stored valuations and diagnostics');
+  assert.deepEqual([gateCalls, quoteCalls, externalFailures], beforeSummaryRequests, 'Reading health must not contact any data source');
   assert.deepEqual(transportViolations, [], 'All outbound Gate requests must satisfy the signed GET contract');
-  console.log('Gate production smoke passed: signed USDT GET, non-parity USD conversion, safe HTTP and quote diagnostics, encrypted credentials, atomic connect/replace, independent pricing, retained failures/disconnect, manual aliases, duplicate rejection and import preservation');
+  console.log('Gate production smoke passed: signed USDT GET, non-parity USD conversion, safe HTTP and quote diagnostics, encrypted credentials, atomic connect/replace, independent pricing, retained failures/disconnect, manual aliases, duplicate rejection, import preservation and connection-aware summary health');
 } catch (error) {
   console.error(error);
   process.exitCode = 1;
