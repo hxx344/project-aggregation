@@ -128,8 +128,7 @@ class RuntimeDependencyTests(unittest.TestCase):
             self.assertFalse((self.target / 'node_modules' / name).exists())
         self.assertFalse(any(module.is_link(path) for path in self.target.rglob('*')))
 
-    def test_five_module_package_includes_aster_static_and_python_without_vinext(self):
-        from unittest.mock import patch
+    def prepare_five_modules(self):
         runtime, vinext = self.package('runtime'), self.package('vinext')
         for importer in module.IMPORTERS:
             self.importer({'runtime': runtime}, importer=importer)
@@ -145,6 +144,11 @@ class RuntimeDependencyTests(unittest.TestCase):
             file = self.source / name
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text('runtime')
+        return required
+
+    def test_five_module_package_includes_aster_static_and_python_without_vinext(self):
+        from unittest.mock import patch
+        required = self.prepare_five_modules()
         with patch.object(module, 'read_runtime_lock', return_value=self.lock):
             module.stage_runtime(self.source, self.target)
         for name in required:
@@ -152,6 +156,98 @@ class RuntimeDependencyTests(unittest.TestCase):
         self.assertFalse((self.target / 'node_modules/vinext').exists())
         self.assertFalse((self.target / 'modules/aster/dashboard/node_modules').exists())
         self.assertTrue((self.target / 'node_modules/runtime/package.json').is_file())
+
+    def test_embedded_stage_omits_hub_outputs_and_dependency_materialization(self):
+        from unittest.mock import patch
+        required = self.prepare_five_modules()
+        # The source installer does not hydrate the hub dist for this operation.
+        shutil.rmtree(self.source / 'dist')
+        with patch.object(module, 'copy_runtime_dependencies', side_effect=AssertionError('Dependencies must be cached separately')):
+            module.stage_runtime(self.source, self.target, embedded_only=True)
+        self.assertEqual({'modules', 'deploy'}, {p.name for p in self.target.iterdir()})
+        for name in required:
+            if name.startswith(('modules/', 'deploy/')):
+                self.assertTrue((self.target / name).is_file(), name)
+        self.assertFalse((self.target / 'node_modules').exists())
+
+    def test_embedded_stage_still_rejects_missing_bridge(self):
+        from unittest.mock import patch
+        self.prepare_five_modules()
+        (self.source / 'server/modules/aster.mjs').unlink()
+        with patch.object(module, 'read_runtime_lock', return_value=self.lock):
+            with self.assertRaisesRegex(ValueError, 'Missing module runtime/build output: server/modules/aster.mjs'):
+                module.stage_runtime(self.source, self.target, embedded_only=True)
+
+    def test_dependency_stage_has_fixed_importer_targets_and_validated_production_graph(self):
+        from unittest.mock import patch
+        self.prepare_five_modules()
+        with patch.object(module, 'read_runtime_lock', return_value=self.lock):
+            module.stage_dependencies(self.source, self.target)
+        self.assertEqual({'modules', 'node_modules'}, {p.name for p in self.target.iterdir()})
+        for importer in module.IMPORTERS:
+            self.assertTrue((self.target / importer / 'node_modules').is_dir())
+        self.assertTrue((self.target / 'node_modules/runtime/package.json').is_file())
+        self.assertFalse((self.target / 'node_modules/vinext').exists())
+        shutil.rmtree(self.target)
+        self.unlink(self.source / 'node_modules/runtime')
+        with patch.object(module, 'read_runtime_lock', return_value=self.lock):
+            with self.assertRaisesRegex(ValueError, 'Missing production dependency: runtime'):
+                module.stage_dependencies(self.source, self.target)
+
+    def test_embedded_only_option_cannot_change_full_archive_contract(self):
+        for flag in ('--embedded-only', '--dependencies-only'):
+            with self.subTest(flag=flag):
+                result = subprocess.run([sys.executable, str(module.__file__), flag],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn('requires --stage-only', result.stderr)
+
+    def test_fixed_importer_links_preserve_shared_and_conflicting_dependency_resolution(self):
+        from unittest.mock import patch
+        shared1 = self.package('shared', code='module.exports = "first";')
+        shared2 = self.package('shared', '2.0.0', code='module.exports = "second";')
+        root_only = self.package('root-only', code='module.exports = "root";')
+        peer_code = 'module.exports = [require("shared"), require("root-only")];'
+        consumer1 = self.package('consumer', context='(shared@1.0.0)', code=peer_code)
+        consumer2 = self.package('consumer', context='(shared@2.0.0)', code=peer_code)
+        for consumer, shared in ((consumer1, shared1), (consumer2, shared2)):
+            self.connect(consumer, shared, peer=True)
+            self.connect(consumer, root_only)
+        nested = self.package('nested', code='module.exports = require("shared");')
+        self.connect(nested, shared2)
+        for importer in module.IMPORTERS:
+            deps = {'shared': shared1, 'consumer': consumer1, 'root-only': root_only}
+            if importer == 'modules/asset':
+                deps = {'shared': shared2, 'consumer': consumer2, 'nested': nested}
+            self.importer(deps, importer=importer)
+        with patch.object(module, 'read_runtime_lock', return_value=self.lock):
+            module.stage_dependencies(self.source, self.target)
+        self.assertTrue((self.target / 'modules/asset/node_modules/consumer').is_dir())
+        self.assertFalse((self.target / 'modules/asset/node_modules/root-only').exists())
+        self.assertFalse((self.target / 'modules/asset/node_modules/consumer/node_modules/root-only').exists())
+        release = self.source.parent / 'release'
+        for importer in module.IMPORTERS:
+            directory = release / importer
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / 'package.json').write_text('{}')
+            self.link(directory / 'node_modules', self.target / importer / 'node_modules')
+        # Only the immutable production layout remains available to the release.
+        self.move(self.source)
+        script = '''
+          const { createRequire } = require('node:module');
+          const { resolve } = require('node:path');
+          const root = createRequire(resolve('package.json'));
+          const asset = createRequire(resolve('modules/asset/package.json'));
+          const monitor = createRequire(resolve('modules/monitor/package.json'));
+          console.log(JSON.stringify([root('consumer'), asset('consumer'), asset('nested'), monitor('shared')]));
+        '''
+        self.assertEqual([['first', 'root'], ['second', 'root'], 'second', 'first'],
+                         json.loads(self.run_node(script, release)))
+        (release / 'modules/asset/check.mjs').write_text(
+            'import consumer from "consumer"; import nested from "nested"; console.log(JSON.stringify([consumer,nested]));')
+        result = subprocess.run(['node', str(release / 'modules/asset/check.mjs')],
+                                cwd=release, check=True, capture_output=True, text=True)
+        self.assertEqual([['second', 'root'], 'second'], json.loads(result.stdout))
 
     def test_missing_required_direct_and_transitive_dependencies_fail(self):
         runtime, child = self.package('runtime'), self.package('required-child')

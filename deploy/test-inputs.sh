@@ -28,7 +28,7 @@ refresh() {
   commit=$(git -C "$source_dir" rev-parse HEAD)
   input_keys
 }
-capture() { before=($dependency_key $typecheck_key $test_key $build_key $application_key); }
+capture() { before=($dependency_key $typecheck_key $test_key $build_key $application_key); runtime_before=$runtime_dependency_key; }
 compare() {
   local after=($dependency_key $typecheck_key $test_key $build_key $application_key) index=0 changed
   for changed in "$@"; do
@@ -88,10 +88,27 @@ module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${modul
 echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 0 1 0 1
 [[ ${module_build_keys[monitor]} != "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
    ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} == "${module_before[3]}" ]]
+module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+for file in trading/runtime.py requirements.lock; do
+  capture
+  embedded_before=$embedded_key
+  echo backend > "$source_dir/modules/aster/$file"; refresh; compare 0 0 1 0 1
+  [[ $runtime_dependency_key == "$runtime_before" && $embedded_key != "$embedded_before" && ${module_build_keys[monitor]} == "${module_before[0]}" &&
+     ${module_build_keys[asset]} == "${module_before[1]}" && ${module_build_keys[crossex]} == "${module_before[2]}" &&
+     ${module_build_keys[aster]} == "${module_before[3]}" ]]
+done
+for file in dashboard/page.tsx .env.production; do
+  capture
+  echo frontend > "$source_dir/modules/aster/$file"; refresh; compare 0 0 1 0 1
+  [[ $runtime_dependency_key == "$runtime_before" && ${module_build_keys[monitor]} == "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
+     ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} != "${module_before[3]}" ]]
+  module_before[3]=${module_build_keys[aster]}
+done
 capture
 mkdir -p "$source_dir/deploy"
 module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
 echo helper > "$source_dir/deploy/pnpm-runtime-lock.mjs"; refresh; compare 0 0 0 0 1
+[[ $runtime_dependency_key != "$runtime_before" ]]
 [[ ${module_build_keys[monitor]} == "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
    ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} == "${module_before[3]}" ]]
 capture
@@ -101,6 +118,7 @@ echo frontend >> "$source_dir/src/app.ts"; refresh; compare 0 1 1 1 1
 capture
 embedded_before=$embedded_key
 echo helper > "$source_dir/deploy/build-artifact-cache.py"; refresh; compare 0 0 0 1 1
+[[ $runtime_dependency_key == "$runtime_before" ]]
 [[ $embedded_key != "$embedded_before" && ${module_build_keys[monitor]} != "${module_before[0]}" &&
    ${module_build_keys[asset]} != "${module_before[1]}" && ${module_build_keys[crossex]} != "${module_before[2]}" &&
    ${module_build_keys[aster]} != "${module_before[3]}" ]]

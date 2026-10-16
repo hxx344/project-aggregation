@@ -852,3 +852,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `4197923` 基线上的 2026-10-16 构建优化工作区，五份 package 清单被改写而锁文件未变；固定 pnpm 11.25.0 的 `install --frozen-lockfile --lockfile-only --ignore-scripts --offline` 实际报 `ERR_PNPM_OUTDATED_LOCKFILE`，恢复 catalog 和已验证插件后通过。旧 `apply-ci-optimization-parallel.sh` 模板缺少当前打包器要求的 `--parser-user`；旧缓存草案没有向 `run_as_service` 的独立 HOME 传递 pip 路径。修正入口见 [构建说明](docs/build-performance.md)。这些草案未作为正式方案执行。
 
 **事件记录：** `build-optimization-entrypoint-20261016`；同一次构建优化审核中的关联问题，不推进主线复盘检查点。
+
+**同次用户反馈补充：** 2026-10-16 更新到 `668c32417df9` 的页面显示源码更新共 82 秒，其中 Aster 构建 18 秒、运行环境准备 27 秒、解包与发布目录准备 13 秒。该版本确实修改 Aster dashboard，构建合理；上轮 CI pip 缓存和重复类型检查没有覆盖服务器运行时组装。源码核对发现：默认不跑部署行为测试仍先恢复所有模块到无消费者的构建目录，随后再次恢复到可信目录；每次模块变化重新物化并复制全部生产 Node 依赖；Aster 构建键还覆盖整个 Python 模块。修正为按需工作区、独立固定生产依赖缓存与精确 importer 链接，并保留 Aster 实际引用的共享配置。首次新布局需建立缓存，不把 CI 成功或本地夹具耗时当作服务器提速结果。
+
+**补充验证入口：** [依赖布局测试](deploy/test-package-layout.py) 覆盖无原构建树时固定链接的 CJS/ESM、共享与冲突版本解析；[模块安装回归](deploy/test-module-incremental.sh) 覆盖后端变化不编译、依赖缓存复用、固定旧版本链接及无效缓存拒绝；[真实工作区检查](deploy/test-workspace.sh) 直接验收源码链接布局和独立发布包。该反馈与修正沿用同一事件 ID。

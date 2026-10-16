@@ -270,26 +270,40 @@ def copy_runtime_dependencies(source, destination, dependency_roots=(), node='no
     graph.materialize()
 
 
-def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=None):
-    for relative in ('dist', 'server'):
-        if is_link(source / relative):
-            raise ValueError('Runtime directory cannot be a link: ' + relative)
-        shutil.copytree(source / relative, stage / relative, ignore=checked_ignore({'__pycache__'}))
-    shutil.copy2(source / 'package.json', stage / 'package.json')
-    for notice in ('LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md'):
-        if (source / notice).is_file():
-            shutil.copy2(source / notice, stage / notice)
+def stage_dependencies(source, stage, dependency_roots=(), node='node', parser_user=None):
+    """Keep the existing production graph layout in one immutable source cache."""
+    copy_runtime_dependencies(source, stage, dependency_roots, node, parser_user=parser_user)
+    # All importers have a stable link target, including those whose complete
+    # dependency set resolves from the shared root without any local conflicts.
+    for importer in IMPORTERS:
+        (stage / importer / 'node_modules').mkdir(parents=True, exist_ok=True)
+
+
+def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=None, *, embedded_only=False):
+    # Source installs publish the hub separately from its pinned Git sources and
+    # verified dist cache. Do not copy those files into a stage that discards them.
+    if not embedded_only:
+        for relative in ('dist', 'server'):
+            if is_link(source / relative):
+                raise ValueError('Runtime directory cannot be a link: ' + relative)
+            shutil.copytree(source / relative, stage / relative, ignore=checked_ignore({'__pycache__'}))
+        shutil.copy2(source / 'package.json', stage / 'package.json')
+        for notice in ('LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md'):
+            if (source / notice).is_file():
+                shutil.copy2(source / notice, stage / notice)
     for module in MODULES:
         origin, target = source / 'modules' / module, stage / 'modules' / module
         if is_link(origin) or not origin.is_dir():
             raise ValueError('Missing embedded module: ' + module)
         shutil.copytree(origin, target, ignore=checked_ignore(EXCLUDED))
-    copy_runtime_dependencies(source, stage, dependency_roots, node, parser_user=parser_user)
+    if not embedded_only:
+        copy_runtime_dependencies(source, stage, dependency_roots, node, parser_user=parser_user)
     for relative in ('modules/monitor/dist/client/index.html', 'modules/asset/.next/BUILD_ID',
                      'modules/crossex/dist/index.html', 'modules/greeks/requirements.lock',
                      'server/modules/greeks-bridge.py', 'modules/aster/requirements.lock',
                      'modules/aster/dashboard/dist/client/index.html', 'server/modules/aster.mjs', 'server/modules/python-module.mjs'):
-        if not (stage / relative).is_file():
+        required_root = source if embedded_only and relative.startswith('server/') else stage
+        if not (required_root / relative).is_file():
             raise ValueError('Missing module runtime/build output: ' + relative)
     (stage / 'deploy').mkdir()
     shutil.copy2(source / 'deploy/migrate-modules.py', stage / 'deploy/migrate-modules.py')
@@ -302,16 +316,27 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('output/release'))
     parser.add_argument('--architecture', choices=('x64', 'arm64'))
     parser.add_argument('--stage-only', type=Path)
+    partial = parser.add_mutually_exclusive_group()
+    partial.add_argument('--embedded-only', action='store_true',
+                         help='With --stage-only, assemble only module sources, artifacts and migration helper')
+    partial.add_argument('--dependencies-only', action='store_true',
+                         help='With --stage-only, assemble the validated production dependency graph')
     parser.add_argument('--dependency-root', type=Path, action='append', default=[],
                         help='Trusted installed pnpm workspace root (may be repeated)')
     parser.add_argument('--node', default=os.environ.get('NODE_BIN', 'node'))
     parser.add_argument('--parser-user', help='Non-root username or UID for dependency lock parsing; required when running as root')
     args = parser.parse_args()
+    if (args.embedded_only or args.dependencies_only) and not args.stage_only:
+        parser.error('--embedded-only/--dependencies-only requires --stage-only')
     runtime_parser_credentials(args.parser_user)
     source, repository = args.source.resolve(), args.repository.resolve()
     if args.stage_only:
         args.stage_only.mkdir(parents=True, exist_ok=True)
-        stage_runtime(source, args.stage_only, args.dependency_root, args.node, args.parser_user)
+        if args.dependencies_only:
+            stage_dependencies(source, args.stage_only, args.dependency_root, args.node, args.parser_user)
+        else:
+            stage_runtime(source, args.stage_only, args.dependency_root, args.node, args.parser_user,
+                          embedded_only=args.embedded_only)
         return
     architecture = args.architecture or {'x86_64': 'x64', 'AMD64': 'x64', 'aarch64': 'arm64'}.get(platform.machine())
     if platform.system() != 'Linux' or not architecture:

@@ -82,6 +82,15 @@ printf '[workspace] root-behavior-tests: %ss\n' "$((SECONDS - stage_started))"
 stage_started=$SECONDS
 prepare_application
 validate_embedded_runtime "$release"
+source_runtime_dependencies_ready "$release" "$runtime_dependency_key"
+for importer in "${RUNTIME_DEPENDENCY_IMPORTERS[@]}"; do
+  if run_as_service test -w "$runtime_dependencies/$importer/node_modules"; then
+    echo 'The service account can modify the shared production dependency layout' >&2; exit 1
+  fi
+done
+if run_as_service test -w "$runtime_dependencies/node_modules/react/package.json"; then
+  echo 'The service account can modify a shared production package' >&2; exit 1
+fi
 run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$release"
 printf '[workspace] source-assembly-and-package-check: %ss\n' "$((SECONDS - stage_started))"
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
@@ -105,7 +114,14 @@ fi
 work_dir="$test_root/reuse-work"
 mkdir "$work_dir"
 modules_prepared=0
+module_outputs_prepared=()
 prepare_build_cache_helper
+# The default update path only needs trusted caches. It must not extract a
+# disposable build workspace or materialize dependencies on a warm reuse.
+prepare_module_builds cache-only
+[[ ! -e "$work_dir/source" ]]
+prepare_runtime_dependencies
+[[ ! -e "$work_dir/trusted-dependencies" && ! -e "$work_dir/runtime-dependencies" ]]
 prepare_workspace
 run_as_service() {
   [[ "$1" == /usr/bin/python3 && "$2" == -I ]] || { echo 'Unexpected rebuild while reusing verified module artifacts' >&2; return 91; }
