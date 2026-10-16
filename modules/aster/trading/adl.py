@@ -30,6 +30,15 @@ MAX_SECONDS = 1800
 MAX_BATCHES = 500
 
 
+class AdlStateConflict(TradingError):
+    """A stale worker must not overwrite a newer incident journal."""
+
+
+def _retry_delay(error, minimum=10):
+    value = getattr(error, "retry_after", 0)
+    return max(minimum, value) if type(value) in (int, float) and math.isfinite(value) else minimum
+
+
 def _get(db, key, default=None):
     row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
     return json.loads(row[0]) if row else deepcopy(default)
@@ -375,13 +384,104 @@ class AdlController:
         for aid, snapshot in (snapshots or {}).items():
             snapshot.require_current(brokers[aid])
 
-    def _read(self, brokers):
+    def _read(self, brokers, *, market_only=False):
+        adl_exchange.require_snapshot_budget(brokers, market_only=market_only)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="adl-scene") as pool:
-            futures = {aid: pool.submit(adl_exchange.reduction_snapshot, broker) for aid, broker in brokers.items()}
+            futures = {aid: pool.submit(adl_exchange.reduction_snapshot, broker, market_only=market_only)
+                       for aid, broker in brokers.items()}
             snapshots = {aid: future.result() for aid, future in futures.items()}
         for aid, snapshot in snapshots.items():
             snapshot.require_current(brokers[aid])
         return snapshots
+
+    @staticmethod
+    def _market_only(incident):
+        runtime = incident["frozen_runtime"]
+        batches = list((runtime.get("recovery_watch") or {}).get("batches", []))
+        pending = runtime.get("pending")
+        if pending and pending.get("kind") != "leverage":
+            batches.append(pending)
+        orders = [leg.get("order", {}) for batch in batches
+                  for leg in batch.get("legs", []) + batch.get("repairs", [])]
+        orders.extend(item["order"] for item in AdlController._order_items(incident))
+        return all(order.get("type") == "MARKET" for order in orders)
+
+    def _capture_receipts(self, pair, incident, accounts, brokers):
+        """Keep late order evidence even when the positions read was invalidated.
+
+        This operation can only retain/reconcile original receipts. It cannot
+        authorize position adoption or another order using stale snapshots.
+        """
+        from .adl_recovery import capture_receipt
+        if not self._order_items(incident):
+            return False
+        with ExitStack() as stack:
+            for aid in sorted(brokers):
+                stack.enter_context(brokers[aid]._snapshot_lock)
+            self._guard(pair, incident, accounts, brokers)
+            expected = self.store.get("adl_pair:" + pair["id"])
+            if (not expected or expected["id"] != incident["id"]
+                    or self._order_items(expected) != self._order_items(incident)):
+                raise AdlStateConflict("ADL 原订单记录已变化，等待重新核对")
+            candidate = deepcopy(incident)
+            changed = False
+            errors = []
+            for item in self._order_items(candidate):
+                try:
+                    changed = capture_receipt(item, brokers[item["account_id"]], lambda: None) or changed
+                except TradingError as exc:
+                    errors.append(exc)
+            if not changed:
+                if errors:
+                    raise errors[0]
+                return False
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
+                if (not current or json.loads(current[0]).get("revision") != incident["revision"]
+                        or json.loads(current[0]).get("enabled")
+                        or _get(db, "adl_pair:" + pair["id"]) != expected):
+                    raise AdlStateConflict("ADL 回执保存期间处理记录或配对配置已变化")
+                for aid, account in accounts.items():
+                    row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
+                    if not row or json.loads(row[0]) != account:
+                        raise AdlStateConflict("ADL 回执保存期间账户配置已变化")
+                _put(db, "adl_pair:" + pair["id"], candidate)
+                _put(db, "adl_incident:" + incident["id"], candidate)
+            for original, updated in zip(self._order_items(incident), self._order_items(candidate)):
+                original.clear()
+                original.update(updated)
+            if errors:
+                raise errors[0]
+            return True
+
+    def _scene(self, pair, incident, accounts, brokers):
+        try:
+            return self._read(brokers, market_only=self._market_only(incident))
+        finally:
+            # The event may have arrived after original-ID reconciliation and
+            # before this read captured its generation, or invalidated the read.
+            self._capture_receipts(pair, incident, accounts, brokers)
+
+    @staticmethod
+    def _require_orders_settled(incident):
+        if any(item.get("receipt") and item["receipt"]["status"] not in TERMINAL
+               for item in AdlController._order_items(incident)):
+            raise TradingError("ADL 原订单仍有活动回执，等待原编号确认终态后再减仓")
+
+    @staticmethod
+    def _require_receipts_reflected(incident, snapshots):
+        for item in AdlController._order_items(incident):
+            receipt = item.get("receipt") or {}
+            stamp = receipt.get("updateTime")
+            if not dec(receipt.get("executedQty", "0")) or stamp is None:
+                continue
+            if (type(stamp) not in (int, float) or not math.isfinite(stamp)
+                    or stamp <= 0 or stamp / 1000 > time.time() + 1):
+                raise TradingError("ADL 原订单成交时间无效，等待核对")
+            snapshot = snapshots[item["account_id"]]
+            if snapshot.position_updates.get((item["order"]["symbol"], item["order"]["positionSide"]), 0) < stamp / 1000:
+                raise TradingError("ADL 原订单成交尚未反映到持仓，等待新的现场")
 
     def _settle(self, incident, item, broker):
         from .adl_recovery import reconcile_order
@@ -395,7 +495,8 @@ class AdlController:
         from .pair_planning import require_runtime_symbols
         require_runtime_symbols(pair, incident["frozen_runtime"])
         pending = incident["frozen_runtime"].get("pending")
-        if pending and (pending.get("identities") != incident["identities"] or pending.get("pair_id") != pair["id"]):
+        if pending and (pending.get("identities") != incident["identities"]
+                or pending.get("pair_id", pair["id"] if pending.get("kind") == "leverage" else None) != pair["id"]):
             raise TradingError("ADL 发生前未完成批次的账户身份或配对标识不一致，禁止查询或撤销原订单")
         watch = incident["frozen_runtime"].get("recovery_watch") or {}
         if watch.get("retired_identities", incident["identities"]) != incident["identities"]:
@@ -431,7 +532,7 @@ class AdlController:
                             "sent_at": batch.get("last_possible_send_at", incident["created_at"])}
                     if leg.get("dispatch") == "prepared":
                         item["not_sent"] = True
-                    if batch.get("bounded_queries_complete") and not terminal:
+                    if batch.get("bounded_queries_complete") and not receipt and not terminal:
                         item.update(resolution="positions_verified_unknown", resolved_at=incident["created_at"])
                     prior.append(item)
             incident["prior_orders"] = prior
@@ -449,6 +550,7 @@ class AdlController:
         # Unknown is preserved as unknown. Fresh reality permits a different
         # reduce-only correction, never retransmission of the old client ID.
         items = self._order_items(incident)
+        self._require_orders_settled(incident)
         symbols = set(incident["symbols"]) | {item["order"]["symbol"] for item in items}
         if any(row.get("symbol") in symbols for snapshot in snapshots.values() for row in snapshot.open_orders):
             raise TradingError("ADL 标的或原订单标的存在未完成挂单，等待活动订单结束后再减仓")
@@ -467,8 +569,9 @@ class AdlController:
         incident["watch_after"] = time.time() + 10
         try:
             self._guard(pair, incident, accounts, brokers)
-            snapshots = self._read(brokers)
+            snapshots = self._scene(pair, incident, accounts, brokers)
             require_adl_reflected(incident, snapshots)
+            self._require_receipts_reflected(incident, snapshots)
             self._reality(incident, snapshots)
             self._guard(pair, incident, accounts, brokers, snapshots)
             if imbalances(snapshots, incident["symbols"]):
@@ -483,7 +586,10 @@ class AdlController:
             incident["reason"] = "ADL 已按实际仓位完成平衡；原订单结果仍有未知，保持暂停并观察迟到持仓变化"
             incident["watch_checked_at"] = time.time()
             self._save(incident)
+        except AdlStateConflict:
+            raise
         except TradingError as exc:
+            incident["watch_after"] = time.time() + _retry_delay(exc)
             reason = "ADL 已完成后的迟到订单观察受阻：" + str(exc)
             changed = incident.get("reason") != reason
             incident["reason"] = reason
@@ -501,12 +607,20 @@ class AdlController:
         # Any crash after this commit leaves an uncertain request to query.
         self._save(incident)
         try:
-            try:
-                self._guard(pair, incident, accounts, brokers, snapshots)
-            except TradingError as exc:
-                raise RequestNotSent(str(exc)) from None
-            with brokers[aid].reconciliation_budget():
-                rows = brokers[aid].submit([batch["order"]], timeout=3)
+            with ExitStack() as stack:
+                for owner in sorted(brokers):
+                    stack.enter_context(brokers[owner]._snapshot_lock)
+                try:
+                    self._capture_receipts(pair, incident, accounts, brokers)
+                    self._require_orders_settled(incident)
+                    self._require_receipts_reflected(incident, snapshots)
+                    self._guard(pair, incident, accounts, brokers, snapshots)
+                except AdlStateConflict:
+                    raise
+                except TradingError as exc:
+                    raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
+                with brokers[aid].reconciliation_budget():
+                    rows = brokers[aid].submit([batch["order"]], timeout=3)
             if not isinstance(rows, list) or len(rows) != 1:
                 raise TradingError("ADL 单笔减仓回执不完整")
             receipt = rows[0]
@@ -517,8 +631,13 @@ class AdlController:
                 batch["receipt"] = receipt
                 if receipt["status"] in TERMINAL:
                     batch["state"] = "terminal"
-        except RequestNotSent:
+        except AdlStateConflict:
+            raise
+        except RequestNotSent as exc:
             batch.update(state="terminal", error="请求明确未发送，等待重新确认现场", not_sent=True)
+            # Keep the audit row, but quota denial is neither an exchange fill
+            # failure nor an actual send attempt. Re-read positions when due.
+            incident.update(reason=str(exc), retry_at=time.time() + _retry_delay(exc, 1))
         except ExchangeError as exc:
             if not isinstance(exc, AmbiguousOrder) and exc.code in ORDER_REJECTION_CODES and exc.http_status != 408 and not (exc.http_status and exc.http_status >= 500):
                 batch.update(state="terminal", error=f"交易所拒绝 ADL 减仓（代码 {exc.code}）", rejected=True)
@@ -538,9 +657,16 @@ class AdlController:
         with ExitStack() as stack:
             for aid in sorted(brokers):
                 stack.enter_context(brokers[aid]._snapshot_lock)
+            self._capture_receipts(pair, incident, accounts, brokers)
+            self._require_orders_settled(incident)
+            self._require_receipts_reflected(incident, snapshots)
+            expected = self.store.get("adl_pair:" + pair["id"])
+            for aid in sorted(brokers):
                 snapshots[aid].require_current(brokers[aid])
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                if _get(db, "adl_pair:" + pair["id"]) != expected:
+                    raise AdlStateConflict("ADL 完成核验期间处理记录已变化")
                 saved_pair = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
                 if not saved_pair or json.loads(saved_pair[0]).get("revision") != incident["revision"]:
                     raise TradingError("ADL 完成核验期间配对配置已变化")
@@ -574,9 +700,9 @@ class AdlController:
                 _put(db, "adl_incident:" + incident["id"], incident)
                 adl_notifications.enqueue(db, incident, "completed")
 
-    def _blocked(self, incident, reason, *, halt=False):
+    def _blocked(self, incident, reason, *, halt=False, retry_after=10):
         changed = incident.get("reason") != reason or incident["status"] != "blocked"
-        incident.update(status="blocked", reason=reason, retry_at=time.time() + 10)
+        incident.update(status="blocked", reason=reason, retry_at=time.time() + retry_after)
         if halt:
             incident["halted"] = True
         if changed:
@@ -584,9 +710,12 @@ class AdlController:
         self._save(incident, phase="blocked" if changed else None)
 
     def _runtime(self, pair, incident):
+        delay = max(1, incident.get("retry_at", 0) - time.time())
+        if incident["status"] == "completed":
+            delay = max(10, incident.get("watch_after", 0) - time.time())
         runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
         runtime.update(phase="paused" if incident["status"] == "completed" else "attention" if incident["status"] == "blocked" else "recovering",
-                       reason=incident["reason"], updated_at=time.time(), retry_after=1 if incident["status"] == "active" else 10,
+                       reason=incident["reason"], updated_at=time.time(), retry_after=delay,
                        adl={key: incident.get(key) for key in ("id", "status", "symbols", "created_at", "completed_at", "reason")})
         self.store.put("pair_runtime:" + pair["id"], {key: value for key, value in runtime.items() if key != "retry_after"})
         return runtime
@@ -625,7 +754,7 @@ class AdlController:
                 raise TradingError("ADL 原订单证据存在冲突，已暂停，需人工核对")
             snapshots = None
             if not incident["before"]:
-                snapshots = self._read(brokers)
+                snapshots = self._scene(pair, incident, accounts, brokers)
                 incident["after"] = scene_json(accounts, snapshots)
                 require_adl_reflected(incident, snapshots)
                 incident["before"] = deepcopy(incident["after"])
@@ -641,9 +770,10 @@ class AdlController:
             if snapshots is None or self._order_items(incident):
                 # An order query/cancellation may have advanced execution. The
                 # bounded exit always reads reality after those operations.
-                snapshots = self._read(brokers)
+                snapshots = self._scene(pair, incident, accounts, brokers)
             incident["after"] = scene_json(accounts, snapshots)
             require_adl_reflected(incident, snapshots)
+            self._require_receipts_reflected(incident, snapshots)
             self._guard(pair, incident, accounts, brokers, snapshots)
             self._reality(incident, snapshots)
             if incident["batches"]:
@@ -682,15 +812,28 @@ class AdlController:
             if incident["batches"] and incident["batches"][-1].get("rejected"):
                 self._blocked(incident, incident["batches"][-1]["error"], halt=True)
                 return self._runtime(pair, incident)
-            if time.time() - incident["created_at"] > MAX_SECONDS or len(incident["batches"]) >= MAX_BATCHES:
+            sent_batches = [item for item in incident["batches"] if not item.get("not_sent")]
+            if time.time() - incident["created_at"] > MAX_SECONDS or len(sent_batches) >= MAX_BATCHES:
                 self._blocked(incident, "ADL 自动减仓达到处理时限或批次数上限，已保留剩余仓位与完整记录", halt=True)
                 return self._runtime(pair, incident)
-            recent = incident["batches"][-3:]
+            recent = sent_batches[-3:]
             if len(recent) == 3 and all(item["state"] == "terminal" and not dec((item.get("receipt") or {}).get("executedQty", "0")) for item in recent):
                 self._blocked(incident, "连续三批未成交，已停止自动重试并保留现场", halt=True)
                 return self._runtime(pair, incident)
             incident.update(status="active", reason=f"正在分批市价关闭 {batch['order']['symbol']} 多余的 {batch['direction']} 仓位", retry_at=0)
             self._send(pair, incident, accounts, brokers, snapshots, batch)
+        except AdlStateConflict:
+            raise
         except TradingError as exc:
-            self._blocked(incident, str(exc))
+            # Failed guard/position reads must not discard a late active event
+            # before the in-memory event cache expires during this backoff.
+            try:
+                self._capture_receipts(pair, incident, accounts, brokers)
+            except AdlStateConflict:
+                raise
+            except TradingError:
+                # Invalid account identity or new ADL evidence permits neither
+                # receipt adoption nor trading. Preserve the original failure.
+                pass
+            self._blocked(incident, str(exc), retry_after=_retry_delay(exc))
         return self._runtime(pair, incident)

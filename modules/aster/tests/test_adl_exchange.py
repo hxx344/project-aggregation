@@ -200,15 +200,49 @@ class ReductionSnapshotTests(unittest.TestCase):
                     reduction_snapshot(broker)
 
     def test_account_event_during_each_read_invalidates_whole_result(self):
-        for path in (ACCOUNT, RISK, DUAL, ORDERS):
-            with self.subTest(path=path):
-                broker, api = self.broker()
-                def event(current):
-                    if current == path:
-                        broker._snapshot_generation += 1
-                api.on_read = event
-                with self.assertRaisesRegex(TradingError, "发生变化"):
+        for market_only in (False, True):
+            for path in (ACCOUNT, RISK, DUAL) + (() if market_only else (ORDERS,)):
+                with self.subTest(market_only=market_only, path=path):
+                    broker, api = self.broker()
+                    def event(current):
+                        if current == path:
+                            broker._snapshot_generation += 1
+                    api.on_read = event
+                    with self.assertRaisesRegex(TradingError, "发生变化"):
+                        reduction_snapshot(broker, market_only=market_only)
+
+    def test_market_only_skips_order_inventory_and_preserves_complete_position_evidence(self):
+        for orders in (None, {"invalid": "orders"}, [{"symbol": "OTHERUSDT"}]):
+            with self.subTest(orders=orders):
+                data = responses()
+                data[ORDERS] = orders
+                data[RISK][0]["updateTime"] = 1234567
+                broker, api = self.broker(data)
+                result = reduction_snapshot(broker, market_only=True)
+                self.assertEqual([call[1] for call in api.calls], [ACCOUNT, RISK, DUAL])
+                self.assertEqual(sum(call[3]["weight"] for call in api.calls), 40)
+                self.assertEqual(result.open_orders, [])
+                self.assertEqual(result.position_updates, {("BTCUSDT", "LONG"): 1234.567})
+                self.assertEqual(result.positions[0].quantity, dec("1.25"))
+                self.assertEqual(result.positions[0].leverage, 37)
+                result.require_current(broker)
+                with self.assertRaises(TradingError):
                     reduction_snapshot(broker)
+
+    def test_market_only_still_rejects_incomplete_or_conflicting_account_evidence(self):
+        for mutate in (lambda d: d[ACCOUNT].pop("canTrade"),
+                       lambda d: d[ACCOUNT].pop("positions"),
+                       lambda d: d.update({RISK: []}),
+                       lambda d: d[DUAL].update(dualSidePosition="true"),
+                       lambda d: d[RISK][0].update(positionAmt="1.24"),
+                       lambda d: d[RISK][0].update(updateTime="NaN"),
+                       lambda d: d[RISK][0].update(marginType="unknown")):
+            with self.subTest(mutation=mutate):
+                data = responses()
+                mutate(data)
+                broker, _ = self.broker(data)
+                with self.assertRaises(TradingError):
+                    reduction_snapshot(broker, market_only=True)
 
     def test_exchange_position_updates_include_explicit_flat_legs_only(self):
         data = responses()
@@ -240,28 +274,30 @@ class ReductionSnapshotTests(unittest.TestCase):
                     reduction_snapshot(broker)
 
     def test_oldest_read_owns_freshness_and_post_read_identity_generation_are_checked(self):
-        broker, api = self.broker()
-        with patch("trading.adl_exchange.time.time", side_effect=[100, 109, 109]):
-            with self.assertRaisesRegex(TradingError, "过期"):
-                reduction_snapshot(broker)
-        result = reduction_snapshot(broker)
-        for stamp in (result.timestamp - 10, result.timestamp + 10, float("nan")):
-            with self.subTest(timestamp=stamp), self.assertRaises(TradingError):
-                replace(result, timestamp=stamp).require_current(broker)
-        broker._snapshot_generation += 1
-        with self.assertRaises(TradingError):
-            result.require_current(broker)
-        broker._snapshot_generation -= 1
-        api.credentials["user"] = "different-wallet"
-        with self.assertRaises(TradingError):
-            result.require_current(broker)
-        api.credentials["user"] = "wallet-a"
-        other, _ = self.broker()
-        with self.assertRaises(TradingError):
-            result.require_current(other)
-        broker.api = FakeAPI(responses())
-        with self.assertRaises(TradingError):
-            result.require_current(broker)
+        for market_only in (False, True):
+            with self.subTest(market_only=market_only):
+                broker, api = self.broker()
+                with patch("trading.adl_exchange.time.time", side_effect=[100, 109, 109]):
+                    with self.assertRaisesRegex(TradingError, "过期"):
+                        reduction_snapshot(broker, market_only=market_only)
+                result = reduction_snapshot(broker, market_only=market_only)
+                for stamp in (result.timestamp - 10, result.timestamp + 10, float("nan")):
+                    with self.subTest(timestamp=stamp), self.assertRaises(TradingError):
+                        replace(result, timestamp=stamp).require_current(broker)
+                broker._snapshot_generation += 1
+                with self.assertRaises(TradingError):
+                    result.require_current(broker)
+                broker._snapshot_generation -= 1
+                api.credentials["user"] = "different-wallet"
+                with self.assertRaises(TradingError):
+                    result.require_current(broker)
+                api.credentials["user"] = "wallet-a"
+                other, _ = self.broker()
+                with self.assertRaises(TradingError):
+                    result.require_current(other)
+                broker.api = FakeAPI(responses())
+                with self.assertRaises(TradingError):
+                    result.require_current(broker)
 
 
 class ReductionRuleTests(unittest.TestCase):

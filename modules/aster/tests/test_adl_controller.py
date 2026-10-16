@@ -130,7 +130,7 @@ class AdlControllerTests(unittest.TestCase):
         rules.start()
         self.addCleanup(rules.stop)
 
-    def snapshot(self, broker):
+    def snapshot(self, broker, *, market_only=False):
         aid = next(aid for aid, current in self.brokers.items() if current is broker)
         self.reads.append((aid, deepcopy(self.holdings[aid])))
         return ReductionSnapshot(tuple(self.holdings[aid]), True, True, deepcopy(self.open_orders[aid]), self.now,
@@ -572,8 +572,8 @@ class AdlControllerTests(unittest.TestCase):
         self.holdings["b"] = [position("SHORT", "2")]
         self.observe()
         original_read = self.controller._read
-        def read_with_late_event(brokers):
-            snapshots = original_read(brokers)
+        def read_with_late_event(brokers, **options):
+            snapshots = original_read(brokers, **options)
             self.observe(order_id=43)
             return snapshots
         with patch.object(self.controller, "_read", side_effect=read_with_late_event):
@@ -734,8 +734,8 @@ class AdlControllerTests(unittest.TestCase):
     def test_snapshot_generation_change_before_send_fails_closed(self):
         self.observe()
         original_read = self.controller._read
-        def invalidate(brokers):
-            snapshots = original_read(brokers)
+        def invalidate(brokers, **options):
+            snapshots = original_read(brokers, **options)
             self.brokers["a"]._snapshot_generation += 1
             return snapshots
         with patch.object(self.controller, "_read", side_effect=invalidate):
@@ -764,8 +764,8 @@ class AdlControllerTests(unittest.TestCase):
     def test_credential_identity_change_before_send_fails_closed(self):
         self.observe()
         original_read = self.controller._read
-        def replace_identity(brokers):
-            snapshots = original_read(brokers)
+        def replace_identity(brokers, **options):
+            snapshots = original_read(brokers, **options)
             self.brokers["a"].api.credentials["user"] = "different-wallet"
             return snapshots
         with patch.object(self.controller, "_read", side_effect=replace_identity):

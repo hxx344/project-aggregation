@@ -11,6 +11,7 @@ from .models import TradingError, dec
 MAX_QUERIES = 3
 OBSERVATION_SECONDS = 120
 CANCEL_SECONDS = 10
+ACTIVE_QUERY_SECONDS = 30
 UNKNOWN = "原订单结果尚未确认，仅按原客户端订单号核对，不重复下单"
 
 
@@ -64,6 +65,49 @@ def _accept(item, receipt):
         item["state"] = "terminal"
 
 
+def capture_receipt(item, broker, persist):
+    """Persist fresh local evidence only; never query or authorize reality.
+
+    Callers may hold their snapshot locks while capturing a late event. A
+    positive active receipt also revokes an older unknown-position resolution.
+    Invalid cache evidence leaves the last valid item untouched and blocks the
+    caller instead of falling through to a reality decision.
+    """
+    updated = deepcopy(item)
+    previous = updated.get("receipt")
+    if previous:
+        Executor.validate_receipt(updated["order"], previous)
+        if updated.get("state") == "terminal" and previous["status"] not in TERMINAL:
+            raise TradingError("ADL 订单终态与回执不一致")
+    # Durable terminal evidence is final, including a proven local no-send.
+    if not (previous and previous["status"] in TERMINAL) and updated.get("state") != "terminal":
+        read = getattr(broker, "order_event_receipt", None)
+        if callable(read):
+            try:
+                receipt = read(updated["order"], include_active=True)
+                if receipt is not None:
+                    _accept(updated, receipt)
+            except Exception:
+                raise TradingError("ADL 原订单流回执核对失败，保留原有效记录") from None
+    receipt = updated.get("receipt")
+    if receipt:
+        terminal = receipt["status"] in TERMINAL
+        if terminal:
+            updated["state"] = "terminal"
+        resolved_unknown = updated.get("resolution") == "positions_verified_unknown"
+        if resolved_unknown:
+            updated.pop("resolution", None)
+            updated.pop("resolved_at", None)
+        if resolved_unknown or updated.get("reconciliation_phase") == "reality":
+            updated["reconciliation_phase"] = "terminal" if terminal else "waiting"
+    if updated == item:
+        return False
+    item.clear()
+    item.update(updated)
+    persist()
+    return True
+
+
 def _cancel(item, broker, persist, clock):
     """Commit intent before HTTP; only a proven local denial can undo it."""
     fields = ("cancel_requested", "cancel_requested_at", "last_possible_send_at", "post_cancel_queries")
@@ -90,17 +134,16 @@ def _cancel(item, broker, persist, clock):
 def reconcile_order(item, broker, persist, *, now=None, allow_cancel=True):
     """Return terminal, waiting or reality without resending the original order.
 
-    ``reality`` is only permission to obtain new complete positions/open orders.
+    ``reality`` is only permission to obtain new complete account positions.
     It never asserts that an unknown order was absent or filled, and leaves the
     caller responsible for persisting its independent reality resolution.
     With allow_cancel=False, recovery only queries the existing order.
     """
-    if item.get("resolution") == "positions_verified_unknown":
-        return "reality"
     clock = time.time if now is None else lambda: now
     current = _timestamp(clock())
     if item.get("state") not in {"sending", "terminal"}:
         raise TradingError("ADL 订单恢复状态无效")
+    capture_receipt(item, broker, persist)
     receipt = item.get("receipt")
     if receipt:
         Executor.validate_receipt(item["order"], receipt)
@@ -113,6 +156,8 @@ def reconcile_order(item, broker, persist, *, now=None, allow_cancel=True):
         if receipt:
             raise TradingError("ADL 订单终态与回执不一致")
         return "terminal"
+    if item.get("resolution") == "positions_verified_unknown":
+        return "reality"
 
     if "first_observed_at" not in item:
         item["first_observed_at"] = current
@@ -124,6 +169,7 @@ def reconcile_order(item, broker, persist, *, now=None, allow_cancel=True):
         # Legacy cancellation journals did not capture their possible send time.
         anchor = max(anchor, _timestamp(item.get("cancel_requested_at", observed)))
     query_after = _timestamp(item.get("query_after", 0))
+    active_query_after = _timestamp(item.get("active_query_after", 0))
     key = "post_cancel_queries" if item.get("cancel_requested") else "queries"
     count = _attempts(item, key)
     if current < anchor:
@@ -133,11 +179,15 @@ def reconcile_order(item, broker, persist, *, now=None, allow_cancel=True):
         return "waiting"
     if allow_cancel and receipt and not item.get("cancel_requested") and current - sent_at >= CANCEL_SECONDS:
         return _cancel(item, broker, persist, clock)
-    if count >= MAX_QUERIES:
+    if count >= MAX_QUERIES and not receipt:
         return "reality" if current - anchor >= OBSERVATION_SECONDS else "waiting"
+    if count >= MAX_QUERIES and current < active_query_after:
+        return "waiting"
 
-    item[key] = count + 1
+    item[key] = min(MAX_QUERIES, count + 1)
     item["query_after"] = current + 2
+    if receipt and item[key] >= MAX_QUERIES:
+        item["active_query_after"] = current + ACTIVE_QUERY_SECONDS
     persist()
     try:
         receipt = broker.query(item["order"]["symbol"], item["order"]["newClientOrderId"], timeout=3)
@@ -147,13 +197,17 @@ def reconcile_order(item, broker, persist, *, now=None, allow_cancel=True):
             item[key] = count
         item["error"] = UNKNOWN
         item["query_after"] = _timestamp(clock()) + _delay(error)
+        if item.get("receipt") and item[key] >= MAX_QUERIES:
+            item["active_query_after"] = max(item.get("active_query_after", 0), item["query_after"])
         persist()
-        return ("reality" if not _not_sent(error) and item[key] >= MAX_QUERIES
+        return ("reality" if not item.get("receipt") and not _not_sent(error) and item[key] >= MAX_QUERIES
                 and _timestamp(clock()) - anchor >= OBSERVATION_SECONDS else "waiting")
+    if item["state"] != "terminal" and item[key] >= MAX_QUERIES:
+        item["active_query_after"] = _timestamp(clock()) + ACTIVE_QUERY_SECONDS
     persist()
     if item["state"] == "terminal":
         return "terminal"
     current = _timestamp(clock())
     if allow_cancel and not item.get("cancel_requested") and current - sent_at >= CANCEL_SECONDS:
         return _cancel(item, broker, persist, clock)
-    return "reality" if item[key] >= MAX_QUERIES and current - anchor >= OBSERVATION_SECONDS else "waiting"
+    return "waiting"
