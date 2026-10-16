@@ -880,3 +880,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `4229052` 的 [disconnect](modules/asset/lib/store.ts) 和 [hub-summary](modules/asset/lib/hub-summary.ts)。2026-10-17 用户明确说明 VAR 令牌过期后已主动断开，但工作台仍持续显示两条过期提示；本轮按当前连接投影摘要时效，生产 API 回归覆盖断开前后及重连。
 
 **事件记录：** `asset-disconnected-valuation-freshness-20261017`；同一次用户纠正及修复，不推进主线复盘检查点。
+
+### L057：滚动均值使用各时点之前的完整历史
+
+**适用条件：** 图表按时间范围展示尾随均值，且可见区间之前的样本仍属于历史点的计算窗口。
+
+**根因：** 原油图把整个可见区间的平均值画成水平参考线，既不随历史时点变化，也不能表示当时已知的滚动基准。先裁剪历史再算均线还会丢失左端预热数据。
+
+**以后做法：** 先按完整历史为每个时点计算，再裁剪展示；仅包含当前已收盘样本及之前记录。原油 1 天、1 周、1 月分别沿用 24 小时、7 天和 UTC 日历月窗口，固定窗口不足或有缺口时留空；全部历史明确标为逐点累计均值，缺失不补零。日历月末钳制可能让起点回退，不能假定窗口左边界永远递增。图线、悬停、键盘读数与最新摘要使用同一结果，纵轴包含均值范围。
+
+**如何验证：** [滚动均值测试](modules/monitor/tests/oil-rolling-average.test.mjs) 以逐点筛选参考计算检查未来隔离、预热、窗口边界、月末回退、缺口及真实零值；[工作台浏览器检查](modules/monitor/tests/oil-rolling-average.browser.mjs) 验证四个范围、图线与读数、价格切换、缺口恢复和移动布局。按本次影响复用原油配对与百分比测试，不扩大无关模块回归。
+
+**证据：** project-aggregation 基线 `24bb935` 的 [原油图](modules/monitor/modules/oil/app.mjs) 在 `renderChart` 中直接以 `summary.average` 绘制水平线，[区间统计](modules/monitor/modules/oil/data-utils.mjs) 对可见样本只求一次平均。2026-10-17 用户截图指出应为滚动平均，并明确窗口随 1 天、1 周、1 月范围变化。
+
+**事件记录：** `oil-rolling-average-window-20261017`；一次用户纠正及修复，不推进主线复盘检查点。

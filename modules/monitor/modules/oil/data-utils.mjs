@@ -15,17 +15,49 @@ export function validateRows(rows) {
   });
 }
 
-export function filterRows(rows, range, intervalMs = 0) {
-  if (range === 'ytd' || range === 'all' || !rows.length) return rows;
-  const end = new Date(Date.parse(rows.at(-1).date) + intervalMs);
-  if (range === '1d' || range === '1w') return rows.filter(row => Date.parse(row.date) >= end.getTime() - (range === '1d' ? 1 : 7) * 86_400_000);
+function rangeStart(endTime, range) {
+  if (range === '1d' || range === '1w') return endTime - (range === '1d' ? 1 : 7) * 86_400_000;
   if (!['1m', '3m'].includes(range)) throw Error('Invalid chart range');
+  const end = new Date(endTime);
   const months = range === '1m' ? 1 : 3;
   const cutoff = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - months, 1));
   const lastDay = new Date(Date.UTC(cutoff.getUTCFullYear(), cutoff.getUTCMonth() + 1, 0)).getUTCDate();
   cutoff.setUTCDate(Math.min(end.getUTCDate(), lastDay));
   cutoff.setUTCHours(end.getUTCHours(), end.getUTCMinutes(), end.getUTCSeconds(), end.getUTCMilliseconds());
-  return rows.filter(row => Date.parse(row.date) >= cutoff.getTime());
+  return cutoff.getTime();
+}
+
+export function filterRows(rows, range, intervalMs = 0) {
+  if (range === 'ytd' || range === 'all' || !rows.length) return rows;
+  const cutoff = rangeStart(Date.parse(rows.at(-1).date) + intervalMs, range);
+  return rows.filter(row => Date.parse(row.date) >= cutoff);
+}
+
+/** Compute on complete, validated history before filtering the display range.
+ * Fixed windows require all paired candles; all-history means use only the
+ * observations available up to each point. Neither mode reads future samples.
+ */
+export function rollingAverages(rows, range, intervalMs) {
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) throw Error('Invalid candle interval');
+  if (!['1d', '1w', '1m', 'all'].includes(range)) throw Error('Invalid average range');
+  const totals = [0];
+  for (const row of rows) totals.push(totals.at(-1) + row.spread);
+  return rows.map((row, index) => {
+    const end = row.time + intervalMs;
+    const start = range === 'all' ? rows[0].time : rangeStart(end, range);
+    // Month-end clamping can move the cutoff backwards, so search each prefix.
+    let left = 0, right = index + 1;
+    while (left < right) {
+      const middle = (left + right) >>> 1;
+      if (rows[middle].time < start) left = middle + 1;
+      else right = middle;
+    }
+    const averageCount = index - left + 1;
+    const averageExpectedCount = (end - start) / intervalMs;
+    const complete = averageCount === averageExpectedCount;
+    return { ...row, average: range === 'all' || complete ? (totals[index + 1] - totals[left]) / averageCount : null,
+      averageCount, averageExpectedCount };
+  });
 }
 
 export function summarize(rows) {

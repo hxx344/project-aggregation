@@ -1,5 +1,5 @@
 import { oilSpreadPercent } from './spread.mjs';
-import { round, signed, filterRows, summarize, monthlyAverages, chartDomain } from './data-utils.mjs';
+import { round, signed, filterRows, rollingAverages, summarize, monthlyAverages, chartDomain } from './data-utils.mjs';
 import { calculateShortSpreadFunding, DAY } from './binance.mjs';
 import { validateFundingSnapshot, analyzeFundingWindow } from './binance-funding-history.mjs';
 
@@ -17,6 +17,8 @@ let overviewActive = summaryActive;
 const $ = id => root.getElementById(id);
 const state = { rows: [], range: '1w', view: 'spread', visible: [], chart: null, selectedDate: null, market: null, metadata: null, basis: 'quantity', marketMode: 'snapshot', historyMode: 'snapshot', refreshing: false, fundingSnapshot: null, fundingByTime: new Map(), fundingChart: null, fundingHistoryMode: 'loading', fundingRefreshing: false, tablePage: 0 };
 const labels = { '1d': '近 1 天', '1w': '近 1 周', '1m': '近 1 月', all: '全部历史' };
+const averageLabels = { '1d': '1 天滚动均值', '1w': '1 周滚动均值', '1m': '1 月滚动均值', all: '历史累计均值' };
+const averageWindows = { '1d': '24 小时', '1w': '7 天', '1m': '1 个日历月' };
 let fundingHistoryView = 'annualized', fundingAnalysis = null, fundingAnalysisSource = null, fundingAnalysisRange = '';
 let fundingRangeDaily = new Map();
 const money = value => `${value.toFixed(3)}<small>USDT / 桶</small>`;
@@ -29,6 +31,7 @@ const timeFormatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shangha
 const beijingTime = iso => timeFormatter.format(new Date(iso));
 let tableDirty = true;
 let summaryRows, summaryHistory, tablePreviousSource, tablePreviousRows;
+let averageSource, averageRange, averageHistory;
 let pointerFrame = 0, queuedPointer = null, chartDirty = true;
 let refreshGeneration = 0, quoteGeneration = 0, fundingGeneration = 0;
 const tableDetails = $('data-table').closest('details');
@@ -135,7 +138,9 @@ function fillMetrics() {
 
 function renderSummary(summary) {
   $('summary-range').textContent = labels[state.range];
-  $('average-spread').textContent = summary.average.toFixed(3);
+  $('average-label').textContent = `最新 · ${averageLabels[state.range]}`;
+  $('average-spread').textContent = averageValue(summary.latest);
+  $('average-coverage').textContent = averageCoverage(summary.latest);
   $('max-spread').textContent = `${summary.max.spread.toFixed(3)}%`;
   $('min-spread').textContent = `${summary.min.spread.toFixed(3)}%`;
   $('max-date').textContent = displayDate(summary.max.date);
@@ -144,6 +149,14 @@ function renderSummary(summary) {
   const percentile = span === 0 ? 50 : (summary.latest.spread - summary.min.spread) / span * 100;
   $('range-marker').style.left = `clamp(0px, ${percentile.toFixed(3)}%, calc(100% - 3px))`;
   $('range-description').textContent = `最近收盘价差位于区间${percentile < 33 ? '下部' : percentile > 66 ? '上部' : '中部'} · ${summary.latest.spread.toFixed(3)}%`;
+}
+
+function averageValue(row) { return row.average === null ? '—' : row.average.toFixed(3); }
+
+function averageCoverage(row) {
+  const count = `${row.averageCount} / ${row.averageExpectedCount} 根`;
+  if (state.range === 'all') return `截至该时点 · ${row.averageCount} 根有效 K 线${row.averageCount < row.averageExpectedCount ? ' · 缺失不补零' : ''}`;
+  return row.average === null ? `窗口不足或有缺口 · ${count}` : `截至该时点 · ${row.averageCount} 根 K 线`;
 }
 
 function renderMonthly() {
@@ -213,7 +226,7 @@ function renderChart() {
   const plotHeight = height - padding.top - padding.bottom;
   const isSpread = state.view === 'spread';
   const summary = summarize(rows);
-  const domain = chartDomain(isSpread ? rows.map(row => row.spread) : rows.flatMap(row => [row.wti, row.brent]));
+  const domain = chartDomain(isSpread ? rows.flatMap(row => row.average === null ? [row.spread] : [row.spread, row.average]) : rows.flatMap(row => [row.wti, row.brent]));
   const start = Date.parse(rows[0].date), end = Date.parse(rows.at(-1).date);
   const x = date => padding.left + (start === end ? 0.5 : ((typeof date === 'number' ? date : Date.parse(date)) - start) / (end - start)) * plotWidth;
   const y = value => padding.top + (domain.max - value) / (domain.max - domain.min) * plotHeight;
@@ -223,7 +236,7 @@ function renderChart() {
   gradient.append(svgElement('stop', { offset: '0%', 'stop-color': 'var(--primary)', 'stop-opacity': '.20' }), svgElement('stop', { offset: '100%', 'stop-color': 'var(--primary)', 'stop-opacity': '.015' }));
   defs.append(gradient); svg.append(defs);
   svg.append(svgElement('title', {}, `${isSpread ? '布伦特相对WTI的百分比价差' : '布伦特与WTI永续合约收盘价'}，${rows[0].date}至${rows.at(-1).date}`));
-  svg.append(svgElement('desc', {}, `共${rows.length}根共同 15 分钟 K 线。价差均值${summary.average.toFixed(3)}，最低${summary.min.spread.toFixed(3)}，最高${summary.max.spread.toFixed(3)}%。价差以 WTI 为基准。完整数值见页面下方15 分钟数据明细。`));
+  svg.append(svgElement('desc', {}, `共${rows.length}根共同 15 分钟 K 线。最新${averageLabels[state.range]}${averageValue(summary.latest)}%，${averageCoverage(summary.latest)}；最低${summary.min.spread.toFixed(3)}，最高${summary.max.spread.toFixed(3)}%。均值仅使用各时点及之前的数据。价差以 WTI 为基准。完整数值见页面下方15 分钟数据明细。`));
   for (let i = 0; i <= 4; i++) {
     const value = domain.min + (domain.max - domain.min) * i / 4;
     const py = y(value);
@@ -234,22 +247,22 @@ function renderChart() {
     svg.append(svgElement('line', { x1: padding.left, y1: y(0), x2: width - padding.right, y2: y(0), stroke: 'var(--muted-foreground)', 'stroke-width': 1 }));
   }
   drawTimeTicks(svg, rows, width, height, x);
-  if (isSpread) svg.append(svgElement('line', { x1: padding.left, y1: y(summary.average), x2: width - padding.right, y2: y(summary.average), stroke: 'var(--muted-foreground)', 'stroke-dasharray': '5 5', opacity: '.75' }));
-  const series = isSpread ? [{ field: 'spread', color: 'var(--primary)' }] : [{ field: 'brent', color: 'var(--primary)' }, { field: 'wti', color: 'var(--chart-2)' }];
+  const series = isSpread ? [{ field: 'spread', color: 'var(--primary)' }, { field: 'average', color: 'var(--muted-foreground)' }] : [{ field: 'brent', color: 'var(--primary)' }, { field: 'wti', color: 'var(--chart-2)' }];
   for (const { field, color } of series) {
     const segments = [];
     for (const row of rows) {
+      if (row[field] === null) continue;
       const last = segments.at(-1)?.at(-1);
       if (!last || Date.parse(row.date) - Date.parse(last.date) > OIL_CANDLE_MS) segments.push([]);
       segments.at(-1).push(row);
     }
     for (const segment of segments) {
       const path = segment.map((row, i) => `${i === 0 ? 'M' : 'L'}${x(row.date).toFixed(3)},${y(row[field]).toFixed(3)}`).join(' ');
-      if (isSpread && segment.length > 1) svg.append(svgElement('path', { d: `${path} L${x(segment.at(-1).date)},${baseline} L${x(segment[0].date)},${baseline} Z`, fill: 'url(#spread-fill)' }));
-      svg.append(svgElement('path', { d: path, fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+      if (field === 'spread' && segment.length > 1) svg.append(svgElement('path', { d: `${path} L${x(segment.at(-1).date)},${baseline} L${x(segment[0].date)},${baseline} Z`, fill: 'url(#spread-fill)' }));
+      svg.append(svgElement('path', { d: path, fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'data-series': field, ...(field === 'average' ? { 'stroke-dasharray': '5 5' } : {}) }));
       if (segment.length === 1) svg.append(svgElement('circle', { cx: x(segment[0].date), cy: y(segment[0][field]), r: 2.5, fill: color }));
     }
-    svg.append(svgElement('circle', { cx: x(rows.at(-1).date), cy: y(rows.at(-1)[field]), r: 4, fill: color, stroke: 'var(--card)', 'stroke-width': 2 }));
+    if (rows.at(-1)[field] !== null) svg.append(svgElement('circle', { cx: x(rows.at(-1).date), cy: y(rows.at(-1)[field]), r: 4, fill: color, stroke: 'var(--card)', 'stroke-width': 2 }));
   }
   const crosshair = svgElement('g', { visibility: 'hidden', 'aria-hidden': 'true' });
   const guide = svgElement('line', { y1: padding.top, y2: height - padding.bottom, stroke: 'var(--muted-foreground)', 'stroke-dasharray': '3 4' });
@@ -257,7 +270,7 @@ function renderChart() {
   const dots = series.map(item => { const dot = svgElement('circle', { r: 4, fill: item.color, stroke: 'var(--card)', 'stroke-width': 2 }); crosshair.append(dot); return { field: item.field, node: dot }; });
   svg.append(crosshair);
   state.chart = { width, height, x, y, crosshair, guide, dots, padding, start, end, plotWidth };
-  svg.setAttribute('aria-label', isSpread ? '布伦特相对WTI的15分钟K线收盘价差走势，单位百分比' : '布伦特和WTI永续合约15分钟K线收盘价格走势，单位USDT 每桶');
+  svg.setAttribute('aria-label', isSpread ? `布伦特相对WTI的15分钟K线收盘价差与${averageLabels[state.range]}，单位百分比` : '布伦特和WTI永续合约15分钟K线收盘价格走势，单位USDT 每桶');
   const previousIndex = rows.findIndex(row => row.date === state.selectedDate);
   const cursorIndex = previousIndex >= 0 ? previousIndex : rows.length - 1;
   const selected = rows[cursorIndex];
@@ -376,7 +389,7 @@ function showHistoricalFundingTooltip(date) {
 }
 
 function cursorDescription(row) {
-  return `${displayDate(row.date)} 北京时间，布伦特 ${row.brent.toFixed(3)} USDT/桶，WTI ${row.wti.toFixed(3)} USDT/桶，价差 ${row.spread.toFixed(3)}%`;
+  return `${displayDate(row.date)} 北京时间，布伦特 ${row.brent.toFixed(3)} USDT/桶，WTI ${row.wti.toFixed(3)} USDT/桶，价差 ${row.spread.toFixed(3)}%${state.view === 'spread' ? `，${averageLabels[state.range]} ${averageValue(row)}%，${averageCoverage(row)}` : ''}`;
 }
 
 function showTooltip(index) {
@@ -386,9 +399,13 @@ function showTooltip(index) {
   const px = chart.x(row.date);
   chart.crosshair.setAttribute('visibility', 'visible');
   chart.guide.setAttribute('x1', px); chart.guide.setAttribute('x2', px);
-  for (const dot of chart.dots) { dot.node.setAttribute('cx', px); dot.node.setAttribute('cy', chart.y(row[dot.field])); }
+  for (const dot of chart.dots) {
+    if (row[dot.field] === null) dot.node.setAttribute('visibility', 'hidden');
+    else { dot.node.removeAttribute('visibility'); dot.node.setAttribute('cx', px); dot.node.setAttribute('cy', chart.y(row[dot.field])); }
+  }
   const tooltip = $('chart-tooltip');
   tooltip.innerHTML = `<div class="tooltip-date">${displayDate(row.date)} · 北京时间</div><div class="tooltip-row"><span>布伦特</span><strong>${row.brent.toFixed(3)}</strong></div><div class="tooltip-row"><span>WTI</span><strong>${row.wti.toFixed(3)}</strong></div><div class="tooltip-row accent-text"><span>价差</span><strong>${signed(row.spread)}%</strong></div>`;
+  if (state.view === 'spread') tooltip.innerHTML += `<div class="tooltip-row"><span>${averageLabels[state.range]}</span><strong>${averageValue(row)}${row.average === null ? '' : '%'}</strong></div><div>${averageCoverage(row)}</div>`;
   tooltip.hidden = false;
   tooltip.style.left = `${Math.max(0, Math.min(px + 14, chart.width - tooltip.offsetWidth))}px`;
   tooltip.style.top = '38px';
@@ -417,13 +434,19 @@ function hideTooltip() {
 }
 
 function render(full = true) {
-  state.visible = filterRows(state.rows, state.range, OIL_CANDLE_MS);
+  if (averageSource !== state.rows || averageRange !== state.range) {
+    averageHistory = rollingAverages(state.rows, state.range, OIL_CANDLE_MS);
+    averageSource = state.rows; averageRange = state.range;
+  }
+  state.visible = filterRows(averageHistory, state.range, OIL_CANDLE_MS);
   const summary = summarize(state.visible);
   $('range-caption').textContent = `${displayDate(summary.first.date)} — ${displayDate(summary.latest.date)} · 北京时间 · 15 分钟 K 线收盘`;
   $('observation-count').textContent = `${summary.count} 根共同 15 分钟 K 线`;
   $('chart-title').textContent = state.view === 'spread' ? '布伦特相对 WTI 价差' : '两种原油永续合约的收盘价';
   $('chart-axis-unit').textContent = state.view === 'spread' ? '%' : 'USDT / 桶';
-  $('chart-legend').innerHTML = state.view === 'spread' ? '<span><i class="legend-line brent"></i>15 分钟价差</span><span><i class="legend-line average"></i>区间均值</span>' : '<span><i class="legend-line brent"></i>布伦特</span><span><i class="legend-line wti"></i>WTI</span>';
+  $('chart-legend').innerHTML = state.view === 'spread' ? `<span><i class="legend-line brent"></i>15 分钟价差</span><span><i class="legend-line average"></i>${averageLabels[state.range]}</span>` : '<span><i class="legend-line brent"></i>布伦特</span><span><i class="legend-line wti"></i>WTI</span>';
+  $('average-method').hidden = state.view !== 'spread';
+  $('average-method').textContent = state.range === 'all' ? '累计均值：从最早记录到每个时点，按已有共同收盘价差取算术平均；缺失不补零。' : `滚动均值：每个时点向前取 ${averageWindows[state.range]}，包含当前已收盘的 15 分钟 K 线；${state.range === '1m' ? '按 UTC 对齐，上月没有对应日期时取上月最后一天；' : ''}先计算完整历史，再显示所选范围。窗口不足或有缺口时留空。`;
   root.querySelectorAll('[data-range]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.range === state.range)));
   root.querySelectorAll('[data-view]').forEach(button => { const active = button.dataset.view === state.view; button.setAttribute('aria-selected', String(active)); button.tabIndex = active ? 0 : -1; });
   $('chart-content').setAttribute('aria-labelledby', `${state.view}-tab`);

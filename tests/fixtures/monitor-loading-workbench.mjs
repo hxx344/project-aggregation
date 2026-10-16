@@ -1,6 +1,7 @@
 // Windows-native fixture using the real Hub login, launch, proxy and bridge.
 // Run from the repository root:
 // node --import ./tests/fixtures/monitor-loading-workbench.mjs server/index.mjs
+// Set MONITOR_BROWSER_FIXTURE=oil for oil-rolling-average.browser.mjs.
 // Production monitor SSR/assets with seeded data; no collectors or trading workers.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
@@ -17,6 +18,43 @@ import { readHubSummary } from '../../modules/monitor/server/hub-summary.mjs';
 import { monitors } from '../../modules/monitor/lib/monitors.ts';
 import { parseGoldOilAction } from '../../modules/monitor/lib/gold-oil.ts';
 import { createGoldOilLoadingFixture } from '../../modules/monitor/tests/gold-oil-loading-server.mjs';
+import { createIntradaySnapshot, OIL_CANDLE_MS } from '../../modules/monitor/modules/oil/intraday.mjs';
+import { createFundingSnapshot, FUNDING_MS } from '../../modules/monitor/modules/oil/binance-funding-history.mjs';
+
+function createOilRollingFixture(now = Date.now()) {
+  const count = 72 * 96, end = Math.floor(now / OIL_CANDLE_MS) * OIL_CANDLE_MS;
+  const start = end - count * OIL_CANDLE_MS, fetchedAt = new Date(now).toISOString();
+  const rows = Array.from({ length: count }, (_, index) => {
+    const wti = 80 + Math.sin(index / 71), spread = 2 + index / 900 + Math.sin(index / 37) / 4;
+    return { time: start + index * OIL_CANDLE_MS, brent: wti * (1 + spread / 100), wti };
+  });
+  const nextFundingAt = new Date(Math.floor(now / FUNDING_MS + 1) * FUNDING_MS).toISOString();
+  const quote = { source: 'Binance', currency: 'USDT', status: 'live', fetchedAt,
+    brent: { coin: 'BZUSDT', markPx: rows.at(-1).brent, fundingRate: 0.0001, fundingIntervalHours: 4, nextFundingAt },
+    wti: { coin: 'CLUSDT', markPx: rows.at(-1).wti, fundingRate: 0.0002, fundingIntervalHours: 4, nextFundingAt } };
+  const candles = createIntradaySnapshot(rows, fetchedAt);
+  const funding = { ...createFundingSnapshot(rows.filter(row => row.time % FUNDING_MS === 0)
+    .map(row => ({ time: row.time, brent: 0.0001, wti: 0.0002 })), fetchedAt), status: 'live' };
+  const chartFixture = ({ scenario = 'complete' } = {}) => {
+    if (!['complete', 'gap', 'revised', 'short'].includes(scenario)) throw Error('Unknown oil fixture scenario');
+    // Equal timestamps are intentional: changed source rows must invalidate means
+    // even when a repair shares the previous snapshot's fetchedAt value.
+    const data = scenario === 'short' ? rows.slice(-48) : rows.map((row, index) => ({ ...row,
+      ...(scenario === 'gap' && index === count - 48 ? { wti: null } : {}),
+      ...(scenario === 'revised' && index === count - 1 ? { brent: row.brent + row.wti * 0.09 } : {}),
+    }));
+    return createIntradaySnapshot(data, fetchedAt);
+  };
+  const snapshots = { kind: 'oil', quote, candles, funding };
+  const services = new Map([['oil', { handle(action, method = 'GET') {
+    if (method !== 'GET') throw Error('Business writes are forbidden in this fixture');
+    if (action === 'candles/15m') return candles;
+    if (action === 'quote') return quote;
+    if (action === 'funding') return funding;
+    throw Error('Inactive oil fixture action');
+  } }]]);
+  return { snapshots, services, chartFixture };
+}
 
 const monitorRoot = fileURLToPath(new URL('../../modules/monitor/', import.meta.url));
 const directory = mkdtempSync(path.join(tmpdir(), 'monitor-loading-browser-'));
@@ -38,9 +76,10 @@ registerHooks({
 });
 
 export async function startFixtureModules() {
-  const { snapshots, services, chartFixture } = createGoldOilLoadingFixture();
+  const oilFixture = process.env.MONITOR_BROWSER_FIXTURE === 'oil';
+  const { snapshots, services, chartFixture } = oilFixture ? createOilRollingFixture() : createGoldOilLoadingFixture();
   const runtime = Object.fromEntries(monitors.map(({ id }) => [id, {
-    monitorId: id, available: false, enabled: id === 'cl-xau', running: false,
+    monitorId: id, available: false, enabled: id === (oilFixture ? 'oil' : 'cl-xau'), running: false,
     revision: 0, reason: 'Read-only seeded browser fixture',
   }]));
   services.controls = { view: () => runtime };
@@ -98,7 +137,16 @@ export async function startFixtureModules() {
         }
         if (pathname === '/api/notifications/feishu') return send({ available: false, revision: 0, webhookConfigured: false,
           signingSecretConfigured: false, candidates: [], migratedFrom: [], lastTestAt: null, testResult: null, error: '', reason: 'Fixture notifications disabled' });
-        if (pathname.startsWith('/api/monitors/cl-xau/')) {
+        if (oilFixture && pathname.startsWith('/api/monitors/oil/')) {
+          const action = pathname.slice('/api/monitors/oil/'.length);
+          if (['quote', 'candles/15m', 'funding'].includes(action)) return send(services.get('oil').handle(action));
+          if (action === 'status') return send({ available: false, reason: 'Fixture alerts disabled', webhookConfigured: false,
+            lastAttemptAt: null, lastSuccessAt: null, stale: false, error: '' });
+          if (action === 'config') return send({ revision: 0, config: { enabled: false, rules: [] } });
+          if (action === 'events') return send({ events: [] });
+          return send({ error: 'Inactive oil fixture API' }, 503);
+        }
+        if (!oilFixture && pathname.startsWith('/api/monitors/cl-xau/')) {
           const action = pathname.slice('/api/monitors/cl-xau/'.length), parsed = parseGoldOilAction(action);
           if (!parsed) return send({ error: 'Unknown fixture action' }, 404);
           if (['quote', 'history', 'funding', 'chart'].includes(parsed.action)) return send(services.get('cl-xau').handle(action, 'GET', Object.fromEntries(url.searchParams)));
