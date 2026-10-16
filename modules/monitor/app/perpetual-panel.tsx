@@ -1,7 +1,8 @@
 "use client";
 
 import { hubNavigate, cleanHubQuery } from "../lib/hub-bridge";
-import { Fragment, Suspense, lazy, memo, useDeferredValue, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, Suspense, lazy, memo, useDeferredValue, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { createCrossExImportId, prepareCrossExImport, type CrossExImportOptions } from "../lib/crossex-import";
 import { Activity, Bell, ChevronDown, ChevronLeft, ChevronRight, RefreshCw, Search, SlidersHorizontal, Star, X } from "lucide-react";
 import { usePerpetualFeed } from "../hooks/use-perpetual-feed";
 import { usePerpetualQuality } from "../hooks/use-perpetual-quality";
@@ -74,6 +75,24 @@ function price(value: number | null) {
 function pairName(key: string) {
   try { const [base, long, short] = JSON.parse(key) as string[]; return `${base} · 多 ${long} / 空 ${short}`; }
   catch { return key; }
+}
+
+function CrossExImportButton({ row, pairLabel, options, readNow }: { row: PerpetualSpread; pairLabel: string; options: CrossExImportOptions; readNow: () => number }) {
+  const reasonId = useId();
+  const [clickFailure, setClickFailure] = useState<{ reason: string; at: number } | null>(null);
+  const selection = prepareCrossExImport(row, options);
+  const reason = selection.reason ?? (clickFailure && options.now < clickFailure.at ? clickFailure.reason : null);
+  return <div className="scanner-crossex-import" data-crossex-import="">
+    <button type="button" disabled={Boolean(reason)} aria-label={`导入 CrossEx：${pairLabel}`} aria-describedby={reason ? reasonId : undefined} onClick={event => {
+      event.stopPropagation();
+      // A retained detail row can expire between the last render and this click.
+      const at = readNow(), current = prepareCrossExImport(row, { ...options, now: at });
+      if (!current.query) { setClickFailure({ reason: current.reason, at }); return; }
+      setClickFailure(null);
+      hubNavigate("crossex", { ...current.query, importId: createCrossExImportId() });
+    }}>导入 CrossEx</button>
+    {reason ? <small id={reasonId}>{reason}</small> : null}
+  </div>;
 }
 
 const fundingHistoryStatus = { pending: "采集中", partial: "历史不足", stale: "已过期", error: "更新失败", unsupported: "不支持", ready: "" };
@@ -206,7 +225,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
   // Release frozen rows when the policy changes; metadata polling still applies below.
   if (inspection && inspection.blockedKey !== blockedKey) setInspection(null);
   const paused = opportunitiesActive && inspection !== null;
-  const { data: liveData, connection, error, now, refresh } = usePerpetualFeed(marketActive, paused);
+  const { data: liveData, connection, error, now, readNow, refresh } = usePerpetualFeed(marketActive, paused);
   const data = paused ? inspection.snapshot : liveData;
   const savedBlockedBases = crossex.data ? crossex.blockedBases : null;
   const visibleData = useMemo(() => visiblePerpetualSnapshot(data, savedBlockedBases), [data, savedBlockedBases]);
@@ -557,7 +576,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
     {view === "rank" && marketMetricsError ? <p className="perp-quality-notice" role="status">{marketMetricsError}</p> : null}
     {filters.crossCurrency ? <p className="perp-currency-warning">{fxError || (fx ? `汇率快照 ${stamp(fx.generatedAt)} · 仅纳入有新鲜买卖汇率的组合；USD 等缺失汇率不假定等于 1。换汇手续费另计。` : "正在读取现货汇率，缺失汇率的跨币组合暂不参与排名。")}</p> : null}
     {filters.crossCurrency && fx ? <details className="perp-fx-details"><summary>查看每条汇率的来源时间与买卖价</summary><div>{["USDC", "USD1", "USDG", "USD"].map(currency => { const rate = fx.rates[currency]; return <p key={currency}><strong>{currency} / USDT</strong> · {rate ? <>买 {rate.bid.toFixed(6)} / 卖 {rate.ask.toFixed(6)} · 源时间 {stamp(rate.at)}{now - rate.at > fx.staleAfterMs ? " · 已过期" : ""}</> : "未纳入"}{fx.reasons?.[currency] ? <span> · {fx.reasons[currency]}</span> : null}</p>; })}</div></details> : null}
-    {view === "quotes" ? <><p className="perp-quotes-caption">平台组合与价差阈值仅影响排名。此处保留原始合约单位，独立合约不参与跨所比较。</p><div className="perp-table-wrap"><QuoteDetails crossex={crossex} quotes={quoteRows} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={data?.staleAfterMs ?? 30_000} standalone/>{!quoteRows.length ? <div className="perp-empty"><strong>暂无符合条件的报价</strong><p>{!data || !quotes.length ? emptyMessage : "可以调整币种搜索或交易所筛选。"}</p></div> : null}</div></> : <div className="perp-table-wrap scanner-table-wrap" tabIndex={0} role="region" aria-label="套利组合表格，可横向滚动"><table className="perp-table perp-scanner-table"><thead><tr><th scope="col">币种</th>{visibleColumns.map(column => {
+    {view === "quotes" ? <><p className="perp-quotes-caption">平台组合与价差阈值仅影响排名。此处保留原始合约单位，独立合约不参与跨所比较。</p><div className="perp-table-wrap"><QuoteDetails crossex={crossex} quotes={quoteRows} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={data?.staleAfterMs ?? 30_000} standalone/>{!quoteRows.length ? <div className="perp-empty"><strong>暂无符合条件的报价</strong><p>{!data || !quotes.length ? emptyMessage : "可以调整币种搜索或交易所筛选。"}</p></div> : null}</div></> : <div className="perp-table-wrap scanner-table-wrap" tabIndex={0} role="region" aria-label="套利组合表格，可横向滚动"><table className="perp-table perp-scanner-table"><thead><tr><th scope="col">币种</th><th scope="col" data-column="crossexImport">CrossEx<small>仅预填合约</small></th>{visibleColumns.map(column => {
       const sortable = sortableScannerColumns.has(column.id) ? column.id as ScannerSortColumn : null;
       const sorted = activeSort.column === column.id;
       const dualLeg = column.id === "volume" || column.id === "openInterest" || column.id === "quote";
@@ -574,6 +593,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
         const rowKey = perpetualSpreadKey(row), isExpanded = expanded === rowKey;
         const detailId = `perp-detail-${encodeURIComponent(rowKey)}`;
         const pairLabel = `${row.base}，做多 ${venues.get(row.long.exchange)?.name ?? row.long.exchange} ${row.long.symbol}，做空 ${venues.get(row.short.exchange)?.name ?? row.short.exchange} ${row.short.symbol}`;
+        const importOptions: CrossExImportOptions = { connected: hubConnected, now, staleAfterMs: data?.staleAfterMs ?? 30_000, priceMode: filters.priceMode, opportunityKind: fundingSort ? "funding" : "spread" };
         const quality = qualities.get(rowKey)!;
         const primarySpread = netSort ? row.netSpreadPercent ?? null : row.spreadPercent;
         const isFavorite = favoritePairs.has(rowKey);
@@ -604,14 +624,15 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
           time: <div className="scanner-time"><time dateTime={new Date(row.updatedAt).toISOString()}>{stamp(row.updatedAt)}</time><small>{age(row.updatedAt, now)}{paused ? now - row.updatedAt > (data?.staleAfterMs ?? 30_000) ? " · 已过期" : " · 已暂停" : ""}</small></div>,
           quality: <QualityCell quality={quality} pairLabel={pairLabel} onInspect={() => inspect(row, false, "quality")}/>,
         };
-        return <Fragment key={rowKey}><tr className={`${isExpanded ? "perp-row-expanded " : ""}scanner-chart-row`} onClick={event => { const target = event.target as HTMLElement; if (event.currentTarget.contains(target) && !target.closest('button, a, input, select, summary')) openChart(row); }}>
+        return <Fragment key={rowKey}><tr className={`${isExpanded ? "perp-row-expanded " : ""}scanner-chart-row`} onClick={event => { const target = event.target as HTMLElement; if (event.currentTarget.contains(target) && !target.closest('button, a, input, select, summary, [data-crossex-import]')) openChart(row); }}>
           <th scope="row" className="perp-base-cell"><button type="button" className={`perp-star ${isFavorite ? "is-favorite" : ""}`} aria-label={`${isFavorite ? "移除" : "收藏"}组合：${pairLabel}`} aria-pressed={isFavorite} onClick={() => toggleFavorite(row)}><Star size={15} fill={isFavorite ? "currentColor" : "none"}/></button><div><strong>{row.base}</strong><small>{row.crossCurrency ? `${row.long.quoteCurrency} / ${row.short.quoteCurrency}` : row.long.quoteCurrency}{row.fxAdjusted ? " · 已换汇" : ""}</small><PerpetualPushToggle base={row.base} settings={crossex}/></div></th>
+          <td data-column="crossexImport"><CrossExImportButton row={row} pairLabel={pairLabel} options={importOptions} readNow={readNow}/></td>
           {visibleColumns.map(column => <td key={column.id} data-column={column.id} className="scanner-number">{cells[column.id]}</td>)}
           <td className="perp-expand-cell"><button type="button" aria-label={`${isExpanded ? "收起" : "展开"} ${pairLabel} 质量依据与各平台报价`} aria-expanded={isExpanded} aria-controls={detailId} onClick={() => inspect(row, true)}><ChevronDown size={16}/></button></td>
-        </tr>{isExpanded ? <tr className="perp-detail-row" id={detailId}><td colSpan={visibleColumns.length + 2}>
+        </tr>{isExpanded ? <tr className="perp-detail-row" id={detailId}><td colSpan={visibleColumns.length + 3}>
           <div className="perp-inspection-bar"><p role="status"><strong>行情已暂停</strong> · 保留 {stamp(data?.generatedAt)} 的排名与报价{now - row.updatedAt > (data?.staleAfterMs ?? 30_000) ? " · 报价已过期，仅供核对" : ""}</p><button type="button" onClick={() => setInspection(null)}>收起并恢复</button></div>
           <div className="scanner-detail-evidence"><button type="button" className="perp-refresh" onClick={() => openChart(row)}>创建价差图表 · 资金费稳定度</button><SpotTransferEvidence row={row} settings={crossex} now={now}/><DelistingNotice quote={row.long} now={now}/><DelistingNotice quote={row.short} now={now}/><FundingHistory long={fundingHistoryReport?.legs[`${row.long.exchange}:${row.long.symbol}`]} short={fundingHistoryReport?.legs[`${row.short.exchange}:${row.short.symbol}`]} now={now}/>{fundingScenario ? <p>未来 24h 资金费 {percent(fundingScenario.fundingPercent, 4)} · 未来 24h 扣费后 {percent(fundingScenario.estimatedNetPercent, 4)}{fundingScenario.reasons.length ? ` · ${fundingScenario.reasons[0]}` : ""}</p> : null}</div>
-          <div className="perp-detail-navigation"><div role="tablist" aria-label="组合详情" onKeyDown={event => { const tabs: DetailTab[] = ["execution", "quality", "exit", "quotes"]; const index = tabs.indexOf(detailTab); const next = event.key === "ArrowRight" ? tabs[(index + 1) % tabs.length] : event.key === "ArrowLeft" ? tabs[(index + tabs.length - 1) % tabs.length] : event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[tabs.length - 1] : null; if (next) { event.preventDefault(); setDetailTab(next); document.getElementById(`${detailId}-tab-${next}`)?.focus(); } }}>{([{ id: "execution", label: "成交与持有" }, { id: "quality", label: "质量依据" }, { id: "exit", label: "平仓与跟踪" }, { id: "quotes", label: "各平台报价" }] as const).map(tab => <button type="button" role="tab" key={tab.id} id={`${detailId}-tab-${tab.id}`} aria-selected={detailTab === tab.id} tabIndex={detailTab === tab.id ? 0 : -1} aria-controls={`${detailId}-content`} onClick={() => setDetailTab(tab.id)}>{tab.label}</button>)}</div><div className="perp-detail-actions">{hubConnected && [row.long.exchange, row.short.exchange].every(id => ["binance", "bybit", "okx", "gate", "kraken", "hyperliquid", "lighter"].includes(id)) && <button type="button" onClick={() => hubNavigate("crossex", { symbol: row.base, longExchange: row.long.exchange, shortExchange: row.short.exchange })}>在 CrossEx 查看</button>}<button type="button" onClick={() => configureAlert(row)}><Bell size={13}/>{fundingSort ? "设置价差提醒" : "设置提醒"}</button><button type="button" onClick={() => blockPair(row)}><X size={13}/>屏蔽组合</button></div></div>
+          <div className="perp-detail-navigation"><div role="tablist" aria-label="组合详情" onKeyDown={event => { const tabs: DetailTab[] = ["execution", "quality", "exit", "quotes"]; const index = tabs.indexOf(detailTab); const next = event.key === "ArrowRight" ? tabs[(index + 1) % tabs.length] : event.key === "ArrowLeft" ? tabs[(index + tabs.length - 1) % tabs.length] : event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[tabs.length - 1] : null; if (next) { event.preventDefault(); setDetailTab(next); document.getElementById(`${detailId}-tab-${next}`)?.focus(); } }}>{([{ id: "execution", label: "成交与持有" }, { id: "quality", label: "质量依据" }, { id: "exit", label: "平仓与跟踪" }, { id: "quotes", label: "各平台报价" }] as const).map(tab => <button type="button" role="tab" key={tab.id} id={`${detailId}-tab-${tab.id}`} aria-selected={detailTab === tab.id} tabIndex={detailTab === tab.id ? 0 : -1} aria-controls={`${detailId}-content`} onClick={() => setDetailTab(tab.id)}>{tab.label}</button>)}</div><div className="perp-detail-actions"><CrossExImportButton row={row} pairLabel={pairLabel} options={importOptions} readNow={readNow}/><button type="button" onClick={() => configureAlert(row)}><Bell size={13}/>{fundingSort ? "设置价差提醒" : "设置提醒"}</button><button type="button" onClick={() => blockPair(row)}><X size={13}/>屏蔽组合</button></div></div>
           <div role="tabpanel" id={`${detailId}-content`} aria-labelledby={`${detailId}-tab-${detailTab}`} className="perp-detail-content"><Suspense fallback={<p role="status">正在加载组合详情…</p>}>
             {detailTab === "execution" ? <><PerpetualExecution long={row.long} short={row.short} active={interactionActive} now={now}/><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort}/><PerpetualTrend history={history} now={now} crossCurrency={row.crossCurrency}/></> : detailTab === "quality" ? <QualityEvidence row={row} report={qualityReport} quality={quality} venues={venues} now={now} slippagePercent={qualityBudget.slippagePercent}/> : detailTab === "exit" ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active={interactionActive && opportunitiesActive} now={now} onRegistered={() => { setInspection(null); setWorkspace("positions"); document.getElementById("perp-positions-tab")?.focus(); }}/> : <QuoteDetails crossex={crossex} quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={data?.staleAfterMs ?? 30_000}/>}
           </Suspense></div>

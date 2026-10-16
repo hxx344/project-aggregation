@@ -85,6 +85,16 @@ mkdir -p "$source_dir/modules/aster/trading"
 echo cycle > "$source_dir/modules/aster/trading/cycle-config.json"; refresh; compare 1 1 1 1 1
 capture
 module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+for file in hub-navigation.mjs hub-navigation.d.mts asset-identity.mjs asset-identity.d.mts; do
+  capture
+  embedded_before=$embedded_key
+  echo shared-navigation > "$source_dir/server/$file"; refresh; compare 0 1 1 1 1
+  [[ $embedded_key != "$embedded_before" && ${module_build_keys[monitor]} != "${module_before[0]}" &&
+     ${module_build_keys[asset]} == "${module_before[1]}" && ${module_build_keys[crossex]} != "${module_before[2]}" &&
+     ${module_build_keys[aster]} == "${module_before[3]}" ]]
+  module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+done
+capture
 echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 0 1 0 1
 [[ ${module_build_keys[monitor]} != "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&
    ${module_build_keys[crossex]} == "${module_before[2]}" && ${module_build_keys[aster]} == "${module_before[3]}" ]]

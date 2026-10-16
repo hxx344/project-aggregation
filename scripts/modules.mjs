@@ -23,6 +23,7 @@ if (selected.some(id => !builds.some(build => build.id === id)) || new Set(selec
 }
 const manifests = ['package.json', ...builds.map(({ importer }) => `${importer}/package.json`)];
 const sharedInputs = [...manifests, 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'scripts/modules.mjs'];
+const navigationInputs = ['server/hub-navigation.mjs', 'server/hub-navigation.d.mts', 'server/asset-identity.mjs', 'server/asset-identity.d.mts'];
 const environment = JSON.stringify({
   node: process.version, platform: process.platform, arch: process.arch,
   manager: process.env.npm_config_user_agent.split(' ')[0],
@@ -31,7 +32,8 @@ const environment = JSON.stringify({
 const ignored = new Set(['node_modules', 'dist', '.next', '.vinext', '.wrangler', '.build-cache', '.module-cache', '.git', '__pycache__', '.pytest_cache', '.venv', '.data', 'output']);
 function digest(directory, buildDirectory) {
   const hash = createHash('sha256').update('embedded-workspace-build-v2:' + environment);
-  for (const relative of sharedInputs) {
+  const inputs = ['monitor', 'crossex'].includes(path.basename(directory)) ? [...sharedInputs, ...navigationInputs] : sharedInputs;
+  for (const relative of inputs) {
     const file = path.join(root, relative);
     hash.update(relative).update(existsSync(file) ? readFileSync(file) : '<absent>');
   }

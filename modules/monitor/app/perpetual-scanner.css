@@ -317,6 +317,17 @@
 .perp-scanner .perp-scanner-table > tbody > tr:not(.perp-detail-row) > .perp-expand-cell { width: 36px; padding: 0 3px; border-right: 0; }
 .perp-scanner .perp-scanner-table .perp-expand-cell > button { width: 30px; min-height: 36px; padding: 9px 5px; color: var(--scanner-muted); }
 .perp-scanner .perp-scanner-table .perp-expand-cell > button:hover { background: var(--border); color: var(--scanner-text); }
+.perp-scanner .perp-scanner-table [data-column="crossexImport"] { min-width: 144px; text-align: left; }
+.perp-scanner .scanner-chart-row > [data-column="crossexImport"] { cursor: default; }
+.perp-scanner .scanner-crossex-import { display: grid; justify-items: start; align-content: start; gap: 4px; max-width: 164px; }
+.perp-scanner .scanner-crossex-import > button { min-height: 36px; padding: 6px 10px; border: 1px solid var(--scanner-border); border-radius: 4px; background: transparent; color: var(--scanner-focus); font-size: 11px; white-space: nowrap; }
+.perp-scanner .scanner-crossex-import > button:hover:not(:disabled) { background: var(--scanner-hover); border-color: var(--scanner-focus); }
+.perp-scanner .scanner-crossex-import > button:disabled { color: var(--scanner-muted); cursor: not-allowed; }
+.perp-scanner .scanner-crossex-import > button:focus-visible { outline: 2px solid var(--scanner-focus); outline-offset: 2px; }
+.perp-scanner .scanner-crossex-import > small { display: block; max-width: 164px; color: var(--scanner-muted); font-size: 10px; font-weight: 400; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; text-align: left; }
+@media (max-width: 700px) {
+  .perp-scanner .scanner-crossex-import > button { min-height: 40px; }
+}
 .perp-scanner .scanner-sort-column { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; min-height: 32px; padding: 2px 0; border: 0; background: transparent; color: inherit; font-size: inherit; white-space: nowrap; cursor: pointer; }
 .perp-scanner th[aria-sort]:not([aria-sort="none"]) .scanner-sort-column { color: var(--scanner-text); }
 .perp-scanner .scanner-sort-column:hover { color: var(--scanner-focus); }

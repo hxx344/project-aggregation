@@ -1463,15 +1463,16 @@ atomic_record() {
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree runtime_dependency_tree module module_tree
+  local -a navigation_inputs=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts)
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
     modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json) || return
-  typecheck_tree=$(tree_hash src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
+  typecheck_tree=$(tree_hash src "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
-  build_tree=$(tree_hash src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
+  build_tree=$(tree_hash src public "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
   runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py) || return
-  embedded_tree=$(tree_hash modules scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py .env .env.local .env.production .env.production.local) || return
+  embedded_tree=$(tree_hash modules "${navigation_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf 'pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger\n%s\n%s\n%s' "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
@@ -1495,6 +1496,8 @@ input_keys() {
       module_tree=$(tree_hash modules/aster/dashboard modules/aster/trading/cycle-config.json \
         modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local \
         scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
+    elif [[ "$module" == monitor || "$module" == crossex ]]; then
+      module_tree=$(tree_hash "modules/$module" "${navigation_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
     else
       module_tree=$(tree_hash "modules/$module" scripts/modules.mjs deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local) || return
     fi

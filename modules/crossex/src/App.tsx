@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, ArrowLeftRight, RefreshCw, LayoutDashboard, CandlestickChart, ListOrdered, Settings2, ArrowUpRight } from 'lucide-react';
 import { createLatestRead } from './latest-read';
 import { createServerClock, sourceIsStale, STATE_POLL_MS } from './freshness';
-import { cleanHubQuery, hubChanged, hubNavigate, observeReadWake, readPollDelay, useHubBridge } from './hub-bridge';
+import { cleanHubQuery, HUB_QUERY_KEYS, hubChanged, hubNavigate, observeReadWake, readPollDelay, useHubBridge, type HubQuery } from './hub-bridge';
 import type { LiveBootstrap, LiveExecution, LiveOrder, LivePreview, LiveState, PositionActionInput, PreviewInput } from './live-types';
 import { positionPreviewChanged } from './position-actions';
 import { BOOTSTRAP_REFRESH_MS, latestBootstrap, needsCatalog, parseBootstrap, readRetryDelay, stateReadPath, validCsrf } from './live-loading';
@@ -30,13 +30,14 @@ export default function App() {
   const [bootstrapRevision, setBootstrapRevision] = useState(0);
   const [error, setError] = useState(''), [readError, setReadError] = useState(''), [notice, setNotice] = useState(''), [busy, setBusy] = useState(false);
   const [tab, setTab] = useState<Tab>(() => tabs.some(item => item[0] === location.hash.slice(1)) ? location.hash.slice(1) as Tab : 'positions');
-  const [search, setSearch] = useState('');
-  const [pair, setPair] = useState<{ longExchange?: string; shortExchange?: string }>({});
+  const [selection, setSelection] = useState<HubQuery>({}), [importError, setImportError] = useState('');
+  const lastSelection = useRef('');
   const [preview, setPreview] = useState<LivePreview | null>(null), [cancelOrder, setCancelOrder] = useState<LiveOrder | null>(null);
   const [positionPreview, setPositionPreview] = useState<PositionActionInput | null>(null), [previewInvalidated, setPreviewInvalidated] = useState(false);
   const [requestStore] = useState(() => { let storage: Storage | null = null; try { storage = window.sessionStorage; } catch { /* Writes stay blocked when their identity cannot survive reload. */ } return { storage, key: requestStorageKey(location.pathname) }; });
   const [pendingRequest, setPendingRequest] = useState<PendingRequest | null>(() => readPendingRequest(requestStore.storage, requestStore.key)), [now, setNow] = useState(0);
   const pendingRef = useRef(pendingRequest);
+  const operationPending = useRef(false);
   const requests = useRef(new Map<string, string>());
   const rememberPending = useCallback((next: PendingRequest | null) => {
     const saved = writePendingRequest(requestStore.storage, requestStore.key, next);
@@ -113,10 +114,21 @@ export default function App() {
   useEffect(() => {
     const restore = () => {
       const params = new URL(location.href).searchParams;
-      const query = cleanHubQuery(Object.fromEntries(['symbol', 'longExchange', 'shortExchange'].flatMap(key => params.has(key) ? [[key, params.get(key)!]] : [])));
-      if (!query) return;
-      setSearch(query.symbol || ''); setPair({ longExchange: query.longExchange, shortExchange: query.shortExchange });
-      if (Object.keys(query).length) setTab('hedge');
+      const query = cleanHubQuery(Object.fromEntries(HUB_QUERY_KEYS.flatMap(key => params.has(key) ? [[key, params.get(key)!]] : [])));
+      if (!query || !Object.keys(query).length) return;
+      const signature = JSON.stringify(query);
+      if (signature === lastSelection.current) return;
+      if (operationPending.current || pendingRef.current) {
+        setImportError('当前操作尚未结束或结果待确认，本次机会未导入。请先核对原操作，再从 Monitor 重新导入。');
+        const url = new URL(location.href);
+        for (const key of HUB_QUERY_KEYS) url.searchParams.delete(key);
+        history.replaceState(null, '', url);
+        return;
+      }
+      lastSelection.current = signature;
+      setSelection(query); setTab('hedge'); setImportError('');
+      setPreview(null); setCancelOrder(null); setPositionPreview(null); setPreviewInvalidated(false);
+      requests.current.clear(); setError(''); setNotice('');
     };
     restore(); addEventListener('popstate', restore); return () => removeEventListener('popstate', restore);
   }, []);
@@ -134,8 +146,8 @@ export default function App() {
   async function mutate<T>(route: string, input: object, method = 'POST', actionKey?: string): Promise<T | null> {
     const administrative = route === '/api/settings' || route === '/api/live/connection';
     const csrfToken = administrative ? connectionInfo?.csrfToken : state?.csrfToken;
-    if (!validCsrf(csrfToken) || lifecycle.current.mutating || !administrative && (!state || tradingDisabled) || actionKey && pendingRef.current) return null;
-    lifecycle.current.mutating = true; cancelRead(); cancelBootstrap(); setBusy(true); setError(''); setNotice('');
+    if (!validCsrf(csrfToken) || operationPending.current || !administrative && (!state || tradingDisabled) || actionKey && pendingRef.current) return null;
+    operationPending.current = true; lifecycle.current.mutating = true; cancelRead(); cancelBootstrap(); setBusy(true); setError(''); setNotice('');
     let id: string | undefined;
     try {
       if (actionKey) {
@@ -161,15 +173,17 @@ export default function App() {
       setError(actionKey ? '提交结果尚未确认。请查询最新状态，确认前不要再次提交。请求编号：' + id : cause instanceof Error ? cause.message : '请求未完成，请稍后重试');
       return null;
     } finally {
-      lifecycle.current.mutating = false; setBusy(false);
-      if (lifecycle.current.tab === 'settings') setBootstrapRevision(value => value + 1);
-      else await refresh(true);
+      lifecycle.current.mutating = false;
+      try {
+        if (lifecycle.current.tab === 'settings') setBootstrapRevision(value => value + 1);
+        else await refresh(true);
+      } finally { operationPending.current = false; setBusy(false); }
     }
   }
   const go = (value: Tab) => { setTab(value); location.hash = value; };
   const queryAccount = async () => {
-    if (lifecycle.current.mutating) return;
-    lifecycle.current.mutating = true; cancelRead(); cancelBootstrap(); setBusy(true); setError(''); setNotice('');
+    if (operationPending.current) return;
+    operationPending.current = true; lifecycle.current.mutating = true; cancelRead(); cancelBootstrap(); setBusy(true); setError(''); setNotice('');
     let message = '已查询账户与订单状态。';
     try {
       const pending = pendingRef.current;
@@ -188,7 +202,13 @@ export default function App() {
       const data = await response.json(); if (!response.ok) throw new Error(data.error || '账户查询未完成，请继续查询。');
       setNotice(message);
     } catch (cause) { setError(cause instanceof Error ? cause.message : '状态查询未完成，待确认请求已保留。'); }
-    finally { lifecycle.current.mutating = false; setBusy(false); if (lifecycle.current.tab === 'settings') setBootstrapRevision(value => value + 1); else await refresh(true); }
+    finally {
+      lifecycle.current.mutating = false;
+      try {
+        if (lifecycle.current.tab === 'settings') setBootstrapRevision(value => value + 1);
+        else await refresh(true);
+      } finally { operationPending.current = false; setBusy(false); }
+    }
   };
   const previewOrder = async (input: PreviewInput) => {
     const data = await mutate<LivePreview | { preview: LivePreview }>('/api/live/preview', input);
@@ -223,10 +243,11 @@ export default function App() {
 
   return <div className="app"><header className="topbar"><a className="brand" href="#positions" onClick={() => go('positions')}><span className="brand-icon"><ArrowLeftRight size={21}/></span><span>Gate <strong>CrossEx</strong></span><span className="tag live-tag">LIVE</span></a>
     <nav aria-label="模块功能">{tabs.map(([id, label, Icon]) => <button key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => go(id)}><Icon size={15}/>{label}</button>)}</nav>
-    <div className="header-actions">{hub.connected && <button className="text-button" onClick={() => hubNavigate('monitor', { ...(search.trim() ? { symbol: search.trim().toUpperCase() } : {}), ...pair })}>Monitor <ArrowUpRight size={13}/></button>}<span className={'connection-badge ' + (!accountStale && live?.connection.connected ? 'positive' : 'warning')}><i className={'status-dot ' + (!accountStale && live?.connection.connected ? 'live' : '')}/>{!connectionInfo ? '读取连接信息' : !connectionInfo.connection.configured ? '未连接账户' : accountStale ? '待同步' : '账户已连接'}</span><button className="icon-button" disabled={busy} onClick={() => { if (tab === 'settings') void refreshBootstrap(); else void refresh(true); }} aria-label="刷新页面状态"><RefreshCw size={15}/></button><button className="primary small" onClick={() => go('settings')}>{connectionInfo?.connection.configured ? '管理账户' : '连接账户'}</button></div>
+    <div className="header-actions">{hub.connected && <button className="text-button" onClick={() => hubNavigate('monitor', Object.fromEntries(['symbol', 'longExchange', 'shortExchange'].flatMap(key => selection[key as keyof HubQuery] ? [[key, selection[key as keyof HubQuery]!]] : [])))}>Monitor <ArrowUpRight size={13}/></button>}<span className={'connection-badge ' + (!accountStale && live?.connection.connected ? 'positive' : 'warning')}><i className={'status-dot ' + (!accountStale && live?.connection.connected ? 'live' : '')}/>{!connectionInfo ? '读取连接信息' : !connectionInfo.connection.configured ? '未连接账户' : accountStale ? '待同步' : '账户已连接'}</span><button className="icon-button" disabled={busy} onClick={() => { if (tab === 'settings') void refreshBootstrap(); else void refresh(true); }} aria-label="刷新页面状态"><RefreshCw size={15}/></button><button className="primary small" onClick={() => go('settings')}>{connectionInfo?.connection.configured ? '管理账户' : '连接账户'}</button></div>
   </header><main>
     {(error || tab !== 'settings' && readError) && <div className="notice error" role="alert"><AlertCircle size={16}/><span>{error || readError}</span>{error && !pendingRequest && <button onClick={() => setError('')} aria-label="关闭操作提示">×</button>}</div>}
     {pendingRequest && <div className="notice warning" role="status"><span>存在结果待确认的操作，新的交易暂不可用。请求 {pendingRequest.id}</span><button disabled={busy} onClick={() => void queryAccount()}>查询最新状态</button></div>}
+    {importError && <div className="notice warning" role="status"><span>{importError}</span><button aria-label="关闭导入提示" onClick={() => setImportError('')}>×</button></div>}
     {notice && <div className="notice success" role="status"><span>{notice}</span><button aria-label="关闭状态提示" onClick={() => setNotice('')}>×</button></div>}
     {tab === 'settings' && <><div className="view-heading"><div><span className="eyebrow">ACCOUNT & PREFERENCES</span><h2>连接与设置</h2><p>管理账户连接、行情来源和手动交易额度</p></div></div><SettingsForm config={connectionInfo?.config || null} configured={connectionInfo?.connection.configured ?? null} ready={!!connectionInfo} loading={bootstrapLoading} loadError={bootstrapError} retry={() => void refreshBootstrap()} busy={busy} save={async input => !!await mutate('/api/settings', input, 'PUT')} connect={async input => !!await mutate('/api/live/connection', input, 'PUT')} disconnect={async () => !!await mutate('/api/live/connection', {}, 'DELETE')}/></>}
     {tab === 'settings' ? null : !state || !live ? <div className="empty panel loading-state"><p>{readError ? '账户状态尚未读取，可重试或先连接账户。' : '正在读取 Gate CrossEx 账户状态…'}</p><div className="filters"><button disabled={busy} onClick={() => void refresh(true)}>重试账户状态</button><button className="primary" onClick={() => go('settings')}>连接账户</button></div></div> : <>
@@ -236,7 +257,7 @@ export default function App() {
       {state.config.entryPaused && (tab === 'trade' || tab === 'hedge') && <p className="inline-state warning">新开仓已暂停，可在设置中恢复；仍可手动平仓和撤单。</p>}
       {tab === 'positions' && <><div className="view-heading portfolio-heading"><div><span className="eyebrow">PORTFOLIO</span><h2>投资组合</h2><p>统一保证金概览与跨交易所真实持仓</p></div><div className="portfolio-count"><strong>{new Set(live.positions.map(p => p.baseCurrency || p.symbol)).size}</strong><span>个币种 <b>·</b> {live.positions.length} 条持仓腿</span></div></div><AccountOverview live={live}/><PortfolioPanel positionFundingRates={state.positionFundingRates} now={now} fundingOpportunities={state.fundingOpportunities || []} marketStale={marketStale} live={{ ...live, stale: accountStale }} instruments={instruments.items} disabled={tradingDisabled || !!preview} preview={previewOrder} previewError={error} budget={state.config.notionalPerLeg} entryPaused={!!state.config.entryPaused} capacityContext={capacityContext!} catalogError={instruments.error} close={positions => previewOrder({ kind: 'close', positions })}/></>}
       {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} preview={previewOrder} capacityContext={capacityContext!}/>}
-      {tab === 'hedge' && <ManualHedgePanel key={[search, pair.longExchange, pair.shortExchange].join(':')} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} opportunities={state.opportunities} fundingOpportunities={state.fundingOpportunities || []} now={now} initial={{ base: search, ...pair }} monitorStale={marketStale} preview={previewOrder} capacityContext={capacityContext!}/>}
+      {tab === 'hedge' && <ManualHedgePanel key={JSON.stringify(selection)} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} opportunities={state.opportunities} fundingOpportunities={state.fundingOpportunities || []} now={now} initial={selection} monitorStale={marketStale} preview={previewOrder} capacityContext={capacityContext!}/>}
       {tab === 'orders' && <><div className="view-heading"><div><span className="eyebrow">ORDERS & EXECUTIONS</span><h2>订单与操作记录</h2><p>核对真实成交状态，管理尚未成交的委托</p></div></div><HistoryPanel live={live} disabled={tradingDisabled} querying={busy} query={() => void queryAccount()} cancel={setCancelOrder}/></>}
 
     </>}

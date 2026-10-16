@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 
-export type HubQuery = { symbol?: string; longExchange?: string; shortExchange?: string };
+import { cleanHubQuery, HUB_QUERY_KEYS, type HubQuery } from '../../../server/hub-navigation.mjs';
+export { cleanHubQuery, HUB_QUERY_KEYS };
+export type { HubQuery };
 export type HubProject = 'monitor' | 'crossex';
 const envelope = { channel: 'project-hub', version: 1 } as const;
 let targetOrigin = '', connected = false;
@@ -8,16 +10,7 @@ export function trustedHubOrigin(location: Pick<Location, 'hostname' | 'protocol
   return embedded && /^p-[a-f0-9]{24}\.hub\.localhost$/.test(location.hostname) && ['http:', 'https:'].includes(location.protocol)
     ? location.protocol + '//hub.localhost' + (location.port ? ':' + location.port : '') : null;
 }
-export function cleanHubQuery(input: unknown): HubQuery | null {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
-  const query: HubQuery = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (!['symbol', 'longExchange', 'shortExchange'].includes(key) || typeof value !== 'string') return null;
-    if (key === 'symbol' ? !/^[A-Z0-9._-]{1,40}$/.test(value) : !['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter'].includes(value)) return null;
-    query[key as keyof HubQuery] = value;
-  }
-  return query;
-}
+
 function post(value: object) { if (connected && targetOrigin) window.parent.postMessage({ ...envelope, ...value }, targetOrigin); }
 export function hubChanged() { post({ type: 'changed', scope: 'summary' }); }
 export function hubNavigate(projectId: HubProject, query: HubQuery) { const clean = cleanHubQuery(query); if (clean) post({ type: 'navigate', projectId, query: clean }); }
@@ -58,7 +51,7 @@ export function useHubBridge(projectId: HubProject) {
       else if (connected && value.type === 'navigate' && value.projectId === projectId) {
         const query = cleanHubQuery(value.query); if (!query) return;
         const url = new URL(window.location.href);
-        for (const key of ['symbol', 'longExchange', 'shortExchange']) { url.searchParams.delete(key); if (query[key as keyof HubQuery]) url.searchParams.set(key, query[key as keyof HubQuery]!); }
+        for (const key of HUB_QUERY_KEYS) { url.searchParams.delete(key); if (query[key as keyof HubQuery]) url.searchParams.set(key, query[key as keyof HubQuery]!); }
         if (projectId === 'monitor') url.searchParams.set('monitor', 'perpetual');
         window.history.replaceState(null, '', url); window.dispatchEvent(new PopStateEvent('popstate'));
       }

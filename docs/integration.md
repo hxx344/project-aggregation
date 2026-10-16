@@ -187,7 +187,11 @@ Asset 响应为 `schemaVersion: 1`、`generatedAt`、`exchanges[]`。每个交�
 
 模块确认可以早于或晚于 iframe `load`。每次文档 `load` 都重新探测能力，防止内部刷新或跳转至登录页后沿用旧文档状态；新文档提前发送的无能力探针也能在 load 前重新握手。能力确认不会无限触发 ready 往返。
 
-`navigate` 携带 `projectId` 和 `query`。目标限 `monitor`、`crossex`、`aster`、`asset`；前两者只接受 `symbol`（1–40 位大写字母、数字、点、下划线、短横线）、`longExchange`、`shortExchange`（binance/bybit/okx/gate/kraken/hyperliquid/lighter）。ASTER 和 Asset 只接受空条件。导航只改变查看状态，不触发交易、导入或保存。
+`navigate` 携带 `projectId` 和 `query`。目标限 `monitor`、`crossex`、`greeks`、`asset`；前两者接受 `symbol`（1–40 位大写字母、数字、点、下划线、短横线）、`longExchange`、`shortExchange`（binance/bybit/okx/gate/kraken/hyperliquid/lighter）。Greeks 和 Asset 只接受空条件。
+
+Monitor 合约价差和资金费机会可从列表或详情点击“导入 CrossEx”，进入「跨所对冲」并填入精确多空合约。目标为 `crossex` 时，导入必须同时携带上述三个字段及 `longContract`、`shortContract`、`opportunityKind`（`spread` / `funding`）、每次点击独立的 `importId`。合约代码须匹配交易所和统一币种；CrossEx 再按最新目录核对，缺少合约时不回退到其它币种或计价币。普通导航保留旧协议兼容，下一次选择会清除旧导入字段。
+
+导入只填入合约身份与方向，数量留空，不保存策略或发出委托；资金费机会沿用 `short − long` 的方向，不按价格高低重排。原页面的价差、资金费率和报价不作为下单参数，用户填写数量后，继续以 CrossEx 最新盘口、费用、保证金进行预览和确认。重复导入会清空数量及旧预览；执行中或结果未知的请求仍需先完成核对。独立打开 Monitor 时须返回工作台使用跨模块导入。
 
 双方校验精确 `origin`、`event.source` 与消息结构，不使用 `*`。模块仅在 `p-<24位十六进制>.hub.localhost` 代理 iframe 内建立桥，父来源为同协议、同端口的 `hub.localhost`；独立打开不启用桥。工作台只接受当前可见、已完成握手的页面发起导航，目标也必须启用代理。
 

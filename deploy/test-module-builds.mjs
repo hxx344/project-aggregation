@@ -76,3 +76,18 @@ test('cache keys survive relocation and deterministic asset preparation; one mod
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(f.calls(), ['monitor', 'asset', 'crossex', 'aster', 'crossex']);
 });
+
+test('shared navigation and asset identities invalidate only their consuming module builds', t => {
+  const f = fixture(t);
+  assert.equal(f.run().status, 0);
+  mkdirSync(path.join(f.root, 'server'), { recursive: true });
+  for (const filename of ['hub-navigation.mjs', 'hub-navigation.d.mts', 'asset-identity.mjs', 'asset-identity.d.mts']) {
+    const before = f.calls().length;
+    writeFileSync(path.join(f.root, 'server', filename), 'changed shared input');
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls().slice(before), ['monitor', 'crossex']);
+    assert.equal(f.run().status, 0);
+    assert.equal(f.calls().length, before + 2, 'unchanged inputs reuse the successful build');
+  }
+});

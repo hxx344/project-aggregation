@@ -1,4 +1,6 @@
 import type { Instrument } from './live-types';
+import { canonicalBase } from '../../../server/asset-identity.mjs';
+import { cleanHubQuery } from '../../../server/hub-navigation.mjs';
 
 export type FundingLeg = {
   exchange: string; symbol: string; quoteCurrency: string;
@@ -21,8 +23,13 @@ export function fundingStaleReason(row: FundingOpportunity, now: number, monitor
 
 /** Never substitute a similar contract when filling a funding direction. */
 export function fundingPair(row: FundingOpportunity, instruments: Instrument[]) {
-  const match = (leg: FundingLeg) => instruments.find(i => i.symbol === leg.symbol
-    && i.exchange === leg.exchange && i.base === row.base && i.quoteCurrency === leg.quoteCurrency);
+  // Funding quoteCurrency is native; the CrossEx symbol carries the contract's counter currency.
+  const query = cleanHubQuery({ symbol: row.base, longExchange: row.long.exchange, shortExchange: row.short.exchange,
+    longContract: row.long.symbol, shortContract: row.short.symbol, opportunityKind: 'funding', importId: 'internal-funding' });
+  if (!query) return null;
+  const match = (leg: FundingLeg) => instruments.find(i => i.symbol === leg.symbol && i.exchange === leg.exchange
+    && canonicalBase(i.exchange, i.base) === row.base && i.quoteCurrency === leg.symbol.split('_').at(-1)
+    && (!i.state || i.state === 'live'));
   const long = match(row.long), short = match(row.short);
-  return long && short && long.exchange !== short.exchange ? { long, short } : null;
+  return long && short ? { long, short } : null;
 }

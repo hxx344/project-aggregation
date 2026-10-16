@@ -1,4 +1,5 @@
 import type { Diagnostic, Project, Snapshot } from './types';
+import { cleanHubQuery, type HubQuery } from '../server/hub-navigation.mjs';
 
 export const ATTENTION_DELAY_MS = 120_000;
 
@@ -26,22 +27,14 @@ export function connectionDiagnostic(issue: Diagnostic): boolean {
   return ['hub:auth', 'hub:connection'].includes(issue.id);
 }
 
-export type NavigationQuery = { symbol?: string; longExchange?: string; shortExchange?: string };
-const venues = new Set(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter']);
-export function navigationQuery(value: unknown): NavigationQuery | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const query = value as Record<string, unknown>;
-  if (Object.keys(query).some(key => !['symbol', 'longExchange', 'shortExchange'].includes(key))) return null;
-  if (query.symbol !== undefined && (typeof query.symbol !== 'string' || !/^[A-Z0-9._-]{1,40}$/.test(query.symbol))) return null;
-  for (const key of ['longExchange', 'shortExchange']) if (query[key] !== undefined && (typeof query[key] !== 'string' || !venues.has(query[key]))) return null;
-  return { ...query } as NavigationQuery;
-}
+export type NavigationQuery = HubQuery;
+export const navigationQuery = cleanHubQuery;
 export function navigation(value: unknown): { projectId: string; query: NavigationQuery } | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const message = value as Record<string, unknown>;
   if (!['asset', 'monitor', 'crossex', 'greeks'].includes(String(message.projectId))) return null;
   const query = navigationQuery(message.query);
-  if (!query || (['greeks', 'asset'].includes(String(message.projectId)) && Object.keys(query).length)) return null;
+  if (!query || (query.importId && message.projectId !== 'crossex') || (['greeks', 'asset'].includes(String(message.projectId)) && Object.keys(query).length)) return null;
   return { projectId: String(message.projectId), query };
 }
 export const projectKey = (project: Project) => `${project.id}:${project.revision || JSON.stringify(project)}`;

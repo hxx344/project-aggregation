@@ -319,6 +319,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `crossex-base-alias-20261014`；本轮身份、匹配与兼容修复归为同一事件，不增加复发次数。
 
+**跨模块导入补充（2026-10-17）：** 事件 `monitor-crossex-import-identity-20261017`。本仓 `c00f651` 的 Monitor「在 CrossEx 查看」只传币种和交易所，`ManualHedgePanel` 据此选择目录中第一个合约；同平台 USDT/USDC 并存时会选错计价币，缺腿时还会回退。跨模块预填须携带精确双腿代码，并从原生符号解析币名、复用已验证别名与合约计价规则；接收端缺任何一腿时保留待处理状态，不自动替换。[Monitor 映射测试](modules/monitor/tests/crossex-import.test.mjs)、[接收匹配测试](modules/crossex/tests/opportunity-import.test.mjs) 与[工作台导入验收](tests/opportunity-import.browser.mjs)覆盖原生别名、USDT/USDC、Hyperliquid、迟到目录和缺合约。
+
 ### L021：子面板样式不能改变公共页面的宽度
 
 **适用条件：** 多个市场面板共用导航、行情卡片和居中容器，子面板按需加载并在切换后保留挂载。

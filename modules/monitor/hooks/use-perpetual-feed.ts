@@ -87,5 +87,5 @@ export function usePerpetualFeed(active: boolean, paused = false) {
     publisher.flush();
     void feed.refresh().then(() => { if (controls.current === feed) publisher.flush(); });
   }, []);
-  return { data, connection, error, now, refresh };
+  return { data, connection, error, now, readNow: sourceClock.read, refresh };
 }

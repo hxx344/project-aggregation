@@ -13,6 +13,7 @@ import { createTradingCache } from './trading-cache';
 import type { Notice } from './check-notice';
 import type { NavigationQuery } from './hub-state';
 import type { Adapter, Category, Metric, Overview, Project, Snapshot } from './types';
+import { HUB_QUERY_KEYS } from '../server/hub-navigation.mjs';
 
 const TrendChart = lazy(() => import('./TrendChart'));
 const TradingPage = lazy(() => import('./TradingPage'));
@@ -31,7 +32,7 @@ type Route = { view: 'overview' | 'projects' | 'project' | 'trading' | 'diagnost
 function readRoute(): Route {
   const params = new URLSearchParams(location.search);
   const view = params.get('view');
-  const query = Object.fromEntries(['symbol', 'longExchange', 'shortExchange'].filter(key => params.has(key)).map(key => [key, params.get(key)]));
+  const query = Object.fromEntries(HUB_QUERY_KEYS.filter(key => params.has(key)).map(key => [key, params.get(key)]));
   return { view: view === 'projects' || view === 'project' || view === 'trading' || view === 'diagnostic' ? view : 'overview', id: params.get('id') || '', ...(Object.keys(query).length && navigationQuery(query) ? { query: navigationQuery(query)! } : {}) };
 }
 function formatDate(value: string | null, full = false) {

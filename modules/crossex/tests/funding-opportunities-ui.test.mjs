@@ -17,6 +17,18 @@ test('funding direction keeps exact native contracts and never falls back to a s
   assert.equal(fundingPair(row, []), null);
 });
 
+test('funding selections use CrossEx counter currency and verified base aliases', () => {
+  const hyperliquid = { ...long, exchange: 'hyperliquid', symbol: 'HYPERLIQUID_FUTURE_BTC_USDC', quoteCurrency: 'USDT' };
+  const catalogLeg = { ...instruments[0], ...hyperliquid, quoteCurrency: 'USDC' };
+  assert.deepEqual(fundingPair({ ...row, long: hyperliquid }, [catalogLeg, instruments[1]]), { long: catalogLeg, short: instruments[1] });
+  assert.equal(fundingPair({ ...row, long: hyperliquid }, [{ ...catalogLeg, quoteCurrency: 'USDT' }, instruments[1]]), null);
+  const gate = { ...long, exchange: 'gate', symbol: 'GATE_FUTURE_LUNA_USDT', quoteCurrency: 'USDT' };
+  const binance = { ...short, symbol: 'BINANCE_FUTURE_LUNA2_USDT' };
+  const aliasCatalog = [{ ...instruments[0], ...gate, base: 'LUNA' }, { ...instruments[1], ...binance, base: 'LUNA2' }];
+  assert.deepEqual(fundingPair({ ...row, base: 'LUNA2', long: gate, short: binance }, aliasCatalog), { long: aliasCatalog[0], short: aliasCatalog[1] });
+  assert.equal(fundingPair({ ...row, base: 'LUNC', long: gate, short: binance }, aliasCatalog), null);
+});
+
 test('a visible funding opportunity expires without another poll and respects source failure', () => {
   assert.equal(fundingStaleReason(row, now, false), '');
   assert.equal(fundingStaleReason(row, row.expiresAt, false), '机会数据已过期，等待更新');
