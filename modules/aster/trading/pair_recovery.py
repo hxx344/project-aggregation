@@ -159,11 +159,11 @@ def _commit_runtime(engine, pair, runtime, *, expected, margin, accounts, identi
             db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
 
 
-def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=False):
+def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=False, member_read=None):
     from .pair_planning import positions, PairPositionError
     from .pair_execution import PairTrader
-    snapshots, guards = engine.pairs._read_members(pair, adopt=True, reconciliation=reconciliation, runtime=state,
-                                                 market_recovery=market_recovery)
+    snapshots, guards = member_read if member_read is not None else engine.pairs._read_members(
+        pair, adopt=True, reconciliation=reconciliation, runtime=state, market_recovery=market_recovery)
     held = positions(snapshots, pair["symbol"])
     leverage = held["LONG"].leverage
     require_supported_leverage(leverage)
@@ -172,6 +172,40 @@ def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=F
            for snapshot in risk.values()):
         raise PairPositionError("实际仓位保证金风险仍超限，保留恢复记录并停止新增")
     return snapshots, guards, {side: wire(held[side].qty) for _, side in SIDES}, leverage
+
+
+def _stream_receipts(engine, pair, brokers, records):
+    """Capture positive order evidence, independently of revoked position reads.
+
+    These guards can only authorize recording receipts while retaining pending.
+    A captured receipt remains useful after cache expiry or a newer event; it
+    must never authorize position adoption or clearing the original batch.
+    """
+    from .pair_planning import PairRecoveryConflict
+    guards = {}
+    for key, broker in brokers.items():
+        aid = pair[key + "_account_id"]
+        def current(aid=aid, broker=broker):
+            with engine.lock:
+                if engine.brokers.get(aid) is not broker:
+                    raise PairRecoveryConflict("原订单回执核对期间账户连接变化，已保留最新记录")
+        guards[aid] = (broker._snapshot_lock if isinstance(broker, LiveBroker) else None, current)
+    found = {}
+    with engine.pairs._current_members(guards):
+        for record in records:
+            broker, order, previous = brokers[record["key"]], record["order"], record.get("receipt")
+            if not isinstance(broker, LiveBroker) or previous and previous["status"] in TERMINAL:
+                continue
+            row = broker.order_event_receipt(order, include_active=True)
+            if row is None:
+                continue
+            Executor.validate_receipt(order, row)
+            if positive(row.get("origQty")) != positive(order["quantity"]):
+                raise TradingError("原订单流回执的委托数量不匹配，不能采纳")
+            if previous and dec(row["executedQty"]) < dec(previous["executedQty"]):
+                raise TradingError("原订单流回执的累计成交数量倒退，不能采纳")
+            found[order["newClientOrderId"]] = row
+    return found, guards
 
 
 def _query(broker, order, *, timeout=None):
@@ -479,47 +513,80 @@ class PairOrderRecovery:
         _, brokers, identities = trader._members(pair)
         if identities != pending.get("identities") or identities != state.get("identities"):
             raise PairPositionError("原批次与当前账户身份不一致，不能自动接管")
-        snapshots, guards, actual, leverage = _safe_reality(self.engine, pair, state,
-            market_recovery=pending["kind"] != "leverage")
-        balanced = dec(actual["LONG"]) == dec(actual["SHORT"])
-        baseline = all(dec(actual[side]) == dec(before[side]) for _, side in SIDES)
-        if not balanced and not (pending["kind"] != "cycle" and baseline):
-            raise PairPositionError("实际仓位仍单边或不等量，保留原批次；需两侧平衡或分别回到原底仓")
-        now = time.time()
-        reconciled = deepcopy(state)
-        resolution = ("leverage_positions_verified" if pending["kind"] == "leverage" else
-                      "terminal_positions_adopted" if pending.get("terminal_position_recovery") else
-                      "positions_adopted_unknown")
-        if pending["kind"] == "leverage":
-            if leverage != pending["target_leverage"]:
-                reconciled["leverage_recovery_cooldown"] = {
-                    "symbol": pair["symbol"], "target": pending["target_leverage"],
-                    "identities": deepcopy(identities), "ordinary": deepcopy(pair["ordinary"]),
-                    "until": now + 300, "actual_leverage": leverage}
-        else:
-            trader._account_volume(reconciled, pending)
-            watch = {"id": pending["id"], "symbol": pair["symbol"],
-                "created_at": pending["created_at"], "identities": deepcopy(identities),
-                "positions_verified_at": now, "bounded_queries_complete": True,
-                "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])}
-                         for leg in pending["legs"] + pending["repairs"]]}
-            reconciled["recovery_watch"] = _append_watch(self.store, pair["id"], reconciled.get("recovery_watch"), watch)
-        message = (f"原记录有限核对后已验证实际仓位与 {leverage}x 杠杆安全，采纳底仓：多 {actual['LONG']}、空 {actual['SHORT']}；"
-                   "旧批次已结束，原成交记录保留，下一轮重新检查交易条件")
-        reconciled.update(pending=None, owned=actual,
-            progress=empty_progress(actual, state.get("progress", {}).get("completed_cycles", 0)),
-            phase="waiting" if pair["enabled"] else "paused", reason=message, updated_at=now,
-            last_batch={"id": pending["id"], "kind": pending["kind"], "phase": pending.get("phase"),
-                        "completed": False, "status": "aborted", "at": now, "resolution": resolution, "positions_verified": True})
-        for key in ("attention", "retry_after", "retry_at", "failure_count", "api_notice", "trade_retry"):
-            reconciled.pop(key, None)
-        trader._publish_snapshots(reconciled, snapshots, pair["symbol"])
-        audit = {"status": resolution, "pending": deepcopy(pending), "confirmed_at": now,
-                 "actual": actual, "leverage": leverage, "identities": deepcopy(identities)}
-        batch = {**deepcopy(pending), "completed": False, "status": "aborted", "finished_at": now,
-                 "resolution": resolution, "positions_verified": True, "actual": actual}
-        _commit_runtime(self.engine, pair, trader._durable(reconciled), expected=persisted, margin=margin,
-            accounts=accounts, identities=identities, guards=guards, batch=batch, audit=audit)
+        def restore_stream_receipts():
+            if pending["kind"] == "leverage":
+                return False
+            found, receipt_guards = _stream_receipts(self.engine, pair, brokers,
+                pending["legs"] + pending["repairs"])
+            if not found:
+                return False
+            restored = deepcopy(state)
+            for leg in restored["pending"]["legs"] + restored["pending"]["repairs"]:
+                row = found.get(leg["order"]["newClientOrderId"])
+                if row is not None:
+                    leg.update(receipt=row, error=None)
+            restored.update(phase="reconciling", updated_at=time.time(),
+                reason="已找回原订单流回执，保留原批次并继续按原编号核对成交与持仓")
+            _commit_runtime(self.engine, pair, trader._durable(restored), expected=persisted, margin=margin,
+                accounts=accounts, identities=identities, guards=receipt_guards)
+            state.clear()
+            state.update(restored)
+            return True
+
+        try:
+            member_read = self.manager._read_members(pair, adopt=True, reconciliation=True, runtime=state,
+                market_recovery=pending["kind"] != "leverage")
+            # Events arriving after _query may already be part of these snapshots'
+            # generation, or may have revoked them. Persist the original receipt in
+            # either case, before a risk check or retry delay can outlive the cache.
+            if restore_stream_receipts():
+                return False
+            snapshots, guards, actual, leverage = _safe_reality(self.engine, pair, state, member_read=member_read)
+            balanced = dec(actual["LONG"]) == dec(actual["SHORT"])
+            baseline = all(dec(actual[side]) == dec(before[side]) for _, side in SIDES)
+            if not balanced and not (pending["kind"] != "cycle" and baseline):
+                raise PairPositionError("实际仓位仍单边或不等量，保留原批次；需两侧平衡或分别回到原底仓")
+            now = time.time()
+            reconciled = deepcopy(state)
+            resolution = ("leverage_positions_verified" if pending["kind"] == "leverage" else
+                          "terminal_positions_adopted" if pending.get("terminal_position_recovery") else
+                          "positions_adopted_unknown")
+            if pending["kind"] == "leverage":
+                if leverage != pending["target_leverage"]:
+                    reconciled["leverage_recovery_cooldown"] = {
+                        "symbol": pair["symbol"], "target": pending["target_leverage"],
+                        "identities": deepcopy(identities), "ordinary": deepcopy(pair["ordinary"]),
+                        "until": now + 300, "actual_leverage": leverage}
+            else:
+                trader._account_volume(reconciled, pending)
+                watch = {"id": pending["id"], "symbol": pair["symbol"],
+                    "created_at": pending["created_at"], "identities": deepcopy(identities),
+                    "positions_verified_at": now, "bounded_queries_complete": True,
+                    "legs": [{"key": leg["key"], "order": deepcopy(leg["order"])}
+                             for leg in pending["legs"] + pending["repairs"]]}
+                reconciled["recovery_watch"] = _append_watch(self.store, pair["id"], reconciled.get("recovery_watch"), watch)
+            message = (f"原记录有限核对后已验证实际仓位与 {leverage}x 杠杆安全，采纳底仓：多 {actual['LONG']}、空 {actual['SHORT']}；"
+                       "旧批次已结束，原成交记录保留，下一轮重新检查交易条件")
+            reconciled.update(pending=None, owned=actual,
+                progress=empty_progress(actual, state.get("progress", {}).get("completed_cycles", 0)),
+                phase="waiting" if pair["enabled"] else "paused", reason=message, updated_at=now,
+                last_batch={"id": pending["id"], "kind": pending["kind"], "phase": pending.get("phase"),
+                            "completed": False, "status": "aborted", "at": now, "resolution": resolution, "positions_verified": True})
+            for key in ("attention", "retry_after", "retry_at", "failure_count", "api_notice", "trade_retry"):
+                reconciled.pop(key, None)
+            trader._publish_snapshots(reconciled, snapshots, pair["symbol"])
+            audit = {"status": resolution, "pending": deepcopy(pending), "confirmed_at": now,
+                     "actual": actual, "leverage": leverage, "identities": deepcopy(identities)}
+            batch = {**deepcopy(pending), "completed": False, "status": "aborted", "finished_at": now,
+                     "resolution": resolution, "positions_verified": True, "actual": actual}
+            _commit_runtime(self.engine, pair, trader._durable(reconciled), expected=persisted, margin=margin,
+                accounts=accounts, identities=identities, guards=guards, batch=batch, audit=audit)
+        except PairRecoveryConflict:
+            raise
+        except TradingError:
+            if restore_stream_receipts():
+                return False
+            raise
         state.clear()
         state.update(reconciled)
         trader._wake_hot_data(pair)
@@ -1011,8 +1078,25 @@ class PairOrderRecovery:
                 if isinstance(broker, LiveBroker):
                     budget.enter_context(broker.reconciliation_budget())
             MarginBalancer(self.engine).verify_members(pair)
-        snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True, market_recovery=True)
-        actual = {side: wire(snapshots[key].pair(symbol)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
+        snapshots, guards, read_error = None, None, None
+        try:
+            snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True, market_recovery=True)
+        except TradingError as exc:
+            read_error = exc
+        records = [{**leg, "receipt": found.get(leg["key"], leg.get("receipt"))} for leg in pending["legs"]]
+        streamed, receipt_guards = _stream_receipts(self.engine, pair, brokers, records)
+        for leg in pending["legs"]:
+            row = streamed.get(leg["order"]["newClientOrderId"])
+            if row is not None:
+                found[leg["key"]] = row
+        if streamed:
+            # Only receipt restoration uses these guards. No positions or
+            # archive decision can be committed without the full read guards.
+            guards = receipt_guards
+        elif read_error is not None:
+            raise read_error
+        actual = ({side: wire(snapshots[key].pair(symbol)[0 if side == "LONG" else 1].qty) for key, side in SIDES}
+                  if snapshots is not None else None)
         if not found:
             if any(dec(actual[side]) != dec(pending["before"][side]) for _, side in SIDES):
                 raise TradingError("实际持仓未回到本批开仓前底仓；即使两侧数量相等，也不能归档此未决批次")
@@ -1021,7 +1105,7 @@ class PairOrderRecovery:
             require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers)
         if PairTrader(self.engine)._members(pair)[2] != identities:
             raise TradingError("核对期间账户身份变化，请重新核对")
-        return {"pair": pair, "state": state, "margin": margin, "accounts": accounts, "identities": identities,
+        return {"pair": pair, "state": state, "margin": margin, "accounts": accounts, "identities": identities, "brokers": brokers,
                 "snapshots": snapshots, "guards": guards, "found": found, "evidence": evidence,
                 "actual": actual, "fingerprint": self._fingerprint(pair, state, margin, accounts)}
 
@@ -1098,6 +1182,19 @@ class PairOrderRecovery:
             updated_at=time.time())
         runtime.pop("attention", None)
         runtime.pop("retry_after", None)
-        self._commit(read, runtime, message, audit=audit, expires=preview["expires"])
+        from .pair_planning import PairRecoveryConflict
+        try:
+            self._commit(read, runtime, message, audit=audit, expires=preview["expires"])
+        except PairRecoveryConflict:
+            raise
+        except TradingError:
+            found, guards = _stream_receipts(self.engine, read["pair"], read["brokers"], pending["legs"])
+            if found:
+                receipt_read = {**read, "guards": guards,
+                    "found": {leg["key"]: found[leg["order"]["newClientOrderId"]] for leg in pending["legs"]
+                              if leg["order"]["newClientOrderId"] in found}}
+                restored = self._restore_receipts(receipt_read)
+                raise TradingError(restored["message"])
+            raise
         self.previews.pop(pair_id, None)
         return {"ok": True, "message": message}

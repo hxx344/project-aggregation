@@ -613,7 +613,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `bounded-unknown-execution-recovery-20261015`；本次跨执行器的同类根因修复，不按文件或路径重复计数。
 
-**2026-10-17 补充证据：** 基线 `d135996` 的配对恢复虽然限制原单查询次数，观察期仍每约 3 秒读取两侧交易快照，现实核验失败后又按待处理调度反复读取。`_read_members` 强制刷新账户模式并另查两侧全账户挂单，冷读预估 `2 × (72 + 40) = 224` 权重，与用户截图中的准入需求相符。市价恢复移除全账户挂单查询与显示专用重复快照，失败期限持久化，自动、手动及重启共同遵守；最终持仓、模式与身份新鲜度不变。发送前 `_config_guard` 的失败也须归为结构化“未发送”，而实际 POST 的未知结果仍保留。对应 [恢复预算检查](modules/aster/tests/test_pair_recovery_budget.py)、[未知单观察检查](modules/aster/tests/test_pair_unknown_observation.py) 及发送证据检查；本地离线结果不表示已验证服务器现场。事件 `pair-recovery-weight-starvation-20261017`。
+**2026-10-17 补充证据：** 基线 `d135996` 的配对恢复虽然限制原单查询次数，观察期仍每约 3 秒读取两侧交易快照，现实核验失败后又按待处理调度反复读取。`_read_members` 强制刷新账户模式并另查两侧全账户挂单，冷读预估 `2 × (72 + 40) = 224` 权重，与用户截图中的准入需求相符。市价恢复移除全账户挂单查询与显示专用重复快照，失败期限持久化，自动、手动及重启共同遵守；最终持仓、模式与身份新鲜度不变。发送前 `_config_guard` 的失败也须归为结构化“未发送”，而实际 POST 的未知结果仍保留。固定差异 `4229052` 的离线时序复现另发现：活动回执若在原编号检查后、快照捕获新代次前到达，仅靠快照代次仍可提前结束批次；恢复须在快照后再次补读本地回执，并在原身份、快照锁和事务 CAS 保护下持久化，不能等缓存过期后丢失已知活动状态。对应 [恢复预算检查](modules/aster/tests/test_pair_recovery_budget.py)、[未知单观察检查](modules/aster/tests/test_pair_unknown_observation.py)、[晚到回执检查](modules/aster/tests/test_pair_late_receipt_recovery.py) 及发送证据检查；本地离线结果不表示已验证服务器现场。事件 `pair-recovery-weight-starvation-20261017`。
 
 ### L040：显示调度周期不能延长配对快照有效期
 
