@@ -8,6 +8,7 @@ import { createMarket } from '../server/market.mjs';
 import { createLiveRuntime } from '../server/live-runtime.mjs';
 import { D } from '../server/money.mjs';
 import { createLiveHttpFixture } from './live-http-fixture.mjs';
+import { parseOpenCapacity } from '../src/open-capacity.ts';
 
 const epoch = 1791430000000, symbols = ['BINANCE_FUTURE_BTC_USDT', 'BYBIT_FUTURE_BTC_USDT'];
 const clone = value => JSON.parse(JSON.stringify(value));
@@ -17,20 +18,22 @@ const tier = (min = '0', max = '1000000', leverage = '100') => ({ min_risk_limit
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 function quote(symbol, now) {
   const [venue, , base, currency] = symbol.split('_'), exchange = venue.toLowerCase();
-  return { exchange, symbol: exchange === 'bybit' && currency === 'USDC' ? `${base}PERP` : `${base}${currency}`, crossexSymbol: symbol,
-    base, rawBase: base, quoteCurrency: currency, collateralCurrency: currency, settlementCurrency: currency, counterCurrency: currency,
-    contractKind: 'linear', multiplier: 1, nativeUnit: '1', assetClass: 'crypto', identityScope: 'manual', comparable: true,
+  const nativeCurrency = exchange === 'hyperliquid' && !['HYPE', 'PURR'].includes(base) ? 'USDT' : currency;
+  return { exchange, symbol: ['hyperliquid', 'lighter'].includes(exchange) ? base : exchange === 'bybit' && currency === 'USDC' ? `${base}PERP` : `${base}${currency}`, crossexSymbol: symbol,
+    base, rawBase: base, quoteCurrency: nativeCurrency, collateralCurrency: currency, settlementCurrency: currency, counterCurrency: currency,
+    contractKind: nativeCurrency === currency ? 'linear' : 'quanto', multiplier: 1, nativeUnit: '1', assetClass: 'crypto', identityScope: 'manual', comparable: true,
+    ...(exchange === 'lighter' ? { marketId: 1 } : {}),
     identitySource: 'exchange-instrument-metadata', identityVerified: true, bid: exchange === 'binance' ? 99 : 102,
     ask: exchange === 'binance' ? 100 : 103, bidAskAt: now, receivedAt: now };
 }
 async function fixture(t, options = {}) {
-  const { initialUid = '123', ...runtimeOptions } = options;
+  const { initialUid = '123', selectedSymbols = symbols, ...runtimeOptions } = options;
   const directory = mkdtempSync(join(tmpdir(), 'crossex-capacity-')), store = createStore(directory);
   const remote = { now: epoch, positions: [], orders: [], marginByVenue: { BINANCE: '10000', BYBIT: '10000' },
     account: { user_id: initialUid, position_mode: 'DUAL', account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', available_margin: '10000', assets: [] },
     leverages: { [symbols[0]]: '10', [symbols[1]]: '5' }, tiers: {}, fxAt: epoch, fxRate: 1.1, depthAt: null,
     depthSize: 100, depthHook: null, leverageHook: null, riskHook: null, isolatedUid: initialUid, isolatedUidsByVenue: {}, writes: 0, reads: { leverage: 0, risk: 0, account: 0 } };
-  const rules = [symbols[0], symbols[1], 'BYBIT_FUTURE_BTC_USDC'].map(symbol => ({ symbol, exchange_type: symbol.split('_')[0],
+  const rules = [...selectedSymbols, 'BYBIT_FUTURE_BTC_USDC'].map(symbol => ({ symbol, exchange_type: symbol.split('_')[0],
     business_type: 'FUTURE', state: 'live', min_size: '0.001', lot_size: '0.001', tick_size: '0.01', min_notional: '5',
     max_market_size: '10000', max_limit_size: '10000', delist_time: '0' }));
   const market = createMarket(store, { clock: () => remote.now, catalogReader: async () => clone(rules),
@@ -163,6 +166,42 @@ test('FX conversion preserves quote currency, bid/ask freshness and source times
   result = await f.runtime.openCapacity(order({ symbol })); assert.equal(result.status, 'unavailable'); assert.equal(result.maxQuantity, null);
   f.remote.fxAt = epoch; f.remote.fxRate = null;
   result = await f.runtime.openCapacity(order({ symbol })); assert.equal(result.status, 'unavailable');
+});
+
+test('capacity uses CrossEx currency for Hyperliquid direct BUY and SELL without changing settlement FX', async t => {
+  const symbol = 'HYPERLIQUID_FUTURE_VIRTUAL_USDC', f = await fixture(t, { selectedSymbols: [symbol] });
+  f.remote.fxAt -= 1000;
+  for (const side of ['BUY', 'SELL']) {
+    const input = order({ symbol, side, price: '103', quantity: '1' });
+    const result = parseOpenCapacity(await f.runtime.openCapacity(input), input, 1);
+    assert.equal(result.status, 'ready'); assert.equal(result.legs[0].quoteCurrency, 'USDC');
+    assert.equal(result.legs[0].notionalUSDT, '113.3'); assert.equal(result.requiredMargin, '12.463');
+    assert.equal(result.asOf, epoch - 1000);
+  }
+  f.assertReadOnly();
+});
+
+test('capacity uses CrossEx currency for Lighter/Hyperliquid pairs and preserves rejection states', async t => {
+  const selected = ['LIGHTER_FUTURE_VIRTUAL_USDC', 'HYPERLIQUID_FUTURE_VIRTUAL_USDC'];
+  const f = await fixture(t, { selectedSymbols: selected });
+  for (const [longSymbol, shortSymbol] of [selected, [...selected].reverse()]) {
+    const input = { pair: { longSymbol, shortSymbol, quantity: '100' } };
+    const result = parseOpenCapacity(await f.runtime.openCapacity(input), input, 1);
+    assert.equal(result.status, 'ready'); assert.equal(result.inputWithinCapacity, true);
+    assert.deepEqual(result.legs.map(l => [l.symbol, l.side, l.quoteCurrency]), [[longSymbol, 'BUY', 'USDC'], [shortSymbol, 'SELL', 'USDC']]);
+    assert.deepEqual(result.legs.map(l => l.notionalUSDT), ['11330', '11220']);
+    assert.equal(result.maxNotionalUSDT, '22550'); assert.equal(result.requiredMargin, '2480.5');
+  }
+  const input = { pair: { longSymbol: selected[0], shortSymbol: selected[1], quantity: '100' } };
+  f.market.settings({ config: { entryPaused: true } });
+  const blocked = parseOpenCapacity(await f.runtime.openCapacity(input), input, 1);
+  assert.equal(blocked.status, 'blocked'); assert.equal(blocked.maxQuantity, '0');
+  assert.deepEqual(blocked.legs.map(l => l.quoteCurrency), ['USDC', 'USDC']);
+  f.market.settings({ config: { entryPaused: false } }); f.remote.fxAt = epoch - 180001;
+  const unavailable = parseOpenCapacity(await f.runtime.openCapacity(input), input, 1);
+  assert.equal(unavailable.status, 'unavailable'); assert.equal(unavailable.maxQuantity, null);
+  assert.deepEqual(unavailable.legs.map(l => l.quoteCurrency), ['USDC', 'USDC']);
+  f.assertReadOnly();
 });
 
 test('positions, active or unknown orders, pause, position count and cooldown return known zero capacity', async t => {

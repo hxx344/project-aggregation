@@ -18,6 +18,8 @@ test('capacity responses remain bound to the selected account, symbol and direct
   assert.throws(() => parseOpenCapacity(snapshot(), { order: { ...input.order, symbol: 'GATE_FUTURE_SOL_USDT' } }, 2));
   assert.throws(() => parseOpenCapacity(snapshot(), { order: { ...input.order, side: 'SELL' } }, 2));
   assert.throws(() => parseOpenCapacity(snapshot(), { pair: { longSymbol: symbol, shortSymbol: 'GATE_FUTURE_SOL_USDT' } }, 2));
+  const wrongCurrency = snapshot(); wrongCurrency.legs[0].quoteCurrency = 'USDC';
+  assert.throws(() => parseOpenCapacity(wrongCurrency, input, 2), /所选合约不匹配/);
 });
 
 test('missing estimates stay unknown and blocked responses cannot advertise positive capacity', () => {

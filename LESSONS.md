@@ -422,6 +422,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `crossex-position-counter-currency-20261014`；一次已核实的提交前审查发现，不推进主线复盘检查点。
 
+**开仓容量补充（2026-10-18）：** 独立事件 `crossex-capacity-counter-currency-20261018`。本仓 `a896ba7` 的 [容量上下文](modules/crossex/server/market.mjs) 将原生 `quoteCurrency` 写入容量响应，但 [前端校验](modules/crossex/src/open-capacity.ts) 要求它与 CrossEx 合约后缀相同，导致 Lighter 多 / Hyperliquid 空的 VIRTUAL USDC 组合持续显示“开仓估算与所选合约不匹配”。容量字段应使用已验证身份的 `counterCurrency`（兼容旧身份的 `quoteCurrency`），保留原生身份与按结算币换算的金额逻辑，不放宽前端校验。[容量回归](modules/crossex/tests/open-capacity.test.mjs) 在修复前实际复现单腿和双腿错配，并覆盖 BUY/SELL、反向双腿、非 1 汇率的名义额和保证金、拒绝/不可用状态及零交易写入；[前端校验回归](modules/crossex/tests/open-capacity-ui.test.mjs) 继续拒绝真实币种错配。本次不推进历史复盘检查点。
+
 ### L028：移除账户组件重建时保留旧操作状态的失效边界
 
 **适用条件：** 移除由账户或连接版本决定的 React `key`，以保留新功能对话框或页面状态。

@@ -362,7 +362,8 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       const depthQuantity = immediate ? (r.side === 'BUY' ? books[i].asks : books[i].bids)
         .filter(([p]) => r.side === 'BUY' ? D(p).lte(price) : D(p).gte(price)).reduce((sum, [, q]) => sum.plus(q), D(0)).toString() : null;
       if (request.source === 'direct' && r.orderType === 'LIMIT' && r.price === undefined) notes.push('限价尚未填写，暂按当前盘口保护价估算');
-      return { symbol: rule.symbol, side: r.side, quoteCurrency: quote.quoteCurrency, orderType: r.orderType, timeInForce: r.timeInForce,
+      // Capacity labels use the verified CrossEx currency, not the native quote currency.
+      return { symbol: rule.symbol, side: r.side, quoteCurrency: quote.counterCurrency ?? quote.quoteCurrency, orderType: r.orderType, timeInForce: r.timeInForce,
         price, budgetPrice: Decimal.max(price, built.referencePrice).toString(), fxRate: String(rate.ask), depthQuantity, rule };
     });
     if (legs.some(l => l.orderType === 'MARKET')) notes.push('市价单按当前保护价内深度估算；实际成交价格由提交时盘口决定');
