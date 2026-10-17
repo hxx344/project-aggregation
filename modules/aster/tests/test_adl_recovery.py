@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from trading.adl_recovery import UNKNOWN, reconcile_order
+from trading.adl_recovery import UNKNOWN, capture_receipt, reconcile_order
 from trading.exchange import BudgetWait, ExchangeError, RequestNotSent
 from trading.execution import Executor
 from trading.models import TradingError
@@ -16,10 +16,17 @@ class Crash(BaseException):
 
 
 class Broker:
-    def __init__(self, queries=(), cancellations=()):
+    def __init__(self, queries=(), cancellations=(), *, streamed=None):
         self.queries, self.cancellations = list(queries), list(cancellations)
         self.calls = []
         self.before = None
+        self.streamed, self.cache_calls = streamed, []
+
+    def order_event_receipt(self, order, *, include_active=False):
+        self.cache_calls.append((deepcopy(order), include_active))
+        if isinstance(self.streamed, BaseException):
+            raise self.streamed
+        return deepcopy(self.streamed)
 
     def request(self, kind, symbol, client_id, timeout=None):
         if self.before:
@@ -174,16 +181,16 @@ class ADLRecoveryTests(unittest.TestCase):
         self.assertEqual(self.item, before)
         self.assertEqual(broker.calls, [])
 
-    def test_unknown_cancel_is_sent_once_with_new_window_and_bounded_post_cancel_queries(self):
+    def test_unknown_cancel_is_sent_once_and_active_receipt_keeps_low_frequency_queries(self):
         self.item["receipt"] = self.receipt()
-        broker = Broker([self.unknown() for _ in range(3)], [self.unknown()])
+        broker = Broker([*[self.unknown() for _ in range(4)], self.receipt("CANCELED")], [self.unknown()])
 
         def before(kind):
             saved = self.saved()
             self.assertTrue(saved["cancel_requested"])
             self.assertEqual(saved["last_possible_send_at"], 1011)
             if kind == "query":
-                self.assertEqual(saved["post_cancel_queries"], len(broker.calls))
+                self.assertEqual(saved["post_cancel_queries"], min(3, len(broker.calls)))
 
         broker.before = before
         self.assertEqual(self.run_recovery(broker, 1011), "waiting")
@@ -192,10 +199,14 @@ class ADLRecoveryTests(unittest.TestCase):
             self.assertEqual(self.run_recovery(broker, at), "waiting")
             self.restart()
         self.assertEqual(self.run_recovery(broker, 1130), "waiting")
-        self.assertEqual(self.run_recovery(broker, 1131), "reality")
-        self.assertEqual([call[0] for call in broker.calls], ["cancel", "query", "query", "query"])
+        self.assertEqual(self.run_recovery(broker, 1131), "waiting")
+        self.assertEqual([call[0] for call in broker.calls], ["cancel", "query", "query", "query", "query"])
         self.assertEqual(self.item["receipt"]["status"], "NEW")
         self.assertEqual(self.item["state"], "sending")
+        self.restart()
+        self.assertEqual(self.run_recovery(broker, 1159), "waiting")
+        self.assertEqual(self.run_recovery(broker, 1160), "terminal")
+        self.assertEqual(sum(call[0] == "cancel" for call in broker.calls), 1)
 
     def test_known_active_receipt_can_cancel_after_original_query_budget_is_exhausted(self):
         broker = Broker([self.receipt() for _ in range(3)], [self.receipt("CANCELED")])
@@ -207,28 +218,34 @@ class ADLRecoveryTests(unittest.TestCase):
         self.assertEqual(self.item["queries"], 3)
 
     def test_active_query_then_cancel_uses_independent_post_cancel_budget(self):
-        broker = Broker([self.receipt(), *[self.unknown() for _ in range(3)]], [self.unknown()])
+        broker = Broker([self.receipt(), *[self.unknown() for _ in range(4)]], [self.unknown()])
         self.assertEqual(self.run_recovery(broker, 1011), "waiting")
         self.assertEqual(self.item["queries"], 1)
         self.assertEqual(self.item["post_cancel_queries"], 0)
         for at in (1013, 1015, 1017):
             self.run_recovery(broker, at)
-        self.assertEqual(self.run_recovery(broker, 1131), "reality")
+        self.assertEqual(self.run_recovery(broker, 1131), "waiting")
         self.assertEqual(self.item["queries"], 1)
         self.assertEqual(self.item["post_cancel_queries"], 3)
-        self.assertEqual(len(broker.calls), 5)
+        self.assertEqual(len(broker.calls), 6)
 
-    def test_cancel_disabled_keeps_known_active_order_read_only_through_bounded_recovery(self):
+    def test_cancel_disabled_keeps_known_active_order_read_only_until_terminal(self):
         self.item["receipt"] = self.receipt()
-        broker = Broker([self.receipt(), self.receipt(), self.receipt()])
+        broker = Broker([self.receipt(), self.receipt(), self.receipt(), self.receipt(), self.receipt("FILLED", "1")])
         for at in (1011, 1013, 1015):
             self.assertEqual(reconcile_order(self.item, broker, self.persist, now=at, allow_cancel=False), "waiting")
             self.restart()
-        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1120, allow_cancel=False), "reality")
-        self.assertEqual([call[0] for call in broker.calls], ["query"] * 3)
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1044, allow_cancel=False), "waiting")
+        self.assertEqual(len(broker.calls), 3)
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1045, allow_cancel=False), "waiting")
+        self.restart()
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1074, allow_cancel=False), "waiting")
+        self.assertEqual(len(broker.calls), 4)
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1120, allow_cancel=False), "terminal")
+        self.assertEqual([call[0] for call in broker.calls], ["query"] * 5)
         self.assertNotIn("cancel_requested", self.item)
-        self.assertEqual(self.item["state"], "sending")
-        self.assertEqual(self.item["receipt"]["status"], "NEW")
+        self.assertEqual(self.item["state"], "terminal")
+        self.assertEqual(self.item["receipt"]["status"], "FILLED")
 
     def test_cancel_disabled_does_not_write_after_first_late_active_query(self):
         broker = Broker([self.receipt()])
@@ -260,15 +277,125 @@ class ADLRecoveryTests(unittest.TestCase):
 
     def test_crash_after_cancel_intent_never_sends_another_cancellation(self):
         self.item["receipt"] = self.receipt()
-        broker = Broker([self.unknown() for _ in range(3)], [Crash()])
+        broker = Broker([self.unknown() for _ in range(4)], [Crash()])
         with self.assertRaises(Crash):
             self.run_recovery(broker, 1010)
         self.restart()
         self.assertTrue(self.item["cancel_requested"])
         for at in (1012, 1014, 1016):
             self.run_recovery(broker, at)
-        self.assertEqual(self.run_recovery(broker, 1130), "reality")
+        self.assertEqual(self.run_recovery(broker, 1130), "waiting")
         self.assertEqual(sum(call[0] == "cancel" for call in broker.calls), 1)
+
+    def test_cached_terminal_receipt_overrides_exhausted_unknown_resolution_without_rest(self):
+        self.item.update(resolution="positions_verified_unknown", resolved_at=1200, queries=3,
+                         query_after=9000, reconciliation_phase="reality")
+        broker = Broker(streamed=self.receipt("FILLED", "1", origQty="1"))
+        self.assertEqual(self.run_recovery(broker, 1300), "terminal")
+        self.restart()
+        self.assertEqual(self.item["receipt"]["status"], "FILLED")
+        self.assertEqual(self.item["state"], "terminal")
+        self.assertNotIn("resolution", self.item)
+        self.assertNotIn("resolved_at", self.item)
+        self.assertEqual(self.item["reconciliation_phase"], "terminal")
+        self.assertEqual(broker.calls, [])
+        self.assertTrue(broker.cache_calls[0][1])
+
+    def test_cached_active_receipts_revoke_legacy_resolution_and_survive_cache_expiry(self):
+        for status, qty in (("NEW", "0"), ("PARTIALLY_FILLED", ".4"), ("PENDING_CANCEL", ".4")):
+            with self.subTest(status=status):
+                self.item = {"order": deepcopy(self.item["order"]), "state": "sending", "sent_at": 1000,
+                             "queries": 3, "query_after": 2000, "resolution": "positions_verified_unknown",
+                             "resolved_at": 1200, "reconciliation_phase": "reality"}
+                broker = Broker([self.unknown(), self.receipt("CANCELED", qty)], streamed=self.receipt(status, qty))
+                self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1300, allow_cancel=False), "waiting")
+                self.assertNotIn("resolution", self.saved())
+                self.assertNotIn("resolved_at", self.saved())
+                self.assertEqual(self.saved()["reconciliation_phase"], "waiting")
+                self.assertEqual(broker.calls, [])
+                self.restart()
+                broker.streamed = None
+                self.assertEqual(reconcile_order(self.item, broker, self.persist, now=2000, allow_cancel=False), "waiting")
+                self.assertEqual(self.item["receipt"]["status"], status)
+                self.assertEqual(self.item["queries"], 3)
+                self.restart()
+                self.assertEqual(reconcile_order(self.item, broker, self.persist, now=2029, allow_cancel=False), "waiting")
+                self.assertEqual(len(broker.calls), 1)
+                self.assertEqual(reconcile_order(self.item, broker, self.persist, now=2030, allow_cancel=False), "terminal")
+
+    def test_existing_active_receipt_revokes_resolution_even_without_new_stream_evidence(self):
+        self.item.update(receipt=self.receipt("NEW"), resolution="positions_verified_unknown", resolved_at=1200,
+                         queries=3, query_after=2000)
+        self.assertTrue(capture_receipt(self.item, Broker(), self.persist))
+        self.assertNotIn("resolution", self.saved())
+        self.assertEqual(self.saved()["receipt"]["status"], "NEW")
+
+    def test_cached_activity_revokes_uncommitted_reality_phase_before_snapshot_commit(self):
+        self.item.update(queries=3, reconciliation_phase="reality")
+        broker = Broker(streamed=self.receipt("NEW"))
+        self.assertTrue(capture_receipt(self.item, broker, self.persist))
+        self.assertEqual(self.saved()["reconciliation_phase"], "waiting")
+        self.assertEqual(self.saved()["state"], "sending")
+        self.assertNotIn("resolution", self.saved())
+        self.assertEqual(broker.calls, [])
+
+    def test_cached_evidence_must_persist_before_any_http_fallback(self):
+        broker = Broker(streamed=self.receipt("NEW"))
+        def failed_save():
+            raise OSError("disk unavailable")
+        with self.assertRaises(OSError):
+            reconcile_order(self.item, broker, failed_save, now=1300)
+        self.assertEqual(broker.calls, [])
+
+    def test_cache_failures_preserve_valid_receipt_and_cannot_fall_through_to_reality(self):
+        original = self.receipt("PARTIALLY_FILLED", ".4", updateTime=10)
+        invalid = [RuntimeError("private cache failure"), self.receipt("PARTIALLY_FILLED", ".3"),
+                   self.receipt("PARTIALLY_FILLED", ".5", origQty="2"),
+                   self.receipt("PARTIALLY_FILLED", ".5", orderId=124),
+                   self.receipt("PARTIALLY_FILLED", ".5", updateTime=9),
+                   self.receipt("FILLED", "1", clientOrderId="another-order")]
+        for bad in invalid:
+            with self.subTest(evidence=bad):
+                self.item = {"order": deepcopy(self.item["order"]), "state": "sending", "sent_at": 1000,
+                             "receipt": deepcopy(original), "queries": 3,
+                             "resolution": "positions_verified_unknown", "resolved_at": 1200}
+                self.persist()
+                before = deepcopy(self.item)
+                broker = Broker(streamed=bad)
+                with self.assertRaisesRegex(TradingError, "原订单流回执核对失败"):
+                    self.run_recovery(broker, 1300)
+                self.assertEqual(self.item, before)
+                self.assertEqual(self.saved(), before)
+                self.assertEqual(broker.calls, [])
+
+    def test_cached_active_receipt_cannot_downgrade_a_durable_terminal(self):
+        self.item.update(state="terminal", receipt=self.receipt("FILLED", "1"))
+        self.persist()
+        before = deepcopy(self.item)
+        broker = Broker(streamed=self.receipt("NEW"))
+        self.assertFalse(capture_receipt(self.item, broker, self.persist))
+        self.assertEqual(self.run_recovery(broker, 1300), "terminal")
+        self.assertEqual(self.item, before)
+        self.assertEqual(broker.cache_calls, [])
+        self.assertEqual(broker.calls, [])
+
+    def test_cache_capture_is_idempotent_and_never_consumes_query_or_cancel_budget(self):
+        broker = Broker(streamed=self.receipt("NEW", origQty="1"))
+        self.assertTrue(capture_receipt(self.item, broker, self.persist))
+        self.assertFalse(capture_receipt(self.item, broker, lambda: self.fail("unchanged evidence persisted")))
+        self.assertNotIn("queries", self.item)
+        self.assertNotIn("cancel_requested", self.item)
+        self.assertEqual(broker.calls, [])
+
+    def test_active_query_budget_wait_remains_waiting_and_respects_longer_retry(self):
+        self.item.update(receipt=self.receipt("NEW"), queries=3)
+        broker = Broker([BudgetWait("local denial", retry_after=60), self.receipt("FILLED", "1")])
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1300, allow_cancel=False), "waiting")
+        self.assertEqual(self.saved()["queries"], 3)
+        self.restart()
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1359, allow_cancel=False), "waiting")
+        self.assertEqual(len(broker.calls), 1)
+        self.assertEqual(reconcile_order(self.item, broker, self.persist, now=1360, allow_cancel=False), "terminal")
 
     def test_receipt_regressions_and_identity_conflicts_preserve_last_valid_evidence(self):
         original = self.receipt("PARTIALLY_FILLED", ".4", updateTime=10)

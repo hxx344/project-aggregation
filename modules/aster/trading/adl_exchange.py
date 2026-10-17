@@ -39,6 +39,23 @@ def _budget(api):
     return budget.reconciliation() if budget is not None else nullcontext()
 
 
+def require_snapshot_budget(brokers, *, market_only=False):
+    """Admit the whole scene before either member starts its account reads.
+
+    This is a non-spending preflight, not a reservation across workers. Every
+    actual request must still reserve atomically against concurrent consumers.
+    """
+    budgets = {}
+    weight = 40 if market_only is True else 80
+    for broker in brokers.values():
+        budget = getattr(broker.api, "budget", None)
+        if budget is not None:
+            budgets[budget] = budgets.get(budget, 0) + weight
+    for budget, total in budgets.items():
+        with budget.reconciliation():
+            budget.require_available(total)
+
+
 @dataclass(frozen=True)
 class ReductionPosition:
     symbol: str
@@ -165,12 +182,14 @@ def _open_orders(rows, hedge_mode):
     return deepcopy(rows)
 
 
-def reduction_snapshot(broker):
+def reduction_snapshot(broker, *, market_only=False):
     """Read complete positions and orders without ordinary opening risk gates.
 
-All four reads use the existing reconciliation quota. The oldest request time
-owns freshness; a write or private event during any read invalidates the result.
-"""
+    A caller that has verified MARKET-only recovery can omit openOrders; that
+    result does not prove the whole account has no open orders. Position, mode,
+    identity and generation checks remain mandatory in either mode. All reads
+    use reconciliation quota and the oldest request time owns freshness.
+    """
     with broker._snapshot_lock:
         started, generation = time.time(), broker._snapshot_generation
         api, account_identity = broker.api, _identity(broker.api)
@@ -178,7 +197,7 @@ owns freshness; a write or private event during any read invalidates the result.
         account = api.call("GET", "/fapi/v3/accountWithJoinMargin", signed=True, weight=5)
         risk = api.call("GET", "/fapi/v3/positionRisk", signed=True, weight=5)
         dual = api.call("GET", "/fapi/v3/positionSide/dual", signed=True, weight=30)
-        orders = api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
+        orders = [] if market_only is True else api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
     if not isinstance(dual, dict) or type(dual.get("dualSidePosition")) is not bool:
         raise TradingError("ADL 账户持仓模式响应无效")
     if not isinstance(account, dict) or type(account.get("canTrade")) is not bool:

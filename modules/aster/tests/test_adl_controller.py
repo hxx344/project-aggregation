@@ -130,7 +130,7 @@ class AdlControllerTests(unittest.TestCase):
         rules.start()
         self.addCleanup(rules.stop)
 
-    def snapshot(self, broker):
+    def snapshot(self, broker, *, market_only=False):
         aid = next(aid for aid, current in self.brokers.items() if current is broker)
         self.reads.append((aid, deepcopy(self.holdings[aid])))
         return ReductionSnapshot(tuple(self.holdings[aid]), True, True, deepcopy(self.open_orders[aid]), self.now,
@@ -262,14 +262,14 @@ class AdlControllerTests(unittest.TestCase):
             self.controller = adl.AdlController(self.engine)
             original_snapshot = self.snapshot
             with patch("trading.adl.adl_exchange.reduction_snapshot",
-                       side_effect=lambda broker: replace(original_snapshot(broker), can_trade=False)):
+                       side_effect=lambda broker, **options: replace(original_snapshot(broker, **options), can_trade=False)):
                 self.tick(10)
             self.assertEqual(self.state()["status"], "completed")
             self.assertTrue(self.state()["hold"])
             self.assertEqual(self.sent, [])
             rules.assert_not_called()
 
-    def test_disabled_automatic_reduction_queries_old_orders_without_cancel_and_preserves_unknown(self):
+    def test_disabled_automatic_reduction_tracks_known_active_orders_without_cancel_until_terminal(self):
         self.store.save_pair({**self.store.pair("pair"), "adl": {"enabled": False}})
         runtime = self.archived_runtime()
         for batch in runtime["recovery_watch"]["batches"]:
@@ -285,20 +285,25 @@ class AdlControllerTests(unittest.TestCase):
         self.controller = adl.AdlController(self.engine)
         self.now = started + 120
         self.tick()
-        self.assertEqual(self.state()["status"], "blocked")
-        self.assertIn("自动减仓已关闭", self.state()["reason"])
+        self.assertEqual(self.state()["status"], "active")
+        self.assertIn("正在核对原策略订单", self.state()["reason"])
         self.assertEqual(self.sent, [])
         for broker in self.brokers.values():
-            self.assertEqual(broker.query.call_count, 3)
+            self.assertEqual(broker.query.call_count, 4)
             broker.cancel.assert_not_called()
         for item in self.state()["prior_orders"]:
-            self.assertEqual(item["resolution"], "positions_verified_unknown")
+            self.assertNotIn("resolution", item)
             self.assertEqual(item["state"], "sending")
             self.assertEqual(item["receipt"]["status"], "NEW")
         self.holdings["b"] = [position("SHORT", "2")]
         self.tick(10)
+        self.assertNotEqual(self.state()["status"], "completed")
+        self.query_visible = True
+        for item in self.state()["prior_orders"]:
+            self.exchange_orders[item["account_id"], item["order"]["newClientOrderId"]] = receipt(item["order"], "0", status="CANCELED")
+        self.tick(20)
         self.assertEqual(self.state()["status"], "completed")
-        self.assertTrue(self.state()["watch_unknown"])
+        self.assertFalse(self.state()["watch_unknown"])
 
     def test_legacy_incident_without_config_retains_default_execution_policy(self):
         self.observe()
@@ -572,8 +577,8 @@ class AdlControllerTests(unittest.TestCase):
         self.holdings["b"] = [position("SHORT", "2")]
         self.observe()
         original_read = self.controller._read
-        def read_with_late_event(brokers):
-            snapshots = original_read(brokers)
+        def read_with_late_event(brokers, **options):
+            snapshots = original_read(brokers, **options)
             self.observe(order_id=43)
             return snapshots
         with patch.object(self.controller, "_read", side_effect=read_with_late_event):
@@ -734,8 +739,8 @@ class AdlControllerTests(unittest.TestCase):
     def test_snapshot_generation_change_before_send_fails_closed(self):
         self.observe()
         original_read = self.controller._read
-        def invalidate(brokers):
-            snapshots = original_read(brokers)
+        def invalidate(brokers, **options):
+            snapshots = original_read(brokers, **options)
             self.brokers["a"]._snapshot_generation += 1
             return snapshots
         with patch.object(self.controller, "_read", side_effect=invalidate):
@@ -764,8 +769,8 @@ class AdlControllerTests(unittest.TestCase):
     def test_credential_identity_change_before_send_fails_closed(self):
         self.observe()
         original_read = self.controller._read
-        def replace_identity(brokers):
-            snapshots = original_read(brokers)
+        def replace_identity(brokers, **options):
+            snapshots = original_read(brokers, **options)
             self.brokers["a"].api.credentials["user"] = "different-wallet"
             return snapshots
         with patch.object(self.controller, "_read", side_effect=replace_identity):
