@@ -22,11 +22,14 @@ project_aggregation/
 ### 根目录保留文件
 - `README.md` - 项目主文档
 - `CLAUDE.md` - AI 协作入口
-- `AGENTS.md` - 项目规则与文档索引
+- `AGENTS.md` - 项目规则与文档索引（代理执行协议唯一权威）
 - `LESSONS.md` - 项目经验记录
 - `daily-review-prompt.md` - 复盘流程
+- `CONVENTIONS.md` - aider 入口，只引用 `AGENTS.md`
 - `code-standards.md` - 代码规范兼容链接
 - `package.json`, `tsconfig.json`, `vite.config.ts` 等配置文件
+
+编码工具入口统一只做引用，不复制规则正文：`.cursor/rules/`、`.clinerules`、`.roo/rules/`、`.github/instructions/`、`.claude/commands/`。提交门禁为 `scripts/review-gate.mjs` 与 `.githooks/`（`pre-commit` 查内容、`commit-msg` 查证据，由 `scripts/install-hooks.mjs` 在安装时启用）。
 
 ### scripts/ 目录
 运维和辅助脚本：
@@ -44,6 +47,7 @@ project_aggregation/
 ### docs/ 目录
 - **持久性技术文档**：`deployment.md`, `integration.md`, `local-route.md`
 - **代码规范**：`code-standards.md`, `workspace-style.md`, `FILE_ORGANIZATION.md`
+- **审查机制**：`code-review-standard.md`, `code-review-checklist.md`, `code-review-process.md`
 - **专题指南**：特定时期的重要改动记录（带日期命名）
 - **归档子目录**：`archive/` - 已完成的临时文档
 
