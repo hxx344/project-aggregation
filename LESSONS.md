@@ -323,6 +323,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **跨模块导入补充（2026-10-17）：** 事件 `monitor-crossex-import-identity-20261017`。本仓 `c00f651` 的 Monitor「在 CrossEx 查看」只传币种和交易所，`ManualHedgePanel` 据此选择目录中第一个合约；同平台 USDT/USDC 并存时会选错计价币，缺腿时还会回退。跨模块预填须携带精确双腿代码，并从原生符号解析币名、复用已验证别名与合约计价规则；接收端缺任何一腿时保留待处理状态，不自动替换。[Monitor 映射测试](modules/monitor/tests/crossex-import.test.mjs)、[接收匹配测试](modules/crossex/tests/opportunity-import.test.mjs) 与[工作台导入验收](tests/opportunity-import.browser.mjs)覆盖原生别名、USDT/USDC、Hyperliquid、迟到目录和缺合约。
 
+**跨模块导入补充（2026-10-18）：** 同一事件 `monitor-crossex-import-identity-20261017` 的后续，不增加事件数。基于 `61b43d2` 的逐腿导入改动中，[FOLKS 夹具](modules/crossex/tests/opportunity-import.test.mjs) 使用已收录的 Gate 合约与缺失的 Lighter 合约验证部分匹配；实际支持范围以当前目录为准，不据夹具推断交易所实时上架状态。接收端保留精确有效腿，提示缺失合约及仍有效的可选场所，机会表禁用缺腿组合；缺腿必须由用户明确补选。审查在[工作台浏览器回归](tests/opportunity-import.browser.mjs) 实际复现：编辑已保留腿会触发默认选腿 effect，把原缺失腿自动替换为另一计价币合约；修复后手动选择保留空腿，切换币种才重新采用默认选择。单测另复现已下架或暂停合约被列为“可交易”，修正提示只统计有效状态。后续目录变化、补齐双腿和显式预览分别验收，数量与旧核对页不得沿用。原修改中的目录总数及实时场所断言未保存原始响应，不纳入本轮核实证据。
+
 ### L021：子面板样式不能改变公共页面的宽度
 
 **适用条件：** 多个市场面板共用导航、行情卡片和居中容器，子面板按需加载并在切换后保留挂载。

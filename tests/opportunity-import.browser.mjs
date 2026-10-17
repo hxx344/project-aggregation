@@ -47,7 +47,13 @@ async page => {
     long: { exchange: 'binance', symbol: code('binance', 'BTC', 'USDC'), quoteCurrency: 'USDC', rate: .01, intervalHours: 8, normalized8hBps: 100, fundingAt: now(), nextFundingAt: now() + hour },
     short: { exchange: 'gate', symbol: code('gate', 'BTC', 'USDT'), quoteCurrency: 'USDT', rate: .0101, intervalHours: 8, normalized8hBps: 101, fundingAt: now(), nextFundingAt: now() + hour },
     equivalent8hBps: 1, grossBps: -1000, asOf: now(), expiresAt: now() + 9000, eligible: true, reason: '' }];
-  const state = () => ({ now: now(), csrfToken: 'opportunity-import-fixture', mode: 'live', config, venues: [], fx: [], opportunities: [], fundingOpportunities: funding(), positionFundingRates: [],
+  const spreadOpportunities = () => ['BTC', 'ETH'].map(base => {
+    const [long, short] = quotes().filter(quote => quote.base === base);
+    return { id: `spread-${base}`, pairKey: `spread-${base}`, base,
+      long: { ...long, crossexSymbol: code('binance', base, 'USDC') }, short: { ...short, crossexSymbol: code('gate', base, 'USDT') },
+      grossBps: 300, netBps: 280, eligible: true, reason: '', observedAt: now(), expiresAt: now() + 9000, transfer: { state: 'ready', reason: '' } };
+  });
+  const state = () => ({ now: now(), csrfToken: 'opportunity-import-fixture', mode: 'live', config, venues: [], fx: [], opportunities: spreadOpportunities(), fundingOpportunities: funding(), positionFundingRates: [],
     source: { state: 'live', error: null, updatedAt: now(), generatedAt: now(), checkedAt: now(), quoteCount: 4 }, catalog: { state: 'ready', count: instruments.length, updatedAt: now(), error: null },
     live: { connection, status: 'live', freshnessState: 'fresh', stale: false, partial: false, asOf: now(), tradingAllowed: true, reasons: [],
       account: { account_mode: 'CROSS_EXCHANGE', available_margin: '10000', margin_balance: '10000', initial_margin: '0', maintenance_margin: '0' },
@@ -240,6 +246,8 @@ async page => {
     holdCatalog = false; for (const release of catalogWaiters) release(); catalogWaiters.clear();
     await expectPair(code('binance', 'BTC', 'USDC'), code('gate', 'BTC', 'USDT'));
     assert(await select('A').locator('option').count() === 2, 'USDT and USDC coexist in the same venue directory');
+    await crossexFrame.getByRole('group', { name: '机会类型' }).getByRole('button', { name: '价差机会', exact: true }).click();
+    assert(await crossexFrame.locator('.opportunities-panel').getByRole('button', { name: '填入对冲组合', exact: true }).isEnabled(), 'A fully listed spread pair remains fillable');
     await crossexFrame.getByRole('group', { name: '机会类型' }).getByRole('button', { name: /资金费/ }).click();
     const fundingRow = crossexFrame.locator('.funding-table tbody tr').first();
     const capitalCell = fundingRow.locator('[data-label="资本效率"]');
@@ -306,11 +314,38 @@ async page => {
 
     await goMonitor();
     await captureImport('ETH', 'spread', 'binance', 'USDC', 'gate', 'USDT');
-    await expectPair('', '');
-    assert(await select('A').inputValue() !== code('binance', 'ETH', 'USDT'), 'missing exact ETH/USDC must not select available ETH/USDT');
+    await expectPair('', code('gate', 'ETH', 'USDT'));
+    assert(await select('A').inputValue() === '', 'missing exact ETH/USDC must not select available ETH/USDT');
     const crossex = page.frames().find(frame => frame.url().startsWith(crossexOrigin));
-    assert(/合约|目录/.test(await crossex.locator('.inline-state.warning').first().innerText()), 'missing directory match has a visible reason');
+    const notice = await crossex.locator('.inline-state.warning').first().innerText();
+    assert(/未上架 Binance 的 BINANCE_FUTURE_ETH_USDC/.test(notice) && /已选中 Gate GATE_FUTURE_ETH_USDT/.test(notice), 'missing leg is named while the listed leg stays selected');
+    await crossexFrame.getByRole('group', { name: '机会类型' }).getByRole('button', { name: '价差机会', exact: true }).click();
+    assert(await crossexFrame.locator('.opportunities-panel').getByRole('button', { name: '填入对冲组合', exact: true }).isDisabled(), 'A spread opportunity with a missing exact contract cannot be filled');
     await page.screenshot({ path: 'output/playwright/opportunity-import-missing-contract.png', fullPage: true });
+
+    await crossexFrame.getByRole('combobox', { name: 'B 腿交易所', exact: true }).selectOption('binance');
+    assert(await select('A').inputValue() === '', 'editing the retained leg must not auto-fill the missing exact contract');
+    await crossexFrame.getByRole('combobox', { name: 'B 腿交易所', exact: true }).selectOption('gate');
+    await crossexFrame.getByRole('combobox', { name: 'A 腿交易所', exact: true }).selectOption('binance');
+    await expectPair(code('binance', 'ETH', 'USDT'), code('gate', 'ETH', 'USDT'));
+    assert(previews.length === 2, 'manually completing a partial import never previews automatically');
+    await quantity().fill('0.25');
+    await crossexFrame.getByRole('button', { name: '预览双腿委托', exact: true }).click();
+    await crossexFrame.getByRole('dialog', { name: '核对开仓委托', exact: true }).waitFor();
+    assert(previews.length === 3 && previews[2].pair.longSymbol === code('binance', 'ETH', 'USDT')
+      && previews[2].pair.shortSymbol === code('gate', 'ETH', 'USDT') && previews[2].pair.quantity === '0.25', 'explicit preview uses the manually completed contracts and new quantity');
+    await crossexFrame.getByRole('button', { name: '关闭订单核对', exact: true }).click();
+    await page.evaluate(({ crossexOrigin, query }) => {
+      document.querySelector('iframe[title="Gate CrossEx模块"]').contentWindow.postMessage({ channel: 'project-hub', version: 1, type: 'navigate', projectId: 'crossex', query }, crossexOrigin);
+    }, { crossexOrigin, query: { symbol: 'ETH', longExchange: 'gate', shortExchange: 'binance', longContract: code('gate', 'ETH', 'USDT'),
+      shortContract: code('binance', 'ETH', 'USDC'), opportunityKind: 'spread', importId: 'partial-short-fixture' } });
+    await expectPair(code('gate', 'ETH', 'USDT'), '');
+    await crossexFrame.getByRole('combobox', { name: 'A 腿交易所', exact: true }).selectOption('binance');
+    assert(await select('B').inputValue() === '', 'editing the retained long leg leaves the missing short leg empty');
+    await crossexFrame.getByRole('combobox', { name: 'A 腿交易所', exact: true }).selectOption('gate');
+    await crossexFrame.getByRole('combobox', { name: 'B 腿交易所', exact: true }).selectOption('binance');
+    await expectPair(code('gate', 'ETH', 'USDT'), code('binance', 'ETH', 'USDT'));
+    assert(previews.length === 3, 'manual completion of a missing short leg also requires a new explicit preview');
 
     // Restore a pending operation identity without creating or confirming an order.
     await crossex.evaluate(() => {
@@ -325,14 +360,14 @@ async page => {
     const rejectedPending = await captureImport('BTC', 'spread', 'binance', 'USDC', 'gate', 'USDT');
     await expectRejected(rejectedPending);
     assert(await quantity().inputValue() === '0.4' && await select('A').inputValue() === code('binance', 'BTC', 'USDT'), 'restored pending request protects the current form from import');
-    assert(previews.length === 2, 'only the two explicit preview clicks reach the mock endpoint');
+    assert(previews.length === 3, 'only the three explicit preview clicks reach the mock endpoint');
     assert(!requests.some(item => /\/api\/live\/(confirm|cancel|connection)$/.test(item.path)), 'no business writes or order confirmations occur');
     assert(unexpected.length === 0, `unexpected requests: ${unexpected.join('; ')}`);
     assert(errors.length === 0, `uncaught browser errors: ${errors.join('; ')}`);
     return { passed: true, monitorImports: imports.length - 1, refreshWindowHostMessages: 1, previews: previews.length, liveOrders: 0,
       scenarios: ['real Hub Monitor-to-CrossEx iframe bridge', '1440/390px import column and disabled reason', 'source clock differs from browser by 24 hours',
         'late directory', 'USDT/USDC exact match', 'repeated import clears quantity and review', 'funding reverse direction from detail',
-        'in-flight preview rejects import', 'post-preview refresh rejects import', 'pending request rejects import', 'missing contract has no fallback'] };
+        'in-flight preview rejects import', 'post-preview refresh rejects import', 'pending request rejects import', 'missing contract keeps the listed leg without fallback'] };
   } finally {
     holdCatalog = false; holdState = false; holdPreview = false;
     for (const release of catalogWaiters) release(); for (const release of stateWaiters) release(); releasePreview?.();

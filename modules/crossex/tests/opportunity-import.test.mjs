@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { instrumentBase, opportunityImportPair } from '../src/opportunity-import.ts';
+import { importStatusMessage, instrumentBase, opportunityImportPair, resolveOpportunityImport } from '../src/opportunity-import.ts';
 
 const instrument = (exchange, base, currency, extra = {}) => ({
   symbol: `${exchange.toUpperCase()}_FUTURE_${base}_${currency}`, exchange, base,
@@ -59,4 +59,46 @@ test('Hyperliquid imports match CrossEx USDC counter currency without interpreti
   const imported = { ...query, longExchange: 'hyperliquid', longContract: hyperliquid.symbol };
   assert.deepEqual(opportunityImportPair(imported, [hyperliquid, short]), { long: hyperliquid, short });
   assert.equal(opportunityImportPair(imported, [{ ...hyperliquid, quoteCurrency: 'USDT' }, short]), null);
+});
+
+test('a missing leg is reported without discarding the leg CrossEx still lists', () => {
+  const resolution = resolveOpportunityImport(query, [long]);
+  assert.equal(resolution.long, long);
+  assert.equal(resolution.short, null);
+  assert.deepEqual(resolution.missing, [{ side: 'short', exchange: 'binance', symbol: short.symbol }]);
+  assert.equal(opportunityImportPair(query, [long]), null);
+  assert.deepEqual(resolveOpportunityImport(query, []).missing.map(leg => leg.side), ['long', 'short']);
+  assert.equal(resolveOpportunityImport({ ...query, importId: undefined }, [long, short]), null);
+});
+
+test('an unlisted venue leg names the missing contract and the venues CrossEx lists', () => {
+  const gate = instrument('gate', 'FOLKS', 'USDT'), binance = instrument('binance', 'FOLKS', 'USDT'), bybit = instrument('bybit', 'FOLKS', 'USDT');
+  const imported = { symbol: 'FOLKS', longExchange: 'gate', shortExchange: 'lighter', longContract: gate.symbol,
+    shortContract: 'LIGHTER_FUTURE_FOLKS_USDC', opportunityKind: 'spread', importId: 'folks-import' };
+  const instruments = [gate, binance, bybit], resolution = resolveOpportunityImport(imported, instruments);
+  const label = exchange => ({ gate: 'Gate', binance: 'Binance', bybit: 'Bybit', lighter: 'Lighter' }[exchange] ?? exchange);
+  assert.deepEqual(resolution, { long: gate, short: null, missing: [{ side: 'short', exchange: 'lighter', symbol: 'LIGHTER_FUTURE_FOLKS_USDC' }] });
+  const message = importStatusMessage(imported, resolution, instruments, '', label);
+  assert.match(message, /CrossEx 未上架 Lighter 的 LIGHTER_FUTURE_FOLKS_USDC/);
+  assert.match(message, /CrossEx 可交易的 FOLKS：Gate、Binance、Bybit/);
+  assert.match(message, /已选中 Gate GATE_FUTURE_FOLKS_USDT/);
+  assert.match(importStatusMessage(imported, resolution, [], '', label), /正在等待合约目录/);
+  assert.match(importStatusMessage(imported, resolution, instruments, '读取失败', label), /合约目录读取失败/);
+  assert.match(importStatusMessage(imported, resolution, [gate], '', label), /CrossEx 目录中只有 Gate 的 FOLKS 合约，暂时无法组成双腿/);
+  assert.match(importStatusMessage(imported, resolution, [gate, { ...binance, state: 'delisted' }, { ...bybit, state: 'suspended' }], '', label), /CrossEx 目录中只有 Gate 的 FOLKS 合约，暂时无法组成双腿/);
+});
+
+test('partial resolution retains only live exact legs through catalog removal and recovery', () => {
+  for (const patch of [{ state: 'delisted' }, { state: 'suspended' }, { quoteCurrency: 'USDT' }, { base: 'ETH' }, { exchange: 'gate' }]) {
+    const partial = resolveOpportunityImport(query, [{ ...long, ...patch }, short]);
+    assert.equal(partial.long, null);
+    assert.equal(partial.short, short);
+    assert.deepEqual(partial.missing, [{ side: 'long', exchange: 'bybit', symbol: long.symbol }]);
+  }
+  assert.deepEqual(resolveOpportunityImport(query, [long, short]), { long, short, missing: [] });
+  assert.deepEqual(resolveOpportunityImport(query, [short]).missing.map(leg => leg.side), ['long']);
+  assert.deepEqual(resolveOpportunityImport(query, [long, short]), { long, short, missing: [] });
+  for (const patch of [{ longExchange: 'binance', longContract: short.symbol }, { longContract: 'invalid' }, { quantity: '1' }]) {
+    assert.equal(resolveOpportunityImport({ ...query, ...patch }, [long, short]), null);
+  }
 });
