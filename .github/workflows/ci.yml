@@ -51,6 +51,21 @@ jobs:
           if-no-files-found: error
           # The runtime tarball is already gzip-compressed.
           compression-level: 0
+  hygiene:
+    name: Review gate (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+      - name: Check changed lines for review blockers
+        run: node scripts/review-gate.mjs --range "${{ github.event.pull_request.base.sha }}...HEAD"
+
   installer:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

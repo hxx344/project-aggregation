@@ -2,6 +2,49 @@
 
 本文件维护 project-aggregation 的项目规则与文档入口。用户当前指令和全局工作约定继续适用；这里不复制沟通、授权、提交发布和运行环境偏好。
 
+## 代理执行协议
+
+任何编码代理（Codex、Claude、DeepSeek 或其它客户端）改代码前后按本节执行。本节是唯一必读的硬约束，细节按链接取用。
+
+**动手前**
+
+1. 读「修改前」一节，再按下面的路由表只读相关经验条目，不要一次读完 `LESSONS.md`。
+2. 给改动定级 R1/R2/R3（[标准第 3 节](docs/code-review-standard.md#3-改动分级)）。R3 先说清影响面与回滚，再改代码。
+3. 需求或契约不明确时先问；不猜着改公共接口、资金路径、部署脚本。
+
+**改的时候**
+
+4. 一个改动只做一件事：不顺手重构、不夹带格式化、不改 `output/`、`dist/`、`node_modules/`。
+5. 同类路径一起处理，或明确登记；不接受"只修这一处"。
+6. 新增外部调用必须写清超时、重试上限、失败行为；新增缓存必须写清失效条件。
+7. 不新增 `console.log`、`debugger`、`.only(`、被放宽的断言；服务端日志走 `server/logger.mjs`。
+
+**交付前**
+
+8. 实际运行 `pnpm run check` 与改动相关测试，在回复和提交信息里给「已运行 / 未运行 / 待确认」三段。
+9. 按 [审查清单](docs/code-review-checklist.md) 自审，不适用项注明原因。
+10. 声称完成前确认：没有未处理的 P0/P1，没有把未验证项写成已验证。
+
+**禁止**
+
+- 把"引用了测试"表述为"验证通过"。
+- 因审查意见与己见不同就静默忽略；不同意须写明理由。
+- 未获当次授权就部署、推送或修改服务器。
+
+### 按改动取用经验
+
+| 改动涉及 | 必读条目 |
+| --- | --- |
+| 收益、盈亏、资金费、计价换算 | L002 L016 L038 L045 L059 |
+| 行情、报价、快照、新鲜度 | L040 L046 L049 L050 L058 |
+| 持仓、配对、杠杆、保证金 | L020 L027 L035 L041 L056 |
+| 下单、平仓、ADL、执行 | L008 L009 L024 L029 L054 |
+| 缓存、恢复、重连、轮询 | L002 L003 L037 L042 L048 |
+| 更新器、安装、发布、部署 | L011 L015 L017 L018 L019 L030 L032 L034 L036 L055 |
+| 模块拆分、构建、依赖 | L005 L018 L019 L032 |
+
+路由表未覆盖的改动，先读 `LESSONS.md` 目录再定位。
+
 ## 开发与发布范围
 
 - 工作台及其内置模块的修改、验证、提交、推送和正式发布统一在本仓库完成；模块业务代码直接修改 `modules/monitor`、`modules/asset`、`modules/crossex`、`modules/greeks`、`modules/aster` 中的内置版本。
@@ -13,6 +56,17 @@
 - 阅读 [LESSONS.md](LESSONS.md) 的目录与适用条件，检查与本次改动相关的经验及其证据。
 - 阅读 [代码规范](docs/code-standards.md)，只应用范围匹配的条目。历史经验中的参数、外部仓库做法与待核实结论不能直接推广为本项目的强制规则。
 - 涉及某条经验时，核对当前源码，并选择其“如何验证”中与本次变化相称的检查。复用本任务中仍有效的结果，不因文档列出多个检查就重复全套验证。
+- 按 [审查标准](docs/code-review-standard.md) 第 3 节给改动定级；定级决定审查深度与所需证据，不决定是否需要审查。
+
+## 合并前审查
+
+- 判定标准以 [docs/code-review-standard.md](docs/code-review-standard.md) 为准，逐项检查用 [清单](docs/code-review-checklist.md)，步骤、时限与留痕以 [流程](docs/code-review-process.md) 为准。三份文件不互相复制正文。
+- 自审证据必须对应真实执行过的命令与输出；引用已有测试不等于运行过测试，未运行的检查要写明原因。
+- 提交前运行 `node scripts/review-gate.mjs --staged`。门禁只覆盖调试残留、`.only`、冲突标记、疑似凭据与禁止提交目录；门禁变绿不等于审查完成。
+- `.githooks/` 由 `pnpm install` 的 `prepare` 自动启用（等价于 `git config core.hooksPath .githooks`）。其中 `pre-commit` 跑内容门禁，`commit-msg` 要求改动涉及 `src/`、`server/`、`modules/*/src/`、`deploy/` 时，提交信息必须含「风险等级」与「已运行/未运行」证据。
+- P0/P1 清零才可合并；P2 须登记；R3 改动（资金、权限、部署激活、数据库结构、公共契约）须有独立审查记录与回滚方案。
+- 同一改动不能由作者代理同时充当唯一审查者；审查代理只读，上下文与作者隔离。
+- 合并后发现的 P0/P1 记为逃逸缺陷，回填下次复盘，并据此决定是否补充清单项。
 
 ## 经验记录与维护
 
@@ -28,6 +82,8 @@
 
 普通开发、局部 PR 审查只更新本次已核实经验，不推进整个主线的复盘检查点。鉴权、凭据或交易执行边界的安全审查沿用用户要求的安全审查流程。
 
+复盘审的是已合入历史，不能替代 [合并前审查](#合并前审查)；合并前审查的记录可作为复盘的证据。
+
 ## 文件职责
 
 | 文件 | 维护内容 |
@@ -35,10 +91,16 @@
 | `AGENTS.md` | 项目规则和阅读入口 |
 | `LESSONS.md` | 项目经验、适用边界和事件证据 |
 | `docs/code-standards.md` | 满足升级条件的规范及其依据 |
+| `docs/code-review-standard.md` | 合并前的审查范围、分级、严重级别与门槛 |
+| `docs/code-review-checklist.md` | 逐项检查清单（唯一清单正文） |
+| `docs/code-review-process.md` | 审查步骤、时限、轮次、热修与度量 |
 | `daily-review-prompt.md` | 增量复盘、事件去重和检查点更新流程 |
 | `docs/review-state.json` | 已完成检查点和未完成复盘的报告位置 |
 | `docs/FILE_ORGANIZATION.md` | 文件组织与命名规范 |
-| `CLAUDE.md`、`.cursorrules`、`.github/copilot-instructions.md` | 工具入口，只引用上述权威文件 |
+| `.github/pull_request_template.md` | PR 自审与证据模板，只引用上述标准 |
+| `scripts/review-gate.mjs`、`.githooks/pre-commit` | 可机械判定的提交前门禁 |
+| `CLAUDE.md`、`CONVENTIONS.md`、`.cursor/rules/`、`.cursorrules`、`.clinerules`、`.roo/rules/`、`.github/copilot-instructions.md`、`.github/instructions/` | 工具入口，只引用 `AGENTS.md`，不复制规则正文 |
+| `.claude/commands/review.md` | Claude Code 审查命令，按标准输出意见 |
 
 根目录 `code-standards.md` 仅保留兼容链接。工具入口和使用说明不维护业务规则副本；权威文件路径变化时同步更新引用。
 
