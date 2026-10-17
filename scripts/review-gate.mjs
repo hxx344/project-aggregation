@@ -11,9 +11,11 @@
  * 本脚本只覆盖可机械判定的部分；语义、缓存、资金边界仍须人工/代理审查。
  */
 import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const BLOCKED_PATHS = [
-  { re: /^(output|dist|node_modules)\//, why: '生成物或依赖目录不提交，改为修改生成源' },
+  { re: /(^|\/)(output|dist|node_modules)\//, why: '生成物或依赖目录不提交，改为修改生成源' },
   { re: /(^|\/)\.env(\.|$)/, why: '环境文件可能含凭据，不得提交' },
 ];
 
@@ -28,7 +30,7 @@ const CONTENT_RULES = [
     id: 'console.log',
     re: /\bconsole\.log\s*\(/,
     level: 'error',
-    scope: /^(src|server|modules\/[^/]+\/src)\//,
+    scope: /^(src|server|modules)\//,
     why: '服务端/前端日志走 logger 或已有诊断通道，不新增 console.log',
   },
   {
@@ -63,58 +65,55 @@ const CONTENT_RULES = [
   },
 ];
 
-function git(args) {
-  return execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+export function git(args, options = {}) {
+  return execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true, ...options });
 }
 
 function parseArgs(argv) {
   const out = { mode: 'worktree', range: null };
   for (let i = 0; i < argv.length; i += 1) {
-    if (argv[i] === '--staged') out.mode = 'staged';
+    if (argv[i] === '--staged' && out.mode === 'worktree') out.mode = 'staged';
     else if (argv[i] === '--range') {
+      if (out.mode !== 'worktree' || !argv[i + 1] || argv[i + 1].startsWith('-')) return { mode: 'invalid' };
+      out.mode = 'range';
       out.range = argv[i + 1];
       i += 1;
-    } else if (argv[i] === '-h' || argv[i] === '--help') out.mode = 'help';
-    else {
-      console.error(`未知参数：${argv[i]}`);
-      out.mode = 'invalid';
-    }
+    } else if ((argv[i] === '-h' || argv[i] === '--help') && argv.length === 1) out.mode = 'help';
+    else return { mode: 'invalid' };
   }
   return out;
 }
 
-function readDiff(mode, range) {
-  if (mode === 'staged') return git(['diff', '--cached', '-U0', '--no-color', '--no-ext-diff']);
+export function diffArgs(mode, range) {
+  if (mode === 'staged') return ['--cached'];
   if (mode === 'range') {
-    if (!range) throw new Error('--range 需要形如 origin/main...HEAD 的范围');
-    return git(['diff', '-U0', '--no-color', '--no-ext-diff', range]);
+    if (typeof range !== 'string' || range.startsWith('-') || !/^[^\s]+?\.{2,3}[^\s]+$/.test(range)) throw new Error('Invalid review range');
+    return [range];
   }
-  return git(['diff', '-U0', '--no-color', '--no-ext-diff', 'HEAD']);
+  return ['HEAD'];
+}
+
+export function changedPaths(mode, range, includeDeleted = false) {
+  return git(['diff', '--name-only', '-z', '--no-renames', `--diff-filter=${includeDeleted ? 'ACDMRT' : 'ACMRT'}`, ...diffArgs(mode, range), '--']).split('\0').filter(Boolean);
 }
 
 function parseAddedLines(diff) {
-  const files = new Map();
-  let current = null;
+  const lines = [];
+  let inHunk = false;
   let newLine = 0;
   for (const raw of diff.split('\n')) {
-    if (raw.startsWith('+++ ')) {
-      const target = raw.slice(4).trim();
-      current = target === '/dev/null' ? null : target.replace(/^b\//, '');
-      if (current && !files.has(current)) files.set(current, []);
-      continue;
-    }
     if (raw.startsWith('@@')) {
       const match = /\+(\d+)(?:,(\d+))?/.exec(raw);
       newLine = match ? Number(match[1]) : 0;
+      inHunk = !!match;
       continue;
     }
-    if (!current || raw.startsWith('---')) continue;
-    if (raw.startsWith('+')) {
-      files.get(current).push({ line: newLine, text: raw.slice(1) });
+    if (inHunk && raw.startsWith('+')) {
+      lines.push({ line: newLine, text: raw.slice(1) });
       newLine += 1;
     }
   }
-  return files;
+  return lines;
 }
 
 function main() {
@@ -123,22 +122,22 @@ function main() {
     console.log('用法：node scripts/review-gate.mjs [--staged | --range <base...head>]');
     return 0;
   }
-  if (opts.mode === 'invalid') return 2;
+  if (opts.mode === 'invalid') { console.error('用法错误：--staged 与 --range <base..head> 只能选一个。'); return 2; }
 
-  let diff;
+  let files;
   try {
-    diff = readDiff(opts.mode, opts.range);
-  } catch (error) {
-    console.error(`读取 diff 失败：${error.message}`);
+    files = new Map(changedPaths(opts.mode, opts.range).map(file => [file, parseAddedLines(git(['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', ...diffArgs(opts.mode, opts.range), '--', file]))]));
+  } catch {
+    console.error('读取 Git 改动失败，请确认审查范围存在且可读取。');
     return 2;
   }
 
-  const files = parseAddedLines(diff);
   const findings = [];
   let addedLines = 0;
 
   for (const [file, lines] of files) {
     for (const rule of BLOCKED_PATHS) {
+      if (file.split('/').at(-1) === '.env.example' && rule.re.test('.env')) continue;
       if (rule.re.test(file)) {
         findings.push({ level: 'error', file, line: 0, rule: 'blocked-path', why: rule.why });
       }
@@ -148,7 +147,7 @@ function main() {
       for (const rule of CONTENT_RULES) {
         if (rule.scope && !rule.scope.test(file)) continue;
         if (rule.re.test(text)) {
-          findings.push({ level: rule.level, file, line, rule: rule.id, why: rule.why, text: text.trim() });
+          findings.push({ level: rule.level, file, line, rule: rule.id, why: rule.why });
         }
       }
     }
@@ -167,7 +166,6 @@ function main() {
       const mark = f.level === 'error' ? '阻断' : '提醒';
       const where = f.line ? `${f.file}:${f.line}` : f.file;
       console.log(`[${mark}] ${where}  ${f.why}`);
-      if (f.text) console.log(`         ${f.text.slice(0, 120)}`);
     }
   }
 
@@ -181,4 +179,4 @@ function main() {
   return 0;
 }
 
-process.exitCode = main();
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) process.exitCode = main();

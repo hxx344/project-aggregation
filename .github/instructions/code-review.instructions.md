@@ -4,6 +4,6 @@ applyTo: "**"
 
 改动前读取仓库根目录 `AGENTS.md` 的《代理执行协议》与《修改前》，按路由表取用经验条目，不要一次读完 `LESSONS.md`。
 
-交付前：运行 `pnpm run check` 与改动相关测试，按 `docs/code-review-checklist.md` 自审，并给出「已运行 / 未运行 / 待确认」三段证据。判定标准见 `docs/code-review-standard.md`。
+交付前按 `AGENTS.md` 选择必要检查、记录证据并执行提交门禁；标准与清单从权威入口按需读取。
 
 本文件只做入口，不复制规则正文。

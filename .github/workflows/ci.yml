@@ -53,7 +53,6 @@ jobs:
           compression-level: 0
   hygiene:
     name: Review gate (changed lines)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -64,7 +63,11 @@ jobs:
         with:
           node-version: '24.15.0'
       - name: Check changed lines for review blockers
-        run: node scripts/review-gate.mjs --range "${{ github.event.pull_request.base.sha }}...HEAD"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --test tests/review-gate.test.mjs
+          node scripts/review-ci.mjs
 
   installer:
     runs-on: ubuntu-24.04
@@ -183,7 +186,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, installer, aster-relay, release-mirror]
+    needs: [app, hygiene, installer, aster-relay, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

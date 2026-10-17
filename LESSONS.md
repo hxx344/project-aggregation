@@ -931,3 +931,18 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基于 `cb6cba5` 的 2026-10-18 资本效率工作区；审查确认首次实现 [共享公式](server/capital-metrics.mjs) 分子未加权，[Monitor页面](modules/monitor/app/perpetual-panel.tsx) 从冻结行读取旧费差。首次提交前修正为 [共享时效入口](modules/monitor/lib/perpetual-capital.ts)；基线提交本身没有这些新指标。
 
 **事件记录：** `capital-roc-contract-20261018`；本次开发前置审查及连续修补归为一个事件，不推进主线复盘检查点。
+
+
+### L060：审查门禁须验证真实 Git 与发布入口
+
+**适用条件：** 用提交钩子、CI 范围参数及提交证据落实代码审查规范。
+
+**根因：** 参数被解析但未切换执行模式，干净 CI 将范围检查退化为空工作区检查；仅从文本 diff 头收集文件还会漏掉二进制、空文件和纯重命名。只给 PR 接门禁、却沿用直接 push main 和独立发布依赖，也不能覆盖实际交付路径。
+
+**以后做法：** 在隔离 Git 仓库用真实提交与钩子验证失败和成功路径；文件路径与新增行分别采集，诊断不回显疑似凭据所在源行。PR、push 与手动执行都选择明确基线，发布内容从最近正式版检查至目标，不能把前一次失败的提交作为可信基线；目标提交为整个交付留证据，发布依赖同一门禁。安装钩子保留已有配置并报告实际状态。证据格式校验只检查基本完整性，测试真实性与语义结论仍由独立审查核对。
+
+**如何验证：** [门禁行为回归](tests/review-gate.test.mjs) 覆盖干净工作区提交范围、暂存与未暂存差异、非法参数、重命名/嵌套/空/二进制路径、同一源行多规则命中时不泄漏内容、非 src 模块与删除提交证据、实际 Git 钩子拒绝及合格提交、安装幂等与归档隔离、PR/push/首次 push/手动运行，以及失败代码后续纯文档提交仍被拒绝。CI 在 Linux 运行同一回归；不以脚本语法正确或工作区空扫通过代替。
+
+**证据：** project-aggregation `89685c8` 的 [参数解析](scripts/review-gate.mjs) 只保存 range 未设置 mode；本轮 Windows 原生运行 `--range 5dc279b..HEAD` 返回“没有代码改动”，而范围内有实际新增代码。隔离回归进一步复现已提交的违规行、嵌套二进制/空文件漏检以及合成 token 原文回显。新 [CI 入口](scripts/review-ci.mjs)、[提交证据入口](scripts/review-message.mjs) 与 [.github/workflows/ci.yml](.github/workflows/ci.yml) 接通执行链。复现使用无效合成数据，不涉及真实凭据。
+
+**事件记录：** `review-gate-entrypoint-20261018`；一次门禁机制审核及连续修正，不推进主线复盘检查点。

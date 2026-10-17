@@ -26,12 +26,12 @@ R3 改动若方案本身有分歧，先对齐方案再写实现；不要在审�
 
 作者（人或代理）在发起审查前完成：
 
-1. 跑 `pnpm run check`，跑改动相关的测试（不是全部，也不是不跑）。
-2. 过一遍 [清单](code-review-checklist.md)，不适用的注明原因。
+1. 先选最小必要检查集：对应模块的类型检查、相关测试及本次实际受影响的入口；纯文档不跑代码检查，同任务中输入与环境未变的已通过结果直接复用。
+2. 按 [清单](code-review-checklist.md) 的适用类别自审，不适用原因可按类别汇总。
 3. 自查 diff：有没有夹带、调试残留、被放宽的断言。
 4. 准备证据：**运行了什么、结果如何、什么没运行及原因**。
 
-留痕格式（写在 PR 描述或提交信息）：
+留痕格式（代码、配置和测试提交写入提交信息，PR 可复用并补充独立审查记录）：
 
 ```text
 风险等级：R2
@@ -131,15 +131,18 @@ PR 必须包含：
 
 规则只在**被加载**时生效。各客户端读取的入口不同，因此仓库根目录 `AGENTS.md` 是唯一权威，其余文件只是入口：
 
-| 客户端 | 读取的文件 | 说明 |
+| 客户端 | 已配置的入口文件 | 核实边界 |
 | --- | --- | --- |
-| Codex CLI | `AGENTS.md` | 从根目录向下逐级合并，子目录可用 `AGENTS.override.md` 覆盖 |
-| Claude Code | `CLAUDE.md` | 已 `@AGENTS.md` 导入，无需额外配置 |
-| DeepSeek（经 Cline / Roo / aider 等） | `.clinerules`、`.roo/rules/`、`CONVENTIONS.md` | 模型本身不带配置，取决于客户端；`.aider.conf.yml` 已声明自动读取 `CONVENTIONS.md` |
-| Cursor | `.cursor/rules/project.mdc` | 旧版 `.cursorrules` 仍保留兼容 |
-| GitHub Copilot | `.github/copilot-instructions.md`、`.github/instructions/` | 按 `applyTo` 生效 |
+| Codex | `AGENTS.md` | 本次审查已实际读取；其他会话以其实际加载上下文为准 |
+| Claude Code | `CLAUDE.md` | 文件含 `@AGENTS.md` 引用，未逐个启动客户端验收 |
+| WorkBuddy（当前 DeepSeek 客户端） | `.codebuddy/CODEBUDDY.md`、`.codebuddy/commands/review.md` | 已接项目记忆与 `/review`；更新后新建项目会话核对加载，本轮未控制 WorkBuddy 客户端验收 |
+| DeepSeek 的客户端 | `.clinerules`、`.roo/rules/`、`CONVENTIONS.md` | `.aider.conf.yml` 已配置 `read`；模型名称不决定客户端加载方式 |
+| Cursor | `.cursor/rules/project.mdc`、`.cursorrules` | 入口已配置，是否加载须核对客户端当前会话 |
+| GitHub Copilot | `.github/copilot-instructions.md`、`.github/instructions/` | 入口含适用范围，未逐个启动客户端验收 |
 
 这些入口文件只写"读 `AGENTS.md` 的哪一节"，不复制规则正文；规则变更只改 `AGENTS.md` 一处。
+
+WorkBuddy 入口依据其[项目级代码开发配置官方说明](https://www.codebuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Project)。在工作目录为本仓库的新会话中，先确认它实际读取 `AGENTS.md` 与本次适用标准，再用 `/review` 发起只读审查；检查其文件读取与验证工具记录，而不只接受“已遵守规范”的自述。`.workbuddy-ai/memory/` 的历史任务笔记不代替规则入口或执行证据，本轮未修改这些用户文件。
 
 **机器门禁**（不依赖模型自觉）：
 
@@ -148,20 +151,28 @@ node scripts/review-gate.mjs --staged                  # 提交前
 node scripts/review-gate.mjs --range origin/main...HEAD  # PR
 ```
 
-只检查新增行：调试残留、`.only`、未解决冲突、疑似凭据、禁止提交的目录。启用预提交钩子：
+行内容检查调试残留、`.only`、冲突与疑似凭据；路径检查独立读取 Git 变更清单，覆盖嵌套生成物、二进制、空文件及重命名。`.env.example` 可提交，真实环境文件不可提交；诊断只输出位置与原因，不回显源行。验证本地接线：
 
 ```bash
-git config core.hooksPath .githooks
+node scripts/install-hooks.mjs
+git config --get core.hooksPath
+node --test tests/review-gate.test.mjs
 ```
 
-钩子已由 `pnpm install` 的 `prepare`（`scripts/install-hooks.mjs`）自动启用，无需手工配置。两条钩子分工：
+`pnpm install` 的 `prepare` 尝试启用钩子，并输出实际状态：已有自定义 hooksPath 会保留，归档、嵌套在另一仓库的发布包及只读目录正常跳过。不能仅凭 `prepare` 退出码为零就声称已启用。两条钩子分工：
 
 | 钩子 | 检查 | 失败后果 |
 | --- | --- | --- |
 | `pre-commit` | 新增行的内容问题 | 提交被拒，指出文件与行号 |
-| `commit-msg` | 改动涉及 `src/`、`server/`、`modules/*/src/`、`deploy/` 时，提交信息须含「风险等级」与「已运行/未运行」 | 提交被拒，打印证据模板 |
+| `commit-msg` | 代码、配置、测试和删除改动须有有效 R1/R2/R3 及「已运行 / 未运行 / 待确认」三个非空证据段；纯文档豁免 | 提交被拒，打印证据要求 |
+
+CI 的 `hygiene` job 运行同一套行为回归及 `scripts/review-ci.mjs`：PR 比较共同基线至 PR head；push main 与手动运行均从 GitHub 最新正式版的 `deploy-<SHA>` 检查到目标提交，不能把前一次失败的 before 提交当成已通过基线。尚无正式版时从空树检查。正式通道读取固定 GitHub API，超时 12 秒、不自动重试，读取失败或基线不是目标祖先就拒绝；显式 `REVIEW_BASE_SHA` 只用于受控测试或已核实基线的调用。范围中含代码、配置或测试时，目标提交必须为整个交付记录三段证据；补充审查可用新提交留痕，无需重写历史。正式候选发布的 `release.needs` 包含 `hygiene`，门禁失败就不会产生该提交的候选包。
+
+本地钩子可以被 `--no-verify` 等方式绕过，因此 CI 必须独立复查。直接 push main 仍可能先进入分支，CI 保护的是后续发布；禁止直接进入 main 需要单独配置分支保护和 PR 工作流，本次不更改远端策略。
 
 门禁只覆盖可机械判定的部分。语义、缓存、资金边界和证据**内容是否真实**仍须按清单人工确认——**不要因为门禁变绿就认为审查完成**，也不要为了过钩子而填写未实际运行的检查。
+
+实质开发完成后，主任务派独立只读审查者，只给仓库、固定差异范围及标准，不给作者的结论。提交或 PR 记录审查者标识、审查范围、结论与未覆盖项；修复后只复核增量。没有启动独立审查，就不能凭填写标签声称已审。
 
 **没有斜杠命令的客户端**，直接把下面这段作为审查指令：
 

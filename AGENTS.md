@@ -4,32 +4,32 @@
 
 ## 代理执行协议
 
-任何编码代理（Codex、Claude、DeepSeek 或其它客户端）改代码前后按本节执行。本节是唯一必读的硬约束，细节按链接取用。
+任何编码代理（Codex、Claude、DeepSeek 或其它客户端）改代码前后按本节执行。本节是执行入口，细节按链接取用；用户当前及已有授权、按风险验证和结果复用约定优先。
 
 **动手前**
 
 1. 读「修改前」一节，再按下面的路由表只读相关经验条目，不要一次读完 `LESSONS.md`。
 2. 给改动定级 R1/R2/R3（[标准第 3 节](docs/code-review-standard.md#3-改动分级)）。R3 先说清影响面与回滚，再改代码。
-3. 需求或契约不明确时先问；不猜着改公共接口、资金路径、部署脚本。
+3. 缺少影响正确性的关键信息时及时提问，同时继续不依赖答案的已授权工作；常规实现选择按现有契约推进。
 
 **改的时候**
 
 4. 一个改动只做一件事：不顺手重构、不夹带格式化、不改 `output/`、`dist/`、`node_modules/`。
 5. 同类路径一起处理，或明确登记；不接受"只修这一处"。
 6. 新增外部调用必须写清超时、重试上限、失败行为；新增缓存必须写清失效条件。
-7. 不新增 `console.log`、`debugger`、`.only(`、被放宽的断言；服务端日志走 `server/logger.mjs`。
+7. 业务代码不新增临时 `console.log`、`debugger`、`.only(` 或被放宽的断言；CLI 正常结果输出与各模块既有日志入口按实际用途保留。
 
 **交付前**
 
-8. 实际运行 `pnpm run check` 与改动相关测试，在回复和提交信息里给「已运行 / 未运行 / 待确认」三段。
-9. 按 [审查清单](docs/code-review-checklist.md) 自审，不适用项注明原因。
+8. 先确定受影响行为与最小检查集，实际运行对应模块的类型检查及相关测试；纯文档无需代码检查。复用本任务内仍有效的结果，在提交信息记录「已运行 / 未运行 / 待确认」，回复简述结果。
+9. 按 [审查清单](docs/code-review-checklist.md) 的适用类别自审；不适用原因可按类别汇总，不机械逐条复制全表。
 10. 声称完成前确认：没有未处理的 P0/P1，没有把未验证项写成已验证。
 
 **禁止**
 
 - 把"引用了测试"表述为"验证通过"。
 - 因审查意见与己见不同就静默忽略；不同意须写明理由。
-- 未获当次授权就部署、推送或修改服务器。
+- 忽略用户已有授权或明确禁令。提交、推送与正式发布遵循用户持续授权；服务器部署仍须明确授权。
 
 ### 按改动取用经验
 
@@ -63,7 +63,8 @@
 - 判定标准以 [docs/code-review-standard.md](docs/code-review-standard.md) 为准，逐项检查用 [清单](docs/code-review-checklist.md)，步骤、时限与留痕以 [流程](docs/code-review-process.md) 为准。三份文件不互相复制正文。
 - 自审证据必须对应真实执行过的命令与输出；引用已有测试不等于运行过测试，未运行的检查要写明原因。
 - 提交前运行 `node scripts/review-gate.mjs --staged`。门禁只覆盖调试残留、`.only`、冲突标记、疑似凭据与禁止提交目录；门禁变绿不等于审查完成。
-- `.githooks/` 由 `pnpm install` 的 `prepare` 自动启用（等价于 `git config core.hooksPath .githooks`）。其中 `pre-commit` 跑内容门禁，`commit-msg` 要求改动涉及 `src/`、`server/`、`modules/*/src/`、`deploy/` 时，提交信息必须含「风险等级」与「已运行/未运行」证据。
+- `.githooks/` 在 `pnpm install` 的 `prepare` 中尝试启用：保留已有自定义 hooksPath，无 Git 的发布归档正常跳过，以安装输出与 `git config --get core.hooksPath` 核实状态。`pre-commit` 跑内容门禁；`commit-msg` 调用 `scripts/review-message.mjs`，代码、配置和测试（含所有模块目录、删除文件）须有有效风险等级与三段非空证据。
+- CI 对 PR、push main 和手动运行都检查明确 Git 范围与提交证据；正式候选发布依赖门禁通过。本地钩子可被绕过，CI 只检查机械规则及证据格式，不能证明测试实际执行或语义审查完成。
 - P0/P1 清零才可合并；P2 须登记；R3 改动（资金、权限、部署激活、数据库结构、公共契约）须有独立审查记录与回滚方案。
 - 同一改动不能由作者代理同时充当唯一审查者；审查代理只读，上下文与作者隔离。
 - 合并后发现的 P0/P1 记为逃逸缺陷，回填下次复盘，并据此决定是否补充清单项。
@@ -99,8 +100,8 @@
 | `docs/FILE_ORGANIZATION.md` | 文件组织与命名规范 |
 | `.github/pull_request_template.md` | PR 自审与证据模板，只引用上述标准 |
 | `scripts/review-gate.mjs`、`.githooks/pre-commit` | 可机械判定的提交前门禁 |
-| `CLAUDE.md`、`CONVENTIONS.md`、`.cursor/rules/`、`.cursorrules`、`.clinerules`、`.roo/rules/`、`.github/copilot-instructions.md`、`.github/instructions/` | 工具入口，只引用 `AGENTS.md`，不复制规则正文 |
-| `.claude/commands/review.md` | Claude Code 审查命令，按标准输出意见 |
+| `CLAUDE.md`、`CONVENTIONS.md`、`.codebuddy/CODEBUDDY.md`、`.cursor/rules/`、`.cursorrules`、`.clinerules`、`.roo/rules/`、`.github/copilot-instructions.md`、`.github/instructions/` | 工具入口，只引用 `AGENTS.md`，不复制规则正文 |
+| `.claude/commands/review.md`、`.codebuddy/commands/review.md` | 客户端只读审查命令，按权威流程输出意见 |
 
 根目录 `code-standards.md` 仅保留兼容链接。工具入口和使用说明不维护业务规则副本；权威文件路径变化时同步更新引用。
 

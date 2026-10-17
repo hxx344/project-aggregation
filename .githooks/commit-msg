@@ -1,42 +1,6 @@
 #!/usr/bin/env bash
-# 检查提交信息是否带审查证据（AGENTS.md《代理执行协议》第 8 条）。
-# 仅对代码路径生效；文档、配置提交不要求。
+# Node 实现同时供本地 Git 与 CI 使用。
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-msg_file="${1:?缺少提交信息文件}"
-
-code_paths="$(git diff --cached --name-only --diff-filter=ACMR \
-  | grep -E '^(src/|server/|modules/[^/]+/src/|deploy/)' || true)"
-
-if [ -z "$code_paths" ]; then
-  exit 0
-fi
-
-body="$(grep -v '^#' "$msg_file" || true)"
-
-has_level=0
-has_evidence=0
-printf '%s' "$body" | grep -Eq '风险等级[[:space:]]*[:：]' && has_level=1
-printf '%s' "$body" | grep -Eq '(已运行|未运行)[[:space:]]*[:：]' && has_evidence=1
-
-if [ "$has_level" -eq 1 ] && [ "$has_evidence" -eq 1 ]; then
-  exit 0
-fi
-
-cat >&2 <<'EOF'
-
-提交信息缺少审查证据（本次改动包含代码路径）。
-
-请在提交信息正文补上，参考：
-
-  风险等级：R1 / R2 / R3
-  已运行：<命令与结果>
-  未运行：<没跑的检查及原因>
-  待确认：<未核实项>
-
-依据：AGENTS.md《代理执行协议》第 8 条、docs/code-review-process.md 第 2 节。
-只改文档或配置的提交不受此检查约束。
-
-EOF
-exit 1
+exec node scripts/review-message.mjs --staged --message "${1:?缺少提交信息文件}"
