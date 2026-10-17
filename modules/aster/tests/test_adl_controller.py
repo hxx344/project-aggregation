@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 from tests.helpers import account
 from trading import adl
 from trading.adl_exchange import ReductionPosition, ReductionRule, ReductionSnapshot
-from trading.exchange import AmbiguousOrder, ExchangeError, LiveBroker
+from trading.exchange import AmbiguousOrder, BudgetWait, ExchangeError, LiveBroker
 from trading.models import TradingError, dec
 from trading.pair_execution import runtime_default
 from trading.pairing import validate_pair
@@ -110,6 +110,7 @@ class AdlControllerTests(unittest.TestCase):
                                  for aid, rows in self.holdings.items()}
         self.open_orders = {"a": [], "b": []}
         self.brokers, self.reads, self.sent, self.persisted_at_send, self.exchange_orders = {}, [], [], [], {}
+        self.mode_hints, self.order_symbols = [], []
         self.submit_unknown = False
         self.query_visible = True
         self.snapshot_filled = True
@@ -130,9 +131,11 @@ class AdlControllerTests(unittest.TestCase):
         rules.start()
         self.addCleanup(rules.stop)
 
-    def snapshot(self, broker, *, market_only=False):
+    def snapshot(self, broker, *, market_only=False, hedge_mode=None, order_symbols=None):
         aid = next(aid for aid, current in self.brokers.items() if current is broker)
         self.reads.append((aid, deepcopy(self.holdings[aid])))
+        self.mode_hints.append(hedge_mode)
+        self.order_symbols.append(order_symbols)
         return ReductionSnapshot(tuple(self.holdings[aid]), True, True, deepcopy(self.open_orders[aid]), self.now,
             broker._snapshot_generation, position_updates=dict(self.position_updates[aid]), _broker=broker, _api=broker.api,
             _account_identity=tuple(broker.api.credentials[key] for key in ("user", "signer")))
@@ -203,6 +206,132 @@ class AdlControllerTests(unittest.TestCase):
         self.tick()
         self.assertEqual(len(self.sent), 1)
         self.assertFalse(self.store.pair("pair")["enabled"])
+
+    def test_scene_reuses_bounded_mode_evidence_and_refreshes_after_expiry(self):
+        self.observe()
+        self.tick()
+        self.assertEqual(self.mode_hints, [None, None])
+        self.mode_hints.clear()
+        self.tick(1)
+        self.assertTrue(self.mode_hints)
+        self.assertTrue(all(value is True for value in self.mode_hints))
+        incident = self.state()
+        self.assertTrue(self.controller._mode_hint(incident))
+        self.now = incident["mode_evidence"]["at"] + adl.MODE_EVIDENCE_SECONDS
+        self.assertTrue(self.controller._mode_hint(incident))
+        self.now += .001
+        self.assertIsNone(self.controller._mode_hint(incident))
+
+    def test_reconnect_invalidates_mode_evidence_before_the_next_scene(self):
+        self.observe()
+        self.tick()
+        self.mode_hints.clear()
+        self.controller.reconnected("a", self.brokers["a"])
+        self.tick(1)
+        self.assertTrue(self.mode_hints)
+        self.assertTrue(all(value is None for value in self.mode_hints))
+
+    def test_account_config_event_forces_mode_reread(self):
+        self.observe()
+        self.tick()
+        self.mode_hints.clear()
+        self.controller.observe("a", self.brokers["a"], {"e": "ACCOUNT_CONFIG_UPDATE"})
+        self.tick(1)
+        self.assertTrue(self.mode_hints)
+        self.assertTrue(all(value is None for value in self.mode_hints))
+
+    def test_failed_forced_mode_read_keeps_invalidation_for_retry(self):
+        self.observe()
+        self.tick()
+        self.mode_hints.clear()
+        self.controller.reconnected("a", self.brokers["a"])
+        with patch.object(self.controller, "_read", side_effect=BudgetWait("budget", retry_after=10)):
+            self.tick(1)
+        self.assertIn("a", self.controller.mode_stale)
+        self.mode_hints.clear()
+        self.tick(10)
+        self.assertTrue(self.mode_hints)
+        self.assertTrue(all(value is None for value in self.mode_hints))
+        self.assertNotIn("a", self.controller.mode_stale)
+
+    def test_new_process_does_not_reuse_persisted_mode_evidence(self):
+        self.observe()
+        self.tick()
+        incident = self.state()
+        self.assertTrue(incident["mode_evidence"])
+        self.controller = adl.AdlController(self.engine)
+        self.assertIsNone(self.controller._mode_hint(incident))
+        self.mode_hints.clear()
+        self.tick(1)
+        self.assertTrue(self.mode_hints)
+        self.assertTrue(all(value is None for value in self.mode_hints))
+
+    def test_mode_invalidation_during_read_is_not_consumed_by_that_read(self):
+        self.observe()
+        self.tick()
+        self.controller.reconnected("a", self.brokers["a"])
+        pair = self.store.pair("pair")
+        accounts, brokers, _ = self.controller._context(pair)
+        incident = self.state()
+        read = self.controller._read
+
+        def invalidate_again(*args, **kwargs):
+            snapshots = read(*args, **kwargs)
+            self.controller.observe("a", self.brokers["a"], {"e": "ACCOUNT_CONFIG_UPDATE"})
+            return snapshots
+
+        with patch.object(self.controller, "_read", side_effect=invalidate_again):
+            self.controller._scene(pair, incident, accounts, brokers)
+        self.assertIn("a", self.controller.mode_stale)
+        self.mode_hints.clear()
+        self.controller._scene(pair, incident, accounts, brokers)
+        self.assertTrue(self.mode_hints)
+        self.assertTrue(all(value is None for value in self.mode_hints))
+
+    def test_scene_caches_each_accounts_mode_independently(self):
+        self.observe()
+        self.tick()
+        pair = self.store.pair("pair")
+        accounts, brokers, _ = self.controller._context(pair)
+        incident = self.state()
+        incident.pop("mode_evidence", None)
+        read = self.controller._read
+
+        def mixed_modes(*args, **kwargs):
+            snapshots = read(*args, **kwargs)
+            snapshots["b"] = replace(snapshots["b"], hedge_mode=False)
+            return snapshots
+
+        with patch.object(self.controller, "_read", side_effect=mixed_modes):
+            self.controller._scene(pair, incident, accounts, brokers)
+        self.assertEqual(self.controller._mode_hint(incident), {"a": True, "b": False})
+        self.mode_hints.clear()
+        self.controller._scene(pair, incident, accounts, brokers)
+        self.assertCountEqual(self.mode_hints, [True, False])
+
+    def test_invalid_incident_symbols_block_scene_without_querying_other_symbols(self):
+        runtime = self.archived_runtime()
+        runtime["recovery_watch"]["batches"][0]["legs"][0]["order"]["type"] = "LIMIT"
+        self.store.put("pair_runtime:pair", runtime)
+        self.observe()
+        self.tick()
+        incident = self.state()
+        incident["symbols"] = SYMBOL
+        self.mode_hints.clear()
+        pair = self.store.pair("pair")
+        accounts, brokers, _ = self.controller._context(pair)
+        with self.assertRaisesRegex(TradingError, "标的记录无效"):
+            self.controller._scene(pair, incident, accounts, brokers)
+        self.assertEqual(self.mode_hints, [])
+
+    def test_full_scene_scopes_order_inventory_to_incident_and_prior_symbols(self):
+        runtime = self.archived_runtime()
+        runtime["recovery_watch"]["batches"][0]["legs"][0]["order"]["type"] = "LIMIT"
+        self.store.put("pair_runtime:pair", runtime)
+        self.observe()
+        self.tick()
+        self.assertTrue(self.order_symbols)
+        self.assertTrue(all(value == [SYMBOL, "XAUUSD1"] for value in self.order_symbols))
 
     def test_each_batch_uses_fresh_actual_net_and_has_a_durable_id_before_send(self):
         self.holdings = {"a": [position("LONG", "6"), position("SHORT", "1")],
@@ -375,6 +504,58 @@ class AdlControllerTests(unittest.TestCase):
         self.assertEqual(self.store.get(key)["checked_at"], 1073)
         self.assertEqual(self.store.get(key)["attempt_at"], 1071)
         self.assertIsNone(self.store.get(key)["error"])
+
+    def test_ws_events_flush_and_wake_pair_without_extra_history_reads(self):
+        account = self.store.account("a")
+        complete = {"events": [], "remaining": [], "error": None, "blocked": None, "retry_after": 0}
+        with patch("trading.adl.adl_events.scan_force_orders", return_value=complete) as scan:
+            self.controller.poll(account)
+            for seconds in (1, 15, 30, 59):
+                self.now = 1000 + seconds
+                self.observe(quantity=str(seconds / 100))
+                self.controller.poll(account)
+                self.assertEqual(scan.call_count, 1)
+                self.assertEqual(self.controller.queue, {})
+            self.assertTrue(self.records())
+            self.engine.wake_adl.assert_called_with("a")
+            self.now = 1060
+            self.controller.poll(account)
+            self.assertEqual(scan.call_count, 2)
+
+    def test_reconnect_waits_out_backoff_then_scans_before_periodic_deadline(self):
+        account = self.store.account("a")
+        complete = {"events": [], "remaining": [], "error": None, "blocked": None, "retry_after": 0}
+        with patch("trading.adl.adl_events.scan_force_orders", return_value=complete) as scan:
+            self.controller.poll(account)
+            self.controller.reconnected("a", self.brokers["a"])
+            self.controller.poll(account)
+            self.assertEqual(scan.call_count, 1)
+            self.now += 1
+            self.controller.poll(account)
+            self.assertEqual(scan.call_count, 2)
+
+            self.now += 1
+            self.controller.poll(account)
+            self.assertEqual(scan.call_count, 2)
+
+    def test_reconnect_during_history_read_is_kept_for_the_next_read(self):
+        account = self.store.account("a")
+        complete = {"events": [], "remaining": [], "error": None, "blocked": None, "retry_after": 0}
+
+        def reconnect_again(*args, **kwargs):
+            self.controller.reconnected("a", self.brokers["a"])
+            return complete
+
+        self.controller.reconnected("a", self.brokers["a"])
+        with patch("trading.adl.adl_events.scan_force_orders", side_effect=reconnect_again):
+            self.controller.poll(account)
+        self.now += 1
+        with patch("trading.adl.adl_events.scan_force_orders", return_value=complete) as scan:
+            self.controller.poll(account)
+            scan.assert_called_once()
+            self.now += 1
+            self.controller.poll(account)
+            scan.assert_called_once()
 
     def test_first_incomplete_or_blocked_scan_never_claims_successful_health(self):
         account = self.store.account("a")

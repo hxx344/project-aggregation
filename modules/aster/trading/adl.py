@@ -28,6 +28,11 @@ SCAN_OVERLAP_MS = 60000
 BATCH_NOTIONAL = Decimal("1000")
 MAX_SECONDS = 1800
 MAX_BATCHES = 500
+# A position mode is account configuration, not a per-batch value. The
+# incident may reuse its last authoritative read for a short, bounded window;
+# position rows are still validated against the hint, so a mode change that
+# changes returned rows blocks the scene instead of authorizing a reduction.
+MODE_EVIDENCE_SECONDS = 15
 
 
 class AdlStateConflict(TradingError):
@@ -159,8 +164,10 @@ class AdlController:
     def __init__(self, engine):
         self.engine, self.store = engine, engine.store
         self.lock = threading.RLock()
+        self.mode_epoch = uuid.uuid4().hex
         self.queue = {}
-        self.wake = set()
+        self.scan_wake = {}
+        self.mode_stale = {}
         self.overflow = set()
         self.next_scan = {}
         self.scan_backoff = {}
@@ -171,6 +178,12 @@ class AdlController:
             wake(account_id)
 
     def observe(self, account_id, broker, payload):
+        if isinstance(payload, dict) and payload.get("e") == "ACCOUNT_CONFIG_UPDATE":
+            # A mode/leverage change invalidates the incident's mode evidence;
+            # the next scene must read the authoritative mode again.
+            with self.lock:
+                self.mode_stale[account_id] = object()
+            return
         event = adl_events.parse_ws(payload)
         if event is None:
             return
@@ -182,12 +195,12 @@ class AdlController:
                     self.queue[key] = (broker, event)
             else:
                 self.overflow.add(account_id)
-            self.wake.add(account_id)
         self._wake(account_id)
 
     def reconnected(self, account_id, broker):
         with self.lock:
-            self.wake.add(account_id)
+            self.scan_wake[account_id] = object()
+            self.mode_stale[account_id] = object()
         self._wake(account_id)
 
     def _memory_pending(self, account_ids):
@@ -226,11 +239,10 @@ class AdlController:
         key = f"adl_scan:{pair['id']}:{aid}:{owner}"
         now = time.time()
         with self.lock:
-            urgent = aid in self.wake
-            self.wake.discard(aid)
+            reconnect = self.scan_wake.get(aid)
         if now < self.scan_backoff.get(key, 0):
             return 1
-        if not urgent and now < self.next_scan.get(key, 0):
+        if reconnect is None and now < self.next_scan.get(key, 0):
             return min(1, self.next_scan[key] - now)
         scan = self.store.get(key)
         if scan is not None and now < scan.get("retry_at", 0):
@@ -274,6 +286,8 @@ class AdlController:
                     scan["checked_at"] = time.time()
             _put(db, key, scan)
         with self.lock:
+            if self.scan_wake.get(aid) is reconnect:
+                self.scan_wake.pop(aid, None)
             if not scan["windows"]:
                 self.overflow.discard(aid)
         self.next_scan[key] = now + max(result.get("retry_after", 0), 10 if scan["error"] else 1 if scan["windows"] else SCAN_SECONDS)
@@ -384,15 +398,55 @@ class AdlController:
         for aid, snapshot in (snapshots or {}).items():
             snapshot.require_current(brokers[aid])
 
-    def _read(self, brokers, *, market_only=False):
-        adl_exchange.require_snapshot_budget(brokers, market_only=market_only)
+    def _read(self, brokers, *, market_only=False, hedge_modes=None, order_symbols=None):
+        adl_exchange.require_snapshot_budget(brokers, market_only=market_only,
+                                             hedge_modes=hedge_modes, order_symbols=order_symbols)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="adl-scene") as pool:
-            futures = {aid: pool.submit(adl_exchange.reduction_snapshot, broker, market_only=market_only)
+            futures = {aid: pool.submit(adl_exchange.reduction_snapshot, broker,
+                                        market_only=market_only, hedge_mode=(hedge_modes or {}).get(aid),
+                                        order_symbols=order_symbols)
                        for aid, broker in brokers.items()}
             snapshots = {aid: future.result() for aid, future in futures.items()}
         for aid, snapshot in snapshots.items():
             snapshot.require_current(brokers[aid])
         return snapshots
+
+    def _mode_hint(self, incident):
+        """Return only the bounded-age mode evidence this process already read.
+
+        Evidence persisted by an earlier process is not reused: a restart may
+        straddle a manual account-mode change, so the first scene must reread
+        the authoritative mode.
+        """
+        evidence = incident.get("mode_evidence")
+        if not isinstance(evidence, dict):
+            return None
+        at, modes = evidence.get("at"), evidence.get("hedge_modes")
+        if (type(at) not in (int, float) or not math.isfinite(at)
+                or evidence.get("epoch") != self.mode_epoch
+                or not isinstance(modes, dict) or set(modes) != set(incident["accounts"])
+                or any(type(mode) is not bool for mode in modes.values())):
+            return None
+        return dict(modes) if 0 <= time.time() - at <= MODE_EVIDENCE_SECONDS else None
+
+    @staticmethod
+    def _order_symbols(incident):
+        """Symbols whose open orders this incident's reality check can inspect."""
+        recorded = incident.get("symbols")
+        if recorded is not None and (not isinstance(recorded, list)
+                or any(not isinstance(symbol, str) for symbol in recorded)):
+            raise TradingError("ADL 事件标的记录无效，无法核对挂单")
+        symbols = set(recorded or [])
+        for item in AdlController._order_items(incident):
+            order = item.get("order")
+            symbol = order.get("symbol") if isinstance(order, dict) else None
+            if not isinstance(symbol, str):
+                raise TradingError("ADL 原订单标的无效，无法核对挂单")
+            symbols.add(symbol)
+        try:
+            return sorted(symbols)
+        except TypeError:
+            raise TradingError("ADL 原订单标的无效，无法核对挂单") from None
 
     @staticmethod
     def _market_only(incident):
@@ -456,12 +510,38 @@ class AdlController:
             return True
 
     def _scene(self, pair, incident, accounts, brokers):
+        with self.lock:
+            stale = {aid: token for aid, token in self.mode_stale.items() if aid in brokers}
+        hedge_modes = None if stale else self._mode_hint(incident)
+        market_only = self._market_only(incident)
         try:
-            return self._read(brokers, market_only=self._market_only(incident))
+            # Validate the symbol records even when MARKET-only recovery skips
+            # the open-order read; _reality() uses the same shared scope.
+            scoped_symbols = self._order_symbols(incident)
+            order_symbols = None if market_only else scoped_symbols
+            snapshots = self._read(brokers, market_only=market_only,
+                                   hedge_modes=hedge_modes, order_symbols=order_symbols)
         finally:
             # The event may have arrived after original-ID reconciliation and
             # before this read captured its generation, or invalidated the read.
             self._capture_receipts(pair, incident, accounts, brokers)
+        if hedge_modes is None:
+            modes = {aid: snapshot.hedge_mode for aid, snapshot in snapshots.items()}
+            if any(type(mode) is not bool for mode in modes.values()):
+                raise TradingError("ADL 账户持仓模式无效，等待重新读取")
+            # Use the oldest source-read time, not the time after receipt
+            # capture, so a slow scene cannot extend the mode hint's age.
+            mode_at = min(snapshot.timestamp for snapshot in snapshots.values())
+            incident["mode_evidence"] = {"hedge_modes": modes, "at": mode_at, "epoch": self.mode_epoch}
+            if stale:
+                # Consume only the invalidations observed before this successful
+                # authoritative read. A newer event keeps its marker and forces
+                # another read instead of being cleared by this one.
+                with self.lock:
+                    for aid, token in stale.items():
+                        if self.mode_stale.get(aid) is token:
+                            del self.mode_stale[aid]
+        return snapshots
 
     @staticmethod
     def _require_orders_settled(incident):
@@ -553,7 +633,9 @@ class AdlController:
         # reduce-only correction, never retransmission of the old client ID.
         items = self._order_items(incident)
         self._require_orders_settled(incident)
-        symbols = set(incident["symbols"]) | {item["order"]["symbol"] for item in items}
+        # Share the exact scope used by the scoped open-order read so the query
+        # and the reality check cannot silently diverge.
+        symbols = set(self._order_symbols(incident))
         if any(row.get("symbol") in symbols for snapshot in snapshots.values() for row in snapshot.open_orders):
             raise TradingError("ADL 标的或原订单标的存在未完成挂单，等待活动订单结束后再减仓")
         changed = False

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from trading.adl_exchange import reduction_rule, reduction_snapshot
+from trading.adl_exchange import ORDER_QUERY_SYMBOL_LIMIT, order_query_symbols, reduction_rule, reduction_snapshot
 from trading.exchange import LiveBroker
 from trading.models import MARKET_SYMBOLS, TradingError, dec
 
@@ -243,6 +243,81 @@ class ReductionSnapshotTests(unittest.TestCase):
                 broker, _ = self.broker(data)
                 with self.assertRaises(TradingError):
                     reduction_snapshot(broker, market_only=True)
+
+    def test_cached_mode_and_scoped_orders_skip_dual_and_all_symbol_inventory(self):
+        broker, api = self.broker()
+        result = reduction_snapshot(broker, hedge_mode=True, order_symbols=["BTCUSDT"])
+        self.assertTrue(result.hedge_mode)
+        self.assertEqual([call[1] for call in api.calls], [ACCOUNT, RISK, ORDERS])
+        self.assertEqual([call[3] for call in api.calls], [
+            {"signed": True, "weight": 5}, {"signed": True, "weight": 5},
+            {"signed": True, "weight": 1}])
+        self.assertEqual(api.calls[2][2], ({"symbol": "BTCUSDT"},))
+
+    def test_cached_mode_still_rejects_a_contradicting_position_mode(self):
+        data = responses(hedge=False)
+        broker, _ = self.broker(data)
+        with self.assertRaisesRegex(TradingError, "方向"):
+            reduction_snapshot(broker, hedge_mode=True, order_symbols=["BTCUSDT"])
+
+    def test_many_symbols_fall_back_to_one_all_symbol_order_request(self):
+        broker, api = self.broker()
+        symbols = [f"S{i}USDT" for i in range(ORDER_QUERY_SYMBOL_LIMIT + 1)]
+        reduction_snapshot(broker, hedge_mode=True, order_symbols=symbols)
+        self.assertEqual([call[1] for call in api.calls], [ACCOUNT, RISK, ORDERS])
+        self.assertEqual(api.calls[2][2], ())
+        self.assertEqual(api.calls[2][3], {"signed": True, "weight": 40})
+
+    def test_scoped_order_symbols_merge_and_reject_foreign_rows(self):
+        data = responses()
+        broker, api = self.broker(data)
+        second = {"symbol": "ETHUSDT", "clientOrderId": "second-order", "orderId": 8,
+                  "side": "BUY", "positionSide": "LONG", "status": "NEW",
+                  "origQty": "1", "executedQty": "0"}
+        data[ORDERS] = [{**second, "symbol": "BTCUSDT", "clientOrderId": "first-order", "orderId": 7}]
+        original_call = api.call
+        def by_symbol(method, path, *args, **kwargs):
+            if path == ORDERS:
+                api.calls.append((method, path, args, kwargs, api.budget.active))
+                return [row for row in (data[ORDERS] + [second]) if row["symbol"] == args[0]["symbol"]]
+            return original_call(method, path, *args, **kwargs)
+        api.call = by_symbol
+        result = reduction_snapshot(broker, hedge_mode=True, order_symbols=["BTCUSDT", "ETHUSDT"])
+        self.assertEqual([row["symbol"] for row in result.open_orders], ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual([call[3]["weight"] for call in api.calls if call[1] == ORDERS], [1, 1])
+        foreign = {**second, "symbol": "XRPUSDT", "clientOrderId": "foreign-order", "orderId": 9}
+        api.call = lambda method, path, *args, **kwargs: (
+            api.calls.append((method, path, args, kwargs, api.budget.active)) or [foreign]
+            if path == ORDERS else original_call(method, path, *args, **kwargs))
+        with self.assertRaisesRegex(TradingError, "未请求"):
+            reduction_snapshot(broker, hedge_mode=True, order_symbols=["BTCUSDT"])
+
+    def test_order_query_symbols_are_bounded_and_validated(self):
+        self.assertEqual(order_query_symbols(None), None)
+        self.assertEqual(order_query_symbols(["BTCUSDT", "BTCUSDT", "ETHUSDT"]),
+                         ("BTCUSDT", "ETHUSDT"))
+        self.assertIsNone(order_query_symbols([f"S{i}USDT" for i in range(ORDER_QUERY_SYMBOL_LIMIT + 1)]))
+        for value in ([], ["in valid"], "BTCUSDT", [None],
+                      [f"S{i}USDT" for i in range(ORDER_QUERY_SYMBOL_LIMIT)] + [None]):
+            with self.subTest(value=value), self.assertRaises(TradingError):
+                order_query_symbols(value)
+
+    def test_scoped_orders_reject_wrong_symbol_even_if_it_belongs_to_another_query(self):
+        data = responses()
+        data[ORDERS] = [{"symbol": "ETHUSDT", "clientOrderId": "wrong-response", "orderId": 8,
+                         "side": "BUY", "positionSide": "LONG", "status": "NEW",
+                         "origQty": "1", "executedQty": "0"}]
+        broker, api = self.broker(data)
+        original = api.call
+
+        def wrong_first_symbol(method, path, *args, **kwargs):
+            if path == ORDERS and args[0]["symbol"] == "ETHUSDT":
+                return []
+            return original(method, path, *args, **kwargs)
+
+        api.call = wrong_first_symbol
+        with self.assertRaisesRegex(TradingError, "未请求"):
+            reduction_snapshot(broker, hedge_mode=True, order_symbols=["BTCUSDT", "ETHUSDT"])
 
     def test_exchange_position_updates_include_explicit_flat_legs_only(self):
         data = responses()

@@ -158,6 +158,47 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertEqual(self.tick()["phase"], "monitoring")
         self.assertEqual(len(self.calls(ACCOUNT)), 0)
 
+    def test_low_exchange_withdrawable_precheck_skips_live_owner_and_account_rereads(self):
+        self.paper["long"].state["wallet"] = "3000"
+        self.paper["short"].state["wallet"] = "1000"
+        for paper in self.paper.values():
+            paper.save()
+        self.monitor_wait()
+        self.store.put("pair_margin:gold", {"next_check_at": self.wall + 1})
+        self.advance(1)
+        broker = self.brokers["long"]
+        original = broker.api.call
+
+        def call(method, path, params=None, *, signed=False, weight=1, timeout=None):
+            result = original(method, path, params, signed=signed, weight=weight, timeout=timeout)
+            if path == ACCOUNT and isinstance(result, dict):
+                result = deepcopy(result)
+                result["assets"][0]["maxWithdrawAmount"] = "0"
+            return result
+
+        broker.api.call = call
+        with patch.object(MarginBalancer, "_live", side_effect=AssertionError("no live re-read")):
+            state = self.tick()
+        self.assertEqual(state["phase"], "monitoring")
+        self.assertEqual(len(self.calls(ACCOUNT)), 2)
+        self.assertIn("来源账户可划余额", state["reason"])
+
+    def test_prior_block_still_runs_live_verification_before_a_local_decline(self):
+        self.paper["long"].state["wallet"] = "3000"
+        self.paper["short"].state["wallet"] = "1000"
+        for paper in self.paper.values():
+            paper.save()
+        self.monitor_wait()
+        self.store.put("pair_margin:gold", {"blocked_reason": "ownership unverified",
+                                            "next_check_at": self.wall + 1})
+        self.advance(1)
+        with patch.object(MarginBalancer, "_live", return_value={
+                "blocks_trading": True, "reason": "ownership unverified"}) as live:
+            state = self.tick()
+        live.assert_called_once()
+        self.assertEqual(state["phase"], "margin_wait")
+        self.assertTrue(state["margin"]["blocks_trading"])
+
     def test_monitor_only_wait_and_cooldown_do_not_read_unused_strategy_snapshots(self):
         for cooldown in (False, True):
             with self.subTest(cooldown=cooldown):

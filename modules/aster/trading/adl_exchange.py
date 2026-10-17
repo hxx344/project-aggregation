@@ -18,6 +18,10 @@ from .models import TradingError, dec, positive
 
 _RULE_MAX_AGE = 60
 _RULE_CACHE_GUARD = threading.Lock()
+# A scoped open-order query is weight 1 per symbol; falling back to the
+# all-symbol request above this count keeps one scene's sequential request
+# latency inside the snapshot freshness window and its admission bounded.
+ORDER_QUERY_SYMBOL_LIMIT = 5
 
 
 def _name(value, field_name):
@@ -39,15 +43,59 @@ def _budget(api):
     return budget.reconciliation() if budget is not None else nullcontext()
 
 
-def require_snapshot_budget(brokers, *, market_only=False):
+def order_query_symbols(order_symbols):
+    """Return the scoped symbols to query, or None for the all-symbol request.
+
+    A caller that knows the incident/order symbols can avoid the weight-40
+    all-symbol open-order read. Too many scoped symbols are cheaper and more
+    latency-safe as the existing all-symbol request.
+    """
+    if order_symbols is None:
+        return None
+    if isinstance(order_symbols, (str, bytes)):
+        raise TradingError("ADL 挂单查询标的格式无效")
+    try:
+        symbols = list(dict.fromkeys(order_symbols))
+    except TypeError:
+        raise TradingError("ADL 挂单查询标的格式无效") from None
+    if not symbols:
+        raise TradingError("ADL 挂单查询标的为空")
+    for symbol in symbols:
+        _name(symbol, "挂单查询交易代码")
+    if len(symbols) > ORDER_QUERY_SYMBOL_LIMIT:
+        return None
+    return tuple(symbols)
+
+
+def _scene_weight(*, market_only=False, hedge_mode=None, order_symbols=None):
+    if market_only is True:
+        order_weight = 0
+    else:
+        symbols = order_query_symbols(order_symbols)
+        order_weight = 40 if symbols is None else len(symbols)
+    dual_weight = 0 if hedge_mode is not None else 30
+    return 10 + dual_weight + order_weight
+
+
+def require_snapshot_budget(brokers, *, market_only=False, hedge_mode=None, hedge_modes=None, order_symbols=None):
     """Admit the whole scene before either member starts its account reads.
 
     This is a non-spending preflight, not a reservation across workers. Every
     actual request must still reserve atomically against concurrent consumers.
+    A cached hedge-mode hint and scoped order symbols intentionally lower the
+    admission weight because the matching requests are not sent.
     """
+    if hedge_mode is not None and type(hedge_mode) is not bool:
+        raise TradingError("ADL 持仓模式提示无效")
+    if hedge_modes is not None and (not isinstance(hedge_modes, dict)
+            or set(hedge_modes) != set(brokers)
+            or any(type(mode) is not bool for mode in hedge_modes.values())):
+        raise TradingError("ADL 账户持仓模式提示无效")
     budgets = {}
-    weight = 40 if market_only is True else 80
-    for broker in brokers.values():
+    for aid, broker in brokers.items():
+        mode = hedge_modes[aid] if hedge_modes is not None else hedge_mode
+        weight = _scene_weight(market_only=market_only, hedge_mode=mode,
+                               order_symbols=order_symbols)
         budget = getattr(broker.api, "budget", None)
         if budget is not None:
             budgets[budget] = budgets.get(budget, 0) + weight
@@ -158,14 +206,17 @@ def _position_updates(rows):
     return result
 
 
-def _open_orders(rows, hedge_mode):
+def _open_orders(rows, hedge_mode, symbols=None):
     if not isinstance(rows, list):
         raise TradingError("ADL 全账户挂单响应不完整")
+    expected = None if symbols is None else set(symbols)
     seen = set()
     for row in rows:
         if not isinstance(row, dict):
             raise TradingError("ADL 挂单记录无效")
         symbol = _name(row.get("symbol"), "挂单交易代码")
+        if expected is not None and symbol not in expected:
+            raise TradingError("ADL 挂单查询返回了未请求的标的")
         _name(row.get("clientOrderId"), "挂单客户端编号")
         order_id = positive(row.get("orderId"))
         if order_id != order_id.to_integral_value() or (symbol, order_id) in seen:
@@ -182,27 +233,46 @@ def _open_orders(rows, hedge_mode):
     return deepcopy(rows)
 
 
-def reduction_snapshot(broker, *, market_only=False):
+def reduction_snapshot(broker, *, market_only=False, hedge_mode=None, order_symbols=None):
     """Read complete positions and orders without ordinary opening risk gates.
 
     A caller that has verified MARKET-only recovery can omit openOrders; that
     result does not prove the whole account has no open orders. Position, mode,
     identity and generation checks remain mandatory in either mode. All reads
     use reconciliation quota and the oldest request time owns freshness.
+
+    ``hedge_mode`` is a bounded-age hint supplied by the incident that owns this
+    scene. When present, the weight-30 mode request is skipped; position rows
+    are still validated against the hint, so an actual mode change blocks the
+    scene instead of authorizing a wrong reduction. ``order_symbols`` scopes the
+    open-order inventory to the incident/order symbols, using the weight-1
+    single-symbol endpoint; None keeps the weight-40 all-symbol request.
     """
+    if hedge_mode is not None and type(hedge_mode) is not bool:
+        raise TradingError("ADL 持仓模式提示无效")
+    symbols = None if market_only is True else order_query_symbols(order_symbols)
     with broker._snapshot_lock:
         started, generation = time.time(), broker._snapshot_generation
         api, account_identity = broker.api, _identity(broker.api)
     with _budget(api):
         account = api.call("GET", "/fapi/v3/accountWithJoinMargin", signed=True, weight=5)
         risk = api.call("GET", "/fapi/v3/positionRisk", signed=True, weight=5)
-        dual = api.call("GET", "/fapi/v3/positionSide/dual", signed=True, weight=30)
-        orders = [] if market_only is True else api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
-    if not isinstance(dual, dict) or type(dual.get("dualSidePosition")) is not bool:
-        raise TradingError("ADL 账户持仓模式响应无效")
+        if hedge_mode is None:
+            dual = api.call("GET", "/fapi/v3/positionSide/dual", signed=True, weight=30)
+            if not isinstance(dual, dict) or type(dual.get("dualSidePosition")) is not bool:
+                raise TradingError("ADL 账户持仓模式响应无效")
+            hedge_mode = dual["dualSidePosition"]
+        if market_only is True:
+            orders = []
+        elif symbols is None:
+            orders = api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
+        else:
+            orders = []
+            for symbol in symbols:
+                rows = api.call("GET", "/fapi/v3/openOrders", {"symbol": symbol}, signed=True, weight=1)
+                orders.extend(_open_orders(rows, hedge_mode, (symbol,)))
     if not isinstance(account, dict) or type(account.get("canTrade")) is not bool:
         raise TradingError("ADL 账户交易权限响应无效")
-    hedge_mode = dual["dualSidePosition"]
     account_rows = _position_rows(account.get("positions"), hedge_mode)
     risk_rows = _position_rows(risk, hedge_mode)
     account_nonzero = {key: item for key, item in account_rows.items() if item[1]}
@@ -225,7 +295,7 @@ def reduction_snapshot(broker, *, market_only=False):
         positions.append(ReductionPosition(key[0], key[1], amount.copy_abs(),
             positive(row.get("markPrice")), entry, leverage, amount))
     snapshot = ReductionSnapshot(tuple(positions), hedge_mode, account["canTrade"],
-        _open_orders(orders, hedge_mode), started, generation, _position_updates(risk_rows),
+        _open_orders(orders, hedge_mode, symbols), started, generation, _position_updates(risk_rows),
         broker, api, account_identity)
     snapshot.require_current(broker)
     return snapshot

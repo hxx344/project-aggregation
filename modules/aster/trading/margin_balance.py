@@ -817,11 +817,21 @@ class MarginBalancer:
             diagnostics = {}
             may_transfer = self._may_need_transfer(snapshots, config)
             if may_transfer and members["long"]["mode"] == "live":
-                # An optimistic withdrawal ceiling cannot tighten the existing
-                # per-transfer cap. This local preview can only decline work;
-                # it never authorizes a transfer or substitutes for live limits.
+                # The transfer snapshot already carries the exchange withdrawal
+                # ceiling. Use it for this local decline-only preview instead of
+                # paying for a full ownership+account re-read when the source
+                # account simply cannot transfer. While an earlier failure is
+                # still unresolved, keep the old path so ownership/credential
+                # verification is not silently cleared by a local decline.
+                if state.get("blocked_reason") or state.get("api_notice"):
+                    withdrawable = dict.fromkeys(members, config["max_transfer"])
+                else:
+                    withdrawable = {}
+                    for side, snapshot in snapshots.items():
+                        value = getattr(snapshot, "transfer_withdrawable", None)
+                        withdrawable[side] = config["max_transfer"] if value is None else positive(value, True)
                 may_transfer = self._plan(pair, members, snapshots, config,
-                    dict.fromkeys(members, config["max_transfer"]), diagnostics=diagnostics) is not None
+                    withdrawable, diagnostics=diagnostics) is not None
             if not may_transfer:
                 # No extra account read is needed to decline a transfer. Hot
                 # snapshots remain protected by the caller's account leases;

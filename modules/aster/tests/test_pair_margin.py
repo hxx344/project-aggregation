@@ -782,6 +782,39 @@ class PairMarginTests(unittest.TestCase):
         self.assertTrue(all(not path.endswith("/openOrders") for broker in self.brokers.values()
                             for _, path, _ in broker.api.calls))
 
+    def test_snapshot_withdrawal_hint_can_only_decline_before_live_verification(self):
+        snapshots = self.live()
+        snapshots["long"].transfer_withdrawable = dec(0)
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "waiting", result)
+        self.assertIn("来源账户可划余额", result["reason"])
+        self.assertEqual(self.master_calls, [])
+        self.assertEqual(self.transfers, [])
+        self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
+
+    def test_missing_withdrawal_hint_falls_back_but_live_limit_still_controls_amount(self):
+        for value in ("missing", None, dec(9999)):
+            with self.subTest(value=value):
+                snapshots = self.live()
+                if value != "missing":
+                    snapshots["long"].transfer_withdrawable = value
+                self.store.put("pair_margin:gold", {})
+                self.brokers["long"].api.account["assets"][0]["maxWithdrawAmount"] = "17"
+                result = self.balancer.tick(self.pair, snapshots)
+                self.assertEqual(result["status"], "acknowledged", result)
+                self.assertEqual(self.transfers[0][2]["amount"], "17.00000000")
+
+    def test_invalid_withdrawal_hint_blocks_instead_of_using_an_optimistic_cap(self):
+        for value in ("bad", "-1", "NaN", True):
+            with self.subTest(value=value):
+                snapshots = self.live()
+                snapshots["long"].transfer_withdrawable = value
+                self.store.put("pair_margin:gold", {})
+                result = self.balancer.tick(self.pair, snapshots)
+                self.assertEqual(result["status"], "blocked", result)
+                self.assertEqual(self.master_calls, [])
+                self.assertEqual(self.transfers, [])
+
     def test_fresh_balance_movement_uses_latest_equity_and_available(self):
         snapshots = self.live()
         self.brokers["long"].api.account["assets"][0].update(availableBalance="2000", marginBalance="2000")

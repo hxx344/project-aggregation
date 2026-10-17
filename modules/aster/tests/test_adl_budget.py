@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from tests import test_adl_exchange as fixtures
-from trading.adl_exchange import reduction_snapshot, require_snapshot_budget
+from trading.adl_exchange import ORDER_QUERY_SYMBOL_LIMIT, reduction_snapshot, require_snapshot_budget
 from trading.exchange import BudgetWait, LiveBroker, RateBudget, RequestNotSent
 
 
@@ -47,10 +47,13 @@ class AdlSnapshotBudgetTests(unittest.TestCase):
             budget.reserve(weight)
 
     @staticmethod
-    def read(brokers, *, market_only=False):
-        require_snapshot_budget(brokers, market_only=market_only)
+    def read(brokers, *, market_only=False, hedge_mode=None, order_symbols=None):
+        require_snapshot_budget(brokers, market_only=market_only, hedge_mode=hedge_mode,
+                                order_symbols=order_symbols)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            return list(pool.map(lambda broker: reduction_snapshot(broker, market_only=market_only), brokers.values()))
+            return list(pool.map(lambda broker: reduction_snapshot(
+                broker, market_only=market_only, hedge_mode=hedge_mode,
+                order_symbols=order_symbols), brokers.values()))
 
     def assert_no_reads(self, brokers):
         self.assertTrue(all(not broker.api.calls for broker in brokers.values()))
@@ -83,6 +86,61 @@ class AdlSnapshotBudgetTests(unittest.TestCase):
         for broker in brokers.values():
             self.assertEqual([call[1] for call in broker.api.calls], [fixtures.ACCOUNT, fixtures.RISK, fixtures.DUAL])
             self.assertTrue(all(call[3] == (True, False, False) for call in broker.api.calls))
+
+    def test_cached_mode_and_scoped_orders_admit_a_22_weight_scene(self):
+        brokers = self.brokers()
+        budget = brokers["a"].api.budget
+        self.spend(budget, 1778)
+        require_snapshot_budget(brokers, hedge_mode=True, order_symbols=["BTCUSDT"])
+        self.assertEqual(budget.snapshot()["used"], 1778)
+        snapshots = self.read(brokers, hedge_mode=True, order_symbols=["BTCUSDT"])
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(budget.snapshot()["used"], 1800)
+        for broker in brokers.values():
+            self.assertEqual([call[1] for call in broker.api.calls],
+                             [fixtures.ACCOUNT, fixtures.RISK, fixtures.ORDERS])
+            self.assertEqual([call[2]["weight"] for call in broker.api.calls],
+                             [5, 5, 1])
+
+    def test_cached_mode_market_scene_fits_last_20_weight(self):
+        brokers = self.brokers()
+        budget = brokers["a"].api.budget
+        self.spend(budget, 1780)
+        snapshots = self.read(brokers, market_only=True, hedge_mode=True)
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(budget.snapshot()["used"], 1800)
+        for broker in brokers.values():
+            self.assertEqual([call[1] for call in broker.api.calls],
+                             [fixtures.ACCOUNT, fixtures.RISK])
+            self.assertEqual([call[2]["weight"] for call in broker.api.calls], [5, 5])
+
+    def test_mixed_account_modes_keep_their_own_evidence_and_scene_weight(self):
+        brokers = self.brokers()
+        brokers["b"].api.responses = fixtures.responses(hedge=False)
+        modes = {"a": True, "b": False}
+        budget = brokers["a"].api.budget
+        self.spend(budget, 1780)
+        require_snapshot_budget(brokers, market_only=True, hedge_modes=modes)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {aid: pool.submit(reduction_snapshot, broker, market_only=True,
+                                       hedge_mode=modes[aid]) for aid, broker in brokers.items()}
+            snapshots = {aid: future.result() for aid, future in futures.items()}
+        self.assertEqual({aid: snapshot.hedge_mode for aid, snapshot in snapshots.items()}, modes)
+        self.assertEqual(budget.snapshot()["used"], 1800)
+        self.assertTrue(all(call[1] != fixtures.DUAL for broker in brokers.values() for call in broker.api.calls))
+
+    def test_cached_mode_above_symbol_limit_falls_back_to_all_symbol_weight(self):
+        brokers = self.brokers()
+        budget = brokers["a"].api.budget
+        symbols = [f"S{i}USDT" for i in range(ORDER_QUERY_SYMBOL_LIMIT + 1)]
+        self.spend(budget, 1700)
+        snapshots = self.read(brokers, hedge_mode=True, order_symbols=symbols)
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(budget.snapshot()["used"], 1800)
+        for broker in brokers.values():
+            self.assertEqual([call[1] for call in broker.api.calls],
+                             [fixtures.ACCOUNT, fixtures.RISK, fixtures.ORDERS])
+            self.assertEqual([call[2]["weight"] for call in broker.api.calls], [5, 5, 40])
 
     def test_full_scene_keeps_all_four_requests_and_exact_160_weight(self):
         brokers = self.brokers()
