@@ -7,9 +7,11 @@ repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 export FIXTURE_ROOT=$fixture
-mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/source/deploy" "$fixture/runtime"
+export FIXTURE_REAL_NODE=$(command -v node)
+mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/source/deploy" "$fixture/source/scripts" "$fixture/runtime"
 cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-artifact-cache.py"
-printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
+cp "$repository/scripts/install-hooks.mjs" "$fixture/source/scripts/install-hooks.mjs"
+printf '{"name":"fixture","version":"1.0.0","type":"module","scripts":{"prepare":"node scripts/install-hooks.mjs"}}\n' > "$fixture/source/package.json"
 printf '{}\n' > "$fixture/source/pnpm-lock.yaml"
 printf 'packages: []\n' > "$fixture/source/pnpm-workspace.yaml"
 printf '{}\n' > "$fixture/source/tsconfig.json"
@@ -47,6 +49,7 @@ if [[ $1 == --version ]]; then printf '11.25.0\n'; exit; fi
 case "$1 ${2:-}" in
   'install --frozen-lockfile')
     echo install >> "$FIXTURE_ROOT/pnpm.calls"
+    "$FIXTURE_REAL_NODE" scripts/install-hooks.mjs
     mkdir -p node_modules/.bin node_modules/example
     printf 'immutable package\n' > node_modules/example/index.js
     for importer in modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
@@ -332,4 +335,27 @@ expect_counts 3 6 10 8 11
 # Build environment invalidates assets, not dependencies or source verification.
 VITE_FIXTURE_VALUE=new run_install
 expect_counts 3 6 10 9 12
+# A failed lifecycle script cannot publish a dependency cache or switch services.
+current=$(readlink "$fixture/application/current")
+cp "$fixture/application/.deployed-state" "$fixture/before-prepare-state"
+dependency_caches=$(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*' | wc -l)
+printf '\nthrow new Error("fixture prepare failure");\n' >> "$fixture/source/scripts/install-hooks.mjs"
+commit_source fail-prepare
+if run_install; then echo 'Failed prepare was accepted' >&2; exit 1; fi
+[[ $(cat "$fixture/last-exit") == 1 ]]
+grep -q 'fixture prepare failure' "$fixture/last.log"
+! grep -Eq '^(switch|finalize)$' "$fixture/progress.calls"
+expect_counts 4 6 10 9 12
+[[ $(readlink "$fixture/application/current") == "$current" ]]
+cmp -s "$fixture/before-prepare-state" "$fixture/application/.deployed-state"
+[[ $(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*' | wc -l) == "$dependency_caches" ]]
+[[ -z $(find "$fixture/application" -path '*/dependencies/.complete' -print -quit) ]]
+cp "$repository/scripts/install-hooks.mjs" "$fixture/source/scripts/install-hooks.mjs"
+printf '\n// Repaired prepare input.\n' >> "$fixture/source/scripts/install-hooks.mjs"
+commit_source repair-prepare
+run_install
+expect_counts 5 7 11 10 13
+[[ $(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*' | wc -l) == $((dependency_caches + 1)) ]]
+run_install
+expect_counts 5 7 11 10 13
 printf 'Incremental installer paths passed (docs/tests/backend/frontend/config, failures and environment).\n'

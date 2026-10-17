@@ -26,15 +26,9 @@ commit=$(git --git-dir="$APP_DIR/repository.git" rev-parse HEAD)
 runtime_key=$(printf '%s\n%s\n%s\n%s\n' "$("$NODE_BIN" --version)" "$PNPM_VERSION" "$(uname -s)" "$(uname -m)" | hash)
 build_environment=$(read_build_environment)
 input_keys
-mkdir -p "$dependencies"
-cp -a --reflink=auto "$repository/node_modules" "$dependencies/node_modules"
-for importer in monitor asset crossex aster/dashboard; do
-  mkdir -p "$dependencies/modules/$importer"
-  cp -a --reflink=auto "$repository/modules/$importer/node_modules" "$dependencies/modules/$importer/node_modules"
-done
-chown -R root:root "$dependencies"
-chmod -R go-w "$dependencies"
-printf '%s\n' "$dependency_key" > "$dependencies/.complete"
+# Exercise the same cold, fixed-Git extraction and lifecycle scripts as a server.
+mkdir -p "$APP_DIR/cache"
+prepare_dependencies
 cache_modules_hash=$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)
 prepare_workspace
 for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do

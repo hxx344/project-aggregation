@@ -83,6 +83,18 @@ echo catalog >> "$source_dir/pnpm-workspace.yaml"; refresh; compare 1 1 1 1 1
 capture
 echo settings >> "$source_dir/.npmrc"; refresh; compare 1 1 1 1 1
 capture
+mkdir -p "$source_dir/scripts"
+for change in added modified; do
+  echo "$change hook" > "$source_dir/scripts/install-hooks.mjs"; refresh; compare 1 1 1 1 1
+  compare_module_inputs 1 1 1 1
+  capture
+  refresh; compare 0 0 0 0 0
+  compare_module_inputs 0 0 0 0
+done
+rm "$source_dir/scripts/install-hooks.mjs"; refresh; compare 1 1 1 1 1
+compare_module_inputs 1 1 1 1
+capture
+
 PNPM_VERSION=changed-pnpm; input_keys; compare 1 1 1 1 1
 compare_module_inputs 1 1 1 1
 capture

@@ -875,6 +875,10 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **新增共享指标补充（2026-10-18）：** 基于 `cb6cba5` 的资本效率改动工作区引入 `server/capital-metrics.mjs` 后，Windows 原生运行 [隔离类型检查](deploy/test-typecheck-cache.mjs) 实际复现 CrossEx 冷检查 `TS2307`；原有指标测试全部通过仍不能覆盖该失败。新增共享前端依赖须同时纳入隔离夹具、[模块构建键](scripts/modules.mjs) 与[源码更新构建键](deploy/install.sh)，否则后续只更新共享公式时可能复用旧页面。复用 [模块键检查](deploy/test-module-builds.mjs) 与 [Git 输入分类](deploy/test-inputs.sh) 验证仅 Monitor/CrossEx 失效，其余模块保持缓存。事件 `capital-shared-build-input-20261018`，不推进复盘检查点。
 
+**生命周期输入补充（2026-10-18）：** 用户在 `f641445` 正式版源码安装时反馈根 `prepare` 报 `MODULE_NOT_FOUND`：临时 `dependencies` 目录未提取 `scripts/install-hooks.mjs`。根脚本已由 `2a81ade` 接入，但 [源码安装器](deploy/install.sh) 的依赖白名单及指纹仍只覆盖 Asset 的 prepare 输入；[真实工作区检查](deploy/test-workspace.sh) 又预先复制依赖并写完成标记，跳过了冷安装。安装生命周期所需的本地脚本和数据必须同时进入固定 Git 提取及依赖指纹；验证不能用预填缓存替代首次安装。本次沿用 L055 的适用范围，记录独立事件 `source-deploy-lifecycle-input-20261018`，不推进复盘检查点。
+
+**对应验证入口：** [Git 输入分类](deploy/test-inputs.sh) 覆盖根 hook 新增、修改、删除及无变化复用；[增量安装](deploy/test-incremental.sh) 在模拟依赖安装时执行真实 hook，并检查 prepare 失败不写完成缓存、不切服，修复后可重试；[Linux 工作区检查](deploy/test-workspace.sh) 改由生产函数执行真实固定源码冻结安装，再验证不可变依赖和跨目录复用。实际执行结果以修复提交的证据及对应 CI 为准，不把 Windows 检查描述为 Linux 部署验收。
+
 ### L056：主动断开后保留估值不再要求实时同步
 
 **适用条件：** Asset 中由单个连接维护余额的 Bybit、Binance、OKX、Gate、VAR 账户；Aster 多账号聚合需按其独立来源规则处理，不直接套用单连接判断。

@@ -1509,7 +1509,7 @@ input_keys() {
   local -a module_shared_inputs=("${navigation_inputs[@]}" server/capital-metrics.mjs server/capital-metrics.d.mts)
   local -a module_inputs
   legacy_module_build_keys=()
-  dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
+  dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc scripts/install-hooks.mjs \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
     modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json) || return
@@ -1680,7 +1680,7 @@ prepare_dependencies() {
   local staging="$work_dir/dependencies"
   mkdir "$staging"
   local name
-  for name in package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
+  for name in package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc scripts/install-hooks.mjs \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
     modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json; do
