@@ -7,8 +7,8 @@ import {
 import { createPerpetualSnapshotAccumulator } from '../lib/perpetual-feed.ts';
 import { createPerpetualPatch, createPerpetualDelta } from '../server/perpetual-service.mjs';
 
-test('scanner defaults expose twelve reference columns and all asset categories', () => {
-  assert.deepEqual(defaultScannerPreferences.columns, ['type', 'pair', 'funding', 'fundingSpread', 'annualized', 'volume', 'openInterest', 'quote', 'spread', 'history24h', 'history7d', 'history30d']);
+test('scanner defaults expose fourteen reference columns and all asset categories', () => {
+  assert.deepEqual(defaultScannerPreferences.columns, ['type', 'pair', 'funding', 'fundingSpread', 'annualized', 'volume', 'openInterest', 'quote', 'spread', 'capital', 'roc', 'history24h', 'history7d', 'history30d']);
   assert.deepEqual(SCANNER_COLUMNS.filter(column => !column.defaultVisible).map(column => column.id), ['time', 'quality']);
   assert.deepEqual(defaultScannerPreferences.categories, ['crypto', 'equity', 'commodity', 'forex', 'index', 'unknown']);
   assert.ok([...SCANNER_COLUMNS, ...SCANNER_CATEGORIES].every(item => item.label.length > 0));
@@ -16,19 +16,21 @@ test('scanner defaults expose twelve reference columns and all asset categories'
 
 test('scanner preference parsing removes unknown values and duplicates while preserving empty selections', () => {
   assert.deepEqual(parseScannerPreferences(JSON.stringify({ columns: ['quote', 'quote', 'future-column', null, 'spread', 3], categories: ['crypto', 'unknown', 'crypto', 'rwa', {}] })), {
-    columns: ['quote', 'spread'], categories: ['crypto', 'unknown'],
+    version: 2, columns: ['quote', 'spread', 'capital', 'roc'], categories: ['crypto', 'unknown'],
   });
-  assert.deepEqual(parseScannerPreferences('{"columns":[],"categories":[]}'), { columns: [], categories: [] });
-  assert.deepEqual(parseScannerPreferences('{"columns":["future"],"categories":["future"]}'), { columns: [], categories: [] });
-  assert.deepEqual(parseScannerPreferences('{"columns":[],"categories":false}'), { columns: [], categories: defaultScannerPreferences.categories });
-  assert.deepEqual(parseScannerPreferences('{"columns":null,"categories":["equity"]}'), { columns: defaultScannerPreferences.columns, categories: ['equity'] });
+  assert.deepEqual(parseScannerPreferences('{"columns":[],"categories":[]}'), { version: 2, columns: [], categories: [] });
+  assert.deepEqual(parseScannerPreferences('{"columns":["future"],"categories":["future"]}'), { version: 2, columns: [], categories: [] });
+  assert.deepEqual(parseScannerPreferences('{"columns":[],"categories":false}'), { version: 2, columns: [], categories: defaultScannerPreferences.categories });
+  assert.deepEqual(parseScannerPreferences('{"columns":null,"categories":["equity"]}'), { version: 2, columns: defaultScannerPreferences.columns, categories: ['equity'] });
+  assert.deepEqual(parseScannerPreferences('{"version":2,"columns":["quote","spread"],"categories":["crypto"]}'), { version: 2, columns: ['quote', 'spread'], categories: ['crypto'] });
+  assert.deepEqual(parseScannerPreferences('{"version":1,"columns":["quote","spread"],"categories":["crypto"]}'), { version: 2, columns: ['quote', 'spread', 'capital', 'roc'], categories: ['crypto'] });
 });
 
 test('invalid or absent scanner preferences use independent default arrays', () => {
   for (const raw of [null, '', '{', 'null', '[]', 'true', '42', '"columns"', '{}']) assert.deepEqual(parseScannerPreferences(raw), defaultScannerPreferences);
   const saved = parseScannerPreferences(null);
   saved.columns.length = 0; saved.categories.length = 0;
-  assert.equal(parseScannerPreferences(null).columns.length, 12);
+  assert.equal(parseScannerPreferences(null).columns.length, 14);
   assert.equal(parseScannerPreferences(null).categories.length, 6);
 });
 

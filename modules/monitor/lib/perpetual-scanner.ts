@@ -11,6 +11,8 @@ export const SCANNER_COLUMNS = [
   { id: "openInterest", label: "持仓量", defaultVisible: true },
   { id: "quote", label: "报价", defaultVisible: true },
   { id: "spread", label: "开仓价差", defaultVisible: true },
+  { id: "capital", label: "所需资本", defaultVisible: true },
+  { id: "roc", label: "ROC", defaultVisible: true },
   { id: "history24h", label: "24h · 实际", defaultVisible: true },
   { id: "history7d", label: "7天 · 实际", defaultVisible: true },
   { id: "history30d", label: "30天 · 实际", defaultVisible: true },
@@ -30,9 +32,10 @@ export const SCANNER_CATEGORIES = [
 ] as const;
 
 export type ScannerCategoryId = typeof SCANNER_CATEGORIES[number]["id"];
-export interface ScannerPreferences { columns: ScannerColumnId[]; categories: ScannerCategoryId[] }
+export interface ScannerPreferences { version: 2; columns: ScannerColumnId[]; categories: ScannerCategoryId[] }
 
 export const defaultScannerPreferences: ScannerPreferences = {
+  version: 2,
   columns: SCANNER_COLUMNS.filter(column => column.defaultVisible).map(column => column.id),
   categories: SCANNER_CATEGORIES.map(category => category.id),
 };
@@ -42,15 +45,20 @@ const categoryIds = new Set<string>(SCANNER_CATEGORIES.map(category => category.
 
 /** Display preferences are independent of trading filters; an explicit empty list stays empty. */
 export function parseScannerPreferences(raw: string | null): ScannerPreferences {
-  const defaults = (): ScannerPreferences => ({ columns: [...defaultScannerPreferences.columns], categories: [...defaultScannerPreferences.categories] });
+  const defaults = (): ScannerPreferences => ({ version: 2, columns: [...defaultScannerPreferences.columns], categories: [...defaultScannerPreferences.categories] });
   try {
     const value: unknown = JSON.parse(raw ?? "null");
     if (!value || typeof value !== "object" || Array.isArray(value)) return defaults();
     const saved = value as Record<string, unknown>;
+    const columns: ScannerColumnId[] = Array.isArray(saved.columns)
+      ? [...new Set(saved.columns.filter((id): id is ScannerColumnId => typeof id === "string" && columnIds.has(id)))]
+      : [...defaultScannerPreferences.columns];
+    // Version 1 saved a smaller default list. Keep explicitly hidden columns
+    // hidden, but make new first-class metrics visible to existing users.
+    const migrated = saved.version === 2 || columns.length === 0 ? columns : [...new Set<ScannerColumnId>([...columns, "capital", "roc"])];
     return {
-      columns: Array.isArray(saved.columns)
-        ? [...new Set(saved.columns.filter((id): id is ScannerColumnId => typeof id === "string" && columnIds.has(id)))]
-        : [...defaultScannerPreferences.columns],
+      version: 2,
+      columns: migrated,
       categories: Array.isArray(saved.categories)
         ? [...new Set(saved.categories.filter((id): id is ScannerCategoryId => typeof id === "string" && categoryIds.has(id)))]
         : [...defaultScannerPreferences.categories],

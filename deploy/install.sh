@@ -1506,6 +1506,7 @@ input_keys() {
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree runtime_dependency_tree module module_tree
   local legacy_runner_blob legacy_tree module_recipe module_artifacts_key
   local -a navigation_inputs=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts)
+  local -a module_shared_inputs=("${navigation_inputs[@]}" server/capital-metrics.mjs server/capital-metrics.d.mts)
   local -a module_inputs
   legacy_module_build_keys=()
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc \
@@ -1516,7 +1517,7 @@ input_keys() {
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash src public "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
   runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py) || return
-  embedded_tree=$(tree_hash modules "${navigation_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py .env .env.local .env.production .env.production.local) || return
+  embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf 'pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger\n%s\n%s\n%s' "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
@@ -1538,7 +1539,7 @@ input_keys() {
       module_inputs=(modules/aster/dashboard modules/aster/trading/cycle-config.json \
         modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local)
     elif [[ "$module" == monitor || "$module" == crossex ]]; then
-      module_inputs=("modules/$module" "${navigation_inputs[@]}")
+      module_inputs=("modules/$module" "${module_shared_inputs[@]}")
     else
       module_inputs=("modules/$module")
     fi

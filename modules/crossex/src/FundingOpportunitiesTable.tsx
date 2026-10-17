@@ -2,7 +2,7 @@ import DecimalValue from './DecimalValue';
 import { direction, time, venue } from './display';
 import { percentage } from './position-view';
 import { amountClass } from './live-display';
-import { fundingPair, fundingStaleReason, type FundingLeg, type FundingOpportunity } from './funding-opportunities';
+import { fundingCapitalRoc, fundingPair, fundingStaleReason, type FundingLeg, type FundingOpportunity } from './funding-opportunities';
 import type { Instrument } from './live-types';
 
 export default function FundingOpportunitiesTable({ rows, instruments, now, monitorStale, onSelect }: {
@@ -11,22 +11,29 @@ export default function FundingOpportunitiesTable({ rows, instruments, now, moni
 }) {
   return <>
     {rows.length ? <div className="table-wrap"><table className="responsive-table opportunity-table funding-table">
-      <thead><tr><th>币种 / 方向</th><th>原始费率 / 周期</th><th>8h 等效费率差</th><th>开仓毛价差</th><th>下次结算</th><th>数据检查</th><th>操作</th></tr></thead>
+      <thead><tr><th>币种 / 方向</th><th>原始费率 / 周期</th><th>8h 等效费率差</th><th>开仓毛价差</th><th>资本效率</th><th>下次结算</th><th>数据检查</th><th>操作</th></tr></thead>
       <tbody>{rows.map(row => {
         const reason = fundingStaleReason(row, now, monitorStale) || (!fundingPair(row, instruments) ? '对应合约尚未进入目录' : '');
+        const capitalRoc = fundingCapitalRoc(row), capitalReason = reason || capitalRoc.reason;
         return <tr key={row.id}>
           <td data-label="币种 / 方向"><strong>{row.base}</strong><small>{direction(row)}</small><small>{row.long.quoteCurrency} / {row.short.quoteCurrency}</small></td>
           <td data-label="原始费率 / 周期"><FundingRate leg={row.long} side="多"/><FundingRate leg={row.short} side="空"/></td>
           <td data-label="8h 等效费率差"><strong className={reason ? 'muted' : 'positive'}><DecimalValue value={String(row.equivalent8hBps)} kind="rate" signed/> bp</strong><small>空腿 − 多腿 · 折合至 8h</small></td>
           <td data-label="开仓毛价差"><span className={amountClass(row.grossBps == null ? null : String(row.grossBps))}><DecimalValue value={row.grossBps == null ? null : String(row.grossBps)} kind="rate" signed/> bp</span><small>未扣交易费与滑点</small></td>
+          <td data-label="资本效率"><strong className={capitalReason ? 'muted' : amountClass(capitalRoc.rocPercent == null ? null : String(capitalRoc.rocPercent))}>{rocPercent(capitalRoc.rocPercent)}</strong><small>资金费 ROC · 24h · 未扣费</small><small>资金费年化 {rocPercent(capitalRoc.fundingRocAnnualizedPercent)}</small><small>所需资本 {capitalRoc.capitalPercent == null ? '—' : `${capitalRoc.capitalPercent.toFixed(1)}%`} 多腿名义</small>{capitalReason ? <small className="warning">{capitalReason}</small> : null}</td>
           <td data-label="下次结算"><small>多 · {time(row.long.nextFundingAt)}</small><small>空 · {time(row.short.nextFundingAt)}</small></td>
           <td data-label="数据检查"><span className={reason ? 'warning' : 'positive'}>{reason || '可参考'}</span><small>费率 · {time(row.asOf)}</small></td>
           <td data-label="操作"><button disabled={!!reason} onClick={() => onSelect(row)}>填入对冲组合</button></td>
         </tr>;
       })}</tbody>
     </table></div> : <div className="empty compact"><span>{monitorStale ? 'Monitor 行情待更新，暂无法比较资金费机会。' : '暂无匹配的正资金费差机会。'}</span><small>需要两所同币合约的有效费率与明确结算周期；缺失数据不按零计算。</small></div>}
-    <p className="footnote">8h 等效费率差 =（空腿费率 ÷ 空腿周期 − 多腿费率 ÷ 多腿周期）× 8 × 10000 bp；公式中费率使用比例值，周期使用小时，按单腿相同名义额比较。正值表示该方向的资金费优势，不代表下次结算净收入；两腿结算时间、名义额及实际费率可能不同。开仓价差单独展示，未估算净收益或年化。最多显示 60 项。</p>
+    <p className="footnote">8h 等效费率差 =（空腿费率 ÷ 空腿周期 − 多腿费率 ÷ 多腿周期）× 8 × 10000 bp；公式中费率使用比例值，周期使用小时，按单腿相同名义额比较。正值表示该方向的资金费优势，不代表下次结算净收入；两腿结算时间、名义额及实际费率可能不同。资本效率按两腿 3x、20% 保证金缓冲、24 小时连续外推估算，同数量双腿资金费按各自名义金额加权：ROC = 持有期资金费 ÷ 所需资本，未扣交易费、滑点、借币利息或换汇成本；资金费年化只外推当前两腿费率，不是保证收益。最多显示 60 项。</p>
   </>;
+}
+
+function rocPercent(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${value > 0 ? '+' : value < 0 ? '−' : ''}${Math.abs(value).toFixed(2)}%`;
 }
 
 function FundingRate({ leg, side }: { leg: FundingLeg; side: string }) {

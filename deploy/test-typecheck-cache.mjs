@@ -29,7 +29,7 @@ for (const importer of ['.', 'modules/crossex']) {
     }
     // Preserve repository-relative imports without reading shared source outside the fixture.
     mkdirSync(path.join(workspace, 'server'), { recursive: true });
-    for (const name of ['hub-navigation.mjs', 'hub-navigation.d.mts', 'asset-identity.mjs', 'asset-identity.d.mts']) {
+    for (const name of ['hub-navigation.mjs', 'hub-navigation.d.mts', 'asset-identity.mjs', 'asset-identity.d.mts', 'capital-metrics.mjs', 'capital-metrics.d.mts']) {
       cpSync(path.join(repository, 'server', name), path.join(workspace, 'server', name));
     }
     symlinkSync(path.join(source, 'node_modules'), dependencies, 'junction');

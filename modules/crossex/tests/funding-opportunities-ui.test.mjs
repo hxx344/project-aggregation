@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fundingPair, fundingStaleReason } from '../src/funding-opportunities.ts';
+import { fundingCapitalRoc, fundingPair, fundingStaleReason } from '../src/funding-opportunities.ts';
 
 const now = 1_800_000_000_000;
 const long = { exchange: 'bybit', symbol: 'BYBIT_FUTURE_BTC_USDC', quoteCurrency: 'USDC', rate: 0, intervalHours: 1, normalized8hBps: 0, fundingAt: now - 1000, nextFundingAt: null };
@@ -41,4 +41,34 @@ test('a visible funding opportunity expires without another poll and respects so
 test('missing eligibility evidence cannot become a fillable direction', () => {
   assert.equal(fundingStaleReason({ ...row, eligible: false, reason: '缺少同两腿的筛选证据' }, now, false), '缺少同两腿的筛选证据');
   assert.equal(fundingStaleReason({ ...row, eligible: false }, now, false), '机会数据待核实');
+});
+
+test('funding capital efficiency uses the shared assumptions and never hides missing gross quotes', () => {
+  const roc = fundingCapitalRoc(row);
+  const capital = (100 / 3 + (1 - 12 / 10000) * 100 / 3) * 1.2;
+  assert.ok(Math.abs(roc.capitalPercent - capital) < 1e-9);
+  assert.ok(Math.abs(roc.rocPercent - 0.03 * (1 - 12 / 10000) / capital * 100) < 1e-9);
+  assert.ok(Math.abs(roc.fundingRocAnnualizedPercent - 10.95 * (1 - 12 / 10000) / capital * 100) < 1e-9);
+  assert.equal(roc.reason, '');
+
+  for (const patch of [{ grossBps: null }, { grossBps: NaN }, { equivalent8hBps: NaN }]) {
+    const missing = fundingCapitalRoc({ ...row, ...patch });
+    assert.equal(missing.rocPercent, null);
+    assert.notEqual(missing.reason, '');
+  }
+});
+
+test('funding ROC weights both notionals and normalizes each funding interval', () => {
+  const result = fundingCapitalRoc({ ...row, grossBps: 1000,
+    long: { ...long, rate: .005, intervalHours: 4 }, short: { ...short, rate: .01, intervalHours: 8 } });
+  assert.ok(Math.abs(result.rocPercent - .3 / 84 * 100) < 1e-9);
+  const negative = fundingCapitalRoc({ ...row, grossBps: -1000,
+    long: { ...long, rate: .01, intervalHours: 8 }, short: { ...short, rate: .0101, intervalHours: 8 } });
+  assert.ok(negative.rocPercent < 0, 'positive equal-notional carry can lose money for equal-quantity legs');
+  for (const invalid of [{ rate: NaN }, { intervalHours: 0 }, { intervalHours: 169 }]) {
+    const missing = fundingCapitalRoc({ ...row, long: { ...long, ...invalid } });
+    assert.equal(missing.rocPercent, null);
+    assert.equal(missing.fundingRocAnnualizedPercent, null);
+    assert.match(missing.reason, /资金费缺失/);
+  }
 });

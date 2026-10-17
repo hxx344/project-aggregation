@@ -13,6 +13,8 @@ async page => {
   const historyHours = { history24h: 24, history7d: 168, history30d: 720 };
   const errors = [], external = [], writes = [], scannerRequests = [], counts = new Map();
   let now = anchor, pendingSevenDay = true, metricLeader = null, long00 = 100;
+  const capitalKey = 'market-monitor:perpetual-capital-assumptions:v1';
+  let leverage = 3, buffer = 20, holding = 24;
   const check = (condition, message) => { if (!condition) throw Error(message); };
   const onError = error => { if (!errors.includes(error.message)) errors.push(error.message); };
   const indexOf = base => Number(base.slice(4));
@@ -65,6 +67,13 @@ async page => {
     const index = indexOf(base);
     if (column === 'quote') return quotePrice(index, leg);
     if (column === 'spread') return (quotePrice(index, 'short') / quotePrice(index, 'long') - 1) * 100;
+    if (column === 'capital' || column === 'roc') {
+      const ratio = quotePrice(index, 'short') / quotePrice(index, 'long');
+      const capital = 100 * (1 + ratio) / leverage * (1 + buffer / 100);
+      if (column === 'capital') return capital;
+      const funding = sourceMissing(index) ? 0 : (index - 30) * .000001 * ratio * 100 * holding / 8;
+      return ((ratio - 1) * 100 - .3 + funding) / capital * 100;
+    }
     if (sourceMissing(index)) return null;
     if (doubleColumns.has(column)) return metricAmount(index, column, leg);
     if (historyHours[column]) return pendingSevenDay && index === 64 && column === 'history7d' ? null : actualFunding(index, historyHours[column]);
@@ -86,6 +95,7 @@ async page => {
     if (!sessionStorage.getItem('scanner-sort-seeded')) {
       sessionStorage.setItem('scanner-sort-seeded', '1');
       localStorage.setItem(preferenceKey, JSON.stringify({ version: 2, sortBy: 'gross', minSpreadPercent: 0 }));
+      localStorage.removeItem('market-monitor:perpetual-capital-assumptions:v1');
       for (const key of [displayKey, rangeKey, sortKey]) localStorage.removeItem(key);
     }
     const fixture = window.perpetualSortFixture = { initial, streams: [], created: 0, frames: 0, sequence: 0, long00: 100 };
@@ -201,7 +211,7 @@ async page => {
     check((await names())[0] === 'COIN00', 'A genuine zero sorts before positive amounts');
     await expectMissingAtEnd('volume', 'asc');
 
-    for (const column of ['fundingSpread', 'annualized', 'openInterest', 'quote', 'spread', 'history24h', 'history30d']) {
+    for (const column of ['fundingSpread', 'annualized', 'openInterest', 'quote', 'spread', 'capital', 'roc', 'history24h', 'history30d']) {
       await title(column).click(); await expectSort(column, 'desc'); await expectFirstPage(column, 'desc');
       await title(column).click(); await expectSort(column, 'asc'); await expectFirstPage(column, 'asc');
     }
@@ -278,8 +288,31 @@ async page => {
     check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'The mobile page itself does not overflow horizontally');
     await page.screenshot({ path: 'output/playwright/scanner-sort-mobile.png', fullPage: false });
 
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('.scanner-tools > summary').click();
+    await page.locator('.scanner-advanced-filters > summary').click();
+    leverage = 5; buffer = 30; holding = 48;
+    await page.getByRole('spinbutton', { name: 'ROC 杠杆', exact: true }).fill(String(leverage));
+    await page.getByRole('spinbutton', { name: 'ROC 保证金缓冲', exact: true }).fill(String(buffer));
+    await page.getByRole('spinbutton', { name: 'ROC 持有小时', exact: true }).fill(String(holding));
+    await title('roc').click(); await expectSort('roc', 'desc'); await expectFirstPage('roc', 'desc');
+    check((await header('roc').innerText()).includes('48h'), 'The ROC header follows the configured holding period');
+    check((await page.evaluate(key => JSON.parse(localStorage.getItem(key)), capitalKey)).longLeverage === 5, 'Capital assumptions persist');
+    long00 = 100; // The page fixture starts a new stream from its original snapshot.
+    await page.reload(); await until(async () => await rows.count() > 0, 'Reload restores the scanner');
+    await expectSort('roc', 'desc'); await expectFirstPage('roc', 'desc');
+    check((await header('roc').innerText()).includes('48h'), 'Reload restores the holding period');
+    await rows.first().getByRole('button', { name: /^展开 / }).click();
+    const expanded = page.locator('.perp-row-expanded'), rocCell = expanded.locator('[data-column="roc"]');
+    check(await rocCell.locator('strong').count() === 1, 'A fresh inspection has a scenario ROC');
+    await tick(300_001);
+    check((await rocCell.innerText()).trim() === '—', 'A paused inspection stops showing ROC after quote expiry');
+    check(await rocCell.locator('strong').count() === 0, 'Expired funding cannot retain a live annualized return');
+    await table.getByRole('button', { name: '收起并恢复', exact: true }).click();
+    await until(async () => await rows.first().locator('[data-column="roc"] strong').count() === 1, 'Fresh quotes restore ROC');
+
     check(errors.length === 0 && external.length === 0 && writes.length === 0, JSON.stringify({ errors, external, writes }));
-    return { passed: true, checks: ['nine columns in both directions', 'sixty-five candidates sorted before pagination and page reset', 'three independent long/short numeric sorts', 'quote-currency conversion, true zero, negative actuals and missing/stale last', 'pending history becomes ranked without another click', 'independent filters and persisted sort', 'inspection freezes and resumes sort', 'existing twenty-second quote delivery', 'Enter/Space, focus and no chart navigation', '390px rightmost header and bounded horizontal scrolling'],
+    return { passed: true, checks: ['eleven columns in both directions', 'capital assumptions persist and restore', 'paused inspection drops expired ROC and recovers', 'sixty-five candidates sorted before pagination and page reset', 'three independent long/short numeric sorts', 'quote-currency conversion, true zero, negative actuals and missing/stale last', 'pending history becomes ranked without another click', 'independent filters and persisted sort', 'inspection freezes and resumes sort', 'existing twenty-second quote delivery', 'Enter/Space, focus and no chart navigation', '390px rightmost header and bounded horizontal scrolling'],
       scannerRequests: scannerRequests.length, apiRequests: Object.fromEntries(counts), screenshots: ['output/playwright/scanner-sort-desktop.png', 'output/playwright/scanner-sort-mobile.png'] };
   } finally { page.off('pageerror', onError); await page.clock.resume(); }
 }

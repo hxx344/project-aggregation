@@ -1,12 +1,14 @@
 import type { FundingWindowHours } from "./perpetual-funding-history.ts";
+import { DEFAULT_CAPITAL_ASSUMPTIONS, type CapitalAssumptions } from "../../../server/capital-metrics.mjs";
+import { scannerCapitalMetrics } from "./perpetual-capital.ts";
 import { scannerAmountValue, scannerCurrencyValue, scannerHistoryValue, type ScannerRangeData, type ScannerRangeValue } from "./perpetual-scanner-filters.ts";
 import { annualizedFundingPercent } from "./perpetual-scanner.ts";
 import { normalizedFunding8h, perpetualSpreadKey, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "./perpetual-spreads.ts";
 
-export type ScannerSortColumn = "fundingSpread" | "annualized" | "volume" | "openInterest" | "quote" | "spread" | "history24h" | "history7d" | "history30d";
+export type ScannerSortColumn = "fundingSpread" | "annualized" | "volume" | "openInterest" | "quote" | "spread" | "capital" | "roc" | "history24h" | "history7d" | "history30d";
 export interface ScannerSort { column: ScannerSortColumn; direction: "asc" | "desc"; leg?: "long" | "short" }
 
-const columns = new Set<string>(["fundingSpread", "annualized", "volume", "openInterest", "quote", "spread", "history24h", "history7d", "history30d"]);
+const columns = new Set<string>(["fundingSpread", "annualized", "volume", "openInterest", "quote", "spread", "capital", "roc", "history24h", "history7d", "history30d"]);
 const legColumns = new Set<ScannerSortColumn>(["volume", "openInterest", "quote"]);
 const historyWindows: Partial<Record<ScannerSortColumn, FundingWindowHours>> = { history24h: 24, history7d: 168, history30d: 720 };
 
@@ -37,7 +39,7 @@ export function scannerSortRequirements(sort: ScannerSort | null): { metrics: bo
   return { metrics, historyHours: hours === undefined ? [] : [hours], needsFx: metrics || sort?.column === "quote" };
 }
 
-type SortData = ScannerRangeData & { net: boolean; priceMode: PerpetualFilters["priceMode"]; staleAfterMs: number };
+type SortData = ScannerRangeData & { net: boolean; priceMode: PerpetualFilters["priceMode"]; staleAfterMs: number; capital?: CapitalAssumptions };
 const finite = (value: number | null | undefined): number | null => typeof value === "number" && Number.isFinite(value) ? value : null;
 const numeric = (value: ScannerRangeValue): number | null => typeof value === "number" ? finite(value) : null;
 
@@ -53,9 +55,11 @@ function sortValue(row: PerpetualSpread, sort: ScannerSort, data: SortData): num
     // Public prices are already normalized per asset; do not apply multiplier again.
     return numeric(scannerCurrencyValue(price, quote.quoteCurrency, "USDT", data));
   }
-  if (sort.column === "spread") {
+  if (sort.column === "spread" || sort.column === "capital" || sort.column === "roc") {
     if (!quoteIsFresh(row.long, data.priceMode, data.now, data.staleAfterMs) || !quoteIsFresh(row.short, data.priceMode, data.now, data.staleAfterMs)) return null;
-    return finite(data.net ? row.netSpreadPercent : row.spreadPercent);
+    if (sort.column === "spread") return finite(data.net ? row.netSpreadPercent : row.spreadPercent);
+    const { capital, roc } = scannerCapitalMetrics(row, data.capital ?? DEFAULT_CAPITAL_ASSUMPTIONS, data);
+    return sort.column === "capital" ? capital.capitalPercent : roc.rocPercent;
   }
   const long = normalizedFunding8h(row.long, data.now), short = normalizedFunding8h(row.short, data.now);
   if (long === null || short === null) return null;

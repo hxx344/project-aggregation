@@ -4,9 +4,11 @@ import { nextScannerSort, parseScannerSort, scannerSortRequirements, sortScanner
 import { scannerHistoryPairKey } from "../lib/perpetual-scanner-filters.ts";
 import { PERPETUAL_MARKET_METRICS_STALE_MS } from "../lib/perpetual-market-metrics.ts";
 import { PERPETUAL_FUNDING_STALE_MS } from "../lib/perpetual-funding-history.ts";
+import { scannerCapitalMetrics } from "../lib/perpetual-capital.ts";
+import { DEFAULT_CAPITAL_ASSUMPTIONS } from "../../../server/capital-metrics.mjs";
 
 const NOW = 1_800_000_000_000;
-const columns = ["fundingSpread", "annualized", "volume", "openInterest", "quote", "spread", "history24h", "history7d", "history30d"];
+const columns = ["fundingSpread", "annualized", "volume", "openInterest", "quote", "spread", "capital", "roc", "history24h", "history7d", "history30d"];
 const histories = [["history24h", 24], ["history7d", 168], ["history30d", 720]];
 const quote = (base, exchange, patch = {}) => ({
   exchange, symbol: `${base}USDT`, base, quoteCurrency: "USDT", multiplier: 1,
@@ -206,6 +208,56 @@ test("freshness boundaries remain inclusive for metric, history, and funding sor
   const metrics = { [legKey(a.long)]: metricsLeg(a.long, { volume24h: metric(1, { observedAt: NOW - PERPETUAL_MARKET_METRICS_STALE_MS }) }), [legKey(b.long)]: metricsLeg(b.long) };
   const history = { [scannerHistoryPairKey(a)]: { 24: total(24, 1, { asOf: NOW - PERPETUAL_FUNDING_STALE_MS }) }, [scannerHistoryPairKey(b)]: { 24: total(24) } };
   for (const column of ["fundingSpread", "annualized", "volume", "history24h"]) assertBoth([a, b], column, ["B", "A"], { metrics, history });
+});
+
+test("capital and ROC sorts share the configured assumptions and keep missing values last", () => {
+  const capital = { longLeverage: 3, shortLeverage: 3, marginBufferPercent: 20, holdingHours: 24 };
+  const a = row("A", { buyPrice: 100, sellPrice: 101, netSpreadPercent: 1, short: quote("A", "z", { fundingRate: .0001 }) });
+  const b = row("B", { buyPrice: 100, sellPrice: 100, netSpreadPercent: 2, fundingSpread8h: 0 });
+  const c = row("C", { buyPrice: 100, sellPrice: 100, netSpreadPercent: 1, short: quote("C", "z", { fundingRate: .0001 }) });
+  assert.deepEqual(ids(sort([a, b, c], "capital", "desc", { capital })), ["A", "B", "C"]);
+  assert.deepEqual(ids(sort([a, b, c], "capital", "asc", { capital })), ["B", "C", "A"]);
+  assert.deepEqual(ids(sort([a, b, c], "roc", "desc", { capital })), ["B", "C", "A"]);
+  assert.deepEqual(ids(sort([a, b, c], "roc", "asc", { capital })), ["A", "C", "B"]);
+
+  const missingNet = row("D", { buyPrice: 100, sellPrice: 100, netSpreadPercent: null, fundingSpread8h: .0001 });
+  const stale = row("E", { buyPrice: 100, sellPrice: 100, netSpreadPercent: 100, fundingSpread8h: .0001, long: quote("E", "a", { bidAskAt: NOW - 30_001 }) });
+  const unadjusted = row("F", { buyPrice: 100, sellPrice: 100, netSpreadPercent: 100, fundingSpread8h: .0001, crossCurrency: true, fxAdjusted: false });
+  for (const direction of ["asc", "desc"]) {
+    assert.deepEqual(ids(sort([missingNet, a, b, c, stale, unadjusted], "roc", direction, { capital })).at(-1), "F");
+    assert.deepEqual(ids(sort([missingNet, a, b, c, stale, unadjusted], "capital", direction, { capital })).at(-1), "F");
+  }
+});
+
+test("display and ROC sorting recheck each funding clock instead of cached spread", () => {
+  const a = row("A", { buyPrice: 100, sellPrice: 110, netSpreadPercent: 0, fundingSpread8h: -100,
+    long: quote("A", "a", { fundingRate: .005, fundingIntervalHours: 4 }), short: quote("A", "z", { fundingRate: .01 }) });
+  const b = row("B", { netSpreadPercent: .2, fundingSpread8h: 100 });
+  const current = scannerCapitalMetrics(a, DEFAULT_CAPITAL_ASSUMPTIONS, data());
+  assert.ok(Math.abs(current.roc.fundingPercent - .3) < 1e-9);
+  assert.deepEqual(ids(sort([a, b], "roc")), ["A", "B"]);
+  const atBoundary = { ...a, long: { ...a.long, fundingAt: NOW - 300_000 }, short: { ...a.short, fundingAt: NOW - 300_000 } };
+  assert.equal(scannerCapitalMetrics(atBoundary, DEFAULT_CAPITAL_ASSUMPTIONS, data()).roc.fundingAvailable, true);
+  const expired = { ...atBoundary, long: { ...atBoundary.long, fundingAt: NOW - 300_001 } };
+  const stale = scannerCapitalMetrics(expired, DEFAULT_CAPITAL_ASSUMPTIONS, data()).roc;
+  assert.equal(stale.fundingAvailable, false);
+  assert.equal(stale.fundingRocAnnualizedPercent, null);
+  assert.equal(stale.rocPercent, 0);
+  assert.deepEqual(ids(sort([expired, b], "roc")), ["B", "A"]);
+  const paused = scannerCapitalMetrics(a, DEFAULT_CAPITAL_ASSUMPTIONS, data({ now: NOW + 300_001 }));
+  assert.equal(paused.capital.capitalPercent, null);
+  assert.equal(paused.roc.rocPercent, null);
+  assert.match(paused.capital.reason, /报价已过期/);
+});
+
+test("cross-currency capital requires converted prices and shares the display denominator", () => {
+  const converted = row("FX", { crossCurrency: true, fxAdjusted: true, buyPrice: 200, sellPrice: 100,
+    referenceBuyPrice: 100, referenceSellPrice: 110, netSpreadPercent: 1 });
+  assert.ok(Math.abs(scannerCapitalMetrics(converted, DEFAULT_CAPITAL_ASSUMPTIONS, data()).capital.capitalPercent - 84) < 1e-9);
+  for (const patch of [{ referenceBuyPrice: undefined }, { referenceSellPrice: NaN }, { fxAdjusted: false }]) {
+    assert.equal(scannerCapitalMetrics({ ...converted, ...patch }, DEFAULT_CAPITAL_ASSUMPTIONS, data()).roc.rocPercent, null);
+    assert.equal(ids(sort([converted, row("A"), { ...converted, base: "Z", ...patch }], "capital")).at(-1), "Z");
+  }
 });
 
 test("ties use stable pair identity in both directions across different input orders without mutation", () => {

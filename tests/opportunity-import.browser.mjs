@@ -43,7 +43,11 @@ async page => {
     state: 'online', freshness: 'static', message: '', checkedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), latencyMs: 1, metrics: [],
   })) };
   const updates = { enabled: false, checking: false, checkedAt: null, checkError: null, planId: null, expiresAt: null, modules: [], job: null };
-  const state = () => ({ now: now(), csrfToken: 'opportunity-import-fixture', mode: 'live', config, venues: [], fx: [], opportunities: [], fundingOpportunities: [], positionFundingRates: [],
+  const funding = () => [{ id: 'capital-btc', base: 'BTC',
+    long: { exchange: 'binance', symbol: code('binance', 'BTC', 'USDC'), quoteCurrency: 'USDC', rate: .01, intervalHours: 8, normalized8hBps: 100, fundingAt: now(), nextFundingAt: now() + hour },
+    short: { exchange: 'gate', symbol: code('gate', 'BTC', 'USDT'), quoteCurrency: 'USDT', rate: .0101, intervalHours: 8, normalized8hBps: 101, fundingAt: now(), nextFundingAt: now() + hour },
+    equivalent8hBps: 1, grossBps: -1000, asOf: now(), expiresAt: now() + 9000, eligible: true, reason: '' }];
+  const state = () => ({ now: now(), csrfToken: 'opportunity-import-fixture', mode: 'live', config, venues: [], fx: [], opportunities: [], fundingOpportunities: funding(), positionFundingRates: [],
     source: { state: 'live', error: null, updatedAt: now(), generatedAt: now(), checkedAt: now(), quoteCount: 4 }, catalog: { state: 'ready', count: instruments.length, updatedAt: now(), error: null },
     live: { connection, status: 'live', freshnessState: 'fresh', stale: false, partial: false, asOf: now(), tradingAllowed: true, reasons: [],
       account: { account_mode: 'CROSS_EXCHANGE', available_margin: '10000', margin_balance: '10000', initial_margin: '0', maintenance_margin: '0' },
@@ -213,6 +217,7 @@ async page => {
 
     await importButton('BTC').waitFor();
     const monitor = page.frames().find(frame => frame.url().startsWith(monitorOrigin));
+    assert(await row('BTC').locator('[data-column="capital"]').count() === 1 && await row('BTC').locator('[data-column="roc"] strong').count() === 1, 'The real Monitor iframe exposes capital and ROC');
     const disabledImport = importButton('XAU'), disabledReason = row('XAU').locator('[data-column="crossexImport"] small');
     assert(await disabledImport.isDisabled() && (await disabledReason.innerText()).length > 0, 'unsupported asset keeps a visible disabled reason');
     for (const width of [1440, 390]) {
@@ -235,6 +240,22 @@ async page => {
     holdCatalog = false; for (const release of catalogWaiters) release(); catalogWaiters.clear();
     await expectPair(code('binance', 'BTC', 'USDC'), code('gate', 'BTC', 'USDT'));
     assert(await select('A').locator('option').count() === 2, 'USDT and USDC coexist in the same venue directory');
+    await crossexFrame.getByRole('group', { name: '机会类型' }).getByRole('button', { name: /资金费/ }).click();
+    const fundingRow = crossexFrame.locator('.funding-table tbody tr').first();
+    const capitalCell = fundingRow.locator('[data-label="资本效率"]');
+    await capitalCell.waitFor();
+    assert((await capitalCell.locator('strong').innerText()) === '−0.36%', 'CrossEx ROC weights notionals even when equal-notional funding carry is positive');
+    assert(await capitalCell.locator('strong').getAttribute('class') === 'negative', 'Negative carry has the correct visual sign');
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await capitalCell.scrollIntoViewIfNeeded();
+      assert(await capitalCell.isVisible(), `${width}px CrossEx capital efficiency remains visible`);
+      await page.screenshot({ path: `output/playwright/capital-crossex-${width}.png`, fullPage: true });
+    }
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await fundingRow.getByRole('button', { name: '填入对冲组合', exact: true }).click();
+    await expectPair(code('binance', 'BTC', 'USDC'), code('gate', 'BTC', 'USDT'));
+    assert(previews.length === 0, 'Capital display and fill create no preview automatically');
     await quantity().fill('0.2');
     await crossexFrame.getByRole('button', { name: '预览双腿委托', exact: true }).click();
     await crossexFrame.getByRole('dialog', { name: '核对开仓委托', exact: true }).waitFor();

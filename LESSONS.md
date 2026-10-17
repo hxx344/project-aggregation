@@ -871,6 +871,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **共享依赖夹具补充（2026-10-17）：** 沿用 `monitor-crossex-import-identity-20261017`。本仓 `fa5e09b` 将导航解析器移至 `server/` 后，[CI 38954241655](https://github.com/hxx344/project-aggregation/actions/runs/38954241655) 的根项目冷类型检查报 `TS2307`：临时夹具只复制 `src`，遗漏新增跨目录依赖；CrossEx 的旧扁平夹具还会意外读到原仓共享文件。隔离类型检查须保留 importer 的仓库相对布局并复制直接共享源码，复用原有冷/热检查、新增类型错误与修复恢复场景验证，不以完整工作树的构建通过代替夹具验证。
 
+**新增共享指标补充（2026-10-18）：** 基于 `cb6cba5` 的资本效率改动工作区引入 `server/capital-metrics.mjs` 后，Windows 原生运行 [隔离类型检查](deploy/test-typecheck-cache.mjs) 实际复现 CrossEx 冷检查 `TS2307`；原有指标测试全部通过仍不能覆盖该失败。新增共享前端依赖须同时纳入隔离夹具、[模块构建键](scripts/modules.mjs) 与[源码更新构建键](deploy/install.sh)，否则后续只更新共享公式时可能复用旧页面。复用 [模块键检查](deploy/test-module-builds.mjs) 与 [Git 输入分类](deploy/test-inputs.sh) 验证仅 Monitor/CrossEx 失效，其余模块保持缓存。事件 `capital-shared-build-input-20261018`，不推进复盘检查点。
+
 ### L056：主动断开后保留估值不再要求实时同步
 
 **适用条件：** Asset 中由单个连接维护余额的 Bybit、Binance、OKX、Gate、VAR 账户；Aster 多账号聚合需按其独立来源规则处理，不直接套用单连接判断。
@@ -912,3 +914,18 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `025884a` 的 [页面刷新](modules/aster/dashboard/lib/state-refresh.ts)、[状态展示](modules/aster/dashboard/lib/capacity-relay.ts) 和 [额度连接面板](modules/aster/dashboard/components/capacity-relay-panel.tsx)。2026-10-17 用户报告切回标签时黄色一闪后恢复绿色；源码确认上述路径可以独立触发该现象，未取得服务器现场日志，不推断每次黄灯均为页面时效所致。
 
 **事件记录：** `aster-relay-display-resume-20261017`；一次状态展示语义修正，不推进主线复盘检查点。
+
+
+### L059：资本回报分子与分母须描述同一双腿头寸
+
+**适用条件：** 按双腿价格、杠杆和缓冲估算资本，再组合价差与资金费计算 ROC 的只读机会表。
+
+**根因：** 分母按同数量双腿的各自名义金额计算，分子却直接使用等名义的资金费率差；两腿价格不同时会误估资金费现金流。冻结报价行中的预计算费差还会跨过时效期限，导致同一行费率已缺失而年化仍有效。
+
+**以后做法：** 先固定头寸及计价单位；以多腿名义为基准，空腿资金费乘以空腿/多腿名义比后再减多腿支出。显示与排序共用计算入口，每次按当前时钟验证双腿报价与资金费；过期报价不继续给出 ROC，资金费缺失时只保留明确标注的价差情景。连续外推与实际结算时点计数须明确各自前提。
+
+**如何验证：** [资本指标测试](tests/capital-metrics.test.mjs) 以多价100、空价110、两腿同为1%/8h验证现金流为多腿名义0.1%/8h，并覆盖负费率；[Monitor指标与排序测试](modules/monitor/tests/perpetual-scanner-sort.test.mjs) 覆盖不同周期、过期边界、缓存费差与当前双腿冲突、FX转换及排序一致性；[CrossEx资金费UI测试](modules/crossex/tests/funding-opportunities-ui.test.mjs)覆盖正等名义费差但加权收益为负、缺失费率不补零。按本次可见交互运行工作台浏览器回归。
+
+**证据：** project-aggregation 基于 `cb6cba5` 的 2026-10-18 资本效率工作区；审查确认首次实现 [共享公式](server/capital-metrics.mjs) 分子未加权，[Monitor页面](modules/monitor/app/perpetual-panel.tsx) 从冻结行读取旧费差。首次提交前修正为 [共享时效入口](modules/monitor/lib/perpetual-capital.ts)；基线提交本身没有这些新指标。
+
+**事件记录：** `capital-roc-contract-20261018`；本次开发前置审查及连续修补归为一个事件，不推进主线复盘检查点。
