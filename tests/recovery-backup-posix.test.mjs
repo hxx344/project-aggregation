@@ -44,9 +44,12 @@ async function fixture(t) {
 test('POSIX root cold inspect/backup leaves service-owned DBs reopenable by the original UID', {skip:!eligible}, async t=>{
   const f=await fixture(t);const before=readRegistry(f.source);
   const interrupted=actor(f.source,`
-    import path from 'node:path';import {DatabaseSync} from 'node:sqlite';
+    import fs from 'node:fs';import path from 'node:path';import {DatabaseSync} from 'node:sqlite';
     const db=new DatabaseSync(path.join(process.argv[1],'hub.sqlite'));db.exec('PRAGMA journal_mode=WAL');
     db.prepare('SELECT count(*) FROM witness').get();db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    // Modern SQLite may copy the DB UID to new sidecars even for a root
+    // caller. Inject the older-tool/root-owned crash residue explicitly.
+    for(const suffix of ['-wal','-shm']){const file=path.join(process.argv[1],'hub.sqlite'+suffix);fs.chownSync(file,0,0);fs.chmodSync(file,0o600);}
     process.kill(process.pid,'SIGKILL');
   `,{root:true});
   assert.equal(interrupted.signal,'SIGKILL');
@@ -69,10 +72,12 @@ test('POSIX root cold inspect/backup leaves service-owned DBs reopenable by the 
 test('POSIX root retirement WAL survives SIGKILL and resumes under the original lock without adopting unknown sidecars', {skip:!eligible}, async t=>{
   const f=await fixture(t), database=path.join(f.source,'execution-control.sqlite');
   const killed=actor(f.source,`
-    import path from 'node:path';import {DatabaseSync} from 'node:sqlite';
+    import fs from 'node:fs';import path from 'node:path';import {DatabaseSync} from 'node:sqlite';
     const db=new DatabaseSync(path.join(process.argv[1],'execution-control.sqlite'));db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL');
     const state=JSON.parse(db.prepare("SELECT value FROM aw_meta WHERE key='recovery_state'").get().value);state.state='retired';
-    db.prepare("UPDATE aw_meta SET value=? WHERE key='recovery_state'").run(JSON.stringify(state));process.kill(process.pid,'SIGKILL');
+    db.prepare("UPDATE aw_meta SET value=? WHERE key='recovery_state'").run(JSON.stringify(state));
+    for(const suffix of ['-wal','-shm']){const file=path.join(process.argv[1],'execution-control.sqlite'+suffix);fs.chownSync(file,0,0);fs.chmodSync(file,0o600);}
+    process.kill(process.pid,'SIGKILL');
   `,{root:true});
   assert.equal(killed.signal,'SIGKILL');
   for(const suffix of ['-wal','-shm']){const info=fs.statSync(database+suffix);assert.equal(info.uid,0);assert.equal(info.mode&0o777,0o600);}

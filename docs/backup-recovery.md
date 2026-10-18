@@ -1,6 +1,6 @@
 # 冷备份、隔离恢复与交易交接
 
-本文对应当前 [恢复工具](../server/recovery/operations.py)、[备份实现](../server/recovery/backup.mjs)和[恢复实现](../server/recovery/restore.mjs)。M2 已接入实现，相关 Linux CI 仍需按本次提交结果验收；本文不表示服务器已经部署、执行过生产恢复或达到生产 SLA。
+本文对应当前 [恢复工具](../server/recovery/operations.py)、[备份实现](../server/recovery/backup.mjs)和[恢复实现](../server/recovery/restore.mjs)。M2 已接入实现，相关 Linux 验收结果见对应提交的 Checks；本文不表示服务器已经部署、执行过生产恢复或达到生产 SLA。
 
 普通备份允许保留活动任务和 UNKNOWN，恢复后统一进入 `quarantine`。它能恢复持久材料，不能证明备份点之后没有成交。只有仍持有完整原源、在同一冷停检查点证明财务静止并封存的 `handoff`，才有一次性授予指定恢复目标交易资格的入口。
 
