@@ -340,6 +340,19 @@ class AccountWriterTests(unittest.TestCase):
             self.assertEqual(restarted.registry.unresolved(ticket), [])
         self.assertEqual(sum(method != "GET" for _, method, _ in self.requests), writes)
 
+    def test_managed_dispatch_without_original_batch_id_still_rejects_before_transport(self):
+        pair = self.pair()
+        state = self.terminal_pair(pair)
+        state["pending"].pop("id")
+        writer = self.engine.account_writer
+        before = list(self.requests)
+        with writer.accounts(["long", "short"]) as ticket:
+            with self.assertRaisesRegex(TradingError, "原批次"):
+                PairTrader(self.engine)._dispatch(pair, state, self.engine.brokers, state["pending"]["legs"])
+            self.assertEqual(writer.registry.unresolved(ticket), [])
+        self.assertEqual(self.requests, before)
+        self.assertNotIn("writer_dispatches", state["pending"])
+
 
 if __name__ == "__main__":
     unittest.main()

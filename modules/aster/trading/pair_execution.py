@@ -597,16 +597,21 @@ class PairTrader:
             raise PairPositionError("待发送订单标的与配对组不一致，停止交易并等待核对")
         state["_trading_write_started"] = True
         pending = state.get("pending") or {}
-        client_ids = [leg["order"]["newClientOrderId"] for leg in legs]
-        operation = "aster:pair-orders:" + pending["id"] + ":" + ":".join(client_ids)
-        dispatch = {"operationId": operation, "clientOrderIds": client_ids}
-        dispatches = pending.setdefault("writer_dispatches", [])
-        if not isinstance(dispatches, list) or len(dispatches) > 32:
-            raise PairPositionError("持久配对发送分组无效，停止发送并保留原订单")
-        if dispatch not in dispatches:
-            if len(dispatches) == 32:
-                raise PairPositionError("配对发送分组达到恢复上限，停止发送并保留原订单")
-            dispatches.append(dispatch)
+        writer = writer_for(self.engine)
+        operation = None
+        if writer.enabled:
+            if not isinstance(pending.get("id"), str) or not pending["id"]:
+                raise PairPositionError("受管理配对发送缺少持久原批次标识，未发送请求")
+            client_ids = [leg["order"]["newClientOrderId"] for leg in legs]
+            operation = "aster:pair-orders:" + pending["id"] + ":" + ":".join(client_ids)
+            dispatch = {"operationId": operation, "clientOrderIds": client_ids}
+            dispatches = pending.setdefault("writer_dispatches", [])
+            if not isinstance(dispatches, list) or len(dispatches) > 32:
+                raise PairPositionError("持久配对发送分组无效，停止发送并保留原订单")
+            if dispatch not in dispatches:
+                if len(dispatches) == 32:
+                    raise PairPositionError("配对发送分组达到恢复上限，停止发送并保留原订单")
+                dispatches.append(dispatch)
         observe = pending.get("kind") == "cycle" and legs is pending.get("legs")
         quality_clocks = {}
         # Workers observe separate objects so a runtime commit cannot serialize
@@ -667,8 +672,8 @@ class PairTrader:
                 return None, str(exc), evidence
             except Exception as exc:
                 return None, str(exc) if isinstance(exc, TradingError) else "订单结果未知，继续按客户端订单号核对", evidence
-        writer = writer_for(self.engine)
-        with writer.batch(operation, {"orders": [leg["order"] for leg in legs]}), ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
+        batch = writer.batch(operation, {"orders": [leg["order"] for leg in legs]}) if writer.enabled else nullcontext()
+        with batch, ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
             futures = [(leg, pool.submit(writer.wrap(send), leg)) for leg in legs]
             for index, (leg, future) in enumerate(futures):
                 receipt, error, evidence = future.result()
