@@ -156,7 +156,9 @@ class OperatorTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root ownership fixture runs in Linux CI')
     def test_guard_install_is_incremental_and_does_not_restart_or_remove_other_overrides(self):
-        with tempfile.TemporaryDirectory(prefix='recovery-install-') as directory:
+        # The production drop-in requires a root-owned non-writable ancestor
+        # chain. /tmp intentionally does not satisfy that installation contract.
+        with tempfile.TemporaryDirectory(prefix='recovery-install-', dir='/run') as directory:
             root = Path(directory)
             release = root / 'release'
             (release / 'server/recovery').mkdir(parents=True)

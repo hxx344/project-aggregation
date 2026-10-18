@@ -71,7 +71,7 @@ spec = importlib.util.spec_from_file_location('recovery_operations', pathlib.Pat
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); module.SERVICE = sys.argv[2]
 module.require_stopped(sys.argv[3])
 PY
-node --input-type=module - "$repository" "$fixture/data" <<'JS'
+"${RECOVERY_TEST_NODE:?Pass the verified Node executable}" --input-type=module - "$repository" "$fixture/data" <<'JS'
 import {pathToFileURL} from 'node:url';
 const {acquireRuntimeLock}=await import(pathToFileURL(process.argv[2]+'/server/recovery/lifecycle-lock.mjs'));
 const lock=await acquireRuntimeLock({dataDir:process.argv[3]}); lock.assertHeld(); await lock.close();

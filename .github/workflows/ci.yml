@@ -77,11 +77,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24.15.0'
-      - name: Verify recovery guard, cold-stop ownership and real cgroup isolation
+      - name: Verify recovery guard and cold-stop ownership
         run: |
           sudo env RECOVERY_TEST_NODE="$(command -v node)" python3 -I tests/test_recovery_operations.py -v
+      - name: Verify SQLite recovery across root and service identities
+        if: ${{ !cancelled() }}
+        run: |
           sudo "$(command -v node)" --test tests/recovery-backup-posix.test.mjs
-          sudo env AGG_RECOVERY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-recovery-systemd.sh
+      - name: Verify actual recovery cgroup isolation
+        if: ${{ !cancelled() }}
+        run: |
+          sudo env RECOVERY_TEST_NODE="$(command -v node)" AGG_RECOVERY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-recovery-systemd.sh
       - name: Check release download, integrity, extraction and cache boundaries
         run: |
           python3 deploy/test-release.py -v
