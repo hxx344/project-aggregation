@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createModuleUpdateGuard } from '../server/modules/updates.mjs';
+import { moduleCapabilities } from '../server/modules/capabilities.mjs';
 import { createUpdateCoordinator, UpdateError, unavailableUpdateState } from '../server/updates.mjs';
 
 const planId = 'embedded-update-plan-1234';
@@ -19,6 +20,10 @@ function fixture({ maintenance = false, pendingPlanId = null } = {}) {
     const id = modules.find(id => origin === `http://${id}.workspace.internal`);
     assert.ok(id, 'guard must use one of the fixed private module origins');
     assert.ok(options.deadline >= Date.now() && options.deadline <= Date.now() + (id === 'aster' && route.endsWith('update-status') ? 60_000 : 10_000), 'module requests have a bounded deadline');
+    if (route === '/__workspace/capabilities') {
+      events.push(`capabilities:${id}`);
+      return handlers[`capabilities:${id}`] ? handlers[`capabilities:${id}`]() : { data: moduleCapabilities(id) };
+    }
     if (route === '/__workspace/maintenance') {
       assert.equal(options.method, 'POST');
       assert.deepEqual(Object.keys(options.body), ['active']);
@@ -163,6 +168,20 @@ test('Aster verification failures explain which account evidence must be restore
   f.handlers['status:aster'] = () => ({ data: { busy: true, reason: '实盘账户缺少有效凭据，无法核查完整挂单；请配置凭据后重试' } });
   await assert.rejects(f.apply(), error => error.status === 409 && error.message.includes('请配置凭据后重试'));
   assert.deepEqual(f.calls, []);
+});
+
+test('missing, mismatched and unknown capability contracts refuse update before querying account evidence', async t => {
+  const cases = [null, {}, { ...moduleCapabilities('aster'), schemaVersion: 2 },
+    { ...moduleCapabilities('aster'), moduleId: 'greeks' }, { ...moduleCapabilities('aster'), accountWriterVersion: 1 },
+    { ...moduleCapabilities('aster'), extra: 'not-allowed' }];
+  for (const value of cases) await t.test(JSON.stringify(value), async () => {
+    const f = fixture(); f.handlers['capabilities:aster'] = () => ({ data: value });
+    await assert.rejects(f.apply(), error => error.status === 503 && /维护协议/.test(error.message));
+    assert.equal(f.events.includes('status:aster:start'), false);
+    assert.deepEqual(f.calls, []); assert.equal(f.persisted.maintenance, false);
+  });
+  const f = fixture(); f.handlers['capabilities:aster'] = () => { throw new Error('private timeout details'); };
+  await assert.rejects(f.apply(), error => error.status === 503 && !error.message.includes('private timeout'));
 });
 
 test('uncertain updater acceptance keeps all module gates across unavailable status and restart initialization', async () => {

@@ -1,6 +1,7 @@
 import { requestJson } from '../adapters.mjs';
 import { UpdateError } from '../updates.mjs';
 import { moduleOrigin } from './transport.mjs';
+import { readModuleCapabilities } from './capabilities.mjs';
 
 const tradingModules = ['crossex', 'greeks', 'aster'];
 const names = { crossex: 'Gate CrossEx', greeks: 'Greeks', aster: 'Aster 5x' };
@@ -16,6 +17,8 @@ export function createModuleUpdateGuard({ request = requestJson } = {}) {
     // has acknowledged maintenance. Wait for all reads before any rollback.
     const results = await Promise.allSettled(tradingModules.map(async id => {
       let data;
+      try { await readModuleCapabilities(id, { request, deadline: Date.now() + 5000 }); }
+      catch { throw new UpdateError(503, `${names[id]} 的维护协议无法确认，暂不能更新`); }
       try { ({ data } = await request(moduleOrigin(id), '/__workspace/update-status', { deadline: Date.now() + (id === 'aster' ? 60_000 : 10_000) })); }
       catch { throw new UpdateError(503, `无法确认 ${names[id]} 的委托状态，请稍后重试`); }
       const detail = id === 'aster' && typeof data?.reason === 'string' && data.reason.length <= 200 ? `：${data.reason}` : '';

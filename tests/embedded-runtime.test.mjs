@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { startModules } from '../server/modules/runtime.mjs';
 import { moduleOrigin, moduleTransport } from '../server/modules/transport.mjs';
 import { moduleIds } from '../server/modules/catalog.mjs';
+import { moduleCapabilities } from '../server/modules/capabilities.mjs';
 
 const repository = fileURLToPath(new URL('..', import.meta.url));
 const fixtureSource = `
@@ -44,9 +45,9 @@ async function bounded(promise, milliseconds, label) {
   try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} exceeded ${milliseconds} ms`)), milliseconds); })]); }
   finally { clearTimeout(timer); }
 }
-function request(transport, pathname = '/', secret = transport.secret) {
+function request(transport, pathname = '/', secret = transport.secret, method = 'GET') {
   return new Promise((accept, reject) => {
-    const pending = http.request({ socketPath: transport.socketPath, path: pathname, headers: { 'x-workspace-key': secret } }, response => {
+    const pending = http.request({ socketPath: transport.socketPath, path: pathname, method, headers: { 'x-workspace-key': secret } }, response => {
       const chunks = [];
       response.on('data', chunk => chunks.push(chunk)); response.once('error', reject);
       response.once('end', () => accept({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString() }));
@@ -75,7 +76,7 @@ async function fixture(t, { modes = {}, closeDelay = 0, omitRoot } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'embedded-runtime-'));
   const root = path.join(directory, 'root'), dataDir = path.join(directory, 'data'), logs = [];
   await mkdir(path.join(root, 'server/modules'), { recursive: true });
-  await copyFile(path.join(repository, 'server/modules/worker.mjs'), path.join(root, 'server/modules/worker.mjs'));
+  for (const file of ['worker.mjs', 'capabilities.mjs', 'transport.mjs']) await copyFile(path.join(repository, 'server/modules', file), path.join(root, 'server/modules', file));
   for (const id of moduleIds) {
     if (id !== omitRoot) await mkdir(path.join(root, 'modules', id), { recursive: true });
     await writeFile(path.join(root, 'server/modules', `${id}.mjs`), fixtureSource);
@@ -116,6 +117,13 @@ test('supervisor readies all real workers on authenticated private pipes and clo
     assert.equal(value.tcpListeners, 0); assert.equal(value.maintenance, '1');
     const rejected = await request(transport, '/', 'wrong-key');
     assert.equal(rejected.status, 403); assert.equal(rejected.headers['x-fixture-handler'], undefined);
+    const capabilities = await request(transport, '/__workspace/capabilities');
+    assert.equal(capabilities.status, 200);
+    assert.deepEqual(JSON.parse(capabilities.body), moduleCapabilities(id));
+    assert.equal(capabilities.headers['x-fixture-handler'], undefined, 'capabilities never reaches module business handlers');
+    assert.equal((await request(transport, '/__workspace/capabilities', 'wrong-key')).status, 403);
+    assert.equal((await request(transport, '/__workspace/capabilities?extra=1')).status, 400);
+    assert.equal((await request(transport, '/__workspace/capabilities', transport.secret, 'POST')).status, 405);
   }
   assert.equal(new Set(rows.map(row => row.pid)).size, moduleIds.length);
   await bounded(runtime.close(), 5000, 'shutdown');

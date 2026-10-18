@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validateUrl, validateAuthOrigin, readSummary, UpstreamError } from './adapters.mjs';
+import { validateUrl, validateAuthOrigin, readSummary, requestJson, UpstreamError } from './adapters.mjs';
 import { createPortal } from './portal.mjs';
 import { loginForPortal } from './portal-auth.mjs';
 import { createAssetSync, syncAsset } from './asset-sync.mjs';
@@ -23,6 +23,8 @@ import { createUpdateStream } from './update-stream.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { moduleCatalog, moduleIds } from './modules/catalog.mjs';
 import { createModuleUpdateGuard } from './modules/updates.mjs';
+import { readModuleCapabilities } from './modules/capabilities.mjs';
+import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from './observability.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -52,7 +54,8 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS) } = {}) {
+export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson } = {}) {
+  validateBaselineInterval(baselineIntervalMs);
   if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
   if (!Array.isArray(warmupProjects) || warmupProjects.some(id => typeof id !== 'string')) throw new TypeError('warmupProjects 必须为项目 ID 字符串数组');
   const warmupProjectIds = new Set(warmupProjects.map(id => id.trim()).filter(Boolean));
@@ -156,6 +159,19 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const getProjects = () => stmt.prepare('SELECT * FROM projects').all().map(publicProject).filter(Boolean).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   const rowFor = id => { if (embeddedModules && !moduleIds.includes(id)) throw new HttpError(404, '模块已移除'); const row = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set();
+  let baseline = null;
+  async function observedSummary(...args) {
+    const start = performance.now();
+    try { const value = await summaryReader(...args); baseline?.observeSummary(true, performance.now() - start); return value; }
+    catch (error) { baseline?.observeSummary(false, performance.now() - start); throw error; }
+  }
+  async function capabilities(signal) {
+    if (!embeddedModules) return [];
+    return Promise.all(moduleIds.map(async id => {
+      try { return { moduleId: id, state: 'compatible', capabilities: await readModuleCapabilities(id, { request: capabilitiesRequest, deadline: Date.now() + 5000, signal }) }; }
+      catch { return { moduleId: id, state: 'unavailable', capabilities: null }; }
+    }));
+  }
   const loginAttempts = new Map(); // IP-based rate limiting
   const accountLockouts = new Map(); // Account-level lockout: tracks failed password attempts
   const ACCOUNT_LOCKOUT_THRESHOLD = 5; // Lock after 5 failed attempts
@@ -175,7 +191,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     let message, data;
     for (const [res, current] of streams) {
       if (closed || !stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(current.id, Date.now())) { res.end(); streams.delete(res); continue; }
-      if (res.writableLength > 256 * 1024) { res.destroy(); streams.delete(res); continue; }
+      if (res.writableLength > 256 * 1024) { baseline?.observeSlowConsumer(); res.destroy(); streams.delete(res); continue; }
       data ??= overview();
       if (current.encode) res.write(`data: ${JSON.stringify(current.encode(data))}\n\n`);
       else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
@@ -238,7 +254,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(id);
       const previous = saved ? JSON.parse(saved.json) : null;
       try {
-        const data = await summaryReader(project, embeddedModules ? null : decrypt(row.credentials), { deadline: start + timeoutMs, signal: controller.signal });
+        const data = await observedSummary(project, embeddedModules ? null : decrypt(row.credentials), { deadline: start + timeoutMs, signal: controller.signal });
         if (closed) return null;
         const latest = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id);
         if (!latest) return null;
@@ -369,6 +385,20 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
+    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics') {
+      if (req.method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
+      if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取基线');
+      if (req.headers.origin) sameOrigin(req);
+      if (pathname === '/api/system/metrics') { send(res, 200, baseline.read()); return; }
+      const controller = new AbortController(); controllers.add(controller);
+      try {
+        const modules = await capabilities(controller.signal);
+        if (closed || session(req)?.id !== current.id) throw new HttpError(401, '登录已失效，请重新登录');
+        send(res, 200, { schemaVersion: 1, embeddedModules, modules, accountWriterVersion: null });
+      } finally { controllers.delete(controller); }
+      return;
+    }
     if (pathname === '/api/logout' && req.method === 'POST') {
       log.info({ ip: req.socket.remoteAddress, type: 'auth_logout' }, '用户登出');
       stmt.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
@@ -561,9 +591,15 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const heartbeat = setInterval(publishOverview, 15000); heartbeat.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   await updates.initialize();
+  baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
+    readSnapshot: () => ({ sseConnections: streams.size, projects: getProjects().map(project => ({ project,
+      snapshot: states.get(project.id) || (() => { const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); return saved ? JSON.parse(saved.json) : null; })(),
+    })) }),
+  });
+  baseline.start();
   return {
-    server, check, refresh, assetSync, trading, execution, dataDir: resolvedData,
+    server, check, refresh, assetSync, trading, execution, baseline, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); stmt.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await baseline.close(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

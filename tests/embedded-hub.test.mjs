@@ -8,6 +8,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server/app.mjs';
 import { moduleIds } from '../server/modules/catalog.mjs';
+import { moduleCapabilities } from '../server/modules/capabilities.mjs';
 import { registerModuleTransport, moduleOrigin, moduleTransport } from '../server/modules/transport.mjs';
 import { requestJson } from '../server/adapters.mjs';
 import { unavailableUpdateState } from '../server/updates.mjs';
@@ -39,6 +40,7 @@ async function fixture(t, { existing = false } = {}) {
       calls.push({ id, path: req.url, method: req.method, body, headers: req.headers });
       let value = req.url === '/__workspace/update-status' ? { busy: false } : { ok: true, module: id };
       if (req.url === '/__workspace/maintenance') value = { active: body.active };
+      if (req.url === '/__workspace/capabilities') value = moduleCapabilities(id);
       if (req.url === '/api/hub/positions') value = { schemaVersion: 1, generatedAt: new Date().toISOString(), accounts: [] };
       if (req.url.startsWith('/api/hub/trading-connections')) value = { schemaVersion: 1, connections: [] };
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value));
@@ -46,7 +48,7 @@ async function fixture(t, { existing = false } = {}) {
     await new Promise(resolve => server.listen(socketPath, resolve)); modules.push(server);
     removers.push(registerModuleTransport(id, { socketPath, secret }));
   }
-  app = await createApp({ ...options, dataDir, embeddedModules: true, updatesClient: { status: async () => unavailableUpdateState() } });
+  app = await createApp({ baselineIntervalMs: 0, ...options, dataDir, embeddedModules: true, updatesClient: { status: async () => unavailableUpdateState() } });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); port = app.server.address().port;
   const origin = `http://hub.localhost:${port}`;
   function request(route, { method = 'GET', body, host = `hub.localhost:${port}`, headers = {}, auth = true } = {}) {
@@ -96,7 +98,7 @@ test('one hub login reaches all five modules on one TCP port; private controls a
     const response = await f.request('/', { host: module.host, auth: false, headers });
     assert.equal(response.status, 200); assert.equal(response.data.module, id);
     assert.equal((await f.request('/api/read', { host: module.host, auth: false })).status, 401);
-    for (const route of ['/__workspace/update-status', '/%5f%5fworkspace/maintenance', '/api/hub/trading-connections/export', '/api/hub/trading-connections/%65xport']) {
+    for (const route of ['/__workspace/update-status', '/%5f%5fworkspace/maintenance', '/__workspace/capabilities', '/%5f%5fworkspace/capabilities', '/%255f%255fworkspace/capabilities', '/api/hub/trading-connections/export', '/api/hub/trading-connections/%65xport']) {
       assert.equal((await f.request(route, { host: module.host, auth: false, headers })).status, 403, route);
     }
     assert.equal((await f.request('/api/write', { method: 'POST', body: {}, host: module.host, auth: false, headers: { ...headers, Origin: 'https://evil.example' } })).status, 403);
@@ -111,6 +113,25 @@ test('native trading reads the embedded Asset without a separate web password or
   assert.equal((await f.request('/api/trading/import-sources')).status, 200);
   assert.ok(f.calls.some(call => call.id === 'asset' && call.path.startsWith('/api/hub/trading-connections')));
   assert.ok(!f.calls.some(call => call.path === '/api/login'));
+});
+
+test('architecture inspection and sampling read only the five authenticated capability contracts', async t => {
+  const f = await fixture(t); await f.login();
+  const before = f.calls.length;
+  const response = await f.request('/api/system/architecture');
+  assert.equal(response.status, 200); assert.equal(response.headers['cache-control'], 'no-store');
+  assert.deepEqual(response.data.modules.map(item => item.moduleId), moduleIds);
+  for (const row of response.data.modules) { assert.equal(row.state, 'compatible'); assert.deepEqual(row.capabilities, moduleCapabilities(row.moduleId)); }
+  assert.equal(f.calls.length - before, 5);
+  assert.ok(f.calls.slice(before).every(call => call.path === '/__workspace/capabilities' && call.method === 'GET'));
+  const serialized = JSON.stringify(response.data);
+  for (const id of moduleIds) assert.equal(serialized.includes(moduleTransport(moduleOrigin(id)).secret), false);
+  await f.app.baseline.sample();
+  assert.equal(f.app.baseline.read().recentSamples[0].capabilities.length, 5);
+  assert.ok(f.calls.slice(before).every(call => call.path === '/__workspace/capabilities'));
+  const after = f.calls.length;
+  assert.equal((await f.request('/api/system/metrics')).status, 200);
+  assert.equal(f.calls.length, after, 'metrics GET performs no IPC or upstream refresh');
 });
 
 test('virtual transports fail closed after unregister and never fall back to DNS or TCP', async t => {

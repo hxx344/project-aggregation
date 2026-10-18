@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import { chmodSync } from 'node:fs';
+import { moduleCapabilities } from './capabilities.mjs';
 
 let application, closing = false, closeTimeoutMs = 30_000;
 async function close(code = 0) {
@@ -30,6 +31,15 @@ process.on('message', async message => {
       if (!equal(request.headers['x-workspace-key'], secret)) {
         response.writeHead(403, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
         response.end('Forbidden'); return;
+      }
+      let url;
+      try { url = new URL(request.url, 'http://workspace.internal'); }
+      catch { response.writeHead(400, { 'Cache-Control': 'no-store' }).end(); return; }
+      if (url.pathname === '/__workspace/capabilities') {
+        const status = request.method !== 'GET' ? 405 : url.search ? 400 : 200;
+        response.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(status === 405 ? { Allow: 'GET' } : {}) });
+        response.end(JSON.stringify(status === 200 ? moduleCapabilities(id) : { error: 'Invalid capabilities request' }));
+        return;
       }
       for (const handler of handlers) handler.call(application.server, request, response);
     });
