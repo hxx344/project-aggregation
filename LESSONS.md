@@ -12,6 +12,8 @@
 
 2026-10-17 日复盘覆盖昨日日复盘合入 `831aeec`（此前检查点到 `bb4dcc91`）之后、直到主线 `7642f4e9` 的 14 个提交（2026-10-16 UTC 约 08:44–20:59，对应 Asia/Shanghai 10-16 下午至 10-17 凌晨）。范围包括 Aster 配对失衡告警与 20 秒确认、ADL 自动减仓恢复与设置/状态/报告、部署构建缓存与模块隔离、Monitor 向 CrossEx 导入机会与 CI 夹具、Asset 断开后估值时效、配对恢复权重与晚到回执、原油滚动均值，以及中继连接与数据新鲜度分离。L054–L058 及对既有条目的相关补充已随该窗口内的开发提交写入主线；本轮对照差异后没有新增独立经验。这些条目各自仍只有一个已核实日期，未达到 [升级条件](docs/code-standards.md#升级规则)，仍留在本文件。全历史复盘尚未完成，完成检查点保持未建立。
 
+2026-10-18 日复盘覆盖昨日日复盘合入 `58517771`（此前检查点到 `7642f4e9`）之后、直到主线 `1791a5e` 的 11 个非 merge 提交（2026-10-17 UTC 约业务时段至 2026-10-18 Asia/Shanghai；合入 PR 仅 #9 昨日 docs，本窗口业务 PR 合入 0）。范围包括 Aster ADL 配额等待与未发送计数修正、资本效率 ROC 指标、CrossEx 部分导入精确腿与开仓容量计价币、合并前审查标准/门禁/真实 Git 与发布路径及钩子执行位、源码安装纳入根 prepare 指纹、ADL/保证金冗余读取削减，以及工作台架构实现方案文档。L059–L060 已随窗口内开发提交写入主线；本轮对照差异后新增 L061（账户配置与只读预检的有界复用），其余主题落在既有条目补充（L027 容量币种、导入身份后续、L055 生命周期输入、ADL 路径配额）。各新条目仍只有一个已核实日期，未达到 [升级条件](docs/code-standards.md#升级规则)，仍留在本文件。全历史复盘尚未完成，完成检查点保持未建立。
+
 每条历史线索保留稳定 ID、原复盘日期和全部原有证据。实际发生日期、独立事件边界未完成核实时，不计入规范升级；后续核实时沿用 ID 或明确关联正式事件，避免重复统计。外仓证据标注“未核验”，不将其实现或测试描述为本仓已有能力。
 
 ## Correctness at the boundary
@@ -952,3 +954,22 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `89685c8` 的 [参数解析](scripts/review-gate.mjs) 只保存 range 未设置 mode；本轮 Windows 原生运行 `--range 5dc279b..HEAD` 返回“没有代码改动”，而范围内有实际新增代码。隔离回归进一步复现已提交的违规行、嵌套二进制/空文件漏检以及合成 token 原文回显。新 [CI 入口](scripts/review-ci.mjs)、[提交证据入口](scripts/review-message.mjs) 与 [.github/workflows/ci.yml](.github/workflows/ci.yml) 接通执行链。复现使用无效合成数据，不涉及真实凭据。
 
 **事件记录：** `review-gate-entrypoint-20261018`；一次门禁机制审核及连续修正，不推进主线复盘检查点。
+
+
+### L061：账户配置与只读预检证据须有界复用且不得授权执行
+
+**适用条件：** ADL/保证金等路径复用「账户配置」类证据（如持仓模式）降低 REST 权重，或用同次资金快照字段做 decline-only 划转预检；以及按事件标的缩小挂单查询范围。
+
+**根因：** 配置类字段在短窗口内稳定，但若无明确 TTL 与失效源（配置推送、重连、进程重启），或把预检结论当成执行授权，会在模式变更后按错误现场减仓，或跳过归属/可划核验。挂单若按标的收窄却不校验响应集合，会漏读其他标的挂单或接受未请求标的。
+
+**以后做法：**
+- 配置证据（如 hedge mode）仅在同一事件/进程内有界复用（当前实现 ≤15s），配置更新与重连必须失效；仓位/挂单行仍须与模式提示一致，矛盾则阻塞。
+- 缩小挂单查询时：标的集合有上限；超出回退全账户；响应标的必须 ⊆ 请求集。
+- 快照可划额度等 hint 只用于「本轮不划转」预检；缺失可回退上限，畸形须阻塞；实际划转前重新核验归属、余额与交易所可划。
+- 准入权重必须等于本轮实际将发送的请求权重（跳过的 dual/openOrders 不得仍按满权重准入）。
+
+**证据：** project-aggregation `a896ba7d`：[ADL 控制器](modules/aster/trading/adl.py) `MODE_EVIDENCE_SECONDS`、`mode_stale` / `ACCOUNT_CONFIG_UPDATE`；[现场读取](modules/aster/trading/adl_exchange.py) `order_query_symbols` / `_scene_weight`；[保证金](modules/aster/trading/margin_balance.py) 快照 `transfer_withdrawable` decline-only。关联前序配额路径 `cb6cba5e`（未发送不计失败），不合并为同一事件。
+
+**如何验证：** [ADL 预算](modules/aster/tests/test_adl_budget.py)、[控制器](modules/aster/tests/test_adl_controller.py)、[现场](modules/aster/tests/test_adl_exchange.py) 覆盖双账户不同模式、模式缓存失效、有界挂单查询与响应校验；[保证金轮询效率](modules/aster/tests/test_pair_margin_poll_efficiency.py) / [margin](modules/aster/tests/test_pair_margin.py) 覆盖 decline-only 与畸形 hint。不以「请求次数变少」单独作为正确性证据。
+
+**事件记录：** `aster-adl-mode-evidence-cache-20261018`；历史复盘 2026-10-18（Seen 1×）；不推进主线复盘检查点以外的全历史完成标记。
