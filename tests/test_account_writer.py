@@ -4,10 +4,12 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server" / "execution"))
 from account_writer import AccountWriter, AccountWriterError, account_key
@@ -47,6 +49,119 @@ class AccountWriterTests(unittest.TestCase):
         with self.assertRaises(AccountWriterError) as context:
             action()
         self.assertEqual(context.exception.code, expected)
+
+    def recovery(self, **update):
+        with closing(sqlite3.connect(self.database_path)) as database:
+            old = json.loads(database.execute("SELECT value FROM aw_meta WHERE key='recovery_state'").fetchone()[0])
+            value = {**old, **update}
+            database.execute("UPDATE aw_meta SET value=? WHERE key='recovery_state'", (json.dumps(value),))
+            database.commit()
+            return value
+
+    def test_quarantine_preserves_recovery_but_rejects_new_and_late_send(self):
+        writer = self.writer()
+        ticket = self.ticket(writer)
+        operation = writer.prepare(ticket, "before-restore", {"clientId": "original"})
+        gate = self.recovery(state="quarantine", recoveryId=str(uuid.uuid4()), admittedTarget={"accountId": "never-leak"})
+        self.assertEqual(writer.recovery_protection_version, 1)
+        self.assertEqual(writer.recoveryProtectionVersion, 1)
+        self.error("RECOVERY_REQUIRED", lambda: writer.assert_owned(operation))
+        self.error("RECOVERY_REQUIRED", lambda: writer.prepare(ticket, "after-restore", {}))
+        self.assertTrue(writer.assert_owned(operation, 0))
+        writer.finish(operation, "unknown")
+        writer.close()
+        recovery = self.writer()
+        recovered = recovery.claim([identity()])
+        self.assertEqual(recovery.import_unknown(recovered, "before-restore", {"clientId": "original"})["state"], "unknown")
+        recovery.resolve("before-restore", recovered)
+        self.assertEqual(recovery.import_unknown(recovered, "imported-recovery", {})["state"], "unknown")
+        recovery.resolve("imported-recovery", recovered, "rejected")
+        self.error("RECOVERY_REQUIRED", lambda: recovery.assert_owned(recovered, 1))
+        self.assertEqual(recovery.snapshot()["recovery"]["authorityId"], gate["authorityId"])
+        self.assertNotIn("never-leak", json.dumps(recovery.snapshot()))
+
+    def test_retired_authority_rejects_zero_budget_and_constructor(self):
+        writer = self.writer()
+        ticket = self.ticket(writer)
+        operation = writer.prepare(ticket, "late-result", {})
+        self.recovery(state="retired", handoffId=str(uuid.uuid4()))
+        for action in [lambda: writer.assert_owned(ticket), lambda: writer.assert_owned(operation, 0), lambda: writer.finish(operation, "confirmed"), lambda: writer.import_unknown(ticket, "late-import", {}), lambda: writer.resolve("late-result", ticket), lambda: writer.claim([identity()]), lambda: writer.bind("other", identity("101"), 1), self.writer]:
+            self.error("AUTHORITY_RETIRED", action)
+        self.assertEqual(writer.snapshot()["recovery"]["state"], "retired")
+        writer.close()
+
+    def test_invalid_missing_or_unknown_recovery_metadata_is_not_repaired(self):
+        writer = self.writer()
+        ticket = self.ticket(writer)
+        good = writer.snapshot()["recovery"]
+        cases = [("{", "INVALID_RECOVERY_STATE"), (json.dumps({**good, "schemaVersion": 2}), "UNSUPPORTED_RECOVERY_SCHEMA"), (json.dumps({**good, "schemaVersion": True}), "INVALID_RECOVERY_STATE"), (json.dumps({**good, "authorityId": "invalid"}), "INVALID_RECOVERY_STATE"), (json.dumps({**good, "admittedTarget": []}), "INVALID_RECOVERY_STATE"), (None, "INVALID_RECOVERY_STATE")]
+        for raw, expected in cases:
+            with closing(sqlite3.connect(self.database_path)) as database:
+                database.execute("DELETE FROM aw_meta WHERE key='recovery_state'")
+                if raw is not None:
+                    database.execute("INSERT INTO aw_meta VALUES ('recovery_state',?)", (raw,))
+                database.commit()
+            self.error(expected, lambda: writer.assert_owned(ticket, 0))
+            self.error(expected, self.writer)
+            self.error(expected, writer.snapshot)
+        writer.close()
+
+    def test_m1_initialization_preserves_new_authority_on_subsequent_start(self):
+        old = self.writer()
+        old.close()
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("DELETE FROM aw_meta WHERE key IN ('recovery_state','recovery_schema')")
+            database.commit()
+        first = self.writer()
+        second = self.writer("hub")
+        self.assertEqual(first.snapshot()["recovery"], second.snapshot()["recovery"])
+        self.assertEqual(first.snapshot()["recovery"]["state"], "normal")
+
+    def test_published_m1_and_m2_registry_never_recreate_missing_marker(self):
+        writer = self.writer()
+        writer.close()
+        marker = Path(self.database_path + ".required")
+        for state in ("normal", "quarantine", "retired"):
+            self.recovery(state=state)
+            body = marker.read_bytes()
+            before = Path(self.database_path).read_bytes()
+            marker.unlink()
+            self.error("REGISTRY_MISSING", self.writer)
+            self.assertFalse(marker.exists())
+            self.assertEqual(Path(self.database_path).read_bytes(), before)
+            marker.write_bytes(body)
+            marker.chmod(0o600)
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("DELETE FROM aw_meta WHERE key IN ('recovery_schema','recovery_state')")
+            database.commit()
+        marker.unlink()
+        self.error("REGISTRY_MISSING", self.writer)
+        self.assertFalse(marker.exists())
+
+    def test_normal_registry_clone_without_marker_does_not_rebind(self):
+        writer = self.writer()
+        writer.close()
+        copied = Path(self.directory.name) / "copied.sqlite"
+        before = Path(self.database_path).read_bytes()
+        copied.write_bytes(before)
+        copied.chmod(0o600)
+        self.database_path = str(copied)
+        self.error("REGISTRY_MISSING", self.writer)
+        self.assertFalse(Path(str(copied) + ".required").exists())
+        self.assertEqual(copied.read_bytes(), before)
+
+    def test_rejected_registry_with_crash_wal_is_read_only(self):
+        script = 'import os,sys; sys.path.insert(0,sys.argv[2]); from account_writer import AccountWriter; w=AccountWriter(sys.argv[1],"greeks","crashed"); os._exit(0)'
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, self.database_path, str(Path(__file__).resolve().parents[1] / "server" / "execution")], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wal = Path(self.database_path + "-wal")
+        self.assertGreater(wal.stat().st_size, 0)
+        Path(self.database_path + ".required").unlink()
+        main_before, wal_before = Path(self.database_path).read_bytes(), wal.read_bytes()
+        self.error("REGISTRY_MISSING", self.writer)
+        self.assertEqual(Path(self.database_path).read_bytes(), main_before)
+        self.assertEqual(wal.read_bytes(), wal_before)
+        self.assertFalse(Path(self.database_path + ".required").exists())
 
     def test_identity_and_binding_revision(self):
         self.assertEqual(account_key(identity("000123")), account_key(identity("123", parentAccountId="5")))

@@ -22,11 +22,14 @@ import time
 import uuid
 
 TTL_MS = 60_000
+RECOVERY_SCHEMA_VERSION = 1
 HEARTBEAT_MS = 5_000
 SAFETY_MS = 10_000
 AUTHORITIES = frozenset(("binance", "bybit", "okx", "gate-crossex", "aster"))
 ENVIRONMENTS = frozenset(("mainnet", "testnet", "demo"))
 SECRET_KEY = re.compile(r"^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$", re.I)
+RECOVERY_IDS = ("authorityId", "recoveryId", "checkpointId", "handoffId", "sourceAuthorityId")
+UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 class AccountWriterError(RuntimeError):
@@ -210,6 +213,58 @@ def _safe_database_path(value):
     return str(database)
 
 
+def _registry_marker_admission(database, database_path):
+    required = Path(database_path + ".required")
+    deadline = time.monotonic() + 0.75
+
+    def reject_missing():
+        if required.exists() or required.is_symlink():
+            return False
+        _fail("REGISTRY_MISSING")
+
+    tables = [row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+    while True:
+        if required.exists() or required.is_symlink():
+            return False
+        meta = dict(database.execute("SELECT key,value FROM aw_meta WHERE key IN ('registry_id','recovery_schema','recovery_state')")) if "aw_meta" in tables else {}
+        if any(key != "registry_id" for key in meta):
+            # A concurrent cold publisher can finish between the path and meta reads.
+            return reject_missing()
+        registry_id = meta.get("registry_id")
+        if registry_id is None:
+            known = ("aw_meta", "aw_owners", "aw_bindings", "aw_accounts", "aw_operations", "aw_operation_accounts", "aw_isolations")
+            if any(name not in known for name in tables):
+                return reject_missing()
+            for name in tables:
+                query = "SELECT 1 FROM aw_meta WHERE key<>'schema' LIMIT 1" if name == "aw_meta" else f"SELECT 1 FROM {name} LIMIT 1"
+                if database.execute(query).fetchone() is not None:
+                    return reject_missing()
+            return True
+        if not isinstance(registry_id, str) or not UUID_PATTERN.fullmatch(registry_id):
+            _fail("REGISTRY_REPLACED")
+        expected = {"schema": 1, "registryId": registry_id, **_file_identity(database_path)}
+        prefix = required.name + ".tmp-"
+        for name in os.listdir(required.parent):
+            if not name.startswith(prefix):
+                continue
+            match = re.fullmatch(r"([1-9][0-9]*)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", name[len(prefix):])
+            if match is None or not _default_alive(int(match[1])):
+                continue
+            target = required.parent / name
+            try:
+                info = target.lstat()
+                if not stat.S_ISREG(info.st_mode) or target.is_symlink() or info.st_nlink != 1 or info.st_size > 1024 or (os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077)):
+                    continue
+                evidence = json.loads(target.read_text(encoding="utf-8"))
+                if isinstance(evidence, dict) and type(evidence.get("schema")) is int and evidence == expected:
+                    return True
+            except (OSError, ValueError):
+                continue
+        if time.monotonic() >= deadline:
+            return reject_missing()
+        time.sleep(0.01)
+
+
 def _file_identity(target):
     value = Path(target)
     info = value.lstat()
@@ -338,6 +393,12 @@ def _synchronized(method):
 
 
 class AccountWriter:
+    recovery_protection_version = RECOVERY_SCHEMA_VERSION
+
+    @property
+    def recoveryProtectionVersion(self):
+        return RECOVERY_SCHEMA_VERSION
+
     def __init__(self, database_path, module_id, runtime_id, owner_id=None, pid=None, now=None, process_alive=None):
         self.module_id = _identifier(module_id)
         self.runtime_id = _identifier(runtime_id)
@@ -357,9 +418,17 @@ class AccountWriter:
         self._db = None
         try:
             self.database_path = _safe_database_path(database_path)
+            if os.stat(self.database_path).st_size > 0:
+                admission = sqlite3.connect(Path(self.database_path).as_uri() + "?mode=ro", uri=True, timeout=0.75, isolation_level=None)
+                try:
+                    admission.execute("PRAGMA busy_timeout=750")
+                    _registry_marker_admission(admission, self.database_path)
+                finally:
+                    admission.close()
             self._db = sqlite3.connect(self.database_path, timeout=0.75, isolation_level=None, check_same_thread=False)
             self._db.row_factory = sqlite3.Row
             self._db.execute("PRAGMA busy_timeout=750")
+            _registry_marker_admission(self._db, self.database_path)
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.execute("PRAGMA foreign_keys=ON")
@@ -368,7 +437,7 @@ class AccountWriter:
                 _fail("UNSUPPORTED_SCHEMA")
             self._register_file()
             current = self._time()
-            self._transaction(lambda: self._db.execute("INSERT INTO aw_owners VALUES (?,?,?,?,?,?)", (self.owner_id, self.module_id, self.runtime_id, self.pid, "active", current)))
+            self._transaction(lambda: self._db.execute("INSERT INTO aw_owners VALUES (?,?,?,?,?,?)", (self.owner_id, self.module_id, self.runtime_id, self.pid, "active", current)), initialize_recovery=True)
         except Exception as error:
             if self._db is not None:
                 self._db.close()
@@ -384,7 +453,7 @@ class AccountWriter:
             raise error
         _fail("REGISTRY_BUSY" if re.search("busy|locked", str(error), re.I) else "REGISTRY_UNAVAILABLE")
 
-    def _transaction(self, action):
+    def _transaction(self, action, initialize_recovery=False, closing=False):
         with self._lock:
             started = False
             try:
@@ -392,6 +461,13 @@ class AccountWriter:
                     self._check_registry_file()
                 self._db.execute("BEGIN IMMEDIATE")
                 started = True
+                if initialize_recovery:
+                    if self._db.execute("SELECT 1 FROM aw_meta WHERE key='recovery_state'").fetchone() is None and self._db.execute("SELECT 1 FROM aw_meta WHERE key='recovery_schema'").fetchone() is not None:
+                        _fail("INVALID_RECOVERY_STATE")
+                    self._db.execute("INSERT OR IGNORE INTO aw_meta VALUES ('recovery_state',?)", (_json({"schemaVersion": 1, "authorityId": str(uuid.uuid4()), "state": "normal"}),))
+                    self._db.execute("INSERT OR IGNORE INTO aw_meta VALUES ('recovery_schema','1')")
+                if not closing:
+                    self._recovery_gate(0)
                 result = action()
                 if hasattr(self, "_registry_identity"):
                     self._check_registry_file()
@@ -405,11 +481,59 @@ class AccountWriter:
                         pass
                 self._error(error)
 
+    def _recovery_state(self):
+        schema = self._db.execute("SELECT value FROM aw_meta WHERE key='recovery_schema'").fetchone()
+        if schema is not None and schema[0] != "1":
+            _fail("UNSUPPORTED_RECOVERY_SCHEMA")
+        row = self._db.execute("SELECT value FROM aw_meta WHERE key='recovery_state'").fetchone()
+        raw = row[0] if row is not None else None
+        try:
+            if not isinstance(raw, str) or len(raw.encode("utf-8")) > 65536:
+                _fail("INVALID_RECOVERY_STATE")
+            value = json.loads(raw, parse_constant=lambda _: _fail("INVALID_RECOVERY_STATE"))
+        except AccountWriterError:
+            raise
+        except Exception:
+            _fail("INVALID_RECOVERY_STATE")
+        version = value.get("schemaVersion") if isinstance(value, dict) else None
+        if isinstance(version, bool) or not isinstance(version, (int, float)) or not math.isfinite(version) or version != int(version) or abs(version) > 9007199254740991:
+            _fail("INVALID_RECOVERY_STATE")
+        if value["schemaVersion"] != 1:
+            _fail("UNSUPPORTED_RECOVERY_SCHEMA")
+        if any(key not in ("schemaVersion", "state", "admittedTarget", *RECOVERY_IDS) for key in value) or value.get("state") not in ("normal", "quarantine", "retired") or not isinstance(value.get("authorityId"), str) or not UUID_PATTERN.fullmatch(value["authorityId"]):
+            _fail("INVALID_RECOVERY_STATE")
+        for key in RECOVERY_IDS:
+            if key in value and (not isinstance(value[key], str) or not UUID_PATTERN.fullmatch(value[key])):
+                _fail("INVALID_RECOVERY_STATE")
+        if "admittedTarget" in value and not isinstance(value["admittedTarget"], dict):
+            _fail("INVALID_RECOVERY_STATE")
+        return value
+
+    def _recovery_gate(self, budget_ms):
+        value = self._recovery_state()
+        if value["state"] == "retired":
+            _fail("AUTHORITY_RETIRED")
+        if value["state"] == "quarantine" and budget_ms > 0:
+            _fail("RECOVERY_REQUIRED")
+        return value
+
     def _register_file(self):
+        may_publish = _registry_marker_admission(self._db, self.database_path)
         self._registry_identity = _file_identity(self.database_path)
-        self._db.execute("INSERT OR IGNORE INTO aw_meta VALUES ('registry_id',?)", (str(uuid.uuid4()),))
-        self._registry_id = self._db.execute("SELECT value FROM aw_meta WHERE key='registry_id'").fetchone()[0]
+        if may_publish:
+            self._db.execute("INSERT OR IGNORE INTO aw_meta VALUES ('registry_id',?)", (str(uuid.uuid4()),))
+        row = self._db.execute("SELECT value FROM aw_meta WHERE key='registry_id'").fetchone()
+        self._registry_id = row[0] if row is not None else None
+        if not isinstance(self._registry_id, str) or not UUID_PATTERN.fullmatch(self._registry_id):
+            _fail("REGISTRY_REPLACED")
         self._required_path = self.database_path + ".required"
+        if not may_publish:
+            self._marker_identity = _read_required(self._required_path)["identity"]
+            if os.name != "nt" and os.stat(self._required_path).st_uid != os.getuid():
+                _fail("UNSAFE_DATABASE_PATH")
+            os.chmod(self._required_path, 0o600)
+            self._check_registry_file()
+            return
         content = _json({"schema": 1, "registryId": self._registry_id, **self._registry_identity})
         temporary = f"{self._required_path}.tmp-{os.getpid()}-{uuid.uuid4()}"
         descriptor = None
@@ -566,6 +690,7 @@ class AccountWriter:
             _fail("INVALID_TICKET")
         if isinstance(budget_ms, bool) or not isinstance(budget_ms, int) or not 0 <= budget_ms <= TTL_MS - SAFETY_MS:
             _fail("INVALID_BUDGET")
+        self._recovery_gate(budget_ms)
         self._owner(current)
         keys = set()
         for claim in ticket["claims"]:
@@ -663,7 +788,7 @@ class AccountWriter:
         current = self._time()
 
         def action():
-            self._validate(ticket, current, 35000)
+            self._validate(ticket, current, 0 if importing else 35000)
             old = self._db.execute("SELECT * FROM aw_operations WHERE operation_id=?", (operation_id,)).fetchone()
             if old is not None:
                 if old["module_id"] != self.module_id or old["body_hash"] != body_hash or old["account_keys"] != _json(keys):
@@ -789,13 +914,15 @@ class AccountWriter:
                 _fail("WRITER_CLOSED")
             try:
                 self._check_registry_file()
+                recovery_state = self._recovery_state()
+                recovery = {key: recovery_state[key] for key in ("schemaVersion", "state", *RECOVERY_IDS) if key in recovery_state}
                 current = self.now()
                 rows = self._db.execute("SELECT a.authority,a.environment,a.module_id,a.lease_until,o.status FROM aw_accounts a LEFT JOIN aw_owners o ON o.owner_id=a.owner_id ORDER BY a.authority,a.environment,a.module_id").fetchall()
                 accounts = [{"authority": row["authority"], "environment": row["environment"], "moduleId": row["module_id"], "state": "closed" if row["status"] == "closed" else "expired" if row["lease_until"] <= current else "owned"} for row in rows]
                 bindings = [{"authority": row["authority"], "environment": row["environment"], "moduleId": row["module_id"], "verified": bool(row["verified"]), "count": row["count"]} for row in self._db.execute("SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified")]
                 operations = [{"moduleId": row["module_id"], "state": row["state"], "count": row["count"]} for row in self._db.execute("SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state")]
                 isolations = [{"authority": row["authority"], "environment": row["environment"], "reason": row["reason"], "moduleId": row["module_id"]} for row in self._db.execute("SELECT authority,environment,reason,module_id FROM aw_isolations ORDER BY authority,environment,module_id")]
-                return {"accounts": accounts, "bindings": bindings, "operations": operations, "isolations": isolations}
+                return {"accounts": accounts, "bindings": bindings, "operations": operations, "isolations": isolations, "recovery": recovery}
             except Exception as error:
                 self._error(error)
 
@@ -809,7 +936,7 @@ class AccountWriter:
             if self.closed:
                 return
             try:
-                self._transaction(lambda: self._db.execute("UPDATE aw_owners SET status='closed' WHERE owner_id=?", (self.owner_id,)))
+                self._transaction(lambda: self._db.execute("UPDATE aw_owners SET status='closed' WHERE owner_id=?", (self.owner_id,)), closing=True)
             finally:
                 self.closed = True
                 self._db.close()

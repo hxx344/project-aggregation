@@ -4,11 +4,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const TTL_MS = 60_000;
+export const RECOVERY_SCHEMA_VERSION = 1;
 const HEARTBEAT_MS = 5_000;
 const SAFETY_MS = 10_000;
 const AUTHORITIES = new Set(['binance', 'bybit', 'okx', 'gate-crossex', 'aster']);
 const ENVIRONMENTS = new Set(['mainnet', 'testnet', 'demo']);
 const SECRET_KEY = /^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$/i;
+const RECOVERY_IDS = ['authorityId', 'recoveryId', 'checkpointId', 'handoffId', 'sourceAuthorityId'];
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export class AccountWriterError extends Error {
   constructor(code) { super(`Account execution control: ${code}`); this.name = 'AccountWriterError'; this.code = code; }
@@ -199,6 +202,41 @@ function readRequired(target) {
     return { identity: { dev: String(info.dev), ino: String(info.ino) }, evidence };
   }
 }
+function registryMarkerAdmission(database, databasePath) {
+  const required = `${databasePath}.required`; const deadline = performance.now() + 750;
+  const markerPresent = () => { try { fs.lstatSync(required); return true; } catch (error) { if (error.code !== 'ENOENT') throw error; return false; } };
+  const rejectMissing = () => { if (markerPresent()) return false; fail('REGISTRY_MISSING'); };
+  const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map((row) => row.name);
+  while (true) {
+    if (markerPresent()) return false;
+    const meta = tables.includes('aw_meta') ? database.prepare("SELECT key,value FROM aw_meta WHERE key IN ('registry_id','recovery_schema','recovery_state')").all() : [];
+    if (meta.some((row) => row.key !== 'registry_id')) {
+      // A concurrent cold publisher can finish between the path and meta reads.
+      return rejectMissing();
+    }
+    const registryId = meta.find((row) => row.key === 'registry_id')?.value;
+    if (registryId === undefined) {
+      const known = ['aw_meta', 'aw_owners', 'aw_bindings', 'aw_accounts', 'aw_operations', 'aw_operation_accounts', 'aw_isolations'];
+      if (tables.some((name) => !known.includes(name)) || tables.some((name) => name === 'aw_meta' ? database.prepare("SELECT 1 FROM aw_meta WHERE key<>'schema' LIMIT 1").get() : database.prepare(`SELECT 1 FROM ${name} LIMIT 1`).get())) return rejectMissing();
+      return true;
+    }
+    if (typeof registryId !== 'string' || !UUID.test(registryId)) fail('REGISTRY_REPLACED');
+    const expected = { schema: 1, registryId, ...fileIdentity(databasePath) }; const prefix = `${path.basename(required)}.tmp-`;
+    for (const name of fs.readdirSync(path.dirname(required)).filter((entry) => entry.startsWith(prefix))) {
+      const match = /^([1-9][0-9]*)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(name.slice(prefix.length));
+      if (!match || !defaultAlive(Number(match[1]))) continue;
+      const target = path.join(path.dirname(required), name);
+      try {
+        const info = fs.lstatSync(target);
+        if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > 1024 || (process.platform !== 'win32' && (info.uid !== process.getuid() || info.mode & 0o077))) continue;
+        const evidence = JSON.parse(fs.readFileSync(target, 'utf8'));
+        if (evidence && Object.keys(evidence).length === 4 && Object.keys(expected).every((key) => evidence[key] === expected[key])) return true;
+      } catch (error) { if (error instanceof AccountWriterError) throw error; }
+    }
+    if (performance.now() >= deadline) return rejectMissing();
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS aw_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO aw_meta VALUES ('schema','1');
@@ -215,19 +253,27 @@ const defaultAlive = (pid) => { try { process.kill(pid, 0); return true; } catch
 export function createAccountWriter(options) { return new AccountWriter(options); }
 
 export class AccountWriter {
+  get recoveryProtectionVersion() { return RECOVERY_SCHEMA_VERSION; }
   constructor({ databasePath, moduleId, runtimeId, ownerId = randomUUID(), pid = process.pid, now = Date.now, processAlive = defaultAlive }) {
     this.moduleId = identifier(moduleId); this.runtimeId = identifier(runtimeId); this.ownerId = identifier(ownerId);
     if (!Number.isSafeInteger(pid) || pid <= 0 || typeof now !== 'function' || typeof processAlive !== 'function') fail('INVALID_OPTIONS');
     this.pid = pid; this.now = now; this.processAlive = processAlive; this.retired = false; this.closed = false; this.timer = null; this.held = new Map();
     try {
       this.databasePath = safeDatabasePath(databasePath);
+      if (fs.statSync(this.databasePath).size > 0) {
+        const admission = new DatabaseSync(this.databasePath, { readOnly: true });
+        try { admission.exec('PRAGMA busy_timeout=750'); registryMarkerAdmission(admission, this.databasePath); }
+        finally { admission.close(); }
+      }
       this.db = new DatabaseSync(this.databasePath);
+      this.db.exec('PRAGMA busy_timeout=750');
+      registryMarkerAdmission(this.db, this.databasePath);
       this.db.exec('PRAGMA busy_timeout=750; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;');
       this.db.exec(SCHEMA);
       if (this.db.prepare("SELECT value FROM aw_meta WHERE key='schema'").get()?.value !== '1') fail('UNSUPPORTED_SCHEMA');
       this._registerFile();
       const time = this._time();
-      this._transaction(() => this.db.prepare('INSERT INTO aw_owners VALUES (?,?,?,?,?,?)').run(this.ownerId, this.moduleId, this.runtimeId, this.pid, 'active', time));
+      this._transaction(() => this.db.prepare('INSERT INTO aw_owners VALUES (?,?,?,?,?,?)').run(this.ownerId, this.moduleId, this.runtimeId, this.pid, 'active', time), { initializeRecovery: true });
     } catch (error) {
       this.db?.close();
       if (error instanceof AccountWriterError) throw error;
@@ -239,32 +285,68 @@ export class AccountWriter {
     if (error instanceof AccountWriterError) throw error;
     fail(/busy|locked/i.test(error?.message ?? '') ? 'REGISTRY_BUSY' : 'REGISTRY_UNAVAILABLE');
   }
-  _transaction(action) {
+  _transaction(action, { initializeRecovery = false, closing = false } = {}) {
     let started = false;
-    try { if (this.registryIdentity) this._checkRegistryFile(); this.db.exec('BEGIN IMMEDIATE'); started = true; const result = action(); if (this.registryIdentity) this._checkRegistryFile(); this.db.exec('COMMIT'); return result; }
+    try {
+      if (this.registryIdentity) this._checkRegistryFile();
+      this.db.exec('BEGIN IMMEDIATE'); started = true;
+      if (initializeRecovery) {
+        if (!this.db.prepare("SELECT 1 FROM aw_meta WHERE key='recovery_state'").get() && this.db.prepare("SELECT 1 FROM aw_meta WHERE key='recovery_schema'").get()) fail('INVALID_RECOVERY_STATE');
+        this.db.prepare("INSERT OR IGNORE INTO aw_meta VALUES ('recovery_state',?)").run(JSON.stringify({ schemaVersion: 1, authorityId: randomUUID(), state: 'normal' }));
+        this.db.prepare("INSERT OR IGNORE INTO aw_meta VALUES ('recovery_schema','1')").run();
+      }
+      if (!closing) this._recoveryGate(0);
+      const result = action();
+      if (this.registryIdentity) this._checkRegistryFile();
+      this.db.exec('COMMIT'); return result;
+    }
     catch (error) { if (started) try { this.db.exec('ROLLBACK'); } catch {} this._error(error); }
   }
+  _recoveryState() {
+    const schema = this.db.prepare("SELECT value FROM aw_meta WHERE key='recovery_schema'").get()?.value;
+    if (schema !== undefined && schema !== '1') fail('UNSUPPORTED_RECOVERY_SCHEMA');
+    const raw = this.db.prepare("SELECT value FROM aw_meta WHERE key='recovery_state'").get()?.value;
+    let value;
+    try { if (typeof raw !== 'string' || Buffer.byteLength(raw) > 65_536) fail('INVALID_RECOVERY_STATE'); value = JSON.parse(raw); }
+    catch (error) { if (error instanceof AccountWriterError) throw error; fail('INVALID_RECOVERY_STATE'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !Number.isSafeInteger(value.schemaVersion)) fail('INVALID_RECOVERY_STATE');
+    if (value.schemaVersion !== 1) fail('UNSUPPORTED_RECOVERY_SCHEMA');
+    if (Object.keys(value).some((key) => !['schemaVersion', 'state', 'admittedTarget', ...RECOVERY_IDS].includes(key)) || !['normal', 'quarantine', 'retired'].includes(value.state) || !UUID.test(value.authorityId ?? '')) fail('INVALID_RECOVERY_STATE');
+    for (const key of RECOVERY_IDS) if (Object.hasOwn(value, key) && (typeof value[key] !== 'string' || !UUID.test(value[key]))) fail('INVALID_RECOVERY_STATE');
+    if (Object.hasOwn(value, 'admittedTarget') && (!value.admittedTarget || typeof value.admittedTarget !== 'object' || Array.isArray(value.admittedTarget))) fail('INVALID_RECOVERY_STATE');
+    return value;
+  }
+  _recoveryGate(budgetMs) {
+    const value = this._recoveryState();
+    if (value.state === 'retired') fail('AUTHORITY_RETIRED');
+    if (value.state === 'quarantine' && budgetMs > 0) fail('RECOVERY_REQUIRED');
+    return value;
+  }
   _registerFile() {
+    const mayPublish = registryMarkerAdmission(this.db, this.databasePath);
     this.registryIdentity = fileIdentity(this.databasePath);
-    this.db.prepare("INSERT OR IGNORE INTO aw_meta VALUES ('registry_id',?)").run(randomUUID());
-    this.registryId = this.db.prepare("SELECT value FROM aw_meta WHERE key='registry_id'").get().value;
+    if (mayPublish) this.db.prepare("INSERT OR IGNORE INTO aw_meta VALUES ('registry_id',?)").run(randomUUID());
+    this.registryId = this.db.prepare("SELECT value FROM aw_meta WHERE key='registry_id'").get()?.value;
+    if (typeof this.registryId !== 'string' || !UUID.test(this.registryId)) fail('REGISTRY_REPLACED');
     this.requiredPath = `${this.databasePath}.required`;
-    const content = JSON.stringify({ schema: 1, registryId: this.registryId, ...this.registryIdentity });
-    const temporary = `${this.requiredPath}.tmp-${process.pid}-${randomUUID()}`;
-    let descriptor;
-    try {
-      descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-      fs.writeFileSync(descriptor, content); fs.fsyncSync(descriptor);
-      fs.closeSync(descriptor); descriptor = undefined;
-      try { fs.linkSync(temporary, this.requiredPath); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-      fs.unlinkSync(temporary);
-      if (process.platform !== 'win32') {
-        const directory = fs.openSync(path.dirname(this.requiredPath), fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
-        try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    if (mayPublish) {
+      const content = JSON.stringify({ schema: 1, registryId: this.registryId, ...this.registryIdentity });
+      const temporary = `${this.requiredPath}.tmp-${process.pid}-${randomUUID()}`;
+      let descriptor;
+      try {
+        descriptor = fs.openSync(temporary, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+        fs.writeFileSync(descriptor, content); fs.fsyncSync(descriptor);
+        fs.closeSync(descriptor); descriptor = undefined;
+        try { fs.linkSync(temporary, this.requiredPath); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+        fs.unlinkSync(temporary);
+        if (process.platform !== 'win32') {
+          const directory = fs.openSync(path.dirname(this.requiredPath), fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
+          try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+        }
+      } finally {
+        if (descriptor !== undefined) fs.closeSync(descriptor);
+        try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
       }
-    } finally {
-      if (descriptor !== undefined) fs.closeSync(descriptor);
-      try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     this.markerIdentity = readRequired(this.requiredPath).identity;
     if (process.platform !== 'win32' && fs.statSync(this.requiredPath).uid !== process.getuid()) fail('UNSAFE_DATABASE_PATH');
@@ -355,6 +437,7 @@ export class AccountWriter {
   _validate(ticket, time, budgetMs, renewAlways = false) {
     if (!ticket || ticket.ownerId !== this.ownerId || ticket.moduleId !== this.moduleId || ticket.runtimeId !== this.runtimeId || !Array.isArray(ticket.claims) || !ticket.claims.length || !Array.isArray(ticket.bindings)) fail('INVALID_TICKET');
     if (!Number.isSafeInteger(budgetMs) || budgetMs < 0 || budgetMs > TTL_MS - SAFETY_MS) fail('INVALID_BUDGET');
+    this._recoveryGate(budgetMs);
     this._owner(time);
     const keys = new Set();
     for (const claim of ticket.claims) {
@@ -417,7 +500,7 @@ export class AccountWriter {
     const groupId = payload && typeof payload === 'object' && !Array.isArray(payload) && payload.groupId != null ? identifier(payload.groupId, 'INVALID_GROUP_ID') : operationId;
     const intent = intentMetadata(keys, payload);
     return this._transaction(() => {
-      this._validate(ticket, time, 35_000);
+      this._validate(ticket, time, importing ? 0 : 35_000);
       const old = this.db.prepare('SELECT * FROM aw_operations WHERE operation_id=?').get(operationId);
       if (old) {
         if (old.module_id !== this.moduleId || old.body_hash !== hash || old.account_keys !== JSON.stringify(keys)) fail('OPERATION_CONFLICT');
@@ -503,17 +586,20 @@ export class AccountWriter {
     if (this.closed) fail('WRITER_CLOSED');
     try {
       this._checkRegistryFile();
+      const recoveryState = this._recoveryState();
+      const recovery = { schemaVersion: recoveryState.schemaVersion, state: recoveryState.state };
+      for (const key of RECOVERY_IDS) if (Object.hasOwn(recoveryState, key)) recovery[key] = recoveryState[key];
       const accounts = this.db.prepare('SELECT authority,environment,module_id,lease_until,owner_id FROM aw_accounts ORDER BY authority,environment,module_id').all();
       const current = this.now();
       const isolations = this.db.prepare('SELECT authority,environment,reason,module_id FROM aw_isolations ORDER BY authority,environment,module_id').all().map((row) => ({ authority: row.authority, environment: row.environment, reason: row.reason, moduleId: row.module_id }));
-      return { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations };
+      return { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations, recovery };
     } catch (error) { this._error(error); }
   }
   close() {
     // The adapter must stop new requests and drain all in-flight transport before close.
     if (this.closed) return;
     if (this.timer) clearInterval(this.timer); this.timer = null;
-    try { this._transaction(() => this.db.prepare("UPDATE aw_owners SET status='closed' WHERE owner_id=?").run(this.ownerId)); }
+    try { this._transaction(() => this.db.prepare("UPDATE aw_owners SET status='closed' WHERE owner_id=?").run(this.ownerId), { closing: true }); }
     finally { this.closed = true; this.db.close(); }
   }
 }

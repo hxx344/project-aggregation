@@ -987,3 +987,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基于 `c76b196` 的 2026-10-19 M1 提交前独立审查：真实 SQLite 注入 IOERR 得到 HTTP 0 次、私库订单结束却丢失标识、共享 sending 仍为 1；双 repair 终态后重启仍残留包含两条 CID 的父操作；操作拒绝后共享未决已归零却仍无法从页面重新确认。修复与独立增量探针确认原标识保留、按实际批次结算且下一次合法交易可进行。均为本次未发布实现的审查发现，不计为基线已发布缺陷。
 
 **事件记录：** `shared-admission-private-journal-recovery-20261019`；一次共享准入集成审查及其同类路径修复，不推进主线复盘检查点。
+
+### L063：恢复检查点须保留秘密材料、真实未决状态与原服务可用性
+
+**适用条件：** 跨模块制作冷备份、隔离恢复或一次性转移交易 authority，尤其由 root 工具操作服务账户拥有的 SQLite 数据。
+
+**根因：** 按文件名猜测秘密材料会漏掉迁移后的通知签名；当前成交量已处理完不能证明 ADL 原单已终结。把 schema/JSON 错误与业务未决混为一类会发布不可用恢复目录；只读 SQLite 也可能创建不同 UID 的 WAL/SHM，主文件的旧 gate 又不能替代已提交 WAL。仅创建新目标并 chown 不能保证服务账户可遍历已有父目录。
+
+**以后做法：** 普通配置与未知文件默认进入独立 secrets 载荷；按真实订单终态和完整日志判断静止。隔离恢复仅容许明确、结构有效的业务未决，未知或损坏结构拒绝发布；普通恢复不能依赖已丢失的源。冷读只有无待提交 WAL 时使用 immutable；真实 WAL 优先，持真实生命周期锁才能 checkpoint，并处理本工具遗留的合法 root sidecar，禁止收编陌生 UID 文件。恢复前以实际服务身份验证父链可遍历性；文本限制按 UTF-8 字节执行。
+
+**如何验证：** [备份回归](tests/recovery-backup.test.mjs) 覆盖真实通知迁移、损坏状态、双密钥、WAL gate 与 Unicode 字节限额；[准入分类](tests/recovery-admission.test.mjs) 覆盖零成交和部分成交的非终态 ADL；[POSIX 探针](tests/recovery-backup-posix.test.mjs) 与 [操作入口](tests/test_recovery_operations.py) 在非 WSL Linux CI 验证 root SIGKILL 残留、原服务 UID 重开、父链和缺源恢复。本机跳过的 POSIX 项不能描述为已通过。
+
+**证据：** project-aggregation 基于 `56cdb9e` 的 2026-10-19 M2 提交前独立审查，复现通知签名进入 data 载荷、非终态 ADL 被误判静止、损坏日志被误容许，以及 1024 字节预算接受 1554 字节中文 JSON；相关 Windows 增量探针已验证修复。root 空 WAL/SHM 和父链后果在同轮审查中定位，Linux 故障探针随本批 CI 实测，不把代码存在等同运行通过。均属本次未发布实现的连续修补。
+
+**事件记录：** `cold-recovery-authority-boundary-20261019`；本次恢复集成审查归为一个事件，不推进历史复盘检查点。

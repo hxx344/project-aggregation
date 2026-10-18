@@ -112,7 +112,7 @@ export async function createPythonModule({ root, secret, env, executable, applic
         const response = { destroyed: false, writeHead(value) { status = value; return this; }, end(body) {
           try {
             const value = JSON.parse(Buffer.from(body || '').toString('utf8'));
-            if (status !== 200 || value.writerProtectionVersion !== 1 || typeof value.ready !== 'boolean' || !Number.isInteger(value.registeredConnections) || value.registeredConnections < 0) throw new Error('Invalid writer status');
+            if (status !== 200 || value.writerProtectionVersion !== 1 || value.recoveryProtectionVersion !== 1 || typeof value.ready !== 'boolean' || !Number.isInteger(value.registeredConnections) || value.registeredConnections < 0) throw new Error('Invalid writer status');
             resolve();
           } catch { reject(new Error(`${label} shared account protection is unavailable`)); }
         } };
@@ -122,7 +122,7 @@ export async function createPythonModule({ root, secret, env, executable, applic
     } catch (error) { closing = true; fail(); child.kill(); await exited; throw error; }
   }
   let closePromise;
-  return { server, child, writerProtectionVersion: requireWriterProtection ? 1 : null, close() {
+  return { server, child, writerProtectionVersion: requireWriterProtection ? 1 : null, recoveryProtectionVersion: requireWriterProtection ? 1 : null, close() {
     return closePromise ??= (async () => {
       closing = true; ready = false;
       for (const { response, timer } of pending.values()) { clearTimeout(timer); if (!response.destroyed) response.writeHead(503).end(`${label} shutting down`); }

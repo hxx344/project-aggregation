@@ -30,7 +30,7 @@ export async function createModule({ root, dataDir, environment, transports }) {
       tcpListeners: process._getActiveHandles().filter(handle => handle instanceof net.Server && handle.listening && typeof handle.address() !== 'string').length }));
     if (req.url === '/crash') setTimeout(() => process.exit(27), 20);
   });
-  return { server, writerProtectionVersion: environment.FIXTURE_START === 'unguarded' ? null : 1, close() {
+  return { server, writerProtectionVersion: environment.FIXTURE_START === 'unguarded' ? null : 1, recoveryProtectionVersion: environment.FIXTURE_START === 'legacy-recovery' ? null : 1, close() {
     return closing ??= (async () => {
       await delay(Number(environment.FIXTURE_CLOSE_DELAY_MS || 0));
       if (server.listening) await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
@@ -181,6 +181,26 @@ test('a trading worker cannot become ready without its real protection handshake
   await assert.rejects(bounded(f.start(), 5000, 'guard handshake'), /crossex:|crossex exited/);
   assertUnavailable();
   for (const row of await f.records()) assert.equal(hasProcess(row.pid), false);
+});
+
+test('a trading worker cannot advertise recovery protection using an older executor', { timeout: 15000 }, async t => {
+  const f = await fixture(t, { modes: { crossex: 'legacy-recovery' } });
+  await assert.rejects(bounded(f.start(), 5000, 'recovery handshake'), /crossex:|crossex exited/);
+  assertUnavailable();
+  for (const row of await f.records()) assert.equal(hasProcess(row.pid), false);
+});
+
+test('parent can drain real workers during startup before a complete runtime is returned', { timeout: 15000 }, async t => {
+  const f = await fixture(t, { modes: { asset: 'hang' } });
+  let startup;
+  const starting = f.start({ onStarting: handle => { startup = handle; } });
+  const rejected = assert.rejects(starting, /startup|exited|interrupted/);
+  const deadline = Date.now() + 3000;
+  while ((await f.records()).length < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal((await f.records()).length, 2);
+  await startup.close(); await rejected;
+  for (const row of await f.records()) assert.equal(hasProcess(row.pid), false);
+  assertUnavailable();
 });
 
 test('spawn failure without a PID rejects promptly and still cleans up a ready peer', { timeout: 15000 }, async t => {

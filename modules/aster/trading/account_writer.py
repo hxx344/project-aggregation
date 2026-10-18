@@ -643,6 +643,7 @@ class ManagedWriter:
 
     def status(self):
         return {"writerProtectionVersion": 1 if self.enabled and self.registry is not None else None,
+                "recoveryProtectionVersion": getattr(self.registry, "recovery_protection_version", None),
                 "ready": self.ready, "registeredConnections": len(self.connections), "error": self.error}
 
     def close(self):

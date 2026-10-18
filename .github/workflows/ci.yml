@@ -74,6 +74,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.15.0'
+      - name: Verify recovery guard, cold-stop ownership and real cgroup isolation
+        run: |
+          sudo env RECOVERY_TEST_NODE="$(command -v node)" python3 -I tests/test_recovery_operations.py -v
+          sudo "$(command -v node)" --test tests/recovery-backup-posix.test.mjs
+          sudo env AGG_RECOVERY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-recovery-systemd.sh
       - name: Check release download, integrity, extraction and cache boundaries
         run: |
           python3 deploy/test-release.py -v

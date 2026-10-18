@@ -9,7 +9,7 @@ import { moduleCatalog } from './catalog.mjs';
 import { registerModuleTransport } from './transport.mjs';
 
 const repository = fileURLToPath(new URL('../..', import.meta.url));
-export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, timeoutMs = 120_000, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
+export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, timeoutMs = 120_000, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
   if (path.resolve(writerContext.databasePath) !== path.join(path.resolve(dataDir), 'execution-control.sqlite') || !/^[a-f0-9-]{36}$/.test(writerContext.runtimeId)) throw new Error('Invalid writer runtime context');
   const directory = mkdtempSync(path.join(tmpdir(), 'workbench-'));
   const children = [], unregister = [];
@@ -34,6 +34,9 @@ export async function startModules({ dataDir, root = repository, logger = consol
     return closing;
   }
   try {
+    // Publish cleanup before the first worker await. The parent must be able
+    // to drain a partially started group when its lifecycle lock is lost.
+    onStarting({ close });
     // Sequential readiness keeps resource use bounded and starts Monitor before
     // CrossEx, which consumes its opportunities over the private pipe.
     for (const { id } of moduleCatalog) {

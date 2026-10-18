@@ -24,7 +24,7 @@ test('baseline endpoints require a live same-origin session and never refresh so
   const origin = `http://127.0.0.1:${app.server.address().port}`;
   const login = await fetch(origin + '/api/login', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'architecture-test-password' }) });
   const cookie = login.headers.get('set-cookie').split(';')[0], { csrfToken } = await login.json();
-  for (const route of ['/api/system/metrics', '/api/system/architecture', '/api/system/accounts']) {
+  for (const route of ['/api/system/metrics', '/api/system/architecture', '/api/system/accounts', '/api/system/recovery']) {
     assert.equal((await fetch(origin + route)).status, 401);
     assert.equal((await fetch(origin + route, { headers: { Cookie: cookie, Origin: 'https://wrong.example' } })).status, 403);
     assert.equal((await fetch(origin + route, { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'same-site' } })).status, 403);
@@ -35,6 +35,7 @@ test('baseline endpoints require a live same-origin session and never refresh so
     const value = await response.json();
     assert.equal(value.schemaVersion, 1);
     if (route.endsWith('metrics')) { assert.equal(value.sampling.retainedBuckets, 0); assert.equal(value.summaries.missing, 6); }
+    else if (route.endsWith('recovery')) { assert.equal(value.enabled, true); assert.equal(value.recovery.state, 'normal'); assert.equal(JSON.stringify(value).includes(identity.accountId), false); }
     else if (route.endsWith('accounts')) {
       assert.equal(value.enabled, true); assert.equal(value.accounts.length, 1);
       assert.deepEqual(value.operations, [{ moduleId: 'hub', state: 'sending', count: 1 }]);

@@ -27,5 +27,5 @@ export async function createModule({ root, dataDir, secret, environment = {}, tr
     ...(accountWriter ? { liveOptions: { accountWriter } } : {}),
   }); } catch (error) { accountWriter?.close(); throw error; }
   const close = app.close.bind(app);
-  return { ...app, writerProtectionVersion: accountWriter ? 1 : null, async close() { await close(); accountWriter?.close(); } };
+  return { ...app, writerProtectionVersion: accountWriter ? 1 : null, recoveryProtectionVersion: accountWriter?.recoveryProtectionVersion ?? null, async close() { await close(); accountWriter?.close(); } };
 }

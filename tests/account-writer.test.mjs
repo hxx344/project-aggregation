@@ -21,6 +21,15 @@ function fixture(t) {
 }
 function bindClaim(writer, values = [identity()]) { values.forEach((value, index) => writer.bind(`connection-${index}`, value, 1)); return writer.claim(values); }
 function readRow(databasePath, sql, ...args) { const database = new DatabaseSync(databasePath, { readOnly: true }); try { return database.prepare(sql).get(...args); } finally { database.close(); } }
+function recoveryState(databasePath, update) {
+  const database = new DatabaseSync(databasePath);
+  try {
+    const old = JSON.parse(database.prepare("SELECT value FROM aw_meta WHERE key='recovery_state'").get().value);
+    const next = { ...old, ...update };
+    database.prepare("UPDATE aw_meta SET value=? WHERE key='recovery_state'").run(JSON.stringify(next));
+    return next;
+  } finally { database.close(); }
+}
 
 test('account identity is independent of API key revision, parent, and decimal UID formatting', (t) => {
   const f = fixture(t); const writer = f.writer();
@@ -239,6 +248,49 @@ test('persistent required marker rejects registry disappearance and replacement 
   assert.throws(() => recovered.claim([identity()]), code('WRITER_RETIRED'));
 });
 
+test('missing published marker never reinitializes an M1 or M2 registry', (t) => {
+  const f = fixture(t); const writer = f.writer(); writer.close();
+  for (const state of ['normal', 'quarantine', 'retired']) {
+    recoveryState(f.databasePath, { state });
+    const marker = `${f.databasePath}.required`; const body = fs.readFileSync(marker);
+    const before = fs.readFileSync(f.databasePath);
+    fs.unlinkSync(marker);
+    assert.throws(() => f.writer('greeks'), code('REGISTRY_MISSING'));
+    assert.equal(fs.existsSync(marker), false);
+    assert.deepEqual(fs.readFileSync(f.databasePath), before);
+    fs.writeFileSync(marker, body, { mode: 0o600 });
+  }
+  const db = new DatabaseSync(f.databasePath);
+  try { db.prepare("DELETE FROM aw_meta WHERE key IN ('recovery_schema','recovery_state')").run(); } finally { db.close(); }
+  fs.unlinkSync(`${f.databasePath}.required`);
+  assert.throws(() => f.writer('greeks'), code('REGISTRY_MISSING'));
+  assert.equal(fs.existsSync(`${f.databasePath}.required`), false);
+});
+
+test('a copied normal registry without its published marker cannot self-bind to a new inode', (t) => {
+  const f = fixture(t); const writer = f.writer(); writer.close();
+  const copied = path.join(f.directory, 'copied.sqlite'); fs.copyFileSync(f.databasePath, copied);
+  const before = fs.readFileSync(copied);
+  assert.throws(() => createAccountWriter({ databasePath: copied, moduleId: 'hub', runtimeId: crypto.randomUUID() }), code('REGISTRY_MISSING'));
+  assert.equal(fs.existsSync(`${copied}.required`), false);
+  assert.deepEqual(fs.readFileSync(copied), before);
+});
+
+test('missing marker rejection preserves the main database and valid crash WAL byte for byte', (t) => {
+  const f = fixture(t);
+  const script = 'import os,sys; sys.path.insert(0,sys.argv[2]); from account_writer import AccountWriter; w=AccountWriter(sys.argv[1],"greeks","crashed"); os._exit(0)';
+  const result = spawnSync(pythonCommand, ['-I', '-B', '-c', script, f.databasePath, fileURLToPath(new URL('../server/execution/', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 10_000 });
+  assert.equal(result.status, 0, result.stderr);
+  const wal = `${f.databasePath}-wal`;
+  assert.ok(fs.statSync(wal).size > 0);
+  fs.unlinkSync(`${f.databasePath}.required`);
+  const mainBefore = fs.readFileSync(f.databasePath); const walBefore = fs.readFileSync(wal);
+  assert.throws(() => f.writer('hub'), code('REGISTRY_MISSING'));
+  assert.deepEqual(fs.readFileSync(f.databasePath), mainBefore);
+  assert.deepEqual(fs.readFileSync(wal), walBefore);
+  assert.equal(fs.existsSync(`${f.databasePath}.required`), false);
+});
+
 async function pythonPeer(t, databasePath, moduleId = 'greeks', options = {}) {
   const peer = spawn(pythonCommand, [fileURLToPath(new URL('./account-writer-peer.py', import.meta.url)), JSON.stringify({ databasePath, moduleId, runtimeId: crypto.randomUUID(), ...options })], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   const pending = new Map(); let sequence = 0; let stderr = '';
@@ -406,9 +458,87 @@ test('five-second heartbeat isolates one account while renewing unrelated accoun
   assert.equal(writer.retired, false);
 });
 
+test('quarantine gates Node and Python late send while preserving zero budget recovery', async (t) => {
+  const f = fixture(t); const node = f.writer('hub');
+  const nodeTicket = bindClaim(node, [identity('8811')]);
+  const nodePayload = { clientId: 'persisted-node' };
+  const nodeOperation = node.prepare(nodeTicket, 'quarantine-node', nodePayload);
+  const peer = await pythonPeer(t, f.databasePath, 'greeks');
+  await peer.call('bind', 'python', identity('8822'), 1);
+  const pythonTicket = (await peer.call('claim', [identity('8822')])).result;
+  const pythonOperation = (await peer.call('prepare', pythonTicket, 'quarantine-python', { clientId: 'persisted-python' })).result;
+  const gate = recoveryState(f.databasePath, { state: 'quarantine', recoveryId: crypto.randomUUID(), checkpointId: crypto.randomUUID(), admittedTarget: { accountId: 'must-not-leak' } });
+  assert.equal(node.recoveryProtectionVersion, 1);
+  assert.throws(() => node.assertOwned(nodeOperation), code('RECOVERY_REQUIRED'));
+  assert.throws(() => node.prepare(nodeTicket, 'fresh-node', {}), code('RECOVERY_REQUIRED'));
+  assert.equal((await peer.call('assert_owned', pythonOperation, 35_000)).code, 'RECOVERY_REQUIRED');
+  assert.equal((await peer.call('prepare', pythonTicket, 'fresh-python', {})).code, 'RECOVERY_REQUIRED');
+  assert.equal(node.assertOwned(nodeOperation, 0), true);
+  assert.equal((await peer.call('assert_owned', pythonOperation, 0)).result, true);
+  node.finish(nodeOperation, 'unknown'); await peer.call('finish', pythonOperation, 'unknown');
+  node.close(); await peer.close();
+  const recovery = f.writer('hub'); const ticket = recovery.claim([identity('8811')]);
+  assert.equal(recovery.importUnknown(ticket, 'quarantine-node', nodePayload).state, 'unknown');
+  recovery.resolve('quarantine-node', ticket, 'confirmed');
+  assert.equal(recovery.importUnknown(ticket, 'import-after-restore', {}).state, 'unknown');
+  recovery.resolve('import-after-restore', ticket, 'rejected');
+  assert.throws(() => recovery.assertOwned(ticket, 1), code('RECOVERY_REQUIRED'));
+  const recoveredPeer = await pythonPeer(t, f.databasePath, 'greeks');
+  const recoveredTicket = (await recoveredPeer.call('claim', [identity('8822')])).result;
+  assert.equal((await recoveredPeer.call('import_unknown', recoveredTicket, 'quarantine-python', { clientId: 'persisted-python' })).result.state, 'unknown');
+  assert.equal((await recoveredPeer.call('resolve', 'quarantine-python', recoveredTicket, 'confirmed')).result.state, 'confirmed');
+  assert.equal(recovery.snapshot().recovery.recoveryId, gate.recoveryId);
+  assert.equal((await recoveredPeer.call('snapshot')).result.recovery.authorityId, gate.authorityId);
+  assert.doesNotMatch(JSON.stringify(recovery.snapshot()), /must-not-leak|8811|accountKey|admittedTarget/);
+  await recoveredPeer.close();
+});
+
+test('retirement rejects every live Node/Python ticket and new owners while snapshot and close remain usable', async (t) => {
+  const f = fixture(t); const node = f.writer('hub'); const ticket = bindClaim(node, [identity('9911')]);
+  const operation = node.prepare(ticket, 'late-source', {});
+  const peer = await pythonPeer(t, f.databasePath, 'greeks');
+  await peer.call('bind', 'python', identity('9922'), 1);
+  const pythonTicket = (await peer.call('claim', [identity('9922')])).result;
+  const pythonOperation = (await peer.call('prepare', pythonTicket, 'late-python-source', {})).result;
+  recoveryState(f.databasePath, { state: 'retired', handoffId: crypto.randomUUID() });
+  for (const action of [() => node.assertOwned(ticket), () => node.assertOwned(operation, 0), () => node.finish(operation, 'confirmed'), () => node.bind('other', identity('9912'), 1), () => node.claim([identity('9911')]), () => node.importUnknown(ticket, 'late-import', {}), () => node.resolve('late-source', ticket)]) assert.throws(action, code('AUTHORITY_RETIRED'));
+  for (const [method, args] of [['assert_owned', [pythonOperation, 0]], ['assert_owned', [pythonOperation, 35_000]], ['finish', [pythonOperation, 'confirmed']], ['import_unknown', [pythonTicket, 'late-import-python', {}]], ['claim', [[identity('9922')]]]]) assert.equal((await peer.call(method, ...args)).code, 'AUTHORITY_RETIRED');
+  assert.throws(() => f.writer('monitor'), code('AUTHORITY_RETIRED'));
+  assert.equal(node.snapshot().recovery.state, 'retired');
+  assert.equal((await peer.call('snapshot')).result.recovery.state, 'retired');
+  assert.equal(readRow(f.databasePath, 'SELECT state FROM aw_operations WHERE operation_id=?', 'late-source').state, 'sending');
+  node.close(); await peer.close();
+});
+
+test('invalid or missing M2 recovery metadata and unknown schema fail closed without repair', (t) => {
+  const f = fixture(t); const writer = f.writer(); const ticket = bindClaim(writer);
+  const good = JSON.parse(readRow(f.databasePath, "SELECT value FROM aw_meta WHERE key='recovery_state'").value);
+  const cases = [['{', 'INVALID_RECOVERY_STATE'], [JSON.stringify({ ...good, schemaVersion: 2 }), 'UNSUPPORTED_RECOVERY_SCHEMA'], [JSON.stringify({ ...good, authorityId: 'not-uuid' }), 'INVALID_RECOVERY_STATE'], [JSON.stringify({ ...good, schemaVersion: true }), 'INVALID_RECOVERY_STATE'], [JSON.stringify({ ...good, state: 'unlocked' }), 'INVALID_RECOVERY_STATE'], [JSON.stringify({ ...good, admittedTarget: [] }), 'INVALID_RECOVERY_STATE'], [null, 'INVALID_RECOVERY_STATE']];
+  for (const [raw, expected] of cases) {
+    const db = new DatabaseSync(f.databasePath);
+    try { db.prepare("DELETE FROM aw_meta WHERE key='recovery_state'").run(); if (raw !== null) db.prepare("INSERT INTO aw_meta VALUES ('recovery_state',?)").run(raw); }
+    finally { db.close(); }
+    assert.throws(() => writer.assertOwned(ticket, 0), code(expected));
+    assert.throws(() => f.writer('monitor'), code(expected));
+    assert.throws(() => writer.snapshot(), code(expected));
+    assert.equal(readRow(f.databasePath, "SELECT value FROM aw_meta WHERE key='recovery_state'")?.value ?? null, raw);
+  }
+  writer.close();
+});
+
+test('M1 database initializes one stable authority shared with Python', async (t) => {
+  const f = fixture(t); const old = f.writer(); old.close();
+  const db = new DatabaseSync(f.databasePath);
+  try { db.prepare("DELETE FROM aw_meta WHERE key IN ('recovery_state','recovery_schema')").run(); } finally { db.close(); }
+  const next = f.writer('hub'); const peer = await pythonPeer(t, f.databasePath, 'greeks');
+  assert.equal(next.snapshot().recovery.state, 'normal');
+  assert.equal((await peer.call('snapshot')).result.recovery.authorityId, next.snapshot().recovery.authorityId);
+  await peer.close();
+});
+
 test('Python registry contract and failure scenarios run under the normal Node test entrypoint', () => {
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 14 tests/);
+  assert.match(result.stderr, /Ran 21 tests/);
 });
