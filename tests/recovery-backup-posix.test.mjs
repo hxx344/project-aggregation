@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { createBackup } from '../server/recovery/backup.mjs';
 import { acquireRuntimeLock } from '../server/recovery/lifecycle-lock.mjs';
 import { readLockedRegistry, readRegistry } from '../server/recovery/inventory.mjs';
@@ -12,14 +13,20 @@ import { runRecoveryCli } from '../server/recovery/cli.mjs';
 
 const eligible = process.platform !== 'win32' && process.getuid() === 0;
 const serviceUid = Number(process.env.RECOVERY_TEST_SERVICE_UID || 65534);
-const writerUrl = new URL('../server/execution/account-writer.mjs', import.meta.url).href;
 function actor(directory, code, { root = false } = {}) {
+  const writerUrl = pathToFileURL(path.join(path.dirname(directory),'code/account-writer.mjs')).href;
   return spawnSync(process.execPath, ['--input-type=module','-e',code,directory,writerUrl], { cwd:directory, uid:root?0:serviceUid,gid:root?0:serviceUid,windowsHide:true,timeout:15_000,encoding:'utf8',env:{PATH:process.env.PATH,NODE_OPTIONS:'',NODE_PATH:''} });
 }
 function successful(result) { assert.equal(result.status,0,result.stderr); }
 async function fixture(t) {
   assert.ok(Number.isSafeInteger(serviceUid) && serviceUid>0);
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'recovery-posix-'));fs.chmodSync(root,0o755);
+  // The hosted runner checkout may live below a private /home/runner parent.
+  // Copy the unmodified builtin-only core into the traversable fixture instead
+  // of granting the service UID access to somebody else's home directory.
+  const code=path.join(root,'code');fs.mkdirSync(code,{mode:0o755});
+  fs.copyFileSync(new URL('../server/execution/account-writer.mjs',import.meta.url),path.join(code,'account-writer.mjs'));
+  fs.chmodSync(path.join(code,'account-writer.mjs'),0o644);
   const source=path.join(root,'source');fs.mkdirSync(source,{mode:0o700});fs.chownSync(source,serviceUid,serviceUid);
   const held=[];t.after(async()=>{for(const lock of held)await lock.close();fs.rmSync(root,{recursive:true,force:true});});
   successful(actor(source,`
