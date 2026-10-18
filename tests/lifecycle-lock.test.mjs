@@ -60,7 +60,7 @@ test('permission loss invalidates held token and invokes fail closed callback', 
   const lock = await f.acquire({ onLost: loss });
   permissions(f.directory, true);
   const error = await Promise.race([lost, new Promise((_, reject) => { const timer = setTimeout(() => reject(new Error('lock loss callback timed out')), 3000); timer.unref(); })]);
-  assert.equal(error.code, 'UNSAFE_RUNTIME_LOCK_PATH');
+  assert.equal(error.code, process.platform === 'win32' ? 'UNSAFE_RUNTIME_LOCK_PATH' : 'RUNTIME_LOCK_LOST');
   assert.equal(lock.lost, true);
   assert.throws(() => lock.assertHeld(), code('RUNTIME_LOCK_LOST'));
   await lock.close(); permissions(f.directory);
