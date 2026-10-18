@@ -235,6 +235,13 @@ test('unknown schema columns and inconsistent order row identities are never acc
   rejects(f, 'hub', 'SCHEMA_MISMATCH'); rejects(f, 'crossex', 'INVALID_JOURNAL');
 });
 
+test('missing Greeks state stays missing evidence and cannot authorize a sealed handoff', t => {
+  const f = fixture(t), filename = path.join(f.directory, 'modules/greeks/engine_state.json');
+  rmSync(filename); const before = hashes(f.directory);
+  rejects(f, 'greeks', 'GREEKS_STATE_MISSING');
+  assert.deepEqual(hashes(f.directory), before);
+});
+
 test('uncheckpointed WAL is refused rather than reading an older main-file inventory', t => {
   const f = fixture(t), db = new DatabaseSync(path.join(f.directory, 'hub.sqlite'));
   try {

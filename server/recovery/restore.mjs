@@ -15,6 +15,7 @@ const QUARANTINE_REASONS = new Set([
   'HUB_JOB_UNRESOLVED', 'HUB_ORDER_UNRESOLVED', 'HUB_WRITE_UNRESOLVED', 'HUB_EXECUTION_LOCK_REMAINS', 'HUB_CANCEL_UNRESOLVED',
   'WRITER_OPERATION_UNRESOLVED', 'CROSSEX_ORDER_UNRESOLVED', 'CROSSEX_EXECUTION_WITHOUT_ORDERS', 'CROSSEX_EXTERNAL_ORDER_UNRESOLVED',
   'GREEKS_AUTO_OPEN_ENABLED', 'GREEKS_ORDER_UNRESOLVED', 'GREEKS_TASK_UNRESOLVED', 'GREEKS_RFQ_UNRESOLVED',
+  'GREEKS_STATE_MISSING',
   'ASTER_ACCOUNT_AUTOMATION_ENABLED', 'ASTER_PAIR_AUTOMATION_ENABLED', 'ASTER_INTENT_UNRESOLVED', 'ASTER_INTENT_OUTCOME_UNKNOWN',
   'ASTER_RECOVERY_OWNER_UNKNOWN', 'ASTER_CYCLE_UNRESOLVED', 'ASTER_POST_FILL_UNRESOLVED', 'ASTER_AUTO_RESUME_REMAINS',
   'ASTER_PAIR_UNRESOLVED', 'ASTER_TRANSFER_UNRESOLVED', 'ASTER_ADL_UNRESOLVED', 'ASTER_ADL_EVENT_UNRESOLVED',
@@ -163,8 +164,6 @@ export async function restoreBackup(options) {
     }
     limits.check();
     rebindEmbeddedPaths(stage, target, body);
-    const greekState = loadJson(path.join(stage, 'modules/greeks/engine_state.json'));
-    if (greekState.schema_version !== 1) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
     const compatibility = await checkpointEvidence(stage, limits);
     if (compatibility.reasons.some(reason => !QUARANTINE_REASONS.has(reason.code))) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
     validateAndRevoke(stage);

@@ -248,6 +248,28 @@ test('checkpoint record budgets count UTF-8 bytes rather than Unicode characters
   assert.equal(readRegistry(f.source).state.state, 'normal');
 });
 
+test('absent Greeks journal restores only in quarantine and never replaces a missing archived payload', async t => {
+  const f = await setup(t), filename = path.join(f.source, 'modules/greeks/engine_state.json'), original = fs.readFileSync(filename);
+  fs.unlinkSync(filename);
+  await assert.rejects(createBackup({ ...f.backupOptions, kind: 'handoff' }), /RECOVERY_HANDOFF_UNSAFE/);
+  assert.equal(readRegistry(f.source).state.state, 'normal');
+  await createBackup(f.backupOptions); const restored = await f.restore();
+  assert.equal(restored.result.state, 'quarantine');
+  assert.equal(fs.existsSync(path.join(restored.targetDir, 'modules/greeks/engine_state.json')), false);
+  const writer = createAccountWriter({ databasePath: path.join(restored.targetDir, 'execution-control.sqlite'), moduleId: 'hub', runtimeId: crypto.randomUUID() }); f.writers.push(writer);
+  const subject = { authority: 'bybit', environment: 'mainnet', accountId: '123456789' };
+  writer.bind('missing-state', subject, 1); const ticket = writer.claim([subject]);
+  assert.throws(() => writer.prepare(ticket, 'missing-state-blocked', { action: 'create' }), { code: 'RECOVERY_REQUIRED' });
+  await assert.rejects(admitHandoff({ sourceDir: f.source, targetDir: restored.targetDir, sourceLock: f.sourceLock, targetLock: restored.lock, dataKey: f.dataKey, secretsKey: f.secretsKey }), /RECOVERY_HANDOFF_REQUIRED/);
+  fs.writeFileSync(filename, original); const backupDir = path.join(f.root, 'with-state');
+  await createBackup({ ...f.backupOptions, destination: backupDir });
+  const body = JSON.parse(fs.readFileSync(path.join(backupDir, 'manifest.json'))).body;
+  const index = body.entries.findIndex(entry => entry.path === 'modules/greeks/engine_state.json'); assert.ok(index >= 0);
+  fs.unlinkSync(path.join(backupDir, body.entries[index].category, index + '.gcm'));
+  await assert.rejects(f.restore('lost-payload', { backupDir }), { code: 'ENOENT' });
+  assert.equal(fs.existsSync(path.join(f.root, 'lost-payload', 'execution-control.sqlite')), false);
+});
+
 test('restoring a migrated ASTER CA rebinds only the fixed key to the new DATA_DIR and handoff verifies the included certificate', async t => {
   const f = await setup(t), envFile = path.join(f.source,'modules/aster/.env');
   const relative = 'modules/aster/migration-files/aster_capacity_relay_ca_file.pem', certificate = path.join(f.source, relative);

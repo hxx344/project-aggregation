@@ -304,7 +304,15 @@ export function inspectTradingCheckpoint(dataDir, { environment = {} } = {}) {
       moduleEnvironment = parseEnv(readFileSync(filename, 'utf8'));
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
     const effective = Object.fromEntries(Object.entries({ ...environment, ...moduleEnvironment }).map(([key, value]) => [key.toLowerCase(), value]));
-    inspectGreeks(readJson(path.join(root, 'modules/greeks/engine_state.json')), effective, add, counts);
+    let state;
+    try { state = readJson(path.join(root, 'modules/greeks/engine_state.json')); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      // A never-used engine does not persist this file. Absence is missing
+      // evidence, never proof of an empty journal or permission to hand off.
+      add('GREEKS_STATE_MISSING'); return;
+    }
+    inspectGreeks(state, effective, add, counts);
   });
   inspect('aster', add => withDatabase(path.join(root, 'modules/aster/trading.sqlite3'), ASTER_SCHEMA, db => inspectAster(db, add, counts)));
   return { safeForHandoff: reasons.length === 0, reasons, counts };

@@ -1001,3 +1001,5 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基于 `56cdb9e` 的 2026-10-19 M2 提交前独立审查，复现通知签名进入 data 载荷、非终态 ADL 被误判静止、损坏日志被误容许，以及 1024 字节预算接受 1554 字节中文 JSON；相关 Windows 增量探针已验证修复。root 空 WAL/SHM 和父链后果在同轮审查中定位，Linux 故障探针随本批 CI 实测，不把代码存在等同运行通过。均属本次未发布实现的连续修补。
 
 **事件记录：** `cold-recovery-authority-boundary-20261019`；本次恢复集成审查归为一个事件，不推进历史复盘检查点。
+
+**同轮整包补充：** 真实五模块 CI 在根行为测试无失败后发现，从未创建任务的 Greeks 不落 `engine_state.json`。备份本来没有该固定文件时，允许恢复到 quarantine 并保留缺证，不合成空日志；handoff/admit 仍拒绝。已列入 manifest 的材料丢失、现有 JSON 或 schema 损坏继续拒绝。验证使用实际发布包演练和 [缺证/丢密文回归](tests/recovery-backup.test.mjs)，不能为了让新安装夹具通过而将所有缺文件都解释为新库。
