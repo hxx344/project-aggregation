@@ -36,7 +36,7 @@ sudo project-aggregation-recovery backup
 ```sh
 sudo project-aggregation-recovery keys
 sudo project-aggregation-recovery inspect
-sudo project-aggregation-recovery inspect --target-dir /var/lib/project-aggregation-restored
+sudo project-aggregation-recovery inspect --target-dir /srv/project-aggregation/restored
 ```
 
 ## 一致性与备份内容
@@ -71,7 +71,7 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 ```sh
 sudo project-aggregation-recovery restore \
   --backup-dir /var/backups/project-aggregation/<备份目录> \
-  --target-dir /var/lib/project-aggregation-restored
+  --target-dir /srv/project-aggregation/restored
 ```
 
 工具在隔离 staging 内验证双密钥认证、GCM、文件摘要、SQLite 完整性和外键、schema、财务记录结构以及既有加密凭据可解密性。未知版本、损坏记录和缺失必需材料不能作为“待恢复任务”被忽略。验证成功后先发布处于隔离状态的保护库，再发布其余材料，最后写入完成状态。
@@ -89,7 +89,7 @@ sudo project-aggregation-recovery restore \
 
 隔离状态可用于检查恢复材料和启动可读服务，不代表所有本地文件都不再写入，也不替代网络隔离。公共行情和通知等非交易路径可能仍访问外部服务；演练使用隔离网络环境，不能拿生产凭据试下单证明恢复成功。
 
-`restore` 和 `admit` 均不修改 `DATA_DIR`、不切换发布版本、不自动将新目录部署为生产。用户需要自行选择配置切换与启动时机。
+`restore` 和 `admit` 均不修改 `DATA_DIR`、不切换发布版本、不自动将新目录部署为生产。用户需要自行选择配置切换与启动时机。示例使用安装器允许的 `/srv/project-aggregation/` 子目录，便于后续正常更新；目标仍必须与当前源目录互不重叠。
 
 ## 一次性交接准入
 
@@ -101,10 +101,10 @@ sudo project-aggregation-recovery handoff \
 
 sudo project-aggregation-recovery restore \
   --backup-dir /var/backups/project-aggregation/<新交接目录> \
-  --target-dir /var/lib/project-aggregation-restored
+  --target-dir /srv/project-aggregation/restored
 
 sudo project-aggregation-recovery admit \
-  --target-dir /var/lib/project-aggregation-restored
+  --target-dir /srv/project-aggregation/restored
 ```
 
 密文和已认证 manifest 持久化后，源在共享保护库内永久进入 `retired`，旧 owner 关闭且 fence 增加。退休不会因备份目录发布失败而回滚，源不会自动重启。请在交接完成前保留当前配置对原源的引用，使 `admit` 能找到真正的源 authority。
