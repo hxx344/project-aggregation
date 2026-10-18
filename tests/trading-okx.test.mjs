@@ -388,6 +388,21 @@ test('OKX cancel ACK does not imply terminal state and own system-trimmed order 
   assert.equal(mutations(foreign.calls).length, 0);
 });
 
+test('OKX cancellation recovery reads only the strongly identified reduced close order and keeps other checks strict', async () => {
+  const close = { ...spec, id: ORDER, reduceOnly: true, side: 'sell', stopPrice: '50' };
+  const h = harness(); h.state.order = order({ side: 'sell', reduceOnly: 'true', sz: '1', state: 'canceled' });
+  await assert.rejects(h.client.inspect(credentials, close), isExecutionError('invalid_data'));
+  const recovered = await h.client.inspect(credentials, close, { cancelRecovery: true });
+  assert.equal(recovered.id, ORDER); assert.equal(recovered.quantity, '1'); assert.equal(recovered.terminal, true);
+  for (const changes of [{ sz: '3' }, { clOrdId: 'foreign' }, { ordId: '999' }, { attachAlgoOrds: [{}] }, { reduceOnly: 'false' }, { posSide: 'long' }]) {
+    h.state.order = order({ side: 'sell', reduceOnly: 'true', sz: '1', ...changes });
+    await assert.rejects(h.client.inspect(credentials, close, { cancelRecovery: true }), isExecutionError('invalid_data'));
+  }
+  h.state.order = order({ sz: '1' });
+  await assert.rejects(h.client.inspect(credentials, { ...spec, id: ORDER }, { cancelRecovery: true }), isExecutionError('invalid_data'));
+  assert.equal(mutations(h.calls).length, 0);
+});
+
 test('OKX mutation transport, malformed ACK, timeout and unknown provider errors remain uncertain without retry', async () => {
   const cases = [
     () => { throw new Error('private response fixture-okx-secret'); },

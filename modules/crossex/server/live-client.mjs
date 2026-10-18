@@ -203,8 +203,9 @@ function orderPayload(value) {
 }
 
 /** Fixed Gate REST endpoints. Credentials stay in this closure; no order is retried. */
-export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = Date.now, timeoutMs = 8000 } = {}) {
+export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = Date.now, timeoutMs = 8000, beforeSubmit } = {}) {
   requireValue(typeof apiKey === 'string' && /^[\x21-\x7e]{1,512}$/.test(apiKey) && typeof apiSecret === 'string' && apiSecret.length > 0 && apiSecret.length <= 2048 && typeof fetcher === 'function' && typeof clock === 'function' && Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 120_000, inputError);
+  requireValue(beforeSubmit === undefined || typeof beforeSubmit === 'function', inputError);
   async function request(method, path, query = {}, payload, validate = value => value, { authenticated = true } = {}) {
     const queryString = Object.entries(query).map(([key, value]) => `${key}=${value}`).join('&');
     const body = payload === undefined ? '' : JSON.stringify(payload), pathname = PREFIX + path;
@@ -217,6 +218,17 @@ export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = D
     }
     const controller = new AbortController(); let timer;
     const work = async () => {
+      if (method !== 'GET' && beforeSubmit) {
+        try {
+          const checked = beforeSubmit({ method, path, payload });
+          if (checked && typeof checked.then === 'function') {
+            void Promise.resolve(checked).catch(() => {});
+            throw new Error('ASYNC_SUBMISSION_CHECK');
+          }
+        } catch {
+          throw new GateClientError('GATE_SUBMISSION_BLOCKED', '账户写入许可已失效，此请求没有发送', { uncertain: false });
+        }
+      }
       const response = await fetcher(ORIGIN + pathname + (queryString ? `?${queryString}` : ''), { method, headers, ...(body ? { body } : {}), redirect: 'error', signal: controller.signal });
       let bytes = 0; const chunks = [];
       if (response.body) for await (const chunk of response.body) {

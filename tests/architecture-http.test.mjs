@@ -3,13 +3,19 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createApp } from '../server/app.mjs';
+import { createAccountWriter } from '../server/execution/account-writer.mjs';
 
 test('baseline endpoints require a live same-origin session and never refresh sources, trading or maintenance', async t => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'architecture-http-'));
+  const accountWriter = createAccountWriter({ databasePath: path.join(dataDir, 'execution-control.sqlite'), moduleId: 'hub', runtimeId: randomUUID() });
+  const identity = { authority: 'bybit', environment: 'mainnet', accountId: '1234567890123456789' };
+  accountWriter.bind('private-connection', identity, 1);
+  accountWriter.prepare(accountWriter.claim([identity]), 'private-operation', { clientId: 'private-intent' });
   let reads = 0, updateReads = 0;
   const app = await createApp({ dataDir, initialPassword: 'architecture-test-password', refreshInterval: 0, assetSyncIntervalMs: 0,
-    tradingRefreshIntervalMs: 0, executionIntervalMs: 0, baselineIntervalMs: 0, logger: { info() {}, warn() {}, error() {} },
+    tradingRefreshIntervalMs: 0, executionIntervalMs: 0, baselineIntervalMs: 0, accountWriter, logger: { info() {}, warn() {}, error() {} },
     summaryReader: async () => { reads++; return { updatedAt: new Date().toISOString(), metrics: [], message: 'fixture' }; },
     updatesClient: { status: async () => { updateReads++; throw new Error('metrics must not request updater status'); } },
   });
@@ -18,7 +24,7 @@ test('baseline endpoints require a live same-origin session and never refresh so
   const origin = `http://127.0.0.1:${app.server.address().port}`;
   const login = await fetch(origin + '/api/login', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ password: 'architecture-test-password' }) });
   const cookie = login.headers.get('set-cookie').split(';')[0], { csrfToken } = await login.json();
-  for (const route of ['/api/system/metrics', '/api/system/architecture']) {
+  for (const route of ['/api/system/metrics', '/api/system/architecture', '/api/system/accounts']) {
     assert.equal((await fetch(origin + route)).status, 401);
     assert.equal((await fetch(origin + route, { headers: { Cookie: cookie, Origin: 'https://wrong.example' } })).status, 403);
     assert.equal((await fetch(origin + route, { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'same-site' } })).status, 403);
@@ -29,6 +35,11 @@ test('baseline endpoints require a live same-origin session and never refresh so
     const value = await response.json();
     assert.equal(value.schemaVersion, 1);
     if (route.endsWith('metrics')) { assert.equal(value.sampling.retainedBuckets, 0); assert.equal(value.summaries.missing, 6); }
+    else if (route.endsWith('accounts')) {
+      assert.equal(value.enabled, true); assert.equal(value.accounts.length, 1);
+      assert.deepEqual(value.operations, [{ moduleId: 'hub', state: 'sending', count: 1 }]);
+      for (const privateValue of [identity.accountId, 'private-connection', 'private-operation', 'private-intent']) assert.equal(JSON.stringify(value).includes(privateValue), false);
+    }
     else assert.deepEqual(value.modules, []);
     assert.equal(JSON.stringify(value).includes('credentials.key'), false);
   }

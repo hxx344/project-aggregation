@@ -62,7 +62,7 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
     return { schemaVersion: 1, observedAt: new Date(at).toISOString(), instanceId,
       summaries: summarizeSources(value.projects, at), summaryReads: { ...reads },
       sse: { activeConnections: value.sseConnections, slowConsumerDisconnects: slowConsumers },
-      coverage: { executionResults: false, updateSuccessRate: false, browserPushLatency: false, crossModuleAccountProtection: false } };
+      coverage: { executionResults: false, updateSuccessRate: false, browserPushLatency: false, crossModuleAccountProtection: value.accountWriterVersion === 1 } };
   }
   function read() {
     const at = now(), bucket = bucketOf(at), earliest = bucket - BASELINE_RETENTION_MS + BASELINE_INTERVAL_MS;

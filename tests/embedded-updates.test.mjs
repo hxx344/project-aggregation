@@ -172,7 +172,7 @@ test('Aster verification failures explain which account evidence must be restore
 
 test('missing, mismatched and unknown capability contracts refuse update before querying account evidence', async t => {
   const cases = [null, {}, { ...moduleCapabilities('aster'), schemaVersion: 2 },
-    { ...moduleCapabilities('aster'), moduleId: 'greeks' }, { ...moduleCapabilities('aster'), accountWriterVersion: 1 },
+    { ...moduleCapabilities('aster'), moduleId: 'greeks' }, { ...moduleCapabilities('aster'), accountWriterVersion: null },
     { ...moduleCapabilities('aster'), extra: 'not-allowed' }];
   for (const value of cases) await t.test(JSON.stringify(value), async () => {
     const f = fixture(); f.handlers['capabilities:aster'] = () => ({ data: value });

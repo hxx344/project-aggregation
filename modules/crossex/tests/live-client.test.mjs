@@ -33,6 +33,28 @@ test('fixed production host signs exact JSON bytes, timestamp and raw query with
   assert.equal(f.calls[1].init.body, undefined);
 });
 
+test('the synchronous final submission guard blocks POST and DELETE before fetch while reads remain available', async () => {
+  for (const asynchronous of [false, true]) {
+    const calls = [], checks = [];
+    const client = createGateClient({ apiKey: KEY, apiSecret: SECRET, clock: () => NOW,
+      beforeSubmit(context) { checks.push(context); if (asynchronous) return Promise.resolve(); throw new Error(SECRET); },
+      fetcher: async (url, init) => { calls.push({ url, init }); return json([]); } });
+    for (const write of [() => client.createOrder(payload()), () => client.cancelOrder('original-order')]) {
+      await assert.rejects(write(), error => error.code === 'GATE_SUBMISSION_BLOCKED' && error.uncertain === false && !error.stack.includes(SECRET));
+    }
+    assert.equal(calls.length, 0); assert.deepEqual(checks.map(check => check.method), ['POST', 'DELETE']);
+    await client.getOpenOrders(); assert.equal(calls.length, 1); assert.equal(checks.length, 2);
+  }
+});
+
+test('a successful final guard executes immediately before the original signed request', async () => {
+  const events = [];
+  const client = createGateClient({ apiKey: KEY, apiSecret: SECRET, clock: () => NOW,
+    beforeSubmit({ method, path, payload: body }) { events.push('guard'); assert.equal(method, 'POST'); assert.equal(path, '/crossex/orders'); assert.equal(body.text, payload().text); },
+    fetcher: async (_url, init) => { events.push('fetch'); assert.equal(init.headers.SIGN, 'b53c4fe04dc9f6afdee7947903fa569e20e8825af950ac03abef25f8d987512e2295673521b57ca12063a7dc41572fc7fe8cff0773f2d36293ea1c30b2baaabe'); return json({ order_id: 'original-order', text: payload().text }); } });
+  await client.createOrder(payload()); assert.deepEqual(events, ['guard', 'fetch']);
+});
+
 test('decimal quantities, cumulative partial fills and positions retain exact strings', async () => {
   const f = fixture(url => json(url.pathname.endsWith('/positions') ? [position()] : url.pathname.endsWith('/accounts') ? account() : order()));
   const value = await f.client.getOrder('cx-1');

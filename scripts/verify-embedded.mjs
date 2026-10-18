@@ -4,17 +4,21 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 
 const root = path.resolve(process.argv[2] || '.');
 const dataDir = await mkdtemp(path.join(tmpdir(), 'ci-package-data-'));
 const password = 'package-test-only-123456';
-let app, modules, failure;
+let app, modules, failure, accountWriter;
 try {
   const { startModules } = await import(pathToFileURL(path.join(root, 'server/modules/runtime.mjs')));
   const { createApp } = await import(pathToFileURL(path.join(root, 'server/app.mjs')));
   const { readSummary } = await import(pathToFileURL(path.join(root, 'server/adapters.mjs')));
-  modules = await startModules({ root, dataDir, logger: console, onFailure: error => { failure = error; } });
-  app = await createApp({ dataDir, initialPassword: password, embeddedModules: true, logger: () => {},
+  const { createAccountWriter } = await import(pathToFileURL(path.join(root, 'server/execution/account-writer.mjs')));
+  const writerContext = { databasePath: path.join(dataDir, 'execution-control.sqlite'), runtimeId: randomUUID() };
+  accountWriter = createAccountWriter({ ...writerContext, moduleId: 'hub' });
+  modules = await startModules({ root, dataDir, logger: console, writerContext, onFailure: error => { failure = error; } });
+  app = await createApp({ dataDir, initialPassword: password, embeddedModules: true, accountWriter, logger: () => {},
     refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0 });
   await new Promise((resolve, reject) => { app.server.once('error', reject); app.server.listen(Number(process.env.PACKAGE_TEST_PORT || 3100), '127.0.0.1', resolve); });
   const port = app.server.address().port, host = `hub.localhost:${port}`;
@@ -34,6 +38,13 @@ try {
   assert.equal((await request('/api/projects')).status, 401);
   const login = await request('/api/login', { method: 'POST', body: { password } });
   assert.equal(login.status, 200); cookie = login.headers['set-cookie'][0].split(';')[0]; csrf = login.data.csrfToken;
+  const architecture = (await request('/api/system/architecture')).data;
+  assert.equal(architecture.accountWriterVersion, 1);
+  for (const module of architecture.modules.filter(row => ['crossex', 'greeks', 'aster'].includes(row.moduleId))) {
+    assert.equal(module.state, 'compatible'); assert.equal(module.capabilities.accountWriterVersion, 1);
+  }
+  const accounts = await request('/api/system/accounts');
+  assert.equal(accounts.status, 200); assert.equal(accounts.data.enabled, true); assert.deepEqual(accounts.data.operations, []);
   const projects = (await request('/api/projects')).data.projects;
   assert.deepEqual(projects.map(item => item.id), ['monitor', 'asset', 'crossex', 'greeks', 'aster']);
   assert.equal((await request('/api/trading')).status, 200, 'Original trading module remains available');
@@ -78,5 +89,6 @@ try {
 } finally {
   await app?.close();
   await modules?.close();
+  if (!app) accountWriter?.close();
   await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }

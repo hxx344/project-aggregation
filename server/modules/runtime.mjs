@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9,7 +9,8 @@ import { moduleCatalog } from './catalog.mjs';
 import { registerModuleTransport } from './transport.mjs';
 
 const repository = fileURLToPath(new URL('../..', import.meta.url));
-export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, timeoutMs = 120_000 } = {}) {
+export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, timeoutMs = 120_000, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
+  if (path.resolve(writerContext.databasePath) !== path.join(path.resolve(dataDir), 'execution-control.sqlite') || !/^[a-f0-9-]{36}$/.test(writerContext.runtimeId)) throw new Error('Invalid writer runtime context');
   const directory = mkdtempSync(path.join(tmpdir(), 'workbench-'));
   const children = [], unregister = [];
   const transports = Object.fromEntries(moduleCatalog.map(({ id }) => [id, {
@@ -42,8 +43,12 @@ export async function startModules({ dataDir, root = repository, logger = consol
       const envFile = path.join(moduleData, '.env');
       const environment = existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {};
       environment.WORKSPACE_MAINTENANCE = '1';
+      environment.WORKSPACE_MANAGED = '1';
+      environment.WORKSPACE_WRITER_DB = writerContext.databasePath;
+      environment.WORKSPACE_RUNTIME_ID = writerContext.runtimeId;
+      environment.WORKSPACE_WRITER_MODULE = path.join(root, 'server', 'execution', 'account_writer.py');
       const env = { ...process.env };
-      for (const key of ['PORT', 'HOST', 'DATA_DIR', 'INITIAL_PASSWORD', 'PUBLIC_ORIGIN', 'APP_PASSWORD', 'APP_USERNAME', 'COOKIE_SECURE', 'MONITOR_EXTERNAL_LOCK']) delete env[key];
+      for (const key of ['PORT', 'HOST', 'DATA_DIR', 'INITIAL_PASSWORD', 'PUBLIC_ORIGIN', 'APP_PASSWORD', 'APP_USERNAME', 'COOKIE_SECURE', 'MONITOR_EXTERNAL_LOCK', 'WORKSPACE_WRITER_DB', 'WORKSPACE_RUNTIME_ID', 'WORKSPACE_WRITER_MODULE']) delete env[key];
       const worker = path.join(root, 'server', 'modules', 'worker.mjs');
       const locking = id === 'monitor' && process.platform === 'linux';
       if (locking) environment.MONITOR_EXTERNAL_LOCK = '1';

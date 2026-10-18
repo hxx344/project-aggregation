@@ -30,6 +30,9 @@ class WorkspaceControl:
     def set_maintenance(self, active):
         if type(active) is not bool:
             raise ValueError("maintenance must be boolean")
+        writer = getattr(self.engine, "account_writer", None)
+        if not active and writer is not None and not writer.ready:
+            writer.initialize()
         with self.lock:
             if self.active != active:
                 self.active = active

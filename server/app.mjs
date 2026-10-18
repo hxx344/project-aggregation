@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
+import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
 import { promisify } from 'node:util';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
 import path from 'node:path';
@@ -25,6 +25,7 @@ import { moduleCatalog, moduleIds } from './modules/catalog.mjs';
 import { createModuleUpdateGuard } from './modules/updates.mjs';
 import { readModuleCapabilities } from './modules/capabilities.mjs';
 import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from './observability.mjs';
+import { createAccountWriter } from './execution/account-writer.mjs';
 
 const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -54,7 +55,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson } = {}) {
+export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null } = {}) {
   validateBaselineInterval(baselineIntervalMs);
   if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
   if (!Array.isArray(warmupProjects) || warmupProjects.some(id => typeof id !== 'string')) throw new TypeError('warmupProjects 必须为项目 ID 字符串数组');
@@ -137,7 +138,8 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64'); };
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs });
-  const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
+  const sharedAccountWriter = accountWriter || (embeddedModules ? createAccountWriter({ databasePath: path.join(resolvedData, 'execution-control.sqlite'), runtimeId: randomUUID(), moduleId: 'hub' }) : null);
+  const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
   const moduleUpdateGuard = embeddedModules ? createModuleUpdateGuard() : null;
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
     ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, prepareApply: moduleUpdateGuard.prepareApply } : {}),
@@ -385,17 +387,18 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
-    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics') {
+    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts') {
       if (req.method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取基线');
       if (req.headers.origin) sameOrigin(req);
       if (pathname === '/api/system/metrics') { send(res, 200, baseline.read()); return; }
+      if (pathname === '/api/system/accounts') { send(res, 200, { schemaVersion: 1, enabled: !!sharedAccountWriter, ...(sharedAccountWriter?.snapshot() || { accounts: [], bindings: [], operations: [], isolations: [] }) }); return; }
       const controller = new AbortController(); controllers.add(controller);
       try {
         const modules = await capabilities(controller.signal);
         if (closed || session(req)?.id !== current.id) throw new HttpError(401, '登录已失效，请重新登录');
-        send(res, 200, { schemaVersion: 1, embeddedModules, modules, accountWriterVersion: null });
+        send(res, 200, { schemaVersion: 1, embeddedModules, modules, accountWriterVersion: sharedAccountWriter ? 1 : null });
       } finally { controllers.delete(controller); }
       return;
     }
@@ -590,9 +593,10 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   interval?.unref();
   const heartbeat = setInterval(publishOverview, 15000); heartbeat.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
+  await execution.initializeProtection();
   await updates.initialize();
   baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
-    readSnapshot: () => ({ sseConnections: streams.size, projects: getProjects().map(project => ({ project,
+    readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: streams.size, projects: getProjects().map(project => ({ project,
       snapshot: states.get(project.id) || (() => { const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); return saved ? JSON.parse(saved.json) : null; })(),
     })) }),
   });
@@ -600,6 +604,6 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   return {
     server, check, refresh, assetSync, trading, execution, baseline, dataDir: resolvedData,
     async resetPassword() { const password = randomBytes(18).toString('base64url'); stmt.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
-    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await baseline.close(); await updateStream.close(); await execution.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
+    async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); for (const res of streams.keys()) res.end(); streams.clear(); await baseline.close(); await updateStream.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }

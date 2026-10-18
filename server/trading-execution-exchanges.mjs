@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
 
@@ -44,7 +44,7 @@ import { createOkxExecutionClient } from './trading-okx-execution.mjs';
  * Binance conditional orders are queried separately; an existing conditional
  * order on either supported symbol blocks preflight with external_orders. The
  * module cannot cancel those orders, and never fabricates their missing fills.
- * Binance exposes no stable account UID in these endpoints, so identity is null.
+ * Managed execution additionally verifies Binance UID through signed Spot USER_DATA.
  * Bybit identity is its userID (never the API key or API-key id).
  *
  * Official protocol references (verified 2026-10-07):
@@ -178,6 +178,7 @@ function binanceEndpoints(mode) {
   const prefix = portfolio ? '/papi/v1/um' : '/fapi/v1';
   return {
     permissions: ['https://api.binance.com', '/sapi/v1/account/apiRestrictions', 'GET', true],
+    identity: ['https://api.binance.com', '/api/v3/account', 'GET', true],
     config: [host, `${prefix}/accountConfig`, 'GET', true],
     positions: [host, portfolio ? `${prefix}/positionRisk` : '/fapi/v3/positionRisk', 'GET', true],
     openOrders: [host, `${prefix}/openOrders`, 'GET', true],
@@ -238,6 +239,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) fail('configuration');
   let timeOffset = 0;
   const ruleCache = new Map();
+  let identityEvidence = null;
   function clock() { const value = now(); if (!Number.isSafeInteger(value) || value <= 0) fail('configuration'); return value; }
   function modeOf(value) {
     const mode = value ?? (exchange === 'binance' ? 'standard' : 'unified');
@@ -382,7 +384,21 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       const config = requireObject(await request('config', credentials, {}, options));
       if (config.canTrade !== true) fail('permissions');
       if (typeof config.dualSidePosition !== 'boolean') fail('account_mode');
-      return { identity: null, positionMode: config.dualSidePosition ? 'hedge' : 'one-way' };
+      let identity = null;
+      if (options.requireIdentity) {
+        const revision = createHash('sha256').update(credentials.apiKey).update('\0').update(credentials.apiSecret).digest('hex');
+        if (identityEvidence?.revision === revision && clock() >= identityEvidence.at && clock() - identityEvidence.at < 60_000) identity = identityEvidence.identity;
+        else {
+          identityEvidence = null;
+          try {
+            const value = requireObject(await request('identity', credentials, { omitZeroBalances: 'true' }, options));
+            const uid = identifier(value.uid);
+            if (!/^[1-9][0-9]{0,39}$/.test(uid)) fail('invalid_data');
+            identity = uid; identityEvidence = { revision, identity, at: clock() };
+          } catch { checkAbort(options.signal); /* A readable connection without verified UID remains read-only. */ }
+        }
+      }
+      return { identity, positionMode: config.dualSidePosition ? 'hedge' : 'one-way' };
     }
     if (info.readOnly !== 0 || !object(info.permissions)) fail('permissions');
     const scopes = info.permissions;
@@ -443,13 +459,13 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       positionSide: null, createdAt: iso(row.createdTimeE3) };
   }
 
-  async function verify(credentials, { accountMode, signal } = {}) {
-    const snapshot = await permissionSnapshot(credentials, { accountMode: modeOf(accountMode), signal });
+  async function verify(credentials, { accountMode, signal, requireIdentity = false } = {}) {
+    const snapshot = await permissionSnapshot(credentials, { accountMode: modeOf(accountMode), signal, requireIdentity });
     return { identity: snapshot.identity };
   }
 
-  async function account(credentials, { accountMode, signal } = {}) {
-    const options = { accountMode: modeOf(accountMode), signal };
+  async function account(credentials, { accountMode, signal, requireIdentity = false } = {}) {
+    const options = { accountMode: modeOf(accountMode), signal, requireIdentity };
     const snapshot = await permissionSnapshot(credentials, options);
     const positions = [], openOrders = [], strategies = [], modes = {}, seenOrders = new Set(), seenStrategies = new Set();
     for (const symbol of SYMBOLS) {

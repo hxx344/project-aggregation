@@ -3,6 +3,7 @@ import json
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from fractions import Fraction
@@ -363,6 +364,15 @@ class API:
         self.nonce_lock = threading.Lock()
         self.last_nonce = 0
         self.workspace_control = None
+        self.account_writer = None
+        self.writer_connection = None
+        self._writer_prepared = ContextVar("aster_transport_prepared", default=None)
+        self.http.event_hooks["request"].append(self._before_account_request)
+
+    def _before_account_request(self, request):
+        prepared = self._writer_prepared.get()
+        if prepared is not None:
+            self.account_writer.before_send(prepared)
 
     def signed_parameters(self, params):
         if not self.credentials:
@@ -384,6 +394,29 @@ class API:
         return data
 
     def call(self, method, path, params=None, signed=False, weight=1, *, timeout=None):
+        # listenKey creation/renewal only maintains a private read stream. All
+        # other signed non-GET calls must pass account admission before signing.
+        writer = self.account_writer if signed and method != "GET" and path != "/fapi/v3/listenKey" else None
+        if signed and method != "GET" and path != "/fapi/v3/listenKey" and os.environ.get("WORKSPACE_MANAGED") == "1" and writer is None:
+            raise RequestNotSent("受管理交易请求未绑定账户保护，未发送请求")
+        prepared = writer.prepare(self, method, path, params or {}) if writer is not None else None
+        token = self._writer_prepared.set(prepared)
+        try:
+            try:
+                result = self._call(method, path, params, signed, weight, timeout=timeout)
+                if writer is not None:
+                    writer.validate_response(path, params or {}, result)
+            except BaseException as exc:
+                if writer is not None:
+                    writer.finish(prepared, "rejected" if isinstance(exc, RequestNotSent) else "unknown")
+                raise
+            if writer is not None:
+                writer.finish(prepared, "confirmed")
+            return result
+        finally:
+            self._writer_prepared.reset(token)
+
+    def _call(self, method, path, params=None, signed=False, weight=1, *, timeout=None):
         with transport_stage("budget_ms"):
             ticket = self.budget.reserve(weight, track=True)
         try:
@@ -2078,7 +2111,10 @@ class LiveBroker:
     def query(self, symbol, client_id, *, timeout=None):
         with self.reconciliation_budget():
             options = {"timeout": timeout} if timeout is not None else {}
-            return self.api.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True, **options)
+            row = self.api.call("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True, **options)
+            if getattr(self.api, "account_writer", None) is not None:
+                self.api.account_writer.observe_order(self.api.writer_connection, symbol, client_id, row)
+            return row
 
     def cancel(self, symbol, client_id):
         with self.reconciliation_budget():

@@ -13,12 +13,19 @@ export async function createModule(options) { return createAsterModule(options);
 export async function createAsterModule({ root, dataDir, secret, environment = {}, application = 'trading.workspace:app',
   requestTimeout = 60_000, startupTimeout = 90_000, shutdownTimeout = 100_000 }) {
   if (typeof secret !== 'string' || secret.length < 12) throw new Error('Missing ASTER worker secret');
+  if (environment.WORKSPACE_MANAGED === '1' && (!environment.WORKSPACE_WRITER_DB || !environment.WORKSPACE_RUNTIME_ID)) throw new Error('Missing shared account protection');
   mkdirSync(dataDir, { recursive: true });
   const env = { ...process.env, ...environment, ASTER_TRADING_RUNTIME: resolve(dataDir),
     ASTER_DASHBOARD_DIR: resolve(root, 'dashboard/dist/client'), ASTER_WORKSPACE_SECRET: secret,
     WORKSPACE_MANAGED: '1', PYTHONPATH: root, PYTHONNOUSERSITE: '1', PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' };
   delete env.ASTER_PUBLIC_ORIGIN;
   delete env.ASTER_DASHBOARD_PASSWORD;
+  for (const key of ['WORKSPACE_WRITER_DB', 'WORKSPACE_RUNTIME_ID', 'WORKSPACE_WRITER_MODULE']) delete env[key];
+  for (const key of ['WORKSPACE_WRITER_DB', 'WORKSPACE_RUNTIME_ID']) {
+    if (typeof environment[key] === 'string') env[key] = environment[key];
+  }
+  env.WORKSPACE_WRITER_MODULE = resolve(workspace, 'server/execution/account_writer.py');
   return createPythonModule({ root, secret, env, executable: pythonExecutable(environment), application, label: 'ASTER',
-    privateHeaders: [['x-workspace-key', secret]], requestTimeout, startupTimeout, shutdownTimeout });
+    privateHeaders: [['x-workspace-key', secret]], requestTimeout, startupTimeout, shutdownTimeout,
+    requireWriterProtection: application === 'trading.workspace:app' && Boolean(env.WORKSPACE_WRITER_DB) });
 }

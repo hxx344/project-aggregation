@@ -15,6 +15,7 @@ from .margin_balance import DEFAULT_MARGIN, validate_margin
 from .models import AccountModeError, TradingError, dec, positive, wire
 
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, get_symbol_config, validate_symbol
+from .account_writer import protected_pair_id
 DEFAULT_ORDINARY = {"enabled": False, "threshold": "10000", "order_notional": "1000",
                     "min_open_leverage": 5, "margin_limit": "0.5", "spread_limit": "0.0005"}
 PAIR_FIELDS = {"id", "name", "long_account_id", "short_account_id", "symbol", "enabled",
@@ -706,6 +707,7 @@ class PairManager:
         pair = self.store.pair_for_account(account_id)
         return pair if pair and pair_active(pair, self.store.get("pair_runtime:" + pair["id"])) else None
 
+    @protected_pair_id
     def tick(self, pair_id):
         pair = self.store.pair(pair_id)
         if not pair or self.engine.shutdown.is_set():

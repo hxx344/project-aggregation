@@ -15,6 +15,7 @@ import math
 import threading
 import time
 import uuid
+from .account_writer import protected_pair
 
 from . import adl_events, adl_exchange, adl_notifications
 from .adl_config import validate_adl
@@ -564,6 +565,10 @@ class AdlController:
                 raise TradingError("ADL 原订单成交尚未反映到持仓，等待新的现场")
 
     def _settle(self, incident, item, broker):
+        pair = self.store.pair(incident["pair_id"])
+        if pair is not None:
+            from .account_writer import writer_for
+            writer_for(self.engine).settle_adl(pair, incident)
         from .adl_recovery import reconcile_order
         result = reconcile_order(item, broker, lambda: self._save(incident),
                                  allow_cancel=validate_adl(incident.get("config"))["enabled"])
@@ -817,6 +822,7 @@ class AdlController:
         self.store.put("pair_runtime:" + pair["id"], {key: value for key, value in runtime.items() if key != "retry_after"})
         return runtime
 
+    @protected_pair
     def tick(self, pair):
         incident = self.store.get("adl_pair:" + pair["id"])
         accounts, brokers, identities = self._context(pair)

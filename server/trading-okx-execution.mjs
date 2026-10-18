@@ -64,7 +64,7 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     const result = Object.keys(POSITION_SIDES).find(key => POSITION_SIDES[key] === value);
     if (!result) fail(); return result;
   }
-  function parseOrder(row, spec, mode, { matchQuantity = true } = {}) {
+  function parseOrder(row, spec, mode, { matchQuantity = true, cancelRecovery = false } = {}) {
     requireObject(row);
     const positionSide = positionSideOf(row.posSide), size = volume(row);
     if (row.instId !== instrumentId(spec.symbol) || row.instType !== 'SWAP' || row.tdMode !== mode
@@ -74,8 +74,9 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
       || row.ccy !== undefined && row.ccy !== '' && row.ccy !== 'USDT') fail();
     const reduceOnly = row.reduceOnly === 'true' || hedgeClose(row.side, positionSide);
     const orderId = id(row.ordId), terminal = TERMINAL.has(row.state);
+    const reducedOriginal = cancelRecovery && spec.id && spec.reduceOnly && compareDecimals(size.quantity, spec.quantity) <= 0;
     if (spec.id && spec.id !== orderId || row.side !== spec.side || positionSide !== spec.positionSide || reduceOnly !== spec.reduceOnly
-      || matchQuantity && size.quantity !== spec.quantity || row.state === 'filled' && size.quantity !== size.filledQuantity) fail();
+      || matchQuantity && !reducedOriginal && size.quantity !== spec.quantity || row.state === 'filled' && size.quantity !== size.filledQuantity) fail();
     return { id: orderId, kind: 'order', status: terminal ? 'terminal' : 'working', ...size,
       price: optionalPrice(row.px), averagePrice: optionalPrice(row.avgPx), terminal, childrenSettled: terminal,
       symbol: spec.symbol, side: row.side, reduceOnly, positionSide, createdAt: iso(row.cTime),
@@ -180,8 +181,8 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     }, { signal, beforeMutation: mutationGuard(quote, spec, beforeMutation) });
     return ack(rows, spec);
   });
-  const inspect = wrapped(async (credentials, rawSpec, { accountMode, signal } = {}) => {
-    return readOrder(credentials, specOf(rawSpec), { accountMode: modeOf(accountMode), signal });
+  const inspect = wrapped(async (credentials, rawSpec, { accountMode, signal, cancelRecovery = false } = {}) => {
+    return readOrder(credentials, specOf(rawSpec), { accountMode: modeOf(accountMode), signal }, { cancelRecovery: cancelRecovery === true });
   });
   const amend = wrapped(async (credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) => {
     const mode = modeOf(accountMode), spec = specOf(rawSpec, true), readOptions = { accountMode: mode, signal };

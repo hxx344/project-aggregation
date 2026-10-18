@@ -264,6 +264,9 @@ class Store:
             try:
                 with db:
                     yield db
+                    writer = getattr(self, "account_writer", None)
+                    if writer is not None and db.in_transaction:
+                        writer.assert_current()
             finally:
                 if not scoped:
                     db.close()

@@ -8,7 +8,7 @@ const MAX_LINE = 24 * 1024 * 1024;
 const HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'x-workspace-key']);
 
 export async function createPythonModule({ root, secret, env, executable, application, label,
-  privateHeaders, requestTimeout = 60_000, startupTimeout = 90_000, shutdownTimeout = 10_000 }) {
+  privateHeaders, requestTimeout = 60_000, startupTimeout = 90_000, shutdownTimeout = 10_000, requireWriterProtection = false }) {
   const child = spawn(executable, ['-u', bridge, application, String(shutdownTimeout / 1000)], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   const pending = new Map();
   let counter = 0, buffer = '', closing = false, ready = false, failed = false;
@@ -103,8 +103,26 @@ export async function createPythonModule({ root, secret, env, executable, applic
   });
   const timer = setTimeout(fail, startupTimeout);
   try { await started; } catch (error) { closing = true; child.kill(); throw error; } finally { clearTimeout(timer); }
+  if (requireWriterProtection) {
+    try {
+      await new Promise((resolve, reject) => {
+        const id = ++counter;
+        let status;
+        const timer = setTimeout(() => { pending.delete(id); write({ type: 'cancel', id }); reject(new Error(`${label} account protection handshake timed out`)); }, 5000);
+        const response = { destroyed: false, writeHead(value) { status = value; return this; }, end(body) {
+          try {
+            const value = JSON.parse(Buffer.from(body || '').toString('utf8'));
+            if (status !== 200 || value.writerProtectionVersion !== 1 || typeof value.ready !== 'boolean' || !Number.isInteger(value.registeredConnections) || value.registeredConnections < 0) throw new Error('Invalid writer status');
+            resolve();
+          } catch { reject(new Error(`${label} shared account protection is unavailable`)); }
+        } };
+        pending.set(id, { response, timer });
+        write({ type: 'request', id, method: 'GET', url: '/__workspace/writer-status', scheme: 'http', headers: [['host', 'localhost'], ...privateHeaders], body: '' });
+      });
+    } catch (error) { closing = true; fail(); child.kill(); await exited; throw error; }
+  }
   let closePromise;
-  return { server, child, close() {
+  return { server, child, writerProtectionVersion: requireWriterProtection ? 1 : null, close() {
     return closePromise ??= (async () => {
       closing = true; ready = false;
       for (const { response, timer } of pending.values()) { clearTimeout(timer); if (!response.destroyed) response.writeHead(503).end(`${label} shutting down`); }

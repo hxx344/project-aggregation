@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { createStore } from '../server/store.mjs';
 import { createLiveRuntime } from '../server/live-runtime.mjs';
+import { createAccountWriter, accountKey } from '../../../server/execution/account-writer.mjs';
+import { createGateClient } from '../server/live-client.mjs';
 
 const epoch = 1791430000000;
 const symbols = ['BINANCE_FUTURE_BTC_USDT', 'BYBIT_FUTURE_BTC_USDT'];
@@ -43,10 +45,18 @@ function fixture(t, options = {}) {
     async previewClose(p, quantity) { return { kind: 'close', base: p.symbol.split('_')[2], expiresAt: now + 30000, warnings: [], legs: [{ symbol: p.symbol, exchange: 'binance', side: p.position_side === 'LONG' ? 'SELL' : 'BUY', positionSide: p.position_side, quantity: quantity ?? p.position_qty.replace(/^-/, ''), price: '100' }] }; },
     async revalidateClose() {},
   };
-  const runtimeOptions = { market, clientFactory: () => client, clock: () => now, requestTimeoutMs: 20, confirmationPollMs: 0, ...options };
+  const writers = [];
+  const makeWriter = () => {
+    const writer = createAccountWriter({ databasePath: join(directory, 'account-writer.sqlite'), moduleId: 'crossex', runtimeId: `fixture-${writers.length}`, now: () => now });
+    writers.push(writer); return writer;
+  };
+  const { managed = false, ...runtimeOverrides } = options;
+  const runtimeOptions = { market, clientFactory: () => client, clock: () => now, requestTimeoutMs: 20, confirmationPollMs: 0,
+    ...(managed ? { accountWriter: makeWriter() } : {}), ...runtimeOverrides };
   let runtime = createLiveRuntime(store, runtimeOptions);
-  t.after(async () => { await runtime.stop(); store.close(); const target = resolve(directory), child = relative(resolve(tmpdir()), target); assert.ok(child && !child.startsWith('..') && !isAbsolute(child) && child.startsWith('crossex-live-')); rmSync(target, { recursive: true, force: true }); });
+  t.after(async () => { await runtime.stop(); for (const writer of writers) writer.close(); store.close(); const target = resolve(directory), child = relative(resolve(tmpdir()), target); assert.ok(child && !child.startsWith('..') && !isAbsolute(child) && child.startsWith('crossex-live-')); rmSync(target, { recursive: true, force: true }); });
   return { store, calls, remote, directory, market, client, runtimeOptions,
+    get writer() { return runtimeOptions.accountWriter; },
     get runtime() { return runtime; }, get now() { return now; },
     account(value) { account = { ...account, ...value }; }, positions(value) { held = value; }, orders(value) { open = value; },
     mode(value) { responseMode = value; }, mutate(fn) { mutate = fn; }, onOrderRead(fn) { readHook = fn; }, onAccountRead(fn) { accountHook = fn; }, credentialsFail(value) { rejectCredentials = value; },
@@ -54,7 +64,8 @@ function fixture(t, options = {}) {
     async connect() { return runtime.connection({ apiKey: 'test-api-key-1234', apiSecret: 'test-secret-5678' }); },
     async preview() { return runtime.preview({ kind: 'open', signalId: 'signal-1' }); },
     async confirm(preview, requestId = 'request-test-001') { return runtime.confirm({ previewId: preview.id, requestId }); },
-    async reopen() { await runtime.stop(); runtime = createLiveRuntime(store, runtimeOptions); },
+    async enableManagement() { await runtime.stop(); runtimeOptions.accountWriter = makeWriter(); runtime = createLiveRuntime(store, runtimeOptions); },
+    async reopen() { await runtime.stop(); if (writers.includes(runtimeOptions.accountWriter)) { runtimeOptions.accountWriter.close(); runtimeOptions.accountWriter = makeWriter(); } runtime = createLiveRuntime(store, runtimeOptions); },
   };
 }
 
@@ -477,20 +488,364 @@ test('a follower cannot claim that another process has not submitted a request',
   finally { await follower.stop(); }
 });
 
-test('UID-less account snapshots and sparse final order descriptors remain usable', async t => {
+test('UID-less accounts remain readable and previewable but cannot confirm or cancel', async t => {
   const f = fixture(t); f.account({ user_id: undefined });
   f.mutate(row => { for (const key of ['user_id', 'position_side', 'reduce_only', 'time_in_force', 'price']) delete row[key]; });
   await f.connect(); assert.equal(f.runtime.view().live.connection.accountId, null);
-  const result = await f.confirm(await f.preview());
-  assert.equal(result.state, 'completed'); assert.equal(f.calls.create.length, 2);
+  await assert.rejects(f.confirm(await f.preview()), /账户 UID 尚未核实/);
+  assert.equal(f.runtime.view().live.tradingAllowed, false); assert.equal(f.calls.create.length, 0);
+  f.orders([{ order_id: 'external-uidless', text: 'external-text', symbol: symbols[0], side: 'BUY', state: 'OPEN', qty: '1', executed_qty: '0' }]);
+  await assert.rejects(f.runtime.cancel({ orderId: 'external-uidless', requestId: 'uidless-cancel-001' }), /账户 UID 尚未核实/);
+  assert.equal(f.calls.cancel.length, 0); assert.equal(f.store.prepare('SELECT COUNT(*) n FROM live_orders').get().n, 0);
   const stored = JSON.parse(f.store.db.prepare('SELECT json FROM live_connection').get().json);
   assert.equal(typeof stored.accountReference, 'string'); assert.equal(stored.accountReference.length, 64);
   assert.ok(!JSON.stringify(f.runtime.view()).includes(stored.accountReference));
 });
 
+test('known account identity permits sparse original-order descriptors without inventing UIDs', async t => {
+  const f = fixture(t, { managed: true });
+  f.mutate(row => { for (const key of ['user_id', 'position_side', 'reduce_only', 'time_in_force', 'price']) delete row[key]; });
+  await f.connect(); const result = await f.confirm(await f.preview());
+  assert.equal(result.state, 'completed'); assert.equal(f.calls.create.length, 2);
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'confirmed')?.count, 2);
+});
+
+test('managed Gate identity survives key rotation and one subject covers every venue leg', async t => {
+  const f = fixture(t, { managed: true }); await f.connect();
+  const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+  const first = f.writer.db.prepare('SELECT * FROM aw_bindings WHERE connection_id=?').get('crossex:live');
+  assert.equal(first.account_key, accountKey(identity));
+  await f.runtime.connection({ apiKey: 'rotated-test-api-9876', apiSecret: 'rotated-secret', accountUid: '999' });
+  const next = f.writer.db.prepare('SELECT * FROM aw_bindings WHERE connection_id=?').get('crossex:live');
+  assert.equal(next.account_key, first.account_key); assert.ok(next.generation > first.generation);
+  const execution = await f.confirm(await f.preview());
+  assert.equal(execution.state, 'completed'); assert.equal(f.calls.create.length, 2);
+  assert.equal(f.writer.db.prepare('SELECT COUNT(*) n FROM aw_accounts').get().n, 1);
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'confirmed')?.count, 2);
+});
+
+test('managed registration conflicts reject confirms and external cancels without false pending records', async t => {
+  const f = fixture(t, { managed: true }); await f.connect(); const preview = await f.preview();
+  f.writer.db.prepare("UPDATE aw_accounts SET module_id='other-module'").run();
+  await assert.rejects(f.confirm(preview), error => error.code === 'ACCOUNT_PINNED' && error.requestStatus === 'not_submitted');
+  f.orders([{ order_id: 'external-conflict', text: 'external-text', symbol: symbols[0], side: 'BUY', state: 'OPEN', qty: '1', executed_qty: '0' }]);
+  await assert.rejects(f.runtime.cancel({ orderId: 'external-conflict', requestId: 'conflicting-cancel-001' }), error => error.code === 'ACCOUNT_PINNED');
+  assert.equal(f.store.prepare('SELECT COUNT(*) n FROM live_orders').get().n, 0);
+  assert.equal(f.store.prepare('SELECT COUNT(*) n FROM live_requests').get().n, 0);
+  assert.equal(f.calls.create.length, 0); assert.equal(f.calls.cancel.length, 0);
+});
+
+test('managed unknown orders survive restart and resolve only after strict original-order evidence', async t => {
+  const f = fixture(t, { managed: true }); await f.connect(); f.mode('TIMEOUT');
+  const execution = await f.confirm(await f.preview());
+  const originalText = execution.legs[0].text;
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown')?.count, 1);
+  await f.reopen(); await f.runtime.refresh();
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown')?.count, 1);
+  assert.equal(f.calls.create.length, 1);
+  const original = f.calls.create[0];
+  f.remote.set('recovered-order', { ...original, user_id: '123', order_id: 'recovered-order', state: 'FILLED', executed_qty: original.qty, executed_avg_price: original.price });
+  await f.runtime.refresh();
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'confirmed')?.count, 1);
+  const duplicate = await f.runtime.requestStatus('request-test-001');
+  assert.equal(duplicate.result.legs[0].text, originalText); assert.equal(duplicate.result.legs[0].status, 'FILLED');
+  assert.equal(duplicate.result.legs[1].status, 'UNSENT'); assert.equal(f.calls.create.length, 1);
+});
+
+test('legacy unresolved orders enter the shared registry before any new managed write', async t => {
+  const f = fixture(t); await f.connect(); f.mode('TIMEOUT');
+  const execution = await f.confirm(await f.preview());
+  const row = f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(execution.legs[0].id), legacy = JSON.parse(row.json);
+  delete legacy.writerCreateId;
+  f.store.prepare('UPDATE live_orders SET json=? WHERE id=?').run(JSON.stringify(legacy), legacy.id);
+  await f.enableManagement(); await f.runtime.refresh();
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown')?.count, 1);
+  assert.equal(f.writer.db.prepare('SELECT operation_id FROM aw_operations').get().operation_id, `crossex:create:${legacy.text}`);
+  assert.equal(f.calls.create.length, 1); assert.equal(f.calls.cancel.length, 0);
+  await assert.rejects(f.preview(), /未知或待确认订单/);
+});
+
+test('legacy unresolved conflicts isolate the already registered writer as well as CrossEx', async t => {
+  const f = fixture(t); await f.connect(); f.mode('TIMEOUT'); await f.confirm(await f.preview());
+  const other = createAccountWriter({ databasePath: join(f.directory, 'account-writer.sqlite'), moduleId: 'other-module', runtimeId: 'legacy-conflict-test', now: () => f.now });
+  try {
+    const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+    other.bind('existing-writer', identity, 1); const ticket = other.claim([identity]);
+    await f.enableManagement();
+    assert.throws(() => other.assertOwned(ticket), error => error.code === 'ACCOUNT_ISOLATED');
+    assert.equal(f.runtime.view().live.tradingAllowed, false); assert.equal(f.calls.create.length, 1);
+    assert.equal(f.writer.db.prepare('SELECT COUNT(*) n FROM aw_isolations').get().n, 1);
+  } finally { other.close(); }
+});
+
+test('an unresolved shared operation cannot disconnect and discard the original credentials', async t => {
+  const f = fixture(t, { managed: true }); await f.connect();
+  const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+  f.writer.prepare(f.writer.claim([identity]), 'crossex:orphan:original-operation', { action: 'durable-original-target' });
+  await assert.rejects(f.runtime.disconnect(), error => error.code === 'BINDING_UNRESOLVED');
+  assert.equal(f.runtime.connectionView().connected, true); assert.equal(f.runtime.connectionView().version, 1);
+  const record = JSON.parse(f.store.prepare('SELECT json FROM live_connection').get().json);
+  assert.ok(record.apiKey && record.apiSecret); assert.equal(f.calls.create.length, 0);
+});
+
+test('shared unresolved originals block both account replacement and same-UID key rotation', async t => {
+  let f, candidateReads = 0;
+  f = fixture(t, { managed: true, clientFactory: options => options.apiKey.startsWith('candidate-') ? {
+    ...f.client, async getAccount() { candidateReads++; return { user_id: '456', position_mode: 'DUAL', account_mode: 'CROSS_EXCHANGE', available_margin: '10000', assets: [] }; },
+  } : f.client });
+  await f.connect();
+  const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' }, ticket = f.writer.claim([identity]);
+  f.writer.prepare(ticket, 'crossex:original:pending', { action: 'original-pending-operation' });
+  const original = f.store.prepare('SELECT json FROM live_connection').get().json;
+  for (const apiKey of ['candidate-other-account', 'rotated-same-account']) {
+    await assert.rejects(f.runtime.connection({ apiKey, apiSecret: 'candidate-secret' }), error => error.code === 'BINDING_UNRESOLVED');
+    assert.equal(f.store.prepare('SELECT json FROM live_connection').get().json, original);
+    assert.equal(f.writer.db.prepare('SELECT account_key FROM aw_bindings WHERE connection_id=?').get('crossex:live').account_key, accountKey(identity));
+  }
+  assert.equal(candidateReads, 0); assert.equal(f.calls.create.length, 0);
+  assert.equal(f.writer.unresolved(ticket)[0].operationId, 'crossex:original:pending');
+  // The synthetic operation has no transport call; rejecting it is the test's
+  // explicit evidence, after which rotating the same UID may proceed.
+  f.writer.resolve('crossex:original:pending', ticket, 'rejected');
+  await f.runtime.connection({ apiKey: 'rotated-same-account', apiSecret: 'rotated-secret' });
+  assert.equal(f.runtime.connectionView().accountId, '123'); assert.equal(f.runtime.connectionView().version, 2);
+  assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get('crossex:original:pending').state, 'rejected');
+});
+
+test('a pinned candidate rolls back the original account binding and leaves it writable', async t => {
+  let f;
+  f = fixture(t, { managed: true, clientFactory: options => options.apiKey === 'candidate-pinned' ? {
+    ...f.client, async getAccount() { return { user_id: '456', position_mode: 'DUAL', account_mode: 'CROSS_EXCHANGE', available_margin: '10000', assets: [] }; },
+  } : f.client });
+  await f.connect(); const original = f.store.prepare('SELECT json FROM live_connection').get().json;
+  const other = createAccountWriter({ databasePath: join(f.directory, 'account-writer.sqlite'), moduleId: 'other-module', runtimeId: 'candidate-pinned-test', now: () => f.now });
+  try {
+    const otherIdentity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '456' };
+    other.bind('other-live', otherIdentity, 1); other.claim([otherIdentity]);
+    await assert.rejects(f.runtime.connection({ apiKey: 'candidate-pinned', apiSecret: 'candidate-secret' }), error => error.code === 'ACCOUNT_PINNED');
+    assert.equal(f.store.prepare('SELECT json FROM live_connection').get().json, original);
+    const originalIdentity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+    assert.equal(f.writer.db.prepare('SELECT account_key FROM aw_bindings WHERE connection_id=?').get('crossex:live').account_key, accountKey(originalIdentity));
+    assert.equal(f.runtime.view().live.tradingAllowed, true);
+    const result = await f.confirm(await f.preview());
+    assert.equal(result.state, 'completed'); assert.equal(f.calls.create.length, 2);
+    assert.equal(f.runtime.connectionView().accountId, '123'); assert.equal(f.runtime.connectionView().version, 1);
+  } finally { other.close(); }
+});
+
+test('definite rejection evidence is durable before the shared result and survives either crash window', async t => {
+  for (const status of ['UNSENT', 'REJECT']) {
+    const f = fixture(t, { managed: true }); await f.connect();
+    f.client.createOrder = async () => {
+      if (status === 'UNSENT') throw Object.assign(new Error('blocked-before-fetch'), { code: 'GATE_SUBMISSION_BLOCKED' });
+      throw Object.assign(new Error('readonly-credential'), { code: 'GATE_HTTP_ERROR', uncertain: false, label: 'READ_ONLY' });
+    };
+    const finish = f.writer.finish.bind(f.writer); let checkpoint;
+    f.writer.finish = (operation, outcome) => {
+      if (outcome === 'rejected') {
+        const saved = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE text=?').get(operation.operationId.slice('crossex:create:'.length)).json);
+        assert.equal(saved.status, status); assert.equal(saved.writerRejectedState, status);
+        checkpoint = { operation, saved };
+        throw new Error('simulated-stop-before-shared-finish');
+      }
+      return finish(operation, outcome);
+    };
+    await assert.rejects(f.confirm(await f.preview()), /simulated-stop-before-shared-finish/);
+    assert.ok(checkpoint); assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(checkpoint.operation.operationId).state, 'sending');
+    await f.reopen(); await f.runtime.refresh();
+    assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(checkpoint.operation.operationId).state, 'rejected');
+    const restored = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(checkpoint.saved.id).json);
+    assert.equal(restored.status, status); assert.equal(restored.writerRejectedState, status);
+    assert.equal(restored.text, checkpoint.saved.text); assert.equal(f.calls.create.length, 0); assert.equal(f.calls.cancel.length, 0);
+  }
+});
+
+test('an older shared rejection recovers a local SENDING record without inventing an unknown order', async t => {
+  const f = fixture(t, { managed: true }); await f.connect();
+  f.client.createOrder = async () => { throw Object.assign(new Error('blocked-before-fetch'), { code: 'GATE_SUBMISSION_BLOCKED' }); };
+  const result = await f.confirm(await f.preview()), first = result.legs[0];
+  const row = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(first.id).json);
+  row.status = 'SENDING'; delete row.writerRejectedState;
+  f.store.prepare('UPDATE live_orders SET state=?,json=? WHERE id=?').run('SENDING', JSON.stringify(row), row.id);
+  await f.reopen(); await f.runtime.refresh();
+  const recovered = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(row.id).json);
+  assert.equal(recovered.status, 'REJECT'); assert.equal(recovered.writerRejectedState, 'REJECT');
+  assert.equal(recovered.text, row.text); assert.equal(recovered.executedQty, '0');
+  assert.equal(f.writer.snapshot().operations.find(item => item.state === 'unknown'), undefined);
+  assert.equal(f.calls.create.length, 0); assert.equal(f.calls.cancel.length, 0);
+});
+
+test('a later signed UID binds the same connection and migrates its existing unknown orders', async t => {
+  const f = fixture(t); await f.connect(); f.mode('TIMEOUT'); await f.confirm(await f.preview());
+  const connection = JSON.parse(f.store.prepare('SELECT json FROM live_connection').get().json);
+  connection.accountUid = null;
+  f.store.prepare('UPDATE live_connection SET json=?').run(JSON.stringify(connection));
+  f.account({ user_id: undefined }); await f.enableManagement();
+  assert.equal(f.runtime.view().live.tradingAllowed, false);
+  f.client.getAccountDetail = async () => ({ user_id: 123 });
+  await f.runtime.refresh();
+  assert.equal(f.runtime.connectionView().accountId, '123');
+  assert.equal(f.runtime.connectionView().version, connection.version);
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown')?.count, 1);
+  assert.equal(f.calls.create.length, 1);
+});
+
+test('a crash after shared preparation leaves a durable never-sent leg rejected on recovery', async t => {
+  const f = fixture(t, { managed: true }); await f.connect(); const plan = await f.preview();
+  const order = { id: 'prepared-local-order', executionId: 'prepared-local-execution', index: 0, text: 'cx-prepared-original',
+    writerCreateId: 'crossex:create:cx-prepared-original', version: 1, status: 'PREPARED', symbol: symbols[0], exchange: 'binance',
+    side: 'BUY', positionSide: 'LONG', quantity: '1', price: '100', reduceOnly: false, orderType: 'LIMIT', timeInForce: 'IOC',
+    executedQty: '0', orderId: null, createdAt: f.now, updatedAt: f.now, error: null };
+  f.store.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(order.executionId, plan.id, f.now,
+    JSON.stringify({ id: order.executionId, previewId: plan.id, connectionVersion: 1, accountUid: '123', kind: 'open', createdAt: f.now }));
+  f.store.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)').run(order.id, order.executionId, order.text, 1, order.status, f.now, JSON.stringify(order));
+  const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+  f.writer.prepare(f.writer.claim([identity]), order.writerCreateId, { action: 'create_order', identity,
+    order: { symbol: order.symbol, side: order.side, position_side: order.positionSide, qty: order.quantity, price: order.price, type: order.orderType, time_in_force: order.timeInForce, reduce_only: 'false', text: order.text } });
+  await f.reopen();
+  assert.equal(JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(order.id).json).status, 'UNSENT');
+  assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(order.writerCreateId).state, 'rejected');
+  assert.equal(f.calls.create.length, 0);
+});
+
+test('the actual Gate fetch guard catches a lease lost after the runtime submission check', async t => {
+  let f, finalCheck, networkWrites = 0;
+  f = fixture(t, { managed: true, clientFactory: options => { finalCheck = options.beforeSubmit; return f.client; } });
+  f.client.createOrder = async body => {
+    f.writer.db.prepare('UPDATE aw_accounts SET lease_until=?').run(f.now - 1);
+    const gate = createGateClient({ apiKey: 'test-key', apiSecret: 'test-secret', clock: () => f.now, beforeSubmit: finalCheck,
+      fetcher: async () => { networkWrites++; return new Response(JSON.stringify({ order_id: 'should-not-send', text: body.text })); } });
+    return gate.createOrder(body);
+  };
+  await f.connect(); const result = await f.confirm(await f.preview());
+  assert.equal(networkWrites, 0); assert.equal(result.legs[0].status, 'SENDING');
+  assert.equal(result.legs[1].status, 'PREPARED'); assert.equal(f.runtime.view().live.tradingAllowed, false);
+});
+
+test('the actual Gate fetch guard rejects payload drift before any remote write', async t => {
+  let f, finalCheck, networkWrites = 0;
+  f = fixture(t, { managed: true, clientFactory: options => { finalCheck = options.beforeSubmit; return f.client; } });
+  f.client.createOrder = async body => createGateClient({ apiKey: 'test-key', apiSecret: 'test-secret', clock: () => f.now, beforeSubmit: finalCheck,
+    fetcher: async () => { networkWrites++; return new Response('{}'); } }).createOrder({ ...body, qty: '2' });
+  await f.connect(); const result = await f.confirm(await f.preview());
+  assert.equal(networkWrites, 0); assert.ok(result.legs.every(leg => leg.status === 'UNSENT'));
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'rejected')?.count, 1);
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown'), undefined);
+});
+
+test('a prepared create cannot reach Gate after another shared operation becomes unknown', async t => {
+  let f, finalCheck, networkWrites = 0;
+  f = fixture(t, { managed: true, clientFactory: options => { finalCheck = options.beforeSubmit; return f.client; } });
+  f.client.createOrder = async body => {
+    const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+    f.writer.importUnknown(f.writer.claim([identity]), 'crossex:other:late-unknown', { action: 'other-unresolved-original' });
+    return createGateClient({ apiKey: 'test-key', apiSecret: 'test-secret', clock: () => f.now, beforeSubmit: finalCheck,
+      fetcher: async () => { networkWrites++; return new Response(JSON.stringify({ order_id: 'should-not-send', text: body.text })); } }).createOrder(body);
+  };
+  await f.connect(); const result = await f.confirm(await f.preview());
+  assert.equal(networkWrites, 0); assert.ok(result.legs.every(leg => leg.status === 'UNSENT'));
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'rejected')?.count, 1);
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown')?.count, 1);
+  assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(result.legs[0].writerCreateId).state, 'rejected');
+  await f.runtime.refresh();
+  assert.equal(f.runtime.view().live.tradingAllowed, false); assert.equal((await f.preview()).canConfirm, false);
+});
+
+test('a finished create operation is rejected at the final Gate boundary without losing the valid lease', async t => {
+  let f, finalCheck, networkWrites = 0, operation;
+  f = fixture(t, { managed: true, clientFactory: options => { finalCheck = options.beforeSubmit; return f.client; } });
+  const originalCreate = f.client.createOrder;
+  const prepare = f.writer.prepare.bind(f.writer);
+  f.writer.prepare = (...args) => { operation = prepare(...args); return operation; };
+  f.client.createOrder = async body => {
+    f.writer.finish(operation, 'rejected');
+    return createGateClient({ apiKey: 'test-key', apiSecret: 'test-secret', clock: () => f.now, beforeSubmit: finalCheck,
+      fetcher: async () => { networkWrites++; return new Response(JSON.stringify({ order_id: 'should-not-send', text: body.text })); } }).createOrder(body);
+  };
+  await f.connect(); const result = await f.confirm(await f.preview());
+  assert.equal(networkWrites, 0); assert.ok(result.legs.every(leg => leg.status === 'UNSENT'));
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown'), undefined);
+  assert.equal(f.writer.assertOwned(operation, 0), true);
+  f.client.createOrder = originalCreate;
+  await f.runtime.refresh(); assert.equal(f.runtime.view().live.tradingAllowed, true);
+  const next = await f.preview(); assert.equal(next.canConfirm, true);
+  const retried = await f.confirm(next, 'after-finished-create-002');
+  assert.equal(retried.state, 'completed'); assert.equal(f.calls.create.length, 2);
+});
+
+test('a finished cancel operation cannot reach Gate or leave a false pending cancellation', async t => {
+  let f, finalCheck, networkWrites = 0, operation;
+  f = fixture(t, { managed: true, clientFactory: options => { finalCheck = options.beforeSubmit; return f.client; } });
+  const prepare = f.writer.prepare.bind(f.writer);
+  f.writer.prepare = (...args) => { operation = prepare(...args); return operation; };
+  f.client.cancelOrder = async orderId => {
+    f.writer.finish(operation, 'rejected');
+    return createGateClient({ apiKey: 'test-key', apiSecret: 'test-secret', clock: () => f.now, beforeSubmit: finalCheck,
+      fetcher: async () => { networkWrites++; return new Response(JSON.stringify({ order_id: orderId, text: 'external-text' })); } }).cancelOrder(orderId);
+  };
+  const raw = { order_id: 'external-late-cancel', text: 'external-text', symbol: symbols[0], side: 'BUY', state: 'OPEN', qty: '1', executed_qty: '0', type: 'LIMIT', price: '100', time_in_force: 'GTC', position_side: 'LONG' };
+  f.orders([raw]); await f.connect();
+  const request = { orderId: raw.order_id, requestId: 'late-cancel-operation-001' };
+  const result = await f.runtime.cancel(request);
+  assert.equal(networkWrites, 0); assert.equal(result.status, 'UNSENT'); assert.equal(result.order.status, 'OPEN');
+  assert.equal(result.order.writerCancelId, undefined);
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown'), undefined);
+  const duplicate = await f.runtime.cancel(request);
+  assert.equal(duplicate.status, 'UNSENT'); assert.equal(duplicate.order.status, 'OPEN'); assert.equal(networkWrites, 0);
+  await f.runtime.refresh(); assert.equal(f.runtime.view().live.tradingAllowed, true);
+  f.orders([]); f.remote.set(raw.order_id, { ...raw, state: 'CANCELLED' });
+  await f.runtime.refresh();
+  const next = await f.preview(); assert.equal(next.canConfirm, true);
+  const retried = await f.confirm(next, 'after-finished-cancel-002');
+  assert.equal(retried.state, 'completed'); assert.equal(f.calls.create.length, 2);
+});
+
+test('a stale writer cannot persist a late fill or send the following leg', async t => {
+  const f = fixture(t, { managed: true, requestTimeoutMs: 2000 }); await f.connect();
+  let complete, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  f.client.createOrder = body => { f.calls.create.push(clone(body)); started(); return new Promise(resolve => { complete = () => resolve({ ...body, user_id: '123', order_id: 'late-order', state: 'FILLED', executed_qty: body.qty }); }); };
+  const pending = f.confirm(await f.preview()); await ready;
+  f.writer.db.prepare('UPDATE aw_accounts SET fence=fence+1').run();
+  complete(); const result = await pending;
+  assert.equal(f.calls.create.length, 1); assert.equal(result.legs[0].status, 'SENDING');
+  assert.equal(result.legs[0].executedQty, '0'); assert.equal(result.legs[0].orderId, null);
+  assert.equal(result.legs[1].status, 'PREPARED');
+});
+
+test('managed cancel intents stay unresolved on OPEN evidence and settle once without repeating DELETE', async t => {
+  const f = fixture(t, { managed: true }); await f.connect(); f.mode('OPEN');
+  const execution = await f.confirm(await f.preview());
+  await f.runtime.cancel({ orderId: execution.legs[0].id, requestId: 'managed-cancel-001' });
+  await f.runtime.refresh();
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown')?.count, 1);
+  const original = f.remote.get(execution.legs[0].orderId); original.state = 'CANCELLED';
+  await f.runtime.refresh(); await f.reopen(); await f.runtime.refresh();
+  assert.equal(f.writer.snapshot().operations.find(row => row.state === 'unknown'), undefined);
+  assert.equal(f.calls.cancel.length, 1); assert.equal(f.calls.create.length, 1);
+});
+
+test('a crash between shared cancel preparation and local sending rejects only the unsent cancel', async t => {
+  const f = fixture(t, { managed: true }); await f.connect(); f.mode('OPEN');
+  const execution = await f.confirm(await f.preview());
+  const row = f.store.prepare('SELECT * FROM live_orders WHERE id=?').get(execution.legs[0].id), order = JSON.parse(row.json);
+  order.writerCancelId = 'crossex:cancel:prepared-crash'; order.writerCancelPrepared = true;
+  f.store.prepare('UPDATE live_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.id);
+  const identity = { authority: 'gate-crossex', environment: 'mainnet', accountId: '123' };
+  const ticket = f.writer.claim([identity]);
+  f.writer.prepare(ticket, order.writerCancelId, { action: 'cancel_order', identity, orderId: order.orderId, symbol: order.symbol, text: order.text });
+  await f.reopen(); await f.runtime.refresh();
+  const restored = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(order.id).json);
+  assert.equal(restored.status, 'OPEN'); assert.equal(restored.writerCancelId, undefined);
+  assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(order.writerCancelId).state, 'rejected');
+  assert.equal(f.calls.cancel.length, 0);
+});
+
 test('optional account detail UID is checked and later snapshots cannot mix account identities', async t => {
   const f = fixture(t); f.client.getAccountDetail = async () => ({ user_id: 456 });
   await assert.rejects(f.connect(), /账户验证/); assert.equal(f.runtime.view().live.connection.connected, false);
+  f.account({ user_id: undefined }); f.client.getAccountDetail = async () => ({ user_id: Number.MAX_SAFE_INTEGER + 1 });
+  await assert.rejects(f.connect(), /账户验证/);
   f.account({ user_id: undefined }); delete f.client.getAccountDetail; await f.connect();
   f.account({ user_id: '123' }); f.positions([{ user_id: '456', symbol: symbols[0], position_side: 'LONG', position_qty: '1' }]);
   await f.runtime.refresh(); assert.equal(f.runtime.view().live.tradingAllowed, false);

@@ -25,6 +25,7 @@ process.on('message', async message => {
     process.chdir(root);
     const { createModule } = await import(`./${id}.mjs`);
     application = await createModule({ root, dataDir, secret, environment, transports });
+    if (['crossex', 'greeks', 'aster'].includes(id) && application.writerProtectionVersion !== 1) throw new Error('Module account protection was not initialized');
     const handlers = application.server.listeners('request');
     application.server.removeAllListeners('request');
     application.server.on('request', (request, response) => {

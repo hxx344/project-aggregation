@@ -10,7 +10,7 @@ const declarations = {
 
 export function moduleCapabilities(id) {
   if (!Object.hasOwn(declarations, id)) throw new Error('Unknown embedded module');
-  return { schemaVersion: 1, moduleId: id, ...structuredClone(declarations[id]), readinessVersion: null, accountWriterVersion: null };
+  return { schemaVersion: 1, moduleId: id, ...structuredClone(declarations[id]), readinessVersion: null, accountWriterVersion: ['crossex', 'greeks', 'aster'].includes(id) ? 1 : null };
 }
 
 function matches(value, expected) {

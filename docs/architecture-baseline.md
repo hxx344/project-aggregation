@@ -1,6 +1,6 @@
 # 架构实施基线与批次进度
 
-本文件记录 [架构实现方案](architecture-implementation.md) 的实际接入边界。2026-10-19 首批建立 M0 的能力协商、持续采样和写入口清单；四周生产样本仍需用户升级后积累，跨模块账户保护属于下一阶段 M1。
+本文件记录 [架构实现方案](architecture-implementation.md) 的实际接入边界。2026-10-19 建立 M0 的能力协商、持续采样和写入口清单，随后接入 M1 的真实账户身份与跨模块写入保护。四周生产样本仍需用户升级后积累，恢复演练属于后续 M2。
 
 ## 已接入的基线
 
@@ -10,9 +10,9 @@
 | --- | --- | --- | --- | --- | --- |
 | Monitor | 1、2 | 无 | 无 | `/healthz` | 未接入 |
 | Asset | 2 | 无 | 无 | `/api/health` | 未接入 |
-| CrossEx | 1、2 | 1 | 1 | `/api/health` | 未接入 |
-| Greeks | 2 | 1 | 1 | `/api/health` | 未接入 |
-| ASTER | 2 | 1 | 1 | `/api/health` | 未接入 |
+| CrossEx | 1、2 | 1 | 1 | `/api/health` | 1 |
+| Greeks | 2 | 1 | 1 | `/api/health` | 1 |
+| ASTER | 2 | 1 | 1 | `/api/health` | 1 |
 
 健康路径只描述现有读取入口，五模块均未声明统一 readiness。更新准入在三个交易模块进入维护后核对能力，再读取原有完整停机证据；身份、版本、字段或读取结果不符合当前契约时拒绝更新，仍等待所有并发检查结束后恢复维护状态。
 
@@ -22,6 +22,7 @@
 | --- | --- |
 | `/api/system/architecture` | 通过私有 IPC 核对五模块能力；不可用时按模块返回 `unavailable`，不回退外部地址 |
 | `/api/system/metrics` | 读取当前本地观测和最近最多 60 个分钟桶，不调用模块或交易所、不采集新样本 |
+| `/api/system/accounts` | 读取共享保护库的账户域、模块归属、身份核验数量、操作状态数量和隔离原因；不返回 UID、连接名、原始意图、订单号或凭据 |
 
 采样默认每分钟独立运行，无浏览器也会持续执行。记录存入 Hub 库的附加表 `platform_baseline_samples`，以分钟时间为主键，最多保留 28 天及 40,320 行，每条 JSON 不超过 16 KiB。重复启动或重复采样覆盖同一分钟，不增加时间分母；停机缺口保持缺失，时钟回拨到已记录分钟之前暂停写入并标记错误。
 
@@ -48,28 +49,52 @@
 
 ## 真实写入口清单
 
-以下为源码入口清单，不包含生产账户 UID 或凭据。当前保护均局限于相应执行器，五模块能力不会把本地锁声明为跨模块账户锁。
+以下为源码入口清单，不包含生产账户 UID 或凭据。工作台实际启动器将统一保护接入 Hub 和三个交易模块，保留各执行器已有的本地运行锁、维护门和恢复机制。
 
 | 写入域 | 触发与最终写出位置 | 身份与现有保护 | 幂等及未知结果恢复 | M1 覆盖 |
 | --- | --- | --- | --- | --- |
-| Hub 原生订单 | 预览确认后的 jobs、停止与核对；[执行器](../server/trading-execution.mjs) → [交易所适配器](../server/trading-execution-exchanges.mjs)、[OKX 执行](../server/trading-okx-execution.mjs) | 会话、预览和账户 revision；60 s 全局租约、资源锁及发送前检查。账户表按 exchange 主键；部分连接没有可靠外部 UID | 持久 request/job/order、确定性 clientId；未知请求查询原单，旧所有者晚回执拒绝覆盖 | 尚无跨模块账户注册 |
-| CrossEx 订单 | [HTTP](../modules/crossex/server/app.mjs) 的 `/api/live/confirm`、`/api/live/cancel` → [live-runtime](../modules/crossex/server/live-runtime.mjs) → [live-client](../modules/crossex/server/live-client.mjs) | 连接代次、已确认的 Gate UID、本地 `live_owner` 与维护门；Gate 身份不自动等于所有底层交易所账户身份 | 本地请求和订单记录、客户端身份、恢复核对；保留不确定状态 | 未接入共享写入准入 |
-| Greeks 限价及恢复 | [API](../modules/greeks/app/main.py) 的 `/api/trading/tasks`、停止；[engine](../modules/greeks/app/engine.py) 的调度、核对和失败腿恢复 → [bybit](../modules/greeks/app/bybit.py) | 模拟或实盘模式、执行锁、状态文件锁、维护门；缺少统一账户 UID 注册 | 持久任务、orderLinkId 与成交核对；单腿失败和未决执行保留原身份 | 未接入共享写入准入 |
-| Greeks RFQ | 同一 API 的 `/api/rfq/create`、`/api/rfq/execute`、`/api/rfq/cancel` → engine → bybit | 原有模式、风控及 RFQ 未决保护 | RFQ link/id、报价和执行核对；不能将重复 execute 假设为交易所幂等 | 未接入共享写入准入 |
-| ASTER 订单与杠杆 | [engine](../modules/aster/trading/engine.py)、[cycle](../modules/aster/trading/cycle.py)、[ADL](../modules/aster/trading/adl.py) 的账户、配对和后台动作 → [exchange](../modules/aster/trading/exchange.py) | 原有账户身份、配置代次、运行实例锁、预算和[维护控制](../modules/aster/trading/workspace_control.py) | 持久 intent、pending、post-fill 和 recovery watch；成交后验证源现场，未知不能清零 | 未接入共享写入准入 |
-| ASTER 资金划转 | [margin_balance](../modules/aster/trading/margin_balance.py) 的配对保证金平衡与恢复 | 已验证子账户、签名身份、持久 pending 与发送前保护；与订单权限分别核对 | 保留原划转身份、历史及余额证据；未知写入不自动重试 | 未接入共享写入准入 |
+| Hub 原生订单 | 预览确认后的 jobs、停止与核对；[执行器](../server/trading-execution.mjs) → [交易所适配器](../server/trading-execution-exchanges.mjs)、[OKX 执行](../server/trading-okx-execution.mjs) | 会话、预览和账户 revision；全局租约、资源锁及真实 UID 注册 | 持久 request/job/order、确定性 clientId；未知请求查询原单，旧所有者晚回执拒绝覆盖 | 全账户准入、创建/改单/撤单的最终 HTTP 守卫及回执写入守卫 |
+| CrossEx 订单 | [HTTP](../modules/crossex/server/app.mjs) 的 `/api/live/confirm`、`/api/live/cancel` → [live-runtime](../modules/crossex/server/live-runtime.mjs) → [live-client](../modules/crossex/server/live-client.mjs) | 连接代次、已确认的 Gate UID、本地 `live_owner` 与维护门；Gate 身份不自动等于所有底层交易所账户身份 | 本地请求和订单记录、客户端身份、恢复核对；保留不确定状态 | Gate CrossEx 账户域的准入、最终 HTTP 及状态写入守卫 |
+| Greeks 限价及恢复 | [API](../modules/greeks/app/main.py) 的 `/api/trading/tasks`、停止；[engine](../modules/greeks/app/engine.py) 的调度、核对和失败腿恢复 → [bybit](../modules/greeks/app/bybit.py) | 模拟或实盘模式、执行锁、状态文件锁、维护门及 Bybit 当前用户 UID | 持久任务、orderLinkId 与成交核对；单腿失败和未决执行保留原身份 | 创建/改单/撤单及恢复；与 Hub 的同一 Bybit 主体互斥 |
+| Greeks RFQ | 同一 API 的 `/api/rfq/create`、`/api/rfq/execute`、`/api/rfq/cancel` → engine → bybit | 原有模式、风控及 RFQ 未决保护 | RFQ link/id、报价和执行核对；不能将重复 execute 假设为交易所幂等 | 三类 RFQ 最终 HTTP 守卫，保留原 RFQ 恢复身份 |
+| ASTER 订单与杠杆 | [engine](../modules/aster/trading/engine.py)、[cycle](../modules/aster/trading/cycle.py)、[ADL](../modules/aster/trading/adl.py) 的账户、配对和后台动作 → [exchange](../modules/aster/trading/exchange.py) | 已认证的 user 钱包、配置代次、运行实例锁、预算和[维护控制](../modules/aster/trading/workspace_control.py) | 持久 intent、pending、post-fill 和 recovery watch；成交后验证源现场，未知不能清零 | 单账户与配对整体准入、后台线程、订单和杠杆最终 HTTP 及存储守卫 |
+| ASTER 资金划转 | [margin_balance](../modules/aster/trading/margin_balance.py) 的配对保证金平衡与恢复 | 已验证子账户、签名身份、持久 pending 与发送前保护；与订单权限分别核对 | 保留原划转身份、历史及余额证据；未知写入不自动重试 | 同时取得涉及的账户，持久具体划转语义，最终 HTTP 与确认回执守卫 |
 
 Monitor 没有交易所订单写入；其订阅、通知与本地配置写入另属数据采集和外部通知。Asset 的同步、导入、估值与配置会写本地账本，但不代表交易账户下单或划转。CrossEx 连接、预览与刷新，以及 Greeks 交易计划预览也不能算作已发送订单。
 
-M1 需要将 HTTP 与后台写入路径一并接入最终发送前边界，识别生产或测试环境、外部账户 UID、子账户和写入模块。同一账户的 API Key 轮换不得产生新身份；缺失可靠身份时不能启用共享写入或自动接管。
+## M1 账户与持久保护
+
+统一注册键为 `authority + environment + accountId` 的散列；API Key、签名者、模块显示名与本地账户名都不能构成新主体。父账户证据作为绑定元数据保存其散列，不替代当前子账户 UID；API Key 或签名者轮换仍受同一主体的模块归属约束。
+
+| 实际适配器 | 身份证据 | 账户域 |
+| --- | --- | --- |
+| Hub Binance | 签名 USER_DATA `/api/v3/account` 的 `uid`；保留大整数精度 | `binance/mainnet` |
+| Hub / Greeks Bybit | 私有 `/v5/user/query-api` 的当前 `userID`；Greeks 同时核验父子信息 | `bybit/mainnet`，Greeks 测试账户为 `bybit/testnet` |
+| Hub OKX | 已有私有账户配置的 UID | `okx/mainnet` |
+| CrossEx | Gate CrossEx 私有认证返回的 `user_id` | `gate-crossex/mainnet` |
+| ASTER | 成功认证账户读取证明的 `user` 钱包，规范为小写地址 | `aster/mainnet` |
+
+CrossEx 的 `BINANCE_`、`OKX_` 等交易场所前缀不提供底层原生账户 UID。因此 Gate CrossEx 主体不伪装成同名原生账户；本批不声称已经证明 Gate 与某个 Binance/OKX 原生账户相同。未知身份、缺少凭据的旧未决库存或损坏状态保留对应账户域的未知绑定，保持只读并阻止该域其他模块取得新的写许可。
+
+保护由 [Node 核心](../server/execution/account-writer.mjs) 和 [Python 核心](../server/execution/account_writer.py) 共用 `DATA_DIR/execution-control.sqlite`。SQLite 使用 WAL、短事务和最多 750 ms 的争用等待；首次创建原子发布 `.required` 标记。数据库或标记缺失、身份变更、替换或不可信路径均拒绝继续写入，不自动创建空库绕过旧 fence。保留数据库、WAL 和标记，不将删除注册库当成解锁手段。
+
+账户归属固定到模块；租约过期不会允许别的模块接管。同模块仅在旧进程已退出或已完成关闭后接管，fence 单调增加。租约 60 s，5 s 心跳，最终请求保留请求预算和 10 s 余量；时间倒退或真正失去所有权会终止旧写者的写入资格。单个账户隔离不续约该账户，也不拖垮同实例中无关账户。
+
+任务第一腿前一次取得完整账户集合。每次副作用先持久化具体语义的操作 ID 和内容散列，再在实际 HTTP 出站及状态提交处检查原 ticket、绑定代次、fence 和未决状态。同一父任务的已准备多腿可并发；任何 UNKNOWN 阻止新风险操作。UNKNOWN amend 仅允许在核对原单后撤销同一账户、同一标的和同一原订单，不能因此换号建单；终态核对才解除 amend 的未知记录。
+
+已确认、明确未发送和明确拒绝的私有回执先于共享操作结算落盘，恢复按原操作身份衔接两套存储。请求超时和失联保留 UNKNOWN，查询未找到不等于未发送；旧实例晚回执不能覆盖新写者状态。旧版本未决操作迁入核对，发现同一主体已有跨模块旧交易则持久隔离，不自动挑选胜者。只读查询和本地停止仍可使用，资金撤单仍须合法所有权。
+
+实际监督器覆盖模块 `.env` 中的保护上下文，Python 核心路径固定在本发布的 `server/execution/`；模块不能改指向另一个空库。三个交易 worker 仅在确认实际执行器支持协议 1 后就绪；Python 通过已认证 stdio 私有状态完成握手，身份核验失败的只读状态仍可就绪。能力协议与真实执行器不一致时启动失败。`metrics.coverage.crossModuleAccountProtection` 仅表示工作台已接入此保护，不表示完成实盘、全账户健康或四周生产验收。
+
+回滚保留业务库、操作身份和整个保护库，使用仍具协议 1 的健康版本。首次 M1 若需回退到不具该保护的旧程序，须保持交易模块维护/只读，完成原操作核对后再修复升级；不能恢复旧自动交易或重置 fence。程序回滚不能撤销已发生的成交或划转。本批没有执行服务器部署或真实资金请求；非 WSL Linux 权限、打包与生命周期行为由既有 CI 验证。
 
 ## 后续批次
 
 | 批次 | 状态 | 下一项可核验交付 |
 | --- | --- | --- |
-| M0 基础接入 | 本批实现 | 发布包验证和用户升级后持续采样；补足尚未覆盖 SLI，积累四周生产基线 |
-| M1a 账户身份与准入 | 待实施，最高优先级 | 按上述清单提供可信账户身份与所有写入入口，拒绝跨模块同账户冲突 |
-| M1b 租约与核对 | 依赖 M1a | 多账户整体取得、fence、旧实例隔离、持久原单恢复 |
+| M0 基础接入 | 已交付基础能力 | 用户升级后持续采样；补足尚未覆盖 SLI，积累四周生产基线 |
+| M1a 账户身份与准入 | 已接入实现 | 真实主体、环境和父子证据；冲突或身份缺失拒绝资金写入 |
+| M1b 租约与核对 | 已接入实现 | 全账户首腿前准入、fence、晚回执隔离和持久原操作恢复；审查与发布检查按本批证据收口 |
 | M2 备份与恢复 | 可在 M0 基础上并行 | 一致性备份、隔离恢复、密钥恢复及非 WSL Linux 演练 |
 | M3 至 M7 | 保持原依赖 | 依次推进生命周期、双槽、共享数据、主库切换和多实例；不跳过执行保护或恢复证据 |
 

@@ -39,6 +39,7 @@ async def lifespan(_: FastAPI):
         try:
             engine._load_state()
             engine._initialize_trade_tasks(persist=True)
+            await engine.account_writer.initialize()
             account_cache.invalidate()
             await engine.refresh_chain(force=True)
             tasks = [asyncio.create_task(engine.market_loop()), asyncio.create_task(engine.scheduler()), asyncio.create_task(engine.reconciliation_loop()), asyncio.create_task(engine.performance_loop())]
@@ -51,6 +52,7 @@ async def lifespan(_: FastAPI):
                 await engine.shutdown_trade_tasks()
             finally:
                 await engine.client.close()
+                engine.account_writer.close()
 
 
 app = FastAPI(title="BTC Iron Condor", version="0.1.0", lifespan=lifespan)
@@ -62,6 +64,11 @@ async def workspace_update_status():
     return update_status(engine)
 
 
+@app.get("/__workspace/writer-status", include_in_schema=False)
+async def workspace_writer_status():
+    return engine.account_writer.status()
+
+
 @app.post("/__workspace/maintenance", include_in_schema=False)
 async def workspace_maintenance(request: Request):
     try:
@@ -70,6 +77,8 @@ async def workspace_maintenance(request: Request):
         raise HTTPException(status_code=422, detail="Invalid maintenance state") from exc
     if not isinstance(value, dict) or set(value) != {"active"} or not isinstance(value["active"], bool):
         raise HTTPException(status_code=422, detail="Invalid maintenance state")
+    if not value["active"] and not engine.account_writer.ready:
+        await engine.account_writer.initialize()
     engine.workspace_maintenance = value["active"]
     return {"active": engine.workspace_maintenance, **update_status(engine)}
 

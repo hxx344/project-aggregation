@@ -24,7 +24,7 @@ const credentialError = () => new AppError('账户验证未完成，请核对 AP
 /** Private reads are automatic. Every exchange write requires a fresh manual API action. */
 export function createLiveRuntime(store, { market, clientFactory = createGateClient, clock = Date.now,
   freshnessMs = 15000, requestTimeoutMs = 12000, ownerLeaseMs = 60000, confirmationPollMs = 15000, pollIntervalMs = 250,
-  confirmationWaitMs = 20000, postConfirmRefreshMs = 2000, capacityTimeoutMs = 4000, capacityRiskTtlMs = 5000 } = {}) {
+  confirmationWaitMs = 20000, postConfirmRefreshMs = 2000, capacityTimeoutMs = 4000, capacityRiskTtlMs = 5000, accountWriter } = {}) {
   if (!market) throw new Error('Live runtime requires a market reader');
   const db = store.db, owner = id();
   db.exec(`CREATE TABLE IF NOT EXISTS live_connection (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);
@@ -48,6 +48,139 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   const findOrder = orderId => { const row = store.prepare('SELECT json FROM live_orders WHERE id=? OR text=?').get(orderId, orderId); return row ? JSON.parse(row.json) : orderRecords().find(o => o.orderId === orderId); };
   const getExecution = executionId => { const row = store.prepare('SELECT json FROM live_executions WHERE id=?').get(executionId); return row ? executionView(JSON.parse(row.json)) : null; };
   let stopped = false, lostOwnership = false, queue = Promise.resolve(), queuedOperations = 0, clientVersion = null, privateClient = null, supplementalFlight = null, supplementalAttempt = -Infinity;
+  let writerTicket = null, writerError = null, writerLost = false, activeSubmission = null, writerHistoryReady = !accountWriter;
+  const writerScope = { authority: 'gate-crossex', environment: 'mainnet' }, bindingId = 'crossex:live';
+  // CrossEx authenticates one Gate subject. Venue prefixes are instruments,
+  // never evidence of the underlying exchanges' native account identities.
+  const writerIdentity = record => record?.enabled && record.accountUid ? { ...writerScope, accountId: record.accountUid } : null;
+  function writerFailure(error) {
+    const failure = new AppError('账户写入保护未通过，仅允许读取和原单核对', 409);
+    if (typeof error?.code === 'string' && /^[A-Z_]{1,80}$/.test(error.code)) failure.code = error.code;
+    writerError = failure.message; return failure;
+  }
+  function recoveryFailure(error, record) {
+    if (accountWriter && error?.code === 'ACCOUNT_PINNED' && writerIdentity(record) && activeOrders().length) {
+      accountWriter.freeze([writerIdentity(record)], 'legacy-conflict');
+    }
+    writerError = writerFailure(error).message;
+  }
+  function bindWriter(record) {
+    if (!accountWriter) return;
+    writerHistoryReady = false;
+    try {
+      accountWriter.bind(bindingId, writerIdentity(record), record?.version ?? 0, writerScope);
+      writerTicket = writerIdentity(record) ? accountWriter.claim([writerIdentity(record)]) : null;
+      writerError = null;
+    } catch (error) { writerTicket = null; throw writerFailure(error); }
+  }
+  function assertWriter(ticket = writerTicket, budgetMs = requestTimeoutMs) {
+    assertOwner();
+    if (!writerIdentity(connectionRecord())) fail('账户 UID 尚未核实，仅允许读取和预览');
+    if (!accountWriter) return;
+    if (writerLost || !ticket) throw writerFailure();
+    try { accountWriter.assertOwned(ticket, budgetMs); }
+    catch (error) {
+      const operationDenied = budgetMs > 0 && ticket.operationId && ['ACCOUNT_UNRESOLVED', 'ALREADY_SUBMITTED', 'ALREADY_REJECTED', 'OPERATION_UNRESOLVED', 'OPERATION_NOT_FOUND', 'OPERATION_CONFLICT'].includes(error?.code);
+      if (!operationDenied) writerLost = true;
+      throw writerFailure(error);
+    }
+  }
+  function claimWriter(record) {
+    if (!writerIdentity(record)) fail('账户 UID 尚未核实，仅允许读取和预览');
+    if (!accountWriter) return null;
+    if (writerLost || !writerHistoryReady) throw writerFailure();
+    try { writerTicket = accountWriter.claim([writerIdentity(record)]); }
+    catch (error) { throw writerFailure(error); }
+    assertWriter(writerTicket); writerError = null; return writerTicket;
+  }
+  function assertConnectionSettled(record) {
+    if (!accountWriter || !writerIdentity(record)) return;
+    try {
+      const ticket = claimWriter(record);
+      if (accountWriter.unresolved(ticket).length) throw writerFailure({ code: 'BINDING_UNRESOLVED' });
+    } catch (error) { throw writerFailure(error); }
+  }
+  function mayPersist(ticket = writerTicket) {
+    if (!owns()) return false;
+    if (!accountWriter) return true;
+    try { assertWriter(ticket, 0); return true; } catch { return false; }
+  }
+  function createPayload(order) {
+    return { symbol: order.symbol, side: order.side, position_side: order.positionSide, qty: order.quantity,
+      ...(order.orderType === 'LIMIT' ? { price: order.price } : {}), type: order.orderType,
+      time_in_force: order.timeInForce, reduce_only: String(order.reduceOnly), text: order.text };
+  }
+  const createOperation = order => order.writerCreateId || `crossex:create:${order.text}`;
+  const createSemantic = (order, record) => ({ action: 'create_order', identity: writerIdentity(record), order: createPayload(order) });
+  const cancelSemantic = (order, record) => ({ action: 'cancel_order', identity: writerIdentity(record), orderId: order.orderId, symbol: order.symbol, text: order.clientText ?? order.text });
+  function prepareOperation(ticket, operationId, payload) {
+    assertWriter(ticket);
+    if (!accountWriter) return null;
+    try { return accountWriter.prepare(ticket, operationId, payload); }
+    catch (error) { throw writerFailure(error); }
+  }
+  function finishOperation(operation, outcome) {
+    if (!accountWriter || !operation) return;
+    assertWriter(operation, 0);
+    accountWriter.finish(operation, outcome);
+  }
+  function clearSettledWriterError(ticket) {
+    if (!accountWriter || writerLost) return;
+    assertWriter(ticket, 0);
+    if (accountWriter.unresolved(ticket).length === 0) writerError = null;
+  }
+  function resolveOperation(operationId, ticket, outcome = 'confirmed') {
+    if (!accountWriter || !operationId) return;
+    assertWriter(ticket, 0);
+    try { accountWriter.resolve(operationId, ticket, outcome); }
+    catch (error) { if (error?.code !== 'OPERATION_NOT_FOUND') throw writerFailure(error); }
+  }
+  function resolveOrder(order, ticket = writerTicket) {
+    if (!order.external) resolveOperation(createOperation(order), ticket, order.writerRejectedState ? 'rejected' : 'confirmed');
+    if (order.writerCancelId && !order.writerCancelPrepared && TERMINAL.has(order.status)) resolveOperation(order.writerCancelId, ticket);
+  }
+  function importWriterHistory(record) {
+    if (!accountWriter) return;
+    if (!record?.enabled) { writerHistoryReady = true; return; }
+    if (!writerTicket) return;
+    if (activeOrders().some(order => order.version !== record.version)) throw writerFailure();
+    for (const order of orderRecords().filter(order => order.version === record.version)) {
+      if (order.writerCancelPrepared) {
+        resolveOperation(order.writerCancelId, writerTicket, 'rejected');
+        delete order.writerCancelId; delete order.writerCancelPrepared;
+        assertWriter(writerTicket, 0); writeOrder(order);
+      }
+      if (order.status === 'UNSENT') {
+        if (order.writerCreateId) resolveOperation(order.writerCreateId, writerTicket, 'rejected');
+        continue;
+      }
+      if (TERMINAL.has(order.status) && !order.writerCreateId && !order.writerCancelId) continue;
+      if (!order.external) {
+        const operation = accountWriter.importUnknown(writerTicket, createOperation(order), createSemantic(order, record));
+        if (operation.state === 'rejected') {
+          if (!D(order.executedQty).isZero() || order.orderId || order.raw) throw writerFailure({ code: 'OPERATION_CONFLICT' });
+          order.status = order.writerRejectedState === 'UNSENT' ? 'UNSENT' : 'REJECT';
+          order.writerRejectedState = order.status;
+          order.error = '原操作已明确拒绝，不会重新发送此订单';
+          assertWriter(writerTicket, 0); writeOrder(order);
+        }
+      }
+      if (order.status === 'CANCEL_PENDING' || order.writerCancelId) {
+        if (!order.writerCancelId) { order.writerCancelId = `crossex:cancel:legacy:${order.id}`; assertWriter(writerTicket, 0); writeOrder(order); }
+        accountWriter.importUnknown(writerTicket, order.writerCancelId, cancelSemantic(order, record));
+      }
+      if (order.writerRejectedState || TERMINAL.has(order.status) && order.raw && validateOrderResult(order, order.raw)) resolveOrder(order);
+    }
+    writerHistoryReady = true;
+  }
+  function beforeSubmit({ method, path, payload }) {
+    const active = activeSubmission, record = connectionRecord();
+    if (!active || record?.version !== active.version || record?.accountUid !== active.accountUid
+      || method !== active.method || (method === 'POST' ? hash(Object.entries(payload).sort()) !== active.payloadHash : path !== `/crossex/orders/${active.orderId}`)
+      || active.expiresAt !== undefined && (clock() >= active.expiresAt || remaining(active.deadline) <= 0 || configFingerprint() !== active.configFingerprint)) fail('连接或发送许可已变化');
+    assertWriter(active.ticket);
+  }
+  const newClient = credentials => clientFactory({ ...credentials, clock, beforeSubmit });
   const capacityReads = new Map(), capacityFlights = new Set();
   function exclusive(fn) {
     queuedOperations++;
@@ -91,13 +224,17 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       else if (order.status === 'SENDING') { order.status = 'UNKNOWN'; order.error = '服务中断，正在按原订单标识只读核对'; writeOrder(order); }
     }
   }
-  if (takeOwnership()) recoverUnsent(); else lostOwnership = true;
+  if (takeOwnership()) {
+    recoverUnsent();
+    try { bindWriter(connectionRecord()); importWriterHistory(connectionRecord()); }
+    catch (error) { recoveryFailure(error, connectionRecord()); }
+  } else lostOwnership = true;
   const heartbeat = setInterval(() => { if (!stopped && owns()) store.prepare('UPDATE live_owner SET expires_at=? WHERE singleton=1 AND owner=?').run(clock() + ownerLeaseMs, owner); }, Math.max(1000, Math.floor(ownerLeaseMs / 3)));
   heartbeat.unref();
   function getClient(record = connectionRecord()) {
     if (!record?.enabled) fail('请先连接 Gate CrossEx 账户');
     if (clientVersion !== record.version) {
-      privateClient = clientFactory({ apiKey: store.decrypt(record.apiKey), apiSecret: store.decrypt(record.apiSecret), clock }); clientVersion = record.version;
+      privateClient = newClient({ apiKey: store.decrypt(record.apiKey), apiSecret: store.decrypt(record.apiSecret) }); clientVersion = record.version;
     }
     return privateClient;
   }
@@ -114,6 +251,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function remoteUid(value) {
     if (value === undefined || value === null) return null;
+    if (typeof value === 'number' && !Number.isSafeInteger(value)) throw credentialError();
     if (!['string', 'number'].includes(typeof value) || !/^[1-9][0-9]{0,39}$/.test(String(value))) throw credentialError();
     return String(value);
   }
@@ -169,7 +307,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (TERMINAL.has(order.status) && result.state !== order.status) return false;
     return true;
   }
-  function applyResult(order, result) {
+  function applyResult(order, result, ticket = writerTicket) {
+    if (!mayPersist(ticket)) return false;
     if (!validateOrderResult(order, result)) {
       order.status = 'INVALID'; order.error = '订单回报身份、状态或累计成交不一致，已冻结写操作'; writeOrder(order); return false;
     }
@@ -177,7 +316,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     order.orderId = String(result.order_id); order.executedQty = D(result.executed_qty).toString();
     order.status = wasCancel && ACTIVE.has(result.state) ? 'CANCEL_PENDING' : result.state;
     order.exchangeState = result.state; order.executedAmount = result.executed_amount ?? null; order.averagePrice = result.executed_avg_price ?? null;
-    order.raw = result; order.error = order.status === 'CANCEL_PENDING' ? '撤单请求已发送，等待交易所终态' : null; writeOrder(order); return true;
+    order.raw = result; order.error = order.status === 'CANCEL_PENDING' ? '撤单请求已发送，等待交易所终态' : null; writeOrder(order);
+    resolveOrder(order, ticket); return true;
   }
   async function reconcileOrder(order, client, knownOrders, deadline = Infinity) {
     let result = knownOrders.find(o => (order.orderId && String(o.order_id) === order.orderId) || o.text === order.text);
@@ -190,7 +330,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       }
     }
     if (result) applyResult(order, result);
-    else { order.status = order.status === 'CANCEL_PENDING' ? 'CANCEL_PENDING' : 'UNKNOWN'; order.error = '未能确认原订单状态；不会重新发单，请等待或在交易所核对'; writeOrder(order); }
+    else if (mayPersist()) { order.status = order.status === 'CANCEL_PENDING' ? 'CANCEL_PENDING' : 'UNKNOWN'; order.error = '未能确认原订单状态；不会重新发单，请等待或在交易所核对'; writeOrder(order); }
   }
   async function readConnectionAccount(client, exchangeType) {
     try { return { account: await bounded(client.getAccount(exchangeType)), exchangeType }; }
@@ -256,17 +396,29 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   async function refreshInternal({ deadline = Infinity, reconcile = true, includeView = true } = {}) {
     assertOwner();
-    const record = connectionRecord(); if (!record?.enabled) return includeView ? view() : undefined;
+    let record = connectionRecord(); if (!record?.enabled) return includeView ? view() : undefined;
     const client = getClient(record), previous = cacheRecord(), readStartedAt = clock();
     try {
-      const [account, positions, openOrders] = await Promise.all([
+      const [account, positions, openOrders, detail] = await Promise.all([
         withinDeadline(() => client.getAccount(record.exchangeType), deadline),
         withinDeadline(() => client.getPositions(), deadline),
         withinDeadline(() => client.getOpenOrders(), deadline),
+        !record.accountUid && typeof client.getAccountDetail === 'function'
+          ? withinDeadline(() => bounded(client.getAccountDetail(), Math.min(requestTimeoutMs, 2000)), deadline).catch(() => null) : null,
       ]);
       if (!owns() || connectionRecord()?.version !== record.version) fail('连接版本已变化');
       const observedAccountUid = verifyUid(validateAccount(account), record.accountUid);
       validateLists(positions, openOrders, record.accountUid ?? observedAccountUid);
+      const uids = new Set([observedAccountUid, remoteUid(detail?.user_id), ...positions.map(position => remoteUid(position.user_id)), ...openOrders.map(order => remoteUid(order.user_id))].filter(Boolean));
+      if (uids.size > 1) throw credentialError();
+      if (!record.accountUid && uids.size === 1) {
+        record = { ...record, accountUid: [...uids][0], verifiedAt: clock() };
+        // Credentials and original connection generation stay unchanged. The
+        // newly signed identity invalidates UID-less previews and binds recovery.
+        putSingleton('live_connection', record);
+        try { bindWriter(record); importWriterHistory(record); }
+        catch (error) { recoveryFailure(error, record); }
+      }
       if (reconcile) for (const order of activeOrders().filter(o => o.version === record.version && o.status !== 'PREPARED')) await reconcileOrder(order, client, openOrders, deadline);
       putSingleton('live_cache', { account, positions, openOrders, version: record.version, asOf: readStartedAt, error: null });
       void refreshSupplemental();
@@ -279,11 +431,13 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     assertOwner();
     if (!object(input) || typeof input.apiKey !== 'string' || typeof input.apiSecret !== 'string' || !input.apiKey.trim() || !input.apiSecret.trim() || input.apiKey.length > 1024 || input.apiSecret.length > 2048) throw credentialError();
     if (input.exchangeType !== undefined && (typeof input.exchangeType !== 'string' || !/^[A-Z][A-Z0-9_]{0,31}$/.test(input.exchangeType))) fail('交易所类型格式无效', 400);
-    const previous = connectionRecord();
+    let previous = connectionRecord();
     if (previous?.enabled) await refreshInternal({ includeView: false });
+    previous = connectionRecord();
     if (activeOrders().length || cacheRecord().openOrders?.some(o => !TERMINAL.has(o.state))) fail('仍有活动或未知订单，不能更换凭据或账户');
     if (previous?.enabled && cacheRecord().error) fail('原账户状态未核实，不能更换凭据或账户');
-    const candidate = clientFactory({ apiKey: input.apiKey.trim(), apiSecret: input.apiSecret.trim(), clock });
+    assertConnectionSettled(previous);
+    const candidate = newClient({ apiKey: input.apiKey.trim(), apiSecret: input.apiSecret.trim() });
     let account, positions, openOrders, accountDetail, exchangeType;
     const readStartedAt = clock();
     let accountUid;
@@ -300,16 +454,37 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     }
     catch { throw credentialError(); }
     assertOwner();
+    assertConnectionSettled(previous);
     const record = { enabled: true, version: (previous?.version || 0) + 1, accountUid, accountReference: hash(input.apiKey.trim()), keySuffix: input.apiKey.trim().slice(-4),
       apiKey: store.encrypt(input.apiKey.trim()), apiSecret: store.encrypt(input.apiSecret.trim()), exchangeType, verifiedAt: clock(), tradePermission: 'unknown' };
-    store.transaction(() => { putSingleton('live_connection', record); putSingleton('live_cache', { account, positions, openOrders, version: record.version, asOf: readStartedAt, error: null }); });
+    const previousCache = readSingleton('live_cache'); let saved = false;
+    try {
+      bindWriter(record);
+      store.transaction(() => { putSingleton('live_connection', record); putSingleton('live_cache', { account, positions, openOrders, version: record.version, asOf: readStartedAt, error: null }); });
+      saved = true; importWriterHistory(record);
+    } catch (error) {
+      if (saved) store.transaction(() => {
+        if (previous) putSingleton('live_connection', previous); else store.prepare('DELETE FROM live_connection WHERE singleton=1').run();
+        if (previousCache) putSingleton('live_cache', previousCache); else store.prepare('DELETE FROM live_cache WHERE singleton=1').run();
+      });
+      // A rejected candidate must not replace the still-valid connection's
+      // binding or ticket. The rollback gets a fresh binding generation.
+      try { bindWriter(previous); importWriterHistory(previous); }
+      catch (restoreError) { recoveryFailure(restoreError, previous); }
+      throw error;
+    }
     privateClient = candidate; clientVersion = record.version; supplementalAttempt = -Infinity; void refreshSupplemental(); return connectionView();
   }
   function disconnectInternal() {
     assertOwner();
     if (activeOrders().length || cacheRecord().openOrders?.some(o => !TERMINAL.has(o.state))) fail('仍有活动或未知订单，请先核实订单后断开');
     const record = connectionRecord();
+    if (accountWriter) {
+      try { accountWriter.releaseBinding(bindingId); }
+      catch (error) { throw writerFailure(error); }
+    }
     if (record) putSingleton('live_connection', { ...record, enabled: false, apiKey: null, apiSecret: null, version: record.version + 1 });
+    writerTicket = null; writerError = null; writerHistoryReady = !accountWriter;
     privateClient = null; clientVersion = null; return connectionView();
   }
   function checkPositionLimit(plan, cache) {
@@ -545,7 +720,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const risk = await riskPreview(plan, record, cache);
     const preview = { ...plan, id: id(), createdAt: clock(), expiresAt: Math.min(plan.expiresAt || Infinity, clock() + 30000),
       connectionVersion: record.version, accountUid: record.accountUid, accountFingerprint: accountFingerprint(cache), configFingerprint: configFingerprint(), positionId: selected.length === 1 ? selected[0].positionId : null,
-      selectedPositionSide: selected.length === 1 ? selected[0].positionSide : null, positions: selected, risk, feeEstimate: feeEstimate(plan, record.version), canConfirm: true,
+      selectedPositionSide: selected.length === 1 ? selected[0].positionSide : null, positions: selected, risk, feeEstimate: feeEstimate(plan, record.version), canConfirm: !!record.accountUid && !writerError && !writerLost,
       warnings: [...(plan.warnings || []), '这是实盘订单，交易权限未能预先核实，最终由 Gate 校验',
         ...(selected.some(p => p.directionSource === 'quantity_sign') ? ['单向净仓方向按持仓数量符号推导；减仓单仅减少持仓，不跨过零仓位'] : []),
         ...(input.kind === 'open' && plan.legs.length === 2 ? ['两腿依次提交；第一腿未在本次确认中全成则不发送第二腿，可能留下单边敞口，需手动处理'] : []),
@@ -583,11 +758,14 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (currentRisk && plan.risk && hash(currentRisk.legs.map(l => [l.symbol, l.leverage])) !== hash(plan.risk.legs.map(l => [l.symbol, l.leverage]))) fail('账户杠杆已变化，请重新预览');
     assertOwner();
     if (remaining(deadline) <= 0 || clock() >= plan.expiresAt || connectionRecord()?.version !== record.version || configFingerprint() !== plan.configFingerprint) fail('预览或连接已变化，请重新预览');
+    const ticket = claimWriter(record);
     const execution = { id: id(), requestId, previewId: plan.id, kind: plan.kind, ...(plan.kind === 'position' ? { action: plan.action, strategy: plan.strategy, targetQuantity: plan.targetQuantity } : {}), base: plan.base, accountUid: record.accountUid, connectionVersion: record.version, createdAt: clock(), updatedAt: clock() };
     const legs = plan.legs.map((leg, index) => ({ id: id(), executionId: execution.id, index, text: `cx-${id()}`, version: record.version, status: 'PREPARED',
       symbol: leg.symbol, exchange: leg.exchange, side: leg.side, positionSide: leg.positionSide, quantity: D(leg.quantity).toString(), price: D(leg.price).toString(),
       reduceOnly: plan.kind === 'position' ? leg.reduceOnly : plan.kind === 'close', orderType: leg.orderType || 'LIMIT', timeInForce: leg.timeInForce || 'IOC', executedQty: '0', orderId: null, createdAt: clock(), updatedAt: clock(), error: null }));
+    for (const order of legs) order.writerCreateId = createOperation(order);
     store.transaction(() => {
+      assertWriter(ticket, 0);
       store.prepare('UPDATE live_previews SET consumed=1 WHERE id=?').run(plan.id);
       store.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(execution.id, plan.id, clock(), JSON.stringify(execution));
       for (const leg of legs) writeOrder(leg);
@@ -600,37 +778,48 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       const currentConnection = connectionRecord();
       if (['open', 'position'].includes(plan.kind) && index && legs[index - 1].status !== 'FILLED' || remaining(deadline) <= 0 || clock() >= plan.expiresAt || !owns()
         || !currentConnection?.enabled || currentConnection.version !== record.version || currentConnection.accountUid !== record.accountUid || configFingerprint() !== plan.configFingerprint) {
-        if (owns()) { order.status = 'UNSENT'; order.error = '前腿未全成、确认超时或设置/连接已变化，此腿没有发送；请管理实际敞口'; writeOrder(order); } continue;
+        if (mayPersist(ticket)) { order.status = 'UNSENT'; order.error = '前腿未全成、确认超时或设置/连接已变化，此腿没有发送；请管理实际敞口'; writeOrder(order); } continue;
       }
-      order.status = 'SENDING'; writeOrder(order);
+      let operation = null, invoked = false;
       try {
-        const response = await withinDeadline(() => client.createOrder({ symbol: order.symbol, side: order.side, position_side: order.positionSide, qty: order.quantity,
-          ...(order.orderType === 'LIMIT' ? { price: order.price } : {}), type: order.orderType, time_in_force: order.timeInForce, reduce_only: String(order.reduceOnly), text: order.text }), deadline);
-        if (owns()) {
+        operation = prepareOperation(ticket, order.writerCreateId, createSemantic(order, record));
+        const submissionTicket = operation ?? ticket;
+        assertWriter(submissionTicket); order.status = 'SENDING'; writeOrder(order);
+        activeSubmission = { ticket: submissionTicket, version: record.version, accountUid: record.accountUid, method: 'POST',
+          payloadHash: hash(Object.entries(createPayload(order)).sort()), expiresAt: plan.expiresAt, deadline, configFingerprint: plan.configFingerprint };
+        const response = await withinDeadline(() => { assertWriter(submissionTicket); invoked = true; return client.createOrder(createPayload(order)); }, deadline);
+        if (mayPersist(ticket)) {
           if (object(response) && response.order_id && response.text === order.text && response.state === undefined) {
             order.orderId = String(response.order_id); order.status = 'UNKNOWN'; order.error = '交易所已接单，成交尚待核实'; writeOrder(order);
             await reconcileOrder(order, client, [], deadline);
-          } else applyResult(order, response);
-          while ((order.orderType === 'MARKET' || ['IOC', 'FOK'].includes(order.timeInForce)) && owns() && ACTIVE.has(order.status) && remaining(deadline) > 0 && performance.now() - confirmationStarted < confirmationPollMs && performance.now() - legStarted < legPollMs && clock() < plan.expiresAt) {
+          } else applyResult(order, response, ticket);
+          while ((order.orderType === 'MARKET' || ['IOC', 'FOK'].includes(order.timeInForce)) && mayPersist(ticket) && ACTIVE.has(order.status) && remaining(deadline) > 0 && performance.now() - confirmationStarted < confirmationPollMs && performance.now() - legStarted < legPollMs && clock() < plan.expiresAt) {
             await new Promise(resolve => setTimeout(resolve, Math.min(remaining(deadline), pollIntervalMs, Math.max(1, legPollMs - (performance.now() - legStarted)))));
-            if (remaining(deadline) <= 0 || performance.now() - confirmationStarted >= confirmationPollMs || performance.now() - legStarted >= legPollMs || clock() >= plan.expiresAt || !owns()) break;
+            if (remaining(deadline) <= 0 || performance.now() - confirmationStarted >= confirmationPollMs || performance.now() - legStarted >= legPollMs || clock() >= plan.expiresAt || !mayPersist(ticket)) break;
             await reconcileOrder(order, client, [], deadline);
           }
         }
       } catch (error) {
-        if (owns()) {
+        if (mayPersist(ticket)) {
           // No transport/API failure is proof that a write did not reach Gate.
-          if (error.code === 'GATE_HTTP_ERROR' && error.uncertain === false && error.label === 'READ_ONLY') {
-            order.status = 'REJECT'; order.error = 'Gate 明确拒绝：此凭据只有读取权限'; putSingleton('live_connection', { ...record, tradePermission: 'denied' });
+          let outcome = 'unknown', denied = false;
+          if (!invoked || error.code === 'GATE_SUBMISSION_BLOCKED') {
+            order.status = 'UNSENT'; order.error = '账户写入许可未通过，此腿没有发送'; outcome = 'rejected';
+          } else if (error.code === 'GATE_HTTP_ERROR' && error.uncertain === false && error.label === 'READ_ONLY') {
+            order.status = 'REJECT'; order.error = 'Gate 明确拒绝：此凭据只有读取权限'; outcome = 'rejected'; denied = true;
           } else { order.status = 'UNKNOWN'; order.error = '提交结果未能核实，正在按原订单标识查询；不会重试下单'; }
+          if (outcome === 'rejected') order.writerRejectedState = order.status;
           writeOrder(order);
+          if (denied) putSingleton('live_connection', { ...record, tradePermission: 'denied' });
+          finishOperation(operation, outcome);
+          if (outcome === 'rejected') clearSettledWriterError(ticket);
         }
-      }
+      } finally { activeSubmission = null; }
     }
     // Refresh actual balances/positions once, within this request's remaining
     // budget. This read is not part of the durable execution result and cannot
     // turn a recorded fill into a failed request.
-    if (owns() && connectionRecord()?.version === record.version) {
+    if (mayPersist(ticket) && connectionRecord()?.version === record.version) {
       putSingleton('live_cache', { ...cacheRecord(), error: '订单结果已记录，等待更新账户与实际持仓快照' });
       if (remaining(deadline) > 0 && postConfirmRefreshMs > 0) {
         try { await refreshInternal({ deadline: Math.min(deadline, performance.now() + postConfirmRefreshMs), reconcile: false, includeView: false }); }
@@ -654,13 +843,41 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
         reduceOnly: String(raw.reduce_only) === 'true', status: raw.state, createdAt: clock(), updatedAt: clock(), external: true, raw };
     }
     if (order.version !== record.version || !order.orderId || !ACTIVE.has(order.status)) fail('订单状态尚未确认、已结束或撤单处理中，不能重复撤单');
+    const ticket = claimWriter(record), original = copy(order);
+    const operationId = `crossex:cancel:${requestId}`;
+    // Persist the original target before the shared intent. This marker proves
+    // a restart before CANCEL_PENDING could not have reached the transport.
+    order.writerCancelId = operationId; order.writerCancelPrepared = true;
+    assertWriter(ticket, 0); writeOrder(order);
+    let operation;
+    try { operation = prepareOperation(ticket, operationId, cancelSemantic(order, record)); }
+    catch (error) { if (mayPersist(ticket)) writeOrder(original); throw error; }
+    order.writerCancelPrepared = false;
     order.status = 'CANCEL_PENDING'; order.error = '撤单请求待交易所确认';
     const result = { requestId, orderId: order.id, status: 'CANCEL_PENDING' };
-    store.transaction(() => { writeOrder(order); store.prepare('INSERT INTO live_requests VALUES (?,?,?,?)').run(requestId, fingerprint, 'cancel', JSON.stringify(result)); });
+    store.transaction(() => { assertWriter(ticket, 0); writeOrder(order); store.prepare('INSERT INTO live_requests VALUES (?,?,?,?)').run(requestId, fingerprint, 'cancel', JSON.stringify(result)); });
+    let invoked = false;
     try {
+      const submissionTicket = operation ?? ticket;
+      activeSubmission = { ticket: submissionTicket, version: record.version, accountUid: record.accountUid, method: 'DELETE', orderId: order.orderId };
+      assertWriter(submissionTicket); invoked = true;
       const response = await bounded(getClient(record).cancelOrder(order.orderId));
-      if (owns() && object(response) && response.state) applyResult(order, response);
-    } catch { /* Preserve cancel intent; background reconciliation never cancels again. */ }
+      if (mayPersist(ticket) && object(response) && response.state) applyResult(order, response, ticket);
+    } catch (error) {
+      if ((!invoked || error.code === 'GATE_SUBMISSION_BLOCKED') && mayPersist(ticket)) {
+        const unsent = { ...original, writerCancelId: operationId, writerCancelPrepared: true };
+        result.status = 'UNSENT';
+        store.transaction(() => {
+          assertWriter(ticket, 0); writeOrder(unsent);
+          store.prepare('UPDATE live_requests SET result=? WHERE id=?').run(JSON.stringify(result), requestId);
+        });
+        finishOperation(operation, 'rejected');
+        delete unsent.writerCancelId; delete unsent.writerCancelPrepared; writeOrder(unsent);
+        clearSettledWriterError(ticket);
+      }
+      // Other failures retain the cancel intent; reconciliation never retries DELETE.
+    }
+    finally { activeSubmission = null; if (mayPersist(ticket) && findOrder(order.id)?.status === 'CANCEL_PENDING') finishOperation(operation, 'unknown'); }
     return { ...result, order: findOrder(order.id) };
   }
   function positionView(p, at, adl = []) {
@@ -705,6 +922,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (stale) reasons.push('账户数据已过期');
     if (cache.error) reasons.push(cache.error);
     if (unknown) reasons.push('存在未知或待确认订单，只能继续查询');
+    if (connected && !record.accountUid) reasons.push('账户 UID 尚未核实，仅允许读取和预览');
+    if (writerError) reasons.push(writerError);
     if (!knownMode) reasons.push('账户持仓模式不明');
     if (record?.tradePermission === 'denied') reasons.push('此凭据只有读取权限');
     if (!owns()) reasons.push('本实例未持有执行锁');
@@ -717,7 +936,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return { ...market.view({ ...options, includeFundingOpportunities: options?.includeOpportunities === false ? false : options?.includeFundingOpportunities,
       includePositionFunding: options?.includeFundingOpportunities === true, positionSymbols: held.map(p => p.symbol) }), mode: 'live', live: {
       connection: connectionView(record, cache),
-      status: freshnessState, freshnessState, stale, partial, asOf: cache.asOf, tradingAllowed: connected && !stale && !partial && knownMode && record?.tradePermission !== 'denied' && owns(), reasons,
+      status: freshnessState, freshnessState, stale, partial, asOf: cache.asOf, tradingAllowed: connected && !!record.accountUid && !writerError && !writerLost && !stale && !partial && knownMode && record?.tradePermission !== 'denied' && owns(), reasons,
       account: cache.account, balances: Array.isArray(cache.account?.assets) ? cache.account.assets : [],
       positions: held.map(p => positionView(p, cache.asOf, details.adl || [])),
       orders: [...current.map(o => orderView(o)), ...externalOrders.map(o => orderView(o, true))].slice(0, 300),
@@ -732,8 +951,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const stale = !cache.asOf || clock() - cache.asOf > freshnessMs || cache.asOf > clock() + 1000;
     const externalOrders = cache.openOrders.filter(raw => !orders.some(o => o.orderId === String(raw.order_id) || o.text === raw.text));
     const knownMode = ['SINGLE', 'DUAL'].includes(cache.account?.position_mode) && ['CROSS_EXCHANGE', 'ISOLATED_EXCHANGE'].includes(cache.account?.account_mode);
-    const state = !connected ? 'offline' : cache.error || unknown.length || !knownMode ? 'partial' : stale ? 'stale' : 'online';
-    const message = !connected ? '尚未连接 Gate CrossEx 实盘账户' : cache.error || (unknown.length ? '存在未知或待确认订单，仅继续只读对账' : !knownMode ? '账户模式尚未核实，仅可查看' : stale ? '账户快照已过期' : '实盘账户已同步，仅接受手动确认下单');
+    const state = !connected ? 'offline' : cache.error || unknown.length || !knownMode || !record.accountUid || writerError ? 'partial' : stale ? 'stale' : 'online';
+    const message = !connected ? '尚未连接 Gate CrossEx 实盘账户' : cache.error || writerError || (!record.accountUid ? '账户 UID 尚未核实，仅允许读取和预览' : unknown.length ? '存在未知或待确认订单，仅继续只读对账' : !knownMode ? '账户模式尚未核实，仅可查看' : stale ? '账户快照已过期' : '实盘账户已同步，仅接受手动确认下单');
     return { name: 'Gate CrossEx', mode: 'live', updatedAt: connected && cache.asOf ? new Date(cache.asOf).toISOString() : null,
       health: { state, message, staleAfterSeconds: Math.floor(freshnessMs / 1000) },
       metrics: [

@@ -19,7 +19,7 @@ import { writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 export async function createModule({ root, dataDir, environment, transports }) {
   const id = path.basename(root);
-  await writeFile(path.join(dataDir, 'started.json'), JSON.stringify({ id, pid: process.pid, socketPath: transports[id].socketPath, maintenance: environment.WORKSPACE_MAINTENANCE }));
+  await writeFile(path.join(dataDir, 'started.json'), JSON.stringify({ id, pid: process.pid, socketPath: transports[id].socketPath, maintenance: environment.WORKSPACE_MAINTENANCE, writerDb: environment.WORKSPACE_WRITER_DB, runtimeId: environment.WORKSPACE_RUNTIME_ID, writerModule: environment.WORKSPACE_WRITER_MODULE }));
   if (environment.FIXTURE_START === 'fail') throw new Error('fixture startup failure');
   if (environment.FIXTURE_START === 'hang') await new Promise(() => {});
   let closing;
@@ -30,7 +30,7 @@ export async function createModule({ root, dataDir, environment, transports }) {
       tcpListeners: process._getActiveHandles().filter(handle => handle instanceof net.Server && handle.listening && typeof handle.address() !== 'string').length }));
     if (req.url === '/crash') setTimeout(() => process.exit(27), 20);
   });
-  return { server, close() {
+  return { server, writerProtectionVersion: environment.FIXTURE_START === 'unguarded' ? null : 1, close() {
     return closing ??= (async () => {
       await delay(Number(environment.FIXTURE_CLOSE_DELAY_MS || 0));
       if (server.listening) await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
@@ -82,7 +82,7 @@ async function fixture(t, { modes = {}, closeDelay = 0, omitRoot } = {}) {
     await writeFile(path.join(root, 'server/modules', `${id}.mjs`), fixtureSource);
     const moduleData = path.join(dataDir, 'modules', id);
     await mkdir(moduleData, { recursive: true });
-    await writeFile(path.join(moduleData, '.env'), `FIXTURE_START=${modes[id] || 'ok'}\nFIXTURE_CLOSE_DELAY_MS=${closeDelay}\nWORKSPACE_MAINTENANCE=0\n`);
+    await writeFile(path.join(moduleData, '.env'), `FIXTURE_START=${modes[id] || 'ok'}\nFIXTURE_CLOSE_DELAY_MS=${closeDelay}\nWORKSPACE_MAINTENANCE=0\nWORKSPACE_WRITER_DB=untrusted.sqlite\nWORKSPACE_RUNTIME_ID=untrusted\nWORKSPACE_WRITER_MODULE=untrusted.py\n`);
   }
   const record = async id => JSON.parse(await readFile(path.join(dataDir, 'modules', id, 'started.json'), 'utf8'));
   const records = async () => {
@@ -124,6 +124,11 @@ test('supervisor readies all real workers on authenticated private pipes and clo
     assert.equal((await request(transport, '/__workspace/capabilities', 'wrong-key')).status, 403);
     assert.equal((await request(transport, '/__workspace/capabilities?extra=1')).status, 400);
     assert.equal((await request(transport, '/__workspace/capabilities', transport.secret, 'POST')).status, 405);
+  }
+  for (const row of rows) {
+    assert.equal(row.writerDb, path.join(f.dataDir, 'execution-control.sqlite'));
+    assert.match(row.runtimeId, /^[a-f0-9-]{36}$/);
+    assert.equal(row.writerModule, path.join(f.root, 'server', 'execution', 'account_writer.py'));
   }
   assert.equal(new Set(rows.map(row => row.pid)).size, moduleIds.length);
   await bounded(runtime.close(), 5000, 'shutdown');
@@ -169,6 +174,13 @@ test('module initialization failure closes already-ready peers and removes their
   for (const row of rows) assert.equal(hasProcess(row.pid), false);
   assertUnavailable();
   await assert.rejects(readdir(transportDirectory(rows[0])), { code: 'ENOENT' });
+});
+
+test('a trading worker cannot become ready without its real protection handshake', { timeout: 15000 }, async t => {
+  const f = await fixture(t, { modes: { crossex: 'unguarded' } });
+  await assert.rejects(bounded(f.start(), 5000, 'guard handshake'), /crossex:|crossex exited/);
+  assertUnavailable();
+  for (const row of await f.records()) assert.equal(hasProcess(row.pid), false);
 });
 
 test('spawn failure without a PID rejects promptly and still cleans up a ready peer', { timeout: 15000 }, async t => {

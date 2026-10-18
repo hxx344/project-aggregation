@@ -15,7 +15,8 @@ const root = fileURLToPath(new URL('../modules/aster', import.meta.url));
 async function fixture(t, options = {}) {
   const dataDir = mkdtempSync(join(tmpdir(), 'workspace-aster-'));
   const module = await createAsterModule({ root, dataDir, secret, application: 'tests.workspace_fixture:app',
-    environment: { WORKSPACE_MAINTENANCE: '1', ASTER_PUBLIC_ORIGIN: 'https://old.invalid',
+    environment: { WORKSPACE_MAINTENANCE: '1', WORKSPACE_WRITER_DB: join(dataDir, 'account-writer.sqlite'),
+      WORKSPACE_RUNTIME_ID: randomUUID(), ASTER_PUBLIC_ORIGIN: 'https://old.invalid',
       ASTER_TRADING_RUNTIME: 'must-never-use-this-path', ASTER_DASHBOARD_DIR: 'must-never-use-this-path' }, ...options });
   const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\aster-test-${randomUUID()}` : join(dataDir, 'app.sock');
   module.server.on('error', () => {});
@@ -105,7 +106,8 @@ test('ASTER child observes abrupt parent death and exits without a listening TCP
   const adapter = new URL('../server/modules/aster.mjs', import.meta.url).href;
   const program = `import { createAsterModule } from ${JSON.stringify(adapter)};
     const module = await createAsterModule({ root: ${JSON.stringify(root)}, dataDir: ${JSON.stringify(dataDir)},
-      secret: ${JSON.stringify(secret)}, application: 'tests.workspace_fixture:app', environment: { WORKSPACE_MAINTENANCE: '1' } });
+      secret: ${JSON.stringify(secret)}, application: 'tests.workspace_fixture:app', environment: { WORKSPACE_MAINTENANCE: '1',
+        WORKSPACE_WRITER_DB: ${JSON.stringify(join(dataDir, 'account-writer.sqlite'))}, WORKSPACE_RUNTIME_ID: ${JSON.stringify(randomUUID())} } });
     console.log(module.child.pid); setInterval(() => {}, 1000);`;
   const parent = spawn(process.execPath, ['--input-type=module', '-e', program], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   let pid;

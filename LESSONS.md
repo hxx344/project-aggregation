@@ -973,3 +973,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **如何验证：** [ADL 预算](modules/aster/tests/test_adl_budget.py)、[控制器](modules/aster/tests/test_adl_controller.py)、[现场](modules/aster/tests/test_adl_exchange.py) 覆盖双账户不同模式、模式缓存失效、有界挂单查询与响应校验；[保证金轮询效率](modules/aster/tests/test_pair_margin_poll_efficiency.py) / [margin](modules/aster/tests/test_pair_margin.py) 覆盖 decline-only 与畸形 hint。不以「请求次数变少」单独作为正确性证据。
 
 **事件记录：** `aster-adl-mode-evidence-cache-20261018`；历史复盘 2026-10-18（Seen 1×）；不推进主线复盘检查点以外的全历史完成标记。
+
+### L062：共享准入与私有日志须按真实原操作恢复
+
+**适用条件：** 账户共享保护库与各交易模块的私有订单、RFQ、划转或配对日志分别提交，且 HTTP 副作用可能在任意提交点前后中断。
+
+**根因：** 共享 prepare 已成功后清除私有原操作标识，或共享 finish 先于可恢复的私有证据，会在崩溃后留下不可核对的永久未决记录。配对补偿可能双腿同批，逐腿猜父操作 ID 不能匹配真实批次。仅在准备阶段检查普通租约，也不能阻止已准备操作在其它结果变为 UNKNOWN 后迟发。
+
+**以后做法：** HTTP 前持久化实际 operationId、真实有序批次与具体请求语义；准备成功后的本地写失败仍保留 prepared 证据。明确未发送、拒绝或合法回执先记私库，再结算共享操作；恢复按原批次和完整回执核对，不以余额或「查无原单」推断成功。紧邻最终 HTTP 使用含 operationId 的许可再次检查，晚回执提交仍核对原 fence。操作级明确拒绝与真正失去所有权分别处理，结算完成不能遗留永久页面禁用状态。
+
+**如何验证：** [核心跨语言测试](tests/account-writer.test.mjs)、[Hub 执行测试](tests/trading-execution.test.mjs)、[CrossEx 运行时测试](modules/crossex/tests/live-runtime.test.mjs) 与 [ASTER 保护测试](modules/aster/tests/test_account_writer.py) 覆盖 prepare 后私库持续写失败、回执持久化后进程退出、双 repair 批次、已准备请求迟发以及结算后的下一次正常确认。
+
+**证据：** project-aggregation 基于 `c76b196` 的 2026-10-19 M1 提交前独立审查：真实 SQLite 注入 IOERR 得到 HTTP 0 次、私库订单结束却丢失标识、共享 sending 仍为 1；双 repair 终态后重启仍残留包含两条 CID 的父操作；操作拒绝后共享未决已归零却仍无法从页面重新确认。修复与独立增量探针确认原标识保留、按实际批次结算且下一次合法交易可进行。均为本次未发布实现的审查发现，不计为基线已发布缺陷。
+
+**事件记录：** `shared-admission-private-journal-recovery-20261019`；一次共享准入集成审查及其同类路径修复，不推进主线复盘检查点。

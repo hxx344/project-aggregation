@@ -570,3 +570,28 @@ test('native strategy success with missing id or non-null result remains uncerta
     assert.equal(calls.length, 1);
   }
 });
+
+test('managed Binance identity uses signed spot USER_DATA and preserves large UID across API key rotation', async () => {
+  let time = NOW;
+  const { client, calls } = harness('binance', call => call.url.pathname === '/api/v3/account'
+    ? new Response('{"uid":9223372036854775806,"balances":[]}') : undefined, { now: () => time });
+  const options = { accountMode: 'standard', requireIdentity: true };
+  assert.equal((await client.verify(credentials, options)).identity, ORDER);
+  assert.equal((await client.account(credentials, options)).identity, ORDER);
+  const identityCalls = () => calls.filter(call => call.url.pathname === '/api/v3/account');
+  assert.equal(identityCalls().length, 1); authenticatedSignature('binance', identityCalls()[0]);
+  assert.equal(identityCalls()[0].parameters.omitZeroBalances, 'true');
+  const rotated = { ...credentials, apiKey: 'rotated-key' };
+  assert.equal((await client.verify(rotated, options)).identity, ORDER); assert.equal(identityCalls().length, 2);
+  time += 60_000; assert.equal((await client.verify(rotated, options)).identity, ORDER); assert.equal(identityCalls().length, 3);
+  time -= 120_000; assert.equal((await client.verify(rotated, options)).identity, ORDER); assert.equal(identityCalls().length, 4);
+});
+
+test('managed Binance unavailable or malformed UID yields read-only identity and never caches failure', async () => {
+  for (const answer of [{ uid: 0 }, { uid: 'rounded-key-label' }, json({ code: -2015, msg: 'denied' }, 403)]) {
+    const { client, calls } = harness('binance', call => call.url.pathname === '/api/v3/account' ? answer : undefined);
+    for (let attempt = 0; attempt < 2; attempt++) assert.equal((await client.verify(credentials, { accountMode: 'standard', requireIdentity: true })).identity, null);
+    assert.equal(calls.filter(call => call.url.pathname === '/api/v3/account').length, 2);
+    assert.ok(calls.every(call => call.init.method === 'GET'));
+  }
+});

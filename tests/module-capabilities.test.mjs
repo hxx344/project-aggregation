@@ -6,7 +6,7 @@ test('five capability contracts distinguish summary, maintenance and future acco
   for (const [id, summaries, maintenance] of [['monitor', [1, 2], null], ['asset', [2], null], ['crossex', [1, 2], 1], ['greeks', [2], 1], ['aster', [2], 1]]) {
     const contract = moduleCapabilities(id);
     assert.deepEqual(contract.summaryVersions, summaries); assert.equal(contract.maintenanceVersion, maintenance);
-    assert.equal(contract.readinessVersion, null); assert.equal(contract.accountWriterVersion, null);
+    assert.equal(contract.readinessVersion, null); assert.equal(contract.accountWriterVersion, maintenance === 1 ? 1 : null);
     const result = await readModuleCapabilities(id, { request: async (origin, route, options) => {
       assert.equal(origin, `http://${id}.workspace.internal`); assert.equal(route, '/__workspace/capabilities');
       assert.ok(options.deadline <= Date.now() + 5000); assert.equal(options.limit, 16 * 1024);

@@ -204,6 +204,7 @@ class RfqMixin:
         self.rfq_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         if quotes is not None:
             self.rfq_state["quotes"] = deepcopy(quotes)
+        self.account_writer.resolved_rfq(self.rfq_state)
         self._save_state()
         return deepcopy(self.rfq_state)
 

@@ -15,6 +15,7 @@ import math
 import re
 import time
 import uuid
+from .account_writer import protected_pair, protected_transfer, writer_for
 from urllib.parse import urlencode
 
 from eth_account import Account as EthAccount
@@ -66,7 +67,9 @@ class TransferAPI(API):
     def __init__(self, credentials=None, transport=None, budget=None, *, before_submit=None):
         super().__init__(credentials, transport=transport, budget=budget)
         self.before_submit = before_submit
-        self.http.event_hooks["request"].append(self._before_request)
+        # Snapshot guards run first; shared ownership is checked by API's final
+        # request hook immediately after them and before transport dispatch.
+        self.http.event_hooks["request"].insert(0, self._before_request)
 
     def _before_request(self, request):
         # HTTPX calls request hooks after budget admission/signing and before
@@ -315,6 +318,7 @@ class MarginBalancer:
             raise TradingError("划转必须使用独立授权的主账户 API signer")
         budget = getattr(getattr(self.engine.broker(members["long"]), "api", None), "budget", None)
         api = API(master, budget=budget)
+        writer_for(self.engine).bind_api(api, "master:" + prefix)
         try:
             yield api, master, children
         finally:
@@ -622,6 +626,10 @@ class MarginBalancer:
                 return self._resume_unknown(pair, members, state, config)
             return self._view(state, config, pending["status"], "两侧 USD1 划转流水尚未匹配；有限次核对后将以新余额归档旧请求，期间不开始新开仓或新划转")
         kind, txn = common.pop()
+        writer = writer_for(self.engine)
+        with writer.accounts([member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]):
+            writer.resolve_prefix("aster:transfer:" + pending["request_id"])
+            writer.resolve_prefix("aster:legacy:pair_margin:" + pair["id"] + ":" + pending["request_id"])
         done = {**pending, "status": "confirmed", "confirmed_at": time.time(), "transaction_id": txn, "income_type": kind}
         state.update(pending=None, last_transfer=done)
         state["used_receipts"] = (state.get("used_receipts", []) + [[kind, txn]])[-100:]
@@ -640,6 +648,7 @@ class MarginBalancer:
         acknowledged_at = pending.get("acknowledged_at")
         if type(acknowledged_at) not in (int, float) or not math.isfinite(acknowledged_at):
             raise TradingError("划转成功回执缺少有效时间，保留待核对状态")
+        writer_for(self.engine).settle_transfer(pair, pending)
         brokers = {side: self.engine.broker(member) for side, member in members.items()}
         done = self._refresh_acknowledged_ws(pair, members, brokers, state)
         if done is not None:
@@ -753,6 +762,7 @@ class MarginBalancer:
         for member in members.values():
             self.engine.broker(member).reload()
 
+    @protected_pair
     def tick(self, pair, snapshots, pending_orders=False, *, snapshot_guards=None, snapshot_loader=None):
         """Return display state; the caller must obey ``blocks_trading``."""
         config = validate_margin(pair.get("margin", {}))
@@ -1005,6 +1015,7 @@ class MarginBalancer:
             return self._refresh_acknowledged(pair, members, state, config)
         return result
 
+    @protected_transfer
     def _submit_live(self, pair, members, snapshots, state, config, snapshot_guards=None):
         key = "pair_margin:" + pair["id"]
         snapshots, require_current = self._live_snapshots(pair, members, snapshots, snapshot_guards)
@@ -1062,10 +1073,13 @@ class MarginBalancer:
 
             transfer = TransferAPI(master, budget=api.budget, before_submit=before_submit)
             transfer.workspace_control = self.engine.workspace
+            writer = writer_for(self.engine)
+            writer.bind_api(transfer, "master:" + config["master_env_prefix"])
             try:
-                response = transfer.call("POST", "/fapi/v3/subAccountTransfer", {
-                    "toAccountAddress": children[plan["destination"]]["user"], "asset": "USD1", "amount": plan["amount"],
-                    "kindType": "FUTURE_FUTURE", "fromAccountAddress": children[plan["source"]]["user"]}, signed=True, weight=5)
+                params = {"toAccountAddress": children[plan["destination"]]["user"], "asset": "USD1", "amount": plan["amount"],
+                    "kindType": "FUTURE_FUTURE", "fromAccountAddress": children[plan["source"]]["user"]}
+                with writer.accounts([member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]), writer.batch("aster:transfer:" + pending["request_id"], params):
+                    response = transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
                 if (not isinstance(response, dict) or type(response.get("code")) not in (int, str)
                         or response.get("code") not in (0, 200, "0", "200")
                         or not isinstance(response.get("msg"), str) or response["msg"].strip().lower() != "success"):

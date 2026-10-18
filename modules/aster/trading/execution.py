@@ -392,6 +392,9 @@ class Executor:
     def reconcile(self, account, intent=None):
         self.last_snapshot = None
         self.last_completed_intent = None
+        writer = getattr(self.store, "account_writer", None)
+        if writer is not None:
+            writer.settle_intent(intent or self.store.intent(account["id"]) or {})
         with getattr(self.broker, "reconciliation_budget", nullcontext)():
             return self._reconcile(account, intent)
 
@@ -425,6 +428,10 @@ class Executor:
                     return self._recover_current(account, intent)
                 return self.attention(account, intent, "旧降杠杆请求仅核对实际账户，不会重复提交；等待安全观察窗口")
             if long.leverage == short.leverage and long.leverage >= intent["target"]:
+                writer = getattr(self.store, "account_writer", None)
+                if writer is not None:
+                    writer.resolve_prefix("aster:leverage:POST:" + intent["id"])
+                    writer.resolve_prefix("aster:legacy:intent:" + intent["id"])
                 self.store.complete_leverage(intent, long.leverage)
                 self.store.event(account["id"], "leverage", f"{intent['symbol']} 已核实实际杠杆 {long.leverage}x（目标 {intent['target']}x）；按实际档位准备开仓，禁止降档")
                 return "杠杆调整已确认"

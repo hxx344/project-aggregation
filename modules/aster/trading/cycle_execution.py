@@ -428,6 +428,9 @@ class CycleExecutor(Executor):
         raise TradingError("循环杠杆自动沿用当前持仓，禁止通过循环修改杠杆")
 
     def reconcile(self, account, intent=None):
+        writer = getattr(self.store, "account_writer", None)
+        if writer is not None:
+            writer.settle_intent(intent or self.store.intent(account["id"]) or {})
         self._cycle_admission = None
         self._cycle_submit_guard = None
         self.last_snapshot = self.last_completed_intent = None
@@ -662,6 +665,10 @@ class CycleExecutor(Executor):
         if long.qty or short.qty:
             return self.attention(account, intent, "独立循环杠杆核对期间发现外部仓位，已暂停")
         if long.leverage >= intent["target"]:
+            writer = getattr(self.store, "account_writer", None)
+            if writer is not None:
+                writer.resolve_prefix("aster:leverage:POST:" + intent["id"])
+                writer.resolve_prefix("aster:legacy:intent:" + intent["id"])
             return self._finish(intent, intent["progress"], snapshot, f"独立循环实际杠杆已核实为 {long.leverage}x")
         if isinstance(self.broker, PaperBroker) and long.leverage == intent["previous"]:
             intent["status"] = "aborted"

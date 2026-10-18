@@ -47,6 +47,7 @@ from .report_cache import ReportCache
 from .scheduling import AccountWork, OrdinaryRead, PollBackoff
 from .store import dumps
 from .pairing import PairManager, has_cycle_quantity, pair_active
+from .account_writer import ManagedWriter, protected_account
 
 LOG = logging.getLogger("aster.trading")
 MAX_ACCOUNTS = 8
@@ -199,6 +200,8 @@ class Engine:
             account = {"id": "demo", "name": "示例子账户", "mode": "paper", "env_prefix": "ASTER_DEMO", "enabled": False, "policy": {**DEFAULT_POLICY}}
             store.save_account(account)
             self.brokers["demo"] = PaperBroker("demo", self.market, store, seed=True)
+        self.account_writer = ManagedWriter(self)
+        self.store.account_writer = self.account_writer
 
     def account_lock(self, account_id):
         with self.lock:
@@ -212,11 +215,15 @@ class Engine:
             return state
 
     def view(self, account_id, **updates):
+        if hasattr(self, "account_writer"):
+            self.account_writer.assert_current()
         with self.lock:
             current = self.views.setdefault(account_id, {"strategies": {}})
             current.update(updates)
 
     def strategy(self, account_id, symbol, reason, phase="waiting", **fields):
+        if hasattr(self, "account_writer"):
+            self.account_writer.assert_current()
         with self.lock:
             current = self.views.setdefault(account_id, {"strategies": {}})
             current["strategies"][symbol] = {"reason": reason, "phase": phase, **fields}
@@ -229,7 +236,10 @@ class Engine:
             if aid in self.deleted_accounts:
                 raise TradingError("账户已删除")
             if aid in self.brokers:
-                return self.workspace.bind(self.brokers[aid])
+                broker = self.workspace.bind(self.brokers[aid])
+                if getattr(broker, "mode", None) == "live":
+                    self.account_writer.bind_api(broker.api, aid)
+                return broker
             if account["mode"] == "paper":
                 self.brokers[aid] = PaperBroker(aid, self.market, self.store)
             else:
@@ -249,7 +259,10 @@ class Engine:
                 self.signers[signer] = aid
                 self.users[user] = aid
                 self.brokers[aid] = broker
-            return self.workspace.bind(self.brokers[aid])
+            broker = self.workspace.bind(self.brokers[aid])
+            if getattr(broker, "mode", None) == "live":
+                self.account_writer.bind_api(broker.api, aid)
+            return broker
 
     def live_allowed(self, account):
         return account["mode"] == "paper" or (not self.demo and os.environ.get("ASTER_ALLOW_LIVE") == "1")
@@ -1611,6 +1624,7 @@ class Engine:
         future.add_done_callback(ready)
         return None
 
+    @protected_account
     def _tick_account(self, account_id, *, cycle_signal=None):
         with self.account_lock(account_id):
             paired = self.store.pair_for_account(account_id)
@@ -2995,6 +3009,7 @@ class Engine:
                 raise TradingError("交易服务正在停止或已停止，请重新创建执行器")
             self.process_lock.acquire()
             try:
+                self.account_writer.initialize()
                 self.thread = threading.Thread(target=self.run, name="aster-engine", daemon=True)
                 self.thread.start()
             except BaseException:
@@ -3015,3 +3030,4 @@ class Engine:
             self.dashboard_reports.close()
             if not self.thread or not self.thread.is_alive():
                 self.process_lock.release()
+                self.account_writer.close()

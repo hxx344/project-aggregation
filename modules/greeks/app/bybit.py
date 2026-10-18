@@ -1,7 +1,9 @@
 import hashlib
 import hmac
 import json
+import os
 import time
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -19,6 +21,13 @@ class BybitClient:
         self.public_base_url = "https://api-testnet.bybit.com" if market_testnet else "https://api.bybit.com"
         self.private_base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self._client: httpx.AsyncClient | None = None
+        self.account_writer = None
+        self._writer_prepared = ContextVar("bybit_writer_prepared", default=None)
+
+    async def _before_account_request(self, request):
+        operation = self._writer_prepared.get()
+        if operation is not None:
+            self.account_writer.registry.assert_owned(operation)
 
     def _http_client(self) -> httpx.AsyncClient:
         if self._client is None or getattr(self._client, "is_closed", False):
@@ -54,7 +63,30 @@ class BybitClient:
         request_kwargs = {"params": params if method == "GET" else None, "headers": headers}
         if method != "GET":
             request_kwargs["content"] = encoded_body
-        response = await client.request(method, base_url + path, **request_kwargs)
+        writer = self.account_writer if private and method != "GET" and self.account_writer is not None and self.account_writer.enabled else None
+        if private and method != "GET" and os.environ.get("WORKSPACE_MANAGED") == "1" and writer is None:
+            raise BybitError("Managed trading request has no account protection")
+        operation = writer.prepare(method, path, body) if writer is not None else None
+        token = self._writer_prepared.set(operation)
+        if writer is not None and self._before_account_request not in client.event_hooks["request"]:
+            client.event_hooks["request"].append(self._before_account_request)
+        try:
+            response = await client.request(method, base_url + path, **request_kwargs)
+            result = self._response_result(response)
+            if writer is not None:
+                writer.validate_response(path, body, result)
+        except BaseException:
+            if writer is not None and operation is not None:
+                writer.finish(operation, "unknown")
+            raise
+        finally:
+            self._writer_prepared.reset(token)
+        if writer is not None:
+            writer.finish(operation, "confirmed")
+        return result
+
+    @staticmethod
+    def _response_result(response):
         response.raise_for_status()
         try:
             data = response.json()
@@ -67,6 +99,9 @@ class BybitClient:
         if not isinstance(data.get("result"), dict):
             raise BybitError("Invalid Bybit response result")
         return data["result"]
+
+    async def api_key_info(self) -> dict[str, Any]:
+        return await self._request("GET", "/v5/user/query-api", private=True)
 
     async def _pages(self, path: str, params: dict[str, Any], *, private: bool = False, max_items: int | None = None, identity: str | tuple[str, ...] = "symbol") -> list[dict[str, Any]]:
         params = dict(params)
@@ -180,6 +215,8 @@ class BybitClient:
             result = await self._request("GET", path, params, private=True)
             match = next((item for item in result.get("list", []) if item.get("orderLinkId") == order_link_id and item.get("symbol") == symbol), None)
             if match is not None:
+                if self.account_writer is not None:
+                    self.account_writer.observe_order(symbol, order_link_id, match)
                 return match
         return None
 

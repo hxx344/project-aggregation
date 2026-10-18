@@ -392,6 +392,10 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
 
     app = FastAPI(title="Aster Account Desk", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.engine = engine
+
+    @app.get("/__workspace/writer-status", include_in_schema=False)
+    def workspace_writer_status():
+        return engine.account_writer.status()
     if workspace_secret is not None:
         def begin_workspace_shutdown():
             # Close admission before waiting for cancelled synchronous HTTP

@@ -1,5 +1,6 @@
 """Durable two-subaccount execution. Recovery never repeats an uncertain write."""
 from concurrent.futures import ThreadPoolExecutor
+from .account_writer import protected_pair, writer_for
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -250,6 +251,7 @@ class PairTrader:
             from .pair_recovery import require_archived_orders_clear
             require_archived_orders_clear(self.engine, current)
 
+    @protected_pair
     def tick(self, pair):
         self.engine.adl.require_clear(pair["id"])
         symbol = pair["symbol"]
@@ -595,6 +597,16 @@ class PairTrader:
             raise PairPositionError("待发送订单标的与配对组不一致，停止交易并等待核对")
         state["_trading_write_started"] = True
         pending = state.get("pending") or {}
+        client_ids = [leg["order"]["newClientOrderId"] for leg in legs]
+        operation = "aster:pair-orders:" + pending["id"] + ":" + ":".join(client_ids)
+        dispatch = {"operationId": operation, "clientOrderIds": client_ids}
+        dispatches = pending.setdefault("writer_dispatches", [])
+        if not isinstance(dispatches, list) or len(dispatches) > 32:
+            raise PairPositionError("持久配对发送分组无效，停止发送并保留原订单")
+        if dispatch not in dispatches:
+            if len(dispatches) == 32:
+                raise PairPositionError("配对发送分组达到恢复上限，停止发送并保留原订单")
+            dispatches.append(dispatch)
         observe = pending.get("kind") == "cycle" and legs is pending.get("legs")
         quality_clocks = {}
         # Workers observe separate objects so a runtime commit cannot serialize
@@ -655,8 +667,9 @@ class PairTrader:
                 return None, str(exc), evidence
             except Exception as exc:
                 return None, str(exc) if isinstance(exc, TradingError) else "订单结果未知，继续按客户端订单号核对", evidence
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
-            futures = [(leg, pool.submit(send, leg)) for leg in legs]
+        writer = writer_for(self.engine)
+        with writer.batch(operation, {"orders": [leg["order"] for leg in legs]}), ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
+            futures = [(leg, pool.submit(writer.wrap(send), leg)) for leg in legs]
             for index, (leg, future) in enumerate(futures):
                 receipt, error, evidence = future.result()
                 leg["receipt"], leg["error"] = receipt, error
@@ -697,6 +710,7 @@ class PairTrader:
         symbol = pair["symbol"]
         require_runtime_symbols(pair, state)
         pending = state["pending"]
+        writer_for(self.engine).settle_pair(pair, state)
         for leg in pending["legs"] + pending["repairs"]:
             receipt, order = leg.get("receipt"), leg["order"]
             if receipt is not None:
@@ -934,6 +948,7 @@ class PairTrader:
             recovery_ready(pending)
 
     def _finish(self, pair, state, pending, *, completed, check_current=None):
+        writer_for(self.engine).settle_pair(pair, state)
         symbol = pair["symbol"]
         published = state
         state = deepcopy(state)
@@ -1076,8 +1091,9 @@ class PairTrader:
             except Exception:
                 return {"unknown": True, "reason": "杠杆请求结果未知，系统继续读取两侧实际杠杆；不重发原请求"}
         state["_trading_write_started"] = True
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-leverage") as pool:
-            futures = {key: pool.submit(send, key) for key, _ in SIDES}
+        writer = writer_for(self.engine)
+        with writer.batch("aster:pair-leverage:" + pending["id"], {"symbol": symbol, "target": target}), ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-leverage") as pool:
+            futures = {key: pool.submit(writer.wrap(send), key) for key, _ in SIDES}
             for key, future in futures.items():
                 pending["results"][key] = future.result()
                 self._save(pair, state)
@@ -1109,6 +1125,8 @@ class PairTrader:
         held = require_quantities(snapshots, symbol, pending["before"], equal_leverage=False)
         with self._confirmed(pair, brokers, guards):
             if all(p.leverage == pending["target_leverage"] for p in held.values()):
+                writer_for(self.engine).resolve_prefix("aster:pair-leverage:" + pending["id"])
+                writer_for(self.engine).resolve_prefix("aster:legacy:pair_runtime:" + pair["id"] + ":" + pending["id"])
                 state.update(pending=None, phase="waiting", reason=f"两子账户实际杠杆均已确认 {pending['target_leverage']}x；系统下一轮重新检查额度、余额、价差及风险条件后才开仓")
             elif (all(p.leverage == pending["previous_leverage"] for p in held.values())
                   and all(pending["results"].get(key, {}).get("rejected") for key, _ in SIDES)):

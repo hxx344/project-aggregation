@@ -4,6 +4,7 @@ import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
 import { TRADING_NAMES } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
+import { accountKey } from './execution/account-writer.mjs';
 
 const iso = time => new Date(time).toISOString();
 const FINAL = new Set(['completed', 'stopped']);
@@ -18,7 +19,7 @@ const modeOf = (exchange, mode) => {
 };
 
 /** Durable, explicit live execution. Read endpoints never submit exchange requests. */
-export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true } = {}) {
+export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true, accountWriter = null } = {}) {
   // If stmt is explicitly null, use raw db.prepare (for tests that mock db.prepare)
   // If stmt is undefined, create a cached version for production
   // If stmt is provided, use it
@@ -34,10 +35,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     CREATE TABLE IF NOT EXISTS execution_requests (id TEXT PRIMARY KEY, preview_id TEXT NOT NULL, job_id TEXT NOT NULL, session TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_locks (resource TEXT PRIMARY KEY, job_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS execution_stop_requests (job_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL);
   `);
   for (const exchange of EXECUTION_EXCHANGES) stmt.prepare('INSERT OR IGNORE INTO execution_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified');
   const owner = randomUUID(), clients = new Map(EXECUTION_EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const pending = new Set(), controllers = new Set(), busyJobs = new Set(), connecting = new Set();
+  const writerTickets = new Map(), verifiedAccounts = new Map(), protectionErrors = new Map(), recoveredWriterJobs = new Set();
+  let protectionReady = !accountWriter;
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
   function lostLease() {
     retired = true; leader = false;
@@ -50,7 +54,133 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   };
   const jobs = () => stmt.prepare('SELECT json FROM execution_jobs').all().map(row => JSON.parse(row.json));
   const jobFor = id => { const row = stmt.prepare('SELECT json FROM execution_jobs WHERE id=?').get(id); if (!row) throw new ExecutionError(404, '执行任务不存在'); return JSON.parse(row.json); };
+  const accountIdentity = (exchange, id) => id ? { authority: exchange, environment: 'mainnet', accountId: id } : null;
+  const jobExchanges = job => [...new Set([...(job.totals || []), ...job.plan.legs].map(leg => leg.exchange))];
+  function bindAccount(exchange, revision, identity) {
+    if (!accountWriter) return;
+    accountWriter.bind(`hub:${exchange}`, accountIdentity(exchange, identity), revision, { authority: exchange, environment: 'mainnet' });
+    if (identity) { verifiedAccounts.set(exchange, { revision, identity }); protectionErrors.delete(exchange); }
+    else { verifiedAccounts.delete(exchange); protectionErrors.set(exchange, '账户真实身份尚未核验，仅允许读取'); }
+  }
+  function protectJob(job, replace = false) {
+    if (!accountWriter) return null;
+    if (!protectionReady) throw new NotSubmittedError('账户写入保护正在恢复，请稍后核对');
+    let ticket = replace ? null : writerTickets.get(job.id);
+    if (!ticket) {
+      const identities = jobExchanges(job).map(exchange => {
+        const row = accountRow(exchange), verified = verifiedAccounts.get(exchange);
+        if (!verified || verified.revision !== row.revision || verified.identity !== row.identity) throw new NotSubmittedError('账户真实身份尚未核验，仅允许读取与本地停止');
+        return accountIdentity(exchange, row.identity);
+      });
+      try { ticket = accountWriter.claim(identities); }
+      catch (error) { const blocked = new NotSubmittedError('账户已由其他模块使用或写入所有权无法确认，请先核对账户保护状态'); blocked.protectionCode = error.code; throw blocked; }
+      writerTickets.set(job.id, ticket);
+    }
+    try { accountWriter.assertOwned(ticket, callTimeoutMs); }
+    catch { throw new NotSubmittedError('账户写入所有权或连接版本已变化，本次操作未获准发送'); }
+    return ticket;
+  }
+  function assertJob(id) {
+    if (!accountWriter || !writerTickets.has(id)) return;
+    accountWriter.assertOwned(writerTickets.get(id), 0);
+  }
+  function prepareWrite(order, action, payload = {}) {
+    if (!accountWriter) return null;
+    const ticket = protectJob(jobFor(order.jobId));
+    const suffix = action === 'amend' ? `:${order.amendCount}` : action === 'cancel' ? `:${order.cancelAttempt || 0}` : '';
+    const operationId = `hub:${action}:${order.localId}${suffix}`;
+    if (action === 'cancel' && order.writerOperation?.operationId === operationId && ['sending', 'unknown', 'confirmed'].includes(order.writerOperation.state)) return { skip: true, operationId, ticket };
+    const job = jobFor(order.jobId);
+    const semantic = { groupId: `hub:${job.id}:${job.phase}:${job.batchIndex}:${action}`, action, exchange: order.exchange, symbol: order.spec.symbol, clientId: order.spec.clientId, remoteId: action === 'create' ? null : order.remoteId,
+      ...(['amend', 'cancel'].includes(action) ? { intentAction: action, intentTarget: { accountKey: accountKey(accountIdentity(order.exchange, accountRow(order.exchange).identity)), symbol: order.spec.symbol, clientOrderId: order.spec.clientId } } : {}), ...payload };
+    const previousOperation = order.writerOperation, previousDispatch = order.writerDispatch;
+    order.writerOperation = { operationId, action, payload: semantic, state: 'prepared' };
+    order.writerDispatch = 'prepared'; saveOrder(order);
+    let operation;
+    try { operation = accountWriter.prepare(ticket, operationId, semantic); }
+    catch (error) {
+      order.writerOperation = previousOperation; order.writerDispatch = previousDispatch; saveOrder(order);
+      if (action === 'cancel' && ['ALREADY_SUBMITTED', 'OPERATION_UNRESOLVED', 'ALREADY_REJECTED'].includes(error.code)) return { skip: true, operationId, ticket };
+      throw new NotSubmittedError('账户存在未核对操作或重复意图，本次操作未获准发送');
+    }
+    order.writerDispatch = 'sending'; order.writerOperation.state = 'sending';
+    try { saveOrder(order); }
+    catch {
+      // No transport has been called. Keep the durable prepared identity even
+      // if this second private-store write fails, and settle it when possible.
+      order.writerDispatch = 'prepared'; order.writerOperation.state = 'prepared';
+      try { finishWrite(operation, 'rejected', order); } catch { /* Prepared evidence survives for restart recovery. */ }
+      throw new NotSubmittedError('发送前状态保存失败，本次操作未发送');
+    }
+    return operation;
+  }
+  function finishWrite(operation, outcome, order) {
+    if (operation && !operation.skip) {
+      if (order?.writerOperation?.operationId === operation.operationId) { order.writerOperation.state = outcome; order.writerDispatch = outcome; }
+      // Durable adapter evidence precedes releasing the shared operation. A
+      // crash between these stores can be recovered without guessing a result.
+      saveOrder(order);
+      accountWriter.finish(operation, outcome);
+    }
+  }
+  const stopRequested = id => !!stmt.prepare('SELECT 1 FROM execution_stop_requests WHERE job_id=?').get(id);
+  function recoverWriterOperation(order, ticket) {
+    if (!accountWriter) return;
+    let operation = order.writerOperation;
+    if (!operation && (order.unknown || order.amendPending || order.cancelRequestedAt)) {
+      const action = order.amendPending ? 'legacy-amend' : order.cancelRequestedAt ? 'legacy-cancel' : 'create';
+      const operationId = action === 'create' ? `hub:create:${order.localId}` : `hub:${action}:${order.localId}`;
+      const payload = { action, exchange: order.exchange, symbol: order.spec.symbol, clientId: order.spec.clientId, remoteId: action === 'create' ? null : order.remoteId,
+        ...(action === 'legacy-amend' ? { intentAction: 'amend', intentTarget: { accountKey: accountKey(accountIdentity(order.exchange, accountRow(order.exchange).identity)), symbol: order.spec.symbol, clientOrderId: order.spec.clientId } } : {}) };
+      operation = order.writerOperation = { operationId, action, payload, state: 'unknown' };
+    }
+    if (!operation) return;
+    const imported = accountWriter.importUnknown(ticket, operation.operationId, operation.payload);
+    if (order.writerDispatch === 'prepared' || operation.state === 'rejected' || imported.state === 'rejected') {
+      accountWriter.resolve(operation.operationId, ticket, 'rejected'); operation.state = 'rejected';
+      if (operation.action === 'create') Object.assign(order, { state: 'rejected', settled: true, unknown: false });
+      else { order.unknown = false; order.amendPending = false; if (operation.action === 'cancel') { order.cancelAttempt = (order.cancelAttempt || 0) + 1; order.cancelRequestedAt = null; } }
+    } else if (operation.state === 'confirmed' || order.settled) accountWriter.resolve(operation.operationId, ticket);
+    saveOrder(order);
+  }
+  function protectAndRecover(job) {
+    const ticket = protectJob(job);
+    if (accountWriter && !recoveredWriterJobs.has(job.id)) {
+      for (const order of orders(job.id)) recoverWriterOperation(order, ticket);
+      recoveredWriterJobs.add(job.id);
+    }
+    return ticket;
+  }
+  async function initializeProtection() {
+    if (!accountWriter) return;
+    const savedJobs = jobs();
+    const legacyExchanges = new Set(savedJobs.flatMap(job => ACTIVE.has(job.status) || orders(job.id).some(order => !order.settled) ? jobExchanges(job) : []));
+    const configured = EXECUTION_EXCHANGES.map(accountRow).filter(row => row.credentials);
+    for (const row of EXECUTION_EXCHANGES.map(accountRow)) if (row.credentials || legacyExchanges.has(row.exchange)) bindAccount(row.exchange, row.revision, null);
+    await Promise.all(configured.map(async row => {
+      try {
+        const ctx = context(row.exchange, row.revision);
+        const value = await call(signal => ctx.client.verify(ctx.credentials, { accountMode: row.account_mode, signal, requireIdentity: true }));
+        if (closed || accountRow(row.exchange).revision !== row.revision) return;
+        if (row.identity && value.identity && row.identity !== value.identity) throw new Error('Changed account');
+        if (value.identity) stmt.prepare('UPDATE execution_accounts SET identity=? WHERE exchange=? AND revision=?').run(value.identity, row.exchange, row.revision);
+        bindAccount(row.exchange, row.revision, value.identity || null);
+      } catch { protectionErrors.set(row.exchange, '账户真实身份尚未核验，仅允许读取与本地停止'); }
+    }));
+    protectionReady = true;
+    const sharedPending = accountWriter.snapshot().operations.some(row => row.moduleId === 'hub' && ['sending', 'unknown'].includes(row.state));
+    for (const job of jobs()) if (ACTIVE.has(job.status) || orders(job.id).some(order => !order.settled) || sharedPending && orders(job.id).some(order => order.writerOperation)) {
+      try {
+        protectAndRecover(job);
+        if (FINAL.has(job.status)) { writerTickets.delete(job.id); recoveredWriterJobs.delete(job.id); }
+      } catch (error) {
+        const identities = jobExchanges(job).flatMap(exchange => verifiedAccounts.has(exchange) ? [accountIdentity(exchange, accountRow(exchange).identity)] : []);
+        if (identities.length && ['ACCOUNT_PINNED', 'OWNER_ALIVE'].includes(error.protectionCode)) { try { accountWriter.freeze(identities, 'legacy-conflict'); } catch { /* Unknown identities remain read-only. */ } }
+      }
+    }
+  }
   const saveJob = job => {
+    assertJob(job.id);
     job.updatedAt = iso(now());
     const result = stmt.prepare('INSERT INTO execution_jobs(id,json) SELECT ?,? WHERE EXISTS(SELECT 1 FROM execution_lease WHERE id=1 AND owner=? AND expires>?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(job.id, JSON.stringify(job), owner, now());
     if (!result.changes) lostLease();
@@ -58,6 +188,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   };
   const orders = jobId => stmt.prepare('SELECT json FROM execution_orders WHERE job_id=? ORDER BY rowid').all(jobId).map(row => JSON.parse(row.json));
   const saveOrder = order => {
+    assertJob(order.jobId);
     const result = stmt.prepare('INSERT INTO execution_orders(id,job_id,json) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM execution_lease WHERE id=1 AND owner=? AND expires>?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(order.localId, order.jobId, JSON.stringify(order), owner, now());
     if (!result.changes) lostLease();
   };
@@ -100,7 +231,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   function checkSession(session) { if (session !== undefined && !isSessionActive(session)) throw new ExecutionError(401, '登录已失效，请重新登录'); }
   function connection(row) {
     return { exchange: row.exchange, connected: !!row.credentials, revision: row.revision, accountMode: row.account_mode,
-      identity: row.identity, keyLabel: row.key_label, verifiedAt: row.verified_at, locked: locked(row.exchange) };
+      identity: row.identity, keyLabel: row.key_label, verifiedAt: row.verified_at, locked: locked(row.exchange),
+      ...(accountWriter ? { writeProtection: { identityVerified: verifiedAccounts.get(row.exchange)?.revision === row.revision, reason: protectionErrors.get(row.exchange) || null } } : {}) };
   }
   function context(exchange, revision) {
     const row = accountRow(exchange);
@@ -121,7 +253,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const all = orders(job.id);
     return { id: job.id, preset: job.plan.preset, action: job.plan.action, status: job.status,
       createdAt: job.createdAt, updatedAt: job.updatedAt, deadlineAt: job.deadlineAt, batchIndex: job.batchIndex, batchCount: job.plan.batchCount,
-      reason: job.reason, canResume: job.status === 'paused' && all.every(order => order.settled) && job.totals.some(leg => compareDecimals(totalFilled(all, leg.id), leg.quantity) < 0),
+      reason: job.reason, ...(stopRequested(job.id) ? { stopRequested: true } : {}), canResume: job.status === 'paused' && all.every(order => order.settled) && job.totals.some(leg => compareDecimals(totalFilled(all, leg.id), leg.quantity) < 0),
       legs: job.totals.map(leg => {
         const filledQuantity = totalFilled(all, leg.id), last = all.filter(order => order.legId === leg.id).at(-1);
         return { id: leg.id, exchange: leg.exchange, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, quantity: leg.quantity, stopPrice: leg.stopPrice,
@@ -150,18 +282,36 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (exchange === 'okx' && (typeof body.passphrase !== 'string' || body.passphrase.length < 8 || body.passphrase.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(body.passphrase))) throw new ExecutionError(400, '请填写有效的 OKX Passphrase');
     if (connecting.has(exchange)) throw new ExecutionError(409, '此交易所正在验证实盘连接');
     connecting.add(exchange);
+    const previous = accountRow(exchange), previousVerified = verifiedAccounts.get(exchange);
+    let rebound = false;
     try {
       const credentials = { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
-      const result = await call(async signal => { const verified = await client.verify(credentials, { accountMode: mode, signal }); const account = await client.account(credentials, { accountMode: mode, signal }); return { verified, account }; });
+      const result = await call(async signal => { const options = { accountMode: mode, signal, requireIdentity: !!accountWriter }; const verified = await client.verify(credentials, options); const account = await client.account(credentials, options); return { verified, account }; });
       checkSession(session); checkAvailable(exchange, body.revision);
+      if (result.verified.identity && result.account.identity && result.verified.identity !== result.account.identity) throw new ExecutionError(409, '交易账户身份不一致');
+      if (accountWriter) {
+        try {
+          accountWriter.releaseBinding(`hub:${exchange}`);
+          rebound = true;
+          bindAccount(exchange, body.revision + 1, result.verified.identity && result.account.identity ? result.verified.identity : null);
+        } catch { throw new ExecutionError(409, '原账户仍有未核对操作或账户保护不可用，请先恢复原操作'); }
+      }
       stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=?,account_mode=?,identity=?,key_label=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(
         encrypt({ purpose: 'execution', exchange, ...credentials }), mode, result.verified.identity ?? null, body.apiKey.slice(-4), iso(now()), JSON.stringify({ at: iso(now()), account: result.account }), exchange, body.revision);
       return state();
-    } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
+    } catch (error) {
+      if (rebound) {
+        try { if (previous.credentials) bindAccount(exchange, previous.revision, previousVerified?.identity || null); else accountWriter.releaseBinding(`hub:${exchange}`); }
+        catch { verifiedAccounts.delete(exchange); protectionErrors.set(exchange, '账户保护绑定恢复未确认，仅允许读取'); }
+      }
+      if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error));
+    }
     finally { connecting.delete(exchange); }
   }
   function disconnect(exchange, body, session) {
     exactKeys(body, ['revision']); checkSession(session); checkAvailable(exchange, body.revision);
+    accountWriter?.releaseBinding(`hub:${exchange}`);
+    verifiedAccounts.delete(exchange); protectionErrors.delete(exchange);
     stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
     return state();
   }
@@ -170,10 +320,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     await Promise.all(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
-      const account = await call(async signal => { await ctx.client.verify(ctx.credentials, { ...ctx.options, signal }); return ctx.client.account(ctx.credentials, { ...ctx.options, signal }); });
+      const account = await call(async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity) throw new ExecutionError(409, '交易账户身份不一致'); return snapshot; });
       requireLease();
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
+      if (accountWriter) {
+        if (!ctx.row.identity && account.identity) stmt.prepare('UPDATE execution_accounts SET identity=? WHERE exchange=? AND revision=?').run(account.identity, exchange, ctx.row.revision);
+        bindAccount(exchange, ctx.row.revision, account.identity);
+      }
       snapshots.set(exchange, account); connections.set(exchange, connection(ctx.row));
       stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify({ account, at: iso(now()) }), exchange, ctx.row.revision);
     }));
@@ -230,6 +384,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         job.plan = plan; job.phase += 1;
       } else job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [] };
       Object.assign(job, { status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) });
+      protectJob(job, !!plan.resumeJobId);
+      recoveredWriterJobs.add(job.id);
+      stmt.prepare('DELETE FROM execution_stop_requests WHERE job_id=?').run(job.id);
       event(job, plan.resumeJobId ? '已确认剩余数量，等待重新核对账户与盘口' : '已确认实盘预览，等待核对账户与盘口'); saveJob(job);
       for (const leg of plan.legs) stmt.prepare('INSERT OR IGNORE INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
       stmt.prepare('UPDATE execution_previews SET consumed=? WHERE id=?').run(job.id, plan.id);
@@ -237,36 +394,62 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       return state();
     });
   }
-  function validateInspection(order, value, { explicit = false } = {}) {
-    if (!value || typeof value.id !== 'string' || !value.id || (order.remoteId && value.id !== order.remoteId) || value.symbol !== order.spec.symbol || value.side !== order.spec.side || value.reduceOnly !== order.spec.reduceOnly || (value.positionSide !== null && value.positionSide !== order.spec.positionSide) || value.kind !== order.kind || compareDecimals(value.quantity, order.spec.quantity) !== 0) throw new ExecutionError(409, '委托身份或数量与本任务不一致，禁止认领或补单');
+  function validateInspection(order, value, { explicit = false, cancelRecovery = false } = {}) {
+    const reducedOriginal = cancelRecovery && order.exchange === 'okx' && order.remoteId && order.spec.reduceOnly && value && compareDecimals(value.quantity, '0') > 0 && compareDecimals(value.quantity, order.spec.quantity) <= 0;
+    if (!value || typeof value.id !== 'string' || !value.id || (order.remoteId && value.id !== order.remoteId) || value.symbol !== order.spec.symbol || value.side !== order.spec.side || value.reduceOnly !== order.spec.reduceOnly || (value.positionSide !== null && value.positionSide !== order.spec.positionSide) || value.kind !== order.kind || !reducedOriginal && compareDecimals(value.quantity, order.spec.quantity) !== 0) throw new ExecutionError(409, '委托身份或数量与本任务不一致，禁止认领或补单');
     const filled = decimal(value.filledQuantity, { nonnegative: true });
     if (compareDecimals(filled, order.filledQuantity) < 0 || compareDecimals(filled, order.spec.quantity) > 0 || typeof value.terminal !== 'boolean' || typeof value.childrenSettled !== 'boolean') throw new ExecutionError(409, '委托成交记录不一致，暂停自动执行');
     if (explicit && (value.positionSide === null || !value.createdAt || !Number.isFinite(Date.parse(value.createdAt)) || Date.parse(value.createdAt) < Date.parse(order.createdAt) - 5000 || Date.parse(value.createdAt) > Date.parse(order.createdAt) + callTimeoutMs + 5000)) throw new ExecutionError(409, '策略方向或创建时间不匹配，禁止认领其他策略');
     return filled;
   }
-  async function inspectOrder(order, explicitId) {
+  async function inspectOrder(order, explicitId, cancelRecovery = false) {
     requireLease();
     if (order.exchange === 'bybit' && !order.remoteId && !explicitId) return false;
     const ctx = context(order.exchange, order.accountRevision);
-    const value = await call(signal => ctx.client.inspect(ctx.credentials, { ...order.spec, id: explicitId ?? order.remoteId }, { ...ctx.options, signal }));
+    const value = await call(signal => ctx.client.inspect(ctx.credentials, { ...order.spec, id: explicitId ?? order.remoteId }, { ...ctx.options, signal, cancelRecovery }));
     requireLease();
-    const current = orderFor(order.localId), filledQuantity = validateInspection(current, value, { explicit: !!explicitId });
+    const current = orderFor(order.localId), filledQuantity = validateInspection(current, value, { explicit: !!explicitId, cancelRecovery });
+    if (accountWriter) {
+      const ticket = protectJob(jobFor(order.jobId));
+      const known = new Set([`hub:create:${order.localId}`, `hub:legacy-amend:${order.localId}`, `hub:legacy-cancel:${order.localId}`]);
+      for (const operation of accountWriter.unresolved(ticket)) {
+        const belongs = known.has(operation.operationId) || operation.operationId.startsWith(`hub:amend:${order.localId}:`) || operation.operationId.startsWith(`hub:cancel:${order.localId}:`);
+        if (belongs && (operation.operationId === `hub:create:${order.localId}` || value.terminal && value.childrenSettled)) accountWriter.resolve(operation.operationId, ticket);
+      }
+      assertJob(order.jobId);
+    }
     Object.assign(current, { remoteId: value.id, filledQuantity, unknown: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
     saveOrder(current); return true;
   }
   async function cancelOrder(order) {
     requireLease();
     if (order.settled) return;
+    if (accountWriter && order.unknown && order.remoteId) {
+      try { await inspectOrder(order, undefined, true); } catch { /* A known original ID can still be safely cancelled; the adapter validates it again. */ }
+      order = orderFor(order.localId); if (order.settled) return;
+    }
     if (!order.remoteId) {
       try { await inspectOrder(order); } catch { /* An absent Binance lookup is never proof that create failed. */ }
       order = orderFor(order.localId);
       if (!order.remoteId || order.settled) return;
     }
     const ctx = context(order.exchange, order.accountRevision);
+    if (order.writerOperation?.action === 'cancel' && order.writerOperation.state === 'rejected') order.cancelAttempt = (order.cancelAttempt || 0) + 1;
+    let operation;
+    try { operation = prepareWrite(order, 'cancel'); }
+    catch { await inspectOrder(order, undefined, true); return; }
+    if (operation?.skip) { await inspectOrder(order, undefined, true); return; }
     order.cancelRequestedAt = iso(now()); order.state = 'canceling'; saveOrder(order);
-    try { await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal })); }
-    catch { /* Even a failed or timed-out stop must be reconciled by a fresh query. */ }
-    await inspectOrder(orderFor(order.localId));
+    try {
+      await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) accountWriter.assertOwned(operation, callTimeoutMs); } }));
+      finishWrite(operation, 'confirmed', order); saveOrder(order);
+    }
+    catch (error) {
+      finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', order);
+      saveOrder(order);
+      /* Even a failed or timed-out stop must be reconciled by a fresh query. */
+    }
+    await inspectOrder(orderFor(order.localId), undefined, true);
   }
   async function amendOrder(job, leg, order, market) {
     writable();
@@ -277,11 +460,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     // belong to the same order; this intent must survive a lost acknowledgement.
     Object.assign(order, { state: 'amending', amendPending: true, unknown: true, lastAmendAt: iso(now()), amendCount: (order.amendCount ?? 0) + 1 });
     saveOrder(order);
+    let operation;
     try {
+      operation = prepareWrite(order, 'amend', { quantity: order.spec.quantity, price: leg.orderSide === 'buy' ? market.bid : market.ask });
       const beforeMutation = () => {
         requireLease();
+        if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次追价未发送'); } }
         const current = jobFor(job.id), original = orderFor(order.localId);
-        if (closing || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)
+        if (closing || stopRequested(job.id) || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)
             || original.settled || original.remoteId !== order.remoteId || !original.amendPending) throw new NotSubmittedError('任务或原订单已停止，本次追价未发送');
         try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次追价未发送'); }
         if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价停止价，本次追价未发送');
@@ -290,6 +476,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       requireLease();
       const current = orderFor(order.localId), filledQuantity = validateInspection(current, value);
       Object.assign(current, { filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
+      finishWrite(operation, 'confirmed', current);
       saveOrder(current);
       if (current.settled && compareDecimals(current.filledQuantity, current.spec.quantity) < 0) throw new ExecutionError(409, '原生追价后订单提前终止且未全部成交，暂停其余交易腿');
     } catch (error) {
@@ -297,6 +484,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       // A rejected amendment says nothing about whether the original order is
       // still live. Keep it unsettled until inspection and stop finish normally.
       const current = orderFor(order.localId);
+      finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', current);
       if (current.amendPending) {
         current.amendPending = false;
         current.unknown = !(error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain);
@@ -318,27 +506,38 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       kind: leg.exchange === 'bybit' ? 'strategy' : 'order', remoteId: null, spec, state: 'submitting', unknown: true, settled: false, filledQuantity: '0', price: null, lastCheckedAt: null, createdAt: iso(now()), cancelRequestedAt: null };
     // Persist intent before the network call. On restart an unanswered intent is uncertain.
     saveOrder(order);
+    let operation;
     try {
+      operation = prepareWrite(order, 'create', { quantity, side: spec.side, positionSide: spec.positionSide, reduceOnly: spec.reduceOnly, stopPrice: spec.stopPrice });
       const beforeMutation = () => {
         requireLease();
+        if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次建单未发送'); } }
         const current = jobFor(job.id);
-        if (closing || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)) throw new NotSubmittedError('任务已停止或执行时间已到，本次建单未发送');
+        if (closing || stopRequested(job.id) || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)) throw new NotSubmittedError('任务已停止或执行时间已到，本次建单未发送');
         try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次建单未发送'); }
       };
       const result = await call(signal => ctx.client.create(ctx.credentials, spec, { ...ctx.options, signal, beforeMutation }));
       requireLease();
       if (!result || typeof result.id !== 'string' || !result.id || result.kind !== order.kind) throw new Error('Uncertain acknowledgement');
-      Object.assign(order, { remoteId: result.id, unknown: false, state: 'working' }); saveOrder(order);
+      Object.assign(order, { remoteId: result.id, unknown: false, state: 'working' });
+      finishWrite(operation, 'confirmed', order);
+      saveOrder(order);
     } catch (error) {
       // A stale process must not overwrite reconciliation performed by a new owner.
       requireLease();
+      finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', order);
       if (error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain) Object.assign(order, { state: 'rejected', settled: true, unknown: false });
       else Object.assign(order, { state: 'unknown', unknown: true });
       saveOrder(order); pause(job.id, `${leg.exchange} ${leg.symbol} 下单结果：${safeError(error)}`);
     }
   }
   async function stopping(job) {
-    await Promise.allSettled(orders(job.id).filter(unsettled).map(cancelOrder));
+    const initial = orders(job.id).filter(unsettled);
+    await Promise.allSettled(initial.map(cancelOrder));
+    // An exact original-order cancel can clear an unknown amendment while a
+    // sibling was blocked by that uncertainty. Allow one bounded cleanup pass.
+    const remaining = orders(job.id).filter(unsettled);
+    if (accountWriter && remaining.length && remaining.length < initial.length) await Promise.allSettled(remaining.map(cancelOrder));
     requireLease();
     const latest = jobFor(job.id), all = orders(job.id);
     if (all.every(order => order.settled)) {
@@ -353,8 +552,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (busyJobs.has(id)) return; busyJobs.add(id);
     try {
       requireLease(); let job = jobFor(id);
+      protectAndRecover(job);
+      if (stopRequested(id) && ACTIVE.has(job.status) && job.status !== 'stopping') { pause(id, '用户停止：等待当前合法写者核对原委托', 'stopped'); job = jobFor(id); }
       if (job.status === 'stopping') { await stopping(job); return; }
       if (!['queued', 'running'].includes(job.status)) return;
+      protectJob(job);
       if (now() >= Date.parse(job.deadlineAt)) { pause(id, '执行时间已到，停止追价并撤销余单'); await stopping(jobFor(id)); return; }
       const allBefore = orders(id), working = allBefore.filter(unsettled);
       if (working.length) {
@@ -414,19 +616,26 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (jobFor(id).status === 'stopping') await stopping(jobFor(id));
     } catch (error) {
       try { requireLease(); pause(id, safeError(error)); await stopping(jobFor(id)); } catch { /* A new lease owner will reconcile durable intents. */ }
-    } finally { busyJobs.delete(id); }
+    } finally {
+      busyJobs.delete(id);
+      if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); }
+    }
   }
   function tick() {
-    if (closed || closing) return Promise.resolve();
+    if (closed || closing || !protectionReady) return Promise.resolve();
     if (ticking) return ticking;
     if (!acquire()) return Promise.resolve();
     ticking = Promise.allSettled(jobs().filter(job => ACTIVE.has(job.status)).map(job => runJob(job.id))).finally(() => { ticking = null; });
     return ticking;
   }
   function stop(id, body, session) {
-    exactKeys(body, []); writable(); checkSession(session);
+    exactKeys(body, []); checkSession(session);
     const job = jobFor(id);
-    if (!FINAL.has(job.status)) pause(id, '用户停止：停止后续下单并撤销余单，保留已成交仓位', 'stopped');
+    stmt.prepare('INSERT INTO execution_stop_requests(job_id,requested_at) VALUES (?,?) ON CONFLICT(job_id) DO NOTHING').run(id, now());
+    if (!FINAL.has(job.status)) {
+      try { writable(); pause(id, '用户停止：停止后续下单并撤销余单，保留已成交仓位', 'stopped'); }
+      catch (error) { if (!accountWriter) throw error; /* The local stop command survives loss of account ownership. */ }
+    }
     return state();
   }
   async function reconcile(id, body, session) {
@@ -439,7 +648,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (order.exchange !== 'bybit' && body.strategyId !== undefined) throw new ExecutionError(400, '此交易所按本任务客户订单号核对');
     busyJobs.add(id);
     try {
-      await inspectOrder(order, order.exchange === 'bybit' && !order.remoteId ? body.strategyId : undefined);
+      await inspectOrder(order, order.exchange === 'bybit' && !order.remoteId ? body.strategyId : undefined, true);
       pause(id, '正在核对并撤销确认的剩余委托', job.stopTarget || 'paused');
       await stopping(jobFor(id)); return state();
     } catch (error) { throw new ExecutionError(409, safeError(error)); } finally { busyJobs.delete(id); }
@@ -447,16 +656,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, connect, disconnect, preview, start, stop, reconcile, tick,
+  return { state, connect, disconnect, preview, start, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       let ownsLease = false;
       try { requireLease(); ownsLease = true; } catch { /* The current owner handles recovery. */ }
-      if (ownsLease) for (const job of jobs()) if (ACTIVE.has(job.status)) pause(job.id, '服务关闭：暂停后续交易并撤销余单');
+      if (ownsLease) for (const job of jobs()) if (ACTIVE.has(job.status)) { try { pause(job.id, '服务关闭：暂停后续交易并撤销余单'); } catch (error) { if (!accountWriter) throw error; } }
       const timeout = setTimeout(() => { for (const controller of controllers) controller.abort(); }, 8000); timeout.unref?.();
       try {
         await Promise.allSettled([...(ticking ? [ticking] : []), ...pending]);
         if (ownsLease) await Promise.allSettled(jobs().filter(job => job.status === 'stopping').map(job => runJob(job.id)));
-      } finally { clearTimeout(timeout); closed = true; stmt.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner); }
+      } finally { clearTimeout(timeout); closed = true; writerTickets.clear(); recoveredWriterJobs.clear(); stmt.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner); }
     } };
 }

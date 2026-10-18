@@ -12,6 +12,7 @@ import uuid
 from .exchange import AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, api_wait_notice
 from .exchange_messages import exchange_reason
 from .execution import Executor, TERMINAL
+from .account_writer import protected_pair_id, writer_for
 from .models import TradingError, dec, positive, require_supported_leverage, opening_margin_limit, wire
 from .paper import PaperBroker, PaperOrderAbsent
 
@@ -802,6 +803,7 @@ class PairOrderRecovery:
                 Executor.validate_receipt(order, leg["receipt"])
         return pending
 
+    @protected_pair_id
     def check(self, pair_id, *, source="paused_manual_check"):
         """Review eligible opens without sending repair orders or assuming fills."""
         from .pair_execution import PairTrader, PairPositionError
@@ -861,6 +863,7 @@ class PairOrderRecovery:
                 "completed": current is None, "message": state.get("reason", "本次核对结束"), "orders": rows,
                 "archive_available": archive_available, "archive_reason": archive_reason}
 
+    @protected_pair_id
     def skip_positions(self, pair_id, batch_id, acknowledge_skip):
         """End a terminal batch locally; activation must still read the real baseline."""
         from .pair_execution import PairTrader
@@ -883,6 +886,7 @@ class PairOrderRecovery:
         _, _, identities = trader._members(pair)
         if pending.get("identities") != identities or original.get("identities") != identities:
             raise TradingError("原批次与当前真实账户身份不一致，不能跳过")
+        writer_for(self.engine).settle_pair(pair, original)
         now = time.time()
         audit = {"status": "manual_position_check_skipped", "positions_verified": False,
                  "at": now, "pending": deepcopy(pending), "identities": identities}
@@ -1137,6 +1141,7 @@ class PairOrderRecovery:
         self.previews.pop(read["pair"]["id"], None)
         return {"status": "receipts_found", "message": message}
 
+    @protected_pair_id
     def preview(self, pair_id):
         read = self._read(pair_id)
         restored = self._restore_receipts(read)
@@ -1152,6 +1157,7 @@ class PairOrderRecovery:
             "fingerprint": read["fingerprint"], "review": deepcopy(review)}
         return review
 
+    @protected_pair_id
     def confirm(self, pair_id, token, acknowledge_unknown=False):
         preview = self.previews.get(pair_id)
         if acknowledge_unknown is not True:

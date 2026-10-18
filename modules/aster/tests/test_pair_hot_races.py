@@ -174,7 +174,7 @@ class PendingRefreshRaceTests(TestCase):
         self.f.store.put("pair_runtime:gold", {"pending": {"id": "recovering"}})
         self.broker.cycle_cache.invalidate("真实写入已撤销")
         self.broker.start_cycle_hot_data.side_effect = lambda symbols, on_invalidate: self.broker.cycle_cache.set_listener(on_invalidate)
-        with patch.object(self.engine.pairs, "active_for_account", return_value=pair):
+        with patch.object(self.f.store, "pair_for_account", return_value=pair):
             self.engine.poll_cycle_hot_data("test")
             self.assertTrue(self.engine.work("test").hot_wake)
             self.engine.work("test").hot_wake = False

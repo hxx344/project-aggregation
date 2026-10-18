@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
 import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 import { normalizeIntent, splitQuantity } from '../server/trading-execution-plan.mjs';
@@ -14,10 +18,13 @@ const intent = (overrides = {}) => ({ preset: 'cross-exchange', action: 'open', 
 ], batchCount: 2, batchIntervalMs: 1000, repriceIntervalMs: 1000, timeoutMs: 60_000, ...overrides });
 
 async function fixture(t, options = {}) {
+  const { guarded = false, ...executionOptions } = options;
   const db = new DatabaseSync(':memory:');
   let time = baseTime, serial = 0, instance;
+  const directory = guarded ? mkdtempSync(join(tmpdir(), 'native-writer-')) : null;
+  const writer = guarded ? createAccountWriter({ databasePath: join(directory, 'execution-control.sqlite'), moduleId: 'hub', runtimeId: randomUUID(), now: () => time }) : null;
   const records = new Map(), calls = [], handlers = {}, markets = {};
-  const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map(exchange => [exchange, { identity: exchange === 'binance' ? null : 'fixture-uid', modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
+  const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map((exchange, index) => [exchange, { identity: guarded ? String(index + 1) : exchange === 'binance' ? null : 'fixture-uid', modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
   const factory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
@@ -27,6 +34,7 @@ async function fixture(t, options = {}) {
     if (method === 'market') { const value = market(args[0]); return { ...value, ...(exchange === 'okx' ? { rule: { ...value.rule, quantityStep: '1', minQuantity: '1', contractSize: args[0] === 'CLUSDT' ? '0.1' : '0.01', instrumentId: args[0] === 'CLUSDT' ? 'CL-USDT-SWAP' : 'BZ-USDT-SWAP', quantityUnit: '张', minNotional: '0' } } : {}), ...markets[exchange] }; }
     const spec = args[1];
     if (method === 'create') {
+      if (guarded) args[2].beforeMutation();
       const id = String(++serial), record = { ...spec, id, kind: exchange === 'bybit' ? 'strategy' : 'order', status: 'working', terminal: false, childrenSettled: false, filledQuantity: '0', price: '70', averagePrice: null, createdAt: new Date(time).toISOString() };
       records.set(id, record); return { id, kind: record.kind };
     }
@@ -39,13 +47,14 @@ async function fixture(t, options = {}) {
       record.price = (markets[exchange] ?? market(spec.symbol))[spec.side === 'buy' ? 'bid' : 'ask'];
       return structuredClone(record);
     }
-    if (method === 'stop') Object.assign(record, { status: 'terminal', terminal: true, childrenSettled: true });
+    if (method === 'stop') { if (guarded) args[2].beforeMutation(); Object.assign(record, { status: 'terminal', terminal: true, childrenSettled: true }); }
   }]));
-  const create = () => createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, ...options });
+  const create = () => createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, accountWriter: writer, ...executionOptions });
   instance = create();
-  t.after(async () => { await instance.close(); db.close(); });
+  t.after(async () => { await instance.close(); writer?.close(); db.close(); if (directory) rmSync(directory, { recursive: true, force: true }); });
+  await instance.initializeProtection();
   for (const exchange of ['binance', 'bybit', 'okx']) await instance.connect(exchange, { revision: 0, accountMode: exchange === 'binance' ? 'standard' : exchange === 'okx' ? 'cross' : 'unified', apiKey: 'fixture_key', apiSecret: 'fixture_secret', ...(exchange === 'okx' ? { passphrase: 'fixture_private_passphrase' } : {}) });
-  return { db, records, calls, accounts, handlers, markets, create, get service() { return instance; }, set service(value) { instance = value; }, get time() { return time; }, advance(value) { time += value; },
+  return { db, writer, directory, records, calls, accounts, handlers, markets, create, get service() { return instance; }, set service(value) { instance = value; }, get time() { return time; }, advance(value) { time += value; },
     async preview(body = intent(), session = 'session-a') { return instance.preview(body, session); },
     start(preview, requestId = randomUUID(), session = 'session-a') { return instance.start({ previewId: preview.id, requestId, confirmLive: true }, session); },
     get creates() { return calls.filter(call => call.method === 'create'); },
@@ -60,6 +69,165 @@ test('exact decimal split conserves very large and fractional quantities', () =>
   assert.throws(() => splitQuantity('0.003', 4, '0.001'));
   assert.throws(() => normalizeIntent({ ...intent(), orderType: 'MARKET' }));
   assert.throws(() => normalizeIntent(intent({ legs: intent().legs.map(leg => ({ ...leg, side: 'long' })) })));
+});
+
+test('managed native execution claims the full account vector before any leg and cannot take a Greeks UID', async t => {
+  const f = await fixture(t, { guarded: true });
+  const greeks = createAccountWriter({ databasePath: join(f.directory, 'execution-control.sqlite'), moduleId: 'greeks', runtimeId: randomUUID(), now: () => f.time });
+  t.after(() => greeks.close());
+  const identity = { authority: 'bybit', environment: 'mainnet', accountId: '2' };
+  greeks.bind('greeks', identity, 1); greeks.claim([identity]);
+  const preview = await f.preview();
+  assert.throws(() => f.start(preview), /其他模块|所有权/);
+  assert.equal(f.creates.length, 0);
+  assert.equal(f.writer.snapshot().accounts.some(row => row.moduleId === 'hub'), false);
+  greeks.close();
+});
+
+test('managed native four-leg siblings share one preflight and all final sends use operation tickets', async t => {
+  const f = await fixture(t, { guarded: true });
+  const four = intent({ preset: 'four-leg', batchCount: 1, legs: [...intent().legs,
+    { exchange: 'binance', symbol: 'BZUSDT', side: 'short', quantity: '2', stopPrice: '50' },
+    { exchange: 'bybit', symbol: 'BZUSDT', side: 'long', quantity: '2', stopPrice: '90' }] });
+  f.start(await f.preview(four)); await f.service.tick();
+  assert.equal(f.creates.length, 4); assert.equal(f.records.size, 4);
+  assert.deepEqual(f.writer.snapshot().operations, [{ moduleId: 'hub', state: 'confirmed', count: 4 }]);
+});
+
+test('managed missing UID remains readable and cannot submit or unblock another module in the same scope', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.accounts.bybit.identity = null;
+  await f.service.connect('bybit', { revision: 1, accountMode: 'unified', apiKey: 'replacement_key', apiSecret: 'replacement_secret' });
+  assert.equal(f.service.state().connections.find(row => row.exchange === 'bybit').writeProtection.identityVerified, false);
+  const preview = await f.preview();
+  assert.throws(() => f.start(preview), /真实身份/); assert.equal(f.creates.length, 0);
+  const greeks = createAccountWriter({ databasePath: join(f.directory, 'execution-control.sqlite'), moduleId: 'greeks', runtimeId: randomUUID(), now: () => f.time });
+  t.after(() => greeks.close());
+  const identity = { authority: 'bybit', environment: 'mainnet', accountId: '2' };
+  greeks.bind('greeks', identity, 1);
+  assert.throws(() => greeks.claim([identity]), { code: 'UNVERIFIED_BINDING' });
+  greeks.close();
+});
+
+test('managed reconnect cannot discard a shared orphan operation even when no local job locks the connection', async t => {
+  const f = await fixture(t, { guarded: true });
+  const identity = { authority: 'bybit', environment: 'mainnet', accountId: '2' }, ticket = f.writer.claim([identity]);
+  f.writer.prepare(ticket, 'hub:orphan', { action: 'create', clientId: 'original' });
+  f.accounts.bybit.identity = '200';
+  await assert.rejects(f.service.connect('bybit', { revision: 1, accountMode: 'unified', apiKey: 'replacement_key', apiSecret: 'replacement_secret' }), /原账户/);
+  assert.equal(f.service.state().connections.find(row => row.exchange === 'bybit').identity, '2');
+  assert.equal(f.service.state().connections.find(row => row.exchange === 'bybit').revision, 1);
+  assert.throws(() => f.service.disconnect('bybit', { revision: 1 }), { code: 'BINDING_UNRESOLVED' });
+});
+
+test('managed final transport rejects a changed binding, preserves the durable intent and accepts a local stop', async t => {
+  const f = await fixture(t, { guarded: true }), entered = deferred(), release = deferred();
+  let sent = false;
+  f.handlers['binance:create'] = async (_credentials, _spec, options) => { entered.resolve(); await release.promise; options.beforeMutation(); sent = true; return { id: 'late-id', kind: 'order' }; };
+  f.start(await f.preview(intent({ batchCount: 1 })));
+  const running = f.service.tick(); await entered.promise;
+  f.writer.bind('hub:binance', { authority: 'binance', environment: 'mainnet', accountId: '1' }, 2);
+  release.resolve(); await running;
+  assert.equal(sent, false);
+  const local = f.db.prepare('SELECT json FROM execution_orders').all().map(row => JSON.parse(row.json)).find(row => row.exchange === 'binance');
+  assert.equal(local.remoteId, null); assert.equal(local.writerOperation.state, 'sending');
+  assert.equal(f.service.stop(f.job.id, {}).jobs[0].stopRequested, true);
+});
+
+test('managed unknown native amendment permits only cancellation of the verified original order', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:amend'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('lost_ack', { uncertain: true }); };
+  f.markets.binance = { bid: '71', ask: '71.01' }; f.advance(1000); await f.service.tick();
+  assert.equal(f.calls.filter(call => call.method === 'amend').length, 1);
+  assert.equal(f.records.size, 2); assert.ok([...f.records.values()].every(row => row.terminal));
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  assert.equal(f.job.status, 'paused');
+});
+
+test('managed restart resolves a crash after durable ACK or unsent evidence without replay', async t => {
+  for (const outcome of ['confirmed', 'prepared']) {
+    const f = await fixture(t, { guarded: true });
+    f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+    const job = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs').get().json); job.status = 'attention';
+    f.db.prepare('UPDATE execution_jobs SET json=? WHERE id=?').run(JSON.stringify(job), job.id);
+    const row = f.db.prepare('SELECT json FROM execution_orders').get(), order = JSON.parse(row.json);
+    order.writerOperation.state = outcome; order.writerDispatch = outcome;
+    f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+    const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+    shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+    await f.service.close(); f.service = f.create(); await f.service.initializeProtection();
+    assert.equal(f.creates.length, 2);
+    assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+    const restored = JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE id=?').get(order.localId).json);
+    if (outcome === 'prepared') { assert.equal(restored.state, 'rejected'); assert.equal(restored.settled, true); }
+    else assert.equal(restored.remoteId, order.remoteId);
+  }
+});
+
+test('managed missing credentials with legacy unresolved orders retain an unverified scope binding', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview()); await f.service.tick();
+  const job = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs').get().json); job.status = 'attention';
+  f.db.prepare('UPDATE execution_jobs SET json=? WHERE id=?').run(JSON.stringify(job), job.id);
+  f.db.prepare("UPDATE execution_accounts SET credentials=NULL WHERE exchange='bybit'").run();
+  await f.service.close(); f.service = f.create(); await f.service.initializeProtection();
+  assert.equal(f.writer.snapshot().bindings.some(row => row.authority === 'bybit' && !row.verified), true);
+  const greeks = createAccountWriter({ databasePath: join(f.directory, 'execution-control.sqlite'), moduleId: 'greeks', runtimeId: randomUUID(), now: () => f.time });
+  t.after(() => greeks.close());
+  const identity = { authority: 'bybit', environment: 'mainnet', accountId: '2' }; greeks.bind('g', identity, 1);
+  assert.throws(() => greeks.claim([identity]), { code: 'UNVERIFIED_BINDING' });
+  greeks.close();
+});
+
+test('managed shared prepare followed by private sending-save failure retains and settles its original intent', async t => {
+  const f = await fixture(t, { guarded: true }), prepare = f.db.prepare.bind(f.db);
+  let injected = false;
+  f.db.prepare = sql => {
+    const statement = prepare(sql);
+    if (sql.startsWith('INSERT INTO execution_orders')) {
+      const run = statement.run.bind(statement);
+      statement.run = (...args) => {
+        const value = JSON.parse(args[2]);
+        if (!injected && value.exchange === 'binance' && value.writerDispatch === 'sending') { injected = true; throw new Error('SQLITE_IOERR'); }
+        return run(...args);
+      };
+    }
+    return statement;
+  };
+  f.start(await f.preview()); await f.service.tick(); f.db.prepare = prepare;
+  assert.equal(injected, true); assert.equal(f.creates.length, 0);
+  const local = JSON.parse(f.db.prepare('SELECT json FROM execution_orders').get().json);
+  assert.equal(local.writerOperation.state, 'rejected'); assert.equal(local.settled, true);
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  await f.service.close(); f.service = f.create(); await f.service.initializeProtection();
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.doesNotThrow(() => f.service.disconnect('binance', { revision: 1 }));
+});
+
+test('managed OKX unknown amendment can cancel an exactly identified system-trimmed original or after a failed read', async t => {
+  for (const failedRead of [false, true]) {
+    const f = await fixture(t, { guarded: true });
+    f.accounts.okx.positions = [{ symbol: 'CLUSDT', side: 'long', quantity: '20' }];
+    f.accounts.bybit.positions = [{ symbol: 'CLUSDT', side: 'short', quantity: '2' }];
+    const body = intent({ action: 'close', batchCount: 1, legs: intent().legs.map(leg => ({ ...leg,
+      ...(leg.exchange === 'binance' ? { exchange: 'okx', quantity: '20' } : {}), stopPrice: leg.side === 'long' ? '50' : '90' })) });
+    f.start(await f.preview(body)); await f.service.tick();
+    const original = [...f.records.values()].find(row => row.kind === 'order');
+    f.handlers['okx:amend'] = async (_credentials, _spec, options) => {
+      options.beforeMutation(); original.quantity = '19';
+      if (failedRead) f.handlers['okx:inspect'] = async () => { throw new Error('read unavailable'); };
+      throw new ExecutionExchangeError('lost_ack', { uncertain: true });
+    };
+    f.markets.okx = { bid: '71', ask: '71.01' }; f.advance(1000); await f.service.tick();
+    assert.equal(f.calls.filter(call => call.exchange === 'okx' && call.method === 'stop').length, 1);
+    assert.equal(original.terminal, true); assert.equal(f.creates.length, 2);
+    if (!failedRead) {
+      assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+      assert.equal(f.job.status, 'paused');
+    }
+  }
 });
 
 test('preview/read endpoints do not order; session-bound and one-use preview is idempotent by request ID', async t => {

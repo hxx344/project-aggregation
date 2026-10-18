@@ -19,6 +19,7 @@ from .rfq import RfqMixin
 from .reconciliation import ReconciliationMixin
 from .performance import PerformanceMixin
 from .trade_tasks import TradeTaskMixin, TradeConflict
+from .account_writer import ManagedWriter
 
 
 class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMixin):
@@ -65,6 +66,8 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
         self.execution_details: dict[str, list[ExecutionRecord]] = {}
         self.lock = asyncio.Lock()
         self._initialize_trade_tasks()
+        self.account_writer = ManagedWriter(self)
+        self.client.account_writer = self.account_writer
         self.log("INFO", f"Engine started in {settings.environment} mode")
 
     def _load_state(self) -> None:
@@ -107,6 +110,8 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
 
     def _save_state(self) -> None:
         self._require_trading_state()
+        if hasattr(self, "account_writer"):
+            self.account_writer.assert_current()
         target = Path(self.settings.state_file)
         temp = None
         try:
@@ -372,6 +377,8 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
         return {"risk_legs": proposed, "risk_reserved_usd": reserved}
 
     def _observe_order(self, link: str, event: dict) -> None:
+        if hasattr(self, "account_writer"):
+            self.account_writer.assert_current()
         observe_order(self.order_activity, link, event)
 
     def order_snapshot(self) -> dict:
@@ -380,6 +387,10 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
                                groups=self.execution_groups, group_links=self.execution_group_links)
 
     def _record_order(self, link: str, outcome: dict) -> None:
+        if hasattr(self, "account_writer"):
+            self.account_writer.assert_current()
+            if outcome.get("orderId") and outcome.get("status") != "not_submitted":
+                self.account_writer.resolved_order(link, terminal=outcome.get("terminal") is True)
         entry = self.order_journal[link]
         # Reconciliation carries a copy of the journal; its old display timestamp
         # must not turn unchanged exchange observations into repeated disk writes.
