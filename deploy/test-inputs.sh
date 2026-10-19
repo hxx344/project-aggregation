@@ -192,6 +192,11 @@ echo helper > "$source_dir/deploy/build-artifact-cache.py"; refresh; compare 0 0
    ${module_build_keys[aster]} != "${module_before[3]}" ]]
 capture
 embedded_before=$embedded_key
+echo diagnostic > "$source_dir/deploy/diagnose-aster-margin.py"; refresh; compare 0 0 0 0 1
+compare_module_inputs 0 0 0 0
+[[ $embedded_key != "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
+capture
+embedded_before=$embedded_key
 # An actual compiler dispatch change invalidates both the module artifacts and
 # the assembled runtime; an existing embedded cache cannot bypass the new recipe.
 run_module_build() { printf 'changed build recipe\n'; }

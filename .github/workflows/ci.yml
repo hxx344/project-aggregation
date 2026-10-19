@@ -80,6 +80,8 @@ jobs:
       - name: Verify recovery guard and cold-stop ownership
         run: |
           sudo env RECOVERY_TEST_NODE="$(command -v node)" python3 -I tests/test_recovery_operations.py -v
+      - name: Verify read-only Aster margin evidence and privacy
+        run: sudo python3 -I tests/test_aster_margin_diagnostics.py -v
       - name: Verify SQLite recovery across root and service identities
         if: ${{ !cancelled() }}
         run: |

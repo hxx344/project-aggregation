@@ -307,6 +307,21 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
             raise ValueError('Missing module runtime/build output: ' + relative)
     (stage / 'deploy').mkdir()
     shutil.copy2(source / 'deploy/migrate-modules.py', stage / 'deploy/migrate-modules.py')
+    diagnostic = source / 'deploy/diagnose-aster-margin.py'
+    if not diagnostic.is_file() or is_link(diagnostic):
+        raise ValueError('Missing trusted Aster margin diagnostic')
+    shutil.copy2(diagnostic, stage / 'deploy/diagnose-aster-margin.py')
+
+
+def application_key(git, architecture):
+    inputs = ['server', 'src', 'public', 'modules', 'scripts/modules.mjs',
+              'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
+              'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
+              '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',
+              'deploy/package-release.py', 'deploy/pnpm-runtime-lock.mjs', 'deploy/migrate-modules.py',
+              'deploy/diagnose-aster-margin.py', 'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md']
+    tree = subprocess.check_output([*git, 'ls-tree', '-r', 'HEAD', '--', *inputs])
+    return hashlib.sha256(f'unified-native-pnpm-v1\n24.15.0\n11.25.0\n{architecture}\n'.encode() + tree).hexdigest()
 
 
 def main():
@@ -350,14 +365,7 @@ def main():
         raise ValueError('Build the unified application before packaging')
     git = ['git', '-c', f'safe.directory={repository.as_posix()}', '-C', str(repository)]
     commit = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
-    inputs = ['server', 'src', 'public', 'modules', 'scripts/modules.mjs',
-              'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
-              'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
-              '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',
-              'deploy/package-release.py', 'deploy/pnpm-runtime-lock.mjs', 'deploy/migrate-modules.py',
-              'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md']
-    tree = subprocess.check_output([*git, 'ls-tree', '-r', 'HEAD', '--', *inputs])
-    application_key = hashlib.sha256(f'unified-native-pnpm-v1\n24.15.0\n11.25.0\n{architecture}\n'.encode() + tree).hexdigest()
+    runtime_key = application_key(git, architecture)
     args.output.mkdir(parents=True, exist_ok=True)
     filename = f'{name}-linux-{architecture}.tar.gz'
     archive_path = args.output / filename
@@ -367,7 +375,7 @@ def main():
         stage_runtime(source, stage, args.dependency_root, args.node, args.parser_user)
         print(f'[package] Runtime staging: {perf_counter() - started:.1f}s', flush=True)
         (stage / '.release-commit').write_text(commit + '\n')
-        (stage / '.release-application-key').write_text(application_key + '\n')
+        (stage / '.release-application-key').write_text(runtime_key + '\n')
         # Level 6 avoids the expensive maximum-compression pass while retaining
         # deterministic gzip metadata and the same verified runtime contents.
         started = perf_counter()
@@ -383,7 +391,7 @@ def main():
                     info.size, info.mode, info.mtime = len(content), 0o755 if path.stat().st_mode & 0o111 else 0o644, 0
                     archive.addfile(info, io.BytesIO(content))
         print(f'[package] Archive compression (gzip 6): {perf_counter() - started:.1f}s', flush=True)
-    artifact = {'file': filename, 'sha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(), 'application_key': application_key}
+    artifact = {'file': filename, 'sha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(), 'application_key': runtime_key}
     manifest = {'schema': 1, 'repository': 'hxx344/' + name, 'commit': commit, 'tag': 'deploy-' + commit,
                 'node_version': '24.15.0', 'artifacts': {'linux-' + architecture: artifact}}
     (args.output / f'release-manifest-{architecture}.json').write_text(json.dumps(manifest, indent=2) + '\n')

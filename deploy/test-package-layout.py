@@ -139,7 +139,7 @@ class RuntimeDependencyTests(unittest.TestCase):
                     'modules/monitor/dist/client/index.html', 'modules/asset/.next/BUILD_ID',
                     'modules/crossex/dist/index.html', 'modules/greeks/requirements.lock',
                     'modules/aster/dashboard/dist/client/index.html', 'modules/aster/requirements.lock',
-                    'modules/aster/trading/server.py', 'deploy/migrate-modules.py')
+                    'modules/aster/trading/server.py', 'deploy/migrate-modules.py', 'deploy/diagnose-aster-margin.py')
         for name in required:
             file = self.source / name
             file.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +177,36 @@ class RuntimeDependencyTests(unittest.TestCase):
         with patch.object(module, 'read_runtime_lock', return_value=self.lock):
             with self.assertRaisesRegex(ValueError, 'Missing module runtime/build output: server/modules/aster.mjs'):
                 module.stage_runtime(self.source, self.target, embedded_only=True)
+
+    def test_embedded_stage_rejects_missing_margin_diagnostic(self):
+        self.prepare_five_modules()
+        (self.source / 'deploy/diagnose-aster-margin.py').unlink()
+        with self.assertRaisesRegex(ValueError, 'Missing trusted Aster margin diagnostic'):
+            module.stage_runtime(self.source, self.target, embedded_only=True)
+
+    def test_embedded_stage_rejects_linked_margin_diagnostic(self):
+        self.prepare_five_modules()
+        diagnostic = self.source / 'deploy/diagnose-aster-margin.py'; diagnostic.unlink()
+        outside = self.source.parent / 'outside-diagnostic.py'; outside.write_text('must not be packaged')
+        self.link(diagnostic, outside)
+        with self.assertRaisesRegex(ValueError, 'Missing trusted Aster margin diagnostic'):
+            module.stage_runtime(self.source, self.target, embedded_only=True)
+
+    def test_ci_application_key_tracks_only_committed_diagnostic_changes(self):
+        diagnostic = self.source / 'deploy/diagnose-aster-margin.py'
+        diagnostic.parent.mkdir(); diagnostic.write_text('original diagnostic')
+        git = ['git', '-C', str(self.source)]
+        def run(*args):
+            subprocess.run([*git, *args], check=True, capture_output=True)
+        run('init', '-q'); run('config', 'user.name', 'fixture'); run('config', 'user.email', 'fixture@example.invalid')
+        run('config', 'core.autocrlf', 'false'); run('add', '.'); run('commit', '-qm', 'original')
+        before = module.application_key(git, 'x64')
+        diagnostic.write_text('updated diagnostic')
+        self.assertEqual(module.application_key(git, 'x64'), before, 'uncommitted input cannot change a fixed release')
+        run('add', '.'); run('commit', '-qm', 'diagnostic update')
+        changed = module.application_key(git, 'x64'); self.assertNotEqual(changed, before)
+        (self.source / 'README.md').write_text('documentation only'); run('add', '.'); run('commit', '-qm', 'docs')
+        self.assertEqual(module.application_key(git, 'x64'), changed)
 
     def test_dependency_stage_has_fixed_importer_targets_and_validated_production_graph(self):
         from unittest.mock import patch

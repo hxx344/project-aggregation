@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import http from 'node:http';
 import { randomUUID, randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 
 const root = path.resolve(process.argv[2] || '.');
 const dataDir = await mkdtemp(path.join(tmpdir(), 'ci-package-data-'));
@@ -135,6 +136,13 @@ try {
   assert.equal((await request('/api/projects')).data.projects.length, 5);
   for (const module of (await request('/api/system/architecture')).data.modules) assert.equal(module.state, 'compatible', module.moduleId);
   assert.equal((await request('/api/system/accounts')).data.recovery.state, 'quarantine');
+  const diagnostic = spawnSync(process.env.ASTER_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
+    ['-I', path.join(root, 'deploy/diagnose-aster-margin.py'), targetDir], { windowsHide: true, timeout: 15_000, encoding: 'utf8' });
+  assert.equal(diagnostic.status, 0, 'packaged read-only Aster diagnostic succeeds as the service account');
+  const evidence = JSON.parse(diagnostic.stdout);
+  assert.equal(evidence.schema, 'aster-margin-diagnostics/v1');
+  assert.equal(evidence.recoveryState, 'quarantine');
+  assert.deepEqual(evidence.sharedOperations.items, []);
   assert.equal(failure, undefined, failure?.message);
   console.log(JSON.stringify({ recoveryDrill: 'real-five-module-read-only', checkpointAgeAtFaultMs: faultAt - backupStartedAt,
     restoreToReadableMs: Date.now() - restoreStartedAt, scope: 'local-CI-artifact-and-keys', trading: 'quarantine' }));

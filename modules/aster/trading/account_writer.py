@@ -49,6 +49,20 @@ class _UnmanagedWriter:
 _UNMANAGED = _UnmanagedWriter()
 
 
+ADMISSION_CODES = frozenset({"ACCOUNT_UNRESOLVED", "OPERATION_UNRESOLVED", "ACCOUNT_ISOLATED",
+    "ACCOUNT_PINNED", "OWNER_ALIVE", "OWNERSHIP_LOST", "LEASE_EXPIRED", "BINDING_CHANGED",
+    "UNVERIFIED_BINDING", "RECOVERY_REQUIRED", "AUTHORITY_RETIRED", "ALREADY_SUBMITTED",
+    "ALREADY_REJECTED", "WRITER_UNAVAILABLE"})
+
+
+def _not_sent(message, cause):
+    from .exchange import RequestNotSent
+    error = RequestNotSent(message)
+    code = getattr(cause, "code", None)
+    error.admission_code = code if isinstance(code, str) and code in ADMISSION_CODES else "WRITER_UNAVAILABLE"
+    return error
+
+
 def writer_for(engine):
     return getattr(engine, "account_writer", _UNMANAGED)
 
@@ -138,7 +152,10 @@ class ManagedWriter:
             prefix = pair.get("margin", {}).get("master_env_prefix")
             margin_state = self.engine.store.get("pair_margin:" + pair["id"], {})
             pending = margin_state.get("pending") if isinstance(margin_state, dict) else True
-            if prefix and (pair.get("margin", {}).get("enabled") or pending):
+            last = margin_state.get("last_transfer") if isinstance(margin_state, dict) else None
+            rejection = last.get("writer_rejection") if isinstance(last, dict) else None
+            needs_rejection = isinstance(rejection, dict) and rejection.get("settled") is not True
+            if prefix and (pair.get("margin", {}).get("enabled") or pending or needs_rejection):
                 configured["master:" + prefix] = prefix
         with self.lock:
             for connection in set(self.connections) - set(configured):
@@ -276,28 +293,36 @@ class ManagedWriter:
                 raise TradingError("账户写入所有权已失效，拒绝旧执行者状态写回") from exc
 
     @contextmanager
-    def batch(self, operation_id, payload):
+    def batch(self, operation_id, payload, *, before_finish=None):
         if not self.enabled:
             yield
             return
         ticket = self.current.get()
         if ticket is None:
-            raise TradingError("多账户写入缺少整体账户所有权")
+            raise _not_sent("多账户写入缺少整体账户所有权，未发送请求", None)
         try:
             operation = self.registry.prepare(ticket, operation_id, payload)
         except Exception as exc:
-            raise TradingError("账户有未决交易或不具备整体写入权，未发送请求") from exc
+            raise _not_sent("账户有未决交易或不具备整体写入权，未发送请求", exc) from exc
         state = {"operation": operation, "unknown": False, "sent": False, "lock": threading.Lock()}
         token = self.active_batch.set(state)
         try:
             yield
-        except BaseException:
-            state["unknown"] = True
+        except BaseException as exc:
+            from .exchange import RequestNotSent
+            with state["lock"]:
+                # A veto before the final send hook is a proven local no-send.
+                # Another leg may already have dispatched, so never apply that
+                # evidence to a partially sent batch or an earlier unknown.
+                state["unknown"] |= not (isinstance(exc, RequestNotSent) and not state["sent"])
             raise
         finally:
             self.active_batch.reset(token)
             self.registry.assert_owned(operation, budget_ms=0)
-            self.registry.finish(operation, "unknown" if state["unknown"] else "confirmed" if state["sent"] else "rejected")
+            outcome = "unknown" if state["unknown"] else "confirmed" if state["sent"] else "rejected"
+            if before_finish is not None:
+                before_finish(operation, outcome, state["sent"])
+            self.registry.finish(operation, outcome)
 
     def prepare(self, api, method, path, params):
         if not self.enabled:
@@ -313,7 +338,7 @@ class ManagedWriter:
             ticket = self.current.get() or self.registry.claim(self._identities([connection]))
             self.registry.assert_owned(ticket)
         except Exception as exc:
-            raise RequestNotSent("账户真实身份或写入权未通过验证，未发送请求") from exc
+            raise _not_sent("账户真实身份或写入权未通过验证，未发送请求", exc) from exc
         batch = self.active_batch.get()
         if batch is not None:
             return {"batch": batch, "ticket": batch["operation"]}
@@ -321,7 +346,7 @@ class ManagedWriter:
         try:
             prepared = self.registry.prepare(ticket, operation, {"method": method, "path": path, "params": params})
         except Exception as exc:
-            raise RequestNotSent("账户存在未决操作或写入权已变化，未发送请求") from exc
+            raise _not_sent("账户存在未决操作或写入权已变化，未发送请求", exc) from exc
         return {"ticket": prepared}
 
     def operation_id(self, connection, method, path, params):
@@ -368,7 +393,7 @@ class ManagedWriter:
             try:
                 self.registry.assert_owned(prepared["ticket"])
             except Exception as exc:
-                raise RequestNotSent("发送前账户所有权已改变，未发送请求") from exc
+                raise _not_sent("发送前账户所有权已改变，未发送请求", exc) from exc
             if "batch" in prepared:
                 with prepared["batch"]["lock"]:
                     prepared["batch"]["sent"] = True
@@ -418,10 +443,15 @@ class ManagedWriter:
             pending = state.get("pending")
             batches = state.get("recovery_watch", {}).get("batches", []) if isinstance(state.get("recovery_watch"), dict) else []
             active_adl = key.startswith("adl_pair:") and (state.get("status") != "completed" or state.get("hold"))
-            if not pending and not batches and not active_adl:
+            last = state.get("last_transfer")
+            rejection = last.get("writer_rejection") if isinstance(last, dict) else None
+            needs_rejection = key.startswith("pair_margin:") and isinstance(rejection, dict) and rejection.get("settled") is not True
+            if not pending and not batches and not active_adl and not needs_rejection:
                 continue
             pair = store.pair(key.split(":", 1)[1])
             if pair is None:
+                if not pending and not batches and not active_adl:
+                    continue  # Historical receipts never recreate a deleted pair.
                 raise TradingError("恢复记录缺少原始配对账户，禁止新写入")
             ids = [pair["long_account_id"], pair["short_account_id"]]
             if key.startswith("pair_margin:"):
@@ -429,6 +459,9 @@ class ManagedWriter:
             if all(store.account(aid) and store.account(aid)["mode"] == "paper" for aid in ids):
                 continue
             with self.accounts(ids, recovery=True) as ticket:
+                if needs_rejection:
+                    self.settle_transfer(pair, last)
+                    store.put(key, state)
                 if pending:
                     identity = pending.get("id") or pending.get("request_id")
                     if not identity:
@@ -622,7 +655,8 @@ class ManagedWriter:
     def settle_transfer(self, pair, pending):
         if not self.enabled or self.current.get() is None:
             return
-        if (pending.get("status") != "acknowledged" or type(pending.get("acknowledgement_code")) is not int
+        rejected = pending.get("status") == "rejected" and isinstance(pending.get("writer_rejection"), dict)
+        if not rejected and (pending.get("status") != "acknowledged" or type(pending.get("acknowledgement_code")) is not int
                 or pending.get("acknowledgement_code") not in (0, 200)
                 or not isinstance(pending.get("request_id"), str) or not pending["request_id"]):
             return
@@ -630,16 +664,35 @@ class ManagedWriter:
         from .exchange import credentials_for
         from .margin_balance import MarginBalancer
         acknowledged = pending.get("acknowledged_at")
-        if (not MarginBalancer._valid_pending(pending) or type(acknowledged) not in (int, float)
+        if rejected:
+            evidence = pending["writer_rejection"]
+            if (not MarginBalancer._valid_pending({**pending, "status": "unknown"})
+                    or set(evidence) != {"schema_version", "operation_id", "body_hash", "request_sent", "settled"}
+                    or type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1
+                    or evidence["request_sent"] is not False or type(evidence["settled"]) is not bool
+                    or evidence["operation_id"] != "aster:transfer:" + pending["request_id"]
+                    or not isinstance(evidence["body_hash"], str) or len(evidence["body_hash"]) != 64
+                    or any(char not in "0123456789abcdef" for char in evidence["body_hash"])):
+                raise TradingError("持久划转未发送证据与原请求不一致")
+        elif (not MarginBalancer._valid_pending(pending) or type(acknowledged) not in (int, float)
                 or not math.isfinite(acknowledged) or acknowledged < pending["created_at"]):
             raise TradingError("持久划转成功回执缺少有效的原请求或确认时间")
         children = {side: credentials_for(member["env_prefix"]) for side, member in members.items()}
         master = credentials_for(pair["margin"]["master_env_prefix"])
         if pending.get("identity") != MarginBalancer._fingerprint(pair, members, children, master):
-            raise TradingError("持久划转成功回执的原账户身份不一致")
-        with self.accounts([member["id"] for member in members.values()] + ["master:" + pair["margin"]["master_env_prefix"]], recovery=not self.ready):
-            self.resolve_prefix("aster:transfer:" + pending["request_id"])
-            self.resolve_prefix("aster:legacy:pair_margin:" + pair["id"] + ":" + pending["request_id"])
+            raise TradingError("持久划转回执的原账户身份不一致")
+        with self.accounts([member["id"] for member in members.values()] + ["master:" + pair["margin"]["master_env_prefix"]], recovery=not self.ready) as ticket:
+            if rejected:
+                for row in self.registry.unresolved(ticket):
+                    if row["operationId"] != evidence["operation_id"]:
+                        continue
+                    if row["bodyHash"] != evidence["body_hash"]:
+                        raise TradingError("共享划转记录与持久未发送证据不一致")
+                    self.registry.resolve(row["operationId"], ticket, outcome="rejected")
+                evidence["settled"] = True
+            else:
+                self.resolve_prefix("aster:transfer:" + pending["request_id"])
+                self.resolve_prefix("aster:legacy:pair_margin:" + pair["id"] + ":" + pending["request_id"])
 
     def status(self):
         return {"writerProtectionVersion": 1 if self.enabled and self.registry is not None else None,

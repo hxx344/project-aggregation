@@ -990,6 +990,12 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `shared-admission-private-journal-recovery-20261019`；一次共享准入集成审查及其同类路径修复，不推进主线复盘检查点。
 
+**已发布路径逃逸（2026-10-19）：** 用户在 `a0d9b64` 反馈 ASTER 保证金反复结果未知、交易所查无划转。离线真实 ManagedWriter、共享 SQLite 和 HTTPX hooks 确认：快照失效在发送前抛 `RequestNotSent`，HTTP 为 0，私库 rejected，批次却被无条件设为共享 unknown；下一轮 prepare 因旧 unknown 拒绝又被包装成普通异常，误记为新的私库 unknown，余额归档后继续循环。引入于已发布 M1 `519d2e8`，属于 P1 逃逸；不能据此断定用户现场第一笔一定是该快照失效。
+
+修复明确未发送分类，先持久化 exact operation/body hash 的未发送证据或明确成功回执，再结算共享操作；尚未结算的证据保留原配对和主账户配置，暂停期间继续只读恢复。旧版 unknown 缺乏发送边界，不凭查无流水、新余额或 skipped 自动追认为 rejected/confirmed。原覆盖仅验证已持久 ACK 的恢复，缺少实际受管理新划转路径；[真实划转集成](modules/aster/tests/test_managed_margin_transfer.py) 现覆盖正常首发、发送前拒绝后重试、部分发送、超时、双库提交切点、原体篡改及配对删除/改配保护。[只读诊断](deploy/diagnose-aster-margin.py) 提供脱敏原请求关联，不改变 gate。
+
+**新增独立事件：** `aster-margin-preflight-shared-unknown-20261019`，同次用户故障定位及连续修补；历史复盘检查点不变。
+
 ### L063：恢复检查点须保留秘密材料、真实未决状态与原服务可用性
 
 **适用条件：** 跨模块制作冷备份、隔离恢复或一次性转移交易 authority，尤其由 root 工具操作服务账户拥有的 SQLite 数据。

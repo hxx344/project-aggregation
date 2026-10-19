@@ -288,9 +288,10 @@ class PairTrader:
                     or not math.isfinite(margin_state[field]))
                 for field in ("checked_at", "next_check_at", "cooldown_until"))
             margin_pending = margin_state.get("pending") if isinstance(margin_state, dict) else None
-            margin_waiting = bool(margin_pending)
-            margin_eligible = bool(pair["margin"]["enabled"] or margin_pending is not None or margin_invalid)
             from .margin_balance import MarginBalancer
+            margin_rejection = MarginBalancer.unsettled_rejection(margin_state)
+            margin_waiting = bool(margin_pending)
+            margin_eligible = bool(pair["margin"]["enabled"] or margin_pending is not None or margin_invalid or margin_rejection)
             from .pairing import margin_only
             if margin_only(pair) and not pending and not holding:
                 # Funds management has no strategy-symbol, order-history or
@@ -314,7 +315,7 @@ class PairTrader:
                     or retry.get("identities") != identities):
                 state.pop("trade_retry", None)
                 retry = {}
-            if margin_pending is not None or margin_invalid:
+            if margin_pending is not None or margin_invalid or margin_rejection:
                 # Confirm existing transfers first, then recover outstanding
                 # orders or a due reduction using fresh reconciliation reads.
                 self._ordinary_observations.pop(pair["id"], None)

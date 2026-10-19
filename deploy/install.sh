@@ -1516,8 +1516,8 @@ input_keys() {
   typecheck_tree=$(tree_hash src "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash src public "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
-  runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py) || return
-  embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py .env .env.local .env.production .env.production.local) || return
+  runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
+  embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py deploy/diagnose-aster-margin.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf 'pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger\n%s\n%s\n%s' "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
@@ -1833,6 +1833,10 @@ prepare_embedded_runtime() {
   # object. Only the declared, fully verified build outputs come from caches.
   mkdir "$work_dir/trusted-runtime"
   git --git-dir="$APP_DIR/repository.git" archive "$commit" server modules package.json pnpm-lock.yaml pnpm-workspace.yaml deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py | tar -x -C "$work_dir/trusted-runtime"
+  # Older selected revisions remain installable with their own packaging code.
+  if git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:deploy/diagnose-aster-margin.py" 2>/dev/null; then
+    git --git-dir="$APP_DIR/repository.git" archive "$commit" deploy/diagnose-aster-margin.py | tar -x -C "$work_dir/trusted-runtime"
+  fi
   local module key
   for module in "${MODULE_BUILD_IDS[@]}"; do
     key=${module_build_keys[$module]}
