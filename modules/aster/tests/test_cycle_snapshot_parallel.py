@@ -305,13 +305,13 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         self.assertEqual(broker.cached_at, {})
 
     def test_all_budget_contexts_keep_their_effective_limit_in_workers(self):
-        cases = [((False, False, False), 1320, False),
-                 ((True, False, False), 1320, True),
-                 ((True, True, False), 1320, False),
-                 ((True, False, True), 1320, True),
-                 ((True, False, True), 1500, False),
-                 ((True, True, True), 1500, False)]
-        names = ("reconciliation", "cycle_accounting", "capacity_monitoring")
+        cases = [((False, False, False, False), 1320, False),
+                 ((True, False, False, False), 1320, True),
+                 ((True, True, False, False), 1320, False),
+                 ((True, False, True, False), 1320, True),
+                 ((True, False, True, False), 1500, False),
+                 ((True, True, True, False), 1500, False)]
+        names = ("reconciliation", "cycle_accounting", "capacity_monitoring", "margin")
         for flags, used, allowed in cases:
             with self.subTest(flags=flags, used=used):
                 budget = RateBudget(capacity_reserve=180)
@@ -331,7 +331,7 @@ class CycleSnapshotParallelTests(unittest.TestCase):
                         with self.assertRaises(BudgetWait):
                             broker.cycle_snapshot([SYMBOL], fresh_modes=True)
                     self.assertEqual(budget._priority_flags(), flags)
-                self.assertEqual(budget._priority_flags(), (False, False, False))
+                self.assertEqual(budget._priority_flags(), (False, False, False, False))
                 self.assertEqual(len(observed.requests), 2 if allowed else 0)
                 self.assertEqual(seen_flags, [flags] * (2 if allowed else 0))
                 self.assertEqual(budget.inflight, {})
@@ -340,7 +340,7 @@ class CycleSnapshotParallelTests(unittest.TestCase):
         budget = RateBudget(capacity_reserve=180)
         budget.reserve(1320)
         def inherited():
-            with budget._inherit_priority((True, False, False)):
+            with budget._inherit_priority((True, False, False, False)):
                 budget.reserve(1)
                 raise RuntimeError("worker failed")
         with ThreadPoolExecutor(max_workers=1) as pool:

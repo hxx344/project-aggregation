@@ -70,7 +70,7 @@ class AdlSnapshotBudgetTests(unittest.TestCase):
                         self.read(brokers, market_only=market_only)
                 admission.assert_called_once_with(total)
                 self.assertEqual(budget.snapshot()["used"], used)
-                self.assertEqual(budget._priority_flags(), (False, False, False))
+                self.assertEqual(budget._priority_flags(), (False, False, False, False))
                 self.assert_no_reads(brokers)
 
     def test_market_scene_fits_last_80_weight_without_full_order_inventory(self):
@@ -85,7 +85,7 @@ class AdlSnapshotBudgetTests(unittest.TestCase):
         self.assertEqual(budget.snapshot()["used"], 1800)
         for broker in brokers.values():
             self.assertEqual([call[1] for call in broker.api.calls], [fixtures.ACCOUNT, fixtures.RISK, fixtures.DUAL])
-            self.assertTrue(all(call[3] == (True, False, False) for call in broker.api.calls))
+            self.assertTrue(all(call[3] == (True, False, False, False) for call in broker.api.calls))
 
     def test_cached_mode_and_scoped_orders_admit_a_22_weight_scene(self):
         brokers = self.brokers()

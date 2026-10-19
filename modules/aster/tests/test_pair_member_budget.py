@@ -125,7 +125,7 @@ class PairMemberBudgetTests(TestCase):
         with budget.reconciliation():
             with self.assertRaises(BudgetWait) as raised:
                 self.read(reconciliation=False)
-            self.assertEqual(budget._priority_flags(), (True, False, False))
+            self.assertEqual(budget._priority_flags(), (True, False, False, False))
         self.assertIn("1280/1500", str(raised.exception))
         self.assert_no_reads()
 

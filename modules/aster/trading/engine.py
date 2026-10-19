@@ -2719,11 +2719,14 @@ class Engine:
                 raise TradingError("缺少配置市场的交易规则")
             with self.lock:
                 self.ready, self.error = True, None
-            return 10
+            delay = 10
         except (TradingError, KeyError, ValueError, TypeError) as exc:
             with self.lock:
                 self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
-            return max(10, getattr(exc, "retry_after", 0))
+            delay = max(10, getattr(exc, "retry_after", 0))
+        # Preserve the completion-based deadline even if the scheduler consumes
+        # this future on a later turn. This result applies to this attempt only.
+        return delay, time.monotonic() + delay
 
     def run(self):
         from .margin_balance import MarginBalancer
@@ -2756,7 +2759,11 @@ class Engine:
                             if future.done():
                                 failed = False
                                 try:
-                                    delay = future.result()
+                                    result = future.result()
+                                    if key == "rules":
+                                        delay, rules_deadline = result
+                                    else:
+                                        delay = result
                                 except Exception:
                                     failed = True
                                     LOG.error("Worker failed; new work delayed (%s)", key)
@@ -2789,6 +2796,8 @@ class Engine:
                                     # account worker; it never postpones ordinary
                                     # work or consumes another market's wakeup.
                                     due[key] = cycle_job_due.pop(key)
+                                elif key == "rules" and not failed:
+                                    due[key] = max(time.monotonic(), rules_deadline)
                                 elif (key.startswith("market:") and not failed and not isinstance(delay, PollBackoff)
                                       and delay <= max(CAPACITY_POLL_INTERVAL, self.capacity_interval(key.removeprefix("market:")))):
                                     # Successful sampling uses start times; failed
