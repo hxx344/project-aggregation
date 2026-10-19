@@ -1,5 +1,5 @@
 """Shared account ownership for managed Aster transports and durable receipts."""
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar, copy_context
 from functools import wraps
 import hashlib
@@ -8,9 +8,11 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
+from urllib.parse import parse_qsl, urlencode
 
 from .models import TradingError, dec
 
@@ -67,6 +69,30 @@ def writer_for(engine):
     return getattr(engine, "account_writer", _UNMANAGED)
 
 
+@contextmanager
+def funds_budget(engine, pair):
+    """Scope only funds work and its initial binding verification to T0 quota."""
+    with ExitStack() as priorities:
+        seen = set()
+        for side in ("long", "short"):
+            member = engine.store.account(pair[side + "_account_id"])
+            if member is None:
+                continue
+            budget = getattr(getattr(engine.broker(member), "api", None), "budget", None)
+            if budget is not None and id(budget) not in seen:
+                priorities.enter_context(getattr(budget, "margin", nullcontext)())
+                seen.add(id(budget))
+        yield
+
+
+def funds_priority(method):
+    @wraps(method)
+    def run(self, pair, *args, **kwargs):
+        with funds_budget(self.engine, pair):
+            return method(self, pair, *args, **kwargs)
+    return run
+
+
 def protected_account(method):
     @wraps(method)
     def run(self, account_id, *args, **kwargs):
@@ -96,7 +122,14 @@ def protected_pair_id(method):
         pair = self.store.pair(pair_id) if writer.enabled else None
         if pair is None:
             return method(self, pair_id, *args, **kwargs)
-        with writer.accounts([pair["long_account_id"], pair["short_account_id"]]):
+        journal = self.store.get("pair_margin:" + pair["id"], {})
+        from .margin_balance import MarginBalancer
+        priority = (pair["margin"]["enabled"] or isinstance(journal, dict) and journal.get("pending") is not None
+            or MarginBalancer.unsettled_rejection(journal))
+        with ExitStack() as ownership:
+            with funds_budget(self.engine, pair) if priority else nullcontext():
+                ownership.enter_context(writer.accounts([pair["long_account_id"], pair["short_account_id"]]))
+            # Strategy work retains ownership but cannot spend funds quota.
             return method(self, pair_id, *args, **kwargs)
     return run
 
@@ -212,10 +245,24 @@ class ManagedWriter:
             return
         self.refresh_bindings()
         self.error = None
+        from .margin_balance import MarginBalancer
+        funding_connections = {}
+        for pair in self.engine.store.pairs():
+            journal = self.engine.store.get("pair_margin:" + pair["id"], {})
+            if (pair["margin"]["enabled"] or isinstance(journal, dict) and journal.get("pending") is not None
+                    or MarginBalancer.unsettled_rejection(journal)):
+                for connection in (pair["long_account_id"], pair["short_account_id"],
+                        "master:" + pair["margin"]["master_env_prefix"]):
+                    funding_connections[connection] = pair
         for connection, row in list(self.connections.items()):
             try:
                 if row["identity"] is None:
-                    self.verify_connection(connection)
+                    pair = funding_connections.get(connection)
+                    # Only authenticated identity reads for funds accounts use
+                    # their quota. Inventory import below remains unchanged and
+                    # does not send orders or query order history.
+                    with funds_budget(self.engine, pair) if pair is not None else nullcontext():
+                        self.verify_connection(connection)
             except Exception:
                 self.error = "部分实盘账户身份尚未核实，账户保持只读"
         # No new side effect is admitted until the complete old inventory has
@@ -293,18 +340,33 @@ class ManagedWriter:
                 raise TradingError("账户写入所有权已失效，拒绝旧执行者状态写回") from exc
 
     @contextmanager
-    def batch(self, operation_id, payload, *, before_finish=None):
+    def batch(self, operation_id, payload, *, before_finish=None, margin_transfer=None):
         if not self.enabled:
             yield
             return
         ticket = self.current.get()
         if ticket is None:
             raise _not_sent("多账户写入缺少整体账户所有权，未发送请求", None)
+        transfer = None
+        if margin_transfer is not None:
+            try:
+                if not isinstance(margin_transfer, dict) or set(margin_transfer) != {"source", "destination", "master"}:
+                    raise TradingError("保证金划转身份字段无效")
+                connections = dict(margin_transfer)
+                if len(set(connections.values())) != 3 or set(connections.values()) != set(self.current_ids.get()):
+                    raise TradingError("保证金划转须恰好持有三个真实账户")
+                identities = {role: self._identities([connection])[0] for role, connection in connections.items()}
+                transfer = {"version": 1, "method": "POST", "path": "/fapi/v3/subAccountTransfer",
+                    "params": json.loads(json.dumps(payload)), **identities}
+                payload = {"marginTransfer": transfer}
+            except Exception as exc:
+                raise _not_sent("保证金划转身份或参数无效，未发送请求", exc) from exc
         try:
             operation = self.registry.prepare(ticket, operation_id, payload)
         except Exception as exc:
             raise _not_sent("账户有未决交易或不具备整体写入权，未发送请求", exc) from exc
-        state = {"operation": operation, "unknown": False, "sent": False, "dispatches": 0, "rejections": 0, "lock": threading.Lock()}
+        state = {"operation": operation, "transfer": transfer, "connections": dict(margin_transfer or {}),
+            "unknown": False, "sent": False, "dispatches": 0, "rejections": 0, "lock": threading.Lock()}
         token = self.active_batch.set(state)
         try:
             yield
@@ -346,7 +408,12 @@ class ManagedWriter:
             raise _not_sent("账户真实身份或写入权未通过验证，未发送请求", exc) from exc
         batch = self.active_batch.get()
         if batch is not None:
-            return {"batch": batch, "ticket": batch["operation"]}
+            if batch["transfer"] is not None:
+                expected = batch["transfer"]
+                if (method != expected["method"] or path != expected["path"] or params != expected["params"]
+                        or connection != batch["connections"]["master"] or batch["dispatches"]):
+                    raise RequestNotSent("实际请求与保证金划转凭据不一致，未发送请求")
+            return {"batch": batch, "ticket": batch["operation"], "api": api}
         operation = self.operation_id(connection, method, path, params)
         try:
             prepared = self.registry.prepare(ticket, operation, {"method": method, "path": path, "params": params})
@@ -392,7 +459,7 @@ class ManagedWriter:
                 if "newClientOrderId" in order and not ManagedWriter._verified_receipt(order, row):
                     raise AmbiguousOrder("交易所回执与原始订单方向或数量不一致")
 
-    def before_send(self, prepared):
+    def before_send(self, prepared, request=None):
         if prepared is not None:
             from .exchange import RequestNotSent
             try:
@@ -400,7 +467,45 @@ class ManagedWriter:
             except Exception as exc:
                 raise _not_sent("发送前账户所有权已改变，未发送请求", exc) from exc
             if "batch" in prepared:
+                batch = prepared["batch"]
+                if batch["transfer"] is not None:
+                    api, expected = prepared["api"], batch["transfer"]
+                    try:
+                        self.refresh_bindings()
+                        for role, connection in batch["connections"].items():
+                            row = self.connections.get(connection, {})
+                            revision = digest([os.environ.get(row.get("prefix", "") + suffix, "")
+                                for suffix in ("_USER", "_SIGNER", "_PRIVATE_KEY")])
+                            if row.get("identity") != expected[role] or revision != row.get("revision"):
+                                raise TradingError("划转账户已变化")
+                        row = self.connections[batch["connections"]["master"]]
+                        if (api.writer_connection != batch["connections"]["master"]
+                                or digest([api.credentials.get(key) for key in ("user", "signer", "private_key")]) != row["revision"]):
+                            raise TradingError("主账户凭据已变化")
+                        pairs = parse_qsl(request.content.decode("utf-8"), keep_blank_values=True, strict_parsing=True)
+                        actual = dict(pairs)
+                        if (request.method != expected["method"] or request.url.path != expected["path"]
+                                or request.url.scheme != "https" or request.url.host != "fapi.asterdex.com"
+                                or request.url.port not in (None, 443) or request.url.query or len(pairs) != len(actual)
+                                or set(actual) != set(expected["params"]) | {"nonce", "signer", "signature"}
+                                or any(actual[key] != str(value) for key, value in expected["params"].items())
+                                or actual["signer"].lower() != api.credentials["signer"].lower()
+                                or not actual["nonce"].isdigit() or not re.fullmatch(r"0x[0-9a-fA-F]{130}", actual["signature"])):
+                            raise TradingError("最终划转请求已改变")
+                        from eth_account import Account as EthAccount
+                        from eth_account.messages import encode_typed_data
+                        message = encode_typed_data(domain_data={"name": "AsterSignTransaction", "version": "1",
+                            "chainId": 1666, "verifyingContract": "0x" + "00" * 20},
+                            message_types={"Message": [{"name": "msg", "type": "string"}]},
+                            message_data={"msg": urlencode([(key, value) for key, value in pairs if key != "signature"])})
+                        if EthAccount.recover_message(message, signature=actual["signature"]).lower() != api.credentials["signer"].lower():
+                            raise TradingError("最终划转签名已改变")
+                        self.registry.assert_owned(prepared["ticket"])
+                    except Exception as exc:
+                        raise _not_sent("最终请求与已核实保证金划转不一致，未发送请求", exc) from exc
                 with prepared["batch"]["lock"]:
+                    if prepared["batch"]["transfer"] is not None and prepared["batch"]["dispatches"]:
+                        raise RequestNotSent("本保证金划转已进入发送，未重复发送请求")
                     prepared["batch"]["sent"] = True
                     prepared["batch"]["dispatches"] += 1
                     prepared["dispatched"] = True

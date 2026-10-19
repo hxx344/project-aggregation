@@ -710,6 +710,22 @@ class PairManager:
         return pair if pair and pair_active(pair, self.store.get("pair_runtime:" + pair["id"])) else None
 
     @protected_pair_id
+    def tick_margin(self, pair_id):
+        """Cold-start funds jobs do not enter ADL, positions or market paths."""
+        pair = self.store.pair(pair_id)
+        if not pair or self.engine.shutdown.is_set():
+            return 5
+        with self.locked(pair), self.store.connection_scope():
+            pair = self.store.pair(pair_id)
+            if not pair:
+                return 5
+            if self.trader is None:
+                from .pair_execution import PairTrader
+                self.trader = PairTrader(self.engine)
+            result = self.trader.margin_tick(pair)
+            return self._funds_poll_delay(pair, max(1, result.get("retry_after", 5)))
+
+    @protected_pair_id
     def tick(self, pair_id):
         pair = self.store.pair(pair_id)
         if not pair or self.engine.shutdown.is_set():
@@ -719,31 +735,23 @@ class PairManager:
             if not pair:
                 return 5
             try:
-                accounts = self._members(pair)
+                accounts = [self.store.account(pair[side + "_account_id"]) for side in ("long", "short")]
+                if any(account is None for account in accounts):
+                    raise TradingError("配对组成员账户不存在")
                 if any(not self.engine.live_allowed(account) for account in accounts):
                     raise TradingError("服务器未开放实盘执行，配对组仅保留现有记录")
-                adl_state = self.engine.adl.tick(pair)
-                if adl_state is not None:
-                    return max(1, adl_state.get("retry_after", 0))
                 if self.trader is None:
                     from .pair_execution import PairTrader
                     self.trader = PairTrader(self.engine)
-                state = self.trader.tick(pair)
+                margin_result = self.trader.margin_tick(pair)
+                self._members(pair)
+                adl_state = self.engine.adl.tick(pair)
+                if adl_state is not None:
+                    return self._funds_poll_delay(pair, max(1, adl_state.get("retry_after", 0)))
+                state = self.trader.tick(pair, margin_result=margin_result)
                 delay = self.poll_interval(pair, state)
                 delay = max(delay, state.get("retry_after", 0))
-                margin = self.store.get("pair_margin:" + pair["id"]) or {}
-                if isinstance(margin, dict) and (margin.get("pending") or pair["enabled"] and pair["margin"]["enabled"]):
-                    deadlines = [margin.get("next_check_at", 0)]
-                    if not margin.get("pending"):
-                        deadlines.append(margin.get("cooldown_until", 0))
-                    deadline = max((value for value in deadlines
-                                    if type(value) in (int, float) and math.isfinite(value)), default=0)
-                    remaining = deadline - time.time()
-                    # An overdue check blocked by unknown orders still gets a
-                    # visible check at its own cadence, not a hot polling loop.
-                    delay = min(delay, max(1, remaining if remaining > 0
-                                           else pair["margin"]["check_interval_seconds"]))
-                return delay
+                return self._funds_poll_delay(pair, delay)
             except (TradingError, KeyError, ValueError, TypeError) as exc:
                 runtime = self.store.get("pair_runtime:" + pair_id) or {}
                 runtime.update(phase="attention" if isinstance(exc, AccountModeError) else "waiting",
@@ -752,7 +760,20 @@ class PairManager:
                 if isinstance(exc, AccountModeError) and pair["enabled"]:
                     self.store.save_pair({**pair, "enabled": False, "pause_reason": str(exc)})
                     self._changed(pair)
-                return max(1, getattr(exc, "retry_after", 0))
+                return self._funds_poll_delay(pair, max(1, getattr(exc, "retry_after", 0)))
+
+    def _funds_poll_delay(self, pair, delay):
+        """An ADL/strategy wait cannot move the independent funds deadline."""
+        margin = self.store.get("pair_margin:" + pair["id"]) or {}
+        if isinstance(margin, dict) and (margin.get("pending") or pair["enabled"] and pair["margin"]["enabled"]):
+            deadlines = [margin.get("next_check_at", 0)]
+            if not margin.get("pending"):
+                deadlines.append(margin.get("cooldown_until", 0))
+            deadline = max((value for value in deadlines
+                if type(value) in (int, float) and math.isfinite(value)), default=0)
+            remaining = deadline - time.time()
+            return min(delay, max(1, remaining if remaining > 0 else pair["margin"]["check_interval_seconds"]))
+        return delay
 
     def poll_interval(self, pair, state):
         margin = self.store.get("pair_margin:" + pair["id"]) or {}

@@ -74,14 +74,15 @@ class AdlIntegrationTests(unittest.TestCase):
         self.engine.adl.tick.assert_called_once()
         self.engine.pairs.trader.tick.assert_not_called()
 
-    def test_ordinary_recovery_balance_and_submit_guard_stop_on_adl(self):
+    def test_adl_stops_strategy_and_recovery_while_funds_remain_independent(self):
         trader = PairTrader(self.engine)
         self.engine.adl.require_clear.side_effect = TradingError("ADL 等待核对")
-        for action in (lambda: trader.tick(self.pair),
-                       lambda: trader._recover(self.pair, {"pending": {"id": "old"}}, {}),
-                       lambda: trader._balance(self.pair, {}, {}, {})):
-            with self.assertRaisesRegex(TradingError, "ADL"):
-                action()
+        self.assertIn("ADL", trader.tick(self.pair)["reason"])
+        with self.assertRaisesRegex(TradingError, "ADL"):
+            trader._recover(self.pair, {"pending": {"id": "old"}}, {})
+        with patch("trading.margin_balance.MarginBalancer.tick", return_value={"blocks_trading": False}) as balance:
+            trader._balance(self.pair, {}, {}, {})
+        balance.assert_called_once()
         with self.assertRaisesRegex(RequestNotSent, "ADL"):
             trader._config_guard(self.pair, {}, opening=False)
 
@@ -114,8 +115,9 @@ class AdlIntegrationTests(unittest.TestCase):
             raise TradingError("持仓被ADL事件更新")
 
         with patch.object(trader, "_read", side_effect=fail_read), \
-                patch.object(trader, "_balance", side_effect=AssertionError("ordinary finally balanced")):
+                patch.object(trader, "_balance", wraps=trader._balance) as balance:
             trader.tick(pair)
+        balance.assert_called_once()
 
     def test_management_and_recovery_cannot_clear_adl_hold(self):
         self.engine.adl.require_clear.side_effect = TradingError("ADL 保持暂停")

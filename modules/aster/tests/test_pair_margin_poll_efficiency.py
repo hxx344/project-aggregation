@@ -38,6 +38,10 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.engine.capacities = lambda symbol: {5: dec(0), 10: dec(0), 20: dec(0)}
         self.children = {side: broker.api.credentials for side, broker in self.brokers.items()}
         self.master = {"user": "0x" + "f" * 40}
+        credentials = patch("trading.margin_balance.credentials_for", side_effect=lambda prefix:
+            self.master if prefix == "ASTER_MASTER" else self.children[prefix.removeprefix("ASTER_").lower()])
+        credentials.start()
+        self.addCleanup(credentials.stop)
         self.income_rows = {side: [] for side in self.brokers}
 
         @contextmanager

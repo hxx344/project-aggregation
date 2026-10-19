@@ -70,7 +70,7 @@ class PairMarginLifelineTests(TestCase):
                 self.assertEqual(state["phase"], "attention", state)
                 self.assert_no_orders()
 
-    def test_hot_failure_uses_one_margin_fallback_and_keeps_trade_retry(self):
+    def test_funds_run_before_hot_failure_and_keep_their_own_deadline(self):
         self.wallet("long", 26000)
         self.wallet("short", 24000)
         original = self.trader._read
@@ -82,10 +82,10 @@ class PairMarginLifelineTests(TestCase):
             return original(brokers, symbol, **options)
 
         with patch.object(self.trader, "_read", side_effect=read) as reads:
-            self.assertEqual(self.engine.pairs.tick("gold"), 5)
+            self.assertEqual(self.engine.pairs.tick("gold"), 1)
             state = self.store.get("pair_runtime:gold")
             self.assert_transferred(state)
-            self.assertEqual(reads.call_count, 2)
+            self.assertEqual(reads.call_count, 1)
             self.wall += 1
             self.engine.pairs.tick("gold")
             self.assertEqual(reads.call_count, 2)
@@ -127,7 +127,7 @@ class PairMarginLifelineTests(TestCase):
         self.wall += 1
         state = self.tick()
         self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
-        self.assertGreater(state["retry_after"], 1)
+        self.assertGreater(state["margin"]["retry_after"], 1)
         self.assertEqual(state["margin"]["api_notice"]["kind"], "budget")
 
     def test_pair_revision_revokes_previous_trade_retry(self):
@@ -218,7 +218,7 @@ class PairMarginLifelineTests(TestCase):
             self.assertGreater(dec(self.brokers["short"].state["wallet"]), 24000)
             self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["status"], "paper_confirmed")
 
-    def test_paused_pair_and_changed_identity_never_transfer(self):
+    def test_paused_pair_blocks_funds_and_stale_strategy_identity_blocks_only_orders(self):
         self.wallet("long", 26000)
         self.wallet("short", 24000)
         self.pair = self.store.save_pair({**self.pair, "enabled": False})
@@ -230,7 +230,8 @@ class PairMarginLifelineTests(TestCase):
         self.store.put("pair_runtime:gold", state)
         state = self.tick()
         self.assertEqual(state["phase"], "attention")
-        self.assertEqual(self.brokers["long"].state["wallet"], "26000")
+        self.assertEqual(dec(self.brokers["long"].state["wallet"]), 25000)
+        self.assertEqual(state["margin"]["status"], "paper_confirmed")
         self.assert_no_orders()
 
     def test_margin_does_not_consult_or_adopt_archived_strategy_orders(self):

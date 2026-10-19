@@ -132,11 +132,112 @@ def _payload_hash(keys, payload):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _intent_metadata(keys, payload):
+def _exact_keys(value, keys):
+    return isinstance(value, dict) and set(value) == set(keys)
+
+
+def _positive_decimal(value):
+    return isinstance(value, str) and len(value) <= 128 and re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value) is not None and re.search(r"[1-9]", value) is not None
+
+
+def _margin_metadata(module_id, keys, payload):
+    transfer = payload["marginTransfer"]
+    if module_id != "aster" or not _exact_keys(payload, ("marginTransfer",)) or not _exact_keys(transfer, ("version", "method", "path", "params", "source", "destination", "master")) or type(transfer["version"]) not in (int, float) or transfer["version"] != 1 or transfer["method"] != "POST" or transfer["path"] != "/fapi/v3/subAccountTransfer":
+        _fail("INVALID_MARGIN_TRANSFER")
+    params = transfer["params"]
+    if not _exact_keys(params, ("fromAccountAddress", "toAccountAddress", "asset", "amount", "kindType")) or params["asset"] != "USD1" or params["kindType"] != "FUTURE_FUTURE" or not _positive_decimal(params["amount"]) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,9})(?:\.[0-9]{1,8})?", params["amount"]):
+        _fail("INVALID_MARGIN_TRANSFER")
+    whole, _, fraction = params["amount"].partition(".")
+    if int(whole) * 100_000_000 + int(fraction.ljust(8, "0")) > 100_000_000_000_000_000:
+        _fail("INVALID_MARGIN_TRANSFER")
+    identities = [transfer[role] for role in ("source", "destination", "master")]
+    for identity in identities:
+        if not _exact_keys(identity, ("authority", "environment", "accountId")) or identity["authority"] != "aster" or identity["environment"] != "mainnet" or not isinstance(identity["accountId"], str) or not re.fullmatch(r"0x[0-9a-f]{40}", identity["accountId"]):
+            _fail("INVALID_MARGIN_TRANSFER")
+    transfer_keys = sorted(account_key(identity) for identity in identities)
+    if len(set(transfer_keys)) != 3 or keys != transfer_keys or params["fromAccountAddress"] != identities[0]["accountId"] or params["toAccountAddress"] != identities[1]["accountId"]:
+        _fail("INVALID_MARGIN_TRANSFER")
+    return {"action": "margin-transfer", "targetHash": _payload_hash(keys, payload)}
+
+
+def _original_order(value):
+    required = {"symbol", "side", "type", "positionSide", "quantity", "newClientOrderId"}
+    allowed = required | {"newOrderRespType", "timeInForce", "price", "reduceOnly"}
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - allowed:
+        return False
+    return (isinstance(value["symbol"], str) and re.fullmatch(r"[A-Z0-9_]{1,64}", value["symbol"]) is not None
+            and value["side"] in ("BUY", "SELL") and value["positionSide"] in ("LONG", "SHORT", "BOTH") and value["type"] in ("MARKET", "LIMIT") and _positive_decimal(value["quantity"])
+            and isinstance(value["newClientOrderId"], str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,36}", value["newClientOrderId"]) is not None
+            and ("newOrderRespType" not in value or value["newOrderRespType"] in ("ACK", "RESULT"))
+            and ("timeInForce" not in value or value["timeInForce"] in ("GTC", "IOC", "FOK", "GTX"))
+            and ("price" not in value or _positive_decimal(value["price"])) and (value["type"] != "LIMIT" or ("price" in value and "timeInForce" in value))
+            and ("reduceOnly" not in value or type(value["reduceOnly"]) is bool or value["reduceOnly"] in ("true", "false")))
+
+
+def _valid_symbol(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Z0-9_]{1,64}", value) is not None
+
+
+def _valid_leverage(value):
+    if isinstance(value, str):
+        return re.fullmatch(r"(?:[1-9]|[1-9][0-9]|1[01][0-9]|12[0-5])", value) is not None
+    return type(value) in (int, float) and math.isfinite(value) and value == int(value) and 1 <= value <= 125
+
+
+def _legacy_id(value):
+    return isinstance(value, str) and 0 < len(value) <= 256 and re.search(r"[\x00-\x1f\x7f]", value) is None
+
+
+def _matching_orders(orders, symbol=None):
+    return isinstance(orders, list) and 0 < len(orders) <= 100 and all(_original_order(order) and (symbol is None or order["symbol"] == symbol) for order in orders) and len({order["newClientOrderId"] for order in orders}) == len(orders)
+
+
+def _nonfunding_action(payload):
+    if _exact_keys(payload, ("order",)) and _original_order(payload["order"]):
+        return "order"
+    if _exact_keys(payload, ("orders",)) and isinstance(payload["orders"], list) and 0 < len(payload["orders"]) <= 100 and all(_original_order(order) for order in payload["orders"]):
+        return "order"
+    if _exact_keys(payload, ("symbol", "target")) and _valid_symbol(payload["symbol"]) and _valid_leverage(payload["target"]):
+        return "leverage"
+    if _exact_keys(payload, ("id", "kind", "symbol", "orders", "target")) and _legacy_id(payload["id"]) and _valid_symbol(payload["symbol"]):
+        if payload["kind"] in ("pair", "cycle") and payload["target"] is None and _matching_orders(payload["orders"], payload["symbol"]):
+            return "order"
+        if payload["kind"] == "migration" and payload["target"] is None and _matching_orders(payload["orders"]):
+            return "order"
+        if payload["kind"] in ("leverage", "cycle_leverage") and payload["orders"] is None and _valid_leverage(payload["target"]):
+            return "leverage"
+    if _exact_keys(payload, ("id", "request_id", "kind", "symbol", "target_leverage", "amount", "source", "destination", "orders")) and _legacy_id(payload["id"]) and (payload["request_id"] is None or _legacy_id(payload["request_id"])) and _valid_symbol(payload["symbol"]) and payload["amount"] is None and payload["source"] is None and payload["destination"] is None:
+        if payload["kind"] in ("ordinary", "cycle") and payload["target_leverage"] is None and _matching_orders(payload["orders"], payload["symbol"]):
+            return "order"
+        if payload["kind"] == "leverage" and isinstance(payload["orders"], list) and not payload["orders"] and _valid_leverage(payload["target_leverage"]):
+            return "leverage"
+    if not _exact_keys(payload, ("method", "path", "params")):
+        return None
+    method, endpoint, params = payload["method"], payload["path"], payload["params"]
+    if method == "POST" and endpoint == "/fapi/v3/order" and _original_order(params):
+        return "order"
+    if method == "POST" and endpoint == "/fapi/v3/batchOrders" and _exact_keys(params, ("batchOrders",)):
+        try:
+            orders = json.loads(params["batchOrders"]) if isinstance(params["batchOrders"], str) else params["batchOrders"]
+        except (TypeError, ValueError):
+            return None
+        if isinstance(orders, list) and 0 < len(orders) <= 100 and all(_original_order(order) for order in orders):
+            return "order"
+    if method == "POST" and endpoint == "/fapi/v3/leverage" and _exact_keys(params, ("symbol", "leverage")) and isinstance(params["symbol"], str) and re.fullmatch(r"[A-Z0-9_]{1,64}", params["symbol"]) and type(params["leverage"]) in (str, int, float):
+        leverage = params["leverage"]
+        if isinstance(leverage, str) and re.fullmatch(r"(?:[1-9]|[1-9][0-9]|1[01][0-9]|12[0-5])", leverage) or type(leverage) in (int, float) and math.isfinite(leverage) and leverage == int(leverage) and 1 <= leverage <= 125:
+            return "leverage"
+    return None
+
+
+def _intent_metadata(module_id, keys, payload):
+    if isinstance(payload, dict) and "marginTransfer" in payload:
+        return _margin_metadata(module_id, keys, payload)
     action = payload.get("intentAction") if isinstance(payload, dict) else None
     target = payload.get("intentTarget") if isinstance(payload, dict) else None
     if action is None and target is None:
-        return {"action": None, "targetHash": None}
+        inferred = _nonfunding_action(payload)
+        return {"action": inferred, "targetHash": _payload_hash(keys, payload) if inferred else None}
     if action not in ("amend", "cancel") or not isinstance(target, dict) or set(target) - {"accountKey", "symbol", "clientOrderId", "remoteId"} or not (target.get("clientOrderId") or target.get("remoteId")):
         _fail("INVALID_INTENT_TARGET")
     target_key = target.get("accountKey", keys[0] if len(keys) == 1 else None)
@@ -147,6 +248,8 @@ def _intent_metadata(keys, payload):
         if key in target:
             _identifier(target[key], "INVALID_INTENT_TARGET")
     semantic_target = {key: value for key, value in target.items() if key != "accountKey"}
+    if module_id == "aster" and (set(payload) - {"intentAction", "intentTarget", "price", "quantity", "groupId"} or any(key in payload and not _positive_decimal(payload[key]) for key in ("price", "quantity"))):
+        _fail("INVALID_INTENT_TARGET")
     return {"action": action, "targetHash": _payload_hash([target_key], semantic_target)}
 
 
@@ -739,9 +842,49 @@ class AccountWriter:
         if operation["state"] != "sending":
             _fail("ALREADY_SUBMITTED" if operation["state"] == "confirmed" else "ALREADY_REJECTED" if operation["state"] == "rejected" else "OPERATION_UNRESOLVED")
         for claim in ticket["claims"]:
-            unknowns = self._db.execute("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.operation_id<>? AND o.state='unknown'", (claim["accountKey"], ticket["operationId"])).fetchall()
-            if any(not _reduces_amend_risk(operation, pending) for pending in unknowns):
+            pending = self._db.execute("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.operation_id<>? AND o.state IN ('sending','unknown')", (claim["accountKey"], ticket["operationId"])).fetchall()
+            if any((not _reduces_amend_risk(operation, row) and not self._margin_compatible(operation, row)) if row["state"] == "unknown" else (operation["intent_action"] == "margin-transfer" and not self._margin_compatible(operation, row)) for row in pending):
                 _fail("ACCOUNT_UNRESOLVED")
+
+    def _margin_compatible(self, operation, pending):
+        if operation["module_id"] != "aster" or operation["intent_action"] != "margin-transfer" or not operation["intent_target_hash"] or pending["module_id"] != "aster" or pending["intent_action"] not in ("order", "leverage", "amend", "cancel") or not pending["intent_target_hash"]:
+            return False
+        if pending["state"] == "unknown":
+            return True
+        if pending["state"] != "sending":
+            return False
+        # A fenced ticket may have passed its final guard already; its sender must also be dead.
+        try:
+            ticket = json.loads(pending["ticket_json"])
+            keys = json.loads(pending["account_keys"])
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(ticket, dict) or ticket.get("ownerId") != pending["owner_id"] or ticket.get("moduleId") != pending["module_id"] or not isinstance(ticket.get("claims"), list) or not ticket["claims"] or not isinstance(keys, list) or len(keys) != len(ticket["claims"]) or any(not isinstance(key, str) for key in keys) or len(set(keys)) != len(keys) or not isinstance(ticket.get("bindings"), list) or not ticket["bindings"]:
+            return False
+        if any(not isinstance(claim, dict) or not isinstance(claim.get("accountKey"), str) for claim in ticket["claims"]) or len({claim["accountKey"] for claim in ticket["claims"]}) != len(keys):
+            return False
+        for binding in ticket["bindings"]:
+            if not _exact_keys(binding, ("connectionId", "generation", "accountKey")) or not isinstance(binding["connectionId"], str) or not binding["connectionId"] or len(binding["connectionId"]) > 256 or re.search(r"[\x00-\x1f\x7f]", binding["connectionId"]) or binding["accountKey"] not in keys or type(binding["generation"]) is not int or binding["generation"] < 1:
+                return False
+        if len({binding["connectionId"] for binding in ticket["bindings"]}) != len(ticket["bindings"]):
+            return False
+        fenced = True
+        for claim in ticket["claims"]:
+            if not isinstance(claim, dict) or claim.get("accountKey") not in keys or type(claim.get("fence")) is not int or claim["fence"] < 1:
+                return False
+            current = self._db.execute("SELECT owner_id,fence,module_id FROM aw_accounts WHERE account_key=?", (claim["accountKey"],)).fetchone()
+            if current is None or current["module_id"] != "aster" or not any(binding["accountKey"] == claim["accountKey"] for binding in ticket["bindings"]):
+                return False
+            fenced = fenced and (current["owner_id"] != pending["owner_id"] or current["fence"] != claim["fence"])
+        if not fenced:
+            return False
+        owner = self._db.execute("SELECT * FROM aw_owners WHERE owner_id=?", (pending["owner_id"],)).fetchone()
+        if owner is None or owner["module_id"] != "aster" or owner["runtime_id"] != ticket.get("runtimeId") or type(owner["pid"]) is not int or owner["pid"] <= 0 or owner["status"] not in ("active", "closed"):
+            return False
+        try:
+            return self.process_alive(owner["pid"]) is False
+        except Exception:
+            return False
 
     def _heartbeat_start(self):
         if self._thread is not None:
@@ -784,7 +927,7 @@ class AccountWriter:
         keys = sorted(claim.get("accountKey", "") for claim in ticket["claims"])
         body_hash = _payload_hash(keys, payload)
         group_id = _identifier(payload["groupId"], "INVALID_GROUP_ID") if isinstance(payload, dict) and payload.get("groupId") is not None else operation_id
-        intent = _intent_metadata(keys, payload)
+        intent = _intent_metadata(self.module_id, keys, payload)
         current = self._time()
 
         def action():
@@ -794,13 +937,18 @@ class AccountWriter:
                 if old["module_id"] != self.module_id or old["body_hash"] != body_hash or old["account_keys"] != _json(keys):
                     _fail("OPERATION_CONFLICT")
                 if importing:
+                    if old["intent_action"] is None and old["intent_target_hash"] is None:
+                        if intent["action"] is not None:
+                            self._db.execute("UPDATE aw_operations SET intent_action=?,intent_target_hash=? WHERE operation_id=?", (intent["action"], intent["targetHash"], operation_id))
+                    elif old["intent_action"] != intent["action"] or old["intent_target_hash"] != intent["targetHash"]:
+                        _fail("OPERATION_CONFLICT")
                     return self._operation_ticket(ticket, operation_id, body_hash, old["state"])
                 _fail("ALREADY_SUBMITTED" if old["state"] == "confirmed" else "ALREADY_REJECTED" if old["state"] == "rejected" else "OPERATION_UNRESOLVED")
             if not importing:
                 for key in keys:
                     pending = self._db.execute("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.state IN ('sending','unknown')", (key,)).fetchall()
                     proposed = {"module_id": self.module_id, "intent_action": intent["action"], "intent_target_hash": intent["targetHash"]}
-                    if any(not _reduces_amend_risk(proposed, row) and (row["state"] != "sending" or row["module_id"] != self.module_id or row["owner_id"] != self.owner_id or row["group_id"] != group_id or row["account_keys"] != _json(keys) or json.loads(row["ticket_json"]) != ticket) for row in pending):
+                    if any(not _reduces_amend_risk(proposed, row) and not self._margin_compatible(proposed, row) and (intent["action"] == "margin-transfer" or row["state"] != "sending" or row["module_id"] != self.module_id or row["owner_id"] != self.owner_id or row["group_id"] != group_id or row["account_keys"] != _json(keys) or json.loads(row["ticket_json"]) != ticket) for row in pending):
                         _fail("ACCOUNT_UNRESOLVED")
             state = "unknown" if importing else "sending"
             self._db.execute("INSERT INTO aw_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (operation_id, self.module_id, body_hash, _json(keys), self.owner_id, _json(ticket), state, current, current, group_id, intent["action"], intent["targetHash"]))

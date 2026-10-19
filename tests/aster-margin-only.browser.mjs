@@ -80,6 +80,9 @@ async (page) => {
       await (await response).finished();
       await page.waitForTimeout(100);
     };
+    ready = false; await refresh();
+    assert(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled(), 'ordinary trading activation still waits for market readiness');
+    ready = true; await refresh();
     pair.state.pending = { id: 'original-order', kind: 'ordinary', phase: 'open', orders: [], created_at: Date.now() / 1000 - 300 };
     pair.state.progress = { phase: 'closing', baseline: { LONG: '1', SHORT: '1' }, quantities: { LONG: '0.2', SHORT: '0.2' } };
     pair.state.recovery_watch = { batches: [{ id: 'history-observation' }] };
@@ -118,13 +121,19 @@ async (page) => {
     assert(!pair.enabled && !pair.ordinary.enabled && !pair.cycle.enabled && pair.margin.enabled, 'switch changes only strategy mode and keeps paused');
     assert(await save.isDisabled(), 'pending evidence still locks the complete settings after switching');
     assert(!(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled()), 'manual margin-only start is available after clearing the draft');
+    ready = false; await refresh();
+    assert(!(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled()), 'funds-only activation does not require public market readiness');
+    failReads = true; await refresh();
+    assert(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled(), 'funds-only activation still requires a connected service');
+    failReads = false; await refresh();
+    assert(!(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled()), 'fresh service evidence restores funds-only activation while public markets remain unready');
     assert(JSON.stringify({ pending: pair.state.pending, progress: pair.state.progress, history: pair.state.recovery_watch }) === originalRecords, 'original recovery evidence remains visible');
     assert(await button.count() === 0, 'already margin-only mode has no redundant switch');
     assert(writes.length === 2, 'only explicit rejected and successful switch requests were sent');
     assert(unexpectedWrites.length === 0, `no auto-start, order, transfer or full configuration writes: ${unexpectedWrites.join('; ')}`);
     assert(errors.length === 0, `browser errors: ${errors.join('; ')}`);
     assert(external.length === 0, `external requests: ${external.join('; ')}`);
-    observations.push('busy duplicate guard, rejected draft preservation, successful draft reset, pause retained, no auto-start, original recovery records retained');
+    observations.push('busy duplicate guard, rejected draft preservation, successful draft reset, pause retained, no auto-start, original recovery records retained, funds-only start independent of public market readiness with offline guard retained');
     return { passed: true, entry: page.url(), moduleOrigin, switchRequests: writes.length, unexpectedWrites: 0, browserErrors: 0, observations };
   } catch (error) {
     releaseReply?.();

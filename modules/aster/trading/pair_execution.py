@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from .account_writer import protected_pair, writer_for
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -38,6 +39,7 @@ class PairTrader:
     def __init__(self, engine):
         self.engine, self.store, self.market = engine, engine.store, engine.market
         self._ordinary_observations = {}
+        self._margin_identity = ContextVar("aster_margin_identity", default=None)
 
     def _ordinary_wait(self, pair, state, identities, margin_state):
         """Reuse recent reads only to reject work, never to authorize a write."""
@@ -133,7 +135,9 @@ class PairTrader:
         def read(key):
             broker = brokers[key]
             # Budget priority is thread-local: establish it inside each worker.
-            budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
+            budget = (getattr(getattr(broker, "api", None), "budget", None))
+            budget = (getattr(budget, "margin", nullcontext)() if margin else
+                getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext())
             with budget:
                 if hot and isinstance(broker, LiveBroker):
                     lease = broker.cycle_hot_snapshot([symbol])
@@ -154,7 +158,6 @@ class PairTrader:
         return {key: row[0] for key, row in rows.items()}, {key: row[1] for key, row in rows.items()}
 
     def _balance(self, pair, state, brokers, identities, snapshots=None, guards=None, *, pending_orders=False):
-        self.engine.adl.require_clear(pair["id"])
         symbol = pair["symbol"]
         from .margin_balance import MarginBalancer
 
@@ -172,9 +175,7 @@ class PairTrader:
             self._publish_balances(state, current)
 
             def check(side):
-                self._config_guard(pair, identities, opening=False)
-                if not self.store.pair(pair["id"])["enabled"]:
-                    raise RequestNotSent("配对组已暂停，禁止新划转")
+                self._margin_guard(pair, identities)
                 checks[side]()
 
             return current, {side: lambda side=side: check(side) for side in checks}
@@ -185,6 +186,45 @@ class PairTrader:
         if balancer.refreshed_snapshots is not None:
             self._publish_balances(state, balancer.refreshed_snapshots)
         state["margin"] = result
+        return result
+
+    def _margin_guard(self, pair, identities):
+        current = self.store.pair(pair["id"])
+        if (not current or current.get("revision") != pair.get("revision") or not current["enabled"]
+                or not current["margin"]["enabled"] or self.engine.workspace.active or self.engine.shutdown.is_set()):
+            raise RequestNotSent("保证金配置已变化、配对组暂停或工作台正在停止，未发送请求")
+        accounts, brokers, actual = self._members(current)
+        if actual != identities:
+            raise RequestNotSent("保证金成员真实身份已变化，未发送请求")
+        self._margin_credentials(accounts, brokers)
+
+    @staticmethod
+    def _margin_credentials(accounts, brokers):
+        from .margin_balance import credentials_for
+        for side, broker in brokers.items():
+            if isinstance(broker, LiveBroker):
+                configured = credentials_for(accounts[side]["env_prefix"])
+                if any(broker.api.credentials.get(field) != configured.get(field) for field in ("user", "signer", "private_key")):
+                    raise PairPositionError("保证金成员实际凭据与当前配置不一致，未发送请求")
+
+    def margin_tick(self, pair):
+        """Run before ADL/strategy recovery without reading their runtime state."""
+        self._margin_identity.set(None)
+        state = self.store.get("pair_runtime:" + pair["id"]) or {}
+        state = dict(state) if isinstance(state, dict) else {}
+        margin = self.store.get("pair_margin:" + pair["id"], {})
+        from .margin_balance import MarginBalancer
+        if (not pair["margin"]["enabled"] and isinstance(margin, dict)
+                and margin.get("pending") is None and not MarginBalancer.unsettled_rejection(margin)):
+            return MarginBalancer.status_view(pair, margin, state.get("margin"))
+        _, brokers, identities = self._members(pair)
+        self._margin_identity.set((pair["id"], pair.get("revision"), deepcopy(identities)))
+        result = self._balance(pair, state, brokers, identities, pending_orders=bool(state.get("pending")))
+        if (isinstance(margin, dict) and margin.get("pending") is not None
+                or result.get("status") in {"acknowledged", "confirmed", "skipped", "paper_confirmed"}):
+            self._ordinary_observations.pop(pair["id"], None)
+        state["updated_at"] = time.time()
+        self.store.put("pair_runtime:" + pair["id"], self._durable(state))
         return result
 
     def _risk_snapshots(self, pair, snapshots, *, recovery=False):
@@ -252,13 +292,14 @@ class PairTrader:
             require_archived_orders_clear(self.engine, current)
 
     @protected_pair
-    def tick(self, pair):
-        self.engine.adl.require_clear(pair["id"])
+    def tick(self, pair, *, margin_result=None):
+        if margin_result is None:
+            margin_result = self.margin_tick(pair)
         symbol = pair["symbol"]
         state = {**runtime_default(), **(self.store.get("pair_runtime:" + pair["id"]) or {})}
         pending_at_entry = state.get("pending")
         margin_waiting = False
-        margin_checked = margin_eligible = trade_work = False
+        margin_checked, margin_eligible, trade_work = True, False, False
         margin_delay = 0
         snapshots = guards = None
         state.pop("retry_after", None)
@@ -266,7 +307,13 @@ class PairTrader:
         state["api_notice"] = None
         save_state = True
         try:
+            state["margin"] = margin_result
+            self.engine.adl.require_clear(pair["id"])
             accounts, brokers, identities = self._members(pair)
+            margin_identity = self._margin_identity.get()
+            if (margin_identity is not None and margin_identity[:2] == (pair["id"], pair.get("revision"))
+                    and margin_identity[2] != identities):
+                raise PairPositionError("保证金检查期间配对组账户身份发生变化，禁止后续交易")
             if state.get("identities") and state["identities"] != identities:
                 raise PairPositionError("配对组凭据指向的真实账户发生变化，等待人工核对")
             state["identities"] = identities
@@ -298,7 +345,7 @@ class PairTrader:
                 # market-data prerequisite. Actual pending batches and cycle
                 # holdings retain the existing recovery/reduction path below.
                 margin_checked = True
-                margin = self._balance(pair, state, brokers, identities)
+                margin = margin_result
                 if self.engine.workspace.active:
                     state.update(phase="maintenance", reason="工作台维护中，保留策略配置并暂停新交易")
                 elif not pair["enabled"]:
@@ -320,7 +367,7 @@ class PairTrader:
                 # orders or a due reduction using fresh reconciliation reads.
                 self._ordinary_observations.pop(pair["id"], None)
                 margin_checked = True
-                margin = self._balance(pair, state, brokers, identities, pending_orders=bool(pending))
+                margin = margin_result
                 state.update(phase="margin_wait", reason=margin.get("reason", "划转核对中"))
                 if margin.get("blocks_trading") and not closing_due and not pending:
                     margin_delay = max(0, margin.get("retry_after", 0))
@@ -333,6 +380,10 @@ class PairTrader:
             if pending:
                 trade_work = True
                 self._recover(pair, state, brokers)
+                return state
+            if margin_result.get("blocks_trading") and not closing_due:
+                state.update(phase="margin_wait", reason=margin_result.get("reason", "保证金划转等待核对"))
+                margin_delay = max(0, margin_result.get("retry_after", 0))
                 return state
             if self.engine.workspace.active:
                 state.update(phase="maintenance", reason="工作台维护中，保留策略配置并暂停新交易")

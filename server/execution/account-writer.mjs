@@ -88,15 +88,79 @@ function payloadHash(keys, payload) {
   if (Buffer.byteLength(json) > 262_144) fail('INVALID_PAYLOAD');
   return digest(json);
 }
-function intentMetadata(keys, payload) {
+const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+const positiveDecimal = (value) => typeof value === 'string' && /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value) && value.length <= 128 && /[1-9]/.test(value);
+function marginMetadata(moduleId, keys, payload) {
+  const transfer = payload.marginTransfer;
+  const invalid = () => fail('INVALID_MARGIN_TRANSFER');
+  if (moduleId !== 'aster' || !exactKeys(payload, ['marginTransfer']) || !exactKeys(transfer, ['version', 'method', 'path', 'params', 'source', 'destination', 'master']) || transfer.version !== 1 || transfer.method !== 'POST' || transfer.path !== '/fapi/v3/subAccountTransfer') invalid();
+  const params = transfer.params;
+  if (!exactKeys(params, ['fromAccountAddress', 'toAccountAddress', 'asset', 'amount', 'kindType']) || params.asset !== 'USD1' || params.kindType !== 'FUTURE_FUTURE' || !positiveDecimal(params.amount) || !/^(?:0|[1-9][0-9]{0,9})(?:\.[0-9]{1,8})?$/.test(params.amount)) invalid();
+  const [whole, fraction = ''] = params.amount.split('.');
+  if (BigInt(whole) * 100_000_000n + BigInt(fraction.padEnd(8, '0')) > 100_000_000_000_000_000n) invalid();
+  const identities = ['source', 'destination', 'master'].map((role) => {
+    const identity = transfer[role];
+    if (!exactKeys(identity, ['authority', 'environment', 'accountId']) || identity.authority !== 'aster' || identity.environment !== 'mainnet' || typeof identity.accountId !== 'string' || !/^0x[0-9a-f]{40}$/.test(identity.accountId)) invalid();
+    return identity;
+  });
+  const transferKeys = identities.map(accountKey).sort();
+  if (new Set(transferKeys).size !== 3 || JSON.stringify(keys) !== JSON.stringify(transferKeys) || params.fromAccountAddress !== identities[0].accountId || params.toAccountAddress !== identities[1].accountId) invalid();
+  return { action: 'margin-transfer', targetHash: payloadHash(keys, payload) };
+}
+function originalOrder(value) {
+  const required = ['symbol', 'side', 'type', 'positionSide', 'quantity', 'newClientOrderId'];
+  const allowed = [...required, 'newOrderRespType', 'timeInForce', 'price', 'reduceOnly'];
+  if (!value || typeof value !== 'object' || Array.isArray(value) || required.some((key) => !Object.hasOwn(value, key)) || Object.keys(value).some((key) => !allowed.includes(key))) return false;
+  return typeof value.symbol === 'string' && /^[A-Z0-9_]{1,64}$/.test(value.symbol) && ['BUY', 'SELL'].includes(value.side) && ['LONG', 'SHORT', 'BOTH'].includes(value.positionSide) && ['MARKET', 'LIMIT'].includes(value.type) && positiveDecimal(value.quantity)
+    && typeof value.newClientOrderId === 'string' && /^[A-Za-z0-9_.:/-]{1,36}$/.test(value.newClientOrderId)
+    && (value.newOrderRespType === undefined || ['ACK', 'RESULT'].includes(value.newOrderRespType))
+    && (value.timeInForce === undefined || ['GTC', 'IOC', 'FOK', 'GTX'].includes(value.timeInForce))
+    && (value.price === undefined || positiveDecimal(value.price)) && (value.type !== 'LIMIT' || (value.price !== undefined && value.timeInForce !== undefined))
+    && (value.reduceOnly === undefined || [true, false, 'true', 'false'].includes(value.reduceOnly));
+}
+const validSymbol = (value) => typeof value === 'string' && /^[A-Z0-9_]{1,64}$/.test(value);
+const validLeverage = (value) => ['string', 'number'].includes(typeof value) && /^(?:[1-9]|[1-9][0-9]|1[01][0-9]|12[0-5])$/.test(String(value));
+const legacyId = (value) => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
+const matchingOrders = (orders, symbol = null) => Array.isArray(orders) && orders.length > 0 && orders.length <= 100 && orders.every((order) => originalOrder(order) && (symbol === null || order.symbol === symbol)) && new Set(orders.map((order) => order.newClientOrderId)).size === orders.length;
+function nonfundingAction(payload) {
+  if (exactKeys(payload, ['order']) && originalOrder(payload.order)) return 'order';
+  if (exactKeys(payload, ['orders']) && Array.isArray(payload.orders) && payload.orders.length > 0 && payload.orders.length <= 100 && payload.orders.every(originalOrder)) return 'order';
+  if (exactKeys(payload, ['symbol', 'target']) && validSymbol(payload.symbol) && validLeverage(payload.target)) return 'leverage';
+  if (exactKeys(payload, ['id', 'kind', 'symbol', 'orders', 'target']) && legacyId(payload.id) && validSymbol(payload.symbol)) {
+    if (['pair', 'cycle'].includes(payload.kind) && payload.target === null && matchingOrders(payload.orders, payload.symbol)) return 'order';
+    if (payload.kind === 'migration' && payload.target === null && matchingOrders(payload.orders)) return 'order';
+    if (['leverage', 'cycle_leverage'].includes(payload.kind) && payload.orders === null && validLeverage(payload.target)) return 'leverage';
+  }
+  if (exactKeys(payload, ['id', 'request_id', 'kind', 'symbol', 'target_leverage', 'amount', 'source', 'destination', 'orders']) && legacyId(payload.id) && (payload.request_id === null || legacyId(payload.request_id)) && validSymbol(payload.symbol) && payload.amount === null && payload.source === null && payload.destination === null) {
+    if (['ordinary', 'cycle'].includes(payload.kind) && payload.target_leverage === null && matchingOrders(payload.orders, payload.symbol)) return 'order';
+    if (payload.kind === 'leverage' && Array.isArray(payload.orders) && payload.orders.length === 0 && validLeverage(payload.target_leverage)) return 'leverage';
+  }
+  if (!exactKeys(payload, ['method', 'path', 'params'])) return null;
+  const { method, path: endpoint, params } = payload;
+  if (method === 'POST' && endpoint === '/fapi/v3/order' && originalOrder(params)) return 'order';
+  if (method === 'POST' && endpoint === '/fapi/v3/batchOrders' && exactKeys(params, ['batchOrders'])) {
+    let orders;
+    try { orders = typeof params.batchOrders === 'string' ? JSON.parse(params.batchOrders) : params.batchOrders; } catch { return null; }
+    if (Array.isArray(orders) && orders.length > 0 && orders.length <= 100 && orders.every(originalOrder)) return 'order';
+  }
+  if (method === 'POST' && endpoint === '/fapi/v3/leverage' && exactKeys(params, ['symbol', 'leverage']) && typeof params.symbol === 'string' && /^[A-Z0-9_]{1,64}$/.test(params.symbol) && /^(?:[1-9]|[1-9][0-9]|1[01][0-9]|12[0-5])$/.test(String(params.leverage)) && ['string', 'number'].includes(typeof params.leverage)) return 'leverage';
+  return null;
+}
+function intentMetadata(moduleId, keys, payload) {
+  if (payload && typeof payload === 'object' && Object.hasOwn(payload, 'marginTransfer')) return marginMetadata(moduleId, keys, payload);
   const action = payload?.intentAction; const target = payload?.intentTarget;
-  if (action == null && target == null) return { action: null, targetHash: null };
+  if (action == null && target == null) {
+    const inferred = nonfundingAction(payload);
+    return { action: inferred, targetHash: inferred ? payloadHash(keys, payload) : null };
+  }
   if (!['amend', 'cancel'].includes(action) || !target || typeof target !== 'object' || Array.isArray(target) || Object.keys(target).some((key) => !['accountKey', 'symbol', 'clientOrderId', 'remoteId'].includes(key)) || (!target.clientOrderId && !target.remoteId)) fail('INVALID_INTENT_TARGET');
   const targetKey = Object.hasOwn(target, 'accountKey') ? target.accountKey : (keys.length === 1 ? keys[0] : null);
   if (!targetKey || !keys.includes(targetKey)) fail('INVALID_INTENT_TARGET');
   identifier(target.symbol, 'INVALID_INTENT_TARGET');
   for (const key of ['clientOrderId', 'remoteId']) if (target[key] !== undefined) identifier(target[key], 'INVALID_INTENT_TARGET');
   const semanticTarget = { ...target }; delete semanticTarget.accountKey;
+  // ASTER compatibility cannot be granted by self-described intent plus arbitrary payload.
+  if (moduleId === 'aster' && (Object.keys(payload).some((key) => !['intentAction', 'intentTarget', 'price', 'quantity', 'groupId'].includes(key)) || ['price', 'quantity'].some((key) => Object.hasOwn(payload, key) && !positiveDecimal(payload[key])))) fail('INVALID_INTENT_TARGET');
   return { action, targetHash: payloadHash([targetKey], semanticTarget) };
 }
 function reducesAmendRisk(operation, pending) {
@@ -464,9 +528,30 @@ export class AccountWriter {
     if (operation.owner_id !== this.ownerId || operation.module_id !== this.moduleId || operation.body_hash !== ticket.bodyHash || JSON.stringify(JSON.parse(operation.ticket_json)) !== JSON.stringify(base)) fail('OPERATION_CONFLICT');
     if (operation.state !== 'sending') fail(operation.state === 'confirmed' ? 'ALREADY_SUBMITTED' : operation.state === 'rejected' ? 'ALREADY_REJECTED' : 'OPERATION_UNRESOLVED');
     for (const claim of ticket.claims) {
-      const unknowns = this.db.prepare("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.operation_id<>? AND o.state='unknown'").all(claim.accountKey, ticket.operationId);
-      if (unknowns.some((pending) => !reducesAmendRisk(operation, pending))) fail('ACCOUNT_UNRESOLVED');
+      const pending = this.db.prepare("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.operation_id<>? AND o.state IN ('sending','unknown')").all(claim.accountKey, ticket.operationId);
+      if (pending.some((row) => row.state === 'unknown' ? !reducesAmendRisk(operation, row) && !this._marginCompatible(operation, row) : operation.intent_action === 'margin-transfer' && !this._marginCompatible(operation, row))) fail('ACCOUNT_UNRESOLVED');
     }
+  }
+  _marginCompatible(operation, pending) {
+    if (operation.module_id !== 'aster' || operation.intent_action !== 'margin-transfer' || !operation.intent_target_hash || pending.module_id !== 'aster' || !['order', 'leverage', 'amend', 'cancel'].includes(pending.intent_action) || !pending.intent_target_hash) return false;
+    if (pending.state === 'unknown') return true;
+    if (pending.state !== 'sending') return false;
+    // A fenced ticket may have passed its final guard already. Its sender must also be dead.
+    let ticket; let keys;
+    try { ticket = JSON.parse(pending.ticket_json); keys = JSON.parse(pending.account_keys); } catch { return false; }
+    if (ticket?.ownerId !== pending.owner_id || ticket.moduleId !== pending.module_id || !Array.isArray(ticket.claims) || !ticket.claims.length || !Array.isArray(keys) || keys.length !== ticket.claims.length || new Set(keys).size !== keys.length || !Array.isArray(ticket.bindings) || !ticket.bindings.length) return false;
+    if (new Set(ticket.claims.map((claim) => claim?.accountKey)).size !== keys.length || ticket.bindings.some((binding) => !exactKeys(binding, ['connectionId', 'generation', 'accountKey']) || typeof binding.connectionId !== 'string' || !binding.connectionId.length || binding.connectionId.length > 256 || /[\x00-\x1f\x7f]/.test(binding.connectionId) || !keys.includes(binding.accountKey) || !Number.isSafeInteger(binding.generation) || binding.generation < 1) || new Set(ticket.bindings.map((binding) => binding.connectionId)).size !== ticket.bindings.length) return false;
+    let fenced = true;
+    for (const claim of ticket.claims) {
+      if (!claim || !keys.includes(claim.accountKey) || !Number.isSafeInteger(claim.fence) || claim.fence < 1) return false;
+      const current = this.db.prepare('SELECT owner_id,fence,module_id FROM aw_accounts WHERE account_key=?').get(claim.accountKey);
+      if (!current || current.module_id !== 'aster' || !ticket.bindings.some((binding) => binding.accountKey === claim.accountKey)) return false;
+      fenced &&= current.owner_id !== pending.owner_id || current.fence !== claim.fence;
+    }
+    if (!fenced) return false;
+    const owner = this.db.prepare('SELECT * FROM aw_owners WHERE owner_id=?').get(pending.owner_id);
+    if (!owner || owner.module_id !== 'aster' || owner.runtime_id !== ticket.runtimeId || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !['active', 'closed'].includes(owner.status)) return false;
+    try { return this.processAlive(owner.pid) === false; } catch { return false; }
   }
   assertOwned(ticket, budgetMs = 35_000) {
     const time = this._time();
@@ -498,19 +583,24 @@ export class AccountWriter {
     if (!keys?.length) fail('INVALID_TICKET');
     const hash = payloadHash(keys, payload); const time = this._time();
     const groupId = payload && typeof payload === 'object' && !Array.isArray(payload) && payload.groupId != null ? identifier(payload.groupId, 'INVALID_GROUP_ID') : operationId;
-    const intent = intentMetadata(keys, payload);
+    const intent = intentMetadata(this.moduleId, keys, payload);
     return this._transaction(() => {
       this._validate(ticket, time, importing ? 0 : 35_000);
       const old = this.db.prepare('SELECT * FROM aw_operations WHERE operation_id=?').get(operationId);
       if (old) {
         if (old.module_id !== this.moduleId || old.body_hash !== hash || old.account_keys !== JSON.stringify(keys)) fail('OPERATION_CONFLICT');
-        if (importing) return this._operationTicket(ticket, operationId, hash, old.state);
+        if (importing) {
+          if (old.intent_action === null && old.intent_target_hash === null) {
+            if (intent.action !== null) this.db.prepare('UPDATE aw_operations SET intent_action=?,intent_target_hash=? WHERE operation_id=?').run(intent.action, intent.targetHash, operationId);
+          } else if (old.intent_action !== intent.action || old.intent_target_hash !== intent.targetHash) fail('OPERATION_CONFLICT');
+          return this._operationTicket(ticket, operationId, hash, old.state);
+        }
         fail(old.state === 'confirmed' ? 'ALREADY_SUBMITTED' : old.state === 'rejected' ? 'ALREADY_REJECTED' : 'OPERATION_UNRESOLVED');
       }
       if (!importing) for (const key of keys) {
         const pending = this.db.prepare("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.state IN ('sending','unknown')").all(key);
         const proposed = { module_id: this.moduleId, intent_action: intent.action, intent_target_hash: intent.targetHash };
-        if (pending.some((row) => !reducesAmendRisk(proposed, row) && (row.state !== 'sending' || row.module_id !== this.moduleId || row.owner_id !== this.ownerId || row.group_id !== groupId || row.account_keys !== JSON.stringify(keys) || JSON.stringify(JSON.parse(row.ticket_json)) !== JSON.stringify(ticket)))) fail('ACCOUNT_UNRESOLVED');
+        if (pending.some((row) => !reducesAmendRisk(proposed, row) && !this._marginCompatible(proposed, row) && (intent.action === 'margin-transfer' || row.state !== 'sending' || row.module_id !== this.moduleId || row.owner_id !== this.ownerId || row.group_id !== groupId || row.account_keys !== JSON.stringify(keys) || JSON.stringify(JSON.parse(row.ticket_json)) !== JSON.stringify(ticket)))) fail('ACCOUNT_UNRESOLVED');
       }
       const state = importing ? 'unknown' : 'sending';
       this.db.prepare('INSERT INTO aw_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(operationId, this.moduleId, hash, JSON.stringify(keys), this.ownerId, JSON.stringify(ticket), state, time, time, groupId, intent.action, intent.targetHash);

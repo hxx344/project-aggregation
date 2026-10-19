@@ -21,6 +21,22 @@ function fixture(t) {
 }
 function bindClaim(writer, values = [identity()]) { values.forEach((value, index) => writer.bind(`connection-${index}`, value, 1)); return writer.claim(values); }
 function readRow(databasePath, sql, ...args) { const database = new DatabaseSync(databasePath, { readOnly: true }); try { return database.prepare(sql).get(...args); } finally { database.close(); } }
+function writeRows(databasePath, sql, ...args) { const database = new DatabaseSync(databasePath); try { return database.prepare(sql).run(...args); } finally { database.close(); } }
+const marginIdentities = () => [1, 2, 3].map((value) => ({ authority: 'aster', environment: 'mainnet', accountId: `0x${String(value).repeat(40)}` }));
+const marginPayload = (values = marginIdentities(), amount = '12.3456789') => ({ marginTransfer: { version: 1, method: 'POST', path: '/fapi/v3/subAccountTransfer', params: { fromAccountAddress: values[0].accountId, toAccountAddress: values[1].accountId, asset: 'USD1', amount, kindType: 'FUTURE_FUTURE' }, source: values[0], destination: values[1], master: values[2] } });
+const legacyOrder = (client = 'original-L', extra = {}) => ({ symbol: 'BTCUSDT', positionSide: 'LONG', side: 'BUY', type: 'MARKET', quantity: '0.01000', newClientOrderId: client, newOrderRespType: 'RESULT', ...extra });
+const legacyWrappers = () => [
+  { symbol: 'BTCUSDT', target: 20 },
+  { id: 'pair-intent', kind: 'pair', symbol: 'BTCUSDT', orders: [legacyOrder('intent')], target: null },
+  { id: 'leverage-intent', kind: 'leverage', symbol: 'BTCUSDT', orders: null, target: '20' },
+  { id: 'pair-pending', request_id: null, kind: 'ordinary', symbol: 'BTCUSDT', target_leverage: null, amount: null, source: null, destination: null, orders: [legacyOrder('pending')] },
+  { id: 'cycle-pending', request_id: null, kind: 'cycle', symbol: 'BTCUSDT', target_leverage: null, amount: null, source: null, destination: null, orders: [legacyOrder('cycle')] },
+  { id: 'leverage-pending', request_id: null, kind: 'leverage', symbol: 'BTCUSDT', target_leverage: 20, amount: null, source: null, destination: null, orders: [] },
+  { id: 'cycle-intent', kind: 'cycle', symbol: 'BTCUSDT', orders: [legacyOrder('cycle-intent')], target: null },
+  { id: 'migration-intent', kind: 'migration', symbol: 'SPCXUSD1', orders: [legacyOrder('migration-open', { symbol: 'SPCXUSD1' }), legacyOrder('migration-close', { symbol: 'XAUUSD1', side: 'SELL' })], target: null },
+  { id: 'historical-cycle-leverage', kind: 'cycle_leverage', symbol: 'XAUUSD1', orders: null, target: 2 },
+];
+function subsetTicket(ticket, keys) { return { ...ticket, claims: ticket.claims.filter((row) => keys.includes(row.accountKey)), bindings: ticket.bindings.filter((row) => keys.includes(row.accountKey)) }; }
 function recoveryState(databasePath, update) {
   const database = new DatabaseSync(databasePath);
   try {
@@ -315,6 +331,215 @@ async function pythonPeer(t, databasePath, moduleId = 'greeks', options = {}) {
   return { call, close, kill };
 }
 
+test('Python six legacy UNKNOWN orders backfill safely and admit Node T0 without clearing old operations', async (t) => {
+  const f = fixture(t); const values = marginIdentities(); const peer = await pythonPeer(t, f.databasePath, 'aster');
+  for (const [index, value] of values.entries()) assert.ok((await peer.call('bind', `connection-${index}`, value, 1)).result.verified);
+  const ticket = (await peer.call('claim', values)).result; const originals = [];
+  for (let index = 0; index < 6; index++) {
+    const payload = { order: legacyOrder(`old-${index}`, index % 2 ? { positionSide: 'SHORT', side: 'SELL' } : {}) };
+    const operationId = `aster:legacy:order:${payload.order.newClientOrderId}`; const originalTicket = subsetTicket(ticket, [accountKey(values[index % 2])]);
+    assert.equal((await peer.call('import_unknown', originalTicket, operationId, payload)).result.state, 'unknown');
+    originals.push({ operationId, payload, keys: originalTicket.claims.map((row) => row.accountKey) });
+  }
+  await peer.close();
+  writeRows(f.databasePath, 'UPDATE aw_operations SET intent_action=NULL,intent_target_hash=NULL');
+  const writer = f.writer('aster'); const current = writer.claim(values);
+  assert.throws(() => writer.prepare(current, 'aster:transfer:before-backfill', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  for (const { operationId, payload, keys } of originals) {
+    const before = readRow(f.databasePath, 'SELECT * FROM aw_operations WHERE operation_id=?', operationId);
+    writer.importUnknown(subsetTicket(current, keys), operationId, payload);
+    const after = readRow(f.databasePath, 'SELECT * FROM aw_operations WHERE operation_id=?', operationId);
+    assert.equal(after.intent_action, 'order'); assert.equal(after.intent_target_hash, after.body_hash);
+    const { intent_action, intent_target_hash, ...stable } = after;
+    assert.deepEqual(stable, Object.fromEntries(Object.entries(before).filter(([key]) => !['intent_action', 'intent_target_hash'].includes(key))));
+  }
+  assert.throws(() => writer.prepare(current, 'ordinary-order', { order: legacyOrder('new-order') }), code('ACCOUNT_UNRESOLVED'));
+  const transfer = writer.prepare(current, 'opaque-request-id', marginPayload());
+  assert.equal(writer.assertOwned(transfer), true);
+  assert.equal(readRow(f.databasePath, "SELECT COUNT(*) AS count FROM aw_operations WHERE operation_id LIKE 'aster:legacy:order:%' AND state='unknown'").count, 6);
+  writer.finish(transfer, 'unknown');
+  assert.throws(() => writer.prepare(current, 'opaque-request-id', marginPayload()), code('OPERATION_UNRESOLVED'));
+  assert.throws(() => writer.prepare(current, 'another-transfer', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+});
+
+test('margin transfer rejects forged priority, invalid request semantics and incomplete identities', (t) => {
+  const f = fixture(t); const writer = f.writer('aster'); const values = marginIdentities(); const ticket = bindClaim(writer, values);
+  const bad = [
+    (p) => { p.priority = 'T0'; }, (p) => { p.marginTransfer.purpose = 'margin'; },
+    (p) => { p.marginTransfer.path = '/fapi/v1/subAccountTransfer'; }, (p) => { p.marginTransfer.method = 'DELETE'; },
+    (p) => { p.marginTransfer.version = true; }, (p) => { p.marginTransfer.params.asset = 'USDT'; },
+    (p) => { p.marginTransfer.params.kindType = 'SPOT_FUTURE'; }, (p) => { p.marginTransfer.params.fromAccountAddress = values[2].accountId; },
+    (p) => { p.marginTransfer.params.toAccountAddress = values[2].accountId; }, (p) => { p.marginTransfer.params.extra = 'hidden'; },
+    (p) => { p.marginTransfer.source.environment = 'testnet'; }, (p) => { p.marginTransfer.source.authority = 'binance'; },
+    (p) => { p.marginTransfer.master = p.marginTransfer.source; }, (p) => { p.marginTransfer.master.parentAccountId = values[0].accountId; },
+  ];
+  for (const mutate of bad) { const payload = structuredClone(marginPayload()); mutate(payload); assert.throws(() => writer.prepare(ticket, crypto.randomUUID(), payload), code('INVALID_MARGIN_TRANSFER')); }
+  for (const amount of [0, 12, '0', '-1', '01', '1e2', '0.000000001', '1000000000.00000001', '1000000001', 'NaN', ' 1', '+1']) assert.throws(() => writer.prepare(ticket, crypto.randomUUID(), marginPayload(values, amount)), code('INVALID_MARGIN_TRANSFER'));
+  assert.throws(() => writer.prepare(subsetTicket(ticket, [accountKey(values[0]), accountKey(values[1])]), 'missing-master', marginPayload()), code('INVALID_MARGIN_TRANSFER'));
+  const extra = { authority: 'aster', environment: 'mainnet', accountId: `0x${'4'.repeat(40)}` }; writer.bind('extra', extra, 1);
+  assert.throws(() => writer.prepare(writer.claim([...values, extra]), 'extra-account', marginPayload()), code('INVALID_MARGIN_TRANSFER'));
+  const other = f.writer('other-module'); assert.throws(() => other.prepare(ticket, 'wrong-module', marginPayload()), code('INVALID_MARGIN_TRANSFER'));
+  const fake = writer.importUnknown(ticket, 'aster:order:fake', { purpose: 'margin', kind: 'order' });
+  assert.throws(() => writer.prepare(ticket, 'aster:transfer:fake', { purpose: 'margin' }), code('ACCOUNT_UNRESOLVED'));
+  assert.throws(() => writer.prepare(ticket, 'valid-margin-blocked', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  assert.equal(readRow(f.databasePath, 'SELECT intent_action FROM aw_operations WHERE operation_id=?', fake.operationId).intent_action, null);
+});
+
+test('T0 final guard rechecks unknown classes and active versus fenced sending', (t) => {
+  const f = fixture(t); const values = marginIdentities(); const writer = f.writer('aster'); const ticket = bindClaim(writer, values);
+  const active = writer.prepare(ticket, 'active-order', { order: legacyOrder() });
+  assert.throws(() => writer.prepare(ticket, 'blocked-active', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  writer.bind('connection-0', values[0], 2);
+  const rebound = writer.claim(values);
+  assert.deepEqual(rebound.claims, ticket.claims);
+  assert.throws(() => writer.assertOwned(active), code('BINDING_CHANGED'));
+  assert.throws(() => writer.prepare(rebound, 'after-binding-generation', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  writer.close();
+  let oldAlive = true;
+  const successor = f.writer('aster', { processAlive: () => oldAlive }); const current = successor.claim(values);
+  assert.throws(() => successor.prepare(current, 'closed-owner-still-alive', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  oldAlive = false;
+  const transfer = successor.prepare(current, 'after-fence', marginPayload(values, '1000000000'));
+  assert.equal(successor.assertOwned(transfer), true);
+  for (const corrupt of [
+    (old) => { old.bindings = []; },
+    (old) => { old.bindings[0].generation = '1'; },
+  ]) {
+    const invalid = structuredClone(ticket); corrupt(invalid);
+    writeRows(f.databasePath, "UPDATE aw_operations SET ticket_json=? WHERE operation_id='active-order'", JSON.stringify(invalid));
+    assert.throws(() => successor.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+  }
+  writeRows(f.databasePath, "UPDATE aw_operations SET ticket_json=? WHERE operation_id='active-order'", JSON.stringify(ticket));
+  assert.equal(successor.assertOwned(transfer), true);
+  oldAlive = true;
+  assert.throws(() => successor.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+  oldAlive = false;
+  assert.equal(readRow(f.databasePath, 'SELECT state FROM aw_operations WHERE operation_id=?', active.operationId).state, 'sending');
+  // A concurrent import must veto a transfer that was already prepared.
+  successor.importUnknown(current, 'late-unknown', { unknown: true });
+  assert.throws(() => successor.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+  successor.resolve('late-unknown', current, 'rejected');
+  successor.importUnknown(current, 'foreign-unknown', { order: legacyOrder('foreign') });
+  writeRows(f.databasePath, "UPDATE aw_operations SET module_id='hub' WHERE operation_id='foreign-unknown'");
+  assert.throws(() => successor.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+  writeRows(f.databasePath, "UPDATE aw_operations SET module_id='aster',state='rejected' WHERE operation_id='foreign-unknown'");
+  successor.importUnknown(current, 'late-transfer', marginPayload());
+  assert.throws(() => successor.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+  successor.resolve('late-transfer', current, 'rejected');
+  assert.equal(successor.assertOwned(transfer), true);
+  const before = readRow(f.databasePath, "SELECT ticket_json FROM aw_operations WHERE operation_id='active-order'").ticket_json;
+  writeRows(f.databasePath, "UPDATE aw_operations SET ticket_json=?,owner_id=? WHERE operation_id='active-order'", JSON.stringify(current), current.ownerId);
+  assert.throws(() => successor.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+  writeRows(f.databasePath, "UPDATE aw_operations SET ticket_json=?,owner_id=? WHERE operation_id='active-order'", before, JSON.parse(before).ownerId);
+  assert.equal(successor.assertOwned(transfer), true);
+  recoveryState(f.databasePath, { state: 'quarantine', recoveryId: crypto.randomUUID() });
+  assert.throws(() => successor.assertOwned(transfer), code('RECOVERY_REQUIRED'));
+  recoveryState(f.databasePath, { state: 'retired', handoffId: crypto.randomUUID() });
+  assert.throws(() => successor.assertOwned(transfer), code('AUTHORITY_RETIRED'));
+});
+
+test('original classifications are bound to raw body hashes and cannot be changed by backfill', (t) => {
+  const f = fixture(t); const writer = f.writer('aster'); const values = marginIdentities(); const ticket = bindClaim(writer, values);
+  const payload = { order: legacyOrder() }; writer.importUnknown(ticket, 'legacy', payload);
+  writeRows(f.databasePath, "UPDATE aw_operations SET intent_action=NULL,intent_target_hash=NULL WHERE operation_id='legacy'");
+  assert.throws(() => writer.importUnknown(ticket, 'legacy', { order: legacyOrder('changed') }), code('OPERATION_CONFLICT'));
+  writer.importUnknown(ticket, 'legacy', payload);
+  writeRows(f.databasePath, "UPDATE aw_operations SET intent_action='leverage' WHERE operation_id='legacy'");
+  assert.throws(() => writer.importUnknown(ticket, 'legacy', payload), code('OPERATION_CONFLICT'));
+  writeRows(f.databasePath, "UPDATE aw_operations SET intent_action=NULL WHERE operation_id='legacy'");
+  assert.throws(() => writer.importUnknown(ticket, 'legacy', payload), code('OPERATION_CONFLICT'));
+});
+
+test('actual legacy wrappers backfill losslessly while malformed or funded wrappers block T0', (t) => {
+  const f = fixture(t); const writer = f.writer('aster'); const ticket = bindClaim(writer, marginIdentities());
+  for (const [index, payload] of legacyWrappers().entries()) {
+    writer.importUnknown(ticket, `wrapper-${index}`, payload);
+    writeRows(f.databasePath, 'UPDATE aw_operations SET intent_action=NULL,intent_target_hash=NULL WHERE operation_id=?', `wrapper-${index}`);
+    const before = readRow(f.databasePath, 'SELECT * FROM aw_operations WHERE operation_id=?', `wrapper-${index}`);
+    writer.importUnknown(ticket, `wrapper-${index}`, payload);
+    const after = readRow(f.databasePath, 'SELECT * FROM aw_operations WHERE operation_id=?', `wrapper-${index}`);
+    assert.ok(['order', 'leverage'].includes(after.intent_action)); assert.equal(after.intent_target_hash, before.body_hash);
+    const { intent_action, intent_target_hash, ...stable } = after;
+    assert.deepEqual(stable, Object.fromEntries(Object.entries(before).filter(([key]) => !['intent_action', 'intent_target_hash'].includes(key))));
+  }
+  const transfer = writer.prepare(ticket, 'wrapper-margin', marginPayload()); assert.equal(writer.assertOwned(transfer), true);
+  const wrappers = legacyWrappers(); const bad = [
+    { symbol: 'BTCUSDT', target: 0 }, { symbol: 'BTCUSDT', target: true }, { symbol: 'BTCUSDT', target: 126 },
+    { ...wrappers[0], kind: 'leverage' }, { ...wrappers[1], target: 20 }, { ...wrappers[1], orders: [] },
+    { ...wrappers[1], orders: [legacyOrder('wrong-symbol', { symbol: 'ETHUSDT' })] },
+    { ...wrappers[1], orders: [legacyOrder('duplicate'), legacyOrder('duplicate')] },
+    { ...wrappers[2], orders: [] }, { ...wrappers[2], target: '20.5' },
+    { ...wrappers[3], amount: '1' }, { ...wrappers[3], source: 'wallet' }, { ...wrappers[3], destination: 'wallet' },
+    { ...wrappers[3], kind: 'transfer' }, { ...wrappers[3], target_leverage: 20 },
+    { ...wrappers[5], orders: [legacyOrder()] }, { ...wrappers[5], request_id: '' },
+    { ...wrappers[6], orders: [legacyOrder('wrong-cycle-symbol', { symbol: 'ETHUSDT' })] },
+    { ...wrappers[7], kind: 'unknown-strategy' }, { ...wrappers[7], target: 20 },
+    { ...wrappers[7], orders: [legacyOrder('bad-migration', { symbol: 'SPCXUSD1', quantity: '0' })] },
+    { ...wrappers[7], orders: [legacyOrder('duplicate-migration'), legacyOrder('duplicate-migration')] },
+    { ...wrappers[8], orders: [] }, { ...wrappers[8], target: 0 },
+  ];
+  const missing = structuredClone(wrappers[3]); delete missing.amount; bad.push(missing);
+  for (const [index, payload] of bad.entries()) {
+    const id = `bad-wrapper-${index}`; writer.importUnknown(ticket, id, payload);
+    assert.equal(readRow(f.databasePath, 'SELECT intent_action FROM aw_operations WHERE operation_id=?', id).intent_action, null);
+    assert.throws(() => writer.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+    writer.resolve(id, ticket, 'rejected');
+  }
+  assert.throws(() => writer.prepare(ticket, 'ordinary-still-blocked', { order: legacyOrder('new') }), code('ACCOUNT_UNRESOLVED'));
+  writer.importUnknown(ticket, 'funded-wrapper-transfer', marginPayload());
+  assert.throws(() => writer.assertOwned(transfer), code('ACCOUNT_UNRESOLVED'));
+});
+
+test('an already admitted live transport blocks T0 through generation and close; a dead native sender does not', async (t) => {
+  const f = fixture(t); const values = marginIdentities(); const writer = f.writer('aster'); const ticket = bindClaim(writer, values);
+  const order = writer.prepare(ticket, 'barrier-order', { order: legacyOrder('barrier') });
+  const { createServer } = await import('node:http'); const sent = [];
+  const server = createServer((request, response) => { sent.push(request.url); response.end('ok'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const transport = (async () => { writer.assertOwned(order); await gate; const response = await fetch(`http://127.0.0.1:${server.address().port}/old-order`, { method: 'POST', signal: AbortSignal.timeout(5000) }); await response.text(); })();
+  try {
+    writer.bind('connection-0', values[0], 2); const rebound = writer.claim(values);
+    assert.throws(() => writer.prepare(rebound, 'generation-must-wait', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+    writer.close(); const successor = f.writer('aster'); const current = successor.claim(values);
+    assert.throws(() => successor.prepare(current, 'closed-live-must-wait', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  } finally { release(); await transport; }
+  assert.deepEqual(sent, ['/old-order']);
+
+  const deadFixture = fixture(t); const peer = await pythonPeer(t, deadFixture.databasePath, 'aster');
+  for (const [index, value] of values.entries()) await peer.call('bind', `connection-${index}`, value, 1);
+  const oldTicket = (await peer.call('claim', values)).result;
+  const oldOperation = (await peer.call('prepare', oldTicket, 'dead-order', { order: legacyOrder('dead') })).result;
+  assert.equal((await peer.call('assert_owned', oldOperation)).result, true);
+  await peer.kill();
+  const currentWriter = deadFixture.writer('aster'); const currentTicket = currentWriter.claim(values);
+  const margin = currentWriter.prepare(currentTicket, 'after-native-death', marginPayload()); assert.equal(currentWriter.assertOwned(margin), true);
+  assert.equal(readRow(deadFixture.databasePath, "SELECT state FROM aw_operations WHERE operation_id='dead-order'").state, 'sending');
+});
+
+test('Node/Python agree on strict order, batch, leverage and margin semantic hashes', async (t) => {
+  const f = fixture(t); const values = marginIdentities(); const node = f.writer('aster'); const ticket = bindClaim(node, values);
+  const samples = [
+    { order: legacyOrder() }, { orders: [legacyOrder('one'), legacyOrder('two')] },
+    { method: 'POST', path: '/fapi/v3/order', params: legacyOrder('http') },
+    { method: 'POST', path: '/fapi/v3/batchOrders', params: { batchOrders: JSON.stringify([legacyOrder('batch')]) } },
+    { method: 'POST', path: '/fapi/v3/leverage', params: { symbol: 'BTCUSDT', leverage: '20' } },
+    { intentAction: 'cancel', intentTarget: { accountKey: accountKey(values[0]), symbol: 'BTCUSDT', clientOrderId: 'cancel' } }, marginPayload(values, '0.00000001'), marginPayload(values, '1000.00000000'), marginPayload(values, '1.0'),
+    ...legacyWrappers(),
+  ];
+  const hashes = samples.map((payload, index) => node.importUnknown(ticket, `sample-${index}`, payload).bodyHash);
+  node.close(); const peer = await pythonPeer(t, f.databasePath, 'aster'); const current = (await peer.call('claim', values)).result;
+  for (const [index, payload] of samples.entries()) {
+    const before = readRow(f.databasePath, 'SELECT intent_action,intent_target_hash FROM aw_operations WHERE operation_id=?', `sample-${index}`);
+    assert.ok(before.intent_action); assert.ok(before.intent_target_hash);
+    const imported = await peer.call('import_unknown', current, `sample-${index}`, payload);
+    assert.equal(imported.code, undefined); assert.equal(imported.result.bodyHash, hashes[index]);
+  }
+  await peer.close();
+});
+
 test('cold Node/Python initialization publishes only a complete marker and preserves a concurrent winner', async (t) => {
   const f = fixture(t); const markerGate = path.join(f.directory, 'publish-gate');
   const starting = pythonPeer(t, f.databasePath, 'greeks', { markerGate });
@@ -540,5 +765,5 @@ test('Python registry contract and failure scenarios run under the normal Node t
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 21 tests/);
+  assert.match(result.stderr, /Ran 28 tests/);
 });

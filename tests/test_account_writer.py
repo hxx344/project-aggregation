@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -17,6 +18,39 @@ from account_writer import AccountWriter, AccountWriterError, account_key
 
 def identity(account_id="112233445566", **extra):
     return {"authority": "binance", "environment": "mainnet", "accountId": account_id, **extra}
+
+
+def margin_identities():
+    return [{"authority": "aster", "environment": "mainnet", "accountId": "0x" + str(index) * 40} for index in (1, 2, 3)]
+
+
+def margin_payload(values=None, amount="12.3456789"):
+    values = margin_identities() if values is None else values
+    return {"marginTransfer": {"version": 1, "method": "POST", "path": "/fapi/v3/subAccountTransfer",
+            "params": {"fromAccountAddress": values[0]["accountId"], "toAccountAddress": values[1]["accountId"], "asset": "USD1", "amount": amount, "kindType": "FUTURE_FUTURE"},
+            "source": dict(values[0]), "destination": dict(values[1]), "master": dict(values[2])}}
+
+
+def legacy_order(client="legacy-L", **extra):
+    return {"symbol": "BTCUSDT", "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": "0.01000", "newClientOrderId": client, "newOrderRespType": "RESULT", **extra}
+
+
+def legacy_wrappers():
+    return [
+        {"symbol": "BTCUSDT", "target": 20},
+        {"id": "pair-intent", "kind": "pair", "symbol": "BTCUSDT", "orders": [legacy_order("intent")], "target": None},
+        {"id": "leverage-intent", "kind": "leverage", "symbol": "BTCUSDT", "orders": None, "target": "20"},
+        {"id": "pair-pending", "request_id": None, "kind": "ordinary", "symbol": "BTCUSDT", "target_leverage": None, "amount": None, "source": None, "destination": None, "orders": [legacy_order("pending")]},
+        {"id": "cycle-pending", "request_id": None, "kind": "cycle", "symbol": "BTCUSDT", "target_leverage": None, "amount": None, "source": None, "destination": None, "orders": [legacy_order("cycle")]},
+        {"id": "leverage-pending", "request_id": None, "kind": "leverage", "symbol": "BTCUSDT", "target_leverage": 20, "amount": None, "source": None, "destination": None, "orders": []},
+        {"id": "cycle-intent", "kind": "cycle", "symbol": "BTCUSDT", "orders": [legacy_order("cycle-intent")], "target": None},
+        {"id": "migration-intent", "kind": "migration", "symbol": "SPCXUSD1", "orders": [legacy_order("migration-open", symbol="SPCXUSD1"), legacy_order("migration-close", symbol="XAUUSD1", side="SELL")], "target": None},
+        {"id": "historical-cycle-leverage", "kind": "cycle_leverage", "symbol": "XAUUSD1", "orders": None, "target": 2},
+    ]
+
+
+def subset_ticket(ticket, keys):
+    return {**ticket, "claims": [row for row in ticket["claims"] if row["accountKey"] in keys], "bindings": [row for row in ticket["bindings"] if row["accountKey"] in keys]}
 
 
 class AccountWriterTests(unittest.TestCase):
@@ -57,6 +91,237 @@ class AccountWriterTests(unittest.TestCase):
             database.execute("UPDATE aw_meta SET value=? WHERE key='recovery_state'", (json.dumps(value),))
             database.commit()
             return value
+
+    def test_six_legacy_unknown_orders_admit_only_strict_t0_after_lossless_backfill(self):
+        writer = self.writer("aster")
+        values = margin_identities()
+        ticket = self.ticket(writer, values)
+        originals = []
+        for index in range(6):
+            payload = {"order": legacy_order(f"old-{index}", **({"side": "SELL", "positionSide": "SHORT"} if index % 2 else {}))}
+            original_ticket = subset_ticket(ticket, [account_key(values[index % 2])])
+            operation_id = "aster:legacy:order:" + payload["order"]["newClientOrderId"]
+            writer.import_unknown(original_ticket, operation_id, payload)
+            originals.append((operation_id, payload, original_ticket))
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("UPDATE aw_operations SET intent_action=NULL,intent_target_hash=NULL")
+            database.commit()
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "before-backfill", margin_payload()))
+        for operation_id, payload, original_ticket in originals:
+            with closing(sqlite3.connect(self.database_path)) as database:
+                before = database.execute("SELECT * FROM aw_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            writer.import_unknown(original_ticket, operation_id, payload)
+            with closing(sqlite3.connect(self.database_path)) as database:
+                after = database.execute("SELECT * FROM aw_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            self.assertEqual(after[:-2], before[:-2])
+            self.assertEqual(after[-2], "order")
+            self.assertEqual(after[-1], after[2])
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "ordinary", {"order": legacy_order("new")}))
+        transfer = writer.prepare(ticket, "opaque-request", margin_payload())
+        self.assertTrue(writer.assert_owned(transfer))
+        with closing(sqlite3.connect(self.database_path)) as database:
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM aw_operations WHERE operation_id LIKE 'aster:legacy:order:%' AND state='unknown'").fetchone()[0], 6)
+        writer.finish(transfer, "unknown")
+        self.error("OPERATION_UNRESOLVED", lambda: writer.prepare(ticket, "opaque-request", margin_payload()))
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "different-request", margin_payload()))
+
+    def test_margin_contract_rejects_forgery_and_exact_identity_or_amount_changes(self):
+        writer = self.writer("aster")
+        values = margin_identities()
+        ticket = self.ticket(writer, values)
+        for amount in (0, 1, True, "0", "-1", "01", "+1", "1e2", " 1", "0.000000001", "1000000000.00000001", "1000000001"):
+            with self.subTest(amount=amount):
+                self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(ticket, str(uuid.uuid4()), margin_payload(amount=amount)))
+        cases = [
+            ("method", "DELETE"), ("path", "/fapi/v1/subAccountTransfer"), ("version", True), ("purpose", "margin"),
+            ("source", {**values[0], "environment": "testnet"}), ("source", {**values[0], "authority": "binance"}),
+            ("master", values[0]), ("master", {**values[2], "parentAccountId": values[0]["accountId"]}),
+        ]
+        for key, value in cases:
+            payload = margin_payload()
+            payload["marginTransfer"][key] = value
+            self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(ticket, str(uuid.uuid4()), payload))
+        for key, value in (("asset", "USDT"), ("kindType", "SPOT_FUTURE"), ("fromAccountAddress", values[2]["accountId"]), ("toAccountAddress", values[2]["accountId"]), ("extra", "hidden")):
+            payload = margin_payload()
+            payload["marginTransfer"]["params"][key] = value
+            self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(ticket, str(uuid.uuid4()), payload))
+        payload = {**margin_payload(), "purpose": "T0"}
+        self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(ticket, "extra-top", payload))
+        self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(subset_ticket(ticket, [account_key(value) for value in values[:2]]), "missing-master", margin_payload()))
+        other = self.writer("other")
+        self.error("INVALID_MARGIN_TRANSFER", lambda: other.prepare(ticket, "other-module", margin_payload()))
+
+    def test_unknown_payloads_and_transfer_unknown_block_both_prepare_and_final_guard(self):
+        writer = self.writer("aster")
+        ticket = self.ticket(writer, margin_identities())
+        transfer = writer.prepare(ticket, "margin", margin_payload(amount="0.00000001"))
+        bad = [
+            {"kind": "order", "purpose": "margin"}, {"order": legacy_order(extra="hidden")},
+            {"order": legacy_order(quantity="0")}, {"order": legacy_order(newClientOrderId="")},
+            {"method": "POST", "path": "/fapi/v3/subAccountTransfer", "params": {"asset": "USD1"}},
+            {"method": "POST", "path": "/fapi/v3/order", "params": {"symbol": "BTCUSDT"}},
+            {"method": "POST", "path": "/fapi/v3/batchOrders", "params": {"batchOrders": "broken"}},
+            {"method": "POST", "path": "/fapi/v3/leverage", "params": {"symbol": "BTCUSDT", "leverage": 20, "amount": "1"}},
+            margin_payload(),
+        ]
+        for index, payload in enumerate(bad):
+            operation_id = f"late-{index}"
+            writer.import_unknown(ticket, operation_id, payload)
+            self.error("ACCOUNT_UNRESOLVED", lambda: writer.assert_owned(transfer))
+            self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "another", margin_payload()))
+            writer.resolve(operation_id, ticket, "rejected")
+        self.assertTrue(writer.assert_owned(transfer))
+        self.error("INVALID_INTENT_TARGET", lambda: writer.import_unknown(ticket, "forged-amend", {"intentAction": "amend", "intentTarget": {"accountKey": account_key(margin_identities()[0]), "symbol": "BTCUSDT", "clientOrderId": "old"}, "transfer": {"amount": "1"}}))
+
+    def test_active_sending_blocks_t0_but_fenced_historical_sending_remains_preserved(self):
+        writer = self.writer("aster")
+        values = margin_identities()
+        ticket = self.ticket(writer, values)
+        old = writer.prepare(ticket, "active", {"order": legacy_order()})
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "blocked", margin_payload()))
+        writer.bind("connection-0", values[0], 2)
+        rebound = writer.claim(values)
+        self.assertEqual(rebound["claims"], ticket["claims"])
+        self.error("BINDING_CHANGED", lambda: writer.assert_owned(old))
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(rebound, "after-binding-generation", margin_payload()))
+        writer.close()
+        old_alive = [True]
+        successor = self.writer("aster", process_alive=lambda pid: old_alive[0])
+        current = successor.claim(values)
+        self.error("ACCOUNT_UNRESOLVED", lambda: successor.prepare(current, "closed-owner-still-alive", margin_payload()))
+        old_alive[0] = False
+        transfer = successor.prepare(current, "after-fence", margin_payload(amount="1000000000"))
+        self.assertTrue(successor.assert_owned(transfer))
+        invalid_tickets = []
+        invalid = json.loads(json.dumps(ticket))
+        invalid["bindings"] = []
+        invalid_tickets.append(invalid)
+        invalid = json.loads(json.dumps(ticket))
+        invalid["bindings"][0]["generation"] = "1"
+        invalid_tickets.append(invalid)
+        for invalid in invalid_tickets:
+            with closing(sqlite3.connect(self.database_path)) as database:
+                database.execute("UPDATE aw_operations SET ticket_json=? WHERE operation_id='active'", (json.dumps(invalid),))
+                database.commit()
+            self.error("ACCOUNT_UNRESOLVED", lambda: successor.assert_owned(transfer))
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("UPDATE aw_operations SET ticket_json=? WHERE operation_id='active'", (json.dumps(ticket),))
+            database.commit()
+        self.assertTrue(successor.assert_owned(transfer))
+        old_alive[0] = True
+        self.error("ACCOUNT_UNRESOLVED", lambda: successor.assert_owned(transfer))
+        old_alive[0] = False
+        with closing(sqlite3.connect(self.database_path)) as database:
+            self.assertEqual(database.execute("SELECT state FROM aw_operations WHERE operation_id=?", (old["operationId"],)).fetchone()[0], "sending")
+            previous = database.execute("SELECT ticket_json,owner_id FROM aw_operations WHERE operation_id='active'").fetchone()
+            database.execute("UPDATE aw_operations SET ticket_json=?,owner_id=? WHERE operation_id='active'", (json.dumps(current), current["ownerId"]))
+            database.commit()
+        self.error("ACCOUNT_UNRESOLVED", lambda: successor.assert_owned(transfer))
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("UPDATE aw_operations SET ticket_json=?,owner_id=? WHERE operation_id='active'", previous)
+            database.commit()
+        self.assertTrue(successor.assert_owned(transfer))
+        self.recovery(state="quarantine", recoveryId=str(uuid.uuid4()))
+        self.error("RECOVERY_REQUIRED", lambda: successor.assert_owned(transfer))
+        self.recovery(state="retired", handoffId=str(uuid.uuid4()))
+        self.error("AUTHORITY_RETIRED", lambda: successor.assert_owned(transfer))
+
+    def test_classification_backfill_rejects_different_body_or_existing_classification(self):
+        writer = self.writer("aster")
+        ticket = self.ticket(writer, margin_identities())
+        payload = {"order": legacy_order()}
+        writer.import_unknown(ticket, "legacy", payload)
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("UPDATE aw_operations SET intent_action=NULL,intent_target_hash=NULL WHERE operation_id='legacy'")
+            database.commit()
+        self.error("OPERATION_CONFLICT", lambda: writer.import_unknown(ticket, "legacy", {"order": legacy_order("changed")}))
+        writer.import_unknown(ticket, "legacy", payload)
+        for action in ("leverage", None):
+            with closing(sqlite3.connect(self.database_path)) as database:
+                database.execute("UPDATE aw_operations SET intent_action=? WHERE operation_id='legacy'", (action,))
+                database.commit()
+            self.error("OPERATION_CONFLICT", lambda: writer.import_unknown(ticket, "legacy", payload))
+
+    def test_actual_legacy_wrappers_backfill_losslessly_and_reject_funded_or_invalid_wrappers(self):
+        writer = self.writer("aster")
+        ticket = self.ticket(writer, margin_identities())
+        for index, payload in enumerate(legacy_wrappers()):
+            operation_id = f"wrapper-{index}"
+            writer.import_unknown(ticket, operation_id, payload)
+            with closing(sqlite3.connect(self.database_path)) as database:
+                database.execute("UPDATE aw_operations SET intent_action=NULL,intent_target_hash=NULL WHERE operation_id=?", (operation_id,))
+                database.commit()
+                before = database.execute("SELECT * FROM aw_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            writer.import_unknown(ticket, operation_id, payload)
+            with closing(sqlite3.connect(self.database_path)) as database:
+                after = database.execute("SELECT * FROM aw_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            self.assertEqual(after[:-2], before[:-2])
+            self.assertIn(after[-2], ("order", "leverage"))
+            self.assertEqual(after[-1], before[2])
+        transfer = writer.prepare(ticket, "wrapper-margin", margin_payload())
+        self.assertTrue(writer.assert_owned(transfer))
+        wrappers = legacy_wrappers()
+        bad = [
+            {"symbol": "BTCUSDT", "target": value} for value in (0, True, 126, "20.5")
+        ] + [
+            {**wrappers[0], "kind": "leverage"}, {**wrappers[1], "target": 20}, {**wrappers[1], "orders": []},
+            {**wrappers[1], "orders": [legacy_order("wrong", symbol="ETHUSDT")]},
+            {**wrappers[1], "orders": [legacy_order("duplicate"), legacy_order("duplicate")]},
+            {**wrappers[2], "orders": []}, {**wrappers[2], "target": "20.5"},
+            {**wrappers[3], "amount": "1"}, {**wrappers[3], "source": "wallet"}, {**wrappers[3], "destination": "wallet"},
+            {**wrappers[3], "kind": "transfer"}, {**wrappers[3], "target_leverage": 20},
+            {**wrappers[5], "orders": [legacy_order()]}, {**wrappers[5], "request_id": ""},
+            {**wrappers[6], "orders": [legacy_order("wrong-cycle-symbol", symbol="ETHUSDT")]},
+            {**wrappers[7], "kind": "unknown-strategy"}, {**wrappers[7], "target": 20},
+            {**wrappers[7], "orders": [legacy_order("bad-migration", symbol="SPCXUSD1", quantity="0")]},
+            {**wrappers[7], "orders": [legacy_order("duplicate-migration"), legacy_order("duplicate-migration")]},
+            {**wrappers[8], "orders": []}, {**wrappers[8], "target": 0},
+            {key: value for key, value in wrappers[3].items() if key != "amount"},
+        ]
+        for index, payload in enumerate(bad):
+            operation_id = f"bad-wrapper-{index}"
+            writer.import_unknown(ticket, operation_id, payload)
+            with closing(sqlite3.connect(self.database_path)) as database:
+                self.assertIsNone(database.execute("SELECT intent_action FROM aw_operations WHERE operation_id=?", (operation_id,)).fetchone()[0])
+            self.error("ACCOUNT_UNRESOLVED", lambda: writer.assert_owned(transfer))
+            writer.resolve(operation_id, ticket, "rejected")
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "ordinary-still-blocked", {"order": legacy_order("new")}))
+        writer.import_unknown(ticket, "transfer-unknown", margin_payload())
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.assert_owned(transfer))
+
+    def test_live_sender_past_final_guard_stays_exclusive_after_generation_change_or_close(self):
+        writer = self.writer("aster")
+        values = margin_identities()
+        ticket = self.ticket(writer, values)
+        operation = writer.prepare(ticket, "barrier-order", {"order": legacy_order("barrier")})
+        admitted, release = threading.Event(), threading.Event()
+        sent, failures = [], []
+        def transport():
+            try:
+                writer.assert_owned(operation)
+                admitted.set()
+                if not release.wait(5):
+                    raise TimeoutError("transport barrier timed out")
+                sent.append("old-order")
+            except Exception as error:
+                failures.append(error)
+        sender = threading.Thread(target=transport)
+        sender.start()
+        try:
+            self.assertTrue(admitted.wait(5))
+            writer.bind("connection-0", values[0], 2)
+            current = writer.claim(values)
+            self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(current, "after-generation", margin_payload()))
+            writer.close()
+            successor = self.writer("aster")
+            current = successor.claim(values)
+            self.error("ACCOUNT_UNRESOLVED", lambda: successor.prepare(current, "closed-live", margin_payload()))
+        finally:
+            release.set()
+            sender.join(5)
+        self.assertFalse(sender.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(sent, ["old-order"])
 
     def test_quarantine_preserves_recovery_but_rejects_new_and_late_send(self):
         writer = self.writer()

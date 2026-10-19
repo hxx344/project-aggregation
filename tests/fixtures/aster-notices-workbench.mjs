@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerHooks } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { registerModuleTransport } from '../../server/modules/transport.mjs';
 import { moduleCatalog } from '../../server/modules/catalog.mjs';
 import { createStaticResponder } from '../../server/static-response.mjs';
@@ -16,6 +17,11 @@ import { createStaticResponder } from '../../server/static-response.mjs';
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const dist = path.join(root, 'modules/aster/dashboard/dist/client');
 const directory = mkdtempSync(path.join(tmpdir(), 'aster-notices-browser-'));
+if (process.platform === 'win32') {
+  const secure = spawnSync(process.env.PYTHON || 'python', ['-I', path.join(root, 'tests/test_lifecycle_lock.py'), '--secure-dir', directory],
+    { windowsHide: true, timeout: 5000 });
+  if (secure.status !== 0) throw new Error('Cannot protect the isolated browser fixture data directory');
+}
 process.env.DATA_DIR = directory;
 process.env.PORT = '39152';
 process.env.HOST = '127.0.0.1';

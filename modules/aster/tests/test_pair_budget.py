@@ -132,7 +132,8 @@ class PairBudgetTests(TestCase):
         legs = self.legs()
         # Even a caller's ambient priority cannot leak to newly spawned workers.
         with self.budget.reconciliation():
-            self.trader._dispatch(self.pair, {**runtime_default(), "pending": {"legs": legs}}, self.brokers, legs)
+            self.trader._dispatch(self.pair, {**runtime_default(), "identities": self.trader._members(self.pair)[2],
+                "pending": {"legs": legs}}, self.brokers, legs)
         self.assertTrue(all(leg["receipt"]["local_not_sent"] for leg in legs))
         self.assertEqual(self.budget.snapshot()["used"], 1500)
         self.assertFalse(any(broker.api.calls for broker in self.brokers.values()))
@@ -165,7 +166,7 @@ class PairBudgetTests(TestCase):
     def test_leverage_confirmation_uses_reserve_without_resending(self):
         self.live_brokers()
         state = runtime_default()
-        state["pending"] = {"kind": "leverage", "identities": self.trader._members(self.pair)[2],
+        state["pending"] = {"id": "original-leverage", "kind": "leverage", "identities": self.trader._members(self.pair)[2],
                             "before": {"LONG": "0", "SHORT": "0"}, "target_leverage": 5,
                             "previous_leverage": 2, "results": {}}
         self.store.put("pair_runtime:gold", state)
@@ -187,7 +188,7 @@ class PairBudgetTests(TestCase):
                 with self.assertRaises(RequestNotSent):
                     self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
                 legs = self.legs(reducing=True)
-                self.trader._dispatch(self.pair, {**runtime_default(), "pending": {"repairs": legs}},
+                self.trader._dispatch(self.pair, {**runtime_default(), "identities": self.trader._members(self.pair)[2], "pending": {"repairs": legs}},
                                       self.brokers, legs, reconciliation=True)
                 self.assertTrue(all(leg["receipt"]["local_not_sent"] for leg in legs))
                 self.assertFalse(any(broker.api.calls for broker in self.brokers.values()))

@@ -2711,15 +2711,30 @@ class Engine:
                                  "hourly_summary": hourly_summary,
                                  "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or self.position_imbalance_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
+    def poll_trading_rules(self):
+        """One public rules attempt, isolated from the funds scheduler."""
+        try:
+            self.market.load_rules()
+            if any(symbol not in self.market.rules for symbol in SYMBOLS):
+                raise TradingError("缺少配置市场的交易规则")
+            with self.lock:
+                self.ready, self.error = True, None
+            return 10
+        except (TradingError, KeyError, ValueError, TypeError) as exc:
+            with self.lock:
+                self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
+            return max(10, getattr(exc, "retry_after", 0))
+
     def run(self):
+        from .margin_balance import MarginBalancer
         pending, due = {}, {}
-        rules_due = 0
         market_started, market_backoff = {}, {}
         cycle_job_due = {}
         adl_wake_jobs = set()
         account_ids, account_generation, accounts_due = [], -1, 0
         schedules, known_accounts, next_ordinary_start = {}, set(), 0
         saved_accounts, saved_pairs, pair_revisions = [], [], {}
+        funds_pairs, funds_pairs_due, funds_generation = [], 0, -1
         # Account refresh and history never occupy an execution worker's slot.
         try:
             self.dashboard_reports.start(self._dashboard_report_accounts)
@@ -2731,7 +2746,8 @@ class Engine:
                     self.market.start_stream()
                 except Exception:
                     LOG.warning("Public quote stream unavailable; using REST quotes")
-            with ThreadPoolExecutor(max_workers=4 * MAX_ACCOUNTS + 4 * len(MARKET_SYMBOLS) + 1, thread_name_prefix="aster") as pool:
+            with ThreadPoolExecutor(max_workers=MAX_ACCOUNTS // 2, thread_name_prefix="aster-pair") as pair_pool, \
+                    ThreadPoolExecutor(max_workers=4 * MAX_ACCOUNTS + 4 * len(MARKET_SYMBOLS) + 1, thread_name_prefix="aster") as pool:
                 self._ordinary_pool = pool
                 try:
                     while not self.shutdown.is_set():
@@ -2788,15 +2804,25 @@ class Engine:
                                         market_backoff[key] = due[key]
                                 del pending[key]
                         if not self.ready:
-                            if time.monotonic() >= rules_due:
-                                try:
-                                    self.market.load_rules()
-                                    if any(s not in self.market.rules for s in SYMBOLS):
-                                        raise TradingError("缺少配置市场的交易规则")
-                                    self.ready, self.error = True, None
-                                except (TradingError, KeyError, ValueError, TypeError) as exc:
-                                    self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
-                                    rules_due = time.monotonic() + max(10, getattr(exc, "retry_after", 0))
+                            # Funds are independent of public trading rules.
+                            # Submit them before a bounded public rules request
+                            # so a slow/failed market cannot stall their worker.
+                            with self.lock:
+                                generation = self.accounts_generation
+                            if generation != funds_generation or time.monotonic() >= funds_pairs_due:
+                                funds_pairs = self.store.pairs()
+                                funds_generation = generation
+                                funds_pairs_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
+                            for pair in funds_pairs:
+                                journal = self.store.get("pair_margin:" + pair["id"], {})
+                                if not (pair["margin"]["enabled"] or isinstance(journal, dict) and journal.get("pending")
+                                        or MarginBalancer.unsettled_rejection(journal)):
+                                    continue
+                                key = "pair:" + pair["id"]
+                                if key not in pending and time.monotonic() >= due.get(key, 0):
+                                    pending[key] = pair_pool.submit(self.pairs.tick_margin, pair["id"])
+                            if "rules" not in pending and time.monotonic() >= due.get("rules", 0):
+                                pending["rules"] = pool.submit(self.poll_trading_rules)
                             if not self.ready:
                                 # Startup failures still need local status reports.
                                 # Market polling and trading jobs remain behind ready.
@@ -2895,7 +2921,11 @@ class Engine:
                                     if time.monotonic() < work.ordinary_priority_after:
                                         priority_accounts.discard(aid)
                         monitored_symbols = self.monitored_market_symbols(saved_accounts)
-                        jobs = {"market:" + s: (self.poll_market, s) for s in capacity_symbols}
+                        # At most four disjoint pairs have their own four
+                        # workers. Public polling/history cannot queue ahead of
+                        # the funds-first pair turn, including cold startup.
+                        jobs = {"pair:" + pair["id"]: (self.pairs.tick, pair["id"]) for pair in saved_pairs}
+                        jobs.update({"market:" + s: (self.poll_market, s) for s in capacity_symbols})
                         if isinstance(self.market, MarketData):
                             jobs.update({"brackets:" + s: (self.poll_public_brackets, s) for s in capacity_symbols})
                         jobs.update({"book:" + s: (self.poll_book, s) for s in monitored_symbols})
@@ -2914,7 +2944,6 @@ class Engine:
                         ordered_accounts = sorted(account_ids, key=lambda aid: (aid not in urgent_accounts,
                             aid not in cycle_candidates, aid not in priority_accounts))
                         jobs.update({"account:" + aid: (self.tick_account, aid) for aid in ordered_accounts})
-                        jobs.update({"pair:" + pair["id"]: (self.pairs.tick, pair["id"]) for pair in saved_pairs})
                         for key, (function, *args) in jobs.items():
                             is_account = key.startswith("account:")
                             aid = key.removeprefix("account:")
@@ -2957,7 +2986,7 @@ class Engine:
                                         self.work(aid).cycle.signal = None
                                     if key.startswith("market:"):
                                         market_started[key] = time.monotonic()
-                                    pending[key] = pool.submit(function, *args)
+                                    pending[key] = (pair_pool if key.startswith("pair:") else pool).submit(function, *args)
                                 if not ordinary_resume and (ordinary or priority and aid in schedules and aid not in urgent_accounts):
                                     next_ordinary_start = max(next_ordinary_start, time.monotonic() + schedules[aid]["gap"])
                         self.scheduler_event.wait(.02 if targets else .1)

@@ -356,7 +356,7 @@ function PairDetail({
   const lastBatch = pair.state?.last_batch;
   const startBlock = pair.enabled
     ? '配对组执行已启用；实际进度见下方状态'
-    : !ready
+    : !ready && !marginOnly
       ? '等待服务就绪'
       : draft.dirty
         ? '请先保存或撤销设置草稿'

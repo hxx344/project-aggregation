@@ -15,7 +15,7 @@ import math
 import re
 import time
 import uuid
-from .account_writer import ADMISSION_CODES, protected_pair, protected_transfer, writer_for
+from .account_writer import ADMISSION_CODES, funds_priority, protected_pair, protected_transfer, writer_for
 from urllib.parse import urlencode
 
 from eth_account import Account as EthAccount
@@ -786,8 +786,22 @@ class MarginBalancer:
         for member in members.values():
             self.engine.broker(member).reload()
 
+    @funds_priority
     @protected_pair
     def tick(self, pair, snapshots, pending_orders=False, *, snapshot_guards=None, snapshot_loader=None):
+        # Include funds reads, ownership discovery, POST and the acknowledged
+        # balance refresh in one isolated priority context.
+        with ExitStack() as priorities:
+            seen = set()
+            for member in self._members(pair).values():
+                budget = getattr(getattr(self.engine.broker(member), "api", None), "budget", None)
+                if budget is not None and id(budget) not in seen:
+                    priorities.enter_context(getattr(budget, "margin", nullcontext)())
+                    seen.add(id(budget))
+            return self._tick(pair, snapshots, pending_orders, snapshot_guards=snapshot_guards,
+                snapshot_loader=snapshot_loader)
+
+    def _tick(self, pair, snapshots, pending_orders=False, *, snapshot_guards=None, snapshot_loader=None):
         """Return display state; the caller must obey ``blocks_trading``."""
         config = validate_margin(pair.get("margin", {}))
         try:
@@ -1003,8 +1017,14 @@ class MarginBalancer:
         if replacements:
             # Funds reads do not depend on trading modes, positions or markets.
             with ThreadPoolExecutor(max_workers=len(replacements), thread_name_prefix="margin-read") as pool:
-                reads = {side: pool.submit(brokers[side].transfer_snapshot)
-                         for side in replacements}
+                def read(side, budget, flags):
+                    with budget._inherit_priority(flags) if flags is not None else nullcontext():
+                        return brokers[side].transfer_snapshot()
+                reads = {}
+                for side in replacements:
+                    budget = getattr(getattr(brokers[side], "api", None), "budget", None)
+                    flags = budget._priority_flags() if callable(getattr(budget, "_priority_flags", None)) else None
+                    reads[side] = pool.submit(read, side, budget, flags)
                 originals.update({side: future.result() for side, future in reads.items()})
         for side in brokers:
             if side in guards:
@@ -1133,9 +1153,12 @@ class MarginBalancer:
                 pending.update(done)
                 state.update(updated)
             try:
-                params = {"toAccountAddress": children[plan["destination"]]["user"], "asset": "USD1", "amount": plan["amount"],
-                    "kindType": "FUTURE_FUTURE", "fromAccountAddress": children[plan["source"]]["user"]}
-                with writer.accounts([member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]), writer.batch("aster:transfer:" + pending["request_id"], params, before_finish=persist_rejection):
+                params = {"toAccountAddress": children[plan["destination"]]["user"].lower(), "asset": "USD1", "amount": plan["amount"],
+                    "kindType": "FUTURE_FUTURE", "fromAccountAddress": children[plan["source"]]["user"].lower()}
+                with writer.accounts([member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]), writer.batch("aster:transfer:" + pending["request_id"], params, before_finish=persist_rejection,
+                        margin_transfer={"source": members[plan["source"]]["id"],
+                            "destination": members[plan["destination"]]["id"],
+                            "master": "master:" + config["master_env_prefix"]}):
                     try:
                         response = transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
                     except (TransferRejected, RequestNotSent) as exc:

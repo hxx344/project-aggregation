@@ -209,7 +209,7 @@ class PairMarginLifelineLiveTests(TestCase):
                 reads.append(stack.enter_context(patch.object(broker, "transfer_snapshot", wraps=broker.transfer_snapshot)))
             self.assert_transferred(self.tick())
             self.assertTrue(all(read.call_count >= 2 for read in reads))
-        self.assertTrue(any(path == BRACKET for broker in self.brokers.values() for _, path, _ in broker.api.calls))
+        self.assertFalse(any(path == BRACKET for broker in self.brokers.values() for _, path, _ in broker.api.calls))
 
     def test_event_after_fallback_read_and_real_signing_prevents_transfer_transport(self):
         for broker in self.brokers.values():

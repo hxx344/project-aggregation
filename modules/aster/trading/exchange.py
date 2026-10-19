@@ -107,11 +107,13 @@ def api_wait_notice(exc):
 
 
 class RateBudget:
-    def __init__(self, reconciliation_reserve=300, capacity_reserve=0):
+    def __init__(self, reconciliation_reserve=300, capacity_reserve=0, margin_reserve=0):
         if type(reconciliation_reserve) is not int or reconciliation_reserve < 0:
             raise ExchangeError("订单核对保留额度无效")
         if type(capacity_reserve) is not int or capacity_reserve < 0:
             raise ExchangeError("额度监控保留预算无效")
+        if type(margin_reserve) is not int or not 0 <= margin_reserve <= 1800:
+            raise ExchangeError("保证金保留预算无效")
         self.lock = threading.Lock()
         self.until, self.window, self.weight = 0.0, time.monotonic(), 0
         self.cooldown_reason = "未记录触发原因"
@@ -123,7 +125,18 @@ class RateBudget:
         self.limit = 1800
         self.reconciliation_reserve = reconciliation_reserve
         self.capacity_reserve = capacity_reserve
+        self.margin_reserve = margin_reserve
         self.priority = threading.local()
+
+    @contextmanager
+    def margin(self):
+        """Funds work alone may use its reserved share of the hard IP limit."""
+        previous = getattr(self.priority, "margin", False)
+        self.priority.margin = True
+        try:
+            yield self
+        finally:
+            self.priority.margin = previous
 
     def configure_capacity_reserve(self, weight):
         if type(weight) is not int or weight < 0:
@@ -163,12 +176,12 @@ class RateBudget:
 
     def _priority_flags(self):
         return tuple(getattr(self.priority, name, False) for name in
-                     ("reconciliation", "cycle_accounting", "capacity_monitoring"))
+                     ("reconciliation", "cycle_accounting", "capacity_monitoring", "margin"))
 
     @contextmanager
     def _inherit_priority(self, flags):
         previous = self._priority_flags()
-        names = ("reconciliation", "cycle_accounting", "capacity_monitoring")
+        names = ("reconciliation", "cycle_accounting", "capacity_monitoring", "margin")
         for name, value in zip(names, flags):
             setattr(self.priority, name, value)
         try:
@@ -207,10 +220,15 @@ class RateBudget:
         monitoring = getattr(self.priority, "capacity_monitoring", False)
         critical = (getattr(self.priority, "reconciliation", False) and not monitoring
                     and not getattr(self.priority, "cycle_accounting", False))
-        if monitoring:
+        margin = bool(self.margin_reserve and getattr(self.priority, "margin", False))
+        if margin:
+            limit = self.limit
+        elif monitoring:
             limit = self._ordinary_limit()
         else:
             limit = self.limit if critical else self._execution_limit()
+        if not margin:
+            limit = min(limit, self.limit - min(self.margin_reserve, self.limit))
         if self.weight + weight > limit:
             message = "本地 API 请求权重预算不足" if critical else "本地普通 API 请求权重预算不足，已为订单核对和补偿保留请求权重"
             if not critical and not monitoring and self.capacity_reserve:
@@ -317,6 +335,7 @@ class RateBudget:
                               reset_after if self.weight >= execution_limit else 0.0)
             return {"used": self.weight, "limit": self.limit, "ordinary_limit": ordinary_limit,
                     "execution_limit": execution_limit, "capacity_reserve": ordinary_limit - execution_limit,
+                    "margin_reserve": self.margin_reserve,
                     "local_used": self.local_weight, "aster_ip_used": self.reported_weight,
                     "remaining": max(0, self.limit - self.weight),
                     "ordinary_remaining": max(0, execution_limit - self.weight),
@@ -346,7 +365,7 @@ class RateBudget:
         return seconds
 
 
-BUDGET = RateBudget()
+BUDGET = RateBudget(margin_reserve=120)
 
 
 def cooldown_reason(method, path, *, status=None, codes=()):
@@ -376,7 +395,7 @@ class API:
     def _before_account_request(self, request):
         prepared = self._writer_prepared.get()
         if prepared is not None:
-            self.account_writer.before_send(prepared)
+            self.account_writer.before_send(prepared, request)
 
     def signed_parameters(self, params):
         if not self.credentials:
