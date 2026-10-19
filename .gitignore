@@ -61,3 +61,16 @@ VISUAL_COMPARISON.md
 
 # Archive - keep in git history but not in working tree
 docs/archive/
+
+# Local agent memory
+.workbuddy-ai/memory/
+
+# Local planning specs and reviews (kept out of version control)
+docs/asset-monthly-performance-spec.md
+docs/aster-monitoring-simplification-spec.md
+docs/aster-rust-migration-plan.md
+docs/crossex-position-actions-spec.md
+docs/workbench-feature-arbitrage-review-2026-10-18.md
+modules/crossex/docs/fix-cross-exchange-base-matching.md
+modules/crossex/docs/portfolio-metrics-product-review.md
+modules/crossex/docs/portfolio-spread-metrics.md
