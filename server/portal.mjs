@@ -257,7 +257,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     if (source['content-security-policy-report-only']) headers['content-security-policy-report-only'] = framePolicy(source['content-security-policy-report-only'], context.hubOrigin);
     headers['referrer-policy'] = 'no-referrer';
     // Avoid a shared browser cache serving private data after a grant is revoked.
-    headers['cache-control'] = cachePolicy(requestPath, source, status);
+    headers['cache-control'] = cachePolicy(requestPath, source, status, Boolean(target.transport));
     if (source.location) {
       let location;
       try { location = new URL(source.location, new URL(target.base.pathname.replace(/\/$/, '') + requestPath, target.base.origin)); } catch { throw new PortalError(502, '项目返回了无效跳转地址'); }
@@ -384,7 +384,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         if (req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/logout' && incoming.statusCode >= 200 && incoming.statusCode < 300) {
           revokeGrant(grant); headers['set-cookie'] = [...(headers['set-cookie'] || []), clearPortalCookie(context)];
         }
-        const compress = prepareAssetCompression(req, incoming, headers);
+        const compress = prepareAssetCompression(req, incoming, headers, Boolean(target.transport));
         res.writeHead(incoming.statusCode, headers);
         if (compress && req.method === 'HEAD') { incoming.resume(); res.end(); }
         else if (compress) pipeline(incoming, createGzip(), res, error => { if (error) sendError(res, error); });

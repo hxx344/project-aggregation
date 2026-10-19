@@ -1,8 +1,8 @@
 // Run with playwright-cli run-code --filename against the isolated production preview.
 async (page) => {
-  const origin = 'http://127.0.0.1:4175';
+  const origin = new URL(page.url()).origin;
   const assert = (value, message) => { if (!value) throw new Error(message); };
-  const ids = ['aster', 'monitor', 'asset', 'crossex', 'variational', 'greeks'];
+  const ids = ['aster', 'monitor', 'asset', 'crossex', 'greeks'];
   const projects = ids.map((id, order) => ({ id, name: id, description: '', category: 'other', adapter: order > 2 ? 'standard' : id,
     enabled: true, accessMode: 'proxy', apiUrl: 'http://127.0.0.1:9000', url: '', mode: 'embed', hasCredentials: true, revision: 'one', staleAfterSeconds: 120, order }));
   let sample = 1, expire = false, hold = false;
@@ -70,8 +70,8 @@ async (page) => {
   await page.goto(origin);
   await page.waitForFunction(() => window.__streams?.length > 0);
   await emit();
-  for (let i = 0; i < 10 && page.frames().length < 7; i++) await advance(300);
-  assert(page.frames().length === 7, 'all six module frames preload');
+  for (let i = 0; i < 10 && page.frames().length < 6; i++) await advance(300);
+  assert(page.frames().length === 6, 'all five module frames preload');
   const frames = page.frames().filter(frame => frame !== page.mainFrame());
   await advance(300);
   for (const frame of frames) {
@@ -126,7 +126,7 @@ async (page) => {
   await page.getByRole('heading', { name: '进入工作台', exact: true }).waitFor();
   const loggedOutReads = reads.length;
   await advance(60_000); assert(reads.length === loggedOutReads && page.frames().length === 1, 'expiry stops polling and removes modules');
-  assert(writes.length === 6 && writes.every(path => path.endsWith('/launch')), 'automatic refresh sends no data mutations');
+  assert(writes.length === 5 && writes.every(path => path.endsWith('/launch')), 'automatic refresh sends no data mutations');
   assert(errors.length === 0, `browser errors: ${errors.join('; ')}`);
   return { passed: true, modules: ids.length, hiddenRounds: 3, overviewReads: reads.length, launches: Object.fromEntries(launches), scenarios: ['background stream', 'background fallback', 'retained modules', 'hidden navigation rejected', 'late read isolation', 'wake recovery', 'offline', 'session expiry'] };
 }

@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { gunzipSync, gzipSync } from 'node:zlib';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createPortal, HUB_HOST, PORTAL_COOKIE } from '../server/portal.mjs';
+import { registerModuleTransport } from '../server/modules/transport.mjs';
 
 test('portal streams compressed public assets while preserving identity, HEAD and conditional reads', async t => {
   const body = Buffer.from('export const message = "ASTER static build fixture";\n'.repeat(1000));
@@ -70,6 +73,33 @@ test('portal caches only public immutable build files after authorization', asyn
   f.revoke(); assert.equal((await f.request('/assets/index-12345678.js', { cookie })).status, 401);
 });
 
+test('registered embedded build files retain private browser caching and gzip after grant validation', async t => {
+  const body = Buffer.from('export const fixture = "private embedded build code";\n'.repeat(400));
+  const f = await fixture(t, { embedded: true, onUpstream(req, res) {
+    assert.equal(req.headers['x-workspace-key'], 'embedded-static-test-only-secret');
+    res.writeHead(200, { 'Content-Type': 'text/javascript', 'Cache-Control': 'private, max-age=31536000, immutable',
+      'Content-Length': body.length, ...(req.url.includes('personal') ? { 'Set-Cookie': 'private=value' } : {}) });
+    res.end(body); return true;
+  } });
+  const path = '/assets/app-deadbeef.js';
+  assert.equal((await f.request(path)).status, 401);
+  assert.equal(f.calls, 0);
+  const { cookie } = await f.authorize();
+  const result = await f.request(path, { cookie, headers: { 'Accept-Encoding': 'gzip' } });
+  assert.equal(result.headers['cache-control'], 'private, max-age=31536000, immutable');
+  assert.equal(result.headers['content-encoding'], 'gzip');
+  assert.deepEqual(gunzipSync(result.body), body);
+  for (const path of ['/', '/api/state', '/assets/personal-deadbeef.js']) {
+    const response = await f.request(path, { cookie, headers: { 'Accept-Encoding': 'gzip' } });
+    assert.equal(response.headers['cache-control'], 'no-store');
+    assert.equal(response.headers['content-encoding'], undefined);
+  }
+  f.revoke();
+  const calls = f.calls;
+  assert.equal((await f.request(path, { cookie })).status, 401);
+  assert.equal(f.calls, calls);
+});
+
 async function fixture(t, options = {}) {
   const upgradedSockets = new Set();
   let upstreamCalls = 0; let ledgerReads = 0; let validSession = true; let revision = 'revision-one'; let time = Date.now();
@@ -97,8 +127,16 @@ async function fixture(t, options = {}) {
     socket.on('error', () => {});
     socket.on('data', frame => { if (frame.length < 6) return; const length = frame[1] & 127; const mask = frame.subarray(2, 6); const data = Buffer.from(frame.subarray(6, 6 + length)); for (let index = 0; index < data.length; index++) data[index] ^= mask[index % 4]; const response = Buffer.from(`echo:${data}`); socket.write(Buffer.concat([Buffer.from([0x81, response.length]), response])); });
   });
-  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
-  const projects = [{ id: 'asset', enabled: true, ...(options.assetLedger ? { adapter: 'asset', autoSync: true, hasCredentials: true } : {}), apiUrl: `http://127.0.0.1:${upstream.address().port}`, url: 'http://127.0.0.1:5678/?view=ledger', authOrigin: '' }, { id: 'monitor', enabled: true, apiUrl: `http://127.0.0.1:${upstream.address().port}`, url: 'http://127.0.0.1:3000/?monitor=oil', authOrigin: '' }];
+  let unregister;
+  if (options.embedded) {
+    const name = `portal-static-${randomBytes(10).toString('hex')}`;
+    const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\${name}` : join(tmpdir(), name + '.sock');
+    await new Promise(resolve => upstream.listen(socketPath, resolve));
+    unregister = registerModuleTransport('asset', { socketPath, secret: 'embedded-static-test-only-secret' });
+    t.after(() => unregister());
+  } else await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const upstreamOrigin = options.embedded ? 'http://asset.workspace.internal' : `http://127.0.0.1:${upstream.address().port}`;
+  const projects = [{ id: 'asset', enabled: true, ...(options.assetLedger ? { adapter: 'asset', autoSync: true, hasCredentials: true } : {}), apiUrl: upstreamOrigin, url: 'http://127.0.0.1:5678/?view=ledger', authOrigin: '' }, { id: 'monitor', enabled: true, apiUrl: upstreamOrigin, url: 'http://127.0.0.1:3000/?monitor=oil', authOrigin: '' }];
   let portal;
   const server = http.createServer(async (req, res) => {
     options.onRequest?.(req, res);

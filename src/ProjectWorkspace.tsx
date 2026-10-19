@@ -14,6 +14,9 @@ export default function ProjectWorkspace({ projects, snapshots, now, activeId, p
   const latest = useRef({ projects, activeId, priorityId, allowPreload });
   latest.current = { projects, activeId, priorityId, allowPreload };
   const revisions = projects.map(projectKey).join('|');
+  const activeProject = projects.find(project => project.id === activeId);
+  const activeKey = activeProject ? projectKey(activeProject) : null;
+  const foregroundLoading = plan.frames.some(frame => frame.phase === 'loading' && frame.key === activeKey);
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
@@ -38,6 +41,6 @@ export default function ProjectWorkspace({ projects, snapshots, now, activeId, p
   return <>{plan.frames.map(frame => {
     const project = projects.find(project => projectKey(project) === frame.key);
     if (!project || (!project.enabled && project.id !== activeId)) return null;
-    return <ProjectPage key={frame.key} project={project} snapshot={snapshots.find(item => item.project.id === project.id)} now={now} active={project.id === activeId} query={project.id === activeId ? query : undefined} onEdit={() => onEdit(project)} onExpired={onExpired} onStatus={phase => onStatus(frame.key, phase)} onChanged={() => onChanged(project.id)} onNavigate={onNavigate} />;
+    return <ProjectPage key={frame.key} project={project} snapshot={snapshots.find(item => item.project.id === project.id)} now={now} active={project.id === activeId} backgroundUpdates={!foregroundLoading} query={project.id === activeId ? query : undefined} onEdit={() => onEdit(project)} onExpired={onExpired} onStatus={phase => onStatus(frame.key, phase)} onChanged={() => onChanged(project.id)} onNavigate={onNavigate} />;
   })}</>;
 }

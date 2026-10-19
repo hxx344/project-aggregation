@@ -13,6 +13,9 @@
   const mode = () => !allowed() ? 'paused' : foreground() ? 'foreground' : 'background';
   let previousMode = mode();
   const post = (message) => { if (embedded) window.parent.postMessage({channel: 'project-hub', version: 1, ...message}, origin); };
+  const announceReady = () => {
+    if (ready && started) post({type: 'ready', role: 'module', capabilities: ['activity', 'changed']});
+  };
   const clear = task => { if (task.timer != null) clearTimeout(task.timer); task.timer = null; };
   function schedule(task) {
     clear(task);
@@ -37,7 +40,9 @@
   const bridge = {
     register(name, period, load) { tasks.set(name, {period, load, generation: 0, running: false, pending: false, timer: null}); },
     start() {
+      if (started) return;
       started = true;
+      announceReady();
       if (allowed()) for (const task of tasks.values()) task.load();
     },
     begin(name) {
@@ -70,7 +75,7 @@
       if (!data || typeof data !== 'object' || Array.isArray(data) || data.channel !== 'project-hub' || data.version !== 1) return;
       if (data.type === 'ready' && data.role === 'host') {
         ready = true;
-        post({type: 'ready', role: 'module', capabilities: ['activity', 'changed']});
+        announceReady();
       } else if (ready && data.type === 'activity' && typeof data.active === 'boolean'
                  && (data.backgroundUpdates === undefined || typeof data.backgroundUpdates === 'boolean')) {
         active = data.active;

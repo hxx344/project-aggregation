@@ -32,6 +32,19 @@ function reader(page, name = 'market', period = 10000) {
   return {reads, run};
 }
 
+test('early host handshake does not report readiness until the main dashboard has registered its reads', () => {
+  const p = page(), r = reader(p);
+  p.ready();
+  assert.ok(p.messages.every(item => item.message.capabilities === undefined));
+  assert.equal(r.reads.length, 0);
+  p.bridge.start();
+  assert.deepEqual([...p.messages.at(-1).message.capabilities], ['activity', 'changed']);
+  p.activity(true, true);
+  assert.equal(r.reads.length, 1);
+  p.bridge.start();
+  assert.equal(r.reads.length, 1, 'Repeated start cannot overlap the initial reads');
+});
+
 test('proxy iframe stays inactive until exact parent/origin handshake and valid activity', () => {
   const p = page(), r = reader(p);
   p.bridge.start();

@@ -4,7 +4,7 @@
 // Optional: open /?load-case=delayed-hydration before running to select one case.
 // The baseline is expected to fail late-ready and delayed-hydration separately.
 async (page) => {
-  const origin = 'http://127.0.0.1:4175';
+  const origin = new URL(page.url()).origin;
   const selectedCase = new URL(page.url()).searchParams.get('load-case');
   const timeoutText = '项目页面加载超时，请重新载入或检查该项目服务。';
   const ids = ['monitor', 'asset', 'crossex', 'greeks', 'aster'];

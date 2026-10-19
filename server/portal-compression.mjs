@@ -1,12 +1,12 @@
 import { acceptsGzip } from './static-response.mjs';
 import { cachePolicy } from './static-cache.mjs';
 
-// Negotiate only public build assets. Never transform HTML, API responses or
+// Negotiate only immutable build code. Never transform HTML, API responses or
 // session-dependent content, and never buffer a proxied response in memory.
-export function prepareAssetCompression(req, incoming, headers) {
+export function prepareAssetCompression(req, incoming, headers, trustedBuildAssets = false) {
   const source = incoming.headers;
   if (!['GET', 'HEAD'].includes(req.method) ||
-      cachePolicy(req.url, source, incoming.statusCode) === 'no-store' ||
+      cachePolicy(req.url, source, incoming.statusCode, trustedBuildAssets) === 'no-store' ||
       req.headers.range || req.headers['if-range'] || source['content-range'] ||
       source['content-encoding'] ||
       /(?:^|,)\s*no-transform\s*(?:,|$)/i.test(source['cache-control'] || '') ||

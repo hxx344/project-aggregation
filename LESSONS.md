@@ -1029,3 +1029,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `56cdb9e84befc97511068c21e36dbefcf0a05166`。父提交 `519d2e8ec31f5e5962d464bc9bcf88425a03e18c` 的 [配对发送](modules/aster/trading/pair_execution.py) 在启用判断之外读取 `pending["id"]`；`56cdb9e` 将原批次校验和 `writer_dispatches` 收进 `writer.enabled`，未启用时用 `nullcontext` 代替 `writer.batch`。
 
 **事件记录：** `aster-unmanaged-dispatch-compat-20261019`；实际发生日期 2026-10-19（Asia/Shanghai）；历史复盘 2026-10-19（Seen 1×）；不推进全历史复盘检查点。
+
+### L065：项目加载优化须核对代理后的传输、缓存与就绪阶段
+
+**适用条件：** 工作台通过独立 iframe 与受鉴权代理打开内置模块，尤其是带宽受限、冷缓存或多个后台页面同时读取的场景。
+
+**根因：** 单独确认工作台入口启用 gzip，不能证明模块资源也已压缩。Greeks 的非哈希静态文件原本不在统一代理的压缩白名单内；Monitor 的 `private, immutable` 构建资源又被代理改成 `no-store`。此外，页面桥接脚本先于主脚本执行时，提前报告 ready 会在关键文件仍下载期间恢复后台读取。
+
+**以后做法：** 沿工作台入口、授权、iframe 文档、静态文件与首批读取检查实际响应。明确选择项目时释放未完成的其他预载，保留已就绪文档；后台读取仅在前台加载期间暂停，并在就绪、失败或切回后恢复既有策略。模块 ready 须有主程序初始化依据。仅允许已注册内置传输的、声明不可变且带内容版本的构建代码保留浏览器私有缓存；HTML、API、Set-Cookie 和任意外部服务仍按原边界处理。非哈希静态代码可单独协商压缩，不能顺带改成长缓存。
+
+**如何验证：** [预载状态回归](tests/workspace-preload.test.mjs) 与 [浏览器优先级回归](tests/project-priority.browser.mjs) 核对取消竞争、文档保留、暂停与恢复；[Greeks 分离脚本回归](tests/greeks-loading.browser.mjs) 使用真实 `hub.js` 延迟主脚本，防止提前恢复。代理的 [真实私有传输回归](tests/portal.test.mjs)、[缓存白名单](tests/static-cache.test.mjs) 和 [Greeks 静态交付](modules/greeks/tests/test_static_delivery.py) 检查正文一致、协商、范围/条件响应以及鉴权不变。传输字节的减少不等于同等比例的耗时改善，网络抖动须单独报告。
+
+**证据：** project-aggregation 基线 `c413a92584ea18c452b278522fcc818bc24665b9` 的 `server/static-cache.mjs`、`modules/greeks/app/main.py`、`modules/greeks/app/static/hub.js` 与 `src/hub-state.ts`。本次新增基线回归分别复现资源缓存被禁用、项目打开时仍保留其他下载，以及 Greeks 未压缩；真实跨子域浏览器夹具使用旧 `hub.js` 时复现提前 ready，换为本次实现后通过。独立审查发现的同一就绪缺口已同批修复。
+
+**事件记录：** `project-opening-transfer-contract-20261019`；实际发生日期 2026-10-19（Asia/Shanghai）；不推进历史复盘检查点。

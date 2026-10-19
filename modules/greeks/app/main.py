@@ -19,6 +19,7 @@ from .cache import SnapshotCache
 from .lease import StateLease
 from .hub import build_summary
 from .security import authorize_dashboard
+from .static_compression import StaticCompressionMiddleware
 from .workspace import update_status
 from .strategy import StrategyUnavailable, SundayExpiryUnavailable
 from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyMode, TradePlanRequest, TradeTaskRequest
@@ -57,6 +58,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="BTC Iron Condor", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+app.add_middleware(StaticCompressionMiddleware)
 
 
 @app.get("/__workspace/update-status", include_in_schema=False)

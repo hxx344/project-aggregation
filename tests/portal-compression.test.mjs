@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { prepareAssetCompression } from '../server/portal-compression.mjs';
 
 const publicHeaders = { 'content-type': 'text/javascript', 'cache-control': 'public, max-age=31536000, immutable', 'content-length': '4096', etag: '"build-one"' };
-function negotiate({ method = 'GET', url = '/_next/static/chunks/page-AbCd1234.js', statusCode = 200, request = {}, source = {}, outgoing = {} } = {}) {
+function negotiate({ method = 'GET', url = '/_next/static/chunks/page-AbCd1234.js', statusCode = 200, request = {}, source = {}, outgoing = {}, trusted = false } = {}) {
   const original = { ...publicHeaders, ...source };
   const headers = { ...original, ...outgoing };
-  const compress = prepareAssetCompression({ method, url, headers: { 'accept-encoding': 'gzip', ...request } }, { headers: original, statusCode }, headers);
+  const compress = prepareAssetCompression({ method, url, headers: { 'accept-encoding': 'gzip', ...request } }, { headers: original, statusCode }, headers, trusted);
   return { compress, headers, original };
 }
 
@@ -30,6 +30,14 @@ test('asset compression negotiates variants without stale size, range or integri
     assert.equal(identity.headers['content-length'], '4096');
     assert.equal(identity.headers.etag, '"build-one"');
   }
+});
+
+test('registered module build code can be compressed without making HTML, API or session content eligible', () => {
+  const source = { 'cache-control': 'private, max-age=31536000, immutable' };
+  assert.equal(negotiate({ source }).compress, false);
+  assert.equal(negotiate({ source, trusted: true }).compress, true);
+  for (const url of ['/', '/api/state', '/assets/unversioned.js']) assert.equal(negotiate({ source, trusted: true, url }).compress, false);
+  assert.equal(negotiate({ source: { ...source, 'set-cookie': 'session=private' }, trusted: true }).compress, false);
 });
 
 test('private content, streams, existing encodings and range/conditional responses pass through', () => {

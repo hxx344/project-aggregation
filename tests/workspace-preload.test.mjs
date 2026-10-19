@@ -20,11 +20,11 @@ test('idle warmup starts one module at a time and retains all five without movin
   state = reconcile(state, null, null, true, [...projects].reverse()); assert.deepEqual(state.frames.map(frame => frame.key), order);
 });
 
-test('explicit selection bypasses a slow preload; intent reorders only work that has not started', () => {
+test('explicit selection cancels a slow preload; hover starts only after the selected document is ready', () => {
   let state = reconcile(emptyWorkspacePlan());
   state = reconcile(state, null, 'asset'); assert.deepEqual(state.frames.map(frame => frame.key), [keys[0]]);
-  state = reconcile(state, 'crossex', 'asset'); assert.deepEqual(state.frames.map(frame => frame.key), [keys[0], keys[2]]);
-  state = reconcile(finish(state, keys[0]), 'crossex', 'asset'); assert.equal(state.frames.length, 2);
+  state = reconcile(state, 'crossex', 'asset'); assert.deepEqual(state.frames.map(frame => frame.key), [keys[2]]);
+  state = reconcile(state, 'crossex', 'asset'); assert.equal(state.frames.length, 1);
   state = reconcile(finish(state, keys[2]), 'crossex', 'asset'); assert.equal(state.frames.at(-1).key, keys[1]);
 });
 
@@ -77,4 +77,25 @@ test('unknown, external and differently configured modules are not opened specul
   for (const project of list) assert.equal(canPreload(project), false);
   assert.deepEqual(reconcile(emptyWorkspacePlan(), null, 'custom', true, list).frames, []);
   assert.equal(reconcile(emptyWorkspacePlan(), 'custom', null, true, list).frames[0].key, 'custom:one');
+});
+
+test('opening a project releases unfinished speculative downloads and leaves no background load competing with it', () => {
+  let state = reconcile(emptyWorkspacePlan());
+  state = reconcile(state, 'aster');
+  assert.deepEqual(state.frames.map(frame => frame.key), [keys[4]]);
+  assert.ok(!state.attempted.includes(keys[0]), 'Cancelled speculation can resume when the overview becomes idle');
+  state = reconcile(finish(state, keys[4]), 'aster');
+  assert.deepEqual(state.frames.map(frame => frame.key), [keys[4]], 'Viewing a project must not automatically download another module');
+  state = reconcile(state, null);
+  assert.equal(state.frames.at(-1).key, keys[0]);
+});
+
+test('ready documents survive foreground priority, and explicit hover can warm the next project after loading completes', () => {
+  let state = finish(reconcile(emptyWorkspacePlan()), keys[0]);
+  state = reconcile(state, 'aster', 'asset');
+  assert.deepEqual(state.frames.map(frame => frame.key), [keys[0], keys[4]]);
+  state = reconcile(finish(state, keys[4]), 'aster', 'asset');
+  assert.deepEqual(state.frames.map(frame => frame.key), [keys[0], keys[4], keys[1]]);
+  state = reconcile(state, 'crossex');
+  assert.deepEqual(state.frames.map(frame => frame.key), [keys[0], keys[4], keys[2]]);
 });

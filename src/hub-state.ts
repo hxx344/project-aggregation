@@ -89,7 +89,17 @@ export function planWorkspace(previous: WorkspacePlan, projects: Project[], acti
   if (activeKey && !frames.some(frame => frame.key === activeKey)) {
     frames.push({ key: activeKey, phase: 'loading' }); attempted.add(activeKey);
   }
-  // Rapid clicks may leave one old load in the background, never an unbounded queue.
+  // Give a newly selected document the connection budget. Retain ready pages,
+  // but cancel unfinished speculation so it cannot compete with its assets.
+  const activeLoading = frames.some(frame => frame.key === activeKey && frame.phase === 'loading');
+  if (activeLoading) {
+    frames = frames.filter(frame => {
+      if (frame.key === activeKey || frame.phase !== 'loading') return true;
+      attempted.delete(frame.key);
+      return false;
+    });
+  }
+  // Outside a foreground load, never retain an unbounded pending queue.
   const pending = frames.filter(frame => frame.key !== activeKey && frame.phase === 'loading');
   const retainedPending = recent.map(key => pending.find(frame => frame.key === key)).find(Boolean) ?? pending[0];
   frames = frames.filter(frame => frame.phase !== 'loading' || frame.key === activeKey || frame === retainedPending);
@@ -98,9 +108,12 @@ export function planWorkspace(previous: WorkspacePlan, projects: Project[], acti
     const oldest = candidates.reduce((a, b) => (recent.indexOf(a.key) < 0 ? Infinity : recent.indexOf(a.key)) >= (recent.indexOf(b.key) < 0 ? Infinity : recent.indexOf(b.key)) ? a : b);
     frames = frames.filter(frame => frame !== oldest);
   }
-  if (allowPreload && frames.length < workspaceCapacity && !frames.some(frame => frame.phase === 'loading')) {
+  // Automatic warming belongs to the overview. While viewing a project, only
+  // explicit hover/focus intent may start another download after it is ready.
+  const intent = projects.find(project => project.id === priorityId && project.id !== activeId && canPreload(project));
+  if (allowPreload && (!activeKey || intent) && frames.length < workspaceCapacity && !frames.some(frame => frame.phase === 'loading')) {
     const candidates = projects.filter(project => canPreload(project) && !attempted.has(projectKey(project)) && !frames.some(frame => frame.key === projectKey(project)));
-    const next = candidates.find(project => project.id === priorityId) ?? candidates[0];
+    const next = candidates.find(project => project.id === priorityId) ?? (!activeKey ? candidates[0] : undefined);
     if (next) { const key = projectKey(next); frames.push({ key, phase: 'loading' }); attempted.add(key); }
   }
   const result = { frames, attempted: [...attempted], recent };

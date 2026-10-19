@@ -9,7 +9,7 @@ import type { FramePhase, NavigationQuery } from './hub-state';
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
 
-export default function ProjectPage({ project, snapshot, now, active, query, onEdit, onExpired, onStatus, onChanged, onNavigate }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
+export default function ProjectPage({ project, snapshot, now, active, backgroundUpdates = true, query, onEdit, onExpired, onStatus, onChanged, onNavigate }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; backgroundUpdates?: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
   const proxied = project.accessMode === 'proxy';
   const embedded = proxied || project.mode === 'embed';
   const accessible = project.enabled && !!(proxied ? project.apiUrl : project.url);
@@ -25,12 +25,15 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
   const connected = useRef(false);
   const acknowledged = useRef(false);
   const sentNavigation = useRef('');
-  const latest = useRef({ active, query, onStatus, onChanged, onNavigate });
-  latest.current = { active, query, onStatus, onChanged, onNavigate };
+  const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate });
+  latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate };
   const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
   function synchronize() {
     if (!connected.current) return;
-    post({ type: 'activity', active: latest.current.active && document.visibilityState === 'visible', backgroundUpdates: true });
+    const visible = latest.current.active && document.visibilityState === 'visible';
+    // Temporarily reserve background reads for the foreground document load;
+    // retain normal low-frequency background updates once that load is ready.
+    post({ type: 'activity', active: visible, backgroundUpdates: latest.current.backgroundUpdates });
     const next = latest.current.query;
     const key = next === undefined ? '' : JSON.stringify(next);
     if (!latest.current.active) { sentNavigation.current = ''; return; }
@@ -62,7 +65,7 @@ export default function ProjectPage({ project, snapshot, now, active, query, onE
     window.addEventListener('message', message); document.addEventListener('visibilitychange', synchronize);
     return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
-  useEffect(synchronize, [active, query, source]);
+  useEffect(synchronize, [active, backgroundUpdates, query, source]);
 
   useEffect(() => {
     const pending = pendingTabs.current;
