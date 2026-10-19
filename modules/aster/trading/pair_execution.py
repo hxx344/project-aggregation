@@ -381,12 +381,12 @@ class PairTrader:
                 trade_work = True
                 self._recover(pair, state, brokers)
                 return state
+            if self.engine.workspace.active:
+                state.update(phase="maintenance", reason="工作台维护中，保留策略配置并暂停新交易")
+                return state
             if margin_result.get("blocks_trading") and not closing_due:
                 state.update(phase="margin_wait", reason=margin_result.get("reason", "保证金划转等待核对"))
                 margin_delay = max(0, margin_result.get("retry_after", 0))
-                return state
-            if self.engine.workspace.active:
-                state.update(phase="maintenance", reason="工作台维护中，保留策略配置并暂停新交易")
                 return state
             if (not holding and margin_pending is None and not margin_invalid
                     and margin_state.get("api_notice")
