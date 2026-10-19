@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
-from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, api_wait_notice, credentials_for
+from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, TransferRejected, api_wait_notice, credentials_for
 from .models import TradingError, dec, decimal_value, positive, wire
 from .pair_planning import PairRecoveryConflict
 
@@ -79,6 +79,20 @@ class TransferAPI(API):
                 self.before_submit()
             except Exception:
                 raise RequestNotSent("划转发送前账户状态已变化，未发送请求") from None
+
+    def _call(self, method, path, params=None, signed=False, weight=1, *, timeout=None):
+        try:
+            return super()._call(method, path, params, signed, weight, timeout=timeout)
+        except ExchangeError as exc:
+            # Match the balancer's existing documented rejection policy only
+            # for this fixed transfer endpoint. Timeouts/gateway uncertainty
+            # and every other signed mutation keep their unknown semantics.
+            if (method == "POST" and path == "/fapi/v3/subAccountTransfer" and signed
+                    and not isinstance(exc, (AmbiguousOrder, RequestNotSent))
+                    and type(exc.code) is int and exc.code in REJECTION_CODES):
+                raise TransferRejected("交易所明确拒绝保证金划转", code=exc.code,
+                    retry_after=exc.retry_after, http_status=exc.http_status) from None
+            raise
 
     def signed_parameters(self, params):
         if not self.credentials or any(key in params for key in ("user", "signer", "nonce", "signature")):
@@ -502,7 +516,7 @@ class MarginBalancer:
             return MarginBalancer._view({}, config, "blocked", "保证金划转日志无效，停止新开仓和新划转；请人工核对服务器日志与交易所划转记录", blocks=True)
         view = lambda status, reason, **kwargs: MarginBalancer._view(journal, config, status, reason, **kwargs)
         if MarginBalancer.unsettled_rejection(journal):
-            return view("blocked", "划转未发送证据已保存，等待恢复共享结算；完成前保留原配对配置和账户绑定", blocks=True)
+            return view("blocked", "划转拒绝回执已保存，等待恢复共享结算；完成前保留原配对配置和账户绑定", blocks=True)
         pending = journal.get("pending")
         if pending is not None:
             if not isinstance(pending, dict) or pending.get("status") not in {"submitting", "unknown", "accepted", "acknowledged"}:
@@ -788,7 +802,7 @@ class MarginBalancer:
             last = state.get("last_transfer")
             rejection = last.get("writer_rejection") if isinstance(last, dict) else None
             if not state.get("pending") and isinstance(rejection, dict) and rejection.get("settled") is not True:
-                # Only this version's durable no-send proof may settle the exact
+            # Only this version's durable rejection proof may settle the exact
                 # shared operation. Old unknown/skipped records are not proof.
                 writer_for(self.engine).settle_transfer(pair, last)
                 self.store.put("pair_margin:" + pair["id"], state)
@@ -1093,14 +1107,24 @@ class MarginBalancer:
             writer = writer_for(self.engine)
             writer.bind_api(transfer, "master:" + config["master_env_prefix"])
             receipt_write_failed = False
+            rejection_code = None
+            rejection_error = None
             def persist_rejection(operation, outcome, sent):
                 nonlocal receipt_write_failed
-                if outcome != "rejected" or sent:
+                if outcome != "rejected":
                     return
+                if sent and rejection_code not in REJECTION_CODES:
+                    raise TradingError("划转拒绝缺少可验证的交易所回执，保留共享未决")
                 done = {**pending, "status": "rejected", "writer_rejection": {
                     "schema_version": 1, "operation_id": operation["operationId"], "body_hash": operation["bodyHash"],
-                    "request_sent": False, "settled": False}}
+                    "request_sent": sent, "settled": False}}
+                if sent:
+                    done["writer_rejection"]["exchange_code"] = rejection_code
+                    done["exchange_rejection_code"] = rejection_code
                 updated = {**state, "pending": None, "last_transfer": done, "retry_without_blocking": True}
+                # This commit is also the recovery boundary for a known rate
+                # limit. A process exit before shared finish must not shorten it.
+                self._apply_api_wait(updated, rejection_error)
                 # A crash after this commit can reject the original shared
                 # operation by its exact body hash, never by a new balance.
                 receipt_write_failed = True
@@ -1112,7 +1136,12 @@ class MarginBalancer:
                 params = {"toAccountAddress": children[plan["destination"]]["user"], "asset": "USD1", "amount": plan["amount"],
                     "kindType": "FUTURE_FUTURE", "fromAccountAddress": children[plan["source"]]["user"]}
                 with writer.accounts([member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]), writer.batch("aster:transfer:" + pending["request_id"], params, before_finish=persist_rejection):
-                    response = transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
+                    try:
+                        response = transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
+                    except (TransferRejected, RequestNotSent) as exc:
+                        rejection_error = exc
+                        rejection_code = exc.code if isinstance(exc, TransferRejected) else None
+                        raise
                     if (not isinstance(response, dict) or type(response.get("code")) not in (int, str)
                             or response.get("code") not in (0, 200, "0", "200")
                             or not isinstance(response.get("msg"), str) or response["msg"].strip().lower() != "success"):
@@ -1136,6 +1165,8 @@ class MarginBalancer:
                 if pending.get("status") != "acknowledged":
                     rejected = isinstance(exc, RequestNotSent) or (isinstance(exc, ExchangeError)
                         and not isinstance(exc, AmbiguousOrder) and exc.code in REJECTION_CODES)
+                    if isinstance(exc, TransferRejected) and writer.enabled and not pending.get("writer_rejection"):
+                        rejected = False  # Never release a partially rejected batch.
                     rejected |= pending.get("status") == "rejected" and isinstance(pending.get("writer_rejection"), dict)
                     pending["status"] = "rejected" if rejected else "unknown"
                     if rejected:
@@ -1148,8 +1179,10 @@ class MarginBalancer:
                             detail = ("账户仍有旧未决写入，须核对原请求；读取新余额不会解除该保护"
                                 if code in {"ACCOUNT_UNRESOLVED", "OPERATION_UNRESOLVED"} else "发送前的本地校验未通过")
                             state["blocked_reason"] = f"划转未发送（{code}）：{detail}"
+                        elif isinstance(exc, TransferRejected):
+                            state["blocked_reason"] = f"交易所明确拒绝本次保证金划转（{exc.code}），本次未划转；冷却后重新评估"
                         elif pending.get("writer_rejection"):
-                            state["blocked_reason"] = "划转已持久记录为未发送，共享结算等待恢复；不重发原请求"
+                            state["blocked_reason"] = "划转拒绝回执已持久保存，共享结算等待恢复；不重发原请求"
                         if pending.get("writer_rejection"):
                             writer.settle_transfer(pair, pending)
                         state["last_transfer"] = dict(pending)

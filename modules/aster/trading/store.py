@@ -509,7 +509,7 @@ class Store:
             from .margin_balance import MarginBalancer
             margin_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_margin:" + pair["id"],)).fetchone()
             if MarginBalancer.unsettled_rejection(json.loads(margin_row[0]) if margin_row else {}):
-                raise TradingError("划转未发送证据尚未完成共享结算，不能更换原主账户配置")
+                raise TradingError("划转拒绝回执尚未完成共享结算，不能更换原主账户配置")
         if previous and previous["symbol"] != pair["symbol"] and not allow_symbol_change:
             raise TradingError("交易标的只能通过暂停后的空仓核验切换")
         members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]

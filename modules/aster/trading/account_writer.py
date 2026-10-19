@@ -304,22 +304,27 @@ class ManagedWriter:
             operation = self.registry.prepare(ticket, operation_id, payload)
         except Exception as exc:
             raise _not_sent("账户有未决交易或不具备整体写入权，未发送请求", exc) from exc
-        state = {"operation": operation, "unknown": False, "sent": False, "lock": threading.Lock()}
+        state = {"operation": operation, "unknown": False, "sent": False, "dispatches": 0, "rejections": 0, "lock": threading.Lock()}
         token = self.active_batch.set(state)
         try:
             yield
         except BaseException as exc:
-            from .exchange import RequestNotSent
+            from .exchange import RequestNotSent, TransferRejected
             with state["lock"]:
                 # A veto before the final send hook is a proven local no-send.
                 # Another leg may already have dispatched, so never apply that
                 # evidence to a partially sent batch or an earlier unknown.
-                state["unknown"] |= not (isinstance(exc, RequestNotSent) and not state["sent"])
+                not_sent = isinstance(exc, RequestNotSent) and not state["sent"]
+                rejected_transfer = (isinstance(exc, TransferRejected) and operation_id.startswith("aster:transfer:")
+                    and state["dispatches"] == state["rejections"] == 1)
+                state["unknown"] |= not (not_sent or rejected_transfer)
             raise
         finally:
             self.active_batch.reset(token)
             self.registry.assert_owned(operation, budget_ms=0)
-            outcome = "unknown" if state["unknown"] else "confirmed" if state["sent"] else "rejected"
+            all_rejected = operation_id.startswith("aster:transfer:") and state["dispatches"] == state["rejections"] == 1
+            mixed_rejection = state["rejections"] > 0 and not all_rejected
+            outcome = "unknown" if state["unknown"] or mixed_rejection else "confirmed" if state["sent"] and not all_rejected else "rejected"
             if before_finish is not None:
                 before_finish(operation, outcome, state["sent"])
             self.registry.finish(operation, outcome)
@@ -397,6 +402,8 @@ class ManagedWriter:
             if "batch" in prepared:
                 with prepared["batch"]["lock"]:
                     prepared["batch"]["sent"] = True
+                    prepared["batch"]["dispatches"] += 1
+                    prepared["dispatched"] = True
 
     def finish(self, prepared, outcome):
         if prepared is None:
@@ -405,6 +412,8 @@ class ManagedWriter:
         if "batch" in prepared:
             with prepared["batch"]["lock"]:
                 prepared["batch"]["unknown"] |= outcome == "unknown"
+                if outcome == "rejected" and prepared.get("dispatched") and type(prepared.get("transfer_rejection_code")) is int:
+                    prepared["batch"]["rejections"] += 1
             return
         self.registry.finish(prepared["ticket"], outcome)
 
@@ -666,14 +675,19 @@ class ManagedWriter:
         acknowledged = pending.get("acknowledged_at")
         if rejected:
             evidence = pending["writer_rejection"]
+            from .margin_balance import REJECTION_CODES
+            required = {"schema_version", "operation_id", "body_hash", "request_sent", "settled"}
+            if evidence.get("request_sent") is True:
+                required.add("exchange_code")
             if (not MarginBalancer._valid_pending({**pending, "status": "unknown"})
-                    or set(evidence) != {"schema_version", "operation_id", "body_hash", "request_sent", "settled"}
+                    or set(evidence) != required
                     or type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1
-                    or evidence["request_sent"] is not False or type(evidence["settled"]) is not bool
+                    or type(evidence["request_sent"]) is not bool or type(evidence["settled"]) is not bool
+                    or evidence["request_sent"] and (type(evidence.get("exchange_code")) is not int or evidence["exchange_code"] not in REJECTION_CODES)
                     or evidence["operation_id"] != "aster:transfer:" + pending["request_id"]
                     or not isinstance(evidence["body_hash"], str) or len(evidence["body_hash"]) != 64
                     or any(char not in "0123456789abcdef" for char in evidence["body_hash"])):
-                raise TradingError("持久划转未发送证据与原请求不一致")
+                raise TradingError("持久划转拒绝证据与原请求不一致")
         elif (not MarginBalancer._valid_pending(pending) or type(acknowledged) not in (int, float)
                 or not math.isfinite(acknowledged) or acknowledged < pending["created_at"]):
             raise TradingError("持久划转成功回执缺少有效的原请求或确认时间")
@@ -687,7 +701,7 @@ class ManagedWriter:
                     if row["operationId"] != evidence["operation_id"]:
                         continue
                     if row["bodyHash"] != evidence["body_hash"]:
-                        raise TradingError("共享划转记录与持久未发送证据不一致")
+                        raise TradingError("共享划转记录与持久拒绝证据不一致")
                     self.registry.resolve(row["operationId"], ticket, outcome="rejected")
                 evidence["settled"] = True
             else:

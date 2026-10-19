@@ -57,6 +57,10 @@ class RequestNotSent(ExchangeError):
     """A local admission check failed before any HTTP request was sent."""
 
 
+class TransferRejected(ExchangeError):
+    """A documented transfer rejection; the request was sent but not accepted."""
+
+
 class SnapshotSuperseded(TradingError):
     """An account event or write invalidated a read-only preparation."""
 
@@ -408,7 +412,13 @@ class API:
                     writer.validate_response(path, params or {}, result)
             except BaseException as exc:
                 if writer is not None:
-                    writer.finish(prepared, "rejected" if isinstance(exc, RequestNotSent) else "unknown")
+                    transfer_rejected = False
+                    if isinstance(exc, TransferRejected):
+                        from .margin_balance import REJECTION_CODES
+                        transfer_rejected = method == "POST" and path == "/fapi/v3/subAccountTransfer" and type(exc.code) is int and exc.code in REJECTION_CODES
+                    if transfer_rejected and prepared is not None:
+                        prepared["transfer_rejection_code"] = exc.code
+                    writer.finish(prepared, "rejected" if isinstance(exc, RequestNotSent) or transfer_rejected else "unknown")
                 raise
             if writer is not None:
                 writer.finish(prepared, "confirmed")

@@ -283,7 +283,7 @@ class PairManager:
             raise TradingError("配对组仍在核对订单或减回本轮循环持仓，暂不能启动、修改设置、核对空仓或删除；请查看配对组当前执行状态")
         from .margin_balance import MarginBalancer
         if MarginBalancer.unsettled_rejection(margin):
-            raise TradingError("划转未发送证据尚未完成共享结算，暂不能修改原配置或删除配对；请等待只读恢复")
+            raise TradingError("划转拒绝回执尚未完成共享结算，暂不能修改原配置或删除配对；请等待只读恢复")
         can_resume = resume_unknown and MarginBalancer.resume_ready(margin)
         if not can_resume and (margin.get("pending") is not None or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown")):
             raise TradingError("保证金划转结果尚未核实，暂不能启动、修改设置、核对空仓或删除；请查看保证金平衡中的核对状态")

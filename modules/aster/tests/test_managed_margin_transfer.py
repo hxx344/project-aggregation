@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -16,7 +17,7 @@ import httpx
 
 from tests.helpers import account
 from trading.account_writer import ManagedWriter
-from trading.exchange import API, LiveBroker, RateBudget, RequestNotSent
+from trading.exchange import API, LiveBroker, RateBudget, RequestNotSent, TransferRejected
 from trading.margin_balance import MarginBalancer, TransferAPI
 from trading.models import TradingError
 from trading.pairing import PairManager, validate_pair
@@ -56,6 +57,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
             "cycle": {"enabled": False}, "margin": {"enabled": True, "master_env_prefix": "ASTER_MASTER"}}), create=True)
         self.requests = []
         self.fail_dispatch = False
+        self.reject_code = None
         self.api_instances = []
         self.balances = {"long": "3000", "short": "1000", "master": "0"}
         self.engine = SimpleNamespace(store=self.store, market=DemoMarket(), brokers={},
@@ -101,6 +103,8 @@ class ManagedMarginTransferTests(unittest.TestCase):
             if request.method == "POST" and request.url.path.endswith("/subAccountTransfer"):
                 if self.fail_dispatch:
                     raise httpx.ReadTimeout("injected after dispatch", request=request)
+                if self.reject_code is not None:
+                    return httpx.Response(400, json={"code": self.reject_code, "msg": "injected exchange rejection"})
                 params = dict(parse_qsl(request.content.decode()))
                 self.assertEqual(params["amount"], "1000.00000000")
                 self.balances.update(long="2000", short="2000")
@@ -479,6 +483,150 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertIs(self.state()["last_transfer"]["writer_rejection"]["settled"], True)
         self.assertEqual(self.shared_operations(), [{"operation_id": evidence["operation_id"],
             "body_hash": evidence["body_hash"], "state": "rejected"}])
+
+    def test_explicit_exchange_rejection_releases_shared_transfer_and_allows_one_new_request(self):
+        self.reject_code = -2019
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "rejected", result)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertIsNone(self.state().get("pending"))
+        self.assertIn("-2019", result["reason"])
+        self.assertIn("-2019", result["error"])
+        operation_id = "aster:transfer:" + self.state()["last_transfer"]["request_id"]
+        self.assertEqual({row["operation_id"]: row["state"] for row in self.shared_operations()},
+                         {operation_id: "rejected"})
+        self.reject_code = None
+        state = self.state()
+        state.update(next_check_at=0, cooldown_until=0)
+        self.store.put("pair_margin:gold", state)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "acknowledged", result)
+        self.assertEqual(len(self.posts()), 2)
+        self.assertIsNone(self.state().get("pending"))
+        self.assertEqual(self.unresolved(), [])
+
+    def test_unknown_execution_code_remains_unknown_without_an_automatic_retry(self):
+        self.reject_code = -1007
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "unknown", result)
+        self.assertEqual(len(self.posts()), 1)
+        pending = self.state()["pending"]
+        self.assertEqual(pending["status"], "unknown")
+        operation_id = "aster:transfer:" + pending["request_id"]
+        self.assertEqual({row["operation_id"]: row["state"] for row in self.shared_operations()},
+                         {operation_id: "unknown"})
+        self.reject_code = None
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "unknown", result)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_restart_settles_durable_remote_rejection_by_original_body_without_another_post(self):
+        self.reject_code = -2019
+        with patch.object(self.writer.registry, "finish", side_effect=RuntimeError("shared finish unavailable")), \
+                patch.object(self.writer, "settle_transfer", side_effect=RuntimeError("shared settlement unavailable")):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(len(self.posts()), 1, result)
+        state = self.state()
+        self.assertIsNone(state.get("pending"))
+        last = state["last_transfer"]
+        self.assertEqual(last["status"], "rejected")
+        self.assertEqual(last["exchange_rejection_code"], -2019)
+        evidence = last["writer_rejection"]
+        self.assertEqual(set(evidence), {"schema_version", "operation_id", "body_hash", "request_sent", "settled", "exchange_code"})
+        self.assertEqual(evidence["schema_version"], 1)
+        self.assertIs(evidence["request_sent"], True)
+        self.assertIs(evidence["settled"], False)
+        self.assertIs(type(evidence["exchange_code"]), int)
+        self.assertEqual(evidence["exchange_code"], -2019)
+        self.assertEqual(evidence["operation_id"], "aster:transfer:" + last["request_id"])
+        self.assertEqual(self.shared_operations(), [{"operation_id": evidence["operation_id"],
+            "body_hash": evidence["body_hash"], "state": "sending"}])
+        self.reject_code = None
+        writer = self.restart_writer()
+        self.assertTrue(writer.ready, writer.error)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.shared_operations(), [{"operation_id": evidence["operation_id"],
+            "body_hash": evidence["body_hash"], "state": "rejected"}])
+        self.assertIs(self.state()["last_transfer"]["writer_rejection"]["settled"], True)
+        self.assertEqual(self.unresolved(), [])
+
+    def test_success_then_explicit_remote_rejection_does_not_reject_the_whole_batch(self):
+        transfer = self.transfer_api(self.credentials["master"])
+        self.writer.bind_api(transfer, "master:ASTER_MASTER")
+        params = {"fromAccountAddress": self.credentials["long"]["user"],
+            "toAccountAddress": self.credentials["short"]["user"], "asset": "USD1",
+            "amount": "1000.00000000", "kindType": "FUTURE_FUTURE"}
+        with self.writer.accounts(["long", "short", "master:ASTER_MASTER"]):
+            with self.assertRaises(TransferRejected) as rejected:
+                with self.writer.batch("aster:transfer:success-before-rejection", params):
+                    transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
+                    self.reject_code = -2019
+                    transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
+        self.assertEqual(rejected.exception.code, -2019)
+        self.assertEqual(len(self.posts()), 2)
+        self.assertEqual([(row["operationId"], row["state"]) for row in self.unresolved()],
+                         [("aster:transfer:success-before-rejection", "unknown")])
+
+
+    def test_rate_limit_deadline_survives_exit_after_proof_commit_and_new_process_budgets(self):
+        created = time.time()
+        self.reject_code = -1003
+        with patch("time.time", return_value=created), \
+                patch.object(self.writer.registry, "finish", side_effect=SystemExit("exit after durable rejection")):
+            with self.assertRaises(SystemExit):
+                self.balancer.tick(self.pair, self.snapshots())
+        state = self.state()
+        self.assertIsNone(state.get("pending"))
+        last = state["last_transfer"]
+        self.assertEqual(last["status"], "rejected")
+        self.assertEqual(last["created_at"], created)
+        self.assertIsInstance(state.get("api_notice"), dict)
+        self.assertGreaterEqual(state["next_check_at"], created + 180)
+        evidence = last["writer_rejection"]
+        self.assertEqual(evidence["exchange_code"], -1003)
+        self.assertIs(evidence["request_sent"], True)
+        self.assertIs(evidence["settled"], False)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.shared_operations(), [{"operation_id": evidence["operation_id"],
+            "body_hash": evidence["body_hash"], "state": "sending"}])
+
+        self.reject_code = None
+        with patch("time.time", return_value=created + 31):
+            # New process budgets have no in-memory cooldown; the journal alone
+            # must retain the exchange's full 180-second retry deadline.
+            old_budgets = [broker.api.budget for broker in self.engine.brokers.values()]
+            for broker in self.engine.brokers.values():
+                broker.api.budget = RateBudget()
+                self.assertNotIn(broker.api.budget, old_budgets)
+                broker.api.budget.require_available(5)
+            writer = self.restart_writer()
+            self.assertTrue(writer.ready, writer.error)
+            self.balancer = MarginBalancer(self.engine)
+            for broker in self.engine.brokers.values():
+                broker.api.budget.require_available(5)
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "waiting", result)
+        self.assertEqual(len(self.posts()), 1, result)
+        self.assertGreaterEqual(self.state()["next_check_at"], created + 180)
+        self.assertEqual(self.shared_operations(), [{"operation_id": evidence["operation_id"],
+            "body_hash": evidence["body_hash"], "state": "rejected"}])
+
+    def test_caught_remote_rejection_after_success_keeps_a_normally_exited_batch_unknown(self):
+        transfer = self.transfer_api(self.credentials["master"])
+        self.writer.bind_api(transfer, "master:ASTER_MASTER")
+        params = {"fromAccountAddress": self.credentials["long"]["user"],
+            "toAccountAddress": self.credentials["short"]["user"], "asset": "USD1",
+            "amount": "1000.00000000", "kindType": "FUTURE_FUTURE"}
+        with self.writer.accounts(["long", "short", "master:ASTER_MASTER"]):
+            with self.writer.batch("aster:transfer:caught-rejection-after-success", params):
+                transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
+                self.reject_code = -2019
+                with self.assertRaises(TransferRejected) as rejected:
+                    transfer.call("POST", "/fapi/v3/subAccountTransfer", params, signed=True, weight=5)
+                self.assertEqual(rejected.exception.code, -2019)
+        self.assertEqual(len(self.posts()), 2)
+        self.assertEqual([(row["operationId"], row["state"]) for row in self.unresolved()],
+                         [("aster:transfer:caught-rejection-after-success", "unknown")])
 
 
 if __name__ == "__main__":
