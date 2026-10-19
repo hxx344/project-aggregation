@@ -14,6 +14,8 @@
 
 2026-10-18 日复盘覆盖昨日日复盘合入 `58517771`（此前检查点到 `7642f4e9`）之后、直到主线 `1791a5e` 的 11 个非 merge 提交（2026-10-17 UTC 约业务时段至 2026-10-18 Asia/Shanghai；合入 PR 仅 #9 昨日 docs，本窗口业务 PR 合入 0）。范围包括 Aster ADL 配额等待与未发送计数修正、资本效率 ROC 指标、CrossEx 部分导入精确腿与开仓容量计价币、合并前审查标准/门禁/真实 Git 与发布路径及钩子执行位、源码安装纳入根 prepare 指纹、ADL/保证金冗余读取削减，以及工作台架构实现方案文档。L059–L060 已随窗口内开发提交写入主线；本轮对照差异后新增 L061（账户配置与只读预检的有界复用），其余主题落在既有条目补充（L027 容量币种、导入身份后续、L055 生命周期输入、ADL 路径配额）。各新条目仍只有一个已核实日期，未达到 [升级条件](docs/code-standards.md#升级规则)，仍留在本文件。全历史复盘尚未完成，完成检查点保持未建立。
 
+2026-10-19 日复盘覆盖昨日日复盘合入 `3adba3c`（此前检查点到 `1791a5e`）之后、直到主线 `a0d9b64` 的 11 个非 merge 提交（2026-10-19 Asia/Shanghai；本窗口业务 PR 合入 0，这些提交直接进入 main）。范围包括 M0 平台能力与采样基线（`c76b196`，约 536 行）、M1 各模块共享账户写入保护（`519d2e8`，约 5328 行，标为大改动，全文深度仍待人工审查）、Aster 未托管配对发送兼容（`56cdb9e`）、M2 加密冷备份与隔离恢复（`8a3bfaca`，约 4191 行，标为大改动，全文深度仍待人工审查），以及随后的测试夹具对齐（`3139c59`、`64eccb9`、`0652077`、`809b3e7`）、Greeks 缺状态隔离（`6faa176`）和文档（`4c9ac1b`、`a0d9b64`）。L062–L063 已随窗口内开发提交写入主线；Greeks 缺失 `engine_state.json` 的缺证规则已在 L063 同轮整包补充，不另建条目。L062 记录托管路径按真实原操作恢复；本轮对照 `56cdb9e` 后新增 L064，记录只有托管发送才要求持久原批次与发送分组，未托管路径保持原契约。各新条目仍只有一个已核实日期，未达到 [升级条件](docs/code-standards.md#升级规则)，`docs/code-standards.md` 仍无已升级规范，这些条目仍留在本文件。全历史复盘尚未完成，完成检查点保持未建立。
+
 每条历史线索保留稳定 ID、原复盘日期和全部原有证据。实际发生日期、独立事件边界未完成核实时，不计入规范升级；后续核实时沿用 ID 或明确关联正式事件，避免重复统计。外仓证据标注“未核验”，不将其实现或测试描述为本仓已有能力。
 
 ## Correctness at the boundary
@@ -1003,3 +1005,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **事件记录：** `cold-recovery-authority-boundary-20261019`；本次恢复集成审查归为一个事件，不推进历史复盘检查点。
 
 **同轮整包补充：** 真实五模块 CI 在根行为测试无失败后发现，从未创建任务的 Greeks 不落 `engine_state.json`。备份本来没有该固定文件时，允许恢复到 quarantine 并保留缺证，不合成空日志；handoff/admit 仍拒绝。已列入 manifest 的材料丢失、现有 JSON 或 schema 损坏继续拒绝。验证使用实际发布包演练和 [缺证/丢密文回归](tests/recovery-backup.test.mjs)，不能为了让新安装夹具通过而将所有缺文件都解释为新库。
+
+### L064：托管发送才要求持久原批次，未托管路径保持原契约
+
+**适用条件：** 同一发送入口同时服务已启用的共享账户写入器与尚未启用的旧路径，例如 Aster 配对 [发送](modules/aster/trading/pair_execution.py) `_dispatch`。
+
+**根因：** `519d2e8` 在 `writer.enabled` 为假时仍拼接 `pending["id"]`、写入 `writer_dispatches`，并进入 `writer.batch`。未托管 ADL 与配对发送的 pending 可以没有持久原批次编号，读取发生在 HTTP 之前。`56cdb9e` 的提交说明记录，`519d2e8` 的 Linux CI 在 ASTER 第二组 217 项中有 1 个 KeyError。
+
+**以后做法：** 账户写入器启用时，HTTP 前要求非空字符串形式的持久原批次标识，并把本次 `operationId` 与有序 `clientOrderIds` 写入发送分组；缺少原批次时，在准备共享操作和发送 HTTP 之前失败，且不留下 `writer_dispatches`。写入器未启用时保持原发送契约：不读取原批次编号、不写发送分组、不用共享 batch 上下文。启用判断之前，托管约束不能进入未托管路径。
+
+**如何验证：** [账户写入测试](modules/aster/tests/test_account_writer.py) `test_managed_dispatch_without_original_batch_id_still_rejects_before_transport` 覆盖托管缺原批次时零 HTTP、共享未决为空且不写分组。[预算路径](modules/aster/tests/test_pair_budget.py) `test_opening_cannot_spend_recovery_reserve` 与 [ADL 集成](modules/aster/tests/test_adl_integration.py) `test_each_prepared_leg_rechecks_adl_before_transport` 使用没有 `pending.id` 的未托管发送，应仍按原契约结束。本次日复盘未重跑这些测试。`56cdb9e` 的提交说明记录当时 Windows 上 `tests.test_adl_integration`、`tests.test_account_writer`、`tests.test_pair_submit_evidence` 为 51/51；该记录属于该提交，不是本轮复盘的执行结果。
+
+**证据：** project-aggregation `56cdb9e84befc97511068c21e36dbefcf0a05166`。父提交 `519d2e8ec31f5e5962d464bc9bcf88425a03e18c` 的 [配对发送](modules/aster/trading/pair_execution.py) 在启用判断之外读取 `pending["id"]`；`56cdb9e` 将原批次校验和 `writer_dispatches` 收进 `writer.enabled`，未启用时用 `nullcontext` 代替 `writer.batch`。
+
+**事件记录：** `aster-unmanaged-dispatch-compat-20261019`；实际发生日期 2026-10-19（Asia/Shanghai）；历史复盘 2026-10-19（Seen 1×）；不推进全历史复盘检查点。
