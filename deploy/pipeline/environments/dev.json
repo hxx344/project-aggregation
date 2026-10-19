@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "id": "dev",
+  "extends": "base",
+  "description": "本机开发：安装依赖、渲染配置、类型检查与前端构建；不打包、不发布、不切换服务。",
+  "toolchain": {
+    "node": ">=22.12.0",
+    "pnpm": ">=11.0.0",
+    "strict": false
+  },
+  "guards": {
+    "requireClean": false,
+    "allowDirtyOverride": true
+  },
+  "triggers": {
+    "local": {
+      "guards": {
+        "requireClean": false
+      }
+    },
+    "manual": {
+      "guards": {
+        "requireClean": false
+      }
+    }
+  },
+  "config": [
+    {
+      "name": "NODE_ENV",
+      "default": "development"
+    },
+    {
+      "name": "DATA_DIR",
+      "default": ".data-dev"
+    },
+    {
+      "name": "PUBLIC_ORIGIN",
+      "default": "http://127.0.0.1:3100"
+    },
+    {
+      "name": "COOKIE_SECURE",
+      "default": false
+    },
+    {
+      "name": "LOG_LEVEL",
+      "default": "debug"
+    },
+    {
+      "name": "INITIAL_PASSWORD",
+      "required": false,
+      "minLength": 8,
+      "description": "本机可不设置；设置后用于工作台登录"
+    },
+    {
+      "name": "WARMUP_ENABLED",
+      "default": false
+    }
+  ],
+  "stages": {
+    "verify": {
+      "commands": [
+        { "cmd": "pnpm", "args": ["run", "check"], "timeoutMs": 600000 }
+      ]
+    },
+    "package": {
+      "enabled": false
+    },
+    "publish": {
+      "enabled": false
+    },
+    "activate": {
+      "enabled": false
+    }
+  }
+}

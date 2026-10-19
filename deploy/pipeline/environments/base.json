@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "id": "base",
+  "description": "开发、测试、生产共享的阶段骨架与配置声明；由各环境覆盖差异部分。",
+  "toolchain": {
+    "node": ">=24.15.0",
+    "pnpm": "11.25.0",
+    "strict": true
+  },
+  "guards": {
+    "requireClean": true,
+    "allowDirtyOverride": false
+  },
+  "triggers": {},
+  "config": [
+    {
+      "name": "NODE_ENV",
+      "type": "enum",
+      "values": ["development", "test", "production"],
+      "required": true
+    },
+    {
+      "name": "HOST",
+      "type": "string",
+      "required": true,
+      "default": "127.0.0.1",
+      "pattern": "^[0-9a-zA-Z.:\\-]+$",
+      "description": "服务监听地址，默认只监听本机，由 SSH 隧道或反向代理对外"
+    },
+    {
+      "name": "PORT",
+      "type": "port",
+      "required": true,
+      "default": 3100
+    },
+    {
+      "name": "DATA_DIR",
+      "type": "path",
+      "required": true,
+      "description": "运行数据目录，包含交易数据、模块状态与凭据文件"
+    },
+    {
+      "name": "LOG_LEVEL",
+      "type": "enum",
+      "values": ["debug", "info", "warn", "error"],
+      "required": true,
+      "default": "info"
+    },
+    {
+      "name": "PUBLIC_ORIGIN",
+      "type": "url",
+      "required": true,
+      "description": "对外访问地址，用于 Cookie 与跨域判断"
+    },
+    {
+      "name": "COOKIE_SECURE",
+      "type": "boolean",
+      "required": true,
+      "default": true
+    },
+    {
+      "name": "INITIAL_PASSWORD",
+      "type": "string",
+      "secret": true,
+      "required": true,
+      "minLength": 12,
+      "description": "首次登录口令；只在环境变量或 .env.<env> 中提供"
+    },
+    {
+      "name": "WARMUP_ENABLED",
+      "type": "boolean",
+      "required": false,
+      "default": false
+    },
+    {
+      "name": "WARMUP_INTERVAL_MS",
+      "type": "integer",
+      "required": false,
+      "default": 60000,
+      "min": 1000
+    }
+  ],
+  "stages": {
+    "preflight": {
+      "enabled": true,
+      "inputs": ["package.json", "pnpm-lock.yaml", "deploy/pipeline"]
+    },
+    "deps": {
+      "enabled": true,
+      "frozen": true,
+      "commands": [
+        { "cmd": "pnpm", "args": ["install", "--frozen-lockfile"], "timeoutMs": 900000 }
+      ],
+      "inputs": ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
+      "outputs": ["node_modules/.modules.yaml"]
+    },
+    "config": {
+      "enabled": true,
+      "target": ".pipeline/runtime/{env}.env",
+      "inputs": ["deploy/pipeline/environments"],
+      "outputs": [".pipeline/runtime/{env}.env"]
+    },
+    "build": {
+      "enabled": true,
+      "commands": [
+        { "cmd": "pnpm", "args": ["run", "build"], "timeoutMs": 900000 }
+      ],
+      "inputs": ["src", "index.html", "vite.config.ts", "tsconfig.json", "package.json", "public"],
+      "outputs": ["dist/index.html"]
+    },
+    "verify": {
+      "enabled": true,
+      "commands": [
+        { "cmd": "pnpm", "args": ["run", "check"], "timeoutMs": 600000 }
+      ],
+      "inputs": ["src", "server", "tests", "tsconfig.json"]
+    },
+    "package": {
+      "enabled": false,
+      "commands": [],
+      "outputs": []
+    },
+    "publish": {
+      "enabled": false,
+      "commands": []
+    },
+    "activate": {
+      "enabled": false,
+      "commands": [],
+      "healthUrl": ""
+    }
+  }
+}

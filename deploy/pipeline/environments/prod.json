@@ -1,0 +1,103 @@
+{
+  "schema": 1,
+  "id": "prod",
+  "extends": "test",
+  "description": "生产发布：只接受 main 上的正式标签或显式确认；打包、发布到 GitHub Release，服务切换需 --apply。",
+  "toolchain": {
+    "node": "24.15.0",
+    "pnpm": "11.25.0",
+    "strict": true
+  },
+  "guards": {
+    "requireClean": true,
+    "allowDirtyOverride": false,
+    "requireConfirmation": false
+  },
+  "triggers": {
+    "release": {
+      "guards": {
+        "branch": "main",
+        "requireClean": true,
+        "tagPattern": "deploy-*"
+      }
+    },
+    "manual": {
+      "guards": {
+        "branch": "main",
+        "requireClean": true,
+        "requireConfirmation": true
+      }
+    }
+  },
+  "config": [
+    {
+      "name": "NODE_ENV",
+      "default": "production"
+    },
+    {
+      "name": "DATA_DIR",
+      "default": "/var/lib/project-aggregation",
+      "absolute": true
+    },
+    {
+      "name": "PUBLIC_ORIGIN",
+      "required": true,
+      "default": null,
+      "description": "生产对外地址，必须由部署环境显式提供，不设默认值"
+    },
+    {
+      "name": "COOKIE_SECURE",
+      "default": true
+    },
+    {
+      "name": "LOG_LEVEL",
+      "default": "info"
+    },
+    {
+      "name": "INITIAL_PASSWORD",
+      "required": true,
+      "minLength": 12
+    },
+    {
+      "name": "WARMUP_ENABLED",
+      "default": true
+    }
+  ],
+  "stages": {
+    "config": {
+      "target": ".pipeline/runtime/{env}.env",
+      "applyCommands": [
+        {
+          "cmd": "sudo",
+          "args": [
+            "install",
+            "-m",
+            "600",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            ".pipeline/runtime/prod.env",
+            "/etc/project-aggregation.env"
+          ],
+          "timeoutMs": 60000
+        }
+      ]
+    },
+    "publish": {
+      "enabled": true,
+      "requiresConfirmation": true,
+      "commands": [
+        { "cmd": "python3", "args": ["deploy/publish-release.py", "output/release"], "timeoutMs": 600000 }
+      ]
+    },
+    "activate": {
+      "enabled": true,
+      "requiresApply": true,
+      "commands": [
+        { "cmd": "sudo", "args": ["bash", "deploy/install-all.sh"], "timeoutMs": 1800000 }
+      ],
+      "healthUrl": "http://127.0.0.1:{PORT}/api/health"
+    }
+  }
+}

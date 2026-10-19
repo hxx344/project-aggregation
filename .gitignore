@@ -11,6 +11,9 @@ dist/
 # Data directories
 .data*/
 
+# Agent company run artifacts (local operational logs; company definitions stay tracked)
+.company/runs/
+
 # Environment
 .env
 .env.*
@@ -19,6 +22,9 @@ dist/
 # Output and temporary directories
 output/
 *.log
+
+# Deployment pipeline state (locks, run journals, rendered configs)
+.pipeline/
 
 # Playwright
 .playwright-cli/

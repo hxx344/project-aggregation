@@ -1,0 +1,105 @@
+{
+  "schema": 1,
+  "id": "test",
+  "extends": "base",
+  "description": "测试环境：冻结安装、工作台与内置模块全量构建、类型检查与行为测试、打包并校验发布清单。",
+  "toolchain": {
+    "node": "24.15.0",
+    "pnpm": "11.25.0",
+    "strict": true
+  },
+  "guards": {
+    "requireClean": true,
+    "allowDirtyOverride": false
+  },
+  "triggers": {
+    "pull_request": {
+      "guards": {
+        "branch": null,
+        "requireClean": true
+      }
+    },
+    "push": {
+      "guards": {
+        "branch": "main",
+        "requireClean": true
+      }
+    },
+    "manual": {
+      "guards": {
+        "branch": null,
+        "requireClean": true
+      }
+    }
+  },
+  "config": [
+    {
+      "name": "NODE_ENV",
+      "default": "test"
+    },
+    {
+      "name": "DATA_DIR",
+      "default": ".data-test"
+    },
+    {
+      "name": "PUBLIC_ORIGIN",
+      "default": "http://127.0.0.1:3100"
+    },
+    {
+      "name": "COOKIE_SECURE",
+      "default": false
+    },
+    {
+      "name": "LOG_LEVEL",
+      "default": "info"
+    },
+    {
+      "name": "INITIAL_PASSWORD",
+      "required": true,
+      "minLength": 8
+    }
+  ],
+  "stages": {
+    "build": {
+      "commands": [
+        { "cmd": "pnpm", "args": ["run", "build:all"], "timeoutMs": 1800000 }
+      ],
+      "inputs": [
+        "src",
+        "index.html",
+        "vite.config.ts",
+        "tsconfig.json",
+        "package.json",
+        "public",
+        "modules",
+        "scripts/modules.mjs",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml"
+      ],
+      "outputs": [
+        "dist/index.html",
+        "modules/crossex/dist/index.html",
+        "modules/monitor/dist/build-manifest.json"
+      ]
+    },
+    "verify": {
+      "commands": [
+        { "cmd": "pnpm", "args": ["run", "check"], "timeoutMs": 600000 },
+        { "cmd": "pnpm", "args": ["test"], "timeoutMs": 900000 }
+      ]
+    },
+    "package": {
+      "enabled": true,
+      "commands": [
+        { "cmd": "python3", "args": ["deploy/package-release.py", "--architecture", "x64"], "timeoutMs": 1800000 }
+      ],
+      "outputs": ["output/release/release-manifest-x64.json"]
+    },
+    "publish": {
+      "enabled": false
+    },
+    "activate": {
+      "enabled": false
+    }
+  }
+}
