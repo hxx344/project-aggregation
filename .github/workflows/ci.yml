@@ -15,21 +15,24 @@ jobs:
     # Match the deployment server: Ubuntu 24.04 LTS / x86_64.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.15.0'
-      - uses: pnpm/action-setup@v4
+      # Exact pin: v6 installs a bundled bootstrap pnpm at dest/node_modules/pnpm and
+      # self-updates elsewhere when packageManager differs; test-workspace.sh reads the
+      # bootstrap path, which only matches while it equals packageManager (11.25.0).
+      - uses: pnpm/action-setup@v6.1.0
         id: pnpm
       - name: Locate pnpm content store
         id: pnpm-store
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: pnpm-11.25.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: pnpm-11.25.0-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -44,7 +47,7 @@ jobs:
           pip_cache="$(python -m pip cache dir)"
           sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" bash deploy/test-workspace.sh
       - name: Keep the verified deployment package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deployment-package-x64
           path: output/release/*
@@ -56,10 +59,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.15.0'
       - name: Check changed lines for review blockers
@@ -73,8 +76,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.15.0'
       - name: Verify recovery guard and cold-stop ownership
@@ -156,7 +159,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Prepare privileged installation paths on the disposable runner
         run: |
           # Hosted tool-cache directories may grant writes through default ACLs.
@@ -187,7 +190,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify download reports, configuration and installation recovery
         run: |
           python3 deploy/test-mirror-tools.py -v
@@ -211,8 +214,8 @@ jobs:
       group: deployment-release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: deployment-package-x64
           path: output/release

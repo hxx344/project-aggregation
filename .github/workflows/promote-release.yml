@@ -22,7 +22,7 @@ jobs:
       group: deployment-release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify candidate and explicitly publish the stable version
         env:
           GH_TOKEN: ${{ github.token }}
