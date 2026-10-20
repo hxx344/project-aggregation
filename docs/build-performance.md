@@ -9,9 +9,10 @@
 - 根项目和 Crossex 的 TypeScript 检查将增量信息保存在各自
   `.build-cache/.tsbuildinfo`。重复检查可以复用结果，源码变化仍执行类型验证；
   缓存缺失时正常进行完整检查。它不等同于跨 GitHub Actions 运行的产物缓存。
-- CI 的 `deploy/test-workspace.sh` 按依赖并行：Python 环境准备、前端检查、模块构建三个任务
-  同时运行；组装和打包完成后，根行为测试与源码发布目录、解包发布包两项隔离包检查同时运行。
-  打包先于根行为测试，避免测试在同一源码树写入的文件进入发布包。
+- CI 的 `deploy/test-workspace.sh` 按依赖并行：Python 环境准备、前端检查和四个模块各自的
+  生产构建同时运行。随后根行为测试在另一份固定 Git 提取中运行，模块产物从已校验缓存恢复
+  （与开启 `PROJECT_DEPLOY_TESTS=1` 的升级相同），与组装、打包以及源码发布目录、解包发布包
+  两项隔离包检查同时进行；打包读取的源码树不受测试写入影响。
   `deploy/workspace-test-jobs.sh` 负责传播失败和取消时清理进程组。
 - 夹具通过 `INSTALL_TEST_PNPM_STORE` 复用 actions/cache 恢复的 pnpm 内容 store，只省去包下载；
   生产安装器仍执行冻结复制安装和生命周期脚本，并关闭 side-effects 缓存，依赖构建钩子照常执行。

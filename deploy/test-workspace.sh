@@ -73,16 +73,37 @@ workspace_python_setup() {
   run_as_service "${INSTALL_TEST_PYTHON:-/usr/bin/python3}" -m venv "$test_root/python-aster"
   run_as_service "$test_root/python-aster/bin/python" -m pip --cache-dir "$pip_cache" install --disable-pip-version-check --require-hashes -r "$work_dir/source/modules/aster/requirements.lock"
 }
+workspace_module_build() {
+  # The production build path for one module per lane. Each module builds in
+  # its own importer and publishes its own trusted cache.
+  MODULE_BUILD_IDS=("$1")
+  prepare_module_builds
+}
+workspace_root_tests() {
+  # A separate extraction hydrated from the verified module caches, as an
+  # upgrade with PROJECT_DEPLOY_TESTS=1 does. Packaging reads the first tree
+  # concurrently and rejects files that appear or vanish while it copies.
+  work_dir="$test_root/test-work"
+  mkdir "$work_dir"
+  modules_prepared=0
+  module_outputs_prepared=()
+  prepare_build_cache_helper
+  prepare_module_builds
+  (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
+}
 prepare_build_cache_helper
 workspace_start_job python-setup workspace_python_setup
 workspace_start_job frontend-checks workspace_frontend_checks
-workspace_start_job module-builds prepare_module_builds
+for module in "${MODULE_BUILD_IDS[@]}"; do
+  workspace_start_job "module-build-$module" workspace_module_build "$module"
+done
 workspace_wait_jobs
-# The module lane published verified artifacts and the check lane its stamp to
+# The module lanes published verified artifacts and the check lane its stamp to
 # disk. This is the only in-memory prepare_module_builds result needed later.
 modules_prepared=1
-stage_started=$SECONDS
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
+workspace_start_job root-behavior-tests workspace_root_tests
+stage_started=$SECONDS
 prepare_application
 validate_embedded_runtime "$release"
 source_runtime_dependencies_ready "$release" "$runtime_dependency_key"
@@ -101,19 +122,13 @@ isolated_package_check() {
     recovery-drill "$SERVICE_USER" "$test_root/python/bin/python" "$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$1"
 }
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
-  # Package before the behavior tests start: they run in this same source tree,
-  # and the packager rejects files that appear or vanish while it copies.
   python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --parser-user "$SERVICE_USER" --repository "$repository" --output "$repository/output/release"
   mkdir "$test_root/package"
   tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
 fi
 printf '[workspace] source-assembly-and-packaging: %ss\n' "$((SECONDS - stage_started))"
-workspace_root_tests() {
-  (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
-}
 # Each package check owns a network namespace and a temporary data directory;
 # both only read the root-owned trees and the Python environments.
-workspace_start_job root-behavior-tests workspace_root_tests
 workspace_start_job source-package-check isolated_package_check "$release"
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
   workspace_start_job archive-package-check isolated_package_check "$test_root/package"
