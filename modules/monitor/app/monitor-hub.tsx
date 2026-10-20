@@ -123,9 +123,9 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
   }, [selectMonitor]);
   return <div className={`monitor-hub ${active === "perpetual" ? "monitor-hub-perpetual" : ""}`}>
     <header className="hub-header"><a className="hub-brand" href="/"><span><Activity size={23}/></span>MARKET <b>/ MONITOR</b></a><div className="hub-source">跨市场行情 <span>· CEX / DEX</span></div></header>
-    <div className="hub-intro"><div><p className="eyebrow">跨市场价差观察</p><h1>市场监控</h1></div><a href="https://github.com/hxx344/market-spread-monitor" target="_blank" rel="noreferrer"><Layers3 size={16}/>项目与扩展说明<ArrowUpRight size={15}/></a></div>
+    <div className="hub-intro"><div><p className="eyebrow">跨市场价差观察</p><h1>市场监控</h1></div></div>
     <Tabs value={active} onValueChange={value => selectMonitor(String(value))} className={`hub-tabs ${active === "perpetual" ? "hub-perpetual-active" : ""}`}>
-      <TabsList className="hub-market-nav" aria-label="选择监控市场">{monitors.map(monitor => <TabsTrigger key={monitor.id} value={monitor.id} className="hub-market-tab">{monitor.title}</TabsTrigger>)}</TabsList>
+      <div className="hub-nav-row"><TabsList className="hub-market-nav" aria-label="选择监控市场">{monitors.map(monitor => <TabsTrigger key={monitor.id} value={monitor.id} className="hub-market-tab">{monitor.title}</TabsTrigger>)}</TabsList><a className="hub-project-link" href="https://github.com/hxx344/market-spread-monitor" target="_blank" rel="noreferrer"><Layers3 size={14}/>项目与扩展说明<ArrowUpRight size={13}/></a></div>
       <section className="hub-market-overview" aria-label="市场行情概览">{monitors.map(monitor => {
         const runtime = controls.runtime[monitor.id], pending = controls.pending[monitor.id], error = controls.errors[monitor.id] || runtime?.error;
         return <article key={monitor.id} className="hub-summary-shell" data-active={active === monitor.id} data-disabled={!enabled(monitor.id)} aria-label={monitor.title}>

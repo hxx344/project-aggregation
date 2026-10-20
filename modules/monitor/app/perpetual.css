@@ -94,7 +94,7 @@
 .perpetual-panel button { min-height:40px; }
 .perpetual-panel :is(input:not([type=checkbox]):not([type=radio]):not([type=range]),select) { min-height:40px; }
 .perpetual-panel :is(button,input,select,summary):focus-visible { outline-color:var(--primary); }
-.perp-table-wrap,.perp-source-list,.perp-filters,.perp-quality-panel,.perp-fee-settings,.perp-execution,.perp-exit-workspace,.perp-paper { background:var(--card); border-color:var(--border); border-radius:10px; }
+.perp-table-wrap,.perp-source-list,.perp-filters,.perp-quality-panel,.perp-fee-settings,.perp-execution,.perp-exit-workspace,.perp-paper { background:var(--card); border-color:var(--border); border-radius:8px; }
 .perp-table thead th,.perp-detail thead th,.perp-convergence thead { background:var(--muted); }
 .perp-table>tbody>tr:hover { background:var(--muted); }
 .perp-table>tbody>tr.perp-row-expanded,.perp-table>tbody>tr.perp-detail-row>td { background:var(--background); }

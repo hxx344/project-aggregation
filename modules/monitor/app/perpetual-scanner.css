@@ -284,8 +284,8 @@
 .perp-scanner .perp-scanner-table > tbody > tr:not(.perp-detail-row) > :is(th, td) {
   display: table-cell;
   color: var(--scanner-text);
-  height: 60px;
-  padding: 8px 11px;
+  height: 52px;
+  padding: 7px 11px;
   border-top: 0;
   border-right: 1px solid var(--surface-hover);
   border-bottom: 1px solid var(--scanner-border);
