@@ -18,7 +18,11 @@
   `deploy/workspace-test-jobs.sh` 负责传播失败和取消时清理进程组。
 - 夹具通过 `INSTALL_TEST_PNPM_STORE` 复用 actions/cache 恢复的 pnpm 内容 store，只省去包下载；
   生产安装器仍执行冻结复制安装和生命周期脚本，并关闭 side-effects 缓存，依赖构建钩子照常执行。
-- ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
+- 夹具通过 `INSTALL_TEST_MODULE_CACHE` 导入 actions/cache 恢复的上次模块产物：仅导入目录名中
+  内容键与本次输入键一致的模块，经 `build-artifact-cache.py` 完整校验后重新存入 root 所有的
+  缓存，校验失败即丢弃并正常构建。因此输入未变的模块在 CI 中不再编译，任一构建输入变化的
+  模块照常构建并验证；`package` 作业在有模块重建时导出当前四个缓存（`INSTALL_TEST_MODULE_CACHE_EXPORT=1`），
+  按提交另存一份。是否命中以日志中的 `Imported the verified … build` 为准。- ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
   Git 归档为每个分片提取独立源码树，按原四组运行，其中交易组按模块分片并发，最后汇总测试数。
   模块选择与增量类型检查、安装器两组检查也拆成并行作业，`release` 等待全部作业通过。
 - `actions/setup-python` 按两份 `requirements.lock` 缓存 pip 下载。CI 将

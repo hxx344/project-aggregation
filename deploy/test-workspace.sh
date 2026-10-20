@@ -146,7 +146,48 @@ assert_shared_dependencies_unchanged() {
   done
   [[ "$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)" == "$cache_modules_hash" ]]
 }
+imported_modules=0
+workspace_import_module_caches() {
+  local source=$1 module key name stage artifact
+  [[ $source == /* && -d $source && ! -L $source ]] ||
+    { echo 'INSTALL_TEST_MODULE_CACHE must be an existing absolute directory.' >&2; return 1; }
+  for module in "${MODULE_BUILD_IDS[@]}"; do
+    key=${module_build_keys[$module]}
+    name="module-$module-$key"
+    [[ -d "$source/$name" && ! -L "$source/$name" ]] || continue
+    stage=$(mktemp -d "$work_dir/module-cache-import-$module.XXXXXXXX")
+    artifact="$stage/${MODULE_BUILD_OUTPUTS[$module]##*/}"
+    # Re-hash the restored bytes into a root-owned cache, as a legacy cache
+    # migration does. The content key still names every build input; a
+    # mismatch only means this module builds again.
+    if build_artifact_cache restore "$source/$name" "$key" "$artifact" &&
+        build_artifact_cache store "$artifact" "$APP_DIR/cache/$name" "$key"; then
+      chown -R root:root "$APP_DIR/cache/$name"
+      chmod -R a+rX,go-w "$APP_DIR/cache/$name"
+      imported_modules=$((imported_modules + 1))
+      printf '[workspace] Imported the verified %s build from an earlier CI run.\n' "$module"
+    else
+      rm -rf -- "$APP_DIR/cache/$name"
+      printf '[workspace] Discarded an unverifiable %s build cache.\n' "$module"
+    fi
+    rm -rf -- "$stage"
+  done
+}
+workspace_export_module_caches() {
+  local target=$1 module name
+  (( imported_modules < ${#MODULE_BUILD_IDS[@]} )) || return 0
+  # Keep exactly the current module caches so the saved entry does not grow.
+  find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  for module in "${MODULE_BUILD_IDS[@]}"; do
+    name="module-$module-${module_build_keys[$module]}"
+    cp -R -- "$APP_DIR/cache/$name" "$target/$name"
+  done
+  chown -R "$SERVICE_USER:$SERVICE_USER" "$target"
+  : > "$target.updated"
+  printf '[workspace] Exported the current module builds for later CI runs.\n'
+}
 prepare_build_cache_helper
+if [[ -n ${INSTALL_TEST_MODULE_CACHE:-} ]]; then workspace_import_module_caches "$INSTALL_TEST_MODULE_CACHE"; fi
 workspace_start_job python-setup workspace_python_setup
 if [[ $lane != package ]]; then workspace_start_job frontend-checks workspace_frontend_checks; fi
 for module in "${MODULE_BUILD_IDS[@]}"; do
@@ -156,6 +197,9 @@ workspace_wait_jobs
 # The module lanes published verified artifacts and the check lane its stamp to
 # disk. This is the only in-memory prepare_module_builds result needed later.
 modules_prepared=1
+if [[ -n ${INSTALL_TEST_MODULE_CACHE:-} && ${INSTALL_TEST_MODULE_CACHE_EXPORT:-0} == 1 ]]; then
+  workspace_export_module_caches "$INSTALL_TEST_MODULE_CACHE"
+fi
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
 if [[ $lane != package ]]; then workspace_start_job root-behavior-tests workspace_root_tests; fi
 if [[ $lane == behavior ]]; then
