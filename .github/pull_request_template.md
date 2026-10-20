@@ -43,3 +43,5 @@
 ## 关联
 
 <!-- 经验条目 L0xx、issue、设计文档 -->
+
+<!-- path filter probe: dot path -->
