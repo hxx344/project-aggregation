@@ -1117,3 +1117,5 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `a16228f`。2026-10-21 用户截图显示 Binance 普通 UM、PM-UM、普通 CM「读取失败」，PM-CM 曾读到数据；服务器实测四个域名均 200、`fapi/v1/exchangeInfo` 约 1.15 MB（未超 2 MB 上限），目录含 5 个中文 `symbol`/`baseAsset`。普通 UM/CM 失败是否另因统一账户被拒绝未实测。
 
 **事件记录：** `binance-unicode-symbol-catalog-20261021`；实际发生日期 2026-10-21（Asia/Shanghai）；不推进全历史复盘检查点。
+
+**统一账户互斥范围补充（2026-10-21）：** 同一事件的后续，不增加事件数。`ac22920` 发布后 PM-UM/PM-CM 恢复，普通 UM/CM 仍「读取失败」；[Binance 说明](https://www.binance.com/en/support/faq/binance-portfolio-margin-api-ccf04078d7774d479f11ae15c4f56081) 写明开通统一账户后 fapi/dapi 的交易与用户数据接口受限，只能经 papi 读取。按用户选择，[仓位服务](modules/asset/lib/hub-positions.ts) 以目录 `accountMode` 判断：一种账户模式有范围读取成功、另一种从未成功时，隐藏并停止轮询后者；成功一侧转为失败即恢复显示与读取，避免长期掩盖真实故障。[服务测试](modules/asset/tests/hub-positions.test.ts) 双向覆盖隐藏、不轮询与失败恢复，并已确认在修复前代码上失败。

@@ -1,10 +1,10 @@
 export type PositionsExchangeId = 'binance' | 'bybit' | 'okx' | 'aster' | 'variational';
-export type ScopeDefinition = { id: string; label: string; unsupported?: string };
+export type ScopeDefinition = { id: string; label: string; unsupported?: string; accountMode?: 'classic' | 'portfolio' };
 export const POSITIONS_CATALOG: { id: PositionsExchangeId; name: string; scopes: ScopeDefinition[] }[] = [
   { id: 'binance', name: 'Binance', scopes: [
-    { id: 'um', label: '普通 USDⓈ-M 合约' }, { id: 'pm-um', label: 'Portfolio Margin · USDⓈ-M' },
-    { id: 'cm', label: '普通 COIN-M 合约（张数）' },
-    { id: 'pm-cm', label: 'Portfolio Margin · COIN-M（张数）' },
+    { id: 'um', label: '普通 USDⓈ-M 合约', accountMode: 'classic' }, { id: 'pm-um', label: 'Portfolio Margin · USDⓈ-M', accountMode: 'portfolio' },
+    { id: 'cm', label: '普通 COIN-M 合约（张数）', accountMode: 'classic' },
+    { id: 'pm-cm', label: 'Portfolio Margin · COIN-M（张数）', accountMode: 'portfolio' },
     { id: 'options', label: '期权', unsupported: '暂未接入 Binance 期权' },
   ] },
   { id: 'bybit', name: 'Bybit', scopes: [

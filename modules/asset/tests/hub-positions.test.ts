@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDatabase } from '../lib/sqlite.ts';
 import { createPositionsService } from '../lib/hub-positions.ts';
-import { position } from '../lib/positions-values.ts';
+import { position, POSITIONS_FAILED } from '../lib/positions-values.ts';
 import type { HubPositions, Position } from '../lib/positions-types.ts';
 import type { Credentials } from '../lib/validation.ts';
 
@@ -137,4 +137,28 @@ test('vault decryption failures are sanitized and never become successful empty 
   await service.read(f.database, 'owner', async () => { throw new Error('PRIVATE encrypted content'); }); await service.idle();
   const result = await service.read(f.database, 'owner', f.unseal);
   assert.equal(scope(result).status, 'error'); assert.equal(scope(result).fetchedAt, null); assert.equal(JSON.stringify(result).includes('PRIVATE'), false);
+});
+
+test('Binance hides and stops polling the account mode that fails while the other mode reads, and restores it on failure', async t => {
+  const ids = (report: HubPositions) => report.exchanges.find(item => item.id === 'binance')!.accounts[0].scopes.map(item => item.id);
+  for (const [working, restricted] of [[['pm-um', 'pm-cm'], ['um', 'cm']], [['um', 'cm'], ['pm-um', 'pm-cm']]]) {
+    const f = fixture(); t.after(() => f.database.close()); await f.save(); let clock = at; let broken = false; const reads: string[] = [];
+    const service = createPositionsService({ now: () => clock, read: async (_c, id) => {
+      reads.push(id);
+      if (restricted.includes(id) || broken) throw new Error(POSITIONS_FAILED);
+      return id === working[0] ? sample : [];
+    } });
+    const first = await service.read(f.database, 'owner', f.unseal); await service.idle();
+    assert.deepEqual(ids(first), ['um', 'pm-um', 'cm', 'pm-cm', 'options']);
+    const settled = await service.read(f.database, 'owner', f.unseal);
+    assert.deepEqual(ids(settled), ids(first).filter(id => !restricted.includes(id)));
+    assert.equal(scope(settled, 'binance', 'default', working[0]).positions.length, 1);
+    clock += 30_000; reads.length = 0; await service.read(f.database, 'owner', f.unseal); await service.idle();
+    assert.deepEqual(reads.sort(), [...working].sort(), 'hidden mode is not polled');
+    broken = true; clock += 30_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+    const failed = await service.read(f.database, 'owner', f.unseal);
+    assert.deepEqual(ids(failed), ['um', 'pm-um', 'cm', 'pm-cm', 'options']);
+    for (const id of working) assert.equal(scope(failed, 'binance', 'default', id).status, 'error');
+    await service.idle(); assert.ok(restricted.every(id => reads.includes(id)), 'restored mode is polled again');
+  }
 });

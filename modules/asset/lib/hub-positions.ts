@@ -118,11 +118,21 @@ export function createPositionsService(options: { now?: () => number; ttl?: numb
       const exchanges = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
         accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
           const revision = account.row ? revisionOf(account.row.encrypted) : null;
-          return { id: account.id, name: account.name, configured: !!account.row, revision, scopes: exchange.scopes.map(scope => {
+          const healthy = (scope: ScopeDefinition) => {
+            const entry = entries.get(cacheKey(owner, account.key, scope.id));
+            return !!revision && entry?.revision === revision && entry.scope.status === 'live';
+          };
+          // Account modes are exclusive (Binance restricts fapi/dapi user data once Portfolio Margin is on), so a
+          // mode is hidden and not polled only while the other mode reads successfully and this one never does.
+          const inactive = new Set(exchange.scopes.filter(scope => scope.accountMode
+            && !exchange.scopes.some(item => item.accountMode === scope.accountMode && healthy(item))
+            && exchange.scopes.some(item => item.accountMode && item.accountMode !== scope.accountMode && healthy(item))).map(scope => scope.id));
+          return { id: account.id, name: account.name, configured: !!account.row, revision, scopes: exchange.scopes.flatMap(scope => {
             const key = cacheKey(owner, account.key, scope.id); keep.add(key);
             let entry = entries.get(key);
             if (entry && entry.revision !== revision) { entry.abort?.abort(); entries.delete(key); entry = undefined; }
-            if (!revision || scope.unsupported) return empty(scope, !!revision);
+            if (!revision || scope.unsupported) return [empty(scope, !!revision)];
+            if (inactive.has(scope.id)) return [];
             if (!entry) {
               entry = { revision, scope: empty(scope, true), attemptedAt: -Infinity, touchedAt: now() }; entries.set(key, entry);
             }
@@ -130,7 +140,7 @@ export function createPositionsService(options: { now?: () => number; ttl?: numb
             if (!entry.pending && now() - entry.attemptedAt >= ttl) refresh(database, owner, account, entry, key, unseal);
             const result = { ...entry.scope, positions: entry.scope.positions.map(item => ({ ...item })) };
             if (result.status === 'live' && result.fetchedAt && now() - Date.parse(result.fetchedAt) >= STALE_AFTER) result.status = 'stale';
-            return result;
+            return [result];
           }) };
         }),
       }));
