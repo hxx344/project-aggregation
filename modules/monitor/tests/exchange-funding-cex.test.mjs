@@ -60,11 +60,14 @@ test('official success envelopes are required; API error objects cannot become e
   assert.throws(() => parseCexFundingHistory('other', 'BZUSDT', [], NOW), /Unsupported/);
 });
 
-test('OKX uses only actual realized rates, including zero and historical next_period; Binance rejects dividend entries', () => {
+test('OKX uses only actual realized rates, including zero and historical next_period; Binance keeps special dividend settlements', () => {
   assert.deepEqual(parse('okx', [{ ...row('okx'), realizedRate: '0', method: 'next_period' }]), [{ time: NOW - HOUR, rate: 0 }]);
   assert.throws(() => parse('okx', [{ ...row('okx'), realizedRate: undefined }]), /Invalid/);
   assert.throws(() => parse('okx', [{ ...row('okx'), instType: 'FUTURES' }]), /instrument/);
-  assert.throws(() => parse('binance', [{ ...row('binance'), rateType: 'Special' }]), /rate type/);
+  // A Special settlement can land about a second after a Regular one; both are real cash flows.
+  const regular = row('binance', NOW - HOUR), special = { ...row('binance', NOW - HOUR + 1001, '-0.00021475'), rateType: 'Special' };
+  assert.deepEqual(parse('binance', [regular, special]), [{ time: NOW - HOUR, rate: Number(regular.fundingRate) }, { time: NOW - HOUR + 1001, rate: -0.00021475 }]);
+  assert.throws(() => parse('binance', [{ ...row('binance'), rateType: 'Unknown' }]), /rate type/);
 });
 
 const pageSizes = { binance: 1000, bybit: 200, okx: 400, bitget: 100 };

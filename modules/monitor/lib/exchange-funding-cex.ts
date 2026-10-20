@@ -70,7 +70,8 @@ function parseFundingPage(exchange: CexFundingExchange, symbol: string, input: u
   for (const value of rows(exchange, input)) {
     const row = object(value), identity = exchange === 'okx' ? row.instId : row.symbol;
     if (identity !== undefined && identity !== symbol) throw new Error('CEX funding contract mismatch');
-    if ((exchange === 'binance' || exchange === 'aster') && row.rateType !== undefined && row.rateType !== 'Regular') throw new Error('Unsupported funding rate type');
+    // Special is a real one-off settlement, e.g. Binance equity-perpetual dividend funding at the ex-date.
+    if ((exchange === 'binance' || exchange === 'aster') && row.rateType !== undefined && row.rateType !== 'Regular' && row.rateType !== 'Special') throw new Error('Unsupported funding rate type');
     if (exchange === 'okx' && row.instType !== undefined && row.instType !== 'SWAP') throw new Error('Invalid OKX funding instrument');
     const time = timestamp(exchange === 'bybit' ? row.fundingRateTimestamp : row.fundingTime);
     // OKX calls fundingRate predicted and realizedRate actual. A historical

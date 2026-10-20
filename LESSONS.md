@@ -1089,3 +1089,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `f4aab21` 的 [CrossEx 应用](modules/crossex/server/app.mjs)。2026-10-20 用户截图显示目录读取超时与账户过期；本机经端口转发读取工作台 272 KB 构建文件耗时 11.9 秒（约 22 KB/s，可能含浏览器并发占用）；实际上游目录 4.9 MB，接口输出 2034841 字节，gzip 后 91341 字节。未取得服务器日志，`/api/state` 的线上体积未实测。
 
 **事件记录：** `crossex-uncompressed-json-slow-link-20261020`；实际发生日期 2026-10-20（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L069：结算历史中的已知特殊类型须按真实收付计入，未知类型才拒绝
+
+**适用条件：** 解析交易所历史资金费结算（Binance/Aster 等带 `rateType` 字段的接口），尤其是股票、ADR 等会除息的永续合约。
+
+**根因：** Binance 历史资金费在股票永续除息时返回一条 `rateType: "Special"` 的一次性分红资金费，时间紧跟当期 `Regular` 结算约 1 秒。[CEX 结算解析](modules/monitor/lib/exchange-funding-cex.ts) 把非 `Regular` 一律视为异常并抛错，60 天窗口内只要出现一条，整条腿就读取失败，页面只显示「历史结算费率暂时读取失败」。原油合约没有分红，所以接入海力士前没有暴露。
+
+**以后做法：** 对接口已知的结算类型逐个判断是否为真实收付；真实收付按原时间戳计入，不并入相邻的常规结算，未知类型仍拒绝。新增合约类别（股票、指数、商品）时，先用真实接口拉取完整窗口，检查有无非常规类型和异常间隔，不只抽样最近几条。
+
+**如何验证：** [CEX 结算测试](modules/monitor/tests/exchange-funding-cex.test.mjs) 断言 `Special` 与紧邻的 `Regular` 两条均保留，未知类型仍拒绝；涉及新合约时用真实接口读取完整窗口核对。
+
+**证据：** project-aggregation `1fdb6e8` 为海力士接入结算历史后，用户截图显示 Binance「正股 · 做多」`SKHYNIXUSDT` 读取失败；实测 `/fapi/v1/fundingRate?symbol=SKHYNIXUSDT` 在 2026-08-27 23:00:01 UTC 有一条 `Special`、费率 −0.00021475。同类 Binance 解析器 [gold-oil-funding.ts](modules/monitor/lib/gold-oil-funding.ts) 与 [binance-funding-history.mjs](modules/monitor/modules/oil/binance-funding-history.mjs) 只处理 BZ/CL/XAU 商品合约，按小时对齐配对，未改动。
+
+**事件记录：** `binance-special-funding-hynix-20261020`；实际发生日期 2026-10-20（Asia/Shanghai）；不推进全历史复盘检查点。
