@@ -473,7 +473,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
     setInspection(null); setChartSelection(selection); setChartLinkError(""); setWorkspace("chart");
     const next = perpetualChartUrl(window.location.href, selection);
     if (next !== window.location.href) window.history.pushState(window.history.state, "", next);
-    requestAnimationFrame(() => document.getElementById("perpetual-chart-heading")?.focus());
+    requestAnimationFrame(() => { const heading = document.getElementById("perpetual-chart-heading"); heading?.focus({ preventScroll: true }); heading?.scrollIntoView({ block: "nearest" }); });
   }
   function openChart(row: PerpetualSpread) {
     selectChart({ base: row.base, longKey: `${row.long.exchange}:${row.long.symbol}`, shortKey: `${row.short.exchange}:${row.short.symbol}`, days: chartSelection?.days ?? 7 });
@@ -505,7 +505,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
     setInspection(null); setPage(1); setRangeInputs(previous => ({ ...previous, [id]: { ...previous[id], [bound]: value } }));
   }
   function clearRanges() { setInspection(null); setPage(1); setRangeInputs(parseScannerRangeInputs(null)); }
-  function closeRanges() { setFiltersOpen(false); document.getElementById("perpetual-filter-toggle")?.focus(); }
+  function closeRanges() { setFiltersOpen(false); document.getElementById("perpetual-filter-toggle")?.focus({ preventScroll: true }); }
   function changeView(next: "rank" | "quotes") { setInspection(null); setView(next); setPage(1); }
   function changeOpportunityMode(funding: boolean) { changeView("rank"); updateFilters({ sortBy: funding ? "funding" : fundingSort ? "gross" : filters.sortBy }); }
   function changePage(next: number) { setInspection(null); setPage(next); }
@@ -525,11 +525,11 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
     setToolsOpen(true);
     if (tool === "health") setHealthOpen(true);
     else { setAlertsVisited(true); setAlertsOpen(true); }
-    requestAnimationFrame(() => document.getElementById(tool === "health" ? "perpetual-health-region" : "perpetual-alert-region")?.scrollIntoView({ behavior: "auto", block: "start" }));
+    requestAnimationFrame(() => document.getElementById(tool === "health" ? "perpetual-health-region" : "perpetual-alert-region")?.scrollIntoView({ behavior: "auto", block: "nearest" }));
   }
   function configureAlert(row: PerpetualSpread) {
     setToolsOpen(true); setAlertPair(row); setAlertsVisited(true); setAlertsOpen(true);
-    requestAnimationFrame(() => document.getElementById("perpetual-alert-region")?.scrollIntoView({ behavior: "auto", block: "start" }));
+    requestAnimationFrame(() => document.getElementById("perpetual-alert-region")?.scrollIntoView({ behavior: "auto", block: "nearest" }));
   }
 
   function toggleCategory(id: ScannerCategoryId) {

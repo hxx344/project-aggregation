@@ -131,7 +131,7 @@ function priceState(leg: PerpetualPriceLeg | undefined, start: number, end: numb
 const noSeries: Series[] = [];
 
 function PerpetualChart({ selection, snapshot, active, now, onSelectionChange, onBack, connectionError }: Props) {
-  useEffect(() => { document.getElementById('perpetual-chart-heading')?.focus(); }, []);
+  useEffect(() => { document.getElementById('perpetual-chart-heading')?.focus({ preventScroll: true }); }, []);
   const [cursorTime, setCursorTime] = useState<number | null>(null);
   const [copied, setCopied] = useState({ key: '', message: '' });
   const [recordsOpen, setRecordsOpen] = useState(false), [recordPage, setRecordPage] = useState(0);

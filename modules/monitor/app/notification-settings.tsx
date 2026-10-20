@@ -43,7 +43,7 @@ export default function NotificationSettings({ active = true }: { active?: boole
         if (next.available) { latestRevision.current = next.revision; if (!dirtyRef.current) setRevision(next.revision); }
       } catch { if (!controller.signal.aborted && !signal.aborted) setLoadError("无法连接统一告警设置，请检查后台服务。"); }
     };
-    const show = () => { setOpen(true); document.getElementById("shared-feishu")?.scrollIntoView({ block: "start", behavior: "instant" }); };
+    const show = () => { setOpen(true); document.getElementById("shared-feishu")?.scrollIntoView({ block: "nearest", behavior: "instant" }); };
     const unload = (event: BeforeUnloadEvent) => { if (dirtyRef.current) { event.preventDefault(); event.returnValue = ""; } };
     const polling = startActivityPolling({ intervalMs: 10_000, active: false, load, onData: () => {}, onError: () => {} });
     activity.current = polling;

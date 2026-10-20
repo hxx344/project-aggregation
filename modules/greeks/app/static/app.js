@@ -613,9 +613,9 @@ function updateGroupHtml(id, html) {
   target.innerHTML = html;
   for (const detail of target.querySelectorAll?.('details') || []) {
     detail.open = opened.has(detail.dataset.detail);
-    if (focusedDetail && detail.dataset.detail === focusedDetail) detail.querySelector('summary')?.focus();
+    if (focusedDetail && detail.dataset.detail === focusedDetail) detail.querySelector('summary')?.focus({ preventScroll: true });
   }
-  if (focused) for (const button of target.querySelectorAll?.('[data-stop]') || []) if (button.dataset.stop === focused && !button.disabled) button.focus();
+  if (focused) for (const button of target.querySelectorAll?.('[data-stop]') || []) if (button.dataset.stop === focused && !button.disabled) button.focus({ preventScroll: true });
 }
 function renderExecutionGroups(groups = []) {
   const active = groups.filter(isActiveExecution), history = groups.filter(group => !isActiveExecution(group));

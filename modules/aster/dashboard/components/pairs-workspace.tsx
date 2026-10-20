@@ -493,7 +493,7 @@ function PairDetail({
             loadSymbols();
             settings.current
               .querySelector<HTMLElement>('.pair-adl-settings')
-              ?.scrollIntoView({ block: 'center' });
+              ?.scrollIntoView({ block: 'nearest' });
             settings.current
               .querySelector<HTMLInputElement>('[id$="-pair-adl-batch"]')
               ?.focus({ preventScroll: true });

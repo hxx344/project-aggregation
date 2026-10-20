@@ -78,7 +78,7 @@ export default function ManualHedgePanel({ instruments, catalogError, live, budg
   };
   const fillImported = (query: HubQuery) => {
     setImported(query); setBase(query.symbol || ''); setQuantity(''); setPrefillNotice('');
-    document.querySelector('.hedge-layout')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.querySelector('.hedge-layout')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   };
   const spreadQuery = (row: Opportunity): HubQuery => {
     const contract = (leg: Opportunity['long'] & { crossexSymbol?: string }) => leg.crossexSymbol || (leg.symbol.includes('_FUTURE_') ? leg.symbol : '');

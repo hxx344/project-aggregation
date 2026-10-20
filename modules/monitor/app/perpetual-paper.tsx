@@ -49,7 +49,7 @@ function PaperWorkspace({ active, readActive = active }: { active: boolean; read
     const current = editorRef.current;
     if (current) edit({ ...current, fields: { ...current.fields, [key]: value } });
   }
-  useEffect(() => { editorHeading.current?.focus(); }, [editor?.id, editor?.kind]);
+  useEffect(() => { editorHeading.current?.focus({ preventScroll: true }); editorHeading.current?.scrollIntoView({ block: 'nearest' }); }, [editor?.id, editor?.kind]);
   useEffect(() => {
     const hide = () => { if (document.hidden) mutation.current?.abort(); };
     const protect = (event: BeforeUnloadEvent) => { if (editorRef.current) { event.preventDefault(); event.returnValue = ''; } };
