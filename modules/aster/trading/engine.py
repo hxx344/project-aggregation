@@ -186,6 +186,7 @@ class Engine:
         self.hourly_summary_error = None
         self.relay_health_error = None
         self.position_imbalance_error = None
+        self.margin_imbalance_error = None
         self.position_observation_instance = uuid.uuid4().hex
         self.capacity_notification_errors = {}
         self.capacity_targets, self.capacity_accounts = {}, []
@@ -2523,7 +2524,7 @@ class Engine:
         channels = notification_channels.public_status({
             "scheduled": self.notification_channel_errors["scheduled"] or self.hourly_summary_error,
             "event": self.notification_channel_errors["event"] or self.relay_health_error or self.position_imbalance_error
-                or next(iter(self.capacity_notification_errors.values()), None)})
+                or self.margin_imbalance_error or next(iter(self.capacity_notification_errors.values()), None)})
         with self.store.read_snapshot() as reader:
             saved_accounts = reader.accounts()
             paired_states = self.pairs.states(reader)
@@ -2709,7 +2710,7 @@ class Engine:
                                  "channels": channels, "routing_mode": notification_channels.routing_mode(),
                                  "enabled": monitoring_state["settings"]["feishu_enabled"], "pending": pending_notifications,
                                  "hourly_summary": hourly_summary,
-                                 "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or self.position_imbalance_error or next(iter(self.capacity_notification_errors.values()), None)}}))
+                                 "error": self.notification_error or self.hourly_summary_error or self.relay_health_error or self.position_imbalance_error or self.margin_imbalance_error or next(iter(self.capacity_notification_errors.values()), None)}}))
 
     def poll_trading_rules(self):
         """One public rules attempt, isolated from the funds scheduler."""

@@ -111,14 +111,14 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.assertIsNone(self.store.notification_for_delivery("master"))
 
     def test_symbol_alert_mute_applies_to_every_symbol_category(self):
-        for category in monitoring.CATEGORIES - {"hourly_summary", "relay_health"}:
+        for category in monitoring.CATEGORIES - {"hourly_summary", "relay_health", "margin_imbalance"}:
             self.queue(category, ["BTCUSD1"])
         self.store.edit_monitoring({"alerts": False}, symbol="BTCUSD1")
         self.assertEqual(self.store.pending_notifications(), 0)
         self.assertEqual(self.store.due_notifications(), [])
 
     def test_monitoring_off_suppresses_public_alerts_but_preserves_trade_alerts(self):
-        for category in monitoring.CATEGORIES - {"hourly_summary", "relay_health"}:
+        for category in monitoring.CATEGORIES - {"hourly_summary", "relay_health", "margin_imbalance"}:
             self.queue(category, ["BTCUSD1"])
         self.store.edit_monitoring({"monitor": False}, symbol="BTCUSD1")
         self.assertEqual([row["id"] for row in self.store.due_notifications()], ["trade_summary"])

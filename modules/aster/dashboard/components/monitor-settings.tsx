@@ -160,6 +160,15 @@ export function MonitorSettings({
               disabled={disabled}
               onChange={(value) => void save({ relay_health_alerts: value })}
             />
+            <SettingSwitch
+              title="保证金不平衡告警"
+              description="配对组保证金持续 1 分钟不平衡或无法划转时提醒，未恢复每 2 分钟重复，恢复后通知一次；只遵循飞书总开关与本开关。"
+              checked={settings.margin_imbalance_alerts}
+              disabled={disabled}
+              onChange={(value) =>
+                void save({ margin_imbalance_alerts: value })
+              }
+            />
             <SummaryIntervalForm
               savedMinutes={interval}
               disabled={disabled}

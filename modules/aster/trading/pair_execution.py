@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timezone
 from fractions import Fraction
+import logging
 import math
 import time
 import uuid
@@ -23,6 +24,8 @@ from .pair_planning import (SIDES, PairPositionError, PairRecoveryConflict, posi
                             require_runtime_symbols)
 from .store import dumps
 from . import pair_quality
+
+LOG = logging.getLogger("aster.trading")
 
 
 def empty_progress(owned=None, completed=0):
@@ -216,7 +219,9 @@ class PairTrader:
         from .margin_balance import MarginBalancer
         if (not pair["margin"]["enabled"] and isinstance(margin, dict)
                 and margin.get("pending") is None and not MarginBalancer.unsettled_rejection(margin)):
-            return MarginBalancer.status_view(pair, margin, state.get("margin"))
+            result = MarginBalancer.status_view(pair, margin, state.get("margin"))
+            self._observe_margin_alert(pair, result, None)
+            return result
         _, brokers, identities = self._members(pair)
         self._margin_identity.set((pair["id"], pair.get("revision"), deepcopy(identities)))
         result = self._balance(pair, state, brokers, identities, pending_orders=bool(state.get("pending")))
@@ -225,7 +230,27 @@ class PairTrader:
             self._ordinary_observations.pop(pair["id"], None)
         state["updated_at"] = time.time()
         self.store.put("pair_runtime:" + pair["id"], self._durable(state))
+        self._observe_margin_alert(pair, result, state.get("margin_balances"))
         return result
+
+    def _observe_margin_alert(self, pair, view, balances):
+        """Record margin alert evidence; a failure here never affects transfers."""
+        try:
+            from .margin_balance import validate_margin
+            margin = validate_margin(pair.get("margin", {}))
+            accounts = [self.store.account(pair[side + "_account_id"]) for side in ("long", "short")]
+            active = all(account is not None and self.engine.live_allowed(account) for account in accounts)
+            self.store.observe_margin_imbalance({
+                "pair_id": pair["id"], "name": pair.get("name"), "symbol": pair.get("symbol"),
+                "mode": accounts[0]["mode"] if accounts[0] else None, "active": active, "view": view,
+                "balances": balances, "threshold": margin["threshold"],
+                "check_interval_seconds": margin["check_interval_seconds"], "cooldown_seconds": margin["cooldown_seconds"]})
+            error = None
+        except Exception:
+            error = "保证金不平衡提醒检查失败，等待重试"
+            LOG.error("Margin imbalance notification observation failed")
+        # Engine.state() reports this beside the other notification errors.
+        self.engine.margin_imbalance_error = error
 
     def _risk_snapshots(self, pair, snapshots, *, recovery=False):
         from .margin_balance import MarginBalancer

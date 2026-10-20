@@ -13,7 +13,7 @@ import time
 import uuid
 
 from .models import MARKET_SYMBOLS, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, hourly_notifications, listing_alerts, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations, pair_cost
+from . import cycle_quality_history, hourly_notifications, listing_alerts, margin_imbalance_notifications, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations, pair_cost
 from .migration import DEFAULT_MIGRATION
 from .cycle import DEFAULT_CYCLE
 from .ledger_cache import LedgerCache
@@ -780,6 +780,8 @@ class Store:
                 hourly_notifications.reset(db, time.time(), monitoring.allowed(config, "hourly_summary", []))
             if any(previous[key] != config[key] for key in ("feishu_enabled", "relay_health_alerts")):
                 relay_health_notifications.reset(db)
+            if any(previous[key] != config[key] for key in ("feishu_enabled", "margin_imbalance_alerts")):
+                margin_imbalance_notifications.reset(db)
             if previous["feishu_enabled"] != config["feishu_enabled"]:
                 position_imbalance_notifications.reset(db)
             else:
@@ -796,6 +798,11 @@ class Store:
                             for row in observations]
             return position_imbalance_notifications.observe(db, observations, available=available,
                 revision=revision, instance_id=instance_id, now=time.time() if now is None else now)
+
+    def observe_margin_imbalance(self, observation, *, now=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return margin_imbalance_notifications.observe(db, observation, now=time.time() if now is None else now)
 
     def observe_relay_health(self, status, *, available, revision, now=None):
         with self.connect() as db:
@@ -1637,6 +1644,8 @@ class Store:
             return None
         if item.get("category") == "relay_health" and not relay_health_notifications.deliverable(db, item):
             return None
+        if item.get("category") == "margin_imbalance" and not margin_imbalance_notifications.deliverable(db, item, time.time()):
+            return None
         if item.get("category") == "position_imbalance":
             capture = position_imbalance_notifications.delivery_observation(db, item)
             if (not position_imbalance_notifications.deliverable(db, item) or not capture
@@ -1706,6 +1715,8 @@ class Store:
                     relay_health_notifications.delivered(db, dict(row))
                 if row["category"] == "position_imbalance":
                     position_imbalance_notifications.delivered(db, dict(row))
+                if row["category"] == "margin_imbalance":
+                    margin_imbalance_notifications.delivered(db, dict(row), now)
                 if item["id"].startswith(listing_alerts.MESSAGE_PREFIX):
                     listing_alerts.delivered(db, item)
                 if row["capacity_key"]:

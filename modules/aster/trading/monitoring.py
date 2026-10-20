@@ -21,6 +21,7 @@ LEGACY_DEFAULTS = {
     "hourly_summary_interval_minutes": 60,
     "relay_health_alerts": True,
     "position_imbalance_alerts": True,
+    "margin_imbalance_alerts": True,
 }
 NOTIFICATION_TYPES = ("new_listing", "listing_capacity", "strategy_capacity", "trade_summary", "position_imbalance")
 DEFAULTS = {**LEGACY_DEFAULTS, "schema_version": 2, "auto_discover": True,
@@ -28,7 +29,7 @@ DEFAULTS = {**LEGACY_DEFAULTS, "schema_version": 2, "auto_discover": True,
 GLOBAL_FIELDS = set(DEFAULTS) - {"schema_version"}
 CAPACITY_DEFAULTS = {"listing_capacity_leverage": None, "listing_capacity_threshold": "0"}
 SYMBOL_FIELDS = {"monitor_enabled", "notification_types", "monitor", "alerts", "max_capacity_alert", *CAPACITY_DEFAULTS}
-CATEGORIES = set(NOTIFICATION_TYPES) | {"hourly_summary", "relay_health"}
+CATEGORIES = set(NOTIFICATION_TYPES) | {"hourly_summary", "relay_health", "margin_imbalance"}
 
 
 def applicable_types(types, symbol):
@@ -114,7 +115,8 @@ def allowed(config, category, symbols):
         return True
     if category not in CATEGORIES:
         return False
-    if category in ("hourly_summary", "relay_health"):
+    # Margin is balanced per pair account group, not per notification symbol.
+    if category in ("hourly_summary", "relay_health", "margin_imbalance"):
         return config[category + "_alerts"]
     if not symbols or not all(category in symbol_options(config, symbol)["notification_types"] for symbol in symbols):
         return False
