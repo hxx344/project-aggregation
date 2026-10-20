@@ -45,6 +45,13 @@ test('stream deltas preserve other projects and handle removal, order, revisions
   const a = snapshot('a'), b = snapshot('b');
   const first = send([a, b]).data;
   const beat = send([a, b]); assert.equal(beat.event.type, 'heartbeat'); assert.equal(beat.data, null);
+  for (const field of [{ sync: { status: 'error' } }, { diagnostics: [{ code: 'hub:data-freshness' }] }, { message: '读取失败' }, { metrics: [{ label: 'x', value: '1' }] }]) {
+    const patched = send([a, { ...b, ...field }]);
+    assert.equal(patched.event.type, 'patch', `${Object.keys(field)[0]} change must be published`);
+    const [key, value] = Object.entries(field)[0];
+    assert.deepEqual(patched.data.projects[1][key], value);
+  }
+  send([a, b]);
   const changed = send([a, { ...b, project: { ...b.project, revision: 'new' } }]);
   assert.equal(changed.event.projects.length, 1); assert.equal(changed.data.projects[0], first.projects[0]);
   assert.equal(changed.data.projects[1].project.revision, 'new');
