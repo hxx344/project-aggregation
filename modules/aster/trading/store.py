@@ -327,11 +327,24 @@ class Store:
                         "pairs", "pair_members", "cycle_quality_history", "pair_cost_revision", "pair_cost_changes"}
             # New databases may have no tables yet. Historical paper data and
             # unknown tables must never be claimed by the anonymous interface.
-            if tables - expected or any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                                        for table in sorted(tables)):
+            if tables - expected or any(not Store._demo_claimable(db, table) for table in sorted(tables)):
                 raise TradingError("演示模式不能使用用途未确认的已有账本；请指定新的空数据目录，原数据保留")
         db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, data TEXT NOT NULL)")
         db.execute("INSERT INTO kv(key,data) VALUES ('runtime_mode',?)", (dumps(mode),))
+
+    @staticmethod
+    def _demo_claimable(db, table):
+        rows = db.execute(f"SELECT * FROM {table} LIMIT 2").fetchall()
+        if table != "kv" or not rows:
+            return not rows
+        # Initializing a new ledger seeds the default monitoring settings; only
+        # that exact untouched default leaves the ledger claimable as empty.
+        if len(rows) != 1 or rows[0]["key"] != monitoring.KEY:
+            return False
+        try:
+            return json.loads(rows[0]["data"]) == json.loads(json.dumps(monitoring.migrate_v1_to_v2({})))
+        except (TypeError, ValueError):
+            return False
 
     @staticmethod
     def account_defaults(account):

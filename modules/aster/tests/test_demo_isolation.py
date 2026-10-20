@@ -288,6 +288,24 @@ class DemoIsolationTests(unittest.TestCase):
             self.assertEqual(client.get("/api/state").status_code, 200)
         self.assertEqual(bound.get("runtime_mode"), "demo")
 
+    def test_only_untouched_default_monitoring_settings_keep_a_new_ledger_claimable(self):
+        fresh = Store(self.root / "fresh.sqlite3")
+        fresh.bind_runtime_mode(demo=True)
+        self.assertEqual(fresh.get("runtime_mode"), "demo")
+
+        def changed_settings(store):
+            store.put("monitoring_settings", {**store.get("monitoring_settings"), "feishu_enabled": False})
+
+        for name, change in (("changed settings", changed_settings),
+                             ("other row", lambda store: store.put("usd1_listings", {"rows": {}})),
+                             ("non-object settings", lambda store: store.put("monitoring_settings", "x"))):
+            with self.subTest(name):
+                store = Store(self.root / f"{name.replace(' ', '-')}.sqlite3")
+                change(store)
+                with self.assertRaisesRegex(TradingError, "用途未确认"):
+                    store.bind_runtime_mode(demo=True)
+                self.assertIsNone(store.get("runtime_mode"))
+
     def test_invalid_marker_fails_closed_for_both_modes(self):
         for value in (None, {}, "other"):
             for demo in (False, True):
