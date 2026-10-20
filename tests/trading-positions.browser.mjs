@@ -104,7 +104,7 @@ async (page) => {
 
   await page.getByRole('button', { name: '在 Asset 备用账本 管理账户', exact: true }).click();
   assert(new URL(page.url()).searchParams.get('id') === 'asset-two', 'manage account navigates to selected Asset project');
-  await page.getByRole('button', { name: '交易', exact: true }).click();
+  await page.getByRole('button', { name: '交易中心', exact: true }).click();
   await page.getByRole('heading', { name: '交易所仓位', exact: true }).waitFor();
   await page.locator('[data-position-id="btc-long"]').waitFor();
   assert(new URL(page.url()).searchParams.get('tradingSection') === 'positions' && oilReads() === 0, 'main navigation enters positions explicitly');

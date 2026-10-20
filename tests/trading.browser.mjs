@@ -121,7 +121,7 @@ async (page) => {
   assert(await page.getByRole('button', { name: '近7天', exact: true }).getAttribute('aria-pressed') === 'true', 'history restores range');
   holdReads = true;
   await page.getByRole('button', { name: '总览', exact: true }).click();
-  await page.getByRole('button', { name: '交易', exact: true }).click();
+  await page.getByRole('button', { name: '交易中心', exact: true }).click();
   await page.getByRole('button', { name: '原油四腿套利', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.trading-funding-summary')?.textContent.includes('12.4'));
   assert(await page.locator('.trading-initial').count() === 0, 'returning to trading displays the cached page before a held GET completes');

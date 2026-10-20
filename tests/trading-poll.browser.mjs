@@ -125,7 +125,7 @@ async (page) => {
   await page.evaluate(() => { window.dispatchEvent(new Event('focus')); window.dispatchEvent(new Event('pageshow')); document.dispatchEvent(new Event('visibilitychange')); });
   await advance(5000, 0);
   const returning = tradingResponse();
-  await page.getByRole('button', { name: '交易', exact: true }).click();
+  await page.getByRole('button', { name: '交易中心', exact: true }).click();
   await page.getByRole('button', { name: '原油四腿套利', exact: true }).click();
   await settle(returning); await checkFresh();
   expire = true;

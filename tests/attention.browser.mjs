@@ -37,7 +37,7 @@ async (page) => {
   assert(!panelText.includes('历史订单观察正常') && !panelText.includes('短暂配对'), 'notices and transient faults stay out of homepage');
   const aster = page.locator('.attention-item').filter({ hasText: 'ASTER 5X' });
   assert(await aster.locator('p').count() === 1, 'a pair has one merged message');
-  assert((await page.locator('.project-card').filter({ hasText: 'ASTER 5X' }).innerText()).includes('—'), 'missing volume remains missing');
+  assert((await page.locator('.module-row').filter({ hasText: 'ASTER 5X' }).innerText()).includes('—'), 'missing volume remains missing');
   await page.screenshot({ path: 'output/playwright/attention-desktop.png', fullPage: true });
   await page.locator('.attention-item').filter({ hasText: '认证异常项目' }).getByRole('button', { name: '检查连接' }).click();
   await page.getByRole('dialog').waitFor();

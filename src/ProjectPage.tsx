@@ -3,6 +3,7 @@ import { ExternalLink, FolderKanban, LoaderCircle, RefreshCw, Settings2 } from '
 import { api, ApiError } from './api';
 import type { Project, Snapshot } from './types';
 import DiagnosticDetails from './DiagnosticDetails';
+import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
 
@@ -141,13 +142,13 @@ export default function ProjectPage({ project, snapshot, now, active, background
   }
 
   return <section className="project-screen" hidden={!active} aria-label={project.name}>
-    <h1 className="visually-hidden">{project.name}</h1>
     <div className="original-page-toolbar">
+      <div className="module-heading"><span className={`project-icon ${project.category}`}><ProjectIcon category={project.category} size={16} /></span><h1>{project.name}</h1>{snapshot ? <Status state={snapshot.state} adapter={project.adapter} diagnostics={snapshot.diagnostics} /> : null}</div>
       <span className="original-page-loading" role="status">{loading ? <><LoaderCircle size={15} className="spin" />正在打开项目…</> : null}</span>
       <div className="original-page-actions">
-        {accessible && embedded ? <button className="button ghost" onClick={() => setAttempt(value => value + 1)}><RefreshCw size={16} />重新载入</button> : null}
-        {accessible ? <button className="button ghost" disabled={openingTab} onClick={() => void openInTab()}>{openingTab ? <LoaderCircle size={16} className="spin" /> : <ExternalLink size={16} />}单独打开</button> : null}
-        <button className="button ghost" onClick={onEdit}><Settings2 size={16} />模块设置</button>
+        {accessible && embedded ? <button className="button ghost" onClick={() => setAttempt(value => value + 1)}><RefreshCw size={15} />重新载入</button> : null}
+        {accessible ? <button className="button ghost" disabled={openingTab} onClick={() => void openInTab()}>{openingTab ? <LoaderCircle size={15} className="spin" /> : <ExternalLink size={15} />}单独打开</button> : null}
+        <button className="button ghost" onClick={onEdit}><Settings2 size={15} />模块设置</button>
       </div>
     </div>
     {snapshot ? <DiagnosticDetails snapshot={snapshot} now={now} /> : null}
