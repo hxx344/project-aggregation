@@ -10,7 +10,7 @@ const DAY = 86400000, INITIAL = Date.UTC(2025, 1, 7, 16);
 async function fixture(t, count = 63) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-trading-view-'));
   let db, trading, clock = INITIAL;
-  const queries = [], calls = [];
+  const queries = [], executed = [], calls = [];
   const events = Array.from({ length: count }, (_, i) => ({ id: `ledger-${i}`, exchange: 'binance', symbol: i % 2 ? 'CLUSDT' : 'BZUSDT', currency: 'USDT', amount: '0.1', time: new Date(INITIAL - 1000 - i * 1000).toISOString() }));
   const clientFactory = exchange => Object.fromEntries(['positions', 'verify', 'funding'].map(method => [method, async (_, options) => {
     calls.push({ exchange, method });
@@ -19,12 +19,18 @@ async function fixture(t, count = 63) {
   }]));
   function open() {
     db = new DatabaseSync(path.join(directory, 'fixture.sqlite'));
-    const traced = { exec(sql) { queries.push(sql); return db.exec(sql); }, prepare(sql) { queries.push(sql); return db.prepare(sql); } };
+    // Statements are cached after preparation, so record each execution as well as each prepare.
+    const track = (sql, statement) => new Proxy(statement, { get(target, key) {
+      const value = Reflect.get(target, key, target);
+      if (typeof value !== 'function') return value;
+      return ['run', 'get', 'all', 'iterate'].includes(key) ? (...args) => { executed.push(sql); return value.apply(target, args); } : value.bind(target);
+    } });
+    const traced = { exec(sql) { queries.push(sql); executed.push(sql); return db.exec(sql); }, prepare(sql) { queries.push(sql); return track(sql, db.prepare(sql)); } };
     trading = createTrading({ db: traced, encrypt: JSON.stringify, decrypt: JSON.parse, now: () => clock, intervalMs: 0, clientFactory });
   }
   open();
   t.after(async () => { await trading.close(); db.close(); await rm(directory, { recursive: true, force: true }); });
-  return { get trading() { return trading; }, get db() { return db; }, get now() { return clock; }, queries, calls, events,
+  return { get trading() { return trading; }, get db() { return db; }, get now() { return clock; }, queries, executed, calls, events,
     advance(ms) { clock += ms; },
     async connect() { for (const exchange of ['binance', 'bybit']) await trading.connect(exchange, { revision: 0, apiKey: 'fixture_only_key', apiSecret: 'fixture_only_secret' }); await trading.refresh(); },
     async reopen() { await trading.close(); db.close(); open(); },
@@ -34,7 +40,7 @@ async function fixture(t, count = 63) {
 test('paged cached reads do not scan histories, calculate PnL, write storage or contact exchanges', async t => {
   const f = await fixture(t); await f.connect();
   const reads = f.calls.length, stored = f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all();
-  f.queries.length = 0;
+  f.executed.length = 0;
   for (let i = 0; i < 5; i++) {
     const first = f.trading.state(7, { page: 0 }), second = f.trading.state(7, { page: 1 }), last = f.trading.state(7, { page: 1999 });
     assert.deepEqual(first.funding.pagination, { page: 0, pageSize: 50, pages: 2, total: 63 });
@@ -44,7 +50,8 @@ test('paged cached reads do not scan histories, calculate PnL, write storage or 
     assert.equal(new Set([...first.funding.events, ...second.funding.events].map(row => row.id)).size, 63);
   }
   assert.equal(f.calls.length, reads);
-  assert.ok(f.queries.every(sql => /^SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts/.test(sql)), f.queries.join('\n'));
+  assert.ok(f.executed.length > 0, 'cached reads must be traced');
+  assert.ok(f.executed.every(sql => /^SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts/.test(sql)), f.executed.join('\n'));
   assert.deepEqual(f.db.prepare('SELECT * FROM trading_views_v2 ORDER BY days').all(), stored);
   for (const page of [-1, 2000, 1.2, '1', NaN]) assert.throws(() => f.trading.state(7, { page }), error => error.status === 400);
 });
@@ -76,7 +83,7 @@ test('invalid, older-version or source-mismatched disk views rebuild from local 
 test('cached values keep their original time and degrade freshness without rebuilding', async t => {
   const f = await fixture(t, 0); await f.connect();
   const before = f.trading.state();
-  f.advance(76000); f.queries.length = 0;
+  f.advance(76000); f.executed.length = 0;
   const stale = f.trading.state();
   assert.equal(stale.generatedAt, before.generatedAt);
   assert.equal(stale.cache.builtAt, before.cache.builtAt);
@@ -88,7 +95,8 @@ test('cached values keep their original time and degrade freshness without rebui
   assert.equal(expired.funding.complete, false);
   assert.equal(expired.funding.net, null);
   assert.ok(expired.funding.daily.every(day => !day.complete && day.net === null));
-  assert.ok(f.queries.every(sql => sql.startsWith('SELECT exchange,revision,')));
+  assert.ok(f.executed.length > 0, 'cached reads must be traced');
+  assert.ok(f.executed.every(sql => sql.startsWith('SELECT exchange,revision,')), f.executed.join('\n'));
 });
 
 test('account replacement and disconnect immediately discard both cached ranges and old ledger pages', async t => {
