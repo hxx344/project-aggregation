@@ -26,7 +26,13 @@ jobs:
         id: pnpm
       - name: Locate pnpm content store
         id: pnpm-store
-        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+        # --store-dir appends the store version (v11), so the fixture receives
+        # the parent. Create it so a cache miss still has a writable store.
+        run: |
+          store="$(pnpm store path --silent)"
+          mkdir -p "$store"
+          echo "path=$store" >> "$GITHUB_OUTPUT"
+          echo "root=$(dirname "$store")" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
@@ -39,13 +45,10 @@ jobs:
           cache-dependency-path: |
             modules/greeks/requirements.lock
             modules/aster/requirements.lock
-      - run: pnpm install --frozen-lockfile
-      - name: Verify module selection, cache relocation and incremental type errors
-        run: node --test --test-concurrency=2 deploy/test-module-builds.mjs deploy/test-typecheck-cache.mjs
       - name: Check and build with immutable dependencies as the service account
         run: |
           pip_cache="$(python -m pip cache dir)"
-          sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" bash deploy/test-workspace.sh
+          sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" bash deploy/test-workspace.sh
       - name: Keep the verified deployment package
         uses: actions/upload-artifact@v7
         with:
@@ -54,6 +57,36 @@ jobs:
           if-no-files-found: error
           # The runtime tarball is already gzip-compressed.
           compression-level: 0
+
+  build-tooling:
+    name: Module selection and incremental type checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.15.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify module selection, cache relocation and incremental type errors
+        run: node --test --test-concurrency=2 deploy/test-module-builds.mjs deploy/test-typecheck-cache.mjs
+
+  aster-python:
+    name: Aster Python unit tests (locked dependencies)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: modules/aster/requirements.lock
+      - name: Run sharded unit tests from a fixed Git extraction
+        run: ASTER_TEST_PYTHON="$(command -v python)" bash deploy/test-aster-python.sh
+
   hygiene:
     name: Review gate (changed lines)
     runs-on: ubuntu-24.04
@@ -72,7 +105,8 @@ jobs:
           node --test tests/review-gate.test.mjs
           node scripts/review-ci.mjs
 
-  installer:
+  installer-release:
+    name: Installer (recovery, release and updater)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -117,6 +151,7 @@ jobs:
           bash -n deploy/test-inputs.sh
           bash -n deploy/test-incremental.sh
           bash -n deploy/test-workspace.sh
+          bash -n deploy/test-aster-python.sh
           bash -n deploy/workspace-test-jobs.sh
           bash -n deploy/test-workspace-parallel.sh
           bash -n deploy/test-module-incremental.sh
@@ -135,6 +170,16 @@ jobs:
           python3 deploy/test-release-cache.py -v
           sudo bash deploy/test-update-service.sh
           sudo env AGG_UPDATER_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-update-systemd.sh
+
+  installer-deploy:
+    name: Installer (activation, incremental and stack)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.15.0'
       - name: Check configuration, atomic activation, cleanup boundaries, and rollback
         run: bash deploy/test-install.sh
       - name: Classify real git inputs including compiler and build environment
@@ -205,7 +250,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, hygiene, installer, aster-relay, release-mirror]
+    needs: [app, build-tooling, aster-python, hygiene, installer-release, installer-deploy, aster-relay, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

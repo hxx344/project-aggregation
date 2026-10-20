@@ -9,8 +9,15 @@
 - 根项目和 Crossex 的 TypeScript 检查将增量信息保存在各自
   `.build-cache/.tsbuildinfo`。重复检查可以复用结果，源码变化仍执行类型验证；
   缓存缺失时正常进行完整检查。它不等同于跨 GitHub Actions 运行的产物缓存。
-- CI 的 `deploy/test-workspace.sh` 保留 Python 准备/测试与前端检查/构建两个独立任务。
+- CI 的 `deploy/test-workspace.sh` 按依赖并行：Python 环境准备、前端检查、模块构建三个任务
+  同时运行；组装和打包完成后，根行为测试与源码发布目录、解包发布包两项隔离包检查同时运行。
+  打包先于根行为测试，避免测试在同一源码树写入的文件进入发布包。
   `deploy/workspace-test-jobs.sh` 负责传播失败和取消时清理进程组。
+- 夹具通过 `INSTALL_TEST_PNPM_STORE` 复用 actions/cache 恢复的 pnpm 内容 store，只省去包下载；
+  生产安装器仍执行冻结复制安装和生命周期脚本，并关闭 side-effects 缓存，依赖构建钩子照常执行。
+- ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
+  Git 归档为每个分片提取独立源码树，按原四组运行，其中交易组按模块分片并发，最后汇总测试数。
+  模块选择与增量类型检查、安装器两组检查也拆成并行作业，`release` 等待全部作业通过。
 - `actions/setup-python` 按两份 `requirements.lock` 缓存 pip 下载。CI 将
   `python -m pip cache dir` 的结果作为 `INSTALL_TEST_PIP_CACHE` 传给工作区检查，
   两个虚拟环境均显式使用该目录，继续验证锁文件中的哈希。未指定路径时使用
