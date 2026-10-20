@@ -157,16 +157,16 @@ function renderPayoff(preview) {
   const values = samples.map((point) => point.pnl); const min = Math.min(...values, 0); const max = Math.max(...values, 0); const pad = Math.max(50, (max - min) * 0.12); const yMin = min - pad; const yMax = max + pad; const left = 48; const right = 15; const top = unbounded ? 66 : 18; const bottom = 28;
   const x = (price) => left + (price - low) / (high - low) * (width - left - right); const y = (pnl) => top + (yMax - pnl) / (yMax - yMin) * (height - top - bottom);
   ctx.clearRect(0, 0, width, height); ctx.font = '10px Segoe UI, system-ui, sans-serif';
-  for (let index = 0; index <= 4; index += 1) { const pnl = yMin + (yMax - yMin) * index / 4; const yp = y(pnl); ctx.strokeStyle = '#26352a'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(left, yp); ctx.lineTo(width - right, yp); ctx.stroke(); ctx.fillStyle = '#8d9e91'; ctx.fillText(`${pnl >= 0 ? '+' : ''}${Math.round(pnl).toLocaleString()}`, 5, yp + 3); }
-  const zeroY = y(0); ctx.strokeStyle = '#667e6c'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(width - right, zeroY); ctx.stroke(); ctx.setLineDash([]);
+  for (let index = 0; index <= 4; index += 1) { const pnl = yMin + (yMax - yMin) * index / 4; const yp = y(pnl); ctx.strokeStyle = '#212831'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(left, yp); ctx.lineTo(width - right, yp); ctx.stroke(); ctx.fillStyle = '#7A8591'; ctx.fillText(`${pnl >= 0 ? '+' : ''}${Math.round(pnl).toLocaleString()}`, 5, yp + 3); }
+  const zeroY = y(0); ctx.strokeStyle = '#7A8591'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(left, zeroY); ctx.lineTo(width - right, zeroY); ctx.stroke(); ctx.setLineDash([]);
   ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.lineTo(x(samples[samples.length - 1].price), zeroY); ctx.lineTo(x(samples[0].price), zeroY); ctx.closePath();
   ctx.save(); ctx.clip();
-  ctx.fillStyle = 'rgba(155, 205, 176, .10)'; ctx.fillRect(left, top, width - left - right, zeroY - top);
-  ctx.fillStyle = 'rgba(223, 159, 153, .06)'; ctx.fillRect(left, zeroY, width - left - right, height - bottom - zeroY);
+  ctx.fillStyle = 'rgba(45, 190, 135, .10)'; ctx.fillRect(left, top, width - left - right, zeroY - top);
+  ctx.fillStyle = 'rgba(242, 98, 107, .07)'; ctx.fillRect(left, zeroY, width - left - right, height - bottom - zeroY);
   ctx.restore();
-  ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.strokeStyle = '#bedcc6'; ctx.lineWidth = 2.4; ctx.stroke();
-  for (const strike of strikes) { const xp = x(strike); ctx.strokeStyle = '#405e49'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#a9bbaf'; ctx.textAlign = 'center'; ctx.fillText(`${Math.round(strike).toLocaleString()}`, xp, height - 9); }
-  const spot = Number(preview.btc_price || 0); if (spot >= low && spot <= high) { const xp = x(spot); ctx.strokeStyle = '#d6bc86'; ctx.setLineDash([5, 3]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#d6bc86'; ctx.textAlign = 'center'; ctx.fillText(`BTC ${Math.round(spot).toLocaleString()}`, xp, 11); }
+  ctx.beginPath(); samples.forEach((point, index) => index ? ctx.lineTo(x(point.price), y(point.pnl)) : ctx.moveTo(x(point.price), y(point.pnl))); ctx.strokeStyle = '#38BDF8'; ctx.lineWidth = 2.4; ctx.stroke();
+  for (const strike of strikes) { const xp = x(strike); ctx.strokeStyle = '#3A4450'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#A3ADB9'; ctx.textAlign = 'center'; ctx.fillText(`${Math.round(strike).toLocaleString()}`, xp, height - 9); }
+  const spot = Number(preview.btc_price || 0); if (spot >= low && spot <= high) { const xp = x(spot); ctx.strokeStyle = '#F0B03F'; ctx.setLineDash([5, 3]); ctx.beginPath(); ctx.moveTo(xp, top); ctx.lineTo(xp, height - bottom); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = '#F0B03F'; ctx.textAlign = 'center'; ctx.fillText(`BTC ${Math.round(spot).toLocaleString()}`, xp, 11); }
   const breaks = []; for (let index = 1; index < samples.length; index += 1) { if ((samples[index - 1].pnl < 0) !== (samples[index].pnl < 0)) { const a = samples[index - 1]; const b = samples[index]; breaks.push(a.price + (0 - a.pnl) * (b.price - a.price) / (b.pnl - a.pnl)); } }
   const maxProfit = Number(preview.net_credit_usd); const current = spot ? payoffAt(spot, preview) : 0;
   $('payoffStats').innerHTML = `<div class="payoff-stat"><span>现价对应到期盈亏</span><strong class="${current >= 0 ? 'profit' : 'loss'}">${money(current)}</strong></div><div class="payoff-stat"><span>最大收益</span><strong class="profit">${Number.isFinite(maxProfit) ? money(maxProfit) : '--'}</strong></div><div class="payoff-stat"><span>最大亏损</span><strong class="loss">${unbounded ? '无上限' : optionalMoney(preview.max_loss_usd)}</strong></div><div class="payoff-stat"><span>盈亏平衡</span><strong>${breaks.length ? breaks.map((point) => Math.round(point).toLocaleString()).join(' / ') : '--'}</strong></div>`;
@@ -392,7 +392,7 @@ async function loadMarket() {
       $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : quoteStatus;
       $('statusSub').textContent = config.trading_blocked_reason || notice;
       $('updateText').textContent = fresh ? '行情更新正常 · 策略等待' : `${quoteStatus} · 等待更新`;
-      $('updateDot').style.background = '#d6bc86';
+      $('updateDot').style.background = '#F0B03F';
       return;
     }
     if (payload.status === 'waiting_for_listing') {
@@ -414,7 +414,7 @@ async function loadMarket() {
       $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : (chain.expiry && chain.items?.length ? '备用盘口 · 只读' : '等待合约上线');
       $('statusSub').textContent = config.trading_blocked_reason || payload.message;
       $('updateText').textContent = '行情已连接 · 自动检查合约';
-      $('updateDot').style.background = '#d6bc86';
+      $('updateDot').style.background = '#F0B03F';
       return;
     }
     if ($('chainPanel')) $('chainPanel').dataset.availability = 'ready';
@@ -428,9 +428,9 @@ async function loadMarket() {
     updateTradeControls();
     const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
     $('statusValue').dataset.state = age > config.quote_stale_seconds ? 'waiting' : 'ready';
-    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#df9f99' : '#bedcc6';
+    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#F2626B' : '#2DBE87';
     if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
-  } catch (error) { if (!current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#df9f99'; }
+  } catch (error) { if (!current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#F2626B'; }
   finally { read.finish(); }
 }
 let ordersSnapshot = null;

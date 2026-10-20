@@ -4,6 +4,8 @@
   const location = window.location;
   const embedded = window.parent !== window && /^p-[a-f0-9]{24}\.hub\.localhost$/.test(location.hostname)
     && ['http:', 'https:'].includes(location.protocol);
+  // Loaded synchronously from <head>, so the workbench-duplicated header is hidden before first paint.
+  if (embedded) document.documentElement?.classList?.add('hub-embedded');
   const origin = embedded ? `${location.protocol}//hub.localhost${location.port ? `:${location.port}` : ''}` : null;
   const tasks = new Map();
   let ready = false, active = !embedded, background = !embedded, started = false;
