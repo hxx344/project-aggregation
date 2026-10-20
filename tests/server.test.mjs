@@ -563,7 +563,10 @@ test('concurrent partial login bodies reserve quota before await and success rel
   assert.equal((await f.login()).status, 429);
   extra.end('}'); assert.equal(await extraResponse, 401);
   for (const part of partials.slice(1)) part.req.end(part.remainder);
-  assert.deepEqual(await Promise.all(partials.slice(1).map(part => part.response)), Array(9).fill(401));
+  // Every failure counts toward the account lockout: three more 401s, then the fifth failure locks.
+  const statuses = await Promise.all(partials.slice(1).map(part => part.response));
+  assert.equal(statuses.filter(status => status === 401).length, 3, statuses.join(','));
+  assert.equal(statuses.filter(status => status === 429).length, 6, statuses.join(','));
 });
 
 test('malformed login bodies consume quota and a valid login works after the window expires', async t => {

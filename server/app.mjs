@@ -56,9 +56,10 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null } = {}) {
+export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null } = {}) {
   validateBaselineInterval(baselineIntervalMs);
   if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
+  if (!Number.isInteger(accountLockoutMs) || accountLockoutMs < 1000 || accountLockoutMs > 86400000) throw new RangeError('accountLockoutMs 必须为 1000 至 86400000 的整数（毫秒）');
   if (!Array.isArray(warmupProjects) || warmupProjects.some(id => typeof id !== 'string')) throw new TypeError('warmupProjects 必须为项目 ID 字符串数组');
   const warmupProjectIds = new Set(warmupProjects.map(id => id.trim()).filter(Boolean));
   const configuredOrigin = publicOrigin ? validateAuthOrigin(publicOrigin) : '';
@@ -180,9 +181,11 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     }));
   }
   const loginAttempts = new Map(); // IP-based rate limiting
-  const accountLockouts = new Map(); // Account-level lockout: tracks failed password attempts
-  const ACCOUNT_LOCKOUT_THRESHOLD = 5; // Lock after 5 failed attempts
-  const ACCOUNT_LOCKOUT_DURATION = 30 * 60000; // 30 minutes lockout
+  // Account-level lockout: failures within accountLockoutMs of the first one, password checks in flight, and the lock deadline.
+  const accountLockouts = new Map();
+  const ACCOUNT_LOCKOUT_THRESHOLD = 5;
+  // A lock expires at its deadline; unlocked failures expire one lockout period after the first failure.
+  const expireLockouts = now => { for (const [account, lockout] of accountLockouts) if (!lockout.pending && (lockout.until ? lockout.until <= now : now - lockout.firstFailureAt >= accountLockoutMs)) accountLockouts.delete(account); };
   let closed = false;
   const updateStream = createUpdateStream({ readState: updates.status,
     isSessionActive: id => !closed && !!stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
@@ -334,52 +337,55 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       sameOrigin(req);
       const ip = req.socket.remoteAddress || 'unknown'; const now = Date.now();
 
-      // Clean up expired rate limit entries
       for (const [address, attempt] of loginAttempts) if (attempt.until < now) loginAttempts.delete(address);
-      // Only delete lockouts that have expired (until > 0 and until < now), keep tracking failed attempts
-      for (const [account, lockout] of accountLockouts) if (lockout.until > 0 && lockout.until < now) accountLockouts.delete(account);
+      expireLockouts(now);
+      const accountId = 'global'; // Single-account system
+      const locked = lockout => lockout && lockout.until > Date.now() ? new HttpError(429, `账户已被锁定，请 ${Math.ceil((lockout.until - Date.now()) / 60000)} 分钟后重试`) : null;
+      const lockedError = locked(accountLockouts.get(accountId));
+      if (lockedError) throw lockedError;
 
-      // Check account-level lockout first (prevents brute force even from distributed IPs)
-      const accountId = 'global'; // Single-account system, use 'global' as identifier
-      const lockout = accountLockouts.get(accountId);
-      if (lockout && lockout.until > 0 && lockout.until > now) {
-        const remainingMinutes = Math.ceil((lockout.until - now) / 60000);
-        throw new HttpError(429, `账户已被锁定，请 ${remainingMinutes} 分钟后重试`);
-      }
-
-      // Check IP-based rate limiting
       const attempt = loginAttempts.get(ip) || { count: 0, until: now + loginWindowMs };
       if (attempt.count >= 10) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
-
       // Reserve before reading the body: partial concurrent requests share one quota.
       attempt.count += 1; loginAttempts.set(ip, attempt);
       const body = await bodyOf(req);
-      const passwordVersion = getSetting('password');
 
-      // Verify password
-      const passwordValid = typeof body.password === 'string' && body.password.length <= 1024 && await passwordMatches(body.password, passwordVersion) && getSetting('password') === passwordVersion;
+      // Reserve an account slot after the body arrives, so held-open bodies cannot block logins,
+      // and before hashing, so concurrent guesses cannot exceed the remaining failure budget.
+      expireLockouts(Date.now());
+      const reserved = accountLockouts.get(accountId) || { failedAttempts: 0, pending: 0, until: 0, firstFailureAt: 0 };
+      const reservedError = locked(reserved);
+      if (reservedError) throw reservedError;
+      if (reserved.failedAttempts + reserved.pending >= ACCOUNT_LOCKOUT_THRESHOLD) throw new HttpError(429, '登录尝试过多，请稍后重试');
+      reserved.pending += 1; accountLockouts.set(accountId, reserved);
+      let passwordValid;
+      try {
+        const passwordVersion = getSetting('password');
+        passwordValid = typeof body.password === 'string' && body.password.length <= 1024 && await passwordMatches(body.password, passwordVersion) && getSetting('password') === passwordVersion;
+      } finally { reserved.pending -= 1; }
 
+      // The record cannot be removed while a check is pending, so update it in place instead of writing back a stale copy.
       if (!passwordValid) {
-        // Increment failed attempts counter
-        const currentFailedAttempts = lockout?.failedAttempts || 0;
-        const failedAttempts = currentFailedAttempts + 1;
-        log.warn({ ip, failedAttempts, type: 'auth_failed' }, '登录失败');
-
-        // Check if THIS failure triggers lockout (check AFTER incrementing)
-        if (failedAttempts >= ACCOUNT_LOCKOUT_THRESHOLD) {
-          accountLockouts.set(accountId, { failedAttempts, until: now + ACCOUNT_LOCKOUT_DURATION });
-          log.error({ ip, failedAttempts, type: 'account_locked' }, '账户已被锁定');
-          throw new HttpError(429, `连续登录失败过多，账户已被锁定 30 分钟`);
-        } else {
-          // Track failed attempts but don't set lockout time yet
-          accountLockouts.set(accountId, { failedAttempts, until: 0 });
+        const failedAt = Date.now();
+        if (!reserved.failedAttempts) reserved.firstFailureAt = failedAt;
+        reserved.failedAttempts += 1;
+        log.warn({ ip, failedAttempts: reserved.failedAttempts, type: 'auth_failed' }, '登录失败');
+        const alreadyLocked = locked(reserved);
+        if (alreadyLocked) throw alreadyLocked;
+        if (reserved.failedAttempts >= ACCOUNT_LOCKOUT_THRESHOLD) {
+          reserved.until = failedAt + accountLockoutMs;
+          log.error({ ip, failedAttempts: reserved.failedAttempts, type: 'account_locked' }, '账户已被锁定');
+          throw new HttpError(429, `连续登录失败过多，账户已被锁定 ${Math.ceil(accountLockoutMs / 60000)} 分钟`);
         }
         throw new HttpError(401, '登录密码不正确');
       }
+      // A lock set by concurrent failures while this password was being checked still applies.
+      const lockedAfterCheck = locked(reserved);
+      if (lockedAfterCheck) throw lockedAfterCheck;
 
-      // Successful login: clear account lockout and release IP quota
       log.info({ ip, type: 'auth_success' }, '登录成功');
-      accountLockouts.delete(accountId);
+      reserved.failedAttempts = 0; reserved.firstFailureAt = 0;
+      if (!reserved.pending) accountLockouts.delete(accountId);
       if (loginAttempts.get(ip) === attempt) { attempt.count -= 1; if (attempt.count === 0) loginAttempts.delete(ip); }
 
       stmt.prepare('DELETE FROM sessions WHERE expires<=?').run(now);
