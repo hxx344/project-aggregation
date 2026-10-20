@@ -91,13 +91,25 @@ done
 echo ""
 echo "=== 阶段 3: 触发稳定版发布 ==="
 echo "触发发布: $commit_sha"
+# 记录触发前已有的 run，只认触发后新出现的那一个，避免误盯上一次发布的结果。
+previous_runs=$(gh run list --workflow=promote-release.yml --event workflow_dispatch --limit 50 --json databaseId --jq '[.[].databaseId]')
 gh workflow run promote-release.yml -f commit="$commit_sha"
-sleep 5
 
 # 4. 监控发布
 echo ""
 echo "=== 阶段 4: 监控发布 ==="
-release_run=$(gh run list --workflow=promote-release.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+release_run=""
+for _ in $(seq 1 24); do
+  # previous_runs 是 gh 输出的数字数组，可直接作为 jq 字面量。
+  release_run=$(gh run list --workflow=promote-release.yml --event workflow_dispatch --limit 50 --json databaseId \
+    --jq "[.[].databaseId | select(. as \$id | $previous_runs | index(\$id) | not)] | first // empty" 2>/dev/null || true)
+  [ -n "$release_run" ] && break
+  sleep 5
+done
+if [ -z "$release_run" ]; then
+  echo "❌ 触发后 120 秒内没有出现新的发布 run，请在 GitHub Actions 中确认"
+  exit 1
+fi
 echo "监控发布 run: $release_run"
 
 while true; do
