@@ -21,6 +21,10 @@ while true; do
   ci_runs=$(gh run list --commit "$commit_sha" --workflow=ci.yml --json status,conclusion,databaseId --limit 1)
 
   if [ "$(echo "$ci_runs" | jq length)" -eq 0 ]; then
+    if [ $elapsed -gt 180 ]; then
+      echo "❌ 180s 内没有 CI 运行：纯文档提交不触发 Checks，也不生成候选版；请发布下一个代码提交"
+      exit 1
+    fi
     echo "[$(date +%H:%M:%S)] 等待 CI 启动... (${elapsed}s)"
     sleep 10
     continue

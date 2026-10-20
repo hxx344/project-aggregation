@@ -1,9 +1,27 @@
 name: Checks
 
+# Documentation-only changes run docs.yml instead; keep its paths the inverse
+# of this list. NOTICE files ship in the release package, so they still count.
 on:
   push:
     branches: [main]
+    paths:
+      - '**'
+      - '!docs/**/*.md'
+      - '!docs/**/*.txt'
+      - '!docs/**/*.rst'
+      - '!*.md'
+      - 'NOTICE.md'
+      - 'THIRD_PARTY_NOTICES.md'
   pull_request:
+    paths:
+      - '**'
+      - '!docs/**/*.md'
+      - '!docs/**/*.txt'
+      - '!docs/**/*.rst'
+      - '!*.md'
+      - 'NOTICE.md'
+      - 'THIRD_PARTY_NOTICES.md'
   workflow_dispatch:
 
 permissions:
