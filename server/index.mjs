@@ -46,7 +46,13 @@ try {
   app = await createApp({ logger, dataDir, embeddedModules: true, accountWriter });
   runtimeLock.assertHeld();
   if (closing) throw new Error('工作台启动已中止');
-} catch (error) { finishStartup(); await shutdown(1); throw error; }
+} catch (error) {
+  // shutdown() ends with process.exit, so the cause must be logged before it; a signal,
+  // lost lock or module failure already logged why startup was aborted.
+  if (closing) logger.warn({ err: error, type: 'startup' }, '工作台启动已中止');
+  else logger.error({ err: error, type: 'startup' }, '工作台启动失败');
+  finishStartup(); await shutdown(1); throw error;
+}
 finally { finishStartup(); }
 app.server.listen(port, host, () => logger.info({ port, host, type: 'startup' }, `工作台已启动：http://${host}:${port}`));
 app.server.once('error', error => { logger.error({ err: error }, '工作台监听失败'); void shutdown(1); });
