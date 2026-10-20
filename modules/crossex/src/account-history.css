@@ -1,5 +1,5 @@
 .account-history .history-statement{display:flex;gap:12px;align-items:baseline;justify-content:space-between;margin:5px 0}
 .account-history td>button{margin-top:8px}
-.account-history .account-history-detail>td{padding:12px 18px;background:#09151c}
-.account-history-detail .table-wrap{border:1px solid #233442;border-radius:5px}
+.account-history .account-history-detail>td{padding:12px 18px;background:var(--surface-1)}
+.account-history-detail .table-wrap{border:1px solid var(--surface-5);border-radius:5px}
 @media(max-width:760px){.account-history .account-history-detail{display:block;padding:0}.account-history .account-history-detail>td{padding:10px;width:100%}.account-history .account-history-detail>td::before{display:none}.account-history .history-statement{gap:8px;flex-wrap:wrap}}

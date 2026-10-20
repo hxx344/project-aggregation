@@ -1,27 +1,36 @@
 /* Shared dark palette; layout and component rules remain in styles.css. */
+/* Values mirror the workbench palette so standalone and embedded views match. */
 :root {
   /* ===== Color Palette ===== */
-  /* Surface Layers - Deep teal-tinted dark palette (6 layers) */
-  --surface-0: #05080C;  /* Darkest - main background */
-  --surface-1: #0A0F14;  /* Navigation, secondary backgrounds */
-  --surface-2: #0F151C;  /* Cards, panels */
-  --surface-3: #161E26;  /* Hover states, overlays */
-  --surface-4: #1E2831;  /* Borders, dividers */
-  --surface-5: #28333D;  /* Darker borders */
-  --surface-6: #323F4A;  /* Deep shadows */
+  --surface-0: #0A0D11;  /* Page background */
+  --surface-1: #0E1217;  /* Navigation, secondary backgrounds */
+  --surface-2: #10141A;  /* Cards, panels */
+  --surface-3: #161B22;  /* Hover states, overlays */
+  --surface-4: #212831;  /* Borders, dividers */
+  --surface-5: #2E3640;  /* Input borders */
+  --surface-6: #3A4450;  /* Strong borders */
 
   /* Accent Colors */
-  --accent: #38BDF8;           /* Primary action - bright cyan */
-  --accent-dim: #0EA5E9;       /* Hover state */
-  --accent-subtle: #1E3A52;    /* Background tint */
-  --emerald: #6EE7B7;          /* Success - bright teal-green */
-  --emerald-dim: #34D399;      /* Hover state */
-  --warning: #FBBF24;          /* Alert - amber */
-  --error: #F87171;            /* Danger - red */
+  --accent: #38BDF8;
+  --accent-dim: #0EA5E9;
+  --accent-subtle: rgba(56,189,248,.12);
+  --emerald: #2DBE87;          /* Up / long / success */
+  --emerald-dim: #24A576;
+  --emerald-soft: rgba(45,190,135,.13);
+  --emerald-border: rgba(45,190,135,.3);
+  --warning: #F0B03F;
+  --warning-soft: rgba(240,176,63,.13);
+  --warning-border: rgba(240,176,63,.3);
+  --error: #F2626B;            /* Down / short / error */
+  --error-soft: rgba(242,98,107,.13);
+  --error-border: rgba(242,98,107,.3);
+  --info: #6EA8FE;
 
-  /* Text Colors - High contrast for accessibility */
-  --text-primary: #F0F4F8;     /* Primary text */
-  --text-secondary: #B0BEC8;   /* Secondary text */
-  --text-tertiary: #7A8A98;    /* Tertiary/muted text */
+  /* Text Colors */
+  --text-primary: #E6EAF0;
+  --text-secondary: #A3ADB9;
+  --text-tertiary: #7A8591;
 
+  --font-sans: "Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",sans-serif;
+  --font-mono: "Cascadia Mono","JetBrains Mono","SF Mono",Consolas,monospace;
 }
