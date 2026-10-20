@@ -31,6 +31,7 @@
   --warning-soft:rgba(240,176,63,.13);
   --error-soft:rgba(242,98,107,.13);
   --info-soft:rgba(110,168,254,.13);
+  --warning-border:rgba(240,176,63,.3);
 
   --text-primary:#E6EAF0;
   --text-secondary:#A3ADB9;
