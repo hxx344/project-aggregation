@@ -29,6 +29,14 @@
   GitHub 的路径过滤只看前 300 个改动文件，只有前 300 个全是文档时才可能漏跑，同样无法发布。
 - ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
   Git 归档为每个分片提取独立源码树，按原四组运行，其中交易组按模块分片并发，最后汇总测试数。
+  `tests/` 下其余模块自动归入 discovered 组并分片运行，新增测试文件无需登记；
+  `test_cycle_volume_execution` 的两个约 50 秒的方法各占一个分片。CI 用 `ASTER_TEST_PART`
+  把 listed、discovered、slow 三部分分到三台 runner，每部分都校验每个模块恰好属于一处。
+- Monitor、Crossex、Asset 的 Node 测试和 Greeks、Asset 的 Python 测试不需要构建产物，由
+  `deploy/test-module-units.sh` 在 `module-units` 作业中并发运行，参数与各模块 `package.json`
+  的 test 脚本一致。
+- `deploy/test-exclusions.txt` 列出暂未通过、因此不运行的测试文件及原因；修好后删掉对应行即可
+  接入，条目对应的文件不存在时检查失败。
   模块选择与增量类型检查、安装器两组检查也拆成并行作业，`release` 等待全部作业通过。
 - `actions/setup-python` 按两份 `requirements.lock` 缓存 pip 下载。CI 将
   `python -m pip cache dir` 的结果作为 `INSTALL_TEST_PIP_CACHE` 传给工作区检查，
