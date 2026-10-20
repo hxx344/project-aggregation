@@ -36,7 +36,7 @@ Windows 原生 Node，真实生产构建，Codex 内置浏览器。基线为 `6d
 更新工作台可使用现有幂等安装入口：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash -s -- --only hub
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash -s -- --only hub
 ```
 
 只检查和更新工作台，保留已有配置与数据；内容和环境未变化时复用已有构建与验证结果。若四个模块还未更新至支持活动状态协议的版本，应先使用默认安装入口更新全部模块。

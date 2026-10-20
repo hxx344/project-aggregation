@@ -37,7 +37,7 @@
 统一入口会检测并更新发生变化的模块，保留既有配置与数据；无变化的部分沿用安装器的增量跳过机制：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/install-all.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
 ```
 
 升级后重新加载工作台页面。外部行情源仍可能出现真实断流；恢复机制和性能优化不会延长其有效期或把旧值当作新数据。
