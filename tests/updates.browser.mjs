@@ -223,6 +223,13 @@ async (page) => {
   state.planId = null;
   await emit();
   await page.getByRole('heading', { name: '更新已完成', exact: true }).waitFor();
+  await page.getByText('更新已完成，正在刷新页面以载入新版本和重启后的模块连接。', { exact: true }).waitFor();
+  assert(await page.locator('.update-nav').getAttribute('aria-label') === '系统更新：更新已完成，正在刷新页面', 'navigation announces the automatic reload');
+  const reloaded = page.waitForEvent('load'); await advance(1_600); await reloaded;
+  await emit(); await openUpdates();
+  await page.getByRole('heading', { name: '更新已完成', exact: true }).waitFor();
+  assert(await page.getByText('更新已完成，正在刷新页面以载入新版本和重启后的模块连接。', { exact: true }).count() === 0, 'a page loaded after completion does not reload again');
+  assert(applies.length === 1, 'the automatic reload never resubmits the update');
 
   await makeAvailable('plan-two'); loseApplyResponse = true;
   await page.reload(); await emit(); await openUpdates();
@@ -303,5 +310,5 @@ async (page) => {
   assert(await page.evaluate(() => window.__updateStreams.every(stream => stream.closed)), 'session expiry closes all update streams');
   assert(errors.length === 0, `browser errors: ${errors.join('; ')}`);
   assert(checks.length === 3, 'only the three explicit manual clicks send check requests');
-  return { passed: true, reads, checks: checks.length, confirmedUpdates: applies.length, scenarios: ['stable versions', 'release notes keyboard disclosure and plain text', 'release notes freshness and legacy fallback', 'mobile long release notes', 'no automatic checks', 'hidden stream', 'hidden fallback', 'heartbeat timeout', 'offline recovery', 'stale GET isolation', 'two-step confirmation', 'unchanged plan while checking', 'double-click protection', 'late apply response', 'structured progress', 'restart reconnect', 'refresh recovery', 'lost apply response', 'late check response', 'failed check with old cache', 'check failure', 'legacy setup', 'mobile focus', 'seven-module confirmation', 'stale plan', 'plan expiry', 'session expiry'], screenshots: ['updates-desktop.png', 'updates-review.png', 'updates-progress.png', 'updates-mobile.png', 'updates-mobile-review.png', 'updates-notes-desktop.png', 'updates-notes-mobile.png'] };
+  return { passed: true, reads, checks: checks.length, confirmedUpdates: applies.length, scenarios: ['stable versions', 'release notes keyboard disclosure and plain text', 'release notes freshness and legacy fallback', 'mobile long release notes', 'no automatic checks', 'hidden stream', 'hidden fallback', 'heartbeat timeout', 'offline recovery', 'stale GET isolation', 'two-step confirmation', 'unchanged plan while checking', 'double-click protection', 'late apply response', 'structured progress', 'restart reconnect', 'refresh recovery', 'automatic reload after observed success', 'lost apply response', 'late check response', 'failed check with old cache', 'check failure', 'legacy setup', 'mobile focus', 'seven-module confirmation', 'stale plan', 'plan expiry', 'session expiry'], screenshots: ['updates-desktop.png', 'updates-review.png', 'updates-progress.png', 'updates-mobile.png', 'updates-mobile-review.png', 'updates-notes-desktop.png', 'updates-notes-mobile.png'] };
 }

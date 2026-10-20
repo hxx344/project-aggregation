@@ -7,6 +7,7 @@ import { getUpdateProgress, getUpdateTimingSummary } from './update-progress';
 import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
+const RELOAD_DELAY = 1_500;
 type RequestKind = 'read' | 'check' | 'apply' | 'token';
 const moduleLabels = { current: '已是最新', available: '可更新', unavailable: '检查未完成', unmanaged: '需手动更新' };
 const jobLabels = { queued: '更新已排队', running: '正在更新', succeeded: '更新已完成', failed: '上次更新未完成', interrupted: '上次更新已中断' };
@@ -122,6 +123,8 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const failedCheckAt = useRef<string | null | undefined>(undefined);
   const submittedPlan = useRef<string | null>(null);
   const uncertainRef = useRef<{ previousJobId: string | null; failed: boolean } | null>(null);
+  // Only a job this page saw running or submitted may reload it, so a page opened after completion never loops.
+  const watchedJob = useRef<string | null>(null);
   const refreshFallback = useRef<() => void>(() => {});
   const reviewElement = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
@@ -136,6 +139,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     }
     const attempt = uncertainRef.current;
     const foundJob = !!data.job && data.job.id !== attempt?.previousJobId;
+    if (data.job && (running(data.job) || (attempt && foundJob))) watchedJob.current = data.job.id;
     if (attempt && (foundJob || (attempt.failed && confirmMissingJob))) {
       if (!foundJob && !running(data.job)) setActionNotice('已恢复连接。未发现新的更新任务，请重新检查版本后再试。');
       uncertainRef.current = null;
@@ -185,7 +189,10 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
         failedCheckAt.current = undefined;
         setCheckRequestFailed(false);
       }
-      if (kind === 'apply') { uncertainRef.current = null; setUncertain(false); }
+      if (kind === 'apply') {
+        if (data.job && data.job.id !== previousJobId) watchedJob.current = data.job.id;
+        uncertainRef.current = null; setUncertain(false);
+      }
       if (kind === 'token') {
         // HTTP success confirms the write even when a newer stream snapshot wins.
         setToken('');
@@ -334,6 +341,14 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const active = !!snapshot?.checking || running(snapshot?.job) || uncertain;
   useEffect(() => { if (active) refreshFallback.current(); }, [active]);
 
+  // Restarted modules and the new frontend bundle are only picked up by a full page load.
+  const reloading = snapshot?.job?.status === 'succeeded' && snapshot.job.id === watchedJob.current;
+  useEffect(() => {
+    if (!reloading) return;
+    const timer = setTimeout(() => location.reload(), RELOAD_DELAY);
+    return () => clearTimeout(timer);
+  }, [reloading]);
+
   useEffect(() => {
     const expiresIn = snapshot?.expiresAt ? Date.parse(snapshot.expiresAt) - Date.now() : 0;
     if (expiresIn <= 0 || !Number.isFinite(expiresIn)) return;
@@ -374,7 +389,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const reviewModeInvalid = !!review && (review.modeSupported !== modeSupported || modeSupported && !deploymentModes.includes(review.deployMode));
   const reviewInvalid = !!review && (review.planId !== snapshot?.planId || expired || reviewModeInvalid);
   const blocked = !snapshot?.enabled || !snapshot.planId || expired || !!snapshot.checkError || checkRequestFailed || !!networkError || pending !== null || updating || checking || uncertain || !changes.length || snapshot.planId === submittedPlan.current;
-  const summary = networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? recoveries.length === changes.length ? `${changes.length} 个待完成更新` : `${changes.length} 个可用更新${recoveries.length ? `（含 ${recoveries.length} 个待完成）` : ''}` : incomplete ? '部分模块待处理' : different ? '当前版本与正式版不同' : unconfirmed ? '版本待确认' : snapshot?.checkedAt && modules.length ? lastUpdateIssue ? `版本已对齐，${lastUpdateIssue}` : '已是最新正式版' : lastUpdateIssue || (snapshot ? '尚无检查结果' : '正在读取状态');
+  const summary = reloading ? '更新已完成，正在刷新页面' : networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? recoveries.length === changes.length ? `${changes.length} 个待完成更新` : `${changes.length} 个可用更新${recoveries.length ? `（含 ${recoveries.length} 个待完成）` : ''}` : incomplete ? '部分模块待处理' : different ? '当前版本与正式版不同' : unconfirmed ? '版本待确认' : snapshot?.checkedAt && modules.length ? lastUpdateIssue ? `版本已对齐，${lastUpdateIssue}` : '已是最新正式版' : lastUpdateIssue || (snapshot ? '尚无检查结果' : '正在读取状态');
   const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete || different || unconfirmed || unfinishedJob ? 'attention' : changes.length ? 'available' : '';
   const close = () => { setOpen(false); setReview(null); setToken(''); setTokenNotice(''); setRemoveToken(false); requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
   const show = () => { onOpen?.(); setOpen(true); void request('read'); };
@@ -413,6 +428,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {networkError ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>{networkError}</strong><p>恢复连接后会自动读取服务器记录。</p><button className="text-button" disabled={pending !== null} onClick={() => void request('read')}>重新连接</button></div></div> : null}
     {snapshot?.checkError || checkRequestFailed ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{snapshot?.checkError || '上次检查请求未完成，当前显示的是已有记录。'}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
+    {reloading ? <div className="update-message setup" role="status"><RefreshCw size={18} className="spin" /><p>更新已完成，正在刷新页面以载入新版本和重启后的模块连接。</p></div> : null}
     {downloadProgress ? <DownloadProgress progress={downloadProgress} /> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}
     {snapshot?.enabled && !needsSetup && !review && !updating && !uncertain ? <section className="update-mode" aria-labelledby="update-mode-title">

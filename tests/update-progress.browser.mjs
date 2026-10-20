@@ -144,6 +144,11 @@ async (page) => {
   assert(await page.locator('.update-timing-total strong').innerText() === '1 分 1 秒', 'task total uses durable start and finish timestamps');
   assert(await page.locator('.update-timings dt').allTextContents().then(values => values.join('|')) === '更新条件检查|源码接收|工作台构建|服务健康检查', 'source completion displays recorded detail labels');
   assert(await page.locator('.update-timings dd').allTextContents().then(values => values.join('|')) === '不足 1 秒|20 秒|40 秒|不足 1 秒', 'completed phases show their actual durations');
+  await page.getByText('更新已完成，正在刷新页面以载入新版本和重启后的模块连接。', { exact: true }).waitFor();
+  const reloaded = page.waitForEvent('load'); await advance(1_600); await reloaded;
+  await openUpdates();
+  assert(await page.locator('.update-timings dt').count() === 4, 'the automatic reload obtains the completed timing summary');
+  assert(await page.getByText('更新已完成，正在刷新页面以载入新版本和重启后的模块连接。', { exact: true }).count() === 0, 'a page loaded after completion does not reload again');
   await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
   await openUpdates();
   assert(await page.locator('.update-timings dt').count() === 4, 'closing and reopening preserves timings');
@@ -153,7 +158,7 @@ async (page) => {
   assert(await page.locator('.update-timing-total strong').innerText() === '1 分 1 秒', 'reload obtains the completed timing summary from status');
   assert(await page.locator('.update-dialog').evaluate(element => element.scrollWidth <= element.clientWidth), 'mobile timing labels and durations stay inside the dialog');
   await page.screenshot({ path: 'output/playwright/update-stage-timings-mobile.png', fullPage: true });
-  scenarios.push('terminal SSE summary, reopen, persisted HTTP reload and narrow timing layout');
+  scenarios.push('terminal SSE summary, automatic reload, reopen, persisted HTTP reload and narrow timing layout');
 
   state.job.deployMode = 'ci';
   state.job.stageTimings = { entries: [{ stage: 'download', durationMs: 45000 }, { stage: 'verify', durationMs: 15000 }] };

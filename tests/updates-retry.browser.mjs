@@ -136,7 +136,9 @@ async (page) => {
   await page.getByRole('heading', { name: '更新已完成', exact: true }).waitFor();
   assert(await page.locator('.update-footer .primary').isDisabled(), 'late rejection cannot unlock the accepted plan even after its job finishes');
   assert(applies.length === beforeRace + 1, 'a late rejection never repeats the streamed update');
-  scenarios.push('streamed accepted job wins over late 409 and remains protected after completion');
+  await page.getByText('更新已完成，正在刷新页面以载入新版本和重启后的模块连接。', { exact: true }).waitFor();
+  const reloaded = page.waitForEvent('load'); await advance(1_600); await reloaded;
+  scenarios.push('streamed accepted job wins over late 409, remains protected after completion and reloads the page');
 
   mode = 'lose-no-job'; await fresh('unknown-plan'); await open();
   await prepare(); holdRead = true;
