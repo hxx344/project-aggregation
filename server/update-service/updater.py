@@ -35,7 +35,9 @@ WORKER = 'project-aggregation-update-worker.service'
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 PLAN_TTL = 30 * 60
 CHECK_MIN_INTERVAL = 60
-AUTO_CHECK_INTERVAL = 5 * 60
+# Steady-state checks are mostly github.com requests; API use is bounded by
+# the release cache TTL, not by this interval.
+AUTO_CHECK_INTERVAL = 60
 CHECK_RETRY_MAX_INTERVAL = 15 * 60
 # Longest sequential chain is about four probes of two 15s attempts each.
 CHECK_DEADLINE = 3 * 60
@@ -307,7 +309,7 @@ class Coordinator:
     def _record_check_failure(self, state, message, retry_at=0):
         count = state.get('failureCount', 0)
         count = count + 1 if type(count) is int and count >= 0 else 1
-        delay = min(CHECK_RETRY_MAX_INTERVAL, AUTO_CHECK_INTERVAL * 2 ** min(count - 1, 3))
+        delay = min(CHECK_RETRY_MAX_INTERVAL, AUTO_CHECK_INTERVAL * 2 ** min(count - 1, 4))
         now = self.clock()
         server_deadline = retry_at if retry_at > now else 0
         state.update(checking=False, checkId=None, checkedAt=iso(now), checkError=message,

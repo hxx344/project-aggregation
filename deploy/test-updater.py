@@ -691,12 +691,13 @@ class CoordinatorTests(RootFixture):
         restarted = self.make_coordinator(); restarted.recover(starting=True)
         self.assertFalse(restarted.status()['checking']); self.assertIsNone(restarted.status()['planId'])
 
-    def test_automatic_check_is_due_every_five_minutes_and_survives_restart(self):
+    def test_automatic_check_is_due_every_minute_and_survives_restart(self):
+        self.assertEqual(updater.AUTO_CHECK_INTERVAL, 60)
         self.assertEqual(self.coordinator.next_check_delay(), 0)
         self.check()
-        self.assertEqual(self.coordinator.next_check_delay(), 300)
+        self.assertEqual(self.coordinator.next_check_delay(), updater.AUTO_CHECK_INTERVAL)
         calls = len(self.network.calls)
-        self.clock += 299
+        self.clock += updater.AUTO_CHECK_INTERVAL - 1
         restarted = self.make_coordinator(); restarted.recover(starting=True)
         self.assertEqual(restarted.next_check_delay(), 1)
         self.assertFalse(restarted.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
@@ -705,7 +706,7 @@ class CoordinatorTests(RootFixture):
         self.assertTrue(restarted.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
         restarted.check_thread.join(5)
         self.assertGreater(len(self.network.calls), calls)
-        self.assertEqual(restarted.next_check_delay(), 300)
+        self.assertEqual(restarted.next_check_delay(), updater.AUTO_CHECK_INTERVAL)
 
     def test_scheduler_starts_without_http_and_does_not_duplicate_or_reenter(self):
         entered = threading.Event(); release = threading.Event()
@@ -733,15 +734,15 @@ class CoordinatorTests(RootFixture):
         self.assertFalse(self.coordinator.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['checking'])
 
     def test_auto_retry_after_failure_preserves_no_failed_plan(self):
-        plan = self.prepare(); self.clock += 300
+        plan = self.prepare(); self.clock += updater.AUTO_CHECK_INTERVAL
         self.network.values['hub']['metadata']['prerelease'] = True
         state = self.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)
         self.assertIsNone(state['planId']); self.assertIsNotNone(state['checkError'])
         with self.assertRaises(updater.UpdateError):
             self.coordinator.apply(plan)
-        self.assertEqual(self.coordinator.next_check_delay(), 300)
+        self.assertEqual(self.coordinator.next_check_delay(), updater.AUTO_CHECK_INTERVAL)
         self.network.values['hub']['metadata']['prerelease'] = False
-        self.clock += 300
+        self.clock += updater.AUTO_CHECK_INTERVAL
         self.assertIsNotNone(self.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['planId'])
 
     def test_server_retry_deadline_blocks_manual_auto_and_restarted_checks(self):
@@ -787,7 +788,8 @@ class CoordinatorTests(RootFixture):
         failures = [releases.ReleaseError('网络暂时不可用', transient=True),
                     releases.ReleaseError('发布校验失败'),
                     OSError('https://example.invalid/?secret=PRIVATE_BODY')]
-        for index, delay in enumerate([300, 600, 900, 900, 900]):
+        interval, cap = updater.AUTO_CHECK_INTERVAL, updater.CHECK_RETRY_MAX_INTERVAL
+        for index, delay in enumerate([interval, 2 * interval, 4 * interval, 8 * interval, cap, cap]):
             with self.subTest(attempt=index + 1), \
                     patch.object(self.reader, 'read', side_effect=failures[index % len(failures)]) as read:
                 state = self.check(minimum_interval=0)
@@ -805,16 +807,16 @@ class CoordinatorTests(RootFixture):
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
         self.assertEqual(self.coordinator.load()['failureCount'], 0)
         self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], 0)
-        self.clock += 300
+        self.clock += interval
         with patch.object(self.reader, 'read', side_effect=failures[0]):
             self.check(minimum_interval=0)
         self.assertEqual(self.coordinator.load()['failureCount'], 1)
-        self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 300)
+        self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + interval)
 
     def test_inventory_failure_and_interrupted_check_also_back_off(self):
         with patch.object(self.coordinator, 'inspect', side_effect=OSError('PRIVATE_INSPECT_ERROR')) as inspect:
             state = self.check(minimum_interval=0)
-            self.assertIn('约 5 分钟后自动重试，也可以手动重新检查', state['checkError'])
+            self.assertIn('约 1 分钟后自动重试，也可以手动重新检查', state['checkError'])
             self.assertNotIn('PRIVATE_INSPECT_ERROR', json.dumps(state))
             self.assertEqual(self.coordinator.load()['failureCount'], 1)
             self.assertFalse(self.coordinator.check(minimum_interval=0, automatic=True)['checking'])
@@ -826,7 +828,7 @@ class CoordinatorTests(RootFixture):
         restarted = self.make_coordinator()
         restarted.recover(starting=True)
         self.assertEqual(restarted.load()['failureCount'], 2)
-        self.assertEqual(restarted.load()['nextCheckNotBefore'], self.clock + 600)
+        self.assertEqual(restarted.load()['nextCheckNotBefore'], self.clock + 2 * updater.AUTO_CHECK_INTERVAL)
         self.assertFalse(restarted.check(minimum_interval=0, automatic=True)['checking'])
         restarted.recover(starting=True)
         self.assertEqual(restarted.load()['failureCount'], 2)
@@ -849,8 +851,8 @@ class CoordinatorTests(RootFixture):
         self.assertEqual(self.coordinator.next_check_delay(), 0)
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
         self.clock -= 86400
-        self.assertEqual(self.coordinator.next_check_delay(), 300)
-        self.clock += 300
+        self.assertEqual(self.coordinator.next_check_delay(), updater.AUTO_CHECK_INTERVAL)
+        self.clock += updater.AUTO_CHECK_INTERVAL
         self.assertEqual(self.coordinator.next_check_delay(), 0)
         self.assertIsNotNone(self.check(minimum_interval=updater.AUTO_CHECK_INTERVAL)['planId'])
 
@@ -861,7 +863,7 @@ class CoordinatorTests(RootFixture):
             for key in ['failureCount', 'nextCheckNotBefore', 'lastCheckStarted']:
                 state.pop(key, None)
             self.coordinator.save(state)
-        self.clock += 299
+        self.clock += updater.AUTO_CHECK_INTERVAL - 1
         restarted = self.make_coordinator()
         self.assertEqual(restarted.next_check_delay(), 1)
         self.assertEqual(restarted.load()['failureCount'], 0)
@@ -874,11 +876,11 @@ class CoordinatorTests(RootFixture):
             raise releases.ReleaseError('网络暂时不可用', transient=True)
         with patch.object(self.reader, 'read', side_effect=fail_after_rollback) as read:
             self.check()
-            self.assertEqual(self.coordinator.next_check_delay(), 300)
-            self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 300)
+            self.assertEqual(self.coordinator.next_check_delay(), updater.AUTO_CHECK_INTERVAL)
+            self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + updater.AUTO_CHECK_INTERVAL)
             self.assertFalse(self.coordinator.check(minimum_interval=0, automatic=True)['checking'])
             read.assert_called_once()
-        self.clock += 300
+        self.clock += updater.AUTO_CHECK_INTERVAL
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
 
     def test_manual_check_skips_local_backoff_but_keeps_server_deadline(self):
@@ -886,7 +888,7 @@ class CoordinatorTests(RootFixture):
             self.check()
             self.check(minimum_interval=0)
             self.assertEqual(read.call_count, 2)
-            self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 600)
+            self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 2 * updater.AUTO_CHECK_INTERVAL)
             self.assertEqual(self.coordinator.load()['retryNotBefore'], 0)
         self.clock += updater.CHECK_MIN_INTERVAL - 1
         self.assertFalse(self.coordinator.check()['checking'])
