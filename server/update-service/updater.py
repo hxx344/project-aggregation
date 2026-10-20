@@ -36,7 +36,9 @@ STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 PLAN_TTL = 30 * 60
 CHECK_MIN_INTERVAL = 60
 AUTO_CHECK_INTERVAL = 5 * 60
-CHECK_RETRY_MAX_INTERVAL = 30 * 60
+CHECK_RETRY_MAX_INTERVAL = 15 * 60
+# Longest sequential chain is about four probes of two 15s attempts each.
+CHECK_DEADLINE = 3 * 60
 ACTIVE = {'queued', 'running'}
 DEPLOYMENT_MODES = ('source', 'ci')
 TOKEN = re.compile(r'[a-f0-9]{32}')
@@ -193,7 +195,7 @@ class Coordinator:
         with self.lock():
             if not (directory / 'state.json').exists():
                 self.save({'schema': 1, 'checking': False, 'checkedAt': None, 'checkError': None,
-                           'failureCount': 0, 'nextCheckNotBefore': 0,
+                           'failureCount': 0, 'nextCheckNotBefore': 0, 'retryNotBefore': 0,
                            'planId': None, 'expiresAt': None, 'modules': [], 'job': None})
 
     @contextmanager
@@ -207,6 +209,10 @@ class Coordinator:
             raise ValueError('Unsupported updater state')
         result.setdefault('failureCount', 0)
         result.setdefault('nextCheckNotBefore', 0)
+        if 'retryNotBefore' not in result:
+            # Older services kept server deadlines inside the local backoff, so
+            # a pending one is honoured as a server deadline until it passes.
+            result['retryNotBefore'] = result['nextCheckNotBefore'] if result['failureCount'] else 0
         return result
 
     def save(self, state):
@@ -289,9 +295,13 @@ class Coordinator:
                 timings = get_stage_timings(self.jobs / job['id'] / 'stage-timings.json')
                 if timings is not None:
                     job['stageTimings'] = timings
-        remaining = state.get('nextCheckNotBefore', 0) - self.clock()
-        if result['checkError'] and remaining > 0:
-            result['checkError'] += f'；已暂停重试，约 {math.ceil(remaining / 60)} 分钟后自动重试'
+        now = self.clock()
+        server_wait = state.get('retryNotBefore', 0) - now
+        local_wait = state.get('nextCheckNotBefore', 0) - now
+        if result['checkError'] and server_wait > 0:
+            result['checkError'] += f'；已暂停重试，约 {math.ceil(server_wait / 60)} 分钟后自动重试'
+        elif result['checkError'] and local_wait > 0:
+            result['checkError'] += f'；约 {math.ceil(local_wait / 60)} 分钟后自动重试，也可以手动重新检查'
         return result
 
     def _record_check_failure(self, state, message, retry_at=0):
@@ -299,23 +309,26 @@ class Coordinator:
         count = count + 1 if type(count) is int and count >= 0 else 1
         delay = min(CHECK_RETRY_MAX_INTERVAL, AUTO_CHECK_INTERVAL * 2 ** min(count - 1, 3))
         now = self.clock()
-        state.update(checking=False, checkedAt=iso(now), checkError=message,
-                     failureCount=count, nextCheckNotBefore=max(now + delay, retry_at),
-                     planId=None, expiresAt=None)
+        server_deadline = retry_at if retry_at > now else 0
+        state.update(checking=False, checkId=None, checkedAt=iso(now), checkError=message,
+                     failureCount=count, nextCheckNotBefore=max(now + delay, server_deadline),
+                     retryNotBefore=server_deadline, planId=None, expiresAt=None)
 
-    def _check_delay(self, state, minimum_interval):
+    def _check_delay(self, state, minimum_interval, automatic=True):
+        """Local failure backoff paces automatic checks only; server deadlines bind every check."""
         now = self.clock()
         started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
-        deadline = state.get('nextCheckNotBefore', 0)
         if started > now:
             # Rebase once when the wall clock moves backwards, preserving the
             # original retry duration rather than blocking until the old date.
             retry_started = timestamp(state.get('checkedAt')) or started
-            if deadline and retry_started > now:
-                deadline = now + max(0, deadline - retry_started)
-            state.update(lastCheckStarted=now, nextCheckNotBefore=deadline)
+            state['lastCheckStarted'] = now
+            for key in ('nextCheckNotBefore', 'retryNotBefore'):
+                if state.get(key) and retry_started > now:
+                    state[key] = now + max(0, state[key] - retry_started)
             self.save(state)
             started = now
+        deadline = max(state.get('retryNotBefore', 0), state.get('nextCheckNotBefore', 0) if automatic else 0)
         interval_delay = minimum_interval - (now - started) if started else 0
         return max(0, interval_delay, deadline - now)
 
@@ -326,6 +339,15 @@ class Coordinator:
             if state['checking'] and starting:
                 self._record_check_failure(state, '上次版本检查已中断')
                 changed = True
+            elif state['checking']:
+                started = state.get('lastCheckStarted') or 0
+                if not 0 < started <= self.clock():
+                    state['lastCheckStarted'] = self.clock()
+                    changed = True
+                elif self.clock() - started > CHECK_DEADLINE:
+                    # A thread cannot be cancelled; its late result is discarded by checkId.
+                    self._record_check_failure(state, '版本检查超时，请检查服务器到 GitHub 的网络')
+                    changed = True
             job = state['job']
             if job and job['status'] in ACTIVE and self.clock() - timestamp(job['startedAt']) > 30:
                 try:
@@ -354,16 +376,17 @@ class Coordinator:
                 self.save(state)
             return self.public(state)
 
-    def check(self, minimum_interval=CHECK_MIN_INTERVAL):
+    def check(self, minimum_interval=CHECK_MIN_INTERVAL, automatic=False):
         with self.lock():
             state = self.load()
             if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
                 return self.public(state)
-            if self._check_delay(state, minimum_interval) > 0:
+            if self._check_delay(state, minimum_interval, automatic) > 0:
                 return self.public(state)
-            state.update(checking=True, checkError=None, lastCheckStarted=self.clock())
+            check_id = uuid.uuid4().hex
+            state.update(checking=True, checkId=check_id, checkError=None, lastCheckStarted=self.clock())
             self.save(state)
-            self.check_thread = threading.Thread(target=self.perform_check, daemon=True, name='stable-release-check')
+            self.check_thread = threading.Thread(target=self.perform_check, args=(check_id,), daemon=True, name='stable-release-check')
             self.check_thread.start()
             return self.public(state)
 
@@ -386,7 +409,7 @@ class Coordinator:
                         self.recover()
                         if self.scheduler_stop.wait(self.next_check_delay()):
                             return
-                        self.check(minimum_interval=AUTO_CHECK_INTERVAL)
+                        self.check(minimum_interval=AUTO_CHECK_INTERVAL, automatic=True)
                     except Exception:
                         # A transient local read failure must not terminate future checks or spin.
                         if self.scheduler_stop.wait(AUTO_CHECK_INTERVAL):
@@ -459,7 +482,9 @@ class Coordinator:
             item.update(state='unavailable', reason='正式版本检查未完成，请稍后重试')
             return item, None
 
-    def perform_check(self):
+    def perform_check(self, check_id=None):
+        def current(state):
+            return state['checking'] and state.get('checkId') == check_id
         try:
             installations = self.inspect()
             recovery = self.recovery_targets()
@@ -479,7 +504,10 @@ class Coordinator:
                     entry.update(id=item['id'], installedIdentity=item['identity'])
                     entries.append(entry)
                 with self.lock():
-                    previous = self.load().get('planId')
+                    latest = self.load()
+                    if not current(latest):
+                        return
+                    previous = latest.get('planId')
                     try:
                         plan = self.read_plan(previous) if previous else None
                     except (UpdateError, OSError, ValueError):
@@ -496,18 +524,21 @@ class Coordinator:
                     write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
             with self.lock():
                 state = self.load()
+                if not current(state):
+                    return
                 state.update(modules=modules)
                 if failed:
                     self._record_check_failure(state, '部分模块检查失败，暂不能开始更新', retry_at)
                 else:
-                    state.update(checking=False, checkedAt=iso(self.clock()), checkError=None,
-                                 failureCount=0, nextCheckNotBefore=0, planId=plan_id, expiresAt=expires)
+                    state.update(checking=False, checkId=None, checkedAt=iso(self.clock()), checkError=None,
+                                 failureCount=0, nextCheckNotBefore=0, retryNotBefore=0, planId=plan_id, expiresAt=expires)
                 self.save(state)
         except Exception:
             with self.lock():
                 state = self.load()
-                self._record_check_failure(state, '版本检查未完成')
-                self.save(state)
+                if current(state):
+                    self._record_check_failure(state, '版本检查未完成')
+                    self.save(state)
 
     def read_plan(self, plan_id, *, allow_expired=False):
         if not isinstance(plan_id, str) or not TOKEN.fullmatch(plan_id):

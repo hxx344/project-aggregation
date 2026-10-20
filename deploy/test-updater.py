@@ -279,8 +279,8 @@ class CoordinatorTests(RootFixture):
                      identity=hashlib.sha256((key + NEW).encode()).hexdigest())
         return 0
 
-    def check(self, minimum_interval=updater.CHECK_MIN_INTERVAL):
-        self.coordinator.check(minimum_interval=minimum_interval)
+    def check(self, minimum_interval=updater.CHECK_MIN_INTERVAL, automatic=False):
+        self.coordinator.check(minimum_interval=minimum_interval, automatic=automatic)
         if self.coordinator.check_thread:
             self.coordinator.check_thread.join(5)
             self.assertFalse(self.coordinator.check_thread.is_alive(), 'version check did not finish')
@@ -787,7 +787,7 @@ class CoordinatorTests(RootFixture):
         failures = [releases.ReleaseError('网络暂时不可用', transient=True),
                     releases.ReleaseError('发布校验失败'),
                     OSError('https://example.invalid/?secret=PRIVATE_BODY')]
-        for index, delay in enumerate([300, 600, 1200, 1800, 1800]):
+        for index, delay in enumerate([300, 600, 900, 900, 900]):
             with self.subTest(attempt=index + 1), \
                     patch.object(self.reader, 'read', side_effect=failures[index % len(failures)]) as read:
                 state = self.check(minimum_interval=0)
@@ -799,7 +799,7 @@ class CoordinatorTests(RootFixture):
                 self.assertNotIn('PRIVATE_BODY', json.dumps(state))
                 self.clock += delay - 1
                 self.assertEqual(self.coordinator.next_check_delay(), 1)
-                self.assertFalse(self.coordinator.check(minimum_interval=0)['checking'])
+                self.assertFalse(self.coordinator.check(minimum_interval=0, automatic=True)['checking'])
                 read.assert_called_once()
                 self.clock += 1
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
@@ -814,10 +814,10 @@ class CoordinatorTests(RootFixture):
     def test_inventory_failure_and_interrupted_check_also_back_off(self):
         with patch.object(self.coordinator, 'inspect', side_effect=OSError('PRIVATE_INSPECT_ERROR')) as inspect:
             state = self.check(minimum_interval=0)
-            self.assertIn('已暂停重试', state['checkError'])
+            self.assertIn('约 5 分钟后自动重试，也可以手动重新检查', state['checkError'])
             self.assertNotIn('PRIVATE_INSPECT_ERROR', json.dumps(state))
             self.assertEqual(self.coordinator.load()['failureCount'], 1)
-            self.assertFalse(self.coordinator.check(minimum_interval=0)['checking'])
+            self.assertFalse(self.coordinator.check(minimum_interval=0, automatic=True)['checking'])
             inspect.assert_called_once()
         with self.coordinator.lock():
             state = self.coordinator.load()
@@ -827,7 +827,7 @@ class CoordinatorTests(RootFixture):
         restarted.recover(starting=True)
         self.assertEqual(restarted.load()['failureCount'], 2)
         self.assertEqual(restarted.load()['nextCheckNotBefore'], self.clock + 600)
-        self.assertFalse(restarted.check(minimum_interval=0)['checking'])
+        self.assertFalse(restarted.check(minimum_interval=0, automatic=True)['checking'])
         restarted.recover(starting=True)
         self.assertEqual(restarted.load()['failureCount'], 2)
 
@@ -876,10 +876,87 @@ class CoordinatorTests(RootFixture):
             self.check()
             self.assertEqual(self.coordinator.next_check_delay(), 300)
             self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 300)
-            self.assertFalse(self.coordinator.check(minimum_interval=0)['checking'])
+            self.assertFalse(self.coordinator.check(minimum_interval=0, automatic=True)['checking'])
             read.assert_called_once()
         self.clock += 300
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
+
+    def test_manual_check_skips_local_backoff_but_keeps_server_deadline(self):
+        with patch.object(self.reader, 'read', side_effect=releases.ReleaseError('网络暂时不可用', transient=True)) as read:
+            self.check()
+            self.check(minimum_interval=0)
+            self.assertEqual(read.call_count, 2)
+            self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 600)
+            self.assertEqual(self.coordinator.load()['retryNotBefore'], 0)
+        self.clock += updater.CHECK_MIN_INTERVAL - 1
+        self.assertFalse(self.coordinator.check()['checking'])
+        self.clock += 1
+        self.assertGreater(self.coordinator.next_check_delay(), 0)
+        recovered = self.check()
+        self.assertIsNotNone(recovered['planId'])
+        self.assertIsNone(recovered['checkError'])
+        saved = self.coordinator.load()
+        self.assertEqual((saved['failureCount'], saved['nextCheckNotBefore'], saved['retryNotBefore']), (0, 0, 0))
+        self.clock += 300
+        deadline = self.clock + 1200
+        with patch.object(self.reader, 'read', side_effect=releases.ReleaseError('受限', retry_at=deadline, transient=True)):
+            self.check(minimum_interval=0)
+        self.assertEqual(self.coordinator.load()['retryNotBefore'], deadline)
+        self.clock = deadline - 1
+        restarted = self.make_coordinator(); restarted.recover(starting=True)
+        self.assertFalse(restarted.check(minimum_interval=0)['checking'])
+        self.clock = deadline
+        self.coordinator = restarted
+        self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
+
+    def test_legacy_backoff_is_honoured_as_a_server_deadline_once(self):
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state.pop('retryNotBefore')
+            state.update(failureCount=2, nextCheckNotBefore=self.clock + 600, checkedAt=updater.iso(self.clock))
+            self.coordinator.save(state)
+        restarted = self.make_coordinator()
+        self.assertEqual(restarted.load()['retryNotBefore'], self.clock + 600)
+        self.assertFalse(restarted.check(minimum_interval=0)['checking'])
+        self.clock += 600
+        self.coordinator = restarted
+        self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
+        self.assertEqual(self.coordinator.load()['retryNotBefore'], 0)
+
+    def test_hung_check_times_out_and_its_late_result_is_discarded(self):
+        entered = threading.Event(); release = threading.Event()
+        original = self.coordinator.inspect
+        calls = []
+        def inspect():
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set(); release.wait(5)
+                self.network.values['hub']['metadata']['prerelease'] = True
+            return original()
+        self.coordinator.inspect = inspect
+        try:
+            self.assertTrue(self.coordinator.check()['checking'])
+            hung = self.coordinator.check_thread
+            self.assertTrue(entered.wait(5))
+            self.clock += updater.CHECK_DEADLINE
+            self.assertTrue(self.coordinator.status()['checking'])
+            self.clock += 1
+            state = self.coordinator.status()
+            self.assertFalse(state['checking'])
+            self.assertIn('版本检查超时', state['checkError'])
+            self.assertIsNone(self.coordinator.load()['checkId'])
+            self.assertFalse(self.coordinator.check(minimum_interval=0, automatic=True)['checking'])
+            recovered = self.check(minimum_interval=0)
+            self.assertIsNotNone(recovered['planId'])
+        finally:
+            release.set()
+            hung.join(5)
+        self.assertFalse(hung.is_alive())
+        final = self.coordinator.status()
+        self.assertEqual(final['planId'], recovered['planId'])
+        self.assertIsNone(final['checkError'])
+        self.assertEqual(final['modules'], recovered['modules'])
+        self.assertEqual(self.coordinator.load()['failureCount'], 0)
 
     def test_unchanged_plan_survives_check_without_extending_expiry(self):
         plan = self.prepare(); expires = self.coordinator.status()['expiresAt']

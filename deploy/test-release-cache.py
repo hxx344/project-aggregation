@@ -452,6 +452,63 @@ class ReleaseCacheTests(unittest.TestCase):
         self.assertTrue(installer_started.is_set())
         self.assertTrue(head_started.is_set())
 
+    def overlap(self, first, second):
+        """Make each matched request wait until the other one is in flight."""
+        events = {first: threading.Event(), second: threading.Event()}
+        original = self.network.request
+
+        def overlapping(url, maximum=releases.MAX_JSON, method='GET'):
+            for name, matches in ((first, events[first]), (second, events[second])):
+                if self.kind(url, method) == name:
+                    matches.set()
+                    other = events[second if name == first else first]
+                    if not other.wait(5):
+                        raise AssertionError(name + ' was serialized before the other probe')
+            return original(url, maximum, method)
+
+        self.network.request = overlapping
+        return events
+
+    @staticmethod
+    def kind(url, method):
+        if url.startswith('https://api.github.com/'):
+            return 'metadata'
+        if url.endswith('/release-manifest.json'):
+            return 'manifest'
+        return 'artifact' if method == 'HEAD' else 'other'
+
+    def test_cold_manifest_and_metadata_are_requested_concurrently(self):
+        events = self.overlap('manifest', 'metadata')
+        self.assertEqual(self.reader.read(self.module)['commit'], NEW)
+        self.assertTrue(all(event.is_set() for event in events.values()))
+
+    def test_cached_artifact_probe_overlaps_manifest_and_keeps_request_counts(self):
+        self.reader.read(self.module)
+        events = self.overlap('manifest', 'artifact')
+        before = self.network.counts()
+        self.reader.read(self.module)
+        self.assertTrue(all(event.is_set() for event in events.values()))
+        self.assertEqual(self.network.counts() - before, {'discovery': 1, 'manifest': 1, 'artifact': 1})
+
+    def test_concurrent_probe_failures_keep_original_error_precedence(self):
+        manifest = (self.reader.download(self.module, 'deploy-' + NEW, 'release-manifest.json'), 'GET')
+        metadata = (self.reader.api(self.module, 'releases/latest'), 'GET')
+        self.network.failures.update({manifest, metadata})
+        with self.assertRaisesRegex(releases.ReleaseError, 'fixture network unavailable') as caught, \
+                patch.object(self.reader, 'metadata', side_effect=releases.ReleaseError('metadata failed', transient=True)):
+            self.reader.read(self.module)
+        self.assertFalse(caught.exception.transient)
+        self.network.failures.clear()
+        self.reader.read(self.module)
+        self.value['manifest']['node_version'] = '24.15.0'
+        artifact = (self.reader.download(self.module, 'deploy-' + NEW, self.value['manifest']['artifacts']['linux-x64']['file']), 'HEAD')
+        self.network.failures.add(artifact)
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.read(self.module)
+        self.network.failures.clear()
+        # The speculative probe of the old manifest cannot replace the new full validation.
+        self.assertEqual(self.reader.read(self.module)['manifest']['node_version'], '24.15.0')
+
 
 class TransportTests(unittest.TestCase):
     def http_error(self, code, headers=None, url='https://api.github.com/repos/hxx344/project-aggregation/releases/latest', token=''):
@@ -586,11 +643,40 @@ class TransportTests(unittest.TestCase):
         network = releases.Network()
         network.opener = unittest.mock.Mock()
         network.opener.open.side_effect = urllib.error.URLError('private proxy credentials')
-        with self.assertRaises(releases.ReleaseError) as caught:
+        with self.assertRaises(releases.ReleaseError) as caught, patch.object(releases.time, 'sleep') as sleep:
             network.request('https://raw.githubusercontent.com/hxx344/project-aggregation/fixed/deploy/install.sh')
         self.assertIn('安装器源码服务', str(caught.exception))
         self.assertNotIn('private', str(caught.exception))
         self.assertTrue(caught.exception.transient)
+        self.assertEqual(network.opener.open.call_count, releases.CONNECTION_ATTEMPTS)
+        sleep.assert_called_once_with(releases.CONNECTION_RETRY_DELAY)
+
+    def test_connection_failure_retries_once_but_http_responses_do_not(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.url = 'https://github.com/hxx344/project-aggregation/releases/download/deploy-' + NEW + '/release-manifest.json'
+        response.headers = {}
+        response.read.return_value = b'{}'
+        for failure in (urllib.error.URLError('reset'), TimeoutError(), ConnectionResetError()):
+            with self.subTest(failure=type(failure).__name__):
+                network = releases.Network()
+                network.opener = unittest.mock.Mock()
+                network.opener.open.side_effect = [failure, response]
+                with patch.object(releases.time, 'sleep'):
+                    self.assertEqual(network.request(response.url), b'{}')
+                self.assertEqual(network.opener.open.call_count, 2)
+        for code, headers in ((404, {}), (429, {'Retry-After': '90'}), (403, {}), (503, {'Retry-After': '120'}), (502, {})):
+            with self.subTest(code=code), patch.object(releases.time, 'sleep') as sleep:
+                network = releases.Network()
+                network.opener = unittest.mock.Mock()
+                message = Message()
+                for key, value in headers.items():
+                    message[key] = value
+                network.opener.open.side_effect = urllib.error.HTTPError(response.url, code, 'reason', message, io.BytesIO())
+                with self.assertRaises(releases.ReleaseError):
+                    network.request(response.url)
+                self.assertEqual(network.opener.open.call_count, 1)
+                sleep.assert_not_called()
 
     def test_head_discovery_returns_final_url_and_request_remains_bytes(self):
         final = 'https://github.com/hxx344/project-aggregation/releases/tag/deploy-' + NEW
@@ -607,7 +693,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(request.get_method(), 'HEAD')
         self.assertEqual(request.get_header('Cache-control'), 'no-cache')
         self.assertEqual(request.get_header('Accept'), '*/*')
-        self.assertEqual(network.opener.open.call_args.kwargs['timeout'], 25)
+        self.assertEqual(network.opener.open.call_args.kwargs['timeout'], releases.REQUEST_TIMEOUT)
         response.read.assert_not_called()
         self.assertEqual(network.request('https://api.github.com/repos/hxx344/project-aggregation/releases/latest'), b'{}')
         self.assertEqual(network.opener.open.call_args.args[0].get_header('Accept'), 'application/vnd.github+json')

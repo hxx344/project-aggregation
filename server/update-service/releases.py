@@ -1,5 +1,6 @@
 """Read only public, stable GitHub releases from the built-in repository list."""
 from collections import OrderedDict
+from concurrent import futures
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from email.utils import parsedate_to_datetime
@@ -28,9 +29,16 @@ RELEASE_NOTES_TRUNCATED = '\n（更新内容过长，已截断）'
 RELEASE_NOTES_CONTROLS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]')
 RELEASE_CACHE_TTL = 30 * 60
 MAX_RETRY_DELAY = 24 * 60 * 60
+# Per socket operation; one retry only when no HTTP response arrived.
+REQUEST_TIMEOUT = 15
+CONNECTION_ATTEMPTS = 2
+CONNECTION_RETRY_DELAY = 1
 GITHUB_TOKEN = re.compile(r'[A-Za-z0-9_]{20,255}')
 # Shared by all repositories; cold checks add at most two network workers.
 ARTIFACT_CHECKS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='release-artifact')
+# Discovery probes that run beside the manifest. Separate from ARTIFACT_CHECKS,
+# which _verified submits to while one of these tasks may still be waiting.
+RELEASE_PROBES = ThreadPoolExecutor(max_workers=4, thread_name_prefix='release-probe')
 
 
 class ReleaseError(Exception):
@@ -133,8 +141,19 @@ class Network:
             if token:
                 request.add_header('Authorization', 'Bearer ' + token)
                 authenticated = True
+        for attempt in range(1, CONNECTION_ATTEMPTS + 1):
+            try:
+                return self._open(request, maximum, method, final_url, authenticated)
+            except (OSError, TimeoutError, urllib.error.URLError):
+                # _open converts every HTTP response, including 5xx with
+                # Retry-After, so only a missing response gets another attempt.
+                if attempt == CONNECTION_ATTEMPTS:
+                    raise ReleaseError(f'无法连接{endpoint_name(url)}，请检查服务器网络', transient=True) from None
+                time.sleep(CONNECTION_RETRY_DELAY)
+
+    def _open(self, request, maximum, method, final_url, authenticated):
         try:
-            with self.opener.open(request, timeout=25) as response:
+            with self.opener.open(request, timeout=REQUEST_TIMEOUT) as response:
                 allowed_url(response.url)
                 if final_url:
                     return response.url
@@ -166,8 +185,6 @@ class Network:
                 raise ReleaseError(f'{endpoint}{reason}（HTTP {error.code}）', retry_at=deadline, transient=True) from None
             raise ReleaseError(f'{endpoint}暂时不可用（HTTP {error.code}）',
                                retry_at=deadline, transient=500 <= error.code < 600) from None
-        except (OSError, TimeoutError, urllib.error.URLError):
-            raise ReleaseError(f'无法连接{endpoint_name(url)}，请检查服务器网络', transient=True) from None
 
 
 def decode_json(data):
@@ -274,17 +291,35 @@ class Releases:
         key = (module.repository, self.arch)
         try:
             tag = self.latest_tag(module)
-            manifest_bytes = self.network.request(self.download(module, tag, 'release-manifest.json'))
-            manifest_hash = digest(manifest_bytes)
+            manifest_url = self.download(module, tag, 'release-manifest.json')
             cached = self._cached(self._releases, key)
+            reusable = None
             if cached is not None:
                 verified_at, value = cached
-                age = self.clock() - verified_at
-                if (0 <= age < RELEASE_CACHE_TTL and value['tag'] == tag and value['manifestHash'] == manifest_hash):
-                    item = value['manifest']['artifacts'][self.arch]
-                    self.network.request(self.download(module, tag, item['file']), method='HEAD')
-                    return copy.deepcopy(value)
-            release = self.metadata(module)
+                if 0 <= self.clock() - verified_at < RELEASE_CACHE_TTL and value['tag'] == tag:
+                    reusable = value
+            if reusable is not None:
+                # Probe the cached artifact while the manifest downloads; the
+                # probe only counts when the manifest bytes are unchanged.
+                item = reusable['manifest']['artifacts'][self.arch]
+                artifact = RELEASE_PROBES.submit(self.network.request, self.download(module, tag, item['file']), method='HEAD')
+                try:
+                    manifest_bytes = self.network.request(manifest_url)
+                finally:
+                    futures.wait([artifact])
+                if reusable['manifestHash'] == digest(manifest_bytes):
+                    artifact.result()
+                    return copy.deepcopy(reusable)
+                release = self.metadata(module)
+            else:
+                # Metadata does not depend on the manifest; manifest errors keep
+                # their original precedence because they are raised first.
+                metadata = RELEASE_PROBES.submit(self.metadata, module)
+                try:
+                    manifest_bytes = self.network.request(manifest_url)
+                finally:
+                    futures.wait([metadata])
+                release = metadata.result()
             if release['tag_name'] != tag:
                 raise ReleaseError('最新正式版本已改变，请重新检查')
             result = self._verified(module, release, manifest_bytes)
