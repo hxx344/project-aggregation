@@ -25,6 +25,7 @@ class MarketExecutionTests(unittest.TestCase):
 
         class Gateway:
             budget = None
+            credentials = {}
 
             def call(self, method, path, params, **kwargs):
                 test.calls.append((method, path, copy.deepcopy(params), kwargs))

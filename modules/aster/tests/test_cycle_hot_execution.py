@@ -31,7 +31,7 @@ class HotBroker(LiveBroker):
     """Exercise live executor dispatch with a real local fill ledger."""
     def __init__(self, paper):
         self.paper = paper
-        self.api = SimpleNamespace(workspace_control=None)
+        self.api = SimpleNamespace(workspace_control=None, credentials={})
         self.lease = None
         self.before_post = None
         self.cycle_hot_snapshot = Mock(side_effect=self.hot_snapshot)

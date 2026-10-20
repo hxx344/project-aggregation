@@ -3,10 +3,8 @@
 # test or the code, then delete the line; deploy/test-aster-python.sh and
 # deploy/test-module-units.sh then run the file and fail on an entry whose file
 # no longer exists.
-aster test_cycle_hot_execution AttributeError: fixture gateway lacks credentials
 aster test_cycle_parallel_engine 1 failure: holding cycle additions in both other markets
 aster test_cycle_parallel_execution 1 failure: other ordinary positions vs volume ledger
-aster test_cycle_pending_volume AttributeError: fixture gateway lacks credentials
 aster test_cycle_position_sync 16 errors: account identity changed during batch recovery
 aster test_cycle_pre_submit_optimization 1 failure: intent index and event commit before submit
 aster test_cycle_volume 1 error: demo mode refuses a ledger of unconfirmed purpose
@@ -15,7 +13,6 @@ aster test_derived_cache 1 error: demo mode refuses a ledger of unconfirmed purp
 aster test_exchange_hardening 1 error: book timestamp expectation
 aster test_high_leverage_risk 3 errors: post-fill occupancy check
 aster test_leverage_selection_recovery 1 failure: unknown risk-limit recheck resends or resumes
-aster test_market_execution AttributeError: Gateway lacks credentials
 aster test_market_priority 2 failures: same-tier ranking before upgrade and first open
 aster test_ordinary_priority_budget 8 of 9 failures: public sampling budget
 aster test_pair_api_wait 1 error: saved snapshot timestamp
