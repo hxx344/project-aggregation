@@ -2,25 +2,25 @@ import type { LiveQuote } from "./market";
 import { oilSpreadPercent } from '../modules/oil/spread.mjs';
 import { validateMarket } from '../modules/oil/binance.mjs';
 
-export const externalExchanges = ["bybit", "binance", "lighter", "variational", "okx", "bitget"] as const;
+export const externalExchanges = ["bybit", "binance", "lighter", "variational", "okx", "bitget", "gate"] as const;
 export type ExternalExchange = typeof externalExchanges[number];
 export type Exchange = "hyperliquid" | ExternalExchange;
 export type SpreadMarket = "oil" | "hynix";
-const oilExchanges: readonly Exchange[] = ['hyperliquid', ...externalExchanges];
-const hynixExchanges: readonly Exchange[] = ['bybit', 'binance'];
+const oilExchanges: readonly Exchange[] = ['hyperliquid', 'bybit', 'binance', 'lighter', 'variational', 'okx', 'bitget'];
+const hynixExchanges: readonly Exchange[] = ['bybit', 'binance', 'okx', 'bitget', 'gate'];
 const hynixDisplayExchanges: readonly Exchange[] = ['hyperliquid', ...hynixExchanges];
 export const comparisonExchanges = (market: SpreadMarket): readonly Exchange[] => market === 'oil' ? oilExchanges : hynixExchanges;
 export const displayComparisonExchanges = (market: SpreadMarket): readonly Exchange[] => market === 'oil' ? oilExchanges : hynixDisplayExchanges;
 export const supportsExchange = (market: string, exchange: Exchange) => (market === 'oil' || market === 'hynix') && comparisonExchanges(market).includes(exchange);
 export const EXCHANGE_REFRESH_MS = 15_000;
 export const EXCHANGE_STALE_MS = 45_000;
-export const exchangeNames: Record<Exchange, string> = { hyperliquid: "Hyperliquid", bybit: "Bybit", binance: "Binance", lighter: "Lighter", variational: "Variational", okx: "OKX", bitget: "Bitget" };
+export const exchangeNames: Record<Exchange, string> = { hyperliquid: "Hyperliquid", bybit: "Bybit", binance: "Binance", lighter: "Lighter", variational: "Variational", okx: "OKX", bitget: "Bitget", gate: "Gate" };
 export const exchangeContracts = {
   oil: { left: "BZUSDT", right: "CLUSDT", leftBase: "BZ", rightBase: "CL", leftLabel: "布伦特", rightLabel: "WTI", leftUnits: 1 },
   hynix: { left: "SKHYUSDT", right: "SKHYNIXUSDT", leftBase: "SKHY", rightBase: "SKHYNIX", leftLabel: "ADR", rightLabel: "正股", leftUnits: 10 },
 } as const;
 type ExchangeDefinition = { left: string; right: string; currency: "USD" | "USDT" | "USDC"; priceBasis: "mid" | "mark"; fundingPriceBasis: "oracle" | "index" | "mark" };
-const oilDefinitions: Record<Exchange, ExchangeDefinition> = {
+const oilDefinitions: Partial<Record<Exchange, ExchangeDefinition>> = {
   hyperliquid: { left: 'xyz:BRENTOIL', right: 'xyz:CL', currency: 'USD', priceBasis: 'mark', fundingPriceBasis: 'oracle' },
   bybit: { left: 'BZUSDT', right: 'CLUSDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
   binance: { left: 'BZUSDT', right: 'CLUSDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
@@ -29,11 +29,19 @@ const oilDefinitions: Record<Exchange, ExchangeDefinition> = {
   okx: { left: 'BZ-USDT-SWAP', right: 'CL-USDT-SWAP', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
   bitget: { left: 'BZUSDT', right: 'CLUSDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
 };
+// All Hynix CEX contracts quote one ADR or one ordinary share per unit of mark price.
+const hynixDefinitions: Partial<Record<Exchange, ExchangeDefinition>> = {
+  hyperliquid: { left: 'xyz:SKHY', right: 'xyz:SKHX', currency: 'USD', priceBasis: 'mid', fundingPriceBasis: 'oracle' },
+  bybit: { left: 'SKHYUSDT', right: 'SKHYNIXUSDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
+  binance: { left: 'SKHYUSDT', right: 'SKHYNIXUSDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
+  okx: { left: 'SKHY-USDT-SWAP', right: 'SKHYNIX-USDT-SWAP', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
+  bitget: { left: 'SKHYUSDT', right: 'SKHYNIXUSDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
+  gate: { left: 'SKHY_USDT', right: 'SKHYNIX_USDT', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' },
+};
 export function exchangeDefinition(exchange: Exchange, market: SpreadMarket): ExchangeDefinition {
-  if (market === 'oil') return oilDefinitions[exchange];
-  if (exchange === 'hyperliquid') return { left: 'xyz:SKHY', right: 'xyz:SKHX', currency: 'USD', priceBasis: 'mid', fundingPriceBasis: 'oracle' };
-  if (exchange === 'bybit' || exchange === 'binance') return { ...exchangeContracts.hynix, currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' };
-  throw new Error('Unsupported exchange comparison market');
+  const definition = (market === 'oil' ? oilDefinitions : hynixDefinitions)[exchange];
+  if (!definition) throw new Error('Unsupported exchange comparison market');
+  return definition;
 }
 export const exchangeAction = (exchange: Exchange) => `exchanges/${exchange}/quote`;
 export function exchangeFromAction(action: string): Exchange | null {

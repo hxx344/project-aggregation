@@ -14,10 +14,10 @@ type ReaderOptions = {
 const PAGE_SIZES: Record<CexFundingExchange, number> = { binance: 1000, bybit: 200, okx: 400, bitget: 100, aster: 1000 };
 const MAX_PAGES = 32;
 const symbols: Record<CexFundingExchange, readonly string[]> = {
-  binance: ['BZUSDT', 'CLUSDT'],
-  bybit: ['BZUSDT', 'CLUSDT'],
-  okx: ['BZ-USDT-SWAP', 'CL-USDT-SWAP'],
-  bitget: ['BZUSDT', 'CLUSDT'],
+  binance: ['BZUSDT', 'CLUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'],
+  bybit: ['BZUSDT', 'CLUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'],
+  okx: ['BZ-USDT-SWAP', 'CL-USDT-SWAP', 'SKHY-USDT-SWAP', 'SKHYNIX-USDT-SWAP'],
+  bitget: ['BZUSDT', 'CLUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'],
   aster: [],
 };
 

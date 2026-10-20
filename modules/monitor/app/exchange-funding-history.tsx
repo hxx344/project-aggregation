@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { RefreshCw, X } from "lucide-react";
-import { exchangeDefinition, exchangeNames, type Exchange } from "../lib/exchange-quotes";
+import { exchangeContracts, exchangeDefinition, exchangeNames, type Exchange, type SpreadMarket } from "../lib/exchange-quotes";
 import { exchangeFundingAction, HISTORY_PAGE_SIZE, HISTORY_REFRESH_MS, HISTORY_STALE_MS, HISTORY_WINDOW_MS, validateExchangeFundingHistory, type ExchangeFundingHistory } from "../lib/exchange-funding-history";
 import { analyzeFundingRange, fundingRangeInput, parseFundingRangeInput } from "../lib/exchange-funding-analysis";
 import { summaryTimestamp } from "../lib/monitor-summary";
@@ -20,9 +20,11 @@ const formatRate = (rate: number) => {
   const value = magnitude > 0 && magnitude < 1e-8 ? magnitude.toExponential(4).replace(/\.?(0+)(?=e)/, "") : rateNumber.format(magnitude);
   return `${rate > 0 ? "+" : rate < 0 ? "−" : ""}${value}%`;
 };
+const spaced = (label: string) => /^[A-Za-z]/.test(label) ? ` ${label}` : label;
 
-export default function ExchangeFundingHistoryPanel({ id, selection, active, now, onClose }: {
+export default function ExchangeFundingHistoryPanel({ id, monitorId, selection, active, now, onClose }: {
   id: string;
+  monitorId: SpreadMarket;
   selection: FundingHistorySelection | null;
   active: boolean;
   now: number;
@@ -57,9 +59,9 @@ export default function ExchangeFundingHistoryPanel({ id, selection, active, now
       intervalMs: HISTORY_REFRESH_MS,
       immediate: !cached || cached.status === "snapshot" || Date.now() - Date.parse(cached.fetchedAt) >= HISTORY_REFRESH_MS,
       async load(signal) {
-        const response = await fetch(`/api/monitors/oil/${exchangeFundingAction(exchange)}`, { cache: "no-store", signal });
-        if (!response.ok) throw new Error(response.status === 423 ? "原油监控已暂停。" : "历史结算读取失败，稍后重试。已有记录保留。");
-        try { return validateExchangeFundingHistory(await response.json(), exchange); }
+        const response = await fetch(`/api/monitors/${monitorId}/${exchangeFundingAction(exchange)}`, { cache: "no-store", signal });
+        if (!response.ok) throw new Error(response.status === 423 ? `${monitorId === "oil" ? "原油" : "海力士"}监控已暂停。` : "历史结算读取失败，稍后重试。已有记录保留。");
+        try { return validateExchangeFundingHistory(await response.json(), exchange, monitorId); }
         catch { throw new Error("历史结算数据异常，已有记录保留。"); }
       },
       onData(value) {
@@ -78,7 +80,7 @@ export default function ExchangeFundingHistoryPanel({ id, selection, active, now
     });
     poll.current = control;
     return () => { control.stop(); poll.current = null; };
-  }, [exchange, active]);
+  }, [exchange, active, monitorId]);
 
   useEffect(() => {
     if (!exchange || !active) return;
@@ -88,7 +90,8 @@ export default function ExchangeFundingHistoryPanel({ id, selection, active, now
 
   if (!selection) return null;
   const error = errors[selection.exchange];
-  const definition = exchangeDefinition(selection.exchange, "oil");
+  const definition = exchangeDefinition(selection.exchange, monitorId);
+  const contracts = exchangeContracts[monitorId];
   const unavailable = history?.availability === "unsupported";
   const loading = !history && !error;
   const refreshing = refreshingExchange === selection.exchange;
@@ -126,7 +129,7 @@ export default function ExchangeFundingHistoryPanel({ id, selection, active, now
 
   return <section id={id} ref={panel} className="exchange-funding-history" aria-labelledby={`${id}-title`} aria-busy={loading || refreshing} tabIndex={-1} data-funding-exchange={selection.exchange}>
     <div className="exchange-funding-heading">
-      <div><h3 id={`${id}-title`}>{exchangeNames[selection.exchange]} · 资金费结算历史</h3><p>{selection.direction === "short" ? "做空价差：空布伦特、多 WTI" : "做多价差：多布伦特、空 WTI"} · {history?.currency ?? definition.currency}</p></div>
+      <div><h3 id={`${id}-title`}>{exchangeNames[selection.exchange]} · 资金费结算历史</h3><p>{selection.direction === "short" ? `做空价差：空${spaced(contracts.leftLabel)}、多${spaced(contracts.rightLabel)}` : `做多价差：多${spaced(contracts.leftLabel)}、空${spaced(contracts.rightLabel)}`} · {history?.currency ?? definition.currency}</p></div>
       <div className="exchange-funding-actions">
         {!unavailable && <button type="button" className="refresh-button" onClick={refresh} disabled={loading || refreshing || !active} aria-label={`刷新 ${exchangeNames[selection.exchange]} 资金费历史`}><RefreshCw size={14} className={refreshing ? "spinning" : ""}/>{refreshing ? "更新中" : "刷新"}</button>}
         <button type="button" className="exchange-funding-close" onClick={onClose} aria-label="收起资金费历史"><X size={18}/><span>收起</span></button>
@@ -157,7 +160,7 @@ export default function ExchangeFundingHistoryPanel({ id, selection, active, now
       const pageCount = Math.max(1, Math.ceil(result.count / HISTORY_PAGE_SIZE));
       const page = Math.min(pageCount, pages.key === pageKey ? pages[side] : 1);
       const records = result.records.slice((page - 1) * HISTORY_PAGE_SIZE, page * HISTORY_PAGE_SIZE);
-      const name = side === "left" ? "布伦特" : "WTI";
+      const name = side === "left" ? contracts.leftLabel : contracts.rightLabel;
       const legStale = Boolean(leg.fetchedAt && now - Date.parse(leg.fetchedAt) > HISTORY_STALE_MS);
       return <article key={side} className="exchange-funding-leg" data-funding-leg={side}>
         <h4>{name} · {short ? "做空" : "做多"}<span>{leg.symbol}</span></h4>

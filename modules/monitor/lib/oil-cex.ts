@@ -1,7 +1,7 @@
-import { validateExchangeQuote, type ExchangeLeg, type ExchangeQuote } from './exchange-quotes.ts';
+import { exchangeContracts, validateExchangeQuote, type ExchangeLeg, type ExchangeQuote, type SpreadMarket } from './exchange-quotes.ts';
 
 type JsonObject = Record<string, unknown>;
-type OilCex = 'okx' | 'bitget';
+type OilCex = 'okx' | 'bitget' | 'gate';
 type Funding = Pick<ExchangeLeg, 'fundingRate' | 'fundingIntervalHours' | 'nextFundingAt'> & { sourceTime: number };
 type ReaderOptions = {
   request: (url: string) => Promise<unknown>;
@@ -9,7 +9,7 @@ type ReaderOptions = {
   clock?: () => number;
 };
 const HOUR = 3_600_000;
-const bases = ['BZ', 'CL'] as const;
+const marketBases = (monitorId: SpreadMarket) => [exchangeContracts[monitorId].leftBase, exchangeContracts[monitorId].rightBase] as const;
 const emptyFunding = { fundingRate: null, fundingIntervalHours: null, nextFundingAt: null };
 
 function object(value: unknown): JsonObject {
@@ -67,25 +67,25 @@ function optionalFunding(load: () => Funding[], priceTime: number): Funding[] | 
     return result;
   } catch { return null; }
 }
-function finish(exchange: OilCex, times: number[], legs: ExchangeLeg[], funding: Funding[] | null): ExchangeQuote {
+function finish(exchange: OilCex, monitorId: SpreadMarket, times: number[], legs: ExchangeLeg[], funding: Funding[] | null, timestampBasis?: 'received'): ExchangeQuote {
   synchronized(times);
   const apply = (leg: ExchangeLeg, index: number): ExchangeLeg => {
     const item = funding?.[index];
     return item ? { ...leg, fundingRate: item.fundingRate, fundingIntervalHours: item.fundingIntervalHours, nextFundingAt: item.nextFundingAt } : leg;
   };
   return validateExchangeQuote({
-    exchange, monitorId: 'oil', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark',
-    fetchedAt: new Date(Math.min(...times)).toISOString(),
+    exchange, monitorId, currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark',
+    fetchedAt: new Date(Math.min(...times)).toISOString(), ...(timestampBasis ? { timestampBasis } : {}),
     fundingFetchedAt: funding ? new Date(Math.min(...funding.map(item => item.sourceTime))).toISOString() : null,
     status: 'live', left: apply(legs[0], 0), right: apply(legs[1], 1),
     fundingError: funding ? '' : '资金费或结算周期暂不可用，价格仍正常更新。',
-  }, exchange, 'oil');
+  }, exchange, monitorId);
 }
 
 /** Official OKX envelopes; funding may contain one response per contract. */
-export function parseOkxOilQuote(instruments: unknown, marks: unknown, funding: unknown, now = Date.now()): ExchangeQuote {
+export function parseOkxOilQuote(instruments: unknown, marks: unknown, funding: unknown, now = Date.now(), monitorId: SpreadMarket = 'oil'): ExchangeQuote {
   const metadata = rows(instruments, '0'), prices = rows(marks, '0'), times: number[] = [];
-  const legs = bases.map(base => {
+  const legs = marketBases(monitorId).map(base => {
     const symbol = `${base}-USDT-SWAP`, spec = unique(metadata, 'instId', symbol), mark = unique(prices, 'instId', symbol);
     if (spec.state !== 'live' || spec.instType !== 'SWAP' || spec.ctType !== 'linear' || spec.settleCcy !== 'USDT' || spec.ctValCcy !== base || spec.instFamily !== `${base}-USDT` || spec.uly !== `${base}-USDT` || spec.ruleType !== 'normal' || mark.instType !== 'SWAP') throw new Error('Unsupported OKX oil contract');
     times.push(sourceTime(mark.ts, now));
@@ -103,13 +103,13 @@ export function parseOkxOilQuote(instruments: unknown, marks: unknown, funding: 
       return fundingFields(item.fundingRate, (timestamp(item.nextFundingTime) - settlement) / HOUR, settlement, time, priceTime, now);
     });
   }, priceTime);
-  return finish('okx', times, legs, completeFunding);
+  return finish('okx', monitorId, times, legs, completeFunding);
 }
 
 /** Official Bitget USDT-FUTURES envelopes; rates are decimal values, not percentages. */
-export function parseBitgetOilQuote(instruments: unknown, tickers: unknown, funding: unknown, now = Date.now()): ExchangeQuote {
+export function parseBitgetOilQuote(instruments: unknown, tickers: unknown, funding: unknown, now = Date.now(), monitorId: SpreadMarket = 'oil'): ExchangeQuote {
   const metadata = rows(instruments, '00000'), prices = rows(tickers, '00000'), times: number[] = [];
-  const legs = bases.map(base => {
+  const legs = marketBases(monitorId).map(base => {
     const symbol = `${base}USDT`, spec = unique(metadata, 'symbol', symbol), ticker = unique(prices, 'symbol', symbol);
     if (spec.symbolStatus !== 'normal' || spec.symbolType !== 'perpetual' || spec.baseCoin !== base || spec.quoteCoin !== 'USDT' || !Array.isArray(spec.supportMarginCoins) || spec.supportMarginCoins.length !== 1 || spec.supportMarginCoins[0] !== 'USDT') throw new Error('Unsupported Bitget oil contract');
     times.push(sourceTime(ticker.ts, now));
@@ -128,7 +128,25 @@ export function parseBitgetOilQuote(instruments: unknown, tickers: unknown, fund
       return fundingFields(item.fundingRate, item.fundingRateInterval, item.nextUpdate, time, priceTime, now);
     });
   }, priceTime);
-  return finish('bitget', times, legs, completeFunding);
+  return finish('bitget', monitorId, times, legs, completeFunding);
+}
+
+/** Gate USDT contract details, one object per leg. Gate publishes no quote
+ * timestamp, so the receipt time is reported as such. funding_rate is the
+ * decimal rate applied at funding_next_apply (Unix seconds).
+ * https://www.gate.com/docs/developers/apiv4/en/futures/#get-a-single-contract
+ */
+export function parseGateQuote(details: unknown, receivedAt: number, monitorId: SpreadMarket = 'hynix'): ExchangeQuote {
+  if (!Array.isArray(details) || details.length !== 2) throw new Error('Invalid Gate contract response');
+  const now = timestamp(receivedAt);
+  const specs = marketBases(monitorId).map((base, index) => {
+    const symbol = `${base}_USDT`, spec = object(details[index]);
+    if (spec.name !== symbol || spec.status !== 'trading' || spec.in_delisting !== false || spec.type !== 'direct') throw new Error('Unsupported Gate contract');
+    return { symbol, spec };
+  });
+  const legs = specs.map(({ symbol, spec }) => priceLeg(symbol, spec.mark_price));
+  const completeFunding = optionalFunding(() => specs.map(({ spec }) => fundingFields(spec.funding_rate, number(spec.funding_interval) / 3600, timestamp(spec.funding_next_apply) * 1000, now, now, now)), now);
+  return finish('gate', monitorId, [now, now], legs, completeFunding, 'received');
 }
 
 /** Public market transport only; funding outages leave validated prices available. */
@@ -138,23 +156,35 @@ export function createOilCexReader({ request, shared, clock = Date.now }: Reader
     envelope(value, code);
     return value;
   });
-  return async (exchange: OilCex): Promise<ExchangeQuote> => {
+  return async (exchange: OilCex, monitorId: SpreadMarket = 'oil'): Promise<ExchangeQuote> => {
+    const bases = marketBases(monitorId);
+    // Instrument and price lists cover every market, so both monitors share one request.
     if (exchange === 'okx') {
       const [instruments, marks, funding] = await Promise.all([
-        cached('okx/oil/instruments', 60_000, 'https://www.okx.com/api/v5/public/instruments?instType=SWAP', '0'),
-        cached('okx/oil/marks', 1000, 'https://www.okx.com/api/v5/public/mark-price?instType=SWAP', '0'),
-        Promise.all(bases.map(base => cached(`okx/oil/funding/${base}`, 15_000, `https://www.okx.com/api/v5/public/funding-rate?instId=${base}-USDT-SWAP`, '0').catch(() => null))),
+        cached('okx/instruments', 60_000, 'https://www.okx.com/api/v5/public/instruments?instType=SWAP', '0'),
+        cached('okx/marks', 1000, 'https://www.okx.com/api/v5/public/mark-price?instType=SWAP', '0'),
+        Promise.all(bases.map(base => cached(`okx/funding/${base}`, 15_000, `https://www.okx.com/api/v5/public/funding-rate?instId=${base}-USDT-SWAP`, '0').catch(() => null))),
       ]);
-      return parseOkxOilQuote(instruments, marks, funding, clock());
+      return parseOkxOilQuote(instruments, marks, funding, clock(), monitorId);
     }
     if (exchange === 'bitget') {
       const [instruments, tickers, funding] = await Promise.all([
-        cached('bitget/oil/instruments', 60_000, 'https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES', '00000'),
-        cached('bitget/oil/tickers', 1000, 'https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES', '00000'),
-        Promise.all(bases.map(base => cached(`bitget/oil/funding/${base}`, 15_000, `https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES&symbol=${base}USDT`, '00000').catch(() => null))),
+        cached('bitget/instruments', 60_000, 'https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES', '00000'),
+        cached('bitget/tickers', 1000, 'https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES', '00000'),
+        Promise.all(bases.map(base => cached(`bitget/funding/${base}`, 15_000, `https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES&symbol=${base}USDT`, '00000').catch(() => null))),
       ]);
-      return parseBitgetOilQuote(instruments, tickers, funding, clock());
+      return parseBitgetOilQuote(instruments, tickers, funding, clock(), monitorId);
     }
-    throw new Error('Unsupported oil exchange');
+    if (exchange === 'gate') {
+      const { details, receivedAt } = await shared(`gate/${monitorId}/contracts`, 1000, async () => {
+        const results = await Promise.all(bases.map(async base => {
+          const value = object(await request(`https://api.gateio.ws/api/v4/futures/usdt/contracts/${base}_USDT`));
+          return { value, receivedAt: clock() };
+        }));
+        return { details: results.map(item => item.value), receivedAt: Math.min(...results.map(item => item.receivedAt)) };
+      }) as { details: unknown[]; receivedAt: number };
+      return parseGateQuote(details, receivedAt, monitorId);
+    }
+    throw new Error('Unsupported CEX exchange');
   };
 }

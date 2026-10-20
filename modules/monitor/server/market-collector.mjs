@@ -12,7 +12,7 @@ import { fetchIntradaySnapshot, OIL_CANDLE_ACTION, OIL_CANDLE_REFRESH_MS } from 
 import oilIntradayArchive from '../public/oil/data/binance-15m.json' with { type: 'json' };
 import { createGoldOilReader } from '../lib/gold-oil-service.ts';
 import { GOLD_OIL_QUOTE_MS, GOLD_OIL_HISTORY_MS, GOLD_OIL_FUNDING_MS, GOLD_OIL_VARIANTS, goldOilAction } from '../lib/gold-oil.ts';
-import { exchangeFundingAction, HISTORY_REFRESH_MS } from '../lib/exchange-funding-history.ts';
+import { exchangeFundingAction, fundingHistoryExchanges, HISTORY_REFRESH_MS } from '../lib/exchange-funding-history.ts';
 import { createExchangeFundingReader } from '../lib/exchange-funding-service.ts';
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
 import { createOilHedgePricesReader } from '../lib/oil-hedge-price-service.ts';
@@ -56,7 +56,7 @@ export function marketJobs({ oilIntervalMs = 30_000, variationalSession, variati
     { id: 'hynix', action: 'funding', intervalMs: 300_000, load: previous => fetchHynixFundingSnapshot(previous ?? hynixFundingArchive, { signal: AbortSignal.timeout(12_000) }) },
     { id: 'oil', action: 'funding', intervalMs: 300_000, load: previous => fetchFundingSnapshot(previous ?? oilFundingArchive) },
     ...['oil', 'hynix'].flatMap(id => comparisonExchanges(id).map(exchange => ({ id, action: exchangeAction(exchange), intervalMs: EXCHANGE_REFRESH_MS, load: () => readExchange(exchange, id) }))),
-    ...comparisonExchanges('oil').map(exchange => ({ id: 'oil', action: exchangeFundingAction(exchange), intervalMs: HISTORY_REFRESH_MS, load: previous => readFundingHistory(exchange, previous) })),
+    ...['oil', 'hynix'].flatMap(id => fundingHistoryExchanges(id).map(exchange => ({ id, action: exchangeFundingAction(exchange), intervalMs: HISTORY_REFRESH_MS, load: previous => readFundingHistory(exchange, previous, id) }))),
     { id: 'oil', action: OIL_HEDGE_PRICES_ACTION, intervalMs: HEDGE_PRICES_REFRESH_MS, load: previous => readHedgePrices(previous) },
     { id: 'oil', action: OIL_CANDLE_ACTION, intervalMs: OIL_CANDLE_REFRESH_MS, load: previous => fetchIntradaySnapshot(previous ?? oilIntradayArchive) },
   ];

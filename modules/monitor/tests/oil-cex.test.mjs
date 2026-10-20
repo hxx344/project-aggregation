@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseOkxOilQuote, parseBitgetOilQuote, createOilCexReader } from '../lib/oil-cex.ts';
+import { parseOkxOilQuote, parseBitgetOilQuote, parseGateQuote, createOilCexReader } from '../lib/oil-cex.ts';
 import { calculateExchangeSpread } from '../lib/exchange-quotes.ts';
 
 const NOW = Date.UTC(2026, 9, 1, 10), HOUR = 3_600_000;
@@ -194,4 +194,66 @@ test('reader rejects failed envelopes before caching, and unknown exchanges befo
   const previous = requests;
   await assert.rejects(reader('binance'), /Unsupported/);
   assert.equal(requests, previous);
+});
+
+test('OKX and Bitget read the Hynix ADR and ordinary-share contracts with the 10:1 ratio', () => {
+  for (const exchange of ['okx', 'bitget']) {
+    const fixture = fixtures(exchange), okx = exchange === 'okx';
+    const rename = row => { for (const field of ['instId', 'symbol', 'ctValCcy', 'instFamily', 'uly', 'baseCoin']) if (typeof row[field] === 'string') row[field] = row[field].replace(/^BZ/, 'SKHY').replace(/^CL/, 'SKHYNIX'); };
+    for (const row of [...fixture.instruments.data, ...fixture.prices.data, ...fixture.funding.flatMap(item => item.data)]) rename(row);
+    fixture.prices.data[0][okx ? 'markPx' : 'markPrice'] = '140'; fixture.prices.data[1][okx ? 'markPx' : 'markPrice'] = '930';
+    const quote = (okx ? parseOkxOilQuote : parseBitgetOilQuote)(fixture.instruments, fixture.prices, fixture.funding, NOW, 'hynix');
+    assert.equal(quote.monitorId, 'hynix');
+    assert.equal(quote.left.symbol, okx ? 'SKHY-USDT-SWAP' : 'SKHYUSDT');
+    assert.equal(quote.right.symbol, okx ? 'SKHYNIX-USDT-SWAP' : 'SKHYNIXUSDT');
+    assert.ok(Math.abs(calculateExchangeSpread(quote).premium - (140 / 93 - 1) * 100) < 1e-9);
+    assert.throws(() => (okx ? parseOkxOilQuote : parseBitgetOilQuote)(fixtures(exchange).instruments, fixtures(exchange).prices, fixtures(exchange).funding, NOW, 'hynix'), /contract/);
+  }
+});
+
+function gateDetails(overrides = [{}, {}]) {
+  return [
+    { name: 'SKHY_USDT', status: 'trading', in_delisting: false, type: 'direct', mark_price: '140.5', funding_rate: '0', funding_interval: 28800, funding_next_apply: (NOW + 2 * HOUR) / 1000, quanto_multiplier: '0.01', ...overrides[0] },
+    { name: 'SKHYNIX_USDT', status: 'trading', in_delisting: false, type: 'direct', mark_price: '934', funding_rate: '0.000566', funding_interval: 14400, funding_next_apply: (NOW + 2 * HOUR) / 1000, quanto_multiplier: '0.001', ...overrides[1] },
+  ];
+}
+
+test('Gate: mark prices are per share, intervals come from seconds, and receipt time is labelled', () => {
+  const quote = parseGateQuote(gateDetails(), NOW, 'hynix');
+  assert.equal(quote.exchange, 'gate');
+  assert.equal(quote.timestampBasis, 'received');
+  assert.equal(quote.fetchedAt, iso(NOW));
+  assert.equal(quote.fundingFetchedAt, iso(NOW));
+  assert.deepEqual([quote.left.price, quote.right.price], [140.5, 934]);
+  assert.deepEqual([quote.left.fundingIntervalHours, quote.right.fundingIntervalHours], [8, 4]);
+  assert.equal(quote.right.nextFundingAt, iso(NOW + 2 * HOUR));
+  const expected = (10 * 140.5 * 0 / 8 - 934 * 0.000566 / 4) / (10 * 140.5 + 934) * 8760;
+  assert.ok(Math.abs(calculateExchangeSpread(quote).shortAnnualized - expected) < 1e-12);
+});
+
+test('Gate rejects inactive or mismatched contracts and keeps prices when funding metadata is broken', () => {
+  for (const patch of [{ name: 'SKHX_USDT' }, { status: 'delisted' }, { in_delisting: true }, { type: 'inverse' }, { mark_price: '0' }]) {
+    assert.throws(() => parseGateQuote(gateDetails([patch, {}]), NOW, 'hynix'));
+  }
+  assert.throws(() => parseGateQuote(gateDetails().slice(0, 1), NOW, 'hynix'));
+  for (const patch of [{ funding_rate: '' }, { funding_interval: 1800 }, { funding_next_apply: (NOW - 2 * HOUR) / 1000 }, { funding_next_apply: NOW + 2 * HOUR }]) {
+    const quote = parseGateQuote(gateDetails([{}, patch]), NOW, 'hynix');
+    assert.equal(quote.right.price, 934);
+    assert.equal(quote.fundingFetchedAt, null);
+    assert.equal(calculateExchangeSpread(quote).shortAnnualized, null);
+    assert.ok(quote.fundingError);
+  }
+});
+
+test('Gate reader requests both contract details through one shared short cache entry', async () => {
+  const calls = [], keys = [];
+  const reader = createOilCexReader({
+    clock: () => NOW,
+    shared: async (key, ttl, load) => { keys.push([key, ttl]); return load(); },
+    request: async input => { const url = new URL(input); calls.push(url); return gateDetails().find(row => url.pathname.endsWith(`/${row.name}`)); },
+  });
+  const quote = await reader('gate', 'hynix');
+  assert.equal(quote.right.fundingRate, 0.000566);
+  assert.deepEqual(keys, [['gate/hynix/contracts', 1000]]);
+  assert.deepEqual(calls.map(url => url.href), ['https://api.gateio.ws/api/v4/futures/usdt/contracts/SKHY_USDT', 'https://api.gateio.ws/api/v4/futures/usdt/contracts/SKHYNIX_USDT']);
 });

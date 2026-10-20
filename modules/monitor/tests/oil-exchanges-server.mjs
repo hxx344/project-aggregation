@@ -3,6 +3,7 @@
 import { createServer } from 'node:http';
 import { createPageHandler } from '../server/page-handler.mjs';
 import { comparisonExchanges, exchangeDefinition } from '../lib/exchange-quotes.ts';
+import { fundingHistoryExchanges } from '../lib/exchange-funding-history.ts';
 import oilArchive from '../public/oil/data/binance-2026.json' with { type: 'json' };
 import oilCandles from '../public/oil/data/binance-15m.json' with { type: 'json' };
 
@@ -17,12 +18,12 @@ function exchangeQuote(exchange, id, now = Date.now()) {
   }
   return result;
 }
-function exchangeFundingHistory(exchange, now = Date.now()) {
-  const spec = exchangeDefinition(exchange, 'oil'), at = new Date(now).toISOString();
+function exchangeFundingHistory(exchange, id = 'oil', now = Date.now()) {
+  const spec = exchangeDefinition(exchange, id), at = new Date(now).toISOString();
   const unsupported = exchange === 'variational';
   const settled = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
   const coverage = unsupported ? null : { from: now - 60 * 24 * 3_600_000, to: now };
-  return { exchange, monitorId: 'oil', currency: spec.currency, fetchedAt: at, status: 'live', availability: unsupported ? 'unsupported' : 'supported',
+  return { exchange, monitorId: id, currency: spec.currency, fetchedAt: at, status: 'live', availability: unsupported ? 'unsupported' : 'supported',
     reason: unsupported ? 'Variational 暂无公开的市场已结算资金费历史接口；当前统计不作为历史结算。' : '',
     left: { symbol: spec.left, fetchedAt: unsupported ? null : at, error: '', coverage }, right: { symbol: spec.right, fetchedAt: unsupported ? null : at, error: '', coverage },
     rows: unsupported ? [] : [
@@ -37,7 +38,7 @@ const services = new Map(['oil', 'hynix'].map(id => [id, { handle(action) {
   const match = /^exchanges\/([^/]+)\/quote$/.exec(action);
   if (match && comparisonExchanges(id).includes(match[1])) return exchangeQuote(match[1], id);
   const funding = /^exchanges\/([^/]+)\/funding-history$/.exec(action);
-  if (funding && id === 'oil' && comparisonExchanges(id).includes(funding[1])) return exchangeFundingHistory(funding[1]);
+  if (funding && fundingHistoryExchanges(id).includes(funding[1])) return exchangeFundingHistory(funding[1], id);
   if (id === 'oil' && action === 'quote') return { ...oilArchive.market, status: 'snapshot' };
   if (id === 'oil' && action === 'candles/15m') return { ...oilCandles, status: 'snapshot' };
   throw Error('Fixture unavailable');

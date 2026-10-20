@@ -4,8 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
-import { normalizeSettledFunding, validateExchangeFundingHistory, exchangeFundingAction, HISTORY_REFRESH_MS, HISTORY_STALE_MS, HISTORY_WINDOW_MS, HISTORY_LEG_LIMIT } from '../lib/exchange-funding-history.ts';
-import { parseHyperliquidFundingHistory, parseLighterFundingHistory, createExchangeFundingReader } from '../lib/exchange-funding-service.ts';
+import { normalizeSettledFunding, validateExchangeFundingHistory, exchangeFundingAction, fundingHistoryExchanges, HISTORY_REFRESH_MS, HISTORY_STALE_MS, HISTORY_WINDOW_MS, HISTORY_LEG_LIMIT } from '../lib/exchange-funding-history.ts';
+import { parseHyperliquidFundingHistory, parseLighterFundingHistory, parseGateFundingHistory, createExchangeFundingReader } from '../lib/exchange-funding-service.ts';
 import { comparisonExchanges, exchangeDefinition } from '../lib/exchange-quotes.ts';
 import { createDataReader } from '../lib/monitor-service.ts';
 import { openMarketStore } from '../server/market-store.mjs';
@@ -169,7 +169,9 @@ test('preview history has an independent five-minute cache, deduplicates request
   now += HISTORY_REFRESH_MS - 1; assert.equal((await read('oil', action)).fetchedAt, values[0].fetchedAt); assert.equal(calls, 1);
   now += 2; fail = true;
   const retained = await read('oil', action); assert.equal(retained.status, 'snapshot'); assert.equal(retained.fetchedAt, values[0].fetchedAt); assert.equal(calls, 2);
-  for (const id of ['hynix', 'perpetual', 'cl-xau']) await assert.rejects(read(id, action), /Unsupported/);
+  for (const id of ['perpetual', 'cl-xau']) await assert.rejects(read(id, action), /Unsupported/);
+  await assert.rejects(read('oil', exchangeFundingAction('gate')), /Unsupported/);
+  await assert.rejects(read('hynix', exchangeFundingAction('lighter')), /Unsupported/);
   await assert.rejects(read('oil', 'exchanges/fake/funding-history'));
 });
 
@@ -196,14 +198,72 @@ test('history schedules and persistent API reads retain failures without loading
       const response = await fetch(url, { headers }); assert.equal(response.status, 200);
       const value = await response.json(); assert.equal(value.exchange, exchange); assert.equal(value.collection.source, 'database');
       assert.equal((await fetch(url, { method: 'POST', headers })).status, 405);
-      assert.equal((await fetch(`${base}/api/monitors/hynix/${path}`, { headers })).status, 404);
+      if (!fundingHistoryExchanges('hynix').includes(exchange)) assert.equal((await fetch(`${base}/api/monitors/hynix/${path}`, { headers })).status, 404);
     }
+    assert.equal((await fetch(`${base}/api/monitors/oil/${exchangeFundingAction('gate')}`, { headers })).status, 404);
     assert.deepEqual(services.market.status(), before);
     const jobs = marketJobs().filter(job => job.action.endsWith('/funding-history'));
-    assert.equal(jobs.length, 7); assert.ok(jobs.every(job => job.id === 'oil' && job.intervalMs === HISTORY_REFRESH_MS));
+    assert.equal(jobs.length, 13); assert.ok(jobs.every(job => job.intervalMs === HISTORY_REFRESH_MS));
+    assert.deepEqual(jobs.filter(job => job.id === 'hynix').map(job => job.action), fundingHistoryExchanges('hynix').map(exchangeFundingAction));
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
     if (services) { await Promise.all([...services.values()].map(service => service.stop())); await services.market.stop(); await services.notifications.stop(); }
     store?.close(); await rm(directory, { recursive: true, force: true });
   }
+});
+
+function hynixHistory(exchange, now = NOW) {
+  const definition = exchangeDefinition(exchange, 'hynix'), fetchedAt = new Date(now).toISOString();
+  return validateExchangeFundingHistory({ exchange, monitorId: 'hynix', currency: definition.currency, fetchedAt, status: 'live', availability: 'supported', reason: '',
+    left: { symbol: definition.left, fetchedAt, error: '' }, right: { symbol: definition.right, fetchedAt, error: '' },
+    rows: [{ time: now - 4 * HOUR, leftRate: null, rightRate: 0.0001 }] }, exchange, 'hynix');
+}
+
+test('Hynix histories keep their own market identity, contracts and exchange list', () => {
+  assert.deepEqual(fundingHistoryExchanges('hynix'), ['hyperliquid', 'bybit', 'binance', 'okx', 'bitget', 'gate']);
+  for (const exchange of fundingHistoryExchanges('hynix')) {
+    const value = hynixHistory(exchange);
+    assert.equal(value.monitorId, 'hynix');
+    assert.throws(() => validateExchangeFundingHistory(value, exchange, 'oil'));
+    assert.throws(() => validateExchangeFundingHistory({ ...value, monitorId: 'oil' }, exchange, 'hynix'));
+  }
+  assert.throws(() => validateExchangeFundingHistory(history('lighter'), 'lighter', 'hynix'), /Unsupported/);
+  assert.equal(validateExchangeFundingHistory(history('okx'), 'okx').monitorId, 'oil', 'Oil remains the default market');
+});
+
+test('Gate history parses second timestamps, decimal rates and pages backwards without truncation', async () => {
+  assert.deepEqual(parseGateFundingHistory([{ t: NOW / 1000 - 3599, r: '0.000312' }, { t: NOW / 1000 - 7200, r: '0' }], NOW), [{ time: NOW - 3_599_000, rate: 0.000312 }, { time: NOW - 7_200_000, rate: 0 }]);
+  for (const row of [{ t: NOW, r: '0' }, { t: NOW / 1000, r: '' }, { t: 'x', r: '0' }]) assert.throws(() => parseGateFundingHistory([row], NOW));
+  const settlements = Array.from({ length: 360 }, (_, i) => ({ t: NOW / 1000 - i * 4 * 3600, r: String(i % 2 ? 0.0001 : -0.0002) }));
+  const calls = [];
+  const read = createExchangeFundingReader({ clock: () => NOW, fetcher: async input => {
+    const url = new URL(input); calls.push(url);
+    if (url.hostname !== 'api.gateio.ws' || !['SKHY_USDT', 'SKHYNIX_USDT'].includes(url.searchParams.get('contract'))) return new Response('', { status: 404 });
+    const from = Number(url.searchParams.get('from')), to = Number(url.searchParams.get('to'));
+    return Response.json(settlements.filter(row => row.t >= from && row.t < to).slice(0, Number(url.searchParams.get('limit'))));
+  } });
+  const value = await read('gate', null, 'hynix');
+  assert.equal(value.monitorId, 'hynix'); assert.equal(value.currency, 'USDT');
+  assert.equal(value.rows.length, 360); assert.equal(value.rows.filter(row => row.leftRate !== null && row.rightRate !== null).length, 360);
+  assert.equal(value.rows[0].time, NOW); assert.equal(value.rows.at(-1).time, NOW - 359 * 4 * HOUR);
+  assert.equal(calls.length, 8, 'Four 100-row pages per leg');
+  assert.ok(calls.every(url => url.searchParams.get('limit') === '100' && url.searchParams.get('from') === String((NOW - HISTORY_WINDOW_MS) / 1000)));
+  const stuck = createExchangeFundingReader({ clock: () => NOW, fetcher: async () => Response.json(Array.from({ length: 100 }, () => ({ t: NOW / 1000 + 10, r: '0' }))) });
+  await assert.rejects(stuck('gate', null, 'hynix'));
+});
+
+test('Hynix CEX and Hyperliquid histories request the Hynix contracts', async () => {
+  const seen = [];
+  const read = createExchangeFundingReader({ clock: () => NOW, fetcher: async (input, init) => {
+    const url = new URL(input);
+    if (url.hostname === 'api.hyperliquid.xyz') { const { coin } = JSON.parse(init.body); seen.push(coin); return Response.json([{ coin, time: NOW - HOUR + 5, fundingRate: '0.00001' }]); }
+    const symbol = url.searchParams.get('instId') ?? url.searchParams.get('symbol'); seen.push(symbol);
+    if (url.hostname === 'www.okx.com') return Response.json({ code: '0', data: [{ instId: symbol, instType: 'SWAP', fundingTime: String(NOW - 8 * HOUR), realizedRate: '0.0001', fundingRate: '0.9' }] });
+    return Response.json({ code: '00000', data: [{ symbol, fundingTime: String(NOW - 8 * HOUR), fundingRate: '0.0001' }] });
+  } });
+  assert.equal((await read('hyperliquid', null, 'hynix')).rows[0].leftRate, 0.00001);
+  assert.equal((await read('okx', null, 'hynix')).rows[0].rightRate, 0.0001);
+  assert.equal((await read('bitget', null, 'hynix')).rows[0].leftRate, 0.0001);
+  assert.deepEqual(seen.sort(), ['SKHY-USDT-SWAP', 'SKHYNIX-USDT-SWAP', 'SKHYNIXUSDT', 'SKHYUSDT', 'xyz:SKHX', 'xyz:SKHY'].sort());
+  await assert.rejects(read('lighter', null, 'hynix'), /Unsupported/);
 });

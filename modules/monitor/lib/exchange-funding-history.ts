@@ -1,4 +1,4 @@
-import { comparisonExchanges, exchangeDefinition, type Exchange } from './exchange-quotes.ts';
+import { displayComparisonExchanges, exchangeDefinition, externalExchanges, type Exchange, type SpreadMarket } from './exchange-quotes.ts';
 
 export const HISTORY_REFRESH_MS = 300_000;
 export const HISTORY_STALE_MS = HISTORY_REFRESH_MS * 2 + 15_000;
@@ -11,7 +11,7 @@ export type FundingHistoryLeg = { symbol: string; fetchedAt: string | null; erro
 export type SettledFundingRecord = { time: number; rate: number };
 export type ExchangeFundingHistory = {
   exchange: Exchange;
-  monitorId: 'oil';
+  monitorId: SpreadMarket;
   currency: 'USD' | 'USDT' | 'USDC';
   fetchedAt: string;
   status: 'live' | 'snapshot';
@@ -23,7 +23,10 @@ export type ExchangeFundingHistory = {
 };
 
 export const exchangeFundingAction = (exchange: Exchange) => `exchanges/${exchange}/funding-history`;
-export const fundingExchangeFromAction = (action: string): Exchange | null => comparisonExchanges('oil').find(exchange => exchangeFundingAction(exchange) === action) ?? null;
+export const fundingHistoryExchanges = (market: SpreadMarket): readonly Exchange[] => displayComparisonExchanges(market);
+export const supportsFundingHistory = (market: string, exchange: Exchange) => (market === 'oil' || market === 'hynix') && fundingHistoryExchanges(market).includes(exchange);
+/** Without a market, recognizes any exchange action; callers then check supportsFundingHistory. */
+export const fundingExchangeFromAction = (action: string, market?: SpreadMarket): Exchange | null => (market ? fundingHistoryExchanges(market) : ['hyperliquid', ...externalExchanges] as const).find(exchange => exchangeFundingAction(exchange) === action) ?? null;
 
 /** Preserve the original settlement timestamps; asynchronous legs are never paired by a time bucket. */
 export function normalizeSettledFunding(records: SettledFundingRecord[], now: number): SettledFundingRecord[] {
@@ -38,11 +41,12 @@ export function normalizeSettledFunding(records: SettledFundingRecord[], now: nu
   return [...unique].sort(([a], [b]) => b - a).map(([time, rate]) => ({ time, rate }));
 }
 
-export function validateExchangeFundingHistory(input: unknown, exchange: Exchange): ExchangeFundingHistory {
+export function validateExchangeFundingHistory(input: unknown, exchange: Exchange, monitorId: SpreadMarket = 'oil'): ExchangeFundingHistory {
   const value = input as ExchangeFundingHistory;
-  const definition = exchangeDefinition(exchange, 'oil');
+  if (!supportsFundingHistory(monitorId, exchange)) throw new Error('Unsupported exchange funding history');
+  const definition = exchangeDefinition(exchange, monitorId);
   const stamp = (time: unknown) => typeof time === 'string' && Number.isFinite(Date.parse(time));
-  if (!value || value.exchange !== exchange || value.monitorId !== 'oil' || value.currency !== definition.currency || !stamp(value.fetchedAt) || !['live', 'snapshot'].includes(value.status) || !['supported', 'unsupported'].includes(value.availability) || typeof value.reason !== 'string' || !Array.isArray(value.rows) || value.rows.length > HISTORY_LEG_LIMIT * 2) throw new Error('Invalid exchange funding history');
+  if (!value || value.exchange !== exchange || value.monitorId !== monitorId || value.currency !== definition.currency || !stamp(value.fetchedAt) || !['live', 'snapshot'].includes(value.status) || !['supported', 'unsupported'].includes(value.availability) || typeof value.reason !== 'string' || !Array.isArray(value.rows) || value.rows.length > HISTORY_LEG_LIMIT * 2) throw new Error('Invalid exchange funding history');
   if ((exchange === 'variational') !== (value.availability === 'unsupported')) throw new Error('Invalid history availability');
   const now = Date.parse(value.fetchedAt);
   for (const [side, symbol] of [['left', definition.left], ['right', definition.right]] as const) {
@@ -64,6 +68,6 @@ export function validateExchangeFundingHistory(input: unknown, exchange: Exchang
     }
   }
   if (value.availability === 'unsupported' && (value.rows.length || !value.reason || value.left.fetchedAt !== null || value.right.fetchedAt !== null || value.left.coverage != null || value.right.coverage != null)) throw new Error('Unsupported history cannot contain settlements');
-  return { exchange, monitorId: 'oil', currency: definition.currency, fetchedAt: value.fetchedAt, status: value.status, availability: value.availability, reason: value.reason,
+  return { exchange, monitorId, currency: definition.currency, fetchedAt: value.fetchedAt, status: value.status, availability: value.availability, reason: value.reason,
     left: { ...value.left, coverage: value.left.coverage == null ? null : { ...value.left.coverage } }, right: { ...value.right, coverage: value.right.coverage == null ? null : { ...value.right.coverage } }, rows: value.rows.map(row => ({ time: row.time, leftRate: row.leftRate, rightRate: row.rightRate })).sort((a, b) => b.time - a.time) };
 }

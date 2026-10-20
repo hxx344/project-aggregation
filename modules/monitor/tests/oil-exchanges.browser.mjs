@@ -48,13 +48,17 @@ async page => {
   await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
   const hynix = page.locator('[data-exchange-market="hynix"]');
   await hynix.waitFor({ state: 'visible' });
-  check(await hynix.locator('tbody [data-exchange]').count() === 3, 'Hynix remains at its original three exchanges');
-  check(!paths.some(path => /hynix\/exchanges\/(lighter|variational|okx|bitget)/.test(path)), 'New oil sources never poll through Hynix');
+  await hynix.locator('[data-exchange="gate"]').getByText('SKHY_USDT / SKHYNIX_USDT', { exact: true }).waitFor();
+  check(await hynix.locator('tbody [data-exchange]').count() === 6, 'Hynix lists Hyperliquid, Bybit, Binance, OKX, Bitget and Gate');
+  check((await hynix.locator('[data-exchange="okx"]').innerText()).includes('SKHY-USDT-SWAP / SKHYNIX-USDT-SWAP'), 'Hynix OKX contracts are explicit');
+  check((await hynix.locator('[data-exchange="bitget"]').innerText()).includes('SKHYUSDT / SKHYNIXUSDT'), 'Hynix Bitget contracts are explicit');
+  check(['okx', 'bitget', 'gate'].every(exchange => paths.some(path => path.endsWith(`/hynix/exchanges/${exchange}/quote`))), 'Hynix polls the new exchanges');
+  check(!paths.some(path => /hynix\/exchanges\/(lighter|variational)\//.test(path) || path.includes('/oil/exchanges/gate/')), 'Each market polls only its own sources');
   await page.getByRole('tab', { name: '原油价差', exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
   await oil.waitFor({ state: 'visible' });
   check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'New comparison rows fit the narrow viewport');
   await variational.screenshot({ path: 'output/playwright/oil-exchanges-mobile.png' });
   check(errors.length === 0, errors.join('; '));
-  return { passed: true, oilExchanges: 7, hynixExchanges: 3, checked: ['source units', 'missing funding', 'estimated settlement', 'failure retention', 'older response', 'recovery', 'mobile'] };
+  return { passed: true, oilExchanges: 7, hynixExchanges: 6, checked: ['source units', 'missing funding', 'estimated settlement', 'failure retention', 'older response', 'recovery', 'mobile'] };
 }

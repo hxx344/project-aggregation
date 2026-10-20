@@ -6,7 +6,7 @@ import { comparisonExchanges, exchangeAction, validateComparisonQuote } from '..
 import { OIL_CANDLE_ACTION, validateIntradaySnapshot } from '../modules/oil/intraday.mjs';
 import { validateGoldOilQuote, validateGoldOilHistory, GOLD_OIL_VARIANTS, goldOilAction } from '../lib/gold-oil.ts';
 import { validateGoldOilFunding } from '../lib/gold-oil-funding.ts';
-import { exchangeFundingAction, validateExchangeFundingHistory } from '../lib/exchange-funding-history.ts';
+import { exchangeFundingAction, fundingHistoryExchanges, validateExchangeFundingHistory } from '../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION, validateOilHedgePrices } from '../lib/oil-hedge-prices.ts';
 
 const validators = { 'hynix/quote': validateHynixQuote, 'hynix/history': validateHynixHistory, 'hynix/funding': validateHynixFunding, 'oil/quote': validateOilQuote, 'oil/history': validateOilHistory, 'oil/funding': validateOilFunding };
@@ -16,7 +16,7 @@ for (const { oilType, exchange } of GOLD_OIL_VARIANTS) for (const [action, valid
 }
 validators[`oil/${OIL_HEDGE_PRICES_ACTION}`] = validateOilHedgePrices;
 for (const id of ['oil', 'hynix']) for (const exchange of comparisonExchanges(id)) validators[`${id}/${exchangeAction(exchange)}`] = value => validateComparisonQuote(value, exchange, id);
-for (const exchange of comparisonExchanges('oil')) validators[`oil/${exchangeFundingAction(exchange)}`] = value => validateExchangeFundingHistory(value, exchange);
+for (const id of ['oil', 'hynix']) for (const exchange of fundingHistoryExchanges(id)) validators[`${id}/${exchangeFundingAction(exchange)}`] = value => validateExchangeFundingHistory(value, exchange, id);
 export const datasetKeys = Object.keys(validators);
 const timestamp = value => Date.parse(value.fetchedAt ?? value.metadata?.fetchedAt);
 const keyFor = (id, action) => { const key = `${id}/${action}`; if (!Object.hasOwn(validators, key)) throw new Error('Unknown market dataset'); return key; };

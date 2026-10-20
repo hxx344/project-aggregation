@@ -1,4 +1,4 @@
-import { exchangeDefinition, type Exchange } from './exchange-quotes.ts';
+import { exchangeDefinition, type Exchange, type SpreadMarket } from './exchange-quotes.ts';
 import { normalizeSettledFunding, validateExchangeFundingHistory, HISTORY_WINDOW_MS, type ExchangeFundingHistory, type FundingHistoryRange, type SettledFundingRecord } from './exchange-funding-history.ts';
 import { createCexFundingHistoryReader } from './exchange-funding-cex.ts';
 import { parseLighterOilMarkets } from './oil-dex.ts';
@@ -10,7 +10,7 @@ const number = (input: unknown) => { if ((typeof input !== 'number' && typeof in
 
 /** https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#retrieve-historical-funding-rates */
 export function parseHyperliquidFundingHistory(input: unknown, symbol: string, now: number): SettledFundingRecord[] {
-  if (!['xyz:BRENTOIL', 'xyz:CL'].includes(symbol)) throw Error('Unknown Hyperliquid oil contract');
+  if (!['xyz:BRENTOIL', 'xyz:CL', 'xyz:SKHY', 'xyz:SKHX'].includes(symbol)) throw Error('Unknown Hyperliquid comparison contract');
   return normalizeSettledFunding(list(input).map(row => {
     if (row.coin !== symbol) throw Error('Funding contract mismatch');
     return { time: number(row.time), rate: number(row.fundingRate) };
@@ -29,6 +29,17 @@ export function parseLighterFundingHistory(input: unknown, marketId: number, now
     const magnitude = number(row.rate), seconds = number(row.timestamp);
     if (magnitude < 0 || magnitude > 100 || !Number.isSafeInteger(seconds) || seconds < 1_000_000_000 || seconds >= 100_000_000_000 || !['long', 'short'].includes(String(row.direction)) || (row.market_id !== undefined && number(row.market_id) !== marketId)) throw Error('Invalid Lighter funding settlement');
     return { time: seconds * 1000, rate: magnitude === 0 ? 0 : magnitude / 100 * (row.direction === 'short' ? -1 : 1) };
+  }), now);
+}
+
+/** Gate reports settlement times in Unix seconds and rates as decimal strings.
+ * https://www.gate.com/docs/developers/apiv4/en/futures/#futures-market-historical-funding-rate
+ */
+export function parseGateFundingHistory(input: unknown, now: number): SettledFundingRecord[] {
+  return normalizeSettledFunding(list(input).map(row => {
+    const seconds = number(row.t);
+    if (!Number.isSafeInteger(seconds) || seconds < 1_000_000_000 || seconds >= 100_000_000_000) throw Error('Invalid Gate funding settlement');
+    return { time: seconds * 1000, rate: number(row.r) };
   }), now);
 }
 
@@ -69,6 +80,29 @@ export function createExchangeFundingReader({ fetcher = fetch, clock = Date.now 
       }
       throw Error('Hyperliquid funding pagination limit exceeded');
     }
+    if (exchange === 'gate') {
+      const records = new Map<number, number>();
+      // `to` is exclusive in seconds; walk backwards from just past the range end.
+      let cursor = Math.floor(range.to / 1000) + 1;
+      for (let page = 0; page < 32; page++) {
+        const query = new URLSearchParams({ contract: symbol, limit: '100', from: String(Math.floor(range.from / 1000)), to: String(cursor) });
+        const input = await request(`https://api.gateio.ws/api/v4/futures/usdt/funding_rate?${query}`);
+        if (!Array.isArray(input) || input.length > 100) throw Error('Invalid Gate funding page');
+        const parsed = parseGateFundingHistory(input, range.to), times = list(input).map(row => number(row.t) * 1000);
+        if (!times.length) break;
+        if (times.some(time => time >= cursor * 1000)) throw Error('Gate funding page outside requested range');
+        for (const { time, rate } of parsed) {
+          if (records.has(time) && records.get(time) !== rate) throw Error('Conflicting Gate funding settlements');
+          records.set(time, rate);
+        }
+        const oldest = Math.min(...times);
+        if (input.length < 100 || oldest <= range.from) break;
+        if (oldest / 1000 >= cursor) throw Error('Gate funding pagination did not advance');
+        if (page === 31) throw Error('Gate funding pagination limit exceeded');
+        cursor = oldest / 1000;
+      }
+      return normalizeSettledFunding([...records].filter(([time]) => time >= range.from).map(([time, rate]) => ({ time, rate })), range.to);
+    }
     if (exchange === 'lighter') {
       const market = (await discoverLighter()).find(item => item.symbol === symbol);
       if (!market) throw Error('Lighter oil contract unavailable');
@@ -91,11 +125,11 @@ export function createExchangeFundingReader({ fetcher = fetch, clock = Date.now 
     }
     return readCex(exchange, symbol, range);
   }
-  return async (exchange: Exchange, previous?: ExchangeFundingHistory | null): Promise<ExchangeFundingHistory> => {
-    const definition = exchangeDefinition(exchange, 'oil');
+  return async (exchange: Exchange, previous?: ExchangeFundingHistory | null, monitorId: SpreadMarket = 'oil'): Promise<ExchangeFundingHistory> => {
+    const definition = exchangeDefinition(exchange, monitorId);
     const startedAt = clock();
-    if (exchange === 'variational') return validateExchangeFundingHistory({ exchange, monitorId: 'oil', currency: definition.currency, fetchedAt: new Date(startedAt).toISOString(), status: 'live', availability: 'unsupported', reason: 'Variational 公开接口尚未提供可核实的历史实际结算费率。', left: { symbol: definition.left, fetchedAt: null, error: '' }, right: { symbol: definition.right, fetchedAt: null, error: '' }, rows: [] }, exchange);
-    const old = previous ? validateExchangeFundingHistory(previous, exchange) : null;
+    if (exchange === 'variational') return validateExchangeFundingHistory({ exchange, monitorId, currency: definition.currency, fetchedAt: new Date(startedAt).toISOString(), status: 'live', availability: 'unsupported', reason: 'Variational 公开接口尚未提供可核实的历史实际结算费率。', left: { symbol: definition.left, fetchedAt: null, error: '' }, right: { symbol: definition.right, fetchedAt: null, error: '' }, rows: [] }, exchange, monitorId);
+    const old = previous ? validateExchangeFundingHistory(previous, exchange, monitorId) : null;
     const coverage = { from: startedAt - HISTORY_WINDOW_MS, to: startedAt };
     const ranges = (['left', 'right'] as const).map(side => {
       const previousCoverage = old?.[side].coverage;
@@ -123,7 +157,7 @@ export function createExchangeFundingReader({ fetcher = fetch, clock = Date.now 
       const retainedCoverage = previousCoverage && previousCoverage.to >= coverage.from ? { from: Math.max(previousCoverage.from, coverage.from), to: previousCoverage.to } : null;
       return { symbol, fetchedAt: result.status === 'fulfilled' ? fetchedAt : old?.[side].fetchedAt ?? null, error: result.status === 'fulfilled' ? '' : '本合约历史结算费率暂时读取失败，保留上次成功记录。', coverage: result.status === 'fulfilled' ? coverage : retainedCoverage };
     });
-    return validateExchangeFundingHistory({ exchange, monitorId: 'oil', currency: definition.currency, fetchedAt, status: 'live', availability: 'supported', reason: legs.some(leg => leg.error) ? '部分合约更新失败，请查看各合约采集时间。' : '', left: legs[0], right: legs[1], rows: [...rows.values()] }, exchange);
+    return validateExchangeFundingHistory({ exchange, monitorId, currency: definition.currency, fetchedAt, status: 'live', availability: 'supported', reason: legs.some(leg => leg.error) ? '部分合约更新失败，请查看各合约采集时间。' : '', left: legs[0], right: legs[1], rows: [...rows.values()] }, exchange, monitorId);
   };
 }
 

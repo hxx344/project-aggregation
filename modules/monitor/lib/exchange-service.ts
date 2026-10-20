@@ -89,7 +89,7 @@ export function createExchangeReader({ fetcher = fetch, clock = Date.now, variat
   return async (exchange: Exchange, monitorId: SpreadMarket): Promise<ExchangeQuote> => {
     if (!Object.hasOwn(exchangeContracts, monitorId)) throw new Error("Unknown spread market");
     if (!supportsExchange(monitorId, exchange)) throw new Error('Unsupported exchange comparison market');
-    if (exchange === 'okx' || exchange === 'bitget') return readOilCex(exchange);
+    if (exchange === 'okx' || exchange === 'bitget' || exchange === 'gate') return readOilCex(exchange, monitorId);
     if (exchange === 'lighter' || exchange === 'variational') return readOilDex(exchange);
     if (exchange === 'hyperliquid') {
       if (monitorId !== 'oil') throw new Error('Unsupported Hyperliquid comparison market');

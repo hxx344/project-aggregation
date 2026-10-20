@@ -3,7 +3,7 @@ import { readMonitorData } from "../../../../../lib/monitor-service";
 import { exchangeFromAction, supportsExchange } from "../../../../../lib/exchange-quotes";
 import { OIL_CANDLE_ACTION } from "../../../../../modules/oil/intraday.mjs";
 import { unavailablePerpetualOpportunities } from "../../../../../lib/perpetual-opportunities.ts";
-import { fundingExchangeFromAction } from '../../../../../lib/exchange-funding-history.ts';
+import { fundingExchangeFromAction, supportsFundingHistory } from '../../../../../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION } from '../../../../../lib/oil-hedge-prices.ts';
 import { GOLD_OIL_EXCHANGES, parseGoldOilAction } from '../../../../../lib/gold-oil.ts';
 import { unavailablePerpetualSummary } from '../../../../../lib/perpetual-summary.ts';
@@ -28,7 +28,7 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
   if (id === "perpetual" && name === "crossex-settings") return Response.json({ available: false, generatedAt: Date.now(), revision: 0, metadataRevision: 0, spotTransferPairs: [], config: { requireSpotTransfer: false, blockedBases: [] }, venues: [], error: "当前网页预览没有常驻后台，无法保存 CrossEx 推送筛选。" }, { headers });
   if (id === "perpetual" && name === "paper") return Response.json({ available: false, generatedAt: Date.now(), revision: 0, running: false, error: "当前为网页行情版，请通过 Linux 一键部署启用持仓跟踪。", positions: [] }, { headers });
   if (exchange && !supportsExchange(id, exchange)) return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
-  if (fundingExchange && id !== 'oil') return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
+  if (fundingExchange && !supportsFundingHistory(id, fundingExchange)) return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
   if (hedgePrices && id !== 'oil') return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
   if (goldOil?.action === 'chart') {
     try {

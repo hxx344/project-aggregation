@@ -18,14 +18,14 @@ import { openPerpetualPaperStore } from './perpetual-paper-store.mjs';
 import { openMonitorControlStore, attachMonitorControl } from './monitor-control.mjs';
 import { GOLD_OIL_QUOTE_MS, GOLD_OIL_HISTORY_MS, GOLD_OIL_FUNDING_MS, GOLD_OIL_VARIANTS, GOLD_OIL_EXCHANGES, goldOilVariantKey, goldOilAction, parseGoldOilAction } from '../lib/gold-oil.ts';
 import { goldOilAlertDefaults, validateGoldOilAlerts, createGoldOilAlertDefinition, confirmGoldOilTriggers } from './gold-oil/alerts.mjs';
-import { exchangeFundingAction, fundingExchangeFromAction } from '../lib/exchange-funding-history.ts';
+import { exchangeFundingAction, fundingExchangeFromAction, fundingHistoryExchanges } from '../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
 import { createVariationalSession, openVariationalSessionStore } from './variational-session.mjs';
 import { fetchVariational } from './variational-transport.mjs';
 import { parseGoldOilChartRange, readGoldOilChartData } from '../lib/gold-oil-chart-data.ts';
 
 const exchangeActions = market => Object.fromEntries(comparisonExchanges(market).map(exchange => [exchangeAction(exchange), ["GET"]]));
-const exchangeFundingActions = Object.fromEntries(comparisonExchanges('oil').map(exchange => [exchangeFundingAction(exchange), ['GET']]));
+const exchangeFundingActions = market => Object.fromEntries(fundingHistoryExchanges(market).map(exchange => [exchangeFundingAction(exchange), ['GET']]));
 
 /** Runtime adapters own their schedule, storage and API. They share one HTTP server. */
 export async function createMonitorServices(directory, { externallyLocked = false, env = process.env, notificationOptions, hynixOptions, oilOptions, goldOilOptions, marketOptions, perpetualOptions, variationalSessionOptions } = {}) {
@@ -121,12 +121,12 @@ export async function createMonitorServices(directory, { externallyLocked = fals
       ["hynix", {
         start() { hynixRunning = true; hynix.start(); }, stop() { hynixRunning = false; return hynix.stop(); }, healthy: () => hynix.healthy(),
         async handle(action, method, input) {
-          if ((["quote", "history", "funding"].includes(action) || exchangeFromAction(action)) && method === "GET") return read("hynix", action);
+          if ((["quote", "history", "funding"].includes(action) || exchangeFromAction(action) || fundingExchangeFromAction(action, 'hynix')) && method === "GET") return read("hynix", action);
           if (action === "alerts" && method === "GET") return hynix.view();
           if (action === "alerts" && method === "PUT") return hynix.update(input);
           if (action === "alerts/test" && method === "POST") return hynix.test();
         },
-        actions: { quote: ["GET"], history: ["GET"], funding: ["GET"], ...exchangeActions('hynix'), alerts: ["GET", "PUT"], "alerts/test": ["POST"] },
+        actions: { quote: ["GET"], history: ["GET"], funding: ["GET"], ...exchangeActions('hynix'), ...exchangeFundingActions('hynix'), alerts: ["GET", "PUT"], "alerts/test": ["POST"] },
       }],
       ["oil", {
         start() { oilRunning = true; oil.start(); }, healthy: () => !oil.storageError, async stop() { oilRunning = false; await Promise.all([oil.stop(), variationalSession.stop()]); },
@@ -134,7 +134,7 @@ export async function createMonitorServices(directory, { externallyLocked = fals
           if (action === 'exchanges/variational/session') return method === 'PUT' ? variationalSession.update(input) : variationalSession.view();
           if (action === "status" && method === "GET") return { ...oil.status(), available: true, monitorId: "oil" };
           if ((action === OIL_CANDLE_ACTION || action === OIL_HEDGE_PRICES_ACTION) && method === "GET") return read("oil", action);
-          if ((["quote", "history", "funding"].includes(action) || exchangeFromAction(action) || fundingExchangeFromAction(action)) && method === "GET") return read("oil", action);
+          if ((["quote", "history", "funding"].includes(action) || exchangeFromAction(action) || fundingExchangeFromAction(action, 'oil')) && method === "GET") return read("oil", action);
           if (action === "config" && method === "GET") return oil.configuration();
           if (action === "events" && method === "GET") return { events: oil.data.events };
           if (action === "config" && method === "PUT") {
@@ -143,7 +143,7 @@ export async function createMonitorServices(directory, { externallyLocked = fals
           }
           if (action === "test-notification" && method === "POST") { await notifications.test(); return { ok: true }; }
         },
-        actions: { quote: ["GET"], history: ["GET"], funding: ["GET"], 'exchanges/variational/session': ['GET', 'PUT'], [OIL_CANDLE_ACTION]: ["GET"], [OIL_HEDGE_PRICES_ACTION]: ["GET"], ...exchangeActions('oil'), ...exchangeFundingActions, status: ["GET"], config: ["GET", "PUT"], events: ["GET"], "test-notification": ["POST"] },
+        actions: { quote: ["GET"], history: ["GET"], funding: ["GET"], 'exchanges/variational/session': ['GET', 'PUT'], [OIL_CANDLE_ACTION]: ["GET"], [OIL_HEDGE_PRICES_ACTION]: ["GET"], ...exchangeActions('oil'), ...exchangeFundingActions('oil'), status: ["GET"], config: ["GET", "PUT"], events: ["GET"], "test-notification": ["POST"] },
       }],
     ]);
     services.notifications = notifications;

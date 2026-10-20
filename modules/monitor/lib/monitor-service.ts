@@ -10,7 +10,7 @@ import { OIL_CANDLE_ACTION } from "../modules/oil/intraday.mjs";
 import { loadPerpetualSnapshot } from './perpetual-service.ts';
 import { goldOilReader, goldOilBzReader, goldOilBybitReader, goldOilBybitBzReader } from './gold-oil-service.ts';
 import { GOLD_OIL_QUOTE_MS, GOLD_OIL_HISTORY_MS, GOLD_OIL_FUNDING_MS, parseGoldOilAction } from './gold-oil.ts';
-import { fundingExchangeFromAction, HISTORY_REFRESH_MS, type ExchangeFundingHistory } from './exchange-funding-history.ts';
+import { fundingExchangeFromAction, supportsFundingHistory, HISTORY_REFRESH_MS, type ExchangeFundingHistory } from './exchange-funding-history.ts';
 import { readExchangeFundingHistory } from './exchange-funding-service.ts';
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS, type OilHedgePrices } from './oil-hedge-prices.ts';
 import { readOilHedgePrices } from './oil-hedge-price-service.ts';
@@ -53,12 +53,12 @@ export function createDataReader(adapters = dataAdapters, clock = Date.now, exch
     const goldOil = id === 'cl-xau' ? parseGoldOilAction(action) : null;
     const goldOilData = goldOil && ['quote', 'history', 'funding'].includes(goldOil.action);
     if (hedgePrices && id !== 'oil') throw new Error('Unsupported monitor capability');
-    if (fundingExchange && id !== 'oil') throw new Error('Unsupported monitor capability');
+    if (fundingExchange && !supportsFundingHistory(id, fundingExchange)) throw new Error('Unsupported monitor capability');
     if (exchange && !supportsExchange(id, exchange)) throw new Error('Unsupported monitor capability');
     if (id === 'cl-xau' && !goldOilData) throw new Error('Unknown monitor action');
     if (!getMonitor(id) || !Object.hasOwn(adapters, id) || (!["quote", "history", "funding", OIL_CANDLE_ACTION].includes(action) && !goldOilData && !exchange && !fundingExchange && !hedgePrices)) throw new Error("Unknown monitor action");
     const key = `${id}/${action}`, previous = cache.get(key);
-    const loader = hedgePrices ? () => pricesReader(previous?.value as OilHedgePrices | undefined) : fundingExchange ? () => fundingReader(fundingExchange, previous?.value as ExchangeFundingHistory | undefined) : exchange ? () => exchangeReader(exchange, id as SpreadMarket) : adapters[id][action as keyof DataAdapter];
+    const loader = hedgePrices ? () => pricesReader(previous?.value as OilHedgePrices | undefined) : fundingExchange ? () => fundingReader(fundingExchange, previous?.value as ExchangeFundingHistory | undefined, id as SpreadMarket) : exchange ? () => exchangeReader(exchange, id as SpreadMarket) : adapters[id][action as keyof DataAdapter];
     if (!loader) throw new Error("Unsupported monitor capability");
     if (previous && clock() < previous.until) return previous.value;
     if (!pending.has(key)) {

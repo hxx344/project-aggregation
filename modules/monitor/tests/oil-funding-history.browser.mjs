@@ -112,7 +112,16 @@ async page => {
   await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
   const hynix = page.locator('[data-exchange-market="hynix"]');
   await hynix.waitFor({ state: 'visible' });
-  check(await hynix.locator('.exchange-funding-trigger').count() === 0, 'Hynix comparison is unchanged');
+  check(await hynix.locator('.exchange-funding-trigger').count() === 12, 'Every Hynix exchange exposes short and long history triggers');
+  await hynix.getByRole('button', { name: '查看 Gate 做空价差的资金费结算历史', exact: true }).click();
+  const gate = hynix.locator('[data-funding-exchange="gate"]');
+  await gate.locator('.exchange-funding-table').first().waitFor();
+  check((await gate.innerText()).includes('做空价差：空 ADR、多正股'), 'Hynix direction names the ADR and ordinary-share legs');
+  check((await gate.locator('[data-funding-leg="left"] h4').innerText()).includes('ADR · 做空') && (await gate.locator('[data-funding-leg="left"] h4').innerText()).includes('SKHY_USDT'), 'Hynix left leg is the short ADR contract');
+  check((await gate.locator('[data-funding-leg="right"] h4').innerText()).includes('正股 · 做多'), 'Hynix right leg is the long ordinary-share contract');
+  check(!requests.some(path => path.includes('/oil/exchanges/gate/')), 'Hynix history never requests through the oil monitor');
+  await hynix.getByRole('button', { name: '查看 OKX 做多价差的资金费结算历史', exact: true }).click();
+  await hynix.locator('[data-funding-exchange="okx"]').getByText('做多价差：多 ADR、空正股', { exact: false }).waitFor();
   check(errors.length === 0, errors.join('; '));
-  return { passed: true, requests: requests.length, checked: ['lazy loading', 'keyboard', 'signed rates', 'zero rate', 'direction reuse', 'close focus', 'cache reuse', 'failure retention', 'older response', 'partial history', 'first-load retry', 'empty history', 'fast switching', 'unsupported source', 'small-rate precision', 'millisecond source time', 'mobile', 'Hynix unchanged'] };
+  return { passed: true, requests: requests.length, checked: ['lazy loading', 'keyboard', 'signed rates', 'zero rate', 'direction reuse', 'close focus', 'cache reuse', 'failure retention', 'older response', 'partial history', 'first-load retry', 'empty history', 'fast switching', 'unsupported source', 'small-rate precision', 'millisecond source time', 'mobile', 'Hynix history'] };
 }

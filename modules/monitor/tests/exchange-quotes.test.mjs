@@ -34,14 +34,22 @@ function quote(exchange, market, now = NOW) {
   }, exchange, market);
 }
 
-test('oil expands to seven exchanges with distinct symbols and currencies; Hynix retains its original scope', () => {
+test('oil expands to seven exchanges with distinct symbols and currencies; Hynix adds OKX, Bitget and Gate', () => {
   assert.deepEqual(comparisonExchanges('oil'), ['hyperliquid', 'bybit', 'binance', 'lighter', 'variational', 'okx', 'bitget']);
-  assert.deepEqual(comparisonExchanges('hynix'), ['bybit', 'binance']);
-  assert.deepEqual(displayComparisonExchanges('hynix'), ['hyperliquid', 'bybit', 'binance']);
+  assert.deepEqual(comparisonExchanges('hynix'), ['bybit', 'binance', 'okx', 'bitget', 'gate']);
+  assert.deepEqual(displayComparisonExchanges('hynix'), ['hyperliquid', 'bybit', 'binance', 'okx', 'bitget', 'gate']);
+  assert.throws(() => exchangeDefinition('gate', 'oil'), /Unsupported/);
+  for (const [exchange, left, right] of [['okx', 'SKHY-USDT-SWAP', 'SKHYNIX-USDT-SWAP'], ['bitget', 'SKHYUSDT', 'SKHYNIXUSDT'], ['gate', 'SKHY_USDT', 'SKHYNIX_USDT']]) {
+    assert.deepEqual(exchangeDefinition(exchange, 'hynix'), { left, right, currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark' });
+    const value = quote(exchange, 'hynix');
+    assert.equal(calculateExchangeSpread(value).premium, 50);
+    assert.throws(() => validateExchangeQuote(value, exchange, 'oil'));
+  }
   for (const exchange of ['lighter', 'variational', 'okx', 'bitget']) {
     const value = quote(exchange, 'oil');
     assert.equal(calculateExchangeSpread(value).premium, 4);
-    assert.throws(() => validateExchangeQuote(value, exchange, 'hynix'), /Unsupported/);
+    if (['lighter', 'variational'].includes(exchange)) assert.throws(() => validateExchangeQuote(value, exchange, 'hynix'), /Unsupported/);
+    else assert.throws(() => validateExchangeQuote(value, exchange, 'hynix'), /mismatch/);
     assert.throws(() => validateExchangeQuote({ ...value, left: { ...value.left, symbol: 'BTC' } }, exchange, 'oil'));
     const wrongCurrency = value.currency === 'USDC' ? 'USDT' : 'USDC';
     assert.throws(() => validateExchangeQuote({ ...value, currency: wrongCurrency }, exchange, 'oil'));
@@ -299,16 +307,19 @@ test('new exchange snapshots survive restart and upstream failure; all APIs and 
     }
     const initial = await readInitialMarket(services);
     assert.equal(initial.hynix.exchanges.bybit.status, 'snapshot'); assert.equal(initial.oil.exchanges.binance.left.price, 104);
-    for (const exchange of ['lighter', 'variational', 'okx', 'bitget']) {
-      assert.equal(initial.oil.exchanges[exchange].left.price, 104);
+    for (const exchange of ['lighter', 'variational', 'okx', 'bitget']) assert.equal(initial.oil.exchanges[exchange].left.price, 104);
+    for (const exchange of ['lighter', 'variational']) {
       assert.equal(initial.hynix.exchanges[exchange], undefined);
       assert.equal((await fetch(`${base}/api/monitors/hynix/exchanges/${exchange}/quote`, { headers })).status, 404);
     }
+    for (const exchange of ['okx', 'bitget', 'gate']) assert.equal(initial.hynix.exchanges[exchange].left.symbol, exchangeDefinition(exchange, 'hynix').left);
+    assert.equal(initial.oil.exchanges.gate, undefined);
+    assert.equal((await fetch(`${base}/api/monitors/oil/exchanges/gate/quote`, { headers })).status, 404);
     assert.equal(initial.oil.exchanges.lighter.status, 'snapshot');
     assert.deepEqual(services.market.status(), before);
     const jobs = marketJobs().filter(job => job.action.startsWith('exchanges/') && job.action.endsWith('/quote'));
-    assert.equal(jobs.length, 9); assert.ok(jobs.every(job => job.intervalMs === 15000));
-    assert.equal(jobs.filter(job => job.id === 'hynix').length, 2);
+    assert.equal(jobs.length, 12); assert.ok(jobs.every(job => job.intervalMs === 15000));
+    assert.equal(jobs.filter(job => job.id === 'hynix').length, 5);
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
     if (services) { await Promise.all([...services.values()].map(service => service.stop())); await services.market.stop(); await services.notifications.stop(); }

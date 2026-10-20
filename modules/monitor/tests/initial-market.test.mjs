@@ -54,10 +54,11 @@ test('a missing dataset cannot block other first-render data; the server provide
     assert.equal(first.oil.quote.revision, 0);
     revision++;
     assert.equal((await readServerInitialMarket()).oil.quote.revision, 1);
-    assert.equal(calls.length, 26);
+    assert.equal(calls.length, 32);
     assert.ok(!calls.some(([id, action]) => id === 'oil' && action === 'history'), 'Unused daily history is not serialized into the first render');
-    assert.ok(calls.every(([, action, method]) => ['quote', 'history', 'candles/15m', 'exchanges/bybit/quote', 'exchanges/binance/quote', 'exchanges/hyperliquid/quote', 'exchanges/lighter/quote', 'exchanges/variational/quote', 'exchanges/okx/quote', 'exchanges/bitget/quote'].includes(action) && method === 'GET'));
-    assert.ok(calls.filter(([, action]) => /exchanges\/(lighter|variational|okx|bitget)\//.test(action)).every(([id]) => id === 'oil'));
+    assert.ok(calls.every(([, action, method]) => ['quote', 'history', 'candles/15m', 'exchanges/bybit/quote', 'exchanges/binance/quote', 'exchanges/hyperliquid/quote', 'exchanges/lighter/quote', 'exchanges/variational/quote', 'exchanges/okx/quote', 'exchanges/bitget/quote', 'exchanges/gate/quote'].includes(action) && method === 'GET'));
+    assert.ok(calls.filter(([, action]) => /exchanges\/(lighter|variational)\//.test(action)).every(([id]) => id === 'oil'));
+    assert.ok(calls.filter(([, action]) => action === 'exchanges/gate/quote').every(([id]) => id === 'hynix'));
   } finally { release(); }
   assert.equal(await readServerInitialMarket(), null, 'A stopped runtime cannot leak its provider into another instance');
 });
