@@ -268,8 +268,8 @@
 }
 .monitor-tier-table td {
   vertical-align: top;
-  padding-top: 18px;
-  padding-bottom: 18px;
+  padding-top: 10px;
+  padding-bottom: 10px;
 }
 .monitor-tier-table .number {
   min-width: 108px;
@@ -421,8 +421,8 @@
 }
 .monitor-center-table td {
   vertical-align: top;
-  padding-top: 18px;
-  padding-bottom: 18px;
+  padding-top: 10px;
+  padding-bottom: 10px;
 }
 .monitor-center-table small {
   display: block;
@@ -688,37 +688,42 @@
   --color-border: var(--border);
   --color-input: var(--border);
   --color-ring: var(--primary);
-  --font-sans: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-  --font-mono: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  /* CJK fallbacks keep Chinese text inside numeric fields off the system monospace font. */
+  --font-mono: "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
   --radius-sm: 4px;
   --radius-md: 6px;
-  --radius-lg: 10px;
-  --radius-xl: 12px;
+  --radius-lg: 8px;
+  --radius-xl: 8px;
 }
+/* Shared workspace palette: mirrors the hub tokens in src/styles.css. */
 :root {
   color-scheme: dark;
-  --background: #05080c;
-  --foreground: #f0f4f8;
-  --card: #0f151c;
-  --surface-muted: #161e26;
+  --background: #0a0d11;
+  --foreground: #e6eaf0;
+  --card: #10141a;
+  --surface-muted: #161b22;
   --secondary: var(--surface-muted);
   --primary: #38bdf8;
-  --primary-hover: #7dd3fc;
-  --primary-foreground: #05080c;
-  --primary-subtle: #102d40;
-  --muted-foreground: #a0b1bf;
-  --border: #334553;
-  --positive: #6ee7b7;
-  --positive-subtle: #102d26;
-  --positive-border: #285545;
-  --danger: #fb8c8c;
-  --danger-subtle: #321e25;
-  --danger-border: #693b45;
-  --warning: #fbbf24;
-  --warning-subtle: #322b17;
-  --warning-border: #6b5525;
-  --chart-blue: #a5b4fc;
-  --radius: 10px;
+  --primary-hover: #0ea5e9;
+  --primary-foreground: #0a0d11;
+  --primary-subtle: rgba(56, 189, 248, 0.12);
+  --muted-foreground: #a3adb9;
+  --subtle-foreground: #7a8591;
+  --border: #212831;
+  --input-border: #2e3640;
+  --positive: #2dbe87;
+  --positive-subtle: rgba(45, 190, 135, 0.13);
+  --positive-border: rgba(45, 190, 135, 0.3);
+  --danger: #f2626b;
+  --danger-subtle: rgba(242, 98, 107, 0.13);
+  --danger-border: rgba(242, 98, 107, 0.35);
+  --warning: #f0b03f;
+  --warning-subtle: rgba(240, 176, 63, 0.13);
+  --warning-border: rgba(240, 176, 63, 0.3);
+  --info: #6ea8fe;
+  --chart-blue: var(--info);
+  --radius: 8px;
 }
 * {
   box-sizing: border-box;
@@ -727,8 +732,9 @@ body {
   margin: 0;
   background: var(--background);
   color: var(--foreground);
-  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-  font-size: 16px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
   font-variant-numeric: tabular-nums;
 }
 button,
@@ -750,17 +756,18 @@ a:focus-visible {
 [data-slot='button'],
 [data-slot='input'],
 [data-slot='select-trigger'] {
-  min-height: 40px;
+  min-height: 36px;
 }
 [data-slot='input'],
 [data-slot='select-trigger'] {
   background: var(--card);
+  border-color: var(--input-border);
 }
 [data-slot='dialog-content'] {
   max-height: calc(100dvh - 32px);
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 8px;
   box-shadow: 0 18px 64px rgb(0 0 0 / 48%);
 }
 [data-slot='dialog-header'] {
@@ -775,7 +782,14 @@ a {
 }
 .number,
 .metric-value,
-.risk-value,
+.risk-value > span,
+.account-strip dd,
+.pair-risk-values dd,
+.cycle-key-values dd,
+.volume-windows > section > strong {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
 .gate strong {
   font-family: var(--font-sans);
   font-variant-numeric: tabular-nums;
@@ -813,33 +827,33 @@ a {
   background: var(--positive);
 }
 .topbar {
-  height: 72px;
+  height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border);
-  padding: 0 max(32px, calc((100vw - 1496px) / 2));
+  padding: 0 max(24px, calc((100vw - 1512px) / 2));
   background: var(--card);
 }
 .brand {
   display: flex;
   align-items: center;
-  gap: 13px;
+  gap: 10px;
   letter-spacing: 0.09em;
   font-weight: 650;
-  font-size: 21px;
+  font-size: 16px;
 }
 .brand > svg {
   color: var(--primary);
 }
 .brand small {
   letter-spacing: 0;
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 450;
   color: var(--muted-foreground);
 }
 .brand-separator {
-  margin: 0 17px;
+  margin: 0 10px;
   color: var(--border);
   font-weight: 300;
 }
@@ -865,22 +879,22 @@ a {
 .workspace {
   max-width: 1560px;
   margin: auto;
-  padding: 32px;
+  padding: 20px 24px;
 }
 .page-heading {
   display: flex;
   justify-content: space-between;
-  gap: 24px;
+  gap: 16px;
   align-items: center;
-  margin-bottom: 27px;
+  margin-bottom: 16px;
 }
 h1 {
-  font-size: 27px;
+  font-size: 20px;
   margin: 0;
   font-weight: 550;
 }
 h2 {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 550;
   margin: 0;
 }
@@ -901,8 +915,8 @@ h3 {
 }
 .metric {
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 21px 23px;
+  border-radius: 8px;
+  padding: 14px 16px;
   background: var(--card);
   min-width: 0;
 }
@@ -918,8 +932,8 @@ h3 {
 }
 .metric-value {
   font-size: clamp(23px, 2.35vw, 34px);
-  letter-spacing: -0.045em;
-  margin-top: 16px;
+  letter-spacing: -0.02em;
+  margin-top: 8px;
   overflow-wrap: anywhere;
 }
 .metric p {
@@ -930,11 +944,11 @@ h3 {
 .panel {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 8px;
   overflow: hidden;
 }
 .section-head {
-  padding: 20px 22px;
+  padding: 14px 22px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -961,11 +975,11 @@ th {
   font-size: 13px !important;
   font-weight: 400 !important;
   color: var(--muted-foreground) !important;
-  height: 44px !important;
+  height: 34px !important;
   background: var(--surface-muted);
 }
 td {
-  height: 78px;
+  height: 44px;
 }
 th:first-child,
 td:first-child {
@@ -1613,7 +1627,7 @@ label input,
 .cycle-trade-table th,
 .cycle-trade-table td {
   height: auto;
-  padding: 16px;
+  padding: 10px 12px;
   border-top: 1px solid var(--border);
   text-align: left;
   vertical-align: top;
@@ -1711,7 +1725,7 @@ label input,
   gap: 20px;
   color: var(--muted-foreground);
   font-size: 12px;
-  margin-top: 32px;
+  margin-top: 16px;
   letter-spacing: 0.04em;
 }
 .event-list {
@@ -1965,9 +1979,9 @@ label input,
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: 14px 22px;
+  padding: 10px 22px;
   border-top: 1px solid var(--border);
-  font-size: 14px;
+  font-size: 13px;
 }
 .event time {
   font-family: var(--font-sans);
@@ -2056,10 +2070,11 @@ label input,
 }
 .message,
 .demo-banner {
-  padding: 12px 18px;
+  padding: 10px 14px;
   border-radius: 6px;
-  font-size: 14px;
-  margin-bottom: 20px;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 14px;
   background: var(--positive-subtle);
   border: 1px solid var(--positive-border);
 }
@@ -2099,13 +2114,13 @@ label input,
 }
 @media (max-width: 1250px) {
   .workspace {
-    padding: 28px 32px;
+    padding: 20px 24px;
   }
   .topbar {
-    padding: 0 32px;
+    padding: 0 24px;
   }
   .metric {
-    padding: 18px;
+    padding: 14px;
   }
   .table-footer > span:last-child {
     display: none;
@@ -2195,11 +2210,11 @@ label input,
     padding-left: 16px;
   }
   .topbar {
-    height: 72px;
+    height: 52px;
     padding: 0 16px;
   }
   .brand {
-    font-size: 17px;
+    font-size: 15px;
     gap: 9px;
   }
   .brand-separator {
@@ -2208,19 +2223,24 @@ label input,
   .brand small {
     font-size: 13px;
   }
-  .connection {
-    display: none;
-  }
   .workspace {
-    padding: 24px 16px;
+    padding: 16px 12px;
   }
   .page-heading {
     flex-direction: column;
     align-items: flex-start;
-    gap: 17px;
+    gap: 12px;
   }
   h1 {
-    font-size: 24px;
+    font-size: 18px;
+  }
+  [data-slot='button'],
+  [data-slot='input'],
+  [data-slot='select-trigger'] {
+    min-height: 40px;
+  }
+  [data-slot='input'] {
+    font-size: 16px;
   }
   .account-controls {
     width: 100%;
@@ -2233,10 +2253,10 @@ label input,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .metric {
-    padding: 16px;
+    padding: 14px;
   }
   .metric-value {
-    font-size: 26px;
+    font-size: 22px;
   }
   .metric-label svg {
     display: none;
@@ -2245,7 +2265,7 @@ label input,
     font-size: 12px;
   }
   .section-head {
-    padding: 18px 16px;
+    padding: 12px 16px;
   }
   .table-footer {
     padding: 12px 16px;
@@ -2311,16 +2331,16 @@ label input,
 /* A shared account header with one focused feature workspace below it. */
 .focused-desk .workspace {
   max-width: 1560px;
-  padding-top: 28px;
+  padding-top: 20px;
 }
 .focused-desk .topbar {
-  height: 72px;
+  height: 52px;
 }
 .focused-desk .page-heading {
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 .focused-desk h1 {
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 650;
 }
 .account-bar,
@@ -2335,12 +2355,12 @@ label input,
   gap: 12px 24px;
   flex-wrap: wrap;
   justify-content: space-between;
-  padding: 18px 0;
+  padding: 12px 0;
   border-top: 1px solid var(--border);
 }
 .run-indicator {
   gap: 9px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 550;
 }
 .run-indicator i {
@@ -2365,7 +2385,7 @@ label input,
 .account-strip {
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 0 24px;
+  padding: 10px 0 16px;
 }
 .account-strip dl {
   margin: 0;
@@ -2378,10 +2398,10 @@ label input,
   color: var(--muted-foreground);
 }
 .account-strip dd {
-  font-size: 21px;
+  font-size: 18px;
   font-variant-numeric: tabular-nums;
-  margin: 5px 0 0;
-  letter-spacing: -0.03em;
+  margin: 4px 0 0;
+  letter-spacing: -0.01em;
 }
 .snapshot-stamp {
   text-align: right;
@@ -2395,7 +2415,7 @@ label input,
   font-size: 12px;
 }
 .workspace-tabs {
-  gap: 22px;
+  gap: 16px;
 }
 .workspace-tabs > [data-slot='tabs-content'][hidden] {
   display: none;
@@ -2403,8 +2423,8 @@ label input,
 .workspace-navigation {
   width: 100%;
   justify-content: flex-start;
-  gap: 8px !important;
-  height: 48px !important;
+  gap: 4px !important;
+  height: 40px !important;
   padding: 0 !important;
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
@@ -2412,9 +2432,9 @@ label input,
 }
 .workspace-navigation [data-slot='tabs-trigger'] {
   flex: none;
-  height: 46px;
-  padding: 0 18px;
-  font-size: 14px;
+  height: 38px;
+  padding: 0 14px;
+  font-size: 13px;
   color: var(--muted-foreground);
   border-radius: 6px 6px 0 0;
 }
@@ -2445,7 +2465,7 @@ label input,
 }
 .pair-workspace-heading h2 {
   margin: 0;
-  font-size: 17px;
+  font-size: 15px;
 }
 .pair-workspace-heading p {
   margin: 7px 0 0;
@@ -2474,8 +2494,8 @@ label input,
   font-size: 12px;
 }
 .pair-risk-values dd {
-  margin: 7px 0 4px;
-  font-size: 24px;
+  margin: 6px 0 4px;
+  font-size: 20px;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
@@ -2586,7 +2606,7 @@ label input,
     gap: 18px 12px;
   }
   .pair-risk-values dd {
-    font-size: 21px;
+    font-size: 18px;
   }
   .pair-config .pair-settings-form {
     padding: 0 16px 18px;
@@ -2617,10 +2637,10 @@ label input,
   min-width: 0;
 }
 .focused-desk .panel {
-  border-radius: 10px;
+  border-radius: 8px;
 }
 .focused-desk .section-head {
-  padding: 19px 22px;
+  padding: 14px 22px;
 }
 .focused-desk .section-head h2 {
   display: flex;
@@ -2744,9 +2764,9 @@ label input,
   font-size: 12px;
 }
 .cycle-key-values dd {
-  font-size: 25px;
+  font-size: 20px;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.025em;
+  letter-spacing: -0.01em;
   margin: 8px 0 6px;
   overflow-wrap: anywhere;
 }
@@ -2900,10 +2920,10 @@ label input,
   gap: 16px;
 }
 .focused-desk .metric-value {
-  font-size: 26px;
+  font-size: 22px;
 }
 .focused-desk .metric {
-  padding: 18px 20px;
+  padding: 14px 16px;
 }
 .focused-desk .migration-panel {
   max-width: 900px;
@@ -2915,7 +2935,7 @@ label input,
 }
 .focused-desk .footer {
   font-size: 11px;
-  margin-top: 24px;
+  margin-top: 16px;
   gap: 12px;
 }
 .focused-desk .footer > span:first-child {
@@ -2978,14 +2998,14 @@ label input,
 }
 @media (max-width: 640px) {
   .focused-desk .workspace {
-    padding: 24px 16px;
+    padding: 16px 12px;
   }
   .focused-desk .page-heading {
     gap: 12px;
-    margin-bottom: 14px;
+    margin-bottom: 12px;
   }
   .focused-desk h1 {
-    font-size: 20px;
+    font-size: 18px;
   }
   .account-controls {
     gap: 8px;
@@ -3033,12 +3053,16 @@ label input,
     gap: 4px !important;
     justify-content: flex-start;
   }
+  .workspace-navigation {
+    height: 44px !important;
+  }
   .workspace-navigation [data-slot='tabs-trigger'] {
+    height: 42px;
     font-size: 13px;
     padding: 0 12px;
   }
   .focused-desk .section-head {
-    padding: 17px 16px;
+    padding: 12px 16px;
     flex-wrap: wrap;
   }
   .disclosure > summary {
@@ -3068,7 +3092,7 @@ label input,
     margin-left: auto;
   }
   .cycle-key-values dd {
-    font-size: 22px;
+    font-size: 18px;
   }
   .volume-windows {
     padding: 0 16px 16px;
@@ -3100,7 +3124,7 @@ label input,
     padding: 16px;
   }
   .focused-desk .metric-value {
-    font-size: 23px;
+    font-size: 20px;
     margin-top: 8px;
   }
   .focused-desk .migration-panel .migration-details {
@@ -3124,5 +3148,21 @@ label input,
   }
   .compact-conditions .ordinary-tier > .ordinary-condition {
     margin-top: 0;
+  }
+}
+
+/* Inside the hub, the workbench toolbar already names the module; layout.tsx sets the class before paint. */
+.hub-embedded .topbar {
+  display: none;
+}
+.hub-embedded .workspace,
+.hub-embedded .focused-desk .workspace {
+  max-width: none;
+  padding: 12px 16px 16px;
+}
+@media (max-width: 640px) {
+  .hub-embedded .workspace,
+  .hub-embedded .focused-desk .workspace {
+    padding: 12px;
   }
 }

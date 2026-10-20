@@ -155,32 +155,11 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     <main className="desk focused-desk">
       <header className="topbar">
         <div className="brand">
-          <Layers3 size={27} />
+          <Layers3 size={22} />
           <span>
             ASTER<span className="brand-separator">/</span>
             <small>交易管理</small>
           </span>
-        </div>
-        <div className="toolbar">
-          <span className={`connection ${connectionError ? 'danger' : ''}`}>
-            <i />
-            {connectionError
-              ? '连接异常'
-              : state?.demo
-                ? '模拟环境'
-                : state
-                  ? '服务已连接'
-                  : '等待连接'}
-          </span>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="刷新数据"
-            disabled={busy}
-            onClick={refresh}
-          >
-            <RefreshCw size={17} />
-          </Button>
         </div>
       </header>
       <div className="workspace">
@@ -194,7 +173,29 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             )}
           </div>
           <div className="account-controls">
-            {' '}
+            <div className="toolbar">
+              <span
+                className={`connection ${connectionError ? 'danger' : ''}`}
+              >
+                <i />
+                {connectionError
+                  ? '连接异常'
+                  : state?.demo
+                    ? '模拟环境'
+                    : state
+                      ? '服务已连接'
+                      : '等待连接'}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="刷新数据"
+                disabled={busy}
+                onClick={refresh}
+              >
+                <RefreshCw size={17} />
+              </Button>
+            </div>
             {account && workspace !== 'pairs' && (
               <Select
                 value={selected}
