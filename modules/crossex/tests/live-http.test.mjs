@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import { gunzipSync } from 'node:zlib';
 import Decimal from 'decimal.js';
 import { createLiveHttpFixture } from './live-http-fixture.mjs';
 
@@ -188,6 +190,29 @@ test('manual HTTP tickets use independent terminal data and genuine order payloa
   assert.equal(plan.source, 'direct'); assert.ok(new Decimal(plan.risk.requiredMargin).gt(0));
   await confirm(f, plan, 'http-direct-market-01');
   assert.equal(writes(f).length, 1); assert.equal(writes(f)[0].body.type, 'MARKET'); assert.equal(writes(f)[0].body.price, undefined);
+});
+
+test('large JSON reads are gzip-negotiated with an identical body and small or unaccepted reads stay plain', async t => {
+  const f = await fixture(t); await connect(f);
+  const authorization = 'Basic ' + Buffer.from(`${f.username}:${f.password}`).toString('base64');
+  const read = (path, encoding) => new Promise((resolve, reject) => {
+    const request = http.get(f.origin + path, { headers: { authorization, ...(encoding ? { 'accept-encoding': encoding } : {}) } }, response => {
+      const chunks = []; response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) }));
+    });
+    request.on('error', reject);
+  });
+  const plain = await read('/api/state?opportunities=0'), zipped = await read('/api/state?opportunities=0', 'gzip, deflate, br');
+  assert.equal(plain.status, 200); assert.equal(plain.headers['content-encoding'], undefined); assert.equal(plain.headers.vary, 'Accept-Encoding');
+  assert.ok(plain.body.length >= 1024);
+  assert.equal(zipped.status, 200); assert.equal(zipped.headers['content-encoding'], 'gzip'); assert.ok(zipped.body.length < plain.body.length);
+  const decoded = JSON.parse(gunzipSync(zipped.body).toString('utf8')), original = JSON.parse(plain.body.toString('utf8'));
+  delete decoded.now; delete original.now; delete decoded.updatedAt; delete original.updatedAt; delete decoded.live.updatedAt; delete original.live.updatedAt;
+  assert.deepEqual(decoded, original);
+  assert.equal((await read('/api/state?opportunities=0', 'gzip;q=0')).headers['content-encoding'], undefined);
+  const health = await read('/api/health', 'gzip');
+  assert.equal(health.headers['content-encoding'], undefined); assert.equal(JSON.parse(health.body.toString('utf8')).status, 'ok');
+  assert.equal(writes(f).length, 0);
 });
 
 test('group close submits only selected exact quantities and never opens exposure', async t => {

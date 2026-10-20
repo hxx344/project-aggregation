@@ -3,6 +3,9 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypt
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzip as gzipCallback } from 'node:zlib';
+import { promisify } from 'node:util';
+import { acceptsGzip } from '../../../server/static-response.mjs';
 import { createStore } from './store.mjs';
 import { createMarket } from './market.mjs';
 import { createLiveRuntime } from './live-runtime.mjs';
@@ -13,6 +16,11 @@ import { createAuthenticator } from './auth.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const digest = value => createHash('sha256').update(value).digest();
 const equal = (a, b) => timingSafeEqual(digest(a), digest(b));
+const gzip = promisify(gzipCallback);
+// The catalog exceeds 2 MB and account state is read every two seconds; over a
+// slow workbench link uncompressed JSON outlives the browser read timeouts.
+// No response reflects request input next to the CSRF token, so length cannot leak it.
+const COMPRESS_MIN_BYTES = 1024;
 const makePassword = value => { const salt = randomBytes(16).toString('hex'); return `${salt}:${scryptSync(value, salt, 64).toString('hex')}`; };
 async function body(req) {
   if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) throw new AppError('请使用 JSON 请求', 415);
@@ -39,7 +47,12 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
   const csrf = randomBytes(32).toString('base64url');
   const auth = createAuthenticator({ getRecord: () => store.get('password') });
   let accountTimer = null, stopping = false, workspaceMaintenance = Boolean(authorizeRequest && initialWorkspaceMaintenance);
-  const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
+  const json = (res, status, value) => {
+    const body = Buffer.from(JSON.stringify(value)), headers = { 'Content-Type': 'application/json; charset=utf-8', Vary: 'Accept-Encoding' };
+    const send = (content, encoded) => { if (res.headersSent || res.destroyed) return; res.writeHead(status, encoded ? { ...headers, 'Content-Encoding': 'gzip' } : headers); res.end(content); };
+    if (body.length < COMPRESS_MIN_BYTES || !acceptsGzip(res.req?.headers['accept-encoding'])) return send(body, false);
+    void gzip(body).then(content => send(content, true), () => send(body, false));
+  };
   const runTick = () => {
     if (stopping) return;
     // Each market reader owns its in-flight request. Neither can delay accounts.

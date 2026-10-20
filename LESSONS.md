@@ -1073,3 +1073,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `d7f92d8b674c73a9f3efa3070e91a4fe1dc4081f`：[pair_execution.py](modules/aster/trading/pair_execution.py) 将 `workspace.active` → `phase=maintenance` 恢复到 `blocks_trading`/`margin_wait` 之前。
 
 **事件记录：** `aster-maintenance-before-margin-wait-20261020`；实际发生日期 2026-10-19（UTC 提交），历史复盘 2026-10-20（Seen 1×）；不推进全历史复盘检查点。
+
+### L068：模块高频或大体积 JSON 读取须协商压缩
+
+**适用条件：** 内置模块经工作台代理向浏览器返回大体积或高频轮询的 JSON（合约目录、账户状态等），且用户可能通过带宽受限的链路访问服务器。
+
+**根因：** 统一代理按设计不改写 API 响应，只压缩构建资源；CrossEx 的 `/api/live/instruments` 原样返回约 2 MB 的合约目录，`/api/state` 每 2 秒轮询且包含订单、成交与流水。用户链路实测约 22 KB/s 时，目录读取必然超过前端 12 秒超时并按退避反复重下，占满链路后账户状态也持续晚到，页面同时出现「合约目录读取超时」「数据已过期」，未选出合约导致价格图表与盘口为空。代码路径自内置以来未改变，上游目录增长（约 12458 条、4.9 MB）与慢链路叠加后才暴露。
+
+**以后做法：** 模块自身对达到阈值的 JSON 响应按 `Accept-Encoding` 协商 gzip，压缩在线程池异步完成，失败回退原文并带 `Vary: Accept-Encoding`；小响应与不接受 gzip 的读取保持原样。响应不回显请求输入，才能与 CSRF token 同体压缩。排查「数据过期」时先测浏览器到服务器的实际吞吐与各接口体积，不先假定服务端变慢。
+
+**如何验证：** [CrossEx HTTP 回归](modules/crossex/tests/live-http.test.mjs) 用原始 HTTP 核对 gzip 协商、解压后内容一致、`q=0` 与小响应不压缩；工作台嵌入与代理测试确认服务端读取方仍得到原文。
+
+**证据：** project-aggregation 基线 `f4aab21` 的 [CrossEx 应用](modules/crossex/server/app.mjs)。2026-10-20 用户截图显示目录读取超时与账户过期；本机经端口转发读取工作台 272 KB 构建文件耗时 11.9 秒（约 22 KB/s，可能含浏览器并发占用）；实际上游目录 4.9 MB，接口输出 2034841 字节，gzip 后 91341 字节。未取得服务器日志，`/api/state` 的线上体积未实测。
+
+**事件记录：** `crossex-uncompressed-json-slow-link-20261020`；实际发生日期 2026-10-20（Asia/Shanghai）；不推进全历史复盘检查点。
