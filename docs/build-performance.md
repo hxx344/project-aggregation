@@ -22,7 +22,12 @@
   内容键与本次输入键一致的模块，经 `build-artifact-cache.py` 完整校验后重新存入 root 所有的
   缓存，校验失败即丢弃并正常构建。因此输入未变的模块在 CI 中不再编译，任一构建输入变化的
   模块照常构建并验证；`package` 作业在有模块重建时导出当前四个缓存（`INSTALL_TEST_MODULE_CACHE_EXPORT=1`），
-  按提交另存一份。是否命中以日志中的 `Imported the verified … build` 为准。- ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
+  按提交另存一份。是否命中以日志中的 `Imported the verified … build` 为准。
+- 改动只涉及 `docs/` 下的 md/txt/rst 或根目录 `*.md` 时，Checks 不运行，改由 `docs.yml`
+  运行同一审查门禁；`NOTICE.md`、`THIRD_PARTY_NOTICES.md` 和 `modules/` 下的文件会进入发布包，
+  不算文档。这类提交没有候选版，也就不能提升为正式版，下一次代码提交照常全量检查和发布。
+  GitHub 的路径过滤只看前 300 个改动文件，只有前 300 个全是文档时才可能漏跑，同样无法发布。
+- ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
   Git 归档为每个分片提取独立源码树，按原四组运行，其中交易组按模块分片并发，最后汇总测试数。
   模块选择与增量类型检查、安装器两组检查也拆成并行作业，`release` 等待全部作业通过。
 - `actions/setup-python` 按两份 `requirements.lock` 缓存 pip 下载。CI 将
