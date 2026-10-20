@@ -29,7 +29,7 @@ function migrateSamples(db, stmt) {
   try {
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples (time INTEGER NOT NULL, binance_revision INTEGER NOT NULL, bybit_revision INTEGER NOT NULL, binance_at INTEGER, bybit_at INTEGER, unrealized_pnl TEXT, PRIMARY KEY (binance_revision, bybit_revision, time))');
     db.exec('CREATE TABLE IF NOT EXISTS trading_pnl_samples_v2 (pair_key TEXT NOT NULL, revision_key TEXT NOT NULL, time INTEGER NOT NULL, first_at INTEGER, second_at INTEGER, unrealized_pnl TEXT, cumulative_funding_pnl TEXT, PRIMARY KEY (pair_key, revision_key, time))');
-    // Add cumulative_funding_pnl column to existing tables that don't have it
+    // cumulative_funding_pnl is no longer written or read; keep the column so every database shares one schema.
     if (!stmt.prepare('PRAGMA table_info(trading_pnl_samples_v2)').all().some(col => col.name === 'cumulative_funding_pnl')) {
       db.exec('ALTER TABLE trading_pnl_samples_v2 ADD COLUMN cumulative_funding_pnl TEXT');
     }
@@ -85,7 +85,7 @@ export function createTradingPnl(db, stmt) {
 
   function record(entries, current) {
     if (!insertSample) {
-      insertSample = stmt.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl,cumulative_funding_pnl) VALUES (?,?,?,?,?,?,?)');
+      insertSample = stmt.prepare('INSERT OR IGNORE INTO trading_pnl_samples_v2 (pair_key,revision_key,time,first_at,second_at,unrealized_pnl) VALUES (?,?,?,?,?,?)');
       deleteSamples = stmt.prepare('DELETE FROM trading_pnl_samples_v2 WHERE pair_key=? AND (time < ? OR revision_key != ?)');
     }
     const pair = pairSource(entries);
@@ -99,15 +99,7 @@ export function createTradingPnl(db, stmt) {
     const previous = latestRow(pair);
     if (previous && (time <= previous.time || Math.floor(time / PNL_INTERVAL) === Math.floor(previous.time / PNL_INTERVAL) && (previous.unrealized_pnl !== null) === good)) return false;
     const value = good ? addDecimals(rows.map(row => row.unrealizedPnl)) : null;
-
-    // Calculate cumulative funding PnL up to this time, only if all exchanges have complete coverage
-    // This matches the 'known' check in read() to ensure consistency
-    const hasCoverage = entries.every(({ snapshot }) => snapshot.funding.coverage.some(range => range.start <= (time - 31 * DAY) && range.end >= time));
-    const cumulativeFunding = hasCoverage
-      ? entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) <= time).sort((a, b) => stamp(a.time) - stamp(b.time)).reduce((sum, event) => addDecimals([sum, event.amount]), '0')
-      : null;
-
-    insertSample.run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value, cumulativeFunding);
+    insertSample.run(pair.pairKey, pair.revisionKey, time, ...sources.map(value => validTime(value) ? value : null), value);
     deleteSamples.run(pair.pairKey, current - 31 * DAY, pair.revisionKey);
     return true;
   }
