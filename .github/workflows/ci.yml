@@ -121,6 +121,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
         # listed: the original four groups; discovered: every other module not
         # in deploy/test-exclusions.txt; slow: the two ~50 s methods apart.
