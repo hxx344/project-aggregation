@@ -1,5 +1,6 @@
-# Auto-detect text files and normalize line endings
-* text=auto
+# Auto-detect text files and check them out with LF on every platform, so files
+# copied from a Windows working tree (shell scripts, units, Python) still run on Linux.
+* text=auto eol=lf
 
 # Explicitly declare text files
 *.md text
