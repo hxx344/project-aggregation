@@ -150,12 +150,13 @@ export default function Dashboard({initial}:{initial:Ledger}){
  <a className="skip-link" href="#ledger-content">跳到页面内容</a>
  <header className="topbar">
    <div className="brand"><Wallet aria-hidden="true"/><div>资产账本<small>ASSET LEDGER</small></div></div>
-   <div className="topbar-actions">
+ </header>
+ <nav className="workspace-nav" aria-label="账本功能"><div>{nav.map(({id,label,Icon})=><button type="button" key={id} aria-current={view===id?'page':undefined} onClick={()=>navigate(id)}><Icon size={17} aria-hidden="true"/><span>{label}</span></button>)}
+   <div className="workspace-meta">
      <span className="workspace-date">{new Date(now).toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'long',day:'numeric'})}</span>
      <span className="privacy"><ShieldCheck size={16} aria-hidden="true"/>独立密码保护</span>
    </div>
- </header>
- <nav className="workspace-nav" aria-label="账本功能"><div>{nav.map(({id,label,Icon})=><button type="button" key={id} aria-current={view===id?'page':undefined} onClick={()=>navigate(id)}><Icon size={17} aria-hidden="true"/><span>{label}</span></button>)}</div></nav>
+ </div></nav>
  <main className="workspace" id="ledger-content" tabIndex={-1}><div className="page"><div className="page-heading"><div><h1>{viewNames[view]}</h1><p>{view==='overview'?'实时估值与手动资产，统一记录。':view==='history'?'保留原表记录；每天保存最近一次更新。':view==='withdrawals'?'登记出金，观察剔除提款影响后的资产变化。':'通过读取接口获取账户资产，连接凭据仅加密保存在服务端。'}</p></div><button className="button primary" disabled={busy} onClick={()=>void refresh(true)}><RefreshCw className={busy?'loading-spin':''} size={16}/>{busy?'正在更新':'刷新资产'}</button></div>
  {ledger.dataKind==='example'&&<div className="notice import-notice"><div><strong>当前为示例数据，尚未导入你的原表</strong><p>这里的资产和金额是演示内容。导入原表后才会显示你的真实持仓和历史。</p></div><button className="button primary" disabled={busy} onClick={()=>toggleImport(true)}>导入原表数据</button></div>}
  {error&&<div className="notice" role="alert">{error}。当前显示上次已保存的数据。</div>}
