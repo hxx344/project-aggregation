@@ -105,4 +105,4 @@
 
 根目录 `code-standards.md` 仅保留兼容链接。工具入口和使用说明不维护业务规则副本；权威文件路径变化时同步更新引用。
 
-已完成任务的指南、临时分析和演示文件移入 `docs/archive/` 后通过 `.gitignore` 从工作树移除，但保留在 git 历史中。所有脚本移至 `scripts/` 或 `deploy/` 目录。
+已完成任务的指南、临时分析和演示文件移入 `docs/archive/`；已跟踪的文件同时用 `git rm --cached` 取消跟踪，内容保留在 git 历史中。`.gitignore` 只防止归档文件被重新加入，不会移除已跟踪的文件。脚本放在 `scripts/` 或 `deploy/`；根目录 `test-download-speed.sh` 是 CI 与镜像文档引用的兼容入口，保留为例外。

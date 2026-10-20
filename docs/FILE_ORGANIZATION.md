@@ -5,7 +5,7 @@
 ```
 project_aggregation/
 ├── docs/              # 项目文档
-│   ├── archive/       # 已完成的临时分析和指南（不出现在工作树）
+│   ├── archive/       # 已完成的临时分析和指南（gitignore，不跟踪）
 │   ├── code-standards.md
 │   ├── deployment.md
 │   └── ...
@@ -34,9 +34,10 @@ project_aggregation/
 ### scripts/ 目录
 运维和辅助脚本：
 - `check-server.sh` - 服务器检查脚本
-- `wait-and-release.sh` - 等待和释放脚本
-- `ssh-tunnel-optimized.ps1` - SSH 隧道管理
-- `local-route-helper.mjs`, `start-local-route.ps1` - 本地路由
+- `wait-and-release.sh` - 等待 CI 后触发正式发布并跟踪发布结果
+- `ssh-tunnel-optimized.ps1` - SSH 隧道管理（目标服务器由参数或环境变量提供）
+- `force-reinstall.sh`, `kill-all-processes.sh` - 停止工作台 systemd 服务与重新安装
+- `local-route-helper.mjs`, `start-local-route.ps1`, `inspect-ssh-route.ps1` - 本地路由
 - `benchmark-overview.mjs` - 性能基准测试
 
 ### deploy/ 目录
@@ -57,7 +58,7 @@ project_aggregation/
 - **已完成指南**：`*_COMPLETED.md`, `*_SUMMARY.md`, `*_GUIDE.md`（任务完成后的一次性文档）
 - **对比记录**：`BEFORE_AFTER.md`, `VISUAL_COMPARISON.md`
 
-这些文件保留在 git 历史中，但通过 `.gitignore` 从工作树中移除。
+归档时把文件移入该目录；已跟踪的文件同时执行 `git rm --cached`，内容保留在 git 历史中。`.gitignore` 只防止归档文件被重新加入。
 
 ### 自动忽略的临时文件（.gitignore）
 - **HTML 预览**：`*-preview.html`, `diagnose-*.html`
@@ -70,7 +71,7 @@ project_aggregation/
 ## 添加新文档的规则
 
 1. **持久性文档** → 放入 `docs/`，使用清晰的名称
-2. **临时分析** → 直接创建在根目录，完成后移入 `docs/archive/` 并提交一次，之后通过 gitignore 从工作树移除
+2. **临时分析** → 放在 `output/` 或 `docs/archive/`（均不跟踪）；已提交的临时文档完成后移入 `docs/archive/` 并 `git rm --cached`
 3. **演示和预览** → 使用 `-preview.html` 或 `diagnose-*.html` 后缀，自动被 gitignore
 4. **项目规则** → 更新 `AGENTS.md`, `LESSONS.md`, `docs/code-standards.md`
 
@@ -80,24 +81,19 @@ project_aggregation/
 - 命名约定：
   - 单元/集成测试：`*.test.mjs`
   - 浏览器测试：`*.browser.mjs`
+  - 内置模块测试沿用各模块约定（如 `modules/*/tests/*.test.ts`、`*.smoke.mjs`），部署测试在 `deploy/test-*`
 - 不要在根目录创建测试文件
 - 测试报告输出到 `output/` 目录（已 gitignore）
 
 ## 脚本文件规范
 
-- **根目录脚本**：仅保留常用的顶层命令脚本
-  - 服务器管理：`check-server.sh`, `wait-and-release.sh`
-  - 环境设置：`install.sh`, `install-all.sh`
-  - SSH 管理：`ssh-tunnel-optimized.ps1`
-
-- **scripts/ 目录**：放置专用或较大的辅助脚本
-  - 本地路由：`local-route-helper.mjs`, `start-local-route.ps1`, `inspect-ssh-route.ps1`
-  - 性能分析：`benchmark-overview.mjs`
+- 脚本放在 `scripts/`（运维与本地辅助）或 `deploy/`（安装、发布与部署测试）。
+- 根目录唯一例外是 `test-download-speed.sh`：CI 与 [发布镜像说明](release-mirror-setup.md) 把它作为兼容入口引用。
 
 ## 清理检查清单
 
 在提交前检查：
-- [ ] 根目录是否有超过 10 个 `.md` 文件？
+- [ ] 根目录 `.md` 是否超出上面“根目录保留文件”列出的范围？
 - [ ] 是否有 `*-preview.html` 或临时分析文档？
 - [ ] 临时文件是否已添加到 `.gitignore`？
 - [ ] 已完成的指南是否移到了 `docs/archive/`？
@@ -106,7 +102,7 @@ project_aggregation/
 ## 根目录文件控制目标
 
 保持根目录简洁：
-- **Markdown 文档**：≤ 6 个（核心文档）
-- **脚本文件**：0 个（全部在 scripts/ 或 deploy/）
+- **Markdown 文档**：仅限“根目录保留文件”列出的文档
+- **脚本文件**：仅 `test-download-speed.sh` 兼容入口，其余在 scripts/ 或 deploy/
 - **配置文件**：必需的项目配置（package.json, tsconfig.json 等）
 - **临时文件**：0 个（通过 gitignore 自动排除）
