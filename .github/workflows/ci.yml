@@ -54,7 +54,7 @@ jobs:
       - name: Check and build with immutable dependencies as the service account
         run: |
           pip_cache="$(python -m pip cache dir)"
-          sudo env INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" bash deploy/test-workspace.sh
+          sudo env WORKSPACE_DISPOSABLE_CI=1 GITHUB_ACTIONS=true INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" bash deploy/test-workspace.sh
       - name: Keep the verified deployment package
         if: matrix.lane == 'package'
         uses: actions/upload-artifact@v7

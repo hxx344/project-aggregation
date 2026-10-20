@@ -66,6 +66,9 @@ workspace_cleanup() {
     kill -KILL -- "-$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
+  # A disposable CI runner is discarded with its disk. Removing the dependency
+  # copies there only delays the job; every process is still stopped above.
+  if [[ ${WORKSPACE_DISPOSABLE_CI:-0} == 1 && ${GITHUB_ACTIONS:-} == true ]]; then exit "$result"; fi
   rm -rf -- "$test_root"
   exit "$result"
 }
