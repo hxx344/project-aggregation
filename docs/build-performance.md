@@ -92,3 +92,5 @@ node --test deploy/test-module-builds.mjs deploy/test-typecheck-cache.mjs
 工作区可能保留旧优化草案（如 `apply-ci-optimizations.sh`、`build-parallel.mjs` 和
 `CODEX-EXECUTE-THIS.md`）。这些草案不属于发布入口；旧的整文件替换模板会丢失已有检查，
 不得用于更新当前 CI。性能结论以实际阶段耗时和缓存日志为依据，不采用草案中的预估比例。
+
+<!-- path filter probe: docs only -->
