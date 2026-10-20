@@ -54,8 +54,11 @@ class MarkPriceValueTests(unittest.TestCase):
 
 class MarkPriceMarketTests(unittest.TestCase):
     def test_rest_needs_only_premium_index_and_preserves_source_time(self):
+        # 97000 is exactly 3 s old: its expiry is monotonic + 3 - 3, which float
+        # rounding pushes below an arbitrary real clock reading now and then.
         for stamp in (97000, 100000, 101000):
-            with self.subTest(stamp=stamp), patch("trading.exchange.time.time", return_value=100):
+            with self.subTest(stamp=stamp), patch("trading.exchange.time.time", return_value=100), \
+                 patch("trading.exchange.time.monotonic", return_value=1000.0):
                 market, api, stream = market_fixture(mark_response(time=stamp))
                 mark = market.mark_price(SYMBOL)
                 self.assertEqual((mark.symbol, mark.price, mark.timestamp), (SYMBOL, dec("100.5"), stamp / 1000))
