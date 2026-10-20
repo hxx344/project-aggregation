@@ -11,9 +11,15 @@ permissions:
 
 jobs:
   app:
-    name: App (Ubuntu 24.04 x64, Node 24.15.0)
+    name: App ${{ matrix.lane }} (Ubuntu 24.04 x64, Node 24.15.0)
     # Match the deployment server: Ubuntu 24.04 LTS / x86_64.
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # Both lanes run the real installer path on their own runner: package
+        # assembles, packages and verifies the release; behavior runs the
+        # frontend checks and root behavior tests.
+        lane: [package, behavior]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -48,8 +54,9 @@ jobs:
       - name: Check and build with immutable dependencies as the service account
         run: |
           pip_cache="$(python -m pip cache dir)"
-          sudo env INSTALL_TEST_PACKAGE=1 INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" bash deploy/test-workspace.sh
+          sudo env INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" bash deploy/test-workspace.sh
       - name: Keep the verified deployment package
+        if: matrix.lane == 'package'
         uses: actions/upload-artifact@v7
         with:
           name: deployment-package-x64

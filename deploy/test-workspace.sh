@@ -18,6 +18,12 @@ PNPM_BIN=$(realpath "${INSTALL_TEST_PNPM:?Pass the pnpm JavaScript entry file (n
   echo "INSTALL_TEST_PNPM must be the pnpm $PNPM_VERSION JavaScript entry file executable by INSTALL_TEST_NODE." >&2
   exit 1
 }
+# CI runs the two halves on separate runners; local runs default to both.
+lane=${INSTALL_TEST_LANE:-all}
+case "$lane" in
+  all|behavior|package) ;;
+  *) echo 'INSTALL_TEST_LANE must be all, behavior or package.' >&2; exit 1 ;;
+esac
 work_dir="$test_root/work"
 mkdir -p "$APP_DIR/build-home" "$APP_DIR/cache" "$APP_DIR/releases" "$work_dir"
 chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/build-home"
@@ -91,9 +97,58 @@ workspace_root_tests() {
   prepare_module_builds
   (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
 }
+workspace_reuse_check() {
+  # A fresh extraction on the next upgrade must hydrate all four module outputs
+  # without invoking a compiler, and the service account cannot edit the caches.
+  work_dir="$test_root/reuse-work"
+  mkdir "$work_dir"
+  modules_prepared=0
+  module_outputs_prepared=()
+  prepare_build_cache_helper
+  # The default update path only needs trusted caches. It must not extract a
+  # disposable build workspace or materialize dependencies on a warm reuse.
+  prepare_module_builds cache-only
+  [[ ! -e "$work_dir/source" ]]
+  prepare_runtime_dependencies
+  [[ ! -e "$work_dir/trusted-dependencies" && ! -e "$work_dir/runtime-dependencies" ]]
+  prepare_workspace
+  run_as_service() {
+    [[ "$1" == /usr/bin/python3 && "$2" == -I ]] || { echo 'Unexpected rebuild while reusing verified module artifacts' >&2; return 91; }
+    runuser -u "$SERVICE_USER" -- "$@"
+  }
+  prepare_module_builds
+  local module cache
+  for module in "${MODULE_BUILD_IDS[@]}"; do
+    cache="$APP_DIR/cache/module-$module-${module_build_keys[$module]}"
+    build_artifact_cache verify "$cache" "${module_build_keys[$module]}"
+    [[ -s "$work_dir/source/${MODULE_BUILD_OUTPUTS[$module]}/${MODULE_BUILD_ENTRIES[$module]}" ]]
+    if runuser -u "$SERVICE_USER" -- test -w "$cache/artifact/${MODULE_BUILD_ENTRIES[$module]}"; then
+      echo 'The build account can modify a published artifact cache' >&2; return 1
+    fi
+  done
+  printf 'Real source deployment and cross-workspace module reuse passed.\n'
+}
+isolated_package_check() {
+  # Real restored workers may read stale notification configuration. A separate
+  # network namespace allows their loopback/private IPC, with no outside route.
+  unshare --net -- bash -c 'ip link set dev lo up; exec runuser -u "$1" -- env GREEKS_PYTHON="$2" ASTER_PYTHON="$3" "$4" "$5" "$6"' \
+    recovery-drill "$SERVICE_USER" "$test_root/python/bin/python" "$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$1"
+}
+workspace_archive_check() {
+  mkdir "$test_root/package"
+  tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
+  isolated_package_check "$test_root/package"
+}
+assert_shared_dependencies_unchanged() {
+  local importer
+  for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
+    [[ ! -d "$dependencies/$importer/node_modules/.vite-temp" ]]
+  done
+  [[ "$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)" == "$cache_modules_hash" ]]
+}
 prepare_build_cache_helper
 workspace_start_job python-setup workspace_python_setup
-workspace_start_job frontend-checks workspace_frontend_checks
+if [[ $lane != package ]]; then workspace_start_job frontend-checks workspace_frontend_checks; fi
 for module in "${MODULE_BUILD_IDS[@]}"; do
   workspace_start_job "module-build-$module" workspace_module_build "$module"
 done
@@ -102,7 +157,13 @@ workspace_wait_jobs
 # disk. This is the only in-memory prepare_module_builds result needed later.
 modules_prepared=1
 (cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
-workspace_start_job root-behavior-tests workspace_root_tests
+if [[ $lane != package ]]; then workspace_start_job root-behavior-tests workspace_root_tests; fi
+if [[ $lane == behavior ]]; then
+  workspace_wait_jobs
+  assert_shared_dependencies_unchanged
+  printf 'Real non-root checks and behavior tests passed with immutable shared dependencies.\n'
+  exit 0
+fi
 stage_started=$SECONDS
 prepare_application
 validate_embedded_runtime "$release"
@@ -115,57 +176,19 @@ done
 if run_as_service test -w "$runtime_dependencies/node_modules/react/package.json"; then
   echo 'The service account can modify a shared production package' >&2; exit 1
 fi
-isolated_package_check() {
-  # Real restored workers may read stale notification configuration. A separate
-  # network namespace allows their loopback/private IPC, with no outside route.
-  unshare --net -- bash -c 'ip link set dev lo up; exec runuser -u "$1" -- env GREEKS_PYTHON="$2" ASTER_PYTHON="$3" "$4" "$5" "$6"' \
-    recovery-drill "$SERVICE_USER" "$test_root/python/bin/python" "$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$1"
-}
-if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
-  python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --parser-user "$SERVICE_USER" --repository "$repository" --output "$repository/output/release"
-  mkdir "$test_root/package"
-  tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
-fi
-printf '[workspace] source-assembly-and-packaging: %ss\n' "$((SECONDS - stage_started))"
+printf '[workspace] source-assembly: %ss\n' "$((SECONDS - stage_started))"
 # Each package check owns a network namespace and a temporary data directory;
-# both only read the root-owned trees and the Python environments.
+# like the reuse check, it only reads root-owned trees, caches and the Python
+# environments, so all of them overlap with packaging.
 workspace_start_job source-package-check isolated_package_check "$release"
+workspace_start_job cross-workspace-reuse workspace_reuse_check
 if [[ ${INSTALL_TEST_PACKAGE:-0} == 1 ]]; then
-  workspace_start_job archive-package-check isolated_package_check "$test_root/package"
+  stage_started=$SECONDS
+  python3 "$repository/deploy/package-release.py" --source "$work_dir/source" --dependency-root "$dependencies" --node "$NODE_BIN" --parser-user "$SERVICE_USER" --repository "$repository" --output "$repository/output/release"
+  printf '[workspace] packaging: %ss\n' "$((SECONDS - stage_started))"
+  workspace_start_job archive-package-check workspace_archive_check
 fi
 workspace_wait_jobs
 [[ -s "$work_dir/source/dist/index.html" && -d "$work_dir/source/node_modules/.vite-temp" && ! -L "$work_dir/source/node_modules/.vite-temp" ]]
-for importer in . modules/monitor modules/asset modules/crossex modules/aster/dashboard; do
-  [[ ! -d "$dependencies/$importer/node_modules/.vite-temp" ]]
-done
-[[ "$(sha256sum "$dependencies/node_modules/.modules.yaml" | cut -d ' ' -f 1)" == "$cache_modules_hash" ]]
-printf 'Real non-root build and backend import passed with immutable shared dependencies.\n'
-
-# A fresh extraction on the next upgrade must hydrate all four module outputs
-# without invoking a compiler, and the service account cannot edit the caches.
-work_dir="$test_root/reuse-work"
-mkdir "$work_dir"
-modules_prepared=0
-module_outputs_prepared=()
-prepare_build_cache_helper
-# The default update path only needs trusted caches. It must not extract a
-# disposable build workspace or materialize dependencies on a warm reuse.
-prepare_module_builds cache-only
-[[ ! -e "$work_dir/source" ]]
-prepare_runtime_dependencies
-[[ ! -e "$work_dir/trusted-dependencies" && ! -e "$work_dir/runtime-dependencies" ]]
-prepare_workspace
-run_as_service() {
-  [[ "$1" == /usr/bin/python3 && "$2" == -I ]] || { echo 'Unexpected rebuild while reusing verified module artifacts' >&2; return 91; }
-  runuser -u "$SERVICE_USER" -- "$@"
-}
-prepare_module_builds
-for module in "${MODULE_BUILD_IDS[@]}"; do
-  cache="$APP_DIR/cache/module-$module-${module_build_keys[$module]}"
-  build_artifact_cache verify "$cache" "${module_build_keys[$module]}"
-  [[ -s "$work_dir/source/${MODULE_BUILD_OUTPUTS[$module]}/${MODULE_BUILD_ENTRIES[$module]}" ]]
-  if runuser -u "$SERVICE_USER" -- test -w "$cache/artifact/${MODULE_BUILD_ENTRIES[$module]}"; then
-    echo 'The build account can modify a published artifact cache' >&2; exit 1
-  fi
-done
-printf 'Real source deployment and cross-workspace module reuse passed.\n'
+assert_shared_dependencies_unchanged
+printf 'Real non-root build, backend import and source deployment reuse passed with immutable shared dependencies.\n'
