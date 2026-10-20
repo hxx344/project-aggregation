@@ -1103,3 +1103,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `1fdb6e8` 为海力士接入结算历史后，用户截图显示 Binance「正股 · 做多」`SKHYNIXUSDT` 读取失败；实测 `/fapi/v1/fundingRate?symbol=SKHYNIXUSDT` 在 2026-08-27 23:00:01 UTC 有一条 `Special`、费率 −0.00021475。同类 Binance 解析器 [gold-oil-funding.ts](modules/monitor/lib/gold-oil-funding.ts) 与 [binance-funding-history.mjs](modules/monitor/modules/oil/binance-funding-history.mjs) 只处理 BZ/CL/XAU 商品合约，按小时对齐配对，未改动。
 
 **事件记录：** `binance-special-funding-hynix-20261020`；实际发生日期 2026-10-20（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L070：交易所目录只校验实际用到的条目，原生代码不限 ASCII
+
+**适用条件：** 读取持仓、余额等账户数据时，再下载交易所完整合约目录做元数据匹配（Binance/Aster `exchangeInfo` 等）。
+
+**根因：** [Asset 仓位读取](modules/asset/lib/positions-readers.ts) 把整份目录逐条按 ASCII 格式校验后建表。Binance U 本位目录上架了「币安人生USDT」「龙虾USDT」等中文代码后，只要账户有任何 U 本位持仓，整个范围就因与持仓无关的条目报「读取失败」；没有持仓时跳过目录读取，所以同一 Key 的币本位范围仍正常，被误判为 API 权限不足。
+
+**以后做法：** 目录只按原样建立查找表，仅对持仓实际命中的条目校验字段；查不到或字段非法仍拒绝整份快照。交易所原生代码与币名允许 Unicode 字母和数字，继续拒绝控制字符等异常字符，并保留原生代码不转写。
+
+**如何验证：** [仓位读取测试](modules/asset/tests/positions-readers.test.ts) 在目录中混入中文、空值与含控制字符的无关条目，断言 UM/PM-UM/PM-CM 正常返回且保留中文持仓代码，持仓命中非法或缺失条目仍拒绝。
+
+**证据：** project-aggregation 基线 `a16228f`。2026-10-21 用户截图显示 Binance 普通 UM、PM-UM、普通 CM「读取失败」，PM-CM 曾读到数据；服务器实测四个域名均 200、`fapi/v1/exchangeInfo` 约 1.15 MB（未超 2 MB 上限），目录含 5 个中文 `symbol`/`baseAsset`。普通 UM/CM 失败是否另因统一账户被拒绝未实测。
+
+**事件记录：** `binance-unicode-symbol-catalog-20261021`；实际发生日期 2026-10-21（Asia/Shanghai）；不推进全历史复盘检查点。

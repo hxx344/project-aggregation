@@ -61,6 +61,24 @@ test('malformed or unauthorized Binance responses fail rather than returning fla
   assert.equal(calls, 1);
 });
 
+test('Binance validates only held instruments and keeps native non-ASCII symbols', async () => {
+  const unrelated = [{ symbol: '龙虾USDT', baseAsset: '龙虾', quoteAsset: 'USDT', marginAsset: 'USDT' }, { symbol: null }, { symbol: 'BAD\u0000USDT' }];
+  for (const scope of ['um', 'pm-um'] as const) {
+    const result = await readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions()
+      : url.pathname.endsWith('/exchangeInfo') ? { symbols: [...unrelated, ...linearMetadata.symbols, { symbol: '币安人生USDT', baseAsset: '币安人生', quoteAsset: 'USDT', marginAsset: 'USDT' }] }
+        : [linearPosition('1'), { ...linearPosition('-3'), symbol: '币安人生USDT' }]), undefined, scope);
+    assert.deepEqual(result.map(item => [item.symbol, item.side, item.quantity, item.quantityUnit]), [['BTCUSDT', 'long', '1', 'BTC'], ['币安人生USDT', 'short', '3', '币安人生']]);
+  }
+  const [inverse] = await readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions()
+    : url.pathname.endsWith('/exchangeInfo') ? { symbols: [...unrelated, { symbol: 'BTCUSD_PERP', baseAsset: 'BTC', quoteAsset: 'USD', marginAsset: 'BTC', contractSize: 100 }] }
+      : [{ ...linearPosition('2'), symbol: 'BTCUSD_PERP' }]), undefined, 'pm-cm');
+  assert.equal(inverse.notional, '200');
+  for (const symbol of ['BAD\u0000USDT', 'MISSINGUSDT']) {
+    await assert.rejects(readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions()
+      : url.pathname.endsWith('/exchangeInfo') ? { symbols: unrelated } : [{ ...linearPosition('1'), symbol }])));
+  }
+});
+
 const bybitPosition = (side = 'Buy', symbol = 'BTCUSDT') => ({ symbol, side, size: '0.000000000000000001', avgPrice: '100', markPrice: '102', positionValue: '0.000000000000000102', unrealisedPnl: '-0.01', leverage: '', liqPrice: '', updatedTime: String(at) });
 test('Bybit follows every cursor and normalizes USDT/USDC/inverse/option using instrument currency metadata', async () => {
   for (const scope of ['linear-usdt', 'linear-usdc', 'inverse', 'option'] as const) {

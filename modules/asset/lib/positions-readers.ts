@@ -83,8 +83,11 @@ function signedQuantity(row: Json, field: string, sideField: string): { quantity
   return { quantity, side: quantity.startsWith('-') ? 'short' : 'long' };
 }
 
+// Only held instruments are validated: an unrelated listing must not invalidate the account snapshot.
+const instrumentsOf = (metadata: unknown) => new Map(rows(record(metadata).symbols).map(item => [item.symbol, item]));
+
 function normalizeLinear(data: unknown, metadata: unknown): Position[] {
-  const instruments = new Map(rows(record(metadata).symbols).map(item => [text(item.symbol), item]));
+  const instruments = instrumentsOf(metadata);
   return uniquePositions(rows(data).flatMap(row => {
     const parsed = signedQuantity(row, 'positionAmt', 'positionSide'); if (!parsed) return [];
     const symbol = text(row.symbol), instrument = instruments.get(symbol); if (!instrument) throw new Error(POSITIONS_INVALID);
@@ -114,7 +117,7 @@ export async function readBinancePositions(c: BinanceCredential, fetcher: Fetche
 }
 
 function normalizeBinanceInverse(data: unknown, metadata: unknown): Position[] {
-  const instruments = new Map(rows(record(metadata).symbols).map(item => [text(item.symbol), item]));
+  const instruments = instrumentsOf(metadata);
   return uniquePositions(rows(data).flatMap(row => {
     const parsed = signedQuantity(row, 'positionAmt', 'positionSide'); if (!parsed) return [];
     const symbol = text(row.symbol), instrument = instruments.get(symbol); if (!instrument) throw new Error(POSITIONS_INVALID);

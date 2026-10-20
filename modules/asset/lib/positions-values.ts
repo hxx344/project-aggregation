@@ -12,7 +12,7 @@ export function rows(value: unknown): Record<string, unknown>[] {
   return value.map(record);
 }
 export function text(value: unknown): string {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_.:/ -]{1,160}$/.test(value)) throw new Error(POSITIONS_INVALID);
+  if (typeof value !== 'string' || !/^[\p{L}\p{N}_.:/ -]{1,160}$/u.test(value)) throw new Error(POSITIONS_INVALID);
   return value;
 }
 export function decimal(value: unknown): string {
