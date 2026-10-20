@@ -234,12 +234,12 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   });
 
   function snapshot(project) {
-    let state = states.get(project.id);
-    if (!state) { const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); state = saved ? JSON.parse(saved.json) : null; }
     const base = { project, state: 'unconfigured', message: '等待首次读取数据', checkedAt: null, updatedAt: null, latencyMs: null, metrics: [], ...(project.adapter === 'asset' ? { sync: assetSync?.getStatus(project.id) || null } : {}) };
     if (!project.enabled) return { ...base, state: 'disabled', message: '项目已停用' };
     if (!project.apiUrl && project.adapter !== 'link') return { ...base, message: '请配置接口地址' };
     if (project.adapter === 'link') return { ...base, state: project.url ? 'online' : 'unconfigured', message: project.url ? '链接入口；不采集项目数据' : '请配置项目地址' };
+    let state = states.get(project.id);
+    if (!state) { const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); state = saved ? JSON.parse(saved.json) : null; }
     if (!state) return base;
     const diagnostics = snapshotDiagnostics(state, project);
     if (JSON.stringify(diagnostics) !== JSON.stringify(state.diagnostics)) {
