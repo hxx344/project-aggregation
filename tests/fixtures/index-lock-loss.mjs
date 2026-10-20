@@ -14,7 +14,7 @@ let closePromise;
 const control = { close() { return closePromise ??= (async () => { events.push('workers-close'); await new Promise(resolve => setTimeout(resolve, 40)); events.push('workers-closed'); })(); } };
 const imports = {
   './app.mjs': { createApp: async () => { events.push('app-create'); return { server: { listen() { events.push('listen'); }, once() {} }, close: async () => events.push('app-close') }; } },
-  './logger.mjs': { logger: { info() {}, error() {} } },
+  './logger.mjs': { logger: { info() {}, warn(_, message) { events.push(`warn:${message}`); }, error(_, message) { events.push(`error:${message}`); } } },
   'node:path': { default: path }, 'node:url': { fileURLToPath }, 'node:crypto': { randomUUID }, 'node:fs': { mkdirSync() {} },
   './execution/account-writer.mjs': { createAccountWriter: () => ({ close() { events.push('authority-close'); } }) },
   './recovery/startup.mjs': { assertRecoveryStartup() {} },

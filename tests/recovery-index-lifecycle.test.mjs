@@ -11,4 +11,8 @@ test('actual index drains a partially started group before releasing its lock af
   assert.ok(events.indexOf('workers-closed') < events.indexOf('lock-close'));
   assert.ok(events.indexOf('lock-close') < events.indexOf('exit:1'));
   assert.equal(events.includes('app-create'), false); assert.equal(events.includes('listen'), false);
+  // The lost lock already logged the cause, so the aborted startup is a warning rather than a startup failure.
+  assert.ok(events.includes('error:数据目录运行锁失效'), result.stdout);
+  assert.ok(events.indexOf('warn:工作台启动已中止') < events.indexOf('exit:1'), result.stdout);
+  assert.equal(events.includes('error:工作台启动失败'), false);
 });
