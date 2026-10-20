@@ -10,11 +10,13 @@ interface RequestLog {
   duration: number;
   timestamp: number;
   size: number | null;
+  cancelled: boolean;
 }
 
 interface RequestStats {
   total: number;
   failed: number;
+  cancelled: number;
   avgDuration: number;
   maxDuration: number;
   totalSize: number;
@@ -53,16 +55,18 @@ export default function DiagnosticPage() {
     const ep = acc.byEndpoint[endpoint];
     ep.count++;
     ep.avgDuration = (ep.avgDuration * (ep.count - 1) + log.duration) / ep.count;
-    if (log.status === 0 || log.status >= 400) ep.failed++;
+    const failed = !log.cancelled && (log.status === 0 || log.status >= 400);
+    if (failed) ep.failed++;
 
     acc.total++;
-    if (log.status === 0 || log.status >= 400) acc.failed++;
+    if (failed) acc.failed++;
+    if (log.cancelled) acc.cancelled++;
     acc.avgDuration = (acc.avgDuration * (acc.total - 1) + log.duration) / acc.total;
     acc.maxDuration = Math.max(acc.maxDuration, log.duration);
     acc.totalSize += log.size ?? 0;
 
     return acc;
-  }, { total: 0, failed: 0, avgDuration: 0, maxDuration: 0, totalSize: 0, byEndpoint: {} } as RequestStats);
+  }, { total: 0, failed: 0, cancelled: 0, avgDuration: 0, maxDuration: 0, totalSize: 0, byEndpoint: {} } as RequestStats);
 
   const exportData = () => {
     const data = {
@@ -139,6 +143,10 @@ export default function DiagnosticPage() {
           <span className="stat-value error">{stats.failed}</span>
         </div>
         <div className="stat-card">
+          <span className="stat-label">已取消</span>
+          <span className="stat-value">{stats.cancelled}</span>
+        </div>
+        <div className="stat-card">
           <span className="stat-label">平均响应等待</span>
           <span className="stat-value">{stats.total > 0 ? formatTime(Math.round(stats.avgDuration)) : '—'}</span>
         </div>
@@ -201,12 +209,12 @@ export default function DiagnosticPage() {
             </thead>
             <tbody>
               {logs.map(log => (
-                <tr key={log.id} className={log.status === 0 || log.status >= 400 ? 'error-row' : ''}>
+                <tr key={log.id} className={!log.cancelled && (log.status === 0 || log.status >= 400) ? 'error-row' : ''}>
                   <td>{new Date(log.timestamp).toLocaleTimeString('zh-CN')}</td>
                   <td><code>{log.method}</code></td>
                   <td className="url-cell" title={log.url}>{new URL(log.url, location.origin).pathname}</td>
-                  <td className={log.status === 0 ? 'error' : log.status >= 400 ? 'warning' : log.status >= 300 ? 'info' : 'success'}>
-                    {log.status === 0 ? '失败' : log.status}
+                  <td className={log.cancelled ? '' : log.status === 0 ? 'error' : log.status >= 400 ? 'warning' : log.status >= 300 ? 'info' : 'success'}>
+                    {log.cancelled ? '已取消' : log.status === 0 ? '失败' : log.status}
                   </td>
                   <td className={log.duration > 3000 ? 'error' : log.duration > 1000 ? 'warning' : ''}>
                     {formatTime(log.duration)}

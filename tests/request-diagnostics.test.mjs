@@ -13,6 +13,7 @@ test('diagnostics return streaming headers without reading or cloning the body',
   assert.equal(response.bodyUsed, false);
   assert.equal(logs[0].status, 200);
   assert.equal(logs[0].size, null);
+  assert.equal(logs[0].cancelled, false);
   await response.body.cancel();
 });
 
@@ -41,13 +42,15 @@ test('URL inputs preserve the supplied method; absent or invalid lengths stay un
   }
 });
 
-test('network failure identity is preserved and recorded even when aborted', async () => {
-  const failure = new DOMException('Stopped', 'AbortError');
-  const logs = [];
-  const observed = createDiagnosticFetch(async () => { throw failure; }, log => logs.push(log));
-  await assert.rejects(observed('/api/check'), error => error === failure);
-  assert.equal(logs[0].status, 0);
-  assert.equal(logs[0].size, null);
+test('network failure identity is preserved; caller aborts are recorded as cancelled, not failed', async () => {
+  for (const [failure, cancelled] of [[new DOMException('Stopped', 'AbortError'), true], [new DOMException('Deadline', 'TimeoutError'), false], [new TypeError('Failed to fetch'), false]]) {
+    const logs = [];
+    const observed = createDiagnosticFetch(async () => { throw failure; }, log => logs.push(log));
+    await assert.rejects(observed('/api/check'), error => error === failure);
+    assert.equal(logs[0].status, 0);
+    assert.equal(logs[0].size, null);
+    assert.equal(logs[0].cancelled, cancelled, failure.name);
+  }
 });
 
 test('a failing diagnostic sink never changes a successful response or original error', async () => {
