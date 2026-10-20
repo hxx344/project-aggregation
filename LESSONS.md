@@ -16,6 +16,8 @@
 
 2026-10-19 日复盘覆盖昨日日复盘合入 `3adba3c`（此前检查点到 `1791a5e`）之后、直到主线 `a0d9b64` 的 11 个非 merge 提交（2026-10-19 Asia/Shanghai；本窗口业务 PR 合入 0，这些提交直接进入 main）。范围包括 M0 平台能力与采样基线（`c76b196`，约 536 行）、M1 各模块共享账户写入保护（`519d2e8`，约 5328 行，标为大改动，全文深度仍待人工审查）、Aster 未托管配对发送兼容（`56cdb9e`）、M2 加密冷备份与隔离恢复（`8a3bfaca`，约 4191 行，标为大改动，全文深度仍待人工审查），以及随后的测试夹具对齐（`3139c59`、`64eccb9`、`0652077`、`809b3e7`）、Greeks 缺状态隔离（`6faa176`）和文档（`4c9ac1b`、`a0d9b64`）。L062–L063 已随窗口内开发提交写入主线；Greeks 缺失 `engine_state.json` 的缺证规则已在 L063 同轮整包补充，不另建条目。L062 记录托管路径按真实原操作恢复；本轮对照 `56cdb9e` 后新增 L064，记录只有托管发送才要求持久原批次与发送分组，未托管路径保持原契约。各新条目仍只有一个已核实日期，未达到 [升级条件](docs/code-standards.md#升级规则)，`docs/code-standards.md` 仍无已升级规范，这些条目仍留在本文件。全历史复盘尚未完成，完成检查点保持未建立。
 
+2026-10-20 日复盘覆盖昨日日复盘合入 `8cc3e3d`（此前检查点到 `a0d9b64`）之后、直到主线 `aca4637` 的 10 个非 merge 提交（2026-10-19 UTC 约 09:38–17:00，对应 Asia/Shanghai 10-19 下午至傍晚；本窗口业务 PR 合入 0，这些提交直接进入 main；昨日 docs PR #11 合入本身不计入业务提交）。范围包括 ASTER 托管划转发送前拒绝与明确 HTTP 拒绝的结算顺序（`0e21089`、`5c51e81`；其中 `0e21089` 约 1340 行，标为大改动，全文深度仍待人工审查）、保证金 T0 独立于策略/ADL 恢复（`40bdb6a`，约 1685 行，标为大改动，全文深度仍待人工审查）、维护阶段优先于资金等待（`d7f92d8`）、异步规则 retry 截止时间（`c413a92`）、项目加载优先级与嵌入资源压缩（`942414d`）、环境流水线编排（`c9a0cef`，约 2578 行，标为大改动，全文深度仍待人工审查）、agent 编制定义入库（`29edcd0`）与 CI Actions 升至 Node 24 大版本并精确钉死 pnpm action（`aca4637`）。L062 的已发布路径逃逸补充、L041 的 T0 优先补充，以及 L065（项目加载传输/缓存/就绪契约）已随窗口内开发提交写入主线；测试夹具（`b029703`）与小范围顺序修补不另计独立事件。本轮对照差异后新增 L066（异步规则完成截止时间）与 L067（新增阶段分支须保留既有优先级）。各新条目仍只有一个已核实日期，未达到 [升级条件](docs/code-standards.md#升级规则)，`docs/code-standards.md` 仍无已升级规范，这些条目仍留在本文件。全历史复盘尚未完成，完成检查点保持未建立。
+
 每条历史线索保留稳定 ID、原复盘日期和全部原有证据。实际发生日期、独立事件边界未完成核实时，不计入规范升级；后续核实时沿用 ID 或明确关联正式事件，避免重复统计。外仓证据标注“未核验”，不将其实现或测试描述为本仓已有能力。
 
 ## Correctness at the boundary
@@ -1043,3 +1045,31 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `c413a92584ea18c452b278522fcc818bc24665b9` 的 `server/static-cache.mjs`、`modules/greeks/app/main.py`、`modules/greeks/app/static/hub.js` 与 `src/hub-state.ts`。本次新增基线回归分别复现资源缓存被禁用、项目打开时仍保留其他下载，以及 Greeks 未压缩；真实跨子域浏览器夹具使用旧 `hub.js` 时复现提前 ready，换为本次实现后通过。独立审查发现的同一就绪缺口已同批修复。
 
 **事件记录：** `project-opening-transfer-contract-20261019`；实际发生日期 2026-10-19（Asia/Shanghai）；不推进历史复盘检查点。
+
+### L066：异步规则任务须用完成时刻的绝对截止时间
+
+**适用条件：** Engine 用 Future/worker 池调度周期性规则、通知或同类异步任务，并把 `future.result()` 的 delay 写回 `due[key]` 的路径（例如 Aster [engine](modules/aster/trading/engine.py) 的 `poll_trading_rules` / `run`）。
+
+**根因：** worker 只返回相对 delay，主循环在更晚的一轮才消费 Future 时，会把「消费等待」叠加到退避上，真实 RetryAfter 下限被推迟；通知组回归曾因此失败。
+
+**以后做法：** 规则类 worker 在尝试结束时返回 `(delay, absolute_deadline)`，绝对期限按 `monotonic()+delay`（并尊重 RetryAfter 下限）。主调度仅对该任务键使用该绝对期限，不得把 Future 消费等待再加进去；其他任务键保持原退避契约。预算优先级扩展（如资金第四维）时，夹具断言必须同步维度，避免三维假绿。
+
+**如何验证：** 通知/配对/WebSocket 调度相关用例（如 `hourly_notification_engine` / `pair_scheduling` / `cycle_ws_scheduler`）覆盖持续失败与 pool 占满时资金仍可运行；本轮日复盘未重跑这些测试，`c413a92` 提交说明记录当时 Windows 原生相关项通过，该记录属于该提交而非本轮执行结果。
+
+**证据：** project-aggregation `c413a92584ea18c452b278522fcc818bc24665b9`：`poll_trading_rules` 返回 `(delay, deadline)`；`run` 对 `key=="rules"` 解包并用 `max(monotonic(), rules_deadline)`。关联夹具四维 flag 同步属同提交修补，不另建事件。
+
+**事件记录：** `aster-async-rule-deadline-20261020`；实际发生日期 2026-10-19（UTC 提交），历史复盘 2026-10-20（Seen 1×）；不推进全历史复盘检查点。
+
+### L067：新增状态分支须保留既有阶段优先级
+
+**适用条件：** 配对/执行 `tick` 一类多阶段状态机中插入新的等待/阻断分支（例如资金 `margin_wait`）且已有维护、恢复或更高优先的暂停语义。
+
+**根因：** `40bdb6a` 为保证金等待新增分支后，把维护判断挪到了其后；Linux 模块回归发现维护中的工作台被资金等待覆盖，维护「禁止新发送、保留配置」语义丢失。
+
+**以后做法：** 插入新阶段时先画出原优先级表，再放置新分支。维护/工作台暂停等全局禁发语义应先于资金等待等业务等待；pending 只读恢复顺序不得被新分支打断。改动后至少有一条回归断言「维护中不会落到 margin_wait」。
+
+**如何验证：** 工作台/维护与资金等待相关用例；`d7f92d8` 提交说明记录首轮 Linux 726 项中维护 phase 断言失败并已修复。本轮日复盘未重跑。
+
+**证据：** project-aggregation `d7f92d8b674c73a9f3efa3070e91a4fe1dc4081f`：[pair_execution.py](modules/aster/trading/pair_execution.py) 将 `workspace.active` → `phase=maintenance` 恢复到 `blocks_trading`/`margin_wait` 之前。
+
+**事件记录：** `aster-maintenance-before-margin-wait-20261020`；实际发生日期 2026-10-19（UTC 提交），历史复盘 2026-10-20（Seen 1×）；不推进全历史复盘检查点。
