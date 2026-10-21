@@ -3,5 +3,4 @@
 # test or the code, then delete the line; deploy/test-aster-python.sh and
 # deploy/test-module-units.sh then run the file and fail on an entry whose file
 # no longer exists.
-aster test_pair_hot_races 1 failure: pending transfer completion wake-up
 aster test_pair_review terminal recovery after one lagging position read never completes the batch (dc87ff8)

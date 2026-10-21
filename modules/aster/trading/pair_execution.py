@@ -224,12 +224,16 @@ class PairTrader:
             return result
         _, brokers, identities = self._members(pair)
         self._margin_identity.set((pair["id"], pair.get("revision"), deepcopy(identities)))
+        transfer_pending = isinstance(margin, dict) and margin.get("pending") is not None
         result = self._balance(pair, state, brokers, identities, pending_orders=bool(state.get("pending")))
-        if (isinstance(margin, dict) and margin.get("pending") is not None
-                or result.get("status") in {"acknowledged", "confirmed", "skipped", "paper_confirmed"}):
+        if transfer_pending or result.get("status") in {"acknowledged", "confirmed", "skipped", "paper_confirmed"}:
             self._ordinary_observations.pop(pair["id"], None)
         state["updated_at"] = time.time()
         self.store.put("pair_runtime:" + pair["id"], self._durable(state))
+        # The strategy tick that follows no longer sees this transfer as
+        # pending, so its completion wake-up has to come from here.
+        if transfer_pending and not (self.store.get("pair_margin:" + pair["id"]) or {}).get("pending"):
+            self._wake_hot_data(pair)
         self._observe_margin_alert(pair, result, state.get("margin_balances"))
         return result
 
