@@ -9,6 +9,28 @@ import tempfile
 from pathlib import Path
 
 
+# Keep in step with validNote() in scripts/review-message.mjs.
+NOTE_LABEL = re.compile(r'^更新说明[ \t]*[:：][ \t]*')
+NOTE_END = re.compile(r'^(?:风险等级|已运行|未运行|待确认|独立审查|回滚)[ \t]*[:：]')
+CHINESE = re.compile(r'[\u3400-\u9fff]')
+FALLBACK_NOTES = '内部维护与稳定性改进，使用方式无变化。'
+
+
+def user_notes(message):
+    """Only the commit's Chinese user-facing section reaches the update dialog."""
+    lines = message.splitlines()
+    starts = [index for index, line in enumerate(lines) if NOTE_LABEL.match(line)]
+    if len(starts) != 1:
+        return FALLBACK_NOTES
+    section = [NOTE_LABEL.sub('', lines[starts[0]], count=1)]
+    for line in lines[starts[0] + 1:]:
+        if not line.strip() or NOTE_END.match(line):
+            break
+        section.append(line)
+    note = '\n'.join(line.strip() for line in section if line.strip())
+    return note if CHINESE.search(note) else FALLBACK_NOTES
+
+
 def gh(*arguments, check=True):
     result = subprocess.run(['gh', *arguments], capture_output=True, text=True)
     if check and result.returncode:
@@ -50,14 +72,12 @@ if release:
         print('Identical deployment release already published; skipped.')
         sys.exit(0)
 
-# Read only the verified release commit, including its subject and multiline body.
+# Read only the verified release commit; its English subject and review evidence stay out of the notes.
 message = subprocess.run(['git', 'log', '-1', '--format=%B', commit], capture_output=True,
                          text=True, encoding='utf-8', shell=False, check=True).stdout.rstrip('\r\n')
 if not message.strip():
     raise ValueError('Release commit has no update description')
-notes = (f'{message}\n\n发布提交：{commit}\n'
-         '此说明来自该发布提交的标题与正文，不是跨版本累计变更。\n\n'
-         '部署说明：部署包已通过 CI 验证，更新时保留服务器已有配置与数据。\n')
+notes = user_notes(message) + '\n'
 with tempfile.TemporaryDirectory(prefix='candidate-notes-') as temporary:
     notes_file = Path(temporary) / 'release-notes.txt'
     notes_file.write_text(notes, encoding='utf-8', newline='\n')

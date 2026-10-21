@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const evidence = 'test change\n\n风险等级：R2\n已运行：isolated Git regression passed\n未运行：browser (no visible behavior)\n待确认：无\n';
+const evidence = 'test change\n\n更新说明：提交证据门禁回归\n风险等级：R2\n已运行：isolated Git regression passed\n未运行：browser (no visible behavior)\n待确认：无\n';
 const focused = ['test', '.only("fixture", () => {});'].join('');
 const logging = ['console', '.log("fixture");'].join('');
 const secret = ['ghp_', 'a'.repeat(36)].join('');
@@ -81,12 +81,17 @@ test('commit evidence covers non-src modules, scripts, CI and deletion; docs rem
     f.put(name, 'fixture\n'); f.git('add', name);
     assert.equal(f.node('review-message.mjs', ['--staged', '--message', path.join(f.directory, 'message.txt')]).status, 1);
   }
-  for (const body of ['风险等级：R9\n已运行：yes\n未运行：none\n待确认：none', '风险等级：R2\n已运行：\n未运行：none\n待确认：none', evidence.replace('R2', 'R1 / R2 / R3'), evidence + '风险等级：R3\n']) {
+  const withoutNote = evidence.replace('更新说明：提交证据门禁回归\n', '');
+  for (const body of ['更新说明：变更\n风险等级：R9\n已运行：yes\n未运行：none\n待确认：none', '更新说明：变更\n风险等级：R2\n已运行：\n未运行：none\n待确认：none', evidence.replace('R2', 'R1 / R2 / R3'), evidence + '风险等级：R3\n',
+    withoutNote, withoutNote.replace('风险等级', '更新说明：Fix the gate\n风险等级'), withoutNote.replace('风险等级', '更新说明：\n\n- 空行后的条目\n风险等级'),
+    withoutNote.replace('风险等级', '更新说明：<中文摘要>\n风险等级'), withoutNote.replace('风险等级', `更新说明：${'很'.repeat(301)}\n风险等级`), evidence.replace('风险等级', '更新说明：重复\n风险等级')]) {
     f.put('message.txt', body);
     assert.equal(f.node('review-message.mjs', ['--staged', '--message', path.join(f.directory, 'message.txt')]).status, 1);
   }
-  f.put('message.txt', evidence);
-  assert.equal(f.node('review-message.mjs', ['--staged', '--message', path.join(f.directory, 'message.txt')]).status, 0);
+  for (const body of [evidence, evidence.replace(/\n/g, '\r\n'), withoutNote.replace('风险等级', `更新说明：\n- 修复 Aster 5x 维护状态\n- ${'好'.repeat(270)}\n风险等级`)]) {
+    f.put('message.txt', body);
+    assert.equal(f.node('review-message.mjs', ['--staged', '--message', path.join(f.directory, 'message.txt')]).status, 0, body);
+  }
   f.git('reset', '--hard', '-q'); f.put('server/deleted.mjs', 'export const value = 1;'); f.git('add', 'server/deleted.mjs'); f.git('commit', '-qm', evidence);
   f.git('rm', 'server/deleted.mjs');
   f.put('message.txt', 'missing evidence');

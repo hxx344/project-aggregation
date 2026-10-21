@@ -30,7 +30,10 @@ class PublishRelease(unittest.TestCase):
         self.calls = []
         self.upload_failure = False
         self.remote_manifest = self.manifest
-        self.message = '更新面板显示具体变更 🚀\n\n保留提交正文的换行。\n- 显示更新内容\n- 保留已有配置\n'
+        self.notes = '- 系统更新弹窗只显示中文摘要 🚀\n- 更新时保留已有配置'
+        self.message = ('feat(updates): show concise release notes\n\nEnglish implementation detail.\n\n'
+                        '更新说明：\n' + self.notes + '\n风险等级：R2\n已运行：fixture\n\n'
+                        'Co-authored-by: fixture <fixture@example.invalid>\n')
         self.git_failure = False
         self.notes_files = []
 
@@ -110,10 +113,7 @@ class PublishRelease(unittest.TestCase):
         self.assertEqual({item['name'] for item in self.release['assets']}, {'fixture.tar.gz', 'release-manifest.json'})
         self.assertEqual(self.calls[-1][1:3], ['release', 'edit'])
         self.assertFalse(any(call[1] == 'api' for call in self.calls))
-        self.assertTrue(self.release['body'].startswith(self.message + '\n'))
-        self.assertIn('发布提交：' + self.commit, self.release['body'])
-        self.assertIn('不是跨版本累计变更', self.release['body'])
-        self.assertIn('保留服务器已有配置与数据', self.release['body'])
+        self.assertEqual(self.release['body'], self.notes + '\n')
         self.assertEqual(len(self.notes_files), 2)
         self.assertFalse(any(path.exists() for path in self.notes_files))
 
@@ -123,7 +123,7 @@ class PublishRelease(unittest.TestCase):
         self.assertFalse(any(call[1:3] == ['release', 'create'] for call in self.calls))
         self.assertEqual(sum(call[1:3] == ['release', 'upload'] for call in self.calls), 2)
         self.assertTrue(self.release['prerelease'])
-        self.assertTrue(self.release['body'].startswith(self.message + '\n'))
+        self.assertEqual(self.release['body'], self.notes + '\n')
         self.assertEqual(len(self.notes_files), 1)
         self.assertFalse(self.notes_files[0].exists())
 
@@ -143,6 +143,21 @@ class PublishRelease(unittest.TestCase):
                     self.publish()
                 self.assertEqual(self.writes(), [])
                 self.assertEqual(self.release, draft)
+
+    def test_notes_keep_only_the_chinese_user_section(self):
+        cases = [
+            ('fix: one line\n\n更新说明：修复更新后交易模块停留在维护中\n\n风险等级：R2\n', '修复更新后交易模块停留在维护中\n'),
+            ('fix: stop at evidence\n\n更新说明：第一条\n  - 第二条\n已运行：fixture\n', '第一条\n- 第二条\n'),
+            ('docs: no section\n\nEnglish body only.\n', '内部维护与稳定性改进，使用方式无变化。\n'),
+            ('fix: english\n\n更新说明：Fix the latch\n', '内部维护与稳定性改进，使用方式无变化。\n'),
+            ('fix: duplicate\n\n更新说明：甲\n\n更新说明：乙\n', '内部维护与稳定性改进，使用方式无变化。\n'),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.calls.clear(); self.notes_files.clear(); self.release = None; self.message = message
+                self.publish()
+                self.assertEqual(self.release['body'], expected)
+                self.assertNotIn(self.commit, self.release['body'])
 
     def test_empty_commit_message_prevents_publication(self):
         self.message = '\n \n'
