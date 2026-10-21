@@ -1,6 +1,4 @@
 # Unit test files that Checks does not run yet, one per line: <suite> <file> <reason>.
-# Each failed or hung when run on its own (test census, 2026-10-20). Fix the
-# test or the code, then delete the line; deploy/test-aster-python.sh and
-# deploy/test-module-units.sh then run the file and fail on an entry whose file
-# no longer exists.
-aster test_pair_review terminal recovery after one lagging position read never completes the batch (dc87ff8)
+# Add a file only with the reason it cannot run yet; fix the test or the code,
+# then delete the line. deploy/test-aster-python.sh and deploy/test-module-units.sh
+# run every other file and fail on an entry whose file no longer exists.
