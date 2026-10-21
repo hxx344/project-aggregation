@@ -1149,3 +1149,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `d1939d3`。2026-10-22 用户截图显示更新回来后 Aster 5x「数据过期」，运行详情为 xau01、xau02「资金快照已过期（超过 120 秒）」与「项目数据已过期」，手动重新载入或等待后恢复。服务器日志未取得，「回来后才释放」的时序由源码推断，未在服务器复现。
 
 **事件记录：** `update-latch-browser-release-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L073：按市场分支的配对展示须覆盖每个有同构报价的市场
+
+**适用条件：** Monitor 关联交易面板按市场计算两腿配对指标（开仓价差、当前价差），而多个市场共用同一套报价对比组件与持仓列表（原油 CL/BZ、海力士 ADR/正股）。
+
+**根因：** [关联交易面板](modules/monitor/app/related-positions.tsx) 只在 `market === "oil"` 时计算配对，[Monitor 主页](modules/monitor/app/monitor-hub.tsx) 也只把原油对比的实时价差传给面板。海力士两条腿都已列出，开仓价差和当前价差却整块不显示，也没有“无法配对”提示。
+
+**以后做法：** 配对规则按市场集中在 [配对模块](modules/monitor/lib/related-pairs.ts) 的表里，每个有报价对比的市场都登记两腿币名与价差公式；开仓价差与实时对比用同一公式（海力士为 ADR ÷（正股 ÷ 10）− 1，不用原始比值）。新增市场时同时接上实时价差。
+
+**如何验证：** [Monitor 桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 覆盖海力士 10:1 溢价公式、`SKHX` 别名、同交易所多笔/同向/缺腿、无效入场价，以及原油配对不受影响。
+
+**证据：** project-aggregation 基线 `d1939d3`。2026-10-22 用户截图显示海力士关联交易只有持仓、没有开仓价差。
+
+**事件记录：** `hynix-related-spread-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；不推进全历史复盘检查点。

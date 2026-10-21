@@ -3,10 +3,15 @@
 import { useState, type ReactNode } from "react";
 import { ArrowUpRight, ChevronDown, Link2 } from "lucide-react";
 import { hubOpenTrading, POSITIONS_TIMEOUT_MS, useHubHost, useHubPositions, type HubPositionItem, type PositionsMarket } from "../lib/hub-bridge";
-import { oilSpreadPairs, type UnpairedReason, type VenueSpreads } from "../lib/related-pairs";
+import { pairedMarket, relatedSpreadPairs, type UnpairedReason, type VenueSpreads } from "../lib/related-pairs";
+import type { SpreadMarket } from "../lib/exchange-quotes";
 
 export type { VenueSpreads };
-const unpairedText: Record<UnpairedReason, string> = { "same-side": "CL 与 BZ 同向", multiple: "同一交易所有多笔同币种持仓", "missing-leg": "缺少另一条腿" };
+const unpairedText = (market: PositionsMarket): Record<UnpairedReason, string> => ({ "same-side": market === "hynix" ? "ADR 与正股同向" : "CL 与 BZ 同向", multiple: "同一交易所有多笔同币种持仓", "missing-leg": "缺少另一条腿" });
+const pairFoot: Record<SpreadMarket, string> = {
+  oil: "价差 =（BZ − CL）÷ CL，仅在同一交易所 CL 与 BZ 各一笔且方向相反时计算；当前价差取本页交易所报价。",
+  hynix: "价差 = ADR ÷（正股 ÷ 10）− 1，10 份 ADR 对 1 股正股；仅在同一交易所 ADR 与正股各一笔且方向相反时计算；当前价差取本页交易所报价，无报价的交易所显示 —。",
+};
 
 const beijing = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 const beijingDate = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -53,7 +58,8 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
   const [open, setOpen] = useState(false);
   const positions = useHubPositions(market, symbols, active);
   const shown = positions.status === "ok" ? positions.items : positions.previous?.items ?? [];
-  const pairs = market === "oil" ? oilSpreadPairs(shown, spreads) : [];
+  const pairMarket = pairedMarket(market) ? market : null;
+  const pairs = pairMarket ? relatedSpreadPairs(pairMarket, shown, spreads) : [];
   const message = positions.status === "standalone" ? "在工作台中打开可查看关联持仓"
     : positions.status === "connecting" ? "正在连接工作台…"
     : positions.status === "unsupported" ? "持仓不可用：当前工作台未提供持仓查询"
@@ -70,9 +76,9 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
     {message ? <p className={positions.status === "unavailable" || positions.status === "unsupported" || positions.status === "unauthorized" || positions.incomplete ? "detail-side-error" : "detail-side-empty"}>{message}</p> : null}
     {partial ? <p className="detail-side-error">部分数据源不可用，列表可能不完整</p> : null}
     {keptAt ? <p className="detail-side-note">{keptAt}</p> : null}
-    {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === "paired" ? <dl><div><dt>开仓价差</dt><dd className={tone(pair.opening)}>{signedPercent(pair.opening)}</dd></div><div><dt>当前价差</dt><dd className={tone(pair.current)}>{signedPercent(pair.current)}{pair.current !== null && pair.currentStale ? <span className="detail-stale-tag">旧</span> : null}</dd></div></dl> : <p className="related-unpaired">无法配对 · {unpairedText[pair.reason]}</p>}</li>)}</ul> : null}
+    {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === "paired" ? <dl><div><dt>开仓价差</dt><dd className={tone(pair.opening)}>{signedPercent(pair.opening)}</dd></div><div><dt>当前价差</dt><dd className={tone(pair.current)}>{signedPercent(pair.current)}{pair.current !== null && pair.currentStale ? <span className="detail-stale-tag">旧</span> : null}</dd></div></dl> : <p className="related-unpaired">无法配对 · {unpairedText(market)[pair.reason]}</p>}</li>)}</ul> : null}
     {shown.length ? <PositionRows items={shown}/> : null}
-    {pairs.length ? <p className="detail-side-foot">价差 =（BZ − CL）÷ CL，仅在同一交易所 CL 与 BZ 各一笔且方向相反时计算；当前价差取本页交易所报价。</p> : null}
+    {pairMarket && pairs.length ? <p className="detail-side-foot">{pairFoot[pairMarket]}</p> : null}
   </>;
   if (variant === "strip") {
     const summary = positions.status === "ok" ? positions.items.length ? `${positions.items.length} 笔关联持仓 · ${clock(positions.generatedAt)}${positions.incomplete ? " · 部分数据源不可用" : ""}` : message : message;

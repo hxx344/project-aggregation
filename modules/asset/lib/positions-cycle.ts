@@ -2,6 +2,9 @@ import type { PositionCycle } from './positions-types.ts';
 import { decimal, POSITIONS_INVALID } from './positions-values.ts';
 
 export const CYCLE_LOOKBACK_DAYS = 85;
+/** The replayed fills disagree with the exchange's own position, as opposed to malformed data. */
+export const CYCLE_MISMATCH = '成交记录与当前持仓对不上，暂不统计本轮';
+export const CYCLE_CURRENCY = '资金费币种与结算币种不同，暂不统计本轮';
 export const CYCLE_LOOKBACK_MS = CYCLE_LOOKBACK_DAYS * 86_400_000;
 
 /** One fill of the tracked position side; amounts keep the exchange's decimal text. */
@@ -95,15 +98,15 @@ export function summarizeCycle(input: CycleInput): PositionCycle {
       const amount = subtract(magnitude(position), magnitude(after));
       closed = add(closed, amount); closeValue = add(closeValue, multiply(amount, fill.price));
     }
-    if (fill.sizeAfter !== undefined && compare(fill.sizeAfter, after) !== 0) throw new Error(POSITIONS_INVALID);
+    if (fill.sizeAfter !== undefined && compare(fill.sizeAfter, after) !== 0) throw new Error(CYCLE_MISMATCH);
     if (!opening) realized.push(fill.realizedPnl);
     if (fill.feeCurrency !== input.currency) feesKnown = false;
     else fees.push(opening ? multiply(fill.fee, input.openingFraction!) : fill.fee);
     position = after;
   });
-  if (compare(position, input.current) !== 0) throw new Error(POSITIONS_INVALID);
+  if (compare(position, input.current) !== 0) throw new Error(CYCLE_MISMATCH);
   const inCycle = input.cash.filter(item => item.time >= input.since);
-  if (inCycle.some(item => item.currency !== input.currency)) throw new Error(POSITIONS_INVALID);
+  if (inCycle.some(item => item.currency !== input.currency)) throw new Error(CYCLE_CURRENCY);
   realized.push(...inCycle.filter(item => item.kind === 'realized').map(item => item.amount));
   const realizedPnl = sum(realized);
   const feeTotal = feesKnown ? sum(fees) : null;

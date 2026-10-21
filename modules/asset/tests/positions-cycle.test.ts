@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { locateCycle, newestFirst, summarizeCycle } from '../lib/positions-cycle.ts';
+import { CYCLE_MISMATCH, locateCycle, newestFirst, summarizeCycle } from '../lib/positions-cycle.ts';
 import type { CycleFill } from '../lib/positions-cycle.ts';
 import { position } from '../lib/positions-values.ts';
 import { CycleRetry, readPositionCycle } from '../lib/positions-cycle-readers.ts';
@@ -42,7 +42,7 @@ test('a short cycle, partial lookback, foreign fee currency and replay mismatch 
   assert.equal(partial.status, 'partial'); assert.equal(partial.closedQuantity, '0.5'); assert.equal(partial.fees, null); assert.equal(partial.net, null);
   assert.match(partial.note!, /其他币种/); assert.match(partial.note!, /85 天/);
   assert.equal(locateCycle('3', [fill('1', at, 'buy', '1', '1')]), null);
-  assert.throws(() => summarizeCycle({ ...base, current: '-1.5', fills: [{ ...short[0], sizeAfter: '-1' }, short[1]], complete: true, openingFraction: null, since: short[1].time }));
+  assert.throws(() => summarizeCycle({ ...base, current: '-1.5', fills: [{ ...short[0], sizeAfter: '-1' }, short[1]], complete: true, openingFraction: null, since: short[1].time }), { message: CYCLE_MISMATCH });
   const unattributed = summarizeCycle({ ...base, current: '-1.5', fills: short, complete: true, openingFraction: null, since: short[1].time, fundingAttributable: false });
   assert.equal(unattributed.funding, null); assert.equal(unattributed.net, null); assert.match(unattributed.note!, /资金费无法拆分/);
 });
@@ -93,6 +93,18 @@ test('Binance one-way funding is attributed, fresh fills ask for a retry and err
   assert.equal((await readPositionCycle(credential, 'cm', request, { now: () => at })).status, 'unavailable');
 });
 
+test('an int64 Binance funding tranId still counts, and malformed fills get a format note rather than a mismatch', async () => {
+  const trades = [{ symbol: 'ETHUSDT', id: 1, side: 'SELL', positionSide: 'BOTH', price: '3000', qty: '2', realizedPnl: '0', commission: '0.6', commissionAsset: 'USDT', time: at - hour }];
+  // 2^60 is serialized exactly but JSON.parse rounds it to an unsafe number.
+  const income = [{ symbol: 'ETHUSDT', incomeType: 'FUNDING_FEE', income: '0.3', asset: 'USDT', time: at - 30 * 60_000, tranId: 2 ** 60 }];
+  const request = { position: held('short', '2', 'ETHUSDT', 'ETH'), siblings: [], snapshotAt: at };
+  const credential: Credentials = { exchange: 'binance', ...keys };
+  const read = (rows: unknown[]) => readPositionCycle(credential, 'um', request, { fetcher: mock(url => url.pathname.endsWith('userTrades') ? rows : income.filter(row => inRange(url, row.time))).fetcher, now: () => at, spacing: false });
+  const cycle = await read(trades);
+  assert.equal(cycle.status, 'complete'); assert.equal(cycle.funding, '0.3');
+  const malformed = await read([{ ...trades[0], price: 3000 }]);
+  assert.equal(malformed.status, 'unavailable'); assert.match(malformed.note!, /格式无法识别/);
+});
 test('Bybit reads the unified ledger with cursor pages, checks each post-trade size and counts settlement funding', async () => {
   const row = (id: string, time: number, extra: Record<string, unknown>) => ({ id, symbol: 'SOLUSDT', category: 'linear', currency: 'USDT', transactionTime: String(time), ...extra });
   const ledger = [

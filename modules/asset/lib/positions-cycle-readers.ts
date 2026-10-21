@@ -4,7 +4,7 @@ import type { Position, PositionCycle } from './positions-types.ts';
 import type { Credentials } from './validation.ts';
 import { positionsGet } from './positions-readers.ts';
 import { decimal, record, rows, text, POSITIONS_FAILED, POSITIONS_INVALID } from './positions-values.ts';
-import { CYCLE_LOOKBACK_MS, cycleUnavailable, locateCycle, negate, newestFirst, sign, summarizeCycle } from './positions-cycle.ts';
+import { CYCLE_CURRENCY, CYCLE_LOOKBACK_MS, CYCLE_MISMATCH, cycleUnavailable, locateCycle, negate, newestFirst, sign, summarizeCycle } from './positions-cycle.ts';
 import type { CycleCash, CycleFill } from './positions-cycle.ts';
 
 type Fetcher = typeof fetch;
@@ -68,6 +68,10 @@ function identifier(value: unknown): string {
   if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return String(value);
   if (typeof value !== 'string' || !value || value.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(value)) throw new Error(POSITIONS_INVALID);
   return value;
+}
+/** Cash-flow ids are never compared, so an int64 id that JSON.parse rounded (Binance tranId) is still usable. */
+function cashId(value: unknown): string {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? String(value) : identifier(value);
 }
 function positive(value: unknown) { const result = decimal(value); if (sign(result) <= 0) throw new Error(POSITIONS_INVALID); return result; }
 /** Bybit ledger amounts may be empty or use exponent notation; the point is moved as text. */
@@ -145,7 +149,7 @@ async function binanceCycle(c: BinanceCredential, scope: string, request: CycleR
     for (const row of await range(incomePath, { incomeType: 'FUNDING_FEE' }, start, end)) {
       const time = millis(row.time);
       if (row.symbol !== symbol || row.incomeType !== 'FUNDING_FEE' || time < start || time > end) throw new Error(POSITIONS_INVALID);
-      cash.push({ id: identifier(row.tranId), time, kind: 'funding', amount: decimal(row.income), currency: text(row.asset) });
+      cash.push({ id: cashId(row.tranId), time, kind: 'funding', amount: decimal(row.income), currency: text(row.asset) });
     }
   }
   // Binance books funding per symbol; an opposite hedge leg in the same period shares it.
@@ -251,7 +255,8 @@ export async function readPositionCycle(credentials: Credentials, scope: string,
     return cycleUnavailable('此交易所暂不支持统计本轮平仓', at());
   } catch (error) {
     if (error instanceof CycleRetry || options.signal?.aborted) throw error;
-    return cycleUnavailable(error instanceof CycleUnavailable ? error.message
-      : error instanceof Error && error.message === POSITIONS_INVALID ? '成交记录与当前持仓对不上，暂不统计本轮' : '本轮成交读取失败，稍后重试', at());
+    const message = error instanceof Error ? error.message : '';
+    return cycleUnavailable(error instanceof CycleUnavailable || message === CYCLE_MISMATCH || message === CYCLE_CURRENCY ? message
+      : message === POSITIONS_INVALID ? '交易所成交数据格式无法识别，暂不统计本轮' : '本轮成交读取失败，稍后重试', at());
   }
 }

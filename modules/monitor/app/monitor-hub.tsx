@@ -80,6 +80,7 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
   const reportAlertView = useCallback((id: string, state: AlertViewState) => setAlertStates(previous => previous[id]?.view === state.view && previous[id]?.loadError === state.loadError ? previous : { ...previous, [id]: state }), []);
   const [alertOpenRequests, setAlertOpenRequests] = useState<Record<string, number>>({});
   const [oilSpreads, setOilSpreads] = useState<VenueSpreads>({});
+  const [hynixSpreads, setHynixSpreads] = useState<VenueSpreads>({});
   const [navSlot, setNavSlot] = useState<HTMLDivElement | null>(null);
   const perpetual = usePerpetualSummary(hub.readActive && enabled('perpetual'));
   const summaries: Record<string, MonitorSummary> = { oil, hynix, perpetual, 'cl-xau': goldOilMarkets[goldOilKey] };
@@ -151,7 +152,7 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
     setAlertOpenRequests(previous => ({ ...previous, [alertId]: (previous[alertId] ?? 0) + 1 }));
     requestAnimationFrame(() => document.querySelector(`[data-alert-monitor="${alertId}"]`)?.scrollIntoView({ behavior: "auto", block: "nearest" }));
   };
-  const comparison = (id: "oil" | "hynix") => enabled(id) ? <div className="hub-exchange-comparison" {...(id === "oil" ? { slot: "after-chart" } : {})}><ExchangeComparison active={hub.readActive && active === id} interactionActive={hub.active && active === id} monitorId={id} primary={summaries[id]?.comparison} initial={initial?.[id].exchanges} renderedAt={initial?.renderedAt} onSpreads={id === "oil" ? setOilSpreads : undefined}/></div> : null;
+  const comparison = (id: "oil" | "hynix") => enabled(id) ? <div className="hub-exchange-comparison" {...(id === "oil" ? { slot: "after-chart" } : {})}><ExchangeComparison active={hub.readActive && active === id} interactionActive={hub.active && active === id} monitorId={id} primary={summaries[id]?.comparison} initial={initial?.[id].exchanges} renderedAt={initial?.renderedAt} onSpreads={id === "oil" ? setOilSpreads : setHynixSpreads}/></div> : null;
   const detailMonitor = monitors.find(monitor => monitor.id === active);
   return <div className={`monitor-hub ${active === "perpetual" ? "monitor-hub-perpetual" : ""}`}>
     <header className="hub-header"><a className="hub-brand" href="/"><span><Activity size={23}/></span>MARKET <b>/ MONITOR</b></a><div className="hub-source">跨市场行情 <span>· CEX / DEX</span></div></header>
@@ -179,7 +180,7 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
         </div>
         {active !== "perpetual" && detailEnabled ? <aside className="monitor-detail-side">
           {hasAlerts ? <MonitorAlertSide state={alertStates[alertId]} onOpenRules={openAlertRules}/> : null}
-          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.readActive} spreads={active === "oil" ? oilSpreads : undefined}/>
+          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.readActive} spreads={active === "oil" ? oilSpreads : active === "hynix" ? hynixSpreads : undefined}/>
         </aside> : null}
       </div>
     </Tabs>

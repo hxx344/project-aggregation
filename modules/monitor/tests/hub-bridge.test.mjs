@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { trustedHubOrigin, cleanHubQuery, observeNetworkActivity, hubSelectionUrl, MODULE_CAPABILITIES, hostCapabilityList, canUseHostCapability, isHubMessage, cleanPositionsRequest, parsePositionsReply, createPositionsRequester } from '../lib/hub-bridge.ts';
-import { oilSpreadPairs, RELATED_SYMBOLS } from '../lib/related-pairs.ts';
+import { relatedSpreadPairs, RELATED_SYMBOLS } from '../lib/related-pairs.ts';
 import { exchangeContracts } from '../lib/exchange-quotes.ts';
 
 test('bridge trusts only the exact isolated proxy hostname, matching scheme and port', () => {
@@ -125,6 +125,7 @@ test('oil spreads pair only one CL and one BZ position in opposite directions on
   const cl = (overrides = {}) => item({ key: `cl-${Math.random()}`, symbol: 'CLUSDT', base: 'CL', side: 'long', entryPrice: '62.10', ...overrides });
   const bz = (overrides = {}) => item({ key: `bz-${Math.random()}`, symbol: 'BZUSDT', base: 'BZ', side: 'short', entryPrice: '65.80', ...overrides });
   const spreads = { binance: { premium: 5.68, stale: false } };
+  const oilSpreadPairs = (items, values) => relatedSpreadPairs('oil', items, values);
   const [paired] = oilSpreadPairs([cl(), bz()], spreads);
   assert.equal(paired.status, 'paired');
   assert.ok(Math.abs(paired.opening - (65.8 - 62.1) / 62.1 * 100) < 1e-9);
@@ -140,6 +141,22 @@ test('oil spreads pair only one CL and one BZ position in opposite directions on
   assert.equal(oilSpreadPairs([cl({ entryPrice: null }), bz()], spreads)[0].opening, null, 'a missing entry price stays unknown');
 });
 
+test('Hynix pairs one ADR and one ordinary-share leg per venue using the 10 ADR to 1 share premium', () => {
+  const adr = (overrides = {}) => item({ key: `adr-${Math.random()}`, symbol: 'SKHYUSDT', base: 'SKHY', side: 'short', entryPrice: '141.68', ...overrides });
+  const ordinary = (overrides = {}) => item({ key: `ord-${Math.random()}`, symbol: 'SKHYNIXUSDT', base: 'SKHYNIX', side: 'long', entryPrice: '959.75', ...overrides });
+  const spreads = { binance: { premium: 46.2, stale: true } };
+  const [paired] = relatedSpreadPairs('hynix', [adr(), ordinary()], spreads);
+  assert.equal(paired.status, 'paired');
+  assert.ok(Math.abs(paired.opening - (141.68 / (959.75 / 10) - 1) * 100) < 1e-9, 'matches the live comparison formula');
+  assert.equal(paired.current, 46.2); assert.equal(paired.currentStale, true);
+  const [hyperliquid] = relatedSpreadPairs('hynix', [adr({ exchangeId: 'hyperliquid' }), ordinary({ exchangeId: 'hyperliquid', base: 'SKHX', symbol: 'xyz:SKHX' })], spreads);
+  assert.equal(hyperliquid.status, 'paired', 'SKHX is the ordinary-share leg'); assert.equal(hyperliquid.current, null, 'no quote for that venue');
+  assert.deepEqual(relatedSpreadPairs('hynix', [ordinary({ exchange: 'Aster', side: 'short' }), ordinary({ exchange: 'Aster' })], spreads).map(pair => [pair.status, pair.reason]), [['unpaired', 'missing-leg']]);
+  assert.deepEqual(relatedSpreadPairs('hynix', [adr(), adr(), ordinary()], spreads).map(pair => pair.reason), ['multiple']);
+  assert.deepEqual(relatedSpreadPairs('hynix', [adr({ side: 'long' }), ordinary()], spreads).map(pair => pair.reason), ['same-side']);
+  for (const entryPrice of [null, '0', 'abc']) assert.equal(relatedSpreadPairs('hynix', [adr(), ordinary({ entryPrice })], spreads)[0].opening, null);
+  assert.deepEqual(relatedSpreadPairs('oil', [adr(), ordinary()], spreads), [], 'other markets ignore Hynix legs');
+});
 test('related position requests cover both legs of every compared contract pair', () => {
   for (const [market, contract] of Object.entries(exchangeContracts))
     for (const base of [contract.leftBase, contract.rightBase]) assert.ok(RELATED_SYMBOLS[market].includes(base), `${market} requests ${base}`);
