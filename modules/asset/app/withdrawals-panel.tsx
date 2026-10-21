@@ -17,12 +17,12 @@ export function WithdrawalsPanel({ ledger, today, busy, error, mutate, clearErro
     setDraft({ id: row?.id ?? crypto.randomUUID(), editing: !!row, date: row?.date ?? today, amount: row ? String(row.amount) : '', note: row?.note ?? '' });
   };
   return <>
-    <div className="notice">原表“出金”已作为累计出金计入，当前为 $ {money(embeddedWithdrawals(ledger.assets))}。这里只登记原表基准日 {ledger.baselineDate} 之后尚未计入的新增出金；同日新增也可登记。新增记录会自动加入总览表内总额及资产明细的出金数量和估值，请勿再手动加到原表“出金”行。</div>
+    <div className="notice info">原表“出金”已作为累计出金计入，当前为 $ {money(embeddedWithdrawals(ledger.assets))}。这里只登记原表基准日 {ledger.baselineDate} 之后尚未计入的新增出金；同日新增也可登记。新增记录会自动加入总览表内总额及资产明细的出金数量和估值，请勿再手动加到原表“出金”行。</div>
     <section className="panel holdings">
-      <div className="holdings-heading"><div><h2>新增出金记录 <span>{ledger.withdrawals.length}</span></h2><p className="help">金额使用出金时的美元价值；账户间内部转账不记出金。</p></div><button className="button primary" disabled={busy} onClick={() => open()}><Plus size={16}/>登记出金</button></div>
+      <div className="holdings-heading"><h2>新增出金记录 <span className="count-chip">{ledger.withdrawals.length}</span></h2><p className="help">金额使用出金时的美元价值；账户间内部转账不记出金。</p><button className="button primary" disabled={busy} onClick={() => open()}><Plus size={15}/>登记出金</button></div>
       {ledger.withdrawals.length ? <Table><TableHeader><TableRow><TableHead>日期（北京时间）</TableHead><TableHead className="numeric">金额 / USD</TableHead><TableHead>备注</TableHead><TableHead>操作</TableHead></TableRow></TableHeader><TableBody>{[...ledger.withdrawals].sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)).map(row => <TableRow key={row.id}><TableCell>{row.date}</TableCell><TableCell className="numeric">{money(row.amount)}</TableCell><TableCell className="withdrawal-note">{row.note || '—'}</TableCell><TableCell><div className="row-actions"><button className="icon-button" disabled={busy} aria-label={'编辑 ' + row.date + ' 出金 ' + row.amount} onClick={() => open(row)}><Pencil size={16}/></button><button className="icon-button" disabled={busy} aria-label={'删除 ' + row.date + ' 出金 ' + row.amount} onClick={() => { clearError(); setRemoving(row); }}><Trash2 size={16}/></button></div></TableCell></TableRow>)}</TableBody></Table> : <div className="empty-state">尚未登记新增出金。原表中的累计出金已自动纳入统计。</div>}
+      <p className="panel-foot">登记不会改动持仓或再次扣减账户余额。交易所余额由同步更新；手动资产需先更新实际剩余金额。补录、修改或删除出金后，对应日期起的调整曲线会重新计算，原始历史总额保持不变。</p>
     </section>
-    <p className="help section-note">登记不会改动持仓或再次扣减账户余额。交易所余额由同步更新；手动资产需先更新实际剩余金额。补录、修改或删除出金后，对应日期起的调整曲线会重新计算，原始历史总额保持不变。</p>
     <Dialog open={!!draft} onOpenChange={open => { if (!open && !busy) setDraft(null); }}><DialogContent className="withdrawal-dialog"><DialogHeader><DialogTitle>{draft?.editing ? '修改出金记录' : '登记出金'}</DialogTitle><DialogDescription>仅调整统计口径。请先确认当前资产已反映这笔出金。</DialogDescription></DialogHeader>{draft && <form className="form-grid" onSubmit={event => {
       event.preventDefault();
       void mutate('/api/withdrawals', draft.editing ? 'PATCH' : 'POST', { id: draft.id, date: draft.date, amount: Number(draft.amount), note: draft.note }, () => setDraft(null));
