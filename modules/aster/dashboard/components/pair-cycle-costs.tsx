@@ -30,14 +30,14 @@ export function PairCycleCostsPanel({
       {stale ? (
         <p className="amber">花费数据已过期或连接中断，以下保留上次统计。</p>
       ) : null}
-      <p className="muted">
-        优惠按 ASTER 抵扣 5% 后再返 10% 估算，最终手续费为原额的 85.5%。
-        账户优惠资格、实际抵扣与返佣到账尚未核对。
-      </p>
       <div className="pair-cost-periods">
         <CostPeriod title="今日" period={report?.daily} />
         <CostPeriod title="本周" period={report?.weekly} />
       </div>
+      <p className="muted pair-cost-note">
+        优惠按 ASTER 抵扣 5% 后再返 10% 估算，最终手续费为原额的 85.5%。
+        账户优惠资格、实际抵扣与返佣到账尚未核对。
+      </p>
       <details className="pair-cost-method">
         <summary>计算口径</summary>
         <p>

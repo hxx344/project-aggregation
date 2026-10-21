@@ -25,10 +25,12 @@ export function AccountPositionsTable({
   positions,
   strategy,
   label = '账户完整持仓',
+  stale = false,
 }: {
   positions: DisplayPosition[];
   strategy?: PositionStrategy;
   label?: string;
+  stale?: boolean;
 }) {
   return (
     <div className="table-scroll account-positions-table">
@@ -57,10 +59,14 @@ export function AccountPositionsTable({
                 )
               : null;
             return (
-              <TableRow key={`${position.symbol}-${position.side}`}>
+              <TableRow
+                key={`${position.symbol}-${position.side}`}
+                className={stale ? 'stale-row' : undefined}
+              >
                 <TableCell>
                   <div className="position-market">
                     <strong>{position.symbol}</strong>
+                    {stale ? <span className="stale-tag">旧</span> : null}
                     {scope?.symbolLabel ? (
                       <span className="position-strategy-badge">
                         {scope.symbolLabel}

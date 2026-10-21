@@ -151,6 +151,147 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
         : Number(snapshot.ratio) > Number(account?.policy.margin_limit)
           ? 'amber'
           : '';
+  const strips = (
+    <div className="desk-strips">
+      {state && !needsLogin ? (
+        <CapacityRelayPanel
+          relay={state.capacity_relay}
+          now={serverNow}
+          updatedAt={state.updated_at}
+          connectionError={connectionError}
+          demo={state.demo}
+        />
+      ) : null}
+      {(separateError || connectionError || notice) && (
+        <output
+          className={`message ${separateError || connectionError ? 'message-error' : ''}`}
+        >
+          {separateError || connectionError || notice}
+        </output>
+      )}
+      {account && accountMessage && workspace !== 'pairs' && (
+        <div className="message message-error cycle-recovery-message">
+          <output>{accountMessage}</output>
+          {recoveryReason ? (
+            <CycleRecovery
+              key={account.id}
+              accountId={account.id}
+              accountName={account.name}
+              disabled={busy || pairBound || Boolean(connectionError)}
+              action={action}
+              setNotice={setNotice}
+            />
+          ) : null}
+        </div>
+      )}
+      {!needsLogin && account ? (
+        <>
+          {workspace !== 'pairs' ? (
+            <section className="panel account-summary-panel">
+              <section className="account-bar" aria-label="账户状态与总开关">
+                <div className="account-run-state">
+                  <span
+                    className={`run-indicator ${(binding ? binding.enabled : account.enabled) ? 'mint' : 'muted'}`}
+                  >
+                    <i />
+                    {binding
+                      ? binding.enabled
+                        ? '配对组已启用'
+                        : '配对组已暂停'
+                      : account.enabled
+                        ? '账户执行已启用'
+                        : '账户执行已暂停'}
+                  </span>
+                  <p>
+                    {pairBound
+                      ? `由配对组「${binding?.name ?? account.pair_id}」统一管理，旧账户交易入口已禁用。`
+                      : `已保存的执行范围：${modes}；是否下单以各功能检查结果为准。`}
+                  </p>
+                </div>
+                <div className="account-run-actions">
+                  <Button
+                    disabled={busy || !canStart}
+                    title={
+                      pairBound
+                        ? '请到配对组管理此账户'
+                        : cycle.dirty
+                          ? '请先保存或撤销循环草稿'
+                          : '按已保存配置启动账户的全部已启用功能'
+                    }
+                    onClick={() =>
+                      void action(`/api/accounts/${account.id}/enable`)
+                    }
+                  >
+                    <CirclePlay size={16} />
+                    启动账户
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy || pairBound || !account.enabled}
+                    onClick={() =>
+                      void action(`/api/accounts/${account.id}/pause`)
+                    }
+                  >
+                    <CirclePause size={16} />
+                    暂停账户
+                  </Button>
+                  {account.status === 'attention' ? (
+                    <Button
+                      variant="outline"
+                      disabled={busy || pairBound}
+                      onClick={() =>
+                        void action(`/api/accounts/${account.id}/retry`)
+                      }
+                    >
+                      核对未完成批次
+                    </Button>
+                  ) : null}
+                </div>
+                {cycle.dirty ? (
+                  <p className="draft-notice amber">
+                    循环设置有未保存修改，请到「多空循环」保存或撤销。
+                  </p>
+                ) : null}
+              </section>
+              <section className="account-strip" aria-label="账户关键数据">
+                <dl>
+                  <div>
+                    <dt>权益 · USD1</dt>
+                    <dd>{fmt(snapshot?.equity)}</dd>
+                  </div>
+                  <div>
+                    <dt>可用 · USD1</dt>
+                    <dd>{fmt(snapshot?.available)}</dd>
+                  </div>
+                  <div>
+                    <dt
+                      title={
+                        snapshotView.fundsOnly
+                          ? '仅保证金模式只检查账户余额，不重新计算持仓占用率'
+                          : undefined
+                      }
+                    >
+                      保证金占用率{snapshotView.fundsOnly ? ' · 未采集' : ''}
+                    </dt>
+                    <dd className={marginTone}>{pct(snapshot?.ratio)}</dd>
+                  </div>
+                </dl>
+                <span
+                  className={`snapshot-stamp ${snapshotView.warning ? 'amber' : ''}`}
+                  title={snapshotView.notice}
+                >
+                  {snapshot && snapshotView.elapsed !== null
+                    ? `${snapshotView.label} ${new Date(snapshot.timestamp * 1000).toLocaleString('zh-CN', { hour12: false })}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
+                    : snapshotView.label}
+                  {state?.demo ? ' · 模拟环境' : ''}
+                </span>
+              </section>
+            </section>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
   return (
     <main className="desk focused-desk">
       <header className="topbar">
@@ -164,18 +305,11 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
       </header>
       <div className="workspace">
         <div className="page-heading">
-          <div className="flex items-center gap-3">
-            <h1>交易工作台</h1>
-            {desk.hubConnected && (
-              <Button variant="ghost" onClick={desk.openAssets}>
-                查看资产账本
-              </Button>
-            )}
-          </div>
-          <div className="account-controls">
-            <div className="toolbar">
+          <div className="page-title">
+            <div className="page-title-row">
+              <h1>交易工作台</h1>
               <span
-                className={`connection ${connectionError ? 'danger' : ''}`}
+                className={`connection ${connectionError ? 'danger' : state ? 'mint' : ''}`}
               >
                 <i />
                 {connectionError
@@ -186,6 +320,26 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                       ? '服务已连接'
                       : '等待连接'}
               </span>
+            </div>
+            {!needsLogin && account ? (
+              <p className="page-meta">
+                <span>
+                  <Bell size={13} /> {notificationOverview(state?.notification)}
+                </span>
+                <span>
+                  {state?.accounts.length} 个账户 · 更新{' '}
+                  {clock(state?.updated_at)}
+                </span>
+              </p>
+            ) : null}
+          </div>
+          <div className="account-controls">
+            {desk.hubConnected && (
+              <Button variant="ghost" onClick={desk.openAssets}>
+                查看资产账本
+              </Button>
+            )}
+            <div className="toolbar">
               <Button
                 variant="ghost"
                 size="icon"
@@ -228,37 +382,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
             />
           </div>
         </div>
-        {state && !needsLogin ? (
-          <CapacityRelayPanel
-            relay={state.capacity_relay}
-            now={serverNow}
-            updatedAt={state.updated_at}
-            connectionError={connectionError}
-            demo={state.demo}
-          />
-        ) : null}
-        {(separateError || connectionError || notice) && (
-          <output
-            className={`message ${separateError || connectionError ? 'message-error' : ''}`}
-          >
-            {separateError || connectionError || notice}
-          </output>
-        )}
-        {account && accountMessage && workspace !== 'pairs' && (
-          <div className="message message-error cycle-recovery-message">
-            <output>{accountMessage}</output>
-            {recoveryReason ? (
-              <CycleRecovery
-                key={account.id}
-                accountId={account.id}
-                accountName={account.name}
-                disabled={busy || pairBound || Boolean(connectionError)}
-                action={action}
-                setNotice={setNotice}
-              />
-            ) : null}
-          </div>
-        )}
+        {needsLogin ? strips : null}
         {needsLogin && (
           <section className="login-panel panel">
             <ShieldCheck size={27} />
@@ -269,108 +393,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
 
         {!needsLogin && account && featureProps ? (
           <>
-            {workspace !== 'pairs' ? (
-              <>
-                <section className="account-bar" aria-label="账户状态与总开关">
-                  <div className="account-run-state">
-                    <span
-                      className={`run-indicator ${(binding ? binding.enabled : account.enabled) ? 'mint' : 'muted'}`}
-                    >
-                      <i />
-                      {binding
-                        ? binding.enabled
-                          ? '配对组已启用'
-                          : '配对组已暂停'
-                        : account.enabled
-                          ? '账户执行已启用'
-                          : '账户执行已暂停'}
-                    </span>
-                    <p>
-                      {pairBound
-                        ? `由配对组「${binding?.name ?? account.pair_id}」统一管理，旧账户交易入口已禁用。`
-                        : `已保存的执行范围：${modes}；是否下单以各功能检查结果为准。`}
-                    </p>
-                  </div>
-                  <div className="account-run-actions">
-                    <Button
-                      disabled={busy || !canStart}
-                      title={
-                        pairBound
-                          ? '请到配对组管理此账户'
-                          : cycle.dirty
-                            ? '请先保存或撤销循环草稿'
-                            : '按已保存配置启动账户的全部已启用功能'
-                      }
-                      onClick={() =>
-                        void action(`/api/accounts/${account.id}/enable`)
-                      }
-                    >
-                      <CirclePlay size={16} />
-                      启动账户
-                    </Button>
-                    <Button
-                      variant="outline"
-                      disabled={busy || pairBound || !account.enabled}
-                      onClick={() =>
-                        void action(`/api/accounts/${account.id}/pause`)
-                      }
-                    >
-                      <CirclePause size={16} />
-                      暂停账户
-                    </Button>
-                    {account.status === 'attention' ? (
-                      <Button
-                        variant="outline"
-                        disabled={busy || pairBound}
-                        onClick={() =>
-                          void action(`/api/accounts/${account.id}/retry`)
-                        }
-                      >
-                        核对未完成批次
-                      </Button>
-                    ) : null}
-                  </div>
-                  {cycle.dirty ? (
-                    <p className="draft-notice amber">
-                      循环设置有未保存修改，请到「多空循环」保存或撤销。
-                    </p>
-                  ) : null}
-                </section>
-                <section className="account-strip" aria-label="账户关键数据">
-                  <dl>
-                    <div>
-                      <dt>权益 · USD1</dt>
-                      <dd>{fmt(snapshot?.equity)}</dd>
-                    </div>
-                    <div>
-                      <dt>可用 · USD1</dt>
-                      <dd>{fmt(snapshot?.available)}</dd>
-                    </div>
-                    <div>
-                      <dt
-                        title={
-                          snapshotView.fundsOnly
-                            ? '仅保证金模式只检查账户余额，不重新计算持仓占用率'
-                            : undefined
-                        }
-                      >
-                        保证金占用率{snapshotView.fundsOnly ? ' · 未采集' : ''}
-                      </dt>
-                      <dd className={marginTone}>{pct(snapshot?.ratio)}</dd>
-                    </div>
-                  </dl>
-                  <span
-                    className={`snapshot-stamp ${snapshotView.warning ? 'amber' : ''}`}
-                    title={snapshotView.notice}
-                  >
-                    {snapshot && snapshotView.elapsed !== null
-                      ? `${snapshotView.label} ${new Date(snapshot.timestamp * 1000).toLocaleString('zh-CN', { hour12: false })}${snapshotView.elapsed ? ` · ${snapshotView.elapsed}` : ''}`
-                      : snapshotView.label}
-                    {state?.demo ? ' · 模拟环境' : ''}
-                  </span>
-                </section>
-              </>
-            ) : null}
             <Tabs
               value={workspace}
               onValueChange={(value) => setWorkspace(String(value))}
@@ -395,6 +417,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 <TabsTrigger value="account">账户</TabsTrigger>
                 <TabsTrigger value="records">记录</TabsTrigger>
               </TabsList>
+              {strips}
               <TabsContent value="pairs" keepMounted>
                 <PairsWorkspace {...pairProps} />
               </TabsContent>
@@ -444,15 +467,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 />
               </TabsContent>
             </Tabs>
-            <footer className="footer">
-              <span>
-                <Bell size={13} /> {notificationOverview(state?.notification)}
-              </span>
-              <span>
-                {state?.accounts.length} 个账户 · 更新{' '}
-                {clock(state?.updated_at)}
-              </span>
-            </footer>
           </>
         ) : !needsLogin ? (
           <>
@@ -469,6 +483,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 <TabsTrigger value="pairs">配对组</TabsTrigger>
                 <TabsTrigger value="monitoring">币种监控中心</TabsTrigger>
               </TabsList>
+              {strips}
               <TabsContent value="pairs" keepMounted>
                 <PairsWorkspace {...pairProps} />
               </TabsContent>

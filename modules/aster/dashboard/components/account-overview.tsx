@@ -192,6 +192,7 @@ export function AccountOverview({
           <AccountPositionsTable
             positions={positions}
             strategy={positionStrategy}
+            stale={Boolean(positionsSnapshot) && positionsView.warning}
           />
           {!positions.length && (
             <div className="empty-state">
