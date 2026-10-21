@@ -9,6 +9,8 @@ import * as freshness from '../src/freshness.ts';
 import * as display from '../src/display.ts';
 import * as liveDisplay from '../src/live-display.ts';
 import * as liveRequests from '../src/live-requests.ts';
+import * as positionActions from '../src/position-actions.ts';
+import * as hubNavigation from '../../../server/hub-navigation.mjs';
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -41,7 +43,8 @@ function browser({ embedded = false, hidden = false, tab = 'positions' } = {}) {
     fetch(url, { signal }) { return new Promise((resolve, reject) => requests.push({ url, signal, resolve, reject })); },
   };
   const modules = { react, 'react/jsx-runtime': { jsx: () => null, jsxs: () => null }, 'lucide-react': {}, './latest-read': { createLatestRead }, './live-loading': loading,
-    './freshness': freshness, './display': display, './live-display': liveDisplay, './live-requests': liveRequests };
+    './freshness': freshness, './display': display, './live-display': liveDisplay, './live-requests': liveRequests,
+    './position-actions': positionActions, '../../../server/hub-navigation.mjs': hubNavigation };
   for (const name of ['AccountOverview', 'PortfolioPanel', 'TradingTerminal', 'ManualHedgePanel', 'SettingsForm', 'HistoryPanel', 'TradeReview']) modules[`./${name}`] = { default: () => null };
   function load(name, extension = 'ts') {
     const module = { exports: {} };
@@ -98,7 +101,7 @@ test('trusted background reads are separate from visibility and preserve old-hos
 
 test('the hidden account and settings routes keep reading only their own data and ignore stale wake responses', async () => {
   const f = browser({ hidden: true }); f.app(); f.mount(); await flush();
-  assert.deepEqual(f.requests.map(request => request.url).sort(), ['/api/bootstrap', '/api/live/instruments', '/api/state?opportunities=0']);
+  assert.deepEqual(f.requests.map(request => request.url).sort(), ['/api/bootstrap', '/api/live/instruments', '/api/state?opportunities=0&funding=1']);
   const first = f.requests.find(request => request.url.startsWith('/api/state'));
   f.respond(first, { now: Date.now(), csrfToken: 'test-token', live: {}, marker: 'background' }); await flush();
   assert.equal(f.states[1].marker, 'background');

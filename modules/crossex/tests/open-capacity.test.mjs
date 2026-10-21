@@ -245,18 +245,21 @@ test('account, settings and connection races discard late capacity reads without
   }
 });
 
-test('capacity UID merging rejects an isolated account inconsistent with a later identified cache', async t => {
+test('capacity rejects an isolated venue whose UID differs from the refresh-bound identity', async t => {
   const f = await fixture(t, { initialUid: null });
   assert.equal(f.runtime.connectionView().accountId, null);
   f.remote.account.account_mode = 'ISOLATED_EXCHANGE'; f.remote.isolatedUid = '123'; await f.sync();
+  assert.equal(f.runtime.connectionView().accountId, '123', 'Refresh binds the first observed identity');
   f.remote.isolatedUid = '999';
   let result = await f.runtime.openCapacity(pair());
   assert.equal(result.status, 'unavailable'); assert.equal(result.maxQuantity, null);
   const reads = f.remote.reads.account;
+  result = await f.runtime.openCapacity(pair());
+  assert.equal(f.remote.reads.account, reads + 2, 'Rejected venue reads are not reused');
+  assert.equal(result.status, 'unavailable', 'Every estimate rechecks the bound identity');
   f.remote.isolatedUid = '123';
   result = await f.runtime.openCapacity(pair());
-  assert.equal(f.remote.reads.account, reads, 'The second estimate reuses cached isolated snapshots');
-  assert.equal(result.status, 'unavailable', 'Cached snapshots retain UID evidence for every estimate');
+  assert.equal(result.status, 'ready');
   f.assertReadOnly();
 });
 
