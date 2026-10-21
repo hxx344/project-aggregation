@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { trustedHubOrigin, cleanHubQuery, observeNetworkActivity, hubSelectionUrl, MODULE_CAPABILITIES, hostCapabilityList, canUseHostCapability, isHubMessage, cleanPositionsRequest, parsePositionsReply, createPositionsRequester } from '../lib/hub-bridge.ts';
-import { oilSpreadPairs } from '../lib/related-pairs.ts';
+import { oilSpreadPairs, RELATED_SYMBOLS } from '../lib/related-pairs.ts';
+import { exchangeContracts } from '../lib/exchange-quotes.ts';
 
 test('bridge trusts only the exact isolated proxy hostname, matching scheme and port', () => {
   const hostname = 'p-' + 'a'.repeat(24) + '.hub.localhost';
@@ -137,4 +138,9 @@ test('oil spreads pair only one CL and one BZ position in opposite directions on
   assert.ok(venues.every(pair => !('opening' in pair)), 'unpaired venues expose no spread numbers');
   assert.equal(oilSpreadPairs([cl({ exchangeId: 'bybit' }), bz({ exchangeId: 'bybit' })], spreads)[0].current, null, 'a host exchange id takes precedence over the display name');
   assert.equal(oilSpreadPairs([cl({ entryPrice: null }), bz()], spreads)[0].opening, null, 'a missing entry price stays unknown');
+});
+
+test('related position requests cover both legs of every compared contract pair', () => {
+  for (const [market, contract] of Object.entries(exchangeContracts))
+    for (const base of [contract.leftBase, contract.rightBase]) assert.ok(RELATED_SYMBOLS[market].includes(base), `${market} requests ${base}`);
 });

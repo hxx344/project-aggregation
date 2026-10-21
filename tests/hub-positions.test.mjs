@@ -34,6 +34,10 @@ test('symbol matching only strips separators and allowed quote suffixes', () => 
   for (const symbol of ['CLOUD', 'BZX', 'CLUSDTM', 'XCLUSDT', 'CLUSDT2', 'CLEUR', 'SKHYNIX', 'CL币安USDT', 'BTCUSDT', ''])
     assert.equal(matchBase(symbol, bases), null, symbol);
   assert.equal(matchBase('CLUSD', ['CL', 'CLUSD']), 'CLUSD', 'the longest requested base wins');
+  const hynix = ['SKHY', 'SKHX', 'SKHYNIX'];
+  for (const [symbol, base] of [['SKHYUSDT', 'SKHY'], ['SKHYNIXUSDT', 'SKHYNIX'], ['SKHYNIX-USDT-SWAP', 'SKHYNIX'], ['SKHYNIX_USDT', 'SKHYNIX'], ['SKHYNIXUSD1', 'SKHYNIX'], ['SKHYUSD1', 'SKHY']])
+    assert.equal(matchBase(symbol, hynix), base, `both Hynix legs match the CEX contract names: ${symbol}`);
+  assert.equal(matchBase('CLUSD1', ['CL']), 'CL', 'Aster USD1 contracts match');
 });
 
 test('items are redacted and keep decimal strings and nulls unchanged', () => {

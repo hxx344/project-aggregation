@@ -1121,3 +1121,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **事件记录：** `binance-unicode-symbol-catalog-20261021`；实际发生日期 2026-10-21（Asia/Shanghai）；不推进全历史复盘检查点。
 
 **统一账户互斥范围补充（2026-10-21）：** 同一事件的后续，不增加事件数。`ac22920` 发布后 PM-UM/PM-CM 恢复，普通 UM/CM 仍「读取失败」；[Binance 说明](https://www.binance.com/en/support/faq/binance-portfolio-margin-api-ccf04078d7774d479f11ae15c4f56081) 写明开通统一账户后 fapi/dapi 的交易与用户数据接口受限，只能经 papi 读取。按用户选择，[仓位服务](modules/asset/lib/hub-positions.ts) 以目录 `accountMode` 判断：一种账户模式有范围读取成功、另一种从未成功时，隐藏并停止轮询后者；成功一侧转为失败即恢复显示与读取，避免长期掩盖真实故障。[服务测试](modules/asset/tests/hub-positions.test.ts) 双向覆盖隐藏、不轮询与失败恢复，并已确认在修复前代码上失败。
+
+### L071：关联持仓按币种前缀匹配时，请求列表须覆盖每个交易所的原生命名
+
+**适用条件：** Monitor 通过工作台按币种前缀（`matchBase`）筛选关联持仓，且同一标的在不同交易所使用不同币名或计价币（海力士 Hyperliquid `xyz:SKHX` 对 CEX `SKHYNIXUSDT`，Aster `USD1` 计价）。
+
+**根因：** [Monitor 请求列表](modules/monitor/lib/related-pairs.ts) 的海力士只有 Hyperliquid 命名 `SKHY`、`SKHX`；[工作台匹配](src/hub-positions.ts) 要求前缀后只剩允许的计价后缀，`SKHYNIXUSDT` 去掉 `SKHY` 余下 `NIXUSDT`，正股腿被静默丢弃，面板只剩 ADR 一条腿。`USD1` 不在后缀表内，Aster 的 `SKHYNIXUSD1`、`CLUSD1` 等持仓同样被过滤。
+
+**以后做法：** 请求列表与报价对比的合约表对齐，两腿原生币名都要列出；新增计价币先补后缀表。前缀匹配保持严格，不改成“包含”或放宽为任意后缀，避免 `SKHY` 误吞 `SKHYNIX`、`CL` 误吞 `CLOUD`。
+
+**如何验证：** [Monitor 桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 断言请求列表覆盖 `exchangeContracts` 每个市场的两腿币名；[工作台持仓测试](tests/hub-positions.test.mjs) 覆盖 `SKHYNIXUSDT`、`SKHYNIX-USDT-SWAP`、`SKHYNIX_USDT`、`USD1` 计价，并保留 `SKHYNIX` 不被 `SKHY` 匹配的反例。
+
+**证据：** project-aggregation 基线 `f8e8560`。2026-10-22 用户截图显示海力士关联交易只有 Binance `SKHYUSDT` 空单一条，实际持仓有两腿。
+
+**事件记录：** `hynix-related-leg-symbol-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；不推进全历史复盘检查点。

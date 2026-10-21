@@ -18,6 +18,7 @@ import NotificationSettings from "./notification-settings";
 import AlertSettings, { type AlertViewState } from "./alert-settings";
 import { MonitorAlertSide } from "./monitor-detail-side";
 import RelatedPositions, { type VenueSpreads } from "./related-positions";
+import { RELATED_SYMBOLS } from "../lib/related-pairs";
 import { monitorAlertAdapters, goldOilAlertId } from "../lib/monitor-alerts";
 import { GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, GOLD_OIL_VARIANTS, goldOilVariantKey, type GoldOilType, type GoldOilExchange } from '../lib/gold-oil';
 import ExchangeComparison from "./exchange-comparison";
@@ -27,7 +28,6 @@ const PerpetualPanel = lazyComponent(() => import('./perpetual-panel'), { loadin
 
 const panels = { oil: memo(OilPanel), hynix: memo(Dashboard), 'cl-xau': memo(GoldOilPanel) };
 const OilDetail = panels.oil, HynixDetail = panels.hynix;
-const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], 'cl-xau': ['XAU', 'CL', 'BZ'], hynix: ['SKHY', 'SKHX'] };
 const detailStatusLabels = { live: "实时", snapshot: "备用快照", stale: "陈旧", error: "暂不可用", loading: "获取中" } as const;
 
 const DetailStatus = memo(function DetailStatus({ summary, intervalMs, renderedAt }: { summary: MonitorSummary; intervalMs: number; renderedAt?: number }) {

@@ -2,6 +2,8 @@ import type { HubPositionItem } from './hub-bridge.ts';
 
 /** Current same-venue spread in percent, keyed by exchange id (for example `binance`). */
 export type VenueSpreads = Record<string, { premium: number | null; stale: boolean }>;
+/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. */
+export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], 'cl-xau': ['XAU', 'CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'] };
 export type UnpairedReason = 'same-side' | 'multiple' | 'missing-leg';
 export type SpreadPair =
   | { key: string; label: string; status: 'paired'; opening: number | null; current: number | null; currentStale: boolean }
