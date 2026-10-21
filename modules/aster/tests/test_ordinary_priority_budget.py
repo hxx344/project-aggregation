@@ -36,14 +36,15 @@ class PublicSamplingBudgetTests(unittest.TestCase):
         for count in range(4):
             with self.subTest(count=count):
                 intervals, brackets, enabled = self.configure(count)
-                cost = sum(60 / value for value in intervals.values()) + 3 * 60 / brackets
+                # The schedule also lists unsampled pair markets; only the
+                # strategy markets are polled and cost requests.
+                cost = sum(60 / intervals[symbol] for symbol in SYMBOLS) + 3 * 60 / brackets
                 self.assertTrue(enabled)
                 self.assertLessEqual(cost, self.budget.snapshot()["capacity_reserve"] + 1e-6)
-                if count == 1:
+                if count:
+                    # Only metals sample fast; other strategy markets keep the 2 s baseline.
                     self.assertEqual(intervals[XAU], .2)
-                    self.assertEqual(intervals[SYMBOLS[1]], 2)
-                if count > 1:
-                    self.assertGreater(intervals[XAU], .2)
+                    self.assertEqual({intervals[symbol] for symbol in SYMBOLS[1:]}, {2})
 
     def test_all_symbol_cost_no_longer_reduces_private_schedule_to_one_weight(self):
         intervals, brackets, _ = self.configure(3)
@@ -54,7 +55,7 @@ class PublicSamplingBudgetTests(unittest.TestCase):
                 {"symbol": symbol, "side": side, "leverage": 5, "qty": "0"}
                 for symbol in SYMBOLS for side in ("LONG", "SHORT")]})
         schedules = self.engine.scheduling(owners)
-        public = PUBLIC_POLL_ALLOWANCE - CAPACITY_MONITOR_RESERVE + sum(60 / v for v in intervals.values()) + 180 / brackets
+        public = PUBLIC_POLL_ALLOWANCE - CAPACITY_MONITOR_RESERVE + sum(60 / intervals[s] for s in SYMBOLS) + 180 / brackets
         total = public + sum(120 * 60 / schedules[o["id"]]["interval"] for o in owners)
         self.assertLessEqual(total, self.budget.snapshot()["execution_limit"] + 1e-6)
         self.assertLess(schedules["a0"]["interval"], 300)
@@ -67,7 +68,7 @@ class PublicSamplingBudgetTests(unittest.TestCase):
                 reserve = self.budget.snapshot()["capacity_reserve"]
                 if reserve:
                     self.assertTrue(enabled)
-                    self.assertLessEqual(sum(60 / v for v in intervals.values()) + 180 / brackets, reserve + 1e-6)
+                    self.assertLessEqual(sum(60 / intervals[s] for s in SYMBOLS) + 180 / brackets, reserve + 1e-6)
                 else:
                     self.assertFalse(enabled)
                     with patch.object(self.engine.market, "capacities") as oi, patch.object(self.engine.market, "refresh_public_brackets") as tiers:

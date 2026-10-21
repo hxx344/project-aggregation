@@ -3,15 +3,10 @@
 # test or the code, then delete the line; deploy/test-aster-python.sh and
 # deploy/test-module-units.sh then run the file and fail on an entry whose file
 # no longer exists.
-aster test_cycle_parallel_engine 1 failure: holding cycle additions in both other markets
-aster test_cycle_parallel_execution 1 failure: other ordinary positions vs volume ledger
 aster test_cycle_position_sync 16 errors: account identity changed during batch recovery
-aster test_cycle_pre_submit_optimization 1 failure: intent index and event commit before submit
 aster test_exchange_hardening 1 error: book timestamp expectation
 aster test_high_leverage_risk 3 errors: post-fill occupancy check
 aster test_leverage_selection_recovery 1 failure: unknown risk-limit recheck resends or resumes
-aster test_market_priority 2 failures: same-tier ranking before upgrade and first open
-aster test_ordinary_priority_budget 8 of 9 failures: public sampling budget
 aster test_pair_api_wait 1 error: saved snapshot timestamp
 aster test_pair_hot_races 1 failure: pending transfer completion wake-up
 aster test_pair_integration 1 failure: pause schedules recovery and serializes accounts
@@ -21,7 +16,6 @@ aster test_pair_warm_mode_recovery KeyError: 'id'
 aster test_paper_recovery 3 errors: unknown live order query
 aster test_relay_health_telemetry 1 failure: telemetry fault and recovery
 aster test_resume_strategy TypeError: commit() got an unexpected keyword argument 'user_control'
-aster test_upgrade_opening_floor 3 of 4 failures: upgrade below opening floor
 aster test_ws_market_integration hangs: no output within 300s
 crossex background-read.test.mjs require shim lacks server/hub-navigation.mjs
 crossex open-capacity.test.mjs 1 failure: isolated snapshot reuse count (6 !== 4)

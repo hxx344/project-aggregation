@@ -19,7 +19,7 @@ class UpgradeOpeningFloorTests(unittest.TestCase):
         self.f.account['policy'].update(symbols=list(SYMBOLS), min_open_leverage=10, margin_limit='0.9')
         self.f.store.save_account(self.f.account)
         self.f.broker.state['wallet'] = '100000'
-        self.f.broker.state['leverages'] = {XAU: 5, SPCX: 5, CL: 1}
+        self.f.broker.state['leverages'].update({XAU: 5, SPCX: 5, CL: 1})
         for symbol, qty, entry in ((XAU, '43.516', '4350.77'), (CL, '1.018', '98.28')):
             for side in ('LONG', 'SHORT'):
                 self.f.broker.state['positions'][symbol + ':' + side] = {'qty': qty, 'entry': entry}

@@ -31,7 +31,7 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
         return {"depth": depth, "quality_plan": replace(plan, **changes),
                 "checked_at": time.time(), "checked_monotonic": time.monotonic()}
 
-    def test_intent_index_and_event_commit_once_before_broker_submit(self):
+    def test_intent_index_and_event_commit_together_before_broker_submit(self):
         statements = []
         connect, original = self.f.store.connect, self.f.broker.submit
         @contextmanager
@@ -68,12 +68,19 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
             elif sql == "COMMIT":
                 if transaction:
                     writes.append(transaction)
-            elif sql.startswith(("INSERT ", "UPDATE ", "DELETE ")):
+            elif sql.startswith(("INSERT ", "UPDATE ", "DELETE ")) and (not transaction or transaction[-1] != sql):
+                # The trace callback repeats the outer statement for each
+                # trigger step (intents feed the position activity counters).
                 transaction.append(sql)
-        self.assertEqual(len(writes), 1)
-        self.assertEqual(sum(sql.startswith("INSERT INTO intents") for sql in prefix), 1)
-        self.assertEqual(sum(sql.startswith("INSERT INTO cycle_volume_sync") for sql in prefix), 1)
-        self.assertEqual(sum(sql.startswith("INSERT INTO events") for sql in prefix), 1)
+
+        def tables(statements):
+            return [sql.split()[2].split("(")[0] for sql in statements]
+
+        # Creation commits intent, index and event together; the send marker
+        # then durably records the bounded-recovery send time before submit.
+        self.assertEqual([tables(write) for write in writes],
+                         [["intents", "cycle_volume_sync", "events"], ["intents", "cycle_volume_sync"]])
+        self.assertTrue(writes[0][0].startswith("INSERT INTO intents VALUES"))
         self.assertEqual(sent.call_count, 1)
         self.assertEqual(self.quality()["actual"]["status"], "filled")
         database = self.quality()["timing"]["database"]

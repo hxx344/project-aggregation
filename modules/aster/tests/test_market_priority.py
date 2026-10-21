@@ -127,7 +127,7 @@ class MarketPriorityTests(unittest.TestCase):
         self.open_tick(SPCX)
 
     def test_same_target_tier_is_ranked_before_upgrade_and_first_open(self):
-        self.f.broker.state["leverages"] = dict.fromkeys(SYMBOLS, 1)
+        self.f.broker.state["leverages"].update(dict.fromkeys(SYMBOLS, 1))
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as change:
             self.engine.tick_account("test")
             change.assert_called_once_with(SPCX, 5)
@@ -161,7 +161,7 @@ class MarketPriorityTests(unittest.TestCase):
             self.open_tick(CL)
 
     def test_target_change_during_comparison_does_not_upgrade_to_an_unranked_tier(self):
-        self.f.broker.state["leverages"] = dict.fromkeys(SYMBOLS, 1)
+        self.f.broker.state["leverages"].update(dict.fromkeys(SYMBOLS, 1))
         capacity = self.engine.capacities
         reads = []
         def changed(symbol):

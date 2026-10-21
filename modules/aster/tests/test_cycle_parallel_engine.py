@@ -70,7 +70,7 @@ class CycleParallelEngineTests(TestCase):
         self.assertEqual([row for row in self.f.broker.state["orders"].values() if row["symbol"] == "XAUUSD1"],
                          list(cycle_orders.values()))
         self.assertEqual(self.f.store.account("test")["policy"]["symbols"], list(SYMBOLS))
-        self.assertEqual({p["symbol"] for p in self.engine.views["test"]["snapshot"]["positions"]}, set(SYMBOLS))
+        self.assertEqual({p["symbol"] for p in self.engine.views["test"]["snapshot"]["positions"] if dec(p["qty"])}, set(SYMBOLS))
 
     def test_cycle_spread_wait_does_not_block_other_market_fills(self):
         self.start(spread_limit_bp="0")

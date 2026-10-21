@@ -45,7 +45,7 @@ class CycleParallelExecutionTests(TestCase):
 
     def ordinary_positions(self):
         return {key: deepcopy(value) for key, value in self.f.broker.state["positions"].items()
-                if not key.startswith(CYCLE_SYMBOL + ":")}
+                if key.split(":")[0] in SYMBOLS and not key.startswith(CYCLE_SYMBOL + ":")}
 
     def test_other_ordinary_positions_survive_cycle_and_stay_out_of_volume_ledger(self):
         self.open_ordinary("SPCXUSD1")
