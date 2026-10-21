@@ -125,10 +125,12 @@ class RelayHealthTelemetryTests(unittest.TestCase):
     def test_real_telemetry_drives_fault_and_recovery_without_exchange_or_http_requests(self):
         from tests.helpers import Fixture
         from trading.engine import Engine
-        from trading.exchange import MarketData
+        from trading.exchange import MarketData, RateBudget
         fixture = Fixture()
         self.addCleanup(fixture.close)
         api = Mock()
+        # The scheduler reads the local budget; a bare Mock would record it as a call.
+        api.budget = RateBudget()
         engine = Engine(fixture.store, market=MarketData(api=api, capacity_relay=self.client))
         self.addCleanup(engine.dashboard_reports.close)
         self.client._connect = Mock(side_effect=RuntimeError("handshake failed"))

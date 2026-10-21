@@ -67,7 +67,7 @@ class PairReviewTests(TestCase):
     def test_revoked_leverage_confirmation_preserves_pending(self):
         state = runtime_default()
         _, _, identities = self.trader._members(self.pair)
-        pending = {"kind": "leverage", "identities": identities,
+        pending = {"id": "revoked-leverage", "kind": "leverage", "identities": identities,
                    "before": {"LONG": "0", "SHORT": "0"}, "target_leverage": 5,
                    "previous_leverage": 2, "results": {}}
         state["pending"] = pending

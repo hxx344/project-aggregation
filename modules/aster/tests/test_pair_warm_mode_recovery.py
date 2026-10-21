@@ -140,7 +140,7 @@ class PairWarmModeRecoveryTests(TestCase):
     def test_leverage_confirmation_still_forces_fresh_modes(self):
         self.warm()
         state = runtime_default()
-        state["pending"] = {"kind": "leverage", "before": {"LONG": "0", "SHORT": "0"},
+        state["pending"] = {"id": "warm-leverage", "kind": "leverage", "before": {"LONG": "0", "SHORT": "0"},
                             "target_leverage": 5, "previous_leverage": 2, "results": {}}
         self.trader._recover_leverage(self.pair, state, self.brokers)
         self.assertIsNone(state["pending"])

@@ -65,9 +65,9 @@ class ResumeStrategyTests(unittest.TestCase):
         before = copy.deepcopy(self.engine.views["test"])
         save = self.f.store.save_account
 
-        def commit(value):
+        def commit(value, **kwargs):
             self.assertEqual(self.engine.views["test"], before)
-            return save(value)
+            return save(value, **kwargs)
 
         with patch.object(self.f.store, "save_account", side_effect=commit):
             self.engine.enable("test", True)

@@ -98,20 +98,23 @@ class PairAPIWaitTests(TestCase):
         self.assertIsNone(state["pending"])
         self.assertNotIn("retry_after", state)
 
-    def test_new_snapshots_are_published_before_slow_balance_preparation(self):
+    def test_margin_balance_runs_before_strategy_snapshots_without_reusing_them(self):
+        # Margin balancing is independent of the strategy (40bdb6a): it runs
+        # first, with its own reads, before any strategy snapshot is taken.
         self.ordinary()
         self.pair["margin"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
+        seen = []
 
         def balance(pair, snapshots, **kwargs):
-            saved = self.store.get("pair_runtime:gold")
-            for side in ("long", "short"):
-                self.assertEqual(saved["snapshots"][side]["timestamp"], snapshots[side].timestamp)
+            seen.append((dict(snapshots), (self.store.get("pair_runtime:gold") or {}).get("snapshots")))
             return {"blocks_trading": False}
 
         with patch("trading.margin_balance.MarginBalancer.tick", side_effect=balance):
             state = self.tick()
+        self.assertEqual(seen, [({}, None)])
         self.assertIsNone(state["pending"])
+        self.assertEqual(set(state["snapshots"]), {"long", "short"})
 
     def test_safe_wait_classification_does_not_copy_unrelated_remote_error(self):
         self.assertIsNone(api_wait_notice(ExchangeError("untrusted secret=plaintext", code=-2019)))

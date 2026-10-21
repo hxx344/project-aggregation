@@ -357,7 +357,10 @@ class QuoteHardeningTests(unittest.TestCase):
 
     def test_exact_freshness_boundaries_and_oldest_timestamp_are_preserved(self):
         for bid, mark in ((97000, 101000), (101000, 97000), (100000, 100000)):
-            with self.subTest(bid=bid, mark=mark), patch("trading.exchange.time.time", return_value=100):
+            # A mark exactly 3 s old expires at the monotonic reading taken with
+            # it, so a clock that advances during the BBO read would reject it.
+            with self.subTest(bid=bid, mark=mark), patch("trading.exchange.time.time", return_value=100), \
+                 patch("trading.exchange.time.monotonic", return_value=1000.0):
                 market = self.market(bid, mark)
                 self.assertEqual(market.book("XAUUSD1").timestamp, min(bid, mark) / 1000)
                 self.assertEqual([call[1] for call in market.api.calls],
