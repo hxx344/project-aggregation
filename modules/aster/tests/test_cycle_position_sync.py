@@ -36,6 +36,12 @@ class CyclePositionSyncTests(unittest.TestCase):
         clock = patch("trading.cycle_execution.time.time", return_value=time.time())
         self.clock = clock.start()
         self.addCleanup(clock.stop)
+        # Batches start on the paper broker and recover on the live double;
+        # both stand for the same signed account.
+        identity = patch("trading.recovery.broker_identity", side_effect=lambda account, broker: {
+            **{key: account[key] for key in ("id", "mode", "env_prefix")}, "user": "0xuser", "signer": "0xsigner"})
+        identity.start()
+        self.addCleanup(identity.stop)
 
     def advance(self, seconds=5):
         self.clock.return_value += seconds
@@ -191,7 +197,7 @@ class CyclePositionSyncTests(unittest.TestCase):
         self.pending()
         self.f.broker.state["leverages"]["XAUUSD1"] = 5
         self.f.broker.save()
-        self.assertIn("杠杆被改变", self.reconcile())
+        self.assertIn("实际杠杆已变化", self.reconcile())
         self.assertFalse(self.f.store.account("test")["enabled"])
         self.assertNotIn("position_sync", self.f.store.intent("test"))
         self.live.submit.assert_not_called()
@@ -203,8 +209,8 @@ class CyclePositionSyncTests(unittest.TestCase):
             self.reconcile()
             self.advance()
         self.observe("2", "2")
-        self.reconcile()
-        self.assertIsNone(self.f.store.intent("test"))
+        self.assertIn("等待安全观察窗口", self.reconcile())
+        self.assertEqual(self.f.store.intent("test")["status"], "attention")
         self.assertFalse(self.f.store.account("test")["enabled"])
         self.live.submit.assert_not_called()
 

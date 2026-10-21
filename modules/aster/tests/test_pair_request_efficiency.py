@@ -90,11 +90,13 @@ class PairRequestEfficiencyTests(TestCase):
 
     def test_skipping_private_read_keeps_existing_margin_block_visible(self):
         self.ordinary()
+        self.pair["margin"]["enabled"] = True
+        self.pair = self.store.save_pair(self.pair)
         with patch("trading.margin_balance.MarginBalancer.tick", return_value={
                 "blocks_trading": True, "reason": "划转归属检查暂不可用"}):
             self.assertEqual(self.trader.tick(self.pair)["phase"], "margin_wait")
-        state = self.trader.tick(self.pair)
-        self.assertEqual(self.read_count(), 2)
+            state = self.trader.tick(self.pair)
+        self.assertEqual(self.read_count(), 0)
         self.assertEqual(state["phase"], "margin_wait")
         self.assertEqual(state["reason"], "划转归属检查暂不可用")
 

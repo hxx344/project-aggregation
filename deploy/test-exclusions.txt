@@ -3,11 +3,5 @@
 # test or the code, then delete the line; deploy/test-aster-python.sh and
 # deploy/test-module-units.sh then run the file and fail on an entry whose file
 # no longer exists.
-aster test_cycle_position_sync 16 errors: account identity changed during batch recovery
-aster test_high_leverage_risk 3 errors: post-fill occupancy check
-aster test_leverage_selection_recovery 1 failure: unknown risk-limit recheck resends or resumes
 aster test_pair_hot_races 1 failure: pending transfer completion wake-up
-aster test_pair_integration 1 failure: pause schedules recovery and serializes accounts
-aster test_pair_request_efficiency 1 failure: skipped private read hides margin block
 aster test_pair_review terminal recovery after one lagging position read never completes the batch (dc87ff8)
-aster test_paper_recovery 3 errors: unknown live order query

@@ -146,7 +146,10 @@ class PairIntegrationTests(unittest.TestCase):
         guard = threading.Lock()
 
         class Trader:
-            def tick(inner, pair):
+            def margin_tick(inner, pair):
+                return {}
+
+            def tick(inner, pair, *, margin_result=None):
                 nonlocal concurrent, maximum
                 with guard:
                     concurrent += 1

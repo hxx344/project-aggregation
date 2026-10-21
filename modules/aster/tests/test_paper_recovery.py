@@ -184,7 +184,7 @@ class PaperRecoveryTests(unittest.TestCase):
         for error in (ExchangeError("not yet visible", code=-2013), RequestNotSent("query budget unavailable")):
             with self.subTest(error=error):
                 fixture = self.fixture()
-                broker = LiveBroker({}, fixture.market, api=SimpleNamespace(budget=None))
+                broker = LiveBroker({}, fixture.market, api=SimpleNamespace(budget=None, credentials={"user": "0xUser", "signer": "0xSigner"}))
                 executor = Executor(fixture.store, broker, fixture.market)
                 with patch.object(broker, "snapshot", side_effect=fixture.broker.snapshot), \
                      patch.object(broker, "submit", side_effect=AmbiguousOrder("response lost")) as submit, \
@@ -199,7 +199,7 @@ class PaperRecoveryTests(unittest.TestCase):
 
     def test_live_unconfirmed_leverage_remains_pending_without_resubmission(self):
         fixture = self.fixture()
-        broker = LiveBroker({}, fixture.market, api=SimpleNamespace(budget=None))
+        broker = LiveBroker({}, fixture.market, api=SimpleNamespace(budget=None, credentials={"user": "0xUser", "signer": "0xSigner"}))
         executor = Executor(fixture.store, broker, fixture.market)
         with patch.object(broker, "snapshot", side_effect=fixture.broker.snapshot), \
              patch.object(broker, "set_leverage", side_effect=AmbiguousOrder("change response lost")) as change:

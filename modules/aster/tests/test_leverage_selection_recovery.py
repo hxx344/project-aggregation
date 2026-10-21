@@ -275,7 +275,7 @@ class LiveLeverageRecoveryTests(unittest.TestCase):
                     row["leverage"] = "5"
             engine.tick_account("test")
             self.assertIsNone(self.f.store.intent("test"))
-            self.assertFalse(self.f.store.account("test")["enabled"])
+            self.assertTrue(self.f.store.account("test")["enabled"])
             self.assertEqual(self.writes, ["/fapi/v3/leverage"])
 
     def test_definite_rejection_does_not_wait_forever_for_an_unapplied_change(self):

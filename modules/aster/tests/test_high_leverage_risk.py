@@ -211,6 +211,10 @@ class HighLeverageRiskTests(unittest.TestCase):
                                ({"symbol": "SPCXUSD1", "leverage": 10}, 5),
                                ({"symbol": "SPCXUSD1", "leverage": 10}, 15)):
             with self.subTest(marker=marker, actual=actual):
+                # Each case pauses the account; start the next one enabled.
+                current = {**self.f.store.account("test"), "enabled": True}
+                current.pop("pause_reason", None)
+                self.f.store.save_account(current)
                 snapshot = self.snapshot()
                 for position in snapshot.pair("XAUUSD1"):
                     position.qty = dec(460)
