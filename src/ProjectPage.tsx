@@ -6,11 +6,15 @@ import DiagnosticDetails from './DiagnosticDetails';
 import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
+import { createPositionsSource, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest } from './hub-positions';
 
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
+const HOST_CAPABILITIES = ['activity', 'navigate', 'changed'];
+// Single release switch for the Monitor positions bridge: false declares neither capability and ignores both messages.
+const POSITIONS_BRIDGE_ENABLED = true;
 
-export default function ProjectPage({ project, snapshot, now, active, backgroundUpdates = true, query, onEdit, onExpired, onStatus, onChanged, onNavigate }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; backgroundUpdates?: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void }) {
+export default function ProjectPage({ project, snapshot, now, active, backgroundUpdates = true, query, onEdit, onExpired, onStatus, onChanged, onNavigate, onOpenTrading }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; backgroundUpdates?: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void; onOpenTrading?: () => void }) {
   const proxied = project.accessMode === 'proxy';
   const embedded = proxied || project.mode === 'embed';
   const accessible = project.enabled && !!(proxied ? project.apiUrl : project.url);
@@ -26,8 +30,15 @@ export default function ProjectPage({ project, snapshot, now, active, background
   const connected = useRef(false);
   const acknowledged = useRef(false);
   const sentNavigation = useRef('');
-  const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate });
-  latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate };
+  // Only Monitor may read account positions through the host; other modules never see the capability.
+  const positionsBridge = POSITIONS_BRIDGE_ENABLED && project.id === 'monitor';
+  const hostCapabilities = positionsBridge ? [...HOST_CAPABILITIES, ...POSITIONS_CAPABILITIES] : HOST_CAPABILITIES;
+  const moduleCapabilities = useRef<string[]>([]);
+  // Advances whenever the iframe document may have changed, so late replies never reach a newer document.
+  const documentGeneration = useRef(0);
+  const positions = useRef<ReturnType<typeof createPositionsSource> | null>(null);
+  const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading });
+  latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading };
   const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
   function synchronize() {
     if (!connected.current) return;
@@ -52,21 +63,35 @@ export default function ProjectPage({ project, snapshot, now, active, background
         // A new document can probe before its load event. Answer again after a
         // previous connection, without looping with unsupported legacy peers.
         const acknowledge = !acknowledged.current || (!supportsActivity && connected.current);
-        if (!supportsActivity) { connected.current = false; sentNavigation.current = ''; setBridgeReady(false); }
-        if (acknowledge) { acknowledged.current = true; post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] }); }
+        if (!supportsActivity) { connected.current = false; sentNavigation.current = ''; moduleCapabilities.current = []; setBridgeReady(false); }
+        if (acknowledge) { acknowledged.current = true; post({ type: 'ready', role: 'host', capabilities: hostCapabilities }); }
         if (!supportsActivity) return;
+        moduleCapabilities.current = hostCapabilities.filter(value => (data.capabilities as unknown[]).includes(value));
         connected.current = true; setBridgeReady(true); setLoading(false);
         setError(value => value === PAGE_LOAD_TIMEOUT ? '' : value); latest.current.onStatus('ready');
         synchronize();
       } else if (connected.current && data.type === 'changed' && data.scope === 'summary') latest.current.onChanged();
       else if (connected.current && latest.current.active && document.visibilityState === 'visible' && data.type === 'navigate') {
         const target = navigation(data); if (target) latest.current.onNavigate(target.projectId, target.query);
+      } else if (positionsBridge && connected.current && data.type === 'positions-request' && moduleCapabilities.current.includes('positions')) {
+        const request = positionsRequest(data); if (!request) return;
+        const generation = documentGeneration.current;
+        // Background reads are only for the visible page; hidden pages get the cache or 'unavailable'.
+        // A 401 here is a background helper failure: answer the module, never expire the hub session.
+        positions.current ??= createPositionsSource(signal => api('/api/trading/positions', { signal, timeoutMs: POSITIONS_TIMEOUT_MS }));
+        void positions.current.read(latest.current.active && document.visibilityState === 'visible').then(outcome => {
+          if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('positions')) return;
+          post(positionsReply(request, outcome, Date.now()));
+        });
+      } else if (positionsBridge && connected.current && latest.current.active && document.visibilityState === 'visible' && data.type === 'open-trading' && moduleCapabilities.current.includes('open-trading')) {
+        if (openTradingRequest(data)) latest.current.onOpenTrading?.();
       }
     }
     window.addEventListener('message', message); document.addEventListener('visibilitychange', synchronize);
     return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
   useEffect(synchronize, [active, backgroundUpdates, query, source]);
+  useEffect(() => () => { positions.current?.dispose(); positions.current = null; }, []);
 
   useEffect(() => {
     const pending = pendingTabs.current;
@@ -76,7 +101,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
   useEffect(() => {
     if (!accessible || !embedded) { latest.current.onStatus('unsupported'); return; }
     const controller = new AbortController();
-    connected.current = false; acknowledged.current = false; sentNavigation.current = ''; setDocumentLoad(0); setBridgeReady(false); latest.current.onStatus('loading');
+    connected.current = false; acknowledged.current = false; sentNavigation.current = ''; moduleCapabilities.current = []; documentGeneration.current++; setDocumentLoad(0); setBridgeReady(false); latest.current.onStatus('loading');
     setSource(null); setError(''); setLoading(true);
     const request = proxied
       ? api<{ url: string }>(`/api/projects/${encodeURIComponent(project.id)}/launch`, { method: 'POST', signal: controller.signal })
@@ -111,9 +136,9 @@ export default function ProjectPage({ project, snapshot, now, active, background
     setLoading(false); setDocumentLoad(value => value + 1);
     // WindowProxy survives iframe navigation: revalidate this document even
     // when an earlier document (or its ready-before-load event) was connected.
-    connected.current = false; acknowledged.current = false; sentNavigation.current = ''; setBridgeReady(false);
+    connected.current = false; acknowledged.current = false; sentNavigation.current = ''; moduleCapabilities.current = []; documentGeneration.current++; setBridgeReady(false);
     setError(value => value === PAGE_LOAD_TIMEOUT ? '' : value);
-    post({ type: 'ready', role: 'host', capabilities: ['activity', 'navigate', 'changed'] });
+    post({ type: 'ready', role: 'host', capabilities: hostCapabilities });
   }
 
   async function openInTab() {
