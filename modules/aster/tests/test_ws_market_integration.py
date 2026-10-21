@@ -254,21 +254,34 @@ class WSStreamLifecycleTests(unittest.TestCase):
         self.market.rules = self.f.market.rules
         self.engine = Engine(self.f.store, market=self.market)
 
-    def test_scheduler_starts_stream_before_loading_rules_and_closes_all_resources_on_failure(self):
-        events = []
+    def test_scheduler_starts_stream_before_loading_rules_and_keeps_running_after_a_rules_failure(self):
+        # Rules load in a retried worker job (40bdb6a), so a failure no longer
+        # ends the scheduler; stopping it still closes every resource in order.
+        events, attempted = [], threading.Event()
         self.stream.start.side_effect = lambda: events.append("stream.start")
         self.stream.close.side_effect = lambda: events.append("stream.close")
         self.api.close.side_effect = lambda: events.append("api.close")
 
         def load_rules():
             events.append("rules")
+            attempted.set()
             raise RuntimeError("simulated scheduler failure")
 
         with patch.object(self.market, "load_rules", side_effect=load_rules), \
-             self.assertLogs("aster.trading", level="ERROR"):
-            self.engine.run()
+             patch.object(self.engine, "notify", return_value=60), \
+             self.assertLogs("aster.trading", level="ERROR") as log:
+            self.engine.start()
+            try:
+                self.assertTrue(attempted.wait(2))
+                deadline = time.monotonic() + 2
+                while not log.output and time.monotonic() < deadline:
+                    time.sleep(.005)
+                self.assertTrue(self.engine.thread.is_alive())
+                self.assertFalse(self.engine.ready)
+            finally:
+                self.engine.stop()
+        self.assertFalse(self.engine.thread.is_alive())
         self.assertEqual(events, ["stream.start", "rules", "stream.close", "api.close"])
-        self.assertFalse(self.engine.ready)
         self.assertTrue(self.engine.shutdown.is_set())
 
     def test_failing_broker_and_stream_close_do_not_prevent_other_resource_cleanup(self):
@@ -277,9 +290,20 @@ class WSStreamLifecycleTests(unittest.TestCase):
         self.stream.close.side_effect = RuntimeError("private websocket diagnostic")
         self.api.close.side_effect = RuntimeError("private HTTP diagnostic")
         self.engine.brokers = {"first": first, "second": second}
-        with patch.object(self.market, "load_rules", side_effect=RuntimeError("private scheduler diagnostic")), \
+        attempted = threading.Event()
+
+        def load_rules():
+            attempted.set()
+            raise RuntimeError("private scheduler diagnostic")
+
+        with patch.object(self.market, "load_rules", side_effect=load_rules), \
+             patch.object(self.engine, "notify", return_value=60), \
              self.assertLogs("aster.trading", level="ERROR") as log:
-            self.engine.run()
+            self.engine.start()
+            try:
+                self.assertTrue(attempted.wait(2))
+            finally:
+                self.engine.stop()
         for client in (first, second, self.stream, self.api):
             client.close.assert_called_once_with()
         self.assertNotIn("private", self.engine.error + " ".join(log.output))

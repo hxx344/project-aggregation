@@ -16,6 +16,5 @@ aster test_pair_warm_mode_recovery KeyError: 'id'
 aster test_paper_recovery 3 errors: unknown live order query
 aster test_relay_health_telemetry 1 failure: telemetry fault and recovery
 aster test_resume_strategy TypeError: commit() got an unexpected keyword argument 'user_control'
-aster test_ws_market_integration hangs: no output within 300s
 crossex background-read.test.mjs require shim lacks server/hub-navigation.mjs
 crossex open-capacity.test.mjs 1 failure: isolated snapshot reuse count (6 !== 4)
