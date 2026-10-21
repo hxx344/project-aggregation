@@ -81,4 +81,6 @@ export const liveStatus = (status: string) => ({
 
 export const sideLabel = (side: string) => ({ long: '做多', short: '做空', buy: '买入', sell: '卖出', none: '单向持仓', unknown: '方向未知' }[side.toLowerCase()] || side);
 export const executionStatus = (state: string) => state.toLowerCase() === 'partial' ? '部分成交，需处理敞口' : liveStatus(state);
+const TERMINAL_ORDER_STATUSES = new Set(['FILLED', 'CANCELLED', 'CANCELED', 'FAIL', 'REJECT', 'REJECTED', 'EXPIRED']);
+export const orderIsTerminal = (status: string) => TERMINAL_ORDER_STATUSES.has(status.toUpperCase());
 export const stateIsUncertain = (state: string) => ['UNKNOWN', 'SENDING', 'SUBMITTING', 'CANCEL_PENDING', 'RECONCILING', 'INVALID'].includes(state.toUpperCase());

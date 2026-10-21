@@ -118,7 +118,7 @@ async (page) => {
     await page.goto(`${origin}/?view=project&id=crossex`);
     const iframe = page.locator('iframe[title="Gate CrossEx模块"]');
     await iframe.waitFor();
-    await page.frameLocator('iframe[title="Gate CrossEx模块"]').getByRole('heading', { name: '投资组合', exact: true }).waitFor();
+    await page.frameLocator('iframe[title="Gate CrossEx模块"]').getByRole('heading', { name: '持仓', exact: true }).waitFor();
     const frame = page.frames().find(item => item.url().startsWith(moduleOrigin));
     assert(frame, 'the real CrossEx build is loaded inside the Hub iframe');
     const module = frame;

@@ -104,7 +104,7 @@ async (page) => {
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.goto(`${origin}/?view=project&id=crossex`);
     const iframe = page.locator('iframe[title="Gate CrossEx模块"]'); await iframe.waitFor();
-    await page.frameLocator('iframe[title="Gate CrossEx模块"]').getByRole('heading', { name: '投资组合', exact: true }).waitFor();
+    await page.frameLocator('iframe[title="Gate CrossEx模块"]').getByRole('heading', { name: '持仓', exact: true }).waitFor();
     const module = page.frames().find(f => f.url().startsWith(moduleOrigin)); assert(module, 'real Hub embedded entry loads CrossEx');
     const group = module.locator('.position-group').filter({ has: module.locator('.group-identity').filter({ hasText: 'BTC' }) });
     const addButton = group.getByRole('button', { name: 'BTC 加仓', exact: true });
@@ -113,7 +113,7 @@ async (page) => {
       const response = page.waitForResponse(r => r.url().startsWith(`${moduleOrigin}/api/state`));
       await module.getByRole('button', { name: '刷新页面状态', exact: true }).click(); await (await response).finished();
     };
-    const toPositions = async () => { await module.getByRole('button', { name: '投资组合', exact: true }).click(); await addButton.waitFor(); };
+    const toPositions = async () => { await module.getByRole('button', { name: '持仓', exact: true }).click(); await addButton.waitFor(); };
     const setQuantities = async (long, short) => { held[0].quantity = held[0].baseQuantity = long; held[1].quantity = held[1].baseQuantity = short; await refresh(); };
     const dialog = name => module.getByRole('dialog', { name, exact: true });
     assert(await addButton.isEnabled(), 'equal pair can be increased');
@@ -144,7 +144,7 @@ async (page) => {
     const review = module.getByRole('dialog');
     assert((await review.innerText()).includes('IOC'), 'review discloses the protected immediate-or-cancel orders');
     await review.getByRole('checkbox').check(); await review.getByRole('button', { name: '确认实盘下单', exact: true }).click();
-    await module.getByRole('heading', { name: '订单与操作记录', exact: true }).waitFor();
+    await module.getByRole('heading', { name: '订单查询与撤单', exact: true }).waitFor();
     assert(confirmations.length === 1 && held.every(p => p.baseQuantity === '1.2'), 'one confirmation updates both held quantities');
     await toPositions();
     await setQuantities('1.2', '1');
@@ -179,7 +179,7 @@ async (page) => {
     assert(previews.at(-1).targetQuantity === '1.1' && mixed.legs.length === 2 && mixed.legs[0].reduceOnly && !mixed.legs[1].reduceOnly, 'one target preview shows reduction before increase');
     await module.getByRole('dialog').getByRole('checkbox').check();
     await module.getByRole('button', { name: '确认实盘下单', exact: true }).click();
-    await module.getByRole('heading', { name: '订单与操作记录', exact: true }).waitFor();
+    await module.getByRole('heading', { name: '订单查询与撤单', exact: true }).waitFor();
     assert(held.every(p => p.baseQuantity === '1.1') && confirmations.length === 2, 'mixed target refreshes actual resulting quantities');
     await page.setViewportSize({ width: 1440, height: 1000 }); await toPositions();
     paused = true; await setQuantities('1.2', '1'); await balanceButton.click(); picker = dialog('BTC · 平衡双腿数量');

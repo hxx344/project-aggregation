@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { LiveOrder, LiveView } from './live-types';
-import { executionStatus, liveStatus, sideLabel } from './live-display';
+import { executionStatus, liveStatus, orderIsTerminal, sideLabel } from './live-display';
 import DecimalValue from './DecimalValue';
 import { time, venue } from './display';
 
@@ -8,8 +8,7 @@ export default function HistoryPanel({ live, disabled, querying, query, cancel }
   live: LiveView; disabled: boolean; querying: boolean; query: () => void; cancel: (order: LiveOrder) => void;
 }) {
   const [showClosed, setShowClosed] = useState(false);
-  const terminal = new Set(['FILLED', 'CANCELLED', 'CANCELED', 'FAIL', 'REJECT', 'REJECTED', 'EXPIRED']);
-  const orders = live.orders.filter(order => showClosed || !terminal.has(order.status.toUpperCase())).slice(0, 150);
+  const orders = live.orders.filter(order => showClosed || !orderIsTerminal(order.status)).slice(0, 150);
   return <div className="order-panels">
     <section className="panel">
       <div className="section-heading"><div><h2>订单查询与撤单</h2><p>来源时间 {time(live.asOf)} · 状态以交易所最新查询为准</p></div><div className="filters"><label className="check"><input type="checkbox" checked={showClosed} onChange={e => setShowClosed(e.target.checked)}/>显示已结束订单</label><button disabled={querying || !live.connection.configured} onClick={query}>{querying ? '正在查询…' : '查询最新状态'}</button></div></div>

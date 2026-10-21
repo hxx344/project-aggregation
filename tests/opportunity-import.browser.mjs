@@ -119,6 +119,8 @@ async page => {
         if (path === '/api/overview') return send(overview);
         if (path === '/api/system/updates') return send(updates);
         if (path === '/api/health') return send({ status: 'ok' });
+        // Monitor's related-positions panel reads through the Hub; no held positions in this fixture.
+        if (path === '/api/trading/positions') return send({ generatedAt: new Date().toISOString(), sources: [] });
       }
     } else if (url.origin === monitorOrigin) {
       if (method === 'GET') {
@@ -353,7 +355,7 @@ async page => {
       location.reload();
     });
     await crossexFrame.getByText(/存在结果待确认的操作，新的交易暂不可用/).waitFor();
-    await crossexFrame.getByRole('button', { name: '跨所对冲', exact: true }).click();
+    await crossexFrame.getByRole('button', { name: '对冲', exact: true }).click();
     await expectPair(code('binance', 'BTC', 'USDT'), code('gate', 'BTC', 'USDT'));
     await quantity().fill('0.4');
     await goMonitor();

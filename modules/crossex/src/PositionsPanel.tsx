@@ -5,7 +5,7 @@ import type { CloseLeg, Instrument, LivePosition, LiveView, PositionFundingRate 
 import { amountClass, liquidationPrice, positiveQuantity, sideLabel } from './live-display';
 import DecimalValue from './DecimalValue';
 import AdlIndicator from './AdlIndicator';
-import { fractionQuantity, groupPositions } from './position-view';
+import { fractionQuantity, groupPositions, percentage } from './position-view';
 import type { CurrencyAmount } from './position-view';
 import type { FundingOpportunity } from './funding-opportunities';
 import { PositionMetricsSummary, PositionMetricsDetails } from './PositionMetrics';
@@ -16,18 +16,25 @@ import PositionActionDialog from './PositionActionDialog';
 import type { PositionActionProps, PositionActionSelection } from './PositionActionDialog';
 import { legQuantityDiff } from './position-actions';
 
+const COLUMNS = 11;
+type GroupFilter = 'all' | 'hedge' | 'single';
+const filterLabels: [GroupFilter, string][] = [['all', '全部'], ['hedge', '对冲组'], ['single', '单腿']];
+const sideMark = (side: string) => side.toUpperCase() === 'LONG' ? '多' : side.toUpperCase() === 'SHORT' ? '空' : null;
+
 export default function PositionsPanel({ live, instruments, disabled, close, now, fundingOpportunities, positionFundingRates, marketStale, ...actionProps }: PositionActionProps & {
   live: LiveView; instruments: Instrument[]; disabled: boolean; close: (positions: CloseLeg[]) => Promise<boolean>;
   now: number; positionFundingRates?: PositionFundingRate[]; fundingOpportunities: FundingOpportunity[]; marketStale: boolean;
 }) {
-  const [search, setSearch] = useState(''), [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState(''), [expanded, setExpanded] = useState<Set<string>>(new Set()), [filter, setFilter] = useState<GroupFilter>('all');
   const [closing, setClosing] = useState<LivePosition[] | null>(null), [page, setPage] = useState(0);
   const [action, setAction] = useState<PositionActionSelection | null>(null);
   const stale = live.stale || !live.connection.connected || !live.asOf || now - live.asOf > 15_000 || live.asOf > now + 1000;
   const scope = JSON.stringify([live.connection.accountId, live.connection.version]);
   useEffect(() => { setClosing(null); }, [scope]);
   const allGroups = useMemo(() => groupPositions(live.positions, { now, fundingOpportunities, positionFundingRates, marketStale, stale, partial: live.partial }), [live.positions, now, fundingOpportunities, positionFundingRates, marketStale, stale, live.partial]);
-  const groups = useMemo(() => allGroups.filter(group => `${group.base} ${group.legs.map(p => p.exchange + ' ' + p.symbol).join(' ')}`.toUpperCase().includes(search.trim().toUpperCase())), [allGroups, search]);
+  const filterCounts = { all: allGroups.length, hedge: allGroups.filter(group => group.legs.length > 1).length, single: allGroups.filter(group => group.legs.length === 1).length };
+  const groups = useMemo(() => allGroups.filter(group => (filter === 'all' || (filter === 'hedge') === (group.legs.length > 1))
+    && `${group.base} ${group.legs.map(p => p.exchange + ' ' + p.symbol).join(' ')}`.toUpperCase().includes(search.trim().toUpperCase())), [allGroups, search, filter]);
   const [history, setHistory] = useState<PositionHistoryState | null>(null);
   useEffect(() => {
     setHistory(previous => updatePositionHistory(previous, allGroups, { scope, at: live.asOf, now, stale, partial: live.partial }));
@@ -35,28 +42,52 @@ export default function PositionsPanel({ live, instruments, disabled, close, now
   const pages = Math.max(1, Math.ceil(groups.length / 20)), shownPage = Math.min(page, pages - 1), shown = groups.slice(shownPage * 20, (shownPage + 1) * 20);
   const toggle = (base: string) => setExpanded(previous => { const next = new Set(previous); if (next.has(base)) next.delete(base); else next.add(base); return next; });
   const actionDisabled = disabled || stale || live.partial || !!closing || !!action;
+  const legFunding = (p: LivePosition) => positionFundingRates?.find(rate => rate.exchange === p.exchange && rate.symbol === p.symbol && rate.expiresAt > now) || null;
   return <section className="panel positions-panel">
-    <div className="section-heading"><div><h2>持仓组合 <span className="count">{groups.length}</span></h2><p>{live.positions.length} 条真实持仓腿 · 点击币种展开价差、资金费与单腿风险</p></div><label className="search-field"><Search size={14}/><input aria-label="搜索持仓币种或交易所" placeholder="搜索币种 / 交易所" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}/></label></div>
+    <div className="section-heading panel-h"><h2>持仓</h2><div className="seg" role="group" aria-label="持仓类型">{filterLabels.map(([id, label]) => <button key={id} className={filter === id ? 'on' : ''} aria-pressed={filter === id} onClick={() => { setFilter(id); setPage(0); }}>{label}<span className="count">{filterCounts[id]}</span></button>)}</div>
+      <label className="search-field"><Search size={14}/><input aria-label="搜索持仓币种或交易所" placeholder="搜索币种 / 交易所" value={search} onChange={e => { setSearch(e.target.value); setPage(0); }}/></label></div>
     {live.partial && <p className="inline-state warning">持仓数据不完整，保留已知仓位；汇总可能不完整，暂不可交易。</p>}
-    {shown.length ? <div className="position-groups"><div className="group-columns"><span>币种 / 交易所</span><span>净数量 / 总名义额</span><span>加权开仓 / 标记价</span><span>未实现盈亏</span><span>已实现 / 资金费</span><span>操作</span></div>{shown.map(group => <article className={'position-group ' + (expanded.has(group.base) ? 'expanded' : '')} key={group.base}>
-      <div className="group-row"><button className="group-identity" onClick={() => toggle(group.base)} aria-expanded={expanded.has(group.base)} aria-label={`${expanded.has(group.base) ? '收起' : '展开'} ${group.base} 持仓`}>
-        {expanded.has(group.base) ? <ChevronDown size={15}/> : <ChevronRight size={15}/>}<span className="coin-icon">{group.base.slice(0, 1)}</span><span><strong>{group.base}<em>{group.legs.length} 腿</em></strong><small>{Array.from(new Set(group.legs.map(p => venue(p.exchange)))).join(' / ')}</small></span>
-      </button><div data-label="净数量 / 总名义额"><strong className={amountClass(group.net)}><DecimalValue value={group.net} signed/> <small>{group.base}</small></strong><NativeValues values={group.notional}/></div>
-      <div data-label="加权开仓 / 标记价"><strong><DecimalValue value={group.entry?.value} kind="price"/> <small>{group.entry?.currency}</small></strong><small><DecimalValue value={group.mark?.value} kind="price"/> {group.mark?.currency}</small></div>
-      <div data-label="未实现盈亏"><NativeValues values={group.pnl} signed/></div><div data-label="已实现 / 资金费"><NativeValues values={group.realized} signed/><NativeValues values={group.funding} signed subtle/></div>
-      <div className="group-actions"><button className="danger-quiet" disabled={disabled || !!action || group.legs.length > 16} onClick={() => setClosing(group.legs)}>平仓组合</button><button className="primary-quiet" aria-label={`${group.base} 加仓`} title={!group.metrics.applicable ? '加仓需要严格等量且有效的双腿组合' : actionProps.entryPaused ? '新开仓已暂停' : actionProps.catalogError || '双腿等量加仓'} disabled={actionDisabled || actionProps.entryPaused || !!actionProps.catalogError || !group.metrics.applicable || !legQuantityDiff(group.legs).equal} onClick={() => setAction({ action: 'add', group, connectionVersion: live.connection.version, accountId: live.connection.accountId })}>加仓</button><button className="secondary-quiet" aria-label={`${group.base} 平衡双腿`} title={legQuantityDiff(group.legs).problem || '数量差异超过双腿均值的 0.1% 时可平衡'} disabled={actionDisabled || !legQuantityDiff(group.legs).needsBalance} onClick={() => setAction({ action: 'balance', group, connectionVersion: live.connection.version, accountId: live.connection.accountId })}>平衡双腿</button>{group.legs.length > 16 && <small>每次最多 16 腿，请逐腿操作</small>}</div></div>
-      <PositionMetricsSummary group={group} stale={stale || live.partial}/>
-      {expanded.has(group.base) && <PositionMetricsDetails group={group} now={now} samples={positionHistorySamples(history, group, scope)} stale={stale || live.partial}/>}
-      {expanded.has(group.base) && <div className="position-leg-list">{group.legs.map(p => <div className="position-leg" key={p.id}><div className="leg-identity"><span className={'side-badge ' + p.side.toLowerCase()}>{sideLabel(p.side)}</span><strong>{venue(p.exchange)}</strong><span>{p.symbol}</span><span className="muted"><DecimalValue value={p.leverage} kind="rate"/>×</span><button className="danger-quiet" disabled={disabled} onClick={() => setClosing([p])}>平此腿</button></div>
-        <dl className="leg-values"><div><dt>持仓数量</dt><dd><DecimalValue value={p.baseQuantity}/> <small>{p.baseCurrency}</small></dd></div><div><dt>开仓均价 / 标记价</dt><dd><DecimalValue value={p.entryPrice} kind="price"/> / <DecimalValue value={p.markPrice} kind="price"/> <small>{p.quoteCurrency}</small></dd></div><div><dt>未实现盈亏</dt><dd className={amountClass(p.unrealizedPnl)}><DecimalValue value={p.unrealizedPnl} kind="amount" signed/> <small>{p.pnlCurrency}</small></dd></div><div><dt>初始 / 维持保证金</dt><dd><DecimalValue value={p.margin} kind="amount"/> / <DecimalValue value={p.maintenanceMargin} kind="amount"/> <small>{p.marginCurrency}</small></dd></div><div><dt>强平价</dt><dd>{liquidationPrice(p.liquidationPrice) ? <DecimalValue value={p.liquidationPrice} kind="price"/> : '未提供或不适用'} <small>{liquidationPrice(p.liquidationPrice) ? p.quoteCurrency : ''}</small></dd></div><div><dt>已实现 / 资金费 / 交易费</dt><dd><DecimalValue value={p.realizedPnl} kind="amount"/> / <DecimalValue value={p.fundingFee} kind="amount"/> / <DecimalValue value={p.fee} kind="amount"/> <small>{p.pnlCurrency}</small></dd></div><div><dt>方向来源</dt><dd>{p.directionSource === 'quantity_sign' ? '方向由数量符号推导' : p.directionSource === 'position_side' ? '交易所持仓方向' : '交易所返回值'}</dd></div><div><dt>ADL 减仓优先级</dt><dd><AdlIndicator exchange={p.exchange} internalRank={p.crossExAdlRank} exchangeRank={p.exchangeAdlRank} stale={live.stale || !!live.adlError || !live.connection.connected} asOf={live.adlAsOf}/></dd></div><div><dt>最大杠杆 / 风险限额</dt><dd><DecimalValue value={p.maxLeverage} kind="rate"/>× / <DecimalValue value={p.riskLimit} kind="amount"/></dd></div><div><dt>来源时间</dt><dd>{time(p.updatedAt)}</dd></div></dl>
-      </div>)}</div>}
-    </article>)}</div> : <div className="empty"><Layers3 size={28}/><h3>{search ? '没有匹配的持仓' : !live.connection.configured ? '连接账户后查看持仓组合' : live.stale || live.partial ? '持仓数据尚未完整读取' : '当前没有持仓'}</h3><p>同币种仓位按交易所分组，已有仓位会在账户同步后显示。</p></div>}
-    <div className="table-footer"><span>同基础币汇总净数量；金额按原币种汇总，缺失值显示「—」。</span><div><button disabled={shownPage === 0} onClick={() => setPage(shownPage - 1)}>上一页</button><span>{shownPage + 1} / {pages}</span><button disabled={shownPage + 1 >= pages} onClick={() => setPage(shownPage + 1)}>下一页</button></div></div>
+    {shown.length ? <div className="table-wrap positions-wrap"><table className="positions-table"><thead><tr><th>合约</th><th>交易所</th><th>方向</th><th className="r">数量</th><th className="r">名义价值</th><th className="r">开仓价</th><th className="r">标记价</th><th className="r">强平价</th><th className="r">未实现盈亏</th><th className="r">资金费率</th><th className="r">操作</th></tr></thead>
+      {shown.map(group => { const open = expanded.has(group.base), single = group.legs.length === 1; return <tbody className={'position-group ' + (open ? 'expanded' : '')} key={group.base}>
+        <tr className="group-row">
+          <td colSpan={3} className="group-cell-identity"><div className="group-title"><button className="group-identity" onClick={() => toggle(group.base)} aria-expanded={open} aria-label={`${open ? '收起' : '展开'} ${group.base} 持仓`}>
+            {open ? <ChevronDown size={15}/> : <ChevronRight size={15}/>}<span className="coin-icon">{group.base.slice(0, 1)}</span><span><strong>{group.base}<em>{group.legs.length} 腿</em></strong><small>{Array.from(new Set(group.legs.map(p => venue(p.exchange)))).join(' / ')}</small></span>
+          </button><span className={'group-kind ' + (single ? 'single' : '')}>{single ? '单腿 · 未对冲' : '对冲组'}</span></div></td>
+          <td data-label="净数量" className={'r ' + amountClass(group.net)} title="同基础币净数量"><small className="cell-label">净</small><DecimalValue value={group.net} signed/> <small>{group.base}</small></td>
+          <td data-label="总名义额" className="r" title="总名义额"><NativeValues values={group.notional}/></td>
+          <td data-label="加权开仓价" className="r" title="加权开仓价"><DecimalValue value={group.entry?.value} kind="price"/>{group.entry?.currency && <small> {group.entry.currency}</small>}</td>
+          <td data-label="加权标记价" className="r" title="加权标记价"><DecimalValue value={group.mark?.value} kind="price"/>{group.mark?.currency && <small> {group.mark.currency}</small>}</td>
+          <td data-label="强平价" className="r muted" aria-hidden="true"></td>
+          <td data-label="未实现盈亏" className="r" title="未实现盈亏合计"><NativeValues values={group.pnl} signed/></td>
+          <td data-label="已实现 / 资金费" className="r" title="已实现 / 资金费"><span className="group-split"><small className="cell-label">已实现</small><NativeValues values={group.realized} signed/></span><span className="group-split"><small className="cell-label">资金费</small><NativeValues values={group.funding} signed subtle/></span></td>
+          <td data-label="操作" className="r"><div className="group-actions"><button className="danger-quiet" disabled={disabled || !!action || group.legs.length > 16} onClick={() => setClosing(group.legs)}>平仓组合</button><button className="primary-quiet" aria-label={`${group.base} 加仓`} title={!group.metrics.applicable ? '加仓需要严格等量且有效的双腿组合' : actionProps.entryPaused ? '新开仓已暂停' : actionProps.catalogError || '双腿等量加仓'} disabled={actionDisabled || actionProps.entryPaused || !!actionProps.catalogError || !group.metrics.applicable || !legQuantityDiff(group.legs).equal} onClick={() => setAction({ action: 'add', group, connectionVersion: live.connection.version, accountId: live.connection.accountId })}>加仓</button><button className="secondary-quiet" aria-label={`${group.base} 平衡双腿`} title={legQuantityDiff(group.legs).problem || '数量差异超过双腿均值的 0.1% 时可平衡'} disabled={actionDisabled || !legQuantityDiff(group.legs).needsBalance} onClick={() => setAction({ action: 'balance', group, connectionVersion: live.connection.version, accountId: live.connection.accountId })}>平衡双腿</button>{group.legs.length > 16 && <small>每次最多 16 腿，请逐腿操作</small>}</div></td>
+        </tr>
+        <tr className="group-summary-row"><td colSpan={COLUMNS}><PositionMetricsSummary group={group} stale={stale || live.partial}/></td></tr>
+        {group.legs.map(p => { const rate = legFunding(p), mark = sideMark(p.side), liquidation = liquidationPrice(p.liquidationPrice); return <tr className="position-leg" key={p.id}>
+          <td data-label="合约"><strong className="leg-symbol">{p.symbol}</strong><span className={'ml ' + (single ? 'warning' : '')}>{single ? '单腿 · 未对冲' : `${group.base} 对冲组`}</span></td>
+          <td data-label="交易所">{venue(p.exchange)}<span className="ml"><DecimalValue value={p.leverage} kind="rate"/>×</span></td>
+          <td data-label="方向">{mark && <span className={'side-badge mark ' + p.side.toLowerCase()} aria-hidden="true">{mark}</span>}{mark ? sideLabel(p.side) : <span className={'side-badge ' + p.side.toLowerCase()}>{sideLabel(p.side)}</span>}</td>
+          <td data-label="数量" className="r"><DecimalValue value={p.baseQuantity}/> <small>{p.baseCurrency}</small></td>
+          <td data-label="名义价值" className="r"><DecimalValue value={p.notional ?? p.positionValue} kind="amount"/> <small>{p.quoteCurrency}</small></td>
+          <td data-label="开仓价" className="r"><DecimalValue value={p.entryPrice} kind="price"/></td>
+          <td data-label="标记价" className="r"><DecimalValue value={p.markPrice} kind="price"/></td>
+          <td data-label="强平价" className="r">{liquidation ? <DecimalValue value={p.liquidationPrice} kind="price"/> : <span className="muted" title="未提供或不适用">—</span>}</td>
+          <td data-label="未实现盈亏" className={'r ' + amountClass(p.unrealizedPnl)}><DecimalValue value={p.unrealizedPnl} kind="amount" signed/> <small>{p.pnlCurrency}</small></td>
+          <td data-label="资金费率" className={'r ' + (rate ? amountClass(String(rate.rate)) : 'muted')}>{rate ? <span title={`每 ${rate.intervalHours} 小时结算`}>{percentage(String(rate.rate))}<small> /{rate.intervalHours}h</small></span> : '—'}</td>
+          <td data-label="操作" className="r"><button className="danger-quiet" disabled={disabled} onClick={() => setClosing([p])}>平此腿</button></td>
+        </tr>; })}
+        {open && <tr className="group-detail-row"><td colSpan={COLUMNS}>
+          <PositionMetricsDetails group={group} now={now} samples={positionHistorySamples(history, group, scope)} stale={stale || live.partial}/>
+          <div className="position-leg-list">{group.legs.map(p => <section className="leg-detail" key={p.id} aria-label={`${venue(p.exchange)} ${p.symbol} 明细`}><div className="leg-identity"><span className={'side-badge ' + p.side.toLowerCase()}>{sideLabel(p.side)}</span><strong>{venue(p.exchange)}</strong><span>{p.symbol}</span><span className="muted"><DecimalValue value={p.leverage} kind="rate"/>×</span></div>
+            <dl className="leg-values"><div><dt>开仓均价 / 标记价</dt><dd><DecimalValue value={p.entryPrice} kind="price"/> / <DecimalValue value={p.markPrice} kind="price"/> <small>{p.quoteCurrency}</small></dd></div><div><dt>初始 / 维持保证金</dt><dd><DecimalValue value={p.margin} kind="amount"/> / <DecimalValue value={p.maintenanceMargin} kind="amount"/> <small>{p.marginCurrency}</small></dd></div><div><dt>强平价</dt><dd>{liquidationPrice(p.liquidationPrice) ? <DecimalValue value={p.liquidationPrice} kind="price"/> : '未提供或不适用'} <small>{liquidationPrice(p.liquidationPrice) ? p.quoteCurrency : ''}</small></dd></div><div><dt>已实现 / 资金费 / 交易费</dt><dd><DecimalValue value={p.realizedPnl} kind="amount"/> / <DecimalValue value={p.fundingFee} kind="amount"/> / <DecimalValue value={p.fee} kind="amount"/> <small>{p.pnlCurrency}</small></dd></div><div><dt>方向来源</dt><dd>{p.directionSource === 'quantity_sign' ? '方向由数量符号推导' : p.directionSource === 'position_side' ? '交易所持仓方向' : '交易所返回值'}</dd></div><div><dt>ADL 减仓优先级</dt><dd><AdlIndicator exchange={p.exchange} internalRank={p.crossExAdlRank} exchangeRank={p.exchangeAdlRank} stale={live.stale || !!live.adlError || !live.connection.connected} asOf={live.adlAsOf}/></dd></div><div><dt>最大杠杆 / 风险限额</dt><dd><DecimalValue value={p.maxLeverage} kind="rate"/>× / <DecimalValue value={p.riskLimit} kind="amount"/></dd></div><div><dt>来源时间</dt><dd>{time(p.updatedAt)}</dd></div></dl>
+          </section>)}</div>
+        </td></tr>}
+      </tbody>; })}</table></div> : <div className="empty"><Layers3 size={28}/><h3>{search || filter !== 'all' ? '没有匹配的持仓' : !live.connection.configured ? '连接账户后查看持仓组合' : live.stale || live.partial ? '持仓数据尚未完整读取' : '当前没有持仓'}</h3><p>同币种仓位按交易所分组，已有仓位会在账户同步后显示。</p></div>}
+    <div className="table-footer"><span>{live.positions.length} 条真实持仓腿 · 点击币种展开价差、资金费与单腿风险。名义价值、盈亏按原币种显示；强平价为交易所返回值，资金费率为交易所原始费率（标注结算周期）。同基础币汇总净数量；金额按原币种汇总，缺失值显示「—」。</span><div><button disabled={shownPage === 0} onClick={() => setPage(shownPage - 1)}>上一页</button><span>{shownPage + 1} / {pages}</span><button disabled={shownPage + 1 >= pages} onClick={() => setPage(shownPage + 1)}>下一页</button></div></div>
     {closing && <ClosePositionDialog key={closing.map(p => p.id).join(':')} positions={closing} instruments={instruments} disabled={disabled} dismiss={() => setClosing(null)} preview={async legs => { if (await close(legs)) setClosing(null); }}/>}
     {action && <PositionActionDialog selection={action} live={live} instruments={instruments} disabled={disabled || stale || live.partial} {...actionProps} dismiss={() => setAction(null)}/>}
   </section>;
 }
-
 function NativeValues({ values, signed = false, subtle = false }: { values: CurrencyAmount[]; signed?: boolean; subtle?: boolean }) {
   return <span className={'native-values ' + (subtle ? 'subtle' : '')}>{values.map(item => <span key={item.currency} className={signed ? amountClass(item.value) : undefined}><DecimalValue value={item.value} kind="amount" signed={signed}/> <small>{item.currency}</small></span>)}</span>;
 }
