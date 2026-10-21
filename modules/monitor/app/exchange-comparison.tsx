@@ -10,6 +10,7 @@ import { summaryTimestamp } from "../lib/monitor-summary";
 import { startActivityPolling } from "../lib/polling";
 import ExchangeFundingHistoryPanel, { type FundingHistorySelection } from "./exchange-funding-history";
 import VariationalSession from "./variational-session";
+import type { VenueSpreads } from "./related-positions";
 
 const OilFundingHedge = lazyComponent(() => import("./oil-funding-hedge"), { clientOnly: true, loading: () => <p className="exchange-caption" role="status">正在载入四腿历史模拟…</p> });
 
@@ -18,9 +19,10 @@ const tone = (value: number | null | undefined) => value == null || value === 0 
 const price = (value: number | undefined, digits: number) => value === undefined ? "—" : value.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 const rate = (value: number | null) => signed(value === null ? null : value * 100, 5, "%");
 const fundingPriceLabels = { oracle: "预言机价格", index: "指数价格", mark: "标记价格" };
+const age = (fetchedAt: string, now: number) => { const seconds = Math.max(0, Math.round((now - Date.parse(fetchedAt)) / 1000)); return !Number.isFinite(seconds) ? "" : seconds < 60 ? `${seconds} 秒前` : seconds < 3600 ? `${Math.floor(seconds / 60)} 分钟前` : `${Math.floor(seconds / 3600)} 小时前`; };
 const settlement = (leg: ExchangeLeg) => leg.nextFundingAt ? `${summaryTimestamp(leg.nextFundingAt)}${leg.nextFundingEstimated ? "（推算）" : ""}` : "—";
 
-function ExchangeComparison({ monitorId, primary, initial, renderedAt, active = true, interactionActive = active }: { monitorId: SpreadMarket; primary?: ExchangeQuote; initial?: ExternalQuoteSet; renderedAt?: number; active?: boolean; interactionActive?: boolean }) {
+function ExchangeComparison({ monitorId, primary, initial, renderedAt, active = true, interactionActive = active, onSpreads }: { monitorId: SpreadMarket; primary?: ExchangeQuote; initial?: ExternalQuoteSet; renderedAt?: number; active?: boolean; interactionActive?: boolean; onSpreads?: (spreads: VenueSpreads) => void }) {
   const { quotes, errors, loading, refresh } = useExchangeQuotes(monitorId, initial, active);
   const [now, setNow] = useState(() => renderedAt ?? Date.now());
   const [historySelection, setHistorySelection] = useState<FundingHistorySelection | null>(null);
@@ -53,12 +55,18 @@ function ExchangeComparison({ monitorId, primary, initial, renderedAt, active = 
     const stale = Boolean(quote && (error || externalQuoteStale(quote, now)));
     return { exchange, definition, quote, error, metrics: quote ? calculateExchangeSpread(quote) : null, stale, status: !quote ? error ? "暂不可用" : "等待首次采集" : stale ? "保留数据 · 待更新" : quote.fundingError ? "价格已更新 · 资金费缺失" : "已更新" };
   });
+  const spreadKey = JSON.stringify(rows.map(row => [row.exchange, row.metrics?.premium ?? null, row.stale]));
+  useEffect(() => {
+    if (!onSpreads) return;
+    const entries = JSON.parse(spreadKey) as [string, number | null, boolean][];
+    onSpreads(Object.fromEntries(entries.map(([name, premium, stale]) => [name, { premium, stale }])));
+  }, [onSpreads, spreadKey]);
   return <section className="exchange-comparison" aria-label={`${oil ? "原油" : "海力士"}交易所实时对比`} data-exchange-market={monitorId}>
     <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? "价差相对 WTI · 资金费按等桶数" : "ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股"}</p></div><div><span>各平台每 15 秒更新</span><button type="button" className="refresh-button" onClick={refresh} disabled={loading} aria-label={`刷新${oil ? "原油" : "海力士"}交易所报价`}><RefreshCw size={14} className={loading ? "spinning" : ""}/>{loading ? "更新中" : "刷新"}</button></div></div>
     <Table className="exchange-table">
       <TableHeader><TableRow><TableHead>交易所 / 报价口径</TableHead><TableHead>{contracts.leftLabel} / {oil ? "WTI" : "正股 ÷ 10"}</TableHead><TableHead>{oil ? "价差 (%)" : "价差"}</TableHead>{!oil && <TableHead>ADR 溢价率</TableHead>}<TableHead>做空价差年化</TableHead><TableHead>做多价差年化</TableHead></TableRow></TableHeader>
       <TableBody>{rows.map(({ exchange, definition, quote, metrics, stale, status }) => <Fragment key={exchange}><TableRow data-exchange={exchange} data-stale={stale}>
-        <TableCell className="exchange-identity"><strong>{exchangeNames[exchange]}</strong><span>{quote?.currency ?? definition.currency} · {(quote?.priceBasis ?? definition.priceBasis) === "mid" ? "中间价" : "标记价"}</span><small className={stale || !quote || quote.fundingError ? "exchange-stale" : ""}>{status}</small>{quote && <time dateTime={quote.fetchedAt}>{quote.timestampBasis === "received" ? "采集时间：" : ""}{summaryTimestamp(quote.fetchedAt)} 北京时间</time>}{quote?.timestampBasis === "received" && <small>源未提供行情时间戳</small>}{quote?.fundingError && <small className="exchange-stale">{quote.fundingError}</small>}{oil && exchange === "variational" ? <button ref={sessionTrigger} type="button" className="variational-session-trigger" onClick={() => setSessionOpen(open => !open)} aria-expanded={sessionOpen && interactionActive} aria-controls={sessionId}>更新 Var token<ChevronDown size={13} aria-hidden="true"/></button> : null}</TableCell>
+        <TableCell className="exchange-identity"><strong>{exchangeNames[exchange]}</strong><span>{quote?.currency ?? definition.currency} · {(quote?.priceBasis ?? definition.priceBasis) === "mid" ? "中间价" : "标记价"}</span><small className={stale || !quote || quote.fundingError ? "exchange-stale" : ""}>{status}</small>{stale && quote ? <small className="exchange-old" title="报价超过有效期，仅供核对"><b>旧</b>{age(quote.fetchedAt, now)}</small> : null}{quote && <time dateTime={quote.fetchedAt}>{quote.timestampBasis === "received" ? "采集时间：" : ""}{summaryTimestamp(quote.fetchedAt)} 北京时间</time>}{quote?.timestampBasis === "received" && <small>源未提供行情时间戳</small>}{quote?.fundingError && <small className="exchange-stale">{quote.fundingError}</small>}{oil && exchange === "variational" ? <button ref={sessionTrigger} type="button" className="variational-session-trigger" onClick={() => setSessionOpen(open => !open)} aria-expanded={sessionOpen && interactionActive} aria-controls={sessionId}>更新 Var token<ChevronDown size={13} aria-hidden="true"/></button> : null}</TableCell>
         <TableCell data-label={`${contracts.leftLabel} / ${oil ? "WTI" : "正股 ÷ 10"}`}><span className="exchange-prices"><span>{price(quote?.left.price, oil ? 3 : 2)}</span><span className="exchange-separator" aria-hidden="true">/</span><span>{price(metrics?.equivalent, oil ? 3 : 2)}</span></span><small className="exchange-pair-symbols">{quote ? `${quote.left.symbol} / ${quote.right.symbol}` : `${definition.left} / ${definition.right}`}</small></TableCell>
         <TableCell data-label={oil ? "价差 (%)" : "价差"}><strong className={tone(oil ? metrics?.premium : metrics?.spread)}>{signed(oil ? metrics?.premium : metrics?.spread, oil ? 3 : 2, oil ? "%" : "")}</strong></TableCell>
         {!oil && <TableCell data-label="ADR 溢价率"><strong className={tone(metrics?.premium)}>{signed(metrics?.premium, 2, "%")}</strong></TableCell>}

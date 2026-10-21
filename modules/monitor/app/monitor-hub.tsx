@@ -1,6 +1,6 @@
 "use client";
 
-import { useHubBridge } from "../lib/hub-bridge";
+import { useHubBridge, type PositionsMarket } from "../lib/hub-bridge";
 import { memo, useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { Activity, ArrowUpRight, Layers3 } from "lucide-react";
@@ -15,7 +15,9 @@ import GoldOilPanel from './gold-oil-panel';
 import MonitorSparkline from "./monitor-sparkline";
 import { trendExpired } from "../lib/monitor-trend";
 import NotificationSettings from "./notification-settings";
-import AlertSettings from "./alert-settings";
+import AlertSettings, { type AlertViewState } from "./alert-settings";
+import { MonitorAlertSide } from "./monitor-detail-side";
+import RelatedPositions, { type VenueSpreads } from "./related-positions";
 import { monitorAlertAdapters, goldOilAlertId } from "../lib/monitor-alerts";
 import { GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, GOLD_OIL_VARIANTS, goldOilVariantKey, type GoldOilType, type GoldOilExchange } from '../lib/gold-oil';
 import ExchangeComparison from "./exchange-comparison";
@@ -24,6 +26,22 @@ import { usePerpetualSummary } from '../hooks/use-perpetual-summary';
 const PerpetualPanel = lazyComponent(() => import('./perpetual-panel'), { loading: () => <p role="status">正在加载合约监控…</p> });
 
 const panels = { oil: memo(OilPanel), hynix: memo(Dashboard), 'cl-xau': memo(GoldOilPanel) };
+const OilDetail = panels.oil, HynixDetail = panels.hynix;
+const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], 'cl-xau': ['XAU', 'CL', 'BZ'], hynix: ['SKHY', 'SKHX'] };
+const detailStatusLabels = { live: "实时", snapshot: "备用快照", stale: "陈旧", error: "暂不可用", loading: "获取中" } as const;
+
+const DetailStatus = memo(function DetailStatus({ summary, intervalMs, renderedAt }: { summary: MonitorSummary; intervalMs: number; renderedAt?: number }) {
+  const [now, setNow] = useState(() => renderedAt ?? Date.now());
+  useEffect(() => {
+    const updateClock = () => setNow(Date.now());
+    const timer = setInterval(updateClock, 10_000);
+    document.addEventListener("visibilitychange", updateClock);
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", updateClock); };
+  }, []);
+  const timestamp = summaryTimestamp(summary.fetchedAt);
+  const state = summaryExpired(summary, intervalMs, now) ? "stale" : summary.status;
+  return <span className="hub-detail-status" data-state={state}><i aria-hidden="true"/>{detailStatusLabels[state]}{timestamp ? <> · 更新于 <time dateTime={summary.fetchedAt!}>{timestamp}</time></> : null}</span>;
+});
 
 const CardSummary = memo(function CardSummary({ summary, intervalMs, renderedAt, disabled = false }: { summary: MonitorSummary; intervalMs: number; renderedAt?: number; disabled?: boolean }) {
   const [now, setNow] = useState(() => renderedAt ?? Date.now());
@@ -37,7 +55,7 @@ const CardSummary = memo(function CardSummary({ summary, intervalMs, renderedAt,
   const expired = summaryExpired(summary, intervalMs, now);
   return <>
     <span className="hub-card-metrics">{summary.metrics.map((metric, index) => <span key={metric.label}><small>{metric.label}</small><span className="hub-metric-reading"><strong className={metric.tone}>{metric.value}</strong>{index === 0 && summary.trend && <MonitorSparkline trend={summary.trend} expired={trendExpired(summary.trend, now)}/>}</span></span>)}</span>
-    {summary.note && <span className="hub-card-note">{summary.note}</span>}
+    {summary.note && <span className="hub-card-note" title={summary.note}>{summary.note}</span>}
     <span className={`hub-card-status ${disabled ? 'disabled' : expired ? "stale" : summary.status}`}><span><i aria-hidden="true"/>{disabled ? '已关闭 · 保留上次数据' : expired ? "行情待更新" : summaryStatusLabels[summary.status]}</span>{timestamp && <time dateTime={summary.fetchedAt!}>{timestamp} 北京时间</time>}</span>
   </>;
 });
@@ -58,6 +76,11 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
     return [goldOilVariantKey(oilType, exchange), goldOilSummary(seed?.quote ?? null, false, seed?.trend ?? goldOilTrend(seed?.history ?? null, false, oilType, exchange), oilType, exchange)];
   })) as Record<string, MonitorSummary>);
   const setGoldOil = useCallback((summary: MonitorSummary) => setGoldOilMarkets(previous => ({ ...previous, [goldOilKey]: summary })), [goldOilKey]);
+  const [alertStates, setAlertStates] = useState<Record<string, AlertViewState>>({});
+  const reportAlertView = useCallback((id: string, state: AlertViewState) => setAlertStates(previous => previous[id]?.view === state.view && previous[id]?.loadError === state.loadError ? previous : { ...previous, [id]: state }), []);
+  const [alertOpenRequests, setAlertOpenRequests] = useState<Record<string, number>>({});
+  const [oilSpreads, setOilSpreads] = useState<VenueSpreads>({});
+  const [navSlot, setNavSlot] = useState<HTMLDivElement | null>(null);
   const perpetual = usePerpetualSummary(hub.readActive && enabled('perpetual'));
   const summaries: Record<string, MonitorSummary> = { oil, hynix, perpetual, 'cl-xau': goldOilMarkets[goldOilKey] };
   // Stable setters keep mounted panels and their pollers intact on every quote.
@@ -121,27 +144,44 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
     } catch { /* Standard browsers do not require WebMCP. */ }
     return () => lifecycle.abort();
   }, [selectMonitor]);
+  const detailEnabled = enabled(active);
+  const alertId = active === 'cl-xau' ? goldOilAlertId(goldOilType, goldOilExchange) : active;
+  const hasAlerts = Boolean(monitors.find(monitor => monitor.id === active)?.capabilities.includes("alerts") && monitorAlertAdapters[alertId]);
+  const openAlertRules = () => {
+    setAlertOpenRequests(previous => ({ ...previous, [alertId]: (previous[alertId] ?? 0) + 1 }));
+    requestAnimationFrame(() => document.querySelector(`[data-alert-monitor="${alertId}"]`)?.scrollIntoView({ behavior: "auto", block: "nearest" }));
+  };
+  const comparison = (id: "oil" | "hynix") => enabled(id) ? <div className="hub-exchange-comparison" {...(id === "oil" ? { slot: "after-chart" } : {})}><ExchangeComparison active={hub.readActive && active === id} interactionActive={hub.active && active === id} monitorId={id} primary={summaries[id]?.comparison} initial={initial?.[id].exchanges} renderedAt={initial?.renderedAt} onSpreads={id === "oil" ? setOilSpreads : undefined}/></div> : null;
+  const detailMonitor = monitors.find(monitor => monitor.id === active);
   return <div className={`monitor-hub ${active === "perpetual" ? "monitor-hub-perpetual" : ""}`}>
     <header className="hub-header"><a className="hub-brand" href="/"><span><Activity size={23}/></span>MARKET <b>/ MONITOR</b></a><div className="hub-source">跨市场行情 <span>· CEX / DEX</span></div></header>
     <div className="hub-intro"><div><p className="eyebrow">跨市场价差观察</p><h1>市场监控</h1></div></div>
     <Tabs value={active} onValueChange={value => selectMonitor(String(value))} className={`hub-tabs ${active === "perpetual" ? "hub-perpetual-active" : ""}`}>
-      <div className="hub-nav-row"><TabsList className="hub-market-nav" aria-label="选择监控市场">{monitors.map(monitor => <TabsTrigger key={monitor.id} value={monitor.id} className="hub-market-tab">{monitor.title}</TabsTrigger>)}</TabsList><a className="hub-project-link" href="https://github.com/hxx344/market-spread-monitor" target="_blank" rel="noreferrer"><Layers3 size={14}/>项目与扩展说明<ArrowUpRight size={13}/></a></div>
+      <div className="hub-nav-row"><TabsList className="hub-market-nav" aria-label="选择监控市场">{monitors.map(monitor => <TabsTrigger key={monitor.id} value={monitor.id} className="hub-market-tab">{monitor.title}</TabsTrigger>)}</TabsList><div className="hub-nav-aside">{active === "perpetual" ? <div className="hub-nav-slot" ref={setNavSlot}/> : detailMonitor && detailEnabled && summaries[active] ? <DetailStatus summary={summaries[active]} intervalMs={detailMonitor.quoteIntervalMs} renderedAt={initial?.renderedAt}/> : null}<a className="hub-project-link" href="https://github.com/hxx344/market-spread-monitor" target="_blank" rel="noreferrer"><Layers3 size={14}/>项目与扩展说明<ArrowUpRight size={13}/></a></div></div>
       <section className="hub-market-overview" aria-label="市场行情概览">{monitors.map(monitor => {
         const runtime = controls.runtime[monitor.id], pending = controls.pending[monitor.id], error = controls.errors[monitor.id] || runtime?.error;
+        const identity = `${monitor.id === 'cl-xau' ? `XAU / ${GOLD_OIL_INSTRUMENTS[goldOilType].code}` : monitor.subtitle}${monitor.id === "perpetual" ? " · WS 行情" : ` · ${monitor.id === "hynix" ? "Hyperliquid" : monitor.id === 'cl-xau' ? GOLD_OIL_EXCHANGES[goldOilExchange].name : "Binance"}`}`;
         return <article key={monitor.id} className="hub-summary-shell" data-active={active === monitor.id} data-disabled={!enabled(monitor.id)} aria-label={monitor.title}>
-          <button type="button" className="hub-summary-card" aria-pressed={active === monitor.id} onClick={() => selectMonitor(monitor.id)}><span className="hub-card-heading"><i style={{background:monitor.accent}}/><span>{monitor.title}<small>{monitor.id === 'cl-xau' ? `XAU / ${GOLD_OIL_INSTRUMENTS[goldOilType].code}` : monitor.subtitle}{monitor.id === "perpetual" ? " · WS 行情" : ` · ${monitor.id === "hynix" ? "Hyperliquid" : monitor.id === 'cl-xau' ? GOLD_OIL_EXCHANGES[goldOilExchange].name : "Binance"}`}</small></span><em>{monitor.category}</em></span>{summaries[monitor.id] && <CardSummary summary={summaries[monitor.id]} intervalMs={monitor.quoteIntervalMs} renderedAt={initial?.renderedAt} disabled={!enabled(monitor.id)} />}</button>
+          <button type="button" className="hub-summary-card" aria-pressed={active === monitor.id} onClick={() => selectMonitor(monitor.id)}><span className="hub-card-heading"><i style={{background:monitor.accent}}/><span title={`${monitor.title} · ${identity}`}>{monitor.title}<small>{identity}</small></span><em>{monitor.category}</em></span>{summaries[monitor.id] && <CardSummary summary={summaries[monitor.id]} intervalMs={monitor.quoteIntervalMs} renderedAt={initial?.renderedAt} disabled={!enabled(monitor.id)} />}</button>
           <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-label={`${monitor.title}监控开关`} aria-checked={runtime?.enabled ?? true} aria-busy={pending || undefined} disabled={!runtime?.available || pending} title={runtime?.reason || '控制行情采集、自动告警及跟踪'} onClick={() => void controls.toggle(monitor.id)}><span>{pending ? '保存中…' : runtime?.error ? '重试切换' : !runtime ? '读取中…' : !runtime.available ? '预览模式' : runtime.enabled ? '已开启' : '已关闭'}</span><i aria-hidden="true"/></button></div>
           {error && <p className="hub-monitor-error" role="alert">{error}</p>}
         </article>;
       })}</section>
       {controls.errors.load && <p className="hub-control-notice" role="status">{controls.errors.load}</p>}
       <NotificationSettings active={hub.readActive}/>
-      {monitors.filter(monitor => enabled(monitor.id) && (monitor.id === "oil" || monitor.id === "hynix")).map(monitor => { const id = monitor.id as "oil" | "hynix"; return <div key={id} hidden={active !== id} className="hub-exchange-comparison"><ExchangeComparison active={hub.readActive && active === id} interactionActive={hub.active && active === id} monitorId={id} primary={summaries[id]?.comparison} initial={initial?.[id].exchanges} renderedAt={initial?.renderedAt}/></div>; })}
-      <div className="hub-alert-settings">{monitors.filter(monitor => enabled(monitor.id) && monitor.capabilities.includes("alerts")).map(monitor => <div key={monitor.id} hidden={active !== monitor.id}>{monitor.id === 'cl-xau' ? <>
-        <p className="alert-help">当前组合：{GOLD_OIL_EXCHANGES[goldOilExchange].name} · {GOLD_OIL_INSTRUMENTS[goldOilType].code} · {GOLD_OIL_INSTRUMENTS[goldOilType].name}。各交易所的 CL 与 BZ 告警分别保存，并由后台独立检查。</p>
-        {GOLD_OIL_VARIANTS.map(({ oilType, exchange }) => { const id = goldOilAlertId(oilType, exchange), selected = goldOilType === oilType && goldOilExchange === exchange; return <div key={id} hidden={!selected}><AlertSettings active={hub.readActive && active === monitor.id && selected} monitorId={id} title={`金油比 · ${GOLD_OIL_EXCHANGES[exchange].name} ${GOLD_OIL_INSTRUMENTS[oilType].code}`} adapter={monitorAlertAdapters[id]}/></div>; })}
-      </> : monitorAlertAdapters[monitor.id] ? <AlertSettings active={hub.readActive && active === monitor.id} monitorId={monitor.id} title={monitor.title} adapter={monitorAlertAdapters[monitor.id]}/> : <p role="alert">该监控模块尚未接入统一告警设置。</p>}</div>)}</div>
-      {monitors.map(monitor => { const id = monitor.id as keyof typeof panels; const Panel = panels[id]; return <TabsContent key={monitor.id} value={monitor.id} forceMount className="hub-content">{!enabled(monitor.id) ? <p className="notice" role="status">{monitor.title}监控已关闭，行情采集、自动告警{monitor.id === 'perpetual' ? '和持仓跟踪' : ''}已暂停。配置和历史数据已保留，可通过上方开关重新开启。</p> : monitor.id === "perpetual" ? (perpetualVisited && <PerpetualPanel hubConnected={hub.connected} active={hub.readActive && active === "perpetual"} interactionActive={hub.active && active === "perpetual"}/>) : Panel ? <Panel initial={initial} onSummary={summaryHandlers[id]} active={hub.readActive && active === id} summaryActive={hub.readActive} {...(id === 'cl-xau' ? { oilType: goldOilType, onOilTypeChange: selectGoldOil, exchange: goldOilExchange, onExchangeChange: selectGoldOilExchange } : {})} /> : <p role="alert">该监控模块尚未提供面板。</p>}</TabsContent>; })}
+      <div className="monitor-detail" data-detail-monitor={active} data-layout={active === "perpetual" || !detailEnabled ? "wide" : "split"}>
+        <div className="monitor-detail-main">
+          {monitors.map(monitor => { const id = monitor.id as keyof typeof panels; const Panel = panels[id]; const panelProps = { initial, onSummary: summaryHandlers[id], active: hub.readActive && active === id, summaryActive: hub.readActive }; return <TabsContent key={monitor.id} value={monitor.id} forceMount className="hub-content">{!enabled(monitor.id) ? <p className="notice" role="status">{monitor.title}监控已关闭，行情采集、自动告警{monitor.id === 'perpetual' ? '和持仓跟踪' : ''}已暂停。配置和历史数据已保留，可通过上方开关重新开启。</p> : monitor.id === "perpetual" ? (perpetualVisited && <PerpetualPanel hubConnected={hub.connected} active={hub.readActive && active === "perpetual"} interactionActive={hub.active && active === "perpetual"} navSlot={active === "perpetual" ? navSlot : null}/>) : id === "oil" ? <OilDetail {...panelProps}>{comparison("oil")}</OilDetail> : id === "hynix" ? <HynixDetail {...panelProps}>{comparison("hynix")}</HynixDetail> : Panel ? <Panel {...panelProps} {...(id === 'cl-xau' ? { oilType: goldOilType, onOilTypeChange: selectGoldOil, exchange: goldOilExchange, onExchangeChange: selectGoldOilExchange } : {})} /> : <p role="alert">该监控模块尚未提供面板。</p>}</TabsContent>; })}
+          <div className="hub-alert-settings">{monitors.filter(monitor => enabled(monitor.id) && monitor.capabilities.includes("alerts")).map(monitor => <div key={monitor.id} hidden={active !== monitor.id}>{monitor.id === 'cl-xau' ? <>
+            <p className="alert-help">当前组合：{GOLD_OIL_EXCHANGES[goldOilExchange].name} · {GOLD_OIL_INSTRUMENTS[goldOilType].code} · {GOLD_OIL_INSTRUMENTS[goldOilType].name}。各交易所的 CL 与 BZ 告警分别保存，并由后台独立检查。</p>
+            {GOLD_OIL_VARIANTS.map(({ oilType, exchange }) => { const id = goldOilAlertId(oilType, exchange), selected = goldOilType === oilType && goldOilExchange === exchange; return <div key={id} hidden={!selected}><AlertSettings active={hub.readActive && active === monitor.id && selected} monitorId={id} title={`金油比 · ${GOLD_OIL_EXCHANGES[exchange].name} ${GOLD_OIL_INSTRUMENTS[oilType].code}`} adapter={monitorAlertAdapters[id]} onView={reportAlertView} openRequest={alertOpenRequests[id] ?? 0}/></div>; })}
+          </> : monitorAlertAdapters[monitor.id] ? <AlertSettings active={hub.readActive && active === monitor.id} monitorId={monitor.id} title={monitor.title} adapter={monitorAlertAdapters[monitor.id]} onView={reportAlertView} openRequest={alertOpenRequests[monitor.id] ?? 0}/> : <p role="alert">该监控模块尚未接入统一告警设置。</p>}</div>)}</div>
+        </div>
+        {active !== "perpetual" && detailEnabled ? <aside className="monitor-detail-side">
+          {hasAlerts ? <MonitorAlertSide state={alertStates[alertId]} onOpenRules={openAlertRules}/> : null}
+          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.readActive} spreads={active === "oil" ? oilSpreads : undefined}/>
+        </aside> : null}
+      </div>
     </Tabs>
   </div>;
 }

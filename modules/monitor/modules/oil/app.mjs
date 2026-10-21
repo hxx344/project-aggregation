@@ -98,6 +98,7 @@ function renderStatus() {
   }
   if (!state.metadata) return;
   $('data-notice').textContent = `15 分钟 K 线收盘价差 · ${displayDate(state.metadata.firstCommonObservation)} — ${displayDate(state.metadata.lastCommonObservation)} 北京时间。${state.metadata.missingObservationRows ? `缺少 ${state.metadata.missingObservationRows} 根共同 K 线，缺口断线。` : ''}${state.historyMode !== 'live' ? '历史更新中断，保留已存数据。' : ''}`;
+  $('data-notice').dataset.tone = state.metadata.missingObservationRows || state.historyMode !== 'live' ? 'warn' : 'info';
   $('data-notice').hidden = false;
   $('source-note').textContent = `历史采用 Binance BZUSDT 与 CLUSDT 同一时段已收盘的 15 分钟 K 线，价格按 USDT/桶报价，价差＝(布伦特 − WTI) ÷ WTI × 100%。图表显示北京时间，按 UTC 对齐；从 4 月 1 日回补，后台持续保存新记录。采集：${beijingTime(state.metadata.fetchedAt)} 北京时间。`;
 }

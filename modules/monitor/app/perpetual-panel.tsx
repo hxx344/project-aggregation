@@ -1,6 +1,7 @@
 "use client";
 
 import { hubNavigate, cleanHubQuery } from "../lib/hub-bridge";
+import { createPortal } from "react-dom";
 import { Fragment, Suspense, lazy, memo, useDeferredValue, useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { DEFAULT_CAPITAL_ASSUMPTIONS, normalizeCapitalAssumptions, parseCapitalAssumptions, type CapitalAssumptions } from "../../../server/capital-metrics.mjs";
 import { scannerCapitalMetrics } from "../lib/perpetual-capital";
@@ -30,6 +31,7 @@ import { ScannerMenu, ScannerLeg, ScannerFundingRate, ScannerHistory, ScannerMar
 import { ScannerRangeFilters } from "./perpetual-scanner-filters";
 import { compileScannerRanges, evaluateScannerRanges, parseScannerRangeInputs, type ScannerRangeId, type ScannerRangeInputs } from "../lib/perpetual-scanner-filters";
 import { perpetualChartUrl, perpetualWorkspaceUrl, readPerpetualChartSelection, type PerpetualChartSelection } from "../lib/perpetual-chart-state";
+import RelatedPositions from "./related-positions";
 import "./perpetual.css";
 import "./perpetual-scanner.css";
 
@@ -216,7 +218,7 @@ function QuoteDetails({ quotes, venues, mode, now, staleAfterMs, crossex, standa
   </div>;
 }
 
-function PerpetualPanel({ active = true, interactionActive = active, onSummary, hubConnected = false }: SummaryProps & { active?: boolean; interactionActive?: boolean; hubConnected?: boolean }) {
+function PerpetualPanel({ active = true, interactionActive = active, onSummary, hubConnected = false, navSlot = null }: SummaryProps & { active?: boolean; interactionActive?: boolean; hubConnected?: boolean; navSlot?: HTMLElement | null }) {
   const [workspace, setWorkspace] = useState<"opportunities" | "positions" | "chart">("opportunities");
   const [chartSelection, setChartSelection] = useState<PerpetualChartSelection | null>(null);
   const [chartLinkError, setChartLinkError] = useState("");
@@ -363,6 +365,9 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
   const qualities = useMemo(() => new Map(rows.map(row => [qualityPairKey(row), evaluateOpportunityQuality(row, qualityReport, now, qualityBudget, filters.priceMode)])), [rows, qualityReport, now, qualityBudget, filters.priceMode]);
   const fundingScenarios = useMemo(() => fundingSort ? new Map(rows.map(row => [perpetualSpreadKey(row), estimatePerpetualHoldingScenario(row, qualityBudget, { holdingHours: 24, exitSpreadPercent: row.spreadPercent, priceMode: filters.priceMode, staleAfterMs: data?.staleAfterMs }, now)])) : null, [fundingSort, rows, qualityBudget, filters.priceMode, data?.staleAfterMs, now]);
   const quoteRows = view === "quotes" ? quoteSelection.keys.slice((visiblePage - 1) * pageSize, visiblePage * pageSize).map(key => quoteSelection.byKey.get(key)!) : emptyQuotes;
+  // Positions follow the rows currently on screen; the joined key keeps the list stable across quote ticks.
+  const contextBaseKey = [...new Set((view === "quotes" ? quoteRows : rows).map(row => row.base.toUpperCase()))].join(",");
+  const contextBases = useMemo(() => contextBaseKey ? contextBaseKey.split(",") : [], [contextBaseKey]);
   const detailQuotes = useMemo(() => expandedBase ? quotes.filter(quote => quote.base === expandedBase && (!selected || selected.has(quote.exchange))) : [], [quotes, expandedBase, selected]);
   useEffect(() => {
     const restore = (event?: StorageEvent) => {
@@ -553,7 +558,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
 
   return <section className={`perpetual-panel${workspace !== "positions" ? " perp-scanner" : ""}${fundingSort && view === "rank" ? " is-funding-mode" : ""}`} aria-label="CEX 与 DEX 合约价差监控">
     <header className="perp-heading"><div><h2>合约价差套利</h2></div><div className="perp-heading-actions" hidden={workspace !== "opportunities"}><button className="perp-refresh" type="button" aria-expanded={toolsOpen && healthOpen} aria-controls="perpetual-health-region" onClick={() => openTool("health")}><Activity size={15}/>报价健康</button><button className="perp-refresh" type="button" aria-expanded={toolsOpen && alertsOpen} aria-controls="perpetual-alert-region" onClick={() => openTool("alerts")}><Bell size={15}/>机会提醒</button><button className="perp-refresh" type="button" onClick={() => paused ? setInspection(null) : refresh()} disabled={!paused && connection === "paused"}><RefreshCw size={15}/>{paused ? "收起并恢复" : "刷新"}</button></div></header>
-    <nav className="perp-workspace-nav" aria-label="合约价差工作区"><button type="button" aria-current={workspace === "opportunities" ? "page" : undefined} onClick={() => leaveChart()}>发现机会</button><button type="button" aria-current={workspace === "chart" ? "page" : undefined} onClick={() => { if (chartSelection) selectChart(chartSelection); else { setInspection(null); setWorkspace("chart"); } }}>创建价差图表</button><button id="perp-positions-tab" type="button" aria-current={workspace === "positions" ? "page" : undefined} onClick={() => leaveChart("positions")}>持仓跟踪</button></nav>
+    {navSlot ? createPortal(<nav className="perp-workspace-nav" aria-label="合约价差工作区"><button type="button" aria-current={workspace === "opportunities" ? "page" : undefined} onClick={() => leaveChart()}>发现机会</button><button type="button" aria-current={workspace === "chart" ? "page" : undefined} onClick={() => { if (chartSelection) selectChart(chartSelection); else { setInspection(null); setWorkspace("chart"); } }}>创建价差图表</button><button id="perp-positions-tab" type="button" aria-current={workspace === "positions" ? "page" : undefined} onClick={() => leaveChart("positions")}>持仓跟踪</button></nav>, navSlot) : <nav className="perp-workspace-nav" aria-label="合约价差工作区"><button type="button" aria-current={workspace === "opportunities" ? "page" : undefined} onClick={() => leaveChart()}>发现机会</button><button type="button" aria-current={workspace === "chart" ? "page" : undefined} onClick={() => { if (chartSelection) selectChart(chartSelection); else { setInspection(null); setWorkspace("chart"); } }}>创建价差图表</button><button id="perp-positions-tab" type="button" aria-current={workspace === "positions" ? "page" : undefined} onClick={() => leaveChart("positions")}>持仓跟踪</button></nav>}
     {workspace === "positions" ? <Suspense fallback={<p role="status">正在加载持仓跟踪…</p>}><PerpetualPaper active={interactionActive} readActive={active}/></Suspense> : workspace === "chart" ? chartSelection ? <Suspense fallback={<p role="status">正在加载组合图表…</p>}><PerpetualChart key={JSON.stringify([chartSelection.base, chartSelection.longKey, chartSelection.shortKey])} selection={chartSelection} snapshot={visibleData} active={marketActive && Boolean(crossex.data) && !crossex.error} now={now} onSelectionChange={selectChart} onBack={() => leaveChart()} connectionError={crossex.error || problem}/></Suspense> : <div className="perp-empty"><h3 id="perpetual-chart-heading" tabIndex={-1}>创建价差图表</h3><p>{chartLinkError || "从套利列表点击组合，自动带入做多和做空合约，查看价差与 3、7、30 天资金费稳定度。"}</p><button type="button" onClick={() => leaveChart()}>选择套利组合</button></div> : <>
     <div className="scanner-toolbar">
       <div className="perp-view-tabs" role="group" aria-label="行情视图">
@@ -583,6 +588,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
     </div>
     {filtersOpen ? <ScannerRangeFilters inputs={rangeInputs} compiled={ranges} onChange={updateRange} onClear={clearRanges} onClose={closeRanges}/> : null}
     <div className="scanner-status"><div className={`perp-connection ${expired || error || data?.status === "unavailable" ? "is-warning" : ""}`} role="status"><i aria-hidden="true"/>{statusText}<span>{transportText}</span></div><span>{totalItems} {view === "rank" ? "组合" : "报价"} · {liveExchanges} / {exchanges.length} 平台在线 · 更新 {stamp(data?.generatedAt)} 北京时间</span><span className="scanner-direction-key"><i className="positive">多</i> 做多腿在上 <i className="negative">空</i> 做空腿在下</span></div>
+    <RelatedPositions variant="strip" market="perpetual" symbols={contextBases} active={active} extra={<button type="button" className="detail-side-action" aria-expanded={toolsOpen && alertsOpen} aria-controls="perpetual-alert-region" onClick={() => openTool("alerts")}><Bell size={13} aria-hidden="true"/>提醒设置</button>}/>
     {view === "rank" && ranges.active.length > 0 ? <div className="scanner-filter-progress" role="status" aria-label="全量筛选状态">
       {!ranges.valid ? <span className="scanner-filter-pending">请修正无效范围</span> : <><span>筛选范围：全部 {categoryRanking.length} 个候选组合</span><span>匹配 {ranking.length}</span>{rangeSelection.pending > 0 ? <span className="scanner-filter-pending">{!ranges.needsMetrics && ranges.historyHours.length === 1 && ranges.historyHours[0] === 720 ? "30天历史待补齐" : "待采集"} {rangeSelection.pending}{scannerLoading ? " · 自动补齐中" : ""}</span> : null}{rangeSelection.missing > 0 ? <span>缺失或过期 {rangeSelection.missing}</span> : null}{(scannerData?.progress?.deferred ?? 0) > 0 ? <span>部分数据稍后重试</span> : null}</>}
     </div> : null}

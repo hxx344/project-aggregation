@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { mount as mountChart } from "../modules/oil/app.mjs";
 import { createOilSummaryReader, type SummaryProps } from "../lib/monitor-summary";
 import { initialSummaries, type InitialMarketData } from "../lib/initial-market";
 type Mounted = { dispose: () => void; setActive: (active: boolean) => void; setSummaryActive: (active: boolean) => void };
 
-export default function OilPanel({ onSummary, initial = null, active = true, summaryActive = active }: SummaryProps & { initial?: InitialMarketData | null; active?: boolean; summaryActive?: boolean }) {
+export default function OilPanel({ onSummary, initial = null, active = true, summaryActive = active, children }: SummaryProps & { initial?: InitialMarketData | null; active?: boolean; summaryActive?: boolean; children?: ReactNode }) {
   const host = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
   const mountedPanel = useRef<Mounted | null>(null);
@@ -34,6 +34,8 @@ export default function OilPanel({ onSummary, initial = null, active = true, sum
       } catch (cause) {
         if (!controller.signal.aborted) {
           setError(cause instanceof Error ? cause.message : "原油面板加载失败。");
+          // Light-DOM details (exchange comparison) only render through this slot.
+          const slot = document.createElement("slot"); slot.name = "after-chart"; root.replaceChildren(slot);
           onSummary?.({ ...initialSummaries(initial).oil, status: initial?.oil.quote ? "stale" : "error" });
         }
       }
@@ -41,5 +43,5 @@ export default function OilPanel({ onSummary, initial = null, active = true, sum
     void load();
     return () => { controller.abort(); mountedPanel.current = null; mounted.forEach(panel => panel.dispose()); root.replaceChildren(); };
   }, [onSummary, initial]);
-  return <>{error && <p role="alert" className="notice error">{error}</p>}<div ref={host} data-monitor="oil" /></>;
+  return <>{error && <p role="alert" className="notice error">{error}</p>}<div ref={host} data-monitor="oil">{children}</div></>;
 }

@@ -9,8 +9,12 @@ import { startActivityPolling } from "../lib/polling";
 const time = (value: string | null) => value == null ? "尚无记录" : `${new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })} 北京时间`;
 const numberValue = (value: number) => Number.isFinite(value) ? value : "";
 
-function AlertSettings({ monitorId, title, adapter, active = true }: { monitorId: string; title: string; adapter: MonitorAlertAdapter; active?: boolean }) {
+export type AlertViewState = { view: MonitorAlertView | null; loadError: string };
+
+function AlertSettings({ monitorId, title, adapter, active = true, onView, openRequest = 0 }: { monitorId: string; title: string; adapter: MonitorAlertAdapter; active?: boolean; onView?: (monitorId: string, state: AlertViewState) => void; openRequest?: number }) {
   const [open, setOpen] = useState(false);
+  const [handledOpenRequest, setHandledOpenRequest] = useState(openRequest);
+  if (openRequest !== handledOpenRequest) { setHandledOpenRequest(openRequest); setOpen(true); }
   const [view, setView] = useState<MonitorAlertView | null>(null);
   const [draft, setDraft] = useState<MonitorAlertDraft>({ enabled: false, rules: [] });
   const [revision, setRevision] = useState(0);
@@ -57,6 +61,8 @@ function AlertSettings({ monitorId, title, adapter, active = true }: { monitorId
     return () => { controller.abort(); mutation.current?.abort(); polling.stop(); activity.current = null; window.removeEventListener("feishu-settings-changed", reload); window.removeEventListener("beforeunload", unload); };
   }, [adapter]);
   useEffect(() => { activeRef.current = active; activity.current?.setActive(active); }, [active]);
+  // The side panel reads this editor's poll instead of starting a second one.
+  useEffect(() => { onView?.(monitorId, { view, loadError }); }, [onView, monitorId, view, loadError]);
 
   async function mutate(discard: boolean) {
     if (busyRef.current) return;

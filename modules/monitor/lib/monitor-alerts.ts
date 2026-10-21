@@ -16,6 +16,8 @@ export type MonitorAlertView = {
   available: boolean; reason?: string; revision: number; draft: MonitorAlertDraft;
   webhookConfigured: boolean; checkedAt: string | null; lastSuccessAt: string | null;
   market: string; error: string; history: MonitorAlertEvent[];
+  /** Server-side market sample is past its freshness budget (oil and gold/oil report this). */
+  stale?: boolean;
 };
 export type AlertMetric = { id: string; label: string; unit: string; hysteresisUnit: string; min: number; max: number };
 type Fetcher = typeof fetch;
@@ -84,7 +86,7 @@ export const oilAlerts: MonitorAlertAdapter = {
     if (!status.available) return empty(status.reason);
     const [config, events] = await Promise.all([request<{ revision: number; config: OilConfig }>("/api/monitors/oil/config", signal, fetcher), request<{ events: OilEvent[] }>("/api/monitors/oil/events", signal, fetcher)]);
     const market = status.market;
-    return { available: true, revision: config.revision, draft: oilDraft(config.config), webhookConfigured: status.webhookConfigured, checkedAt: status.lastAttemptAt, lastSuccessAt: status.lastSuccessAt,
+    return { available: true, revision: config.revision, draft: oilDraft(config.config), webhookConfigured: status.webhookConfigured, checkedAt: status.lastAttemptAt, lastSuccessAt: status.lastSuccessAt, stale: status.stale === true,
       market: market ? `Binance 标记价${status.stale ? "（已过期）" : ""} · 布伦特 ${market.brent.markPx.toFixed(4)} / WTI ${market.wti.markPx.toFixed(4)} / 价差 ${oilSpreadPercent(market.brent.markPx, market.wti.markPx)?.toFixed(4) ?? "—"}%` : "服务器尚未取得有效行情。",
       error: [status.error, status.deliveryError].filter(Boolean).join("；"), history: events.events.map(event => ({ id: event.id, time: event.time, status: event.status, description: event.test ? "测试消息" : event.rules.map(rule => `${event.source === 'hyperliquid' ? '[历史 Hyperliquid] ' : '[Binance] '}${rule.label} · ${oilMetricLabel[rule.metric] ?? rule.metric} ${rule.value.toFixed(4)} ${rule.operator === "gte" ? "≥" : "≤"} ${rule.threshold} ${rule.metric === 'spreadPercent' ? '%' : event.source === 'hyperliquid' ? '美元/桶' : 'USDT/桶'}`).join("；"), error: event.error })) };
   },
@@ -119,7 +121,7 @@ function createGoldOilAlerts(oilType: GoldOilType, exchange: GoldOilExchange = '
     let market: GoldOilQuote | null = null, marketError = '';
     if (status.market) { try { market = validateGoldOilQuote(status.market, oilType, exchange); } catch { marketError = '行情合约标识或格式无效，已隐藏报价。'; } }
     return { available: true, revision: config.revision, draft: oilDraft(config.config), webhookConfigured: status.webhookConfigured,
-      checkedAt: status.lastAttemptAt, lastSuccessAt: status.lastSuccessAt,
+      checkedAt: status.lastAttemptAt, lastSuccessAt: status.lastSuccessAt, stale: status.stale === true,
       market: market ? `${source} 标记价${status.stale ? '（已过期）' : ''} · 金油比 XAU / ${instrument.code} ${market.ratio.toFixed(4)} ${units.ratio} · 黄金 ${market.xau.price.toFixed(4)} USDT/盎司 / ${instrument.name} ${market.oil.price.toFixed(4)} ${units.oil}` : '服务器尚未取得有效行情。',
       error: [status.error, status.deliveryError, marketError].filter(Boolean).join('；'),
       history: events.events.map(event => ({ id: event.id, time: event.time, status: event.status,
