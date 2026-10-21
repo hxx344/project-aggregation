@@ -79,6 +79,24 @@ test('Binance validates only held instruments and keeps native non-ASCII symbols
   }
 });
 
+test('Binance and Aster share the public catalog per fetcher, reload for an unseen symbol, and never cache failures', async () => {
+  let catalogs = 0, failCatalog = false, held = 'BTCUSDT';
+  const symbols = () => [...linearMetadata.symbols, { symbol: 'ETHUSDT', baseAsset: 'ETH', quoteAsset: 'USDT', marginAsset: 'USDT' }];
+  let listed = linearMetadata.symbols;
+  const fetcher = mock(url => {
+    if (url.pathname.includes('apiRestrictions')) return permissions();
+    if (url.pathname.endsWith('/exchangeInfo')) { catalogs++; return failCatalog ? { code: -1003 } : { symbols: listed }; }
+    return [{ ...linearPosition('1'), symbol: held }];
+  });
+  for (const scope of ['um', 'pm-um', 'um'] as const) await readBinancePositions(c, fetcher, undefined, scope);
+  assert.equal(catalogs, 1, 'UM and PM-UM reuse one cached catalog');
+  held = 'ETHUSDT'; listed = symbols();
+  assert.equal((await readBinancePositions(c, fetcher))[0].symbol, 'ETHUSDT'); assert.equal(catalogs, 2, 'unseen symbol forces one reload');
+  held = 'NEWUSDT'; await assert.rejects(readBinancePositions(c, fetcher)); assert.equal(catalogs, 3);
+  const fresh = mock(url => url.pathname.includes('apiRestrictions') ? permissions() : url.pathname.endsWith('/exchangeInfo') ? (catalogs++, failCatalog ? { code: -1003 } : { symbols: listed }) : [{ ...linearPosition('1'), symbol: 'BTCUSDT' }]);
+  failCatalog = true; await assert.rejects(readBinancePositions(c, fresh)); failCatalog = false;
+  await readBinancePositions(c, fresh); assert.equal(catalogs, 5, 'a failed load is retried next time');
+});
 const bybitPosition = (side = 'Buy', symbol = 'BTCUSDT') => ({ symbol, side, size: '0.000000000000000001', avgPrice: '100', markPrice: '102', positionValue: '0.000000000000000102', unrealisedPnl: '-0.01', leverage: '', liqPrice: '', updatedTime: String(at) });
 test('Bybit follows every cursor and normalizes USDT/USDC/inverse/option using instrument currency metadata', async () => {
   for (const scope of ['linear-usdt', 'linear-usdc', 'inverse', 'option'] as const) {

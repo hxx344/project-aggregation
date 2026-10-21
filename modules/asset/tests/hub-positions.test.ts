@@ -46,7 +46,7 @@ test('GET returns loading promptly, single-flights within TTL and marks only suc
   pending.resolve([]); await service.idle(); assert.equal(reads, 4);
   const result = await service.read(f.database, 'owner', f.unseal);
   assert.equal(scope(result).status, 'live'); assert.deepEqual(scope(result).positions, []); assert.equal(scope(result).fetchedAt, new Date(at).toISOString());
-  clock += 29_999; await service.read(f.database, 'owner', f.unseal); assert.equal(reads, 4);
+  clock += 4_999; await service.read(f.database, 'owner', f.unseal); assert.equal(reads, 4);
   assert.equal(JSON.stringify(result).includes('synthetic-secret'), false);
 });
 
@@ -161,4 +161,16 @@ test('Binance hides and stops polling the account mode that fails while the othe
     for (const id of working) assert.equal(scope(failed, 'binance', 'default', id).status, 'error');
     await service.idle(); assert.ok(restricted.every(id => reads.includes(id)), 'restored mode is polled again');
   }
+});
+
+test('exchange scopes refresh every 5 s and Variational every 30 s', async t => {
+  const f = fixture(); t.after(() => f.database.close()); let clock = at; const reads: string[] = [];
+  await f.save('owner', 'variational', { exchange: 'variational', vrToken: 'synthetic-token' });
+  await f.save('owner', 'okx', { exchange: 'okx', apiKey: 'synthetic-key', apiSecret: 'synthetic-secret', passphrase: 'synthetic' });
+  const service = createPositionsService({ now: () => clock, read: async (c, id) => { reads.push(c.exchange + ':' + id); return []; } });
+  const cycle = async (ms: number) => { clock += ms; reads.length = 0; await service.read(f.database, 'owner', f.unseal); await service.idle(); return [...new Set(reads.map(item => item.split(':')[0]))].sort(); };
+  assert.deepEqual(await cycle(0), ['okx', 'variational']);
+  assert.deepEqual(await cycle(4_999), []);
+  assert.deepEqual(await cycle(1), ['okx']);
+  assert.deepEqual(await cycle(25_000), ['okx', 'variational']);
 });

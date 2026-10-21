@@ -16,7 +16,9 @@ type SourceAccount = { id: string; name: string; exchange: PositionsExchangeId; 
 type Unseal = (encrypted: string, context: string) => Promise<unknown>;
 type Read = (credentials: Credentials, scope: string, signal: AbortSignal) => Promise<Position[]>;
 type Entry = { revision: string; scope: PositionsScope; attemptedAt: number; touchedAt: number; pending?: Promise<void>; abort?: AbortController };
-const TTL = 30_000;
+const TTL = 5_000;
+// Variational reads start a Python process per refresh.
+const SLOW_TTL: Partial<Record<PositionsExchangeId, number>> = { variational: 30_000 };
 const STALE_AFTER = 90_000;
 const DEADLINE = 25_000;
 const revisionOf = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -63,7 +65,8 @@ async function sourceAccounts(database: Database, owner: string): Promise<Source
 
 /** Process-local snapshots contain normalized public data only. Each poll reads current vault revisions. */
 export function createPositionsService(options: { now?: () => number; ttl?: number; deadline?: number; concurrency?: number; read?: Read } = {}) {
-  const now = options.now ?? Date.now, ttl = options.ttl ?? TTL;
+  const now = options.now ?? Date.now;
+  const ttlFor = (exchange: PositionsExchangeId) => options.ttl ?? SLOW_TTL[exchange] ?? TTL;
   const entries = new Map<string, Entry>();
   let active = 0;
   const queue: (() => void)[] = [];
@@ -137,7 +140,7 @@ export function createPositionsService(options: { now?: () => number; ttl?: numb
               entry = { revision, scope: empty(scope, true), attemptedAt: -Infinity, touchedAt: now() }; entries.set(key, entry);
             }
             entry.touchedAt = now();
-            if (!entry.pending && now() - entry.attemptedAt >= ttl) refresh(database, owner, account, entry, key, unseal);
+            if (!entry.pending && now() - entry.attemptedAt >= ttlFor(account.exchange)) refresh(database, owner, account, entry, key, unseal);
             const result = { ...entry.scope, positions: entry.scope.positions.map(item => ({ ...item })) };
             if (result.status === 'live' && result.fetchedAt && now() - Date.parse(result.fetchedAt) >= STALE_AFTER) result.status = 'stale';
             return [result];

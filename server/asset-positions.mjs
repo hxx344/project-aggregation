@@ -98,9 +98,9 @@ function sourceError(error) {
 }
 
 /** Only configured Asset projects are addressable; exchange credentials stay in Asset. */
-export function createAssetPositions({ listTargets, request = requestJson, now = Date.now, cacheMs = 5000, timeoutMs = 12000 } = {}) {
+export function createAssetPositions({ listTargets, request = requestJson, now = Date.now, cacheMs = 5000, timeoutMs = 12000, backgroundIntervalMs = 0 } = {}) {
   const entries = new Map();
-  let closed = false;
+  let closed = false, timer, background = null;
   const targets = () => listTargets().filter(target => target.project.enabled && target.project.adapter === 'asset');
   const usable = target => !!target.project.apiUrl && (!!target.project.embedded || !!target.credentials?.password);
   const present = target => !closed && targets().some(current => current.project.id === target.project.id && current.revision === target.revision && usable(current));
@@ -159,10 +159,15 @@ export function createAssetPositions({ listTargets, request = requestJson, now =
     const current = reconcile();
     return { generatedAt: new Date(now()).toISOString(), sources: current.map(target => view(target, entries.get(target.project.id))) };
   }
+  if (backgroundIntervalMs > 0) {
+    // Without an open page Asset only refreshes when read; this keeps its per-scope snapshots warm.
+    timer = setInterval(() => { background ??= state().catch(() => {}).finally(() => { background = null; }); }, backgroundIntervalMs);
+    timer.unref?.();
+  }
   return { state, invalidate, async close() {
-    closed = true;
+    closed = true; clearInterval(timer);
     const pending = [...entries.values()].map(entry => entry.pending);
     for (const id of entries.keys()) invalidate(id);
-    await Promise.allSettled(pending);
+    await Promise.allSettled([...pending, background]);
   } };
 }

@@ -86,6 +86,26 @@ function signedQuantity(row: Json, field: string, sideField: string): { quantity
 // Only held instruments are validated: an unrelated listing must not invalidate the account snapshot.
 const instrumentsOf = (metadata: unknown) => new Map(rows(record(metadata).symbols).map(item => [item.symbol, item]));
 
+const CATALOG_TTL = 10 * 60_000;
+type CatalogSlot = { value?: { metadata: unknown; symbols: Set<unknown>; expires: number }; pending?: Promise<unknown> };
+const catalogs = new WeakMap<Fetcher, Map<string, CatalogSlot>>();
+/** Public instrument catalogs (about 1 MB each) are shared for 10 minutes per fetcher. A held symbol missing from the
+ * cached copy forces a reload so new listings resolve at once; failed or malformed loads are never cached. */
+async function catalog(fetcher: Fetcher, key: string, held: unknown[], load: () => Promise<unknown>): Promise<unknown> {
+  let store = catalogs.get(fetcher);
+  if (!store) { store = new Map(); catalogs.set(fetcher, store); }
+  let slot = store.get(key);
+  if (!slot) { slot = {}; store.set(key, slot); }
+  const cached = slot.value;
+  if (cached && cached.expires > Date.now() && held.every(symbol => cached.symbols.has(symbol))) return cached.metadata;
+  const current = slot;
+  current.pending ??= load().then(metadata => {
+    current.value = { metadata, symbols: new Set(instrumentsOf(metadata).keys()), expires: Date.now() + CATALOG_TTL };
+    return metadata;
+  }).finally(() => { current.pending = undefined; });
+  return current.pending;
+}
+
 function normalizeLinear(data: unknown, metadata: unknown): Position[] {
   const instruments = instrumentsOf(metadata);
   return uniquePositions(rows(data).flatMap(row => {
@@ -110,8 +130,10 @@ export async function readBinancePositions(c: BinanceCredential, fetcher: Fetche
   const coinMargined = scope === 'cm' || scope === 'pm-cm', portfolioMargin = scope.startsWith('pm-');
   const path = portfolioMargin ? '/papi/v1/' + (coinMargined ? 'cm' : 'um') + '/positionRisk' : coinMargined ? '/dapi/v1/positionRisk' : '/fapi/v3/positionRisk';
   const data = await positionsGet('binance', c, path, new URLSearchParams(), fetcher, signal);
-  if (!rows(data).some(row => !isZero(decimal(row.positionAmt)))) return [];
-  const metadata = await positionsGet('binance', c, coinMargined ? '/dapi/v1/exchangeInfo' : '/fapi/v1/exchangeInfo', new URLSearchParams(), fetcher, signal);
+  const held = rows(data).filter(row => !isZero(decimal(row.positionAmt))).map(row => row.symbol);
+  if (!held.length) return [];
+  const catalogPath = coinMargined ? '/dapi/v1/exchangeInfo' : '/fapi/v1/exchangeInfo';
+  const metadata = await catalog(fetcher, 'binance' + catalogPath, held, () => positionsGet('binance', c, catalogPath, new URLSearchParams(), fetcher, signal));
   const result = coinMargined ? normalizeBinanceInverse(data, metadata) : normalizeLinear(data, metadata);
   return portfolioMargin ? result.map(item => ({ ...item, marginMode: 'portfolio' })) : result;
 }
@@ -209,7 +231,8 @@ export async function readAsterPositions(c: AsterCredential, fetcher: Fetcher = 
   const signature = await wallet.signTypedData({ name: 'AsterSignTransaction', version: '1', chainId: 1666, verifyingContract: '0x0000000000000000000000000000000000000000' }, { Message: [{ name: 'msg', type: 'string' }] }, { msg: params.toString() });
   params.set('signature', signature);
   const data = await getJson('https://fapi.asterdex.com' + path + '?' + params, {}, fetcher, signal);
-  if (!rows(data).some(row => !isZero(decimal(row.positionAmt)))) return [];
-  const metadata = await getJson('https://fapi.asterdex.com/fapi/v3/exchangeInfo', {}, fetcher, signal);
+  const held = rows(data).filter(row => !isZero(decimal(row.positionAmt))).map(row => row.symbol);
+  if (!held.length) return [];
+  const metadata = await catalog(fetcher, 'aster/fapi/v3/exchangeInfo', held, () => getJson('https://fapi.asterdex.com/fapi/v3/exchangeInfo', {}, fetcher, signal));
   return normalizeLinear(data, metadata);
 }

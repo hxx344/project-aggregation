@@ -149,3 +149,14 @@ test('times out with a controlled error and aborts pending requests on close', a
   f.tick(); const pending = f.reader.state(); await f.reader.close();
   assert.deepEqual((await pending).sources, []);
 });
+
+test('background reads keep sources warm without a page, never overlap, and stop on close', async t => {
+  const f = fixture(t, { backgroundIntervalMs: 20, cacheMs: 0 }); let active = 0, maximum = 0;
+  f.handle(async () => { active++; maximum = Math.max(maximum, active); await new Promise(resolve => setTimeout(resolve, 30)); active--; return { data: payload() }; });
+  await new Promise(resolve => setTimeout(resolve, 150));
+  const reads = () => f.calls.filter(call => call.path === '/api/hub/positions').length;
+  assert.ok(reads() >= 2, 'reads happen without any caller'); assert.equal(maximum, 1);
+  await f.reader.close(); const after = reads();
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(reads(), after);
+});
