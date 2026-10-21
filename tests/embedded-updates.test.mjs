@@ -12,10 +12,11 @@ const state = (status = null) => ({ enabled: true, checking: false, checkedAt: s
   planId, expiresAt: stamp, modules: [], job: status ? { id: 'managed-update', status, startedAt: stamp,
     finishedAt: ['queued', 'running'].includes(status) ? null : stamp, activeModule: null, steps: [], message: '更新状态' } : null });
 
-function fixture({ maintenance = false, pendingPlanId = null } = {}) {
+function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 } = {}) {
   const persisted = { maintenance, pendingPlanId };
   const active = { crossex: null, greeks: null, aster: null }, events = [], handlers = {}, calls = [];
   let updaterState = state('running');
+  const gates = { status: null };
   const request = async (origin, route, options) => {
     const id = modules.find(id => origin === `http://${id}.workspace.internal`);
     assert.ok(id, 'guard must use one of the fixed private module origins');
@@ -44,7 +45,12 @@ function fixture({ maintenance = false, pendingPlanId = null } = {}) {
   };
   const guard = createModuleUpdateGuard({ request });
   const client = {
-    async status() { calls.push('status'); return structuredClone(updaterState); },
+    async status() {
+      calls.push('status');
+      const snapshot = structuredClone(updaterState);
+      if (gates.status) { const gate = gates.status; gates.status = null; gate.entered.resolve(); await gate.release.promise; }
+      return snapshot;
+    },
     async check() { calls.push('check'); return structuredClone(updaterState); },
     async apply(id, deployMode) {
       calls.push('apply'); events.push('updater:apply'); assert.equal(id, planId);
@@ -61,10 +67,12 @@ function fixture({ maintenance = false, pendingPlanId = null } = {}) {
     writePendingPlanId: value => { persisted.pendingPlanId = value; events.push(`persist:plan:${value}`); },
     setModuleMaintenance: guard.setMaintenance,
     prepareApply: async () => { events.push('prepare'); await guard.prepareApply(); },
+    releasePollMs,
   });
   return { coordinator, guard, persisted, active, events, handlers, calls,
     apply: deployMode => coordinator.apply(planId, () => events.push('authorize'), deployMode),
-    set updaterState(value) { updaterState = value; } };
+    set updaterState(value) { updaterState = value; },
+    holdNextStatus() { const gate = { entered: deferred(), release: deferred() }; gates.status = gate; return gate; } };
 }
 
 test('coordinator initialization synchronizes each module with durable maintenance and pending-plan recovery', async t => {
@@ -242,4 +250,91 @@ test('a module that does not acknowledge the requested maintenance value fails c
       assert.equal(f.events.includes('prepare'), false);
     });
   }
+});
+
+const until = async (condition, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('condition not reached');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+};
+
+test('a restarted hub releases the update latch itself once the updater job finishes', async t => {
+  const f = fixture({ maintenance: true, releasePollMs: 10 });
+  t.after(() => f.coordinator.close());
+  await f.coordinator.initialize();
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
+  await until(() => f.calls.length >= 2);
+  assert.equal(f.persisted.maintenance, true, 'a running job keeps the latch');
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
+  f.updaterState = state('succeeded');
+  await until(() => f.active.aster === false);
+  assert.deepEqual(f.active, { crossex: false, greeks: false, aster: false });
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  const settled = f.calls.length;
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(f.calls.length, settled, 'polling stops once the latch is released and modules acknowledged it');
+});
+
+test('background release polling keeps an uncertain plan latched and stops on close', async () => {
+  const f = fixture({ maintenance: true, pendingPlanId: planId, releasePollMs: 10 });
+  await f.coordinator.initialize();
+  f.updaterState = unavailableUpdateState();
+  await until(() => f.calls.length >= 2);
+  f.updaterState = state();
+  await until(() => f.calls.length >= 4);
+  assert.deepEqual(f.persisted, { maintenance: true, pendingPlanId: planId }, 'an idle updater still offering the pending plan is not completion');
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
+  f.coordinator.close();
+  const stopped = f.calls.length;
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.ok(f.calls.length <= stopped + 1, 'close stops further polling');
+});
+
+test('a failed initial module synchronization is retried without any browser status read', async t => {
+  const f = fixture({ releasePollMs: 10 });
+  t.after(() => f.coordinator.close());
+  let failures = 2;
+  f.handlers['gate:aster'] = active => {
+    if (failures-- > 0) throw new Error('module not ready');
+    return { data: { active } };
+  };
+  f.active.aster = true;
+  f.updaterState = state();
+  await assert.rejects(f.coordinator.initialize(), error => error instanceof UpdateError && error.status === 503);
+  await until(() => f.active.aster === false);
+  assert.deepEqual(f.active, { crossex: false, greeks: false, aster: false });
+  assert.equal(f.persisted.maintenance, false);
+});
+
+test('release polling never reads status while an apply is in flight', async t => {
+  const f = fixture({ releasePollMs: 10 }), entered = deferred(), release = deferred();
+  t.after(() => f.coordinator.close());
+  f.handlers['status:aster'] = async () => { entered.resolve(); await release.promise; return { data: { busy: false } }; };
+  const result = f.apply();
+  await entered.promise;
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.deepEqual(f.calls, [], 'no updater status read races the privileged submission');
+  release.resolve();
+  assert.equal((await result).job.status, 'running');
+  await until(() => f.calls.includes('status'));
+  f.updaterState = state('succeeded');
+  await until(() => f.active.aster === false);
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+});
+
+test('closing during a background status read neither persists the result nor calls modules', async () => {
+  const f = fixture({ maintenance: true, releasePollMs: 10 });
+  await f.coordinator.initialize();
+  f.updaterState = state('succeeded');
+  const gate = f.holdNextStatus();
+  await gate.entered.promise;
+  const closing = f.coordinator.close();
+  const events = f.events.length;
+  gate.release.resolve();
+  await closing;
+  assert.equal(f.events.length, events, 'no persistence or module call after close');
+  assert.equal(f.persisted.maintenance, true);
+  assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
 });

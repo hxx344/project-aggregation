@@ -172,15 +172,28 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, prepareApply = async () => {} }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, prepareApply = async () => {}, releasePollMs = 5000 }) {
   let pendingPlanId = readPendingPlanId();
   let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
-  let moduleSync = Promise.resolve();
+  let moduleSync = Promise.resolve(), synchronized = false, watcher = null, polling = null, closed = false;
   const synchronizeModules = () => {
     const next = moduleSync.catch(() => {}).then(() => setModuleMaintenance(maintenance));
-    moduleSync = next; return next;
+    moduleSync = next;
+    void next.then(() => { synchronized = true; }, () => { synchronized = false; }).finally(watchRelease);
+    return next;
   };
+  // The hub restarts while the update job is still running, so the latch can
+  // only be released by a later status read. Without a server-side read the
+  // trading modules stay in maintenance until some browser asks for status.
+  function watchRelease() {
+    if (closed || watcher || !(releasePollMs > 0) || applying || !maintenance && synchronized) return;
+    watcher = setTimeout(() => {
+      // status() always resynchronizes modules; failures retry on the next turn.
+      polling = (applying ? Promise.resolve() : status()).catch(() => {}).finally(() => { polling = null; watcher = null; watchRelease(); });
+    }, releasePollMs);
+    watcher.unref?.();
+  }
   function remember(value) { if (maintenance !== value) { writeMaintenance(value); maintenance = value; } }
   function rememberPending(value, deployMode = 'source') {
     const rememberMode = () => { if (pendingDeployMode !== deployMode) { writePendingDeployMode(deployMode); pendingDeployMode = deployMode; } };
@@ -202,6 +215,8 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   async function status() {
     const version = generation;
     const state = publicUpdateState(await client.status());
+    // A read that returns during shutdown must not write state or call modules.
+    if (closed) return state;
     if (!applying && version === generation) observe(state);
     await synchronizeModules();
     return state;
@@ -266,5 +281,6 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     })();
     return pending.promise;
   }
-  return { status, check, apply, token, withExecutionEntry, initialize: synchronizeModules };
+  async function close() { closed = true; clearTimeout(watcher); await polling; }
+  return { status, check, apply, token, withExecutionEntry, initialize: synchronizeModules, close };
 }
