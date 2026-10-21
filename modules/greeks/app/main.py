@@ -22,6 +22,7 @@ from .security import authorize_dashboard
 from .static_compression import StaticCompressionMiddleware
 from .workspace import update_status
 from .strategy import StrategyUnavailable, SundayExpiryUnavailable
+from .position_greeks import summarize_position_greeks
 from .models import CloseRequest, OpenRequest, Position, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest, StrategyMode, TradePlanRequest, TradeTaskRequest
 
 # The dashboard polls several endpoints frequently; HTTP 200 access lines are
@@ -247,7 +248,10 @@ async def _build_account_dashboard():
     if isinstance(execution_result, Exception):
         engine.log("WARNING", f"Could not refresh dashboard executions: {execution_result}")
         execution_result = engine.last_executions
-    return {"positions": {"available": positions_available, "items": [item.model_dump(mode="json") for item in position_result]}, "health": health_result.model_dump(mode="json"), "executions": {"items": [item.model_dump(mode="json") for item in execution_result]}, "logs": {"items": [item.model_dump(mode="json") for item in engine.logs]}}
+    greeks = summarize_position_greeks(position_result, engine.ticker_greeks, positions_available=positions_available,
+                                       market_updated_at=engine.chain_updated_at if engine.chain_source == "bybit" else None,
+                                       stale_seconds=engine.settings.quote_stale_seconds)
+    return {"positions": {"available": positions_available, "items": [item.model_dump(mode="json") for item in position_result]}, "greeks": greeks, "health": health_result.model_dump(mode="json"), "executions": {"items": [item.model_dump(mode="json") for item in execution_result]}, "logs": {"items": [item.model_dump(mode="json") for item in engine.logs]}}
 
 
 @app.get("/api/chain")

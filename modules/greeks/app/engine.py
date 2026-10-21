@@ -20,6 +20,7 @@ from .reconciliation import ReconciliationMixin
 from .performance import PerformanceMixin
 from .trade_tasks import TradeTaskMixin, TradeConflict
 from .account_writer import ManagedWriter
+from .position_greeks import ticker_greeks
 
 
 class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMixin):
@@ -30,6 +31,8 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
         self.chain = []
         self.chain_source = "demo"
         self.chain_updated_at: datetime | None = None
+        # Replaced together with self.chain; timestamped by chain_updated_at.
+        self.ticker_greeks: dict[str, dict[str, float | None]] = {}
         self.raw_instruments: list[dict] = []
         self.instruments_updated_at: datetime | None = None
         self.btc_price: float | None = None
@@ -225,6 +228,7 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
                 if len(valid_deltas) >= 2 and {item.option_type for item in valid_deltas} == {"Call", "Put"}:
                     # Replace the visible snapshot only after both endpoints and all rows validate.
                     self.chain = parsed
+                    self.ticker_greeks = {symbol: ticker_greeks(ticker) for symbol, ticker in ticker_map.items() if symbol}
                     self.chain_source = "bybit"
                     self.chain_updated_at = now
                     self.btc_price = underlying_price or None

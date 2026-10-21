@@ -171,12 +171,17 @@ function renderPayoff(preview) {
   const maxProfit = Number(preview.net_credit_usd); const current = spot ? payoffAt(spot, preview) : 0;
   $('payoffStats').innerHTML = `<div class="payoff-stat"><span>现价对应到期盈亏</span><strong class="${current >= 0 ? 'profit' : 'loss'}">${money(current)}</strong></div><div class="payoff-stat"><span>最大收益</span><strong class="profit">${Number.isFinite(maxProfit) ? money(maxProfit) : '--'}</strong></div><div class="payoff-stat"><span>最大亏损</span><strong class="loss">${unbounded ? '无上限' : optionalMoney(preview.max_loss_usd)}</strong></div><div class="payoff-stat"><span>盈亏平衡</span><strong>${breaks.length ? breaks.map((point) => Math.round(point).toLocaleString()).join(' / ') : '--'}</strong></div>`;
 }
-function renderLegs(legs) { $('legs').className = 'legs'; $('legs').innerHTML = (legs || []).map((leg) => `<div class="leg"><span class="leg-mark ${leg.side.toLowerCase()}">${leg.side === 'Sell' ? 'S' : 'B'} ${leg.option_type[0]}</span><div><div class="leg-title">${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type} · Δ ${Number(leg.delta).toFixed(3)}</div><div class="leg-symbol">${esc(leg.symbol)}</div></div><div class="leg-price"><strong>${money(leg.mark_price)}</strong><small>目标 ${Number(leg.target_delta).toFixed(2)}</small><small>预估费 ${money(leg.estimated_fee_usd)} / 封顶 ${money(leg.fee_cap_usd)}</small></div></div>`).join(''); }
-function renderPositions(items) { $('positions').className = items.length ? 'positions' : 'positions empty'; $('positions').innerHTML = items.length ? items.map((p) => `<div class="position-row"><strong>${esc(p.symbol)}</strong><span>${esc(p.side)} · ${p.size}</span><span class="${p.unrealised_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${money(p.unrealised_pnl)}</span></div>`).join('') : '暂无持仓'; }
+function renderLegs(legs) {
+  $('legs').className = 'legs';
+  const rows = (legs || []).map((leg) => `<tr><td><span class="leg-mark ${leg.side.toLowerCase()}" title="${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type}">${leg.side === 'Sell' ? 'S' : 'B'} ${leg.option_type[0]}</span></td><td class="leg-symbol">${esc(leg.symbol)}<small>${leg.side === 'Sell' ? '卖出' : '买入'} ${leg.option_type}</small></td><td class="r">${Number(leg.delta).toFixed(3)} / ${Number(leg.target_delta).toFixed(2)}</td><td class="r">${money(leg.mark_price)}</td><td class="r">${money(leg.estimated_fee_usd)} / ${money(leg.fee_cap_usd)}</td></tr>`).join('');
+  $('legs').innerHTML = `<table class="legs-table" aria-label="策略腿"><thead><tr><th scope="col">腿</th><th scope="col">合约</th><th scope="col" class="r">Δ / 目标</th><th scope="col" class="r">标记价</th><th scope="col" class="r">预估费 / 封顶</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderPositions(items) { setTabCount('tabPositionsCount', items.length ? String(items.length) : ''); $('positions').className = items.length ? 'positions' : 'positions empty'; $('positions').innerHTML = items.length ? items.map((p) => `<div class="position-row"><strong>${esc(p.symbol)}</strong><span>${esc(p.side)} · ${p.size}</span><span class="${p.unrealised_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${money(p.unrealised_pnl)}</span></div>`).join('') : '暂无持仓'; }
 function renderLogs(items) { $('logs').innerHTML = (items || []).slice(0, 20).map((log) => `<div class="log-line"><span class="log-time">${utcTime(log.timestamp)}</span><span class="log-level ${log.level}">${log.level}</span><span>${esc(log.message)}</span></div>`).join(''); }
 function renderPortfolioMargin(health) {
   let target = $('pmDetails');
   if (!target) { target = document.createElement('div'); target.id = 'pmDetails'; target.className = 'pm-details'; $('healthContent').appendChild(target); }
+  if ($('pmDisclosure')) $('pmDisclosure').hidden = health.margin_mode !== 'PORTFOLIO_MARGIN';
   if (health.margin_mode !== 'PORTFOLIO_MARGIN') { target.style.display = 'none'; return; }
   target.style.display = 'grid';
   if (!health.portfolio_margin_available) { target.innerHTML = `<div class="pm-message">真实 PM 明细不可用：${esc(health.portfolio_margin_message || '等待 Bybit 返回')}</div>`; return; }
@@ -358,6 +363,7 @@ async function loadMarket() {
     if ($('modeBox')) $('modeBox').dataset.mode = config.environment || (enabled ? 'live' : 'dry-run');
     const modeLabel = config.environment === "testnet" ? "TESTNET" : (enabled ? "LIVE" : "MAINNET DATA / DRY");
     window.__tradingBlocked = Boolean(config.trading_blocked_reason);
+    window.__blockedReason = config.trading_blocked_reason ? `交易已阻止：${config.trading_blocked_reason}` : config.opening_blocked_reason ? '开仓已阻止：RFQ 状态待确认，后台正在对账' : '';
     window.__marketReadOnly = payload.read_only === true || payload.status === 'waiting_for_listing';
     window.__strategyUnavailable = !preview || window.__marketReadOnly;
     $('marketNotice').hidden = !window.__marketReadOnly;
@@ -431,7 +437,7 @@ async function loadMarket() {
     $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#F2626B' : '#2DBE87';
     if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
   } catch (error) { if (!current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#F2626B'; }
-  finally { read.finish(); }
+  finally { read.finish(); updateStrip(); }
 }
 let ordersSnapshot = null;
 let ordersReceivedAt = null;
@@ -624,6 +630,7 @@ function renderExecutionGroups(groups = []) {
   $('executionHistory').hidden = !history.length;
   $('executionHistorySummary').textContent = `最近结束的组合 · ${history.length} 笔`;
   $('ordersSummary').textContent = `执行中 ${active.length} 组 · 最近结束 ${history.length} 组`;
+  setTabCount('tabOrdersCount', active.length ? String(active.length) : '');
   const hero = active[0];
   $('heroExecution').textContent = hero ? `${hero.operation === 'close' ? '平仓' : '开仓'}执行中 · ${orderNumber(hero.completed_legs)} / ${orderNumber(hero.total_legs)} 腿完成` : tradeFlow.pending ? '提交结果待核对' : '当前无活动执行';
 }
@@ -753,13 +760,16 @@ async function loadAccount() {
     if (!read.current()) return;
     const {positions, logs, health, executions} = payload;
     window.__positionSnapshot = positions.items || [];
+    renderGreeks(payload.greeks || null);
+    // Missing credentials is the normal demo state and is already shown in the health panel.
+    window.__accountIssue = !health.available && health.message && health.message !== 'Live account credentials are not configured' ? `账户读取异常：${health.message}` : positions.available === false ? '持仓更新失败，显示最近一次记录' : '';
     window.__positionError = positions.available === false;
     renderPositionPayoff();
     renderPositions(positions.items || []); renderLogs(logs.items || []); renderExecutions(executions.items || []);
     window.__latestExecutions = executions.items || [];
     $('healthMode').textContent = health.available ? marginLabel(health.margin_mode) : '未连接账户'; $('healthUnavailable').textContent = health.message || '连接账户后，将显示余额、保证金和风险指标。'; $('healthUnavailable').style.display = health.available ? 'none' : 'block'; $('healthContent').style.display = health.available ? 'grid' : 'none'; if (health.available) { const im = Number(health.initial_margin_rate || 0) * 100; const mm = Number(health.maintenance_margin_rate || 0) * 100; $('imRate').textContent = `${im.toFixed(2)}%`; $('mmRate').textContent = `${mm.toFixed(2)}%`; $('imBar').style.width = `${Math.min(100, im)}%`; $('mmBar').style.width = `${Math.min(100, mm)}%`; $('availableBalance').textContent = money(health.available_balance_usd); $('marginBalance').textContent = money(health.margin_balance_usd); $('totalEquity').textContent = money(health.total_equity_usd); $('accountMode').textContent = marginLabel(health.margin_mode); renderPortfolioMargin(health); }
-  } catch (error) { if (!read.current()) return; window.__positionError = true; renderPositionPayoff(); $('healthMode').textContent = '账户连接异常'; $('healthUnavailable').textContent = error.message; $('healthUnavailable').style.display = 'block'; $('healthContent').style.display = 'none'; }
-  finally { read.finish(); }
+  } catch (error) { if (!read.current()) return; window.__positionError = true; window.__accountIssue = `账户读取失败：${error.message}`; renderGreeks(null, {failed: true}); renderPositionPayoff(); $('healthMode').textContent = '账户连接异常'; $('healthUnavailable').textContent = error.message; $('healthUnavailable').style.display = 'block'; $('healthContent').style.display = 'none'; }
+  finally { read.finish(); updateStrip(); }
 }
 async function load() { await Promise.allSettled([loadMarket(), loadAccount()]); }
 async function openTrade() { await prepareTrade('open'); }
@@ -823,6 +833,7 @@ function renderRfq(state) {
   if (tradeFlow.lock === 'rfqExecutionUnknown' && tradeFlow.rfqRejectedId === state?.rfq_id && state?.status === 'Active' && !state.selected_quote_id) tradeFlow.lock = null;
   if (tradeFlow.lock === 'rfqCreateUnknown' && state?.rfq_id && state.rfq_id !== tradeFlow.previousRfqId) tradeFlow.lock = null;
   updateRfqConfirmation();
+  setTabCount('tabRfqCount', rfqStatusLabel(state));
   if (!state || !state.rfq_id || rfqTerminal(state)) { $('rfqStatus').textContent = rfqStatusLabel(state); $('rfqId').textContent = '--'; $('rfqType').textContent = '--'; $('rfqExpires').textContent = '--'; $('rfqQuoteCount').textContent = '0'; $('rfqQuotes').className = 'rfq-quotes empty'; $('rfqQuotes').textContent = '暂无活动 RFQ'; updateTradeControls(); return; }
   $('rfqStatus').textContent = rfqStatusLabel(state); $('rfqId').textContent = state.rfq_id; $('rfqType').textContent = rfqStrategyLabel(state); $('rfqExpires').textContent = state.expires_at ? new Date(Number(state.expires_at)).toLocaleTimeString('zh-CN') : '--'; const quotes = (state.quotes || []).slice().sort((a, b) => { const aCount = quoteLegCount(a); const bCount = quoteLegCount(b); const total = (state.legs || []).length; if ((aCount >= total) !== (bCount >= total)) return aCount >= total ? -1 : 1; if ((aCount > 0) !== (bCount > 0)) return aCount > 0 ? -1 : 1; return quoteNet(b, 'Sell', state) - quoteNet(a, 'Sell', state); }); $('rfqQuoteCount').textContent = String(quotes.length);
   $('rfqQuotes').className = quotes.length ? 'rfq-quotes' : 'rfq-quotes empty'; $('rfqQuotes').innerHTML = quotes.length ? quotes.map((quote) => { const legCount = quoteLegCount(quote); const complete = legCount >= (state.legs || []).length; const executable = complete && state.status === 'Active' && !state.selected_quote_id; const disabled = executable && !transactionBusy() ? '' : ' disabled title="报价不完整或询价已经提交/结束"'; const netDiff = quoteNetDiff(quote, state); return `<div class="rfq-quote"><div><strong>${esc(quote.deskCode || '做市商')} · ${legCount}/${(state.legs || []).length} 腿</strong><span>${esc(quote.status || '--')} · 到期 ${quote.expiresAt ? new Date(Number(quote.expiresAt)).toLocaleTimeString('zh-CN') : '--'}</span></div><div class="rfq-quote-values"><span>Sell 净额 ${quoteNet(quote, 'Sell', state).toFixed(4)}</span><span class="${netDiff >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative'}">链净额差 ${netDiff >= 0 ? '+' : ''}${netDiff.toFixed(4)}</span><span class="rfq-fee">预估手续费 ${rfqFeeEstimate(quote).toFixed(6)} USDT <small>预估费率0.03% · 单腿上限7%</small></span><button class="button ghost rfq-execute" data-rfq="${esc(quote.rfqId || state.rfq_id)}" data-quote="${esc(quote.quoteId || '')}" data-side="Sell" data-executable="${executable}"${disabled}>执行 Sell</button></div><div class="rfq-compare-title">Sell 报价方向 · 本次询价 ${(state.legs || []).length} 腿成交方向（Sell 用 Bid1，Buy 用 Ask1）</div><div class="rfq-leg-compare">${quoteLegComparison(quote, 'Sell', state) || '<span>无 Sell 方向报价</span>'}</div></div>`; }).join('') : '等待做市商报价';
@@ -934,6 +945,68 @@ $('rfqCreate').addEventListener('click', createRfq); $('rfqCancel').addEventList
 $('reloadPerformance').addEventListener('click', loadPerformance);
 $('performanceCurrency').addEventListener('change', () => { if (window.__performance) renderPerformance(window.__performance); });
 window.addEventListener('resize', () => { if (window.__performance) renderPerformance(window.__performance); });
+const TAB_BY_ANCHOR = {overview: 'desk', market: 'desk', chainPanel: 'desk', account: 'desk', greeks: 'desk', 'position-payoff': 'pos', activity: 'pos', orders: 'orders', performance: 'perf', rfq: 'rfq'};
+function setTabCount(id, value) { const target = $(id); if (!target) return; target.textContent = value; target.hidden = !value; }
+function selectTab(tab) {
+  document.querySelectorAll('[data-pane]').forEach((pane) => { pane.hidden = pane.dataset.pane !== tab; });
+  document.querySelectorAll('.tab[data-tab]').forEach((link) => {
+    const selected = link.dataset.tab === tab;
+    link.classList.toggle('active', selected);
+    if (selected) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+  });
+  // Canvas and SVG charts measure their container, which is zero-sized while the pane is hidden.
+  if (tab === 'desk' && window.__latestPreview) renderPayoff(window.__latestPreview);
+  if (tab === 'pos') renderPositionPayoff();
+  if (tab === 'perf' && window.__performance) renderPerformance(window.__performance);
+}
+// The page used to be one long scroll; old anchors (#orders, #rfq, ...) now open the tab that holds them.
+function syncTabFromHash() {
+  const anchor = String(window.location.hash || '').slice(1);
+  selectTab(TAB_BY_ANCHOR[anchor] || 'desk');
+  const target = anchor && anchor !== 'overview' && TAB_BY_ANCHOR[anchor] ? $(anchor) : null;
+  if (target?.scrollIntoView) target.scrollIntoView({block: 'start'}); else window.scrollTo?.(0, 0);
+}
+const signedFixed = (value, digits) => `${value > 0 ? '+' : ''}${value.toFixed(digits)}`;
+const greekText = {
+  delta: (value) => signedFixed(value, 4),
+  gamma: (value) => value !== 0 && Math.abs(value) < 0.001 ? `${value > 0 ? '+' : ''}${value.toExponential(2)}` : signedFixed(value, 6),
+  vega: (value) => signedFixed(value, 2),
+  theta: (value) => signedFixed(value, 2),
+};
+function renderGreeks(summary, {failed = false} = {}) {
+  const panel = $('greeks');
+  if (!panel) return;
+  const totals = failed ? {} : summary?.totals || {};
+  for (const [name, id] of [['delta', 'greeksDelta'], ['gamma', 'greeksGamma'], ['vega', 'greeksVega'], ['theta', 'greeksTheta']]) {
+    const value = totals[name];
+    const known = typeof value === 'number' && Number.isFinite(value);
+    $(id).textContent = known ? greekText[name](value) : '—';
+    $(id).className = `num${known ? '' : ' miss'}`;
+  }
+  const missing = [...new Set(Object.values(summary?.missing || {}).flat())];
+  const marketTime = summary?.market_updated_at ? ` · 行情 ${utcTime(summary.market_updated_at)} UTC` : '';
+  const status = failed ? '账户读取失败'
+    : !summary ? '等待同步'
+    : summary.status === 'empty' ? '暂无持仓'
+    : summary.status === 'unavailable' ? (summary.positions_available === false ? '持仓暂不可用' : '期权行情 Greeks 暂不可用')
+    : summary.status === 'partial' ? `${missing.length} 个合约缺少部分 Greeks${marketTime}`
+    : `${summary.position_count} 笔持仓${marketTime}`;
+  const stale = !failed && summary?.stale === true && summary.status !== 'empty';
+  $('greeksStatus').textContent = stale ? `${status} · 旧` : status;
+  panel.dataset.state = failed ? 'error' : summary?.status || 'loading';
+  panel.dataset.stale = String(stale);
+}
+function updateStrip() {
+  const blocked = window.__blockedReason || '', account = window.__accountIssue || '';
+  $('stripBlocked').textContent = blocked; $('stripBlocked').hidden = !blocked;
+  $('stripAccount').textContent = account; $('stripAccount').hidden = !account;
+  const schedule = $('automaticMode').textContent, nextOpen = $('nextOpen').textContent;
+  $('stripSchedule').textContent = `${schedule}${nextOpen ? ` · 计划开仓 ${nextOpen}` : ''}`;
+  const count = [!$('marketNotice').hidden, Boolean(blocked), Boolean(account)].filter(Boolean).length;
+  setTabCount('stripCount', count ? `${count} 项提醒` : '');
+}
+window.addEventListener('hashchange', syncTabFromHash);
+syncTabFromHash();
 window.ProjectHub.register('market', 10000, loadMarket);
 window.ProjectHub.register('account', 15000, loadAccount);
 window.ProjectHub.register('orders', 1000, loadOrders);
