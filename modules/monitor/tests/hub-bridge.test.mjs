@@ -144,3 +144,11 @@ test('related position requests cover both legs of every compared contract pair'
   for (const [market, contract] of Object.entries(exchangeContracts))
     for (const base of [contract.leftBase, contract.rightBase]) assert.ok(RELATED_SYMBOLS[market].includes(base), `${market} requests ${base}`);
 });
+
+test('an optional cycle summary is copied field by field and malformed summaries reject the reply', () => {
+  const cycle = { status: 'complete', since: '2026-10-19T08:00:00.000Z', closedQuantity: '4', closePrice: '70.25', realizedPnl: '12.5', fees: '-0.4', funding: '0.2', net: '12.3', currency: 'USDT', note: null, updatedAt: '2026-10-20T08:00:00.000Z' };
+  assert.deepEqual(parsePositionsReply(reply({ items: [item({ cycle: { ...cycle, secret: 'x' } })] })).items[0].cycle, cycle);
+  assert.equal(parsePositionsReply(reply({ items: [item({ cycle: null })] })).items[0].cycle, null);
+  assert.equal('cycle' in parsePositionsReply(reply()).items[0], false, 'older hosts send no summary');
+  for (const bad of [{ ...cycle, status: 'done' }, { ...cycle, net: 12.3 }, { ...cycle, note: 'x'.repeat(301) }, 'complete']) assert.equal(parsePositionsReply(reply({ items: [item({ cycle: bad })] })), null);
+});

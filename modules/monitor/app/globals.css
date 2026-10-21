@@ -420,6 +420,9 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 .related-position-main { display: flex; align-items: baseline; gap: 8px; margin: 3px 0; flex-wrap: wrap; }
 .related-position-main strong { font-family: var(--font-number); font-size: 13px; }
 .related-positions dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 0; }
+.related-cycle { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+.related-cycle-head { display: flex; justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 11px; }
+.related-cycle-note { margin: 6px 0 0; color: var(--muted-foreground); font-size: 11px; }
 .related-spread-pairs li { padding: 8px 10px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); }
 .related-spread-pairs li > span { color: var(--muted-foreground); }
 .related-unpaired { margin: 4px 0 0; color: var(--warning); }

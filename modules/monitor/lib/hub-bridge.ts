@@ -48,18 +48,28 @@ export function hubChanged() { post({ type: 'changed', scope: 'summary' }); }
 export function hubNavigate(projectId: HubProject, query: HubQuery) { const clean = cleanHubQuery(query); if (clean) post({ type: 'navigate', projectId, query: clean }); }
 
 export type PositionsMarket = 'oil' | 'cl-xau' | 'hynix' | 'perpetual';
+/** Realized results since the position last opened from zero; signed cash flows in `currency`, `net` null when a part is unknown. */
+export type HubPositionCycle = {
+  status: 'loading' | 'complete' | 'partial' | 'unavailable'; since: string | null;
+  closedQuantity: string | null; closePrice: string | null; realizedPnl: string | null; fees: string | null; funding: string | null; net: string | null;
+  currency: string | null; note: string | null; updatedAt: string | null;
+};
 export type HubPositionItem = {
   key: string; source: string; exchange: string; symbol: string; base: string; side: 'long' | 'short';
   quantity: string; quantityUnit: string; entryPrice: string | null; markPrice: string | null;
   unrealizedPnl: string | null; pnlCurrency: string | null; updatedAt: string | null; stale: boolean;
   /** Stable venue id; older hosts send only the display name in `exchange`. */
   exchangeId?: string;
+  /** Absent from older hosts and from venues without fill history. */
+  cycle?: HubPositionCycle | null;
 };
 /** `incomplete` marks an ok reply where some source could not confirm its positions. */
 export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[]; timedOut?: boolean };
 const POSITION_MARKETS: ReadonlySet<string> = new Set(['oil', 'cl-xau', 'hynix', 'perpetual']);
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/, POSITION_BASE = /^[A-Z0-9]{1,20}$/;
 export const POSITIONS_TIMEOUT_MS = 12_000, POSITIONS_REFRESH_MS = 60_000;
+// Longer than the host's 20 s positions cache so the follow-up reaches Asset again.
+export const POSITIONS_FOLLOW_UP_MS = 25_000;
 
 export function cleanPositionsRequest(market: unknown, symbols: unknown): { market: PositionsMarket; symbols: string[] } | null {
   if (typeof market !== 'string' || !POSITION_MARKETS.has(market) || !Array.isArray(symbols)) return null;
@@ -68,6 +78,19 @@ export function cleanPositionsRequest(market: unknown, symbols: unknown): { mark
 }
 const text = (value: unknown, max: number) => typeof value === 'string' && value.length <= max ? value : undefined;
 const optionalText = (value: unknown, max: number) => value === null ? null : text(value, max);
+const CYCLE_STATES: ReadonlySet<string> = new Set(['loading', 'complete', 'partial', 'unavailable']);
+function positionCycle(value: unknown): HubPositionCycle | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const cycle = value as Record<string, unknown>;
+  const result = {
+    status: typeof cycle.status === 'string' && CYCLE_STATES.has(cycle.status) ? cycle.status : undefined, since: optionalText(cycle.since, 40),
+    closedQuantity: optionalText(cycle.closedQuantity, 64), closePrice: optionalText(cycle.closePrice, 64), realizedPnl: optionalText(cycle.realizedPnl, 64),
+    fees: optionalText(cycle.fees, 64), funding: optionalText(cycle.funding, 64), net: optionalText(cycle.net, 64),
+    currency: optionalText(cycle.currency, 20), note: optionalText(cycle.note, 300), updatedAt: optionalText(cycle.updatedAt, 40),
+  };
+  return Object.values(result).some(field => field === undefined) ? undefined : result as HubPositionCycle;
+}
 function positionItem(value: unknown): HubPositionItem | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const item = value as Record<string, unknown>;
@@ -82,8 +105,11 @@ function positionItem(value: unknown): HubPositionItem | null {
   };
   // Copy only the redacted contract fields; anything malformed rejects the whole reply.
   if (Object.values(result).some(field => field === undefined)) return null;
-  if (item.exchangeId === undefined) return result as HubPositionItem;
-  return typeof item.exchangeId === 'string' && /^[a-z0-9-]{1,40}$/.test(item.exchangeId) ? { ...result, exchangeId: item.exchangeId } as HubPositionItem : null;
+  const cycle = item.cycle === undefined ? undefined : positionCycle(item.cycle);
+  if (item.cycle !== undefined && cycle === undefined) return null;
+  const extra = { ...(cycle === undefined ? {} : { cycle }) };
+  if (item.exchangeId === undefined) return { ...result, ...extra } as HubPositionItem;
+  return typeof item.exchangeId === 'string' && /^[a-z0-9-]{1,40}$/.test(item.exchangeId) ? { ...result, exchangeId: item.exchangeId, ...extra } as HubPositionItem : null;
 }
 export function parsePositionsReply(value: unknown): HubPositionsReply | null {
   if (!value || typeof value !== 'object') return null;
@@ -162,20 +188,26 @@ export function useHubPositions(market: PositionsMarket, symbols: readonly strin
   const [stored, setStored] = useState<StoredReply | null>(null);
   useEffect(() => {
     if (mode || !active) return;
+    let followUp: ReturnType<typeof setTimeout> | null = null;
     const requester = createPositionsRequester({
       send: message => post(message),
-      onReply: reply => setStored(current => {
+      onReply: reply => {
+        if (followUp) clearTimeout(followUp);
+        // Asset summarizes closed trades in the background; read again sooner than the regular refresh.
+        followUp = reply.status === 'ok' && reply.items.some(item => item.cycle?.status === 'loading') ? setTimeout(run, POSITIONS_FOLLOW_UP_MS) : null;
+        setStored(current => {
         const sameKey = current?.key === requestKey ? current : null;
         const previous = reply.status === 'ok' ? null : sameKey?.reply.status === 'ok' ? { items: sameKey.reply.items, generatedAt: sameKey.reply.generatedAt } : sameKey?.previous ?? null;
         return { key: requestKey, reply, previous };
-      }),
+        });
+      },
     });
     const listener = (value: unknown) => { requester.receive(value); };
     positionListeners.add(listener);
     const run = () => { requester.request(market, symbolKey.split(',')); };
     run();
     const timer = setInterval(run, POSITIONS_REFRESH_MS);
-    return () => { clearInterval(timer); positionListeners.delete(listener); requester.dispose(); };
+    return () => { clearInterval(timer); if (followUp) clearTimeout(followUp); positionListeners.delete(listener); requester.dispose(); };
   }, [mode, active, market, symbolKey, requestKey]);
   if (mode) return { status: mode, items: [], generatedAt: null, timedOut: false, incomplete: false, previous: null };
   const current = stored?.key === requestKey ? stored : null;

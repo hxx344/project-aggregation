@@ -18,6 +18,23 @@ export type Position = {
   pnlCurrency: string | null;
   marginMode: string | null;
   sourceUpdatedAt: string | null;
+  /** Fills and cash flows since this position last opened from zero; absent where not supported. */
+  cycle?: PositionCycle | null;
+};
+
+/** Signed cash flows in `currency`; `net` = realizedPnl + fees + funding and is null when any part is unknown. */
+export type PositionCycle = {
+  status: 'loading' | 'complete' | 'partial' | 'unavailable';
+  since: string | null;
+  closedQuantity: string | null;
+  closePrice: string | null;
+  realizedPnl: string | null;
+  fees: string | null;
+  funding: string | null;
+  net: string | null;
+  currency: string | null;
+  note: string | null;
+  updatedAt: string | null;
 };
 
 export type PositionsStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';

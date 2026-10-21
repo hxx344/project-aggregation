@@ -1,4 +1,4 @@
-import type { TradingPositionsResponse } from './trading-positions-types';
+import type { PositionCycle, TradingPositionsResponse } from './trading-positions-types';
 
 export const POSITION_MARKETS = ['oil', 'cl-xau', 'hynix', 'perpetual'] as const;
 export type PositionMarket = typeof POSITION_MARKETS[number];
@@ -8,6 +8,7 @@ export type HubPositionItem = {
   key: string; source: string; exchange: string; exchangeId?: string; symbol: string; base: string; side: 'long' | 'short';
   quantity: string; quantityUnit: string; entryPrice: string | null; markPrice: string | null;
   unrealizedPnl: string | null; pnlCurrency: string | null; updatedAt: string | null; stale: boolean;
+  cycle?: PositionCycle | null;
 };
 export type PositionsReply = { type: 'positions'; requestId: string; market: PositionMarket; status: PositionsStatus; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[] };
 export type PositionsOutcome = { status: 'ok'; data: unknown; at: number } | { status: 'unavailable' | 'unauthorized'; at: number };
@@ -51,6 +52,15 @@ const text = (value: unknown) => { if (typeof value !== 'string') throw new Malf
 const optional = (value: unknown) => { if (value !== null && typeof value !== 'string') throw new MalformedPositions(); return value; };
 const list = (value: unknown) => { if (!Array.isArray(value)) throw new MalformedPositions(); return value as unknown[]; };
 const object = (value: unknown) => { if (!record(value)) throw new MalformedPositions(); return value; };
+const CYCLE_STATES = new Set(['loading', 'complete', 'partial', 'unavailable']);
+function cycleOf(value: unknown): PositionCycle | null {
+  if (value === null) return null;
+  const cycle = object(value);
+  if (!CYCLE_STATES.has(cycle.status as string)) throw new MalformedPositions();
+  return { status: cycle.status as PositionCycle['status'], since: optional(cycle.since), closedQuantity: optional(cycle.closedQuantity), closePrice: optional(cycle.closePrice),
+    realizedPnl: optional(cycle.realizedPnl), fees: optional(cycle.fees), funding: optional(cycle.funding), net: optional(cycle.net),
+    currency: optional(cycle.currency), note: optional(cycle.note), updatedAt: optional(cycle.updatedAt) };
+}
 const old = (value: string | null, now: number) => value === null || !Number.isFinite(Date.parse(value)) || now - Date.parse(value) > POSITIONS_STALE_AFTER_MS;
 
 // Throws on any shape violation: a partial list must not be reported as complete.
@@ -83,7 +93,8 @@ export function positionItems(response: unknown, bases: readonly string[], now: 
             seen.set(identity, count);
             // A stable venue id lets the module pair legs without relying on display names.
             const venue = /^[a-z0-9-]{1,40}$/.test(exchangeId) ? { exchangeId } : {};
-            items.push({ key: `${identity}:${count}`, source: sourceName, exchange: exchangeName, ...venue, symbol, base, side, ...item, updatedAt: fetchedAt, stale });
+            const cycle = position.cycle === undefined ? {} : { cycle: cycleOf(position.cycle) };
+            items.push({ key: `${identity}:${count}`, source: sourceName, exchange: exchangeName, ...venue, symbol, base, side, ...item, updatedAt: fetchedAt, stale, ...cycle });
           }
         }
       }

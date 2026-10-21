@@ -10,9 +10,10 @@ type Json = Record<string, unknown>;
 const BYBIT_HOSTS = { global: 'https://api.bybit.com', nl: 'https://api.bybit.nl', tr: 'https://api.bybit-tr.com', kz: 'https://api.bybit.kz', ge: 'https://api.bybitgeorgia.ge', ae: 'https://api.bybit.ae', eu: 'https://api.bybit.eu' };
 const ENDPOINTS = {
   binance: new Set(['/sapi/v1/account/apiRestrictions', '/fapi/v3/positionRisk', '/papi/v1/um/positionRisk', '/fapi/v1/exchangeInfo',
-    '/dapi/v1/positionRisk', '/papi/v1/cm/positionRisk', '/dapi/v1/exchangeInfo']),
-  bybit: new Set(['/v5/user/query-api', '/v5/position/list', '/v5/market/instruments-info']),
-  okx: new Set(['/api/v5/account/config', '/api/v5/account/positions', '/api/v5/public/instruments']),
+    '/dapi/v1/positionRisk', '/papi/v1/cm/positionRisk', '/dapi/v1/exchangeInfo',
+    '/fapi/v1/userTrades', '/papi/v1/um/userTrades', '/fapi/v1/income', '/papi/v1/um/income']),
+  bybit: new Set(['/v5/user/query-api', '/v5/position/list', '/v5/market/instruments-info', '/v5/account/transaction-log']),
+  okx: new Set(['/api/v5/account/config', '/api/v5/account/positions', '/api/v5/public/instruments', '/api/v5/trade/fills-history', '/api/v5/account/bills-archive']),
   aster: new Set(['/fapi/v3/positionRisk', '/fapi/v3/exchangeInfo']),
 };
 

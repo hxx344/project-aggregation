@@ -169,6 +169,8 @@ Asset 响应为 `schemaVersion: 1`、`generatedAt`、`exchanges[]`。每个交�
 
 工作台只保留经过字段校验的响应和受控错误消息，不透传上游原始对象、诊断或凭据。Asset 只在被读取时刷新交易所：每个范围最快 5 秒一次（Variational 每次启动 Python 进程，为 30 秒），全局最多 3 个并发。Binance 与 Aster 的公开交易对目录按进程缓存 10 分钟，持仓出现目录中没有的合约时立即重新拉取，拉取失败不缓存；确认 Key 只读的权限检查每次刷新都执行。后台读取会让已启用项目的 Asset 缓存保持有效，不再按 15 分钟无人读取回收。只有 `live` 的空列表表示已确认空仓；范围超过 90 秒未更新即过期，来源失败保留同一项目配置版本的旧快照并降级状态。项目配置改变、停用或删除立即中止旧请求并清除缓存，迟到响应不能恢复旧数据。`generatedAt` 与 `checkedAt` 不替代仓位实际读取时间。
 
+Binance U 本位（含统一账户）、Bybit 统一账户 USDT/USDC 永续与 OKX 永续的仓位另带可选 `cycle`，汇总本轮持仓（从持仓上次归零后开仓起）的平仓结果：`status`（`loading/complete/partial/unavailable`）、`since`、`closedQuantity/closePrice`、`realizedPnl`、`fees`、`funding`、`net`、`currency`、`note`、`updatedAt`。金额为结算币种的带符号现金流，`net = realizedPnl + fees + funding`，任一部分未知时为 `null`。Asset 在仓位读取成功后于后台逐个读取成交与资金费（Binance `userTrades`/`income`，Bybit `transaction-log`，OKX `fills-history`/`bills-archive`，均为固定只读 GET），按 7 天窗口或游标向前翻页，找到开仓成交即停止，最多回看 85 天；超出时为 `partial`。回放出的持仓与交易所不一致、请求超过上限、同一合约同时持有多空（Bybit）或读取失败时为 `unavailable` 并附说明，不显示猜测值。汇总全局串行读取，单个最长 45 秒；数量不变时缓存 5 分钟，失败 1 分钟后重试，数量变化至少间隔 30 秒重算，期间保留同方向的上次结果并以 `updatedAt` 标注。工作台对 `cycle` 逐字段校验，格式无效时置为 `null` 而不影响仓位；旧版 Asset 不带此字段，Monitor 关联交易面板随之不显示平仓汇总。
+
 ## 资产新鲜度补充
 
 资产适配器使用原账本的 `mode` 分类：`manual` 为手工估值，`market`、`bybit`、`aster` 为动态数据。混合账本的 `updatedAt` 取所有非 `manual` 行最早更新时间，并通过 `manual_valuation_at` 指标单独保留手工行最早估值时间。缺少或未知 `mode` 按动态行处理并提示数据不完整，避免误判为不会过期。

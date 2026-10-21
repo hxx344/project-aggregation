@@ -13,12 +13,14 @@ async (page) => {
   const project = { id: 'monitor', name: 'monitor', description: '', category: 'other', adapter: 'monitor', enabled: true, embedded: true, accessMode: 'proxy',
     apiUrl: 'http://127.0.0.1:9000', url: '', mode: 'embed', hasCredentials: true, revision: 'related-fixture', staleAfterSeconds: 120, order: 0 };
   const overview = () => ({ generatedAt: stamp(), projects: [{ project, state: 'online', freshness: 'static', message: '', checkedAt: null, updatedAt: null, latencyMs: 1, diagnostics: [], metrics: [] }] });
-  const position = (symbol, side, entryPrice, unrealizedPnl) => ({ id: `fixture-${symbol}`, symbol, instrumentId: symbol, side, quantity: '10', quantityUnit: 'contracts',
+  const position = (symbol, side, entryPrice, unrealizedPnl, cycle) => ({ id: `fixture-${symbol}`, symbol, instrumentId: symbol, side, quantity: '10', quantityUnit: 'contracts',
     contractSize: '1', entryPrice, markPrice: null, notional: null, unrealizedPnl, leverage: '3', liquidationPrice: null,
-    priceCurrency: 'USDT', notionalCurrency: 'USDT', pnlCurrency: 'USDT', marginMode: 'cross', sourceUpdatedAt: stamp() });
+    priceCurrency: 'USDT', notionalCurrency: 'USDT', pnlCurrency: 'USDT', marginMode: 'cross', sourceUpdatedAt: stamp(), ...(cycle ? { cycle } : {}) });
+  const closed = () => ({ status: 'complete', since: new Date(Date.now() - 86_400_000).toISOString(), closedQuantity: '4', closePrice: '63.1', realizedPnl: '8.75', fees: '-0.42', funding: '0.11', net: '8.44', currency: 'USDT', note: null, updatedAt: stamp() });
+  const failed = () => ({ status: 'unavailable', since: null, closedQuantity: null, closePrice: null, realizedPnl: null, fees: null, funding: null, net: null, currency: null, note: '本轮成交读取失败，稍后重试', updatedAt: stamp() });
   const positionsState = () => ({ generatedAt: stamp(), sources: [{ projectId: 'asset-fixture', name: 'Asset', status: 'ready', error: null, checkedAt: stamp(), data: { schemaVersion: 1, generatedAt: stamp(), exchanges: [
     { id: 'binance', name: 'Binance', accounts: [{ id: 'account-fixture', name: '账户', configured: true, revision: 'r1', scopes: [{ id: 'usdm', label: 'U 本位合约', status: 'live', refreshing: false, fetchedAt: stamp(), error: null,
-      positions: [position('CLUSDT', 'long', '62', '12.5'), position('BZUSDT', 'short', '66', '-3.25'), position('XAUUSDT', 'long', '4000', '1')] }] }] }] } }] });
+      positions: [position('CLUSDT', 'long', '62', '12.5', closed()), position('BZUSDT', 'short', '66', '-3.25', failed()), position('XAUUSDT', 'long', '4000', '1')] }] }] }] } }] });
   const errors = [], unexpected = [], external = [];
   let positionReads = 0;
   page.on('pageerror', error => errors.push(error.message));
@@ -65,6 +67,10 @@ async (page) => {
     const pairText = await pair.innerText();
     assert(/开仓价差\s*\+6\.452%/.test(pairText), `opening spread from entry prices: ${pairText}`);
     assert(text.includes('+12.5 USDT') && text.includes('−3.25 USDT'), `PnL keeps the host decimals: ${text}`);
+    const cycle = await panel.locator('[data-cycle-status="complete"]').innerText();
+    assert(/平仓数量\s*4 contracts/.test(cycle) && /平仓均价\s*63\.1/.test(cycle) && /已实现盈亏\s*\+8\.75 USDT/.test(cycle)
+      && /手续费\s*−0\.42 USDT/.test(cycle) && /资金费\s*\+0\.11 USDT/.test(cycle) && /净额\s*\+8\.44 USDT/.test(cycle), `closed-trade summary per leg: ${cycle}`);
+    assert(text.includes('本轮平仓：本轮成交读取失败，稍后重试'), `an unavailable summary explains itself: ${text}`);
     assert(await frame.locator('[data-detail-alerts]').count() === 1, 'alert digest is in the side column');
     const reads = positionReads;
     await panel.getByRole('button', { name: '在交易中心查看' }).click();
@@ -73,7 +79,7 @@ async (page) => {
     assert(target.get('view') === 'trading' && target.get('tradingSection') === 'positions', `open-trading url ${page.url()}`);
     assert(reads >= 1, 'positions were read through the host');
     assert(!unexpected.length && !external.length && !errors.length, JSON.stringify({ unexpected, external, errors }));
-    return { passed: true, positionReads, scenarios: ['real Monitor connects through the bridge', 'oil positions filtered to CL/BZ', 'opening spread paired by exchange', 'PnL strings kept', 'alert digest beside chart', 'open-trading to positions'] };
+    return { passed: true, positionReads, scenarios: ['real Monitor connects through the bridge', 'oil positions filtered to CL/BZ', 'opening spread paired by exchange', 'PnL strings kept', 'closed-trade summary per leg', 'alert digest beside chart', 'open-trading to positions'] };
   } finally {
     await page.goto('about:blank').catch(() => {});
     await page.unroute('**/*', handler);

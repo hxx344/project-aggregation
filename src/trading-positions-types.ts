@@ -19,6 +19,23 @@ export interface AssetPosition {
   pnlCurrency: string | null;
   marginMode: string | null;
   sourceUpdatedAt: string | null;
+  /** Realized results since the position last opened from zero; older Asset versions omit it. */
+  cycle?: PositionCycle | null;
+}
+
+/** Signed cash flows in `currency`; `net` = realizedPnl + fees + funding and is null when any part is unknown. */
+export interface PositionCycle {
+  status: 'loading' | 'complete' | 'partial' | 'unavailable';
+  since: string | null;
+  closedQuantity: string | null;
+  closePrice: string | null;
+  realizedPnl: string | null;
+  fees: string | null;
+  funding: string | null;
+  net: string | null;
+  currency: string | null;
+  note: string | null;
+  updatedAt: string | null;
 }
 
 export interface PositionScope {

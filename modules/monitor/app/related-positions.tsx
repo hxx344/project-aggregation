@@ -9,22 +9,42 @@ export type { VenueSpreads };
 const unpairedText: Record<UnpairedReason, string> = { "same-side": "CL 与 BZ 同向", multiple: "同一交易所有多笔同币种持仓", "missing-leg": "缺少另一条腿" };
 
 const beijing = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const beijingDate = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 const clock = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? beijing.format(new Date(value)) : "—";
+const dateClock = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? beijingDate.format(new Date(value)) : "—";
 const finite = (value: string | null) => { if (value === null || value.trim() === "") return null; const number = Number(value); return Number.isFinite(number) ? number : null; };
 const tone = (value: number | null) => value === null || value === 0 ? "" : value > 0 ? "positive" : "negative";
 const signedPercent = (value: number | null) => value === null ? "—" : `${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value).toFixed(3)}%`;
-const pnlText = (item: HubPositionItem) => {
-  const value = finite(item.unrealizedPnl);
-  if (value === null || item.unrealizedPnl === null) return "—";
-  const raw = item.unrealizedPnl.trim().replace(/^[+-]/, "");
-  return `${value > 0 ? "+" : value < 0 ? "−" : ""}${raw}${item.pnlCurrency ? ` ${item.pnlCurrency}` : ""}`;
+const signedText = (amount: string | null, currency: string | null) => {
+  const value = finite(amount);
+  if (value === null || amount === null) return "—";
+  const raw = amount.trim().replace(/^[+-]/, "");
+  return `${value > 0 ? "+" : value < 0 ? "−" : ""}${raw}${currency ? ` ${currency}` : ""}`;
 };
+
+function CycleSummary({ item }: { item: HubPositionItem }) {
+  const cycle = item.cycle;
+  if (!cycle) return null;
+  if (cycle.status === "loading") return <p className="related-cycle-note">本轮平仓统计中…</p>;
+  if (cycle.status === "unavailable") return <p className="related-cycle-note">本轮平仓：{cycle.note ?? "暂不可用"}</p>;
+  const amount = (label: string, value: string | null) => <div><dt>{label}</dt><dd className={tone(finite(value))}>{signedText(value, cycle.currency)}</dd></div>;
+  return <div className="related-cycle" data-cycle-status={cycle.status}>
+    <div className="related-cycle-head"><span>本轮已平仓</span><span>{cycle.since ? `${dateClock(cycle.since)} 开仓 · ` : ""}{clock(cycle.updatedAt)} 统计{cycle.status === "partial" ? "（不完整）" : ""}</span></div>
+    <dl>
+      <div><dt>平仓数量</dt><dd>{cycle.closedQuantity === null ? "—" : `${cycle.closedQuantity} ${item.quantityUnit}`}</dd></div>
+      <div><dt>平仓均价</dt><dd>{cycle.closePrice ?? "—"}</dd></div>
+      {amount("已实现盈亏", cycle.realizedPnl)}{amount("手续费", cycle.fees)}{amount("资金费", cycle.funding)}{amount("净额", cycle.net)}
+    </dl>
+    {cycle.note ? <p className="related-cycle-note">{cycle.note}</p> : null}
+  </div>;
+}
 
 function PositionRows({ items }: { items: HubPositionItem[] }) {
   return <ul className="related-positions-list">{items.map(item => { const pnl = finite(item.unrealizedPnl); return <li key={item.key} data-stale={item.stale}>
     <div className="related-position-head"><span className="related-position-source">{item.source} · {item.exchange}</span>{item.stale ? <span className="detail-stale-tag" title={item.updatedAt ? `数据时间 ${clock(item.updatedAt)} 北京时间` : "数据时间未知"}>旧</span> : null}</div>
     <div className="related-position-main"><strong>{item.symbol}</strong><span className={item.side === "long" ? "positive" : "negative"}>{item.side === "long" ? "多" : "空"}</span><span>{item.quantity} {item.quantityUnit}</span></div>
-    <dl><div><dt>未实现盈亏</dt><dd className={tone(pnl)}>{pnlText(item)}</dd></div><div><dt>入场价</dt><dd>{item.entryPrice ?? "—"}</dd></div></dl>
+    <dl><div><dt>未实现盈亏</dt><dd className={tone(pnl)}>{signedText(item.unrealizedPnl, item.pnlCurrency)}</dd></div><div><dt>入场价</dt><dd>{item.entryPrice ?? "—"}</dd></div></dl>
+    <CycleSummary item={item}/>
   </li>; })}</ul>;
 }
 

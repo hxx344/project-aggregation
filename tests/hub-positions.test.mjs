@@ -115,3 +115,10 @@ test('positions source coalesces reads, caches every outcome for 20 seconds and 
   clock = 60_000; const pending = source.read(true); source.dispose(); release(); await pending;
   assert.equal((await source.read(false)).status, 'unavailable', 'dispose discards the in-flight result');
 });
+
+test('cycle summaries are forwarded field by field and stay absent for older Asset versions', () => {
+  const cycle = { status: 'partial', since: at, closedQuantity: '2', closePrice: '70.5', realizedPnl: '-3.2', fees: null, funding: '0.1', net: null, currency: 'USDT', note: '部分手续费以其他币种扣除，未计入', updatedAt: at };
+  const { items } = positionItems(response([position('CLUSDT', { cycle: { ...cycle, secret: 'leak' } }), position('BZUSDT'), position('CL-USDT-SWAP', { side: 'short', cycle: null })]), ['CL', 'BZ'], now);
+  assert.deepEqual(items[0].cycle, cycle); assert.equal('cycle' in items[1], false); assert.equal(items[2].cycle, null);
+  for (const bad of [{ ...cycle, status: 'done' }, { ...cycle, net: 1 }, 'partial']) assert.throws(() => positionItems(response([position('CLUSDT', { cycle: bad })]), ['CL'], now));
+});

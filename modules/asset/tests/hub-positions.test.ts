@@ -5,6 +5,7 @@ import { createPositionsService } from '../lib/hub-positions.ts';
 import { position, POSITIONS_FAILED } from '../lib/positions-values.ts';
 import type { HubPositions, Position } from '../lib/positions-types.ts';
 import type { Credentials } from '../lib/validation.ts';
+import { CycleRetry } from '../lib/positions-cycle-readers.ts';
 
 const credential: Credentials = { exchange: 'binance', apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' };
 const at = Date.parse('2026-10-01T00:00:00.000Z');
@@ -173,4 +174,44 @@ test('exchange scopes refresh every 5 s and Variational every 30 s', async t => 
   assert.deepEqual(await cycle(4_999), []);
   assert.deepEqual(await cycle(1), ['okx']);
   assert.deepEqual(await cycle(25_000), ['okx', 'variational']);
+});
+
+test('cycle summaries load in the background, stay cached by side and quantity, and retry after failures', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(); let clock = at;
+  let held = [{ ...position('BTCUSDT', 'long', '2', 'BTC'), pnlCurrency: 'USDT' }];
+  const requests: { scope: string; quantity: string; snapshotAt: number }[] = []; let outcome: 'ok' | 'retry' | 'throw' = 'ok';
+  const done = (quantity: string) => ({ status: 'complete' as const, since: new Date(at - 3_600_000).toISOString(), closedQuantity: quantity, closePrice: '100',
+    realizedPnl: '1', fees: '-0.1', funding: '0', net: '0.9', currency: 'USDT', note: null, updatedAt: new Date(clock).toISOString() });
+  const service = createPositionsService({ now: () => clock, read: async () => held, cycle: async (_c, scope, request) => {
+    requests.push({ scope, quantity: request.position.quantity, snapshotAt: request.snapshotAt });
+    if (outcome === 'retry') throw new CycleRetry();
+    if (outcome === 'throw') throw new Error('PRIVATE timeout');
+    return done(request.position.quantity);
+  } });
+  const cycleOf = (report: HubPositions, id = 'um') => scope(report, 'binance', 'default', id).positions[0]?.cycle;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.deepEqual(requests.map(item => item.scope).sort(), ['pm-um', 'um'], 'only linear scopes with fill history are summarized');
+  assert.equal(requests[0].snapshotAt, at);
+  const first = await service.read(f.database, 'owner', f.unseal);
+  assert.equal(cycleOf(first)?.status, 'complete'); assert.equal(cycleOf(first)?.net, '0.9');
+  assert.equal(cycleOf(first, 'cm'), undefined, 'unsupported scopes carry no cycle field');
+  clock += 10_000; requests.length = 0; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(requests.length, 0, 'unchanged positions reuse the summary');
+  held = [{ ...held[0], quantity: '1' }]; clock += 10_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(requests.length, 0, 'a quantity change waits for the minimum age');
+  assert.equal(cycleOf(await service.read(f.database, 'owner', f.unseal))?.closedQuantity, '2', 'the older same-side summary stays visible');
+  clock += 10_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.deepEqual(requests.map(item => item.quantity), ['1', '1']);
+  held = [{ ...held[0], entryPrice: '101' }]; requests.length = 0; clock += 30_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(requests.length, 2, 'a same-size reopen at a new entry price is summarized again');
+  held = [{ ...held[0], id: 'flipped', side: 'short' }]; outcome = 'retry'; requests.length = 0; clock += 5_000;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(requests.length, 2); assert.equal(cycleOf(await service.read(f.database, 'owner', f.unseal))?.status, 'loading');
+  outcome = 'throw'; clock += 5_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  const failed = cycleOf(await service.read(f.database, 'owner', f.unseal));
+  assert.equal(failed?.status, 'unavailable'); assert.equal(JSON.stringify(failed).includes('PRIVATE'), false);
+  outcome = 'ok'; requests.length = 0; clock += 30_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(requests.length, 0, 'failures retry after a minute');
+  clock += 30_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(cycleOf(await service.read(f.database, 'owner', f.unseal))?.status, 'complete');
 });

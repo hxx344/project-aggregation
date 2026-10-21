@@ -25,6 +25,20 @@ function timestamp(value, now, nullable = true) {
   if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT/.test(value) || value.length > 40 || !Number.isFinite(Date.parse(value)) || Date.parse(value) > now + 60_000) throw malformed();
   return new Date(value).toISOString();
 }
+const CYCLE_STATES = new Set(['loading', 'complete', 'partial', 'unavailable']);
+const CYCLE_AMOUNTS = ['closedQuantity', 'closePrice', 'realizedPnl', 'fees', 'funding', 'net'];
+/** Optional derived summary: a malformed one is dropped rather than hiding the positions it belongs to. */
+function cycle(value, now) {
+  try {
+    if (!object(value) || !CYCLE_STATES.has(value.status)) throw malformed();
+    const result = { status: value.status, since: timestamp(value.since, now) };
+    for (const key of CYCLE_AMOUNTS) result[key] = decimal(value[key]);
+    result.currency = value.currency === null ? null : label(value.currency, 20);
+    result.note = value.note === null ? null : label(value.note, 300);
+    result.updatedAt = timestamp(value.updatedAt, now);
+    return result;
+  } catch { return null; }
+}
 function unique(rows, maximum, key, map) {
   if (!Array.isArray(rows) || rows.length > maximum) throw malformed();
   const seen = new Set();
@@ -60,6 +74,7 @@ export function normalizeAssetPositions(data, now = Date.now()) {
             for (const key of ['contractSize', 'entryPrice', 'markPrice', 'notional', 'unrealizedPnl', 'leverage', 'liquidationPrice']) position[key] = decimal(row[key]);
             for (const key of ['priceCurrency', 'notionalCurrency', 'pnlCurrency', 'marginMode']) position[key] = row[key] === null ? null : label(row[key], 160);
             position.sourceUpdatedAt = timestamp(row.sourceUpdatedAt, now);
+            if (row.cycle !== undefined) position.cycle = cycle(row.cycle, now);
             return position;
           });
           if (positions.length && (!fetchedAt || ['unconfigured', 'loading', 'unsupported'].includes(scope.status))) throw malformed();
