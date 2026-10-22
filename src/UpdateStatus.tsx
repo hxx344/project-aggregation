@@ -8,6 +8,7 @@ import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
 const RELOAD_DELAY = 1_500;
+const NOTICE_KEY = 'workbench.update-notice.dismissed';
 type RequestKind = 'read' | 'check' | 'apply' | 'token';
 const moduleLabels = { current: '已是最新', available: '可更新', unavailable: '检查未完成', unmanaged: '需手动更新' };
 const jobLabels = { queued: '更新已排队', running: '正在更新', succeeded: '更新已完成', failed: '上次更新未完成', interrupted: '上次更新已中断' };
@@ -25,6 +26,9 @@ function matchesLatest(module: UpdateModule): boolean | null {
     return module.currentCommit && module.latestCommit ? module.currentCommit === module.latestCommit : null;
   }
   return module.currentVersion && module.latestVersion ? module.currentVersion === module.latestVersion : null;
+}
+function readNoticeDismissed() {
+  try { return localStorage.getItem(NOTICE_KEY) || ''; } catch { return ''; }
 }
 function dateTime(value: string | null) {
   if (!value || !Number.isFinite(Date.parse(value))) return '尚未检查';
@@ -116,6 +120,8 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const [deployMode, setDeployMode] = useState<UpdateDeployMode>('source');
   const [review, setReview] = useState<{ planId: string; modules: UpdateModule[]; deployMode: UpdateDeployMode; modeSupported: boolean } | null>(null);
   const [, setClock] = useState(0);
+  const [noticeDismissed, setNoticeDismissed] = useState(readNoticeDismissed);
+  const [noticeShown, setNoticeShown] = useState(false);
   const snapshotRef = useRef<UpdateState | null>(null);
   const requestRef = useRef<{ controller: AbortController; kind: RequestKind } | null>(null);
   const stateVersion = useRef(0);
@@ -129,6 +135,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const reviewElement = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const notice = useRef<HTMLDialogElement>(null);
   const downloadProgress = getUpdateProgress(snapshot?.job);
 
   const accept = useCallback((data: UpdateState, confirmMissingJob = false) => {
@@ -391,8 +398,35 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const blocked = !snapshot?.enabled || !snapshot.planId || expired || !!snapshot.checkError || checkRequestFailed || !!networkError || pending !== null || updating || checking || uncertain || !changes.length || snapshot.planId === submittedPlan.current;
   const summary = reloading ? '更新已完成，正在刷新页面' : networkError ? '连接待恢复' : updating || uncertain ? '更新进行中' : checking ? '正在检查版本' : needsSetup ? '待启用' : snapshot?.checkError || checkRequestFailed ? '检查失败' : changes.length ? recoveries.length === changes.length ? `${changes.length} 个待完成更新` : `${changes.length} 个可用更新${recoveries.length ? `（含 ${recoveries.length} 个待完成）` : ''}` : incomplete ? '部分模块待处理' : different ? '当前版本与正式版不同' : unconfirmed ? '版本待确认' : snapshot?.checkedAt && modules.length ? lastUpdateIssue ? `版本已对齐，${lastUpdateIssue}` : '已是最新正式版' : lastUpdateIssue || (snapshot ? '尚无检查结果' : '正在读取状态');
   const tone = networkError || snapshot?.checkError || checkRequestFailed || needsSetup || incomplete || different || unconfirmed || unfinishedJob ? 'attention' : changes.length ? 'available' : '';
+  // Keyed by the offered release identities so a dismissed notice returns only for a newer release.
+  const noticeSignature = snapshot?.enabled && !needsSetup && !updating && !uncertain && !reloading && changes.length
+    ? changes.map(module => `${module.id}@${module.latestCommit || ''}/${module.latestVersion || ''}`).sort().join('|') : '';
+  const noticeWanted = !!noticeSignature && noticeSignature !== noticeDismissed && !open;
+  const noticeVisible = noticeShown && noticeWanted;
+  const dismissNotice = useCallback((signature: string) => {
+    setNoticeDismissed(signature);
+    try { localStorage.setItem(NOTICE_KEY, signature); } catch { /* Private mode keeps the dismissal for this page only. */ }
+  }, []);
+  useEffect(() => { if (open && noticeSignature) dismissNotice(noticeSignature); }, [open, noticeSignature, dismissNotice]);
+  useEffect(() => {
+    const sync = (event: StorageEvent) => { if (event.key === NOTICE_KEY) setNoticeDismissed(event.newValue || ''); };
+    window.addEventListener('storage', sync);
+    return () => window.removeEventListener('storage', sync);
+  }, []);
+  useEffect(() => {
+    if (!noticeWanted) { setNoticeShown(false); return; }
+    if (noticeShown) return;
+    // Never stack over another modal such as an order confirmation; wait until it closes.
+    const tryShow = () => { if (!document.querySelector('dialog[open]')) setNoticeShown(true); };
+    tryShow();
+    const timer = setInterval(tryShow, 2_000);
+    return () => clearInterval(timer);
+  }, [noticeWanted, noticeShown]);
+  useEffect(() => { if (noticeVisible) notice.current?.showModal(); }, [noticeVisible]);
+  const closeNotice = () => { notice.current?.close(); dismissNotice(noticeSignature); };
   const close = () => { setOpen(false); setReview(null); setToken(''); setTokenNotice(''); setRemoveToken(false); requestAnimationFrame(() => { const mobileMenu = document.querySelector<HTMLButtonElement>('.mobile-menu'); if (mobileMenu?.getClientRects().length) mobileMenu.focus(); else trigger.current?.focus(); }); };
   const show = () => { onOpen?.(); setOpen(true); void request('read'); };
+  const showFromNotice = () => { dismissNotice(noticeSignature); show(); };
   const prepare = () => {
     if (blocked || !snapshot?.planId) return;
     setReview({ planId: snapshot.planId, modules: changes, deployMode: selectedMode, modeSupported });
@@ -441,5 +475,5 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {snapshot?.enabled && !needsSetup ? <section className="update-token" aria-labelledby="update-token-title"><div className="update-section-heading"><h3 id="update-token-title">GitHub Token</h3>{tokenSupported ? <span className={`update-token-status ${tokenConfigured ? 'configured' : ''}`}>{tokenConfigured ? '已配置' : '未配置（可选）'}</span> : <span>需升级更新服务</span>}</div>{tokenSupported ? <><p className="update-token-help" id="update-token-help">用于读取公开仓库的正式版本，只需公开仓库只读权限。<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">创建 GitHub Token</a></p><p className="update-token-help">Token 仅保存在服务器，不会回显。保存后下次检查生效，已有重试等待会保留。</p><form onSubmit={event => { event.preventDefault(); void saveToken(); }}><label htmlFor="update-github-token">{tokenConfigured ? '替换 Token' : '配置 Token'}</label><input id="update-github-token" type="password" autoComplete="off" autoCapitalize="none" spellCheck={false} value={token} disabled={tokenBlocked} aria-describedby="update-token-help" placeholder={tokenConfigured ? '粘贴新的 Token' : '粘贴 GitHub Token'} onChange={event => { setToken(event.target.value); setTokenError(''); setTokenNotice(''); }} /><div className="update-token-actions"><button type="submit" className="button secondary" disabled={tokenBlocked || !token.trim()}>{pending === 'token' ? <LoaderCircle size={15} className="spin" /> : null}{tokenConfigured ? '替换 Token' : '保存 Token'}</button>{tokenConfigured && !removeToken ? <button type="button" className="text-button" disabled={tokenBlocked} onClick={() => { setRemoveToken(true); setTokenNotice(''); }}>移除 Token</button> : null}</div></form>{removeToken && tokenConfigured ? <div className="update-token-remove"><p>确认移除已保存的 Token？后续检查将使用公开访问额度。</p><div className="update-token-actions"><button type="button" className="button secondary" disabled={tokenBlocked} onClick={() => void saveToken(true)}>确认移除</button><button type="button" className="text-button" disabled={pending === 'token'} onClick={() => setRemoveToken(false)}>取消移除</button></div></div> : null}{tokenError ? <p className="update-token-error" role="alert">{tokenError}</p> : null}{tokenResultUncertain ? <button className="text-button update-token-refresh" disabled={pending !== null || checking || updating || uncertain} onClick={() => void refreshToken()}>刷新配置状态</button> : null}{tokenNotice ? <p className="update-token-notice" role="status">{tokenNotice}</p> : null}</> : <p className="update-token-help">当前更新服务暂不支持 Token 配置。请在服务器上重新运行原一键部署命令升级，之后即可在这里配置。</p>}</section> : null}
     {modules.length ? <section aria-labelledby="update-modules-title"><div className="update-section-heading"><h3 id="update-modules-title">本机模块</h3><span>{modules.length} 个已安装</span></div><ul className="update-modules">{modules.map(module => <ModuleRow key={module.id} module={module} unfinishedJob={unfinishedJob} />)}</ul></section> : snapshot?.enabled && !checking ? <p className="update-empty">尚未识别到可更新的本机模块，请重新检查。</p> : null}
     {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3><p className="update-review-mode">更新方式：<strong>{modeLabels[review.deployMode]}</strong></p><p>{modeDescriptions[review.deployMode]}</p><p>将更新 {review.modules.map(module => module.name).join('、')}，共 {review.modules.length} 个模块。</p>{review.modules.some(module => module.recovery === true) ? <p>其中 {review.modules.filter(module => module.recovery === true).map(module => module.name).join('、')} 将恢复未完成的更新，重新完成安装与健康检查。</p> : null}<p>变更模块会短暂重启。请先完成这些模块中正在进行的操作。</p>{reviewInvalid ? <p role="alert">{reviewModeInvalid ? '更新方式支持情况已变化，请返回重新确认。' : '版本检查结果已变化或过期，请返回重新检查。'}</p> : null}</section> : changes.length && !updating ? <p className="update-footnote">{recoveries.length ? '本次包含未完成更新的恢复；相关模块会短暂重启。' : '仅更新有新正式版本的模块；变更模块会短暂重启。'}</p> : null}
-  </div><footer className="update-footer">{review ? <><button className="button secondary" disabled={pending === 'apply'} onClick={() => setReview(null)}>返回</button><button className="button primary" disabled={blocked || reviewInvalid} onClick={() => void apply()}>{pending === 'apply' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}确认更新 {review.modules.length} 个模块</button></> : <><button className="button secondary" disabled={pending !== null || checking || updating || uncertain || needsSetup} onClick={() => void request('check')}><RefreshCw size={16} className={checking ? 'spin' : ''} />{checking ? '正在检查' : '检查更新'}</button>{changes.length ? <button className="button primary" disabled={blocked} onClick={prepare}>{updating ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{updating ? '正在更新' : expired || snapshot?.planId === submittedPlan.current ? '请先重新检查' : recoveries.length === changes.length ? '恢复未完成更新' : '查看更新'}</button> : <span className="update-channel">正式版本</span>}</>}</footer></div></dialog>, document.body) : null}</>;
+  </div><footer className="update-footer">{review ? <><button className="button secondary" disabled={pending === 'apply'} onClick={() => setReview(null)}>返回</button><button className="button primary" disabled={blocked || reviewInvalid} onClick={() => void apply()}>{pending === 'apply' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}确认更新 {review.modules.length} 个模块</button></> : <><button className="button secondary" disabled={pending !== null || checking || updating || uncertain || needsSetup} onClick={() => void request('check')}><RefreshCw size={16} className={checking ? 'spin' : ''} />{checking ? '正在检查' : '检查更新'}</button>{changes.length ? <button className="button primary" disabled={blocked} onClick={prepare}>{updating ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}{updating ? '正在更新' : expired || snapshot?.planId === submittedPlan.current ? '请先重新检查' : recoveries.length === changes.length ? '恢复未完成更新' : '查看更新'}</button> : <span className="update-channel">正式版本</span>}</>}</footer></div></dialog>, document.body) : null}{noticeVisible ? createPortal(<dialog ref={notice} className="update-dialog update-notice" aria-labelledby="update-notice-title" aria-describedby="update-notice-description" onCancel={event => { event.preventDefault(); closeNotice(); }}><div className="update-dialog-content"><header className="update-header"><div><h2 id="update-notice-title">{recoveries.length === changes.length ? '有未完成的更新' : '发现新版本'}</h2><p id="update-notice-description">{recoveries.length === changes.length ? `${changes.length} 个模块的更新尚未完成` : `${changes.length} 个模块有新的正式版本`}</p></div><button className="icon-button" aria-label="关闭更新提醒" onClick={closeNotice}><X size={21} /></button></header><div className="update-body"><ul className="update-modules">{changes.map(module => <ModuleRow key={module.id} module={module} unfinishedJob={unfinishedJob} />)}</ul><p className="update-footnote">更新前会再次确认，变更模块会短暂重启。关闭后可随时在侧栏“系统更新”查看。</p></div><footer className="update-footer"><button className="button secondary" onClick={closeNotice}>稍后</button><button className="button primary" onClick={showFromNotice}><Download size={16} />查看更新</button></footer></div></dialog>, document.body) : null}</>;
 }

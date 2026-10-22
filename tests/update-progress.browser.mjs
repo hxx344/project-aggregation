@@ -18,6 +18,8 @@ async (page) => {
     await page.waitForTimeout(40);
   };
   const openUpdates = async () => {
+    // The automatic release notice is covered by update-notice.browser.mjs.
+    if (await page.locator('.update-notice').count()) await page.getByRole('button', { name: '稍后', exact: true }).click();
     if (await page.locator('.mobile-menu').isVisible()) await page.getByRole('button', { name: '打开导航', exact: true }).click();
     await page.getByRole('button', { name: /^系统更新：/ }).click();
     await page.getByRole('dialog', { name: '系统更新', exact: true }).waitFor();
