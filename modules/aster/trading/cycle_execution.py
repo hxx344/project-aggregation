@@ -93,12 +93,12 @@ class CycleExecutor(Executor):
             # strand exposure because a display write failed.
             pass
 
-    def send(self, intent, orders, *, repair=False):
+    def send(self, intent, orders, *, repair=False, persist=None):
         self._cycle_admission = None
         guard = getattr(self, "_cycle_submit_guard", None)
         self._cycle_submit_guard = None
         if repair or intent.get("kind") != "cycle":
-            return super().send(intent, orders, repair=repair)
+            return super().send(intent, orders, repair=repair, persist=persist)
         broker = self.broker
         if isinstance(broker, LiveBroker) or guard:
             validate = guard[1] if guard and guard[0] == intent["id"] else None
@@ -116,7 +116,7 @@ class CycleExecutor(Executor):
         try:
             # Reuse the original one-call send, validation and persistence logic.
             # A failed observation setup must still use the live admission guard.
-            return Executor(self.store, observed or broker, self.market).send(intent, orders, repair=repair)
+            return Executor(self.store, observed or broker, self.market).send(intent, orders, repair=repair, persist=persist)
         finally:
             self.last_send_attempted = observed.send_attempted if observed is not None else True
             self._observe_quality(intent)
@@ -405,6 +405,12 @@ class CycleExecutor(Executor):
             intent["execution_quality"] = quality
         action = "加仓" if plan.phase == "open" else "减回本轮新增"
         persist_started = clock_tick()
+        persisted = False
+        def persist_send(marked_intent):
+            nonlocal persisted
+            self.store.create_cycle_intent(marked_intent, f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
+            persisted = True
+            record_duration(quality, "persist_ms", persist_started)
         def validate_send():
             if isinstance(self.broker, LiveBroker):
                 self._require_admission_fresh(admission)
@@ -413,11 +419,12 @@ class CycleExecutor(Executor):
         if isinstance(self.broker, LiveBroker) or before_send is not None:
             self._cycle_submit_guard = (token, validate_send)
         try:
-            self.store.create_cycle_intent(intent, f"{symbol} 独立循环同时{action}多空，每边 {wire(qty)}，{plan.leverage}x")
-            record_duration(quality, "persist_ms", persist_started)
             self._quality_clocks = (token, trigger_ticks, final_ticks)
-            self.send(intent, orders)
+            self.send(intent, orders, persist=persist_send)
         finally:
+            if not persisted:
+                # A commit failure precedes transport even without telemetry.
+                self.last_send_attempted = False
             self._quality_clocks = None
             self._cycle_submit_guard = None
         return self.reconcile(account, intent)

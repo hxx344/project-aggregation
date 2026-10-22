@@ -12,8 +12,10 @@ from unittest.mock import Mock, patch
 from trading.cycle import CyclePlan
 from trading.cycle_execution import CycleExecutor
 from trading.cycle_quality import ObservedBroker
+from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.models import TradingError, dec
 from trading.paper import PaperBroker
+from trading import recovery
 from trading.store import Store
 from tests import test_cycle_execution_quality as quality_cases
 
@@ -33,6 +35,7 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
 
     def test_intent_index_and_event_commit_together_before_broker_submit(self):
         statements = []
+        saved_account = self.f.store.account("test")
         connect, original = self.f.store.connect, self.f.broker.submit
         @contextmanager
         def observed_connection():
@@ -42,11 +45,18 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
         def submit(orders):
             statements.append("BROKER_SUBMIT")
             with connect() as db:
+                self.assertFalse(db.in_transaction)
                 pending = db.execute("SELECT id,account_id,status,data FROM intents").fetchone()
                 self.assertEqual((pending["account_id"], pending["status"]), ("test", "pending"))
                 durable = json.loads(pending["data"])
                 self.assertEqual(durable["orders"], orders)
                 self.assertEqual(durable["receipts"], {})
+                marker = durable["bounded_recovery"]
+                self.assertEqual(marker["identity"], recovery.broker_identity(saved_account, self.f.broker))
+                self.assertEqual(marker["config"], recovery.recovery_config(saved_account))
+                self.assertEqual(marker["checks"], {order["newClientOrderId"]: 0 for order in orders})
+                self.assertLessEqual(marker["first_observed_at"], marker["last_send_at"])
+                self.assertLessEqual(marker["last_send_at"], time.time())
                 indexed = db.execute("SELECT * FROM cycle_volume_sync WHERE intent_id=?", (pending["id"],)).fetchone()
                 self.assertEqual((indexed["account_id"], indexed["status"]), ("test", "pending"))
                 self.assertIsNone(indexed["synced_at"])
@@ -76,10 +86,9 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
         def tables(statements):
             return [sql.split()[2].split("(")[0] for sql in statements]
 
-        # Creation commits intent, index and event together; the send marker
-        # then durably records the bounded-recovery send time before submit.
+        # Creation includes the bounded-recovery marker in the same FULL commit.
         self.assertEqual([tables(write) for write in writes],
-                         [["intents", "cycle_volume_sync", "events"], ["intents", "cycle_volume_sync"]])
+                         [["intents", "cycle_volume_sync", "events"]])
         self.assertTrue(writes[0][0].startswith("INSERT INTO intents VALUES"))
         self.assertEqual(sent.call_count, 1)
         self.assertEqual(self.quality()["actual"]["status"], "filled")
@@ -126,11 +135,19 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
                 self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0], 0)
 
     def test_created_pending_survives_restart_without_resubmitting_or_duplicating_event(self):
-        with patch.object(self.executor, "send", side_effect=RuntimeError("crash before send")), \
+        create = self.f.store.create_cycle_intent
+        def crash_after_commit(intent, message):
+            create(intent, message)
+            raise RuntimeError("crash before send")
+        with patch.object(self.f.store, "create_cycle_intent", side_effect=crash_after_commit), \
+             patch.object(self.f.broker, "submit") as submit, \
              self.assertRaisesRegex(RuntimeError, "crash before send"):
             self.start()
+        submit.assert_not_called()
         pending = self.f.store.intent("test")
         self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["bounded_recovery"]["checks"],
+                         {order["newClientOrderId"]: 0 for order in pending["orders"]})
         store = Store(self.f.store.path)
         broker = PaperBroker("test", self.f.market, store)
         restored = CycleExecutor(store, broker, self.f.market)
@@ -146,7 +163,11 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE message LIKE '%同时加仓%'").fetchone()[0], 1)
 
     def test_creation_rejects_an_existing_id_without_updating_it(self):
-        with patch.object(self.executor, "send", side_effect=RuntimeError("before send")), self.assertRaises(RuntimeError):
+        create = self.f.store.create_cycle_intent
+        def crash_after_commit(intent, message):
+            create(intent, message)
+            raise RuntimeError("before send")
+        with patch.object(self.f.store, "create_cycle_intent", side_effect=crash_after_commit), self.assertRaises(RuntimeError):
             self.start()
         original = self.f.store.intent("test")
         changed = copy.deepcopy(original)
@@ -156,6 +177,111 @@ class CyclePreSubmitOptimizationTests(unittest.TestCase):
         self.assertEqual(self.f.store.intent("test"), original)
         with self.f.store.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
+
+    def test_send_marker_failure_leaves_no_partial_intent_and_never_sends(self):
+        with patch("trading.execution.recovery.mark_send", side_effect=TradingError("invalid recovery identity")), \
+             patch.object(self.f.broker, "submit") as submit, \
+             self.assertRaisesRegex(TradingError, "invalid recovery identity"):
+            self.start()
+        submit.assert_not_called()
+        self.assertFalse(self.executor.last_send_attempted)
+        with self.f.store.connect() as db:
+            for name in ("intents", "cycle_volume_sync", "events"):
+                self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0], 0)
+        self.assertEqual(self.f.store.get("cycle:test"), self.progress)
+
+    def test_writer_guard_failure_rolls_back_marker_index_and_event_without_sending(self):
+        revoked = []
+        def assert_current():
+            # Inspect the still-uncommitted transaction at the real Store guard.
+            db = self.f.store._connection_local.db
+            row = db.execute("SELECT data FROM intents").fetchone()
+            if row is not None:
+                intent = json.loads(row[0])
+                self.assertIn("last_send_at", intent["bounded_recovery"])
+                for name in ("intents", "cycle_volume_sync", "events"):
+                    self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0], 1)
+                revoked.append(intent["id"])
+                raise TradingError("writer ownership revoked")
+        writer = SimpleNamespace(assert_current=assert_current)
+        with patch.object(self.f.store, "account_writer", writer, create=True), \
+             patch.object(self.f.broker, "submit") as submit, \
+             self.assertRaisesRegex(TradingError, "writer ownership revoked"):
+            self.start()
+        self.assertEqual(len(revoked), 1)
+        submit.assert_not_called()
+        self.assertFalse(self.executor.last_send_attempted)
+        with self.f.store.connect() as db:
+            for name in ("intents", "cycle_volume_sync", "events"):
+                self.assertEqual(db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0], 0)
+        self.assertEqual(self.f.store.get("cycle:test"), self.progress)
+
+    def test_observation_failure_cannot_count_a_failed_commit_as_a_send(self):
+        with patch("trading.cycle_execution.ObservedBroker", side_effect=RuntimeError("display unavailable")), \
+             patch.object(self.f.store, "create_cycle_intent", side_effect=sqlite3.OperationalError("commit failed")), \
+             patch.object(self.f.broker, "submit") as submit, \
+             self.assertRaisesRegex(sqlite3.OperationalError, "commit failed"):
+            self.start()
+        submit.assert_not_called()
+        self.assertFalse(self.executor.last_send_attempted)
+        self.assertIsNone(self.f.store.intent("test"))
+        self.assertIsNone(self.executor._cycle_submit_guard)
+
+    def test_crash_after_fills_before_receipt_commit_recovers_original_orders_once(self):
+        original = self.f.broker.submit
+        def accepted_then_crashed(orders):
+            original(orders)
+            raise RuntimeError("crash before receipt commit")
+        with patch.object(self.f.broker, "submit", side_effect=accepted_then_crashed) as submit, \
+             self.assertRaisesRegex(RuntimeError, "crash before receipt commit"):
+            self.start()
+        submit.assert_called_once()
+        pending = self.f.store.intent("test")
+        self.assertEqual(pending["receipts"], {})
+        self.assertIn("last_send_at", pending["bounded_recovery"])
+        store = Store(self.f.store.path)
+        broker = PaperBroker("test", self.f.market, store)
+        restored = CycleExecutor(store, broker, self.f.market)
+        with patch.object(broker, "submit", side_effect=AssertionError("must not resend")), \
+             patch.object(broker, "query", wraps=broker.query) as query:
+            restored.reconcile(self.f.account)
+            restored.reconcile(self.f.account)
+        self.assertEqual([call.args[1] for call in query.call_args_list],
+                         [order["newClientOrderId"] for order in pending["orders"]])
+        self.assertIsNone(store.intent("test"))
+        self.assertEqual(store.get("cycle:test")["quantities"], {"LONG": "2", "SHORT": "2"})
+        self.assertEqual(store.get("cycle:test")["phase"], "holding")
+        with store.connect() as db:
+            index = db.execute("SELECT status,synced_at FROM cycle_volume_sync WHERE intent_id=?", (pending["id"],)).fetchone()
+            self.assertEqual(index["status"], "complete")
+            self.assertIsNotNone(index["synced_at"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE message LIKE '%同时加仓%'").fetchone()[0], 1)
+
+    def test_unknown_send_keeps_original_marker_and_bounded_queries_across_restart(self):
+        with patch.object(self.f.broker, "submit", side_effect=AmbiguousOrder("unknown send")) as submit, \
+             patch.object(self.executor, "reconcile", return_value="restart before queries"):
+            self.start()
+        submit.assert_called_once()
+        pending = self.f.store.intent("test")
+        self.assertEqual(pending["receipts"], {})
+        store = Store(self.f.store.path)
+        broker = PaperBroker("test", self.f.market, store)
+        restored = CycleExecutor(store, broker, self.f.market)
+        with patch.object(broker, "submit", side_effect=AssertionError("must not resend")), \
+             patch.object(broker, "query", side_effect=ExchangeError("not visible", code=-2013)) as query:
+            for _ in range(5):
+                restored.reconcile(self.f.account)
+        self.assertEqual(query.call_count, 6)
+        current = store.intent("test")
+        self.assertEqual(current["orders"], pending["orders"])
+        self.assertEqual(current["receipts"], {})
+        self.assertEqual(current["bounded_recovery"]["last_send_at"], pending["bounded_recovery"]["last_send_at"])
+        self.assertEqual(current["bounded_recovery"]["checks"],
+                         {order["newClientOrderId"]: 3 for order in pending["orders"]})
+        with store.connect() as db:
+            index = db.execute("SELECT status,synced_at FROM cycle_volume_sync WHERE intent_id=?", (pending["id"],)).fetchone()
+            self.assertEqual(index["status"], "pending")
+            self.assertIsNone(index["synced_at"])
 
     def test_final_plan_reuses_exact_batch_amounts_without_rescanning(self):
         final = self.final_observation()

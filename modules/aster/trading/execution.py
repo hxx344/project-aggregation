@@ -70,10 +70,13 @@ class Executor:
         return {"symbol": symbol, "positionSide": position_side, "side": side, "type": "MARKET",
                 "quantity": wire(qty), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
 
-    def send(self, intent, orders, *, repair=False, capacity_observation=None):
+    def send(self, intent, orders, *, repair=False, capacity_observation=None, persist=None):
         account = self.store.account(intent["account_id"])
         recovery.mark_send(intent, account, self.broker, orders)
-        self.store.save_intent(intent)  # Also persist a repair's new settling window before send.
+        # Commit the marked intent before entering the possibly-sent boundary.
+        # Initial cycles insert their intent/index/event here in one transaction;
+        # other sends, including repairs, retain the usual durable update.
+        (self.store.save_intent if persist is None else persist)(intent)
         not_sent = None
         rejections = []
         try:
