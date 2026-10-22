@@ -2,21 +2,20 @@
 import { memo, useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { assetTrend } from '@/lib/withdrawals';
-import { calculateMonthlyPerformance, calculateAnnualizedReturns, formatGain, formatReturnRate, MIN_MONTHLY_SPAN_DAYS } from '@/lib/performance-metrics';
+import { calculateMonthlyPerformance, calculateAnnualizedReturns, formatGain, formatReturnRate, performanceTone, MIN_MONTHLY_SPAN_DAYS } from '@/lib/performance-metrics';
 import type { Ledger } from '@/lib/types';
+import { DailyChanges } from './daily-changes';
 
 const money = (value: number) => value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const signed = (value: number) => (value > 0 ? '+' : '') + money(value);
-const performanceTone = (value: number | null, scale = 1) => {
-  const rounded = value === null ? 0 : Number((value * scale).toFixed(2));
-  return !Number.isFinite(rounded) || rounded === 0 ? 'performance-neutral' : rounded > 0 ? 'performance-positive' : 'performance-negative';
-};
 
 export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }: { ledger: Ledger; today: string; onHistory: () => void }) {
   const history = useMemo(() => assetTrend(ledger, today), [ledger, today]);
   const monthly = useMemo(() => calculateMonthlyPerformance(history), [history]);
   const annualized = useMemo(() => calculateAnnualizedReturns(history, monthly, today), [history, monthly, today]);
   const first = history[0], last = history.at(-1);
+  // Daily snapshots only change for today's refresh, withdrawal edits or an import.
+  const changesVersion = useMemo(() => [history.length, last?.date, last?.total, last?.withdrawn, ledger.baselineDate, JSON.stringify(ledger.withdrawals)].join('|'), [history, last, ledger.baselineDate, ledger.withdrawals]);
   const change = first && last ? last.adjusted - first.adjusted : null;
   const month = annualized.monthlyPeriod;
   const monthlyHint = !month ? '上个自然月没有快照'
@@ -83,6 +82,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
         </div>
       </details>
     </section>}
+    {history.length >= 2 && <DailyChanges version={changesVersion}/>}
     <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。连线仅连接已有记录，不代表缺失日期的估值。{(first?.partial || last?.partial) && <strong> 含旧值快照，详见历史记录。</strong>}<button className="text-button" onClick={onHistory}>查看记录</button></p>
   </section>;
 });

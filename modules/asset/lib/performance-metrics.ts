@@ -108,6 +108,11 @@ export function calculateAnnualizedReturns(
   return { monthlyAnnualized, overallAnnualized, referenceMonth, monthlyPeriod, daysSpan, hasData, partial };
 }
 
+export function performanceTone(value: number | null, scale = 1) {
+  const rounded = value === null ? 0 : Number((value * scale).toFixed(2));
+  return !Number.isFinite(rounded) || rounded === 0 ? 'performance-neutral' : rounded > 0 ? 'performance-positive' : 'performance-negative';
+}
+
 /** Unknown values remain unknown, and values rounding to zero never show -0.00. */
 export function formatGain(value: number | null, decimals = 2): string {
   if (value === null || !Number.isFinite(value)) return '—';
