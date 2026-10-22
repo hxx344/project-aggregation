@@ -112,8 +112,10 @@ function sourceError(error) {
   return '暂时无法读取 Asset 仓位，请检查项目连接';
 }
 
+export const ASSET_POSITIONS_TIMEOUT_MS = 12000;
+
 /** Only configured Asset projects are addressable; exchange credentials stay in Asset. */
-export function createAssetPositions({ listTargets, request = requestJson, now = Date.now, cacheMs = 5000, timeoutMs = 12000, backgroundIntervalMs = 0 } = {}) {
+export function createAssetPositions({ listTargets, request = requestJson, now = Date.now, cacheMs = 5000, timeoutMs = ASSET_POSITIONS_TIMEOUT_MS, backgroundIntervalMs = 0 } = {}) {
   const entries = new Map();
   let closed = false, timer, background = null;
   const targets = () => listTargets().filter(target => target.project.enabled && target.project.adapter === 'asset');

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPositionsSource, matchBase, MAX_POSITION_ITEMS, openTradingRequest, positionItems, positionsReply, positionsRequest } from '../src/hub-positions.ts';
+import { createPositionsSource, matchBase, MAX_POSITION_ITEMS, openTradingRequest, positionItems, positionsReply, positionsRequest, POSITIONS_TIMEOUT_MS } from '../src/hub-positions.ts';
+import { ASSET_POSITIONS_TIMEOUT_MS } from '../server/asset-positions.mjs';
+import { POSITIONS_TIMEOUT_MS as MODULE_POSITIONS_TIMEOUT_MS } from '../modules/monitor/lib/hub-bridge.ts';
 
 const now = Date.parse('2026-10-22T04:00:00.000Z');
 const at = new Date(now - 5_000).toISOString();
@@ -114,6 +116,12 @@ test('positions source coalesces reads, caches every outcome for 20 seconds and 
   assert.equal((await timeout).status, 'unavailable'); assert.equal(calls, 3);
   clock = 60_000; const pending = source.read(true); source.dispose(); release(); await pending;
   assert.equal((await source.read(false)).status, 'unavailable', 'dispose discards the in-flight result');
+});
+
+test('each positions deadline outlasts the one it waits on, so a slow source is reported by the layer that knows why', () => {
+  // Server -> Asset, host page -> server, Monitor -> host page.
+  assert.ok(POSITIONS_TIMEOUT_MS >= ASSET_POSITIONS_TIMEOUT_MS + 2_000, 'the host waits for the server to give up on Asset and answer with kept positions');
+  assert.ok(MODULE_POSITIONS_TIMEOUT_MS >= POSITIONS_TIMEOUT_MS + 2_000, 'Monitor waits for the host to answer, including its own failure reply');
 });
 
 test('cycle summaries are forwarded field by field and stay absent for older Asset versions', () => {

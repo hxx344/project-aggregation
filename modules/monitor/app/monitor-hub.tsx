@@ -180,7 +180,7 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil", ini
         </div>
         {active !== "perpetual" && detailEnabled ? <aside className="monitor-detail-side">
           {hasAlerts ? <MonitorAlertSide state={alertStates[alertId]} onOpenRules={openAlertRules}/> : null}
-          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.readActive} spreads={active === "oil" ? oilSpreads : active === "hynix" ? hynixSpreads : undefined}/>
+          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.active} spreads={active === "oil" ? oilSpreads : active === "hynix" ? hynixSpreads : undefined}/>
         </aside> : null}
       </div>
     </Tabs>

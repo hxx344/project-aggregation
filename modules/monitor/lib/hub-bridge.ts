@@ -13,6 +13,7 @@ export const MODULE_CAPABILITIES = ['activity', 'navigate', 'changed', 'position
 let targetOrigin = '', connected = false, hostCapabilities: ReadonlySet<string> = new Set();
 const hubListeners = new Set<() => void>();
 const positionListeners = new Set<(value: unknown) => void>();
+const hostReadyListeners = new Set<() => void>();
 let hubSnapshot = '0|';
 function notifyHub() { hubSnapshot = `${connected ? 1 : 0}|${[...hostCapabilities].sort().join(',')}`; hubListeners.forEach(listener => listener()); }
 export function trustedHubOrigin(location: Pick<Location, 'hostname' | 'protocol' | 'port'>, embedded: boolean) {
@@ -67,7 +68,8 @@ export type HubPositionItem = {
 export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[]; timedOut?: boolean };
 const POSITION_MARKETS: ReadonlySet<string> = new Set(['oil', 'cl-xau', 'hynix', 'perpetual']);
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/, POSITION_BASE = /^[A-Z0-9]{1,20}$/;
-export const POSITIONS_TIMEOUT_MS = 12_000, POSITIONS_REFRESH_MS = 60_000;
+// Outlasts the host's own positions read deadline (15 s) so a slow but answered read is not reported as silence.
+export const POSITIONS_TIMEOUT_MS = 20_000, POSITIONS_REFRESH_MS = 60_000;
 // Longer than the host's 20 s positions cache so the follow-up reaches Asset again.
 export const POSITIONS_FOLLOW_UP_MS = 25_000;
 
@@ -136,13 +138,13 @@ export function createPositionsRequester({ send, onReply, timeoutMs = POSITIONS_
   cancel?: (timer: never) => void;
   createId?: () => string;
 }) {
-  let latest: string | null = null, timer: unknown = null;
+  let latest: string | null = null, timer: unknown = null, asked: { market: PositionsMarket; symbols: string[] } | null = null;
   const clear = () => { if (timer !== null) cancel(timer as never); timer = null; };
   return {
     request(market: PositionsMarket, symbols: string[]) {
       const clean = cleanPositionsRequest(market, symbols), requestId = createId();
       if (!clean || !REQUEST_ID.test(requestId)) return null;
-      clear(); latest = requestId;
+      clear(); latest = requestId; asked = clean;
       timer = schedule(() => {
         if (latest !== requestId) return;
         latest = null; timer = null;
@@ -157,6 +159,8 @@ export function createPositionsRequester({ send, onReply, timeoutMs = POSITIONS_
       latest = null; clear(); onReply(reply);
       return true;
     },
+    /** Asks again only while a request is unanswered; a host that revalidated the frame drops replies to earlier requests. */
+    retry() { return latest !== null && asked ? this.request(asked.market, asked.symbols) : null; },
     dispose() { latest = null; clear(); },
   };
 }
@@ -180,6 +184,7 @@ export type HubPositionsView = {
   previous: { items: HubPositionItem[]; generatedAt: string | null } | null;
 };
 type StoredReply = { key: string; reply: HubPositionsReply; previous: HubPositionsView['previous'] };
+/** `active` must follow host foreground activity, not background read permission: the host answers background requests without reading. */
 export function useHubPositions(market: PositionsMarket, symbols: readonly string[], active: boolean): HubPositionsView {
   const host = useHubHost();
   const symbolKey = cleanPositionsRequest(market, symbols)?.symbols.join(',') ?? '';
@@ -203,11 +208,12 @@ export function useHubPositions(market: PositionsMarket, symbols: readonly strin
       },
     });
     const listener = (value: unknown) => { requester.receive(value); };
-    positionListeners.add(listener);
+    const reconnected = () => { requester.retry(); };
+    positionListeners.add(listener); hostReadyListeners.add(reconnected);
     const run = () => { requester.request(market, symbolKey.split(',')); };
     run();
     const timer = setInterval(run, POSITIONS_REFRESH_MS);
-    return () => { clearInterval(timer); if (followUp) clearTimeout(followUp); positionListeners.delete(listener); requester.dispose(); };
+    return () => { clearInterval(timer); if (followUp) clearTimeout(followUp); positionListeners.delete(listener); hostReadyListeners.delete(reconnected); requester.dispose(); };
   }, [mode, active, market, symbolKey, requestKey]);
   if (mode) return { status: mode, items: [], generatedAt: null, timedOut: false, incomplete: false, previous: null };
   const current = stored?.key === requestKey ? stored : null;
@@ -232,6 +238,8 @@ export function useHubBridge(projectId: HubProject) {
       if (value.type === 'ready' && value.role === 'host') {
         targetOrigin = origin!; connected = true; hostCapabilities = new Set(hostCapabilityList(value.capabilities)); readActivity.connect(); update(); notifyHub();
         post({ type: 'ready', role: 'module', capabilities: [...MODULE_CAPABILITIES] });
+        // Sent after our ready so the host has re-accepted this document before the repeated request arrives.
+        hostReadyListeners.forEach(listener => listener());
       } else if (connected && value.type === 'activity' && typeof value.active === 'boolean') { hostActive = value.active; readActivity.update(value.active, value.backgroundUpdates); update(); }
       else if (connected && value.type === 'navigate' && value.projectId === projectId) {
         const query = cleanHubQuery(value.query); if (!query) return;

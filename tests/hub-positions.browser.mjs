@@ -166,7 +166,7 @@ async (page) => {
     const cold = await reply(monitor, 'cold-hidden');
     assert(cold.status === 'unavailable' && cold.incomplete === false && reads() === coldReads, 'inactive page with no cache answers unavailable without reading');
 
-    // Timeout: no retry, unavailable after ten seconds.
+    // Timeout: no retry, unavailable after fifteen seconds.
     neverRespond = true;
     await page.goto(`${origin}/?view=project&id=monitor`);
     monitor = await connect('monitor');
@@ -175,7 +175,7 @@ async (page) => {
     await ask(monitor, request('slow-1'));
     const slow = await reply(monitor, 'slow-1', 400);
     const waited = Date.now() - started;
-    assert(slow.status === 'unavailable' && waited >= 9_500 && waited < 14_000 && reads() === slowReads + 1, `timeout reply ${slow.status} after ${waited}ms`);
+    assert(slow.status === 'unavailable' && waited >= 14_500 && waited < 19_000 && reads() === slowReads + 1, `timeout reply ${slow.status} after ${waited}ms`);
     neverRespond = false; release();
 
     await ask(monitor, { type: 'open-trading', market: 'oil' });
@@ -185,7 +185,7 @@ async (page) => {
 
     assert(!unexpected.length && !external.length && !errors.length, JSON.stringify({ unexpected, external, errors }));
     assert(requests.every(request => request.method === 'GET' || (request.method === 'POST' && /\/api\/projects\/(monitor|asset)\/launch$/.test(request.path))), 'only launch POSTs are sent');
-    return { passed: true, positionReads: reads(), scenarios: ['monitor capabilities', 'single in-flight read', 'redacted items', 'cache across markets', 'invalid and forged messages ignored', 'inactive cache and open-trading ignored', 'non-monitor ignored', '401 unauthorized without logout', 'inactive cold unavailable', '10s timeout without retry', 'open-trading to positions'] };
+    return { passed: true, positionReads: reads(), scenarios: ['monitor capabilities', 'single in-flight read', 'redacted items', 'cache across markets', 'invalid and forged messages ignored', 'inactive cache and open-trading ignored', 'non-monitor ignored', '401 unauthorized without logout', 'inactive cold unavailable', '15s timeout without retry', 'open-trading to positions'] };
   } finally {
     neverRespond = false; holdRead = false; release();
     await page.goto('about:blank').catch(() => {});

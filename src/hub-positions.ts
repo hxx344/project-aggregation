@@ -15,7 +15,8 @@ export type PositionsOutcome = { status: 'ok'; data: unknown; at: number } | { s
 
 export const POSITIONS_CAPABILITIES = ['positions', 'open-trading'] as const;
 export const MAX_POSITION_ITEMS = 50;
-export const POSITIONS_TIMEOUT_MS = 10_000;
+// Outlasts the server's 12 s Asset deadline so its degraded reply (kept positions marked stale) reaches the module.
+export const POSITIONS_TIMEOUT_MS = 15_000;
 export const POSITIONS_CACHE_MS = 20_000;
 // Matches the trading center: a scope not re-read within this window is no longer live.
 export const POSITIONS_STALE_AFTER_MS = 90_000;

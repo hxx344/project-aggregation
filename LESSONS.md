@@ -1177,3 +1177,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `4db7716`。2026-10-22 用户截图显示更新弹窗展示 `2e21b96` 的完整英文提交信息与审查证据，并要求只看中文、简洁的信息。已发布的旧版本说明不改写，新发布起生效。
 
 **事件记录：** `release-notes-user-summary-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L075：跨层读取的超时由内向外递增，请求方的活跃条件与应答方一致
+
+**适用条件：** 一次读取穿过多层并各自设超时（Monitor → 工作台页面 → 工作台服务 → Asset），或请求方与应答方各自判断“现在能否读取”，或应答方在重新校验连接时丢弃旧请求的回复。
+
+**根因：** 关联持仓的三层截止时间是 Monitor 12 秒、工作台页面 10 秒、服务端读 Asset 12 秒。Asset 慢于 10 秒时页面先放弃，报「工作台暂时无法读取持仓」，服务端本来会在 12 秒时带着上次仓位标为旧数据返回，这个降级结果送不到面板；交易中心用 15 秒，同一时刻能正常显示。Monitor 按后台读取许可（`readActive`）请求，工作台只在自己处于前台可见时才读取，后台请求直接答「不可用」，切回前台后要等下一轮 60 秒刷新才恢复。模块先于 iframe 原生 load 就绪并发出请求时，工作台在 load 时重新校验连接、丢弃旧文档代际的回复，Monitor 收不到任何回复，12 秒后报「未收到工作台回复」。
+
+**以后做法：** 外层截止时间要比它等待的内层长出足够余量，让知道失败原因的那一层先回复；改任一层时一起核对上下游。请求方的活跃条件跟随应答方真正允许读取的条件，不用更宽的后台许可。应答方重新握手后，请求方对仍未得到回复的请求重发一次，已回复或已超时的请求不重发。
+
+**如何验证：** [工作台持仓测试](tests/hub-positions.test.mjs) 断言服务端、工作台页面、Monitor 三层截止时间依次递增且留有余量；[Monitor 桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 覆盖握手后只重发未回复请求；[主机桥接浏览器回归](tests/hub-positions.browser.mjs) 核对页面 15 秒超时，[真实 Monitor 浏览器回归](tests/monitor-related-positions.browser.mjs) 核对嵌入后按前台活跃读取并显示持仓。load 竞态依赖资源加载时序，浏览器回归无法稳定复现，只有单元测试覆盖。
+
+**证据：** project-aggregation 基线 `d21a78c` 的 [工作台持仓桥](src/hub-positions.ts)、[服务端 Asset 读取](server/asset-positions.mjs)、[Monitor 桥接](modules/monitor/lib/hub-bridge.ts) 与 [Monitor 主页](modules/monitor/app/monitor-hub.tsx)。2026-10-23 用户截图显示关联交易时而「持仓不可用：工作台暂时无法读取持仓」，时而「12 秒内未收到工作台回复」，其余时间正常。现场 Asset 耗时与服务器日志未取得，三条原因由源码推断，哪一条在现场占主导未核实。
+
+**事件记录：** `related-positions-intermittent-20261023`；实际发生日期 2026-10-23（Asia/Shanghai）；不推进全历史复盘检查点。

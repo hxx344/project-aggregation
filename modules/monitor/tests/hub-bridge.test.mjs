@@ -106,6 +106,28 @@ test('only the latest request id resolves, later or foreign replies are ignored 
   assert.equal(requester.receive(reply({ requestId: 'req-5', market: 'hynix' })), false);
 });
 
+test('a host that revalidates the frame gets the unanswered request again, and an answered one is not repeated', () => {
+  const sent = [], replies = [], timers = new Map(); let id = 0, nextTimer = 0;
+  const requester = createPositionsRequester({
+    send: message => sent.push(message), onReply: value => replies.push(value), timeoutMs: 20_000,
+    schedule: (callback, ms) => { const handle = ++nextTimer; timers.set(handle, { callback, ms }); return handle; },
+    cancel: handle => timers.delete(handle), createId: () => `req-${++id}`,
+  });
+  assert.equal(requester.retry(), null, 'nothing to repeat before the first request');
+  requester.request('oil', ['CL', 'BZ']);
+  assert.equal(requester.retry(), 'req-2');
+  assert.deepEqual(sent.at(-1), { type: 'positions-request', requestId: 'req-2', market: 'oil', symbols: ['CL', 'BZ'] });
+  assert.equal(timers.size, 1, 'the repeated request restarts a single deadline');
+  assert.equal(requester.receive(reply({ requestId: 'req-1' })), false, 'the dropped request no longer resolves');
+  assert.equal(requester.receive(reply({ requestId: 'req-2' })), true);
+  assert.equal(requester.retry(), null, 'an answered request is not sent again'); assert.equal(sent.length, 2);
+  requester.request('hynix', ['SKHY']); [...timers.values()][0].callback();
+  assert.equal(replies.at(-1).timedOut, true);
+  assert.equal(requester.retry(), null, 'a timed-out request waits for the next refresh');
+  requester.request('perpetual', ['BTC']); requester.dispose();
+  assert.equal(requester.retry(), null, 'nothing is sent after dispose'); assert.equal(sent.length, 4);
+});
+
 test('incomplete is accepted as a boolean, defaults to false for older hosts and only applies to ok replies', () => {
   assert.equal(parsePositionsReply(reply()).incomplete, false, 'an older host without the flag is treated as complete');
   assert.equal(parsePositionsReply(reply({ incomplete: false })).incomplete, false);
