@@ -2725,6 +2725,13 @@ class Engine:
             with self.lock:
                 self.error = str(exc) if isinstance(exc, TradingError) else "交易规则加载失败"
             delay = max(10, getattr(exc, "retry_after", 0))
+        except Exception as exc:
+            # Otherwise the status page keeps the startup "connecting" text and
+            # an actual failure is indistinguishable from a slow connection.
+            LOG.error("Trading rules load failed unexpectedly (%s)", type(exc).__name__)
+            with self.lock:
+                self.error = f"交易规则加载异常（{type(exc).__name__}），30 秒后重试"
+            delay = 30
         # Preserve the completion-based deadline even if the scheduler consumes
         # this future on a later turn. This result applies to this attempt only.
         return delay, time.monotonic() + delay

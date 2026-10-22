@@ -92,6 +92,23 @@ class EngineHardeningTests(unittest.TestCase):
             client.close.assert_called_once_with()
         self.assertNotIn("private", self.engine.error + " ".join(log.output))
 
+    def test_unexpected_rules_failure_replaces_connecting_status_without_details(self):
+        engine = Engine(self.f.store, market=Mock(spec=MarketData))
+        engine.market.load_rules.side_effect = RuntimeError("private rules diagnostic")
+        self.assertEqual(engine.error, "正在连接行情服务")
+        with self.assertLogs("aster.trading", level="ERROR") as log:
+            delay, _ = engine.poll_trading_rules()
+        self.assertEqual(delay, 30)
+        self.assertFalse(engine.ready)
+        self.assertIn("交易规则加载异常（RuntimeError）", engine.error)
+        self.assertNotIn("private", engine.error + " ".join(log.output))
+        engine.market.load_rules.side_effect = None
+        engine.market.rules = self.f.market.rules
+        with patch("trading.engine.SYMBOLS", tuple(self.f.market.rules)):
+            engine.poll_trading_rules()
+        self.assertTrue(engine.ready)
+        self.assertIsNone(engine.error)
+
     def test_shutdown_retains_process_lock_and_clients_until_active_worker_stops(self):
         entered = threading.Event()
         release = threading.Event()
