@@ -11,6 +11,7 @@ export type MonthlyPerformance = {
   startDate: string;
   endDate: string;
   daysSpan: number;
+  /** The first or last snapshot used for this month's gain is partial. */
   partial: boolean;
 };
 
@@ -21,6 +22,8 @@ export type AnnualizedMetrics = {
   monthlyPeriod: MonthlyPerformance | null;
   daysSpan: number;
   hasData: boolean;
+  /** A snapshot used by a displayed annualized value is partial. */
+  partial: boolean;
 };
 
 const DAY_MS = 86_400_000;
@@ -77,7 +80,7 @@ export function calculateMonthlyPerformance(trendData: readonly PerformancePoint
       month, startValue: first.adjusted, endValue: last.adjusted, gain,
       returnRate: gain !== null && first.adjusted > 0 ? finite(gain / first.adjusted) : null,
       snapshotCount: points.length, startDate: first.date, endDate: last.date,
-      daysSpan: daysBetween(first.date, last.date), partial: points.some(point => point.partial),
+      daysSpan: daysBetween(first.date, last.date), partial: !!(first.partial || last.partial),
     };
   });
 }
@@ -100,7 +103,9 @@ export function calculateAnnualizedReturns(
   const monthlyAnnualized = monthlyPeriod && monthlyPeriod.snapshotCount >= 2 &&
     monthlyPeriod.daysSpan >= MIN_MONTHLY_SPAN_DAYS && monthlyPeriod.returnRate !== null
     ? finite(monthlyPeriod.returnRate / yearFraction(monthlyPeriod.startDate, monthlyPeriod.endDate)) : null;
-  return { monthlyAnnualized, overallAnnualized, referenceMonth, monthlyPeriod, daysSpan, hasData };
+  const partial = (overallAnnualized !== null && !!(first.partial || last!.partial))
+    || (monthlyAnnualized !== null && monthlyPeriod!.partial);
+  return { monthlyAnnualized, overallAnnualized, referenceMonth, monthlyPeriod, daysSpan, hasData, partial };
 }
 
 /** Unknown values remain unknown, and values rounding to zero never show -0.00. */

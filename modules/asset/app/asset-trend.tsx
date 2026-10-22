@@ -57,7 +57,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
           <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；起始调整后资产须大于 0，收益率需为有效数值'}</p>
         </div>
       </div>
-      {history.some(point => point.partial) && <p className="performance-warning">含旧值或缺失行情的快照，收益指标可能受影响。</p>}
+      {annualized.partial && <p className="performance-warning">含旧值或缺失行情的快照，收益指标可能受影响。</p>}
       <details className="performance-monthly">
         <summary>每月表现 <span>（{monthly.length} 个月）</span>与收益口径</summary>
         <div className="performance-monthly-body">
@@ -83,6 +83,6 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
         </div>
       </details>
     </section>}
-    <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。连线仅连接已有记录，不代表缺失日期的估值。{history.some(point => point.partial) && <strong> 含旧值快照，详见历史记录。</strong>}<button className="text-button" onClick={onHistory}>查看记录</button></p>
+    <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。连线仅连接已有记录，不代表缺失日期的估值。{(first?.partial || last?.partial) && <strong> 含旧值快照，详见历史记录。</strong>}<button className="text-button" onClick={onHistory}>查看记录</button></p>
   </section>;
 });

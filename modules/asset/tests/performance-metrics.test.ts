@@ -36,6 +36,23 @@ test('months use sorted observed endpoints, unique days and do not mutate input'
   assert.deepEqual(data, before);
 });
 
+test('only partial snapshots used as calculation endpoints flag months and annualized metrics', () => {
+  const partial = (date: string, adjusted: number) => ({ ...point(date, adjusted), partial: true });
+  const clean = [point('2024-01-01', 100), point('2024-01-31', 110), point('2024-02-10', 120)];
+  const middle = [point('2024-01-01', 100), partial('2024-01-15', 105), point('2024-01-31', 110), point('2024-02-10', 120)];
+  assert.equal(annualized(clean).partial, false);
+  assert.equal(calculateMonthlyPerformance(middle)[1].partial, false);
+  assert.equal(annualized(middle).partial, false);
+  const latest = [...clean.slice(0, 2), partial('2024-02-10', 120)];
+  assert.equal(calculateMonthlyPerformance(latest)[0].partial, true);
+  assert.equal(annualized(latest).partial, true);
+  const monthEnd = [point('2023-12-15', 90), point('2024-01-01', 100), partial('2024-01-31', 110), point('2024-02-10', 120)];
+  assert.equal(calculateMonthlyPerformance(monthEnd)[1].partial, true);
+  assert.equal(annualized(monthEnd).partial, true);
+  // A partial endpoint of an unavailable metric does not affect a displayed value.
+  const unavailable = [partial('2024-01-01', 0), point('2024-01-31', 110)];
+  assert.equal(annualized(unavailable).partial, false);
+});
 test('zero and negative starting assets are unknown rates, not zero returns', () => {
   for (const start of [0, -100]) {
     const data = [point('2024-01-01', start), point('2024-01-31', 100)];
