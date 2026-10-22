@@ -178,8 +178,40 @@ test('Hynix pairs one ADR and one ordinary-share leg per venue using the 10 ADR 
   assert.deepEqual(relatedSpreadPairs('hynix', [adr({ side: 'long' }), ordinary()], spreads).map(pair => pair.reason), ['same-side']);
   for (const entryPrice of [null, '0', 'abc']) assert.equal(relatedSpreadPairs('hynix', [adr(), ordinary({ entryPrice })], spreads)[0].opening, null);
   assert.deepEqual(relatedSpreadPairs('oil', [adr(), ordinary()], spreads), [], 'other markets ignore Hynix legs');
+  assert.equal(paired.narrowingFavors, true, 'short ADR (the numerator) profits when the premium falls');
+  assert.equal(relatedSpreadPairs('hynix', [adr({ side: 'long' }), ordinary({ side: 'short' })], spreads)[0].narrowingFavors, false);
 });
-test('related position requests cover both legs of every compared contract pair', () => {
+
+test('paired legs add up unrealized and realized results and show the closing spread', () => {
+  const cycle = (overrides = {}) => ({ status: 'complete', since: '2026-10-01T13:40:00.000Z', closedQuantity: '500', closePrice: '97.912', realizedPnl: '3416.58823527', fees: '-37.13599997', funding: '1701.40490575', net: '5080.85714105', currency: 'USDT', note: null, updatedAt: '2026-10-20T08:00:00.000Z', ...overrides });
+  const cl = (overrides = {}) => item({ key: 'cl', symbol: 'CLUSDT', base: 'CL', side: 'long', entryPrice: '91.07882352941174', unrealizedPnl: '10142.71680071', cycle: cycle(), ...overrides });
+  const bz = (overrides = {}) => item({ key: 'bz', symbol: 'BZUSDT', base: 'BZ', side: 'short', entryPrice: '101.4829411764706', unrealizedPnl: '-9066.40914424', cycle: cycle({ closePrice: '105.766', realizedPnl: '-2141.52941173', fees: '-25.13735598', funding: '-4640.21922683', net: '-6806.88599454' }), ...overrides });
+  const near = (actual, expected) => assert.ok(actual !== null && Math.abs(actual - expected) < 1e-6, `${actual} ≈ ${expected}`);
+  const [pair] = relatedSpreadPairs('oil', [cl(), bz()], { binance: { premium: 9.545, stale: false } });
+  near(pair.closing, (105.766 - 97.912) / 97.912 * 100);
+  near(pair.change, 9.545 - pair.opening);
+  assert.equal(pair.narrowingFavors, true, 'long CL / short BZ profits when the spread narrows');
+  const t = pair.totals;
+  assert.equal(t.realizedStatus, 'complete'); assert.equal(t.unrealizedCurrency, 'USDT'); assert.equal(t.realizedCurrency, 'USDT');
+  near(t.unrealized, 10142.71680071 - 9066.40914424); near(t.realized, 3416.58823527 - 2141.52941173);
+  near(t.fees, -37.13599997 - 25.13735598); near(t.funding, 1701.40490575 - 4640.21922683);
+  near(t.net, 5080.85714105 - 6806.88599454); near(t.total, t.unrealized + t.net);
+  assert.equal(relatedSpreadPairs('oil', [cl({ side: 'short' }), bz({ side: 'long' })], undefined)[0].narrowingFavors, false);
+
+  const totals = (clOver, bzOver) => relatedSpreadPairs('oil', [cl(clOver), bz(bzOver)], undefined)[0];
+  const loading = totals({}, { cycle: cycle({ status: 'loading', closePrice: null, net: null }) });
+  assert.equal(loading.totals.realizedStatus, 'loading'); assert.equal(loading.totals.net, null); assert.equal(loading.totals.total, null); assert.equal(loading.closing, null);
+  near(loading.totals.unrealized, 10142.71680071 - 9066.40914424);
+  for (const missing of [undefined, null, cycle({ status: 'unavailable' })]) assert.equal(totals({}, { cycle: missing }).totals.realizedStatus, 'unavailable');
+  const mixed = totals({}, { cycle: cycle({ currency: 'USDC' }) });
+  assert.equal(mixed.totals.realizedStatus, 'mixed-currency'); assert.equal(mixed.totals.realized, null, 'USDT and USDC are never added');
+  const unrealizedMixed = totals({}, { pnlCurrency: 'USDC' });
+  assert.equal(unrealizedMixed.totals.unrealized, null); assert.equal(unrealizedMixed.totals.total, null);
+  const partial = totals({}, { cycle: cycle({ status: 'partial', net: null }) });
+  assert.equal(partial.totals.realizedStatus, 'partial'); assert.equal(partial.totals.net, null, 'an unknown leg net leaves the pair net unknown'); assert.ok(partial.totals.realized !== null);
+  assert.equal(totals({}, { cycle: cycle({ closedQuantity: '0' }) }).closing, null, 'no closing spread before both legs closed something');
+  assert.equal(totals({}, { stale: true }).totals.unrealizedStale, true);
+});test('related position requests cover both legs of every compared contract pair', () => {
   for (const [market, contract] of Object.entries(exchangeContracts))
     for (const base of [contract.leftBase, contract.rightBase]) assert.ok(RELATED_SYMBOLS[market].includes(base), `${market} requests ${base}`);
 });

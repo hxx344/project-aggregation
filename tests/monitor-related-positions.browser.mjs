@@ -66,7 +66,10 @@ async (page) => {
     assert(await pair.count() === 1, 'one Binance CL/BZ pair is recognised');
     const pairText = await pair.innerText();
     assert(/开仓价差\s*\+6\.452%/.test(pairText), `opening spread from entry prices: ${pairText}`);
-    assert(text.includes('+12.5 USDT') && text.includes('−3.25 USDT'), `PnL keeps the host decimals: ${text}`);
+    assert(text.includes('+12.50 USDT') && text.includes('−3.25 USDT'), `PnL is shown to cents: ${text}`);
+    const totals = await pair.locator('[data-pair-totals="unavailable"]').innerText();
+    assert(/未实现盈亏\s*\+9\.25 USDT/.test(totals) && /总盈亏\s*—/.test(totals) && totals.includes('已实现部分暂不可用'), `pair totals add the open legs and explain the missing realized half: ${totals}`);
+    assert(/平仓价差\s*—/.test(pairText) && /价差变化\s*[+−]\d+\.\d{3} 百分点/.test(pairText), `closing spread needs both legs closed; change uses the live spread: ${pairText}`);
     const cycle = await panel.locator('[data-cycle-status="complete"]').innerText();
     assert(/平仓数量\s*4 contracts/.test(cycle) && /平仓均价\s*63\.1/.test(cycle) && /已实现盈亏\s*\+8\.75 USDT/.test(cycle)
       && /手续费\s*−0\.42 USDT/.test(cycle) && /资金费\s*\+0\.11 USDT/.test(cycle) && /净额\s*\+8\.44 USDT/.test(cycle), `closed-trade summary per leg: ${cycle}`);
@@ -79,7 +82,7 @@ async (page) => {
     assert(target.get('view') === 'trading' && target.get('tradingSection') === 'positions', `open-trading url ${page.url()}`);
     assert(reads >= 1, 'positions were read through the host');
     assert(!unexpected.length && !external.length && !errors.length, JSON.stringify({ unexpected, external, errors }));
-    return { passed: true, positionReads, scenarios: ['real Monitor connects through the bridge', 'oil positions filtered to CL/BZ', 'opening spread paired by exchange', 'PnL strings kept', 'closed-trade summary per leg', 'alert digest beside chart', 'open-trading to positions'] };
+    return { passed: true, positionReads, scenarios: ['real Monitor connects through the bridge', 'oil positions filtered to CL/BZ', 'opening spread paired by exchange', 'PnL rounded to cents', 'pair totals and closing spread', 'closed-trade summary per leg', 'alert digest beside chart', 'open-trading to positions'] };
   } finally {
     await page.goto('about:blank').catch(() => {});
     await page.unroute('**/*', handler);

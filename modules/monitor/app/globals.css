@@ -407,6 +407,8 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 .detail-side-times div, .related-positions dl div { min-width: 0; }
 .detail-side-times dt, .related-positions dt { color: var(--muted-foreground); font-size: 11px; }
 .detail-side-times dd, .related-positions dd { margin: 2px 0 0; font-family: var(--font-number); color: var(--foreground); overflow-wrap: anywhere; }
+.related-positions dd.positive { color: var(--positive); }
+.related-positions dd.negative { color: var(--negative); }
 .detail-alert-events { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .detail-alert-events li { padding: 7px 0; border-bottom: 1px solid var(--border); }
 .detail-alert-events li:last-child { border-bottom: 0; }
@@ -420,7 +422,7 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 .related-position-main { display: flex; align-items: baseline; gap: 8px; margin: 3px 0; flex-wrap: wrap; }
 .related-position-main strong { font-family: var(--font-number); font-size: 13px; }
 .related-positions dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 0; }
-.related-cycle { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+.related-cycle, .related-pair-totals { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
 .related-cycle-head { display: flex; justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 11px; }
 .related-cycle-note { margin: 6px 0 0; color: var(--muted-foreground); font-size: 11px; }
 .related-spread-pairs li { padding: 8px 10px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); }
