@@ -18,6 +18,15 @@
 - “出金（加回）”为累计出金变化（原表出金行 + 已登记出金），与提款对应的资产行减少相抵；“原表合计差异”为原表总额与行估值之和的差额变化，日快照通常为 0。各来源合计 + 出金 + 原表合计差异 = 当日变化。
 - 日涨跌比例 = 当日变化 / 前一份快照的调整后资产，前值不大于 0 时显示“—”。入金未剔除，资产变化不等于投资收益；任一侧含旧值或缺失行情时标记“含旧值”。
 
-实现与检查入口：`modules/asset/lib/daily-changes.ts`、`modules/asset/tests/daily-changes.test.ts`、`modules/asset/lib/performance-metrics.ts`、`modules/asset/tests/performance-metrics.test.ts`、`modules/asset/tests/snapshot-history.test.ts`。沿用项目的 Node 测试工具，不引入新依赖。
+### 交易所分项、持仓与套利组合
+
+- 交易所资产行展开后按快照内的余额明细（账户 + 币种）列出变化，例如 Binance 钱包分类、Bybit 统一账户各币、OKX/Gate 账户类型、Aster 各账号。只有两份快照都带明细时才比较，不补造分项。
+- 每次写日快照时，同时保存持仓服务里已有的缓存（`hubPositionsService.peek`）：交易所、账号、范围、读取时间、是否新鲜，以及各仓位的数量、浮盈亏、盈亏币种和本轮统计（since、net 等）。写快照不触发交易所请求；缓存由工作台的持仓读取保持更新。持仓从本功能上线后开始记录，此前的日期只有余额分项。
+- 单个仓位的影响 = 浮盈亏变化 + 本轮 net（已实现盈亏 + 手续费 + 资金费）的变化，按快照内同币种余额明细的价格折成 USD，找不到价格时不按 1:1 估算。两份快照里持仓范围都是新鲜读取才计算；同一轮（since 相同、方向相同）取 net 差，前一份快照之后才开仓的仓位计入整段 net，其余情况只计浮盈亏并标“部分”。当天已平仓的仓位影响记为未知。
+- 本轮统计只在方向、数量、开仓价与当前持仓一致时保存；统计每几分钟刷新一次，快照前几分钟到账的资金费可能计入下一天，统计比读取时间旧 15 分钟以上时只计浮盈亏并标“部分”。API 凭据更换后（按凭据摘要区分）新旧账户不互相比较。
+- 未知不记为 0：交易所任一持仓范围未在两份快照中都新鲜读取时，持仓合计只给已知小计并标“部分”，不给“其他”；组合内所有腿都未知时组合影响显示“—”。
+- 原油套利匹配 `CL`、`BZ`，海力士套利匹配 `SKHY`、`SKHX`、`SKHYNIX`，前缀与计价后缀规则与工作台关联持仓一致。组合影响为各腿影响之和，任一腿未知或不完整即标“部分”。各交易所另列“余额变化”“持仓合计”，所有仓位都已知时给出“其他”（余额变化减持仓合计，包含转账、现货估值等）。
+- Gate、Hyperliquid、Bitget 目前没有持仓读取；Aster、Var 没有本轮统计，只计浮盈亏。
+实现与检查入口：`modules/asset/lib/daily-changes.ts`、`modules/asset/lib/daily-positions.ts`、`modules/asset/tests/daily-changes.test.ts`、`modules/asset/tests/hub-positions.test.ts`、`tests/asset-daily-changes.browser.mjs`、`modules/asset/lib/performance-metrics.ts`、`modules/asset/tests/performance-metrics.test.ts`、`modules/asset/tests/snapshot-history.test.ts`。沿用项目的 Node 测试工具，不引入新依赖。
 
 参考规格 `asset-monthly-performance-spec.md` 的示例代码存在固定 365、含首尾天数、完整月选择和零值格式的不一致；以上口径是实际实现与验收依据。

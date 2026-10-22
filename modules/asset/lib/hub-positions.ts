@@ -5,6 +5,7 @@ import type { Credentials } from './validation.ts';
 import { POSITIONS_CATALOG } from './positions-catalog.ts';
 import type { PositionsExchangeId, ScopeDefinition } from './positions-catalog.ts';
 import type { HubPositions, Position, PositionCycle, PositionsScope } from './positions-types.ts';
+import type { SnapshotScope } from './daily-positions.ts';
 import { POSITIONS_FAILED } from './positions-values.ts';
 import { cycleUnavailable } from './positions-cycle.ts';
 import { cycleSupported, CycleRetry, readPositionCycle } from './positions-cycle-readers.ts';
@@ -213,8 +214,33 @@ export function createPositionsService(options: { now?: () => number; ttl?: numb
       }
       return { schemaVersion: 1, generatedAt: new Date(now()).toISOString(), exchanges };
     },
-    async idle() {
-      while ([...entries.values()].some(entry => entry.pending || entry.cycleJob)) await Promise.allSettled([...entries.values()].flatMap(entry => [entry.pending, entry.cycleJob]));
+    /** Cached scopes for daily snapshots; never starts a read and does not keep idle entries alive. */
+    async peek(database: Database, owner: string): Promise<SnapshotScope[]> {
+      const scopes: SnapshotScope[] = [];
+      for (const account of await sourceAccounts(database, owner)) {
+        if (!account.row) continue;
+        const revision = revisionOf(account.row.encrypted), catalog = POSITIONS_CATALOG.find(item => item.id === account.exchange)!;
+        const generation = revisionOf('daily-snapshot:' + revision).slice(0, 16);
+        for (const definition of catalog.scopes) {
+          const entry = entries.get(cacheKey(owner, account.key, definition.id)), fetchedAt = entry?.scope.fetchedAt;
+          if (definition.unsupported || !entry || entry.revision !== revision || !fetchedAt) continue;
+          const cycles = cyclesFor(account.exchange, definition.id);
+          scopes.push({ exchange: account.exchange, account: account.id, accountName: account.name, generation, scope: definition.id, fetchedAt,
+            status: entry.scope.status === 'live' && now() - Date.parse(fetchedAt) < STALE_AFTER ? 'live' : 'stale',
+            positions: entry.scope.positions.map(item => {
+              // Unlike the live view, a snapshot keeps a summary only while it still describes the held size and entry.
+              const slot = cycles ? entry.cycles?.get(item.id) : undefined;
+              const cycle = !cycles ? null : slot && slot.side === item.side && slot.quantity === item.quantity && slot.entryPrice === item.entryPrice
+                ? slot.cycle : cycleUnavailable(CYCLE_LOADING, null, 'loading');
+              return { id: item.id, symbol: item.symbol, instrumentId: item.instrumentId, side: item.side, quantity: item.quantity, quantityUnit: item.quantityUnit,
+                unrealizedPnl: item.unrealizedPnl, pnlCurrency: item.pnlCurrency,
+                cycle: cycle && { status: cycle.status, since: cycle.since, realizedPnl: cycle.realizedPnl, fees: cycle.fees, funding: cycle.funding, net: cycle.net, currency: cycle.currency, updatedAt: cycle.updatedAt } };
+            }) });
+        }
+      }
+      return scopes;
+    },
+    async idle() {      while ([...entries.values()].some(entry => entry.pending || entry.cycleJob)) await Promise.allSettled([...entries.values()].flatMap(entry => [entry.pending, entry.cycleJob]));
     },
   };
 }

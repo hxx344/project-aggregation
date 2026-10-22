@@ -11,6 +11,7 @@ import { editValue, type Credentials, type WithdrawalInput, type AsterAccountInp
 import { asterKey, readAsterAccounts, aggregateAster } from './aster-accounts';
 import { embeddedWithdrawals } from './withdrawals';
 import { readSnapshotHistory } from './snapshot-history';
+import { hubPositionsService } from './hub-positions';
 import { yuanQuote } from './fx';
 import { mapConcurrent, settleIndependent } from './concurrency';
 import type { Asset, Ledger, Connection, Withdrawal, FxStatus, AsterAccount } from './types';
@@ -60,7 +61,9 @@ async function snapshot(owner:string){
   const ledger=await getCurrentLedger(owner);
   const total=ledger.assets.reduce((s,a)=>s+(a.value??0),0), date=chinaDate();
   const partial=!!ledger.fxStatus.error||ledger.assets.some(a=>a.mode!=='manual'&&(!!a.error||Date.now()-new Date(a.updatedAt).getTime()>900000));
-  const data={id:'daily-'+date,date,total,fx:ledger.fx,fxStatus:ledger.fxStatus,cny:total*ledger.fx,future:false,difference:0,partial,withdrawn:embeddedWithdrawals(ledger.assets),updatedAt:new Date().toISOString(),assets:ledger.assets};
+  // Holdings come from the positions cache only, so writing a snapshot never waits on exchange reads.
+  const scopes=await hubPositionsService.peek(db(),owner).catch(()=>null), updatedAt=new Date().toISOString();
+  const data={id:'daily-'+date,date,total,fx:ledger.fx,fxStatus:ledger.fxStatus,cny:total*ledger.fx,future:false,difference:0,partial,withdrawn:embeddedWithdrawals(ledger.assets),updatedAt,assets:ledger.assets,...(scopes?{positions:{capturedAt:updatedAt,scopes}}:{})};
   await db().prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?) ON CONFLICT(owner,date) DO UPDATE SET data=excluded.data').bind(owner,date,JSON.stringify(data)).run();
 }
 export async function lock(owner:string){

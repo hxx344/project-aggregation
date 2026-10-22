@@ -1,20 +1,26 @@
 import type { openDatabase } from './sqlite.ts';
 import type { Asset, Withdrawal } from './types.ts';
 import { assetMeasures, embeddedWithdrawals } from './withdrawals.ts';
+import { analyzePositions, positionsOf, type PositionAnalysis, type PositionsCapture } from './daily-positions.ts';
 
 /** Day-over-day changes of the adjusted asset measure, attributed to ledger rows. */
 export const DAILY_CHANGE_DAYS = 90;
 const DAY_MS = 86_400_000;
 const CENT = 0.005;
 
-type ChangeRow = Pick<Asset, 'id' | 'project' | 'kind' | 'value'>;
-export type ChangeSnapshot = { id: string; date: string; total: number; withdrawn?: number; partial?: boolean; future?: boolean; archived?: boolean; rows: ChangeRow[] };
-export type SourceChange = { id: string; project: string; kind: string; previous: number | null; current: number | null; change: number };
+type DetailRow = { coin: string; account: string; value: number; price: number };
+type ChangeRow = Pick<Asset, 'id' | 'project' | 'kind' | 'value'> & { mode?: string; details?: DetailRow[] };
+export type ChangeSnapshot = { id: string; date: string; total: number; withdrawn?: number; partial?: boolean; future?: boolean; archived?: boolean; rows: ChangeRow[]; positions?: PositionsCapture | null };
+/** Balance lines inside one exchange row, matched by account and coin. */
+export type DetailChange = { label: string; previous: number | null; current: number | null; change: number };
+export type SourceChange = { id: string; project: string; kind: string; previous: number | null; current: number | null; change: number; details: DetailChange[] };
 export type DailyChange = {
   date: string; previousDate: string; gapDays: number;
   previousAdjusted: number; adjusted: number; change: number;
   heldChange: number; withdrawnChange: number; unattributed: number;
   sources: SourceChange[]; partial: boolean;
+  /** Null before holdings were recorded with snapshots. */
+  positions: PositionAnalysis | null;
 };
 export type DailyChangeReport = { today: string; windowStart: string; days: DailyChange[] };
 
@@ -43,6 +49,24 @@ function measures(snapshot: ChangeSnapshot, withdrawals: Pick<Withdrawal, 'date'
   return assetMeasures(snapshot.total, embedded, withdrawals, snapshot.date, snapshot.id.startsWith('daily-') || snapshot.date > baselineDate);
 }
 
+function detailChanges(previous: DetailRow[] | undefined, current: DetailRow[] | undefined): DetailChange[] {
+  if (!previous || !current) return [];
+  const sum = (rows: DetailRow[]) => {
+    const map = new Map<string, { label: string; value: number }>();
+    for (const row of rows) {
+      const key = JSON.stringify([row.account, row.coin]), item = map.get(key);
+      if (item) item.value += row.value; else map.set(key, { label: row.account + ' · ' + row.coin, value: row.value });
+    }
+    return map;
+  };
+  const before = sum(previous), after = sum(current), changes: DetailChange[] = [];
+  for (const key of new Set([...after.keys(), ...before.keys()])) {
+    const old = before.get(key), next = after.get(key), change = cents((next?.value ?? 0) - (old?.value ?? 0));
+    if (change) changes.push({ label: (next ?? old)!.label, previous: old?.value ?? null, current: next?.value ?? null, change });
+  }
+  return changes.sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
+}
+
 function sourceChanges(previous: ChangeRow[], current: ChangeRow[]): SourceChange[] {
   const before = new Map(previous.filter(row => !isWithdrawalRow(row)).map(row => [row.id, row]));
   const after = new Map(current.filter(row => !isWithdrawalRow(row)).map(row => [row.id, row]));
@@ -51,7 +75,9 @@ function sourceChanges(previous: ChangeRow[], current: ChangeRow[]): SourceChang
     const old = before.get(id), next = after.get(id), label = next ?? old!;
     const previousValue = old?.value ?? null, currentValue = next?.value ?? null;
     const change = cents((currentValue ?? 0) - (previousValue ?? 0));
-    if (change) changes.push({ id, project: label.project, kind: label.kind, previous: previousValue, current: currentValue, change });
+    // A transfer between accounts of one exchange leaves the row total unchanged but is still a source of movement.
+    const details = detailChanges(old?.details, next?.details);
+    if (change || details.length) changes.push({ id, project: label.project, kind: label.kind, previous: previousValue, current: currentValue, change, details });
   }
   return changes.sort((a, b) => Math.abs(b.change) - Math.abs(a.change) || a.project.localeCompare(b.project));
 }
@@ -75,19 +101,32 @@ export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapsho
       // Workbook totals can differ from their row sum; that part has no row source.
       unattributed: cents(heldChange - sources.reduce((sum, source) => sum + source.change, 0)),
       sources, partial: !!previous.partial || !!current.partial,
+      positions: analyzePositions({ previous: previous.positions, current: current.positions, rows: current.rows, balanceChange: exchange => {
+        const before = previous.rows.filter(row => row.mode === exchange), after = current.rows.filter(row => row.mode === exchange);
+        if (!before.length && !after.length) return null;
+        const total = (rows: ChangeRow[]) => rows.reduce((sum, row) => sum + (row.value ?? 0), 0);
+        return cents(total(after) - total(before));
+      } }),
     });
   }
   return { today: input.today, windowStart, days: result.reverse() };
 }
 
 type ChangeDatabase = Pick<ReturnType<typeof openDatabase>, 'prepare'>;
-type StoredSnapshot = Omit<ChangeSnapshot, 'rows'> & { assets?: ChangeRow[] };
+type StoredSnapshot = Omit<ChangeSnapshot, 'rows' | 'positions'> & { assets?: ChangeRow[]; positions?: unknown };
 type StoredSource = { baselineDate?: string; periods?: (Omit<ChangeSnapshot, 'rows'> & { rows?: ChangeRow[] })[] };
 const DAILY_KEY = "date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'";
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const detailsOf = (details: unknown): DetailRow[] | undefined => Array.isArray(details) ? details.filter((row): row is DetailRow =>
+  !!row && typeof row.coin === 'string' && typeof row.account === 'string' && finite(row.value)).map(row => ({
+  coin: row.coin, account: row.account, value: row.value, price: finite(row.price) ? row.price : 0,
+})) : undefined;
 const rowsOf = (rows: unknown): ChangeRow[] => Array.isArray(rows) ? rows.filter((row): row is ChangeRow =>
   !!row && typeof row.id === 'string' && typeof row.project === 'string').map(row => ({
   id: row.id, project: row.project, kind: typeof row.kind === 'string' ? row.kind : '',
-  value: typeof row.value === 'number' && Number.isFinite(row.value) ? row.value : null,
+  value: finite(row.value) ? row.value : null,
+  ...(typeof row.mode === 'string' ? { mode: row.mode } : {}),
+  ...(Array.isArray(row.details) ? { details: detailsOf(row.details) } : {}),
 })) : [];
 
 export async function readDailyChanges(database: ChangeDatabase, owner: string, now = Date.now(), days = DAILY_CHANGE_DAYS): Promise<DailyChangeReport> {
@@ -103,8 +142,8 @@ export async function readDailyChanges(database: ChangeDatabase, owner: string, 
   const ledger: StoredSource = source ? JSON.parse(source.value) : {};
   const original = (ledger.periods ?? []).map(({ rows, ...period }) => ({ ...period, rows: rowsOf(rows) }));
   const daily = [...(before ? [before] : []), ...inWindow.results].map(row => {
-    const { assets, ...snapshot } = JSON.parse(row.data) as StoredSnapshot;
-    return { ...snapshot, rows: rowsOf(assets) };
+    const { assets, positions, ...snapshot } = JSON.parse(row.data) as StoredSnapshot;
+    return { ...snapshot, rows: rowsOf(assets), positions: positionsOf(positions) };
   });
   return calculateDailyChanges({ snapshots: [...original, ...daily], withdrawals: withdrawals ? JSON.parse(withdrawals.value) : [], baselineDate: ledger.baselineDate ?? '', today, days });
 }

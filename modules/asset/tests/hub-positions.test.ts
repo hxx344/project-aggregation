@@ -215,3 +215,41 @@ test('cycle summaries load in the background, stay cached by side and quantity, 
   clock += 30_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
   assert.equal(cycleOf(await service.read(f.database, 'owner', f.unseal))?.status, 'complete');
 });
+
+test('peek returns cached holdings for snapshots without reading, and drops replaced credentials', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(); let clock = at; let reads = 0;
+  const service = createPositionsService({ now: () => clock, read: async () => { reads++; return sample; } });
+  assert.deepEqual(await service.peek(f.database, 'owner'), [], 'nothing cached before the first read');
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  const before = reads, live = await service.peek(f.database, 'owner');
+  const um = live.find(item => item.scope === 'um')!;
+  assert.equal(um.status, 'live'); assert.equal(um.exchange, 'binance'); assert.equal(um.fetchedAt, new Date(at).toISOString());
+  assert.deepEqual(um.positions.map(item => [item.symbol, item.quantity, item.cycle]), [['BTCUSDT', '1.000000000000000001', null]]);
+  assert.equal(live.some(item => item.scope === 'options'), false, 'unsupported scopes are not captured');
+  clock += 90_000; assert.equal((await service.peek(f.database, 'owner')).find(item => item.scope === 'um')!.status, 'stale');
+  assert.equal(reads, before, 'peek never starts a read');
+  await f.save(); assert.deepEqual(await service.peek(f.database, 'owner'), [], 'replaced credentials invalidate cached holdings');
+  assert.equal(JSON.stringify(live).includes('synthetic'), false);
+});
+
+test('peek keeps a cycle summary only while it matches the held size and entry, and digests the credential', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(); let clock = at;
+  let held = [{ ...position('CLUSDT', 'long', '2', 'CL'), pnlCurrency: 'USDT' }];
+  const service = createPositionsService({ now: () => clock, read: async () => held, cycle: async (_c, _scope, request) => ({ status: 'complete' as const,
+    since: new Date(at - 3_600_000).toISOString(), closedQuantity: '0', closePrice: null, realizedPnl: '0', fees: '0', funding: '0', net: '0', currency: 'USDT', note: null,
+    updatedAt: new Date(clock).toISOString(), ...(request.position.quantity === '1' ? { net: '50' } : {}) }) });
+  const um = async () => (await service.peek(f.database, 'owner')).find(item => item.scope === 'um')!;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  const first = await um();
+  assert.equal(first.positions[0].cycle?.net, '0');
+  assert.match(first.generation, /^[a-f0-9]{16}$/);
+  assert.equal(JSON.stringify(first).includes('synthetic-encrypted'), false, 'the credential blob is not stored');
+  held = [{ ...held[0], quantity: '1' }]; clock += 10_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
+  const reduced = await um();
+  assert.equal(reduced.positions[0].quantity, '1');
+  assert.equal(reduced.positions[0].cycle?.status, 'loading', 'the old summary does not describe the reduced position');
+  assert.equal(reduced.positions[0].cycle?.net, null);
+  assert.equal(scope(await service.read(f.database, 'owner', f.unseal)).positions[0].cycle?.net, '0', 'the live view still shows the older summary');
+  await f.save(); await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.notEqual((await um()).generation, first.generation, 'a replaced credential changes the generation');
+});

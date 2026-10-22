@@ -14,8 +14,9 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
   const monthly = useMemo(() => calculateMonthlyPerformance(history), [history]);
   const annualized = useMemo(() => calculateAnnualizedReturns(history, monthly, today), [history, monthly, today]);
   const first = history[0], last = history.at(-1);
-  // Daily snapshots only change for today's refresh, withdrawal edits or an import.
-  const changesVersion = useMemo(() => [history.length, last?.date, last?.total, last?.withdrawn, ledger.baselineDate, JSON.stringify(ledger.withdrawals)].join('|'), [history, last, ledger.baselineDate, ledger.withdrawals]);
+  // Daily snapshots only change for today's refresh, withdrawal edits or an import. A refresh rewrites balance details and holdings even when the total is unchanged.
+  const refreshed = useMemo(() => ledger.assets.map(asset => asset.id + ':' + asset.updatedAt).join(','), [ledger.assets]);
+  const changesVersion = useMemo(() => [history.length, last?.date, last?.total, last?.withdrawn, ledger.baselineDate, JSON.stringify(ledger.withdrawals), refreshed].join('|'), [history, last, ledger.baselineDate, ledger.withdrawals, refreshed]);
   const change = first && last ? last.adjusted - first.adjusted : null;
   const month = annualized.monthlyPeriod;
   const monthlyHint = !month ? '上个自然月没有快照'

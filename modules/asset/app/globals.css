@@ -319,6 +319,17 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .daily-source-label{overflow-wrap:anywhere}
 .daily-change-list .text-button{margin:2px 0 0;min-height:22px;font-size:11px}
 .daily-changes .error-text .text-button{margin-left:6px}
+.daily-sources.expanded .daily-details{grid-column:1/-1;margin:0 0 2px 10px;padding-left:8px;border-left:1px solid var(--border)}
+.daily-combos{display:flex;flex-wrap:wrap;gap:2px 12px;margin:4px 0 0;padding:0;list-style:none;font-size:12px}
+.daily-combos li{display:flex;align-items:baseline;gap:4px}
+.daily-combos b{font-family:var(--font-number);font-weight:600}
+.daily-combos small.daily-partial{font-size:11px;color:var(--warning)}
+.daily-combos-note{margin:4px 0 0;font-size:11px;color:var(--subtle-foreground)}
+.daily-holdings section{margin-top:6px}
+.daily-holdings h4{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;margin:0;font-size:11px;font-weight:600}
+.daily-holdings .daily-sources.expanded li{grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto}
+.daily-holdings .daily-sources.expanded small{overflow-wrap:anywhere;text-align:right}
+.daily-holdings h4 small{font-weight:400;color:var(--subtle-foreground);font-family:var(--font-number)}
 .trend-panel .chart-note .text-button{margin-left:6px}
 .connections-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;align-items:start}
 .connection-card{padding:12px 14px}
