@@ -66,7 +66,7 @@ git rev-list --reverse --topo-order $reviewTarget
 
 ## 4. 更新经验与去重
 
-条目格式与项目维护规则以 `AGENTS.md` 为准，升级条件以 `docs/code-standards.md` 为唯一依据。每个新增的独立事件至少记录：
+条目格式与维护规则以 [LESSONS.md 的记录规则](LESSONS.md#记录规则) 为准，升级条件以 `docs/code-standards.md` 为唯一依据。每个新增的独立事件至少记录：
 
 ```text
 事件 ID：<稳定、唯一，后续复盘复用>

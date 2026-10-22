@@ -29,7 +29,24 @@ project_aggregation/
 - `code-standards.md` - 代码规范兼容链接
 - `package.json`, `tsconfig.json`, `vite.config.ts` 等配置文件
 
-编码工具入口统一只做引用，不复制规则正文：`.cursor/rules/`、`.clinerules`、`.roo/rules/`、`.github/instructions/`、`.claude/commands/`。提交门禁为 `scripts/review-gate.mjs` 与 `.githooks/`（`pre-commit` 查内容、`commit-msg` 查证据，由 `scripts/install-hooks.mjs` 在安装时启用）。
+### 规则与审查文件职责
+
+| 文件 | 维护内容 |
+| --- | --- |
+| `AGENTS.md` | 项目规则和阅读入口（代理执行协议唯一权威） |
+| `LESSONS.md` | 项目经验、记录规则、适用边界和事件证据 |
+| `docs/code-standards.md` | 满足升级条件的规范及其依据 |
+| `docs/code-review-standard.md` | 合并前的审查范围、分级、严重级别与门槛 |
+| `docs/code-review-checklist.md` | 逐项检查清单（唯一清单正文） |
+| `docs/code-review-process.md` | 审查步骤、时限、轮次、热修、钩子与 CI 门禁、度量 |
+| `daily-review-prompt.md` | 增量复盘、事件去重和检查点更新流程 |
+| `docs/review-state.json` | 已完成检查点和未完成复盘的报告位置 |
+| `.github/pull_request_template.md` | PR 自审与证据模板，只引用上述标准 |
+| `scripts/review-gate.mjs`、`.githooks/` | 可机械判定的提交门禁：`pre-commit` 查内容、`commit-msg` 查证据，由 `scripts/install-hooks.mjs` 在安装时启用 |
+| `CLAUDE.md`、`CONVENTIONS.md`、`.codebuddy/CODEBUDDY.md`、`.cursor/rules/`、`.cursorrules`、`.clinerules`、`.roo/rules/`、`.github/copilot-instructions.md`、`.github/instructions/` | 工具入口，只引用 `AGENTS.md`，不复制规则正文 |
+| `.claude/commands/review.md`、`.codebuddy/commands/review.md` | 客户端只读审查命令，按权威流程输出意见 |
+
+根目录 `code-standards.md` 仅保留兼容链接。权威文件路径变化时同步更新上述入口的引用。
 
 ### scripts/ 目录
 运维和辅助脚本：

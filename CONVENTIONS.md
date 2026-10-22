@@ -1,6 +1,6 @@
 # 项目约定
 
-改动前读取仓库根目录 `AGENTS.md` 的《代理执行协议》与《修改前》，按路由表取用经验条目，不要一次读完 `LESSONS.md`。
+改动前读取仓库根目录 `AGENTS.md` 的《代理执行协议》，按路由表取用经验条目，不要一次读完 `LESSONS.md`。
 
 - 定级与判定：`docs/code-review-standard.md`
 - 自审清单：`docs/code-review-checklist.md`
