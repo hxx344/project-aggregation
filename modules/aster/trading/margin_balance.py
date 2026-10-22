@@ -528,6 +528,12 @@ class MarginBalancer:
                 "accepted": "划转请求已受理，系统有限次查询两侧 USD1 流水；仍无法匹配时重新读取两侧余额并归档旧请求",
                 "acknowledged": "交易所已确认划转，系统继续读取两侧最新余额；刷新前不开始新开仓或新划转"}
             return view(status, journal.get("blocked_reason") or reasons[status], blocks=True)
+        # Match tick(): a corrupt journal stays visible even while disabled or
+        # paused, instead of surfacing only after the balancer is re-enabled.
+        for field in ("checked_at", "next_check_at", "cooldown_until"):
+            value = journal.get(field)
+            if field in journal and (type(value) not in (int, float) or not math.isfinite(value)):
+                return view("blocked", "保证金划转日志时间无效", blocks=True)
         if not config["enabled"]:
             return view("disabled", "自动保证金平衡未启用")
         if not pair.get("enabled"):
@@ -535,10 +541,6 @@ class MarginBalancer:
         if journal.get("blocked_reason"):
             return view("waiting" if journal.get("retry_without_blocking") else "blocked", journal["blocked_reason"],
                         blocks=not journal.get("retry_without_blocking"))
-        for field in ("checked_at", "next_check_at", "cooldown_until"):
-            value = journal.get(field)
-            if field in journal and (type(value) not in (int, float) or not math.isfinite(value)):
-                return view("blocked", "保证金划转日志时间无效", blocks=True)
         if time.time() < journal.get("cooldown_until", 0):
             return view("cooldown", "划转冷却中" + _remaining_time(journal["cooldown_until"], time.time())
                         + "；结束后重新评估划转条件")

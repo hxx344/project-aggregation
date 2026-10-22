@@ -67,6 +67,16 @@ class MarginStatusTests(TestCase):
         self.assertEqual(self.view()["status"], "unknown")
         self.assertTrue(self.view()["blocks_trading"])
 
+    def test_invalid_journal_time_is_visible_while_disabled_or_paused(self):
+        self.journal["next_check_at"] = "corrupt"
+        for pair_enabled, margin_enabled in ((True, False), (False, True), (False, False)):
+            self.pair["enabled"] = pair_enabled
+            self.pair["margin"]["enabled"] = margin_enabled
+            view = self.view()
+            self.assertEqual(view["status"], "blocked")
+            self.assertEqual(view["reason"], "保证金划转日志时间无效")
+            self.assertTrue(view["blocks_trading"])
+
     def test_disabled_paused_and_cooldown_are_derived_from_current_state(self):
         self.journal["cooldown_until"] = 120
         self.assertEqual(self.view()["status"], "cooldown")
