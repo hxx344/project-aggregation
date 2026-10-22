@@ -44,7 +44,7 @@ export const DailyChanges = memo(function DailyChanges({ version }: { version: s
           const rate = day.previousAdjusted > 0 ? day.change / day.previousAdjusted : null;
           return <li key={day.date}>
             <div className="daily-change-head">
-              <span><strong>{day.date.slice(5)}</strong><small>较 {day.previousDate.slice(5)}{day.gapDays > 1 && ' · 间隔 ' + day.gapDays + ' 天'}</small>{day.partial && <small className="performance-warning">含旧值</small>}</span>
+              <span><strong>{day.date.slice(5)}</strong><small>较 {day.previousDate.slice(5)}{day.gapDays > 1 && ' · 间隔 ' + day.gapDays + ' 天'}</small></span>
               <span className={performanceTone(day.change)}>$ {formatGain(day.change)}<small>{formatReturnRate(rate)}</small></span>
             </div>
             {all.length ? <ul className={isOpen ? 'daily-sources expanded' : 'daily-sources'}>{shown.map(item => <li key={item.key}>

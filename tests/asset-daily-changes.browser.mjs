@@ -106,7 +106,7 @@ async (page) => {
       const text = await items.nth(index).innerText();
       assert(text.includes(day.date.slice(5)) && text.includes('较 ' + day.previous.slice(5)), `day ${day.date} compares with ${day.previous}: ${text}`);
       assert(text.includes('$ ' + signed(day.change)), `day ${day.date} change ${signed(day.change)}: ${text}`);
-      assert(text.includes('含旧值') === day.partial, `day ${day.date} partial marker`);
+      assert(!text.includes('含旧值'), `day ${day.date} shows no stale-value marker`);
       assert(text.includes(`间隔 ${day.gap} 天`) === day.gap > 1, `day ${day.date} gap ${day.gap}`);
       if (day.change) assert(text.includes('月度表现示例资产 · 资产') && text.includes(signed(day.change)), `day ${day.date} is attributed to the asset row`);
       else assert(text.includes('各来源无变化'), `day ${day.date} without change says so`);
@@ -116,7 +116,7 @@ async (page) => {
     assert((await first.getAttribute('class')).includes(expected[0].change > 0 ? 'performance-positive' : expected[0].change < 0 ? 'performance-negative' : 'performance-neutral'), 'change uses the signed tone');
     await details.scrollIntoViewIfNeeded();
     await details.screenshot({ path: `${screenshotRoot}/desktop.png` });
-    scenarios.push('real SQLite days are newest first with prior-day base, gap, partial and row attribution');
+    scenarios.push('real SQLite days are newest first with prior-day base, gap, no stale-value marker and row attribution');
 
     mode = 'many';
     await summary.click();

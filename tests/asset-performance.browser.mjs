@@ -150,9 +150,7 @@ async (page) => {
     assert(await negative.locator('td').nth(0).innerText() === '$ -500.00', 'earlier month loss is -500 USD');
     assert(await negative.locator('td').nth(1).innerText() === '-5.00%', 'earlier month rate is -5%');
     assert(await negative.locator('td.performance-negative').count() === 2, 'negative gain and rate use the negative class');
-    assert(!(await previous.innerText()).includes('含旧值或缺失行情'), 'a partial snapshot between month endpoints does not flag the month');
-    assert(await metrics.locator(':scope > .performance-warning').count() === 0, 'a partial snapshot that no metric uses has no metric-level warning');
-    assert(!(await app.locator('.chart-note').innerText()).includes('含旧值快照'), 'the chart note ignores a partial snapshot between the range endpoints');
+    assert(!(await app.locator('.trend-panel').innerText()).includes('含旧值'), 'a partial snapshot shows no stale-value notice in the trend panel');
     assert((await current.innerText()).includes('进行中'), 'current calendar month is marked in progress');
     const currentRate = today === date(0, 1) ? null : 1600 / 11000;
     assert(await current.locator('td').nth(1).innerText() === percent(currentRate), 'current month rate reflects its available distinct days');
@@ -164,7 +162,7 @@ async (page) => {
     await metrics.scrollIntoViewIfNeeded();
     await page.screenshot({ path: `${screenshotRoot}/desktop.png`, fullPage: true });
     await metrics.screenshot({ path: `${screenshotRoot}/desktop-metrics.png` });
-    scenarios.push('real SQLite samples, previous-month/overall annualization, native keyboard toggle, signs and no warning for an unused partial snapshot');
+    scenarios.push('real SQLite samples, previous-month/overall annualization, native keyboard toggle, signs and no stale-value notice');
 
     await page.setViewportSize({ width: 390, height: 844 });
     await metrics.scrollIntoViewIfNeeded();
@@ -216,12 +214,10 @@ async (page) => {
 
     await setHistory([{ date: date(-1, 1), value: 10000 }, { date: date(0, 0), value: 11000 }, { date: today, value: 12000, partial: true }]);
     await metrics.waitFor();
-    assert((await metrics.locator(':scope > .performance-warning').innerText()).includes('收益指标可能受影响'), 'a partial latest snapshot warns that the metrics may be affected');
-    assert((await app.locator('.chart-note').innerText()).includes('含旧值快照'), 'a partial range endpoint is flagged in the chart note');
     await openTable();
-    assert((await rowFor(currentMonth).innerText()).includes('含旧值或缺失行情'), 'the month ending at the partial snapshot has a row-level warning');
-    assert(!(await rowFor(priorMonth).innerText()).includes('含旧值或缺失行情'), 'a month with clean endpoints has no row-level warning');
-    scenarios.push('a partial snapshot used as an endpoint shows metric, chart and row warnings');
+    assert(!(await app.locator('.trend-panel').innerText()).includes('含旧值'), 'a partial latest snapshot shows no stale-value notice in the trend panel');
+    scenarios.push('a partial latest snapshot used by every metric still shows no stale-value notice');
+
     await setHistory([{ date: date(-1, 1), value: 0 }, { date: date(0, 0), value: 100 }]);
     assert(await cards.nth(0).locator('strong').innerText() === '—' && await cards.nth(1).locator('strong').innerText() === '—', 'zero starting assets produce no annualized percentage');
     await openTable();

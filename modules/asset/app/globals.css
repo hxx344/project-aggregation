@@ -146,10 +146,9 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .performance-label{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--muted-foreground);font-size:.75rem}
 .performance-label small{font-size:.6875rem}
 .performance-card strong{display:block;margin:6px 0;font-size:1.375rem;font-family:var(--font-number);font-weight:600;letter-spacing:-.025em;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-.performance-card p,.performance-note,.performance-warning{font-size:.6875rem;line-height:1.7;overflow-wrap:anywhere}
+.performance-card p,.performance-note{font-size:.6875rem;line-height:1.7;overflow-wrap:anywhere}
 .performance-card p,.performance-note{color:var(--muted-foreground)}
 .performance-note{margin-top:12px}
-.performance-warning{color:var(--warning);margin-top:5px}
 .performance-positive{color:var(--positive)}
 .performance-negative{color:var(--destructive)}
 .performance-neutral{color:var(--muted-foreground)}
@@ -166,7 +165,6 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .performance-table th:first-child{text-align:left;padding-left:0}
 .performance-table tbody th{font-weight:500}
 .performance-table tbody th small{display:block;font-size:.625rem;font-weight:400;color:var(--muted-foreground);margin-top:4px}
-.performance-table tbody th small.performance-warning{color:var(--warning)}
 .performance-table tr>*:last-child{padding-right:0}
 .performance-table tbody tr:last-child>*{border-bottom:0}
 .performance-table tbody tr:hover{background:var(--card)}
@@ -299,7 +297,6 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .trend-panel .performance-label{font-size:11px;color:var(--subtle-foreground)}
 .trend-panel .performance-card strong{margin:2px 0;font-size:16px}
 .trend-panel .performance-card p{color:var(--subtle-foreground)}
-.trend-panel .performance-metrics>.performance-warning{margin:0;padding:6px 14px;border-top:1px solid var(--border)}
 .trend-panel .performance-monthly{margin:0}
 .trend-panel .performance-monthly summary{min-height:38px;padding:9px 14px;font-size:12px;color:var(--muted-foreground)}
 .performance-monthly-body{padding:0 14px 12px}
@@ -313,7 +310,6 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .daily-change-head>span{display:flex;align-items:baseline;flex-wrap:wrap;gap:2px 8px;min-width:0}
 .daily-change-head>span:last-child{flex:none;font-family:var(--font-number);font-weight:600}
 .daily-change-head small{font-size:11px;font-weight:400;color:var(--subtle-foreground)}
-.daily-change-head small.performance-warning{color:var(--warning);margin:0}
 .daily-sources{display:flex;flex-wrap:wrap;gap:2px 12px;margin:4px 0 0;padding:0;list-style:none;font-size:11px;color:var(--muted-foreground)}
 .daily-sources li{display:flex;gap:4px;min-width:0}
 .daily-sources b{font-weight:500;font-family:var(--font-number)}
