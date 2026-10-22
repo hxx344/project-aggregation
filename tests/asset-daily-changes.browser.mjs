@@ -27,20 +27,14 @@ async (page) => {
     return { date: sample.date, previous: previous.date, change: sample.total - previous.total,
       gap: (Date.parse(sample.date) - Date.parse(previous.date)) / 86_400_000, partial: !!sample.partial || !!previous.partial };
   }).reverse();
-  const holding = (symbol, side, change, combo, extra = {}) => ({ key: symbol + side, account: '默认账号', symbol, side, combo, previousQuantity: '10', quantity: '10', quantityUnit: symbol.replace('USDT', ''),
-    currency: 'USDT', unrealizedChange: change, cashFlowChange: 0, change, partial: false, note: null, ...extra });
   const manySources = { today, windowStart: today, days: [{
     date: today, previousDate: date(0, 0), gapDays: 2, previousAdjusted: 1000, adjusted: 1015, change: 15,
     heldChange: 5, withdrawnChange: 10, unattributed: 0, partial: false,
     sources: [['A', 8], ['B', -6], ['C', 2], ['D', 1]].map(([project, change], index) => ({ id: 'row-' + index, project, kind: '资产', previous: 100, current: 100 + change, change,
       details: project === 'A' ? [{ label: 'USDⓈ-M 合约（折合 USDT） · USDT', previous: 60, current: 70, change: 10 }, { label: '资金账户（折合 USDT） · USDT', previous: 40, current: 38, change: -2 }] : [] })),
-    positions: { compared: true, capturedAt: today + 'T07:00:00.000Z', previousCapturedAt: date(0, 0) + 'T07:00:00.000Z',
-      combos: [{ id: 'oil', label: '原油套利', change: 5.5, complete: true, legs: 2, exchanges: ['Binance'] },
-        { id: 'hynix', label: '海力士套利', change: -1.25, complete: false, legs: 2, exchanges: ['Binance'] }],
-      exchanges: [{ exchange: 'binance', name: 'Binance', balanceChange: 8, positionsChange: 4.25, other: null, complete: false, readable: true, positions: [
-        holding('CLUSDT', 'long', 7.5, 'oil'), holding('BZUSDT', 'short', -2, 'oil'), holding('SKHYNIXUSDT', 'long', -1.25, 'hynix'),
-        holding('SKHYUSDT', 'short', null, 'hynix', { quantity: null, unrealizedChange: null, cashFlowChange: null, partial: true, note: '已平仓，平仓盈亏未单独统计' }),
-      ] }] },
+    positions: { compared: true, recorded: true, capturedAt: today + 'T07:00:00.000Z', previousCapturedAt: date(0, 0) + 'T07:00:00.000Z', groups: [
+      { id: 'oil', label: '原油套利', change: 5.5, complete: true, legs: 2 }, { id: 'hynix', label: '海力士套利', change: -1.25, complete: false, legs: 2 },
+      { id: 'other', label: '其他持仓', change: null, complete: false, legs: 1 }] },
   }] };  await page.unrouteAll({ behavior: 'wait' });
   page.on('pageerror', onPageError);
   const routeHandler = async route => {
@@ -134,26 +128,24 @@ async (page) => {
     const day = items.nth(0);
     assert(await day.locator(':scope > ul.daily-sources > li').count() === 3, 'only the top three sources show by default');
     assert((await day.locator(':scope > ul.daily-sources > li').allInnerTexts()).map(text => text.split('\n')[0])[0].startsWith('出金（加回）'), 'withdrawal add-back is ranked among sources by size');
-    const combos = await day.getByRole('list', { name: '套利组合影响' }).innerText();
-    assert(combos.includes('原油套利') && combos.includes('+5.50') && combos.includes('海力士套利') && combos.includes('-1.25') && combos.includes('部分'), `combo impact is visible without expanding: ${combos}`);
-    assert(await day.locator('.daily-holdings').count() === 0, 'holdings stay hidden until expanded');
-    const toggle = day.getByRole('button', { name: '明细与持仓' });
+    const groups = (await day.getByRole('list', { name: '持仓影响' }).locator('li').allInnerTexts()).map(text => text.replace(/\s+/g, ''));
+    assert(groups.length === 3 && groups[0] === '原油套利+5.50' && groups[1] === '海力士套利-1.25部分' && groups[2] === '其他持仓—', `three holding totals are visible without expanding: ${groups.join(' | ')}`);
+    const toggle = day.getByRole('button', { name: '展开明细' });
     assert(await toggle.getAttribute('aria-expanded') === 'false', 'expand control reports collapsed');
     await toggle.click();
     assert(await day.locator(':scope > ul.daily-sources > li').count() === 5, 'expanding shows all five sources');
     const expandedText = await day.innerText();
     assert(expandedText.includes('100.00 → 108.00'), 'expanded sources show previous and current values');
     assert(expandedText.includes('USDⓈ-M 合约（折合 USDT） · USDT') && expandedText.includes('60.00 → 70.00'), 'exchange rows break down by account');
-    const holdings = await day.locator('.daily-holdings').innerText();
-    assert(holdings.includes('Binance 持仓') && holdings.includes('CLUSDT · 多') && holdings.includes('原油') && holdings.includes('已平仓，平仓盈亏未单独统计') && holdings.includes('（部分）'), `holdings list legs, combos and unknown closes: ${holdings}`);
+    assert(!expandedText.includes('CLUSDT') && await day.getByRole('list', { name: '持仓影响' }).locator('li').count() === 3, 'expanding adds balance details but no per-position list');
     await page.setViewportSize({ width: 390, height: 844 });
     await day.scrollIntoViewIfNeeded();
-    await noPageOverflow('390 mobile expanded holdings');
+    await noPageOverflow('390 mobile expanded day');
     await day.screenshot({ path: `${screenshotRoot}/holdings-mobile.png` });
     await page.setViewportSize({ width: 1440, height: 1050 });
     await day.getByRole('button', { name: '收起' }).click();
     assert(await day.locator(':scope > ul.daily-sources > li').count() === 3, 'collapsing returns to the top three');
-    scenarios.push('combo impact shows by default; expanding lists all sources, account breakdown and holdings; 390 expanded has no overflow');
+    scenarios.push('crude-oil, SK hynix and other holding totals show by default; expanding lists all sources and account breakdown only; 390 expanded has no overflow');
     mode = 'real';
     await summary.click();
     await summary.click();

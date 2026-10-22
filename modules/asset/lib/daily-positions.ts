@@ -1,4 +1,3 @@
-import { POSITIONS_CATALOG } from './positions-catalog.ts';
 import type { Position, PositionCycle } from './positions-types.ts';
 
 /** Positions as cached when a daily snapshot was written; balances and holdings share that moment. */
@@ -21,10 +20,12 @@ export type PositionChange = {
   /** Funding, fees and realized PnL are missing from `change`, or the whole change is unknown. */
   partial: boolean; note: string | null;
 };
-/** `positionsChange` sums known contributions only and is null when none is known; `readable` is false when some scope was not read live at both snapshots. */
-export type ExchangeImpact = { exchange: string; name: string; balanceChange: number | null; positionsChange: number | null; other: number | null; complete: boolean; readable: boolean; positions: PositionChange[] };
-export type ComboImpact = { id: ComboId; label: string; change: number | null; complete: boolean; legs: number; exchanges: string[] };
-export type PositionAnalysis = { compared: boolean; capturedAt: string; previousCapturedAt: string | null; combos: ComboImpact[]; exchanges: ExchangeImpact[] };
+export type GroupId = ComboId | 'other';
+/** `change` sums known contributions only and is null when nothing is known; `complete` also requires every scope read live at both snapshots. */
+export type GroupImpact = { id: GroupId; label: string; change: number | null; complete: boolean; legs: number };
+/** `groups` is empty until two captures can be compared; `recorded` says the current snapshot holds any scope. */
+export type PositionAnalysis = { compared: boolean; recorded: boolean; capturedAt: string; previousCapturedAt: string | null; groups: GroupImpact[] };
+const GROUPS: { id: GroupId; label: string }[] = [...COMBOS.map(({ id, label }) => ({ id, label })), { id: 'other', label: '其他持仓' }];
 type BalanceRow = { mode?: string; value: number | null; details?: { coin: string; value: number; price: number }[] };
 
 const CENT = 0.005;
@@ -88,43 +89,41 @@ function positionChange(previous: SnapshotPosition | undefined, current: Snapsho
     note: cash === null ? (current.cycle ? '本轮统计不可比，仅计浮盈亏变化' : '仅计浮盈亏变化，未含资金费与手续费') : null };
 }
 
-/** Compares two captures. Only scopes read live at both moments are attributed; everything else stays unknown, never zero. */
-export function analyzePositions(input: { previous: PositionsCapture | null | undefined; current: PositionsCapture | null | undefined; rows: BalanceRow[]; balanceChange: (exchange: string) => number | null }): PositionAnalysis | null {
+type CompareInput = { previous: PositionsCapture | null | undefined; current: PositionsCapture; rows: BalanceRow[] };
+/** Per-position changes. `readable` is false when any scope was not read live at both captures, so an empty group may still hide holdings. */
+export function comparePositions(input: CompareInput): { positions: PositionChange[]; readable: boolean } {
   const { previous, current } = input;
-  if (!current) return null;
   const before = new Map((previous?.scopes ?? []).map(scope => [scopeKey(scope), scope]));
   const after = new Map(current.scopes.map(scope => [scopeKey(scope), scope]));
-  const byExchange = new Map<string, PositionChange[]>(), unreadable = new Set<string>();
+  const positions: PositionChange[] = [];
+  // An empty capture means the positions cache was cold, not that nothing was held.
+  let readable = before.size > 0 && after.size > 0;
   for (const key of new Set([...after.keys(), ...before.keys()])) {
     const old = before.get(key), next = after.get(key), scope = next ?? old!;
     const usable = !!previous && old?.status === 'live' && next?.status === 'live';
-    if (!usable) unreadable.add(scope.exchange);
+    if (!usable) readable = false;
     const oldPositions = new Map((old?.positions ?? []).map(item => [item.id, item]));
     const nextPositions = new Map((next?.positions ?? []).map(item => [item.id, item]));
-    const list = byExchange.get(scope.exchange) ?? [];
     for (const id of new Set([...nextPositions.keys(), ...oldPositions.keys()])) {
-      list.push(positionChange(oldPositions.get(id), nextPositions.get(id), { usable, previous: previous ? old?.fetchedAt ?? previous.capturedAt : null, current: next?.fetchedAt ?? current.capturedAt },
+      positions.push(positionChange(oldPositions.get(id), nextPositions.get(id), { usable, previous: previous ? old?.fetchedAt ?? previous.capturedAt : null, current: next?.fetchedAt ?? current.capturedAt },
         currency => usdRate(currency, input.rows, scope.exchange), scope.accountName, JSON.stringify([key, id])));
     }
-    byExchange.set(scope.exchange, list);
   }
-  const exchanges: ExchangeImpact[] = [...byExchange].map(([exchange, positions]) => {
-    const balanceChange = input.balanceChange(exchange);
-    const readable = !unreadable.has(exchange), known = readable && positions.every(item => item.change !== null);
-    // An empty list only proves "no holdings" when every scope was read live at both snapshots.
-    const positionsChange = readable && !positions.length ? 0 : knownSum(positions.map(item => item.change));
-    const complete = known && positions.every(item => !item.partial);
-    return { exchange, name: POSITIONS_CATALOG.find(item => item.id === exchange)?.name ?? exchange, balanceChange, positionsChange, readable,
-      other: balanceChange === null || !known || positionsChange === null ? null : cents(balanceChange - positionsChange), complete,
-      positions: positions.sort((a, b) => Math.abs(b.change ?? 0) - Math.abs(a.change ?? 0) || a.symbol.localeCompare(b.symbol)) };
-  }).sort((a, b) => a.name.localeCompare(b.name));
-  const combos = COMBOS.flatMap(combo => {
-    const legs = exchanges.flatMap(exchange => exchange.positions.filter(item => item.combo === combo.id).map(item => ({ item, name: exchange.name })));
-    if (!legs.length) return [];
-    return [{ id: combo.id, label: combo.label, change: knownSum(legs.map(leg => leg.item.change)),
-      complete: legs.every(leg => leg.item.change !== null && !leg.item.partial), legs: legs.length, exchanges: [...new Set(legs.map(leg => leg.name))] }];
+  return { positions, readable };
+}
+
+/** Crude-oil and SK hynix arbitrage legs, and all other holdings as one total. Unknown stays unknown, never zero. */
+export function analyzePositions(input: Omit<CompareInput, 'current'> & { current: PositionsCapture | null | undefined }): PositionAnalysis | null {
+  const { previous, current } = input;
+  if (!current) return null;
+  const { positions, readable } = comparePositions({ ...input, current });
+  const groups = !previous ? [] : GROUPS.map(group => {
+    const legs = positions.filter(item => (item.combo ?? 'other') === group.id);
+    // No legs only proves "no holdings" when every scope was read live at both captures.
+    const change = legs.length ? knownSum(legs.map(item => item.change)) : readable ? 0 : null;
+    return { ...group, change, complete: readable && legs.every(item => item.change !== null && !item.partial), legs: legs.length };
   });
-  return { compared: !!previous, capturedAt: current.capturedAt, previousCapturedAt: previous?.capturedAt ?? null, combos, exchanges };
+  return { compared: !!previous, recorded: current.scopes.length > 0, capturedAt: current.capturedAt, previousCapturedAt: previous?.capturedAt ?? null, groups };
 }
 
 const isText = (value: unknown, max = 200): value is string => typeof value === 'string' && value.length <= max;

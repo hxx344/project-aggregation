@@ -101,12 +101,7 @@ export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapsho
       // Workbook totals can differ from their row sum; that part has no row source.
       unattributed: cents(heldChange - sources.reduce((sum, source) => sum + source.change, 0)),
       sources, partial: !!previous.partial || !!current.partial,
-      positions: analyzePositions({ previous: previous.positions, current: current.positions, rows: current.rows, balanceChange: exchange => {
-        const before = previous.rows.filter(row => row.mode === exchange), after = current.rows.filter(row => row.mode === exchange);
-        if (!before.length && !after.length) return null;
-        const total = (rows: ChangeRow[]) => rows.reduce((sum, row) => sum + (row.value ?? 0), 0);
-        return cents(total(after) - total(before));
-      } }),
+      positions: analyzePositions({ previous: previous.positions, current: current.positions, rows: current.rows }),
     });
   }
   return { today: input.today, windowStart, days: result.reverse() };
