@@ -5,6 +5,7 @@ import { memo, useEffect, useRef, useState, type FormEvent } from "react";
 import { Bell, ChevronDown, Plus, Save, Trash2 } from "lucide-react";
 import type { MonitorAlertAdapter, MonitorAlertDraft, MonitorAlertRule, MonitorAlertView } from "../lib/monitor-alerts";
 import { startActivityPolling } from "../lib/polling";
+import { loadSettings } from "../lib/settings-load";
 
 const time = (value: string | null) => value == null ? "尚无记录" : `${new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })} 北京时间`;
 const numberValue = (value: number) => Number.isFinite(value) ? value : "";
@@ -36,20 +37,24 @@ function AlertSettings({ monitorId, title, adapter, active = true, onView, openR
   };
   useEffect(() => {
     const controller = new AbortController();
+    let latestRequest = 0;
     const load = async (signal: AbortSignal) => {
       if (busyRef.current) return;
-      const requestGeneration = generation.current;
-      try {
-        const next = await adapter.load(AbortSignal.any([controller.signal, signal, AbortSignal.timeout(15_000)]));
-        if (controller.signal.aborted || signal.aborted || generation.current !== requestGeneration || (next.available && next.revision < latestRevision.current)) return;
-        setLoadError(""); setView(next);
-        if (next.available) {
-          latestRevision.current = next.revision;
-          if (!dirtyRef.current) { setDraft(next.draft); setRevision(next.revision); }
-        }
-      } catch {
-        if (!controller.signal.aborted && !signal.aborted && generation.current === requestGeneration) setLoadError("无法刷新告警后台状态，现有配置与草稿已保留。请检查后台服务。");
-      }
+      const requestGeneration = generation.current, request = ++latestRequest;
+      await loadSettings({
+        signal: AbortSignal.any([controller.signal, signal]),
+        load: signal => adapter.load(signal),
+        isCurrent: () => !controller.signal.aborted && generation.current === requestGeneration && request === latestRequest,
+        onData: next => {
+          if (next.available && next.revision < latestRevision.current) return;
+          setLoadError(""); setView(next);
+          if (next.available) {
+            latestRevision.current = next.revision;
+            if (!dirtyRef.current) { setDraft(next.draft); setRevision(next.revision); }
+          }
+        },
+        onError: timedOut => setLoadError(timedOut ? "读取告警后台状态超时，现有配置与草稿已保留。请检查后台服务。" : "无法刷新告警后台状态，现有配置与草稿已保留。请检查后台服务。"),
+      });
     };
     const polling = startActivityPolling({ intervalMs: 10_000, active: activeRef.current, load, onData: () => {}, onError: () => {} });
     activity.current = polling;
