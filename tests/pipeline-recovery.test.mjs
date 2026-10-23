@@ -596,7 +596,9 @@ test('GitHub origin 解析支持 HTTPS 和 SSH，拒绝其他服务与非法仓�
   }
 });
 
-test('CLI 在 Actions 外传入已验证发布身份，Actions 不一致或 origin 无效时拒绝', t => {
+// 夹具从当前检出取一个已有提交对象；CI 的行为测试在无 .git 的展开目录运行，此时跳过。
+const rootHasGit = spawnSync('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10000 }).status === 0;
+test('CLI 在 Actions 外传入已验证发布身份，Actions 不一致或 origin 无效时拒绝', { skip: !rootHasGit && '需要 Git 检出' }, t => {
   const f = fixture(t, {});
   const git = args => {
     const result = spawnSync('git', ['-C', f.directory, ...args], { encoding: 'utf8', timeout: 10000 });
