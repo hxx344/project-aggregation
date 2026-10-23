@@ -347,6 +347,8 @@ small{font-size:.75rem}
 .original-project-frame{display:block;flex:1;width:100%;min-height:0;border:0;background:var(--surface-0)}
 .original-page-placeholder{flex:1;min-height:0;overflow:auto;background:var(--surface-0)}
 .original-page-error{flex-shrink:0;margin:10px 16px}
+.module-recovery{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}.module-recovery>div{flex:1 1 240px;min-width:0}.module-recovery p{margin:2px 0 0}.module-recovery>svg{flex-shrink:0;margin-top:2px}
+.module-recovery.notice{flex-shrink:0;margin:10px 16px;align-items:center;padding:9px 12px;border-radius:var(--radius-sm);border:1px solid rgba(110,168,254,.3);background:var(--info-soft);color:var(--text-secondary);font-size:.75rem;line-height:1.55}.module-recovery.notice p{margin:0}
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
 .diagnostic-details{flex-shrink:0;margin:8px 16px;padding:8px 12px;border:1px solid var(--surface-4);background:var(--surface-2);border-radius:var(--radius-sm);font-size:.75rem;min-width:0;overflow-wrap:anywhere}
 .diagnostic-details summary{cursor:pointer;color:var(--text-secondary)}
