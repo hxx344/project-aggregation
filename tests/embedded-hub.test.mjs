@@ -15,7 +15,7 @@ import { unavailableUpdateState } from '../server/updates.mjs';
 
 const password = 'embedded-hub-test-password';
 const options = { initialPassword: password, logger: () => {}, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0 };
-async function fixture(t, { existing = false } = {}) {
+async function fixture(t, { existing = false, moduleRuntime } = {}) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'embedded-hub-'));
   const modules = [], calls = [], removers = [], failing = new Set();
   let app, cookie, csrf, port;
@@ -49,7 +49,7 @@ async function fixture(t, { existing = false } = {}) {
     await new Promise(resolve => server.listen(socketPath, resolve)); modules.push(server);
     removers.push(registerModuleTransport(id, { socketPath, secret }));
   }
-  app = await createApp({ baselineIntervalMs: 0, ...options, dataDir, embeddedModules: true, updatesClient: { status: async () => unavailableUpdateState() } });
+  app = await createApp({ baselineIntervalMs: 0, ...options, dataDir, embeddedModules: true, moduleRuntime, updatesClient: { status: async () => unavailableUpdateState() } });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); port = app.server.address().port;
   const origin = `http://hub.localhost:${port}`;
   function request(route, { method = 'GET', body, host = `hub.localhost:${port}`, headers = {}, auth = true } = {}) {
@@ -140,6 +140,41 @@ test('an unconfirmed trading module rejects only its own writes; other modules a
   const status = await f.request('/api/system/updates');
   assert.equal(status.status, 200);
   assert.deepEqual(status.data.moduleMaintenance, [{ id: 'crossex', confirmed: true }, { id: 'greeks', confirmed: false }, { id: 'aster', confirmed: true }]);
+});
+
+test('module status joins supervisor state with maintenance, and operator restart only accepts a faulted module', async t => {
+  const states = Object.fromEntries(moduleIds.map(id => [id, 'ready'])), restarts = [];
+  const moduleRuntime = {
+    status: () => moduleIds.map(moduleId => ({ moduleId, state: states[moduleId], generation: 1 })),
+    restart: id => { restarts.push(id); return states[id] === 'fault'; },
+  };
+  const f = await fixture(t, { moduleRuntime });
+  assert.equal((await f.request('/api/system/modules')).status, 401);
+  await f.login();
+  const read = await f.request('/api/system/modules');
+  assert.equal(read.status, 200); assert.match(read.headers['cache-control'], /no-store/);
+  assert.equal(read.data.enabled, true);
+  assert.deepEqual(read.data.modules.map(row => [row.moduleId, row.maintenanceConfirmed]), [['monitor', null], ['asset', null], ['crossex', true], ['greeks', true], ['aster', true]]);
+  assert.match(read.data.modules.find(row => row.moduleId === 'greeks').maintenanceReleasedAt, /^\d{4}-/);
+  assert.equal((await f.request('/api/system/modules?x=1')).status, 400);
+  assert.equal((await f.request('/api/system/modules', { method: 'POST', body: {} })).status, 405);
+  assert.equal((await f.request('/api/system/modules', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST' })).status, 409);
+  states.greeks = 'fault';
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST', headers: { 'X-CSRF-Token': 'forged' } })).status, 403);
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST', headers: { Origin: 'https://evil.example' } })).status, 403);
+  const accepted = await f.request('/api/system/modules/greeks/restart', { method: 'POST' });
+  assert.equal(accepted.status, 202); assert.deepEqual(accepted.data, { accepted: true, moduleId: 'greeks' });
+  for (const [route, method, status] of [['/api/system/modules/unknown/restart', 'POST', 404], ['/api/system/modules/constructor/restart', 'POST', 404], ['/api/system/modules/greeks/restart', 'GET', 405], ['/api/system/modules/greeks/restart?now=1', 'POST', 400]]) {
+    assert.equal((await f.request(route, { method })).status, status, `${method} ${route}`);
+  }
+  assert.deepEqual(restarts, ['greeks', 'greeks']);
+});
+
+test('without a supervisor the module status is disabled and restart is not found', async t => {
+  const f = await fixture(t); await f.login();
+  assert.deepEqual((await f.request('/api/system/modules')).data, { schemaVersion: 1, enabled: false, modules: [] });
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST' })).status, 404);
 });
 
 test('architecture inspection and sampling read only the five authenticated capability contracts', async t => {

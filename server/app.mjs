@@ -57,7 +57,7 @@ async function passwordMatches(password, record) {
   return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
 }
 
-export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow, assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null } = {}) {
+export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow, assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null, moduleRuntime = null } = {}) {
   validateBaselineInterval(baselineIntervalMs);
   if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
   if (!Number.isInteger(accountLockoutMs) || accountLockoutMs < 1000 || accountLockoutMs > 86400000) throw new RangeError('accountLockoutMs 必须为 1000 至 86400000 的整数（毫秒）');
@@ -159,6 +159,13 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   });
   // Native execution is not gated by any one embedded trading module's maintenance sync.
   const native = { scope: 'native' };
+  // Supervisor state joined with the trading maintenance gate; no pids, paths or secrets.
+  function moduleStatus() {
+    if (!moduleRuntime) return { schemaVersion: 1, enabled: false, modules: [] };
+    const gates = updates.moduleMaintenance();
+    return { schemaVersion: 1, enabled: true, modules: moduleRuntime.status().map(row => ({ ...row,
+      maintenanceConfirmed: gates[row.moduleId]?.confirmed ?? null, maintenanceReleasedAt: gates[row.moduleId]?.releasedAt ?? null })) };
+  }
   const publicProject = row => { const project = JSON.parse(row.json);
     if (embeddedModules) {
       const module = moduleCatalog.find(item => item.id === project.id);
@@ -403,7 +410,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
-    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery') {
+    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/modules') {
       if (req.method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取基线');
@@ -411,6 +418,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       if (pathname === '/api/system/metrics') { send(res, 200, baseline.read()); return; }
       if (pathname === '/api/system/accounts') { send(res, 200, { schemaVersion: 1, enabled: !!sharedAccountWriter, ...(sharedAccountWriter?.snapshot() || { accounts: [], bindings: [], operations: [], isolations: [] }) }); return; }
       if (pathname === '/api/system/recovery') { send(res, 200, { schemaVersion: 1, enabled: !!sharedAccountWriter, recovery: sharedAccountWriter?.snapshot().recovery ?? null }); return; }
+      if (pathname === '/api/system/modules') { send(res, 200, moduleStatus()); return; }
       const controller = new AbortController(); controllers.add(controller);
       try {
         const modules = await capabilities(controller.signal);
@@ -418,6 +426,16 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         send(res, 200, { schemaVersion: 1, embeddedModules, modules, accountWriterVersion: sharedAccountWriter ? 1 : null, recoveryProtectionVersion: sharedAccountWriter?.recoveryProtectionVersion ?? null });
       } finally { controllers.delete(controller); }
       return;
+    }
+    const moduleRestart = /^\/api\/system\/modules\/([^/]+)\/restart$/.exec(pathname);
+    if (moduleRestart) {
+      if (req.method !== 'POST') throw new HttpError(405, '模块恢复接口仅支持 POST');
+      if (url.search) throw new HttpError(400, '模块恢复接口不接受查询参数');
+      const id = moduleRestart[1];
+      if (!moduleRuntime || !moduleIds.includes(id)) throw new HttpError(404, '模块不存在');
+      if (!moduleRuntime.restart(id)) throw new HttpError(409, '模块不在故障状态，无需恢复');
+      log.info({ moduleId: id, ip: req.socket.remoteAddress, type: 'module-restart' }, '管理员已请求恢复内嵌模块');
+      send(res, 202, { accepted: true, moduleId: id }); return;
     }
     if (pathname === '/api/logout' && req.method === 'POST') {
       log.info({ ip: req.socket.remoteAddress, type: 'auth_logout' }, '用户登出');

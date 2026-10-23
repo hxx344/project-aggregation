@@ -167,6 +167,6 @@ export async function startFixtureModules() {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
     for (const { id } of moduleCatalog) remove.push(registerModuleTransport(id, { socketPath, secret }));
     console.log('Monitor loading fixture: http://hub.localhost:39154/?view=project&id=monitor; seeded read-only data, no collectors or trading workers');
-    return { close: cleanup };
+    return { markStarted() {}, close: cleanup };
   } catch (error) { await cleanup(); throw error; }
 }

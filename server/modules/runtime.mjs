@@ -19,13 +19,23 @@ const stopBudget = id => id === 'aster' ? 115_000 : 32_000;
 // Python bridge outlives its worker. Windows children are reported over IPC.
 const processGroups = process.platform !== 'win32';
 
-export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, onModuleReady = () => {}, timeoutMs = 120_000, restartPolicy = {}, holdFaults = false, drainTimeoutMs = stopBudget, killGraceMs = 5000, probeMs = 100, random = Math.random, now = Date.now, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
+/** Kernel start time of a Linux process in clock ticks, or null when unknown. */
+export function processStartTime(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // Field 22; the command name in field 2 may itself contain spaces or ')'.
+    const value = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+    return Number.isSafeInteger(value) ? value : null;
+  } catch { return null; }
+}
+
+export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, onModuleReady = () => {}, timeoutMs = 120_000, restartPolicy = {}, holdFaults = true, drainTimeoutMs = stopBudget, killGraceMs = 5000, probeMs = 100, random = Math.random, now = Date.now, startTime = processStartTime, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
   if (path.resolve(writerContext.databasePath) !== path.join(path.resolve(dataDir), 'execution-control.sqlite') || !/^[a-f0-9-]{36}$/.test(writerContext.runtimeId)) throw new Error('Invalid writer runtime context');
   const policy = { ...restartDefaults, ...restartPolicy };
   const directory = mkdtempSync(path.join(tmpdir(), 'workbench-'));
   const children = [], unregister = [], ready = {}, tasks = new Set();
   const slots = Object.fromEntries(moduleCatalog.map(({ id }) => [id, { id, state: 'stopped', generation: 0, child: null, timer: null, due: false,
-    restartCount: 0, consecutiveFailures: 0, readyAt: null, lastExitAt: null, lastExitKind: null, nextAttemptAt: null, faultReason: null }]));
+    restartCount: 0, consecutiveFailures: 0, readyAt: null, lastExitAt: null, lastExitKind: null, nextAttemptAt: null, faultReason: null, waitingFor: null }]));
   // Every instance gets a fresh path and secret, so a stale listener from an
   // earlier generation can never receive traffic meant for its successor.
   const createTransport = (id, generation) => ({
@@ -43,10 +53,18 @@ export async function startModules({ dataDir, root = repository, logger = consol
   }
   const running = child => Boolean(child.pid) && child.exitCode === null && child.signalCode === null;
   const exists = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
-  const remaining = child => running(child) || Boolean(child.pid) && (processGroups ? exists(-child.pid) : [...child.descendants].some(exists));
+  // Once the old group is gone its id may be reused by a new group leader,
+  // possibly another module's worker. A live leader with a different start
+  // time is not ours; a leaderless group can only be the old one.
+  const ownGroup = child => {
+    if (child.startTime === null) return true;
+    const current = startTime(child.pid);
+    return current === null || current === child.startTime;
+  };
+  const remaining = child => running(child) || Boolean(child.pid) && (processGroups ? exists(-child.pid) && ownGroup(child) : [...child.descendants].some(exists));
   function terminate(child) {
     if (!child.pid) return;
-    if (processGroups) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} return; }
+    if (processGroups) { if (ownGroup(child)) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } return; }
     child.kill('SIGKILL');
     for (const pid of child.descendants) { try { process.kill(pid, 'SIGKILL'); } catch {} }
   }
@@ -120,7 +138,7 @@ export async function startModules({ dataDir, root = repository, logger = consol
       locking ? ['--no-fork', '--nonblock', '--conflict-exit-code', '75', path.join(moduleData, 'instance.lock'), process.execPath, ...args] : args,
       { cwd: moduleRoot, env, windowsHide: true, detached: processGroups, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
     const generation = slot.generation += 1, instanceId = randomUUID(), transport = createTransport(id, generation);
-    child.moduleId = id; child.descendants = new Set();
+    child.moduleId = id; child.descendants = new Set(); child.startTime = processGroups && child.pid ? startTime(child.pid) : null;
     Object.assign(slot, { state: 'starting', child, readyAt: null });
     children.push(child);
     child.once('close', () => { const index = children.indexOf(child); if (index >= 0) children.splice(index, 1); });
@@ -184,15 +202,18 @@ export async function startModules({ dataDir, root = repository, logger = consol
   function fault(slot, reason) {
     Object.assign(slot, { state: 'fault', nextAttemptAt: null, faultReason: reason });
     lifecycle('warn', { moduleId: slot.id, generation: slot.generation, event: 'fault', reason, consecutiveFailures: slot.consecutiveFailures }, holdFaults ? '内嵌模块已停止自动重启，需要管理员恢复' : '内嵌模块已停止自动重启，正在关闭工作台');
-    // Until an operator can restart a faulted module (P0-3), fall back to the
-    // old contract: the whole workbench exits and systemd restarts it.
+    // holdFaults: false is the pre-P0 contract: the whole workbench exits and
+    // systemd restarts it. By default the module waits for restart(id).
     if (!holdFaults) void close().finally(() => onFailure(new Error(`${slot.id} fault (${reason})`)));
   }
 
   // A due module waits in backoff, without counting a failure, until every
   // dependency is ready again; activate() retries it.
   function attempt(slot) {
-    if (stopping || slot.state !== 'backoff' || !slot.due || requires(slot.id).some(dependency => !ready[dependency])) return;
+    if (stopping || slot.state !== 'backoff' || !slot.due) return;
+    const waiting = requires(slot.id).filter(dependency => !ready[dependency]);
+    Object.assign(slot, { waitingFor: waiting.length ? waiting : null, ...(waiting.length ? { nextAttemptAt: null } : {}) });
+    if (waiting.length) return;
     slot.due = false;
     supervise(restart(slot));
   }
@@ -209,7 +230,8 @@ export async function startModules({ dataDir, root = repository, logger = consol
     // close() already owns this child.
     if (stopping) return;
     activate(slot, instance);
-    lifecycle('info', { moduleId: slot.id, generation: instance.generation, event: 'ready', restartCount: slot.restartCount }, '内嵌模块已重新就绪');
+    const recoveryMs = slot.lastExitAt === null ? null : now() - Date.parse(slot.lastExitAt);
+    lifecycle('info', { moduleId: slot.id, generation: instance.generation, event: 'ready', restartCount: slot.restartCount, recoveryMs }, '内嵌模块已重新就绪');
     onModuleReady({ id: slot.id, generation: instance.generation });
   }
 
@@ -235,8 +257,11 @@ export async function startModules({ dataDir, root = repository, logger = consol
   function status() {
     return moduleCatalog.map(({ id }) => {
       const slot = slots[id];
-      return { moduleId: id, state: slot.state, generation: slot.generation, restartCount: slot.restartCount, consecutiveFailures: slot.consecutiveFailures,
-        lastExitAt: slot.lastExitAt, lastExitKind: slot.lastExitKind, readyAt: slot.readyAt === null ? null : new Date(slot.readyAt).toISOString(), nextAttemptAt: slot.nextAttemptAt };
+      // recover() clears the count on the next exit; report a stable run now.
+      const stable = slot.state === 'ready' && slot.readyAt !== null && now() - slot.readyAt >= policy.stableMs;
+      return { moduleId: id, state: slot.state, generation: slot.generation, restartCount: slot.restartCount, consecutiveFailures: stable ? 0 : slot.consecutiveFailures,
+        lastExitAt: slot.lastExitAt, lastExitKind: slot.lastExitKind, readyAt: slot.readyAt === null ? null : new Date(slot.readyAt).toISOString(), nextAttemptAt: slot.nextAttemptAt,
+        waitingFor: slot.state === 'backoff' ? slot.waitingFor : null, faultReason: slot.state === 'fault' ? slot.faultReason : null };
     });
   }
 
@@ -253,7 +278,10 @@ export async function startModules({ dataDir, root = repository, logger = consol
       if (stopping) throw new Error('Module startup was interrupted');
       activate(slots[id], instance);
     }
-    started = true;
-    return { projects: moduleCatalog, close, status, restart: restartModule };
+    // The caller ends the first-start contract once the workbench is serving.
+    // Until then a module exit still fails startup, so the installer's health
+    // check sees a release that crashes while the hub is being created.
+    const markStarted = () => { started = true; };
+    return { projects: moduleCatalog, close, status, restart: restartModule, markStarted };
   } catch (error) { await close(); throw error; }
 }
