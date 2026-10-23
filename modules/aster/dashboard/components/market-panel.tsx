@@ -106,7 +106,7 @@ export function MarketPanel({
                     return (
                       <TableCell
                         key={v}
-                        className={`number ${ordinaryCapacityReady(m?.capacities?.[v], account?.policy.threshold || '10000', tierLive, ordinaryBlock) ? 'mint' : ''}`}
+                        className={`number ${ordinaryCapacityReady(m?.capacities?.[v], account?.policy.threshold, tierLive, ordinaryBlock) ? 'mint' : ''}`}
                       >
                         <span className="mobile-cell-label">{v}x 额度</span>
                         {tierLive ? fmt(m?.capacities?.[v], 0) : '—'}

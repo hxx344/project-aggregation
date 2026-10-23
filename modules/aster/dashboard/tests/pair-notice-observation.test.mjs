@@ -263,6 +263,41 @@ test('margin-only balances use their own timestamps and planned waits reset stal
   assert.equal(state.data.short.since, null);
 });
 
+test('missing funds evidence confirms data warnings despite fresh retained trading snapshots', () => {
+  const fixture = pair(
+    {
+      phase: 'monitoring',
+      margin: {
+        enabled: true,
+        blocks_trading: false,
+        status: 'waiting',
+        checked_at: 100,
+        next_check_at: 130,
+      },
+    },
+    { ordinary: { enabled: false }, margin: { enabled: true } },
+  );
+  let state = observe(undefined, fixture, 0);
+  state = observe(state, fixture, 3);
+  assert.equal(state.data.long.confirmed, true);
+  assert.equal(state.data.short.confirmed, true);
+  assert.equal(state.data.runtime.confirmed, false);
+  assert.equal(
+    current(state).some(({ kind }) => kind === 'data'),
+    true,
+  );
+  assert.equal(state.history.entries.length, 1);
+  fixture.state.margin_balances = {
+    long: { timestamp: 103 },
+    short: { timestamp: 103 },
+  };
+  state = observe(state, fixture, 4);
+  assert.equal(state.data.long.confirmed, false);
+  assert.equal(state.data.short.confirmed, false);
+  assert.deepEqual(current(state), []);
+  assert.equal(state.history.entries.length, 1);
+});
+
 test('cost report staleness has an independent delay and removal clears it', () => {
   const fixture = pair({
     cycle_costs: {

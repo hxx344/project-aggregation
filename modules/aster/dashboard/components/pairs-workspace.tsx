@@ -47,6 +47,7 @@ import {
   pairConfigurationLock,
   pairDataFresh,
   pairDeletionBlock,
+  pairDisplayBalances,
   pairDraft,
   pairExecutionPhaseLabel,
   pairHasPending,
@@ -313,9 +314,7 @@ function PairDetail({
   const settings = useRef<HTMLDetailsElement>(null);
   const snapshots = pair.state?.snapshots;
   const marginOnly = pairMarginOnly(pair);
-  const displayedBalances = marginOnly
-    ? (pair.state?.margin_balances ?? snapshots)
-    : snapshots;
+  const displayedBalances = pairDisplayBalances(pair);
   const symbol = pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol;
   const long = accounts.find((account) => account.id === pair.long_account_id);
   const short = accounts.find(

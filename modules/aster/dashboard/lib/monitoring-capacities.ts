@@ -49,7 +49,7 @@ function compareCapacityValues(
 }
 
 export function computeMonitoredCapacityView(
-  symbol: Pick<MonitoredSymbol, 'monitor_enabled'>,
+  symbol: Partial<Pick<MonitoredSymbol, 'monitor_enabled'>>,
   listing: Listing | undefined,
   listings: Listings | undefined,
   now: number,
@@ -99,7 +99,7 @@ export function monitoredCapacityRows(
   options: ViewOptions = {},
 ) {
   return symbols
-    .filter((symbol) => symbol.monitor_enabled)
+    .filter((symbol) => symbol.monitor_enabled === true)
     .map((symbol) => {
       const listing = listings?.rows[symbol.symbol];
       return {
