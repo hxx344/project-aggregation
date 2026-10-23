@@ -25,6 +25,7 @@ export async function createModule({ root, dataDir, environment, transports }) {
   await writeFile(path.join(dataDir, 'started.json'), JSON.stringify(started));
   if (environment.FIXTURE_START === 'fail') throw new Error('fixture startup failure');
   if (environment.FIXTURE_START === 'hang') await new Promise(() => {});
+  if (environment.FIXTURE_START === 'slow') await delay(2500);
   if (environment.FIXTURE_START === 'orphan') {
     // Stands in for a Python bridge that ignores both stdin EOF and SIGTERM.
     const orphan = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' });
@@ -318,7 +319,7 @@ test('CrossEx follows a restarted Monitor without restarting and no other worker
 
 test('repeated failures fault a module, its dependent waits without counting, and an operator restart resumes both', { timeout: 20000 }, async t => {
   const f = await fixture(t);
-  const runtime = await f.start({ restartPolicy: { delaysMs: [50, 100, 200], maxFailures: 3 }, random: () => 0, onFailure: error => assert.fail(error) });
+  const runtime = await f.start({ restartPolicy: { delaysMs: [50, 100, 200], maxFailures: 3 }, holdFaults: true, random: () => 0, onFailure: error => assert.fail(error) });
   await f.mode('monitor', 'fail');
   assert.equal((await request(registered('monitor'), '/crash')).status, 200);
   await until(() => f.state('monitor').state === 'fault', 'monitor fault');
@@ -370,4 +371,79 @@ test('close cancels a pending restart while a module waits in backoff', { timeou
   assert.equal(f.state('asset').generation, 1); assert.equal(f.state('asset').state, 'stopped');
   for (const row of rows) assert.equal(hasProcess(row.pid), false);
   assertUnavailable();
+});
+
+test('without operator recovery a faulted module still shuts the workbench down for systemd to restart', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  let failure;
+  const failed = new Promise(resolve => { failure = resolve; });
+  await f.start({ restartPolicy: { delaysMs: [20], maxFailures: 2 }, random: () => 0, onFailure: failure });
+  const rows = await f.records();
+  await f.mode('greeks', 'fail');
+  assert.equal((await request(registered('greeks'), '/crash')).status, 200);
+  assert.match((await bounded(failed, 5000, 'fault escalation')).message, /greeks fault \(failures\)/);
+  assert.equal(f.logs.find(entry => entry?.event === 'fault').reason, 'failures');
+  for (const row of rows) await until(() => !hasProcess(row.pid), `${row.id} stopped`);
+  assertUnavailable();
+});
+
+test('close waits for a drain in progress and never starts the successor', { timeout: 15000, skip: process.platform === 'win32' ? 'Windows children are tracked by reported pids' : false }, async t => {
+  const f = await fixture(t, { modes: { asset: 'orphan' } });
+  const runtime = await f.start({ restartPolicy: { delaysMs: [10] }, drainTimeoutMs: () => 600, onFailure: error => assert.fail(error) });
+  const orphan = Number(await readFile(path.join(f.dataDir, 'modules', 'asset', 'orphan.pid'), 'utf8'));
+  assert.equal((await request(registered('asset'), '/crash')).status, 200);
+  await until(() => f.state('asset').state === 'draining', 'asset draining');
+  await bounded(runtime.close(), 3000, 'close during drain');
+  assert.equal(hasProcess(orphan), false, 'close returned only after the drain killed the old group');
+  assert.equal(f.state('asset').generation, 1); assert.equal(f.state('asset').state, 'stopped');
+  assertUnavailable();
+});
+
+test('close during a restarted instance startup stops it without recovery or a fresh transport', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const runtime = await f.start({ restartPolicy: { delaysMs: [10] }, onFailure: error => assert.fail(error) });
+  const first = await f.record('asset');
+  await f.mode('asset', 'hang');
+  assert.equal((await request(registered('asset'), '/crash')).status, 200);
+  await until(async () => f.state('asset').state === 'starting' && (await f.record('asset')).pid !== first.pid, 'asset restarting');
+  const hanging = await f.record('asset');
+  await bounded(runtime.close(), 3000, 'close during restart');
+  assert.equal(hasProcess(hanging.pid), false);
+  assert.equal(f.state('asset').generation, 2); assert.equal(f.state('asset').state, 'stopped');
+  assert.equal(f.logs.filter(entry => entry?.event === 'exit' && entry.moduleId === 'asset').length, 1, 'the closed startup is not treated as a failure');
+  assertUnavailable();
+});
+
+test('a process tree that survives the kill faults the module, and an operator restart drains it before starting', { timeout: 15000, skip: process.platform === 'win32' ? 'Windows children are tracked by reported pids' : false }, async t => {
+  const f = await fixture(t, { modes: { asset: 'orphan' } });
+  // No grace after SIGKILL: the killed orphan is still a zombie on the first probe.
+  const runtime = await f.start({ restartPolicy: { delaysMs: [10] }, holdFaults: true, drainTimeoutMs: () => 200, killGraceMs: 0, onFailure: error => assert.fail(error) });
+  await f.mode('asset', 'ok');
+  assert.equal((await request(registered('asset'), '/crash')).status, 200);
+  await until(() => f.state('asset').state === 'fault', 'asset fault');
+  assert.equal(f.logs.find(entry => entry?.event === 'fault').reason, 'process-tree');
+  assert.equal(f.state('asset').generation, 1);
+  assert.equal(runtime.restart('asset'), true);
+  await until(() => generation('asset') === 2, 'asset generation 2');
+  assert.equal(f.state('asset').state, 'ready');
+  assert.equal(f.logs.filter(entry => entry?.event === 'drained' && entry.moduleId === 'asset').length, 1, 'the operator drain is not a new exit');
+  assert.throws(() => runtime.restart('constructor'), /Unknown embedded module/);
+});
+
+test('a dependency that changes while its consumer is still starting is delivered once the consumer is created', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  await f.start({ timeoutMs: 6000, restartPolicy: { delaysMs: [20] }, onFailure: error => assert.fail(error) });
+  const first = await f.record('crossex');
+  await f.mode('crossex', 'slow');
+  assert.equal((await request(registered('crossex'), '/crash')).status, 200);
+  await until(async () => (await f.record('crossex')).pid !== first.pid, 'CrossEx restarting');
+  const starting = await f.record('crossex');
+  assert.equal((await request(registered('monitor'), '/crash')).status, 200);
+  await until(() => generation('monitor') === 2, 'monitor generation 2');
+  assert.equal(f.state('crossex').state, 'starting', 'Monitor came back before CrossEx finished creating');
+  await until(() => generation('crossex') === 2, 'crossex generation 2', 6000);
+  const file = path.join(f.dataDir, 'modules', 'crossex', 'dependencies.jsonl');
+  const updates = (await readFile(file, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(updates, [{ name: 'monitor', socketPath: registered('monitor').socketPath }]);
+  assert.equal((await f.record('crossex')).pid, starting.pid);
 });

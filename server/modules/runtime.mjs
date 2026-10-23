@@ -19,13 +19,13 @@ const stopBudget = id => id === 'aster' ? 115_000 : 32_000;
 // Python bridge outlives its worker. Windows children are reported over IPC.
 const processGroups = process.platform !== 'win32';
 
-export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, onModuleReady = () => {}, timeoutMs = 120_000, restartPolicy = {}, drainTimeoutMs = stopBudget, killGraceMs = 5000, probeMs = 100, random = Math.random, now = Date.now, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
+export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, onModuleReady = () => {}, timeoutMs = 120_000, restartPolicy = {}, holdFaults = false, drainTimeoutMs = stopBudget, killGraceMs = 5000, probeMs = 100, random = Math.random, now = Date.now, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
   if (path.resolve(writerContext.databasePath) !== path.join(path.resolve(dataDir), 'execution-control.sqlite') || !/^[a-f0-9-]{36}$/.test(writerContext.runtimeId)) throw new Error('Invalid writer runtime context');
   const policy = { ...restartDefaults, ...restartPolicy };
   const directory = mkdtempSync(path.join(tmpdir(), 'workbench-'));
   const children = [], unregister = [], ready = {}, tasks = new Set();
   const slots = Object.fromEntries(moduleCatalog.map(({ id }) => [id, { id, state: 'stopped', generation: 0, child: null, timer: null, due: false,
-    restartCount: 0, consecutiveFailures: 0, readyAt: null, lastExitAt: null, lastExitKind: null, nextAttemptAt: null }]));
+    restartCount: 0, consecutiveFailures: 0, readyAt: null, lastExitAt: null, lastExitKind: null, nextAttemptAt: null, faultReason: null }]));
   // Every instance gets a fresh path and secret, so a stale listener from an
   // earlier generation can never receive traffic meant for its successor.
   const createTransport = (id, generation) => ({
@@ -143,7 +143,8 @@ export async function startModules({ dataDir, root = repository, logger = consol
 
   function activate(slot, { child, transport, generation, instanceId }) {
     const { id } = slot;
-    const remove = registerModuleTransport(id, transport, { instanceId, generation });
+    const registration = registerModuleTransport(id, transport, { instanceId, generation });
+    const remove = () => { registration(); const index = unregister.indexOf(remove); if (index >= 0) unregister.splice(index, 1); };
     unregister.push(remove);
     Object.assign(slot, { state: 'ready', readyAt: now(), nextAttemptAt: null });
     ready[id] = transport;
@@ -180,8 +181,11 @@ export async function startModules({ dataDir, root = repository, logger = consol
   }
 
   function fault(slot, reason) {
-    Object.assign(slot, { state: 'fault', nextAttemptAt: null });
-    lifecycle('warn', { moduleId: slot.id, generation: slot.generation, event: 'fault', reason, consecutiveFailures: slot.consecutiveFailures }, '内嵌模块已停止自动重启，需要管理员恢复');
+    Object.assign(slot, { state: 'fault', nextAttemptAt: null, faultReason: reason });
+    lifecycle('warn', { moduleId: slot.id, generation: slot.generation, event: 'fault', reason, consecutiveFailures: slot.consecutiveFailures }, holdFaults ? '内嵌模块已停止自动重启，需要管理员恢复' : '内嵌模块已停止自动重启，正在关闭工作台');
+    // Until an operator can restart a faulted module (P0-3), fall back to the
+    // old contract: the whole workbench exits and systemd restarts it.
+    if (!holdFaults) void close().finally(() => onFailure(new Error(`${slot.id} fault (${reason})`)));
   }
 
   // A due module waits in backoff, without counting a failure, until every
@@ -210,13 +214,15 @@ export async function startModules({ dataDir, root = repository, logger = consol
 
   /** Operator recovery from fault; returns false in any other state. */
   function restartModule(id) {
+    if (!Object.hasOwn(slots, id)) throw new Error('Unknown embedded module');
     const slot = slots[id];
-    if (!slot) throw new Error('Unknown embedded module');
     if (stopping || slot.state !== 'fault') return false;
-    slot.consecutiveFailures = 0; slot.state = 'draining';
+    const lingering = slot.faultReason === 'process-tree';
+    Object.assign(slot, { consecutiveFailures: 0, state: 'draining', faultReason: null });
     supervise((async () => {
-      // A fault may have left a process tree behind; never start beside it.
-      if (slot.child && !await drain(slot.child, id)) return fault(slot, 'process-tree');
+      // Only this fault leaves a process tree behind; never start beside it.
+      // Any other fault already confirmed the old tree was gone.
+      if (lingering && !await drain(slot.child, id)) return fault(slot, 'process-tree');
       if (stopping) return;
       Object.assign(slot, { state: 'backoff', due: true });
       attempt(slot);

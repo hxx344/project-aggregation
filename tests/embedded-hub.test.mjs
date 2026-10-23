@@ -115,6 +115,15 @@ test('native trading reads the embedded Asset without a separate web password or
   assert.ok(!f.calls.some(call => call.path === '/api/login'));
 });
 
+test('the hub resynchronization used after a module restart releases every trading module from maintenance', async t => {
+  const f = await fixture(t);
+  const before = f.calls.length;
+  await f.app.resynchronizeModules();
+  const released = f.calls.slice(before).filter(call => call.path === '/__workspace/maintenance');
+  assert.deepEqual(released.map(call => call.id).sort(), ['aster', 'crossex', 'greeks']);
+  for (const call of released) assert.deepEqual(call.body, { active: false });
+});
+
 test('architecture inspection and sampling read only the five authenticated capability contracts', async t => {
   const f = await fixture(t); await f.login();
   const before = f.calls.length;
