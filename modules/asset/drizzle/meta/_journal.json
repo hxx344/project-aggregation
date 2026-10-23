@@ -15,6 +15,13 @@
       "when": 1789814916685,
       "tag": "0001_careless_scarlet_spider",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792780000000,
+      "tag": "0002_fill_cache",
+      "breakpoints": true
     }
   ]
 }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { openDatabase } from '../lib/sqlite.ts';
@@ -11,8 +11,10 @@ test('SQLite upgrades preserve data, isolate owners and roll back a failed batch
   const dir = mkdtempSync(join(tmpdir(), 'ledger-database-'));
   let database;
   try {
-    const filename = join(dir, 'ledger.sqlite');
-    database = openDatabase(filename, resolve('drizzle'));
+    const filename = join(dir, 'ledger.sqlite'), previous = join(dir, 'previous-migrations');
+    // Start from the schema before fill_cache existed, as an installed ledger would.
+    cpSync(resolve('drizzle'), previous, { recursive: true, filter: source => !source.endsWith('0002_fill_cache.sql') });
+    database = openDatabase(filename, previous);
     await database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-1', '{"value":123}').run();
     await assert.rejects(database.batch([
       database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('other', 'row-2', '{}'),
@@ -21,7 +23,8 @@ test('SQLite upgrades preserve data, isolate owners and roll back a failed batch
     assert.equal(await database.prepare('SELECT data FROM assets WHERE owner=?').bind('other').first(), null);
     database.close(); database = openDatabase(filename, resolve('drizzle'));
     assert.deepEqual({ ...await database.prepare('SELECT data FROM assets WHERE owner=?').bind('owner').first() }, { data: '{"value":123}' });
-    assert.equal((await database.prepare('SELECT * FROM _schema_migrations').all()).results.length, 2);
+    assert.equal((await database.prepare('SELECT * FROM _schema_migrations').all()).results.length, 3);
+    assert.deepEqual((await database.prepare('SELECT * FROM fill_cache').all()).results, []);
   } finally { database?.close(); rmSync(dir, { recursive: true }); }
 });
 

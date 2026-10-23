@@ -350,7 +350,7 @@ test('the 80-request budget includes the current position snapshot and never ret
   assert.equal(calls, 80); assert.equal(result.status, 'error'); assert.equal(result.fetchedAt, null);
 });
 
-test('failures retain prior successful data as stale, sanitize text, retry after 60s and expire idle entries', async t => {
+test('failures retain prior successful data as stale, sanitize text, retry after 60s and restore idle entries from storage', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   let clock = at, fail = false, reads = 0;
   const service = createFillsService({ now: () => clock, read: async () => [], fills: async () => {
@@ -363,7 +363,9 @@ test('failures retain prior successful data as stale, sanitize text, retry after
   assert.equal(JSON.stringify(result).includes('PRIVATE'), false);
   clock += 59_999; await service.read(f.database, 'owner', f.unseal); await service.idle(); assert.equal(reads, 2);
   clock++; await service.read(f.database, 'owner', f.unseal); await service.idle(); assert.equal(reads, 3);
-  clock += 15 * minute; result = scope(await service.read(f.database, 'owner', f.unseal)); assert.equal(result.status, 'loading'); assert.equal(result.fills.length, 0);
+  // Failed refreshes are never stored: the evicted entry comes back as the last success, now stale.
+  clock += 15 * minute; result = scope(await service.read(f.database, 'owner', f.unseal));
+  assert.equal(result.status, 'stale'); assert.equal(result.fetchedAt, iso(at)); assert.equal(result.fills.length, 1); assert.equal(result.refreshing, true);
   await service.idle();
 });
 
@@ -399,9 +401,11 @@ test('global scheduler allows only one scope across services and deadline releas
   await service.read(f.database, 'owner', f.unseal); await second.read(f.database, 'owner', f.unseal);
   await flush(); assert.equal(active, 1);
   pending.resolve([]); await Promise.all([service.idle(), second.idle()]); assert.equal(maximum, 1);
+  // A separate database: the shared one already stores the successful read above.
+  const g = fixture(); t.after(() => g.database.close()); await g.save();
   const stuck = createFillsService({ now: () => at, deadline: 10, read: async () => new Promise(() => {}), fills: async () => assert.fail('deadline prevents fills') });
-  await stuck.read(f.database, 'owner', f.unseal); await stuck.idle();
-  assert.equal(scope(await stuck.read(f.database, 'owner', f.unseal)).status, 'error');
+  await stuck.read(g.database, 'owner', g.unseal); await stuck.idle();
+  assert.equal(scope(await stuck.read(g.database, 'owner', g.unseal)).status, 'error');
 });
 
 test('history requests have a shared spacing reservation and refuse a page beyond the 80 request budget', async () => {
@@ -597,7 +601,7 @@ test('credential replacement, account deletion, idle eviction and close cancel s
     assert.equal(reads, action === 'revision' ? 2 : 1, 'no cancelled timer returns later');
     if (action === 'idle') {
       const result = scope(await service.read(f.database, 'owner', f.unseal));
-      assert.equal(result.status, 'loading'); assert.deepEqual(result.fills, []);
+      assert.equal(result.status, 'stale'); assert.equal(result.fills.length, 1);
       await service.idle();
     }
     if (action === 'close') await assert.rejects(service.read(f.database, 'owner', f.unseal));
@@ -614,4 +618,100 @@ test('scheduled retries recheck credentials even without a poll after deletion',
   await f.database.prepare('DELETE FROM connections WHERE owner = ?').bind('owner').run();
   t.mock.timers.tick(30_000); await service.idle(); assert.equal(reads, 1);
   t.mock.timers.tick(60_000); await service.idle(); assert.equal(reads, 1);
+});
+
+test('a restarted service serves stored fills at once, waits for the stored refresh time and resumes from the stored cursor', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save();
+  let clock = at; const requests: { start: number; end: number }[] = [];
+  const options = { now: () => clock, read: async () => [held('1')], fills: async (_c: Credentials, _s: string, request: { start: number; end: number }) => {
+    requests.push(request); return [fill('1', at - 2 * minute, 'buy', '1')];
+  } };
+  const first = createFillsService(options);
+  await first.read(f.database, 'owner', f.unseal); await first.idle(); first.close();
+  assert.equal(requests.length, 1);
+
+  clock += 4 * minute;
+  const second = createFillsService(options); t.after(() => second.close());
+  let result = scope(await second.read(f.database, 'owner', f.unseal));
+  assert.equal(result.status, 'live'); assert.equal(result.refreshing, false); assert.equal(result.fetchedAt, iso(at));
+  assert.deepEqual(result.fills.map(item => [item.id, item.positionBefore, item.positionAfter]), [['1', '0', '1']]);
+  await second.idle(); assert.equal(requests.length, 1, 'a stored success is reused until its own refresh time');
+
+  clock += minute;
+  result = scope(await second.read(f.database, 'owner', f.unseal));
+  assert.equal(result.refreshing, true); assert.equal(result.fills.length, 1);
+  await second.idle();
+  assert.equal(requests[1].start, at - 10 * minute, 'refresh resumes from the stored cursor, not the 85-day lookback');
+  assert.equal(scope(await second.read(f.database, 'owner', f.unseal)).fetchedAt, iso(clock));
+});
+
+test('stored fills are dropped for replaced or deleted credentials, conflicts and unreadable rows', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save();
+  const rows = async () => (await f.database.prepare('SELECT account,scope,revision FROM fill_cache WHERE owner = ?').bind('owner').all()).results;
+  let clock = at, conflict = false;
+  const options = { now: () => clock, read: async () => [held('1')], fills: async () => [fill('1', at - 2 * minute, 'buy', '1', conflict ? { price: '999' } : {})] };
+  const service = createFillsService(options); t.after(() => service.close());
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal((await rows()).length, 1);
+
+  await f.save({ ...okx, apiKey: 'replacement-key' });
+  const other = createFillsService(options); t.after(() => other.close());
+  assert.deepEqual(scope(await other.read(f.database, 'owner', f.unseal)).fills, []);
+  assert.deepEqual(await rows(), [], 'a row from older credentials is never served and is deleted');
+  await other.idle(); other.close();
+
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal((await rows()).length, 1);
+  conflict = true; clock += 5 * minute;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.match(scope(await service.read(f.database, 'owner', f.unseal)).error!, /冲突/);
+  assert.deepEqual(await rows(), [], 'a conflicting history does not survive the process');
+
+  conflict = false; clock += minute;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal((await rows()).length, 1);
+  await f.database.prepare('UPDATE fill_cache SET data = ? WHERE owner = ?').bind('{"version":1,"scope":{}}', 'owner').run();
+  const fresh = createFillsService(options); t.after(() => fresh.close());
+  assert.equal(scope(await fresh.read(f.database, 'owner', f.unseal)).status, 'loading');
+  await fresh.idle(); assert.equal((await rows()).length, 1, 'an unreadable row is replaced by a fresh full read');
+
+  await f.database.prepare('DELETE FROM connections WHERE owner = ?').bind('owner').run();
+  await fresh.read(f.database, 'owner', f.unseal);
+  assert.deepEqual(await rows(), []);
+});
+
+test('a restart after 15 minutes drops stored Binance mode evidence, so a PM account hides classic mode again', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(binance);
+  let clock = at, pmFailed = false; const products: string[] = [];
+  const options = { now: () => clock, read: async (_c: Credentials, product: string) => {
+    products.push(product); if (pmFailed && product === 'pm-um') throw new Error('PRIVATE'); return [];
+  }, fills: async () => [] };
+  const first = createFillsService(options);
+  await first.read(f.database, 'owner', f.unseal); await first.idle();
+  pmFailed = true; clock += 5 * minute; await first.read(f.database, 'owner', f.unseal); await first.idle();
+  await first.read(f.database, 'owner', f.unseal); await first.idle(); first.close();
+  assert.deepEqual(products, ['pm-um', 'pm-um', 'um']);
+
+  pmFailed = false; clock += 20 * minute; products.length = 0;
+  const second = createFillsService(options); t.after(() => second.close());
+  await second.read(f.database, 'owner', f.unseal); await second.idle();
+  const result = await second.read(f.database, 'owner', f.unseal);
+  assert.deepEqual(products, ['pm-um']);
+  assert.equal(scope(result, 'binance', 'um'), undefined);
+});
+
+test('stored fills stay with their owner', async t => {
+  const f = fixture(); t.after(() => f.database.close());
+  await f.save(okx, 'owner'); await f.save(okx, 'other');
+  // The fixture vault is keyed by owner 'owner'; give the second owner its own key.
+  const unseal = async (value: string) => value === 'synthetic-1' ? okx : { ...okx, apiKey: 'other-key' };
+  const options = { now: () => at, read: async () => [held('1')],
+    fills: async (c: Credentials) => [fill('apiKey' in c && c.apiKey === 'other-key' ? 'other-fill' : 'owner-fill', at - 2 * minute, 'buy', '1')] };
+  const first = createFillsService(options);
+  for (const owner of ['owner', 'other']) { await first.read(f.database, owner, unseal); await first.idle(); }
+  first.close();
+  const second = createFillsService({ ...options, fills: async () => assert.fail('stored fills are within their refresh time') });
+  t.after(() => second.close());
+  assert.deepEqual(scope(await second.read(f.database, 'owner', unseal)).fills.map(item => item.id), ['owner-fill']);
+  assert.deepEqual(scope(await second.read(f.database, 'other', unseal)).fills.map(item => item.id), ['other-fill']);
 });

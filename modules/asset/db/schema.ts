@@ -5,3 +5,4 @@ export const connections = sqliteTable('connections', { owner: text('owner').not
 export const snapshots = sqliteTable('snapshots', { owner: text('owner').notNull(), date: text('date').notNull(), data: text('data').notNull() }, t => [primaryKey({columns:[t.owner,t.date]})]);
 export const locks = sqliteTable('sync_locks', { owner:text('owner').primaryKey(), expires:integer('expires').notNull() });
 export const authAttempts = sqliteTable('auth_attempts', { id: text('id').primaryKey(), startedAt: integer('started_at').notNull(), attempts: integer('attempts').notNull() });
+export const fillCache = sqliteTable('fill_cache', { owner: text('owner').notNull(), account: text('account').notNull(), scope: text('scope').notNull(), revision: text('revision').notNull(), data: text('data').notNull(), updatedAt: integer('updated_at').notNull() }, t => [primaryKey({columns:[t.owner,t.account,t.scope]})]);

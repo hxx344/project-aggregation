@@ -158,6 +158,7 @@ export async function disconnect(owner:string,exchange:'bybit'|'aster'|'binance'
     const ledger=await getCurrentLedger(owner),asset=ledger.assets.find(a=>a.mode===exchange);
     await db().batch([
       db().prepare('DELETE FROM connections WHERE owner = ? AND exchange = ?').bind(owner,exchange),
+      db().prepare('DELETE FROM fill_cache WHERE owner = ? AND account = ?').bind(owner,exchange),
       db().prepare('INSERT INTO settings(owner,key,value) VALUES(?,?,?) ON CONFLICT(owner,key) DO UPDATE SET value=excluded.value').bind(owner,exchange+'-status',JSON.stringify({configured:false,lastSync:ledger.connections[exchange].lastSync,error:null,scope:ledger.connections[exchange].scope})),
       ...(asset?[db().prepare('UPDATE assets SET data = ? WHERE owner = ? AND id = ?').bind(JSON.stringify({...asset,status:'已断开 · 保留旧值',error:undefined}),owner,asset.id)]:[]),
     ]);
