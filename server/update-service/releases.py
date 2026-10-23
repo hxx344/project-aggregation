@@ -3,6 +3,7 @@ from collections import OrderedDict
 from concurrent import futures
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
@@ -27,6 +28,20 @@ MAX_COMPARISON_CACHE = 64
 MAX_RELEASE_NOTES = 6000
 RELEASE_NOTES_TRUNCATED = '\n（更新内容过长，已截断）'
 RELEASE_NOTES_CONTROLS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ud800-\udfff]')
+# Notes across versions read one page of releases; 100 releases of the
+# deployment repository measured about 0.7 MB on 2026-10-23.
+HISTORY_PAGE = 100
+MAX_HISTORY_JSON = 4 * 1024 * 1024
+MAX_HISTORY_CACHE = 16
+MAX_HISTORY_ENTRY_NOTES = 1200
+HISTORY_RESERVE = 300
+# After a failed history read; a later server retry deadline takes precedence.
+HISTORY_RETRY_DELAY = 10 * 60
+# Same-second boundary releases need a compare request each.
+MAX_HISTORY_COMPARES = 4
+DEPLOY_TAG = re.compile(r'deploy-([a-f0-9]{40})')
+# Release dates are shown to users in China; the server clock zone is irrelevant.
+DISPLAY_ZONE = timezone(timedelta(hours=8))
 RELEASE_CACHE_TTL = 30 * 60
 MAX_RETRY_DELAY = 24 * 60 * 60
 # Per socket operation; one retry only when no HTTP response arrived.
@@ -36,6 +51,8 @@ CONNECTION_RETRY_DELAY = 1
 GITHUB_TOKEN = re.compile(r'[A-Za-z0-9_]{20,255}')
 # Shared by all repositories; cold checks add at most two network workers.
 ARTIFACT_CHECKS = ThreadPoolExecutor(max_workers=2, thread_name_prefix='release-artifact')
+# Display-only history reads. One worker: a hung read delays only later notes.
+HISTORY_READS = ThreadPoolExecutor(max_workers=1, thread_name_prefix='release-history')
 # Discovery probes that run beside the manifest. Separate from ARTIFACT_CHECKS,
 # which _verified submits to while one of these tasks may still be waiting.
 RELEASE_PROBES = ThreadPoolExecutor(max_workers=4, thread_name_prefix='release-probe')
@@ -213,6 +230,55 @@ def release_notes(value):
     return encoded[:budget].decode('utf-8', errors='ignore') + RELEASE_NOTES_TRUNCATED
 
 
+def clip_notes(value, maximum):
+    encoded = value.encode('utf-8')
+    if len(encoded) <= maximum:
+        return value
+    return encoded[:maximum - len('…'.encode('utf-8'))].decode('utf-8', errors='ignore').rstrip() + '…'
+
+
+def history_entry(release):
+    """Return a published deployment release, or None for anything not shown."""
+    if not isinstance(release, dict) or release.get('draft') is not False:
+        return None
+    tag, created, published = release.get('tag_name'), release.get('created_at'), release.get('published_at')
+    match = DEPLOY_TAG.fullmatch(tag) if isinstance(tag, str) else None
+    if match is None or not isinstance(created, str) or not isinstance(published, str):
+        return None
+    try:
+        created_at = datetime.fromisoformat(created.replace('Z', '+00:00'))
+        published_at = datetime.fromisoformat(published.replace('Z', '+00:00'))
+        if created_at.tzinfo is None or published_at.tzinfo is None:
+            return None
+    except ValueError:
+        return None
+    return {'commit': match.group(1), 'created': created_at.timestamp(),
+            'date': published_at.astimezone(DISPLAY_ZONE).strftime('%Y-%m-%d'),
+            'notes': release_notes(release.get('body'))}
+
+
+def compose_history(entries, incomplete):
+    """Bound the combined notes to the single public notes field."""
+    count = f'至少 {len(entries)}' if incomplete else f' {len(entries)}'
+    parts = [f'本次更新包含{count} 个版本，按从新到旧列出：']
+    used = len(parts[0].encode('utf-8'))
+    shown = 0
+    for entry in entries:
+        notes = clip_notes(entry['notes'], MAX_HISTORY_ENTRY_NOTES) if entry['notes'] else '未提供更新内容。'
+        block = f'版本 {entry["commit"][:12]}（{entry["date"]}）\n{notes}'
+        size = len(block.encode('utf-8')) + 2
+        if used + size > MAX_RELEASE_NOTES - HISTORY_RESERVE:
+            break
+        parts.append(block)
+        used += size
+        shown += 1
+    omitted = len(entries) - shown
+    if omitted or incomplete:
+        rest = '更多' if incomplete else f' {omitted} 个'
+        parts.append(f'另有{rest}更早版本的更新内容未显示，可在 GitHub 发布页查看。')
+    return release_notes('\n\n'.join(parts))
+
+
 def architecture():
     try:
         return {'x86_64': 'linux-x64', 'amd64': 'linux-x64', 'aarch64': 'linux-arm64',
@@ -232,6 +298,9 @@ class Releases:
         self._releases = OrderedDict()
         self._installers = OrderedDict()
         self._comparisons = OrderedDict()
+        self._histories = OrderedDict()
+        self._history_retry = {}
+        self._history_read = None
 
     def _cached(self, cache, key):
         with self._lock:
@@ -393,6 +462,110 @@ class Releases:
         if self.cacheable and not fresh:
             self._remember(self._installers, key, source, MAX_INSTALLER_CACHE)
         return source
+
+    def start_notes(self, module, installed_commit, release):
+        """Run notes_since on the history worker; at most one read is queued.
+
+        Returns the running future for the same range, or None while another
+        range is still being read.
+        """
+        key = (module.repository, installed_commit, release.get('commit') if isinstance(release, dict) else None)
+        with self._lock:
+            if self._history_read is not None and not self._history_read[1].done():
+                return self._history_read[1] if self._history_read[0] == key else None
+            future = HISTORY_READS.submit(self.notes_since, module, installed_commit, release)
+            self._history_read = (key, future)
+            return future
+
+    def notes_since(self, module, installed_commit, release):
+        """Combine notes of every published release after the installed one.
+
+        Display-only and never part of an update plan. Returns None when the
+        range covers one release or cannot be placed, so callers keep the
+        latest release notes. Network and content errors raise ReleaseError
+        and pause further history reads for this repository.
+        """
+        latest = release.get('commit') if isinstance(release, dict) else None
+        if (not isinstance(installed_commit, str) or not HEX40.fullmatch(installed_commit) or
+                not isinstance(latest, str) or not HEX40.fullmatch(latest) or installed_commit == latest):
+            return None
+        key = (module.repository, installed_commit, latest)
+        if self.cacheable:
+            cached = self._cached(self._histories, key)
+            if cached is not None and 0 <= self.clock() - cached[0] < RELEASE_CACHE_TTL:
+                return cached[1]
+        with self._lock:
+            retry = self._history_retry.get(module.repository)
+        if retry is not None and 0 < retry - self.clock() <= MAX_RETRY_DELAY:
+            return None
+        try:
+            try:
+                listed = json.loads(self.network.request(self.api(module, f'releases?per_page={HISTORY_PAGE}'), MAX_HISTORY_JSON))
+            except (ValueError, UnicodeError):
+                raise ReleaseError('正式版本列表无效') from None
+            if not isinstance(listed, list):
+                raise ReleaseError('正式版本列表无效')
+            result = self._history(module, installed_commit, latest, listed)
+        except ReleaseError as error:
+            self._defer_history(module, error)
+            raise
+        if self.cacheable:
+            self._remember(self._histories, key, (self.clock(), result), MAX_HISTORY_CACHE)
+        return result
+
+    def _defer_history(self, module, error):
+        delay = HISTORY_RETRY_DELAY
+        if type(error.retry_at) in (int, float):
+            delay = max(delay, min(error.retry_at - time.time(), MAX_RETRY_DELAY))
+        with self._lock:
+            self._history_retry[module.repository] = self.clock() + delay
+
+    def _history(self, module, installed_commit, latest, listed):
+        compares = 0
+        def ordered(older, newer):
+            # Releases created in the same second need the repository history.
+            nonlocal compares
+            compares += 1
+            if compares > MAX_HISTORY_COMPARES:
+                raise ReleaseError('同一时间创建的版本过多，无法确认更新内容的先后')
+            return self.is_newer(module, older, newer)
+
+        entries = {}
+        for item in listed:
+            entry = history_entry(item)
+            if entry is not None:
+                entries.setdefault(entry['commit'], entry)
+        newest, installed = entries.get(latest), entries.get(installed_commit)
+        if newest is None:
+            return None
+        if installed is None:
+            # Older or unlisted installs are placed by their own release.
+            try:
+                installed = history_entry(decode_json(self.network.request(
+                    self.api(module, f'releases/tags/deploy-{installed_commit}'))))
+            except ReleaseError as error:
+                if error.transient:
+                    raise
+                return None
+            if installed is None:
+                return None
+
+        def shipped(entry):
+            # created_at follows the release commit, so prereleases and stable
+            # releases interleave in history order.
+            if entry['commit'] == latest:
+                return True
+            if entry['commit'] == installed_commit or not installed['created'] <= entry['created'] <= newest['created']:
+                return False
+            return ((entry['created'] != installed['created'] or ordered(installed_commit, entry['commit'])) and
+                    (entry['created'] != newest['created'] or ordered(entry['commit'], latest)))
+
+        selected = sorted((entry for entry in entries.values() if shipped(entry)),
+                          key=lambda entry: (entry['commit'] != latest, -entry['created']))
+        # A full page may not reach back to the installed release.
+        incomplete = (len(listed) >= HISTORY_PAGE and installed_commit not in entries and
+                      min(entry['created'] for entry in entries.values()) > installed['created'])
+        return compose_history(selected, incomplete) if len(selected) > 1 or incomplete else None
 
     def is_newer(self, module, installed_commit, candidate):
         if (not isinstance(candidate, str) or not HEX40.fullmatch(candidate) or

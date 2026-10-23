@@ -41,6 +41,9 @@ AUTO_CHECK_INTERVAL = 60
 CHECK_RETRY_MAX_INTERVAL = 15 * 60
 # Longest sequential chain is about four probes of two 15s attempts each.
 CHECK_DEADLINE = 3 * 60
+# Release history is display-only and must not push a check past its deadline;
+# a slower read still fills the cache for the next check.
+HISTORY_WAIT = 20
 ACTIVE = {'queued', 'running'}
 DEPLOYMENT_MODES = ('source', 'ci')
 TOKEN = re.compile(r'[a-f0-9]{32}')
@@ -473,6 +476,15 @@ class Coordinator:
                 item.update(state='current', reason='本机版本领先于当前正式版本，不自动降级')
                 return item, None
             item.update(state='available', reason='正式版本可用')
+            if current:
+                try:
+                    reading = self.releases.start_notes(module, current, release)
+                    notes = reading.result(timeout=HISTORY_WAIT) if reading else None
+                except Exception:
+                    # Display-only: a failed history read keeps the latest notes.
+                    notes = None
+                if notes:
+                    item['releaseNotes'] = notes
             return item, release
         except ReleaseError as error:
             item.update(state='unavailable', reason=str(error))
