@@ -66,10 +66,13 @@
   "stages": {
     "config": {
       "target": ".pipeline/runtime/{env}.env",
+      "applyTarget": "/etc/project-aggregation.env",
+      "applyWithSudo": true,
       "applyCommands": [
         {
           "cmd": "sudo",
           "args": [
+            "-n",
             "install",
             "-m",
             "600",
@@ -77,8 +80,8 @@
             "root",
             "-g",
             "root",
-            ".pipeline/runtime/prod.env",
-            "/etc/project-aggregation.env"
+            "{target}",
+            "{applyTarget}"
           ],
           "timeoutMs": 60000
         }
@@ -88,7 +91,7 @@
       "enabled": true,
       "requiresConfirmation": true,
       "commands": [
-        { "cmd": "python3", "args": ["deploy/publish-release.py", "output/release"], "timeoutMs": 600000 }
+        { "cmd": "python3", "args": ["deploy/publish-release.py", "{releaseDirectory}"], "timeoutMs": 600000 }
       ]
     },
     "activate": {
