@@ -5,9 +5,9 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_bounded_recovery as fixtures
-from tests import test_pair_order_recovery as orders
 from trading.engine import Engine
 from trading.exchange import BudgetWait
+from trading.execution import Executor
 from trading.models import TradingError
 from trading.pair_execution import PairTrader
 from trading.store import Store
@@ -59,7 +59,12 @@ class PairRealityBackoffTests(TestCase):
 
     def test_budget_deadline_survives_manual_calls_and_restart_without_losing_known_receipt(self):
         state = self.f.state()
-        state["pending"]["legs"][0]["receipt"] = orders.receipt_for(state["pending"]["legs"][0], status="FILLED", qty="0.2")
+        leg = state["pending"]["legs"][0]
+        broker = self.f.broker("long")
+        leg["receipt"] = broker.submit([leg["order"]])[0]
+        # A real manual rollback supplies a direction timestamp covering the
+        # known fill; the quota deadline alone is not position evidence.
+        broker.submit([Executor.order("XAUUSD1", "LONG", "SELL", "0.2", "budget-manual-rollback")])
         state["snapshots"] = {"long": {"timestamp": self.wall - 120, "positions": []}}
         self.f.f.store.put("pair_runtime:gold", state)
         with patch.object(self.f.engine.pairs, "_read_members", side_effect=BudgetWait("quota", retry_after=90)) as reads:

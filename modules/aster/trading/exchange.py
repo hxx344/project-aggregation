@@ -1591,7 +1591,8 @@ class LiveBroker:
                 rows.append({"symbol": row["symbol"], "positionSide": row["positionSide"], "positionAmt": "0",
                              "entryPrice": "0", "markPrice": "0",
                              "leverage": row["leverage"], "unRealizedProfit": "0", "liquidationPrice": "0",
-                             "marginType": "isolated" if row["isolated"] else "cross"})
+                             "marginType": "isolated" if row["isolated"] else "cross",
+                             "updateTime": row.get("updateTime")})
         positions = []
         for row in rows:
             if row["symbol"] not in symbols and not dec(row["positionAmt"]):
@@ -1604,7 +1605,8 @@ class LiveBroker:
                 positive(row["markPrice"], True, field=f"{field_prefix} 标记价（markPrice）"),
                 self._leverage(row.get("leverage"), field=f"{field_prefix} 实际杠杆（leverage）"), dec(row["unRealizedProfit"]),
                 positive(row["liquidationPrice"], True, field=f"{field_prefix} 强平价（liquidationPrice）"),
-                isolated=row["marginType"].lower() not in ("cross", "crossed")))
+                isolated=row["marginType"].lower() not in ("cross", "crossed"),
+                update_time=self._position_update_time(row)))
         # Never combine balances and positions from different fills.
         represented = {(p.symbol, p.side) for p in positions}
         if any(dec(row["positionAmt"]) and key not in represented for key, row in account_positions.items()):
@@ -1728,6 +1730,16 @@ class LiveBroker:
             pass
         return None
 
+    @staticmethod
+    def _position_update_time(row):
+        value = row.get("updateTime")
+        if value is None:
+            return None
+        stamp = positive(value, True)
+        if stamp != stamp.to_integral_value() or stamp > dec(str(time.time() + 1)) * 1000:
+            raise TradingError("持仓更新时间无效或超前")
+        return int(stamp)
+
     def _cycle_positions(self, account, symbols, read):
         rows = self._position_rows(account.get("positions"))
         # V3 account returns LONG/SHORT only in hedge mode, including flat legs.
@@ -1792,7 +1804,8 @@ class LiveBroker:
                 liquidation = positive(risk_row["liquidationPrice"], True, field=f"{symbol} {side} 强平价（liquidationPrice）")
             positions.append(Position(symbol, side, qty, positive(row["entryPrice"], allow_zero=not qty,
                 field=f"{symbol} {side} 开仓价（entryPrice）"),
-                mark, leverages[symbol], dec(row["unrealizedProfit"]), liquidation, isolated=row["isolated"]))
+                mark, leverages[symbol], dec(row["unrealizedProfit"]), liquidation, isolated=row["isolated"],
+                update_time=self._position_update_time(row)))
         return self._fill_missing_marks(positions), rows, leverages, risk_unrealized
 
     @staticmethod

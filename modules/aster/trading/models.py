@@ -204,6 +204,9 @@ class Position:
     liquidation: Decimal | None = ZERO
     maintenance: Decimal = ZERO
     isolated: bool = False
+    # Exchange time of this direction's last position update, including zero.
+    # None is missing evidence, never the local snapshot/request time.
+    update_time: int | None = None
 
     @property
     def notional(self):

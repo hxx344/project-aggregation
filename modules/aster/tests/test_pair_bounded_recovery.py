@@ -277,6 +277,8 @@ class PairBoundedRecoveryTests(unittest.TestCase):
             state["recovery_watch"]["batches"].append(row)
         pending = deepcopy(self.f.store.get("pair_batch:" + fixtures.BATCH_ID))
         pending["id"] = "ninth-legacy"
+        # This is another batch, not a retry of the archived batch's reserved read.
+        pending["bounded_recovery"] = {"observed_at": time.time() - 121, "stage": "positions"}
         for leg in pending["legs"]:
             leg["order"]["newClientOrderId"] = leg["key"] + pending["id"]
         state["pending"] = pending
@@ -458,6 +460,11 @@ class PairBoundedRecoveryTests(unittest.TestCase):
             pending["repair_attempts"] = 3
             for leg in pending["legs"]:
                 leg["receipt"]["status"] = "EXPIRED"
+        for side in ("long", "short"):
+            broker = self.broker(side)
+            # These cases explicitly model later manual positions/leverage.
+            broker.state["positions"]["XAUUSD1:" + side.upper()]["updateTime"] = int(time.time() * 1000)
+            broker.save()
         self.f.store.put("pair_runtime:gold", state)
 
     def test_terminal_cycle_mismatch_leverage_and_exhausted_repairs_have_finite_safe_exit(self):

@@ -281,6 +281,13 @@ class PairManualBaselineLiveTests(unittest.TestCase):
         for index, leg in enumerate(original["pending"]["legs"]):
             leg["receipt"] = recovery.receipt_for(leg, status="FILLED" if index else "REJECTED",
                                                  qty="0.2" if index else "0")
+        # These fixtures model a manual rollback after the filled receipt.
+        # Both authenticated responses must retain that exchange-time evidence.
+        for broker in self.live.values():
+            for row in broker.api.responses["/fapi/v3/positionRisk"]:
+                row["updateTime"] = int(time.time() * 1000)
+            for row in broker.api.responses["/fapi/v3/accountWithJoinMargin"]["positions"]:
+                row["updateTime"] = int(time.time() * 1000)
         self.f.store.put("pair_runtime:gold", original)
         return original
 

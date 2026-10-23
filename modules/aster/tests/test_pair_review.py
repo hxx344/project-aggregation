@@ -1,14 +1,16 @@
 """Independent regression cases for transient recovery and reduction priority."""
 from dataclasses import replace
 from datetime import datetime, timezone
+from fractions import Fraction
 import sqlite3
+from threading import Lock
 import time
 from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_trading as fixtures
-from trading.exchange import ExchangeError, RequestNotSent
-from trading.models import TradingError, dec
+from trading.exchange import AmbiguousOrder, ExchangeError, RequestNotSent
+from trading.models import TradingError, dec, wire
 from trading.pair_execution import PairTrader, runtime_default
 
 
@@ -109,17 +111,148 @@ class PairReviewTests(TestCase):
         self.assertEqual(state["phase"], "reconciling")
         self.assertEqual(self.order_count(), count)
 
-    def test_terminal_recovery_does_not_send_repair_orders(self):
+    def test_terminal_margin_recovery_only_reduces_added_quantity_and_never_resends(self):
         with self.lag_position_reads(lambda reads: reads == 2):
             self.tick()
         count = self.order_count()
-        # A reflected read that still misses the restore target must not send reductions.
-        with patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")):
+        with self.lag_position_reads(lambda reads: True), \
+             patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")):
             state = self.tick()
-        self.assertIsNotNone(state["pending"])
-        self.assertEqual(state["phase"], "reconciling")
         self.assertEqual(state["pending"]["repairs"], [])
         self.assertEqual(self.order_count(), count)
+        original = self.brokers["long"].submit
+
+        def lose_receipt(orders):
+            self.assert_reducing_journal(orders, "long")
+            original(orders)
+            raise AmbiguousOrder("repair receipt lost")
+
+        with patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")), \
+             patch.object(self.brokers["long"], "submit", side_effect=lose_receipt):
+            state = self.tick()
+        pending = state["pending"]
+        self.assertIsNotNone(pending, state)
+        self.assertTrue(pending["terminal_margin_rollback"])
+        self.assertEqual(len(pending["repairs"]), 2)
+        for leg in pending["repairs"]:
+            order = leg["order"]
+            self.assertEqual(order["side"], "SELL" if leg["key"] == "long" else "BUY")
+            self.assertEqual(dec(order["quantity"]), dec(pending["quantity"]))
+        self.assertEqual(self.order_count(), count + 2)
+        with patch.object(self.brokers["long"], "query", side_effect=ExchangeError("not visible", code=-2013)):
+            for _ in range(2):
+                state = self.tick()
+                self.assertIsNotNone(state["pending"])
+                self.assertEqual(self.order_count(), count + 2)
+        self.trader = PairTrader(self.engine)
+        state = self.tick()
+        self.assertIsNone(state["pending"], state)
+        self.assertEqual(self.order_count(), count + 2)
+        self.assertFalse(state["last_batch"]["completed"])
+        self.assert_flat()
+
+    def assert_reducing_journal(self, orders, key):
+        pending = self.store.get("pair_runtime:gold")["pending"]
+        for order in orders:
+            self.assertEqual(order["positionSide"], key.upper())
+            self.assertEqual(order["side"], "SELL" if key == "long" else "BUY")
+            saved = [leg for leg in pending["repairs"] if leg["order"] == order]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["dispatch"], "sending")
+
+    def terminal_partial_close(self):
+        self.tick()
+        self.expire()
+        read = self.trader._read
+        book = self.market.book
+        submit = {key: broker.submit for key, broker in self.brokers.items()}
+        book_lock = Lock()
+
+        def partial(key):
+            def send(orders):
+                with book_lock, patch.object(self.market, "book", side_effect=lambda symbol: replace(
+                        book(symbol), ask_qty=dec("0.2"), bid_qty=dec("0.1"))):
+                    return submit[key](orders)
+            return send
+
+        def lag(*args, **kwargs):
+            snapshots, guards = read(*args, **kwargs)
+            pending = (self.store.get("pair_runtime:gold") or {}).get("pending")
+            if pending and pending["phase"] == "close":
+                snapshots = {key: replace(snapshot, positions=[
+                    replace(p, qty=dec(pending["before"][p.side]), update_time=None)
+                    if p.symbol == "XAUUSD1" and p.side == key.upper() else p for p in snapshot.positions])
+                    for key, snapshot in snapshots.items()}
+            return snapshots, guards
+
+        with patch.object(self.brokers["long"], "submit", side_effect=partial("long")), \
+             patch.object(self.brokers["short"], "submit", side_effect=partial("short")), \
+             patch.object(self.trader, "_read", side_effect=lag):
+            state = self.tick()
+        self.assertTrue(state["pending"]["terminal_position_recovery"], state)
+        self.assertEqual(state["pending"]["repairs"], [])
+        return state
+
+    def test_terminal_partial_close_repairs_to_balance_without_resending_or_losing_cycle(self):
+        state = self.terminal_partial_close()
+        count = self.order_count()
+        expected = self.trader._receipt_quantities(state["pending"])
+        difference = expected["LONG"] - expected["SHORT"]
+        self.assertGreater(difference, 0)
+        with self.lag_position_reads(lambda reads: True):
+            state = self.tick()
+        self.assertEqual(state["pending"]["repairs"], [])
+        self.assertEqual(self.order_count(), count)
+        original = self.brokers["long"].submit
+
+        def lose_receipt(orders):
+            self.assert_reducing_journal(orders, "long")
+            self.assertEqual(Fraction(dec(orders[0]["quantity"])), difference)
+            original(orders)
+            raise AmbiguousOrder("repair receipt lost")
+
+        with patch.object(self.brokers["long"], "submit", side_effect=lose_receipt), \
+             patch.object(self.brokers["short"], "submit", side_effect=AssertionError("balanced side must not reduce")):
+            state = self.tick()
+        self.assertEqual(len(state["pending"]["repairs"]), 1)
+        self.assertEqual(self.order_count(), count + 1)
+        with patch.object(self.brokers["long"], "query", side_effect=ExchangeError("not visible", code=-2013)):
+            for _ in range(2):
+                state = self.tick()
+                self.assertIsNotNone(state["pending"])
+                self.assertEqual(self.order_count(), count + 1)
+        self.trader = PairTrader(self.engine)
+        state = self.tick()
+        self.assertIsNone(state["pending"], state)
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+        self.assertEqual(state["progress"]["baseline"], state["owned"])
+        self.assertEqual(state["progress"]["quantities"], dict.fromkeys(("LONG", "SHORT"), wire(expected["SHORT"])))
+        self.assertEqual(state["progress"]["completed_cycles"], 0)
+        self.assertEqual(self.order_count(), count + 1)
+        state = self.tick()
+        self.assertEqual(state["progress"]["completed_cycles"], 1, state)
+        self.assert_flat()
+
+    def test_terminal_close_repair_floors_exact_residual_without_crossing_balance(self):
+        self.terminal_partial_close()
+        state = self.store.get("pair_runtime:gold")
+        pending = state["pending"]
+        pending["legs"][0]["receipt"]["executedQty"] = "0.1"
+        pending["legs"][1]["receipt"]["executedQty"] = "0.1019999999999999999999999999999"
+        self.store.put("pair_runtime:gold", state)
+        expected = self.trader._receipt_quantities(pending)
+        snapshots, guards = self.trader._read(self.brokers, "XAUUSD1")
+        snapshots = {key: replace(snapshot, positions=[
+            replace(p, qty=dec(wire(expected[p.side]))) if p.symbol == "XAUUSD1" and p.side == key.upper() else p
+            for p in snapshot.positions]) for key, snapshot in snapshots.items()}
+        with patch.object(self.trader, "_read", return_value=(snapshots, guards)), \
+             patch.object(self.brokers["long"], "submit", side_effect=RequestNotSent("budget")) as submit:
+            state = self.tick()
+        self.assertEqual(submit.call_count, 1)
+        order = submit.call_args.args[0][0]
+        self.assertEqual(dec(order["quantity"]), dec("0.001"))
+        self.assertLessEqual(Fraction(dec(order["quantity"])), expected["LONG"] - expected["SHORT"])
+        self.assertEqual(order["side"], "SELL")
 
     def exhaust_bounded_reads(self, lagging):
         """Lag through all three bounded reads, then open the 120 s full check."""
@@ -151,25 +284,164 @@ class PairReviewTests(TestCase):
 
     def test_failed_full_check_read_keeps_the_retry_cadence(self):
         self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
-        with patch.object(self.trader, "_read", side_effect=ExchangeError("network")) as read:
+        with patch.object(self.engine.pairs, "_read_members", side_effect=ExchangeError("network")) as read:
             self.tick()
             state = self.tick()
         self.assertEqual(read.call_count, 1)
         self.assertIsNotNone(state["pending"])
         self.assertGreater(state["pending"]["bounded_recovery"]["next_check_at"], time.time() + 20)
 
+    def test_full_check_reuses_one_read_when_receipts_are_not_reflected(self):
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        original = self.engine.pairs._read_members
+
+        def lag(*args, **kwargs):
+            snapshots, guards = original(*args, **kwargs)
+            return ({key: replace(snapshot, positions=[replace(p, qty=dec(0), update_time=None)
+                                                       for p in snapshot.positions])
+                     for key, snapshot in snapshots.items()}, guards)
+
+        with patch.object(self.engine.pairs, "_read_members", side_effect=lag) as read, \
+             patch.object(self.trader, "_read", side_effect=AssertionError("full check owns the read")):
+            state = self.tick()
+            self.tick()
+        self.assertEqual(read.call_count, 1)
+        self.assertIsNotNone(state["pending"], state)
+        self.assertEqual(state["pending"]["bounded_recovery"]["failure_count"], 1)
+        self.assertIn("方向持仓更新时间", state["reason"])
+        self.assertNotIn("last_batch", state)
+
+    def test_full_check_failure_uses_shared_backoff_and_status_fields(self):
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        now = time.time()
+        failure = ExchangeError("rate limited", http_status=429, retry_after=40)
+        with patch("trading.pair_recovery.time.time", return_value=now), \
+             patch.object(self.engine.pairs, "_read_members", side_effect=failure) as read:
+            state = self.tick()
+            gate = state["pending"]["bounded_recovery"]
+            self.assertEqual(gate["failure_count"], 1)
+            self.assertEqual(gate["next_check_at"], now + 40)
+            self.assertEqual(gate["phase"], "reconciling")
+            self.assertTrue(gate["reason"])
+            self.assertIsNotNone(gate["api_notice"])
+            self.tick()
+            self.assertEqual(read.call_count, 1)
+        with patch("trading.pair_recovery.time.time", return_value=now + 41), \
+             patch.object(self.engine.pairs, "_read_members", side_effect=failure) as read:
+            state = self.tick()
+            gate = state["pending"]["bounded_recovery"]
+            self.assertEqual(gate["failure_count"], 2)
+            self.assertEqual(gate["next_check_at"], now + 101)
+            self.tick()
+            self.assertEqual(read.call_count, 1)
+
+    def test_full_check_reservation_preserves_a_concurrent_runtime(self):
+        from trading.pair_planning import PairRecoveryConflict
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        stale = self.store.get("pair_runtime:gold")
+        current = self.store.get("pair_runtime:gold")
+        current["owned"]["LONG"] = "0.001"
+        self.store.put("pair_runtime:gold", current)
+        with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("no read after conflict")), \
+             self.assertRaises(PairRecoveryConflict):
+            self.engine.pairs.recovery.adopt_unknown(self.trader, self.pair, stale)
+        self.assertEqual(self.store.get("pair_runtime:gold"), current)
+
+    def test_full_check_waits_for_position_review_without_consuming_its_deadline(self):
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        state = self.store.get("pair_runtime:gold")
+        now = time.time()
+        state["pending"].update(kind="ordinary", position_review=True,
+            position_review_attempted_at=now, position_review_retry_at=now + 60)
+        self.store.put("pair_runtime:gold", state)
+        with patch.object(self.engine.pairs, "_read_members", wraps=self.engine.pairs._read_members) as read:
+            state = self.tick()
+            self.assertEqual(read.call_count, 0)
+            self.assertNotIn("next_check_at", state["pending"]["bounded_recovery"])
+            state = self.store.get("pair_runtime:gold")
+            state["pending"]["position_review_retry_at"] = now - 1
+            self.store.put("pair_runtime:gold", state)
+            state = self.tick()
+            self.assertEqual(read.call_count, 1)
+        self.assertIsNone(state["pending"], state)
+
+    def test_full_check_clock_rollback_restores_saved_delay_then_completes(self):
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        state = self.store.get("pair_runtime:gold")
+        now = time.time()
+        state["pending"]["bounded_recovery"].update(attempted_at=now + 60, next_check_at=now + 120)
+        self.store.put("pair_runtime:gold", state)
+        with patch("trading.pair_recovery.time.time", return_value=now), \
+             patch.object(self.engine.pairs, "_read_members", wraps=self.engine.pairs._read_members) as read:
+            state = self.tick()
+            self.assertEqual(read.call_count, 0)
+            self.assertEqual(state["pending"]["bounded_recovery"]["next_check_at"], now + 60)
+        with patch("trading.pair_recovery.time.time", return_value=now + 61), \
+             patch.object(self.engine.pairs, "_read_members", wraps=self.engine.pairs._read_members) as read:
+            state = self.tick()
+            self.assertEqual(read.call_count, 1)
+        self.assertIsNone(state["pending"], state)
+
+    def test_full_check_adoption_failure_after_deadline_uses_one_read_and_backoff(self):
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        original = self.engine.pairs._read_members
+        now = time.time()
+
+        def unbalanced(*args, **kwargs):
+            snapshots, guards = original(*args, **kwargs)
+            snapshot = snapshots["short"]
+            snapshots["short"] = replace(snapshot, positions=[
+                replace(p, qty=dec(0)) if p.side == "SHORT" else p for p in snapshot.positions])
+            return snapshots, guards
+
+        for elapsed, expected_failures, delay in ((0, 1, 30), (31, 2, 60)):
+            with patch("trading.pair_recovery.time.time", return_value=now + elapsed), \
+                 patch.object(self.engine.pairs, "_read_members", side_effect=unbalanced) as read:
+                state = self.tick()
+                self.assertEqual(read.call_count, 1)
+                gate = state["pending"]["bounded_recovery"]
+                self.assertEqual(gate["failure_count"], expected_failures)
+                self.assertEqual(gate["phase"], "attention")
+                self.assertEqual(gate["next_check_at"], now + elapsed + delay)
+                state = self.tick()
+                self.assertEqual(read.call_count, 1)
+                self.assertEqual(state["reason"], gate["reason"])
+
+    def test_full_check_margin_failure_can_reduce_verified_fills(self):
+        self.exhaust_bounded_reads(self.lag_position_reads(lambda reads: reads >= 2))
+        count = self.order_count()
+        with patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")), \
+             patch.object(self.engine.pairs, "_read_members", wraps=self.engine.pairs._read_members) as read:
+            state = self.tick()
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(len(state["pending"]["repairs"]), 2)
+        self.assertEqual(self.order_count(), count + 2)
+        state = self.tick()
+        self.assertIsNone(state["pending"], state)
+        self.assert_flat()
+
     def test_ordinary_partial_fill_after_read_lag_finishes_from_positions(self):
+        self.ordinary_partial_fill_after_read_lag(("LONG",))
+
+    def test_ordinary_both_lagging_positions_are_not_adopted_as_manual_rollback(self):
+        self.ordinary_partial_fill_after_read_lag(("LONG", "SHORT"), update_time=1)
+
+    def test_ordinary_missing_position_times_do_not_authorize_manual_rollback(self):
+        self.ordinary_partial_fill_after_read_lag(("LONG", "SHORT"))
+
+    def ordinary_partial_fill_after_read_lag(self, lagged_sides, update_time=None):
         pair = self.store.pair("gold")
         pair["cycle"]["enabled"] = False
         pair["ordinary"]["enabled"] = True
         self.store.save_pair(pair)
         book, sent = self.market.book, []
         originals = {key: broker.submit for key, broker in self.brokers.items()}
+        book_lock = Lock()
 
         def thin(key):
             def submit(orders):
                 sent.append(key)
-                with patch.object(self.market, "book", side_effect=lambda symbol: replace(
+                with book_lock, patch.object(self.market, "book", side_effect=lambda symbol: replace(
                         book(symbol), ask_qty=dec("0.01"), bid_qty=dec("0.01"))):
                     return originals[key](orders)
             return submit
@@ -180,14 +452,15 @@ class PairReviewTests(TestCase):
             def read(*args, **kwargs):
                 snapshots, guards = original(*args, **kwargs)
                 if sent and not lagging:
-                    snapshots = {key: replace(snapshot, positions=[replace(p, qty=dec(0)) if p.side == "LONG" else p
+                    snapshots = {key: replace(snapshot, positions=[replace(p, qty=dec(0), update_time=update_time)
+                                                                   if p.side in lagged_sides else p
                                                                    for p in snapshot.positions])
                                  for key, snapshot in snapshots.items()}
                 return snapshots, guards
             return read
 
-        # The long fill lags in every read of the submitting tick, including
-        # the member reads behind reconcile_positions; later reads reflect it.
+        # Every read in the submitting tick carries the old positions, including
+        # the independent member read. Request freshness cannot prove rollback.
         with patch.object(self.brokers["long"], "submit", side_effect=thin("long")), \
              patch.object(self.brokers["short"], "submit", side_effect=thin("short")), \
              patch.object(self.trader, "_read", side_effect=lag(self.trader._read)), \
@@ -197,11 +470,76 @@ class PairReviewTests(TestCase):
                 if sent:
                     break
             lagging.append(False)
+            self.assertIsNotNone(state["pending"], state)
             self.assertTrue(state["pending"]["terminal_position_recovery"])
+            if len(lagged_sides) == 2:
+                self.assertEqual(state["phase"], "reconciling")
+                self.assertNotIn("attention", state)
+            self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+            batch_id = state["pending"]["id"]
+            self.assertIsNone(self.store.get("pair_batch:" + batch_id))
             state = self.tick()
         self.assertIsNone(state["pending"], state)
         self.assertEqual(state["owned"], {"LONG": "0.01", "SHORT": "0.01"})
         self.assertEqual(len(sent), 2)
+        audit = self.store.get("pair_batch:" + batch_id)["manual_position_reconciliation"]
+        self.assertEqual({side: dec(qty) for side, qty in audit["external_reduction"].items()},
+                         {"LONG": dec(0), "SHORT": dec(0)})
+
+    def test_terminal_ordinary_margin_recovery_reduces_instead_of_adopting_over_limit_fills(self):
+        pair = self.store.pair("gold")
+        pair["cycle"]["enabled"] = False
+        pair["ordinary"]["enabled"] = True
+        self.store.save_pair(pair)
+        read = self.trader._read
+
+        def lag(*args, **kwargs):
+            snapshots, guards = read(*args, **kwargs)
+            if (self.store.get("pair_runtime:gold") or {}).get("pending"):
+                snapshots = {key: replace(snapshot, positions=[replace(p, qty=dec(0), update_time=None)
+                                                               for p in snapshot.positions])
+                             for key, snapshot in snapshots.items()}
+            return snapshots, guards
+
+        with patch.object(self.trader, "_read", side_effect=lag), \
+             patch.object(self.engine.pairs.recovery, "reconcile_positions", return_value=False):
+            for _ in range(4):
+                state = self.tick()
+                if state.get("pending"):
+                    break
+        self.assertTrue(state["pending"]["terminal_position_recovery"], state)
+        count = self.order_count()
+        with patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001")):
+            state = self.tick()
+        self.assertTrue(state["pending"]["terminal_margin_rollback"])
+        self.assertEqual(len(state["pending"]["repairs"]), 2)
+        for leg in state["pending"]["repairs"]:
+            self.assertEqual(leg["order"]["side"], "SELL" if leg["key"] == "long" else "BUY")
+            self.assertEqual(dec(leg["order"]["quantity"]), dec(state["pending"]["quantity"]))
+        state = self.tick()
+        self.assertIsNone(state["pending"], state)
+        self.assertEqual(self.order_count(), count + 2)
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+        self.assert_flat()
+
+    def test_terminal_repair_honors_read_only_adl_and_attempt_limit(self):
+        self.terminal_partial_close()
+        count = self.order_count()
+        state = self.store.get("pair_runtime:gold")
+        self.trader._recover(self.pair, state, self.brokers, read_only=True)
+        self.assertEqual(state["phase"], "repairing")
+        self.assertEqual(state["pending"]["repairs"], [])
+        self.assertEqual(self.order_count(), count)
+        with patch.object(self.engine.adl, "require_clear", side_effect=TradingError("ADL guard")), \
+             self.assertRaisesRegex(TradingError, "ADL guard"):
+            self.trader._recover(self.pair, state, self.brokers)
+        self.assertEqual(self.order_count(), count)
+        state["pending"]["repair_attempts"] = 3
+        self.store.put("pair_runtime:gold", state)
+        state = self.tick()
+        self.assertIsNotNone(state["pending"])
+        self.assertEqual(state["pending"]["repairs"], [])
+        self.assertEqual(self.order_count(), count)
 
     def test_transient_position_read_lag_does_not_strand_verified_cycle(self):
         original_read = self.trader._read

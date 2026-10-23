@@ -111,7 +111,8 @@ class PaperBroker:
                 maintenance += mm
                 initial += qty * mark / leverage
                 pnl += profit
-                positions.append(Position(symbol, side, qty, entry, mark, leverage, profit, maintenance=mm))
+                positions.append(Position(symbol, side, qty, entry, mark, leverage, profit, maintenance=mm,
+                                          update_time=row.get("updateTime")))
         wallet = dec(self.state["wallet"])
         return AccountSnapshot(wallet + pnl, maintenance, wallet + pnl - initial, wallet, pnl, positions, [], True, False, True,
             started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), {s: PAPER_BRACKETS for s in symbols})
@@ -182,6 +183,8 @@ class PaperBroker:
             # Fill time and identity are committed with both balance and receipt;
             # restart recovery must not move a fill into a different UTC day.
             executed_at = time.time()
+            if executed:
+                position["updateTime"] = int(executed_at * 1000)
             receipt.update(orderId="paper:" + cid, time=int(executed_at * 1000), updateTime=int(executed_at * 1000),
                            paperTrades=[{"trade_id": "paper:" + cid + ":0", "order_id": "paper:" + cid,
                                          "client_id": cid, "symbol": symbol, "position_side": side, "side": order["side"],

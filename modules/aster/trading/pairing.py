@@ -139,12 +139,20 @@ class PairManager:
         return accounts
 
     def _read_members(self, pair, *, flat=False, adopt=False, reconciliation=False, startup=False,
-                      runtime=None, full_account_flat=False, market_recovery=False):
+                      runtime=None, full_account_flat=False, market_recovery=False, reduction_recovery=False):
         from .pair_planning import require_runtime_symbols
         if market_recovery and (not adopt or flat or full_account_flat):
             raise TradingError("市价单恢复读取不能用于绑定或空仓核验")
         if runtime is None:
             runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
+        if reduction_recovery:
+            from .execution import TERMINAL
+            pending = runtime.get("pending") or {}
+            records = pending.get("legs", []) + pending.get("repairs", [])
+            if (not market_recovery or not reconciliation or not pending.get("terminal_position_recovery")
+                    or pending.get("kind") not in {"ordinary", "cycle"} or not records
+                    or any(not leg.get("receipt") or leg["receipt"]["status"] not in TERMINAL for leg in records)):
+                raise TradingError("减仓恢复读取仅用于已有终态回执的原批次")
         require_runtime_symbols(pair, runtime)
         symbol = validate_symbol(pair["symbol"])
         accounts = self._members(pair)
@@ -196,7 +204,7 @@ class PairManager:
             snapshot.pair(symbol)
             if not snapshot.can_trade:
                 raise TradingError("子账户没有交易权限")
-            if not flat and snapshot.equity <= 0:
+            if not flat and not reduction_recovery and snapshot.equity <= 0:
                 raise TradingError("启用配对组前需要子账户具有正的 USD1 权益")
             if not market_recovery:
                 orders = snapshot.open_orders

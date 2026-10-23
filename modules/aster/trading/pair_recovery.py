@@ -40,11 +40,13 @@ def recovery_ready(pending):
         # A positive active receipt remains unresolved even after three reads
         # or a previously persisted positions stage. Query that original ID.
         return False
-    if pending.get("kind") == "leverage" or pending.get("terminal_position_recovery"):
+    if pending.get("kind") == "leverage":
         records = [pending]
     else:
         records = [leg for leg in pending.get("legs", []) + pending.get("repairs", [])
                    if not leg.get("receipt") or leg["receipt"].get("status") not in TERMINAL]
+        if not records and pending.get("terminal_position_recovery"):
+            records = [pending]
     if not records:
         return False
     gate = pending.setdefault("bounded_recovery", {"observed_at": time.time()})
@@ -166,6 +168,10 @@ def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=F
     snapshots, guards = member_read if member_read is not None else engine.pairs._read_members(
         pair, adopt=True, reconciliation=reconciliation, runtime=state, market_recovery=market_recovery)
     held = positions(snapshots, pair["symbol"])
+    pending = state.get("pending")
+    if (pending and pending["kind"] != "leverage"
+            and not PairTrader._receipts_reflected(pending, snapshots, pair["symbol"])):
+        PairTrader._require_position_times(pending, snapshots, pair["symbol"])
     leverage = held["LONG"].leverage
     require_supported_leverage(leverage)
     risk = PairTrader(engine)._risk_snapshots(pair, snapshots, recovery=True)
@@ -252,7 +258,8 @@ def _publish_archived_diagnostic(engine, pair, watch, accounts, status, message)
 
 
 def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, read_only=False, deadline=None,
-                                 adopt_positions=True, expected_quantities=None, retire_for_deletion=False):
+                                 adopt_positions=True, expected_quantities=None, retire_for_deletion=False,
+                                 member_read=None):
     """Check durable watches for new writes or a fresh read-only maintenance check."""
     from .pair_execution import PairTrader
     state = engine.store.get("pair_runtime:" + pair["id"], {}) if state is None else state
@@ -374,7 +381,13 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, rea
                     "SELECT key,data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))}
         if needs_reality:
             from .pair_planning import PairPositionError, PairRecoveryConflict
-            snapshots, guards, actual, _ = _safe_reality(engine, pair, state, reconciliation=False)
+            snapshots, guards, actual, _ = _safe_reality(engine, pair, state, reconciliation=False,
+                member_read=member_read)
+            if member_read is not None:
+                # Historical queries may revoke the original lease. Reuse that
+                # read only while its guards remain valid; never silently reread.
+                with engine.pairs._current_members(guards):
+                    pass
             expected = expected_quantities if expected_quantities is not None else PairTrader._expected(state)
             if any(dec(actual[side]) != dec(expected[side]) for _, side in SIDES):
                 if (state.get("pending") or any(dec(qty) for qty in state["progress"]["quantities"].values())
@@ -415,7 +428,7 @@ class PairOrderRecovery:
         self.previews = {}
         self.baseline_previews = {}
 
-    def adopt_unknown(self, trader, pair, state):
+    def adopt_unknown(self, trader, pair, state, *, read_only=False, recovery_source=None):
         """Throttle full reality checks across automatic/manual calls and restarts."""
         from .pair_planning import PairRecoveryConflict, PairPositionError
         pending = state["pending"]
@@ -438,8 +451,11 @@ class PairOrderRecovery:
                          api_notice=deepcopy(gate.get("api_notice")))
             state["retry_after"] = max(state.get("retry_after", 0), deadline - now)
             return False
+        # Reserve before reading, including crash/restart and terminal recovery.
+        gate.update(attempted_at=now, next_check_at=now + REALITY_RETRY_SECONDS)
         try:
-            return self._adopt_unknown(trader, pair, state)
+            return self._adopt_unknown(trader, pair, state,
+                read_only=read_only, recovery_source=recovery_source)
         except PairRecoveryConflict:
             raise
         except TradingError as exc:
@@ -455,7 +471,7 @@ class PairOrderRecovery:
             state["retry_after"] = max(state.get("retry_after", 0), delay)
             raise
 
-    def _adopt_unknown(self, trader, pair, state):
+    def _adopt_unknown(self, trader, pair, state, *, read_only=False, recovery_source=None):
         """End exhausted recovery from fresh reality, keeping every unknown fill."""
         from .pair_execution import empty_progress
         from .pair_planning import PairRecoveryConflict, PairPositionError
@@ -470,8 +486,10 @@ class PairOrderRecovery:
                 or type(created) not in (int, float) or not math.isfinite(created) or not 0 < created <= time.time()):
             raise PairPositionError("原批次编号或时间无效，不能自动接管")
         margin = self.store.get("pair_margin:" + pair["id"], {}) or {}
-        if margin.get("pending") is not None or margin.get("status") in {"submitting", "acknowledged", "accepted", "unknown"}:
-            raise TradingError("仍有未决划转，暂不结束订单恢复")
+        if not isinstance(margin, dict):
+            raise TradingError("保证金划转记录无效，保留原批次")
+        margin_unsettled = (margin.get("pending") is not None
+            or margin.get("status") in {"submitting", "acknowledged", "accepted", "unknown"})
         if not isinstance(pending.get("before"), dict) or set(pending["before"]) != {"LONG", "SHORT"}:
             raise PairPositionError("原批次底仓记录不完整，不能自动接管")
         before = {side: wire(positive(pending["before"][side], True)) for _, side in SIDES}
@@ -500,6 +518,11 @@ class PairOrderRecovery:
                 cids.add(cid)
                 if leg.get("receipt") is not None:
                     Executor.validate_receipt(order, leg["receipt"])
+        known_terminal = (pending["kind"] != "leverage" and pending.get("terminal_position_recovery")
+            and all(leg.get("receipt") and leg["receipt"]["status"] in TERMINAL
+                    for leg in pending["legs"] + pending["repairs"]))
+        if margin_unsettled and not known_terminal:
+            raise TradingError("仍有未决划转，暂不采纳底仓结束订单恢复")
         persisted = self.store.get("pair_runtime:" + pair["id"], {})
         # The stage is set immediately after the last query's durable save.
         # Compare the actual journal without treating that local marker as a race.
@@ -514,6 +537,19 @@ class PairOrderRecovery:
         _, brokers, identities = trader._members(pair)
         if identities != pending.get("identities") or identities != state.get("identities"):
             raise PairPositionError("原批次与当前账户身份不一致，不能自动接管")
+        # Reserve the read only after checking the existing journal. An
+        # unconditional save here would erase a concurrent recovery before CAS.
+        from .store import dumps
+        state["updated_at"] = time.time()
+        reserved = deepcopy(trader._durable(state))
+        runtime_key = "pair_runtime:" + pair["id"]
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM kv WHERE key=?", (runtime_key,)).fetchone()
+            if (json.loads(row[0]) if row else {}) != persisted:
+                raise PairRecoveryConflict("现实核验节流落盘期间批次变化，已保留最新记录")
+            db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(reserved), runtime_key))
+        persisted = reserved
         def restore_stream_receipts():
             if pending["kind"] == "leverage":
                 return False
@@ -536,12 +572,23 @@ class PairOrderRecovery:
 
         try:
             member_read = self.manager._read_members(pair, adopt=True, reconciliation=True, runtime=state,
-                market_recovery=pending["kind"] != "leverage")
+                market_recovery=pending["kind"] != "leverage", reduction_recovery=bool(known_terminal))
             # Events arriving after _query may already be part of these snapshots'
             # generation, or may have revoked them. Persist the original receipt in
             # either case, before a risk check or retry delay can outlive the cache.
             if restore_stream_receipts():
                 return False
+            snapshots, member_guards = member_read
+            if known_terminal and trader._receipts_reflected(pending, snapshots, pair["symbol"]):
+                # Known fills retain their lifecycle; neither a second read nor
+                # baseline adoption may strand an open cycle or block reductions.
+                guards = {key: member_guards[pair[key + "_account_id"]][1] for key, _ in SIDES}
+                handled = trader._recover_terminal(pair, state, brokers, snapshots, guards,
+                    member_read=member_read, read_only=read_only, recovery_source=recovery_source)
+                if handled is not False:
+                    return state.get("pending") is None
+            if margin_unsettled:
+                raise TradingError("仍有未决划转，暂不采纳底仓结束订单恢复")
             snapshots, guards, actual, leverage = _safe_reality(self.engine, pair, state, member_read=member_read)
             balanced = dec(actual["LONG"]) == dec(actual["SHORT"])
             baseline = all(dec(actual[side]) == dec(before[side]) for _, side in SIDES)
@@ -964,17 +1011,29 @@ class PairOrderRecovery:
             pair, adopt=True, reconciliation=True, market_recovery=True)
         held = positions(snapshots, symbol)
         actual = {side: Fraction(held[side].qty) for _, side in SIDES}
+        if not trader._receipts_reflected(pending, snapshots, symbol):
+            # Exact quantity/leverage projections retain legacy completion.
+            # Adopting a different baseline needs evidence of this batch's fills.
+            trader._require_position_times(pending, snapshots, symbol)
         if not acceptable(actual) or any(pos.leverage != pending["leverage"] for pos in held.values()):
             raise PairPositionError("仓位核对未通过：需两侧数量相等或分别回到原底仓，且杠杆不变；"
                 + "；".join(f"{'A 多侧' if key == 'long' else 'B 空侧'}实际 {wire(actual[side])}，底仓 {wire(before[side])}"
                             for key, side in SIDES))
+        # Preserve normal full-fill completion of the exact known projection.
+        # Adopting a different baseline or ending terminal recovery still needs
+        # the full risk admission, including when the read allowed low equity.
+        normal_completion = (not pending.get("terminal_position_recovery") and actual == expected
+            and not pending["repairs"] and all(leg["receipt"]["status"] == "FILLED" for leg in pending["legs"]))
+        if not normal_completion:
+            _safe_reality(self.engine, pair, state, member_read=(snapshots, guards))
         reconciled = deepcopy(state)
         owned = {side: wire(value) for side, value in actual.items()}
         if state.get("recovery_watch") is not None:
             # This batch's terminal receipts and balanced quantities have been
             # checked above. The historical guard must compare against that
             # verified result, not the old pre-batch owned baseline.
-            require_archived_orders_clear(self.engine, pair, state=state, expected_quantities=owned)
+            require_archived_orders_clear(self.engine, pair, state=state, expected_quantities=owned,
+                member_read=(snapshots, guards))
         reconciled["pending"]["manual_position_reconciliation"] = {
             "source": source, "checked_at": time.time(),
             "identities": deepcopy(pending["identities"]),

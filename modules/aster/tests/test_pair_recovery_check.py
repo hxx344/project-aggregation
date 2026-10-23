@@ -8,7 +8,7 @@ from tests import test_pair_integration as integration
 from tests import test_pair_order_recovery as recovery_tests
 from tests.test_pair_order_recovery import seed_pending, receipt_for
 from trading.exchange import BudgetWait, ExchangeError, RateBudget, RequestNotSent
-from trading.models import TradingError
+from trading.models import TradingError, dec
 
 
 class PairRecoveryCheckTests(unittest.TestCase):
@@ -98,7 +98,8 @@ class PairRecoveryCheckTests(unittest.TestCase):
             self.engine.pairs.tick("gold")
         repair.assert_called_once()
         order = repair.call_args.args[0][0]
-        self.assertEqual((order["positionSide"], order["side"], order["quantity"]), ("LONG", "SELL", "0.200"))
+        self.assertEqual((order["positionSide"], order["side"], dec(order["quantity"])),
+                         ("LONG", "SELL", dec("0.200")))
         self.assertEqual(len(self.state()["pending"]["repairs"]), 1)
         result = self.check()
         self.assertTrue(result["completed"])
