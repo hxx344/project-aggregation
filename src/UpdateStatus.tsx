@@ -464,7 +464,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {networkError ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>{networkError}</strong><p>恢复连接后会自动读取服务器记录。</p><button className="text-button" disabled={pending !== null} onClick={() => void request('read')}>重新连接</button></div></div> : null}
     {snapshot?.checkError || checkRequestFailed ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{snapshot?.checkError || '上次检查请求未完成，当前显示的是已有记录。'}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
-    {recovering.length && !updating && !uncertain && !reloading ? <div className="update-message warning" role="status"><CircleAlert size={18} /><div><strong>交易模块恢复中：{recovering.join('、')}</strong><p>维护状态确认前，这些模块暂不能交易，其他模块不受影响。确认后会自动恢复。</p></div></div> : null}
+    {recovering.length && !updating && !uncertain && !reloading ? <div className="update-message warning" role="status"><CircleAlert size={18} /><div><strong>交易模块恢复中：{recovering.join('、')}</strong><p>维护状态确认前，这些模块暂不能交易，其他模块不受影响。模块恢复运行后会自动确认；如果模块已停止运行，请在该模块页面重新启动。</p></div></div> : null}
     {reloading ? <div className="update-message setup" role="status"><RefreshCw size={18} className="spin" /><p>更新已完成，正在刷新页面以载入新版本和重启后的模块连接。</p></div> : null}
     {downloadProgress ? <DownloadProgress progress={downloadProgress} /> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}

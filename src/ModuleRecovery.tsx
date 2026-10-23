@@ -19,7 +19,7 @@ const names: Record<string, string> = { monitor: 'Monitor' };
 
 /** Supervisor state of one built-in module, with the operator restart for a faulted module. */
 export default function ModuleRecovery({ moduleId, name, active, onRecovered, onExpired }: { moduleId: string; name: string; active: boolean; onRecovered: () => void; onExpired: () => void }) {
-  const [row, setRow] = useState<ModuleRow | null>(null);
+  const [rows, setRows] = useState<ModuleRow[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
   const [revision, setRevision] = useState(0);
@@ -32,24 +32,30 @@ export default function ModuleRecovery({ moduleId, name, active, onRecovered, on
     if (!active) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const schedule = (delay: number) => { timer = setTimeout(() => void read(), delay); };
+    let reading = false;
+    const schedule = (delay: number) => { clearTimeout(timer); timer = setTimeout(() => void read(), delay); };
     async function read() {
-      if (document.visibilityState !== 'visible') { schedule(IDLE_MS); return; }
+      // A hidden page waits; visibilitychange reads again as soon as it shows.
+      if (document.visibilityState !== 'visible' || reading) return;
+      reading = true;
       try {
         const data = await api<{ enabled: boolean; modules: ModuleRow[] }>('/api/system/modules', { signal: controller.signal });
         if (controller.signal.aborted) return;
-        const next = data.enabled ? data.modules.find(item => item.moduleId === moduleId) ?? null : null;
-        setRow(next);
+        const all = data.enabled ? data.modules : [];
+        const next = all.find(item => item.moduleId === moduleId) ?? null;
+        setRows(all);
         if (awaitingReady.current && next?.state === 'ready') { awaitingReady.current = false; latest.current.onRecovered(); }
         schedule(next && (RECOVERING.has(next.state) || next.maintenanceConfirmed === false) ? RECOVERING_MS : IDLE_MS);
       } catch (reason) {
         if (controller.signal.aborted) return;
         if (reason instanceof ApiError && reason.status === 401) { latest.current.onExpired(); return; }
         schedule(IDLE_MS);
-      }
+      } finally { reading = false; }
     }
+    const visible = () => { if (document.visibilityState === 'visible') void read(); };
+    document.addEventListener('visibilitychange', visible);
     void read();
-    return () => { controller.abort(); clearTimeout(timer); };
+    return () => { controller.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
   }, [active, moduleId, revision]);
 
   async function restart() {
@@ -58,14 +64,14 @@ export default function ModuleRecovery({ moduleId, name, active, onRecovered, on
       await api(`/api/system/modules/${encodeURIComponent(moduleId)}/restart`, { method: 'POST' });
       awaitingReady.current = true;
     } catch (reason) {
-      if (reason instanceof ApiError && reason.status === 401) { onExpired(); return; }
+      if (reason instanceof ApiError && reason.status === 401) { setPending(false); onExpired(); return; }
       // 409 means the module already left fault; the next read shows where it is.
       if (!(reason instanceof ApiError && reason.status === 409)) setError(reason instanceof Error ? reason.message : '恢复请求未完成，请稍后重试');
-    } finally {
-      setPending(false); setRevision(value => value + 1);
     }
+    setPending(false); setRevision(value => value + 1);
   }
 
+  const row = rows.find(item => item.moduleId === moduleId);
   if (!row) return null;
   if (row.state === 'fault') {
     const cause = row.faultReason === 'process-tree' ? '旧进程未能结束，为避免与新实例同时运行，已停止自动重启。' : `连续 ${row.consecutiveFailures} 次启动失败或运行不足 10 分钟即退出，已停止自动重启。`;
@@ -76,6 +82,8 @@ export default function ModuleRecovery({ moduleId, name, active, onRecovered, on
     </div>;
   }
   if (RECOVERING.has(row.state)) {
+    const stopped = (row.waitingFor || []).filter(id => rows.find(item => item.moduleId === id)?.state === 'fault').map(id => names[id] || id);
+    if (stopped.length) return <div className="module-recovery notice" role="status"><CircleAlert size={15} aria-hidden="true" /><p>{name} 需要 {stopped.join('、')} 才能恢复，但 {stopped.join('、')} 已停止运行，请先在 {stopped.join('、')} 页面重新启动。</p></div>;
     const waiting = row.waitingFor?.length ? `，等待 ${row.waitingFor.map(id => names[id] || id).join('、')} 恢复` : '';
     return <div className="module-recovery notice" role="status"><LoaderCircle size={15} className="spin" aria-hidden="true" /><p>{name} 正在自动恢复{waiting}，恢复后即可继续使用。</p></div>;
   }

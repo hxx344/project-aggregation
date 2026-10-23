@@ -5,6 +5,7 @@ const UNAVAILABLE = '更新服务不可用，请先运行一键部署初始化�
 const MAINTENANCE = '系统正在更新或等待确认更新结果，暂不能新建实盘任务或修改实盘连接';
 const ACTIVE = new Set(['queued', 'running']);
 const MODULE_UNCONFIRMED = '该交易模块正在恢复，维护状态尚未确认，请稍后重试';
+const SCOPE_INVALID = '写入范围无效，暂不能写入';
 const FINAL_EXECUTION = new Set(['completed', 'stopped']);
 const PLAN_ID = /^[A-Za-z0-9_-]{16,128}$/;
 const GITHUB_TOKEN = /^[A-Za-z0-9_]{20,255}$/;
@@ -176,7 +177,7 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, tradingModules = [], prepareApply = async () => {}, releasePollMs = 5000, now = Date.now }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, tradingModules = [], moduleIds = tradingModules, prepareApply = async () => {}, releasePollMs = 5000, now = Date.now }) {
   let pendingPlanId = readPendingPlanId();
   let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
@@ -259,6 +260,8 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   }
   /** scope is 'native' or a module id; without one every trading module must be confirmed. */
   async function withExecutionEntry(operation, { scope } = {}) {
+    // An unknown scope would match no gate, so it is refused rather than allowed.
+    if (scope !== undefined && scope !== 'native' && !moduleIds.includes(scope) && !tradingModules.includes(scope)) throw new UpdateError(503, SCOPE_INVALID);
     if (applying) throw new UpdateError(409, MAINTENANCE);
     // Reserve before the first await, so apply cannot pass its idle check concurrently.
     entries += 1;

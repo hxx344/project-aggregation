@@ -149,7 +149,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
   const moduleUpdateGuard = embeddedModules ? createModuleUpdateGuard() : null;
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
-    ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, tradingModules, prepareApply: moduleUpdateGuard.prepareApply } : {}),
+    ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, tradingModules, moduleIds, prepareApply: moduleUpdateGuard.prepareApply } : {}),
     readMaintenance: () => getSetting('updates-maintenance') === '1',
     writeMaintenance: active => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
