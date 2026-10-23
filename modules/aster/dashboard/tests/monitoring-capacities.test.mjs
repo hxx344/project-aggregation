@@ -385,3 +385,16 @@ test('rows follow each saved monitor switch while a global pause keeps all selec
     [],
   );
 });
+
+test('a missing monitor flag neither activates sampled tiers nor adds a monitored row', () => {
+  for (const control of [
+    { symbol: 'XAUUSD1' },
+    { symbol: 'XAUUSD1', monitor: true },
+    { symbol: 'XAUUSD1', monitor_enabled: 'true' },
+  ]) {
+    const view = computeMonitoredCapacityView(control, listing, listings, now);
+    assert.equal(view.status, 'paused');
+    assert.equal(view.dataAvailable, false);
+    assert.deepEqual(monitoredCapacityRows([control], listings, now), []);
+  }
+});

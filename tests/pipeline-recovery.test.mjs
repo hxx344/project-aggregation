@@ -26,8 +26,24 @@ const nodeCommand = (source, args = []) => ({ cmd: process.execPath, args: ['-e'
 const quiet = { info() {}, warn() {}, error() {} };
 const commit = 'a'.repeat(40);
 
+// 用底层对象建一个提交：不读写 Git 身份配置，也不要求当前检出含 .git。
+function initGitFixture(directory) {
+  const git = (args, input) => {
+    const result = spawnSync('git', ['-C', directory, ...args], { encoding: 'utf8', input, timeout: 10000 });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return result.stdout.trim();
+  };
+  git(['init', '-q']);
+  const tree = git(['hash-object', '-t', 'tree', '-w', '--stdin'], '');
+  const signature = 'Pipeline Fixture <fixture@example.invalid> 0 +0000';
+  const head = git(['hash-object', '-t', 'commit', '-w', '--stdin'], `tree ${tree}\nauthor ${signature}\ncommitter ${signature}\n\nfixture\n`);
+  git(['update-ref', 'HEAD', head]);
+  return { git, head };
+}
+
 function fixture(t, stages) {
   const directory = temporary(t);
+  const { git } = initGitFixture(directory);
   cpSync(path.join(root, 'deploy/pipeline'), path.join(directory, 'deploy/pipeline'), { recursive: true });
   const profile = {
     schema: 1, description: '隔离流水线失败夹具', toolchain: { node: '>=22.0.0', pnpm: '>=11.0.0' },
@@ -48,7 +64,7 @@ function fixture(t, stages) {
   };
   const state = () => JSON.parse(readFileSync(path.join(directory, '.pipeline/state/dev.json'), 'utf8'));
   const summary = () => JSON.parse(readFileSync(path.join(directory, '.pipeline/runs', state().lastRunId, 'summary.json'), 'utf8'));
-  return { directory, profile, save, run, state, summary, environment };
+  return { directory, profile, save, run, state, summary, environment, git };
 }
 
 function unconfirmedExecutor(f, stage) {
@@ -382,6 +398,27 @@ test('Windows Job 强制清理标记在脱敏和输出交错时仍触发隔离',
     assert.ok(readLock(file).terminationUnconfirmed);
   }
 });
+test('Git 查询内部命令被超时或信号终止时，执行器在解除标记前隔离', async t => {
+  for (const failure of [{ code: 'ETIMEDOUT', signal: 'SIGTERM' }, { signal: 'SIGKILL' }]) {
+    const directory = temporary(t);
+    const file = path.join(directory, 'dev.lock');
+    const lock = acquireLock(file, { runId: 'git-forced' });
+    const preload = `data:text/javascript,${encodeURIComponent([
+      "import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';",
+      `cp.execFileSync = () => { throw Object.assign(new Error('forced'), ${JSON.stringify(failure)}); };`,
+      'syncBuiltinESMExports();',
+    ].join(''))}`;
+    const result = await runCommand({
+      command: { cmd: process.execPath, args: ['--import', preload, path.join(root, 'deploy/pipeline/git-context.mjs')], timeoutMs: 20000 },
+      cwd: directory, commandLock: lock, stageId: 'identity',
+    });
+    assert.equal(result.terminationUnconfirmed, true, result.tail);
+    assert.match(result.terminationReason, /内部子命令/);
+    lock.release();
+    assert.ok(readLock(file).terminationUnconfirmed);
+    assert.throws(() => acquireLock(file, { runId: 'next' }), LockError);
+  }
+});
 test('忽略 TERM 的进程升级 KILL，已发送信号不阻止强杀', { skip: process.platform === 'win32' }, async t => {
   const directory = temporary(t);
   const file = path.join(directory, 'dev.lock');
@@ -596,19 +633,9 @@ test('GitHub origin 解析支持 HTTPS 和 SSH，拒绝其他服务与非法仓�
   }
 });
 
-// 夹具从当前检出取一个已有提交对象；CI 的行为测试在无 .git 的展开目录运行，此时跳过。
-const rootHasGit = spawnSync('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10000 }).status === 0;
-test('CLI 在 Actions 外传入已验证发布身份，Actions 不一致或 origin 无效时拒绝', { skip: !rootHasGit && '需要 Git 检出' }, t => {
+test('CLI 在 Actions 外传入已验证发布身份，Actions 不一致或 origin 无效时拒绝', t => {
   const f = fixture(t, {});
-  const git = args => {
-    const result = spawnSync('git', ['-C', f.directory, ...args], { encoding: 'utf8', timeout: 10000 });
-    assert.equal(result.status, 0, result.stdout + result.stderr);
-    return result.stdout.trim();
-  };
-  // 只取本地已有提交对象，不创建提交，也不改作者身份。
-  git(['init']);
-  git(['fetch', '--no-tags', root, 'HEAD']);
-  git(['update-ref', 'HEAD', 'FETCH_HEAD']);
+  const { git } = f;
   git(['remote', 'add', 'origin', 'git@github.com:hxx344/project-aggregation.git']);
   const current = git(['rev-parse', 'HEAD']);
   const ctx = releaseContext(f.directory);
@@ -821,7 +848,7 @@ test('损坏的现存锁不能作为死持有者自动回收', t => {
 test('死锁回收序列化，竞争者不能同时回收并覆盖新锁', t => {
   const directory = temporary(t);
   const file = path.join(directory, 'dev.lock');
-  writeFileSync(file, JSON.stringify({ pid: 999998, runId: 'dead', startedAt: 'old' }));
+  writeFileSync(file, JSON.stringify({ pid: 999998, runId: 'dead', startedAt: new Date().toISOString() }));
   const stateUrl = pathToFileURL(path.join(root, 'deploy/pipeline/state.mjs')).href;
   const contender = [
     `import {acquireLock,LockError} from ${JSON.stringify(stateUrl)};`,
@@ -830,8 +857,8 @@ test('死锁回收序列化，竞争者不能同时回收并覆盖新锁', t => 
   ].join('');
   const owner = [
     "import fs from 'node:fs'; import {spawnSync} from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';",
-    `const file=${JSON.stringify(file)}; const original=fs.rmSync; let checked=false;`,
-    'fs.rmSync=function(target,...args){if(target===file&&!checked){checked=true;',
+    `const file=${JSON.stringify(file)}; const original=fs.unlinkSync; let checked=false;`,
+    'fs.unlinkSync=function(target,...args){if(target===file&&!checked){checked=true;',
     `const other=spawnSync(process.execPath,['--input-type=module','-e',${JSON.stringify(contender)}],{encoding:'utf8',timeout:5000});`,
     "if(other.status!==4)throw new Error('竞争者没有被回收互斥阻止：'+other.status+other.stderr);",
     '}return original.call(this,target,...args);};syncBuiltinESMExports();',
@@ -844,6 +871,6 @@ test('死锁回收序列化，竞争者不能同时回收并覆盖新锁', t => 
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', owner], { encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.equal(existsSync(file), false);
-  assert.equal(existsSync(`${file}.reclaim`), false);
+  assert.equal(existsSync(`${file}.guard`), false);
 });
 

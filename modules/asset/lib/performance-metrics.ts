@@ -1,5 +1,5 @@
 /** Performance of Beijing daily snapshots, using held assets plus withdrawals. */
-export type PerformancePoint = { date: string; adjusted: number };
+export type PerformancePoint = { date: string; adjusted: number; missingValues?: number };
 
 export type MonthlyPerformance = {
   month: string;
@@ -71,7 +71,7 @@ export function calculateMonthlyPerformance(trendData: readonly PerformancePoint
   }
   return [...byMonth].reverse().map(([month, points]) => {
     const first = points[0], last = points[points.length - 1];
-    const gain = points.length >= 2 ? finite(last.adjusted - first.adjusted) : null;
+    const gain = points.length >= 2 && !first.missingValues && !last.missingValues ? finite(last.adjusted - first.adjusted) : null;
     return {
       month, startValue: first.adjusted, endValue: last.adjusted, gain,
       returnRate: gain !== null && first.adjusted > 0 ? finite(gain / first.adjusted) : null,
@@ -94,7 +94,7 @@ export function calculateAnnualizedReturns(
   const first = days[0], last = days.at(-1);
   const daysSpan = first && last ? daysBetween(first.date, last.date) : 0;
   const hasData = days.length >= 2 && daysSpan > 0;
-  const overallAnnualized = hasData && first.adjusted > 0
+  const overallAnnualized = hasData && !first.missingValues && !last?.missingValues && first.adjusted > 0
     ? finite(((last!.adjusted - first.adjusted) / first.adjusted) / yearFraction(first.date, last!.date)) : null;
   const monthlyAnnualized = monthlyPeriod && monthlyPeriod.snapshotCount >= 2 &&
     monthlyPeriod.daysSpan >= MIN_MONTHLY_SPAN_DAYS && monthlyPeriod.returnRate !== null

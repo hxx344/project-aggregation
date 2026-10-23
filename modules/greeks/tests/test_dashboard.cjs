@@ -194,6 +194,77 @@ test('failed POST never reports a successful summary change', async () => {
   assert.equal(messages.filter(item => item.message.type === 'changed').length, 0);
 });
 
+test('successful HTTP responses must contain JSON before a write is acknowledged', async (t) => {
+  for (const [status, raw] of [[200, '<html>login</html>'], [200, ''], [202, ' \n'], [200, '{"incomplete"']]) {
+    await t.test(`${status} ${JSON.stringify(raw)}`, async () => {
+      const {context, messages, message} = dashboard({embedded: true, request() {
+        return Promise.resolve({ok: true, status, text: async () => raw});
+      }});
+      message({type: 'ready', role: 'host'});
+      await assert.rejects(context.getJson('/api/trading/tasks/one/stop', {method: 'POST'}),
+        {name: 'ProtocolError', status, message: /预期 JSON.*待核对/});
+      assert.equal(messages.filter(item => item.message.type === 'changed').length, 0);
+    });
+  }
+});
+
+test('non-JSON error bodies preserve their HTTP status and useful error text', async () => {
+  const {context} = dashboard({embedded: true, request() {
+    return Promise.resolve({ok: false, status: 503, text: async () => 'upstream temporarily unavailable'});
+  }});
+  await assert.rejects(context.getJson('/api/trading/tasks/one/stop', {method: 'POST'}),
+    {status: 503, message: 'upstream temporarily unavailable'});
+});
+
+test('unknown account metrics show dashes and unavailable bars while real zeros stay valid', async () => {
+  const health = {available: true, margin_mode: 'REGULAR_MARGIN', initial_margin_rate: .5, maintenance_margin_rate: .2,
+    available_balance_usd: 100, margin_balance_usd: 200, total_equity_usd: 300};
+  const {context, element} = dashboard({request(url) {
+    if (url !== '/api/dashboard/account') return Promise.reject(new Error('offline'));
+    return Promise.resolve({ok: true, status: 200, text: async () => JSON.stringify({
+      positions: {items: [], available: true}, logs: {items: []}, executions: {items: []}, health,
+    })});
+  }});
+  await new Promise(setImmediate);
+  assert.equal(element('imRate').textContent, '50.00%');
+  assert.equal(element('imBar').style.width, '50%');
+  health.initial_margin_rate = null;
+  delete health.maintenance_margin_rate;
+  health.available_balance_usd = null;
+  health.margin_balance_usd = null;
+  delete health.total_equity_usd;
+  await context.loadAccount();
+  assert.equal(element('healthContent').style.display, 'grid');
+  assert.equal(element('healthUnavailable').style.display, 'none');
+  for (const id of ['imRate', 'mmRate', 'availableBalance', 'marginBalance', 'totalEquity']) {
+    assert.equal(element(id).textContent, '—');
+  }
+  for (const id of ['imBar', 'mmBar']) {
+    assert.equal(element(id).dataset.available, 'false');
+    assert.equal(element(id).attributes['aria-disabled'], 'true');
+    assert.equal(element(id).attributes['aria-label'], '风险指标不可用');
+    assert.equal(element(id).style.width, '0%');
+  }
+  Object.assign(health, {initial_margin_rate: 0, maintenance_margin_rate: 0, available_balance_usd: 0,
+    margin_balance_usd: 0, total_equity_usd: 0});
+  await context.loadAccount();
+  for (const id of ['imRate', 'mmRate']) assert.equal(element(id).textContent, '0.00%');
+  for (const id of ['availableBalance', 'marginBalance', 'totalEquity']) assert.equal(element(id).textContent, '$0');
+  for (const id of ['imBar', 'mmBar']) {
+    assert.equal(element(id).dataset.available, 'true');
+    assert.equal(element(id).attributes['aria-disabled'], 'false');
+  }
+});
+
+test('unknown portfolio margin details have neutral dashes instead of positive zero risk', () => {
+  const {context, element} = dashboard({embedded: true});
+  context.renderPortfolioMargin({margin_mode: 'PORTFOLIO_MARGIN', portfolio_margin_available: true});
+  assert.match(element('pmDetails').innerHTML, /真实账户 IM<\/span><strong>—<\/strong>/);
+  assert.match(element('pmDetails').innerHTML, /本次开仓 IM 增量<\/span><strong class="muted">—<\/strong>/);
+  assert.match(element('pmDetails').innerHTML, /最大压力场景<\/span><strong>— \/ IV —<\/strong>/);
+  assert.doesNotMatch(element('pmDetails').innerHTML, /\$0|class="profit"/);
+});
+
 test('position chart preserves payoff but removes stale spot, and clears closed positions', () => {
   const {context, element} = dashboard();
   context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT',side:'Buy',size:.1,avg_price:100,unrealised_pnl:3}];
@@ -1253,17 +1324,22 @@ test('stop remains available during execution and requests only one stop without
 });
 
 test('ambiguous stop failures wait for a fresh running snapshot before an idempotent retry', async (t) => {
-  for (const failure of ['network', '503']) await t.test(failure, async () => {
+  for (const failure of ['network', '503', 'non-json', 'empty']) await t.test(failure, async () => {
     let attempts = 0, finish;
     const page = dashboard({embedded:true, request(url) {
       assert.equal(url, '/api/trading/tasks/execution-one/stop');
-      if (++attempts === 1) return failure === 'network' ? Promise.reject(new Error('connection lost'))
-        : Promise.resolve({ok:false, status:503, text:async () => JSON.stringify({detail:'unavailable'})});
+      if (++attempts === 1) {
+        if (failure === 'network') return Promise.reject(new Error('connection lost'));
+        if (failure === '503') return Promise.resolve({ok:false, status:503, text:async () => JSON.stringify({detail:'unavailable'})});
+        return Promise.resolve({ok:true, status:200, text:async () => failure === 'empty' ? '' : '<html>proxy error</html>'});
+      }
       return new Promise(resolve => { finish = resolve; });
     }});
     const running = () => ({items:[], groups:[executionGroup()], execution_active:true});
     page.context.renderOrders(running());
     await page.context.stopExecution('execution-one');
+    assert.match(page.element('noticeText').textContent, /停止结果待核对/);
+    assert.doesNotMatch(page.element('noticeText').textContent, /停止请求已发送/);
     assert.match(page.element('activeExecutions').innerHTML, /data-stop="execution-one" disabled>停止请求待核对/);
     await page.context.stopExecution('execution-one');
     assert.equal(attempts, 1, 'failed write alone does not authorize a retry');

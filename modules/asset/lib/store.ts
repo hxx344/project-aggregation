@@ -14,6 +14,7 @@ import { readSnapshotHistory } from './snapshot-history';
 import { hubPositionsService } from './hub-positions';
 import { yuanQuote } from './fx';
 import { mapConcurrent, settleIndependent } from './concurrency';
+import { knownAssetValue, snapshotValues, refreshMarketAsset, withMarketQuantity } from './asset-values';
 import type { Asset, Ledger, Connection, Withdrawal, FxStatus, AsterAccount } from './types';
 
 export const chinaDate=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});
@@ -38,7 +39,7 @@ async function readLedger(owner:string,includeHistory:boolean):Promise<Ledger>{
   ]);
   const source=settings.results.find(s=>s.key==='source-ledger');
   const ledger=seedLedger(source?JSON.parse(source.value):readSource(),includeHistory);
-  ledger.assets=rows.results.map(r=>JSON.parse(r.data) as Asset).sort((a,b)=>Number(a.id.slice(4))-Number(b.id.slice(4)));
+  ledger.assets=rows.results.map(r=>{const asset=JSON.parse(r.data) as Asset;return {...asset,value:knownAssetValue(asset)};}).sort((a,b)=>Number(a.id.slice(4))-Number(b.id.slice(4)));
   ledger.fx=Number(settings.results.find(s=>s.key==='fx')?.value??ledger.fx);
   ledger.fxStatus=JSON.parse(settings.results.find(s=>s.key==='fx-status')?.value??'null')??ledger.fxStatus;
   for(const name of ['bybit','aster','binance','okx','gate','variational'] as const){
@@ -59,11 +60,10 @@ async function saveAsset(owner:string,a:Asset){await db().prepare('UPDATE assets
 async function setting(owner:string,key:string,value:unknown){await db().prepare('INSERT INTO settings(owner,key,value) VALUES(?,?,?) ON CONFLICT(owner,key) DO UPDATE SET value=excluded.value').bind(owner,key,typeof value==='string'?value:JSON.stringify(value)).run();}
 async function snapshot(owner:string){
   const ledger=await getCurrentLedger(owner);
-  const total=ledger.assets.reduce((s,a)=>s+(a.value??0),0), date=chinaDate();
-  const partial=!!ledger.fxStatus.error||ledger.assets.some(a=>a.mode!=='manual'&&(!!a.error||Date.now()-new Date(a.updatedAt).getTime()>900000));
+  const {total,partial,missingValues}=snapshotValues(ledger.assets,ledger.fxStatus), date=chinaDate();
   // Holdings come from the positions cache only, so writing a snapshot never waits on exchange reads.
   const scopes=await hubPositionsService.peek(db(),owner).catch(()=>null), updatedAt=new Date().toISOString();
-  const data={id:'daily-'+date,date,total,fx:ledger.fx,fxStatus:ledger.fxStatus,cny:total*ledger.fx,future:false,difference:0,partial,withdrawn:embeddedWithdrawals(ledger.assets),updatedAt,assets:ledger.assets,...(scopes?{positions:{capturedAt:updatedAt,scopes}}:{})};
+  const data={id:'daily-'+date,date,total,fx:ledger.fx,fxStatus:ledger.fxStatus,cny:total*ledger.fx,future:false,difference:0,partial,missingValues,withdrawn:embeddedWithdrawals(ledger.assets),updatedAt,assets:ledger.assets,...(scopes?{positions:{capturedAt:updatedAt,scopes}}:{})};
   await db().prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?) ON CONFLICT(owner,date) DO UPDATE SET data=excluded.data').bind(owner,date,JSON.stringify(data)).run();
 }
 export async function lock(owner:string){
@@ -79,8 +79,9 @@ export async function editAsset(owner:string,input:{id:string,quantity:number,pr
     if(!asset)throw new Error('未找到该资产');
     if(asset.mode==='bybit'||asset.mode==='aster'||asset.mode==='binance'||asset.mode==='okx'||asset.mode==='gate'||asset.mode==='variational')throw new Error('交易所资产由只读接口维护');
     const price=asset.mode==='market'?asset.price:input.price;
-    const status=asset.mode==='manual'?'手动估值':asset.status;
-    const next={...asset,quantity:input.quantity,price,value:editValue(input.quantity,price),status};
+    const edited=asset.mode==='market'?withMarketQuantity(asset,input.quantity):asset;
+    const status=asset.mode==='manual'?'手动估值':edited.status;
+    const next={...edited,quantity:input.quantity,price,value:editValue(input.quantity,price),status};
     if(asset.mode==='manual')next.updatedAt=new Date().toISOString();
     await saveAsset(owner,next);await snapshot(owner);
     return getLedger(owner);
@@ -228,7 +229,7 @@ export async function refresh(owner:string){
       const prices=marketResult.status==='fulfilled'?marketResult.value:undefined;
       const marketError=marketResult.status==='rejected'?(marketResult.reason instanceof Error?marketResult.reason.message:'无法获取行情'):undefined;
       const virtual=ledger.assets.find(a=>a.mode==='market')!;
-      if(prices){await saveAsset(owner,{...virtual,price:prices.VIRTUAL.price,value:(virtual.quantity??0)*prices.VIRTUAL.price,updatedAt:prices.VIRTUAL.at,status:prices.VIRTUAL.source+' · 实时单价',error:undefined});}
+      if(prices){await saveAsset(owner,refreshMarketAsset(virtual,prices.VIRTUAL));}
       else await saveAsset(owner,{...virtual,status:'行情失败 · 保留旧值',error:marketError});
       const walletSync=async(exchange:'bybit'|'binance')=>{
         const row=stored.results.find(row=>row.exchange===exchange);

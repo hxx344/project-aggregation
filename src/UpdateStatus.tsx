@@ -47,7 +47,7 @@ function ModuleRow({ module, unfinishedJob }: { module: UpdateModule; unfinished
     <div className="update-module-heading"><h3>{module.name}</h3><span className={`update-tag ${unconfirmed ? 'unavailable' : aligned ? '' : module.state}`}>{label}</span></div>
     <div className="update-versions"><div><span>当前版本</span><Version version={module.currentVersion} commit={module.currentCommit} /></div>{module.latestVersion || module.latestCommit ? <><ArrowRight size={16} aria-hidden="true" /><div><span>最新正式版</span><Version version={module.latestVersion} commit={module.latestCommit} /></div></> : null}</div>
     {module.reason ? <p className="update-module-note">{module.reason}</p> : null}
-    {module.latestVersion || module.latestCommit ? module.releaseNotes ? <details className="update-release-notes"><summary>该版本更新内容</summary><p>{module.releaseNotes}</p></details> : <p className="update-module-note">该版本未提供更新内容。</p> : null}
+    {module.latestVersion || module.latestCommit ? module.releaseNotes ? <details className="update-release-notes"><summary>更新内容</summary><p>{module.releaseNotes}</p></details> : <p className="update-module-note">该版本未提供更新内容。</p> : null}
   </li>;
 }
 function JobTimings({ job }: { job: UpdateJob }) {

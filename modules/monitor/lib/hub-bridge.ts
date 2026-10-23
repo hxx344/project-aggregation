@@ -3,17 +3,21 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import { readActivity } from './read-activity.ts';
 import { perpetualChartUrl } from './perpetual-chart-state.ts';
+import { createHubRequester } from './hub-requester.ts';
 
 import { cleanHubQuery, HUB_QUERY_KEYS, type HubQuery } from '../../../server/hub-navigation.mjs';
 export { cleanHubQuery, HUB_QUERY_KEYS };
 export type { HubQuery };
 export type HubProject = 'monitor' | 'crossex';
 const envelope = { channel: 'project-hub', version: 1 } as const;
-export const MODULE_CAPABILITIES = ['activity', 'navigate', 'changed', 'positions', 'open-trading'] as const;
+export const MODULE_CAPABILITIES = ['activity', 'navigate', 'changed', 'positions', 'fills', 'open-trading'] as const;
 let targetOrigin = '', connected = false, hostCapabilities: ReadonlySet<string> = new Set();
 const hubListeners = new Set<() => void>();
 const positionListeners = new Set<(value: unknown) => void>();
+const fillListeners = new Set<(value: unknown) => void>();
 const hostReadyListeners = new Set<() => void>();
+export function subscribeHubFills(listener: (value: unknown) => void) { fillListeners.add(listener); return () => { fillListeners.delete(listener); }; }
+export function subscribeHostReady(listener: () => void) { hostReadyListeners.add(listener); return () => { hostReadyListeners.delete(listener); }; }
 let hubSnapshot = '0|';
 function notifyHub() { hubSnapshot = `${connected ? 1 : 0}|${[...hostCapabilities].sort().join(',')}`; hubListeners.forEach(listener => listener()); }
 export function trustedHubOrigin(location: Pick<Location, 'hostname' | 'protocol' | 'port'>, embedded: boolean) {
@@ -30,7 +34,7 @@ export function hostCapabilityList(value: unknown): string[] {
   return Array.isArray(value) ? [...new Set(value.filter((item): item is string => typeof item === 'string' && /^[a-z-]{1,40}$/.test(item)))].slice(0, 32) : [];
 }
 /** Old hosts never declared positions; modules must stay silent rather than guess. */
-export function canUseHostCapability(isConnected: boolean, capabilities: Iterable<string>, capability: 'positions' | 'open-trading') {
+export function canUseHostCapability(isConnected: boolean, capabilities: Iterable<string>, capability: 'positions' | 'fills' | 'open-trading') {
   return isConnected && new Set(capabilities).has(capability);
 }
 
@@ -45,6 +49,7 @@ export function hubSelectionUrl(current: string, projectId: HubProject, query: H
   return url.href;
 }
 function post(value: object) { if (connected && targetOrigin) window.parent.postMessage({ ...envelope, ...value }, targetOrigin); }
+export const postHubMessage = post;
 export function hubChanged() { post({ type: 'changed', scope: 'summary' }); }
 export function hubNavigate(projectId: HubProject, query: HubQuery) { const clean = cleanHubQuery(query); if (clean) post({ type: 'navigate', projectId, query: clean }); }
 
@@ -151,30 +156,14 @@ export function createPositionsRequester({ send, onReply, timeoutMs = POSITIONS_
   cancel?: (timer: never) => void;
   createId?: () => string;
 }) {
-  let latest: string | null = null, timer: unknown = null, asked: { market: PositionsMarket; symbols: string[] } | null = null;
-  const clear = () => { if (timer !== null) cancel(timer as never); timer = null; };
+  const requester = createHubRequester<{ market: PositionsMarket; symbols: string[] }, HubPositionsReply>({
+    onReply, timeoutMs, schedule, cancel, createId, parse: parsePositionsReply, market: query => query.market,
+    send: (query, requestId) => send({ type: 'positions-request', requestId, ...query }),
+    timeout: (query, requestId) => ({ requestId, market: query.market, status: 'unavailable', generatedAt: null, incomplete: false, items: [], timedOut: true }),
+  });
   return {
-    request(market: PositionsMarket, symbols: string[]) {
-      const clean = cleanPositionsRequest(market, symbols), requestId = createId();
-      if (!clean || !REQUEST_ID.test(requestId)) return null;
-      clear(); latest = requestId; asked = clean;
-      timer = schedule(() => {
-        if (latest !== requestId) return;
-        latest = null; timer = null;
-        onReply({ requestId, market: clean.market, status: 'unavailable', generatedAt: null, incomplete: false, items: [], timedOut: true });
-      }, timeoutMs);
-      send({ type: 'positions-request', requestId, market: clean.market, symbols: clean.symbols });
-      return requestId;
-    },
-    receive(value: unknown) {
-      const reply = parsePositionsReply(value);
-      if (!reply || latest === null || reply.requestId !== latest) return false;
-      latest = null; clear(); onReply(reply);
-      return true;
-    },
-    /** Asks again only while a request is unanswered; a host that revalidated the frame drops replies to earlier requests. */
-    retry() { return latest !== null && asked ? this.request(asked.market, asked.symbols) : null; },
-    dispose() { latest = null; clear(); },
+    ...requester,
+    request: (market: PositionsMarket, symbols: string[]) => requester.request(cleanPositionsRequest(market, symbols)),
   };
 }
 export function hubOpenTrading(market: PositionsMarket) {
@@ -188,7 +177,7 @@ export function useHubHost() {
   const [embeddedFlag, flag, list] = snapshot.split('|');
   const embedded = embeddedFlag === '1';
   const capabilities = list ? list.split(',') : [];
-  return { embedded, connected: flag === '1', positions: canUseHostCapability(flag === '1', capabilities, 'positions'), openTrading: canUseHostCapability(flag === '1', capabilities, 'open-trading') };
+  return { embedded, connected: flag === '1', positions: canUseHostCapability(flag === '1', capabilities, 'positions'), fills: canUseHostCapability(flag === '1', capabilities, 'fills'), openTrading: canUseHostCapability(flag === '1', capabilities, 'open-trading') };
 }
 export type HubPositionsView = {
   status: 'standalone' | 'connecting' | 'unsupported' | 'empty' | 'loading' | HubPositionsReply['status'];
@@ -258,6 +247,7 @@ export function useHubBridge(projectId: HubProject) {
         const query = cleanHubQuery(value.query); if (!query) return;
         window.history.replaceState(null, '', hubSelectionUrl(window.location.href, projectId, query)); window.dispatchEvent(new PopStateEvent('popstate'));
       } else if (connected && value.type === 'positions' && hostCapabilities.has('positions')) positionListeners.forEach(listener => listener(value));
+      else if (connected && value.type === 'fills' && hostCapabilities.has('fills')) fillListeners.forEach(listener => listener(value));
     };
     window.addEventListener('message', message); document.addEventListener('visibilitychange', update);
     const stopNetwork = observeNetworkActivity(update);

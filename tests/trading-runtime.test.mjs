@@ -566,3 +566,29 @@ test('PnL never treats missing funding coverage as zero or combines position sna
   f.advance(60000); await f.app.trading.refresh({ force: true });
   assert.equal(f.app.trading.state().pnl.latest.unrealizedPnl, null);
 });
+
+test('视图重建失败与恢复经真实 HTTP 状态返回，并使用服务日志入口', async t => {
+  const logs = [];
+  const f = await fixture(t, { logger: { info() {}, warn() {}, error: (record, message) => logs.push({ record, message }) } });
+  await f.login(); await f.connect('binance');
+  const before = (await f.request('/api/trading')).data.cache.builtAt;
+  const execute = sql => {
+    const db = new DatabaseSync(path.join(f.dataDir, 'hub.sqlite'));
+    try { db.exec(sql); } finally { db.close(); }
+  };
+  execute("CREATE TRIGGER reject_view BEFORE INSERT ON trading_views_v2 BEGIN SELECT RAISE(FAIL, 'private SQL diagnostic'); END");
+  f.advance(6000); await f.app.trading.refresh({ force: true });
+  const failed = await f.request('/api/trading');
+  assert.equal(failed.status, 200);
+  assert.equal(failed.data.cache.builtAt, before);
+  assert.equal(failed.data.cache.rebuilding, true);
+  assert.deepEqual(failed.data.cache.error, { code: 'view_rebuild_failed', message: '缓存更新失败，已保留上次数据，将自动重试。', at: stamp(f.now) });
+  assert.ok(logs.some(({ record }) => record.type === 'trading_view_rebuild_failed' && record.category === 'ERR_SQLITE_ERROR'));
+  assert.doesNotMatch(JSON.stringify([logs, failed.data]), /private SQL|RAISE|INSERT INTO/);
+  execute('DROP TRIGGER reject_view');
+  f.advance(750); await f.app.trading.refresh();
+  const recovered = await f.request('/api/trading');
+  assert.equal(recovered.data.cache.error, null);
+  assert.equal(recovered.data.cache.rebuilding, false);
+  assert.equal(recovered.data.cache.builtAt, stamp(f.now));
+});

@@ -5,6 +5,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Bell, ChevronDown, Save, Send } from "lucide-react";
 import type { NotificationView } from "../lib/notification-types";
 import { startActivityPolling } from "../lib/polling";
+import { loadSettings } from "../lib/settings-load";
 
 const endpoint = "/api/notifications/feishu";
 export default function NotificationSettings({ active = true }: { active?: boolean }) {
@@ -31,17 +32,25 @@ export default function NotificationSettings({ active = true }: { active?: boole
   };
   useEffect(() => {
     const controller = new AbortController();
+    let latestRequest = 0;
     const load = async (signal: AbortSignal) => {
       if (busyRef.current) return;
-      const requestGeneration = generation.current;
-      try {
-        const response = await fetch(endpoint, { cache: "no-store", signal: AbortSignal.any([controller.signal, signal, AbortSignal.timeout(15_000)]) });
-        if (!response.ok) throw new Error();
-        const next: NotificationView = await response.json();
-        if (controller.signal.aborted || signal.aborted || generation.current !== requestGeneration || (next.available && next.revision < latestRevision.current)) return;
-        setLoadError(""); setView(next);
-        if (next.available) { latestRevision.current = next.revision; if (!dirtyRef.current) setRevision(next.revision); }
-      } catch { if (!controller.signal.aborted && !signal.aborted) setLoadError("无法连接统一告警设置，请检查后台服务。"); }
+      const requestGeneration = generation.current, request = ++latestRequest;
+      await loadSettings({
+        signal: AbortSignal.any([controller.signal, signal]),
+        load: async signal => {
+          const response = await fetch(endpoint, { cache: "no-store", signal });
+          if (!response.ok) throw new Error();
+          return await response.json() as NotificationView;
+        },
+        isCurrent: () => !controller.signal.aborted && generation.current === requestGeneration && request === latestRequest,
+        onData: next => {
+          if (next.available && next.revision < latestRevision.current) return;
+          setLoadError(""); setView(next);
+          if (next.available) { latestRevision.current = next.revision; if (!dirtyRef.current) setRevision(next.revision); }
+        },
+        onError: timedOut => setLoadError(timedOut ? "读取统一告警设置超时，现有配置与草稿已保留。请检查后台服务。" : "无法连接统一告警设置，请检查后台服务。"),
+      });
     };
     const show = () => { setOpen(true); document.getElementById("shared-feishu")?.scrollIntoView({ block: "nearest", behavior: "instant" }); };
     const unload = (event: BeforeUnloadEvent) => { if (dirtyRef.current) { event.preventDefault(); event.returnValue = ""; } };

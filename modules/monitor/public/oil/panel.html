@@ -22,9 +22,15 @@
                 <article class="metric"><div class="metric-label"><span><i class="legend-dot wti"></i>WTI 原油</span><span class="ticker">CLUSDT</span></div><div class="metric-number" id="latest-wti"></div><div class="metric-foot"><a href="https://www.binance.com/en/futures/CLUSDT" target="_blank" rel="noreferrer">Binance 永续 · 标记价格 ↗</a></div></article>
                 <article class="metric"><div class="metric-label"><span>共同区间价差变化</span><span class="ticker">15 MIN</span></div><div class="metric-number" id="ytd-change"></div><div class="metric-foot" id="ytd-reference"></div></article>
               </section>
-              <div class="chart-area" id="chart-area"><span class="axis-unit" id="chart-axis-unit">%</span><svg id="main-chart" viewBox="0 0 1000 340" role="img" aria-label="布伦特与WTI原油15分钟K线收盘价差走势"></svg><div class="chart-tooltip" id="chart-tooltip" hidden></div><input id="chart-cursor" class="chart-cursor" type="range" min="0" max="1" value="1" aria-label="按15分钟查看图表数值" /></div>
+              <div class="chart-area" id="chart-area"><span class="axis-unit" id="chart-axis-unit">%</span><svg id="main-chart" viewBox="0 0 1000 340" role="group" aria-label="布伦特与WTI原油15分钟K线收盘价差走势"></svg><div class="chart-tooltip" id="chart-tooltip" hidden></div><div class="chart-tooltip oil-trade-tooltip" id="trade-tooltip" role="tooltip" hidden></div><input id="chart-cursor" class="chart-cursor" type="range" min="0" max="1" value="1" aria-label="按15分钟查看图表数值" /></div>
               <div class="chart-footer"><span id="chart-hint">在图表上移动查看每15分钟的收盘价格；键盘 Tab 后可用方向键查看。</span><span id="observation-count"></span></div>
               <p class="average-method" id="average-method"></p>
+              <section id="oil-trades" class="oil-trades" aria-labelledby="oil-trades-title">
+                <h3 id="oil-trades-title">套利成交</h3>
+                <p id="oil-trades-status" role="status">读取中…</p>
+                <div id="oil-trades-list" class="oil-trades-list" aria-label="当前区间套利成交"></div>
+                <div id="oil-trade-details" class="oil-trade-details" tabindex="0" aria-label="套利成交明细" hidden></div>
+              </section>
             </div>
             <aside class="range-summary"><div class="summary-heading"><h3>区间速览</h3><span id="summary-range">近 1 周</span></div><div class="summary-average"><p id="average-label">最新 · 1 周滚动均值</p><div id="average-spread"></div><span>%</span><p id="average-coverage"></p></div><div class="summary-extremes"><div><span>最高价差</span><strong id="max-spread"></strong><small id="max-date"></small></div><div><span>最低价差</span><strong id="min-spread"></strong><small id="min-date"></small></div></div><div class="range-track" aria-hidden="true"><span id="range-marker"></span></div><p class="range-description" id="range-description"></p><div class="summary-note"><span class="note-symbol" aria-hidden="true">↗</span><p>价差为正，表示布伦特较 WTI 溢价；价差上升，表示两者价差扩大。</p></div></aside>
           </div>

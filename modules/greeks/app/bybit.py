@@ -190,7 +190,10 @@ class BybitClient:
 
     async def wallet_balance(self) -> dict[str, Any]:
         result = await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT,USDC"}, private=True)
-        return (result.get("list") or [{}])[0]
+        rows = result.get("list")
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict) or not rows[0]:
+            raise BybitError("Wallet balance response is empty or invalid")
+        return rows[0]
 
     async def portfolio_margin(self, base_coin: str = "BTC") -> dict[str, Any]:
         return await self._request("GET", "/v5/asset/portfolio-margin", {"baseCoin": base_coin}, private=True)

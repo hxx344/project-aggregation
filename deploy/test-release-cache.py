@@ -76,6 +76,16 @@ class FakeNetwork:
             base = 'https://api.github.com/repos/hxx344/' + repository + '/'
             if url == base + 'releases/latest':
                 return encoded(entry['releases'][entry['latest']]['metadata'])
+            if url == base + f'releases?per_page={releases.HISTORY_PAGE}' and 'history' in entry:
+                if 'historyError' in entry:
+                    raise entry['historyError']
+                return encoded(entry['history'])
+            if url.startswith(base + 'releases/tags/'):
+                tagged = entry.get('tags', {}).get(url.removeprefix(base + 'releases/tags/'))
+                if tagged is None:
+                    raise releases.ReleaseError('GitHub API未找到正式版本或发布文件（HTTP 404）',
+                                                transient=entry.get('tagFailureTransient', False))
+                return encoded(tagged)
             if url.startswith(base + 'compare/'):
                 return encoded(self.comparison)
             for commit, value in entry['releases'].items():
@@ -701,6 +711,176 @@ class TransportTests(unittest.TestCase):
         response.url = 'https://attacker.example/release'
         with self.assertRaises(releases.ReleaseError):
             network.redirect('https://github.com/hxx344/project-aggregation/releases/latest')
+
+
+def listed(commit, created, body='', draft=False, prerelease=False, published=None):
+    return {'tag_name': 'deploy-' + commit, 'draft': draft, 'prerelease': prerelease, 'body': body,
+            'created_at': created, 'published_at': published or created}
+
+
+class ReleaseHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.module = registry.BY_ID['hub']
+        self.network = FakeNetwork([self.module])
+        self.clock = 1800000000.0
+        self.reader = releases.Releases(self.network, arch='linux-x64', clock=lambda: self.clock)
+        self.entry = self.network.values[self.module.repository]
+        self.release = {'commit': NEW}
+
+    def history_requests(self):
+        return sum('/releases?per_page=' in url for url, _ in self.network.calls)
+
+    def test_notes_cover_every_published_release_after_the_installed_one(self):
+        middle, newer, draft, older = 'd' * 40, 'e' * 40, 'f' * 40, '0' * 40
+        self.entry['history'] = [
+            listed(middle, '2026-10-22T08:00:00Z', '- 中间候选版本的修复', prerelease=True),
+            listed(newer, '2026-10-23T08:00:00Z', '- 尚未发布为正式版'),
+            listed(NEW, '2026-10-22T20:00:00Z', '- 最新正式版的改动', published='2026-10-22T17:30:00Z'),
+            listed(draft, '2026-10-22T09:00:00Z', '- 草稿不显示', draft=True),
+            listed(OLD, '2026-10-21T08:00:00Z', '- 本机已安装的版本'),
+            listed(older, '2026-10-20T08:00:00Z', '- 更早的版本'),
+            {'tag_name': 'v1.0.0', 'draft': False, 'created_at': '2026-10-22T10:00:00Z', 'published_at': '2026-10-22T10:00:00Z'},
+            'not a release',
+        ]
+        notes = self.reader.notes_since(self.module, OLD, self.release)
+        self.assertEqual(notes, '本次更新包含 2 个版本，按从新到旧列出：\n\n'
+                                f'版本 {NEW[:12]}（2026-10-23）\n- 最新正式版的改动\n\n'
+                                f'版本 {middle[:12]}（2026-10-22）\n- 中间候选版本的修复')
+        self.assertEqual(self.history_requests(), 1)
+
+    def test_one_release_or_unplaceable_install_keeps_latest_notes(self):
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'), listed(OLD, '2026-10-21T08:00:00Z')]
+        self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))
+        self.assertIsNone(self.reader.notes_since(self.module, NEW, self.release))
+        # The installed commit has no release and the latest one is not listed yet.
+        self.assertIsNone(self.reader.notes_since(self.module, NEXT, self.release))
+        self.entry['history'] = [listed(OLD, '2026-10-21T08:00:00Z')]
+        self.assertIsNone(self.reader.notes_since(self.module, 'd' * 40, self.release))
+
+    def test_transient_tag_lookup_failure_is_retried_after_a_pause(self):
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'), listed('d' * 40, '2026-10-22T10:00:00Z', '- 中间')]
+        self.entry['tagFailureTransient'] = True
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.notes_since(self.module, OLD, self.release)
+        self.entry['tagFailureTransient'] = False
+        self.entry['tags'] = {'deploy-' + OLD: listed(OLD, '2026-10-01T08:00:00Z')}
+        self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))
+        self.assertEqual(self.history_requests(), 1)
+        self.clock += releases.HISTORY_RETRY_DELAY
+        self.assertTrue(self.reader.notes_since(self.module, OLD, self.release).startswith('本次更新包含 2 个版本'))
+        self.assertEqual(self.history_requests(), 2)
+
+    def test_server_retry_deadline_pauses_history_reads(self):
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'), listed('d' * 40, '2026-10-22T10:00:00Z', '- 中间'),
+                                 listed(OLD, '2026-10-21T08:00:00Z')]
+        self.entry['historyError'] = releases.ReleaseError('GitHub API匿名请求额度已用尽（HTTP 403）',
+                                                          retry_at=releases.time.time() + 3600, transient=True)
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.notes_since(self.module, OLD, self.release)
+        del self.entry['historyError']
+        self.clock += releases.HISTORY_RETRY_DELAY
+        self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))
+        self.assertEqual(self.history_requests(), 1)
+        self.clock += 3600
+        self.assertIn('- 中间', self.reader.notes_since(self.module, OLD, self.release))
+        self.assertEqual(self.history_requests(), 2)
+
+    def test_compare_failures_and_too_many_same_second_releases_pause_reads(self):
+        middle = 'd' * 40
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'), listed(middle, '2026-10-21T08:00:00Z', '- 同秒中间'),
+                                 listed(OLD, '2026-10-21T08:00:00Z')]
+        self.network.failures.add((self.reader.api(self.module, f'compare/{OLD}...{middle}'), 'GET'))
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.notes_since(self.module, OLD, self.release)
+        self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))
+        self.assertEqual(self.history_requests(), 1)
+        self.network.failures.clear()
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新')] + [
+            listed(format(number, 'x') * 40, '2026-10-21T08:00:00Z', f'- 同秒 {number}') for number in range(1, 7)
+        ] + [listed(OLD, '2026-10-21T08:00:00Z')]
+        self.reader = releases.Releases(self.network, arch='linux-x64', clock=lambda: self.clock)
+        self.network.calls.clear()
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.notes_since(self.module, OLD, self.release)
+        self.assertEqual(self.network.counts()['compare'], releases.MAX_HISTORY_COMPARES)
+
+    def test_history_worker_queues_at_most_one_read(self):
+        started, finished = threading.Event(), threading.Event()
+        def slow(*args):
+            started.set()
+            finished.wait(2)
+            return 'combined'
+        with patch.object(self.reader, 'notes_since', side_effect=slow) as reading:
+            first = self.reader.start_notes(self.module, OLD, self.release)
+            self.assertTrue(started.wait(2))
+            self.assertIs(self.reader.start_notes(self.module, OLD, self.release), first)
+            self.assertIsNone(self.reader.start_notes(self.module, NEXT, self.release))
+            finished.set()
+            self.assertEqual(first.result(2), 'combined')
+            self.assertEqual(self.reader.start_notes(self.module, NEXT, self.release).result(2), 'combined')
+        self.assertEqual(reading.call_count, 2)
+    def test_releases_created_in_the_same_second_are_ordered_by_history(self):
+        middle, candidate = 'd' * 40, 'e' * 40
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'),
+                                 listed(candidate, '2026-10-22T20:00:00Z', '- 同秒候选'),
+                                 listed(middle, '2026-10-21T08:00:00Z', '- 同秒中间'),
+                                 listed(OLD, '2026-10-21T08:00:00Z')]
+        notes = self.reader.notes_since(self.module, OLD, self.release)
+        self.assertTrue(notes.startswith(f'本次更新包含 3 个版本，按从新到旧列出：\n\n版本 {NEW[:12]}'))
+        self.assertIn('- 同秒候选', notes)
+        self.assertIn('- 同秒中间', notes)
+        self.network.comparison = {'status': 'behind'}
+        self.reader = releases.Releases(self.network, arch='linux-x64', clock=lambda: self.clock)
+        self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))
+    def test_install_beyond_the_listed_page_is_placed_by_its_tag(self):
+        middle, other = 'd' * 40, 'e' * 40
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'),
+                                 listed(middle, '2026-10-22T10:00:00Z', '- 中间'),
+                                 listed(other, '2026-10-21T10:00:00Z', '- 较早')]
+        self.entry['tags'] = {'deploy-' + OLD: dict(listed(OLD, '2026-10-01T08:00:00Z'), id=7)}
+        with patch.object(releases, 'HISTORY_PAGE', 3):
+            notes = self.reader.notes_since(self.module, OLD, self.release)
+        self.assertTrue(notes.startswith('本次更新包含至少 3 个版本'))
+        self.assertTrue(notes.endswith('另有更多更早版本的更新内容未显示，可在 GitHub 发布页查看。'))
+        self.reader = releases.Releases(self.network, arch='linux-x64', clock=lambda: self.clock)
+        notes = self.reader.notes_since(self.module, OLD, self.release)
+        self.assertTrue(notes.startswith('本次更新包含 3 个版本'))
+        self.assertNotIn('另有', notes)
+
+    def test_combined_notes_stay_within_the_public_limit(self):
+        commits = [format(number, 'x') * 40 for number in range(10)]
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '新' * 1000)] + [
+            listed(commit, f'2026-10-22T{10 + number:02d}:00:00Z', f'- 版本 {number}' + '。' * 300)
+            for number, commit in enumerate(commits[1:])] + [listed(OLD, '2026-10-01T08:00:00Z')]
+        notes = self.reader.notes_since(self.module, OLD, self.release)
+        self.assertLessEqual(len(notes.encode('utf-8')), releases.MAX_RELEASE_NOTES)
+        self.assertTrue(notes.startswith('本次更新包含 10 个版本'))
+        self.assertIn('新' * 399 + '…', notes)
+        self.assertNotIn('新' * 400, notes)
+        self.assertIn('- 版本 8', notes)
+        self.assertNotIn('- 版本 0', notes)
+        self.assertRegex(notes, r'另有 \d+ 个更早版本的更新内容未显示')
+
+    def test_history_is_cached_for_the_release_ttl_and_failures_pause_reads(self):
+        self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'),
+                                 listed('d' * 40, '2026-10-22T10:00:00Z', '- 中间'), listed(OLD, '2026-10-21T08:00:00Z')]
+        first = self.reader.notes_since(self.module, OLD, self.release)
+        self.entry['history'][0]['body'] = '- 说明已修订'
+        self.assertEqual(self.reader.notes_since(self.module, OLD, self.release), first)
+        self.assertEqual(self.history_requests(), 1)
+        self.clock += releases.RELEASE_CACHE_TTL
+        self.assertIn('- 说明已修订', self.reader.notes_since(self.module, OLD, self.release))
+        self.assertEqual(self.history_requests(), 2)
+        self.clock += releases.RELEASE_CACHE_TTL
+        self.entry['history'] = {'message': 'not a list'}
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.notes_since(self.module, OLD, self.release)
+        self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))
+        self.assertEqual(self.history_requests(), 3)
+        self.clock += releases.HISTORY_RETRY_DELAY
+        with self.assertRaises(releases.ReleaseError):
+            self.reader.notes_since(self.module, OLD, self.release)
+        self.assertEqual(self.history_requests(), 4)
 
 
 if __name__ == '__main__':

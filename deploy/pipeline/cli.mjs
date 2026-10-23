@@ -94,12 +94,15 @@ function parseArgs(argv) {
   return options;
 }
 
-async function gitContext(root, commandLock) {
+async function readGitContext(root, commandLock) {
   const result = await runCommand({
     command: { cmd: process.execPath, args: [fileURLToPath(new URL('./git-context.mjs', import.meta.url))] },
     cwd: root, commandLock, stageId: 'identity', timeoutMs: 60000,
   });
-  if (result.code !== 0 || result.timedOut || result.terminationUnconfirmed) throw new CommandError('Git 身份查询失败', result);
+  if (result.code !== 0 || result.timedOut || result.terminationUnconfirmed) {
+    const reason = result.tail.split(/\r?\n/).filter(Boolean).at(-1) ?? '';
+    throw new CommandError(`Git 身份查询失败${reason ? `：${reason}` : ''}`, result);
+  }
   return JSON.parse(result.tail);
 }
 
@@ -123,7 +126,7 @@ function createRunId(git) {
 async function createContext(root, options, { runId, state, commandLock }) {
   const profile = loadProfile(root, options.env);
   const resolved = resolveConfig(profile, { env: process.env, fileValues: readEnvFile(root, options.env) });
-  const git = await gitContext(root, commandLock);
+  const git = await readGitContext(root, commandLock);
   const toolchain = {
     node: process.versions.node,
     pnpm: await pnpmVersion(commandLock),
@@ -200,7 +203,7 @@ function summarise(plan, results) {
 async function commandPlan(root, options, commandLock) {
   const profile = loadProfile(root, options.env);
   const resolved = resolveConfig(profile, { env: process.env, fileValues: readEnvFile(root, options.env) });
-  const git = await gitContext(root, commandLock);
+  const git = await readGitContext(root, commandLock);
   const violations = evaluateGuards({ profile, trigger: options.trigger, git, options });
   const plan = buildPlan({ profile, options });
   const output = {
@@ -614,4 +617,4 @@ async function main() {
   }
 }
 
-process.exitCode = await main();
+if (import.meta.main) process.exitCode = await main();

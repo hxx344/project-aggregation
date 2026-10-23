@@ -166,6 +166,17 @@ footer { padding:4px 0 16px; }
 @media(max-width:520px) { main { gap:10px; } .plot-section { padding:10px 12px 8px; } .metrics.readout { margin-inline:-12px; } .readout .metric { padding:8px 12px; } .readout .metric-number { font-size:18px; } .readout .metric-number small { display:block; margin:2px 0 0; } #main-chart { height:230px; } .range-summary { padding:10px 12px; } .data-stamp { gap:4px 8px; } .stamp-source { display:inline; } .funding-panel, .funding-history-panel, .monthly-panel, .methodology { padding:12px; } .funding-metrics { grid-template-columns:1fr 1fr; } .funding-metrics article:first-child .funding-value { font-size:22px; } }
 
 /* Informational notices use the compact info style; warnings keep the warning palette. */
+.oil-panel .oil-trades { border-top:1px solid var(--border); margin-top:12px; padding-top:10px; min-width:0; }
+.oil-panel .oil-trades h3 { font-size:13px; font-weight:600; }
+.oil-panel #oil-trades-status { font-size:12px; color:var(--muted); overflow-wrap:anywhere; margin:5px 0 8px; }
+.oil-panel .oil-trades-list { display:grid; gap:4px; max-height:220px; overflow:auto; }
+.oil-panel .oil-trade-list-item { text-align:left; white-space:normal; overflow-wrap:anywhere; width:100%; padding:6px 8px; border:1px solid var(--border); font-size:12px; }
+.oil-panel .oil-trade-details { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; max-height:320px; overflow:auto; border-top:1px solid var(--border); margin-top:8px; padding-top:8px; }
+.oil-panel .oil-trade-tooltip { white-space:pre-wrap; overflow-wrap:anywhere; width:360px; min-width:0; max-width:100%; max-height:240px; overflow:auto; }
+.oil-panel #main-chart .oil-trade-marker { cursor:pointer; }
+.oil-panel #main-chart .oil-trade-marker text { fill:var(--chart-2); font-size:18px; paint-order:stroke; stroke:var(--card); stroke-width:3px; }
+.oil-panel #main-chart .oil-trade-marker:focus { outline:none; }
+.oil-panel #main-chart .oil-trade-marker:focus circle { stroke:var(--foreground); stroke-width:2px; }
 .data-notice[data-tone=info] { color:color-mix(in srgb, var(--info, var(--chart-2)) 65%, var(--foreground)); background:color-mix(in srgb, var(--info, var(--chart-2)) 9%, transparent); border-color:color-mix(in srgb, var(--info, var(--chart-2)) 28%, transparent); border-radius:6px; padding:7px 12px; line-height:1.55; }
 main { container-type:inline-size; }
 @container (min-width: 900px) {

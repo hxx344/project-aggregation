@@ -150,7 +150,7 @@ function structure(legs) {
 }
 
 /** Account reads only. This service deliberately has no exchange mutation operation. */
-export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000 } = {}) {
+export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000, logger = console } = {}) {
   if (!stmt) stmt = createStatementCache(db);
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -176,6 +176,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   const jobs = new Map(), validations = new Map();
   db.exec('CREATE TABLE IF NOT EXISTS trading_views_v2 (pair_key TEXT NOT NULL, days INTEGER NOT NULL, version INTEGER NOT NULL, source_key TEXT NOT NULL, json TEXT NOT NULL, PRIMARY KEY(pair_key,days))');
   let views = new Map(), viewsDirty = false, viewTimer = null;
+  let viewError = null, viewRetryAt = 0, viewRetryDelay = 750;
   let closed = false;
   let fundingBatchEnd = Math.max(0, ...EXCHANGES.map(exchange => cache.get(exchange).funding.requestedEnd || 0));
   function write(exchange, revision, change) {
@@ -316,11 +317,28 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     if (closed || viewTimer) return;
     // Coalesce partial ledger windows and independent account completions. This
     // timer only calculates local data; no HTTP reader triggers or awaits it.
-    viewTimer = setTimeout(() => { viewTimer = null; try { flushViews(); } catch { if (!closed) invalidateViews(); } }, 750);
+    viewTimer = setTimeout(() => { viewTimer = null; flushViews(); }, Math.max(750, viewRetryAt - now()));
     viewTimer.unref?.();
   }
-  function flushViews() {
+  function flushViews({ required = false } = {}) {
     if (closed || !viewsDirty) return;
+    // Polling and partial account completions must not bypass a failed rebuild's backoff.
+    if (!required && now() < viewRetryAt) { invalidateViews(); return; }
+    try {
+      rebuildViews();
+    } catch (error) {
+      const retryInMs = viewRetryDelay;
+      viewRetryAt = now() + retryInMs;
+      viewRetryDelay = Math.min(30_000, retryInMs * 2);
+      viewError = { code: 'view_rebuild_failed', message: '缓存更新失败，已保留上次数据，将自动重试。', at: iso(now()) };
+      const category = ['ERR_SQLITE_ERROR', 'SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_FULL', 'SQLITE_IOERR', 'ENOSPC'].includes(error?.code)
+        ? error.code : ['TypeError', 'RangeError'].includes(error?.name) ? error.name : 'Error';
+      logger.error?.({ type: 'trading_view_rebuild_failed', category, failedAt: viewError.at, retryInMs }, '交易视图缓存更新失败');
+      invalidateViews();
+      if (required) throw error;
+    }
+  }
+  function rebuildViews() {
     clearTimeout(viewTimer); viewTimer = null;
     const next = new Map(), keys = new Map();
     for (const pair of TRADING_PAIRS) {
@@ -336,11 +354,12 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
     views = next; viewsDirty = false;
+    viewError = null; viewRetryAt = 0; viewRetryDelay = 750;
   }
   function resetViews() {
     views.clear();
     stmt.prepare('DELETE FROM trading_views_v2').run();
-    invalidateViews(); flushViews();
+    invalidateViews(); flushViews({ required: true });
   }
   function restoreViews() {
     const restored = new Map();
@@ -363,6 +382,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     let pair;
     try { pair = normalizeTradingPair(inputPair); } catch { throw new TradingError(400, '请选择两个不同的交易所'); }
     const current = now(), saved = views.get(`${tradingPairKey(pair)}:${days}`);
+    if (!saved) throw new TradingError(503, '交易缓存更新失败，暂时无法读取，请稍后重试');
     // All history scans and monetary aggregation happened before publication.
     // Only bounded account freshness, four positions and one ledger slice remain.
     const accounts = entriesFor().map(({ row, snapshot }) => {
@@ -402,7 +422,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       exchanges: pair, period: saved.period, accounts, legs, structure: structure(legs),
       funding: { complete, ...totals, currency: 'USDT', daily, events: page === undefined ? events : events.slice(selected * PAGE_SIZE, (selected + 1) * PAGE_SIZE), pagination: { page: selected, pageSize: PAGE_SIZE, total: events.length, pages } },
       pnl: { ...historical, end: current, points: expired ? [...historical.points, latest] : historical.points, latest, status: expired ? 'incomplete' : historical.status },
-      cache: { builtAt: saved.generatedAt, servedAt: iso(current), rebuilding: viewsDirty },
+      cache: { builtAt: saved.generatedAt, servedAt: iso(current), rebuilding: viewsDirty, error: viewError },
     };
   }
   async function connect(exchange, body, { credentialReader, beforeSave, signal: externalSignal, timeoutMs = validationTimeoutMs } = {}) {
@@ -453,7 +473,11 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     serializedCache.set(exchange, JSON.stringify(emptySnap)); // Update serialization cache
     snapshotHashes.set(exchange, fundingHash(cache.get(exchange).funding)); resetViews();
   }
-  if (!restoreViews()) { viewsDirty = true; flushViews(); }
+  if (!restoreViews()) {
+    viewsDirty = true;
+    try { flushViews({ required: true }); }
+    catch (error) { closed = true; clearTimeout(viewTimer); throw error; }
+  }
   const timer = intervalMs > 0 ? setInterval(() => { if (!closed) void refresh(); }, intervalMs) : null; timer?.unref();
   const first = intervalMs > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   return { state, refresh, connect, disconnect,

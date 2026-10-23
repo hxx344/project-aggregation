@@ -89,7 +89,7 @@ async (page) => {
     await page.goto(`${origin}/?view=project&id=monitor`);
     let monitor = await connect('monitor');
     const capabilities = await monitor.evaluate(() => fixture.hostReady);
-    assert(capabilities.every(value => JSON.stringify(value) === JSON.stringify([...hostBase, 'positions', 'open-trading'])), `monitor host capabilities: ${JSON.stringify(capabilities)}`);
+    assert(capabilities.every(value => JSON.stringify(value) === JSON.stringify([...hostBase, 'positions', 'open-trading', 'fills'])), `monitor host capabilities: ${JSON.stringify(capabilities)}`);
 
     holdRead = true;
     await ask(monitor, request('oil-1')); await ask(monitor, request('oil-2'));

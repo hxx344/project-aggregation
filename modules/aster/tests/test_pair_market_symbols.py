@@ -94,7 +94,9 @@ class PairMarketSymbolsTests(TestCase):
 
     def test_pair_cycle_capacity_explicitly_accepts_silver_but_account_default_does_not(self):
         pair = self.pair(cycle=True)
-        self.engine.markets[SILVER] = {"status": "ok", "checked_at": time.time(), "capacities": {"5": "1000000"}}
+        now = time.time()
+        self.engine.markets[SILVER] = {"status": "ok", "checked_at": now, "capacities": {"5": "1000000"},
+                                      "capacity_checked_at": {"5": now}}
         with self.assertRaises(TradingError):
             self.engine.require_cycle_open_capacity(pair["cycle"], 5)
         self.assertEqual(self.engine.require_cycle_open_capacity(pair["cycle"], 5, symbols=MARKET_SYMBOLS), dec("1000000"))

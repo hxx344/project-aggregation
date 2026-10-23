@@ -24,9 +24,11 @@ class CycleParallelEngineTests(TestCase):
         self.capacities()
 
     def capacities(self, available=None):
+        now = time.time()
         for symbol in SYMBOLS:
             self.engine.markets[symbol] = {
-                "status": "ok", "checked_at": time.time(),
+                "status": "ok", "checked_at": now,
+                "capacity_checked_at": {str(tier): now for tier in (2, 5, 10, 20)},
                 "capacities": {"2": "1000000", **{str(tier): str((available or {}).get(symbol, {}).get(tier, 0))
                                for tier in (5, 10, 20)}},
             }
@@ -141,7 +143,9 @@ class CycleParallelEngineTests(TestCase):
         other["policy"]["symbols"] = list(SYMBOLS)
         self.f.store.save_account(other)
         for symbol in ("XAUUSD1", "SPCXUSD1"):
-            self.engine.wake_capacity_accounts(symbol, {10: dec(500000)}, time.time(), self.f.store.accounts())
+            now = time.time()
+            self.engine.wake_capacity_accounts(symbol, {10: dec(500000)}, now, self.f.store.accounts(),
+                                               capacity_checked_at={"10": now})
         self.assertNotIn("XAUUSD1", self.engine.work("test").priority_levels)
         self.assertNotIn("XAUUSD1", self.engine.work("test").priority)
         self.assertIn("SPCXUSD1", self.engine.work("test").priority_levels)

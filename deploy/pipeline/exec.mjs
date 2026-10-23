@@ -9,10 +9,12 @@ import { randomUUID } from 'node:crypto';
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { CHILD_FORCED_MARKER } from './constants.mjs';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const TAIL_LINES = 40;
 const JOB_FORCED_MARKER = 'PIPELINE_JOB_FORCED_CLEANUP';
+const MARKER_SCAN = Math.max(JOB_FORCED_MARKER.length, CHILD_FORCED_MARKER.length);
 
 export class CommandError extends Error {
   constructor(message, detail = {}) {
@@ -104,6 +106,7 @@ export function runCommand({
     let closed = false;
     let stdioForced = false;
     let jobForced = false;
+    let childForced = false;
     let markerScan = '';
     let settled = false;
     let timer = null;
@@ -117,10 +120,11 @@ export function runCommand({
 
     const collect = (chunk, stream = null) => {
       const raw = chunk.toString();
-      // 在脱敏前、仅对 stderr 识别包装器标记：脱敏或 stdout 交错都不能让强制清理漏判。
-      if (platform === 'win32' && stream === 'stderr' && !jobForced) {
-        markerScan = markerScan.slice(-JOB_FORCED_MARKER.length) + raw;
-        jobForced = markerScan.includes(JOB_FORCED_MARKER);
+      // 在脱敏前、仅对 stderr 识别强制终止标记：脱敏或 stdout 交错都不能让强制清理漏判。
+      if (stream === 'stderr') {
+        markerScan = markerScan.slice(-MARKER_SCAN) + raw;
+        if (platform === 'win32') jobForced ||= markerScan.includes(JOB_FORCED_MARKER);
+        childForced ||= markerScan.includes(CHILD_FORCED_MARKER);
       }
       const text = sanitize(raw);
       if (sink && !sink.destroyed) sink.write(text);
@@ -137,10 +141,11 @@ export function runCommand({
     const finish = (extra = {}) => {
       if (settled) return;
       settled = true;
-      const terminationUnconfirmed = Boolean(terminating || stdioForced || jobForced || exitSignal);
+      const terminationUnconfirmed = Boolean(terminating || stdioForced || jobForced || childForced || exitSignal);
       const cause = timedOut ? '命令超时' : stopCause === 'log-error' ? '命令日志写入失败'
         : stdioForced ? '输出管道在宽限后仍未关闭'
-        : jobForced ? '命令退出时仍有后代，已由 Windows Job 强制清理' : '命令被强制终止';
+        : jobForced ? '命令退出时仍有后代，已由 Windows Job 强制清理'
+        : childForced ? '内部子命令被超时或信号强制终止' : '命令被强制终止';
       const terminationReason = terminationUnconfirmed
         ? `${cause}；后代停止未确认，请以 root 核对相关进程、安装器日志和独立锁后再解除`
         : undefined;

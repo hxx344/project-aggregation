@@ -24,7 +24,7 @@ def require_cycle_capacity(config, leverage, row, *, now, minimum_notional=0, sy
     """
     target, required = capacity_target(config, symbols=symbols)
     required = max(required, Fraction(positive(minimum_notional, True)))
-    stamp = row.get("capacity_checked_at", {}).get(str(leverage), row.get("checked_at"))
+    stamp = row.get("capacity_checked_at", {}).get(str(leverage))
     fresh = (type(stamp) in (int, float) and math.isfinite(stamp)
              and -1 <= now - stamp <= CYCLE_CAPACITY_MAX_AGE)
     known = type(leverage) is int and 1 <= leverage <= 125

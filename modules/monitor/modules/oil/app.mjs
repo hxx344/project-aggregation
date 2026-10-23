@@ -9,6 +9,9 @@ import { binanceOilExchangeQuote } from '../../lib/exchange-quotes.ts';
 import { nearestTimeIndex, tablePage, samePriceRows } from './chart-performance.mjs';
 import { startOilAutoRefresh } from './auto-refresh.mjs';
 import { getQuoteStaleAfterMs } from '../../lib/market-freshness.ts';
+import { emptyFillsView } from '../../lib/hub-fills-contract.ts';
+import { groupTradeEvents } from './trades.mjs';
+import { createTradeLayer, visibleTradeMarkers } from './trade-markers.mjs';
 /** @param {ShadowRoot} root @param {{ initial?: import('../../lib/initial-market').InitialMarketData['oil'], initialReadAt?: number, active?: boolean, summaryActive?: boolean, onSummary?: (summary: import('../../lib/monitor-summary').OilSummaryUpdate) => void }} options */
 export function mount(root, { onSummary, initial, initialReadAt = 0, active = true, summaryActive = active } = {}) {
 const life = createLifecycle();
@@ -29,6 +32,8 @@ const ns = 'http://www.w3.org/2000/svg';
 const percent = (value, digits = 5) => `${value > 0 ? '+' : value < 0 ? '−' : ''}${Math.abs(value * 100).toFixed(digits)}%`;
 const timeFormatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const beijingTime = iso => timeFormatter.format(new Date(iso));
+const tradeLayer = createTradeLayer(root, beijingTime);
+let tradesView = emptyFillsView('loading'), tradeEvents = [];
 let tableDirty = true;
 let summaryRows, summaryHistory, tablePreviousSource, tablePreviousRows;
 let averageSource, averageRange, averageHistory;
@@ -214,9 +219,11 @@ function renderTable(changed = true) {
 
 function renderChart() {
   const rows = state.visible;
-  if (!rows.length) return;
+  const markers = visibleTradeMarkers(tradeEvents, rows);
+  const renderTrades = chart => tradeLayer.render({ markers, chart, view: state.view, fillsView: tradesView, beforeShow: hideTooltip });
+  if (!rows.length) { renderTrades(null); return; }
   const svg = $('main-chart');
-  if (!svg.clientWidth) { chartDirty = true; return; }
+  if (!svg.clientWidth) { chartDirty = true; renderTrades(null); return; }
   chartDirty = false;
   const width = Math.max(Math.round(svg.clientWidth), 270);
   const height = Math.max(Math.round(svg.clientHeight), 250);
@@ -227,7 +234,7 @@ function renderChart() {
   const plotHeight = height - padding.top - padding.bottom;
   const isSpread = state.view === 'spread';
   const summary = summarize(rows);
-  const domain = chartDomain(isSpread ? rows.flatMap(row => row.average === null ? [row.spread] : [row.spread, row.average]) : rows.flatMap(row => [row.wti, row.brent]));
+  const domain = chartDomain(isSpread ? [...rows.flatMap(row => row.average === null ? [row.spread] : [row.spread, row.average]), ...markers.map(marker => marker.value).filter(value => value !== null)] : rows.flatMap(row => [row.wti, row.brent]));
   const start = Date.parse(rows[0].date), end = Date.parse(rows.at(-1).date);
   const x = date => padding.left + (start === end ? 0.5 : ((typeof date === 'number' ? date : Date.parse(date)) - start) / (end - start)) * plotWidth;
   const y = value => padding.top + (domain.max - value) / (domain.max - domain.min) * plotHeight;
@@ -281,6 +288,7 @@ function renderChart() {
   $('chart-cursor').setAttribute('aria-valuetext', cursorDescription(selected));
   renderFundingHistoryChart();
   hideTooltip();
+  renderTrades(state.chart);
   if (root.activeElement === $('chart-cursor')) showTooltip(cursorIndex);
   else if (root.activeElement === $('funding-history-cursor')) showFundingObservation(Number($('funding-history-cursor').value));
 }
@@ -394,6 +402,7 @@ function cursorDescription(row) {
 }
 
 function showTooltip(index) {
+  tradeLayer.hide();
   const row = state.visible[index], chart = state.chart;
   if (!row || !chart) return;
   state.selectedDate = row.date;
@@ -427,6 +436,7 @@ function showFundingObservation(index) {
 }
 
 function hideTooltip() {
+  tradeLayer.hide();
   cancelAnimationFrame(pointerFrame); pointerFrame = 0; queuedPointer = null;
   $('chart-tooltip').hidden = true;
   state.chart?.crosshair.setAttribute('visibility', 'hidden');
@@ -616,6 +626,6 @@ if (!state.market) publishSummary('loading');
 void stopAutoRefresh.refreshQuote();
 if (!initial?.candles || Date.now() - initialReadAt >= 60_000) void stopAutoRefresh.refreshHistory();
 void stopAutoRefresh.refreshFunding();
-return { setActive(value) { activityActive = value; stopAutoRefresh.setActive(value); }, setSummaryActive(value) { overviewActive = value; stopAutoRefresh.setSummaryActive(value); }, setView(input) { if (!['1d','1w','1m','all'].includes(input.range) || !['spread','prices'].includes(input.view)) throw new Error('Invalid chart view'); if (!state.rows.length) throw new Error('行情尚未加载'); if (state.range !== input.range) state.tablePage=0; state.range=input.range; state.view=input.view; render(); return summarize(state.visible); }, dispose() { life.dispose(); stopAutoRefresh(); resizeObserver.disconnect(); cancelAnimationFrame(resizeFrame); cancelAnimationFrame(pointerFrame); } };
+return { setTrades(view) { if (life.signal.aborted) return; if (tradesView.items !== view.items) tradeEvents = groupTradeEvents(view.items); tradesView = view; renderChart(); }, setActive(value) { activityActive = value; stopAutoRefresh.setActive(value); }, setSummaryActive(value) { overviewActive = value; stopAutoRefresh.setSummaryActive(value); }, setView(input) { if (!['1d','1w','1m','all'].includes(input.range) || !['spread','prices'].includes(input.view)) throw new Error('Invalid chart view'); if (!state.rows.length) throw new Error('行情尚未加载'); if (state.range !== input.range) state.tablePage=0; state.range=input.range; state.view=input.view; render(); return summarize(state.visible); }, dispose() { life.dispose(); stopAutoRefresh(); resizeObserver.disconnect(); cancelAnimationFrame(resizeFrame); cancelAnimationFrame(pointerFrame); } };
 
 }

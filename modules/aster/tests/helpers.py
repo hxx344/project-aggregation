@@ -13,6 +13,7 @@ def seed_cycle_capacity(engine, *, now=None):
     symbols = {a.get("cycle", {}).get("symbol", "XAUUSD1") for a in engine.store.accounts()}
     for symbol in symbols:
         engine.markets[symbol] = {"status": "ok", "checked_at": now,
+                                  "capacity_checked_at": {str(v): now for v in range(1, 21)},
                                   "capacities": {str(v): "1000000" for v in range(1, 21)}}
 
 

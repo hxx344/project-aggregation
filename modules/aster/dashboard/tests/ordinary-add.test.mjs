@@ -107,3 +107,27 @@ test('sufficient 5x, 10x and 20x public capacities never override an account blo
   assert.equal(ordinaryCapacityReady('10000', '10000', true, null), false);
   assert.equal(ordinaryCapacityReady(undefined, '10000', true, null), false);
 });
+
+test('missing or invalid actual thresholds cannot highlight a public capacity', () => {
+  for (const threshold of [
+    undefined,
+    null,
+    '',
+    ' ',
+    '-1',
+    'NaN',
+    'Infinity',
+    '0x10',
+    '1e200',
+    'invalid',
+  ]) {
+    assert.equal(
+      ordinaryCapacityReady('999999', threshold, true, null),
+      false,
+      String(threshold),
+    );
+  }
+  for (const threshold of ['0', '1e4', ' 10000 ']) {
+    assert.equal(ordinaryCapacityReady('10001', threshold, true, null), true);
+  }
+});

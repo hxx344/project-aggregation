@@ -103,17 +103,11 @@ export function SymbolMonitorCenter({
         symbol,
         control,
         listing,
-        view: computeSymbolView(
-          control ?? { monitor_enabled: true },
-          listing,
-          listings,
-          now,
-          {
-            monitoringEnabled: settings.monitoring_enabled,
-            demo,
-            connectionError: Boolean(connectionError),
-          },
-        ),
+        view: computeSymbolView(control ?? {}, listing, listings, now, {
+          monitoringEnabled: settings.monitoring_enabled,
+          demo,
+          connectionError: Boolean(connectionError),
+        }),
       };
     })
     .sort(

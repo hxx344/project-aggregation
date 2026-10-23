@@ -51,7 +51,9 @@ class CycleAddGuardStateTests(TestCase):
         self.engine.enable("test", True)
         capacities = {tier: dec("500000") for tier in (5, 10, 20)}
         self.f.store.save_account(account("second"))
-        self.engine.wake_capacity_accounts(SYMBOL, capacities, time.time(), self.f.store.accounts())
+        now = time.time()
+        self.engine.wake_capacity_accounts(SYMBOL, capacities, now, self.f.store.accounts(),
+                                           capacity_checked_at={str(tier): now for tier in capacities})
         self.assertFalse(self.engine.work("test").priority)
         self.assertIn(SYMBOL, self.engine.work("second").priority)
         # A queued signal from before mode selection must not bypass dispatch.
@@ -60,7 +62,9 @@ class CycleAddGuardStateTests(TestCase):
         with patch("trading.engine.Executor.open_pair", side_effect=AssertionError("ordinary additions are blocked")), \
              patch("trading.engine.Executor.leverage", side_effect=AssertionError("ordinary upgrades are not the cycle path")):
             for _ in range(6):
-                self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": time.time(),
+                now = time.time()
+                self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": now,
+                                               "capacity_checked_at": {str(tier): now for tier in capacities},
                                                "capacities": {str(key): str(value) for key, value in capacities.items()}}
                 self.engine.tick_account("test")
                 if self.f.store.get("cycle:test")["phase"] == "holding":

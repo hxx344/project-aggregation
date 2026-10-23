@@ -5,9 +5,9 @@ import {Dialog,DialogContent,DialogHeader,DialogTitle,DialogDescription} from '@
 import {Checkbox} from '@/components/ui/checkbox';
 import type {AsterAccount} from '@/lib/types';
 
-type Props={accounts:AsterAccount[];busy:boolean;error:string;clearError:()=>void;mutate:(path:string,method:string,body:unknown,onSuccess:()=>void)=>Promise<void>};
+type Props={accounts:AsterAccount[];now:number;busy:boolean;error:string;clearError:()=>void;mutate:(path:string,method:string,body:unknown,onSuccess:()=>void)=>Promise<void>};
 const stamp=(s:string|null)=>s?new Date(s).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}):'尚未同步';
-export function AsterAccountsPanel({accounts,busy,error,clearError,mutate}:Props){
+export function AsterAccountsPanel({accounts,now,busy,error,clearError,mutate}:Props){
   const [editing,setEditing]=useState<{id:string;existing:boolean}|null>(null),[removing,setRemoving]=useState<AsterAccount|null>(null);
   const [name,setName]=useState(''),[address,setAddress]=useState(''),[secret,setSecret]=useState(''),[includeSpot,setIncludeSpot]=useState(false);
   function close(){setEditing(null);setAddress('');setSecret('');clearError();}
@@ -16,10 +16,11 @@ export function AsterAccountsPanel({accounts,busy,error,clearError,mutate}:Props
     <div className="aster-heading"><div className="connection-card-title"><div className="exchange-mark aster">A</div><h2>Aster</h2><span className="status">{accounts.length} 个账号</span></div><button className="button primary" disabled={busy||accounts.length>=10} onClick={()=>open()}><Plus size={16}/>新增 Aster 账号</button></div>
     <p className="help">每个账号使用自己的 API Pro 钱包地址和私钥，分别同步后汇总。最多 10 个账号；每个实际账户只添加一次，更换 API 钱包请使用“更新连接”。</p>
     {accounts.length===0?<p className="help section-note">尚未添加账号。首次连接成功后，以账户余额替换原表 Aster 估值。</p>:<div className="aster-account-list">{accounts.map(account=>{
-      const stale=!!account.error||!account.configured||Date.now()-Date.parse(account.updatedAt)>300000;
+      const unknown=account.value===null;
+      const stale=unknown||!!account.error||!account.configured||now-Date.parse(account.updatedAt)>300000;
       return <article className="aster-account" key={account.id}>
-        <div className="aster-heading"><h3>{account.name}</h3><span className={'status '+(stale?'amber':'live')}>{!account.configured?'已断开 · 保留旧值':account.error?'同步失败 · 保留旧值':stale?'数据已过期 · 保留旧值':'已连接'}</span></div>
-        <strong className="aster-account-value">$ {account.value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} <small>USD</small></strong>
+        <div className="aster-heading"><h3>{account.name}</h3><span className={'status '+(stale?'amber':'live')}>{!account.configured?'已断开 · '+(unknown?'估值缺失':'保留旧值'):unknown?'估值缺失':account.error?'同步失败 · 保留旧值':stale?'数据已过期 · 保留旧值':'已连接'}</span></div>
+        <strong className="aster-account-value">{account.value===null?'—':'$ '+account.value.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})} <small>USD</small></strong>
         <p className="help">{account.scope}{account.label?' · 钱包尾号 '+account.label:''}<br/>最近成功同步：{stamp(account.lastSync)}</p>
         {account.error&&<p className="error-text" role="status">{account.error}</p>}
         <div className="form-actions"><button className="button" disabled={busy} onClick={()=>open(account)}><Pencil size={14}/>{account.configured?'更新连接':'重新连接'}</button><button className="button" disabled={busy} onClick={()=>{setRemoving(account);clearError();}}><Trash2 size={14}/>移除账号</button></div>

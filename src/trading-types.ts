@@ -48,7 +48,7 @@ export type TradingPnl = {
 export type TradingState = {
   mode: 'read-only'; strategy: { id: 'oil-four-leg'; name: string };
   generatedAt: string; period: { days: 7 | 30; start: string; end: string };
-  cache: { builtAt: string | null; servedAt: string; rebuilding: boolean };
+  cache: { builtAt: string | null; servedAt: string; rebuilding: boolean; error?: { code: 'view_rebuild_failed'; message: string; at: string } | null };
   accounts: TradingAccount[]; legs: TradingLeg[];
   exchanges: TradingExchange[];
   pnl: TradingPnl;

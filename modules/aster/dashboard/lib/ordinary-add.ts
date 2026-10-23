@@ -1,3 +1,5 @@
+import { decimal } from './ordinary-conditions.ts';
+
 type OrdinaryAddAccount = {
   policy?: { ordinary_symbol?: string };
   ordinary_add_blocks?: Record<string, string>;
@@ -26,9 +28,17 @@ export function ordinaryAddBlock(
 
 export function ordinaryCapacityReady(
   capacity: string | undefined,
-  threshold: string,
+  threshold: string | undefined,
   live: boolean,
   block: string | null,
 ): boolean {
-  return !block && live && Number(capacity) > Number(threshold);
+  const valid = decimal(threshold);
+  const required = valid === null ? NaN : Number(valid);
+  return (
+    !block &&
+    live &&
+    Number.isFinite(required) &&
+    Number.isFinite(Number(capacity)) &&
+    Number(capacity) > required
+  );
 }

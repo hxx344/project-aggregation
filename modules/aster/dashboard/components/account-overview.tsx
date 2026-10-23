@@ -22,12 +22,8 @@ import {
 import { pairMarginOnly, type Pair } from '@/lib/pairs';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
-import {
-  cycleMarginLimit,
-  marginLimitFromPercent,
-  migrationMarginLimit,
-  percentFromMarginLimit,
-} from '@/lib/policy';
+import { marginLimitFromPercent } from '@/lib/policy';
+import { accountRiskView } from '@/lib/account-risk';
 export function AccountOverview({
   account,
   busy,
@@ -85,46 +81,23 @@ export function AccountOverview({
     account.snapshot_refresh,
     account.status === 'error' ? account.reason : undefined,
   );
-  const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
-  const marginPercent = percentFromMarginLimit(
-    account?.policy.margin_limit ?? '0.5',
-  );
-  const highMarginLimitValue =
-    account?.risk_limits?.high_leverage ??
-    account?.policy.margin_limit ??
-    '0.5';
-  const highMarginLimit = Number(highMarginLimitValue);
-  const highMarginPercent = percentFromMarginLimit(highMarginLimitValue);
-  const migrationMarginPercent = percentFromMarginLimit(
-    migrationMarginLimit(
-      account?.policy.margin_limit ?? '0.5',
-      account?.risk_limits,
-    ),
-  );
-  const cycleMarginLimitValue = cycleMarginLimit(account?.risk_limits);
-  const cycleRiskLimit =
-    cycleMarginLimitValue === null ? null : Number(cycleMarginLimitValue);
-  const cycleMarginPercent =
-    cycleMarginLimitValue === null
-      ? null
-      : percentFromMarginLimit(cycleMarginLimitValue);
-  const cycleMode = Boolean(account?.cycle?.enabled);
-  const upperRiskLimit = cycleMode ? cycleRiskLimit : highMarginLimit;
-  const upperRiskPercent = cycleMode ? cycleMarginPercent : highMarginPercent;
-  const riskAccent =
-    ratio === null || upperRiskLimit === null
-      ? 'muted'
-      : ratio > upperRiskLimit
-        ? 'danger'
-        : ratio > marginLimit
-          ? 'amber'
-          : 'mint';
-
+  const {
+    marginLimit,
+    marginPercent,
+    marginDraft,
+    highMarginPercent,
+    migrationMarginPercent,
+    cycleMarginPercent,
+    cycleMode,
+    upperRiskLimit,
+    upperRiskPercent,
+    riskAccent,
+  } = accountRiskView(account, ratio);
   const {
     value: riskDraft,
     setValue: setRiskDraft,
     clear,
-  } = useAccountDraft(account.id, marginPercent);
+  } = useAccountDraft(account.id, marginDraft);
   return (
     <div className="feature-stack">
       {' '}
@@ -218,7 +191,9 @@ export function AccountOverview({
                   ? cycleMarginPercent === null
                     ? '循环上限待服务确认'
                     : `循环 ≤ ${cycleMarginPercent}%`
-                  : `普通 5x ≤ ${marginPercent}%`}
+                  : marginPercent === null
+                    ? '普通 5x 上限待确认'
+                    : `普通 5x ≤ ${marginPercent}%`}
               </small>
             </div>
             <div className="risk-track">
@@ -230,7 +205,7 @@ export function AccountOverview({
                   aria-label="当前保证金占用率"
                 />
               )}
-              {ratio !== null && (
+              {ratio !== null && marginPercent !== null && (
                 <i
                   className="limit-marker"
                   style={{ left: `${marginPercent}%` }}
@@ -238,6 +213,7 @@ export function AccountOverview({
                 />
               )}
               {ratio !== null &&
+                marginLimit !== null &&
                 upperRiskLimit !== null &&
                 upperRiskLimit > marginLimit && (
                   <i
@@ -257,11 +233,19 @@ export function AccountOverview({
               <div className="risk-explanation muted">
                 <p className="risk-bonus">
                   <span>普通 10x / 20x 加仓上限</span>
-                  <strong>{highMarginPercent}%</strong>
+                  <strong>
+                    {highMarginPercent === null
+                      ? '待确认'
+                      : `${highMarginPercent}%`}
+                  </strong>
                 </p>
                 <p className="risk-bonus">
                   <span>迁移上限 · 含 5x</span>
-                  <strong>{migrationMarginPercent}%</strong>
+                  <strong>
+                    {migrationMarginPercent === null
+                      ? '待确认'
+                      : `${migrationMarginPercent}%`}
+                  </strong>
                 </p>
                 <p className="risk-bonus">
                   <span>循环上限 · 全部持仓</span>
@@ -321,6 +305,9 @@ export function AccountOverview({
                 id="margin-percent"
                 label="基础保证金占用上限 · %"
                 max="100"
+                placeholder={
+                  marginPercent === null ? '待确认，请输入上限' : undefined
+                }
                 disabled={locked}
                 value={riskDraft}
                 onValueChange={(value) => setRiskDraft(value)}
@@ -329,7 +316,11 @@ export function AccountOverview({
                 此设置由普通开仓、循环和迁移共用。
                 {configurationLock || '各功能适用上限见上方风险约束。'}
               </p>
-              <Button type="submit" variant="outline" disabled={locked}>
+              <Button
+                type="submit"
+                variant="outline"
+                disabled={locked || !riskDraft.trim()}
+              >
                 保存账户风险上限
               </Button>
             </SettingsForm>

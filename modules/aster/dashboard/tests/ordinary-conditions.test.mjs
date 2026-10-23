@@ -28,6 +28,7 @@ function fixture() {
       status: 'ok',
       checked_at: now,
       capacities: { 5: '10001', 10: '10000', 20: '9999' },
+      capacity_checked_at: { 5: now, 10: now, 20: now },
       book: { spread: '0.0005', timestamp: now },
     },
   };
@@ -41,6 +42,15 @@ test('a fast current-tier sample cannot renew other leverage timestamps', () => 
   assert.deepEqual(
     view(source).tiers.map((tier) => tier.capacity.state),
     ['stale', 'unmet', 'stale'],
+  );
+});
+
+test('a tier without its own timestamp is unknown even when the market row is fresh', () => {
+  const source = fixture();
+  delete source.market.capacity_checked_at[10];
+  assert.deepEqual(
+    view(source).tiers.map((tier) => tier.capacity.state),
+    ['met', 'unknown', 'unmet'],
   );
 });
 
@@ -70,7 +80,7 @@ test('cycle 2x leaves all three ordinary conditions visible without turning rest
 
 test('each condition expires only from its own backend timestamp at the backend boundary', () => {
   const source = fixture();
-  source.market.checked_at = now - 8;
+  source.market.capacity_checked_at[5] = now - 8;
   source.account.snapshot.timestamp = now - 8;
   source.market.book.timestamp = now - 3;
   assert.equal(view(source).tiers[0].capacity.state, 'met');
@@ -79,7 +89,7 @@ test('each condition expires only from its own backend timestamp at the backend 
   assert.equal(view(source, now + 0.01).spread.state, 'stale');
   assert.equal(view(source, now + 0.01).tiers[0].capacity.state, 'stale');
   assert.equal(view(source, now + 0.01).tiers[1].margin.state, 'stale');
-  source.market.checked_at = now;
+  source.market.capacity_checked_at[5] = now;
   source.account.snapshot.timestamp = now;
   assert.equal(view(source, now + 0.01).tiers[0].capacity.state, 'met');
   assert.equal(view(source, now + 0.01).spread.state, 'stale');

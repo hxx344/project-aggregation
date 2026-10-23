@@ -6,9 +6,11 @@ import {
   pairConfigurationLock,
   pairDataFresh,
   pairDeletionBlock,
+  pairDisplayBalances,
   pairDraft,
   pairExecutionPhaseLabel,
   pairHasPending,
+  pairMarginLimitFieldVisible,
   pairMarginStatus,
   pairMarginOnly,
   pairNetQuantity,
@@ -100,6 +102,53 @@ const pair = (state = {}) => ({
   ...parsePairDraft(draft(), accounts, []),
   enabled: false,
   state: { snapshots: { long: snapshot(), short: snapshot() }, ...state },
+});
+
+test('funds-only displays never use retained trading balances, including partially missing reads', () => {
+  const fixture = pair();
+  fixture.margin.enabled = true;
+  fixture.state.snapshots.long.equity = '9000';
+  fixture.state.snapshots.short.available = '8000';
+  assert.equal(pairDisplayBalances(fixture), undefined);
+  fixture.state.margin_balances = { short: { equity: '100', timestamp: 100 } };
+  assert.equal(pairDisplayBalances(fixture).long, undefined);
+  assert.equal(pairDisplayBalances(fixture), fixture.state.margin_balances);
+  fixture.ordinary.enabled = true;
+  assert.equal(pairDisplayBalances(fixture), fixture.state.snapshots);
+});
+
+test('existing pairs with missing risk limits require explicit input while new pairs keep defaults', () => {
+  const fixture = pair();
+  delete fixture.ordinary.margin_limit;
+  const existing = pairDraft(fixture);
+  assert.equal(existing.margin_percent, '');
+  assert.throws(() => parsePairDraft(existing, accounts, []), /风险约束/);
+  assert.equal(
+    parsePairDraft({ ...existing, margin_percent: '60' }, accounts, []).ordinary
+      .margin_limit,
+    '0.6',
+  );
+  assert.equal(pairDraft().margin_percent, '50');
+  fixture.ordinary.margin_limit = '0.333000000000000001';
+  assert.equal(pairDraft(fixture).margin_percent, '33.3000000000000001');
+});
+
+test('margin-only pairs keep the risk field reachable while the stored limit is missing', () => {
+  const fixture = pair();
+  const monitor = { ...pairDraft(fixture), mode: 'monitor' };
+  assert.equal(pairMarginLimitFieldVisible(monitor, fixture), false);
+  assert.equal(pairMarginLimitFieldVisible(monitor), false);
+  delete fixture.ordinary.margin_limit;
+  const missing = { ...pairDraft(fixture), mode: 'monitor' };
+  assert.equal(pairMarginLimitFieldVisible(missing, fixture), true);
+  assert.equal(
+    pairMarginLimitFieldVisible({ ...missing, margin_percent: '6' }, fixture),
+    true,
+  );
+  assert.equal(
+    pairMarginLimitFieldVisible({ ...missing, mode: 'ordinary' }, fixture),
+    true,
+  );
 });
 
 test('pair requests preserve decimal strings and fixed roles without enabling the group', () => {

@@ -65,6 +65,8 @@ class FakeNetwork:
                 return encoded(entry['metadata'])
             if url.startswith(base + 'compare/'):
                 return encoded(entry['comparison'])
+            if url == base + f'releases?per_page={releases.HISTORY_PAGE}' and 'history' in entry:
+                return encoded(entry['history'])
             download = 'https://github.com/hxx344/' + module.repository + '/releases/download/deploy-' + NEW + '/'
             if url == download + 'release-manifest.json':
                 return encoded(entry['manifest'])
@@ -513,6 +515,50 @@ class CoordinatorTests(RootFixture):
         self.coordinator.apply(plan_id)
         self.coordinator.run()
         self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
+
+    def test_release_notes_cover_every_version_since_the_installed_one(self):
+        middle = 'd' * 40
+        def release(commit, created, body):
+            return {'tag_name': 'deploy-' + commit, 'draft': False, 'prerelease': False, 'body': body,
+                    'created_at': created, 'published_at': created}
+        self.network.values['hub']['metadata']['body'] = '- 最新版本的改动'
+        self.network.values['hub']['history'] = [release(NEW, '2026-10-22T20:00:00Z', '- 最新版本的改动'),
+                                                 release(middle, '2026-10-22T10:00:00Z', '- 中间版本的改动'),
+                                                 release(OLD, '2026-10-21T10:00:00Z', '- 已安装版本')]
+        result = self.check()
+        notes = result['modules'][-1]['releaseNotes']
+        self.assertTrue(notes.startswith('本次更新包含 2 个版本'))
+        self.assertIn('- 中间版本的改动', notes)
+        self.assertNotIn('- 已安装版本', notes)
+        self.assertNotIn('中间版本', json.dumps(self.coordinator.read_plan(result['planId']), ensure_ascii=False))
+        # A failed history read is display-only and keeps the latest release notes.
+        self.network.values['hub']['history'] = {'message': 'rate limited'}
+        self.clock += 180
+        self.reader = releases.Releases(self.network, arch='linux-x64')
+        self.coordinator = self.make_coordinator()
+        result = self.check()
+        self.assertEqual(result['modules'][-1]['releaseNotes'], '- 最新版本的改动')
+        self.assertEqual(result['modules'][-1]['state'], 'available')
+        # A slow history read cannot hold the check; the latest notes are shown
+        # and later checks reuse the same read instead of queueing more.
+        finished = threading.Event()
+        def slow(*args):
+            finished.wait(2)
+            return '本次更新包含 2 个版本'
+        self.clock += 180
+        with patch.object(updater, 'HISTORY_WAIT', 0.05), patch.object(self.reader, 'notes_since', side_effect=slow) as reading:
+            result = self.check()
+            self.assertEqual(result['modules'][-1]['releaseNotes'], '- 最新版本的改动')
+            self.assertIsNotNone(result['planId'])
+            self.clock += 180
+            self.check()
+            self.assertEqual(reading.call_count, 1)
+            finished.set()
+            self.reader._history_read[1].result(2)
+            self.clock += 180
+            result = self.check()
+        self.assertEqual(result['modules'][-1]['releaseNotes'], '本次更新包含 2 个版本')
+        self.assertEqual(reading.call_count, 2)
 
     def test_legacy_release_and_saved_module_without_notes_remain_compatible(self):
         original = self.reader.read

@@ -1,12 +1,27 @@
 import type { Asset, Ledger, Period, Withdrawal } from './types';
+import { knownAssetValue, sumKnownValues } from './asset-values.ts';
 
-type ValuedRow = Pick<Asset, 'project' | 'value'>;
+type ValuedRow = Pick<Asset, 'project' | 'value'> & { mode?: string; quantity?: number | null };
 export const chinaDay = (at = new Date()) => at.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
 
 // The workbook already includes this cumulative withdrawal row in its total.
 // Remove it from holdings before adding it back to the adjusted measure.
 export function embeddedWithdrawals(rows: ValuedRow[]) {
-  return rows.filter(row => row.project.trim() === '出金').reduce((sum, row) => sum + (row.value ?? 0), 0);
+  return sumKnownValues(rows.filter(row => row.project.trim() === '出金')).total;
+}
+
+export function compareEmbeddedWithdrawals(previous: (ValuedRow & { id: string })[], current: (ValuedRow & { id: string })[]) {
+  const byId = (rows: (ValuedRow & { id: string })[]) => new Map(rows.filter(row => row.project.trim() === '出金').map(row => [row.id, row]));
+  const before = byId(previous), after = byId(current);
+  let change = 0, partial = false;
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const old = before.get(id), next = after.get(id);
+    const previousValue = old ? knownAssetValue(old) : null, currentValue = next ? knownAssetValue(next) : null;
+    // A missing amount or unmatched cumulative workbook row is not a recorded cash flow.
+    if (previousValue === null || currentValue === null) partial = true;
+    else change += currentValue - previousValue;
+  }
+  return { change, partial };
 }
 
 export function recordedWithdrawals(withdrawals: Pick<Withdrawal, 'date' | 'amount'>[], date: string) {

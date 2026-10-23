@@ -105,7 +105,8 @@ class _Harness:
         return WALL + self.ticks - 100
 
     def refresh(self, *, good=True):
-        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": self.wall, "capacities": {"5": "1000000"}}
+        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": self.wall, "capacities": {"5": "1000000"},
+                                      "capacity_checked_at": {"5": self.wall}}
         self.engine.view("test", snapshot={"timestamp": self.wall, "positions": [{"symbol": SYMBOL, "leverage": 5}]})
         ask = "100" if good else "101"
         self.quote.book.return_value = Book(dec("100"), dec(ask), dec("1000"), dec("1000"), dec("100"), self.wall)
@@ -328,6 +329,7 @@ class CycleWSSchedulerTests(unittest.TestCase):
             elif step == 3:
                 h.ticks = 101.5
                 h.engine.markets[SYMBOL]["checked_at"] = h.wall
+                h.engine.markets[SYMBOL]["capacity_checked_at"]["5"] = h.wall
                 held.complete = True
                 self.assertFalse(h.engine.work("test").cycle.deferred)
             elif step == 4:

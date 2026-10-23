@@ -66,6 +66,130 @@ test('daily snapshot overrides original columns; future, archived and invalid da
   assert.equal(day.unattributed, -10, 'workbook total above its row sum has no row source');
 });
 
+test('unknown existing asset values are not compared as zero or attributed as gains and losses', () => {
+  const [day] = calculateDailyChanges({ ...base, snapshots: [
+    snap('2026-10-21', [row('row-1', 'unknown-next', 100), row('row-2', 'known', 100)]),
+    snap('2026-10-22', [row('row-1', 'unknown-next', null), row('row-2', 'known', 120)]),
+  ] }).days;
+  assert.equal(day.partial, true, 'legacy snapshots also derive completeness from their rows');
+  assert.equal(day.change, -80, 'the displayed difference remains the difference of known subtotals');
+  assert.deepEqual(day.sources.map(source => [source.project, source.change]), [['known', 20]]);
+  assert.equal(day.unattributed, -100, 'a changed known-value range is not an asset loss');
+  const [zero] = calculateDailyChanges({ ...base, snapshots: [
+    snap('2026-10-21', [row('row-1', 'known', 100)]),
+    snap('2026-10-22', [row('row-1', 'known', 0)]),
+  ] }).days;
+  assert.equal(zero.partial, false);
+  assert.equal(zero.sources[0].change, -100, 'a genuine zero remains a known loss');
+});
+
+test('legacy market zeros moving to or from a known quantity stay unattributed; genuine zero remains comparable', () => {
+  const market = (quantity: number | null, value: number) => ({ ...row('row-2', 'virtual', value), mode: 'market', quantity });
+  for (const [previous, current, difference] of [
+    [market(null, 0), market(20, 50), 50],
+    [market(20, 50), market(null, 0), -50],
+  ] as const) {
+    const [day] = calculateDailyChanges({ ...base, snapshots: [
+      snap('2026-10-21', [row('row-1', 'known', 100), previous], { partial: false }),
+      snap('2026-10-22', [row('row-1', 'known', 100), current], { partial: false }),
+    ] }).days;
+    assert.equal(day.partial, true);
+    assert.deepEqual(day.sources, []);
+    assert.equal(day.withdrawnChange, 0);
+    assert.equal(day.change, difference);
+    assert.equal(day.unattributed, difference);
+  }
+  const [zero] = calculateDailyChanges({ ...base, snapshots: [
+    snap('2026-10-21', [row('row-1', 'known', 100), market(0, 0)]),
+    snap('2026-10-22', [row('row-1', 'known', 100), market(20, 50)]),
+  ] }).days;
+  assert.equal(zero.partial, false);
+  assert.equal(zero.sources[0].change, 50);
+  assert.equal(zero.unattributed, 0);
+});
+
+test('missing embedded withdrawals are not fabricated flows and real zero amounts remain comparable', () => {
+  for (const [previous, current, expectedWithdrawn, expectedUnattributed, partial] of [
+    [null, 100, 0, 100, true], [100, null, 0, -100, true],
+    [100, 0, -100, 0, false], [0, 100, 100, 0, false],
+  ] as const) {
+    const [day] = calculateDailyChanges({ ...base, snapshots: [
+      snap('2026-10-21', [row('row-1', 'known', 100), row('row-2', ' 出金 ', previous)], { withdrawn: previous ?? 0, partial: false }),
+      snap('2026-10-22', [row('row-1', 'known', 100), row('row-2', '出金', current)], { withdrawn: current ?? 0, partial: false }),
+    ] }).days;
+    assert.equal(day.partial, partial);
+    assert.deepEqual(day.sources, []);
+    assert.equal(day.heldChange, 0);
+    assert.equal(day.withdrawnChange, expectedWithdrawn);
+    assert.equal(day.unattributed, expectedUnattributed);
+    assert.equal(day.change, day.withdrawnChange + day.unattributed);
+  }
+});
+
+test('known embedded withdrawal pairs and real recorded withdrawals remain attributable beside an unknown row', () => {
+  const [day] = calculateDailyChanges({ ...base, withdrawals: [{ date: '2026-10-22', amount: 25 }], snapshots: [
+    snap('2026-10-21', [row('row-1', 'known', 100), row('row-2', '出金', null), row('row-3', '出金', 20)]),
+    snap('2026-10-22', [row('row-1', 'known', 90), row('row-2', '出金', 100), row('row-3', '出金', 30)]),
+  ] }).days;
+  assert.equal(day.partial, true);
+  assert.equal(day.sources[0].change, -10);
+  assert.equal(day.withdrawnChange, 35, 'only the known original pair (+10) and the actual record (+25) are flows');
+  assert.equal(day.unattributed, 100);
+  assert.equal(day.change, 125);
+  assert.equal(day.change, day.sources.reduce((sum, source) => sum + source.change, 0) + day.withdrawnChange + day.unattributed);
+});
+
+test('unmatched cumulative workbook withdrawal rows are not treated as new recorded withdrawals', () => {
+  for (const added of [true, false]) {
+    const holding = row('row-1', 'known', 100), embedded = row('row-2', '出金', 100);
+    const [day] = calculateDailyChanges({ ...base, snapshots: [
+      snap('2026-10-21', added ? [holding] : [holding, embedded]),
+      snap('2026-10-22', added ? [holding, embedded] : [holding]),
+    ] }).days;
+    assert.equal(day.partial, true);
+    assert.equal(day.withdrawnChange, 0);
+    assert.equal(day.unattributed, added ? 100 : -100);
+  }
+});
+
+test('daily reader preserves legacy market unknown quantities and compares a genuine zero correctly', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const rows = [
+    { date: '2026-10-20', quantity: null, value: 0 }, { date: '2026-10-21', quantity: 20, value: 50 },
+    { date: '2026-10-22', quantity: 0, value: 0 }, { date: '2026-10-23', quantity: null, value: 0 },
+  ].map(({ date, quantity, value }) => ({
+    id: 'daily-' + date, date, total: 100 + value, partial: false, missingValues: 0,
+    assets: [row('row-1', 'known', 100), { ...row('row-2', 'virtual', value), quantity, price: 2.5, mode: 'market' }],
+  }));
+  await database.batch(rows.map(snapshot => database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('owner', snapshot.date, JSON.stringify(snapshot))));
+  const report = await readDailyChanges(database, 'owner', Date.parse('2026-10-23T04:00:00Z'));
+  assert.deepEqual(report.days.map(day => [day.change, day.partial, day.unattributed]), [[0, true, 0], [-50, false, 0], [50, true, 50]]);
+  assert.deepEqual(report.days.map(day => day.sources.map(source => source.change)), [[], [-50], []]);
+  const stored = await database.prepare('SELECT data FROM snapshots WHERE owner=? ORDER BY date').bind('owner').all<{ data: string }>();
+  assert.deepEqual(stored.results.map(row => row.data), rows.map(row => JSON.stringify(row)));
+});
+
+test('reader detects missing original withdrawals in both workbook columns and daily snapshots', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const columns = [
+    { id: 'E1', date: '2026-10-21', total: 100, rows: [row('row-1', 'known', 100), row('row-2', '出金', null)] },
+    { id: 'F1', date: '2026-10-22', total: 200, rows: [row('row-1', 'known', 100), row('row-2', '出金', 100)] },
+  ];
+  await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('source', 'source-ledger', JSON.stringify({ baselineDate: '2026-10-21', periods: columns })).run();
+  await database.batch(columns.map(({ rows, ...period }) => database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('daily', period.date, JSON.stringify({
+    ...period, id: 'daily-' + period.date, partial: false, withdrawn: period.total - 100, assets: rows,
+  }))));
+  for (const owner of ['source', 'daily']) {
+    const [day] = (await readDailyChanges(database, owner, Date.parse('2026-10-23T04:00:00Z'))).days;
+    assert.equal(day.partial, true);
+    assert.equal(day.withdrawnChange, 0);
+    assert.equal(day.unattributed, 100);
+    assert.deepEqual(day.sources, []);
+  }
+});
+
 test('recorded withdrawals before the workbook baseline are not counted twice on original columns', () => {
   const report = calculateDailyChanges({ ...base, baselineDate: '2026-10-21', withdrawals: [{ date: '2026-10-21', amount: 30 }], snapshots: [
     { id: 'E1', date: '2026-10-21', total: 100, rows: [row('row-1', 'a', 100)] },
