@@ -338,3 +338,32 @@ test('closing during a background status read neither persists the result nor ca
   assert.equal(f.persisted.maintenance, true);
   assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
 });
+
+test('a restarted trading module is released without a browser status read and stays held under a durable latch', async t => {
+  for (const maintenance of [false, true]) {
+    await t.test(`maintenance ${maintenance}`, async t => {
+      const f = fixture({ maintenance, releasePollMs: 10 });
+      t.after(() => f.coordinator.close());
+      await f.coordinator.initialize();
+      // The restarted module comes back in maintenance and is briefly unreachable.
+      f.active.greeks = true;
+      let failures = 1;
+      f.handlers['gate:greeks'] = active => {
+        if (failures-- > 0) throw new Error('module still starting');
+        return { data: { active } };
+      };
+      // Retries read updater status: an idle updater releases, a running job keeps the latch.
+      f.updaterState = maintenance ? state('running') : state();
+      await f.coordinator.resynchronize();
+      await until(() => failures < 0);
+      await until(() => f.active.greeks === maintenance);
+      assert.deepEqual(f.active, { crossex: maintenance, greeks: maintenance, aster: maintenance });
+      assert.equal(f.persisted.maintenance, maintenance);
+    });
+  }
+  const closed = fixture();
+  await closed.coordinator.close();
+  const events = closed.events.length;
+  await closed.coordinator.resynchronize();
+  assert.equal(closed.events.length, events, 'no module call after close');
+});

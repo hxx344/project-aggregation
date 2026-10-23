@@ -281,6 +281,13 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     })();
     return pending.promise;
   }
+  // A restarted trading module starts in maintenance. Resynchronize at once
+  // instead of waiting for a browser status read; failures retry via watchRelease.
+  function resynchronize() {
+    if (closed) return Promise.resolve();
+    synchronized = false;
+    return synchronizeModules().catch(() => {});
+  }
   async function close() { closed = true; clearTimeout(watcher); await polling; }
-  return { status, check, apply, token, withExecutionEntry, initialize: synchronizeModules, close };
+  return { status, check, apply, token, withExecutionEntry, initialize: synchronizeModules, resynchronize, close };
 }

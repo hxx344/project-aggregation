@@ -40,7 +40,8 @@ try {
   if (closing) throw new Error('工作台启动已中止');
   assertRecoveryStartup(dataDir);
   accountWriter = createAccountWriter({ ...writerContext, moduleId: 'hub' });
-  modules = await startModules({ dataDir, logger, writerContext, onStarting: handle => { moduleStartup = handle; }, onFailure: error => { logger.error({ err: error }, '内嵌模块已停止，正在关闭工作台'); void shutdown(1); } });
+  // Before createApp returns, its own initialize() performs the first synchronization.
+  modules = await startModules({ dataDir, logger, writerContext, onStarting: handle => { moduleStartup = handle; }, onModuleReady: () => { void app?.resynchronizeModules(); }, onFailure: error => { logger.error({ err: error }, '内嵌模块已停止，正在关闭工作台'); void shutdown(1); } });
   runtimeLock.assertHeld();
   if (closing) throw new Error('工作台启动已中止');
   app = await createApp({ logger, dataDir, embeddedModules: true, accountWriter });

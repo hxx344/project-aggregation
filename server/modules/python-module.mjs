@@ -10,6 +10,9 @@ const HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', '
 export async function createPythonModule({ root, secret, env, executable, application, label,
   privateHeaders, requestTimeout = 60_000, startupTimeout = 90_000, shutdownTimeout = 10_000, requireWriterProtection = false }) {
   const child = spawn(executable, ['-u', bridge, application, String(shutdownTimeout / 1000)], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  // Windows has no process group to probe; the supervisor waits for this pid
+  // before starting a successor.
+  if (process.platform === 'win32' && child.pid) process.send?.({ type: 'child', pid: child.pid });
   const pending = new Map();
   let counter = 0, buffer = '', closing = false, ready = false, failed = false;
   let resolveReady, rejectReady;
