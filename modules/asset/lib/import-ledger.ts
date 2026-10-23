@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { chinaDate, db, getLedger, lock, unlock } from './store';
 import { seedLedger, type SourceLedger } from './seed';
 import { EXAMPLE_SOURCE, parseSource, isGateProject } from './source-ledger';
+import { snapshotValues, quantityValue, withMarketQuantity, UNKNOWN_QUANTITY_ERROR } from './asset-values';
 import type { Asset, Ledger } from './types';
 
 function importPlan(source: SourceLedger, current: Ledger, previous: SourceLedger) {
@@ -31,9 +32,9 @@ function importPlan(source: SourceLedger, current: Ledger, previous: SourceLedge
     if (asset.mode === 'market') {
       const quantity = edited(saved) ? saved.quantity : asset.quantity;
       if (edited(saved)) retained.push(asset.project + ' 手动数量');
-      const fresh = saved.price !== null && !saved.error && Date.now() - Date.parse(saved.updatedAt) < 900000;
-      if (fresh) return { ...saved, id: asset.id, cell: asset.cell, quantity, value: (quantity ?? 0) * saved.price! };
-      return { ...asset, quantity, value: quantity === null || asset.price === null ? null : quantity * asset.price };
+      const fresh = saved.price !== null && (!saved.error || saved.error === UNKNOWN_QUANTITY_ERROR) && Date.now() - Date.parse(saved.updatedAt) < 900000;
+      if (fresh) return withMarketQuantity({ ...saved, id: asset.id, cell: asset.cell }, quantity);
+      return { ...asset, quantity, value: quantityValue(quantity, asset.price) };
     }
     return asset;
   });
@@ -82,9 +83,9 @@ export async function importLedger(owner: string, input: unknown, apply: boolean
       ...previous.periods.map(({ rows, ...period }) => ({ ...period, assets: rows })),
       ...snapshots.results.map(row => JSON.parse(row.data)),
     ].map((period, index) => ({ ...period, id: `archive-${batchId}-${index}`, archived: true }));
-    const date = chinaDate(), total = plan.ledger.assets.reduce((sum, a) => sum + (a.value ?? 0), 0);
+    const date = chinaDate(), { total, partial, missingValues } = snapshotValues(plan.ledger.assets, plan.ledger.fxStatus);
     const today = { id: 'daily-' + date, date, total, fx: plan.ledger.fx, fxStatus: plan.ledger.fxStatus, cny: total * plan.ledger.fx, future: false, difference: 0,
-      partial: plan.ledger.assets.some(a => a.mode !== 'manual' && (!!a.error || Date.now() - Date.parse(a.updatedAt) > 900000)),
+      partial, missingValues,
       updatedAt: new Date().toISOString(), assets: plan.ledger.assets };
     const settings: Record<string, string> = { 'source-ledger': JSON.stringify(source), 'source-import-hash': fingerprint, fx: String(plan.ledger.fx), 'fx-status': JSON.stringify(plan.ledger.fxStatus), 'last-attempt': '0' };
     await db().batch([

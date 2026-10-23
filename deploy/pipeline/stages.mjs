@@ -7,14 +7,20 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseEnvFile, renderEnvFile } from './config.mjs';
 import { formatInvocation, probeVersion } from './exec.mjs';
 import { hashFile } from './digest.mjs';
+import { snapshotFile, restoreFile } from './config-files.mjs';
+import { releasePaths, validateRelease } from './release-manifest.mjs';
 
 const TOOLCHAIN_COMMANDS = new Set(['git', 'bash', 'python3', 'python', 'sudo']);
 
 export function expandPath(ctx, template) {
-  return template.replaceAll('{env}', ctx.env);
+  const config = ctx.profile?.stages?.config;
+  return template.replaceAll('{releaseDirectory}', ctx.profile?.stages?.package?.releaseDirectory ?? '')
+    .replaceAll('{target}', config?.target ?? '').replaceAll('{applyTarget}', config?.applyTarget ?? '')
+    .replaceAll('{env}', ctx.env);
 }
 
 /** 健康检查地址支持 {env} 与 {PORT}，避免端口改了但探测地址没跟着改。 */
@@ -39,8 +45,15 @@ function requireStage(ctx, id) {
 }
 
 async function runCommands(ctx, id, commands) {
-  for (const [index, command] of commands.entries()) {
+  for (const [index, original] of commands.entries()) {
+    const command = { ...original, args: (original.args ?? []).map(arg => expandPath(ctx, arg)) };
     const result = await ctx.exec(command, id);
+    // 终止不明优先于日志写入，不能让日志故障掩盖仍可能写入的进程。
+    if (result.terminationUnconfirmed) {
+      const error = new Error(`命令进程树终止未确认，保留环境锁并暂停补偿：pid ${result.pid}${result.terminationReason ? `；${result.terminationReason}` : ''}`);
+      error.detail = result;
+      throw error;
+    }
     ctx.journal({
       type: 'command',
       stage: id,
@@ -67,13 +80,29 @@ async function runCommands(ctx, id, commands) {
 }
 
 function assertOutputs(ctx, id) {
-  const outputs = requireStage(ctx, id).outputs ?? [];
+  const outputs = (requireStage(ctx, id).outputs ?? []).map(item => expandPath(ctx, item));
   const missing = outputs.filter(relative => {
     const absolute = path.resolve(ctx.root, relative);
     return !existsSync(absolute) || !statSync(absolute).isFile() || statSync(absolute).size === 0;
   });
   if (missing.length) throw new Error(`阶段 ${id} 缺少产物：${missing.join('、')}`);
   return outputs;
+}
+
+async function privilegedConfigFile(ctx, operation, ...args) {
+  // 无交互、无重试；60 秒命令时限之外沿用执行器有界终止预算。
+  const result = await ctx.exec({
+    cmd: 'sudo',
+    args: ['-n', process.execPath, fileURLToPath(new URL('./config-files.mjs', import.meta.url)), operation, ...args],
+    timeoutMs: 60000,
+  }, 'config');
+  if (result.terminationUnconfirmed) {
+    const error = new Error(`配置文件操作的进程终止未确认，保留环境锁${result.terminationReason ? `；${result.terminationReason}` : ''}`);
+    error.detail = result;
+    throw error;
+  }
+  if (result.timedOut || result.code !== 0) throw new Error(`系统配置 ${operation} 失败：${result.tail ?? ''}`);
+  return operation === 'snapshot' ? JSON.parse(result.tail) : undefined;
 }
 
 export const STAGES = {
@@ -103,8 +132,9 @@ export const STAGES = {
       }
       for (const command of [...requiredCommands].sort()) {
         try {
-          await probeVersion(command, { platform: ctx.platform, npmExecPath: ctx.npmExecPath });
-        } catch {
+          await probeVersion(command, { platform: ctx.platform, npmExecPath: ctx.npmExecPath, commandLock: ctx.commandLock, stageId: 'preflight' });
+        } catch (error) {
+          if (error.detail?.terminationUnconfirmed || error.detail?.lockRetained) throw error;
           findings.push(`缺少命令：${command}（阶段 ${ctx.profile.id} 需要）`);
         }
       }
@@ -143,13 +173,21 @@ export const STAGES = {
     id: 'config',
     title: '配置渲染',
     async snapshot(ctx) {
-      const target = path.resolve(ctx.root, expandPath(ctx, requireStage(ctx, 'config').target));
-      const backup = existsSync(target) ? path.join(ctx.paths.backupDir, `${ctx.env}-${Date.now()}.env`) : null;
-      if (backup) {
-        mkdirSync(path.dirname(backup), { recursive: true });
-        copyFileSync(target, backup);
+      const spec = requireStage(ctx, 'config');
+      const target = path.resolve(ctx.root, expandPath(ctx, spec.target));
+      if (ctx.options.dryRun) return { target };
+      // 共享目录始终由流水线用户创建，root 只创建自己的隔离子目录。
+      mkdirSync(ctx.paths.backupDir, { recursive: true, mode: 0o700 });
+      const snapshot = snapshotFile(target, path.join(ctx.paths.backupDir, 'rendered.env'));
+      if (ctx.options.apply && spec.applyCommands?.length) {
+        const appliedTarget = path.resolve(ctx.root, expandPath(ctx, spec.applyTarget));
+        const backup = path.join(ctx.paths.backupDir, ...(spec.applyWithSudo ? ['privileged'] : []), 'applied.env');
+        const applied = spec.applyWithSudo
+          ? await privilegedConfigFile(ctx, 'snapshot', appliedTarget, backup)
+          : snapshotFile(appliedTarget, backup);
+        snapshot.applied = { ...applied, sudo: Boolean(spec.applyWithSudo) };
       }
-      return { target, backup, existed: Boolean(backup) };
+      return snapshot;
     },
     async run(ctx) {
       const spec = requireStage(ctx, 'config');
@@ -161,7 +199,8 @@ export const STAGES = {
         return;
       }
       mkdirSync(path.dirname(snapshot.target), { recursive: true });
-      writeFileSync(snapshot.target, renderEnvFile(ctx.profile, ctx.resolved));
+      if (existsSync(snapshot.target)) chmodSync(snapshot.target, 0o600);
+      writeFileSync(snapshot.target, renderEnvFile(ctx.profile, ctx.resolved), { mode: 0o600 });
       chmodSync(snapshot.target, 0o600);
       ctx.logger.info('config.rendered', `已生成 ${path.relative(ctx.root, snapshot.target)}（权限 0600）`);
       const applyCommands = spec.applyCommands ?? [];
@@ -186,14 +225,18 @@ export const STAGES = {
     },
     async compensate(ctx, snapshot) {
       if (!snapshot?.target) return;
-      if (snapshot.existed && snapshot.backup && existsSync(snapshot.backup)) {
-        copyFileSync(snapshot.backup, snapshot.target);
-        chmodSync(snapshot.target, 0o600);
-        ctx.logger.warn('config.restored', `已恢复上一份配置：${path.relative(ctx.root, snapshot.target)}`);
-        return;
+      const failures = [];
+      for (const item of [snapshot.applied, snapshot].filter(Boolean)) {
+        try {
+          if (item.sudo) await privilegedConfigFile(ctx, 'restore', JSON.stringify(item));
+          else restoreFile(item);
+          ctx.logger.warn('config.restored', `已恢复配置原状态：${item.target}`);
+        } catch (error) {
+          if (error.detail?.terminationUnconfirmed) throw error;
+          failures.push(`${item.target}：${error.message}；保留备份 ${item.backup ?? '(原文件不存在，应删除新文件)'}`);
+        }
       }
-      rmSync(snapshot.target, { force: true });
-      ctx.logger.warn('config.removed', `已移除本次生成的配置：${path.relative(ctx.root, snapshot.target)}`);
+      if (failures.length) throw new Error(`配置未完全回滚：${failures.join('；')}`);
     },
   },
 
@@ -230,7 +273,8 @@ export const STAGES = {
     title: '打包',
     async snapshot(ctx) {
       const spec = requireStage(ctx, 'package');
-      const manifests = (spec.outputs ?? []).filter(item => item.endsWith('.json'));
+      const paths = releasePaths(ctx);
+      const manifests = [...paths.manifests, paths.merged];
       const saved = [];
       for (const relative of manifests) {
         const target = path.resolve(ctx.root, relative);
@@ -238,7 +282,7 @@ export const STAGES = {
           saved.push({ relative, target, backup: null, existed: false });
           continue;
         }
-        const backup = path.join(ctx.paths.backupDir, `${path.basename(relative)}.${Date.now()}.bak`);
+        const backup = path.join(ctx.paths.backupDir, `${saved.length}-${path.basename(relative)}.bak`);
         mkdirSync(path.dirname(backup), { recursive: true });
         copyFileSync(target, backup);
         saved.push({ relative, target, backup, existed: true });
@@ -248,21 +292,15 @@ export const STAGES = {
     async run(ctx) {
       const spec = requireStage(ctx, 'package');
       if (spec.enabled === false) return { deferred: true, reason: '本环境不打包' };
+      if (!ctx.options.dryRun) {
+        const paths = releasePaths(ctx);
+        for (const file of [...paths.manifests, paths.merged]) rmSync(file, { force: true });
+      }
       await runCommands(ctx, 'package', spec.commands ?? []);
     },
     validate(ctx) {
-      const outputs = assertOutputs(ctx, 'package');
-      const manifestPath = outputs.find(item => item.endsWith('.json'));
-      if (!manifestPath) return outputs;
-      const manifest = JSON.parse(readFileSync(path.resolve(ctx.root, manifestPath), 'utf8'));
-      if (ctx.git.commit && manifest.commit !== ctx.git.commit) {
-        throw new Error(`发布清单提交 ${String(manifest.commit).slice(0, 12)} 与当前提交 ${ctx.git.commit.slice(0, 12)} 不一致`);
-      }
-      const artifact = manifest.artifact ?? {};
-      if (!/^[0-9a-f]{64}$/.test(String(artifact.sha256 ?? ''))) throw new Error('发布清单缺少有效的 SHA-256');
-      const artifactPath = path.join(path.dirname(path.resolve(ctx.root, manifestPath)), artifact.file ?? '');
-      if (!artifact.file || !existsSync(artifactPath)) throw new Error(`发布包缺失：${artifact.file ?? '(未声明)'}`);
-      return outputs;
+      assertOutputs(ctx, 'package');
+      return validateRelease(ctx);
     },
     async compensate(ctx, snapshot) {
       for (const item of snapshot?.manifests ?? []) {
@@ -287,20 +325,11 @@ export const STAGES = {
       if (spec.requiresConfirmation && ctx.trigger === 'manual' && !ctx.options.confirmProd) {
         return { deferred: true, reason: '手动发布需要 --confirm-prod' };
       }
+      if (!ctx.options.dryRun) validateRelease(ctx);
       await runCommands(ctx, 'publish', spec.commands ?? []);
     },
     validate(ctx) {
-      const packageSpec = ctx.profile.stages?.package;
-      const manifestPath = (packageSpec?.outputs ?? []).find(item => item.endsWith('.json'));
-      if (!manifestPath) return [];
-      const absolute = path.resolve(ctx.root, expandPath(ctx, manifestPath));
-      if (!existsSync(absolute)) throw new Error(`发布前缺少打包清单：${manifestPath}`);
-      const manifest = JSON.parse(readFileSync(absolute, 'utf8'));
-      if (!String(manifest.tag ?? '').startsWith('deploy-')) throw new Error(`发布清单标签不是 deploy-*：${manifest.tag ?? '(缺失)'}`);
-      if (ctx.git.commit && manifest.commit !== ctx.git.commit) {
-        throw new Error(`发布清单提交 ${String(manifest.commit).slice(0, 12)} 与当前提交 ${ctx.git.commit.slice(0, 12)} 不一致`);
-      }
-      return [manifestPath];
+      return validateRelease(ctx);
     },
     manualRollback: '远端 Release 不能由本地自动撤回：请在 GitHub 将上一正式版重新标记为 latest，并核对清单提交与 SHA-256。',
   },

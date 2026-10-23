@@ -49,6 +49,22 @@ test('zero and negative starting assets are unknown rates, not zero returns', ()
   close(annualized([point('2024-01-01', 100), point('2024-01-31', 0)]).overallAnnualized, -366 / 30);
 });
 
+test('missing endpoint valuations suppress returns while an unknown intermediate value does not change known endpoints', () => {
+  for (const index of [0, 1]) {
+    const data = [point('2024-01-01', 100), point('2024-01-31', 110)].map((row, current) => current === index ? { ...row, missingValues: 1 } : row);
+    const monthly = calculateMonthlyPerformance(data);
+    assert.equal(monthly[0].gain, null);
+    assert.equal(monthly[0].returnRate, null);
+    const metrics = annualized(data);
+    assert.equal(metrics.monthlyAnnualized, null);
+    assert.equal(metrics.overallAnnualized, null);
+  }
+  const complete = [point('2024-01-01', 100), point('2024-01-31', 110)];
+  const intermediate = [complete[0], { ...point('2024-01-15', 20), missingValues: 1 }, complete[1]];
+  close(annualized(intermediate).overallAnnualized, annualized(complete).overallAnnualized!);
+  close(annualized(intermediate).monthlyAnnualized, annualized(complete).monthlyAnnualized!);
+});
+
 test('annualization uses elapsed days and actual calendar-year lengths', () => {
   const leap = annualized([point('2024-01-01', 100), point('2024-12-31', 110)], '2025-01-01');
   assert.equal(leap.daysSpan, 365);

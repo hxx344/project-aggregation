@@ -99,14 +99,17 @@ export function MarketPanel({
                     ) : null}
                   </TableCell>
                   {SUPPORTED_LEVERAGES.map((v) => {
-                    const stamp =
-                      m?.capacity_checked_at?.[v] ?? m?.checked_at ?? 0;
+                    const stamp = m?.capacity_checked_at?.[v];
                     const tierLive =
-                      live && now - stamp >= -1 && now - stamp <= 8;
+                      live &&
+                      typeof stamp === 'number' &&
+                      Number.isFinite(stamp) &&
+                      now - stamp >= -1 &&
+                      now - stamp <= 8;
                     return (
                       <TableCell
                         key={v}
-                        className={`number ${ordinaryCapacityReady(m?.capacities?.[v], account?.policy.threshold || '10000', tierLive, ordinaryBlock) ? 'mint' : ''}`}
+                        className={`number ${ordinaryCapacityReady(m?.capacities?.[v], account?.policy.threshold, tierLive, ordinaryBlock) ? 'mint' : ''}`}
                       >
                         <span className="mobile-cell-label">{v}x 额度</span>
                         {tierLive ? fmt(m?.capacities?.[v], 0) : '—'}

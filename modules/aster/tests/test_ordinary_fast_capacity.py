@@ -122,12 +122,13 @@ class OrdinaryFastCapacityTests(unittest.TestCase):
         other = account("other")
         other["policy"]["symbols"] = list(SYMBOLS)
         other["policy"]["ordinary_symbol"] = CL
-        self.engine.wake_capacity_accounts(XAU, {5: dec(500000)}, time.time(), [owner, other])
+        now = time.time()
+        self.engine.wake_capacity_accounts(XAU, {5: dec(500000)}, now, [owner, other], capacity_checked_at={"5": now})
         self.assertIn(XAU, self.engine.work("test").priority)
         self.assertFalse(self.engine.work("other").priority)
-        self.engine.wake_capacity_accounts(CL, {5: dec(10000)}, time.time(), [other])
+        self.engine.wake_capacity_accounts(CL, {5: dec(10000)}, now, [other], capacity_checked_at={"5": now})
         self.assertFalse(self.engine.work("other").priority)
-        self.engine.wake_capacity_accounts(CL, {5: dec("10000.01")}, time.time(), [other])
+        self.engine.wake_capacity_accounts(CL, {5: dec("10000.01")}, now, [other], capacity_checked_at={"5": now})
         self.assertIn(CL, self.engine.work("other").priority)
 
     def test_successful_5x_fill_rearms_only_on_the_next_sample(self):
@@ -313,8 +314,10 @@ class OrdinaryFastSchedulerTests(unittest.TestCase):
         def control(step):
             if step == 1:
                 h.ticks = 100.2
-                h.engine.markets[XAU] = {"status": "ok", "checked_at": h.wall, "capacities": {"5": "500000"}}
-                h.engine.wake_capacity_accounts(XAU, {5: dec(500000)}, h.wall, [owner])
+                h.engine.markets[XAU] = {"status": "ok", "checked_at": h.wall, "capacities": {"5": "500000"},
+                                         "capacity_checked_at": {"5": h.wall}}
+                h.engine.wake_capacity_accounts(XAU, {5: dec(500000)}, h.wall, [owner],
+                                               capacity_checked_at={"5": h.wall})
             else:
                 h.engine.shutdown.set()
 

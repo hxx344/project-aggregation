@@ -23,6 +23,18 @@ def number(value):
     return result
 
 
+def parse_execution(row):
+    qty, price, fee = (number(row[field]) for field in ("execQty", "execPrice", "execFee"))
+    if not row.get("execId") or qty <= 0 or price < 0 or row.get("side") not in {"Buy", "Sell"}:
+        raise ValueError("Invalid execution history")
+    return ExecutionRecord(symbol=row["symbol"], side=row["side"], order_id=row.get("orderId", ""),
+        order_link_id=row.get("orderLinkId", ""), exec_id=row["execId"], exec_fee=float(fee), fee_currency=row.get("feeCurrency", ""),
+        exec_price=float(price), exec_qty=float(qty), exec_time=datetime.fromtimestamp(int(row["execTime"]) / 1000, timezone.utc),
+        fee_rate=float(number(row["feeRate"])) if row.get("feeRate") not in (None, "") else None,
+        closed_size=float(number(row["closedSize"])) if row.get("closedSize") not in (None, "") else None,
+        exec_type=row.get("execType") or "Trade")
+
+
 def stamp(value):
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -381,15 +393,7 @@ class PerformanceMixin:
                 start_ms = max(self.performance_start_ms, self.performance_cursor_ms - overlap_ms)
                 end_ms = min(now_ms, start_ms + 7 * 86400000 - 1)
                 raw = await self.client.execution_history(start_ms, end_ms)
-                records = []
-                for row in raw:
-                    qty, price, fee = (number(row[field]) for field in ("execQty", "execPrice", "execFee"))
-                    if not row.get("execId") or qty <= 0 or price < 0 or row.get("side") not in {"Buy", "Sell"}:
-                        raise ValueError("Invalid execution history")
-                    records.append(ExecutionRecord(symbol=row["symbol"], side=row["side"], order_id=row.get("orderId", ""),
-                        order_link_id=row.get("orderLinkId", ""), exec_id=row["execId"], exec_fee=float(fee), fee_currency=row.get("feeCurrency", ""),
-                        exec_price=float(price), exec_qty=float(qty), exec_time=datetime.fromtimestamp(int(row["execTime"]) / 1000, timezone.utc),
-                        closed_size=float(number(row["closedSize"])) if row.get("closedSize") not in (None, "") else None, exec_type=row.get("execType") or "Trade"))
+                records = [parse_execution(row) for row in raw]
                 self._archive_performance(records)
                 self.performance_cursor_ms = end_ms
                 self.performance_updated_at = now.isoformat()

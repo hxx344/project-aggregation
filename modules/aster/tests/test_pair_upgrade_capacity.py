@@ -142,7 +142,9 @@ class PairUpgradeExecutionTests(TestCase):
         self.publish("30000")
 
     def publish(self, capacity):
-        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": time.time(),
+        now = time.time()
+        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": now,
+                                      "capacity_checked_at": {"10": now, "20": now},
                                       "capacities": {"10": "100000", "20": capacity}}
 
     def tick(self):

@@ -11,7 +11,6 @@
  *
  * 退出码：0 成功；1 阶段失败；2 参数或配置错误；3 触发条件不满足；4 环境锁被占用。
  */
-import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -20,6 +19,7 @@ import { ConfigError, loadProfile, parseEnvFile, resolveConfig, configFingerprin
 import { ENV_IDS, STATUS, STAGE_ORDER } from './constants.mjs';
 import { snapshotOutputs } from './digest.mjs';
 import { CommandError, probeVersion, runCommand } from './exec.mjs';
+import { publicationEnvironment } from './identity.mjs';
 import { createLogger } from './logger.mjs';
 import { buildPlan, computeInputKey, evaluateGuards, planRollback, shouldSkip } from './plan.mjs';
 import { STAGES, expandPath } from './stages.mjs';
@@ -94,20 +94,23 @@ function parseArgs(argv) {
   return options;
 }
 
-function gitContext(root) {
-  const run = args => {
-    try {
-      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    } catch {
-      return '';
-    }
-  };
-  return {
-    commit: run(['rev-parse', 'HEAD']),
-    branch: run(['rev-parse', '--abbrev-ref', 'HEAD']),
-    tag: run(['describe', '--tags', '--exact-match']),
-    dirty: Boolean(run(['status', '--porcelain'])),
-  };
+async function readGitContext(root, commandLock) {
+  const result = await runCommand({
+    command: { cmd: process.execPath, args: [fileURLToPath(new URL('./git-context.mjs', import.meta.url))] },
+    cwd: root, commandLock, stageId: 'identity', timeoutMs: 60000,
+  });
+  if (result.code !== 0 || result.timedOut || result.terminationUnconfirmed) {
+    const reason = result.tail.split(/\r?\n/).filter(Boolean).at(-1) ?? '';
+    throw new CommandError(`Git 身份查询失败${reason ? `：${reason}` : ''}`, result);
+  }
+  return JSON.parse(result.tail);
+}
+
+async function pnpmVersion(commandLock) {
+  try { return await probeVersion('pnpm', { commandLock, stageId: 'toolchain' }); } catch (error) {
+    if (error.detail?.terminationUnconfirmed || error.detail?.lockRetained) throw error;
+    return 'unknown';
+  }
 }
 
 function readEnvFile(root, env) {
@@ -120,13 +123,13 @@ function createRunId(git) {
   return `${stamp}-${(git.commit || 'nogit').slice(0, 8)}-${randomBytes(2).toString('hex')}`;
 }
 
-async function createContext(root, options, { runId, state }) {
+async function createContext(root, options, { runId, state, commandLock }) {
   const profile = loadProfile(root, options.env);
   const resolved = resolveConfig(profile, { env: process.env, fileValues: readEnvFile(root, options.env) });
-  const git = gitContext(root);
+  const git = await readGitContext(root, commandLock);
   const toolchain = {
     node: process.versions.node,
-    pnpm: await probeVersion('pnpm', { platform: process.platform }).catch(() => 'unknown'),
+    pnpm: await pnpmVersion(commandLock),
   };
   const pipelineDir = path.join(root, '.pipeline');
   const runDir = path.join(pipelineDir, 'runs', runId);
@@ -150,6 +153,7 @@ async function createContext(root, options, { runId, state }) {
     git,
     toolchain,
     runId,
+    commandLock,
     logger: null,
     state,
     options,
@@ -160,17 +164,23 @@ async function createContext(root, options, { runId, state }) {
     secretFingerprint: secretFingerprint(resolved),
     snapshots: {},
     journal: record => appendJournal(path.join(runDir, 'journal.jsonl'), { ts: new Date().toISOString(), runId, env: options.env, ...record }),
-    exec: (command, stageId) => runCommand({
-      command,
-      cwd: root,
-      env: childEnv,
-      timeoutMs: command.timeoutMs,
-      logFile: path.join(paths.logsDir, `${stageId}.log`),
-      dryRun: options.dryRun,
-      echo: options.echo,
-      platform: process.platform,
-      redact: secretValues,
-    }),
+    exec: async (command, stageId) => {
+      const result = await runCommand({
+        command,
+        commandLock,
+        stageId,
+        cwd: root,
+        env: stageId === 'publish' ? { ...childEnv, ...publicationEnvironment(git, process.env) } : childEnv,
+        timeoutMs: command.timeoutMs,
+        logFile: path.join(paths.logsDir, `${stageId}.log`),
+        dryRun: options.dryRun,
+        echo: options.echo,
+        platform: process.platform,
+        redact: secretValues,
+      });
+      if (result.terminationUnconfirmed) context.unsafeTermination = { pid: result.pid, commandId: result.commandId, stage: stageId, reason: result.terminationReason };
+      return result;
+    },
   };
   // 日志本身也要脱敏：logger 构造时传入敏感值，后续 child 继承。
   context.logger = createLogger({
@@ -190,10 +200,10 @@ function summarise(plan, results) {
   return lines.join('\n');
 }
 
-async function commandPlan(root, options) {
+async function commandPlan(root, options, commandLock) {
   const profile = loadProfile(root, options.env);
   const resolved = resolveConfig(profile, { env: process.env, fileValues: readEnvFile(root, options.env) });
-  const git = gitContext(root);
+  const git = await readGitContext(root, commandLock);
   const violations = evaluateGuards({ profile, trigger: options.trigger, git, options });
   const plan = buildPlan({ profile, options });
   const output = {
@@ -231,10 +241,10 @@ async function commandPlan(root, options) {
   return violations.length ? 3 : 0;
 }
 
-async function commandConfig(root, options) {
+async function commandConfig(root, options, commandLock) {
   const profile = loadProfile(root, options.env);
   const resolved = resolveConfig(profile, { env: process.env, fileValues: readEnvFile(root, options.env) });
-  const toolchain = { node: process.versions.node, pnpm: await probeVersion('pnpm', { platform: process.platform }).catch(() => 'unknown') };
+  const toolchain = { node: process.versions.node, pnpm: await pnpmVersion(commandLock) };
   const rows = (profile.config ?? []).map(entry => ({
     name: entry.name,
     type: entry.type,
@@ -276,7 +286,8 @@ async function commandStatus(root, options) {
 
 async function commandRun(root, options) {
   const profile = loadProfile(root, options.env);
-  const runId = createRunId(gitContext(root));
+  // 在首次外部查询前取得锁，提交身份随后写入运行记录。
+  const runId = createRunId({});
   const stateFile = path.join(root, '.pipeline', 'state', `${options.env}.json`);
   const state = readState(stateFile, options.env);
   const placeholder = { runId, env: options.env, directory: path.join(root, '.pipeline', 'runs', runId), secrets: [], out: process.stdout };
@@ -294,8 +305,12 @@ async function commandRun(root, options) {
 
   const startedAt = Date.now();
   let context;
+  const executed = [];
+  const results = {};
+  let currentStage = null;
+  let plan = [];
   try {
-    context = await createContext(root, options, { runId, logger, state });
+    context = await createContext(root, options, { runId, state, commandLock: lock });
     const { resolved, git, profile: loaded } = context;
     context.logger.info('run.start', `环境 ${options.env}｜触发 ${options.trigger}｜提交 ${git.commit.slice(0, 12) || '-'}${git.dirty ? '｜工作树有改动' : ''}`);
     context.journal({ type: 'run.start', trigger: options.trigger, commit: git.commit, branch: git.branch, dirty: git.dirty, configFingerprint: context.configFingerprint, toolchain: context.toolchain, options: { ...options, only: options.only, skip: options.skip } });
@@ -312,12 +327,10 @@ async function commandRun(root, options) {
       return 2;
     }
 
-    const plan = buildPlan({ profile: loaded, options });
-    const results = {};
-    const executed = [];
-    let failed = false;
+    plan = buildPlan({ profile: loaded, options });
 
     for (const item of plan) {
+      currentStage = { id: item.id, inputKey: null, startedAt: Date.now() };
       const definition = STAGES[item.id];
       const spec = loaded.stages[item.id];
       const stageLogger = context.logger.child({ stage: item.id });
@@ -329,17 +342,21 @@ async function commandRun(root, options) {
         stageLogger.info('stage.deferred', item.reason);
         continue;
       }
+      // 缓存命中也不能绕过 Actions 身份与 origin/HEAD 的一致性检查。
+      if (item.id === 'publish') publicationEnvironment(git, process.env);
 
       const inputKey = computeInputKey({
-        root, stageId: item.id, profile: loaded, spec,
+        root, stageId: item.id, profile: loaded,
+        spec: item.id === 'config' || item.id === 'activate' ? { ...spec, apply: options.apply } : spec,
         configFingerprint: context.configFingerprint,
         secretFingerprint: context.secretFingerprint,
         git, toolchain: context.toolchain,
       });
-      const outputs = snapshotOutputs(root, (spec.outputs ?? []).map(item => expandPath(context, item)));
-      const decision = definition.alwaysRun
+      currentStage.inputKey = inputKey;
+      const outputPaths = (spec.outputs ?? []).map(item => expandPath(context, item));
+      const decision = definition.alwaysRun || (item.id === 'config' && options.apply)
         ? { skip: false, reason: '每轮必跑' }
-        : shouldSkip({ state: context.state, stageId: item.id, inputKey, root, outputs, force: options.force });
+        : shouldSkip({ state: context.state, stageId: item.id, inputKey, root, outputPaths, force: options.force });
 
       if (decision.skip) {
         results[item.id] = { status: STATUS.skipped, reason: decision.reason, durationMs: 0 };
@@ -349,60 +366,41 @@ async function commandRun(root, options) {
       }
 
       stageLogger.info('stage.start', `开始：${item.title}${decision.reason ? `（${decision.reason}）` : ''}`);
-      try {
-        if (definition.snapshot) {
-          const snapshot = await definition.snapshot(stageContext);
-          context.snapshots[item.id] = snapshot;
-          context.journal({ type: 'snapshot', stage: item.id, data: snapshot });
-        }
-        context.journal({ type: 'stage.start', stage: item.id, inputKey });
-        const result = await definition.run(stageContext);
-        if (result?.deferred) {
-          results[item.id] = { status: STATUS.deferred, reason: result.reason, durationMs: Date.now() - stageStarted };
-          stageLogger.warn('stage.deferred', result.reason);
-          context.journal({ type: 'stage.deferred', stage: item.id, reason: result.reason });
-          continue;
-        }
-        if (!options.dryRun && definition.validate) await definition.validate(stageContext, result);
-        const durationMs = Date.now() - stageStarted;
-        results[item.id] = { status: options.dryRun ? STATUS.planned : STATUS.ok, durationMs };
-        if (!options.dryRun) {
-          context.state.stages[item.id] = {
-            status: STATUS.ok,
-            inputKey,
-            runId,
-            finishedAt: new Date().toISOString(),
-            durationMs,
-            outputs: snapshotOutputs(root, (spec.outputs ?? []).map(entry => expandPath(context, entry))),
-          };
-          writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
-          executed.push(item.id);
-        }
-        context.journal({ type: 'stage.ok', stage: item.id, durationMs });
-        stageLogger.info('stage.ok', `完成：${item.title}`, { durationMs });
-      } catch (error) {
-        failed = true;
-        const durationMs = Date.now() - stageStarted;
-        results[item.id] = { status: STATUS.failed, reason: error.message.split('\n')[0], durationMs };
-        if (!options.dryRun) {
-          context.state.stages[item.id] = { status: STATUS.failed, inputKey, runId, finishedAt: new Date().toISOString(), durationMs };
-          writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
-        }
-        stageLogger.error('stage.failed', `${item.title} 失败：${error.message}`, { durationMs });
-        context.journal({ type: 'stage.failed', stage: item.id, message: error.message, durationMs });
-        const rollbackTargets = definition.compensate ? [...executed, item.id] : executed;
-        const { compensated } = await rollbackRun(context, rollbackTargets, { reason: `${item.id} 失败`, logger: stageLogger });
-        for (const id of compensated) {
-          if (id === item.id) continue;
-          if (results[id]) results[id].status = STATUS.rolledBack;
-          if (context.state.stages[id]) context.state.stages[id].status = STATUS.rolledBack;
-        }
-        if (compensated.length) writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
-        break;
+      if (definition.snapshot) {
+        const snapshot = await definition.snapshot(stageContext);
+        context.snapshots[item.id] = snapshot;
+        context.journal({ type: 'snapshot', stage: item.id, data: snapshot });
       }
+      context.journal({ type: 'stage.start', stage: item.id, inputKey });
+      // 在任何阶段写入之前登记，后续摘要、状态和日志失败仍能补偿。
+      if (!options.dryRun) executed.push(item.id);
+      const result = await definition.run(stageContext);
+      if (result?.deferred) {
+        results[item.id] = { status: STATUS.deferred, reason: result.reason, durationMs: Date.now() - stageStarted };
+        stageLogger.warn('stage.deferred', result.reason);
+        context.journal({ type: 'stage.deferred', stage: item.id, reason: result.reason });
+        continue;
+      }
+      const validatedOutputs = !options.dryRun && definition.validate ? await definition.validate(stageContext, result) : [];
+      const durationMs = Date.now() - stageStarted;
+      results[item.id] = { status: options.dryRun ? STATUS.planned : STATUS.ok, durationMs };
+      if (!options.dryRun) {
+        context.state.stages[item.id] = {
+          status: STATUS.ok,
+          inputKey,
+          runId,
+          finishedAt: new Date().toISOString(),
+          durationMs,
+          outputs: snapshotOutputs(root, [...new Set([...outputPaths, ...(Array.isArray(validatedOutputs) ? validatedOutputs : [])])]),
+        };
+        writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
+      }
+      context.journal({ type: 'stage.ok', stage: item.id, durationMs });
+      stageLogger.info('stage.ok', `完成：${item.title}`, { durationMs });
     }
 
-    const status = failed ? 'failed' : options.dryRun ? 'planned' : 'ok';
+    currentStage = null;
+    const status = options.dryRun ? 'planned' : 'ok';
     context.journal({ type: 'run.end', status, durationMs: Date.now() - startedAt });
     const summary = {
       runId, env: options.env, trigger: options.trigger, commit: git.commit, status,
@@ -412,52 +410,108 @@ async function commandRun(root, options) {
     };
     writeFileSync(path.join(context.paths.runDir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
     context.logger.info('run.end', `运行结束：${status}（${((Date.now() - startedAt) / 1000).toFixed(1)}s）\n${summarise(plan, results)}`);
-    return failed ? 1 : 0;
+    return 0;
   } catch (error) {
-    if (error instanceof ConfigError) {
-      logger.error('config.error', error.message);
-      for (const issue of error.issues ?? []) logger.error('config.issue', issue);
-      return 2;
+    // 所有阶段准备、执行及收尾共用此失败出口；记录失败不能阻止恢复。
+    if (context) {
+      const recovery = recoveryContext(context);
+      const stage = currentStage?.id;
+      if (error.detail?.terminationUnconfirmed) context.unsafeTermination = { pid: error.detail.pid, commandId: error.detail.commandId, stage, reason: error.detail.terminationReason };
+      if (stage) {
+        const durationMs = Date.now() - currentStage.startedAt;
+        results[stage] = { status: STATUS.failed, reason: error.message.split('\n')[0], durationMs };
+        if (!options.dryRun) context.state.stages[stage] = {
+          status: STATUS.failed, inputKey: currentStage.inputKey, runId, durationMs, finishedAt: new Date().toISOString(),
+        };
+        recovery.journal({ type: 'stage.failed', stage, message: error.message, durationMs });
+      }
+      recovery.logger.error('run.failed', `运行失败：${error.message}`);
+      if (context.unsafeTermination) {
+        recovery.journal({ type: 'run.quarantined', ...context.unsafeTermination });
+      } else {
+        const { compensated, failures } = await rollbackRun(context, executed, { reason: `${stage ?? '运行收尾'} 失败` });
+        for (const id of failures) {
+          if (results[id]) results[id].status = STATUS.failed;
+          if (context.state.stages[id]) context.state.stages[id].status = STATUS.failed;
+        }
+        for (const id of compensated) {
+          if (id === stage) continue;
+          if (results[id]) results[id].status = STATUS.rolledBack;
+          if (context.state.stages[id]) context.state.stages[id].status = STATUS.rolledBack;
+        }
+      }
+      if (!options.dryRun) recoveryWrite(context, () => writeState(stateFile, {
+        ...context.state, lastRunId: runId, commit: context.git.commit, configFingerprint: context.configFingerprint,
+      }));
+      recovery.journal({ type: 'run.end', status: 'failed', durationMs: Date.now() - startedAt });
+      recoveryWrite(context, () => writeFileSync(path.join(context.paths.runDir, 'summary.json'), `${JSON.stringify({
+        runId, env: options.env, status: 'failed', stages: results, durationMs: Date.now() - startedAt,
+      }, null, 2)}\n`));
+      recovery.logger.error('run.end', `运行结束：failed\n${summarise(plan, results)}`);
+    } else {
+      recoveryWrite(null, () => logger.error('run.error', error.message));
     }
-    if (error instanceof CommandError) {
-      logger.error('command.error', error.message);
-      return 1;
-    }
-    logger.error('run.error', error.stack ?? error.message);
-    return 1;
+    return error instanceof ConfigError && !executed.length ? 2 : 1;
   } finally {
+    if (context?.unsafeTermination) recoveryWrite(context, () => lock?.quarantine(context.unsafeTermination));
     lock?.release();
   }
 }
 
-/** 失败回滚：只回滚本次已成功的阶段，逆序执行；人工阶段单独列出。 */
-async function rollbackRun(context, executed, { reason, logger }) {
+/** 仅恢复期间允许记录失败：原执行路径仍将记录失败作为整轮失败。 */
+function recoveryWrite(context, action) {
+  try { return action(); } catch {
+    if (context) context.recordingFailed = true;
+    try { process.stderr.write('恢复记录写入失败，继续补偿；请保留运行目录与备份。\n'); } catch {}
+  }
+}
+
+function recoveryContext(context) {
+  return {
+    ...context,
+    journal: record => recoveryWrite(context, () => context.journal(record)),
+    logger: Object.fromEntries(['info', 'warn', 'error'].map(level => [
+      level, (...args) => recoveryWrite(context, () => context.logger[level](...args)),
+    ])),
+  };
+}
+
+/** 逆序补偿本轮已经开始执行的阶段；准备/记录失败不漏掉先前写入。 */
+async function rollbackRun(context, executed, { reason }) {
+  const recovery = recoveryContext(context);
+  const logger = recovery.logger;
   const stages = [...executed].reverse();
   const manual = [];
   const compensated = [];
+  const failures = [];
   for (const id of stages) {
     const definition = STAGES[id];
     const snapshot = context.snapshots[id];
     try {
       if (definition.compensate) {
-        await definition.compensate(context, snapshot);
+        await definition.compensate(recovery, snapshot);
         compensated.push(id);
-        context.journal({ type: 'rollback.ok', stage: id });
+        recovery.journal({ type: 'rollback.ok', stage: id });
       } else if (definition.manualRollback) {
         manual.push({ stage: id, instruction: definition.manualRollback });
-        context.journal({ type: 'rollback.manual', stage: id, instruction: definition.manualRollback });
+        recovery.journal({ type: 'rollback.manual', stage: id, instruction: definition.manualRollback });
       }
     } catch (error) {
+      failures.push(id);
       logger.error('rollback.failed', `回滚 ${id} 失败：${error.message}`);
-      context.journal({ type: 'rollback.failed', stage: id, message: error.message });
+      recovery.journal({ type: 'rollback.failed', stage: id, message: error.message });
+      if (error.detail?.terminationUnconfirmed) {
+        context.unsafeTermination = { pid: error.detail.pid, commandId: error.detail.commandId, stage: id, reason: error.detail.terminationReason };
+        break;
+      }
     }
   }
-  context.journal({ type: 'rollback.end', reason, stages, compensated, manual });
+  recovery.journal({ type: 'rollback.end', reason, stages, compensated, manual, failures });
   if (manual.length) {
     logger.warn('rollback.manual', `以下阶段需要人工回滚：\n${manual.map(item => `  - ${item.stage}: ${item.instruction}`).join('\n')}`);
   }
   if (!stages.length) logger.warn('rollback.empty', '失败发生在首个可回滚阶段之前，没有需要恢复的本地状态');
-  return { compensated, manual };
+  return { compensated, manual, failures };
 }
 
 async function commandRollback(root, options) {
@@ -497,24 +551,32 @@ async function commandRollback(root, options) {
     throw error;
   }
   try {
-    const context = { root, env: options.env, profile, logger: runLogger, snapshots: {}, journal: record => appendJournal(path.join(runDir, 'journal.jsonl'), { ts: new Date().toISOString(), runId, env: options.env, ...record }) };
-    for (const item of plan) {
-      if (!item.definition.compensate) {
-        runLogger.warn('rollback.manual', `${item.stage}：${item.definition.manualRollback}`);
-        context.journal({ type: 'rollback.manual', stage: item.stage, instruction: item.definition.manualRollback });
-        continue;
-      }
-      await item.definition.compensate(context, item.snapshot);
-      context.journal({ type: 'rollback.ok', stage: item.stage });
-      if (state.stages?.[item.stage]) state.stages[item.stage].status = STATUS.rolledBack;
-      runLogger.info('rollback.ok', `已回滚 ${item.stage}`);
-    }
-    writeState(path.join(root, '.pipeline', 'state', `${options.env}.json`), state);
-    runLogger.info('rollback.end', `回滚结束：${runId}`);
-    return 0;
+    const context = {
+      root, env: options.env, profile, logger: runLogger, snapshots: {},
+      commandLock: lock,
+      exec: (command, stageId) => runCommand({ command, cwd: root, env: process.env, commandLock: lock, stageId: stageId ?? 'rollback' }),
+      journal: record => appendJournal(path.join(runDir, 'journal.jsonl'), { ts: new Date().toISOString(), runId, env: options.env, ...record }),
+    };
+    context.snapshots = Object.fromEntries(plan.map(item => [item.stage, item.snapshot]));
+    const { compensated, failures } = await rollbackRun(context, plan.map(item => item.stage).reverse(), { reason: '手动重试' });
+    for (const id of compensated) if (state.stages?.[id]) state.stages[id].status = STATUS.rolledBack;
+    for (const id of failures) if (state.stages?.[id]) state.stages[id].status = STATUS.failed;
+    if (context.unsafeTermination) recoveryWrite(context, () => lock.quarantine(context.unsafeTermination));
+    recoveryWrite(context, () => writeState(path.join(root, '.pipeline', 'state', `${options.env}.json`), state));
+    const failed = failures.length || context.recordingFailed || context.unsafeTermination;
+    recoveryContext(context).logger.info('rollback.end', `回滚结束：${runId}${failed ? '（存在失败或记录缺失）' : ''}`);
+    return failed || context.recordingFailed ? 1 : 0;
+  } catch (error) {
+    if (error.detail?.terminationUnconfirmed) recoveryWrite(null, () => lock.quarantine({ pid: error.detail.pid, commandId: error.detail.commandId, stage: 'rollback', reason: error.detail.terminationReason }));
+    throw error;
   } finally {
     lock.release();
   }
+}
+
+async function withQueryLock(root, options, action) {
+  const lock = acquireLock(path.join(root, '.pipeline', 'locks', `${options.env}.lock`), { runId: `${createRunId({})}-${options.command}` });
+  try { return await action(lock); } finally { lock.release(); }
 }
 
 async function main() {
@@ -531,8 +593,8 @@ async function main() {
   }
   try {
     switch (options.command) {
-      case 'plan': return await commandPlan(ROOT, options);
-      case 'config': return await commandConfig(ROOT, options);
+      case 'plan': return await withQueryLock(ROOT, options, lock => commandPlan(ROOT, options, lock));
+      case 'config': return await withQueryLock(ROOT, options, lock => commandConfig(ROOT, options, lock));
       case 'status': return await commandStatus(ROOT, options);
       case 'run': return await commandRun(ROOT, options);
       case 'rollback': return await commandRollback(ROOT, options);
@@ -541,6 +603,10 @@ async function main() {
         return 2;
     }
   } catch (error) {
+    if (error instanceof LockError) {
+      process.stderr.write(`${error.message}\n`);
+      return 4;
+    }
     if (error instanceof ConfigError) {
       process.stderr.write(`配置错误：${error.message}\n`);
       for (const issue of error.issues ?? []) process.stderr.write(`  - ${issue}\n`);
@@ -551,4 +617,4 @@ async function main() {
   }
 }
 
-process.exitCode = await main();
+if (import.meta.main) process.exitCode = await main();

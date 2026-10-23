@@ -6,6 +6,7 @@ import { Switch } from '@/components/ui/switch';
 import type { Account } from '@/lib/desk-types';
 import {
   availablePairAccounts,
+  pairMarginLimitFieldVisible,
   selectPairSymbol,
   type Pair,
   type PairDraft,
@@ -250,7 +251,10 @@ export function PairSettings({
           </ConfigurationField>
         </fieldset>
       ) : null}
-      {draft.mode !== 'monitor' ? (
+      {pairMarginLimitFieldVisible(
+        draft,
+        editing ? pairs.find((pair) => pair.id === draft.id) : undefined,
+      ) ? (
         <ConfigurationField
           id={`${formId}-pair-margin-limit`}
           label="每侧基础保证金占用上限"

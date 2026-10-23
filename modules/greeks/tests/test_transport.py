@@ -43,6 +43,17 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(BybitError):
                         await client._request("GET", "/test")
 
+    async def test_empty_or_malformed_wallet_lists_are_read_failures(self):
+        client = BybitClient()
+        for payload in ({}, {"list": None}, {"list": []}, {"list": {}}, {"list": [None]}, {"list": [{}]}):
+            with self.subTest(payload=payload):
+                client._request = AsyncMock(return_value=payload)
+                with self.assertRaisesRegex(BybitError, "Wallet balance"):
+                    await client.wallet_balance()
+        wallet = {"accountType": "UNIFIED", "totalAvailableBalance": ""}
+        client._request = AsyncMock(return_value={"list": [wallet]})
+        self.assertEqual(await client.wallet_balance(), wallet)
+
 
 class PaginationTests(unittest.IsolatedAsyncioTestCase):
     async def test_instrument_pages_follow_cursor_and_deduplicate(self):

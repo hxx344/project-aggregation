@@ -48,6 +48,7 @@ class EngineRequestBudgetTests(unittest.TestCase):
                 for side in ("LONG", "SHORT"):
                     self.f.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "0.01", "entry": "4412"}
                 self.engine.markets["XAUUSD1"]["capacities"] = {str(leverage): "500000", "5": "0", "10": "0", "20": "0"}
+                self.engine.markets["XAUUSD1"]["capacity_checked_at"][str(leverage)] = time.time()
                 with patch.object(self.f.broker, "submit", side_effect=AssertionError("must not open below 5x")), \
                      patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("no higher capacity")):
                     self.engine.tick_account("test")

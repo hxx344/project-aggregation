@@ -12,6 +12,7 @@ def seed_market_capacity(engine, *, now=None, symbols=("XAUUSD1",)):
     now = time.time() if now is None else now
     for symbol in symbols:
         engine.markets[symbol] = {"status": "ok", "checked_at": now,
+                                  "capacity_checked_at": {str(v): now for v in range(1, 21)},
                                   "capacities": {str(v): "1000000" for v in range(1, 21)}}
 
 

@@ -12,7 +12,7 @@ import { ENV_IDS, PIPELINE_VERSION, STAGE_ORDER, TRIGGER_IDS } from './constants
 
 const VALUE_TYPES = new Set(['string', 'port', 'integer', 'boolean', 'url', 'path', 'enum']);
 const GUARD_KEYS = new Set(['branch', 'requireClean', 'tagPattern', 'requireConfirmation']);
-const STAGE_KEYS = new Set(['enabled', 'commands', 'applyCommands', 'inputs', 'outputs', 'frozen', 'target', 'healthUrl', 'requiresConfirmation', 'requiresApply', 'description']);
+const STAGE_KEYS = new Set(['enabled', 'commands', 'applyCommands', 'inputs', 'outputs', 'frozen', 'target', 'applyTarget', 'applyWithSudo', 'architectures', 'releaseDirectory', 'healthUrl', 'requiresConfirmation', 'requiresApply', 'description']);
 const CONFIG_KEYS = new Set(['name', 'type', 'required', 'secret', 'default', 'values', 'pattern', 'minLength', 'maxLength', 'min', 'max', 'absolute', 'description']);
 
 export class ConfigError extends Error {
@@ -116,6 +116,9 @@ function validateProfile(profile, envId) {
         if (command?.timeoutMs !== undefined && (!Number.isInteger(command.timeoutMs) || command.timeoutMs <= 0)) {
           fail(`stages.${id}.${list}[${index}].timeoutMs`, '必须为正整数毫秒');
         }
+        if (command?.privileged !== undefined && typeof command.privileged !== 'boolean') {
+          fail(`stages.${id}.${list}[${index}].privileged`, '必须为布尔值');
+        }
       }
     }
     for (const list of ['inputs', 'outputs']) {
@@ -124,6 +127,17 @@ function validateProfile(profile, envId) {
       }
     }
     if (stage.enabled !== undefined && typeof stage.enabled !== 'boolean') fail(`stages.${id}.enabled`, '必须为布尔值');
+    if (stage.applyWithSudo !== undefined && typeof stage.applyWithSudo !== 'boolean') fail(`stages.${id}.applyWithSudo`, '必须为布尔值');
+    if (stage.applyCommands?.length) {
+      if (typeof stage.applyTarget !== 'string' || !path.isAbsolute(stage.applyTarget)) fail(`stages.${id}.applyTarget`, '必须声明实际写入的绝对路径');
+      if (!stage.applyCommands.some(command => command.args?.includes('{applyTarget}'))) fail(`stages.${id}.applyCommands`, '必须引用 {applyTarget}');
+    }
+    if (id === 'package' && stage.enabled !== false) {
+      if (!Array.isArray(stage.architectures) || !stage.architectures.length
+        || stage.architectures.some(arch => !['x64', 'arm64'].includes(arch))
+        || new Set(stage.architectures).size !== stage.architectures.length) fail('stages.package.architectures', '必须声明不重复的 x64/arm64 目标架构');
+      if (typeof stage.releaseDirectory !== 'string' || !stage.releaseDirectory) fail('stages.package.releaseDirectory', '必须声明发布产物目录');
+    }
   }
 
   const names = new Set();

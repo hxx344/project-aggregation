@@ -1,5 +1,6 @@
 import {
   pairDataFresh,
+  pairDisplayBalances,
   pairExecutionPhaseLabel,
   pairHasPending,
   pairMarginOnly,
@@ -157,9 +158,7 @@ export function pairScheduledMarginWait(
     !Number.isFinite(cooldownUntil) ||
     cooldownUntil < 0 ||
     !['long', 'short'].every((side) => {
-      const snapshot = (state.margin_balances ?? state.snapshots)?.[
-        side as 'long' | 'short'
-      ];
+      const snapshot = state.margin_balances?.[side as 'long' | 'short'];
       return validTime(snapshot?.timestamp) && snapshot.timestamp <= now + 1;
     })
   )
@@ -191,9 +190,7 @@ export function pairStatusNotices(
     pair.state?.margin?.reason,
   );
   const marginOnly = pairMarginOnly(pair);
-  const snapshots = marginOnly
-    ? (pair.state?.margin_balances ?? pair.state?.snapshots)
-    : pair.state?.snapshots;
+  const snapshots = pairDisplayBalances(pair);
   const canCheckAtStart =
     !pair.enabled && pairHasPending(pair) && !pairStartRecoveryBlock(pair);
   const canResumeTransfer =
@@ -378,9 +375,7 @@ export function observePairNotices(
   const history = previous?.history ?? { activeKeys: [], entries: [] };
   const raw = pairStatusNotices(pair, now, offline);
   const scheduled = Boolean(pairScheduledMarginWait(pair, now, offline));
-  const snapshots = pairMarginOnly(pair)
-    ? (pair.state?.margin_balances ?? pair.state?.snapshots)
-    : pair.state?.snapshots;
+  const snapshots = pairDisplayBalances(pair);
   const signals = {
     group: raw.some(({ kind }) => kind === 'data'),
     long:

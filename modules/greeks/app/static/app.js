@@ -3,7 +3,7 @@ const money = (value) => `$${Number(value || 0).toLocaleString('en-US', {maximum
 const num = (value, digits = 2) => Number(value || 0).toLocaleString('en-US', {minimumFractionDigits: digits, maximumFractionDigits: digits});
 const utcTime = (value) => new Date(value).toLocaleTimeString('en-GB', {hour12: false, timeZone: 'UTC'});
 const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'}[char]));
-const optionalMoney = (value) => value === null || value === undefined ? '--' : money(value);
+const optionalMoney = (value) => value === null || value === undefined ? '—' : money(value);
 const marginLabel = (value) => ({REGULAR_MARGIN: '常规保证金', PORTFOLIO_MARGIN: '组合保证金', ISOLATED_MARGIN: '逐仓保证金'}[value] || value || 'UTA');
 const selectedStrategyMode = () => $('strategyMode').value === 'short_strangle' ? 'short_strangle' : 'iron_condor';
 const strategyName = (mode) => mode === 'short_strangle' ? '双腿卖出' : '四腿铁鹰';
@@ -83,9 +83,17 @@ async function getJson(url, options, {notifyChange = true} = {}) {
   const response = await fetch(url, options);
   const raw = await response.text();
   let data;
-  try { data = raw ? JSON.parse(raw) : {}; } catch (_) { data = {detail: raw || `HTTP ${response.status}`}; }
+  try { data = JSON.parse(raw); } catch (_) {
+    if (response.ok) {
+      const error = new Error('服务端响应格式错误：预期 JSON，操作结果待核对');
+      error.name = 'ProtocolError';
+      error.status = response.status;
+      throw error;
+    }
+    data = {detail: raw || `HTTP ${response.status}`};
+  }
   if (!response.ok) {
-    const error = new Error(typeof data.detail === 'string' ? data.detail : `请求失败（HTTP ${response.status}）`);
+    const error = new Error(typeof data?.detail === 'string' ? data.detail : `请求失败（HTTP ${response.status}）`);
     error.status = response.status;
     throw error;
   }
@@ -186,8 +194,9 @@ function renderPortfolioMargin(health) {
   target.style.display = 'grid';
   if (!health.portfolio_margin_available) { target.innerHTML = `<div class="pm-message">真实 PM 明细不可用：${esc(health.portfolio_margin_message || '等待 Bybit 返回')}</div>`; return; }
   const incrementIm = health.pm_incremental_initial_margin_usd; const incrementMm = health.pm_incremental_maintenance_margin_usd;
-  const increment = (value) => value === null || value === undefined ? '--' : `${value >= 0 ? '+' : ''}${money(value)}`;
-  target.innerHTML = `<div><span>真实账户 IM</span><strong>${optionalMoney(health.pm_account_initial_margin_usd)}</strong></div><div><span>真实账户 MM</span><strong>${optionalMoney(health.pm_account_maintenance_margin_usd)}</strong></div><div><span>BTC 风险单元 IM</span><strong>${optionalMoney(health.pm_asset_initial_margin_usd)}</strong></div><div><span>BTC 风险单元 MM</span><strong>${optionalMoney(health.pm_asset_maintenance_margin_usd)}</strong></div><div><span>本次开仓 IM 增量</span><strong class="${Number(incrementIm) > 0 ? 'loss' : 'profit'}">${increment(incrementIm)}</strong></div><div><span>本次开仓 MM 增量</span><strong class="${Number(incrementMm) > 0 ? 'loss' : 'profit'}">${increment(incrementMm)}</strong></div><div><span>Contingency</span><strong>${optionalMoney(health.pm_contingency_usd)}</strong></div><div><span>最大压力场景</span><strong>${health.pm_max_loss_price_move === null || health.pm_max_loss_price_move === undefined ? '--' : `${(Number(health.pm_max_loss_price_move) * 100).toFixed(1)}%`} / IV ${health.pm_max_loss_iv_shock === null || health.pm_max_loss_iv_shock === undefined ? '--' : `${(Number(health.pm_max_loss_iv_shock) * 100).toFixed(1)}%`}</strong></div>`;
+  const increment = (value) => value === null || value === undefined ? '—' : `${value >= 0 ? '+' : ''}${money(value)}`;
+  const incrementTone = (value) => value === null || value === undefined ? 'muted' : value > 0 ? 'loss' : 'profit';
+  target.innerHTML = `<div><span>真实账户 IM</span><strong>${optionalMoney(health.pm_account_initial_margin_usd)}</strong></div><div><span>真实账户 MM</span><strong>${optionalMoney(health.pm_account_maintenance_margin_usd)}</strong></div><div><span>BTC 风险单元 IM</span><strong>${optionalMoney(health.pm_asset_initial_margin_usd)}</strong></div><div><span>BTC 风险单元 MM</span><strong>${optionalMoney(health.pm_asset_maintenance_margin_usd)}</strong></div><div><span>本次开仓 IM 增量</span><strong class="${incrementTone(incrementIm)}">${increment(incrementIm)}</strong></div><div><span>本次开仓 MM 增量</span><strong class="${incrementTone(incrementMm)}">${increment(incrementMm)}</strong></div><div><span>Contingency</span><strong>${optionalMoney(health.pm_contingency_usd)}</strong></div><div><span>最大压力场景</span><strong>${health.pm_max_loss_price_move === null || health.pm_max_loss_price_move === undefined ? '—' : `${(Number(health.pm_max_loss_price_move) * 100).toFixed(1)}%`} / IV ${health.pm_max_loss_iv_shock === null || health.pm_max_loss_iv_shock === undefined ? '—' : `${(Number(health.pm_max_loss_iv_shock) * 100).toFixed(1)}%`}</strong></div>`;
 }
 const isClosingExecution = (item) => item.reduce_only === true || String(item.order_link_id || '').startsWith('ic-close-');
 function uniqueExecutions(items) {
@@ -752,6 +761,16 @@ async function loadOrders() {
   } finally { read.finish(); }
 }
 
+function renderHealthRate(name, value) {
+  const rate = finiteAmount(value) ? value * 100 : null;
+  $(`${name}Rate`).textContent = rate === null ? '—' : `${rate.toFixed(2)}%`;
+  const bar = $(`${name}Bar`);
+  bar.style.width = `${rate === null ? 0 : Math.max(0, Math.min(100, rate))}%`;
+  bar.dataset.available = String(rate !== null);
+  bar.setAttribute('aria-disabled', String(rate === null));
+  bar.setAttribute('aria-label', rate === null ? '风险指标不可用' : `${rate.toFixed(2)}%`);
+}
+
 async function loadAccount() {
   const read = window.ProjectHub.begin('account');
   if (!read) return;
@@ -767,7 +786,16 @@ async function loadAccount() {
     renderPositionPayoff();
     renderPositions(positions.items || []); renderLogs(logs.items || []); renderExecutions(executions.items || []);
     window.__latestExecutions = executions.items || [];
-    $('healthMode').textContent = health.available ? marginLabel(health.margin_mode) : '未连接账户'; $('healthUnavailable').textContent = health.message || '连接账户后，将显示余额、保证金和风险指标。'; $('healthUnavailable').style.display = health.available ? 'none' : 'block'; $('healthContent').style.display = health.available ? 'grid' : 'none'; if (health.available) { const im = Number(health.initial_margin_rate || 0) * 100; const mm = Number(health.maintenance_margin_rate || 0) * 100; $('imRate').textContent = `${im.toFixed(2)}%`; $('mmRate').textContent = `${mm.toFixed(2)}%`; $('imBar').style.width = `${Math.min(100, im)}%`; $('mmBar').style.width = `${Math.min(100, mm)}%`; $('availableBalance').textContent = money(health.available_balance_usd); $('marginBalance').textContent = money(health.margin_balance_usd); $('totalEquity').textContent = money(health.total_equity_usd); $('accountMode').textContent = marginLabel(health.margin_mode); renderPortfolioMargin(health); }
+    $('healthMode').textContent = health.available ? marginLabel(health.margin_mode) : '未连接账户'; $('healthUnavailable').textContent = health.message || '连接账户后，将显示余额、保证金和风险指标。'; $('healthUnavailable').style.display = health.available ? 'none' : 'block'; $('healthContent').style.display = health.available ? 'grid' : 'none';
+    if (health.available) {
+      renderHealthRate('im', health.initial_margin_rate);
+      renderHealthRate('mm', health.maintenance_margin_rate);
+      $('availableBalance').textContent = optionalMoney(health.available_balance_usd);
+      $('marginBalance').textContent = optionalMoney(health.margin_balance_usd);
+      $('totalEquity').textContent = optionalMoney(health.total_equity_usd);
+      $('accountMode').textContent = marginLabel(health.margin_mode);
+      renderPortfolioMargin(health);
+    }
   } catch (error) { if (!read.current()) return; window.__positionError = true; window.__accountIssue = `账户读取失败：${error.message}`; renderGreeks(null, {failed: true}); renderPositionPayoff(); $('healthMode').textContent = '账户连接异常'; $('healthUnavailable').textContent = error.message; $('healthUnavailable').style.display = 'block'; $('healthContent').style.display = 'none'; }
   finally { read.finish(); updateStrip(); }
 }

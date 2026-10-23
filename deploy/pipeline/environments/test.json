@@ -90,10 +90,13 @@
     },
     "package": {
       "enabled": true,
+      "architectures": ["x64"],
+      "releaseDirectory": "output/release/{env}",
       "commands": [
-        { "cmd": "python3", "args": ["deploy/package-release.py", "--architecture", "x64"], "timeoutMs": 1800000 }
+        { "cmd": "python3", "args": ["deploy/package-release.py", "--architecture", "x64", "--output", "{releaseDirectory}"], "timeoutMs": 1800000 },
+        { "cmd": "python3", "args": ["deploy/merge-release-manifests.py", "{releaseDirectory}", "--architectures", "x64"], "timeoutMs": 60000 }
       ],
-      "outputs": ["output/release/release-manifest-x64.json"]
+      "outputs": ["output/release/{env}/release-manifest-x64.json", "output/release/{env}/release-manifest.json"]
     },
     "publish": {
       "enabled": false

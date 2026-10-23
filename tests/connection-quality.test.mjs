@@ -70,10 +70,10 @@ test('health probes preserve API and transport failures and reject malformed or 
   const networkError = new TypeError('Network disconnected');
   globalThis.fetch.mock.mockImplementation(async () => { throw networkError; });
   await assert.rejects(checkConnectionHealth(api, signal), error => error === networkError);
-  for (const response of [new Response('<html>Login</html>'), new Response(null, { status: 204 })]) {
-    globalThis.fetch.mock.mockImplementation(async () => response);
-    await assert.rejects(checkConnectionHealth(api, signal), /Invalid health response/);
-  }
+  globalThis.fetch.mock.mockImplementation(async () => new Response('<html>Login</html>'));
+  await assert.rejects(checkConnectionHealth(api, signal), error => error instanceof ApiError && error.status === 200);
+  globalThis.fetch.mock.mockImplementation(async () => new Response(null, { status: 204 }));
+  await assert.rejects(checkConnectionHealth(api, signal), /Invalid health response/);
 });
 
 for (const bodyHangs of [false, true]) {

@@ -16,12 +16,12 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
   const first = history[0], last = history.at(-1);
   // Daily snapshots only change for today's refresh, withdrawal edits or an import. A refresh rewrites balance details and holdings even when the total is unchanged.
   const refreshed = useMemo(() => ledger.assets.map(asset => asset.id + ':' + asset.updatedAt).join(','), [ledger.assets]);
-  const changesVersion = useMemo(() => [history.length, last?.date, last?.total, last?.withdrawn, ledger.baselineDate, JSON.stringify(ledger.withdrawals), refreshed].join('|'), [history, last, ledger.baselineDate, ledger.withdrawals, refreshed]);
-  const change = first && last ? last.adjusted - first.adjusted : null;
+  const changesVersion = useMemo(() => [history.length, last?.date, last?.total, last?.withdrawn, last?.partial, last?.missingValues, ledger.baselineDate, JSON.stringify(ledger.withdrawals), refreshed].join('|'), [history, last, ledger.baselineDate, ledger.withdrawals, refreshed]);
+  const change = first && last && !first.missingValues && !last.missingValues ? last.adjusted - first.adjusted : null;
   const month = annualized.monthlyPeriod;
   const monthlyHint = !month ? '上个自然月没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`
-    : month.returnRate === null ? '起始调整后资产须大于 0，收益率需为有效数值'
+    : month.returnRate === null ? '首末快照估值须完整，起始调整后资产须大于 0，收益率需为有效数值'
     : `${month.startDate} — ${month.endDate} · ${month.daysSpan} 天`;
   return <section className="panel trend-panel">
     <div className="panel-h"><h2>资产变化</h2><span className="panel-h-right">北京时间 · USD</span></div>
@@ -38,7 +38,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
         <YAxis domain={['auto', 'auto']} tickFormatter={value => Math.abs(value) >= 1000 ? (value / 1000).toLocaleString('zh-CN', { maximumFractionDigits: 1 }) + 'k' : String(value)} axisLine={false} tickLine={false} width={48} tick={{ fill: 'var(--muted-foreground)', fontSize: 11 }}/>
         <Tooltip content={({ active, payload }) => {
           const point = payload?.[0]?.payload as typeof first | undefined;
-          return active && point ? <div className="trend-tooltip"><strong>{point.date}</strong><div>实际持有：$ {money(point.held)}</div><div>累计出金：$ {money(point.withdrawn)}</div><div>剔除出金影响：$ {money(point.adjusted)}</div>{!!point.difference && <p>原表合计差异：$ {money(point.difference)}</p>}</div> : null;
+          return active && point ? <div className="trend-tooltip"><strong>{point.date}</strong>{!!point.missingValues && <p>部分估值：仅汇总已知金额</p>}<div>实际持有：$ {money(point.held)}</div><div>累计出金：$ {money(point.withdrawn)}</div><div>剔除出金影响：$ {money(point.adjusted)}</div>{!!point.difference && <p>原表合计差异：$ {money(point.difference)}</p>}</div> : null;
         }}/>
         <Line type="monotoneX" strokeLinecap="round" strokeLinejoin="round" name="剔除出金影响" dataKey="adjusted" stroke="var(--chart-1)" strokeWidth={2} dot={history.length === 1 ? { r: 4 } : false} activeDot={{ r: 4 }} isAnimationActive={false}/>
         <Line type="monotoneX" strokeLinecap="round" strokeLinejoin="round" name="实际持有资产" dataKey="held" stroke="var(--chart-2)" strokeWidth={1.5} strokeDasharray="5 4" dot={history.length === 1 ? { r: 3 } : false} isAnimationActive={false}/>
@@ -54,7 +54,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
         <div className="performance-card">
           <span className="performance-label">总体年化</span>
           <strong className={performanceTone(annualized.overallAnnualized, 100)}>{formatReturnRate(annualized.overallAnnualized)}</strong>
-          <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；起始调整后资产须大于 0，收益率需为有效数值'}</p>
+          <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；首末快照估值须完整，起始调整后资产须大于 0，收益率需为有效数值'}</p>
         </div>
       </div>
       <details className="performance-monthly">
@@ -70,6 +70,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
                 <th scope="row">{period.month}{period.month === today.slice(0, 7) && <span className="performance-month-state">进行中</span>}
                   <small>{period.startDate.slice(5)} — {period.endDate.slice(5)} · {period.snapshotCount} 日快照</small>
                   {period.snapshotCount < 2 && <small>仅一个日期，无法计算收益</small>}
+                  {period.snapshotCount >= 2 && period.gain === null && <small>首末快照估值不完整或超出计算范围</small>}
                   {period.snapshotCount >= 2 && period.startValue <= 0 && <small>起始资产不大于 0，收益率不可用</small>}
                 </th>
                 <td className={performanceTone(period.gain)}>{period.gain === null ? '—' : '$ ' + formatGain(period.gain)}</td>
@@ -82,6 +83,6 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
       </details>
     </section>}
     {history.length >= 2 && <DailyChanges version={changesVersion}/>}
-    <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。连线仅连接已有记录，不代表缺失日期的估值。<button className="text-button" onClick={onHistory}>查看记录</button></p>
+    <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。缺失估值的快照仅含已知金额，首末快照估值不完整时不计算收益。连线仅连接已有记录，不代表缺失日期的估值。<button className="text-button" onClick={onHistory}>查看记录</button></p>
   </section>;
 });

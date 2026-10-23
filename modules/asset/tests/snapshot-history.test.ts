@@ -88,6 +88,64 @@ test('legacy withdrawals are backfilled without asset payloads and explicit valu
   assert.deepEqual(history, rows.map((row, index) => {
     const { assets: omitted, ...snapshot } = row;
     void omitted;
-    return { ...snapshot, withdrawn: expectedWithdrawn[index] } as Period;
+    return { ...snapshot, withdrawn: expectedWithdrawn[index], ...(index < 4 ? { partial: true, missingValues: 1 } : {}) } as Period;
   }).reverse());
+});
+
+test('legacy unknown valuations become partial on read without rewriting stored snapshots', async t => {
+  const database = openDatabase(':memory:', migrations);
+  t.after(() => database.close());
+  const rows = [
+    period('daily-start', '2024-01-01', { total: 100 }),
+    period('daily-end', '2024-01-31', { total: 50, partial: false, assets: [{ project: 'known', value: 50 }, { project: 'unknown', value: null }] }),
+  ];
+  const insert = database.prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?)');
+  await database.batch(rows.map(row => insert.bind('alice', row.date, JSON.stringify(row))));
+  const history = await readSnapshotHistory(database, 'alice');
+  assert.equal(history[0].total, 50);
+  assert.equal(history[0].partial, true);
+  assert.equal(history[0].missingValues, 1);
+  assert.ok(history.every(row => !Object.hasOwn(row, 'assets')));
+  const trend = assetTrend({ history, withdrawals: [], baselineDate: '2024-01-01' }, '2024-02-15');
+  const metrics = calculateAnnualizedReturns(trend, calculateMonthlyPerformance(trend), '2024-02-15');
+  assert.equal(metrics.monthlyAnnualized, null);
+  assert.equal(metrics.overallAnnualized, null);
+  const stored = await database.prepare('SELECT data FROM snapshots WHERE owner = ? AND date = ?').bind('alice', rows[1].date).first<{ data: string }>();
+  assert.equal(stored?.data, JSON.stringify(rows[1]));
+});
+
+test('legacy market zeros suppress endpoint returns despite complete metadata, while genuine zero quantities remain known', async t => {
+  const database = openDatabase(':memory:', migrations);
+  t.after(() => database.close());
+  const legacy = { project: 'virtual', mode: 'market', quantity: null, price: 2.5, value: 0 };
+  const known = { project: 'known', value: 100 };
+  for (const quantity of [null, 0]) {
+    const owner = quantity === null ? 'legacy' : 'zero';
+    const rows = [
+      period('daily-start', '2024-01-01', { total: 100, partial: false, missingValues: 0, assets: [known, { ...legacy, quantity }] }),
+      period('daily-end', '2024-01-31', { total: 150, assets: [known, { ...legacy, quantity: 20, value: 50 }] }),
+      period('archive-legacy', '2024-01-15', { total: 100, partial: false, missingValues: 0, archived: true, assets: [known, legacy] }),
+    ];
+    await database.batch(rows.map(row => database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind(owner, row.id.startsWith('archive-') ? row.id : row.date, JSON.stringify(row))));
+    const history = await readSnapshotHistory(database, owner);
+    const start = history.find(row => row.id === 'daily-start')!;
+    assert.equal(start.missingValues, quantity === null ? 1 : 0);
+    assert.equal(start.partial, quantity === null);
+    assert.equal(history.find(row => row.id === 'archive-legacy')?.missingValues, 1);
+    assert.ok(history.every(row => !Object.hasOwn(row, 'assets')));
+    const trend = assetTrend({ history, withdrawals: [], baselineDate: '2024-01-01' }, '2024-02-15');
+    const monthly = calculateMonthlyPerformance(trend);
+    assert.equal(monthly[0].gain, quantity === null ? null : 50);
+    assert.equal(monthly[0].returnRate, quantity === null ? null : 0.5);
+    const annualized = calculateAnnualizedReturns(trend, monthly, '2024-02-15');
+    if (quantity === null) {
+      assert.equal(annualized.monthlyAnnualized, null);
+      assert.equal(annualized.overallAnnualized, null);
+    } else {
+      assert.ok(annualized.monthlyAnnualized! > 0);
+      assert.ok(annualized.overallAnnualized! > 0);
+    }
+    const stored = await database.prepare('SELECT date,data FROM snapshots WHERE owner=? ORDER BY date').bind(owner).all<{ date: string; data: string }>();
+    for (const row of stored.results) assert.equal(row.data, JSON.stringify(rows.find(snapshot => (snapshot.id.startsWith('archive-') ? snapshot.id : snapshot.date) === row.date)));
+  }
 });

@@ -19,3 +19,6 @@ export const STATUS = {
 };
 
 export const STATE_SCHEMA = 1;
+
+/** 流水线自带的查询子进程在内部命令被超时或信号终止时写到 stderr 的标记，执行器据此隔离。 */
+export const CHILD_FORCED_MARKER = 'PIPELINE_CHILD_FORCED_TERMINATION';

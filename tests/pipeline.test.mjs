@@ -153,15 +153,18 @@ test('跳过判断要求同键成功记录且产物完整', () => {
     mkdirSync(path.join(directory, 'dist'), { recursive: true });
     writeFileSync(path.join(directory, 'dist/index.html'), '<html></html>');
     const outputs = snapshotOutputs(directory, ['dist/index.html']);
+    const outputPaths = ['dist/index.html'];
     assert.equal(outputsIntact(directory, outputs), true);
     const state = { stages: { build: { status: 'ok', inputKey: 'k1', outputs } } };
-    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputs }).skip, true);
-    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k2', root: directory, outputs }).skip, false);
-    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputs, force: true }).skip, false);
+    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputPaths }).skip, true);
+    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k2', root: directory, outputPaths }).skip, false);
+    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputPaths, force: true }).skip, false);
+    const incomplete = { stages: { build: { ...state.stages.build, outputs: {} } } };
+    assert.equal(shouldSkip({ state: incomplete, stageId: 'build', inputKey: 'k1', root: directory, outputPaths }).skip, false);
     writeFileSync(path.join(directory, 'dist/index.html'), '<html>changed</html>');
-    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputs }).skip, false);
+    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputPaths }).skip, false);
     rmSync(path.join(directory, 'dist/index.html'));
-    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputs }).skip, false);
+    assert.equal(shouldSkip({ state, stageId: 'build', inputKey: 'k1', root: directory, outputPaths }).skip, false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

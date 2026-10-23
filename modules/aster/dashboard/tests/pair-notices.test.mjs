@@ -103,6 +103,10 @@ function marginPair() {
     {
       phase: 'monitoring',
       updated_at: 110,
+      margin_balances: {
+        long: { timestamp: 100, equity: '300', available: '200' },
+        short: { timestamp: 100, equity: '100', available: '80' },
+      },
       margin: {
         enabled: true,
         status: 'waiting',
@@ -120,6 +124,27 @@ function marginPair() {
     },
   );
 }
+
+test('missing funds evidence cannot borrow fresh trading timestamps or a scheduled wait', () => {
+  for (const balances of [
+    undefined,
+    {},
+    { long: { timestamp: 110 } },
+    { short: { timestamp: 110 } },
+  ]) {
+    const fixture = marginPair();
+    fixture.state.snapshots = {
+      long: { timestamp: 110, equity: '9000' },
+      short: { timestamp: 110, available: '8000' },
+    };
+    fixture.state.margin_balances = balances;
+    assert.equal(pairScheduledMarginWait(fixture, 110), null);
+    assert.equal(
+      pairStatusNotices(fixture, 110).some(({ kind }) => kind === 'data'),
+      true,
+    );
+  }
+});
 
 test('scheduled margin waits retain source timestamps without recurring stale notices', () => {
   let history;
@@ -139,6 +164,8 @@ test('scheduled margin waits retain source timestamps without recurring stale no
     assert.deepEqual(history.entries, []);
     assert.equal(fixture.state.snapshots.long.timestamp, 100);
     assert.equal(fixture.state.snapshots.short.timestamp, 100);
+    assert.equal(fixture.state.margin_balances.long.timestamp, 100);
+    assert.equal(fixture.state.margin_balances.short.timestamp, 100);
   }
 });
 
@@ -230,13 +257,13 @@ test('opening modes and incomplete or invalid schedules retain the existing fres
       p.state.margin.enabled = false;
     },
     (p) => {
-      p.state.snapshots.long = null;
+      p.state.margin_balances.long = null;
     },
     (p) => {
-      p.state.snapshots.short.timestamp = 112;
+      p.state.margin_balances.short.timestamp = 112;
     },
     (p) => {
-      p.state.snapshots.long.timestamp = NaN;
+      p.state.margin_balances.long.timestamp = NaN;
     },
     (p) => {
       p.state.margin.checked_at = 112;

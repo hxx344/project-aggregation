@@ -37,6 +37,17 @@ export function percentFromMarginLimit(ratio: string): string {
   return shiftDecimal(ratio, 2);
 }
 
+export function configuredMarginPercent(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const percent = percentFromMarginLimit(value);
+    marginLimitFromPercent(percent);
+    return percent;
+  } catch {
+    return null;
+  }
+}
+
 export function extraMarginLimit(
   base: string,
   limits?: { high_leverage?: string },

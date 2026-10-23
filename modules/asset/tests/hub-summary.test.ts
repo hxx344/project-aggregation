@@ -234,7 +234,7 @@ test('summary reads owner-scoped projected totals and finds 90 valid days beyond
   try {
     await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-1', JSON.stringify({ ...asset(), details: [{ privateHistoryMarker: 'not-in-summary' }] })).run();
     await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('other', 'row-1', JSON.stringify(asset('manual', fresh, 999999))).run();
-    for (const [key, value] of Object.entries({ fx: '7', 'fx-status': JSON.stringify({ fetchedAt: fresh }), 'source-ledger': JSON.stringify({ source: 'personal', periods: [{ id: 'E1', date: '2026-09-22', total: 1, rows: [{ privateHistoryMarker: 'not-in-summary' }] }] }) })) {
+    for (const [key, value] of Object.entries({ fx: '7', 'fx-status': JSON.stringify({ fetchedAt: fresh }), 'source-ledger': JSON.stringify({ source: 'personal', periods: [{ id: 'E1', date: '2026-09-22', total: 1, rows: [{ value: 1, privateHistoryMarker: 'not-in-summary' }] }] }) })) {
       await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', key, value).run();
     }
     for (let index = 0; index < 100; index++) {
@@ -259,7 +259,7 @@ test('owner-scoped recorded withdrawal additions, edits and deletions recalculat
       await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-' + index, JSON.stringify(row)).run();
     }
     const source = JSON.stringify({ source: 'personal', baselineDate: '2026-09-21', periods: [
-      { id: 'baseline', date: '2026-09-21', total: 300, rows: [{ privateHistoryMarker: 'not-in-summary' }] },
+      { id: 'baseline', date: '2026-09-21', total: 300, rows: [{ value: 300, privateHistoryMarker: 'not-in-summary' }] },
       { id: 'original-after', date: '2026-09-22', total: 310 },
     ] });
     const snapshot = JSON.stringify({ id: 'daily-2026-09-23', date: '2026-09-23', total: 325, assets: rows });
@@ -296,4 +296,95 @@ test('owner-scoped recorded withdrawal additions, edits and deletions recalculat
     const persistedAssets = await database.prepare('SELECT data FROM assets WHERE owner = ? ORDER BY id').bind('owner').all<{ data: string }>();
     assert.deepEqual(persistedAssets.results.map(row => JSON.parse(row.data)), rows);
   } finally { database.close(); }
+});
+
+test('hub trend omits incomplete subtotals without reviving an older same-day total, while real zero stays visible', async () => {
+  const database = openDatabase(':memory:');
+  try {
+    await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-1', JSON.stringify(asset('manual', fresh, null))).run();
+    await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', 'source-ledger', JSON.stringify({ source: 'personal', periods: [
+      { id: 'E1', date: '2026-09-22', total: 200, rows: [{ value: 200 }] },
+    ] })).run();
+    const snapshots = [
+      { id: 'daily-2026-09-22', date: '2026-09-22', total: 100, assets: [{ value: 100 }, { value: null }] },
+      { id: 'daily-2026-09-23', date: '2026-09-23', total: 0, assets: [{ value: 0 }] },
+    ];
+    for (const row of snapshots) await database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('owner', row.date, JSON.stringify(row)).run();
+    const result = await readHubSummary(database, 'owner', now);
+    assert.equal(result.data.health.state, 'partial');
+    assert.equal(result.data.metrics[0].value, null);
+    assert.deepEqual(result.data.trend, [{ at: '2026-09-23T00:00:00+08:00', value: 0 }]);
+    assert.match(result.data.health.message, /估值缺失/);
+  } finally { database.close(); }
+});
+
+test('hub trend keeps the 90-day window when incomplete days are omitted', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const days = Array.from({ length: 91 }, (_, index) => new Date(Date.parse('2026-09-23T00:00:00Z') - (90 - index) * 86_400_000).toISOString().slice(0, 10));
+  await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-1', JSON.stringify(asset('manual', fresh, 1))).run();
+  await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', 'source-ledger', JSON.stringify({ source: 'personal', periods: [
+    { id: 'E1', date: days[0], total: 500, rows: [{ value: 500 }] },
+  ] })).run();
+  for (const [index, date] of days.entries()) {
+    const missing = index === 0 || index === 90;
+    const snapshot = { id: `daily-${date}`, date, total: 1, assets: [{ value: 1 }, ...(missing ? [{ value: null }] : [])] };
+    await database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('owner', date, JSON.stringify(snapshot)).run();
+  }
+  const trend = (await readHubSummary(database, 'owner', now)).data.trend;
+  assert.equal(trend.length, 89);
+  assert.equal(trend[0].at, `${days[1]}T00:00:00+08:00`);
+  assert.equal(trend.at(-1)?.at, `${days[89]}T00:00:00+08:00`);
+  assert.ok(trend.every(point => point.value === 1));
+});
+
+test('hub current metrics reject determinable legacy market zeros and preserve genuine zero quantities', () => {
+  for (const quantity of [null, 0]) {
+    const source = { ...input(), assets: [asset('manual', fresh, 100), { ...asset('market', fresh, 0), quantity, price: 2.5 }] };
+    const original = structuredClone(source);
+    const result = buildHubSummary(source, now).data;
+    assert.equal(result.health.state, quantity === null ? 'partial' : 'online');
+    assert.equal(result.metrics[0].value, quantity === null ? null : 100);
+    assert.equal(result.metrics.find(metric => metric.key === 'holdings')?.value, quantity === null ? null : 100);
+    assert.deepEqual(source, original);
+  }
+});
+
+test('hub SQL derives legacy zero incompleteness even with missingValues zero and leaves stored records intact', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const legacy = { ...asset('market', fresh, 0), project: 'virtual', quantity: null, price: 2.5, privateMarker: 'not-in-summary' };
+  const known = asset('manual', fresh, 100);
+  const source = JSON.stringify({ source: 'personal', periods: [
+    { id: 'D1', date: '2026-09-20', total: 100, rows: [known, legacy] },
+    { id: 'E1', date: '2026-09-21', total: 999, rows: [{ value: 999 }] },
+    { id: 'F1', date: '2026-09-22', total: 888, rows: [{ value: 888 }] },
+  ] });
+  const snapshots = [
+    { id: 'daily-2026-09-21', date: '2026-09-21', total: 100, partial: false, assets: [known, legacy] },
+    { id: 'daily-2026-09-22', date: '2026-09-22', total: 100, partial: false, missingValues: 0, assets: [known, legacy] },
+    { id: 'daily-2026-09-23', date: '2026-09-23', total: 0, partial: false, missingValues: 0, assets: [{ ...legacy, quantity: 0 }] },
+  ];
+  await database.batch([
+    database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-1', JSON.stringify(legacy)),
+    database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-2', JSON.stringify(known)),
+    ...Object.entries({ fx: '7', 'fx-status': JSON.stringify({ fetchedAt: fresh }), 'source-ledger': source }).map(([key, value]) =>
+      database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', key, value)),
+    ...snapshots.map(snapshot => database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('owner', snapshot.date, JSON.stringify(snapshot))),
+  ]);
+  const summary = (await readHubSummary(database, 'owner', now)).data;
+  assert.equal(summary.health.state, 'partial');
+  assert.equal(summary.metrics[0].value, null);
+  assert.equal(summary.metrics.find(metric => metric.key === 'holdings')?.value, null);
+  assert.deepEqual(summary.trend, [{ at: '2026-09-23T00:00:00+08:00', value: 0 }], 'incomplete daily totals must not revive same-day original totals');
+  assert.doesNotMatch(JSON.stringify(summary), /privateMarker|not-in-summary/);
+  assert.equal((await database.prepare('SELECT data FROM assets WHERE owner=? AND id=?').bind('owner', 'row-1').first<{ data: string }>())?.data, JSON.stringify(legacy));
+  const stored = await database.prepare('SELECT data FROM snapshots WHERE owner=? ORDER BY date').bind('owner').all<{ data: string }>();
+  assert.deepEqual(stored.results.map(row => row.data), snapshots.map(row => JSON.stringify(row)));
+  assert.equal((await database.prepare("SELECT value FROM settings WHERE owner=? AND key='source-ledger'").bind('owner').first<{ value: string }>())?.value, source);
+
+  await database.prepare('UPDATE assets SET data=? WHERE owner=? AND id=?').bind(JSON.stringify({ ...legacy, quantity: 0 }), 'owner', 'row-1').run();
+  const zero = (await readHubSummary(database, 'owner', now)).data;
+  assert.equal(zero.health.state, 'online');
+  assert.equal(zero.metrics[0].value, 100);
 });

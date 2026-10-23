@@ -7,6 +7,7 @@ import {
   type PairAdlState,
 } from './pair-adl.ts';
 import {
+  configuredMarginPercent,
   marginLimitFromPercent,
   percentFromMarginLimit,
   parseMinimumLeverage,
@@ -154,9 +155,9 @@ export function pairDraft(pair?: Pair): PairDraft {
       pair?.ordinary.order_notional ??
       DEFAULT_PAIR_SYMBOL.default_order_notional,
     min_open_leverage: String(pair?.ordinary.min_open_leverage ?? 5),
-    margin_percent: percentFromMarginLimit(
-      pair?.ordinary.margin_limit ?? '0.5',
-    ),
+    margin_percent: pair
+      ? (configuredMarginPercent(pair.ordinary.margin_limit) ?? '')
+      : percentFromMarginLimit('0.5'),
     spread_limit:
       pair?.ordinary.spread_limit ?? DEFAULT_PAIR_SYMBOL.default_spread_limit,
     margin_enabled: pair?.margin.enabled ?? false,
@@ -448,6 +449,20 @@ export function pairMarginOnly(pair: Pair): boolean {
     pair.margin?.enabled === true &&
     pair.ordinary?.enabled === false
   );
+}
+// A margin-only pair hides the ordinary risk field, but a missing stored limit
+// still blocks saving, so the field must stay reachable until it is filled.
+export function pairMarginLimitFieldVisible(draft: PairDraft, saved?: Pair) {
+  return (
+    draft.mode !== 'monitor' ||
+    (saved !== undefined &&
+      configuredMarginPercent(saved.ordinary.margin_limit) === null)
+  );
+}
+export function pairDisplayBalances(pair: Pair) {
+  return pairMarginOnly(pair)
+    ? pair.state?.margin_balances
+    : pair.state?.snapshots;
 }
 export function pairConfigurationLock(pair: Pair): string {
   const adlBlock = adlConfigurationLock(pair);

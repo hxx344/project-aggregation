@@ -1,9 +1,10 @@
 import type { openDatabase } from './sqlite.ts';
 import type { FxStatus, Withdrawal } from './types.ts';
 import { recordedWithdrawals } from './withdrawals.ts';
+import { knownAssetValue, missingValueSql, sumKnownValues } from './asset-values.ts';
 
-type SummaryAsset = { project: string; mode: string | null; value: number | null; updatedAt: string | null; error?: string | null };
-type SummaryPeriod = { id: string; date: string; total: number | null; future?: boolean | number; archived?: boolean | number };
+type SummaryAsset = { project: string; mode: string | null; quantity?: number | null; value: number | null; updatedAt: string | null; error?: string | null };
+type SummaryPeriod = { id: string; date: string; total: number | null; future?: boolean | number; archived?: boolean | number; missingValues?: number };
 type SummaryWithdrawal = Pick<Withdrawal, 'date' | 'amount'>;
 type SummaryInput = { assets: SummaryAsset[]; connectedExchanges?: string[]; fx: number | null; fxStatus: Partial<FxStatus>; example: boolean; history: SummaryPeriod[]; withdrawals?: SummaryWithdrawal[]; baselineDate?: string | null };
 type Metric = { key: string; label: string; value: number | string | null; unit?: string; detail?: string };
@@ -35,9 +36,9 @@ export function buildHubSummary(input: SummaryInput, now = Date.now()) {
   const retainedAt = oldest([...retained].map(asset => asset.updatedAt));
   const updatedAt = staticValuation ? oldest(assets.map(asset => asset.updatedAt)) : oldest(dynamic.map(asset => asset.updatedAt));
   const unknownMode = dynamic.some(asset => !['market', 'bybit', 'aster', 'binance', 'okx', 'gate', 'variational'].includes(asset.mode ?? ''));
-  const values = assets.map(asset => finite(asset.value));
+  const values = assets.map(knownAssetValue);
   const total = values.every(value => value !== null) ? values.reduce<number>((sum, value) => sum + value!, 0) : null;
-  const withdrawals = assets.filter(asset => asset.project?.trim() === '出金').reduce((sum, asset) => sum + (finite(asset.value) ?? 0), 0);
+  const withdrawals = sumKnownValues(assets.filter(asset => asset.project?.trim() === '出金')).total;
   const fxTime = iso(fxStatus.fetchedAt);
   const fxStale = !fxTime || now - Date.parse(fxTime) > 300000 || !!fxStatus.error || finite(input.fx) === null || (input.fx ?? 0) <= 0;
   const failed = assets.some(asset => !retained.has(asset) && !!asset.error);
@@ -50,6 +51,7 @@ export function buildHubSummary(input: SummaryInput, now = Date.now()) {
     ...(unknownMode ? ['存在未识别的资产来源，按动态数据校验'] : []),
     ...(fxStale ? ['汇率已过期、异常或缺少更新时间'] : []),
     ...(failed ? ['部分资产更新失败，保留旧值'] : []),
+    ...(values.some(value => value === null) ? ['部分资产估值缺失，完整总额暂不可用'] : []),
     ...(stale ? ['动态资产源时间已过期或缺失'] : []),
   ].join('；');
   const metrics: Metric[] = [
@@ -66,7 +68,8 @@ export function buildHubSummary(input: SummaryInput, now = Date.now()) {
     const existing = byDay.get(period.date);
     if (!existing?.id.startsWith('daily-') || period.id.startsWith('daily-')) byDay.set(period.date, period);
   }
-  const trend = [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-90).map(period => ({
+  // Window first: the daily query is limited to 90 rows, so an incomplete day must not let an older original total re-enter.
+  const trend = [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-90).filter(period => !period.missingValues).map(period => ({
     at: period.date + 'T00:00:00+08:00',
     value: period.total! + (period.id.startsWith('daily-') || period.date > (input.baselineDate ?? '') ? recordedWithdrawals(recorded, period.date) : 0),
   }));
@@ -78,12 +81,12 @@ export async function readHubSummary(database: Pick<ReturnType<typeof openDataba
   // SQLite projects current fields, historical totals and withdrawal dates/amounts.
   // Full snapshots, workbook asset rows and withdrawal notes never enter this path.
   const [assets, connections, settings, metadata, original, daily, withdrawals] = await Promise.all([
-    database.prepare("SELECT json_extract(data, '$.project') AS project, json_extract(data, '$.mode') AS mode, json_extract(data, '$.value') AS value, json_extract(data, '$.updatedAt') AS updatedAt, json_extract(data, '$.error') AS error FROM assets WHERE owner = ?").bind(owner).all<SummaryAsset>(),
+    database.prepare(`SELECT json_extract(data, '$.project') AS project, json_extract(data, '$.mode') AS mode, CASE WHEN ${missingValueSql('data')} THEN NULL ELSE json_extract(data, '$.value') END AS value, json_extract(data, '$.updatedAt') AS updatedAt, json_extract(data, '$.error') AS error FROM assets WHERE owner = ?`).bind(owner).all<SummaryAsset>(),
     database.prepare('SELECT exchange FROM connections WHERE owner = ?').bind(owner).all<{ exchange: string }>(),
     database.prepare("SELECT key,value FROM settings WHERE owner = ? AND key IN ('fx','fx-status')").bind(owner).all<{ key: string; value: string }>(),
     database.prepare("SELECT json_extract(value, '$.source') AS source, json_extract(value, '$.baselineDate') AS baselineDate FROM settings WHERE owner = ? AND key = 'source-ledger'").bind(owner).first<{ source: string; baselineDate: string | null }>(),
-    database.prepare("SELECT json_extract(p.value, '$.id') AS id, json_extract(p.value, '$.date') AS date, json_extract(p.value, '$.total') AS total, json_extract(p.value, '$.future') AS future, json_extract(p.value, '$.archived') AS archived FROM settings s, json_each(s.value, '$.periods') p WHERE s.owner = ? AND s.key = 'source-ledger' ORDER BY CAST(p.key AS INTEGER)").bind(owner).all<SummaryPeriod>(),
-    database.prepare("SELECT json_extract(data, '$.id') AS id, date, json_extract(data, '$.total') AS total FROM snapshots WHERE owner = ? AND date <= ? AND date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(date, '+0 days') = date AND COALESCE(json_extract(data, '$.future'), 0) = 0 AND COALESCE(json_extract(data, '$.archived'), 0) = 0 AND json_type(data, '$.total') IN ('integer','real') ORDER BY date DESC LIMIT 90").bind(owner, today).all<SummaryPeriod>(),
+    database.prepare(`SELECT json_extract(p.value, '$.id') AS id, json_extract(p.value, '$.date') AS date, json_extract(p.value, '$.total') AS total, json_extract(p.value, '$.future') AS future, json_extract(p.value, '$.archived') AS archived, (SELECT COUNT(*) FROM json_each(p.value, '$.rows') a WHERE ${missingValueSql('a.value')}) AS missingValues FROM settings s, json_each(s.value, '$.periods') p WHERE s.owner = ? AND s.key = 'source-ledger' ORDER BY CAST(p.key AS INTEGER)`).bind(owner).all<SummaryPeriod>(),
+    database.prepare(`SELECT json_extract(data, '$.id') AS id, date, json_extract(data, '$.total') AS total, MAX(COALESCE(json_extract(data, '$.missingValues'), 0), (SELECT COUNT(*) FROM json_each(data, '$.assets') a WHERE ${missingValueSql('a.value')})) AS missingValues FROM snapshots WHERE owner = ? AND date <= ? AND date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(date, '+0 days') = date AND COALESCE(json_extract(data, '$.future'), 0) = 0 AND COALESCE(json_extract(data, '$.archived'), 0) = 0 AND json_type(data, '$.total') IN ('integer','real') ORDER BY date DESC LIMIT 90`).bind(owner, today).all<SummaryPeriod>(),
     database.prepare("SELECT json_extract(w.value, '$.date') AS date, json_extract(w.value, '$.amount') AS amount FROM settings s, json_each(s.value) w WHERE s.owner = ? AND s.key = 'withdrawals'").bind(owner).all<SummaryWithdrawal>(),
   ]);
   const settingsByKey = new Map(settings.results.map(row => [row.key, row.value]));

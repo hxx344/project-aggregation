@@ -16,7 +16,7 @@ function items(day: DailyChange): Item[] {
       detail: source.previous === null && source.current === null ? '估值缺失' : `${money(source.previous)} → ${money(source.current)}`,
       sub: source.details.map(detail => ({ key: detail.label, label: detail.label, change: detail.change, detail: `${money(detail.previous)} → ${money(detail.current)}` })) })),
     ...(day.withdrawnChange ? [{ key: 'withdrawn', label: '出金（加回）', change: day.withdrawnChange, detail: '累计出金变化', sub: [] }] : []),
-    ...(day.unattributed ? [{ key: 'unattributed', label: '原表合计差异', change: day.unattributed, detail: '原表总额与行估值之和的差额变化', sub: [] }] : []),
+    ...(day.unattributed ? [{ key: 'unattributed', label: day.partial ? '未归因变化' : '原表合计差异', change: day.unattributed, detail: day.partial ? '部分数据无法归因，包含已知金额范围变化' : '原表总额与行估值之和的差额变化', sub: [] }] : []),
   ].sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
 }
 
@@ -55,10 +55,10 @@ export const DailyChanges = memo(function DailyChanges({ version }: { version: s
         : <ol className="daily-change-list" aria-label="每日波动明细，按日期从新到旧" aria-busy={loading}>{days.map(day => {
           const all = items(day), isOpen = expanded === day.date, shown = isOpen ? all : all.slice(0, 3);
           const extra = all.some(item => item.sub.length);
-          const rate = day.previousAdjusted > 0 ? day.change / day.previousAdjusted : null;
+          const rate = !day.partial && day.previousAdjusted > 0 ? day.change / day.previousAdjusted : null;
           return <li key={day.date}>
             <div className="daily-change-head">
-              <span><strong>{day.date.slice(5)}</strong><small>较 {day.previousDate.slice(5)}{day.gapDays > 1 && ' · 间隔 ' + day.gapDays + ' 天'}</small></span>
+              <span><strong>{day.date.slice(5)}</strong>{day.partial && <small className="daily-partial" title="快照含旧值或缺失估值，仅比较已知金额">部分数据</small>}<small>较 {day.previousDate.slice(5)}{day.gapDays > 1 && ' · 间隔 ' + day.gapDays + ' 天'}</small></span>
               <span className={performanceTone(day.change)}>$ {formatGain(day.change)}<small>{formatReturnRate(rate)}</small></span>
             </div>
             {day.positions && <Holdings positions={day.positions}/>}
@@ -69,7 +69,7 @@ export const DailyChanges = memo(function DailyChanges({ version }: { version: s
               {isOpen && !!item.sub.length && <ul className="daily-sources expanded daily-details">{item.sub.map(line => <li key={line.key}>
                 <span className="daily-source-label">{line.label}</span><small>{line.detail}</small><b className={performanceTone(line.change)}>{formatGain(line.change)}</b>
               </li>)}</ul>}
-            </li>)}</ul> : <p className="daily-sources">各来源无变化</p>}
+            </li>)}</ul> : <p className="daily-sources">{day.partial ? '已知来源无变化，部分数据无法比较' : '各来源无变化'}</p>}
             {(all.length > 3 || extra) && <button type="button" className="text-button" aria-expanded={isOpen} onClick={() => setExpanded(isOpen ? null : day.date)}>{isOpen ? '收起' : extra ? '展开明细' : '全部 ' + all.length + ' 项'}</button>}
           </li>;
         })}</ol>}

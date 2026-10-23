@@ -22,10 +22,8 @@ import {
 import { pairMarginOnly, type Pair } from '@/lib/pairs';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
-import {
-  marginLimitFromPercent,
-  percentFromMarginLimit,
-} from '@/lib/policy';
+import { marginLimitFromPercent } from '@/lib/policy';
+import { accountRiskView } from '@/lib/account-risk';
 export function AccountOverview({
   account,
   busy,
@@ -83,30 +81,19 @@ export function AccountOverview({
     account.snapshot_refresh,
     account.status === 'error' ? account.reason : undefined,
   );
-  const marginLimit = Number(account?.policy.margin_limit ?? '0.5');
-  const marginPercent = percentFromMarginLimit(
-    account?.policy.margin_limit ?? '0.5',
-  );
-  const highMarginLimitValue =
-    account?.risk_limits?.high_leverage ??
-    account?.policy.margin_limit ??
-    '0.5';
-  const highMarginLimit = Number(highMarginLimitValue);
-  const highMarginPercent = percentFromMarginLimit(highMarginLimitValue);
-  const riskAccent =
-    ratio === null || highMarginLimit === null
-      ? 'muted'
-      : ratio > highMarginLimit
-        ? 'danger'
-        : ratio > marginLimit
-          ? 'amber'
-          : 'mint';
-
+  const {
+    marginLimit,
+    marginPercent,
+    marginDraft,
+    highMarginLimit,
+    highMarginPercent,
+    riskAccent,
+  } = accountRiskView(account, ratio);
   const {
     value: riskDraft,
     setValue: setRiskDraft,
     clear,
-  } = useAccountDraft(account.id, marginPercent);
+  } = useAccountDraft(account.id, marginDraft);
   return (
     <div className="feature-stack">
       {' '}
@@ -196,7 +183,9 @@ export function AccountOverview({
                 {snapshot ? pct(snapshot.ratio) : '—'}
               </span>
               <small>
-                {`普通 5x ≤ ${marginPercent}%`}
+                {marginPercent === null
+                  ? '普通 5x 上限待确认'
+                  : `普通 5x ≤ ${marginPercent}%`}
               </small>
             </div>
             <div className="risk-track">
@@ -208,7 +197,7 @@ export function AccountOverview({
                   aria-label="当前保证金占用率"
                 />
               )}
-              {ratio !== null && (
+              {ratio !== null && marginPercent !== null && (
                 <i
                   className="limit-marker"
                   style={{ left: `${marginPercent}%` }}
@@ -216,6 +205,7 @@ export function AccountOverview({
                 />
               )}
               {ratio !== null &&
+                marginLimit !== null &&
                 highMarginLimit !== null &&
                 highMarginLimit > marginLimit && (
                   <i
@@ -235,7 +225,11 @@ export function AccountOverview({
               <div className="risk-explanation muted">
                 <p className="risk-bonus">
                   <span>普通 10x / 20x 加仓上限</span>
-                  <strong>{highMarginPercent}%</strong>
+                  <strong>
+                    {highMarginPercent === null
+                      ? '待确认'
+                      : `${highMarginPercent}%`}
+                  </strong>
                 </p>
                 <p>普通 10x / 20x 额外加 5 个百分点，最高 100%。</p>
                 <p>每仓占用 = |数量| × 标记价格 ÷ 实际杠杆；多空分别累加。</p>
@@ -287,6 +281,9 @@ export function AccountOverview({
                 id="margin-percent"
                 label="基础保证金占用上限 · %"
                 max="100"
+                placeholder={
+                  marginPercent === null ? '待确认，请输入上限' : undefined
+                }
                 disabled={locked}
                 value={riskDraft}
                 onValueChange={(value) => setRiskDraft(value)}
@@ -295,7 +292,11 @@ export function AccountOverview({
                 此设置用于普通开仓。
                 {configurationLock || '各功能适用上限见上方风险约束。'}
               </p>
-              <Button type="submit" variant="outline" disabled={locked}>
+              <Button
+                type="submit"
+                variant="outline"
+                disabled={locked || !riskDraft.trim()}
+              >
                 保存账户风险上限
               </Button>
             </SettingsForm>

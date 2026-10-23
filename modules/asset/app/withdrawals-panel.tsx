@@ -4,6 +4,7 @@ import { Pencil, Plus, Trash2 } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { embeddedWithdrawals } from '@/lib/withdrawals';
+import { sumKnownValues } from '@/lib/asset-values';
 import type { Ledger, Withdrawal } from '@/lib/types';
 
 type Mutate = (path: string, method: string, body: unknown, onSuccess: () => void) => Promise<void>;
@@ -12,12 +13,13 @@ const money = (value: number) => value.toLocaleString('zh-CN', { minimumFraction
 export function WithdrawalsPanel({ ledger, today, busy, error, mutate, clearError }: { ledger: Ledger; today: string; busy: boolean; error: string; mutate: Mutate; clearError: () => void }) {
   const [draft, setDraft] = useState<{ id: string; editing: boolean; date: string; amount: string; note: string } | null>(null);
   const [removing, setRemoving] = useState<Withdrawal | null>(null);
+  const partial = sumKnownValues(ledger.assets.filter(asset => asset.project.trim() === '出金')).partial;
   const open = (row?: Withdrawal) => {
     clearError();
     setDraft({ id: row?.id ?? crypto.randomUUID(), editing: !!row, date: row?.date ?? today, amount: row ? String(row.amount) : '', note: row?.note ?? '' });
   };
   return <>
-    <div className="notice info">原表“出金”已作为累计出金计入，当前为 $ {money(embeddedWithdrawals(ledger.assets))}。这里只登记原表基准日 {ledger.baselineDate} 之后尚未计入的新增出金；同日新增也可登记。新增记录会自动加入总览表内总额及资产明细的出金数量和估值，请勿再手动加到原表“出金”行。</div>
+    <div className="notice info">原表“出金”已作为累计出金计入，当前{partial ? '已知金额（部分）' : '金额'}为 $ {money(embeddedWithdrawals(ledger.assets))}。这里只登记原表基准日 {ledger.baselineDate} 之后尚未计入的新增出金；同日新增也可登记。新增记录会自动加入总览表内总额及资产明细的出金数量和估值，请勿再手动加到原表“出金”行。</div>
     <section className="panel holdings">
       <div className="holdings-heading"><h2>新增出金记录 <span className="count-chip">{ledger.withdrawals.length}</span></h2><p className="help">金额使用出金时的美元价值；账户间内部转账不记出金。</p><button className="button primary" disabled={busy} onClick={() => open()}><Plus size={15}/>登记出金</button></div>
       {ledger.withdrawals.length ? <Table><TableHeader><TableRow><TableHead>日期（北京时间）</TableHead><TableHead className="numeric">金额 / USD</TableHead><TableHead>备注</TableHead><TableHead>操作</TableHead></TableRow></TableHeader><TableBody>{[...ledger.withdrawals].sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)).map(row => <TableRow key={row.id}><TableCell>{row.date}</TableCell><TableCell className="numeric">{money(row.amount)}</TableCell><TableCell className="withdrawal-note">{row.note || '—'}</TableCell><TableCell><div className="row-actions"><button className="icon-button" disabled={busy} aria-label={'编辑 ' + row.date + ' 出金 ' + row.amount} onClick={() => open(row)}><Pencil size={16}/></button><button className="icon-button" disabled={busy} aria-label={'删除 ' + row.date + ' 出金 ' + row.amount} onClick={() => { clearError(); setRemoving(row); }}><Trash2 size={16}/></button></div></TableCell></TableRow>)}</TableBody></Table> : <div className="empty-state">尚未登记新增出金。原表中的累计出金已自动纳入统计。</div>}

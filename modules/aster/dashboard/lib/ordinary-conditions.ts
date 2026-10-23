@@ -22,7 +22,7 @@ type OrdinaryMarket = {
   book_error?: string;
 };
 
-function decimal(value: unknown): string | null {
+export function decimal(value: unknown): string | null {
   if (typeof value !== 'string' || value.length > 128) return null;
   const text = value.trim();
   const match = /^\+?(\d+(?:\.\d*)?|\.\d+)(?:[eE]([+-]?\d+))?$/.exec(text);
@@ -173,7 +173,7 @@ export function ordinaryConditionsView(
         '>',
         market?.status === 'ok'
           ? freshness(
-              market.capacity_checked_at?.[leverage] ?? market.checked_at,
+              market.capacity_checked_at?.[leverage],
               now,
               8,
               Boolean(connectionError),

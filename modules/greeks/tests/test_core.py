@@ -115,6 +115,36 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(health.pm_incremental_maintenance_margin_usd, 17.0)
             self.assertEqual(health.pm_asset_initial_margin_usd, 115.0)
 
+    def test_empty_wallet_is_unavailable_without_zero_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = TradingEngine(Settings(_env_file=None, state_file=f"{directory}/state.json",
+                                           bybit_api_key="test", bybit_api_secret="test"))
+            engine.client.account_info = AsyncMock(return_value={"marginMode": "REGULAR_MARGIN"})
+            for rows in ([], [{}], None):
+                with self.subTest(rows=rows):
+                    engine.client._request = AsyncMock(return_value={"list": rows})
+                    health = asyncio.run(engine.load_account_health())
+                    self.assertFalse(health.available)
+                    self.assertIn("Wallet balance", health.message)
+                    self.assertIsNone(health.initial_margin_rate)
+                    self.assertIsNone(health.available_balance_usd)
+
+    def test_missing_individual_wallet_metrics_remain_unknown_on_an_available_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = TradingEngine(Settings(_env_file=None, state_file=f"{directory}/state.json",
+                                           bybit_api_key="test", bybit_api_secret="test"))
+            engine.client.account_info = AsyncMock(return_value={"marginMode": "REGULAR_MARGIN"})
+            engine.client.wallet_balance = AsyncMock(return_value={"accountType": "UNIFIED", "totalAvailableBalance": "",
+                "totalEquity": "42", "accountIMRate": None, "accountMMRate": "0"})
+            health = asyncio.run(engine.load_account_health())
+            self.assertTrue(health.available)
+            self.assertIsNone(health.message)
+            self.assertIsNone(health.available_balance_usd)
+            self.assertIsNone(health.margin_balance_usd)
+            self.assertIsNone(health.initial_margin_rate)
+            self.assertEqual(health.maintenance_margin_rate, 0)
+            self.assertEqual(health.total_equity_usd, 42)
+
     def test_executed_rfq_positions_restore_strategy_tracking(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(_env_file=None, state_file=f"{directory}/state.json")

@@ -52,7 +52,7 @@ export function computeFreshness(
 // The client re-evaluates source clocks as now advances, even if polling stops.
 // These display states never replace the server's trading/notification checks.
 export function computeSymbolView(
-  symbol: Pick<MonitoredSymbol, 'monitor_enabled'> & { monitor?: boolean },
+  symbol: Partial<Pick<MonitoredSymbol, 'monitor_enabled'>>,
   listing: Listing | undefined,
   listings: Listings | undefined,
   now: number,
@@ -81,7 +81,7 @@ export function computeSymbolView(
   if (
     options.demo ||
     options.monitoringEnabled === false ||
-    !(symbol.monitor_enabled ?? symbol.monitor ?? true)
+    symbol.monitor_enabled !== true
   ) {
     status = 'paused';
   } else if (listing?.error || (discovery && listings?.error)) {

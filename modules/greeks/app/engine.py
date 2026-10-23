@@ -17,7 +17,7 @@ from .state import EngineState
 from .risk import leg_count, maximum_loss, reserve_short_margin, strategy_mode as validate_mode, validate_structure
 from .rfq import RfqMixin
 from .reconciliation import ReconciliationMixin
-from .performance import PerformanceMixin
+from .performance import PerformanceMixin, parse_execution
 from .trade_tasks import TradeTaskMixin, TradeConflict
 from .account_writer import ManagedWriter
 from .position_greeks import ticker_greeks
@@ -655,11 +655,11 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
             records = []
             seen = set()
             for item in raw_items:
-                exec_id = item.get("execId", "")
-                if not exec_id or exec_id in seen:
+                record = parse_execution(item)
+                if record.exec_id in seen:
                     continue
-                seen.add(exec_id)
-                order_link_id = item.get("orderLinkId", "")
+                seen.add(record.exec_id)
+                order_link_id = record.order_link_id
                 group_id = self.execution_group_links.get(order_link_id)
                 if not group_id:
                     parts = order_link_id.split("-")
@@ -667,13 +667,14 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
                         group_id = parts[1]
                 group = self.execution_groups.get(group_id or "") or {}
                 reduce_only = group.get("type") == "close" or order_link_id.startswith("ic-close-")
-                baseline = {} if reduce_only else group.get("legs", {}).get(item.get("symbol", ""), {})
-                exec_price = float(item.get("execPrice", 0) or 0)
-                exec_qty = float(item.get("execQty", 0) or 0)
-                chain_price = float(baseline.get("chain_price", 0) or 0) if baseline else None
+                baseline = {} if reduce_only else group.get("legs", {}).get(record.symbol, {})
+                chain_price = float(baseline["chain_price"]) if baseline.get("chain_price") not in (None, "") else None
+                if chain_price is not None and not isfinite(chain_price):
+                    raise ValueError("Invalid execution chain reference")
                 strategy_side = baseline.get("side")
-                chain_diff = ((1 if strategy_side == "Sell" else -1) * (exec_price - chain_price) * exec_qty) if chain_price is not None and strategy_side else None
-                records.append(ExecutionRecord(symbol=item.get("symbol", ""), side=item.get("side", ""), order_id=item.get("orderId", ""), order_link_id=order_link_id, exec_id=exec_id, exec_fee=float(item.get("execFee", 0) or 0), fee_currency=item.get("feeCurrency", ""), exec_price=exec_price, exec_qty=exec_qty, fee_rate=float(item.get("feeRate", 0) or 0) if item.get("feeRate") not in (None, "") else None, exec_time=datetime.fromtimestamp(int(item.get("execTime", 0)) / 1000, tz=timezone.utc), reduce_only=reduce_only, opening_group=group.get("opening_group"), execution_group=group_id, chain_price_at_create=chain_price, chain_price_diff=chain_diff, closed_size=float(item["closedSize"]) if item.get("closedSize") not in (None, "") else None, exec_type=item.get("execType") or "Trade"))
+                chain_diff = ((1 if strategy_side == "Sell" else -1) * (record.exec_price - chain_price) * record.exec_qty) if chain_price is not None and strategy_side else None
+                records.append(record.model_copy(update={"reduce_only": reduce_only, "opening_group": group.get("opening_group"),
+                    "execution_group": group_id, "chain_price_at_create": chain_price, "chain_price_diff": chain_diff}))
             if order_link_ids:
                 for link, group in zip(requested_links, raw_groups):
                     if isinstance(group, list):
@@ -686,6 +687,7 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
             self.last_executions = sorted(merged.values(), key=lambda item: item.exec_time, reverse=True)[:100]
             self._archive_performance(records)
         except Exception as exc:
+            self.performance_error = "近期成交读取失败或数据不完整，已保留本地台账，下次刷新重试"
             self.log("WARNING", f"Could not load execution fee records: {exc}")
         return self.last_executions
 

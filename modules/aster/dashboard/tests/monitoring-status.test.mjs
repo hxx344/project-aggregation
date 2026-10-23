@@ -104,3 +104,27 @@ test('five-state precedence preserves errors, delisting, paused sampling and con
     'stale',
   );
 });
+
+test('only an explicit monitor_enabled flag can activate monitoring', () => {
+  for (const control of [
+    {},
+    { monitor: true },
+    { monitor: false },
+    { monitor_enabled: undefined, monitor: true },
+    { monitor_enabled: null },
+    { monitor_enabled: 'true' },
+  ]) {
+    const view = computeSymbolView(control, row, catalog, now);
+    assert.equal(view.status, 'paused');
+    assert.equal(view.dataAvailable, false);
+  }
+  assert.equal(
+    computeSymbolView(
+      { monitor_enabled: true, monitor: false },
+      row,
+      catalog,
+      now,
+    ).status,
+    'active',
+  );
+});

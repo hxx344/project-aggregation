@@ -129,7 +129,7 @@ function normalizeLinear(data: unknown, metadata: unknown): Position[] {
     const symbol = text(row.symbol), instrument = instruments.get(symbol); if (!instrument) throw new Error(POSITIONS_INVALID);
     const base = text(instrument.baseAsset), quote = text(instrument.quoteAsset), settlement = text(instrument.marginAsset);
     const result = position(symbol, parsed.side, parsed.quantity, base);
-    return [{ ...result, contractSize: '1', entryPrice: optionalDecimal(row.entryPrice), markPrice: optionalDecimal(row.markPrice),
+    return [{ ...result, positionSide: row.positionSide === 'BOTH' ? 'net' : row.positionSide === 'LONG' ? 'long' : 'short', contractSize: '1', entryPrice: optionalDecimal(row.entryPrice), markPrice: optionalDecimal(row.markPrice),
       notional: row.notional === undefined ? null : absolute(decimal(row.notional)), unrealizedPnl: optionalDecimal(row.unRealizedProfit),
       leverage: optionalDecimal(row.leverage), liquidationPrice: optionalDecimal(row.liquidationPrice),
       priceCurrency: quote, notionalCurrency: quote, pnlCurrency: settlement,
@@ -165,7 +165,7 @@ function normalizeBinanceInverse(data: unknown, metadata: unknown): Position[] {
       ? String(instrument.contractSize) : instrument.contractSize);
     if (contractSize.startsWith('-') || isZero(contractSize)) throw new Error(POSITIONS_INVALID);
     const item = position(symbol, parsed.side, parsed.quantity, '张（' + quote + '/张）');
-    return [{ ...item, contractSize, entryPrice: optionalDecimal(row.entryPrice), markPrice: optionalDecimal(row.markPrice),
+    return [{ ...item, positionSide: row.positionSide === 'BOTH' ? 'net' : row.positionSide === 'LONG' ? 'long' : 'short', contractSize, entryPrice: optionalDecimal(row.entryPrice), markPrice: optionalDecimal(row.markPrice),
       notional: multiplyDecimals(absolute(parsed.quantity), contractSize), notionalCurrency: quote, priceCurrency: quote,
       unrealizedPnl: optionalDecimal(row.unRealizedProfit), pnlCurrency: settlement, leverage: optionalDecimal(row.leverage),
       liquidationPrice: optionalDecimal(row.liquidationPrice), marginMode: typeof row.marginType === 'string' ? text(row.marginType) : null,
@@ -204,7 +204,7 @@ export async function readBybitPositions(c: BybitCredential, scope: BybitScope, 
     const instrument = metadata.get(symbol)!; const base = text(instrument.baseCoin), quote = text(instrument.quoteCoin), settlement = text(instrument.settleCoin);
     if (settleCoin && settlement !== settleCoin) throw new Error(POSITIONS_INVALID);
     const item = position(symbol, row.side === 'Buy' ? 'long' : 'short', quantity, category === 'inverse' ? quote : base);
-    result.push({ ...item, contractSize: '1', entryPrice: optionalDecimal(row.avgPrice), markPrice: optionalDecimal(row.markPrice),
+    result.push({ ...item, positionSide: row.positionIdx === 1 ? 'long' : row.positionIdx === 2 ? 'short' : 'net', contractSize: '1', entryPrice: optionalDecimal(row.avgPrice), markPrice: optionalDecimal(row.markPrice),
       notional: optionalDecimal(row.positionValue), unrealizedPnl: optionalDecimal(row.unrealisedPnl), leverage: optionalDecimal(row.leverage),
       liquidationPrice: optionalDecimal(row.liqPrice), priceCurrency: quote, notionalCurrency: category === 'inverse' ? base : quote,
       pnlCurrency: settlement, sourceUpdatedAt: timestamp(row.updatedTime) });
@@ -233,7 +233,7 @@ export async function readOkxPositions(c: OkxCredential, scope: 'SWAP' | 'FUTURE
     const faceCurrency = text(instrument.ctValCcy), settlement = text(instrument.settleCcy);
     const pair = text(instrument.uly).split('-'); if (pair.length !== 2) throw new Error(POSITIONS_INVALID);
     const item = position(symbol, parsed.side, parsed.quantity, '张（' + faceCurrency + '/张）');
-    result.push({ ...item, id: positionId(symbol, text(row.posId), parsed.side), contractSize,
+    result.push({ ...item, positionSide: row.posSide as 'long' | 'short' | 'net', id: positionId(symbol, text(row.posId), parsed.side), contractSize,
       entryPrice: optionalDecimal(row.avgPx), markPrice: optionalDecimal(row.markPx), notional: optionalDecimal(row.notionalUsd),
       unrealizedPnl: optionalDecimal(row.upl), leverage: optionalDecimal(row.lever), liquidationPrice: optionalDecimal(row.liqPx),
       priceCurrency: pair[1], notionalCurrency: 'USD', pnlCurrency: settlement, marginMode: text(row.mgnMode), sourceUpdatedAt: timestamp(row.uTime) });

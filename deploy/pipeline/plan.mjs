@@ -98,20 +98,25 @@ export function computeInputKey({ root, stageId, profile, spec, configFingerprin
 }
 
 /** 跳过条件必须同时满足：同键成功记录、产物仍完整、未被 --force 覆盖。 */
-export function shouldSkip({ state, stageId, inputKey, root, outputs = {}, force = false }) {
+export function shouldSkip({ state, stageId, inputKey, root, outputPaths = [], force = false }) {
   if (force) return { skip: false, reason: '已指定 --force' };
   const record = state.stages?.[stageId];
   if (!record) return { skip: false, reason: '没有历史记录' };
   if (record.status !== 'ok') return { skip: false, reason: `上次状态为 ${record.status}` };
   if (record.inputKey !== inputKey) return { skip: false, reason: '输入或配置已变化' };
-  if (!outputsIntact(root, outputs)) return { skip: false, reason: '产物缺失或已变化' };
+  if (!record.outputs || typeof record.outputs !== 'object' || Array.isArray(record.outputs)
+    || outputPaths.some(file => !/^[a-f0-9]{64}$/.test(record.outputs[file] ?? ''))) {
+    return { skip: false, reason: '缺少可信的成功产物摘要' };
+  }
+  if (!outputsIntact(root, record.outputs)) return { skip: false, reason: '产物缺失或已变化' };
   return { skip: true, reason: '输入与产物均未变化' };
 }
 
 /** 回滚顺序：按 journal 中成功阶段逆序，只处理声明了补偿动作的阶段。 */
 export function planRollback(records) {
-  const succeeded = records.filter(record => record.type === 'stage.ok').map(record => record.stage);
   const snapshots = new Map(records.filter(record => record.type === 'snapshot').map(record => [record.stage, record.data]));
+  const succeeded = records.filter(record => record.type === 'stage.ok'
+    || (record.type === 'stage.failed' && snapshots.has(record.stage))).map(record => record.stage);
   return [...new Set(succeeded)]
     .reverse()
     .map(stage => ({ stage, snapshot: snapshots.get(stage) ?? null, definition: STAGES[stage] }))
