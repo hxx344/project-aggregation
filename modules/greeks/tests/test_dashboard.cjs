@@ -112,6 +112,46 @@ test('account connection failure hides stale health metrics', async () => {
   assert.match(element('positionPayoffContent').innerHTML, /持仓更新失败/);
 });
 
+test('Greeks distinguish confirmed empty positions from unavailable reads and recover', () => {
+  const {context, element} = dashboard({embedded: true});
+  const empty = {status: 'empty', position_count: 0, positions_available: true, stale: false,
+    totals: {delta: null, gamma: null, vega: null, theta: null}, missing: {}};
+  const unavailable = {...empty, status: 'unavailable', positions_available: false, stale: true};
+  for (const summary of [unavailable, empty, unavailable, {...unavailable, status: 'empty'}, empty]) {
+    context.renderGreeks(summary);
+    const available = summary.positions_available;
+    assert.equal(element('greeksStatus').textContent, available ? '暂无持仓' : '持仓暂不可用 · 旧');
+    assert.equal(element('greeks').dataset.state, available ? 'empty' : 'unavailable');
+    assert.equal(element('greeks').dataset.stale, String(!available));
+    for (const id of ['greeksDelta', 'greeksGamma', 'greeksVega', 'greeksTheta']) {
+      assert.equal(element(id).textContent, '—');
+      assert.equal(element(id).className, 'num miss');
+    }
+  }
+});
+
+test('Greeks retain known cached totals, missing values and market freshness warnings', () => {
+  const {context, element} = dashboard({embedded: true});
+  const cached = {status: 'partial', position_count: 1, positions_available: false, stale: true,
+    totals: {delta: -0.2, gamma: -0.00002, vega: null, theta: 55}, missing: {vega: ['C1']}};
+  context.renderGreeks(cached);
+  assert.equal(element('greeks').dataset.state, 'partial');
+  assert.equal(element('greeks').dataset.stale, 'true');
+  assert.equal(element('greeksStatus').textContent, '1 个合约缺少部分 Greeks · 旧');
+  assert.equal(element('greeksDelta').textContent, '-0.2000');
+  assert.equal(element('greeksVega').textContent, '—');
+  context.renderGreeks({...cached, status: 'ok', positions_available: true, totals: {...cached.totals, vega: -40}});
+  assert.equal(element('greeksStatus').textContent, '1 笔持仓 · 旧');
+  assert.equal(element('greeks').dataset.stale, 'true');
+  context.renderGreeks({...cached, status: 'unavailable', positions_available: true,
+    totals: {delta: null, gamma: null, vega: null, theta: null}});
+  assert.equal(element('greeksStatus').textContent, '期权行情 Greeks 暂不可用 · 旧');
+  context.renderGreeks(cached, {failed: true});
+  assert.equal(element('greeksStatus').textContent, '账户读取失败');
+  assert.equal(element('greeks').dataset.state, 'error');
+  assert.equal(element('greeksDelta').textContent, '—');
+});
+
 test('real dashboard initialization waits for proxy activity across all five streams', async () => {
   const {context, requests, message} = dashboard({embedded: true});
   assert.equal(requests.length, 0);

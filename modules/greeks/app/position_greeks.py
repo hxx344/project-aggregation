@@ -42,7 +42,8 @@ def summarize_position_greeks(positions: Iterable, greeks_by_symbol: dict[str, d
             "stale": stale, "units": dict(UNITS)}
     empty_totals = {name: None for name in GREEKS}
     if not counted:
-        return {**base, "status": "empty", "totals": empty_totals, "missing": {name: [] for name in GREEKS}}
+        status = "empty" if positions_available else "unavailable"
+        return {**base, "status": status, "totals": empty_totals, "missing": {name: [] for name in GREEKS}}
     if market_updated_at is None:
         return {**base, "status": "unavailable", "totals": empty_totals,
                 "missing": {name: sorted({p.symbol for p in counted}) for name in GREEKS}}

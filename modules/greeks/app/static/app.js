@@ -985,15 +985,16 @@ function renderGreeks(summary, {failed = false} = {}) {
   }
   const missing = [...new Set(Object.values(summary?.missing || {}).flat())];
   const marketTime = summary?.market_updated_at ? ` · 行情 ${utcTime(summary.market_updated_at)} UTC` : '';
+  const state = summary?.status === 'empty' && summary.positions_available === false ? 'unavailable' : summary?.status;
   const status = failed ? '账户读取失败'
     : !summary ? '等待同步'
-    : summary.status === 'empty' ? '暂无持仓'
-    : summary.status === 'unavailable' ? (summary.positions_available === false ? '持仓暂不可用' : '期权行情 Greeks 暂不可用')
-    : summary.status === 'partial' ? `${missing.length} 个合约缺少部分 Greeks${marketTime}`
+    : state === 'empty' ? '暂无持仓'
+    : state === 'unavailable' ? (summary.positions_available === false ? '持仓暂不可用' : '期权行情 Greeks 暂不可用')
+    : state === 'partial' ? `${missing.length} 个合约缺少部分 Greeks${marketTime}`
     : `${summary.position_count} 笔持仓${marketTime}`;
-  const stale = !failed && summary?.stale === true && summary.status !== 'empty';
+  const stale = !failed && summary?.stale === true && state !== 'empty';
   $('greeksStatus').textContent = stale ? `${status} · 旧` : status;
-  panel.dataset.state = failed ? 'error' : summary?.status || 'loading';
+  panel.dataset.state = failed ? 'error' : state || 'loading';
   panel.dataset.stale = String(stale);
 }
 function updateStrip() {

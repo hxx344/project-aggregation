@@ -60,6 +60,16 @@ class PositionGreeksTests(unittest.TestCase):
         self.assertEqual(result["position_count"], 0)
         self.assertTrue(all(value is None for value in result["totals"].values()))
 
+    def test_unavailable_positions_never_report_confirmed_empty(self):
+        for positions in ([], [position("C1", "Buy", 0)]):
+            with self.subTest(positions=positions):
+                result = summary(positions, {"C1": FULL}, available=False)
+                self.assertEqual(result["status"], "unavailable")
+                self.assertFalse(result["positions_available"])
+                self.assertTrue(result["stale"])
+                self.assertEqual(result["position_count"], 0)
+                self.assertTrue(all(value is None for value in result["totals"].values()))
+
     def test_staleness_and_missing_market(self):
         self.assertTrue(summary([position("C1", "Buy", 1)], {"C1": FULL}, age=31)["stale"])
         self.assertTrue(summary([position("C1", "Buy", 1)], {"C1": FULL}, available=False)["stale"])
@@ -71,6 +81,59 @@ class PositionGreeksTests(unittest.TestCase):
 
 
 class DashboardGreeksTests(unittest.IsolatedAsyncioTestCase):
+    async def test_account_dashboard_empty_snapshots_follow_read_availability_and_recovery(self):
+        from unittest.mock import AsyncMock, patch
+        from app.main import _build_account_dashboard
+        from app.models import AccountHealth
+
+        reads = [RuntimeError("positions offline"), [], RuntimeError("positions offline"), []]
+        with patch("app.main.engine.load_positions", new=AsyncMock(side_effect=reads)), \
+             patch("app.main.engine.positions", []), \
+             patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), \
+             patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), \
+             patch("app.main.engine.ticker_greeks", {}), patch("app.main.engine.chain_source", "bybit"), \
+             patch("app.main.engine.chain_updated_at", datetime.now(timezone.utc)), \
+             patch("app.main.engine.log") as log:
+            for available, status in [(False, "unavailable"), (True, "empty"),
+                                      (False, "unavailable"), (True, "empty")]:
+                with self.subTest(available=available, status=status):
+                    payload = await _build_account_dashboard()
+                    self.assertEqual(payload["positions"], {"available": available, "items": []})
+                    self.assertEqual(payload["greeks"]["status"], status)
+                    self.assertEqual(payload["greeks"]["positions_available"], available)
+                    self.assertEqual(payload["greeks"]["stale"], not available)
+                    self.assertEqual(payload["greeks"]["position_count"], 0)
+                    self.assertTrue(all(value is None for value in payload["greeks"]["totals"].values()))
+            self.assertEqual(log.call_count, 2)
+
+    async def test_account_dashboard_retains_nonempty_cache_after_read_failure(self):
+        from unittest.mock import AsyncMock, patch
+        from app.main import _build_account_dashboard
+        from app.models import AccountHealth
+
+        held = [position("C1", "Sell", 1)]
+        with patch("app.main.engine.load_positions", new=AsyncMock(side_effect=[held, RuntimeError("positions offline")])), \
+             patch("app.main.engine.positions", held), \
+             patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), \
+             patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), \
+             patch("app.main.engine.ticker_greeks", {"C1": {**FULL, "vega": None}}), \
+             patch("app.main.engine.chain_source", "bybit"), \
+             patch("app.main.engine.chain_updated_at", datetime.now(timezone.utc)), \
+             patch("app.main.engine.log"):
+            confirmed = await _build_account_dashboard()
+            payload = await _build_account_dashboard()
+        self.assertTrue(confirmed["positions"]["available"])
+        self.assertFalse(confirmed["greeks"]["stale"])
+        self.assertFalse(payload["positions"]["available"])
+        self.assertEqual(payload["positions"]["items"], [held[0].model_dump(mode="json")])
+        self.assertEqual(payload["greeks"]["totals"], confirmed["greeks"]["totals"])
+        self.assertEqual(payload["greeks"]["status"], "partial")
+        self.assertFalse(payload["greeks"]["positions_available"])
+        self.assertTrue(payload["greeks"]["stale"])
+        self.assertAlmostEqual(payload["greeks"]["totals"]["delta"], -0.2)
+        self.assertIsNone(payload["greeks"]["totals"]["vega"])
+        self.assertEqual(payload["greeks"]["missing"]["vega"], ["C1"])
+
     async def test_account_dashboard_includes_greeks_from_retained_ticker_snapshot(self):
         from unittest.mock import AsyncMock, patch
         from app.main import _build_account_dashboard
