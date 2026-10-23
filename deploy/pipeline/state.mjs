@@ -1,5 +1,6 @@
 /** 运行状态：环境锁、阶段状态文件与追加式日志（journal）。 */
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { STATE_SCHEMA } from './constants.mjs';
 
@@ -17,7 +18,9 @@ export function isProcessAlive(pid) {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return error.code === 'EPERM';
+    if (error.code === 'ESRCH') return false;
+    if (error.code === 'EPERM') return true;
+    throw new LockError(`无法确认锁持有进程状态：${error.code || 'unknown'}`);
   }
 }
 
@@ -27,42 +30,91 @@ export function isProcessAlive(pid) {
  */
 export function acquireLock(lockFile, { pid = process.pid, runId, now = Date.now(), staleMs = 6 * 60 * 60 * 1000 } = {}) {
   mkdirSync(path.dirname(lockFile), { recursive: true });
-  const payload = JSON.stringify({ pid, runId, startedAt: new Date(now).toISOString() });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const token = randomUUID();
+  const payload = JSON.stringify({ pid, runId, token, startedAt: new Date(now).toISOString() });
+  return withLockGuard(lockFile, () => {
+    const temporary = `${lockFile}.${token}.tmp`;
     try {
-      const fd = openSync(lockFile, 'wx');
-      writeSync(fd, `${payload}\n`);
-      closeSync(fd);
+      fs.writeFileSync(temporary, `${payload}\n`, { flag: 'wx', mode: 0o600 });
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          // link publishes the fully written inode without replacing an existing lock.
+          fs.linkSync(temporary, lockFile);
+          break;
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw new LockError(`无法创建环境锁：${error.code || 'unknown'}`);
+          if (attempt) throw new LockError(`无法取得环境锁：${lockFile}`);
+          const { holder, mtimeMs } = inspectLock(lockFile) ?? {};
+          if (mtimeMs === undefined) continue;
+          const age = now - (holder ? Date.parse(holder.startedAt) : mtimeMs);
+          const stale = age > staleMs || (holder && !isProcessAlive(holder.pid));
+          if (!stale) {
+            throw new LockError(holder
+              ? `环境已被运行中的任务占用：pid ${holder.pid}，run ${holder.runId}，开始于 ${holder.startedAt}`
+              : '环境锁内容无效且尚未超时，拒绝回收', holder);
+          }
+          fs.unlinkSync(lockFile);
+        }
+      }
       return {
         file: lockFile,
         pid,
         runId,
         release() {
-          const current = readLock(lockFile);
-          if (current?.pid === pid && current?.runId === runId) rmSync(lockFile, { force: true });
+          // A competitor may hold the guard briefly while it inspects this live lock.
+          withLockGuard(lockFile, () => {
+            const current = readLock(lockFile);
+            if (current?.token === token) fs.unlinkSync(lockFile);
+          }, { attempts: 50 });
         },
       };
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      const holder = readLock(lockFile);
-      const age = holder ? now - Date.parse(holder.startedAt) : staleMs + 1;
-      const stale = !holder || !isProcessAlive(holder.pid) || !Number.isFinite(age) || age > staleMs;
-      if (!stale) {
-        throw new LockError(`环境已被运行中的任务占用：pid ${holder.pid}，run ${holder.runId}，开始于 ${holder.startedAt}`, holder);
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+  });
+}
+
+function withLockGuard(lockFile, work, { attempts = 1, waitMs = 20 } = {}) {
+  const guard = `${lockFile}.guard`;
+  // Serialize stale-lock removal with acquisition/release so a second reclaimer
+  // cannot unlink a newly acquired lock. An abandoned guard fails closed.
+  for (let attempt = 1; ; attempt += 1) {
+    try { fs.mkdirSync(guard); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST' || attempt >= attempts) {
+        throw new LockError(`环境锁正在变更或保护目录不可用（${error.code || 'unknown'}）：${guard}；若持续存在，请确认没有流水线进程后人工清理`);
       }
-      rmSync(lockFile, { force: true });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
     }
   }
-  throw new LockError(`无法取得环境锁：${lockFile}`);
+  try { return work(); }
+  finally { fs.rmdirSync(guard); }
+}
+
+function inspectLock(lockFile) {
+  let fd;
+  try {
+    fd = fs.openSync(lockFile, 'r');
+    const stat = fs.fstatSync(fd);
+    const text = fs.readFileSync(fd, 'utf8');
+    let holder;
+    try { holder = JSON.parse(text); } catch { /* An incomplete old lock may only expire by mtime. */ }
+    const valid = holder && Number.isInteger(holder.pid) && holder.pid > 0
+      && typeof holder.startedAt === 'string' && Number.isFinite(Date.parse(holder.startedAt));
+    return { holder: valid ? holder : null, mtimeMs: stat.mtimeMs };
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw new LockError(`无法读取环境锁，拒绝回收：${error.code || 'unknown'}`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 export function readLock(lockFile) {
-  if (!existsSync(lockFile)) return null;
-  try {
-    return JSON.parse(readFileSync(lockFile, 'utf8'));
-  } catch {
-    return null;
-  }
+  const value = inspectLock(lockFile);
+  if (!value) return null;
+  if (!value.holder) throw new LockError('环境锁内容无法解析或字段无效，不能视为无锁');
+  return value.holder;
 }
 
 export function emptyState(env) {

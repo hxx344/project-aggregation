@@ -27,9 +27,18 @@ export async function api<T>(url: string, { timeoutMs = 15_000, ...options }: Re
         headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}),
           ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}), ...options.headers },
       });
-      const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
+      let data;
+      try {
+        data = response.status === 204 ? {} : await response.json();
+      } catch {
+        controller.signal.throwIfAborted();
+        if (response.ok) throw new ApiError(writing
+          ? '响应数据无效，保存结果尚未确认；请先刷新核对。'
+          : '响应数据无效，无法确认请求结果，请稍后重试。', response.status);
+        data = {};
+      }
       controller.signal.throwIfAborted();
-      if (!response.ok) throw new ApiError(data.error || '请求未完成，请稍后重试。', response.status);
+      if (!response.ok) throw new ApiError(typeof data?.error === 'string' && data.error || '请求未完成，请稍后重试。', response.status);
       return data as T;
     })()]);
   } finally {

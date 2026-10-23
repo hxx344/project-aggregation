@@ -94,18 +94,25 @@ function parseArgs(argv) {
   return options;
 }
 
-function gitContext(root) {
-  const run = args => {
+export function gitContext(root, execute = execFileSync) {
+  const run = (args, optionalTag = false) => {
     try {
-      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    } catch {
-      return '';
+      return execute('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000, env: { ...process.env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' } }).trim();
+    } catch (error) {
+      const reason = String(error.stderr || error.code || error.message).trim();
+      if (optionalTag && error.status === 128 && !error.signal
+        && /^(?:fatal: no tag exactly matches '[0-9a-f]+'|fatal: No names found, cannot describe anything\.)$/.test(reason)) return '';
+      throw new ConfigError(`无法读取 Git 状态（git ${args.join(' ')}）：${reason}`);
     }
   };
+  const commit = run(['rev-parse', 'HEAD']);
+  const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (!commit || !branch) throw new ConfigError('Git 提交或分支为空，无法确认源码身份');
   return {
-    commit: run(['rev-parse', 'HEAD']),
-    branch: run(['rev-parse', '--abbrev-ref', 'HEAD']),
-    tag: run(['describe', '--tags', '--exact-match']),
+    commit,
+    branch,
+    tag: run(['describe', '--tags', '--exact-match'], true),
     dirty: Boolean(run(['status', '--porcelain'])),
   };
 }
@@ -551,4 +558,4 @@ async function main() {
   }
 }
 
-process.exitCode = await main();
+if (import.meta.main) process.exitCode = await main();
