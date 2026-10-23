@@ -63,7 +63,7 @@ class FakeNetwork:
             base = 'https://api.github.com/repos/hxx344/' + module.repository + '/'
             if url in (base + 'releases/latest', base + 'releases/' + str(entry['metadata']['id'])):
                 return encoded(entry['metadata'])
-            if url.startswith(base + 'compare/'):
+            if url.startswith(base + 'compare/') and url.endswith('?' + releases.COMPARE_STATUS_QUERY):
                 return encoded(entry['comparison'])
             if url == base + f'releases?per_page={releases.HISTORY_PAGE}' and 'history' in entry:
                 return encoded(entry['history'])
@@ -654,7 +654,7 @@ class CoordinatorTests(RootFixture):
             return original(url, *args, **kwargs)
         with patch.object(self.network, 'request', side_effect=fail_comparison) as request:
             result = self.check()
-            request.assert_any_call(self.reader.api(registry.BY_ID['hub'], f'compare/{OLD}...{NEW}'))
+            request.assert_any_call(self.reader.api(registry.BY_ID['hub'], f'compare/{OLD}...{NEW}?{releases.COMPARE_STATUS_QUERY}'))
         self.assertEqual(result['modules'][0]['state'], 'unavailable')
         self.assertEqual(result['modules'][0]['reason'], '版本比较暂时不可用')
         self.assertIsNone(result['planId'])

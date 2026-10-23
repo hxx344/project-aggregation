@@ -86,7 +86,7 @@ class FakeNetwork:
                     raise releases.ReleaseError('GitHub API未找到正式版本或发布文件（HTTP 404）',
                                                 transient=entry.get('tagFailureTransient', False))
                 return encoded(tagged)
-            if url.startswith(base + 'compare/'):
+            if url.startswith(base + 'compare/') and url.endswith('?' + releases.COMPARE_STATUS_QUERY):
                 return encoded(self.comparison)
             for commit, value in entry['releases'].items():
                 if url == base + 'releases/' + str(value['metadata']['id']):
@@ -789,7 +789,7 @@ class ReleaseHistoryTests(unittest.TestCase):
         middle = 'd' * 40
         self.entry['history'] = [listed(NEW, '2026-10-22T20:00:00Z', '- 最新'), listed(middle, '2026-10-21T08:00:00Z', '- 同秒中间'),
                                  listed(OLD, '2026-10-21T08:00:00Z')]
-        self.network.failures.add((self.reader.api(self.module, f'compare/{OLD}...{middle}'), 'GET'))
+        self.network.failures.add((self.reader.api(self.module, f'compare/{OLD}...{middle}?{releases.COMPARE_STATUS_QUERY}'), 'GET'))
         with self.assertRaises(releases.ReleaseError):
             self.reader.notes_since(self.module, OLD, self.release)
         self.assertIsNone(self.reader.notes_since(self.module, OLD, self.release))

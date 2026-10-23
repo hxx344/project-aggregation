@@ -39,6 +39,9 @@ HISTORY_RESERVE = 300
 HISTORY_RETRY_DELAY = 10 * 60
 # Same-second boundary releases need a compare request each.
 MAX_HISTORY_COMPARES = 4
+# Only the first page of a comparison lists changed files with patches (1.17 MB
+# for one refactor on 2026-10-24); page 2 keeps status and stays a few KB.
+COMPARE_STATUS_QUERY = 'per_page=1&page=2'
 DEPLOY_TAG = re.compile(r'deploy-([a-f0-9]{40})')
 # Release dates are shown to users in China; the server clock zone is irrelevant.
 DISPLAY_ZONE = timezone(timedelta(hours=8))
@@ -578,7 +581,7 @@ class Releases:
             cached = self._cached(self._comparisons, key)
             if cached is not None:
                 return cached
-        comparison = decode_json(self.network.request(self.api(module, f'compare/{installed_commit}...{candidate}')))
+        comparison = decode_json(self.network.request(self.api(module, f'compare/{installed_commit}...{candidate}?{COMPARE_STATUS_QUERY}')))
         status = comparison.get('status')
         if status not in ('ahead', 'behind', 'identical', 'diverged'):
             raise ReleaseError('无法确认正式版本的更新顺序')
