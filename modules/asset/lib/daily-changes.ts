@@ -1,7 +1,8 @@
 import type { openDatabase } from './sqlite.ts';
 import type { Asset, Withdrawal } from './types.ts';
-import { assetMeasures, embeddedWithdrawals } from './withdrawals.ts';
+import { assetMeasures, compareEmbeddedWithdrawals, embeddedWithdrawals } from './withdrawals.ts';
 import { analyzePositions, positionsOf, type PositionAnalysis, type PositionsCapture } from './daily-positions.ts';
+import { knownAssetValue, sumKnownValues } from './asset-values.ts';
 
 /** Day-over-day changes of the adjusted asset measure, attributed to ledger rows. */
 export const DAILY_CHANGE_DAYS = 90;
@@ -9,7 +10,7 @@ const DAY_MS = 86_400_000;
 const CENT = 0.005;
 
 type DetailRow = { coin: string; account: string; value: number; price: number };
-type ChangeRow = Pick<Asset, 'id' | 'project' | 'kind' | 'value'> & { mode?: string; details?: DetailRow[] };
+type ChangeRow = Pick<Asset, 'id' | 'project' | 'kind' | 'value'> & { mode?: string; quantity?: number | null; details?: DetailRow[] };
 export type ChangeSnapshot = { id: string; date: string; total: number; withdrawn?: number; partial?: boolean; future?: boolean; archived?: boolean; rows: ChangeRow[]; positions?: PositionsCapture | null };
 /** Balance lines inside one exchange row, matched by account and coin. */
 export type DetailChange = { label: string; previous: number | null; current: number | null; change: number };
@@ -73,7 +74,8 @@ function sourceChanges(previous: ChangeRow[], current: ChangeRow[]): SourceChang
   const changes: SourceChange[] = [];
   for (const id of new Set([...after.keys(), ...before.keys()])) {
     const old = before.get(id), next = after.get(id), label = next ?? old!;
-    const previousValue = old?.value ?? null, currentValue = next?.value ?? null;
+    const previousValue = old ? knownAssetValue(old) : null, currentValue = next ? knownAssetValue(next) : null;
+    if ((old && previousValue === null) || (next && currentValue === null)) continue;
     const change = cents((currentValue ?? 0) - (previousValue ?? 0));
     // A transfer between accounts of one exchange leaves the row total unchanged but is still a source of movement.
     const details = detailChanges(old?.details, next?.details);
@@ -93,14 +95,16 @@ export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapsho
     const before = measures(previous, input.withdrawals, input.baselineDate), after = measures(current, input.withdrawals, input.baselineDate);
     const sources = sourceChanges(previous.rows, current.rows);
     const heldChange = after.held - before.held;
+    const embedded = compareEmbeddedWithdrawals(previous.rows, current.rows);
+    const withdrawnChange = cents(embedded.change + after.recorded - before.recorded);
     result.push({
       date: current.date, previousDate: previous.date,
       gapDays: Math.round((Date.parse(current.date) - Date.parse(previous.date)) / DAY_MS),
       previousAdjusted: before.adjusted, adjusted: after.adjusted, change: after.adjusted - before.adjusted,
-      heldChange, withdrawnChange: cents(after.withdrawn - before.withdrawn),
-      // Workbook totals can differ from their row sum; that part has no row source.
-      unattributed: cents(heldChange - sources.reduce((sum, source) => sum + source.change, 0)),
-      sources, partial: !!previous.partial || !!current.partial,
+      heldChange, withdrawnChange,
+      // Missing-value range changes and workbook/row-sum differences have no comparable source.
+      unattributed: cents(after.adjusted - before.adjusted - withdrawnChange - sources.reduce((sum, source) => sum + source.change, 0)),
+      sources, partial: !!previous.partial || !!current.partial || embedded.partial || sumKnownValues(previous.rows).partial || sumKnownValues(current.rows).partial,
       positions: analyzePositions({ previous: previous.positions, current: current.positions, rows: current.rows }),
     });
   }
@@ -119,8 +123,9 @@ const detailsOf = (details: unknown): DetailRow[] | undefined => Array.isArray(d
 const rowsOf = (rows: unknown): ChangeRow[] => Array.isArray(rows) ? rows.filter((row): row is ChangeRow =>
   !!row && typeof row.id === 'string' && typeof row.project === 'string').map(row => ({
   id: row.id, project: row.project, kind: typeof row.kind === 'string' ? row.kind : '',
-  value: finite(row.value) ? row.value : null,
+  value: knownAssetValue(row),
   ...(typeof row.mode === 'string' ? { mode: row.mode } : {}),
+  ...(row.quantity === null || finite(row.quantity) ? { quantity: row.quantity } : {}),
   ...(Array.isArray(row.details) ? { details: detailsOf(row.details) } : {}),
 })) : [];
 

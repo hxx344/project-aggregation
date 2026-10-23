@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { sumKnownValues } from './asset-values.ts';
 
 export const EXAMPLE_SOURCE = '示例数据（非真实资产）';
 export const isVariationalProject = (project: string) => ['var', 'variational'].includes(project.trim().toLowerCase());
@@ -30,7 +31,7 @@ export function parseSource(input: unknown): SourceLedger {
   for (const period of source.periods) {
     if (new Set(period.rows.map(r => r.id)).size !== period.rows.length) throw new Error('原表资产编号重复');
     period.future = period.date > source.startedAt;
-    period.rowSum = period.rows.reduce((sum, asset) => sum + (asset.value ?? 0), 0);
+    period.rowSum = sumKnownValues(period.rows).total;
     period.difference = Math.round((period.rowSum - period.total) * 1e8) / 1e8;
     if (!Number.isFinite(period.rowSum)) throw new Error('原表资产合计超出范围');
   }
