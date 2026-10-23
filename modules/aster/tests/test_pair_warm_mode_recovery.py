@@ -9,7 +9,7 @@ from tests import test_pair_budget as fixtures
 from trading.exchange import BudgetWait, SnapshotSuperseded
 from trading.execution import Executor
 from trading.models import AccountModeError, TradingError, dec
-from trading.pair_execution import runtime_default
+from tests.pair_legacy_fixtures import runtime_default
 from trading.pair_planning import plan_ordinary
 
 SYMBOL, DUAL, MULTI = fixtures.SYMBOL, fixtures.DUAL, fixtures.MULTI
@@ -101,7 +101,7 @@ class PairWarmModeRecoveryTests(TestCase):
         _, guards = self.warm()
         for event in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"):
             with self.subTest(event=event):
-                self.brokers["long"]._cycle_account_event(event)
+                self.brokers["long"]._private_account_event(event)
                 with self.assertRaises(TradingError):
                     guards["long"]()
                 _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
@@ -111,7 +111,7 @@ class PairWarmModeRecoveryTests(TestCase):
     def test_config_event_forces_modes_and_rejects_changed_account_mode(self):
         _, guards = self.warm()
         broker = self.brokers["long"]
-        broker._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        broker._private_account_event("ACCOUNT_CONFIG_UPDATE")
         broker.api.hedge = False
         with self.assertRaises(TradingError):
             guards["long"]()
@@ -129,7 +129,7 @@ class PairWarmModeRecoveryTests(TestCase):
         def changed(method, path, *args, **kwargs):
             value = original(method, path, *args, **kwargs)
             if path == ACCOUNT:
-                broker._cycle_account_event("ACCOUNT_UPDATE")
+                broker._private_account_event("ACCOUNT_UPDATE")
             return value
 
         with patch.object(broker.api, "call", side_effect=changed), self.assertRaises(SnapshotSuperseded):
@@ -148,7 +148,6 @@ class PairWarmModeRecoveryTests(TestCase):
             self.assertEqual(self.paths(key), [DUAL, MULTI, ACCOUNT, RISK])
 
     def ordinary_plan(self):
-        self.pair["cycle"]["enabled"] = False
         self.pair["ordinary"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
         snapshots, guards = self.warm()
@@ -197,7 +196,7 @@ class PairWarmModeRecoveryTests(TestCase):
             return stream
 
         with patch("trading.exchange.PrivateAccountStream", side_effect=make_stream):
-            broker.start_cycle_hot_data([SYMBOL])
+            broker.start_private_stream()
             _, guards = self.warm()
             streams[0].on_state(False)
             with self.assertRaises(TradingError):
@@ -214,10 +213,10 @@ class PairWarmModeRecoveryTests(TestCase):
                 guards["long"]()
             _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.assertEqual(self.paths("long"), [DUAL, MULTI, ACCOUNT, RISK])
-            broker.stop_cycle_hot_data()
+            broker.stop_private_stream()
             with self.assertRaises(TradingError):
                 guards["long"]()
-            broker.start_cycle_hot_data([SYMBOL])
+            broker.start_private_stream()
             _, guards = self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.clear_calls()
             streams[0].on_state(False)
@@ -225,4 +224,4 @@ class PairWarmModeRecoveryTests(TestCase):
             guards["long"]()
             self.trader._read(self.brokers, "XAUUSD1", reconciliation=True)
             self.assertEqual(self.paths("long"), [ACCOUNT, RISK])
-            broker.stop_cycle_hot_data()
+            broker.stop_private_stream()

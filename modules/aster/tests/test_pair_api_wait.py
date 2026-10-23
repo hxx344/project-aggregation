@@ -16,7 +16,6 @@ class PairAPIWaitTests(TestCase):
 
     def ordinary(self):
         self.live_brokers()
-        self.pair["cycle"]["enabled"] = False
         self.pair["ordinary"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
         self.engine.capacities = lambda symbol: {5: dec(0), 10: dec(0), 20: dec(0)}
@@ -41,7 +40,7 @@ class PairAPIWaitTests(TestCase):
         broker.cached_at["dual"] = time.monotonic() - 20
         self.assertEqual(broker.snapshot_weight(["XAUUSD1"]) -
                          broker.snapshot_weight(["XAUUSD1"], reuse_account_mode=True), 30)
-        broker._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        broker._private_account_event("ACCOUNT_CONFIG_UPDATE")
         self.assertEqual(broker.snapshot_weight(["XAUUSD1"]),
                          broker.snapshot_weight(["XAUUSD1"], reuse_account_mode=True))
 
@@ -84,19 +83,6 @@ class PairAPIWaitTests(TestCase):
                 self.assertEqual(state["phase"], "margin_wait")
                 self.assertGreater(state["retry_after"], 20)
         self.assertEqual(self.read_count(), 0)
-
-    def test_transfer_retry_delay_never_delays_due_cycle_reduction(self):
-        self.assertEqual(self.tick()["phase"], "holding")
-        self.expire()
-        notice = {"kind": "budget", "text": "本地执行 API 请求权重预算不足"}
-        self.store.put("pair_margin:gold", {"api_notice": notice, "blocked_reason": notice["text"],
-                                           "next_check_at": time.time() + 50})
-        with patch("trading.margin_balance.MarginBalancer.tick", return_value={
-                "blocks_trading": True, "api_notice": notice, "retry_after": 50, "reason": notice["text"]}):
-            state = self.tick()
-        self.assertEqual(state["progress"]["completed_cycles"], 1)
-        self.assertIsNone(state["pending"])
-        self.assertNotIn("retry_after", state)
 
     def test_margin_balance_runs_before_strategy_snapshots_without_reusing_them(self):
         # Margin balancing is independent of the strategy (40bdb6a): it runs

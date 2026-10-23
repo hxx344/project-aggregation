@@ -16,16 +16,11 @@ async (page) => {
   const snapshot = (stamp) => ({ timestamp: stamp, equity: '1000', available: '800', wallet: '1000',
     maintenance: '1', occupied_margin: '200', unrealized: '0', ratio: '0.2', margin_ratio: '0.001',
     positions: [], mode_checks: { cross: true, hedge: true, single_asset: true } });
-  const period = now => ({ start: now - 3600, end: now + 3600, label: 'fixture', estimated_fee: '0', spread_cost: '0',
-    slippage_cost: '0', total_cost: '0', complete: true, slippage_complete: true, fill_count: 0,
-    unmatched_notional: '0', missing_count: 0, unassigned_count: 0 });
   const pair = (id, now) => {
     const mode = modes[id], stamp = source => mode.stale.has(source) ? mode.stamp : now;
     return { id, name: names[id], long_account_id: `${id}-long`, short_account_id: `${id}-short`,
       symbol: 'XAUUSD1', enabled: true,
       ordinary: { enabled: !mode.funds, threshold: '50000', order_notional: '100', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.1' },
-      cycle: { enabled: false, symbol: 'XAUUSD1', leverage: 5, spread_notional: '50000', spread_limit_bp: '1',
-        min_notional: '100', max_notional: '500', capacity_multiplier: '1', notional_scope: 'per_side', hold_seconds: 600, daily_volume_limit: '0' },
       margin: { enabled: Boolean(mode.funds), master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1',
         max_transfer: '1000', buffer_ratio: '0.05', cooldown_seconds: 30 },
       state: { phase: mode.execution ? 'reconciling' : 'monitoring', reason: mode.execution ? executionText : '',
@@ -33,8 +28,7 @@ async (page) => {
         margin_balances: mode.funds ? { long: snapshot(stamp('long')), short: snapshot(stamp('short')) } : undefined,
         api_notice: mode.api ? { kind: 'budget', text: apiText } : null,
         pending: mode.execution ? { kind: 'ordinary', id: 'fixture-original-order' } : null,
-        cycle_costs: { as_of: mode.stale.has('costs') ? mode.stamp - 30 : now, timezone: 'UTC', fee_rate_percent: '0.0125',
-          daily: period(now), weekly: period(now) }, owned: { LONG: '0', SHORT: '0' } } };
+        owned: { LONG: '0', SHORT: '0' } } };
   };
   const state = () => {
     const now = Date.now() / 1000;
@@ -78,9 +72,6 @@ async (page) => {
     const longSide = app.getByRole('region', { name: 'A 多仓账户风险', exact: true });
     const shortSide = app.getByRole('region', { name: 'B 空仓账户风险', exact: true });
     const runtime = app.getByRole('region', { name: '配对数量与执行进度', exact: true }).locator('.small-note').first();
-    const costs = app.getByRole('region', { name: '两侧循环花费', exact: true });
-    await app.getByText('配对循环成交质量', { exact: true }).click();
-    const qualityWarning = app.locator('.cycle-quality-history > .cycle-quality-notice');
     const refresh = async () => {
       const response = page.waitForResponse(response => response.url().startsWith(`${moduleOrigin}/api/state`));
       await app.getByRole('button', { name: '刷新数据', exact: true }).click();
@@ -107,7 +98,6 @@ async (page) => {
     await noCurrent('a brief stale response must not display a current notice');
     assert(await noticeItems.count() === 0, 'brief expiry must not enter history');
     assert(!await hasExpiry(longSide) && !await hasExpiry(shortSide) && !await hasExpiry(runtime), 'all expiry labels share the grace period');
-    assert(await qualityWarning.count() === 0, 'execution quality does not display a short runtime expiry');
     await set('alpha');
     assert(await noticeItems.count() === 0, 'short recovery leaves no history');
     observations.push('transient expiry recovers without notices or history');
@@ -119,7 +109,6 @@ async (page) => {
     const elapsed = Date.now() - started;
     assert(elapsed >= 2900 && elapsed < 5500, `continuous expiry appears near three seconds (${elapsed} ms)`);
     assert(await hasExpiry(longSide) && await hasExpiry(shortSide) && await hasExpiry(runtime), 'confirmed expiry labels are visible');
-    assert(await qualityWarning.count() === 1, 'execution quality reflects confirmed runtime expiry');
     await page.screenshot({ path: 'output/playwright/aster-stale-confirmed.png', fullPage: true });
     observations.push(`continuous expiry confirmed after ${elapsed} ms`);
 
@@ -141,7 +130,6 @@ async (page) => {
     await select('alpha');
     await currentData.waitFor();
     assert(await hasExpiry(longSide) && !await hasExpiry(shortSide) && await hasExpiry(runtime), 'A-side expiry marks group incompleteness without expiring B-side data');
-    assert(await qualityWarning.count() === 0, 'a side snapshot does not expire fresh runtime quality');
     assert((await notices.innerText()).includes('共出现 2 次'), 'unselected group still records a confirmed recurrence');
     await set('alpha', ['long', 'short']);
     await page.waitForTimeout(1200);
@@ -161,17 +149,6 @@ async (page) => {
     await set('alpha');
     await notices.getByRole('button', { name: '清除历史提示', exact: true }).click();
     assert(await noticeItems.count() === 0, 'resolved errors can be cleared');
-    await set('alpha', ['costs']);
-    await page.waitForTimeout(1200);
-    assert(!(await costs.innerText()).includes('花费数据已过期'), 'cost expiry also ignores short lapses');
-    await set('alpha');
-    await set('alpha', ['costs']);
-    await costs.getByText('花费数据已过期或连接中断，以下保留上次统计。', { exact: true }).waitFor({ timeout: 5000 });
-    await noCurrent('cost expiry does not manufacture a group data notice');
-    await set('alpha');
-    assert(!(await costs.innerText()).includes('花费数据已过期'), 'cost recovery clears its warning immediately');
-    observations.push('cost data uses its own continuous expiry timer and recovery');
-
     await set('alpha', [], { funds: true });
     const longBalance = app.getByRole('region', { name: 'A 账户保证金', exact: true });
     const shortBalance = app.getByRole('region', { name: 'B 账户保证金', exact: true });

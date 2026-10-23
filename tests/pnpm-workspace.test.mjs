@@ -78,9 +78,9 @@ test('module cache tracks workspace inputs, local changes, environment and missi
   run('build', { NEXT_PUBLIC_TEST: 'new' });
   assert.deepEqual(calls().slice(15), ['asset'], 'module environment files are build inputs');
   mkdirSync(path.join(fixture, 'modules/aster/trading'));
-  writeFileSync(path.join(fixture, 'modules/aster/trading/cycle-config.json'), '{}');
+  writeFileSync(path.join(fixture, 'modules/aster/trading/shared.json'), '{}');
   run('build', { NEXT_PUBLIC_TEST: 'new' });
-  assert.deepEqual(calls().slice(16), ['aster'], 'Aster shared trading configuration is a frontend build input');
+  assert.deepEqual(calls().slice(16), ['aster'], 'Aster module files outside the dashboard are local build inputs');
   writeFileSync(path.join(fixture, 'modules/aster/dashboard/.env.production'), 'VITE_TEST=file');
   run('build', { NEXT_PUBLIC_TEST: 'new' });
   assert.deepEqual(calls().slice(17), ['aster'], 'nested importer environment files are build inputs');

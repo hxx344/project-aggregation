@@ -10,7 +10,6 @@ import httpx
 
 from tests import test_pair_trading as fixtures
 from tests.test_pair_budget import OfflineAPI
-from trading.account_cache import HotAccountUnavailable
 from trading.exchange import ExchangeError, LiveBroker, RateBudget
 from trading.margin_balance import TransferAPI
 from trading.models import dec, wire
@@ -73,7 +72,6 @@ class PairMarginLifelineLiveTests(TestCase):
         self.engine.brokers.update(self.brokers)
         self.engine.pairs.trader = self.trader
         self.pair["ordinary"]["enabled"] = True
-        self.pair["cycle"]["enabled"] = False
         self.pair["margin"].update(enabled=True, master_env_prefix="ASTER_MASTER")
         self.pair = self.store.save_pair(self.pair)
         self.sent = []
@@ -187,15 +185,12 @@ class PairMarginLifelineLiveTests(TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assert_no_trades()
 
-    def test_missing_hot_snapshot_uses_fresh_collateral_reads_and_confirms_transfer(self):
+    def test_margin_only_transfer_uses_fresh_collateral_reads_and_confirms(self):
         self.pair["ordinary"]["enabled"] = False
-        self.pair["cycle"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
         with ExitStack() as stack:
             reads = []
             for broker in self.brokers.values():
-                with self.assertRaises(HotAccountUnavailable):
-                    broker.cycle_hot_snapshot([SYMBOL])
                 reads.append(stack.enter_context(patch.object(broker, "transfer_snapshot", wraps=broker.transfer_snapshot)))
             self.assert_transferred(self.tick())
             self.assertTrue(all(read.call_count >= 2 for read in reads))
@@ -214,7 +209,7 @@ class PairMarginLifelineLiveTests(TestCase):
     def test_event_after_fallback_read_and_real_signing_prevents_transfer_transport(self):
         for broker in self.brokers.values():
             broker.api.fail_brackets = True
-        self.on_signed = lambda: self.brokers["short"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.on_signed = lambda: self.brokers["short"]._private_account_event("ACCOUNT_UPDATE")
         state = self.tick()
         self.assertEqual(len(self.signed), 1, state)
         self.assertEqual(self.sent, [])

@@ -298,7 +298,7 @@ class WorkspaceControl:
                     if timeout <= 0:
                         raise ValueError("update evidence deadline exceeded")
                     # No symbol filter: this is the account's complete current
-                    # exchange inventory. Ordinary/cycle snapshots omit orders.
+                    # exchange inventory. Ordinary snapshots omit orders.
                     orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40, timeout=timeout)
                     if not isinstance(orders, list) or orders:
                         raise ValueError("open orders unknown or nonempty")

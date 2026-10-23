@@ -15,7 +15,6 @@ function pair(state = {}, options = {}) {
     id: 'pair-a',
     enabled: true,
     ordinary: { enabled: true },
-    cycle: { enabled: false },
     margin: { enabled: false },
     state: {
       phase: 'waiting',
@@ -296,23 +295,4 @@ test('missing funds evidence confirms data warnings despite fresh retained tradi
   assert.equal(state.data.short.confirmed, false);
   assert.deepEqual(current(state), []);
   assert.equal(state.history.entries.length, 1);
-});
-
-test('cost report staleness has an independent delay and removal clears it', () => {
-  const fixture = pair({
-    cycle_costs: {
-      as_of: 50,
-      daily: { start: 0, end: 1000 },
-      weekly: { start: 0, end: 1000 },
-    },
-  });
-  let state = observe(undefined, fixture, 0);
-  assert.equal(state.data.costs.confirmed, false);
-  state = observe(state, fixture, 3);
-  assert.equal(state.data.costs.confirmed, true);
-  assert.equal(state.data.group.confirmed, false);
-  assert.deepEqual(current(state), []);
-  state = observe(state, pair(), 4);
-  assert.equal(state.data.costs.since, null);
-  assert.equal(state.data.costs.confirmed, false);
 });

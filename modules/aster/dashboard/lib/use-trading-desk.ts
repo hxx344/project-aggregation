@@ -1,17 +1,13 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { State } from './desk-types';
-import type { CycleTrade } from './cycle';
 import { createStatePoller } from './state-poller';
-import { createStateHistory } from './state-history';
 import { connectHubBridge } from './hub-bridge';
 import { createStateRefresh } from './state-refresh';
 export function useTradingDesk() {
   const [state, setState] = useState<State | null>(null);
   const [selected, setSelected] = useState('');
-  const [history] = useState(() => createStateHistory<CycleTrade>());
   const [error, setError] = useState('');
-  const [errorAccountId, setErrorAccountId] = useState('');
   const [connectionError, setConnectionError] = useState('');
   const [needsLogin, setNeedsLogin] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -25,22 +21,24 @@ export function useTradingDesk() {
     setNeedsLogin(true);
     setState(null);
     setSelected('');
-    history.clear();
     setServerClock({ server: 0, local: 0 });
     setConnectionError('');
     setError('');
-    setErrorAccountId('');
     setNotice('');
-  }, [history]);
+  }, []);
   const [poller] = useState(() =>
     createStatePoller<State>({
-      requestUrl: () => history.url(),
+      requestUrl: () => '/api/state?compact=true',
       onState: (next) => {
-        setState({ ...next, accounts: history.merge(next.accounts) });
+        setState(next);
         setServerClock({ server: next.updated_at, local: Date.now() / 1000 });
         setNeedsLogin(false);
         setConnectionError('');
-        setSelected(history.selected());
+        setSelected((current) =>
+          next.accounts.some((account) => account.id === current)
+            ? current
+            : (next.accounts[0]?.id ?? ''),
+        );
       },
       onUnauthorized: clearSession,
       onError: setConnectionError,
@@ -48,12 +46,11 @@ export function useTradingDesk() {
   );
   const selectAccount = useCallback(
     (id: string) => {
-      history.select(id);
       setSelected(id);
       poller.cancel();
       void poller.refresh();
     },
-    [history, poller],
+    [poller],
   );
   const refresh = useCallback(() => poller.refresh(), [poller]);
   useEffect(() => {
@@ -93,7 +90,6 @@ export function useTradingDesk() {
     let resumePolling = true;
     setBusy(true);
     setError('');
-    setErrorAccountId(selected);
     setNotice('');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
@@ -152,7 +148,6 @@ export function useTradingDesk() {
     selectAccount,
     error,
     setError,
-    errorAccountId,
     connectionError,
     needsLogin,
     busy,

@@ -6,10 +6,9 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_budget as fixtures
-from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.margin_balance import MarginBalancer
-from trading.models import TradingError, dec
-from trading.pair_execution import runtime_default
+from trading.models import dec
+from tests.pair_legacy_fixtures import runtime_default
 
 
 ACCOUNT = "/fapi/v3/accountWithJoinMargin"
@@ -31,7 +30,6 @@ class PairMarginPollEfficiencyTests(TestCase):
         for side in self.brokers:
             self.store.save_account({**self.store.account(side), "mode": "live"})
         self.engine.live_allowed = lambda account: True
-        self.pair["cycle"]["enabled"] = False
         self.pair["ordinary"]["enabled"] = True
         self.pair["margin"].update(enabled=True, master_env_prefix="ASTER_MASTER")
         self.pair = self.store.save_pair(self.pair)
@@ -229,7 +227,7 @@ class PairMarginPollEfficiencyTests(TestCase):
 
     def test_only_trading_enable_requires_position_read_during_funds_wait(self):
         self.monitor_wait()
-        self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
         self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), 0)
         self.pair = self.store.save_pair({**self.pair, "name": "updated monitoring"})
@@ -268,7 +266,7 @@ class PairMarginPollEfficiencyTests(TestCase):
 
         def account_changes_after_read(state, snapshots):
             publish(state, snapshots)
-            self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+            self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
 
         with patch.object(self.trader, "_publish_balances", side_effect=account_changes_after_read):
             state = self.tick()
@@ -302,83 +300,4 @@ class PairMarginPollEfficiencyTests(TestCase):
         recover.assert_called_once()
         self.assertEqual(result["margin"]["status"], "accepted")
         self.assertTrue(result["margin"]["blocks_trading"])
-        state.update(pending=None)
-        state["progress"].update(quantities={"LONG": "1", "SHORT": "1"},
-                                 opened_at=self.wall - 10, config={"hold_seconds": 1})
-        self.store.put("pair_runtime:gold", state)
-        with patch.object(self.trader, "_read", side_effect=TradingError("read due reduction")) as read:
-            result = self.tick()
-        self.assertEqual(result["margin"]["status"], "accepted")
-        self.assertEqual(result["reason"], "read due reduction")
-        self.assertTrue(read.call_args.kwargs["reconciliation"])
         self.assertEqual(self.calls(), [])
-
-    def test_unknown_and_accepted_transfers_do_not_freeze_due_reduction(self):
-        for status in ("unknown", "accepted", "acknowledged"):
-            with self.subTest(status=status):
-                for side, broker in self.paper.items():
-                    broker.state["positions"]["XAUUSD1:" + side.upper()].update(qty="0.01", entry="4412.015")
-                    broker.save()
-                state = runtime_default()
-                state["progress"].update(phase="holding", quantities={"LONG": "0.01", "SHORT": "0.01"},
-                    opened_at=self.wall - 10, config={**self.pair["cycle"], "enabled": True,
-                                                    "hold_seconds": 1, "leverage": 5})
-                self.store.put("pair_runtime:gold", state)
-                record = self.pending(status, transaction=status != "unknown")
-                result = self.tick()
-                self.assertIsNone(result["pending"], result)
-                self.assertEqual(result["progress"]["completed_cycles"], 1, result)
-                self.assertEqual(result["margin"]["status"], "skipped" if status == "unknown" else status)
-                for side, broker in self.paper.items():
-                    self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)
-                stored = self.store.get("pair_margin:gold")["pending"]
-                if status == "accepted":
-                    self.assertEqual({key: stored[key] for key in record}, record)
-                else:
-                    self.assertIsNone(stored)
-                if status == "unknown":
-                    self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["request_id"], record["request_id"])
-                self.advance(5)
-
-    def test_unknown_transfer_does_not_starve_pending_close_order_recovery(self):
-        for side, broker in self.paper.items():
-            broker.state["positions"]["XAUUSD1:" + side.upper()].update(qty="0.01", entry="4412.015")
-            broker.save()
-        state = runtime_default()
-        state["progress"].update(phase="holding", quantities={"LONG": "0.01", "SHORT": "0.01"},
-            opened_at=self.wall - 10, config={**self.pair["cycle"], "enabled": True,
-                                            "hold_seconds": 1, "leverage": 5})
-        self.store.put("pair_runtime:gold", state)
-        transfer = self.pending("unknown", transaction=False)
-        long = self.brokers["long"]
-        submit = long.submit
-
-        def uncertain(orders, **options):
-            submit(orders, **options)
-            raise AmbiguousOrder("lost close receipt")
-
-        with patch.object(long, "submit", side_effect=uncertain), \
-             patch.object(long, "query", side_effect=ExchangeError("not found yet", code=-2013)):
-            result = self.tick()
-        self.assertIsNotNone(result["pending"], result)
-        self.assertEqual(result["margin"]["status"], "skipped")
-        self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
-        order_id = result["pending"]["legs"][0]["order"]["newClientOrderId"]
-        self.advance(5)
-        with patch.object(long, "query", wraps=long.query) as query, \
-             patch.object(long, "submit", side_effect=AssertionError("never repeat close")), \
-             patch.object(self.brokers["short"], "submit", side_effect=AssertionError("never repeat close")), \
-             patch.object(MarginBalancer, "_live", side_effect=AssertionError("no new transfer")):
-            result = self.tick()
-        query.assert_called_once_with("XAUUSD1", order_id)
-        self.assertIsNone(result["pending"], result)
-        self.assertEqual(result["progress"]["completed_cycles"], 1)
-        self.assertEqual(result["margin"]["status"], "cooldown")
-        self.assertFalse(result["margin"]["blocks_trading"])
-        journal = self.store.get("pair_margin:gold")
-        self.assertIsNone(journal["pending"])
-        self.assertEqual(journal["last_transfer"]["status"], "skipped")
-        self.assertEqual(journal["last_transfer"]["request_id"], transfer["request_id"])
-        for side, broker in self.paper.items():
-            self.assertEqual(len(broker.state["orders"]), 1)
-            self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)

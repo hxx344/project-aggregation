@@ -72,7 +72,7 @@ test('overdue refresh warns after the budgeted interval plus the read freshness 
   );
 });
 
-test('fast cycle refresh and unknown old servers retain the eight-second warning', () => {
+test('fast snapshot refresh and unknown old servers retain the eight-second warning', () => {
   for (const refresh of [
     undefined,
     { interval_seconds: 2 },

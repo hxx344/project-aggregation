@@ -6,7 +6,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_warm_mode_recovery as warm_fixtures
-from tests import test_cycle_hot_engine as engine_fixtures
+from tests import test_account_stream_engine as engine_fixtures
 from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.models import dec
 from trading.user_stream import PrivateAccountStream
@@ -25,9 +25,9 @@ class PairWsReconciliationTests(TestCase):
     def connect(self):
         with patch.object(PrivateAccountStream, "start"):
             for broker in self.brokers.values():
-                broker.start_cycle_hot_data([SYMBOL])
-                broker.cycle_stream._set_connected(True)
-                self.addCleanup(broker.stop_cycle_hot_data)
+                broker.start_private_stream()
+                broker.private_stream._set_connected(True)
+                self.addCleanup(broker.stop_private_stream)
 
     def run_with_events(self, missing=None, partial=False, disconnect=False):
         self.connect()
@@ -47,9 +47,9 @@ class PairWsReconciliationTests(TestCase):
                             "X": "PARTIALLY_FILLED" if partial else "FILLED", "x": "TRADE",
                             "z": str(dec(receipt["executedQty"]) / 2) if partial else receipt["executedQty"],
                             "ap": receipt["avgPrice"], "T": stamp}}
-                    broker.cycle_stream._handle_message(json.dumps(event))
+                    broker.private_stream._handle_message(json.dumps(event))
                     if disconnect:
-                        broker.cycle_stream._set_connected(False)
+                        broker.private_stream._set_connected(False)
                 raise AmbiguousOrder("Offline POST response lost")
 
             patcher = patch.object(broker, "submit", side_effect=submit)
@@ -118,7 +118,7 @@ class PairWsReconciliationTests(TestCase):
                         "ps": order["positionSide"], "o": "MARKET", "ot": "MARKET",
                         "q": order["quantity"], "i": 123 + index, "X": current_status, "x": "TRADE",
                         "z": qty, "ap": "0" if current_status == "NEW" else receipts[key]["avgPrice"], "T": stamp}}
-                self.brokers[key].cycle_stream._handle_message(json.dumps(event))
+                self.brokers[key].private_stream._handle_message(json.dumps(event))
         with patch("time.time", side_effect=lambda: wall), ExitStack() as stack:
             queries = [stack.enter_context(patch.object(broker, "query", side_effect=ExchangeError("not found", code=-2013)))
                        for broker in self.brokers.values()]
@@ -143,31 +143,27 @@ class PairWsReconciliationTests(TestCase):
 
 
 class PausedTransferStreamTests(TestCase):
-    setUp = engine_fixtures.CycleHotEngineTests.setUp
-    warm = engine_fixtures.CycleHotEngineTests.warm
-    publish = engine_fixtures.CycleHotEngineTests.publish
+    setUp = engine_fixtures.AccountStreamEngineTests.setUp
 
     def test_paused_group_keeps_adl_stream_after_transfer_finishes_without_rest(self):
         row = self.f.store.account("test")
-        row.update(enabled=False, cycle={**row["cycle"], "enabled": False})
+        row.update(enabled=False)
         self.f.store.save_account(row)
-        pair = {"id": "gold", "cycle": {"enabled": False}, "enabled": False}
+        pair = {"id": "gold", "enabled": False}
         self.f.store.put("pair_margin:gold", {"pending": {"status": "acknowledged"}})
         with patch.object(self.engine.pairs, "active_for_account", return_value=None), \
              patch.object(self.f.store, "pair_for_account", return_value=pair), \
-             patch.object(self.broker, "stop_cycle_hot_data") as stop:
-            self.assertEqual(self.engine.poll_cycle_hot_data("test"), 30)
-            self.broker.start_cycle_hot_data.assert_called_once()
+             patch.object(self.broker, "stop_private_stream") as stop:
+            self.assertEqual(self.engine.poll_private_stream("test"), 30)
+            self.broker.start_private_stream.assert_called_once()
             stop.assert_not_called()
-            self.broker.refresh_cycle_hot_snapshot.assert_not_called()
             self.assertFalse(self.f.store.account("test")["enabled"])
             self.f.store.put("pair_margin:gold", {})
-            self.engine.poll_cycle_hot_data("test")
+            self.engine.poll_private_stream("test")
             stop.assert_not_called()
-            self.broker.refresh_cycle_hot_snapshot.assert_not_called()
             # Paused groups still monitor ADL; only removing the binding and
             # leaving the independent account paused releases its stream.
             with patch.object(self.f.store, "pair_for_account", return_value=None):
-                self.engine.poll_cycle_hot_data("test")
+                self.engine.poll_private_stream("test")
             stop.assert_called_once()
         self.api.call.assert_not_called()

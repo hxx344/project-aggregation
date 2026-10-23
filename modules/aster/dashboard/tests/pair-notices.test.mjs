@@ -107,7 +107,6 @@ function marginPair() {
         long: { timestamp: 100, equity: '300', available: '200' },
         short: { timestamp: 100, equity: '100', available: '80' },
       },
-      progress: { quantities: { LONG: '0', SHORT: '0.000' } },
       margin: {
         enabled: true,
         status: 'waiting',
@@ -121,7 +120,6 @@ function marginPair() {
     },
     {
       ordinary: { enabled: false },
-      cycle: { enabled: false },
       margin: { enabled: true },
     },
   );
@@ -250,9 +248,6 @@ test('opening modes and incomplete or invalid schedules retain the existing fres
       p.ordinary.enabled = true;
     },
     (p) => {
-      p.cycle.enabled = true;
-    },
-    (p) => {
       delete p.ordinary;
     },
     (p) => {
@@ -299,7 +294,7 @@ test('opening modes and incomplete or invalid schedules retain the existing fres
   }
 });
 
-test('pending work, failed reads, API waits and remaining cycle positions are never suppressed', () => {
+test('pending work, failed reads and API waits are never suppressed', () => {
   const mutations = [
     (p) => {
       p.state.pending = { id: 'unresolved-order' };
@@ -324,15 +319,6 @@ test('pending work, failed reads, API waits and remaining cycle positions are ne
     },
     (p) => {
       p.state.phase = 'attention';
-    },
-    (p) => {
-      p.state.progress.quantities.LONG = '0.1';
-    },
-    (p) => {
-      p.state.progress.quantities.SHORT = '1e-999';
-    },
-    (p) => {
-      p.state.progress.quantities.SHORT = 'invalid';
     },
     (p) => {
       p.state.margin.api_notice = {
@@ -444,10 +430,6 @@ test('paused unresolved orders or transfers explain the start block before adopt
     { pending: { kind: 'ordinary', id: 'demo-order' } },
     { pending: { kind: 'cycle', phase: 'open', id: 'cycle-order' } },
     { pending: { kind: 'leverage', id: 'leverage-order' } },
-    {
-      pending: { kind: 'ordinary', phase: 'open', id: 'ordinary-order' },
-      progress: { quantities: { LONG: '0.1' } },
-    },
     { margin: { pending: { request_id: 'demo-transfer' } } },
   ]) {
     const notices = pairStatusNotices(
@@ -466,7 +448,6 @@ test('paused ordinary opening offers automatic start checks and preserves balanc
     {
       phase: 'reconciling',
       pending: { kind: 'ordinary', phase: 'open', id: 'ordinary-order' },
-      progress: { quantities: { LONG: '0', SHORT: '0' } },
     },
     { enabled: false },
   );

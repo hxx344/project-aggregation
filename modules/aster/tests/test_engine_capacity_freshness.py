@@ -3,7 +3,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-from trading.cycle import DEFAULT_CYCLE
 from trading.engine import Engine
 from trading.models import TradingError, dec
 from .helpers import Fixture
@@ -91,7 +90,7 @@ class CapacityFreshnessTests(unittest.TestCase):
                     self.assertNotIn("XAUUSD1", self.engine.work("test").priority)
                     self.assertIsNone(self.engine.ordinary_capacity_observation(owners[0], "XAUUSD1", 5))
 
-    def test_partial_sample_cannot_renew_other_tiers_for_ordinary_or_cycle_open(self):
+    def test_partial_sample_cannot_renew_other_tiers_for_ordinary_open(self):
         self.engine.brokers["test"] = self.f.broker
         self.engine.capacity_targets = {"XAUUSD1": {10}}
         self.engine.capacity_accounts = self.f.store.accounts()
@@ -106,8 +105,6 @@ class CapacityFreshnessTests(unittest.TestCase):
             sample.assert_called_once_with("XAUUSD1", {10})
             self.assertEqual(self.engine.markets["XAUUSD1"]["capacity_checked_at"], {"5": 1000, "10": 1009})
             self.assertEqual(self.engine.capacities("XAUUSD1"), {10: dec(0)})
-            with self.assertRaises(TradingError):
-                self.engine.require_cycle_open_capacity(DEFAULT_CYCLE, 5)
             with patch.object(self.f.broker, "submit") as submit:
                 self.engine.tick_account("test")
                 submit.assert_not_called()

@@ -23,8 +23,8 @@ function freeze(value) {
   return value;
 }
 
-test('only ordinary and cycle pending batches expose market order diagnostics', () => {
-  for (const kind of ['ordinary', 'cycle']) {
+test('only ordinary pending batches expose market order diagnostics', () => {
+  for (const kind of ['ordinary']) {
     assert.equal(hasPendingPairOrders(pair({ kind })), true);
     assert.deepEqual(pendingOrderDiagnostics(pair({ kind })), []);
   }
@@ -51,7 +51,7 @@ test('only ordinary and cycle pending batches expose market order diagnostics', 
 test('original and repair legs show exact order identifiers, stages and side labels', () => {
   const result = pendingOrderDiagnostics(
     pair({
-      kind: 'cycle',
+      kind: 'ordinary',
       phase: 'close',
       legs: [
         {
@@ -329,7 +329,7 @@ test('initial submission errors survive later query feedback without inventing o
 test('reading diagnostics never mutates pairs, order payloads, receipts or repair arrays', () => {
   const fixture = freeze(
     pair({
-      kind: 'cycle',
+      kind: 'ordinary',
       phase: 'open',
       legs: [
         {

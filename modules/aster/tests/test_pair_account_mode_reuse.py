@@ -49,7 +49,7 @@ class PairAccountModeReuseTests(TestCase):
         broker.snapshot([SYMBOL], fresh_modes=True, reuse_account_mode=True)
         self.assertEqual(self.count(broker, fixtures.DUAL), 2)
         snapshot = broker.snapshot([SYMBOL], reuse_account_mode=True)
-        broker._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        broker._private_account_event("ACCOUNT_CONFIG_UPDATE")
         with self.assertRaises(TradingError):
             broker.require_snapshot_current(snapshot)
         broker.api.hedge = False
@@ -111,12 +111,12 @@ class PairAccountModeReuseTests(TestCase):
         def changed(method, path, *args, **kwargs):
             payload = original(method, path, *args, **kwargs)
             if path == ACCOUNT:
-                broker._cycle_account_event("ACCOUNT_UPDATE")
+                broker._private_account_event("ACCOUNT_UPDATE")
             return payload
         with patch.object(broker.api, "call", side_effect=changed), self.assertRaises(SnapshotSuperseded):
             broker.snapshot([SYMBOL], reuse_account_mode=True)
         snapshot = broker.snapshot([SYMBOL], reuse_account_mode=True)
-        broker._cycle_account_event("ORDER_TRADE_UPDATE")
+        broker._private_account_event("ORDER_TRADE_UPDATE")
         with self.assertRaises(TradingError):
             broker.require_snapshot_current(snapshot)
 

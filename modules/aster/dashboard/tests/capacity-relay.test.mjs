@@ -75,7 +75,6 @@ test('returning to an old healthy status waits for an update without implying a 
 test('sample and HTTP problems do not change a confirmed healthy WS connection', () => {
   for (const values of [
     { samples: [] },
-    { samples: [sample({ age_seconds: 2.8 })] },
     { samples: [sample({ age_seconds: 9 })] },
     { http: { ...status().http, last_error: 'snapshot_invalid' } },
   ]) {
@@ -256,7 +255,7 @@ test('an explicit cleared transport error overrides a retained legacy error', ()
   assert.equal(wsRecovered.connectionTone, 'good');
 });
 
-test('polling delay does not age the server sample or invent a cycle expiry', () => {
+test('polling delay does not age the server sample or invent an expiry', () => {
   const relay = status();
   const before = structuredClone(relay);
   const view = capacityRelayView(relay, {
@@ -265,46 +264,43 @@ test('polling delay does not age the server sample or invent a cycle expiry', ()
   });
   assert.equal(view.samples[0].ageSeconds, 0.2);
   assert.equal(view.samples[0].ageLabel, '0.2 秒');
-  assert.equal(view.samples[0].freshness, '采集时 · 额度缓存有效 · 1 秒内');
+  assert.equal(view.samples[0].freshness, '采集时 · 额度缓存有效');
   assert.equal(view.data, '采集时 · 1 项缓存有效');
   assert.equal(view.samples[0].tone, 'good');
   assert.equal(view.dataTone, 'good');
   assert.deepEqual(relay, before);
 });
 
-test('a sample already outside the cycle lifetime at observation remains explicit', () => {
+test('a sample inside the cache lifetime remains valid with its observed age', () => {
   const view = capacityRelayView(
     status({ samples: [sample({ age_seconds: 2.8 })] }),
     { now: timestamp + 2.6, updatedAt: timestamp },
   );
   assert.equal(view.samples[0].ageSeconds, 2.8);
   assert.equal(view.samples[0].ageLabel, '2.8 秒');
-  assert.match(
-    view.samples[0].freshness,
-    /^采集时 · .*缓存有效.*已超循环 1 秒/,
-  );
-  assert.match(view.data, /^采集时 · .*循环额度已过期/);
-  assert.equal(view.samples[0].tone, 'warning');
-  assert.equal(view.dataTone, 'warning');
+  assert.equal(view.samples[0].freshness, '采集时 · 额度缓存有效');
+  assert.equal(view.data, '采集时 · 1 项缓存有效');
+  assert.equal(view.samples[0].tone, 'good');
+  assert.equal(view.dataTone, 'good');
 });
 
-test('OI cache lifetime and the shorter cycle lifetime keep their own boundaries', () => {
-  for (const [age, cacheValid, cycleValid] of [
-    [1, true, true],
-    [1.01, true, false],
-    [8, true, false],
-    [8.01, false, false],
+test('OI cache lifetime preserves its exact validity boundary', () => {
+  for (const [age, cacheValid] of [
+    [1, true],
+    [1.01, true],
+    [8, true],
+    [8.01, false],
   ]) {
     const view = capacityRelayView(
       status({ samples: [sample({ age_seconds: age })] }),
       options,
     );
     assert.equal(view.samples[0].freshness.includes('缓存有效'), cacheValid);
-    assert.equal(view.samples[0].tone === 'good', cycleValid);
+    assert.equal(view.samples[0].tone === 'good', cacheValid);
   }
 });
 
-test('bracket freshness does not imply current OI or cycle readiness', () => {
+test('bracket freshness does not imply current OI readiness', () => {
   const relay = status({
     samples: [
       sample({ kind: 'brackets', age_seconds: 300, max_age_seconds: 300 }),

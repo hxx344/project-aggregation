@@ -2,15 +2,14 @@ from pathlib import Path
 import tempfile
 import time
 
-from trading.engine import DEFAULT_POLICY, Engine
+from trading.engine import DEFAULT_POLICY
 from trading.paper import DemoMarket, PaperBroker
 from trading.store import Store
 
 
-def seed_cycle_capacity(engine, *, now=None):
-    """Explicit public-cache prerequisite for tests of other cycle conditions."""
+def seed_market_capacity(engine, *, now=None, symbols=("XAUUSD1",)):
+    """Explicit public-cache prerequisite for tests of other trading conditions."""
     now = time.time() if now is None else now
-    symbols = {a.get("cycle", {}).get("symbol", "XAUUSD1") for a in engine.store.accounts()}
     for symbol in symbols:
         engine.markets[symbol] = {"status": "ok", "checked_at": now,
                                   "capacity_checked_at": {str(v): now for v in range(1, 21)},

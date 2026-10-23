@@ -8,7 +8,7 @@ from trading.models import TradingError, positive
 from trading.paper import DemoMarket
 from .helpers import Fixture
 from .test_exchange_hardening import FixtureAPI, account_responses
-from .test_cycle_account_snapshot import ACCOUNT, RISK, SYMBOL, LocalQuoteMarket, cycle_account_responses, risk_row
+from .account_fixtures import ACCOUNT, RISK, SYMBOL
 
 
 class AccountNumericErrorTests(unittest.TestCase):
@@ -43,17 +43,6 @@ class AccountNumericErrorTests(unittest.TestCase):
                     broker.snapshot([SYMBOL])
                 self.assertIn(field, str(caught.exception))
                 self.assertIn("USD1" if path == ACCOUNT else SYMBOL, str(caught.exception))
-
-    def test_cycle_risk_fallback_has_the_same_position_diagnostic(self):
-        responses = cycle_account_responses()
-        responses[RISK] = [risk_row(row) for row in responses[ACCOUNT]["positions"]]
-        responses[RISK][1]["liquidationPrice"] = "-2"
-        market = LocalQuoteMarket()
-        market.connected.clear()
-        broker = LiveBroker({}, market, api=FixtureAPI(responses))
-        with self.assertRaisesRegex(TradingError, "XAUUSD1 SHORT.*liquidationPrice.*非负数.*-2"):
-            broker.cycle_snapshot([SYMBOL])
-        self.assertIsNone(broker.leverage_snapshot)
 
     def test_malformed_value_is_not_echoed_and_zero_semantics_are_preserved(self):
         with self.assertRaises(TradingError) as caught:

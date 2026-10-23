@@ -5,7 +5,6 @@ from fractions import Fraction
 import json
 import math
 
-from .exchange import LiveBroker
 from .execution import Executor, TERMINAL
 from .models import SYMBOLS, TradingError, positive, wire
 from .position_imbalance_notifications import KEY as NOTIFICATIONS_KEY, finite_time
@@ -140,8 +139,7 @@ def collect(engine):
                     if (target.get("capture") or {}).get("scope") == scope}
         margin = pair.get("margin") or {}
         interval = margin.get("check_interval_seconds", 5) if (margin.get("enabled")
-            and not (pair.get("ordinary") or {}).get("enabled")
-            and not (pair.get("cycle") or {}).get("enabled")) else 30
+            and not (pair.get("ordinary") or {}).get("enabled")) else 30
         interval = min(3600, max(1, interval)) if finite_time(interval) else 30
         base = {"scope": scope, "bindings": bindings, "label": "配对组「" + pair["name"] + "」",
                 "configured_symbol": pair["symbol"], "activity": activity(engine.store, scope),
@@ -206,20 +204,9 @@ def collect(engine):
                 with engine.lock:
                     candidates = [deepcopy(engine.views.get(aid, {}).get("snapshot") or {}),
                                   deepcopy(engine.display_snapshots.get(aid) or {})]
-                    broker = engine.brokers.get(aid)
-                if isinstance(broker, LiveBroker) and account.get("cycle", {}).get("enabled"):
-                    try:
-                        lease = broker.cycle_cache.lease([account["cycle"]["symbol"]])
-                        # Serialize only position evidence; no dashboard reporting.
-                        s = lease.snapshot
-                        candidates.append({"timestamp": s.timestamp, "open_orders": s.open_orders,
-                            "positions": [{"symbol": p.symbol, "side": p.side, "qty": str(p.qty)} for p in s.positions]})
-                        lease.require_fresh()
-                    except (TradingError, KeyError, TypeError, ValueError):
-                        candidates = candidates[:2]
                 for row in rows:
                     row.update(activity=marker, suppressed=suppressed, attention=attention)
-                    # A cycle-only snapshot must not erase another symbol's evidence.
+                    # A partial snapshot must not erase another symbol's evidence.
                     available = [s for s in candidates if type(s.get("timestamp")) in (float, int)
                                  and math.isfinite(s["timestamp"])
                                  and all(quantity(s, row["symbol"], side) is not None for side in ("LONG", "SHORT"))]

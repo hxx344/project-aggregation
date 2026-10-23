@@ -33,7 +33,6 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.store = self.f.store
         self.store.save_listing_state(catalog("BTCUSD1", "ETHUSD1", "XAUUSD1"))
         self.engine = Engine(self.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
 
     def queue(self, category, symbols, message_id=None):
         import json
@@ -191,17 +190,24 @@ class MonitoringSettingsTests(unittest.TestCase):
         self.assertTrue(row["effective_monitor"])
         self.assertTrue(row["required_by"])
 
-    def test_paused_cycle_holding_and_migration_keep_data(self):
+    def test_paused_legacy_cycle_holding_keeps_data(self):
         self.pause()
         self.store.edit_monitoring({"monitoring_enabled": False})
         self.store.put("cycle:test", {"phase": "holding", "config": {"symbol": "SPCXUSD1"}})
         self.assertIn("SPCXUSD1", self.engine.monitored_market_symbols())
-        owner = self.store.account("test")
-        owner["enabled"] = True
-        owner["migration"]["enabled"] = True
-        self.store.save_account(owner)
-        self.assertEqual(self.engine.monitored_market_symbols(), set(SYMBOLS))
-
+        policy = set(self.store.account("test")["policy"]["symbols"])
+        for record in ({"phase": "holding", "config": {"symbol": ["SPCXUSD1"]}},
+                       {"phase": "holding", "config": ["SPCXUSD1"]}, ["holding"]):
+            with self.subTest(record=record):
+                self.store.put("cycle:test", record)
+                self.assertTrue(policy <= self.engine.monitored_market_symbols())
+        self.store.put("cycle:test", None)
+        self.store.save_intent({"id": "legacy", "account_id": "test", "status": "pending", "kind": "cycle",
+                                "symbol": [], "orders": [{"symbol": {}}, "bad"]})
+        self.assertTrue(policy <= self.engine.monitored_market_symbols())
+        self.store.save_intent({"id": "legacy", "account_id": "test", "status": "aborted", "kind": "cycle"})
+        self.store.put("post_fill_check:test", {"kind": "migration", "symbol": []})
+        self.assertTrue(policy <= self.engine.monitored_market_symbols())
     def test_new_listing_requests_obey_symbol_and_master_switches(self):
         market = Mock()
         market.listing_symbols.return_value = {"symbols": [symbol("BTCUSD1"), symbol("ETHUSD1")]}
@@ -259,15 +265,14 @@ class MonitoringSettingsTests(unittest.TestCase):
 
     def test_scheduler_omits_disabled_market_jobs(self):
         from contextlib import ExitStack
-        from tests.test_cycle_ws_scheduler import _Harness, _Pool
+        from tests.scheduler_fixtures import _Harness, _Pool
         harness = _Harness(self.f)
-        self.addCleanup(harness.engine.dashboard_reports.close)
         self.pause()
         self.store.edit_monitoring({"monitoring_enabled": False})
         calls = []
         def submit(function, *args, **kwargs):
             calls.append((getattr(function, "__name__", "mock"), args))
-            from tests.test_cycle_ws_scheduler import _Future
+            from tests.scheduler_fixtures import _Future
             return _Future(60)
         with ExitStack() as stack:
             stack.enter_context(patch.object(harness.engine, "scheduling", return_value=harness.timing))
@@ -287,7 +292,6 @@ class MonitoringAPITests(unittest.TestCase):
         self.store.save_listing_state(catalog("BTCUSD1"))
         from trading.paper import DemoMarket
         self.engine = Engine(self.store, market=DemoMarket())
-        self.addCleanup(self.engine.dashboard_reports.close)
         with patch.dict(os.environ, {"ASTER_DASHBOARD_PASSWORD": "monitor-test-password"}, clear=True):
             app = create_app(self.engine, start_engine=False)
         self.client = TestClient(app)

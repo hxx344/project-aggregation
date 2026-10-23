@@ -336,7 +336,8 @@ class AdlController:
         accounts, brokers, identities = PairTrader(self.engine)._members(pair)
         by_id = {value["id"]: value for value in accounts.values()}
         by_broker = {accounts[key]["id"]: value for key, value in brokers.items()}
-        if incident and (incident["identities"] != identities or incident["accounts"] != by_id):
+        frozen = incident and {aid: self.store.account_defaults(value) for aid, value in incident["accounts"].items()}
+        if incident and (incident["identities"] != identities or frozen != by_id):
             raise TradingError("ADL 处理期间账户身份或配置已变化，禁止自动减仓")
         return by_id, by_broker, identities
 
@@ -499,7 +500,7 @@ class AdlController:
                     raise AdlStateConflict("ADL 回执保存期间处理记录或配对配置已变化")
                 for aid, account in accounts.items():
                     row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-                    if not row or json.loads(row[0]) != account:
+                    if not row or self.store.account_defaults(json.loads(row[0])) != account:
                         raise AdlStateConflict("ADL 回执保存期间账户配置已变化")
                 _put(db, "adl_pair:" + pair["id"], candidate)
                 _put(db, "adl_incident:" + incident["id"], candidate)
@@ -578,7 +579,9 @@ class AdlController:
 
     def _quiesce(self, pair, incident, brokers, *, prepare_only=False):
         from .pair_planning import require_runtime_symbols
-        require_runtime_symbols(pair, incident["frozen_runtime"])
+        # ADL retains its independent cancellation/reduction authority. The
+        # frozen strategy journal is evidence only and is never resumed here.
+        require_runtime_symbols(pair, incident["frozen_runtime"], allow_legacy=True)
         pending = incident["frozen_runtime"].get("pending")
         if pending and (pending.get("identities") != incident["identities"]
                 or pending.get("pair_id", pair["id"] if pending.get("kind") == "leverage" else None) != pair["id"]):
@@ -747,7 +750,7 @@ class AdlController:
         self._save(incident)
 
     def _complete(self, pair, incident, accounts, brokers, snapshots):
-        from .pair_execution import empty_progress
+        from .pair_legacy import has_legacy_cycle, LEGACY_CYCLE_REASON
         self._guard(pair, incident, accounts, brokers, snapshots)
         require_adl_reflected(incident, snapshots)
         if self._memory_pending(set(accounts)):
@@ -771,7 +774,7 @@ class AdlController:
                     raise TradingError("ADL 完成核验期间配对配置已变化")
                 for aid, account in accounts.items():
                     saved_account = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-                    if not saved_account or json.loads(saved_account[0]) != account:
+                    if not saved_account or self.store.account_defaults(json.loads(saved_account[0])) != account:
                         raise TradingError("ADL 完成核验期间账户配置已变化")
                 captured = {event["evidence_key"]: event for event in incident["events"]}
                 for key, event in _unhandled(db, pair["id"]):
@@ -785,11 +788,17 @@ class AdlController:
                                         if p.symbol == pair["symbol"] and p.side == side), Fraction(0)))
                          for key, side in (("long", "LONG"), ("short", "SHORT"))}
                 runtime = _get(db, "pair_runtime:" + pair["id"], {})
-                runtime.update(owned=owned, pending=None, symbol=pair["symbol"], identities=incident["identities"],
-                               progress=empty_progress(owned, (runtime.get("progress") or {}).get("completed_cycles", 0)),
+                pending = runtime.get("pending") or {}
+                legacy_batch = _get(db, "pair_batch:" + pending["id"], {}) if pending.get("id") else {}
+                legacy = has_legacy_cycle(runtime) or isinstance(legacy_batch, dict) and legacy_batch.get("kind") == "cycle"
+                runtime.update(symbol=pair["symbol"], identities=incident["identities"],
                                phase="paused", reason="ADL 持仓核实完成，多空总数量已一致；策略保持暂停，请核对后手动启动",
                                updated_at=time.time())
-                runtime.pop("attention", None)
+                if legacy:
+                    runtime.update(phase="attention", reason=LEGACY_CYCLE_REASON, attention=LEGACY_CYCLE_REASON)
+                else:
+                    runtime.update(owned=owned, pending=None)
+                    runtime.pop("attention", None)
                 incident.update(status="completed", completed_at=time.time(), reason=runtime["reason"], hold=True,
                                 after=scene_json(accounts, snapshots))
                 incident["watch_unknown"] = any(item.get("resolution") for item in self._order_items(incident))
@@ -809,6 +818,7 @@ class AdlController:
         self._save(incident, phase="blocked" if changed else None)
 
     def _runtime(self, pair, incident):
+        from .pair_legacy import has_legacy_cycle, LEGACY_CYCLE_REASON
         # Local receipt capture must run before the 30-second stream cache can
         # expire. This does not shorten any persisted HTTP retry deadline.
         minimum = 1 if incident["status"] == "active" else 10
@@ -819,6 +829,8 @@ class AdlController:
         runtime.update(phase="paused" if incident["status"] == "completed" else "attention" if incident["status"] == "blocked" else "recovering",
                        reason=incident["reason"], updated_at=time.time(), retry_after=delay,
                        adl={key: incident.get(key) for key in ("id", "status", "symbols", "created_at", "completed_at", "reason")})
+        if incident["status"] == "completed" and has_legacy_cycle(runtime, self.store):
+            runtime.update(phase="attention", reason=LEGACY_CYCLE_REASON, attention=LEGACY_CYCLE_REASON)
         self.store.put("pair_runtime:" + pair["id"], {key: value for key, value in runtime.items() if key != "retry_after"})
         return runtime
 

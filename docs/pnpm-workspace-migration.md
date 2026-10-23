@@ -12,7 +12,7 @@
 
 原方案中的“从模块删除所有共享依赖声明”没有采用：模块构建工具及生产依赖解析需要显式依赖，去重由 pnpm 完成。Asset 的 Next.js、主题与组件库、CrossEx 的 WebSocket 等原有依赖均保留；迁移不切换 Next 的运行模式。
 
-ASTER dashboard 的 React、ReactDOM 与 RSC 使用独立的 `aster-react` catalog，保持 19.2.8 一致；其余共享依赖仍使用默认 catalog。嵌套 importer 的环境文件及 `trading/cycle-config.json` 也参与构建缓存。ASTER 生产前端为静态产物，运行包不携带 vinext 构建依赖。
+ASTER dashboard 的 React、ReactDOM 与 RSC 使用独立的 `aster-react` catalog，保持 19.2.8 一致；其余共享依赖仍使用默认 catalog。嵌套 importer 的环境文件也参与构建缓存（`trading/cycle-config.json` 已随循环功能移除）。ASTER 生产前端为静态产物，运行包不携带 vinext 构建依赖。
 
 ## 本地安装与构建
 

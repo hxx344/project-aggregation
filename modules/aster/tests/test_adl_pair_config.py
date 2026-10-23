@@ -16,7 +16,6 @@ class AdlPairConfigTests(unittest.TestCase):
         for aid in ("test", "second"):
             self.f.store.save_account({**account(aid), "enabled": False})
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
 
     def test_defaults_are_detached_and_explicit_null_or_extra_fields_fail(self):
         source = pair_config()
@@ -36,7 +35,9 @@ class AdlPairConfigTests(unittest.TestCase):
         self.assertEqual(changed["adl"], {"enabled": True, "batch_notional": "250.5"})
         changed = self.engine.pairs.configure("gold", {"name": "新名称"})
         self.assertEqual(changed["adl"], {"enabled": True, "batch_notional": "250.5"})
-        self.assertEqual(changed["cycle"], original["cycle"])
+        self.assertEqual(changed["ordinary"], original["ordinary"])
+        self.assertEqual(changed["margin"], original["margin"])
+        self.assertNotIn("cycle", changed)
 
     def test_legacy_saved_pair_projection_and_edit_do_not_require_migration(self):
         pair = self.engine.pairs.create(pair_config())

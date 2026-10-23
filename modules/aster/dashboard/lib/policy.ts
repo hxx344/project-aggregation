@@ -48,22 +48,11 @@ export function configuredMarginPercent(value: unknown): string | null {
   }
 }
 
-export function cycleMarginLimit(limits?: { cycle?: string }): string | null {
-  // Older services still enforce the base limit. Only a valid dedicated field
-  // confirms that the shared extra allowance is active for cycle trading.
-  if (typeof limits?.cycle !== 'string') return null;
-  try {
-    return marginLimitFromPercent(percentFromMarginLimit(limits.cycle));
-  } catch {
-    return null;
-  }
-}
-
-export function migrationMarginLimit(
+export function extraMarginLimit(
   base: string,
-  limits?: { migration?: string; high_leverage?: string },
+  limits?: { high_leverage?: string },
 ): string {
-  const reported = limits?.migration ?? limits?.high_leverage;
+  const reported = limits?.high_leverage;
   if (reported !== undefined) return reported;
   const normalized = shiftDecimal(base, 0);
   if (normalized >= '0.95') return '1';
@@ -72,18 +61,6 @@ export function migrationMarginLimit(
   const units = BigInt(whole + fraction.padEnd(places, '0'));
   const bonus = BigInt(`5${'0'.repeat(places - 2)}`);
   return shiftDecimal(String(units + bonus), -places);
-}
-
-export function migrationToleranceFromPercent(percent: string): string {
-  let ratio: string;
-  try {
-    ratio = shiftDecimal(percent, -2);
-  } catch {
-    throw new Error('迁移金额误差必须是 0% 至 50% 的有效数字');
-  }
-  if (ratio !== '0' && (!ratio.startsWith('0.') || ratio > '0.5'))
-    throw new Error('迁移金额误差必须介于 0% 至 50%');
-  return ratio;
 }
 
 export function parseMinimumLeverage(value: string): number {

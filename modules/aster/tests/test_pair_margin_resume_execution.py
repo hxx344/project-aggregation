@@ -10,7 +10,7 @@ from tests import test_pair_margin_poll_efficiency as fixtures
 from trading.exchange import ExchangeError
 from trading.margin_balance import MarginBalancer
 from trading.models import TradingError, dec, wire
-from trading.pair_execution import empty_progress, runtime_default
+from tests.pair_legacy_fixtures import empty_progress, runtime_default
 
 
 SYMBOL = "XAUUSD1"
@@ -64,12 +64,6 @@ class PairMarginResumeExecutionTests(TestCase):
         for side, index in (("long", 0), ("short", 1)):
             actual = self.paper[side].snapshot([SYMBOL]).pair(SYMBOL)[index].qty
             self.assertEqual(actual, dec(owned[side.upper()]))
-
-    def publish(self, side):
-        broker = self.brokers[side]
-        cache = broker.cycle_cache
-        snapshot = replace(self.paper[side].snapshot([SYMBOL]), open_orders=None)
-        self.assertTrue(cache.publish(cache.begin_refresh(), snapshot, self.ticks))
 
     def test_unknown_debit_reservation_prevents_opening_when_cash_is_insufficient(self):
         original = self.unknown("24990")
@@ -136,37 +130,6 @@ class PairMarginResumeExecutionTests(TestCase):
         self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
         self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"], journal["last_transfer"])
         self.assertTrue(all(path == ORDER for _, path, _ in self.posts()))
-
-    def test_hot_replacement_replans_with_the_same_unknown_debit_reservation(self):
-        original = self.unknown("23000")
-        self.pair["ordinary"]["enabled"] = False
-        self.pair["cycle"]["enabled"] = True
-        self.pair = self.store.save_pair(self.pair)
-        for side, broker in self.brokers.items():
-            broker.cycle_cache.configure([SYMBOL])
-            broker.cycle_cache.set_connected(True)
-            self.publish(side)
-        save = self.trader._save
-        replaced = []
-
-        def replace_after_intent(pair, state):
-            save(pair, state)
-            pending = state.get("pending")
-            if not replaced and pending and all(leg["dispatch"] == "prepared" for leg in pending["legs"]):
-                replaced.append(pending["id"])
-                self.paper["long"].state["wallet"] = "23010"
-                self.paper["long"].save()
-                self.publish("long")
-
-        with patch.object(self.trader, "_save", side_effect=replace_after_intent), \
-                patch.object(self.trader, "_read", wraps=self.trader._read) as read:
-            state = self.tick()
-        self.assertEqual(len(replaced), 1, state)
-        self.assertEqual(sum(call.kwargs.get("hot", False) for call in read.call_args_list), 2)
-        self.assertEqual(self.posts(), [])
-        self.assertFalse(state["last_batch"]["completed"])
-        self.assert_flat()
-        self.assert_original_transfer_retained(original)
 
     def test_postfill_reserved_margin_violation_reduces_only_this_batch(self):
         owned = self.baseline()

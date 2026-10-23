@@ -2,25 +2,18 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   marginLimitFromPercent,
-  migrationMarginLimit,
+  extraMarginLimit,
   parseMinimumLeverage,
   percentFromMarginLimit,
 } from '../lib/policy.ts';
 
-test('migration risk limits prefer the dedicated API value and support older responses', () => {
-  assert.equal(
-    migrationMarginLimit('0.93', {
-      migration: '0.975',
-      high_leverage: '0.98',
-    }),
-    '0.975',
-  );
-  assert.equal(migrationMarginLimit('0.93', { high_leverage: '0.98' }), '0.98');
-  assert.equal(migrationMarginLimit('0.93'), '0.98');
-  assert.equal(migrationMarginLimit('0.5', {}), '0.55');
+test('higher leverage limits use the reported value and support missing responses', () => {
+  assert.equal(extraMarginLimit('0.93', { high_leverage: '0.98' }), '0.98');
+  assert.equal(extraMarginLimit('0.93'), '0.98');
+  assert.equal(extraMarginLimit('0.5', {}), '0.55');
 });
 
-test('migration fallback adds five percentage points exactly and caps at 100 percent', () => {
+test('higher leverage fallback adds five percentage points exactly and caps at 100 percent', () => {
   for (const [base, expected] of [
     ['.93', '0.98'],
     ['9.3e-1', '0.98'],
@@ -30,7 +23,7 @@ test('migration fallback adds five percentage points exactly and caps at 100 per
     ['0.99', '1'],
     ['1', '1'],
   ])
-    assert.equal(migrationMarginLimit(base), expected, base);
+    assert.equal(extraMarginLimit(base), expected, base);
 });
 
 test('risk percentages convert and round-trip exactly', () => {

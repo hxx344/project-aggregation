@@ -453,7 +453,6 @@ class ListingAlertAPITests(unittest.TestCase):
         api = API(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
         self.addCleanup(api.close)
         self.engine = Engine(self.store, market=MarketData(api=api))
-        self.addCleanup(self.engine.dashboard_reports.close)
         import time
         now = time.time()
         self.store.save_listing_state({"initialized": True, "checked_at": now, "rows": {"BTCUSD1": {

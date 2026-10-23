@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from tests import test_pair_order_recovery as fixtures
 from tests import test_pair_bounded_recovery as bounded
-from tests.test_cycle_account_snapshot import ACCOUNT, RISK, risk_row
+from tests.account_fixtures import ACCOUNT, RISK, risk_row
 from trading.exchange import SnapshotSuperseded
 from trading.models import TradingError, dec, wire
 from trading.pair_execution import PairTrader
@@ -35,10 +35,10 @@ class PairLateReceiptRecoveryTests(unittest.TestCase):
         self.ready()
         with patch.object(PrivateAccountStream, "start"):
             for broker in self.live.values():
-                if broker.cycle_stream is None:
-                    broker.start_cycle_hot_data([fixtures.SYMBOL])
-                    broker.cycle_stream._set_connected(True)
-                    self.addCleanup(broker.stop_cycle_hot_data)
+                if broker.private_stream is None:
+                    broker.start_private_stream()
+                    broker.private_stream._set_connected(True)
+                    self.addCleanup(broker.stop_private_stream)
                 else:
                     broker._private_evidence.reset(True)
                 broker.api.calls.clear()
@@ -62,7 +62,7 @@ class PairLateReceiptRecoveryTests(unittest.TestCase):
                       "ps": order["positionSide"], "o": "MARKET", "ot": "MARKET", "q": order["quantity"],
                       "i": 123 + index, "X": status, "x": "TRADE", "z": quantity,
                       "ap": "100" if dec(quantity) else "0", "T": stamp}}
-            broker.cycle_stream._handle_message(json.dumps(event))
+            broker.private_stream._handle_message(json.dumps(event))
             self.assertEqual(broker.order_event_receipt(order, include_active=True)["status"], status)
 
     def during_read(self, pending, status, timing):

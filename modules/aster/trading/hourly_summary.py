@@ -1,10 +1,10 @@
 """Compact, native Feishu cards from published state; no exchange/database I/O."""
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_UP
+from decimal import Decimal, InvalidOperation
 import json
 
 from monitor import FEISHU_CARD_PREFIX
-from .report_cache import REPORT_MAX_AGE
+from .pair_legacy import has_legacy_cycle, LEGACY_CYCLE_REASON
 
 
 # Budget the HTTP serialization, leaving room below the custom bot's 20 KB limit.
@@ -78,21 +78,6 @@ def _metric(title, value, size="heading-2", color="default"):
     return [_label(title, "notation", "grey"), _label(value, size, color)]
 
 
-def _progress(value, target, known):
-    used, limit = _number(value), _number(target)
-    if not known or used is None or used < 0:
-        return "待同步 / 待核实"
-    if limit is None or limit < 0:
-        return "目标待同步"
-    if limit == 0:
-        return "未设目标上限"
-    if used >= limit:
-        return "已达标"
-    # Never round a positive remaining amount to zero or label 99.998% as 100%.
-    remaining = (limit - used).quantize(Decimal("0.01"), rounding=ROUND_UP)
-    return f"还差 {remaining:,.2f}"
-
-
 def _usage(snapshot):
     equity, occupied = _number(snapshot.get("equity")), _number(snapshot.get("occupied_margin"))
     if equity is None or equity <= 0 or occupied is None or occupied < 0:
@@ -116,13 +101,11 @@ def _snapshot_note(snapshot, now):
 def _pair_sources(pair, accounts):
     """Project display sources only; funds reads are never trading evidence."""
     state = _map(pair.get("state"))
-    quantities = _map(_map(state.get("progress")).get("quantities"))
     funds_only = (_map(pair.get("margin")).get("enabled") is True
                   and _map(pair.get("ordinary")).get("enabled") is False
-                  and _map(pair.get("cycle")).get("enabled") is False
                   and state.get("pending") is None
-                  and set(quantities) == {"LONG", "SHORT"}
-                  and all(_number(value) == 0 for value in quantities.values()))
+                  and not has_legacy_cycle(state)
+                  and state.get("attention") != LEGACY_CYCLE_REASON)
     snapshots, displays = {}, {}
     for side in ("long", "short"):
         account = accounts.get(pair.get(side + "_account_id"), {})
@@ -208,15 +191,14 @@ def _display_position_note(display, label, now):
     return note
 
 
-def _account_card(account, snapshot, label, progress, now, side=None, funds_note=None):
+def _account_card(account, snapshot, label, now, side=None, funds_note=None):
     mode = {"live": "实盘", "paper": "模拟"}.get(account.get("mode"), "模式待同步")
     color = "blue" if side == "long" else "red" if side == "short" else "default"
     # Feishu expects a named color, not an inline CSS rgba() expression.
     background = "red-50" if side == "short" else "blue-50"
     elements = [_label(f"{label} · {_text(account.get('name'))}（{mode}）", "heading", color),
                 _columns(_metric("可用保证金", _amount(snapshot.get("available"))),
-                         _metric("保证金占用率", _usage(snapshot)), background=background),
-                _label(f"距交易量目标  {progress}")]
+                         _metric("保证金占用率", _usage(snapshot)), background=background)]
     note = funds_note if funds_note is not None else _snapshot_note(snapshot, now)
     if note:
         elements.append(_label(note, "notation", "orange"))
@@ -258,8 +240,8 @@ def _capacity(pair, snapshots, markets, now):
     return f"公开额度 {key}x  {_amount(value)}"
 
 
-def _pair_block(pair, accounts, markets, now, utc_date, sources):
-    state, config = _map(pair.get("state")), _map(pair.get("cycle"))
+def _pair_block(pair, accounts, markets, now, sources):
+    state = _map(pair.get("state"))
     funds_only, snapshots, displays = sources
     errors = _funds_errors(pair) if funds_only else []
     margin = _map(state.get("margin"))
@@ -280,14 +262,11 @@ def _pair_block(pair, accounts, markets, now, utc_date, sources):
             elements.append(_label(error, color="orange"))
     if state.get("pending"):
         elements.append(_label("订单 / 执行批次待核对", color="orange"))
-    daily = _map(_map(state.get("daily_volume")).get(utc_date))
-    known = not state.get("volume_unknown") and not state.get("pending") and _fresh(state.get("updated_at"), now, 120)
     for side, label in (("long", "A 多"), ("short", "B 空")):
         account = accounts.get(pair.get(side + "_account_id"), {})
         snapshot = snapshots[side]
-        progress = _progress(daily.get(side), config.get("daily_volume_limit"), known) if config.get("enabled") else "循环未启用"
         note = _funds_note(pair, snapshot, snapshots, now) if funds_only else None
-        elements.append(_account_card(account, snapshot, label, progress, now, side, note))
+        elements.append(_account_card(account, snapshot, label, now, side, note))
     positions_source = {side: _map(display.get("snapshot")) for side, display in displays.items()} if funds_only else snapshots
     positions = f"持仓  多 {_position_text(positions_source['long'], pair.get('symbol'), 'LONG')} / 空 {_position_text(positions_source['short'], pair.get('symbol'), 'SHORT')}"
     elements.append(_label(positions, "notation"))
@@ -307,15 +286,10 @@ def _pair_block(pair, accounts, markets, now, utc_date, sources):
     return urgent, elements
 
 
-def _account_block(account, now, utc_date):
-    cycle = _map(account.get("cycle_state"))
-    daily, report = _map(cycle.get("daily_volume")), _map(cycle.get("report_status"))
-    known = (report.get("status") == "ready" and _fresh(report.get("as_of"), now, REPORT_MAX_AGE)
-             and daily.get("utc_date") == utc_date and not daily.get("sync_pending") and not daily.get("error"))
-    progress = _progress(daily.get("volume"), _map(account.get("cycle")).get("daily_volume_limit"), known) if _map(account.get("cycle")).get("enabled") else "循环未启用"
+def _account_block(account, now):
     snapshot = _map(account.get("snapshot"))
     urgent = account.get("status") in ATTENTION or bool(account.get("pause_reason"))
-    elements = [_account_card(account, snapshot, "账户", progress, now),
+    elements = [_account_card(account, snapshot, "账户", now),
                 _label(f"{'启用' if account.get('enabled') else '暂停'} · {_phase(account.get('status'))} · 持仓 {_position_text(snapshot)}", "notation")]
     if urgent and (account.get("pause_reason") or account.get("reason")):
         elements.append(_label(_text(account.get("pause_reason") or account.get("reason")), color="orange"))
@@ -350,15 +324,15 @@ def format_hourly_summary(state, now):
         if error:
             elements.append(_label("异常：" + _text(error), color="orange"))
     markets = _map(state.get("markets"))
-    blocks = [_pair_block(p, account_by_id, markets, now, utc_date, sources) for p, sources in zip(pairs, pair_sources)]
-    blocks += [_account_block(a, now, utc_date) for a in accounts if a.get("id") not in bound]
+    blocks = [_pair_block(p, account_by_id, markets, now, sources) for p, sources in zip(pairs, pair_sources)]
+    blocks += [_account_block(a, now) for a in accounts if a.get("id") not in bound]
     blocks.sort(key=lambda block: not block[0])
     budget, relay = _map(state.get("request_budget")), _map(state.get("capacity_relay"))
     footer = ["WS " + ("已连接" if relay.get("connected") else "未连接" if relay else "未配置"),
               f"API {_amount(budget.get('used'), 0)} / {_amount(budget.get('limit'), 0)}" if budget else "API 暂无采样"]
     interval = _number(_map(_map(state.get("notification")).get("hourly_summary")).get("interval_seconds", 3600))
     tail = [{"tag": "hr"}, _label(" · ".join(footer), "notation"),
-            _label(f"金额 USD1 · 交易量 UTC 日 {utc_date} · 每 {_amount(interval / 60, 0) if interval is not None else '待同步'} 分钟", "notation", "grey")]
+            _label(f"金额 USD1 · UTC 日期 {utc_date} · 每 {_amount(interval / 60, 0) if interval is not None else '待同步'} 分钟", "notation", "grey")]
     if relay.get("last_error"):
         tail.insert(1, _label("WS：" + _text(relay["last_error"]), color="orange"))
     retry = _number(budget.get("retry_after"))

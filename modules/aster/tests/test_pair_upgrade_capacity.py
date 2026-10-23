@@ -13,7 +13,7 @@ from tests import test_pair_budget as live_fixtures
 from tests import test_pair_trading as pair_fixtures
 from trading.exchange import AmbiguousOrder
 from trading.models import TradingError, dec
-from trading.pair_execution import runtime_default
+from tests.pair_legacy_fixtures import runtime_default
 from trading.pair_planning import ordinary_upgrade, plan_ordinary
 from trading.pairing import validate_pair
 
@@ -128,7 +128,6 @@ class PairUpgradeExecutionTests(TestCase):
 
     def setUp(self):
         pair_fixtures.PairTradingTests.setUp(self)
-        self.pair["cycle"]["enabled"] = False
         self.pair["ordinary"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
         for key, broker in self.brokers.items():

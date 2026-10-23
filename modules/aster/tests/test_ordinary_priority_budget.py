@@ -5,7 +5,7 @@ from unittest.mock import patch
 import httpx
 
 from tests.helpers import Fixture, account
-from tests.test_cycle_ws_scheduler import _Harness
+from tests.scheduler_fixtures import _Harness
 from tests import test_ordinary_fast_capacity as ordinary_fast
 from trading.engine import Engine, PUBLIC_POLL_ALLOWANCE, CAPACITY_MONITOR_RESERVE
 from trading.exchange import API, LiveBroker, MarketData, RateBudget
@@ -101,7 +101,6 @@ class OrdinaryPriorityPacingTests(unittest.TestCase):
         self.addCleanup(self.f.close)
         self.h = _Harness(self.f)
         self.owner = self.f.store.account("test")
-        self.owner["cycle"]["enabled"] = False
         self.owner["policy"].update(symbols=[XAU], ordinary_symbol=XAU)
         self.f.store.save_account(self.owner)
 

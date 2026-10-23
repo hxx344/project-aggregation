@@ -27,7 +27,6 @@ class PairFullCheckTests(TestCase):
     assert_flat = fixtures.PairTradingTests.assert_flat
     order_count = review.PairReviewTests.order_count
     assert_reducing_journal = review.PairReviewTests.assert_reducing_journal
-    terminal_partial_close = review.PairReviewTests.terminal_partial_close
 
     def full_check_due(self):
         state = self.store.get("pair_runtime:gold")
@@ -40,7 +39,6 @@ class PairFullCheckTests(TestCase):
     def terminal_open(self, kind):
         pair = self.store.pair("gold")
         pair["ordinary"]["enabled"] = kind == "ordinary"
-        pair["cycle"]["enabled"] = kind == "cycle"
         self.pair = self.store.save_pair(pair)
 
         def lag(original):
@@ -67,7 +65,7 @@ class PairFullCheckTests(TestCase):
         return self.full_check_due()
 
     def test_known_fills_require_direction_times_at_full_check_for_both_kinds(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             for stamp in (None, 1):
                 for quantity in ("baseline", "balanced_partial"):
                     with self.subTest(kind=kind, stamp=stamp, quantity=quantity):
@@ -89,7 +87,7 @@ class PairFullCheckTests(TestCase):
                             self.assertIsNotNone(state["pending"], state)
                             self.assertEqual(state["pending"]["id"], original["pending"]["id"])
                             self.assertEqual(state["owned"], original["owned"])
-                            self.assertEqual(state["progress"], original["progress"])
+                            self.assertEqual(state.get("progress"), original.get("progress"))
                             self.assertEqual(state["pending"]["bounded_recovery"]["failure_count"], 1)
                             self.assertIn("方向持仓更新时间", state["reason"])
                             self.assertIsNone(self.store.get("pair_batch:" + original["pending"]["id"]))
@@ -102,15 +100,7 @@ class PairFullCheckTests(TestCase):
                         self.store.put("pair_runtime:gold", state)
                         state = self.tick()
                         self.assertIsNone(state["pending"], state)
-                        if kind == "cycle":
-                            self.assertEqual(state["owned"], original["owned"])
-                            self.assertGreater(dec(state["progress"]["quantities"]["LONG"]), 0)
-                            self.expire()
-                            state = self.tick()
-                            self.assertEqual(state["progress"]["completed_cycles"], 1, state)
-                            self.assert_flat()
-                        else:
-                            self.assertEqual(state["owned"], original["pending"]["target"])
+                        self.assertEqual(state["owned"], original["pending"]["target"])
 
     def test_balanced_manual_reconciliation_requires_direction_times(self):
         for stamp in (None, 1):
@@ -137,14 +127,13 @@ class PairFullCheckTests(TestCase):
         return {"pending": record}
 
     def test_full_check_reduces_known_open_fills_with_pending_transfer(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             with self.subTest(kind=kind):
                 self.setUp()
                 original = self.terminal_open(kind)
                 margin = self.pending_transfer()
                 count = self.order_count()
-                with patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")), \
-                     patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001")), \
+                with patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001")), \
                      patch.object(self.engine.pairs, "_read_members", wraps=self.engine.pairs._read_members) as read:
                     state = self.tick()
                 self.assertEqual(read.call_count, 1)
@@ -160,7 +149,7 @@ class PairFullCheckTests(TestCase):
                 self.assert_flat()
 
     def test_full_check_reduces_known_open_fills_with_nonpositive_equity(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             for equity in ("0", "-1"):
                 with self.subTest(kind=kind, equity=equity):
                     self.setUp()
@@ -182,28 +171,8 @@ class PairFullCheckTests(TestCase):
                     self.assertEqual(self.order_count(), count + 2)
                     self.assert_flat()
 
-    def test_full_check_close_reduces_with_pending_transfer_and_nonpositive_equity(self):
-        self.terminal_partial_close()
-        original = self.full_check_due()
-        count = self.order_count()
-        margin = self.pending_transfer()
-        with ExitStack() as stack:
-            for broker in self.brokers.values():
-                snapshot = broker.snapshot
-                stack.enter_context(patch.object(broker, "snapshot", side_effect=lambda *a, _read=snapshot, **kw:
-                    replace(_read(*a, **kw), equity=dec(0))))
-            state = self.tick()
-            self.assertEqual(len(state["pending"]["repairs"]), 1, state)
-            state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assertEqual(state["owned"], original["owned"])
-        self.assertGreater(dec(state["progress"]["quantities"]["LONG"]), 0)
-        self.assertEqual(state["progress"]["quantities"]["LONG"], state["progress"]["quantities"]["SHORT"])
-        self.assertEqual(self.order_count(), count + 1)
-        self.assertEqual(self.store.get("pair_margin:gold"), margin)
-
     def test_pending_transfer_still_blocks_reality_adoption(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             with self.subTest(kind=kind):
                 self.setUp()
                 original = self.terminal_open(kind)
@@ -225,7 +194,10 @@ class PairFullCheckTests(TestCase):
                 self.assertEqual(self.store.get("pair_margin:gold"), margin)
 
     def test_full_check_reduction_honors_read_only_and_revoked_guards(self):
-        self.terminal_partial_close()
+        self.terminal_open("ordinary")
+        low_limit = patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001"))
+        low_limit.start()
+        self.addCleanup(low_limit.stop)
         self.full_check_due()
         self.pending_transfer()
         count = self.order_count()
@@ -253,7 +225,10 @@ class PairFullCheckTests(TestCase):
         for revoked_key in ("long", "short"):
             with self.subTest(revoked=revoked_key):
                 self.setUp()
-                self.terminal_partial_close()
+                self.terminal_open("ordinary")
+                low_limit = patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001"))
+                low_limit.start()
+                self.addCleanup(low_limit.stop)
                 self.full_check_due()
                 count = self.order_count()
                 read_members = self.engine.pairs._read_members
@@ -273,7 +248,7 @@ class PairFullCheckTests(TestCase):
                 self.assertTrue(all(leg["receipt"]["local_not_sent"] for leg in state["pending"]["repairs"]))
 
     def test_pre_upgrade_pending_keeps_prior_adoption_without_direction_times(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             with self.subTest(kind=kind):
                 self.setUp()
                 original = self.terminal_open(kind)
@@ -301,7 +276,7 @@ class PairFullCheckTests(TestCase):
                 self.assertEqual(self.order_count(), count)
                 self.assertEqual(state["owned"], original["owned"])
     def test_legacy_exact_projection_completes_without_direction_times(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             for full_check in (False, True):
                 with self.subTest(kind=kind, full_check=full_check):
                     self.setUp()
@@ -320,12 +295,7 @@ class PairFullCheckTests(TestCase):
                     self.assertIsNone(state["pending"], state["reason"])
                     self.assertEqual(self.order_count(), count)
                     self.assertNotIn("recovery_watch", state)
-                    if kind == "cycle":
-                        self.assertEqual(state["owned"], original["owned"])
-                        self.assertEqual(state["progress"]["phase"], "holding")
-                        self.assertGreater(dec(state["progress"]["quantities"]["LONG"]), 0)
-                    else:
-                        self.assertEqual(state["owned"], original["pending"]["target"])
+                    self.assertEqual(state["owned"], original["pending"]["target"])
 
     def test_full_check_with_watch_reuses_one_read_and_its_guards(self):
         for revoked in (False, True):
@@ -403,16 +373,12 @@ class PairFullCheckLiveTests(TestCase):
                 return result
 
             broker.api.call = call
-            broker.cycle_cache.configure([SYMBOL])
-            broker.cycle_cache.set_connected(True)
-            self.assertTrue(broker.cycle_cache.publish(broker.cycle_cache.begin_refresh(),
-                replace(self.paper[side].snapshot([SYMBOL]), open_orders=None), self.ticks))
 
     def order_count(self):
         return sum(len(b.state["orders"]) for b in self.paper.values())
 
     def test_all_pending_transfer_statuses_allow_verified_reductions(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             for status in ("submitting", "acknowledged", "accepted", "unknown"):
                 with self.subTest(kind=kind, status=status):
                     self.setUp()
@@ -420,8 +386,7 @@ class PairFullCheckLiveTests(TestCase):
                     self.pending_transfer(status)
                     margin = self.store.get("pair_margin:gold")
                     count = self.order_count()
-                    with patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")), \
-                         patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001")):
+                    with patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001")):
                         state = self.tick()
                     self.assertEqual(len(state["pending"]["repairs"]), 2, state["reason"])
                     self.assertEqual(self.order_count(), count + 2)
@@ -433,7 +398,7 @@ class PairFullCheckLiveTests(TestCase):
                     self.assertEqual(self.store.get("pair_margin:gold"), margin)
 
     def test_transfer_invalidation_still_revokes_full_check_repair_authority(self):
-        self.terminal_open("cycle")
+        self.terminal_open("ordinary")
         self.pending_transfer("unknown", transaction=False)
         count = self.order_count()
         config_guard = self.trader._config_guard
@@ -447,7 +412,7 @@ class PairFullCheckLiveTests(TestCase):
                     {key: self.store.account(key) for key in ("long", "short")})
 
         with patch.object(self.trader, "_config_guard", side_effect=guard), \
-             patch("trading.pair_execution.cycle_margin_limit", return_value=dec("0.000001")):
+             patch("trading.pair_execution.opening_margin_limit", return_value=dec("0.000001")):
             state = self.tick()
         self.assertTrue(revoked)
         self.assertEqual(self.order_count(), count)

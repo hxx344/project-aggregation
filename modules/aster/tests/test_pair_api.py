@@ -46,7 +46,7 @@ class PairApiTests(unittest.TestCase):
         self.assertFalse(response.json()["pair"]["enabled"])
         self.assertEqual(self.client.get("/api/pairs").json()["pairs"][0]["state"]["phase"], "paused")
         self.assertEqual(self.client.get("/api/state").json()["pairs"][0]["id"], "gold")
-        response = self.client.patch("/api/pairs/gold", json={"ordinary": {"enabled": True}, "cycle": {"enabled": False}})
+        response = self.client.patch("/api/pairs/gold", json={"ordinary": {"enabled": True}})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["pair"]["ordinary"]["enabled"])
         self.assertEqual(self.client.patch("/api/pairs/gold", json={"enabled": True}).status_code, 422)
@@ -78,7 +78,6 @@ class PairApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         state = self.f.store.get("pair_runtime:gold")
         self.assertEqual(state["owned"], {"LONG": "0.25", "SHORT": "0.5"})
-        self.assertEqual(state["progress"]["baseline"], state["owned"])
         self.assertEqual(self.client.post("/api/pairs/gold/enable").status_code, 409)
         self.assertEqual(self.f.store.get("pair_runtime:gold"), state)
 

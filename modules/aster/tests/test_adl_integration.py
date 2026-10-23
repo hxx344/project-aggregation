@@ -7,12 +7,13 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tests.helpers import Fixture, account
-from tests.test_cycle_ws_scheduler import _Future, _Harness
+from tests.scheduler_fixtures import _Future, _Harness
 from trading.adl import AdlController
 from trading.engine import Engine
 from trading.exchange import ExchangeError, LiveBroker, RequestNotSent
 from trading.models import TradingError
-from trading.pair_execution import PairTrader, runtime_default
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import runtime_default
 from trading.pairing import validate_pair
 from trading.user_stream import PrivateAccountStream
 
@@ -20,7 +21,7 @@ from trading.user_stream import PrivateAccountStream
 def paired_config(**changes):
     return validate_pair({"id": "gold", "name": "黄金", "long_account_id": "test",
                           "short_account_id": "second", "enabled": False,
-                          "cycle": {"enabled": True}, **changes})
+                          "ordinary": {"enabled": True}, **changes})
 
 
 class AdlIntegrationTests(unittest.TestCase):
@@ -31,7 +32,6 @@ class AdlIntegrationTests(unittest.TestCase):
             self.f.store.save_account({**account(aid), "enabled": False})
         self.pair = self.f.store.save_pair(paired_config(), create=True)
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.engine.brokers["test"] = self.f.broker
         self.engine.adl = Mock(tick=Mock(return_value=None), poll=Mock(return_value=None))
 
@@ -103,10 +103,9 @@ class AdlIntegrationTests(unittest.TestCase):
     def test_adl_arriving_during_snapshot_read_skips_finally_balance(self):
         pair = deepcopy(self.pair)
         pair["margin"]["enabled"] = True
+        pair["enabled"] = True
         pair = self.f.store.save_pair(pair)
         runtime = runtime_default()
-        runtime["progress"].update(quantities={"LONG": "1", "SHORT": "1"}, opened_at=0,
-                                   config={"hold_seconds": 1})
         self.f.store.put("pair_runtime:gold", runtime)
         trader = PairTrader(self.engine)
 
@@ -114,10 +113,11 @@ class AdlIntegrationTests(unittest.TestCase):
             self.engine.adl.require_clear.side_effect = TradingError("ADL 新事件")
             raise TradingError("持仓被ADL事件更新")
 
-        with patch.object(trader, "_read", side_effect=fail_read), \
+        with patch.object(trader, "_read", side_effect=fail_read) as read, \
                 patch.object(trader, "_balance", wraps=trader._balance) as balance:
             trader.tick(pair)
         balance.assert_called_once()
+        read.assert_called()
 
     def test_management_and_recovery_cannot_clear_adl_hold(self):
         self.engine.adl.require_clear.side_effect = TradingError("ADL 保持暂停")
@@ -164,7 +164,7 @@ class AdlIntegrationTests(unittest.TestCase):
 
     def test_margin_only_start_also_releases_hold_after_activation(self):
         pair = deepcopy(self.pair)
-        pair["cycle"]["enabled"] = False
+        pair["ordinary"]["enabled"] = False
         pair["margin"]["enabled"] = True
         self.f.store.save_pair(pair)
         seen = []
@@ -176,11 +176,9 @@ class AdlIntegrationTests(unittest.TestCase):
 
     def test_paused_live_pair_keeps_private_stream_without_snapshot_refresh(self):
         broker = self.make_live()
-        broker.start_cycle_hot_data = Mock()
-        broker.refresh_cycle_hot_snapshot = Mock(side_effect=AssertionError("paused pair refreshed REST"))
-        self.assertEqual(self.engine.poll_cycle_hot_data("test"), 30)
-        self.assertEqual(broker.start_cycle_hot_data.call_args.args, (["XAUUSD1"],))
-        broker.refresh_cycle_hot_snapshot.assert_not_called()
+        broker.start_private_stream = Mock()
+        self.assertEqual(self.engine.poll_private_stream("test"), 30)
+        self.assertEqual(broker.start_private_stream.call_args.args, ())
         broker.api.call.assert_not_called()
         raw = {"e": "ORDER_TRADE_UPDATE", "o": {"c": "adl_autoclose"}}
         broker._adl_on_event(raw)
@@ -367,23 +365,23 @@ class AdlPrivateStreamHookTests(unittest.TestCase):
         event_listener, state_listener = Mock(), Mock()
         broker.set_adl_listener(on_event=event_listener, on_reconnected=state_listener)
         with patch.object(PrivateAccountStream, "start"):
-            broker.start_cycle_hot_data(["XAUUSD1"])
-        token = broker._cycle_stream_token
+            broker.start_private_stream()
+        token = broker._private_stream_token
         raw = {"e": "ORDER_TRADE_UPDATE", "o": {"c": "adl_autoclose", "X": "NEW_ADL"}}
         with patch.object(broker._private_evidence, "payload") as normal:
-            broker._cycle_stream_payload(token, raw)
+            broker._private_stream_payload(token, raw)
             normal.assert_called_once_with(raw)
             event_listener.assert_called_once_with(raw)
-            broker._cycle_stream_payload(object(), raw)
+            broker._private_stream_payload(object(), raw)
             self.assertEqual(event_listener.call_count, 1)
-        broker._cycle_stream_state(token, True)
-        broker._cycle_stream_state(token, True)
-        broker._cycle_stream_state(token, False)
-        broker._cycle_stream_state(object(), True)
+        broker._private_stream_state(token, True)
+        broker._private_stream_state(token, True)
+        broker._private_stream_state(token, False)
+        broker._private_stream_state(object(), True)
         self.assertEqual(state_listener.call_count, 2)
-        broker.stop_cycle_hot_data()
-        broker._cycle_stream_payload(token, raw)
-        broker._cycle_stream_state(token, True)
+        broker.stop_private_stream()
+        broker._private_stream_payload(token, raw)
+        broker._private_stream_state(token, True)
         self.assertEqual(event_listener.call_count, 1)
         self.assertEqual(state_listener.call_count, 2)
         broker.api.call.assert_not_called()
@@ -419,8 +417,7 @@ class AdlSchedulerHookTests(unittest.TestCase):
                 harness.engine.shutdown.set()
 
         with patch.object(harness.engine, "poll_adl", side_effect=poll), \
-                patch.object(harness.engine, "poll_cycle_hot_data", return_value=30), \
-                patch.object(harness.engine, "poll_cycle_history", return_value=30), \
+                patch.object(harness.engine, "poll_private_stream", return_value=30), \
                 patch.object(harness.engine.pairs, "tick", side_effect=tick):
             harness.run(control)
         self.assertEqual([stamp for aid, stamp in history if aid == "test"], [100, 103])

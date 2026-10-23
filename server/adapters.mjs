@@ -165,7 +165,7 @@ function asterPairOrdersUnresolved(state) {
   if (!record(pending)) return true;
   if (pending.kind === 'leverage') return state.phase !== 'leverage' || !record(pending.results)
     || Object.values(pending.results).some(row => !record(row) || row.unknown);
-  if (state.phase !== 'submitting' || !['cycle', 'ordinary'].includes(pending.kind) || !['open', 'close'].includes(pending.phase)) return true;
+  if (state.phase !== 'submitting' || pending.kind !== 'ordinary' || !['open', 'close'].includes(pending.phase)) return true;
   if (!Array.isArray(pending.legs) || pending.legs.length !== 2 || !Array.isArray(pending.repairs) || pending.repairs.length) return true;
   return pending.legs.some(leg => !record(leg) || (leg.receipt == null
     ? !!(leg.error || leg.submit_error || leg.submit_evidence)
@@ -368,9 +368,10 @@ export async function readSummary(project, credentials, { request = requestJson,
       const member = paired.get(account.id);
       return [account.id, asterPairVolume(member.state, member.side, now, utcDay)];
     }));
-    const volumes = live.map(account => pairVolumes.has(account.id) ? pairVolumes.get(account.id).value
-      : account.cycle_state?.daily_volume?.utc_date === utcDay && account.cycle_state?.report_status?.status === 'ready' ? finite(account.cycle_state.daily_volume.volume) : null);
-    const volumeDetail = pairVolumes.size ? '上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总' : '上游 UTC 日口径；不计入资产汇总';
+    const volumes = [...pairVolumes.values()].map(volume => volume.value);
+    const volumeDetail = live.some(account => !paired.has(account.id))
+      ? '上游 UTC 日口径；仅统计配对组已核对成交，单账户不统计；不计入资产汇总'
+      : '上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总';
     const metrics = [metric('accounts', '启用账户', accounts.length, '个'), metric('live_accounts', '实盘账户', live.length, '个'), metric('occupied_margin', '实盘占用保证金', sum(live.map(account => finite(account.snapshot?.occupied_margin))), 'USD1'), metric('daily_volume', '实盘今日成交量', sum(volumes), 'USD1', volumeDetail)];
     const reasons = [];
     const diagnostics = asterDiagnosticCollector();
@@ -383,11 +384,10 @@ export async function readSummary(project, credentials, { request = requestJson,
     }
     for (const [index, account] of data.accounts.entries()) {
       if (account.mode !== 'live') continue;
-      const runtime = [account.cycle_state, account.migration_state].find(state => asterRuntimeKind(state) === 'action');
-      if (!account.pause_reason && account.status !== 'attention' && !runtime) continue;
+      if (!account.pause_reason && account.status !== 'attention') continue;
       const pair = allPaired.get(account.id);
       const label = pair?.label || diagnosticText(account.name || account.id, `实盘账户 ${index + 1}`);
-      diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, 'action', `${label}：${diagnosticText(account.pause_reason || runtime?.reason || account.reason, '账户需要人工核对')}`);
+      diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, 'action', `${label}：${diagnosticText(account.pause_reason || account.reason, '账户需要人工核对')}`);
     }
     for (const [index, account] of live.entries()) {
       const label = diagnosticText(account.name || account.id, `实盘账户 ${index + 1}`);
@@ -396,7 +396,7 @@ export async function readSummary(project, credentials, { request = requestJson,
         reasons.push(`${label}：${reason}`);
         diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, kind, `${pair ? pair.label : label}：${reason}`);
       };
-      const runtime = pair?.state || account.cycle_state;
+      const runtime = pair?.state;
       const runtimeKind = asterRuntimeKind(runtime);
       if (runtimeKind === 'fault') diagnostics.add(pair ? 'pair' : 'account', pair?.id || account.id || index, runtimeKind, `${pair ? pair.label : label}：${diagnosticText(runtime?.reason || runtime?.error, '订单正在核对或修复')}`);
       if (account.error) add(`账户读取失败：${diagnosticText(account.error, '上游未提供具体原因')}`);
@@ -405,18 +405,8 @@ export async function readSummary(project, credentials, { request = requestJson,
         if (!iso(account.snapshot.timestamp)) add('快照缺少有效更新时间');
         if (finite(account.snapshot.occupied_margin) === null) add('保证金数据缺失或无效');
       }
-      if (volumes[index] === null) {
-        if (pairVolumes.has(account.id)) { const volume = pairVolumes.get(account.id); add(volume.reason, volume.kind); continue; }
-        const report = account.cycle_state?.report_status;
-        const daily = account.cycle_state?.daily_volume;
-        const reason = report?.error ? `成交统计读取失败：${diagnosticText(report.error, '上游未提供具体原因')}`
-          : report?.status === 'stale' ? '成交统计已过期'
-          : report?.status === 'error' ? '成交统计读取失败，上游未提供具体原因'
-          : report?.status !== 'ready' ? '成交统计尚未就绪'
-          : daily?.utc_date !== utcDay ? '成交统计缺少当日 UTC 数据'
-          : '今日成交量缺失或无效';
-        add(reason, report?.error || report?.status === 'error' ? 'fault' : 'notice');
-      }
+      const volume = pairVolumes.get(account.id);
+      if (volume && volume.value === null) add(volume.reason, volume.kind);
     }
     return { metrics, updatedAt, partial: reasons.length > 0, diagnostics: diagnostics.values(), message: diagnosticMessage(data.demo ? '上游为演示模式；交易数据不计入资产汇总' : '保证金与成交量使用 USD1 口径', reasons) };
   }

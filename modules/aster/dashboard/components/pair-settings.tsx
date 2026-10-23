@@ -42,15 +42,10 @@ export function PairSettings({
   const field = <K extends keyof PairDraft>(key: K, value: PairDraft[K]) =>
     setDraft({ ...draft, [key]: value });
   const textField = (
-    key: Exclude<keyof PairDraft, 'cycle' | 'margin_enabled' | 'adl_enabled'>,
+    key: Exclude<keyof PairDraft, 'margin_enabled' | 'adl_enabled'>,
   ) => ({
     value: draft[key],
     onValueChange: (value: string) => setDraft({ ...draft, [key]: value }),
-  });
-  const cycleField = (key: keyof PairDraft['cycle']) => ({
-    value: String(draft.cycle[key]),
-    onValueChange: (value: string) =>
-      field('cycle', { ...draft.cycle, [key]: value }),
   });
   const eligible = availablePairAccounts(
     accounts,
@@ -88,7 +83,7 @@ export function PairSettings({
         if (!locked) void submit();
       }}
     >
-      <fieldset disabled={locked} className="cycle-form-grid">
+      <fieldset disabled={locked} className="settings-form-grid">
         <ConfigurationField
           id={`${formId}-pair-name`}
           label="配对组名称"
@@ -161,7 +156,6 @@ export function PairSettings({
             {
               monitor: '保证金管理（不开仓）',
               ordinary: '普通市价共同开仓',
-              cycle: '两子账户多空循环',
             }[draft.mode]
           }
           disabled={locked}
@@ -169,13 +163,12 @@ export function PairSettings({
           items={[
             ['monitor', '保证金管理（不开仓）'],
             ['ordinary', '普通市价共同开仓'],
-            ['cycle', '两子账户多空循环'],
           ]}
         />
       </fieldset>
-      <fieldset disabled={locked} className="cycle-form-grid pair-adl-settings">
+      <fieldset disabled={locked} className="settings-form-grid pair-adl-settings">
         <legend>ADL 应急处理</legend>
-        <div className="migration-toggle">
+        <div className="settings-toggle">
           <label htmlFor={`${formId}-pair-adl-enabled`}>ADL 后自动减仓</label>
           <Switch
             id={`${formId}-pair-adl-enabled`}
@@ -206,7 +199,7 @@ export function PairSettings({
         </p>
       </fieldset>
       {draft.mode === 'ordinary' ? (
-        <fieldset disabled={locked} className="cycle-form-grid">
+        <fieldset disabled={locked} className="settings-form-grid">
           <legend>普通开仓</legend>
           <ConfigurationField
             id={`${formId}-pair-threshold`}
@@ -258,91 +251,6 @@ export function PairSettings({
           </ConfigurationField>
         </fieldset>
       ) : null}
-      {draft.mode === 'cycle' ? (
-        <fieldset disabled={locked} className="cycle-form-grid">
-          <legend>两侧共同循环</legend>
-          <ConfigurationField
-            id={`${formId}-pair-cycle-min`}
-            label="名义价值下限"
-            unit="USD1"
-            {...cycleField('min_notional')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-max`}
-            label="名义价值上限"
-            unit="USD1"
-            {...cycleField('max_notional')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-scope`}
-            label="名义金额口径"
-            display={
-              draft.cycle.notional_scope === 'gross'
-                ? '两侧合计'
-                : '每侧分别计算'
-            }
-            items={[
-              ['per_side', '每侧分别计算'],
-              ['gross', '两侧合计'],
-            ]}
-            {...cycleField('notional_scope')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-multiplier`}
-            label="公开额度门槛倍数"
-            {...cycleField('capacity_multiplier')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-depth`}
-            label="深度价差参考金额"
-            unit="USD1 / 每侧"
-            {...cycleField('spread_notional')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-spread`}
-            label="深度价差上限"
-            unit="bp"
-            {...cycleField('spread_limit_bp')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-hold`}
-            label="最短持仓时间"
-            {...cycleField('hold_duration')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-unit`}
-            label="持仓时间单位"
-            display={draft.cycle.hold_unit === 'seconds' ? '秒' : '分钟'}
-            items={[
-              ['seconds', '秒'],
-              ['minutes', '分钟'],
-            ]}
-            {...cycleField('hold_unit')}
-            disabled={locked}
-          />
-          <ConfigurationField
-            id={`${formId}-pair-cycle-daily`}
-            label="每侧 UTC 当日成交量上限"
-            unit="USD1 · 0 为不限制"
-            {...cycleField('daily_volume_limit')}
-            disabled={locked}
-          >
-            <small>
-              两侧分别累计本组普通、循环和风险恢复成交；此上限限制新循环开仓，减回已有本轮仓位不受限制。
-            </small>
-          </ConfigurationField>
-          <p className="muted">
-            杠杆按两侧账户的实际设置核验；两侧须一致。每轮减回各自基线，不减原有普通底仓。
-          </p>
-        </fieldset>
-      ) : null}
       {pairMarginLimitFieldVisible(
         draft,
         editing ? pairs.find((pair) => pair.id === draft.id) : undefined,
@@ -356,14 +264,14 @@ export function PairSettings({
           disabled={locked}
         >
           <small>
-            普通 5x 使用基础上限；普通 10x / 20x 与循环额外加 5 个百分点，最高
+            普通 5x 使用基础上限；普通 10x / 20x 额外加 5 个百分点，最高
             100%。
           </small>
         </ConfigurationField>
       ) : null}
-      <fieldset disabled={locked} className="cycle-form-grid">
+      <fieldset disabled={locked} className="settings-form-grid">
         <legend>主账户核验与自动保证金平衡</legend>
-        <div className="migration-toggle">
+        <div className="settings-toggle">
           <label htmlFor={`${formId}-pair-margin-enabled`}>
             启用两侧可用余额平衡
           </label>

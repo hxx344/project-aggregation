@@ -65,7 +65,6 @@ assert assets, 'Built browser assets must be referenced'
 for asset in assets:
     assert client.get(asset).status_code == 200, asset
 client.close()
-app.state.engine.dashboard_reports.close()
 """
             else:
                 environment.update(STATE_FILE=str(root / "temporary-state.json"), TRADING_MODE="dry-run", LIVE_TRADING="false", AUTO_OPEN="false",

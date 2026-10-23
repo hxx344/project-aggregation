@@ -262,7 +262,6 @@ class RelayHealthEngineTests(unittest.TestCase):
         self.api.budget = RateBudget()
         self.market = MarketData(self.api, capacity_relay=self.relay, stream=Mock(), depth_stream=Mock())
         self.engine = Engine(self.store, market=self.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
         sender = patch("monitor.send_feishu")
         self.sender = sender.start()
         self.addCleanup(sender.stop)

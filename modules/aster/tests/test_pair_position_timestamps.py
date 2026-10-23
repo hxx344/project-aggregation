@@ -2,7 +2,7 @@
 import time
 from unittest import TestCase
 
-from tests.test_cycle_account_snapshot import cycle_account_responses, LocalQuoteMarket, ACCOUNT
+from tests.account_fixtures import ACCOUNT
 from tests.test_exchange_hardening import FixtureAPI, account_responses
 from trading.exchange import LiveBroker
 from trading.models import TradingError
@@ -30,16 +30,6 @@ class PairPositionTimestampTests(TestCase):
             row.update(positionAmt="0", entryPrice="0", updateTime=stamp)
         broker = LiveBroker({}, DemoMarket(), api=FixtureAPI(responses))
         self.assertEqual([p.update_time for p in broker.snapshot(["XAUUSD1"]).pair("XAUUSD1")], stamps)
-
-    def test_account_cycle_snapshot_preserves_direction_times_without_risk_read(self):
-        responses = cycle_account_responses()
-        stamps = [int(time.time() * 1000) - 2000, int(time.time() * 1000) - 1000]
-        for row, stamp in zip(responses[ACCOUNT]["positions"], stamps):
-            row["updateTime"] = stamp
-        api = FixtureAPI(responses)
-        broker = LiveBroker({}, LocalQuoteMarket(), api=api)
-        self.assertEqual([p.update_time for p in broker.cycle_snapshot(["XAUUSD1"]).pair("XAUUSD1")], stamps)
-        self.assertNotIn("/fapi/v3/positionRisk", [call[1] for call in api.calls])
 
     def test_missing_time_is_not_replaced_by_request_or_account_time(self):
         responses = account_responses()

@@ -94,7 +94,7 @@ class PairRecoveryBudgetTests(TestCase):
                             for broker in self.live.values()))
 
     def test_changed_positions_use_same_full_read_for_existing_repair_decision(self):
-        from tests.test_cycle_account_snapshot import ACCOUNT, RISK, risk_row
+        from tests.account_fixtures import ACCOUNT, RISK, risk_row
         original, budget = self.prepare(review=True)
         rows = self.broker('short').api.responses[ACCOUNT]['positions']
         for row in rows:

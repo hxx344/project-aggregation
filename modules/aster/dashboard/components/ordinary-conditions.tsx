@@ -60,10 +60,8 @@ function Check({
 
 export function OrdinaryConditions({
   view,
-  cycleSymbolActive,
 }: {
   view: View;
-  cycleSymbolActive: boolean;
 }) {
   return (
     <div className="ordinary-conditions compact-conditions">
@@ -71,12 +69,12 @@ export function OrdinaryConditions({
         当前品种持仓杠杆：
         {view.currentLeverage === null
           ? '未核验'
-          : `${view.currentLeverage}x${cycleSymbolActive ? '（循环品种）' : ''}`}
+          : `${view.currentLeverage}x`}
         ； 普通最低开仓杠杆：
         {view.minimumLeverage === null ? '未核验' : `${view.minimumLeverage}x`}
         。
       </p>
-      {!cycleSymbolActive && view.leverageConstraint ? (
+      {view.leverageConstraint ? (
         <p className="ordinary-conditions-context amber">
           {view.leverageConstraint === 'unsupported'
             ? `当前 ${view.currentLeverage}x 不在普通开仓支持的 5x / 10x / 20x 档位内，当前不能普通新增。可升档位与后续处理请查看执行原因。`

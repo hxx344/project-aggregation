@@ -72,7 +72,6 @@ function sampleView(
 ): {
   view: RelaySampleView;
   cacheFresh: boolean;
-  cycleFresh: boolean;
   isOi: boolean;
   isHttp: boolean;
 } {
@@ -98,8 +97,6 @@ function sampleView(
   const maxAge = Math.min(limit, sample.kind === 'oi' ? 8 : 300);
   const known = kindKnown && sourceKnown && validLimit && ageSeconds !== null;
   const fresh = known && ageSeconds <= maxAge;
-  const cycleFresh =
-    sample.kind !== 'oi' || (ageSeconds !== null && ageSeconds <= 1);
   const inactive = !relay.enabled || relay.closed;
   const freshness = stale
     ? '最近记录 · 时效待更新'
@@ -111,9 +108,7 @@ function sampleView(
           ? '缓存已过期'
           : sample.kind === 'brackets'
             ? '档位缓存有效'
-            : cycleFresh
-              ? '额度缓存有效 · 1 秒内'
-              : '额度缓存有效 · 已超循环 1 秒要求';
+            : '额度缓存有效';
   return {
     view: {
       key: `${sample.kind}:${sample.symbol}:${index}`,
@@ -137,10 +132,9 @@ function sampleView(
       freshness:
         !stale && !inactive && known ? `采集时 · ${freshness}` : freshness,
       tone:
-        stale || inactive ? 'muted' : fresh && cycleFresh ? 'good' : 'warning',
+        stale || inactive ? 'muted' : fresh ? 'good' : 'warning',
     },
     cacheFresh: !stale && !inactive && fresh,
-    cycleFresh,
     isOi: sample.kind === 'oi',
     isHttp: sample.source === 'http',
   };
@@ -221,9 +215,6 @@ export function capacityRelayView(
   const freshRows = records.filter((sample) => sample.cacheFresh);
   const freshHttp = freshRows.filter((sample) => sample.isHttp).length;
   const freshOi = freshRows.filter((sample) => sample.isOi).length;
-  const cycleExpired = freshRows.some(
-    (sample) => sample.isOi && !sample.cycleFresh,
-  );
   const retry = relay.ws?.retry_in_seconds;
   const connection = !relay.enabled
     ? '副服务器未启用'
@@ -252,7 +243,7 @@ export function capacityRelayView(
         ? '未提供样本时效'
         : !freshRows.length
           ? `${httpActive ? 'HTTP 补取中 · ' : ''}${samples.length ? '暂无有效缓存' : '等待有效样本'}`
-          : `${freshHttp ? 'HTTP 补取样本有效 · ' : httpActive ? 'HTTP 补取中 · ' : ''}${freshRows.length} 项缓存有效${freshOi ? (cycleExpired ? ' · 循环额度已过期' : '') : ' · 无有效公开额度'}${freshRows.length < samples.length ? ' · 部分时效异常' : ''}`;
+          : `${freshHttp ? 'HTTP 补取样本有效 · ' : httpActive ? 'HTTP 补取中 · ' : ''}${freshRows.length} 项缓存有效${freshOi ? '' : ' · 无有效公开额度'}${freshRows.length < samples.length ? ' · 部分时效异常' : ''}`;
   const note = connectionError
     ? `主服务器连接异常，显示最近记录，无法确认当前连接和样本时效。${SAMPLE_NOTE}`
     : stale

@@ -124,8 +124,8 @@ jobs:
       fail-fast: false
       matrix:
         # listed: the original four groups; discovered: every other module not
-        # in deploy/test-exclusions.txt; slow: the two ~50 s methods apart.
-        part: [listed, discovered, slow]
+        # in deploy/test-exclusions.txt.
+        part: [listed, discovered]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

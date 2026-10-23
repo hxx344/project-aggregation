@@ -10,11 +10,8 @@ import httpx
 
 from trading.depth import DEPTH_RESYNC_INTERVAL
 from trading.depth_stream import PublicDepthStream
-from trading.engine import Engine
-from trading.exchange import API, BudgetWait, ExchangeError, LiveBroker, MarketData, RateBudget
-from trading.migration import DEFAULT_MIGRATION
-from trading.models import SYMBOLS, TradingError
-from tests.helpers import Fixture
+from trading.exchange import API, ExchangeError, MarketData, RateBudget
+from trading.models import TradingError
 
 
 SYMBOL = "CLUSD1"
@@ -143,52 +140,6 @@ class WSDepthIntegrationTests(unittest.TestCase):
         with self.assertRaises(ExchangeError):
             self.market.depth(SYMBOL)
         self.assertEqual(len(self.calls), 1)
-
-
-class MigrationDepthAdmissionTests(unittest.TestCase):
-    def test_valid_plan_still_reserves_full_private_mode_recheck_and_submission(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        account = fixture.store.account("test")
-        account["migration"] = {**DEFAULT_MIGRATION, "enabled": True}
-        fixture.store.save_account(account)
-        for side in ("LONG", "SHORT"):
-            fixture.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "1", "entry": "4412.01"}
-        engine = Engine(fixture.store, demo=True, market=fixture.market)
-        for symbol in SYMBOLS:
-            engine.poll_market(symbol)
-        broker = Mock(spec=LiveBroker)
-        broker.api = Mock()
-        broker.api.budget = RateBudget(capacity_reserve=180)
-        broker.api.budget.reserve(1250)
-        broker.snapshot_weight.return_value = 79
-        with self.assertRaises(BudgetWait):
-            engine.tick_migration(account, fixture.broker.snapshot(SYMBOLS), broker)
-        broker.snapshot_weight.assert_called_once_with(list(SYMBOLS), fresh_modes=True)
-        broker.snapshot.assert_not_called()
-        broker.submit.assert_not_called()
-        self.assertIsNone(fixture.store.intent("test"))
-
-    def test_healthy_depth_can_be_evaluated_without_sixty_phantom_weight(self):
-        fixture = Fixture()
-        self.addCleanup(fixture.close)
-        account = fixture.store.account("test")
-        account["migration"] = {**DEFAULT_MIGRATION, "enabled": True}
-        fixture.store.save_account(account)
-        for side in ("LONG", "SHORT"):
-            fixture.broker.state["positions"]["XAUUSD1:" + side] = {"qty": "1", "entry": "4412.01"}
-        engine = Engine(fixture.store, demo=True, market=fixture.market)
-        for symbol in SYMBOLS:
-            engine.poll_market(symbol)
-        broker = Mock(spec=LiveBroker)
-        broker.api = Mock()
-        broker.api.budget = RateBudget(capacity_reserve=180)
-        broker.api.budget.reserve(1300)
-        with patch("trading.engine.plan_migration", side_effect=TradingError("no valid plan")) as plan:
-            engine.tick_migration(account, fixture.broker.snapshot(SYMBOLS), broker)
-        self.assertEqual(plan.call_count, 2)
-        self.assertEqual(broker.api.budget.weight, 1300)
-        broker.snapshot.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -30,7 +30,6 @@ function fixture() {
     short_account_id: 'b',
     enabled: true,
     ordinary: { enabled: false },
-    cycle: { enabled: false },
     margin: { enabled: true, check_interval_seconds: 5 },
     state: {
       phase: 'monitoring',
@@ -74,13 +73,12 @@ test('funds-only summary uses the selected member balance and does not borrow ol
   assert.deepEqual({ account, pair }, before);
 });
 
-test('standalone, unrelated, ordinary and cycle accounts retain the full snapshot and original warning', () => {
+test('standalone, unrelated, ordinary accounts retain the full snapshot and original warning', () => {
   const { account, pair } = fixture();
   for (const binding of [
     undefined,
     { ...pair, long_account_id: 'c' },
     { ...pair, ordinary: { enabled: true } },
-    { ...pair, cycle: { enabled: true } },
     { ...pair, ordinary: {} },
     { ...pair, margin: { enabled: false } },
   ]) {

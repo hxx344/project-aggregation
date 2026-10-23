@@ -23,7 +23,7 @@ export const notificationTypes: {
   {
     key: 'trade_summary',
     title: '普通开仓成交汇总',
-    description: '普通开仓结束后按币种汇总；循环与迁移只记录本地历史。',
+    description: '普通开仓结束后按币种汇总。',
   },
   {
     key: 'position_imbalance',

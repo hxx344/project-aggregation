@@ -99,13 +99,15 @@ def _lock_reason(reader, pair, runtime, raw_incident, pending_event):
     margin = reader.get("pair_margin:" + pair["id"], {})
     if not isinstance(runtime, dict) or not isinstance(margin, dict):
         return "配对组或保证金日志无效，请先核对"
-    from .pairing import has_cycle_quantity
+    from .pair_legacy import has_legacy_cycle, LEGACY_CYCLE_REASON
     try:
-        pending = runtime.get("pending") is not None or has_cycle_quantity(runtime)
+        if has_legacy_cycle(runtime, reader):
+            return LEGACY_CYCLE_REASON
+        pending = runtime.get("pending") is not None
     except (TradingError, ValueError, TypeError):
         pending = True
     if pending:
-        return "配对组仍在核对订单或减回本轮循环持仓，暂不能修改设置"
+        return "配对组仍在核对订单，暂不能修改设置"
     if margin.get("pending") is not None or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown"):
         return "保证金划转结果尚未核实，暂不能修改设置"
     return ""

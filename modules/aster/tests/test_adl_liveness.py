@@ -6,7 +6,7 @@ from tests import test_adl_controller as fixtures
 from trading import adl
 from trading.exchange import BudgetWait
 from trading.models import TradingError
-from trading.pair_execution import runtime_default
+from tests.pair_legacy_fixtures import runtime_default
 
 
 class AdlLivenessTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class AdlLivenessTests(unittest.TestCase):
         with broker._snapshot_lock:
             if not broker._private_evidence.connected:
                 broker._private_evidence.reset(True)
-            broker._cycle_account_event("ORDER_TRADE_UPDATE")
+            broker._private_account_event("ORDER_TRADE_UPDATE")
             broker._private_evidence.payload(event)
         self.assertIsNotNone(broker.order_event_receipt(order, include_active=True))
 

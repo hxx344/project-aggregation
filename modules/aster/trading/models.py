@@ -238,11 +238,9 @@ class AccountSnapshot:
     timestamp: float
     fees: dict[str, Decimal] = field(default_factory=dict)
     brackets: dict[str, list[dict]] = field(default_factory=dict)
-    # Account-reported total cap at this exact current leverage. Cycle additions
+    # Account-reported total cap at this exact current leverage. Additions
     # must subtract existing gross exposure before consuming the remaining room. It is not a tier table for selecting another leverage.
     current_leverage_caps: dict[str, tuple[int, Decimal]] = field(default_factory=dict)
-    # Conditional tier-derived caps retain the original five-second cache age.
-    cycle_cap_cached_at: dict[str, float] = field(default_factory=dict)
 
     @property
     def total_notional(self):
@@ -292,9 +290,6 @@ class AccountSnapshot:
         age = (time.time() if now is None else now) - self.timestamp
         if not -1 <= age <= max_age:
             raise TradingError("账户快照已过期")
-        for stamp in self.cycle_cap_cached_at.values():
-            if (type(stamp) not in (int, float) or not 0 <= time.monotonic() - stamp < 5):
-                raise TradingError("账户风控档位查询已过期，等待重试")
 
     def require_ready(self, symbol, now=None):
         self.require_fresh(now)
@@ -372,20 +367,6 @@ def opening_margin_limit(policy, leverage):
     base = Fraction(dec(policy["margin_limit"]))
     bonus = EXTRA_MARGIN_ALLOWANCE if leverage in (10, 20) else Fraction(0)
     return decimal_value(min(Fraction(1), base + bonus), exact=True)
-
-
-def migration_margin_limit(policy):
-    """Migration at every tier shares the same account-wide five-point allowance."""
-    base = Fraction(dec(policy["margin_limit"]))
-    return decimal_value(min(Fraction(1), base + EXTRA_MARGIN_ALLOWANCE), exact=True)
-
-
-def cycle_margin_limit(policy):
-    """Every cycle leverage shares five points above the account base limit."""
-    base = Fraction(positive(policy["margin_limit"]))
-    if base > 1:
-        raise TradingError("循环账户保证金基础上限不得超过 100%")
-    return decimal_value(min(Fraction(1), base + EXTRA_MARGIN_ALLOWANCE), exact=True)
 
 
 def plan_pair(snapshot, book, rules, capacities, policy, now=None):

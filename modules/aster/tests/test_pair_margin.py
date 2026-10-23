@@ -343,7 +343,7 @@ class PairMarginTests(unittest.TestCase):
                 result = self.balancer.tick(self.pair, {**snapshots, "long": changed})
                 self.assertEqual(result["status"], "blocked", result)
         self.ready()
-        self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
         self.assertEqual(self.balancer.tick(self.pair, snapshots)["status"], "blocked")
         self.assertEqual(self.master_calls, [])
         self.assertEqual(self.transfers, [])
@@ -858,7 +858,7 @@ class PairMarginTests(unittest.TestCase):
 
     def test_revoked_original_snapshot_aborts_before_live_reads(self):
         snapshots = self.live()
-        self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "blocked")
         self.assertIn("失效", result["reason"])
@@ -875,7 +875,7 @@ class PairMarginTests(unittest.TestCase):
                 def changed(method, path, *args, **kwargs):
                     response = original(method, path, *args, **kwargs)
                     if path.endswith("/accountWithJoinMargin"):
-                        self.brokers[side]._cycle_account_event("ACCOUNT_UPDATE")
+                        self.brokers[side]._private_account_event("ACCOUNT_UPDATE")
                     return response
 
                 with patch.object(self.brokers[side].api, "call", side_effect=changed):
@@ -891,7 +891,7 @@ class PairMarginTests(unittest.TestCase):
         def commit_then_event(key, value):
             original(key, value)
             if key == "pair_margin:gold" and (value.get("pending") or {}).get("status") == "submitting":
-                self.brokers["short"]._cycle_account_event("ORDER_TRADE_UPDATE")
+                self.brokers["short"]._private_account_event("ORDER_TRADE_UPDATE")
 
         with patch.object(self.store, "put", side_effect=commit_then_event):
             result = self.balancer.tick(self.pair, snapshots)
@@ -913,7 +913,7 @@ class PairMarginTests(unittest.TestCase):
             def sign_then_event(params):
                 result = original(params)
                 signed.append(True)
-                self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+                self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
                 return result
 
             api.signed_parameters = sign_then_event
@@ -930,7 +930,7 @@ class PairMarginTests(unittest.TestCase):
         snapshots = self.live()
         for side in ("long", "short"):
             del snapshots[side].account_read_generation
-            self.brokers[side]._cycle_account_event("ACCOUNT_UPDATE")
+            self.brokers[side]._private_account_event("ACCOUNT_UPDATE")
         result = self.balancer.tick(self.pair, snapshots)
         self.assertEqual(result["status"], "acknowledged")
         self.assertCountEqual(self.refreshed[:2], ["long", "short"])
@@ -950,7 +950,7 @@ class PairMarginTests(unittest.TestCase):
                 current = original()
                 barrier.wait()
                 if side == "short":
-                    self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+                    self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
                 return current
 
             broker.transfer_snapshot = fresh

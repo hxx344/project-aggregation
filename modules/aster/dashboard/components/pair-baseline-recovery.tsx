@@ -136,7 +136,7 @@ export function PairBaselineRecovery({
         }}
       >
         <DialogContent
-          className="cycle-recovery-dialog sm:max-w-2xl"
+          className="order-recovery-dialog sm:max-w-2xl"
           showCloseButton={!loading}
         >
           <DialogHeader>

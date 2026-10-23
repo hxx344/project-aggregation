@@ -29,7 +29,6 @@ class HourlyNotificationEngineTests(unittest.TestCase):
         self.f = Fixture()
         self.addCleanup(self.f.close)
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
         sender = patch("monitor.send_feishu")
         self.sender = sender.start()
         self.addCleanup(sender.stop)
@@ -52,7 +51,7 @@ class HourlyNotificationEngineTests(unittest.TestCase):
             formatter.assert_not_called()
             self.now = 3600
             self.engine.notify()
-            state.assert_called_once_with(background_reports=True, compact=True)
+            state.assert_called_once_with()
             formatter.assert_called_once_with({"snapshot": "cached"}, 3600)
             self.engine.notify()
             self.assertEqual(state.call_count, 1)
@@ -105,7 +104,7 @@ class HourlyNotificationEngineTests(unittest.TestCase):
             state = stack.enter_context(patch.object(self.engine, "state", wraps=self.engine.state))
             formatter = stack.enter_context(patch("trading.engine.format_hourly_summary", wraps=format_hourly_summary))
             self.engine.notify()
-            state.assert_called_once_with(background_reports=True, compact=True)
+            state.assert_called_once_with()
             formatter.assert_called_once()
             for read in reads:
                 read.assert_not_called()
@@ -231,7 +230,7 @@ class StartupHourlyNotificationTests(unittest.TestCase):
         self.f.store.put("hourly_summary_schedule", {"next_due_at": 3600, "last_sent_at": None})
 
     def run_scheduler(self, control, rules_effect, *, notify_effect=None):
-        from tests.test_cycle_ws_scheduler import _Pool, _SchedulerEvent
+        from tests.scheduler_fixtures import _Pool, _SchedulerEvent
         from tests.test_pair_capacity_cadence import save_ordinary_pair
         save_ordinary_pair(self.f.store)
         self.iteration, self.failure, self.control = 0, None, control
@@ -245,7 +244,6 @@ class StartupHourlyNotificationTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("trading.engine.ThreadPoolExecutor", return_value=_Pool()))
             stack.enter_context(patch("trading.engine.time.monotonic", side_effect=lambda: self.now))
-            stack.enter_context(patch.object(self.engine.dashboard_reports, "start"))
             rules = stack.enter_context(patch.object(self.f.market, "load_rules", side_effect=rules_effect))
             for name in ("tick_account", "poll_market", "poll_book", "poll_depth"):
                 stack.enter_context(patch.object(self.engine, name, side_effect=job(name)))
@@ -280,7 +278,7 @@ class StartupHourlyNotificationTests(unittest.TestCase):
         self.assert_startup_summaries(7200)
 
     def test_pending_notification_never_overlaps_during_startup_backoff(self):
-        from tests.test_cycle_ws_scheduler import _Future
+        from tests.scheduler_fixtures import _Future
         first = _Future(5, done=False)
         submissions = []
         def notify():
@@ -305,7 +303,7 @@ class StartupHourlyNotificationTests(unittest.TestCase):
         self.assertEqual(jobs, [])
 
     def test_rule_recovery_preserves_retry_deadline_and_resumes_original_jobs(self):
-        from tests.test_cycle_ws_scheduler import _Future
+        from tests.scheduler_fixtures import _Future
         attempts = []
         def load_rules():
             attempts.append(self.now)
@@ -329,7 +327,7 @@ class StartupHourlyNotificationTests(unittest.TestCase):
         notify.assert_called_once()
 
     def test_startup_notification_failure_keeps_worker_backoff_and_rule_retry_independent(self):
-        from tests.test_cycle_ws_scheduler import _Future
+        from tests.scheduler_fixtures import _Future
         times = {1: 3500.1, 2: 3529.9, 3: 3530.1}
         def control(step):
             if step in times:

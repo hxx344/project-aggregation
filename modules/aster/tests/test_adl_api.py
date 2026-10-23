@@ -13,7 +13,6 @@ class AdlApiTests(unittest.TestCase):
     login = pair_api_cases.PairApiTests.login
 
     def test_report_requires_login_and_returns_friendly_missing_states(self):
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.assertEqual(self.client.get("/api/pairs/gold/adl-report").status_code, 401)
         self.login()
         self.assertEqual(self.client.get("/api/pairs/gold/adl-report").status_code, 404)
@@ -23,7 +22,6 @@ class AdlApiTests(unittest.TestCase):
         self.assertIn("暂无 ADL", response.text)
 
     def test_create_edit_strict_nested_values_and_origin(self):
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.login()
         for adl in (None, {}, [], {"enabled": "false"}, {"enabled": 0}, {"enabled": None},
                     {"batch_notional": 25}, {"batch_notional": None}, {"extra": 1}):
@@ -42,7 +40,6 @@ class AdlApiTests(unittest.TestCase):
                 self.assertEqual(self.client.patch("/api/pairs/gold", json={"adl": {"batch_notional": amount}}).status_code, 409)
 
     def test_report_get_is_read_only_and_does_not_publish_internal_state(self):
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.login()
         self.assertEqual(self.client.post("/api/pairs", json=pair_config()).status_code, 200)
         item = {**incident(), "pair_id": "gold", "hold": True, "accounts": {"private": "hidden-account"},

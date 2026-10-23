@@ -84,7 +84,6 @@ test('legacy pair defaults and explicit disabled config round trip through saved
 const pairWith = (status, hold = true) => ({
   enabled: false,
   ordinary: { enabled: false },
-  cycle: { enabled: false },
   margin: { enabled: true },
   state: {
     adl: {

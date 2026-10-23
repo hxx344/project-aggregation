@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from tests.helpers import Fixture, account
-from tests.test_cycle_ws_scheduler import _Harness, _Pool
+from tests.scheduler_fixtures import _Harness, _Pool
 from trading.engine import Engine
 from trading.exchange import API, MarketData, RateBudget
 from trading.models import SYMBOLS, dec
@@ -21,7 +21,7 @@ def save_ordinary_pair(store, pair_id="gold", long_id="test", short_id="second")
     return store.save_pair(validate_pair({
         "id": pair_id, "name": pair_id, "long_account_id": long_id,
         "short_account_id": short_id, "enabled": True,
-        "ordinary": {"enabled": True}, "cycle": {"enabled": False},
+        "ordinary": {"enabled": True},
     }), create=True)
 
 
@@ -31,7 +31,6 @@ class PairCapacityCadenceTests(unittest.TestCase):
         self.addCleanup(self.f.close)
         self.pair = save_ordinary_pair(self.f.store)
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
 
     def targets(self):
         return self.engine.fast_capacity_targets(self.f.store.accounts())
@@ -79,12 +78,9 @@ class PairCapacityCadenceTests(unittest.TestCase):
         self.assertEqual(self.engine.capacity_market_symbols(), {XAU, CL})
         self.assertEqual(self.targets()[CL], {5})
 
-    def test_migration_and_paused_pending_account_preserve_needed_markets(self):
+    def test_paused_pending_account_preserves_needed_markets(self):
         independent = account("independent")
-        independent["migration"] = {"enabled": True}
-        self.f.store.save_account(independent)
-        self.assertEqual(self.engine.capacity_market_symbols(), set(SYMBOLS))
-        independent.update(enabled=False, migration={"enabled": False})
+        independent.update(enabled=False)
         self.f.store.save_account(independent)
         self.f.store.save_intent({"id": "unfinished", "account_id": "independent",
                                 "kind": "pair", "status": "pending", "symbol": SPCX})
@@ -98,7 +94,6 @@ class PairCapacityCadenceTests(unittest.TestCase):
                 self.pending({"id": "uncertain", "kind": kind, "phase": "open"})
                 self.assertEqual(self.targets(), {})
                 restarted = Engine(self.f.store, market=self.f.market)
-                self.addCleanup(restarted.dashboard_reports.close)
                 self.assertEqual(restarted.fast_capacity_targets(self.f.store.accounts()), {})
                 self.assertEqual(restarted.capacity_market_symbols(), {XAU})
         self.pending(None)
@@ -212,7 +207,6 @@ class PairCapacitySchedulerTests(unittest.TestCase):
         self.f = Fixture()
         self.addCleanup(self.f.close)
         self.h = _Harness(self.f)
-        self.addCleanup(self.h.engine.dashboard_reports.close)
         save_ordinary_pair(self.f.store)
         self.h.api.budget = RateBudget()
 

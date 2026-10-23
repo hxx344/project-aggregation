@@ -3,9 +3,9 @@ from fractions import Fraction
 from unittest import TestCase
 from unittest.mock import patch
 
-from tests.test_cycle_account_snapshot import (
+from tests.account_fixtures import (
     ACCOUNT, BRACKET, MULTI, RISK, SYMBOL, LocalQuoteMarket,
-    account_row, cycle_account_responses, risk_row,
+    account_row, join_margin_responses, risk_row,
 )
 from tests.test_exchange_hardening import FixtureAPI
 from trading.exchange import LiveBroker
@@ -18,7 +18,7 @@ DUAL = "/fapi/v3/positionSide/dual"
 
 class MarginAccountSnapshotTests(TestCase):
     def broker(self, extra=None):
-        responses = cycle_account_responses()
+        responses = join_margin_responses()
         if extra:
             responses[ACCOUNT]["positions"].append(extra)
         responses[DUAL] = {"dualSidePosition": True}
@@ -64,7 +64,7 @@ class MarginAccountSnapshotTests(TestCase):
         broker, api, _ = self.broker()
         result = broker.margin_snapshot([SYMBOL])
         broker.require_snapshot_current(result)
-        broker._cycle_account_event("ACCOUNT_UPDATE")
+        broker._private_account_event("ACCOUNT_UPDATE")
         with self.assertRaisesRegex(TradingError, "失效"):
             broker.require_snapshot_current(result)
         original = api.call
@@ -72,7 +72,7 @@ class MarginAccountSnapshotTests(TestCase):
         def event_during_read(method, path, *args, **kwargs):
             response = original(method, path, *args, **kwargs)
             if path == RISK:
-                broker._cycle_account_event("ACCOUNT_UPDATE")
+                broker._private_account_event("ACCOUNT_UPDATE")
             return response
 
         with patch.object(api, "call", side_effect=event_during_read):
@@ -82,7 +82,7 @@ class MarginAccountSnapshotTests(TestCase):
     def test_account_modes_and_staleness_are_not_relaxed(self):
         broker, api, _ = self.broker()
         broker.margin_snapshot([SYMBOL], reuse_account_mode=True)
-        broker._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        broker._private_account_event("ACCOUNT_CONFIG_UPDATE")
         api.responses[DUAL] = {"dualSidePosition": False}
         result = broker.margin_snapshot([SYMBOL], reuse_account_mode=True)
         with self.assertRaises(AccountModeError):

@@ -42,7 +42,7 @@ function text(value: unknown, fallback = ''): string {
 
 function pendingOrders(pair: Pair): Record<string, unknown> | undefined {
   const pending = record(record(record(pair)?.state)?.pending);
-  return pending?.kind === 'ordinary' || pending?.kind === 'cycle'
+  return pending?.kind === 'ordinary'
     ? pending
     : undefined;
 }

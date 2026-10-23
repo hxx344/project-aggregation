@@ -16,6 +16,7 @@ from eth_account import Account
 import httpx
 
 from tests.helpers import account
+from trading import margin_balance
 from trading.account_writer import ManagedWriter
 from trading.exchange import API, LiveBroker, RateBudget, RequestNotSent, TransferRejected
 from trading.margin_balance import MarginBalancer, TransferAPI
@@ -54,7 +55,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
             self.store.save_account(member)
         self.pair = self.store.save_pair(validate_pair({"id": "gold", "name": "gold", "enabled": True,
             "long_account_id": "long", "short_account_id": "short", "ordinary": {"enabled": False},
-            "cycle": {"enabled": False}, "margin": {"enabled": True, "master_env_prefix": "ASTER_MASTER"}}), create=True)
+            "margin": {"enabled": True, "master_env_prefix": "ASTER_MASTER"}}), create=True)
         self.requests = []
         self.fail_dispatch = False
         self.reject_code = None
@@ -148,18 +149,19 @@ class ManagedMarginTransferTests(unittest.TestCase):
         return self.writer
 
     def veto_next_send(self):
-        broker = self.engine.brokers["long"]
-        original = broker.discard_cycle_hot_snapshot
+        original = margin_balance.TransferAPI
         vetoed = False
 
-        def veto_once(*args, **kwargs):
-            nonlocal vetoed
-            if not vetoed:
-                vetoed = True
-                raise RequestNotSent("injected local veto")
-            return original(*args, **kwargs)
+        def make(*args, before_submit, **kwargs):
+            def veto_once():
+                nonlocal vetoed
+                if not vetoed:
+                    vetoed = True
+                    raise RequestNotSent("injected local veto")
+                return before_submit()
+            return original(*args, before_submit=veto_once, **kwargs)
 
-        return patch.object(broker, "discard_cycle_hot_snapshot", side_effect=veto_once)
+        return patch("trading.margin_balance.TransferAPI", side_effect=make)
 
     def unsettled_rejection(self):
         with self.veto_next_send(), \
@@ -186,7 +188,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.engine.registration_lock = threading.RLock()
         self.engine.accounts_generation = 0
         self.engine.account_lock = lambda aid: locks[aid]
-        self.engine.revoke_cycle_hot_data = lambda *args: None
+        self.engine.revoke_account_reads = lambda *args: None
         self.engine.adl = SimpleNamespace(require_clear=lambda *args, **kwargs: None)
         self.engine.demo = False
         self.engine.pairs = PairManager(self.engine)
@@ -216,18 +218,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertIn("ACCOUNT_UNRESOLVED", result["reason"])
 
     def test_before_submit_rejection_does_not_poison_shared_transfer(self):
-        broker = self.engine.brokers["long"]
-        original = broker.discard_cycle_hot_snapshot
-        vetoed = False
-
-        def veto_once(*args, **kwargs):
-            nonlocal vetoed
-            if not vetoed:
-                vetoed = True
-                raise RequestNotSent("injected local veto")
-            return original(*args, **kwargs)
-
-        with patch.object(broker, "discard_cycle_hot_snapshot", side_effect=veto_once):
+        with self.veto_next_send():
             result = self.balancer.tick(self.pair, self.snapshots())
         self.assertEqual(self.posts(), [], result)
         self.assertEqual(result["status"], "rejected", result)

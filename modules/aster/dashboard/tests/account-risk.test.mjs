@@ -11,8 +11,7 @@ test('missing and invalid account risk limits remain unknown without a savable d
     assert.equal(view.marginPercent, null);
     assert.equal(view.marginDraft, '');
     assert.equal(view.highMarginPercent, null);
-    assert.equal(view.migrationMarginPercent, null);
-    assert.equal(view.upperRiskLimit, null);
+    assert.equal(view.highMarginLimit, null);
     assert.equal(view.riskAccent, 'muted');
     assert.throws(() => marginLimitFromPercent(view.marginDraft), /风险约束/);
   }
@@ -22,22 +21,20 @@ test('reported derived limits remain visible but cannot replace a missing base r
   const view = accountRiskView(
     {
       policy: {},
-      risk_limits: { high_leverage: '0.55', migration: '0.6', cycle: '0.7' },
+      risk_limits: { high_leverage: '0.55' },
     },
     0.52,
   );
   assert.equal(view.marginPercent, null);
   assert.equal(view.marginDraft, '');
   assert.equal(view.highMarginPercent, '55');
-  assert.equal(view.migrationMarginPercent, '60');
-  assert.equal(view.cycleMarginPercent, '70');
   assert.equal(view.riskAccent, 'muted');
 });
 
-test('confirmed limits preserve exact drafts, existing risk colors and cycle limits', () => {
+test('confirmed limits preserve exact drafts and existing risk colors', () => {
   const account = {
     policy: { margin_limit: '0.5' },
-    risk_limits: { high_leverage: '0.55', cycle: '0.6' },
+    risk_limits: { high_leverage: '0.55' },
   };
   for (const [ratio, accent] of [
     [0.49, 'mint'],
@@ -47,10 +44,6 @@ test('confirmed limits preserve exact drafts, existing risk colors and cycle lim
   ]) {
     assert.equal(accountRiskView(account, ratio).riskAccent, accent);
   }
-  const cycle = accountRiskView({ ...account, cycle: { enabled: true } }, 0.56);
-  assert.equal(cycle.riskAccent, 'amber');
-  assert.equal(cycle.upperRiskPercent, '60');
-  assert.equal(cycle.migrationMarginPercent, '55');
   assert.equal(
     accountRiskView({ policy: { margin_limit: '0.333000000000000001' } }, 0)
       .marginDraft,

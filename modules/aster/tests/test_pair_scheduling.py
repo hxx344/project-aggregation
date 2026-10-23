@@ -3,7 +3,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests.helpers import Fixture, account
-from tests.test_cycle_ws_scheduler import _Harness, _Future
+from tests.scheduler_fixtures import _Harness, _Future
 from trading.pairing import validate_pair
 
 
@@ -16,7 +16,7 @@ class PairSchedulingTests(TestCase):
             fixture.store.save_account({**account(aid), "enabled": False})
         fixture.store.save_pair(validate_pair({"id": "gold", "name": "黄金",
             "long_account_id": "test", "short_account_id": "second",
-            "enabled": True, "cycle": {"enabled": True}}), create=True)
+            "enabled": True}), create=True)
         held, calls = _Future(60, done=False), []
 
         def tick(pair_id):

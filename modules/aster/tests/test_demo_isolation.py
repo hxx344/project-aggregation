@@ -54,7 +54,6 @@ class DemoIsolationTests(unittest.TestCase):
     def test_factory_default_demo_is_separate_and_allows_anonymous_paper_state(self):
         normal = self.app()
         demo = self.app(demo=True)
-        self.addCleanup(demo.state.engine.dashboard_reports.close)
         self.assertEqual(normal.state.engine.store.path, (self.root / "runtime/trading/trading.sqlite3").resolve())
         self.assertEqual(demo.state.engine.store.path, (self.root / "runtime/demo/trading.sqlite3").resolve())
         with TestClient(normal) as client:
@@ -282,7 +281,6 @@ class DemoIsolationTests(unittest.TestCase):
         bound = Store(self.root / "bound.sqlite3")
         bound.bind_runtime_mode(demo=True)
         engine = Engine(bound, demo=True, market=DemoMarket())
-        self.addCleanup(engine.dashboard_reports.close)
         app = self.app(engine=engine)
         with TestClient(app) as client:
             self.assertEqual(client.get("/api/state").status_code, 200)

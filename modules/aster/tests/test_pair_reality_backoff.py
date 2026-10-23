@@ -27,7 +27,6 @@ class PairRealityBackoffTests(TestCase):
 
     def restart(self):
         self.f.engine = Engine(Store(self.f.f.store.path), market=self.f.f.market)
-        self.addCleanup(self.f.engine.dashboard_reports.close)
 
     def test_failed_reality_waits_30_then_60_seconds_across_manual_checks_and_restart(self):
         original = deepcopy(self.f.state())

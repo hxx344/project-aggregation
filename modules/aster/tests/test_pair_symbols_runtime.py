@@ -9,11 +9,11 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests.helpers import account
-from trading.cycle import validate_cycle
 from trading.engine import Engine
 from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.models import TradingError, dec
-from trading.pair_execution import PairTrader, runtime_default
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import runtime_default
 from trading.pair_planning import PairPositionError, plan_ordinary, require_runtime_symbols
 from trading.pair_recovery import require_archived_orders_clear
 from trading.pairing import validate_pair
@@ -29,12 +29,13 @@ class PairSymbolsRuntimeTests(TestCase):
         self.market = DemoMarket()
         self.engine = Engine(self.store, market=self.market)
         self.trader = PairTrader(self.engine)
+        self.engine.capacities = lambda symbol: {5: dec("1000000"), 10: dec(0), 20: dec(0)}
         self.brokers = {}
         self.margin = patch("trading.margin_balance.MarginBalancer.tick", return_value={"blocks_trading": False})
         self.margin.start()
         self.addCleanup(self.margin.stop)
 
-    def create(self, symbol="XAGUSD1", *, kind="cycle", pair_id="silver"):
+    def create(self, symbol="XAGUSD1", *, kind="ordinary", pair_id="silver"):
         members = {}
         for side in ("long", "short"):
             aid = pair_id + "_" + side
@@ -44,9 +45,7 @@ class PairSymbolsRuntimeTests(TestCase):
         self.brokers[pair_id] = members
         pair = validate_pair({"id": pair_id, "name": pair_id, "symbol": symbol,
             "long_account_id": pair_id + "_long", "short_account_id": pair_id + "_short", "enabled": True,
-            "ordinary": {"enabled": kind == "ordinary", "min_open_leverage": 5},
-            "cycle": {"enabled": kind == "cycle", "spread_notional": "1000", "spread_limit_bp": "5",
-                      "min_notional": "500", "max_notional": "1000", "hold_seconds": 60}})
+            "ordinary": {"enabled": kind == "ordinary", "min_open_leverage": 5}})
         return self.store.save_pair(pair, create=True)
 
     def tick(self, pair_id="silver"):
@@ -83,44 +82,19 @@ class PairSymbolsRuntimeTests(TestCase):
             self.assertTrue(all(order["symbol"] == "XAGUSD1" for order in broker.state["orders"].values()))
             self.assertEqual(broker.state["positions"]["XAUUSD1:" + side.upper()]["qty"], "0")
 
-    def test_silver_cycle_pause_closes_recorded_increment_after_restart(self):
-        pair = self.create()
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
-        self.assertEqual(state["progress"]["config"]["symbol"], "XAGUSD1")
-        self.store.save_pair({**pair, "enabled": False})
-        self.trader = PairTrader(self.engine)
-        state = self.tick()
-        self.assertEqual(state["progress"]["completed_cycles"], 1, state)
-        self.assertIsNone(state["pending"])
-        for broker in self.brokers[pair["id"]].values():
-            self.assertEqual(len(broker.state["orders"]), 2)
-            self.assertTrue(all(row["symbol"] == "XAGUSD1" for row in broker.state["orders"].values()))
-            self.assertTrue(all(not p.qty for p in broker.snapshot(["XAGUSD1"]).positions))
-
-    def test_gold_legacy_runtime_without_symbol_still_closes(self):
-        pair = self.create("XAUUSD1", pair_id="gold")
-        state = self.tick("gold")
-        self.assertEqual(state["phase"], "holding", state)
-        state.pop("symbol")
-        self.store.put("pair_runtime:gold", state)
-        self.store.save_pair({**pair, "enabled": False})
-        self.trader = PairTrader(self.engine)
-        state = self.tick("gold")
-        self.assertEqual(state["progress"]["completed_cycles"], 1, state)
-
     def test_two_groups_keep_capacity_positions_and_recovery_separate(self):
         self.create("XAUUSD1", pair_id="gold")
         silver = self.create()
         gold_state = self.tick("gold")
-        self.assertEqual(gold_state["phase"], "holding", gold_state)
+        self.assertEqual(gold_state["phase"], "waiting", gold_state)
         self.engine.markets["XAUUSD1"] = {"status": "failed"}
         silver_state = self.tick()
-        self.assertEqual(silver_state["phase"], "holding", silver_state)
-        self.assertNotEqual(gold_state["progress"]["quantities"], silver_state["progress"]["quantities"])
+        self.assertEqual(silver_state["phase"], "waiting", silver_state)
+        self.assertGreater(dec(silver_state["owned"]["LONG"]), 0)
+        self.assertGreater(dec(gold_state["owned"]["LONG"]), 0)
         gold_runtime = deepcopy(self.store.get("pair_runtime:gold"))
         self.store.save_pair({**silver, "enabled": False})
-        self.assertEqual(self.tick()["progress"]["completed_cycles"], 1)
+        self.assertEqual(self.tick()["phase"], "paused")
         self.assertEqual(self.store.get("pair_runtime:gold"), gold_runtime)
 
     def test_silver_unknown_order_restart_queries_original_id_without_resending(self):
@@ -174,22 +148,6 @@ class PairSymbolsRuntimeTests(TestCase):
         self.assertEqual([row["clientOrderId"] for row in rows], ["current_silver"])
         self.assertEqual(window["rows"], 1)
 
-    def test_silver_ordinary_baseline_survives_cycle_pause(self):
-        pair = self.create(kind="ordinary")
-        with patch.object(self.engine, "capacities", return_value={5: "1000000", 10: "0", 20: "0"}):
-            owned = self.tick()["owned"]
-        self.assertGreater(dec(owned["LONG"]), 0)
-        pair = self.store.save_pair({**pair, "ordinary": {**pair["ordinary"], "enabled": False},
-                                    "cycle": {**pair["cycle"], "enabled": True}})
-        self.assertEqual(self.tick()["phase"], "holding")
-        self.store.save_pair({**pair, "enabled": False})
-        state = self.tick()
-        self.assertEqual(state["owned"], owned)
-        self.assertEqual(state["progress"]["completed_cycles"], 1)
-        for side, snapshot in self.snapshots(pair).items():
-            position = snapshot.pair("XAGUSD1")[0 if side == "long" else 1]
-            self.assertEqual(position.qty, dec(owned[side.upper()]))
-
     def test_silver_failed_leg_repairs_only_silver(self):
         self.create()
         with patch.object(self.brokers["silver"]["short"], "submit", side_effect=ExchangeError("balance", code=-2019)):
@@ -202,6 +160,7 @@ class PairSymbolsRuntimeTests(TestCase):
 
     def test_ordinary_upgrade_changes_only_silver_leverage(self):
         self.create(kind="ordinary")
+        del self.engine.capacities
         state = self.tick()
         self.assertIsNone(state["pending"], state)
         for broker in self.brokers["silver"].values():
@@ -234,7 +193,6 @@ class PairSymbolsRuntimeTests(TestCase):
             "config": lambda state: state["pending"]["config"].update(symbol="XAUUSD1"),
             "order": lambda state: state["pending"]["legs"][0]["order"].update(symbol="XAUUSD1"),
             "repair": lambda state: state["pending"]["repairs"].append({"order": {"symbol": "XAUUSD1"}}),
-            "progress": lambda state: state["progress"].update(config={"symbol": "XAUUSD1"}),
             "watch": lambda state: state.update(recovery_watch={"batches": [{"legs": [{"order": {"symbol": "XAUUSD1"}}]}]}),
         }
         for label, mutate in mutations.items():
@@ -249,16 +207,6 @@ class PairSymbolsRuntimeTests(TestCase):
                     result = self.tick()
                 self.assertEqual(result["phase"], "attention", result)
                 self.assertEqual(result["pending"], pending)
-
-    def test_frozen_silver_cycle_with_gold_config_blocks_close(self):
-        self.create()
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
-        state["progress"]["config"]["symbol"] = "XAUUSD1"
-        state["progress"]["opened_at"] = time.time() - 100
-        self.store.put("pair_runtime:silver", state)
-        with self.no_writes():
-            self.assertEqual(self.tick()["phase"], "attention")
 
     def test_unmarked_legacy_gold_order_cannot_be_reinterpreted_as_silver(self):
         pair = self.create()
@@ -308,7 +256,3 @@ class PairSymbolsRuntimeTests(TestCase):
         state["owned"] = {"LONG": "1", "SHORT": "1"}
         with self.assertRaisesRegex(PairPositionError, "缺少 XAGUSD1"):
             require_runtime_symbols(pair, state)
-
-    def test_single_account_cycle_default_still_excludes_silver(self):
-        with self.assertRaises(TradingError):
-            validate_cycle({"symbol": "XAGUSD1"})
