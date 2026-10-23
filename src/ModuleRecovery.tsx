@@ -15,7 +15,8 @@ type ModuleRow = {
 const IDLE_MS = 15_000;
 const RECOVERING_MS = 2_000;
 const RECOVERING = new Set(['starting', 'draining', 'backoff']);
-const names: Record<string, string> = { monitor: 'Monitor' };
+// Same display names as server/modules/catalog.mjs.
+const names: Record<string, string> = { monitor: 'Market Monitor', asset: 'Asset Ledger', crossex: 'Gate CrossEx', greeks: 'Greeks', aster: 'Aster 5x' };
 
 /** Supervisor state of one built-in module, with the operator restart for a faulted module. */
 export default function ModuleRecovery({ moduleId, name, active, onRecovered, onExpired }: { moduleId: string; name: string; active: boolean; onRecovered: () => void; onExpired: () => void }) {
