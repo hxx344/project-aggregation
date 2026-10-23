@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { chmodSync } from 'node:fs';
 import { moduleCapabilities } from './capabilities.mjs';
 
-let application, closing = false, closeTimeoutMs = 30_000;
+let application, closing = false, closeTimeoutMs = 30_000, dependencies = null;
 async function close(code = 0) {
   if (closing) return;
   closing = true;
@@ -17,14 +17,25 @@ function equal(value, expected) {
 }
 process.on('message', async message => {
   if (message?.type === 'shutdown') return void close();
+  if (message?.type === 'dependency') {
+    // Only transports declared at start can change; the module reads the new
+    // value on its next request instead of keeping a stale socket.
+    if (!dependencies || !Object.hasOwn(dependencies, message.id)) return;
+    dependencies[message.id] = message.transport ?? null;
+    application?.updateDependency?.(message.id, dependencies[message.id]);
+    return;
+  }
   if (message?.type !== 'start' || application || closing) return;
   try {
     const { id, root, dataDir, secret, socketPath, environment, transports } = message;
     if (!['monitor', 'asset', 'crossex', 'greeks', 'aster'].includes(id)) throw new Error('Invalid module');
     closeTimeoutMs = id === 'aster' ? 110_000 : 30_000;
     process.chdir(root);
+    dependencies = { ...transports };
+    const initial = { ...dependencies };
     const { createModule } = await import(`./${id}.mjs`);
     application = await createModule({ root, dataDir, secret, environment, transports });
+    for (const [name, transport] of Object.entries(dependencies)) if (transport !== initial[name]) application.updateDependency?.(name, transport);
     if (['crossex', 'greeks', 'aster'].includes(id) && application.writerProtectionVersion !== 1) throw new Error('Module account protection was not initialized');
     if (['crossex', 'greeks', 'aster'].includes(id) && application.recoveryProtectionVersion !== 1) throw new Error('Module recovery protection was not initialized');
     const handlers = application.server.listeners('request');

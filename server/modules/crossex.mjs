@@ -8,7 +8,9 @@ export async function createModule({ root, dataDir, secret, environment = {}, tr
   const load = file => import(pathToFileURL(resolve(root, file)).href);
   const [{ createApp }, { createPublicClients }] = await Promise.all([load('server/app.mjs'), load('server/clients.mjs')]);
   if (!transports.monitor) throw new Error('Embedded CrossEx requires the Monitor private transport');
-  const clients = createPublicClients({ monitorTransport: transports.monitor });
+  // Monitor can restart under a new generation; reads follow the current value.
+  let monitorTransport = transports.monitor;
+  const clients = createPublicClients({ monitorTransport: () => monitorTransport });
   const expected = Buffer.from(secret);
   const managed = environment.WORKSPACE_MANAGED === '1';
   if (managed && (!environment.WORKSPACE_WRITER_DB || !environment.WORKSPACE_RUNTIME_ID)) throw new Error('Missing shared account protection');
@@ -27,5 +29,5 @@ export async function createModule({ root, dataDir, secret, environment = {}, tr
     ...(accountWriter ? { liveOptions: { accountWriter } } : {}),
   }); } catch (error) { accountWriter?.close(); throw error; }
   const close = app.close.bind(app);
-  return { ...app, writerProtectionVersion: accountWriter ? 1 : null, recoveryProtectionVersion: accountWriter?.recoveryProtectionVersion ?? null, async close() { await close(); accountWriter?.close(); } };
+  return { ...app, updateDependency(id, transport) { if (id === 'monitor') monitorTransport = transport ?? null; }, writerProtectionVersion: accountWriter ? 1 : null, recoveryProtectionVersion: accountWriter?.recoveryProtectionVersion ?? null, async close() { await close(); accountWriter?.close(); } };
 }

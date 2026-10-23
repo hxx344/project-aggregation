@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startModules } from '../server/modules/runtime.mjs';
-import { moduleOrigin, moduleTransport } from '../server/modules/transport.mjs';
+import { moduleOrigin, moduleTransport, registerModuleTransport } from '../server/modules/transport.mjs';
 import { moduleIds } from '../server/modules/catalog.mjs';
 import { moduleCapabilities } from '../server/modules/capabilities.mjs';
 
@@ -15,11 +15,13 @@ const fixtureSource = `
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
+import { writeFileSync, appendFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 export async function createModule({ root, dataDir, environment, transports }) {
   const id = path.basename(root);
-  await writeFile(path.join(dataDir, 'started.json'), JSON.stringify({ id, pid: process.pid, socketPath: transports[id].socketPath, maintenance: environment.WORKSPACE_MAINTENANCE, writerDb: environment.WORKSPACE_WRITER_DB, runtimeId: environment.WORKSPACE_RUNTIME_ID, writerModule: environment.WORKSPACE_WRITER_MODULE }));
+  const started = { id, pid: process.pid, dependencies: Object.keys(transports), maintenance: environment.WORKSPACE_MAINTENANCE, writerDb: environment.WORKSPACE_WRITER_DB, runtimeId: environment.WORKSPACE_RUNTIME_ID, writerModule: environment.WORKSPACE_WRITER_MODULE };
+  await writeFile(path.join(dataDir, 'started.json'), JSON.stringify(started));
   if (environment.FIXTURE_START === 'fail') throw new Error('fixture startup failure');
   if (environment.FIXTURE_START === 'hang') await new Promise(() => {});
   let closing;
@@ -30,7 +32,9 @@ export async function createModule({ root, dataDir, environment, transports }) {
       tcpListeners: process._getActiveHandles().filter(handle => handle instanceof net.Server && handle.listening && typeof handle.address() !== 'string').length }));
     if (req.url === '/crash') setTimeout(() => process.exit(27), 20);
   });
-  return { server, writerProtectionVersion: environment.FIXTURE_START === 'unguarded' ? null : 1, recoveryProtectionVersion: environment.FIXTURE_START === 'legacy-recovery' ? null : 1, close() {
+  // The worker owns the listen call; record the real path before it reports ready.
+  server.once('listening', () => writeFileSync(path.join(dataDir, 'started.json'), JSON.stringify({ ...started, socketPath: server.address() })));
+  return { server, updateDependency(name, transport) { appendFileSync(path.join(dataDir, 'dependencies.jsonl'), JSON.stringify({ name, socketPath: transport?.socketPath ?? null }) + '\\n'); }, writerProtectionVersion: environment.FIXTURE_START === 'unguarded' ? null : 1, recoveryProtectionVersion: environment.FIXTURE_START === 'legacy-recovery' ? null : 1, close() {
     return closing ??= (async () => {
       await delay(Number(environment.FIXTURE_CLOSE_DELAY_MS || 0));
       if (server.listening) await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
@@ -64,7 +68,7 @@ function transportDirectory(record) {
   if (process.platform !== 'win32') return path.dirname(record.socketPath);
   const prefix = '\\\\.\\pipe\\workbench-';
   assert.ok(record.socketPath.startsWith(prefix));
-  return path.join(tmpdir(), record.socketPath.slice(prefix.length, -(`-${record.id}`.length)));
+  return path.join(tmpdir(), record.socketPath.slice(prefix.length).replace(new RegExp(`-${record.id}-\\d+$`), ''));
 }
 async function removeFixture(directory) {
   const relative = path.relative(path.resolve(tmpdir()), path.resolve(directory));
@@ -131,6 +135,13 @@ test('supervisor readies all real workers on authenticated private pipes and clo
     assert.equal(row.writerModule, path.join(f.root, 'server', 'execution', 'account_writer.py'));
   }
   assert.equal(new Set(rows.map(row => row.pid)).size, moduleIds.length);
+  for (const row of rows) {
+    assert.equal(registered(row.id).generation, 1);
+    assert.match(registered(row.id).instanceId, /^[a-f0-9-]{36}$/);
+    assert.ok(row.socketPath.endsWith(`${row.id}-1${process.platform === 'win32' ? '' : '.sock'}`));
+    // Only CrossEx declares a dependency; nobody receives its own or a peer's credentials otherwise.
+    assert.deepEqual(row.dependencies, row.id === 'crossex' ? ['monitor'] : []);
+  }
   await bounded(runtime.close(), 5000, 'shutdown');
   assertUnavailable();
   for (const row of rows) { assert.equal(hasProcess(row.pid), false); assert.equal(await f.closed(row.id), true); }
@@ -221,4 +232,34 @@ test('a factory that never becomes ready times out without leaving a child or pr
   for (const row of rows) assert.equal(hasProcess(row.pid), false);
   assertUnavailable();
   await assert.rejects(readdir(transportDirectory(rows[0])), { code: 'ENOENT' });
+});
+
+test('a larger generation replaces a module transport and the old remover cannot evict it', t => {
+  const id = 'greeks', secret = 'g'.repeat(32);
+  const legacy = registerModuleTransport(id, { socketPath: 'legacy.sock', secret });
+  t.after(() => legacy());
+  assert.throws(() => registerModuleTransport(id, { socketPath: 'again.sock', secret }), /already registered/);
+  const first = registerModuleTransport(id, { socketPath: 'one.sock', secret }, { instanceId: 'a', generation: 1 });
+  t.after(() => first());
+  assert.equal(registered(id).socketPath, 'one.sock');
+  assert.throws(() => registerModuleTransport(id, { socketPath: 'same.sock', secret }, { generation: 1 }), /already registered/);
+  assert.throws(() => registerModuleTransport(id, { socketPath: 'older.sock', secret }, { generation: 0 }), /already registered/);
+  assert.throws(() => registerModuleTransport(id, { socketPath: 'bad.sock', secret }, { generation: 1.5 }), /Invalid module generation/);
+  const second = registerModuleTransport(id, { socketPath: 'two.sock', secret }, { instanceId: 'b', generation: 2 });
+  first(); legacy();
+  assert.equal(registered(id).socketPath, 'two.sock', 'a stale instance cleanup leaves its successor registered');
+  second();
+  assert.throws(() => registered(id), /unavailable/);
+});
+
+test('a Monitor exit withdraws its transport from CrossEx before the group is drained', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  let failed;
+  const failure = new Promise(accept => { failed = accept; });
+  await f.start({ onFailure: failed });
+  assert.equal((await request(registered('monitor'), '/crash')).status, 200);
+  await bounded(failure, 5000, 'worker failure callback');
+  const updates = (await readFile(path.join(f.dataDir, 'modules', 'crossex', 'dependencies.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(updates, [{ name: 'monitor', socketPath: null }]);
+  for (const id of moduleIds) assert.equal(await exists(path.join(f.dataDir, 'modules', id, 'dependencies.jsonl')), id === 'crossex');
 });

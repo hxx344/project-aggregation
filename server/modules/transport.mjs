@@ -6,11 +6,16 @@ export const moduleOrigin = id => {
   if (!ids.has(id)) throw new Error('Unknown embedded module');
   return `http://${id}.workspace.internal`;
 };
-export function registerModuleTransport(id, transport) {
+// A restarted instance replaces its predecessor only with a larger generation.
+// Calls without a generation register as generation 0 and keep the old
+// one-registration-per-module behaviour.
+export function registerModuleTransport(id, transport, { instanceId = null, generation = 0 } = {}) {
   const origin = moduleOrigin(id);
-  if (transports.has(origin)) throw new Error('Module transport already registered');
+  if (!Number.isSafeInteger(generation) || generation < 0) throw new Error('Invalid module generation');
+  const current = transports.get(origin);
+  if (current && generation <= current.generation) throw new Error('Module transport already registered');
   if (!transport?.socketPath || typeof transport.secret !== 'string' || transport.secret.length < 32) throw new Error('Invalid module transport');
-  const value = Object.freeze({ socketPath: transport.socketPath, secret: transport.secret });
+  const value = Object.freeze({ socketPath: transport.socketPath, secret: transport.secret, instanceId, generation });
   transports.set(origin, value);
   return () => { if (transports.get(origin) === value) transports.delete(origin); };
 }

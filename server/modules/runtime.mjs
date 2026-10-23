@@ -5,18 +5,27 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
-import { moduleCatalog } from './catalog.mjs';
+import { moduleCatalog, moduleDependencies } from './catalog.mjs';
 import { registerModuleTransport } from './transport.mjs';
 
 const repository = fileURLToPath(new URL('../..', import.meta.url));
 export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, timeoutMs = 120_000, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
   if (path.resolve(writerContext.databasePath) !== path.join(path.resolve(dataDir), 'execution-control.sqlite') || !/^[a-f0-9-]{36}$/.test(writerContext.runtimeId)) throw new Error('Invalid writer runtime context');
   const directory = mkdtempSync(path.join(tmpdir(), 'workbench-'));
-  const children = [], unregister = [];
-  const transports = Object.fromEntries(moduleCatalog.map(({ id }) => [id, {
-    socketPath: process.platform === 'win32' ? `\\\\.\\pipe\\workbench-${path.basename(directory)}-${id}` : path.join(directory, `${id}.sock`),
+  const children = [], unregister = [], generations = {}, ready = {};
+  // Every instance gets a fresh path and secret, so a stale listener from an
+  // earlier generation can never receive traffic meant for its successor.
+  const createTransport = (id, generation) => ({
+    socketPath: process.platform === 'win32' ? `\\\\.\\pipe\\workbench-${path.basename(directory)}-${id}-${generation}` : path.join(directory, `${id}-${generation}.sock`),
     secret: randomBytes(32).toString('hex'),
-  }]));
+  });
+  const dependencies = id => Object.fromEntries((moduleDependencies[id] ?? []).filter(dependency => ready[dependency]).map(dependency => [dependency, ready[dependency]]));
+  function notifyDependents(id, transport) {
+    for (const child of children) {
+      if (child.moduleId === id || !(moduleDependencies[child.moduleId] ?? []).includes(id) || !child.connected) continue;
+      child.send({ type: 'dependency', id, transport }, () => {});
+    }
+  }
   let stopping = false, closing;
   function close() {
     if (closing) return closing;
@@ -59,6 +68,7 @@ export async function startModules({ dataDir, root = repository, logger = consol
       const child = spawn(locking ? 'flock' : process.execPath,
         locking ? ['--no-fork', '--nonblock', '--conflict-exit-code', '75', path.join(moduleData, 'instance.lock'), process.execPath, ...args] : args,
         { cwd: moduleRoot, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+      const generation = generations[id] = (generations[id] ?? 0) + 1, instanceId = randomUUID(), transport = createTransport(id, generation);
       child.moduleId = id;
       children.push(child);
       child.stdout.on('data', data => logger.info(`[${id}] ${String(data).trimEnd()}`));
@@ -72,10 +82,15 @@ export async function startModules({ dataDir, root = repository, logger = consol
           if (message?.type === 'failed') failure(new Error(`${id}: ${message.message}`));
           if (message?.type !== 'ready') return;
           clearTimeout(timer); child.removeListener('exit', exited);
-          child.once('exit', (code, signal) => { if (!stopping) void close().finally(() => onFailure(new Error(`${id} stopped (${signal || code})`))); });
-          unregister.push(registerModuleTransport(id, transports[id])); resolve();
+          const remove = registerModuleTransport(id, transport, { instanceId, generation });
+          child.once('exit', (code, signal) => {
+            remove();
+            if (ready[id] === transport) { delete ready[id]; notifyDependents(id, null); }
+            if (!stopping) void close().finally(() => onFailure(new Error(`${id} stopped (${signal || code})`)));
+          });
+          unregister.push(remove); ready[id] = transport; notifyDependents(id, transport); resolve();
         });
-        child.send({ type: 'start', id, root: moduleRoot, dataDir: moduleData, environment, transports, ...transports[id] }, error => { if (error) failure(error); });
+        child.send({ type: 'start', id, root: moduleRoot, dataDir: moduleData, environment, transports: dependencies(id), ...transport }, error => { if (error) failure(error); });
       });
     }
     return { projects: moduleCatalog, close };

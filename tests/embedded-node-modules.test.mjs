@@ -154,6 +154,24 @@ test('CrossEx Monitor reads use only the configured private pipe and keep old cr
   await assert.rejects(internal(`${MONITOR_ORIGIN}/api`, { method: 'POST' }), /Unsupported/);
 });
 
+test('CrossEx follows a replaced Monitor transport and fails reads while none is available', async t => {
+  const servers = [];
+  const serve = async label => {
+    const socketPath = pipe(), server = http.createServer((_req, res) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ schemaVersion: 2, label })); });
+    await listen(server, socketPath); servers.push(server);
+    return { socketPath, secret };
+  };
+  t.after(() => Promise.all(servers.map(close)));
+  let current = await serve('first');
+  const clients = createPublicClients({ monitorTransport: () => current });
+  assert.equal((await clients.loadFeed({})).label, 'first');
+  current = null;
+  await assert.rejects(clients.loadFeed({}), /Monitor private transport is required/);
+  current = await serve('second');
+  assert.equal((await clients.loadFeed({})).label, 'second');
+  assert.throws(() => createEmbeddedRequest(null), /Monitor private transport is required/, 'a fixed transport is still validated up front');
+});
+
 test('private Monitor request rejects redirects and honors the existing deadline', async t => {
   const socketPath = pipe(); let hang = false;
   const server = http.createServer((_req, res) => { if (hang) return; res.writeHead(302, { Location: 'https://external.example' }); res.end(); });

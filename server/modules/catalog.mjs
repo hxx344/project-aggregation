@@ -10,3 +10,6 @@ export const moduleCatalog = Object.freeze([
   accessMode: 'proxy', autoSync: item.id === 'asset', authOrigin: '', apiUrl: moduleOrigin(item.id),
   url: moduleOrigin(item.id) + (item.id === 'monitor' ? '/?monitor=oil' : '/'), hasCredentials: true })));
 export const moduleIds = Object.freeze(moduleCatalog.map(item => item.id));
+// Kept outside the persisted project records. A worker receives only the
+// transports listed here; every other module gets none.
+export const moduleDependencies = Object.freeze({ crossex: Object.freeze(['monitor']) });
