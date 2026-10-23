@@ -7,11 +7,12 @@ import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
 import { createPositionsSource, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest } from './hub-positions';
+import { FILLS_CAPABILITIES, FILLS_CACHE_MS, FILLS_TIMEOUT_MS, fillsReply, fillsRequest } from './hub-fills';
 
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
 const HOST_CAPABILITIES = ['activity', 'navigate', 'changed'];
-// Single release switch for the Monitor positions bridge: false declares neither capability and ignores both messages.
+// Single release switch for Monitor account reads and trading navigation.
 const POSITIONS_BRIDGE_ENABLED = true;
 
 export default function ProjectPage({ project, snapshot, now, active, backgroundUpdates = true, query, onEdit, onExpired, onStatus, onChanged, onNavigate, onOpenTrading }: { project: Project; snapshot?: Snapshot; now: number; active: boolean; backgroundUpdates?: boolean; query?: NavigationQuery; onEdit: () => void; onExpired: () => void; onStatus: (value: FramePhase) => void; onChanged: () => void; onNavigate: (id: string, query: NavigationQuery) => void; onOpenTrading?: () => void }) {
@@ -30,13 +31,14 @@ export default function ProjectPage({ project, snapshot, now, active, background
   const connected = useRef(false);
   const acknowledged = useRef(false);
   const sentNavigation = useRef('');
-  // Only Monitor may read account positions through the host; other modules never see the capability.
+  // Only Monitor may read account positions/fills through the host.
   const positionsBridge = POSITIONS_BRIDGE_ENABLED && project.id === 'monitor';
-  const hostCapabilities = positionsBridge ? [...HOST_CAPABILITIES, ...POSITIONS_CAPABILITIES] : HOST_CAPABILITIES;
+  const hostCapabilities = positionsBridge ? [...HOST_CAPABILITIES, ...POSITIONS_CAPABILITIES, ...FILLS_CAPABILITIES] : HOST_CAPABILITIES;
   const moduleCapabilities = useRef<string[]>([]);
   // Advances whenever the iframe document may have changed, so late replies never reach a newer document.
   const documentGeneration = useRef(0);
   const positions = useRef<ReturnType<typeof createPositionsSource> | null>(null);
+  const fills = useRef<ReturnType<typeof createPositionsSource> | null>(null);
   const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading });
   latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading };
   const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
@@ -83,6 +85,14 @@ export default function ProjectPage({ project, snapshot, now, active, background
           if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('positions')) return;
           post(positionsReply(request, outcome, Date.now()));
         });
+      } else if (positionsBridge && connected.current && data.type === 'fills-request' && moduleCapabilities.current.includes('fills')) {
+        const request = fillsRequest(data); if (!request) return;
+        const generation = documentGeneration.current;
+        fills.current ??= createPositionsSource(signal => api('/api/trading/fills', { signal, timeoutMs: FILLS_TIMEOUT_MS }), { cacheMs: FILLS_CACHE_MS });
+        void fills.current.read(latest.current.active && document.visibilityState === 'visible').then(outcome => {
+          if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('fills')) return;
+          post(fillsReply(request, outcome, Date.now()));
+        });
       } else if (positionsBridge && connected.current && latest.current.active && document.visibilityState === 'visible' && data.type === 'open-trading' && moduleCapabilities.current.includes('open-trading')) {
         if (openTradingRequest(data)) latest.current.onOpenTrading?.();
       }
@@ -91,7 +101,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
     return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
   useEffect(synchronize, [active, backgroundUpdates, query, source]);
-  useEffect(() => () => { positions.current?.dispose(); positions.current = null; }, []);
+  useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; fills.current?.dispose(); fills.current = null; }, []);
 
   useEffect(() => {
     const pending = pendingTabs.current;

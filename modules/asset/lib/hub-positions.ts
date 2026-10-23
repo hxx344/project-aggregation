@@ -14,10 +14,10 @@ import { readBinancePositions, readBybitPositions, readOkxPositions, readAsterPo
 import type { BinanceScope, BybitScope } from './positions-readers.ts';
 import { readVariationalPythonPositions } from './variational-python-client.ts';
 
-type Database = Pick<ReturnType<typeof openDatabase>, 'prepare'>;
-type ConnectionRow = { exchange: string; encrypted: string };
-type SourceAccount = { id: string; name: string; exchange: PositionsExchangeId; key: string; row?: ConnectionRow };
-type Unseal = (encrypted: string, context: string) => Promise<unknown>;
+export type Database = Pick<ReturnType<typeof openDatabase>, 'prepare'>;
+export type ConnectionRow = { exchange: string; encrypted: string };
+export type SourceAccount = { id: string; name: string; exchange: PositionsExchangeId; key: string; row?: ConnectionRow };
+export type Unseal = (encrypted: string, context: string) => Promise<unknown>;
 type Read = (credentials: Credentials, scope: string, signal: AbortSignal) => Promise<Position[]>;
 type CycleRead = (credentials: Credentials, scope: string, request: CycleRequest, signal: AbortSignal) => Promise<PositionCycle>;
 /** `entryPrice` joins the signature so a close and same-size reopen between two reads is not mistaken for the old cycle. */
@@ -33,21 +33,21 @@ const DEADLINE = 25_000;
 // CYCLE_MIN_AGE, otherwise after CYCLE_TTL (CYCLE_RETRY after a failure). One summary is read at a time globally.
 const CYCLE_TTL = 5 * 60_000, CYCLE_RETRY = 60_000, CYCLE_MIN_AGE = 30_000, CYCLE_DEADLINE = 45_000;
 const CYCLE_LOADING = '正在统计本轮平仓…';
-const revisionOf = (value: string) => createHash('sha256').update(value).digest('hex');
+export const revisionOf = (value: string) => createHash('sha256').update(value).digest('hex');
 
-async function defaultRead(credentials: Credentials, scope: string, signal: AbortSignal): Promise<Position[]> {
+export async function defaultRead(credentials: Credentials, scope: string, signal: AbortSignal, fetcher: typeof fetch = fetch): Promise<Position[]> {
   switch (credentials.exchange) {
-    case 'binance': return readBinancePositions(credentials, fetch, signal, scope as BinanceScope);
-    case 'bybit': return readBybitPositions(credentials, scope as BybitScope, fetch, signal);
-    case 'okx': return readOkxPositions(credentials, scope as 'SWAP' | 'FUTURES', fetch, signal);
-    case 'aster': return readAsterPositions(credentials, fetch, signal);
+    case 'binance': return readBinancePositions(credentials, fetcher, signal, scope as BinanceScope);
+    case 'bybit': return readBybitPositions(credentials, scope as BybitScope, fetcher, signal);
+    case 'okx': return readOkxPositions(credentials, scope as 'SWAP' | 'FUTURES', fetcher, signal);
+    case 'aster': return readAsterPositions(credentials, fetcher, signal);
     case 'variational': return readVariationalPythonPositions(credentials, signal);
     default: throw new Error(POSITIONS_FAILED);
   }
 }
 const defaultCycle: CycleRead = (credentials, scope, request, signal) => readPositionCycle(credentials, scope, request, { signal });
 
-async function sourceAccounts(database: Database, owner: string): Promise<SourceAccount[]> {
+export async function sourceAccounts(database: Database, owner: string): Promise<SourceAccount[]> {
   const [stored, settings] = await Promise.all([
     database.prepare('SELECT exchange,encrypted FROM connections WHERE owner = ?').bind(owner).all<ConnectionRow>(),
     database.prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner, 'aster-accounts').first<{ value: string }>(),

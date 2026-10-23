@@ -171,6 +171,16 @@ Asset 响应为 `schemaVersion: 1`、`generatedAt`、`exchanges[]`。每个交�
 
 Binance U 本位（含统一账户）、Bybit 统一账户 USDT/USDC 永续与 OKX 永续的仓位另带可选 `cycle`，汇总本轮持仓（从持仓上次归零后开仓起）的平仓结果：`status`（`loading/complete/partial/unavailable`）、`since`、`closedQuantity/closePrice`、`realizedPnl`、`fees`、`funding`、`net`、`currency`、`note`、`updatedAt`。金额为结算币种的带符号现金流，`net = realizedPnl + fees + funding`，任一部分未知时为 `null`。Asset 在仓位读取成功后于后台逐个读取成交与资金费（Binance `userTrades`/`income`，Bybit `transaction-log`，OKX `fills-history`/`bills-archive`，均为固定只读 GET），按 7 天窗口或游标向前翻页，找到开仓成交即停止，最多回看 85 天；超出时为 `partial`。回放出的持仓与交易所不一致、请求超过上限、同一合约同时持有多空（Bybit）或读取失败时为 `unavailable` 并附说明，不显示猜测值。汇总全局串行读取，单个最长 45 秒；数量不变时缓存 5 分钟，失败 1 分钟后重试，数量变化至少间隔 30 秒重算，期间保留同方向的上次结果并以 `updatedAt` 标注。工作台对 `cycle` 逐字段校验，格式无效时置为 `null` 而不影响仓位；旧版 Asset 不带此字段，Monitor 关联交易面板随之不显示平仓汇总。
 
+## Asset 原油只读成交
+
+`GET /api/hub/fills` 沿用 Asset 仓位接口的鉴权，仅接受可选 `schemaVersion=1`，立即返回缓存并在后台刷新。固定读取最近 85 天 CL/BZ 成交，支持 Binance UM/PM-UM、Bybit USDT/USDC 永续与 OKX SWAP；其它已配置范围报告 `unsupported`。响应沿用 `exchanges/accounts/scopes` 层级，增加 `lookbackStart`；范围带 `coverageStart/coverageEnd/truncated` 与新到旧的 `fills[]`，每范围最多 2000 笔、全响应最多 5000 笔。成交包含原生合约、方向、方向腿、数量及单位、价格及计价币、手续费现金流、已实现盈亏和成交前后持仓；金额为十进制字符串，未知回推为 `null`。
+
+工作台 `GET /api/trading/fills` 只读取已配置 Asset 的固定路径，登录保护、返回前会话复查、HTTPS/回环限制与仓位接口相同，拒绝非 GET 和任何查询参数。响应为 `generatedAt/sources[]`；来源状态为 `ready/stale/unavailable/unconfigured`。请求合并，超时 12 秒，结果缓存 20 秒；鉴权失效最多重登一次且共用截止时间。响应上限 12 MiB，为 5000 笔带高精度十进制字符串的成交及范围元数据预留空间。全部字段白名单校验，任一成交非法则整源失败，不静默漏掉成交；失败保留旧快照并标 `stale`，范围超过 15 分钟未成功刷新也标过期。项目配置或凭据变更、停用、删除及关闭服务会清除缓存并中止旧请求。
+
+Monitor 与工作台双方声明 `fills` 能力后，可在 `project-hub` v1 通道发送 `{type:"fills-request",requestId,market:"oil"}`；不接受自定义币种或目标。回复 `{type:"fills",requestId,market:"oil",status,generatedAt,lookbackStart,pending,incomplete,truncated,coverage,items}`，`status` 为 `ok/unavailable/unauthorized`。`pending` 表示范围加载或刷新中；来源/范围失败、过期、截断或持仓回推未知时 `incomplete=true`。`coverage` 保留范围实际采样及覆盖时间；`items` 保留来源、交易所、账户、产品范围身份，按时间新到旧排列，最多 2000 笔，超出显式标截断。每个成交项和覆盖项都必须携带 `sourceId`，取 Asset 项目的稳定 `projectId`；`source` 仅作显示。成交场所按 `sourceId + exchangeId + accountId` 分组，两个同名 Asset 项目不得拼接双腿。`key` 使用同一项目 ID、交易所 ID、账户 ID、范围 ID、成交 ID 组成，不按显示名称合并账户。
+
+页面桥复用持仓读取的进行中合并与 20 秒缓存，仅在模块前台且页面可见时发网络请求，401 回复 `unauthorized`，不触发工作台退出。浏览器超时 15 秒，Monitor 等待 20 秒，形成 `12s < 15s < 20s`；iframe 重载后旧文档回复丢弃，卸载中止请求。独立打开 Monitor 或任一侧未声明能力时不启用成交读取。
+
 ## 资产新鲜度补充
 
 资产适配器使用原账本的 `mode` 分类：`manual` 为手工估值，`market`、`bybit`、`aster` 为动态数据。混合账本的 `updatedAt` 取所有非 `manual` 行最早更新时间，并通过 `manual_valuation_at` 指标单独保留手工行最早估值时间。缺少或未知 `mode` 按动态行处理并提示数据不完整，避免误判为不会过期。

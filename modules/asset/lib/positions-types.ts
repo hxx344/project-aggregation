@@ -4,6 +4,8 @@ export type Position = {
   symbol: string;
   instrumentId: string;
   side: 'long' | 'short';
+  /** Exchange leg identity retained for fill replay; older providers may omit it. */
+  positionSide?: 'long' | 'short' | 'net';
   quantity: string;
   quantityUnit: string;
   contractSize: string | null;
