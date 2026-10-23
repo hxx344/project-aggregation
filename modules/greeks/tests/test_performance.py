@@ -19,6 +19,11 @@ def fill(identity, side, qty, price, fee, day, group="a", opening=None, symbol=S
         exec_time=NOW + timedelta(days=day), execution_group=group, opening_group=opening, reduce_only=opening is not None)
 
 
+def exchange_fill(identity="open", fee="1"):
+    return dict(symbol=SYMBOL, side="Buy", execQty="1", execPrice="100", execFee=fee, feeCurrency="USDT",
+                execId=identity, orderId=identity, orderLinkId="ic-a-open", execTime=str(int(NOW.timestamp() * 1000)))
+
+
 class PerformanceTests(unittest.TestCase):
     def expiry_group(self, total=97, early_fee=0, close_time=None):
         row = {"symbol":SYMBOL,"side":"Sell","qty":"1","openTime":int(NOW.timestamp()*1000),
@@ -264,6 +269,82 @@ class PerformancePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.engine.performance_error)
         self.assertEqual(self.engine.performance_report()["network"], "mainnet")
         self.assertEqual(self.engine.performance_executions["fill-a"].closed_size, 0)
+
+    async def test_incomplete_recent_fills_never_replace_cached_or_persisted_records(self):
+        correct = fill("open", "Buy", 1, 100, 1, 0)
+        link = correct.order_link_id
+        self.engine._archive_performance([correct])
+        self.engine.last_executions = [correct]
+        self.engine.execution_details[link] = [correct]
+        for links in (None, [link]):
+            for identity in ("open", "unseen"):
+                for field in ("execPrice", "execQty", "execFee", "execTime"):
+                    for missing in ("absent", None, ""):
+                        with self.subTest(links=links, identity=identity, field=field, missing=missing):
+                            row = exchange_fill(identity)
+                            if missing == "absent":
+                                row.pop(field)
+                            else:
+                                row[field] = missing
+                            self.engine.client.executions = AsyncMock(return_value=[exchange_fill("fresh"), row])
+                            await self.engine.load_recent_executions(links)
+                            self.assertEqual(self.engine.last_executions, [correct])
+                            self.assertEqual(self.engine.execution_details[link], [correct])
+                            self.assertEqual(self.engine.performance_executions, {"open": correct})
+                            self.assertIn("成交", self.engine.performance_report()["error"])
+        restored = TradingEngine(self.settings)
+        self.assertEqual(restored.performance_executions, {"open": correct})
+        self.assertTrue(any(log.level == "WARNING" and "execution fee records" in log.message for log in self.engine.logs))
+
+    async def test_incomplete_history_does_not_archive_partial_batches_or_advance_cursor(self):
+        correct = fill("open", "Buy", 1, 100, 1, 0)
+        self.engine._archive_performance([correct])
+        cursor = int(datetime.now(timezone.utc).timestamp() * 1000) - 60000
+        self.engine.performance_start_ms = self.engine.performance_cursor_ms = cursor
+        for field in ("execPrice", "execQty", "execFee", "execTime"):
+            for missing in ("absent", None, ""):
+                with self.subTest(field=field, missing=missing):
+                    row = exchange_fill()
+                    if missing == "absent":
+                        row.pop(field)
+                    else:
+                        row[field] = missing
+                    self.engine.client.execution_history = AsyncMock(return_value=[exchange_fill("fresh"), row])
+                    await self.engine.sync_performance()
+                    self.assertEqual(self.engine.performance_executions, {"open": correct})
+                    self.assertEqual(self.engine.performance_cursor_ms, cursor)
+                    self.assertIsNone(self.engine.performance_updated_at)
+                    self.assertIsNotNone(self.engine.performance_error)
+
+    async def test_real_zero_fees_are_archived_identically_by_recent_and_full_history(self):
+        for fee in ("0", 0):
+            with self.subTest(fee=fee):
+                self.engine.client.executions = AsyncMock(return_value=[exchange_fill(fee=fee)])
+                await self.engine.load_recent_executions(["ic-a-open"])
+                recent = self.engine.performance_executions["open"]
+                self.assertEqual(recent.exec_fee, 0)
+                self.assertEqual(recent.exec_price, 100)
+                self.assertEqual(recent.exec_qty, 1)
+                self.assertEqual(recent.exec_time, NOW)
+                self.engine.client.execution_history = AsyncMock(return_value=[exchange_fill(fee=fee)])
+                await self.engine.sync_performance()
+                self.assertIsNone(self.engine.performance_error)
+                self.assertEqual(self.engine.performance_executions["open"], recent)
+                self.assertEqual(TradingEngine(self.settings).performance_executions["open"], recent)
+
+    async def test_missing_chain_reference_stays_unknown_and_real_zero_is_preserved(self):
+        baseline = {"side": "Buy", "qty": 1}
+        self.engine.execution_groups["a"] = {"type": "open", "legs": {SYMBOL: baseline}}
+        self.engine.client.executions = AsyncMock(return_value=[exchange_fill()])
+        await self.engine.load_recent_executions()
+        record = self.engine.performance_executions["open"]
+        self.assertIsNone(record.chain_price_at_create)
+        self.assertIsNone(record.chain_price_diff)
+        baseline["chain_price"] = 0
+        await self.engine.load_recent_executions()
+        record = self.engine.performance_executions["open"]
+        self.assertEqual(record.chain_price_at_create, 0)
+        self.assertEqual(record.chain_price_diff, -100)
 
     async def test_history_fetch_follows_all_pages_beyond_recent_execution_limit(self):
         self.engine.client._request = AsyncMock(side_effect=[
