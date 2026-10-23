@@ -70,7 +70,7 @@ export function fillsStatusText(view, formatTime) {
     failed ? `部分账户失败（${failed} 个范围）` : null,
     view.incomplete ? '覆盖不完整，部分成交开平未知或数据陈旧' : null,
     view.truncated ? '成交记录已截断' : null,
-    '仅支持 Binance、Bybit、OKX', '最近 85 天', '▲ 入场 · ▼ 出场 · ◆ 调仓 · ● 成交；颜色不表示盈亏',
+    '仅支持 Binance、Bybit、OKX', '最近 85 天',
   ].filter(Boolean).join(' · ');
 }
 /** Every user-controlled label is inserted as text, including SVG accessible names. */
@@ -81,6 +81,7 @@ export function renderTradeMarkers(svg, markers, chart, { formatTime, show, hide
     const { event } = marker, type = TRADE_TYPES[event.type], px = chart.x(event.time), py = chart.y(marker.value);
     const node = doc.createElementNS(ns, 'g');
     node.setAttribute('class', 'oil-trade-marker');
+    node.setAttribute('data-trade-type', event.type);
     node.setAttribute('transform', `translate(${px},${py})`);
     node.setAttribute('tabindex', '0'); node.setAttribute('role', 'button');
     node.setAttribute('data-trade-key', event.key);
@@ -137,6 +138,7 @@ export function createTradeLayer(root, formatTime) {
       for (const marker of [...markers].reverse()) {
         const button = list.ownerDocument.createElement('button'), type = TRADE_TYPES[marker.event.type];
         button.type = 'button'; button.className = 'oil-trade-list-item';
+        button.setAttribute('data-trade-type', marker.event.type);
         button.textContent = `${type.symbol} ${formatTime(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${spreadText(marker.value)}`;
         button.addEventListener('click', () => {
           const node = markerNodes.get(marker.event.key);

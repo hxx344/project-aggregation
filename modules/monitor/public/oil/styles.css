@@ -174,7 +174,17 @@ footer { padding:4px 0 16px; }
 .oil-panel .oil-trade-details { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; max-height:320px; overflow:auto; border-top:1px solid var(--border); margin-top:8px; padding-top:8px; }
 .oil-panel .oil-trade-tooltip { white-space:pre-wrap; overflow-wrap:anywhere; width:360px; min-width:0; max-width:100%; max-height:240px; overflow:auto; }
 .oil-panel #main-chart .oil-trade-marker { cursor:pointer; }
-.oil-panel #main-chart .oil-trade-marker text { fill:var(--chart-2); font-size:18px; paint-order:stroke; stroke:var(--card); stroke-width:3px; }
+/* Warm and neutral hues stay distinct from the cyan spread line; green/red are avoided so types do not read as PnL. */
+.oil-panel { --trade-entry:#f59e0b; --trade-exit:#f472b6; --trade-rebalance:#a78bfa; --trade-trade:#cbd5e1; }
+.oil-panel [data-trade-type=entry] { --trade-color:var(--trade-entry); }
+.oil-panel [data-trade-type=exit] { --trade-color:var(--trade-exit); }
+.oil-panel [data-trade-type=rebalance] { --trade-color:var(--trade-rebalance); }
+.oil-panel [data-trade-type=trade] { --trade-color:var(--trade-trade); }
+.oil-panel #main-chart .oil-trade-marker text { fill:var(--trade-color); font-size:20px; paint-order:stroke; stroke:var(--background); stroke-width:4px; stroke-linejoin:round; }
+.oil-panel .oil-trade-list-item { border-left:3px solid var(--trade-color, var(--border)); }
+.oil-panel .oil-trade-legend { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:12px; margin:0 0 8px; }
+.oil-panel .oil-trade-legend [data-trade-type] { color:var(--trade-color); font-weight:600; }
+.oil-panel .oil-trade-legend-note { color:var(--muted); }
 .oil-panel #main-chart .oil-trade-marker:focus { outline:none; }
 .oil-panel #main-chart .oil-trade-marker:focus circle { stroke:var(--foreground); stroke-width:2px; }
 .data-notice[data-tone=info] { color:color-mix(in srgb, var(--info, var(--chart-2)) 65%, var(--foreground)); background:color-mix(in srgb, var(--info, var(--chart-2)) 9%, transparent); border-color:color-mix(in srgb, var(--info, var(--chart-2)) 28%, transparent); border-radius:6px; padding:7px 12px; line-height:1.55; }
