@@ -64,8 +64,10 @@ export type HubPositionItem = {
   /** Absent from older hosts and from venues without fill history. */
   cycle?: HubPositionCycle | null;
 };
-/** `incomplete` marks an ok reply where some source could not confirm its positions. */
-export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[]; timedOut?: boolean };
+/** Range fields are absent on older hosts and failed reads. */
+type PositionsRange = { truncated: boolean; matchedCount: number; itemLimit: number };
+/** `incomplete` marks unconfirmed sources or a truncated match list. */
+export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; sourcesIncomplete?: boolean; items: HubPositionItem[]; timedOut?: boolean } & Partial<PositionsRange>;
 const POSITION_MARKETS: ReadonlySet<string> = new Set(['oil', 'cl-xau', 'hynix', 'perpetual']);
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/, POSITION_BASE = /^[A-Z0-9]{1,20}$/;
 // Outlasts the host's own positions read deadline (15 s) so a slow but answered read is not reported as silence.
@@ -125,8 +127,19 @@ export function parsePositionsReply(value: unknown): HubPositionsReply | null {
   if (items.some(item => !item)) return null;
   // Older hosts omit the flag; treat that as complete rather than rejecting the reply.
   if (reply.incomplete !== undefined && typeof reply.incomplete !== 'boolean') return null;
+  if (reply.sourcesIncomplete !== undefined && typeof reply.sourcesIncomplete !== 'boolean') return null;
+  let range: Partial<PositionsRange> = {};
+  if (reply.truncated !== undefined || reply.matchedCount !== undefined || reply.itemLimit !== undefined) {
+    const { truncated, matchedCount, itemLimit } = reply;
+    if (typeof truncated !== 'boolean' || typeof matchedCount !== 'number' || !Number.isSafeInteger(matchedCount) || matchedCount < 0
+      || typeof itemLimit !== 'number' || !Number.isSafeInteger(itemLimit) || itemLimit < 1 || itemLimit > 50) return null;
+    if (items.length !== Math.min(matchedCount, itemLimit) || truncated !== (matchedCount > itemLimit)) return null;
+    range = { truncated, matchedCount, itemLimit };
+  }
   const ok = reply.status === 'ok';
-  return { requestId: reply.requestId, market: reply.market as PositionsMarket, status: reply.status, generatedAt: reply.generatedAt, incomplete: ok && reply.incomplete === true, items: ok ? items as HubPositionItem[] : [] };
+  // Older hosts do not split the reasons; preserve their existing source warning.
+  const sourcesIncomplete = reply.sourcesIncomplete ?? reply.incomplete === true;
+  return { requestId: reply.requestId, market: reply.market as PositionsMarket, status: reply.status, generatedAt: reply.generatedAt, incomplete: ok && (reply.incomplete === true || sourcesIncomplete || range.truncated === true), sourcesIncomplete: ok && sourcesIncomplete, items: ok ? items as HubPositionItem[] : [], ...(ok ? range : {}) };
 }
 const createRequestId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 /** One requester per consumer: only its most recent request may resolve, and silence becomes unavailable. */
@@ -179,10 +192,10 @@ export function useHubHost() {
 }
 export type HubPositionsView = {
   status: 'standalone' | 'connecting' | 'unsupported' | 'empty' | 'loading' | HubPositionsReply['status'];
-  items: HubPositionItem[]; generatedAt: string | null; timedOut: boolean; incomplete: boolean;
+  items: HubPositionItem[]; generatedAt: string | null; timedOut: boolean; incomplete: boolean; sourcesIncomplete?: boolean;
   /** A failed refresh keeps the last good list visible, labelled with its own time. */
-  previous: { items: HubPositionItem[]; generatedAt: string | null } | null;
-};
+  previous: Pick<HubPositionsReply, 'items' | 'generatedAt' | 'incomplete' | 'sourcesIncomplete' | 'truncated' | 'matchedCount' | 'itemLimit'> | null;
+} & Partial<PositionsRange>;
 type StoredReply = { key: string; reply: HubPositionsReply; previous: HubPositionsView['previous'] };
 /** `active` must follow host foreground activity, not background read permission: the host answers background requests without reading. */
 export function useHubPositions(market: PositionsMarket, symbols: readonly string[], active: boolean): HubPositionsView {
@@ -202,7 +215,7 @@ export function useHubPositions(market: PositionsMarket, symbols: readonly strin
         followUp = reply.status === 'ok' && reply.items.some(item => item.cycle?.status === 'loading') ? setTimeout(run, POSITIONS_FOLLOW_UP_MS) : null;
         setStored(current => {
         const sameKey = current?.key === requestKey ? current : null;
-        const previous = reply.status === 'ok' ? null : sameKey?.reply.status === 'ok' ? { items: sameKey.reply.items, generatedAt: sameKey.reply.generatedAt } : sameKey?.previous ?? null;
+        const previous = reply.status === 'ok' ? null : sameKey?.reply.status === 'ok' ? sameKey.reply : sameKey?.previous ?? null;
         return { key: requestKey, reply, previous };
         });
       },
@@ -218,7 +231,7 @@ export function useHubPositions(market: PositionsMarket, symbols: readonly strin
   if (mode) return { status: mode, items: [], generatedAt: null, timedOut: false, incomplete: false, previous: null };
   const current = stored?.key === requestKey ? stored : null;
   if (!current) return { status: 'loading', items: [], generatedAt: null, timedOut: false, incomplete: false, previous: null };
-  return { status: current.reply.status, items: current.reply.items, generatedAt: current.reply.generatedAt, timedOut: Boolean(current.reply.timedOut), incomplete: current.reply.incomplete, previous: current.previous };
+  return { status: current.reply.status, items: current.reply.items, generatedAt: current.reply.generatedAt, timedOut: Boolean(current.reply.timedOut), incomplete: current.reply.incomplete, sourcesIncomplete: current.reply.sourcesIncomplete, truncated: current.reply.truncated, matchedCount: current.reply.matchedCount, itemLimit: current.reply.itemLimit, previous: current.previous };
 }
 
 export function observeNetworkActivity(update: () => void, source: Pick<Window, 'addEventListener' | 'removeEventListener'> = window) {

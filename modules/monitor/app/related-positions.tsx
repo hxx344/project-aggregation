@@ -99,9 +99,13 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
   const host = useHubHost();
   const [open, setOpen] = useState(false);
   const positions = useHubPositions(market, symbols, active);
-  const shown = positions.status === "ok" ? positions.items : positions.previous?.items ?? [];
+  const snapshot = positions.status === "ok" ? positions : positions.previous;
+  const shown = snapshot?.items ?? [];
+  const incomplete = snapshot?.incomplete === true;
+  const sourcesIncomplete = snapshot?.sourcesIncomplete === true;
+  const range = snapshot?.truncated ? `仅显示前 ${snapshot.itemLimit} 条（${sourcesIncomplete ? "已读取部分中共" : "共"} ${snapshot.matchedCount} 条匹配）` : "";
   const pairMarket = pairedMarket(market) ? market : null;
-  const pairs = pairMarket ? relatedSpreadPairs(pairMarket, shown, spreads) : [];
+  const pairs = pairMarket ? relatedSpreadPairs(pairMarket, shown, spreads, incomplete) : [];
   const message = positions.status === "standalone" ? "在工作台中打开可查看关联持仓"
     : positions.status === "connecting" ? "正在连接工作台…"
     : positions.status === "unsupported" ? "持仓不可用：当前工作台未提供持仓查询"
@@ -111,19 +115,21 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
     : positions.status === "unavailable" ? positions.timedOut ? `持仓不可用：${POSITIONS_TIMEOUT_MS / 1000} 秒内未收到工作台回复，稍后自动重试` : "持仓不可用：工作台暂时无法读取持仓"
     : positions.incomplete && !positions.items.length ? "部分数据源不可用"
     : !positions.items.length ? "无关联持仓" : "";
-  const partial = positions.status === "ok" && positions.incomplete && positions.items.length > 0;
+  const partial = sourcesIncomplete && shown.length > 0;
   const keptAt = positions.status !== "ok" && positions.previous ? `保留 ${clock(positions.previous.generatedAt)} 的持仓数据` : "";
   const openTrading = <div className="related-positions-actions"><button type="button" className="detail-side-action" disabled={!host.openTrading} onClick={() => hubOpenTrading(market)} title={host.openTrading ? undefined : "当前不在工作台中，或工作台未开放跳转"}>在交易中心查看<ArrowUpRight size={13} aria-hidden="true"/></button>{!host.openTrading ? <small>{host.embedded ? "工作台未开放跳转到交易中心" : "独立打开时不可跳转"}</small> : null}</div>;
   const body = <>
     {message ? <p className={positions.status === "unavailable" || positions.status === "unsupported" || positions.status === "unauthorized" || positions.incomplete ? "detail-side-error" : "detail-side-empty"}>{message}</p> : null}
     {partial ? <p className="detail-side-error">部分数据源不可用，列表可能不完整</p> : null}
+    {range ? <p className="detail-side-error">{range}</p> : null}
+    {pairMarket && incomplete && shown.length ? <p className="detail-side-note">持仓列表不完整，暂不确认配对</p> : null}
     {keptAt ? <p className="detail-side-note">{keptAt}</p> : null}
     {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === "paired" ? <PairDetail pair={pair}/> : <p className="related-unpaired">无法配对 · {unpairedText(market)[pair.reason]}</p>}</li>)}</ul> : null}
     {shown.length ? <PositionRows items={shown}/> : null}
     {pairMarket && pairs.length ? <p className="detail-side-foot">{pairFoot[pairMarket]}</p> : null}
   </>;
   if (variant === "strip") {
-    const summary = positions.status === "ok" ? positions.items.length ? `${positions.items.length} 笔关联持仓 · ${clock(positions.generatedAt)}${positions.incomplete ? " · 部分数据源不可用" : ""}` : message : message;
+    const summary = positions.status === "ok" ? positions.items.length ? `${range || `${positions.items.length} 笔关联持仓`} · ${clock(positions.generatedAt)}${sourcesIncomplete ? " · 部分数据源不可用" : ""}` : message : message;
     return <section className="related-positions related-positions-strip" data-related-positions={market} data-status={positions.status}>
       <div className="related-strip-bar"><button type="button" className="related-strip-toggle" aria-expanded={open} onClick={() => setOpen(value => !value)}><Link2 size={14} aria-hidden="true"/><strong>关联交易</strong><span>{summary}</span><ChevronDown size={13} aria-hidden="true" className={open ? "rotated" : ""}/></button>{extra}{openTrading}</div>
       {open ? <div className="related-strip-body">{body}</div> : null}

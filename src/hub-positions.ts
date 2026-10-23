@@ -10,7 +10,11 @@ export type HubPositionItem = {
   unrealizedPnl: string | null; pnlCurrency: string | null; updatedAt: string | null; stale: boolean;
   cycle?: PositionCycle | null;
 };
-export type PositionsReply = { type: 'positions'; requestId: string; market: PositionMarket; status: PositionsStatus; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[] };
+export type PositionsReply = {
+  type: 'positions'; requestId: string; market: PositionMarket; status: PositionsStatus; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[];
+  /** Present on successful reads; counts cover provided source/scope lists before the item cap. */
+  sourcesIncomplete?: boolean; truncated?: boolean; matchedCount?: number; itemLimit?: number;
+};
 export type PositionsOutcome = { status: 'ok'; data: unknown; at: number } | { status: 'unavailable' | 'unauthorized'; at: number };
 
 export const POSITIONS_CAPABILITIES = ['positions', 'open-trading'] as const;
@@ -65,22 +69,22 @@ function cycleOf(value: unknown): PositionCycle | null {
 const old = (value: string | null, now: number) => value === null || !Number.isFinite(Date.parse(value)) || now - Date.parse(value) > POSITIONS_STALE_AFTER_MS;
 
 // Throws on any shape violation: a partial list must not be reported as complete.
-// `incomplete` marks sources or scopes that could not confirm their positions, so an
-// empty match list is not mistaken for "no related positions".
-export function positionItems(response: unknown, bases: readonly string[], now: number): { items: HubPositionItem[]; incomplete: boolean } {
+// `incomplete` marks unconfirmed sources/scopes or a capped match list, so a subset
+// is never mistaken for the complete set of related positions.
+export function positionItems(response: unknown, bases: readonly string[], now: number): { items: HubPositionItem[]; incomplete: boolean; sourcesIncomplete: boolean; truncated: boolean; matchedCount: number; itemLimit: number } {
   const items: HubPositionItem[] = [], seen = new Map<string, number>();
-  let incomplete = false;
+  let sourcesIncomplete = false, matchedCount = 0;
   for (const sourceValue of list(object(response).sources)) {
     const source = object(sourceValue);
     const sourceName = text(source.name), sourceStatus = text(source.status);
-    if (source.data === null) { if (sourceStatus === 'unavailable' || sourceStatus === 'stale') incomplete = true; continue; }
+    if (source.data === null) { if (sourceStatus === 'unavailable' || sourceStatus === 'stale') sourcesIncomplete = true; continue; }
     for (const exchangeValue of list(object(source.data).exchanges)) {
       const exchange = object(exchangeValue), exchangeId = text(exchange.id), exchangeName = text(exchange.name);
       for (const accountValue of list(exchange.accounts)) {
         for (const scopeValue of list(object(accountValue).scopes)) {
           const scope = object(scopeValue), scopeStatus = text(scope.status), fetchedAt = optional(scope.fetchedAt);
           const positions = list(scope.positions);
-          if ((scopeStatus === 'error' || scopeStatus === 'loading') && !positions.length) incomplete = true;
+          if ((scopeStatus === 'error' || scopeStatus === 'loading') && !positions.length) sourcesIncomplete = true;
           const stale = scopeStatus === 'stale' || scopeStatus === 'error' || sourceStatus === 'stale' || sourceStatus === 'unavailable' || old(fetchedAt, now);
           for (const positionValue of positions) {
             const position = object(positionValue), symbol = text(position.symbol), instrumentId = text(position.instrumentId);
@@ -89,7 +93,9 @@ export function positionItems(response: unknown, bases: readonly string[], now: 
             const item = { quantity: text(position.quantity), quantityUnit: text(position.quantityUnit), entryPrice: optional(position.entryPrice),
               markPrice: optional(position.markPrice), unrealizedPnl: optional(position.unrealizedPnl), pnlCurrency: optional(position.pnlCurrency) };
             const base = matchBase(symbol, bases) ?? matchBase(instrumentId, bases);
-            if (!base || items.length >= MAX_POSITION_ITEMS) continue;
+            if (!base) continue;
+            matchedCount++;
+            if (items.length >= MAX_POSITION_ITEMS) continue;
             const identity = `${exchangeId}:${symbol}:${side}`, count = (seen.get(identity) ?? 0) + 1;
             seen.set(identity, count);
             // A stable venue id lets the module pair legs without relying on display names.
@@ -101,16 +107,17 @@ export function positionItems(response: unknown, bases: readonly string[], now: 
       }
     }
   }
-  return { items, incomplete };
+  const truncated = matchedCount > MAX_POSITION_ITEMS;
+  return { items, incomplete: sourcesIncomplete || truncated, sourcesIncomplete, truncated, matchedCount, itemLimit: MAX_POSITION_ITEMS };
 }
 
 export function positionsReply(request: PositionsRequest, outcome: PositionsOutcome, now: number): PositionsReply {
   const failed = (status: 'unavailable' | 'unauthorized'): PositionsReply => ({ type: 'positions', requestId: request.requestId, market: request.market, status, generatedAt: null, incomplete: false, items: [] });
   if (outcome.status !== 'ok') return failed(outcome.status);
   try {
-    const { items, incomplete } = positionItems(outcome.data, request.symbols, now);
+    const selection = positionItems(outcome.data, request.symbols, now);
     const generatedAt = (outcome.data as TradingPositionsResponse).generatedAt;
-    return { type: 'positions', requestId: request.requestId, market: request.market, status: 'ok', generatedAt: typeof generatedAt === 'string' && Number.isFinite(Date.parse(generatedAt)) ? generatedAt : null, incomplete, items };
+    return { type: 'positions', requestId: request.requestId, market: request.market, status: 'ok', generatedAt: typeof generatedAt === 'string' && Number.isFinite(Date.parse(generatedAt)) ? generatedAt : null, ...selection };
   } catch (error) {
     if (error instanceof MalformedPositions) return failed('unavailable');
     throw error;

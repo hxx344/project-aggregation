@@ -79,9 +79,10 @@ export function pairTotals(base: HubPositionItem, quote: HubPositionItem): PairT
 
 /**
  * A spread is shown only for a venue holding exactly one position of each leg in
- * opposite directions; any other mix is reported as unpaired instead of guessing.
+ * opposite directions; incomplete lists cannot establish uniqueness and yield no pairs.
  */
-export function relatedSpreadPairs(market: SpreadMarket, items: readonly HubPositionItem[], spreads: VenueSpreads | undefined): SpreadPair[] {
+export function relatedSpreadPairs(market: SpreadMarket, items: readonly HubPositionItem[], spreads: VenueSpreads | undefined, incomplete = false): SpreadPair[] {
+  if (incomplete) return [];
   const spec = PAIRS[market];
   const venues = new Map<string, { label: string; venue: string; base: HubPositionItem[]; quote: HubPositionItem[] }>();
   for (const item of items) {

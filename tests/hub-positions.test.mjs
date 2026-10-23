@@ -65,10 +65,63 @@ test('stale follows scope, source and read age', () => {
   assert.equal(stale({ fetchedAt: new Date(now - 91_000).toISOString() }), true);
 });
 
-test('items are capped and duplicate identities get distinct keys', () => {
-  const { items } = positionItems(response(Array.from({ length: 60 }, () => position('CLUSDT'))), ['CL'], now);
-  assert.equal(items.length, MAX_POSITION_ITEMS);
-  assert.equal(new Set(items.map(item => item.key)).size, MAX_POSITION_ITEMS);
+for (const count of [49, 50, 51, 60]) test(`${count} matching positions report the exact range without raising the item cap`, () => {
+  const data = response(Array.from({ length: count }, () => position('CLUSDT')));
+  const selection = positionItems(data, ['CL'], now);
+  assert.equal(selection.items.length, Math.min(count, MAX_POSITION_ITEMS));
+  assert.equal(new Set(selection.items.map(item => item.key)).size, selection.items.length, 'duplicate identities retain distinct keys');
+  assert.equal(selection.matchedCount, count);
+  assert.equal(selection.itemLimit, MAX_POSITION_ITEMS);
+  assert.equal(selection.truncated, count > MAX_POSITION_ITEMS);
+  assert.equal(selection.incomplete, count > MAX_POSITION_ITEMS);
+  assert.equal(selection.sourcesIncomplete, false, 'truncation alone does not mean a source failed');
+  const reply = positionsReply(positionsRequest(request()), { status: 'ok', data, at: 0 }, now);
+  assert.equal(reply.status, 'ok');
+  for (const field of ['items', 'matchedCount', 'itemLimit', 'truncated', 'incomplete', 'sourcesIncomplete']) assert.deepEqual(reply[field], selection[field], field);
+  for (const secret of ['account-secret-1', '机密账户名', 'revision-secret-7', 'scope-secret-9', 'leak', 'secret-position', 'asset-secret-project'])
+    assert.ok(!JSON.stringify(reply).includes(secret), secret);
+});
+
+test('unrelated positions do not count toward matches or cause truncation', () => {
+  for (const count of [0, 49, 50, 51, 60]) {
+    const unrelated = Array.from({ length: 60 }, (_, index) => position(index % 2 ? 'CLOUDUSDT' : 'BTCUSDT'));
+    const data = response([...unrelated, ...Array.from({ length: count }, () => position('CLUSDT')), ...unrelated]);
+    const reply = positionsReply(positionsRequest(request()), { status: 'ok', data, at: 0 }, now);
+    assert.equal(reply.matchedCount, count);
+    assert.equal(reply.items.length, Math.min(count, MAX_POSITION_ITEMS));
+    assert.equal(reply.truncated, count > MAX_POSITION_ITEMS);
+    assert.equal(reply.incomplete, count > MAX_POSITION_ITEMS);
+  }
+});
+
+test('matching totals span every source and malformed positions beyond the cap still reject the response', () => {
+  const data = response(Array.from({ length: 50 }, () => position('CLUSDT')));
+  const extra = response(Array.from({ length: 10 }, () => position('BZUSDT'))).sources[0];
+  data.sources.push(extra);
+  const reply = positionsReply(positionsRequest(request()), { status: 'ok', data, at: 0 }, now);
+  assert.equal(reply.matchedCount, 60);
+  assert.equal(reply.truncated, true);
+  assert.equal(reply.incomplete, true);
+  const malformed = response([...Array.from({ length: 50 }, () => position('CLUSDT')), position('BZUSDT', { quantity: 2 })]);
+  assert.equal(positionsReply(positionsRequest(request()), { status: 'ok', data: malformed, at: 0 }, now).status, 'unavailable');
+});
+
+test('source or scope failures remain distinguishable when the matching list is also truncated', () => {
+  for (const failure of ['source-unavailable', 'source-stale', 'scope-error', 'scope-loading']) {
+    const data = response(Array.from({ length: 60 }, () => position('CLUSDT')));
+    if (failure.startsWith('source-')) data.sources.push({ name: 'Asset 备用账本', status: failure.slice(7), data: null });
+    else {
+      const scopes = data.sources[0].data.exchanges[0].accounts[0].scopes;
+      scopes.push({ ...scopes[0], status: failure.slice(6), positions: [] });
+    }
+    const reply = positionsReply(positionsRequest(request()), { status: 'ok', data, at: 0 }, now);
+    assert.equal(reply.status, 'ok', failure);
+    assert.equal(reply.matchedCount, 60, 'the count describes only sources/scopes that provided a list');
+    assert.equal(reply.items.length, 50);
+    assert.equal(reply.sourcesIncomplete, true, failure);
+    assert.equal(reply.truncated, true, failure);
+    assert.equal(reply.incomplete, true, failure);
+  }
 });
 
 test('replies map outcomes and reject malformed responses', () => {

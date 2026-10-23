@@ -99,6 +99,8 @@ async (page) => {
     assert(reads() === 1, `concurrent requests share one read (${reads()})`);
     assert(first.status === 'ok' && second.status === 'ok' && first.market === 'oil' && typeof first.generatedAt === 'string', 'oil replies are ok');
     assert(first.incomplete === true && second.incomplete === true, 'an unavailable source without data marks the reply incomplete');
+    assert(first.sourcesIncomplete === true && second.sourcesIncomplete === true, 'source failures are distinct from truncation');
+    assert(first.truncated === false && second.truncated === false && first.matchedCount === 3 && second.matchedCount === 3 && first.itemLimit === 50 && second.itemLimit === 50, 'the successful replies expose the exact matching range');
     assert(JSON.stringify(first.items.map(item => [item.symbol, item.base, item.stale])) === JSON.stringify([['CLUSDT', 'CL', false], ['BZUSDT', 'BZ', false], ['CL-USDT-SWAP', 'CL', true]]), `oil items ${JSON.stringify(first.items)}`);
     const bz = first.items.find(item => item.symbol === 'BZUSDT');
     assert(bz.entryPrice === null && bz.unrealizedPnl === null && bz.side === 'short' && bz.quantity === '0.123456789012345678', 'null stays null and decimals stay strings');
@@ -106,7 +108,7 @@ async (page) => {
     for (const secret of ['account-secret-1', '机密账户名', 'revision-secret-7', 'scope-secret', 'leaked-detail', 'secret-position', 'asset-secret-project', 'asset-secret-missing'])
       assert(!serialized.includes(secret), `reply leaks ${secret}`);
     assert(first.items.every(item => !('accountId' in item) && !('name' in item) && !('revision' in item) && Object.keys(item).length === 15 && item.exchangeId === 'binance'), 'items carry only protocol fields');
-    assert(JSON.stringify(Object.keys(first).sort()) === JSON.stringify(['channel', 'generatedAt', 'incomplete', 'items', 'market', 'requestId', 'status', 'type', 'version']), `reply fields ${Object.keys(first)}`);
+    assert(JSON.stringify(Object.keys(first).sort()) === JSON.stringify(['channel', 'generatedAt', 'incomplete', 'itemLimit', 'items', 'market', 'matchedCount', 'requestId', 'sourcesIncomplete', 'status', 'truncated', 'type', 'version']), `reply fields ${Object.keys(first)}`);
 
     await ask(monitor, request('gold-1', { market: 'cl-xau', symbols: ['XAU', 'CL', 'BZ'] }));
     const gold = await reply(monitor, 'gold-1');

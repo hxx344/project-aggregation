@@ -18,9 +18,23 @@ async (page) => {
     priceCurrency: 'USDT', notionalCurrency: 'USDT', pnlCurrency: 'USDT', marginMode: 'cross', sourceUpdatedAt: stamp(), ...(cycle ? { cycle } : {}) });
   const closed = () => ({ status: 'complete', since: new Date(Date.now() - 86_400_000).toISOString(), closedQuantity: '4', closePrice: '63.1', realizedPnl: '8.75', fees: '-0.42', funding: '0.11', net: '8.44', currency: 'USDT', note: null, updatedAt: stamp() });
   const failed = () => ({ status: 'unavailable', since: null, closedQuantity: null, closePrice: null, realizedPnl: null, fees: null, funding: null, net: null, currency: null, note: '本轮成交读取失败，稍后重试', updatedAt: stamp() });
-  const positionsState = () => ({ generatedAt: stamp(), sources: [{ projectId: 'asset-fixture', name: 'Asset', status: 'ready', error: null, checkedAt: stamp(), data: { schemaVersion: 1, generatedAt: stamp(), exchanges: [
+  let matchingCount = null, positionsUnavailable = false, sourceUnavailable = false;
+  const positionsState = () => {
+    const state = { generatedAt: stamp(), sources: [{ projectId: 'asset-fixture', name: 'Asset', status: 'ready', error: null, checkedAt: stamp(), data: { schemaVersion: 1, generatedAt: stamp(), exchanges: [
     { id: 'binance', name: 'Binance', accounts: [{ id: 'account-fixture', name: '账户', configured: true, revision: 'r1', scopes: [{ id: 'usdm', label: 'U 本位合约', status: 'live', refreshing: false, fetchedAt: stamp(), error: null,
-      positions: [position('CLUSDT', 'long', '62', '12.5', closed()), position('BZUSDT', 'short', '66', '-3.25', failed()), position('XAUUSDT', 'long', '4000', '1')] }] }] }] } }] });
+      positions: [position('CLUSDT', 'long', '62', '12.5', closed()), position('BZUSDT', 'short', '66', '-3.25', failed()), position('XAUUSDT', 'long', '4000', '1')] }] }] }] } }] };
+    if (matchingCount !== null) {
+      const exchange = state.sources[0].data.exchanges[0];
+      const extra = structuredClone(exchange); extra.id = 'bybit'; extra.name = 'Bybit';
+      extra.accounts[0].scopes[0].positions = Array.from({ length: matchingCount - 3 }, () => position('CLUSDT', 'long', '62', '0'));
+      exchange.accounts[0].scopes[0].positions = exchange.accounts[0].scopes[0].positions.slice(0, 2);
+      const hiddenDuplicate = structuredClone(exchange);
+      hiddenDuplicate.accounts[0].scopes[0].positions = [position('CLUSDT', 'long', '62', '0')];
+      state.sources[0].data.exchanges.push(extra, hiddenDuplicate);
+    }
+    if (sourceUnavailable) state.sources.push({ projectId: 'asset-missing', name: 'Asset 备用账本', status: 'unavailable', error: '来源不可用', checkedAt: stamp(), data: null });
+    return state;
+  };
   const errors = [], unexpected = [], external = [];
   let positionReads = 0;
   page.on('pageerror', error => errors.push(error.message));
@@ -48,7 +62,7 @@ async (page) => {
     if (path === '/api/overview/events' || path === '/api/system/updates/events') return route.abort();
     if (path === '/api/overview') return send(overview());
     if (path === '/api/system/updates') return send({ enabled: false, checking: false, checkedAt: null, checkError: null, planId: null, expiresAt: null, modules: [], job: null });
-    if (path === '/api/trading/positions') { positionReads += 1; return send(positionsState()); }
+    if (path === '/api/trading/positions') { positionReads += 1; return positionsUnavailable ? send({ error: 'Fixture positions unavailable' }, 503) : send(positionsState()); }
     if (path.startsWith('/api/')) { unexpected.push(`${request.method()} ${path}`); return send({ error: `Unexpected API ${path}` }, 404); }
     return route.continue();
   };
@@ -81,8 +95,38 @@ async (page) => {
     const target = new URL(page.url()).searchParams;
     assert(target.get('view') === 'trading' && target.get('tradingSection') === 'positions', `open-trading url ${page.url()}`);
     assert(reads >= 1, 'positions were read through the host');
+
+    for (const count of [49, 50, 51, 60]) {
+      matchingCount = count;
+      await page.goto(`${origin}/?view=project&id=monitor`);
+      await panel.waitFor({ timeout: 20_000 });
+      assert(await panel.locator('.related-positions-list > li').count() === Math.min(count, 50), `the ${count}-match list keeps the 50-item cap`);
+      const text = await panel.innerText();
+      assert(!await panel.locator('[data-pair-status="paired"]').count(), 'a hidden or visible duplicate cannot confirm a unique pair');
+      if (count > 50) {
+        assert(text.includes(`仅显示前 50 条（共 ${count} 条匹配）`), `the range is explicit: ${text}`);
+        assert(text.includes('持仓列表不完整，暂不确认配对'), 'the missing pairing conclusion is explained');
+      } else {
+        assert(!text.includes('仅显示前') && !text.includes('持仓列表不完整'), 'an uncapped list does not claim truncation');
+      }
+    }
+    sourceUnavailable = true;
+    await page.goto(`${origin}/?view=project&id=monitor`);
+    await panel.waitFor({ timeout: 20_000 });
+    const mixedText = await panel.innerText();
+    assert(mixedText.includes('部分数据源不可用，列表可能不完整') && mixedText.includes('仅显示前 50 条（已读取部分中共 60 条匹配）'), `source failure and truncation are both explained: ${mixedText}`);
+    assert(!await panel.locator('[data-pair-status="paired"]').count(), 'mixed source failure and truncation cannot confirm a pair');
+    positionsUnavailable = true;
+    await page.clock.install();
+    await page.clock.fastForward(61_000);
+    const kept = frame.locator('[data-related-positions="oil"][data-status="unavailable"]');
+    await kept.waitFor({ timeout: 20_000 });
+    const keptText = await kept.innerText();
+    assert(keptText.includes('仅显示前 50 条（已读取部分中共 60 条匹配）') && keptText.includes('部分数据源不可用') && keptText.includes('保留 ') && keptText.includes('持仓列表不完整，暂不确认配对'), `a failed refresh preserves source completeness and range metadata: ${keptText}`);
+    assert(!await kept.locator('[data-pair-status="paired"]').count(), 'kept truncated data still cannot confirm a pair');
+    assert(await kept.locator('.related-positions-list > li').count() === 50, 'the previous capped list remains visible');
     assert(!unexpected.length && !external.length && !errors.length, JSON.stringify({ unexpected, external, errors }));
-    return { passed: true, positionReads, scenarios: ['real Monitor connects through the bridge', 'oil positions filtered to CL/BZ', 'opening spread paired by exchange', 'PnL rounded to cents', 'pair totals and closing spread', 'closed-trade summary per leg', 'alert digest beside chart', 'open-trading to positions'] };
+    return { passed: true, positionReads, scenarios: ['real Monitor connects through the bridge', 'oil positions filtered to CL/BZ', 'opening spread paired by exchange', 'PnL rounded to cents', 'pair totals and closing spread', 'closed-trade summary per leg', 'alert digest beside chart', 'open-trading to positions', '49/50/51/60-match range boundaries', 'truncated lists cannot confirm unique pairs', 'source failure and truncation are both visible', 'failed refresh retains truncation metadata'] };
   } finally {
     await page.goto('about:blank').catch(() => {});
     await page.unroute('**/*', handler);

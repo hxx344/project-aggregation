@@ -137,6 +137,59 @@ test('incomplete is accepted as a boolean, defaults to false for older hosts and
   for (const bad of ['yes', 1, null]) assert.equal(parsePositionsReply(reply({ incomplete: bad })), null);
 });
 
+test('position ranges preserve exact totals and truncation always makes the list incomplete', () => {
+  for (const matchedCount of [49, 50, 51, 60]) {
+    const items = Array.from({ length: Math.min(matchedCount, 50) }, (_, index) => item({ key: `k${index}` }));
+    const parsed = parsePositionsReply(reply({ items, truncated: matchedCount > 50, matchedCount, itemLimit: 50, incomplete: false }));
+    assert.ok(parsed);
+    assert.equal(parsed.truncated, matchedCount > 50);
+    assert.equal(parsed.matchedCount, matchedCount);
+    assert.equal(parsed.itemLimit, 50);
+    assert.equal(parsed.incomplete, matchedCount > 50, 'a truncated reply cannot claim completeness');
+  }
+  const range = { truncated: false, matchedCount: 1, itemLimit: 50 };
+  for (const bad of [
+    { truncated: 'yes' }, { matchedCount: -1 }, { matchedCount: 1.5 }, { matchedCount: Number.MAX_SAFE_INTEGER + 1 },
+    { itemLimit: 0 }, { itemLimit: 51 }, { itemLimit: 1.5 }, { matchedCount: 2 }, { truncated: true },
+    { truncated: undefined }, { matchedCount: undefined }, { itemLimit: undefined },
+  ]) assert.equal(parsePositionsReply(reply({ ...range, ...bad })), null, JSON.stringify(bad));
+  const legacy = parsePositionsReply(reply());
+  assert.equal(legacy.truncated, undefined, 'older hosts without range metadata remain supported');
+});
+
+test('source incompleteness survives alongside truncation and contributes to the aggregate flag', () => {
+  for (const matchedCount of [1, 60]) for (const sourcesIncomplete of [false, true]) {
+    const truncated = matchedCount > 50;
+    const items = Array.from({ length: Math.min(matchedCount, 50) }, (_, index) => item({ key: `k${index}` }));
+    const parsed = parsePositionsReply(reply({ items, sourcesIncomplete, truncated, matchedCount, itemLimit: 50, incomplete: false }));
+    assert.ok(parsed);
+    assert.equal(parsed.sourcesIncomplete, sourcesIncomplete, 'the source failure is independent from the item cap');
+    assert.equal(parsed.truncated, truncated);
+    assert.equal(parsed.matchedCount, matchedCount, 'a partial source count is preserved without inventing a full total');
+    assert.equal(parsed.incomplete, sourcesIncomplete || truncated);
+  }
+  const pureTruncation = parsePositionsReply(reply({ items: Array.from({ length: 50 }, () => item()), sourcesIncomplete: false, truncated: true, matchedCount: 60, itemLimit: 50, incomplete: true }));
+  assert.equal(pureTruncation.sourcesIncomplete, false, 'the combined flag must not create a source failure on a capped healthy read');
+  assert.equal(parsePositionsReply(reply({ incomplete: true })).sourcesIncomplete, true, 'legacy source warnings remain visible');
+  assert.equal(parsePositionsReply(reply({ status: 'unavailable', items: [], generatedAt: null, sourcesIncomplete: true })).sourcesIncomplete, false);
+  for (const sourcesIncomplete of ['yes', 1, null]) assert.equal(parsePositionsReply(reply({ sourcesIncomplete })), null);
+});
+
+test('an incomplete subset cannot confirm a unique spread pair even when the visible legs are unique', () => {
+  for (const [market, base, quote] of [['oil', 'CL', 'BZ'], ['hynix', 'SKHY', 'SKHYNIX']]) {
+    const items = [
+      item({ key: 'base', base, symbol: `${base}USDT`, side: 'long' }),
+      item({ key: 'quote', base: quote, symbol: `${quote}USDT`, side: 'short' }),
+      ...Array.from({ length: 48 }, (_, index) => item({ key: `other-${index}`, base, symbol: `${base}USDT`, exchangeId: 'bybit', exchange: 'Bybit' })),
+    ];
+    const parsed = parsePositionsReply(reply({ market, items, incomplete: true, truncated: true, matchedCount: 51, itemLimit: 50 }));
+    assert.equal(relatedSpreadPairs(market, parsed.items, undefined)[0].status, 'paired', 'the hidden duplicate would otherwise look like a unique pair');
+    assert.deepEqual(relatedSpreadPairs(market, parsed.items, undefined, parsed.incomplete), [], 'no pair is inferred from a truncated list');
+    assert.deepEqual(relatedSpreadPairs(market, items.slice(0, 2), undefined, true), [], 'other incomplete sources use the same degradation');
+    assert.equal(relatedSpreadPairs(market, items.slice(0, 2), undefined, false)[0].status, 'paired', 'a complete list can still confirm the pair');
+  }
+});
+
 test('an optional stable exchange id is kept only when well formed', () => {
   assert.equal(parsePositionsReply(reply({ items: [item({ exchangeId: 'binance' })] })).items[0].exchangeId, 'binance');
   assert.equal('exchangeId' in parsePositionsReply(reply()).items[0], false);
