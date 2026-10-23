@@ -7,13 +7,14 @@ import unittest
 from unittest.mock import patch
 
 from tests import test_pair_integration as integration
-from tests.test_cycle_account_snapshot import (
-    ACCOUNT, BRACKET, ORDERS, RISK, LocalQuoteMarket, account_row, cycle_account_responses, risk_row)
+from tests.account_fixtures import (
+    ACCOUNT, BRACKET, ORDERS, RISK, LocalQuoteMarket, account_row, join_margin_responses, risk_row)
 from tests.test_exchange_hardening import FixtureAPI
 from trading.engine import Engine
 from trading.exchange import ExchangeError, LiveBroker
 from trading.models import TradingError, dec
-from trading.pair_execution import PairTrader, empty_progress, runtime_default
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import empty_progress, runtime_default
 from trading.paper import PAPER_BRACKETS
 from trading.store import Store
 
@@ -38,7 +39,7 @@ class PairSymbolChangeTests(unittest.TestCase):
             side_effect=AssertionError("unexpected transfer")))
 
     def guard_broker(self, broker):
-        for method in ("submit", "cancel", "set_leverage", "set_cycle_leverage"):
+        for method in ("submit", "cancel", "set_leverage"):
             self.no_writes.enter_context(patch.object(broker, method,
                 side_effect=AssertionError("unexpected " + method)))
 
@@ -77,13 +78,10 @@ class PairSymbolChangeTests(unittest.TestCase):
             self.assertFalse(pair["enabled"])
             for key in ("id", "long_account_id", "short_account_id", "ordinary", "margin"):
                 self.assertEqual(pair[key], self.pair[key])
-            self.assertEqual(pair["cycle"], {**self.pair["cycle"], "symbol": symbol})
             state = self.f.store.get("pair_runtime:gold")
             self.assertEqual(state["symbol"], symbol)
             self.assertEqual(state["phase"], "paused")
-            self.assertEqual(state["progress"]["completed_cycles"], 7)
             self.assertEqual(state["snapshots"], {})
-            self.assertNotIn("config", state["progress"])
             for key in ("last_batch", "attention", "retry_after"):
                 self.assertNotIn(key, state)
             archive = self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")
@@ -96,13 +94,12 @@ class PairSymbolChangeTests(unittest.TestCase):
         self.original["owned"]["LONG"] = "2"
         self.f.store.put("pair_runtime:gold", self.original)
         with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("unexpected read")):
-            self.switch(GOLD, cycle={"hold_seconds": 120})
+            self.switch(GOLD, ordinary={"threshold": "12000"})
         self.assertEqual(self.f.store.get("pair_runtime:gold"), self.original)
 
     def test_restart_retains_new_symbol_and_both_member_bindings(self):
         pair = self.switch()
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         self.assertEqual(restarted.store.pair("gold"), pair)
         self.assertEqual(restarted.store.get("pair_runtime:gold")["symbol"], SILVER)
         self.assertEqual(restarted.store.get("pair_runtime:gold")["phase"], "paused")
@@ -123,12 +120,10 @@ class PairSymbolChangeTests(unittest.TestCase):
         pair = self.switch()
         state = self.f.store.get("pair_runtime:gold")
         self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
-        self.assertEqual(state["progress"], empty_progress(state["owned"], completed=5))
         self.assertEqual(state["phase"], "paused")
         self.assertFalse(pair["enabled"])
         self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         self.assertEqual(restarted.store.get("pair_runtime:gold")["owned"], state["owned"])
         self.assertEqual(restarted.store.pair("gold")["symbol"], SILVER)
 
@@ -184,7 +179,6 @@ class PairSymbolChangeTests(unittest.TestCase):
         self.assertEqual(pair["symbol"], SILVER)
         self.assertFalse(pair["enabled"])
         self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
-        self.assertEqual(state["progress"]["baseline"], state["owned"])
         self.assertEqual(broker.state["positions"], holdings)
         self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
 
@@ -260,7 +254,7 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
         self.live = {}
         for aid in ("test", "second"):
             self.f.store.save_account({**self.f.store.account(aid), "mode": "live"})
-            responses = cycle_account_responses((GOLD, SILVER))
+            responses = join_margin_responses((GOLD, SILVER))
             responses["/fapi/v3/positionSide/dual"] = {"dualSidePosition": True}
             responses[RISK] = [risk_row(row) for row in responses[ACCOUNT]["positions"]]
             responses[BRACKET] = [{"symbol": symbol, "brackets": PAPER_BRACKETS} for symbol in (GOLD, SILVER)]
@@ -305,7 +299,6 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
         self.assertEqual(pair["symbol"], SILVER)
         self.assertFalse(pair["enabled"])
         self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
-        self.assertEqual(state["progress"]["baseline"], state["owned"])
         self.assertEqual(api.responses[ACCOUNT]["positions"], holdings)
         self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
 
@@ -341,7 +334,7 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
         self.assert_no_change()
 
     def test_snapshot_event_after_reads_cannot_authorize_commit(self):
-        with self.after_reads(lambda _: self.live["test"]._cycle_account_event("ACCOUNT_UPDATE")), \
+        with self.after_reads(lambda _: self.live["test"]._private_account_event("ACCOUNT_UPDATE")), \
                 self.assertRaises(TradingError):
             self.switch()
         self.assert_no_change()

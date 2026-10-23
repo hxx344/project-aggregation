@@ -7,10 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from tests.helpers import Fixture, account
-from tests.test_cycle_account_snapshot import (ACCOUNT, BRACKET, ORDERS, RISK, SYMBOL,
-    LocalQuoteMarket, cycle_account_responses, risk_row)
+from tests.account_fixtures import (ACCOUNT, BRACKET, ORDERS, RISK, SYMBOL,
+    LocalQuoteMarket, join_margin_responses, risk_row)
 from tests.test_exchange_hardening import FixtureAPI
-from trading.engine import Engine, snapshot_json
+from trading.engine import Engine
 from trading.exchange import LiveBroker
 from trading.models import TradingError, dec
 from trading.pairing import validate_pair
@@ -20,7 +20,7 @@ from trading.store import Store
 
 def pair_config(**changes):
     return {"id": "gold", "name": "黄金配对", "long_account_id": "test",
-            "short_account_id": "second", "cycle": {"enabled": True}, **changes}
+            "short_account_id": "second", "ordinary": {"enabled": True}, **changes}
 
 
 class PairIntegrationTests(unittest.TestCase):
@@ -83,8 +83,6 @@ class PairIntegrationTests(unittest.TestCase):
             self.engine.pairs.reconcile_flat("gold")
             state = self.f.store.get("pair_runtime:gold")
             self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
-            self.assertEqual(state["progress"]["baseline"], state["owned"])
-            self.assertEqual(state["progress"]["completed_cycles"], 3)
             self.assertEqual(state["daily_volume"], {"2026-09-29": {"long": "100", "short": "200"}})
             self.engine.pairs.delete("gold")
         self.assertIsNone(self.f.store.pair("gold"))
@@ -118,8 +116,9 @@ class PairIntegrationTests(unittest.TestCase):
             self.f.store.save_pair(pair)
         with self.assertRaisesRegex(TradingError, "方向固定"):
             self.engine.pairs.configure("gold", {"long_account_id": "third"})
-        with self.assertRaisesRegex(TradingError, "同时启用"):
-            self.engine.pairs.configure("gold", {"ordinary": {"enabled": True}})
+        configured = self.engine.pairs.configure("gold", {"ordinary": {"enabled": True}})
+        self.assertTrue(configured["ordinary"]["enabled"])
+        self.assertNotIn("cycle", configured)
 
     def test_pending_and_unknown_transfer_block_changes_and_release(self):
         self.create()
@@ -177,15 +176,7 @@ class PairIntegrationTests(unittest.TestCase):
         pair = self.create()
         pair["enabled"] = True
         self.f.store.save_pair(pair)
-        self.assertNotIn("XAUUSD1", self.engine.fast_capacity_targets(self.f.store.accounts()))
-        snapshots = {side: snapshot_json(self.engine.broker(self.f.store.account(aid)).snapshot([SYMBOL]), [SYMBOL])
-            for side, aid in (("long", "test"), ("short", "second"))}
-        self.f.store.put("pair_runtime:gold", {"snapshots": snapshots})
-        self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts())["XAUUSD1"], {5})
-        self.assertEqual(pair["cycle"]["leverage"], 2)
-        snapshots["short"]["timestamp"] -= 10
-        self.f.store.put("pair_runtime:gold", {"snapshots": snapshots})
-        self.assertNotIn("XAUUSD1", self.engine.fast_capacity_targets(self.f.store.accounts()))
+        self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts())["XAUUSD1"], {5, 10, 20})
         self.assertIn("XAUUSD1", self.engine.required_monitoring_symbols())
         self.assertIsNotNone(self.engine.pairs.active_for_account("test"))
 
@@ -199,8 +190,7 @@ class PairIntegrationTests(unittest.TestCase):
         self.assertEqual(manager.poll_interval(pair, {}), 1)
         self.f.store.put("pair_margin:gold", {})
         pair = {**pair, "enabled": True}
-        self.assertEqual(manager.poll_interval(pair, {}), 1)
-        pair["cycle"]["enabled"] = False
+        self.assertEqual(manager.poll_interval(pair, {}), 2)
         pair["ordinary"]["enabled"] = True
         self.assertEqual(manager.poll_interval(pair, {}), 2)
         pair["ordinary"]["enabled"] = False
@@ -254,7 +244,6 @@ class PairIntegrationTests(unittest.TestCase):
         runtime = self.f.store.get("pair_runtime:gold")
         self.assertEqual(runtime["owned"], {"LONG": "0", "SHORT": "0"})
         self.assertEqual(runtime["phase"], "paused")
-        self.assertEqual(runtime["progress"]["completed_cycles"], 9)
         self.assertNotIn("attention", runtime)
         self.assertIn("2026-09-29", runtime["daily_volume"])
         self.assertEqual(self.f.store.get("pair_batch:old"), history)
@@ -300,7 +289,7 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
         self.live = {}
         for aid in ("test", "second"):
             self.f.store.save_account({**self.f.store.account(aid), "mode": "live"})
-            responses = cycle_account_responses()
+            responses = join_margin_responses()
             responses["/fapi/v3/positionSide/dual"] = {"dualSidePosition": True}
             responses[RISK] = [risk_row(row) for row in responses[ACCOUNT]["positions"]]
             responses[BRACKET] = {"symbol": SYMBOL, "brackets": PAPER_BRACKETS}
@@ -319,26 +308,12 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self.assertTrue(all(call[0] == "GET" for broker in self.live.values() for call in broker.api.calls))
 
-    def test_live_capacity_uses_both_current_leases_without_stale_view_fallback(self):
-        self.create()
-        self.engine.pairs.enable("gold", True)
-        self.f.store.put("pair_runtime:gold", {"snapshots": {
-            side: {"timestamp": time.time(), "positions": [{"symbol": SYMBOL, "leverage": 5}]}
-            for side in ("long", "short")}})
-        with patch.object(self.live["test"].cycle_cache, "current_leverage", return_value=10), \
-             patch.object(self.live["second"].cycle_cache, "current_leverage", return_value=10) as second:
-            self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts()), {SYMBOL: {10}})
-            second.return_value = 20
-            self.assertNotIn(SYMBOL, self.engine.fast_capacity_targets(self.f.store.accounts()))
-            second.side_effect = TradingError("热快照已失效")
-            self.assertNotIn(SYMBOL, self.engine.fast_capacity_targets(self.f.store.accounts()))
-
     def revoke_after_reads(self):
         original = self.engine.pairs._read_members
 
         def read(*args, **kwargs):
             result = original(*args, **kwargs)
-            self.live["test"]._cycle_account_event("ORDER_TRADE_UPDATE")
+            self.live["test"]._private_account_event("ORDER_TRADE_UPDATE")
             return result
 
         return patch.object(self.engine.pairs, "_read_members", side_effect=read)
@@ -352,7 +327,7 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
                 def call(method, path, *args, **kwargs):
                     value = original(method, path, *args, **kwargs)
                     if path == ORDERS:
-                        broker._cycle_account_event("ACCOUNT_UPDATE")
+                        broker._private_account_event("ACCOUNT_UPDATE")
                     return value
 
                 with patch.object(broker.api, "call", side_effect=call), self.assertRaisesRegex(TradingError, "失效"):
@@ -380,7 +355,7 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
             value = second_call(method, path, *args, **kwargs)
             if path == ORDERS:
                 self.assertTrue(first_read.wait(2))
-                first._cycle_account_event("ORDER_TRADE_UPDATE")
+                first._private_account_event("ORDER_TRADE_UPDATE")
             return value
 
         with patch.object(first.api, "call", side_effect=read_first), \
@@ -392,7 +367,7 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
         self.create()
         runtime = {"attention": "仍需核对", "owned": {"LONG": "0", "SHORT": "0"}}
         self.f.store.put("pair_runtime:gold", runtime)
-        self.verify.side_effect = lambda pair: self.live["second"]._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        self.verify.side_effect = lambda pair: self.live["second"]._private_account_event("ACCOUNT_CONFIG_UPDATE")
         with self.assertRaisesRegex(TradingError, "失效"):
             self.engine.pairs.enable("gold", True)
         self.assertFalse(self.f.store.pair("gold")["enabled"])
@@ -431,7 +406,7 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
                 return original_lock.__exit__(*args)
 
         def event():
-            broker._cycle_account_event("ACCOUNT_UPDATE")
+            broker._private_account_event("ACCOUNT_UPDATE")
             committed.append(self.f.store.pair("gold") is not None)
             finished.set()
 

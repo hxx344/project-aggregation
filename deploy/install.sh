@@ -1512,7 +1512,7 @@ input_keys() {
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc scripts/install-hooks.mjs \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
-    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json) || return
+    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json) || return
   typecheck_tree=$(tree_hash src "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash src public "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
@@ -1533,10 +1533,9 @@ input_keys() {
   test_stamp="$APP_DIR/cache/tested-$test_key"
   legacy_runner_blob=$(git --git-dir="$APP_DIR/repository.git" rev-parse "$commit:scripts/modules.mjs" 2>/dev/null) || legacy_runner_blob=
   for module in "${MODULE_BUILD_IDS[@]}"; do
-    # ASTER serves a static dashboard. Its Python runtime is not a frontend
-    # input, except for the cycle configuration imported by the dashboard.
+    # ASTER serves a static dashboard. Its Python runtime is not a frontend input.
     if [[ "$module" == aster ]]; then
-      module_inputs=(modules/aster/dashboard modules/aster/trading/cycle-config.json \
+      module_inputs=(modules/aster/dashboard \
         modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local)
     elif [[ "$module" == monitor || "$module" == crossex ]]; then
       module_inputs=("modules/$module" "${module_shared_inputs[@]}")
@@ -1683,7 +1682,7 @@ prepare_dependencies() {
   for name in package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc scripts/install-hooks.mjs \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
-    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json modules/aster/trading/cycle-config.json; do
+    modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json; do
     git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:$name" 2>/dev/null || continue
     mkdir -p "$(dirname "$staging/$name")"
     git --git-dir="$APP_DIR/repository.git" show "$commit:$name" > "$staging/$name"

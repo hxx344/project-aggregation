@@ -9,11 +9,12 @@ from unittest.mock import patch
 
 from tests import test_pair_integration as integration
 from tests import test_pair_trading as trading_tests
-from tests.test_cycle_account_snapshot import ACCOUNT, ORDERS, RISK, risk_row
+from tests.account_fixtures import ACCOUNT, ORDERS, RISK, risk_row
 from trading.exchange import AmbiguousOrder, ExchangeError, LiveBroker, RateBudget, RequestNotSent
 from trading.execution import Executor
 from trading.models import TradingError, dec, wire
-from trading.pair_execution import PairTrader, empty_progress, runtime_default
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import empty_progress, runtime_default
 from trading.store import Store
 
 
@@ -27,7 +28,7 @@ def seed_pending(engine, before=None):
     pair = store.pair("gold")
     if pair is None:
         pair = engine.pairs.create(integration.pair_config(
-            ordinary={"enabled": True}, cycle={"enabled": False}))
+            ordinary={"enabled": True}))
     before = dict(before or {"LONG": "3.039", "SHORT": "3.039"})
     _, brokers, identities = PairTrader(engine)._members(pair)
     for key, side in (("long", "LONG"), ("short", "SHORT")):
@@ -50,7 +51,7 @@ def seed_pending(engine, before=None):
                "identities": identities, "created_at": time.time() - 3600, "quantity": "0.2",
                "before": before, "target": {side: wire(dec(qty) + dec("0.2")) for side, qty in before.items()},
                "leverage": 5, "legs": legs, "repairs": [], "repair_attempts": 0,
-               "config": {**pair["cycle"], "leverage": 5}}
+               "config": {"symbol": pair["symbol"], "leverage": 5}}
     runtime = {"phase": "reconciling", "reason": "原订单结果未知", "owned": before,
                "identities": identities, "progress": empty_progress(before, 4), "pending": pending,
                "daily_volume": {"2026-09-29": {"long": "123", "short": "456"}},
@@ -87,7 +88,7 @@ class PairOrderRecoveryTests(unittest.TestCase):
         stack = ExitStack()
         for key in ("long", "short"):
             broker = self.broker(key)
-            for method in ("submit", "set_leverage", "set_cycle_leverage"):
+            for method in ("submit", "set_leverage"):
                 stack.enter_context(patch.object(broker, method, side_effect=AssertionError("recovery must not trade")))
         stack.enter_context(patch("trading.margin_balance.MarginBalancer.tick", side_effect=AssertionError("recovery must not transfer")))
         return stack
@@ -128,9 +129,6 @@ class PairOrderRecoveryTests(unittest.TestCase):
         self.assertFalse(self.f.store.pair("gold")["enabled"])
         self.assertIsNone(state["pending"])
         self.assertEqual(state["owned"], original["owned"])
-        self.assertEqual(state["progress"]["baseline"], original["owned"])
-        self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(state["progress"]["completed_cycles"], 4)
         self.assertEqual(state["daily_volume"], original["daily_volume"])
         self.assertEqual(state["last_batch"], original["last_batch"])
         self.assertEqual(self.f.store.get("pair_batch:completed-before"), history)
@@ -689,7 +687,7 @@ class PairOrderRecoveryLiveReadTests(unittest.TestCase):
         read_members = self.engine.pairs._read_members
         def revoke(*args, **kwargs):
             result = read_members(*args, **kwargs)
-            self.live["second"]._cycle_account_event("ORDER_TRADE_UPDATE")
+            self.live["second"]._private_account_event("ORDER_TRADE_UPDATE")
             return result
         with self.no_writes(), patch.object(self.engine.pairs, "_read_members", side_effect=revoke), self.assertRaises(TradingError):
             self.confirm(review["token"])
@@ -735,7 +733,6 @@ class PairExplicitOrderRejectionTests(unittest.TestCase):
     def setUp(self):
         trading_tests.PairTradingTests.setUp(self)
         pair = self.store.pair("gold")
-        pair["cycle"]["enabled"] = False
         pair["ordinary"]["enabled"] = True
         self.store.save_pair(pair)
         self.before = {"LONG": "0.3", "SHORT": "0.3"}

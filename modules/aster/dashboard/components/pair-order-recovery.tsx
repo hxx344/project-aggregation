@@ -68,7 +68,6 @@ function PairOrderRecoveryDialog({
   useEffect(() => () => request.current?.abort(), []);
   const block = pairOrderRecoveryBlock(pair);
   const locked = disabled || Boolean(block);
-  const cycleOpening = pair.state?.pending?.kind === 'cycle';
   const skipBlock = pairOrderRecoverySkipBlock(pair);
   const reviewBlock = review
     ? pairOrderRecoveryReviewBlock(review, pair, now)
@@ -200,7 +199,7 @@ function PairOrderRecoveryDialog({
         }}
       >
         <DialogContent
-          className="cycle-recovery-dialog sm:max-w-2xl"
+          className="order-recovery-dialog sm:max-w-2xl"
           showCloseButton={!loading}
         >
           <DialogHeader>
@@ -229,11 +228,7 @@ function PairOrderRecoveryDialog({
               </Button>
             </div>
           ) : null}
-          {cycleOpening ? (
-            <p className="muted">
-              循环开仓将按原订单编号核对历史回执与实际持仓；未找到不等于没有成交。人工归档仍需通过完整核验并由你确认，归档后旧订单继续跟踪。
-            </p>
-          ) : pair.state?.pending?.kind === 'ordinary' ? (
+          {pair.state?.pending?.kind === 'ordinary' ? (
             <>
               <p className="muted">
                 普通开仓原订单与补偿订单均结束、账户核验通过后，两侧数量一致则保留为底仓，包括手动增加的仓位；数量不一致且与本批回执吻合时，后台才回退本批新增量。
@@ -291,7 +286,7 @@ function PairOrderRecoveryDialog({
               <p className="muted">{checked.archive_reason}</p>
               {checked.completed ? (
                 <p>
-                  本批订单已完成核对，配对组仍保持暂停；请返回配对组查看持仓与循环状态。
+                  本批订单已完成核对，配对组仍保持暂停；请返回配对组查看持仓与执行状态。
                 </p>
               ) : null}
             </div>

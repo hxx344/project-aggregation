@@ -23,7 +23,6 @@ class CapacitySourceSchedulingTests(unittest.TestCase):
         self.addCleanup(self.api.close)
         self.market = MarketData(self.api, capacity_relay=Mock())
         self.engine = Engine(self.f.store, market=self.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
 
     def configure(self, symbols=(XAU, XAG, SPCX, CL)):
         targets = {symbol: {5} for symbol in symbols}

@@ -1,5 +1,4 @@
 import type { Account, PositionsDisplay } from './desk-types';
-import type { PairCycleCosts } from './pair-cost';
 import {
   adlConfigurationLock,
   adlStartBlock,
@@ -7,16 +6,6 @@ import {
   type AdlConfig,
   type PairAdlState,
 } from './pair-adl.ts';
-import type {
-  CycleExecutionQuality,
-  CycleQualityHistory,
-} from './cycle-quality';
-import {
-  cycleDraft,
-  parseCycleDraft,
-  type CycleConfig,
-  type CycleDraft,
-} from './cycle.ts';
 import {
   marginLimitFromPercent,
   percentFromMarginLimit,
@@ -85,7 +74,6 @@ export type Pair = {
     margin_limit: string;
     spread_limit: string;
   };
-  cycle: CycleConfig;
   margin: {
     enabled: boolean;
     master_env_prefix: string;
@@ -98,8 +86,6 @@ export type Pair = {
   };
   state?: {
     adl?: PairAdlState;
-    execution_quality?: CycleExecutionQuality | null;
-    execution_quality_history?: CycleQualityHistory | null;
     phase?: string;
     reason?: string;
     api_notice?: PairApiNotice | null;
@@ -111,22 +97,13 @@ export type Pair = {
       short?: PositionsDisplay | null;
     };
     owned?: Partial<Record<'LONG' | 'SHORT', string>>;
-    progress?: {
-      phase?: string;
-      baseline?: Partial<Record<'LONG' | 'SHORT', string>>;
-      quantities?: Partial<Record<'LONG' | 'SHORT', string>>;
-      leverage?: number;
-      config?: CycleConfig;
-      opened_at?: number;
-      close_eligible_at?: number;
-      completed_cycles?: number;
-    } | null;
     pending?: Record<string, unknown> | null;
     recovery_watch?: { batches: { id: string }[] } | null;
     margin?: PairMarginState;
     last_batch?: {
       id: string;
-      kind: 'cycle' | 'ordinary';
+      // Batches recorded before cycle mode was removed keep kind 'cycle'.
+      kind: 'ordinary' | 'cycle';
       phase: 'open' | 'close';
       quantity: string;
       completed: boolean;
@@ -136,7 +113,6 @@ export type Pair = {
     };
     daily_volume?: Record<string, { long?: string; short?: string }>;
     volume_unknown?: boolean;
-    cycle_costs?: PairCycleCosts | null;
   };
 };
 export type PairDraft = {
@@ -145,13 +121,12 @@ export type PairDraft = {
   long_account_id: string;
   short_account_id: string;
   symbol: string;
-  mode: 'monitor' | 'ordinary' | 'cycle';
+  mode: 'monitor' | 'ordinary';
   threshold: string;
   order_notional: string;
   min_open_leverage: string;
   margin_percent: string;
   spread_limit: string;
-  cycle: CycleDraft;
   margin_enabled: boolean;
   master_env_prefix: string;
   check_interval_seconds: string;
@@ -172,11 +147,7 @@ export function pairDraft(pair?: Pair): PairDraft {
     long_account_id: pair?.long_account_id ?? '',
     short_account_id: pair?.short_account_id ?? '',
     symbol,
-    mode: pair?.ordinary.enabled
-      ? 'ordinary'
-      : pair?.cycle.enabled
-        ? 'cycle'
-        : 'monitor',
+    mode: pair?.ordinary.enabled ? 'ordinary' : 'monitor',
     threshold:
       pair?.ordinary.threshold ?? DEFAULT_PAIR_SYMBOL.default_threshold,
     order_notional:
@@ -188,7 +159,6 @@ export function pairDraft(pair?: Pair): PairDraft {
     ),
     spread_limit:
       pair?.ordinary.spread_limit ?? DEFAULT_PAIR_SYMBOL.default_spread_limit,
-    cycle: { ...cycleDraft(pair?.cycle), symbol: pair?.cycle.symbol ?? symbol },
     margin_enabled: pair?.margin.enabled ?? false,
     master_env_prefix: pair?.margin.master_env_prefix ?? '',
     check_interval_seconds: String(pair?.margin.check_interval_seconds ?? 5),
@@ -211,7 +181,6 @@ export function selectPairSymbol(
   const next = {
     ...draft,
     symbol: selected.symbol,
-    cycle: { ...draft.cycle, symbol: selected.symbol },
   };
   if (!applyDefaults) return next;
   const previous = symbols.find((item) => item.symbol === draft.symbol);
@@ -308,8 +277,6 @@ export function parsePairDraft(
   const symbolConfig = symbols.find((item) => item.symbol === symbol);
   if (!symbolConfig && (!current || symbol !== savedSymbol))
     throw new Error('请选择目录中支持的配对标的');
-  if (draft.cycle.symbol !== symbol)
-    throw new Error('循环策略标的必须与配对组一致');
   const minNotional =
     symbolConfig?.min_notional ?? DEFAULT_PAIR_SYMBOL.min_notional;
   const available = availablePairAccounts(accounts, pairs, currentId);
@@ -325,7 +292,7 @@ export function parsePairDraft(
     throw new Error('两侧必须使用相同的实盘或模拟环境');
   if (!currentId && (long.enabled || short.enabled))
     throw new Error('请先暂停两侧账户再创建配对组');
-  if (!['monitor', 'ordinary', 'cycle'].includes(draft.mode))
+  if (!['monitor', 'ordinary'].includes(draft.mode))
     throw new Error('请选择配对执行模式');
   const prefix = draft.master_env_prefix.trim();
   if (prefix && !/^[A-Z][A-Z0-9_]{1,40}$/.test(prefix))
@@ -384,10 +351,6 @@ export function parsePairDraft(
       margin_limit: marginLimitFromPercent(draft.margin_percent),
       spread_limit: spread,
     },
-    cycle: parseCycleDraft(
-      { ...draft.cycle, enabled: draft.mode === 'cycle' },
-      [symbol],
-    ),
     margin: {
       enabled: draft.margin_enabled,
       master_env_prefix: prefix,
@@ -411,8 +374,8 @@ export function parsePairDraft(
 export function pairConfigurationChanges(
   config: ReturnType<typeof parsePairDraft>,
 ) {
-  const { name, symbol, ordinary, cycle, margin, adl } = config;
-  return { name, symbol, ordinary, cycle, margin, adl };
+  const { name, symbol, ordinary, margin, adl } = config;
+  return { name, symbol, ordinary, margin, adl };
 }
 
 // Account display cadence does not describe pair snapshots or runtime health.
@@ -469,20 +432,13 @@ export function pairStartRecoveryBlock(pair: Pair): string {
     )
   )
     return '划转结果仍待核对，完成后才能启动';
-  if (
-    Object.values(pair.state?.progress?.quantities ?? {}).some((value) => {
-      const quantity = typeof value === 'string' ? quantityUnits(value) : null;
-      return !quantity || quantity.units !== BigInt(0);
-    })
-  )
-    return '本轮循环新增仓位仍需恢复，完成后才能启动';
   const pending = pair.state?.pending;
   if (
     pending &&
     Object.keys(pending).length &&
     (pending.kind !== 'ordinary' || pending.phase !== 'open')
   )
-    return '循环、减仓或杠杆批次仍待核对，完成后才能启动';
+    return '减仓或杠杆批次仍待核对，完成后才能启动';
   // An ordinary opening may request reconciliation at start. Only the server
   // can validate receipts and current positions, then authorize activation.
   return '';
@@ -490,8 +446,7 @@ export function pairStartRecoveryBlock(pair: Pair): string {
 export function pairMarginOnly(pair: Pair): boolean {
   return (
     pair.margin?.enabled === true &&
-    pair.ordinary?.enabled === false &&
-    pair.cycle?.enabled === false
+    pair.ordinary?.enabled === false
   );
 }
 export function pairConfigurationLock(pair: Pair): string {
@@ -499,12 +454,6 @@ export function pairConfigurationLock(pair: Pair): string {
   if (adlBlock) return adlBlock;
   if (pair.enabled) return '暂停配对组后可修改设置。';
   if (pairHasPending(pair)) return '订单或划转结果待核对，暂不能修改设置。';
-  if (
-    Object.values(pair.state?.progress?.quantities ?? {}).some(
-      (value) => Number(value) !== 0,
-    )
-  )
-    return '本轮循环减回基线后可修改设置。';
   return '';
 }
 export function pairDeletionBlock(
@@ -602,16 +551,12 @@ export const PAIR_PHASES: Record<string, string> = {
   waiting: '等待条件',
   waiting_open: '等待共同开仓',
   opening: '两侧开仓核对',
-  holding: '持仓计时',
-  waiting_close: '等待减回',
-  closing: '减回本轮基线',
   reconciling: '订单结果核对中',
   repairing: '风险恢复中',
   repair: '风险恢复中',
   attention: '需要处理',
   error: '执行异常',
   blocked: '条件阻止执行',
-  daily_limit: '等待日额度',
   monitoring: '保证金管理中',
   unknown: '结果未知 · 继续查询',
   accepted: '请求已受理 · 等待确认',

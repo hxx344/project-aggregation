@@ -1,7 +1,7 @@
 """Aster V3 EIP-712 API adapter. No automatic retries of signed mutations."""
 import json
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
@@ -19,7 +19,6 @@ from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
 import monitor
-from .account_cache import CycleAccountCache, HotAccountUnavailable
 from .capacity_relay_client import CAPACITY_RELAY_SYMBOLS
 from .depth import DEPTH_LIMIT, DEPTH_MAX_AGE, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT, DepthSnapshot
 from .depth_stream import PublicDepthStream
@@ -29,7 +28,7 @@ from .market_stream import PublicQuoteStream
 from .user_stream import PrivateAccountStream
 from .ws_evidence import PrivateEventEvidence
 from .request_timing import transport_stage
-from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, MARKET_SYMBOLS, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, leverage_cap, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets, wire
+from .models import AccountModeError, AccountSnapshot, Book, MarkPrice, MARKET_SYMBOLS, Position, Rules, SYMBOLS, TAKER_FEE_ESTIMATE, TradingError, dec, decimal_value, positive, require_non_decreasing_leverage, require_supported_leverage, validate_brackets
 
 BASE = "https://fapi.asterdex.com"
 PUBLIC_BRACKETS_REFRESH_INTERVAL = 60
@@ -165,23 +164,23 @@ class RateBudget:
             self.priority.reconciliation = previous
 
     @contextmanager
-    def cycle_accounting(self):
+    def pair_accounting(self):
         """Fill reporting cannot consume the reserved order-repair budget."""
-        previous = getattr(self.priority, "cycle_accounting", False)
-        self.priority.cycle_accounting = True
+        previous = getattr(self.priority, "pair_accounting", False)
+        self.priority.pair_accounting = True
         try:
             yield self
         finally:
-            self.priority.cycle_accounting = previous
+            self.priority.pair_accounting = previous
 
     def _priority_flags(self):
         return tuple(getattr(self.priority, name, False) for name in
-                     ("reconciliation", "cycle_accounting", "capacity_monitoring", "margin"))
+                     ("reconciliation", "pair_accounting", "capacity_monitoring", "margin"))
 
     @contextmanager
     def _inherit_priority(self, flags):
         previous = self._priority_flags()
-        names = ("reconciliation", "cycle_accounting", "capacity_monitoring", "margin")
+        names = ("reconciliation", "pair_accounting", "capacity_monitoring", "margin")
         for name, value in zip(names, flags):
             setattr(self.priority, name, value)
         try:
@@ -219,7 +218,7 @@ class RateBudget:
             raise RequestNotSent(self._cooldown_message(now), retry_after=self.until - now)
         monitoring = getattr(self.priority, "capacity_monitoring", False)
         critical = (getattr(self.priority, "reconciliation", False) and not monitoring
-                    and not getattr(self.priority, "cycle_accounting", False))
+                    and not getattr(self.priority, "pair_accounting", False))
         margin = bool(self.margin_reserve and getattr(self.priority, "margin", False))
         if margin:
             limit = self.limit
@@ -779,14 +778,6 @@ class MarketData:
             self.books[symbol] = (started, replace(book), mark)
             return book
 
-    def cycle_book(self, symbol):
-        """A trading trigger reads only the current local WS book."""
-        book = self._stream_book(symbol)
-        if book is None:
-            raise HotAccountUnavailable("循环报价热数据尚未就绪，等待行情更新")
-        book.require_fresh()
-        return book
-
     def _stream_mark_price(self, symbol):
         """Only the connected stream owns its mark cache; never copy it to REST."""
         getter = getattr(self.stream, "mark_price", None)
@@ -923,16 +914,6 @@ class MarketData:
                 raise TradingError("深度 WS 正在同步，等待连续更新")
             depth.require_fresh()
             return depth
-
-    def cycle_depth(self, symbol):
-        """Read local bridged depth without starting a REST seed on demand."""
-        if symbol not in MARKET_SYMBOLS:
-            raise TradingError("不支持的深度市场")
-        depth = self.depth_stream.snapshot(symbol)
-        if depth is None:
-            raise HotAccountUnavailable("循环深度热数据尚未就绪，等待行情更新")
-        depth.require_fresh()
-        return depth
 
     def _read_depth(self, symbol):
         """Raw REST seed; never expose an unbridged snapshot to consumers."""
@@ -1107,8 +1088,8 @@ class MarketData:
             try:
                 caps = {tier: positive(monitor.extract_bracket_cap(payload, symbol, tier), True)
                         for tier in monitor.SUPPORTED_LEVERAGES}
-                # Cycles follow the account's actual leverage, including levels
-                # outside the ordinary 5x / 10x / 20x strategy. Missing levels
+                # Paired groups follow the account's actual leverage, including
+                # levels outside the ordinary 5x / 10x / 20x strategy. Missing levels
                 # remain unavailable; never substitute a neighbouring tier.
                 for tier in range(1, 126):
                     if tier not in caps:
@@ -1158,89 +1139,81 @@ class LiveBroker:
         self.cached, self.cached_at = {}, {}
         self._snapshot_lock = threading.RLock()
         self._ordinary_read_lock = threading.Lock()
-        self._cycle_read_lock = threading.Lock()
         self._snapshot_generation = 0
-        self._cycle_lifecycle_lock = threading.Lock()
-        self._cycle_stream_callback_lock = threading.RLock()
-        self._cycle_stream_token = None
-        self._cycle_stream_connected = None
+        self._private_stream_lock = threading.Lock()
+        self._private_stream_callback_lock = threading.RLock()
+        self._private_stream_token = None
+        self._private_stream_connected = None
         self._adl_on_event = None
         self._adl_on_reconnected = None
         self._private_evidence = PrivateEventEvidence()
-        self._cycle_hot_closed = False
-        self.cycle_cache = CycleAccountCache()
-        self.cycle_stream = None
+        self._private_stream_closed = False
+        self.private_stream = None
         self.leverage_snapshot = None
-        self.cycle_trade_queries = {}
 
     def set_adl_listener(self, *, on_event=None, on_reconnected=None):
         """Attach local queue callbacks; they must never perform DB or HTTP work."""
         if any(callback is not None and not callable(callback) for callback in (on_event, on_reconnected)):
             raise ValueError("Invalid ADL listener")
-        with self._cycle_stream_callback_lock:
+        with self._private_stream_callback_lock:
             self._adl_on_event, self._adl_on_reconnected = on_event, on_reconnected
 
-    def start_cycle_hot_data(self, symbols, *, on_invalidate=None):
-        """Configure one private stream; neither construction nor start reads REST here."""
-        with self._cycle_lifecycle_lock:
-            if self._cycle_hot_closed:
-                raise HotAccountUnavailable("循环账户热数据已关闭")
-            self.cycle_cache.set_listener(on_invalidate)
-            self.cycle_cache.configure(symbols)
-            if self.cycle_stream is None:
+    def start_private_stream(self):
+        """Start one private stream; neither construction nor start reads REST here."""
+        with self._private_stream_lock:
+            if self._private_stream_closed:
+                raise TradingError("账户私有数据流已关闭")
+            if self.private_stream is None:
                 token = object()
                 stream = PrivateAccountStream(self.api,
-                    on_state=lambda connected: self._cycle_stream_state(token, connected),
-                    on_event=lambda kind: self._cycle_stream_event(token, kind),
-                    on_payload=lambda event: self._cycle_stream_payload(token, event))
-                with self._cycle_stream_callback_lock:
+                    on_state=lambda connected: self._private_stream_state(token, connected),
+                    on_event=lambda kind: self._private_stream_event(token, kind),
+                    on_payload=lambda event: self._private_stream_payload(token, event))
+                with self._private_stream_callback_lock:
                     with self._snapshot_lock:
-                        self._cycle_stream_token = token
-                        self._cycle_stream_connected = None
+                        self._private_stream_token = token
+                        self._private_stream_connected = None
                         self._private_evidence.reset(False)
-                self.cycle_stream = stream
-            self.cycle_stream.start()
+                self.private_stream = stream
+            self.private_stream.start()
 
-    def stop_cycle_hot_data(self):
+    def stop_private_stream(self):
         """Stop private monitoring while keeping this broker's API reusable."""
-        with self._cycle_lifecycle_lock:
-            stream, self.cycle_stream = self.cycle_stream, None
-            with self._cycle_stream_callback_lock:
-                if self._cycle_stream_token is not None:
+        with self._private_stream_lock:
+            stream, self.private_stream = self.private_stream, None
+            with self._private_stream_callback_lock:
+                if self._private_stream_token is not None:
                     self._invalidate_snapshot_reads(refresh_modes=True)
                 with self._snapshot_lock:
-                    self._cycle_stream_token = None
-                    self._cycle_stream_connected = None
+                    self._private_stream_token = None
+                    self._private_stream_connected = None
                     self._private_evidence.reset(False)
-                self.cycle_cache.set_listener(None)
-                self.cycle_cache.set_connected(False)
             if stream is not None:
                 stream.close()
 
-    def _cycle_stream_state(self, token, connected):
+    def _private_stream_state(self, token, connected):
         # A stopped stream may finish after a replacement has connected.
-        with self._cycle_stream_callback_lock:
-            if token is self._cycle_stream_token:
+        with self._private_stream_callback_lock:
+            if token is self._private_stream_token:
                 # A stream gap may hide a mode change. Invalidate once per state
                 # transition, not on every disconnected retry callback.
-                changed = connected is not self._cycle_stream_connected
+                changed = connected is not self._private_stream_connected
                 if changed:
                     with self._snapshot_lock:
-                        self._cycle_stream_connected = connected
+                        self._private_stream_connected = connected
                         self._private_evidence.reset(connected)
                         self._invalidate_snapshot_reads(refresh_modes=True)
-                self.cycle_cache.set_connected(connected)
                 if changed and self._adl_on_reconnected is not None:
                     self._adl_on_reconnected()
 
-    def _cycle_stream_event(self, token, kind):
-        with self._cycle_stream_callback_lock:
-            if token is self._cycle_stream_token:
-                self._cycle_account_event(kind)
+    def _private_stream_event(self, token, kind):
+        with self._private_stream_callback_lock:
+            if token is self._private_stream_token:
+                self._private_account_event(kind)
 
-    def _cycle_stream_payload(self, token, event):
-        with self._cycle_stream_callback_lock:
-            if token is self._cycle_stream_token:
+    def _private_stream_payload(self, token, event):
+        with self._private_stream_callback_lock:
+            if token is self._private_stream_token:
                 with self._snapshot_lock:
                     self._private_evidence.payload(event)
                 if self._adl_on_event is not None:
@@ -1276,17 +1249,8 @@ class LiveBroker:
 
         return evidence, require_current
 
-    def invalidate_cycle_hot_data(self, reason, *, refresh_modes=False):
+    def invalidate_account_reads(self, reason, *, refresh_modes=False):
         self._invalidate_snapshot_reads(refresh_modes=refresh_modes)
-        self.discard_cycle_hot_snapshot(reason, refresh_modes=refresh_modes)
-
-    def discard_cycle_hot_snapshot(self, reason, *, refresh_modes=False):
-        """Revoke hot leases/publication without interrupting recovery GETs.
-
-        Maintenance waiting on a batch or a failed refresh is not an account
-        mutation. Actual writes, events and controls still invalidate both.
-        """
-        self.cycle_cache.invalidate(reason, refresh_modes=refresh_modes)
 
     def _invalidate_snapshot_reads(self, *, refresh_modes=False):
         with self._snapshot_lock:
@@ -1296,66 +1260,25 @@ class LiveBroker:
                 self.cached_at.pop("dual", None)
                 self.cached_at.pop("multi", None)
 
-    def _cycle_account_event(self, kind):
+    def _private_account_event(self, kind):
         with self._snapshot_lock:
             self._private_evidence.event(kind)
             self._invalidate_snapshot_reads(refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
-        self.discard_cycle_hot_snapshot("账户事件：" + str(kind),
-            refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
 
-    def _cycle_write(self, method, path, params, *, weight=1, refresh_modes=False, timeout=None):
+    def _account_write(self, method, path, params, *, weight=1, refresh_modes=False, timeout=None):
         # No snapshot HTTP lock: in-flight background results are revoked by
         # generation instead of making a ready order wait for another request.
-        self.invalidate_cycle_hot_data("账户写入开始", refresh_modes=refresh_modes)
+        self.invalidate_account_reads("账户写入开始", refresh_modes=refresh_modes)
         try:
             return self.api.call(method, path, params, signed=True, weight=weight,
                                  **({"timeout": timeout} if timeout is not None else {}))
         finally:
             # A refresh that started during this write must also be discarded.
-            self.invalidate_cycle_hot_data("账户写入结束", refresh_modes=refresh_modes)
-
-    def refresh_cycle_hot_snapshot(self):
-        """Only the background scheduler calls this network refresh."""
-        ticket = self.cycle_cache.begin_refresh()
-        started = time.monotonic()
-        try:
-            snapshot = self.cycle_snapshot(ticket.symbols, fresh_modes=ticket.refresh_modes,
-                                           authorize_leverage=False)
-            valid_until = snapshot.cycle_mode_valid_until
-            snapshot.require_modes(ticket.symbols)
-            return self.cycle_cache.publish(ticket, snapshot, started,
-                valid_until_monotonic=valid_until)
-        except SnapshotSuperseded as exc:
-            self.cycle_cache.fail(ticket, exc)
-            return False
-        except BaseException as exc:
-            self.cycle_cache.fail(ticket, exc)
-            raise
-
-    def cycle_hot_snapshot(self, symbols):
-        """Lease account state and revalue locally, without any HTTP or read lock."""
-        lease = self.cycle_cache.lease(symbols)
-        snapshot = lease.snapshot
-        marks = {symbol: self._cycle_local_mark(symbol) for symbol in dict.fromkeys(p.symbol for p in snapshot.positions)}
-        positions = [replace(position, mark=marks[position.symbol] if marks[position.symbol] is not None else position.mark)
-                     for position in snapshot.positions]
-        marked = sum((Fraction(position.qty) * (Fraction(position.mark) - Fraction(position.entry))
-                      * (1 if position.side == "LONG" else -1) for position in positions), Fraction(0))
-        pnl = min(Fraction(snapshot.unrealized), marked)
-        loss = Fraction(snapshot.unrealized) - pnl
-        lease.snapshot = replace(snapshot, positions=positions, unrealized=decimal_value(pnl, exact=True),
-            equity=decimal_value(Fraction(snapshot.equity) - loss, exact=True),
-            available=decimal_value(Fraction(snapshot.available) - loss, exact=True))
-        lease.require_fresh()
-        return lease
+            self.invalidate_account_reads("账户写入结束", refresh_modes=refresh_modes)
 
     def reconciliation_budget(self):
         budget = getattr(self.api, "budget", None)
         return budget.reconciliation() if budget is not None else nullcontext()
-
-    def cycle_volume_budget(self):
-        budget = getattr(self.api, "budget", None)
-        return budget.cycle_accounting() if budget is not None else nullcontext()
 
     def cached_call(self, key, path, params=None, ttl=300, weight=1):
         with self._snapshot_lock:
@@ -1479,22 +1402,6 @@ class LiveBroker:
                 snapshot.account_read_generation = generation
             return snapshot
 
-    def cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
-        with self._snapshot_lock:
-            return self._cycle_snapshot_weight(symbols, fresh_modes=fresh_modes)
-
-    def _cycle_snapshot_weight(self, symbols, *, fresh_modes=False):
-        """Include conditional risk/missing-mark/tier reads without issuing them."""
-        symbols = tuple(dict.fromkeys(symbols))
-        now = time.monotonic()
-        # Account; reserve for one full risk fallback and the
-        # one-request mark fallback when risk omits a flat row or reports zero.
-        weight = 5 + 5 + len(symbols)
-        if fresh_modes or now - self.cached_at.get("multi", -1e9) + 8 >= MULTI_ASSETS_MODE_MAX_AGE:
-            weight += 30
-        weight += sum(1 for symbol in symbols if now - self.cached_at.get("bracket:" + symbol, -1e9) + 8 >= 5)
-        return weight
-
     @staticmethod
     def _account_asset(account):
         if (not isinstance(account, dict) or not isinstance(account.get("assets"), list)
@@ -1508,8 +1415,7 @@ class LiveBroker:
         return assets[0]
 
     @staticmethod
-    def _account_snapshot(account, asset, positions, symbols, *, hedge, multi, started, brackets=None,
-                          current_caps=None, risk_unrealized=None):
+    def _account_snapshot(account, asset, positions, symbols, *, hedge, multi, started, brackets=None):
         wallet = dec(asset["crossWalletBalance"])
         account_unrealized = Fraction(dec(asset["crossUnPnl"]))
         # Charge newer losses immediately, without funding additions with an
@@ -1518,14 +1424,12 @@ class LiveBroker:
         marked_unrealized = sum((Fraction(p.qty) * (Fraction(p.mark) - Fraction(p.entry)) * (1 if p.side == "LONG" else -1)
                                  for p in positions), Fraction(0))
         selected_pnl = min(account_unrealized, position_unrealized, marked_unrealized)
-        if risk_unrealized is not None:
-            selected_pnl = min(selected_pnl, risk_unrealized)
         unrealized = decimal_value(selected_pnl, exact=True)
         available = decimal_value(Fraction(dec(asset["availableBalance"])) - (account_unrealized - selected_pnl), exact=True)
         equity = decimal_value(Fraction(wallet) + selected_pnl, exact=True)
         return AccountSnapshot(equity, positive(asset["maintMargin"], True, field="USD1 维持保证金（maintMargin）"), available, wallet,
             unrealized, positions, None, hedge, multi, account.get("canTrade") is True,
-            started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets or {}, current_caps or {})
+            started, dict.fromkeys(symbols, TAKER_FEE_ESTIMATE), brackets or {})
 
     def _require_usd1(self, symbol):
         resolve = getattr(self.market, "margin_asset", None)
@@ -1702,34 +1606,6 @@ class LiveBroker:
         # Revalue both sides together, including positions outside the strategy.
         return [replace(p, mark=marks[p.symbol].price) if p.symbol in marks else p for p in positions]
 
-    def _cycle_local_mark(self, symbol):
-        """Use only local stream state here; live mark_price may issue REST."""
-        try:
-            getter = getattr(self.market, "_stream_mark_price", None)
-            if callable(getter):
-                value = getter(symbol)
-                if value is not None:
-                    if not isinstance(value, MarkPrice) or value.symbol != symbol:
-                        return None
-                    value.require_fresh()
-                    return positive(value.price)
-                return None
-            # Older injected/demo markets can still provide a stricter complete
-            # local book. Never use their public fallback for a live hot read.
-            if getattr(self.market, "demo", False) is True:
-                book = self.market.book(symbol)
-            elif callable(getattr(self.market, "_stream_book", None)):
-                book = self.market._stream_book(symbol)
-            else:
-                stream = getattr(self.market, "stream", None)
-                book = stream.book(symbol) if callable(getattr(stream, "book", None)) else None
-            if book is not None:
-                book.require_fresh()
-                return positive(book.mark)
-        except (TradingError, KeyError):
-            pass
-        return None
-
     @staticmethod
     def _position_update_time(row):
         value = row.get("updateTime")
@@ -1739,237 +1615,6 @@ class LiveBroker:
         if stamp != stamp.to_integral_value() or stamp > dec(str(time.time() + 1)) * 1000:
             raise TradingError("持仓更新时间无效或超前")
         return int(stamp)
-
-    def _cycle_positions(self, account, symbols, read):
-        rows = self._position_rows(account.get("positions"))
-        # V3 account returns LONG/SHORT only in hedge mode, including flat legs.
-        # Do not infer a missing leg as flat or manufacture a dual-mode GET cache.
-        if any(side == "BOTH" for _, side in rows):
-            raise AccountModeError("独立循环需要双向持仓模式，账户返回单向持仓信息")
-        for symbol in symbols:
-            if any((symbol, side) not in rows for side in ("LONG", "SHORT")):
-                raise TradingError(f"{symbol} 缺少双向持仓信息")
-        relevant = {key: row for key, row in rows.items() if key[0] in symbols or dec(row["positionAmt"])}
-        leverages = {}
-        for (symbol, side), row in relevant.items():
-            self._require_usd1(symbol)
-            if type(row.get("isolated")) is not bool:
-                raise TradingError("账户全仓保证金模式响应无效")
-            leverage = self._leverage(row.get("leverage"), field=f"{symbol} {side} 实际杠杆（leverage）")
-            if symbol in leverages and leverages[symbol] != leverage:
-                raise TradingError("多空杠杆不一致")
-            leverages[symbol] = leverage
-            positive(row.get("entryPrice"), allow_zero=not dec(row["positionAmt"]), field=f"{symbol} {side} 开仓价（entryPrice）")
-            dec(row.get("unrealizedProfit"))
-
-        marks = {symbol: self._cycle_local_mark(symbol) for symbol in dict.fromkeys(key[0] for key in relevant)}
-        risk, risk_unrealized = {}, None
-        if any(mark is None for mark in marks.values()):
-            risk = self._position_rows(read("positions", "/fapi/v3/positionRisk", weight=5))
-            if any(side == "BOTH" for _, side in risk):
-                raise AccountModeError("账户与持仓的双向模式尚未同步")
-            # Once a full risk response is needed, every nonzero row on either
-            # side must agree; a newly filled external position cannot disappear.
-            for key in set(relevant) | {key for key, row in risk.items() if dec(row["positionAmt"])}:
-                account_row, risk_row = rows.get(key), risk.get(key)
-                if risk_row is None and account_row is not None and not dec(account_row["positionAmt"]):
-                    continue  # Risk is allowed to omit flat account rows.
-                if (account_row is None or risk_row is None
-                        or dec(account_row["positionAmt"]) != dec(risk_row["positionAmt"])
-                        or self._leverage(account_row.get("leverage")) != self._leverage(risk_row.get("leverage"))):
-                    raise TradingError("账户余额与持仓快照正在同步，稍后重试")
-                margin_type = risk_row.get("marginType")
-                if (not isinstance(margin_type, str) or margin_type.lower() not in ("cross", "crossed", "isolated")
-                        or account_row.get("isolated") != (margin_type.lower() == "isolated")):
-                    raise TradingError("账户与持仓的保证金模式尚未同步，稍后重试")
-            risk_unrealized = sum((Fraction(dec(row.get("unRealizedProfit")))
-                                   for key, row in risk.items() if key in relevant), Fraction(0))
-
-        positions = []
-        for key, row in relevant.items():
-            symbol, side = key
-            qty = dec(row["positionAmt"]).copy_abs()
-            risk_row = risk.get(key)
-            mark = marks[symbol]
-            if mark is None and risk_row is not None:
-                mark = positive(risk_row.get("markPrice"), True, field=f"{symbol} {side} 标记价（markPrice）")
-            if mark is None:
-                if qty:
-                    raise TradingError("账户持仓缺少有效标记价格")
-                # Resolve omitted flat rows and reported zero marks together
-                # after parsing, so both sides use the same fresh price.
-                mark = dec(0)
-            liquidation = None
-            if risk_row is not None and risk_row.get("liquidationPrice") is not None:
-                liquidation = positive(risk_row["liquidationPrice"], True, field=f"{symbol} {side} 强平价（liquidationPrice）")
-            positions.append(Position(symbol, side, qty, positive(row["entryPrice"], allow_zero=not qty,
-                field=f"{symbol} {side} 开仓价（entryPrice）"),
-                mark, leverages[symbol], dec(row["unrealizedProfit"]), liquidation, isolated=row["isolated"],
-                update_time=self._position_update_time(row)))
-        return self._fill_missing_marks(positions), rows, leverages, risk_unrealized
-
-    @staticmethod
-    def _cycle_current_caps(symbols, rows, leverages, read):
-        caps = {}
-        for symbol in symbols:
-            pair = [rows[(symbol, side)] for side in ("LONG", "SHORT")]
-            try:
-                # Validate every reported value, even if the other leg is missing it.
-                reported = [positive(row["maxNotional"], True) for row in pair if "maxNotional" in row]
-                if len(reported) == 2:
-                    cap = min(reported)
-                else:
-                    data = read("bracket:" + symbol, "/fapi/v3/leverageBracket", {"symbol": symbol}, ttl=5)
-                    if isinstance(data, list):
-                        if any(not isinstance(item, dict) for item in data):
-                            raise TradingError("账户风控档位响应无效")
-                        matches = [item for item in data if item.get("symbol") == symbol]
-                        if len(matches) != 1:
-                            raise TradingError("账户风控档位缺失或重复")
-                        data = matches[0]
-                    if not isinstance(data, dict) or data.get("symbol") != symbol:
-                        raise TradingError("账户风控档位交易代码不匹配")
-                    try:
-                        if not isinstance(data.get("brackets"), list) or any(not isinstance(tier, dict) for tier in data["brackets"]):
-                            raise TradingError("账户风控档位响应无效")
-                        tiers = validate_brackets(data["brackets"])
-                    except (KeyError, TypeError):
-                        raise TradingError("账户风控档位响应无效") from None
-                    cap = min([leverage_cap(tiers, leverages[symbol])] + reported)
-            except TradingError:
-                # Missing opening capacity must not strand a held increment.
-                # No cap is published, so planning new exposure still fails.
-                if any(dec(row["positionAmt"]) for row in pair):
-                    continue
-                raise
-            caps[symbol] = (leverages[symbol], cap)
-        return caps
-
-    def cycle_snapshot(self, symbols, fresh_modes=False, *, authorize_leverage=True):
-        with self._cycle_read_lock:
-            return self._cycle_snapshot(symbols, fresh_modes=fresh_modes, authorize_leverage=authorize_leverage)
-
-    def _cycle_snapshot(self, symbols, fresh_modes=False, *, authorize_leverage=True):
-        """Join independent cycle GETs before validating one complete snapshot.
-
-        Aster V3 keeps the latest 100 unique nonces per signer, allowing a small
-        out-of-order group; API's nonce lock preserves uniqueness. HTTPX Client
-        supports sharing across threads. Only GETs use this bounded local pool.
-        """
-        symbols = tuple(dict.fromkeys(symbols))
-        with self._snapshot_lock:
-            generation = self._snapshot_generation
-            if authorize_leverage:
-                self.leverage_snapshot = None
-            cached, cached_at = dict(self.cached), dict(self.cached_at)
-            if fresh_modes:
-                self.cached_at.pop("multi", None)
-        started = time.time()
-        if fresh_modes:
-            cached_at.pop("multi", None)
-        specs = [("multi", "/fapi/v3/multiAssetsMargin", None, MULTI_ASSETS_MODE_MAX_AGE, 30),
-                 ("account", "/fapi/v3/accountWithJoinMargin", None, None, 5)]
-        values, fetched, pending = {}, {}, []
-        for key, path, params, ttl, weight in specs:
-            stamp = cached_at.get(key, -1e9)
-            if ttl is not None and time.monotonic() - stamp < ttl:
-                values[key] = cached[key]
-            else:
-                pending.append((key, path, params, ttl, weight))
-        budget = getattr(self.api, "budget", None)
-        flags = budget._priority_flags() if isinstance(budget, RateBudget) else None
-
-        def fetch(spec):
-            key, path, params, ttl, weight = spec
-            context = budget._inherit_priority(flags) if flags is not None else nullcontext()
-            with context:
-                stamp = time.monotonic()
-                value = self.api.call("GET", path, params, signed=True, weight=weight)
-                return value, stamp
-
-        errors = []
-        # Exiting the pool waits even on failure: no private read can outlive its
-        # account work or overlap the next verification/submit round.
-        with ThreadPoolExecutor(max_workers=min(6, len(pending)), thread_name_prefix="cycle-read") as pool:
-            futures = [(spec, pool.submit(fetch, spec)) for spec in pending]
-            for spec, future in futures:
-                try:
-                    value, stamp = future.result()
-                    values[spec[0]] = value
-                    if spec[3] is not None:
-                        fetched[spec[0]] = (value, stamp)
-                except BaseException as exc:
-                    errors.append(exc)
-        if errors:
-            def priority(exc):
-                if not isinstance(exc, Exception):
-                    return (5, 0)
-                if isinstance(exc, AccountModeError):
-                    return (4, 0)
-                if isinstance(exc, ExchangeError) and not isinstance(exc, RequestNotSent):
-                    try:
-                        delay = float(exc.retry_after)
-                    except (TypeError, ValueError, OverflowError):
-                        delay = 0
-                    return (3, delay if math.isfinite(delay) else 0)
-                return (1 if isinstance(exc, RequestNotSent) else 2, 0)
-            raise max(errors, key=priority)
-
-        def read(key, path, params=None, *, ttl=None, weight=1):
-            stamp = fetched[key][1] if key in fetched else cached_at.get(key, -1e9)
-            if key not in values and ttl is not None and time.monotonic() - stamp < ttl:
-                values[key] = cached[key]
-            if key not in values or (ttl is not None and time.monotonic() - stamp >= ttl):
-                value, stamp = fetch((key, path, params, ttl, weight))
-                values[key] = value
-                if ttl is not None:
-                    fetched[key] = value, stamp
-            if ttl is not None and time.monotonic() - stamp >= ttl:
-                raise TradingError("账户模式或风控档位查询已过期，等待重试")
-            return values[key]
-
-        try:
-            account = values["account"]
-            asset = self._account_asset(account)
-            positions, rows, leverages, risk_unrealized = self._cycle_positions(account, symbols, read)
-            caps = self._cycle_current_caps(symbols, rows, leverages, read)
-            multi = read("multi", "/fapi/v3/multiAssetsMargin", ttl=MULTI_ASSETS_MODE_MAX_AGE, weight=30)
-            if not isinstance(multi, dict) or type(multi.get("multiAssetsMargin")) is not bool:
-                raise TradingError("账户保证金模式响应无效")
-            snapshot = self._account_snapshot(account, asset, positions, symbols, hedge=True,
-                multi=multi["multiAssetsMargin"], started=started, current_caps=caps, risk_unrealized=risk_unrealized)
-            # A fallback tier keeps its original five-second lifetime after it
-            # becomes a current-leverage cap, including the final submit check.
-            snapshot.cycle_cap_cached_at = {
-                symbol: (fetched["bracket:" + symbol][1] if "bracket:" + symbol in fetched
-                         else cached_at["bracket:" + symbol])
-                for symbol in caps if "bracket:" + symbol in values
-            }
-            snapshot.require_fresh()
-            for key in caps:
-                cache_key = "bracket:" + key
-                if cache_key in values:
-                    stamp = fetched[cache_key][1] if cache_key in fetched else cached_at[cache_key]
-                    if time.monotonic() - stamp >= 5:
-                        raise TradingError("账户风控档位查询已过期，等待重试")
-            # Failed rounds publish neither partially refreshed caches nor an
-            # authorization token; cache age includes signing and network time.
-            snapshot.cycle_mode_valid_until = ((fetched["multi"][1] if "multi" in fetched else cached_at["multi"])
-                                               + MULTI_ASSETS_MODE_MAX_AGE)
-            with self._snapshot_lock:
-                if generation != self._snapshot_generation:
-                    raise SnapshotSuperseded("账户在查询期间发生变化，等待新快照")
-                for key, (value, stamp) in fetched.items():
-                    if stamp >= self.cached_at.get(key, -1e9):
-                        self.cached[key], self.cached_at[key] = value, stamp
-                if fresh_modes and authorize_leverage:
-                    self.leverage_snapshot = (snapshot, time.monotonic())
-            return snapshot
-        except BaseException:
-            if authorize_leverage:
-                with self._snapshot_lock:
-                    self.leverage_snapshot = None
-            raise
 
     @staticmethod
     def _leverage(value, *, field="账户实际杠杆（leverage）"):
@@ -2006,7 +1651,7 @@ class LiveBroker:
             except TradingError as exc:
                 raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
         try:
-            return self._cycle_write("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, refresh_modes=True)
+            return self._account_write("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, refresh_modes=True)
         except ExchangeError as exc:
             status_rejected = exc.http_status in LEVERAGE_REJECTION_HTTP_STATUSES and exc.code not in (-1006, -1007)
             code_rejected = not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES
@@ -2014,141 +1659,13 @@ class LiveBroker:
                 raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after),
                                        http_status=exc.http_status) from None
             raise
-
-    def set_cycle_leverage(self, symbol, leverage, *, checked_snapshot=None, before_submit=None):
-        """The independent cycle may choose any integer leverage, only while flat."""
-        if type(leverage) is not int or not 1 <= leverage <= 125:
-            raise TradingError("独立循环杠杆必须为 1 至 125 的整数")
-        # The executor protects its own in-flight orders; verify actual flat
-        # positions without querying external open orders in this taker cycle.
-        self.leverage_snapshot = None
-        try:
-            snapshot = self.cycle_snapshot([symbol], fresh_modes=True)
-            snapshot.require_modes([symbol])
-            long, short = snapshot.require_ready(symbol)
-            if long.qty or short.qty:
-                raise TradingError("独立循环仅允许在所选品种确认空仓时设置杠杆")
-            if before_submit is not None:
-                before_submit(snapshot)
-                long, short = snapshot.require_ready(symbol)
-                if long.qty or short.qty:
-                    raise TradingError("独立循环杠杆提交前必须仍为空仓")
-            if leverage == long.leverage:
-                return {"symbol": symbol, "leverage": leverage}
-        except RequestNotSent:
-            raise
-        except TradingError as exc:
-            raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
-        try:
-            return self._cycle_write("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": str(leverage)}, refresh_modes=True)
-        except ExchangeError as exc:
-            status_rejected = exc.http_status in LEVERAGE_REJECTION_HTTP_STATUSES and exc.code not in (-1006, -1007)
-            code_rejected = not isinstance(exc, AmbiguousOrder) and exc.code in LEVERAGE_REJECTION_CODES
-            if not isinstance(exc, RequestNotSent) and (status_rejected or code_rejected):
-                raise LeverageRejected(str(exc), code=exc.code, retry_after=max(30, exc.retry_after),
-                                       http_status=exc.http_status) from None
-            raise
-
-    def cycle_trades(self, order, receipt, created_at, *, checkpoint=None):
-        """Fetch every fill of one verified order, keeping exchange UTC timestamps.
-
-        userTrades has no orderId filter. Its time filters cannot be combined
-        with fromId, so only the initial page uses a bounded time window.
-        """
-        if any(receipt.get(key) != order[key] for key in ("symbol", "positionSide", "side")) \
-                or receipt.get("clientOrderId") != order["newClientOrderId"]:
-            raise TradingError("循环成交查询的订单回执身份不一致")
-        expected = Fraction(positive(receipt.get("executedQty"), True))
-        if expected > Fraction(positive(order["quantity"])):
-            raise TradingError("循环成交查询数量超过委托数量")
-        if not expected:
-            return []
-
-        def integer(value, name):
-            if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).isdigit() or len(str(value)) > 40:
-                raise TradingError(f"循环成交{name}无效")
-            return int(value)
-
-        oid = str(integer(receipt.get("orderId"), "订单编号"))
-        cid, symbol = order["newClientOrderId"], order["symbol"]
-        if type(created_at) not in (int, float) or not math.isfinite(created_at) or created_at <= 0:
-            raise TradingError("循环订单创建时间无效，无法核对成交")
-        state = checkpoint if checkpoint is not None else self.cycle_trade_queries.setdefault(cid, {})
-        fingerprint = [oid, wire(expected), symbol, order["positionSide"], order["side"]]
-        if state.get("identity") != fingerprint:
-            # An exchange order timestamp is a tighter lookup anchor than the
-            # local write time, especially after delayed restart recovery.
-            order_ms = integer(receipt["time"], "订单时间") if receipt.get("time") is not None else int(created_at * 1000)
-            end_ms = integer(receipt["updateTime"], "回执时间") if receipt.get("updateTime") is not None else int(time.time() * 1000)
-            begin_ms = max(0, order_ms - 60000)
-            end_ms = max(order_ms, end_ms) + 60000
-            state.clear()
-            state.update(identity=fingerprint, begin_ms=begin_ms, end_ms=end_ms, window_start=begin_ms,
-                         window_end=min(end_ms, begin_ms + 7 * 86400000 - 1), from_id=None, fills={})
-        # Bound one scheduler pass; persisted checkpoints resume pagination on
-        # the next tick without spending the repair reserve on repeated pages.
-        for _ in range(5):
-            cursor = state.get("from_id")
-            params = {"symbol": symbol, "limit": 1000}
-            if cursor is None:
-                params.update(startTime=state["window_start"], endTime=state["window_end"])
-            else:
-                params["fromId"] = cursor
-            rows = self.api.call("GET", "/fapi/v3/userTrades", params, signed=True, weight=5)
-            if not isinstance(rows, list) or len(rows) > 1000:
-                raise TradingError("循环逐笔成交响应无效")
-            ids = []
-            for row in rows:
-                if not isinstance(row, dict) or row.get("symbol") != symbol:
-                    raise TradingError("循环逐笔成交品种不一致")
-                trade_id = integer(row.get("id"), "编号")
-                row_oid = str(integer(row.get("orderId"), "订单编号"))
-                ids.append(trade_id)
-                if cursor is not None and trade_id < cursor:
-                    raise TradingError("循环逐笔成交分页没有前进，等待重新核对")
-                if row_oid != oid:
-                    continue
-                if row.get("side") != order["side"] or row.get("positionSide") != order["positionSide"]:
-                    raise TradingError("循环逐笔成交方向与委托不一致")
-                stamp = integer(row.get("time"), "时间")
-                if not 0 < stamp <= 253402300799999:
-                    raise TradingError("循环逐笔成交时间无效")
-                qty, price = positive(row.get("qty")), positive(row.get("price"))
-                fill = {"trade_id": str(trade_id), "order_id": oid, "client_id": cid, "symbol": symbol,
-                        "position_side": order["positionSide"], "side": order["side"],
-                        "quantity": wire(qty), "price": wire(price), "notional": wire(Fraction(qty) * Fraction(price)),
-                        "executed_at": stamp / 1000, "time_source": "exchange"}
-                previous = state["fills"].get(str(trade_id))
-                if previous is not None and previous != fill:
-                    raise TradingError("同一循环成交编号出现冲突明细")
-                state["fills"][str(trade_id)] = fill
-            matched = sum((Fraction(dec(fill["quantity"])) for fill in state["fills"].values()), Fraction(0))
-            if matched > expected:
-                raise TradingError("逐笔成交合计超过已核实回执数量")
-            if matched == expected:
-                result = sorted(state["fills"].values(), key=lambda fill: (fill["executed_at"], int(fill["trade_id"])))
-                state.clear()
-                return result
-            if len(rows) == 1000:
-                state["from_id"] = max(ids) + 1
-                continue
-            if cursor is None and state["window_end"] < state["end_ms"]:
-                state["window_start"] = state["window_end"] + 1
-                state["window_end"] = min(state["end_ms"], state["window_start"] + 7 * 86400000 - 1)
-                continue
-            # Fills may become visible after order status. Restart the lookup
-            # window next time, retain known fills, and never call a short page 0.
-            state.update(from_id=None, window_start=state["begin_ms"],
-                         window_end=min(state["end_ms"], state["begin_ms"] + 7 * 86400000 - 1))
-            raise TradingError("循环逐笔成交尚未查全，后台继续补账")
-        raise TradingError("循环逐笔成交正在分页补账，等待后续核对")
 
     def submit(self, orders, *, timeout=None):
         self.leverage_snapshot = None
         options = {"timeout": timeout} if timeout is not None else {}
         if len(orders) == 1:
-            return [self._cycle_write("POST", "/fapi/v3/order", orders[0], **options)]
-        return self._cycle_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5, **options)
+            return [self._account_write("POST", "/fapi/v3/order", orders[0], **options)]
+        return self._account_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5, **options)
 
     def query(self, symbol, client_id, *, timeout=None):
         with self.reconciliation_budget():
@@ -2160,12 +1677,12 @@ class LiveBroker:
 
     def cancel(self, symbol, client_id):
         with self.reconciliation_budget():
-            return self._cycle_write("DELETE", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id})
+            return self._account_write("DELETE", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id})
 
     def close(self):
-        with self._cycle_lifecycle_lock:
-            self._cycle_hot_closed = True
+        with self._private_stream_lock:
+            self._private_stream_closed = True
         try:
-            self.stop_cycle_hot_data()
+            self.stop_private_stream()
         finally:
             self.api.close()

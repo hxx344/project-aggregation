@@ -132,7 +132,6 @@ class RelayHealthTelemetryTests(unittest.TestCase):
         # The scheduler reads the local budget; a bare Mock would record it as a call.
         api.budget = RateBudget()
         engine = Engine(fixture.store, market=MarketData(api=api, capacity_relay=self.client))
-        self.addCleanup(engine.dashboard_reports.close)
         self.client._connect = Mock(side_effect=RuntimeError("handshake failed"))
         with patch.object(self.client._stop, "wait", side_effect=[False, False, True]):
             self.client._run()

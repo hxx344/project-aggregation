@@ -18,7 +18,6 @@ class DashboardAPITests(unittest.TestCase):
         self.f = Fixture()
         self.addCleanup(self.f.close)
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.engine.brokers["test"] = self.f.broker
         self.f.account["enabled"] = False
         self.f.store.save_account(self.f.account)
@@ -95,7 +94,6 @@ class DashboardAPITests(unittest.TestCase):
     def test_demo_rejects_live_accounts(self):
         store = Store(Path(self.f.directory.name) / "demo.sqlite3", demo=True)
         demo = Engine(store, demo=True, market=self.f.market)
-        self.addCleanup(demo.dashboard_reports.close)
         with TestClient(create_app(demo, start_engine=False)) as client:
             response = client.post("/api/accounts", headers={"origin": "http://testserver"}, json={"id": "live", "name": "live", "mode": "live", "env_prefix": "ASTER_LIVE"})
         self.assertEqual(response.status_code, 409)

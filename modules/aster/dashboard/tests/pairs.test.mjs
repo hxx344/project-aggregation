@@ -22,11 +22,9 @@ import {
 test('funds-only activation keeps pending recovery separate from trading activation', () => {
   const fixture = {
     ordinary: { enabled: false },
-    cycle: { enabled: false },
     margin: { enabled: true },
     state: {
       pending: { kind: 'leverage' },
-      progress: { quantities: { LONG: '7' } },
       margin: { status: 'unknown', pending: { request_id: 'original' } },
     },
   };
@@ -119,12 +117,11 @@ test('pair requests preserve decimal strings and fixed roles without enabling th
   assert.equal(config.ordinary.order_notional, '1000.000000001');
   assert.equal(config.ordinary.margin_limit, '0.5000001');
   assert.equal(config.ordinary.enabled, true);
-  assert.equal(config.cycle.enabled, false);
+  assert.equal(Object.hasOwn(config, 'cycle'), false);
   assert.equal(Object.hasOwn(config, 'enabled'), false);
   assert.equal(typeof config.margin.check_interval_seconds, 'number');
   assert.deepEqual(Object.keys(pairConfigurationChanges(config)).sort(), [
     'adl',
-    'cycle',
     'margin',
     'name',
     'ordinary',
@@ -133,11 +130,16 @@ test('pair requests preserve decimal strings and fixed roles without enabling th
 });
 
 test('trade mode is exclusive and monitor-only does not silently enable trading', () => {
-  for (const mode of ['monitor', 'ordinary', 'cycle']) {
+  for (const mode of ['monitor', 'ordinary']) {
     const config = parsePairDraft({ ...draft(), mode }, accounts, []);
     assert.equal(config.ordinary.enabled, mode === 'ordinary');
-    assert.equal(config.cycle.enabled, mode === 'cycle');
+    assert.equal(Object.hasOwn(config, 'cycle'), false);
   }
+  for (const mode of ['cycle', '', 'unknown'])
+    assert.throws(
+      () => parsePairDraft({ ...draft(), mode }, accounts, []),
+      /请选择配对执行模式/,
+    );
 });
 
 test('membership rejects duplicates, mixed environments, occupied and running accounts', () => {
@@ -260,7 +262,6 @@ test('zero balancing threshold survives an edit that only renames the group', ()
   assert.deepEqual(renamed.margin, saved.margin);
   assert.equal(renamed.margin.threshold, '0');
   assert.deepEqual(renamed.ordinary, saved.ordinary);
-  assert.deepEqual(renamed.cycle, saved.cycle);
 });
 
 test('balancing intervals and cooldowns match their separate server limits', () => {
@@ -436,7 +437,7 @@ test('every live group requires an independent master prefix on create and edit 
     mode: 'live',
     env_prefix: `ASTER_${account.id.toUpperCase()}`,
   }));
-  for (const mode of ['monitor', 'ordinary', 'cycle']) {
+  for (const mode of ['monitor', 'ordinary']) {
     for (const currentId of [undefined, 'gold_pair']) {
       const input = { ...draft(), mode, margin_enabled: false };
       assert.throws(
@@ -665,10 +666,6 @@ test('unknown orders and transfers block edits/deletion without claiming complet
     assert.match(pairConfigurationLock(pair(state)), /待核对/);
     assert.match(pairDeletionBlock(pair(state), 100), /等待确认/);
   }
-  assert.match(
-    pairConfigurationLock(pair({ progress: { quantities: { LONG: '0.01' } } })),
-    /基线/,
-  );
 });
 
 test('ordinary baseline holdings do not lock unrelated configuration edits', () => {
@@ -676,10 +673,6 @@ test('ordinary baseline holdings do not lock unrelated configuration edits', () 
     pairConfigurationLock(
       pair({
         owned: { LONG: '1', SHORT: '1' },
-        progress: {
-          baseline: { LONG: '1', SHORT: '1' },
-          quantities: { LONG: '0', SHORT: '0' },
-        },
         snapshots: {
           long: snapshot([position('LONG', '1')]),
           short: snapshot([position('SHORT', '1')]),
@@ -702,7 +695,6 @@ test('ordinary opening can request reconciliation at start without unlocking edi
       long: snapshot([position('LONG', '19.5')], 1),
       short: snapshot([position('SHORT', '19.5')], 1),
     },
-    progress: { quantities: { LONG: '0', SHORT: '0.000' } },
   });
   assert.equal(pairStartRecoveryBlock(fixture), '');
   assert.equal(pairHasPending(fixture), true);
@@ -734,13 +726,6 @@ test('other pending work still blocks start even alongside an ordinary opening',
     assert.match(
       pairStartRecoveryBlock(pair({ pending: ordinary, margin })),
       /划转/,
-    );
-  for (const qty of ['0.1', '0.000000000000000000000000001', '-0.1', 'invalid'])
-    assert.match(
-      pairStartRecoveryBlock(
-        pair({ pending: ordinary, progress: { quantities: { LONG: qty } } }),
-      ),
-      /循环新增仓位/,
     );
   assert.equal(
     pairStartRecoveryBlock(pair({ margin: { status: 'confirmed' } })),

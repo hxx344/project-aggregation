@@ -8,7 +8,7 @@ function fixture(overrides = {}) {
   const settings = {
     account: { id: 'one' },
     locked: false,
-    changes: () => ({ cycle: { hold_seconds: 90 } }),
+    changes: () => ({ min_open_leverage: 10 }),
     action: async (...args) => {
       events.push(['request', ...args]);
       return true;
@@ -37,10 +37,10 @@ test('locked configuration never parses or sends; rejected save retains its draf
   assert.deepEqual(rejected.events, []);
 });
 
-test('successful saves preserve nested and flat requests and clear only after acknowledgement', async () => {
+test('successful saves preserve account configuration requests and clear only after acknowledgement', async () => {
   for (const body of [
-    { cycle: { enabled: false } },
-    { migration: { batch_notional: '500' } },
+    { ordinary_symbol: 'CLUSD1' },
+    { min_open_leverage: 20 },
     { margin_limit: '0.55' },
   ]) {
     const { settings, events } = fixture({ changes: () => body });

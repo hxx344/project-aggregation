@@ -3,9 +3,6 @@ from datetime import date, datetime, timezone
 import math
 import time
 
-from .report_cache import REPORT_MAX_AGE
-from .models import TradingError, dec
-
 
 STALE_AFTER_SECONDS = 120
 DIAGNOSTIC_LIMIT = 64
@@ -111,17 +108,10 @@ def _funds_only(pair, runtime):
     """Only an idle funds manager has no current position evidence to report."""
     if (not pair.get("enabled") or pair.get("margin", {}).get("enabled") is not True
             or pair.get("ordinary", {}).get("enabled") is not False
-            or pair.get("cycle", {}).get("enabled") is not False
             or not isinstance(runtime, dict) or runtime.get("pending") is not None):
         return False
-    progress = runtime.get("progress")
-    quantities = progress.get("quantities") if isinstance(progress, dict) else None
-    if not isinstance(quantities, dict) or set(quantities) != {"LONG", "SHORT"}:
-        return False
-    try:
-        return all(dec(quantities.get(side)) == 0 for side in ("LONG", "SHORT"))
-    except TradingError:
-        return False
+    from .pair_legacy import has_legacy_cycle
+    return not has_legacy_cycle(runtime)
 
 
 def _funds_errors(runtime, journal):
@@ -161,7 +151,7 @@ def _pair_orders_unresolved(runtime):
         results = pending.get("results")
         return (runtime.get("phase") != "leverage" or not isinstance(results, dict)
                 or any(not isinstance(row, dict) or row.get("unknown") for row in results.values()))
-    if (runtime.get("phase") != "submitting" or pending.get("kind") not in ("cycle", "ordinary")
+    if (runtime.get("phase") != "submitting" or pending.get("kind") != "ordinary"
             or pending.get("phase") not in ("open", "close")):
         return True
     legs, repairs = pending.get("legs"), pending.get("repairs")
@@ -348,45 +338,17 @@ def hub_summary(engine, *, now=None, diagnostics=False):
                 funds_errors.append(message)
                 diagnostic.add(f"pair:{pair['id']}", "fault", message)
     utc_date = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
-    reports = engine.dashboard_reports
-    with reports.lock:
-        for account in live:
-            if account["id"] in paired:
-                runtime, side = paired[account["id"]]
-                volume, reason = _pair_volume(runtime, side, now, utc_date)
-                volumes.append(volume)
-                if reason:
-                    label = f"{_text(account.get('name'), '实盘账户')}（{_text(account['id'], '未知账户')}）"
-                    reasons.append(f"{label}：{reason}")
-                    pair = pair_for_account[account["id"]]
-                    account_diagnostic(account, "report", "notice", f"{_text(pair.get('name'), '配对组')}：{reason}")
-                continue
-            entry = reports.entries.get(account["id"], {})
-            stamp = _number(entry.get("as_of"))
-            valid = (entry.get("key") == reports.key(account) and not entry.get("error")
-                     and stamp is not None and 0 <= now - stamp < REPORT_MAX_AGE
-                     and now // 86400 == stamp // 86400)
-            report = entry.get("data") or {}
-            daily = report.get("volumes", {}).get(account["cycle"]["symbol"], {}).get("daily_volume", {})
-            volumes.append(_number(daily.get("volume")) if valid and daily.get("utc_date") == utc_date else None)
-            if volumes[-1] is None:
-                label = f"{_text(account.get('name'), '实盘账户')}（{_text(account['id'], '未知账户')}）"
-                if entry.get("error"):
-                    reason = f"成交统计读取失败：{_text(entry['error'], '上游未提供具体原因')}"
-                elif not entry or not report:
-                    reason = "成交统计尚未生成"
-                elif entry.get("key") != reports.key(account):
-                    reason = "账户配置已变更，成交统计等待重新生成"
-                elif stamp is None or stamp > now:
-                    reason = "成交统计缺少有效更新时间"
-                elif now // 86400 != stamp // 86400 or daily.get("utc_date") != utc_date:
-                    reason = "成交统计缺少当日 UTC 数据"
-                elif now - stamp >= REPORT_MAX_AGE:
-                    reason = f"成交统计已过期（超过 {REPORT_MAX_AGE} 秒）"
-                else:
-                    reason = "今日成交量缺失或无效"
-                reasons.append(f"{label}：{reason}")
-                account_diagnostic(account, "report", "fault" if entry.get("error") else "notice", reasons[-1])
+    for account in live:
+        if account["id"] not in paired:
+            continue
+        runtime, side = paired[account["id"]]
+        volume, reason = _pair_volume(runtime, side, now, utc_date)
+        volumes.append(volume)
+        if reason:
+            label = f"{_text(account.get('name'), '实盘账户')}（{_text(account['id'], '未知账户')}）"
+            reasons.append(f"{label}：{reason}")
+            pair = pair_for_account[account["id"]]
+            account_diagnostic(account, "report", "notice", f"{_text(pair.get('name'), '配对组')}：{reason}")
     oldest = min(stamps) if stamps and all(stamp is not None for stamp in stamps) else None
     updated_at = (datetime.fromtimestamp(oldest, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
                   if oldest is not None else None)
@@ -406,8 +368,9 @@ def hub_summary(engine, *, now=None, diagnostics=False):
         {"key": "occupied_margin", "label": "实盘占用保证金", "value": _sum(margins), "unit": "USD1",
          **({"detail": "仅保证金模式不采集完整持仓；当前占用保证金汇总暂不可用，不按零计入"} if funds_accounts else {})},
         {"key": "daily_volume", "label": "实盘今日成交量", "value": _sum(volumes), "unit": "USD1",
-         "detail": "上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总" if any(account["id"] in paired for account in live)
-                   else "上游 UTC 日口径；不计入资产汇总"},
+         "detail": "上游 UTC 日口径；仅统计配对组已核对成交，单账户不统计；不计入资产汇总"
+                   if any(account["id"] not in paired for account in live)
+                   else "上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总"},
     ]
     data = {"updatedAt": updated_at,
             "health": {"state": health, "message": message, "staleAfterSeconds": STALE_AFTER_SECONDS}, "metrics": metrics}

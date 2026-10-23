@@ -2,7 +2,6 @@
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
-from fractions import Fraction
 import json
 import math
 from pathlib import Path
@@ -12,16 +11,14 @@ import threading
 import time
 import uuid
 
-from .models import MARKET_SYMBOLS, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive, wire
-from . import cycle_quality_history, hourly_notifications, listing_alerts, margin_imbalance_notifications, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations, pair_cost
-from .migration import DEFAULT_MIGRATION
-from .cycle import DEFAULT_CYCLE
-from .ledger_cache import LedgerCache
+from .models import MARKET_SYMBOLS, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, positive
+from . import hourly_notifications, listing_alerts, margin_imbalance_notifications, monitoring, notification_channels, relay_health_notifications, position_imbalance_notifications, position_observations
+from .pair_legacy import without_cycle, rollback_cycle
 from .account_deletion import deletion_block
-from .request_timing import database_clock, database_duration
 from .capacity_timing import capacity_timing_text
-from .cycle_volume import (FILL_FIELDS, account_identifier, event_message, identifier, normalize_fill,
-                           order_bindings, receipt_quantity, sort_key, utc_day, validate_fill_binding)
+from .identifiers import account_identifier
+from .account_legacy import (without_removed_config, legacy_enabled, legacy_intent, legacy_position,
+                             LEGACY_CONFIG_REASON, LEGACY_PENDING_REASON, REMOVED_CONFIG_KEYS)
 
 
 CAPACITY_ALERT_MAX_AGE = 8
@@ -66,8 +63,6 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self._connection_local = threading.local()
-        self._rolling_cache = LedgerCache()
-        self._pair_cost_cache = pair_cost.HistoryCache()
         with self.connect() as db:
             # Decide HTTP exposure before touching historical schema or state.
             # Keep the claim and migrations in one rollback-capable transaction;
@@ -75,8 +70,6 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if demo is not None:
                 self._bind_runtime_mode(db, demo=demo)
-            had_volume_index = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cycle_volume_sync'").fetchone() is not None
-            had_symbol_volume = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cycle_symbol_volume_days'").fetchone() is not None
             schema = """
                 CREATE TABLE IF NOT EXISTS accounts (
                     id TEXT PRIMARY KEY, data TEXT NOT NULL
@@ -112,64 +105,11 @@ class Store:
                     due_at REAL NOT NULL, delivered_at REAL, expires_at REAL, capacity_key TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(due_at) WHERE delivered_at IS NULL;
-                CREATE TABLE IF NOT EXISTS cycle_fills (
-                    account_id TEXT NOT NULL, symbol TEXT NOT NULL, trade_id TEXT NOT NULL,
-                    order_id TEXT NOT NULL, client_id TEXT NOT NULL, intent_id TEXT NOT NULL,
-                    phase TEXT NOT NULL, position_side TEXT NOT NULL, side TEXT NOT NULL,
-                    quantity TEXT NOT NULL, price TEXT NOT NULL, notional TEXT NOT NULL,
-                    executed_at REAL NOT NULL, time_source TEXT NOT NULL, utc_date TEXT NOT NULL,
-                    daily_volume TEXT NOT NULL, recorded_at REAL NOT NULL, event_id INTEGER,
-                    PRIMARY KEY(account_id,symbol,trade_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_day
-                    ON cycle_fills(account_id,utc_date,executed_at,symbol,trade_id);
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_order
-                    ON cycle_fills(intent_id,client_id);
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_recent
-                    ON cycle_fills(account_id,executed_at DESC,symbol DESC,trade_id DESC);
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_exchange_order
-                    ON cycle_fills(account_id,symbol,order_id,client_id,intent_id);
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_client
-                    ON cycle_fills(account_id,symbol,client_id,order_id,intent_id);
-                CREATE TABLE IF NOT EXISTS cycle_fill_versions (
-                    account_id TEXT PRIMARY KEY, revision INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS cycle_symbol_volume_days (
-                    account_id TEXT NOT NULL, utc_date TEXT NOT NULL, volume TEXT NOT NULL,
-                    trade_count INTEGER NOT NULL, estimated_volume TEXT NOT NULL,
-                    estimated_trade_count INTEGER NOT NULL, latest_trade_at REAL,
-                    latest_symbol TEXT, latest_trade_id TEXT, updated_at REAL NOT NULL,
-                    symbol TEXT NOT NULL, PRIMARY KEY(account_id,utc_date,symbol)
-                );
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_symbol_time
-                    ON cycle_fills(account_id,symbol,executed_at,trade_id);
-                CREATE INDEX IF NOT EXISTS idx_cycle_fills_symbol_day
-                    ON cycle_fills(account_id,utc_date,symbol,executed_at,trade_id);
-                CREATE TABLE IF NOT EXISTS cycle_volume_sync (
-                    intent_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, status TEXT NOT NULL,
-                    created_at REAL, completed_at REAL, synced_at REAL
-                );
-                CREATE INDEX IF NOT EXISTS idx_cycle_volume_backlog
-                    ON cycle_volume_sync(account_id,synced_at,status,completed_at,created_at);
             """
             for statement in schema.split(";"):
                 if statement.strip():
                     db.execute(statement)
             position_observations.initialize(db)
-            cycle_quality_history.initialize(db)
-            pair_cost.initialize(db)
-            # A revision changes in the same transaction as its fills, including
-            # backfills and writes from a different process/Store. Rollbacks
-            # cannot publish a new revision. Never infer validity from a TTL.
-            for action, owners in (("INSERT", ("NEW",)), ("DELETE", ("OLD",)), ("UPDATE", ("OLD", "NEW"))):
-                updates = " ".join(
-                    f"INSERT INTO cycle_fill_versions SELECT {owner}.account_id,1 WHERE "
-                    + ("NEW.account_id!=OLD.account_id " if action == "UPDATE" and owner == "NEW" else "1 ") +
-                    "ON CONFLICT(account_id) DO UPDATE SET revision=revision+1;"
-                    for owner in owners)
-                db.execute(f"DROP TRIGGER IF EXISTS cycle_fills_revision_{action.lower()}")
-                db.execute(f"CREATE TRIGGER IF NOT EXISTS cycle_fills_revision_{action.lower()} "
-                           f"AFTER {action} ON cycle_fills BEGIN {updates} END")
             # Existing trade notifications keep NULL expiry and remain deliverable.
             columns = {row[1] for row in db.execute("PRAGMA table_info(outbox)")}
             for name, kind in (("expires_at", "REAL"), ("capacity_key", "TEXT"), ("category", "TEXT"), ("symbols", "TEXT")):
@@ -184,21 +124,7 @@ class Store:
                 account = json.loads(row["data"])
                 normalized = self.account_defaults(account)
                 if normalized != account:
-                    db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(normalized), row["id"]))
-            # One upgrade pass builds the lightweight index. Subsequent account
-            # ticks never deserialize all historical intents to find today's work.
-            if not had_volume_index:
-                for row in db.execute("SELECT id,account_id,status,data FROM intents").fetchall():
-                    self._index_cycle_volume(db, json.loads(row["data"]), row=row)
-            if not had_symbol_volume:
-                for group in db.execute("SELECT DISTINCT account_id,utc_date,symbol FROM cycle_fills").fetchall():
-                    rows = [dict(row) for row in db.execute(
-                        "SELECT * FROM cycle_fills WHERE account_id=? AND utc_date=? AND symbol=?",
-                        tuple(group))]
-                    self._update_cycle_day(db, group["account_id"], group["utc_date"], rows, symbol=group["symbol"])
-            # The all-symbol total is derived from at most three symbol rows.
-            # Its old duplicate aggregate is no longer read or maintained.
-            db.execute("DROP TABLE IF EXISTS cycle_volume_days")
+                    db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps({**account, **normalized}), row["id"]))
             placeholders = ",".join("?" for _ in CAPACITY_ALERT_KEYS)
             db.execute(f"""UPDATE outbox SET expires_at=0 WHERE delivered_at IS NULL
                 AND capacity_key IS NOT NULL AND capacity_key NOT IN ({placeholders})""", tuple(CAPACITY_ALERT_KEYS))
@@ -248,17 +174,13 @@ class Store:
 
     @contextmanager
     def connect(self):
-        waiting = database_clock()
         with self.lock:
-            database_duration("lock_wait_ms", waiting)
             db = getattr(self._connection_local, "db", None)
             scoped = getattr(self._connection_local, "scoped", False)
             if db is None:
-                started = database_clock()
                 db = sqlite3.connect(self.path, timeout=10)
                 db.row_factory = sqlite3.Row
                 db.execute("PRAGMA synchronous=FULL")
-                database_duration("connection_ms", started)
                 if scoped:
                     self._connection_local.db = db
             try:
@@ -348,12 +270,9 @@ class Store:
 
     @staticmethod
     def account_defaults(account):
-        migration = account.get("migration")
-        normalized = {**account, "migration": {**DEFAULT_MIGRATION, **migration} if isinstance(migration, dict)
-                      else {**DEFAULT_MIGRATION} if "migration" not in account else migration}
-        cycle = account.get("cycle")
-        normalized["cycle"] = ({**DEFAULT_CYCLE, **cycle} if isinstance(cycle, dict)
-                               else {**DEFAULT_CYCLE} if "cycle" not in account else cycle)
+        normalized = without_removed_config(account)
+        if legacy_enabled(account):
+            normalized.update(enabled=False, pause_reason=LEGACY_CONFIG_REASON)
         policy = account.get("policy")
         if isinstance(policy, dict):
             policy = {"ordinary_symbol": "all", **policy}
@@ -376,7 +295,14 @@ class Store:
             row = db.execute("SELECT data FROM accounts WHERE id=?", (account_id,)).fetchone()
             return self.account_defaults(json.loads(row[0])) if row else None
 
-    def save_account(self, account, *, user_control=False):
+    @staticmethod
+    def _keep_removed(raw, account):
+        """Automatic writes keep removed settings so a rolled-back release still finds them."""
+        if not isinstance(raw, dict):
+            return account
+        return {**account, **{key: raw[key] for key in REMOVED_CONFIG_KEYS if key in raw}}
+
+    def save_account(self, account, *, user_control=False, discard_removed=False):
         account = self.account_defaults(account)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -384,24 +310,26 @@ class Store:
                 raise TradingError("该账户标识已有删除记录，请使用新的账户标识")
             if account.get("enabled") and db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (account["id"],)).fetchone():
                 raise TradingError("配对组成员不能启用单账户策略")
-            db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(account)))
+            row = None if discard_removed else db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
+            stored = self._keep_removed(json.loads(row[0]), account) if row else account
+            db.execute("INSERT INTO accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", (account["id"], dumps(stored)))
             if user_control:
                 db.execute("DELETE FROM kv WHERE key=?", ("recovery_auto_pause:" + account["id"],))
 
     def pairs(self):
         with self.connect() as db:
-            return [json.loads(row[0]) for row in db.execute("SELECT data FROM pairs ORDER BY id")]
+            return [without_cycle(json.loads(row[0])) for row in db.execute("SELECT data FROM pairs ORDER BY id")]
 
     def pair(self, pair_id):
         with self.connect() as db:
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
-            return json.loads(row[0]) if row else None
+            return without_cycle(json.loads(row[0])) if row else None
 
     def pair_for_account(self, account_id):
         with self.connect() as db:
             row = db.execute("SELECT p.data FROM pairs p JOIN pair_members m ON p.id=m.pair_id WHERE m.account_id=?",
                              (account_id,)).fetchone()
-            return json.loads(row[0]) if row else None
+            return without_cycle(json.loads(row[0])) if row else None
 
     def save_pair(self, pair, *, create=False):
         """Reserve both members in one durable transaction, across Store instances."""
@@ -415,7 +343,7 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
-            if (not row or json.loads(row[0]) != expected_pair
+            if (not row or without_cycle(json.loads(row[0])) != expected_pair
                     or expected_pair.get("enabled") is not False or pair.get("enabled") is not False
                     or pair.get("symbol") == expected_pair.get("symbol")):
                 raise TradingError("切换标的期间配对组状态已变化，请重新核对")
@@ -428,13 +356,12 @@ class Store:
                 row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
                 binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
                 side = "LONG" if account["id"] == expected_pair["long_account_id"] else "SHORT"
-                if not row or json.loads(row[0]) != account or not binding or tuple(binding) != (pair["id"], side):
+                if not row or self.account_defaults(json.loads(row[0])) != account or not binding or tuple(binding) != (pair["id"], side):
                     raise TradingError("切换标的期间子账户配置或绑定已变化，请重新核对")
                 for prefix in ("post_fill_check:", "cycle:"):
                     row = db.execute("SELECT data FROM kv WHERE key=?", (prefix + account["id"],)).fetchone()
                     legacy = json.loads(row[0]) if row else {}
-                    if ((prefix == "post_fill_check:" and legacy)
-                            or (prefix == "cycle:" and any(dec(qty) for qty in legacy.get("quantities", {}).values()))):
+                    if (prefix == "post_fill_check:" and legacy) or (prefix == "cycle:" and legacy_position(legacy)):
                         raise TradingError("切换标的期间子账户出现未完成批次，请重新核对")
             # The database writer may have waited beyond the snapshot deadline.
             # Recheck identity and revocable read authority under that same lock.
@@ -464,7 +391,7 @@ class Store:
                     raise TradingError("启动核验期间运行或划转记录已变化，请重新核对")
             for account in accounts:
                 row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
-                if not row or json.loads(row[0]) != account:
+                if not row or self.account_defaults(json.loads(row[0])) != account:
                     raise TradingError("启动核验期间子账户配置已变化，请重新核对")
             # Acquiring the database writer lock may itself outlive the reads.
             # The caller holds both generation locks until this commit finishes.
@@ -482,7 +409,7 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
-            if not row or json.loads(row[0]) != pair or pair.get("enabled") is not False:
+            if not row or without_cycle(json.loads(row[0])) != pair or pair.get("enabled") is not False:
                 raise TradingError("核对期间配对组状态已变化，请重新核对")
             for key, expected in (("pair_runtime:" + pair["id"], expected_runtime),
                                   ("pair_margin:" + pair["id"], expected_margin)):
@@ -493,7 +420,7 @@ class Store:
                 row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
                 binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
                 side = "LONG" if account["id"] == pair["long_account_id"] else "SHORT"
-                if not row or json.loads(row[0]) != account or not binding or tuple(binding) != (pair["id"], side):
+                if not row or self.account_defaults(json.loads(row[0])) != account or not binding or tuple(binding) != (pair["id"], side):
                     raise TradingError("核对期间子账户配置或绑定已变化，请重新核对")
             check_current()
             self._save_pair(db, pair)
@@ -538,9 +465,12 @@ class Store:
             if db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone():
                 raise TradingError("账户旧批次尚未完成，请先核对")
         revision = (previous or {}).get("revision", 0) + 1
-        saved_pair = {**pair, "revision": revision}
+        saved_pair = {**without_cycle(pair), "revision": revision}
+        # The previous release rejects ordinary and cycle together only when validating input.
+        disable = bool(pair.get("enabled") or (pair.get("ordinary") or {}).get("enabled")) or allow_symbol_change
+        cycle = rollback_cycle(previous, pair, disable=disable)
         db.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-                   (pair["id"], dumps(saved_pair)))
+                   (pair["id"], dumps({**saved_pair, "cycle": cycle})))
         for aid, direction in members:
             db.execute("INSERT INTO pair_members VALUES (?,?,?) ON CONFLICT(account_id) DO NOTHING",
                        (aid, pair["id"], direction))
@@ -553,7 +483,7 @@ class Store:
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
             if row is None:
                 raise TradingError("配对组不存在")
-            pair = json.loads(row[0])
+            pair = without_cycle(json.loads(row[0]))
             if pair.get("enabled"):
                 raise TradingError("请先暂停配对组")
             runtime_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_runtime:" + pair_id,)).fetchone()
@@ -579,7 +509,7 @@ class Store:
                     row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
                     binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
                     side = "LONG" if account["id"] == pair["long_account_id"] else "SHORT"
-                    if not row or json.loads(row[0]) != account or not binding or tuple(binding) != (pair_id, side):
+                    if not row or self.account_defaults(json.loads(row[0])) != account or not binding or tuple(binding) != (pair_id, side):
                         raise TradingError("解除绑定期间子账户配置或归属已变化，请重新核对")
                 if watch_evidence is not None:
                     prefix = "pair_watch_evidence:" + pair_id + ":"
@@ -637,7 +567,8 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-            current = self.account_defaults(json.loads(row[0])) if row else None
+            raw_account = json.loads(row[0]) if row else None
+            current = self.account_defaults(raw_account) if row else None
             if current is None:
                 raise TradingError("批次暂停期间账户已不存在")
             same_account = current == self.account_defaults(account)
@@ -649,15 +580,14 @@ class Store:
             marker = json.loads(row[0]) if row else None
             paused = {**current, "enabled": False, "pause_reason": reason}
             if same_account and (current.get("enabled") or (isinstance(marker, dict) and marker.get("intent_id") == intent["id"]
-                                          and marker.get("paused_account") == current)):
+                                          and without_removed_config(marker.get("paused_account") or {}) == current)):
                 marker = {"intent_id": intent["id"], "paused_account": paused,
                           "paused_at": (marker or {}).get("paused_at", time.time())}
                 db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(marker)))
             else:
                 db.execute("DELETE FROM kv WHERE key=?", (key,))
-            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(paused), aid))
+            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(self._keep_removed(raw_account, paused)), aid))
             db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (intent["status"], dumps(intent), intent["id"]))
-            self._index_cycle_volume(db, intent)
         account.clear()
         account.update(paused)
 
@@ -669,16 +599,17 @@ class Store:
         if not isinstance(marker, dict) or marker.get("intent_id") != intent["id"]:
             return False
         row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-        current = self.account_defaults(json.loads(row[0])) if row else None
+        raw_account = json.loads(row[0]) if row else None
+        current = self.account_defaults(raw_account) if row else None
         terminal = db.execute("SELECT status FROM intents WHERE id=? AND account_id=?", (intent["id"], aid)).fetchone()
         resumed = bool(current and terminal and terminal[0] in ("complete", "aborted")
-            and marker.get("paused_account") == current and not current.get("enabled")
+            and without_removed_config(marker.get("paused_account") or {}) == current and not current.get("enabled")
             and not db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (aid,)).fetchone()
             and not db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone())
         if resumed:
             current["enabled"] = True
             current.pop("pause_reason", None)
-            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(current), aid))
+            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(self._keep_removed(raw_account, current)), aid))
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
                        (aid, "recovery", "旧批次已正常核对完成，解除该批次自动暂停并恢复原策略运行", time.time()))
         db.execute("DELETE FROM kv WHERE key=?", (key,))
@@ -691,7 +622,8 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-            if not row or self.account_defaults(json.loads(row[0])) != account:
+            raw_account = json.loads(row[0]) if row else None
+            if not row or self.account_defaults(raw_account) != account:
                 raise TradingError("恢复核验期间账户配置已变化")
             rows = db.execute("SELECT id,data FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchall()
             if len(rows) != 1 or rows[0][0] != intent["id"] or json.loads(rows[0][1]) != intent:
@@ -708,15 +640,14 @@ class Store:
                          "resolution": {**resolution, "previous_status": intent["status"]}}
             marker = expected_state.get("recovery_auto_pause:" + aid)
             resumed = (isinstance(marker, dict) and marker.get("intent_id") == intent["id"]
-                       and marker.get("paused_account") == account)
+                       and without_removed_config(marker.get("paused_account") or {}) == account)
             updated_account = dict(account)
             if resumed:
                 updated_account["enabled"] = True
                 updated_account.pop("pause_reason", None)
-                db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(updated_account), aid))
+                db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(self._keep_removed(raw_account, updated_account)), aid))
             db.execute("DELETE FROM kv WHERE key=?", ("recovery_auto_pause:" + aid,))
             db.execute("UPDATE intents SET status='aborted',data=? WHERE id=?", (dumps(completed), intent["id"]))
-            self._index_cycle_volume(db, completed)
             quantities = resolution.get("known_quantities")
             if (intent.get("kind") == "pair" and resolution.get("execution_result_unknown") is False
                     and quantities and any(dec(quantities[key]) for key in ("long_qty", "short_qty"))):
@@ -883,511 +814,10 @@ class Store:
                 raise TradingError("配对组成员不能创建单账户批次")
             db.execute("INSERT INTO intents VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,data=excluded.data",
                        (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
-            self._index_cycle_volume(db, intent)
-
-    def save_cycle_volume_state(self, intent, original):
-        """Merge terminal backfill metadata without replacing execution state."""
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            saved = self._cycle_ledger_intent(db, intent)
-            status = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()[0]
-            if status not in ("complete", "aborted"):
-                # Active reconciliation still owns this intent exclusively.
-                db.execute("UPDATE intents SET status=?,data=? WHERE id=?",
-                           (intent["status"], dumps(intent), intent["id"]))
-                self._index_cycle_volume(db, intent)
-                return False
-            saved["status"] = status
-            indexed = db.execute("SELECT synced_at FROM cycle_volume_sync WHERE intent_id=?", (intent["id"],)).fetchone()
-            if indexed is not None and indexed[0] is not None:
-                saved.pop("volume_error", None)
-                saved["volume_synced"] = True
-                db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
-                return True
-            bindings = order_bindings(saved)
-            signatures = {}
-            for cid, (order, receipt, _) in bindings.items():
-                qty = receipt_quantity(order, receipt, require_terminal=True)
-                incoming = intent.get("receipts", {}).get(cid)
-                if incoming is not None and receipt_quantity(order, incoming) == qty:
-                    old_id, new_id = receipt.get("orderId"), incoming.get("orderId")
-                    if old_id is not None and new_id is not None and str(old_id) != str(new_id):
-                        raise TradingError("循环补账订单编号与已完成回执冲突")
-                    # Terminal economics and status stay fixed. A query or a
-                    # legacy paper adapter may only add previously absent data.
-                    receipt.update({key: value for key, value in incoming.items() if receipt.get(key) is None})
-                signatures[cid] = [str(receipt.get("orderId", "")), wire(qty), receipt["status"]]
-            confirmed = saved.setdefault("volume_receipts", {})
-            prior_confirmed = dict(confirmed)
-            for cid, signature in intent.get("volume_receipts", {}).items():
-                if signature != signatures.get(cid):
-                    continue
-                recorded = sum((Fraction(dec(row[0])) for row in db.execute(
-                    "SELECT quantity FROM cycle_fills WHERE intent_id=? AND client_id=?", (intent["id"], cid))), Fraction(0))
-                if recorded == Fraction(dec(signature[1])):
-                    confirmed[cid] = signature
-            queries = saved.setdefault("volume_queries", {})
-            before_queries = original.get("volume_queries") or {}
-            for cid, incoming in intent.get("volume_queries", {}).items():
-                if cid not in bindings:
-                    continue
-                if confirmed.get(cid) == signatures[cid]:
-                    queries[cid] = {}
-                    continue
-                current = queries.get(cid, {})
-                if current == before_queries.get(cid, {}):
-                    queries[cid] = incoming
-                elif incoming and current.get("identity") == incoming.get("identity"):
-                    # Another worker advanced this checkpoint. Keep its cursor,
-                    # but retain every matching fill observed by either reader.
-                    fills = current.setdefault("fills", {})
-                    for trade_id, fill in incoming.get("fills", {}).items():
-                        if trade_id in fills and fills[trade_id] != fill:
-                            raise TradingError("并发循环补账出现冲突成交明细")
-                        fills[trade_id] = fill
-            if intent.get("volume_error"):
-                if prior_confirmed == (original.get("volume_receipts") or {}):
-                    saved["volume_error"] = intent["volume_error"]
-            else:
-                saved.pop("volume_error", None)
-            db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
-            return False
-
-    def create_cycle_intent(self, intent, message):
-        """Commit a new pending cycle, its volume index and event before send."""
-        if intent.get("kind") != "cycle" or intent.get("status") != "pending":
-            raise TradingError("只能创建新的待提交循环批次")
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM pair_members WHERE account_id=?", (intent["account_id"],)).fetchone():
-                raise TradingError("配对组成员不能创建单账户循环批次")
-            # This is creation, never an upsert of a previously submitted ID.
-            db.execute("INSERT INTO intents VALUES (?,?,?,?)",
-                       (intent["id"], intent["account_id"], intent["status"], dumps(intent)))
-            self._index_cycle_volume(db, intent)
-            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
-                       (intent["account_id"], "cycle", message, time.time()))
-
-    def record_cycle_execution_quality(self, intent):
-        """Update display metadata only; leave status and volume indexes intact."""
-        quality = intent["execution_quality"]
-        if not isinstance(quality, dict) or quality.get("intent_id") != intent.get("id"):
-            raise TradingError("循环执行观测与批次不一致")
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT account_id,data FROM intents WHERE id=?", (intent["id"],)).fetchone()
-            if row is None or row["account_id"] != intent["account_id"]:
-                raise TradingError("循环执行观测不属于此账户")
-            saved = json.loads(row["data"])
-            if saved.get("kind") != "cycle" or any(saved.get(key) != intent.get(key)
-                                                     for key in ("account_id", "symbol", "phase", "quantity")):
-                raise TradingError("循环执行观测与持久批次不一致")
-            if any(quality.get(key) != saved.get(key) for key in ("symbol", "phase", "quantity", "created_at")):
-                raise TradingError("循环执行观测元数据不一致")
-            quality = cycle_quality_history.merge(db, saved, quality)
-            serialized = json.dumps(quality, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-            saved["execution_quality"] = quality
-            db.execute("UPDATE intents SET data=? WHERE id=?", (dumps(saved), intent["id"]))
-            cycle_quality_history.record(db, intent["account_id"], quality)
-            key = "cycle_execution:" + intent["account_id"]
-            previous = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
-            latest = json.loads(previous["data"]) if previous else None
-            # Delayed historical reconciliation must not displace a newer batch.
-            if isinstance(latest, dict) and latest.get("intent_id") != intent["id"] \
-                    and latest.get("created_at", 0) >= quality["created_at"]:
-                return
-            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, serialized))
-
-    def cycle_execution_quality_history(self, account_id):
-        with self.connect() as db:
-            return cycle_quality_history.summary(db, account_id)
-
-    @staticmethod
-    def _index_cycle_volume(db, intent, row=None):
-        if intent.get("kind") != "cycle":
-            return
-        def timestamp(value):
-            return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
-        identity = row if row is not None else intent
-        db.execute("""INSERT INTO cycle_volume_sync(intent_id,account_id,status,created_at,completed_at,synced_at)
-                    VALUES (?,?,?,?,?,NULL) ON CONFLICT(intent_id) DO UPDATE SET
-                    status=excluded.status,created_at=excluded.created_at,completed_at=excluded.completed_at""",
-                   (identity["id"], identity["account_id"], identity["status"],
-                    timestamp(intent.get("created_at")), timestamp(intent.get("completed_at"))))
-
-    @staticmethod
-    def _cycle_ledger_intent(db, intent):
-        if not isinstance(intent, dict):
-            raise TradingError("循环交易量批次无效")
-        intent_id = identifier(intent.get("id"), "循环批次标识")
-        account_id = account_identifier(intent.get("account_id"))
-        row = db.execute("SELECT account_id,status,data FROM intents WHERE id=?", (intent_id,)).fetchone()
-        if row is None or row["account_id"] != account_id:
-            raise TradingError("循环逐笔成交批次不存在或不属于此账户")
-        saved = json.loads(row["data"])
-        if (saved.get("account_id") != account_id or saved.get("id") != intent_id
-                or saved.get("kind") != "cycle" or any(saved.get(key) != intent.get(key) for key in ("kind", "symbol", "run_id"))):
-            raise TradingError("循环逐笔成交与持久批次身份不一致")
-        if db.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone() is None:
-            raise TradingError("循环成交账户不存在")
-        return saved
-
-    def record_cycle_fills(self, intent, fills):
-        """Atomically admit individually verified fills; return the new row count."""
-        if not isinstance(fills, (list, tuple)) or len(fills) > 20000:
-            raise TradingError("循环逐笔成交列表无效或过大")
-        normalized = [normalize_fill(fill) for fill in fills]
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            saved = self._cycle_ledger_intent(db, intent)
-            account_id, intent_id = saved["account_id"], saved["id"]
-            bindings = order_bindings(saved)
-            limits, changed_days = {}, {}
-            for fill in normalized:
-                phase, maximum_quantity = validate_fill_binding(fill, bindings)
-                limits[fill["client_id"]] = maximum_quantity
-                row = {**fill, "account_id": account_id, "intent_id": intent_id, "phase": phase,
-                       "daily_volume": "0", "recorded_at": time.time()}
-                previous = db.execute("SELECT * FROM cycle_fills WHERE account_id=? AND symbol=? AND trade_id=?",
-                                      (account_id, fill["symbol"], fill["trade_id"])).fetchone()
-                if previous is not None:
-                    if any(previous[key] != row[key] for key in FILL_FIELDS | {"intent_id", "phase", "utc_date"}):
-                        raise TradingError("同一循环成交标识对应的价量、时间或委托发生冲突")
-                    continue
-                if db.execute("SELECT 1 FROM cycle_fills WHERE account_id=? AND symbol=? AND order_id=? AND (client_id!=? OR intent_id!=?) LIMIT 1",
-                              (account_id, fill["symbol"], fill["order_id"], fill["client_id"], intent_id)).fetchone():
-                    raise TradingError("同一交易所订单号不能归属不同循环委托")
-                if db.execute("SELECT 1 FROM cycle_fills WHERE account_id=? AND symbol=? AND client_id=? AND (order_id!=? OR intent_id!=?) LIMIT 1",
-                              (account_id, fill["symbol"], fill["client_id"], fill["order_id"], intent_id)).fetchone():
-                    raise TradingError("同一循环委托不能归属不同交易所订单号或批次")
-                event = db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
-                                   (account_id, "cycle_fill", "循环逐笔成交入账", row["recorded_at"]))
-                row["event_id"] = event.lastrowid
-                fields = (*FILL_FIELDS, "account_id", "intent_id", "phase", "utc_date", "daily_volume", "recorded_at", "event_id")
-                db.execute("INSERT INTO cycle_fills(" + ",".join(fields) + ") VALUES (" + ",".join("?" for _ in fields) + ")",
-                           tuple(row[key] for key in fields))
-                changed_days.setdefault(fill["utc_date"], []).append(row)
-            for client_id, maximum_quantity in limits.items():
-                quantity = sum((Fraction(dec(row[0])) for row in db.execute(
-                    "SELECT quantity FROM cycle_fills WHERE intent_id=? AND client_id=?", (intent_id, client_id))), Fraction(0))
-                if quantity > maximum_quantity:
-                    raise TradingError("循环逐笔成交累计数量超过已核实回执")
-            for date, rows in changed_days.items():
-                for symbol in {row["symbol"] for row in rows}:
-                    self._update_cycle_day(db, account_id, date, [row for row in rows if row["symbol"] == symbol], symbol=symbol)
-            return sum(len(rows) for rows in changed_days.values())
-
-    @staticmethod
-    def _update_cycle_day(db, account_id, date, new_rows, *, symbol):
-        table = "cycle_symbol_volume_days"
-        where = "account_id=? AND utc_date=? AND symbol=?"
-        params = (account_id, date, symbol)
-        old = db.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchone()
-        # The preceding persisted prefix seeds a late fill's affected suffix.
-        # Aggregate counts only change by the newly admitted rows.
-        latest = (old["latest_trade_at"], old["latest_symbol"], old["latest_trade_id"]) if old else None
-        append = old is not None and all(sort_key(row) > latest for row in new_rows)
-        rows = sorted(new_rows, key=sort_key)
-        volume = Fraction(dec(old["volume"])) if append else Fraction(0)
-        if old is not None and not append:
-            first = rows[0]["executed_at"], rows[0]["trade_id"]
-            previous = db.execute(f"SELECT daily_volume FROM cycle_fills WHERE {where} "
-                "AND (executed_at,trade_id)<(?,?) ORDER BY executed_at DESC,trade_id DESC LIMIT 1",
-                (*params, *first)).fetchone()
-            volume = Fraction(dec(previous[0])) if previous else Fraction(0)
-            rows = [dict(row) for row in db.execute(f"SELECT * FROM cycle_fills WHERE {where} "
-                "AND (executed_at,trade_id)>=(?,?) ORDER BY executed_at,trade_id", (*params, *first))]
-        estimated = Fraction(dec(old["estimated_volume"])) if old else Fraction(0)
-        count = (old["trade_count"] if old else 0) + len(new_rows)
-        estimated_count = old["estimated_trade_count"] if old else 0
-        for row in new_rows:
-            if row["time_source"] == "legacy_estimated":
-                estimated += Fraction(dec(row["notional"]))
-                estimated_count += 1
-        for row in rows:
-            volume += Fraction(dec(row["notional"]))
-            running = wire(volume)
-            if row["daily_volume"] != running:
-                row["daily_volume"] = running
-                db.execute("UPDATE cycle_fills SET daily_volume=? WHERE account_id=? AND symbol=? AND trade_id=?",
-                           (row["daily_volume"], account_id, row["symbol"], row["trade_id"]))
-                db.execute("UPDATE events SET message=? WHERE id=? AND account_id=? AND kind='cycle_fill'",
-                           (event_message(row), row["event_id"], account_id))
-        last = rows[-1]
-        placeholders = ",".join("?" for _ in range(11))
-        key = "account_id,utc_date,symbol"
-        db.execute(f"""INSERT INTO {table} VALUES ({placeholders})
-                    ON CONFLICT({key}) DO UPDATE SET volume=excluded.volume,trade_count=excluded.trade_count,
-                    estimated_volume=excluded.estimated_volume,estimated_trade_count=excluded.estimated_trade_count,
-                    latest_trade_at=excluded.latest_trade_at,latest_symbol=excluded.latest_symbol,
-                    latest_trade_id=excluded.latest_trade_id,updated_at=excluded.updated_at""",
-                   (account_id, date, wire(volume), count, wire(estimated), estimated_count,
-                    last["executed_at"], last["symbol"], last["trade_id"], time.time(), symbol))
-
-    def cycle_daily_volume(self, account_id, now=None, *, symbol=None, include_pending=False):
-        account_identifier(account_id)
-        self._cycle_volume_symbol(symbol)
-        date, start, reset = utc_day(now)
-        with self.connect() as db:
-            # Fills and their pending reservation must come from one WAL snapshot:
-            # a concurrent backfill cannot disappear between the two reads.
-            if include_pending and not db.in_transaction:
-                db.execute("BEGIN")
-            rows = db.execute("SELECT * FROM cycle_symbol_volume_days WHERE account_id=? AND utc_date=?"
-                              + (" AND symbol=?" if symbol is not None else ""),
-                              (account_id, date) + (() if symbol is None else (symbol,))).fetchall()
-            pending = self._cycle_pending_volume(db, account_id, start, symbol) if include_pending else {}
-        row = None
-        if rows:
-            row = {key: sum(r[key] for r in rows) for key in ("trade_count", "estimated_trade_count")}
-            row.update({key: wire(sum((Fraction(dec(r[key])) for r in rows), Fraction(0)))
-                        for key in ("volume", "estimated_volume")})
-            row["latest_trade_at"] = max(r["latest_trade_at"] for r in rows)
-        return {**({"symbol": symbol} if symbol is not None else {}), "utc_date": date, "volume": row["volume"] if row else "0", "trade_count": row["trade_count"] if row else 0,
-                "next_reset_at": reset, "estimated_volume": row["estimated_volume"] if row else "0",
-                "estimated_trade_count": row["estimated_trade_count"] if row else 0,
-                "latest_trade_at": row["latest_trade_at"] if row else None,
-                "cumulative_order": "execution_time", "timezone": "UTC", **pending}
-
-    @staticmethod
-    def _cycle_pending_volume(db, account_id, start, symbol):
-        """Reserve unrecorded terminal order amounts, without inventing trades.
-
-        Cross-midnight unassigned fills are conservatively charged to today.
-        Only the exchange's cumulative quote amount is used, never a rounded
-        average price. Missing or contradictory evidence keeps capped opens shut.
-        """
-        rows = db.execute("""SELECT i.id,i.data FROM cycle_volume_sync v JOIN intents i ON i.id=v.intent_id
-            WHERE v.account_id=? AND v.synced_at IS NULL AND v.status IN ('complete','aborted')
-            AND i.account_id=v.account_id AND i.status IN ('complete','aborted')
-            AND (v.created_at>=? OR v.completed_at>=? OR v.completed_at IS NULL)
-            """ + (" AND json_extract(i.data,'$.symbol')=?" if symbol is not None else "")
-            + " LIMIT 1001", (account_id, start, start) + (() if symbol is None else (symbol,))).fetchall()
-        reserved, error = Fraction(0), None
-        if len(rows) > 1000:
-            return {"reserved_volume": "0", "quota_pending": True, "sync_pending": True,
-                    "error": "循环待补账批次过多，等待后台同步后核对日额度"}
-        for row in rows:
-            try:
-                intent = json.loads(row["data"])
-                if intent.get("id") != row["id"] or intent.get("account_id") != account_id:
-                    raise TradingError("循环补账批次身份无法核对")
-                fills = {}
-                for fill in db.execute("SELECT client_id,quantity,notional FROM cycle_fills WHERE intent_id=?", (row["id"],)):
-                    totals = fills.setdefault(fill["client_id"], [Fraction(0), Fraction(0)])
-                    totals[0] += Fraction(positive(fill["quantity"]))
-                    totals[1] += Fraction(positive(fill["notional"]))
-                amount = Fraction(0)
-                for cid, (order, receipt, _) in order_bindings(intent).items():
-                    quantity = receipt_quantity(order, receipt, require_terminal=True)
-                    recorded_qty, recorded_quote = fills.get(cid, (Fraction(0), Fraction(0)))
-                    if recorded_qty > quantity:
-                        raise TradingError("循环已入账成交数量超过终态回执")
-                    if recorded_qty == quantity:
-                        continue
-                    quote = receipt.get("cumQuote")
-                    if not isinstance(quote, str):
-                        raise TradingError("循环终态回执缺少累计成交金额，等待明细核对日额度")
-                    remaining = Fraction(positive(quote)) - recorded_quote
-                    if remaining <= 0:
-                        raise TradingError("循环终态回执金额与已入账成交冲突")
-                    # All unrecorded amount is reserved on the current day. This
-                    # also covers orders whose fills span midnight until the
-                    # actual trade timestamps arrive and release the excess.
-                    amount += remaining
-                reserved += amount
-            except (TradingError, KeyError, ValueError, TypeError) as exc:
-                error = str(exc)
-        return {"reserved_volume": wire(reserved), "quota_pending": error is not None,
-                "sync_pending": bool(rows), "error": error}
-
-    @staticmethod
-    def _cycle_volume_symbol(symbol):
-        if symbol is not None and (not isinstance(symbol, str) or symbol not in SYMBOLS):
-            raise TradingError("循环成交统计品种无效")
-
-    def cycle_rolling_volume(self, account_id, now=None, *, symbol=None):
-        """Sum every fill in (now - 24h, now], independently of UTC day changes."""
-        account_identifier(account_id)
-        self._cycle_volume_symbol(symbol)
-        end = time.time() if now is None else now
-        if type(end) not in (int, float) or not 0 <= end <= 253402300799 or not math.isfinite(end):
-            raise TradingError("循环滚动成交统计时间必须为有效时间戳")
-        end = float(end)
-        start = end - 86400
-        volume, estimated = Fraction(0), Fraction(0)
-        count, estimated_count, next_release = 0, 0, None
-        with self.connect() as db:
-            if not db.in_transaction:
-                db.execute("BEGIN")
-            revision = self._fill_revision(db, account_id)
-            key = account_id, symbol
-            cached = self._rolling_cache.read(key, revision, end)
-            if cached is not None:
-                return {**cached, "window_start": start, "window_end": end}
-            # The account/time range uses idx_cycle_fills_recent. Iterate every
-            # matching fill without a UI limit or lossy SQLite numeric SUM.
-            rows = db.execute("""SELECT notional,time_source,executed_at FROM cycle_fills
-                WHERE account_id=? AND executed_at>? AND executed_at<=?"""
-                + (" AND symbol=?" if symbol is not None else "") + " ORDER BY executed_at",
-                (account_id, start, end) + (() if symbol is None else (symbol,)))
-            for row in rows:
-                notional = Fraction(dec(row["notional"]))
-                volume += notional
-                count += 1
-                if next_release is None:
-                    next_release = row["executed_at"] + 86400
-                if row["time_source"] == "legacy_estimated":
-                    estimated += notional
-                    estimated_count += 1
-            future = self._next_fill(db, account_id, end, symbol=symbol)
-        result = {**({"symbol": symbol} if symbol is not None else {}), "window_start": start, "window_end": end, "volume": wire(volume), "trade_count": count,
-                  "next_release_at": next_release, "estimated_volume": wire(estimated),
-                  "estimated_trade_count": estimated_count}
-        self._rolling_cache.save(key, revision, end, min(next_release or math.inf, future or math.inf), result)
-        return result
-
-    @staticmethod
-    def _fill_revision(db, account_id):
-        row = db.execute("SELECT revision FROM cycle_fill_versions WHERE account_id=?", (account_id,)).fetchone()
-        return row[0] if row else 0
-
-    def cycle_fill_revision(self, account_id):
-        account_identifier(account_id)
-        with self.connect() as db:
-            return self._fill_revision(db, account_id)
-
-    @staticmethod
-    def _next_fill(db, account_id, now, *, symbol=None):
-        return db.execute("SELECT MIN(executed_at) FROM cycle_fills WHERE account_id=? AND executed_at>?"
-                          + (" AND symbol=?" if symbol is not None else ""),
-                          (account_id, now) + (() if symbol is None else (symbol,))).fetchone()[0]
-
-    def cycle_report_boundary(self, account_id, now):
-        """Next clock-only change, including future fills already in the ledger."""
-        account_identifier(account_id)
-        _, _, midnight = utc_day(now)
-        with self.connect() as db:
-            future = self._next_fill(db, account_id, now)
-            oldest = db.execute("SELECT MIN(executed_at) FROM cycle_fills "
-                                "WHERE account_id=? AND executed_at>? AND executed_at<=?",
-                                (account_id, now - 86400, now)).fetchone()[0]
-        return min(midnight, future or math.inf, oldest + 86400 if oldest is not None else math.inf)
-
-    def cycle_trade_records(self, account_id, limit=100):
-        account_identifier(account_id)
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise TradingError("循环成交明细条数必须为 1 至 1000 的整数")
-        with self.connect() as db:
-            rows = db.execute("SELECT * FROM cycle_fills WHERE account_id=? ORDER BY executed_at DESC,symbol DESC,trade_id DESC LIMIT ?",
-                              (account_id, limit)).fetchall()
-        fields = FILL_FIELDS | {"utc_date", "daily_volume", "intent_id", "phase"}
-        return [{key: row[key] for key in fields} for row in rows]
-
-    def cycle_cost_records(self, account_id, now=None, limit=100):
-        """Read complete fill contexts for current totals and displayed trades."""
-        account_identifier(account_id)
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise TradingError("循环成本明细条数必须为 1 至 1000 的整数")
-        end = time.time() if now is None else now
-        utc_day(end)
-        end = float(end)
-        fields = sorted(FILL_FIELDS | {"account_id", "intent_id", "phase", "utc_date"})
-        with self.connect() as db:
-            # Select through the account/time index, then seek complete intents.
-            # A counterpart or repair can predate the window or the UI cutoff;
-            # unrelated older intents must not turn this into an account scan.
-            rows = db.execute("""WITH selected_intents AS (
-                SELECT intent_id FROM cycle_fills
-                WHERE account_id=? AND executed_at>? AND executed_at<=?
-                UNION
-                SELECT intent_id FROM (
-                    SELECT intent_id FROM cycle_fills WHERE account_id=?
-                    ORDER BY executed_at DESC,symbol DESC,trade_id DESC LIMIT ?
-                )
-            ) SELECT """ + ",".join(fields) + """ FROM cycle_fills INDEXED BY idx_cycle_fills_order
-                WHERE account_id=? AND intent_id IN (SELECT intent_id FROM selected_intents)
-                ORDER BY executed_at,symbol,trade_id""",
-                              (account_id, end - 86400, end, account_id, limit, account_id))
-            return [dict(row) for row in rows]
-
-    def cycle_volume_backlog(self, account_id, limit=100, since=None, *, symbol=None):
-        account_identifier(account_id)
-        self._cycle_volume_symbol(symbol)
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise TradingError("循环成交补记批次数必须为 1 至 1000 的整数")
-        if since is None:
-            since = utc_day()[1]
-        else:
-            utc_day(since)
-        with self.connect() as db:
-            rows = db.execute("""SELECT i.data FROM cycle_volume_sync v JOIN intents i ON i.id=v.intent_id
-                WHERE v.account_id=? AND v.synced_at IS NULL AND v.status IN ('complete','aborted')
-                AND i.account_id=v.account_id AND i.status IN ('complete','aborted')
-                AND COALESCE(json_extract(i.data,'$.resolution.kind'),'')!='unknown_current_state'
-                AND (v.created_at>=? OR v.completed_at>=? OR v.completed_at IS NULL)
-                """ + (" AND json_extract(i.data,'$.symbol')=?" if symbol is not None else "")
-                + " ORDER BY COALESCE(v.completed_at,v.created_at,0) DESC,v.intent_id DESC LIMIT ?",
-                (account_id, since, since) + (() if symbol is None else (symbol,)) + (limit,)).fetchall()
-        return [json.loads(row[0]) for row in rows]
-
-    def mark_cycle_volume_synced(self, intent_id):
-        identifier(intent_id, "循环批次标识")
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status,data FROM intents WHERE id=?", (intent_id,)).fetchone()
-            if row is None or row["status"] not in ("complete", "aborted"):
-                raise TradingError("循环批次尚未结束，不能标记成交同步完成")
-            intent = json.loads(row["data"])
-            self._cycle_ledger_intent(db, intent)
-            bindings = order_bindings(intent)
-            for client_id, (order, receipt, _) in bindings.items():
-                expected = receipt_quantity(order, receipt, require_terminal=True)
-                actual = sum((Fraction(dec(row[0])) for row in db.execute(
-                    "SELECT quantity FROM cycle_fills WHERE intent_id=? AND client_id=?", (intent_id, client_id))), Fraction(0))
-                if actual != expected:
-                    raise TradingError("循环逐笔成交尚未全部入账，不能标记同步完成")
-            self._index_cycle_volume(db, intent)
-            db.execute("UPDATE cycle_volume_sync SET synced_at=? WHERE intent_id=?", (time.time(), intent_id))
 
     def event(self, account_id, kind, message):
         with self.connect() as db:
             db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (account_id, kind, message, time.time()))
-
-    def record_cycle_check(self, account_id, symbol, phase, message, diagnostic=None):
-        """Update only the latest uninterrupted check for this account and stage."""
-        account_identifier(account_id)
-        if not isinstance(symbol, str) or symbol not in SYMBOLS or phase not in ("open", "close"):
-            raise TradingError("循环检查品种或阶段无效")
-        if not isinstance(message, str) or not message:
-            raise TradingError("循环检查消息无效")
-        metadata = {"symbol": symbol, "phase": phase, "count": 1, "first_at": 0, "last_at": 0}
-        if diagnostic is not None:
-            metadata["diagnostic"] = diagnostic
-        try:
-            metadata = _cycle_check_metadata(json.dumps(metadata, ensure_ascii=False, allow_nan=False))
-        except (TypeError, ValueError, OverflowError, RecursionError):
-            metadata = None
-        if metadata is None:
-            raise TradingError("循环检查诊断格式无效")
-        with self.connect() as db:
-            # The database lock, rather than a Store-instance lock alone, keeps
-            # concurrent workers and restarted processes from losing a count.
-            db.execute("BEGIN IMMEDIATE")
-            now = time.time()
-            if type(now) not in (int, float) or not math.isfinite(now) or not 0 <= now <= 253402300799:
-                raise TradingError("循环检查时间无效")
-            previous = db.execute("SELECT id,kind,cycle_check FROM events WHERE account_id=? ORDER BY id DESC LIMIT 1",
-                                  (account_id,)).fetchone()
-            last = _cycle_check_metadata(previous["cycle_check"]) if previous and previous["kind"] == "cycle_check" else None
-            metadata.update(first_at=now, last_at=now)
-            if last and last["symbol"] == symbol and last["phase"] == phase and now >= last["last_at"]:
-                metadata.update(count=last["count"] + 1, first_at=last["first_at"])
-                db.execute("UPDATE events SET message=?,created_at=?,cycle_check=? WHERE id=? AND account_id=?",
-                           (message, now, dumps(metadata), previous["id"], account_id))
-            else:
-                db.execute("INSERT INTO events(account_id,kind,message,created_at,cycle_check) VALUES (?,?,?,?,?)",
-                           (account_id, "cycle_check", message, now, dumps(metadata)))
 
     def events(self, limit=100, *, account_id=None):
         if account_id is not None:
@@ -1406,95 +836,16 @@ class Store:
 
     def complete_leverage(self, intent, actual):
         """Persist confirmation and the first-add priority in the same transaction."""
+        if legacy_intent(intent):
+            raise TradingError(LEGACY_PENDING_REASON)
         intent.update(status="complete", confirmed_leverage=actual)
         with self.connect() as db:
             row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
             if row and row[0] in ("complete", "aborted"):
                 return
             db.execute("UPDATE intents SET status='complete',data=? WHERE id=?", (dumps(intent), intent["id"]))
-            if intent.get("purpose") != "migration":
-                key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
-                db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
-            self._resume_intent_pause(db, intent)
-
-    def complete_cycle(self, intent, progress):
-        """Commit cycle ownership/timing and the terminal receipt together once."""
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
-            if row and row[0] in ("complete", "aborted"):
-                return
-            if row is None:
-                raise TradingError("多空循环批次记录不存在")
-            key = "cycle:" + intent["account_id"]
-            saved = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
-            if not saved or json.loads(saved[0]).get("run_id") != progress.get("run_id") or progress.get("run_id") != intent.get("run_id"):
-                raise TradingError("多空循环记录与批次不一致，等待人工核对")
-            status = "aborted" if intent.get("status") == "aborted" else "complete"
-            intent.update(status=status, completed_at=time.time())
-            progress = {**progress, "updated_at": time.time(), "active_batch": None}
-            db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (status, dumps(intent), intent["id"]))
-            self._index_cycle_volume(db, intent)
-            db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(progress), key))
-            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
-                       (intent["account_id"], "cycle", progress.get("reason", "多空循环批次已核对"), time.time()))
-            self._resume_intent_pause(db, intent)
-
-    def confirm_cycle_recovery(self, account, previous, progress, review):
-        """Archive the acknowledged state and reset tracking atomically, without trading."""
-        aid, now = account["id"], time.time()
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            saved = db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()
-            old = db.execute("SELECT data FROM kv WHERE key=?", ("cycle:" + aid,)).fetchone()
-            pending = db.execute("SELECT 1 FROM intents WHERE account_id=? AND status NOT IN ('complete','aborted')", (aid,)).fetchone()
-            if (not saved or self.account_defaults(json.loads(saved[0])) != account or not old
-                    or json.loads(old[0]) != previous or pending or account["enabled"]):
-                raise TradingError("账户或循环记录已变化，请重新核对")
-            paused = {**account, "enabled": False}
-            paused.pop("pause_reason", None)
-            audit = {"account_id": aid, "confirmed_at": now, "previous": previous,
-                     "previous_pause_reason": account.get("pause_reason"), "review": review, "next": progress}
-            db.execute("INSERT INTO kv VALUES (?,?)", (f"cycle_recovery:{aid}:{progress['run_id']}", dumps(audit)))
-            db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(progress), "cycle:" + aid))
-            db.execute("UPDATE accounts SET data=? WHERE id=?", (dumps(paused), aid))
-            message = (f"已人工核对 {review['symbol']}：记录多/空 {review['expected']['LONG']}/{review['expected']['SHORT']}，"
-                       f"实际多/空 {review['actual']['LONG']}/{review['actual']['SHORT']}；实际仓位转为原始持仓，"
-                       "本轮跟踪已结束，账户保持暂停，等待手动启动")
-            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)", (aid, "control", message, now))
-
-    def complete_migration(self, intent, result, snapshot_remaining):
-        """Commit the four-leg ledger and migration totals exactly once."""
-        with self.connect() as db:
-            row = db.execute("SELECT status FROM intents WHERE id=?", (intent["id"],)).fetchone()
-            if row and row[0] in ("complete", "aborted"):
-                return
-            key = "migration:" + intent["account_id"]
-            row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
-            progress = json.loads(row[0]) if row else None
-            if not progress or progress.get("run_id") != intent.get("run_id"):
-                raise TradingError("迁移周期记录与批次不一致，等待人工核对")
-            status = "aborted" if intent.get("status") == "aborted" else "complete"
-            intent.update(status=status, result=result, completed_at=time.time())
-            db.execute("UPDATE intents SET status=?,data=? WHERE id=?", (status, dumps(intent), intent["id"]))
-            for side in ("LONG", "SHORT"):
-                source = Fraction(positive(result["source_notional"][side], True))
-                target = Fraction(positive(result["target_notional"][side], True))
-                progress["migrated_notional"][side] = wire(Fraction(dec(progress["migrated_notional"][side])) + source)
-                progress["cumulative_notional_delta"][side] = wire(Fraction(dec(progress["cumulative_notional_delta"][side])) + target - source)
-            moved = any(dec(result["source_qty"][side]) > 0 for side in ("LONG", "SHORT"))
-            remaining = {side: wire(positive(snapshot_remaining[side], True)) for side in ("LONG", "SHORT")}
-            done = not any(dec(value) for value in remaining.values())
-            progress.update(source_remaining_qty=remaining, updated_at=time.time(),
-                            completed_batches=progress.get("completed_batches", 0) + int(moved),
-                            phase="complete" if done else "waiting", target_symbol=intent["target_symbol"],
-                            target_leverage=intent["target_leverage"], required_leverage=intent["target_leverage"], active_batch=None,
-                            reason="XAU 多空仓位已全部迁出" if done else "本批迁移已核对，等待下一批" if moved else "本批目标新增已回退，等待重新评估")
-            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(progress)))
-            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                       ("post_fill_check:" + intent["account_id"], dumps({"kind": "migration", "symbol": intent["target_symbol"], "leverage": intent["target_leverage"]})))
-            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES (?,?,?,?)",
-                       (intent["account_id"], "migration", progress["reason"], time.time()))
+            key = f"open_after_leverage:{intent['account_id']}:{intent['symbol']}"
+            db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(actual)))
             self._resume_intent_pause(db, intent)
 
     def complete_pair(self, intent, quantities):
@@ -1766,8 +1117,6 @@ class _StoreSnapshot(Store):
     """Single-threaded reader sharing one read-only transaction."""
     def __init__(self, owner, db):
         self.path, self.db = owner.path, db
-        self._rolling_cache = owner._rolling_cache
-        self._pair_cost_cache = owner._pair_cost_cache
 
     @contextmanager
     def connect(self):

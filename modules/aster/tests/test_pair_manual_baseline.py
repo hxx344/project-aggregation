@@ -121,7 +121,6 @@ class PairManualBaselineTests(unittest.TestCase):
             self.check()
         self.assertEqual(self.state()["daily_volume"], state["daily_volume"])
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         with patch("trading.paper.PaperBroker.submit", side_effect=AssertionError("must not reduce again")):
             restarted.pairs.tick("gold")
             with self.assertRaises(TradingError):
@@ -198,7 +197,6 @@ class PairManualBaselineTests(unittest.TestCase):
         result = self.check()
         self.assertTrue(result["completed"], result)
         self.assertEqual(self.state()["owned"], {"LONG": "0.5", "SHORT": "0.5"})
-        self.assertEqual(self.state()["progress"]["baseline"], self.state()["owned"])
         batch = self.f.store.get("pair_batch:" + original["pending"]["id"])
         self.assertEqual(batch["legs"], original["pending"]["legs"])
         self.assertEqual(batch["repairs"], [])
@@ -331,7 +329,7 @@ class PairManualBaselineLiveTests(unittest.TestCase):
 
         def invalidate_after_read(*args, **kwargs):
             value = read(*args, **kwargs)
-            self.broker()._cycle_account_event("ACCOUNT_UPDATE")
+            self.broker()._private_account_event("ACCOUNT_UPDATE")
             return value
 
         with self.no_writes(), patch.object(self.engine.pairs, "_read_members", side_effect=invalidate_after_read):

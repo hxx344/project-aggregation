@@ -10,10 +10,11 @@ import unittest
 from unittest.mock import patch
 
 from tests import test_pair_integration as integration
-from tests.helpers import seed_cycle_capacity
-from tests.test_cycle_account_snapshot import ACCOUNT, RISK, SYMBOL, risk_row
+from tests.helpers import seed_market_capacity
+from tests.account_fixtures import ACCOUNT, RISK, SYMBOL, risk_row
 from trading.models import TradingError, dec
-from trading.pair_execution import PairTrader, empty_progress
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import empty_progress
 from trading.pair_planning import require_quantities
 from trading.store import Store
 
@@ -45,7 +46,7 @@ class PairPausedAdoptionTests(unittest.TestCase):
         for aid in ("test", "second"):
             broker = self.engine.broker(self.f.store.account(aid))
             stack.enter_context(patch.object(broker, "submit", side_effect=AssertionError("activation must not trade")))
-            stack.enter_context(patch.object(broker, "set_cycle_leverage", side_effect=AssertionError("activation must not set leverage")))
+            stack.enter_context(patch.object(broker, "set_leverage", side_effect=AssertionError("activation must not set leverage")))
         return stack
 
     def assert_rejected_unchanged(self):
@@ -70,9 +71,6 @@ class PairPausedAdoptionTests(unittest.TestCase):
                 state = self.f.store.get("pair_runtime:gold")
                 expected = {"LONG": long, "SHORT": short}
                 self.assertEqual(state["owned"], expected)
-                self.assertEqual(state["progress"]["baseline"], expected)
-                self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-                self.assertEqual(state["progress"]["completed_cycles"], 7)
                 self.assertIsNone(state["pending"])
                 self.assertNotIn("attention", state)
                 self.engine.pairs.enable("gold", False)
@@ -93,31 +91,7 @@ class PairPausedAdoptionTests(unittest.TestCase):
         state = self.f.store.get("pair_runtime:gold")
         for name, value in retained.items():
             self.assertEqual(state[name], value, name)
-        self.assertEqual(state["progress"]["completed_cycles"], 7)
-        self.assertEqual(state["progress"]["baseline"], {"LONG": "0.4", "SHORT": "0.7"})
-        self.assertNotIn("opened_at", state["progress"])
-        self.assertNotIn("config", state["progress"])
         self.assertEqual(self.f.store.get("pair_batch:previous"), history)
-
-    def test_cycle_close_returns_to_new_unequal_baseline(self):
-        self.seed_paused()
-        self.positions("0.2", "0.3")
-        self.engine.pairs.enable("gold", True)
-        baseline = {"LONG": "0.2", "SHORT": "0.3"}
-        trader = PairTrader(self.engine)
-        seed_cycle_capacity(self.engine)
-        with patch("trading.margin_balance.MarginBalancer.tick", return_value={"blocks_trading": False}):
-            state = trader.tick(self.f.store.pair("gold"))
-            self.assertEqual(state["phase"], "holding", state)
-            self.assertTrue(all(dec(value) > 0 for value in state["progress"]["quantities"].values()))
-            self.engine.pairs.enable("gold", False)
-            state = trader.tick(self.f.store.pair("gold"))
-        self.assertIsNone(state["pending"], state)
-        self.assertEqual(state["owned"], baseline)
-        self.assertEqual(state["progress"]["completed_cycles"], 8)
-        for aid, index, side in (("test", 0, "LONG"), ("second", 1, "SHORT")):
-            snapshot = self.engine.broker(self.f.store.account(aid)).snapshot([SYMBOL])
-            self.assertEqual(snapshot.pair(SYMBOL)[index].qty, dec(baseline[side]))
 
     def test_repeated_start_cannot_adopt_positions_while_running(self):
         self.seed_paused({"LONG": "0", "SHORT": "0"})
@@ -129,7 +103,7 @@ class PairPausedAdoptionTests(unittest.TestCase):
         self.seed_paused({"LONG": "0", "SHORT": "0"})
         self.engine.pairs.enable("gold", True)
         self.positions("0.25", "0.5")
-        seed_cycle_capacity(self.engine)
+        seed_market_capacity(self.engine)
         with self.no_market_writes():
             state = PairTrader(self.engine).tick(self.f.store.pair("gold"))
         self.assertEqual(state["phase"], "attention", state)
@@ -166,8 +140,6 @@ class PairPausedAdoptionTests(unittest.TestCase):
             self.engine.pairs.enable("gold", True)
         state = self.f.store.get("pair_runtime:gold")
         self.assertEqual(state["owned"], {"LONG": "0.4", "SHORT": "0.6"})
-        self.assertEqual(state["progress"]["baseline"], state["owned"])
-        self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
         self.assertEqual(broker.state["positions"], holdings)
 
         # Running ownership checks permit external holdings to evolve without
@@ -323,7 +295,7 @@ class PairPausedAdoptionSnapshotTests(unittest.TestCase):
 
     def test_generation_revoked_during_master_verification_cannot_adopt(self):
         original = self.seed()
-        self.verify.side_effect = lambda pair: self.live["second"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.verify.side_effect = lambda pair: self.live["second"]._private_account_event("ACCOUNT_UPDATE")
         with self.assertRaisesRegex(TradingError, "失效"):
             self.engine.pairs.enable("gold", True)
         self.assertFalse(self.f.store.pair("gold")["enabled"])
@@ -351,7 +323,6 @@ class PairPausedAdoptionSnapshotTests(unittest.TestCase):
         self.assertTrue(self.f.store.pair("gold")["enabled"])
         state = self.f.store.get("pair_runtime:gold")
         self.assertEqual(state["owned"], {"LONG": "0.4", "SHORT": "0.6"})
-        self.assertEqual(state["progress"]["baseline"], state["owned"])
         self.assertNotIn("attention", state)
 
     def test_snapshot_expiring_while_waiting_for_database_writer_is_rejected(self):
@@ -425,7 +396,7 @@ class PairPausedAdoptionSnapshotTests(unittest.TestCase):
                 return original_lock.__exit__(*args)
 
         def event():
-            broker._cycle_account_event("ACCOUNT_UPDATE")
+            broker._private_account_event("ACCOUNT_UPDATE")
             committed.append((self.f.store.pair("gold")["enabled"], self.f.store.get("pair_runtime:gold")["owned"]))
             finished.set()
 

@@ -1,5 +1,4 @@
 """Unknown requests stop being queried; only fresh balanced reality retires them."""
-from copy import deepcopy
 from dataclasses import replace
 import threading
 import time
@@ -8,13 +7,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tests.helpers import Fixture
-from trading.cycle import DEFAULT_CYCLE
-from trading.cycle_execution import CycleExecutor
 from trading.exchange import ExchangeError, LiveBroker, RequestNotSent
 from trading.execution import Executor
-from trading.migration_execution import MigrationExecutor
 from trading.models import TradingError, dec
 from trading import recovery
+from trading import store as store_module
 from trading.store import Store
 
 GOLD, TARGET = "XAUUSD1", "SPCXUSD1"
@@ -221,15 +218,14 @@ class BoundedRecoveryTests(unittest.TestCase):
         self.assertFalse(self.f.store.get("intent_recovery:test:old")["resumed"])
 
     def test_all_normal_completion_paths_release_only_their_own_automatic_pause(self):
-        for method in ("complete_pair", "abort_pair", "complete_leverage", "complete_cycle", "complete_migration"):
+        for method in ("complete_pair", "abort_pair", "complete_leverage"):
             for manual in (False, True):
                 with self.subTest(method=method, manual=manual):
                     account = self.f.store.account("test")
                     account.update(enabled=True)
                     account.pop("pause_reason", None)
                     self.f.store.save_account(account, user_control=True)
-                    kind = {"complete_leverage": "leverage", "complete_cycle": "cycle",
-                            "complete_migration": "migration"}.get(method, "pair")
+                    kind = "leverage" if method == "complete_leverage" else "pair"
                     intent = self.intent(id=f"{method}-{manual}", kind=kind, run_id="run", target_symbol=TARGET, target_leverage=5)
                     self.executor.attention(account, intent, "old request uncertain")
                     if manual:
@@ -238,17 +234,8 @@ class BoundedRecoveryTests(unittest.TestCase):
                         self.f.store.complete_pair(intent, {"long_qty": "1", "short_qty": "1", "notional": "8824"})
                     elif method == "abort_pair":
                         self.f.store.abort_pair(intent)
-                    elif method == "complete_leverage":
-                        self.f.store.complete_leverage(intent, 10)
-                    elif method == "complete_cycle":
-                        progress = {"run_id": "run", "phase": "waiting_open"}
-                        self.f.store.put("cycle:test", progress)
-                        self.f.store.complete_cycle(intent, progress)
                     else:
-                        self.f.store.put("migration:test", {"run_id": "run", "migrated_notional": {"LONG": "0", "SHORT": "0"},
-                            "cumulative_notional_delta": {"LONG": "0", "SHORT": "0"}})
-                        amounts = {key: {"LONG": "1", "SHORT": "1"} for key in ("source_notional", "target_notional", "source_qty", "target_qty")}
-                        self.f.store.complete_migration(intent, amounts, {"LONG": "0", "SHORT": "0"})
+                        self.f.store.complete_leverage(intent, 10)
                     self.assertEqual(self.f.store.account("test")["enabled"], not manual)
                     self.assertIsNone(self.f.store.get("recovery_auto_pause:test"))
                     self.assertIsNone(self.f.store.intent("test"))
@@ -387,117 +374,6 @@ class BoundedRecoveryTests(unittest.TestCase):
             self.assertIsNotNone(self.f.store.intent("test"))
             live.api.credentials["user"] = "child"
 
-    def test_cycle_adopts_actual_baseline_and_clears_tracking(self):
-        account = self.f.store.account("test")
-        account["cycle"] = {**DEFAULT_CYCLE, "enabled": True}
-        self.f.store.save_account(account)
-        progress = {"run_id": "run", "phase": "holding", "config": account["cycle"],
-                    "quantities": {"LONG": "1", "SHORT": "1"}, "baseline": {"LONG": "0", "SHORT": "0"},
-                    "opened_at": self.now - 10, "active_batch": "old", "completed_cycles": 7}
-        self.f.store.put("cycle:test", progress)
-        self.intent(kind="cycle", run_id="run", phase="open", quantity="1", progress=deepcopy(progress))
-        executor = CycleExecutor(self.f.store, self.f.broker, self.f.market)
-        self.exhaust(executor)
-        for side in ("LONG", "SHORT"):
-            self.f.broker.state["positions"][GOLD + ":" + side].update(qty="2", entry="4412")
-        self.f.broker.save()
-        self.safe_exit(executor)
-        result = self.f.store.get("cycle:test")
-        self.assertNotEqual(result["run_id"], "run")
-        self.assertEqual(result["baseline"], {"LONG": "2", "SHORT": "2"})
-        self.assertEqual(result["quantities"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(result["completed_cycles"], 7)
-        self.assertIsNone(result["active_batch"])
-        self.assertIsNone(result["opened_at"])
-        self.assertEqual(self.persisted()["receipts"], {})
-        self.assertEqual(self.f.store.cycle_volume_backlog("test", since=0), [])
-        with patch.object(self.f.broker, "query", side_effect=AssertionError("retired original")):
-            self.assertFalse(executor.sync_volume(self.f.store.account("test"), self.persisted()))
-        self.assertTrue(self.f.store.cycle_daily_volume("test", symbol=GOLD, include_pending=True)["quota_pending"])
-
-    def test_exhausted_cycle_repair_can_adopt_a_balanced_actual_baseline(self):
-        account = self.f.store.account("test")
-        account["cycle"] = {**DEFAULT_CYCLE, "enabled": True}
-        self.f.store.save_account(account)
-        progress = {"run_id": "run", "phase": "waiting_open", "config": account["cycle"],
-                    "quantities": {"LONG": "0", "SHORT": "0"}, "baseline": {"LONG": "0", "SHORT": "0"},
-                    "opened_at": None, "active_batch": "old", "completed_cycles": 7}
-        self.f.store.put("cycle:test", progress)
-        intent = self.intent(kind="cycle", run_id="run", phase="open", quantity="2", progress=deepcopy(progress), repair_attempts=3)
-        for order in intent["orders"]:
-            order["quantity"] = "2"
-        self.fill_receipts(intent, quantity="1", status="EXPIRED")
-        self.f.store.save_intent(intent)
-        for side in ("LONG", "SHORT"):
-            self.f.broker.state["positions"][GOLD + ":" + side].update(qty="1", entry="4412")
-        self.f.broker.save()
-        executor = CycleExecutor(self.f.store, self.f.broker, self.f.market)
-        with patch.object(self.f.broker, "submit", side_effect=AssertionError("no more repairs")):
-            for _ in range(4):
-                self.reconcile(executor)
-        self.safe_exit(executor)
-        result = self.f.store.get("cycle:test")
-        self.assertEqual(result["baseline"], {"LONG": "1", "SHORT": "1"})
-        self.assertEqual(result["completed_cycles"], 7)
-        self.assertEqual(self.persisted()["resolution"]["kind"], "current_state_adopted")
-
-    def test_known_migration_mismatch_preserves_verified_amounts_once(self):
-        account = self.f.store.account("test")
-        account["policy"]["symbols"] = [GOLD, TARGET]
-        self.f.store.save_account(account)
-        self.f.store.put("migration:test", {"run_id": "migration", "migrated_notional": {"LONG": "100", "SHORT": "100"},
-            "cumulative_notional_delta": {"LONG": "1", "SHORT": "1"}, "active_batch": "old", "completed_batches": 2})
-        intent = self.intent(kind="migration", symbol=TARGET, version=1, run_id="migration", phase="open_target",
-            source_symbol=GOLD, target_symbol=TARGET, order_times={"old-LONG": self.now - 1000, "old-SHORT": self.now - 1000},
-            order_roles={"old-LONG": "open_target", "old-SHORT": "open_target"}, target_open_budget="1",
-            source_close_budget={"LONG": "1", "SHORT": "1"}, leverages={GOLD: 5, TARGET: 5},
-            baseline={GOLD: {"LONG": "2", "SHORT": "2"}, TARGET: {"LONG": "2", "SHORT": "2"}})
-        self.fill_receipts(intent, price="724")
-        self.f.store.save_intent(intent)
-        for symbol, qty in ((GOLD, "1"), (TARGET, "3")):
-            for side in ("LONG", "SHORT"):
-                self.f.broker.state["positions"][symbol + ":" + side].update(qty=qty, entry="4412" if symbol == GOLD else "724")
-        self.f.broker.save()
-        executor = MigrationExecutor(self.f.store, self.f.broker, self.f.market)
-        for _ in range(4):
-            self.reconcile(executor)
-        self.safe_exit(executor)
-        result = self.f.store.get("migration:test")
-        self.assertEqual(result["source_remaining_qty"], {"LONG": "1", "SHORT": "1"})
-        self.assertEqual(result["migrated_notional"], {"LONG": "100", "SHORT": "100"})
-        self.assertEqual(result["cumulative_notional_delta"], {"LONG": "725", "SHORT": "725"})
-        self.assertFalse(result["totals_incomplete"])
-        self.assertEqual(result["completed_batches"], 2)
-        self.assertEqual(self.persisted()["resolution"]["kind"], "current_state_adopted")
-
-    def test_migration_rebuilds_source_remaining_but_never_invents_notional(self):
-        account = self.f.store.account("test")
-        account["policy"]["symbols"] = [GOLD, TARGET]
-        self.f.store.save_account(account)
-        progress = {"run_id": "migration", "migrated_notional": {"LONG": "100", "SHORT": "101"},
-                    "cumulative_notional_delta": {"LONG": "1", "SHORT": "2"}, "active_batch": "old"}
-        self.f.store.put("migration:test", progress)
-        self.intent(kind="migration", symbol=TARGET, version=1, run_id="migration", phase="open_target",
-                    source_symbol=GOLD, target_symbol=TARGET, order_times={"old-LONG": self.now - 1000, "old-SHORT": self.now - 1000})
-        executor = MigrationExecutor(self.f.store, self.f.broker, self.f.market)
-        self.exhaust(executor)
-        for symbol, qty in ((GOLD, "2"), (TARGET, "3")):
-            for side in ("LONG", "SHORT"):
-                self.f.broker.state["positions"][symbol + ":" + side].update(qty=qty, entry="4412" if symbol == GOLD else "724")
-        self.f.broker.save()
-        with patch.object(executor, "_ledger", side_effect=AssertionError("invented ledger")):
-            self.safe_exit(executor)
-        result = self.f.store.get("migration:test")
-        self.assertEqual(result["source_remaining_qty"], {"LONG": "2", "SHORT": "2"})
-        self.assertEqual(result["migrated_notional"], progress["migrated_notional"])
-        self.assertEqual(result["cumulative_notional_delta"], progress["cumulative_notional_delta"])
-        self.assertTrue(result["totals_incomplete"])
-        self.assertIsNone(result["active_batch"])
-        projected = recovery.migration_planning_progress(result)
-        self.assertEqual(projected["migrated_notional"], {"LONG": "0", "SHORT": "0"})
-        result["migrated_notional"]["LONG"] = "125"
-        self.assertEqual(recovery.migration_planning_progress(result)["migrated_notional"]["LONG"], "25")
-
     def test_leverage_below_target_archives_actual_and_cools_same_request(self):
         live = LiveReadBroker(self.f.broker)
         executor = Executor(self.f.store, live, self.f.market)
@@ -544,30 +420,16 @@ class BoundedRecoveryTests(unittest.TestCase):
         self.reconcile()
         self.assertIsNone(self.f.store.intent("test"))
 
-    def test_legacy_cycle_leverage_above_target_finishes_without_exact_match(self):
-        account = self.f.store.account("test")
-        account["cycle"] = {**DEFAULT_CYCLE, "enabled": True}
-        self.f.store.save_account(account)
-        progress = {"run_id": "run", "phase": "waiting_open", "config": account["cycle"],
-                    "quantities": {"LONG": "0", "SHORT": "0"}, "completed_cycles": 0}
-        self.f.store.put("cycle:test", progress)
-        self.intent(kind="cycle_leverage", run_id="run", progress=progress, previous=2, target=3)
-        executor = CycleExecutor(self.f.store, self.f.broker, self.f.market)
-        with patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("write")):
-            self.reconcile(executor)
-        self.assertIsNone(self.f.store.intent("test"))
-
     def test_archive_cas_and_failure_roll_back_with_shared_connection(self):
         self.intent()
         self.exhaust()
         self.now += 121
-        original = self.f.store._index_cycle_volume
-        def fail(db, intent, row=None):
-            if intent.get("resolution"):
-                self.assertTrue(db.in_transaction)
+        original = store_module.dumps
+        def fail(value):
+            if isinstance(value, dict) and value.get("resolution"):
                 raise TradingError("injected commit failure")
-            return original(db, intent, row)
-        with self.f.store.connection_scope(), patch.object(self.f.store, "_index_cycle_volume", side_effect=fail):
+            return original(value)
+        with self.f.store.connection_scope(), patch.object(store_module, "dumps", side_effect=fail):
             with self.assertRaisesRegex(TradingError, "injected"):
                 self.reconcile()
         self.assertIsNotNone(self.f.store.intent("test"))

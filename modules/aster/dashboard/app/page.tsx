@@ -19,16 +19,10 @@ import {
 } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useTradingDesk } from '@/lib/use-trading-desk';
-import { useAccountDraft } from '@/lib/use-account-draft';
 import { fmt, pct, clock } from '@/lib/desk-format';
-import { cycleDraft, cycleRecoveryReason } from '@/lib/cycle';
 import { accountRunScope } from '@/lib/account-scope';
 import { accountSummaryView } from '@/lib/account-summary';
-import { cycleMarginLimit } from '@/lib/policy';
-import { CyclePanel } from '@/components/cycle-panel';
-import { CycleRecovery } from '@/components/cycle-recovery';
 import { OrdinaryWorkspace } from '@/components/ordinary-workspace';
-import { MigrationPanel } from '@/components/migration-panel';
 import { AccountOverview } from '@/components/account-overview';
 import { RecordsWorkspace } from '@/components/records-workspace';
 import { AddAccountDialog } from '@/components/add-account-dialog';
@@ -51,7 +45,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     selectAccount,
     error,
     setError,
-    errorAccountId,
     connectionError,
     needsLogin,
     busy,
@@ -98,29 +91,18 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     connectionError,
     action,
   };
-  const cycle = useAccountDraft(selected, cycleDraft(account?.cycle));
-  const recoveryReason = cycleRecoveryReason(account, {
-    accountId: errorAccountId,
-    message: error,
-  });
   const accountMessage =
-    recoveryReason ||
-    (account && ['error', 'attention'].includes(account.status)
+    account && ['error', 'attention'].includes(account.status)
       ? account.reason
-      : '');
+      : '';
   const separateError = error === accountMessage ? '' : error;
   const canStart = Boolean(
     account &&
     !pairBound &&
     !account.enabled &&
     state?.ready &&
-    !connectionError &&
-    !cycle.dirty,
+    !connectionError,
   );
-  const stale =
-    Boolean(connectionError) ||
-    !state?.updated_at ||
-    serverNow - state.updated_at >= 8;
   const snapshotView = accountSummaryView(
     account,
     binding,
@@ -140,9 +122,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     ? { account, busy: busy || pairBound, action, setError, setNotice }
     : null;
   const modes = account ? accountRunScope(account) : '';
-  const riskLimit = account?.cycle?.enabled
-    ? cycleMarginLimit(account.risk_limits)
-    : (account?.risk_limits?.high_leverage ?? account?.policy.margin_limit);
+  const riskLimit = account?.risk_limits?.high_leverage ?? account?.policy.margin_limit;
   const marginTone =
     snapshot?.ratio == null || riskLimit == null
       ? ''
@@ -170,18 +150,8 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
         </output>
       )}
       {account && accountMessage && workspace !== 'pairs' && (
-        <div className="message message-error cycle-recovery-message">
+        <div className="message message-error">
           <output>{accountMessage}</output>
-          {recoveryReason ? (
-            <CycleRecovery
-              key={account.id}
-              accountId={account.id}
-              accountName={account.name}
-              disabled={busy || pairBound || Boolean(connectionError)}
-              action={action}
-              setNotice={setNotice}
-            />
-          ) : null}
         </div>
       )}
       {!needsLogin && account ? (
@@ -214,9 +184,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                     title={
                       pairBound
                         ? '请到配对组管理此账户'
-                        : cycle.dirty
-                          ? '请先保存或撤销循环草稿'
-                          : '按已保存配置启动账户的全部已启用功能'
+                        : '按已保存配置启动账户的全部已启用功能'
                     }
                     onClick={() =>
                       void action(`/api/accounts/${account.id}/enable`)
@@ -247,11 +215,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                     </Button>
                   ) : null}
                 </div>
-                {cycle.dirty ? (
-                  <p className="draft-notice amber">
-                    循环设置有未保存修改，请到「多空循环」保存或撤销。
-                  </p>
-                ) : null}
               </section>
               <section className="account-strip" aria-label="账户关键数据">
                 <dl>
@@ -404,14 +367,8 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
                 className="workspace-navigation"
               >
                 <TabsTrigger value="pairs">配对组</TabsTrigger>
-                <TabsTrigger value="cycle" disabled={pairBound}>
-                  多空循环{pairBound ? ' · 组管理' : ''}
-                </TabsTrigger>
                 <TabsTrigger value="ordinary" disabled={pairBound}>
                   普通开仓{pairBound ? ' · 组管理' : ''}
-                </TabsTrigger>
-                <TabsTrigger value="migration" disabled={pairBound}>
-                  仓位迁移{pairBound ? ' · 组管理' : ''}
                 </TabsTrigger>
                 <TabsTrigger value="monitoring">币种监控中心</TabsTrigger>
                 <TabsTrigger value="account">账户</TabsTrigger>
@@ -421,28 +378,11 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
               <TabsContent value="pairs" keepMounted>
                 <PairsWorkspace {...pairProps} />
               </TabsContent>
-              <TabsContent value="cycle" keepMounted>
-                <CyclePanel
-                  {...featureProps}
-                  draft={cycle.value}
-                  setDraft={cycle.setValue}
-                  clearDraft={cycle.clear}
-                  now={serverNow}
-                  dataTimestamp={state?.updated_at}
-                  connectionError={connectionError}
-                />
-              </TabsContent>
               <TabsContent value="ordinary" keepMounted>
                 <OrdinaryWorkspace
                   {...featureProps}
                   markets={state?.markets ?? {}}
                   now={serverNow}
-                  connectionError={connectionError}
-                />
-              </TabsContent>
-              <TabsContent value="migration" keepMounted>
-                <MigrationPanel
-                  {...featureProps}
                   connectionError={connectionError}
                 />
               </TabsContent>
@@ -460,10 +400,7 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
               <TabsContent value="records">
                 <RecordsWorkspace
                   account={account}
-                  pair={binding}
                   events={events}
-                  now={serverNow}
-                  stale={stale}
                 />
               </TabsContent>
             </Tabs>

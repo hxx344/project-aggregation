@@ -8,7 +8,6 @@ import {
   type PairApiNotice,
   type Pair,
 } from './pairs.ts';
-import { pairCostFresh } from './pair-cost.ts';
 
 export type PairNotice = {
   key: string;
@@ -33,7 +32,7 @@ type DataSignal = {
   confirmed: boolean;
 };
 type DataSignals = Record<
-  'group' | 'long' | 'short' | 'runtime' | 'costs',
+  'group' | 'long' | 'short' | 'runtime',
   DataSignal
 >;
 export type PairNoticeState = {
@@ -134,7 +133,6 @@ export function pairScheduledMarginWait(
   if (
     !pair.enabled ||
     pair.ordinary?.enabled !== false ||
-    pair.cycle?.enabled !== false ||
     pair.margin?.enabled !== true ||
     margin?.enabled !== true ||
     margin.blocks_trading !== false ||
@@ -142,10 +140,6 @@ export function pairScheduledMarginWait(
     !['waiting', 'cooldown', 'confirmed'].includes(margin.status ?? '') ||
     !pairDataFresh(state.updated_at, now, offline) ||
     pairHasPending(pair) ||
-    Object.values(state.progress?.quantities ?? {}).some(
-      (quantity) =>
-        typeof quantity !== 'string' || !/^0(?:\.0+)?$/.test(quantity),
-    ) ||
     apiNotice(state.api_notice, state.reason) ||
     apiNotice(margin.api_notice, margin.reason)
   )
@@ -394,9 +388,6 @@ export function observePairNotices(
     short:
       !scheduled && !pairDataFresh(snapshots?.short?.timestamp, now, offline),
     runtime: !pairDataFresh(pair.state?.updated_at, now, offline),
-    costs:
-      Boolean(pair.state?.cycle_costs) &&
-      !pairCostFresh(pair.state?.cycle_costs, now, offline),
   };
   const validClock =
     Number.isFinite(now) &&

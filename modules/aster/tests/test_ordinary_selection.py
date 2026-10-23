@@ -8,7 +8,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from tests.helpers import Fixture, account
-from trading.cycle_guard import ordinary_add_blocks, ordinary_add_symbols
+from trading.ordinary_selection import ordinary_add_blocks, ordinary_add_symbols
 from trading.engine import Engine, validate_account
 from trading.execution import Executor
 from trading.models import SYMBOLS, TradingError, dec, plan_pair
@@ -183,32 +183,16 @@ class OrdinarySelectionTests(TestCase):
         submit.assert_not_called()
         self.assertIsNone(self.f.store.intent("test"))
 
-    def test_ordinary_upgrade_rechecks_selection_and_migration_upgrade_is_independent(self):
+    def test_ordinary_upgrade_rechecks_selection(self):
         self.select("CLUSD1")
         with patch.object(self.f.broker, "set_leverage", wraps=self.f.broker.set_leverage) as leverage:
             with self.assertRaisesRegex(TradingError, "仅限 CLUSD1"):
                 self.executor.leverage(self.owner, "XAUUSD1", 5, 10)
             leverage.assert_not_called()
             self.assertIsNone(self.f.store.intent("test"))
-            self.executor.leverage(self.f.store.account("test"), "XAUUSD1", 5, 10,
-                                   purpose="migration", symbols=list(SYMBOLS))
+            self.executor.leverage(self.f.store.account("test"), "CLUSD1", 5, 10)
             leverage.assert_called_once()
-        self.assertEqual(self.f.broker.snapshot(list(SYMBOLS)).pair("XAUUSD1")[0].leverage, 10)
-
-    def test_cycle_keeps_ownership_and_can_open_selected_market(self):
-        self.select("CLUSD1")
-        self.engine.configure("test", {"cycle": {"enabled": True, "symbol": "CLUSD1", "leverage": 2,
-                                                   "spread_limit_bp": "5", "spread_notional": "1000", "max_notional": "1000"}})
-        self.f.broker.set_cycle_leverage("CLUSD1", 2)
-        owner = self.f.store.account("test")
-        self.assertEqual(ordinary_add_symbols(owner), [])
-        self.assertIn("成交量循环", ordinary_add_blocks(owner)["CLUSD1"])
-        self.engine.enable("test", True)
-        self.publish()
-        self.engine.markets["CLUSD1"]["capacities"]["2"] = "500000"
-        self.engine.tick_account("test")
-        self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")
-        self.assertEqual({order["symbol"] for order in self.f.broker.state["orders"].values()}, {"CLUSD1"})
+        self.assertEqual(self.f.broker.snapshot(list(SYMBOLS)).pair("CLUSD1")[0].leverage, 10)
 
     def test_existing_partial_pair_recovers_after_selection_changes(self):
         snapshot, plan, book = self.plan()

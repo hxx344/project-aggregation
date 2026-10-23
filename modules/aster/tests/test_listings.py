@@ -369,7 +369,7 @@ class ListingMonitorTests(unittest.TestCase):
         api = API(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
         self.addCleanup(api.close)
         engine = Engine(self.store, market=MarketData(api=api))
-        state = engine.state(compact=True)
+        state = engine.state()
         self.assertEqual(state["accounts"], [])
         self.assertTrue(state["listings"]["enabled"])
         self.assertEqual(state["listings"]["rows"]["BTCUSD1"]["capacity"], "0")

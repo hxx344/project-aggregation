@@ -14,7 +14,6 @@ class PairRequestEfficiencyTests(TestCase):
 
     def ordinary(self):
         self.live_brokers()
-        self.pair["cycle"]["enabled"] = False
         self.pair["ordinary"]["enabled"] = True
         self.pair = self.store.save_pair(self.pair)
         patcher = patch.object(self.engine, "capacities", return_value={5: dec(0), 10: dec(0), 20: dec(0)})
@@ -66,7 +65,7 @@ class PairRequestEfficiencyTests(TestCase):
     def test_configuration_events_revoke_negative_observation_immediately(self):
         self.ordinary()
         self.trader.tick(self.pair)
-        self.brokers["long"]._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        self.brokers["long"]._private_account_event("ACCOUNT_CONFIG_UPDATE")
         self.trader.tick(self.pair)
         self.assertEqual(self.read_count(), 4)
         self.assertEqual(sum(path == fixtures.DUAL for _, path, _ in self.brokers["long"].api.calls), 2)
@@ -110,7 +109,7 @@ class PairRequestEfficiencyTests(TestCase):
             self.store.put("pair_margin:gold", {"next_check_at": wall + 5})
             wall += 4
             ticks += 4
-            self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+            self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
             self.trader.tick(self.pair)
             self.assertEqual(self.read_count(), 4)
             wall += 2
@@ -128,40 +127,23 @@ class PairRequestEfficiencyTests(TestCase):
 
     def test_ordinary_keeps_event_stream_without_unused_hot_rest_reads(self):
         broker = self.hot_broker()
-        self.pair["cycle"]["enabled"] = False
         self.pair["ordinary"]["enabled"] = True
         self.store.save_pair(self.pair)
-        with patch.object(broker, "start_cycle_hot_data") as stream, \
-             patch.object(broker, "refresh_cycle_hot_snapshot") as refresh:
-            self.assertEqual(self.engine.poll_cycle_hot_data("long"), 30)
-        stream.assert_called_once()
-        refresh.assert_not_called()
+        with patch.object(broker, "start_private_stream") as stream:
+            self.assertEqual(self.engine.poll_private_stream("long"), 30)
+        stream.assert_called_once_with()
         self.assertFalse(broker.api.calls)
 
     def test_monitor_only_and_order_recovery_do_not_refresh_hot_data(self):
         broker = self.hot_broker()
-        for cycle, pending in ((False, None), (True, {"id": "unresolved"})):
-            with self.subTest(cycle=cycle):
-                self.pair["cycle"]["enabled"] = cycle
+        for pending in (None, {"id": "unresolved"}):
+            with self.subTest(pending=pending):
+                self.pair["ordinary"]["enabled"] = False
                 self.pair = self.store.save_pair(self.pair)
                 self.store.put("pair_runtime:gold", {"pending": pending})
-                with patch.object(broker, "start_cycle_hot_data"), \
-                     patch.object(broker, "refresh_cycle_hot_snapshot") as refresh:
-                    self.engine.poll_cycle_hot_data("long")
-                refresh.assert_not_called()
+                with patch.object(broker, "start_private_stream"):
+                    self.engine.poll_private_stream("long")
         self.assertFalse(broker.api.calls)
-
-    def test_cycle_without_pending_still_refreshes_and_midread_intent_revokes_result(self):
-        broker = self.hot_broker()
-        def pending_after_read():
-            self.store.put("pair_runtime:gold", {"pending": {"id": "just-submitted"}})
-            return True
-        with patch.object(broker, "start_cycle_hot_data"), \
-             patch.object(broker, "refresh_cycle_hot_snapshot", side_effect=pending_after_read) as refresh, \
-             patch.object(self.engine, "cycle_hot_ready") as ready:
-            self.engine.poll_cycle_hot_data("long")
-        refresh.assert_called_once()
-        ready.assert_not_called()
 
     def test_engine_does_not_renew_shared_public_sample_timestamp(self):
         source_time = time.time() - 9

@@ -6,6 +6,7 @@ import unittest
 
 from monitor import feishu_payload
 from trading.hourly_summary import MAX_MESSAGE_BYTES, format_hourly_summary
+from trading.pair_legacy import LEGACY_CYCLE_REASON
 
 
 NOW = datetime(2026, 9, 30, 1, tzinfo=timezone.utc).timestamp()
@@ -14,9 +15,6 @@ DAY = "2026-09-30"
 
 def account(aid="solo", **changes):
     return {"id": aid, "name": aid, "mode": "live", "enabled": True, "status": "waiting",
-            "cycle": {"enabled": True, "daily_volume_limit": "1000"},
-            "cycle_state": {"daily_volume": {"utc_date": DAY, "volume": "250", "sync_pending": False},
-                            "report_status": {"status": "ready", "as_of": NOW}},
             "snapshot": {"timestamp": NOW, "equity": "100", "available": "70", "occupied_margin": "30",
                          "margin_ratio": ".3", "unrealized": "-2", "positions": []}, **changes}
 
@@ -25,7 +23,6 @@ def paired_state():
     return {"ready": True, "accounts": [account("long"), account("short")], "pairs": [{
         "id": "paired", "name": "黄金配对", "symbol": "XAUUSD1", "enabled": True,
         "long_account_id": "long", "short_account_id": "short",
-        "cycle": {"enabled": True, "daily_volume_limit": "1000"},
         "state": {"phase": "waiting_open", "updated_at": NOW, "daily_volume": {DAY: {"long": "1000", "short": "500"}},
                   "margin": {"status": "waiting", "reason": "等待检查"}}}]}
 
@@ -34,7 +31,7 @@ def margin_only_state(now=NOW):
     """Recent funds and older independent inventory, with obsolete trade data."""
     state = paired_state()
     pair = state["pairs"][0]
-    pair.update(ordinary={"enabled": False}, cycle={"enabled": False},
+    pair.update(ordinary={"enabled": False},
                 margin={"enabled": True, "check_interval_seconds": 60})
     runtime = pair["state"]
     runtime.update(phase="monitoring", reason="等待下次保证金检查", updated_at=now,
@@ -79,13 +76,12 @@ class HourlySummaryTests(unittest.TestCase):
         text = rendered({"notification": {"hourly_summary": {"interval_seconds": 900}}})
         self.assertIn("每 15 分钟", text)
         self.assertIn("09:00:00 UTC+8", text)
-        self.assertIn("UTC 日 2026-09-30", text)
+        self.assertIn("UTC 日期 2026-09-30", text)
         self.assertNotIn("每小时", text)
 
-    def test_pair_sides_use_separate_targets_without_duplicate_accounts(self):
+    def test_pair_sides_have_no_volume_target_or_duplicate_accounts(self):
         text = rendered(paired_state())
-        self.assertIn("距交易量目标  已达标", text)
-        self.assertIn("距交易量目标  还差 500.00", text)
+        self.assertNotIn("距交易量目标", text)
         self.assertEqual(text.count("A 多 · long（实盘）"), 1)
         self.assertEqual(text.count("B 空 · short（实盘）"), 1)
         self.assertNotIn("账户 · long", text)
@@ -112,54 +108,27 @@ class HourlySummaryTests(unittest.TestCase):
 
         check(result)
 
-    def test_screenshot_values_use_occupied_over_equity_and_exact_remaining(self):
+    def test_screenshot_values_use_occupied_over_equity_without_volume_target(self):
         state = paired_state()
         long, short = state["accounts"]
         long["snapshot"].update(equity="72854.90", available="6573.15", occupied_margin="66281.76",
                                 margin_ratio=".114", unrealized="2563.10")
         short["snapshot"].update(equity="72737.44", available="6455.69", occupied_margin="66281.76",
                                  margin_ratio=".114", unrealized="-2577.81")
-        state["pairs"][0]["cycle"]["daily_volume_limit"] = "450000"
         state["pairs"][0]["state"]["daily_volume"][DAY] = {"long": "449993.08", "short": "444998.15"}
         text = rendered(state)
-        for expected in ("-14.71", "6,573.15", "6,455.69", "90.98%", "91.12%", "还差 6.92", "还差 5,001.85"):
+        for expected in ("-14.71", "6,573.15", "6,455.69", "90.98%", "91.12%"):
             self.assertIn(expected, text)
         self.assertNotIn("11.4%", text)
-        self.assertNotIn("已达标", text)
-        state["pairs"][0]["state"]["daily_volume"][DAY]["long"] = "449999.999"
-        self.assertIn("还差 0.01", rendered(state))
+        for retired in ("已达标", "距交易量目标", "449,993.08"):
+            self.assertNotIn(retired, text)
 
-    def test_missing_pair_day_is_not_zero_or_a_previous_day_total(self):
-        state = paired_state()
-        state["pairs"][0]["state"]["daily_volume"] = {"2026-09-29": {"long": "999", "short": "999"}}
-        text = rendered(state)
-        self.assertEqual(text.count("待同步 / 待核实"), 2)
-        self.assertNotIn("999.00", text)
-        self.assertNotIn("还差", text)
-
-    def test_unknown_pending_or_stale_pair_volume_never_claims_target_reached(self):
-        for changes in ({"volume_unknown": True}, {"pending": {"id": "order"}}, {"updated_at": NOW - 121}):
-            with self.subTest(changes=changes):
-                state = paired_state()
-                state["pairs"][0]["state"].update(changes)
-                text = rendered(state)
-                self.assertEqual(text.count("待同步 / 待核实"), 2)
-                self.assertNotIn("已达标", text)
-
-    def test_single_account_reports_require_current_complete_cache(self):
-        row = account()
-        self.assertIn("还差 750.00", rendered({"accounts": [row]}))
-        for target, change in (("daily_volume", {"utc_date": "2026-09-29"}),
-                               ("daily_volume", {"sync_pending": True}),
-                               ("report_status", {"status": "loading"}),
-                               ("report_status", {"as_of": NOW - 16}),
-                               ("report_status", {"as_of": NOW + 1})):
-            with self.subTest(change=change):
-                sample = deepcopy(row)
-                sample["cycle_state"][target].update(change)
-                text = rendered({"accounts": [sample]})
-                self.assertIn("待同步 / 待核实", text)
-                self.assertNotIn("还差 750.00", text)
+    def test_single_account_and_old_published_fields_show_no_volume_progress(self):
+        row = account(cycle={"enabled": True, "daily_volume_limit": "1000"},
+                      cycle_state={"daily_volume": {"utc_date": DAY, "volume": "250"}})
+        text = rendered({"accounts": [row]})
+        for retired in ("距交易量目标", "还差", "循环未启用", "250.00"):
+            self.assertNotIn(retired, text)
 
     def test_stale_snapshot_and_missing_values_stay_visible(self):
         row = account(snapshot={"timestamp": NOW - 60, "positions": [{"symbol": "XAUUSD1", "side": "LONG", "qty": "2"}]})
@@ -227,12 +196,10 @@ class HourlySummaryTests(unittest.TestCase):
         self.assertIn("账户 · paper（模拟）", text)
         self.assertIn("实盘合计浮盈亏 · USD1\n-2.00", text)
 
-    def test_non_finite_missing_and_zero_limit_are_not_fabricated(self):
+    def test_non_finite_and_missing_values_are_not_fabricated(self):
         row = account()
-        row["cycle"]["daily_volume_limit"] = "0"
         row["snapshot"].update(equity="NaN", unrealized="Infinity")
         text = rendered({"accounts": [row]})
-        self.assertIn("未设目标上限", text)
         self.assertIn("保证金占用率\n待同步", text)
         self.assertIn("实盘合计浮盈亏 · USD1\n待同步", text)
         for changes in ({"equity": "0"}, {"equity": "-1"}, {"equity": None},
@@ -256,7 +223,7 @@ class HourlySummaryTests(unittest.TestCase):
         for row, side in zip(state["accounts"], ("LONG", "SHORT")):
             row["snapshot"]["positions"] = [{"symbol": "XAUUSD1", "side": side, "qty": "79.363", "leverage": 5}]
         state["markets"] = {"XAUUSD1": {"capacities": {"5": 0, "10": 999}, "capacity_checked_at": {"5": NOW, "10": NOW}}}
-        state["pairs"][0]["state"]["reason"] = "循环公开可用额度低于本轮开仓检查要求"
+        state["pairs"][0]["state"]["reason"] = "公开可用额度低于本轮开仓检查要求"
         text = rendered(state)
         self.assertIn("等待公开额度", text)
         self.assertIn("公开额度 5x  0.00", text)
@@ -468,17 +435,19 @@ class MarginOnlyHourlySummaryTests(unittest.TestCase):
         self.assertIn("公开额度待同步", text)
         self.assertNotIn("12,345.00", text)
 
-    def test_trade_modes_pending_and_nonzero_cycle_holdings_keep_trade_evidence(self):
-        for guard in ("ordinary", "cycle", "margin_disabled", "pending", "long_holding", "short_holding"):
+    def test_trade_modes_pending_and_legacy_cycle_evidence_keep_trade_evidence(self):
+        for guard in ("ordinary", "margin_disabled", "pending", "legacy_attention", "long_holding", "short_holding"):
             with self.subTest(guard=guard):
                 state = margin_only_state()
                 pair = state["pairs"][0]
-                if guard in {"ordinary", "cycle"}:
+                if guard == "ordinary":
                     pair[guard]["enabled"] = True
                 elif guard == "margin_disabled":
                     pair["margin"]["enabled"] = False
                 elif guard == "pending":
                     pair["state"]["pending"] = {"id": "unfinished-order"}
+                elif guard == "legacy_attention":
+                    pair["state"]["attention"] = LEGACY_CYCLE_REASON
                 else:
                     pair["state"]["progress"]["quantities"]["LONG" if guard == "long_holding" else "SHORT"] = "0.01"
                 text = rendered(state)

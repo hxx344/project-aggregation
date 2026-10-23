@@ -207,7 +207,7 @@ export function CapacityRelayPanel({
             )}
             <p className="relay-status-footnote">
               仅展示已收到的样本，不代表全部目标交易对。额度缓存最长 8
-              秒，循环要求 1 秒内；杠杆档位最长 5
+              秒；杠杆档位最长 5
               分钟。连接正常或缓存新鲜不代表已通过开仓检查。
             </p>
             <p className="relay-status-footnote">

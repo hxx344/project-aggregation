@@ -237,7 +237,7 @@ class PairMarginBudgetWaitTests(TestCase):
 
         def change_first_account(*args, **kwargs):
             current = original(*args, **kwargs)
-            self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+            self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
             return current
 
         with patch.object(self.brokers["short"], "margin_snapshot", side_effect=change_first_account):

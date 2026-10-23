@@ -531,7 +531,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** [标的切换测试](modules/aster/tests/test_pair_symbol_change.py) 覆盖目标标的非零、不等量手动底仓及原账本数量隔离；[历史观察切换测试](modules/aster/tests/test_pair_symbol_watch.py) 覆盖真实人工归档后切换、原标的查询、重启保留、迟到成交及查询竞态，确认切换不发送交易写入。
 
-[归档后底仓采纳](modules/aster/tests/test_pair_archived_baseline.py) 覆盖其他仓位存在时预览、确认及启动；[配对交易](modules/aster/tests/test_pair_trading.py) 验证循环只减回本组新增量；[仓位范围与风险](modules/aster/tests/test_pair_position_scope.py) 和 [升档检查](modules/aster/tests/test_pair_upgrade_capacity.py) 验证同标的总持仓上限、其他仓位占用、行情重估和发送前新增反向持仓不会触发杠杆写入。
+[归档后底仓采纳](modules/aster/tests/test_pair_archived_baseline.py) 覆盖其他仓位存在时预览、确认及启动；[配对交易](modules/aster/tests/test_pair_trading.py) 覆盖单边拒单只减另一侧、超时后按同一编号查询不重发（原循环只减回本组新增量的用例已随配对循环移除，旧循环增量改为阻断待人工核对）；[仓位范围与风险](modules/aster/tests/test_pair_position_scope.py) 和 [升档检查](modules/aster/tests/test_pair_upgrade_capacity.py) 验证同标的总持仓上限、其他仓位占用、行情重估和发送前新增反向持仓不会触发杠杆写入。
 
 展示层改动运行 [ASTER 汇总测试](modules/aster/tests/test_hub_summary.py) 与 [适配器测试](tests/adapters.test.mjs)，覆盖旧观察记录、重启无缓存、实际检查失败、迟到成交、已确认合计及 UTC 跨日；确认读取汇总不新增交易所查询、不修改持久状态。
 
@@ -633,7 +633,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** [单账户有界恢复](modules/aster/tests/test_bounded_recovery.py)、[配对有界恢复](modules/aster/tests/test_pair_bounded_recovery.py)覆盖查询上限、观察窗口、重启、补偿、完整现实证据与事务竞态；[调度衔接](modules/aster/tests/test_recovery_engine.py)验证冷却后仍按当前档位交易及用户暂停优先；[历史划转出口](modules/aster/tests/test_pair_margin_bounded_recovery.py)覆盖流水一直不匹配、网络失败、预算等待、新余额失败与恢复，不发送第二次划转。相关恢复与成交账本测试按影响范围复用。
 
-**证据：** 本仓 `8bce5ca` 的 [普通执行](modules/aster/trading/execution.py)、[循环执行](modules/aster/trading/cycle_execution.py)、[迁移执行](modules/aster/trading/migration_execution.py)在未知单超过 120 秒后仍保留 pending；[配对执行](modules/aster/trading/pair_execution.py)在原单查询失败时到不了仓位采纳；[保证金平衡](modules/aster/trading/margin_balance.py)的旧 `accepted` 状态无历史查询出口。2026-10-15 用户明确要求清理同类永久核对，本次根据源码和离线回归修复；120 秒是转入现实核验的等待窗口，不是订单未成交的证明。
+**证据：** 本仓 `8bce5ca` 的 [普通执行](modules/aster/trading/execution.py)、循环执行 `cycle_execution.py`、迁移执行 `migration_execution.py`（两者已随循环与仓位迁移功能移除，源码见该提交）在未知单超过 120 秒后仍保留 pending；[配对执行](modules/aster/trading/pair_execution.py)在原单查询失败时到不了仓位采纳；[保证金平衡](modules/aster/trading/margin_balance.py)的旧 `accepted` 状态无历史查询出口。2026-10-15 用户明确要求清理同类永久核对，本次根据源码和离线回归修复；120 秒是转入现实核验的等待窗口，不是订单未成交的证明。
 
 **事件记录：** `bounded-unknown-execution-recovery-20261015`；本次跨执行器的同类根因修复，不按文件或路径重复计数。
 
@@ -663,7 +663,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **根因：** 划转复用了交易快照、持仓匹配、普通开仓占用上限和历史订单核查。即使交易所允许转出，标的不同、行情缺失或无关历史查询失败仍会阻止补充保证金；创建与启动入口也强制策略仓位核验。
 
-**以后做法：** 划转单独读取账户 USD1 余额和交易所可划额度，不要求持仓标的、方向、模式或开仓状态匹配。金额按余额差的一半、实际可划额度、单次限额和现金保留确定。仅保证金启动保留原策略记录，不采纳或清空持仓；实际订单恢复及循环减仓继续按原路径处理。暂停、实盘授权、账户归属、发送前身份与快照代次检查、先持久化后发送和未知结果不重发仍保留。资金快照不提供持仓及杠杆授权，界面单独展示余额及原始读取时间。旧指纹与旧划转日志保持恢复兼容。
+**以后做法：** 划转单独读取账户 USD1 余额和交易所可划额度，不要求持仓标的、方向、模式或开仓状态匹配。金额按余额差的一半、实际可划额度、单次限额和现金保留确定。仅保证金启动保留原策略记录，不采纳或清空持仓；实际订单恢复继续按原路径处理（循环减仓已随循环功能移除，旧循环批次改为待人工核对，不阻止保证金平衡）。暂停、实盘授权、账户归属、发送前身份与快照代次检查、先持久化后发送和未知结果不重发仍保留。资金快照不提供持仓及杠杆授权，界面单独展示余额及原始读取时间。旧指纹与旧划转日志保持恢复兼容。
 
 **如何验证：** [专用资金快照](modules/aster/tests/test_transfer_account_snapshot.py) 验证只查询账户接口，缺失资金字段、过期与事件失效仍被拒绝；[独立入口](modules/aster/tests/test_pair_margin_independent.py) 验证其他标的持仓可启动平衡、保留策略记录、普通交易仍核验本组底仓与实际杠杆，以及配置身份竞态；[划转测试](modules/aster/tests/test_pair_margin.py) 验证真实额度、现金保留、旧日志和防重发。恢复、预算及 WebSocket 测试按受影响路径选取，前端配对与提示测试验证余额状态不伪装为已确认空仓。
 

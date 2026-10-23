@@ -8,8 +8,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from tests import test_pair_integration as integration
-from tests.test_cycle_account_snapshot import (
-    ACCOUNT, BRACKET, ORDERS, RISK, LocalQuoteMarket, cycle_account_responses, risk_row)
+from tests.account_fixtures import (
+    ACCOUNT, BRACKET, ORDERS, RISK, LocalQuoteMarket, join_margin_responses, risk_row)
 from tests.test_exchange_hardening import FixtureAPI
 from tests.test_pair_order_recovery import BATCH_ID, receipt_for, seed_pending
 from trading.engine import Engine
@@ -29,9 +29,8 @@ TARGET = {"LONG": "12", "SHORT": "17"}
 class WatchFixture(unittest.TestCase):
     def setUp(self):
         integration.PairIntegrationTests.setUp(self)
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.pair = self.engine.pairs.create(integration.pair_config(
-            ordinary={"enabled": True}, cycle={"enabled": False}))
+            ordinary={"enabled": True}))
         self.checks = ExitStack()
         self.addCleanup(self.checks.close)
         self.prepare_brokers()
@@ -57,7 +56,7 @@ class WatchFixture(unittest.TestCase):
     def no_writes(self, engine=None):
         stack = ExitStack()
         for side in ("long", "short"):
-            for method in ("submit", "cancel", "set_leverage", "set_cycle_leverage"):
+            for method in ("submit", "cancel", "set_leverage"):
                 stack.enter_context(patch.object(self.broker(side, engine), method,
                     side_effect=AssertionError("symbol adoption must not " + method)))
         stack.enter_context(patch("trading.margin_balance.MarginBalancer.tick",
@@ -90,13 +89,9 @@ class WatchFixture(unittest.TestCase):
         self.assertFalse(pair["enabled"])
         for key in ("id", "name", "long_account_id", "short_account_id", "ordinary", "margin"):
             self.assertEqual(pair[key], self.pair[key])
-        self.assertEqual(pair["cycle"], {**self.pair["cycle"], "symbol": SILVER})
         self.assertEqual(state["symbol"], SILVER)
         self.assertEqual(state["phase"], "paused")
         self.assertEqual(state["owned"], TARGET)
-        self.assertEqual(state["progress"]["baseline"], TARGET)
-        self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(state["progress"]["completed_cycles"], 4)
         self.assertIsNone(state["pending"])
         self.assertEqual(state["recovery_watch"], self.original["recovery_watch"])
         for key in ("daily_volume", "volume_unknown", "volume_unknown_until_utc"):
@@ -123,7 +118,6 @@ class PairSymbolWatchTests(WatchFixture):
         self.assertTrue(self.f.store.pair("gold")["enabled"])
         self.assertEqual(self.state()["owned"], TARGET)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         with self.no_writes(restarted), ExitStack() as spies:
             queries = {key: spies.enter_context(patch.object(self.broker(key, restarted), "query",
                 wraps=self.broker(key, restarted).query)) for key in ("long", "short")}
@@ -278,7 +272,7 @@ class PairSymbolLiveWatchTests(WatchFixture):
             return_value={"verified": True, "mode": "live"}))
         for aid, digit in (("test", "1"), ("second", "2")):
             self.f.store.save_account({**self.f.store.account(aid), "mode": "live"})
-            responses = cycle_account_responses((GOLD, SILVER))
+            responses = join_margin_responses((GOLD, SILVER))
             responses["/fapi/v3/positionSide/dual"] = {"dualSidePosition": True}
             responses[RISK] = [risk_row(row) for row in responses[ACCOUNT]["positions"]]
             responses[BRACKET] = [{"symbol": symbol, "brackets": PAPER_BRACKETS} for symbol in (GOLD, SILVER)]
@@ -323,7 +317,7 @@ class PairSymbolLiveWatchTests(WatchFixture):
         original_credentials = deepcopy(broker.api.credentials)
         query = broker.query
         changes = {
-            "account_event": lambda: broker._cycle_account_event("ACCOUNT_UPDATE"),
+            "account_event": lambda: broker._private_account_event("ACCOUNT_UPDATE"),
             "identity": lambda: broker.api.credentials.update(user="0x" + "3" * 40),
         }
         for name, change in changes.items():

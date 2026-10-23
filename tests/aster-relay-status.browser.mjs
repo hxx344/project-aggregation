@@ -128,7 +128,7 @@ async (page) => {
     await expectTone(connection, 'good', 'healthy WS connection is green');
     await expectTone(data, 'good', 'healthy data has its own green status');
     assert(await connection.innerText() === 'WS 已连接', 'healthy connection wording');
-    assert((await oi.innerText()).includes('额度缓存有效 · 1 秒内'), 'fresh OI uses the one-second sample requirement');
+    assert((await oi.innerText()).includes('采集时 · 额度缓存有效'), 'fresh OI is shown as a valid cache sample');
     await checkNoReconnect(await refresh({}));
     observations.push('healthy WS and samples are independently green');
 
@@ -184,7 +184,7 @@ async (page) => {
     assert(await connection.innerText() === '最近记录 · WS 等待重连', 'known stale failure retains its historical qualifier');
     observations.push('fresh disconnect, explicit WS error and historical known disconnect remain warnings');
 
-    for (const [sampleAge, expected] of [[2.8, '已超循环 1 秒要求'], [9, '缓存已过期']]) {
+    for (const [sampleAge, expected] of [[9, '缓存已过期']]) {
       await refresh({ sampleAge });
       await expectTone(connection, 'good', `${sampleAge}-second sample does not recolor a healthy WS connection`);
       await expectTone(data, 'warning', `${sampleAge}-second sample warns independently`);
@@ -197,7 +197,7 @@ async (page) => {
     await expectTone(data, 'warning', 'HTTP fallback error remains a data warning');
     assert(await panel.getByText('HTTP 补取暂不可用', { exact: true }).count() === 1, 'HTTP error detail remains visible');
     await page.screenshot({ path: 'output/playwright/aster-relay-http-warning.png', fullPage: true });
-    observations.push('2.8-second cycle expiry, nine-second cache expiry and HTTP errors warn only in data status');
+    observations.push('nine-second cache expiry and HTTP errors warn only in data status');
 
     await refresh({});
     failReads = true;

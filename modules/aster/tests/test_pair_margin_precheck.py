@@ -4,7 +4,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_margin as fixtures
-from trading.account_cache import HotAccountUnavailable
+from trading.exchange import SnapshotSuperseded
 from trading.models import Position, dec
 
 
@@ -81,7 +81,7 @@ class PairMarginPrecheckTests(TestCase):
     def test_revoked_guard_blocks_negative_preview_without_network(self):
         rows = self.blocked_snapshots("long")
         def guard():
-            raise HotAccountUnavailable("revoked test lease")
+            raise SnapshotSuperseded("revoked test snapshot")
         with patch("time.time", return_value=rows["long"].timestamp):
             result = self.balancer.tick(self.pair, rows, snapshot_guards={"long": guard})
         self.assertEqual(result["status"], "blocked", result)

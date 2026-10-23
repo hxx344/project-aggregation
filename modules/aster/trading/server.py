@@ -24,7 +24,6 @@ from starlette.datastructures import MutableHeaders
 
 from . import monitoring
 from .engine import Engine
-from .cycle import CYCLE_MAXIMUM
 from .hub_summary import hub_summary
 from .models import TIERS, TradingError
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, PairSymbol, supported_symbols_list
@@ -137,12 +136,12 @@ class Login(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
-class CycleRecoveryConfirmation(BaseModel):
+class RecoveryConfirmation(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     token: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
-class PairRecoveryConfirmation(CycleRecoveryConfirmation):
+class PairRecoveryConfirmation(RecoveryConfirmation):
     acknowledge_unknown: Literal[True]
 
     @model_validator(mode="before")
@@ -227,43 +226,6 @@ class MonitoringSymbolEdit(BaseModel):
         return self
 
 
-class MigrationEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    enabled: bool | None = None
-    spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
-    batch_notional: str | None = Field(default=None, min_length=1, max_length=40)
-    notional_tolerance: str | None = Field(default=None, min_length=1, max_length=128)
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_present_values(cls, values):
-        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
-            raise ValueError("请提供非空的迁移配置字段")
-        return values
-
-
-class CycleEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    enabled: bool | None = None
-    symbol: Literal["XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
-    leverage: StrictInt | None = Field(default=None, ge=1, le=CYCLE_MAXIMUM["leverage"])
-    spread_notional: str | None = Field(default=None, min_length=1, max_length=40)
-    spread_limit_bp: str | None = Field(default=None, min_length=1, max_length=40)
-    min_notional: str | None = Field(default=None, min_length=1, max_length=40)
-    max_notional: str | None = Field(default=None, min_length=1, max_length=40)
-    capacity_multiplier: str | None = Field(default=None, min_length=1, max_length=40)
-    daily_volume_limit: str | None = Field(default=None, min_length=1, max_length=40)
-    notional_scope: Literal["per_side", "gross"] | None = None
-    hold_seconds: StrictInt | None = Field(default=None, ge=1, le=CYCLE_MAXIMUM["hold_seconds"])
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_present_values(cls, values):
-        if not isinstance(values, dict) or not values or any(value is None for value in values.values()):
-            raise ValueError("请提供非空的多空循环配置字段")
-        return values
-
-
 class PolicyEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     ordinary_symbol: Literal["all", "XAUUSD1", "SPCXUSD1", "CLUSD1"] | None = None
@@ -271,8 +233,6 @@ class PolicyEdit(BaseModel):
     order_notional: str | None = Field(default=None, min_length=1, max_length=40)
     margin_limit: str | None = Field(default=None, min_length=1, max_length=128)
     min_open_leverage: StrictInt | None = Field(default=None, ge=5, le=20, json_schema_extra={"enum": list(TIERS)})
-    migration: MigrationEdit | None = None
-    cycle: CycleEdit | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -306,10 +266,6 @@ class PairMarginEdit(BaseModel):
     cooldown_seconds: StrictInt | None = None
 
 
-class PairCycleEdit(CycleEdit):
-    symbol: PairSymbol | None = None
-
-
 class PairAdlEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool | None = None
@@ -332,7 +288,6 @@ class NewPair(BaseModel):
     symbol: PairSymbol = DEFAULT_PAIR_SYMBOL
     enabled: bool = False
     ordinary: PairOrdinaryEdit | None = None
-    cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None
     adl: PairAdlEdit | None = None
 
@@ -353,7 +308,6 @@ class PairEdit(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=50)
     symbol: PairSymbol | None = None
     ordinary: PairOrdinaryEdit | None = None
-    cycle: PairCycleEdit | None = None
     margin: PairMarginEdit | None = None
     adl: PairAdlEdit | None = None
 
@@ -501,10 +455,8 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
         return {"ok": True}
 
     @app.get("/api/state", dependencies=[Depends(authenticated)])
-    def state(compact: bool = False, history_account: str = Query("", max_length=32),
-              history_revision: str = Query("", max_length=64)):
-        return {**engine.state(background_reports=True, compact=compact,
-                            history_account=history_account, history_revision=history_revision),
+    def state():
+        return {**engine.state(),
                 "workspaceManaged": workspace_secret is not None}
 
     if workspace_secret is not None:
@@ -650,15 +602,6 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     @app.post("/api/accounts/{account_id}/retry", dependencies=write_dependencies)
     def retry(account_id: str):
         engine.retry(account_id)
-        return {"ok": True}
-
-    @app.post("/api/accounts/{account_id}/cycle/recovery-preview", dependencies=write_dependencies)
-    def preview_cycle_recovery(account_id: str):
-        return engine.preview_cycle_recovery(account_id)
-
-    @app.post("/api/accounts/{account_id}/cycle/recovery-confirm", dependencies=write_dependencies)
-    def confirm_cycle_recovery(account_id: str, body: CycleRecoveryConfirmation):
-        engine.confirm_cycle_recovery(account_id, body.token)
         return {"ok": True}
 
     output = Path(os.environ.get("ASTER_DASHBOARD_DIR", ROOT / "dashboard" / "dist" / "client"))

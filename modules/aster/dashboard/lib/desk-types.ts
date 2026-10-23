@@ -1,6 +1,4 @@
-import type { CycleConfig, CycleState, CycleTrade } from './cycle';
-import type { MigrationConfig, MigrationState } from './migration';
-import type { ExecutionEvent } from './cycle-events';
+import type { ExecutionEvent } from './execution-events';
 import type { AccountCapacity } from './account-capacity';
 import type { DepthQuote } from './depth';
 import type { Pair } from './pairs';
@@ -60,25 +58,16 @@ export type Account = {
   enabled: boolean;
   pair_id?: string | null;
   deletion_block?: string | null;
-  cycle_recovery_available?: boolean;
   status: string;
   reason: string;
   credential_ready: boolean;
   snapshot_refresh?: { interval_seconds: number };
   display_positions?: PositionsDisplay;
   policy: Policy;
-  migration?: MigrationConfig;
-  migration_state?: MigrationState;
-  cycle?: CycleConfig;
-  cycle_state?: CycleState;
-  cycle_trades?: CycleTrade[];
-  cycle_trades_revision?: string;
   ordinary_add_blocks?: Record<string, string>;
   risk_limits?: {
     base: string;
     high_leverage: string;
-    migration?: string;
-    cycle?: string;
   };
   snapshot?: {
     equity: string;

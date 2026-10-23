@@ -65,7 +65,7 @@ class PairUpgradeCompatibilityTests(TestCase):
                     self.assertTrue(all(p.update_time is None for p in broker.snapshot([pair["symbol"]]).positions))
                 with ExitStack() as stack:
                     for broker in brokers.values():
-                        for name in ("query", "submit", "set_leverage", "set_cycle_leverage"):
+                        for name in ("query", "submit", "set_leverage"):
                             stack.enter_context(patch.object(broker, name,
                                 side_effect=AssertionError("legacy bounded watch must not resend or requery")))
                     self.assertEqual(require_archived_orders_clear(engine, pair), [])

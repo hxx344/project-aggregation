@@ -199,7 +199,6 @@ const fundsPair = (now, positions = {}) => ({
   long_account_id: 'a',
   short_account_id: 'b',
   ordinary: { enabled: false },
-  cycle: { enabled: false },
   margin: { enabled: true, check_interval_seconds: 5 },
   state: {
     phase: 'monitoring',

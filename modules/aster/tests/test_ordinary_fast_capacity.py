@@ -5,12 +5,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from trading.cycle import DEFAULT_CYCLE
 from trading.engine import Engine, snapshot_json
 from trading.exchange import ExchangeError, BudgetWait
 from trading.models import Plan, SYMBOLS, dec
 from tests.helpers import Fixture, account
-from tests.test_cycle_ws_scheduler import _Harness, _Future, _Pool
+from tests.scheduler_fixtures import _Harness, _Future, _Pool
 
 
 XAU, SPCX, CL = SYMBOLS
@@ -49,7 +48,7 @@ class OrdinaryFastCapacityTests(unittest.TestCase):
         with patch.object(self.f.market, "capacities", return_value={tier: dec(value) for tier, value in values.items()}):
             self.engine.poll_market(XAU)
 
-    def test_selected_market_or_all_have_fast_5x_without_a_cycle(self):
+    def test_selected_market_or_all_have_fast_5x(self):
         for selected in SYMBOLS:
             with self.subTest(selected=selected):
                 self.assertEqual(self.targets(ordinary_symbol=selected), {selected: {5}})
@@ -57,21 +56,20 @@ class OrdinaryFastCapacityTests(unittest.TestCase):
         self.assertEqual(self.targets(min_open_leverage=10), {})
         self.assertEqual(self.targets(min_open_leverage=20), {})
 
-    def test_paused_disallowed_live_and_migration_accounts_do_not_add_fast_5x(self):
+    def test_paused_and_disallowed_live_accounts_do_not_add_fast_5x(self):
         owner = self.f.store.account("test")
-        for changed in ({"enabled": False}, {"mode": "live"}, {"migration": {"enabled": True}}):
+        for changed in ({"enabled": False}, {"mode": "live"}):
             with self.subTest(changed=changed), patch.dict("os.environ", {}, clear=True):
                 self.assertEqual(self.engine.fast_capacity_targets([{**owner, **changed}]), {})
 
-    def test_cycle_ownership_and_multiple_accounts_share_one_feed(self):
+    def test_multiple_accounts_share_one_feed(self):
         owner = self.f.store.account("test")
         owner["policy"]["symbols"] = list(SYMBOLS)
-        owner["cycle"] = {**DEFAULT_CYCLE, "enabled": True, "symbol": XAU}
         self.engine.view("test", snapshot={"timestamp": time.time(), "positions": [{"symbol": XAU, "leverage": 10}]})
-        self.assertEqual(self.engine.fast_capacity_targets([owner]), {XAU: {10}, SPCX: {5}, CL: {5}})
+        self.assertEqual(self.engine.fast_capacity_targets([owner]), dict.fromkeys(SYMBOLS, {5}))
         second = account("second")
         targets = self.engine.fast_capacity_targets([owner, second, deepcopy(second)])
-        self.assertEqual(targets, {XAU: {5, 10}, SPCX: {5}, CL: {5}})
+        self.assertEqual(targets, dict.fromkeys(SYMBOLS, {5}))
 
     def test_each_fast_sample_can_detect_recovery_without_duplicate_unchanged_work(self):
         self.sample({5: 0, 10: 0, 20: 0})
@@ -119,14 +117,13 @@ class OrdinaryFastCapacityTests(unittest.TestCase):
                 self.live_sample({5: 500000, 10: 0, 20: 0})
                 self.assertFalse(self.engine.work("test").priority)
 
-    def test_5x_signal_respects_selection_cycle_ownership_and_threshold(self):
+    def test_5x_signal_respects_selection_and_threshold(self):
         owner = self.f.store.account("test")
         other = account("other")
         other["policy"]["symbols"] = list(SYMBOLS)
         other["policy"]["ordinary_symbol"] = CL
-        owner["cycle"] = {**DEFAULT_CYCLE, "enabled": True, "symbol": XAU}
         self.engine.wake_capacity_accounts(XAU, {5: dec(500000)}, time.time(), [owner, other])
-        self.assertFalse(self.engine.work("test").priority)
+        self.assertIn(XAU, self.engine.work("test").priority)
         self.assertFalse(self.engine.work("other").priority)
         self.engine.wake_capacity_accounts(CL, {5: dec(10000)}, time.time(), [other])
         self.assertFalse(self.engine.work("other").priority)
@@ -226,7 +223,6 @@ class OrdinaryFastSchedulerTests(unittest.TestCase):
         self.addCleanup(f.close)
         self.h = _Harness(f)
         owner = f.store.account("test")
-        owner["cycle"]["enabled"] = False
         owner["policy"].update(symbols=[XAU], ordinary_symbol=XAU)
         f.store.save_account(owner)
 

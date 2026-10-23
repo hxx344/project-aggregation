@@ -173,7 +173,7 @@ class ChannelDeliveryTests(unittest.TestCase):
         self.split(FEISHU_EVENT_WEBHOOK_URL="")
         self.queue_trade()
         self.engine.notify()
-        state = self.engine.state(compact=True)["notification"]
+        state = self.engine.state()["notification"]
         self.assertEqual(state["routing_mode"], "split")
         self.assertTrue(state["channels"]["scheduled"]["configured"])
         self.assertFalse(state["channels"]["event"]["configured"])

@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 from tests import test_pair_api as api_cases
 from tests import test_pair_integration as integration
-from tests import test_pair_trading as trading_cases
 from tests.test_pair_order_recovery import seed_pending
 from trading.adl_view import status_view
 from trading.exchange import ExchangeError
@@ -27,7 +26,7 @@ class PairMarginOnlySwitchTests(unittest.TestCase):
         with patch.object(self.engine, "broker", side_effect=AssertionError("no exchange work")):
             saved = self.engine.pairs.switch_to_margin_only("gold")
         expected = deepcopy(original)
-        expected["ordinary"]["enabled"] = expected["cycle"]["enabled"] = False
+        expected["ordinary"]["enabled"] = False
         expected["margin"]["enabled"] = True
         expected["revision"] += 1
         self.assertEqual(saved, expected)
@@ -87,28 +86,6 @@ class PairMarginOnlySwitchTests(unittest.TestCase):
         self.assertIsNotNone(state["pending"])
         self.assertEqual(balance.call_count, 1)
         self.assertTrue(balance.call_args.kwargs["pending_orders"])
-
-
-class PairMarginOnlyCycleTests(unittest.TestCase):
-    setUp = trading_cases.PairTradingTests.setUp
-    tick = trading_cases.PairTradingTests.tick
-    snapshots = trading_cases.PairTradingTests.snapshots
-    assert_flat = trading_cases.PairTradingTests.assert_flat
-
-    def test_existing_cycle_finishes_with_original_parameters_after_switch(self):
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding")
-        original_progress = deepcopy(state["progress"])
-        self.engine.pairs.enable("gold", False)
-        pair = self.engine.pairs.switch_to_margin_only("gold")
-        self.assertEqual(self.store.get("pair_runtime:gold")["progress"], original_progress)
-        self.assertFalse(pair["enabled"])
-        self.tick()
-        self.tick()
-        self.assert_flat()
-        self.assertIsNone(self.store.get("pair_runtime:gold")["pending"])
-        self.assertFalse(self.store.pair("gold")["ordinary"]["enabled"])
-        self.assertFalse(self.store.pair("gold")["cycle"]["enabled"])
 
 
 class PairMarginOnlyApiTests(unittest.TestCase):

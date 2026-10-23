@@ -24,7 +24,6 @@ class PairSubmitEvidenceTests(TestCase):
         self.addCleanup(fixture.doCleanups)
         pair = fixture.store.pair("gold")
         pair["ordinary"]["enabled"] = kind == "ordinary"
-        pair["cycle"]["enabled"] = kind == "cycle"
         fixture.store.save_pair(pair)
         return fixture
 
@@ -32,7 +31,7 @@ class PairSubmitEvidenceTests(TestCase):
         return fixture.store.get("pair_batch:" + state["last_batch"]["id"])
 
     def test_both_rejected_orders_finish_after_positions_confirm_for_both_modes(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             with self.subTest(kind=kind):
                 f = self.fixture(kind)
                 with ExitStack() as stack:
@@ -58,12 +57,11 @@ class PairSubmitEvidenceTests(TestCase):
                                       leg["receipt"]["reject_code"], leg["receipt"]["local_not_sent"]),
                                      ("REJECTED", "0", -5018, False))
                 self.assertEqual(state["owned"], f.before)
-                self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
                 self.assertTrue(all(not broker.state["orders"] for broker in f.brokers.values()))
                 f.assert_baseline()
 
     def test_either_rejected_leg_reduces_only_successful_increment_in_both_modes(self):
-        for kind in ("ordinary", "cycle"):
+        for kind in ("ordinary",):
             for rejected in ("long", "short"):
                 with self.subTest(kind=kind, rejected=rejected):
                     f = self.fixture(kind)

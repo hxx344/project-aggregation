@@ -29,9 +29,8 @@
   GitHub 的路径过滤只看前 300 个改动文件，只有前 300 个全是文档时才可能漏跑，同样无法发布。
 - ASTER Python 单元测试由 `deploy/test-aster-python.sh` 在独立 CI 作业中运行：从 HEAD 的固定
   Git 归档为每个分片提取独立源码树，按原四组运行，其中交易组按模块分片并发，最后汇总测试数。
-  `tests/` 下其余模块自动归入 discovered 组并分片运行，新增测试文件无需登记；
-  `test_cycle_volume_execution` 的两个约 50 秒的方法各占一个分片。CI 用 `ASTER_TEST_PART`
-  把 listed、discovered、slow 三部分分到三台 runner，每部分都校验每个模块恰好属于一处。
+  `tests/` 下其余模块自动归入 discovered 组并分片运行，新增测试文件无需登记。CI 用
+  `ASTER_TEST_PART` 把 listed、discovered 两部分分到两台 runner，每部分都校验每个模块恰好属于一处。
 - Monitor、Crossex、Asset 的 Node 测试和 Greeks、Asset 的 Python 测试不需要构建产物，由
   `deploy/test-module-units.sh` 在 `module-units` 作业中并发运行，参数与各模块 `package.json`
   的 test 脚本一致。
@@ -61,8 +60,7 @@ Monitor、Asset、Crossex 的 `node_modules` 指向同一生产缓存中的对�
 使用的可写构建目录，而是在可信运行目录中恢复并完成完整校验。开启部署行为测试时，
 仍为测试恢复所有必要产物。内置模块组装不再复制随后会被丢弃的主站页面和服务源码。
 
-Aster 前端的构建键覆盖 dashboard、实际引用的 `trading/cycle-config.json`、环境文件
-及原有公共构建输入。仅修改 Python 运行代码或模块根文档不会触发前端编译；修改
+Aster 前端的构建键覆盖 dashboard、环境文件及原有公共构建输入。仅修改 Python 运行代码或模块根文档不会触发前端编译；修改
 dashboard 仍需重建。因此包含新界面的版本仍可能在更新时花费十几秒构建 Aster。
 
 服务器安装器直接在各模块目录执行其 `pnpm run build`，Asset 先执行 `pnpm run prepare`。

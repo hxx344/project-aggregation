@@ -276,9 +276,10 @@ class MarginBalancer:
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
+                from .pair_legacy import without_cycle
                 current_pair = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
                 if (row is None or json.loads(row[0]) != state
-                        or (json.loads(current_pair[0]) if current_pair else None) != saved_pair):
+                        or (without_cycle(json.loads(current_pair[0])) if current_pair else None) != saved_pair):
                     raise TradingError("划转记录或配对配置已变化，保留原请求并重新检查")
                 for side, broker in brokers.items():
                     account = db.execute("SELECT data FROM accounts WHERE id=?", (members[side]["id"],)).fetchone()
@@ -758,7 +759,7 @@ class MarginBalancer:
     def _invalidate(self, members):
         for member in members.values():
             broker = self.engine.broker(member)
-            callback = getattr(broker, "invalidate_cycle_hot_data", None)
+            callback = getattr(broker, "invalidate_account_reads", None)
             if callback:
                 callback("子账户保证金划转，重新读取余额")
 
@@ -1058,7 +1059,7 @@ class MarginBalancer:
             for member in members.values():
                 budget = getattr(getattr(self.engine.broker(member), "api", None), "budget", None)
                 if budget is not None and id(budget) not in seen:
-                    ordinary.enter_context(budget.cycle_accounting())
+                    ordinary.enter_context(budget.pair_accounting())
                     seen.add(id(budget))
             self._require_budget(members, self._live_budget_weights(pair, members, snapshots, snapshot_guards))
             result = self._submit_live(pair, members, snapshots, state, config, snapshot_guards)
@@ -1117,14 +1118,7 @@ class MarginBalancer:
             state.pop("api_notice", None)
             state.pop("blocked_reason", None)
             self.store.put(key, state)  # Must commit before any signed mutation.
-            def before_submit():
-                # Validate borrowed leases after signing, then revoke them just
-                # before transport. Earlier revocation would reject our own read.
-                require_current()
-                for member in members.values():
-                    self.engine.broker(member).discard_cycle_hot_snapshot("子账户保证金划转，重新读取余额")
-
-            transfer = TransferAPI(master, budget=api.budget, before_submit=before_submit)
+            transfer = TransferAPI(master, budget=api.budget, before_submit=require_current)
             transfer.workspace_control = self.engine.workspace
             writer = writer_for(self.engine)
             writer.bind_api(transfer, "master:" + config["master_env_prefix"])

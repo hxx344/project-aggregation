@@ -9,7 +9,7 @@ from tests import test_pair_integration as integration
 from tests import test_pair_margin_lifeline_live as live
 from tests.test_transfer_account_snapshot import display_position, seven_position_response
 from trading.models import TradingError, dec, wire
-from trading.pair_execution import runtime_default
+from tests.pair_legacy_fixtures import runtime_default
 from trading.paper import DemoMarket
 
 
@@ -25,7 +25,7 @@ class PairMarginCreationTests(TestCase):
         second.state["leverages"]["XAUUSD1"] = 10
         first.save()
         second.save()
-        config = integration.pair_config(cycle={"enabled": False}, margin={"enabled": True})
+        config = integration.pair_config(ordinary={"enabled": False}, margin={"enabled": True})
         with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("no strategy evidence")):
             pair = self.engine.pairs.create(config)
             self.assertEqual(pair["symbol"], "XAUUSD1")
@@ -36,20 +36,18 @@ class PairMarginCreationTests(TestCase):
         self.assertEqual(first.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
         self.assertEqual(first.state["orders"], {})
 
-    def test_ordinary_and_cycle_creation_allow_other_symbol_holdings(self):
+    def test_ordinary_creation_allows_other_symbol_holdings(self):
         self.f.broker.state["positions"]["SPCXUSD1:SHORT"].update(qty="1", entry="724.185")
         self.f.broker.save()
-        for ordinary in (True, False):
-            with self.subTest(ordinary=ordinary):
-                pair = self.engine.pairs.create(integration.pair_config(id="ordinary" if ordinary else "cycle",
-                    ordinary={"enabled": ordinary}, cycle={"enabled": not ordinary}, margin={"enabled": True}))
-                self.assertFalse(pair["enabled"])
-                self.assertEqual(self.f.broker.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
-                self.engine.pairs.delete(pair["id"])
+        pair = self.engine.pairs.create(integration.pair_config(id="ordinary",
+            ordinary={"enabled": True}, margin={"enabled": True}))
+        self.assertFalse(pair["enabled"])
+        self.assertEqual(self.f.broker.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
+        self.engine.pairs.delete(pair["id"])
         self.assertEqual(self.f.store.pairs(), [])
 
     def test_new_group_keeps_exclusive_ownership_and_legacy_recovery_guard(self):
-        config = integration.pair_config(cycle={"enabled": False}, margin={"enabled": True})
+        config = integration.pair_config(ordinary={"enabled": False}, margin={"enabled": True})
         self.f.store.save_intent({"id": "pending", "account_id": "test", "status": "pending", "kind": "leverage"})
         with self.assertRaisesRegex(TradingError, "未完成"):
             self.engine.pairs.create(config)
@@ -164,11 +162,11 @@ class PairMarginIndependentTests(TestCase):
                 calls = broker.api.calls[before[side]:]
                 self.assertEqual([(method, path) for method, path, _ in calls], [("GET", live.ACCOUNT)])
             before_state = {side: len(broker.api.calls) for side, broker in self.brokers.items()}
-            with patch.object(self.engine, "_load_dashboard_report", return_value={}):
-                view = self.engine.state(compact=True)
+            view = self.engine.state()
             published = next(pair for pair in view["pairs"] if pair["id"] == self.pair["id"])["state"]
             self.assertEqual(published["margin_balances"], balances)
-            for field in ("snapshots", "owned", "progress"):
+            self.assertNotIn("progress", published)
+            for field in ("snapshots", "owned"):
                 self.assertEqual(published[field], old[field])
             accounts = {account["id"]: account for account in view["accounts"]}
             for side in self.brokers:
@@ -305,7 +303,7 @@ class PairMarginIndependentTests(TestCase):
         self.store.put("pair_runtime:gold", old)
         with ExitStack() as stack:
             for target, name in ((self.market, "book"), (self.engine, "capacities"),
-                                 (self.engine, "cycle_book"), (self.engine.pairs, "_read_members")):
+                                 (self.engine.pairs, "_read_members")):
                 stack.enter_context(patch.object(target, name, side_effect=AssertionError("strategy path")))
             stack.enter_context(patch("trading.pair_recovery.require_archived_orders_clear",
                                      side_effect=AssertionError("historical order query")))
@@ -360,26 +358,6 @@ class PairMarginIndependentTests(TestCase):
         self.assertEqual(len(self.sent), 1, state)
         self.assert_no_trades()
 
-    def test_existing_cycle_is_still_reduced_after_margin_only_start(self):
-        for side, paper in self.paper.items():
-            paper.state["positions"]["XAUUSD1:" + side.upper()].update(qty="0.01", entry="4412.015")
-            paper.save()
-        old = runtime_default()
-        old["progress"].update(phase="holding", quantities={"LONG": "0.01", "SHORT": "0.01"},
-            opened_at=time.time() - 10, leverage=5,
-            config={**self.pair["cycle"], "enabled": True, "hold_seconds": 1, "leverage": 5})
-        self.store.put("pair_runtime:gold", old)
-        started = self.start()
-        self.assertEqual(started["progress"], old["progress"])
-        state = self.tick()
-        self.assertEqual(state["progress"]["completed_cycles"], 1, state)
-        self.assertIsNone(state["pending"])
-        for side, paper in self.paper.items():
-            self.assertEqual(dec(paper.state["positions"]["XAUUSD1:" + side.upper()]["qty"]), 0)
-            orders = list(paper.state["orders"].values())
-            self.assertEqual(len(orders), 1)
-            self.assertEqual(orders[0]["side"], "SELL" if side == "long" else "BUY")
-
     def test_live_disabled_identity_change_pause_and_maintenance_block_transfers(self):
         with patch.object(self.engine, "live_allowed", return_value=False), self.assertRaises(TradingError):
             self.start()
@@ -417,10 +395,9 @@ class PairMarginIndependentTests(TestCase):
 
     def test_ordinary_and_cycle_start_still_require_matching_selected_leverage(self):
         self.mixed_positions()
-        for ordinary in (True, False):
+        for ordinary in (True,):
             pair = self.store.pair("gold")
             pair["ordinary"]["enabled"] = ordinary
-            pair["cycle"]["enabled"] = not ordinary
             self.pair = self.store.save_pair(pair)
             with self.complete_strategy_orders():
                 with self.subTest(ordinary=ordinary), self.assertRaisesRegex(TradingError, "实际杠杆必须相同"):
@@ -434,17 +411,15 @@ class PairMarginIndependentTests(TestCase):
             paper.state["leverages"]["XAUUSD1"] = 5
             paper.save()
         holdings = {side: deepcopy(paper.state["positions"]) for side, paper in self.paper.items()}
-        for ordinary in (True, False):
+        for ordinary in (True,):
             with self.subTest(ordinary=ordinary):
                 pair = self.store.pair("gold")
                 pair["ordinary"]["enabled"] = ordinary
-                pair["cycle"]["enabled"] = not ordinary
                 self.pair = self.store.save_pair(pair)
                 with self.complete_strategy_orders():
                     state = self.start()
                 self.assertTrue(self.store.pair("gold")["enabled"])
                 self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
-                self.assertEqual(state["progress"]["baseline"], state["owned"])
                 for side, paper in self.paper.items():
                     self.assertEqual(paper.state["positions"], holdings[side])
                 self.engine.pairs.enable("gold", False)

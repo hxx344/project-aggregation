@@ -48,41 +48,37 @@ class PairSymbolApiTests(unittest.TestCase):
             with self.subTest(symbol=symbol), self.assertRaises(TradingError):
                 validate_symbol(symbol)
 
-    def test_omitted_symbols_keep_gold_and_silver_cycle_inherits_pair(self):
+    def test_omitted_symbols_keep_gold_and_silver_is_explicit(self):
         golden = validate_pair(pair_config())
         self.assertEqual(golden["symbol"], "XAUUSD1")
-        self.assertEqual(golden["cycle"]["symbol"], "XAUUSD1")
         self.login()
         silver = self.create_silver()
         self.assertFalse(silver["enabled"])
-        self.assertEqual(silver["cycle"]["symbol"], "XAGUSD1")
         self.assertNotIn("XAGUSD1", DEFAULT_POLICY["symbols"])
 
     def test_api_rejects_conflicting_cycle_and_unknown_symbols(self):
         self.login()
         for values, status in (({"symbol": "BTCUSD1"}, 422),
-                               ({"symbol": "XAGUSD1", "cycle": {"symbol": "XAUUSD1"}}, 409),
+                               ({"symbol": "XAGUSD1", "cycle": {"symbol": "XAUUSD1"}}, 422),
                                ({"symbol": "XAGUSD1", "cycle": {"symbol": "CLUSD1"}}, 422)):
-            response = self.client.post("/api/pairs", json=pair_config(**values))
+            response = self.client.post("/api/pairs", json={**pair_config(), **values})
             self.assertEqual(response.status_code, status, response.text)
         self.assertEqual(self.f.store.pairs(), [])
 
-    def test_symbol_switch_preserves_members_and_partial_cycle_edits(self):
+    def test_symbol_switch_preserves_members_and_rejects_cycle_edits(self):
         self.login()
         pair = self.create_silver()
         response = self.client.patch("/api/pairs/silver", json={"symbol": "XAUUSD1"})
         self.assertEqual(response.status_code, 200, response.text)
         changed = response.json()["pair"]
-        self.assertEqual(changed["cycle"]["symbol"], "XAUUSD1")
         for key in ("id", "long_account_id", "short_account_id", "ordinary", "margin"):
             self.assertEqual(changed[key], pair[key])
         response = self.client.patch("/api/pairs/silver", json={"symbol": "XAGUSD1"})
         self.assertEqual(response.status_code, 200, response.text)
         response = self.client.patch("/api/pairs/silver", json={"cycle": {"hold_seconds": 90}})
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["pair"]["cycle"]["symbol"], "XAGUSD1")
+        self.assertEqual(response.status_code, 422, response.text)
         response = self.client.patch("/api/pairs/silver", json={"cycle": {"symbol": "XAUUSD1"}})
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 422)
 
     def test_symbol_edits_reject_unknown_null_conflicts_and_member_changes(self):
         self.login()
@@ -90,7 +86,7 @@ class PairSymbolApiTests(unittest.TestCase):
         for changes, status in (({"symbol": None}, 422), ({"symbol": "BTCUSD1"}, 422),
                                 ({"symbol": "xauusd1"}, 422), ({"long_account_id": "third"}, 422),
                                 ({"id": "other"}, 422),
-                                ({"symbol": "XAUUSD1", "cycle": {"symbol": "XAGUSD1"}}, 409)):
+                                ({"symbol": "XAUUSD1", "cycle": {"symbol": "XAGUSD1"}}, 422)):
             with self.subTest(changes=changes):
                 response = self.client.patch("/api/pairs/silver", json=changes)
                 self.assertEqual(response.status_code, status, response.text)
@@ -146,7 +142,7 @@ class PairSymbolApiTests(unittest.TestCase):
         self.f.store.put("cycle:test", legacy)
         with ExitStack() as stack:
             for member in brokers.values():
-                for method in ("submit", "cancel", "set_leverage", "set_cycle_leverage"):
+                for method in ("submit", "cancel", "set_leverage"):
                     stack.enter_context(patch.object(member, method, side_effect=AssertionError("binding must not trade")))
             stack.enter_context(patch("trading.margin_balance.MarginBalancer.tick",
                                      side_effect=AssertionError("binding must not transfer")))
@@ -157,8 +153,6 @@ class PairSymbolApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
         runtime = self.f.store.get("pair_runtime:silver")
         self.assertEqual(runtime["owned"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(runtime["progress"]["baseline"], runtime["owned"])
-        self.assertEqual(runtime["progress"]["quantities"], runtime["owned"])
         self.assertIsNone(runtime["pending"])
         self.assertEqual(self.f.store.get("cycle:test"), legacy)
         for aid, member in brokers.items():

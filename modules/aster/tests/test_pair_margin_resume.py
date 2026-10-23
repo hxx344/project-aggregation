@@ -118,7 +118,7 @@ class PairMarginResumeTests(TestCase):
             self.balancer.risk_snapshots(self.pair, raw)
         raw = self.snapshots()
         reserved = self.balancer.risk_snapshots(self.pair, raw)
-        self.brokers["long"]._cycle_account_event("ACCOUNT_UPDATE")
+        self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
         with self.assertRaises(TradingError):
             self.brokers["long"].require_snapshot_current(reserved["long"])
 

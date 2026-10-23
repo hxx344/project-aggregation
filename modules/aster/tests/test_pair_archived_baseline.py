@@ -63,9 +63,6 @@ class ArchivedBaselineTests(TestCase):
             self.confirm(review["token"])
             state = self.state()
             self.assertEqual(state["owned"], review["actual"])
-            self.assertEqual(state["progress"]["baseline"], review["actual"])
-            self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-            self.assertEqual(state["progress"]["completed_cycles"], 4)
             for key in ("recovery_watch", "daily_volume", "last_batch"):
                 self.assertEqual(state[key], before[key])
             self.assertFalse(self.f.store.pair("gold")["enabled"])

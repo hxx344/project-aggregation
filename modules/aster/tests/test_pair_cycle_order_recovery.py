@@ -1,171 +1,151 @@
-"""Legacy cycle opens are explicitly archived as unknown, never inferred rejected."""
+"""Removed cycles remain immutable and blocked while funds and ADL stay independent."""
 from contextlib import ExitStack
 from copy import deepcopy
+import json
 from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_order_recovery as recovery
-from tests.test_pair_order_recovery import BATCH_ID, receipt_for, seed_pending
-from tests.test_pair_notional_rejection import ORIGINAL_REJECTION
-from trading.exchange import AmbiguousOrder, ExchangeError
+from tests.test_pair_order_recovery import BATCH_ID, seed_pending
 from trading.models import TradingError
 from trading.pair_execution import PairTrader
+from trading.pair_legacy import LEGACY_CYCLE_REASON, ROLLBACK_CYCLE
+from trading.pairing import validate_pair
+from trading.store import Store, dumps
 
 
 class PairCycleOrderRecoveryTests(TestCase):
     setUp = recovery.PairOrderRecoveryTests.setUp
-    state = recovery.PairOrderRecoveryTests.state
-    broker = recovery.PairOrderRecoveryTests.broker
-    no_writes = recovery.PairOrderRecoveryTests.no_writes
-    preview = recovery.PairOrderRecoveryTests.preview
-    confirm = recovery.PairOrderRecoveryTests.confirm
-    audit = recovery.PairOrderRecoveryTests.audit
-    event_rows = recovery.PairOrderRecoveryTests.event_rows
-    change_state = recovery.PairOrderRecoveryTests.change_state
 
-    # The same archival transaction must retain its protections for cycles.
-    test_archive_retains_original_unknown_batch_and_accounting_without_writes = (
-        recovery.PairOrderRecoveryTests.test_archive_retains_original_unknown_batch_and_accounting_without_writes)
-    test_equal_actual_positions_that_differ_from_before_are_rejected = (
-        recovery.PairOrderRecoveryTests.test_equal_actual_positions_that_differ_from_before_are_rejected)
-    test_running_group_and_each_pending_transfer_state_are_rejected = (
-        recovery.PairOrderRecoveryTests.test_running_group_and_each_pending_transfer_state_are_rejected)
-    test_full_or_malformed_order_history_fails_closed = (
-        recovery.PairOrderRecoveryTests.test_full_or_malformed_order_history_fails_closed)
-    test_receipt_appearing_between_preview_and_confirm_prevents_archive = (
-        recovery.PairOrderRecoveryTests.test_receipt_appearing_between_preview_and_confirm_prevents_archive)
-    test_changed_batch_or_actual_positions_invalidates_confirmation = (
-        recovery.PairOrderRecoveryTests.test_changed_batch_or_actual_positions_invalidates_confirmation)
-    test_acknowledgment_is_required_and_token_expiry_and_replay_are_safe = (
-        recovery.PairOrderRecoveryTests.test_acknowledgment_is_required_and_token_expiry_and_replay_are_safe)
-    test_unsafe_pending_shapes_and_tracking_block_preview = (
-        recovery.PairOrderRecoveryTests.test_unsafe_pending_shapes_and_tracking_block_preview)
-    test_other_store_mutation_during_confirmation_is_not_overwritten = (
-        recovery.PairOrderRecoveryTests.test_other_store_mutation_during_confirmation_is_not_overwritten)
-    test_failure_writing_audit_or_event_rolls_back_archival = (
-        recovery.PairOrderRecoveryTests.test_failure_writing_audit_or_event_rolls_back_archival)
-    test_late_archived_receipt_blocks_paper_transfer_before_any_wallet_change = (
-        recovery.PairOrderRecoveryTests.test_late_archived_receipt_blocks_paper_transfer_before_any_wallet_change)
+    def test_old_config_loads_without_strategy_activation_or_database_rewrite(self):
+        pair = self.engine.pairs.create({
+            "id": "gold", "name": "旧配对组", "long_account_id": "test",
+            "short_account_id": "second", "margin": {"enabled": True}})
+        for enabled in (False, True):
+            with self.subTest(cycle_enabled=enabled):
+                old = {**pair, "cycle": {"enabled": enabled, "unexpected_old_key": "retained"}}
+                with self.f.store.connect() as db:
+                    db.execute("UPDATE pairs SET data=? WHERE id=?", (dumps(old), pair["id"]))
+                reopened = Store(self.f.store.path)
+                self.assertNotIn("cycle", reopened.pair("gold"))
+                self.assertNotIn("cycle", reopened.pairs()[0])
+                self.assertNotIn("cycle", reopened.pair_for_account("test"))
+                normalized = validate_pair(old)
+                self.assertNotIn("cycle", normalized)
+                self.assertFalse(normalized["ordinary"]["enabled"])
+                self.assertTrue(normalized["margin"]["enabled"])
+                with self.f.store.connect() as db:
+                    self.assertEqual(db.execute("SELECT data FROM pairs WHERE id='gold'").fetchone()[0], dumps(old))
+        # Existing funds-only groups must still pass activation CAS against old JSON.
+        saved = self.engine.pairs.enable("gold", True)
+        self.assertTrue(saved["enabled"])
+        self.assertFalse(saved["ordinary"]["enabled"])
 
-    def seed(self, before=None):
-        state = seed_pending(self.engine, before)
-        pair = self.f.store.pair("gold")
-        self.f.store.save_pair({**pair, "ordinary": {**pair["ordinary"], "enabled": False},
-                               "cycle": {**pair["cycle"], "enabled": True}})
-        state["pending"]["kind"] = "cycle"
-        for leg in state["pending"]["legs"]:
-            leg.update(submit_evidence_version=1, submit_error=ORIGINAL_REJECTION.replace("-2029", "-5018"))
-        self.f.store.put("pair_runtime:gold", state)
-        return deepcopy(state)
-
-    def missing_orders(self):
-        stack = ExitStack()
-        for key in ("long", "short"):
-            stack.enter_context(patch.object(self.broker(key), "query", side_effect=
-                ExchangeError("Order does not exist.", code=-2013, http_status=400)))
-        return stack
-
-    def test_v1_rejection_text_stays_unknown_until_explicit_archive(self):
-        original = self.seed()
-        with self.no_writes(), self.missing_orders():
+    def test_enabled_old_cycle_without_other_strategy_never_opens(self):
+        pair = self.engine.pairs.create({
+            "id": "gold", "name": "无策略旧组", "long_account_id": "test", "short_account_id": "second"})
+        old = {**pair, "enabled": True, "cycle": {"enabled": True}}
+        with self.f.store.connect() as db:
+            db.execute("UPDATE pairs SET data=? WHERE id=?", (dumps(old), "gold"))
+        with patch.object(PairTrader, "_start", side_effect=AssertionError("no orders")), \
+             patch.object(PairTrader, "_leverage", side_effect=AssertionError("no leverage")):
             self.engine.pairs.tick("gold")
-            self.assertTrue(all(leg["receipt"] is None for leg in self.state()["pending"]["legs"]))
-            checked = self.engine.pairs.check_recovery("gold")
-            self.assertFalse(checked["completed"])
-            self.assertTrue(checked["archive_available"])
-            self.assertEqual([row["status"] for row in checked["orders"]], ["UNKNOWN", "UNKNOWN"])
-            self.confirm(self.preview()["token"])
-        saved = self.state()
-        self.assertIsNone(saved["pending"])
-        self.assertEqual(saved["phase"], "paused")
-        self.assertFalse(self.f.store.pair("gold")["enabled"])
-        self.assertEqual(saved["owned"], original["owned"])
-        self.assertEqual(saved["daily_volume"], original["daily_volume"])
-        self.assertEqual(saved["progress"]["completed_cycles"], original["progress"]["completed_cycles"])
-        self.assertIn("循环开仓", saved["reason"])
-        self.assertTrue(all(leg["receipt"] is None for leg in self.audit()["pending"]["legs"]))
-        self.assertIsNone(self.f.store.get("pair_batch:" + BATCH_ID))
+        self.assertTrue(self.f.store.pair("gold")["enabled"])
+        self.assertFalse(self.f.store.pair("gold")["ordinary"]["enabled"])
+        self.assertFalse(self.f.store.pair("gold")["margin"]["enabled"])
 
-    def test_cycle_shape_must_be_unstarted_with_two_unknown_originals(self):
-        original = self.seed()
-        mutations = {
-            "baseline_missing": lambda s: s["progress"].pop("baseline"),
-            "baseline_changed": lambda s: s["progress"]["baseline"].update(SHORT="3.040"),
-            "baseline_invalid": lambda s: s["progress"]["baseline"].update(SHORT="NaN"),
-            "phase_missing": lambda s: s["progress"].pop("phase"),
-            "closing_cycle": lambda s: s["progress"].update(phase="waiting_close"),
-            "tiny_increment": lambda s: s["progress"]["quantities"].update(LONG="0.00000000000000000001"),
-            "increment_missing": lambda s: s["progress"]["quantities"].pop("SHORT"),
-            "prepared": lambda s: s["pending"]["legs"][0].update(dispatch="prepared"),
-            "receipt_missing": lambda s: s["pending"]["legs"][0].pop("receipt"),
-            "active_receipt": lambda s: s["pending"]["legs"][0].update(receipt=receipt_for(s["pending"]["legs"][0], status="NEW")),
-            "terminal_receipt": lambda s: s["pending"]["legs"][0].update(receipt=receipt_for(s["pending"]["legs"][0])),
-            "repair_attempt": lambda s: s["pending"].update(repair_attempts=1),
-        }
-        for label, mutate in mutations.items():
-            with self.subTest(boundary=label):
-                changed = deepcopy(original)
-                mutate(changed)
-                self.f.store.put("pair_runtime:gold", changed)
-                with self.no_writes(), self.assertRaises(TradingError):
-                    self.engine.pairs.check_recovery("gold")
-                with self.no_writes(), self.assertRaises(TradingError):
-                    self.preview()
-                self.assertEqual(self.state(), changed)
-                self.assertIsNone(self.audit())
+    def test_new_pair_writes_keep_rollback_readable_cycle_settings(self):
+        def raw():
+            with self.f.store.connect() as db:
+                return json.loads(db.execute("SELECT data FROM pairs WHERE id='gold'").fetchone()[0])
 
-    def test_cycle_cannot_skip_positions_or_take_ordinary_start_recovery(self):
-        original = self.seed()
-        with self.no_writes():
-            with self.assertRaises(TradingError):
-                self.engine.pairs.skip_recovery("gold", BATCH_ID, True)
-            with self.assertRaises(TradingError):
-                self.engine.pairs.recovery.check("gold", source="paused_start")
-            with self.assertRaises(TradingError):
-                self.engine.pairs.enable("gold", True)
-        self.assertEqual(self.state(), original)
-        self.assertFalse(self.f.store.pair("gold")["enabled"])
+        def write_raw(cycle):
+            with self.f.store.connect() as db:
+                db.execute("UPDATE pairs SET data=? WHERE id='gold'", (dumps({**raw(), "cycle": cycle}),))
 
-    def test_real_receipt_is_restored_instead_of_archiving_unknown(self):
-        original = self.seed()
-        for status, qty in (("NEW", "0"), ("PARTIALLY_FILLED", "0.1"), ("FILLED", "0.2")):
-            with self.subTest(status=status):
+        pair = self.engine.pairs.create({
+            "id": "gold", "name": "回滚组", "long_account_id": "test",
+            "short_account_id": "second", "margin": {"enabled": True}})
+        self.assertNotIn("cycle", pair)
+        self.assertEqual(raw()["cycle"], {**ROLLBACK_CYCLE, "symbol": pair["symbol"]})
+        old = {"enabled": True, "symbol": pair["symbol"], "hold_seconds": 5, "unexpected_old_key": "retained"}
+        write_raw(old)
+        renamed = self.engine.pairs.configure("gold", {"name": "改名"})
+        self.assertNotIn("cycle", renamed)
+        self.assertEqual(raw()["cycle"], old)
+        # Saving ordinary without starting must not leave both strategies on for a rollback.
+        self.engine.pairs.configure("gold", {"ordinary": {"enabled": True}})
+        self.assertEqual(raw()["cycle"], {**old, "enabled": False})
+        self.engine.pairs.configure("gold", {"ordinary": {"enabled": False}})
+        write_raw(old)
+        started = self.engine.pairs.enable("gold", True)
+        self.assertNotIn("cycle", started)
+        self.assertEqual(raw()["cycle"], {**old, "enabled": False})
+        self.engine.pairs.enable("gold", False)
+        write_raw(old)
+        switched = self.engine.pairs.configure("gold", {"symbol": "XAGUSD1"})
+        self.assertEqual(switched["symbol"], "XAGUSD1")
+        self.assertEqual(raw()["cycle"], {**old, "enabled": False, "symbol": "XAGUSD1"})
+
+    def test_legacy_increment_pending_and_persisted_cycle_batch_block_without_mutation(self):
+        baseline = seed_pending(self.engine)
+        variants = {}
+        pending = deepcopy(baseline)
+        pending["pending"]["kind"] = "cycle"
+        variants["pending"] = pending
+        increment = deepcopy(baseline)
+        increment["pending"] = None
+        increment["progress"]["quantities"]["LONG"] = "0.00000000000000000001"
+        variants["increment"] = increment
+        variants["batch"] = deepcopy(baseline)
+        for name, original in variants.items():
+            with self.subTest(legacy=name):
+                original.update(cycle_costs={"old": True}, execution_quality={"old": True},
+                                execution_quality_history={"old": True})
                 self.f.store.put("pair_runtime:gold", original)
-                row = receipt_for(original["pending"]["legs"][0], status=status, qty=qty)
-                with self.no_writes(), patch.object(self.broker(), "query", return_value=row):
-                    result = self.preview()
-                self.assertEqual(result["status"], "receipts_found")
-                self.assertEqual(self.state()["pending"]["legs"][0]["receipt"], row)
-                self.assertIsNone(self.audit())
-                self.assertIsNone(self.state().get("recovery_watch"))
+                batch = {**baseline["pending"], "kind": "cycle"} if name == "batch" else None
+                self.f.store.put("pair_batch:" + BATCH_ID, batch)
+                with ExitStack() as stack:
+                    for side in ("long", "short"):
+                        pair = self.f.store.pair("gold")
+                        broker = self.engine.broker(self.f.store.account(pair[side + "_account_id"]))
+                        for method in ("submit", "query", "set_leverage"):
+                            stack.enter_context(patch.object(broker, method, side_effect=AssertionError("no cycle work")))
+                    adl = stack.enter_context(patch.object(self.engine.adl, "tick", return_value=None))
+                    for _ in range(2):
+                        self.engine.pairs.tick("gold")
+                    adl.assert_called()
+                    saved = self.f.store.get("pair_runtime:gold")
+                    self.assertEqual(saved["phase"], "attention")
+                    self.assertEqual(saved["reason"], LEGACY_CYCLE_REASON)
+                    for field in ("pending", "progress", "owned", "daily_volume", "last_batch",
+                                  "cycle_costs", "execution_quality", "execution_quality_history"):
+                        self.assertEqual(saved[field], original[field])
+                    self.assertEqual(self.f.store.get("pair_batch:" + BATCH_ID), batch)
+                    for action in (lambda: self.engine.pairs.check_recovery("gold"),
+                                   lambda: self.engine.pairs.preview_recovery("gold"),
+                                   lambda: self.engine.pairs.reconcile_flat("gold"),
+                                   lambda: self.engine.pairs.skip_recovery("gold", BATCH_ID, True)):
+                        with self.assertRaisesRegex(TradingError, LEGACY_CYCLE_REASON):
+                            action()
+                shown = self.engine.pairs.states()[0]
+                self.assertNotIn("cycle", shown)
+                self.assertNotIn("progress", shown["state"])
+                for field in ("cycle_costs", "execution_quality", "execution_quality_history"):
+                    self.assertNotIn(field, shown["state"])
 
-    def test_ambiguous_or_failed_queries_never_authorize_archive(self):
-        original = self.seed()
-        for error in (ExchangeError("gateway", code=-2013, http_status=503),
-                      AmbiguousOrder("unknown", code=-2013),
-                      ExchangeError("cooldown", code=-2013, retry_after=20)):
-            with self.subTest(error=type(error).__name__), self.no_writes(), \
-                    patch.object(self.broker(), "query", side_effect=error), self.assertRaises(TradingError):
-                self.preview()
-            self.assertEqual(self.state(), original)
-
-    def test_restarted_archive_watch_blocks_late_fills_before_new_orders_and_transfers(self):
-        from trading.pair_recovery import require_archived_orders_clear
-        original = self.seed()
-        with self.no_writes(), self.missing_orders():
-            self.confirm(self.preview()["token"])
-        pair = self.f.store.save_pair({**self.f.store.pair("gold"), "enabled": True})
-        # Rebuild the trader: protection comes from the durable watcher.
-        trader = PairTrader(self.engine)
-        broker = self.broker()
-        broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "3.239"
-        broker.save()
-        for status, qty in (("NEW", "0"), ("FILLED", "0.2")):
-            row = receipt_for(original["pending"]["legs"][0], status=status, qty=qty)
-            with self.subTest(status=status), self.no_writes(), patch.object(self.broker(), "query", return_value=row):
-                with self.assertRaises(TradingError):
-                    trader._config_guard(pair, original["identities"], opening=True)
-                # MarginBalancer uses this same guard before preparing a new transfer.
-                with self.assertRaises(TradingError):
-                    require_archived_orders_clear(self.engine, pair)
-        self.assertIsNotNone(self.state()["recovery_watch"])
+    def test_funds_checks_remain_independent_when_legacy_cycle_blocks_orders(self):
+        state = seed_pending(self.engine)
+        state["pending"]["kind"] = "cycle"
+        self.f.store.put("pair_runtime:gold", state)
+        pair = self.f.store.pair("gold")
+        pair["ordinary"]["enabled"] = False
+        pair["margin"]["enabled"] = True
+        pair["enabled"] = True
+        pair = self.f.store.save_pair(pair)
+        with patch.object(PairTrader, "margin_tick", return_value={"blocks_trading": False}) as funds, \
+             patch.object(PairTrader, "_recover", side_effect=AssertionError("no cycle recovery")):
+            result = PairTrader(self.engine).tick(pair)
+        funds.assert_called_once()
+        self.assertEqual(result["phase"], "attention")
+        self.assertEqual(result["pending"], state["pending"])

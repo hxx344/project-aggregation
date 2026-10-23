@@ -115,8 +115,6 @@ capture
 echo example > "$source_dir/modules/asset/lib/example-ledger.json"; refresh; compare 1 1 1 1 1
 capture
 mkdir -p "$source_dir/modules/aster/trading"
-echo cycle > "$source_dir/modules/aster/trading/cycle-config.json"; refresh; compare 1 1 1 1 1
-capture
 mkdir -p "$source_dir/scripts" "$source_dir/modules/monitor/scripts"
 # Source deployment calls each importer directly. The optional local runner
 # cannot invalidate any module's compiled output when its dispatch changes.

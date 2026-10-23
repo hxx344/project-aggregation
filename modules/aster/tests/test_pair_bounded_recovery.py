@@ -68,7 +68,6 @@ class PairBoundedRecoveryTests(unittest.TestCase):
         self.assertEqual([leg["recovery_query_attempts"] for leg in state["pending"]["legs"]], [3, 3])
         self.age()
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         with ExitStack() as stack:
             for aid in ("test", "second"):
                 broker = restarted.broker(restarted.store.account(aid))
@@ -167,17 +166,6 @@ class PairBoundedRecoveryTests(unittest.TestCase):
         with self.no_writes(), self.unknown():
             self.engine.pairs.tick("gold")
         self.assertIsNotNone(self.state()["pending"])
-
-    def test_balanced_cycle_positions_become_baseline_without_automatic_close(self):
-        self.ready("cycle")
-        self.quantities()
-        with self.no_writes(), self.unknown():
-            self.engine.pairs.tick("gold")
-        state = self.state()
-        self.assertIsNone(state["pending"], state["reason"])
-        self.assertEqual(state["owned"], {"LONG": "3.239", "SHORT": "3.239"})
-        self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(state["progress"]["completed_cycles"], 4)
 
     def test_unbalanced_and_incomplete_orders_and_stale_snapshots_keep_pending(self):
         for case in ("unbalanced", "open_orders", "missing_orders", "stale", "equity"):
@@ -293,7 +281,6 @@ class PairBoundedRecoveryTests(unittest.TestCase):
         observed["first_observed_at"] -= 121
         self.f.store.put(key, observed)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         retry_at = self.state()["pending"]["bounded_recovery"]["next_check_at"]
         with patch("time.time", return_value=retry_at):
             restarted.pairs.tick("gold")
@@ -395,7 +382,6 @@ class PairBoundedRecoveryTests(unittest.TestCase):
         observed["first_observed_at"] -= 121
         self.f.store.put(key, observed)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         with patch.object(restarted.broker(restarted.store.account("test")), "query", side_effect=AssertionError("exhausted")):
             restarted.pairs.delete("gold")
         self.assertIsNone(self.f.store.pair("gold"))
@@ -442,63 +428,6 @@ class PairBoundedRecoveryTests(unittest.TestCase):
             self.assertIsNotNone(self.f.store.pair("gold"))
             self.assertIsNone(self.f.store.get("pair_deleted_watch:gold"))
             self.f.store.put("pair_margin:gold", {})
-
-    def terminal_cycle(self, case="mismatch"):
-        self.seed()
-        self.setup_trader()
-        state = self.state()
-        pending = state["pending"]
-        pending.update(kind="cycle", created_at=time.time() - 200)
-        for leg in pending["legs"]:
-            leg["receipt"] = fixtures.receipt_for(leg, status="FILLED", qty="0.2", timestamp=int((time.time() - 120) * 1000))
-        self.quantities("3.439", "3.439")
-        if case == "leverage":
-            self.quantities("3.239", "3.239")
-            pending["leverage"] = 10
-        elif case == "repairs":
-            self.quantities("3.239", "3.239")
-            pending["repair_attempts"] = 3
-            for leg in pending["legs"]:
-                leg["receipt"]["status"] = "EXPIRED"
-        for side in ("long", "short"):
-            broker = self.broker(side)
-            # These cases explicitly model later manual positions/leverage.
-            broker.state["positions"]["XAUUSD1:" + side.upper()]["updateTime"] = int(time.time() * 1000)
-            broker.save()
-        self.f.store.put("pair_runtime:gold", state)
-
-    def test_terminal_cycle_mismatch_leverage_and_exhausted_repairs_have_finite_safe_exit(self):
-        for case in ("mismatch", "leverage", "repairs"):
-            self.terminal_cycle(case)
-            with self.subTest(case=case), self.no_writes(), self.unknown(AssertionError("terminal receipts must not be requeried")):
-                for _ in range(4):
-                    self.engine.pairs.tick("gold")
-                self.assertEqual(self.state()["pending"]["recovery_query_attempts"], 3)
-                self.assertIsNotNone(self.state()["pending"])
-                self.age()
-                self.engine.pairs.tick("gold")
-            state = self.state()
-            self.assertIsNone(state["pending"], state["reason"])
-            self.assertEqual(state["last_batch"]["resolution"], "terminal_positions_adopted")
-            self.assertFalse(state["last_batch"]["completed"])
-            self.assertEqual(state["progress"]["completed_cycles"], 4)
-            self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-            batch = self.f.store.get("pair_batch:" + fixtures.BATCH_ID)
-            self.assertTrue(all(leg["receipt"]["executedQty"] == "0.2" for leg in batch["legs"]))
-            day = datetime.now(timezone.utc).date().isoformat()
-            self.assertEqual({key: dec(value) for key, value in state["daily_volume"][day].items()},
-                {"long": dec("882.403"), "short": dec("882.403")})
-
-    def test_terminal_cycle_unsafe_actual_positions_remain_pending_after_budget(self):
-        self.terminal_cycle()
-        with self.no_writes():
-            for _ in range(3):
-                self.engine.pairs.tick("gold")
-            self.age()
-            self.quantities("3.439", "3.239")
-            self.engine.pairs.tick("gold")
-        self.assertIsNotNone(self.state()["pending"])
-        self.assertEqual(self.state()["pending"]["bounded_recovery"]["stage"], "positions")
 
 
 class PairLeverageBoundedTests(unittest.TestCase):
@@ -555,7 +484,7 @@ class PairBoundedLiveTests(unittest.TestCase):
     flat_watch = PairBoundedRecoveryTests.flat_watch
 
     def test_watch_deletion_requires_complete_full_account_orders(self):
-        from tests.test_cycle_account_snapshot import ORDERS
+        from tests.account_fixtures import ORDERS
         self.flat_watch()
         before = self.state()
         for orders in (None, {"orders": []}, [{"symbol": "SPCXUSD1"}]):
@@ -580,7 +509,7 @@ class PairBoundedLiveTests(unittest.TestCase):
                 if change == "identity":
                     self.broker().api.credentials["user"] = "0x" + "9" * 40
                 elif change == "event":
-                    self.broker()._cycle_account_event("ACCOUNT_UPDATE")
+                    self.broker()._private_account_event("ACCOUNT_UPDATE")
                 else:
                     result[0]["long"].timestamp -= 20
                 return result
@@ -592,7 +521,7 @@ class PairBoundedLiveTests(unittest.TestCase):
             self.assertIsNone(self.f.store.get("pair_deleted_watch:gold"))
 
     def test_market_recovery_never_queries_full_account_open_orders(self):
-        from tests.test_cycle_account_snapshot import ORDERS
+        from tests.account_fixtures import ORDERS
         for orders in (None, {"orders": []}, [{"symbol": "SPCXUSD1"}]):
             self.ready()
             self.broker().api.responses[ORDERS] = orders
@@ -606,7 +535,7 @@ class PairBoundedLiveTests(unittest.TestCase):
                                 for broker in self.live.values()))
 
     def test_fresh_full_account_reads_allow_unknown_adoption_without_requery(self):
-        from tests.test_cycle_account_snapshot import ORDERS
+        from tests.account_fixtures import ORDERS
         self.ready()
         for broker in self.live.values():
             broker.api.calls.clear()
@@ -628,7 +557,7 @@ class PairBoundedLiveTests(unittest.TestCase):
                 if change == "identity":
                     self.broker().api.credentials["user"] = "0x" + "9" * 40
                 elif change == "event":
-                    self.broker()._cycle_account_event("ACCOUNT_UPDATE")
+                    self.broker()._private_account_event("ACCOUNT_UPDATE")
                 else:
                     result[0]["long"].timestamp -= 20
                 return result

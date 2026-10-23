@@ -7,7 +7,7 @@ from tests import test_pair_trading as fixtures
 from trading.exchange import BudgetWait, ExchangeError, LiveBroker, RateBudget, RequestNotSent
 from trading.execution import Executor
 from trading.models import AccountModeError, TradingError, dec, wire
-from trading.pair_execution import runtime_default
+from tests.pair_legacy_fixtures import runtime_default
 from trading.paper import PAPER_BRACKETS
 
 
@@ -90,7 +90,7 @@ class PairBudgetTests(TestCase):
             self.assertEqual(sum(path == MULTI for _, path, _ in broker.api.calls), 1)
         broker = self.brokers["long"]
         broker.api.hedge = False
-        broker._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+        broker._private_account_event("ACCOUNT_CONFIG_UPDATE")
         with self.assertRaises(TradingError):
             guards["long"]()
         fresh, _ = self.trader._read(self.brokers, "XAUUSD1")
@@ -110,21 +110,6 @@ class PairBudgetTests(TestCase):
             self.assertTrue(all(flags[0] for _, _, flags in broker.api.calls))
         for guard in guards.values():
             guard()
-
-    def test_due_close_uses_reserve_without_a_hot_snapshot(self):
-        self.assertEqual(self.tick()["phase"], "holding")
-        self.expire()
-        self.live_brokers()
-        self.budget.reserve(1500)
-        with patch.object(self.brokers["long"], "cycle_hot_snapshot", side_effect=AssertionError("stale hot data")), \
-             patch.object(self.brokers["short"], "cycle_hot_snapshot", side_effect=AssertionError("stale hot data")):
-            state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assertEqual(state["progress"]["completed_cycles"], 1)
-        self.assertLessEqual(self.budget.snapshot()["used"], 1800)
-        for key, broker in self.brokers.items():
-            self.assertTrue(all(flags[0] for _, _, flags in broker.api.calls))
-            self.assertEqual(dec(self.paper[key].state["positions"][SYMBOL + ":" + key.upper()]["qty"]), 0)
 
     def test_opening_cannot_spend_recovery_reserve(self):
         self.live_brokers()

@@ -5,7 +5,6 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from tests import test_leverage_selection_recovery as ordinary_fixtures
-from tests import test_migration_engine as migration_fixtures
 
 XAU = ordinary_fixtures.XAU
 
@@ -53,30 +52,3 @@ class RecoveryEngineTests(unittest.TestCase):
                 self.engine.record_batch_outcome("test", executor)
                 self.assertIsNone(self.f.store.get("order_cooldown:test:" + XAU))
                 self.assertFalse(any("无新增仓位" in event["message"] for event in self.f.store.events()))
-
-
-class MigrationRecoverySelectionTests(unittest.TestCase):
-    setUp = migration_fixtures.MigrationEngineTests.setUp
-    refresh = migration_fixtures.MigrationEngineTests.refresh
-    save_paper = migration_fixtures.MigrationEngineTests.save_paper
-
-    def test_cooling_target_does_not_prevent_other_migration_target(self):
-        self.f.broker.state["leverages"]["XAUUSD1"] = 10
-        self.save_paper()
-        with patch("trading.engine.leverage_cooldown_active", side_effect=lambda store, account, broker, symbol, target:
-                   symbol == "SPCXUSD1" and target == 10):
-            self.engine.tick_account("test")
-        pending = self.f.store.intent("test")
-        self.assertEqual((pending["kind"], pending["symbol"], pending["target"]), ("leverage", "CLUSD1", 10))
-
-    def test_stopping_migration_clears_auto_resume_with_pending_request(self):
-        self.f.broker.state["leverages"]["XAUUSD1"] = 10
-        self.save_paper()
-        self.engine.tick_account("test")
-        self.assertIsNotNone(self.f.store.intent("test"))
-        self.f.store.put("recovery_auto_pause:test", {"intent_id": "old"})
-        self.engine.configure("test", {"migration": {"enabled": False}})
-        self.assertIsNone(self.f.store.get("recovery_auto_pause:test"))
-        account = self.f.store.account("test")
-        self.assertFalse(account["enabled"])
-        self.assertFalse(account["migration"]["enabled"])

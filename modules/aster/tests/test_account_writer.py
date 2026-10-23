@@ -23,7 +23,8 @@ from trading.paper import DemoMarket
 from trading.store import Store
 from trading.account_writer import ManagedWriter, digest
 from trading.pairing import validate_pair
-from trading.pair_execution import PairTrader, empty_progress
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import empty_progress
 from trading.recovery import broker_identity
 from trading.margin_balance import MarginBalancer
 
@@ -53,7 +54,6 @@ class AccountWriterTests(unittest.TestCase):
         for aid in ("long", "short"):
             self.store.save_account(account(aid, mode="live"))
         self.engine = Engine(self.store, market=DemoMarket())
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.addCleanup(self.engine.account_writer.close)
         self.requests = []
         self.fail_write = False
@@ -202,7 +202,7 @@ class AccountWriterTests(unittest.TestCase):
             member["enabled"] = False
             self.store.save_account(member)
         value = validate_pair({"id": "gold", "name": "gold", "long_account_id": "long", "short_account_id": "short",
-            "cycle": {"enabled": False}, "ordinary": {"enabled": True},
+            "ordinary": {"enabled": True},
             "margin": {"enabled": margin, "master_env_prefix": "ASTER_MASTER" if margin else ""}})
         return self.store.save_pair(value, create=True)
 
@@ -214,7 +214,7 @@ class AccountWriterTests(unittest.TestCase):
         pending = {"id": "crash-pair-original", "kind": "ordinary", "phase": "open", "symbol": "XAUUSD1",
             "identities": identities, "created_at": time.time(), "quantity": "1", "before": {"LONG": "0", "SHORT": "0"},
             "target": {"LONG": "1", "SHORT": "1"}, "leverage": 5, "legs": legs, "repairs": [], "repair_attempts": 0,
-            "config": {**pair["cycle"], "leverage": 5}}
+            "config": {"symbol": pair["symbol"], "leverage": 5}}
         return {"symbol": "XAUUSD1", "phase": "reconciling", "identities": identities,
             "owned": {"LONG": "0", "SHORT": "0"}, "progress": empty_progress(), "pending": pending, "daily_volume": {}}
 

@@ -7,7 +7,6 @@ function pair(timestamp = 100, state = {}) {
     id: 'pair-a',
     enabled: true,
     ordinary: { enabled: true },
-    cycle: { enabled: false },
     margin: { enabled: false },
     state: {
       phase: 'waiting',

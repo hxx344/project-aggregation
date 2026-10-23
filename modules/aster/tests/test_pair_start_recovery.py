@@ -33,7 +33,7 @@ class PairStartRecoveryTests(unittest.TestCase):
         with ExitStack() as stack:
             writes = []
             for key in ("long", "short"):
-                for method in ("submit", "cancel", "set_leverage", "set_cycle_leverage"):
+                for method in ("submit", "cancel", "set_leverage"):
                     writes.append(stack.enter_context(patch.object(self.broker(key), method,
                                                     side_effect=AssertionError("must preserve actual positions"))))
             for method in ("tick", "_paper", "_submit_live"):
@@ -78,9 +78,7 @@ class PairStartRecoveryTests(unittest.TestCase):
         self.assertIsNone(state["pending"])
         self.assertEqual({side: dec(qty) for side, qty in state["owned"].items()},
                          {side: dec(quantity) for side in owned})
-        self.assertEqual(state["progress"]["baseline"], state["owned"])
-        self.assertEqual(state["progress"]["quantities"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(state["progress"]["completed_cycles"], original["progress"]["completed_cycles"])
+        self.assertEqual(state["progress"], original["progress"])
         self.assertNotIn("attention", state)
         batch = self.f.store.get("pair_batch:" + original["pending"]["id"])
         self.assertEqual(batch["legs"], original["pending"]["legs"])
@@ -115,7 +113,6 @@ class PairStartRecoveryTests(unittest.TestCase):
             self.assertNotIn(receipt["clientOrderId"], str(batch))
         self.engine.pairs.enable("gold", False)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
-        self.addCleanup(restarted.dashboard_reports.close)
         with patch("trading.paper.PaperBroker.submit", side_effect=AssertionError("no repeat repair")):
             restarted.pairs.tick("gold")
         self.assertEqual(self.state()["daily_volume"], state["daily_volume"])

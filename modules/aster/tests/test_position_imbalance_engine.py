@@ -2,15 +2,12 @@
 from contextlib import ExitStack
 import os
 import threading
-from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from tests.helpers import Fixture, account
 from trading import monitoring, position_observations as observations
 from trading.engine import Engine
-from trading.exchange import LiveBroker
-from trading.models import TradingError
 from trading.store import Store, dumps
 
 
@@ -38,7 +35,6 @@ class PositionObservationTests(unittest.TestCase):
         self.account = {**self.f.account, "mode": "live", "enabled": False}
         self.f.store.save_account(self.account)
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.now = 1000.0
         clock = patch("trading.engine.time.time", side_effect=lambda: self.now)
         clock.start()
@@ -220,7 +216,7 @@ class PositionObservationTests(unittest.TestCase):
             with self.subTest(interval=interval):
                 self.sender.reset_mock()
                 self.f.store.put("position_imbalance_notifications", {})
-                configured = {**pair, "ordinary": {"enabled": False}, "cycle": {"enabled": False},
+                configured = {**pair, "ordinary": {"enabled": False},
                     "margin": {"enabled": True, "check_interval_seconds": interval}}
                 with self.f.store.connect() as db:
                     db.execute("UPDATE pairs SET data=? WHERE id='pair'", (dumps(configured),))
@@ -239,7 +235,7 @@ class PositionObservationTests(unittest.TestCase):
                 self.assertIn("CLUSD1", self.sender.call_args.args[1])
 
     def test_margin_only_interruption_beyond_polling_allowance_restarts_twenty_second_confirmation(self):
-        pair = {**self.pair(), "ordinary": {"enabled": False}, "cycle": {"enabled": False},
+        pair = {**self.pair(), "ordinary": {"enabled": False},
             "margin": {"enabled": True, "check_interval_seconds": 300}}
         with self.f.store.connect() as db:
             db.execute("UPDATE pairs SET data=? WHERE id='pair'", (dumps(pair),))
@@ -368,23 +364,6 @@ class PositionObservationTests(unittest.TestCase):
         queued = self.f.store.due_notifications()[0]
         self.f.store.save_intent(pending())
         self.assertIsNone(self.f.store.notification_for_delivery(queued["id"]))
-
-    def test_existing_hot_cache_can_supply_evidence_but_revoked_lease_cannot(self):
-        account_state = self.f.store.account("test")
-        account_state["cycle"]["enabled"] = True
-        self.f.store.save_account(account_state)
-        broker = object.__new__(LiveBroker)
-        evidence = snapshot(self.now)
-        lease = Mock(snapshot=SimpleNamespace(timestamp=self.now, open_orders=[],
-            positions=[SimpleNamespace(**p) for p in evidence["positions"]]))
-        broker.cycle_cache = Mock()
-        broker.cycle_cache.lease.return_value = lease
-        self.engine.brokers["test"] = broker
-        row = next(r for r in self.collect() if r["symbol"] == "XAUUSD1")
-        self.assertEqual((row["long_qty"], row["short_qty"]), ("2", "1"))
-        lease.require_fresh.side_effect = TradingError("revoked")
-        row = next(r for r in self.collect() if r["symbol"] == "XAUUSD1")
-        self.assertIsNone(row["long_qty"])
 
     def test_external_open_orders_suppress_and_missing_positions_are_not_zero(self):
         self.publish()

@@ -90,12 +90,7 @@ export function OrdinaryWorkspace({
               </SelectContent>
             </Select>
           </div>
-          <OrdinaryConditions
-            view={ordinaryConditions}
-            cycleSymbolActive={Boolean(
-              account?.cycle?.enabled && account.cycle.symbol === focus,
-            )}
-          />
+          <OrdinaryConditions view={ordinaryConditions} />
           <div className="strategy-state">
             <i
               className={`dot ${account?.enabled && !focusedOrdinaryBlock ? 'mint-bg' : 'amber-bg'}`}
@@ -171,7 +166,7 @@ export function OrdinaryWorkspace({
                 ]}
               >
                 <span>
-                  指定后，普通开仓与升杠杆仅操作所选交易对。循环与迁移按各自设置执行。
+                  指定后，普通开仓与升杠杆仅操作所选交易对。
                 </span>
               </ConfigurationField>
               <ConfigurationField

@@ -37,8 +37,8 @@ class PrivateEventEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.broker = LiveBroker(None, Mock(), api=Mock(budget=None))
         with patch.object(PrivateAccountStream, "start"):
-            self.broker.start_cycle_hot_data([SYMBOL])
-        self.stream = self.broker.cycle_stream
+            self.broker.start_private_stream()
+        self.stream = self.broker.private_stream
         self.stream._set_connected(True)
         self.addCleanup(self.broker.close)
         self.stamp = int(time.time() * 1000)
@@ -148,10 +148,10 @@ class PrivateEventEvidenceTests(unittest.TestCase):
         old._set_connected(True)
         self.assertFalse(self.broker.transfer_ws_checkpoint_current(checkpoint))
         self.assertIsNone(self.broker.order_event_receipt(ORDER))
-        self.broker.stop_cycle_hot_data()
+        self.broker.stop_private_stream()
         with patch.object(PrivateAccountStream, "start"):
-            self.broker.start_cycle_hot_data([SYMBOL])
-        self.stream = self.broker.cycle_stream
+            self.broker.start_private_stream()
+        self.stream = self.broker.private_stream
         self.stream._set_connected(True)
         self.emit(order_event(stamp=self.stamp))
         generation = self.broker._snapshot_generation
@@ -168,7 +168,7 @@ class PrivateEventEvidenceTests(unittest.TestCase):
         created_at = (self.stamp - 1) / 1000
         self.emit(balance_event(stamp=self.stamp))
         # Signed HTTP completion still invalidates snapshots after this event.
-        self.broker.invalidate_cycle_hot_data("账户写入结束")
+        self.broker.invalidate_account_reads("账户写入结束")
         evidence, guard = self.broker.transfer_ws_balance(checkpoint, Fraction(-10), created_at)
         json.dumps(evidence)
         self.assertEqual(evidence["source"], "websocket")
@@ -223,9 +223,9 @@ class PrivateEventEvidenceTests(unittest.TestCase):
                     guard()
 
     def test_transfer_guard_expires_on_time_write_disconnect_and_direct_account_event(self):
-        for invalidation in (lambda: self.broker.invalidate_cycle_hot_data("写入"),
+        for invalidation in (lambda: self.broker.invalidate_account_reads("写入"),
                              lambda: self.stream._set_connected(False),
-                             lambda: self.broker._cycle_account_event("ACCOUNT_UPDATE")):
+                             lambda: self.broker._private_account_event("ACCOUNT_UPDATE")):
             self.stream._set_connected(False)
             self.stream._set_connected(True)
             checkpoint = self.broker.transfer_ws_checkpoint("100")
@@ -259,7 +259,7 @@ class PrivateEventEvidenceTests(unittest.TestCase):
             finally:
                 done.set()
 
-        with self.broker._cycle_stream_callback_lock:
+        with self.broker._private_stream_callback_lock:
             thread = threading.Thread(target=verify)
             thread.start()
             self.assertTrue(done.wait(1))

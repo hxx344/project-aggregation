@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from tests.helpers import Fixture, account
 from trading.capacity_relay_server import RelayConfig
-from trading.engine import DEFAULT_POLICY, Engine, FAST_CAPACITY_POLL_INTERVAL, validate_account
+from trading.engine import DEFAULT_POLICY, Engine, validate_account
 from trading.exchange import LiveBroker, MarketData
 from trading.models import MARKET_SYMBOLS, SYMBOLS, TradingError, dec
 from trading.pairing import validate_pair
@@ -26,12 +26,12 @@ class PairMarketSymbolsTests(TestCase):
         for aid in ("test", "second"):
             self.f.store.save_account({**account(aid), "enabled": False})
 
-    def pair(self, *, cycle=False, mode="paper"):
+    def pair(self, *, mode="paper"):
         for aid in ("test", "second"):
             self.f.store.save_account({**account(aid, mode), "enabled": False})
         value = validate_pair({"id": "silver", "name": "白银配对", "symbol": SILVER,
             "long_account_id": "test", "short_account_id": "second", "enabled": True,
-            "cycle": {"enabled": cycle}, "ordinary": {"enabled": not cycle}})
+            "ordinary": {"enabled": True}})
         return self.f.store.save_pair(value, create=True)
 
     def test_active_pair_requires_its_market_even_when_original_monitors_are_all_on(self):
@@ -55,49 +55,17 @@ class PairMarketSymbolsTests(TestCase):
         self.assertIn(SILVER, self.engine.capacity_market_symbols())
         self.assertIn(SILVER, self.engine.monitored_market_symbols())
 
-    def test_pair_ordinary_and_cycle_capacity_targets_use_selected_market_and_leverage(self):
-        pair = self.pair()
+    def test_pair_ordinary_capacity_targets_use_selected_market_and_leverage(self):
+        self.pair()
         self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts()), {SILVER: {5, 10, 20}})
-        pair = {**pair, "ordinary": {**pair["ordinary"], "enabled": False},
-                "cycle": {**pair["cycle"], "enabled": True}}
-        self.f.store.save_pair(pair)
-        self.f.store.put("pair_runtime:silver", {"snapshots": {
-            side: {"timestamp": time.time(), "positions": [
-                {"symbol": GOLD, "leverage": 20}, {"symbol": SILVER, "leverage": 7}]}
-            for side in ("long", "short")}})
-        self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts()), {SILVER: {7}})
-        intervals, _, enabled = self.engine.capacity_poll_schedule({SILVER: {7}})
-        self.assertTrue(enabled)
-        self.assertEqual(intervals[SILVER], FAST_CAPACITY_POLL_INTERVAL)
 
-    def test_live_cycle_capacity_reads_silver_hot_leverage(self):
-        self.pair(cycle=True, mode="live")
-        brokers = [Mock(spec=LiveBroker), Mock(spec=LiveBroker)]
-        for aid, broker in zip(("test", "second"), brokers):
-            broker.cycle_cache = Mock()
-            broker.cycle_cache.current_leverage.return_value = 7
-            self.engine.brokers[aid] = broker
-        with patch.object(self.engine, "live_allowed", return_value=True):
-            self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts()), {SILVER: {7}})
-        for broker in brokers:
-            broker.cycle_cache.current_leverage.assert_called_once_with(SILVER)
-
-    def test_pair_private_stream_and_public_signals_follow_silver(self):
+    def test_pair_private_stream_follows_silver(self):
         self.pair(mode="live")
         broker = Mock(spec=LiveBroker)
         with patch.object(self.engine, "live_allowed", return_value=True), \
                 patch.object(self.engine, "broker", return_value=broker):
-            self.assertEqual(self.engine.poll_cycle_hot_data("test"), 30)
-        self.assertEqual(broker.start_cycle_hot_data.call_args.args, ([SILVER],))
-        self.engine.on_cycle_market_update(SILVER, "depth", time.time(), time.monotonic())
-        self.assertTrue(self.engine.fresh_cycle_signal(self.engine.cycle_market_updates[SILVER]))
-
-    def test_pair_cycle_capacity_explicitly_accepts_silver_but_account_default_does_not(self):
-        pair = self.pair(cycle=True)
-        self.engine.markets[SILVER] = {"status": "ok", "checked_at": time.time(), "capacities": {"5": "1000000"}}
-        with self.assertRaises(TradingError):
-            self.engine.require_cycle_open_capacity(pair["cycle"], 5)
-        self.assertEqual(self.engine.require_cycle_open_capacity(pair["cycle"], 5, symbols=MARKET_SYMBOLS), dec("1000000"))
+            self.assertEqual(self.engine.poll_private_stream("test"), 30)
+        self.assertEqual(broker.start_private_stream.call_args.args, ())
 
     def test_capacity_failure_is_isolated_and_silver_does_not_report_a_notification_error(self):
         self.pair()
@@ -163,8 +131,6 @@ class PairMarketSymbolsTests(TestCase):
         book = self.f.market.book(SILVER)
         self.assertGreaterEqual(book.bid * book.bid_qty, 1000)
         self.assertGreaterEqual(book.ask * book.ask_qty, 1000)
-        bids, asks = self.f.market.depth(SILVER).sweeps
-        self.assertGreaterEqual(min(bids.notional, asks.notional), 1000)
         receipt, = self.f.broker.submit([{"symbol": SILVER, "positionSide": "LONG", "side": "BUY",
             "type": "MARKET", "quantity": "19", "newClientOrderId": "silver-order"}])
         self.assertEqual(receipt["status"], "FILLED")
@@ -203,7 +169,6 @@ class PairMarketSymbolsTests(TestCase):
         api.call.return_value = {"E": now, "T": now, "lastUpdateId": 12,
             "bids": [["52.31", "100"]], "asks": [["52.32", "100"]]}
         market.depth(SILVER).require_fresh()
-        market.cycle_depth(SILVER).require_fresh()
         self.assertEqual(api.call.call_args.args[2]["symbol"], SILVER)
 
     def test_relay_default_includes_silver_and_explicit_configuration_is_preserved(self):

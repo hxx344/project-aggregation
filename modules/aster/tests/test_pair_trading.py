@@ -1,6 +1,5 @@
 """Offline regressions for two independent collateral budgets and recovery."""
 from copy import deepcopy
-from dataclasses import replace
 from fractions import Fraction
 import tempfile
 import threading
@@ -9,13 +8,12 @@ from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
-from tests.helpers import account, seed_cycle_capacity
-from trading.cycle import DEFAULT_CYCLE
+from tests.helpers import account, seed_market_capacity
 from trading.engine import Engine
 from trading.exchange import AmbiguousOrder, ExchangeError
 from trading.models import TradingError, dec
 from trading.pair_execution import PairTrader
-from trading.pair_planning import plan_paired_cycle, plan_ordinary, PairPositionError
+from trading.pair_planning import plan_ordinary
 from trading.pairing import validate_pair
 from trading.paper import DemoMarket, PaperBroker
 from trading.store import Store
@@ -36,15 +34,19 @@ class PairTradingTests(TestCase):
             self.brokers[key] = PaperBroker(key, self.market, self.store)
             self.engine.brokers[key] = self.brokers[key]
         self.pair = self.store.save_pair(validate_pair({"id": "gold", "name": "黄金配对", "long_account_id": "long",
-            "short_account_id": "short", "enabled": True, "cycle": {"enabled": True}}), create=True)
+            "short_account_id": "short", "enabled": True, "ordinary": {"enabled": True}}), create=True)
         self.trader = PairTrader(self.engine)
-        seed_cycle_capacity(self.engine)
+        seed_market_capacity(self.engine)
+        self.engine.markets["XAUUSD1"]["capacities"] = {"5": "1000000", "10": "0", "20": "0"}
         self.margin = patch("trading.margin_balance.MarginBalancer.tick", return_value={"blocks_trading": False})
         self.margin.start()
         self.addCleanup(self.margin.stop)
 
     def tick(self):
-        seed_cycle_capacity(self.engine)
+        seed_market_capacity(self.engine)
+        current = max(broker.state["leverages"]["XAUUSD1"] for broker in getattr(self, "paper", self.brokers).values())
+        self.engine.markets["XAUUSD1"]["capacities"] = {
+            str(leverage): "1000000" if leverage <= current else "0" for leverage in (5, 10, 20)}
         return self.trader.tick(self.store.pair("gold"))
 
     def snapshots(self):
@@ -71,14 +73,15 @@ class PairTradingTests(TestCase):
         with patch.object(self.brokers["long"], "submit", side_effect=lambda rows: send("long", rows)), \
              patch.object(self.brokers["short"], "submit", side_effect=lambda rows: send("short", rows)):
             state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
+        self.assertEqual(state["phase"], "waiting", state)
         self.assertIsNone(state["pending"])
-        self.assertEqual(state["progress"]["quantities"]["LONG"], state["progress"]["quantities"]["SHORT"])
-        self.expire()
+        self.assertEqual(state["owned"]["LONG"], state["owned"]["SHORT"])
+        owned = deepcopy(state["owned"])
+        pair = self.store.save_pair({**self.store.pair("gold"), "enabled": False})
         self.trader = PairTrader(self.engine)
-        state = self.tick()
-        self.assertEqual(state["progress"]["completed_cycles"], 1, state)
-        self.assert_flat()
+        state = self.trader.tick(pair)
+        self.assertEqual(state["owned"], owned)
+        self.assertEqual(len(self.brokers["long"].state["orders"]), 1)
 
     def test_reject_one_leg_reduces_other_without_opening_missing_leg(self):
         with patch.object(self.brokers["short"], "submit", side_effect=ExchangeError("余额不足", code=-2019)):
@@ -100,7 +103,7 @@ class PairTradingTests(TestCase):
         with patch.object(self.brokers["long"], "submit", side_effect=timeout) as send:
             state = self.tick()
         self.assertEqual(send.call_count, 1)
-        self.assertEqual(state["phase"], "holding", state)
+        self.assertEqual(state["phase"], "waiting", state)
         self.assertEqual(len(self.brokers["long"].state["orders"]), 1)
 
     def test_unknown_live_style_query_blocks_retries_and_margin(self):
@@ -116,63 +119,15 @@ class PairTradingTests(TestCase):
             self.assertEqual(state["pending"]["legs"][0]["order"], frozen[0]["order"])
             self.assertEqual(state["phase"], "reconciling")
 
-    def test_paused_cycle_reduces_increment_without_waiting_timer(self):
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding")
-        value = self.store.pair("gold")
-        value["enabled"] = False
-        self.store.save_pair(value)
-        state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assertEqual(state["progress"]["completed_cycles"], 1)
-        self.assert_flat()
-        count = len(self.brokers["long"].state["orders"])
-        self.tick()
-        self.assertEqual(len(self.brokers["long"].state["orders"]), count)
-
-    def test_cycle_only_opens_and_reduces_its_own_legs_with_other_positions_present(self):
-        external = {}
-        for key, other_side in (("long", "SHORT"), ("short", "LONG")):
-            broker = self.brokers[key]
-            for symbol in ("XAUUSD1", "XAGUSD1"):
-                position_key = symbol + ":" + other_side
-                broker.state["positions"][position_key].update(qty="1", entry=str(self.market.book(symbol).mark))
-                external[key, position_key] = deepcopy(broker.state["positions"][position_key])
-            broker.save()
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
-        self.assertGreater(dec(state["progress"]["quantities"]["LONG"]), 0)
-        self.expire()
-        state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assertEqual(state["progress"]["completed_cycles"], 1)
-        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
-        for (key, position_key), original in external.items():
-            self.assertEqual(self.brokers[key].state["positions"][position_key], original)
-        for key, broker in self.brokers.items():
-            self.assertEqual(len(broker.state["orders"]), 2)
-            self.assertEqual({(row["symbol"], row["positionSide"]) for row in broker.state["orders"].values()},
-                             {("XAUUSD1", key.upper())})
-            self.assertEqual(dec(broker.state["positions"]["XAUUSD1:" + key.upper()]["qty"]), 0)
-
     def test_weak_subaccount_limits_quantity_despite_large_combined_equity(self):
         self.brokers["long"].state["wallet"] = "50"
         self.brokers["long"].save()
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
-        qty = dec(state["progress"]["quantities"]["LONG"])
-        self.assertLess(qty, dec("0.04"))
+        value = deepcopy(self.pair)
+        value["ordinary"]["order_notional"] = "500"
+        with self.assertRaises(TradingError):
+            plan_ordinary(value, self.snapshots(), self.market.book("XAUUSD1"),
+                          self.market.rules["XAUUSD1"], {5: "1000000"})
         self.assertLess(self.snapshots()["long"].ratio, dec("0.55"))
-
-    def test_closing_does_not_require_opening_fees_or_capital_or_daily_allowance(self):
-        state = self.tick()
-        self.expire()
-        state = self.store.get("pair_runtime:gold")
-        snapshots = {key: replace(snap, equity=dec("-1"), available=dec("-5"), fees={}, brackets={}, current_leverage_caps={})
-                     for key, snap in self.snapshots().items()}
-        plan = plan_paired_cycle(self.pair, snapshots, self.market.book("XAUUSD1"), self.market.depth("XAUUSD1"),
-                                 self.market.rules["XAUUSD1"], state["progress"])
-        self.assertEqual(plan.phase, "close")
 
     def test_public_capacity_counts_both_accounts_not_each_independently(self):
         value = deepcopy(self.pair)
@@ -181,43 +136,6 @@ class PairTradingTests(TestCase):
         book = self.market.book("XAUUSD1")
         plan = plan_ordinary(value, self.snapshots(), book, self.market.rules["XAUUSD1"], {5: "2000"})
         self.assertLessEqual(Fraction(plan.qty) * 2 * max(Fraction(book.ask), Fraction(book.mark)), 2000)
-
-    def test_daily_limit_is_checked_for_each_account(self):
-        value = self.store.pair("gold")
-        value["cycle"]["daily_volume_limit"] = "1000"
-        self.store.save_pair(value)
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
-        qty = dec(state["progress"]["quantities"]["LONG"])
-        self.assertLessEqual(2 * qty * self.market.book("XAUUSD1").ask, 1000)
-        self.expire()
-        self.tick()
-        count = len(self.brokers["long"].state["orders"])
-        state = self.tick()
-        self.assertEqual(len(self.brokers["long"].state["orders"]), count)
-        self.assertNotEqual(state["phase"], "holding")
-
-    def test_ordinary_baseline_survives_switch_to_cycle(self):
-        pair = self.store.pair("gold")
-        pair["cycle"]["enabled"] = False
-        pair["ordinary"]["enabled"] = True
-        self.store.save_pair(pair)
-        for _ in range(4):
-            state = self.tick()
-            if dec(state["owned"]["LONG"]):
-                break
-        self.assertGreater(dec(state["owned"]["LONG"]), 0, state)
-        baseline = deepcopy(state["owned"])
-        pair = self.store.pair("gold")
-        pair["cycle"]["enabled"] = True
-        pair["ordinary"]["enabled"] = False
-        self.store.save_pair(pair)
-        state = self.tick()
-        self.assertEqual(state["phase"], "holding", state)
-        self.expire()
-        state = self.tick()
-        self.assertEqual(state["owned"], baseline)
-        self.assertEqual(self.snapshots()["long"].pair("XAUUSD1")[0].qty, dec(baseline["LONG"]))
 
     def test_final_configuration_change_prevents_both_submissions(self):
         original = self.trader._config_guard
@@ -233,23 +151,3 @@ class PairTradingTests(TestCase):
         self.assertIsNone(state["pending"], state)
         self.assert_flat()
         self.assertFalse(self.brokers["long"].state["orders"])
-
-    def test_partial_close_finishes_only_residual_and_preserves_baseline(self):
-        self.tick()
-        self.expire()
-        original = self.brokers["short"].submit
-        first = True
-        def partial(orders):
-            nonlocal first
-            if first:
-                first = False
-                original_book = self.market.book
-                with patch.object(self.market, "book", side_effect=lambda symbol: replace(original_book(symbol), ask_qty=dec("0.1"))):
-                    return original(orders)
-            return original(orders)
-        with patch.object(self.brokers["short"], "submit", side_effect=partial):
-            state = self.tick()
-        self.assertIsNotNone(state["pending"], state)
-        state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assert_flat()

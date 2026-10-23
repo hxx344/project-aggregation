@@ -10,7 +10,7 @@ from trading.exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, 
 from trading.models import MarkPrice, Position, TradingError, dec
 from trading.paper import PAPER_BRACKETS
 from .helpers import Fixture
-from .test_cycle_account_snapshot import ACCOUNT, RISK, LocalQuoteMarket, cycle_account_responses, risk_row
+from .account_fixtures import ACCOUNT, RISK, LocalQuoteMarket
 from .test_exchange_hardening import FixtureAPI, account_responses
 
 
@@ -39,7 +39,7 @@ class ZeroPositionMarkTests(unittest.TestCase):
         return LiveBroker({}, market, api=api), api, market
 
     def test_account_mark_recovery_ignores_stale_bbo_but_trading_still_rejects_it(self):
-        for method in ("snapshot", "cycle_snapshot"):
+        for method in ("snapshot", "margin_snapshot"):
             with self.subTest(method=method), patch("trading.exchange.time.time", return_value=100):
                 responses = ordinary_responses()
                 responses[RISK][0]["markPrice"] = "0E-8"
@@ -56,8 +56,6 @@ class ZeroPositionMarkTests(unittest.TestCase):
                 self.assertFalse(any(call[1] in ("/fapi/v3/ticker/bookTicker", "/fapi/v3/commissionRate") for call in api.calls))
                 with self.assertRaises(TradingError):
                     market.book(SYMBOL)
-                with self.assertRaises(TradingError):
-                    market.cycle_book(SYMBOL)
                 self.assertTrue(all(call[0] == "GET" for call in api.calls))
 
     def test_flat_and_held_zero_marks_use_one_fresh_price_for_both_sides(self):
@@ -169,25 +167,6 @@ class ZeroPositionMarkTests(unittest.TestCase):
             broker.snapshot([SYMBOL], fresh_modes=True)
         self.assertIsNone(broker.leverage_snapshot)
 
-    def test_cycle_background_read_recovers_zero_marks_with_consistent_risk(self):
-        for flat in (False, True):
-            with self.subTest(flat=flat):
-                responses = cycle_account_responses((SYMBOL,))
-                if not flat:
-                    for row in responses[ACCOUNT]["positions"]:
-                        row.update(positionAmt="1" if row["positionSide"] == "LONG" else "-1", entryPrice="100")
-                responses[RISK] = [risk_row(row) for row in responses[ACCOUNT]["positions"]]
-                responses[RISK][1]["markPrice"] = "0E-8"
-                broker, api, market = self.broker(responses)
-                market.connected.clear()
-                snapshot = broker.cycle_snapshot([SYMBOL])
-                self.assertEqual([p.mark for p in snapshot.positions], [50, 50])
-                self.assertEqual(snapshot.occupied_margin, 0 if flat else 20)
-                self.assertEqual(snapshot.unrealized, 0)
-                market.mark_price.assert_called_once_with(SYMBOL)
-                market.book.assert_not_called()
-                self.assertTrue(all(call[0] == "GET" for call in api.calls))
-
     def test_zero_mark_does_not_hide_account_position_mismatch(self):
         responses = ordinary_responses()
         responses[RISK][0].update(markPrice="0E-8", positionAmt="2")
@@ -197,15 +176,6 @@ class ZeroPositionMarkTests(unittest.TestCase):
         market.book.assert_not_called()
         market.mark_price.assert_not_called()
         self.assertIsNone(broker.leverage_snapshot)
-
-    def test_cycle_local_mark_needs_no_bbo_and_never_starts_rest(self):
-        broker, _, market = self.broker(ordinary_responses())
-        market._stream_book = Mock(side_effect=AssertionError("BBO should not be read"))
-        self.assertEqual(broker._cycle_local_mark(SYMBOL), dec(50))
-        market.connected.clear()
-        self.assertIsNone(broker._cycle_local_mark(SYMBOL))
-        market.mark_price.assert_not_called()
-        market.book.assert_not_called()
 
     def test_earlier_mark_is_revalidated_after_another_symbol_read(self):
         broker, _, market = self.broker(ordinary_responses())

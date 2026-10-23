@@ -1,12 +1,12 @@
 """Bounded original-request reads and fresh, read-only recovery evidence."""
 from copy import deepcopy
 from contextlib import nullcontext
-from fractions import Fraction
 import math
 import time
 
 from .exchange import LiveBroker, RequestNotSent
-from .models import TradingError, dec, hedge_balanced, wire
+from .models import TradingError, hedge_balanced, wire
+from .account_legacy import REMOVED_CONFIG_KEYS
 from .paper import PaperBroker
 
 MIN_CHECKS = 3
@@ -33,7 +33,7 @@ def broker_identity(account, broker):
 
 def recovery_config(account):
     return {key: deepcopy(value) for key, value in account.items()
-            if key not in ("enabled", "pause_reason")}
+            if key not in {"enabled", "pause_reason"} | REMOVED_CONFIG_KEYS}
 
 
 def observe(intent, account, broker):
@@ -149,17 +149,5 @@ def leverage_cooldown_active(store, account, broker, symbol, target, now=None):
     return (type(stamp) in (int, float) and math.isfinite(stamp)
             and (time.time() if now is None else now) < stamp
             and state.get("identity") == broker_identity(account, broker)
-            and state.get("config") == recovery_config(account)
+            and recovery_config(state.get("config") or {}) == recovery_config(account)
             and state.get("target") == target)
-
-
-def migration_planning_progress(progress):
-    """Plan the verified post-recovery segment, retaining unknown older totals."""
-    if not isinstance(progress, dict) or not isinstance(progress.get("recovery_origin"), dict):
-        return progress
-    result = deepcopy(progress)
-    for field in ("migrated_notional", "cumulative_notional_delta"):
-        result[field] = {side: wire(Fraction(dec(progress[field][side]))
-                                   - Fraction(dec(progress["recovery_origin"][field][side])))
-                         for side in ("LONG", "SHORT")}
-    return result

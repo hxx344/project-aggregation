@@ -105,67 +105,13 @@ export function pairOrderRecoveryBlock(pair: Pair): string {
   if (!pending || !Object.keys(pending).length)
     return '当前没有可手动核对的开仓批次';
   if (
-    (pending.kind !== 'ordinary' && pending.kind !== 'cycle') ||
+    pending.kind !== 'ordinary' ||
     pending.phase !== 'open'
   )
     return '仅支持符合条件的开仓待核对批次；减仓、杠杆或划转需继续原流程';
   if (typeof pending.id !== 'string' || !pending.id)
     return '当前批次缺少标识，请等待服务核对';
-  if (pending.kind === 'cycle') {
-    const progress = pair.state?.progress;
-    const quantities = progress?.quantities;
-    const before = pending.before;
-    const owned = pair.state?.owned;
-    const baseline = progress?.baseline;
-    if (
-      progress?.phase !== 'waiting_open' ||
-      !record(quantities) ||
-      Object.keys(quantities).length !== 2 ||
-      !(['LONG', 'SHORT'] as const).every(
-        (side) => normalizedQuantity(quantities[side]) === '0',
-      )
-    )
-      return '循环状态或新增仓位不符合手动核对条件，请继续原恢复流程';
-    if (
-      !record(before) ||
-      !record(owned) ||
-      !record(baseline) ||
-      !(['LONG', 'SHORT'] as const).every((side) => {
-        const quantity = normalizedQuantity(before[side]);
-        return (
-          quantity !== null &&
-          quantity === normalizedQuantity(owned[side]) &&
-          quantity === normalizedQuantity(baseline[side])
-        );
-      })
-    )
-      return '循环底仓记录不一致或不完整，请继续原恢复流程';
-    if (
-      !Array.isArray(pending.legs) ||
-      pending.legs.length !== 2 ||
-      !pending.legs.every(
-        (leg) =>
-          record(leg) &&
-          (leg.key === 'long' || leg.key === 'short') &&
-          leg.receipt === null &&
-          leg.dispatch === 'sending',
-      ) ||
-      new Set(pending.legs.map((leg) => leg.key)).size !== 2 ||
-      !Array.isArray(pending.repairs) ||
-      pending.repairs.length !== 0 ||
-      pending.repair_attempts !== 0
-    )
-      return '仅支持两侧回执均未知且尚无补偿的循环开仓，请继续原恢复流程';
-  }
   return '';
-}
-
-function normalizedQuantity(value: unknown): string | null {
-  if (typeof value !== 'string' || !/^\d+(?:\.\d+)?$/.test(value)) return null;
-  const [integer, fraction = ''] = value.split('.');
-  const whole = integer.replace(/^0+(?=\d)/, '');
-  const decimal = fraction.replace(/0+$/, '');
-  return decimal ? `${whole}.${decimal}` : whole;
 }
 
 export function pairOrderRecoveryReviewBlock(
@@ -186,8 +132,6 @@ export function pairOrderRecoverySkipBlock(pair: Pair): string {
   const block = pairOrderRecoveryBlock(pair);
   if (block) return block;
   const pending = pair.state?.pending;
-  if (pending?.kind !== 'ordinary')
-    return '仅普通开仓批次可跳过持仓核对；循环开仓须核对订单与实际持仓';
   if (
     !pending ||
     !Array.isArray(pending.legs) ||
@@ -220,12 +164,6 @@ export function pairOrderRecoverySkipBlock(pair: Pair): string {
     )
   )
     return '仍有未决划转，请先完成划转核对';
-  if (
-    Object.values(pair.state?.progress?.quantities ?? {}).some(
-      (qty) => Number(qty) !== 0,
-    )
-  )
-    return '仍有循环新增仓位，请继续原恢复流程';
   return '';
 }
 
@@ -264,12 +202,6 @@ export function pairBaselineRecoveryBlock(pair: Pair): string {
   if (pair.enabled) return '请先暂停配对组';
   if (pair.state?.pending) return '请先完成当前待核对批次';
   if (!pair.state?.recovery_watch) return '当前没有人工归档订单';
-  if (
-    Object.values(pair.state?.progress?.quantities ?? {}).some(
-      (qty) => Number(qty) !== 0,
-    )
-  )
-    return '仍有循环新增仓位，请继续原恢复流程';
   if (
     pair.state?.margin?.pending ||
     ['submitting', 'acknowledged', 'accepted', 'unknown'].includes(

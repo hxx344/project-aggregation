@@ -21,7 +21,8 @@ from trading.execution import Executor
 from trading.models import TradingError
 from trading.paper import DemoMarket
 from trading.margin_balance import MarginBalancer
-from trading.pair_execution import PairTrader, runtime_default
+from trading.pair_execution import PairTrader
+from tests.pair_legacy_fixtures import runtime_default
 from trading.pair_recovery import require_archived_orders_clear
 from trading.pairing import validate_pair
 from trading.server import create_app
@@ -37,7 +38,6 @@ class WorkspaceTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.store = Store(Path(self.directory.name) / "trading.sqlite3")
         self.engine = Engine(self.store, market=DemoMarket())
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.engine.process_lock.acquire()
         self.addCleanup(self.engine.process_lock.release)
         self.engine.thread = SimpleNamespace(is_alive=lambda: True)
@@ -158,7 +158,6 @@ class WorkspaceTests(unittest.TestCase):
         self.engine.process_lock.release()
         reopened = Store(self.store.path)
         restarted = Engine(reopened, market=DemoMarket())
-        self.addCleanup(restarted.dashboard_reports.close)
         restarted.process_lock.acquire()
         self.addCleanup(restarted.process_lock.release)
         restarted.thread = SimpleNamespace(is_alive=lambda: True)
@@ -186,8 +185,6 @@ class WorkspaceTests(unittest.TestCase):
         original = deepcopy(self.store.account("paper"))
         with patch.object(broker, "snapshot", side_effect=AssertionError("new work must not start")):
             self.assertEqual(self.engine.tick_account("paper"), 5)
-            self.assertEqual(self.engine.tick_cycle_account(value, broker, None), 5)
-            self.assertEqual(self.engine.tick_migration(value, None, broker), 5)
         with self.assertRaises(RequestNotSent):
             broker.set_leverage("XAUUSD1", 10)
         self.assertEqual(self.store.account("paper"), original)
@@ -686,7 +683,6 @@ class WorkspaceTests(unittest.TestCase):
         self.engine.process_lock.release()
         reopened = Store(self.store.path)
         restarted = Engine(reopened, market=DemoMarket())
-        self.addCleanup(restarted.dashboard_reports.close)
         restarted.process_lock.acquire()
         self.addCleanup(restarted.process_lock.release)
         restarted.thread = SimpleNamespace(is_alive=lambda: True)

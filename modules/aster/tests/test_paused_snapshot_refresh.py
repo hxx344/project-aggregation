@@ -21,28 +21,22 @@ class PausedSnapshotRefreshTests(TestCase):
         self.addCleanup(self.f.close)
         self.f.store.save_account({**self.f.account, "enabled": False})
         self.engine = Engine(self.f.store, market=self.f.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
         self.engine.brokers["test"] = self.f.broker
 
-    def configure(self, cycle_enabled, ordinary_symbol):
+    def configure(self, ordinary_symbol):
         account = self.f.store.account("test")
         account["policy"]["symbols"] = ["XAUUSD1", "SPCXUSD1"]
         self.f.store.save_account(account)
-        self.engine.configure("test", {
-            "cycle": {"enabled": cycle_enabled, "symbol": "XAUUSD1"},
-            "ordinary_symbol": ordinary_symbol,
-        })
+        self.engine.configure("test", {"ordinary_symbol": ordinary_symbol})
         symbols = ["XAUUSD1", "SPCXUSD1"]
         old = replace(self.f.broker.snapshot(symbols), timestamp=time.time() - 780)
         self.engine.view("test", snapshot=snapshot_json(old, symbols))
         return old
 
-    def test_paused_accounts_refresh_with_cycle_only_mixed_or_ordinary_configuration(self):
-        for enabled, selected in ((True, "XAUUSD1"), (True, "SPCXUSD1"), (False, "XAUUSD1")):
-            with self.subTest(cycle=enabled, ordinary=selected):
-                old = self.configure(enabled, selected)
-                progress = {"phase": "holding", "opened_at": time.time() - 900, "marker": "keep"}
-                self.f.store.put("cycle:test", progress)
+    def test_paused_accounts_refresh_with_any_ordinary_selection(self):
+        for selected in ("XAUUSD1", "SPCXUSD1"):
+            with self.subTest(ordinary=selected):
+                old = self.configure(selected)
                 with patch.object(self.f.broker, "snapshot", wraps=self.f.broker.snapshot) as read, \
                      patch.object(self.f.broker, "submit", side_effect=AssertionError("paused account must not trade")), \
                      patch.object(self.f.broker, "set_leverage", side_effect=AssertionError("paused account must not change leverage")):
@@ -52,11 +46,10 @@ class PausedSnapshotRefreshTests(TestCase):
                 self.assertGreater(view["snapshot"]["timestamp"], old.timestamp)
                 self.assertEqual(view["status"], "paused")
                 self.assertFalse(self.f.store.account("test")["enabled"])
-                self.assertEqual(self.f.store.get("cycle:test"), progress)
                 self.assertIsNone(self.f.store.intent("test"))
 
     def test_failed_paused_read_keeps_old_timestamp_then_recovers_on_next_attempt(self):
-        old = self.configure(True, "XAUUSD1")
+        old = self.configure("XAUUSD1")
         retained = deepcopy(self.engine.views["test"]["snapshot"])
         with patch.object(self.f.broker, "snapshot", side_effect=TradingError("Aster 网络连接失败")):
             self.engine.tick_account("test")
@@ -68,13 +61,12 @@ class PausedSnapshotRefreshTests(TestCase):
         self.assertFalse(self.f.store.account("test")["enabled"])
 
     def test_state_reports_current_display_cadence_without_exchange_reads(self):
-        self.configure(True, "XAUUSD1")
+        self.configure("XAUUSD1")
         saved = self.f.store.account("test")
         saved["mode"] = "live"
-        for enabled, cycling, expected in ((False, True, 60), (False, False, 60), (True, False, 10), (True, True, 2)):
-            with self.subTest(enabled=enabled, cycling=cycling):
+        for enabled, expected in ((False, 60), (True, 10)):
+            with self.subTest(enabled=enabled):
                 saved["enabled"] = enabled
-                saved["cycle"]["enabled"] = cycling
                 self.f.store.save_account(saved)
                 with patch.object(self.engine, "live_allowed", return_value=True), \
                      patch.object(self.f.broker, "snapshot", side_effect=AssertionError("state must not read exchange")):
@@ -82,13 +74,13 @@ class PausedSnapshotRefreshTests(TestCase):
                 self.assertEqual(row["snapshot_refresh"]["interval_seconds"], expected)
 
     def test_display_schedule_does_not_make_old_snapshot_valid_for_execution(self):
-        old = self.configure(True, "XAUUSD1")
-        self.assertEqual(self.engine.state()["accounts"][0]["snapshot_refresh"]["interval_seconds"], 60)
+        old = self.configure("XAUUSD1")
+        self.assertEqual(self.engine.state()["accounts"][0]["snapshot_refresh"]["interval_seconds"], 5)
         with self.assertRaises(TradingError):
             old.require_fresh()
 
     def test_paused_live_adapter_reads_account_with_only_get_requests(self):
-        old = self.configure(True, "XAUUSD1")
+        old = self.configure("XAUUSD1")
         saved = self.f.store.account("test")
         saved["mode"] = "live"
         saved["policy"]["symbols"] = ["XAUUSD1"]
@@ -108,9 +100,9 @@ class PausedSnapshotRefreshTests(TestCase):
 
     def test_scheduler_reads_moonshot_before_account_has_ever_been_started(self):
         # Exercise the actual scheduler, cold views and live adapter after a
-        # restart, including when the account has a saved cycle-only policy.
+        # restart, including when an old ledger still carries a retired cycle setting.
         for cycling in (False, True):
-            with self.subTest(cycling=cycling):
+            with self.subTest(legacy_cycle=cycling):
                 saved = self.f.store.account("test")
                 saved.update(mode="live", enabled=False)
                 saved["cycle"] = {"enabled": cycling, "symbol": "XAUUSD1"}
@@ -129,7 +121,6 @@ class PausedSnapshotRefreshTests(TestCase):
 
                 with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "0"}), \
                      patch.object(engine, "view", side_effect=publish), \
-                     patch.object(engine.dashboard_reports, "start"), \
                      patch.object(engine, "notify", return_value=60):
                     engine.start()
                     try:
@@ -158,7 +149,6 @@ class PausedSnapshotRefreshTests(TestCase):
 
         with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "0"}), \
              patch.object(self.engine, "view", side_effect=publish), \
-             patch.object(self.engine.dashboard_reports, "start"), \
              patch.object(self.engine, "notify", return_value=60):
             self.engine.start()
             try:

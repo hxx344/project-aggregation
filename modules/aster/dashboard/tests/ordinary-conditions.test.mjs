@@ -21,8 +21,7 @@ function fixture() {
           { symbol: 'XAUUSD1', side: 'SHORT', leverage: 2 },
         ],
       },
-      cycle: { enabled: true, symbol: 'XAUUSD1' },
-      ordinary_add_blocks: { XAUUSD1: '循环占用，普通加仓禁用' },
+      ordinary_add_blocks: { XAUUSD1: '未完成订单，普通加仓禁用' },
     },
     market: {
       status: 'ok',
@@ -44,7 +43,7 @@ test('a fast current-tier sample cannot renew other leverage timestamps', () => 
   );
 });
 
-test('cycle 2x leaves all three ordinary conditions visible without turning restrictions into condition failures', () => {
+test('unsupported 2x leaves all three ordinary conditions visible without turning restrictions into condition failures', () => {
   const result = view(fixture());
   assert.equal(result.currentLeverage, 2);
   assert.equal(result.leverageConstraint, 'unsupported');

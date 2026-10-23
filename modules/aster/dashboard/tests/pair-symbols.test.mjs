@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cycleDraft, parseCycleDraft } from '../lib/cycle.ts';
 import {
   DEFAULT_PAIR_SYMBOL,
   fetchPairSymbols,
@@ -96,14 +95,12 @@ test('HTTP, authentication and malformed catalog failures never invent supported
 
 test('gold and silver serialize the exact selected symbol for every pair mode', () => {
   for (const symbol of catalog) {
-    for (const mode of ['monitor', 'ordinary', 'cycle']) {
+    for (const mode of ['monitor', 'ordinary']) {
       const selected = selectPairSymbol({ ...draft(), mode }, symbol, catalog);
       const config = parsePairDraft(selected, accounts, [], undefined, catalog);
       const request = JSON.parse(JSON.stringify(config));
       assert.equal(request.symbol, symbol.symbol);
-      assert.equal(request.cycle.symbol, symbol.symbol);
       assert.equal(request.ordinary.enabled, mode === 'ordinary');
-      assert.equal(request.cycle.enabled, mode === 'cycle');
       assert.equal(Object.hasOwn(request, 'enabled'), false);
     }
   }
@@ -124,7 +121,6 @@ test('symbol selection follows catalog defaults without overwriting edited amoun
   assert.equal(selected.threshold, '12000');
   assert.equal(selected.order_notional, '1500');
   assert.equal(selected.spread_limit, '0.0004');
-  assert.equal(selected.cycle.symbol, 'XAGUSD1');
   assert.equal(
     selectPairSymbol({ ...draft(), order_notional: '2000.01' }, custom, catalog)
       .order_notional,
@@ -157,11 +153,9 @@ test('saved silver groups keep their symbol and remain editable without a catalo
   const edited = { ...pairDraft(saved), name: '白银组改名' };
   const parsed = parsePairDraft(edited, accounts, [saved], saved.id, []);
   assert.equal(parsed.symbol, 'XAGUSD1');
-  assert.equal(parsed.cycle.symbol, 'XAGUSD1');
   const changes = pairConfigurationChanges(parsed);
   assert.equal(changes.name, '白银组改名');
   assert.equal(changes.symbol, 'XAGUSD1');
-  assert.equal(changes.cycle.symbol, 'XAGUSD1');
   assert.throws(
     () =>
       parsePairDraft(
@@ -183,7 +177,7 @@ test('switching a saved pair preserves all settings and PATCH excludes its ident
     default_spread_limit: '0.0004',
   };
   const choices = [DEFAULT_PAIR_SYMBOL, customSilver];
-  for (const mode of ['monitor', 'ordinary', 'cycle']) {
+  for (const mode of ['monitor', 'ordinary']) {
     const saved = {
       ...parsePairDraft(
         {
@@ -193,12 +187,6 @@ test('switching a saved pair preserves all settings and PATCH excludes its ident
           margin_enabled: true,
           balance_threshold: '25.125',
           max_transfer: '2500',
-          cycle: {
-            ...draft().cycle,
-            min_notional: '1600',
-            max_notional: '2600',
-            daily_volume_limit: '15000',
-          },
         },
         accounts,
         [],
@@ -214,7 +202,6 @@ test('switching a saved pair preserves all settings and PATCH excludes its ident
     assert.deepEqual(selected, {
       ...original,
       symbol: 'XAGUSD1',
-      cycle: { ...original.cycle, symbol: 'XAGUSD1' },
     });
     assert.deepEqual(pairDraft(saved), original);
     const parsed = parsePairDraft(
@@ -231,7 +218,6 @@ test('switching a saved pair preserves all settings and PATCH excludes its ident
       name: saved.name,
       symbol: 'XAGUSD1',
       ordinary: saved.ordinary,
-      cycle: { ...saved.cycle, symbol: 'XAGUSD1' },
       margin: saved.margin,
       adl: saved.adl,
     });
@@ -253,82 +239,14 @@ test('switching a saved pair preserves all settings and PATCH excludes its ident
   }
 });
 
-test('saved pairs reject unknown changes and mismatched cycle symbols even in monitor mode', () => {
-  const saved = {
-    ...parsePairDraft(draft(), accounts, [], undefined, catalog),
-    enabled: false,
-  };
-  for (const mode of ['monitor', 'ordinary', 'cycle']) {
-    const original = { ...pairDraft(saved), mode };
+test('saved pairs reject unknown symbol changes in every remaining mode', () => {
+  const saved = { ...parsePairDraft(draft(), accounts, [], undefined, catalog), enabled: false };
+  for (const mode of ['monitor', 'ordinary']) {
     assert.throws(
-      () =>
-        parsePairDraft(
-          {
-            ...original,
-            symbol: 'UNKNOWN',
-            cycle: { ...original.cycle, symbol: 'UNKNOWN' },
-          },
-          accounts,
-          [saved],
-          saved.id,
-          catalog,
-        ),
+      () => parsePairDraft({ ...pairDraft(saved), mode, symbol: 'UNKNOWN' }, accounts, [saved], saved.id, catalog),
       /支持的配对标的/,
     );
-    assert.throws(
-      () =>
-        parsePairDraft(
-          { ...original, symbol: 'XAGUSD1' },
-          accounts,
-          [saved],
-          saved.id,
-          catalog,
-        ),
-      /必须与配对组一致/,
-    );
-    assert.throws(
-      () =>
-        parsePairDraft(
-          { ...original, cycle: { ...original.cycle, symbol: 'XAGUSD1' } },
-          accounts,
-          [saved],
-          saved.id,
-          [],
-        ),
-      /必须与配对组一致/,
-    );
   }
-});
-
-test('pair/cycle mismatches and unknown symbols are rejected, including disabled cycles', () => {
-  assert.throws(
-    () =>
-      parsePairDraft(
-        { ...draft(), symbol: 'XAGUSD1' },
-        accounts,
-        [],
-        undefined,
-        catalog,
-      ),
-    /必须与配对组一致/,
-  );
-  assert.throws(
-    () =>
-      parsePairDraft(
-        { ...draft(), symbol: 'UNKNOWN' },
-        accounts,
-        [],
-        undefined,
-        catalog,
-      ),
-    /支持的配对标的/,
-  );
-  assert.throws(
-    () => parseCycleDraft({ ...cycleDraft(), symbol: 'XAGUSD1' }),
-    /支持的循环品种/,
-  );
-  for (const symbol of ['XAUUSD1', 'SPCXUSD1', 'CLUSD1'])
-    assert.equal(parseCycleDraft({ ...cycleDraft(), symbol }).symbol, symbol);
 });
 
 test('legacy pair records and drafts without a symbol retain the gold default', () => {
@@ -338,7 +256,6 @@ test('legacy pair records and drafts without a symbol retain the gold default', 
   delete config.symbol;
   const restored = pairDraft(config);
   assert.equal(restored.symbol, 'XAUUSD1');
-  assert.equal(restored.cycle.symbol, 'XAUUSD1');
 });
 
 test('net quantities isolate gold and silver precisely and preserve unknown data', () => {

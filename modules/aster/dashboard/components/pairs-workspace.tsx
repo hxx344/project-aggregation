@@ -21,13 +21,11 @@ import {
 import { PairSettings } from '@/components/pair-settings';
 import { PairAdlPanel } from '@/components/pair-adl-panel';
 import { adlRecoveryBlock } from '@/lib/pair-adl';
-import { PairCycleCostsPanel } from '@/components/pair-cycle-costs';
 import { PairNotices } from '@/components/pair-notices';
 import { PairOrderDiagnostics } from '@/components/pair-order-diagnostics';
 import { PairOrderRecovery } from '@/components/pair-order-recovery';
 import { PairBaselineRecovery } from '@/components/pair-baseline-recovery';
 import { PairAccountPositions } from '@/components/pair-account-positions';
-import { CycleQualityHistoryPanel } from '@/components/cycle-quality-history';
 import {
   pairScheduledMarginWait,
   type PairNoticeState,
@@ -35,12 +33,12 @@ import {
 import { usePairNotices } from '@/lib/use-pair-notices';
 import { ExecutionEvents } from '@/components/execution-events';
 import type { Account, DeskAction, State } from '@/lib/desk-types';
-import type { ExecutionEvent } from '@/lib/cycle-events';
+import type { ExecutionEvent } from '@/lib/execution-events';
 import { useAccountDraft } from '@/lib/use-account-draft';
 import { usePairSymbols } from '@/lib/use-pair-symbols';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { clock, fmt, pct } from '@/lib/desk-format';
-import { migrationMarginLimit } from '@/lib/policy';
+import { extraMarginLimit } from '@/lib/policy';
 import {
   availablePairAccounts,
   pairConfigurationChanges,
@@ -53,7 +51,6 @@ import {
   pairMarginStatus,
   pairMarginOnly,
   pairNetQuantity,
-  pairPhaseLabel,
   pairSnapshotStatus,
   pairStartRecoveryBlock,
   pairTransferStatus,
@@ -338,16 +335,7 @@ function PairDetail({
   const locked = busy || offline || Boolean(configurationLock);
   const mode = pair.ordinary.enabled
     ? '普通市价共同开仓'
-    : pair.cycle.enabled
-      ? '两子账户多空循环'
-      : '保证金管理（不开仓）';
-  const progress =
-    pair.cycle.enabled ||
-    Object.values(pair.state?.progress?.quantities ?? {}).some(
-      (quantity) => Number(quantity) !== 0,
-    )
-      ? pair.state?.progress
-      : null;
+    : '保证金管理（不开仓）';
   const utcDate =
     now > 0 && Number.isFinite(now)
       ? new Date(now * 1000).toISOString().slice(0, 10)
@@ -471,13 +459,12 @@ function PairDetail({
               now={now}
               offline={offline}
               baseLimit={pair.ordinary.margin_limit}
-              cycle={pair.cycle.enabled}
               scheduledWait={Boolean(scheduledMarginWait)}
               dataWarning={noticeObservation?.data[side].confirmed ?? false}
             />
           ))}
         </div>
-        <div className="cycle-live-state">
+        <div className="execution-live-state">
           <p className={pending ? 'amber' : ''} aria-live="polite">
             {pairExecutionPhaseLabel(pair)}
             {reason ? ` · ${reason}` : ''}
@@ -501,13 +488,13 @@ function PairDetail({
           <p className="muted">
             {adlLock
               ? 'ADL 期间由应急处理接管核实与减仓，普通策略和新划转保持暂停。'
-              : '组暂停会阻止新开仓和新划转；已成交循环继续减回本轮基线，既有订单与划转请求继续查询。'}
+              : '组暂停会阻止新开仓和新划转；既有订单与划转请求继续查询。'}
           </p>
           {!pair.enabled ? (
             <p className="muted">
               {marginOnly
                 ? '启动时核验两个账户的归属与 USD1 余额；之后按余额差自动平衡，持仓标的和方向不影响划转。已有订单和划转记录继续按原编号核对。'
-                : '启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转，后续循环仅处理新增部分。未知划转重新读取两侧余额后自动归档跳过，不再额外预留旧金额；其他未决请求或循环仓位仍须先恢复。'}
+                : '启动会自动核对遗留普通开仓批次；订单全部结束且两侧数量一致时保留实际底仓，包括手动加仓。启动和核对不下单或划转。未知划转重新读取两侧余额后自动归档跳过，不再额外预留旧金额；其他未决请求仍须先恢复。'}
             </p>
           ) : null}
         </div>
@@ -527,23 +514,6 @@ function PairDetail({
               </span>
             </div>
             <dl className="pair-exec-grid">
-              <div>
-                <dt>本轮循环状态</dt>
-                <dd>
-                  {progress
-                    ? pairPhaseLabel(progress.phase)
-                    : pair.state
-                      ? '无活动循环'
-                      : '循环状态尚未提供'}
-                </dd>
-                <small>
-                  {progress?.opened_at
-                    ? `开仓确认 ${clock(progress.opened_at)}`
-                    : pair.cycle.enabled
-                      ? '尚无本轮开仓确认记录，执行进度见上方状态'
-                      : '普通底仓不参与循环减回'}
-                </small>
-              </div>
               <div>
                 <dt>订单与风险恢复</dt>
                 <dd className={pending ? 'amber' : ''}>
@@ -571,24 +541,6 @@ function PairDetail({
                       : '单侧异常时由配对组统一处理'}
                 </small>
               </div>
-              {progress ? (
-                <>
-                  <div>
-                    <dt>本轮新增数量 · A 多 / B 空</dt>
-                    <dd className="number-value">
-                      {progress.quantities?.LONG ?? '—'} /{' '}
-                      {progress.quantities?.SHORT ?? '—'}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>本轮基线数量 · A 多 / B 空</dt>
-                    <dd className="number-value">
-                      {progress.baseline?.LONG ?? '—'} /{' '}
-                      {progress.baseline?.SHORT ?? '—'}
-                    </dd>
-                  </div>
-                </>
-              ) : null}
               <div>
                 <dt>普通底仓数量 · A 多 / B 空</dt>
                 <dd className="number-value">
@@ -596,11 +548,11 @@ function PairDetail({
                   {pair.state?.owned?.SHORT ?? '—'}
                 </dd>
               </div>
-              <div className={progress ? 'wide' : ''}>
+              <div>
                 <dt>最近批次</dt>
                 <dd>
                   {lastBatch
-                    ? `${lastBatch.kind === 'cycle' ? '循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.resolution === 'manual_skip' ? '已手动跳过，启动时核实底仓' : lastBatch.completed ? '成交与持仓已核实' : '本批跟踪已结束，实际底仓已核实'} · ${clock(lastBatch.at)}`
+                    ? `${lastBatch.kind === 'cycle' ? '历史循环' : '普通'}${lastBatch.phase === 'open' ? '开仓' : '减回'} · ${lastBatch.resolution === 'manual_skip' ? '已手动跳过，启动时核实底仓' : lastBatch.completed ? '成交与持仓已核实' : '本批跟踪已结束，实际底仓已核实'} · ${clock(lastBatch.at)}`
                     : '暂无记录'}
                 </dd>
               </div>
@@ -627,17 +579,6 @@ function PairDetail({
           ))}
           <div className="pair-discs">
             <details className="disclosure panel">
-              <summary>配对循环成交质量</summary>
-              <CycleQualityHistoryPanel
-                key={pair.id}
-                scope="pair"
-                accountName={`配对组 · ${pair.name}`}
-                quality={pair.state?.execution_quality}
-                history={pair.state?.execution_quality_history}
-                stale={noticeObservation?.data.runtime.confirmed ?? false}
-              />
-            </details>
-            <details className="disclosure panel">
               <summary>配对执行记录</summary>
               <ExecutionEvents
                 events={(events ?? []).filter(
@@ -658,7 +599,7 @@ function PairDetail({
               <summary>
                 配对组设置{draft.dirty ? ' · 未保存' : ''}
                 <span className="disclosure-hint">
-                  标的 · 执行模式 · ADL · 普通开仓 · 循环 · 保证金平衡
+                  标的 · 执行模式 · ADL · 普通开仓 · 保证金平衡
                 </span>
               </summary>
               {configurationLock ? (
@@ -681,7 +622,7 @@ function PairDetail({
                       ) {
                         draft.clear();
                         setNotice(
-                          '已切换为仅保证金管理并保持暂停；点击“启动配对组”后才会按条件平衡保证金。原订单继续核对，已有循环仓位仍按原路径执行必要减仓。',
+                          '已切换为仅保证金管理并保持暂停；点击“启动配对组”后才会按条件平衡保证金。原订单继续核对。',
                         );
                       }
                     }}
@@ -689,7 +630,7 @@ function PairDetail({
                     切换为仅保证金管理
                   </Button>
                   <p className="muted">
-                    暂停后可关闭普通开仓与新循环、开启保证金管理；切换后仍保持暂停，未保存的设置草稿会撤销。原订单继续核对，已有循环仓位仍会执行必要减仓。
+                    暂停后可关闭普通开仓、开启保证金管理；切换后仍保持暂停，未保存的设置草稿会撤销。原订单继续核对。
                   </p>
                 </div>
               ) : null}
@@ -800,7 +741,7 @@ function PairDetail({
                 {pairMarginStatus(margin)}
               </span>
             </div>
-            <div className="cycle-live-state" aria-live="polite">
+            <div className="execution-live-state" aria-live="polite">
               <p>
                 {margin?.reason ||
                   (pair.margin.enabled
@@ -894,9 +835,9 @@ function PairDetail({
                 <dd>{fmt(dayVolume?.short)}</dd>
               </div>
             </dl>
-            <div className="cycle-live-state">
+            <div className="execution-live-state">
               <p className="muted">
-                仅计本组普通、循环及风险恢复的实际成交；两个子账户分别累计。
+                仅计本组普通及风险恢复的实际成交；两个子账户分别累计。
               </p>
               {pair.state?.volume_unknown ? (
                 <p className="amber">
@@ -905,10 +846,6 @@ function PairDetail({
               ) : null}
             </div>
           </section>
-          <PairCycleCostsPanel
-            report={pair.state?.cycle_costs}
-            stale={noticeObservation?.data.costs.confirmed ?? false}
-          />
         </div>
       </div>
       <Dialog
@@ -961,7 +898,6 @@ function PairSide({
   now,
   offline,
   baseLimit,
-  cycle,
   scheduledWait,
   dataWarning,
 }: {
@@ -973,7 +909,6 @@ function PairSide({
   now: number;
   offline: boolean;
   baseLimit: string;
-  cycle: boolean;
   scheduledWait: boolean;
   dataWarning: boolean;
 }) {
@@ -1022,9 +957,9 @@ function PairSide({
   const positions = snapshot?.positions.filter(
     (position) => position.symbol === symbol && Number(position.qty) !== 0,
   );
-  const highLimit = migrationMarginLimit(baseLimit);
+  const highLimit = extraMarginLimit(baseLimit);
   const limit =
-    cycle || positions?.some((position) => [10, 20].includes(position.leverage))
+    positions?.some((position) => [10, 20].includes(position.leverage))
       ? highLimit
       : baseLimit;
   const ratio =
@@ -1073,9 +1008,7 @@ function PairSide({
           className="pair-kpi-sub"
           title="维持保证金率 = 维持保证金 ÷ 本侧权益"
         >
-          {cycle
-            ? `循环上限 ${pct(highLimit)}`
-            : `5x ≤ ${pct(baseLimit)} · 10x / 20x ≤ ${pct(highLimit)}`}{' '}
+          {`5x ≤ ${pct(baseLimit)} · 10x / 20x ≤ ${pct(highLimit)}`}{' '}
           · 维持保证金率 {pct(snapshot?.margin_ratio)}
         </div>
       </div>

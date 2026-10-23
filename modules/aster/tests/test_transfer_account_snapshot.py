@@ -372,7 +372,7 @@ class TransferAccountSnapshotTests(TestCase):
     def test_leverage_paths_must_obtain_separate_trading_evidence(self):
         broker, api = self.broker()
         snapshot = broker.transfer_snapshot()
-        for setter, reader in ((broker.set_leverage, "snapshot"), (broker.set_cycle_leverage, "cycle_snapshot")):
+        for setter, reader in ((broker.set_leverage, "snapshot"),):
             with self.subTest(setter=setter.__name__), patch.object(broker, reader,
                     side_effect=TradingError("separate trading evidence required")) as trading_read:
                 with self.assertRaisesRegex(TradingError, "separate trading evidence"):
@@ -388,7 +388,7 @@ class TransferAccountSnapshotTests(TestCase):
 
                 def changed(*args, **kwargs):
                     result = original(*args, **kwargs)
-                    broker._cycle_account_event(event)
+                    broker._private_account_event(event)
                     return result
 
                 with patch.object(api, "call", side_effect=changed):
@@ -399,7 +399,7 @@ class TransferAccountSnapshotTests(TestCase):
     def test_events_after_read_revoke_currentness_and_another_read_does_not_restore_it(self):
         broker, _ = self.broker()
         snapshot = broker.transfer_snapshot()
-        broker._cycle_account_event("ACCOUNT_UPDATE")
+        broker._private_account_event("ACCOUNT_UPDATE")
         latest = broker.transfer_snapshot()
         broker.require_snapshot_current(latest)
         with self.assertRaisesRegex(TradingError, "失效"):

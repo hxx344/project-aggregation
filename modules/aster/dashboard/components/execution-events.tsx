@@ -1,7 +1,7 @@
 import { Activity } from 'lucide-react';
-import { CycleDiagnostic } from '@/components/cycle-diagnostic';
-import { cycleUtcTime } from '@/lib/cycle-daily';
-import { executionEventRows, type ExecutionEvent } from '@/lib/cycle-events';
+import { ExecutionDiagnostic } from '@/components/execution-diagnostic';
+import { utcTime } from '@/lib/format-time';
+import { executionEventRows, type ExecutionEvent } from '@/lib/execution-events';
 
 export function ExecutionEvents({ events }: { events: ExecutionEvent[] }) {
   const rows = executionEventRows(events).slice(0, 50);
@@ -19,7 +19,7 @@ export function ExecutionEvents({ events }: { events: ExecutionEvent[] }) {
               className={`event${isCheck ? ' event-check' : ''}`}
               key={row.key}
             >
-              <time title={cycleUtcTime(event.created_at)}>
+              <time title={utcTime(event.created_at)}>
                 {new Date(event.created_at * 1000).toLocaleTimeString('zh-CN', {
                   hour12: false,
                 })}
@@ -46,17 +46,17 @@ export function ExecutionEvents({ events }: { events: ExecutionEvent[] }) {
                   </p>
                   <p className="event-check-range">
                     <span>
-                      首次 <time>{cycleUtcTime(row.firstAt)}</time>
+                      首次 <time>{utcTime(row.firstAt)}</time>
                     </span>
                     <span>
-                      最近 <time>{cycleUtcTime(row.lastAt)}</time>
+                      最近 <time>{utcTime(row.lastAt)}</time>
                     </span>
                   </p>
                   <details className="event-check-details">
                     <summary>最新详情</summary>
                     <div className="event-check-detail-body">
                       <p>{event.message}</p>
-                      <CycleDiagnostic diagnostic={row.diagnostic} />
+                      <ExecutionDiagnostic diagnostic={row.diagnostic} />
                     </div>
                   </details>
                 </div>

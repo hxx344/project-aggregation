@@ -68,27 +68,27 @@ test('asset adapter uses cookie login, keeps USD totals separate from withdrawn 
 });
 
 test('aster adapter uses snapshot timestamps, leaves missing values null and reports USD1 units', async () => {
-  const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, updated_at: Date.now() / 1000, accounts: [{ enabled: true, mode: 'live', snapshot: { occupied_margin: '12.3', timestamp: 1600000000 }, cycle_state: { daily_volume: { volume: null } } }] } }) });
+  const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, updated_at: Date.now() / 1000, accounts: [{ enabled: true, mode: 'live', snapshot: { occupied_margin: '12.3', timestamp: 1600000000 } }] } }) });
   assert.equal(result.updatedAt, new Date(1600000000000).toISOString()); assert.equal(result.metrics.find(item => item.key === 'occupied_margin').unit, 'USD1'); assert.equal(result.metrics.find(item => item.key === 'daily_volume').value, null);
 });
 
-test('legacy ASTER describes each missing source and report failure without extra requests', async () => {
+test('legacy ASTER describes each missing source without extra requests and never counts single-account volume', async () => {
   const utcDate = new Date().toISOString().slice(0, 10);
-  const healthy = { name: '账户 A', enabled: true, mode: 'live', snapshot: { timestamp: Date.now() / 1000, occupied_margin: '12.3' }, cycle_state: { daily_volume: { utc_date: utcDate, volume: '42' }, report_status: { status: 'ready' } } };
+  const healthy = { name: '账户 A', enabled: true, mode: 'live', snapshot: { timestamp: Date.now() / 1000, occupied_margin: '12.3' } };
   const read = async data => {
     const calls = [];
     const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async (_base, route) => { calls.push(route); return { data }; } });
     assert.deepEqual(calls, ['/api/state?compact=true']); return result;
   };
-  assert.equal((await read({ ready: true, accounts: [healthy] })).partial, false);
+  for (const account of [healthy, { ...healthy, cycle_state: { daily_volume: { utc_date: utcDate, volume: '42' }, report_status: { status: 'error', error: '旧统计' } } }]) {
+    const single = await read({ ready: true, accounts: [account] });
+    const volume = single.metrics.find(item => item.key === 'daily_volume');
+    assert.equal(single.partial, false); assert.deepEqual(single.diagnostics, []);
+    assert.equal(volume.value, null); assert.match(volume.detail, /单账户不统计/);
+  }
   const cases = [
     [{ ...healthy, snapshot: null }, /账户 A：缺少账户快照/],
     [{ ...healthy, snapshot: { timestamp: null, occupied_margin: null } }, /账户 A：快照缺少有效更新时间.*账户 A：保证金数据缺失或无效/],
-    [{ ...healthy, cycle_state: {} }, /账户 A：成交统计尚未就绪/],
-    [{ ...healthy, cycle_state: { report_status: { status: 'error', error: '统计缓存读取失败' } } }, /账户 A：成交统计读取失败：统计缓存读取失败/],
-    [{ ...healthy, cycle_state: { report_status: { status: 'stale' } } }, /账户 A：成交统计已过期/],
-    [{ ...healthy, cycle_state: { ...healthy.cycle_state, daily_volume: { utc_date: '2000-01-01', volume: 42 } } }, /账户 A：成交统计缺少当日 UTC 数据/],
-    [{ ...healthy, cycle_state: { ...healthy.cycle_state, daily_volume: { utc_date: utcDate, volume: null } } }, /账户 A：今日成交量缺失或无效/],
   ];
   for (const [account, expected] of cases) {
     const result = await read({ ready: true, accounts: [account] }); assert.equal(result.partial, true); assert.match(result.message, expected);
@@ -130,7 +130,10 @@ test('legacy ASTER counts enabled pair members and reads their own snapshots and
   f.data.accounts[0].enabled = true; // Union membership never counts one account twice.
   f.data.accounts.push({ id: 'single', enabled: true, mode: 'live', snapshot: { timestamp: f.now, occupied_margin: '2' },
     cycle_state: { daily_volume: { utc_date: f.day, volume: '30' }, report_status: { status: 'ready' } } });
-  assert.deepEqual((await f.read()).values, { accounts: 3, live_accounts: 3, occupied_margin: 22, daily_volume: 250 });
+  const mixed = await f.read();
+  assert.deepEqual(mixed.values, { accounts: 3, live_accounts: 3, occupied_margin: 22, daily_volume: 220 });
+  assert.equal(mixed.partial, false);
+  assert.match(mixed.metrics.find(item => item.key === 'daily_volume').detail, /单账户不统计/);
 });
 
 test('legacy ASTER excludes paused pair members and paper pairs from live totals', async () => {
@@ -216,6 +219,8 @@ test('legacy ASTER keeps confirmed volume during normal submissions and leverage
   f.state.recovery_watch = { batches: ['old'] };
   f.state.phase = 'submitting';
   f.state.pending = { kind: 'cycle', phase: 'open', legs: [{ receipt: null, dispatch: 'sending' }, { receipt: { status: 'FILLED' } }], repairs: [] };
+  assert.equal((await f.read()).values.daily_volume, null);
+  f.state.pending.kind = 'ordinary';
   let result = await f.read();
   assert.equal(result.partial, false); assert.equal(result.values.daily_volume, 220);
   assert.match(result.metrics.find(metric => metric.key === 'daily_volume').detail, /配对仅统计已核对成交/);
@@ -394,14 +399,11 @@ test('legacy ASTER merges pair diagnostics by stable ID and uses runtime evidenc
   result = await f.read(); assert.deepEqual(result.diagnostics, []); assert.equal(result.values.daily_volume, 220);
 });
 
-test('legacy ASTER ordinary statistics delays stay notices while report and margin faults remain faults', async () => {
-  const data = { ready: true, accounts: [{ id: 'a', name: 'A', enabled: true, mode: 'live', snapshot: { timestamp: Date.now() / 1000, occupied_margin: '1' }, cycle_state: { report_status: { status: 'stale' } } }] };
-  const read = () => readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data }) });
-  assert.equal((await read()).diagnostics[0].kind, 'notice');
-  data.accounts[0].cycle_state.report_status = { status: 'error', error: '读取失败' };
-  assert.equal((await read()).diagnostics[0].kind, 'fault');
-  data.accounts[0].cycle_state.report_status = { status: 'stale' }; data.accounts[0].snapshot.occupied_margin = null;
-  const result = await read(); assert.equal(result.diagnostics[0].kind, 'fault'); assert.equal(result.metrics.find(row => row.key === 'occupied_margin').value, null);
+test('legacy ASTER single-account margin faults remain faults', async () => {
+  const data = { ready: true, accounts: [{ id: 'a', name: 'A', enabled: true, mode: 'live', snapshot: { timestamp: Date.now() / 1000, occupied_margin: null } }] };
+  const result = await readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data }) });
+  assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'fault');
+  assert.equal(result.metrics.find(row => row.key === 'occupied_margin').value, null);
 });
 
 test('legacy ASTER retains actions for fault-paused pairs and merges paused member evidence without counting their metrics', async () => {
@@ -418,12 +420,12 @@ test('legacy ASTER retains actions for fault-paused pairs and merges paused memb
   assert.deepEqual((await f.read()).diagnostics, []);
 });
 
-test('legacy ASTER identifies disabled single-account actions from explicit runtime evidence, never pause wording', async t => {
+test('legacy ASTER identifies disabled single-account actions from explicit pause evidence, never pause wording', async t => {
   const read = async account => readLegacySummary({ adapter: 'aster', apiUrl: 'http://127.0.0.1:8765' }, null, { request: async () => ({ data: { ready: true, accounts: [account] } }) });
   const base = { id: 'paused', mode: 'live', enabled: false, status: 'paused', reason: '用户暂停后可人工检查' };
-  const normal = await read({ ...base, cycle_state: { phase: 'paused', reason: '等待用户恢复' } });
+  const normal = await read(base);
   assert.deepEqual(normal.diagnostics, []);
-  for (const evidence of [{ pause_reason: '账户模式错误' }, { status: 'attention' }, { cycle_state: { phase: 'attention', reason: '订单待核对' } }, { migration_state: { phase: 'attention', reason: '迁移待核对' } }]) await t.test(JSON.stringify(evidence), async () => {
+  for (const evidence of [{ pause_reason: '账户模式错误' }, { status: 'attention' }]) await t.test(JSON.stringify(evidence), async () => {
     const result = await read({ ...base, ...evidence });
     assert.equal(result.diagnostics.length, 1); assert.equal(result.diagnostics[0].kind, 'action');
     assert.deepEqual(Object.fromEntries(result.metrics.map(row => [row.key, row.value])), { accounts: 0, live_accounts: 0, occupied_margin: null, daily_volume: null });

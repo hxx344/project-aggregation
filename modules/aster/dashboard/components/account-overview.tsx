@@ -23,9 +23,7 @@ import { pairMarginOnly, type Pair } from '@/lib/pairs';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
 import {
-  cycleMarginLimit,
   marginLimitFromPercent,
-  migrationMarginLimit,
   percentFromMarginLimit,
 } from '@/lib/policy';
 export function AccountOverview({
@@ -95,26 +93,10 @@ export function AccountOverview({
     '0.5';
   const highMarginLimit = Number(highMarginLimitValue);
   const highMarginPercent = percentFromMarginLimit(highMarginLimitValue);
-  const migrationMarginPercent = percentFromMarginLimit(
-    migrationMarginLimit(
-      account?.policy.margin_limit ?? '0.5',
-      account?.risk_limits,
-    ),
-  );
-  const cycleMarginLimitValue = cycleMarginLimit(account?.risk_limits);
-  const cycleRiskLimit =
-    cycleMarginLimitValue === null ? null : Number(cycleMarginLimitValue);
-  const cycleMarginPercent =
-    cycleMarginLimitValue === null
-      ? null
-      : percentFromMarginLimit(cycleMarginLimitValue);
-  const cycleMode = Boolean(account?.cycle?.enabled);
-  const upperRiskLimit = cycleMode ? cycleRiskLimit : highMarginLimit;
-  const upperRiskPercent = cycleMode ? cycleMarginPercent : highMarginPercent;
   const riskAccent =
-    ratio === null || upperRiskLimit === null
+    ratio === null || highMarginLimit === null
       ? 'muted'
-      : ratio > upperRiskLimit
+      : ratio > highMarginLimit
         ? 'danger'
         : ratio > marginLimit
           ? 'amber'
@@ -214,11 +196,7 @@ export function AccountOverview({
                 {snapshot ? pct(snapshot.ratio) : '—'}
               </span>
               <small>
-                {cycleMode
-                  ? cycleMarginPercent === null
-                    ? '循环上限待服务确认'
-                    : `循环 ≤ ${cycleMarginPercent}%`
-                  : `普通 5x ≤ ${marginPercent}%`}
+                {`普通 5x ≤ ${marginPercent}%`}
               </small>
             </div>
             <div className="risk-track">
@@ -238,12 +216,12 @@ export function AccountOverview({
                 />
               )}
               {ratio !== null &&
-                upperRiskLimit !== null &&
-                upperRiskLimit > marginLimit && (
+                highMarginLimit !== null &&
+                highMarginLimit > marginLimit && (
                   <i
                     className="limit-marker high-limit-marker"
-                    style={{ left: `${upperRiskPercent}%` }}
-                    title={`${cycleMode ? '循环全部持仓' : '普通 10x / 20x'}上限 ${upperRiskPercent}%`}
+                    style={{ left: `${highMarginPercent}%` }}
+                    title={`普通 10x / 20x上限 ${highMarginPercent}%`}
                   />
                 )}
             </div>
@@ -259,19 +237,7 @@ export function AccountOverview({
                   <span>普通 10x / 20x 加仓上限</span>
                   <strong>{highMarginPercent}%</strong>
                 </p>
-                <p className="risk-bonus">
-                  <span>迁移上限 · 含 5x</span>
-                  <strong>{migrationMarginPercent}%</strong>
-                </p>
-                <p className="risk-bonus">
-                  <span>循环上限 · 全部持仓</span>
-                  <strong>
-                    {cycleMarginPercent === null
-                      ? '待服务确认'
-                      : `${cycleMarginPercent}%`}
-                  </strong>
-                </p>
-                <p>共用额外 5 个百分点，最高 100%。</p>
+                <p>普通 10x / 20x 额外加 5 个百分点，最高 100%。</p>
                 <p>每仓占用 = |数量| × 标记价格 ÷ 实际杠杆；多空分别累加。</p>
               </div>
             </details>
@@ -326,7 +292,7 @@ export function AccountOverview({
                 onValueChange={(value) => setRiskDraft(value)}
               />
               <p className="muted">
-                此设置由普通开仓、循环和迁移共用。
+                此设置用于普通开仓。
                 {configurationLock || '各功能适用上限见上方风险约束。'}
               </p>
               <Button type="submit" variant="outline" disabled={locked}>

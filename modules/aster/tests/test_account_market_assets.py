@@ -5,7 +5,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from tests.test_cycle_account_snapshot import account_row, risk_row, ACCOUNT, RISK, SYMBOL
+from tests.account_fixtures import account_row, risk_row, ACCOUNT, RISK, SYMBOL
 from tests.test_exchange_hardening import FixtureAPI, account_responses
 from tests.test_market_order_rules import exchange_info
 from trading.exchange import ExchangeError, LiveBroker, MarketData, RateBudget
@@ -40,8 +40,8 @@ def list_other(api, asset="USD1"):
 
 
 class AccountMarketAssetTests(unittest.TestCase):
-    def test_new_usd1_holding_refreshes_once_and_contributes_to_both_snapshot_paths(self):
-        for method in ("snapshot", "cycle_snapshot"):
+    def test_new_usd1_holding_refreshes_once_and_contributes_to_ordinary_and_margin_snapshots(self):
+        for method in ("snapshot", "margin_snapshot"):
             with self.subTest(method=method):
                 market, api = market_and_api()
                 list_other(api)
@@ -65,7 +65,7 @@ class AccountMarketAssetTests(unittest.TestCase):
                 self.assertNotIn(OTHER, private_symbols)
 
     def test_known_usd1_does_not_refresh_and_losses_remain_in_total_risk(self):
-        for method in ("snapshot", "cycle_snapshot"):
+        for method in ("snapshot", "margin_snapshot"):
             with self.subTest(method=method):
                 market, api = market_and_api()
                 market.assets[OTHER] = "USD1"
@@ -76,7 +76,7 @@ class AccountMarketAssetTests(unittest.TestCase):
                 self.assertFalse(any(call[1] == INFO for call in api.calls))
 
     def test_confirmed_non_usd1_is_blocked_even_with_a_usd1_suffix(self):
-        for method in ("snapshot", "cycle_snapshot"):
+        for method in ("snapshot", "margin_snapshot"):
             for cached in (False, True):
                 with self.subTest(method=method, cached=cached):
                     market, api = market_and_api()
@@ -88,7 +88,7 @@ class AccountMarketAssetTests(unittest.TestCase):
                     self.assertEqual(sum(call[1] == INFO for call in api.calls), 0 if cached else 1)
 
     def test_unknown_is_not_misreported_as_non_usd1_and_retries_after_cooldown(self):
-        for method in ("snapshot", "cycle_snapshot"):
+        for method in ("snapshot", "margin_snapshot"):
             with self.subTest(method=method):
                 market, api = market_and_api()
                 broker = LiveBroker({}, market, api=api)

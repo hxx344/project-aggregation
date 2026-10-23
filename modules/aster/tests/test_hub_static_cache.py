@@ -17,7 +17,6 @@ class HubStaticCacheTests(TestCase):
         f = Fixture()
         self.addCleanup(f.close)
         engine = Engine(f.store, market=f.market)
-        self.addCleanup(engine.dashboard_reports.close)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             files = {"index.html": "<html>dashboard</html>", "404.html": "missing",

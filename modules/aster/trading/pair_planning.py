@@ -2,9 +2,10 @@
 from fractions import Fraction
 import time
 
-from .cycle import CyclePlan, plan_cycle
-from .models import (AccountSnapshot, TradingError, TIERS, dec,
-                     decimal_value, leverage_cap, opening_margin_limit, cycle_margin_limit,
+from .plans import TradePlan
+from .pair_legacy import require_no_legacy_cycle
+from .models import (TradingError, TIERS, dec,
+                     decimal_value, leverage_cap, opening_margin_limit,
                      positive, wire)
 
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, get_symbol_config, validate_symbol
@@ -19,13 +20,15 @@ class PairRecoveryConflict(TradingError):
     """A newer durable state must never be overwritten by a stale recovery."""
 
 
-def require_runtime_symbols(pair, state):
+def require_runtime_symbols(pair, state, *, allow_legacy=False):
     """Bind every executable journal to the pair before querying or writing.
 
     Historical gold runtimes have no top-level symbol. Their orders and frozen
-    cycle configuration still carry their own symbols and must agree. Archived
+    batch configurations still carry their own symbols and must agree. Archived
     watches keep each batch's original symbol across active-symbol edits.
     """
+    if not allow_legacy:
+        require_no_legacy_cycle(state)
     symbol = validate_symbol(pair["symbol"])
 
     def record(value, label, *, required=False, explicit=False):
@@ -35,19 +38,11 @@ def require_runtime_symbols(pair, state):
         if actual != symbol:
             raise PairPositionError(f"{label}标的 {actual} 与配对组 {symbol} 不一致，停止交易并等待核对")
 
-    record(pair.get("cycle", {}), "配对循环配置", required=True)
     record(state, "配对运行状态")
     if symbol != DEFAULT_PAIR_SYMBOL and "symbol" not in state:
         owned = state.get("owned") or {}
         if not isinstance(owned, dict) or any(positive(qty, True) for qty in owned.values()):
             raise PairPositionError(f"配对底仓缺少 {symbol} 标的记录，停止交易并等待核对")
-    progress = state.get("progress")
-    if progress is not None:
-        record(progress, "循环进度")
-        if progress.get("config") is not None:
-            record(progress["config"], "循环冻结配置", required=True)
-        elif progress.get("phase") in ("holding", "waiting_close"):
-            raise PairPositionError("循环持仓缺少冻结标的配置，停止交易并等待核对")
     pending = state.get("pending")
     if pending is not None:
         record(pending, "未完成批次", required=True)
@@ -130,26 +125,12 @@ def current_cap(snapshot, symbol, leverage):
     return Fraction(leverage_cap(snapshot.brackets.get(symbol, []), leverage))
 
 
-def combine(snapshots, symbol, *, opening=True):
-    held = positions(snapshots, symbol)
-    long, short = (snapshots[key] for key, _ in SIDES)
-    return AccountSnapshot(
-        long.equity + short.equity, long.maintenance + short.maintenance,
-        long.available + short.available, long.wallet + short.wallet,
-        long.unrealized + short.unrealized, [held["LONG"], held["SHORT"]], [],
-        True, False, True, min(long.timestamp, short.timestamp),
-        fees={symbol: max(positive(s.fees.get(symbol), True) for s in snapshots.values())} if opening else {},
-        current_leverage_caps={symbol: (held["LONG"].leverage, decimal_value(
-            sum((current_cap(s, symbol, held["LONG"].leverage) for s in snapshots.values()), Fraction(0)), exact=True))} if opening else {},
-    )
-
-
-def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None):
+def resource_gate(pair, snapshots, book):
     symbol = pair["symbol"]
     held = positions(snapshots, symbol)
     leverage = held["LONG"].leverage
     policy = pair["ordinary"]
-    limit = Fraction(cycle_margin_limit(policy) if cycling else opening_margin_limit(policy, leverage))
+    limit = Fraction(opening_margin_limit(policy, leverage))
     mark = Fraction(positive(book.mark))
     # Capture validated exact values once, rather than parsing them in each search step.
     budgets = []
@@ -165,15 +146,11 @@ def resource_gate(pair, snapshots, book, *, cycling=False, daily_remaining=None)
         loss = sum((max(Fraction(0), -Fraction(p.qty) * (mark - Fraction(p.mark)) *
                        (1 if p.side == "LONG" else -1)) for p in holdings), Fraction(0))
         valued = tuple((Fraction(p.qty), Fraction(p.mark), p.occupied_margin_exact) for p in holdings)
-        budget = None if daily_remaining is None else daily_remaining.get(key)
-        budgets.append((side, snap, valued, fee, loss, current_cap(snap, symbol, leverage),
-                        None if budget is None else Fraction(positive(budget, True))))
+        budgets.append((side, snap, valued, fee, loss, current_cap(snap, symbol, leverage)))
 
     def allowed(qty, buy, sell, high_price):
-        for side, snap, valued, fee, loss, cap, daily in budgets:
+        for side, snap, valued, fee, loss, cap in budgets:
             amount = buy if side == "LONG" else sell
-            if daily is not None and 2 * amount > daily:
-                return False
             high = max(high_price, *(old_mark for _, old_mark, _ in valued))
             occupied_delta = sum((max(Fraction(0), old_qty * max(high_price, old_mark) / leverage - occupied)
                                   for old_qty, old_mark, occupied in valued), Fraction(0))
@@ -266,26 +243,9 @@ def plan_ordinary(pair, snapshots, book, rule, capacities):
     minimum = max(rule.min_notional, dec(get_symbol_config(symbol)["min_notional"]))
     if qty < Fraction(rule.min_qty) or qty * mark < minimum or not qty:
         raise TradingError(f"按两账户各自余额、持仓上限、保证金占用、公开额度、盘口及配置的单批金额上限计算后，共同可开数量不足以满足最小下单量及按标记价计算的每边名义金额至少 {wire(minimum)} USD1，暂不新增")
-    return CyclePlan("open", symbol, decimal_value(qty, exact=True), leverage,
+    return TradePlan("open", symbol, decimal_value(qty, exact=True), leverage,
                      decimal_value(qty * ask, exact=True), decimal_value(qty * bid, exact=True),
                      decimal_value(book.spread_exact * 10000), capacity_notional=decimal_value(2 * qty * high, exact=True))
-
-
-def plan_paired_cycle(pair, snapshots, book, depth, rule, progress, *, capacity=None, daily_remaining=None, paused=False):
-    symbol = pair["symbol"]
-    require_runtime_symbols(pair, {"symbol": symbol, "progress": progress})
-    config = {**pair["cycle"], "enabled": True}
-    progress = dict(progress)
-    if paused and progress.get("phase") in ("holding", "waiting_close"):
-        # Pausing still reduces the recorded cycle increment, without waiting its timer.
-        progress["config"] = {**progress["config"], "hold_seconds": 1}
-        progress["opened_at"] = min(progress["opened_at"], time.time() - 2)
-    account = {"id": pair["id"], "policy": pair["ordinary"], "cycle": config}
-    opening = progress.get("phase", "waiting_open") == "waiting_open"
-    snapshot = combine(snapshots, symbol, opening=opening)
-    gate = resource_gate(pair, snapshots, book, cycling=True, daily_remaining=daily_remaining) if opening else None
-    return plan_cycle(account, snapshot, book, depth, rule, progress,
-                      market_capacity=capacity, opening_gate=gate, symbols=SUPPORTED_SYMBOLS)
 
 
 def ordinary_upgrade(pair, snapshots, book, capacities, *, runtime=None):

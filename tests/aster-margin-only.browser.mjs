@@ -10,8 +10,6 @@ async (page) => {
   const pair = { id: 'gold', name: '仅保证金切换隔离配对', long_account_id: 'a', short_account_id: 'b', symbol: 'XAUUSD1',
     enabled: false, revision: 1,
     ordinary: { enabled: true, threshold: '10000', order_notional: '1000', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.0005' },
-    cycle: { enabled: false, symbol: 'XAUUSD1', leverage: 2, spread_notional: '10000', spread_limit_bp: '0.1', min_notional: '0',
-      max_notional: '10000', capacity_multiplier: '1', notional_scope: 'per_side', hold_seconds: 60, daily_volume_limit: '0' },
     margin: { enabled: false, master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1', max_transfer: '1000', buffer_ratio: '0.05', cooldown_seconds: 30 },
     state: { phase: 'paused', reason: '隔离配对已暂停', snapshots: {}, pending: null,
       adl: { monitoring: { status: 'monitoring', reason: '两侧 ADL 补查已完成', checked_at: Date.now() / 1000 },
@@ -44,7 +42,7 @@ async (page) => {
         assert(JSON.stringify(body) === '{}', 'dedicated switch must not submit the configuration draft');
         if (replyGate) await replyGate;
         if (rejectNext) { rejectNext = false; return route.fulfill({ status: 409, json: { detail: '隔离夹具：当前不能切换保证金管理' } }); }
-        pair.ordinary.enabled = false; pair.cycle.enabled = false; pair.margin.enabled = true;
+        pair.ordinary.enabled = false; pair.margin.enabled = true;
         pair.revision += 1; pair.state.adl.margin_only_switch_allowed = false;
         return route.fulfill({ status: 200, json: { ok: true, pair } });
       }
@@ -84,7 +82,6 @@ async (page) => {
     assert(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled(), 'ordinary trading activation still waits for market readiness');
     ready = true; await refresh();
     pair.state.pending = { id: 'original-order', kind: 'ordinary', phase: 'open', orders: [], created_at: Date.now() / 1000 - 300 };
-    pair.state.progress = { phase: 'closing', baseline: { LONG: '1', SHORT: '1' }, quantities: { LONG: '0.2', SHORT: '0.2' } };
     pair.state.recovery_watch = { batches: [{ id: 'history-observation' }] };
     Object.assign(pair.state.adl, { configuration_locked: true, lock_reason: '订单或划转结果待核对，暂不能修改设置。', margin_only_switch_allowed: false });
     await refresh();
@@ -114,11 +111,11 @@ async (page) => {
     await app.getByRole('alert').filter({ hasText: '当前不能切换保证金管理' }).first().waitFor();
     assert(await name.inputValue() === '未保存的草稿不能发送', 'rejected switch preserves the draft');
     assert(pair.ordinary.enabled && !pair.margin.enabled && !pair.enabled, 'rejection preserves saved mode and pause');
-    const originalRecords = JSON.stringify({ pending: pair.state.pending, progress: pair.state.progress, history: pair.state.recovery_watch });
+    const originalRecords = JSON.stringify({ pending: pair.state.pending, history: pair.state.recovery_watch });
     await button.click();
-    await app.getByText('已切换为仅保证金管理并保持暂停；点击“启动配对组”后才会按条件平衡保证金。原订单继续核对，已有循环仓位仍按原路径执行必要减仓。', { exact: true }).waitFor();
+    await app.getByText('已切换为仅保证金管理并保持暂停；点击“启动配对组”后才会按条件平衡保证金。原订单继续核对。', { exact: true }).waitFor();
     assert(await name.inputValue() === pair.name, 'successful switch clears the unsaved draft');
-    assert(!pair.enabled && !pair.ordinary.enabled && !pair.cycle.enabled && pair.margin.enabled, 'switch changes only strategy mode and keeps paused');
+    assert(!pair.enabled && !pair.ordinary.enabled && pair.margin.enabled, 'switch changes only strategy mode and keeps paused');
     assert(await save.isDisabled(), 'pending evidence still locks the complete settings after switching');
     assert(!(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled()), 'manual margin-only start is available after clearing the draft');
     ready = false; await refresh();
@@ -127,7 +124,7 @@ async (page) => {
     assert(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled(), 'funds-only activation still requires a connected service');
     failReads = false; await refresh();
     assert(!(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled()), 'fresh service evidence restores funds-only activation while public markets remain unready');
-    assert(JSON.stringify({ pending: pair.state.pending, progress: pair.state.progress, history: pair.state.recovery_watch }) === originalRecords, 'original recovery evidence remains visible');
+    assert(JSON.stringify({ pending: pair.state.pending, history: pair.state.recovery_watch }) === originalRecords, 'original recovery evidence remains visible');
     assert(await button.count() === 0, 'already margin-only mode has no redundant switch');
     assert(writes.length === 2, 'only explicit rejected and successful switch requests were sent');
     assert(unexpectedWrites.length === 0, `no auto-start, order, transfer or full configuration writes: ${unexpectedWrites.join('; ')}`);

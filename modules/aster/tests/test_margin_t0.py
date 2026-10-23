@@ -13,7 +13,7 @@ from unittest.mock import patch
 from eth_utils import to_checksum_address
 
 from tests.test_managed_margin_transfer import ManagedMarginTransferTests as Fixture
-from tests.test_cycle_ws_scheduler import _Future, _Pool
+from tests.scheduler_fixtures import _Future, _Pool
 from trading.engine import Engine
 from trading.exchange import BudgetWait, RateBudget, RequestNotSent
 from trading.execution import Executor
@@ -57,7 +57,7 @@ class MarginT0Tests(unittest.TestCase):
         self.assertFalse(any("order" in path.lower() for _, _, path in self.requests))
 
     def test_every_real_single_account_intent_producer_imports_without_gating_t0(self):
-        from tests import test_cycle_execution, test_execution, test_migration_execution
+        from tests import test_execution
 
         # Execute the real producers, then load their SQLite-serialized records.
         # The fixtures supply paper transports; intent construction is production code.
@@ -65,15 +65,13 @@ class MarginT0Tests(unittest.TestCase):
             (test_execution.ExecutionTests(), "pair", lambda case: case.open()),
             (test_execution.ExecutionTests(), "leverage", lambda case:
                 case.executor.leverage(case.f.account, "XAUUSD1", 5, 10)),
-            (test_cycle_execution.CycleExecutionTests(), "cycle", lambda case: case.open()),
-            (test_migration_execution.MigrationExecutionTests(), "migration", lambda case: case.start()),
         )
         records = []
         for case, kind, invoke in producers:
             with self.subTest(producer=kind):
                 case.setUp()
                 captured = []
-                save, create = case.f.store.save_intent, case.f.store.create_cycle_intent
+                save = case.f.store.save_intent
                 def persisted(intent):
                     with case.f.store.connect() as db:
                         row = db.execute("SELECT data FROM intents WHERE id=?", (intent["id"],)).fetchone()
@@ -85,23 +83,27 @@ class MarginT0Tests(unittest.TestCase):
                     result = save(intent)
                     persisted(intent)
                     return result
-                def capture_create(intent, message):
-                    result = create(intent, message)
-                    persisted(intent)
-                    return result
                 try:
-                    with patch.object(case.f.store, "save_intent", side_effect=capture_save), \
-                            patch.object(case.f.store, "create_cycle_intent", side_effect=capture_create):
+                    with patch.object(case.f.store, "save_intent", side_effect=capture_save):
                         invoke(case)
                     self.assertTrue(captured, kind)
                     record = max(captured, key=lambda value: len(value.get("orders", [])))
                     self.assertEqual(record["kind"], kind)
-                    if kind == "migration":
-                        self.assertEqual({order["symbol"] for order in record["orders"]}, {"XAUUSD1", "SPCXUSD1"})
                     # Map the paper fixture account to this managed fixture's live owner.
                     records.append({**record, "account_id": "long"})
                 finally:
                     case.doCleanups()
+        # Retired producers can still leave unresolved records in old ledgers.
+        pair = next(record for record in records if record["kind"] == "pair")
+        for kind in ("cycle", "migration"):
+            legacy = deepcopy(pair)
+            legacy.update(id=pair["id"] + "-" + kind, kind=kind)
+            for order in legacy["orders"]:
+                order["newClientOrderId"] = order["newClientOrderId"][:20] + kind[:3]
+            if kind == "migration":
+                legacy["order_roles"] = {order["newClientOrderId"]: role for order, role
+                                         in zip(legacy["orders"], ("open_target", "close_source"))}
+            records.append(legacy)
         self.assertEqual({record["kind"] for record in records}, {"pair", "leverage", "cycle", "migration"})
         def import_records():
             for record in records:
@@ -166,7 +168,7 @@ class MarginT0Tests(unittest.TestCase):
         self.assertEqual(self.store.intent("long")["id"], "old-intent")
         self.assertEqual(self.store.get("pair_runtime:gold")["margin"]["status"], "acknowledged")
 
-    def test_ordinary_or_cycle_adl_wait_cannot_delay_the_next_funds_check(self):
+    def test_ordinary_or_legacy_cycle_adl_wait_cannot_delay_the_next_funds_check(self):
         manager = self.pair_manager()
         self.engine.adl.tick = lambda pair: {"hold": True, "retry_after": 120}
         old = self.old_orders()
@@ -176,7 +178,9 @@ class MarginT0Tests(unittest.TestCase):
             with self.subTest(mode=mode):
                 pair = deepcopy(self.store.pair("gold"))
                 pair["ordinary"]["enabled"] = mode == "ordinary"
-                pair["cycle"]["enabled"] = mode == "cycle"
+                runtime = self.store.get("pair_runtime:gold")
+                runtime["pending"]["kind"] = mode
+                self.store.put("pair_runtime:gold", runtime)
                 pair["margin"]["cooldown_seconds"] = 1
                 self.pair = self.store.save_pair(pair)
                 self.balances.update(long="3000", short="1000")
@@ -359,7 +363,6 @@ class MarginT0Tests(unittest.TestCase):
         engine.brokers = previous.brokers
         self.writer.engine = self.engine = engine
         engine.ready = False
-        self.addCleanup(engine.dashboard_reports.close)
         clock = {"tick": 100.0, "wall": time.time(), "turn": 0}
         owner = self
         class Event:
@@ -387,7 +390,7 @@ class MarginT0Tests(unittest.TestCase):
                 patch("time.time", side_effect=lambda: clock["wall"] + clock["tick"] - 100), \
                 patch.object(engine.market, "load_rules", side_effect=TradingError("market unavailable")) as rules, \
                 patch.object(engine.market, "book", side_effect=AssertionError("no market prerequisite")), \
-                patch.object(engine.dashboard_reports, "start"), patch.object(engine, "notify", return_value=60), \
+                patch.object(engine, "notify", return_value=60), \
                 patch.object(engine.pairs, "tick", side_effect=AssertionError("strategy blocked while market not ready")):
             engine.run()
         self.assertEqual(len(self.posts()), 3)

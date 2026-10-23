@@ -6,7 +6,6 @@ from time import perf_counter, time
 
 
 _transport = ContextVar("transport_timing", default=None)
-_database = ContextVar("database_timing", default=None)
 
 
 def _clock():
@@ -22,37 +21,6 @@ def _elapsed(start):
         return duration if math.isfinite(duration) and duration >= 0 else None
     except Exception:
         return None
-
-
-@contextmanager
-def observe_database():
-    data = {"lock_wait_ms": 0.0, "connection_ms": 0.0, "connections": 0}
-    token = _database.set({"active": True, "data": data})
-    try:
-        yield data
-    finally:
-        _database.reset(token)
-
-
-def database_clock():
-    observed = _database.get()
-    return _clock() if observed is not None and observed["active"] else None
-
-
-def database_duration(key, started):
-    observed = _database.get()
-    if observed is not None and observed["active"]:
-        value = _elapsed(started)
-        previous = observed["data"][key]
-        observed["data"][key] = previous + value if previous is not None and value is not None else None
-        if key == "connection_ms":
-            observed["data"]["connections"] += 1
-
-
-def freeze_database():
-    observed = _database.get()
-    if observed is not None:
-        observed["active"] = False
 
 
 @contextmanager

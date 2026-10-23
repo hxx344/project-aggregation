@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -14,7 +15,7 @@ from trading import adl
 from trading.adl_exchange import ReductionPosition, ReductionRule, ReductionSnapshot
 from trading.exchange import AmbiguousOrder, BudgetWait, ExchangeError, LiveBroker
 from trading.models import TradingError, dec
-from trading.pair_execution import runtime_default
+from tests.pair_legacy_fixtures import runtime_default
 from trading.pairing import validate_pair
 from trading.store import Store
 
@@ -206,6 +207,44 @@ class AdlControllerTests(unittest.TestCase):
         self.tick()
         self.assertEqual(len(self.sent), 1)
         self.assertFalse(self.store.pair("pair")["enabled"])
+
+    def test_adl_completes_without_clearing_removed_cycle_increment(self):
+        from trading.pair_legacy import LEGACY_CYCLE_REASON
+        original = self.store.get("pair_runtime:pair")
+        original["progress"]["quantities"] = {"LONG": "1", "SHORT": "1"}
+        original["owned"] = {"LONG": "9", "SHORT": "9"}
+        self.store.put("pair_runtime:pair", original)
+        self.observe()
+        self.tick()
+        self.assertEqual(len(self.sent), 1)
+        self.tick(1)
+        self.assertEqual(self.state()["status"], "completed")
+        for _ in range(2):
+            runtime = self.tick(10)
+            self.assertEqual(runtime["phase"], "attention")
+            self.assertEqual(runtime["reason"], LEGACY_CYCLE_REASON)
+            for field in ("owned", "progress", "pending"):
+                self.assertEqual(runtime[field], original[field])
+        self.assertFalse(self.store.pair("pair")["enabled"])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_adl_completion_ignores_removed_account_settings(self):
+        with self.store.connect() as db:
+            for aid in ("a", "b"):
+                saved = json.loads(db.execute("SELECT data FROM accounts WHERE id=?", (aid,)).fetchone()[0])
+                saved.update(cycle={"enabled": False}, migration={"enabled": False}, migration_run_id=None)
+                db.execute("UPDATE accounts SET data=? WHERE id=?", (json.dumps(saved), aid))
+        self.observe()
+        self.tick()
+        self.assertEqual(len(self.sent), 1)
+        # Incidents opened by the previous release froze full account records.
+        incident = self.state()
+        for frozen in incident["accounts"].values():
+            frozen.update(cycle={"enabled": False}, migration={"enabled": False}, migration_run_id=None)
+        self.store.put("adl_pair:pair", incident)
+        self.store.put("adl_incident:" + incident["id"], incident)
+        self.tick(1)
+        self.assertEqual(self.state()["status"], "completed")
 
     def test_scene_reuses_bounded_mode_evidence_and_refreshes_after_expiry(self):
         self.observe()

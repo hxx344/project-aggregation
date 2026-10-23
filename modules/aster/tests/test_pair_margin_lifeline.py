@@ -1,5 +1,6 @@
 """Independent funds checks through real paper ledgers and pair scheduling."""
 from dataclasses import replace
+from copy import copy
 import time
 from unittest import TestCase
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from tests import test_pair_trading as fixtures
 from tests import test_pair_budget as budget_fixtures
 from trading.exchange import AmbiguousOrder, ExchangeError, RequestNotSent
 from trading.margin_balance import MarginBalancer
-from trading.models import TradingError, dec
+from trading.models import dec
 from trading.pair_execution import PairTrader
 
 
@@ -21,6 +22,8 @@ class PairMarginLifelineTests(TestCase):
         clock.start()
         self.addCleanup(clock.stop)
         self.engine.pairs.trader = self.trader
+        self.strategy_market = copy(self.market)
+        self.trader.market = self.strategy_market
         self.enable_margin()
 
     tick = fixtures.PairTradingTests.tick
@@ -70,19 +73,19 @@ class PairMarginLifelineTests(TestCase):
                 self.assertEqual(state["phase"], "attention", state)
                 self.assert_no_orders()
 
-    def test_funds_run_before_hot_failure_and_keep_their_own_deadline(self):
+    def test_funds_run_before_strategy_read_failure_and_keep_their_own_deadline(self):
         self.wallet("long", 26000)
         self.wallet("short", 24000)
         original = self.trader._read
 
         def read(brokers, symbol, **options):
-            if options.get("hot"):
-                raise RequestNotSent("hot data unavailable", retry_after=60)
+            if not options.get("margin"):
+                raise RequestNotSent("strategy data unavailable", retry_after=60)
             self.assertTrue(options.get("margin"))
             return original(brokers, symbol, **options)
 
         with patch.object(self.trader, "_read", side_effect=read) as reads:
-            self.assertEqual(self.engine.pairs.tick("gold"), 1)
+            self.assertEqual(self.engine.pairs.tick("gold"), 2)
             state = self.store.get("pair_runtime:gold")
             self.assert_transferred(state)
             self.assertEqual(reads.call_count, 1)
@@ -98,13 +101,14 @@ class PairMarginLifelineTests(TestCase):
         self.assert_no_orders()
 
     def test_market_retry_survives_restart_while_margin_keeps_checking(self):
-        with patch.object(self.engine, "cycle_book", side_effect=RequestNotSent("market backoff", retry_after=60)) as book:
+        with patch.object(self.strategy_market, "book", side_effect=RequestNotSent("market backoff", retry_after=60)) as book:
             self.assertEqual(self.engine.pairs.tick("gold"), 5)
             self.assertEqual(book.call_count, 1)
             self.wall += 5
             self.wallet("long", 26000)
             self.wallet("short", 24000)
             self.trader = PairTrader(self.engine)
+            self.trader.market = self.strategy_market
             self.engine.pairs.trader = self.trader
             self.assertEqual(self.engine.pairs.tick("gold"), 5)
             self.assert_transferred(self.store.get("pair_runtime:gold"))
@@ -131,42 +135,11 @@ class PairMarginLifelineTests(TestCase):
         self.assertEqual(state["margin"]["api_notice"]["kind"], "budget")
 
     def test_pair_revision_revokes_previous_trade_retry(self):
-        with patch.object(self.engine, "cycle_book", side_effect=RequestNotSent("market backoff", retry_after=60)) as book:
+        with patch.object(self.strategy_market, "book", side_effect=RequestNotSent("market backoff", retry_after=60)) as book:
             self.tick()
             self.pair = self.store.save_pair({**self.store.pair("gold"), "name": "new revision"})
             self.tick()
             self.assertEqual(book.call_count, 2)
-
-    def test_due_close_read_or_market_failure_still_transfers(self):
-        self.assertEqual(self.tick()["phase"], "holding")
-        self.expire()
-        counts = {side: len(broker.state["orders"]) for side, broker in self.brokers.items()}
-        for failure in ("read", "market", "planning", "before_intent"):
-            with self.subTest(failure=failure):
-                self.store.put("pair_margin:gold", {})
-                self.wallet("long", 26000)
-                self.wallet("short", 24000)
-                if failure == "read":
-                    original = self.trader._read
-
-                    def read(brokers, symbol, **options):
-                        if options.get("reconciliation"):
-                            raise TradingError("close read unavailable")
-                        return original(brokers, symbol, **options)
-
-                    mock = patch.object(self.trader, "_read", side_effect=read)
-                elif failure == "market":
-                    mock = patch.object(self.engine, "cycle_book", side_effect=TradingError("close book unavailable"))
-                elif failure == "planning":
-                    mock = patch("trading.pair_execution.plan_paired_cycle", side_effect=TradingError("close plan unavailable"))
-                else:
-                    mock = patch.object(self.trader, "_start", side_effect=RequestNotSent("lease expired before intent"))
-                with mock:
-                    state = self.tick()
-                self.assertEqual(state["margin"]["status"], "paper_confirmed", state)
-                self.assertIsNone(state["pending"])
-                self.assertEqual({side: len(broker.state["orders"]) for side, broker in self.brokers.items()}, counts)
-                self.wall += 5
 
     def test_account_modes_and_open_orders_do_not_block_transfers(self):
         original = self.trader._read

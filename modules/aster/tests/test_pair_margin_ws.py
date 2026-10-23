@@ -22,9 +22,9 @@ class PairMarginWebSocketTests(unittest.TestCase):
 
     def connect(self, broker):
         with patch("trading.exchange.PrivateAccountStream.start"):
-            broker.start_cycle_hot_data(["XAUUSD1"])
-        broker.cycle_stream._set_connected(True)
-        self.addCleanup(broker.stop_cycle_hot_data)
+            broker.start_private_stream()
+        broker.private_stream._set_connected(True)
+        self.addCleanup(broker.stop_private_stream)
 
     def live(self, *, connect=True, wallet=True):
         snapshots = fixtures.PairMarginTests.live(self)
@@ -64,7 +64,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
                 "a": {"m": "ASSET_TRANSFER", "B": [{"a": "USD1", "bc": str(amount), "wb": str(base + amount)}], "P": []}}
             if change:
                 change(side, event)
-            self.brokers[side].cycle_stream._handle_message(json.dumps(event))
+            self.brokers[side].private_stream._handle_message(json.dumps(event))
 
     def expire_grace(self, snapshots):
         pending = self.state()["pending"]
@@ -204,7 +204,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
         snapshots = self.live()
         def disconnect(pending):
             self.emit(pending)
-            self.brokers["short"].cycle_stream._set_connected(False)
+            self.brokers["short"].private_stream._set_connected(False)
         self.after_http = disconnect
         self.assert_rest(self.balancer.tick(self.pair, snapshots))
 
@@ -218,7 +218,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
                 self.emit(pending)
                 if mode == "restart":
                     for side, previous in list(self.brokers.items()):
-                        previous.stop_cycle_hot_data()
+                        previous.stop_private_stream()
                         broker = LiveBroker({}, self.market, api=previous.api)
                         broker.snapshot = previous.snapshot
                         broker.margin_snapshot = previous.margin_snapshot
@@ -282,7 +282,7 @@ class PairMarginWebSocketTests(unittest.TestCase):
         original = self.brokers["short"].transfer_ws_balance
         def changed(*args, **kwargs):
             result = original(*args, **kwargs)
-            self.brokers["long"]._cycle_account_event("ACCOUNT_CONFIG_UPDATE")
+            self.brokers["long"]._private_account_event("ACCOUNT_CONFIG_UPDATE")
             return result
         with patch.object(self.brokers["short"], "transfer_ws_balance", side_effect=changed):
             first = self.balancer.tick(self.pair, snapshots)

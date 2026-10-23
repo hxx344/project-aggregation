@@ -9,8 +9,6 @@ import httpx
 import monitor
 from tests.helpers import Fixture, account
 from trading.capacity_relay_client import PublicCapacityRelayClient
-from trading.cycle import DEFAULT_CYCLE
-from trading.cycle_capacity import require_cycle_capacity
 from trading.engine import Engine, PUBLIC_POLL_ALLOWANCE, CAPACITY_MONITOR_RESERVE
 from trading.exchange import API, ExchangeError, MarketData, RateBudget, RequestNotSent
 from trading.models import TradingError, dec
@@ -73,7 +71,6 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
         self.addCleanup(self.api.close)
         self.market = MarketData(self.api, capacity_relay=self.relay)
         self.engine = Engine(self.f.store, market=self.market)
-        self.addCleanup(self.engine.dashboard_reports.close)
 
     def payload(self, kind, symbol):
         result = deepcopy(self.rows[kind])
@@ -105,18 +102,14 @@ class CapacityRelayIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.budget.snapshot()["aster_ip_used"])
         self.assertEqual(self.aster_requests, [])
 
-    def test_rereading_duplicate_remote_cache_cannot_reauthorize_cycle(self):
+    def test_rereading_duplicate_remote_cache_keeps_original_source_time(self):
         self.configure()
         self.market.refresh_public_brackets(SYMBOL)
         self.engine.poll_market(SYMBOL)
         checked_at = self.engine.markets[SYMBOL]["capacity_checked_at"]["7"]
-        config = {**DEFAULT_CYCLE, "max_notional": "1000"}
-        require_cycle_capacity(config, 7, self.engine.markets[SYMBOL], now=self.wall)
         self.advance(1.1)
         self.engine.poll_market(SYMBOL)
         self.assertEqual(self.engine.markets[SYMBOL]["capacity_checked_at"]["7"], checked_at)
-        with self.assertRaisesRegex(TradingError, "过期"):
-            require_cycle_capacity(config, 7, self.engine.markets[SYMBOL], now=self.wall)
 
     def test_remote_sampling_releases_reserve_without_erasing_used_weight_or_cooldown(self):
         self.budget.reserve(100)
