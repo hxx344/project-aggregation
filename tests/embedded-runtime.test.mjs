@@ -16,7 +16,7 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { writeFileSync, appendFileSync } from 'node:fs';
+import { writeFileSync, appendFileSync, existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 export async function createModule({ root, dataDir, environment, transports }) {
@@ -25,7 +25,8 @@ export async function createModule({ root, dataDir, environment, transports }) {
   await writeFile(path.join(dataDir, 'started.json'), JSON.stringify(started));
   if (environment.FIXTURE_START === 'fail') throw new Error('fixture startup failure');
   if (environment.FIXTURE_START === 'hang') await new Promise(() => {});
-  if (environment.FIXTURE_START === 'slow') await delay(2500);
+  // Holds creation until the test writes the release file.
+  while (environment.FIXTURE_START === 'gated' && !existsSync(path.join(dataDir, 'release'))) await delay(20);
   if (environment.FIXTURE_START === 'orphan') {
     // Stands in for a Python bridge that ignores both stdin EOF and SIGTERM.
     const orphan = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' });
@@ -176,6 +177,8 @@ test('concurrent close callers all await graceful shutdown and transport cleanup
   const records = await f.records();
   const first = runtime.close(), second = runtime.close();
   assert.equal(first, second, 'close must expose the same in-flight cleanup promise');
+  // Every virtual origin fails closed at once, before the workers finish closing.
+  assertUnavailable();
   await bounded(second, 5000, 'second shutdown caller');
   for (const row of records) { assert.equal(hasProcess(row.pid), false); assert.equal(await f.closed(row.id), true); }
   assertUnavailable();
@@ -319,7 +322,8 @@ test('CrossEx follows a restarted Monitor without restarting and no other worker
 
 test('repeated failures fault a module, its dependent waits without counting, and an operator restart resumes both', { timeout: 20000 }, async t => {
   const f = await fixture(t);
-  const runtime = await f.start({ restartPolicy: { delaysMs: [50, 100, 200], maxFailures: 3 }, holdFaults: true, random: () => 0, onFailure: error => assert.fail(error) });
+  const drains = [];
+  const runtime = await f.start({ restartPolicy: { delaysMs: [50, 100, 200], maxFailures: 3 }, holdFaults: true, drainTimeoutMs: id => { drains.push(id); return 32_000; }, random: () => 0, onFailure: error => assert.fail(error) });
   await f.mode('monitor', 'fail');
   assert.equal((await request(registered('monitor'), '/crash')).status, 200);
   await until(() => f.state('monitor').state === 'fault', 'monitor fault');
@@ -336,12 +340,15 @@ test('repeated failures fault a module, its dependent waits without counting, an
   assert.equal(crossex.state, 'backoff'); assert.equal(crossex.generation, 1); assert.equal(crossex.restartCount, 0); assert.equal(crossex.consecutiveFailures, 1);
   assert.equal(runtime.restart('crossex'), false);
   await f.mode('monitor', 'ok');
+  const monitorDrains = drains.filter(id => id === 'monitor').length;
+  assert.equal(monitorDrains, 3);
   assert.equal(runtime.restart('monitor'), true);
   assert.equal(runtime.restart('monitor'), false, 'a second request while recovering is rejected');
   await until(() => f.state('crossex').state === 'ready', 'crossex ready after Monitor');
   monitor = f.state('monitor'); crossex = f.state('crossex');
   assert.equal(monitor.state, 'ready'); assert.equal(monitor.generation, 4); assert.equal(monitor.consecutiveFailures, 0);
   assert.equal(crossex.generation, 2); assert.equal(crossex.consecutiveFailures, 1);
+  assert.equal(drains.filter(id => id === 'monitor').length, monitorDrains, 'a failures fault was already drained');
   assert.ok((await f.record('crossex')).startedAt >= (await f.record('monitor')).startedAt);
   assert.deepEqual((await f.record('crossex')).dependencies, ['monitor']);
 });
@@ -377,11 +384,14 @@ test('without operator recovery a faulted module still shuts the workbench down 
   const f = await fixture(t);
   let failure;
   const failed = new Promise(resolve => { failure = resolve; });
-  await f.start({ restartPolicy: { delaysMs: [20], maxFailures: 2 }, random: () => 0, onFailure: failure });
+  let runtime;
+  runtime = await f.start({ restartPolicy: { delaysMs: [20], maxFailures: 2 }, random: () => 0, onFailure: error => failure({ error, states: runtime.status().map(row => row.state) }) });
   const rows = await f.records();
   await f.mode('greeks', 'fail');
   assert.equal((await request(registered('greeks'), '/crash')).status, 200);
-  assert.match((await bounded(failed, 5000, 'fault escalation')).message, /greeks fault \(failures\)/);
+  const { error, states } = await bounded(failed, 5000, 'fault escalation');
+  assert.match(error.message, /greeks fault \(failures\)/);
+  assert.deepEqual(new Set(states), new Set(['stopped']), 'onFailure runs after close finished');
   assert.equal(f.logs.find(entry => entry?.event === 'fault').reason, 'failures');
   for (const row of rows) await until(() => !hasProcess(row.pid), `${row.id} stopped`);
   assertUnavailable();
@@ -416,8 +426,9 @@ test('close during a restarted instance startup stops it without recovery or a f
 
 test('a process tree that survives the kill faults the module, and an operator restart drains it before starting', { timeout: 15000, skip: process.platform === 'win32' ? 'Windows children are tracked by reported pids' : false }, async t => {
   const f = await fixture(t, { modes: { asset: 'orphan' } });
-  // No grace after SIGKILL: the killed orphan is still a zombie on the first probe.
-  const runtime = await f.start({ restartPolicy: { delaysMs: [10] }, holdFaults: true, drainTimeoutMs: () => 200, killGraceMs: 0, onFailure: error => assert.fail(error) });
+  // No grace after SIGKILL: the first probe runs before the orphan is reaped.
+  const drains = [];
+  const runtime = await f.start({ restartPolicy: { delaysMs: [10] }, holdFaults: true, drainTimeoutMs: id => { drains.push(id); return 200; }, killGraceMs: 0, onFailure: error => assert.fail(error) });
   await f.mode('asset', 'ok');
   assert.equal((await request(registered('asset'), '/crash')).status, 200);
   await until(() => f.state('asset').state === 'fault', 'asset fault');
@@ -426,7 +437,7 @@ test('a process tree that survives the kill faults the module, and an operator r
   assert.equal(runtime.restart('asset'), true);
   await until(() => generation('asset') === 2, 'asset generation 2');
   assert.equal(f.state('asset').state, 'ready');
-  assert.equal(f.logs.filter(entry => entry?.event === 'drained' && entry.moduleId === 'asset').length, 1, 'the operator drain is not a new exit');
+  assert.deepEqual(drains, ['asset', 'asset'], 'the operator restart drained the lingering group first');
   assert.throws(() => runtime.restart('constructor'), /Unknown embedded module/);
 });
 
@@ -434,13 +445,14 @@ test('a dependency that changes while its consumer is still starting is delivere
   const f = await fixture(t);
   await f.start({ timeoutMs: 6000, restartPolicy: { delaysMs: [20] }, onFailure: error => assert.fail(error) });
   const first = await f.record('crossex');
-  await f.mode('crossex', 'slow');
+  await f.mode('crossex', 'gated');
   assert.equal((await request(registered('crossex'), '/crash')).status, 200);
   await until(async () => (await f.record('crossex')).pid !== first.pid, 'CrossEx restarting');
   const starting = await f.record('crossex');
   assert.equal((await request(registered('monitor'), '/crash')).status, 200);
   await until(() => generation('monitor') === 2, 'monitor generation 2');
-  assert.equal(f.state('crossex').state, 'starting', 'Monitor came back before CrossEx finished creating');
+  assert.equal(f.state('crossex').state, 'starting');
+  await writeFile(path.join(f.dataDir, 'modules', 'crossex', 'release'), '');
   await until(() => generation('crossex') === 2, 'crossex generation 2', 6000);
   const file = path.join(f.dataDir, 'modules', 'crossex', 'dependencies.jsonl');
   const updates = (await readFile(file, 'utf8')).trim().split('\n').map(line => JSON.parse(line));

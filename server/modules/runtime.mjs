@@ -71,7 +71,8 @@ export async function startModules({ dataDir, root = repository, logger = consol
     if (closing) return closing;
     stopping = true;
     for (const slot of Object.values(slots)) { clearTimeout(slot.timer); slot.timer = null; slot.state = 'stopping'; }
-    for (const remove of unregister) remove();
+    // Each remover also deletes itself from the list.
+    for (const remove of unregister.splice(0)) remove();
     closing = (async () => {
       await Promise.all(children.map(child => new Promise(resolve => {
         if (!running(child)) return resolve();
@@ -222,8 +223,9 @@ export async function startModules({ dataDir, root = repository, logger = consol
     supervise((async () => {
       // Only this fault leaves a process tree behind; never start beside it.
       // Any other fault already confirmed the old tree was gone.
-      if (lingering && !await drain(slot.child, id)) return fault(slot, 'process-tree');
+      const drained = !lingering || await drain(slot.child, id);
       if (stopping) return;
+      if (!drained) return fault(slot, 'process-tree');
       Object.assign(slot, { state: 'backoff', due: true });
       attempt(slot);
     })());
