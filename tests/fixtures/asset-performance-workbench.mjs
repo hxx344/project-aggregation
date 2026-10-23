@@ -146,7 +146,7 @@ export async function startFixtureModules({ logger = console, onFailure = () => 
       });
       child.send({ type: 'start', ...asset }, error => { if (error) fail(error); });
     });
-    return { projects: moduleCatalog, close };
+    return { markStarted() {}, status: () => [], restart: () => false, projects: moduleCatalog, close };
   } catch (error) { await close(); throw error; }
 }
 

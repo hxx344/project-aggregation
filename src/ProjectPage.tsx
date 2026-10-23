@@ -3,6 +3,7 @@ import { ExternalLink, FolderKanban, LoaderCircle, RefreshCw, Settings2 } from '
 import { api, ApiError } from './api';
 import type { Project, Snapshot } from './types';
 import DiagnosticDetails from './DiagnosticDetails';
+import ModuleRecovery from './ModuleRecovery';
 import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
@@ -187,6 +188,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
       </div>
     </div>
     {snapshot ? <DiagnosticDetails snapshot={snapshot} now={now} /> : null}
+    {project.embedded ? <ModuleRecovery moduleId={project.id} name={project.name} active={active} onRecovered={() => setAttempt(value => value + 1)} onExpired={onExpired} /> : null}
     {error ? <div className="error-box original-page-error" role="alert">{error}</div> : null}
     {!accessible ? <div className="empty-state original-page-placeholder"><FolderKanban size={32} /><h2>{project.enabled ? '请先设置项目地址' : '项目已停用'}</h2><p>{project.enabled ? '保存模块设置后，即可在这里打开原始页面。' : '在模块设置中启用后，可继续访问原始页面。'}</p><button className="button secondary" onClick={onEdit}>模块设置</button></div>
       : !embedded ? <div className="empty-state original-page-placeholder"><ExternalLink size={32} /><h2>{project.name}</h2><p>此项目设为在新窗口打开。</p><button className="button primary" disabled={openingTab} onClick={() => void openInTab()}>打开原始页面</button></div>

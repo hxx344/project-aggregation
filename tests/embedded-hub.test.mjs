@@ -15,9 +15,9 @@ import { unavailableUpdateState } from '../server/updates.mjs';
 
 const password = 'embedded-hub-test-password';
 const options = { initialPassword: password, logger: () => {}, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0 };
-async function fixture(t, { existing = false } = {}) {
+async function fixture(t, { existing = false, moduleRuntime } = {}) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'embedded-hub-'));
-  const modules = [], calls = [], removers = [];
+  const modules = [], calls = [], removers = [], failing = new Set();
   let app, cookie, csrf, port;
   t.after(async () => {
     await app?.close(); for (const remove of removers) remove();
@@ -39,6 +39,7 @@ async function fixture(t, { existing = false } = {}) {
       const text = Buffer.concat(chunks).toString(), body = text ? JSON.parse(text) : null;
       calls.push({ id, path: req.url, method: req.method, body, headers: req.headers });
       let value = req.url === '/__workspace/update-status' ? { busy: false } : { ok: true, module: id };
+      if (req.url === '/__workspace/maintenance' && failing.has(id)) { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{}'); return; }
       if (req.url === '/__workspace/maintenance') value = { active: body.active };
       if (req.url === '/__workspace/capabilities') value = moduleCapabilities(id);
       if (req.url === '/api/hub/positions') value = { schemaVersion: 1, generatedAt: new Date().toISOString(), accounts: [] };
@@ -48,7 +49,7 @@ async function fixture(t, { existing = false } = {}) {
     await new Promise(resolve => server.listen(socketPath, resolve)); modules.push(server);
     removers.push(registerModuleTransport(id, { socketPath, secret }));
   }
-  app = await createApp({ baselineIntervalMs: 0, ...options, dataDir, embeddedModules: true, updatesClient: { status: async () => unavailableUpdateState() } });
+  app = await createApp({ baselineIntervalMs: 0, ...options, dataDir, embeddedModules: true, moduleRuntime, updatesClient: { status: async () => unavailableUpdateState() } });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve)); port = app.server.address().port;
   const origin = `http://hub.localhost:${port}`;
   function request(route, { method = 'GET', body, host = `hub.localhost:${port}`, headers = {}, auth = true } = {}) {
@@ -69,7 +70,7 @@ async function fixture(t, { existing = false } = {}) {
     assert.equal(authorized.status, 302, authorized.text);
     return { host: url.host, cookie: authorized.headers['set-cookie'][0].split(';')[0] };
   }
-  return { request, login, launch, calls, dataDir, app };
+  return { request, login, launch, calls, failing, dataDir, app };
 }
 
 test('migration exposes exactly five built-ins, keeps the native trading module and preserves old configuration', async t => {
@@ -122,6 +123,58 @@ test('the hub resynchronization used after a module restart releases every tradi
   const released = f.calls.slice(before).filter(call => call.path === '/__workspace/maintenance');
   assert.deepEqual(released.map(call => call.id).sort(), ['aster', 'crossex', 'greeks']);
   for (const call of released) assert.deepEqual(call.body, { active: false });
+});
+
+test('an unconfirmed trading module rejects only its own writes; other modules and native execution stay open', async t => {
+  const f = await fixture(t); await f.login();
+  f.failing.add('greeks');
+  for (const id of ['monitor', 'crossex', 'greeks']) {
+    const module = await f.launch(id);
+    const result = await f.request('/api/write', { method: 'POST', body: {}, host: module.host, auth: false, headers: { Cookie: module.cookie } });
+    assert.equal(result.status, id === 'greeks' ? 503 : 200, id);
+    assert.equal(f.calls.some(call => call.id === id && call.path === '/api/write'), id !== 'greeks', `${id} write reached the module`);
+  }
+  // Native execution passes admission; the invalid body is then rejected by execution itself.
+  const native = await f.request('/api/trading/execution/preview', { method: 'POST', body: {} });
+  assert.notEqual(native.status, 503, native.text);
+  const status = await f.request('/api/system/updates');
+  assert.equal(status.status, 200);
+  assert.deepEqual(status.data.moduleMaintenance, [{ id: 'crossex', confirmed: true }, { id: 'greeks', confirmed: false }, { id: 'aster', confirmed: true }]);
+});
+
+test('module status joins supervisor state with maintenance, and operator restart only accepts a faulted module', async t => {
+  const states = Object.fromEntries(moduleIds.map(id => [id, 'ready'])), restarts = [];
+  const moduleRuntime = {
+    status: () => moduleIds.map(moduleId => ({ moduleId, state: states[moduleId], generation: 1 })),
+    restart: id => { restarts.push(id); return states[id] === 'fault'; },
+  };
+  const f = await fixture(t, { moduleRuntime });
+  assert.equal((await f.request('/api/system/modules')).status, 401);
+  await f.login();
+  const read = await f.request('/api/system/modules');
+  assert.equal(read.status, 200); assert.match(read.headers['cache-control'], /no-store/);
+  assert.equal(read.data.enabled, true);
+  assert.deepEqual(read.data.modules.map(row => [row.moduleId, row.maintenanceConfirmed]), [['monitor', null], ['asset', null], ['crossex', true], ['greeks', true], ['aster', true]]);
+  assert.match(read.data.modules.find(row => row.moduleId === 'greeks').maintenanceReleasedAt, /^\d{4}-/);
+  assert.equal((await f.request('/api/system/modules?x=1')).status, 400);
+  assert.equal((await f.request('/api/system/modules', { method: 'POST', body: {} })).status, 405);
+  assert.equal((await f.request('/api/system/modules', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST' })).status, 409);
+  states.greeks = 'fault';
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST', headers: { 'X-CSRF-Token': 'forged' } })).status, 403);
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST', headers: { Origin: 'https://evil.example' } })).status, 403);
+  const accepted = await f.request('/api/system/modules/greeks/restart', { method: 'POST' });
+  assert.equal(accepted.status, 202); assert.deepEqual(accepted.data, { accepted: true, moduleId: 'greeks' });
+  for (const [route, method, status] of [['/api/system/modules/unknown/restart', 'POST', 404], ['/api/system/modules/constructor/restart', 'POST', 404], ['/api/system/modules/greeks/restart', 'GET', 405], ['/api/system/modules/greeks/restart?now=1', 'POST', 400]]) {
+    assert.equal((await f.request(route, { method })).status, status, `${method} ${route}`);
+  }
+  assert.deepEqual(restarts, ['greeks', 'greeks']);
+});
+
+test('without a supervisor the module status is disabled and restart is not found', async t => {
+  const f = await fixture(t); await f.login();
+  assert.deepEqual((await f.request('/api/system/modules')).data, { schemaVersion: 1, enabled: false, modules: [] });
+  assert.equal((await f.request('/api/system/modules/greeks/restart', { method: 'POST' })).status, 404);
 });
 
 test('architecture inspection and sampling read only the five authenticated capability contracts', async t => {

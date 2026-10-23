@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, writeFile, readFile, copyFile, rm, readdir } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startModules } from '../server/modules/runtime.mjs';
+import { startModules, processStartTime } from '../server/modules/runtime.mjs';
 import { moduleOrigin, moduleTransport, registerModuleTransport } from '../server/modules/transport.mjs';
 import { moduleIds } from '../server/modules/catalog.mjs';
 import { moduleCapabilities } from '../server/modules/capabilities.mjs';
@@ -131,7 +131,8 @@ async function fixture(t, { modes = {}, closeDelay = 0, omitRoot } = {}) {
     closed: id => exists(path.join(dataDir, 'modules', id, 'closed')),
     mode: (id, value) => writeFile(path.join(dataDir, 'modules', id, '.env'), `FIXTURE_START=${value}\nFIXTURE_CLOSE_DELAY_MS=${closeDelay}\n`),
     state: id => runtime.status().find(row => row.moduleId === id),
-    async start(options = {}) { runtime = await startModules({ root, dataDir, timeoutMs: 2000, logger: { info: value => logs.push(value), warn: value => logs.push(value) }, ...options }); return runtime; },
+    // The workbench calls markStarted() once it listens; started: false keeps the first-start contract.
+    async start({ started = true, ...options } = {}) { runtime = await startModules({ root, dataDir, timeoutMs: 2000, logger: { info: value => logs.push(value), warn: value => logs.push(value) }, ...options }); if (started) runtime.markStarted(); return runtime; },
   };
 }
 
@@ -205,10 +206,13 @@ test('a ready worker crash restarts only that worker under a new generation afte
   }
   assert.deepEqual(readies, [{ id: 'asset', generation: 2 }]);
   let asset = f.state('asset');
-  assert.deepEqual(Object.keys(asset).sort(), ['consecutiveFailures', 'generation', 'lastExitAt', 'lastExitKind', 'moduleId', 'nextAttemptAt', 'readyAt', 'restartCount', 'state'], 'status never exposes pids, paths or secrets');
+  assert.deepEqual(Object.keys(asset).sort(), ['consecutiveFailures', 'faultReason', 'generation', 'lastExitAt', 'lastExitKind', 'moduleId', 'nextAttemptAt', 'readyAt', 'restartCount', 'state', 'waitingFor'], 'status never exposes pids, paths or secrets');
   assert.equal(asset.state, 'ready'); assert.equal(asset.restartCount, 1); assert.equal(asset.consecutiveFailures, 1); assert.equal(asset.lastExitKind, 'exit');
-  // An instance that stayed ready past stableMs does not count its exit as a failure.
+  assert.equal(typeof f.logs.find(entry => entry?.event === 'ready' && entry.moduleId === 'asset').recoveryMs, 'number');
+  // A run past stableMs reports a cleared count before the next exit.
   offset += 60_000;
+  assert.equal(f.state('asset').consecutiveFailures, 0);
+  // An instance that stayed ready past stableMs does not count its exit as a failure.
   assert.equal((await request(registered('asset'), '/crash')).status, 200);
   await until(() => generation('asset') === 3, 'asset generation 3');
   asset = f.state('asset');
@@ -340,6 +344,8 @@ test('repeated failures fault a module, its dependent waits without counting, an
   await new Promise(resolve => setTimeout(resolve, 400));
   let crossex = f.state('crossex');
   assert.equal(crossex.state, 'backoff'); assert.equal(crossex.generation, 1); assert.equal(crossex.restartCount, 0); assert.equal(crossex.consecutiveFailures, 1);
+  assert.deepEqual(crossex.waitingFor, ['monitor']); assert.equal(crossex.nextAttemptAt, null);
+  assert.equal(f.state('monitor').faultReason, 'failures');
   assert.equal(runtime.restart('crossex'), false);
   await f.mode('monitor', 'ok');
   const monitorDrains = drains.filter(id => id === 'monitor').length;
@@ -382,12 +388,12 @@ test('close cancels a pending restart while a module waits in backoff', { timeou
   assertUnavailable();
 });
 
-test('without operator recovery a faulted module still shuts the workbench down for systemd to restart', { timeout: 15000 }, async t => {
+test('with holdFaults off a faulted module shuts the workbench down for systemd to restart', { timeout: 15000 }, async t => {
   const f = await fixture(t);
   let failure;
   const failed = new Promise(resolve => { failure = resolve; });
   let runtime;
-  runtime = await f.start({ restartPolicy: { delaysMs: [20], maxFailures: 2 }, random: () => 0, onFailure: error => failure({ error, states: runtime.status().map(row => row.state) }) });
+  runtime = await f.start({ restartPolicy: { delaysMs: [20], maxFailures: 2 }, holdFaults: false, random: () => 0, onFailure: error => failure({ error, states: runtime.status().map(row => row.state) }) });
   const rows = await f.records();
   await f.mode('greeks', 'fail');
   assert.equal((await request(registered('greeks'), '/crash')).status, 200);
@@ -460,4 +466,38 @@ test('a dependency that changes while its consumer is still starting is delivere
   const updates = (await readFile(file, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(updates, [{ name: 'monitor', socketPath: registered('monitor').socketPath }]);
   assert.equal((await f.record('crossex')).pid, starting.pid);
+});
+
+test('until the workbench marks itself started, a module exit still fails startup', { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  let failure;
+  const failed = new Promise(resolve => { failure = resolve; });
+  const runtime = await f.start({ started: false, restartPolicy: { delaysMs: [10] }, onFailure: failure });
+  const rows = await f.records();
+  assert.equal((await request(registered('asset'), '/crash')).status, 200);
+  assert.match((await bounded(failed, 5000, 'startup failure')).message, /asset stopped/);
+  assert.equal(f.state('asset').generation, 1, 'no restart before the workbench is serving');
+  for (const row of rows) await until(() => !hasProcess(row.pid), `${row.id} stopped`);
+  assert.equal(runtime.restart('asset'), false);
+});
+
+test('a reused process group id is not treated as the old instance and is never killed', { timeout: 15000, skip: process.platform === 'win32' ? 'Windows children are tracked by reported pids' : false }, async t => {
+  const f = await fixture(t, { modes: { asset: 'orphan' } });
+  let reused = null;
+  // Every worker reports start time 1 at spawn; after the crash the asset group id answers as a new leader.
+  await f.start({ restartPolicy: { delaysMs: [10] }, drainTimeoutMs: () => 10_000, startTime: pid => pid === reused ? 2 : 1, onFailure: error => assert.fail(error) });
+  await f.mode('asset', 'ok');
+  const orphan = Number(await readFile(path.join(f.dataDir, 'modules', 'asset', 'orphan.pid'), 'utf8'));
+  reused = (await f.record('asset')).pid;
+  assert.equal((await request(registered('asset'), '/crash')).status, 200);
+  await until(() => generation('asset') === 2, 'asset generation 2', 5000);
+  assert.ok(f.logs.find(entry => entry?.event === 'drained' && entry.moduleId === 'asset').drainMs < 5000, 'no wait on a group that is not ours');
+  assert.equal(hasProcess(orphan), true, 'a group with another start time is never killed');
+});
+
+test('process start times come from the kernel and are null for a missing process', { skip: process.platform !== 'linux' ? 'Linux /proc only' : false }, () => {
+  const value = processStartTime(process.pid);
+  assert.ok(Number.isSafeInteger(value) && value > 0);
+  assert.equal(processStartTime(process.pid), value);
+  assert.equal(processStartTime(2 ** 30), null);
 });

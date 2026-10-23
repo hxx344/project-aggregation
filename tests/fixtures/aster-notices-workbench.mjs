@@ -70,7 +70,7 @@ export async function startFixtureModules() {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
   for (const { id } of moduleCatalog) remove.push(registerModuleTransport(id, { socketPath, secret }));
   console.log('ASTER notices fixture: real Hub entry http://hub.localhost:39152/?view=project&id=aster; no trading workers');
-  return { close: async () => {
+  return { markStarted() {}, status: () => [], restart: () => false, close: async () => {
     for (const unregister of remove) unregister();
     await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });

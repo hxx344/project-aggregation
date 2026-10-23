@@ -4,6 +4,8 @@ const SOCKET_PATH = '/run/project-aggregation-updater/control.sock';
 const UNAVAILABLE = '更新服务不可用，请先运行一键部署初始化更新服务';
 const MAINTENANCE = '系统正在更新或等待确认更新结果，暂不能新建实盘任务或修改实盘连接';
 const ACTIVE = new Set(['queued', 'running']);
+const MODULE_UNCONFIRMED = '该交易模块正在恢复，维护状态尚未确认，请稍后重试';
+const SCOPE_INVALID = '写入范围无效，暂不能写入';
 const FINAL_EXECUTION = new Set(['completed', 'stopped']);
 const PLAN_ID = /^[A-Za-z0-9_-]{16,128}$/;
 const GITHUB_TOKEN = /^[A-Za-z0-9_]{20,255}$/;
@@ -71,7 +73,9 @@ export function publicUpdateState(value) {
   if (!object(value) || typeof value.enabled !== 'boolean' || typeof value.checking !== 'boolean'
     || !nullable(value.checkedAt, timestamp) || !nullable(value.checkError, text)
     || !nullable(value.planId, value => typeof value === 'string' && PLAN_ID.test(value)) || !nullable(value.expiresAt, timestamp)
-    || !Array.isArray(value.modules) || value.modules.length > 32 || value.reason !== undefined && !text(value.reason)) invalid();
+    || !Array.isArray(value.modules) || value.modules.length > 32 || value.reason !== undefined && !text(value.reason)
+    || value.moduleMaintenance !== undefined && (!Array.isArray(value.moduleMaintenance) || value.moduleMaintenance.length > 8
+      || value.moduleMaintenance.some(row => !object(row) || !identifier(row.id) || typeof row.confirmed !== 'boolean'))) invalid();
   if (value.githubToken !== undefined && (!object(value.githubToken) || typeof value.githubToken.configured !== 'boolean')) invalid();
   if (value.deploymentModes !== undefined && (!Array.isArray(value.deploymentModes) || !value.deploymentModes.length
     || value.deploymentModes.length > DEPLOYMENT_MODES.size || new Set(value.deploymentModes).size !== value.deploymentModes.length
@@ -108,7 +112,8 @@ export function publicUpdateState(value) {
   return { enabled: value.enabled, ...(value.reason === undefined ? {} : { reason: value.reason }), checking: value.checking,
     checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job,
     ...(value.deploymentModes === undefined ? {} : { deploymentModes: [...value.deploymentModes] }),
-    ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }) };
+    ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }),
+    ...(value.moduleMaintenance === undefined ? {} : { moduleMaintenance: value.moduleMaintenance.map(row => ({ id: row.id, confirmed: row.confirmed })) }) };
 }
 
 export function validateUpdateBody(action, body) {
@@ -172,22 +177,40 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, prepareApply = async () => {}, releasePollMs = 5000 }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, tradingModules = [], moduleIds = tradingModules, prepareApply = async () => {}, releasePollMs = 5000, now = Date.now }) {
   let pendingPlanId = readPendingPlanId();
   let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
-  let moduleSync = Promise.resolve(), synchronized = false, watcher = null, polling = null, closed = false;
-  const synchronizeModules = () => {
-    const next = moduleSync.catch(() => {}).then(() => setModuleMaintenance(maintenance));
+  let moduleSync = Promise.resolve(), watcher = null, polling = null, closed = false;
+  // The maintenance value each trading module last acknowledged; null is unknown.
+  const acknowledged = new Map(tradingModules.map(id => [id, null])), releasedAt = new Map();
+  const confirmed = id => acknowledged.get(id) === maintenance;
+  // Rejects when any module fails, so initialize() and apply() stay all-or-nothing.
+  const synchronizeModules = (ids = tradingModules) => {
+    const next = moduleSync.catch(() => {}).then(async () => {
+      const active = maintenance;
+      let failed = [];
+      try { await setModuleMaintenance(active, ids); }
+      catch (error) { failed = Array.isArray(error?.failed) ? error.failed : ids; throw error; }
+      finally {
+        for (const id of ids) {
+          const value = failed.includes(id) ? null : active;
+          if (value === false && acknowledged.get(id) !== false) releasedAt.set(id, new Date(now()).toISOString());
+          if (value !== false) releasedAt.delete(id);
+          acknowledged.set(id, value);
+        }
+      }
+    });
     moduleSync = next;
-    void next.then(() => { synchronized = true; }, () => { synchronized = false; }).finally(watchRelease);
+    void next.catch(() => {}).finally(watchRelease);
     return next;
   };
+  const withModules = state => tradingModules.length ? { ...state, moduleMaintenance: tradingModules.map(id => ({ id, confirmed: confirmed(id) })) } : state;
   // The hub restarts while the update job is still running, so the latch can
   // only be released by a later status read. Without a server-side read the
   // trading modules stay in maintenance until some browser asks for status.
   function watchRelease() {
-    if (closed || watcher || !(releasePollMs > 0) || applying || !maintenance && synchronized) return;
+    if (closed || watcher || !(releasePollMs > 0) || applying || !maintenance && tradingModules.every(confirmed)) return;
     watcher = setTimeout(() => {
       // status() always resynchronizes modules; failures retry on the next turn.
       polling = (applying ? Promise.resolve() : status()).catch(() => {}).finally(() => { polling = null; watcher = null; watchRelease(); });
@@ -218,15 +241,16 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     // A read that returns during shutdown must not write state or call modules.
     if (closed) return state;
     if (!applying && version === generation) observe(state);
-    await synchronizeModules();
-    return state;
+    // One restarting module must not hide the updater state; the result is per module.
+    await synchronizeModules().catch(() => {});
+    return withModules(state);
   }
   async function check() {
     const version = generation;
     const state = publicUpdateState(await client.check());
     if (!applying && version === generation) observe(state);
-    await synchronizeModules();
-    return state;
+    await synchronizeModules().catch(() => {});
+    return withModules(state);
   }
   async function token(value, authorize) {
     authorize();
@@ -234,13 +258,19 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     // Credential writes do not enter or clear the trading maintenance gate.
     return publicUpdateState(await client.token(value));
   }
-  async function withExecutionEntry(operation) {
+  /** scope is 'native' or a module id; without one every trading module must be confirmed. */
+  async function withExecutionEntry(operation, { scope } = {}) {
+    // An unknown scope would match no gate, so it is refused rather than allowed.
+    if (scope !== undefined && scope !== 'native' && !moduleIds.includes(scope) && !tradingModules.includes(scope)) throw new UpdateError(503, SCOPE_INVALID);
     if (applying) throw new UpdateError(409, MAINTENANCE);
     // Reserve before the first await, so apply cannot pass its idle check concurrently.
     entries += 1;
     try {
       await status();
       if (maintenance || applying) throw new UpdateError(409, MAINTENANCE);
+      // Only the target trading module's gate matters; other scopes need none.
+      const required = scope === undefined ? tradingModules : tradingModules.filter(id => id === scope);
+      if (!required.every(confirmed)) throw new UpdateError(503, MODULE_UNCONFIRMED);
       return await operation();
     } finally { entries -= 1; }
   }
@@ -281,13 +311,19 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     })();
     return pending.promise;
   }
-  // A restarted trading module starts in maintenance. Resynchronize at once
-  // instead of waiting for a browser status read; failures retry via watchRelease.
-  function resynchronize() {
-    if (closed) return Promise.resolve();
-    synchronized = false;
-    return synchronizeModules().catch(() => {});
+  // A restarted trading module starts in maintenance. Synchronize only that
+  // module at once instead of waiting for a browser status read; failures
+  // retry via watchRelease.
+  function resynchronize(id) {
+    const ids = id === undefined ? tradingModules : tradingModules.filter(module => module === id);
+    if (closed || !ids.length) return Promise.resolve();
+    for (const module of ids) { acknowledged.set(module, null); releasedAt.delete(module); }
+    return synchronizeModules(ids).catch(() => {});
+  }
+  /** Per trading module: whether its gate matches the durable value, and when it was last released. */
+  function moduleMaintenance() {
+    return Object.fromEntries(tradingModules.map(id => [id, { confirmed: confirmed(id), maintenance, releasedAt: releasedAt.get(id) ?? null }]));
   }
   async function close() { closed = true; clearTimeout(watcher); await polling; }
-  return { status, check, apply, token, withExecutionEntry, initialize: synchronizeModules, resynchronize, close };
+  return { status, check, apply, token, withExecutionEntry, initialize: () => synchronizeModules(), resynchronize, moduleMaintenance, close };
 }

@@ -65,7 +65,7 @@ function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 
     writeMaintenance: value => { persisted.maintenance = value; events.push(`persist:maintenance:${value}`); },
     readPendingPlanId: () => persisted.pendingPlanId,
     writePendingPlanId: value => { persisted.pendingPlanId = value; events.push(`persist:plan:${value}`); },
-    setModuleMaintenance: guard.setMaintenance,
+    setModuleMaintenance: guard.setMaintenance, tradingModules: modules, moduleIds: ['monitor', 'asset', ...modules],
     prepareApply: async () => { events.push('prepare'); await guard.prepareApply(); },
     releasePollMs,
   });
@@ -230,14 +230,94 @@ test('one failed module maintenance call waits for the other result and prevents
   assert.deepEqual(f.active, { crossex: false, greeks: false, aster: false });
 });
 
-test('failed module synchronization rejects initialization and live-entry operations closed', async () => {
-  const f = fixture(); let entries = 0;
+test('failed module synchronization rejects initialization, and live entry closes only for that module or an unscoped caller', async () => {
+  const f = fixture(); const entries = [];
   f.handlers['gate:greeks'] = () => { throw new Error('private failure'); };
   await assert.rejects(f.coordinator.initialize(), error => error instanceof UpdateError && error.status === 503);
   f.updaterState = state();
-  await assert.rejects(f.coordinator.withExecutionEntry(() => { entries += 1; }), error => error instanceof UpdateError && error.status === 503);
-  assert.equal(entries, 0);
+  for (const scope of [undefined, 'greeks']) {
+    await assert.rejects(f.coordinator.withExecutionEntry(() => { entries.push(scope); }, { scope }), error => error instanceof UpdateError && error.status === 503);
+  }
+  // CrossEx, Monitor, Asset and native execution do not depend on the Greeks gate.
+  for (const scope of ['crossex', 'monitor', 'asset', 'native']) assert.equal(await f.coordinator.withExecutionEntry(() => { entries.push(scope); return scope; }, { scope }), scope);
+  assert.deepEqual(entries, ['crossex', 'monitor', 'asset', 'native']);
   assert.equal(f.calls.includes('apply'), false);
+});
+
+test('every scope still closes on the durable latch, an apply in flight or an unreadable updater, and unknown scopes never pass', async t => {
+  const scopes = ['monitor', 'asset', 'native', 'crossex'];
+  await t.test('durable latch', async () => {
+    const f = fixture({ maintenance: true }); let entered = 0;
+    f.updaterState = state('running');
+    for (const scope of scopes) await assert.rejects(f.coordinator.withExecutionEntry(() => { entered += 1; }, { scope }), error => error.status === 409, scope);
+    assert.equal(entered, 0);
+  });
+  await t.test('apply in flight', async () => {
+    const f = fixture(); let entered = 0;
+    f.updaterState = state();
+    const gate = deferred();
+    f.handlers['status:greeks'] = async () => { await gate.promise; return { data: { busy: false } }; };
+    const applying = f.apply();
+    for (const scope of scopes) await assert.rejects(f.coordinator.withExecutionEntry(() => { entered += 1; }, { scope }), error => error.status === 409, scope);
+    gate.resolve(); await applying;
+    assert.equal(entered, 0);
+  });
+  await t.test('unreadable updater', async () => {
+    const f = fixture(); let entered = 0;
+    // An invalid updater reply is unreadable state.
+    f.updaterState = null;
+    for (const scope of scopes) await assert.rejects(f.coordinator.withExecutionEntry(() => { entered += 1; }, { scope }), error => error instanceof UpdateError && error.status === 503, scope);
+    assert.equal(entered, 0);
+  });
+  await t.test('unknown scope', async () => {
+    const f = fixture(); let entered = 0;
+    f.updaterState = state();
+    for (const scope of ['Aster', 'aster5x', 'constructor', '']) await assert.rejects(f.coordinator.withExecutionEntry(() => { entered += 1; }, { scope }), error => error instanceof UpdateError && error.status === 503, JSON.stringify(scope));
+    assert.equal(entered, 0);
+  });
+});
+
+test('status reports each trading module gate instead of failing while one module is unreachable', async () => {
+  const f = fixture();
+  f.updaterState = state();
+  let failing = true;
+  f.handlers['gate:aster'] = active => { if (failing) throw new Error('restarting'); return { data: { active } }; };
+  const first = await f.coordinator.status();
+  assert.equal(first.job, null);
+  assert.deepEqual(first.moduleMaintenance, [{ id: 'crossex', confirmed: true }, { id: 'greeks', confirmed: true }, { id: 'aster', confirmed: false }]);
+  assert.deepEqual((await f.coordinator.check()).moduleMaintenance.map(row => row.confirmed), [true, true, false]);
+  const released = f.coordinator.moduleMaintenance();
+  assert.equal(released.aster.confirmed, false); assert.equal(released.aster.releasedAt, null);
+  assert.equal(released.crossex.confirmed, true); assert.equal(released.crossex.maintenance, false); assert.match(released.crossex.releasedAt, /^\d{4}-/);
+  failing = false;
+  assert.deepEqual((await f.coordinator.status()).moduleMaintenance.map(row => row.confirmed), [true, true, true]);
+  assert.match(f.coordinator.moduleMaintenance().aster.releasedAt, /^\d{4}-/);
+  assert.equal(f.coordinator.moduleMaintenance().crossex.releasedAt, released.crossex.releasedAt, 'a repeated release keeps the first release time');
+});
+
+test('a restarted trading module is synchronized alone and other modules stay writable while it is unconfirmed', async t => {
+  const f = fixture({ releasePollMs: 0 });
+  t.after(() => f.coordinator.close());
+  f.updaterState = state();
+  await f.coordinator.initialize();
+  let attempts = 0;
+  // The first acknowledgement fails as if the module were still finishing startup.
+  f.handlers['gate:greeks'] = active => { if (attempts++ === 0) throw new Error('starting'); return { data: { active } }; };
+  const before = f.events.length;
+  await f.coordinator.resynchronize('greeks');
+  assert.deepEqual(f.events.slice(before).filter(value => value.startsWith('gate:')), ['gate:greeks:false:start'], 'only Greeks is synchronized for its own restart');
+  const gates = f.coordinator.moduleMaintenance();
+  assert.equal(gates.greeks.confirmed, false); assert.equal(gates.greeks.releasedAt, null);
+  assert.equal(gates.crossex.confirmed, true);
+  f.handlers['gate:greeks'] = () => { throw new Error('still starting'); };
+  assert.equal(await f.coordinator.withExecutionEntry(() => 'crossex', { scope: 'crossex' }), 'crossex');
+  await assert.rejects(f.coordinator.withExecutionEntry(() => 'greeks', { scope: 'greeks' }), error => error instanceof UpdateError && error.status === 503);
+  delete f.handlers['gate:greeks'];
+  assert.equal(await f.coordinator.withExecutionEntry(() => 'greeks', { scope: 'greeks' }), 'greeks', 'the next status read confirms Greeks');
+  const events = f.events.length;
+  await f.coordinator.resynchronize('monitor');
+  await f.coordinator.resynchronize('constructor');
+  assert.equal(f.events.length, events, 'non-trading and unknown ids synchronize nothing');
 });
 
 test('a module that does not acknowledge the requested maintenance value fails closed before update submission', async t => {

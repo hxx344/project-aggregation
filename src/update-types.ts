@@ -35,6 +35,8 @@ export type UpdateState = {
   enabled: boolean;
   deploymentModes?: UpdateDeployMode[];
   githubToken?: { configured: boolean };
+  /** Embedded trading modules whose maintenance gate is not yet confirmed after a restart. */
+  moduleMaintenance?: Array<{ id: string; confirmed: boolean }>;
   reason?: string;
   checking: boolean;
   checkedAt: string | null;

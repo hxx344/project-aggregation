@@ -41,10 +41,10 @@ try {
   assertRecoveryStartup(dataDir);
   accountWriter = createAccountWriter({ ...writerContext, moduleId: 'hub' });
   // Before createApp returns, its own initialize() performs the first synchronization.
-  modules = await startModules({ dataDir, logger, writerContext, onStarting: handle => { moduleStartup = handle; }, onModuleReady: () => { void app?.resynchronizeModules(); }, onFailure: error => { logger.error({ err: error }, '内嵌模块已停止，正在关闭工作台'); void shutdown(1); } });
+  modules = await startModules({ dataDir, logger, writerContext, onStarting: handle => { moduleStartup = handle; }, onModuleReady: ({ id }) => { void app?.resynchronizeModules(id); }, onFailure: error => { logger.error({ err: error }, '内嵌模块已停止，正在关闭工作台'); void shutdown(1); } });
   runtimeLock.assertHeld();
   if (closing) throw new Error('工作台启动已中止');
-  app = await createApp({ logger, dataDir, embeddedModules: true, accountWriter });
+  app = await createApp({ logger, dataDir, embeddedModules: true, accountWriter, moduleRuntime: modules });
   runtimeLock.assertHeld();
   if (closing) throw new Error('工作台启动已中止');
 } catch (error) {
@@ -55,5 +55,6 @@ try {
   finishStartup(); await shutdown(1); throw error;
 }
 finally { finishStartup(); }
-app.server.listen(port, host, () => logger.info({ port, host, type: 'startup' }, `工作台已启动：http://${host}:${port}`));
+// From here a crashed module restarts alone instead of failing startup.
+app.server.listen(port, host, () => { modules.markStarted(); logger.info({ port, host, type: 'startup' }, `工作台已启动：http://${host}:${port}`); });
 app.server.once('error', error => { logger.error({ err: error }, '工作台监听失败'); void shutdown(1); });
