@@ -25,6 +25,9 @@ type Entry = {
   snapshotOkAt?: number; snapshotHealthy?: boolean; pending?: Promise<void>; abort?: AbortController;
   timer?: ReturnType<typeof setTimeout>; retryScheduled: boolean; automaticRetries: number;
 };
+// Bump whenever readOilFills ids/normalization or mergeFills identity change: stored raw fills are merged with new reads.
+const FILL_CACHE_FORMAT = 1;
+type Stored = Pick<Entry, 'scope' | 'raw' | 'cursor' | 'retryAt' | 'snapshotOkAt' | 'snapshotHealthy'> & { version: number };
 // One scope across all owners and service instances, not one slot per account.
 let queue: Promise<void> = Promise.resolve();
 function serial(work: () => Promise<void>) {
@@ -43,19 +46,63 @@ async function current(database: Database, owner: string, account: SourceAccount
   const row = await database.prepare('SELECT encrypted FROM connections WHERE owner = ? AND exchange = ?').bind(owner, account.key).first<{ encrypted: string }>();
   return !!row && revisionOf(row.encrypted) === revision;
 }
+function parseStored(value: string, definition: ScopeDefinition): Stored | null {
+  try {
+    const data = JSON.parse(value) as Stored;
+    const finite = (item: unknown) => typeof item === 'number' && Number.isFinite(item);
+    if (data?.version !== FILL_CACHE_FORMAT || data.scope?.id !== definition.id || !Array.isArray(data.raw) || !Array.isArray(data.scope.fills)
+      || data.cursor !== null && !finite(data.cursor) || !finite(data.retryAt)) return null;
+    return data;
+  } catch { return null; }
+}
 export function validFillsQuery(url: string) {
   const params = new URL(url).searchParams;
   return [...params.keys()].every(key => key === 'schemaVersion') && params.getAll('schemaVersion').length <= 1
     && (!params.has('schemaVersion') || params.get('schemaVersion') === '1');
 }
 
-/** Process-local, public data only. Replaced/deleted credentials abort work and invalidate cache at every poll.
- * Idle entries expire after 15m; successes refresh after 5m, failures after 60s.
+/** Credentials never enter the cache. Replaced/deleted credentials abort work and invalidate cache at every poll.
+ * Each successful refresh is stored in fill_cache (account fills in plain text, like ledger snapshots) under its
+ * credential revision, so a restart or an entry idle for 15m (evicted from memory) serves the stored fills at once
+ * and resumes incrementally from the stored cursor. Binance mode evidence older than 15m is not restored.
+ * Successes refresh after 5m, failures after 60s.
  * Snapshot uncertainty schedules at most 10 consecutive automatic retries, 30s apart, then waits for a read.
  * Each refresh has a 45s total deadline, <=80 HTTP requests (including positions), no in-request retries. */
 export function createFillsService(options: { now?: () => number; deadline?: number; read?: ReadPositions; fills?: ReadFills; fetcher?: typeof fetch } = {}) {
   const now = options.now ?? Date.now, entries = new Map<string, Entry>(), jobs = new Set<Promise<void>>();
   let closed = false;
+  // A failed cache write only costs the next cold read a full history read.
+  async function save(database: Database, owner: string, account: SourceAccount, entry: Entry) {
+    const { scope, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy } = entry;
+    const stored: Stored = { version: FILL_CACHE_FORMAT, scope: { ...scope, refreshing: false }, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy };
+    await database.prepare('INSERT INTO fill_cache(owner,account,scope,revision,data,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(owner,account,scope) DO UPDATE SET revision=excluded.revision,data=excluded.data,updated_at=excluded.updated_at')
+      .bind(owner, account.key, scope.id, entry.revision, JSON.stringify(stored), now()).run().catch(() => {});
+  }
+  async function forget(database: Database, owner: string, account: string, scope: string, revision: string) {
+    await database.prepare('DELETE FROM fill_cache WHERE owner = ? AND account = ? AND scope = ? AND revision = ?').bind(owner, account, scope, revision).run().catch(() => {});
+  }
+  /** Stored scopes for configured accounts that are not in memory; rows of replaced or removed credentials are deleted. */
+  async function restore(database: Database, owner: string, accounts: SourceAccount[]) {
+    const restored = new Map<string, Stored>();
+    const rows = await database.prepare('SELECT account,scope,revision FROM fill_cache WHERE owner = ?').bind(owner)
+      .all<{ account: string; scope: string; revision: string }>().catch(() => ({ results: [] }));
+    for (const row of rows.results) {
+      const account = accounts.find(item => item.key === row.account);
+      const definition = POSITIONS_CATALOG.find(item => item.id === account?.exchange)?.scopes.find(item => item.id === row.scope);
+      if (!account?.row || revisionOf(account.row.encrypted) !== row.revision || !definition || !cycleSupported(account.exchange, row.scope)) {
+        await forget(database, owner, row.account, row.scope, row.revision); continue;
+      }
+      // A hidden Binance mode never gets an entry; skip it rather than parse its row on every poll.
+      const key = cacheKey(owner, row.account, row.scope);
+      if (entries.has(key) || inactive(owner, account, row.scope, row.revision)) continue;
+      const data = await database.prepare('SELECT data FROM fill_cache WHERE owner = ? AND account = ? AND scope = ? AND revision = ?')
+        .bind(owner, row.account, row.scope, row.revision).first<{ data: string }>().catch(() => null);
+      const stored = data && parseStored(data.data, definition);
+      if (stored) restored.set(key, { ...stored, scope: { ...stored.scope, label: definition.label } });
+      else await forget(database, owner, row.account, row.scope, row.revision);
+    }
+    return restored;
+  }
   function remove(key: string, entry: Entry) {
     clearTimeout(entry.timer); entry.timer = undefined; entry.retryScheduled = false;
     entry.abort?.abort(); entry.scope.refreshing = false;
@@ -148,7 +195,10 @@ export function createFillsService(options: { now?: () => number; deadline?: num
         if (!replayed.skew && positions !== null) entry.cursor = snapshotAt;
         entry.retryAt = now() + (replayed.skew ? SKEW_RETRY : positions === null ? RETRY : TTL);
         entry.retryScheduled = replayed.skew && entry.automaticRetries < MAX_AUTO_RETRIES;
+        if (entries.get(key) === entry && !abort.signal.aborted) await save(database, owner, account, entry);
       } catch (error) {
+        // A conflicting stored history must not outlive this process; the next cold read starts over.
+        if (error instanceof FillConflict) await forget(database, owner, account.key, entry.scope.id, entry.revision);
         if (entries.get(key) === entry && await current(database, owner, account, entry.revision).catch(() => false)) {
           entry.scope = { ...entry.scope, status: error instanceof FillConflict ? 'error' : entry.scope.fetchedAt ? 'stale' : 'error',
             error: error instanceof FillConflict ? CONFLICT : FAILED };
@@ -175,6 +225,8 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           remove(key, entry);
         }
       }
+      const restored = await restore(database, owner, accounts);
+      if (closed) throw new Error(FAILED);
       const exchanges: HubFills['exchanges'] = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
         accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
           const revision = account.row ? revisionOf(account.row.encrypted) : null;
@@ -188,8 +240,12 @@ export function createFillsService(options: { now?: () => number; deadline?: num
             if (!supported) return [empty(definition, true, false)];
             let entry = entries.get(key);
             if (!entry) {
-              entry = { revision, scope: empty(definition, true, true), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null,
-                retryScheduled: false, automaticRetries: 0 };
+              // Old mode evidence would pin a Binance account to both modes; a clock set back must not postpone refresh.
+              const stored = restored.get(key), recent = stored?.snapshotOkAt !== undefined && tick - stored.snapshotOkAt < IDLE;
+              entry = stored ? { revision, scope: stored.scope, raw: stored.raw, touchedAt: tick, retryAt: Math.min(stored.retryAt, tick + TTL), cursor: stored.cursor,
+                ...(recent ? { snapshotOkAt: stored.snapshotOkAt, snapshotHealthy: stored.snapshotHealthy } : {}), retryScheduled: false, automaticRetries: 0 }
+                : { revision, scope: empty(definition, true, true), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null,
+                  retryScheduled: false, automaticRetries: 0 };
               entries.set(key, entry);
             }
             entry.touchedAt = tick;
