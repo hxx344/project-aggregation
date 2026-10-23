@@ -434,7 +434,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
             const finish = () => { res.removeListener('close', finish); resolve(); };
             res.once('close', finish);
             proxy(req, res, context, project, grant).catch(error => { res.removeListener('close', finish); reject(error); });
-          }));
+          }), { scope: project.id });
         } catch (error) { throw error instanceof PortalError ? error : new PortalError([400, 401, 403, 409, 503].includes(error.status) ? error.status : 503, error.message || '模块暂时不可写入'); }
       } else await proxy(req, res, context, project, grant);
     } catch (error) { sendError(res, error); }

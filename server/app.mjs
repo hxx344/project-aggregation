@@ -23,7 +23,7 @@ import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, Update
 import { createUpdateStream } from './update-stream.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { moduleCatalog, moduleIds } from './modules/catalog.mjs';
-import { createModuleUpdateGuard } from './modules/updates.mjs';
+import { createModuleUpdateGuard, tradingModules } from './modules/updates.mjs';
 import { readModuleCapabilities } from './modules/capabilities.mjs';
 import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from './observability.mjs';
 import { createAccountWriter } from './execution/account-writer.mjs';
@@ -149,7 +149,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
   const moduleUpdateGuard = embeddedModules ? createModuleUpdateGuard() : null;
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
-    ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, prepareApply: moduleUpdateGuard.prepareApply } : {}),
+    ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, tradingModules, prepareApply: moduleUpdateGuard.prepareApply } : {}),
     readMaintenance: () => getSetting('updates-maintenance') === '1',
     writeMaintenance: active => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
@@ -157,6 +157,8 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     readPendingDeployMode: () => getSetting('updates-pending-deploy-mode') || 'source',
     writePendingDeployMode: mode => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-deploy-mode', mode),
   });
+  // Native execution is not gated by any one embedded trading module's maintenance sync.
+  const native = { scope: 'native' };
   const publicProject = row => { const project = JSON.parse(row.json);
     if (embeddedModules) {
       const module = moduleCatalog.find(item => item.id === project.id);
@@ -469,10 +471,10 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && req.method === 'GET') { send(res, 200, execution.state()); return; }
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
-      if (account && req.method === 'PUT') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.connect(account[1], body, current.id))); return; }
-      if (account && req.method === 'DELETE') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.disconnect(account[1], body, current.id))); return; }
-      if (pathname === '/api/trading/execution/preview' && req.method === 'POST') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.preview(body, current.id))); return; }
-      if (pathname === '/api/trading/execution/jobs' && req.method === 'POST') { const body = await bodyOf(req); send(res, 202, await updates.withExecutionEntry(() => execution.start(body, current.id))); return; }
+      if (account && req.method === 'PUT') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.connect(account[1], body, current.id), native)); return; }
+      if (account && req.method === 'DELETE') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.disconnect(account[1], body, current.id), native)); return; }
+      if (pathname === '/api/trading/execution/preview' && req.method === 'POST') { const body = await bodyOf(req); send(res, 200, await updates.withExecutionEntry(() => execution.preview(body, current.id), native)); return; }
+      if (pathname === '/api/trading/execution/jobs' && req.method === 'POST') { const body = await bodyOf(req); send(res, 202, await updates.withExecutionEntry(() => execution.start(body, current.id), native)); return; }
       const job = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/(stop|reconcile)$/);
       if (job && req.method === 'POST') { const body = await bodyOf(req); send(res, 200, job[2] === 'stop' ? execution.stop(job[1], body, current.id) : await execution.reconcile(job[1], body, current.id)); return; }
       throw new HttpError(404, '实盘执行接口不存在');

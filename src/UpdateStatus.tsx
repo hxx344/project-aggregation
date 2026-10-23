@@ -11,6 +11,7 @@ const RELOAD_DELAY = 1_500;
 const NOTICE_KEY = 'workbench.update-notice.dismissed';
 type RequestKind = 'read' | 'check' | 'apply' | 'token';
 const moduleLabels = { current: '已是最新', available: '可更新', unavailable: '检查未完成', unmanaged: '需手动更新' };
+const tradingNames: Record<string, string> = { crossex: 'Gate CrossEx', greeks: 'Greeks', aster: 'Aster 5x' };
 const jobLabels = { queued: '更新已排队', running: '正在更新', succeeded: '更新已完成', failed: '上次更新未完成', interrupted: '上次更新已中断' };
 const stepLabels = { pending: '等待', running: '进行中', succeeded: '已完成', failed: '失败', skipped: '已跳过' };
 const modeLabels: Record<UpdateDeployMode, string> = { source: '下载源码构建', ci: '下载 CI 构建包' };
@@ -385,6 +386,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
   const unconfirmed = modules.some(module => module.state === 'current' && matchesLatest(module) === null);
   const checking = !!snapshot?.checking || pending === 'check';
   const updating = running(snapshot?.job) || pending === 'apply';
+  const recovering = Array.isArray(snapshot?.moduleMaintenance) ? snapshot.moduleMaintenance.filter(row => row?.confirmed === false).map(row => tradingNames[row.id] || row.id) : [];
   const deploymentModes = Array.isArray(snapshot?.deploymentModes) ? snapshot.deploymentModes.filter((mode, index, modes) => (mode === 'source' || mode === 'ci') && modes.indexOf(mode) === index) : [];
   const modeSupported = deploymentModes.length > 0;
   const selectedMode = deploymentModes.includes(deployMode) ? deployMode : deploymentModes[0] || 'source';
@@ -462,6 +464,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {networkError ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>{networkError}</strong><p>恢复连接后会自动读取服务器记录。</p><button className="text-button" disabled={pending !== null} onClick={() => void request('read')}>重新连接</button></div></div> : null}
     {snapshot?.checkError || checkRequestFailed ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{snapshot?.checkError || '上次检查请求未完成，当前显示的是已有记录。'}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
     {actionNotice ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{actionNotice}</p></div> : null}
+    {recovering.length && !updating && !uncertain && !reloading ? <div className="update-message warning" role="status"><CircleAlert size={18} /><div><strong>交易模块恢复中：{recovering.join('、')}</strong><p>维护状态确认前，这些模块暂不能交易，其他模块不受影响。确认后会自动恢复。</p></div></div> : null}
     {reloading ? <div className="update-message setup" role="status"><RefreshCw size={18} className="spin" /><p>更新已完成，正在刷新页面以载入新版本和重启后的模块连接。</p></div> : null}
     {downloadProgress ? <DownloadProgress progress={downloadProgress} /> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} /> : null}

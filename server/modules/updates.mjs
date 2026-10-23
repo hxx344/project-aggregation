@@ -3,14 +3,16 @@ import { UpdateError } from '../updates.mjs';
 import { moduleOrigin } from './transport.mjs';
 import { readModuleCapabilities } from './capabilities.mjs';
 
-const tradingModules = ['crossex', 'greeks', 'aster'];
+export const tradingModules = Object.freeze(['crossex', 'greeks', 'aster']);
 const names = { crossex: 'Gate CrossEx', greeks: 'Greeks', aster: 'Aster 5x' };
 export function createModuleUpdateGuard({ request = requestJson } = {}) {
-  async function setMaintenance(active) {
-    const results = await Promise.allSettled(tradingModules.map(id => request(moduleOrigin(id), '/__workspace/maintenance', {
+  /** Rejects with `failed` listing every module that did not acknowledge `active`. */
+  async function setMaintenance(active, ids = tradingModules) {
+    const results = await Promise.allSettled(ids.map(id => request(moduleOrigin(id), '/__workspace/maintenance', {
       method: 'POST', body: { active }, deadline: Date.now() + 10_000,
     })));
-    if (results.some(result => result.status === 'rejected' || result.value?.data?.active !== active)) throw new UpdateError(503, '内嵌交易模块的维护状态尚未确认，请重试');
+    const failed = ids.filter((_, index) => results[index].status === 'rejected' || results[index].value?.data?.active !== active);
+    if (failed.length) throw Object.assign(new UpdateError(503, '内嵌交易模块的维护状态尚未确认，请重试'), { failed });
   }
   async function prepareApply() {
     // Independent read-only evidence is checked concurrently after every gate

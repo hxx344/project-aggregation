@@ -17,7 +17,7 @@ const password = 'embedded-hub-test-password';
 const options = { initialPassword: password, logger: () => {}, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0 };
 async function fixture(t, { existing = false } = {}) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'embedded-hub-'));
-  const modules = [], calls = [], removers = [];
+  const modules = [], calls = [], removers = [], failing = new Set();
   let app, cookie, csrf, port;
   t.after(async () => {
     await app?.close(); for (const remove of removers) remove();
@@ -39,6 +39,7 @@ async function fixture(t, { existing = false } = {}) {
       const text = Buffer.concat(chunks).toString(), body = text ? JSON.parse(text) : null;
       calls.push({ id, path: req.url, method: req.method, body, headers: req.headers });
       let value = req.url === '/__workspace/update-status' ? { busy: false } : { ok: true, module: id };
+      if (req.url === '/__workspace/maintenance' && failing.has(id)) { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{}'); return; }
       if (req.url === '/__workspace/maintenance') value = { active: body.active };
       if (req.url === '/__workspace/capabilities') value = moduleCapabilities(id);
       if (req.url === '/api/hub/positions') value = { schemaVersion: 1, generatedAt: new Date().toISOString(), accounts: [] };
@@ -69,7 +70,7 @@ async function fixture(t, { existing = false } = {}) {
     assert.equal(authorized.status, 302, authorized.text);
     return { host: url.host, cookie: authorized.headers['set-cookie'][0].split(';')[0] };
   }
-  return { request, login, launch, calls, dataDir, app };
+  return { request, login, launch, calls, failing, dataDir, app };
 }
 
 test('migration exposes exactly five built-ins, keeps the native trading module and preserves old configuration', async t => {
@@ -122,6 +123,23 @@ test('the hub resynchronization used after a module restart releases every tradi
   const released = f.calls.slice(before).filter(call => call.path === '/__workspace/maintenance');
   assert.deepEqual(released.map(call => call.id).sort(), ['aster', 'crossex', 'greeks']);
   for (const call of released) assert.deepEqual(call.body, { active: false });
+});
+
+test('an unconfirmed trading module rejects only its own writes; other modules and native execution stay open', async t => {
+  const f = await fixture(t); await f.login();
+  f.failing.add('greeks');
+  for (const id of ['monitor', 'crossex', 'greeks']) {
+    const module = await f.launch(id);
+    const result = await f.request('/api/write', { method: 'POST', body: {}, host: module.host, auth: false, headers: { Cookie: module.cookie } });
+    assert.equal(result.status, id === 'greeks' ? 503 : 200, id);
+    assert.equal(f.calls.some(call => call.id === id && call.path === '/api/write'), id !== 'greeks', `${id} write reached the module`);
+  }
+  // Native execution passes admission; the invalid body is then rejected by execution itself.
+  const native = await f.request('/api/trading/execution/preview', { method: 'POST', body: {} });
+  assert.notEqual(native.status, 503, native.text);
+  const status = await f.request('/api/system/updates');
+  assert.equal(status.status, 200);
+  assert.deepEqual(status.data.moduleMaintenance, [{ id: 'crossex', confirmed: true }, { id: 'greeks', confirmed: false }, { id: 'aster', confirmed: true }]);
 });
 
 test('architecture inspection and sampling read only the five authenticated capability contracts', async t => {
