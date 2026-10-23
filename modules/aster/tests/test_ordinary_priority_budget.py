@@ -108,8 +108,10 @@ class OrdinaryPriorityPacingTests(unittest.TestCase):
     def signal(self, values=None):
         h = self.h
         values = values or {5: dec(500000)}
-        h.engine.markets[XAU] = {"status": "ok", "checked_at": h.wall, "capacities": {str(k): str(v) for k, v in values.items()}}
-        h.engine.wake_capacity_accounts(XAU, values, h.wall, [self.owner])
+        stamps = {str(tier): h.wall for tier in values}
+        h.engine.markets[XAU] = {"status": "ok", "checked_at": h.wall, "capacity_checked_at": stamps,
+                                "capacities": {str(k): str(v) for k, v in values.items()}}
+        h.engine.wake_capacity_accounts(XAU, values, h.wall, [self.owner], capacity_checked_at=stamps)
 
     def test_flapping_and_success_rearm_cannot_restart_private_work_every_sample(self):
         h = self.h

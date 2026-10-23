@@ -51,7 +51,9 @@ class PairSymbolsRuntimeTests(TestCase):
 
     def tick(self, pair_id="silver"):
         symbol = self.store.pair(pair_id)["symbol"]
-        self.engine.markets[symbol] = {"status": "ok", "checked_at": time.time(),
+        now = time.time()
+        self.engine.markets[symbol] = {"status": "ok", "checked_at": now,
+            "capacity_checked_at": {str(leverage): now for leverage in range(1, 21)},
             "capacities": {str(leverage): "1000000" for leverage in range(1, 21)}}
         return self.trader.tick(self.store.pair(pair_id))
 

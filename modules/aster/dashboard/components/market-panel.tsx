@@ -99,10 +99,13 @@ export function MarketPanel({
                     ) : null}
                   </TableCell>
                   {SUPPORTED_LEVERAGES.map((v) => {
-                    const stamp =
-                      m?.capacity_checked_at?.[v] ?? m?.checked_at ?? 0;
+                    const stamp = m?.capacity_checked_at?.[v];
                     const tierLive =
-                      live && now - stamp >= -1 && now - stamp <= 8;
+                      live &&
+                      typeof stamp === 'number' &&
+                      Number.isFinite(stamp) &&
+                      now - stamp >= -1 &&
+                      now - stamp <= 8;
                     return (
                       <TableCell
                         key={v}

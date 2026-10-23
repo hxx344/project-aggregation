@@ -38,7 +38,8 @@ class CycleCapacityThresholdTests(unittest.TestCase):
 
     def test_equality_passes_but_one_decimal_below_threshold_does_not(self):
         config = {**DEFAULT_CYCLE, "capacity_multiplier": "2"}
-        row = {"status": "ok", "checked_at": 100, "capacities": {"17": "40000"}}
+        row = {"status": "ok", "checked_at": 100, "capacities": {"17": "40000"},
+               "capacity_checked_at": {"17": 100}}
         self.assertEqual(require_cycle_capacity(config, 17, row, now=100.2), dec(40000))
         row["capacities"]["17"] = "39999.99999999999999999999"
         with self.assertRaises(TradingError) as caught:
@@ -46,10 +47,12 @@ class CycleCapacityThresholdTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostic["checks"][0]["required"], "≥ 40000")
 
     def test_exact_tier_freshness_and_failure_are_required(self):
-        valid = {"status": "ok", "checked_at": 100, "capacities": {"5": "999999"}}
-        for changes, leverage in (({}, 2), ({"status": "error"}, 5), ({"checked_at": 98.999}, 5),
-                                   ({"checked_at": 102}, 5), ({"checked_at": float("nan")}, 5),
-                                   ({"capacity_checked_at": {"5": 98}}, 5),
+        valid = {"status": "ok", "checked_at": 100, "capacities": {"5": "999999"},
+                 "capacity_checked_at": {"5": 100}}
+        for changes, leverage in (({}, 2), ({"status": "error"}, 5), ({"capacity_checked_at": {"5": 98.999}}, 5),
+                                   ({"capacity_checked_at": {"5": 102}}, 5),
+                                   ({"capacity_checked_at": {"5": float("nan")}}, 5),
+                                   ({"capacity_checked_at": {}}, 5),
                                    ({"capacities": {"5": "NaN"}}, 5), ({}, None)):
             with self.subTest(changes=changes, leverage=leverage), self.assertRaises(TradingError):
                 require_cycle_capacity(DEFAULT_CYCLE, leverage, {**valid, **changes}, now=100)
@@ -69,7 +72,38 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
         seed_cycle_capacity(self.engine)
 
     def quota(self, value):
-        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": time.time(), "capacities": {"2": value}}
+        now = time.time()
+        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": now, "capacities": {"2": value},
+                                      "capacity_checked_at": {"2": now}}
+
+    def test_missing_tier_time_blocks_hint_and_open_until_a_new_sample(self):
+        owner = self.f.store.account("test")
+        for stamps in (None, {}, {"5": time.time()}, {"2": None}):
+            with self.subTest(stamps=stamps), patch.object(self.f.broker, "submit") as submit:
+                self.quota("4000")
+                row = self.engine.markets[SYMBOL]
+                if stamps is None:
+                    row.pop("capacity_checked_at")
+                else:
+                    row["capacity_checked_at"] = stamps
+                with self.assertRaises(TradingError):
+                    self.engine.cycle_public_hint(owner)
+                self.engine.tick_account("test")
+                submit.assert_not_called()
+                self.assertIsNone(self.f.store.intent("test"))
+                self.assertEqual(self.f.store.get("cycle:test")["phase"], "waiting_open")
+                check = self.engine.views["test"]["cycle_state"]["diagnostic"]["checks"][0]
+                self.assertIsNone(check["actual"])
+                self.assertIsNone(check["passed"])
+        self.engine.capacity_targets = {SYMBOL: {2}}
+        self.engine.capacity_accounts = [owner]
+        with patch.object(self.f.market, "capacities", return_value={2: dec(4000)}):
+            self.engine.poll_market(SYMBOL)
+        self.assertIsNotNone(self.engine.cycle_public_hint(owner))
+        with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit:
+            self.engine.tick_account("test")
+            submit.assert_called_once()
+        self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")
 
     def test_lower_tier_capacity_never_replaces_unavailable_current_leverage(self):
         self.f.broker.set_cycle_leverage(SYMBOL, 20)
@@ -84,7 +118,8 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
                     self.engine.markets[SYMBOL] = {
                         "status": "ok", "checked_at": now,
                         "capacities": {"2": "1000000", "5": "1000000", "10": "1000000", **current},
-                        "capacity_checked_at": {"20": now - 2} if current.get("20") == "1000000" else {},
+                        "capacity_checked_at": {key: now - 2 if key == "20" and current[key] == "1000000" else now
+                                                for key in ("2", "5", "10", *current)},
                     }
                     with self.assertRaises(TradingError):
                         self.engine.cycle_public_hint(owner)
@@ -105,7 +140,9 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
             self.f.broker.state["positions"][SYMBOL + ":" + side] = {"qty": qty, "entry": "4412"}
         self.f.broker.save()
         self.engine.view("test", snapshot=snapshot_json(self.f.broker.snapshot([SYMBOL]), [SYMBOL]))
-        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": time.time(), "capacities": {"17": "4000"}}
+        now = time.time()
+        self.engine.markets[SYMBOL] = {"status": "ok", "checked_at": now, "capacities": {"17": "4000"},
+                                      "capacity_checked_at": {"17": now}}
         with patch.object(self.f.broker, "submit", wraps=self.f.broker.submit) as submit, \
              patch.object(self.f.broker, "set_leverage") as ordinary_leverage, \
              patch.object(self.f.broker, "set_cycle_leverage") as cycle_leverage:
@@ -183,7 +220,9 @@ class CycleMarketCapacityEngineTests(unittest.TestCase):
         for side, qty in baseline.items():
             self.f.broker.state["positions"][SYMBOL + ":" + side] = {"qty": qty, "entry": "4412"}
         self.f.broker.save()
-        for row in ({"status": "ok", "checked_at": time.time(), "capacities": {"2": "0"}}, {"status": "error"}, {}):
+        now = time.time()
+        for row in ({"status": "ok", "checked_at": now, "capacities": {"2": "0"},
+                     "capacity_checked_at": {"2": now}}, {"status": "error"}, {}):
             seed_cycle_capacity(self.engine)
             self.engine.tick_account("test")
             progress = self.f.store.get("cycle:test")

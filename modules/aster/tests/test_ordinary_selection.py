@@ -34,8 +34,10 @@ class OrdinarySelectionTests(TestCase):
 
     def publish(self, enabled=SYMBOLS, tiers=(5,)):
         for symbol in SYMBOLS:
+            now = time.time()
             self.engine.markets[symbol] = {
-                "status": "ok", "checked_at": time.time(),
+                "status": "ok", "checked_at": now,
+                "capacity_checked_at": {str(tier): now for tier in (5, 10, 20)},
                 "capacities": {str(tier): "500000" if symbol in enabled and tier in tiers else "0"
                                for tier in (5, 10, 20)},
             }
@@ -155,7 +157,9 @@ class OrdinarySelectionTests(TestCase):
         other["policy"]["symbols"] = list(SYMBOLS)
         self.f.store.save_account(other)
         for symbol in SYMBOLS:
-            self.engine.wake_capacity_accounts(symbol, {10: dec(500000)}, time.time(), self.f.store.accounts())
+            now = time.time()
+            self.engine.wake_capacity_accounts(symbol, {10: dec(500000)}, now, self.f.store.accounts(),
+                                               capacity_checked_at={"10": now})
         self.assertEqual(set(self.engine.work("test").priority), {"CLUSD1"})
         self.assertEqual(set(self.engine.work("second").priority), set(SYMBOLS))
 
@@ -206,6 +210,7 @@ class OrdinarySelectionTests(TestCase):
         self.engine.enable("test", True)
         self.publish()
         self.engine.markets["CLUSD1"]["capacities"]["2"] = "500000"
+        self.engine.markets["CLUSD1"]["capacity_checked_at"]["2"] = time.time()
         self.engine.tick_account("test")
         self.assertEqual(self.f.store.get("cycle:test")["phase"], "holding")
         self.assertEqual({order["symbol"] for order in self.f.broker.state["orders"].values()}, {"CLUSD1"})

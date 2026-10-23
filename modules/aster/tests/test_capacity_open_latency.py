@@ -35,6 +35,7 @@ class AvailabilityPeriodTests(unittest.TestCase):
     def sample(self, values, *, sampled=None, stamps=None, checked=None, owners=None):
         checked = WALL + self.tick if checked is None else checked
         owners = self.f.store.accounts() if owners is None else owners
+        stamps = {str(tier): checked for tier in values} if stamps is None else stamps
         self.engine.wake_capacity_accounts(SYMBOL, {k: dec(v) for k, v in values.items()}, checked, owners,
             sampled_tiers=sampled, capacity_checked_at=stamps)
 

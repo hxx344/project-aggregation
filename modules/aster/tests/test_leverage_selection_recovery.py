@@ -33,6 +33,7 @@ class HigherLeverageSelectionTests(unittest.TestCase):
         for symbol in SYMBOLS:
             self.engine.poll_market(symbol)
             self.engine.markets[symbol]["capacities"] = {"2": "500000"}
+            self.engine.markets[symbol]["capacity_checked_at"]["2"] = time.time()
 
     def seed_held_markets(self):
         quotes = {XAU: ("4999.995", "5000.005", "5000"),

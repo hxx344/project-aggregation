@@ -1027,8 +1027,10 @@ class Engine:
         now = time.time()
         fresh = -1 <= now - checked_at <= 8
         sampled = set(TIERS) if sampled_tiers is None else set(sampled_tiers)
-        stamps = {tier: (capacity_checked_at or {}).get(str(tier), checked_at) for tier in capacities}
-        capacities = {tier: value for tier, value in capacities.items() if -1 <= now - stamps[tier] <= 8}
+        stamps = {tier: (capacity_checked_at or {}).get(str(tier)) for tier in capacities}
+        capacities = {tier: value for tier, value in capacities.items()
+                      if type(stamps[tier]) in (int, float) and math.isfinite(stamps[tier])
+                      and -1 <= now - stamps[tier] <= 8}
         by_id = {a["id"]: a for a in accounts}
         with self.lock:
             ids = set(by_id) | {aid for aid, work in self.account_work.items()
@@ -1131,10 +1133,12 @@ class Engine:
     def capacities(self, symbol):
         with self.lock:
             row = self.markets.get(symbol, {}).copy()
-        if row.get("status") != "ok" or not -1 <= time.time() - row.get("checked_at", 0) <= 8:
+        now = time.time()
+        if row.get("status") != "ok" or not -1 <= now - row.get("checked_at", 0) <= 8:
             raise TradingError("市场额度快照过期或查询失败")
         capacities = {int(k): dec(v) for k, v in row["capacities"].items()
-                      if -1 <= time.time() - row.get("capacity_checked_at", {}).get(k, row["checked_at"]) <= 8}
+                      if type(stamp := row.get("capacity_checked_at", {}).get(k)) in (int, float)
+                      and math.isfinite(stamp) and -1 <= now - stamp <= 8}
         return capacities
 
     def check_post_fill_occupancy(self, account, snapshot):
