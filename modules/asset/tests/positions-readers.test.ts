@@ -97,6 +97,158 @@ test('Binance and Aster share the public catalog per fetcher, reload for an unse
   failCatalog = true; await assert.rejects(readBinancePositions(c, fresh)); failCatalog = false;
   await readBinancePositions(c, fresh); assert.equal(catalogs, 5, 'a failed load is retried next time');
 });
+
+const catalogScopes = ['um', 'pm-um', 'cm', 'pm-cm', 'aster'] as const;
+function catalogFixture(scope: typeof catalogScopes[number]) {
+  const inverse = scope === 'cm' || scope === 'pm-cm';
+  const instrument = inverse ? { symbol: 'BTCUSD_PERP', baseAsset: 'BTC', quoteAsset: 'USD', marginAsset: 'BTC', contractSize: 100 }
+    : { ...linearMetadata.symbols[0] };
+  const row = { ...linearPosition('2'), symbol: instrument.symbol };
+  const privateKey = '0'.repeat(63) + '1';
+  const credential = { privateKey, walletAddress: new Wallet(privateKey).address, includeSpot: false };
+  return { inverse, instrument, row, read: (fetcher: typeof fetch) => scope === 'aster'
+    ? readAsterPositions(credential, fetcher) : readBinancePositions(c, fetcher, undefined, scope) };
+}
+
+test('held catalog fields are validated before caching, so the next read recovers immediately after repair', async t => {
+  for (const scope of catalogScopes) {
+    const fixture = catalogFixture(scope);
+    const damaged: [string, unknown][] = fixture.inverse
+      ? [['quoteAsset', null], ['marginAsset', 'BAD\u0000'], ['contractSize', 0], ['contractSize', '-100'], ['contractSize', 'NaN']]
+      : [['baseAsset', null], ['quoteAsset', 'BAD\u0000'], ['marginAsset', null]];
+    for (const [field, value] of damaged) await t.test(`${scope}: ${field}=${JSON.stringify(value)}`, async () => {
+      let broken = true, loads = 0;
+      const fetcher = mock(url => {
+        if (url.pathname.includes('apiRestrictions')) return permissions();
+        if (url.pathname.endsWith('/exchangeInfo')) {
+          loads++;
+          return { symbols: [{ symbol: 'UNRELATED', baseAsset: null, quoteAsset: 'BAD\u0000', contractSize: 0 }, { symbol: null },
+            { ...fixture.instrument, ...(broken ? { [field]: value } : {}) }] };
+        }
+        return [fixture.row];
+      });
+      await assert.rejects(fixture.read(fetcher), /仓位数据不完整/);
+      assert.equal(loads, 1, 'a malformed fresh catalog is fetched only once per read');
+      broken = false;
+      const [recovered] = await fixture.read(fetcher);
+      assert.equal(recovered.symbol, fixture.instrument.symbol);
+      assert.equal(recovered.contractSize, fixture.inverse ? '100' : '1');
+      assert.equal(recovered.pnlCurrency, fixture.instrument.marginAsset);
+      assert.equal(loads, 2, 'repair is visible without waiting for the TTL');
+      await fixture.read(fetcher);
+      assert.equal(loads, 2, 'a repaired catalog is reused despite unrelated malformed entries');
+    });
+  }
+});
+
+test('a newly held malformed cached entry forces one shared reload and remains invalid after persistent damage', async t => {
+  for (const scope of catalogScopes) await t.test(scope, async () => {
+    const fixture = catalogFixture(scope);
+    const next = { ...fixture.instrument, symbol: fixture.inverse ? 'ETHUSD_PERP' : 'ETHUSDT', baseAsset: 'ETH' };
+    let held = fixture.instrument.symbol, repaired = false, loads = 0;
+    const fetcher = mock(url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) {
+        loads++;
+        return { symbols: [fixture.instrument, { ...next, ...(repaired ? {} : { marginAsset: null }) }] };
+      }
+      return [{ ...fixture.row, symbol: held }];
+    });
+    await fixture.read(fetcher);
+    held = next.symbol;
+    await assert.rejects(fixture.read(fetcher), /仓位数据不完整/);
+    assert.equal(loads, 2, 'the invalid cached entry triggers at most one reload');
+    repaired = true;
+    assert.equal((await fixture.read(fetcher))[0].symbol, next.symbol);
+    assert.equal(loads, 3, 'persistent malformed metadata was not cached again');
+    await fixture.read(fetcher);
+    assert.equal(loads, 3);
+  });
+});
+
+test('valid public catalogs expire at ten minutes and missing held contracts never become cached successes', async t => {
+  let now = at;
+  t.mock.method(Date, 'now', () => now);
+  for (const scope of catalogScopes) await t.test(scope, async () => {
+    const fixture = catalogFixture(scope);
+    let held = fixture.instrument.symbol, loads = 0;
+    let listed = [fixture.instrument];
+    const fetcher = mock(url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) { loads++; return { symbols: listed }; }
+      return [{ ...fixture.row, symbol: held }];
+    });
+    await fixture.read(fetcher);
+    now += 10 * 60_000 - 1;
+    await fixture.read(fetcher); assert.equal(loads, 1);
+    now++;
+    await fixture.read(fetcher); assert.equal(loads, 2, 'TTL boundary reloads the catalog');
+    held = fixture.inverse ? 'NEWUSD_PERP' : 'NEWUSDT';
+    await assert.rejects(fixture.read(fetcher), /仓位数据不完整/);
+    assert.equal(loads, 3, 'a missing held contract triggers one reload');
+    listed = [{ ...fixture.instrument, symbol: held }];
+    assert.equal((await fixture.read(fetcher))[0].symbol, held);
+    assert.equal(loads, 4, 'the missing contract is retried on the next read');
+  });
+});
+
+test('concurrent readers share one catalog load per wave, including persistent damage and immediate repair', async t => {
+  for (const scope of catalogScopes) await t.test(scope, async t => {
+    const fixture = catalogFixture(scope);
+    let loads = 0, broken = true;
+    let gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+    t.after(() => gate.resolve());
+    const fetcher = mock(async url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) {
+        loads++; entered.resolve(); await gate.promise;
+        return { symbols: [{ ...fixture.instrument, ...(broken ? { quoteAsset: null } : {}) }] };
+      }
+      return [fixture.row];
+    });
+    for (let wave = 0; wave < 3; wave++) {
+      broken = wave < 2;
+      gate = Promise.withResolvers<void>(); entered = Promise.withResolvers<void>();
+      const reads = Promise.allSettled(Array.from({ length: 8 }, () => fixture.read(fetcher)));
+      await Promise.race([entered.promise, reads.then(() => assert.fail('a fresh catalog request must start before the reads complete'))]);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(loads, wave + 1, 'all concurrent readers share the in-flight public request');
+      gate.resolve();
+      const results = await reads;
+      assert.ok(results.every(result => result.status === (broken ? 'rejected' : 'fulfilled')));
+      assert.equal(loads, wave + 1, 'malformed responses do not trigger an unbounded retry');
+    }
+    await fixture.read(fetcher); assert.equal(loads, 3, 'the repaired shared catalog is reused');
+  });
+});
+
+test('one invalid held entry prevents another concurrent reader from caching the same shared catalog', async t => {
+  for (const scope of catalogScopes) await t.test(scope, async t => {
+    const fixture = catalogFixture(scope);
+    const other = { ...fixture.instrument, symbol: fixture.inverse ? 'ETHUSD_PERP' : 'ETHUSDT' };
+    const gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+    t.after(() => gate.resolve());
+    let loads = 0, positions = 0;
+    const fetcher = mock(async url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) {
+        loads++; entered.resolve(); await gate.promise;
+        return { symbols: [fixture.instrument, { ...other, marginAsset: null }] };
+      }
+      return [{ ...fixture.row, symbol: positions++ === 0 ? other.symbol : fixture.instrument.symbol }];
+    });
+    const reads = Promise.allSettled([fixture.read(fetcher), fixture.read(fetcher)]);
+    await Promise.race([entered.promise, reads.then(() => assert.fail('a catalog request must start before the reads complete'))]);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(loads, 1);
+    gate.resolve();
+    assert.deepEqual((await reads).map(result => result.status).sort(), ['fulfilled', 'rejected']);
+    await fixture.read(fetcher);
+    assert.equal(loads, 2, 'a successful waiter cannot restore the copy rejected by another waiter');
+    await fixture.read(fetcher); assert.equal(loads, 2, 'unrelated malformed entries still permit subsequent valid reuse');
+  });
+});
+
 const bybitPosition = (side = 'Buy', symbol = 'BTCUSDT') => ({ symbol, side, size: '0.000000000000000001', avgPrice: '100', markPrice: '102', positionValue: '0.000000000000000102', unrealisedPnl: '-0.01', leverage: '', liqPrice: '', updatedTime: String(at) });
 test('Bybit follows every cursor and normalizes USDT/USDC/inverse/option using instrument currency metadata', async () => {
   for (const scope of ['linear-usdt', 'linear-usdc', 'inverse', 'option'] as const) {

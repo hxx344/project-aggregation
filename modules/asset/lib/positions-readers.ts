@@ -88,23 +88,38 @@ function signedQuantity(row: Json, field: string, sideField: string): { quantity
 const instrumentsOf = (metadata: unknown) => new Map(rows(record(metadata).symbols).map(item => [item.symbol, item]));
 
 const CATALOG_TTL = 10 * 60_000;
-type CatalogSlot = { value?: { metadata: unknown; symbols: Set<unknown>; expires: number }; pending?: Promise<unknown> };
+type CatalogValue = { metadata: unknown; symbols: Set<unknown>; expires: number; invalid?: boolean };
+type CatalogSlot = { value?: CatalogValue; pending?: Promise<CatalogValue> };
 const catalogs = new WeakMap<Fetcher, Map<string, CatalogSlot>>();
-/** Public instrument catalogs (about 1 MB each) are shared for 10 minutes per fetcher. A held symbol missing from the
- * cached copy forces a reload so new listings resolve at once; failed or malformed loads are never cached. */
-async function catalog(fetcher: Fetcher, key: string, held: unknown[], load: () => Promise<unknown>): Promise<unknown> {
+/** Public catalogs are shared for 10 minutes only after the held positions normalize successfully. A missing or invalid
+ * held entry evicts the cached copy. Each read loads at most once, sharing in-flight loads; fresh failures stay invalid. */
+async function catalog(fetcher: Fetcher, key: string, held: unknown[], load: () => Promise<unknown>,
+  normalize: (metadata: unknown) => Position[]): Promise<Position[]> {
   let store = catalogs.get(fetcher);
   if (!store) { store = new Map(); catalogs.set(fetcher, store); }
   let slot = store.get(key);
   if (!slot) { slot = {}; store.set(key, slot); }
   const cached = slot.value;
-  if (cached && cached.expires > Date.now() && held.every(symbol => cached.symbols.has(symbol))) return cached.metadata;
+  if (cached && cached.expires > Date.now() && held.every(symbol => cached.symbols.has(symbol))) {
+    try { return normalize(cached.metadata); }
+    catch { cached.invalid = true; slot.value = undefined; }
+  }
+  slot.value = undefined;
   const current = slot;
-  current.pending ??= load().then(metadata => {
-    current.value = { metadata, symbols: new Set(instrumentsOf(metadata).keys()), expires: Date.now() + CATALOG_TTL };
-    return metadata;
-  }).finally(() => { current.pending = undefined; });
-  return current.pending;
+  current.pending ??= load().then(metadata => ({
+    metadata, symbols: new Set(instrumentsOf(metadata).keys()), expires: Date.now() + CATALOG_TTL,
+  })).finally(() => { current.pending = undefined; });
+  const loaded = await current.pending;
+  try {
+    const result = normalize(loaded.metadata);
+    // A successful waiter must not restore a copy another waiter already rejected.
+    if (!loaded.invalid) current.value = loaded;
+    return result;
+  } catch (error) {
+    loaded.invalid = true;
+    if (current.value === loaded) current.value = undefined;
+    throw error;
+  }
 }
 
 function normalizeLinear(data: unknown, metadata: unknown): Position[] {
@@ -134,8 +149,9 @@ export async function readBinancePositions(c: BinanceCredential, fetcher: Fetche
   const held = rows(data).filter(row => !isZero(decimal(row.positionAmt))).map(row => row.symbol);
   if (!held.length) return [];
   const catalogPath = coinMargined ? '/dapi/v1/exchangeInfo' : '/fapi/v1/exchangeInfo';
-  const metadata = await catalog(fetcher, 'binance' + catalogPath, held, () => positionsGet('binance', c, catalogPath, new URLSearchParams(), fetcher, signal));
-  const result = coinMargined ? normalizeBinanceInverse(data, metadata) : normalizeLinear(data, metadata);
+  const result = await catalog(fetcher, 'binance' + catalogPath, held,
+    () => positionsGet('binance', c, catalogPath, new URLSearchParams(), fetcher, signal),
+    metadata => coinMargined ? normalizeBinanceInverse(data, metadata) : normalizeLinear(data, metadata));
   return portfolioMargin ? result.map(item => ({ ...item, marginMode: 'portfolio' })) : result;
 }
 
@@ -234,6 +250,6 @@ export async function readAsterPositions(c: AsterCredential, fetcher: Fetcher = 
   const data = await getJson('https://fapi.asterdex.com' + path + '?' + params, {}, fetcher, signal);
   const held = rows(data).filter(row => !isZero(decimal(row.positionAmt))).map(row => row.symbol);
   if (!held.length) return [];
-  const metadata = await catalog(fetcher, 'aster/fapi/v3/exchangeInfo', held, () => getJson('https://fapi.asterdex.com/fapi/v3/exchangeInfo', {}, fetcher, signal));
-  return normalizeLinear(data, metadata);
+  return catalog(fetcher, 'aster/fapi/v3/exchangeInfo', held,
+    () => getJson('https://fapi.asterdex.com/fapi/v3/exchangeInfo', {}, fetcher, signal), metadata => normalizeLinear(data, metadata));
 }
