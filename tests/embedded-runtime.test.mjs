@@ -16,13 +16,15 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { writeFileSync, appendFileSync, existsSync } from 'node:fs';
+import { writeFileSync, appendFileSync, existsSync, renameSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+// The test polls started.json, so it is replaced atomically and never read half written.
+const publish = (file, value) => { writeFileSync(file + '.tmp', value); renameSync(file + '.tmp', file); };
 export async function createModule({ root, dataDir, environment, transports }) {
   const id = path.basename(root);
   const started = { id, pid: process.pid, startedAt: Date.now(), dependencies: Object.keys(transports), maintenance: environment.WORKSPACE_MAINTENANCE, writerDb: environment.WORKSPACE_WRITER_DB, runtimeId: environment.WORKSPACE_RUNTIME_ID, writerModule: environment.WORKSPACE_WRITER_MODULE };
-  await writeFile(path.join(dataDir, 'started.json'), JSON.stringify(started));
+  publish(path.join(dataDir, 'started.json'), JSON.stringify(started));
   if (environment.FIXTURE_START === 'fail') throw new Error('fixture startup failure');
   if (environment.FIXTURE_START === 'hang') await new Promise(() => {});
   // Holds creation until the test writes the release file.
@@ -42,7 +44,7 @@ export async function createModule({ root, dataDir, environment, transports }) {
     if (req.url === '/crash') setTimeout(() => process.exit(27), 20);
   });
   // The worker owns the listen call; record the real path before it reports ready.
-  server.once('listening', () => writeFileSync(path.join(dataDir, 'started.json'), JSON.stringify({ ...started, socketPath: server.address() })));
+  server.once('listening', () => publish(path.join(dataDir, 'started.json'), JSON.stringify({ ...started, socketPath: server.address() })));
   return { server, updateDependency(name, transport) { appendFileSync(path.join(dataDir, 'dependencies.jsonl'), JSON.stringify({ name, socketPath: transport?.socketPath ?? null }) + '\\n'); }, writerProtectionVersion: environment.FIXTURE_START === 'unguarded' ? null : 1, recoveryProtectionVersion: environment.FIXTURE_START === 'legacy-recovery' ? null : 1, close() {
     return closing ??= (async () => {
       await delay(Number(environment.FIXTURE_CLOSE_DELAY_MS || 0));
