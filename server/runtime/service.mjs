@@ -22,17 +22,22 @@ export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime 
   // The durable flag is the only authority: the caller names modules, never the value.
   // Calls run one at a time in arrival order, so a sync its caller abandoned
   // still reaches the modules before a later one and cannot overwrite it.
-  let syncs = Promise.resolve();
-  function syncMaintenance(ids) {
+  // `ifIdle` skips the call (null) while another one is queued or running: that
+  // one sends the current durable value. `deadlineMs` shortens the per-module
+  // deadline, so an API sync queued behind this one still fits its budget.
+  let syncs = Promise.resolve(), queued = 0;
+  function syncMaintenance(ids, { ifIdle = false, deadlineMs } = {}) {
     const modules = validateMaintenanceIds(ids);
     if (!guard) throw new RuntimeError(404, MODULES_DISABLED);
+    if (ifIdle && queued) return Promise.resolve(null);
+    queued += 1;
     const run = syncs.then(async () => {
       const active = readMaintenance() === true;
       let failed = [];
-      try { await guard.setMaintenance(active, modules); }
+      try { await guard.setMaintenance(active, modules, { deadlineMs }); }
       catch (error) { failed = Array.isArray(error?.failed) ? error.failed : modules; }
       return { active, modules: modules.map(id => ({ id, confirmed: !failed.includes(id) })) };
-    });
+    }).finally(() => { queued -= 1; });
     syncs = run.catch(() => {});
     return run;
   }
