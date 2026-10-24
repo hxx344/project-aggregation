@@ -258,7 +258,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .old{display:inline-block;margin-left:5px;padding:0 3px;border:1px solid rgba(240,176,63,.45);border-radius:3px;font-family:var(--font-ui);font-size:10px;font-weight:500;line-height:14px;letter-spacing:0;color:var(--warning);vertical-align:3px}
 .warn-text{color:var(--warning)}
 .overview-grid{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;align-items:start}
-.overview-side{display:flex;flex-direction:column;gap:14px;min-width:0}
+.overview-main,.overview-side{display:flex;flex-direction:column;gap:14px;min-width:0}
 .panel-h,.holdings-heading{display:flex;align-items:center;gap:10px;min-height:42px;padding:6px 14px;border-bottom:1px solid var(--border)}
 .panel-h h2,.holdings-heading h2{font-size:13px;font-weight:600}
 .panel-h>svg{margin-left:auto;color:var(--positive)}
@@ -289,7 +289,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .trend-panel .trend-summary p{font-size:11px;color:var(--subtle-foreground)}
 .trend-panel .trend-key{padding:8px 14px 0;gap:6px 14px;font-size:12px}
 .trend-panel .trend-key i{width:14px;border-top-width:2px}
-.trend-panel .chart{height:170px;margin:4px 6px 0 0}
+.trend-panel .chart{height:220px;margin:4px 6px 0 0}
 .trend-panel .performance-metrics{margin:0;padding:0;background:none;border:0;border-top:1px solid var(--border);border-radius:0}
 .trend-panel .performance-annualized{gap:0}
 .trend-panel .performance-card{padding:10px 14px;background:none;border:0;border-radius:0}

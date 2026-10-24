@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { knownAssetValue, sumKnownValues, snapshotValues, quantityValue, refreshMarketAsset, withMarketQuantity } from '../lib/asset-values.ts';
+import { knownAssetValue, knownWorkbookValue, sumKnownValues, sumWorkbookValues, snapshotValues, quantityValue, refreshMarketAsset, withMarketQuantity, workbookMissingValueSql } from '../lib/asset-values.ts';
+import { openDatabase } from '../lib/sqlite.ts';
 import type { Asset } from '../lib/types.ts';
 
 const now = Date.parse('2026-10-23T04:00:00Z');
@@ -95,4 +96,27 @@ test('filling a market quantity resolves the unknown state immediately without c
   const failed = withMarketQuantity({ ...unknown, error: '行情失败' }, 4);
   assert.equal(failed.error, '行情失败');
   assert.equal(failed.updatedAt, unknown.updatedAt, 'editing a quantity must not freshen its quote');
+});
+test('blank workbook cells are known zeros while uncached formulas and partial inputs stay unknown', () => {
+  const blank = { value: null, quantity: null, price: null, formula: null };
+  assert.equal(knownWorkbookValue(blank), 0);
+  assert.equal(knownWorkbookValue({ value: null }), 0, 'absent fields are blank too');
+  for (const row of [{ ...blank, formula: '=B2*C2' }, { ...blank, quantity: 3 }, { ...blank, price: 2.5 }, { ...blank, value: NaN }]) {
+    assert.equal(knownWorkbookValue(row), null);
+  }
+  assert.equal(knownWorkbookValue({ ...blank, value: 12, formula: '=B2*C2' }), 12);
+  assert.deepEqual(sumWorkbookValues([{ ...blank, value: 50 }, blank, { ...blank, formula: '=X1' }]), { total: 50, missingValues: 1, partial: true });
+  assert.deepEqual(sumWorkbookValues([{ ...blank, value: 50 }, blank]), { total: 50, missingValues: 0, partial: false });
+});
+
+test('workbook SQL classifies the same rows as knownWorkbookValue', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const rows = [
+    { value: null, quantity: null, price: null, formula: null }, { value: null }, {},
+    { value: null, formula: '=B2*C2' }, { value: null, quantity: 3 }, { value: null, price: 2.5 },
+    { value: 0 }, { value: 7, formula: '=B2*C2' }, { value: 0, quantity: null, mode: 'market' },
+  ];
+  const result = await database.prepare(`SELECT ${workbookMissingValueSql('a.value')} AS missing FROM json_each(?) a ORDER BY CAST(a.key AS INTEGER)`).bind(JSON.stringify(rows)).all<{ missing: number }>();
+  assert.deepEqual(result.results.map(row => !!row.missing), rows.map(row => knownWorkbookValue(row as Parameters<typeof knownWorkbookValue>[0]) === null));
 });

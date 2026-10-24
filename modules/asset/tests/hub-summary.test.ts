@@ -318,6 +318,19 @@ test('hub trend omits incomplete subtotals without reviving an older same-day to
   } finally { database.close(); }
 });
 
+test('hub trend keeps workbook columns whose blank cells were not yet held, but omits uncached formulas', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const blank = { value: null, quantity: null, price: null, formula: null };
+  await database.prepare('INSERT INTO assets VALUES(?,?,?)').bind('owner', 'row-1', JSON.stringify(asset('manual', fresh, 1))).run();
+  await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', 'source-ledger', JSON.stringify({ source: 'personal', periods: [
+    { id: 'E1', date: '2026-09-20', total: 300, rows: [{ value: 300 }, blank] },
+    { id: 'F1', date: '2026-09-21', total: 400, rows: [{ value: 400 }, { ...blank, formula: '=C3*D3' }] },
+  ] })).run();
+  const trend = (await readHubSummary(database, 'owner', now)).data.trend;
+  assert.deepEqual(trend, [{ at: '2026-09-20T00:00:00+08:00', value: 300 }]);
+});
+
 test('hub trend keeps the 90-day window when incomplete days are omitted', async t => {
   const database = openDatabase(':memory:');
   t.after(() => database.close());

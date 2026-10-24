@@ -18,6 +18,8 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
   const refreshed = useMemo(() => ledger.assets.map(asset => asset.id + ':' + asset.updatedAt).join(','), [ledger.assets]);
   const changesVersion = useMemo(() => [history.length, last?.date, last?.total, last?.withdrawn, last?.partial, last?.missingValues, ledger.baselineDate, JSON.stringify(ledger.withdrawals), refreshed].join('|'), [history, last, ledger.baselineDate, ledger.withdrawals, refreshed]);
   const change = first && last && !first.missingValues && !last.missingValues ? last.adjusted - first.adjusted : null;
+  const incomplete = [first && { label: '起点', point: first }, last !== first && last && { label: '终点', point: last }]
+    .flatMap(item => item && item.point.missingValues ? [`${item.label} ${item.point.date} 有 ${item.point.missingValues} 项估值缺失`] : []).join('，');
   const month = annualized.monthlyPeriod;
   const monthlyHint = !month ? '上个自然月没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`
@@ -28,7 +30,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
     <div className="trend-summary">
       <span>剔除出金影响的区间变化</span>
       <strong className={change === null ? undefined : performanceTone(change)}>{change === null ? '—' : '$ ' + signed(change)}</strong>
-      <p>{first && last ? first.date + ' — ' + last.date : '等待首条快照'}</p>
+      <p>{first && last ? first.date + ' — ' + last.date : '等待首条快照'}{change === null && incomplete && '；' + incomplete}</p>
     </div>
     <div className="trend-key"><span><i className="adjusted-line"/>剔除出金影响</span><span><i className="held-line"/>实际持有资产</span></div>
     {history.length ? <div className="chart" aria-label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产。详细数值见历史记录。">
@@ -54,7 +56,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
         <div className="performance-card">
           <span className="performance-label">总体年化</span>
           <strong className={performanceTone(annualized.overallAnnualized, 100)}>{formatReturnRate(annualized.overallAnnualized)}</strong>
-          <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；首末快照估值须完整，起始调整后资产须大于 0，收益率需为有效数值'}</p>
+          <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；' + (incomplete ? incomplete + '，不计算收益' : '首末快照估值须完整，起始调整后资产须大于 0，收益率需为有效数值')}</p>
         </div>
       </div>
       <details className="performance-monthly">

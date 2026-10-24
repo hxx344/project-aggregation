@@ -24,6 +24,24 @@ export function sumKnownValues(rows: readonly ValuedRow[]) {
   return { total, missingValues, partial: missingValues > 0 };
 }
 
+type WorkbookRow = ValuedRow & { price?: number | null; formula?: unknown };
+const blankWorkbookFields = ['value', 'quantity', 'price', 'formula'] as const;
+
+/** A workbook cell with no value, quantity, price or formula was not held that day; the sheet total counts it as 0. */
+export function knownWorkbookValue(row: WorkbookRow): number | null {
+  return blankWorkbookFields.every(key => row[key] === null || row[key] === undefined) ? 0 : knownAssetValue(row);
+}
+
+export function sumWorkbookValues(rows: readonly WorkbookRow[]) {
+  return sumKnownValues(rows.map(row => ({ value: knownWorkbookValue(row) })));
+}
+
+/** SQL form of knownWorkbookValue() === null; row must be an internal SQL expression. */
+export function workbookMissingValueSql(row: string) {
+  const blank = blankWorkbookFields.map(key => `COALESCE(json_type(${row}, '$.${key}'), 'null') = 'null'`).join(' AND ');
+  return `(${missingValueSql(row)} AND NOT (${blank}))`;
+}
+
 export function snapshotValues(assets: readonly Asset[], fxStatus: Pick<FxStatus, 'error'>, now = Date.now()) {
   const values = sumKnownValues(assets);
   const partial = values.partial || !!fxStatus.error || assets.some(asset => asset.mode !== 'manual' &&

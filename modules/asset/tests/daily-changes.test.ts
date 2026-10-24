@@ -174,12 +174,14 @@ test('reader detects missing original withdrawals in both workbook columns and d
   const database = openDatabase(':memory:');
   t.after(() => database.close());
   const columns = [
-    { id: 'E1', date: '2026-10-21', total: 100, rows: [row('row-1', 'known', 100), row('row-2', '出金', null)] },
+    // An uncached workbook formula is unknown; a fully blank cell is covered by the next test.
+    { id: 'E1', date: '2026-10-21', total: 100, rows: [row('row-1', 'known', 100), { ...row('row-2', '出金', null), formula: '=SUM(X2)' }] },
     { id: 'F1', date: '2026-10-22', total: 200, rows: [row('row-1', 'known', 100), row('row-2', '出金', 100)] },
   ];
   await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('source', 'source-ledger', JSON.stringify({ baselineDate: '2026-10-21', periods: columns })).run();
+  // Daily snapshots keep the plain null row: only workbook columns treat blank cells as zero.
   await database.batch(columns.map(({ rows, ...period }) => database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('daily', period.date, JSON.stringify({
-    ...period, id: 'daily-' + period.date, partial: false, withdrawn: period.total - 100, assets: rows,
+    ...period, id: 'daily-' + period.date, partial: false, withdrawn: period.total - 100, assets: rows.map(({ id, project, kind, value }) => ({ id, project, kind, value })),
   }))));
   for (const owner of ['source', 'daily']) {
     const [day] = (await readDailyChanges(database, owner, Date.parse('2026-10-23T04:00:00Z'))).days;
@@ -188,6 +190,22 @@ test('reader detects missing original withdrawals in both workbook columns and d
     assert.equal(day.unattributed, 100);
     assert.deepEqual(day.sources, []);
   }
+});
+
+test('a fully blank workbook cell is a known zero, so a later cumulative withdrawal is attributed', async t => {
+  const database = openDatabase(':memory:');
+  t.after(() => database.close());
+  const blank = { ...row('row-2', '出金', null), quantity: null, price: null, formula: null };
+  const columns = [
+    { id: 'E1', date: '2026-10-21', total: 100, rows: [row('row-1', 'known', 100), blank, { ...row('row-3', 'later', null), quantity: null, price: null, formula: null }] },
+    { id: 'F1', date: '2026-10-22', total: 230, rows: [row('row-1', 'known', 100), row('row-2', '出金', 100), row('row-3', 'later', 30)] },
+  ];
+  await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', 'source-ledger', JSON.stringify({ baselineDate: '2026-10-22', periods: columns })).run();
+  const [day] = (await readDailyChanges(database, 'owner', Date.parse('2026-10-23T04:00:00Z'))).days;
+  assert.equal(day.partial, false);
+  assert.equal(day.withdrawnChange, 100);
+  assert.equal(day.unattributed, 0);
+  assert.deepEqual(day.sources.map(source => [source.project, source.previous, source.current, source.change]), [['later', 0, 30, 30]]);
 });
 
 test('recorded withdrawals before the workbook baseline are not counted twice on original columns', () => {

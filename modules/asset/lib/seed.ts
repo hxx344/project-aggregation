@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import type { Ledger, Asset } from './types';
 import { parseSource, EXAMPLE_SOURCE, isVariationalProject, isGateProject, type SourceLedger } from './source-ledger';
 import { embeddedWithdrawals } from './withdrawals';
-import { knownAssetValue, sumKnownValues } from './asset-values';
+import { knownAssetValue, sumWorkbookValues } from './asset-values';
 export type { SourceLedger } from './source-ledger';
 export function readSource(): SourceLedger {
   const filenames = process.env.ASSET_DATA_DIR
@@ -27,7 +27,7 @@ export function seedLedger(raw: SourceLedger = readSource(), includeHistory = tr
       return {...asset, value: knownAssetValue(asset)};
     }),
     history: includeHistory ? raw.periods.map(({rows,...period}) => {
-      const { missingValues } = sumKnownValues(rows);
+      const { missingValues } = sumWorkbookValues(rows);
       return {...period, withdrawn: embeddedWithdrawals(rows), ...(missingValues ? {partial:true,missingValues} : {})};
     }) : [], withdrawals: [], fx: raw.fx, baselineDate: raw.baselineDate, startedAt: raw.startedAt, baselineTotal: base.total,
     connections: { bybit: {configured:false,lastSync:null,error:null,scope:'统一账户 + 资金账户'}, aster: {configured:false,lastSync:null,error:null,scope:'合约账户'}, binance: {configured:false,lastSync:null,error:null,scope:'各钱包资产估值（USDT 折合 USD）'}, okx: {configured:false,lastSync:null,error:null,scope:'当前账户总资产估值（USD）'}, gate: {configured:false,lastSync:null,error:null,scope:'Gate 账户总资产估值（USDT 折合 USD，最多缓存 1 分钟）'}, variational: {configured:false,lastSync:null,error:null,scope:'Omni 真实账户净权益（USDC 折合 USD）'} }

@@ -2,7 +2,7 @@ import type { openDatabase } from './sqlite.ts';
 import type { Asset, Withdrawal } from './types.ts';
 import { assetMeasures, compareEmbeddedWithdrawals, embeddedWithdrawals } from './withdrawals.ts';
 import { analyzePositions, positionsOf, type PositionAnalysis, type PositionsCapture } from './daily-positions.ts';
-import { knownAssetValue, sumKnownValues } from './asset-values.ts';
+import { knownAssetValue, knownWorkbookValue, sumKnownValues } from './asset-values.ts';
 
 /** Day-over-day changes of the adjusted asset measure, attributed to ledger rows. */
 export const DAILY_CHANGE_DAYS = 90;
@@ -120,10 +120,10 @@ const detailsOf = (details: unknown): DetailRow[] | undefined => Array.isArray(d
   !!row && typeof row.coin === 'string' && typeof row.account === 'string' && finite(row.value)).map(row => ({
   coin: row.coin, account: row.account, value: row.value, price: finite(row.price) ? row.price : 0,
 })) : undefined;
-const rowsOf = (rows: unknown): ChangeRow[] => Array.isArray(rows) ? rows.filter((row): row is ChangeRow =>
+const rowsOf = (rows: unknown, workbook = false): ChangeRow[] => Array.isArray(rows) ? rows.filter((row): row is ChangeRow =>
   !!row && typeof row.id === 'string' && typeof row.project === 'string').map(row => ({
   id: row.id, project: row.project, kind: typeof row.kind === 'string' ? row.kind : '',
-  value: knownAssetValue(row),
+  value: workbook ? knownWorkbookValue(row) : knownAssetValue(row),
   ...(typeof row.mode === 'string' ? { mode: row.mode } : {}),
   ...(row.quantity === null || finite(row.quantity) ? { quantity: row.quantity } : {}),
   ...(Array.isArray(row.details) ? { details: detailsOf(row.details) } : {}),
@@ -140,7 +140,7 @@ export async function readDailyChanges(database: ChangeDatabase, owner: string, 
     database.prepare("SELECT value FROM settings WHERE owner = ? AND key = 'withdrawals'").bind(owner).first<{ value: string }>(),
   ]);
   const ledger: StoredSource = source ? JSON.parse(source.value) : {};
-  const original = (ledger.periods ?? []).map(({ rows, ...period }) => ({ ...period, rows: rowsOf(rows) }));
+  const original = (ledger.periods ?? []).map(({ rows, ...period }) => ({ ...period, rows: rowsOf(rows, true) }));
   const daily = [...(before ? [before] : []), ...inWindow.results].map(row => {
     const { assets, positions, ...snapshot } = JSON.parse(row.data) as StoredSnapshot;
     return { ...snapshot, rows: rowsOf(assets), positions: positionsOf(positions) };

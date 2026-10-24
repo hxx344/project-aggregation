@@ -1,7 +1,7 @@
 import type { openDatabase } from './sqlite.ts';
 import type { FxStatus, Withdrawal } from './types.ts';
 import { recordedWithdrawals } from './withdrawals.ts';
-import { knownAssetValue, missingValueSql, sumKnownValues } from './asset-values.ts';
+import { knownAssetValue, missingValueSql, sumKnownValues, workbookMissingValueSql } from './asset-values.ts';
 
 type SummaryAsset = { project: string; mode: string | null; quantity?: number | null; value: number | null; updatedAt: string | null; error?: string | null };
 type SummaryPeriod = { id: string; date: string; total: number | null; future?: boolean | number; archived?: boolean | number; missingValues?: number };
@@ -85,7 +85,7 @@ export async function readHubSummary(database: Pick<ReturnType<typeof openDataba
     database.prepare('SELECT exchange FROM connections WHERE owner = ?').bind(owner).all<{ exchange: string }>(),
     database.prepare("SELECT key,value FROM settings WHERE owner = ? AND key IN ('fx','fx-status')").bind(owner).all<{ key: string; value: string }>(),
     database.prepare("SELECT json_extract(value, '$.source') AS source, json_extract(value, '$.baselineDate') AS baselineDate FROM settings WHERE owner = ? AND key = 'source-ledger'").bind(owner).first<{ source: string; baselineDate: string | null }>(),
-    database.prepare(`SELECT json_extract(p.value, '$.id') AS id, json_extract(p.value, '$.date') AS date, json_extract(p.value, '$.total') AS total, json_extract(p.value, '$.future') AS future, json_extract(p.value, '$.archived') AS archived, (SELECT COUNT(*) FROM json_each(p.value, '$.rows') a WHERE ${missingValueSql('a.value')}) AS missingValues FROM settings s, json_each(s.value, '$.periods') p WHERE s.owner = ? AND s.key = 'source-ledger' ORDER BY CAST(p.key AS INTEGER)`).bind(owner).all<SummaryPeriod>(),
+    database.prepare(`SELECT json_extract(p.value, '$.id') AS id, json_extract(p.value, '$.date') AS date, json_extract(p.value, '$.total') AS total, json_extract(p.value, '$.future') AS future, json_extract(p.value, '$.archived') AS archived, (SELECT COUNT(*) FROM json_each(p.value, '$.rows') a WHERE ${workbookMissingValueSql('a.value')}) AS missingValues FROM settings s, json_each(s.value, '$.periods') p WHERE s.owner = ? AND s.key = 'source-ledger' ORDER BY CAST(p.key AS INTEGER)`).bind(owner).all<SummaryPeriod>(),
     database.prepare(`SELECT json_extract(data, '$.id') AS id, date, json_extract(data, '$.total') AS total, MAX(COALESCE(json_extract(data, '$.missingValues'), 0), (SELECT COUNT(*) FROM json_each(data, '$.assets') a WHERE ${missingValueSql('a.value')})) AS missingValues FROM snapshots WHERE owner = ? AND date <= ? AND date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(date, '+0 days') = date AND COALESCE(json_extract(data, '$.future'), 0) = 0 AND COALESCE(json_extract(data, '$.archived'), 0) = 0 AND json_type(data, '$.total') IN ('integer','real') ORDER BY date DESC LIMIT 90`).bind(owner, today).all<SummaryPeriod>(),
     database.prepare("SELECT json_extract(w.value, '$.date') AS date, json_extract(w.value, '$.amount') AS amount FROM settings s, json_each(s.value) w WHERE s.owner = ? AND s.key = 'withdrawals'").bind(owner).all<SummaryWithdrawal>(),
   ]);
