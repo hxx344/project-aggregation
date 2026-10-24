@@ -16,7 +16,7 @@ export function usePerpetualFeed(active: boolean, paused = false) {
   const [sourceClock] = useState(() => createPerpetualClock());
 
   useEffect(() => {
-    const publisher = createPerpetualDisplay({ onData: snapshot => { setData(snapshot); setNow(sourceClock.read()); } });
+    const publisher = createPerpetualDisplay({ onData: snapshot => { setData(snapshot); setNow(sourceClock.read()); }, sourceNow: sourceClock.read });
     display.current = publisher;
     let clock: ReturnType<typeof setInterval> | undefined;
     let background = readActivity.background(document.hidden);

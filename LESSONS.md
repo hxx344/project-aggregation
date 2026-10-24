@@ -1215,3 +1215,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `d21a78c` 的 [工作台持仓桥](src/hub-positions.ts)、[服务端 Asset 读取](server/asset-positions.mjs)、[Monitor 桥接](modules/monitor/lib/hub-bridge.ts) 与 [Monitor 主页](modules/monitor/app/monitor-hub.tsx)。2026-10-23 用户截图显示关联交易时而「持仓不可用：工作台暂时无法读取持仓」，时而「12 秒内未收到工作台回复」，其余时间正常。现场 Asset 耗时与服务器日志未取得，三条原因由源码推断，哪一条在现场占主导未核实。
 
 **事件记录：** `related-positions-intermittent-20261023`；实际发生日期 2026-10-23（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L076：显示节流不能让已收到的新观测背后的旧报价过期
+
+**适用条件：** 前端按固定周期发布已累积的行情帧，而新鲜度时钟按源时间逐秒前进，排名、提醒或筛选用该时钟判断已显示报价是否过期。
+
+**根因：** Monitor 合约页每秒收到流帧并推进源时钟，却每 20 秒才发布一次最新帧。部分平台盘口不变时每 5 秒批量确认，服务端再把未变化的确认按 5 秒节奏转发，发布时报价可能已近 12 秒；接下来 20 秒不换帧，报价在下一次发布前越过 30 秒有效期退出排名，下一帧到达后又回来，表现为每次刷新前后机会短暂消失再出现。更新数据其实已在浏览器中，只是被显示节流压住。
+
+**以后做法：** 有效期和时钟都不放宽、不冻结（L040、L058）。显示层发现已显示且发布时仍新鲜的报价即将过期，而同一合约已收到能撑过下一次常规发布的更新观测（盘口、标记价或资金费时间）时，在过期前一个时钟刻度提前发布最新帧；没有更新观测、已在发布时过期、不可比较或平台不在线的报价不触发提前发布，避免退化为高频刷新。
+
+**如何验证：** [显示调度测试](modules/monitor/tests/perpetual-display.test.mjs) 覆盖提前发布、只有旧观测时按时过期、发布时已过期的报价等待常规周期、迟到确认立即发布、即将过期的确认不缩短周期、计时器只提前不推后，以及显示层接排名选择器、按 1 秒时钟逐秒检查分批确认的组合不会掉出排名（旧实现失败）。
+
+**证据：** project-aggregation 基线 `5925053` 的 [显示调度](modules/monitor/lib/perpetual-display.ts)、[行情 Hook](modules/monitor/hooks/use-perpetual-feed.ts)、[排名新鲜度](modules/monitor/lib/perpetual-spreads.ts) 与 [服务端确认节奏](modules/monitor/server/perpetual-service.mjs)。2026-10-24 用户截图反映资金费套利列表每 20 秒刷新时机会短暂消失再出现；本机无运行中的行情服务，现场未复现，根因由源码与回放测试确认。独立审查另指出两腿时间差超过 5 秒的组合仍会随每次发布进出排名（持续约 20 秒），本次未改。
+
+**事件记录：** `monitor-display-cadence-expiry-20261024`；实际发生日期 2026-10-24（Asia/Shanghai）；不推进全历史复盘检查点。
