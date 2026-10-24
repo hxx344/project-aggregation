@@ -11,7 +11,7 @@ import { parseEnv } from 'node:util';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createStore } from '../modules/crossex/server/store.mjs';
 import { createLiveRuntime } from '../modules/crossex/server/live-runtime.mjs';
-import { acquireRuntimeLock } from '../server/recovery/lifecycle-lock.mjs';
+import { acquireRecoveryLocks, acquireRuntimeLock } from '../server/recovery/lifecycle-lock.mjs';
 import { createBackup } from '../server/recovery/backup.mjs';
 import { restoreBackup, admitHandoff } from '../server/recovery/restore.mjs';
 import { authenticate, decryptFile } from '../server/recovery/crypto.mjs';
@@ -61,7 +61,7 @@ async function setup(t, { pending = false } = {}) {
   const aiv = randomBytes(12), ac = createCipheriv('aes-256-gcm', assetKey, aiv); ac.setAAD(Buffer.from('owner:gate')); const encrypted = Buffer.concat([ac.update('{"apiKey":"asset-fixture"}'),ac.final(),ac.getAuthTag()]);
   asset.prepare('INSERT INTO connections VALUES(?,?,?,?)').run('owner','gate',JSON.stringify({iv:[...aiv],cipher:[...encrypted]}),'2026-10-19'); asset.close();
   if (pending) { const db = new DatabaseSync(path.join(source, 'execution-control.sqlite')); db.exec("INSERT INTO aw_operations VALUES('pending','hub','hash','[]','old','{}','unknown',1,1,'group',NULL,NULL)"); db.close(); }
-  const takeLock = async directory => { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); if (process.platform === 'win32') { const result = spawnSync(process.env.PYTHON || 'python', ['-I', fileURLToPath(new URL('./test_lifecycle_lock.py', import.meta.url)), '--secure-dir', directory]); assert.equal(result.status, 0, result.stderr?.toString()); } const lock = await acquireRuntimeLock({ dataDir: directory }); locks.push(lock); return lock; };
+  const takeLock = async directory => { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); if (process.platform === 'win32') { const result = spawnSync(process.env.PYTHON || 'python', ['-I', fileURLToPath(new URL('./test_lifecycle_lock.py', import.meta.url)), '--secure-dir', directory]); assert.equal(result.status, 0, result.stderr?.toString()); } const lock = await acquireRecoveryLocks({ dataDir: directory }); locks.push(lock); return lock; };
   const sourceLock = await takeLock(source); const dataKey = randomBytes(32), secretsKey = randomBytes(32);
   const backupOptions = { dataDir: source, destination: path.join(root, 'backup'), dataKey, secretsKey, lock: sourceLock, commit: 'a'.repeat(40) };
   const restore = async (name = 'target', options = {}) => { const targetDir = path.join(root, name), lock = await takeLock(targetDir); return { result: await restoreBackup({ backupDir: backupOptions.destination, targetDir, lock, dataKey, secretsKey, ...options }), targetDir, lock }; };
@@ -97,6 +97,9 @@ test('archive traversal, same encryption keys, hardlinks, limits and forged lock
   const f=await setup(t);
   await assert.rejects(createBackup({...f.backupOptions,secretsKey:f.dataKey}),/KEYS_INVALID/);
   await assert.rejects(createBackup({...f.backupOptions,lock:{assertHeld(){}}}),/RUNTIME_LOCK_LOST/);
+  // The runtime lock alone does not prove that no API process is alive.
+  const empty = fs.mkdtempSync(path.join(f.root, 'runtime-only-')); fs.chmodSync(empty, 0o700); const runtimeOnly = await acquireRuntimeLock({ dataDir: empty });
+  try { await assert.rejects(createBackup({...f.backupOptions,dataDir:empty,lock:runtimeOnly}),/RUNTIME_LOCK_LOST/); } finally { await runtimeOnly.close(); }
   await assert.rejects(createBackup({...f.backupOptions,maxBytes:32}),/LIMIT_EXCEEDED/);
   await assert.rejects(createBackup({...f.backupOptions,destination:path.join(f.source,'nested')}),/OVERLAP/);
   fs.linkSync(path.join(f.source,'credentials.key'),path.join(f.source,'hard-link')); await assert.rejects(createBackup(f.backupOptions),/UNSAFE_FILE/); fs.unlinkSync(path.join(f.source,'hard-link'));

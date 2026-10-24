@@ -5,7 +5,7 @@ import { parseArgs, parseEnv } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createBackup } from './backup.mjs';
 import { restoreBackup, admitHandoff } from './restore.mjs';
-import { acquireRuntimeLock } from './lifecycle-lock.mjs';
+import { acquireRecoveryLocks } from './lifecycle-lock.mjs';
 import { safePath, readLockedRegistry, openSourceDatabase } from './inventory.mjs';
 
 const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -64,7 +64,7 @@ export async function runRecoveryCli(args = process.argv.slice(2)) {
   if (action === 'inspect') return publicState(values['data-dir']);
   if (action === 'check-source') {
     const dataDir = absolute(values['data-dir']);
-    const lock = await acquireRuntimeLock({ dataDir, expectedOwnerUid: owner(values['owner-uid']), timeoutMs: 5000 });
+    const lock = await acquireRecoveryLocks({ dataDir, expectedOwnerUid: owner(values['owner-uid']), timeoutMs: 5000 });
     try { const registry = readLockedRegistry(dataDir, lock); return { schemaVersion: 1, state: registry.state.state, authorityId: registry.state.authorityId }; }
     finally { await lock.close(); }
   }
@@ -72,7 +72,7 @@ export async function runRecoveryCli(args = process.argv.slice(2)) {
   const timeoutMs = positive(values['timeout-ms'], 600_000);
   const bounds = { timeoutMs, maxBytes: positive(values['max-bytes'], 10 * 1024 ** 3), maxFiles: positive(values['max-files'], 10_000) };
   const hold = async (dataDir, expectedOwnerUid) => {
-    const held = await acquireRuntimeLock({ dataDir, expectedOwnerUid, timeoutMs: 5000 }); locks.push(held); return held;
+    const held = await acquireRecoveryLocks({ dataDir, expectedOwnerUid, timeoutMs: 5000 }); locks.push(held); return held;
   };
   try {
     if (action === 'backup' || action === 'handoff') {

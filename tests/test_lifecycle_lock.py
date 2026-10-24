@@ -1,9 +1,11 @@
 import ctypes
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server" / "recovery"))
@@ -58,8 +60,8 @@ class RuntimeLockTests(unittest.TestCase):
             lock.close()
         self.directory.cleanup()
 
-    def lock(self, timeout_ms=25):
-        lock = RuntimeLock(str(self.path), timeout_ms)
+    def lock(self, timeout_ms=25, **options):
+        lock = RuntimeLock(str(self.path), timeout_ms, **options)
         self.locks.append(lock)
         return lock
 
@@ -78,6 +80,32 @@ class RuntimeLockTests(unittest.TestCase):
         self.assertEqual(second.identity, (info.st_dev, info.st_ino))
         self.error("RUNTIME_LOCK_LOST", first.assert_held)
 
+    def test_api_lock_is_shared_and_separate_from_the_runtime_lock(self):
+        runtime = self.lock()
+        first = self.lock(name="api", mode="shared")
+        second = self.lock(name="api", mode="shared")
+        self.assertTrue(first.assert_held() and second.assert_held())
+        self.assertNotEqual(first.identity, runtime.identity)
+        self.assertEqual(first.identity, second.identity)
+        # Recovery takes the API lock exclusively: any live API refuses it.
+        self.error("RUNTIME_LOCK_BUSY", lambda: self.lock(name="api"))
+        first.close()
+        self.error("RUNTIME_LOCK_BUSY", lambda: self.lock(name="api"))
+        second.close()
+        exclusive = self.lock(name="api")
+        self.error("RUNTIME_LOCK_BUSY", lambda: self.lock(name="api", mode="shared"))
+        exclusive.close()
+        self.assertTrue(self.lock(name="api", mode="shared").assert_held())
+
+    def test_lock_name_and_mode_are_closed_sets(self):
+        for options in ({"name": "../hub"}, {"name": "instance"}, {"mode": "read"}, {"mode": "shared"}, {"name": "runtime", "mode": "shared"}):
+            self.error("INVALID_RUNTIME_LOCK_OPTIONS", lambda: self.lock(**options))
+        helper = Path(__file__).resolve().parents[1] / "server" / "recovery" / "lifecycle_lock.py"
+        for extra in (["--name=other"], ["--mode"], ["--name=api", "--name=api"], ["--path=x"], ["--mode=shared"], ["--name=runtime", "--mode=shared"]):
+            result = subprocess.run([sys.executable, "-I", str(helper), str(self.path), "25", *extra], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("INVALID_RUNTIME_LOCK_OPTIONS", result.stdout)
+
     def test_cross_process_lock_releases_after_parent_pipe_eof(self):
         helper = Path(__file__).resolve().parents[1] / "server" / "recovery" / "lifecycle_lock.py"
         child = subprocess.Popen([sys.executable, "-I", str(helper), str(self.path), "100"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -87,6 +115,26 @@ class RuntimeLockTests(unittest.TestCase):
             child.stdin.close()
             self.assertEqual(child.wait(timeout=3), 0)
             self.assertTrue(self.lock().assert_held())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
+            child.stdout.close()
+            child.stderr.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals")
+    def test_helper_keeps_the_lock_through_a_service_stop_signal(self):
+        helper = Path(__file__).resolve().parents[1] / "server" / "recovery" / "lifecycle_lock.py"
+        child = subprocess.Popen([sys.executable, "-I", str(helper), str(self.path), "100"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertIn('"ready": true', child.stdout.readline())
+            for signal_number in (signal.SIGTERM, signal.SIGINT):
+                child.send_signal(signal_number)
+            time.sleep(0.3)
+            self.assertIsNone(child.poll())
+            self.error("RUNTIME_LOCK_BUSY", self.lock)
+            child.stdin.close()
+            self.assertEqual(child.wait(timeout=3), 0)
         finally:
             if child.poll() is None:
                 child.kill()

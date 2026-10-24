@@ -29,7 +29,7 @@ function manifestBody(document, dataKey, secretsKey, limits) {
   for (const entry of body.entries) {
     safeRelative(entry.path); limits.add(entry.size);
     if (seen.has(entry.path.toLowerCase()) || !/^[a-f0-9]{64}$/.test(entry.sha256 ?? '') || !/^[a-f0-9]{64}$/.test(entry.payloadSha256 ?? '') || !['data','secrets'].includes(entry.category) || entry.category !== category(entry.path) || (/\.(?:sqlite|sqlite3|db)$/i.test(entry.path) && !entry.database)) throw new Error('RECOVERY_MANIFEST_INVALID');
-    if (entry.path === CONTROL || entry.path === '.runtime.lock' || entry.path.startsWith('.recovery-stage-') || (entry.path.startsWith('_recovery/') && entry.path !== '_recovery/root.env')) throw new Error('RECOVERY_UNSAFE_PATH');
+    if (entry.path === CONTROL || entry.path === '.runtime.lock' || entry.path === '.api.lock' || entry.path.startsWith('.recovery-stage-') || (entry.path.startsWith('_recovery/') && entry.path !== '_recovery/root.env')) throw new Error('RECOVERY_UNSAFE_PATH');
     seen.add(entry.path.toLowerCase());
   }
   for (const required of [REGISTRY, REGISTRY + '.required', 'hub.sqlite', 'credentials.key']) if (!seen.has(required)) throw new Error('RECOVERY_REQUIRED_MATERIAL_MISSING');
@@ -146,7 +146,7 @@ export async function restoreBackup(options) {
   const source = safePath(backupDir, { directory: true }), target = safePath(targetDir, { directory: true });
   if (within(source, target) || within(target, source)) throw new Error('RECOVERY_TARGET_OVERLAP');
   const limits = budget(options, () => assertLifecycleLock(lock, { dataDir: target })); limits.check();
-  if (fs.readdirSync(target).some(name => name !== '.runtime.lock')) throw new Error('RECOVERY_TARGET_NOT_EMPTY');
+  if (fs.readdirSync(target).some(name => name !== '.runtime.lock' && name !== '.api.lock')) throw new Error('RECOVERY_TARGET_NOT_EMPTY');
   const manifest = loadJson(path.join(source, 'manifest.json')), body = manifestBody(manifest, dataKey, secretsKey, limits);
   limits.space(target, body.entries.reduce((n, e) => n + e.size + 1024, 0));
   const recoveryId = randomUUID(), authorityId = randomUUID(); const stage = path.join(target, '.recovery-stage-' + recoveryId);

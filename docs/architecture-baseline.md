@@ -93,7 +93,7 @@ CrossEx 的 `BINANCE_`、`OKX_` 等交易场所前缀不提供底层原生账户
 
 ## M2 冷备份与恢复保护
 
-工作台启动前取得数据根 OS 生命周期锁，关闭全部组件后释放。正式操作入口先串行更新锁、冷停完整服务 cgroup，再持有同一排他锁处理各库、JSON 和密钥；SQLite 备份 API 吸收 WAL，清单记录库结构和水位。`data` 与 `secrets` 分别加密，完整内容、路径依赖和操作步骤见 [备份与恢复](backup-recovery.md)。
+工作台启动前取得数据根 OS 生命周期锁，关闭全部组件后释放。正式操作入口先串行更新锁、冷停完整服务 cgroup，再排他持有运行时与 API 两把生命周期锁处理各库、JSON 和密钥；SQLite 备份 API 吸收 WAL，清单记录库结构和水位。`data` 与 `secrets` 分别加密，完整内容、路径依赖和操作步骤见 [备份与恢复](backup-recovery.md)。
 
 恢复只发布到新的隔离目标，校验密钥可解密性、完整性和 schema，撤销旧会话与预览，产生新 authority/epoch，并增加 fence 与绑定代次。共享 Node/Python 核心持久保留 `quarantine`，UNKNOWN、账户归属与隔离不清除。原源仍在且完整静止时生成的 sealed handoff 才能一次性准入唯一目标；源永久退休，历史备份或失去原源的副本不能手工解锁。`admit` 不切换生产数据目录，也不执行服务器部署。
 

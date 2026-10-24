@@ -5,8 +5,9 @@ import { parseEnv } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 // This is local checkpoint evidence, not exchange reconciliation or proof that
-// writers stopped. The caller must hold the exclusive runtime lock throughout
-// inspection, sealing and retirement. Nothing here repairs or clears a journal.
+// writers stopped. The caller must hold the recovery locks (the runtime and API
+// locks, both exclusive) throughout inspection, sealing and retirement. Nothing
+// here repairs or clears a journal.
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0;
 const own = (value, key) => Object.hasOwn(value, key);
