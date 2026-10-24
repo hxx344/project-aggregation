@@ -137,6 +137,7 @@ expect_modules 3 1 2 1
 current=$(readlink "$fixture/application/current")
 cp "$fixture/application/.deployed-state" "$fixture/success-state"
 saved_caches=$(aster_caches)
+saved_aster_cache=$(find "$fixture/application/cache" -mindepth 1 -maxdepth 1 -type d -name 'module-aster-*')
 saved_stops=$(stops)
 printf 'changed aster\n' >> "$fixture/source/modules/aster/dashboard/input.txt"
 commit_source aster
@@ -151,7 +152,8 @@ rm "$fixture/fail-module-aster"
 run_install
 expect_counts 1 2 0 2 5
 expect_modules 3 1 2 3
-[[ $(aster_caches) == $((saved_caches + 1)) ]]
+# Activation keeps only the rebuilt module cache; the superseded key is pruned.
+[[ $(aster_caches) == 1 && $(find "$fixture/application/cache" -mindepth 1 -maxdepth 1 -type d -name 'module-aster-*') != "$saved_aster_cache" ]]
 [[ $(sort -u "$fixture/module-workspaces" | wc -l) -ge 4 ]]
 
 # A Python-only change updates the runtime without rebuilding the dashboard or

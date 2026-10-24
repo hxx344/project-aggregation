@@ -5,7 +5,7 @@ import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createServer } from 'node:http';
-import { openMarketStore } from '../server/market-store.mjs';
+import { openMarketStore, MARKET_OBSERVATION_RETENTION_MS } from '../server/market-store.mjs';
 import { createMarketCollector, seedMarketDatabase } from '../server/market-collector.mjs';
 import { createMonitorServices } from '../server/monitor-services.mjs';
 import { createHandler } from '../server/http.mjs';
@@ -60,6 +60,39 @@ test('SQLite retains legacy history and 15-minute candles, sample keys and origi
       assert.equal(reopened.count('hynix', 'quote'), 1);
       assert.throws(() => reopened.read('__proto__', 'quote'));
     } finally { reopened.close(); }
+  } finally { store.close(); }
+});
+
+test('observation pruning removes rows last confirmed before the retention window across rowid ranges and stops on abort', async t => {
+  let clock = NOW;
+  const { store, filename } = await database(t, () => clock);
+  try {
+    assert.equal(await store.pruneObservations(), 0);
+    store.write('hynix', 'quote', quote(NOW));
+    const day = 86_400_000, retention = MARKET_OBSERVATION_RETENTION_MS;
+    assert.equal(retention, 360 * day);
+    const direct = new DatabaseSync(filename);
+    try {
+      const insert = direct.prepare('INSERT INTO market_observations(rowid,dataset,time,payload,source_ms) VALUES (?,?,?,?,?)');
+      // Spread rows over several delete ranges; each row's source_ms decides retention, never its time unit.
+      insert.run(12_000, 'hynix/quote', 1, '{}', NOW - retention - day);
+      insert.run(20_000, 'hynix/quote', 2, '{}', NOW - retention + day);
+      insert.run(30_000, 'hynix/quote', 3, '{}', NOW - retention - 2 * day);
+    } finally { direct.close(); }
+    assert.equal(store.count('hynix', 'quote'), 4);
+    const control = new AbortController();
+    let pauses = 0;
+    assert.equal(await store.pruneObservations({ signal: control.signal, pause: async () => { if (++pauses === 3) control.abort(); } }), 1);
+    assert.equal(store.count('hynix', 'quote'), 3);
+    assert.equal(await store.pruneObservations({ signal: control.signal }), 0);
+    assert.equal(await store.pruneObservations(), 1);
+    assert.equal(store.count('hynix', 'quote'), 2);
+    assert.equal(store.raw('hynix', 'quote').fetchedAt, new Date(NOW).toISOString());
+    clock = NOW + 2 * day;
+    assert.equal(await store.pruneObservations(), 1);
+    assert.equal(store.count('hynix', 'quote'), 1);
+    store.close();
+    assert.equal(await store.pruneObservations(), 0);
   } finally { store.close(); }
 });
 

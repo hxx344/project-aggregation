@@ -1266,6 +1266,18 @@ prepare_environment_rollback() {
   install -m 0600 "$APP_DIR/.last-successful.env" "$old_environment"
   old_health_url=$(health_url "$(read_setting HOST 127.0.0.1 "$old_environment")" "$(read_setting PORT 3100 "$old_environment")")
 }
+# The interpreter recorded before this activation belongs to the release that
+# becomes the rollback target. The record names that release so cache pruning
+# can ignore it whenever the previous link has moved without it.
+remember_previous_python_paths() {
+  local module interpreter target
+  target=$(realpath -e -- "$1") || return 1
+  for module in greeks aster; do
+    interpreter=
+    if [[ -f "$work_dir/previous-$module-python-path" ]]; then interpreter=$(cat -- "$work_dir/previous-$module-python-path") || return 1; fi
+    atomic_record "$APP_DIR/.previous-$module-python-path" "$target"$'\n'"$interpreter" || return 1
+  done
+}
 restore_python_paths() {
   local module
   for module in greeks aster; do
@@ -2380,6 +2392,116 @@ prune_releases() {
     safe_remove_release "$directory"
   done < <(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d ' ' -f 2-)
 }
+# Rename before deleting: an interrupted removal must never leave a partial
+# entry under a live cache key, which later installs reject as incomplete.
+discard_cache_entry() {
+  local target=$1 trash
+  trash="${target%/*}/.prune.${target##*/}"
+  if [[ -e "$trash" || -L "$trash" ]]; then rm -rf -- "$trash" || return 1; fi
+  mv -T -- "$target" "$trash" || return 1
+  rm -rf -- "$trash"
+}
+# Every cache entry is rebuilt from pinned inputs when its key is missing, so a
+# successful activation keeps only what this deployment and its rollback
+# releases still reference. Callers hold the install lock and must treat a
+# failure as non-fatal: the activated release never depends on pruning.
+prune_caches() {
+  local cache="$APP_DIR/cache" entry name root links target key module directory interpreter recorded recorded_release
+  local removed=0 failed=0 source_keys=0
+  local -A keep=() keep_python=()
+  local -a roots=()
+  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous"; do
+    [[ -n "$root" && -e "$root" ]] || continue
+    root=$(realpath -e -- "$root") || return 1
+    roots+=("$root")
+  done
+  for root in "${roots[@]}"; do
+    # Releases built by any installer revision link production dependencies into the cache.
+    links=$(find "$root" -maxdepth 5 -type l -lname "$cache/*" -printf '%l\n') || return 1
+    while IFS= read -r target; do
+      target=${target#"$cache/"}
+      target=${target%%/*}
+      [[ -n "$target" ]] || continue
+      keep[$target]=1
+    done <<< "$links"
+    if [[ -f "$root/.runtime-dependency-key" ]]; then
+      key=$(cat -- "$root/.runtime-dependency-key") || return 1
+      keep[runtime-dependencies-$key]=1
+    fi
+  done
+  # CI deployments never compute source cache keys; leave those caches for a later source deployment.
+  if [[ "$PROJECT_DEPLOY_MODE" == source && -n "${dependency_key:-}" && -n "${embedded_key:-}" ]]; then
+    source_keys=1
+    for key in "dependencies-$dependency_key" "runtime-dependencies-$runtime_dependency_key" "build-$build_key" "embedded-$embedded_key"; do
+      keep[$key]=1
+    done
+    for module in "${!module_build_keys[@]}"; do keep[module-$module-${module_build_keys[$module]}]=1; done
+  fi
+  for entry in "$cache"/* "$cache"/.[!.]*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    name=${entry##*/}
+    if [[ "$name" == .prune.* || "$name" =~ ^\.(build|module-[a-z]+)-[a-f0-9]{64}\.(tmp|old)- ]]; then
+      if rm -rf -- "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+      continue
+    fi
+    (( source_keys )) || continue
+    [[ "$name" =~ ^(dependencies|runtime-dependencies|build|embedded)-[a-f0-9]{64}$ ||
+       "$name" =~ ^module-[a-z]+-[a-f0-9]{64}$ ]] || continue
+    [[ -z ${keep[$name]:-} ]] || continue
+    if discard_cache_entry "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+  done
+  if [[ -d "$cache/archives" && ! -L "$cache/archives" ]]; then
+    for entry in "$cache/archives"/* "$cache/archives"/.[!.]*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      name=${entry##*/}
+      if [[ "$name" == .prune.* ]]; then
+        if rm -rf -- "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+        continue
+      fi
+      [[ "$name" =~ ^\.?([a-f0-9]{64})\.(tar\.gz|parts|lock)$ && "${BASH_REMATCH[1]}" != "${CI_RELEASE_SHA256:-}" ]] || continue
+      if discard_cache_entry "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+    done
+  fi
+  for module in greeks aster; do
+    directory="$APP_DIR/python"
+    interpreter=$GREEKS_PYTHON_PATH
+    if [[ "$module" == aster ]]; then directory="$APP_DIR/python-aster"; interpreter=$ASTER_PYTHON_PATH; fi
+    # Without a managed active interpreter there is no trustworthy keep set.
+    [[ "$interpreter" =~ ^"$directory/"([a-f0-9]{64})/bin/python$ ]] || continue
+    keep_python=(["${BASH_REMATCH[1]}"]=1)
+    if [[ -e "$APP_DIR/previous" ]]; then
+      # Without a record naming the current rollback release, its environment is unknown.
+      [[ -f "$APP_DIR/.previous-$module-python-path" ]] || continue
+      recorded_release= interpreter=
+      { IFS= read -r recorded_release || true; IFS= read -r interpreter || true; } < "$APP_DIR/.previous-$module-python-path" || return 1
+      [[ -n "$recorded_release" && "$recorded_release" == "$(realpath -e -- "$APP_DIR/previous")" ]] || continue
+      if [[ "$interpreter" =~ ^"$directory/"([a-f0-9]{64})/bin/python$ ]]; then keep_python[${BASH_REMATCH[1]}]=1; fi
+    fi
+    # The active record and this run's pre-activation copy cover the restored unit after a rollback.
+    for recorded in "$APP_DIR/.$module-python-path" "${work_dir:-}/previous-$module-python-path"; do
+      [[ -f "$recorded" ]] || continue
+      interpreter=$(cat -- "$recorded") || return 1
+      if [[ "$interpreter" =~ ^"$directory/"([a-f0-9]{64})/bin/python$ ]]; then keep_python[${BASH_REMATCH[1]}]=1; fi
+    done
+    for entry in "$directory"/* "$directory"/.prune.*; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      name=${entry##*/}
+      if [[ "$name" == .prune.* ]]; then
+        if rm -rf -- "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+        continue
+      fi
+      [[ "$name" =~ ^[a-f0-9]{64}$ && -z ${keep_python[$name]:-} ]] || continue
+      if discard_cache_entry "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+    done
+  done
+  # Work directories are created only under the install lock, so any other one is a failed attempt.
+  for entry in "$APP_DIR"/.install.*; do
+    [[ -d "$entry" && ! -L "$entry" && "$entry" != "${work_dir:-}" && "${entry##*/}" =~ ^\.install\.[A-Za-z0-9]{8}$ ]] || continue
+    if rm -rf -- "$entry"; then removed=$((removed + 1)); else failed=$((failed + 1)); fi
+  done
+  (( removed == 0 )) || log "已清理 $removed 项旧部署缓存或失败安装残留。"
+  (( failed == 0 )) || { log "有 $failed 项旧缓存未能删除。"; return 1; }
+}
 main() {
   case "$PROJECT_DEPLOY_MODE" in source|ci) ;; *) fail 'PROJECT_DEPLOY_MODE 必须是 ci 或 source。'; return 1 ;; esac
   case "$PROJECT_DEPLOY_TESTS" in
@@ -2461,6 +2583,7 @@ main() {
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
     finish_update_service "$old_release"
+    prune_caches || log '部分旧缓存未能清理；已上线版本不受影响，下次成功部署会重试。'
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -2488,6 +2611,7 @@ main() {
     remember_environment
     log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
     finish_update_service "$release"
+    prune_caches || log '部分旧缓存未能清理；已上线版本不受影响，下次成功部署会重试。'
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -2511,9 +2635,11 @@ main() {
   atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
   atomic_record "$release/.install-ready" "$application_key"
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"
+  if [[ -n "$old_release" && "$old_release" != "$release" ]]; then remember_previous_python_paths "$old_release"; fi
   if [[ -n "$previous_release" && "$previous_release" != "$release" ]]; then atomic_link "$previous_release" "$APP_DIR/previous"; fi
   finish_update_service "$release"
   prune_releases
+  prune_caches || log '部分旧缓存未能清理；已上线版本不受影响，下次成功部署会重试。'
   rm -rf -- "$work_dir"
   trap - ERR INT TERM
   log "安装完成：已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha")；监听 $HOST_VALUE:$PORT_VALUE，配置与数据已保留。"
