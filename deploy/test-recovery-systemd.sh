@@ -73,7 +73,7 @@ module.require_stopped(sys.argv[3])
 PY
 "${RECOVERY_TEST_NODE:?Pass the verified Node executable}" --input-type=module - "$repository" "$fixture/data" <<'JS'
 import {pathToFileURL} from 'node:url';
-const {acquireRuntimeLock}=await import(pathToFileURL(process.argv[2]+'/server/recovery/lifecycle-lock.mjs'));
-const lock=await acquireRuntimeLock({dataDir:process.argv[3]}); lock.assertHeld(); await lock.close();
+const {acquireRecoveryLocks,assertLifecycleLock}=await import(pathToFileURL(process.argv[2]+'/server/recovery/lifecycle-lock.mjs'));
+const lock=await acquireRecoveryLocks({dataDir:process.argv[3]}); assertLifecycleLock(lock,{dataDir:process.argv[3]}); await lock.close();
 JS
 echo 'Real cgroup orphan rejection, complete stop and native lifecycle lock passed.'

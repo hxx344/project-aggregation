@@ -6,10 +6,17 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sys
 import threading
 import time
+
+
+# The runtime holds its lock exclusively; API processes share theirs; the
+# recovery tools take both exclusively (design doc 5.7).
+LOCK_FILES = {"runtime": ".runtime.lock", "api": ".api.lock"}
+LOCK_MODES = ("exclusive", "shared")
 
 
 class LifecycleLockError(RuntimeError):
@@ -119,15 +126,17 @@ def _check_path(data_dir, owner_uid):
 
 
 class RuntimeLock:
-    def __init__(self, data_dir, timeout_ms=5000, expected_owner_uid=None):
+    def __init__(self, data_dir, timeout_ms=5000, expected_owner_uid=None, name="runtime", mode="exclusive"):
         self.descriptor = None
         self.handle = None
         self._directory_handles = []
         self._overlapped = None
         self.closed = False
         try:
-            if type(timeout_ms) is not int or not 0 <= timeout_ms <= 60000:
+            # Only API processes share their lock: a shared runtime lock would let two runtimes run.
+            if type(timeout_ms) is not int or not 0 <= timeout_ms <= 60000 or name not in LOCK_FILES or mode not in LOCK_MODES or (name == "runtime" and mode != "exclusive"):
                 _fail("INVALID_RUNTIME_LOCK_OPTIONS")
+            self.shared = mode == "shared"
             if os.name == "nt":
                 if expected_owner_uid is not None:
                     _fail("INVALID_RUNTIME_LOCK_OPTIONS")
@@ -137,7 +146,7 @@ class RuntimeLock:
                 if type(self.owner_uid) is not int or self.owner_uid < 0 or (self.owner_uid != os.getuid() and os.getuid() != 0):
                     _fail("INVALID_RUNTIME_LOCK_OPTIONS")
             self.data_dir, self.directory_identity = _check_path(data_dir, self.owner_uid)
-            self.path = self.data_dir / ".runtime.lock"
+            self.path = self.data_dir / LOCK_FILES[name]
             if os.name == "nt":
                 self._open_windows()
             else:
@@ -207,14 +216,15 @@ class RuntimeLock:
 
     def _try_lock(self):
         if os.name == "nt":
-            if self._kernel.LockFileEx(self.handle, 0x00000003, 0, 1, 0, ctypes.byref(self._overlapped)):
+            # LOCKFILE_FAIL_IMMEDIATELY, plus LOCKFILE_EXCLUSIVE_LOCK unless shared.
+            if self._kernel.LockFileEx(self.handle, 0x00000001 if self.shared else 0x00000003, 0, 1, 0, ctypes.byref(self._overlapped)):
                 return True
             if ctypes.get_last_error() in (33, 158):
                 return False
             _fail("RUNTIME_LOCK_UNAVAILABLE")
         import fcntl
         try:
-            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(self.descriptor, (fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
             return True
         except BlockingIOError:
             return False
@@ -255,10 +265,25 @@ class RuntimeLock:
 
 def main():
     lock = None
+    # A service stop or Ctrl+C reaches the whole process group: the lock stays
+    # until the parent closes stdin (or dies), so it is never freed before the
+    # parent has closed its databases.
+    for name in ("SIGINT", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
     try:
-        if len(sys.argv) not in (3, 4):
+        # DATA_DIR TIMEOUT_MS [OWNER_UID] [--name=runtime|api] [--mode=exclusive|shared]
+        positional = [value for value in sys.argv[1:] if not value.startswith("--")]
+        options = {}
+        for value in sys.argv[1:]:
+            if value.startswith("--"):
+                key, separator, choice = value[2:].partition("=")
+                if key not in ("name", "mode") or not separator or key in options:
+                    _fail("INVALID_RUNTIME_LOCK_OPTIONS")
+                options[key] = choice
+        if len(positional) not in (2, 3):
             _fail("INVALID_RUNTIME_LOCK_OPTIONS")
-        lock = RuntimeLock(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) == 4 else None)
+        lock = RuntimeLock(positional[0], int(positional[1]), int(positional[2]) if len(positional) == 3 else None, **options)
         print(json.dumps({"ready": True, "schemaVersion": 1}), flush=True)
         ended = threading.Event()
 

@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { createBackup } from '../server/recovery/backup.mjs';
-import { acquireRuntimeLock } from '../server/recovery/lifecycle-lock.mjs';
+import { acquireRecoveryLocks } from '../server/recovery/lifecycle-lock.mjs';
 import { readLockedRegistry, readRegistry } from '../server/recovery/inventory.mjs';
 import { runRecoveryCli } from '../server/recovery/cli.mjs';
 
@@ -37,7 +37,7 @@ async function fixture(t) {
     fs.writeFileSync(path.join(directory,'credentials.key'),randomBytes(32),{mode:0o600});
     for(const id of ['monitor','asset','crossex','greeks','aster'])fs.mkdirSync(path.join(directory,'modules',id),{recursive:true,mode:0o700});
   `));
-  const lock=await acquireRuntimeLock({dataDir:source,expectedOwnerUid:serviceUid});held.push(lock);
+  const lock=await acquireRecoveryLocks({dataDir:source,expectedOwnerUid:serviceUid});held.push(lock);
   return {root,source,lock};
 }
 

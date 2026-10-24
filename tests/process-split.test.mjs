@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { fork } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,7 @@ import { startRuntime } from '../server/runtime/main.mjs';
 import { tradingModules } from '../server/modules/updates.mjs';
 import { dataPlaneOptions, fakeModules } from './fixtures/split-modules.mjs';
 import { unavailableUpdateState } from '../server/updates.mjs';
+import { acquireLifecycleLock, acquireRecoveryLocks } from '../server/recovery/lifecycle-lock.mjs';
 
 // The runtime and the API as separate processes (design doc 3.1), over the
 // fixture entries in tests/fixtures/split-*.mjs. POSIX only: the runtime lock
@@ -179,6 +180,45 @@ test('the API starts while a trading module refuses maintenance and keeps that m
   const confirmed = Object.fromEntries(rows.filter(row => tradingModules.includes(row.moduleId)).map(row => [row.moduleId, row.maintenanceConfirmed]));
   assert.deepEqual(confirmed, Object.fromEntries(tradingModules.map(id => [id, id !== 'crossex'])));
   runtime.child.kill('SIGTERM'); await runtime.exited;
+});
+
+test('API processes share .api.lock, which keeps the recovery tools out until the last one closes', { skip, timeout: 60_000 }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const quiet = { info() {}, debug() {}, warn() {}, error() {} };
+  const busy = error => error.code === 'RUNTIME_LOCK_BUSY';
+  const options = { logger: quiet, env, port: 0, distDir: path.join(dataDir, 'dist'), updatesClient: { status: async () => unavailableUpdateState() } };
+  const runtime = spawnFixture(t, 'split-runtime.mjs', env);
+  await runtime.next('ready');
+  const first = await startApi({ dataDir, ...options }), second = await startApi({ dataDir, ...options });
+  t.after(() => Promise.allSettled([first.close(), second.close()]));
+  assert.equal((await client(second.ready.port).request('/api/health')).status, 200, 'a second API starts beside the first');
+  await assert.rejects(acquireRecoveryLocks({ dataDir, timeoutMs: 100 }), busy);
+  runtime.child.kill('SIGTERM'); assert.deepEqual(await runtime.exited, { code: 0, signal: null }, runtime.stderr());
+  // The runtime lock is free now; a live API alone still keeps recovery out.
+  await assert.rejects(acquireRecoveryLocks({ dataDir, timeoutMs: 100 }), busy);
+  await first.close();
+  await assert.rejects(acquireLifecycleLock({ dataDir, name: 'api', timeoutMs: 100 }), busy);
+  await second.close();
+  const recovery = await acquireRecoveryLocks({ dataDir, timeoutMs: 100 });
+  try {
+    // While recovery holds both locks, an API cannot start or open the database.
+    await assert.rejects(startApi({ dataDir, ...options }), busy);
+  } finally { await recovery.close(); }
+});
+
+test('an API whose lifecycle lock is lost reports it through fail()', { skip, timeout: 60_000 }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const runtime = spawnFixture(t, 'split-runtime.mjs', env);
+  await runtime.next('ready');
+  const failures = [];
+  const api = await startApi({ dataDir, logger: { info() {}, debug() {}, warn() {}, error() {} }, env, port: 0, distDir: path.join(dataDir, 'dist'),
+    updatesClient: { status: async () => unavailableUpdateState() }, fail: error => failures.push(error) });
+  t.after(() => api.close().catch(() => {}));
+  // A data directory others may read no longer protects the lock: the helper gives it up.
+  chmodSync(dataDir, 0o750);
+  try { assert.equal(await until(() => failures.length > 0, 5000), true, 'fail() heard of the lost lock'); }
+  finally { chmodSync(dataDir, 0o700); }
+  assert.equal(failures[0].name, 'RuntimeLockError');
 });
 
 test('an API started before the runtime refuses to create the database', { skip, timeout: 30_000 }, async t => {

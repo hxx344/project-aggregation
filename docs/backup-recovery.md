@@ -41,7 +41,7 @@ sudo project-aggregation-recovery inspect --target-dir /srv/project-aggregation/
 
 ## 一致性与备份内容
 
-操作入口先串行取得 stack 和 installer 锁，避免同时升级。需要冷操作时停止 `project-aggregation.service`，检查 `ActiveState`、`MainPID=0` 以及原服务 cgroup 的 `populated 0`，随后由工具持有数据根 `.runtime.lock` 的 OS 排他锁。Hub 在创建共享保护库和模块前取得同一生命周期锁，关闭完成后才释放。只看主 PID 或手动创建一个锁文件不能替代这套证据。
+操作入口先串行取得 stack 和 installer 锁，避免同时升级。需要冷操作时停止 `project-aggregation.service`，检查 `ActiveState`、`MainPID=0` 以及原服务 cgroup 的 `populated 0`，随后由工具先后持有数据根 `.runtime.lock` 与 `.api.lock` 的 OS 排他锁。Hub 在创建共享保护库和模块前取得 `.runtime.lock`，拆分后的 API 进程以共享模式持有 `.api.lock`，都在关闭完成后才释放。只看主 PID 或手动创建一个锁文件不能替代这套证据。
 
 当前采用完整服务组冷停。没有跨数据库事务：一致性依据是在全部受支持写者退出且生命周期锁持有期间，各库及 JSON 保持静止。SQLite 使用备份 API 生成完整快照；需要时受控 checkpoint，读取或恢复不丢弃仍有内容的 WAL，也不直接复制主文件并忽略 WAL。manifest 为每个库记录 schema 摘要、`user_version`、`application_id` 和完整表行数，恢复时重新校验。
 
@@ -58,7 +58,7 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 
 各模块 `.env`、JSON、应用解密密钥、引用的内部 CA 和未知文件默认归 `secrets`。已知业务库、共享保护库与身份标记归 `data`；未知 SQLite 文件仍按秘密材料处理。两类分别使用独立密钥进行 AES-256-GCM 加密，manifest 同时用两把密钥认证，关联固定发布提交、检查点、文件明文与密文摘要、大小和分类。成功制作只表示归档完成；返回 `restorable: null` 不等于已完成独立恢复验收。
 
-排除的可再生材料包括 `.runtime.lock`、模块进程锁、socket、临时文件、已被数据库快照吸收的 WAL/SHM 和旧恢复控制文件。符号链接、硬链接、特殊文件、不安全权限及路径越界直接拒绝，不会通过改名为排除项而放过。
+排除的可再生材料包括 `.runtime.lock`、`.api.lock`、模块进程锁、socket、临时文件、已被数据库快照吸收的 WAL/SHM 和旧恢复控制文件。符号链接、硬链接、特殊文件、不安全权限及路径越界直接拒绝，不会通过改名为排除项而放过。
 
 根环境文件归档为加密的 `_recovery/root.env`，恢复时只作为材料保存，**不会写回 `/etc/project-aggregation.env`**。交易准入使用当前受保护根环境与对应模块 `.env` 的实际组合，不能把历史环境归档当成新授权。
 

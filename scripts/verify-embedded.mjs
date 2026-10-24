@@ -16,7 +16,7 @@ try {
   const { createApp } = await import(pathToFileURL(path.join(root, 'server/app.mjs')));
   const { readSummary } = await import(pathToFileURL(path.join(root, 'server/adapters.mjs')));
   const { createAccountWriter } = await import(pathToFileURL(path.join(root, 'server/execution/account-writer.mjs')));
-  const { acquireRuntimeLock } = await import(pathToFileURL(path.join(root, 'server/recovery/lifecycle-lock.mjs')));
+  const { acquireRuntimeLock, acquireRecoveryLocks } = await import(pathToFileURL(path.join(root, 'server/recovery/lifecycle-lock.mjs')));
   runtimeLock = await acquireRuntimeLock({ dataDir });
   const writerContext = { databasePath: path.join(dataDir, 'execution-control.sqlite'), runtimeId: randomUUID() };
   accountWriter = createAccountWriter({ ...writerContext, moduleId: 'hub' });
@@ -108,12 +108,12 @@ try {
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   assert.ok(commit, 'verified package has a fixed release identity');
-  let lock = await acquireRuntimeLock({ dataDir });
+  let lock = await acquireRecoveryLocks({ dataDir });
   const backupStartedAt = Date.now();
   try { await createBackup({ dataDir, destination: backupDir, dataKey, secretsKey, lock, commit }); }
   finally { await lock.close(); }
   const faultAt = Date.now(), restoreStartedAt = Date.now();
-  await mkdir(targetDir, { mode: 0o700 }); lock = await acquireRuntimeLock({ dataDir: targetDir });
+  await mkdir(targetDir, { mode: 0o700 }); lock = await acquireRecoveryLocks({ dataDir: targetDir });
   try { await restoreBackup({ backupDir, targetDir, dataKey, secretsKey, lock }); }
   finally { await lock.close(); dataKey.fill(0); secretsKey.fill(0); }
   runtimeLock = await acquireRuntimeLock({ dataDir: targetDir });

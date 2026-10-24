@@ -5,6 +5,7 @@ import { logger as defaultLogger } from '../logger.mjs';
 import { runProcess } from '../process-entry.mjs';
 import { validateAuthOrigin } from '../adapters.mjs';
 import { assertRecoveryStartup } from '../recovery/startup.mjs';
+import { acquireLifecycleLock } from '../recovery/lifecycle-lock.mjs';
 import { openHubDatabase, seedProjects } from '../control/schema.mjs';
 import { createControlStore } from '../control/store.mjs';
 import { createProjectCatalog } from '../control/projects.mjs';
@@ -24,23 +25,28 @@ const noCredentials = () => { throw new Error('API 进程不处理项目凭据')
 // The API process (design doc 3.1): sessions, the update coordinator, project
 // configuration, Portal, the overview streams and static files, reaching the
 // runtime only through its socket. It writes the control tables, so it seeds
-// them. Until P1-4 it holds no lock of its own: the launcher runs one at a time.
+// them. It holds `.api.lock` shared from before the recovery check until close()
+// has closed the Hub database, so the recovery tools see it alive (design doc 5.7).
 export async function startApi({ dataDir, logger = defaultLogger, signal, fail = () => {}, env = process.env, port = 3100, host = '127.0.0.1', distDir = path.join(root, 'dist'), updatesClient, loginLimits = resolveLoginLimits() }) {
   const resolvedData = path.resolve(dataDir);
-  const stopped = () => { if (signal?.aborted) throw new Error('API 启动已中止'); };
-  let db = null, api = null, closing = null;
+  // Each step checks the lock too: a lost lock may already let a recovery tool in.
+  const stopped = () => { lock.assertHeld(); if (signal?.aborted) throw new Error('API 启动已中止'); };
+  let db = null, api = null, lock = null, closing = null;
   function close() {
     return closing ??= (async () => {
       const results = [];
-      for (const action of [() => api?.close(), () => api?.closeServer(), () => db?.close()]) { try { await action(); } catch (error) { results.push(error); } }
+      for (const action of [() => api?.close(), () => api?.closeServer(), () => db?.close(), () => lock?.close()]) { try { await action(); } catch (error) { results.push(error); } }
       if (results.length) throw new AggregateError(results, 'API 关闭失败');
     })();
   }
   try {
-    assertRecoveryStartup(resolvedData);
     // The runtime creates the data directory and the credential key first; a
     // database created here without the key would keep the runtime from starting.
     if (!existsSync(path.join(resolvedData, 'credentials.key'))) throw new Error('运行时尚未初始化数据目录，请先启动运行时');
+    lock = await acquireLifecycleLock({ dataDir: resolvedData, name: 'api', mode: 'shared', onLost: fail });
+    stopped();
+    assertRecoveryStartup(resolvedData);
+    lock.assertHeld();
     db = openHubDatabase(path.join(resolvedData, 'hub.sqlite'));
     const control = createControlStore(db);
     await ensurePassword(control, { initialPassword: env.INITIAL_PASSWORD, log: logger });
