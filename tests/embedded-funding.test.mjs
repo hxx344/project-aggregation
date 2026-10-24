@@ -41,8 +41,15 @@ test('Hub-launched embedded CrossEx receives normalized funding opportunities fr
     account: null, openOrders: [], asOf: heldAt, error: null,
     positions: ['BINANCE', 'BYBIT'].map((exchange, i) => ({ position_id: `held-${i}`, symbol: `${exchange}_FUTURE_BTC_USDT`, position_side: i ? 'SHORT' : 'LONG', position_qty: '1', create_time: String(heldAt - 86400000), update_time: String(heldAt) })),
   }));
-  const portfolio = await module.request('/api/state?opportunities=0&funding=1');
-  assert.equal(portfolio.status, 200);
+  // Held rates come from the venues' own public APIs in the background; the
+  // first portfolio read starts them without waiting on exchange IO.
+  let portfolio;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    portfolio = await module.request('/api/state?opportunities=0&funding=1');
+    assert.equal(portfolio.status, 200);
+    if (portfolio.data.positionFundingRates.length === 2) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
   assert.deepEqual(portfolio.data.opportunities, []);
   assert.deepEqual(portfolio.data.fundingOpportunities, []);
   assert.equal(portfolio.data.positionFundingRates.length, 2, 'positions receive exact held rates without evaluating opportunity rankings');

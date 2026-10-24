@@ -1,7 +1,10 @@
-import { validIdentity, contractIdentity } from './model.mjs';
+import WebSocket from 'ws';
+import { validIdentity, validManualIdentity, contractIdentity } from './model.mjs';
 import { D } from './money.mjs';
+import { publicSnapshot } from './public-snapshot.mjs';
 
 const HOUR = 3_600_000, DAY = 24 * HOUR, MAX_BYTES = 8 * 1024 * 1024, MAX_PAGES = 3;
+const LIGHTER_STREAM = 'wss://mainnet.zklighter.elliot.ai/stream?readonly=true';
 const BASE = Object.freeze({ binance: 'https://fapi.binance.com', bybit: 'https://api.bybit.com', okx: 'https://www.okx.com', gate: 'https://api.gateio.ws', kraken: 'https://futures.kraken.com', hyperliquid: 'https://api.hyperliquid.xyz', lighter: 'https://mainnet.zklighter.elliot.ai' });
 const fail = message => { throw new Error(message); };
 const decimal = (value, positive = false) => {
@@ -13,17 +16,23 @@ const hours = value => Number.isFinite(Number(value)) && Number(value) > 0 && Nu
 const array = value => Array.isArray(value) && value.length <= 50_000 ? value : fail('资金费响应列表无效');
 const rowFor = (rows, field, symbol) => array(rows).find(row => row?.[field] === symbol) || fail('资金费响应合约不一致');
 const source = (venue, path, params = {}) => { const url = new URL(path, BASE[venue]); for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value)); return url.href; };
-async function together(reads) { const results = await Promise.allSettled(reads), failed = results.find(row => row.status === 'rejected'); if (failed) throw failed.reason; return results.map(row => row.value); }
+// A rate limit on any leg must surface, so callers can cool the venue.
+async function together(reads) {
+  const results = await Promise.allSettled(reads), failures = results.filter(row => row.status === 'rejected');
+  if (failures.length) throw (failures.find(row => [418, 429].includes(row.reason?.status)) ?? failures[0]).reason;
+  return results.map(row => row.value);
+}
 
 /** Fixed public endpoints only; no account identifier, key, signer or trading endpoint. */
-export function createFundingClient({ fetcher = fetch, clock = Date.now, timeoutMs = 8000 } = {}) {
-  const flights = new Map(), cache = new Map(), venueState = new Map();
+export function createFundingClient({ fetcher = fetch, clock = Date.now, timeoutMs = 8000, WebSocketImpl = WebSocket } = {}) {
+  const flights = new Map(), cache = new Map(), venueState = new Map(), currentCooldown = new Map();
+  let intervals = null, intervalsFlight = null;
   async function json(url, body) {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), Math.min(8000, Math.max(1, timeoutMs)));
     let response;
     try {
       response = await fetcher(url, { method: body ? 'POST' : 'GET', redirect: 'error', signal: controller.signal, headers: { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
-      if (!response.ok) fail(`公开资金费来源响应 ${response.status}`);
+      if (!response.ok) throw Object.assign(new Error(`公开资金费来源响应 ${response.status}`), { status: response.status });
       if (Number(response.headers?.get('content-length')) > MAX_BYTES) fail('资金费响应超过 8 MB');
       let size = 0; const chunks = [];
       if (!response.body) fail('资金费响应为空');
@@ -33,6 +42,14 @@ export function createFundingClient({ fetcher = fetch, clock = Date.now, timeout
   }
   const get = (venue, path, params) => json(source(venue, path, params));
   const info = body => json(source('hyperliquid', '/info'), body);
+  // fundingInfo shares Binance's 500 per 5 min IP budget with funding history,
+  // so one snapshot serves every symbol for a minute; failures are not cached.
+  function binanceIntervals() {
+    const now = clock();
+    if (intervals && now >= intervals.at && now - intervals.at < 60_000) return Promise.resolve(intervals.rows);
+    return intervalsFlight ??= get('binance', '/fapi/v1/fundingInfo').then(value => { const rows = array(value); intervals = { at: clock(), rows }; return rows; })
+      .finally(() => { intervalsFlight = null; });
+  }
   function point(row, at, rate, url, extra = {}) {
     at = time(at); rate = decimal(rate);
     if (!row || at === null || at > clock() || rate === null) fail('资金费结算时间或费率无效');
@@ -46,16 +63,23 @@ export function createFundingClient({ fetcher = fetch, clock = Date.now, timeout
   async function readCurrent(q) {
     const { exchange: v, symbol } = q;
     if (v === 'binance') {
-      const [row, intervals] = await together([get(v, '/fapi/v1/premiumIndex', { symbol }), get(v, '/fapi/v1/fundingInfo')]);
+      const [row, rows] = await together([get(v, '/fapi/v1/premiumIndex', { symbol }), binanceIntervals()]);
       if (row.symbol !== symbol) fail('Binance 当前资金费合约不一致');
-      const adjustment = array(intervals).find(x => x.symbol === symbol);
+      const adjustment = rows.find(x => x.symbol === symbol);
       return current(row.lastFundingRate, adjustment ? adjustment.fundingIntervalHours : 8, row.nextFundingTime, row.time, row.markPrice);
     }
     if (v === 'bybit') {
-      const [ticker, metadata] = await together([get(v, '/v5/market/tickers', { category: 'linear', symbol }), get(v, '/v5/market/instruments-info', { category: 'linear', symbol })]);
-      if (ticker.retCode !== 0 || ticker.result?.category !== 'linear' || metadata.retCode !== 0) fail('Bybit 当前资金费响应无效');
-      const row = rowFor(ticker.result.list, 'symbol', symbol), rule = rowFor(metadata.result?.list, 'symbol', symbol);
-      return current(row.fundingRate, Number(rule.fundingInterval) / 60, row.nextFundingTime, ticker.time, row.markPrice);
+      const ticker = await get(v, '/v5/market/tickers', { category: 'linear', symbol });
+      if (ticker.retCode !== 0 || ticker.result?.category !== 'linear') fail('Bybit 当前资金费响应无效');
+      const row = rowFor(ticker.result.list, 'symbol', symbol);
+      // A present ticker interval wins even when invalid: metadata can lag an interval change.
+      let interval = row.fundingIntervalHour;
+      if (interval === undefined) {
+        const metadata = await get(v, '/v5/market/instruments-info', { category: 'linear', symbol });
+        if (metadata.retCode !== 0) fail('Bybit 当前资金费响应无效');
+        interval = Number(rowFor(metadata.result?.list, 'symbol', symbol).fundingInterval) / 60;
+      }
+      return current(row.fundingRate, interval, row.nextFundingTime, ticker.time, row.markPrice);
     }
     if (v === 'okx') {
       const data = await get(v, '/api/v5/public/funding-rate', { instId: symbol });
@@ -78,6 +102,36 @@ export function createFundingClient({ fetcher = fetch, clock = Date.now, timeout
     }
     // Lighter's /funding-rates is a cross-venue comparison, not its live settlement feed.
     return null;
+  }
+  // Lighter publishes the estimated current rate only on its public stream;
+  // stats rates are hourly percentage points, matching Monitor's reader.
+  async function lighterCurrent(q) {
+    const id = q.marketId;
+    if (!Number.isInteger(id) || id < 0) fail('Lighter market_id 无效');
+    const data = await publicSnapshot({ source: LIGHTER_STREAM, WebSocketImpl, timeoutMs: Math.min(8000, Math.max(1, timeoutMs)),
+      subscription: { type: 'subscribe', channel: `market_stats/${id}` },
+      accept: value => value.channel === `market_stats:${id}` && !!value.market_stats && typeof value.market_stats === 'object' });
+    const stats = data.market_stats, row = stats.market_id !== undefined ? stats : stats[String(id)];
+    if (!row || Number(row.market_id) !== id || row.symbol !== undefined && row.symbol !== q.symbol) fail('Lighter 当前资金费合约不一致');
+    const rate = decimal(row.current_funding_rate);
+    if (rate === null) fail('Lighter 当前资金费无效');
+    return current(D(rate).div(100).toString(), 1, (Math.floor(clock() / HOUR) + 1) * HOUR, data.timestamp);
+  }
+  /** Current rate for one held contract; accepts Monitor or native manual identities. */
+  async function currentRate(q) {
+    if (!validIdentity(q) && !validManualIdentity(q)) fail('资金费合约身份无效');
+    const now = clock(), until = currentCooldown.get(q.exchange);
+    if (until > now && until - now <= 60_000) throw Object.assign(new Error('公开资金费来源限流，冷却中'), { status: 429 });
+    if (until !== undefined) currentCooldown.delete(q.exchange);
+    try {
+      const value = q.exchange === 'lighter' ? await lighterCurrent(q) : await readCurrent(q);
+      if (!value) fail('该交易所未提供可核实的当前资金费');
+      return value;
+    } catch (error) {
+      // 418/429 apply to the whole IP, so further symbols on that venue wait a minute.
+      if (error?.status === 418 || error?.status === 429) currentCooldown.set(q.exchange, clock() + 60_000);
+      throw error;
+    }
   }
   async function history(q, from, to) {
     const { exchange: v, symbol } = q, all = [];
@@ -180,7 +234,8 @@ export function createFundingClient({ fetcher = fetch, clock = Date.now, timeout
     }).finally(() => flights.delete(key));
     flights.set(key, flight); return structuredClone(await flight);
   }
-  return { read };
+  return { read, current: currentRate };
 }
 const defaultClient = createFundingClient();
 export const loadFunding = (quote, from, to) => defaultClient.read(quote, from, to);
+export const loadCurrentFunding = quote => defaultClient.current(quote);

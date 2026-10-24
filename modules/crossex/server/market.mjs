@@ -4,7 +4,9 @@ import { AppError, defaults, configuration, validateFeed, validSignal, validManu
 import { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCrossexQuote, resolveManualQuote } from './clients.mjs';
 import { D, Decimal } from './money.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
-import { fundingOpportunities, positionFundingRates } from './funding-opportunities.mjs';
+import { fundingOpportunities } from './funding-opportunities.mjs';
+import { loadCurrentFunding } from './funding-client.mjs';
+import { createPositionFunding } from './position-funding.mjs';
 import { canonicalBase, crossexBase } from '../../../server/asset-identity.mjs';
 
 const CONFIG_KEYS = ['entryPaused', 'monitorUrl', 'monitorUsername', 'notionalPerLeg', 'maxOpen', 'maxTotalNotional', 'feeBps', 'feeSchedule', 'slippageBps', 'minNetBps', 'cooldownSeconds'];
@@ -116,12 +118,13 @@ function budgetValue(leg, latestPrice, fx, now, budget) {
 export function createMarket(store, { catalogReader = loadCatalog, feedReader = loadFeed, depthReader = loadDepth,
   fxReader = loadFx, identityReader = resolveCrossexQuote,
   manualIdentityReader = identityReader === resolveCrossexQuote ? resolveManualQuote : identityReader,
-  manualDepthReader = depthReader === loadDepth ? loadManualDepth : depthReader, clock = Date.now } = {}) {
+  manualDepthReader = depthReader === loadDepth ? loadManualDepth : depthReader, currentFundingReader = loadCurrentFunding, clock = Date.now } = {}) {
   let feed = null, sourceError = '等待首次读取价差服务', sourceCheckedAt = null, sourceReceivedAt = null, sourceDurationMs = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogError = null, catalogAttempt = -Infinity;
   let sourceFlight = null, catalogFlight = null, generation = 0, stopping = false;
   let entryPolicyKnown = store.get('entryPolicyKnown', false);
   const recentSignals = new Map();
+  const positionFunding = createPositionFunding({ identityReader: manualIdentityReader, currentReader: currentFundingReader, clock });
   let feedIndex = indexFeed(null), catalogIndex = indexCatalog(catalog.items);
   // Keep simulation controls out of both settings and production execution.
   const config = () => { const saved = store.config(); return Object.fromEntries(CONFIG_KEYS.map(k => [k, saved[k]])); };
@@ -231,8 +234,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       venues: SUPPORTED_VENUES.map(id => ({ id, state: live ? feedIndex.venues.get(id) ?? 'unavailable' : 'offline', quoteCount: feedIndex.counts.get(id) || 0 })),
       fx: ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (e) { return { currency, state: 'unavailable', error: safeMessage(e) }; } }),
       opportunities: includeOpportunities ? candidates() : [],
-      positionFundingRates: includePositionFunding ? positionFundingRates(feed, { now, ruleFor: manualRuleFor, symbols: positionSymbols,
-        sourceReason: live ? '' : sourceError || '价差数据已过期', catalogExpiresAt: catalog.at + 900000 }) : [],
+      positionFundingRates: includePositionFunding ? positionFunding.rates(positionSymbols) : [],
       fundingOpportunities: includeFundingOpportunities ? fundingOpportunities(feed, { now, ruleFor: manualRuleFor,
         sourceReason: live ? '' : sourceError || '价差数据已过期', entryPaused: config().entryPaused, entryPolicyKnown,
         catalogExpiresAt: catalog.at + 900000,
@@ -560,5 +562,5 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     return view({ includeOpportunities: false });
   }
   return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, resolveDisplaySymbol, openCapacityContext, previewDirect, previewPair, previewOpen, revalidateOpen, previewPosition, revalidatePosition, previewClose, revalidateClose, positionsNotional, positionsValuation, settings,
-    async stop() { stopping = true; await Promise.all([sourceFlight, catalogFlight]); } };
+    async stop() { stopping = true; await Promise.all([sourceFlight, catalogFlight, positionFunding.stop()]); } };
 }
