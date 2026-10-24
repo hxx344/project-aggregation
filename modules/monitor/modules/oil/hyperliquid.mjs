@@ -43,7 +43,7 @@ export function pairDailyCandles(brentCandles, wtiCandles, now = Date.now()) {
       const t = finiteNumber(candle.t, 'candle start');
       const end = finiteNumber(candle.T, 'candle end');
       if (candle.s !== coin || candle.i !== '1d' || t % DAY !== 0 || end !== t + DAY - 1) throw new Error(`Unexpected candle for ${coin}`);
-      if (t < YEAR_START || t >= Date.UTC(2027, 0, 1) || end >= now) continue;
+      if (t < YEAR_START || end >= now) continue;
       if (map.has(t)) throw new Error(`Duplicate candle for ${coin}`);
       map.set(t, finiteNumber(candle.c, 'daily close', true));
     }
