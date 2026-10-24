@@ -433,7 +433,7 @@ function marketPayload(waiting) {
     status: waiting ? 'waiting_for_listing' : 'ready',
     message: '周日到期合约尚未上线，系统将自动检查；上线后生成四腿策略。',
     config: {live_enabled: true, market_refresh_seconds: 10, quote_stale_seconds: 30, max_risk_usd: 2500, open_time: 'Friday 21:00 UTC'},
-    chain: {source: 'bybit', btc_price: 100000, items: []},
+    chain: {source: 'bybit', btc_price: 100000, quote_age_seconds: 0, items: []},
     preview: waiting ? null : {expiry: '2026-09-13T08:00:00Z', market_timestamp: new Date().toISOString(), legs: [], btc_price: 100000, net_credit_usd: 42},
   };
 }
@@ -608,7 +608,7 @@ async function readyStrategy(page, mode) {
 function unavailableStrategyMarket(mode, environment = 'live') {
   const payload = strategyMarket(mode), expiry = payload.preview.expiry;
   Object.assign(payload.config, {environment, trading_enabled:true});
-  payload.chain = {source:'bybit', btc_price:102000, updated_at:new Date().toISOString(), expiry,
+  payload.chain = {source:'bybit', btc_price:102000, updated_at:new Date().toISOString(), quote_age_seconds:0, expiry,
     items:payload.preview.legs.map(leg => ({...leg, expiry, bid:leg.mark_price, ask:leg.mark_price + 10}))};
   return {...payload, status:'strategy_unavailable', read_only:true, reason_code:'short_strike_order',
     message:'当前报价下，卖出 Put 的行权价必须低于卖出 Call，暂不能组成所选策略。', preview:null};
@@ -628,6 +628,7 @@ test('strategy unavailability preserves real quotes and position spot, isolates 
       assert.notEqual(element('creditValue').textContent, '--');
       element('confirm').checked = true;
 
+      const requestedFrom = Date.now();
       const waiting = context.loadMarket(); await deliverMarket(page, unavailable); await waiting;
       assert.equal(element('statusValue').textContent, '策略暂不可用');
       assert.equal(element('statusValue').dataset.state, 'waiting');
@@ -651,7 +652,7 @@ test('strategy unavailability preserves real quotes and position spot, isolates 
       assert.equal(element('legs').textContent, unavailable.message);
       assert.equal(element('payoffStats').textContent, '等待可用策略');
       assert.equal(context.window.__positionMarket.price, 102000);
-      assert.equal(context.window.__positionMarket.timestamp, Date.parse(unavailable.chain.updated_at));
+      assert.ok(context.window.__positionMarket.timestamp >= requestedFrom && context.window.__positionMarket.timestamp <= Date.now());
       assert.match(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
       assert.equal(element('openTrade').disabled, true);
       assert.equal(element('rfqCreate').disabled, true);
@@ -699,14 +700,14 @@ test('strategy unavailable responses that expire in transit retain the chain wit
   assert.match(element('chain').innerHTML, /600.00/);
   assert.match(element('btcPrice').textContent, /102,000/);
   assert.equal(context.window.__latestChain.length, payload.chain.items.length);
-  assert.equal(context.window.__positionMarket.timestamp, sampledAt);
+  assert.ok(context.window.__positionMarket.timestamp <= sampledAt);
   assert.doesNotMatch(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
   assert.match(element('positionPayoffContent').innerHTML, /pp-line/);
   assert.equal(element('openTrade').disabled, true);
   assert.equal(element('rfqCreate').disabled, true);
   assert.equal(element('closeTrade').disabled, false);
   const refresh = context.loadMarket();
-  await deliverMarket(page, {...payload, chain:{...payload.chain, updated_at:new Date(arrivedAt).toISOString()}});
+  await deliverMarket(page, payload);
   await refresh;
   assert.equal(element('statusValue').textContent, '策略暂不可用');
   assert.equal(element('updateText').textContent, '行情更新正常 · 策略等待');
@@ -715,13 +716,13 @@ test('strategy unavailable responses that expire in transit retain the chain wit
   assert.equal(element('openTrade').disabled, true);
 });
 
-test('strategy unavailable responses with invalid or future timestamps cannot mark prices as fresh', async (t) => {
-  for (const [name, timestamp] of [['invalid', 'not-a-date'], ['missing', undefined], ['future', new Date(Date.now() + 60000).toISOString()]]) {
+test('strategy unavailable responses without a valid server quote age cannot mark prices as fresh', async (t) => {
+  for (const [name, age] of [['missing', undefined], ['null', null], ['negative', -1], ['string', '1']]) {
     await t.test(name, async () => {
       const page = dashboard(), {context, element} = page;
       await new Promise(setImmediate);
       const payload = unavailableStrategyMarket('iron_condor');
-      payload.chain.updated_at = timestamp;
+      payload.chain.quote_age_seconds = age;
       context.window.__positionError = false;
       context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT', side:'Buy', size:.1, avg_price:100, unrealised_pnl:3}];
       await deliverMarket(page, payload);
@@ -738,6 +739,70 @@ test('strategy unavailable responses with invalid or future timestamps cannot ma
       assert.equal(element('closeTrade').disabled, false);
     });
   }
+});
+
+test('browser clock offset from the server does not change quote freshness', async (t) => {
+  for (const [name, offset] of [['server ahead', 60000], ['server behind', -60000]]) {
+    await t.test(name, async () => {
+      const page = dashboard(), {context, element} = page;
+      await new Promise(setImmediate);
+      context.window.__positionError = false;
+      context.window.__positionSnapshot = [{symbol:'BTC-13Sep99-100000-C-USDT', side:'Buy', size:.1, avg_price:100, unrealised_pnl:3}];
+      const serverTime = new Date(Date.now() + offset).toISOString();
+      const unavailable = unavailableStrategyMarket('iron_condor');
+      Object.assign(unavailable.chain, {updated_at:serverTime, quote_age_seconds:1});
+      await deliverMarket(page, unavailable);
+      assert.equal(element('statusValue').textContent, '策略暂不可用');
+      assert.equal(element('updateText').textContent, '行情更新正常 · 策略等待');
+      assert.equal(element('chainPanel').dataset.availability, 'ready');
+      assert.match(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+      const ready = strategyMarket();
+      Object.assign(ready.chain, {updated_at:serverTime, quote_age_seconds:1});
+      ready.preview.market_timestamp = serverTime;
+      const refresh = context.loadMarket(); await deliverMarket(page, ready); await refresh;
+      assert.equal(element('statusValue').textContent, '策略就绪');
+      assert.match(element('updateText').textContent, /^行情 1s/);
+      assert.match(element('positionPayoffContent').innerHTML, /pp-spot-dot/);
+    });
+  }
+});
+
+test('ready responses without a valid server quote age are not reported as fresh', async () => {
+  const page = dashboard(), {context, element} = page;
+  await new Promise(setImmediate);
+  const ready = strategyMarket();
+  delete ready.chain.quote_age_seconds;
+  await deliverMarket(page, ready);
+  assert.equal(element('statusValue').textContent, '行情时间待核对');
+  assert.equal(element('statusValue').dataset.state, 'waiting');
+  assert.equal(element('updateText').textContent, '行情时间待核对 · 等待更新');
+  assert.match(element('statusSub').textContent, /行情时间待核对/);
+  assert.equal(Number.isNaN(context.window.__positionMarket.timestamp), true);
+});
+
+test('ready quotes past the stale limit are not rounded back to fresh', async () => {
+  const page = dashboard(), {element} = page;
+  await new Promise(setImmediate);
+  const ready = strategyMarket();
+  ready.chain.quote_age_seconds = 30.4;
+  await deliverMarket(page, ready);
+  assert.equal(element('statusValue').textContent, '行情过期');
+  assert.match(element('updateText').textContent, /^行情 30s/);
+});
+
+test('listing-wait observation quotes that expire in transit are marked stale', async () => {
+  const page = dashboard(), {context, element} = page;
+  await new Promise(setImmediate);
+  const observation = unavailableStrategyMarket('iron_condor');
+  const payload = {...marketPayload(true), chain:{...observation.chain, quote_age_seconds:0}};
+  vm.runInContext(`Date.now = () => ${Date.now() + 31000}`, context);
+  await deliverMarket(page, payload);
+  assert.equal(element('chainPanel').dataset.availability, 'stale');
+  assert.equal(element('updateText').textContent, '行情已过期 · 等待更新');
+  assert.match(element('chain').innerHTML, /600.00/);
+  const refresh = context.loadMarket(); await deliverMarket(page, payload); await refresh;
+  assert.equal(element('chainPanel').dataset.availability, 'ready');
+  assert.equal(element('updateText').textContent, '行情已连接 · 自动检查合约');
 });
 
 test('strategy unavailability preserves execution stop and existing close blockers', async (t) => {

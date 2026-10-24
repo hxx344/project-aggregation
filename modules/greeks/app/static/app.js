@@ -339,6 +339,18 @@ function clearStrategyDisplay(message) {
   $('expiry').textContent = '周日到期';
   renderPayoff(null);
 }
+// Server-measured quote age plus local time elapsed since the request began.
+// Only differences of the local clock are used, so a browser/server clock
+// offset cannot make fresh quotes look future-dated or stale.
+function quoteSampleTime(chain, requestedAt) {
+  const age = chain?.quote_age_seconds;
+  return typeof age === 'number' && Number.isFinite(age) && age >= 0 ? requestedAt - age * 1000 : NaN;
+}
+function quoteFreshness(quoteTime, staleSeconds) {
+  const ageMs = Date.now() - quoteTime, limit = Number(staleSeconds);
+  const validTime = Number.isFinite(ageMs) && ageMs >= 0 && Number.isFinite(limit) && limit > 0;
+  return {ageMs, validTime, fresh: validTime && ageMs <= limit * 1000};
+}
 async function loadMarket() {
   const read = window.ProjectHub.begin('market');
   if (!read) return;
@@ -348,9 +360,11 @@ async function loadMarket() {
   try {
     if (!Number.isFinite(requestedQty) || requestedQty <= 0) throw new Error('请输入有效的每腿数量。');
     const marketUrl = `/api/dashboard/market?quantity=${encodeURIComponent(requestedQty)}&strategy_mode=${encodeURIComponent(requestedMode)}`;
+    const requestedAt = Date.now();
     const payload = await getJson(marketUrl);
     if (!current()) return;
     const {config, preview, chain} = payload;
+    const quoteTime = quoteSampleTime(chain, requestedAt);
     window.__strategyConfig = config;
     if (!strategySelectionInitialized) {
       strategySelectionInitialized = true;
@@ -363,7 +377,7 @@ async function loadMarket() {
     }
     renderStrategySelection();
     if (preview && previewStrategyMode(preview) !== requestedMode) throw new Error('返回的预览与所选开仓结构不一致，请重新刷新。');
-    window.__positionMarket = {price: Number(chain.btc_price || preview?.btc_price || 0), timestamp: Date.parse(chain.updated_at || preview?.market_timestamp || ''), staleSeconds: Number(config.quote_stale_seconds || 30)};
+    window.__positionMarket = {price: Number(chain.btc_price || preview?.btc_price || 0), timestamp: quoteTime, staleSeconds: Number(config.quote_stale_seconds || 30)};
     renderPositionPayoff();
     window.__liveEnabled = config.trading_enabled ?? config.live_enabled;
     window.__openingBlocked = Boolean(config.opening_blocked_reason);
@@ -385,10 +399,7 @@ async function loadMarket() {
     updateTradeControls();
     if (payload.status === 'strategy_unavailable') {
       const message = payload.message || '当前合约暂不能组成所选策略，等待行情更新。';
-      const quoteTime = Date.parse(chain.updated_at || ''), quoteAge = Date.now() - quoteTime;
-      const staleSeconds = Number(config.quote_stale_seconds);
-      const validTime = Number.isFinite(quoteTime) && quoteAge >= 0 && Number.isFinite(staleSeconds) && staleSeconds > 0;
-      const fresh = validTime && quoteAge <= staleSeconds * 1000;
+      const {validTime, fresh} = quoteFreshness(quoteTime, config.quote_stale_seconds);
       const quoteStatus = !validTime ? '行情时间待核对' : fresh ? '策略暂不可用' : '行情已过期';
       const notice = fresh ? message : `${quoteStatus}，保留最近收到的真实盘口，等待更新。${message}`;
       if (!validTime) window.__positionMarket = null;
@@ -412,8 +423,9 @@ async function loadMarket() {
     }
     if (payload.status === 'waiting_for_listing') {
       clearStrategyDisplay('等待周日到期合约上线');
+      const {validTime, fresh} = quoteFreshness(quoteTime, config.quote_stale_seconds);
       if (chain.expiry && chain.items?.length) {
-        $('chainPanel').dataset.availability = 'ready';
+        $('chainPanel').dataset.availability = fresh ? 'ready' : validTime ? 'stale' : 'time_unknown';
         window.__latestChain = chain.items;
         renderChain(chain.items, {expiry: chain.expiry, btc_price: chain.btc_price, legs: []});
         $('expiry').textContent = `仅查看 · ${new Date(chain.expiry).toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit', timeZone: 'UTC'})}`;
@@ -428,7 +440,7 @@ async function loadMarket() {
       $('statusValue').dataset.state = config.trading_blocked_reason ? 'error' : 'waiting';
       $('statusValue').textContent = config.trading_blocked_reason ? '交易已阻止' : (chain.expiry && chain.items?.length ? '备用盘口 · 只读' : '等待合约上线');
       $('statusSub').textContent = config.trading_blocked_reason || payload.message;
-      $('updateText').textContent = '行情已连接 · 自动检查合约';
+      $('updateText').textContent = fresh ? '行情已连接 · 自动检查合约' : `${validTime ? '行情已过期' : '行情时间待核对'} · 等待更新`;
       $('updateDot').style.background = '#F0B03F';
       return;
     }
@@ -441,9 +453,9 @@ async function loadMarket() {
     const portfolioEstimate = !unbounded && (preview.margin_basis === 'portfolio_loss_estimate' || (!preview.margin_basis && preview.margin_mode === 'PORTFOLIO_MARGIN'));
     $('creditValue').textContent = optionalMoney(preview.net_credit_usd); $('lossValue').textContent = unbounded ? '无上限' : optionalMoney(preview.max_loss_usd); $('marginValue').textContent = optionalMoney(preview.estimated_margin_usd); $('marginSub').textContent = portfolioEstimate ? 'PM 压力测试估算' : unbounded ? '常规保证金估算（含缓冲）' : 'Bybit Order IM'; $('maintenanceValue').textContent = optionalMoney(preview.estimated_maintenance_margin_usd); $('costValue').textContent = optionalMoney(preview.estimated_trading_cost_usd); $('feeSub').textContent = `Taker ${(Number(preview.estimated_fee_rate) * 100).toFixed(3)}% · 单腿上限 ${(Number(preview.fee_cap_pct) * 100).toFixed(0)}%`; if ($('rrValue')) $('rrValue').textContent = preview.risk_reward == null ? '--' : `${preview.risk_reward}x`;
     updateTradeControls();
-    const quoteTime = preview.market_timestamp ? new Date(preview.market_timestamp) : new Date(); const age = Math.max(0, Math.round((Date.now() - quoteTime.getTime()) / 1000));
-    $('statusValue').dataset.state = age > config.quote_stale_seconds ? 'waiting' : 'ready';
-    $('statusValue').textContent = age > config.quote_stale_seconds ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age}s 前`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = age > config.quote_stale_seconds ? '#F2626B' : '#2DBE87';
+    const quote = quoteFreshness(quoteTime, config.quote_stale_seconds), age = quote.validTime ? Math.round(quote.ageMs / 1000) : null, stale = !quote.fresh;
+    $('statusValue').dataset.state = stale ? 'waiting' : 'ready';
+    $('statusValue').textContent = age === null ? '行情时间待核对' : stale ? '行情过期' : '策略就绪'; $('statusSub').textContent = `${chain.source === 'bybit' ? (config.market_testnet ? 'Bybit 测试网行情' : 'Bybit 主网行情') : '行情不可用'} · ${age === null ? '行情时间待核对' : `${age}s 前`}`; $('expiry').textContent = `到期 ${new Date(preview.expiry).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',timeZone:'UTC'})}`; renderChain(chain.items, preview); renderLegs(preview.legs); renderPayoff(preview); $('updateText').textContent = age === null ? '行情时间待核对 · 等待更新' : `行情 ${age}s · 每 ${config.market_refresh_seconds}s 更新`; $('updateDot').style.background = stale ? '#F2626B' : '#2DBE87';
     if (config.trading_blocked_reason || config.opening_blocked_reason) { $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '交易已阻止'; $('statusSub').textContent = config.trading_blocked_reason || 'RFQ 状态待确认，后台正在对账'; }
   } catch (error) { if (!current()) return; window.__positionMarket = null; renderPositionPayoff(); window.__strategyUnavailable = true; clearStrategyDisplay('策略暂不可用'); updateTradeControls(); $('statusValue').dataset.state = 'error'; $('statusValue').textContent = '行情异常'; $('statusSub').textContent = error.message; $('updateText').textContent = '等待重试'; $('updateDot').style.background = '#F2626B'; }
   finally { read.finish(); updateStrip(); }

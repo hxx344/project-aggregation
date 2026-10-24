@@ -93,6 +93,20 @@ class MarketAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ready.get("read_only", False))
         self.assertTrue(all(not item["symbol"].startswith("observe-") for item in ready["chain"]["items"]))
 
+    async def test_market_responses_report_quote_age_from_the_server_clock(self):
+        self.engine.chain_updated_at = self.now - timedelta(seconds=7)
+        self.engine.chain = self.sunday_chain
+        ready = (await self.request()).json()
+        self.engine.chain = self.unavailable_chain()
+        unavailable = (await self.request()).json()
+        self.engine.chain = [item.model_copy(update={"expiry": item.expiry + timedelta(days=1)}) for item in self.sunday_chain]
+        waiting = (await self.request()).json()
+        for status, data in (("ready", ready), ("strategy_unavailable", unavailable), ("waiting_for_listing", waiting)):
+            with self.subTest(status=status):
+                self.assertEqual(data["status"], status)
+                self.assertEqual(data["chain"]["quote_age_seconds"], 7)
+                self.assertEqual(data["chain"]["updated_at"], (self.now - timedelta(seconds=7)).isoformat())
+
     async def test_stale_missing_or_unavailable_market_is_not_listing_wait(self):
         for source, updated in (("bybit", self.now - timedelta(minutes=5)), ("bybit", None), ("unavailable", self.now)):
             self.engine.chain_source = source
