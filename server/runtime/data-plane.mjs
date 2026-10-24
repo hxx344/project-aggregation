@@ -287,6 +287,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle,
     get baseline() { return baseline; },
     subscribeOverview(subscriber) { subscribers.add(subscriber); return () => subscribers.delete(subscriber); },
+    // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
+    overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     observeSlowConsumer() { baseline?.observeSlowConsumer(); },
     initialize: () => execution.initializeProtection(),
     startBaseline() {

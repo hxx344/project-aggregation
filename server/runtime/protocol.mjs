@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { moduleIds } from '../modules/catalog.mjs';
 import { tradingModules } from '../modules/updates.mjs';
@@ -99,7 +99,17 @@ export function readDiscovery(dir) {
     return validateDiscovery(JSON.parse(readFileSync(fd, 'utf8')), dir);
   } finally { closeSync(fd); }
 }
+// Leftovers of instances that exited without cleaning up: temporary discovery
+// files and their sockets. Only the holder of `.runtime.lock` may call it, so
+// no other instance can be using them.
+export function removeStaleRuntimeFiles(dir, instanceId) {
+  for (const name of readdirSync(dir)) {
+    if (/^\.runtime\.json\.[0-9a-f]+\.tmp$/.test(name)) rmSync(path.join(dir, name), { force: true });
+    else if (!windows && /^runtime-[0-9a-f-]+\.sock$/.test(name) && name !== `runtime-${instanceId}.sock`) rmSync(path.join(dir, name), { force: true });
+  }
+}
 // Removes the file only while it still names this instance, so a stopping runtime never deletes its successor's record.
+// Between the read and the removal no successor can rename its own record in: it needs `.runtime.lock`, which is released after this.
 export function removeDiscovery(dir, instanceId) {
   let current = null;
   try { current = readDiscovery(dir); } catch { return; }
