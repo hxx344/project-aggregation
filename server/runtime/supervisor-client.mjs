@@ -83,16 +83,19 @@ export function createSocketClient({ dir, protocols = SUPPORTED_PROTOCOLS, budge
 
 // Adapts the client to the update coordinator's hooks. The runtime reports the
 // durable value it applied; a different value than the coordinator expects
-// leaves every module unconfirmed (fail closed).
+// leaves every module unconfirmed (fail closed). The module generations the
+// runtime reports go back to the coordinator, also with a partial failure.
 export function coordinatorHooks(client, { log } = {}) {
-  const unconfirmed = failed => Object.assign(new UpdateError(503, '内嵌交易模块的维护状态尚未确认，请重试'), { failed });
+  const unconfirmed = (failed, generations = {}) => Object.assign(new UpdateError(503, '内嵌交易模块的维护状态尚未确认，请重试'), { failed, generations });
   return {
     async setModuleMaintenance(active, ids) {
       let result;
       try { result = await client.syncMaintenance(ids); }
       catch (error) { log?.warn({ err: error, modules: ids, type: 'maintenance' }, '维护同步未获运行时确认'); throw unconfirmed([...ids]); }
+      const generations = Object.fromEntries(result.modules.map(row => [row.id, row.generation]));
       const failed = result.active !== active ? [...ids] : result.modules.filter(row => !row.confirmed).map(row => row.id);
-      if (failed.length) throw unconfirmed(failed);
+      if (failed.length) throw unconfirmed(failed, generations);
+      return { generations };
     },
     async prepareApply() {
       try { await client.prepareStop(); }

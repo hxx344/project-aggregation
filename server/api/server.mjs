@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { validateUrl, validateAuthOrigin } from '../adapters.mjs';
@@ -44,6 +44,9 @@ const REQUEST_TIMEOUT_MS = 60_000;
 // Overview streams get a frame at least this often, and project changes are
 // retried this many times at these delays (initial design values).
 const OVERVIEW_HEARTBEAT_MS = 15_000, RUNTIME_STALE_MS = 30_000, NOTICE_RETRY_MS = [1000, 5000];
+// The overview stream counts go to the runtime at least this often (design doc 5.8);
+// closing waits this long at most for its last report.
+const STATS_INTERVAL_MS = 15_000, CLOSE_REPORT_MS = 500;
 // What the API shows while it has not heard from the runtime for RUNTIME_STALE_MS.
 const staleOverview = overview => ({ ...overview, projects: overview.projects.map(item => ({ ...item, state: 'stale', message: UNAVAILABLE })) });
 
@@ -62,7 +65,7 @@ export function supervisorTransports(supervisor) {
 
 export function createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime, executionJobs, readMaintenance,
   updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits(), resolveTransport,
-  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS }) {
+  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS, statsIntervalMs = STATS_INTERVAL_MS }) {
   const { loginWindowMs, accountLockoutMs } = loginLimits;
   const { getSetting, setSetting, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
@@ -79,6 +82,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   async function moduleStatus() {
     const status = await supervisor.status();
     if (!status.modulesEnabled) return { schemaVersion: 1, enabled: false, modules: [] };
+    updates.observeModules(status.modules);
     const gates = updates.moduleMaintenance();
     return { schemaVersion: 1, enabled: true, modules: status.modules.map(row => ({ ...row,
       maintenanceConfirmed: gates[row.moduleId]?.confirmed ?? null, maintenanceReleasedAt: gates[row.moduleId]?.releasedAt ?? null })) };
@@ -94,17 +98,45 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     isSessionActive: id => !closed && sessions.isActive(id),
   });
   const streams = new Map();
+  // Stream counts for the runtime's baseline: sent at start, after every
+  // change and every statsIntervalMs, one report at a time. A failed report is
+  // not retried; the next one carries the current counts. The first failure of
+  // a run and then every 20th are logged.
+  const apiInstanceId = randomUUID();
+  let slowConsumers = 0, sequence = 0, reporting = false, reportAgain = false, reportFailures = 0;
+  const sendStats = activeConnections => runtime.reportApiStats({ instanceId: apiInstanceId, sequence: ++sequence, activeConnections, slowConsumerDisconnects: slowConsumers });
+  function reportStats() {
+    if (closed) return;
+    if (reporting) { reportAgain = true; return; }
+    reporting = true;
+    void sendStats(streams.size).then(() => { reportFailures = 0; }, error => {
+      if (reportFailures++ % 20 === 0) log.warn({ err: error, failures: reportFailures, type: 'overview' }, 'SSE 计数上报失败');
+    }).finally(() => { reporting = false; if (reportAgain) { reportAgain = false; reportStats(); } });
+  }
+  // On close the API reports no streams, waiting at most CLOSE_REPORT_MS; a
+  // report still in flight carries a lower sequence and cannot replace it.
+  const finalReport = () => new Promise(resolve => {
+    const timer = setTimeout(resolve, CLOSE_REPORT_MS);
+    void sendStats(0).catch(() => {}).finally(() => { clearTimeout(timer); resolve(); });
+  });
+  const statsTimer = setInterval(reportStats, statsIntervalMs); statsTimer.unref?.();
+  reportStats();
   const serveStatic = createStaticResponder();
   // Ends the streams whose session is gone; the others get the next overview.
-  const pruneStreams = () => { for (const [res, current] of streams) if (closed || !sessions.isActive(current.id)) { res.end(); streams.delete(res); } };
+  const pruneStreams = () => {
+    const size = streams.size;
+    for (const [res, current] of streams) if (closed || !sessions.isActive(current.id)) { res.end(); streams.delete(res); }
+    if (streams.size !== size) reportStats();
+  };
   function publishOverview(data) {
-    let message;
+    let message; const size = streams.size;
     for (const [res, current] of streams) {
       if (closed || !sessions.isActive(current.id)) { res.end(); streams.delete(res); continue; }
-      if (res.writableLength > 256 * 1024) { void runtime.observeSlowConsumer().catch(() => {}); res.destroy(); streams.delete(res); continue; }
+      if (res.writableLength > 256 * 1024) { slowConsumers += 1; res.destroy(); streams.delete(res); continue; }
       if (current.encode) res.write(`data: ${JSON.stringify(current.encode(data))}\n\n`);
       else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
     }
+    if (streams.size !== size) reportStats();
   }
   // The latest projection and when the runtime last answered. Streams get it
   // again when the runtime has pushed nothing for a heartbeat period, so session
@@ -336,7 +368,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
       const encode = url.searchParams.get('protocol') === '2' ? createOverviewEncoder() : null;
       streams.set(res, { ...current, encode }); res.write(`retry: 5000\ndata: ${JSON.stringify(encode ? encode(initial) : initial)}\n\n`);
-      res.once('close', () => streams.delete(res)); return;
+      res.once('close', () => { streams.delete(res); reportStats(); }); reportStats(); return;
     }
     if (pathname === '/api/projects' && req.method === 'POST') {
       if (embeddedModules) throw new HttpError(405, '工作台只运行内嵌模块');
@@ -416,10 +448,14 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   return {
     server, updates,
     streamCount: () => streams.size,
+    // A new runtime instance has no counts yet: the entry reports them at once.
+    reportStats,
     initialize: () => updates.initialize(),
     async resetPassword() { const password = await resetPassword(control); pruneStreams(); updateStream.revalidate(); return password; },
     // close() ends the control-plane services; closeServer() then waits for the listener.
-    async close() { closed = true; unsubscribe(); clearInterval(heartbeat); for (const timer of retries) clearTimeout(timer); retries.clear(); await updates.close(); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); portal.close(); },
+    async close() {
+      const reported = closed ? null : finalReport();
+      closed = true; unsubscribe(); clearInterval(heartbeat); clearInterval(statsTimer); for (const timer of retries) clearTimeout(timer); retries.clear(); await updates.close(); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); portal.close(); await reported; },
     async closeServer() { if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },
   };
 }

@@ -12,7 +12,9 @@ export const RUNTIME_KEY_HEADER = 'x-workspace-runtime-key';
 export const BUDGETS = Object.freeze({ read: 5000, maintenance: 15_000, prepareStop: 70_000 });
 export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 export const MAX_REQUEST_BYTES = 16 * 1024;
-const MAX_DISCOVERY_BYTES = 4096, MAX_SOCKET_PATH_BYTES = 100;
+// A longer UDS path would be truncated and bind somewhere else.
+export const MAX_SOCKET_PATH_BYTES = 100;
+const MAX_DISCOVERY_BYTES = 4096;
 const DISCOVERY = 'runtime.json';
 const windows = process.platform === 'win32';
 
@@ -147,10 +149,11 @@ export function validateMaintenanceIds(ids) {
   if (!knownIds(ids, tradingModules) || !ids.length) throw new RuntimeError(400, '维护同步的模块列表无效');
   return [...ids];
 }
+// `generation` is the module instance the sync started with; a runtime that does not report it gives null.
 export function validateSync(value, ids) {
   if (!object(value) || typeof value.active !== 'boolean' || !Array.isArray(value.modules) || value.modules.length !== ids.length
-    || value.modules.some((row, index) => !object(row) || row.id !== ids[index] || typeof row.confirmed !== 'boolean')) throw invalid();
-  return { active: value.active, modules: value.modules.map(row => ({ id: row.id, confirmed: row.confirmed })) };
+    || value.modules.some((row, index) => !object(row) || row.id !== ids[index] || typeof row.confirmed !== 'boolean' || row.generation !== undefined && !nullable(row.generation, count))) throw invalid();
+  return { active: value.active, modules: value.modules.map(row => ({ id: row.id, confirmed: row.confirmed, generation: row.generation ?? null })) };
 }
 export function validatePrepareStop(value) {
   if (!object(value) || value.ready !== true) throw invalid();

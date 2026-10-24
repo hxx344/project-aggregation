@@ -25,7 +25,7 @@ function plane(overrides = {}) {
     projectChanged: (id, change) => calls.push(['changed', id, change]),
     coordinateAssetSync: async (id, value) => { calls.push(['sync', id, value]); return { state: 'success', message: '' }; },
     handle: async value => { calls.push(['handle', { ...value, body: undefined }]); return { status: 202, body: { ok: true }, extra: 1 }; },
-    observeSlowConsumer: () => calls.push(['slow']), ...overrides };
+    reportApiStats: stats => calls.push(['stats', stats]), ...overrides };
   return fake;
 }
 const quiet = { error() {}, warn() {} };
@@ -107,10 +107,15 @@ for (const [name, connect] of Object.entries(implementations)) {
     await until(() => fake.subscribers.size === 0);
   });
 
-  test(`${name}: slow consumers are reported`, options, async t => {
+  test(`${name}: the API's stream counts are reported as one checked record`, options, async t => {
     const fake = plane(), client = await connect(t, fake);
-    assert.deepEqual(await client.observeSlowConsumer(), { accepted: true });
-    assert.deepEqual(fake.calls.filter(([call]) => call === 'slow'), [['slow']]);
+    const stats = { instanceId: '00000000-0000-4000-8000-000000000001', sequence: 1, activeConnections: 3, slowConsumerDisconnects: 2 };
+    assert.deepEqual(await client.reportApiStats({ ...stats, extra: true }), { accepted: true });
+    assert.deepEqual(fake.calls.filter(([call]) => call === 'stats'), [['stats', stats]]);
+    for (const invalid of [null, { ...stats, instanceId: 'api' }, { ...stats, activeConnections: -1 }, { ...stats, activeConnections: 10_001 }, { ...stats, slowConsumerDisconnects: 1.5 }, { ...stats, activeConnections: undefined }, { ...stats, sequence: 0 }, { ...stats, sequence: undefined }]) {
+      await assert.rejects(client.reportApiStats(invalid), error => error instanceof RuntimeError && error.status === 400);
+    }
+    assert.equal(fake.calls.filter(([call]) => call === 'stats').length, 1);
   });
 }
 
@@ -174,12 +179,17 @@ test('socket: the internal server checks forwarded requests and project notices 
   assert.equal((await send('GET', '/internal/v1/forward/internal/v1/status', { 'x-workspace-session': 's' })).status, 400, 'outside /api/');
   assert.equal((await send('GET', '/internal/v1/forward/api/trading', { 'x-workspace-session': 's', 'x-workspace-deadline': 'soon' })).status, 400);
   assert.equal((await send('POST', '/internal/v1/projects/asset/changed', { 'Content-Type': 'application/json' }, Buffer.from('{"reason":"renamed"}'))).status, 400);
+  const json = { 'Content-Type': 'application/json' }, instanceId = '00000000-0000-4000-8000-000000000001';
+  for (const stats of [{ instanceId: 'api', sequence: 1, activeConnections: 0, slowConsumerDisconnects: 0 }, { instanceId, sequence: 1, activeConnections: 10_001, slowConsumerDisconnects: 0 },
+    { instanceId, sequence: 1, activeConnections: 0, slowConsumerDisconnects: -1 }, { instanceId, sequence: 0, activeConnections: 0, slowConsumerDisconnects: 0 }]) {
+    assert.equal((await send('POST', '/internal/v1/api-stats', json, Buffer.from(JSON.stringify(stats)))).status, 400, JSON.stringify(stats));
+  }
   assert.equal((await send('GET', '/internal/v1/overview/events?x=1')).status, 400);
   assert.equal((await send('POST', '/internal/v1/overview/events')).status, 405);
   // Only a GET may stand in for HEAD.
   assert.equal((await send('POST', '/internal/v1/forward/api/trading', { 'x-workspace-session': 's', 'x-workspace-method': 'HEAD' })).status, 400);
   assert.equal((await send('GET', '/internal/v1/forward/api/trading', { 'x-workspace-session': 's', 'x-workspace-method': 'DELETE' })).status, 400);
-  assert.equal(forwarded(fake).length, 0); assert.equal(fake.calls.filter(([call]) => call === 'changed').length, 0);
+  assert.equal(forwarded(fake).length, 0); assert.equal(fake.calls.filter(([call]) => call === 'changed' || call === 'stats').length, 0);
   // A runtime without a data plane does not offer these routes.
   await server.close();
   const bare = await startInternalServer({ service: createRuntimeService({ readMaintenance: () => false }), dir, logger: quiet });

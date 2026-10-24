@@ -172,6 +172,30 @@ test('module status joins supervisor state with maintenance, and operator restar
   assert.deepEqual(restarts, ['greeks', 'greeks']);
 });
 
+test('module status synchronizes a trading module that restarted since it confirmed maintenance, once', async t => {
+  const generations = Object.fromEntries(moduleIds.map(id => [id, 1]));
+  const moduleRuntime = {
+    status: () => moduleIds.map(moduleId => ({ moduleId, state: 'ready', generation: generations[moduleId], restartCount: 0, consecutiveFailures: 0, lastExitAt: null, lastExitKind: null,
+      readyAt: null, nextAttemptAt: null, waitingFor: null, faultReason: null })),
+    restart: () => false,
+  };
+  const f = await fixture(t, { moduleRuntime });
+  await f.login();
+  const syncs = () => f.calls.filter(call => call.id === 'greeks' && call.path === '/__workspace/maintenance').length;
+  const confirmed = async () => Object.fromEntries((await f.request('/api/system/modules')).data.modules.map(row => [row.moduleId, row.maintenanceConfirmed]));
+  assert.equal((await confirmed()).greeks, true);
+  const before = syncs();
+  generations.greeks = 2;
+  assert.deepEqual(await confirmed(), { monitor: null, asset: null, crossex: true, greeks: false, aster: true }, 'the later instance is unconfirmed in the same reply');
+  for (let i = 0; i < 100 && syncs() === before; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(syncs(), before + 1);
+  let current;
+  for (let i = 0; i < 100 && (current = await confirmed()).greeks !== true; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(current.greeks, true);
+  await confirmed();
+  assert.equal(syncs(), before + 1, 'a confirmed instance is not synchronized again');
+});
+
 test('without a supervisor the module status is disabled and restart is not found', async t => {
   const f = await fixture(t); await f.login();
   assert.deepEqual((await f.request('/api/system/modules')).data, { schemaVersion: 1, enabled: false, modules: [] });

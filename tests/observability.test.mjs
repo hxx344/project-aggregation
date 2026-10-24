@@ -29,13 +29,15 @@ test('freshness uses strictest source TTL, excludes static and disabled data, an
 test('sampling persists one observation per minute and reads never manufacture records or fill gaps', async t => {
   const f = fixture(t);
   f.baseline.observeSummary(true, 12); f.baseline.observeSummary(false, 20); f.baseline.observeSlowConsumer();
+  // Counts the API reported together; anything but a positive integer is ignored.
+  f.baseline.observeSlowConsumer(2); for (const invalid of [0, -1, 1.5, NaN, '3']) f.baseline.observeSlowConsumer(invalid);
   await f.baseline.sample(); await f.baseline.sample();
   assert.equal(f.baseline.read().sampling.retainedBuckets, 1);
   f.advance(3 * BASELINE_INTERVAL_MS); await f.baseline.sample();
   const read = f.baseline.read();
   assert.equal(read.sampling.retainedBuckets, 2); assert.equal(read.sampling.missingBuckets, 2);
   assert.deepEqual(read.summaryReads, { success: 1, failed: 1, durationMs: 32, maxDurationMs: 20 });
-  assert.equal(read.sse.slowConsumerDisconnects, 1);
+  assert.equal(read.sse.slowConsumerDisconnects, 3);
   assert.equal(read.coverage.executionResults, false);
   for (let i = 0; i < 3; i++) f.baseline.read();
   assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM platform_baseline_samples').get().count, 2);

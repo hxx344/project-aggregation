@@ -131,6 +131,9 @@ test('an API that outlives its runtime reports it unavailable, then reaches the 
   const c = client(api.ready.port);
   await c.login();
   assert.equal((await c.request('/api/trading')).status, 200);
+  // The runtime's baseline reads the stream count the API reported over the socket.
+  const sse = async () => (await c.request('/api/system/metrics')).data?.sse;
+  assert.ok(await until(async () => (await sse())?.activeConnections === 0), 'the API reported its stream count');
 
   runtime.child.kill('SIGKILL'); await runtime.exited;
   assert.equal((await c.request('/api/ready')).status, 503);
@@ -142,12 +145,22 @@ test('an API that outlives its runtime reports it unavailable, then reaches the 
   assert.notEqual(next.instanceId, instanceId);
   assert.ok(await until(async () => (await c.request('/api/ready')).status === 200), 'the API found the new instance');
   assert.equal((await c.request('/api/trading')).status, 200);
+  assert.ok(await until(async () => (await sse())?.activeConnections === 0, 5000), 'the new instance has the counts without waiting for the periodic report');
   // The new instance's trading modules were taken through the durable maintenance value without a status read.
   const crossex = await c.launch('crossex');
   const calls = async () => (await c.request('/maintenance-calls', { host: crossex.host, auth: false, headers: { Cookie: crossex.cookie } })).data?.calls;
   assert.ok(await until(async () => await calls() >= 1), 'maintenance synchronized after the instance change');
   runtime.child.kill('SIGTERM');
   assert.deepEqual(await runtime.exited, { code: 0, signal: null }, runtime.stderr());
+});
+
+test('a runtime directory too long for the runtime socket fails before any module starts', { skip }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const runDir = path.join(dataDir, 'r'.repeat(Math.max(1, 56 - dataDir.length - 1)));
+  let started = 0;
+  await assert.rejects(startRuntime({ dataDir, logger: { info() {}, debug() {}, warn() {}, error() {} }, env: { ...env, WORKBENCH_RUNTIME_DIR: runDir }, dataPlaneOptions,
+    startModules: async () => { started += 1; throw new Error('modules started'); } }), /运行时 socket 路径超过 100 字节/);
+  assert.equal(started, 0);
 });
 
 test('a module the runtime restarted takes the durable maintenance value from the runtime itself', { skip, timeout: 60_000 }, async t => {

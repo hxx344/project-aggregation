@@ -54,7 +54,8 @@ export async function startApi({ dataDir, logger = defaultLogger, signal, fail =
     stopped();
     const dir = runtimeDir(resolvedData, env);
     // A new runtime instance restarted every module in maintenance: take them all through the durable value again.
-    const connection = createRuntimeConnection({ dir, onInstanceChange: () => { void api?.updates.resynchronize(); } });
+    // It has no stream counts yet either.
+    const connection = createRuntimeConnection({ dir, onInstanceChange: () => { void api?.updates.resynchronize(); api?.reportStats(); } });
     const supervisor = createSocketClient({ dir, connection });
     api = createApiServer({ control, catalog: createProjectCatalog({ control, embeddedModules: true }), encrypt: noCredentials, decrypt: noCredentials, embeddedModules: true, log: logger,
       supervisor, runtime: createSocketDataClient({ dir, connection, log: logger }), executionJobs: createExecutionJobsReader(db),
