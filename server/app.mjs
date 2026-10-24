@@ -21,6 +21,9 @@ import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, Update
 import { createUpdateStream } from './update-stream.mjs';
 import { moduleCatalog, moduleIds } from './modules/catalog.mjs';
 import { createModuleUpdateGuard, tradingModules } from './modules/updates.mjs';
+import { RuntimeError } from './runtime/protocol.mjs';
+import { createRuntimeService } from './runtime/service.mjs';
+import { coordinatorHooks, createInProcessClient } from './runtime/supervisor-client.mjs';
 import { readModuleCapabilities } from './modules/capabilities.mjs';
 import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from './observability.mjs';
 import { createAccountWriter } from './execution/account-writer.mjs';
@@ -73,10 +76,13 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   // already belongs to a managed or recovered authority.
   const sharedAccountWriter = accountWriter || (embeddedModules || existsSync(writerDatabase) || existsSync(`${writerDatabase}.required`) ? createAccountWriter({ databasePath: writerDatabase, runtimeId: randomUUID(), moduleId: 'hub' }) : null);
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
-  const moduleUpdateGuard = embeddedModules ? createModuleUpdateGuard() : null;
+  const readMaintenance = () => getSetting('updates-maintenance') === '1';
+  // The runtime side and its client share this process here; the separated
+  // entries use the socket client against the same contract.
+  const supervisor = createInProcessClient(createRuntimeService({ moduleRuntime, guard: embeddedModules ? createModuleUpdateGuard() : null, readMaintenance }));
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
-    ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, tradingModules, moduleIds, prepareApply: moduleUpdateGuard.prepareApply } : {}),
-    readMaintenance: () => getSetting('updates-maintenance') === '1',
+    ...(embeddedModules ? { ...coordinatorHooks(supervisor), tradingModules, moduleIds } : {}),
+    readMaintenance,
     writeMaintenance: active => setSetting('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
     writePendingPlanId: planId => setSetting('updates-pending-plan', planId || ''),
@@ -86,10 +92,11 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   // Native execution is not gated by any one embedded trading module's maintenance sync.
   const native = { scope: 'native' };
   // Supervisor state joined with the trading maintenance gate; no pids, paths or secrets.
-  function moduleStatus() {
-    if (!moduleRuntime) return { schemaVersion: 1, enabled: false, modules: [] };
+  async function moduleStatus() {
+    const runtime = await supervisor.status();
+    if (!runtime.modulesEnabled) return { schemaVersion: 1, enabled: false, modules: [] };
     const gates = updates.moduleMaintenance();
-    return { schemaVersion: 1, enabled: true, modules: moduleRuntime.status().map(row => ({ ...row,
+    return { schemaVersion: 1, enabled: true, modules: runtime.modules.map(row => ({ ...row,
       maintenanceConfirmed: gates[row.moduleId]?.confirmed ?? null, maintenanceReleasedAt: gates[row.moduleId]?.releasedAt ?? null })) };
   }
   const publicProject = row => { const project = JSON.parse(row.json);
@@ -349,7 +356,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       if (pathname === '/api/system/metrics') { send(res, 200, baseline.read()); return; }
       if (pathname === '/api/system/accounts') { send(res, 200, { schemaVersion: 1, enabled: !!sharedAccountWriter, ...(sharedAccountWriter?.snapshot() || { accounts: [], bindings: [], operations: [], isolations: [] }) }); return; }
       if (pathname === '/api/system/recovery') { send(res, 200, { schemaVersion: 1, enabled: !!sharedAccountWriter, recovery: sharedAccountWriter?.snapshot().recovery ?? null }); return; }
-      if (pathname === '/api/system/modules') { send(res, 200, moduleStatus()); return; }
+      if (pathname === '/api/system/modules') { send(res, 200, await moduleStatus()); return; }
       const controller = new AbortController(); controllers.add(controller);
       try {
         const modules = await capabilities(controller.signal);
@@ -363,8 +370,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       if (req.method !== 'POST') throw new HttpError(405, '模块恢复接口仅支持 POST');
       if (url.search) throw new HttpError(400, '模块恢复接口不接受查询参数');
       const id = moduleRestart[1];
-      if (!moduleRuntime || !moduleIds.includes(id)) throw new HttpError(404, '模块不存在');
-      if (!moduleRuntime.restart(id)) throw new HttpError(409, '模块不在故障状态，无需恢复');
+      await supervisor.restartModule(id);
       log.info({ moduleId: id, ip: req.socket.remoteAddress, type: 'module-restart' }, '管理员已请求恢复内嵌模块');
       send(res, 202, { accepted: true, moduleId: id }); return;
     }
@@ -538,7 +544,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       if (!existsSync(filename) || !statSync(filename).isFile()) { if (path.extname(decoded)) throw new HttpError(404, '文件不存在'); filename = path.join(distDir, 'index.html'); }
       if (!existsSync(filename)) { send(res, 503, { error: '前端尚未构建，请先执行 npm run build' }); return; }
       await serveStatic(req, res, filename, { 'Content-Type': mime[path.extname(filename)] || 'application/octet-stream', 'Cache-Control': path.basename(filename) === 'index.html' ? 'no-cache' : 'public, max-age=3600' });
-    } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError || error instanceof UpdateError ? error.status : 500, { error: error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError || error instanceof UpdateError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
+    } catch (error) { if (!res.headersSent) send(res, error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError || error instanceof UpdateError || error instanceof RuntimeError ? error.status : 500, { error: error instanceof HttpError || error instanceof TradingError || error instanceof ExecutionError || error instanceof UpdateError || error instanceof RuntimeError ? error.message : '服务暂时无法处理请求' }); else res.end(); }
   });
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
