@@ -295,6 +295,293 @@ class CoordinatorTests(RootFixture):
         self.assertIsNotNone(result['planId'], result)
         return result['planId']
 
+    def seed_history(self):
+        paths = []
+        for index in range(updater.JOB_HISTORY_LIMIT + 3):
+            path = updater.private_directory(self.coordinator.jobs / f'{index:032x}')
+            updater.write_bytes(path / 'hub.log', b'historical installer output')
+            # Creation order differs from the age used by retention.
+            modified = self.clock - index - 100
+            os.utime(path, (modified, modified))
+            paths.append(path)
+        return paths
+
+    def test_pruning_expired_plans_keeps_current_and_failed_recovery_references(self):
+        failed_plan = self.fail_after_deployment()
+        failed_job = self.coordinator.load()['job']['id']
+        for _ in range(4):
+            self.clock += updater.PLAN_TTL + 1
+            result = self.check()
+            self.assertTrue(result['modules'][0]['recovery'])
+            self.assertEqual({path.name for path in self.coordinator.plans.iterdir()},
+                             {failed_plan, result['planId']})
+            self.assertTrue((self.coordinator.jobs / failed_job).is_dir())
+            self.assertEqual(self.coordinator.recovery_targets()['hub']['jobId'], failed_job)
+        current = result['planId']
+        self.coordinator.apply(current)
+        self.assertFalse((self.coordinator.plans / failed_plan).exists())
+        self.coordinator.run()
+        self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
+
+    def test_pruning_expired_unapplied_plans_stays_bounded(self):
+        previous = self.prepare()
+        for _ in range(4):
+            self.clock += updater.PLAN_TTL + 1
+            self.assertIsNone(self.coordinator.status()['planId'])
+            self.assertFalse((self.coordinator.plans / previous).exists())
+            previous = self.prepare()
+            self.assertEqual([path.name for path in self.coordinator.plans.iterdir()], [previous])
+
+    def test_pruning_drains_a_large_backlog_in_bounded_rounds(self):
+        count = updater.JOB_HISTORY_LIMIT + updater.PRUNE_BATCH + 5
+        paths = []
+        for index in range(count):
+            path = updater.private_directory(self.coordinator.jobs / f'{index:032x}')
+            updater.write_bytes(path / 'hub.log', b'historical installer output')
+            modified = self.clock - index - 100
+            os.utime(path, (modified, modified))
+            paths.append(path)
+        names = lambda: {path.name for path in self.coordinator.jobs.iterdir()}
+        with self.coordinator.lock():
+            self.coordinator.prune(self.coordinator.load())
+        # One round removes only its budget, oldest first.
+        self.assertEqual(names(), {path.name for path in paths[:count - updater.PRUNE_BATCH]})
+        with self.coordinator.lock():
+            self.coordinator.prune(self.coordinator.load())
+        self.assertEqual(names(), {path.name for path in paths[:updater.JOB_HISTORY_LIMIT]})
+    def test_pruning_retries_failed_entries_after_removable_ones(self):
+        count = updater.JOB_HISTORY_LIMIT + updater.PRUNE_BATCH + 5
+        paths = []
+        for index in range(count):
+            path = updater.private_directory(self.coordinator.jobs / f'{index:032x}')
+            modified = self.clock - index - 100
+            os.utime(path, (modified, modified))
+            paths.append(path)
+        # The oldest full batch cannot be removed.
+        stuck = set(paths[-updater.PRUNE_BATCH:])
+        remove = updater.shutil.rmtree
+
+        def failing(path, *args, **kwargs):
+            if Path(path) in stuck:
+                raise PermissionError('busy')
+            return remove(path, *args, **kwargs)
+
+        with patch.object(updater.shutil, 'rmtree', failing):
+            for _ in range(2):
+                with self.coordinator.lock():
+                    self.coordinator.prune(self.coordinator.load())
+        remaining = {path.name for path in self.coordinator.jobs.iterdir()}
+        self.assertEqual(remaining, {path.name for path in (*paths[:updater.JOB_HISTORY_LIMIT], *stuck)})
+
+    def seed_entries(self, root, count):
+        """Newest first: index 0 has the latest modification time."""
+        paths = []
+        for index in range(count):
+            path = updater.private_directory(root / f'{index:032x}')
+            modified = self.clock - index - 100
+            os.utime(path, (modified, modified))
+            paths.append(path)
+        return paths
+
+    def prune_rounds(self, rounds, stuck):
+        remove = updater.shutil.rmtree
+
+        def failing(path, *args, **kwargs):
+            if Path(path) in stuck:
+                raise PermissionError('busy')
+            return remove(path, *args, **kwargs)
+
+        with patch.object(updater.shutil, 'rmtree', failing):
+            for _ in range(rounds):
+                with self.coordinator.lock():
+                    self.coordinator.prune(self.coordinator.load())
+
+    def test_pruning_failed_plans_do_not_starve_job_history(self):
+        plans = self.seed_entries(self.coordinator.plans, updater.PRUNE_BATCH)
+        jobs = self.seed_entries(self.coordinator.jobs, updater.JOB_HISTORY_LIMIT + 5)
+        self.prune_rounds(2, set(plans))
+        self.assertEqual({path.name for path in self.coordinator.jobs.iterdir()},
+                         {path.name for path in jobs[:updater.JOB_HISTORY_LIMIT]})
+        self.assertEqual(len(list(self.coordinator.plans.iterdir())), updater.PRUNE_BATCH)
+
+    def test_pruning_rotates_through_entries_that_failed_before(self):
+        paths = self.seed_entries(self.coordinator.jobs, updater.JOB_HISTORY_LIMIT + updater.PRUNE_BATCH + 5)
+        expired = paths[updater.JOB_HISTORY_LIMIT:]
+        self.prune_rounds(2, set(expired))
+        # The newest expired entries recover while the oldest batch keeps failing.
+        self.prune_rounds(1, set(expired[-updater.PRUNE_BATCH:]))
+        self.assertEqual({path.name for path in self.coordinator.jobs.iterdir()},
+                         {path.name for path in (*paths[:updater.JOB_HISTORY_LIMIT], *expired[-updater.PRUNE_BATCH:])})
+
+    def test_pruning_forgets_failures_for_entries_removed_elsewhere(self):
+        paths = self.seed_entries(self.coordinator.jobs, updater.JOB_HISTORY_LIMIT + 3)
+        self.prune_rounds(1, set(paths))
+        self.assertEqual(len(self.coordinator.prune_failed), 3)
+        for path in paths[updater.JOB_HISTORY_LIMIT:]:
+            path.rmdir()
+        self.prune_rounds(1, set())
+        self.assertEqual(self.coordinator.prune_failed, {})
+    def test_pruning_preserves_queued_and_running_job_even_when_oldest(self):
+        plan = self.prepare()
+        accepted = self.coordinator.apply(plan)
+        job_path = self.coordinator.jobs / accepted['job']['id']
+        os.utime(job_path, (1, 1))
+        self.alive = True
+        self.clock += updater.PLAN_TTL + 1
+        for status in ('queued', 'running'):
+            with self.subTest(status=status):
+                paths = self.seed_history()
+                with self.coordinator.lock():
+                    state = self.coordinator.load()
+                    state['job']['status'] = status
+                    self.coordinator.save(state)
+                self.make_coordinator().recover(starting=True)
+                self.assertTrue(job_path.is_dir())
+                self.assertEqual(self.coordinator.read_plan(plan, allow_expired=True)['id'], plan)
+                self.assertEqual(self.coordinator.status()['job']['status'], status)
+                self.assertEqual({path.name for path in self.coordinator.jobs.iterdir()},
+                                 {job_path.name, *(path.name for path in paths[:updater.JOB_HISTORY_LIMIT])})
+
+    def test_pruning_terminal_paths_keeps_latest_job_and_recent_history(self):
+        original = copy.deepcopy(self.installed)
+        for outcome in ('succeeded', 'failed', 'interrupted', 'launch-failed'):
+            with self.subTest(outcome=outcome):
+                self.installed = copy.deepcopy(original)
+                self.clock += updater.PLAN_TTL + 1
+                plan = self.prepare()
+                if outcome == 'launch-failed':
+                    def launch():
+                        self.seed_history()
+                        raise OSError('private launch failure')
+                    with patch.object(self.coordinator, 'launch', side_effect=launch):
+                        with self.assertRaises(updater.UpdateError) as caught:
+                            self.coordinator.apply(plan)
+                    self.assertEqual(caught.exception.status, 503)
+                else:
+                    self.coordinator.apply(plan)
+                    self.seed_history()
+                    if outcome == 'interrupted':
+                        self.clock += 31
+                        self.coordinator.recover(starting=True)
+                    else:
+                        self.installer_hook = (lambda _key: 1) if outcome == 'failed' else None
+                        self.coordinator.run()
+                state = self.coordinator.status()
+                self.assertEqual(state['job']['status'], 'failed' if outcome == 'launch-failed' else outcome)
+                self.assertEqual(len(list(self.coordinator.jobs.iterdir())), updater.JOB_HISTORY_LIMIT + 1)
+                self.assertTrue((self.coordinator.jobs / state['job']['id']).is_dir())
+                self.assertTrue((self.coordinator.plans / plan).is_dir())
+        # Startup also prunes when no state transition is needed.
+        for path in self.coordinator.jobs.iterdir():
+            os.utime(path, (1, 1))
+        self.seed_history()
+        current_job = self.coordinator.load()['job']['id']
+        os.utime(self.coordinator.jobs / current_job, (1, 1))
+        self.make_coordinator().recover(starting=True)
+        expected = {current_job, *(f'{index:032x}' for index in range(updater.JOB_HISTORY_LIMIT))}
+        self.assertEqual({path.name for path in self.coordinator.jobs.iterdir()}, expected)
+
+    def test_pruning_ignores_unknown_names_and_regular_files(self):
+        retained = []
+        for root in (self.coordinator.plans, self.coordinator.jobs):
+            for name in ('unknown', 'A' * 32, '0' * 31, '0' * 33, 'a' * 8 + '-' + 'b' * 23):
+                path = root / name
+                path.mkdir()
+                retained.append(path)
+            path = root / ('e' * 32)
+            path.write_bytes(b'unknown file')
+            retained.append(path)
+        self.seed_history()
+        self.prepare()
+        self.assertTrue(all(path.exists() for path in retained))
+
+    def test_pruning_does_not_follow_or_remove_uuid_symlinks(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep'
+        marker.write_bytes(b'keep')
+        links = []
+        for root in (self.coordinator.plans, self.coordinator.jobs):
+            for name, target in (('d' * 32, outside), ('e' * 32, self.root / 'missing')):
+                path = root / name
+                self.link(target, path, directory=True)
+                links.append(path)
+        self.seed_history()
+        self.prepare()
+        self.assertTrue(all(path.is_symlink() for path in links))
+        self.assertEqual(marker.read_bytes(), b'keep')
+
+    def test_pruning_nested_symlink_never_deletes_its_target(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep'
+        marker.write_bytes(b'keep')
+        obsolete = updater.private_directory(self.coordinator.plans / ('f' * 32))
+        self.link(outside, obsolete / 'linked-output', directory=True)
+        self.prepare()
+        self.assertFalse(obsolete.exists())
+        self.assertEqual(marker.read_bytes(), b'keep')
+
+    def test_pruning_io_errors_do_not_change_check_apply_or_worker_results(self):
+        original = copy.deepcopy(self.installed)
+        for operation in ('scan', 'stat', 'delete', 'unexpected'):
+            with self.subTest(operation=operation):
+                self.installed = copy.deepcopy(original)
+                self.clock += updater.PLAN_TTL + 1
+                obsolete = updater.private_directory(self.coordinator.plans / ('f' * 32))
+                original_stat = Path.lstat
+                def inaccessible(path, *args, **kwargs):
+                    if path == obsolete:
+                        raise PermissionError('private filesystem error')
+                    return original_stat(path, *args, **kwargs)
+                failing = (patch.object(Path, 'iterdir', side_effect=OSError('private scan error')) if operation == 'scan'
+                           else patch.object(Path, 'lstat', inaccessible) if operation == 'stat'
+                           else patch.object(updater.shutil, 'rmtree', side_effect=
+                                             RuntimeError('private cleanup error') if operation == 'unexpected'
+                                             else OSError('private deletion error')))
+                with failing:
+                    plan = self.prepare()
+                    accepted = self.coordinator.apply(plan)
+                    self.assertEqual(accepted['job']['status'], 'queued')
+                    self.coordinator.run()
+                    result = self.coordinator.status()
+                    self.assertEqual(result['job']['status'], 'succeeded')
+                    self.assertIsNone(result['checkError'])
+                    self.assertNotIn('private', json.dumps(result))
+                self.assertTrue(obsolete.is_dir())
+                self.coordinator.recover(starting=True)
+                self.assertFalse(obsolete.exists(), 'later housekeeping must retry failed deletions')
+
+    def test_partial_plan_write_is_cleaned_without_losing_failed_job_recovery(self):
+        failed_plan = self.fail_after_deployment()
+        self.clock += updater.PLAN_TTL + 1
+        write = updater.write_bytes
+        def interrupted(path, data):
+            if path.name.endswith('.install.sh'):
+                raise OSError('private disk failure')
+            return write(path, data)
+        with patch.object(updater, 'write_bytes', side_effect=interrupted):
+            state = self.check()
+        self.assertIsNone(state['planId'])
+        self.assertIsNotNone(state['checkError'])
+        self.assertEqual([path.name for path in self.coordinator.plans.iterdir()], [failed_plan])
+        self.assertEqual(self.coordinator.recovery_targets()['hub']['commit'], NEW)
+
+    def test_plan_files_are_published_under_the_cleanup_lock(self):
+        write = updater.write_bytes
+        checked = []
+        def guarded(path, data):
+            if path.parent.parent == self.coordinator.plans:
+                with self.assertRaises((BlockingIOError, PermissionError)):
+                    with updater.file_lock(self.coordinator.directory / 'state.lock', blocking=False):
+                        pass
+                checked.append(path.name)
+            return write(path, data)
+        with patch.object(updater, 'write_bytes', side_effect=guarded):
+            plan = self.prepare()
+        self.assertEqual(set(checked), {'hub.install.sh', 'hub.manifest.json', 'plan.json'})
+        self.assertEqual(self.coordinator.read_plan(plan)['id'], plan)
+
     def test_token_save_replace_remove_and_restart_expose_only_configured(self):
         self.assertEqual(self.coordinator.status()['githubToken'], {'configured': False})
         initial_state = self.coordinator.load()

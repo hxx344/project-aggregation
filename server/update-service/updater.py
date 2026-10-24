@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import socketserver
 import stat
@@ -34,6 +35,11 @@ SOCKET_DIR = Path('/run/project-aggregation-updater')
 WORKER = 'project-aggregation-update-worker.service'
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 PLAN_TTL = 30 * 60
+# Keep a small diagnostic history in addition to the current (possibly active) job.
+JOB_HISTORY_LIMIT = 10
+# Removal runs under the shared state lock; a backlog left by older versions is
+# drained over successive checks so status requests stay within their timeout.
+PRUNE_BATCH = 20
 CHECK_MIN_INTERVAL = 60
 # Steady-state checks are mostly github.com requests; API use is bounded by
 # the release cache TTL, not by this interval.
@@ -193,6 +199,10 @@ class Coordinator:
         self.syntax = syntax or syntax_check
         self.clock = clock
         self.stack_lock = stack_lock
+        # Entries whose removal failed are retried after removable ones so they
+        # cannot use up every later round's budget.
+        self.prune_failed = {}
+        self.prune_attempts = 0
         self.thread_lock = threading.RLock()
         self.check_thread = None
         self.scheduler_stop = threading.Event()
@@ -223,6 +233,46 @@ class Coordinator:
     def save(self, state):
         write_json(self.directory / 'state.json', state)
 
+    def prune(self, state):
+        """Called with the state lock held, after references have been saved."""
+        # There is only one serialized job: apply cannot replace it while ACTIVE.
+        # Its plan also identifies failed/interrupted targets after plan expiry.
+        job = state.get('job') or {}
+        expired = []
+        for root, keep, history in (
+                (self.plans, (state.get('planId'), state.get('jobPlanId')), 0),
+                (self.jobs, (job.get('id'),), JOB_HISTORY_LIMIT)):
+            try:
+                trusted(self.directory, directory=True)
+                trusted(root, directory=True)
+                candidates = []
+                for path in root.iterdir():
+                    if not TOKEN.fullmatch(path.name) or path.name in keep:
+                        continue
+                    try:
+                        info = trusted(path, directory=True)
+                        candidates.append((info.st_mtime_ns, path.name, path))
+                    except (OSError, ValueError):
+                        continue
+                candidates.sort(reverse=True)
+                # Oldest first, so a partial round never removes newer history ahead of older.
+                expired.extend(path for _, _, path in reversed(candidates[history:]))
+            except Exception:
+                # A later check retries inaccessible directories without exposing raw errors.
+                continue
+        # Forget entries removed elsewhere or now protected; untried entries go
+        # first and failed ones rotate by their last attempt.
+        self.prune_failed = {path: self.prune_failed[path] for path in expired if path in self.prune_failed}
+        expired.sort(key=lambda path: (path in self.prune_failed, self.prune_failed.get(path, 0)))
+        for path in expired[:PRUNE_BATCH]:
+            try:
+                trusted(path, directory=True)
+                shutil.rmtree(path)
+                self.prune_failed.pop(path, None)
+            except Exception:
+                # Optional housekeeping must not change the update result.
+                self.prune_attempts += 1
+                self.prune_failed[path] = self.prune_attempts
     def _credentials_path(self):
         info = trusted(self.directory, directory=True)
         if os.name != 'nt' and info.st_mode & 0o077:
@@ -371,6 +421,8 @@ class Coordinator:
                     changed = True
             if changed:
                 self.save(state)
+            if changed or starting:
+                self.prune(state)
 
     def status(self):
         self.recover()
@@ -379,6 +431,7 @@ class Coordinator:
             if state['planId'] and timestamp(state['expiresAt']) <= self.clock() and not (state['job'] and state['job']['status'] in ACTIVE):
                 state.update(planId=None, expiresAt=None)
                 self.save(state)
+                self.prune(state)
             return self.public(state)
 
     def check(self, minimum_interval=CHECK_MIN_INTERVAL, automatic=False):
@@ -517,29 +570,27 @@ class Coordinator:
                     entry = {key: release[key] for key in ('releaseId', 'commit', 'tag', 'version', 'manifestHash', 'installerHash', 'applicationKey')}
                     entry.update(id=item['id'], installedIdentity=item['identity'])
                     entries.append(entry)
-                with self.lock():
-                    latest = self.load()
-                    if not current(latest):
-                        return
-                    previous = latest.get('planId')
+            with self.lock():
+                state = self.load()
+                if not current(state):
+                    return
+                if candidates and not failed:
+                    previous = state.get('planId')
                     try:
                         plan = self.read_plan(previous) if previous else None
                     except (UpdateError, OSError, ValueError):
                         plan = None
                     if plan and plan['entries'] == entries:
                         plan_id, expires = plan['id'], plan['expiresAt']
-                if not plan_id:
-                    plan_id = uuid.uuid4().hex
-                    plan_directory = private_directory(self.plans / plan_id)
-                    expires = iso(self.clock() + PLAN_TTL)
-                    for item, release in candidates:
-                        write_bytes(plan_directory / (item['id'] + '.manifest.json'), release['manifestBytes'])
-                        write_bytes(plan_directory / (item['id'] + '.install.sh'), release['installer'])
-                    write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
-            with self.lock():
-                state = self.load()
-                if not current(state):
-                    return
+                    if not plan_id:
+                        # Publish files and their state reference under the same lock as pruning.
+                        plan_id = uuid.uuid4().hex
+                        plan_directory = private_directory(self.plans / plan_id)
+                        expires = iso(self.clock() + PLAN_TTL)
+                        for item, release in candidates:
+                            write_bytes(plan_directory / (item['id'] + '.manifest.json'), release['manifestBytes'])
+                            write_bytes(plan_directory / (item['id'] + '.install.sh'), release['installer'])
+                        write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
                 state.update(modules=modules)
                 if failed:
                     self._record_check_failure(state, '部分模块检查失败，暂不能开始更新', retry_at)
@@ -547,12 +598,14 @@ class Coordinator:
                     state.update(checking=False, checkId=None, checkedAt=iso(self.clock()), checkError=None,
                                  failureCount=0, nextCheckNotBefore=0, retryNotBefore=0, planId=plan_id, expiresAt=expires)
                 self.save(state)
+                self.prune(state)
         except Exception:
             with self.lock():
                 state = self.load()
                 if current(state):
                     self._record_check_failure(state, '版本检查未完成')
                     self.save(state)
+                    self.prune(state)
 
     def read_plan(self, plan_id, *, allow_expired=False):
         if not isinstance(plan_id, str) or not TOKEN.fullmatch(plan_id):
@@ -607,6 +660,7 @@ class Coordinator:
                          'finishedAt': None, 'activeModule': None, 'message': '已提交，正在准备正式版本更新',
                          'steps': [{'id': entry['id'], 'name': BY_ID[entry['id']].name, 'status': 'pending'} for entry in plan['entries']]})
             self.save(state)
+            self.prune(state)
             try:
                 self.launch()
             except Exception:
@@ -615,6 +669,7 @@ class Coordinator:
                     step.update(status='skipped', message='尚未执行')
                 state.update(planId=None, expiresAt=None)
                 self.save(state)
+                self.prune(state)
                 raise UpdateError(503, '更新服务未能启动') from None
             return self.public(state)
 
@@ -625,6 +680,8 @@ class Coordinator:
                 raise UpdateError(409, '更新任务身份已改变')
             callback(state, state['job'])
             self.save(state)
+            if state['job']['status'] not in ACTIVE:
+                self.prune(state)
 
     def run(self):
         try:
