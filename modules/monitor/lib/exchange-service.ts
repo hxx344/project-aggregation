@@ -55,9 +55,12 @@ function finish(exchange: ExternalExchange, monitorId: SpreadMarket, fetchedAt: 
   return validateExchangeQuote({ exchange, monitorId, currency: "USDT", priceBasis: "mark", fundingPriceBasis: "mark", fetchedAt, fundingFetchedAt: complete ? fetchedAt : null, status: "live", left, right, fundingError: complete ? "" : "资金费或结算周期暂不可用，价格仍正常更新。" }, exchange, monitorId);
 }
 
+// Contract catalogs change rarely; a slow or failed refresh may fall back to the last valid catalog this long.
+const CATALOG_RETAIN_MS = 600_000;
+
 /** Share only transport requests; one unavailable pair cannot stop the other market. */
 export function createExchangeReader({ fetcher = fetch, clock = Date.now, variationalSession, variationalFetcher = fetcher, sleep }: { fetcher?: typeof fetch; clock?: () => number; variationalSession?: VariationalSession; variationalFetcher?: typeof fetch; sleep?: (ms: number) => Promise<void> } = {}) {
-  const cache = new Map<string, { value: unknown; until: number }>(), pending = new Map<string, Promise<unknown>>();
+  const cache = new Map<string, { value: unknown; until: number; at: number }>(), pending = new Map<string, Promise<unknown>>();
   const requestBinance = createBinanceQuoteRequest({ fetcher, clock, sleep });
   async function request(url: string) {
     const response = await fetcher(url, { cache: "no-store", signal: AbortSignal.timeout(10_000) });
@@ -68,8 +71,15 @@ export function createExchangeReader({ fetcher = fetch, clock = Date.now, variat
     const previous = cache.get(key);
     if (previous && clock() < previous.until) return Promise.resolve(previous.value);
     let operation = pending.get(key);
-    if (!operation) { operation = Promise.resolve().then(load).then(value => { cache.set(key, { value, until: clock() + ttl }); return value; }).finally(() => pending.delete(key)); pending.set(key, operation); }
+    if (!operation) { operation = Promise.resolve().then(load).then(value => { const at = clock(); cache.set(key, { value, until: at + ttl, at }); return value; }).finally(() => pending.delete(key)); pending.set(key, operation); }
     return operation;
+  }
+  // Expired catalogs refresh in the background; prices are still parsed against a catalog no older than CATALOG_RETAIN_MS.
+  function retained(key: string, ttl: number, load: () => Promise<unknown>) {
+    const previous = cache.get(key), refresh = shared(key, ttl, load);
+    if (!previous || clock() >= previous.at + CATALOG_RETAIN_MS) return refresh;
+    refresh.catch(() => {});
+    return Promise.resolve(previous.value);
   }
   async function bybitInstruments() {
     const items: JsonObject[] = [], cursors = new Set<string>();
@@ -96,11 +106,11 @@ export function createExchangeReader({ fetcher = fetch, clock = Date.now, variat
       return validateComparisonQuote(await shared('hyperliquid/oil', 1000, async () => oilExchangeQuote(await fetchHyperliquidOil({ fetcher }))), exchange, monitorId);
     }
     if (exchange === "bybit") {
-      const [metadata, tickers] = await Promise.all([shared("bybit/instruments", 60_000, bybitInstruments), shared("bybit/tickers", 1000, () => request("https://api.bybit.com/v5/market/tickers?category=linear"))]);
+      const [metadata, tickers] = await Promise.all([retained("bybit/instruments", 60_000, bybitInstruments), shared("bybit/tickers", 1000, () => request("https://api.bybit.com/v5/market/tickers?category=linear"))]);
       return parseBybitQuote(monitorId, metadata as JsonObject[], tickers, clock());
     }
     if (exchange === "binance") {
-      const [metadata, tickers, funding] = await Promise.all([shared("binance/instruments", 60_000, () => requestBinance('exchangeInfo')), shared("binance/tickers", 1000, () => requestBinance('premiumIndex')), shared("binance/funding", 15_000, async () => list(await requestBinance('fundingInfo'))).catch(() => null)]);
+      const [metadata, tickers, funding] = await Promise.all([retained("binance/instruments", 60_000, () => requestBinance('exchangeInfo')), shared("binance/tickers", 1000, () => requestBinance('premiumIndex')), shared("binance/funding", 15_000, async () => list(await requestBinance('fundingInfo'))).catch(() => null)]);
       try { return parseBinanceQuote(monitorId, metadata, tickers, funding, clock()); }
       catch { throw new BinanceQuoteError('quote', 'invalid_data'); }
     }

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { METRICS, evaluateRule, marketValues, ruleFingerprint, validateConfig } from './config.mjs';
+import { staleMarketReason } from '../market-stale.mjs';
 
 const oilDefinition = {
   service: 'oil-spread-monitor', validateConfig, marketValues, testTitle: '原油阈值告警',
@@ -49,7 +50,11 @@ export class Monitor {
       this.lastAttemptAt = new Date(this.clock()).toISOString();
       let values, market;
       try { market = await this.fetchMarket(); values = this.definition.marketValues(market, this.clock()); }
-      catch (error) { this.error = error.message.startsWith('Binance') ? error.message : '行情获取失败或已过期，暂停阈值判断'; return; }
+      catch (error) {
+        const reason = staleMarketReason(error);
+        this.error = reason ? `${reason}；暂停阈值判断` : error.message.startsWith('Binance') ? error.message : '行情获取失败或已过期，暂停阈值判断';
+        return;
+      }
       this.market = market; this.error = null;
       const now = this.clock(), next = structuredClone(this.data), due = [];
       for (const rule of next.config.rules) {

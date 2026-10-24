@@ -206,6 +206,43 @@ test('funding-only Binance rate limits preserve current prices and resume fundin
   assert.equal(recovered.fundingFetchedAt, new Date(now).toISOString());
 });
 
+test('a failed or slow Binance catalog refresh keeps prices current on the last valid catalog for a bounded time', async () => {
+  let now = NOW, catalog = 'ok', catalogCalls = 0, release = null;
+  const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve)); };
+  const reader = createExchangeReader({ clock: () => now, sleep: async () => {}, fetcher: async input => {
+    const endpoint = new URL(input).pathname.split('/').at(-1), f = fixtures(now);
+    if (endpoint === 'exchangeInfo') {
+      catalogCalls++;
+      if (catalog === 'down') return new Response('private catalog failure', { status: 503 });
+      if (catalog === 'slow') return new Promise(resolve => { release = () => resolve(Response.json(f.binanceInstruments)); });
+      return Response.json(f.binanceInstruments);
+    }
+    return Response.json(endpoint === 'fundingInfo' ? f.binanceFunding : f.binanceTickers);
+  } });
+  await reader('binance', 'oil'); assert.equal(catalogCalls, 1);
+  catalog = 'down';
+  for (const offset of [61_000, 300_000, 599_999]) {
+    now = NOW + offset;
+    const current = await reader('binance', 'oil');
+    assert.equal(current.fetchedAt, new Date(now).toISOString());
+    await settle();
+  }
+  assert.equal(catalogCalls, 1 + 3 * 2, 'each expired read retries the catalog once in the background');
+  now = NOW + 600_000;
+  await assert.rejects(reader('binance', 'oil'), error => error.endpoint === 'exchangeInfo' && error.httpStatus === 503);
+  catalog = 'ok';
+  await reader('binance', 'oil');
+  const refreshedAt = now;
+  now = refreshedAt + 61_000; catalog = 'slow';
+  const unblocked = await reader('binance', 'hynix');
+  assert.equal(unblocked.fetchedAt, new Date(now).toISOString());
+  assert.ok(release, 'the slow catalog refresh is in flight while prices are returned');
+  release(); await settle();
+  now = refreshedAt + 61_000 + 60_000 - 1; catalog = 'down';
+  const calls = catalogCalls;
+  await reader('binance', 'oil'); await settle();
+  assert.equal(catalogCalls, calls, 'a completed background refresh renews the catalog cache');
+});
 test('a Binance IP ban is shared across markets and expires before network reads resume', async () => {
   let now = NOW, banned = true;
   const calls = [], sleeps = [];

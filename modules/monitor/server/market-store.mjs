@@ -8,6 +8,7 @@ import { validateGoldOilQuote, validateGoldOilHistory, GOLD_OIL_VARIANTS, goldOi
 import { validateGoldOilFunding } from '../lib/gold-oil-funding.ts';
 import { exchangeFundingAction, fundingHistoryExchanges, validateExchangeFundingHistory } from '../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION, validateOilHedgePrices } from '../lib/oil-hedge-prices.ts';
+import { staleMarketError } from './market-stale.mjs';
 
 const validators = { 'hynix/quote': validateHynixQuote, 'hynix/history': validateHynixHistory, 'hynix/funding': validateHynixFunding, 'oil/quote': validateOilQuote, 'oil/history': validateOilHistory, 'oil/funding': validateOilFunding };
 validators[`oil/${OIL_CANDLE_ACTION}`] = validateIntradaySnapshot;
@@ -96,7 +97,7 @@ export async function openMarketStore(filename, { clock = Date.now } = {}) {
         const key = keyFor(id, action), row = get.get(storageKey(key));
         if (!row.payload) throw new Error('数据库尚未收到行情，后台正在采集。');
         const stale = row.success_ms === null || Boolean(row.error) || clock() - row.source_ms > maxAgeMs;
-        if (fresh && stale) throw new Error('后台行情采集失败或已过期。');
+        if (fresh && stale) throw staleMarketError(row.error);
         return { ...decode(key, row.payload), status: stale ? 'snapshot' : 'live', collection: { source: 'database', stale, maxAgeMs, lastAttemptAt: row.attempt_ms === null ? null : new Date(row.attempt_ms).toISOString(), lastSuccessAt: row.success_ms === null ? null : new Date(row.success_ms).toISOString(), error: row.error } };
       },
       status() { return datasetKeys.map(key => { const { payload: _payload, ...row } = get.get(storageKey(key)); return { ...row, key }; }).sort((a, b) => a.key.localeCompare(b.key)); },
