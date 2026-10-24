@@ -1,8 +1,22 @@
-import { RuntimeError, unavailable } from './protocol.mjs';
+import { MAX_BODY_BYTES } from '../http-common.mjs';
+import { createRuntimeConnection } from './connection.mjs';
+import { BUDGETS, RuntimeError, runtimeErrorFrom, SUPPORTED_PROTOCOLS, unavailable } from './protocol.mjs';
+import { invokeOverSocket, writeResult } from './supervisor-client.mjs';
 
 // The DataPlaneClient contract: the calls the API makes into the data plane
 // (design doc 5.2). Both implementations validate arguments locally and every
-// result with the same functions; P1-3 adds the socket one.
+// result with the same functions; the runtime's internal server validates the
+// arguments again.
+export const FORWARD_PREFIX = '/internal/v1/forward';
+export const SESSION_HEADER = 'x-workspace-session';
+export const DEADLINE_HEADER = 'x-workspace-deadline';
+// A HEAD reply carries no body, so a forwarded HEAD travels as GET with this header.
+export const METHOD_HEADER = 'x-workspace-method';
+// Budgets of design doc 5.2: a forwarded request keeps the browser request's
+// remaining time, at most the API's 60 s request timeout.
+export const FORWARD_BUDGET = 60_000, ASSET_SYNC_BUDGET = 60_000;
+// Business replies such as fill histories may be larger than internal JSON.
+export const MAX_FORWARD_REPLY_BYTES = 16 * 1024 * 1024;
 const REASONS = new Set(['created', 'updated', 'deleted', 'preferences']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -40,6 +54,9 @@ export function validateReply(value) {
   return { status: value.status, body: value.body };
 }
 const validateSyncStatus = value => { if (value !== null && !object(value)) throw unavailable(); return value; };
+const reads = new Set(['GET', 'HEAD']);
+// A write that may have reached the data plane: the browser must check before trying again.
+export const unconfirmed = () => new RuntimeError(503, '结果未确认，请刷新后核对', { origin: 'transport', uncertain: true });
 const validateAccepted = value => { if (!object(value) || value.accepted !== true) throw unavailable(); return { accepted: true }; };
 
 // `invoke(name, argument)` performs one call; `subscribe(subscriber)` registers
@@ -52,11 +69,16 @@ function contract(invoke, subscribe) {
       if (typeof subscriber?.wants !== 'function' || typeof subscriber.deliver !== 'function') throw new TypeError('Overview subscriber needs wants() and deliver()');
       return subscribe({ wants: () => subscriber.wants(), deliver: event => subscriber.deliver(validateOverviewEvent(event)) });
     },
-    async projectChanged(id, change) { validateProjectId(id); const value = validateChange(change); return validateAccepted(await invoke('projectChanged', { id, ...value })); },
-    async coordinateAssetSync(id, revision) { validateProjectId(id); validateRevision(revision); return validateSyncStatus(await invoke('coordinateAssetSync', { id, revision })); },
-    async forward(request) { return validateReply(await invoke('forward', validateForward(request))); },
+    async projectChanged(id, change) { validateProjectId(id); const value = validateChange(change); return writeResult(invoke('projectChanged', { id, ...value }), validateAccepted); },
+    async coordinateAssetSync(id, revision) { validateProjectId(id); validateRevision(revision); return writeResult(invoke('coordinateAssetSync', { id, revision }), validateSyncStatus); },
+    async forward(request) {
+      const value = validateForward(request);
+      if (reads.has(value.method)) return validateReply(await invoke('forward', value));
+      try { return await writeResult(invoke('forward', value), validateReply); }
+      catch (error) { throw error instanceof RuntimeError && error.origin === 'transport' && error.uncertain ? unconfirmed() : error; }
+    },
     // Transitional: P1-4 reports the API's SSE counts, slow consumers included, as one record.
-    async observeSlowConsumer() { return validateAccepted(await invoke('observeSlowConsumer')); },
+    async observeSlowConsumer() { return writeResult(invoke('observeSlowConsumer'), validateAccepted); },
   };
 }
 
@@ -79,4 +101,92 @@ export function createInProcessDataClient(dataPlane, { log }) {
       throw new RuntimeError(503, '运行时内部错误');
     }
   }, subscriber => dataPlane.subscribeOverview(subscriber));
+}
+
+// Reads up to one byte past the body limit, so the data plane still answers 413
+// for a larger body; the browser's stream is iterated by hand because leaving a
+// for-await early would destroy it and its socket.
+async function bufferBody(body) {
+  const chunks = body[Symbol.asyncIterator]?.() ?? body[Symbol.iterator]();
+  const parts = []; let size = 0;
+  while (size <= MAX_BODY_BYTES) {
+    const { value, done } = await chunks.next();
+    if (done) break;
+    const chunk = Buffer.from(value); parts.push(chunk); size += chunk.length;
+  }
+  return Buffer.concat(parts).subarray(0, MAX_BODY_BYTES + 1);
+}
+
+// Overview events reconnect with 1 to 30 s backoff; the runtime pushes at
+// least every 15 s, so a stream silent for 45 s is treated as broken.
+export const EVENTS_IDLE_MS = 45_000;
+const BACKOFF_MS = [1000, 2000, 4000, 8000, 16_000, 30_000];
+
+// Talks to the runtime's internal server over its private socket; pass the
+// supervisor client's `connection` so both share one discovery record.
+export function createSocketDataClient({ dir, protocols = SUPPORTED_PROTOCOLS, connection = createRuntimeConnection({ dir, protocols }), budgets: overrides = {}, idleMs = EVENTS_IDLE_MS, backoffMs = BACKOFF_MS, log }) {
+  if (!(idleMs > 0 && idleMs <= 2 ** 31 - 1)) throw new TypeError('Data-plane client needs idleMs between 1 and 2^31-1');
+  const budgets = { read: BUDGETS.read, assetSync: ASSET_SYNC_BUDGET, forward: FORWARD_BUDGET, ...overrides };
+  const call = (route, { method = 'POST', body, budget = budgets.read, retry = false } = {}) => invokeOverSocket(connection, { method, route, body, budget, retry });
+  const operations = {
+    overview: () => call('/internal/v1/overview', { method: 'GET', retry: true }),
+    projectChanged: ({ id, reason, clearSnapshot }) => call(`/internal/v1/projects/${id}/changed`, { body: { reason, clearSnapshot } }),
+    coordinateAssetSync: async ({ id, revision }) => {
+      const value = await call(`/internal/v1/projects/${id}/asset-sync`, { body: { revision }, budget: budgets.assetSync });
+      if (!object(value) || !('status' in value)) throw unavailable(true);
+      return value.status;
+    },
+    observeSlowConsumer: () => call('/internal/v1/overview/slow-consumers', { body: {} }),
+    forward: async request => {
+      const deadline = Math.min(request.deadline ?? Infinity, Date.now() + budgets.forward);
+      const content = await bufferBody(request.body);
+      let target = null;
+      try {
+        target = await connection.resolve(deadline);
+        const head = request.method === 'HEAD';
+        const reply = await connection.exchange(target, { method: head ? 'GET' : request.method, route: FORWARD_PREFIX + request.target, deadline, body: content.length ? content : null, maxBytes: MAX_FORWARD_REPLY_BYTES,
+          headers: { [SESSION_HEADER]: request.sessionId, [DEADLINE_HEADER]: String(deadline), ...(head ? { [METHOD_HEADER]: 'HEAD' } : {}), ...(request.contentType !== undefined ? { 'Content-Type': request.contentType } : {}) } });
+        if (reply.status === 401) throw unavailable();
+        if (reply.status !== 200) throw runtimeErrorFrom(reply.status, reply.body);
+        return reply.body;
+      } catch (error) {
+        if (error instanceof RuntimeError && error.origin === 'transport') connection.invalidate(target);
+        throw error;
+      }
+    },
+  };
+  // One upstream stream per subscriber, kept open until the subscription ends.
+  function subscribe(subscriber) {
+    let stopped = false, current = null, timer = null, failures = 0;
+    const retry = () => {
+      if (stopped) return;
+      const delay = backoffMs[Math.min(failures, backoffMs.length - 1)]; failures += 1;
+      timer = setTimeout(open, delay); timer.unref?.();
+    };
+    async function open() {
+      timer = null;
+      let target;
+      try { target = await connection.resolve(Date.now() + budgets.read); }
+      catch { retry(); return; }
+      if (stopped) return;
+      // The backoff resets only once an event was delivered; an event the API
+      // refuses keeps backing off and does not drop the shared record.
+      let refused = false;
+      current = connection.stream(target, { route: '/internal/v1/overview/events', idleMs,
+        onLine: event => {
+          try { subscriber.deliver(event); } catch (error) { refused = true; throw error; }
+          failures = 0;
+        },
+        onClose: error => {
+          current = null;
+          if (stopped) return;
+          if (refused) log?.warn({ err: error, type: 'overview' }, '概览推送处理失败');
+          else connection.invalidate(target);
+          retry();
+        } });
+    }
+    void open();
+    return () => { stopped = true; clearTimeout(timer); current?.close(); };
+  }
+  return contract(async (name, argument) => operations[name](argument), subscribe);
 }

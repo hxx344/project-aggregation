@@ -54,7 +54,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const readMaintenance = () => getSetting('updates-maintenance') === '1';
   // The API and the data plane share this process and talk only through these
   // clients; the separated entries use socket clients against the same contracts.
-  const supervisor = createInProcessClient(createRuntimeService({ moduleRuntime, guard: embeddedModules ? createModuleUpdateGuard() : null, readMaintenance }));
+  const supervisor = createInProcessClient(createRuntimeService({ moduleRuntime, guard: embeddedModules ? createModuleUpdateGuard() : null, readMaintenance }), { log });
   let api = null;
   const dataPlane = createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir: resolvedData, log, accountWriter, readConnections: () => api?.streamCount() ?? 0,
     refreshInterval, timeoutMs, summaryReader, assetSyncIntervalMs, assetSyncReader,

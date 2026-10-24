@@ -11,7 +11,7 @@ import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, Update
 import { createUpdateStream } from '../update-stream.mjs';
 import { moduleIds } from '../modules/catalog.mjs';
 import { tradingModules } from '../modules/updates.mjs';
-import { RuntimeError } from '../runtime/protocol.mjs';
+import { RuntimeError, UNAVAILABLE } from '../runtime/protocol.mjs';
 import { coordinatorHooks } from '../runtime/supervisor-client.mjs';
 import { MAX_PROJECTS } from '../control/schema.mjs';
 import { passwordMatches, resetPassword } from '../control/password.mjs';
@@ -38,13 +38,22 @@ const admitted = (pathname, method) => /^\/api\/trading\/execution\/accounts\/(?
 // coordinator, project configuration, Portal, the overview streams and static
 // files. Business routes go to the data plane through `runtime`, module
 // supervision through `supervisor`; neither is reached any other way.
+// The browser request's budget, which a forwarded call keeps (design doc 5.2).
+const REQUEST_TIMEOUT_MS = 60_000;
+// Overview streams get a frame at least this often, and project changes are
+// retried this many times at these delays (initial design values).
+const OVERVIEW_HEARTBEAT_MS = 15_000, RUNTIME_STALE_MS = 30_000, NOTICE_RETRY_MS = [1000, 5000];
+// What the API shows while it has not heard from the runtime for RUNTIME_STALE_MS.
+const staleOverview = overview => ({ ...overview, projects: overview.projects.map(item => ({ ...item, state: 'stale', message: UNAVAILABLE })) });
+
 export function createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime, executionJobs, readMaintenance,
-  updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits() }) {
+  updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits(),
+  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS }) {
   const { loginWindowMs, accountLockoutMs } = loginLimits;
   const { getSetting, setSetting, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution: executionJobs,
-    ...(embeddedModules ? { ...coordinatorHooks(supervisor), tradingModules, moduleIds } : {}),
+    ...(embeddedModules ? { ...coordinatorHooks(supervisor, { log }), tradingModules, moduleIds } : {}),
     readMaintenance,
     writeMaintenance: active => setSetting('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
@@ -83,9 +92,36 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
     }
   }
-  const unsubscribe = runtime.subscribeOverview({ wants: () => streams.size > 0, deliver: event => publishOverview(event.overview) });
-  // The data plane drops what it derived from a project; the row itself is already written.
-  const notify = (id, change) => runtime.projectChanged(id, change).catch(error => log.warn({ err: error, projectId: id, reason: change.reason, type: 'project-change' }, '项目变更未能通知运行时'));
+  // The latest projection and when the runtime last answered. Streams get it
+  // again when the runtime has pushed nothing for a heartbeat period, so session
+  // checks and the write-buffer guard do not depend on the runtime; after
+  // runtimeStaleMs without contact every project is shown as stale. A read that
+  // a push overtook does not bring back its older projection.
+  let latest = null, lastContact = 0, lastPush = 0, pushes = 0;
+  async function readOverview() {
+    const before = pushes, overview = await runtime.overview();
+    if (pushes === before) latest = overview;
+    lastContact = Date.now(); return overview;
+  }
+  const unsubscribe = runtime.subscribeOverview({ wants: () => streams.size > 0,
+    deliver: event => { latest = event.overview; pushes += 1; lastContact = lastPush = Date.now(); publishOverview(event.overview); } });
+  const heartbeat = setInterval(() => {
+    // A stream is registered only after its first projection was read, so `latest` is set here.
+    if (!streams.size || Date.now() - lastPush < overviewHeartbeatMs) return;
+    publishOverview(Date.now() - lastContact > runtimeStaleMs ? staleOverview(latest) : latest);
+  }, overviewHeartbeatMs);
+  heartbeat.unref?.();
+  // The data plane drops what it derived from a project; the row itself is
+  // already written. A failed notice is retried in the background; repeating
+  // one is harmless, though a retry that arrives after a newer change to the
+  // same id drops that change's cached state until the next collection.
+  const retries = new Set();
+  function retryNotice(id, change, attempts, error) {
+    if (closed || attempts > noticeRetryMs.length) { log.warn({ err: error, projectId: id, reason: change.reason, attempts, type: 'project-change' }, '项目变更未能通知运行时'); return; }
+    const timer = setTimeout(() => { retries.delete(timer); runtime.projectChanged(id, change).catch(next => retryNotice(id, change, attempts + 1, next)); }, noticeRetryMs[attempts - 1]);
+    timer.unref?.(); retries.add(timer);
+  }
+  const notify = (id, change) => runtime.projectChanged(id, change).catch(error => retryNotice(id, change, 1, error));
   const portal = createPortal({
     ...(embeddedModules ? { withMutation: updates.withExecutionEntry } : {}),
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
@@ -132,8 +168,10 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   }
   const bodyOf = req => readJson(req.headers['content-type'], req);
   // The target is the normalized path and query this API matched, not the raw request line.
+  const receivedAt = new WeakMap();
   async function forward(req, res, url, current, { body = req, contentType = req.headers['content-type'] } = {}) {
-    const reply = await runtime.forward({ method: req.method, target: url.pathname + url.search, sessionId: current.id, contentType, body });
+    const deadline = (receivedAt.get(req) ?? Date.now()) + REQUEST_TIMEOUT_MS;
+    const reply = await runtime.forward({ method: req.method, target: url.pathname + url.search, sessionId: current.id, contentType, deadline, body });
     send(res, reply.status, reply.body);
   }
   async function api(req, res, url) {
@@ -265,12 +303,12 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       await updates.withExecutionEntry(() => forward(req, res, url, current, { body: [raw] }), native); return;
     }
     if (pathname === '/api/projects' && req.method === 'GET') { send(res, 200, { projects: getProjects() }); return; }
-    if (pathname === '/api/overview' && req.method === 'GET') { send(res, 200, await runtime.overview()); return; }
+    if (pathname === '/api/overview' && req.method === 'GET') { send(res, 200, await readOverview()); return; }
     if (pathname === '/api/overview/events' && req.method === 'GET') {
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台订阅状态');
       if (req.headers.origin) sameOrigin(req);
       // Read before the limit check, so concurrent subscribers cannot all pass it during the read.
-      const initial = await runtime.overview();
+      const initial = await readOverview();
       if (res.destroyed) return;
       if (closed) throw new HttpError(503, '工作台正在关闭');
       if (!sessions.isActive(current.id)) throw new HttpError(401, '登录已失效，请重新登录');
@@ -328,6 +366,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
 
   const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.json': 'application/json' };
   const server = http.createServer(async (req, res) => {
+    receivedAt.set(req, Date.now());
     try { if ((!configuredOrigin || req.headers.host !== new URL(configuredOrigin).host) && await portal.handle(req, res)) return; }
     catch { if (!res.headersSent) send(res, 502, { error: '项目页面暂时不可用，请从工作台重新打开' }); else res.destroy(); return; }
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Frame-Options', 'DENY');
@@ -352,7 +391,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     } catch (error) { if (!res.headersSent) { const reply = respond(error); send(res, reply.status, reply.body); } else res.end(); }
   });
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
-  server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
+  server.requestTimeout = REQUEST_TIMEOUT_MS; server.headersTimeout = 10000; server.maxHeadersCount = 80;
 
   return {
     server, updates,
@@ -360,7 +399,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     initialize: () => updates.initialize(),
     async resetPassword() { const password = await resetPassword(control); pruneStreams(); updateStream.revalidate(); return password; },
     // close() ends the control-plane services; closeServer() then waits for the listener.
-    async close() { closed = true; unsubscribe(); await updates.close(); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); portal.close(); },
+    async close() { closed = true; unsubscribe(); clearInterval(heartbeat); for (const timer of retries) clearTimeout(timer); retries.clear(); await updates.close(); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); portal.close(); },
     async closeServer() { if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },
   };
 }

@@ -10,7 +10,7 @@ import path from 'node:path';
 import { moduleIds } from '../server/modules/catalog.mjs';
 import { registerModuleTransport } from '../server/modules/transport.mjs';
 import { UpdateError } from '../server/updates.mjs';
-import { createSecret, ensureRuntimeDir, MAX_REQUEST_BYTES, PROTOCOL_VERSION, readDiscovery, removeDiscovery, RUNTIME_KEY_HEADER, RuntimeError, socketPathFor, writeDiscovery } from '../server/runtime/protocol.mjs';
+import { createSecret, ensureRuntimeDir, MAX_REQUEST_BYTES, PROTOCOL_VERSION, readDiscovery, removeDiscovery, removeStaleRuntimeFiles, RUNTIME_KEY_HEADER, RuntimeError, socketPathFor, writeDiscovery } from '../server/runtime/protocol.mjs';
 import { createRuntimeService } from '../server/runtime/service.mjs';
 import { createInternalHandler, startInternalServer } from '../server/runtime/internal-server.mjs';
 import { coordinatorHooks, createInProcessClient, createSocketClient } from '../server/runtime/supervisor-client.mjs';
@@ -364,4 +364,32 @@ test('maintenance syncs run one at a time and each reads the durable flag when i
   release();
   assert.equal((await first).active, false); assert.equal((await second).active, true);
   assert.deepEqual(events, ['start:false', 'done:false', 'start:true', 'done:true']);
+});
+
+test('socket client reports a write whose 200 reply fails validation as uncertain', { skip: windows }, async t => {
+  const { dir } = await scripted(t, (req, res) => { req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('[]'); });
+  const client = createSocketClient({ dir });
+  for (const call of [() => client.syncMaintenance(['crossex']), () => client.prepareStop(), () => client.restartModule('crossex')]) {
+    await assert.rejects(call(), error => error instanceof RuntimeError && error.origin === 'transport' && error.uncertain);
+  }
+});
+
+test('the coordinator hooks and the in-process client log the causes they hide', async () => {
+  const warnings = [], errors = [];
+  const failing = { syncMaintenance: async () => { throw new Error('sync cause'); }, prepareStop: async () => { throw new Error('stop cause'); } };
+  const hooks = coordinatorHooks(failing, { log: { warn: (fields, message) => warnings.push([message, fields.err.message]) } });
+  await assert.rejects(hooks.setModuleMaintenance(true, ['crossex']), error => error instanceof UpdateError && error.status === 503);
+  await assert.rejects(hooks.prepareApply(), error => error instanceof UpdateError && error.message === '运行时不可用，暂不能更新');
+  assert.deepEqual(warnings, [['维护同步未获运行时确认', 'sync cause'], ['停机准入未获运行时确认', 'stop cause']]);
+  const service = { ...createRuntimeService({ readMaintenance: () => false }), status: () => { throw new Error('status cause'); } };
+  await assert.rejects(createInProcessClient(service, { log: { error: (fields, message) => errors.push([message, fields.err.message]) } }).status(), error => error.status === 503 && error.message === '运行时内部错误');
+  assert.deepEqual(errors, [['运行时调用失败', 'status cause']]);
+});
+
+test('a starting runtime removes leftover temp records and other instances\' sockets, and nothing else', { skip: windows }, async t => {
+  const dir = await directory(t), self = randomUUID(), other = randomUUID();
+  const names = ['.runtime.json.0a1b.tmp', `runtime-${other}.sock`, `runtime-${self}.sock`, 'runtime.json', '.runtime.lock', 'notes.tmp'];
+  for (const name of names) writeFileSync(path.join(dir, name), '');
+  removeStaleRuntimeFiles(dir, self);
+  assert.deepEqual(names.filter(name => existsSync(path.join(dir, name))), [`runtime-${self}.sock`, 'runtime.json', '.runtime.lock', 'notes.tmp']);
 });
