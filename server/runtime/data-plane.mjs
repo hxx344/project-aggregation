@@ -18,6 +18,7 @@ import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from '
 import { createAccountWriter } from '../execution/account-writer.mjs';
 import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
+import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 
 const respond = errorResponder([HttpError, TradingError, ExecutionError, UpdateError, RuntimeError]);
 
@@ -53,6 +54,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // already belongs to a managed or recovered authority.
   const sharedAccountWriter = accountWriter || (embeddedModules || existsSync(writerDatabase) || existsSync(`${writerDatabase}.required`) ? createAccountWriter({ databasePath: writerDatabase, runtimeId: randomUUID(), moduleId: 'hub' }) : null);
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
+  const executionEntries = createExecutionEntries({ db, log, readMaintenance: () => control.getSetting('updates-maintenance') === '1', refuse: () => { throw new UpdateError(409, EXECUTION_MAINTENANCE); } });
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   // Overview subscribers; wants() lets an in-process subscriber skip the projection while nobody listens.
   const subscribers = new Set();
@@ -213,14 +215,17 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
       return reply(200, data);
     }
-    // The API admits the account, preview and start writes before forwarding them (withExecutionEntry).
+    // The API admits the account, preview and start writes before forwarding
+    // them (withExecutionEntry); here each one also holds an execution entry
+    // against the durable maintenance flag. Stop and reconcile stay open.
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && method === 'GET') return reply(200, execution.state());
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
-      if (account && method === 'PUT') { const body = await bodyOf(); return reply(200, await execution.connect(account[1], body, sessionId)); }
-      if (account && method === 'DELETE') { const body = await bodyOf(); return reply(200, await execution.disconnect(account[1], body, sessionId)); }
-      if (pathname === '/api/trading/execution/preview' && method === 'POST') { const body = await bodyOf(); return reply(200, await execution.preview(body, sessionId)); }
-      if (pathname === '/api/trading/execution/jobs' && method === 'POST') { const body = await bodyOf(); return reply(202, await execution.start(body, sessionId)); }
+      const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
+      if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));
+      if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId)));
+      if (pathname === '/api/trading/execution/preview' && method === 'POST') return reply(200, await entered(body => execution.preview(body, sessionId)));
+      if (pathname === '/api/trading/execution/jobs' && method === 'POST') return reply(202, await entered(body => execution.start(body, sessionId)));
       const job = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/(stop|reconcile)$/);
       if (job && method === 'POST') { const body = await bodyOf(); return reply(200, job[2] === 'stop' ? execution.stop(job[1], body, sessionId) : await execution.reconcile(job[1], body, sessionId)); }
       throw new HttpError(404, '实盘执行接口不存在');
@@ -291,7 +296,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     observeSlowConsumer() { baseline?.observeSlowConsumer(); },
-    initialize: () => execution.initializeProtection(),
+    initialize: () => { executionEntries.clear(); return execution.initializeProtection(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,

@@ -12,7 +12,7 @@ const defaults = [
   { id: 'greeks', name: 'Greeks · BTC 期权', description: 'Bybit BTC 铁鹰期权、持仓与策略收益', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:8000', apiUrl: 'http://127.0.0.1:8000', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 30 },
 ].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));
 
-const TABLES = 'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);';
+const TABLES = 'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires); CREATE TABLE IF NOT EXISTS execution_entries (id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);';
 
 export function immediate(db, fn) {
   db.exec('BEGIN IMMEDIATE');

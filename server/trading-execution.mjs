@@ -5,9 +5,9 @@ import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildP
 import { TRADING_NAMES } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
+import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL } from './control/execution-jobs.mjs';
 
 const iso = time => new Date(time).toISOString();
-const FINAL = new Set(['completed', 'stopped']);
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
 const PREVIEW_TTL = 30_000, LEASE_TTL = 60_000;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
@@ -19,7 +19,7 @@ const modeOf = (exchange, mode) => {
 };
 
 /** Durable, explicit live execution. Read endpoints never submit exchange requests. */
-export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = 35_000, isSessionActive = () => true, accountWriter = null } = {}) {
+export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = EXECUTION_CALL_TIMEOUT_MS, isSessionActive = () => true, accountWriter = null } = {}) {
   // If stmt is explicitly null, use raw db.prepare (for tests that mock db.prepare)
   // If stmt is undefined, create a cached version for production
   // If stmt is provided, use it

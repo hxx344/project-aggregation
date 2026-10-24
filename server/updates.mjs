@@ -1,12 +1,12 @@
 import http from 'node:http';
+import { EXECUTION_MAINTENANCE as MAINTENANCE, FINAL_EXECUTION } from './control/execution-jobs.mjs';
 
 const SOCKET_PATH = '/run/project-aggregation-updater/control.sock';
 const UNAVAILABLE = '更新服务不可用，请先运行一键部署初始化更新服务';
-const MAINTENANCE = '系统正在更新或等待确认更新结果，暂不能新建实盘任务或修改实盘连接';
 const ACTIVE = new Set(['queued', 'running']);
 const MODULE_UNCONFIRMED = '该交易模块正在恢复，维护状态尚未确认，请稍后重试';
 const SCOPE_INVALID = '写入范围无效，暂不能写入';
-const FINAL_EXECUTION = new Set(['completed', 'stopped']);
+const EXECUTION_BUSY = '请先停止所有实盘任务并完成委托核对，再更新系统';
 const PLAN_ID = /^[A-Za-z0-9_-]{16,128}$/;
 const GITHUB_TOKEN = /^[A-Za-z0-9_]{20,255}$/;
 const TOKEN_BUSY = '正在检查版本或执行更新，请完成后再修改 GitHub Token';
@@ -178,6 +178,10 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
 export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, tradingModules = [], moduleIds = tradingModules, prepareApply = async () => {}, releasePollMs = 5000, now = Date.now }) {
+  // Without these the idle check would skip open entries or run outside the write lock.
+  // writeMaintenance and writePendingPlanId must use the connection of
+  // execution.transaction, or they wait out busy_timeout under its write lock.
+  if (!['state', 'openEntries', 'transaction'].every(name => typeof execution?.[name] === 'function')) throw new TypeError('createUpdateCoordinator requires execution.state, openEntries and transaction');
   let pendingPlanId = readPendingPlanId();
   let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
@@ -282,12 +286,25 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       return applying.promise;
     }
     if (pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
-    if (entries || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status))) throw new UpdateError(409, '请先停止所有实盘任务并完成委托核对，再更新系统');
-    generation += 1;
+    const busy = () => entries || execution.openEntries() || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status));
+    if (busy()) throw new UpdateError(409, EXECUTION_BUSY);
     const previous = { maintenance, pendingPlanId, pendingDeployMode };
-    // Persist the plan first; restoration also treats a pending plan as maintenance.
-    rememberPending(planId, deployMode);
-    remember(true);
+    // The idle check and the maintenance write share one write transaction, so
+    // an execution entry the runtime records concurrently is either seen here
+    // or refused by the committed flag (design doc 5.5). Persist the plan
+    // first; restoration also treats a pending plan as maintenance.
+    try {
+      execution.transaction(() => {
+        if (busy()) throw new UpdateError(409, EXECUTION_BUSY);
+        rememberPending(planId, deployMode);
+        remember(true);
+      });
+    } catch (error) {
+      // A rolled-back write leaves the durable values; the cached ones follow them.
+      ({ maintenance, pendingPlanId, pendingDeployMode } = previous);
+      throw error;
+    }
+    generation += 1;
     const pending = { planId, deployMode, promise: null };
     applying = pending;
     pending.promise = (async () => {

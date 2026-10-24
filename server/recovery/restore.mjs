@@ -102,7 +102,7 @@ function validateAndRevoke(directory) {
   withDb(path.join(directory, 'hub.sqlite'), (db, present) => {
     for (const table of ['settings', 'projects', 'sessions']) if (!present.has(table)) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
     for (const table of ['projects','trading_accounts','execution_accounts']) if (present.has(table)) for (const row of db.prepare('SELECT credentials FROM ' + table + ' WHERE credentials IS NOT NULL').iterate()) validateCipher(row.credentials, hubKey, { tagFirst: true });
-    for (const table of ['sessions','execution_previews','execution_lease']) if (present.has(table)) db.exec('DELETE FROM ' + table);
+    for (const table of ['sessions','execution_previews','execution_lease','execution_entries']) if (present.has(table)) db.exec('DELETE FROM ' + table);
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   });
   const cross = path.join(directory, 'modules/crossex/crossex.sqlite');

@@ -67,7 +67,7 @@ function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 
       return state('running');
     },
   };
-  const coordinator = createUpdateCoordinator({ client, execution: { state: () => ({ jobs: [] }) },
+  const coordinator = createUpdateCoordinator({ client, execution: { state: () => ({ jobs: [] }), openEntries: () => 0, transaction: fn => fn() },
     readMaintenance: () => persisted.maintenance,
     writeMaintenance: value => { persisted.maintenance = value; events.push(`persist:maintenance:${value}`); },
     readPendingPlanId: () => persisted.pendingPlanId,
