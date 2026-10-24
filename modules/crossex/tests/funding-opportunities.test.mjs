@@ -31,7 +31,6 @@ async function fixture(t, options = {}) {
     depthReader: async () => { throw new Error('discovery must not fetch depth'); } });
   t.after(() => market.stop()); await market.refresh();
   return { market, rows: () => market.view().fundingOpportunities,
-    held: symbols => market.view({ includeOpportunities: false, includePositionFunding: true, positionSymbols: symbols }).positionFundingRates,
     snapshot: () => current,
     async setSnapshot(next) { current = next; await market.refreshSource(); },
     async setRules(next) { rules = next; now += 300000; current = { ...current, generatedAt: now }; await market.refresh(); },
@@ -199,84 +198,4 @@ test('the 200-row limit preserves an eligible lower-rate pair ahead of 200 stale
   assert.equal(rows.length, 200); assert.equal(rows[0].base, 'BTC'); assert.equal(rows[0].eligible, true);
   assert.equal(rows[0].equivalent8hBps, 1); assert.ok(rows.slice(1).every(row => !row.eligible));
   assert.equal(rows[1].equivalent8hBps, 201); assert.equal(rows.at(-1).equivalent8hBps, 3);
-});
-
-test('held funding retains both equal-rate legs, including zero, without creating an opportunity', async t => {
-  for (const rate of [0, 0.0001, -0.0001]) {
-    const quotes = [fundingQuote('binance', { fundingRate: rate }), fundingQuote('bybit', { fundingRate: rate })];
-    const f = await fixture(t, { quotes });
-    assert.deepEqual(f.rows(), []);
-    const rows = f.held(quotes.map(q => q.crossexSymbol));
-    assert.equal(rows.length, 2); assert.ok(rows.every(row => row.rate === rate && row.normalized8hBps === rate * 10000));
-    assert.ok(rows.every(row => row.fundingAt === epoch && row.expiresAt === epoch + 10000));
-    assert.deepEqual(f.held([]), []);
-    assert.deepEqual(f.held(['BINANCE_FUTURE_ETH_USDT']), []);
-  }
-});
-
-test('held funding reads the requested tail contracts beyond the ranked 200-row limit', async t => {
-  const quotes = Array.from({ length: 205 }, (_, i) => [fundingQuote('binance', { base: `COIN${i}`, fundingRate: 0 }),
-    fundingQuote('bybit', { base: `COIN${i}`, fundingRate: (205 - i) / 10000 })]).flat();
-  const f = await fixture(t, { quotes }), symbols = quotes.slice(-2).map(q => q.crossexSymbol);
-  assert.equal(f.rows().length, 200); assert.ok(f.rows().every(row => row.base !== 'COIN204'));
-  assert.deepEqual(f.held(symbols).map(row => row.symbol), symbols);
-  assert.deepEqual(f.held(symbols).map(row => row.normalized8hBps), [0, 1]);
-});
-
-test('held funding ignores entry pause, blocked bases, transfer policy and disappearing entry policy', async t => {
-  const f = await fixture(t, { snapshot: { crossexFilter: { requireSpotTransfer: true, blockedBases: ['BTC'], revision: 1 } } });
-  const symbols = f.snapshot().quotes.map(q => q.crossexSymbol);
-  f.market.settings({ config: { entryPaused: true } });
-  assert.deepEqual(f.rows(), []); assert.equal(f.held(symbols).length, 2);
-  const { crossexFilter, ...missingPolicy } = f.snapshot(); await f.setSnapshot(missingPolicy);
-  assert.ok(f.rows().every(row => !row.eligible)); assert.equal(f.held(symbols).length, 2);
-  await f.setSnapshot({ ...missingPolicy, crossexFilter: { requireSpotTransfer: 'unknown', blockedBases: [] } });
-  assert.equal(f.held(symbols).length, 2);
-});
-
-test('held funding requires exact native linear identity and the current CrossEx directory', async t => {
-  const symbol = 'BINANCE_FUTURE_BTC_USDT';
-  for (const extra of [{ symbol: 'ETHUSDT' }, { identityVerified: false }, { rawBase: '1000BTC' },
-    { assetClass: 'stock' }, { contractKind: 'inverse' }, { settlementCurrency: 'USDC' }, { delisting: true }]) {
-    const f = await fixture(t, { quotes: [fundingQuote('binance', extra)] });
-    assert.deepEqual(f.held([symbol]), [], JSON.stringify(extra));
-  }
-  const quotes = [fundingQuote('binance')], rule = rulesFor(quotes)[0];
-  for (const extra of [{ state: 'suspend' }, { exchange_type: 'BYBIT' }, { symbol: 'BINANCE_FUTURE_BTC_USDC' }, { delist_time: '1' }]) {
-    const f = await fixture(t, { quotes, rules: [{ ...rule, ...extra }] });
-    assert.deepEqual(f.held([symbol]), [], JSON.stringify(extra));
-  }
-  const stale = await fixture(t, { quotes }); stale.advance(900001);
-  await stale.setSnapshot({ ...stale.snapshot(), generatedAt: epoch + 900001,
-    quotes: [fundingQuote('binance', { fundingAt: epoch + 900001 })] });
-  assert.deepEqual(stale.held([symbol]), []);
-});
-
-test('held funding has independent five-minute observations and source deadlines', async t => {
-  const symbol = 'BINANCE_FUTURE_BTC_USDT';
-  for (const extra of [{ fundingAt: epoch - 300000 }, { fundingAt: epoch + 1001 }, { fundingAt: undefined },
-    { fundingRate: null }, { fundingIntervalHours: undefined }, { fundingIntervalHours: 0 }, { fundingIntervalHours: 169 }]) {
-    const f = await fixture(t, { quotes: [fundingQuote('binance', extra)] });
-    assert.deepEqual(f.held([symbol]), [], JSON.stringify(extra));
-  }
-  const f = await fixture(t, { quotes: [fundingQuote('binance', { fundingAt: epoch - 299999 })] });
-  assert.equal(f.held([symbol])[0].expiresAt, epoch + 1); f.advance(1); assert.deepEqual(f.held([symbol]), []);
-  const stale = await fixture(t); stale.advance(10000); assert.deepEqual(stale.held([symbol]), []);
-  const offline = await fixture(t); await offline.offline(); assert.deepEqual(offline.held([symbol]), []);
-  const venue = await fixture(t); await venue.setSnapshot({ ...venue.snapshot(), exchanges: [{ id: 'binance', status: 'offline' }] });
-  assert.deepEqual(venue.held([symbol]), []);
-  const future = await fixture(t, { snapshot: { generatedAt: epoch + 1001 } }); assert.deepEqual(future.held([symbol]), []);
-});
-
-test('held funding is independent of opening BBO and FX and lightweight reads do not project it', async t => {
-  let reads = 0;
-  const tracked = fundingQuote('bybit', { quoteCurrency: 'USDC', bid: null, ask: null, bidAskAt: epoch - 10001 });
-  Object.defineProperty(tracked, 'fundingRate', { enumerable: true, get() { reads++; return 0.0001; } });
-  const f = await fixture(t, { quotes: [tracked] });
-  reads = 0; assert.deepEqual(f.market.view({ includeOpportunities: false }).positionFundingRates, []); assert.equal(reads, 0);
-  assert.deepEqual(f.held(['BINANCE_FUTURE_BTC_USDT']), []); assert.equal(reads, 0);
-  const state = f.market.view({ includeOpportunities: false, includePositionFunding: true, positionSymbols: [tracked.crossexSymbol] });
-  assert.deepEqual(state.fundingOpportunities, []); assert.deepEqual(state.opportunities, []);
-  assert.equal(state.positionFundingRates.length, 1); assert.equal(state.positionFundingRates[0].quoteCurrency, 'USDC');
-  assert.equal(state.positionFundingRates[0].normalized8hBps, 1); assert.ok(reads > 0);
 });

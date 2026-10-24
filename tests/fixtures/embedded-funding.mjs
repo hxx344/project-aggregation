@@ -11,6 +11,7 @@ import { registerModuleTransport } from '../../server/modules/transport.mjs';
 import { unavailableUpdateState } from '../../server/updates.mjs';
 import { createApp as createCrossEx } from '../../modules/crossex/server/app.mjs';
 import { createPublicClients, CATALOG_URL } from '../../modules/crossex/server/clients.mjs';
+import { createFundingClient } from '../../modules/crossex/server/funding-client.mjs';
 import { createPerpetualOpportunitiesV2 } from '../../modules/monitor/server/perpetual-opportunities-v2.mjs';
 import { discoverMarkets } from '../../modules/monitor/modules/perpetual/exchanges.mjs';
 
@@ -76,10 +77,17 @@ export async function createEmbeddedFundingFixture({ alias = false } = {}) {
       symbol: binanceSymbol, baseAsset: binanceBase, quoteAsset: 'USDT', marginAsset: 'USDT', contractType: 'PERPETUAL',
       status: 'TRADING', underlyingType: 'COIN', underlyingSubType: [],
     }] };
-    else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/fundingInfo') value = [];
+    else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/fundingInfo') value = [{ symbol: binanceSymbol, fundingIntervalHours: 1 }];
+    else if (url.origin === 'https://fapi.binance.com' && url.pathname === '/fapi/v1/premiumIndex') {
+      assert.equal(url.searchParams.get('symbol'), binanceSymbol);
+      value = { symbol: binanceSymbol, lastFundingRate: '0.0001', nextFundingTime: Date.now() + 3600000, markPrice: '100', time: Date.now() };
+    }
+    else if (url.origin === 'https://api.bybit.com' && url.pathname === '/v5/market/tickers') value = {
+      retCode: 0, time: Date.now(), result: { category: 'linear', list: [{ symbol: 'BTCUSDT', fundingRate: '0.0001', nextFundingTime: String(Date.now() + 3600000), markPrice: '102' }] },
+    };
     else if (url.origin === 'https://api.bybit.com' && url.pathname === '/v5/market/instruments-info') value = {
       retCode: 0, result: { category: 'linear', list: [{ symbol: 'BTCUSDT', baseCoin: 'BTC', quoteCoin: 'USDT', settleCoin: 'USDT',
-        contractType: 'LinearPerpetual', status: 'Trading', isPreListing: false, deliveryTime: '0', symbolType: 'crypto' }] },
+        contractType: 'LinearPerpetual', status: 'Trading', isPreListing: false, deliveryTime: '0', symbolType: 'crypto', fundingInterval: 240 }] },
     };
     else if (alias && url.origin === 'https://api.gateio.ws' && url.pathname === '/api/v4/futures/usdt/contracts') value = [gateInstrument];
     else if (alias && url.origin === 'https://api.gateio.ws' && url.pathname === '/api/v4/futures/usdt/contracts/LUNA_USDT') value = gateInstrument;
@@ -146,7 +154,7 @@ export async function createEmbeddedFundingFixture({ alias = false } = {}) {
       intervalMs: 0, sourceIntervalMs: 0, logger: () => {}, authorizeRequest: req => req.headers['x-workspace-key'] === crossexSecret,
       marketOptions: { feedReader: clients.loadFeed, catalogReader: clients.loadCatalog, depthReader: clients.loadDepth,
         manualDepthReader: clients.loadManualDepth, identityReader: clients.resolveCrossexQuote, manualIdentityReader: clients.resolveManualQuote,
-        fxReader: clients.loadFx },
+        fxReader: clients.loadFx, currentFundingReader: createFundingClient({ fetcher }).current },
       liveOptions: { clientFactory: noPrivateClient },
       terminalOptions: { depthReader: clients.loadManualDepth, candleReader: async () => [], WebSocketImpl: FakeWebSocket },
     });

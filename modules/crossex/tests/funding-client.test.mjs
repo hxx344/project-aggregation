@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { createFundingClient } from '../server/funding-client.mjs';
 
 const HOUR = 3_600_000, SETTLED = Date.UTC(2026, 8, 23, 12), NOW = SETTLED + 600_000;
@@ -116,4 +117,76 @@ test('Kraken gaps and stale response clocks cannot confirm continuous coverage',
   assert.equal((await f.client.read(f.q, SETTLED - HOUR + 1, NOW)).complete, false);
   const g = fixture('kraken', (key, data) => key.includes('historical-funding-rates') ? { ...data, serverTime: new Date(SETTLED - HOUR).toISOString() } : undefined);
   assert.equal((await g.client.read(g.q, SETTLED - HOUR + 1, NOW)).coveredFrom, null);
+});
+class FakeStream extends EventEmitter {
+  static messages = []; static sent = [];
+  constructor(url) { super(); FakeStream.url = url; queueMicrotask(() => this.emit('open')); }
+  send(value) { FakeStream.sent.push(JSON.parse(value)); for (const message of FakeStream.messages) queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify(message)))); }
+  terminate() { this.terminated = true; }
+}
+const manual = q => ({ ...q, identityScope: 'manual', identitySource: 'exchange-instrument-metadata', nativeUnit: '1', comparable: true });
+test('current rate accepts native held identities without a Monitor or Binance proof', async () => {
+  const f = fixture('bybit');
+  const value = await f.client.current(manual(f.q));
+  assert.deepEqual(value, { rate: '0.0003', intervalHours: 4, nextFundingAt: SETTLED + 4 * HOUR, sourceAt: NOW, markPrice: '65000' });
+  assert.deepEqual(f.requests.map(x => new URL(x.url).pathname).sort(), ['/v5/market/instruments-info', '/v5/market/tickers']);
+  const okx = fixture('okx'); assert.equal((await okx.client.current(manual(okx.q))).intervalHours, 4);
+});
+test('current rate rejects invalid identities before IO and venues without a verified current feed', async () => {
+  const f = fixture('binance');
+  await assert.rejects(f.client.current({ ...f.q, exchange: 'http://evil' }), /身份无效/); assert.equal(f.requests.length, 0);
+  const kraken = fixture('kraken'); await assert.rejects(kraken.client.current(kraken.q), /未提供/);
+  const stale = fixture('binance', (key, data) => key === '/fapi/v1/premiumIndex' ? { ...data, time: NOW - 180_001 } : undefined);
+  await assert.rejects(stale.client.current(stale.q), /新鲜来源时间/);
+});
+test('Bybit ticker interval overrides lagging metadata, and an invalid one never falls back', async () => {
+  const ticker = hour => (key, data) => key === '/v5/market/tickers' ? { ...data, result: { ...data.result, list: [{ ...data.result.list[0], fundingIntervalHour: hour }] } }
+    : key === '/v5/market/instruments-info' ? { ...data, result: { list: [{ symbol: 'BTCUSDT', fundingInterval: 480 }] } } : undefined;
+  const f = fixture('bybit', ticker('1'));
+  assert.equal((await f.client.current(manual(f.q))).intervalHours, 1);
+  assert.deepEqual(f.requests.map(x => new URL(x.url).pathname), ['/v5/market/tickers']);
+  const bad = fixture('bybit', ticker('0'));
+  assert.equal((await bad.client.current(manual(bad.q))).intervalHours, null);
+  assert.equal(bad.requests.length, 1);
+});
+test('Binance fundingInfo is shared for a minute across current reads, and 418/429 cool the venue', async () => {
+  let now = NOW, limited = false;
+  const f = fixture('binance', (key, data) => key !== '/fapi/v1/premiumIndex' ? undefined : limited ? new Response('', { status: 429 }) : { ...data, time: now });
+  const client = createFundingClient({ fetcher: f.fetcher, clock: () => now });
+  const count = path => f.requests.filter(x => new URL(x.url).pathname === path).length;
+  await Promise.all([1, 2, 3].map(() => client.current(f.q)));
+  assert.deepEqual([count('/fapi/v1/fundingInfo'), count('/fapi/v1/premiumIndex')], [1, 3]);
+  now += 59_999; await client.current(f.q); assert.equal(count('/fapi/v1/fundingInfo'), 1);
+  now += 1; await client.current(f.q); assert.equal(count('/fapi/v1/fundingInfo'), 2);
+  limited = true; await assert.rejects(client.current(f.q), /429/);
+  limited = false; const before = f.requests.length;
+  now += 59_999; await assert.rejects(client.current(f.q), /冷却/); assert.equal(f.requests.length, before);
+  now += 1; assert.equal((await client.current(f.q)).rate, '0.00012');
+});
+test('a 429 on one parallel Binance leg is not masked by another leg failing first', async () => {
+  const f = fixture('binance', key => key === '/fapi/v1/premiumIndex' ? new Response('', { status: 503 }) : key === '/fapi/v1/fundingInfo' ? new Response('', { status: 429 }) : undefined);
+  await assert.rejects(f.client.current(f.q), error => error.status === 429);
+  const before = f.requests.length;
+  await assert.rejects(f.client.current(f.q), /冷却/); assert.equal(f.requests.length, before);
+});
+test('a current cooldown voided by clock rollback is discarded', async () => {
+  let now = NOW, limited = true;
+  const f = fixture('okx', key => key === '/api/v5/public/funding-rate' && limited ? new Response('', { status: 429 }) : undefined);
+  const client = createFundingClient({ fetcher: f.fetcher, clock: () => now });
+  await assert.rejects(client.current(f.q), /429/);
+  limited = false; now -= HOUR; await assert.rejects(client.current(f.q), /新鲜来源时间/);
+  now = NOW + 30_000; await client.current(f.q).catch(() => {});
+  assert.equal(f.requests.length, 3, 'the old deadline does not block a request after time catches up');
+});
+test('Lighter current rate reads one public market_stats snapshot in hourly percentage points', async () => {
+  const q = quote('lighter'), client = createFundingClient({ clock: () => NOW, WebSocketImpl: FakeStream, fetcher: async () => { throw new Error('no HTTP'); } });
+  FakeStream.sent = []; FakeStream.messages = [{ type: 'connected' }, { channel: 'market_stats:1', type: 'subscribed/market_stats', timestamp: NOW, market_stats: { market_id: 1, symbol: 'BTC', current_funding_rate: '0.0012' } }];
+  const value = await client.current(q);
+  assert.equal(FakeStream.url, 'wss://mainnet.zklighter.elliot.ai/stream?readonly=true');
+  assert.deepEqual(FakeStream.sent, [{ type: 'subscribe', channel: 'market_stats/1' }]);
+  assert.deepEqual([value.rate, value.intervalHours, value.nextFundingAt, value.sourceAt], ['0.000012', 1, (Math.floor(NOW / HOUR) + 1) * HOUR, NOW]);
+  FakeStream.messages = [{ channel: 'market_stats:1', timestamp: NOW, market_stats: { market_id: 1, symbol: 'ETH', current_funding_rate: '0.0012' } }];
+  await assert.rejects(client.current(q), /合约不一致/);
+  FakeStream.messages = [{ channel: 'market_stats:1', timestamp: NOW - 180_001, market_stats: { market_id: 1, current_funding_rate: '0.0012' } }];
+  await assert.rejects(client.current(q), /新鲜来源时间/);
 });

@@ -1231,3 +1231,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `5925053` 的 [显示调度](modules/monitor/lib/perpetual-display.ts)、[行情 Hook](modules/monitor/hooks/use-perpetual-feed.ts)、[排名新鲜度](modules/monitor/lib/perpetual-spreads.ts) 与 [服务端确认节奏](modules/monitor/server/perpetual-service.mjs)。2026-10-24 用户截图反映资金费套利列表每 20 秒刷新时机会短暂消失再出现；本机无运行中的行情服务，现场未复现，根因由源码与回放测试确认。独立审查另指出两腿时间差超过 5 秒的组合仍会随每次发布进出排名（持续约 20 秒），本次未改。
 
 **事件记录：** `monitor-display-cadence-expiry-20261024`；实际发生日期 2026-10-24（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L077：持仓展示数据不能套用开仓发现的准入门槛
+
+**适用条件：** 已有持仓的展示字段（资金费率、标记价等）复用了为发现新机会而设计的数据源，而这个数据源带有开仓准入过滤（跨所身份证明、白名单、排名截断、开仓暂停）。
+
+**根因：** Monitor 给 CrossEx 的 `opportunities-v2` 只发布在 Binance 有已验证 COIN 永续合约的币种，用来防止同名不同币被配成一对。CrossEx 持仓表的资金费率只从这份行情中取，所以 Binance 没上线的新币（Bybit/OKX 新上的 AXIS）两条腿都没有费率，显示「—」；账户里已结算的资金费照常显示，问题不明显。
+
+**以后做法：** 已持有的合约以交易所账户返回的合约代码为准，按原生合约元数据核验身份后，直接读该交易所的公开数据；开仓发现继续保留跨所身份门槛。持仓侧读取在后台进行，页面读取不等待外部 IO；失败只保留旧值到来源时效截止，不用其他来源补齐。按持仓逐个读取时：并发槽位按单调递增的轮次轮转，不能每轮从列表头分配、不能固定截断列表，也不能按墙钟尝试时间排序（本地时钟回退后同样会饿死尾部）；来源时间落在未来的缓存值不能挡住新读取；全量元数据端点（如 Binance `fundingInfo`）在多个合约间共享短期快照；418/429 在身份解析之前就按交易所冷却，并行请求中任一腿限流都要上报；字段优先级沿用 Monitor 已有口径（Bybit ticker 的 `fundingIntervalHour` 优先于合约元数据）。
+
+**如何验证：** [持仓资金费测试](modules/crossex/tests/position-funding.test.mjs) 覆盖 Monitor 行情不含该合约时仍读到费率、70 个合约慢读取下轮转全覆盖、时钟回退一小时后的轮转与缓存替换、限流暂停不触发身份解析、刷新频率、失败保留期限、并发上限与停止；[资金费客户端测试](modules/crossex/tests/funding-client.test.mjs) 覆盖原生身份、Bybit 周期优先级、`fundingInfo` 一分钟共享、限流冷却及 429 不被并行 503 遮蔽、Lighter 快照与身份无效时不发请求；[工作台嵌入测试](tests/embedded-funding.test.mjs) 从真实入口读取持仓费率。
+
+**证据：** project-aggregation 基线 `8da1d5a` 的 [Monitor 投影](modules/monitor/server/perpetual-opportunities-v2.mjs) 第 50–53 行，以及 CrossEx [旧持仓费率路径](modules/crossex/server/funding-opportunities.mjs)。2026-10-25 用户截图显示 AXIS 两条腿资金费率为「—」，同屏 ORDER 正常；公开接口核实 Binance 没有 AXISUSDT（`Invalid symbol`），而 ORDERUSDT 是 COIN 永续合约，Bybit 和 OKX 的 AXIS 资金费数据正常。两轮独立审查用内存探针复现了调度饥饿（含时钟回退）、列表截断、Bybit 周期、`fundingInfo` 额度、未来缓存值、冷却绕过与 429 被遮蔽等问题，均已修复；对应测试经变异检查，在还原单处修复后失败。
+
+**事件记录：** `crossex-held-funding-binance-gate-20261025`；实际发生日期 2026-10-25（Asia/Shanghai）；不推进全历史复盘检查点。

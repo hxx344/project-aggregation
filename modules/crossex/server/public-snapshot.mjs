@@ -5,8 +5,8 @@ export function publicSnapshot({ source, WebSocketImpl, subscription, accept, ti
   if (!['wss://futures.kraken.com/ws/v1', 'wss://mainnet.zklighter.elliot.ai/stream?readonly=true'].includes(source)) throw new AppError('不支持的公开盘口来源');
   const validSubscription = source.includes('kraken.com')
     ? Object.keys(subscription).length === 3 && subscription.event === 'subscribe' && subscription.feed === 'book' && Array.isArray(subscription.product_ids) && subscription.product_ids.length === 1 && /^PF_[A-Z0-9]{1,30}USD$/.test(subscription.product_ids[0])
-    : Object.keys(subscription).length === 2 && subscription.type === 'subscribe' && /^order_book\/\d{1,8}$/.test(subscription.channel);
-  if (!validSubscription) throw new AppError('仅允许订阅公开盘口');
+    : Object.keys(subscription).length === 2 && subscription.type === 'subscribe' && /^(?:order_book|market_stats)\/\d{1,8}$/.test(subscription.channel);
+  if (!validSubscription) throw new AppError('仅允许订阅公开盘口或市场统计');
   return new Promise((resolve, reject) => {
     const socket = new WebSocketImpl(source, { handshakeTimeout: timeoutMs, maxPayload: 8 * 1024 * 1024, perMessageDeflate: false, followRedirects: false });
     let done = false;
