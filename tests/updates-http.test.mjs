@@ -54,11 +54,20 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
   await new Promise(resolve => live.server.listen(0, '127.0.0.1', resolve));
   let origin = `http://127.0.0.1:${live.server.address().port}`;
   t.after(async () => {
-    await live.close();
+    clearJobs(); await live.close();
     const target = path.resolve(dataDir); assert.equal(path.dirname(target), path.resolve(os.tmpdir()));
     assert.ok(path.basename(target).startsWith('hub-updates-http-')); await rm(target, { recursive: true, force: true });
   });
+  // The coordinator's idle check reads execution_jobs, so the scripted jobs are
+  // written there before each request, and removed before the executor, which
+  // would pause them, is closed.
+  function writeJobs(values = jobs) {
+    const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
+    try { db.exec('DELETE FROM execution_jobs'); for (const value of values) db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)').run(value.id, JSON.stringify(value)); } finally { db.close(); }
+  }
+  const clearJobs = () => writeJobs([]);
   async function request(route, { method = 'GET', body, auth = true, originHeader = origin, csrfHeader = current?.csrf } = {}) {
+    writeJobs();
     const response = await fetch(origin + route, { method, headers: {
       ...(auth && current ? { Cookie: current.cookie } : {}), ...(originHeader ? { Origin: originHeader } : {}),
       ...(csrfHeader ? { 'X-CSRF-Token': csrfHeader } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
@@ -78,7 +87,7 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
     try { return db.prepare('SELECT value FROM settings WHERE key=?').get('updates-pending-plan')?.value || null; } finally { db.close(); }
   }
   async function restartApp() {
-    await live.close();
+    clearJobs(); await live.close();
     live = await createApp({ dataDir, refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0,
       executionIntervalMs: 0, updatesClient, secureCookies: false, publicOrigin: '', logger: () => {} });
     await new Promise(resolve => live.server.listen(0, '127.0.0.1', resolve));

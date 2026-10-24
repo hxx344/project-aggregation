@@ -87,6 +87,8 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
         const capabilities = await readCapabilities(controller.signal);
         if (closed) return null;
         const value = { ...current(), capabilities }, at = Date.parse(value.observedAt), bucket = bucketOf(at);
+        // A runtime without the API's stream count (until P1-4) writes no sample rather than an invalid one.
+        if (value.sse.activeConnections === null) { lastError = { code: 'sse_unavailable', at: value.observedAt }; return null; }
         if (newest.get().last > bucket) { lastError = { code: 'clock_regressed', at: new Date(at).toISOString() }; return null; }
         const json = JSON.stringify(value);
         if (Buffer.byteLength(json) > 16 * 1024) throw new Error('Baseline sample exceeds limit');

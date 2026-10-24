@@ -4,7 +4,8 @@ import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createApiServer } from '../server/api/server.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { createApiServer, supervisorTransports } from '../server/api/server.mjs';
 import { openHubDatabase, seedProjects } from '../server/control/schema.mjs';
 import { createControlStore } from '../server/control/store.mjs';
 import { createProjectCatalog } from '../server/control/projects.mjs';
@@ -12,6 +13,7 @@ import { ensurePassword } from '../server/control/password.mjs';
 import { createRuntimeService } from '../server/runtime/service.mjs';
 import { createInProcessClient } from '../server/runtime/supervisor-client.mjs';
 import { createDataPlane } from '../server/runtime/data-plane.mjs';
+import { createExecutionJobsReader } from '../server/control/execution-jobs.mjs';
 
 const PASSWORD = 'test-password-not-a-real-secret';
 const generatedAt = '2026-10-24T00:00:00.000Z';
@@ -180,4 +182,26 @@ test('the API heartbeat ends streams whose session is gone without any runtime p
 
 test('the data plane refuses to start without a source for the open stream count', () => {
   assert.throws(() => createDataPlane({}), { name: 'TypeError', message: 'Data plane needs readConnections()' });
+});
+
+test('the split API asks the supervisor for module transports and keeps moduleTransport()\'s checks', async () => {
+  const asked = [], transport = { moduleId: 'monitor', socketPath: '/run/monitor.sock', secret: 's'.repeat(43), instanceId: null, generation: 1 };
+  const resolve = supervisorTransports({ resolveTransport: async id => { asked.push(id); return transport; } });
+  assert.equal(await resolve(new URL('http://127.0.0.1:3000/api')), null);
+  assert.equal(await resolve(new URL('http://monitor.workspace.internal/')), transport);
+  for (const value of ['http://user@monitor.workspace.internal/', 'http://monitor.workspace.internal:8080/', 'https://monitor.workspace.internal/', 'http://other.workspace.internal/', 'http://constructor.workspace.internal/']) {
+    await assert.rejects(resolve(new URL(value)), { message: 'Embedded module is unavailable' }, value);
+  }
+  assert.deepEqual(asked, ['monitor']);
+});
+
+test('the idle check reads job states from the database and counts unreadable rows as unfinished', () => {
+  const db = new DatabaseSync(':memory:');
+  const reader = createExecutionJobsReader(db);
+  assert.deepEqual(reader.state(), { jobs: [] }, 'no table until the executor created it');
+  db.exec('CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL)');
+  const insert = db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)');
+  insert.run('a', JSON.stringify({ status: 'completed', plan: {} })); insert.run('b', '{'); insert.run('c', '{}');
+  assert.deepEqual(reader.state().jobs.map(job => job.status), ['completed', 'unknown', 'unknown']);
+  db.close();
 });

@@ -366,6 +366,29 @@ test('maintenance syncs run one at a time and each reads the durable flag when i
   assert.deepEqual(events, ['start:false', 'done:false', 'start:true', 'done:true']);
 });
 
+test('an ifIdle maintenance sync is skipped while another one is queued or running', async () => {
+  let release, calls = 0;
+  const held = new Promise(resolve => { release = resolve; });
+  const guard = { async setMaintenance() { calls += 1; await held; }, prepareApply: async () => {} };
+  const service = createRuntimeService({ guard, readMaintenance: () => false });
+  const running = service.syncMaintenance(['crossex']);
+  assert.equal(await service.syncMaintenance(['aster'], { ifIdle: true }), null);
+  // Also while a second call is queued behind the running one.
+  const queued = service.syncMaintenance(['greeks']);
+  assert.equal(await service.syncMaintenance(['aster'], { ifIdle: true }), null);
+  release(); await running; await queued;
+  assert.deepEqual(await service.syncMaintenance(['aster'], { ifIdle: true }), { active: false, modules: [{ id: 'aster', confirmed: true }] });
+  assert.equal(calls, 3);
+});
+
+test('a maintenance sync whose durable read failed does not keep later ifIdle calls skipped', async () => {
+  let fail = true;
+  const guard = { setMaintenance: async () => {}, prepareApply: async () => {} };
+  const service = createRuntimeService({ guard, readMaintenance: () => { if (fail) { fail = false; throw new Error('database closed'); } return false; } });
+  await assert.rejects(service.syncMaintenance(['crossex']), /database closed/);
+  assert.deepEqual(await service.syncMaintenance(['crossex'], { ifIdle: true }), { active: false, modules: [{ id: 'crossex', confirmed: true }] });
+});
+
 test('socket client reports a write whose 200 reply fails validation as uncertain', { skip: windows }, async t => {
   const { dir } = await scripted(t, (req, res) => { req.resume(); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('[]'); });
   const client = createSocketClient({ dir });

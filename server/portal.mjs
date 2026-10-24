@@ -76,7 +76,7 @@ function framePolicy(value, hubOrigin) {
  * Client cancellation never cancels that shared background promise.
  * createLaunch is called only by the authenticated, CSRF-protected hub API.
  */
-export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
+export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function')) throw new Error('项目代理需要项目、版本和会话校验回调');
   const tickets = new Map(); const grants = new Map(); const active = new Set(); const syncFlights = new Map();
   let closed = false;
@@ -220,7 +220,7 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
   }
   async function targetFor(project) {
     const base = new URL(validateUrl(project.apiUrl, { api: true }));
-    const transport = moduleTransport(base);
+    const transport = await resolveTransport(base, project);
     if (transport) return { base, transport, address: { address: '127.0.0.1', family: 4 }, authOrigin: base.origin };
     const hostname = base.hostname.replace(/^\[|\]$/g, '');
     let timer;

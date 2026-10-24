@@ -34,7 +34,8 @@ export function resolveWarmup({ warmupEnabled = process.env.WARMUP_ENABLED !== '
 // sync and the baseline. It owns the `snapshots` table and only reads the
 // control tables. Business routes reach it through handle() after the API has
 // checked the session, origin and CSRF token. `readConnections` returns the
-// API's open overview stream count for the baseline.
+// API's open overview stream count for the baseline, or null where the API runs
+// in another process (the baseline then skips its samples until P1-4).
 export function createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir, log, accountWriter = null, readConnections,
   refreshInterval = 30000, timeoutMs = 5000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset,
   assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow,

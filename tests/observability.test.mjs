@@ -135,3 +135,11 @@ test('synchronous observation failure does not pin the sampler to a completed pr
   assert.ok(await f.baseline.sample()); assert.equal(f.baseline.read().sampling.retainedBuckets, 1);
   for (const value of [-1, 0.5, 999, NaN, Infinity, 2_147_483_648]) assert.throws(() => validateBaselineInterval(value), /interval/);
 });
+
+test('a runtime that cannot count the API streams records no sample and reports why', async t => {
+  const f = fixture(t, { readSnapshot: () => ({ projects: [source()], sseConnections: null }) });
+  assert.equal(await f.baseline.sample(), null);
+  const read = f.baseline.read();
+  assert.equal(read.sampling.retainedBuckets, 0); assert.equal(read.sampling.storedBuckets, 0);
+  assert.deepEqual(read.sampling.lastError, { code: 'sse_unavailable', at: new Date(time).toISOString() });
+});

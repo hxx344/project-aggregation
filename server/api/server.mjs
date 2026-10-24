@@ -10,6 +10,7 @@ import { createStaticResponder } from '../static-response.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from '../updates.mjs';
 import { createUpdateStream } from '../update-stream.mjs';
 import { moduleIds } from '../modules/catalog.mjs';
+import { moduleOrigin } from '../modules/transport.mjs';
 import { tradingModules } from '../modules/updates.mjs';
 import { RuntimeError, UNAVAILABLE } from '../runtime/protocol.mjs';
 import { coordinatorHooks } from '../runtime/supervisor-client.mjs';
@@ -46,8 +47,21 @@ const OVERVIEW_HEARTBEAT_MS = 15_000, RUNTIME_STALE_MS = 30_000, NOTICE_RETRY_MS
 // What the API shows while it has not heard from the runtime for RUNTIME_STALE_MS.
 const staleOverview = overview => ({ ...overview, projects: overview.projects.map(item => ({ ...item, state: 'stale', message: UNAVAILABLE })) });
 
+// When the API runs in its own process the module transports are registered in
+// the runtime's, so the Portal asks the supervisor on every request: a restarted
+// module comes back with a new socket and secret. Same checks as moduleTransport().
+export function supervisorTransports(supervisor) {
+  const suffix = '.workspace.internal';
+  return async base => {
+    if (!base.hostname.endsWith(suffix)) return null;
+    const id = base.hostname.slice(0, -suffix.length);
+    if (base.username || base.password || !moduleIds.includes(id) || base.origin !== moduleOrigin(id)) throw new Error('Embedded module is unavailable');
+    return supervisor.resolveTransport(id);
+  };
+}
+
 export function createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime, executionJobs, readMaintenance,
-  updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits(),
+  updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits(), resolveTransport,
   overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS }) {
   const { loginWindowMs, accountLockoutMs } = loginLimits;
   const { getSetting, setSetting, sessions, projects } = control;
@@ -124,6 +138,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   const notify = (id, change) => runtime.projectChanged(id, change).catch(error => retryNotice(id, change, 1, error));
   const portal = createPortal({
     ...(embeddedModules ? { withMutation: updates.withExecutionEntry } : {}),
+    ...(resolveTransport ? { resolveTransport } : {}),
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
     getProjectRevision: projectRevision,
     isSessionValid: sessions.isActive,
@@ -177,6 +192,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   async function api(req, res, url) {
     const pathname = url.pathname;
     if (pathname === '/api/health' && req.method === 'GET') { send(res, 200, { status: 'ok' }); return; }
+    // Ready once a compatible runtime reports ready; a probe learns nothing more.
+    if (pathname === '/api/ready' && req.method === 'GET') {
+      const ready = !closed && (await supervisor.status().catch(() => null))?.ready === true;
+      send(res, ready ? 200 : 503, { ready }); return;
+    }
     const current = session(req);
     if (pathname === '/api/session' && req.method === 'GET') { send(res, 200, current ? { authenticated: true, csrfToken: current.csrf } : { authenticated: false }); return; }
     if (pathname === '/api/login' && req.method === 'POST') {

@@ -7,9 +7,9 @@ export const tradingModules = Object.freeze(['crossex', 'greeks', 'aster']);
 const names = { crossex: 'Gate CrossEx', greeks: 'Greeks', aster: 'Aster 5x' };
 export function createModuleUpdateGuard({ request = requestJson } = {}) {
   /** Rejects with `failed` listing every module that did not acknowledge `active`. */
-  async function setMaintenance(active, ids = tradingModules) {
+  async function setMaintenance(active, ids = tradingModules, { deadlineMs = 10_000 } = {}) {
     const results = await Promise.allSettled(ids.map(id => request(moduleOrigin(id), '/__workspace/maintenance', {
-      method: 'POST', body: { active }, deadline: Date.now() + 10_000,
+      method: 'POST', body: { active }, deadline: Date.now() + deadlineMs,
     })));
     const failed = ids.filter((_, index) => results[index].status === 'rejected' || results[index].value?.data?.active !== active);
     if (failed.length) throw Object.assign(new UpdateError(503, '内嵌交易模块的维护状态尚未确认，请重试'), { failed });
