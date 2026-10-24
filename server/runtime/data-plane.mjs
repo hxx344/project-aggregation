@@ -21,6 +21,10 @@ import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 
 const respond = errorResponder([HttpError, TradingError, ExecutionError, UpdateError, RuntimeError]);
+// The API reports every 15 s; a sample needs a report at most this old (design doc 5.8).
+export const API_STATS_MAX_AGE_MS = 60_000;
+// API instances whose counts are kept; the least recently reported is dropped first.
+const API_STATS_INSTANCES = 16;
 
 // Warmup settings with the environment defaults; createApp resolves them before opening any file.
 export function resolveWarmup({ warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','),
@@ -34,17 +38,15 @@ export function resolveWarmup({ warmupEnabled = process.env.WARMUP_ENABLED !== '
 // snapshots, the overview projection, trading data, native execution, asset
 // sync and the baseline. It owns the `snapshots` table and only reads the
 // control tables. Business routes reach it through handle() after the API has
-// checked the session, origin and CSRF token. `readConnections` returns the
-// API's open overview stream count for the baseline, or null where the API runs
-// in another process (the baseline then skips its samples until P1-4).
-export function createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir, log, accountWriter = null, readConnections,
+// checked the session, origin and CSRF token. The API reports its overview
+// stream counts through reportApiStats() (design doc 5.8).
+export function createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir, log, accountWriter = null,
   refreshInterval = 30000, timeoutMs = 5000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset,
   assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow,
   assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, assetFillsBackgroundMs = assetSyncIntervalMs > 0 ? ASSET_FILLS_BACKGROUND_MS : 0,
   tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs,
   executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now,
   warmup = resolveWarmup(), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson }) {
-  if (typeof readConnections !== 'function') throw new TypeError('Data plane needs readConnections()');
   validateBaselineInterval(baselineIntervalMs);
   const { stmt, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
@@ -59,6 +61,29 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // Overview subscribers; wants() lets an in-process subscriber skip the projection while nobody listens.
   const subscribers = new Set();
   let baseline = null, closed = false, overviewRevision = 0;
+  // The latest stream counts of each API instance, with their arrival time.
+  // A report older than the instance's last one is dropped. Slow consumers are
+  // counted by difference per instance, so a restarted API counts from zero;
+  // those reported before the baseline starts are kept. An instance's first
+  // report to this runtime, or its first after it was dropped as the least
+  // recently reported, counts its whole total.
+  const apiStats = new Map(); let slowConsumers = 0;
+  function reportApiStats({ instanceId, sequence, activeConnections, slowConsumerDisconnects }) {
+    const previous = apiStats.get(instanceId);
+    if (previous && sequence <= previous.sequence) return;
+    slowConsumers += Math.max(0, slowConsumerDisconnects - (previous?.slowConsumerDisconnects ?? 0));
+    if (baseline && slowConsumers) { baseline.observeSlowConsumer(slowConsumers); slowConsumers = 0; }
+    apiStats.delete(instanceId);
+    apiStats.set(instanceId, { sequence, activeConnections, slowConsumerDisconnects, at: baselineNow() });
+    if (apiStats.size > API_STATS_INSTANCES) apiStats.delete(apiStats.keys().next().value);
+  }
+  // The open streams of the instances that reported within API_STATS_MAX_AGE_MS;
+  // with none, the count is unknown and the baseline skips that minute.
+  function readConnections() {
+    let total = null;
+    for (const stats of apiStats.values()) if (baselineNow() - stats.at <= API_STATS_MAX_AGE_MS) total = (total ?? 0) + stats.activeConnections;
+    return total;
+  }
   async function observedSummary(...args) {
     const start = performance.now();
     try { const value = await summaryReader(...args); baseline?.observeSummary(true, performance.now() - start); return value; }
@@ -295,7 +320,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     subscribeOverview(subscriber) { subscribers.add(subscriber); return () => subscribers.delete(subscriber); },
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
-    observeSlowConsumer() { baseline?.observeSlowConsumer(); },
+    reportApiStats,
     initialize: () => { executionEntries.clear(); return execution.initializeProtection(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
@@ -303,6 +328,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
           snapshot: states.get(project.id) || (() => { const saved = stmt.prepare('SELECT json FROM snapshots WHERE id=?').get(project.id); return saved ? JSON.parse(saved.json) : null; })(),
         })) }),
       });
+      if (slowConsumers) { baseline.observeSlowConsumer(slowConsumers); slowConsumers = 0; }
       baseline.start();
     },
     // stop() ends the timers at once; close() then releases every service.

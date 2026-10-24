@@ -25,6 +25,9 @@ export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime 
   // `ifIdle` skips the call (null) while another one is queued or running: that
   // one sends the current durable value. `deadlineMs` shortens the per-module
   // deadline, so an API sync queued behind this one still fits its budget.
+  // Each row names the module generation the sync started with, so the API
+  // can tell when a later instance has not taken the value yet.
+  const generations = () => Object.fromEntries((moduleRuntime?.status() ?? []).map(row => [row.moduleId, row.generation]));
   let syncs = Promise.resolve(), queued = 0;
   function syncMaintenance(ids, { ifIdle = false, deadlineMs } = {}) {
     const modules = validateMaintenanceIds(ids);
@@ -32,11 +35,11 @@ export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime 
     if (ifIdle && queued) return Promise.resolve(null);
     queued += 1;
     const run = syncs.then(async () => {
-      const active = readMaintenance() === true;
+      const active = readMaintenance() === true, started = generations();
       let failed = [];
       try { await guard.setMaintenance(active, modules, { deadlineMs }); }
       catch (error) { failed = Array.isArray(error?.failed) ? error.failed : modules; }
-      return { active, modules: modules.map(id => ({ id, confirmed: !failed.includes(id) })) };
+      return { active, modules: modules.map(id => ({ id, confirmed: !failed.includes(id), generation: started[id] ?? null })) };
     }).finally(() => { queued -= 1; });
     syncs = run.catch(() => {});
     return run;

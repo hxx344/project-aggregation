@@ -9,8 +9,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { moduleIds } from '../server/modules/catalog.mjs';
 import { registerModuleTransport } from '../server/modules/transport.mjs';
-import { UpdateError } from '../server/updates.mjs';
-import { createSecret, ensureRuntimeDir, MAX_REQUEST_BYTES, PROTOCOL_VERSION, readDiscovery, removeDiscovery, removeStaleRuntimeFiles, RUNTIME_KEY_HEADER, RuntimeError, socketPathFor, writeDiscovery } from '../server/runtime/protocol.mjs';
+import { UpdateError, createUpdateCoordinator } from '../server/updates.mjs';
+import { createSecret, ensureRuntimeDir, MAX_REQUEST_BYTES, PROTOCOL_VERSION, readDiscovery, removeDiscovery, removeStaleRuntimeFiles, RUNTIME_KEY_HEADER, RuntimeError, socketPathFor, validateSync, writeDiscovery } from '../server/runtime/protocol.mjs';
 import { createRuntimeService } from '../server/runtime/service.mjs';
 import { createInternalHandler, startInternalServer } from '../server/runtime/internal-server.mjs';
 import { coordinatorHooks, createInProcessClient, createSocketClient } from '../server/runtime/supervisor-client.mjs';
@@ -94,7 +94,7 @@ for (const [name, connect] of Object.entries(implementations)) {
     const { state, service } = runtime();
     const client = await connect(t, service);
     state.maintenance = true; state.failing = ['greeks'];
-    assert.deepEqual(await client.syncMaintenance(['crossex', 'greeks']), { active: true, modules: [{ id: 'crossex', confirmed: true }, { id: 'greeks', confirmed: false }] });
+    assert.deepEqual(await client.syncMaintenance(['crossex', 'greeks']), { active: true, modules: [{ id: 'crossex', confirmed: true, generation: 2 }, { id: 'greeks', confirmed: false, generation: 2 }] });
     assert.deepEqual(state.syncCalls, [{ active: true, ids: ['crossex', 'greeks'] }]);
     for (const ids of [[], ['monitor'], ['crossex', 'crossex'], 'crossex', null]) {
       await assert.rejects(client.syncMaintenance(ids), error => error.status === 400, JSON.stringify(ids));
@@ -142,7 +142,56 @@ for (const [name, connect] of Object.entries(implementations)) {
     state.prepare = async () => { throw new UpdateError(503, '无法确认 Greeks 的委托状态，请稍后重试'); };
     await assert.rejects(hooks.prepareApply(), error => error instanceof UpdateError && error.status === 503 && error.message === '无法确认 Greeks 的委托状态，请稍后重试' && !error.uncertain);
   });
+
+  test(`${name}: maintenance syncs name the module generation they started with, also when a module fails`, async t => {
+    const { state, service } = runtime();
+    const client = await connect(t, service);
+    state.rows = moduleIds.map(id => row(id, 'ready', { generation: id === 'aster' ? 7 : 3 }));
+    assert.deepEqual((await client.syncMaintenance(['crossex', 'aster'])).modules, [{ id: 'crossex', confirmed: true, generation: 3 }, { id: 'aster', confirmed: true, generation: 7 }]);
+    const hooks = coordinatorHooks(client);
+    assert.deepEqual(await hooks.setModuleMaintenance(false, ['crossex', 'aster']), { generations: { crossex: 3, aster: 7 } });
+    state.failing = ['aster'];
+    await assert.rejects(hooks.setModuleMaintenance(false, ['crossex', 'aster']), error => error.failed.join() === 'aster' && error.generations.crossex === 3);
+  });
 }
+
+test('a sync reply without generations reads as unknown, and an invalid generation is refused', () => {
+  const reply = generation => ({ active: false, modules: [{ id: 'crossex', confirmed: true, ...(generation === undefined ? {} : { generation }) }] });
+  assert.deepEqual(validateSync(reply(undefined), ['crossex']).modules, [{ id: 'crossex', confirmed: true, generation: null }]);
+  assert.equal(validateSync(reply(null), ['crossex']).modules[0].generation, null);
+  for (const invalid of [-1, 1.5, '2', {}]) assert.throws(() => validateSync(reply(invalid), ['crossex']), error => error instanceof RuntimeError, String(invalid));
+});
+
+test('the coordinator takes a trading module whose generation changed through maintenance again', async t => {
+  const { state, service } = runtime();
+  const hooks = coordinatorHooks(createInProcessClient(service));
+  const coordinator = createUpdateCoordinator({ client: {}, execution: { state: () => ({ jobs: [] }), openEntries: () => 0, transaction: fn => fn() },
+    setModuleMaintenance: hooks.setModuleMaintenance, tradingModules: ['crossex', 'greeks', 'aster'], moduleIds, releasePollMs: 0 });
+  t.after(() => coordinator.close());
+  const rows = generation => moduleIds.map(id => row(id, 'ready', { generation: id === 'greeks' ? generation : 2 }));
+  state.rows = rows(2);
+  await coordinator.initialize();
+  assert.equal(state.syncCalls.length, 1);
+  coordinator.observeModules(rows(2));
+  assert.equal(state.syncCalls.length, 1, 'the instance that acknowledged is still running');
+  // Greeks restarted in maintenance and its acknowledgement fails at first.
+  state.rows = rows(3); state.failing = ['greeks'];
+  coordinator.observeModules(state.rows);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(state.syncCalls.at(-1).ids, ['greeks'], 'only the restarted module is synchronized');
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(coordinator.moduleMaintenance().greeks.confirmed, false);
+  assert.equal(coordinator.moduleMaintenance().crossex.confirmed, true);
+  // An unknown generation (the failed sync) is not compared until a sync succeeds.
+  const calls = state.syncCalls.length;
+  coordinator.observeModules(state.rows);
+  assert.equal(state.syncCalls.length, calls);
+  state.failing = [];
+  await coordinator.resynchronize('greeks');
+  assert.equal(coordinator.moduleMaintenance().greeks.confirmed, true);
+  coordinator.observeModules(state.rows);
+  assert.equal(state.syncCalls.length, calls + 1);
+});
 
 test('a runtime without modules reports them disabled and refuses module operations', async () => {
   const client = createInProcessClient(createRuntimeService({ readMaintenance: () => false }));
@@ -257,7 +306,7 @@ test('socket client re-resolves a replaced runtime for reads but never retries w
   t.after(() => server.close());
   await assert.rejects(client.syncMaintenance(['crossex']), error => error.origin === 'transport' && !error.uncertain);
   assert.deepEqual(c.state.syncCalls, [], 'the failed write was not sent to the replacement');
-  assert.deepEqual(await client.syncMaintenance(['crossex']), { active: false, modules: [{ id: 'crossex', confirmed: true }] });
+  assert.deepEqual(await client.syncMaintenance(['crossex']), { active: false, modules: [{ id: 'crossex', confirmed: true, generation: 2 }] });
   assert.equal(c.state.syncCalls.length, 1);
 });
 
@@ -377,7 +426,7 @@ test('an ifIdle maintenance sync is skipped while another one is queued or runni
   const queued = service.syncMaintenance(['greeks']);
   assert.equal(await service.syncMaintenance(['aster'], { ifIdle: true }), null);
   release(); await running; await queued;
-  assert.deepEqual(await service.syncMaintenance(['aster'], { ifIdle: true }), { active: false, modules: [{ id: 'aster', confirmed: true }] });
+  assert.deepEqual(await service.syncMaintenance(['aster'], { ifIdle: true }), { active: false, modules: [{ id: 'aster', confirmed: true, generation: null }] });
   assert.equal(calls, 3);
 });
 
@@ -386,7 +435,7 @@ test('a maintenance sync whose durable read failed does not keep later ifIdle ca
   const guard = { setMaintenance: async () => {}, prepareApply: async () => {} };
   const service = createRuntimeService({ guard, readMaintenance: () => { if (fail) { fail = false; throw new Error('database closed'); } return false; } });
   await assert.rejects(service.syncMaintenance(['crossex']), /database closed/);
-  assert.deepEqual(await service.syncMaintenance(['crossex'], { ifIdle: true }), { active: false, modules: [{ id: 'crossex', confirmed: true }] });
+  assert.deepEqual(await service.syncMaintenance(['crossex'], { ifIdle: true }), { active: false, modules: [{ id: 'crossex', confirmed: true, generation: null }] });
 });
 
 test('socket client reports a write whose 200 reply fails validation as uncertain', { skip: windows }, async t => {

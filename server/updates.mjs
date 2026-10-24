@@ -187,18 +187,21 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
   let moduleSync = Promise.resolve(), watcher = null, polling = null, closed = false;
   // The maintenance value each trading module last acknowledged; null is unknown.
-  const acknowledged = new Map(tradingModules.map(id => [id, null])), releasedAt = new Map();
+  // `instances` holds the module generation that acknowledged it, where the
+  // runtime reports one (observeModules).
+  const acknowledged = new Map(tradingModules.map(id => [id, null])), releasedAt = new Map(), instances = new Map();
   const confirmed = id => acknowledged.get(id) === maintenance;
   // Rejects when any module fails, so initialize() and apply() stay all-or-nothing.
   const synchronizeModules = (ids = tradingModules) => {
     const next = moduleSync.catch(() => {}).then(async () => {
       const active = maintenance;
-      let failed = [];
-      try { await setModuleMaintenance(active, ids); }
-      catch (error) { failed = Array.isArray(error?.failed) ? error.failed : ids; throw error; }
+      let failed = [], reported = {};
+      try { reported = (await setModuleMaintenance(active, ids))?.generations ?? {}; }
+      catch (error) { failed = Array.isArray(error?.failed) ? error.failed : ids; reported = error?.generations ?? {}; throw error; }
       finally {
         for (const id of ids) {
           const value = failed.includes(id) ? null : active;
+          if (value !== null && Number.isSafeInteger(reported[id])) instances.set(id, reported[id]); else instances.delete(id);
           if (value === false && acknowledged.get(id) !== false) releasedAt.set(id, new Date(now()).toISOString());
           if (value !== false) releasedAt.delete(id);
           acknowledged.set(id, value);
@@ -337,10 +340,21 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     for (const module of ids) { acknowledged.set(module, null); releasedAt.delete(module); }
     return synchronizeModules(ids).catch(() => {});
   }
+  // Module rows of the runtime's status. A trading module whose generation
+  // differs from the one that acknowledged the value is a later instance that
+  // started in maintenance: it is unconfirmed until synchronized again. A new
+  // runtime may reuse a generation; the caller reads these rows through
+  // status(), whose instance change resynchronizes every trading module.
+  function observeModules(rows) {
+    for (const row of rows) {
+      const known = instances.get(row.moduleId);
+      if (known !== undefined && known !== row.generation) { instances.delete(row.moduleId); void resynchronize(row.moduleId); }
+    }
+  }
   /** Per trading module: whether its gate matches the durable value, and when it was last released. */
   function moduleMaintenance() {
     return Object.fromEntries(tradingModules.map(id => [id, { confirmed: confirmed(id), maintenance, releasedAt: releasedAt.get(id) ?? null }]));
   }
   async function close() { closed = true; clearTimeout(watcher); await polling; }
-  return { status, check, apply, token, withExecutionEntry, initialize: () => synchronizeModules(), resynchronize, moduleMaintenance, close };
+  return { status, check, apply, token, withExecutionEntry, initialize: () => synchronizeModules(), resynchronize, observeModules, moduleMaintenance, close };
 }

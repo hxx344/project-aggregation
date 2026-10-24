@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { chmodSync, rmSync } from 'node:fs';
 import { createSecret, ensureRuntimeDir, equalSecret, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, removeDiscovery, removeStaleRuntimeFiles, RUNTIME_KEY_HEADER, RuntimeError, socketPathFor, writeDiscovery } from './protocol.mjs';
-import { DEADLINE_HEADER, FORWARD_PREFIX, METHOD_HEADER, SESSION_HEADER, validateChange, validateForward, validateProjectId, validateRevision } from './data-client.mjs';
+import { DEADLINE_HEADER, FORWARD_PREFIX, METHOD_HEADER, SESSION_HEADER, validateApiStats, validateChange, validateForward, validateProjectId, validateRevision } from './data-client.mjs';
 
 const windows = process.platform === 'win32';
 const json = (res, status, value) => {
@@ -20,8 +20,7 @@ async function readBody(req) {
 const MAX_EVENT_BACKLOG = 2 * MAX_RESPONSE_BYTES;
 const PROJECT = '([a-zA-Z0-9_-]{1,64})';
 
-// Routes of design doc 5.2. The data-plane routes exist when `dataPlane` is
-// given; api-stats arrives with P1-4.
+// Routes of design doc 5.2. The data-plane routes exist when `dataPlane` is given.
 export function createInternalHandler({ service, dataPlane = null, secret, logger = console }) {
   const routes = [
     ['GET', /^\/internal\/v1\/status$/, () => service.status()],
@@ -33,8 +32,7 @@ export function createInternalHandler({ service, dataPlane = null, secret, logge
       ['GET', /^\/internal\/v1\/overview$/, () => dataPlane.overview()],
       ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/changed$`), (body, id) => { dataPlane.projectChanged(validateProjectId(id), validateChange(body)); return { accepted: true }; }],
       ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/asset-sync$`), async (body, id) => ({ status: await dataPlane.coordinateAssetSync(validateProjectId(id), validateRevision(body?.revision)) })],
-      // Transitional until P1-4 reports the API's SSE counts as one record.
-      ['POST', /^\/internal\/v1\/overview\/slow-consumers$/, () => { dataPlane.observeSlowConsumer(); return { accepted: true }; }],
+      ['POST', /^\/internal\/v1\/api-stats$/, body => { dataPlane.reportApiStats(validateApiStats(body)); return { accepted: true }; }],
     ] : []),
   ];
   function events(res) {

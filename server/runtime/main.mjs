@@ -16,7 +16,7 @@ import { loadCredentialCipher } from './credentials.mjs';
 import { createRuntimeService } from './service.mjs';
 import { createDataPlane } from './data-plane.mjs';
 import { startInternalServer } from './internal-server.mjs';
-import { runtimeDir } from './protocol.mjs';
+import { ensureRuntimeDir, runtimeDir, socketPathFor } from './protocol.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // A restarted trading module that could not take the durable maintenance value
@@ -92,19 +92,22 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
       };
       void sync();
     };
-    modules = await launchModules({ dataDir: resolvedData, logger, writerContext, onStarting: handle => { moduleStartup = handle; }, onModuleReady, onFailure: fail });
+    // The API reaches the module sockets directly (Portal), so they live in the
+    // runtime directory. Its own socket path is checked before any module starts.
+    const runDir = ensureRuntimeDir(runtimeDir(resolvedData, env));
+    socketPathFor(runDir, randomUUID());
+    modules = await launchModules({ dataDir: resolvedData, socketDir: runDir, logger, writerContext, onStarting: handle => { moduleStartup = handle; }, onModuleReady, onFailure: fail });
     lock.assertHeld(); stopped();
     db = openHubDatabase(path.join(resolvedData, 'hub.sqlite'));
     const control = createControlStore(db);
     const readMaintenance = () => control.getSetting('updates-maintenance') === '1';
     service = createRuntimeService({ moduleRuntime: modules, guard: createModuleUpdateGuard(), readMaintenance, isReady: () => ready });
-    // The API's stream count is not reported yet (P1-4), so the baseline records nothing.
     dataPlane = createDataPlane({ db, control, catalog: createProjectCatalog({ control, embeddedModules: true, decrypt }), encrypt, decrypt, embeddedModules: true,
-      dataDir: resolvedData, log: logger, accountWriter, readConnections: () => null, ...dataPlaneOptions });
+      dataDir: resolvedData, log: logger, accountWriter, ...dataPlaneOptions });
     await dataPlane.initialize();
     lock.assertHeld(); stopped();
     dataPlane.startBaseline();
-    internal = await startInternalServer({ service, dataPlane, dir: runtimeDir(resolvedData, env), logger });
+    internal = await startInternalServer({ service, dataPlane, dir: runDir, logger });
     lock.assertHeld(); stopped();
     // From here a crashed module restarts alone instead of failing startup.
     modules.markStarted(); ready = true;

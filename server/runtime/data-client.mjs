@@ -19,6 +19,7 @@ export const FORWARD_BUDGET = 60_000, ASSET_SYNC_BUDGET = 60_000;
 export const MAX_FORWARD_REPLY_BYTES = 16 * 1024 * 1024;
 const REASONS = new Set(['created', 'updated', 'deleted', 'preferences']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function validateProjectId(id) {
   if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(id)) throw new RuntimeError(400, '项目标识无效');
@@ -40,6 +41,15 @@ export function validateForward(request) {
     || request.deadline !== undefined && !Number.isSafeInteger(request.deadline)
     || typeof (request.body?.[Symbol.asyncIterator] ?? request.body?.[Symbol.iterator]) !== 'function') throw new RuntimeError(400, '转发请求无效');
   return { method: request.method, target: request.target, sessionId: request.sessionId, contentType: request.contentType, deadline: request.deadline, body: request.body };
+}
+// The API's overview stream counts (design doc 5.8): open streams now, and
+// slow-consumer disconnects since that API instance started. `sequence` grows
+// with each report of an instance, so a late report cannot replace a newer one.
+export function validateApiStats(stats) {
+  if (!object(stats) || typeof stats.instanceId !== 'string' || !UUID.test(stats.instanceId) || !Number.isSafeInteger(stats.sequence) || stats.sequence < 1
+    || !Number.isSafeInteger(stats.activeConnections) || stats.activeConnections < 0 || stats.activeConnections > 10_000
+    || !Number.isSafeInteger(stats.slowConsumerDisconnects) || stats.slowConsumerDisconnects < 0) throw new RuntimeError(400, 'SSE 计数上报无效');
+  return { instanceId: stats.instanceId, sequence: stats.sequence, activeConnections: stats.activeConnections, slowConsumerDisconnects: stats.slowConsumerDisconnects };
 }
 export function validateOverview(value) {
   if (!object(value) || !Array.isArray(value.projects) || typeof value.generatedAt !== 'string') throw unavailable();
@@ -77,8 +87,7 @@ function contract(invoke, subscribe) {
       try { return await writeResult(invoke('forward', value), validateReply); }
       catch (error) { throw error instanceof RuntimeError && error.origin === 'transport' && error.uncertain ? unconfirmed() : error; }
     },
-    // Transitional: P1-4 reports the API's SSE counts, slow consumers included, as one record.
-    async observeSlowConsumer() { return writeResult(invoke('observeSlowConsumer'), validateAccepted); },
+    async reportApiStats(stats) { const value = validateApiStats(stats); return writeResult(invoke('reportApiStats', value), validateAccepted); },
   };
 }
 
@@ -90,7 +99,7 @@ export function createInProcessDataClient(dataPlane, { log }) {
     projectChanged: ({ id, reason, clearSnapshot }) => { dataPlane.projectChanged(id, { reason, clearSnapshot }); return { accepted: true }; },
     coordinateAssetSync: ({ id, revision }) => dataPlane.coordinateAssetSync(id, revision),
     forward: request => dataPlane.handle(request),
-    observeSlowConsumer: () => { dataPlane.observeSlowConsumer(); return { accepted: true }; },
+    reportApiStats: stats => { dataPlane.reportApiStats(stats); return { accepted: true }; },
   };
   return contract(async (name, argument) => {
     try { return await operations[name](argument); }
@@ -136,7 +145,7 @@ export function createSocketDataClient({ dir, protocols = SUPPORTED_PROTOCOLS, c
       if (!object(value) || !('status' in value)) throw unavailable(true);
       return value.status;
     },
-    observeSlowConsumer: () => call('/internal/v1/overview/slow-consumers', { body: {} }),
+    reportApiStats: stats => call('/internal/v1/api-stats', { body: stats }),
     forward: async request => {
       const deadline = Math.min(request.deadline ?? Infinity, Date.now() + budgets.forward);
       const content = await bufferBody(request.body);

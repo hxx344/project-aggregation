@@ -46,14 +46,13 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   // The API and the data plane share this process and talk only through these
   // clients; the separated entries use socket clients against the same contracts.
   const supervisor = createInProcessClient(createRuntimeService({ moduleRuntime, guard: embeddedModules ? createModuleUpdateGuard() : null, readMaintenance }), { log });
-  let api = null;
-  const dataPlane = createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir: resolvedData, log, accountWriter, readConnections: () => api?.streamCount() ?? 0,
+  const dataPlane = createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir: resolvedData, log, accountWriter,
     refreshInterval, timeoutMs, summaryReader, assetSyncIntervalMs, assetSyncReader,
     assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow, assetPositionsBackgroundMs, assetFillsBackgroundMs,
     tradingClientFactory, tradingRefreshIntervalMs, tradingNow, tradingTaskTimeoutMs, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs,
     executionClientFactory, executionIntervalMs, executionNow,
     warmup, baselineIntervalMs, baselineNow, capabilitiesRequest });
-  api = createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime: createInProcessDataClient(dataPlane, { log }), executionJobs: createExecutionJobsReader(db), readMaintenance,
+  const api = createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime: createInProcessDataClient(dataPlane, { log }), executionJobs: createExecutionJobsReader(db), readMaintenance,
     updatesClient, secureCookies, configuredOrigin, distDir, loginLimits });
   await dataPlane.initialize();
   await api.initialize();

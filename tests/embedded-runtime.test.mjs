@@ -175,6 +175,28 @@ test('supervisor readies all real workers on authenticated private pipes and clo
   await assert.rejects(readdir(transportDirectory(rows[0])), { code: 'ENOENT' });
 });
 
+test('given a socket directory, worker sockets live there, stale module directories go and a path too long to bind is refused', { timeout: 15000, skip: process.platform === 'win32' ? 'Windows workers use named pipes' : false }, async t => {
+  const f = await fixture(t);
+  const socketDir = path.join(f.directory, 'run');
+  await mkdir(path.join(socketDir, 'modules-AbC123'), { recursive: true, mode: 0o700 });
+  await writeFile(path.join(socketDir, 'modules-AbC123', 'monitor-1.sock'), '');
+  // The runtime's own socket and discovery record are not the supervisor's.
+  await writeFile(path.join(socketDir, 'runtime-other.sock'), '');
+  const runtime = await bounded(f.start({ socketDir }), 8000, 'startup');
+  const [directory, ...others] = (await readdir(socketDir)).filter(name => name.startsWith('modules-'));
+  assert.deepEqual(others, []); assert.notEqual(directory, 'modules-AbC123');
+  for (const id of moduleIds) {
+    assert.equal(path.dirname(registered(id).socketPath), path.join(socketDir, directory));
+    assert.equal((await request(registered(id))).status, 200);
+  }
+  await bounded(runtime.close(), 5000, 'shutdown');
+  assert.deepEqual(await readdir(socketDir), ['runtime-other.sock']);
+  const deep = path.join(f.directory, 'x'.repeat(80));
+  await mkdir(deep, { mode: 0o700 });
+  await assert.rejects(f.start({ socketDir: deep }), /模块 socket 路径可能超过 100 字节/);
+  assert.deepEqual(await readdir(deep), [], 'the refused directory is removed again');
+});
+
 test('concurrent close callers all await graceful shutdown and transport cleanup', { timeout: 15000 }, async t => {
   const f = await fixture(t, { closeDelay: 200 }), runtime = await f.start();
   const records = await f.records();

@@ -87,7 +87,7 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
         const capabilities = await readCapabilities(controller.signal);
         if (closed) return null;
         const value = { ...current(), capabilities }, at = Date.parse(value.observedAt), bucket = bucketOf(at);
-        // A runtime without the API's stream count (until P1-4) writes no sample rather than an invalid one.
+        // Without a current stream count from the API (design doc 5.8) the minute stays missing rather than invalid.
         if (value.sse.activeConnections === null) { lastError = { code: 'sse_unavailable', at: value.observedAt }; return null; }
         if (newest.get().last > bucket) { lastError = { code: 'clock_regressed', at: new Date(at).toISOString() }; return null; }
         const json = JSON.stringify(value);
@@ -107,7 +107,7 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
   }
   return { read, sample,
     observeSummary(success, durationMs) { if (closed) return; reads[success ? 'success' : 'failed']++; if (Number.isFinite(durationMs) && durationMs >= 0) { reads.durationMs += durationMs; reads.maxDurationMs = Math.max(reads.maxDurationMs, durationMs); } },
-    observeSlowConsumer() { if (!closed) slowConsumers++; },
+    observeSlowConsumer(count = 1) { if (!closed && Number.isSafeInteger(count) && count > 0) slowConsumers += count; },
     start() { if (closed || timer || intervalMs === 0) return; void sample(); timer = setInterval(() => void sample(), intervalMs); timer.unref(); },
     async close() { closed = true; clearInterval(timer); controller?.abort(); await pending; },
   };

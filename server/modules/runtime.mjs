@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 import { moduleCatalog, moduleDependencies } from './catalog.mjs';
 import { registerModuleTransport } from './transport.mjs';
+import { MAX_SOCKET_PATH_BYTES } from '../runtime/protocol.mjs';
 
 const repository = fileURLToPath(new URL('../..', import.meta.url));
 // Initial design values from docs/control-data-plane-separation.md section 4.2.
@@ -29,10 +30,20 @@ export function processStartTime(pid) {
   } catch { return null; }
 }
 
-export async function startModules({ dataDir, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, onModuleReady = () => {}, timeoutMs = 120_000, restartPolicy = {}, holdFaults = true, drainTimeoutMs = stopBudget, killGraceMs = 5000, probeMs = 100, random = Math.random, now = Date.now, startTime = processStartTime, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
+// Worker sockets go to a fresh directory in the system temp directory, or in
+// `socketDir` when the API runs in another process and must reach them there
+// (design doc 5.2). The caller of `socketDir` holds `.runtime.lock` and has
+// checked the directory, so `modules-*` directories left there are stale.
+export async function startModules({ dataDir, socketDir = null, root = repository, logger = console, onFailure = () => {}, onStarting = () => {}, onModuleReady = () => {}, timeoutMs = 120_000, restartPolicy = {}, holdFaults = true, drainTimeoutMs = stopBudget, killGraceMs = 5000, probeMs = 100, random = Math.random, now = Date.now, startTime = processStartTime, writerContext = { databasePath: path.join(path.resolve(dataDir), 'execution-control.sqlite'), runtimeId: randomUUID() } } = {}) {
   if (path.resolve(writerContext.databasePath) !== path.join(path.resolve(dataDir), 'execution-control.sqlite') || !/^[a-f0-9-]{36}$/.test(writerContext.runtimeId)) throw new Error('Invalid writer runtime context');
   const policy = { ...restartDefaults, ...restartPolicy };
-  const directory = mkdtempSync(path.join(tmpdir(), 'workbench-'));
+  if (socketDir) for (const name of readdirSync(socketDir)) if (/^modules-[A-Za-z0-9]{6}$/.test(name)) rmSync(path.join(socketDir, name), { recursive: true, force: true });
+  const directory = mkdtempSync(socketDir ? path.join(socketDir, 'modules-') : path.join(tmpdir(), 'workbench-'));
+  const longest = moduleCatalog.reduce((name, { id }) => id.length > name.length ? id : name, '');
+  if (process.platform !== 'win32' && Buffer.byteLength(path.join(directory, `${longest}-9999999999.sock`)) > MAX_SOCKET_PATH_BYTES) {
+    rmSync(directory, { recursive: true, force: true });
+    throw new Error(`模块 socket 路径可能超过 ${MAX_SOCKET_PATH_BYTES} 字节：${directory}，请设置较短的 WORKBENCH_RUNTIME_DIR`);
+  }
   const children = [], unregister = [], ready = {}, tasks = new Set();
   const slots = Object.fromEntries(moduleCatalog.map(({ id }) => [id, { id, state: 'stopped', generation: 0, child: null, timer: null, due: false,
     restartCount: 0, consecutiveFailures: 0, readyAt: null, lastExitAt: null, lastExitKind: null, nextAttemptAt: null, faultReason: null, waitingFor: null }]));
