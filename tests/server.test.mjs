@@ -64,6 +64,15 @@ for (const protocol of ['', '?protocol=2']) test(`authenticated overview stream 
   assert.equal(last, null);
 });
 
+test('concurrent overview subscriptions read their first snapshot before one atomic per-session limit check', async t => {
+  const f = await fixture(t); await f.login();
+  const controller = new AbortController(); t.after(() => controller.abort());
+  const responses = await Promise.all(Array.from({ length: 13 }, () => fetch(f.origin + '/api/overview/events', { headers: { Cookie: f.cookie }, signal: controller.signal })));
+  assert.equal(responses.filter(res => res.status === 200).length, 12);
+  const refused = responses.filter(res => res.status === 429);
+  assert.equal(refused.length, 1); assert.equal((await refused[0].json()).error, '状态订阅过多');
+});
+
 async function fixture(t, options = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'project-hub-test-'));
   let app = await createApp({ dataDir, initialPassword: password, refreshInterval: 0, assetSyncIntervalMs: 0, summaryReader: async () => summary(), ...options });

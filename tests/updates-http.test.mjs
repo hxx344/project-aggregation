@@ -229,6 +229,27 @@ test('live entry reserves the gate before awaiting root status, preventing a rac
   assert.equal((await f.request(`${PREFIX}/apply`, { method: 'POST', body: { planId } })).status, 409);
 });
 
+test('during maintenance an execution entry still reports body errors before the admission refusal', async t => {
+  const f = await fixture(t, { initialMaintenance: true }); await f.login();
+  f.state = unavailableUpdateState();
+  assert.equal((await f.request(`${EXECUTION}/preview`, { method: 'POST', body: { note: 'x'.repeat(40000) } })).status, 413);
+  assert.equal((await f.request(`${EXECUTION}/preview`, { method: 'POST', body: [] })).status, 400);
+  assert.equal((await f.request(`${EXECUTION}/preview`, { method: 'POST', body: {} })).status, 409);
+  assert.deepEqual(f.executionCalls, []);
+});
+
+test('logout while an execution entry awaits admission stops it before the data plane runs it', async t => {
+  const f = await fixture(t); await f.login();
+  const entered = deferred(), release = deferred();
+  f.handlers.status = async () => { entered.resolve(); await release.promise; return f.state; };
+  const start = f.request(`${EXECUTION}/jobs`, { method: 'POST', body: {} }); await entered.promise;
+  assert.equal((await f.request('/api/logout', { method: 'POST' })).status, 200);
+  release.resolve();
+  const response = await start;
+  assert.equal(response.status, 401); assert.equal(response.data.error, '登录已失效，请重新登录');
+  assert.deepEqual(f.executionCalls, []);
+});
+
 test('all nonterminal or unknown live task states block updates', async t => {
   const f = await fixture(t); await f.login();
   for (const status of ['queued', 'running', 'stopping', 'paused', 'attention', 'unknown']) {
