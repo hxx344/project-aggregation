@@ -47,7 +47,7 @@ async function fixture(t, { projectChanged = async () => { throw new Error('data
   const updatesClient = Object.fromEntries(['status', 'check', 'apply', 'token'].map(method => [method, async () => updateState()]));
   const api = createApiServer({ control, catalog: createProjectCatalog({ control, embeddedModules: false, decrypt }), encrypt, decrypt, embeddedModules: false, log,
     supervisor: createInProcessClient(createRuntimeService({ moduleRuntime: null, guard: null, readMaintenance })), runtime,
-    executionJobs: { state: () => ({ jobs: [] }) }, readMaintenance, updatesClient, secureCookies: false, configuredOrigin: '', distDir: path.join(dataDir, 'dist'), noticeRetryMs: [5, 5], ...options });
+    executionJobs: { state: () => ({ jobs: [] }), openEntries: () => 0, transaction: fn => fn() }, readMaintenance, updatesClient, secureCookies: false, configuredOrigin: '', distDir: path.join(dataDir, 'dist'), noticeRetryMs: [5, 5], ...options });
   await api.initialize();
   await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${api.server.address().port}`;
@@ -197,6 +197,7 @@ test('the split API asks the supervisor for module transports and keeps moduleTr
 
 test('the idle check reads job states from the database and counts unreadable rows as unfinished', () => {
   const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE execution_entries (id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)');
   const reader = createExecutionJobsReader(db);
   assert.deepEqual(reader.state(), { jobs: [] }, 'no table until the executor created it');
   db.exec('CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL)');

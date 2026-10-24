@@ -32,7 +32,7 @@ test('updater idle clears only its own maintenance state and cannot clear a real
   const state = JSON.parse(db.prepare("SELECT value FROM aw_meta WHERE key='recovery_state'").get().value);
   db.prepare("UPDATE aw_meta SET value=? WHERE key='recovery_state'").run(JSON.stringify({ ...state, state: 'quarantine', recoveryId: randomUUID() })); db.close();
   let maintenance = true;
-  const coordinator = createUpdateCoordinator({ execution: { state: () => ({ jobs: [] }) }, readMaintenance: () => maintenance,
+  const coordinator = createUpdateCoordinator({ execution: { state: () => ({ jobs: [] }), openEntries: () => 0, transaction: fn => fn() }, readMaintenance: () => maintenance,
     writeMaintenance: value => { maintenance = value; }, client: { status: async () => ({ ...unavailableUpdateState(), enabled: true }) } });
   await coordinator.status(); assert.equal(maintenance, false); assert.equal(writer.snapshot().recovery.state, 'quarantine');
   const identity = { authority: 'bybit', environment: 'mainnet', accountId: '123' };

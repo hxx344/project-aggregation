@@ -323,3 +323,43 @@ test('logout while connection verification is pending prevents credential persis
   assert.equal(f.mutations.length, 0);
   for (const value of Object.values(secret)) assert.equal(JSON.stringify(response.data).includes(value), false);
 });
+
+test('native execution writes hold an execution entry and are refused by the durable maintenance flag alone', async t => {
+  const f = await fixture(t); await f.login(); await f.connectBoth();
+  // Hold one exchange read in an account write and in a preview: each holds an entry while it runs.
+  const revision = exchange => f.app.execution.state().connections.find(row => row.exchange === exchange).revision;
+  for (const [route, method, body] of [[`${PREFIX}/accounts/binance`, 'PUT', { revision: revision('binance'), accountMode: 'standard', ...credentials('binance') }], [`${PREFIX}/preview`, 'POST', intent()]]) {
+    const handler = route.endsWith('preview') ? 'bybit:account' : 'binance:account', entered = deferred(), release = deferred();
+    f.handlers[handler] = async () => { entered.resolve(); await release.promise; return structuredClone(f.accounts[handler.split(':')[0]]); };
+    const pending = f.request(route, { method, body });
+    try {
+      await entered.promise;
+      assert.equal(f.rows('SELECT * FROM execution_entries').length, 1, `${route} holds an entry while it runs`);
+    } finally { release.resolve(); }
+    assert.equal((await pending).status, 200);
+    assert.equal(f.rows('SELECT * FROM execution_entries').length, 0, 'the entry ends with the operation');
+    delete f.handlers[handler];
+  }
+  const preview = await f.preview(), started = await f.request(`${PREFIX}/jobs`, { method: 'POST', body: { previewId: preview.id, requestId: randomUUID(), confirmLive: true } });
+  assert.equal(started.status, 202); const job = started.data.jobs[0].id; await f.app.execution.tick();
+  // Another process committed maintenance: the runtime refuses even though this API never saw it.
+  const db = new DatabaseSync(path.join(f.dataDir, 'hub.sqlite'));
+  try { db.exec('PRAGMA busy_timeout=5000'); db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES ('updates-maintenance','1')").run(); } finally { db.close(); }
+  const before = f.calls.length;
+  for (const [route, method, body] of [
+    [`${PREFIX}/accounts/binance`, 'PUT', { revision: revision('binance'), accountMode: 'standard', ...credentials('binance') }],
+    [`${PREFIX}/accounts/bybit`, 'DELETE', { revision: revision('bybit') }],
+    [`${PREFIX}/preview`, 'POST', intent()],
+    [`${PREFIX}/jobs`, 'POST', { previewId: randomUUID(), requestId: randomUUID(), confirmLive: true }]]) {
+    const refused = await f.request(route, { method, body });
+    assert.equal(refused.status, 409, `${method} ${route}`); assert.match(refused.data.error, /系统正在更新/);
+  }
+  assert.equal(f.calls.length, before, 'no exchange call after a refusal');
+  assert.equal(f.app.execution.state().jobs.length, 1); assert.equal(f.rows('SELECT * FROM execution_entries').length, 0);
+  // Stop and reconcile stay open under maintenance, so a running job can still be ended.
+  // Reconcile reaches the executor, which refuses a running job for its own reason.
+  const reconciled = await f.request(`${PREFIX}/jobs/${job}/reconcile`, { method: 'POST', body: {} });
+  assert.equal(reconciled.status, 409); assert.match(reconciled.data.error, /任务正在执行或核对中/); assert.equal(f.calls.length, before);
+  const stopped = await f.request(`${PREFIX}/jobs/${job}/stop`, { method: 'POST', body: {} });
+  assert.equal(stopped.status, 200); assert.equal(stopped.data.jobs.find(row => row.id === job).status, 'stopping');
+});

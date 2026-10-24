@@ -38,6 +38,7 @@ async function setup(t, { pending = false } = {}) {
     CREATE TABLE execution_jobs(id TEXT PRIMARY KEY,json TEXT); CREATE TABLE execution_orders(id TEXT PRIMARY KEY,job_id TEXT,json TEXT);
     CREATE TABLE execution_locks(resource TEXT PRIMARY KEY,job_id TEXT); CREATE TABLE execution_stop_requests(job_id TEXT PRIMARY KEY,requested_at INTEGER);
     CREATE TABLE execution_previews(id TEXT PRIMARY KEY,session TEXT,expires INTEGER,json TEXT,consumed TEXT); INSERT INTO execution_previews VALUES('preview','old-session',9999999999999,'{}',NULL);
+    CREATE TABLE execution_entries(id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL); INSERT INTO execution_entries VALUES('entry',0,9999999999999);
     CREATE TABLE execution_lease(id INTEGER PRIMARY KEY,owner TEXT,expires INTEGER); INSERT INTO execution_lease VALUES(1,'old-owner',9999999999999);`);
   const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', key, iv), ciphertext = Buffer.concat([cipher.update(JSON.stringify({ password: 'sensitive-password-fixture' })), cipher.final()]);
   hub.prepare('INSERT INTO projects VALUES(?,?,?)').run('one', '{}', Buffer.concat([iv,cipher.getAuthTag(),ciphertext]).toString('base64'));
@@ -77,7 +78,7 @@ test('cold encrypted backup covers nested modules and WAL; restoration revokes s
   for (const dir of ['data','secrets']) for (const file of fs.readdirSync(path.join(f.backupOptions.destination,dir))) assert.equal(fs.readFileSync(path.join(f.backupOptions.destination,dir,file)).includes(Buffer.from('sensitive-password-fixture')), false);
   const restored = await f.restore(); const after = readRegistry(restored.targetDir); assert.equal(after.state.state,'quarantine'); assert.notEqual(after.state.authorityId,before.state.authorityId); assert.equal(after.registryId,before.registryId);
   const db = new DatabaseSync(path.join(restored.targetDir,'hub.sqlite')); assert.equal(db.prepare("SELECT value FROM settings WHERE key='wal-only'").get().value,'must-survive');
-  for (const table of ['sessions','execution_previews','execution_lease']) assert.equal(db.prepare('SELECT count(*) n FROM '+table).get().n,0); db.close();
+  for (const table of ['sessions','execution_previews','execution_lease','execution_entries']) assert.equal(db.prepare('SELECT count(*) n FROM '+table).get().n,0); db.close();
   const registry = new DatabaseSync(path.join(restored.targetDir,'execution-control.sqlite')); assert.equal(registry.prepare("SELECT state FROM aw_operations WHERE operation_id='pending'").get().state,'unknown'); assert.ok(registry.prepare("SELECT count(*) n FROM aw_owners WHERE status='closed'").get().n > 0); registry.close();
   const config = JSON.parse(fs.readFileSync(path.join(restored.targetDir,'modules/asset/config.json'))); assert.equal(config.credentialKey,f.config.credentialKey); assert.notEqual(config.sessionSecret,f.config.sessionSecret);
   await assert.rejects(admitHandoff({ sourceDir:f.source,targetDir:restored.targetDir,sourceLock:f.sourceLock,targetLock:restored.lock,dataKey:f.dataKey,secretsKey:f.secretsKey }),/HANDOFF_REQUIRED/);
