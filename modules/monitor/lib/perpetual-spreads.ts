@@ -58,6 +58,9 @@ const compareLegs = (leftLong: PerpetualQuote, leftShort: PerpetualQuote, rightL
   compareText(leftLong.exchange, rightLong.exchange) || compareText(leftLong.symbol, rightLong.symbol)
   || compareText(leftShort.exchange, rightShort.exchange) || compareText(leftShort.symbol, rightShort.symbol);
 
+/** Funding rates older than this leave funding metrics and sorting. */
+export const PERPETUAL_FUNDING_MAX_AGE_MS = 300_000;
+
 export function quotePriceTime(quote: PerpetualQuote, mode: PerpetualPriceMode): number {
   const priceTime = mode === "book" ? quote.bidAskAt : quote.markAt;
   // A recent funding or ticker message must never make an older order book fresh.
@@ -71,7 +74,7 @@ export function quoteIsFresh(quote: PerpetualQuote, mode: PerpetualPriceMode, no
 
 export function normalizedFunding8h(quote: PerpetualQuote, now?: number): number | null {
   if (quote.fundingRate === null || !Number.isFinite(quote.fundingRate) || !positive(quote.fundingIntervalHours) || quote.fundingIntervalHours > 168) return null;
-  if (now !== undefined && (!Number.isFinite(now) || typeof quote.fundingAt !== "number" || !Number.isFinite(quote.fundingAt) || quote.fundingAt <= 0 || now - quote.fundingAt > 300_000 || quote.fundingAt > now + 5_000)) return null;
+  if (now !== undefined && (!Number.isFinite(now) || typeof quote.fundingAt !== "number" || !Number.isFinite(quote.fundingAt) || quote.fundingAt <= 0 || now - quote.fundingAt > PERPETUAL_FUNDING_MAX_AGE_MS || quote.fundingAt > now + 5_000)) return null;
   const normalized = quote.fundingRate * 8 / quote.fundingIntervalHours;
   return Number.isFinite(normalized) ? normalized : null;
 }
@@ -263,7 +266,7 @@ function quoteRankingExpiry(quote: PerpetualQuote, mode: PerpetualPriceMode, sta
     if (timestamp + maxAge + 1 > now) expiry = Math.min(expiry, timestamp + maxAge + 1);
   };
   deadline(quotePriceTime(quote, mode), staleAfterMs);
-  deadline(quote.fundingAt, 300_000);
+  deadline(quote.fundingAt, PERPETUAL_FUNDING_MAX_AGE_MS);
   deadline(quote.takerFeeAt, contractFeeMaxAgeMs);
   return expiry;
 }
