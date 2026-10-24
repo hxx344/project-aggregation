@@ -14,7 +14,7 @@ import { dataPlaneOptions, fakeModules } from './fixtures/split-modules.mjs';
 import { unavailableUpdateState } from '../server/updates.mjs';
 import { acquireLifecycleLock, acquireRecoveryLocks } from '../server/recovery/lifecycle-lock.mjs';
 import { DatabaseSync } from 'node:sqlite';
-import { writeWaitStats } from '../server/control/schema.mjs';
+import { writeWaitStats } from '../server/sqlite-writes.mjs';
 import { DATABASE_BUSY } from '../server/http-common.mjs';
 import { EXECUTION_MAINTENANCE } from '../server/control/execution-jobs.mjs';
 
@@ -188,6 +188,7 @@ test('over the socket, execution entries keep the runtime\'s 409 and 503 and out
 
   // A write lock held past busy_timeout (5 s) is a retryable 503 in either process. The runtime
   // runs in this process, so its wait blocks this thread while the API process waits beside it.
+  // Only the two requests write meanwhile: `dataPlaneOptions` turns the runtime's background writes off.
   const busyBefore = writeWaitStats().busy;
   db.exec('BEGIN IMMEDIATE');
   let busy;

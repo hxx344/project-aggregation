@@ -9,7 +9,8 @@ import { createModuleUpdateGuard, tradingModules } from '../modules/updates.mjs'
 import { createAccountWriter } from '../execution/account-writer.mjs';
 import { acquireRuntimeLock } from '../recovery/lifecycle-lock.mjs';
 import { assertRecoveryStartup } from '../recovery/startup.mjs';
-import { openHubDatabase, logWriteWaits } from '../control/schema.mjs';
+import { openHubDatabase } from '../control/schema.mjs';
+import { logWriteWaits } from '../sqlite-writes.mjs';
 import { createControlStore } from '../control/store.mjs';
 import { createProjectCatalog } from '../control/projects.mjs';
 import { loadCredentialCipher } from './credentials.mjs';
@@ -51,7 +52,7 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
       const workers = Promise.resolve().then(() => (modules ?? moduleStartup)?.close());
       await step(() => dataPlane?.close() ?? accountWriter?.close());
       await step(() => workers);
-      stopWriteLog();
+      await step(stopWriteLog);
       await step(() => db?.close());
       // Last: a successor may start once the lock is free.
       await step(() => lock?.close());

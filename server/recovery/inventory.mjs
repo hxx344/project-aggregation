@@ -108,11 +108,9 @@ export function budget({ maxBytes = 10 * 1024 ** 3, maxFiles = 10_000, timeoutMs
   check.signal = AbortSignal.timeout(Math.min(timeoutMs, 0xffffffff));
   return { check, remainingMs: () => Math.max(1, Math.ceil(deadline - performance.now())), maxBytes, maxFiles, maxCheckpointRows, maxRecordBytes, add(size) { check(); if (!Number.isSafeInteger(size) || size < 0 || (bytes += size) > maxBytes || ++files > maxFiles) throw new Error('RECOVERY_LIMIT_EXCEEDED'); }, space(directory, needed) { check(); const s = fs.statfsSync(directory, { bigint: true }); if (s.bavail * s.bsize < BigInt(needed) + 1024n * 1024n) throw new Error('RECOVERY_SPACE_INSUFFICIENT'); } };
 }
-// `run` is the runtime directory (server/runtime/protocol.mjs): discovery
-// record and sockets of the runtime and its modules, rebuilt at every start.
 export function excluded(relative) {
   const name = path.posix.basename(relative);
-  return relative === 'run' || name === '.runtime.lock' || name === 'instance.lock' || name.endsWith('-wal') || name.endsWith('-shm') || /(?:\.sock|\.socket|\.tmp|\.lock)$/.test(name) || name.includes('.tmp-') || name === CONTROL;
+  return name === '.runtime.lock' || name === 'instance.lock' || name.endsWith('-wal') || name.endsWith('-shm') || /(?:\.sock|\.socket|\.tmp|\.lock)$/.test(name) || name.includes('.tmp-') || name === CONTROL;
 }
 export function category(relative) {
   // Ordinary configuration and future/unknown paths may contain cleartext
@@ -130,7 +128,9 @@ export function inventory(dataDir, limits) {
       limits.check(); const relative = prefix ? prefix + '/' + name : name; safeRelative(relative);
       const filename = path.join(directory, name); safePath(filename); const info = fs.lstatSync(filename);
       // Links and special files are rejected even if their names normally would be excluded.
-      if (excluded(relative)) continue;
+      // The top-level `run` directory is the runtime directory (server/runtime/protocol.mjs):
+      // discovery record and sockets of the runtime and its modules, rebuilt at every start.
+      if (excluded(relative) || relative === 'run' && info.isDirectory()) continue;
       if (info.isDirectory()) {
         if (prefix === 'modules' && !MODULES.includes(name)) throw new Error('RECOVERY_UNKNOWN_MODULE');
         walk(filename, relative, depth + 1);

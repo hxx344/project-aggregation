@@ -1,4 +1,4 @@
-import { isSqliteBusy } from './control/schema.mjs';
+import { isSqliteBusy, recordBusyReply } from './sqlite-writes.mjs';
 
 // Shared by the API server and the runtime data plane, so a route keeps the
 // same body rules and error mapping on whichever side handles it.
@@ -24,8 +24,9 @@ export const readJson = async (contentType, stream) => (await readJsonBody(conte
 // Errors of the listed classes are decisions with a public message. A write that waited out
 // busy_timeout for the other process is retryable, so it is a 503; anything else is a 500.
 export function errorResponder(classes) {
-  return error => classes.some(type => error instanceof type)
-    ? { status: error.status, body: { error: error.message } }
-    : isSqliteBusy(error) ? { status: 503, body: { error: DATABASE_BUSY } }
-      : { status: 500, body: { error: INTERNAL_ERROR } };
+  return error => {
+    if (classes.some(type => error instanceof type)) return { status: error.status, body: { error: error.message } };
+    if (isSqliteBusy(error)) { recordBusyReply(); return { status: 503, body: { error: DATABASE_BUSY } }; }
+    return { status: 500, body: { error: INTERNAL_ERROR } };
+  };
 }

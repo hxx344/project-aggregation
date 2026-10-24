@@ -119,6 +119,11 @@ test('the runtime directory left by a killed runtime is not backed up, but a lin
   assert.deepEqual(manifest.body.entries.filter(entry => entry.path === 'run' || entry.path.startsWith('run/')), []);
   fs.rmSync(run, { recursive: true }); fs.symlinkSync(os.tmpdir(), run);
   await assert.rejects(createBackup({ ...f.backupOptions, destination: f.backupOptions.destination + '-link' }), /UNSAFE_FILE/);
+  // Only the directory is the runtime's: a file of that name is backed up like any other.
+  fs.rmSync(run); fs.writeFileSync(run, 'kept', { mode: 0o600 });
+  await createBackup({ ...f.backupOptions, destination: f.backupOptions.destination + '-file' });
+  const files = JSON.parse(fs.readFileSync(path.join(f.backupOptions.destination + '-file', 'manifest.json'))).body.entries;
+  assert.deepEqual(files.filter(entry => entry.path === 'run').map(entry => entry.size), [4]);
 });
 
 test('missing or incorrect application credentials and unsupported registry schema keep recovery failed', async t => {
