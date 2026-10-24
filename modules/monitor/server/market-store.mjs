@@ -25,6 +25,12 @@ const decode = (key, payload) => key.startsWith('cl-xau/') ? validators[key](JSO
 // Source changes use a new namespace. Existing Hyperliquid snapshots and every old observation stay untouched.
 export const storageKey = key => ['oil/quote', 'oil/history', 'oil/funding', `oil/${OIL_CANDLE_ACTION}`].includes(key) ? key.replace('oil/', 'oil/binance/') : key;
 
+// Observations are write-only history; pages read the latest dataset row, which pruning never touches.
+export const MARKET_OBSERVATION_RETENTION_MS = 360 * 86_400_000;
+// Rowid order follows insertion, so short rowid ranges bound each synchronous delete.
+const PRUNE_ROWID_SPAN = 5_000;
+const yieldToEventLoop = () => new Promise(resolve => setImmediate(resolve));
+
 function hedgePriceObservations(value) {
   const hours = new Map();
   for (const leg of value.legs) for (const row of leg.rows) {
@@ -57,6 +63,9 @@ export async function openMarketStore(filename, { clock = Date.now } = {}) {
     const save = db.prepare('UPDATE market_datasets SET payload=?,source_ms=?,saved_ms=?,attempt_ms=?,success_ms=?,error=NULL WHERE key=?');
     const recordFailure = db.prepare('UPDATE market_datasets SET attempt_ms=?,error=? WHERE key=?');
     const countObservations = db.prepare('SELECT count(*) AS count FROM market_observations WHERE dataset=?');
+    const observationRowids = db.prepare('SELECT (SELECT rowid FROM market_observations ORDER BY rowid LIMIT 1) AS low, (SELECT rowid FROM market_observations ORDER BY rowid DESC LIMIT 1) AS high');
+    // source_ms is always milliseconds, unlike time, whose unit differs between datasets.
+    const pruneRange = db.prepare('DELETE FROM market_observations WHERE rowid>=? AND rowid<? AND source_ms<?');
     let closed = false;
     return {
       raw(id, action) { const key = keyFor(id, action), row = get.get(storageKey(key)); return row.payload ? decode(key, row.payload) : null; },
@@ -92,6 +101,18 @@ export async function openMarketStore(filename, { clock = Date.now } = {}) {
       },
       status() { return datasetKeys.map(key => { const { payload: _payload, ...row } = get.get(storageKey(key)); return { ...row, key }; }).sort((a, b) => a.key.localeCompare(b.key)); },
       count(id, action) { return countObservations.get(storageKey(keyFor(id, action))).count; },
+      /** Deletes observations last confirmed before the retention window; stops early on abort or close. */
+      async pruneObservations({ retentionMs = MARKET_OBSERVATION_RETENTION_MS, signal, pause = yieldToEventLoop } = {}) {
+        if (closed || signal?.aborted) return 0;
+        const cutoff = clock() - retentionMs, { low, high } = observationRowids.get();
+        let removed = 0;
+        if (low === null) return removed;
+        for (let start = low; start <= high && !closed && !signal?.aborted; start += PRUNE_ROWID_SPAN) {
+          removed += Number(pruneRange.run(start, start + PRUNE_ROWID_SPAN, cutoff).changes);
+          await pause();
+        }
+        return removed;
+      },
       close() { if (!closed) { closed = true; db.close(); } },
     };
   } catch (error) { db.close(); throw error; }

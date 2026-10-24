@@ -339,6 +339,9 @@ expect_counts 3 6 10 9 12
 current=$(readlink "$fixture/application/current")
 cp "$fixture/application/.deployed-state" "$fixture/before-prepare-state"
 dependency_caches=$(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*' | wc -l)
+active_dependency_cache=$(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*')
+# Earlier successful activations pruned every dependency cache except the active one.
+[[ "$dependency_caches" == 1 ]]
 printf '\nthrow new Error("fixture prepare failure");\n' >> "$fixture/source/scripts/install-hooks.mjs"
 commit_source fail-prepare
 if run_install; then echo 'Failed prepare was accepted' >&2; exit 1; fi
@@ -355,7 +358,9 @@ printf '\n// Repaired prepare input.\n' >> "$fixture/source/scripts/install-hook
 commit_source repair-prepare
 run_install
 expect_counts 5 7 11 10 13
-[[ $(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*' | wc -l) == $((dependency_caches + 1)) ]]
+# The repaired install publishes a new cache, then prunes the superseded one.
+repaired_dependency_cache=$(find "$fixture/application/cache" -maxdepth 1 -type d -name 'dependencies-*')
+[[ $(wc -l <<< "$repaired_dependency_cache") == 1 && "$repaired_dependency_cache" != "$active_dependency_cache" ]]
 run_install
 expect_counts 5 7 11 10 13
 printf 'Incremental installer paths passed (docs/tests/backend/frontend/config, failures and environment).\n'

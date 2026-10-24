@@ -24,6 +24,7 @@ import { createVariationalSession, openVariationalSessionStore } from './variati
 import { fetchVariational } from './variational-transport.mjs';
 import { parseGoldOilChartRange, readGoldOilChartData } from '../lib/gold-oil-chart-data.ts';
 
+const OBSERVATION_PRUNE_DELAY_MS = 60_000, OBSERVATION_PRUNE_INTERVAL_MS = 86_400_000;
 const exchangeActions = market => Object.fromEntries(comparisonExchanges(market).map(exchange => [exchangeAction(exchange), ["GET"]]));
 const exchangeFundingActions = market => Object.fromEntries(fundingHistoryExchanges(market).map(exchange => [exchangeFundingAction(exchange), ['GET']]));
 
@@ -147,7 +148,16 @@ export async function createMonitorServices(directory, { externallyLocked = fals
       }],
     ]);
     services.notifications = notifications;
-    services.market = { start: () => collector.start(), healthy: () => collector.healthy(), status: () => marketStore.status(), async stop() { await collector.stop(); marketStore.close(); for (const store of Object.values(goldOilStores)) await store.release(); await oilStore.release(); } };
+    let pruneTimer = null, pruning = null;
+    const pruneControl = new AbortController();
+    const pruneObservations = () => {
+      pruning ??= marketStore.pruneObservations({ signal: pruneControl.signal }).catch(error => console.error(`行情观测历史清理失败：${error?.message ?? error}`)).finally(() => { pruning = null; });
+    };
+    const schedulePrune = delay => { pruneTimer = setTimeout(() => { pruneObservations(); schedulePrune(OBSERVATION_PRUNE_INTERVAL_MS); }, delay); pruneTimer.unref?.(); };
+    services.market = {
+      start() { collector.start(); if (!pruneTimer) schedulePrune(OBSERVATION_PRUNE_DELAY_MS); },
+      healthy: () => collector.healthy(), status: () => marketStore.status(),
+      async stop() { clearTimeout(pruneTimer); pruneTimer = null; pruneControl.abort(); await pruning; await collector.stop(); marketStore.close(); for (const store of Object.values(goldOilStores)) await store.release(); await oilStore.release(); } };
     return attachMonitorControl(services, controlStore, { collector, factories: { perpetual: createPerpetual } });
   } catch (error) { perpetualStore?.close(); marketStore?.close(); for (const store of Object.values(goldOilStores)) await store.release(); await oilStore.release(); throw error; }
 }
