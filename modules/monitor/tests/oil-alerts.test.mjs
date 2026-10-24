@@ -8,6 +8,7 @@ import { defaultConfig, evaluateRule, marketValues, validateConfig } from '../se
 import { createFeishuPayload, createNotifier, validateWebhook } from '../server/oil/feishu.mjs';
 import { Monitor } from '../server/oil/monitor.mjs';
 import { FileStore, emptyStore } from '../server/oil/store.mjs';
+import { staleMarketError } from '../server/market-stale.mjs';
 
 
 const rule = (overrides = {}) => ({ id: 'test-rule', label: '价差一级', metric: 'spread', operator: 'gte', threshold: 5, cooldownMinutes: 30, hysteresis: 0.2, enabled: true, ...overrides });
@@ -161,6 +162,18 @@ test('snapshot or failed market reads never produce alerts; master switch and mi
   off.monitor.data.config.enabled = true; off.monitor.webhookConfigured = false; await off.monitor.tick(); assert.equal(off.messages.length, 0);
 });
 
+test('alerts show the collector-recorded reason for a stale market read and hide arbitrary exception text', async () => {
+  const reason = 'Binance 合约信息请求超时；保留上次成功数据，后台将自动重试。';
+  const recorded = fixture({ fetcher: async () => { throw staleMarketError(reason); } });
+  await recorded.monitor.tick();
+  assert.equal(recorded.monitor.status().error, 'Binance 合约信息请求超时；保留上次成功数据，后台将自动重试；暂停阈值判断');
+  for (const error of [staleMarketError(null), new Error('connect ECONNRESET 203.0.113.7:443'), Object.assign(new Error('internal'), { code: 'MARKET_DATA_STALE', reason: 42 })]) {
+    const hidden = fixture({ fetcher: async () => { throw error; } });
+    await hidden.monitor.tick();
+    assert.equal(hidden.monitor.status().error, '行情获取失败或已过期，暂停阈值判断');
+  }
+  assert.equal(recorded.messages.length, 0);
+});
 test('storage must succeed before a notification can leave the service', async () => {
   const f = fixture({ write: async () => { throw new Error('disk full'); } });
   await assert.rejects(f.monitor.tick(), /数据写入失败/); assert.equal(f.messages.length, 0);

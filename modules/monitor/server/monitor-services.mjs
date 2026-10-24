@@ -6,6 +6,7 @@ import { Monitor } from "./oil/monitor.mjs";
 import { openNotificationStore } from "./notification-store.mjs";
 import { createNotificationService } from "./notification-service.mjs";
 import { openMarketStore } from "./market-store.mjs";
+import { staleMarketError } from "./market-stale.mjs";
 import { createMarketCollector, marketJobs, seedMarketDatabase } from "./market-collector.mjs";
 import { comparisonExchanges, exchangeAction, exchangeFromAction, EXCHANGE_REFRESH_MS } from "../lib/exchange-quotes.ts";
 import { OIL_CANDLE_ACTION, OIL_CANDLE_REFRESH_MS } from "../modules/oil/intraday.mjs";
@@ -50,7 +51,7 @@ export async function createMonitorServices(directory, { externallyLocked = fals
       },
     });
     const read = (id, action, fresh = false) => {
-      if (fresh && !collector.healthy()) throw new Error("行情数据库写入失败，暂停告警。");
+      if (fresh && !collector.healthy()) throw staleMarketError("行情数据库写入失败", "行情数据库写入失败，暂停告警。");
       const goldAction = id === 'cl-xau' ? parseGoldOilAction(action)?.action : null;
       const interval = goldAction ? goldAction === 'quote' ? GOLD_OIL_QUOTE_MS : goldAction === 'funding' ? GOLD_OIL_FUNDING_MS : GOLD_OIL_HISTORY_MS : action === OIL_HEDGE_PRICES_ACTION ? HEDGE_PRICES_REFRESH_MS : action === OIL_CANDLE_ACTION ? OIL_CANDLE_REFRESH_MS : exchangeFromAction(action) ? EXCHANGE_REFRESH_MS : action === "quote" ? id === "oil" ? pollSeconds * 1000 : 10_000 : action === "history" && id === "hynix" ? 60_000 : 300_000;
       const value = marketStore.read(id, action, { fresh, maxAgeMs: interval * 2 + 15_000 });

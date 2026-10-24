@@ -145,7 +145,7 @@ test('database reads expose the actual source-age budget without renewing the qu
     }
     now = NOW + 1000;
     store.fail('hynix', 'quote', 'offline');
-    const failed = store.read('hynix', 'quote', { maxAgeMs: 75_000 });
+    assert.throws(() => store.read('hynix', 'quote', { maxAgeMs: 75_000, fresh: true }), error => error.code === 'MARKET_DATA_STALE' && error.reason === 'offline' && error.message === '后台行情采集失败或已过期。');    const failed = store.read('hynix', 'quote', { maxAgeMs: 75_000 });
     assert.equal(failed.status, 'snapshot');
     assert.equal(failed.collection.error, 'offline');
     assert.equal(failed.fetchedAt, new Date(NOW).toISOString());
