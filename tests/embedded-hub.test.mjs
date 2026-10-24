@@ -145,7 +145,8 @@ test('an unconfirmed trading module rejects only its own writes; other modules a
 test('module status joins supervisor state with maintenance, and operator restart only accepts a faulted module', async t => {
   const states = Object.fromEntries(moduleIds.map(id => [id, 'ready'])), restarts = [];
   const moduleRuntime = {
-    status: () => moduleIds.map(moduleId => ({ moduleId, state: states[moduleId], generation: 1 })),
+    status: () => moduleIds.map(moduleId => ({ moduleId, state: states[moduleId], generation: 1, restartCount: 0, consecutiveFailures: 0, lastExitAt: null, lastExitKind: null,
+      readyAt: null, nextAttemptAt: null, waitingFor: null, faultReason: states[moduleId] === 'fault' ? 'failures' : null })),
     restart: id => { restarts.push(id); return states[id] === 'fault'; },
   };
   const f = await fixture(t, { moduleRuntime });

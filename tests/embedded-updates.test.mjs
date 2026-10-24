@@ -3,6 +3,11 @@ import assert from 'node:assert/strict';
 import { createModuleUpdateGuard } from '../server/modules/updates.mjs';
 import { moduleCapabilities } from '../server/modules/capabilities.mjs';
 import { createUpdateCoordinator, UpdateError, unavailableUpdateState } from '../server/updates.mjs';
+import { createRuntimeService } from '../server/runtime/service.mjs';
+import { coordinatorHooks, createInProcessClient } from '../server/runtime/supervisor-client.mjs';
+
+// tests/embedded-updates-runtime.test.mjs reruns every case through the runtime client that createApp uses.
+const viaRuntime = process.env.EMBEDDED_UPDATES_WIRING === 'runtime';
 
 const planId = 'embedded-update-plan-1234';
 const stamp = '2026-10-13T01:00:00.000Z';
@@ -44,6 +49,8 @@ function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 
     return result;
   };
   const guard = createModuleUpdateGuard({ request });
+  const hooks = viaRuntime ? coordinatorHooks(createInProcessClient(createRuntimeService({ guard, readMaintenance: () => persisted.maintenance })))
+    : { setModuleMaintenance: guard.setMaintenance, prepareApply: guard.prepareApply };
   const client = {
     async status() {
       calls.push('status');
@@ -65,8 +72,8 @@ function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 
     writeMaintenance: value => { persisted.maintenance = value; events.push(`persist:maintenance:${value}`); },
     readPendingPlanId: () => persisted.pendingPlanId,
     writePendingPlanId: value => { persisted.pendingPlanId = value; events.push(`persist:plan:${value}`); },
-    setModuleMaintenance: guard.setMaintenance, tradingModules: modules, moduleIds: ['monitor', 'asset', ...modules],
-    prepareApply: async () => { events.push('prepare'); await guard.prepareApply(); },
+    setModuleMaintenance: hooks.setModuleMaintenance, tradingModules: modules, moduleIds: ['monitor', 'asset', ...modules],
+    prepareApply: async () => { events.push('prepare'); await hooks.prepareApply(); },
     releasePollMs,
   });
   return { coordinator, guard, persisted, active, events, handlers, calls,
