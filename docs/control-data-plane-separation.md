@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `647bfa49e8ea091733a0950357e760b90c3a8b79` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3、11、15 节中的 M3 生命周期批次 |
 | 适用范围 | `server/`、`modules/crossex/server/`、`deploy/`、`server/update-service/`、`server/recovery/` 与相关测试 |
-| 设计状态 | 评审稿；P0-1、P0-2 已发布，P0-3 在分支实施（实现差异见第 9 节），P1、P2、P2b 尚未实施；新增参数为初始设计值 |
+| 设计状态 | 评审稿；P0 已发布（实现差异见第 9 节），P1-1 在分支实施，P1-2 至 P1-4、P2、P2b 尚未实施；新增参数为初始设计值 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 10 节，除一个 R2 批次外均为 R3 |
 | 读者 | 工作台与内置模块开发者、审查者、部署维护者 |
 
@@ -626,7 +626,8 @@ v1.1 文档同步的本地检查仅做提交差异、当前源码和引用核对
 | 在只读挂载上连接 UDS | 未验证 | P2 前在 Ubuntu CI 验证 |
 | 两个进程的 SQLite 写等待 | 尚无数据 | P1 交付前统计 |
 | 多一个 Node 进程的内存占用 | 尚无数据 | P1 交付前实测常驻内存 |
-| `settings` 各键的写入方 | 未逐一审计 | P1 实施时完成 |
+| `settings` 各键的写入方 | P1-1 审计：Hub 库中 `settings`、`projects`、`sessions` 的 SQL 只在 `server/control/` 中；`settings` 的键为 `password`、`seeded` 与各 `seeded-*`/`updated-*` 迁移标记、`module-preferences:<id>`、`updates-maintenance`、`updates-pending-plan`、`updates-pending-deploy-mode`，均由控制面写入；`server/recovery/restore.mjs` 只读 Monitor 自身库的 `monitorPassword` | 与 3.3 节一致，全部归 API；运行时只读维护标记与模块偏好 |
+| 密码重置入口 | `server/setup.mjs` 原先用完整的 `createApp`（默认非内嵌）重置密码，会在内嵌安装上补种外部预设并创建原生执行 | P1-1 改为只打开 Hub 库的控制面存储，不建种子、不读 `credentials.key`；数据目录尚未初始化时拒绝执行，提示先启动工作台 |
 | `PartOf=` 对自动重启的传递 | 依据 systemd 的 restart 作业语义推断 | P2 在 CI 实测，并据此更新第 7 节 |
 
 ## 10 批次拆分与进入条件

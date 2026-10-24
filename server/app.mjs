@@ -1,7 +1,5 @@
 import http from 'node:http';
-import { DatabaseSync } from 'node:sqlite';
-import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
-import { promisify } from 'node:util';
+import { randomBytes, randomUUID, createHash, createCipheriv, createDecipheriv } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,41 +19,22 @@ import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from './updates.mjs';
 import { createUpdateStream } from './update-stream.mjs';
-import { createStatementCache } from './db-cache.mjs';
 import { moduleCatalog, moduleIds } from './modules/catalog.mjs';
 import { createModuleUpdateGuard, tradingModules } from './modules/updates.mjs';
 import { readModuleCapabilities } from './modules/capabilities.mjs';
 import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from './observability.mjs';
 import { createAccountWriter } from './execution/account-writer.mjs';
 import { assertRecoveryStartup } from './recovery/startup.mjs';
+import { MAX_PROJECTS, openHubDatabase, seedProjects } from './control/schema.mjs';
+import { createControlStore } from './control/store.mjs';
+import { ensurePassword, passwordMatches, resetPassword } from './control/password.mjs';
 
-const scrypt = promisify(scryptCallback);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const SESSION_AGE = 7 * 24 * 60 * 60 * 1000;
-const MAX_PROJECTS = 30;
-const defaults = [
-  { id: 'aster', name: 'ASTER 5X', description: '交易账户、保证金占用与运行状态', category: 'trading', adapter: 'aster', url: 'http://127.0.0.1:8765', apiUrl: 'http://127.0.0.1:8765', staleAfterSeconds: 120 },
-  { id: 'monitor', name: 'Market Monitor', description: '原油价差与市场监控', category: 'monitoring', adapter: 'monitor', url: 'http://127.0.0.1:3000/?monitor=oil', apiUrl: 'http://127.0.0.1:3000', staleAfterSeconds: 120 },
-  { id: 'asset', name: 'Asset Ledger', description: '资产账本、持有金额与历史变化', category: 'assets', adapter: 'asset', url: 'http://127.0.0.1:5678', apiUrl: 'http://127.0.0.1:5678', staleAfterSeconds: 900 },
-  { id: 'crossex', name: 'Gate CrossEx', description: '跨交易所永续手动实盘与持仓观察', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:3200', apiUrl: 'http://127.0.0.1:3200', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
-  { id: 'variational', name: 'Variational Grid', description: 'Lighter QQQ / Variational US100 对冲剥头皮模拟', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:9876', apiUrl: 'http://127.0.0.1:9876', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 120 },
-  { id: 'greeks', name: 'Greeks · BTC 期权', description: 'Bybit BTC 铁鹰期权、持仓与策略收益', category: 'trading', adapter: 'standard', url: 'http://127.0.0.1:8000', apiUrl: 'http://127.0.0.1:8000', accessMode: 'proxy', autoSync: false, staleAfterSeconds: 30 },
-].map((project, order) => ({ ...project, authOrigin: '', mode: 'external', enabled: true, order }));
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
-
-async function passwordRecord(password) {
-  const salt = randomBytes(16).toString('hex');
-  const derived = await scrypt(password, salt, 64);
-  return `${salt}:${derived.toString('hex')}`;
-}
-async function passwordMatches(password, record) {
-  const [salt, expected] = record.split(':');
-  const derived = await scrypt(password, salt, 64);
-  return timingSafeEqual(derived, Buffer.from(expected, 'hex'));
-}
 
 export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow, assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null, moduleRuntime = null } = {}) {
   validateBaselineInterval(baselineIntervalMs);
@@ -80,65 +59,12 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const key = readFileSync(keyPath);
   if (key.length !== 32) throw new Error('凭据密钥文件长度不正确');
   if (process.platform !== 'win32') chmodSync(keyPath, 0o600);
-  const db = new DatabaseSync(dbPath);
-  db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);');
-  if (process.platform !== 'win32') chmodSync(dbPath, 0o600);
+  const db = openHubDatabase(dbPath);
+  const control = createControlStore(db);
+  const { stmt, getSetting, setSetting, sessions, projects } = control;
   log.info({ dbPath, type: 'startup' }, '数据库初始化完成');
-  const stmt = createStatementCache(db);
-  const getSetting = name => stmt.prepare('SELECT value FROM settings WHERE key=?').get(name)?.value;
-  if (!getSetting('password')) {
-    const password = initialPassword || randomBytes(18).toString('base64url');
-    if (password.length < 12 || password.length > 1024) { db.close(); throw new Error('INITIAL_PASSWORD 必须为 12 至 1024 个字符'); }
-    stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('password', await passwordRecord(password));
-    if (!initialPassword) log.info({ type: 'security' }, `工作台初始登录密码：${password}\n请保存此密码；只在首次启动显示。重置请运行 node server/setup.mjs --reset-password`);
-  }
-  if (!getSetting('seeded')) {
-    db.exec('BEGIN IMMEDIATE');
-    try { for (const project of (embeddedModules ? moduleCatalog : defaults)) stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS); stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('seeded', '1'); db.exec('COMMIT'); } catch (error) { db.exec('ROLLBACK'); throw error; }
-  }
-  if (embeddedModules) {
-    // Fixed modules are always present, even when a previous external preset
-    // was deleted or a legacy installation already used all project slots.
-    for (const project of moduleCatalog) stmt.prepare('INSERT OR IGNORE INTO projects(id,json) VALUES (?,?)').run(project.id, JSON.stringify(project));
-  }
-  for (const id of (embeddedModules ? moduleIds : ['crossex', 'variational', 'greeks'])) {
-    const marker = `seeded-${id}-v1`;
-    if (getSetting(marker)) continue;
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const project = (embeddedModules ? moduleCatalog : defaults).find(item => item.id === id);
-      // Keep existing connections intact; the marker also preserves a later user deletion.
-      stmt.prepare('INSERT OR IGNORE INTO projects(id,json) SELECT ?,? WHERE (SELECT COUNT(*) FROM projects) < ?').run(project.id, JSON.stringify(project), MAX_PROJECTS);
-      stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run(marker, '1');
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
-  }
-  if (!getSetting('updated-crossex-live-description-v1')) {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const row = stmt.prepare('SELECT json FROM projects WHERE id=?').get('crossex');
-      const project = row ? JSON.parse(row.json) : null;
-      if (project?.description === '同币种跨交易所永续价差套利模拟') {
-        project.description = defaults.find(item => item.id === 'crossex').description;
-        stmt.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'crossex');
-      }
-      stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-crossex-live-description-v1', '1');
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
-  }
-  if (!embeddedModules && !getSetting('updated-variational-description-v1')) {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const row = stmt.prepare('SELECT json FROM projects WHERE id=?').get('variational');
-      const project = row ? JSON.parse(row.json) : null;
-      if (project?.description === 'CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟') {
-        project.description = defaults.find(item => item.id === 'variational').description;
-        stmt.prepare('UPDATE projects SET json=? WHERE id=?').run(JSON.stringify(project), 'variational');
-      }
-      stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?)').run('updated-variational-description-v1', '1');
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
-  }
+  try { await ensurePassword(control, { initialPassword, log }); seedProjects(control, { embeddedModules }); }
+  catch (error) { db.close(); throw error; }
   const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv('aes-256-gcm', key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString('base64'); };
   const decrypt = value => { if (!value) return null; const buffer = Buffer.from(value, 'base64'); const cipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12)); cipher.setAuthTag(buffer.subarray(12, 28)); return JSON.parse(Buffer.concat([cipher.update(buffer.subarray(28)), cipher.final()]).toString()); };
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
@@ -146,16 +72,16 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   // A legacy external-module launch must not turn off protection for data that
   // already belongs to a managed or recovered authority.
   const sharedAccountWriter = accountWriter || (embeddedModules || existsSync(writerDatabase) || existsSync(`${writerDatabase}.required`) ? createAccountWriter({ databasePath: writerDatabase, runtimeId: randomUUID(), moduleId: 'hub' }) : null);
-  const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: id => !!stmt.prepare('SELECT 1 FROM sessions WHERE id=? AND expires>?').get(id, Date.now()) });
+  const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
   const moduleUpdateGuard = embeddedModules ? createModuleUpdateGuard() : null;
   const updates = createUpdateCoordinator({ client: updatesClient || createUpdateClient(), execution,
     ...(moduleUpdateGuard ? { setModuleMaintenance: moduleUpdateGuard.setMaintenance, tradingModules, moduleIds, prepareApply: moduleUpdateGuard.prepareApply } : {}),
     readMaintenance: () => getSetting('updates-maintenance') === '1',
-    writeMaintenance: active => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-maintenance', active ? '1' : '0'),
+    writeMaintenance: active => setSetting('updates-maintenance', active ? '1' : '0'),
     readPendingPlanId: () => getSetting('updates-pending-plan') || null,
-    writePendingPlanId: planId => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-plan', planId || ''),
+    writePendingPlanId: planId => setSetting('updates-pending-plan', planId || ''),
     readPendingDeployMode: () => getSetting('updates-pending-deploy-mode') || 'source',
-    writePendingDeployMode: mode => stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('updates-pending-deploy-mode', mode),
+    writePendingDeployMode: mode => setSetting('updates-pending-deploy-mode', mode),
   });
   // Native execution is not gated by any one embedded trading module's maintenance sync.
   const native = { scope: 'native' };
@@ -174,8 +100,8 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       return { ...module, ...preferences, revision: hash(JSON.stringify([module, preferences])) };
     }
     const credentials = decrypt(row.credentials); return { authOrigin: '', accessMode: ['aster', 'monitor', 'asset'].includes(project.adapter) ? 'proxy' : 'direct', autoSync: project.adapter === 'asset', ...project, revision: hash(`${row.json}\0${row.credentials || ''}`), hasCredentials: !!credentials?.password, ...(credentials?.username ? { username: credentials.username } : {}) }; };
-  const getProjects = () => stmt.prepare('SELECT * FROM projects').all().map(publicProject).filter(Boolean).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
-  const rowFor = id => { if (embeddedModules && !moduleIds.includes(id)) throw new HttpError(404, '模块已移除'); const row = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
+  const getProjects = () => projects.all().map(publicProject).filter(Boolean).sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+  const rowFor = id => { if (embeddedModules && !moduleIds.includes(id)) throw new HttpError(404, '模块已移除'); const row = projects.get(id); if (!row) throw new HttpError(404, '项目不存在'); return row; };
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   let baseline = null;
   async function observedSummary(...args) {
@@ -198,7 +124,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const expireLockouts = now => { for (const [account, lockout] of accountLockouts) if (!lockout.pending && (lockout.until ? lockout.until <= now : now - lockout.firstFailureAt >= accountLockoutMs)) accountLockouts.delete(account); };
   let closed = false;
   const updateStream = createUpdateStream({ readState: updates.status,
-    isSessionActive: id => !closed && !!stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+    isSessionActive: id => !closed && sessions.isActive(id),
   });
   let assetSync = null;
   const streams = new Map();
@@ -210,18 +136,18 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   function publishOverview() {
     let message, data;
     for (const [res, current] of streams) {
-      if (closed || !stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(current.id, Date.now())) { res.end(); streams.delete(res); continue; }
+      if (closed || !sessions.isActive(current.id)) { res.end(); streams.delete(res); continue; }
       if (res.writableLength > 256 * 1024) { baseline?.observeSlowConsumer(); res.destroy(); streams.delete(res); continue; }
       data ??= overview();
       if (current.encode) res.write(`data: ${JSON.stringify(current.encode(data))}\n\n`);
       else { message ??= `data: ${JSON.stringify(data)}\n\n`; res.write(message); }
     }
   }
-  const projectRevision = id => { if (embeddedModules) return getProjects().find(item => item.id === id)?.revision || null; const row = stmt.prepare('SELECT json,credentials FROM projects WHERE id=?').get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
+  const projectRevision = id => { if (embeddedModules) return getProjects().find(item => item.id === id)?.revision || null; const row = projects.get(id); return row ? hash(`${row.json}\0${row.credentials || ''}`) : null; };
   const tradingImporter = createTradingImporter({ trading, request: tradingImportRequest, sourceTimeoutMs: tradingImportSourceTimeoutMs, importTimeoutMs: tradingImportTimeoutMs,
-    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = embeddedModules ? publicProject(row) : JSON.parse(row.json); return project?.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => projects.all().filter(row => { const project = embeddedModules ? publicProject(row) : JSON.parse(row.json); return project?.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
   });
-  const assetTargets = () => stmt.prepare('SELECT * FROM projects').all().filter(row => { const project = embeddedModules ? publicProject(row) : JSON.parse(row.json); return project?.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) }));
+  const assetTargets = () => projects.all().filter(row => { const project = embeddedModules ? publicProject(row) : JSON.parse(row.json); return project?.enabled && project.adapter === 'asset'; }).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) }));
   const assetPositions = createAssetPositions({ request: assetPositionsRequest, cacheMs: assetPositionsCacheMs, timeoutMs: assetPositionsTimeoutMs, now: assetPositionsNow, backgroundIntervalMs: assetPositionsBackgroundMs,
     listTargets: assetTargets,
   });
@@ -230,7 +156,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     ...(embeddedModules ? { withMutation: updates.withExecutionEntry } : {}),
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
     getProjectRevision: projectRevision,
-    isSessionValid: id => !!stmt.prepare('SELECT id FROM sessions WHERE id=? AND expires>?').get(id, Date.now()),
+    isSessionValid: sessions.isActive,
     authenticateProject: async ({ projectId, revision, deadline, signal }) => {
       if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
       const row = rowFor(projectId);
@@ -278,7 +204,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       try {
         const data = await observedSummary(project, embeddedModules ? null : decrypt(row.credentials), { deadline: start + timeoutMs, signal: controller.signal });
         if (closed) return null;
-        const latest = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id);
+        const latest = projects.get(id);
         if (!latest) return null;
         if (latest.json !== row.json || latest.credentials !== row.credentials) return snapshot(publicProject(latest));
         const value = { state: data.state || (data.stale ? 'stale' : data.partial ? 'partial' : 'online'), message: data.message, checkedAt, lastSuccessAt: new Date(Date.now()).toISOString(), updatedAt: data.updatedAt || null, latencyMs: Date.now() - start, metrics: data.metrics, ...(data.staleAfterSeconds ? { staleAfterSeconds: data.staleAfterSeconds } : {}), ...(data.freshness === 'static' ? { freshness: 'static' } : {}), ...(data.trend ? { trend: data.trend } : {}) };
@@ -288,7 +214,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         stmt.prepare('INSERT INTO snapshots(id,json) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json').run(id, JSON.stringify(value)); states.set(id, value);
       } catch (error) {
         if (closed) return null;
-        const latest = stmt.prepare('SELECT * FROM projects WHERE id=?').get(id);
+        const latest = projects.get(id);
         if (!latest) return null;
         if (latest.json !== row.json || latest.credentials !== row.credentials) return snapshot(publicProject(latest));
         const unauthorized = error instanceof UpstreamError && error.code === 'unauthorized';
@@ -325,8 +251,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   function session(req) {
     const cookie = (req.headers.cookie || '').split(';').map(part => part.trim()).find(part => part.startsWith('hub_session='))?.slice(12);
     if (!cookie || !/^[A-Za-z0-9_-]{43}$/.test(cookie)) return null;
-    const row = stmt.prepare('SELECT * FROM sessions WHERE id=? AND expires>?').get(hash(cookie), Date.now());
-    return row || null;
+    return sessions.find(hash(cookie));
   }
   function sameOrigin(req) {
     const origin = req.headers.origin;
@@ -400,12 +325,12 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       if (!reserved.pending) accountLockouts.delete(accountId);
       if (loginAttempts.get(ip) === attempt) { attempt.count -= 1; if (attempt.count === 0) loginAttempts.delete(ip); }
 
-      stmt.prepare('DELETE FROM sessions WHERE expires<=?').run(now);
+      sessions.deleteExpired(now);
       // Security: Always delete old session and generate new ID on login to prevent session fixation
-      if (current) stmt.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
+      if (current) sessions.delete(current.id);
       // Always generate a fresh session ID and CSRF token after successful authentication
       const raw = token(); const csrf = token();
-      stmt.prepare('INSERT INTO sessions(id,csrf,expires) VALUES (?,?,?)').run(hash(raw), csrf, now + SESSION_AGE);
+      sessions.create(hash(raw), csrf, now + SESSION_AGE);
       send(res, 200, { authenticated: true, csrfToken: csrf }, { 'Set-Cookie': `hub_session=${raw}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_AGE / 1000}${secureCookies ? '; Secure' : ''}` }); return;
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
@@ -439,7 +364,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     }
     if (pathname === '/api/logout' && req.method === 'POST') {
       log.info({ ip: req.socket.remoteAddress, type: 'auth_logout' }, '用户登出');
-      stmt.prepare('DELETE FROM sessions WHERE id=?').run(current.id);
+      sessions.delete(current.id);
       publishOverview();
       updateStream.revalidate();
       send(res, 200, { ok: true }, { 'Set-Cookie': `hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secureCookies ? '; Secure' : ''}` });
@@ -532,9 +457,9 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
       const body = await bodyOf(req);
       if (getProjects().length >= MAX_PROJECTS) throw new HttpError(400, `最多接入 ${MAX_PROJECTS} 个项目`);
       const value = validateProject(body); value.id = body.id || randomBytes(8).toString('hex');
-      if (stmt.prepare('SELECT id FROM projects WHERE id=?').get(value.id)) throw new HttpError(409, '项目标识已存在');
+      if (projects.exists(value.id)) throw new HttpError(409, '项目标识已存在');
       const credentials = body.password ? encrypt({ password: body.password, username: body.username || '' }) : null;
-      stmt.prepare('INSERT INTO projects(id,json,credentials) VALUES (?,?,?)').run(value.id, JSON.stringify(value), credentials);
+      projects.insert(value.id, JSON.stringify(value), credentials);
       send(res, 201, { project: publicProject(rowFor(value.id)) }); void check(value.id).catch(() => {}); if (assetSyncIntervalMs > 0) void assetSync.refresh(); return;
     }
     const match = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)(\/(?:check|launch|sync))?$/);
@@ -548,7 +473,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         if (body.staleAfterSeconds !== undefined && (!Number.isInteger(body.staleAfterSeconds) || body.staleAfterSeconds < 30 || body.staleAfterSeconds > 86400)) throw new HttpError(400, '数据过期时间无效');
         if (body.order !== undefined && (!Number.isInteger(body.order) || body.order < 0 || body.order > 9999)) throw new HttpError(400, '排列顺序无效');
         const preferences = { ...JSON.parse(getSetting('module-preferences:' + id) || '{}'), ...body };
-        stmt.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('module-preferences:' + id, JSON.stringify(preferences));
+        setSetting('module-preferences:' + id, JSON.stringify(preferences));
         assetFills.invalidate(id);
         states.delete(id); publishOverview();
         if (assetSyncIntervalMs > 0) void assetSync.refresh();
@@ -571,14 +496,14 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
         const previous = boundaryChanged || body.clearCredentials ? null : decrypt(row.credentials);
         const credentials = body.password ? encrypt({ password: body.password, username: body.username ?? previous?.username ?? '' }) : previous ? encrypt({ ...previous, username: body.username ?? previous.username }) : null;
         const inFlight = pending.get(id);
-        stmt.prepare('UPDATE projects SET json=?,credentials=? WHERE id=?').run(JSON.stringify(value), credentials, id);
+        projects.update(id, JSON.stringify(value), credentials);
         assetPositions.invalidate(id); assetFills.invalidate(id);
         if (boundaryChanged || prior.enabled !== value.enabled || prior.staleAfterSeconds !== value.staleAfterSeconds || (value.adapter === 'monitor' && prior.url !== value.url) || body.password || body.clearCredentials || (body.username !== undefined && body.username !== decrypt(row.credentials)?.username)) stmt.prepare('DELETE FROM snapshots WHERE id=?').run(id);
         states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { project: publicProject(rowFor(id)) });
-        if (inFlight) void inFlight.finally(() => { if (!closed && stmt.prepare('SELECT id FROM projects WHERE id=?').get(id)) void check(id).catch(() => {}); }).catch(() => {});
+        if (inFlight) void inFlight.finally(() => { if (!closed && projects.exists(id)) void check(id).catch(() => {}); }).catch(() => {});
         else void check(id).catch(() => {}); return;
       }
-      if (!match[2] && req.method === 'DELETE') { stmt.prepare('DELETE FROM projects WHERE id=?').run(id); assetPositions.invalidate(id); assetFills.invalidate(id); states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
+      if (!match[2] && req.method === 'DELETE') { projects.delete(id); assetPositions.invalidate(id); assetFills.invalidate(id); states.delete(id); publishOverview(); if (assetSyncIntervalMs > 0) void assetSync.refresh(); send(res, 200, { ok: true }); return; }
     }
     throw new HttpError(404, '接口不存在');
   }
@@ -611,7 +536,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = 60000; server.headersTimeout = 10000; server.maxHeadersCount = 80;
   assetSync = createAssetSync({
-    listTargets: () => stmt.prepare('SELECT * FROM projects').all().filter(row => !embeddedModules || moduleIds.includes(row.id)).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
+    listTargets: () => projects.all().filter(row => !embeddedModules || moduleIds.includes(row.id)).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
     intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
     autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader,
     onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
@@ -646,7 +571,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   baseline.start();
   return {
     server, check, refresh, assetSync, trading, execution, baseline, dataDir: resolvedData, resynchronizeModules: updates.resynchronize,
-    async resetPassword() { const password = randomBytes(18).toString('base64url'); stmt.prepare('UPDATE settings SET value=? WHERE key=?').run(await passwordRecord(password), 'password'); db.exec('DELETE FROM sessions'); publishOverview(); updateStream.revalidate(); return password; },
+    async resetPassword() { const password = await resetPassword(control); publishOverview(); updateStream.revalidate(); return password; },
     async close() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); await updates.close(); for (const res of streams.keys()) res.end(); streams.clear(); await baseline.close(); await updateStream.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); portal.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); db.close(); },
   };
 }
