@@ -1,7 +1,6 @@
 import { ASSETS, API_URL, YEAR_START, DAY, requestInfo } from './hyperliquid.mjs';
 
 export const HOUR = 3_600_000;
-const YEAR_END = Date.UTC(2027, 0, 1);
 
 function numeric(value, label) {
   if (!['number', 'string'].includes(typeof value) || (typeof value === 'string' && !value.trim()) || !Number.isFinite(Number(value))) throw new Error(`Invalid ${label}`);
@@ -17,7 +16,7 @@ export function pairFundingHistory(brentRecords, wtiRecords, endTime = Date.now(
       const time = numeric(record.time, 'settlement time');
       const rate = numeric(record.fundingRate, 'settled hourly rate');
       if (!Number.isSafeInteger(time)) throw new Error('Invalid settlement timestamp');
-      if (time < YEAR_START || time >= YEAR_END || time > endTime) continue;
+      if (time < YEAR_START || time > endTime) continue;
       // Settlement blocks can be a few milliseconds after the UTC hour.
       const hour = Math.floor(time / HOUR) * HOUR;
       if (map.has(hour) && map.get(hour) !== rate) throw new Error(`Conflicting hourly rates for ${coin}`);
@@ -33,7 +32,7 @@ export function validateFundingRows(rows) {
   if (!Array.isArray(rows)) throw new Error('Invalid funding rows');
   let previous = -Infinity;
   return rows.map(row => {
-    if (!Number.isSafeInteger(row.time) || row.time % HOUR !== 0 || row.time < YEAR_START || row.time >= YEAR_END || row.time <= previous) throw new Error('Invalid or unordered funding hour');
+    if (!Number.isSafeInteger(row.time) || row.time % HOUR !== 0 || row.time < YEAR_START || !Number.isFinite(new Date(row.time).getTime()) || row.time <= previous) throw new Error('Invalid or unordered funding hour');
     previous = row.time;
     const brent = row.brent === null ? null : numeric(row.brent, 'Brent historical rate');
     const wti = row.wti === null ? null : numeric(row.wti, 'WTI historical rate');
@@ -59,7 +58,7 @@ export function dailyFundingRates(rows) {
 /** Sum actual paired settlements across the entire selected UTC date interval. */
 export function analyzeFundingRange(rows, firstDate, lastDate) {
   const start = Date.parse(`${firstDate}T00:00:00Z`), end = Date.parse(`${lastDate}T00:00:00Z`) + DAY;
-  if (![firstDate, lastDate].every(date => /^2026-\d{2}-\d{2}$/.test(date)) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || new Date(start).toISOString().slice(0, 10) !== firstDate || new Date(end - DAY).toISOString().slice(0, 10) !== lastDate) throw new Error('Invalid funding date range');
+  if (![firstDate, lastDate].every(date => /^\d{4}-\d{2}-\d{2}$/.test(date)) || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || new Date(start).toISOString().slice(0, 10) !== firstDate || new Date(end - DAY).toISOString().slice(0, 10) !== lastDate) throw new Error('Invalid funding date range');
   const days = new Map();
   for (const row of validateFundingRows(rows)) {
     if (row.time < start || row.time >= end || row.brent === null || row.wti === null) continue;
@@ -131,7 +130,7 @@ export async function fetchFundingHistory(coin, startTime, endTime, options = {}
 
 /** @param {{ data: Array<{time: number, brent: number | null, wti: number | null}>, metadata: {fetchedAt: string} } | null} existing */
 export async function fetchFundingSnapshot(existing = null, options = {}) {
-  const now = options.now ?? Date.now(), endTime = Math.min(now, YEAR_END - 1);
+  const now = options.now ?? Date.now(), endTime = now;
   const previous = existing ? createFundingSnapshot(existing.data, existing.metadata.fetchedAt) : null;
   let missing = Infinity, expected = previous?.data[0]?.time;
   for (const row of previous?.data ?? []) {

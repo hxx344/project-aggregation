@@ -69,8 +69,8 @@ export function validateOilHistory(input: unknown) {
   if (metadata.source !== SOURCE || metadata.currency !== 'USDT' || metadata.interval !== '1d' || metadata.timezone !== 'UTC') throw new Error('Expected Binance daily history');
   let previous = "";
   const data = list(history.data).map(item => {
-    const row = object(item);
-    if (typeof row.date !== "string" || !/^2026-\d{2}-\d{2}$/.test(row.date) || row.date <= previous || !Number.isFinite(Date.parse(row.date)) || Date.parse(row.date) + 86_400_000 > Date.parse(fetchedAt)) throw new Error("Invalid oil candle date");
+    const row = object(item), time = typeof row.date === "string" ? Date.parse(row.date) : NaN;
+    if (typeof row.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(row.date) || row.date <= previous || !Number.isFinite(time) || new Date(time).toISOString().slice(0, 10) !== row.date || time + 86_400_000 > Date.parse(fetchedAt)) throw new Error("Invalid oil candle date");
     previous = row.date;
     return { date: row.date, brent: row.brent === null ? null : finite(row.brent, true), wti: row.wti === null ? null : finite(row.wti, true) };
   });
