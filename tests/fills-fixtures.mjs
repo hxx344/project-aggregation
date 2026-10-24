@@ -9,6 +9,11 @@ export const payload = () => ({ schemaVersion: 1, generatedAt: STAMP, lookbackSt
     { id: 'um', label: 'U 本位', status: 'live', refreshing: false, fetchedAt: STAMP, coverageStart: LOOKBACK, coverageEnd: STAMP, truncated: false, error: null, fills: [fill()] },
   ] }] },
 ] });
+export const hynixPayload = () => {
+  const data = payload();
+  data.exchanges[0].accounts[0].scopes[0].fills = [fill({ id: 'fill-h', symbol: 'SKHYUSDT', base: 'SKHY', quantityUnit: 'SKHY', price: '38.5' })];
+  return data;
+};
 export const scope = data => data.exchanges[0].accounts[0].scopes[0];
 export const response = () => ({ generatedAt: STAMP, sources: [
   { projectId: 'asset', name: 'Asset 账本', status: 'ready', checkedAt: STAMP, error: null, data: payload() },

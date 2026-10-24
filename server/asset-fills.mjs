@@ -2,6 +2,12 @@ import { createAssetSnapshot } from './asset-snapshot.mjs';
 
 export const ASSET_FILLS_TIMEOUT_MS = 12_000;
 export const ASSET_FILLS_CACHE_MS = 20_000;
+// While Asset is still reading a scope, follow-ups must see its result within seconds.
+export const ASSET_FILLS_PENDING_CACHE_MS = 3_000;
+export const ASSET_FILLS_BACKGROUND_MS = 60_000;
+// Only a market a page read within this window keeps being warmed; the Asset fill cache covers later reopens.
+export const ASSET_FILLS_BACKGROUND_IDLE_MS = 6 * 60 * 60_000;
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] };
 export const ASSET_FILLS_STALE_MS = 15 * 60_000;
 // 5,000 fills with six 128-character decimal fields and bounded labels can
 // exceed 2 MiB. Allow ~2 KiB per fill plus scope metadata, still with a hard cap.
@@ -42,7 +48,8 @@ function unique(rows, maximum, map, fillIds = false) {
 
 // Reject the whole source on a malformed row: dropping fills would silently
 // change the event grouping and its opening/closing quantities.
-export function normalizeAssetFills(data, now = Date.now()) {
+export function normalizeAssetFills(data, now = Date.now(), market = 'oil') {
+  const bases = FILL_MARKETS[market];
   if (!object(data) || data.schemaVersion !== 1) throw malformed();
   const generatedAt = timestamp(data.generatedAt, now, false), lookbackStart = timestamp(data.lookbackStart, now, false);
   if (lookbackStart > generatedAt) throw malformed();
@@ -66,7 +73,7 @@ export function normalizeAssetFills(data, now = Date.now()) {
             || !fullyTruncated && (coverageStart === null) !== (coverageEnd === null)
             || coverageStart && coverageEnd && coverageStart > coverageEnd) throw malformed();
           const fills = unique(scope.fills, 2000, row => {
-            if (++count > 5000 || !['CL', 'BZ'].includes(row.base) || !['buy', 'sell'].includes(row.side)
+            if (++count > 5000 || !bases.includes(row.base) || !['buy', 'sell'].includes(row.side)
               || !['long', 'short', 'net'].includes(row.positionSide) || !['USDT', 'USDC'].includes(row.priceCurrency)) throw malformed();
             const symbol = label(row.symbol);
             const symbols = exchange.id === 'okx' ? [`${row.base}-USDT-SWAP`]
@@ -104,8 +111,12 @@ export function ageAssetFills(data, now = Date.now(), failed = false) {
   })) })) };
 }
 
-function sourceError(error) {
+export const fillsPending = data => data.exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status === 'loading' || scope.refreshing)));
+
+function sourceError(error, market) {
   if ([404, 405].includes(error?.statusCode)) return '此 Asset 尚不支持只读成交，请先更新 Asset';
+  // Assets released before market queries reject the unknown parameter.
+  if (market !== 'oil' && error?.statusCode === 400) return '此 Asset 尚不支持海力士成交，请先更新 Asset';
   if ([401, 403].includes(error?.statusCode)) return 'Asset 登录失败，请检查项目中保存的登录密码';
   if (error?.statusCode === 429) return 'Asset 暂时限流，请稍后重试';
   if (error?.code === 'insecure_transport') return 'Asset 连接需要 HTTPS 或本机回环地址';
@@ -114,9 +125,12 @@ function sourceError(error) {
   return '暂时无法读取 Asset 成交，请检查项目连接';
 }
 
-export function createAssetFills({ cacheMs = ASSET_FILLS_CACHE_MS, timeoutMs = ASSET_FILLS_TIMEOUT_MS, ...options } = {}) {
+export function createAssetFills({ market = 'oil', cacheMs = ASSET_FILLS_CACHE_MS, pendingCacheMs = ASSET_FILLS_PENDING_CACHE_MS, timeoutMs = ASSET_FILLS_TIMEOUT_MS, backgroundIdleMs = ASSET_FILLS_BACKGROUND_IDLE_MS, ...options } = {}) {
+  if (!Object.hasOwn(FILL_MARKETS, market)) throw new Error('unknown_fills_market');
   // The shared reader invalidates on project/credential revision, removal or
   // shutdown. Authentication gets at most one retry, inside the same deadline.
-  return createAssetSnapshot({ ...options, cacheMs, timeoutMs, path: '/api/hub/fills', sessionScope: 'asset-fills',
-    limit: ASSET_FILLS_RESPONSE_LIMIT, normalize: normalizeAssetFills, age: ageAssetFills, sourceError });
+  // Oil keeps the original path so an Asset without market queries still serves it.
+  return createAssetSnapshot({ ...options, backgroundIdleMs, cacheMs, cacheMsFor: data => fillsPending(data) ? Math.min(cacheMs, pendingCacheMs) : cacheMs, timeoutMs,
+    path: market === 'oil' ? '/api/hub/fills' : '/api/hub/fills?market=' + market, sessionScope: 'asset-fills',
+    limit: ASSET_FILLS_RESPONSE_LIMIT, normalize: (data, now) => normalizeAssetFills(data, now, market), age: ageAssetFills, sourceError: error => sourceError(error, market) });
 }

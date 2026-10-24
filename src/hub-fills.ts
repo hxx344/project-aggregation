@@ -3,13 +3,17 @@ import type { PositionsOutcome } from './hub-positions';
 export const FILLS_CAPABILITIES = ['fills'] as const;
 export const FILLS_TIMEOUT_MS = 15_000;
 export const FILLS_CACHE_MS = 20_000;
+// A pending read is polled every few seconds; hold it only briefly so a finished scope shows at once.
+export const FILLS_PENDING_CACHE_MS = 3_000;
 export const FILLS_STALE_AFTER_MS = 15 * 60_000;
 export const MAX_FILL_ITEMS = 2000;
-export type FillsRequest = { requestId: string; market: 'oil' };
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] } as const;
+export type FillMarket = keyof typeof FILL_MARKETS;
+export type FillsRequest = { requestId: string; market: FillMarket };
 type ScopeStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';
 export type HubFillItem = {
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
-  symbol: string; base: 'CL' | 'BZ'; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
+  symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
   quantity: string; quantityUnit: string; price: string; priceCurrency: 'USDT' | 'USDC';
   fee: string | null; feeCurrency: string | null; realizedPnl: string | null; positionBefore: string | null; positionAfter: string | null; stale: boolean;
 };
@@ -18,17 +22,17 @@ export type FillCoverage = {
   fetchedAt: string | null; coverageStart: string | null; coverageEnd: string | null; error: string | null;
 };
 export type FillsReply = {
-  type: 'fills'; requestId: string; market: 'oil'; status: 'ok' | 'unavailable' | 'unauthorized';
+  type: 'fills'; requestId: string; market: FillMarket; status: 'ok' | 'unavailable' | 'unauthorized';
   generatedAt: string | null; lookbackStart: string | null; pending: boolean; incomplete: boolean; truncated: boolean;
   coverage: FillCoverage[]; items: HubFillItem[];
 };
 
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 export function fillsRequest(value: unknown): FillsRequest | null {
-  if (!record(value) || value.type !== 'fills-request' || value.market !== 'oil'
+  if (!record(value) || value.type !== 'fills-request' || typeof value.market !== 'string' || !Object.hasOwn(FILL_MARKETS, value.market)
     || typeof value.requestId !== 'string' || !/^[A-Za-z0-9-]{1,64}$/.test(value.requestId)
     || Object.keys(value).some(key => !['channel', 'version', 'type', 'market', 'requestId'].includes(key))) return null;
-  return { requestId: value.requestId, market: 'oil' };
+  return { requestId: value.requestId, market: value.market as FillMarket };
 }
 
 class MalformedFills extends Error {}
@@ -53,7 +57,7 @@ function decimal(value: unknown, positive = false): string | null {
   return result;
 }
 
-export function fillItems(response: unknown, now: number) {
+export function fillItems(response: unknown, now: number, market: FillMarket = 'oil') {
   const items: HubFillItem[] = [], coverage: FillCoverage[] = [], seen = new Set<string>();
   let pending = false, incomplete = false, truncated = false, lookbackStart: string | null = null;
   for (const sourceValue of list(object(response).sources)) {
@@ -91,7 +95,7 @@ export function fillItems(response: unknown, now: number) {
           coverage.push({ sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, account: accountName, scope: scopeId,
             status: coverageStatus, fetchedAt, coverageStart, coverageEnd, error });
           for (const fillValue of list(scope.fills)) {
-            const fill = object(fillValue), base = enumeration(fill.base, ['CL', 'BZ'] as const);
+            const fill = object(fillValue), base = enumeration(fill.base, FILL_MARKETS[market]);
             const priceCurrency = enumeration(fill.priceCurrency, ['USDT', 'USDC'] as const), symbol = text(fill.symbol);
             const symbols = exchangeId === 'okx' ? [`${base}-USDT-SWAP`]
               : exchangeId === 'binance' ? [`${base}USDT`]
@@ -124,9 +128,18 @@ export function fillsReply(request: FillsRequest, outcome: PositionsOutcome, now
     pending: false, incomplete: true, truncated: false, coverage: [], items: [] });
   if (outcome.status !== 'ok') return failed(outcome.status);
   try {
-    return { type: 'fills', ...request, status: 'ok', generatedAt: timestamp(object(outcome.data).generatedAt), ...fillItems(outcome.data, now) };
+    return { type: 'fills', ...request, status: 'ok', generatedAt: timestamp(object(outcome.data).generatedAt), ...fillItems(outcome.data, now, request.market) };
   } catch (error) {
     if (error instanceof MalformedFills) return failed('unavailable');
     throw error;
   }
+}
+
+/** Malformed data is left to fillsReply to reject; here it only counts as not pending. */
+export function fillsCacheMs(outcome: PositionsOutcome) {
+  const items = (value: unknown, key: string) => record(value) && Array.isArray(value[key]) ? value[key] as unknown[] : [];
+  const pending = outcome.status === 'ok' && items(outcome.data, 'sources').some(source => record(source) && items(source.data, 'exchanges')
+    .some(exchange => items(exchange, 'accounts').some(account => items(account, 'scopes')
+      .some(scope => record(scope) && (scope.status === 'loading' || scope.refreshing === true)))));
+  return pending ? FILLS_PENDING_CACHE_MS : FILLS_CACHE_MS;
 }

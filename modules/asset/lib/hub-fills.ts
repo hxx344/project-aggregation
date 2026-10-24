@@ -8,39 +8,48 @@ import type { Database, SourceAccount, Unseal, ConnectionRow } from './hub-posit
 import { cycleSupported } from './positions-cycle-readers.ts';
 import { CYCLE_LOOKBACK_MS } from './positions-cycle.ts';
 import { MAX_REQUESTS } from './positions-history.ts';
-import { readOilFills } from './hub-fills-readers.ts';
+import { readFills } from './hub-fills-readers.ts';
 import type { FillsRequest } from './hub-fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills } from './hub-fills-replay.ts';
-import type { FillsScope, HubFills, ReadFill } from './hub-fills-types.ts';
+import { FILL_MARKETS } from './hub-fills-types.ts';
+import type { FillMarket, FillsScope, HubFills, ReadFill } from './hub-fills-types.ts';
 
 const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000, OVERLAP = 10 * 60_000;
 const SKEW_RETRY = 30_000, MAX_AUTO_RETRIES = 10;
 const FAILED = '成交读取失败，请检查连接、读取权限及服务器时间；已保留上次数据';
 const CONFLICT = '成交记录存在冲突，暂时无法更新';
-const UNSUPPORTED = '此交易所或产品范围暂不支持原油成交读取';
+const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范围暂不支持原油成交读取', hynix: '此交易所或产品范围暂不支持海力士成交读取' };
 type ReadPositions = (credentials: Credentials, scope: string, signal: AbortSignal, fetcher: typeof fetch) => Promise<Position[]>;
 type ReadFills = (credentials: Credentials, scope: string, request: FillsRequest, options: { signal: AbortSignal; fetcher: typeof fetch }) => Promise<ReadFill[]>;
 type Entry = {
-  revision: string; scope: FillsScope; raw: ReadFill[]; touchedAt: number; retryAt: number; cursor: number | null;
+  market: FillMarket; revision: string; scope: FillsScope; raw: ReadFill[]; touchedAt: number; retryAt: number; cursor: number | null;
   snapshotOkAt?: number; snapshotHealthy?: boolean; pending?: Promise<void>; abort?: AbortController;
   timer?: ReturnType<typeof setTimeout>; retryScheduled: boolean; automaticRetries: number;
 };
-// Bump whenever readOilFills ids/normalization or mergeFills identity change: stored raw fills are merged with new reads.
+// Bump whenever readFills ids/normalization or mergeFills identity change: stored raw fills are merged with new reads.
 const FILL_CACHE_FORMAT = 1;
 type Stored = Pick<Entry, 'scope' | 'raw' | 'cursor' | 'retryAt' | 'snapshotOkAt' | 'snapshotHealthy'> & { version: number };
-// One scope across all owners and service instances, not one slot per account.
-let queue: Promise<void> = Promise.resolve();
-function serial(work: () => Promise<void>) {
-  const job = queue.then(work);
-  queue = job.catch(() => {});
+// One scope per exchange across all owners, markets and service instances: exchanges rate-limit by IP,
+// so accounts of one exchange stay serial while Binance, Bybit and OKX read in parallel.
+const queues = new Map<string, Promise<void>>();
+function serial(exchange: string, work: () => Promise<void>) {
+  const job = (queues.get(exchange) ?? Promise.resolve()).then(work);
+  queues.set(exchange, job.catch(() => {}));
   return job;
 }
-const cacheKey = (owner: string, account: string, scope: string) => JSON.stringify([owner, account, scope]);
+// Oil keeps the bare scope id so rows stored before markets existed stay valid.
+const slotOf = (market: FillMarket, scope: string) => market === 'oil' ? scope : market + ':' + scope;
+function parseSlot(slot: string): { market: FillMarket; scope: string } | null {
+  const at = slot.indexOf(':'), market = slot.slice(0, at);
+  if (at < 0) return { market: 'oil', scope: slot };
+  return market !== 'oil' && Object.hasOwn(FILL_MARKETS, market) ? { market: market as FillMarket, scope: slot.slice(at + 1) } : null;
+}
+const cacheKey = (owner: string, account: string, market: FillMarket, scope: string) => JSON.stringify([owner, account, slotOf(market, scope)]);
 const iso = (time: number) => new Date(time).toISOString();
-function empty(scope: ScopeDefinition, configured: boolean, supported: boolean): FillsScope {
+function empty(scope: ScopeDefinition, configured: boolean, supported: boolean, market: FillMarket): FillsScope {
   return { id: scope.id, label: scope.label, status: !configured ? 'unconfigured' : supported ? 'loading' : 'unsupported',
     refreshing: false, fetchedAt: null, coverageStart: null, coverageEnd: null, truncated: false,
-    error: configured && !supported ? UNSUPPORTED : null, fills: [] };
+    error: configured && !supported ? UNSUPPORTED[market] : null, fills: [] };
 }
 async function current(database: Database, owner: string, account: SourceAccount, revision: string) {
   const row = await database.prepare('SELECT encrypted FROM connections WHERE owner = ? AND exchange = ?').bind(owner, account.key).first<{ encrypted: string }>();
@@ -55,10 +64,14 @@ function parseStored(value: string, definition: ScopeDefinition): Stored | null 
     return data;
   } catch { return null; }
 }
-export function validFillsQuery(url: string) {
+/** The market defaults to oil for hosts that predate other markets; null rejects the query. */
+export function fillsQueryMarket(url: string): FillMarket | null {
   const params = new URL(url).searchParams;
-  return [...params.keys()].every(key => key === 'schemaVersion') && params.getAll('schemaVersion').length <= 1
+  const valid = [...params.keys()].every(key => key === 'schemaVersion' || key === 'market')
+    && params.getAll('schemaVersion').length <= 1 && params.getAll('market').length <= 1
     && (!params.has('schemaVersion') || params.get('schemaVersion') === '1');
+  const market = params.get('market') ?? 'oil';
+  return valid && Object.hasOwn(FILL_MARKETS, market) ? market as FillMarket : null;
 }
 
 /** Credentials never enter the cache. Replaced/deleted credentials abort work and invalidate cache at every poll.
@@ -73,28 +86,28 @@ export function createFillsService(options: { now?: () => number; deadline?: num
   let closed = false;
   // A failed cache write only costs the next cold read a full history read.
   async function save(database: Database, owner: string, account: SourceAccount, entry: Entry) {
-    const { scope, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy } = entry;
+    const { market, scope, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy } = entry;
     const stored: Stored = { version: FILL_CACHE_FORMAT, scope: { ...scope, refreshing: false }, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy };
     await database.prepare('INSERT INTO fill_cache(owner,account,scope,revision,data,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(owner,account,scope) DO UPDATE SET revision=excluded.revision,data=excluded.data,updated_at=excluded.updated_at')
-      .bind(owner, account.key, scope.id, entry.revision, JSON.stringify(stored), now()).run().catch(() => {});
+      .bind(owner, account.key, slotOf(market, scope.id), entry.revision, JSON.stringify(stored), now()).run().catch(() => {});
   }
-  async function forget(database: Database, owner: string, account: string, scope: string, revision: string) {
-    await database.prepare('DELETE FROM fill_cache WHERE owner = ? AND account = ? AND scope = ? AND revision = ?').bind(owner, account, scope, revision).run().catch(() => {});
+  async function forget(database: Database, owner: string, account: string, slot: string, revision: string) {
+    await database.prepare('DELETE FROM fill_cache WHERE owner = ? AND account = ? AND scope = ? AND revision = ?').bind(owner, account, slot, revision).run().catch(() => {});
   }
-  /** Stored scopes for configured accounts that are not in memory; rows of replaced or removed credentials are deleted. */
-  async function restore(database: Database, owner: string, accounts: SourceAccount[]) {
+  /** Stored scopes of one market for configured accounts that are not in memory; rows of replaced or removed credentials are deleted. */
+  async function restore(database: Database, owner: string, accounts: SourceAccount[], market: FillMarket) {
     const restored = new Map<string, Stored>();
     const rows = await database.prepare('SELECT account,scope,revision FROM fill_cache WHERE owner = ?').bind(owner)
       .all<{ account: string; scope: string; revision: string }>().catch(() => ({ results: [] }));
     for (const row of rows.results) {
-      const account = accounts.find(item => item.key === row.account);
-      const definition = POSITIONS_CATALOG.find(item => item.id === account?.exchange)?.scopes.find(item => item.id === row.scope);
-      if (!account?.row || revisionOf(account.row.encrypted) !== row.revision || !definition || !cycleSupported(account.exchange, row.scope)) {
+      const account = accounts.find(item => item.key === row.account), slot = parseSlot(row.scope);
+      const definition = POSITIONS_CATALOG.find(item => item.id === account?.exchange)?.scopes.find(item => item.id === slot?.scope);
+      if (!slot || !account?.row || revisionOf(account.row.encrypted) !== row.revision || !definition || !cycleSupported(account.exchange, slot.scope)) {
         await forget(database, owner, row.account, row.scope, row.revision); continue;
       }
       // A hidden Binance mode never gets an entry; skip it rather than parse its row on every poll.
-      const key = cacheKey(owner, row.account, row.scope);
-      if (entries.has(key) || inactive(owner, account, row.scope, row.revision)) continue;
+      const key = cacheKey(owner, row.account, market, slot.scope);
+      if (slot.market !== market || entries.has(key) || inactive(owner, account, market, slot.scope, row.revision)) continue;
       const data = await database.prepare('SELECT data FROM fill_cache WHERE owner = ? AND account = ? AND scope = ? AND revision = ?')
         .bind(owner, row.account, row.scope, row.revision).first<{ data: string }>().catch(() => null);
       const stored = data && parseStored(data.data, definition);
@@ -123,10 +136,10 @@ export function createFillsService(options: { now?: () => number; deadline?: num
     }, Math.max(0, due - now()));
     entry.timer.unref?.();
   }
-  function inactive(owner: string, account: SourceAccount, scope: string, revision: string) {
+  function inactive(owner: string, account: SourceAccount, market: FillMarket, scope: string, revision: string) {
     if (account.exchange !== 'binance' || !['um', 'pm-um', 'cm', 'pm-cm'].includes(scope)) return false;
-    const own = entries.get(cacheKey(owner, account.key, scope.startsWith('pm-') ? 'pm-um' : 'um'));
-    const other = entries.get(cacheKey(owner, account.key, scope.startsWith('pm-') ? 'um' : 'pm-um'));
+    const own = entries.get(cacheKey(owner, account.key, market, scope.startsWith('pm-') ? 'pm-um' : 'um'));
+    const other = entries.get(cacheKey(owner, account.key, market, scope.startsWith('pm-') ? 'um' : 'pm-um'));
     return !(own?.revision === revision && own.snapshotOkAt !== undefined)
       && other?.revision === revision && other.snapshotHealthy === true && other.snapshotOkAt !== undefined && now() - other.snapshotOkAt < IDLE;
   }
@@ -143,8 +156,8 @@ export function createFillsService(options: { now?: () => number; deadline?: num
       }
       return !closed && entries.get(key) === entry && !abort.signal.aborted;
     };
-    const job = serial(async () => {
-      if (!await valid() || inactive(owner, account, entry.scope.id, entry.revision)) return;
+    const job = serial(account.exchange, async () => {
+      if (!await valid() || inactive(owner, account, entry.market, entry.scope.id, entry.revision)) return;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let onAbort: (() => void) | undefined;
       try {
@@ -168,7 +181,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           const snapshotAt = Math.max(snapshotStart, now());
           const lookback = snapshotAt - CYCLE_LOOKBACK_MS;
           const start = Math.max(lookback, entry.cursor === null ? lookback : entry.cursor - OVERLAP);
-          const incoming = await (options.fills ?? readOilFills)(credentials, entry.scope.id, { start, end: snapshotAt }, { signal: abort.signal, fetcher });
+          const incoming = await (options.fills ?? readFills)(credentials, entry.scope.id, { market: entry.market, start, end: snapshotAt }, { signal: abort.signal, fetcher });
           const raw = mergeFills(entry.raw, incoming, lookback);
           if (raw.some(fill => Date.parse(fill.time) > now() + 60_000)) throw new Error(FAILED);
           const replayed = replayFills(raw, positions, snapshotStart, account.exchange);
@@ -198,7 +211,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
         if (entries.get(key) === entry && !abort.signal.aborted) await save(database, owner, account, entry);
       } catch (error) {
         // A conflicting stored history must not outlive this process; the next cold read starts over.
-        if (error instanceof FillConflict) await forget(database, owner, account.key, entry.scope.id, entry.revision);
+        if (error instanceof FillConflict) await forget(database, owner, account.key, slotOf(entry.market, entry.scope.id), entry.revision);
         if (entries.get(key) === entry && await current(database, owner, account, entry.revision).catch(() => false)) {
           entry.scope = { ...entry.scope, status: error instanceof FillConflict ? 'error' : entry.scope.fetchedAt ? 'stale' : 'error',
             error: error instanceof FillConflict ? CONFLICT : FAILED };
@@ -215,7 +228,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
     entry.pending = job; jobs.add(job);
   }
   return {
-    async read(database: Database, owner: string, unseal: Unseal): Promise<HubFills> {
+    async read(database: Database, owner: string, unseal: Unseal, market: FillMarket = 'oil'): Promise<HubFills> {
       if (closed) throw new Error(FAILED);
       const accounts = await sourceAccounts(database, owner), tick = now(), keep = new Set<string>();
       for (const [key, entry] of entries) {
@@ -225,7 +238,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           remove(key, entry);
         }
       }
-      const restored = await restore(database, owner, accounts);
+      const restored = await restore(database, owner, accounts, market);
       if (closed) throw new Error(FAILED);
       const exchanges: HubFills['exchanges'] = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
         accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
@@ -233,18 +246,18 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           // Probe PM first; a successful PM snapshot suppresses the queued classic probe and its fapi history.
           const definitions = [...exchange.scopes].sort((a, b) => Number(b.id === 'pm-um') - Number(a.id === 'pm-um'));
           const scopes = definitions.flatMap(definition => {
-            const key = cacheKey(owner, account.key, definition.id); keep.add(key);
+            const key = cacheKey(owner, account.key, market, definition.id); keep.add(key);
             const supported = cycleSupported(exchange.id, definition.id);
-            if (!revision) return [empty(definition, false, supported)];
-            if (inactive(owner, account, definition.id, revision)) return [];
-            if (!supported) return [empty(definition, true, false)];
+            if (!revision) return [empty(definition, false, supported, market)];
+            if (inactive(owner, account, market, definition.id, revision)) return [];
+            if (!supported) return [empty(definition, true, false, market)];
             let entry = entries.get(key);
             if (!entry) {
               // Old mode evidence would pin a Binance account to both modes; a clock set back must not postpone refresh.
               const stored = restored.get(key), recent = stored?.snapshotOkAt !== undefined && tick - stored.snapshotOkAt < IDLE;
-              entry = stored ? { revision, scope: stored.scope, raw: stored.raw, touchedAt: tick, retryAt: Math.min(stored.retryAt, tick + TTL), cursor: stored.cursor,
+              entry = stored ? { market, revision, scope: stored.scope, raw: stored.raw, touchedAt: tick, retryAt: Math.min(stored.retryAt, tick + TTL), cursor: stored.cursor,
                 ...(recent ? { snapshotOkAt: stored.snapshotOkAt, snapshotHealthy: stored.snapshotHealthy } : {}), retryScheduled: false, automaticRetries: 0 }
-                : { revision, scope: empty(definition, true, true), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null,
+                : { market, revision, scope: empty(definition, true, true, market), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null,
                   retryScheduled: false, automaticRetries: 0 };
               entries.set(key, entry);
             }
@@ -263,7 +276,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           return { id: account.id, name: account.name, configured: !!revision, revision, scopes };
         }),
       }));
-      for (const [key, entry] of entries) if (JSON.parse(key)[0] === owner && !keep.has(key)) remove(key, entry);
+      for (const [key, entry] of entries) if (JSON.parse(key)[0] === owner && entry.market === market && !keep.has(key)) remove(key, entry);
       const latest = await database.prepare('SELECT exchange,encrypted FROM connections WHERE owner = ?').bind(owner).all<ConnectionRow>();
       for (const account of accounts) {
         const row = latest.results.find(item => item.exchange === account.key);
@@ -276,7 +289,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
       const gate = latest.results.find(item => item.exchange === 'gate');
       if (gate) exchanges.push({ id: 'gate', name: 'Gate', accounts: [{
         id: 'default', name: '默认账号', configured: true, revision: revisionOf(gate.encrypted),
-        scopes: [empty({ id: 'portfolio', label: '账户资产' }, true, false)],
+        scopes: [empty({ id: 'portfolio', label: '账户资产' }, true, false, market)],
       }] });
       const scopes = exchanges.flatMap(exchange => exchange.accounts.flatMap(account => account.scopes));
       const retained = new Set(scopes.flatMap(scope => scope.fills).sort(fillsNewestFirst).slice(0, 5000));

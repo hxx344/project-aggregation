@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyFill, groupTradeEvents, TRADE_GAP_MS } from '../modules/oil/trades.mjs';
+import { classifyFill, groupTradeEvents, TRADE_GAP_MS, TRADE_PAIRS } from '../modules/oil/trades.mjs';
 import { fill } from './oil-trades-fixtures.mjs';
 
 const bz = (overrides = {}) => fill({ key: 'bz', symbol: 'BZUSDT', base: 'BZ', quantityUnit: 'BZ', price: '110', side: 'sell', positionAfter: '-2', ...overrides });
@@ -77,4 +77,15 @@ test('fees and PnL keep currency separation, unknown components and cross-zero c
   assert.equal(groupTradeEvents([fill({ fee: null, feeCurrency: null })])[0].fees[0].amount, null);
   assert.equal(groupTradeEvents([fill({ fee: null, feeCurrency: null })])[0].fees[0].known, null);
   assert.equal(groupTradeEvents([fill({ fee: '-1', feeCurrency: null }), bz({ fee: '-2', feeCurrency: null })])[0].fees[0].amount, null, 'unknown currencies cannot be added together');
+});
+
+test('hynix pairs ADR with the ordinary share at ten ADRs per share and names the premium direction', () => {
+  const adr = fill({ key: 'h|1', symbol: 'SKHYUSDT', base: 'SKHY', quantityUnit: 'SKHY', side: 'sell', quantity: '10', price: '42', positionBefore: '0', positionAfter: '-10' });
+  const ordinary = fill({ key: 'h|2', symbol: 'SKHYNIXUSDT', base: 'SKHYNIX', quantityUnit: 'SKHYNIX', side: 'buy', quantity: '1', price: '400', positionBefore: '0', positionAfter: '1' });
+  const [event] = groupTradeEvents([adr, ordinary], TRADE_PAIRS.hynix);
+  assert.equal(event.type, 'entry');
+  assert.ok(Math.abs(event.spread - 5) < 1e-9, '42 / (400 / 10) - 1 = 5%');
+  assert.deepEqual(event.spreadVenue.prices, { left: 42, right: 400 });
+  assert.equal(event.venues[0].direction, '做空溢价（空 ADR / 多正股）');
+  assert.equal(groupTradeEvents([adr, ordinary])[0].spread, null, 'the oil pair never pairs hynix legs');
 });

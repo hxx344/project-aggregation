@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFillsReply, createFillsRequester, createFillsPoller, retainFillsReply, emptyFillsView, FILLS_TIMEOUT_MS, FILLS_REFRESH_MS, FILLS_FOLLOW_UP_MS } from '../lib/hub-fills-contract.ts';
+import { parseFillsReply, createFillsRequester, createFillsPoller, retainFillsReply, emptyFillsView, FILLS_TIMEOUT_MS, FILLS_REFRESH_MS, FILLS_FOLLOW_UP_MS, FILLS_MAX_FOLLOW_UPS } from '../lib/hub-fills-contract.ts';
 import { MODULE_CAPABILITIES, canUseHostCapability } from '../lib/hub-bridge.ts';
 import { fill, fillsReply } from './oil-trades-fixtures.mjs';
 
@@ -48,43 +48,43 @@ function pollerFixture() {
   return { poller, sent, timers, advance, reply: pending => poller.receive(fillsReply({ pending, requestId: sent.at(-1).requestId })) };
 }
 
-test('continuous pending follows up every 25 seconds at most six times, then resumes the five-minute cycle', () => {
+test('continuous pending follows up every 5 seconds for at most 3 minutes, then resumes the five-minute cycle', () => {
   const { poller, sent, timers, advance, reply } = pollerFixture();
   assert.equal(sent.length, 0); poller.start(); poller.start(); assert.equal(sent.length, 1);
   reply(true);
-  for (let followUp = 1; followUp <= 6; followUp++) {
-    advance(24_999); assert.equal(sent.length, followUp);
+  for (let followUp = 1; followUp <= FILLS_MAX_FOLLOW_UPS; followUp++) {
+    advance(4_999); assert.equal(sent.length, followUp);
     advance(1); assert.equal(sent.length, followUp + 1);
     reply(true);
   }
-  advance(149_999); assert.equal(sent.length, 7, 'the seventh follow-up is forbidden even while pending');
-  advance(1); assert.equal(sent.length, 8, 'the normal five-minute request still runs');
-  reply(true); advance(25_000); assert.equal(sent.length, 9, 'a new normal cycle resets the follow-up budget');
+  advance(119_999); assert.equal(sent.length, 37, 'the 37th follow-up is forbidden even while pending');
+  advance(1); assert.equal(sent.length, 38, 'the normal five-minute request still runs');
+  reply(true); advance(5_000); assert.equal(sent.length, 39, 'a new normal cycle resets the follow-up budget');
   poller.dispose(); assert.equal(timers.size, 0);
 });
 
 test('pending false stops follow-ups immediately and the next pending cycle has its full budget', () => {
   const { poller, sent, advance, reply } = pollerFixture();
   poller.start(); reply(true);
-  for (let i = 0; i < 2; i++) { advance(25_000); reply(true); }
-  advance(25_000); reply(false);
-  advance(224_999); assert.equal(sent.length, 4, 'no more follow-ups after completed data');
+  for (let i = 0; i < 2; i++) { advance(5_000); reply(true); }
+  advance(5_000); reply(false);
+  advance(284_999); assert.equal(sent.length, 4, 'no more follow-ups after completed data');
   advance(1); assert.equal(sent.length, 5);
   reply(true);
-  for (let i = 0; i < 6; i++) { advance(25_000); reply(true); }
-  assert.equal(sent.length, 11);
-  advance(25_000); assert.equal(sent.length, 11);
+  for (let i = 0; i < FILLS_MAX_FOLLOW_UPS; i++) { advance(5_000); reply(true); }
+  assert.equal(sent.length, 41);
+  advance(5_000); assert.equal(sent.length, 41);
   poller.dispose();
 });
 
 test('foreground deactivation cleanup stops queued and in-flight follow-ups; activation requests immediately', () => {
   const { poller, sent, timers, advance, reply } = pollerFixture();
-  poller.start(); reply(true); advance(10_000);
+  poller.start(); reply(true); advance(3_000);
   // useHubFills disposes this poller when active becomes false.
   poller.dispose(); assert.equal(timers.size, 0);
   advance(900_000); assert.equal(sent.length, 1); assert.equal(poller.retry(), null);
   poller.start(); assert.equal(sent.length, 2);
-  reply(true); advance(25_000); assert.equal(sent.length, 3);
+  reply(true); advance(5_000); assert.equal(sent.length, 3);
   poller.dispose(); assert.equal(reply(true), false, 'a late pending reply cannot restart an inactive poller');
   advance(900_000); assert.equal(sent.length, 3); assert.equal(timers.size, 0);
 });
@@ -119,7 +119,7 @@ function requesterFixture() {
 }
 test('latest id and market must match; handshake retries only unanswered fills and times out at 20 seconds', () => {
   const { requester, sent, replies, timers } = requesterFixture();
-  assert.equal(FILLS_TIMEOUT_MS, 20_000); assert.equal(FILLS_REFRESH_MS, 300_000); assert.equal(FILLS_FOLLOW_UP_MS, 25_000);
+  assert.equal(FILLS_TIMEOUT_MS, 20_000); assert.equal(FILLS_REFRESH_MS, 300_000); assert.equal(FILLS_FOLLOW_UP_MS, 5_000);
   assert.equal(requester.retry(), null);
   requester.request('oil'); requester.retry();
   assert.deepEqual(sent, [{ type: 'fills-request', requestId: 'req-1', market: 'oil' }, { type: 'fills-request', requestId: 'req-2', market: 'oil' }]);
@@ -145,4 +145,20 @@ test('failed refreshes preserve the last successful fills, coverage and original
   const recovered = retainFillsReply(stale, parseFillsReply(fillsReply({ items: [] })));
   assert.equal(recovered.retained, false); assert.deepEqual(recovered.items, []);
   assert.equal(retainFillsReply(emptyFillsView('loading'), failure).retained, false);
+});
+
+test('hynix replies accept only SK hynix contracts and are matched to a hynix request', () => {
+  const skhy = fill({ key: 'asset|okx|account|SWAP|h1', exchangeId: 'okx', exchange: 'OKX', scope: 'SWAP', symbol: 'SKHY-USDT-SWAP', base: 'SKHY', quantityUnit: '张', price: '38.5' });
+  const hynix = fillsReply({ market: 'hynix', items: [skhy, fill({ key: 'asset|binance|account|um|h2', symbol: 'SKHYNIXUSDT', base: 'SKHYNIX', quantityUnit: 'SKHYNIX' })] });
+  assert.deepEqual(parseFillsReply(hynix, 'hynix').items.map(item => item.base).sort(), ['SKHY', 'SKHYNIX']);
+  assert.equal(parseFillsReply(hynix), null, 'an oil parser rejects a hynix reply');
+  assert.equal(parseFillsReply(fillsReply({ market: 'hynix' }), 'hynix'), null, 'oil contracts never appear in a hynix reply');
+  assert.equal(parseFillsReply(fillsReply({ market: 'hynix', items: [fill({ symbol: 'SKHYUSDC', base: 'SKHY', quantityUnit: 'SKHY' })] }), 'hynix'), null);
+  const sent = [], replies = [];
+  const requester = createFillsRequester({ send: message => sent.push(message), onReply: reply => replies.push(reply), createId: () => 'req-1', schedule: () => 1, cancel() {} });
+  requester.request('hynix');
+  assert.deepEqual(sent, [{ type: 'fills-request', requestId: 'req-1', market: 'hynix' }]);
+  assert.equal(requester.receive(fillsReply()), false, 'an oil reply cannot answer a hynix request');
+  assert.equal(requester.receive(hynix), true); assert.equal(replies[0].market, 'hynix');
+  requester.dispose();
 });

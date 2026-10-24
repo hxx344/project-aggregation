@@ -1,5 +1,6 @@
 import type { Credentials } from './validation.ts';
-import type { ReadFill } from './hub-fills-types.ts';
+import { FILL_MARKETS } from './hub-fills-types.ts';
+import type { FillMarket, ReadFill } from './hub-fills-types.ts';
 import { decimal, text, POSITIONS_INVALID } from './positions-values.ts';
 import { negate } from './positions-cycle.ts';
 import { cycleSupported } from './positions-cycle-readers.ts';
@@ -14,7 +15,7 @@ const BYBIT_DEFAULT_WINDOW_MS = 24 * 60 * 60_000;
 const BYBIT_LATEST_WINDOW_MS = BYBIT_DEFAULT_WINDOW_MS - 60 * 60_000;
 
 /** end anchors historical windows locally; the newest window omits the local upper bound. */
-export type FillsRequest = { start: number; end: number };
+export type FillsRequest = { market: FillMarket; start: number; end: number };
 const optional = (value: unknown, parse = decimal) => value === undefined || value === null || value === '' ? null : parse(value);
 const fee = (value: unknown, parse = decimal) => { const result = optional(value, parse); return result === null ? null : negate(result); };
 function inRange(value: unknown, start: number, end: number | null) {
@@ -33,15 +34,15 @@ function fillWindows<T>(request: FillsRequest, latestWindow: number, read: (star
   };
 }
 
-/** Fixed oil instruments are read even when all current positions have closed.
+/** A market's fixed instruments are read even when all current positions have closed.
  * Pagination, request budgets, decimal parsing and endpoint spacing are shared with cycle statistics. */
-export async function readOilFills(credentials: Credentials, scope: string, request: FillsRequest, options: HistoryOptions = {}): Promise<ReadFill[]> {
+export async function readFills(credentials: Credentials, scope: string, request: FillsRequest, options: HistoryOptions = {}): Promise<ReadFill[]> {
   if (!cycleSupported(credentials.exchange, scope) || !['binance', 'bybit', 'okx'].includes(credentials.exchange)) throw new Error(POSITIONS_INVALID);
   if (credentials.exchange !== 'binance' && credentials.exchange !== 'bybit' && credentials.exchange !== 'okx') throw new Error(POSITIONS_INVALID);
   const ctx = historyContext(credentials.exchange, credentials, options), fills: ReadFill[] = [];
   let order = 0;
   const push = (fill: ReadFill) => { fills.push(fill); if (fills.length > MAX_FILLS) throw new Error(POSITIONS_INVALID); };
-  for (const base of ['CL', 'BZ'] as const) {
+  for (const base of FILL_MARKETS[request.market]) {
     const currency = scope === 'linear-usdc' ? 'USDC' : 'USDT';
     if (credentials.exchange === 'binance') {
       const symbol = base + 'USDT', path = scope === 'pm-um' ? '/papi/v1/um/userTrades' : '/fapi/v1/userTrades';

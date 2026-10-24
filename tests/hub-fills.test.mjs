@@ -1,18 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fillsRequest, fillsReply, fillItems, FILLS_TIMEOUT_MS, FILLS_CACHE_MS, FILLS_STALE_AFTER_MS, MAX_FILL_ITEMS } from '../src/hub-fills.ts';
+import { fillsRequest, fillsReply, fillItems, fillsCacheMs, FILLS_TIMEOUT_MS, FILLS_CACHE_MS, FILLS_PENDING_CACHE_MS, FILLS_STALE_AFTER_MS, MAX_FILL_ITEMS } from '../src/hub-fills.ts';
 import { createPositionsSource } from '../src/hub-positions.ts';
 import { ASSET_FILLS_TIMEOUT_MS } from '../server/asset-fills.mjs';
 import { FILLS_TIMEOUT_MS as MODULE_FILLS_TIMEOUT_MS, parseFillsReply } from '../modules/monitor/lib/hub-fills-contract.ts';
-import { NOW, STAMP, LOOKBACK, response, scope, fill } from './fills-fixtures.mjs';
+import { NOW, STAMP, LOOKBACK, response, scope, fill, hynixPayload } from './fills-fixtures.mjs';
 
 const request = { type: 'fills-request', requestId: 'fills-1', market: 'oil' };
 const reply = data => fillsReply(fillsRequest(request), { status: 'ok', data, at: 0 }, NOW);
 
-test('fills requests only accept the fixed oil market without symbol or URL overrides', () => {
+test('fills requests only accept the fixed oil and hynix markets without symbol or URL overrides', () => {
   assert.deepEqual(fillsRequest(request), { requestId: 'fills-1', market: 'oil' });
+  assert.deepEqual(fillsRequest({ ...request, market: 'hynix' }), { requestId: 'fills-1', market: 'hynix' });
   assert.ok(fillsRequest({ ...request, channel: 'project-hub', version: 1 }));
-  for (const invalid of [null, [], {}, { ...request, type: 'fills' }, { ...request, market: 'cl-xau' }, { ...request, market: undefined },
+  for (const invalid of [null, [], {}, { ...request, type: 'fills' }, { ...request, market: 'cl-xau' }, { ...request, market: undefined }, { ...request, market: '__proto__' }, { ...request, market: 'toString' },
     { ...request, requestId: '' }, { ...request, requestId: 'a'.repeat(65) }, { ...request, requestId: 'a_b' }, { ...request, requestId: 1 },
     { ...request, symbols: ['BTC'] }, { ...request, url: 'https://example.com' }]) assert.equal(fillsRequest(invalid), null);
 });
@@ -131,4 +132,29 @@ test('the browser deadline outlasts the Asset read deadline', () => {
   assert.ok(FILLS_TIMEOUT_MS >= ASSET_FILLS_TIMEOUT_MS + 2000);
   assert.equal(MODULE_FILLS_TIMEOUT_MS, 20_000);
   assert.ok(MODULE_FILLS_TIMEOUT_MS >= FILLS_TIMEOUT_MS + 2000);
+});
+
+test('hynix replies carry only SK hynix contracts, and pending outcomes are cached for three seconds', () => {
+  const raw = response(); raw.sources[0].data = hynixPayload();
+  const hynix = fillsReply(fillsRequest({ ...request, market: 'hynix' }), { status: 'ok', data: raw, at: 0 }, NOW);
+  assert.equal(hynix.status, 'ok'); assert.equal(hynix.market, 'hynix');
+  assert.deepEqual(hynix.items.map(item => [item.symbol, item.base]), [['SKHYUSDT', 'SKHY']]);
+  assert.ok(parseFillsReply(hynix, 'hynix'), 'the actual Monitor parser accepts the hynix response');
+  assert.equal(reply(raw).status, 'unavailable', 'an oil request never accepts hynix fills');
+  assert.equal(fillsReply(fillsRequest({ ...request, market: 'hynix' }), { status: 'ok', data: response(), at: 0 }, NOW).status, 'unavailable');
+  assert.equal(fillsCacheMs({ status: 'ok', data: raw, at: 0 }), FILLS_CACHE_MS);
+  scope(raw.sources[0].data).refreshing = true;
+  assert.equal(fillsCacheMs({ status: 'ok', data: raw, at: 0 }), FILLS_PENDING_CACHE_MS);
+  assert.equal(fillsCacheMs({ status: 'unavailable', at: 0 }), FILLS_CACHE_MS);
+  assert.equal(fillsCacheMs({ status: 'ok', data: { sources: 'bad' }, at: 0 }), FILLS_CACHE_MS);
+});
+
+test('a pending outcome expires after the pending cache window', async () => {
+  let clock = 0, calls = 0, refreshing = true;
+  const source = createPositionsSource(async () => { calls++; const raw = response(); scope(raw.sources[0].data).refreshing = refreshing; return raw; },
+    { cacheMs: FILLS_CACHE_MS, cacheMsFor: fillsCacheMs, clock: () => clock });
+  await source.read(true); clock = FILLS_PENDING_CACHE_MS - 1; await source.read(true); assert.equal(calls, 1);
+  clock = FILLS_PENDING_CACHE_MS; refreshing = false; await source.read(true); assert.equal(calls, 2);
+  clock += FILLS_PENDING_CACHE_MS; await source.read(true); assert.equal(calls, 2);
+  source.dispose();
 });

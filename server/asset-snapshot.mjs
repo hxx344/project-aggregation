@@ -1,9 +1,9 @@
 import { requestAuthenticatedJson, requestJson } from './adapters.mjs';
 
 /** Only configured Asset projects are addressable; exchange credentials stay in Asset. */
-export function createAssetSnapshot({ listTargets, request = requestJson, now = Date.now, cacheMs, timeoutMs, backgroundIntervalMs = 0, path, sessionScope, limit, normalize, age, sourceError } = {}) {
+export function createAssetSnapshot({ listTargets, request = requestJson, now = Date.now, cacheMs, cacheMsFor = () => cacheMs, timeoutMs, backgroundIntervalMs = 0, backgroundIdleMs = Infinity, path, sessionScope, limit, normalize, age, sourceError } = {}) {
   const entries = new Map();
-  let closed = false, timer, background = null;
+  let closed = false, timer, background = null, foregroundAt = null;
   const targets = () => listTargets().filter(target => target.project.enabled && target.project.adapter === 'asset');
   const usable = target => !!target.project.apiUrl && (!!target.project.embedded || !!target.credentials?.password);
   const present = target => !closed && targets().some(current => current.project.id === target.project.id && current.revision === target.revision && usable(current));
@@ -30,9 +30,9 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
     const id = target.project.id;
     let entry = entries.get(id);
     if (entry && entry.revision !== target.revision) { invalidate(id); entry = null; }
-    if (!entry) { entry = { revision: target.revision, data: null, error: null, checkedAt: null, readAt: null, pending: null, controller: null }; entries.set(id, entry); }
+    if (!entry) { entry = { revision: target.revision, data: null, error: null, checkedAt: null, readAt: null, cacheMs, pending: null, controller: null }; entries.set(id, entry); }
     if (entry.pending) return entry.pending;
-    if (entry.readAt !== null && now() - entry.readAt < cacheMs) return;
+    if (entry.readAt !== null && now() - entry.readAt < entry.cacheMs) return;
     const controller = new AbortController(); entry.controller = controller;
     const timer = setTimeout(() => controller.abort(new DOMException('Asset read timed out', 'TimeoutError')), timeoutMs); timer.unref?.();
     entry.pending = (async () => {
@@ -42,9 +42,9 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
         });
         controller.signal.throwIfAborted();
         const data = normalize(response.data, now());
-        if (present(target) && entries.get(id) === entry) { entry.data = data; entry.error = null; }
+        if (present(target) && entries.get(id) === entry) { entry.data = data; entry.error = null; entry.cacheMs = cacheMsFor(data); }
       } catch (error) {
-        if (present(target) && entries.get(id) === entry) entry.error = sourceError(error);
+        if (present(target) && entries.get(id) === entry) { entry.error = sourceError(error); entry.cacheMs = cacheMs; }
       } finally {
         clearTimeout(timer);
         entry.checkedAt = new Date(now()).toISOString(); entry.readAt = now(); entry.pending = null; entry.controller = null;
@@ -62,12 +62,14 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
     const current = reconcile();
     return { generatedAt: new Date(now()).toISOString(), sources: current.map(target => view(target, entries.get(target.project.id))) };
   }
+  // Background reads stop once no page has asked for backgroundIdleMs, so unused sources stop polling exchanges.
+  const recentlyRead = () => backgroundIdleMs === Infinity || foregroundAt !== null && now() - foregroundAt < backgroundIdleMs;
   if (backgroundIntervalMs > 0) {
     // Without an open page Asset only refreshes when read; this keeps its per-scope snapshots warm.
-    timer = setInterval(() => { background ??= state().catch(() => {}).finally(() => { background = null; }); }, backgroundIntervalMs);
+    timer = setInterval(() => { if (recentlyRead()) background ??= state().catch(() => {}).finally(() => { background = null; }); }, backgroundIntervalMs);
     timer.unref?.();
   }
-  return { state, invalidate, async close() {
+  return { state: () => { foregroundAt = now(); return state(); }, invalidate, async close() {
     closed = true; clearInterval(timer);
     const pending = [...entries.values()].map(entry => entry.pending);
     for (const id of entries.keys()) invalidate(id);

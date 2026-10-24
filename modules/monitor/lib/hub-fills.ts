@@ -2,11 +2,11 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useHubHost, postHubMessage, subscribeHubFills, subscribeHostReady } from './hub-bridge.ts';
-import { createFillsPoller, emptyFillsView, retainFillsReply, type HubFillsView } from './hub-fills-contract.ts';
+import { createFillsPoller, emptyFillsView, retainFillsReply, type FillMarket, type HubFillsView } from './hub-fills-contract.ts';
 export type { HubFillsView } from './hub-fills-contract.ts';
 
 /** Foreground only. Successful reads replace the snapshot; failures retain its original time. */
-export function useHubFills(market: 'oil', active: boolean): HubFillsView {
+export function useHubFills(market: FillMarket, active: boolean): HubFillsView {
   const host = useHubHost();
   const mode = !host.embedded ? 'standalone' : !host.connected ? 'connecting' : !host.fills ? 'unsupported' : null;
   const [stored, setStored] = useState<HubFillsView | null>(null);
