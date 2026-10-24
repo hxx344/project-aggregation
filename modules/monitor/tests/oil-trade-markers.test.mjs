@@ -87,3 +87,9 @@ test('coverage states retain actual successful source time and distinguish unsup
   for (const label of ['部分账户失败', '保留上次成功数据', '已截断', '最近 85 天', '仅支持 Binance、Bybit、OKX', fillsReply().coverage[0].fetchedAt]) assert.ok(result.includes(label));
   assert.equal(result.includes(fillsReply().generatedAt), false, 'response generation never refreshes stale source time');
 });
+
+test('a pending refresh over stored fills says it is updating in the background', () => {
+  assert.match(fillsStatusText({ ...fillsReply(), pending: true, retained: false }, String), /^已显示上次成交，后台更新中…/);
+  const cold = { ...fillsReply(), pending: true, retained: false, items: [], coverage: [{ ...fillsReply().coverage[0], status: 'loading', fetchedAt: null }] };
+  assert.match(fillsStatusText(cold, String), /^读取中…/);
+});

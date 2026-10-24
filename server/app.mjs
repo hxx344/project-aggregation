@@ -13,7 +13,7 @@ import { createTrading, TradingError } from './trading.mjs';
 import { snapshotDiagnostics } from './diagnostics.mjs';
 import { createTradingImporter } from './trading-import.mjs';
 import { createAssetPositions } from './asset-positions.mjs';
-import { createAssetFills } from './asset-fills.mjs';
+import { createAssetFills, ASSET_FILLS_BACKGROUND_MS, FILL_MARKETS } from './asset-fills.mjs';
 import { createTradingExecution } from './trading-execution.mjs';
 import { ExecutionError } from './trading-execution-plan.mjs';
 import { normalizeTradingPair } from './trading-markets.mjs';
@@ -36,7 +36,7 @@ const SESSION_AGE = 7 * 24 * 60 * 60 * 1000;
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
-export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow, assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null, moduleRuntime = null } = {}) {
+export async function createApp({ embeddedModules = false, dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, refreshInterval = 30000, timeoutMs = 5000, loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset, assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow, assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, assetFillsBackgroundMs = assetSyncIntervalMs > 0 ? ASSET_FILLS_BACKGROUND_MS : 0, tradingClientFactory, tradingRefreshIntervalMs = 1000, tradingNow = Date.now, tradingTaskTimeoutMs = 60000, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs, executionClientFactory, executionIntervalMs = 1000, executionNow = Date.now, updatesClient, logger = console, secureCookies = process.env.COOKIE_SECURE === 'true', publicOrigin = process.env.PUBLIC_ORIGIN || '', distDir = path.join(root, 'dist'), warmupEnabled = process.env.WARMUP_ENABLED !== 'false', warmupProjects = process.env.WARMUP_PROJECTS === undefined ? ['aster', 'monitor', 'asset'] : process.env.WARMUP_PROJECTS.split(','), warmupIntervalMs = process.env.WARMUP_INTERVAL_MS === undefined ? 90000 : Number(process.env.WARMUP_INTERVAL_MS), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson, accountWriter = null, moduleRuntime = null } = {}) {
   validateBaselineInterval(baselineIntervalMs);
   if (!Number.isInteger(warmupIntervalMs) || warmupIntervalMs < 1000 || warmupIntervalMs > 2147483647) throw new RangeError('WARMUP_INTERVAL_MS 必须为 1000 至 2147483647 的整数（毫秒）');
   if (!Number.isInteger(accountLockoutMs) || accountLockoutMs < 1000 || accountLockoutMs > 86400000) throw new RangeError('accountLockoutMs 必须为 1000 至 86400000 的整数（毫秒）');
@@ -151,7 +151,13 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   const assetPositions = createAssetPositions({ request: assetPositionsRequest, cacheMs: assetPositionsCacheMs, timeoutMs: assetPositionsTimeoutMs, now: assetPositionsNow, backgroundIntervalMs: assetPositionsBackgroundMs,
     listTargets: assetTargets,
   });
-  const assetFills = createAssetFills({ listTargets: assetTargets, request: assetFillsRequest, cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow });
+  // Background reads keep Asset's per-scope fills warm, so opening a chart serves fresh trades at once.
+  const assetFillsByMarket = Object.fromEntries(Object.keys(FILL_MARKETS).map(market => [market, createAssetFills({ market, listTargets: assetTargets, request: assetFillsRequest,
+    cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
+  const assetFills = {
+    invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
+    close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),
+  };
   const portal = createPortal({
     ...(embeddedModules ? { withMutation: updates.withExecutionEntry } : {}),
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),
@@ -406,8 +412,9 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     }
     if (pathname === '/api/trading/fills') {
       if (req.method !== 'GET') throw new HttpError(405, '成交接口仅支持只读查询');
-      if (url.search) throw new HttpError(400, '成交接口不接受查询参数');
-      const data = await assetFills.state();
+      const market = url.search ? url.searchParams.get('market') : 'oil';
+      if (url.search && ([...url.searchParams.keys()].join() !== 'market' || !Object.hasOwn(FILL_MARKETS, market))) throw new HttpError(400, '成交接口只接受 market 参数');
+      const data = await assetFillsByMarket[market].state();
       if (session(req)?.id !== current.id) throw new HttpError(401, '请先登录工作台');
       send(res, 200, data); return;
     }

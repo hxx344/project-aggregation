@@ -27,7 +27,8 @@ function venueLabels(venues) {
   }
   return labels;
 }
-export function tradeDetailLines(marker, formatTime) {
+/** priceUnit, chartLabel and chartNote describe the market's quote unit, chart metric and sampling. */
+export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chartLabel = '图表同时刻价差', chartNote = '最近 15 分钟 K 线' } = {}) {
   const { event, chartSpread, basis, value } = marker, type = TRADE_TYPES[event.type];
   const labels = venueLabels(event.venues);
   const effects = { open: '开仓', close: '平仓', unknown: '开平未知' };
@@ -40,10 +41,10 @@ export function tradeDetailLines(marker, formatTime) {
     `${type.symbol} ${type.label} · ${formatTime(event.time)} 北京时间`,
     `${event.fills.length} 笔成交 · 至 ${formatTime(event.end)}${event.stale ? ' · 保留旧数据' : ''}`,
     `${basis} ${spreadText(value)}${event.spreadVenue ? ` · ${labels.get(event.spreadVenue.key)}` : ''}`,
-    `图表同时刻价差 ${spreadText(chartSpread)}（最近 15 分钟 K 线）`,
+    `${chartLabel} ${spreadText(chartSpread)}（${chartNote}）`,
     ...event.venues.flatMap(venue => [
       `${labels.get(venue.key)} · ${venue.direction}`,
-      ...venue.legs.map(leg => `${leg.base} ${leg.sides.map(side => side === 'buy' ? '买' : '卖').join('/')} ${leg.quantity} ${leg.quantityUnit} @ ${leg.price} ${leg.currency}/桶 · ${leg.scopes.join(' / ')}`),
+      ...venue.legs.map(leg => `${leg.base} ${leg.sides.map(side => side === 'buy' ? '买' : '卖').join('/')} ${leg.quantity} ${leg.quantityUnit} @ ${leg.price} ${leg.currency}${priceUnit} · ${leg.scopes.join(' / ')}`),
       `成交价差 ${spreadText(venue.spread)}${venue.currency ? `（${venue.currency}）` : ''}`,
       `手续费 ${cashText(venue.fees)} · 已实现盈亏 ${cashText(venue.realizedPnl)}`,
     ]),
@@ -59,7 +60,8 @@ export function fillsStatusText(view, formatTime) {
   const state = {
     standalone: '请在工作台中查看账户成交', unsupported: '工作台版本不支持成交读取', connecting: '正在连接工作台',
     loading: '读取中…', unauthorized: '登录状态不可用，请返回工作台重新登录', unavailable: view.timedOut ? '20 秒内未收到工作台回复' : '工作台暂时无法读取成交',
-    ok: view.pending ? '读取中…' : '成交已更新',
+    // Stored fills are already on screen while Asset reads newer history.
+    ok: view.pending ? view.coverage?.some(scope => scope.fetchedAt) ? '已显示上次成交，后台更新中…' : '读取中…' : '成交已更新',
   }[view.status] ?? '读取中…';
   const failed = view.coverage?.filter(scope => ['stale', 'error', 'unavailable'].includes(scope.status)).length ?? 0;
   const times = (view.coverage ?? []).map(scope => scope.fetchedAt).filter(Boolean).sort();

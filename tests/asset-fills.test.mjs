@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAssetFills, normalizeAssetFills, ageAssetFills, ASSET_FILLS_RESPONSE_LIMIT, ASSET_FILLS_CACHE_MS, ASSET_FILLS_STALE_MS } from '../server/asset-fills.mjs';
-import { NOW, STAMP, payload, fill, scope, deferred } from './fills-fixtures.mjs';
+import { createAssetFills, normalizeAssetFills, ageAssetFills, ASSET_FILLS_RESPONSE_LIMIT, ASSET_FILLS_CACHE_MS, ASSET_FILLS_PENDING_CACHE_MS, ASSET_FILLS_STALE_MS, ASSET_FILLS_BACKGROUND_IDLE_MS } from '../server/asset-fills.mjs';
+import { NOW, STAMP, payload, hynixPayload, fill, scope, deferred } from './fills-fixtures.mjs';
 
 test('fills allowlist preserves precision and coverage without upstream secrets', () => {
   const raw = payload();
@@ -107,6 +107,38 @@ test('coalesces reads and caches successes and sanitized failures for twenty sec
   assert.equal(stale.status, 'stale'); assert.equal(scope(stale.data).status, 'stale'); assert.equal(scope(stale.data).fetchedAt, STAMP);
   assert.ok(!JSON.stringify(stale).includes('secret-upstream'));
   await f.reader.state(); assert.equal(f.calls(), 2);
+});
+
+test('pending Asset reads are held for three seconds; each market has its own path and bases', async t => {
+  const pendingPayload = () => { const data = payload(); scope(data).refreshing = true; return data; };
+  const f = fixture(t); f.handle(async () => ({ data: pendingPayload() }));
+  await f.reader.state(); f.tick(ASSET_FILLS_PENDING_CACHE_MS - 1); await f.reader.state(); assert.equal(f.calls(), 1);
+  f.tick(1); f.handle(async () => ({ data: payload() })); await f.reader.state(); assert.equal(f.calls(), 2);
+  f.tick(ASSET_FILLS_PENDING_CACHE_MS); await f.reader.state(); assert.equal(f.calls(), 2, 'a settled read keeps the full cache window');
+  const routes = []; let fail = false;
+  const hynix = createAssetFills({ market: 'hynix', listTargets: () => [target()], now: () => NOW, cacheMs: 0, request: async (_base, route) => {
+    routes.push(route); if (fail) throw Object.assign(new Error('Bad Request'), { statusCode: 400 }); return { data: hynixPayload() };
+  } });
+  t.after(() => hynix.close());
+  assert.deepEqual(scope((await hynix.state()).sources[0].data).fills.map(item => item.base), ['SKHY']);
+  assert.deepEqual(routes, ['/api/hub/fills?market=hynix']);
+  fail = true; assert.match((await hynix.state()).sources[0].error, /尚不支持海力士成交/);
+  assert.throws(() => normalizeAssetFills(payload(), NOW, 'hynix'), /invalid_fills/);
+  assert.throws(() => normalizeAssetFills(hynixPayload(), NOW), /invalid_fills/);
+  assert.throws(() => createAssetFills({ market: 'gold' }), /unknown_fills_market/);
+});
+
+test('background warming runs only for a market a page read recently', async t => {
+  const f = fixture(t, { backgroundIntervalMs: 15, cacheMs: 0 });
+  const wait = (ms = 80) => new Promise(resolve => setTimeout(resolve, ms));
+  const until = async (count, message) => { for (let i = 0; i < 200 && f.calls() < count; i++) await wait(10); assert.ok(f.calls() >= count, message); };
+  await wait(); assert.equal(f.calls(), 0, 'an unopened market never polls Asset');
+  await f.reader.state(); await until(2, 'reads continue without a page after a recent read');
+  f.tick(ASSET_FILLS_BACKGROUND_IDLE_MS - 1); const before = f.calls();
+  await until(before + 1, 'still warm just inside the idle window');
+  // Background reads must not renew the window themselves.
+  f.tick(1); await wait(); const idle = f.calls();
+  await wait(); assert.equal(f.calls(), idle, 'warming stops once the market sits idle');
 });
 
 test('malformed refresh retains the earlier snapshot; revision changes discard it and late completions', async t => {

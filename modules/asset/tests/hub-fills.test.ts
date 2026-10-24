@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { openDatabase } from '../lib/sqlite.ts';
-import { createFillsService, validFillsQuery } from '../lib/hub-fills.ts';
-import { readOilFills } from '../lib/hub-fills-readers.ts';
+import { createFillsService, fillsQueryMarket } from '../lib/hub-fills.ts';
+import { readFills } from '../lib/hub-fills-readers.ts';
 import { FillConflict, mergeFills, replayFills } from '../lib/hub-fills-replay.ts';
 import { CYCLE_LOOKBACK_MS } from '../lib/positions-cycle.ts';
 import { historyContext } from '../lib/positions-history.ts';
@@ -71,7 +71,7 @@ test('Binance history survives flat positions, splits full windows and retains s
       const { start, end } = historyBounds(url, 'binance');
       return url.searchParams.get('symbol') === 'BZUSDT' ? [] : rows.filter(row => row.time >= start && row.time <= end).slice(0, 1000);
     });
-    const fills = await readOilFills(binance, product, { start: at - minute - 1, end: at }, { fetcher, spacing: false });
+    const fills = await readFills(binance, product, { market: 'oil', start: at - minute - 1, end: at }, { fetcher, spacing: false });
     assert.equal(fills.length, 1001); assert.ok(calls.length > 2);
     assert.ok(calls.every(url => url.hostname === (product === 'um' ? 'fapi.binance.com' : 'papi.binance.com')));
     const first = fills.find(item => item.id === 'CLUSDT:1')!;
@@ -80,7 +80,7 @@ test('Binance history survives flat positions, splits full windows and retains s
     assert.equal(fills.find(item => item.id === 'CLUSDT:2')!.fee, '-0.000000000000000001');
   }
   const { calls, fetcher } = mock(url => { historyBounds(url, 'binance'); return []; });
-  assert.deepEqual(await readOilFills(binance, 'um', { start: at - CYCLE_LOOKBACK_MS, end: at }, { fetcher, spacing: false }), []);
+  assert.deepEqual(await readFills(binance, 'um', { market: 'oil', start: at - CYCLE_LOOKBACK_MS, end: at }, { fetcher, spacing: false }), []);
   assert.equal(calls.length, 26, 'both fixed symbols cover all 85 days despite no current holdings');
   assert.ok(calls.every(url => { const { start, end } = historyBounds(url, 'binance'); return end - start < 7 * day; }));
 });
@@ -95,16 +95,16 @@ test('Bybit cursor pages accept only exact oil contracts, preserve exponents, un
         { symbol: 'CLOUDUSDC', qty: 'bad' }, { symbol: 'CLPERP', type: 'SETTLEMENT' },
       ], nextPageCursor: 'next' } };
   });
-  const fills = await readOilFills(bybit, 'linear-usdc', { start: at - minute - 1, end: at }, { fetcher, spacing: false });
+  const fills = await readFills(bybit, 'linear-usdc', { market: 'oil', start: at - minute - 1, end: at }, { fetcher, spacing: false });
   assert.equal(calls.length, 3); assert.equal(fills.length, 2);
   assert.deepEqual(fills.map(item => [item.symbol, item.quantity, item.price, item.fee, item.realizedPnl, item.sizeAfter]), [
     ['CLPERP', '0.001', '81', '-0.000001', null, '0'], ['CLUSDC', '0.001', '80', '0.000002', '-0.01', '-0.001'],
   ]);
   const repeated = mock(() => ({ retCode: 0, result: { list: [], nextPageCursor: 'same' } }));
-  await assert.rejects(readOilFills(bybit, 'linear-usdt', { start: at - minute - 1, end: at }, { fetcher: repeated.fetcher, spacing: false }));
+  await assert.rejects(readFills(bybit, 'linear-usdt', { market: 'oil', start: at - minute - 1, end: at }, { fetcher: repeated.fetcher, spacing: false }));
   assert.equal(repeated.calls.length, 2);
   const missing = mock(() => ({ retCode: 0, result: { list: [] } }));
-  await assert.rejects(readOilFills(bybit, 'linear-usdt', { start: at - minute - 1, end: at }, { fetcher: missing.fetcher, spacing: false }));
+  await assert.rejects(readFills(bybit, 'linear-usdt', { market: 'oil', start: at - minute - 1, end: at }, { fetcher: missing.fetcher, spacing: false }));
 });
 
 test('OKX paginates by billId, keeps contract quantities and its already signed fee/PnL', async () => {
@@ -112,12 +112,12 @@ test('OKX paginates by billId, keeps contract quantities and its already signed 
     side: 'sell', posSide: 'short', fillSz: '2.000000000000000001', fillPx: '80.2', fee: '-0.123', feeCcy: 'USDT', fillPnl: '1.2' }));
   const { calls, fetcher } = mock(url => ({ code: '0', data: url.searchParams.get('instId') === 'BZ-USDT-SWAP' ? []
     : rows.filter(row => !url.searchParams.has('after') || BigInt(row.billId) < BigInt(url.searchParams.get('after')!)).slice(0, 100) }));
-  const fills = await readOilFills(okx, 'SWAP', { start: at - minute - 1, end: at }, { fetcher, spacing: false });
+  const fills = await readFills(okx, 'SWAP', { market: 'oil', start: at - minute - 1, end: at }, { fetcher, spacing: false });
   assert.equal(fills.length, 101); assert.equal(calls[1].searchParams.get('after'), '902');
   assert.deepEqual([fills[0].id, fills[0].quantityUnit, fills[0].quantity, fills[0].fee, fills[0].realizedPnl], ['1001', '张', '2.000000000000000001', '-0.123', '1.2']);
   assert.equal(fills[0].positionSide, 'short');
   const bad = mock(() => ({ code: '0', data: [{ ...rows[0], fillSz: 2 }] }));
-  await assert.rejects(readOilFills(okx, 'SWAP', { start: at - minute - 1, end: at }, { fetcher: bad.fetcher, spacing: false }));
+  await assert.rejects(readFills(okx, 'SWAP', { market: 'oil', start: at - minute - 1, end: at }, { fetcher: bad.fetcher, spacing: false }));
 });
 
 test('replay covers open, close, cross-zero, independent hedge legs and merged OKX margin positions', () => {
@@ -249,7 +249,7 @@ test('real readers include trades during a slow position read, isolate uncertain
         && Number(row.ts) >= Number(url.searchParams.get('begin')) && Number(row.ts) <= Number(url.searchParams.get('end') ?? clock + clockSkew)) };
     });
     const service = createFillsService({ now: () => clock, fetcher,
-      fills: (credentials, product, request, options) => readOilFills(credentials, product, request, { ...options, spacing: false }) });
+      fills: (credentials, product, request, options) => readFills(credentials, product, request, { ...options, spacing: false }) });
     t.after(() => service.close());
     await service.read(f.database, 'owner', f.unseal); await service.idle();
     const awaitedReport = await service.read(f.database, 'owner', f.unseal), first = scope(awaitedReport);
@@ -391,16 +391,23 @@ test('scope cap replays before trimming and response cap keeps the globally newe
   assert.ok(result.fills.every(item => Date.parse(item.time) >= at - minute - 1 - 1250 * 10));
 });
 
-test('global scheduler allows only one scope across services and deadline releases a stalled provider', async t => {
+test('scheduler allows one scope per exchange across services and markets, other exchanges in parallel, and deadline releases a stalled provider', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   const pending = deferred<ReadFill[]>(); let active = 0, maximum = 0;
   const service = createFillsService({ now: () => at, deadline: 30, read: async () => [], fills: async () => {
     active++; maximum = Math.max(maximum, active); try { return await pending.promise; } finally { active--; }
   } });
   const second = createFillsService({ now: () => at, read: async () => [], fills: async () => { maximum = Math.max(maximum, active + 1); return []; } });
-  await service.read(f.database, 'owner', f.unseal); await second.read(f.database, 'owner', f.unseal);
+  await service.read(f.database, 'owner', f.unseal); await second.read(f.database, 'owner', f.unseal, 'hynix');
   await flush(); assert.equal(active, 1);
   pending.resolve([]); await Promise.all([service.idle(), second.idle()]); assert.equal(maximum, 1);
+  const p = fixture(); t.after(() => p.database.close()); await p.save(okx); await p.save(bybit);
+  const gate = deferred<void>(), started: string[] = [];
+  const parallel = createFillsService({ now: () => at, read: async () => [], fills: async credentials => { started.push(credentials.exchange); await gate.promise; return []; } });
+  t.after(() => parallel.close());
+  await parallel.read(p.database, 'owner', p.unseal); await flush(); await flush();
+  assert.deepEqual(started.sort(), ['bybit', 'okx'], 'a slow exchange does not hold back another exchange');
+  gate.resolve(); await parallel.idle();
   // A separate database: the shared one already stores the successful read above.
   const g = fixture(); t.after(() => g.database.close()); await g.save();
   const stuck = createFillsService({ now: () => at, deadline: 10, read: async () => new Promise(() => {}), fills: async () => assert.fail('deadline prevents fills') });
@@ -415,22 +422,26 @@ test('history requests have a shared spacing reservation and refuse a page beyon
   await Promise.all([a.get('/fapi/v1/userTrades', {}), b.get('/fapi/v1/userTrades', {}), a.get('/fapi/v1/userTrades', {})]);
   assert.ok(calls[1] - calls[0] >= 230); assert.ok(calls[2] - calls[1] >= 230);
   const unlimited = mock(url => ({ retCode: 0, result: { list: [], nextPageCursor: 'cursor-' + (Number(url.searchParams.get('cursor')?.split('-')[1] ?? 0) + 1) } }));
-  await assert.rejects(readOilFills(bybit, 'linear-usdt', { start: at - minute - 1, end: at }, { fetcher: unlimited.fetcher, spacing: false }));
+  await assert.rejects(readFills(bybit, 'linear-usdt', { market: 'oil', start: at - minute - 1, end: at }, { fetcher: unlimited.fetcher, spacing: false }));
   assert.equal(unlimited.calls.length, 80);
 });
 
 test('fills route authenticates first, rejects all extra/duplicate query params, and sanitizes service failures', async () => {
-  for (const query of ['', '?schemaVersion=1']) assert.equal(validFillsQuery('http://localhost/api/hub/fills' + query), true);
-  for (const query of ['?schemaVersion=2', '?symbol=BTCUSDT', '?schemaVersion=1&symbol=CL', '?schemaVersion=1&schemaVersion=1', '?schemaVersion=']) {
-    assert.equal(validFillsQuery('http://localhost/api/hub/fills' + query), false);
+  for (const [query, market] of [['', 'oil'], ['?schemaVersion=1', 'oil'], ['?market=oil', 'oil'], ['?schemaVersion=1&market=hynix', 'hynix']]) {
+    assert.equal(fillsQueryMarket('http://localhost/api/hub/fills' + query), market);
+  }
+  for (const query of ['?schemaVersion=2', '?symbol=BTCUSDT', '?schemaVersion=1&symbol=CL', '?schemaVersion=1&schemaVersion=1', '?schemaVersion=',
+    '?market=gold', '?market=', '?market=oil&market=hynix', '?market=__proto__']) {
+    assert.equal(fillsQueryMarket('http://localhost/api/hub/fills' + query), null);
   }
   let auth = true, fail = false, reads = 0, initialized = 0;
+  const markets: unknown[] = [];
   const stubs = {
     apiOwner: async () => { if (!auth) throw new Error('AUTH_REQUIRED'); return 'owner'; },
     failure: () => Response.json({ error: 'unauthorized' }, { status: 401 }),
     json: (value: unknown, status = 200) => Response.json(value, { status }),
-    db: () => ({}), initialize: async () => { initialized++; }, unseal: async () => ({}), validFillsQuery,
-    hubFillsService: { read: async () => { reads++; if (fail) throw new Error('PRIVATE signature=secret'); return { schemaVersion: 1 }; } },
+    db: () => ({}), initialize: async () => { initialized++; }, unseal: async () => ({}), fillsQueryMarket,
+    hubFillsService: { read: async (...args: unknown[]) => { reads++; markets.push(args[3]); if (fail) throw new Error('PRIVATE signature=secret'); return { schemaVersion: 1 }; } },
   };
   const key = '__assetFillsRouteTest';
   const globals = globalThis as unknown as Record<string, unknown>; globals[key] = stubs;
@@ -441,6 +452,8 @@ test('fills route authenticates first, rejects all extra/duplicate query params,
     const request = (query = '') => new Request('http://localhost/api/hub/fills' + query);
     assert.equal((await route.GET(request('?symbol=BTC'))).status, 400); assert.equal(reads, 0); assert.equal(initialized, 0);
     assert.equal((await route.GET(request('?schemaVersion=1'))).status, 200); assert.equal(reads, 1);
+    assert.equal((await route.GET(request('?market=hynix'))).status, 200); assert.deepEqual(markets, ['oil', 'hynix']);
+    assert.equal((await route.GET(request('?market=gold'))).status, 400); assert.equal(reads, 2);
     auth = false; assert.equal((await route.GET(request('?bad=1'))).status, 401);
     auth = true; fail = true; const response = await route.GET(request()); assert.equal(response.status, 503);
     assert.equal((await response.text()).includes('PRIVATE'), false);
@@ -463,7 +476,7 @@ test('all venue readers leave the newest window open and keep older weekly windo
       return { code: '0', data: included ? [{ billId: '1', instId: 'CL-USDT-SWAP', ts: String(exchangeTime), side: 'sell', posSide: 'net',
         fillSz: '2', fillPx: '80', fillPnl: '0', fee: '-0.1', feeCcy: 'USDT' }] : [] };
     });
-    const result = await readOilFills(credentials, product, { start: at - CYCLE_LOOKBACK_MS, end: at + 500 }, { fetcher, spacing: false });
+    const result = await readFills(credentials, product, { market: 'oil', start: at - CYCLE_LOOKBACK_MS, end: at + 500 }, { fetcher, spacing: false });
     assert.equal(result.length, 1); assert.equal(result[0].time, iso(exchangeTime));
     const clCalls = calls.filter(url => (url.searchParams.get('symbol') ?? url.searchParams.get('baseCoin') ?? url.searchParams.get('instId'))!.startsWith('CL'));
     assert.equal(clCalls[0].searchParams.has('endTime'), false); assert.equal(clCalls[0].searchParams.has('end'), false);
@@ -497,7 +510,7 @@ test('Bybit initial and resumed reads cover six-day history and both sides of th
         return { retCode: 0, result: { nextPageCursor: '', list: url.searchParams.get('baseCoin') === 'BZ' ? []
           : rows.filter(row => Number(row.transactionTime) >= bounds.start && Number(row.transactionTime) <= bounds.end) } };
       });
-      const result = await readOilFills(bybit, product, { start, end: at }, { fetcher, spacing: false });
+      const result = await readFills(bybit, product, { market: 'oil', start, end: at }, { fetcher, spacing: false });
       assert.deepEqual(result.map(item => item.time).sort(), times.filter(time => time >= start).map(iso).sort());
       assert.equal(new Set(result.map(item => item.id)).size, result.length, 'window joins must not duplicate fills');
       assert.equal(calls.length, expectedCalls, '85-day history needs 28 base requests, leaving room for positions and cursor pages');
@@ -519,7 +532,7 @@ test('Bybit 85-day pagination rejects an incomplete history when its 28 windows 
     return { retCode: 0, result: { list: [], nextPageCursor: page < 2 ? String(page + 1) : '' } };
   });
   // Three cursor pages per window require 84 requests; never publish the first 80 as complete.
-  await assert.rejects(readOilFills(bybit, 'linear-usdt', { start: at - CYCLE_LOOKBACK_MS, end: at }, { fetcher, spacing: false }),
+  await assert.rejects(readFills(bybit, 'linear-usdt', { market: 'oil', start: at - CYCLE_LOOKBACK_MS, end: at }, { fetcher, spacing: false }),
     /成交记录过多/);
   assert.equal(calls.length, 80);
   assert.equal(calls.filter(url => url.searchParams.get('baseCoin') === 'CL').length, 42);
@@ -714,4 +727,47 @@ test('stored fills stay with their owner', async t => {
   t.after(() => second.close());
   assert.deepEqual(scope(await second.read(f.database, 'owner', unseal)).fills.map(item => item.id), ['owner-fill']);
   assert.deepEqual(scope(await second.read(f.database, 'other', unseal)).fills.map(item => item.id), ['other-fill']);
+});
+
+test('hynix reads its own fixed contracts on every venue and rejects other instruments', async () => {
+  const symbols: string[] = [];
+  const binanceRows = mock(url => { symbols.push(url.searchParams.get('symbol')!); historyBounds(url, 'binance');
+    return url.searchParams.get('symbol') === 'SKHYUSDT' ? [{ symbol: 'SKHYUSDT', id: 1, time: at - 5_000, side: 'SELL', positionSide: 'BOTH',
+      qty: '10', price: '38.5', realizedPnl: '0', commission: '0.01', commissionAsset: 'USDT' }] : []; });
+  const fills = await readFills(binance, 'um', { market: 'hynix', start: at - minute - 1, end: at }, { fetcher: binanceRows.fetcher, spacing: false });
+  assert.deepEqual(fills.map(item => [item.id, item.base, item.quantityUnit]), [['SKHYUSDT:1', 'SKHY', 'SKHY']]);
+  assert.deepEqual([...new Set(symbols)], ['SKHYUSDT', 'SKHYNIXUSDT']);
+  const bybitRows = mock(url => ({ retCode: 0, result: { nextPageCursor: '', list: url.searchParams.get('baseCoin') === 'SKHYNIX' ? [{ id: 'h', symbol: 'SKHYNIXUSDT', currency: 'USDT',
+    type: 'TRADE', side: 'Buy', transactionTime: String(at - 5_000), qty: '1', tradePrice: '390', size: '1', fee: '-0.1', cashFlow: '0' }, { symbol: 'CLUSDT', type: 'TRADE' }] : [] } }));
+  assert.deepEqual((await readFills(bybit, 'linear-usdt', { market: 'hynix', start: at - minute - 1, end: at }, { fetcher: bybitRows.fetcher, spacing: false }))
+    .map(item => [item.symbol, item.base]), [['SKHYNIXUSDT', 'SKHYNIX']]);
+  assert.deepEqual([...new Set(bybitRows.calls.map(url => url.searchParams.get('baseCoin')))], ['SKHY', 'SKHYNIX']);
+  const okxRows = mock(() => ({ code: '0', data: [] }));
+  await readFills(okx, 'SWAP', { market: 'hynix', start: at - minute - 1, end: at }, { fetcher: okxRows.fetcher, spacing: false });
+  assert.deepEqual([...new Set(okxRows.calls.map(url => url.searchParams.get('instId')))], ['SKHY-USDT-SWAP', 'SKHYNIX-USDT-SWAP']);
+  const wrong = mock(() => [{ symbol: 'CLUSDT', id: 2, time: at - 5_000, side: 'BUY', positionSide: 'BOTH', qty: '1', price: '80', realizedPnl: '0', commission: '0', commissionAsset: 'USDT' }]);
+  await assert.rejects(readFills(binance, 'um', { market: 'hynix', start: at - minute - 1, end: at }, { fetcher: wrong.fetcher, spacing: false }));
+});
+
+test('each market keeps its own entries and stored rows, and an unknown stored market is deleted', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save();
+  const rows = async () => (await f.database.prepare('SELECT scope FROM fill_cache WHERE owner = ? ORDER BY scope').bind('owner').all<{ scope: string }>()).results.map(row => row.scope);
+  let clock = at; const markets: string[] = [];
+  const options = { now: () => clock, read: async () => [held('1')], fills: async (_c: Credentials, _s: string, request: { market: string }) => {
+    markets.push(request.market); return [fill(request.market + '-1', at - 2 * minute, 'buy', '1')];
+  } };
+  const first = createFillsService(options);
+  await first.read(f.database, 'owner', f.unseal); await first.idle();
+  await first.read(f.database, 'owner', f.unseal, 'hynix'); await first.idle();
+  clock += minute;
+  assert.deepEqual(scope(await first.read(f.database, 'owner', f.unseal)).fills.map(item => item.id), ['oil-1'], 'reading hynix keeps the oil entry');
+  await first.idle(); first.close();
+  assert.deepEqual(markets, ['oil', 'hynix']);
+  assert.deepEqual(await rows(), ['SWAP', 'hynix:SWAP']);
+  await f.database.prepare('INSERT INTO fill_cache(owner,account,scope,revision,data,updated_at) SELECT owner,account,?,revision,data,updated_at FROM fill_cache WHERE scope = ?').bind('gold:SWAP', 'SWAP').run();
+  const second = createFillsService({ ...options, fills: async () => assert.fail('stored fills are within their refresh time') });
+  t.after(() => second.close());
+  assert.deepEqual(scope(await second.read(f.database, 'owner', f.unseal, 'hynix')).fills.map(item => item.id), ['hynix-1']);
+  assert.deepEqual(scope(await second.read(f.database, 'owner', f.unseal)).fills.map(item => item.id), ['oil-1']);
+  assert.deepEqual(await rows(), ['SWAP', 'hynix:SWAP']);
 });

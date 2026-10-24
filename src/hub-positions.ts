@@ -126,9 +126,9 @@ export function positionsReply(request: PositionsRequest, outcome: PositionsOutc
 
 // One in-flight read shared by concurrent requests; every outcome, including
 // failures, is held for the cache window so a module cannot drive request rate.
-export function createPositionsSource(load: (signal: AbortSignal) => Promise<unknown>, { cacheMs = POSITIONS_CACHE_MS, clock = () => performance.now() } = {}) {
-  let cache: PositionsOutcome | null = null, pending: Promise<PositionsOutcome> | null = null, controller: AbortController | null = null;
-  const fresh = () => cache && clock() - cache.at < cacheMs ? cache : null;
+export function createPositionsSource(load: (signal: AbortSignal) => Promise<unknown>, { cacheMs = POSITIONS_CACHE_MS, cacheMsFor = (_outcome: PositionsOutcome) => cacheMs, clock = () => performance.now() } = {}) {
+  let cache: PositionsOutcome | null = null, cacheFor = cacheMs, pending: Promise<PositionsOutcome> | null = null, controller: AbortController | null = null;
+  const fresh = () => cache && clock() - cache.at < cacheFor ? cache : null;
   return {
     read(allowNetwork: boolean): Promise<PositionsOutcome> {
       const hit = fresh();
@@ -140,7 +140,7 @@ export function createPositionsSource(load: (signal: AbortSignal) => Promise<unk
         (data): PositionsOutcome => ({ status: 'ok', data, at: clock() }),
         (error): PositionsOutcome => ({ status: (error as { status?: unknown } | null)?.status === 401 ? 'unauthorized' : 'unavailable', at: clock() }),
       ).then(outcome => {
-        if (controller === own) { cache = own.signal.aborted ? null : outcome; pending = null; controller = null; }
+        if (controller === own) { cache = own.signal.aborted ? null : outcome; cacheFor = cacheMsFor(outcome); pending = null; controller = null; }
         return outcome;
       });
       pending = promise;

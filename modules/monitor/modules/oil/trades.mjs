@@ -2,6 +2,15 @@ import { oilSpreadPercent } from './spread.mjs';
 import { decimal, decimalText, add, negate, absolute, compare, multiply, divide } from './trade-decimal.mjs';
 
 export const TRADE_GAP_MS = 10 * 60_000;
+/** left/right are the paired bases; spread is the market's chart metric in percent from fill prices. */
+export const TRADE_PAIRS = {
+  oil: { left: 'BZ', right: 'CL', spread: oilSpreadPercent, priceUnit: '/桶',
+    short: '做空价差（空布伦特 / 多 WTI）', long: '做多价差（多布伦特 / 空 WTI）' },
+  // One ordinary share equals ten ADRs, matching the chart's ADR premium.
+  hynix: { left: 'SKHY', right: 'SKHYNIX', priceUnit: '',
+    spread: (adr, ordinary) => adr > 0 && ordinary > 0 && Number.isFinite(adr / ordinary) ? (adr / (ordinary / 10) - 1) * 100 : null,
+    short: '做空溢价（空 ADR / 多正股）', long: '做多溢价（多 ADR / 空正股）' },
+};
 export const TRADE_TYPES = { entry: { label: '入场', symbol: '▲' }, exit: { label: '出场', symbol: '▼' }, rebalance: { label: '调仓', symbol: '◆' }, trade: { label: '成交', symbol: '●' } };
 const zero = () => decimal('0');
 export const tradeVenueKey = item => JSON.stringify([item.sourceId, item.exchangeId, item.accountId]);
@@ -32,7 +41,7 @@ function cashTotals(fills, field, currencyField) {
   }
   return [...currencies].map(([currency, item]) => ({ currency, amount: item.unknown ? null : decimalText(item.known), known: item.knownCount ? decimalText(item.known) : null, unknown: item.unknown }));
 }
-function summarizeVenue(fills) {
+function summarizeVenue(fills, pair) {
   const first = fills[0], groups = new Map();
   for (const fill of fills) {
     const key = JSON.stringify([fill.base, fill.quantityUnit, fill.priceCurrency]);
@@ -46,20 +55,21 @@ function summarizeVenue(fills) {
     base: leg.base, quantityUnit: leg.quantityUnit, currency: leg.currency, quantity: decimalText(leg.quantity),
     price: decimalText(divide(leg.notional, leg.quantity)), sides: [...leg.sides], scopes: [...leg.scopes],
   }));
-  const bz = legs.filter(leg => leg.base === 'BZ'), cl = legs.filter(leg => leg.base === 'CL');
-  const paired = bz.length === 1 && cl.length === 1 && bz[0].currency === cl[0].currency;
+  const left = legs.filter(leg => leg.base === pair.left), right = legs.filter(leg => leg.base === pair.right);
+  const paired = left.length === 1 && right.length === 1 && left[0].currency === right[0].currency;
   const side = list => { const sides = new Set(list.flatMap(leg => leg.sides)); return sides.size === 1 ? [...sides][0] : null; };
-  const bzSide = side(bz), clSide = side(cl);
-  const direction = !bz.length || !cl.length ? '单腿' : bzSide === 'sell' && clSide === 'buy' ? '做空价差（空布伦特 / 多 WTI）'
-    : bzSide === 'buy' && clSide === 'sell' ? '做多价差（多布伦特 / 空 WTI）' : '双向或同向成交';
+  const leftSide = side(left), rightSide = side(right);
+  const direction = !left.length || !right.length ? '单腿' : leftSide === 'sell' && rightSide === 'buy' ? pair.short
+    : leftSide === 'buy' && rightSide === 'sell' ? pair.long : '双向或同向成交';
   return {
     key: tradeVenueKey(first), sourceId: first.sourceId, source: first.source, exchangeId: first.exchangeId, exchange: first.exchange, accountId: first.accountId, account: first.account,
-    legs, direction, spread: paired ? oilSpreadPercent(Number(bz[0].price), Number(cl[0].price)) : null,
-    currency: paired ? bz[0].currency : null,
+    legs, direction, spread: paired ? pair.spread(Number(left[0].price), Number(right[0].price)) : null,
+    prices: paired ? { left: Number(left[0].price), right: Number(right[0].price) } : null,
+    currency: paired ? left[0].currency : null,
     fees: cashTotals(fills, 'fee', 'feeCurrency'), realizedPnl: cashTotals(fills, 'realizedPnl', 'priceCurrency'),
   };
 }
-function summarizeEvent(fills) {
+function summarizeEvent(fills, pair) {
   const effects = fills.flatMap(fill => classifyFill(fill).map(part => ({ ...part, key: fill.key })));
   const kinds = new Set(effects.map(part => part.effect));
   const type = kinds.has('unknown') ? 'trade' : kinds.size > 1 ? 'rebalance' : kinds.has('open') ? 'entry' : 'exit';
@@ -69,7 +79,7 @@ function summarizeEvent(fills) {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(fill);
   }
-  const venues = [...groups.values()].map(summarizeVenue);
+  const venues = [...groups.values()].map(group => summarizeVenue(group, pair));
   const preferred = venues.find(venue => venue.exchangeId === 'binance' && venue.spread !== null) ?? venues.find(venue => venue.spread !== null);
   return {
     key: fills[0].key, time: Date.parse(fills[0].time), end: Date.parse(fills.at(-1).time), type,
@@ -79,7 +89,7 @@ function summarizeEvent(fills) {
   };
 }
 /** Cluster by adjacent fill times across all accounts; never sum quantities across venues. */
-export function groupTradeEvents(items) {
+export function groupTradeEvents(items, pair = TRADE_PAIRS.oil) {
   const ordered = [...items].sort((a, b) => Date.parse(a.time) - Date.parse(b.time) || a.key.localeCompare(b.key));
   const groups = [];
   for (const fill of ordered) {
@@ -87,5 +97,5 @@ export function groupTradeEvents(items) {
     if (!previous || Date.parse(fill.time) - Date.parse(previous.at(-1).time) > TRADE_GAP_MS) groups.push([fill]);
     else previous.push(fill);
   }
-  return groups.map(summarizeEvent);
+  return groups.map(group => summarizeEvent(group, pair));
 }

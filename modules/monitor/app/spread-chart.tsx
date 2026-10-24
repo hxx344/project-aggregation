@@ -3,12 +3,16 @@
 import { memo, useMemo, useState } from "react";
 import { Activity, Check, Info } from "lucide-react";
 import {
-  Area, CartesianGrid, ComposedChart, Line, ReferenceArea, ReferenceLine,
+  Area, CartesianGrid, ComposedChart, Line, ReferenceArea, ReferenceDot, ReferenceLine,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import { selectRange, type Point } from "../lib/market";
 import { calculateIndicators, type IndicatorPoint, type SpreadMetric } from "../lib/indicators";
 import { ranges } from "../lib/chart-ranges";
+import { hynixTradeEvents, hynixTradeMarkers, type HynixTradeMarker } from "../lib/hynix-trades";
+import type { HubFillsView } from "../lib/hub-fills";
+import { TRADE_TYPES } from "../modules/oil/trades.mjs";
+import { fillsStatusText, tradeDetailLines } from "../modules/oil/trade-markers.mjs";
 
 type Mode = SpreadMetric | "price";
 type Toggles = { sma: boolean; bands: boolean; zscore: boolean };
@@ -22,6 +26,38 @@ const metricValue = (v: number | null | undefined, mode: Mode) => v == null ? "�
 const zValue = (v: number | null | undefined) => v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(2)}σ`;
 const date = (time: number, full = false) => new Intl.DateTimeFormat("zh-CN", { timeZone: "UTC", month: "2-digit", day: "2-digit", ...(full ? { year: "numeric" } : {}) }).format(time);
 const stamp = (time: number) => `${date(time,true)} ${new Date(time).toISOString().slice(11,16)} UTC`;
+const beijingFormatter = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const beijing = (time: number | string) => beijingFormatter.format(new Date(time));
+const premiumText = (v: number | null) => v === null ? "未知" : `${v.toFixed(3)}%`;
+const tradeDetails = (marker: HynixTradeMarker) => tradeDetailLines(marker, beijing, { priceUnit: "", chartLabel: "图表同小时溢价率", chartNote: "小时收盘，未收盘小时为未知" }).join("\n");
+type TradeType = keyof typeof TRADE_TYPES;
+
+/** Recharts places this at the marker's chart value; labels stay React text, never markup. */
+function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null; cy?: number | null; marker: HynixTradeMarker; selected: boolean; onSelect: (key: string) => void }) {
+  if (cx == null || cy == null || !Number.isFinite(cx) || !Number.isFinite(cy)) return <g/>;
+  const type = TRADE_TYPES[marker.event.type as TradeType], select = () => onSelect(marker.event.key);
+  return <g className="trade-marker" data-trade-type={marker.event.type} data-selected={selected || undefined} transform={`translate(${cx},${cy})`} tabIndex={0} role="button"
+    aria-label={`${type.label} · ${beijing(marker.event.time)} 北京时间 · ${marker.basis} ${premiumText(marker.value)}，查看成交明细`}
+    onClick={select} onMouseEnter={select} onFocus={select} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } }}>
+    <circle r={12} fill="transparent"/>
+    <text textAnchor="middle" dy=".35em" aria-hidden="true">{type.symbol}</text>
+  </g>;
+}
+
+function TradePanel({ trades, markers, selected, onSelect, chartMarkers }: { trades: HubFillsView; markers: HynixTradeMarker[]; selected: HynixTradeMarker | null; onSelect: (key: string) => void; chartMarkers: boolean }) {
+  return <section className="trade-panel" aria-labelledby="hynix-trades-title">
+    <h3 id="hynix-trades-title">套利成交</h3>
+    <p className="trade-status" role="status">{fillsStatusText(trades, beijing)}</p>
+    <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === "trade" ? "成交（开平未知）" : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? "颜色只区分类型，不表示盈亏" : "切换到溢价率或美元价差可在图上查看标记"}</span></p>
+    <div className="trade-list" aria-label="当前区间套利成交">
+      {!markers.length && <p>{trades.status === "ok" && !trades.pending && !trades.incomplete ? "当前图表区间暂无套利成交" : "当前图表区间暂无可展示成交"}</p>}
+      {[...markers].reverse().map(marker => { const type = TRADE_TYPES[marker.event.type as TradeType]; return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
+        {`${type.symbol} ${beijing(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${premiumText(marker.value)}`}
+      </button>; })}
+    </div>
+    {selected && <div className="trade-details" tabIndex={0} aria-label="套利成交明细">{tradeDetails(selected)}</div>}
+  </section>;
+}
 
 function IndicatorTooltip({ active, payload, mode, enabled, zOnly = false }: {
   active?: boolean;
@@ -55,11 +91,12 @@ function IndicatorTooltip({ active, payload, mode, enabled, zOnly = false }: {
   </div>;
 }
 
-function SpreadChart({ data, loading, range, onRangeChange }: {
+function SpreadChart({ data, loading, range, onRangeChange, trades }: {
   data: Point[];
   loading: boolean;
   range: number | null;
   onRangeChange: (range: number | null) => void;
+  trades?: HubFillsView;
 }) {
   const [mode,setMode] = useState<Mode>("premium");
   const [enabled,setEnabled] = useState<Toggles>({ sma: true, bands: true, zscore: true });
@@ -68,14 +105,24 @@ function SpreadChart({ data, loading, range, onRangeChange }: {
   const fullHistory = useMemo(() => calculateIndicators(data,metric),[data,metric]);
   const points = useMemo(() => selectRange(fullHistory,range),[fullHistory,range]);
   const latest = points.at(-1);
+  const tradeItems = trades?.items;
+  const events = useMemo(() => tradeItems ? hynixTradeEvents(tradeItems) : [],[tradeItems]);
+  const markers = useMemo(() => hynixTradeMarkers(events,points),[events,points]);
+  const [selectedKey,setSelectedKey] = useState<string | null>(null);
+  const selected = markers.find(marker => marker.event.key === selectedKey) ?? null;
+  // Fill premiums use trade prices, so the price chart has no matching axis.
+  const plotted = useMemo(() => mode === "price" ? [] : markers.flatMap(marker => { const y = mode === "premium" ? marker.value : marker.usd; return y !== null && Number.isFinite(y) ? [{ marker, y }] : []; }),[markers,mode]);
+  const lastTradeTime = plotted.reduce((max,item) => Math.max(max,item.marker.event.time),-Infinity);
+  // Fills in the still-open hour extend both synced charts past the last closed bar.
+  const xDomain = useMemo(() => ["dataMin",(max: number) => Math.max(max,lastTradeTime)] as const,[lastTradeTime]);
   const chartPoints = useMemo(() => points.flatMap((p,i) => i && p.time-points[i-1].time > 3_600_000 ? [
     { time: points[i-1].time+3_600_000, adr: null, equivalent: null, spread: null, premium: null, sma: null, basis: null, upper: null, lower: null, band: null, zscore: null }, p,
   ] : [p]),[points]);
   const domain = useMemo(() => {
-    const values = points.flatMap(p => [p[metric], ...(enabled.sma && p.sma !== null ? [p.sma] : []), ...(enabled.bands && p.band ? p.band : [])]);
+    const values = [...points.flatMap(p => [p[metric], ...(enabled.sma && p.sma !== null ? [p.sma] : []), ...(enabled.bands && p.band ? p.band : [])]), ...plotted.map(item => item.y)];
     if (!values.length) return [0,5];
     return [Math.floor(Math.min(0,...values)/5)*5, Math.ceil(Math.max(0,...values)/5)*5 || 5];
-  },[points,metric,enabled.sma,enabled.bands]);
+  },[points,metric,enabled.sma,enabled.bands,plotted]);
   const zDomain = useMemo(() => {
     const values = points.flatMap(p => p.zscore === null ? [] : [p.zscore]);
     return [Math.min(-3,Math.floor(Math.min(0,...values))),Math.max(3,Math.ceil(Math.max(0,...values)))];
@@ -111,7 +158,7 @@ function SpreadChart({ data, loading, range, onRangeChange }: {
           <ComposedChart data={chartPoints} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:25,right:14,left:0,bottom:6}} accessibilityLayer>
             <defs><linearGradient id="premiumFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--primary)" stopOpacity={0.21}/><stop offset="100%" stopColor="var(--primary)" stopOpacity={0.01}/></linearGradient></defs>
             <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/>
-            <XAxis dataKey="time" type="number" domain={["dataMin","dataMax"]} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}} dy={10}/>
+            <XAxis dataKey="time" type="number" domain={xDomain} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}} dy={10}/>
             <YAxis orientation="right" width={68} domain={mode === "price" ? ["auto","auto"] : domain} tickFormatter={v => mode === "premium" ? `${v.toFixed(0)}%` : `$${v.toFixed(0)}`} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{fontSize:12}}/>
             <Tooltip content={<IndicatorTooltip mode={mode} enabled={enabled}/>} cursor={{stroke:"var(--muted-foreground)",strokeDasharray:"3 3"}}/>
             {mode === "price" ? <>
@@ -127,18 +174,20 @@ function SpreadChart({ data, loading, range, onRangeChange }: {
               </>}
               <Area type="linear" dataKey={metric} stroke="var(--primary)" strokeWidth={2} fill="url(#premiumFill)" isAnimationActive={false}/>
               {enabled.sma && <Line type="linear" dataKey="sma" stroke="var(--warning)" strokeWidth={1.8} dot={false} activeDot={false} tooltipType="none" isAnimationActive={false}/>}
+              {plotted.map(({ marker, y }) => <ReferenceDot key={marker.event.key} x={marker.event.time} y={y} shape={props => <TradeMark cx={props.cx} cy={props.cy} marker={marker} selected={selectedKey === marker.event.key} onSelect={setSelectedKey}/>}/>)}
             </>}
           </ComposedChart>
         </ResponsiveContainer>}
     </div>
     <div className="chart-caption"><span>{mode === "price" ? <><i className="legend-dot adr"/>ADR <i className="legend-dot ordinary"/>正股 ÷ 10</> : <><i className="legend-dot premium"/>ADR {mode === "premium" ? "溢价率" : "每份美元价差"}<span className="zero-line"/>0 = 平价</>}</span><span>{points.length ? `${date(points[0].time,true)} — ${date(points.at(-1)!.time,true)} · ${points.length.toLocaleString()} 个小时` : "小时收盘 · UTC"}</span></div>
+    {trades && <TradePanel trades={trades} markers={markers} selected={selected} onSelect={setSelectedKey} chartMarkers={mode !== "price"}/>}
     {mode !== "price" && enabled.zscore && <div className="zscore-panel" aria-label="Z-score 历史走势">
       <div className="zscore-heading"><h3><span className="sample-line z-line"/>Z-score <span>20 日</span></h3><span>0 = 近期均值 · 虚线 = ±2σ</span></div>
       <div className="zscore-chart">
         {points.some(p => p.zscore !== null) ? <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{width:800,height:160}}>
           <ComposedChart data={chartPoints} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:12,right:14,left:0,bottom:6}} accessibilityLayer>
             <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/>
-            <XAxis dataKey="time" type="number" domain={["dataMin","dataMax"]} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}}/>
+            <XAxis dataKey="time" type="number" domain={xDomain} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}}/>
             <YAxis orientation="right" width={68} domain={zDomain} tickFormatter={v => `${v}σ`} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{fontSize:12}}/>
             <ReferenceArea y1={-2} y2={2} fill="var(--chart-2)" fillOpacity={0.035}/>
             <ReferenceLine y={0} stroke="var(--muted-foreground)"/>

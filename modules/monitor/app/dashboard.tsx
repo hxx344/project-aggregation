@@ -9,6 +9,7 @@ import { useMarketFeed } from "../hooks/use-market-feed";
 import { hynixSummary, type SummaryProps } from "../lib/monitor-summary";
 import { createTrend } from "../lib/monitor-trend";
 import type { InitialMarketData } from "../lib/initial-market";
+import { useHubFills } from "../lib/hub-fills";
 
 const EMPTY_POINTS: never[] = [];
 const SpreadChart = lazyComponent(() => import("./spread-chart"), {
@@ -25,7 +26,7 @@ const signedMoney = (v: number | undefined) => v === undefined ? "—" : `${v > 
 const date = (t: number | string, full=false) => new Intl.DateTimeFormat("zh-CN", { timeZone:"UTC", month:"2-digit", day:"2-digit", ...(full ? {year:"numeric"} : {}) }).format(new Date(t));
 const stamp = (t: number | string) => `${date(t,true)} ${new Date(t).toISOString().slice(11,16)} UTC`;
 
-export default function Dashboard({ onSummary, active = true, summaryActive = active, initial = null, children }: SummaryProps & { active?: boolean; summaryActive?: boolean; initial?: InitialMarketData | null; children?: ReactNode }) {
+export default function Dashboard({ onSummary, active = true, summaryActive = active, tradesActive = false, initial = null, children }: SummaryProps & { active?: boolean; summaryActive?: boolean; tradesActive?: boolean; initial?: InitialMarketData | null; children?: ReactNode }) {
   const [hasOpened, setHasOpened] = useState(active);
   // Mount the heavy chart only on its first visit, then preserve its controls.
   if (active && !hasOpened) setHasOpened(true);
@@ -35,6 +36,7 @@ export default function Dashboard({ onSummary, active = true, summaryActive = ac
   const trend = useMemo(() => createTrend(data ? { points: data.points.map(point => ({ time: point.time, value: point.premium })), status: data.status, fetchedAt: data.fetchedAt } : undefined, { days: 7, intervalMs: 3_600_000, label: "7 天小时线", shortLabel: "7天", unit: "%" }, Boolean(error)), [data, error]);
   useEffect(() => { onSummary?.(hynixSummary(quote, quoteError, trend)); }, [onSummary, quote, quoteError, trend]);
   const [range,setRange] = useState<number | null>(null);
+  const trades = useHubFills("hynix", tradesActive);
   const [details,setDetails] = useState(false);
   const points = useMemo(() => selectRange(data?.points ?? EMPTY_POINTS,range),[data?.points,range]);
   // Current metrics must never silently substitute an hourly close for a quote.
@@ -61,7 +63,7 @@ export default function Dashboard({ onSummary, active = true, summaryActive = ac
         <article className="metric"><div className="metric-label"><span className="legend-dot ordinary"/>正股折算价格<span className="ticker">SKHX</span></div><div className="metric-value">{money(current?.equivalent)}</div><div className="metric-foot">正股 {money(current?.ordinary)} <span>÷ 10</span></div></article>
         <article className="metric"><div className="metric-label">区间平均溢价<span className="ticker">{ranges.find(r=>r.days===range)?.label}</span></div><div className="metric-value">{percent(stats?.mean)}</div><div className="metric-foot">{stats ? `${percent(stats.min)} 至 ${percent(stats.max)}` : "等待行情数据"}</div></article>
       </section>
-      {hasOpened && <ChartActivity mode={active ? "visible" : "hidden"}><SpreadChart data={data?.points ?? EMPTY_POINTS} loading={loading} range={range} onRangeChange={setRange} /></ChartActivity>}
+      {hasOpened && <ChartActivity mode={active ? "visible" : "hidden"}><SpreadChart data={data?.points ?? EMPTY_POINTS} loading={loading} range={range} onRangeChange={setRange} trades={trades} /></ChartActivity>}
       <p className="chart-footnote"><Info size={13} aria-hidden="true"/>缺失时段曲线断开，不补 0 · 采样 1 小时</p></div>
       {children}
       {hasOpened && <ChartActivity mode={active ? "visible" : "hidden"}><HynixFundingPanel range={range} onRangeChange={setRange}/></ChartActivity>}

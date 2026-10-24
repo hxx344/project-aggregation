@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createApp } from '../server/app.mjs';
-import { payload, scope, NOW } from './fills-fixtures.mjs';
+import { payload, scope, NOW, hynixPayload } from './fills-fixtures.mjs';
 
 const password = 'hub-fills-test-only';
 const assetPassword = 'asset-fills-test-only';
@@ -26,7 +26,8 @@ async function fixture(t) {
       return send(res, 200, { ok: true }, { 'Set-Cookie': `asset_session=fixture-${++loginCount}; HttpOnly; Path=/` });
     }
     if (req.headers.cookie !== `asset_session=fixture-${loginCount}`) return send(res, 401, { error: 'secret-upstream-error' });
-    assert.equal(req.method, 'GET'); assert.equal(req.url, '/api/hub/fills');
+    assert.equal(req.method, 'GET'); assert.match(req.url, /^\/api\/hub\/fills(\?market=hynix)?$/);
+    if (req.url.endsWith('market=hynix')) return send(res, 200, hynixPayload());
     await reply(req, res);
   });
   await new Promise(resolve => asset.listen(0, '127.0.0.1', resolve));
@@ -71,6 +72,13 @@ test('fills route requires Hub authentication and only reads the configured Asse
   assert.equal(result.data.sources[0].status, 'ready'); assert.deepEqual(result.data.sources[0].data.exchanges[0].accounts[0].scopes[0].fills, payload().exchanges[0].accounts[0].scopes[0].fills);
   assert.deepEqual(f.calls.map(call => [call.method, call.url]), [['POST', '/api/login'], ['GET', '/api/hub/fills']]);
   assert.equal((await f.request('/api/trading/fills?pair=unknown')).response.status, 400);
+  for (const query of ['?market=gold', '?market=oil&market=hynix', '?market=hynix&pair=x', '?market=__proto__']) {
+    assert.equal((await f.request('/api/trading/fills' + query)).response.status, 400);
+  }
+  result = await f.request('/api/trading/fills?market=hynix');
+  assert.equal(result.data.sources[0].status, 'ready');
+  assert.deepEqual(result.data.sources[0].data.exchanges[0].accounts[0].scopes[0].fills.map(item => [item.symbol, item.base]), [['SKHYUSDT', 'SKHY']]);
+  assert.equal(f.calls.at(-1).url, '/api/hub/fills?market=hynix', 'each market reads its own Asset query');
   assert.equal((await f.request('/api/trading/fills', { method: 'POST', data: {} })).response.status, 405);
 });
 

@@ -8,7 +8,7 @@ import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
 import { createPositionsSource, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest } from './hub-positions';
-import { FILLS_CAPABILITIES, FILLS_CACHE_MS, FILLS_TIMEOUT_MS, fillsReply, fillsRequest } from './hub-fills';
+import { FILLS_CAPABILITIES, FILLS_CACHE_MS, FILLS_TIMEOUT_MS, fillsCacheMs, fillsReply, fillsRequest, type FillMarket } from './hub-fills';
 
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
@@ -39,7 +39,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
   // Advances whenever the iframe document may have changed, so late replies never reach a newer document.
   const documentGeneration = useRef(0);
   const positions = useRef<ReturnType<typeof createPositionsSource> | null>(null);
-  const fills = useRef<ReturnType<typeof createPositionsSource> | null>(null);
+  const fills = useRef<Partial<Record<FillMarket, ReturnType<typeof createPositionsSource>>>>({});
   const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading });
   latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading };
   const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
@@ -89,8 +89,10 @@ export default function ProjectPage({ project, snapshot, now, active, background
       } else if (positionsBridge && connected.current && data.type === 'fills-request' && moduleCapabilities.current.includes('fills')) {
         const request = fillsRequest(data); if (!request) return;
         const generation = documentGeneration.current;
-        fills.current ??= createPositionsSource(signal => api('/api/trading/fills', { signal, timeoutMs: FILLS_TIMEOUT_MS }), { cacheMs: FILLS_CACHE_MS });
-        void fills.current.read(latest.current.active && document.visibilityState === 'visible').then(outcome => {
+        const market = request.market;
+        const source = fills.current[market] ??= createPositionsSource(signal => api('/api/trading/fills' + (market === 'oil' ? '' : '?market=' + market), { signal, timeoutMs: FILLS_TIMEOUT_MS }),
+          { cacheMs: FILLS_CACHE_MS, cacheMsFor: fillsCacheMs });
+        void source.read(latest.current.active && document.visibilityState === 'visible').then(outcome => {
           if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('fills')) return;
           post(fillsReply(request, outcome, Date.now()));
         });
@@ -102,7 +104,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
     return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
   useEffect(synchronize, [active, backgroundUpdates, query, source]);
-  useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; fills.current?.dispose(); fills.current = null; }, []);
+  useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; for (const source of Object.values(fills.current)) source.dispose(); fills.current = {}; }, []);
 
   useEffect(() => {
     const pending = pendingTabs.current;
