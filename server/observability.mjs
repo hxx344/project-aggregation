@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { immediate } from './control/schema.mjs';
 
 export const BASELINE_INTERVAL_MS = 60_000;
 export const BASELINE_RETENTION_MS = 28 * 24 * 60 * 60_000;
@@ -92,9 +93,7 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
         if (newest.get().last > bucket) { lastError = { code: 'clock_regressed', at: new Date(at).toISOString() }; return null; }
         const json = JSON.stringify(value);
         if (Buffer.byteLength(json) > 16 * 1024) throw new Error('Baseline sample exceeds limit');
-        db.exec('BEGIN IMMEDIATE');
-        try { insert.run(bucket, json); prune.run(bucket - BASELINE_RETENTION_MS + BASELINE_INTERVAL_MS, BASELINE_MAX_BUCKETS); db.exec('COMMIT'); }
-        catch (error) { db.exec('ROLLBACK'); throw error; }
+        immediate(db, () => { insert.run(bucket, json); prune.run(bucket - BASELINE_RETENTION_MS + BASELINE_INTERVAL_MS, BASELINE_MAX_BUCKETS); });
         lastError = null;
         logger.info?.({ type: 'architecture_baseline', ...value }, '架构基线采样');
         return value;

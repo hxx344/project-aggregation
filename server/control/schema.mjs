@@ -14,9 +14,36 @@ const defaults = [
 
 const TABLES = 'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires); CREATE TABLE IF NOT EXISTS execution_entries (id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);';
 
+// node:sqlite reports SQLITE_BUSY (and its extended codes) as ERR_SQLITE_ERROR with the primary code in the low byte.
+export const isSqliteBusy = error => error?.code === 'ERR_SQLITE_ERROR' && (error.errcode & 0xff) === 5;
+
+// Per-process write lock statistics (design doc 5.6): how long BEGIN IMMEDIATE waited and how long
+// the lock was then held. A wait that ran out of busy_timeout counts as busy, not as a wait.
+export const WRITE_WAIT_BUCKETS_MS = [1, 10, 100, 1000, 5000];
+const writes = { transactions: 0, busy: 0, waitBuckets: Array(WRITE_WAIT_BUCKETS_MS.length + 1).fill(0), maxWaitMs: 0, maxHoldMs: 0 };
+const bucketOfWait = ms => { const index = WRITE_WAIT_BUCKETS_MS.findIndex(limit => ms < limit); return index < 0 ? WRITE_WAIT_BUCKETS_MS.length : index; };
+export const writeWaitStats = () => ({ ...writes, waitBuckets: [...writes.waitBuckets] });
+
 export function immediate(db, fn) {
-  db.exec('BEGIN IMMEDIATE');
+  const started = performance.now();
+  try { db.exec('BEGIN IMMEDIATE'); } catch (error) { if (isSqliteBusy(error)) writes.busy++; throw error; }
+  const acquired = performance.now(), waitMs = acquired - started;
+  writes.transactions++; writes.waitBuckets[bucketOfWait(waitMs)]++; writes.maxWaitMs = Math.max(writes.maxWaitMs, waitMs);
   try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
+  finally { writes.maxHoldMs = Math.max(writes.maxHoldMs, performance.now() - acquired); }
+}
+
+// Logs the cumulative statistics when they changed since the last line; the journal keeps the distribution.
+export function logWriteWaits({ logger = console, role, intervalMs = 15 * 60_000 }) {
+  let logged = 0;
+  const log = () => {
+    const stats = writeWaitStats();
+    if (stats.transactions + stats.busy === logged) return;
+    logged = stats.transactions + stats.busy;
+    logger.info?.({ type: 'sqlite_write_waits', role, bucketsMs: WRITE_WAIT_BUCKETS_MS, ...stats, maxWaitMs: Math.round(stats.maxWaitMs), maxHoldMs: Math.round(stats.maxHoldMs) }, 'SQLite 写锁等待统计');
+  };
+  const timer = setInterval(log, intervalMs); timer.unref?.();
+  return () => { clearInterval(timer); log(); };
 }
 
 // Every process that opens hub.sqlite creates the tables; the write lock serializes a concurrent first start.

@@ -1,9 +1,12 @@
+import { isSqliteBusy } from './control/schema.mjs';
+
 // Shared by the API server and the runtime data plane, so a route keeps the
 // same body rules and error mapping on whichever side handles it.
 export class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
 export const MAX_BODY_BYTES = 32768;
 export const INTERNAL_ERROR = '服务暂时无法处理请求';
+export const DATABASE_BUSY = '数据库繁忙，请稍后重试';
 
 export const send = (res, status, data, headers = {}) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers }); res.end(JSON.stringify(data)); };
 
@@ -18,9 +21,11 @@ export async function readJsonBody(contentType, stream) {
 }
 export const readJson = async (contentType, stream) => (await readJsonBody(contentType, stream)).body;
 
-// Errors of the listed classes are decisions with a public message; anything else is a 500.
+// Errors of the listed classes are decisions with a public message. A write that waited out
+// busy_timeout for the other process is retryable, so it is a 503; anything else is a 500.
 export function errorResponder(classes) {
   return error => classes.some(type => error instanceof type)
     ? { status: error.status, body: { error: error.message } }
-    : { status: 500, body: { error: INTERNAL_ERROR } };
+    : isSqliteBusy(error) ? { status: 503, body: { error: DATABASE_BUSY } }
+      : { status: 500, body: { error: INTERNAL_ERROR } };
 }

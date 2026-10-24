@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { TRADING_VIEW_VERSION, packTradingView, unpackTradingView } from './trading-view-cache.mjs';
 import { TRADING_EXCHANGES as EXCHANGES, TRADING_SYMBOLS as SYMBOLS, TRADING_NAMES as NAMES, TRADING_PAIRS, DEFAULT_TRADING_PAIR, normalizeTradingPair, tradingPairKey } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
+import { immediate } from './control/schema.mjs';
 
 const DAY = 86_400_000;
 const POSITION_INTERVAL = 30_000, FUNDING_INTERVAL = 300_000;
@@ -152,15 +153,13 @@ function structure(legs) {
 /** Account reads only. This service deliberately has no exchange mutation operation. */
 export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = createTradingExchangeClient, now = Date.now, intervalMs = 1000, taskTimeoutMs = 60000, validationTimeoutMs = 35000, logger = console } = {}) {
   if (!stmt) stmt = createStatementCache(db);
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  immediate(db, () => {
     db.exec("CREATE TABLE IF NOT EXISTS trading_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, verified_at TEXT, snapshot TEXT, account_mode TEXT NOT NULL DEFAULT 'standard')");
     if (!stmt.prepare('PRAGMA table_info(trading_accounts)').all().some(column => column.name === 'account_mode')) {
       db.exec("ALTER TABLE trading_accounts ADD COLUMN account_mode TEXT NOT NULL DEFAULT 'standard'; UPDATE trading_accounts SET account_mode='unified' WHERE exchange IN ('bybit','okx')");
     }
     for (const exchange of EXCHANGES) stmt.prepare('INSERT OR IGNORE INTO trading_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, accountModeOf(exchange));
-    db.exec('COMMIT');
-  } catch (error) { db.exec('ROLLBACK'); throw error; }
+  });
   const rowFor = exchange => stmt.prepare('SELECT exchange,revision,credentials,verified_at,account_mode FROM trading_accounts WHERE exchange=?').get(exchangeOf(exchange));
   const storedRows = stmt.prepare('SELECT * FROM trading_accounts ORDER BY exchange').all();
   const cache = new Map(storedRows.map(row => [row.exchange, parseSnapshot(row)]));
@@ -347,12 +346,10 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       for (const days of [7, 30]) next.set(`${pairKey}:${days}`, buildState(days, pair));
       if (key !== sourceKey(pair)) { invalidateViews(); return; }
     }
-    db.exec('BEGIN IMMEDIATE');
-    try {
+    immediate(db, () => {
       const save = stmt.prepare('INSERT INTO trading_views_v2(pair_key,days,version,source_key,json) VALUES (?,?,?,?,?) ON CONFLICT(pair_key,days) DO UPDATE SET version=excluded.version,source_key=excluded.source_key,json=excluded.json');
       for (const value of next.values()) { const pairKey = tradingPairKey(value.exchanges); save.run(pairKey, value.period.days, TRADING_VIEW_VERSION, keys.get(pairKey), packTradingView(value)); }
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    });
     views = next; viewsDirty = false;
     viewError = null; viewRetryAt = 0; viewRetryDelay = 750;
   }
