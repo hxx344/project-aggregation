@@ -228,17 +228,29 @@ class OperatorTests(unittest.TestCase):
             (release / 'server/recovery').mkdir(parents=True)
             shutil.copyfile(ROOT / 'server/recovery/startup-guard.py', release / 'server/recovery/startup-guard.py')
             config = {'release': release, 'source': root / 'data', 'node': Path(NODE)}
-            library, dropins, launcher = root / 'lib', root / 'dropins', root / 'launcher'
+            library, units, launcher = root / 'lib', root / 'units', root / 'launcher'
+            units.mkdir()
+            guards = [units / f'{unit}.d/20-recovery-guard.conf' for unit in operations.SERVICES]
             with patch.object(operations, 'systemctl', return_value='') as controller:
-                operations.install_guard(config, library=library, dropins=dropins, launcher=launcher)
-                first = (dropins / '20-recovery-guard.conf').stat().st_mtime_ns
-                operations.install_guard(config, library=library, dropins=dropins, launcher=launcher)
-                self.assertEqual((dropins / '20-recovery-guard.conf').stat().st_mtime_ns, first)
+                operations.install_guard(config, library=library, units=units, launcher=launcher)
+                first = [guard.stat().st_mtime_ns for guard in guards]
+                self.assertEqual(guards[0].read_bytes(), guards[1].read_bytes())
+                operations.install_guard(config, library=library, units=units, launcher=launcher)
+                self.assertEqual([guard.stat().st_mtime_ns for guard in guards], first)
                 self.assertEqual(sum(call.args == ('daemon-reload',) for call in controller.call_args_list), 1)
                 self.assertFalse(any('restart' in call.args for call in controller.call_args_list))
-            with patch.object(operations, 'systemctl', return_value='/etc/systemd/system/custom.conf'):
-                with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
-                    operations.install_guard(config, library=library, dropins=dropins, launcher=launcher)
+                # A missing API guard is added with one more reload.
+                guards[1].unlink()
+                operations.install_guard(config, library=library, units=units, launcher=launcher)
+                self.assertTrue(guards[1].is_file())
+                self.assertEqual(sum(call.args == ('daemon-reload',) for call in controller.call_args_list), 2)
+            # An override on either unit stops the install before anything is written.
+            guards[1].unlink()
+            for unit in operations.SERVICES:
+                with self.subTest(unit=unit), patch.object(operations, 'systemctl', side_effect=lambda *arguments, **_: '/etc/systemd/system/custom.conf' if arguments[:2] == ('show', unit) else ''):
+                    with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
+                        operations.install_guard(config, library=library, units=units, launcher=launcher)
+                    self.assertFalse(guards[1].exists())
 
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root/service permissions run in Linux CI')
     def test_restored_target_parent_remains_traversable_by_the_service_account(self):

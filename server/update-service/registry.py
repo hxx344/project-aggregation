@@ -24,7 +24,9 @@ class Module:
     working_suffix: str = ''
     # Further units of the same installation, checked like `service`.
     extra_services: tuple[str, ...] = ()
-    # The `service` unit may carry the recovery entry's startup guard.
+    # Per unit (`service`, then `extra_services`): the file under current that ExecStart runs.
+    entries: tuple[str, ...] = ()
+    # Every unit may carry the recovery entry's startup guard.
     recovery_guard: bool = False
 
 
@@ -32,7 +34,8 @@ MODULES = (
     Module('hub', '工作台（包含五个内置模块）', 'project-aggregation', 'project-aggregation', 'project-aggregation',
            'project-aggregation', 'deploy/install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
            ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True,
-           extra_services=('project-aggregation-api',), recovery_guard=True),
+           extra_services=('project-aggregation-api',), entries=('server/runtime/main.mjs', 'server/api/main.mjs'),
+           recovery_guard=True),
 )
 BY_ID = {module.id: module for module in MODULES}
 HEX40 = re.compile(r'[a-f0-9]{40}')
@@ -62,7 +65,23 @@ def optional_text(path: Path):
     return text_file(path) if path.exists() or path.is_symlink() else ''
 
 
-def unit_source(module: Module, name, current_path, filesystem, guard=False):
+def recovery_guard(module: Module):
+    """The exact drop-in operations.install_guard writes; only the Node path varies."""
+    return re.compile(re.escape(RECOVERY_MARKER + '\n[Service]\nExecStartPre=/usr/bin/python3 -I '
+                                '/usr/local/lib/project-aggregation-recovery/startup-guard.py ${DATA_DIR} '
+                                f'/opt/{module.directory}/current/server/execution/account-writer.mjs ') + r'/\S+')
+
+
+def dropin_directories(name, filesystem):
+    """Every directory systemd reads drop-ins of `name`.service from, outside /usr."""
+    parts = name.split('-')
+    names = [name + '.service.d', *('-'.join(parts[:index]) + '-.service.d' for index in range(1, len(parts))), 'service.d']
+    for base in ('etc/systemd/system', 'run/systemd/system', 'etc/systemd/system.control', 'run/systemd/system.control'):
+        for directory in names:
+            yield filesystem / base / directory
+
+
+def unit_source(module: Module, name, current_path, filesystem, guard=False, entry=''):
     unit = filesystem / 'etc/systemd/system' / (name + '.service')
     source = text_file(unit)
     properties = {}
@@ -81,16 +100,19 @@ def unit_source(module: Module, name, current_path, filesystem, guard=False):
     if module.id == 'variational':
         if not re.match(r'^/usr/bin/python3 -m variational_grid (?:run|compare) ', command):
             raise ValueError('Unknown Variational command')
-    elif current_path + '/' not in command:
+    elif current_path + '/' not in command or (entry and not command.endswith(' ' + current_path + '/' + entry)):
         raise ValueError('Service does not run the managed release')
     # Custom service overrides need a deliberate CLI update, not a guessed
     # identity; only the recovery entry's own startup guard is expected.
-    for dropins in (unit.parent / (name + '.service.d'), filesystem / 'run/systemd/system' / (name + '.service.d')):
+    managed = unit.parent / (name + '.service.d')
+    for dropins in dropin_directories(name, filesystem):
+        if dropins.is_symlink():
+            raise ValueError('Custom service overrides')
         if not dropins.exists():
             continue
         for conf in dropins.glob('*.conf'):
-            if not (guard and dropins.parent == unit.parent and conf.name == RECOVERY_GUARD and
-                    text_file(conf).partition('\n')[0] == RECOVERY_MARKER):
+            if not (guard and dropins == managed and conf.name == RECOVERY_GUARD and
+                    recovery_guard(module).fullmatch(text_file(conf))):
                 raise ValueError('Custom service overrides')
     return source
 
@@ -120,8 +142,10 @@ def installed(module: Module, filesystem=Path('/')):
             if module.id == 'variational' and marker == '.install-owned' and value != 'variational-grid':
                 raise ValueError('Wrong installation owner')
         current_path = str(root / 'current').replace('\\', '/')
-        sources = [unit_source(module, name, current_path, filesystem, guard=module.recovery_guard and name == module.service)
-                   for name in (module.service, *module.extra_services)]
+        names = (module.service, *module.extra_services)
+        entries = module.entries or ('',) * len(names)
+        sources = [unit_source(module, name, current_path, filesystem, guard=module.recovery_guard, entry=entry)
+                   for name, entry in zip(names, entries, strict=True)]
         checked = optional_text((root / module.checked[1:]) if module.checked.startswith('@') else (release / module.checked)) if module.checked else ''
         checked = checked.split()[0] if checked else ''
         artifact = optional_text(release / '.release-commit')

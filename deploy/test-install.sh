@@ -257,4 +257,45 @@ set -e
 PROJECT_DEPLOY_MODE=ci
 prune_caches
 [[ -d "$cache/embedded-$(key 36)" ]]
+
+# The units the installer writes are the units the update registry and the
+# recovery entry accept, with the recovery guard on each (design doc 6.3, 6.4).
+repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
+(
+  APP_DIR=/opt/project-aggregation SERVICE=project-aggregation API_SERVICE=project-aggregation-api SERVICE_USER=project-aggregation
+  DATA_PATH=/var/lib/project-aggregation ENV_FILE=/etc/project-aggregation.env NODE_BIN=/usr/local/bin/node
+  GREEKS_PYTHON_PATH=/usr/bin/python3 ASTER_PYTHON_PATH=/usr/bin/python3
+  work_dir="$test_root/units" units="$test_root/filesystem/etc/systemd/system"
+  mkdir -p "$work_dir" "$units"
+  for systemd_version in 252 255; do
+    write_unit
+    cp "$work_dir/service" "$units/$SERVICE.service"
+    cp "$work_dir/api.service" "$units/$API_SERVICE.service"
+    python3 -I - "$repository" "$test_root/filesystem" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+from unittest.mock import patch
+repository, filesystem = Path(sys.argv[1]), Path(sys.argv[2])
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, repository / path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
+registry = load('registry', 'server/update-service/registry.py')
+operations = load('operations', 'server/recovery/operations.py')
+units = filesystem / 'etc/systemd/system'
+module = registry.BY_ID['hub']
+guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
+         '${DATA_DIR} /opt/project-aggregation/current/server/execution/account-writer.mjs /usr/local/bin/node\n')
+for name in (module.service, *module.extra_services):
+    (units / (name + '.service.d')).mkdir(exist_ok=True)
+    (units / (name + '.service.d/20-recovery-guard.conf')).write_text(guard, encoding='utf-8')
+with patch.object(registry, 'text_file', lambda path, maximum=65536: path.read_text(encoding='utf-8').strip()):
+    for name, entry in zip((module.service, *module.extra_services), module.entries, strict=True):
+        registry.unit_source(module, name, '/opt/project-aggregation/current', filesystem, guard=True, entry=entry)
+with patch.object(operations, 'trusted', side_effect=lambda path, private=False: Path(path)):
+    runtime = operations.managed_unit(units / 'project-aggregation.service', 'runtime/main.mjs')
+    assert runtime == ('project-aggregation', '/usr/local/bin/node'), runtime
+    assert operations.managed_unit(units / 'project-aggregation-api.service', 'api/main.mjs') == runtime
+PY
+  done
+)
 printf 'Installer helper and cache pruning checks passed.\n'

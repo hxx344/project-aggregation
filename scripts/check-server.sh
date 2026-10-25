@@ -2,7 +2,7 @@
 # 一键诊断工作台服务状态
 
 echo "========== 1. 服务运行状态 =========="
-systemctl status project-aggregation project-aggregation-api 2>/dev/null || echo "未找到 systemd 服务"
+systemctl status project-aggregation project-aggregation-api --no-pager 2>/dev/null || echo "至少一个服务未在运行或未安装（见上方状态）"
 ps aux | grep -E '[n]ode.*server' | head -5
 
 echo -e "\n========== 2. 端口监听状态 =========="

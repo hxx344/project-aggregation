@@ -104,15 +104,18 @@ def systemctl(*arguments, timeout=15):
 
 
 def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-recovery'),
-                  dropins=Path('/etc/systemd/system/project-aggregation.service.d'),
+                  units=Path('/etc/systemd/system'),
                   launcher=Path('/usr/local/bin/project-aggregation-recovery')):
     guard = library / 'startup-guard.py'
     safe_directory(library, private=False)
-    dropins.mkdir(mode=0o755, exist_ok=True)
-    for candidate in [dropins, *dropins.parents]:
-        info = candidate.lstat()
-        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise ValueError('RECOVERY_UNTRUSTED_INPUT')
+    # Both units start code that opens the data directory, so both carry the guard.
+    dropins = {unit: units / (unit + '.d') for unit in SERVICES}
+    for directory in dropins.values():
+        directory.mkdir(mode=0o755, exist_ok=True)
+        for candidate in [directory, *directory.parents]:
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('RECOVERY_UNTRUSTED_INPUT')
 
     def update(filename, content, mode):
         if filename.exists():
@@ -137,14 +140,16 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
     source = config['release'] / 'server/recovery/startup-guard.py'
     update(guard, trusted(source).read_bytes(), 0o644)
     # Kept outside the release link so a failed update cannot remove this gate.
-    dropin = dropins / '20-recovery-guard.conf'
     content = ('# Managed by project-aggregation recovery\n[Service]\n'
                f'ExecStartPre=/usr/bin/python3 -I {guard} ${{DATA_DIR}} '
                f'{APP}/current/server/execution/account-writer.mjs {config["node"]}\n').encode()
-    existing = systemctl('show', SERVICE, '--property=DropInPaths', '--value').split()
-    if any(Path(value) != dropin for value in existing):
-        raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
-    if update(dropin, content, 0o644):
+    # Every unit is checked before either drop-in is written.
+    for unit, directory in dropins.items():
+        existing = systemctl('show', unit, '--property=DropInPaths', '--value').split()
+        if any(Path(value) != directory / '20-recovery-guard.conf' for value in existing):
+            raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
+    changed = [update(directory / '20-recovery-guard.conf', content, 0o644) for directory in dropins.values()]
+    if any(changed):
         systemctl('daemon-reload')
     launcher_body = ('# Managed by project-aggregation recovery\n#!/bin/sh\n'
                      f'exec /usr/bin/python3 -I {APP}/current/server/recovery/operations.py "$@"\n').encode()
@@ -267,7 +272,8 @@ def _main_locked(values):
     was_running = any(state.get('ActiveState') in {'active', 'activating', 'reloading'} for state in before.values())
     # Both units explicitly: PartOf= alone would leave an API started on its own.
     if was_running:
-        systemctl('stop', *SERVICES, timeout=180)
+        # The API stops first (TimeoutStopSec=75), then the runtime (TimeoutStopSec=150).
+        systemctl('stop', *SERVICES, timeout=260)
     require_stopped(groups)
     try:
         if values.action != 'restore':
@@ -330,7 +336,7 @@ def _main_locked(values):
                 # Disaster restore needs only the checkpoint and its keys.
                 # An unreadable original authority stays stopped.
             else:
-                # The runtime unit starts the API unit (Wants=).
+                # Either unit running counts as running; the runtime unit starts the API unit (Wants=).
                 if current['state'] != 'retired':
                     systemctl('start', SERVICE, timeout=180)
 
