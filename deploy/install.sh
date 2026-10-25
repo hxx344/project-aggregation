@@ -2765,7 +2765,7 @@ main() {
     prepare_ci_application
     ci_update_progress verify
     validate_embedded_runtime "$release"
-    # The entries are imported, not run: argv[1] is a placeholder, so their main-module checks stay false.
+    # The entries are imported, not run: under -e there is no main module, so import.meta.main stays false.
     run_as_service "$NODE_BIN" --input-type=module -e 'for (const file of process.argv.slice(2)) await import(file)' import-check \
       "$release/server/app.mjs" "$release/server/launcher.mjs" "$release/server/runtime/main.mjs" "$release/server/api/main.mjs"
   else

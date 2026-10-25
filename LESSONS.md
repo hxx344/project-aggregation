@@ -1245,3 +1245,17 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `8da1d5a` 的 [Monitor 投影](modules/monitor/server/perpetual-opportunities-v2.mjs) 第 50–53 行，以及 CrossEx [旧持仓费率路径](modules/crossex/server/funding-opportunities.mjs)。2026-10-25 用户截图显示 AXIS 两条腿资金费率为「—」，同屏 ORDER 正常；公开接口核实 Binance 没有 AXISUSDT（`Invalid symbol`），而 ORDERUSDT 是 COIN 永续合约，Bybit 和 OKX 的 AXIS 资金费数据正常。两轮独立审查用内存探针复现了调度饥饿（含时钟回退）、列表截断、Bybit 周期、`fundingInfo` 额度、未来缓存值、冷却绕过与 429 被遮蔽等问题，均已修复；对应测试经变异检查，在还原单处修复后失败。
 
 **事件记录：** `crossex-held-funding-binance-gate-20261025`；实际发生日期 2026-10-25（Asia/Shanghai）；不推进全历史复盘检查点。
+
+### L078：服务入口要按 systemd 的真实启动路径验证
+
+**适用条件：** 入口文件用「是否为主模块」决定是否启动，且服务单元、安装器或恢复工具通过符号链接（如 `/opt/project-aggregation/current`）启动它；或部署测试用桩替代了 `systemctl` 与健康检查。
+
+**根因：** Node 按真实路径加载入口，`import.meta.url` 是解析后的发布目录，而 `process.argv[1]` 保留 systemd 给出的 `current/...` 路径。入口用 `path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)` 比较，经符号链接启动时永远不相等，主块被跳过，进程不报错、以 0 退出。旧的单单元入口 `server/index.mjs` 无条件调用 `runLauncher()`，再用真实路径 `fork` 子进程，所以问题一直没暴露；拆成两个单元后，`ExecStart` 直接指向 `current/server/runtime/main.mjs` 和 `current/server/api/main.mjs`，两个单元一启动就「Deactivated successfully」。`Restart=on-failure` 不会重启退出码为 0 的进程，安装器 30 次健康检查失败后回滚。本地启动、导入检查和 [CI 安装测试](deploy/test-ci-install.sh) 都没覆盖：前两者用的是真实路径，后者把 `systemctl` 和健康检查替换成了桩。
+
+**以后做法：** 由 systemd、安装器或恢复工具启动的入口，主模块判断用 Node 24 的 `import.meta.main`：它按 Node 实际加载的入口判断，经符号链接启动或使用 `--preserve-symlinks-main` 时都成立。不再手写 `argv[1]` 与 `import.meta.url` 的路径比较。只由真实路径调用的部署辅助脚本与开发脚本（`deploy/pipeline/config-files.mjs`、`modules/asset/scripts/prepare-ledger.mjs`、`scripts/*.mjs`、`modules/monitor/tests/*-server.mjs` 测试辅助脚本）暂未改写，改动时一并替换。新增或修改服务单元的 `ExecStart` 时，按单元里原样的路径（含符号链接与工作目录）启动一次入口，确认它真的执行了启动逻辑，而不只是能被导入。部署测试用桩替代 systemd 时，在提交说明里写明真实 systemd 路径未覆盖。
+
+**如何验证：** [入口测试](tests/entry-symlink.test.mjs) 经符号链接发布目录启动运行时、API、启动器和恢复 CLI，各给一项会被立即拒绝的配置，断言退出码为 1 并输出各自的报错；还原修复后，运行时入口以 0 退出，测试失败。
+
+**证据：** project-aggregation 正式版 `3c10039`（PR #57）在服务器 VM-4-13 的在线更新于 2026-10-26 00:20:35（Asia/Shanghai）失败。journal 显示两个单元同一秒 `Started` 后即 `Deactivated successfully`，没有任何 node 日志；更新日志为「服务未在 30 次健康检查内就绪」，回滚后旧版本恢复。本地用 `node <符号链接>/server/runtime/main.mjs` 复现以 0 退出。
+
+**事件记录：** `two-unit-entry-symlink-20261026`；实际发生日期 2026-10-26（Asia/Shanghai）；不推进全历史复盘检查点。
