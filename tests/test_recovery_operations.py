@@ -232,8 +232,7 @@ class OperatorTests(unittest.TestCase):
             units.mkdir()
             guards = [units / f'{unit}.d/20-recovery-guard.conf' for unit in operations.SERVICES]
             # A small systemd: a reload loads each unit's drop-in files plus the
-            # drop-ins of shared directories (`shared`); `show` reports them, and
-            # NeedDaemonReload while what is loaded differs from the files.
+            # drop-ins of shared directories (`shared`); `show` reports them.
             loaded = {unit: {} for unit in operations.SERVICES}
             shared = {unit: [] for unit in operations.SERVICES}
             failing_reloads = []
@@ -250,9 +249,7 @@ class OperatorTests(unittest.TestCase):
                     for unit in operations.SERVICES:
                         loaded[unit] = {**on_disk(unit), **{path: b'' for path in shared[unit]}}
                     return ''
-                unit = arguments[1]
-                stale = loaded[unit] != {**on_disk(unit), **{path: b'' for path in shared[unit]}}
-                return f"DropInPaths={' '.join(loaded[unit])}\nNeedDaemonReload={'yes' if stale else 'no'}"
+                return ' '.join(loaded[arguments[1]])
 
             def install(node=Path(NODE)):
                 operations.install_guard({**config, 'node': node}, library=library, units=units, launcher=launcher)
@@ -264,40 +261,38 @@ class OperatorTests(unittest.TestCase):
                 self.assertEqual(guards[0].read_bytes(), guards[1].read_bytes())
                 self.assertEqual(guards[0].read_bytes(), operations.guard_dropin(library / 'startup-guard.py', Path(NODE)))
                 self.assertEqual(reloads(), 1)
-                # Every later run sees its own loaded guards: nothing is written or reloaded.
+                # A later run rewrites nothing; it still reloads and checks what systemd loaded.
                 first = [guard.stat().st_mtime_ns for guard in guards]
                 install()
                 self.assertEqual([guard.stat().st_mtime_ns for guard in guards], first)
-                self.assertEqual(reloads(), 1)
+                self.assertEqual(reloads(), 2)
                 self.assertFalse(any('restart' in call for call in calls))
-                # A missing API guard is added with one more reload.
+                # A missing API guard is added.
                 guards[1].unlink()
                 install()
                 self.assertTrue(guards[1].is_file())
-                self.assertEqual(reloads(), 2)
-                # A changed guard whose reload failed is reloaded by the next run, which writes nothing.
+                self.assertEqual(reloads(), 3)
+                # A changed guard whose reload failed is loaded by the next run, which writes nothing.
                 failing_reloads.append(True)
                 with self.assertRaises(subprocess.CalledProcessError):
                     install(Path('/opt/node/bin/node'))
                 changed = [guard.read_bytes() for guard in guards]
                 install(Path('/opt/node/bin/node'))
                 self.assertEqual([guard.read_bytes() for guard in guards], changed)
-                self.assertEqual(reloads(), 4)
+                self.assertEqual(reloads(), 5)
                 self.assertEqual(loaded[operations.API_SERVICE], {str(guards[1]): changed[1]})
-                install(Path('/opt/node/bin/node'))
-                self.assertEqual(reloads(), 4)
                 # A drop-in added to a shared directory, guards unchanged, is loaded by the
-                # reload NeedDaemonReload asks for and then stops the install.
+                # reload and then stops the install.
                 shared[operations.API_SERVICE] = ['/etc/systemd/system/service.d/zz.conf']
                 with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
                     install(Path('/opt/node/bin/node'))
                 self.assertEqual([guard.read_bytes() for guard in guards], changed)
-                self.assertEqual(reloads(), 5)
-                # Once the operator removes it and reloads, the guards are in place as they are.
+                self.assertEqual(reloads(), 6)
+                # Once the operator removes it and reloads, the guards are accepted as they are.
                 shared[operations.API_SERVICE] = []
                 controller('daemon-reload')
                 install(Path('/opt/node/bin/node'))
-                self.assertEqual(reloads(), 6)
+                self.assertEqual(reloads(), 8)
                 # Overrides stop the install before anything is written or reloaded: another unit's guard,
                 # a loaded custom drop-in alone or next to the guard, a custom drop-in not
                 # loaded yet alone or next to the guard, or an unmanaged guard.

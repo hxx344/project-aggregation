@@ -49,27 +49,26 @@ systemctl daemon-reload
 systemctl start "$unit"
 for ((attempt=0; attempt<50; attempt++)); do [[ ! -f "$fixture/ready" ]] || break; sleep .1; done
 [[ -f "$fixture/ready" ]]
-# install_guard relies on these: a drop-in added on disk marks the loaded unit
-# NeedDaemonReload, and the reload lists it in DropInPaths.
-dropin_state() {
+# install_guard relies on DropInPaths, as loaded_dropins reads it, listing a
+# drop-in once a reload loaded it, also from a directory created after the last reload.
+loaded_dropins() {
   /usr/bin/python3 -I - "$repository" "$unit" <<'PY'
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location('recovery_operations', pathlib.Path(sys.argv[1]) / 'server/recovery/operations.py')
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-print(module.dropin_state(sys.argv[2]))
+print(module.loaded_dropins(sys.argv[2]))
 PY
 }
-expect_dropin_state() {
+expect_loaded_dropins() {
   local actual
-  actual=$(dropin_state)
-  [[ "$actual" == "$1" ]] || { echo "dropin_state: $actual, expected $1" >&2; return 1; }
+  actual=$(loaded_dropins)
+  [[ "$actual" == "$1" ]] || { echo "loaded_dropins: $actual, expected $1" >&2; return 1; }
 }
-expect_dropin_state "([], False)"
+expect_loaded_dropins "[]"
 mkdir -m 0755 "$dropin_dir"
 printf '[Service]\nEnvironment=RECOVERY_FIXTURE=1\n' > "$dropin_dir/10-recovery-fixture.conf"
-expect_dropin_state "([], True)"
 systemctl daemon-reload
-expect_dropin_state "(['$dropin_dir/10-recovery-fixture.conf'], False)"
+expect_loaded_dropins "['$dropin_dir/10-recovery-fixture.conf']"
 group=$(systemctl show -p ControlGroup --value "$unit")
 systemctl stop "$unit"
 [[ $(systemctl show -p MainPID --value "$unit") == 0 ]]
