@@ -110,6 +110,13 @@ def guard_dropin(guard, node):
             f'{APP}/current/server/execution/account-writer.mjs {node}\n').encode()
 
 
+def dropin_state(unit):
+    """The drop-ins systemd loaded for unit and whether its files changed since."""
+    fields = systemctl('show', unit, '--property=DropInPaths,NeedDaemonReload')
+    fields = dict(line.split('=', 1) for line in fields.splitlines() if '=' in line)
+    return fields.get('DropInPaths', '').split(), fields.get('NeedDaemonReload') == 'yes'
+
+
 def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-recovery'),
                   units=Path('/etc/systemd/system'),
                   launcher=Path('/usr/local/bin/project-aggregation-recovery')):
@@ -150,19 +157,22 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
     # Kept outside the release link so a failed update cannot remove this gate.
     content = guard_dropin(guard, config['node'])
     # Every unit is checked, loaded and on disk, before either drop-in is written.
-    loaded = []
+    current = []
     for unit, directory in dropins.items():
         dropin = directory / '20-recovery-guard.conf'
-        existing = systemctl('show', unit, '--property=DropInPaths', '--value').split()
+        existing, stale = dropin_state(unit)
         if any(Path(value) != dropin for value in existing) or any(path != dropin for path in directory.glob('*.conf')):
             raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
         if dropin.exists() or dropin.is_symlink():
             managed(dropin)
-        loaded.append(str(dropin) in existing)
+        current.append(str(dropin) in existing and not stale)
     changed = [update(directory / '20-recovery-guard.conf', content, 0o644) for directory in dropins.values()]
-    # A guard written by an earlier run whose reload failed is loaded now.
-    if any(changed) or not all(loaded):
+    # A guard written by an earlier run whose reload failed, new or changed, is loaded now.
+    if any(changed) or not all(current):
         systemctl('daemon-reload')
+        # The reload also loads drop-ins from shared directories such as service.d.
+        if any(dropin_state(unit)[0] != [str(directory / '20-recovery-guard.conf')] for unit, directory in dropins.items()):
+            raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
     launcher_body = ('# Managed by project-aggregation recovery\n#!/bin/sh\n'
                      f'exec /usr/bin/python3 -I {APP}/current/server/recovery/operations.py "$@"\n').encode()
     # A shell script needs its shebang first; retain the ownership marker next.
