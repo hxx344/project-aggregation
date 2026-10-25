@@ -73,10 +73,14 @@ def recovery_guard(module: Module):
 
 
 def dropin_directories(name, filesystem):
-    """Every directory systemd reads drop-ins of `name`.service from, outside /usr."""
+    """The directories systemd reads drop-ins of `name`.service from, except
+    /usr/lib and /lib, which belong to distribution packages."""
     parts = name.split('-')
     names = [name + '.service.d', *('-'.join(parts[:index]) + '-.service.d' for index in range(1, len(parts))), 'service.d']
-    for base in ('etc/systemd/system', 'run/systemd/system', 'etc/systemd/system.control', 'run/systemd/system.control'):
+    for base in ('etc/systemd/system.control', 'run/systemd/system.control', 'run/systemd/transient',
+                 'run/systemd/generator.early', 'etc/systemd/system', 'etc/systemd/system.attached',
+                 'run/systemd/system', 'run/systemd/system.attached', 'run/systemd/generator',
+                 'usr/local/lib/systemd/system', 'run/systemd/generator.late'):
         for directory in names:
             yield filesystem / base / directory
 
@@ -100,7 +104,7 @@ def unit_source(module: Module, name, current_path, filesystem, guard=False, ent
     if module.id == 'variational':
         if not re.match(r'^/usr/bin/python3 -m variational_grid (?:run|compare) ', command):
             raise ValueError('Unknown Variational command')
-    elif current_path + '/' not in command or (entry and not command.endswith(' ' + current_path + '/' + entry)):
+    elif current_path + '/' not in command or (entry and not re.fullmatch(r'/\S+ ' + re.escape(current_path + '/' + entry), command)):
         raise ValueError('Service does not run the managed release')
     # Custom service overrides need a deliberate CLI update, not a guessed
     # identity; only the recovery entry's own startup guard is expected.

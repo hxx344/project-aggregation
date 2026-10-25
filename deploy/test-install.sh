@@ -283,18 +283,36 @@ registry = load('registry', 'server/update-service/registry.py')
 operations = load('operations', 'server/recovery/operations.py')
 units = filesystem / 'etc/systemd/system'
 module = registry.BY_ID['hub']
-guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
-         '${DATA_DIR} /opt/project-aggregation/current/server/execution/account-writer.mjs /usr/local/bin/node\n')
+# The drop-in exactly as the recovery entry writes it.
+guard = operations.guard_dropin(Path('/usr/local/lib/project-aggregation-recovery/startup-guard.py'), '/usr/local/bin/node')
 for name in (module.service, *module.extra_services):
     (units / (name + '.service.d')).mkdir(exist_ok=True)
-    (units / (name + '.service.d/20-recovery-guard.conf')).write_text(guard, encoding='utf-8')
-with patch.object(registry, 'text_file', lambda path, maximum=65536: path.read_text(encoding='utf-8').strip()):
-    for name, entry in zip((module.service, *module.extra_services), module.entries, strict=True):
-        registry.unit_source(module, name, '/opt/project-aggregation/current', filesystem, guard=True, entry=entry)
-with patch.object(operations, 'trusted', side_effect=lambda path, private=False: Path(path)):
-    runtime = operations.managed_unit(units / 'project-aggregation.service', 'runtime/main.mjs')
-    assert runtime == ('project-aggregation', '/usr/local/bin/node'), runtime
-    assert operations.managed_unit(units / 'project-aggregation-api.service', 'api/main.mjs') == runtime
+    (units / (name + '.service.d/20-recovery-guard.conf')).write_bytes(guard)
+def accepted():
+    with patch.object(registry, 'text_file', lambda path, maximum=65536: path.read_text(encoding='utf-8').strip()):
+        try:
+            for name, entry in zip((module.service, *module.extra_services), module.entries, strict=True):
+                registry.unit_source(module, name, '/opt/project-aggregation/current', filesystem, guard=True, entry=entry)
+        except ValueError:
+            registry_result = False
+        else:
+            registry_result = True
+    with patch.object(operations, 'trusted', side_effect=lambda path, private=False: Path(path)):
+        try:
+            runtime = operations.managed_unit(units / 'project-aggregation.service', 'runtime/main.mjs')
+            recovery_result = operations.managed_unit(units / 'project-aggregation-api.service', 'api/main.mjs') == runtime
+        except ValueError:
+            recovery_result = False
+    return registry_result, recovery_result
+assert accepted() == (True, True), accepted()
+# Commands the recovery entry rejects are rejected by the registry too.
+unit = units / 'project-aggregation-api.service'
+source = unit.read_text(encoding='utf-8')
+command = '/opt/project-aggregation/current/server/api/main.mjs'
+for forged in ('/bin/sh -c x ' + command, '/usr/local/bin/node --require /tmp/x.js ' + command, '/usr/local/bin/node ' + command + ' extra'):
+    unit.write_text(source.replace('/usr/local/bin/node ' + command, forged), encoding='utf-8')
+    assert accepted() == (False, False), (forged, accepted())
+unit.write_text(source, encoding='utf-8')
 PY
   done
 )

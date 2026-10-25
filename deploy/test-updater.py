@@ -212,7 +212,9 @@ class RegistryTests(RootFixture):
         systemd = self.root / 'etc/systemd'
         for directory in [self.root / 'run/systemd/system/project-aggregation.service.d', systemd / 'system/project-.service.d',
                           systemd / 'system/project-aggregation-.service.d', systemd / 'system/service.d',
-                          systemd / 'system.control/project-aggregation-api.service.d', self.root / 'run/systemd/system.control/project-aggregation.service.d']:
+                          systemd / 'system.control/project-aggregation-api.service.d', self.root / 'run/systemd/system.control/project-aggregation.service.d',
+                          systemd / 'system.attached/project-aggregation-api.service.d', self.root / 'run/systemd/transient/project-aggregation.service.d',
+                          self.root / 'run/systemd/generator.late/project-aggregation-api.service.d', self.root / 'usr/local/lib/systemd/system/project-aggregation-api.service.d']:
             with self.subTest(directory=directory):
                 directory.mkdir(parents=True)
                 (directory / '20-recovery-guard.conf').write_text(guard, encoding='utf8')

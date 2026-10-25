@@ -103,6 +103,13 @@ def systemctl(*arguments, timeout=15):
                           text=True, timeout=timeout, check=True).stdout.strip()
 
 
+def guard_dropin(guard, node):
+    """The startup guard drop-in of both units; registry.recovery_guard() accepts exactly this."""
+    return ('# Managed by project-aggregation recovery\n[Service]\n'
+            f'ExecStartPre=/usr/bin/python3 -I {guard} ${{DATA_DIR}} '
+            f'{APP}/current/server/execution/account-writer.mjs {node}\n').encode()
+
+
 def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-recovery'),
                   units=Path('/etc/systemd/system'),
                   launcher=Path('/usr/local/bin/project-aggregation-recovery')):
@@ -117,14 +124,15 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
             if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
                 raise ValueError('RECOVERY_UNTRUSTED_INPUT')
 
+    def managed(filename):
+        previous = trusted(filename).read_bytes()
+        if b'# Managed by project-aggregation recovery' not in previous.splitlines()[:2]:
+            raise ValueError('RECOVERY_UNMANAGED_GUARD')
+        return previous
+
     def update(filename, content, mode):
-        if filename.exists():
-            trusted(filename)
-            previous = filename.read_bytes()
-            if b'# Managed by project-aggregation recovery' not in previous.splitlines()[:2]:
-                raise ValueError('RECOVERY_UNMANAGED_GUARD')
-            if previous == content:
-                return False
+        if filename.exists() and managed(filename) == content:
+            return False
         temporary = filename.with_name(filename.name + '.tmp-' + uuid.uuid4().hex)
         descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, mode)
         try:
@@ -140,16 +148,20 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
     source = config['release'] / 'server/recovery/startup-guard.py'
     update(guard, trusted(source).read_bytes(), 0o644)
     # Kept outside the release link so a failed update cannot remove this gate.
-    content = ('# Managed by project-aggregation recovery\n[Service]\n'
-               f'ExecStartPre=/usr/bin/python3 -I {guard} ${{DATA_DIR}} '
-               f'{APP}/current/server/execution/account-writer.mjs {config["node"]}\n').encode()
-    # Every unit is checked before either drop-in is written.
+    content = guard_dropin(guard, config['node'])
+    # Every unit is checked, loaded and on disk, before either drop-in is written.
+    loaded = []
     for unit, directory in dropins.items():
+        dropin = directory / '20-recovery-guard.conf'
         existing = systemctl('show', unit, '--property=DropInPaths', '--value').split()
-        if any(Path(value) != directory / '20-recovery-guard.conf' for value in existing):
+        if any(Path(value) != dropin for value in existing) or any(path != dropin for path in directory.glob('*.conf')):
             raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
+        if dropin.exists() or dropin.is_symlink():
+            managed(dropin)
+        loaded.append(str(dropin) in existing)
     changed = [update(directory / '20-recovery-guard.conf', content, 0o644) for directory in dropins.values()]
-    if any(changed):
+    # A guard written by an earlier run whose reload failed is loaded now.
+    if any(changed) or not all(loaded):
         systemctl('daemon-reload')
     launcher_body = ('# Managed by project-aggregation recovery\n#!/bin/sh\n'
                      f'exec /usr/bin/python3 -I {APP}/current/server/recovery/operations.py "$@"\n').encode()
