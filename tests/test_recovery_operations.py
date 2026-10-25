@@ -190,6 +190,29 @@ class OperatorTests(unittest.TestCase):
                 self.assertEqual([call.args for call in controller.call_args_list], [('stop', *operations.SERVICES), ('start', operations.SERVICE)])
                 self.assertEqual(stopped.call_args_list[0].args, ({unit: '/system.slice/' + unit for unit in operations.SERVICES},))
 
+    def test_rejected_guard_runs_no_operation_and_restarts_only_a_live_source(self):
+        import argparse
+        for error, state, started in [(ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE'), 'normal', True),
+                                      (subprocess.CalledProcessError(1, 'daemon-reload'), 'normal', True),
+                                      (ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE'), 'retired', False)]:
+            with self.subTest(error=error, state=state), tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+                keys = Path(directory)
+                states = {unit: {'ActiveState': 'active', 'ControlGroup': '/system.slice/' + unit} for unit in operations.SERVICES}
+                args = argparse.Namespace(action='backup', destination=keys / 'backup', target_dir=None, backup_dir=None)
+                actions = []
+                def cli(_config, action, *_arguments):
+                    actions.append(action)
+                    return {'state': state}
+                with patch.object(operations, 'KEYS', keys), patch.object(operations, 'deployment', return_value={'source': keys / 'data', 'uid': 1}), \
+                        patch.object(operations, 'run_cli', side_effect=cli), patch.object(operations, 'install_guard', side_effect=error), \
+                        patch.object(operations, 'safe_directory'), patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                        patch.object(operations, 'require_stopped'), patch.object(operations, 'systemctl') as controller:
+                    with self.assertRaises(type(error)):
+                        operations._main_locked(args)
+                self.assertEqual(actions, ['keys', 'check-source', 'check-source'])
+                self.assertEqual([call.args for call in controller.call_args_list],
+                                 [('stop', *operations.SERVICES)] + ([('start', operations.SERVICE)] if started else []))
+
     def test_deployment_requires_both_installer_units_with_one_identity(self):
         with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
             root = Path(directory); runtime = root / 'runtime.service'; api = root / 'api.service'
@@ -249,6 +272,7 @@ class OperatorTests(unittest.TestCase):
                     for unit in operations.SERVICES:
                         loaded[unit] = {**on_disk(unit), **{path: b'' for path in shared[unit]}}
                     return ''
+                self.assertEqual(arguments, ('show', arguments[1], '--property=DropInPaths', '--value'))
                 return ' '.join(loaded[arguments[1]])
 
             def install(node=Path(NODE)):

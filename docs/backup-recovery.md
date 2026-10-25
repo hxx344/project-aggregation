@@ -27,7 +27,7 @@ sudo project-aggregation-recovery backup
 | 备份数据密钥 | `/etc/project-aggregation-recovery/data.key`，32 字节，权限 `0600` |
 | 备份秘密材料密钥 | `/etc/project-aggregation-recovery/secrets.key`，独立的 32 字节，权限 `0600`，不得与数据密钥相同 |
 | 交接续作记录 | `/etc/project-aggregation-recovery/pending-handoff.json`，记录原源和备份目标，不是解锁令牌 |
-| 持久启动保护 | `/usr/local/lib/project-aggregation-recovery/startup-guard.py` 与两个单元各自的 `20-recovery-guard.conf`（`project-aggregation.service.d/`、`project-aggregation-api.service.d/`，内容相同）；API 进程启动时另外自行检查恢复状态。安装 guard 前先检查两个单元都没有其他 drop-in，任一单元有就整体拒绝（`RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE`）；删除多余的 drop-in 后先执行 `sudo systemctl daemon-reload` 再重试，否则 systemd 仍报告已加载的旧 drop-in。网页更新只把 `/etc/systemd/system` 下与恢复入口写出内容逐字一致的 guard 视为受管配置，其他 drop-in（包括 `/run`、`system.control`、`system.attached`、transient、generator、`/usr/local/lib/systemd/system`、前缀目录与 `service.d` 中的）仍判为未受管；`/usr/lib` 下由软件包提供的 drop-in 不扫描 |
+| 持久启动保护 | `/usr/local/lib/project-aggregation-recovery/startup-guard.py` 与两个单元各自的 `20-recovery-guard.conf`（`project-aggregation.service.d/`、`project-aggregation-api.service.d/`，内容相同）；API 进程启动时另外自行检查恢复状态。安装 guard 前先检查两个单元都没有其他 drop-in，任一单元有就整体拒绝（`RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE`）；删除多余的 drop-in 后先执行 `sudo systemctl daemon-reload` 再重试，否则 systemd 仍报告已加载的旧 drop-in。恢复入口每次都会重新加载 systemd 再核对，所以拒绝时这份 drop-in 已被加载；服务原本在运行且数据源未退休时会照常重新启动，此时该 drop-in 已经生效。网页更新只把 `/etc/systemd/system` 下与恢复入口写出内容逐字一致的 guard 视为受管配置，其他 drop-in（包括 `/run`、`system.control`、`system.attached`、transient、generator、`/usr/local/lib/systemd/system`、前缀目录与 `service.d` 中的）仍判为未受管；`/usr/lib` 下由软件包提供的 drop-in 不扫描 |
 
 密钥目录只允许 root 访问。备份包不包含这两把备份密钥；取回备份时必须能分别取回对应密钥。应用自身的 `credentials.key` 和 Asset `config.json` 属于备份内容，不能代替备份密钥。不要用重新生成密钥替代丢失的旧密钥。
 

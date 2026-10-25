@@ -167,7 +167,7 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
     # guard written by a run whose reload failed must still be loaded. The reload
     # also reads drop-ins of shared directories such as service.d, so the loaded
     # result must be exactly each unit's own guard.
-    systemctl('daemon-reload')
+    systemctl('daemon-reload', timeout=120)
     if any(loaded_dropins(unit) != [str(directory / '20-recovery-guard.conf')] for unit, directory in dropins.items()):
         raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
     launcher_body = ('# Managed by project-aggregation recovery\n#!/bin/sh\n'
