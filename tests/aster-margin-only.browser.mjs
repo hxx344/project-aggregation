@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=aster-margin-only run-code --filename tests/aster-margin-only.browser.mjs
 // Real Hub login, launch, proxy and built ASTER UI; every trading API is isolated.
 async (page) => {

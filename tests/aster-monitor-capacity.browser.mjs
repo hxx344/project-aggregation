@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=aster-capacity run-code --filename tests/aster-monitor-capacity.browser.mjs
 // Focused capacity-table checks through the real Hub login, proxy and ASTER iframe.
 async (page) => {

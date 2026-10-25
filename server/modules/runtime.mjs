@@ -42,7 +42,7 @@ export async function startModules({ dataDir, socketDir = null, root = repositor
   const longest = moduleCatalog.reduce((name, { id }) => id.length > name.length ? id : name, '');
   if (process.platform !== 'win32' && Buffer.byteLength(path.join(directory, `${longest}-9999999999.sock`)) > MAX_SOCKET_PATH_BYTES) {
     rmSync(directory, { recursive: true, force: true });
-    throw new Error(`模块 socket 路径可能超过 ${MAX_SOCKET_PATH_BYTES} 字节：${directory}，请设置较短的 WORKBENCH_RUNTIME_DIR`);
+    throw new Error(`模块 socket 路径可能超过 ${MAX_SOCKET_PATH_BYTES} 字节：${directory}，请缩短 DATA_DIR（服务单元只能使用 DATA_DIR/run；手动运行时也可设置较短的 WORKBENCH_RUNTIME_DIR）`);
   }
   const children = [], unregister = [], ready = {}, tasks = new Set();
   const slots = Object.fromEntries(moduleCatalog.map(({ id }) => [id, { id, state: 'stopped', generation: 0, child: null, timer: null, due: false,

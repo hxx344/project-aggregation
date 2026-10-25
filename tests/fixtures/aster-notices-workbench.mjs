@@ -1,5 +1,5 @@
-// Windows-native fixture for the real server/index.mjs and embedded ASTER UI.
-// Run: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Windows-native fixture for the real single-process server/workbench.mjs and embedded ASTER UI.
+// Run: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Only module workers are replaced. Hub login, launch, proxy and bridge stay real.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';

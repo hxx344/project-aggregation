@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=aster-notices run-code --filename tests/aster-stale-notices.browser.mjs
 // Uses the actual Hub login/launch/proxy/iframe and modules/aster/dashboard/dist/client.
 // All state reads are synthetic. Real elapsed time is used; no browser clock is mocked.

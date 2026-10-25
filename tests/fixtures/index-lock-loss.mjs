@@ -10,8 +10,8 @@ const serving = process.argv[2] === 'serve';
 const events = [];
 let onLost, lost = false, onModuleReady;
 const context = vm.createContext({ process: { env: { DATA_DIR: path.join(os.tmpdir(), 'simulated-recovery-entry') }, once() {}, exit(code) { events.push(`exit:${code}`); throw new Error('EXPECTED_EXIT'); } } });
-const code = fs.readFileSync(new URL('../../server/index.mjs', import.meta.url), 'utf8');
-const index = new vm.SourceTextModule(code, { context, initializeImportMeta(meta) { meta.url = new URL('../../server/index.mjs', import.meta.url).href; } });
+const code = fs.readFileSync(new URL('../../server/workbench.mjs', import.meta.url), 'utf8');
+const index = new vm.SourceTextModule(code, { context, initializeImportMeta(meta) { meta.url = new URL('../../server/workbench.mjs', import.meta.url).href; } });
 let closePromise;
 const control = { markStarted() { events.push('mark-started'); }, close() { return closePromise ??= (async () => { events.push('workers-close'); await new Promise(resolve => setTimeout(resolve, 40)); events.push('workers-closed'); })(); } };
 const imports = {

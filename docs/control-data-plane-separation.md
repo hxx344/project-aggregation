@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `647bfa49e8ea091733a0950357e760b90c3a8b79` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3、11、15 节中的 M3 生命周期批次 |
 | 适用范围 | `server/`、`modules/crossex/server/`、`deploy/`、`server/update-service/`、`server/recovery/` 与相关测试 |
-| 设计状态 | 评审稿；P0、P1-1 与 P1-2 已发布（实现差异见第 9 节），P1-3 分三步（P1-3a 进程内组合、P1-3b 数据面 UDS 链路、P1-3c 进程入口与启动器）均已发布，P1-4 分四步实施（P1-4a 执行入口串行化、P1-4b 第二把锁、P1-4c SSE 计数上报与模块世代已发布，P1-4d 分两步：P1-4d-1 切换前置项在分支实施，P1-4d-2 生产入口切换尚未实施），P2、P2b 尚未实施；新增参数为初始设计值 |
+| 设计状态 | 评审稿；P0、P1-1 与 P1-2 已发布（实现差异见第 9 节），P1-3 分三步（P1-3a 进程内组合、P1-3b 数据面 UDS 链路、P1-3c 进程入口与启动器）均已发布，P1-4 分四步实施（P1-4a 执行入口串行化、P1-4b 第二把锁、P1-4c SSE 计数上报与模块世代已发布，P1-4d 分两步：P1-4d-1 切换前置项已发布，P1-4d-2 生产入口切换在分支实施），P2、P2b 尚未实施；新增参数为初始设计值 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 10 节，除一个 R2 批次外均为 R3 |
 | 读者 | 工作台与内置模块开发者、审查者、部署维护者 |
 
@@ -17,7 +17,7 @@
 
 ## 本轮同步（v1.1）
 
-本轮对照原基线 `aca4637` 至 `647bfa4` 的提交，只更新与分离方案有关的现状、引用与兼容约束。当前仍由 `server/index.mjs` 在同一进程中组合模块监督和 `createApp`；以下修复不代表已完成控制面与数据面分离。
+本轮对照原基线 `aca4637` 至 `647bfa4` 的提交，只更新与分离方案有关的现状、引用与兼容约束。截至 v1.1，仍由 `server/index.mjs` 在同一进程中组合模块监督和 `createApp`；以下修复不代表已完成控制面与数据面分离。
 
 | 主题 | 最新代码变化 | 对本文的影响 |
 | --- | --- | --- |
@@ -272,7 +272,7 @@ P0 不改数据库、配置和服务单元。程序回滚到上一健康版本�
 | --- | --- |
 | `server/runtime/main.mjs`（新增） | 取得 `.runtime.lock`，检查恢复状态，创建 Hub 账户写入器，启动模块监督，打开 Hub 库并建立数据面的表，创建采集、交易、原生执行、资产同步与基线，监听内部 socket，写入发现文件；由单元内启动器拉起时向其报告就绪 |
 | `server/api/main.mjs`（新增） | 取得 `.api.lock`，检查恢复状态，打开 Hub 库并建立控制面的表，生成初始密码，连接运行时，创建更新协调器与 Portal，监听 `HOST:PORT` |
-| `server/index.mjs` | 改为单元内启动器：先启动运行时并等待就绪，再启动 API；API 意外退出时按 1 至 30 s 退避重启 API；运行时意外退出时停止 API 并以非零码退出，由 systemd 整体重启；收到 SIGTERM 时先停 API 再停运行时，并汇总退出码 |
+| `server/index.mjs` | 改为单元内启动器：先启动运行时并等待就绪，再启动 API；API 意外退出时按 1 至 30 s 退避重启 API；运行时意外退出时停止 API 并以非零码退出，由 systemd 整体重启；收到 SIGTERM 时先停 API 再停运行时，并汇总退出码（systemd 默认 `KillMode=control-group` 同时向三个进程发信号，此时两个进程并发关闭，不保证这一顺序） |
 | `server/app.mjs` 的 `createApp` | 保留为进程内组合，供现有测试、`server/setup.mjs` 与 `scripts/verify-embedded.mjs` 使用；其中的运行时客户端为进程内实现，与跨进程实现遵守同一契约；保留现有 `accountLockoutMs` 等参数及其校验 |
 
 启动器不打开数据库、不持锁、不处理业务请求。单元仍为 `Type=simple`，systemd 停止时信号同时到达同一 cgroup 内的全部进程，这与现在 Hub 和模块 worker 同时收到 SIGTERM 的情况相同；启动器的停止顺序只在单独向它发信号时生效。
@@ -417,7 +417,7 @@ Portal 在 API 进程内代理，入口计数继续留在 API 内存，语义与
 | `server/observability.mjs` | SSE 计数改为外部上报，过期时跳过样本 |
 | `server/recovery/lifecycle-lock.mjs`、`server/recovery/lifecycle_lock.py`、`server/recovery/cli.mjs` | 第二把锁，恢复工具取双锁 |
 | `server/setup.mjs` | 只组合控制面 |
-| `deploy/install.sh` | 导入校验（`:2473`）同时覆盖两个新入口；单元不变 |
+| `deploy/install.sh` | 导入校验同时覆盖启动器与两个新入口；单元不变 |
 
 ### 5.10 验证与退出条件
 
@@ -490,7 +490,7 @@ ReadWritePaths=$DATA_PATH
 - `ProtectSystem=strict` 使 API 单元看到的 `/run` 为只读。在只读挂载上连接 UNIX socket 通常可行，但必须在 Ubuntu CI 的真实 systemd 中验证，未验证前不能交付。
 - 运行时单元停止时 systemd 删除 `RuntimeDirectory`，API 随即看到运行时不可用，符合预期。
 - 两个单元都保持默认 `KillMode=control-group`，与现状一致。
-- P2 之后 `server/index.mjs` 启动器只用于开发和 Windows。
+- P2 之后 `server/index.mjs` 启动器只用于 `pnpm start` 等手动运行；Windows 与 `pnpm dev:server` 运行单进程的 `server/workbench.mjs`（见第 9 节「P1-4d-2 的服务入口」）。
 
 ### 6.2 安装器
 
@@ -625,7 +625,7 @@ v1.1 文档同步的本地检查仅做提交差异、当前源码和引用核对
 | CrossEx 与 Asset 没有实例锁 | 本次核对未找到 | P0 的进程树确认是唯一防线，必须先于自动重启交付 |
 | 在只读挂载上连接 UDS | 未验证 | P2 前在 Ubuntu CI 验证 |
 | 两个进程的 SQLite 写等待 | P1-4d-1 起各进程（`server/sqlite-writes.mjs`）累计统计 Hub 库每个取得写锁的 `BEGIN IMMEDIATE` 的等待分档（<1、<10、<100、<1000、<5000、≥5000 ms）、等满 `busy_timeout` 仍未取得的次数（`busy`，不计入等待分档与最长等待），以及因 SQLITE_BUSY 回 503 的请求数（`busyReplies`，含单条自动提交语句）；最长等待与最长持锁时间只统计上一行日志以来的区间。`trading.mjs`、`observability.mjs`、`trading-execution.mjs` 的写事务改经 `server/control/schema.mjs` 的 `immediate()`。不计时的写入：单条自动提交语句（会话、快照等），以及 `trading-pnl.mjs` 启动时迁移所用的事务外 SAVEPOINT（延迟事务，不在请求路径上；迁移完成后只读）。各入口每 15 分钟在有变化时记一行 `sqlite_write_waits` 日志（`role` 为 `runtime`、`api`，单进程入口为 `workbench`），关闭时若有变化再记一次；写日志失败时保留该区间留待下次；每个进程只启一个记录器（代码不检测，同一进程的第二个记录器会清零共享峰值）。数据待生产运行后从日志汇总 | P1 交付后据日志评估 |
-| 多一个 Node 进程的内存占用 | 尚无数据 | P1 交付前实测常驻内存 |
+| 多一个 Node 进程的内存占用 | P1-4d-2 实测（Linux，Node 24，`NODE_ENV=production`，常驻内存 RSS）：启动器约 59 MiB，API 约 75 MiB，运行时（不含模块 worker）约 77 MiB；空载 Node 约 41 MiB，日志库 pino 约 17 MiB。相比单进程多出约 130 MiB；模块 worker 与 Python 子进程本来就是独立进程，不受影响 | 接受。P2 的两个单元由 systemd 直接启动运行时与 API 入口（第 6 节），届时不再需要启动器 |
 | `settings` 各键的写入方 | P1-1 审计：Hub 库中 `settings`、`projects`、`sessions` 的 SQL 只在 `server/control/` 中；`settings` 的键为 `password`、`seeded` 与各 `seeded-*`/`updated-*` 迁移标记、`module-preferences:<id>`、`updates-maintenance`、`updates-pending-plan`、`updates-pending-deploy-mode`，均由控制面写入；`server/recovery/restore.mjs` 只读 Monitor 自身库的 `monitorPassword` | 与 3.3 节一致，全部归 API；运行时只读维护标记与模块偏好 |
 | 密码重置入口 | `server/setup.mjs` 原先用完整的 `createApp`（默认非内嵌）重置密码，会在内嵌安装上补种外部预设并创建原生执行 | P1-1 改为只打开 Hub 库的控制面存储，不建种子、不读 `credentials.key`；数据目录尚未初始化时拒绝执行，提示先启动工作台 |
 | P1-2 的接线范围 | 5.2 节的 SupervisorClient 有进程内与 UDS 两种实现；P1-3 才有运行时与 API 两个入口 | `createApp` 的模块状态、人工恢复、维护同步与停机准入改由进程内客户端调用（`server/runtime/`）；UDS 服务端与客户端在 P1-3 接入入口前只由契约测试使用。概览、转发、偏好通知与 SSE 计数接口随 P1-3、P1-4 加入 |
@@ -645,7 +645,8 @@ v1.1 文档同步的本地检查仅做提交差异、当前源码和引用核对
 | P1-3c 的职责划分 | 5.1 节只列两个进程的组件 | 控制表由 API 写入，所以初始密码与项目预置由 API 入口完成，运行时只读这些表。凭据密钥只在运行时加载（`server/runtime/credentials.mjs`），API 入口只支持内嵌模块，项目凭据的加解密路径在该模式下不可达。维护同步：首次启动的模块由 API 初始化时同步；运行时重启某个交易模块后自行调用 `syncMaintenance` 下发持久标记，不等 API；重启的模块没确认时，运行时按 1、2、5、10、30 s（之后每 30 s）重试，直到确认、该模块的新实例就绪或运行时关闭；模块再次退出、处于退避或故障时旧实例的重试仍继续，请求立即失败，日志只记前 5 次与之后每第 20 次。已有同步在排队或执行时跳过本轮重试（`syncMaintenance` 的 `ifIdle`），按同一档间隔再等；运行时发起的同步对每个模块只等 4 s，排在它后面的 API 同步（每个模块 10 s）仍在 15 s 预算内；这段时间模块自身处于维护状态，写入被模块拒绝，但 API 的 `maintenanceConfirmed` 仍是重启前的确认结果，P1-4c 由运行时上报模块世代后纠正（见「P1-4c 的 SSE 计数与模块世代」）。API 发现运行时实例变化时对全部交易模块重新同步。API 初始化时有交易模块未确认（故障、退避或超时）不阻止 API 启动：该模块的执行入口以 503 拒绝，协调器每 5 s 重试同步，故障模块仍可从工作台恢复。新增 `/api/ready`：运行时报告就绪且协议兼容时返回 200，否则 503，只返回 `{ ready }` |
 | P1-3c 的启动器取值 | 3.1 节只规定 1 至 30 s 退避 | API 重启退避 1、2、4、8、16、30 s，实例就绪后稳定运行 60 s 才清零；API 60 s 内未就绪或停止时 30 s 内未退出即强制结束。运行时的启动与停止不设期限，交给 systemd 的超时。API 反复启动失败时启动器按上限 30 s 无限重试、每次记录错误日志，不自行退出：退出会连带停止运行时与交易模块。启动顺序固定为运行时先就绪：运行时创建数据目录与凭据密钥，API 入口在密钥缺失时拒绝启动，避免先建出 `hub.sqlite` 后运行时因缺少密钥无法启动 |
 | P1-3c 遗留到 P1-4 的项 | 第 5 节 | 运行时入口拿不到 API 的 SSE 连接数，基线不写样本，并以 `lastError.code = 'sse_unavailable'` 说明原因，P1-4c 的 SSE 计数上报后恢复；模块 worker 的 socket 仍在系统临时目录下由 `startModules` 创建，P1-4c 迁入运行目录；双进程测试（`tests/process-split.test.mjs`）覆盖启动、转发、Portal、API 崩溃重启与会话保留、运行时退出、有序停止与发现文件清理、运行时换实例后的恢复与重新同步、交易模块未确认时 API 仍能启动、重启模块的同步重试，模块 worker 用替身；`tests/launcher.test.mjs` 覆盖就绪超时、退避中停止、运行时无法启动、强制结束后的退出码，以及进程入口在启动中收到信号或 `fail()`、就绪后 `fail()`、关闭失败时的退出码；快照更新时间与原生执行租约持有者不变的断言随 P1-4 切换生产入口时补上 |
-| P1-4 的拆分 | 10 节把串行化、第二把锁、恢复工具与 SSE 上报列为一个批次 | P1-4a：原生执行入口串行化（见「原生执行写入口的准入顺序」）。P1-4b：`.api.lock` 共享锁、`lifecycle_lock.py` 的锁名与模式参数、恢复 CLI 取双锁。P1-4c：`/internal/v1/api-stats` 的 SSE 计数上报与过期跳过、模块 socket 迁入运行目录、运行时上报模块世代以纠正 API 的维护确认。P1-4d 再分两步：P1-4d-1 为切换前置项（恢复清单排除运行目录、SQLITE_BUSY 改为 503 与写等待统计、两条双进程用例）；P1-4d-2 为 `server/index.mjs` 改为调用启动器、`setup.mjs` 与安装器导入校验、5.10 节的退出条件测试。每步单独发布；P1-4d 之前生产入口仍是单进程 `createApp` |
+| P1-4 的拆分 | 10 节把串行化、第二把锁、恢复工具与 SSE 上报列为一个批次 | P1-4a：原生执行入口串行化（见「原生执行写入口的准入顺序」）。P1-4b：`.api.lock` 共享锁、`lifecycle_lock.py` 的锁名与模式参数、恢复 CLI 取双锁。P1-4c：`/internal/v1/api-stats` 的 SSE 计数上报与过期跳过、模块 socket 迁入运行目录、运行时上报模块世代以纠正 API 的维护确认。P1-4d 再分两步：P1-4d-1 为切换前置项（恢复清单排除运行目录、SQLITE_BUSY 改为 503 与写等待统计、两条双进程用例）；P1-4d-2 为 `server/index.mjs` 改为调用启动器、`setup.mjs` 与安装器导入校验、5.10 节的退出条件测试。每步单独发布；P1-4d 之前生产入口仍是单进程 `createApp`。`setup.mjs` 在 P1-1 已只组合控制面，P1-4d-2 无需改动 |
+| P1-4d-2 的服务入口 | 5.1、5.10 节 | `server/index.mjs` 在 POSIX 上调用 `runLauncher()`（`server/launcher.mjs`）；原单进程入口改名为 `server/workbench.mjs`，供 Windows（双进程只在 POSIX 测试）、浏览器测试夹具（`--import` 会被子进程继承）和 `pnpm dev:server`（`--watch` 只跟踪启动器自身的文件）使用。systemd 停止单元时向 cgroup 内所有进程发 SIGTERM，启动器随后再向子进程发一次：入口与启动器都改为重复信号不回落到默认动作，等待 `close()` 完成；停止期间子进程因启动器的 SIGTERM 结束（例如尚未注册处理器）记为正常停止，与 systemd 对主进程的判定一致，被 SIGKILL 仍记为失败。安装器与工作区测试的导入校验覆盖 `app.mjs`、`launcher.mjs`、`runtime/main.mjs`、`api/main.mjs`，只导入不启动。运行时 socket 首次放在 `DATA_DIR/run` 下，完整路径受 100 字节上限约束，安装器在激活前检查运行目录（`check_runtime_dir`）：`DATA_DIR` 按配置值（运行时绑定的就是未解析符号链接的路径）不超过 46 字节；服务单元只能写入 `DATA_DIR`，配置中的 `WORKBENCH_RUNTIME_DIR` 被拒绝，P2 的 `RuntimeDirectory` 再重新考虑运行目录位置。这样避免升级后运行时反复启动失败。`read_setting` 只识别紧凑的 `KEY=value` 行，键前或等号两侧带空白的写法 systemd 会接受而安装器读不到，这是既有限制；恢复工具切换数据目录时不做这一检查。启动器在启动子进程前校验 `PORT` 与 `PUBLIC_ORIGIN`，无效时以 1 退出：systemd 按 `RestartSec` 重启整个单元，运行时也不启动，而不是运行时照常运行、API 无限重启。Portal 的 ticket 与 grant 保存在 API 内存（`server/portal.mjs`），按第 1 节持久授权属于 M4：API 重启后已打开的模块页面得到 401「请从工作台重新打开」，从工作台重新载入即可，Hub 会话（存于 Hub 库）不受影响。包验收（`scripts/verify-embedded.mjs`）在 Linux 上以真实五个模块运行服务入口：杀掉 API 后运行时 pid 与模块状态行不变、会话保留、旧授权为 401、重新打开的页面可用，采集继续、原生执行租约由原持有者续期；向整个进程组发 SIGTERM（同 systemd）后单元以 0 退出并清理发现记录。systemd 还会向模块 worker 发信号，包验收未覆盖这一点 |
 | P1-4b 的生命周期锁 | 5.7 节 | `lifecycle_lock.py` 的锁名只允许 `runtime`（`.runtime.lock`）与 `api`（`.api.lock`），模式只允许 `exclusive` 与 `shared`，命令行以 `--name=`、`--mode=` 传入，每项至多一次；Windows 共享锁只去掉 `LOCKFILE_EXCLUSIVE_LOCK`，POSIX 用 `LOCK_SH`，都以非阻塞方式反复尝试直到超时。`runtime` 只能排他：共享的运行时锁会放两个运行时同时运行，两侧都拒绝该组合。助手忽略 SIGINT 与 SIGTERM（持锁期间仍会因父进程关闭 stdin 或退出、锁校验失败而释放，SIGKILL 等其他信号照常结束它），所以服务停止或 Ctrl+C 发给整组进程时，锁不会先于数据库关闭而释放，正常停止也不会被报成锁失效；代价是父进程在等锁期间退出时，助手要到等锁超时（默认 5 s）才退出。`server/recovery/lifecycle-lock.mjs` 新增 `acquireLifecycleLock`（按锁名与模式）与 `acquireRecoveryLocks`：先取 `.runtime.lock`、再取 `.api.lock`，都为排他，任一失败即释放已取得的锁并抛出原错误；返回前再确认两把锁仍有效（取第二把锁期间第一把可能失效），关闭时按取得的逆序逐个释放。任一把失效时恢复锁的 `onLost` 只通知一次。`assertLifecycleLock` 只接受两把锁组成的恢复锁，单独的运行时锁视为 `RUNTIME_LOCK_LOST`，所以备份、恢复与盘点（含 `cli.mjs` 的 `check-source` 与 `hold`、`scripts/verify-embedded.mjs`）都必须取双锁。API 入口在检查恢复状态之前以共享模式取得 `.api.lock`，失效时调用 `fail()`，启动的每一步（含打开 Hub 库之前）都确认锁仍有效，在关闭 Hub 库之后释放；多个 API 可同时持有，任一存活时恢复工具返回 `RUNTIME_LOCK_BUSY`，恢复工具持锁时 API 无法启动。恢复包的清单拒绝 `.api.lock` 条目，恢复目标只允许残留两个锁文件；备份按既有的 `*.lock` 规则不收录它。生产入口仍是单进程 `createApp`，只取 `.runtime.lock`，此时恢复工具在 `.api.lock` 上不会遇到竞争 |
 | P1-4c 的 SSE 计数与模块世代 | 5.2、5.8 节 | API 在启动时、每次连接数变化（打开、关闭、慢消费者断开）时、发现运行时换实例时与每 15 s 经 `POST /internal/v1/api-stats` 上报 `{ instanceId, sequence, activeConnections, slowConsumerDisconnects }`，同一时间只有一个上报在途，期间的变化合并为下一次；失败不重试，由下一次带上当前计数。运行时校验字段（`instanceId` 为 UUID，`sequence` 为该实例逐次递增的正整数，连接数 0 至 10000，累计次数为非负安全整数，否则 400）。运行时按 API 实例分别记录（最多 16 个，最久未上报的先移除）：序号不大于该实例上一次的上报整条丢弃，迟到的上报既不覆盖连接数也不重复计数；慢消费者按该实例的累计值求差，新实例从零计；某实例对新运行时的首次上报（以及被移除后再次上报）计入它此前的全部累计值；基线启动前收到的差值保留到启动时计入。连接数取 60 s（`API_STATS_MAX_AGE_MS`）内上报过的各实例之和，全部超过 60 s 即视为未知，基线跳过该分钟并记 `sse_unavailable`。API 关闭时上报一次 0 连接，最多等 500 ms，送不到时该实例的连接数在 60 s 内过期；API 被强制结束时同样要到过期才移除，这期间新 API 接住重连后连接数会被重复计算，基线该分钟最多约为两倍。上报失败记录首次与之后每第 20 次。`createApp` 经进程内客户端同步上报，单进程下的连接数与原来在一个上报周期（15 s）内一致：会话清理与慢消费者断开在同一轮结束后上报，连接的 `close` 事件也会上报；新鲜度按 `baselineNow`（默认墙钟）判断，墙钟前跳超过 60 s 后的首次采样可能记为 `sse_unavailable`；`/internal/v1/slow-consumers` 与 `observeSlowConsumer` 契约随之删除，协议版本不变（两个进程来自同一发布）。模块世代：`syncMaintenance` 的每一行附带同步开始时该模块的世代（旧运行时不带时为 `null`），协调器记录确认维护值的世代；`/api/system/modules` 读到某交易模块的世代与之不同，即视为重启后的新实例，标为未确认并单独重新同步；执行入口的准入本来每次都经 `status()` 重新同步，不依赖这一纠正。该纠正在单进程 `createApp` 中同样生效：读取模块状态可能对重启后的模块发起一次维护同步，模块恢复页因此更早看到未确认。运行时换实例后新模块的世代可能与旧值相同，此时依靠 `moduleStatus` 先调用 `status()`、触发换实例回调对全部交易模块重新同步。模块 socket：运行时把运行目录传给 `startModules`，worker socket 建在 `<运行目录>/modules-XXXXXX/` 下（0700），启动时删除残留的 `modules-*` 目录（`.runtime.lock` 证明创建它们的运行时已退出，可能仍存活的孤儿 worker 失去 socket 无害）；运行时自身的 socket 路径在启动模块前检查，最长的模块 socket 路径按 10 位世代估算超过 100 字节时同样启动失败，都提示设置较短的 `WORKBENCH_RUNTIME_DIR`。`createApp` 仍用系统临时目录。运行时被 SIGKILL 后 `<数据目录>/run/` 下残留的 socket 曾让恢复清单（`server/recovery/inventory.mjs` 先做 `safePath` 再判断排除项）以 `RECOVERY_UNSAFE_FILE` 拒绝备份；P1-4d-1 起清单排除顶层 `run`（发现记录与 socket，每次启动重建），`run` 本身是链接时仍拒绝。`WORKBENCH_RUNTIME_DIR` 指到数据目录内其他位置时不在此列 |
 | `PartOf=` 对自动重启的传递 | 依据 systemd 的 restart 作业语义推断 | P2 在 CI 实测，并据此更新第 7 节 |

@@ -200,7 +200,7 @@ modules_prepared=1
 if [[ -n ${INSTALL_TEST_MODULE_CACHE:-} && ${INSTALL_TEST_MODULE_CACHE_EXPORT:-0} == 1 ]]; then
   workspace_export_module_caches "$INSTALL_TEST_MODULE_CACHE"
 fi
-(cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'await import("./server/app.mjs")')
+(cd "$work_dir/source"; run_as_service "$NODE_BIN" -e 'for (const file of ["app", "launcher", "runtime/main", "api/main"]) await import(`./server/${file}.mjs`)')
 if [[ $lane != package ]]; then workspace_start_job root-behavior-tests workspace_root_tests; fi
 if [[ $lane == behavior ]]; then
   workspace_wait_jobs

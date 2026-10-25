@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=aster-adl run-code --filename tests/aster-adl.browser.mjs
 // Incremental compatibility only: first goto http://hub.localhost:39152/?adl-compat=1
 // Real Hub login, launch, proxy, iframe and built ASTER UI; isolated API evidence.

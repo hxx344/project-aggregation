@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=aster-relay run-code --filename tests/aster-relay-status.browser.mjs
 // Uses the real Hub login/launch/proxy and the built embedded ASTER dashboard.
 // Synthetic read-only state; real elapsed time keeps serverNow and fixture timestamps aligned.

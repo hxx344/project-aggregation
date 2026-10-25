@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "dev:server": "node --watch server/index.mjs",
+    "dev:server": "node --watch server/workbench.mjs",
     "check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
     "build:bundle": "vite build",

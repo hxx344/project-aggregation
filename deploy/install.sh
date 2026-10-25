@@ -1235,6 +1235,16 @@ read_setting() {
   value=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
   printf '%s' "${value:-$fallback}"
 }
+# The service keeps its runtime directory at <DATA_DIR>/run: the unit may only
+# write DATA_DIR, so WORKBENCH_RUNTIME_DIR is refused. The runtime socket
+# <DATA_DIR>/run/runtime-<uuid>.sock must fit the 100-byte Unix socket path
+# limit (server/runtime/protocol.mjs), and the runtime binds the configured
+# path (links not resolved), so $1 is the validated, normalized DATA_DIR.
+check_runtime_dir() {
+  if [[ -n "$2" ]]; then fail 'WORKBENCH_RUNTIME_DIR 不适用于服务单元（单元只能写入 DATA_DIR），请从配置中删除。'; return 1; fi
+  if ((${#1} > 46)); then fail "DATA_DIR 路径过长（${#1} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节。请先停止 $SERVICE 服务，把数据目录整体移到较短路径，再修改 DATA_DIR 并重新安装。"; return 1; fi
+}
+
 health_url() {
   local host=$1 port=$2
   case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$host]" ;; esac
@@ -2552,8 +2562,11 @@ main() {
   [[ "$HOST_VALUE" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail 'HOST 格式不正确，请使用无引号的主机名或 IP。'
   [[ "$PORT_VALUE" =~ ^[0-9]{1,5}$ ]] && ((10#$PORT_VALUE > 0 && 10#$PORT_VALUE < 65536)) || fail 'PORT 必须在 1 到 65535 之间。'
   [[ "$DATA_PATH" =~ ^/[A-Za-z0-9_./-]+$ && "$DATA_PATH" != / && "$DATA_PATH" != *'/../'* && "$DATA_PATH" != */.. ]] || fail 'DATA_DIR 必须是无空格的专用绝对目录。'
+  # The runtime resolves the configured path without following links.
+  configured_data=$(realpath -m -s "$DATA_PATH")
   DATA_PATH=$(realpath -m "$DATA_PATH")
   case "$DATA_PATH" in /var/lib/project-aggregation|/var/lib/project-aggregation/*|/srv/project-aggregation/*|/opt/project-aggregation-data|/opt/project-aggregation-data/*) ;; *) fail 'DATA_DIR 请使用 /var/lib/project-aggregation、/srv/project-aggregation/ 子目录或 /opt/project-aggregation-data，避免修改系统目录权限。' ;; esac
+  check_runtime_dir "$configured_data" "$(read_setting WORKBENCH_RUNTIME_DIR '')"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/build-home"
   HEALTH_URL=$(health_url "$HOST_VALUE" "$PORT_VALUE")
@@ -2592,7 +2605,9 @@ main() {
     prepare_ci_application
     ci_update_progress verify
     validate_embedded_runtime "$release"
-    run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
+    # The entries are imported, not run: argv[1] is a placeholder, so their main-module checks stay false.
+    run_as_service "$NODE_BIN" --input-type=module -e 'for (const file of process.argv.slice(2)) await import(file)' import-check \
+      "$release/server/app.mjs" "$release/server/launcher.mjs" "$release/server/runtime/main.mjs" "$release/server/api/main.mjs"
   else
   log "准备正式版本 ${commit:0:12} 的源码；不下载预构建运行包。"
   fetch_source

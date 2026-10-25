@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-test('actual index drains a partially started group before releasing its lock after startup lock loss', () => {
+test('the single-process workbench drains a partially started group before releasing its lock after startup lock loss', () => {
   const result = spawnSync(process.execPath, ['--experimental-vm-modules', fileURLToPath(new URL('./fixtures/index-lock-loss.mjs', import.meta.url))], { windowsHide: true, encoding: 'utf8', timeout: 5000 });
   assert.equal(result.status, 0, result.stderr);
   const events = JSON.parse(result.stdout);
@@ -17,7 +17,7 @@ test('actual index drains a partially started group before releasing its lock af
   assert.equal(events.includes('error:工作台启动失败'), false);
 });
 
-test('actual index ends the first-start contract only after listening and resynchronizes just the restarted module', () => {
+test('the single-process workbench ends the first-start contract only after listening and resynchronizes just the restarted module', () => {
   const result = spawnSync(process.execPath, ['--experimental-vm-modules', fileURLToPath(new URL('./fixtures/index-lock-loss.mjs', import.meta.url)), 'serve'], { windowsHide: true, encoding: 'utf8', timeout: 5000 });
   assert.equal(result.status, 0, result.stderr);
   const events = JSON.parse(result.stdout);

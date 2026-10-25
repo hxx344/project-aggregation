@@ -148,7 +148,8 @@ root = Path(sys.argv[1])
 commit = subprocess.check_output(['git', '-C', str(root / 'source'), 'rev-parse', 'HEAD'], text=True).strip()
 key = hashlib.sha256(sys.argv[3].encode()).hexdigest()
 contents = {'.release-commit': commit, '.release-application-key': key,
-            'server/app.mjs': 'export {};', 'server/index.mjs': 'export {};',
+            'server/app.mjs': 'export {};', 'server/index.mjs': 'export {};', 'server/launcher.mjs': 'export {};',
+            'server/runtime/main.mjs': 'export {};', 'server/api/main.mjs': 'export {};',
             'package.json': '{"type":"module"}', 'dist/index.html': '<html>' + sys.argv[3] + '</html>',
             'node_modules/ws/package.json': '{}', 'node_modules/decimal.js/package.json': '{}'}
 with tarfile.open(root / 'package.tar.gz', 'w:gz') as archive:

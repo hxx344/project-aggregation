@@ -1,16 +1,25 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import http from 'node:http';
 import { randomUUID, randomBytes } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 
 const root = path.resolve(process.argv[2] || '.');
 const dataDir = await mkdtemp(path.join(tmpdir(), 'ci-package-data-'));
 const password = 'package-test-only-123456';
-let app, modules, failure, accountWriter, runtimeLock, recoveryDirectory;
+let app, modules, failure, accountWriter, runtimeLock, recoveryDirectory, entry, interrupted;
+// Stops the service entry's whole process group, so no runtime or API is left behind.
+async function stopEntry() {
+  const group = signal => { try { process.kill(-entry.pid, signal); } catch { /* Already gone. */ } };
+  group('SIGTERM');
+  const timer = setTimeout(() => group('SIGKILL'), 60_000);
+  await entry.exited; clearTimeout(timer);
+}
 try {
   const { startModules } = await import(pathToFileURL(path.join(root, 'server/modules/runtime.mjs')));
   const { createApp } = await import(pathToFileURL(path.join(root, 'server/app.mjs')));
@@ -146,7 +155,98 @@ try {
   assert.equal(failure, undefined, failure?.message);
   console.log(JSON.stringify({ recoveryDrill: 'real-five-module-read-only', checkpointAgeAtFaultMs: faultAt - backupStartedAt,
     restoreToReadableMs: Date.now() - restoreStartedAt, scope: 'local-CI-artifact-and-keys', trading: 'quarantine' }));
+
+  // The service entry as the unit runs it (server/index.mjs) over the data of
+  // the first phase: the launcher starts the runtime with the five modules and
+  // then the API. A killed API restarts alone while the runtime and its modules
+  // keep running, collection goes on and the native execution lease keeps its
+  // holder, sessions survive it, and SIGTERM to the whole process group (as
+  // systemd signals the unit) stops it with status 0 (design doc 5.10).
+  // Windows runs the single-process workbench instead.
+  if (process.platform === 'linux') {
+    await app.close(); await modules.close(); await runtimeLock.close();
+    app = modules = runtimeLock = accountWriter = undefined;
+    const { WORKBENCH_RUNTIME_DIR: _ignored, ...inherited } = process.env;
+    entry = spawn(process.execPath, [path.join(root, 'server/index.mjs')], { cwd: root, detached: true, stdio: ['ignore', 'inherit', 'inherit'],
+      env: { ...inherited, NODE_ENV: 'production', DATA_DIR: dataDir, PORT: String(port), HOST: '127.0.0.1' } });
+    entry.exited = new Promise(resolve => entry.once('exit', (code, signal) => resolve({ code, signal })));
+    // The entry has its own process group, so a signal to this script does not
+    // reach it: stop the group and remove the data before exiting.
+    interrupted = () => {
+      if (interrupted.running) return;
+      interrupted.running = true;
+      void stopEntry().then(() => rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+        .then(() => recoveryDirectory && rm(recoveryDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+        .finally(() => process.exit(130));
+    };
+    for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, interrupted);
+    const until = async (predicate, ms) => { const end = Date.now() + ms; while (Date.now() < end) { if (await predicate().catch(() => false)) return true; await new Promise(resolve => setTimeout(resolve, 250)); } return false; };
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const children = () => readFileSync(`/proc/${entry.pid}/task/${entry.pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number);
+    const runtimePid = () => JSON.parse(readFileSync(path.join(dataDir, 'run', 'runtime.json'), 'utf8')).pid;
+    const lease = () => { const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'), { readOnly: true }); try { return db.prepare('SELECT owner, expires FROM execution_lease WHERE id=1').get(); } finally { db.close(); } };
+    const checkedAt = async () => Math.max(...(await request('/api/overview')).data.projects.map(item => Date.parse(item.checkedAt || '') || 0));
+    const moduleRows = async () => (await request('/api/system/modules')).data.modules.map(({ moduleId, state, generation, readyAt }) => ({ moduleId, state, generation, readyAt }));
+    assert.ok(await until(async () => (await request('/api/health')).status === 200, 180_000), 'the service entry became healthy');
+    const signedIn = await request('/api/login', { method: 'POST', body: { password } });
+    assert.equal(signedIn.status, 200, signedIn.text); cookie = signedIn.headers['set-cookie'][0].split(';')[0]; csrf = signedIn.data.csrfToken;
+    assert.deepEqual((await request('/api/projects')).data.projects.map(item => item.id), ['monitor', 'asset', 'crossex', 'greeks', 'aster']);
+    const runtime = runtimePid(), [api, ...others] = children().filter(pid => pid !== runtime);
+    assert.deepEqual([children().includes(runtime), others], [true, []], 'the launcher runs exactly the runtime and the API');
+    const rows = await moduleRows();
+    assert.deepEqual(rows.map(row => row.state), ['ready', 'ready', 'ready', 'ready', 'ready'], JSON.stringify(rows));
+    const open = async (project, when) => {
+      const launch = await request(`/api/projects/${project}/launch`, { method: 'POST' });
+      assert.equal(launch.status, 200, launch.text);
+      const url = new URL(launch.data.url);
+      const auth = await request(url.pathname + url.search, { moduleHost: url.host, authorize: false, headers: { Origin: `http://${host}` } });
+      assert.equal(auth.status, 302, auth.text);
+      const settings = { moduleHost: url.host, authorize: false, headers: { Cookie: auth.headers['set-cookie'][0].split(';')[0] } };
+      const target = new URL(auth.headers.location, url), destination = target.pathname + target.search;
+      const page = await request(destination, settings);
+      assert.equal(page.status, 200, `${project} ${when}: ${page.text.slice(0, 300)}`); assert.match(page.text, /<html/i);
+      return { project, destination, settings };
+    };
+    const portal = [];
+    for (const project of ['monitor', 'asset', 'crossex', 'greeks', 'aster']) portal.push(await open(project, 'through the API process'));
+    assert.equal((await request('/api/trading')).status, 200, 'forwarded to the runtime process');
+
+    const { owner: holder, expires } = lease() ?? {};
+    assert.ok(holder, 'the runtime holds the native execution lease');
+    const killedAt = Date.now();
+    process.kill(api, 'SIGKILL');
+    assert.ok(await until(async () => children().some(pid => pid !== runtime && pid !== api) && (await request('/api/health')).status === 200, 60_000), 'the launcher restarted the API');
+    assert.equal(alive(api), false);
+    assert.equal(runtimePid(), runtime); assert.ok(alive(runtime), 'the runtime kept running');
+    assert.deepEqual(await moduleRows(), rows, 'no module restarted with the API');
+    // Each project is read at least every 30 s (data-plane refresh).
+    assert.ok(await until(async () => await checkedAt() > killedAt, 60_000), 'collection went on across the API restart');
+    assert.ok(await until(async () => lease()?.owner === holder && lease().expires > expires, 30_000), 'the lease holder renewed the native execution lease');
+    assert.equal((await request('/api/projects')).status, 200, 'the session survived the API restart');
+    // Portal grants live in the API process (design doc 1, persistent grants
+    // are M4): a page asks to be reopened, and reopening reaches the same module.
+    const reopened = [];
+    for (const { project, destination, settings } of portal) {
+      assert.equal((await request(destination, settings)).status, 401, `${project}: a grant of the previous API`);
+      reopened.push(await open(project, 'reopened after the API restart'));
+    }
+    assert.deepEqual(await moduleRows(), rows, 'reopening the pages restarted no module');
+    assert.equal((await request('/api/logout', { method: 'POST' })).status, 200);
+    for (const { project, settings } of reopened) assert.equal((await request('/', settings)).status, 401, `${project} after logout`);
+
+    const pids = children();
+    process.kill(-entry.pid, 'SIGTERM');
+    assert.deepEqual(await entry.exited, { code: 0, signal: null }, 'the unit stops with status 0');
+    entry = undefined;
+    for (const signal of ['SIGINT', 'SIGTERM']) process.off(signal, interrupted);
+    assert.deepEqual(pids.filter(alive), [], 'the runtime and the API stopped with the launcher');
+    assert.equal(existsSync(path.join(dataDir, 'run', 'runtime.json')), false, 'the runtime removed its discovery record');
+    console.log('Service entry passed: launcher, runtime with five real modules, API restart without module restarts, pages reopened, collection and execution lease kept, group SIGTERM exit 0.');
+  }
 } finally {
+  // An interrupt cleans up and exits 130 on its own.
+  if (interrupted?.running) await new Promise(() => {});
+  if (entry) await stopEntry();
   await app?.close();
   await modules?.close();
   if (!app) accountWriter?.close();
