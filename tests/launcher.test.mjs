@@ -91,22 +91,25 @@ test('children ended by the SIGTERM of stop() count as stopped', { skip, timeout
 test('stop() replaces the ready deadline of a starting API with the stop deadline', { skip, timeout: 30_000 }, async t => {
   const s = await scripts(t);
   const runtimeEntry = s.write('runtime.mjs', readyChild);
-  // Never ready, and slower to stop than the ready deadline.
-  const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 600)); setInterval(() => {}, 1000);");
-  const launcher = launch({ runtimeEntry, apiEntry, logger: quiet, apiReadyMs: 300 });
+  // Never ready, and slower to stop than the ready deadline. The start record
+  // and the SIGTERM handler come in one synchronous step.
+  const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1500)); setInterval(() => {}, 1000);");
+  let killed = false;
+  const logger = { ...quiet, error: (fields, message) => { if (message === 'API 未在期限内就绪，正在结束') killed = true; } };
+  const launcher = launch({ runtimeEntry, apiEntry, logger, apiReadyMs: 1000 });
   t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   assert.ok(await until(() => s.count() === 2), 'the API started');
-  await new Promise(resolve => setTimeout(resolve, 100)); // Its SIGTERM handler is installed.
+  assert.equal(killed, false, 'the API was stopped before its ready deadline');
   assert.equal(await launcher.stop(0), 0);
 });
 
-test('settings the API refuses on every start end the service entry before any process starts', async t => {
+test('settings the API refuses on every start end the service entry before any process starts', { timeout: 10_000 }, async t => {
   const previous = process.exitCode;
   t.after(() => { process.exitCode = previous; });
   for (const env of [{ PORT: '70000' }, { PORT: '3100', PUBLIC_ORIGIN: 'https://hub.example/path' }]) {
     const errors = [];
     process.exitCode = undefined;
-    await runLauncher({ env, logger: { ...quiet, error: (fields, message) => errors.push(message) } });
+    await runLauncher({ env, logger: { ...quiet, error: (fields, message) => errors.push(message) }, start: () => assert.fail('no process may start') });
     assert.equal(process.exitCode, 1, JSON.stringify(env));
     assert.deepEqual(errors, ['工作台配置无效']);
   }

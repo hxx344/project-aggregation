@@ -199,6 +199,6 @@ for fail_record in python aster-python migration migration-ack historic-commit; 
   )
 done
 # The longest DATA_DIR whose runtime socket fits the Unix socket path limit (tests/runtime-protocol.test.mjs checks the same bound).
-data_path_fits_runtime "/srv/project-aggregation/$(printf 'x%.0s' {1..21})"
-if data_path_fits_runtime "/srv/project-aggregation/$(printf 'x%.0s' {1..22})"; then echo 'A 47-byte DATA_DIR was accepted' >&2; exit 1; fi
+runtime_dir_fits "/srv/project-aggregation/$(printf 'x%.0s' {1..21})/run"
+if runtime_dir_fits "/srv/project-aggregation/$(printf 'x%.0s' {1..22})/run"; then echo 'A 47-byte DATA_DIR was accepted' >&2; exit 1; fi
 printf 'Activation rollback restores the durable successful environment snapshot.\n'

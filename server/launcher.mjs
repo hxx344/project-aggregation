@@ -84,14 +84,14 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
 // ready and ends with the unit's exit code. A repeated signal is ignored, as in
 // the children. Settings the API would refuse on every start end the unit
 // instead of restarting the API forever.
-export async function runLauncher({ env = process.env, logger = defaultLogger } = {}) {
+export async function runLauncher({ env = process.env, logger = defaultLogger, start = launch } = {}) {
   const port = Number(env.PORT || 3100);
   try {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须为 1 至 65535');
     if (env.PUBLIC_ORIGIN) (await import('./adapters.mjs')).validateAuthOrigin(env.PUBLIC_ORIGIN);
   } catch (error) { logger.error({ err: error, type: 'startup' }, '工作台配置无效'); process.exitCode = 1; return; }
   let started = false;
-  const launcher = launch({ env, logger, onApiReady: ({ port }) => {
+  const launcher = start({ env, logger, onApiReady: ({ port }) => {
     if (started) return;
     started = true;
     const host = env.HOST || '127.0.0.1';

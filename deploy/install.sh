@@ -1235,10 +1235,11 @@ read_setting() {
   value=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
   printf '%s' "${value:-$fallback}"
 }
-# The runtime socket <DATA_DIR>/run/runtime-<uuid>.sock must fit the 100-byte
-# Unix socket path limit (server/runtime/protocol.mjs): 54 bytes follow DATA_DIR.
-data_path_fits_runtime() {
-  ((${#1} <= 46))
+# The runtime socket <runtime dir>/runtime-<uuid>.sock must fit the 100-byte
+# Unix socket path limit (server/runtime/protocol.mjs): 50 bytes follow the
+# runtime directory, which is <DATA_DIR>/run unless WORKBENCH_RUNTIME_DIR is set.
+runtime_dir_fits() {
+  ((${#1} <= 50))
 }
 
 health_url() {
@@ -2558,9 +2559,18 @@ main() {
   [[ "$HOST_VALUE" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail 'HOST 格式不正确，请使用无引号的主机名或 IP。'
   [[ "$PORT_VALUE" =~ ^[0-9]{1,5}$ ]] && ((10#$PORT_VALUE > 0 && 10#$PORT_VALUE < 65536)) || fail 'PORT 必须在 1 到 65535 之间。'
   [[ "$DATA_PATH" =~ ^/[A-Za-z0-9_./-]+$ && "$DATA_PATH" != / && "$DATA_PATH" != *'/../'* && "$DATA_PATH" != */.. ]] || fail 'DATA_DIR 必须是无空格的专用绝对目录。'
+  # The runtime resolves the configured path without following links.
+  configured_data=$(realpath -m -s "$DATA_PATH")
   DATA_PATH=$(realpath -m "$DATA_PATH")
   case "$DATA_PATH" in /var/lib/project-aggregation|/var/lib/project-aggregation/*|/srv/project-aggregation/*|/opt/project-aggregation-data|/opt/project-aggregation-data/*) ;; *) fail 'DATA_DIR 请使用 /var/lib/project-aggregation、/srv/project-aggregation/ 子目录或 /opt/project-aggregation-data，避免修改系统目录权限。' ;; esac
-  data_path_fits_runtime "$DATA_PATH" || fail "DATA_DIR 路径过长（${#DATA_PATH} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节，请改用较短的数据目录。"
+  runtime_setting=$(read_setting WORKBENCH_RUNTIME_DIR '')
+  if [[ -n "$runtime_setting" ]]; then
+    runtime_dir_fits "$(realpath -m -s "$runtime_setting")" || fail 'WORKBENCH_RUNTIME_DIR 路径过长（上限 50 字节）：运行时 socket 的完整路径不能超过 100 字节。'
+  else
+    for candidate in "$configured_data" "$DATA_PATH"; do
+      runtime_dir_fits "$candidate/run" || fail "DATA_DIR 路径过长（${#candidate} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节。请先停止 $SERVICE 服务，把数据目录整体移到较短路径，再修改 DATA_DIR 并重新安装。"
+    done
+  fi
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/build-home"
   HEALTH_URL=$(health_url "$HOST_VALUE" "$PORT_VALUE")

@@ -163,6 +163,9 @@ try {
     entry = spawn(process.execPath, [path.join(root, 'server/index.mjs')], { cwd: root, detached: true, stdio: ['ignore', 'inherit', 'inherit'],
       env: { ...inherited, NODE_ENV: 'production', DATA_DIR: dataDir, PORT: String(port), HOST: '127.0.0.1' } });
     entry.exited = new Promise(resolve => entry.once('exit', (code, signal) => resolve({ code, signal })));
+    // The entry has its own process group, so a signal to this script does not
+    // reach it: stop the group before exiting.
+    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { try { process.kill(-entry.pid, 'SIGTERM'); } catch { /* Already gone. */ } void entry.exited.then(() => process.exit(1)); });
     const until = async (predicate, ms) => { const end = Date.now() + ms; while (Date.now() < end) { if (await predicate().catch(() => false)) return true; await new Promise(resolve => setTimeout(resolve, 250)); } return false; };
     const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
     const children = () => readFileSync(`/proc/${entry.pid}/task/${entry.pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number);
@@ -194,7 +197,7 @@ try {
     for (const project of ['monitor', 'asset', 'crossex', 'greeks', 'aster']) portal.push(await open(project, 'through the API process'));
     assert.equal((await request('/api/trading')).status, 200, 'forwarded to the runtime process');
 
-    const holder = lease()?.owner;
+    const { owner: holder, expires } = lease() ?? {};
     assert.ok(holder, 'the runtime holds the native execution lease');
     const killedAt = Date.now();
     process.kill(api, 'SIGKILL');
@@ -204,7 +207,7 @@ try {
     assert.deepEqual(await moduleRows(), rows, 'no module restarted with the API');
     // Each project is read at least every 30 s (data-plane refresh).
     assert.ok(await until(async () => await checkedAt() > killedAt, 60_000), 'collection went on across the API restart');
-    assert.equal(lease()?.owner, holder, 'the native execution lease kept its holder');
+    assert.ok(await until(async () => lease()?.owner === holder && lease().expires > expires, 30_000), 'the lease holder renewed the native execution lease');
     assert.equal((await request('/api/projects')).status, 200, 'the session survived the API restart');
     // Portal grants live in the API process (design doc 1, persistent grants
     // are M4): a page asks to be reopened, and reopening reaches the same module.
