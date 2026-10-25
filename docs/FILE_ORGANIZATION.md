@@ -34,13 +34,14 @@ project_aggregation/
 | 文件 | 维护内容 |
 | --- | --- |
 | `AGENTS.md` | 项目规则和阅读入口（代理执行协议唯一权威） |
-| `LESSONS.md` | 项目经验、记录规则、适用边界和事件证据 |
+| `LESSONS.md` | 项目经验条目、记录规则、适用边界和事件证据（不含复盘流水） |
 | `docs/code-standards.md` | 满足升级条件的规范及其依据 |
 | `docs/code-review-standard.md` | 合并前的审查范围、分级、严重级别与门槛 |
 | `docs/code-review-checklist.md` | 逐项检查清单（唯一清单正文） |
 | `docs/code-review-process.md` | 审查步骤、时限、轮次、热修、钩子与 CI 门禁、度量 |
 | `daily-review-prompt.md` | 增量复盘、事件去重和检查点更新流程 |
 | `docs/review-state.json` | 已完成检查点和未完成复盘的报告位置 |
+| `docs/review-history.md` | 2026-10-12 至 10-20 的历史复盘摘要（只读存档；此后复盘写入 `docs/reviews/`） |
 | `.github/pull_request_template.md` | PR 自审与证据模板，只引用上述标准 |
 | `scripts/review-gate.mjs`、`.githooks/` | 可机械判定的提交门禁：`pre-commit` 查内容、`commit-msg` 查证据，由 `scripts/install-hooks.mjs` 在安装时启用 |
 | `CLAUDE.md`、`CONVENTIONS.md`、`.codebuddy/CODEBUDDY.md`、`.cursor/rules/`、`.cursorrules`、`.clinerules`、`.roo/rules/`、`.github/copilot-instructions.md`、`.github/instructions/` | 工具入口，只引用 `AGENTS.md`，不复制规则正文 |
@@ -65,7 +66,7 @@ project_aggregation/
 ### docs/ 目录
 - **持久性技术文档**：`deployment.md`, `integration.md`, `local-route.md`
 - **代码规范**：`code-standards.md`, `workspace-style.md`, `FILE_ORGANIZATION.md`
-- **审查机制**：`code-review-standard.md`, `code-review-checklist.md`, `code-review-process.md`
+- **审查机制**：`code-review-standard.md`, `code-review-checklist.md`, `code-review-process.md`, `review-history.md`（2026-10-20 前的复盘摘要）
 - **专题指南**：特定时期的重要改动记录（带日期命名）
 - **归档子目录**：`archive/` - 已完成的临时文档
 

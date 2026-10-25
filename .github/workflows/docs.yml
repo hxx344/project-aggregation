@@ -37,5 +37,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          node --test tests/review-gate.test.mjs
+          node --test tests/review-gate.test.mjs tests/lessons-routing.test.mjs
           node scripts/review-ci.mjs
