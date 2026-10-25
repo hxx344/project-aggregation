@@ -54,8 +54,8 @@ systemctl stop "$unit"
 /usr/bin/python3 -I - "$repository" "$unit" "$group" <<'PY'
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location('recovery_operations', pathlib.Path(sys.argv[1]) / 'server/recovery/operations.py')
-module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); module.SERVICE = sys.argv[2]
-try: module.require_stopped(sys.argv[3])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); module.SERVICES = (sys.argv[2],)
+try: module.require_stopped({sys.argv[2]: sys.argv[3]})
 except ValueError as error: assert str(error) == 'RECOVERY_WRITERS_STILL_RUNNING'
 else: raise AssertionError('An orphan writer was accepted')
 PY
@@ -68,8 +68,8 @@ done
 /usr/bin/python3 -I - "$repository" "$unit" "$group" <<'PY'
 import importlib.util, pathlib, sys
 spec = importlib.util.spec_from_file_location('recovery_operations', pathlib.Path(sys.argv[1]) / 'server/recovery/operations.py')
-module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); module.SERVICE = sys.argv[2]
-module.require_stopped(sys.argv[3])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); module.SERVICES = (sys.argv[2],)
+module.require_stopped({sys.argv[2]: sys.argv[3]})
 PY
 "${RECOVERY_TEST_NODE:?Pass the verified Node executable}" --input-type=module - "$repository" "$fixture/data" <<'JS'
 import {pathToFileURL} from 'node:url';

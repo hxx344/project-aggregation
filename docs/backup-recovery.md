@@ -12,7 +12,7 @@ Linux 正式安装的首次操作入口为：
 sudo python3 -I /opt/project-aggregation/current/server/recovery/operations.py backup
 ```
 
-`backup` 自动准备缺失的备份密钥、停止统一服务并核对完整服务组、取得数据根生命周期锁、制作备份和安装持久启动保护。成功后或失败清理结束后，只有此前运行且原源未被退休的服务才会重新启动。所有命令使用当前受保护的正式发布与服务配置，不接受从网页传入的源码路径。
+`backup` 自动准备缺失的备份密钥、停止运行时与 API 两个服务单元并核对完整服务组、取得数据根生命周期锁、制作备份和安装持久启动保护。成功后或失败清理结束后，只有此前运行且原源未被退休的服务才会重新启动。所有命令使用当前受保护的正式发布与服务配置，不接受从网页传入的源码路径。
 
 首次冷操作安装完成后，可使用短命令：
 
@@ -27,7 +27,7 @@ sudo project-aggregation-recovery backup
 | 备份数据密钥 | `/etc/project-aggregation-recovery/data.key`，32 字节，权限 `0600` |
 | 备份秘密材料密钥 | `/etc/project-aggregation-recovery/secrets.key`，独立的 32 字节，权限 `0600`，不得与数据密钥相同 |
 | 交接续作记录 | `/etc/project-aggregation-recovery/pending-handoff.json`，记录原源和备份目标，不是解锁令牌 |
-| 持久启动保护 | `/usr/local/lib/project-aggregation-recovery/startup-guard.py` 与 `project-aggregation.service.d/20-recovery-guard.conf` |
+| 持久启动保护 | `/usr/local/lib/project-aggregation-recovery/startup-guard.py` 与运行时单元的 `project-aggregation.service.d/20-recovery-guard.conf`；API 进程启动时自行检查恢复状态，API 单元没有 drop-in。网页更新把这个受管 guard 视为受管配置，其他 drop-in 仍判为未受管 |
 
 密钥目录只允许 root 访问。备份包不包含这两把备份密钥；取回备份时必须能分别取回对应密钥。应用自身的 `credentials.key` 和 Asset `config.json` 属于备份内容，不能代替备份密钥。不要用重新生成密钥替代丢失的旧密钥。
 
@@ -41,7 +41,7 @@ sudo project-aggregation-recovery inspect --target-dir /srv/project-aggregation/
 
 ## 一致性与备份内容
 
-操作入口先串行取得 stack 和 installer 锁，避免同时升级。需要冷操作时停止 `project-aggregation.service`，检查 `ActiveState`、`MainPID=0` 以及原服务 cgroup 的 `populated 0`，随后由工具先后持有数据根 `.runtime.lock` 与 `.api.lock` 的 OS 排他锁。Hub 在创建共享保护库和模块前取得 `.runtime.lock`，拆分后的 API 进程以共享模式持有 `.api.lock`，都在关闭完成后才释放。只看主 PID 或手动创建一个锁文件不能替代这套证据。
+操作入口先串行取得 stack 和 installer 锁，避免同时升级。需要冷操作时显式停止 `project-aggregation.service` 与 `project-aggregation-api.service`（不依赖 `PartOf=`），逐个检查两个单元的 `ActiveState`、`MainPID=0` 以及各自原 cgroup 的 `populated 0`，任一单元仍在运行即拒绝；结束后只启动运行时单元，由它拉起 API。两个单元必须都是安装器写出的受管单元，且使用同一服务账户和 Node。随后由工具先后持有数据根 `.runtime.lock` 与 `.api.lock` 的 OS 排他锁。Hub 在创建共享保护库和模块前取得 `.runtime.lock`，拆分后的 API 进程以共享模式持有 `.api.lock`，都在关闭完成后才释放。只看主 PID 或手动创建一个锁文件不能替代这套证据。
 
 当前采用完整服务组冷停。没有跨数据库事务：一致性依据是在全部受支持写者退出且生命周期锁持有期间，各库及 JSON 保持静止。SQLite 使用备份 API 生成完整快照；需要时受控 checkpoint，读取或恢复不丢弃仍有内容的 WAL，也不直接复制主文件并忽略 WAL。manifest 为每个库记录 schema 摘要、`user_version`、`application_id` 和完整表行数，恢复时重新校验。
 

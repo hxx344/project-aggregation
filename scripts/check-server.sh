@@ -2,14 +2,14 @@
 # 一键诊断工作台服务状态
 
 echo "========== 1. 服务运行状态 =========="
-systemctl status project-aggregation 2>/dev/null || echo "未找到 systemd 服务"
+systemctl status project-aggregation project-aggregation-api 2>/dev/null || echo "未找到 systemd 服务"
 ps aux | grep -E '[n]ode.*server' | head -5
 
 echo -e "\n========== 2. 端口监听状态 =========="
 ss -tlnp 2>/dev/null | grep 3100 || netstat -tlnp 2>/dev/null | grep 3100 || echo "3100 端口未监听"
 
-echo -e "\n========== 3. 最近 20 行日志 =========="
-journalctl -u project-aggregation -n 20 --no-pager 2>/dev/null || echo "无 systemd 日志"
+echo -e "\n========== 3. 最近 20 行日志（运行时与 API） =========="
+journalctl -u project-aggregation -u project-aggregation-api -n 20 --no-pager 2>/dev/null || echo "无 systemd 日志"
 
 echo -e "\n========== 4. 防火墙状态 =========="
 ufw status 2>/dev/null | grep 3100 || iptables -L INPUT -n 2>/dev/null | grep 3100 || echo "防火墙检查需要 root"

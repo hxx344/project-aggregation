@@ -5,7 +5,7 @@
 
 set -Eeuo pipefail
 
-UNITS=(project-aggregation.service project-aggregation-updater.service project-aggregation-update-worker.service)
+UNITS=(project-aggregation.service project-aggregation-api.service project-aggregation-updater.service project-aggregation-update-worker.service)
 INSTALL_LOCK=/run/lock/project-aggregation-install.lock
 
 echo "=== Project Aggregation Force Reinstall ==="

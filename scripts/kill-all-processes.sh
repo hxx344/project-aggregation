@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-UNITS=(project-aggregation.service project-aggregation-updater.service project-aggregation-update-worker.service)
+UNITS=(project-aggregation.service project-aggregation-api.service project-aggregation-updater.service project-aggregation-update-worker.service)
 
 echo "=== Stopping project-aggregation services ==="
 echo ""

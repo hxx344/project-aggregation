@@ -17,6 +17,10 @@ APP = Path('/opt/project-aggregation')
 ENVIRONMENT = Path('/etc/project-aggregation.env')
 UNIT_FILE = Path('/etc/systemd/system/project-aggregation.service')
 SERVICE = 'project-aggregation.service'
+# The runtime unit pulls in the API unit; both hold writers of the data directory.
+API_UNIT_FILE = Path('/etc/systemd/system/project-aggregation-api.service')
+API_SERVICE = 'project-aggregation-api.service'
+SERVICES = (SERVICE, API_SERVICE)
 KEYS = Path('/etc/project-aggregation-recovery')
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 INSTALL_LOCK = Path('/run/lock/project-aggregation-install.lock')
@@ -59,18 +63,26 @@ def trusted_environment():
     return ENVIRONMENT
 
 
-def deployment():
-    import pwd
-    trusted_environment()
-    unit = trusted(UNIT_FILE).read_text(encoding='utf-8')
+def managed_unit(filename, entry):
+    """The service user and Node executable of an installer-written unit running `entry`."""
+    unit = trusted(filename).read_text(encoding='utf-8')
     if not unit.startswith('# Managed by project-aggregation installer\n'):
         raise ValueError('RECOVERY_UNMANAGED_SERVICE')
     user = re.search(r'^User=([A-Za-z_][A-Za-z0-9_-]*)$', unit, re.M)
-    command = re.search(r'^ExecStart=(/[^\s]+) ' + re.escape(str(APP / 'current/server/index.mjs')) + r'$', unit, re.M)
+    command = re.search(r'^ExecStart=(/[^\s]+) ' + re.escape(str(APP / 'current/server' / entry)) + r'$', unit, re.M)
     if not user or not command:
         raise ValueError('RECOVERY_SERVICE_CONFIG_INVALID')
-    account = pwd.getpwnam(user[1])
-    node = trusted(command[1])
+    return user[1], command[1]
+
+
+def deployment():
+    import pwd
+    trusted_environment()
+    user, command = managed_unit(UNIT_FILE, 'runtime/main.mjs')
+    if managed_unit(API_UNIT_FILE, 'api/main.mjs') != (user, command):
+        raise ValueError('RECOVERY_SERVICE_CONFIG_INVALID')
+    account = pwd.getpwnam(user)
+    node = trusted(command)
     current_link = APP / 'current'
     if not current_link.is_symlink() or current_link.lstat().st_uid != 0:
         raise ValueError('RECOVERY_RELEASE_INVALID')
@@ -142,25 +154,28 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
     os.chmod(launcher, 0o755)
 
 
-def service_state():
-    fields = systemctl('show', SERVICE, '--property=ActiveState,MainPID,ControlGroup')
+def service_state(unit):
+    fields = systemctl('show', unit, '--property=ActiveState,MainPID,ControlGroup')
     return dict(line.split('=', 1) for line in fields.splitlines() if '=' in line)
 
 
-def require_stopped(previous_group=''):
-    state = service_state()
-    if state.get('ActiveState') not in {'inactive', 'failed'} or state.get('MainPID') != '0':
-        raise ValueError('RECOVERY_WRITERS_STILL_RUNNING')
-    group = state.get('ControlGroup') or previous_group
-    if group:
-        if not group.startswith('/') or '..' in Path(group).parts:
-            raise ValueError('RECOVERY_CGROUP_INVALID')
-        group_dir = Path('/sys/fs/cgroup') / group.lstrip('/')
-        if group_dir.exists():
-            events = group_dir / 'cgroup.events'
-            if not events.is_file() or not re.search(r'^populated 0$', events.read_text(), re.M):
-                raise ValueError('RECOVERY_WRITERS_STILL_RUNNING')
-    return state
+def require_stopped(previous_groups=None):
+    """Every unit is stopped and its cgroup, also the one seen before stopping, is empty."""
+    states = {}
+    for unit in SERVICES:
+        state = states[unit] = service_state(unit)
+        if state.get('ActiveState') not in {'inactive', 'failed'} or state.get('MainPID') != '0':
+            raise ValueError('RECOVERY_WRITERS_STILL_RUNNING')
+        group = state.get('ControlGroup') or (previous_groups or {}).get(unit, '')
+        if group:
+            if not group.startswith('/') or '..' in Path(group).parts:
+                raise ValueError('RECOVERY_CGROUP_INVALID')
+            group_dir = Path('/sys/fs/cgroup') / group.lstrip('/')
+            if group_dir.exists():
+                events = group_dir / 'cgroup.events'
+                if not events.is_file() or not re.search(r'^populated 0$', events.read_text(), re.M):
+                    raise ValueError('RECOVERY_WRITERS_STILL_RUNNING')
+    return states
 
 
 @contextmanager
@@ -247,11 +262,13 @@ def _main_locked(values):
         run_cli(config, 'keys', *key_arguments)
     elif not all((KEYS / name).is_file() for name in ('data.key', 'secrets.key')):
         raise ValueError('RECOVERY_KEYS_MISSING')
-    before = service_state()
-    was_running = before.get('ActiveState') in {'active', 'activating', 'reloading'}
+    before = {unit: service_state(unit) for unit in SERVICES}
+    groups = {unit: state.get('ControlGroup', '') for unit, state in before.items()}
+    was_running = any(state.get('ActiveState') in {'active', 'activating', 'reloading'} for state in before.values())
+    # Both units explicitly: PartOf= alone would leave an API started on its own.
     if was_running:
-        systemctl('stop', SERVICE, timeout=180)
-    require_stopped(before.get('ControlGroup', ''))
+        systemctl('stop', *SERVICES, timeout=180)
+    require_stopped(groups)
     try:
         if values.action != 'restore':
             run_cli(config, 'check-source', '--data-dir', config['source'], '--owner-uid', config['uid'])
@@ -299,7 +316,7 @@ def _main_locked(values):
                 raise ValueError('RECOVERY_OPTIONS_INVALID')
             result = run_cli(config, 'admit', '--data-dir', config['source'], '--target-dir', target,
                              '--owner-uid', config['uid'], '--target-owner-uid', config['uid'], '--environment-file', ENVIRONMENT, *key_arguments)
-        require_stopped(before.get('ControlGroup', ''))
+        require_stopped(groups)
         return result
     finally:
         # A handoff can retire the source before a disk failure is reported.
@@ -313,6 +330,7 @@ def _main_locked(values):
                 # Disaster restore needs only the checkpoint and its keys.
                 # An unreadable original authority stays stopped.
             else:
+                # The runtime unit starts the API unit (Wants=).
                 if current['state'] != 'retired':
                     systemctl('start', SERVICE, timeout=180)
 

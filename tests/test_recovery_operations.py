@@ -154,6 +154,70 @@ class OperatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
                 operations.require_stopped()
 
+    def test_any_running_or_populated_unit_blocks_the_cold_checkpoint(self):
+        stopped = {'ActiveState': 'inactive', 'MainPID': '0', 'ControlGroup': ''}
+        for unit in operations.SERVICES:
+            with self.subTest(unit=unit):
+                states = {name: dict(stopped) for name in operations.SERVICES}
+                states[unit] = {'ActiveState': 'activating', 'MainPID': '0', 'ControlGroup': ''}
+                with patch.object(operations, 'service_state', side_effect=states.__getitem__):
+                    with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
+                        operations.require_stopped()
+                # A unit that stopped but left a process in the cgroup it had before.
+                states[unit] = dict(stopped)
+                group = '/system.slice/' + unit
+                with patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                        patch.object(Path, 'exists', lambda path: str(path) == '/sys/fs/cgroup' + group), \
+                        patch.object(Path, 'is_file', return_value=True), patch.object(Path, 'read_text', return_value='populated 1\n'):
+                    with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
+                        operations.require_stopped({unit: group})
+        with patch.object(operations, 'service_state', return_value=stopped):
+            self.assertEqual(set(operations.require_stopped()), set(operations.SERVICES))
+
+    def test_operation_stops_both_units_and_starts_the_runtime_unit(self):
+        import argparse
+        for running in operations.SERVICES:
+            with self.subTest(running=running), tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+                keys = Path(directory)
+                states = {unit: {'ActiveState': 'active' if unit == running else 'inactive', 'ControlGroup': '/system.slice/' + unit}
+                          for unit in operations.SERVICES}
+                args = argparse.Namespace(action='backup', destination=keys / 'backup', target_dir=None, backup_dir=None)
+                with patch.object(operations, 'KEYS', keys), patch.object(operations, 'deployment', return_value={'source': keys / 'data', 'uid': 1}), \
+                        patch.object(operations, 'run_cli', return_value={'state': 'normal'}), patch.object(operations, 'install_guard'), \
+                        patch.object(operations, 'safe_directory'), patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                        patch.object(operations, 'require_stopped') as stopped, patch.object(operations, 'systemctl') as controller:
+                    operations._main_locked(args)
+                self.assertEqual([call.args for call in controller.call_args_list], [('stop', *operations.SERVICES), ('start', operations.SERVICE)])
+                self.assertEqual(stopped.call_args_list[0].args, ({unit: '/system.slice/' + unit for unit in operations.SERVICES},))
+
+    def test_deployment_requires_both_installer_units_with_one_identity(self):
+        with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+            root = Path(directory); runtime = root / 'runtime.service'; api = root / 'api.service'
+            def unit(entry, user='nobody', node='/usr/bin/node', marker='# Managed by project-aggregation installer\n'):
+                return f'{marker}[Service]\nUser={user}\nExecStart={node} {operations.APP}/current/server/{entry}\n'
+            cases = [(unit('index.mjs'), unit('api/main.mjs'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), None, 'MISSING'),
+                     (unit('runtime/main.mjs'), unit('runtime/main.mjs'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), unit('api/main.mjs', user='root'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), unit('api/main.mjs', node='/opt/node/bin/node'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), unit('api/main.mjs', marker=''), 'UNMANAGED_SERVICE')]
+            def trusted(filename, private=False):
+                if not Path(filename).exists():
+                    raise ValueError('MISSING')
+                return Path(filename)
+            for runtime_text, api_text, error in cases:
+                with self.subTest(error=error, api=api_text):
+                    runtime.write_text(runtime_text); api.unlink(missing_ok=True)
+                    if api_text is not None:
+                        api.write_text(api_text)
+                    with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'API_UNIT_FILE', api), \
+                            patch.object(operations, 'trusted_environment'), patch.object(operations, 'trusted', side_effect=trusted):
+                        with self.assertRaisesRegex(ValueError, error):
+                            operations.deployment()
+            api.write_text(unit('api/main.mjs'))
+            with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'API_UNIT_FILE', api), patch.object(operations, 'trusted', side_effect=trusted):
+                self.assertEqual(operations.managed_unit(runtime, 'runtime/main.mjs'), operations.managed_unit(api, 'api/main.mjs'))
+
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root ownership fixture runs in Linux CI')
     def test_guard_install_is_incremental_and_does_not_restart_or_remove_other_overrides(self):
         # The production drop-in requires a root-owned non-writable ancestor
