@@ -2,7 +2,7 @@
 
 仅在用户或已有调度明确触发提交复盘时执行本流程。文件本身不会启动定时任务；修改规则、普通开发或局部 PR 审查不触发全历史复盘。
 
-先读 [AGENTS.md](AGENTS.md)、[LESSONS.md](LESSONS.md)、[代码规范](docs/code-standards.md) 与 [复盘状态](docs/review-state.json)。本流程只规定增量审查与文档维护；授权、环境、验证、提交与发布继续遵循当前用户约定。
+先读 [AGENTS.md](AGENTS.md)、[LESSONS.md](LESSONS.md)、[代码规范](docs/code-standards.md) 与 [复盘状态](docs/review-state.json)；复盘需要检索既有事件去重，可按需全文检索 `LESSONS.md`，不受改动前按路由表取用的限制。本流程只规定增量审查与文档维护；授权、环境、验证、提交与发布继续遵循当前用户约定。
 
 ## 1. 固定来源与范围
 
@@ -78,6 +78,8 @@ git rev-list --reverse --topo-order $reviewTarget
 ```
 
 先按来源仓库、失败场景、根因和提交关系检索现有事件。重复复盘只补充新证据，不新增日期或事件；同一次故障跨天修补、同补丁跨页面推广或 cherry-pick 也不重复计数。旧的 “Seen” 和复盘日期保留为历史记录，只有核实实际事件后才转换为升级计数。
+
+复盘范围、提交窗口与结论只写入本轮报告，不写入 `LESSONS.md`；`LESSONS.md` 只增补或修订经验条目，新增条目同步登记到 `AGENTS.md` 路由表并运行 `node --test tests/lessons-routing.test.mjs`（见 [LESSONS.md 的记录规则](LESSONS.md#记录规则)）。
 
 有证据支持、且满足范围和检查条件时才升级；不满足则写明缺少什么。本轮没有新经验可以如实记录零条，不为填报告编造规则。
 
