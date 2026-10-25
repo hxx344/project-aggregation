@@ -383,7 +383,7 @@ class CoordinatorTests(RootFixture):
                      identity=hashlib.sha256((key + NEW).encode()).hexdigest())
         return 0
 
-    def check(self, minimum_interval=updater.CHECK_MIN_INTERVAL, automatic=False):
+    def check(self, minimum_interval=None, automatic=False):
         self.coordinator.check(minimum_interval=minimum_interval, automatic=automatic)
         if self.coordinator.check_thread:
             self.coordinator.check_thread.join(5)
@@ -1318,6 +1318,17 @@ class CoordinatorTests(RootFixture):
         self.clock += updater.AUTO_CHECK_INTERVAL
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])
 
+    def test_manual_check_runs_soon_after_an_automatic_check(self):
+        self.assertLess(updater.CHECK_MIN_INTERVAL, updater.AUTO_CHECK_INTERVAL)
+        self.check(minimum_interval=updater.AUTO_CHECK_INTERVAL, automatic=True)
+        calls = len(self.network.calls)
+        self.clock += updater.CHECK_MIN_INTERVAL - 1
+        self.assertFalse(self.coordinator.check()['checking'])
+        self.assertEqual(len(self.network.calls), calls)
+        self.clock += 1
+        self.assertIsNotNone(self.check()['planId'])
+        self.assertGreater(len(self.network.calls), calls)
+
     def test_manual_check_skips_local_backoff_but_keeps_server_deadline(self):
         with patch.object(self.reader, 'read', side_effect=releases.ReleaseError('网络暂时不可用', transient=True)) as read:
             self.check()
@@ -1325,7 +1336,8 @@ class CoordinatorTests(RootFixture):
             self.assertEqual(read.call_count, 2)
             self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 2 * updater.AUTO_CHECK_INTERVAL)
             self.assertEqual(self.coordinator.load()['retryNotBefore'], 0)
-        self.clock += updater.CHECK_MIN_INTERVAL - 1
+        # A failing state keeps manual checks at the slower pace, not CHECK_MIN_INTERVAL.
+        self.clock += updater.CHECK_FAILURE_MIN_INTERVAL - 1
         self.assertFalse(self.coordinator.check()['checking'])
         self.clock += 1
         self.assertGreater(self.coordinator.next_check_delay(), 0)
