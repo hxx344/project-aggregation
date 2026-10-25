@@ -381,6 +381,7 @@ def main():
     git = ['git', '-c', f'safe.directory={repository.as_posix()}', '-C', str(repository)]
     commit = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True).strip()
     runtime_key = application_key(git, architecture)
+    component_key = runtime_component_key(git, architecture)
     args.output.mkdir(parents=True, exist_ok=True)
     filename = f'{name}-linux-{architecture}.tar.gz'
     archive_path = args.output / filename
@@ -391,7 +392,7 @@ def main():
         print(f'[package] Runtime staging: {perf_counter() - started:.1f}s', flush=True)
         (stage / '.release-commit').write_text(commit + '\n')
         (stage / '.release-application-key').write_text(runtime_key + '\n')
-        (stage / '.release-runtime-key').write_text(runtime_component_key(git, architecture) + '\n')
+        (stage / '.release-runtime-key').write_text(component_key + '\n')
         # Level 6 avoids the expensive maximum-compression pass while retaining
         # deterministic gzip metadata and the same verified runtime contents.
         started = perf_counter()
@@ -407,7 +408,9 @@ def main():
                     info.size, info.mode, info.mtime = len(content), 0o755 if path.stat().st_mode & 0o111 else 0o644, 0
                     archive.addfile(info, io.BytesIO(content))
         print(f'[package] Archive compression (gzip 6): {perf_counter() - started:.1f}s', flush=True)
-    artifact = {'file': filename, 'sha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(), 'application_key': runtime_key}
+    # runtime_key lets the update service plan an API-only update before downloading (design doc 6.5).
+    artifact = {'file': filename, 'sha256': hashlib.sha256(archive_path.read_bytes()).hexdigest(), 'application_key': runtime_key,
+                'runtime_key': component_key}
     manifest = {'schema': 1, 'repository': 'hxx344/' + name, 'commit': commit, 'tag': 'deploy-' + commit,
                 'node_version': '24.15.0', 'artifacts': {'linux-' + architecture: artifact}}
     (args.output / f'release-manifest-{architecture}.json').write_text(json.dumps(manifest, indent=2) + '\n')

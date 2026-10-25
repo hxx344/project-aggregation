@@ -25,9 +25,15 @@ UPDATER_UNIT_FILE=/etc/systemd/system/project-aggregation-updater.service
 UPDATER_WORKER_UNIT_FILE=/etc/systemd/system/project-aggregation-update-worker.service
 PROJECT_DEPLOY_TESTS=${PROJECT_DEPLOY_TESTS-0}
 PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-source}
+# api: the update service admitted this update without trading maintenance
+# (design doc 6.5), so only the API may restart. Unset or full: decided here.
+PROJECT_DEPLOY_SCOPE=${PROJECT_DEPLOY_SCOPE-}
+# Exit status of a refused api-scope update; the update service plans it in full next time.
+SCOPE_REFUSED=75
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
 RUNTIME_DEPENDENCIES=0
 activation_started=0
+scope_refused=0
 migration_commit_started=0
 old_release=
 old_unit_backup=
@@ -1350,6 +1356,8 @@ rollback() {
   local exit_code=${1:-$?}
   trap - ERR INT TERM EXIT
   set +e
+  # Only the scope check reports SCOPE_REFUSED; another step's status 75 is an ordinary failure.
+  if [[ "$exit_code" == "$SCOPE_REFUSED" && "$scope_refused" != 1 ]]; then exit_code=1; fi
   # Close before recovery. If this optional write fails, leave the interval
   # unknown instead of retrying at EXIT and counting rollback as deployment.
   ci_finish_progress
@@ -2522,6 +2530,10 @@ activation_scope() {
     printf full
   fi
 }
+# Whether the admitted scope covers the activation: an api-scope update never widens.
+scope_admitted() {
+  [[ "$PROJECT_DEPLOY_SCOPE" != api || "$1" == api ]]
+}
 prune_releases() {
   local directory runtime_release
   if ! runtime_release=$(live_runtime_release); then
@@ -2661,6 +2673,7 @@ main() {
     0|1) ;;
     *) fail 'PROJECT_DEPLOY_TESTS 必须是 0 或 1。'; return 1 ;;
   esac
+  case "$PROJECT_DEPLOY_SCOPE" in ''|full|api) ;; *) fail 'PROJECT_DEPLOY_SCOPE 必须是 api 或 full。'; return 1 ;; esac
   [[ "$(uname -s)" == Linux ]] || fail '安装脚本仅用于 Linux；开发环境请使用 pnpm 命令。'
   [[ "$EUID" == 0 ]] || fail '请使用 sudo bash install.sh。'
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || fail '需要正在运行 systemd 的 Linux 主机。'
@@ -2783,6 +2796,12 @@ main() {
   prepare_environment_rollback
   ci_update_progress switch
   activation_scope=$(activation_scope)
+  if ! scope_admitted "$activation_scope"; then
+    # Nothing is activated yet: rollback only closes progress and exits.
+    log '本次更新按只重启 API 准入（交易未进入维护），但运行时代码、服务配置、环境或模块迁移需要整体重启；未切换版本。请重新检查更新。'
+    scope_refused=1
+    rollback "$SCOPE_REFUSED"
+  fi
   activation_started=1
   if [[ "$activation_scope" == api ]]; then
     log '运行时代码、服务配置和环境未变化：只重启 API，模块与采集保持运行。'

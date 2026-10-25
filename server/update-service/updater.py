@@ -52,6 +52,11 @@ CHECK_DEADLINE = 3 * 60
 HISTORY_WAIT = 20
 ACTIVE = {'queued', 'running'}
 DEPLOYMENT_MODES = ('source', 'ci')
+# Restart scope of a plan per deployment mode (design doc 6.5): 'api' admits the
+# update without trading maintenance, so only the installer's own decision may
+# narrow it further; it never widens it (exit status SCOPE_REFUSED instead).
+SCOPES = ('full', 'api')
+SCOPE_REFUSED = 75
 TOKEN = re.compile(r'[a-f0-9]{32}')
 MAX_CREDENTIALS = 1024
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes', 'recovery')
@@ -168,11 +173,18 @@ def validate_deploy_mode(value):
     return value
 
 
-def run_installer(script, manifest, log, deploy_mode='source'):
+def validate_scope(value):
+    if not isinstance(value, str) or value not in SCOPES:
+        raise UpdateError(400, '更新范围无效')
+    return value
+
+
+def run_installer(script, manifest, log, deploy_mode='source', scope='full'):
     environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': validate_deploy_mode(deploy_mode), 'PROJECT_DEPLOY_TESTS': '0',
                    'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest),
-                   'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json')}
-    # Only the validated mode enters the fixed environment; no shell command string.
+                   'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json'),
+                   **({'PROJECT_DEPLOY_SCOPE': 'api'} if validate_scope(scope) == 'api' else {})}
+    # Only the validated mode and scope enter the fixed environment; no shell command string.
     with log.open('xb') as output:
         os.chmod(log, 0o600)
         result = subprocess.run(['/bin/bash', str(script)], cwd='/', env=environment,
@@ -333,6 +345,7 @@ class Coordinator:
     def public(self, state):
         result = {'enabled': True, **{key: state.get(key) for key in
                 ('checking', 'checkedAt', 'checkError', 'planId', 'expiresAt', 'job')},
+                'planScopes': state.get('planScopes') if state.get('planId') else None,
                 'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']],
                 'githubToken': {'configured': bool(self.read_token())}, 'deploymentModes': list(DEPLOYMENT_MODES)}
         if result['job']:
@@ -341,6 +354,7 @@ class Coordinator:
             job = result['job'] = {key: value for key, value in result['job'].items()
                                   if key not in ('progress', 'stageTimings')}
             job.setdefault('deployMode', 'source')
+            job.setdefault('scope', 'full')
             if job['status'] == 'running' and TOKEN.fullmatch(job['id']):
                 progress = get_progress(self.jobs / job['id'] / 'progress.json',
                                         timestamp(job['startedAt']) * 1000, self.clock())
@@ -549,6 +563,21 @@ class Coordinator:
             item.update(state='unavailable', reason='正式版本检查未完成，请稍后重试')
             return item, None
 
+    def ci_scope(self, candidates, state):
+        """'api' when a CI package would leave the runtime unit running (design doc 6.5).
+
+        Only a forecast for the admission: the installer computes the scope again
+        from the running runtime, the unit and the configuration, and refuses an
+        'api' update it would have to widen. A refused commit is planned in full."""
+        if len(candidates) != 1:
+            return 'full'
+        item, release = candidates[0]
+        key = release.get('runtimeKey')
+        if (item['id'] != 'hub' or not key or item.get('runtimeKey') != key or not item.get('runtimeRecorded')
+                or state.get('scopeRefused') == release['commit']):
+            return 'full'
+        return 'api'
+
     def perform_check(self, check_id=None):
         def current(state):
             return state['checking'] and state.get('checkId') == check_id
@@ -563,6 +592,7 @@ class Coordinator:
             failed = any(item['state'] == 'unavailable' for item in modules)
             plan_id = None
             expires = None
+            scopes = None
             # A partial check never silently drops an installed module from the plan.
             if candidates and not failed:
                 entries = []
@@ -575,12 +605,13 @@ class Coordinator:
                 if not current(state):
                     return
                 if candidates and not failed:
+                    scopes = {'source': 'full', 'ci': self.ci_scope(candidates, state)}
                     previous = state.get('planId')
                     try:
                         plan = self.read_plan(previous) if previous else None
                     except (UpdateError, OSError, ValueError):
                         plan = None
-                    if plan and plan['entries'] == entries:
+                    if plan and plan['entries'] == entries and plan.get('scopes') == scopes:
                         plan_id, expires = plan['id'], plan['expiresAt']
                     if not plan_id:
                         # Publish files and their state reference under the same lock as pruning.
@@ -590,13 +621,15 @@ class Coordinator:
                         for item, release in candidates:
                             write_bytes(plan_directory / (item['id'] + '.manifest.json'), release['manifestBytes'])
                             write_bytes(plan_directory / (item['id'] + '.install.sh'), release['installer'])
-                        write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries})
+                        write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries,
+                                                                  'scopes': scopes})
                 state.update(modules=modules)
                 if failed:
                     self._record_check_failure(state, '部分模块检查失败，暂不能开始更新', retry_at)
                 else:
                     state.update(checking=False, checkId=None, checkedAt=iso(self.clock()), checkError=None,
-                                 failureCount=0, nextCheckNotBefore=0, retryNotBefore=0, planId=plan_id, expiresAt=expires)
+                                 failureCount=0, nextCheckNotBefore=0, retryNotBefore=0, planId=plan_id, expiresAt=expires,
+                                 planScopes=scopes)
                 self.save(state)
                 self.prune(state)
         except Exception:
@@ -621,6 +654,11 @@ class Coordinator:
             raise UpdateError(409, '更新计划无效，请重新检查')
         if ids != [module.id for module in MODULES if module.id in ids]:
             raise UpdateError(409, '更新顺序无效，请重新检查')
+        scopes = plan.get('scopes', {'source': 'full', 'ci': 'full'})
+        if (not isinstance(scopes, dict) or set(scopes) != set(DEPLOYMENT_MODES) or any(value not in SCOPES for value in scopes.values())
+                or scopes['source'] != 'full'):
+            raise UpdateError(409, '更新范围无效，请重新检查')
+        plan['scopes'] = scopes
         for entry in entries:
             if not re.fullmatch(r'[a-f0-9]{40}', entry.get('commit', '')) or entry.get('tag') != 'deploy-' + entry['commit']:
                 raise UpdateError(409, '版本身份无效，请重新检查')
@@ -636,13 +674,14 @@ class Coordinator:
                     raise UpdateError(409, '计划文件校验失败，请重新检查')
         return plan
 
-    def apply(self, plan_id, deploy_mode='source'):
+    def apply(self, plan_id, deploy_mode='source', scope='full'):
         validate_deploy_mode(deploy_mode)
+        validate_scope(scope)
         with self.lock():
             state = self.load()
             job = state['job']
             if job and job['status'] in ACTIVE:
-                if state.get('jobPlanId') == plan_id and job.get('deployMode', 'source') == deploy_mode:
+                if state.get('jobPlanId') == plan_id and job.get('deployMode', 'source') == deploy_mode and job.get('scope', 'full') == scope:
                     return self.public(state)
                 raise UpdateError(409, '已有更新任务正在执行')
             if state['checking'] or state.get('checkError') or not plan_id or state['planId'] != plan_id:
@@ -651,12 +690,15 @@ class Coordinator:
                 plan = self.read_plan(plan_id)
             except (OSError, ValueError):
                 raise UpdateError(409, '计划文件不可用，请重新检查') from None
+            # A caller that skipped trading maintenance may only run a plan forecast as 'api'.
+            if scope == 'api' and plan['scopes'][deploy_mode] != 'api':
+                raise UpdateError(409, '更新范围已改变，请重新检查')
             current = {item['id']: item for item in self.inspect()}
             if any(current.get(entry['id'], {}).get('identity') != entry['installedIdentity'] for entry in plan['entries']):
                 raise UpdateError(409, '本机版本已改变，请重新检查')
             job_id = uuid.uuid4().hex
             private_directory(self.jobs / job_id)
-            state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'deployMode': deploy_mode, 'startedAt': iso(self.clock()),
+            state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'deployMode': deploy_mode, 'scope': scope, 'startedAt': iso(self.clock()),
                          'finishedAt': None, 'activeModule': None, 'message': '已提交，正在准备正式版本更新',
                          'steps': [{'id': entry['id'], 'name': BY_ID[entry['id']].name, 'status': 'pending'} for entry in plan['entries']]})
             self.save(state)
@@ -702,8 +744,10 @@ class Coordinator:
                 return
             job_id, plan_id = state['job']['id'], state['jobPlanId']
             deploy_mode = state['job'].get('deployMode', 'source')
+            scope = state['job'].get('scope', 'full')
         try:
             validate_deploy_mode(deploy_mode)
+            validate_scope(scope)
             with file_lock(self.stack_lock, blocking=False):
                 plan = self.read_plan(plan_id)
                 def begin(state, job):
@@ -718,6 +762,8 @@ class Coordinator:
                     if any(release[key] != entry[key] for key in ('commit', 'tag', 'manifestHash', 'installerHash', 'applicationKey')):
                         raise UpdateError(409, '正式发布内容已改变，未开始部署，请重新检查')
                     self.syntax(self.plans / plan_id / (entry['id'] + '.install.sh'))
+                if scope == 'api' and plan['scopes'][deploy_mode] != 'api':
+                    raise UpdateError(409, '更新范围已改变，未开始部署，请重新检查')
                 for entry in plan['entries']:
                     key = entry['id']
                     def running(state, job):
@@ -726,7 +772,12 @@ class Coordinator:
                     self.progress(job_id, running)
                     plan_directory = self.plans / plan_id
                     code = self.installer(plan_directory / (key + '.install.sh'), plan_directory / (key + '.manifest.json'),
-                                          self.jobs / job_id / (key + '.log'), deploy_mode)
+                                          self.jobs / job_id / (key + '.log'), deploy_mode, scope)
+                    if code == SCOPE_REFUSED and scope == 'api':
+                        # The installer stopped before activation; the next check plans this release in full.
+                        commit = entry['commit']
+                        self.progress(job_id, lambda state, job: state.update(scopeRefused=commit))
+                        raise UpdateError(409, BY_ID[key].name + ' 需要整体重启，未切换版本；请重新检查后再更新（将暂停交易）')
                     if code != 0:
                         raise UpdateError(500, BY_ID[key].name + ' 更新失败；已完成的模块保留，恢复结果请查看服务器部署日志')
                     observed = next((item for item in self.inspect() if item['id'] == key), None)
@@ -796,13 +847,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.headers.get_content_type() != 'application/json':
                 raise UpdateError(415, '请求需使用 JSON')
             body = json.loads(self.rfile.read(int(length)), object_pairs_hook=unique_json_object)
-            expected = {'/check': [set()], '/apply': [{'planId'}, {'planId', 'deployMode'}], '/token': [{'token'}]}[self.path]
+            expected = {'/check': [set()], '/apply': [{'planId'}, {'planId', 'deployMode'}, {'planId', 'scope'}, {'planId', 'deployMode', 'scope'}],
+                        '/token': [{'token'}]}[self.path]
             if not isinstance(body, dict) or set(body) not in expected:
                 raise UpdateError(400, '更新参数无效')
             if self.path == '/token':
                 self.answer(200, self.server.coordinator.set_token(body['token']))
             else:
-                result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(body['planId'], body.get('deployMode', 'source'))
+                result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(
+                    body['planId'], body.get('deployMode', 'source'), body.get('scope', 'full'))
                 self.answer(202, result)
         except UpdateError as error:
             self.answer(error.status, {'error': str(error)})

@@ -17,7 +17,7 @@ const state = (status = null) => ({ enabled: true, checking: false, checkedAt: s
   planId, expiresAt: stamp, modules: [], job: status ? { id: 'managed-update', status, startedAt: stamp,
     finishedAt: ['queued', 'running'].includes(status) ? null : stamp, activeModule: null, steps: [], message: '更新状态' } : null });
 
-function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 } = {}) {
+function fixture({ maintenance = false, pendingPlanId = null, pendingDeployMode = 'source', releasePollMs = 0, jobs = [], openEntries = 0 } = {}) {
   const persisted = { maintenance, pendingPlanId };
   const active = { crossex: null, greeks: null, aster: null }, events = [], handlers = {}, calls = [];
   let updaterState = state('running');
@@ -59,19 +59,22 @@ function fixture({ maintenance = false, pendingPlanId = null, releasePollMs = 0 
       return snapshot;
     },
     async check() { calls.push('check'); return structuredClone(updaterState); },
-    async apply(id, deployMode) {
-      calls.push('apply'); events.push('updater:apply'); assert.equal(id, planId);
-      assert.equal(persisted.maintenance, true, 'hub durable latch must precede updater submission');
-      assert.equal(persisted.pendingPlanId, planId);
-      if (handlers.apply) return handlers.apply(deployMode);
+    async apply(id, deployMode, scope = 'full') {
+      calls.push(scope === 'api' ? 'apply:api' : 'apply'); events.push('updater:apply'); assert.equal(id, planId);
+      if (scope === 'full') {
+        assert.equal(persisted.maintenance, true, 'hub durable latch must precede updater submission');
+        assert.equal(persisted.pendingPlanId, planId);
+      }
+      if (handlers.apply) return handlers.apply(deployMode, scope);
       return state('running');
     },
   };
-  const coordinator = createUpdateCoordinator({ client, execution: { state: () => ({ jobs: [] }), openEntries: () => 0, transaction: fn => fn() },
+  const coordinator = createUpdateCoordinator({ client, execution: { state: () => ({ jobs }), openEntries: () => openEntries, transaction: fn => fn() },
     readMaintenance: () => persisted.maintenance,
     writeMaintenance: value => { persisted.maintenance = value; events.push(`persist:maintenance:${value}`); },
     readPendingPlanId: () => persisted.pendingPlanId,
     writePendingPlanId: value => { persisted.pendingPlanId = value; events.push(`persist:plan:${value}`); },
+    readPendingDeployMode: () => pendingDeployMode,
     setModuleMaintenance: hooks.setModuleMaintenance, tradingModules: modules, moduleIds: ['monitor', 'asset', ...modules],
     prepareApply: async () => { events.push('prepare'); await hooks.prepareApply(); },
     releasePollMs,
@@ -453,4 +456,79 @@ test('a restarted trading module is released without a browser status read and s
   const events = closed.events.length;
   await closed.coordinator.resynchronize();
   assert.equal(closed.events.length, events, 'no module call after close');
+});
+
+// Design doc 6.5: a plan the updater forecast as API-only.
+const apiPlan = (status = null, scope = 'api') => {
+  const value = { ...state(status), planScopes: { source: 'full', ci: 'api' } };
+  if (value.job) value.job.scope = scope;
+  return value;
+};
+
+test('an api-scope plan is applied without trading maintenance, stop evidence or idle native execution', async () => {
+  const f = fixture({ jobs: [{ status: 'running' }], openEntries: 1 });
+  f.updaterState = apiPlan();
+  await f.coordinator.status();
+  const before = f.events.length;
+  f.handlers.apply = (mode, scope) => { assert.deepEqual([mode, scope], ['ci', 'api']); return apiPlan('queued'); };
+  assert.equal((await f.apply('ci')).job.scope, 'api');
+  assert.deepEqual(f.calls.filter(call => call.startsWith('apply')), ['apply:api']);
+  assert.deepEqual(f.events.slice(before), ['authorize', 'authorize', 'updater:apply'], 'no gate, stop evidence or durable write');
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  // The running job keeps the runtime writable, also for a restarted API reading it.
+  f.updaterState = apiPlan('running');
+  await f.coordinator.status();
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  assert.equal(await f.coordinator.withExecutionEntry(() => 'native', { scope: 'native' }), 'native');
+  assert.equal(await f.coordinator.withExecutionEntry(() => 'aster', { scope: 'aster' }), 'aster');
+  const restarted = fixture();
+  restarted.updaterState = apiPlan('running');
+  await restarted.coordinator.status();
+  assert.equal(restarted.persisted.maintenance, false);
+  // A job the updater runs in full still enters maintenance on observation.
+  f.updaterState = apiPlan('running', 'full');
+  await f.coordinator.status();
+  assert.equal(f.persisted.maintenance, true);
+});
+
+test('the full admission stays for source mode, other plans, legacy updaters and a pending plan', async t => {
+  await t.test('source mode of an api plan', async () => {
+    const f = fixture({ jobs: [{ status: 'running' }] });
+    f.updaterState = apiPlan(); await f.coordinator.status();
+    assert.throws(() => f.apply('source'), error => error.status === 409);
+    assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+    assert.equal(f.calls.some(call => call.startsWith('apply')), false);
+  });
+  await t.test('scopes of another plan or none reported', async () => {
+    for (const reported of [{ ...apiPlan(), planId: 'another-update-plan-1234' }, state(), { ...state(), planScopes: null }]) {
+      const f = fixture({ jobs: [{ status: 'running' }] });
+      f.updaterState = reported; await f.coordinator.status();
+      assert.throws(() => f.apply('ci'), error => error.status === 409);
+      assert.equal(f.calls.some(call => call.startsWith('apply')), false);
+    }
+  });
+  await t.test('pending plan', async () => {
+    // A timed-out full request may still be accepted: the retry keeps the full admission.
+    const f = fixture({ pendingPlanId: planId, pendingDeployMode: 'ci' });
+    f.updaterState = apiPlan(); await f.coordinator.status();
+    assert.equal(f.persisted.maintenance, true);
+    f.handlers.apply = (mode, scope) => { assert.deepEqual([mode, scope], ['ci', 'full']); return state('running'); };
+    await f.apply('ci');
+    assert.deepEqual(f.calls.filter(call => call.startsWith('apply')), ['apply']);
+    assert.ok(f.events.includes('prepare'));
+  });
+});
+
+test('an api-scope apply in flight leaves live entries open and a refusal changes nothing', async () => {
+  const f = fixture();
+  f.updaterState = apiPlan(); await f.coordinator.status();
+  const gate = deferred();
+  f.handlers.apply = async () => { await gate.promise; throw new UpdateError(409, '更新范围已改变，请重新检查'); };
+  const applying = f.apply('ci');
+  assert.equal(await f.coordinator.withExecutionEntry(() => 'native', { scope: 'native' }), 'native');
+  assert.throws(() => f.apply('source'), error => error.status === 409, 'another mode waits for the api request');
+  gate.resolve();
+  await assert.rejects(applying, error => error.status === 409);
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  assert.equal(f.events.some(value => value.startsWith('gate:') && value.includes(':true:')), false);
 });
