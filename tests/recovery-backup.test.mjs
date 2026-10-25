@@ -107,6 +107,25 @@ test('archive traversal, same encryption keys, hardlinks, limits and forged lock
   await assert.rejects(f.restore(),/UNSAFE_PATH/);
 });
 
+test('the runtime directory left by a killed runtime is not backed up, but a link in its place still fails', { skip: process.platform === 'win32' ? 'POSIX special files' : false }, async t => {
+  const f = await setup(t);
+  const run = path.join(f.source, 'run'), sockets = path.join(run, 'modules-AbC123');
+  fs.mkdirSync(sockets, { recursive: true, mode: 0o700 }); fs.chmodSync(run, 0o700);
+  fs.writeFileSync(path.join(run, 'runtime.json'), '{}', { mode: 0o600 });
+  // FIFOs stand in for the sockets: both are special files the walk refuses.
+  for (const file of [path.join(run, 'runtime-00000000-0000-4000-8000-000000000001.sock'), path.join(sockets, 'crossex-1.sock')]) assert.equal(spawnSync('mkfifo', ['-m', '600', file]).status, 0);
+  await createBackup(f.backupOptions);
+  const manifest = JSON.parse(fs.readFileSync(path.join(f.backupOptions.destination, 'manifest.json')));
+  assert.deepEqual(manifest.body.entries.filter(entry => entry.path === 'run' || entry.path.startsWith('run/')), []);
+  fs.rmSync(run, { recursive: true }); fs.symlinkSync(os.tmpdir(), run);
+  await assert.rejects(createBackup({ ...f.backupOptions, destination: f.backupOptions.destination + '-link' }), /UNSAFE_FILE/);
+  // Only the directory is the runtime's: a file of that name is backed up like any other.
+  fs.rmSync(run); fs.writeFileSync(run, 'kept', { mode: 0o600 });
+  await createBackup({ ...f.backupOptions, destination: f.backupOptions.destination + '-file' });
+  const files = JSON.parse(fs.readFileSync(path.join(f.backupOptions.destination + '-file', 'manifest.json'))).body.entries;
+  assert.deepEqual(files.filter(entry => entry.path === 'run').map(entry => entry.size), [4]);
+});
+
 test('missing or incorrect application credentials and unsupported registry schema keep recovery failed', async t => {
   const f=await setup(t); fs.writeFileSync(path.join(f.source,'credentials.key'),randomBytes(32)); await createBackup(f.backupOptions);
   await assert.rejects(f.restore(),/CREDENTIAL_VALIDATION_FAILED/);

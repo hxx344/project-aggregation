@@ -6,6 +6,7 @@ import { TRADING_NAMES } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL } from './control/execution-jobs.mjs';
+import { immediate } from './control/schema.mjs';
 
 const iso = time => new Date(time).toISOString();
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
@@ -47,7 +48,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     retired = true; leader = false;
     throw new ExecutionError(503, '执行服务已失去运行锁，请重启服务后核对任务');
   }
-  const transaction = operation => { db.exec('BEGIN IMMEDIATE'); try { const result = operation(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; } };
+  const transaction = operation => immediate(db, operation);
   const accountRow = exchange => {
     if (!EXECUTION_EXCHANGES.includes(exchange)) throw new ExecutionError(404, '交易所不存在');
     return stmt.prepare('SELECT * FROM execution_accounts WHERE exchange=?').get(exchange);

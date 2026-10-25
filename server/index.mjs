@@ -8,6 +8,7 @@ import { createAccountWriter } from './execution/account-writer.mjs';
 import { mkdirSync } from 'node:fs';
 import { acquireRuntimeLock } from './recovery/lifecycle-lock.mjs';
 import { assertRecoveryStartup } from './recovery/startup.mjs';
+import { logWriteWaits } from './sqlite-writes.mjs';
 
 const port = Number(process.env.PORT || 3100);
 const host = process.env.HOST || '127.0.0.1';
@@ -16,6 +17,7 @@ const dataDir = path.resolve(process.env.DATA_DIR || fileURLToPath(new URL('../.
 let app, modules, moduleStartup, accountWriter, runtimeLock, closing = false, shutdownPromise, exitCode = 0;
 let finishStartup;
 const startupFinished = new Promise(resolve => { finishStartup = resolve; });
+const stopWriteLog = logWriteWaits({ logger, role: 'workbench' });
 const writerContext = { databasePath: path.join(dataDir, 'execution-control.sqlite'), runtimeId: randomUUID() };
 function shutdown(code = 0) {
   exitCode = Math.max(exitCode, code); closing = true;
@@ -27,6 +29,7 @@ function shutdown(code = 0) {
     const workersClosed = Promise.allSettled([workerClose]);
     await startupFinished;
     const results = await Promise.allSettled([app?.close()]); results.push(...await workersClosed);
+    try { stopWriteLog(); } catch (error) { results.push({ status: 'rejected', reason: error }); }
     if (!app) { try { accountWriter?.close(); } catch (error) { results.push({ status: 'rejected', reason: error }); } }
     try { await runtimeLock?.close(); } catch (error) { results.push({ status: 'rejected', reason: error }); }
     for (const result of results) if (result.status === 'rejected') logger.error({ err: result.reason }, '关闭组件失败');

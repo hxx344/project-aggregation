@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync } from 'node:fs';
 import { moduleCatalog, moduleIds } from '../modules/catalog.mjs';
+import { isSqliteBusy, recordBusy, recordHold, recordWait } from '../sqlite-writes.mjs';
 
 export const MAX_PROJECTS = 30;
 const defaults = [
@@ -14,9 +15,14 @@ const defaults = [
 
 const TABLES = 'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY,json TEXT NOT NULL,credentials TEXT); CREATE TABLE IF NOT EXISTS snapshots (id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires); CREATE TABLE IF NOT EXISTS execution_entries (id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);';
 
+// Every write transaction on hub.sqlite: the wait for the lock and the time it is held count in server/sqlite-writes.mjs.
 export function immediate(db, fn) {
-  db.exec('BEGIN IMMEDIATE');
+  const started = performance.now();
+  try { db.exec('BEGIN IMMEDIATE'); } catch (error) { if (isSqliteBusy(error)) recordBusy(); throw error; }
+  const acquired = performance.now();
+  recordWait(acquired - started);
   try { const result = fn(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
+  finally { recordHold(performance.now() - acquired); }
 }
 
 // Every process that opens hub.sqlite creates the tables; the write lock serializes a concurrent first start.

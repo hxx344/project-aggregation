@@ -7,6 +7,7 @@ import { validateAuthOrigin } from '../adapters.mjs';
 import { assertRecoveryStartup } from '../recovery/startup.mjs';
 import { acquireLifecycleLock } from '../recovery/lifecycle-lock.mjs';
 import { openHubDatabase, seedProjects } from '../control/schema.mjs';
+import { logWriteWaits } from '../sqlite-writes.mjs';
 import { createControlStore } from '../control/store.mjs';
 import { createProjectCatalog } from '../control/projects.mjs';
 import { ensurePassword } from '../control/password.mjs';
@@ -32,10 +33,11 @@ export async function startApi({ dataDir, logger = defaultLogger, signal, fail =
   // Each step checks the lock too: a lost lock may already let a recovery tool in.
   const stopped = () => { lock.assertHeld(); if (signal?.aborted) throw new Error('API 启动已中止'); };
   let db = null, api = null, lock = null, closing = null;
+  const stopWriteLog = logWriteWaits({ logger, role: 'api' });
   function close() {
     return closing ??= (async () => {
       const results = [];
-      for (const action of [() => api?.close(), () => api?.closeServer(), () => db?.close(), () => lock?.close()]) { try { await action(); } catch (error) { results.push(error); } }
+      for (const action of [() => api?.close(), () => api?.closeServer(), stopWriteLog, () => db?.close(), () => lock?.close()]) { try { await action(); } catch (error) { results.push(error); } }
       if (results.length) throw new AggregateError(results, 'API 关闭失败');
     })();
   }

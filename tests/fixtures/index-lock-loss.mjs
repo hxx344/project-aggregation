@@ -21,6 +21,7 @@ const imports = {
   'node:path': { default: path }, 'node:url': { fileURLToPath }, 'node:crypto': { randomUUID }, 'node:fs': { mkdirSync() {} },
   './execution/account-writer.mjs': { createAccountWriter: () => ({ close() { events.push('authority-close'); } }) },
   './recovery/startup.mjs': { assertRecoveryStartup() {} },
+  './sqlite-writes.mjs': { logWriteWaits: () => () => {} },
   './recovery/lifecycle-lock.mjs': { acquireRuntimeLock: async options => { onLost = options.onLost; return { assertHeld() { if (lost) throw new Error('lost'); }, close: async () => events.push('lock-close') }; } },
   './modules/runtime.mjs': { startModules: async options => {
     events.push('workers-starting'); options.onStarting(control); onModuleReady = options.onModuleReady;

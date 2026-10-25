@@ -13,6 +13,10 @@ import { tradingModules } from '../server/modules/updates.mjs';
 import { dataPlaneOptions, fakeModules } from './fixtures/split-modules.mjs';
 import { unavailableUpdateState } from '../server/updates.mjs';
 import { acquireLifecycleLock, acquireRecoveryLocks } from '../server/recovery/lifecycle-lock.mjs';
+import { DatabaseSync } from 'node:sqlite';
+import { writeWaitStats } from '../server/sqlite-writes.mjs';
+import { DATABASE_BUSY } from '../server/http-common.mjs';
+import { EXECUTION_MAINTENANCE } from '../server/control/execution-jobs.mjs';
 
 // The runtime and the API as separate processes (design doc 3.1), over the
 // fixture entries in tests/fixtures/split-*.mjs. POSIX only: the runtime lock
@@ -152,6 +156,65 @@ test('an API that outlives its runtime reports it unavailable, then reaches the 
   assert.ok(await until(async () => await calls() >= 1), 'maintenance synchronized after the instance change');
   runtime.child.kill('SIGTERM');
   assert.deepEqual(await runtime.exited, { code: 0, signal: null }, runtime.stderr());
+});
+
+test('over the socket, execution entries keep the runtime\'s 409 and 503 and outlive a crashed API', { skip, timeout: 90_000 }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const quiet = { info() {}, debug() {}, warn() {}, error() {} };
+  // Every exchange call of the runtime waits while `gate` is set.
+  let gate = null;
+  const executionClientFactory = () => Object.fromEntries(['verify', 'account', 'market', 'create', 'inspect', 'stop'].map(method => [method, async () => {
+    await gate?.promise;
+    return method === 'verify' ? { identity: null } : { identity: null, modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] };
+  }]));
+  const modules = fakeModules(path.join(dataDir, 'modules'));
+  const runtime = await startRuntime({ dataDir, logger: quiet, env, startModules: modules.startModules, dataPlaneOptions: { ...dataPlaneOptions, executionClientFactory } });
+  // Closing drains the held operation, so a failed assertion releases it first.
+  t.after(() => { gate?.resolve(); return runtime.close(); });
+  const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
+  t.after(() => db.close());
+  const entries = () => db.prepare('SELECT COUNT(*) AS count FROM execution_entries').get().count;
+  const setMaintenance = value => db.prepare("INSERT INTO settings(key,value) VALUES ('updates-maintenance',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(value);
+  const connect = c => c.request('/api/trading/execution/accounts/binance', { method: 'PUT', body: { revision: 0, accountMode: 'standard', apiKey: 'fixture_key_split', apiSecret: 'fixture_secret_split' } });
+
+  const first = spawnFixture(t, 'split-api.mjs', env);
+  const { port } = await first.next('ready'), c = client(port);
+  await c.login();
+  // Another process committed maintenance the API has not seen: the runtime refuses, and the API keeps its reply.
+  setMaintenance('1');
+  const refused = await connect(c);
+  assert.equal(refused.status, 409, refused.text); assert.equal(refused.data.error, EXECUTION_MAINTENANCE);
+  setMaintenance('0');
+
+  // A write lock held past busy_timeout (5 s) is a retryable 503 in either process. The runtime
+  // runs in this process, so its wait blocks this thread while the API process waits beside it.
+  // Only the two requests write meanwhile: `dataPlaneOptions` turns the runtime's background writes off.
+  const { busy: busyBefore, busyReplies: repliesBefore } = writeWaitStats();
+  db.exec('BEGIN IMMEDIATE');
+  let busy;
+  try { busy = await Promise.all([connect(c), client(port).request('/api/login', { method: 'POST', body: { password } })]); }
+  finally { db.exec('ROLLBACK'); }
+  for (const reply of busy) { assert.equal(reply.status, 503, reply.text); assert.equal(reply.data.error, DATABASE_BUSY); }
+  assert.ok(writeWaitStats().busy > busyBefore, 'the runtime counted its write that ran out of busy_timeout');
+  assert.equal(writeWaitStats().busyReplies - repliesBefore, 1, 'the runtime counted its 503; the API, another process, counts the login');
+  assert.equal(entries(), 0);
+
+  // An entry the runtime still runs blocks an update from the next API, which never saw it.
+  gate = Promise.withResolvers();
+  // The API dies with this request open; its reply is lost, not the runtime's work.
+  const lost = connect(c).then(() => null, error => error);
+  assert.ok(await until(() => entries() === 1), 'the runtime recorded the entry');
+  first.child.kill('SIGKILL'); await first.exited;
+  assert.equal((await lost)?.code, 'ECONNRESET');
+  const second = spawnFixture(t, 'split-api.mjs', env);
+  const d = client((await second.next('ready')).port, c.session);
+  const blocked = await d.request('/api/system/updates/apply', { method: 'POST', body: { planId: 'plan-split-process-entry' } });
+  assert.equal(blocked.status, 409, blocked.text); assert.equal(blocked.data.error, '请先停止所有实盘任务并完成委托核对，再更新系统');
+  gate.resolve();
+  assert.ok(await until(() => entries() === 0), 'the entry ends with the operation in the runtime');
+  second.child.kill('SIGTERM');
+  assert.deepEqual(await second.exited, { code: 0, signal: null }, second.stderr());
+  await runtime.close();
 });
 
 test('a runtime directory too long for the runtime socket fails before any module starts', { skip }, async t => {

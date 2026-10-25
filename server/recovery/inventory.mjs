@@ -126,9 +126,11 @@ export function inventory(dataDir, limits) {
     if (depth > 32) throw new Error('RECOVERY_DEPTH_EXCEEDED');
     for (const name of fs.readdirSync(directory).sort()) {
       limits.check(); const relative = prefix ? prefix + '/' + name : name; safeRelative(relative);
-      const filename = path.join(directory, name); safePath(filename); const info = fs.lstatSync(filename);
       // Links and special files are rejected even if their names normally would be excluded.
-      if (excluded(relative)) continue;
+      const filename = path.join(directory, name); safePath(filename); const info = fs.lstatSync(filename);
+      // The top-level `run` directory is the runtime directory (server/runtime/protocol.mjs):
+      // discovery record and sockets of the runtime and its modules, rebuilt at every start.
+      if (excluded(relative) || relative === 'run' && info.isDirectory()) continue;
       if (info.isDirectory()) {
         if (prefix === 'modules' && !MODULES.includes(name)) throw new Error('RECOVERY_UNKNOWN_MODULE');
         walk(filename, relative, depth + 1);
