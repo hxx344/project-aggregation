@@ -27,6 +27,7 @@ sed -e "s|/opt/$service|$fixture/application|g" \
     -e "s|/var/lib/$service|$fixture/data|g" \
     -e "s|/etc/$service.env|$fixture/environment|g" \
     -e "s|/etc/systemd/system/$service.service|$fixture/unit|g" \
+    -e "s|/etc/systemd/system/$service-api.service|$fixture/api-unit|g" \
     -e "s|/run/lock/$service-install.lock|$fixture/install.lock|g" \
     -e "s|/run/systemd/system|$fixture|g" "$repository/deploy/install.sh" > "$fixture/installer.sh"
 cat > "$fixture/runtime/node" <<'NODE'
@@ -77,12 +78,14 @@ if [[ "${FRESH_INSTALL:-0}" == 1 ]]; then
   APP_DIR="$FIXTURE_ROOT/fresh-application"
   ENV_FILE="$FIXTURE_ROOT/fresh-environment"
   UNIT_FILE="$FIXTURE_ROOT/fresh-unit"
+  API_UNIT_FILE="$FIXTURE_ROOT/fresh-api-unit"
 fi
 ensure_tools() { :; }
 validate_embedded_runtime() { :; }
 prepare_greeks_runtime() { :; }
 prepare_aster_runtime() { :; }
 migrate_embedded_modules() { :; }
+migration_settled() { [[ ! -f "$FIXTURE_ROOT/migration-pending" ]]; }
 ensure_node() { NODE_BIN="$FIXTURE_ROOT/runtime/node"; }
 ensure_pnpm() { [[ "$PROJECT_DEPLOY_MODE" == source ]] || { echo "Unexpected pnpm preparation" >&2; return 92; }; PNPM_BIN="$FIXTURE_ROOT/runtime/pnpm"; }
 run_as_service() { "$@"; }
@@ -91,11 +94,21 @@ systemctl() {
   case "$1" in
     is-active) [[ -f "$FIXTURE_ROOT/running-port" ]] ;;
     restart)
-      if [[ $(read_setting PORT 0) == 4999 ]]; then rm -f "$FIXTURE_ROOT/running-port"
-      else read_setting PORT 0 > "$FIXTURE_ROOT/running-port"; fi ;;
+      # fail-api fails the next API restart once.
+      if [[ $(read_setting PORT 0) == 4999 || ( $2 == *-api && -f "$FIXTURE_ROOT/fail-api" ) ]]; then
+        rm -f "$FIXTURE_ROOT/running-port" "$FIXTURE_ROOT/fail-api"
+      else
+        read_setting PORT 0 > "$FIXTURE_ROOT/running-port"
+        # The runtime runs the release current pointed to when its unit started.
+        [[ $2 != "$SERVICE" ]] || printf '%s\n' "$(readlink "$APP_DIR/current")" > "$FIXTURE_ROOT/runtime-cwd-${APP_DIR##*/}"
+      fi ;;
     stop) rm -f "$FIXTURE_ROOT/running-port" ;;
     *) return 0 ;;
   esac
+}
+live_runtime_release() {
+  [[ -f "$FIXTURE_ROOT/running-port" && -f "$FIXTURE_ROOT/runtime-cwd-${APP_DIR##*/}" ]] || return 1
+  managed_release "$(cat "$FIXTURE_ROOT/runtime-cwd-${APP_DIR##*/}")"
 }
 curl() {
   local url='' output='' argument
@@ -116,7 +129,10 @@ curl() {
       *) return 23 ;;
     esac
   else
-    [[ -f "$FIXTURE_ROOT/running-port" && "$url" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/health" ]]
+    # Two units answer on /api/ready, one unit on /api/health.
+    local expected=/api/health
+    [[ ! -f "$API_UNIT_FILE" ]] || expected=/api/ready
+    [[ -f "$FIXTURE_ROOT/running-port" && "$url" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")$expected" ]]
   fi
 }
 ci_release_download() {
@@ -141,13 +157,14 @@ expect_counts() {
 }
 
 make_package() {
-  python3 - "$fixture" "$service" "$1" <<'PACKAGE'
+  python3 - "$fixture" "$service" "$1" "${2:-$1}" <<'PACKAGE'
 import hashlib, io, json, subprocess, sys, tarfile
 from pathlib import Path
 root = Path(sys.argv[1])
 commit = subprocess.check_output(['git', '-C', str(root / 'source'), 'rev-parse', 'HEAD'], text=True).strip()
 key = hashlib.sha256(sys.argv[3].encode()).hexdigest()
 contents = {'.release-commit': commit, '.release-application-key': key,
+            '.release-runtime-key': hashlib.sha256(('runtime:' + sys.argv[4]).encode()).hexdigest(),
             'server/app.mjs': 'export {};', 'server/index.mjs': 'export {};', 'server/launcher.mjs': 'export {};',
             'server/runtime/main.mjs': 'export {};', 'server/api/main.mjs': 'export {};',
             'package.json': '{"type":"module"}', 'dist/index.html': '<html>' + sys.argv[3] + '</html>',
@@ -236,4 +253,58 @@ expect_counts 1 1 0 1 7
 [[ -f "$fixture/fresh-application/current/.install-ready" && -f "$fixture/fresh-environment" ]]
 FRESH_INSTALL=1 run_install
 expect_counts 1 1 0 1 7
-printf 'CI package migration, no-op, content identity, corruption and rollback checks passed.\n'
+
+# Design doc 6.2: with the same runtime component only the API restarts, and the
+# runtime keeps its release until a full restart.
+new_calls() { tail -n "+$((calls + 1))" "$fixture/systemctl.calls"; }
+api_only() { new_calls | grep -qx "restart $service-api" && ! new_calls | grep -Eq "^(restart|stop) $service\$"; }
+full_restart() { new_calls | grep -qx "restart $service"; }
+live() { cat "$fixture/runtime-cwd-application"; }
+[[ -f "$fixture/api-unit" && -f "$fixture/application/.runtime-deployment" && $(live) == "$third" ]]
+grep -q '^ExecStart=.*/server/runtime/main.mjs$' "$fixture/unit"
+grep -q '^ExecStart=.*/server/api/main.mjs$' "$fixture/api-unit"
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo page >> "$fixture/source/src/app.ts"; commit_source page
+make_package page next
+run_install
+fourth=$(readlink "$fixture/application/current")
+[[ "$fourth" != "$third" && $(live) == "$third" ]]
+api_only
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo page >> "$fixture/source/src/app.ts"; commit_source page-two
+make_package page-two next
+run_install
+fifth=$(readlink "$fixture/application/current")
+[[ "$fifth" != "$fourth" && -d "$third" && -d "$fourth" ]] # Pruning keeps the runtime's release.
+api_only
+# A failed API-only activation returns only the API to the earlier release.
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo page >> "$fixture/source/src/app.ts"; commit_source page-three
+make_package page-three next
+touch "$fixture/fail-api"
+if run_install; then echo 'Unhealthy API accepted' >&2; exit 1; fi
+[[ $(readlink "$fixture/application/current") == "$fifth" && $(live) == "$third" ]]
+[[ $(new_calls | grep -cx "restart $service-api") == 2 ]]
+api_only
+# Outstanding module migration and changed runtime code both restart the two units.
+calls=$(wc -l < "$fixture/systemctl.calls")
+touch "$fixture/migration-pending"
+run_install
+full_restart
+rm "$fixture/migration-pending"
+sixth=$(readlink "$fixture/application/current")
+[[ $(live) == "$sixth" && -f "$fixture/application/.runtime-deployment" ]]
+# A changed environment file restarts both units.
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo page >> "$fixture/source/src/app.ts"; commit_source page-four
+make_package page-four next
+printf 'EXTRA_SETTING=1\n' >> "$fixture/environment"
+run_install
+full_restart
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo changed >> "$fixture/source/server/index.mjs"; commit_source runtime
+make_package runtime runtime-two
+run_install
+full_restart
+[[ $(live) == "$(readlink "$fixture/application/current")" ]]
+printf 'CI package migration, no-op, content identity, corruption, rollback and activation scope checks passed.\n'

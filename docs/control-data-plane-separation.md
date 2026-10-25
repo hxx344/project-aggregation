@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `647bfa49e8ea091733a0950357e760b90c3a8b79` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3、11、15 节中的 M3 生命周期批次 |
 | 适用范围 | `server/`、`modules/crossex/server/`、`deploy/`、`server/update-service/`、`server/recovery/` 与相关测试 |
-| 设计状态 | 评审稿；P0、P1-1 与 P1-2 已发布（实现差异见第 9 节），P1-3 分三步（P1-3a 进程内组合、P1-3b 数据面 UDS 链路、P1-3c 进程入口与启动器）均已发布，P1-4 分四步实施（P1-4a 执行入口串行化、P1-4b 第二把锁、P1-4c SSE 计数上报与模块世代已发布，P1-4d 分两步：P1-4d-1 切换前置项已发布，P1-4d-2 生产入口切换在分支实施），P2、P2b 尚未实施；新增参数为初始设计值 |
+| 设计状态 | 评审稿；P0、P1-1 与 P1-2 已发布（实现差异见第 9 节），P1-3 分三步（P1-3a 进程内组合、P1-3b 数据面 UDS 链路、P1-3c 进程入口与启动器）均已发布，P1-4 分四步实施（P1-4a 执行入口串行化、P1-4b 第二把锁、P1-4c SSE 计数上报与模块世代已发布，P1-4d 分两步：P1-4d-1 切换前置项与 P1-4d-2 生产入口切换均已发布），P2-1 与 P2-2 在同一分支分两次提交实施、合并后一起发布，P2b 尚未实施；新增参数为初始设计值 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 10 节，除一个 R2 批次外均为 R3 |
 | 读者 | 工作台与内置模块开发者、审查者、部署维护者 |
 
@@ -483,7 +483,7 @@ ReadWritePaths=$DATA_PATH
 ```
 
 - `PartOf=` 使 `systemctl stop project-aggregation` 和 `systemctl restart project-aggregation` 同时作用于 API，运维命令的含义不变。依赖是单向的：API 自身的停止和重启不影响运行时。
-- systemd 自动重启失败的服务时使用 restart 作业，预计也会经 `PartOf=` 带动 API 重启。运行时崩溃时 API 随之重启，与现状的整站重启相当；以 CI 实测为准。
+- systemd 自动重启失败的服务时使用 restart 作业，也会经 `PartOf=` 带动 API 重启（P2-1 的 CI 实测：运行时被 `SIGKILL` 后 API 换了新进程）。运行时崩溃时 API 随之重启，与现状的整站重启相当。
 - 运行时单元的 `Wants=` 在启动时拉起 API，API 单元无需单独 `enable`。API 不等待运行时就绪，就绪状态由 `/api/ready` 反映。
 - API 单元的 `TimeoutStopSec` 取 60 s 请求上限加排空余量。
 - API 以同一服务用户运行，按组权限访问更新服务 socket（`server/updates.mjs:3`、`server/update-service/updater.py:754-767`），更新服务无需修改。
@@ -517,7 +517,7 @@ ReadWritePaths=$DATA_PATH
 
 - 只重启 API 时，运行时继续运行旧版本目录中的代码。运行时用 `import.meta.url` 定位仓库根（`runtime.mjs:11`），而 Node 默认把入口解析为真实路径，所以之后按模块重启时仍从旧版本目录启动，不会跟随新的 `current`。实施时用测试固定这一行为，并确认没有启用 `--preserve-symlinks-main`。
 - 运行时之后若因崩溃从新的 `current` 重启，由于两版的 `runtime_component_key` 相同，运行的仍是同一份代码。
-- 每次整体重启后原子记录 `$APP_DIR/.runtime-release`。`prune_releases` 除当前和上一版本外，还要保留该记录指向的版本，否则连续两次只改 API 的更新会删掉运行时正在使用的目录。
+- 运行时实际所在的版本从运行时单元的进程读取：单元的 `WorkingDirectory=$APP_DIR/current` 在启动时解析为版本目录，所以 `/proc/<MainPID>/cwd` 就是它运行的版本，安装器之外的重启（崩溃、手动 `systemctl restart`）也会如实反映。`prune_releases` 除当前和上一版本外还保留这个版本，否则连续两次只改 API 的更新会删掉运行时正在使用的目录；运行时在运行但无法确认版本时，本次不清理旧版本。
 - Python 虚拟环境按依赖锁、Python 版本与架构的指纹存放（`install.sh:2249-2250`、`:2295-2296`），不随发布目录变化。依赖锁位于 `modules/` 下，属于 `runtime_component_key`；只改 API 时指纹不变，准备步骤直接复用已有环境，不影响运行中的模块。
 
 **健康检查与回滚**
@@ -531,7 +531,7 @@ ReadWritePaths=$DATA_PATH
 ### 6.3 更新服务登记
 
 - `registry.py` 的 hub 条目改为描述两个单元：逐个校验 `WorkingDirectory`、`User`、唯一 `ExecStart` 和受管标记，身份摘要包含两个单元的文本。
-- drop-in 规则改为：运行时单元只允许 `20-recovery-guard.conf`，且首行必须是 `operations.py:129` 写入的 `# Managed by project-aggregation recovery`；API 单元不允许任何 drop-in；其他情况仍判为未受管。
+- drop-in 规则改为：两个单元都只允许 `/etc/systemd/system/<单元>.service.d/20-recovery-guard.conf`，内容与 `operations.guard_dropin()` 写出的逐字一致；其他情况仍判为未受管（实施时由「只允许运行时单元、只查首行」收紧，见第 8 节 P2-2 行）。
 - 保留 `deploy/test-updater.py:168-170` 的自定义 drop-in 用例，新增「受管 guard 放行」和「伪造 guard 拒绝」用例。
 - 成功回执覆盖两个单元，对应上位文档第 11.3 节。
 
@@ -539,7 +539,7 @@ ReadWritePaths=$DATA_PATH
 
 - `operations.py` 改为管理两个单元。停止时显式停止两个单元，不依赖 `PartOf=`；`require_stopped` 要求两个单元都不在运行、`MainPID` 为 0、两个 cgroup 都已清空；结束后启动运行时单元，由 `Wants=` 拉起 API。
 - `deployment()` 中的 `ExecStart` 匹配（`:69`）改为运行时入口。`operations.py` 随发布版本更新，与同版本安装器写出的单元一致；恢复入口同时持有栈锁和安装锁（`:21-22`、`:234`），安装器持有同一把安装锁（`install.sh:2398-2399`），两者不会交叉进行。
-- `install_guard` 只为运行时单元安装 drop-in，也只检查该单元的 `DropInPaths`（`:132-134`）。API 进程启动时自行调用 `assertRecoveryStartup`。
+- `install_guard` 为两个单元安装同一份 drop-in，写入前先检查两个单元的 `DropInPaths`。API 进程启动时另外自行调用 `assertRecoveryStartup`。
 - 同步更新 `tests/test_recovery_operations.py` 和 [备份与恢复](backup-recovery.md) 中关于服务组的描述。
 
 ### 6.5 P2b：按范围的更新准入（可选）
@@ -556,7 +556,7 @@ P2 中只改 API 的更新仍要经过完整的交易维护与停机准入，只
 
 | 文件 | 改动 |
 | --- | --- |
-| `deploy/install.sh` | 两个单元、组件键、激活决策、`.runtime-release`、清理保护、健康检查与回滚、密码提示 |
+| `deploy/install.sh` | 两个单元、组件键、激活决策、运行版本读取与 `.runtime-deployment`、清理保护、健康检查与回滚、密码提示 |
 | `deploy/package-release.py` | 写出组件键 |
 | `server/update-service/registry.py`、`server/update-service/updater.py` | 双单元登记、受管 guard 放行、回执覆盖两个单元 |
 | `server/recovery/operations.py` | 双单元停止、核对与启动 |
@@ -575,7 +575,7 @@ P2 中只改 API 的更新仍要经过完整的交易维护与停机准入，只
 
 ### 6.8 回滚
 
-回滚到拆分前的版本时，安装器恢复单一单元并删除 API 单元，持久数据不回滚。恢复 guard 位于运行时单元的 drop-in 目录，服务名未变，回滚后继续生效。
+回滚到拆分前的版本时，安装器恢复单一单元并删除 API 单元，持久数据不回滚。运行时单元的恢复 guard 位于其 drop-in 目录，服务名未变，回滚后继续生效；API 单元的 guard 目录 `project-aggregation-api.service.d/` 会留下，没有单元文件时它不起作用，可手动删除。
 
 ## 7 故障处理矩阵
 
@@ -585,7 +585,7 @@ P2 中只改 API 的更新仍要经过完整的交易维护与停机准入，只
 | 模块持续崩溃 | 整站反复重启 | 5 次后该模块进入 `fault`，其余功能正常；模块页面提供重新启动。交易模块处于 `fault` 时停机准入失败关闭，网页更新须先人工恢复，或改用命令行部署 | 同 P0 | 同 P0 |
 | 模块首次启动失败 | 整站启动失败 | 不变 | 运行时启动失败，启动器退出 | 运行时单元失败，API 显示运行时不可用 |
 | API 进程崩溃 | 等同整站崩溃 | 不变 | 启动器重启 API，数据面持续运行 | systemd 重启 API，数据面持续运行 |
-| 运行时进程崩溃 | 等同整站崩溃 | 不变 | 整个单元重启 | 运行时重启，API 预计经 `PartOf=` 一并重启（待实测） |
+| 运行时进程崩溃 | 等同整站崩溃 | 不变 | 整个单元重启 | 运行时重启，API 经 `PartOf=` 一并重启（CI 实测） |
 | 只改 API 的更新 | 整站重启，原生任务须先终结 | 不变 | 不变 | 只重启 API，模块和采集持续；P2b 之前仍需交易维护和原生任务终结 |
 | 生命周期锁失效 | 整站退出 | 不变 | 持锁进程退出；若是运行时则整个单元重启 | 对应单元退出并重启 |
 | 更新应用期间模块重启 | 不会发生（模块退出即整站退出） | 新实例保持维护，停机准入失败关闭 | 同 P0 | 同 P0 |
@@ -646,10 +646,12 @@ v1.1 文档同步的本地检查仅做提交差异、当前源码和引用核对
 | P1-3c 的启动器取值 | 3.1 节只规定 1 至 30 s 退避 | API 重启退避 1、2、4、8、16、30 s，实例就绪后稳定运行 60 s 才清零；API 60 s 内未就绪或停止时 30 s 内未退出即强制结束。运行时的启动与停止不设期限，交给 systemd 的超时。API 反复启动失败时启动器按上限 30 s 无限重试、每次记录错误日志，不自行退出：退出会连带停止运行时与交易模块。启动顺序固定为运行时先就绪：运行时创建数据目录与凭据密钥，API 入口在密钥缺失时拒绝启动，避免先建出 `hub.sqlite` 后运行时因缺少密钥无法启动 |
 | P1-3c 遗留到 P1-4 的项 | 第 5 节 | 运行时入口拿不到 API 的 SSE 连接数，基线不写样本，并以 `lastError.code = 'sse_unavailable'` 说明原因，P1-4c 的 SSE 计数上报后恢复；模块 worker 的 socket 仍在系统临时目录下由 `startModules` 创建，P1-4c 迁入运行目录；双进程测试（`tests/process-split.test.mjs`）覆盖启动、转发、Portal、API 崩溃重启与会话保留、运行时退出、有序停止与发现文件清理、运行时换实例后的恢复与重新同步、交易模块未确认时 API 仍能启动、重启模块的同步重试，模块 worker 用替身；`tests/launcher.test.mjs` 覆盖就绪超时、退避中停止、运行时无法启动、强制结束后的退出码，以及进程入口在启动中收到信号或 `fail()`、就绪后 `fail()`、关闭失败时的退出码；快照更新时间与原生执行租约持有者不变的断言随 P1-4 切换生产入口时补上 |
 | P1-4 的拆分 | 10 节把串行化、第二把锁、恢复工具与 SSE 上报列为一个批次 | P1-4a：原生执行入口串行化（见「原生执行写入口的准入顺序」）。P1-4b：`.api.lock` 共享锁、`lifecycle_lock.py` 的锁名与模式参数、恢复 CLI 取双锁。P1-4c：`/internal/v1/api-stats` 的 SSE 计数上报与过期跳过、模块 socket 迁入运行目录、运行时上报模块世代以纠正 API 的维护确认。P1-4d 再分两步：P1-4d-1 为切换前置项（恢复清单排除运行目录、SQLITE_BUSY 改为 503 与写等待统计、两条双进程用例）；P1-4d-2 为 `server/index.mjs` 改为调用启动器、`setup.mjs` 与安装器导入校验、5.10 节的退出条件测试。每步单独发布；P1-4d 之前生产入口仍是单进程 `createApp`。`setup.mjs` 在 P1-1 已只组合控制面，P1-4d-2 无需改动 |
-| P1-4d-2 的服务入口 | 5.1、5.10 节 | `server/index.mjs` 在 POSIX 上调用 `runLauncher()`（`server/launcher.mjs`）；原单进程入口改名为 `server/workbench.mjs`，供 Windows（双进程只在 POSIX 测试）、浏览器测试夹具（`--import` 会被子进程继承）和 `pnpm dev:server`（`--watch` 只跟踪启动器自身的文件）使用。systemd 停止单元时向 cgroup 内所有进程发 SIGTERM，启动器随后再向子进程发一次：入口与启动器都改为重复信号不回落到默认动作，等待 `close()` 完成；停止期间子进程因启动器的 SIGTERM 结束（例如尚未注册处理器）记为正常停止，与 systemd 对主进程的判定一致，被 SIGKILL 仍记为失败。安装器与工作区测试的导入校验覆盖 `app.mjs`、`launcher.mjs`、`runtime/main.mjs`、`api/main.mjs`，只导入不启动。运行时 socket 首次放在 `DATA_DIR/run` 下，完整路径受 100 字节上限约束，安装器在激活前检查运行目录（`check_runtime_dir`）：`DATA_DIR` 按配置值（运行时绑定的就是未解析符号链接的路径）不超过 46 字节；服务单元只能写入 `DATA_DIR`，配置中的 `WORKBENCH_RUNTIME_DIR` 被拒绝，P2 的 `RuntimeDirectory` 再重新考虑运行目录位置。这样避免升级后运行时反复启动失败。`read_setting` 只识别紧凑的 `KEY=value` 行，键前或等号两侧带空白的写法 systemd 会接受而安装器读不到，这是既有限制；恢复工具切换数据目录时不做这一检查。启动器在启动子进程前校验 `PORT` 与 `PUBLIC_ORIGIN`，无效时以 1 退出：systemd 按 `RestartSec` 重启整个单元，运行时也不启动，而不是运行时照常运行、API 无限重启。Portal 的 ticket 与 grant 保存在 API 内存（`server/portal.mjs`），按第 1 节持久授权属于 M4：API 重启后已打开的模块页面得到 401「请从工作台重新打开」，从工作台重新载入即可，Hub 会话（存于 Hub 库）不受影响。包验收（`scripts/verify-embedded.mjs`）在 Linux 上以真实五个模块运行服务入口：杀掉 API 后运行时 pid 与模块状态行不变、会话保留、旧授权为 401、重新打开的页面可用，采集继续、原生执行租约由原持有者续期；向整个进程组发 SIGTERM（同 systemd）后单元以 0 退出并清理发现记录。systemd 还会向模块 worker 发信号，包验收未覆盖这一点 |
+| P1-4d-2 的服务入口 | 5.1、5.10 节 | `server/index.mjs` 在 POSIX 上调用 `runLauncher()`（`server/launcher.mjs`）；原单进程入口改名为 `server/workbench.mjs`，供 Windows（双进程只在 POSIX 测试）、浏览器测试夹具（`--import` 会被子进程继承）和 `pnpm dev:server`（`--watch` 只跟踪启动器自身的文件）使用。systemd 停止单元时向 cgroup 内所有进程发 SIGTERM，启动器随后再向子进程发一次：入口与启动器都改为重复信号不回落到默认动作，等待 `close()` 完成；停止期间子进程因启动器的 SIGTERM 结束（例如尚未注册处理器）记为正常停止，与 systemd 对主进程的判定一致，被 SIGKILL 仍记为失败。安装器与工作区测试的导入校验覆盖 `app.mjs`、`launcher.mjs`、`runtime/main.mjs`、`api/main.mjs`，只导入不启动。运行时 socket 首次放在 `DATA_DIR/run` 下，完整路径受 100 字节上限约束，安装器在激活前检查运行目录（`check_runtime_dir`）：`DATA_DIR` 按配置值（运行时绑定的就是未解析符号链接的路径）不超过 46 字节；服务单元只能写入 `DATA_DIR`，配置中的 `WORKBENCH_RUNTIME_DIR` 被拒绝。这样避免升级后运行时反复启动失败。P2-1 把服务的运行目录移到 `/run/project-aggregation` 后去掉了长度检查，见「P2-1 的双单元与按范围激活」。`read_setting` 只识别紧凑的 `KEY=value` 行，键前或等号两侧带空白的写法 systemd 会接受而安装器读不到，这是既有限制；恢复工具切换数据目录时不做这一检查。启动器在启动子进程前校验 `PORT` 与 `PUBLIC_ORIGIN`，无效时以 1 退出：systemd 按 `RestartSec` 重启整个单元，运行时也不启动，而不是运行时照常运行、API 无限重启。Portal 的 ticket 与 grant 保存在 API 内存（`server/portal.mjs`），按第 1 节持久授权属于 M4：API 重启后已打开的模块页面得到 401「请从工作台重新打开」，从工作台重新载入即可，Hub 会话（存于 Hub 库）不受影响。包验收（`scripts/verify-embedded.mjs`）在 Linux 上以真实五个模块运行服务入口：杀掉 API 后运行时 pid 与模块状态行不变、会话保留、旧授权为 401、重新打开的页面可用，采集继续、原生执行租约由原持有者续期；向整个进程组发 SIGTERM（同 systemd）后单元以 0 退出并清理发现记录。systemd 还会向模块 worker 发信号，包验收未覆盖这一点 |
 | P1-4b 的生命周期锁 | 5.7 节 | `lifecycle_lock.py` 的锁名只允许 `runtime`（`.runtime.lock`）与 `api`（`.api.lock`），模式只允许 `exclusive` 与 `shared`，命令行以 `--name=`、`--mode=` 传入，每项至多一次；Windows 共享锁只去掉 `LOCKFILE_EXCLUSIVE_LOCK`，POSIX 用 `LOCK_SH`，都以非阻塞方式反复尝试直到超时。`runtime` 只能排他：共享的运行时锁会放两个运行时同时运行，两侧都拒绝该组合。助手忽略 SIGINT 与 SIGTERM（持锁期间仍会因父进程关闭 stdin 或退出、锁校验失败而释放，SIGKILL 等其他信号照常结束它），所以服务停止或 Ctrl+C 发给整组进程时，锁不会先于数据库关闭而释放，正常停止也不会被报成锁失效；代价是父进程在等锁期间退出时，助手要到等锁超时（默认 5 s）才退出。`server/recovery/lifecycle-lock.mjs` 新增 `acquireLifecycleLock`（按锁名与模式）与 `acquireRecoveryLocks`：先取 `.runtime.lock`、再取 `.api.lock`，都为排他，任一失败即释放已取得的锁并抛出原错误；返回前再确认两把锁仍有效（取第二把锁期间第一把可能失效），关闭时按取得的逆序逐个释放。任一把失效时恢复锁的 `onLost` 只通知一次。`assertLifecycleLock` 只接受两把锁组成的恢复锁，单独的运行时锁视为 `RUNTIME_LOCK_LOST`，所以备份、恢复与盘点（含 `cli.mjs` 的 `check-source` 与 `hold`、`scripts/verify-embedded.mjs`）都必须取双锁。API 入口在检查恢复状态之前以共享模式取得 `.api.lock`，失效时调用 `fail()`，启动的每一步（含打开 Hub 库之前）都确认锁仍有效，在关闭 Hub 库之后释放；多个 API 可同时持有，任一存活时恢复工具返回 `RUNTIME_LOCK_BUSY`，恢复工具持锁时 API 无法启动。恢复包的清单拒绝 `.api.lock` 条目，恢复目标只允许残留两个锁文件；备份按既有的 `*.lock` 规则不收录它。生产入口仍是单进程 `createApp`，只取 `.runtime.lock`，此时恢复工具在 `.api.lock` 上不会遇到竞争 |
 | P1-4c 的 SSE 计数与模块世代 | 5.2、5.8 节 | API 在启动时、每次连接数变化（打开、关闭、慢消费者断开）时、发现运行时换实例时与每 15 s 经 `POST /internal/v1/api-stats` 上报 `{ instanceId, sequence, activeConnections, slowConsumerDisconnects }`，同一时间只有一个上报在途，期间的变化合并为下一次；失败不重试，由下一次带上当前计数。运行时校验字段（`instanceId` 为 UUID，`sequence` 为该实例逐次递增的正整数，连接数 0 至 10000，累计次数为非负安全整数，否则 400）。运行时按 API 实例分别记录（最多 16 个，最久未上报的先移除）：序号不大于该实例上一次的上报整条丢弃，迟到的上报既不覆盖连接数也不重复计数；慢消费者按该实例的累计值求差，新实例从零计；某实例对新运行时的首次上报（以及被移除后再次上报）计入它此前的全部累计值；基线启动前收到的差值保留到启动时计入。连接数取 60 s（`API_STATS_MAX_AGE_MS`）内上报过的各实例之和，全部超过 60 s 即视为未知，基线跳过该分钟并记 `sse_unavailable`。API 关闭时上报一次 0 连接，最多等 500 ms，送不到时该实例的连接数在 60 s 内过期；API 被强制结束时同样要到过期才移除，这期间新 API 接住重连后连接数会被重复计算，基线该分钟最多约为两倍。上报失败记录首次与之后每第 20 次。`createApp` 经进程内客户端同步上报，单进程下的连接数与原来在一个上报周期（15 s）内一致：会话清理与慢消费者断开在同一轮结束后上报，连接的 `close` 事件也会上报；新鲜度按 `baselineNow`（默认墙钟）判断，墙钟前跳超过 60 s 后的首次采样可能记为 `sse_unavailable`；`/internal/v1/slow-consumers` 与 `observeSlowConsumer` 契约随之删除，协议版本不变（两个进程来自同一发布）。模块世代：`syncMaintenance` 的每一行附带同步开始时该模块的世代（旧运行时不带时为 `null`），协调器记录确认维护值的世代；`/api/system/modules` 读到某交易模块的世代与之不同，即视为重启后的新实例，标为未确认并单独重新同步；执行入口的准入本来每次都经 `status()` 重新同步，不依赖这一纠正。该纠正在单进程 `createApp` 中同样生效：读取模块状态可能对重启后的模块发起一次维护同步，模块恢复页因此更早看到未确认。运行时换实例后新模块的世代可能与旧值相同，此时依靠 `moduleStatus` 先调用 `status()`、触发换实例回调对全部交易模块重新同步。模块 socket：运行时把运行目录传给 `startModules`，worker socket 建在 `<运行目录>/modules-XXXXXX/` 下（0700），启动时删除残留的 `modules-*` 目录（`.runtime.lock` 证明创建它们的运行时已退出，可能仍存活的孤儿 worker 失去 socket 无害）；运行时自身的 socket 路径在启动模块前检查，最长的模块 socket 路径按 10 位世代估算超过 100 字节时同样启动失败，都提示设置较短的 `WORKBENCH_RUNTIME_DIR`。`createApp` 仍用系统临时目录。运行时被 SIGKILL 后 `<数据目录>/run/` 下残留的 socket 曾让恢复清单（`server/recovery/inventory.mjs` 先做 `safePath` 再判断排除项）以 `RECOVERY_UNSAFE_FILE` 拒绝备份；P1-4d-1 起清单排除顶层 `run`（发现记录与 socket，每次启动重建），`run` 本身是链接时仍拒绝。`WORKBENCH_RUNTIME_DIR` 指到数据目录内其他位置时不在此列 |
-| `PartOf=` 对自动重启的传递 | 依据 systemd 的 restart 作业语义推断 | P2 在 CI 实测，并据此更新第 7 节 |
+| P2-1 的双单元与按范围激活 | 6.1、6.2 节 | 两个单元按 6.1 节写出，差异如下。API 单元用 `RestartSec=1`、`RestartSteps=5`、`RestartMaxDelaySec=30` 实现 1 至 30 s 的退避（需要 systemd 254 以上，Ubuntu 24.04 为 255；低于 254 时安装器改写为 `RestartSec=5`，因为旧版本会忽略退避设置而每秒重启，Debian 12 为 252），并设 `StartLimitIntervalSec=0`，避免频繁重启后被 systemd 永久放弃；两个单元都 `After=network-online.target`。首次安装时 API 与运行时同时启动，运行时尚未创建 `credentials.key` 时 API 启动失败并在 1 s（systemd 低于 254 时 5 s）后重启，日志中会有一次「运行时尚未初始化数据目录」。运行目录固定为 `/run/$SERVICE`，模块 socket 也在其中，不再受 `DATA_DIR` 长度限制，`check_runtime_dir` 只拒绝配置中的 `WORKBENCH_RUNTIME_DIR`（`EnvironmentFile` 会覆盖单元中的 `Environment=`）；手动运行仍用 `$DATA_DIR/run`，长度提示改为同时说明服务单元的固定位置。`healthy()` 按 API 单元文件是否存在选择检查方式：存在时要求两个单元都 `active` 且 `/api/ready` 为 200，否则检查运行时单元与 `/api/health`；回滚到拆分前时 API 单元已被删除，所以不需要版本目录标记。组件键只实现 `runtime_component_key`：源码安装为 `runtime-component-v1:source` 加 `server`（不含 `server/api`）、`package.json`、`deploy/migrate-modules.py`、`deploy/diagnose-aster-margin.py` 的树哈希、`embedded_key`、运行依赖键与运行依赖清单；CI 包由 `package-release.py` 写出 `.release-runtime-key`（除 `server/api` 与前端输入 `src`、`public`、`index.html`、`vite.config.ts`、`tsconfig.app.json` 外的全部应用输入、Node 与 pnpm 版本、架构），安装器复制为版本目录中的 `.runtime-component-key`。环境文件、运行时单元文本、Node 等运行环境（`runtime_key`）与安装器版本（`INSTALL_REVISION` 与构建环境）不进组件键，而是合成 `runtime_deployment_key`，在整体激活且健康检查通过后写入 `$APP_DIR/.runtime-deployment`；`api_component_key` 不需要，两者都不变时沿用现有的部署键跳过路径。只重启 API 要同时满足：存在旧版本，两个单元文件都已安装，候选的运行时单元文本与已安装的相同，`.runtime-deployment` 与本次计算的值相同，运行时单元处于 `active`，从其 `MainPID` 的工作目录读到的版本有效（位于 `releases/` 下、名称合规、是目录而非链接、带受管标记）且组件键与候选版本相同，`migrate-modules.py status` 返回 `committed`；任一条件不满足即整体重启。`portal.mjs`、`updates.mjs` 等只被 API 使用的根目录文件不移动，改动它们按整体重启处理。整体激活前先删除 `.runtime-deployment`，两次回滚都不写它，所以记录缺失或写入失败只会使下次更新整体重启，不会错误地只重启 API。运行版本不再单独记录：评审发现安装器之外的运行时重启会使记录过时，清理时可能删掉运行中的目录，所以改为每次从进程读取；读到的版本在 `prune_releases` 中保留，也是缓存清理的根；运行时在运行但读不到版本时，`prune_releases` 本次不清理，`prune_caches` 把所有受管版本都当作根。若读取始终失败（例如容器中 root 缺少读取其他用户进程工作目录的权限），每次更新都整体重启且旧版本不再清理，两者都安全，只在安装日志中提示。`.runtime-deployment` 只覆盖单元文件与环境文件，不覆盖 drop-in，也发现不了「改环境文件、手动重启运行时、再改回」这类在安装器之外的操作；这些情况由运维在改动后自行重启。只重启 API 的回滚只恢复 `current` 与 API 单元文件并重启 API，不停止运行时、不回退模块迁移；整体回滚另外停止 API 单元、恢复其备份，回滚到拆分前时删除受管的 API 单元。CI 的真实 systemd 用例（`deploy/test-units-systemd.sh`）使用替身入口验证单元关系、运行目录权限、API 在只读 `/run` 下连接 socket、只重启 API 时运行时 pid 与版本目录不变、API 崩溃单独重启、运行时重启经 `PartOf=` 带动 API、停止顺序与运行目录删除；真实五个模块在双单元下的连续性由包验收与发布后检查覆盖，CI 未在 systemd 下运行。回退到拆分前的安装器时，旧安装器不认识 API 单元，`/etc/systemd/system/project-aggregation-api.service` 会留下；运行时单元不再 `Wants=` 它，所以不会启动，可手动删除后 `systemctl daemon-reload`。P2-1 单独发布时，恢复入口（`operations.py`）会因 `ExecStart` 改为运行时入口而拒绝服务，所以 P2-1 与 P2-2 在同一分支分两次提交、分别审查，合并后一起发布 |
+| P2-2 的更新登记与恢复入口 | 6.3、6.4 节 | `registry.py` 的模块描述新增 `extra_services`（hub 为 `project-aggregation-api`）、`entries`（按单元的入口：`server/runtime/main.mjs`、`server/api/main.mjs`）与 `recovery_guard`，每个单元都校验 `WorkingDirectory`、`User`、受管标记与唯一 `ExecStart`（命令必须恰好是一个绝对路径的 Node 加 `current` 下该单元的入口），缺少 API 单元即判为未受管；身份摘要按运行时、API 的顺序包含两个单元的文本。受管 guard 只在两个单元各自的 `/etc/systemd/system/<单元>.service.d/` 中放行，文件名必须是 `20-recovery-guard.conf`、root 所有且不可被组或其他用户写，内容与 `install_guard` 写出的逐字一致（只有 Node 路径可变）；systemd 读取 drop-in 的其他目录（`/run/systemd/system`、`/etc` 与 `/run` 下的 `system.control`、按名称前缀的 `project-.service.d` 等、`service.d`）中的任何 drop-in 以及链接形式的 drop-in 目录仍判为未受管，另外扫描 `system.attached`、`/run/systemd/transient`、三个 generator 目录与 `/usr/local/lib/systemd/system`；`/usr/lib` 与 `/lib` 由软件包管理，不扫描，所以发行版放在 `/usr/lib/systemd/system/service.d/` 的 drop-in 只会被 `install_guard`（按 `DropInPaths`）拒绝，登记侧不发现，Debian 与 Ubuntu 默认没有这类文件。`install_guard` 写入前同时检查 `DropInPaths`（已加载）与磁盘上的 `*.conf`（尚未加载），已有的 guard 必须带受管标记；写入后每次都执行 `daemon-reload`（恢复入口只在停止服务后调用，频率低），再核对每个单元的 `DropInPaths` 恰好只有自己的 guard：上次改写 guard 后重新加载失败的情况由此补上，只有重新加载才会读入的共享目录 drop-in（如 `service.d/`）也会被拒绝。不依赖 `NeedDaemonReload`：CI 在 systemd 255 上实测，上次重新加载之后新建的 drop-in 目录不会使它变为 `yes`；`deploy/test-recovery-systemd.sh` 在真实 systemd 上验证重新加载后 `DropInPaths` 列出新目录中的 drop-in，并对已停止的夹具单元端到端运行 `install_guard`：新建的前缀目录覆盖被拒绝，运维删除并重新加载后接受。重新加载超时 120 s。已知限制：恢复入口与登记侧都不核对 `FragmentPath`，root 在 `system.control` 或 generator 目录放置同名完整单元顶替受管单元的情况不会被发现。单元别名（root 手动建的链接）的 drop-in 目录登记侧不扫描，`install_guard` 按 `DropInPaths` 能发现。guard 文本只由 `operations.guard_dropin()` 生成，`deploy/test-install.sh` 用它验证登记侧逐字接受，并验证恢复入口拒绝的 `ExecStart`（`/bin/sh -c`、附加 Node 参数、多余参数）登记侧同样拒绝。guard 内容不进身份摘要，恢复入口重写 guard 不会使已检查的更新计划失效。`updater.py` 不需要改动：成功回执记录的身份已覆盖两个单元。跨拆分的第一次更新中，执行安装的更新进程仍是旧代码，回执中的身份只含运行时单元，与新代码计算的身份不同，当前版本改由 `.deployed-state` 给出；该任务已成功结束，不影响结果。`operations.py` 用 `managed_unit` 解析两个单元，要求两者都是安装器写出的、分别运行 `server/runtime/main.mjs` 与 `server/api/main.mjs`，且服务账户与 Node 路径相同；`install_guard` 为两个单元写入同一份 guard：评审发现只有运行时单元带 guard 时，交接后单独启动的 API 单元不经 guard，可能在已退休的数据源上启动；写入前先检查两个单元的 `DropInPaths`，任一单元有其他 drop-in 就整体拒绝，写入后执行一次 `daemon-reload` 并核对。任一单元处于 `active`、`activating` 或 `reloading` 即视为在运行，用一条 `systemctl stop` 同时停止两个单元（超时 260 s：API 最多 75 s 后运行时最多 150 s），`require_stopped` 逐个核对状态、`MainPID` 与停止前记录的 cgroup；结束后只启动运行时单元，由 `Wants=` 拉起 API，所以停止前只有 API 在运行时，结束后两个单元都会运行。CI 的 cgroup 用例（`deploy/test-recovery-systemd.sh`）改为传入单元到 cgroup 的映射。`check-server.sh` 同时显示两个单元的状态与日志，两个清理脚本的 `UNITS` 增加 API 单元。`deploy/test-install.sh` 把 `write_unit` 写出的两个单元（含 systemd 252 与 255 两种重启设置）同时交给 `registry.unit_source` 与 `operations.managed_unit`，保证三处的单元约定一致 |
+| `PartOf=` 对自动重启的传递 | P2-1 的 CI 实测（`deploy/test-units-systemd.sh`） | 运行时被 `SIGKILL` 后按 `Restart=on-failure` 重启，API 经 `PartOf=` 一并换了新进程；第 6.1 节与第 7 节已按实测更新 |
 
 ## 10 批次拆分与进入条件
 

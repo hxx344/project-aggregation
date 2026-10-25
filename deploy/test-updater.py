@@ -121,12 +121,14 @@ class RegistryTests(RootFixture):
         (release / '.release-application-key').write_text(OLD_KEY, encoding='utf8')
         current = root / 'current'
         self.link(release, current, directory=True)
-        unit = self.root / 'etc/systemd/system' / (module.service + '.service')
-        unit.parent.mkdir(parents=True, exist_ok=True)
         current_path = str(current).replace('\\', '/')
-        command = '/usr/bin/python3 -m variational_grid run --config /etc/variational-grid/config.toml' if module.id == 'variational' else '/usr/bin/node ' + current_path + '/server/index.mjs'
-        unit.write_text(f'# Managed by {module.service} installer\n[Service]\nUser={module.user}\nWorkingDirectory={current_path}{module.working_suffix}\nExecStart={command}\n', encoding='utf8')
-        return root, release, unit
+        entries = {module.service: 'server/runtime/main.mjs', 'project-aggregation-api': 'server/api/main.mjs'}
+        for name in (module.service, *module.extra_services):
+            unit = self.root / 'etc/systemd/system' / (name + '.service')
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            command = '/usr/bin/python3 -m variational_grid run --config /etc/variational-grid/config.toml' if module.id == 'variational' else '/usr/bin/node ' + current_path + '/' + entries[name]
+            unit.write_text(f'# Managed by {module.service} installer\n[Service]\nUser={module.user}\nWorkingDirectory={current_path}{module.working_suffix}\nExecStart={command}\n', encoding='utf8')
+        return root, release, self.root / 'etc/systemd/system' / (module.service + '.service')
 
     def test_only_unified_installer_identity_and_local_only_discovery(self):
         self.assertEqual(registry.inventory(self.root), [])
@@ -169,6 +171,75 @@ class RegistryTests(RootFixture):
         unit.write_text(source, encoding='utf8')
         dropins = unit.parent / (module.service + '.service.d'); dropins.mkdir()
         (dropins / 'custom.conf').write_text('[Service]\nUser=root\n', encoding='utf8')
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+
+    def test_api_unit_is_part_of_the_hub_identity(self):
+        module = registry.BY_ID['hub']; root, release, unit = self.install(module)
+        api = unit.parent / 'project-aggregation-api.service'
+        source = api.read_text(encoding='utf8')
+        identity = registry.installed(module, self.root)['identity']
+        api.write_text(source + 'RestartSec=2\n', encoding='utf8')
+        changed = registry.installed(module, self.root)
+        self.assertEqual(changed['state'], 'unavailable')
+        self.assertNotEqual(changed['identity'], identity)
+        for forged in [source.replace('User=project-aggregation', 'User=root'), source.replace('# Managed by project-aggregation installer\n', ''),
+                       source + 'ExecStart=/usr/bin/node /tmp/other.mjs\n', source.replace(str(root / 'current').replace('\\', '/'), '/tmp/unknown'),
+                       source.replace('server/api/main.mjs', 'server/runtime/main.mjs')]:
+            with self.subTest(unit=forged):
+                api.write_text(forged, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        api.unlink()
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+
+    def test_only_the_managed_recovery_guard_of_each_unit_is_accepted(self):
+        module = registry.BY_ID['hub']; root, release, unit = self.install(module)
+        guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
+                 '${DATA_DIR} /opt/project-aggregation/current/server/execution/account-writer.mjs /usr/local/bin/node\n')
+        units = [unit.parent / (name + '.service.d') for name in ('project-aggregation', 'project-aggregation-api')]
+        for dropins in units:
+            dropins.mkdir(); (dropins / '20-recovery-guard.conf').write_text(guard, encoding='utf8')
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
+        dropins = units[1]
+        for name, content in [('20-recovery-guard.conf', guard.replace('recovery\n', 'recovery-copy\n')), ('20-recovery-guard.conf', '[Service]\n' + guard),
+                              ('20-recovery-guard.conf', ''), ('30-recovery-guard.conf', guard), ('20-recovery-guard.conf', guard + 'ExecStartPre=/bin/true\n'),
+                              ('20-recovery-guard.conf', guard.replace('account-writer.mjs', 'other.mjs')), ('20-recovery-guard.conf', guard.replace(' /usr/local/bin/node', ' node'))]:
+            with self.subTest(name=name, content=content):
+                for existing in dropins.iterdir(): existing.unlink()
+                (dropins / name).write_text(content, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        for existing in dropins.iterdir(): existing.unlink()
+        # Every other directory systemd reads drop-ins from is unmanaged, even with the guard.
+        systemd = self.root / 'etc/systemd'
+        for directory in [self.root / 'run/systemd/system/project-aggregation.service.d', systemd / 'system/project-.service.d',
+                          systemd / 'system/project-aggregation-.service.d', systemd / 'system/service.d',
+                          systemd / 'system.control/project-aggregation-api.service.d', self.root / 'run/systemd/system.control/project-aggregation.service.d',
+                          systemd / 'system.attached/project-aggregation-api.service.d', self.root / 'run/systemd/transient/project-aggregation.service.d',
+                          self.root / 'run/systemd/generator.late/project-aggregation-api.service.d', self.root / 'usr/local/lib/systemd/system/project-aggregation-api.service.d']:
+            with self.subTest(directory=directory):
+                directory.mkdir(parents=True)
+                (directory / '20-recovery-guard.conf').write_text(guard, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+                (directory / '20-recovery-guard.conf').unlink(); directory.rmdir()
+        dropins.rmdir(); self.link(units[0], dropins, directory=True)
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        dropins.unlink()
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
+
+    @unittest.skipUnless(LINUX_ROOT, 'Linux ownership/mode protection requires root')
+    def test_recovery_guard_must_be_root_owned_and_read_only(self):
+        module = registry.BY_ID['hub']; root, release, unit = self.install(module)
+        guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
+                 '${DATA_DIR} /opt/project-aggregation/current/server/execution/account-writer.mjs /usr/local/bin/node\n')
+        dropins = unit.parent / 'project-aggregation.service.d'; dropins.mkdir()
+        conf = dropins / '20-recovery-guard.conf'; conf.write_text(guard, encoding='utf8')
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
+        os.chmod(conf, 0o664)
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        os.chmod(conf, 0o644); os.chown(conf, 65534, 65534)
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        os.chown(conf, 0, 0); conf.unlink()
+        outside = self.root / 'guard.conf'; outside.write_text(guard, encoding='utf8')
+        self.link(outside, conf)
         self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
 
     @unittest.skipUnless(LINUX_ROOT, 'Linux ownership/mode protection requires root')

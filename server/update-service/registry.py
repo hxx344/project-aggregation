@@ -22,16 +22,26 @@ class Module:
     artifact: str = ''
     root_marker: bool = False
     working_suffix: str = ''
+    # Further units of the same installation, checked like `service`.
+    extra_services: tuple[str, ...] = ()
+    # Per unit (`service`, then `extra_services`): the file under current that ExecStart runs.
+    entries: tuple[str, ...] = ()
+    # Every unit may carry the recovery entry's startup guard.
+    recovery_guard: bool = False
 
 
 MODULES = (
     Module('hub', '工作台（包含五个内置模块）', 'project-aggregation', 'project-aggregation', 'project-aggregation',
            'project-aggregation', 'deploy/install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
-           ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True),
+           ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True,
+           extra_services=('project-aggregation-api',), entries=('server/runtime/main.mjs', 'server/api/main.mjs'),
+           recovery_guard=True),
 )
 BY_ID = {module.id: module for module in MODULES}
 HEX40 = re.compile(r'[a-f0-9]{40}')
 HEX64 = re.compile(r'[a-f0-9]{64}')
+RECOVERY_GUARD = '20-recovery-guard.conf'
+RECOVERY_MARKER = '# Managed by project-aggregation recovery'
 
 
 def trusted(path: Path, directory=False):
@@ -53,6 +63,62 @@ def text_file(path: Path, maximum=65536):
 
 def optional_text(path: Path):
     return text_file(path) if path.exists() or path.is_symlink() else ''
+
+
+def recovery_guard(module: Module):
+    """The exact drop-in operations.install_guard writes; only the Node path varies."""
+    return re.compile(re.escape(RECOVERY_MARKER + '\n[Service]\nExecStartPre=/usr/bin/python3 -I '
+                                '/usr/local/lib/project-aggregation-recovery/startup-guard.py ${DATA_DIR} '
+                                f'/opt/{module.directory}/current/server/execution/account-writer.mjs ') + r'/\S+')
+
+
+def dropin_directories(name, filesystem):
+    """The directories systemd reads drop-ins of `name`.service from, except
+    /usr/lib and /lib, which belong to distribution packages."""
+    parts = name.split('-')
+    names = [name + '.service.d', *('-'.join(parts[:index]) + '-.service.d' for index in range(1, len(parts))), 'service.d']
+    for base in ('etc/systemd/system.control', 'run/systemd/system.control', 'run/systemd/transient',
+                 'run/systemd/generator.early', 'etc/systemd/system', 'etc/systemd/system.attached',
+                 'run/systemd/system', 'run/systemd/system.attached', 'run/systemd/generator',
+                 'usr/local/lib/systemd/system', 'run/systemd/generator.late'):
+        for directory in names:
+            yield filesystem / base / directory
+
+
+def unit_source(module: Module, name, current_path, filesystem, guard=False, entry=''):
+    unit = filesystem / 'etc/systemd/system' / (name + '.service')
+    source = text_file(unit)
+    properties = {}
+    for line in source.splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key, value = line.split('=', 1)
+            properties.setdefault(key, []).append(value)
+    expected_work = current_path + module.working_suffix
+    if properties.get('WorkingDirectory') != [expected_work] or properties.get('User') != [module.user]:
+        raise ValueError('Unexpected service identity')
+    if module.root_marker and f'# Managed by {module.service} installer' not in source:
+        raise ValueError('Unknown service')
+    if len(properties.get('ExecStart', [])) != 1:
+        raise ValueError('Unknown service command')
+    command = properties['ExecStart'][0]
+    if module.id == 'variational':
+        if not re.match(r'^/usr/bin/python3 -m variational_grid (?:run|compare) ', command):
+            raise ValueError('Unknown Variational command')
+    elif current_path + '/' not in command or (entry and not re.fullmatch(r'/\S+ ' + re.escape(current_path + '/' + entry), command)):
+        raise ValueError('Service does not run the managed release')
+    # Custom service overrides need a deliberate CLI update, not a guessed
+    # identity; only the recovery entry's own startup guard is expected.
+    managed = unit.parent / (name + '.service.d')
+    for dropins in dropin_directories(name, filesystem):
+        if dropins.is_symlink():
+            raise ValueError('Custom service overrides')
+        if not dropins.exists():
+            continue
+        for conf in dropins.glob('*.conf'):
+            if not (guard and dropins == managed and conf.name == RECOVERY_GUARD and
+                    recovery_guard(module).fullmatch(text_file(conf))):
+                raise ValueError('Custom service overrides')
+    return source
 
 
 def installed(module: Module, filesystem=Path('/')):
@@ -79,30 +145,11 @@ def installed(module: Module, filesystem=Path('/')):
             value = text_file(release / marker)
             if module.id == 'variational' and marker == '.install-owned' and value != 'variational-grid':
                 raise ValueError('Wrong installation owner')
-        source = text_file(unit)
-        properties = {}
-        for line in source.splitlines():
-            if '=' in line and not line.lstrip().startswith('#'):
-                key, value = line.split('=', 1)
-                properties.setdefault(key, []).append(value)
-        expected_work = str(root / 'current').replace('\\', '/') + module.working_suffix
-        if properties.get('WorkingDirectory') != [expected_work] or properties.get('User') != [module.user]:
-            raise ValueError('Unexpected service identity')
-        if module.root_marker and f'# Managed by {module.service} installer' not in source:
-            raise ValueError('Unknown service')
-        if len(properties.get('ExecStart', [])) != 1:
-            raise ValueError('Unknown service command')
-        command = properties['ExecStart'][0]
         current_path = str(root / 'current').replace('\\', '/')
-        if module.id == 'variational':
-            if not re.match(r'^/usr/bin/python3 -m variational_grid (?:run|compare) ', command):
-                raise ValueError('Unknown Variational command')
-        elif current_path + '/' not in command:
-            raise ValueError('Service does not run the managed release')
-        # Custom service overrides need a deliberate CLI update, not a guessed identity.
-        for dropins in (unit.parent / (module.service + '.service.d'), filesystem / 'run/systemd/system' / (module.service + '.service.d')):
-            if dropins.exists() and any(dropins.glob('*.conf')):
-                raise ValueError('Custom service overrides')
+        names = (module.service, *module.extra_services)
+        entries = module.entries or ('',) * len(names)
+        sources = [unit_source(module, name, current_path, filesystem, guard=module.recovery_guard, entry=entry)
+                   for name, entry in zip(names, entries, strict=True)]
         checked = optional_text((root / module.checked[1:]) if module.checked.startswith('@') else (release / module.checked)) if module.checked else ''
         checked = checked.split()[0] if checked else ''
         artifact = optional_text(release / '.release-commit')
@@ -114,7 +161,7 @@ def installed(module: Module, filesystem=Path('/')):
         checked = checked if HEX40.fullmatch(checked) else artifact
         application_key = optional_text(release / '.release-application-key')
         application_key = application_key if HEX64.fullmatch(application_key) else None
-        identity = hashlib.sha256(('\n'.join([str(release), source, checked or '', artifact or '', application_key or ''])).encode()).hexdigest()
+        identity = hashlib.sha256(('\n'.join([str(release), *sources, checked or '', artifact or '', application_key or ''])).encode()).hexdigest()
         result.update(state='unavailable', currentCommit=checked, currentVersion=checked[:12] if checked else None,
                       reason='尚未检查正式版本', identity=identity, artifactCommit=artifact, applicationKey=application_key)
     except (OSError, ValueError, UnicodeError):

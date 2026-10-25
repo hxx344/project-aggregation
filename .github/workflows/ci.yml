@@ -196,6 +196,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           sudo env RECOVERY_TEST_NODE="$(command -v node)" AGG_RECOVERY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-recovery-systemd.sh
+      - name: Verify the runtime and API units under real systemd
+        if: ${{ !cancelled() }}
+        run: |
+          sudo env UNITS_TEST_NODE="$(command -v node)" AGG_UNITS_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-units-systemd.sh
       - name: Check release download, integrity, extraction and cache boundaries
         run: |
           python3 deploy/test-release.py -v
@@ -214,6 +218,7 @@ jobs:
           bash -n deploy/install-all.sh
           bash -n deploy/test-update-service.sh
           bash -n deploy/test-update-systemd.sh
+          bash -n deploy/test-units-systemd.sh
           bash -n deploy/test-all.sh
           bash -n deploy/test-install.sh
           bash -n deploy/test-environment.sh

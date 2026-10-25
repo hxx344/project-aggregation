@@ -8,6 +8,9 @@ ENV_FILE=/etc/project-aggregation.env
 SERVICE=project-aggregation
 SERVICE_USER=project-aggregation
 UNIT_FILE=/etc/systemd/system/project-aggregation.service
+# The runtime unit keeps the service name; the API runs in its own unit (design doc 6.1).
+API_SERVICE=project-aggregation-api
+API_UNIT_FILE=/etc/systemd/system/project-aggregation-api.service
 REPOSITORY=https://github.com/hxx344/project-aggregation.git
 NODE_VERSION=24.15.0
 PNPM_VERSION=11.25.0
@@ -28,6 +31,8 @@ activation_started=0
 migration_commit_started=0
 old_release=
 old_unit_backup=
+old_api_unit_backup=
+activation_scope=
 old_environment=
 old_health_url=
 work_dir=
@@ -1235,14 +1240,10 @@ read_setting() {
   value=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
   printf '%s' "${value:-$fallback}"
 }
-# The service keeps its runtime directory at <DATA_DIR>/run: the unit may only
-# write DATA_DIR, so WORKBENCH_RUNTIME_DIR is refused. The runtime socket
-# <DATA_DIR>/run/runtime-<uuid>.sock must fit the 100-byte Unix socket path
-# limit (server/runtime/protocol.mjs), and the runtime binds the configured
-# path (links not resolved), so $1 is the validated, normalized DATA_DIR.
+# Both units set WORKBENCH_RUNTIME_DIR=/run/$SERVICE, the runtime unit's
+# RuntimeDirectory; the environment file would override it, so it is refused.
 check_runtime_dir() {
-  if [[ -n "$2" ]]; then fail 'WORKBENCH_RUNTIME_DIR 不适用于服务单元（单元只能写入 DATA_DIR），请从配置中删除。'; return 1; fi
-  if ((${#1} > 46)); then fail "DATA_DIR 路径过长（${#1} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节。请先停止 $SERVICE 服务，把数据目录整体移到较短路径，再修改 DATA_DIR 并重新安装。"; return 1; fi
+  if [[ -n "$1" ]]; then fail "WORKBENCH_RUNTIME_DIR 由服务单元固定为 /run/$SERVICE，请从配置中删除。"; return 1; fi
 }
 
 health_url() {
@@ -1314,8 +1315,15 @@ restore_environment() {
   remember_environment || return 1
   HEALTH_URL=$old_health_url
 }
+# With the API unit installed both units must run and /api/ready answers for
+# the runtime too; a release in one unit is checked as before.
 healthy() {
-  systemctl is-active --quiet "$SERVICE" && curl --fail --silent --max-time 3 "$HEALTH_URL" >/dev/null
+  systemctl is-active --quiet "$SERVICE" || return 1
+  if [[ -f "$API_UNIT_FILE" ]]; then
+    systemctl is-active --quiet "$API_SERVICE" && curl --fail --silent --max-time 3 "${HEALTH_URL%/api/health}/api/ready" >/dev/null
+  else
+    curl --fail --silent --max-time 3 "$HEALTH_URL" >/dev/null
+  fi
 }
 wait_healthy() {
   local attempt
@@ -1345,7 +1353,16 @@ rollback() {
   # Close before recovery. If this optional write fails, leave the interval
   # unknown instead of retrying at EXIT and counting rollback as deployment.
   ci_finish_progress
-  if [[ "$activation_started" == 1 ]]; then
+  if [[ "$activation_started" == 1 && "$activation_scope" == api ]]; then
+    # Only the API was restarted: the runtime, its modules, the configuration
+    # and the Python paths are those of the earlier release and stay as they are.
+    log '新版本 API 启动失败，正在恢复之前的 API；运行时与模块未受影响。'
+    if [[ -n "$old_api_unit_backup" && -f "$old_api_unit_backup" ]]; then cp -- "$old_api_unit_backup" "$API_UNIT_FILE"; fi
+    if [[ -n "$old_release" && -d "$old_release" ]]; then atomic_link "$old_release" "$APP_DIR/current"; fi
+    systemctl daemon-reload
+    systemctl restart "$API_SERVICE" || true
+    if wait_healthy; then log '已恢复之前的 API；运行时与持久数据保持原样。'; else log '之前的 API 尚未恢复健康，请查看服务日志。'; fi
+  elif [[ "$activation_started" == 1 ]]; then
     # A signal/error can arrive after the journal commits but before Python
     # returns. Check only this attempt's commit window, never a historic receipt.
     if [[ "$migration_commit_started" == 1 && -n "$module_migration_helper" ]]; then
@@ -1361,6 +1378,7 @@ rollback() {
     fi
     # Stop every embedded writer before re-enabling its standalone predecessor.
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    systemctl stop "$API_SERVICE" >/dev/null 2>&1 || true
     if [[ -n "$module_migration_helper" ]]; then
       if ! python3 "$module_migration_helper" rollback --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json"; then
         log '旧模块服务恢复未完成；工作台保持停止，请检查迁移日志后重试。'
@@ -1374,6 +1392,12 @@ rollback() {
       systemctl stop "$SERVICE" >/dev/null 2>&1 || true
       systemctl disable "$SERVICE" >/dev/null 2>&1 || true
       if [[ -f "$UNIT_FILE" ]] && grep -q '^# Managed by project-aggregation installer$' "$UNIT_FILE"; then rm -f -- "$UNIT_FILE"; fi
+    fi
+    # Without a previous API unit the earlier release runs in one unit (design doc 6.8).
+    if [[ -n "$old_api_unit_backup" && -f "$old_api_unit_backup" ]]; then
+      cp -- "$old_api_unit_backup" "$API_UNIT_FILE"
+    elif [[ -f "$API_UNIT_FILE" ]] && grep -q '^# Managed by project-aggregation installer$' "$API_UNIT_FILE"; then
+      rm -f -- "$API_UNIT_FILE"
     fi
     if ! restore_python_paths; then
       log '无法恢复上次成功的 Python 路径记录；工作台保持停止，请检查磁盘权限。'
@@ -1526,7 +1550,7 @@ atomic_record() {
 input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree runtime_dependency_tree module module_tree
-  local legacy_runner_blob legacy_tree module_recipe module_artifacts_key
+  local legacy_runner_blob legacy_tree module_recipe module_artifacts_key runtime_listing runtime_component_tree
   local -a navigation_inputs=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts)
   local -a module_shared_inputs=("${navigation_inputs[@]}" server/capital-metrics.mjs server/capital-metrics.d.mts)
   local -a module_inputs
@@ -1539,6 +1563,8 @@ input_keys() {
   test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash src public "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
   runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
+  runtime_listing=$(git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- server package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
+  runtime_component_tree=$(printf '%s\n' "$runtime_listing" | awk -F '\t' '$2 !~ /^server\/api\//' | hash)
   embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py deploy/diagnose-aster-margin.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
@@ -1578,6 +1604,8 @@ input_keys() {
   embedded_key=$(printf 'embedded-runtime-v4:direct-module-builds\n%s\n%s\n%s\n%s' "$embedded_tree" "$dependency_key" "$build_environment" "$module_artifacts_key" | hash)
   application_key=$(printf 'application-v5:immutable-production-links\n%s\n%s\n%s\n%s\n%s' "$runtime_tree" "$build_key" "$embedded_key" "$runtime_dependency_key" "$RUNTIME_DEPENDENCIES" | hash)
   embedded="$APP_DIR/cache/embedded-$embedded_key"
+  # Everything the runtime unit runs: the frontend and server/api are left out (design doc 6.2).
+  runtime_component_key=$(printf 'runtime-component-v1:source\n%s\n%s\n%s\n%s' "$runtime_component_tree" "$embedded_key" "$runtime_dependency_key" "$RUNTIME_DEPENDENCIES" | hash)
 }
 application_ready() {
   [[ -n "$old_release" && -f "$old_release/.install-ready" && -f "$old_release/.application-key" &&
@@ -1958,6 +1986,7 @@ prepare_application() {
   atomic_record "$work_dir/publish/.managed-release" "$commit"
   atomic_record "$work_dir/publish/.source-sha" "$commit"
   atomic_record "$work_dir/publish/.application-key" "$application_key"
+  atomic_record "$work_dir/publish/.runtime-component-key" "$runtime_component_key"
   # Root tar preserves Git archive's group-write bits despite the process umask.
   # Only normalize this freshly assembled tree from the pinned Git object and
   # verified caches; an existing writable release must never regain trust here.
@@ -1996,6 +2025,13 @@ prepare_ci_application() {
   atomic_record "$work_dir/publish/.source-sha" "$commit"
   atomic_record "$work_dir/publish/.application-key" "$application_key"
   atomic_record "$work_dir/publish/.ci-package-sha256" "$CI_RELEASE_SHA256"
+  # Written by deploy/package-release.py; a package without it always restarts both units.
+  if [[ -f "$work_dir/publish/.release-runtime-key" ]]; then
+    local runtime_key_value
+    runtime_key_value=$(cat -- "$work_dir/publish/.release-runtime-key")
+    [[ "$runtime_key_value" =~ ^[a-f0-9]{64}$ ]] || fail '部署包的运行时组件键无效。'
+    atomic_record "$work_dir/publish/.runtime-component-key" "$runtime_key_value"
+  fi
   chown -R root:root "$work_dir/publish"
   chmod -R a+rX,go-w "$work_dir/publish"
   mv -- "$work_dir/publish" "$release"
@@ -2362,23 +2398,34 @@ finish_activation() {
   activation_started=0
 }
 
+# The runtime unit (modules, collection, native execution) and the API unit
+# (design doc 6.1). Stopping or restarting the runtime unit also stops or
+# restarts the API (PartOf=); the API restarts alone, with the launcher's
+# backoff of 1 s doubling up to 30 s, and connects to the runtime socket in the
+# runtime unit's RuntimeDirectory.
 write_unit() {
+  local api_restart=$'RestartSec=1\nRestartSteps=5\nRestartMaxDelaySec=30'
+  # systemd before 254 ignores the backoff and would restart every second.
+  (( ${systemd_version:-0} >= 254 )) || api_restart='RestartSec=5'
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
 [Unit]
-Description=Project Aggregation workspace
+Description=Project Aggregation workspace runtime
 After=network-online.target
-Wants=network-online.target
+Wants=network-online.target $API_SERVICE.service
 
 [Service]
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$APP_DIR/current
-ExecStart=$NODE_BIN $APP_DIR/current/server/index.mjs
+ExecStart=$NODE_BIN $APP_DIR/current/server/runtime/main.mjs
 EnvironmentFile=$ENV_FILE
 Environment=GREEKS_PYTHON=$GREEKS_PYTHON_PATH
 Environment=ASTER_PYTHON=$ASTER_PYTHON_PATH
+Environment=WORKBENCH_RUNTIME_DIR=/run/$SERVICE
+RuntimeDirectory=$SERVICE
+RuntimeDirectoryMode=0700
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=150
@@ -2392,11 +2439,98 @@ ReadWritePaths=$DATA_PATH
 [Install]
 WantedBy=multi-user.target
 EOF
+  cat > "$work_dir/api.service" <<EOF
+# Managed by project-aggregation installer
+[Unit]
+Description=Project Aggregation workspace API
+After=network-online.target $SERVICE.service
+PartOf=$SERVICE.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$APP_DIR/current
+ExecStart=$NODE_BIN $APP_DIR/current/server/api/main.mjs
+EnvironmentFile=$ENV_FILE
+Environment=WORKBENCH_RUNTIME_DIR=/run/$SERVICE
+Restart=on-failure
+$api_restart
+TimeoutStopSec=75
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$DATA_PATH
+EOF
+}
+managed_release() {
+  [[ "$1" == "$APP_DIR/releases/"* && "${1##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ &&
+     -d "$1" && ! -L "$1" && -f "$1/.managed-release" ]] || return 1
+  printf '%s' "$1"
+}
+# The major version of the running systemd, 0 when unknown.
+systemd_major() {
+  local version
+  version=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }') || true
+  version=${version%%[!0-9]*}
+  printf '%s' "${version:-0}"
+}
+# The release the running runtime started from (design doc 6.2): systemd enters
+# the working directory through current, so the main process's working
+# directory is that release, also after a restart outside the installer. An
+# update that only restarts the API leaves the runtime there.
+live_runtime_release() {
+  local pid directory releases
+  pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null) && [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  directory=$(readlink -e -- "/proc/$pid/cwd") || return 1
+  releases=$(realpath -e -- "$APP_DIR/releases") || return 1
+  [[ "${directory%/*}" == "$releases" ]] || return 1
+  managed_release "$APP_DIR/releases/${directory##*/}"
+}
+# What the runtime was last started with by a full activation besides its code:
+# the unit, the environment file, Node and the installer revision.
+runtime_deployment_key() {
+  { cat -- "$work_dir/service" "$ENV_FILE"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash
+}
+release_runtime_key() {
+  local key
+  [[ -f "$1/.runtime-component-key" ]] || return 1
+  key=$(cat -- "$1/.runtime-component-key") || return 1
+  [[ "$key" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf '%s' "$key"
+}
+# Committed covers every legacy module: a helper that would select more differs
+# and so changes the runtime component key.
+migration_settled() {
+  [[ "$(python3 "$1/deploy/migrate-modules.py" status --data "$DATA_PATH" --journal "$APP_DIR/.module-migration.json" 2>/dev/null)" == committed ]]
+}
+# Prints api when the running runtime would restart into the same code with the
+# same unit and configuration, and no module migration is outstanding; full
+# otherwise (design doc 6.2). Shared code outside server/api counts as runtime.
+activation_scope() {
+  local running key
+  if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$API_UNIT_FILE" && -f "$APP_DIR/.runtime-deployment" ]] &&
+     cmp -s "$work_dir/service" "$UNIT_FILE" && [[ "$(cat -- "$APP_DIR/.runtime-deployment")" == "$(runtime_deployment_key)" ]] &&
+     systemctl is-active --quiet "$SERVICE" && running=$(live_runtime_release) &&
+     key=$(release_runtime_key "$release") && [[ "$(release_runtime_key "$running")" == "$key" ]] &&
+     migration_settled "$release"; then
+    printf api
+  else
+    printf full
+  fi
 }
 prune_releases() {
-  local directory
+  local directory runtime_release
+  if ! runtime_release=$(live_runtime_release); then
+    # The runtime may still run from any release while its own is unknown.
+    if systemctl is-active --quiet "$SERVICE"; then log '无法确认运行时所在的版本目录；本次不清理旧版本。'; return 0; fi
+    runtime_release=
+  fi
   while IFS= read -r directory; do
-    if [[ "$directory" == "$release" || "$directory" == "$previous_release" ]]; then continue; fi
+    if [[ "$directory" == "$release" || "$directory" == "$previous_release" || "$directory" == "$runtime_release" ]]; then continue; fi
     [[ -f "$directory/.managed-release" ]] || continue
     [[ "${directory##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ ]] || continue
     safe_remove_release "$directory"
@@ -2419,8 +2553,17 @@ prune_caches() {
   local cache="$APP_DIR/cache" entry name root links target key module directory interpreter recorded recorded_release
   local removed=0 failed=0 source_keys=0
   local -A keep=() keep_python=()
-  local -a roots=()
-  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous"; do
+  local runtime_release
+  local -a roots=() runtime_roots=()
+  if runtime_release=$(live_runtime_release); then
+    runtime_roots=("$runtime_release")
+  elif systemctl is-active --quiet "$SERVICE"; then
+    # As in prune_releases: while the runtime's release is unknown it may run from any of them.
+    for directory in "$APP_DIR"/releases/*; do
+      if managed_release "$directory" >/dev/null; then runtime_roots+=("$directory"); fi
+    done
+  fi
+  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "${runtime_roots[@]}"; do
     [[ -n "$root" && -e "$root" ]] || continue
     root=$(realpath -e -- "$root") || return 1
     roots+=("$root")
@@ -2549,6 +2692,11 @@ main() {
     old_unit_backup="$work_dir/previous.service"
     cp -- "$UNIT_FILE" "$old_unit_backup"
   fi
+  if [[ -f "$API_UNIT_FILE" ]]; then
+    grep -q '^# Managed by project-aggregation installer$' "$API_UNIT_FILE" || fail '同名 API systemd 服务已存在且不属于本安装脚本。'
+    old_api_unit_backup="$work_dir/previous-api.service"
+    cp -- "$API_UNIT_FILE" "$old_api_unit_backup"
+  fi
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     useradd --system --user-group --home-dir "$DATA_DIR_DEFAULT" --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
@@ -2562,11 +2710,9 @@ main() {
   [[ "$HOST_VALUE" =~ ^[A-Za-z0-9.:_-]+$ ]] || fail 'HOST 格式不正确，请使用无引号的主机名或 IP。'
   [[ "$PORT_VALUE" =~ ^[0-9]{1,5}$ ]] && ((10#$PORT_VALUE > 0 && 10#$PORT_VALUE < 65536)) || fail 'PORT 必须在 1 到 65535 之间。'
   [[ "$DATA_PATH" =~ ^/[A-Za-z0-9_./-]+$ && "$DATA_PATH" != / && "$DATA_PATH" != *'/../'* && "$DATA_PATH" != */.. ]] || fail 'DATA_DIR 必须是无空格的专用绝对目录。'
-  # The runtime resolves the configured path without following links.
-  configured_data=$(realpath -m -s "$DATA_PATH")
   DATA_PATH=$(realpath -m "$DATA_PATH")
   case "$DATA_PATH" in /var/lib/project-aggregation|/var/lib/project-aggregation/*|/srv/project-aggregation/*|/opt/project-aggregation-data|/opt/project-aggregation-data/*) ;; *) fail 'DATA_DIR 请使用 /var/lib/project-aggregation、/srv/project-aggregation/ 子目录或 /opt/project-aggregation-data，避免修改系统目录权限。' ;; esac
-  check_runtime_dir "$configured_data" "$(read_setting WORKBENCH_RUNTIME_DIR '')"
+  check_runtime_dir "$(read_setting WORKBENCH_RUNTIME_DIR '')"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/build-home"
   HEALTH_URL=$(health_url "$HOST_VALUE" "$PORT_VALUE")
@@ -2581,8 +2727,9 @@ main() {
   fi
   if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
   if [[ -f "$APP_DIR/.aster-python-path" ]]; then ASTER_PYTHON_PATH=$(cat "$APP_DIR/.aster-python-path"); fi
+  systemd_version=$(systemd_major)
   write_unit
-  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
+  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service" "$work_dir/api.service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   # Both deployment modes consume exactly the selected stable release. The
   # coordinator passes a pinned manifest; direct installs discover stable once.
   ci_release_resolve hxx344/project-aggregation "$work_dir"
@@ -2620,7 +2767,7 @@ main() {
   prepare_greeks_runtime "$release"
   prepare_aster_runtime "$release"
   write_unit
-  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
+  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service" "$work_dir/api.service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] && healthy; then
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
@@ -2635,18 +2782,35 @@ main() {
   if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
   prepare_environment_rollback
   ci_update_progress switch
+  activation_scope=$(activation_scope)
   activation_started=1
-  migrate_embedded_modules "$release"
-  if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
-  if [[ ! -f "$UNIT_FILE" ]] || ! cmp -s "$work_dir/service" "$UNIT_FILE"; then
-    install -m 0644 "$work_dir/service" "$UNIT_FILE"
-    systemctl daemon-reload
+  if [[ "$activation_scope" == api ]]; then
+    log '运行时代码、服务配置和环境未变化：只重启 API，模块与采集保持运行。'
+    if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
+    if ! cmp -s "$work_dir/api.service" "$API_UNIT_FILE"; then
+      install -m 0644 "$work_dir/api.service" "$API_UNIT_FILE"
+      systemctl daemon-reload
+    fi
+    systemctl restart "$API_SERVICE"
+  else
+    # Recorded again once the restarted runtime is healthy.
+    rm -f -- "$APP_DIR/.runtime-deployment"
+    migrate_embedded_modules "$release"
+    if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
+    units_changed=0
+    if [[ ! -f "$UNIT_FILE" ]] || ! cmp -s "$work_dir/service" "$UNIT_FILE"; then install -m 0644 "$work_dir/service" "$UNIT_FILE"; units_changed=1; fi
+    if [[ ! -f "$API_UNIT_FILE" ]] || ! cmp -s "$work_dir/api.service" "$API_UNIT_FILE"; then install -m 0644 "$work_dir/api.service" "$API_UNIT_FILE"; units_changed=1; fi
+    if (( units_changed )); then systemctl daemon-reload; fi
+    systemctl enable "$SERVICE" >/dev/null
+    # PartOf= restarts a running API with the runtime and Wants= starts a stopped one.
+    systemctl restart "$SERVICE"
   fi
-  systemctl enable "$SERVICE" >/dev/null
-  systemctl restart "$SERVICE"
   ci_update_progress finalize '' healthcheck
   wait_healthy || fail '服务未在 30 次健康检查内就绪。'
   finish_activation
+  if [[ "$activation_scope" == full ]]; then
+    atomic_record "$APP_DIR/.runtime-deployment" "$(runtime_deployment_key)" || log '无法记录运行时的部署配置；下次安装会整体重启。'
+  fi
   atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
   atomic_record "$release/.install-ready" "$application_key"
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"
@@ -2658,7 +2822,7 @@ main() {
   rm -rf -- "$work_dir"
   trap - ERR INT TERM
   log "安装完成：已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha")；监听 $HOST_VALUE:$PORT_VALUE，配置与数据已保留。"
-  log "首次登录密码请在服务器运行：sudo journalctl -u $SERVICE --no-pager -n 30"
+  log "首次登录密码请在服务器运行：sudo journalctl -u $API_SERVICE --no-pager -n 30"
 }
 
 # CI may source pure helpers without changing its host.

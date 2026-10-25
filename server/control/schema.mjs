@@ -29,7 +29,8 @@ export function immediate(db, fn) {
 export function openHubDatabase(dbPath) {
   const db = new DatabaseSync(dbPath);
   try {
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+    // busy_timeout first: the runtime and the API may open the database at the same time.
+    db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
     immediate(db, () => db.exec(TABLES));
     if (process.platform !== 'win32') chmodSync(dbPath, 0o600);
   } catch (error) { db.close(); throw error; }

@@ -154,8 +154,95 @@ class OperatorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
                 operations.require_stopped()
 
+    def test_any_running_or_populated_unit_blocks_the_cold_checkpoint(self):
+        stopped = {'ActiveState': 'inactive', 'MainPID': '0', 'ControlGroup': ''}
+        for unit in operations.SERVICES:
+            with self.subTest(unit=unit):
+                states = {name: dict(stopped) for name in operations.SERVICES}
+                states[unit] = {'ActiveState': 'activating', 'MainPID': '0', 'ControlGroup': ''}
+                with patch.object(operations, 'service_state', side_effect=states.__getitem__):
+                    with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
+                        operations.require_stopped()
+                # A unit that stopped but left a process in the cgroup it had before.
+                states[unit] = dict(stopped)
+                group = '/system.slice/' + unit
+                with patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                        patch.object(Path, 'exists', lambda path: str(path) == '/sys/fs/cgroup' + group), \
+                        patch.object(Path, 'is_file', return_value=True), patch.object(Path, 'read_text', return_value='populated 1\n'):
+                    with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
+                        operations.require_stopped({unit: group})
+        with patch.object(operations, 'service_state', return_value=stopped):
+            self.assertEqual(set(operations.require_stopped()), set(operations.SERVICES))
+
+    def test_operation_stops_both_units_and_starts_the_runtime_unit(self):
+        import argparse
+        for running in operations.SERVICES:
+            with self.subTest(running=running), tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+                keys = Path(directory)
+                states = {unit: {'ActiveState': 'active' if unit == running else 'inactive', 'ControlGroup': '/system.slice/' + unit}
+                          for unit in operations.SERVICES}
+                args = argparse.Namespace(action='backup', destination=keys / 'backup', target_dir=None, backup_dir=None)
+                with patch.object(operations, 'KEYS', keys), patch.object(operations, 'deployment', return_value={'source': keys / 'data', 'uid': 1}), \
+                        patch.object(operations, 'run_cli', return_value={'state': 'normal'}), patch.object(operations, 'install_guard'), \
+                        patch.object(operations, 'safe_directory'), patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                        patch.object(operations, 'require_stopped') as stopped, patch.object(operations, 'systemctl') as controller:
+                    operations._main_locked(args)
+                self.assertEqual([call.args for call in controller.call_args_list], [('stop', *operations.SERVICES), ('start', operations.SERVICE)])
+                self.assertEqual(stopped.call_args_list[0].args, ({unit: '/system.slice/' + unit for unit in operations.SERVICES},))
+
+    def test_rejected_guard_runs_no_operation_and_restarts_only_a_live_source(self):
+        import argparse
+        for error, state, started in [(ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE'), 'normal', True),
+                                      (subprocess.CalledProcessError(1, 'daemon-reload'), 'normal', True),
+                                      (ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE'), 'retired', False)]:
+            with self.subTest(error=error, state=state), tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+                keys = Path(directory)
+                states = {unit: {'ActiveState': 'active', 'ControlGroup': '/system.slice/' + unit} for unit in operations.SERVICES}
+                args = argparse.Namespace(action='backup', destination=keys / 'backup', target_dir=None, backup_dir=None)
+                actions = []
+                def cli(_config, action, *_arguments):
+                    actions.append(action)
+                    return {'state': state}
+                with patch.object(operations, 'KEYS', keys), patch.object(operations, 'deployment', return_value={'source': keys / 'data', 'uid': 1}), \
+                        patch.object(operations, 'run_cli', side_effect=cli), patch.object(operations, 'install_guard', side_effect=error), \
+                        patch.object(operations, 'safe_directory'), patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                        patch.object(operations, 'require_stopped'), patch.object(operations, 'systemctl') as controller:
+                    with self.assertRaises(type(error)):
+                        operations._main_locked(args)
+                self.assertEqual(actions, ['keys', 'check-source', 'check-source'])
+                self.assertEqual([call.args for call in controller.call_args_list],
+                                 [('stop', *operations.SERVICES)] + ([('start', operations.SERVICE)] if started else []))
+
+    def test_deployment_requires_both_installer_units_with_one_identity(self):
+        with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+            root = Path(directory); runtime = root / 'runtime.service'; api = root / 'api.service'
+            def unit(entry, user='nobody', node='/usr/bin/node', marker='# Managed by project-aggregation installer\n'):
+                return f'{marker}[Service]\nUser={user}\nExecStart={node} {operations.APP}/current/server/{entry}\n'
+            cases = [(unit('index.mjs'), unit('api/main.mjs'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), None, 'MISSING'),
+                     (unit('runtime/main.mjs'), unit('runtime/main.mjs'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), unit('api/main.mjs', user='root'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), unit('api/main.mjs', node='/opt/node/bin/node'), 'SERVICE_CONFIG_INVALID'),
+                     (unit('runtime/main.mjs'), unit('api/main.mjs', marker=''), 'UNMANAGED_SERVICE')]
+            def trusted(filename, private=False):
+                if not Path(filename).exists():
+                    raise ValueError('MISSING')
+                return Path(filename)
+            for runtime_text, api_text, error in cases:
+                with self.subTest(error=error, api=api_text):
+                    runtime.write_text(runtime_text); api.unlink(missing_ok=True)
+                    if api_text is not None:
+                        api.write_text(api_text)
+                    with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'API_UNIT_FILE', api), \
+                            patch.object(operations, 'trusted_environment'), patch.object(operations, 'trusted', side_effect=trusted):
+                        with self.assertRaisesRegex(ValueError, error):
+                            operations.deployment()
+            api.write_text(unit('api/main.mjs'))
+            with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'API_UNIT_FILE', api), patch.object(operations, 'trusted', side_effect=trusted):
+                self.assertEqual(operations.managed_unit(runtime, 'runtime/main.mjs'), operations.managed_unit(api, 'api/main.mjs'))
+
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root ownership fixture runs in Linux CI')
-    def test_guard_install_is_incremental_and_does_not_restart_or_remove_other_overrides(self):
+    def test_guard_install_is_incremental_and_rejects_other_overrides(self):
         # The production drop-in requires a root-owned non-writable ancestor
         # chain. /tmp intentionally does not satisfy that installation contract.
         with tempfile.TemporaryDirectory(prefix='recovery-install-', dir='/run') as directory:
@@ -164,17 +251,103 @@ class OperatorTests(unittest.TestCase):
             (release / 'server/recovery').mkdir(parents=True)
             shutil.copyfile(ROOT / 'server/recovery/startup-guard.py', release / 'server/recovery/startup-guard.py')
             config = {'release': release, 'source': root / 'data', 'node': Path(NODE)}
-            library, dropins, launcher = root / 'lib', root / 'dropins', root / 'launcher'
-            with patch.object(operations, 'systemctl', return_value='') as controller:
-                operations.install_guard(config, library=library, dropins=dropins, launcher=launcher)
-                first = (dropins / '20-recovery-guard.conf').stat().st_mtime_ns
-                operations.install_guard(config, library=library, dropins=dropins, launcher=launcher)
-                self.assertEqual((dropins / '20-recovery-guard.conf').stat().st_mtime_ns, first)
-                self.assertEqual(sum(call.args == ('daemon-reload',) for call in controller.call_args_list), 1)
-                self.assertFalse(any('restart' in call.args for call in controller.call_args_list))
-            with patch.object(operations, 'systemctl', return_value='/etc/systemd/system/custom.conf'):
+            library, units, launcher = root / 'lib', root / 'units', root / 'launcher'
+            units.mkdir()
+            guards = [units / f'{unit}.d/20-recovery-guard.conf' for unit in operations.SERVICES]
+            # A small systemd: a reload loads each unit's drop-in files plus the
+            # drop-ins of shared directories (`shared`); `show` reports them.
+            loaded = {unit: {} for unit in operations.SERVICES}
+            shared = {unit: [] for unit in operations.SERVICES}
+            failing_reloads = []
+
+            def on_disk(unit):
+                return {str(path): path.read_bytes() for path in units.glob(f'{unit}.d/*.conf')}
+
+            def controller(*arguments, **_):
+                calls.append(arguments)
+                if arguments[0] == 'daemon-reload':
+                    if failing_reloads:
+                        failing_reloads.pop()
+                        raise subprocess.CalledProcessError(1, arguments)
+                    for unit in operations.SERVICES:
+                        loaded[unit] = {**on_disk(unit), **{path: b'' for path in shared[unit]}}
+                    return ''
+                self.assertEqual(arguments, ('show', arguments[1], '--property=DropInPaths', '--value'))
+                return ' '.join(loaded[arguments[1]])
+
+            def install(node=Path(NODE)):
+                operations.install_guard({**config, 'node': node}, library=library, units=units, launcher=launcher)
+
+            reloads = lambda: sum(call == ('daemon-reload',) for call in calls)
+            calls = []
+            with patch.object(operations, 'systemctl', side_effect=controller):
+                install()
+                self.assertEqual(guards[0].read_bytes(), guards[1].read_bytes())
+                self.assertEqual(guards[0].read_bytes(), operations.guard_dropin(library / 'startup-guard.py', Path(NODE)))
+                self.assertEqual(reloads(), 1)
+                # A later run rewrites nothing; it still reloads and checks what systemd loaded.
+                first = [guard.stat().st_mtime_ns for guard in guards]
+                install()
+                self.assertEqual([guard.stat().st_mtime_ns for guard in guards], first)
+                self.assertEqual(reloads(), 2)
+                self.assertFalse(any('restart' in call for call in calls))
+                # A missing API guard is added.
+                guards[1].unlink()
+                install()
+                self.assertTrue(guards[1].is_file())
+                self.assertEqual(reloads(), 3)
+                # A changed guard whose reload failed is loaded by the next run, which writes nothing.
+                failing_reloads.append(True)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    install(Path('/opt/node/bin/node'))
+                changed = [guard.read_bytes() for guard in guards]
+                install(Path('/opt/node/bin/node'))
+                self.assertEqual([guard.read_bytes() for guard in guards], changed)
+                self.assertEqual(reloads(), 5)
+                self.assertEqual(loaded[operations.API_SERVICE], {str(guards[1]): changed[1]})
+                # A drop-in added to a shared directory, guards unchanged, is loaded by the
+                # reload and then stops the install.
+                shared[operations.API_SERVICE] = ['/etc/systemd/system/service.d/zz.conf']
                 with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
-                    operations.install_guard(config, library=library, dropins=dropins, launcher=launcher)
+                    install(Path('/opt/node/bin/node'))
+                self.assertEqual([guard.read_bytes() for guard in guards], changed)
+                self.assertEqual(reloads(), 6)
+                # Once the operator removes it and reloads, the guards are accepted as they are.
+                shared[operations.API_SERVICE] = []
+                controller('daemon-reload')
+                install(Path('/opt/node/bin/node'))
+                self.assertEqual(reloads(), 8)
+                # Overrides stop the install before anything is written or reloaded: another unit's guard,
+                # a loaded custom drop-in alone or next to the guard, a custom drop-in not
+                # loaded yet alone or next to the guard, or an unmanaged guard.
+                custom = guards[1].with_name('custom.conf')
+                api_override = {operations.API_SERVICE: {str(guards[1]): b'', '/etc/systemd/system/custom.conf': b''}}
+                for name, reported, files, keep in [
+                        ('API reports the runtime guard', {operations.API_SERVICE: {str(guards[0]): b''}}, [], False),
+                        ('loaded runtime override', {operations.SERVICE: {'/etc/systemd/system/custom.conf': b''}}, [], False),
+                        ('loaded API override', {operations.API_SERVICE: {'/etc/systemd/system/custom.conf': b''}}, [], False),
+                        ('loaded API override next to the guard', api_override, [], True),
+                        ('unloaded API override', {}, [(custom, b'[Service]\n')], False),
+                        ('unloaded API override next to the guard', {}, [(custom, b'[Service]\n')], True),
+                        ('unmanaged API guard', {}, [(guards[1], b'[Service]\n')], False)]:
+                    with self.subTest(name):
+                        guard_files = [guard.read_bytes() for guard in guards]
+                        if not keep:
+                            for guard in guards: guard.unlink()
+                        for unit in operations.SERVICES:
+                            loaded[unit] = reported.get(unit, on_disk(unit))
+                        for path, content in files: path.write_bytes(content)
+                        before = [guard.read_bytes() if guard.exists() else None for guard in guards]
+                        count = reloads()
+                        with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE|UNMANAGED_GUARD'):
+                            install()
+                        self.assertEqual([guard.read_bytes() if guard.exists() else None for guard in guards], before)
+                        self.assertEqual(reloads(), count)
+                        self.assertFalse(any('restart' in call for call in calls))
+                        for path, _ in files: path.unlink()
+                        for guard, content in zip(guards, guard_files): guard.write_bytes(content)
+                        for unit in operations.SERVICES:
+                            loaded[unit] = on_disk(unit)
 
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root/service permissions run in Linux CI')
     def test_restored_target_parent_remains_traversable_by_the_service_account(self):
