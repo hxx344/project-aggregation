@@ -244,6 +244,8 @@ try {
     console.log('Service entry passed: launcher, runtime with five real modules, API restart without module restarts, pages reopened, collection and execution lease kept, group SIGTERM exit 0.');
   }
 } finally {
+  // An interrupt cleans up and exits 130 on its own.
+  if (interrupted?.running) await new Promise(() => {});
   if (entry) await stopEntry();
   await app?.close();
   await modules?.close();
