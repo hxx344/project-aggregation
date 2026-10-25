@@ -2475,6 +2475,13 @@ managed_release() {
 # the working directory through current, so the main process's working
 # directory is that release, also after a restart outside the installer. An
 # update that only restarts the API leaves the runtime there.
+# The major version of the running systemd, 0 when unknown.
+systemd_major() {
+  local version
+  version=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }') || true
+  version=${version%%[!0-9]*}
+  printf '%s' "${version:-0}"
+}
 live_runtime_release() {
   local pid directory releases
   pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null) && [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -2546,8 +2553,17 @@ prune_caches() {
   local cache="$APP_DIR/cache" entry name root links target key module directory interpreter recorded recorded_release
   local removed=0 failed=0 source_keys=0
   local -A keep=() keep_python=()
-  local -a roots=()
-  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "$(live_runtime_release || true)"; do
+  local runtime_release
+  local -a roots=() runtime_roots=()
+  if runtime_release=$(live_runtime_release); then
+    runtime_roots=("$runtime_release")
+  elif systemctl is-active --quiet "$SERVICE"; then
+    # As in prune_releases: while the runtime's release is unknown it may run from any of them.
+    for directory in "$APP_DIR"/releases/*; do
+      if managed_release "$directory" >/dev/null; then runtime_roots+=("$directory"); fi
+    done
+  fi
+  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "${runtime_roots[@]}"; do
     [[ -n "$root" && -e "$root" ]] || continue
     root=$(realpath -e -- "$root") || return 1
     roots+=("$root")
@@ -2711,7 +2727,7 @@ main() {
   fi
   if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
   if [[ -f "$APP_DIR/.aster-python-path" ]]; then ASTER_PYTHON_PATH=$(cat "$APP_DIR/.aster-python-path"); fi
-  systemd_version=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 + 0 }') || systemd_version=0
+  systemd_version=$(systemd_major)
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service" "$work_dir/api.service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   # Both deployment modes consume exactly the selected stable release. The

@@ -67,15 +67,18 @@ key() { printf '%064d' "$1"; }
 running="$APP_DIR/releases/999999999999-aaaaaaaaaaaaaaaa"
 mkdir -p "$running"
 for directory in "$old_release" "$release" "$running"; do touch "$directory/.managed-release"; key 41 > "$directory/.runtime-component-key"; done
-(cd "$running" && exec sleep 600) & live_pid=$!
 # Same name as the running release, but outside the releases directory.
-mkdir -p "$test_root/elsewhere/${running##*/}"
-(cd "$test_root/elsewhere/${running##*/}" && exec sleep 600) & outside_pid=$!
+elsewhere="$test_root/elsewhere/${running##*/}"
 gone="$APP_DIR/releases/888888888888-aaaaaaaaaaaaaaaa"
-mkdir -p "$gone"; touch "$gone/.managed-release"; key 41 > "$gone/.runtime-component-key"
-(cd "$gone" && exec sleep 600) & gone_pid=$!
-trap 'kill "$live_pid" "$outside_pid" "$gone_pid" 2>/dev/null || true; rm -rf -- "$test_root"' EXIT
-for attempt in {1..50}; do [[ $(readlink "/proc/$gone_pid/cwd") != "$gone" ]] || break; read -rt 0.1 <> <(:) || true; done
+mkdir -p "$elsewhere" "$gone"; touch "$gone/.managed-release"; key 41 > "$gone/.runtime-component-key"
+live_pid= outside_pid= gone_pid=
+trap 'kill $live_pid $outside_pid $gone_pid 2>/dev/null || true; rm -rf -- "$test_root"' EXIT
+in_directory() { (cd "$1" && exec sleep 600) </dev/null >/dev/null 2>&1 & printf '%s' "$!"; }
+live_pid=$(in_directory "$running") outside_pid=$(in_directory "$elsewhere") gone_pid=$(in_directory "$gone")
+for pid_directory in "$live_pid:$running" "$outside_pid:$elsewhere" "$gone_pid:$gone"; do
+  for attempt in {1..50}; do [[ $(readlink "/proc/${pid_directory%%:*}/cwd") != "${pid_directory#*:}" ]] || break; read -rt 0.1 <> <(:) || true; done
+  [[ $(readlink "/proc/${pid_directory%%:*}/cwd") == "${pid_directory#*:}" ]]
+done
 rm -rf -- "$gone"
 printf 'runtime unit\n' > "$UNIT_FILE"; cp "$UNIT_FILE" "$work_dir/service"
 printf 'api unit\n' > "$API_UNIT_FILE"
@@ -169,7 +172,7 @@ for name in dddddddddddd-eeeeeeeeeeeeeeee ffffffffffff-0000000000000000; do mkdi
 ( systemctl() { runtime_stub "$@"; }; previous_release=$old_release; prune_releases )
 [[ -d "$release" && -d "$old_release" && -d "$running" ]]
 [[ ! -e "$APP_DIR/releases/dddddddddddd-eeeeeeeeeeeeeeee" && ! -e "$APP_DIR/releases/ffffffffffff-0000000000000000" ]]
-kill "$live_pid" "$outside_pid" "$gone_pid" 2>/dev/null || true
+kill $live_pid $outside_pid $gone_pid 2>/dev/null || true
 rm -rf -- "$running" "$APP_DIR/.runtime-deployment" "$release/deploy"
 
 # Cache pruning keeps every entry that the active or rollback releases still use.
@@ -242,6 +245,16 @@ rm "$APP_DIR/.previous-greeks-python-path"
 prune_caches
 [[ -d "$APP_DIR/python/$(key 22)" && -d "$APP_DIR/python/$(key 23)" && -d "$APP_DIR/python/$(key 25)" ]]
 
+# While the runtime runs from an unknown release, every managed release is a root, as in prune_releases.
+other="$APP_DIR/releases/999999999999-bbbbbbbbbbbbbbbb"
+mkdir -p "$other" "$cache/runtime-dependencies-$(key 18)/node_modules"
+touch "$other/.managed-release"; printf '%s\n' "$(key 18)" > "$other/.runtime-dependency-key"
+( systemctl() { [[ $1 != show ]] || echo 0; }; prune_caches )
+[[ -d "$cache/runtime-dependencies-$(key 18)" ]]
+( systemctl() { [[ $1 != show ]] || echo 0; [[ $1 != is-active ]]; }; prune_caches )
+[[ ! -e "$cache/runtime-dependencies-$(key 18)" ]]
+rm -rf -- "$other"
+
 # A failed removal is reported without the ERR trap and keeps the entry under its original key.
 mkdir "$cache/embedded-$(key 36)"
 set +e
@@ -261,6 +274,11 @@ prune_caches
 # The units the installer writes are the units the update registry and the
 # recovery entry accept, with the recovery guard on each (design doc 6.3, 6.4).
 repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
+for output in 'systemd 255 (255.4-1ubuntu8.17)' 'systemd 257.1 (257.1-1)' 'systemd 252 (252.33-1~deb12u1)' 'unexpected'; do
+  expected=$(awk 'NR == 1 { print $2 + 0 }' <<< "$output"); expected=${expected%%.*}
+  [[ $(systemctl() { printf '%s\n+PAM\n' "$output"; }; systemd_major) == "$expected" ]]
+done
+[[ $(systemctl() { return 1; }; systemd_major) == 0 ]]
 (
   APP_DIR=/opt/project-aggregation SERVICE=project-aggregation API_SERVICE=project-aggregation-api SERVICE_USER=project-aggregation
   DATA_PATH=/var/lib/project-aggregation ENV_FILE=/etc/project-aggregation.env NODE_BIN=/usr/local/bin/node
@@ -269,6 +287,13 @@ repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
   mkdir -p "$work_dir" "$units"
   for systemd_version in 252 255; do
     write_unit
+    # systemd before 254 ignores RestartSteps, so the API restarts at a fixed interval.
+    if (( systemd_version < 254 )); then
+      grep -qx 'RestartSec=5' "$work_dir/api.service"
+      if grep -q '^RestartSteps=' "$work_dir/api.service"; then echo 'Backoff written for systemd < 254' >&2; exit 1; fi
+    else
+      grep -qx 'RestartSteps=5' "$work_dir/api.service" && grep -qx 'RestartSec=1' "$work_dir/api.service"
+    fi
     cp "$work_dir/service" "$units/$SERVICE.service"
     cp "$work_dir/api.service" "$units/$API_SERVICE.service"
     python3 -I - "$repository" "$test_root/filesystem" <<'PY'

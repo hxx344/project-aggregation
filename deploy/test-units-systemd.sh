@@ -81,7 +81,7 @@ JS
 touch "$release_one/.managed-release"
 chmod -R a+rX,go-w "$APP_DIR"
 atomic_link "$release_one" "$APP_DIR/current"
-systemd_version=$(systemctl --version | awk 'NR == 1 { print $2 + 0 }')
+systemd_version=$(systemd_major)
 write_unit
 if (( systemd_version >= 254 )); then grep -qx 'RestartSteps=5' "$work_dir/api.service"; else grep -qx 'RestartSec=5' "$work_dir/api.service"; fi
 install -m 0644 "$work_dir/service" "$UNIT_FILE"
@@ -136,10 +136,12 @@ snapshot=$(state)
 [[ $(field runtime.url <<< "$snapshot") == "file://$release_two/server/runtime/main.mjs" ]]
 [[ $(live_runtime_release) == "$release_two" ]]
 
-# A crashed runtime restarts (RestartSec=5) and the API reaches the new instance.
+# A crashed runtime restarts (RestartSec=5), the API restarts with it (PartOf=
+# carries the automatic restart) and reaches the new instance.
 runtime_pid=$(main_pid "$SERVICE") api_pid=$(main_pid "$API_SERVICE")
 kill -KILL "$runtime_pid"
 wait_main_pid "$SERVICE" "$runtime_pid"
+wait_main_pid "$API_SERVICE" "$api_pid"
 wait_healthy
 printf 'Runtime crash restart: API pid %s -> %s\n' "$api_pid" "$(main_pid "$API_SERVICE")"
 
