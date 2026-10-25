@@ -10,13 +10,15 @@ repository=$(cd -- "$(dirname "$0")/.." && pwd -P)
 fixture=$(mktemp -d /tmp/agg-recovery-systemd.XXXXXXXX)
 unit=project-aggregation-recovery-fixture.service
 unit_file=/run/systemd/system/$unit
-[[ ! -e "$unit_file" && ! -L "$unit_file" && $(systemctl show -p LoadState --value "$unit" 2>/dev/null) == not-found ]] || exit 1
+dropin_dir=$unit_file.d
+[[ ! -e "$unit_file" && ! -L "$unit_file" && ! -e "$dropin_dir" && ! -L "$dropin_dir" && $(systemctl show -p LoadState --value "$unit" 2>/dev/null) == not-found ]] || exit 1
 cleanup() {
   local result=$?
   trap - EXIT
   systemctl kill --kill-whom=all --signal=KILL "$unit" >/dev/null 2>&1 || true
   systemctl stop "$unit" >/dev/null 2>&1 || true
   if [[ -f "$unit_file" && ! -L "$unit_file" ]] && grep -qx '# Managed recovery CI fixture' "$unit_file"; then rm -f -- "$unit_file"; fi
+  if [[ -d "$dropin_dir" && ! -L "$dropin_dir" ]]; then rm -f -- "$dropin_dir/10-recovery-fixture.conf"; rmdir -- "$dropin_dir" || true; fi
   systemctl daemon-reload
   systemctl reset-failed "$unit" >/dev/null 2>&1 || true
   [[ "$fixture" == /tmp/agg-recovery-systemd.* && -d "$fixture" && ! -L "$fixture" ]] && rm -rf -- "$fixture"
@@ -47,6 +49,27 @@ systemctl daemon-reload
 systemctl start "$unit"
 for ((attempt=0; attempt<50; attempt++)); do [[ ! -f "$fixture/ready" ]] || break; sleep .1; done
 [[ -f "$fixture/ready" ]]
+# install_guard relies on these: a drop-in added on disk marks the loaded unit
+# NeedDaemonReload, and the reload lists it in DropInPaths.
+dropin_state() {
+  /usr/bin/python3 -I - "$repository" "$unit" <<'PY'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location('recovery_operations', pathlib.Path(sys.argv[1]) / 'server/recovery/operations.py')
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+print(module.dropin_state(sys.argv[2]))
+PY
+}
+expect_dropin_state() {
+  local actual
+  actual=$(dropin_state)
+  [[ "$actual" == "$1" ]] || { echo "dropin_state: $actual, expected $1" >&2; return 1; }
+}
+expect_dropin_state "([], False)"
+mkdir -m 0755 "$dropin_dir"
+printf '[Service]\nEnvironment=RECOVERY_FIXTURE=1\n' > "$dropin_dir/10-recovery-fixture.conf"
+expect_dropin_state "([], True)"
+systemctl daemon-reload
+expect_dropin_state "(['$dropin_dir/10-recovery-fixture.conf'], False)"
 group=$(systemctl show -p ControlGroup --value "$unit")
 systemctl stop "$unit"
 [[ $(systemctl show -p MainPID --value "$unit") == 0 ]]
@@ -76,4 +99,4 @@ import {pathToFileURL} from 'node:url';
 const {acquireRecoveryLocks,assertLifecycleLock}=await import(pathToFileURL(process.argv[2]+'/server/recovery/lifecycle-lock.mjs'));
 const lock=await acquireRecoveryLocks({dataDir:process.argv[3]}); assertLifecycleLock(lock,{dataDir:process.argv[3]}); await lock.close();
 JS
-echo 'Real cgroup orphan rejection, complete stop and native lifecycle lock passed.'
+echo 'Real drop-in state, cgroup orphan rejection, complete stop and native lifecycle lock passed.'

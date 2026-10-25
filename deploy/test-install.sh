@@ -255,9 +255,9 @@ mkdir -p "$other" "$cache/runtime-dependencies-$(key 18)/node_modules"
 touch "$other/.managed-release"; printf '%s\n' "$(key 18)" > "$other/.runtime-dependency-key"
 ( systemctl() { [[ $1 != show ]] || echo 0; }; prune_caches )
 [[ -d "$cache/runtime-dependencies-$(key 18)" ]]
-( live_runtime_release() { printf '%s' "$other"; }; prune_caches )
+( live_runtime_release() { printf '%s' "$other"; }; inactive prune_caches )
 [[ -d "$cache/runtime-dependencies-$(key 18)" ]]
-( live_runtime_release() { printf '%s' "$release"; }; prune_caches )
+( live_runtime_release() { printf '%s' "$release"; }; inactive prune_caches )
 [[ ! -e "$cache/runtime-dependencies-$(key 18)" ]]
 mkdir -p "$cache/runtime-dependencies-$(key 18)/node_modules"
 ( systemctl() { [[ $1 != show ]] || echo 0; [[ $1 != is-active ]]; }; prune_caches )
