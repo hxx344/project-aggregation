@@ -13,6 +13,8 @@ export type UpdateModule = {
 
 export type UpdateDeployMode = 'source' | 'ci';
 
+export type UpdateScope = 'full' | 'api';
+
 export type UpdateJob = {
   id: string;
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted';
@@ -27,6 +29,8 @@ export type UpdateJob = {
   }>;
   message: string;
   deployMode?: UpdateDeployMode;
+  /** api: only the API restarted; trading kept running without maintenance. */
+  scope?: UpdateScope;
   progress?: UpdateProgress;
   stageTimings?: { entries: Array<{ stage: UpdateStage; detail?: string; durationMs: number | null }> };
 };
@@ -42,6 +46,8 @@ export type UpdateState = {
   checkedAt: string | null;
   checkError: string | null;
   planId: string | null;
+  /** Restart scope of the plan per deployment mode; a missing value means full. */
+  planScopes?: Partial<Record<UpdateDeployMode, UpdateScope>> | null;
   expiresAt: string | null;
   modules: UpdateModule[];
   job: UpdateJob | null;

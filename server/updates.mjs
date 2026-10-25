@@ -12,6 +12,7 @@ const GITHUB_TOKEN = /^[A-Za-z0-9_]{20,255}$/;
 const TOKEN_BUSY = '正在检查版本或执行更新，请完成后再修改 GitHub Token';
 const TOKEN_INVALID = 'GitHub Token 格式无效，请粘贴完整 Token，且不要包含空格或换行';
 const DEPLOYMENT_MODES = new Set(['source', 'ci']);
+const SCOPES = new Set(['full', 'api']);
 
 export class UpdateError extends Error {
   constructor(status, message, { uncertain = false } = {}) { super(message); this.status = status; this.uncertain = uncertain; }
@@ -80,6 +81,8 @@ export function publicUpdateState(value) {
   if (value.deploymentModes !== undefined && (!Array.isArray(value.deploymentModes) || !value.deploymentModes.length
     || value.deploymentModes.length > DEPLOYMENT_MODES.size || new Set(value.deploymentModes).size !== value.deploymentModes.length
     || value.deploymentModes.some(mode => !DEPLOYMENT_MODES.has(mode)))) invalid();
+  if (value.planScopes !== undefined && value.planScopes !== null && (!object(value.planScopes)
+    || Object.keys(value.planScopes).some(mode => !DEPLOYMENT_MODES.has(mode)) || Object.values(value.planScopes).some(scope => !SCOPES.has(scope)))) invalid();
   const modules = value.modules.map(row => {
     if (!object(row) || !identifier(row.id) || !text(row.name, 120) || !['current', 'available', 'unavailable', 'unmanaged'].includes(row.state)
       || !['currentVersion', 'latestVersion', 'currentCommit', 'latestCommit'].every(key => nullable(row[key], value => text(value, 128)))
@@ -96,7 +99,8 @@ export function publicUpdateState(value) {
     if (!object(row) || !identifier(row.id) || !['queued', 'running', 'succeeded', 'failed', 'interrupted'].includes(row.status)
       || !timestamp(row.startedAt) || !nullable(row.finishedAt, timestamp) || !nullable(row.activeModule, identifier)
       || !text(row.message) || !Array.isArray(row.steps) || row.steps.length > 128
-      || row.deployMode !== undefined && !DEPLOYMENT_MODES.has(row.deployMode)) invalid();
+      || row.deployMode !== undefined && !DEPLOYMENT_MODES.has(row.deployMode)
+      || row.scope !== undefined && !SCOPES.has(row.scope)) invalid();
     const steps = row.steps.map(step => {
       if (!object(step) || !identifier(step.id) || !text(step.name, 120) || !['pending', 'running', 'succeeded', 'failed', 'skipped'].includes(step.status)
         || step.message !== undefined && !text(step.message)) invalid();
@@ -104,6 +108,7 @@ export function publicUpdateState(value) {
     });
     job = { id: row.id, status: row.status, startedAt: row.startedAt, finishedAt: row.finishedAt, activeModule: row.activeModule, steps, message: row.message };
     if (row.deployMode !== undefined) job.deployMode = row.deployMode;
+    if (row.scope !== undefined) job.scope = row.scope;
     const progress = publicProgress(row.progress, row);
     if (progress) job.progress = progress;
     const stageTimings = publicStageTimings(row.stageTimings, row);
@@ -112,6 +117,8 @@ export function publicUpdateState(value) {
   return { enabled: value.enabled, ...(value.reason === undefined ? {} : { reason: value.reason }), checking: value.checking,
     checkedAt: value.checkedAt, checkError: value.checkError, planId: value.planId, expiresAt: value.expiresAt, modules, job,
     ...(value.deploymentModes === undefined ? {} : { deploymentModes: [...value.deploymentModes] }),
+    // Restart scope of the plan per deployment mode; a missing mode or value means full.
+    ...(value.planScopes === undefined ? {} : { planScopes: value.planScopes === null ? null : Object.fromEntries(Object.entries(value.planScopes)) }),
     ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }),
     ...(value.moduleMaintenance === undefined ? {} : { moduleMaintenance: value.moduleMaintenance.map(row => ({ id: row.id, confirmed: row.confirmed })) }) };
 }
@@ -167,10 +174,11 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
   return {
     async status() { try { return await request('GET', '/status'); } catch { return unavailableUpdateState(); } },
     check() { return request('POST', '/check', {}); },
-    apply(planId, deployMode = 'source') {
+    apply(planId, deployMode = 'source', scope = 'full') {
       validateUpdateBody('apply', { planId, deployMode });
-      // Keep source updates compatible with helpers installed before mode selection.
-      return request('POST', '/apply', { planId, ...(deployMode === 'source' ? {} : { deployMode }) });
+      if (!SCOPES.has(scope)) throw new UpdateError(400, '更新范围无效');
+      // Keep source and full updates compatible with helpers installed before mode and scope selection.
+      return request('POST', '/apply', { planId, ...(deployMode === 'source' ? {} : { deployMode }), ...(scope === 'full' ? {} : { scope }) });
     },
     token(token) { validateUpdateBody('token', { token }); return request('POST', '/token', { token }); },
   };
@@ -185,6 +193,9 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   let pendingPlanId = readPendingPlanId();
   let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
+  // Restart scopes the updater reported for its latest plan. They are fixed per
+  // plan id, so a later read never makes them stale (design doc 6.5).
+  let plan = { id: null, scopes: null };
   let moduleSync = Promise.resolve(), watcher = null, polling = null, closed = false;
   // The maintenance value each trading module last acknowledged; null is unknown.
   // `instances` holds the module generation that acknowledged it, where the
@@ -212,7 +223,11 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     void next.catch(() => {}).finally(watchRelease);
     return next;
   };
-  const withModules = state => tradingModules.length ? { ...state, moduleMaintenance: tradingModules.map(id => ({ id, confirmed: confirmed(id) })) } : state;
+  const withModules = value => {
+    // A pending plan keeps its full admission (see apply), so it is never offered as API-only.
+    const state = pendingPlanId && value.planScopes ? { ...value, planScopes: null } : value;
+    return tradingModules.length ? { ...state, moduleMaintenance: tradingModules.map(id => ({ id, confirmed: confirmed(id) })) } : state;
+  };
   // The hub restarts while the update job is still running, so the latch can
   // only be released by a later status read. Without a server-side read the
   // trading modules stay in maintenance until some browser asks for status.
@@ -233,18 +248,23 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     if (!value) rememberMode();
   }
   if (pendingPlanId) remember(true);
+  function learn(state) {
+    if (state.planId) plan = { id: state.planId, scopes: state.planScopes ?? null };
+    return state;
+  }
   function observe(state) {
     if (state.enabled) {
       // A timed-out request may still be waiting for root's lock. Idle state is
       // conclusive only after that request's plan can no longer be accepted.
-      if (ACTIVE.has(state.job?.status) || pendingPlanId && state.planId === pendingPlanId) remember(true);
+      // An API-scope job leaves the runtime running, so it needs no maintenance.
+      if (ACTIVE.has(state.job?.status) && state.job.scope !== 'api' || pendingPlanId && state.planId === pendingPlanId) remember(true);
       else { rememberPending(null); remember(false); }
     }
     return state;
   }
   async function status() {
     const version = generation;
-    const state = publicUpdateState(await client.status());
+    const state = learn(publicUpdateState(await client.status()));
     // A read that returns during shutdown must not write state or call modules.
     if (closed) return state;
     if (!applying && version === generation) observe(state);
@@ -254,7 +274,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   }
   async function check() {
     const version = generation;
-    const state = publicUpdateState(await client.check());
+    const state = learn(publicUpdateState(await client.check()));
     if (!applying && version === generation) observe(state);
     await synchronizeModules().catch(() => {});
     return withModules(state);
@@ -269,12 +289,12 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   async function withExecutionEntry(operation, { scope } = {}) {
     // An unknown scope would match no gate, so it is refused rather than allowed.
     if (scope !== undefined && scope !== 'native' && !moduleIds.includes(scope) && !tradingModules.includes(scope)) throw new UpdateError(503, SCOPE_INVALID);
-    if (applying) throw new UpdateError(409, MAINTENANCE);
+    if (applying?.scope === 'full') throw new UpdateError(409, MAINTENANCE);
     // Reserve before the first await, so apply cannot pass its idle check concurrently.
     entries += 1;
     try {
       await status();
-      if (maintenance || applying) throw new UpdateError(409, MAINTENANCE);
+      if (maintenance || applying?.scope === 'full') throw new UpdateError(409, MAINTENANCE);
       // Only the target trading module's gate matters; other scopes need none.
       const required = scope === undefined ? tradingModules : tradingModules.filter(id => id === scope);
       if (!required.every(confirmed)) throw new UpdateError(503, MODULE_UNCONFIRMED);
@@ -289,6 +309,8 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       return applying.promise;
     }
     if (pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
+    // A pending plan may already be accepted as full, so it keeps that admission.
+    if (!pendingPlanId && plan.id === planId && plan.scopes?.[deployMode] === 'api') return applyApi(planId, authorize, deployMode);
     const busy = () => entries || execution.openEntries() || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status));
     if (busy()) throw new UpdateError(409, EXECUTION_BUSY);
     const previous = { maintenance, pendingPlanId, pendingDeployMode };
@@ -308,7 +330,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       throw error;
     }
     generation += 1;
-    const pending = { planId, deployMode, promise: null };
+    const pending = { planId, deployMode, scope: 'full', promise: null };
     applying = pending;
     pending.promise = (async () => {
       try {
@@ -316,7 +338,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
         await prepareApply();
         // Run authorization again immediately before sending the privileged request.
         authorize();
-        const state = publicUpdateState(await client.apply(planId, deployMode));
+        const state = learn(publicUpdateState(await client.apply(planId, deployMode)));
         rememberPending(null);
         observe(state);
         return state;
@@ -327,6 +349,27 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       } finally {
         if (applying === pending) { generation += 1; applying = null; }
         await synchronizeModules();
+      }
+    })();
+    return pending.promise;
+  }
+  // Design doc 6.5: an update that restarts only the API leaves the runtime, its
+  // modules and native jobs running, so it enters no trading maintenance and
+  // needs no stop evidence. The API's own stop drains its requests. The updater
+  // accepts the scope only for a plan it forecast as 'api', and the installer
+  // refuses rather than widen it.
+  function applyApi(planId, authorize, deployMode) {
+    generation += 1;
+    const pending = { planId, deployMode, scope: 'api', promise: null };
+    applying = pending;
+    pending.promise = (async () => {
+      try {
+        authorize();
+        const state = learn(publicUpdateState(await client.apply(planId, deployMode, 'api')));
+        observe(state);
+        return state;
+      } finally {
+        if (applying === pending) { generation += 1; applying = null; }
       }
     })();
     return pending.promise;

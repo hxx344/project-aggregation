@@ -162,8 +162,13 @@ def installed(module: Module, filesystem=Path('/')):
         application_key = optional_text(release / '.release-application-key')
         application_key = application_key if HEX64.fullmatch(application_key) else None
         identity = hashlib.sha256(('\n'.join([str(release), *sources, checked or '', artifact or '', application_key or ''])).encode()).hexdigest()
+        # Only plan the scope of an update (design doc 6.5); the installer decides again before activation.
+        runtime_key = optional_text(release / '.runtime-component-key')
+        runtime_key = runtime_key if HEX64.fullmatch(runtime_key) else None
+        runtime_recorded = (root / '.runtime-deployment').is_file() and not (root / '.runtime-deployment').is_symlink()
         result.update(state='unavailable', currentCommit=checked, currentVersion=checked[:12] if checked else None,
-                      reason='尚未检查正式版本', identity=identity, artifactCommit=artifact, applicationKey=application_key)
+                      reason='尚未检查正式版本', identity=identity, artifactCommit=artifact, applicationKey=application_key,
+                      runtimeKey=runtime_key, runtimeRecorded=runtime_recorded)
     except (OSError, ValueError, UnicodeError):
         result['reason'] = '本机安装或服务配置不符合受管理目录约定，请使用一键部署命令检查'
     return result

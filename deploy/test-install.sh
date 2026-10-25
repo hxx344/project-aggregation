@@ -120,6 +120,10 @@ printf 'not-a-key\n' > "$release/.runtime-component-key"; key 41 | tr 4 x > "$ru
 key 41 > "$release/.runtime-component-key"; key 41 > "$running/.runtime-component-key"; expect_scope api 'keys restored'
 touch "$test_root/runtime-inactive"; expect_scope full 'runtime not running'; rm "$test_root/runtime-inactive"
 touch "$test_root/migration-pending"; expect_scope full 'module migration outstanding'; rm "$test_root/migration-pending"
+# Design doc 6.5: only an api-scope admission constrains the activation, and only against widening.
+for planned in '' full; do PROJECT_DEPLOY_SCOPE=$planned scope_admitted full; PROJECT_DEPLOY_SCOPE=$planned scope_admitted api; done
+PROJECT_DEPLOY_SCOPE=api scope_admitted api
+if PROJECT_DEPLOY_SCOPE=api scope_admitted full; then echo 'An api-scope update was widened' >&2; exit 1; fi
 mkdir -p "$release/deploy"
 DATA_PATH="$test_root/data"
 for answer in 'print("committed")' 'print("pending")' 'raise SystemExit(3)'; do

@@ -150,6 +150,33 @@ test('deployment selection validates modes and preserves the legacy source reque
   } }), error => error.status === 503);
 });
 
+test('plan scopes and the api scope cross the client only as fixed values', async t => {
+  const calls = [];
+  const client = await fixture(t, async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString()); calls.push(body);
+    res.end(JSON.stringify({ ...state(), planScopes: { source: 'full', ci: 'api' }, job: {
+      id: 'current-job', status: 'queued', deployMode: body.deployMode || 'source', scope: body.scope || 'full', startedAt: now,
+      finishedAt: null, activeModule: null, message: '准备更新', steps: [],
+    } }));
+  });
+  const result = await client.apply(planId, 'ci', 'api');
+  assert.deepEqual(result.planScopes, { source: 'full', ci: 'api' });
+  assert.equal(result.job.scope, 'api');
+  assert.equal((await client.apply(planId, 'ci')).job.scope, 'full');
+  assert.deepEqual(calls, [{ planId, deployMode: 'ci', scope: 'api' }, { planId, deployMode: 'ci' }], 'full stays the legacy request');
+  for (const scope of [null, '', 'API', 'runtime', 'api;id']) assert.throws(() => client.apply(planId, 'ci', scope), error => error.status === 400);
+  assert.equal(calls.length, 2);
+  assert.throws(() => validateUpdateBody('apply', { planId, scope: 'api' }), error => error.status === 400, 'browsers never choose the scope');
+  assert.equal(publicUpdateState({ ...state(), planScopes: null }).planScopes, null);
+  assert.equal(publicUpdateState(state()).planScopes, undefined);
+  for (const planScopes of ['api', [], { ci: 'runtime' }, { auto: 'api' }, { ci: null }]) {
+    assert.throws(() => publicUpdateState({ ...state(), planScopes }), error => error.status === 503);
+  }
+  assert.throws(() => publicUpdateState({ ...state(), job: { id: 'current-job', status: 'queued', scope: 'everything', startedAt: now,
+    finishedAt: null, activeModule: null, message: '准备更新', steps: [] } }), error => error.status === 503);
+});
+
 test('updater client bounds total request time including a trickling response', async t => {
   const client = await fixture(t, (req, res) => {
     res.write('{'); const timer = setInterval(() => res.write(' '), 10);

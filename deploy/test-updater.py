@@ -28,6 +28,7 @@ OLD = 'b' * 40
 NEW = 'a' * 40
 OLD_KEY = '1' * 64
 NEW_KEY = '2' * 64
+RUNTIME_KEY = '5' * 64
 GITHUB_TOKEN = 'github_pat_' + 'A1b2c3d4' * 8
 REPLACEMENT_TOKEN = 'ghp_' + 'X9y8z7w6' * 5
 INSTALLER = b'#!/usr/bin/env bash\n# CI RELEASE HELPERS\n: "${PROJECT_DEPLOY_MANIFEST_FILE}"\n'
@@ -191,6 +192,26 @@ class RegistryTests(RootFixture):
         api.unlink()
         self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
 
+    def test_runtime_forecast_inputs_are_protected_and_keep_the_identity(self):
+        module = registry.BY_ID['hub']; root, release, _ = self.install(module)
+        value = registry.installed(module, self.root)
+        self.assertEqual((value['runtimeKey'], value['runtimeRecorded']), (None, False))
+        identity = value['identity']
+        key = release / '.runtime-component-key'; key.write_text(RUNTIME_KEY + '\n', encoding='utf8')
+        record = root / '.runtime-deployment'; record.write_text('recorded\n', encoding='utf8')
+        value = registry.installed(module, self.root)
+        self.assertEqual((value['runtimeKey'], value['runtimeRecorded'], value['identity']), (RUNTIME_KEY, True, identity))
+        key.write_text('broken', encoding='utf8')
+        self.assertIsNone(registry.installed(module, self.root)['runtimeKey'])
+        record.unlink(); record.mkdir()
+        self.assertFalse(registry.installed(module, self.root)['runtimeRecorded'])
+        record.rmdir(); outside = self.root / 'forged-record'; outside.write_text('recorded\n', encoding='utf8')
+        self.link(outside, record)
+        self.assertFalse(registry.installed(module, self.root)['runtimeRecorded'])
+        key.unlink(); forged = self.root / 'forged-key'; forged.write_text(RUNTIME_KEY, encoding='utf8')
+        self.link(forged, key)
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+
     def test_only_the_managed_recovery_guard_of_each_unit_is_accepted(self):
         module = registry.BY_ID['hub']; root, release, unit = self.install(module)
         guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
@@ -290,7 +311,9 @@ class ReleaseTests(unittest.TestCase):
                      lambda m: m.update(commit=OLD), lambda m: m.update(tag='deploy-' + OLD),
                      lambda m: m.update(artifacts={}), lambda m: m['artifacts']['linux-x64'].update(file='../escape.tar.gz'),
                      lambda m: m['artifacts']['linux-x64'].update(sha256='broken'),
-                     lambda m: m['artifacts']['linux-x64'].update(application_key='broken')]
+                     lambda m: m['artifacts']['linux-x64'].update(application_key='broken'),
+                     lambda m: m['artifacts']['linux-x64'].update(runtime_key='broken'),
+                     lambda m: m['artifacts']['linux-x64'].update(runtime_key=None)]
         for mutate in mutations:
             self.value['manifest'] = copy.deepcopy(original); mutate(self.value['manifest'])
             with self.subTest(manifest=self.value['manifest']):
@@ -317,6 +340,13 @@ class ReleaseTests(unittest.TestCase):
             releases.architecture()
 
 
+class ScopeContractTests(unittest.TestCase):
+    def test_installer_honours_the_scope_contract_of_the_update_service(self):
+        source = (Path(__file__).resolve().parent / 'install.sh').read_bytes()
+        for part in updater.SCOPE_INSTALLER:
+            self.assertIn(part, source)
+
+
 class CoordinatorTests(RootFixture):
     def setUp(self):
         super().setUp()
@@ -327,7 +357,7 @@ class CoordinatorTests(RootFixture):
                            'latestVersion': None, 'currentCommit': OLD, 'latestCommit': None, 'applicationKey': OLD_KEY,
                            'artifactCommit': OLD, 'identity': hashlib.sha256(module.id.encode()).hexdigest()}
                           for module in registry.MODULES]
-        self.launches = []; self.executed = []; self.executed_modes = []; self.syntaxes = []
+        self.launches = []; self.executed = []; self.executed_modes = []; self.executed_scopes = []; self.syntaxes = []
         self.installer_hook = None
         self.alive = False
         self.coordinator = self.make_coordinator()
@@ -338,10 +368,11 @@ class CoordinatorTests(RootFixture):
                                    alive=lambda: self.alive, installer=self.install, syntax=lambda p: self.syntaxes.append(p.stem),
                                    clock=lambda: self.clock, stack_lock=self.root / 'stack.lock')
 
-    def install(self, script, manifest, log, deploy_mode='source'):
+    def install(self, script, manifest, log, deploy_mode='source', scope='full'):
         key = script.name.removesuffix('.install.sh')
         self.executed.append(key)
         self.executed_modes.append(deploy_mode)
+        self.executed_scopes.append(scope)
         log.write_text('api_secret=PRIVATE_DEPLOYMENT_CREDENTIAL\n', encoding='utf8')
         if self.installer_hook:
             code = self.installer_hook(key)
@@ -1685,6 +1716,173 @@ class CoordinatorTests(RootFixture):
         self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci'}))[1]['job']['id'], accepted['job']['id'])
         self.assertEqual(len(self.launches), 1)
 
+    def admit_api(self):
+        self.network.values['hub']['manifest']['artifacts']['linux-x64']['runtime_key'] = RUNTIME_KEY
+        self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.SCOPE_INSTALLER)
+        self.installed[0].update(runtimeKey=RUNTIME_KEY, runtimeRecorded=True)
+
+    def test_installer_without_scope_admission_is_planned_in_full(self):
+        self.admit_api()
+        complete = self.network.values['hub']['installer']
+        for missing in (*updater.SCOPE_INSTALLER, None):
+            with self.subTest(missing=missing):
+                self.network.values['hub']['installer'] = INSTALLER + b''.join(part for part in updater.SCOPE_INSTALLER if part != missing)
+                self.assertEqual(self.network.values['hub']['installer'] == complete, missing is None)
+                # Installers are cached per commit; a fresh reader sees this one.
+                self.reader = releases.Releases(self.network, arch='linux-x64')
+                self.coordinator = self.make_coordinator(); self.clock += 180
+                self.assertEqual(self.check()['planScopes']['ci'], 'api' if missing is None else 'full')
+
+    def test_ci_plan_is_api_only_for_a_recorded_unchanged_runtime(self):
+        legacy = self.check()
+        self.assertEqual(legacy['planScopes'], {'source': 'full', 'ci': 'full'}, 'packages without a runtime key restart everything')
+        self.clock += 180
+        self.admit_api()
+        admitted = self.check()
+        self.assertNotEqual(admitted['planId'], legacy['planId'], 'a changed forecast never reuses a reviewed plan')
+        self.assertEqual(admitted['planScopes'], {'source': 'full', 'ci': 'api'})
+        self.assertEqual(updater.read_json(self.coordinator.plans / admitted['planId'] / 'plan.json')['scopes'], admitted['planScopes'])
+        self.clock += 180
+        self.assertEqual(self.prepare(), admitted['planId'])
+        changes = {'changed runtime': lambda: self.installed[0].update(runtimeKey='6' * 64),
+                   'unknown installed runtime': lambda: self.installed[0].pop('runtimeKey'),
+                   'unrecorded deployment': lambda: self.installed[0].update(runtimeRecorded=False),
+                   'legacy package': lambda: self.network.values['hub']['manifest']['artifacts']['linux-x64'].pop('runtime_key')}
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                self.admit_api(); self.clock += 180
+                previous = self.check()
+                self.assertEqual(previous['planScopes']['ci'], 'api')
+                change(); self.clock += 180
+                result = self.check()
+                self.assertEqual(result['planScopes'], {'source': 'full', 'ci': 'full'})
+                self.assertNotEqual(result['planId'], previous['planId'])
+
+    def test_api_scope_needs_an_api_plan_and_reenters_only_with_the_same_scope(self):
+        full = self.prepare()
+        for mode in ('source', 'ci'):
+            with self.subTest(mode=mode), self.assertRaises(updater.UpdateError) as caught:
+                self.coordinator.apply(full, mode, 'api')
+            self.assertEqual(caught.exception.status, 409)
+        for scope in (None, True, '', 'API', 'api ', 'partial'):
+            with self.subTest(scope=scope), self.assertRaises(updater.UpdateError) as caught:
+                self.coordinator.apply(full, 'ci', scope)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertIsNone(self.coordinator.status()['job'])
+        self.admit_api(); self.clock += 180
+        plan = self.prepare()
+        with self.assertRaises(updater.UpdateError):
+            self.coordinator.apply(plan, 'source', 'api')
+        accepted = self.coordinator.apply(plan, 'ci', 'api')
+        self.assertEqual(accepted['job']['scope'], 'api')
+        self.assertEqual(accepted['planScopes'], {'source': 'full', 'ci': 'api'})
+        restarted = self.make_coordinator()
+        self.assertEqual(restarted.apply(plan, 'ci', 'api')['job']['id'], accepted['job']['id'])
+        with self.assertRaises(updater.UpdateError) as caught:
+            restarted.apply(plan, 'ci')
+        self.assertEqual(caught.exception.status, 409)
+        restarted.run()
+        self.assertEqual((self.executed_modes, self.executed_scopes), (['ci'], ['api']))
+        finished = restarted.status()
+        self.assertEqual((finished['job']['status'], finished['job']['scope']), ('succeeded', 'api'))
+        self.assertIsNone(finished['planScopes'], 'scopes are public only with their plan')
+
+    def test_full_scope_runs_an_api_plan_and_legacy_jobs_and_plans_are_full(self):
+        self.admit_api()
+        plan = self.prepare()
+        self.assertEqual(self.coordinator.apply(plan, 'ci')['job']['scope'], 'full')
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            del state['job']['scope']
+            plan_file = self.coordinator.plans / plan / 'plan.json'
+            value = updater.read_json(plan_file); del value['scopes']
+            updater.write_json(plan_file, value)
+            self.coordinator.save(state)
+        restarted = self.make_coordinator()
+        self.assertEqual(restarted.status()['job']['scope'], 'full')
+        self.assertEqual(restarted.read_plan(plan)['scopes'], {'source': 'full', 'ci': 'full'})
+        restarted.run()
+        self.assertEqual(self.executed_scopes, ['full'])
+        self.assertEqual(restarted.status()['job']['status'], 'succeeded')
+
+    def test_corrupt_plan_or_job_scope_never_executes(self):
+        bad_scopes = [None, [], {'ci': 'api'}, {'source': 'api', 'ci': 'api'}, {'source': 'full', 'ci': 'partial'},
+                      {'source': 'full', 'ci': 'api', 'extra': 'full'}]
+        for scopes in bad_scopes:
+            with self.subTest(scopes=scopes):
+                self.admit_api(); self.clock += 180
+                plan = self.prepare()
+                plan_file = self.coordinator.plans / plan / 'plan.json'
+                value = updater.read_json(plan_file); value['scopes'] = scopes
+                updater.write_json(plan_file, value)
+                with self.assertRaises(updater.UpdateError) as caught:
+                    self.coordinator.apply(plan, 'ci')
+                self.assertEqual(caught.exception.status, 409)
+        self.clock += 180
+        plan = self.prepare()
+        self.coordinator.apply(plan, 'ci', 'api')
+        plan_file = self.coordinator.plans / plan / 'plan.json'
+        value = updater.read_json(plan_file); value['scopes'] = {'source': 'full', 'ci': 'full'}
+        updater.write_json(plan_file, value)
+        self.coordinator.run()
+        self.assertEqual(self.executed, [])
+        self.assertEqual(self.coordinator.status()['job']['status'], 'failed')
+        with self.coordinator.lock():
+            state = self.coordinator.load()
+            state['job'].update(id='f' * 32, status='queued', scope='partial')
+            self.coordinator.save(state)
+        self.coordinator.run()
+        self.assertEqual(self.executed, [])
+
+    def test_refused_api_update_leaves_release_unchanged_and_next_plan_is_full(self):
+        self.installer_hook = lambda key: updater.SCOPE_REFUSED
+        # The same exit status of a full installation is an ordinary failure.
+        self.coordinator.apply(self.prepare(), 'ci'); self.coordinator.run()
+        self.assertIn('更新失败', self.coordinator.status()['job']['message'])
+        self.assertNotIn('scopeRefused', self.coordinator.load())
+        self.admit_api(); self.clock += 180
+        plan = self.prepare()
+        self.coordinator.apply(plan, 'ci', 'api'); self.coordinator.run()
+        state = self.coordinator.status()
+        self.assertEqual(state['job']['status'], 'failed')
+        self.assertIn('需要整体重启', state['job']['message'])
+        self.assertEqual(state['modules'][0]['currentCommit'], OLD)
+        self.assertEqual(self.coordinator.load()['scopeRefused'], NEW)
+        self.installer_hook = None; self.clock += 180
+        replanned = self.check()
+        self.assertEqual(replanned['planScopes'], {'source': 'full', 'ci': 'full'})
+        self.assertFalse(replanned['modules'][0].get('recovery'), 'nothing was activated')
+        self.coordinator.apply(replanned['planId'], 'ci'); self.coordinator.run()
+        self.assertEqual(self.executed_scopes, ['full', 'api', 'full'])
+        self.assertEqual(self.coordinator.status()['job']['status'], 'succeeded')
+
+    def test_apply_http_contract_accepts_only_an_optional_enumerated_scope(self):
+        self.admit_api()
+        plan = self.prepare()
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), updater.Handler)
+        server.coordinator = self.coordinator
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05})
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(server.shutdown)
+        def request(body):
+            connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+            try:
+                connection.request('POST', '/apply', body=body, headers={'Content-Type': 'application/json'})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+        for scope in (None, True, 1, {}, '', 'API', 'api;id'):
+            self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci', 'scope': scope}))[0], 400)
+        self.assertEqual(request(encoded({'planId': plan, 'scope': 'api'}))[0], 409, 'source plans are always full')
+        self.assertEqual(self.launches, [])
+        status, accepted = request(encoded({'planId': plan, 'deployMode': 'ci', 'scope': 'api'}))
+        self.assertEqual((status, accepted['job']['scope']), (202, 'api'))
+        self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci'}))[0], 409)
+        self.assertEqual(len(self.launches), 1)
+
     def test_control_and_worker_use_separate_process_services_and_fixed_arguments(self):
         with patch.object(updater.subprocess, 'run') as run:
             updater.start_worker()
@@ -1734,6 +1932,17 @@ class CoordinatorTests(RootFixture):
         for mode in (None, {}, [], True, 'auto', 'ci;id'):
             with patch.object(updater.subprocess, 'run') as run, self.assertRaises(updater.UpdateError):
                 updater.run_installer(script, manifest, self.root / 'invalid.log', mode)
+            run.assert_not_called()
+            self.assertFalse((self.root / 'invalid.log').exists())
+        with patch.object(updater.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:
+            self.assertEqual(updater.run_installer(script, manifest, self.root / 'api.log', 'ci', 'api'), 0)
+        self.assertEqual(run.call_args.kwargs['env'], {
+            **updater.ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'ci', 'PROJECT_DEPLOY_TESTS': '0',
+            'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest), 'PROJECT_DEPLOY_SCOPE': 'api',
+            'PROJECT_UPDATE_PROGRESS_FILE': str(self.root / 'progress.json')})
+        for scope in (None, 'API', 'api;id', 'partial'):
+            with patch.object(updater.subprocess, 'run') as run, self.assertRaises(updater.UpdateError):
+                updater.run_installer(script, manifest, self.root / 'invalid.log', 'ci', scope)
             run.assert_not_called()
             self.assertFalse((self.root / 'invalid.log').exists())
 

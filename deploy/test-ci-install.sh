@@ -36,6 +36,7 @@ set -Eeuo pipefail
 if [[ $1 == --version ]]; then cat "$FIXTURE_ROOT/node-version"; exit; fi
 if [[ $1 == --input-type=module ]]; then shift; fi
 if [[ $1 == -e ]]; then
+  [[ ! -f "$FIXTURE_ROOT/fail-import" || ${3:-} != import-check ]] || exit 75
   if [[ -n ${VITE_FIXTURE_VALUE:-} ]]; then printf '[["VITE_FIXTURE_VALUE","%s"]]\n' "$VITE_FIXTURE_VALUE"; else printf '[]\n'; fi
   exit
 fi
@@ -301,10 +302,49 @@ make_package page-four next
 printf 'EXTRA_SETTING=1\n' >> "$fixture/environment"
 run_install
 full_restart
+# Design doc 6.5: an update admitted as API-only never widens. Changed runtime
+# code is refused before activation with the update service's status.
 calls=$(wc -l < "$fixture/systemctl.calls")
+before=$(readlink "$fixture/application/current")
+cp "$fixture/application/.deployed-state" "$fixture/success-state"
 echo changed >> "$fixture/source/server/index.mjs"; commit_source runtime
 make_package runtime runtime-two
-run_install
+code=0; PROJECT_DEPLOY_SCOPE=api bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code == 75 && $(readlink "$fixture/application/current") == "$before" && $(live) == "$before" ]] || { cat "$fixture/last.log"; exit 1; }
+cmp -s "$fixture/application/.deployed-state" "$fixture/success-state"
+if new_calls | grep -Eq '^(restart|stop|start|daemon-reload)'; then echo 'Refused api-scope update touched a unit' >&2; exit 1; fi
+code=0; PROJECT_DEPLOY_SCOPE=other bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code != 0 && $code != 75 && $(readlink "$fixture/application/current") == "$before" ]]
+calls=$(wc -l < "$fixture/systemctl.calls")
+PROJECT_DEPLOY_SCOPE=full run_install
 full_restart
 [[ $(live) == "$(readlink "$fixture/application/current")" ]]
+# An API-only change admitted as such restarts only the API.
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo page >> "$fixture/source/src/app.ts"; commit_source page-five
+make_package page-five runtime-two
+PROJECT_DEPLOY_SCOPE=api run_install
+api_only
+# Status 75 of any other step is an ordinary failure, never a scope refusal.
+before=$(readlink "$fixture/application/current")
+echo page >> "$fixture/source/src/app.ts"; commit_source page-six
+make_package page-six runtime-two
+touch "$fixture/fail-import"
+code=0; PROJECT_DEPLOY_SCOPE=api bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+rm "$fixture/fail-import"
+[[ $code == 1 && $(readlink "$fixture/application/current") == "$before" ]] || { cat "$fixture/last.log"; exit 1; }
+# A failed activation admitted as API-only returns only the API and is no scope refusal.
+calls=$(wc -l < "$fixture/systemctl.calls")
+runtime_before=$(live)
+cp "$fixture/application/.deployed-state" "$fixture/success-state"
+cp "$fixture/application/.runtime-deployment" "$fixture/success-runtime"
+echo page >> "$fixture/source/src/app.ts"; commit_source page-seven
+make_package page-seven runtime-two
+touch "$fixture/fail-api"
+code=0; PROJECT_DEPLOY_SCOPE=api bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code == 1 && $(readlink "$fixture/application/current") == "$before" && $(live) == "$runtime_before" ]] || { cat "$fixture/last.log"; exit 1; }
+cmp -s "$fixture/application/.deployed-state" "$fixture/success-state"
+cmp -s "$fixture/application/.runtime-deployment" "$fixture/success-runtime"
+[[ $(new_calls | grep -cx "restart $service-api") == 2 ]]
+api_only
 printf 'CI package migration, no-op, content identity, corruption, rollback and activation scope checks passed.\n'

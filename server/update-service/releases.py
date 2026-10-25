@@ -417,7 +417,8 @@ class Releases:
                      manifest['repository'] == 'hxx344/' + module.repository and
                      HEX40.fullmatch(manifest['commit']) and manifest['tag'] == tag == 'deploy-' + manifest['commit'] and
                      re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.gz', item['file']) and
-                     HEX64.fullmatch(item['sha256']) and HEX64.fullmatch(item['application_key']))
+                     HEX64.fullmatch(item['sha256']) and HEX64.fullmatch(item['application_key']) and
+                     ('runtime_key' not in item or HEX64.fullmatch(item['runtime_key'])))
             if not valid:
                 raise ValueError()
             node = manifest.get('node_version', '')
@@ -447,7 +448,9 @@ class Releases:
                 'version': manifest['commit'][:12], 'publishedAt': release['published_at'],
                 'releaseNotes': release_notes(release.get('body')),
                 'manifest': manifest, 'manifestHash': digest(manifest_bytes), 'manifestBytes': manifest_bytes,
-                'installer': installer, 'installerHash': digest(installer), 'applicationKey': item['application_key']}
+                'installer': installer, 'installerHash': digest(installer), 'applicationKey': item['application_key'],
+                # Older packages have no runtime component key: their plans restart everything.
+                'runtimeKey': item.get('runtime_key')}
 
     def installer(self, module, commit, fresh=False):
         if not isinstance(commit, str) or not HEX40.fullmatch(commit):
