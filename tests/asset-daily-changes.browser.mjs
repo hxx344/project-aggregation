@@ -1,5 +1,5 @@
 // Start after building Hub + Asset:
-// node --import ./tests/fixtures/asset-performance-workbench.mjs server/index.mjs
+// node --import ./tests/fixtures/asset-performance-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=asset-daily-changes run-code --filename tests/asset-daily-changes.browser.mjs
 // Real Hub login, launch, proxy, Next page and SQLite snapshots are read first;
 // only the error and many-source cases replace /api/daily-changes in the browser.

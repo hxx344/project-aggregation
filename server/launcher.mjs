@@ -33,6 +33,9 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
     return child;
   }
   const exitCode = ({ exitCode: value, signal }) => signal === null && Number.isInteger(value) ? value : 1;
+  // While stopping, a child ended by the SIGTERM sent to it (one that had no
+  // handler yet) stopped as asked, as systemd counts a main process ended by SIGTERM.
+  const stopCode = result => result.signal === 'SIGTERM' ? 0 : exitCode(result);
   function startApi() {
     restartTimer = null;
     if (stopping) return;
@@ -44,7 +47,7 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
       onApiReady({ port: message.port, runtimePid: runtime?.pid ?? null, apiPid: child.pid });
     }, result => {
       clearTimeout(readyTimer); api = null;
-      if (stopping) { code = Math.max(code, exitCode(result)); return; }
+      if (stopping) { code = Math.max(code, stopCode(result)); return; }
       if (readyAt !== null && Date.now() - readyAt >= apiStableMs) failures = 0;
       const delay = apiBackoffMs[Math.min(failures, apiBackoffMs.length - 1)]; failures += 1;
       logger.error({ exitCode: result.exitCode, signal: result.signal, delay, type: 'launcher' }, 'API 进程已退出，稍后重启');
@@ -68,15 +71,27 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
     })();
   }
   runtime = start(runtimeEntry, () => { if (!stopping) startApi(); }, result => {
-    if (stopping) { code = Math.max(code, exitCode(result)); return; }
+    if (stopping) { code = Math.max(code, stopCode(result)); return; }
     logger.error({ exitCode: result.exitCode, signal: result.signal, ready: result.ready, type: 'launcher' }, '运行时进程已退出，正在结束工作台');
     runtime = null; void stop(1);
   });
   return { done, stop };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const launcher = launch({});
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { defaultLogger.info({ signal, type: 'shutdown' }, '收到关闭信号，正在依次停止 API 与运行时'); void launcher.stop(0); });
+// The service entry (server/index.mjs): logs the address once the first API is
+// ready and ends with the unit's exit code. A repeated signal is ignored, as in
+// the children.
+export async function runLauncher({ env = process.env, logger = defaultLogger } = {}) {
+  let started = false;
+  const launcher = launch({ env, logger, onApiReady: ({ port }) => {
+    if (started) return;
+    started = true;
+    const host = env.HOST || '127.0.0.1';
+    logger.info({ port, host, type: 'startup' }, `工作台已启动：http://${host}:${port}`);
+  } });
+  let stopping = false;
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { if (!stopping) logger.info({ signal, type: 'shutdown' }, '收到关闭信号，正在依次停止 API 与运行时'); stopping = true; void launcher.stop(0); });
   process.exitCode = await launcher.done;
 }
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runLauncher();

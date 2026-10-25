@@ -1,6 +1,6 @@
 // Windows-native fixture using the real Hub login, launch, proxy and bridge.
 // Run from the repository root:
-// node --import ./tests/fixtures/monitor-loading-workbench.mjs server/index.mjs
+// node --import ./tests/fixtures/monitor-loading-workbench.mjs server/workbench.mjs
 // Set MONITOR_BROWSER_FIXTURE=oil for oil-rolling-average.browser.mjs.
 // Production monitor SSR/assets with seeded data; no collectors or trading workers.
 import http from 'node:http';

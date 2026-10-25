@@ -1,6 +1,6 @@
 // Windows-native fixture for the real Hub and production Asset Next application.
 // Build Hub + Asset first, then run from the repository root:
-// node --import ./tests/fixtures/asset-performance-workbench.mjs server/index.mjs
+// node --import ./tests/fixtures/asset-performance-workbench.mjs server/workbench.mjs
 // Open http://hub.localhost:39153/?view=project&id=asset
 // Password: asset-performance-browser-fixture
 import assert from 'node:assert/strict';

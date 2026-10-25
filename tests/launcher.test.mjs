@@ -71,6 +71,18 @@ test('an API that ignores SIGTERM is killed after the stop deadline and the exit
   for (const pid of [apiPid, runtimePid]) assert.throws(() => process.kill(pid, 0));
 });
 
+test('children ended by the SIGTERM of stop() count as stopped', { skip, timeout: 30_000 }, async t => {
+  const s = await scripts(t);
+  // Neither child has a SIGTERM handler, like a child still loading its modules.
+  const child = "process.send({ type: 'ready', port: 1 }); setInterval(() => {}, 1000);";
+  let ready; const apiReady = new Promise(resolve => { ready = resolve; });
+  const launcher = launch({ runtimeEntry: s.write('runtime.mjs', child), apiEntry: s.write('api.mjs', child), logger: quiet, onApiReady: ready });
+  const { apiPid, runtimePid } = await apiReady;
+  assert.equal(await launcher.stop(0), 0);
+  assert.equal(await launcher.done, 0);
+  for (const pid of [apiPid, runtimePid]) assert.throws(() => process.kill(pid, 0));
+});
+
 // A child running runProcess(); `start` is the body of its start function.
 function entry(t, s, start) {
   const file = s.write('entry.mjs', `import { runProcess } from ${JSON.stringify(processEntry)};
@@ -115,4 +127,16 @@ test('a close() that fails exits 1 after a signal', { skip, timeout: 30_000 }, a
   assert.ok(await until(() => messages.includes('ready')));
   child.kill('SIGTERM');
   assert.deepEqual(await exited, { code: 1, signal: null });
+});
+
+test('a repeated signal while closing waits for close() instead of ending the process', { skip, timeout: 30_000 }, async t => {
+  const s = await scripts(t);
+  // systemd signals the whole unit and the launcher signals its children again.
+  const { child, exited, messages } = entry(t, s, "return { ready: {}, close: async () => { process.send({ type: 'closing' }); await new Promise(resolve => setTimeout(resolve, 300)); closed(); } };");
+  assert.ok(await until(() => messages.includes('ready')));
+  child.kill('SIGTERM');
+  assert.ok(await until(() => messages.includes('closing')));
+  child.kill('SIGTERM'); child.kill('SIGINT');
+  assert.deepEqual(await exited, { code: 0, signal: null });
+  assert.deepEqual(messages, ['ready', 'closing', 'closed']);
 });

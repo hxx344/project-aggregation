@@ -1,5 +1,5 @@
 // Start after building Hub + Asset:
-// node --import ./tests/fixtures/asset-performance-workbench.mjs server/index.mjs
+// node --import ./tests/fixtures/asset-performance-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=asset-performance run-code --filename tests/asset-performance.browser.mjs
 // Real Hub login, launch, proxy, Next page and SQLite history are exercised first.
 // Only the later edge cases replace Asset ledger/sync responses in the browser.

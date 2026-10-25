@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
 // Run: playwright-cli -s=aster-monitor run-code --filename tests/aster-monitor-center.browser.mjs
 // Real Hub login/launch/proxy/iframe and built ASTER assets, with isolated API data.
 async (page) => {

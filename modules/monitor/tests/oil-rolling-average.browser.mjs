@@ -1,4 +1,4 @@
-// Real Hub fixture: MONITOR_BROWSER_FIXTURE=oil node --import ./tests/fixtures/monitor-loading-workbench.mjs server/index.mjs
+// Real Hub fixture: MONITOR_BROWSER_FIXTURE=oil node --import ./tests/fixtures/monitor-loading-workbench.mjs server/workbench.mjs
 // Run from the repository root after production builds:
 // playwright-cli run-code --filename modules/monitor/tests/oil-rolling-average.browser.mjs
 // Optional wrapper arguments: { entryUrl, password, desktopScreenshot, mobileScreenshot }.

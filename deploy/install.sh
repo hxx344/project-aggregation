@@ -2592,7 +2592,9 @@ main() {
     prepare_ci_application
     ci_update_progress verify
     validate_embedded_runtime "$release"
-    run_as_service "$NODE_BIN" --input-type=module -e 'await import(process.argv[1])' "$release/server/app.mjs"
+    # The entries are imported, not run: argv[1] is a placeholder, so their main-module checks stay false.
+    run_as_service "$NODE_BIN" --input-type=module -e 'for (const file of process.argv.slice(2)) await import(file)' import-check \
+      "$release/server/app.mjs" "$release/server/launcher.mjs" "$release/server/runtime/main.mjs" "$release/server/api/main.mjs"
   else
   log "准备正式版本 ${commit:0:12} 的源码；不下载预构建运行包。"
   fetch_source

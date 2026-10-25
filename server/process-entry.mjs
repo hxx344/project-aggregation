@@ -16,7 +16,9 @@ export async function runProcess({ name, start, logger }) {
       process.exit(failed ? 1 : code);
     })();
   }
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { logger.info({ signal, type: 'shutdown' }, `${name}收到关闭信号，正在退出`); void stop(0); });
+  // systemd signals every process of the unit and the launcher signals its
+  // children again: a repeated signal must not fall back to the default action.
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { if (!stopping) logger.info({ signal, type: 'shutdown' }, `${name}收到关闭信号，正在退出`); void stop(0); });
   // Without the launcher nobody would stop this process.
   if (process.send) process.once('disconnect', () => { logger.warn({ type: 'shutdown' }, `${name}与启动器的连接已断开，正在退出`); void stop(1); });
   // Started on a microtask, so a fail() during start still finds `started`.
