@@ -93,10 +93,10 @@ test('stop() replaces the ready deadline of a starting API with the stop deadlin
   const runtimeEntry = s.write('runtime.mjs', readyChild);
   // Never ready, and slower to stop than the ready deadline. The start record
   // and the SIGTERM handler come in one synchronous step.
-  const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1500)); setInterval(() => {}, 1000);");
+  const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 4500)); setInterval(() => {}, 1000);");
   let killed = false;
   const logger = { ...quiet, error: (fields, message) => { if (message === 'API 未在期限内就绪，正在结束') killed = true; } };
-  const launcher = launch({ runtimeEntry, apiEntry, logger, apiReadyMs: 1000 });
+  const launcher = launch({ runtimeEntry, apiEntry, logger, apiReadyMs: 3000 });
   t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   assert.ok(await until(() => s.count() === 2), 'the API started');
   assert.equal(killed, false, 'the API was stopped before its ready deadline');

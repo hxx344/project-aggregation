@@ -59,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 
 安装器把 `GREEKS_PYTHON`、`ASTER_PYTHON` 写入工作台 systemd 单元。ASTER 从自己的 `.env` 继承账户和 relay 设置；运行目录始终指向 `$DATA_DIR/modules/aster`，页面从工作台 Aster 5x 入口打开。关停允许交易引擎等待在途请求完成，systemd 停止上限为 150 秒。
 
-工作台服务在同一个 systemd 单元内运行两个进程：运行时（模块、采集与原生执行）和 API（登录、页面与更新）。API 意外退出时单独重启，模块与采集不中断，已打开的模块页面需从工作台重新载入。两者经 `$DATA_DIR/run` 下的 Unix socket 通信，路径上限为 100 字节，所以 `DATA_DIR` 不能超过 46 字节（设置 `WORKBENCH_RUNTIME_DIR` 时改为它不超过 50 字节），安装器会在激活前检查。需要缩短时，先停止服务，把数据目录整体移到新路径，再修改 `DATA_DIR` 并重新安装。
+工作台服务在同一个 systemd 单元内运行两个进程：运行时（模块、采集与原生执行）和 API（登录、页面与更新）。API 意外退出时单独重启，模块与采集不中断，已打开的模块页面需从工作台重新载入。两者经 `$DATA_DIR/run` 下的 Unix socket 通信，路径上限为 100 字节，所以 `DATA_DIR` 按配置值不能超过 46 字节，安装器会在激活前检查；服务单元只能写入 `DATA_DIR`，配置中不能设置 `WORKBENCH_RUNTIME_DIR`。需要缩短时，先停止服务，把数据目录整体移到新路径，再修改 `DATA_DIR` 并重新安装。
 
 安装完成后查看首次工作台登录信息：
 

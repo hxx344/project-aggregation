@@ -12,7 +12,14 @@ import { DatabaseSync } from 'node:sqlite';
 const root = path.resolve(process.argv[2] || '.');
 const dataDir = await mkdtemp(path.join(tmpdir(), 'ci-package-data-'));
 const password = 'package-test-only-123456';
-let app, modules, failure, accountWriter, runtimeLock, recoveryDirectory, entry;
+let app, modules, failure, accountWriter, runtimeLock, recoveryDirectory, entry, interrupted;
+// Stops the service entry's whole process group, so no runtime or API is left behind.
+async function stopEntry() {
+  const group = signal => { try { process.kill(-entry.pid, signal); } catch { /* Already gone. */ } };
+  group('SIGTERM');
+  const timer = setTimeout(() => group('SIGKILL'), 60_000);
+  await entry.exited; clearTimeout(timer);
+}
 try {
   const { startModules } = await import(pathToFileURL(path.join(root, 'server/modules/runtime.mjs')));
   const { createApp } = await import(pathToFileURL(path.join(root, 'server/app.mjs')));
@@ -164,8 +171,15 @@ try {
       env: { ...inherited, NODE_ENV: 'production', DATA_DIR: dataDir, PORT: String(port), HOST: '127.0.0.1' } });
     entry.exited = new Promise(resolve => entry.once('exit', (code, signal) => resolve({ code, signal })));
     // The entry has its own process group, so a signal to this script does not
-    // reach it: stop the group before exiting.
-    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { try { process.kill(-entry.pid, 'SIGTERM'); } catch { /* Already gone. */ } void entry.exited.then(() => process.exit(1)); });
+    // reach it: stop the group and remove the data before exiting.
+    interrupted = () => {
+      if (interrupted.running) return;
+      interrupted.running = true;
+      void stopEntry().then(() => rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+        .then(() => recoveryDirectory && rm(recoveryDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+        .finally(() => process.exit(130));
+    };
+    for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, interrupted);
     const until = async (predicate, ms) => { const end = Date.now() + ms; while (Date.now() < end) { if (await predicate().catch(() => false)) return true; await new Promise(resolve => setTimeout(resolve, 250)); } return false; };
     const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
     const children = () => readFileSync(`/proc/${entry.pid}/task/${entry.pid}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number);
@@ -224,18 +238,13 @@ try {
     process.kill(-entry.pid, 'SIGTERM');
     assert.deepEqual(await entry.exited, { code: 0, signal: null }, 'the unit stops with status 0');
     entry = undefined;
+    for (const signal of ['SIGINT', 'SIGTERM']) process.off(signal, interrupted);
     assert.deepEqual(pids.filter(alive), [], 'the runtime and the API stopped with the launcher');
     assert.equal(existsSync(path.join(dataDir, 'run', 'runtime.json')), false, 'the runtime removed its discovery record');
     console.log('Service entry passed: launcher, runtime with five real modules, API restart without module restarts, pages reopened, collection and execution lease kept, group SIGTERM exit 0.');
   }
 } finally {
-  if (entry) {
-    // The whole process group, so a failed run leaves no runtime or API behind.
-    const group = signal => { try { process.kill(-entry.pid, signal); } catch { /* Already gone. */ } };
-    group('SIGTERM');
-    const timer = setTimeout(() => group('SIGKILL'), 60_000);
-    await entry.exited; clearTimeout(timer);
-  }
+  if (entry) await stopEntry();
   await app?.close();
   await modules?.close();
   if (!app) accountWriter?.close();

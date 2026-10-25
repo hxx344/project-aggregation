@@ -1235,11 +1235,14 @@ read_setting() {
   value=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
   printf '%s' "${value:-$fallback}"
 }
-# The runtime socket <runtime dir>/runtime-<uuid>.sock must fit the 100-byte
-# Unix socket path limit (server/runtime/protocol.mjs): 50 bytes follow the
-# runtime directory, which is <DATA_DIR>/run unless WORKBENCH_RUNTIME_DIR is set.
-runtime_dir_fits() {
-  ((${#1} <= 50))
+# The service keeps its runtime directory at <DATA_DIR>/run: the unit may only
+# write DATA_DIR, so WORKBENCH_RUNTIME_DIR is refused. The runtime socket
+# <DATA_DIR>/run/runtime-<uuid>.sock must fit the 100-byte Unix socket path
+# limit (server/runtime/protocol.mjs), and the runtime binds the configured
+# path (links not resolved), so $1 is the validated, normalized DATA_DIR.
+check_runtime_dir() {
+  if [[ -n "$2" ]]; then fail 'WORKBENCH_RUNTIME_DIR 不适用于服务单元（单元只能写入 DATA_DIR），请从配置中删除。'; return 1; fi
+  if ((${#1} > 46)); then fail "DATA_DIR 路径过长（${#1} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节。请先停止 $SERVICE 服务，把数据目录整体移到较短路径，再修改 DATA_DIR 并重新安装。"; return 1; fi
 }
 
 health_url() {
@@ -2563,14 +2566,7 @@ main() {
   configured_data=$(realpath -m -s "$DATA_PATH")
   DATA_PATH=$(realpath -m "$DATA_PATH")
   case "$DATA_PATH" in /var/lib/project-aggregation|/var/lib/project-aggregation/*|/srv/project-aggregation/*|/opt/project-aggregation-data|/opt/project-aggregation-data/*) ;; *) fail 'DATA_DIR 请使用 /var/lib/project-aggregation、/srv/project-aggregation/ 子目录或 /opt/project-aggregation-data，避免修改系统目录权限。' ;; esac
-  runtime_setting=$(read_setting WORKBENCH_RUNTIME_DIR '')
-  if [[ -n "$runtime_setting" ]]; then
-    runtime_dir_fits "$(realpath -m -s "$runtime_setting")" || fail 'WORKBENCH_RUNTIME_DIR 路径过长（上限 50 字节）：运行时 socket 的完整路径不能超过 100 字节。'
-  else
-    for candidate in "$configured_data" "$DATA_PATH"; do
-      runtime_dir_fits "$candidate/run" || fail "DATA_DIR 路径过长（${#candidate} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节。请先停止 $SERVICE 服务，把数据目录整体移到较短路径，再修改 DATA_DIR 并重新安装。"
-    done
-  fi
+  check_runtime_dir "$configured_data" "$(read_setting WORKBENCH_RUNTIME_DIR '')"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/build-home"
   HEALTH_URL=$(health_url "$HOST_VALUE" "$PORT_VALUE")

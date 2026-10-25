@@ -257,7 +257,7 @@ test('discovery files that are linked, shared, oversized or point elsewhere are 
   removeDiscovery(dir, randomUUID()); assert.deepEqual(readDiscovery(dir), record, 'a stopping instance keeps its successor\'s record');
   removeDiscovery(dir, instanceId); assert.equal(readDiscovery(dir), null);
   assert.throws(() => socketPathFor(path.join(dir, 'x'.repeat(80)), instanceId), /超过 100 字节/);
-  // deploy/install.sh (runtime_dir_fits) accepts a DATA_DIR of at most 46 bytes, a WORKBENCH_RUNTIME_DIR of at most 50.
+  // deploy/install.sh (check_runtime_dir) accepts a DATA_DIR of at most 46 bytes; the bound below is that of the runtime directory.
   assert.ok(socketPathFor(runtimeDir('/' + 'x'.repeat(45), {}), instanceId));
   assert.throws(() => socketPathFor(runtimeDir('/' + 'x'.repeat(46), {}), instanceId), /超过 100 字节/);
   assert.ok(socketPathFor(runtimeDir('/data', { WORKBENCH_RUNTIME_DIR: '/' + 'x'.repeat(49) }), instanceId));
