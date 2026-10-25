@@ -468,7 +468,7 @@ const apiPlan = (status = null, scope = 'api') => {
 test('an api-scope plan is applied without trading maintenance, stop evidence or idle native execution', async () => {
   const f = fixture({ jobs: [{ status: 'running' }], openEntries: 1 });
   f.updaterState = apiPlan();
-  await f.coordinator.status();
+  assert.deepEqual((await f.coordinator.status()).planScopes, { source: 'full', ci: 'api' });
   const before = f.events.length;
   f.handlers.apply = (mode, scope) => { assert.deepEqual([mode, scope], ['ci', 'api']); return apiPlan('queued'); };
   assert.equal((await f.apply('ci')).job.scope, 'api');
@@ -510,7 +510,8 @@ test('the full admission stays for source mode, other plans, legacy updaters and
   await t.test('pending plan', async () => {
     // A timed-out full request may still be accepted: the retry keeps the full admission.
     const f = fixture({ pendingPlanId: planId, pendingDeployMode: 'ci' });
-    f.updaterState = apiPlan(); await f.coordinator.status();
+    f.updaterState = apiPlan();
+    assert.equal((await f.coordinator.status()).planScopes, null, 'the page does not offer it as API-only');
     assert.equal(f.persisted.maintenance, true);
     f.handlers.apply = (mode, scope) => { assert.deepEqual([mode, scope], ['ci', 'full']); return state('running'); };
     await f.apply('ci');

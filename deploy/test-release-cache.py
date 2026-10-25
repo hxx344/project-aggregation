@@ -204,7 +204,7 @@ class ReleaseCacheTests(unittest.TestCase):
         self.assertEqual(refreshed['releaseNotes'], '已修订的更新内容')
         self.assertEqual(refreshed['manifestHash'], first['manifestHash'])
         self.assertEqual(set(refreshed), {'releaseId', 'commit', 'tag', 'version', 'publishedAt', 'releaseNotes', 'manifest',
-                                         'manifestHash', 'manifestBytes', 'installer', 'installerHash', 'applicationKey'})
+                                         'manifestHash', 'manifestBytes', 'installer', 'installerHash', 'applicationKey', 'runtimeKey'})
         self.assertEqual(self.network.counts()['metadata'], 2)
         self.assertEqual(self.network.counts()['installer'], 1)
         self.assertEqual(self.reader.read(self.module), refreshed)

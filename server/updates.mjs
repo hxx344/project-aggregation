@@ -223,7 +223,11 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     void next.catch(() => {}).finally(watchRelease);
     return next;
   };
-  const withModules = state => tradingModules.length ? { ...state, moduleMaintenance: tradingModules.map(id => ({ id, confirmed: confirmed(id) })) } : state;
+  const withModules = value => {
+    // A pending plan keeps its full admission (see apply), so it is never offered as API-only.
+    const state = pendingPlanId && value.planScopes ? { ...value, planScopes: null } : value;
+    return tradingModules.length ? { ...state, moduleMaintenance: tradingModules.map(id => ({ id, confirmed: confirmed(id) })) } : state;
+  };
   // The hub restarts while the update job is still running, so the latch can
   // only be released by a later status read. Without a server-side read the
   // trading modules stay in maintenance until some browser asks for status.

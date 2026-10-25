@@ -57,6 +57,9 @@ DEPLOYMENT_MODES = ('source', 'ci')
 # narrow it further; it never widens it (exit status SCOPE_REFUSED instead).
 SCOPES = ('full', 'api')
 SCOPE_REFUSED = 75
+# What the planned installer must contain to honour an 'api' admission; an
+# installer without it decides alone and may restart the runtime.
+SCOPE_INSTALLER = (b'PROJECT_DEPLOY_SCOPE=${PROJECT_DEPLOY_SCOPE-}\n', b'\nSCOPE_REFUSED=%d\n' % SCOPE_REFUSED)
 TOKEN = re.compile(r'[a-f0-9]{32}')
 MAX_CREDENTIALS = 1024
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes', 'recovery')
@@ -574,7 +577,7 @@ class Coordinator:
         item, release = candidates[0]
         key = release.get('runtimeKey')
         if (item['id'] != 'hub' or not key or item.get('runtimeKey') != key or not item.get('runtimeRecorded')
-                or state.get('scopeRefused') == release['commit']):
+                or state.get('scopeRefused') == release['commit'] or not all(part in release['installer'] for part in SCOPE_INSTALLER)):
             return 'full'
         return 'api'
 

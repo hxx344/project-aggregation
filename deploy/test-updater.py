@@ -340,6 +340,13 @@ class ReleaseTests(unittest.TestCase):
             releases.architecture()
 
 
+class ScopeContractTests(unittest.TestCase):
+    def test_installer_honours_the_scope_contract_of_the_update_service(self):
+        source = (Path(__file__).resolve().parent / 'install.sh').read_bytes()
+        for part in updater.SCOPE_INSTALLER:
+            self.assertIn(part, source)
+
+
 class CoordinatorTests(RootFixture):
     def setUp(self):
         super().setUp()
@@ -1711,7 +1718,20 @@ class CoordinatorTests(RootFixture):
 
     def admit_api(self):
         self.network.values['hub']['manifest']['artifacts']['linux-x64']['runtime_key'] = RUNTIME_KEY
+        self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.SCOPE_INSTALLER)
         self.installed[0].update(runtimeKey=RUNTIME_KEY, runtimeRecorded=True)
+
+    def test_installer_without_scope_admission_is_planned_in_full(self):
+        self.admit_api()
+        complete = self.network.values['hub']['installer']
+        for missing in (*updater.SCOPE_INSTALLER, None):
+            with self.subTest(missing=missing):
+                self.network.values['hub']['installer'] = INSTALLER + b''.join(part for part in updater.SCOPE_INSTALLER if part != missing)
+                self.assertEqual(self.network.values['hub']['installer'] == complete, missing is None)
+                # Installers are cached per commit; a fresh reader sees this one.
+                self.reader = releases.Releases(self.network, arch='linux-x64')
+                self.coordinator = self.make_coordinator(); self.clock += 180
+                self.assertEqual(self.check()['planScopes']['ci'], 'api' if missing is None else 'full')
 
     def test_ci_plan_is_api_only_for_a_recorded_unchanged_runtime(self):
         legacy = self.check()

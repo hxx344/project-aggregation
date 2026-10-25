@@ -333,4 +333,14 @@ touch "$fixture/fail-import"
 code=0; PROJECT_DEPLOY_SCOPE=api bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
 rm "$fixture/fail-import"
 [[ $code == 1 && $(readlink "$fixture/application/current") == "$before" ]] || { cat "$fixture/last.log"; exit 1; }
+# A failed activation admitted as API-only returns only the API and is no scope refusal.
+calls=$(wc -l < "$fixture/systemctl.calls")
+runtime_before=$(live)
+echo page >> "$fixture/source/src/app.ts"; commit_source page-seven
+make_package page-seven runtime-two
+touch "$fixture/fail-api"
+code=0; PROJECT_DEPLOY_SCOPE=api bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code != 0 && $code != 75 && $(readlink "$fixture/application/current") == "$before" && $(live) == "$runtime_before" ]] || { cat "$fixture/last.log"; exit 1; }
+[[ $(new_calls | grep -cx "restart $service-api") == 2 ]]
+api_only
 printf 'CI package migration, no-op, content identity, corruption, rollback and activation scope checks passed.\n'
