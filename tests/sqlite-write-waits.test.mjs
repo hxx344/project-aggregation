@@ -96,8 +96,16 @@ test('the statistics are logged only when they changed, also when logging stops'
   assert.equal(lines.length, 2, 'a busy reply alone is a change'); assert.equal(lines[1].busyReplies, writeWaitStats().busyReplies);
   stop();
   assert.equal(lines.length, 2, 'nothing changed since the last line');
+  // A line the logger failed to write is written by the next try, with its peaks.
+  let failing = true;
+  const flaky = { info: fields => { if (failing) throw new Error('log stream failed'); lines.push(fields); } };
+  const retried = logWriteWaits({ logger: flaky, role: 'retry', intervalMs: 60_000 });
+  immediate(db, () => { const until = performance.now() + 20; while (performance.now() < until); });
+  assert.throws(() => retried(), /log stream failed/);
+  failing = false; retried();
+  assert.equal(lines.length, 3); assert.equal(lines[2].role, 'retry'); assert.ok(lines[2].maxHoldMs >= 20, 'the peaks survived the failed line');
   const again = logWriteWaits({ logger, role: 'api', intervalMs: 60_000 });
   immediate(db, () => {});
   again();
-  assert.equal(lines.length, 3); assert.equal(lines[2].role, 'api');
+  assert.equal(lines.length, 4); assert.equal(lines[3].role, 'api');
 });

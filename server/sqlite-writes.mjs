@@ -18,18 +18,19 @@ export function recordHold(ms) { writes.maxHoldMs = Math.max(writes.maxHoldMs, m
 export function recordBusy() { writes.busy++; }
 export function recordBusyReply() { writes.busyReplies++; }
 
-// Logs the statistics when they changed since this logger's last line, and once
-// more when stopped; the journal keeps the distribution. One logger per process:
-// every line resets the shared peaks. A failing logger does not end the process
-// from the timer; stop() lets the caller see it.
+// Logs the statistics when they changed since this logger's last line, also when
+// stopped; the journal keeps the distribution. One logger per process: every
+// line resets the shared peaks. A line the logger failed to write is kept for
+// the next try; a failure in the timer does not end the process, stop() lets
+// the caller see it.
 export function logWriteWaits({ logger = console, role, intervalMs = 15 * 60_000 }) {
   let logged = 0;
   const log = () => {
     const stats = writeWaitStats(), total = stats.transactions + stats.busy + stats.busyReplies;
     if (total === logged) return;
-    logged = total; writes.maxWaitMs = 0; writes.maxHoldMs = 0;
     logger.info?.({ type: 'sqlite_write_waits', role, bucketsMs: WRITE_WAIT_BUCKETS_MS, ...stats, maxWaitMs: Math.round(stats.maxWaitMs), maxHoldMs: Math.round(stats.maxHoldMs) }, 'SQLite 写锁等待统计');
+    logged = total; writes.maxWaitMs = 0; writes.maxHoldMs = 0;
   };
-  const timer = setInterval(() => { try { log(); } catch { /* the next line or stop() retries */ } }, intervalMs); timer.unref?.();
+  const timer = setInterval(() => { try { log(); } catch { /* the next interval or stop() writes it */ } }, intervalMs); timer.unref?.();
   return () => { clearInterval(timer); log(); };
 }

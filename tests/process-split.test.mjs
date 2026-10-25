@@ -189,13 +189,14 @@ test('over the socket, execution entries keep the runtime\'s 409 and 503 and out
   // A write lock held past busy_timeout (5 s) is a retryable 503 in either process. The runtime
   // runs in this process, so its wait blocks this thread while the API process waits beside it.
   // Only the two requests write meanwhile: `dataPlaneOptions` turns the runtime's background writes off.
-  const busyBefore = writeWaitStats().busy;
+  const { busy: busyBefore, busyReplies: repliesBefore } = writeWaitStats();
   db.exec('BEGIN IMMEDIATE');
   let busy;
   try { busy = await Promise.all([connect(c), client(port).request('/api/login', { method: 'POST', body: { password } })]); }
   finally { db.exec('ROLLBACK'); }
   for (const reply of busy) { assert.equal(reply.status, 503, reply.text); assert.equal(reply.data.error, DATABASE_BUSY); }
   assert.ok(writeWaitStats().busy > busyBefore, 'the runtime counted its write that ran out of busy_timeout');
+  assert.equal(writeWaitStats().busyReplies - repliesBefore, 1, 'the runtime counted its 503; the API, another process, counts the login');
   assert.equal(entries(), 0);
 
   // An entry the runtime still runs blocks an update from the next API, which never saw it.
