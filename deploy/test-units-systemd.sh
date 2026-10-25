@@ -82,6 +82,7 @@ touch "$release_one/.managed-release"
 chmod -R a+rX,go-w "$APP_DIR"
 atomic_link "$release_one" "$APP_DIR/current"
 systemd_version=$(systemd_major)
+(( systemd_version > 0 ))
 write_unit
 if (( systemd_version >= 254 )); then grep -qx 'RestartSteps=5' "$work_dir/api.service"; else grep -qx 'RestartSec=5' "$work_dir/api.service"; fi
 install -m 0644 "$work_dir/service" "$UNIT_FILE"

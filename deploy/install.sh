@@ -2471,10 +2471,6 @@ managed_release() {
      -d "$1" && ! -L "$1" && -f "$1/.managed-release" ]] || return 1
   printf '%s' "$1"
 }
-# The release the running runtime started from (design doc 6.2): systemd enters
-# the working directory through current, so the main process's working
-# directory is that release, also after a restart outside the installer. An
-# update that only restarts the API leaves the runtime there.
 # The major version of the running systemd, 0 when unknown.
 systemd_major() {
   local version
@@ -2482,6 +2478,10 @@ systemd_major() {
   version=${version%%[!0-9]*}
   printf '%s' "${version:-0}"
 }
+# The release the running runtime started from (design doc 6.2): systemd enters
+# the working directory through current, so the main process's working
+# directory is that release, also after a restart outside the installer. An
+# update that only restarts the API leaves the runtime there.
 live_runtime_release() {
   local pid directory releases
   pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null) && [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1

@@ -173,9 +173,12 @@ for name in dddddddddddd-eeeeeeeeeeeeeeee ffffffffffff-0000000000000000; do mkdi
 [[ -d "$release" && -d "$old_release" && -d "$running" ]]
 [[ ! -e "$APP_DIR/releases/dddddddddddd-eeeeeeeeeeeeeeee" && ! -e "$APP_DIR/releases/ffffffffffff-0000000000000000" ]]
 kill $live_pid $outside_pid $gone_pid 2>/dev/null || true
+live_pid= outside_pid= gone_pid=
 rm -rf -- "$running" "$APP_DIR/.runtime-deployment" "$release/deploy"
 
 # Cache pruning keeps every entry that the active or rollback releases still use.
+# These cases run with the runtime stopped; the cases below cover a running one.
+inactive() ( systemctl() { [[ $1 != is-active ]]; }; "$@" )
 cache="$APP_DIR/cache"
 mkdir -p "$cache/archives" "$APP_DIR/python" "$APP_DIR/python-aster"
 PROJECT_DEPLOY_MODE=source
@@ -218,7 +221,7 @@ remember_previous_python_paths "$previous_release"
 printf '%s\n%s\n' "$previous_target" "$APP_DIR/python/$(key 25)/bin/python" > "$APP_DIR/.previous-greeks-python-path"
 (
   trap 'echo "Pruning triggered the installer ERR trap" >&2; exit 97' ERR
-  prune_caches || exit 3
+  inactive prune_caches || exit 3
 )
 for name in "dependencies-$(key 1)" "runtime-dependencies-$(key 2)" "runtime-dependencies-$(key 12)" "runtime-dependencies-$(key 13)" \
     "build-$(key 3)" "embedded-$(key 6)" "module-monitor-$(key 7)" unrelated "typechecked-$(key 4)" "tested-$(key 15)" \
@@ -239,18 +242,24 @@ done
 rm "$work_dir/previous-greeks-python-path"
 mkdir "$APP_DIR/python/$(key 23)"
 printf '%s\n%s\n' "$release" "$APP_DIR/python/$(key 25)/bin/python" > "$APP_DIR/.previous-greeks-python-path"
-prune_caches
+inactive prune_caches
 [[ -d "$APP_DIR/python/$(key 22)" && -d "$APP_DIR/python/$(key 23)" && -d "$APP_DIR/python/$(key 25)" ]]
 rm "$APP_DIR/.previous-greeks-python-path"
-prune_caches
+inactive prune_caches
 [[ -d "$APP_DIR/python/$(key 22)" && -d "$APP_DIR/python/$(key 23)" && -d "$APP_DIR/python/$(key 25)" ]]
 
-# While the runtime runs from an unknown release, every managed release is a root, as in prune_releases.
+# A running runtime's release is a root; while that release is unknown, every managed release is
+# one, as in prune_releases; a stopped runtime adds none.
 other="$APP_DIR/releases/999999999999-bbbbbbbbbbbbbbbb"
 mkdir -p "$other" "$cache/runtime-dependencies-$(key 18)/node_modules"
 touch "$other/.managed-release"; printf '%s\n' "$(key 18)" > "$other/.runtime-dependency-key"
 ( systemctl() { [[ $1 != show ]] || echo 0; }; prune_caches )
 [[ -d "$cache/runtime-dependencies-$(key 18)" ]]
+( live_runtime_release() { printf '%s' "$other"; }; prune_caches )
+[[ -d "$cache/runtime-dependencies-$(key 18)" ]]
+( live_runtime_release() { printf '%s' "$release"; }; prune_caches )
+[[ ! -e "$cache/runtime-dependencies-$(key 18)" ]]
+mkdir -p "$cache/runtime-dependencies-$(key 18)/node_modules"
 ( systemctl() { [[ $1 != show ]] || echo 0; [[ $1 != is-active ]]; }; prune_caches )
 [[ ! -e "$cache/runtime-dependencies-$(key 18)" ]]
 rm -rf -- "$other"
