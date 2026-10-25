@@ -78,7 +78,7 @@ export async function startApi({ dataDir, logger = defaultLogger, signal, fail =
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main) {
   const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, '.data'));
   const port = Number(process.env.PORT || 3100);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须为 1 至 65535');

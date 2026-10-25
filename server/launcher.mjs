@@ -102,4 +102,4 @@ export async function runLauncher({ env = process.env, logger = defaultLogger, s
   process.exitCode = await launcher.done;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runLauncher();
+if (import.meta.main) await runLauncher();

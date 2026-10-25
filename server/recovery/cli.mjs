@@ -101,7 +101,7 @@ export async function runRecoveryCli(args = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main) {
   try { process.stdout.write(JSON.stringify(await runRecoveryCli()) + '\n'); }
   catch (error) {
     const candidate = error.code || error.message;

@@ -121,7 +121,7 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
   } finally { signal?.removeEventListener('abort', abortModules); }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main) {
   const dataDir = path.resolve(process.env.DATA_DIR || path.join(root, '.data'));
   void runProcess({ name: '运行时', logger: defaultLogger, start: options => startRuntime({ ...options, dataDir }) });
 }
