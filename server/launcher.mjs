@@ -19,7 +19,7 @@ const running = child => child.exitCode === null && child.signalCode === null;
 // `onApiReady({ port, runtimePid, apiPid })` follows each API start.
 export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), apiEntry = path.join(here, 'api/main.mjs'), env = process.env, logger = defaultLogger, onApiReady = () => {},
   apiBackoffMs = API_BACKOFF_MS, apiStableMs = API_STABLE_MS, apiReadyMs = API_READY_MS, apiStopMs = API_STOP_MS }) {
-  let runtime = null, api = null, restartTimer = null, failures = 0, code = 0, stopping = null;
+  let runtime = null, api = null, restartTimer = null, readyTimer = null, failures = 0, code = 0, stopping = null;
   let finish; const done = new Promise(resolve => { finish = resolve; });
   // `onExit({ ready, exitCode, signal })` runs once, also when the process could not be started.
   function start(entry, onReady, onExit) {
@@ -33,14 +33,15 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
     return child;
   }
   const exitCode = ({ exitCode: value, signal }) => signal === null && Number.isInteger(value) ? value : 1;
-  // While stopping, a child ended by the SIGTERM sent to it (one that had no
-  // handler yet) stopped as asked, as systemd counts a main process ended by SIGTERM.
-  const stopCode = result => result.signal === 'SIGTERM' ? 0 : exitCode(result);
+  // While stopping, a child ended by the SIGTERM sent to it, or by the SIGINT a
+  // terminal sends its process group (one that had no handler yet), stopped as
+  // asked, as systemd counts a main process ended by SIGTERM.
+  const stopCode = result => ['SIGTERM', 'SIGINT'].includes(result.signal) ? 0 : exitCode(result);
   function startApi() {
     restartTimer = null;
     if (stopping) return;
     let readyAt = null;
-    const readyTimer = setTimeout(() => { logger.error({ type: 'launcher' }, 'API 未在期限内就绪，正在结束'); child.kill('SIGKILL'); }, apiReadyMs);
+    readyTimer = setTimeout(() => { logger.error({ type: 'launcher' }, 'API 未在期限内就绪，正在结束'); child.kill('SIGKILL'); }, apiReadyMs);
     const child = api = start(apiEntry, message => {
       clearTimeout(readyTimer); readyAt = Date.now();
       logger.info({ port: message.port, type: 'startup' }, '工作台 API 已就绪');
@@ -63,7 +64,8 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
   function stop(value = 0) {
     code = Math.max(code, value);
     return stopping ??= (async () => {
-      clearTimeout(restartTimer);
+      // The stop deadline applies from here on, not the ready deadline.
+      clearTimeout(restartTimer); clearTimeout(readyTimer);
       await terminate(api, apiStopMs);
       await terminate(runtime, null);
       finish(code);
@@ -80,8 +82,14 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
 
 // The service entry (server/index.mjs): logs the address once the first API is
 // ready and ends with the unit's exit code. A repeated signal is ignored, as in
-// the children.
+// the children. Settings the API would refuse on every start end the unit
+// instead of restarting the API forever.
 export async function runLauncher({ env = process.env, logger = defaultLogger } = {}) {
+  const port = Number(env.PORT || 3100);
+  try {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT 必须为 1 至 65535');
+    if (env.PUBLIC_ORIGIN) (await import('./adapters.mjs')).validateAuthOrigin(env.PUBLIC_ORIGIN);
+  } catch (error) { logger.error({ err: error, type: 'startup' }, '工作台配置无效'); process.exitCode = 1; return; }
   let started = false;
   const launcher = launch({ env, logger, onApiReady: ({ port }) => {
     if (started) return;

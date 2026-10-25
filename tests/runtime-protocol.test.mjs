@@ -10,7 +10,7 @@ import path from 'node:path';
 import { moduleIds } from '../server/modules/catalog.mjs';
 import { registerModuleTransport } from '../server/modules/transport.mjs';
 import { UpdateError, createUpdateCoordinator } from '../server/updates.mjs';
-import { createSecret, ensureRuntimeDir, MAX_REQUEST_BYTES, PROTOCOL_VERSION, readDiscovery, removeDiscovery, removeStaleRuntimeFiles, RUNTIME_KEY_HEADER, RuntimeError, socketPathFor, validateSync, writeDiscovery } from '../server/runtime/protocol.mjs';
+import { createSecret, ensureRuntimeDir, MAX_REQUEST_BYTES, PROTOCOL_VERSION, readDiscovery, removeDiscovery, removeStaleRuntimeFiles, RUNTIME_KEY_HEADER, RuntimeError, runtimeDir, socketPathFor, validateSync, writeDiscovery } from '../server/runtime/protocol.mjs';
 import { createRuntimeService } from '../server/runtime/service.mjs';
 import { createInternalHandler, startInternalServer } from '../server/runtime/internal-server.mjs';
 import { coordinatorHooks, createInProcessClient, createSocketClient } from '../server/runtime/supervisor-client.mjs';
@@ -257,6 +257,9 @@ test('discovery files that are linked, shared, oversized or point elsewhere are 
   removeDiscovery(dir, randomUUID()); assert.deepEqual(readDiscovery(dir), record, 'a stopping instance keeps its successor\'s record');
   removeDiscovery(dir, instanceId); assert.equal(readDiscovery(dir), null);
   assert.throws(() => socketPathFor(path.join(dir, 'x'.repeat(80)), instanceId), /超过 100 字节/);
+  // deploy/install.sh (data_path_fits_runtime) accepts a DATA_DIR of at most 46 bytes.
+  assert.ok(socketPathFor(runtimeDir('/' + 'x'.repeat(45), {}), instanceId));
+  assert.throws(() => socketPathFor(runtimeDir('/' + 'x'.repeat(46), {}), instanceId), /超过 100 字节/);
 });
 
 test('socket client refuses an instance whose identity or protocol does not match the discovery record', { skip: windows }, async t => {

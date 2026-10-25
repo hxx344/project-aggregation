@@ -1235,6 +1235,12 @@ read_setting() {
   value=$(sed -n "s/^${key}=//p" "$file" | tail -n 1)
   printf '%s' "${value:-$fallback}"
 }
+# The runtime socket <DATA_DIR>/run/runtime-<uuid>.sock must fit the 100-byte
+# Unix socket path limit (server/runtime/protocol.mjs): 54 bytes follow DATA_DIR.
+data_path_fits_runtime() {
+  ((${#1} <= 46))
+}
+
 health_url() {
   local host=$1 port=$2
   case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$host]" ;; esac
@@ -2554,6 +2560,7 @@ main() {
   [[ "$DATA_PATH" =~ ^/[A-Za-z0-9_./-]+$ && "$DATA_PATH" != / && "$DATA_PATH" != *'/../'* && "$DATA_PATH" != */.. ]] || fail 'DATA_DIR 必须是无空格的专用绝对目录。'
   DATA_PATH=$(realpath -m "$DATA_PATH")
   case "$DATA_PATH" in /var/lib/project-aggregation|/var/lib/project-aggregation/*|/srv/project-aggregation/*|/opt/project-aggregation-data|/opt/project-aggregation-data/*) ;; *) fail 'DATA_DIR 请使用 /var/lib/project-aggregation、/srv/project-aggregation/ 子目录或 /opt/project-aggregation-data，避免修改系统目录权限。' ;; esac
+  data_path_fits_runtime "$DATA_PATH" || fail "DATA_DIR 路径过长（${#DATA_PATH} 字节，上限 46）：运行时 socket 位于 DATA_DIR/run 下，完整路径不能超过 100 字节，请改用较短的数据目录。"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH"
   install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR/build-home"
   HEALTH_URL=$(health_url "$HOST_VALUE" "$PORT_VALUE")

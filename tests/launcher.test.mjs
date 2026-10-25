@@ -6,7 +6,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { launch } from '../server/launcher.mjs';
+import { launch, runLauncher } from '../server/launcher.mjs';
 
 // The launcher and the process entry over small child scripts written per
 // test, so each case controls when a child becomes ready, exits or stops.
@@ -34,6 +34,7 @@ test('the launcher ends an API that is not ready in time and starts another', { 
   const runtimeEntry = s.write('runtime.mjs', readyChild);
   const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);");
   const launcher = launch({ runtimeEntry, apiEntry, logger: quiet, apiReadyMs: 200, apiBackoffMs: [20] });
+  t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   assert.ok(await until(() => s.count() >= 3), 'the API was started again after the ready deadline');
   assert.equal(await launcher.stop(0), 0);
   assert.equal(await launcher.done, 0);
@@ -46,6 +47,7 @@ test('stop() during the API backoff starts no further API', { skip, timeout: 30_
   let exited = false;
   const logger = { ...quiet, error: (fields, message) => { if (message === 'API 进程已退出，稍后重启') exited = true; } };
   const launcher = launch({ runtimeEntry, apiEntry, logger, apiBackoffMs: [300] });
+  t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   assert.ok(await until(() => exited), 'the launcher saw the API exit and scheduled a restart');
   assert.equal(await launcher.stop(0), 0);
   await new Promise(resolve => setTimeout(resolve, 600));
@@ -56,6 +58,7 @@ test('a runtime that cannot be started ends the launcher with a non-zero code an
   const s = await scripts(t);
   const apiEntry = s.write('api.mjs', readyChild);
   const launcher = launch({ runtimeEntry: path.join(s.dir, 'missing.mjs'), apiEntry, logger: quiet });
+  t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   assert.equal(await launcher.done, 1);
   assert.equal(s.count(), 0);
 });
@@ -66,6 +69,7 @@ test('an API that ignores SIGTERM is killed after the stop deadline and the exit
   const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => {}); process.send({ type: 'ready', port: 1 }); setInterval(() => {}, 1000);");
   let ready; const apiReady = new Promise(resolve => { ready = resolve; });
   const launcher = launch({ runtimeEntry, apiEntry, logger: quiet, apiStopMs: 200, onApiReady: ready });
+  t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   const { apiPid, runtimePid } = await apiReady;
   assert.equal(await launcher.stop(0), 1);
   for (const pid of [apiPid, runtimePid]) assert.throws(() => process.kill(pid, 0));
@@ -77,10 +81,35 @@ test('children ended by the SIGTERM of stop() count as stopped', { skip, timeout
   const child = "process.send({ type: 'ready', port: 1 }); setInterval(() => {}, 1000);";
   let ready; const apiReady = new Promise(resolve => { ready = resolve; });
   const launcher = launch({ runtimeEntry: s.write('runtime.mjs', child), apiEntry: s.write('api.mjs', child), logger: quiet, onApiReady: ready });
+  t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
   const { apiPid, runtimePid } = await apiReady;
   assert.equal(await launcher.stop(0), 0);
   assert.equal(await launcher.done, 0);
   for (const pid of [apiPid, runtimePid]) assert.throws(() => process.kill(pid, 0));
+});
+
+test('stop() replaces the ready deadline of a starting API with the stop deadline', { skip, timeout: 30_000 }, async t => {
+  const s = await scripts(t);
+  const runtimeEntry = s.write('runtime.mjs', readyChild);
+  // Never ready, and slower to stop than the ready deadline.
+  const apiEntry = s.write('api.mjs', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 600)); setInterval(() => {}, 1000);");
+  const launcher = launch({ runtimeEntry, apiEntry, logger: quiet, apiReadyMs: 300 });
+  t.after(() => launcher.stop(0)); // A failed assertion leaves no child behind.
+  assert.ok(await until(() => s.count() === 2), 'the API started');
+  await new Promise(resolve => setTimeout(resolve, 100)); // Its SIGTERM handler is installed.
+  assert.equal(await launcher.stop(0), 0);
+});
+
+test('settings the API refuses on every start end the service entry before any process starts', async t => {
+  const previous = process.exitCode;
+  t.after(() => { process.exitCode = previous; });
+  for (const env of [{ PORT: '70000' }, { PORT: '3100', PUBLIC_ORIGIN: 'https://hub.example/path' }]) {
+    const errors = [];
+    process.exitCode = undefined;
+    await runLauncher({ env, logger: { ...quiet, error: (fields, message) => errors.push(message) } });
+    assert.equal(process.exitCode, 1, JSON.stringify(env));
+    assert.deepEqual(errors, ['工作台配置无效']);
+  }
 });
 
 // A child running runProcess(); `start` is the body of its start function.
