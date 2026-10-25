@@ -34,6 +34,7 @@ sed -e "s|/opt/$service|$fixture/application|g" \
     -e "s|/var/lib/$service|$fixture/data|g" \
     -e "s|/etc/$service.env|$fixture/environment|g" \
     -e "s|/etc/systemd/system/$service.service|$fixture/unit|g" \
+    -e "s|/etc/systemd/system/$service-api.service|$fixture/api-unit|g" \
     -e "s|/run/lock/$service-install.lock|$fixture/install.lock|g" \
     -e "s|/run/systemd/system|$fixture|g" "$repository/deploy/install.sh" > "$fixture/installer.sh"
 cat > "$fixture/runtime/node" <<'NODE'
@@ -181,7 +182,8 @@ systemctl() {
     *) return 0 ;;
   esac
 }
-curl() { [[ -f "$FIXTURE_ROOT/running-port" && "${@: -1}" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/health" ]]; }
+# Two units answer on /api/ready, one unit on /api/health.
+curl() { [[ -f "$FIXTURE_ROOT/running-port" && "${@: -1}" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/$([[ -f "$API_UNIT_FILE" ]] && echo ready || echo health)" ]]; }
 wait_healthy() { healthy; }
 ci_update_progress() { printf '%s\n' "$1" >> "$FIXTURE_ROOT/progress.calls"; }
 ci_finish_progress() { printf 'closed\n' >> "$FIXTURE_ROOT/timings.calls"; }

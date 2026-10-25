@@ -59,7 +59,7 @@ export function socketPathFor(dir, instanceId) {
   if (windows) return `\\\\.\\pipe\\workbench-runtime-${instanceId}`;
   const socketPath = path.join(dir, `runtime-${instanceId}.sock`);
   // A truncated UDS path would bind somewhere else; refuse instead.
-  if (Buffer.byteLength(socketPath) > MAX_SOCKET_PATH_BYTES) throw new Error(`运行时 socket 路径超过 ${MAX_SOCKET_PATH_BYTES} 字节：${socketPath}，请缩短 DATA_DIR（服务单元只能使用 DATA_DIR/run；手动运行时也可设置较短的 WORKBENCH_RUNTIME_DIR）`);
+  if (Buffer.byteLength(socketPath) > MAX_SOCKET_PATH_BYTES) throw new Error(`运行时 socket 路径超过 ${MAX_SOCKET_PATH_BYTES} 字节：${socketPath}，请缩短 DATA_DIR 或设置较短的 WORKBENCH_RUNTIME_DIR（服务单元固定使用 /run/project-aggregation）`);
   return socketPath;
 }
 

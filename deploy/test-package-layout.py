@@ -208,6 +208,27 @@ class RuntimeDependencyTests(unittest.TestCase):
         (self.source / 'README.md').write_text('documentation only'); run('add', '.'); run('commit', '-qm', 'docs')
         self.assertEqual(module.application_key(git, 'x64'), changed)
 
+    def test_runtime_component_key_ignores_only_api_inputs(self):
+        git = ['git', '-C', str(self.source)]
+        def commit(relative, content):
+            path = self.source / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(content)
+            for args in (('add', '.'), ('commit', '-qm', relative)):
+                subprocess.run([*git, *args], check=True, capture_output=True)
+            return module.application_key(git, 'x64'), module.runtime_component_key(git, 'x64')
+        for args in (('init', '-q'), ('config', 'user.name', 'fixture'), ('config', 'user.email', 'fixture@example.invalid'), ('config', 'core.autocrlf', 'false')):
+            subprocess.run([*git, *args], check=True, capture_output=True)
+        application, runtime = commit('server/app.mjs', 'shared')
+        self.assertNotEqual(runtime, application)
+        for relative in ('server/api/server.mjs', 'src/App.tsx', 'public/icon.svg', 'index.html', 'vite.config.ts', 'tsconfig.app.json'):
+            changed, same = commit(relative, relative)
+            self.assertNotEqual(changed, application, relative); self.assertEqual(same, runtime, relative)
+            application = changed
+        for relative in ('server/app.mjs', 'server/api-helpers.mjs', 'server/runtime/main.mjs', 'modules/greeks/main.py', 'package.json', 'tsconfig.json'):
+            changed, other = commit(relative, relative + ' changed')
+            self.assertNotEqual(other, runtime, relative)
+            application, runtime = changed, other
+        self.assertNotEqual(module.runtime_component_key(git, 'arm64'), runtime)
+
     def test_dependency_stage_has_fixed_importer_targets_and_validated_production_graph(self):
         from unittest.mock import patch
         self.prepare_five_modules()

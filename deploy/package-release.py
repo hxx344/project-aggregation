@@ -313,15 +313,30 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
     shutil.copy2(diagnostic, stage / 'deploy/diagnose-aster-margin.py')
 
 
+APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'scripts/modules.mjs',
+                      'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
+                      'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
+                      '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',
+                      'deploy/package-release.py', 'deploy/pnpm-runtime-lock.mjs', 'deploy/migrate-modules.py',
+                      'deploy/diagnose-aster-margin.py', 'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md')
+# Inputs only the API unit runs or serves; a change elsewhere restarts both units (design doc 6.2).
+API_ONLY_INPUTS = ('server/api', 'src', 'public', 'index.html', 'vite.config.ts', 'tsconfig.app.json')
+
+
 def application_key(git, architecture):
-    inputs = ['server', 'src', 'public', 'modules', 'scripts/modules.mjs',
-              'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
-              'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
-              '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',
-              'deploy/package-release.py', 'deploy/pnpm-runtime-lock.mjs', 'deploy/migrate-modules.py',
-              'deploy/diagnose-aster-margin.py', 'LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md']
-    tree = subprocess.check_output([*git, 'ls-tree', '-r', 'HEAD', '--', *inputs])
+    tree = subprocess.check_output([*git, 'ls-tree', '-r', 'HEAD', '--', *APPLICATION_INPUTS])
     return hashlib.sha256(f'unified-native-pnpm-v1\n24.15.0\n11.25.0\n{architecture}\n'.encode() + tree).hexdigest()
+
+
+def runtime_component_key(git, architecture):
+    tree = subprocess.check_output([*git, 'ls-tree', '-r', 'HEAD', '--', *APPLICATION_INPUTS])
+    api = tuple(name.encode() for name in API_ONLY_INPUTS)
+
+    def runtime_entry(line):
+        path = line.split(b'\t', 1)[1]
+        return not any(path == name or path.startswith(name + b'/') for name in api)
+    kept = b''.join(line + b'\n' for line in tree.splitlines() if runtime_entry(line))
+    return hashlib.sha256(f'runtime-component-v1:ci\n24.15.0\n11.25.0\n{architecture}\n'.encode() + kept).hexdigest()
 
 
 def main():
@@ -376,6 +391,7 @@ def main():
         print(f'[package] Runtime staging: {perf_counter() - started:.1f}s', flush=True)
         (stage / '.release-commit').write_text(commit + '\n')
         (stage / '.release-application-key').write_text(runtime_key + '\n')
+        (stage / '.release-runtime-key').write_text(runtime_component_key(git, architecture) + '\n')
         # Level 6 avoids the expensive maximum-compression pass while retaining
         # deterministic gzip metadata and the same verified runtime contents.
         started = perf_counter()

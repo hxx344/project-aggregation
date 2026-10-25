@@ -40,6 +40,7 @@ old_release="$APP_DIR/releases/111111111111-2222222222222222"
 release="$APP_DIR/releases/333333333333-4444444444444444"
 old_unit_backup="$test_root/previous.service"
 UNIT_FILE="$test_root/current.service"
+API_UNIT_FILE="$test_root/current-api.service"
 printf 'previous service\n' > "$old_unit_backup"
 printf 'new service\n' > "$UNIT_FILE"
 atomic_link "$release" "$APP_DIR/current"
@@ -59,8 +60,95 @@ set -e
 cmp -s "$old_unit_backup" "$UNIT_FILE"
 grep -q '^restart project-aggregation$' "$test_root/systemctl.calls"
 
-# Cache pruning keeps every entry that the active or rollback releases still use.
+# Activation scope (design doc 6.2): only the API restarts when the runtime unit
+# would restart into the same code, unit and configuration with no pending migration.
 key() { printf '%064d' "$1"; }
+running="$APP_DIR/releases/999999999999-aaaaaaaaaaaaaaaa"
+mkdir -p "$running"
+for directory in "$old_release" "$release" "$running"; do touch "$directory/.managed-release"; key 41 > "$directory/.runtime-component-key"; done
+printf '%s\n' "$running" > "$APP_DIR/.runtime-release"
+printf 'runtime unit\n' > "$UNIT_FILE"; cp "$UNIT_FILE" "$work_dir/service"
+printf 'api unit\n' > "$API_UNIT_FILE"
+cp "$ENV_FILE" "$APP_DIR/.last-successful.env"
+expect_scope() {
+  local actual
+  actual=$(
+    systemctl() { [[ "$1 $2" != 'is-active --quiet' || ! -f "$test_root/runtime-inactive" ]]; }
+    migration_settled() { [[ ! -f "$test_root/migration-pending" ]]; }
+    activation_scope
+  )
+  [[ "$actual" == "$1" ]] || { echo "Expected activation scope $1, got $actual: $2" >&2; exit 1; }
+}
+expect_scope api 'same runtime code, unit and configuration'
+( old_release=; expect_scope full 'first installation' )
+mv "$API_UNIT_FILE" "$test_root/api.hidden"; expect_scope full 'single unit before the split'; mv "$test_root/api.hidden" "$API_UNIT_FILE"
+printf 'changed\n' >> "$work_dir/service"; expect_scope full 'runtime unit changed'; cp "$UNIT_FILE" "$work_dir/service"
+printf 'PORT=3200\n' >> "$ENV_FILE"; expect_scope full 'environment changed'; cp "$APP_DIR/.last-successful.env" "$ENV_FILE"
+mv "$APP_DIR/.last-successful.env" "$test_root/env.hidden"; expect_scope full 'no successful environment'; mv "$test_root/env.hidden" "$APP_DIR/.last-successful.env"
+rm "$APP_DIR/.runtime-release"; expect_scope full 'no runtime release record'
+printf '%s\n' "$test_root/first" > "$APP_DIR/.runtime-release"; expect_scope full 'record outside the releases'
+printf '%s\n' "$APP_DIR/releases/bbbbbbbbbbbb-cccccccccccccccc" > "$APP_DIR/.runtime-release"; expect_scope full 'recorded release removed'
+printf '%s\n' "$running" > "$APP_DIR/.runtime-release"
+key 42 > "$release/.runtime-component-key"; expect_scope full 'runtime component changed'
+rm "$release/.runtime-component-key"; expect_scope full 'candidate without a component key'
+printf 'not-a-key\n' > "$release/.runtime-component-key"; key 41 | tr 4 x > "$running/.runtime-component-key"; expect_scope full 'invalid keys never match'
+key 41 > "$release/.runtime-component-key"; key 41 > "$running/.runtime-component-key"; expect_scope api 'keys restored'
+touch "$test_root/runtime-inactive"; expect_scope full 'runtime not running'; rm "$test_root/runtime-inactive"
+touch "$test_root/migration-pending"; expect_scope full 'module migration outstanding'; rm "$test_root/migration-pending"
+mkdir -p "$release/deploy"
+DATA_PATH="$test_root/data"
+for answer in 'print("committed")' 'print("pending")' 'raise SystemExit(3)'; do
+  printf '%s\n' "$answer" > "$release/deploy/migrate-modules.py"
+  if migration_settled "$release"; then [[ "$answer" == 'print("committed")' ]]; else [[ "$answer" != 'print("committed")' ]]; fi
+done
+
+# A failed API-only activation points current back and restarts only the API.
+old_api_unit_backup="$test_root/previous-api.service"
+printf 'previous api\n' > "$old_api_unit_backup"
+atomic_link "$release" "$APP_DIR/current"
+: > "$test_root/systemctl.calls"
+set +e
+( activation_scope=api; activation_started=1; (exit 7); rollback )
+rollback_status=$?
+set -e
+[[ "$rollback_status" == 7 && "$(readlink "$APP_DIR/current")" == "$old_release" ]]
+cmp -s "$old_api_unit_backup" "$API_UNIT_FILE"
+[[ "$(cat "$UNIT_FILE")" == 'runtime unit' && "$(cat "$APP_DIR/.runtime-release")" == "$running" ]]
+grep -qx 'restart project-aggregation-api' "$test_root/systemctl.calls"
+! grep -Eq '^(stop|restart) project-aggregation$' "$test_root/systemctl.calls"
+# Rolling a full activation back past the split removes the managed API unit.
+old_api_unit_backup=
+printf '# Managed by project-aggregation installer\n' > "$API_UNIT_FILE"
+atomic_link "$release" "$APP_DIR/current"
+: > "$test_root/systemctl.calls"
+set +e
+( activation_scope=full; activation_started=1; (exit 8); rollback )
+rollback_status=$?
+set -e
+[[ "$rollback_status" == 8 && "$(readlink "$APP_DIR/current")" == "$old_release" && ! -e "$API_UNIT_FILE" ]]
+cmp -s "$old_unit_backup" "$UNIT_FILE"
+[[ "$(cat "$APP_DIR/.runtime-release")" == "$old_release" ]]
+grep -qx 'stop project-aggregation-api' "$test_root/systemctl.calls"
+grep -qx 'restart project-aggregation' "$test_root/systemctl.calls"
+# An earlier API unit is restored instead.
+old_api_unit_backup="$test_root/previous-api.service"
+printf 'candidate api\n' > "$API_UNIT_FILE"
+set +e
+( activation_scope=full; activation_started=1; (exit 8); rollback )
+set -e
+cmp -s "$old_api_unit_backup" "$API_UNIT_FILE"
+old_api_unit_backup=
+rm -f "$API_UNIT_FILE"
+
+# Release pruning keeps the release the runtime still runs after API-only updates.
+for name in dddddddddddd-eeeeeeeeeeeeeeee ffffffffffff-0000000000000000; do mkdir -p "$APP_DIR/releases/$name"; touch "$APP_DIR/releases/$name/.managed-release"; done
+printf '%s\n' "$running" > "$APP_DIR/.runtime-release"
+( previous_release=$old_release; prune_releases )
+[[ -d "$release" && -d "$old_release" && -d "$running" ]]
+[[ ! -e "$APP_DIR/releases/dddddddddddd-eeeeeeeeeeeeeeee" && ! -e "$APP_DIR/releases/ffffffffffff-0000000000000000" ]]
+rm -rf -- "$running" "$APP_DIR/.runtime-release" "$release/deploy"
+
+# Cache pruning keeps every entry that the active or rollback releases still use.
 cache="$APP_DIR/cache"
 mkdir -p "$cache/archives" "$APP_DIR/python" "$APP_DIR/python-aster"
 PROJECT_DEPLOY_MODE=source
