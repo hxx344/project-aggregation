@@ -339,8 +339,11 @@ class Releases:
             raise ReleaseError('尚无可用正式版本，或正式版本地址已改变')
         return match.group(1)
 
-    def metadata(self, module, release_id=None):
-        suffix = 'releases/latest' if release_id is None else f'releases/{release_id}'
+    def metadata(self, module, release_id=None, tag=None):
+        # The API's releases/latest is CDN-cached for about a minute and lags the
+        # uncached github.com redirect right after promotion; read the tag it named.
+        # Only request-only adapters (no redirect, see cacheable) still read latest.
+        suffix = f'releases/{release_id}' if release_id is not None else f'releases/tags/{tag}' if tag else 'releases/latest'
         release = decode_json(self.network.request(self.api(module, suffix)))
         if (type(release.get('id')) is not int or release['id'] < 1 or
                 release.get('draft') is not False or release.get('prerelease') is not False or
@@ -382,11 +385,11 @@ class Releases:
                 if reusable['manifestHash'] == digest(manifest_bytes):
                     artifact.result()
                     return copy.deepcopy(reusable)
-                release = self.metadata(module)
+                release = self.metadata(module, tag=tag)
             else:
                 # Metadata does not depend on the manifest; manifest errors keep
                 # their original precedence because they are raised first.
-                metadata = RELEASE_PROBES.submit(self.metadata, module)
+                metadata = RELEASE_PROBES.submit(self.metadata, module, tag=tag)
                 try:
                     manifest_bytes = self.network.request(manifest_url)
                 finally:

@@ -75,13 +75,17 @@ class FakeNetwork:
         for repository, entry in self.values.items():
             base = 'https://api.github.com/repos/hxx344/' + repository + '/'
             if url == base + 'releases/latest':
-                return encoded(entry['releases'][entry['latest']]['metadata'])
+                # Models the API's CDN copy, which may still name the previous release.
+                return encoded(entry['releases'][entry.get('apiLatest', entry['latest'])]['metadata'])
             if url == base + f'releases?per_page={releases.HISTORY_PAGE}' and 'history' in entry:
                 if 'historyError' in entry:
                     raise entry['historyError']
                 return encoded(entry['history'])
             if url.startswith(base + 'releases/tags/'):
-                tagged = entry.get('tags', {}).get(url.removeprefix(base + 'releases/tags/'))
+                tag = url.removeprefix(base + 'releases/tags/')
+                tagged = entry.get('tags', {}).get(tag)
+                if tagged is None and tag.startswith('deploy-') and tag.removeprefix('deploy-') in entry['releases']:
+                    tagged = entry['releases'][tag.removeprefix('deploy-')]['metadata']
                 if tagged is None:
                     raise releases.ReleaseError('GitHub API未找到正式版本或发布文件（HTTP 404）',
                                                 transient=entry.get('tagFailureTransient', False))
@@ -233,14 +237,27 @@ class ReleaseCacheTests(unittest.TestCase):
         self.assertEqual(self.network.counts(), {'discovery': 2, 'manifest': 2, 'artifact': 2,
                                                  'metadata': 2, 'installer': 2})
 
+    def test_new_release_is_found_while_the_api_latest_copy_is_stale(self):
+        self.reader.read(self.module)
+        self.network.add(self.module, NEXT, 2)
+        self.entry.update(latest=NEXT, apiLatest=NEW)
+        result = self.reader.read(self.module)
+        self.assertEqual((result['commit'], result['releaseId']), (NEXT, 2))
+        self.assertIn((self.reader.api(self.module, 'releases/tags/deploy-' + NEXT), 'GET'), self.network.calls)
+        self.assertNotIn((self.reader.api(self.module, 'releases/latest'), 'GET'), self.network.calls)
+
     def test_latest_tag_race_cannot_populate_or_return_cache(self):
         self.reader.read(self.module)
         self.network.add(self.module, NEXT, 2)
-        self.entry['target'] = f'https://github.com/hxx344/{self.module.repository}/releases/tag/deploy-{NEXT}'
-        with self.assertRaises(releases.ReleaseError):
-            self.reader.read(self.module)
-        self.assertFalse(self.reader._releases)
-        self.assertEqual(self.network.counts()['installer'], 1)
+        self.entry['latest'] = NEXT
+        for change in [{'tag_name': 'deploy-' + NEW}, {'prerelease': True}]:
+            with self.subTest(change=change):
+                self.entry['releases'][NEXT]['metadata'].update(change)
+                with self.assertRaises(releases.ReleaseError):
+                    self.reader.read(self.module)
+                self.assertFalse(self.reader._releases)
+                self.assertEqual(self.network.counts()['installer'], 1)
+                self.entry['releases'][NEXT]['metadata'].update(tag_name='deploy-' + NEXT, prerelease=False)
 
     def test_missing_or_cross_repository_redirects_never_reuse_a_cached_release(self):
         base = f'https://github.com/hxx344/{self.module.repository}/releases/'
@@ -502,7 +519,7 @@ class ReleaseCacheTests(unittest.TestCase):
 
     def test_concurrent_probe_failures_keep_original_error_precedence(self):
         manifest = (self.reader.download(self.module, 'deploy-' + NEW, 'release-manifest.json'), 'GET')
-        metadata = (self.reader.api(self.module, 'releases/latest'), 'GET')
+        metadata = (self.reader.api(self.module, 'releases/tags/deploy-' + NEW), 'GET')
         self.network.failures.update({manifest, metadata})
         with self.assertRaisesRegex(releases.ReleaseError, 'fixture network unavailable') as caught, \
                 patch.object(self.reader, 'metadata', side_effect=releases.ReleaseError('metadata failed', transient=True)):

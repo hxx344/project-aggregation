@@ -40,9 +40,16 @@ JOB_HISTORY_LIMIT = 10
 # Removal runs under the shared state lock; a backlog left by older versions is
 # drained over successive checks so status requests stay within their timeout.
 PRUNE_BATCH = 20
-CHECK_MIN_INTERVAL = 60
-# Steady-state checks are mostly github.com requests; API use is bounded by
-# the release cache TTL, not by this interval.
+# Manual checks only guard against double submission. Automatic checks run every
+# AUTO_CHECK_INTERVAL, so a longer manual minimum would silently skip most clicks.
+CHECK_MIN_INTERVAL = 10
+# A failing check may cost an anonymous API request each time (non-transient
+# errors drop the release cache, failed comparisons are not cached), so after a
+# failed check manual ones keep the earlier pace and spend the hourly quota no
+# faster than before.
+CHECK_FAILURE_MIN_INTERVAL = 60
+# Successful steady-state checks are mostly github.com requests; API use is
+# bounded by the release cache TTL, not by this interval.
 AUTO_CHECK_INTERVAL = 60
 CHECK_RETRY_MAX_INTERVAL = 15 * 60
 # Longest sequential chain is about four probes of two 15s attempts each.
@@ -451,11 +458,13 @@ class Coordinator:
                 self.prune(state)
             return self.public(state)
 
-    def check(self, minimum_interval=CHECK_MIN_INTERVAL, automatic=False):
+    def check(self, minimum_interval=None, automatic=False):
         with self.lock():
             state = self.load()
             if state['checking'] or state['job'] and state['job']['status'] in ACTIVE:
                 return self.public(state)
+            if minimum_interval is None:
+                minimum_interval = CHECK_FAILURE_MIN_INTERVAL if state.get('failureCount') else CHECK_MIN_INTERVAL
             if self._check_delay(state, minimum_interval, automatic) > 0:
                 return self.public(state)
             check_id = uuid.uuid4().hex
