@@ -97,10 +97,18 @@ systemctl() {
       # fail-api fails the next API restart once.
       if [[ $(read_setting PORT 0) == 4999 || ( $2 == *-api && -f "$FIXTURE_ROOT/fail-api" ) ]]; then
         rm -f "$FIXTURE_ROOT/running-port" "$FIXTURE_ROOT/fail-api"
-      else read_setting PORT 0 > "$FIXTURE_ROOT/running-port"; fi ;;
+      else
+        read_setting PORT 0 > "$FIXTURE_ROOT/running-port"
+        # The runtime runs the release current pointed to when its unit started.
+        [[ $2 != "$SERVICE" ]] || printf '%s\n' "$(readlink "$APP_DIR/current")" > "$FIXTURE_ROOT/runtime-cwd-${APP_DIR##*/}"
+      fi ;;
     stop) rm -f "$FIXTURE_ROOT/running-port" ;;
     *) return 0 ;;
   esac
+}
+live_runtime_release() {
+  [[ -f "$FIXTURE_ROOT/running-port" && -f "$FIXTURE_ROOT/runtime-cwd-${APP_DIR##*/}" ]] || return 1
+  managed_release "$(cat "$FIXTURE_ROOT/runtime-cwd-${APP_DIR##*/}")"
 }
 curl() {
   local url='' output='' argument
@@ -251,7 +259,8 @@ expect_counts 1 1 0 1 7
 new_calls() { tail -n "+$((calls + 1))" "$fixture/systemctl.calls"; }
 api_only() { new_calls | grep -qx "restart $service-api" && ! new_calls | grep -Eq "^(restart|stop) $service\$"; }
 full_restart() { new_calls | grep -qx "restart $service"; }
-[[ -f "$fixture/api-unit" && $(cat "$fixture/application/.runtime-release") == "$third" ]]
+live() { cat "$fixture/runtime-cwd-application"; }
+[[ -f "$fixture/api-unit" && -f "$fixture/application/.runtime-deployment" && $(live) == "$third" ]]
 grep -q '^ExecStart=.*/server/runtime/main.mjs$' "$fixture/unit"
 grep -q '^ExecStart=.*/server/api/main.mjs$' "$fixture/api-unit"
 calls=$(wc -l < "$fixture/systemctl.calls")
@@ -259,7 +268,7 @@ echo page >> "$fixture/source/src/app.ts"; commit_source page
 make_package page next
 run_install
 fourth=$(readlink "$fixture/application/current")
-[[ "$fourth" != "$third" && $(cat "$fixture/application/.runtime-release") == "$third" ]]
+[[ "$fourth" != "$third" && $(live) == "$third" ]]
 api_only
 calls=$(wc -l < "$fixture/systemctl.calls")
 echo page >> "$fixture/source/src/app.ts"; commit_source page-two
@@ -274,8 +283,9 @@ echo page >> "$fixture/source/src/app.ts"; commit_source page-three
 make_package page-three next
 touch "$fixture/fail-api"
 if run_install; then echo 'Unhealthy API accepted' >&2; exit 1; fi
-[[ $(readlink "$fixture/application/current") == "$fifth" && $(cat "$fixture/application/.runtime-release") == "$third" ]]
-[[ $(new_calls | grep -cx "restart $service-api") == 2 ]] && api_only
+[[ $(readlink "$fixture/application/current") == "$fifth" && $(live) == "$third" ]]
+[[ $(new_calls | grep -cx "restart $service-api") == 2 ]]
+api_only
 # Outstanding module migration and changed runtime code both restart the two units.
 calls=$(wc -l < "$fixture/systemctl.calls")
 touch "$fixture/migration-pending"
@@ -283,11 +293,18 @@ run_install
 full_restart
 rm "$fixture/migration-pending"
 sixth=$(readlink "$fixture/application/current")
-[[ $(cat "$fixture/application/.runtime-release") == "$sixth" ]]
+[[ $(live) == "$sixth" && -f "$fixture/application/.runtime-deployment" ]]
+# A changed environment file restarts both units.
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo page >> "$fixture/source/src/app.ts"; commit_source page-four
+make_package page-four next
+printf 'EXTRA_SETTING=1\n' >> "$fixture/environment"
+run_install
+full_restart
 calls=$(wc -l < "$fixture/systemctl.calls")
 echo changed >> "$fixture/source/server/index.mjs"; commit_source runtime
 make_package runtime runtime-two
 run_install
 full_restart
-[[ $(cat "$fixture/application/.runtime-release") == "$(readlink "$fixture/application/current")" ]]
+[[ $(live) == "$(readlink "$fixture/application/current")" ]]
 printf 'CI package migration, no-op, content identity, corruption, rollback and activation scope checks passed.\n'

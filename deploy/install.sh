@@ -1411,7 +1411,6 @@ rollback() {
       atomic_link "$old_release" "$APP_DIR/current"
       systemctl daemon-reload
       systemctl restart "$SERVICE" || true
-      atomic_record "$APP_DIR/.runtime-release" "$old_release" || log '无法更新运行时版本记录；下次安装会整体重启。'
       if wait_healthy; then log '已恢复上次成功的程序和配置；持久数据保持原样。'; else log '旧版本尚未恢复健康，请查看服务日志。'; fi
     else
       if [[ -L "$APP_DIR/current" && "$(readlink "$APP_DIR/current")" == "${release:-}" ]]; then rm -f -- "$APP_DIR/current"; fi
@@ -2405,6 +2404,9 @@ finish_activation() {
 # backoff of 1 s doubling up to 30 s, and connects to the runtime socket in the
 # runtime unit's RuntimeDirectory.
 write_unit() {
+  local api_restart=$'RestartSec=1\nRestartSteps=5\nRestartMaxDelaySec=30'
+  # systemd before 254 ignores the backoff and would restart every second.
+  (( ${systemd_version:-0} >= 254 )) || api_restart='RestartSec=5'
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
 [Unit]
@@ -2454,9 +2456,7 @@ ExecStart=$NODE_BIN $APP_DIR/current/server/api/main.mjs
 EnvironmentFile=$ENV_FILE
 Environment=WORKBENCH_RUNTIME_DIR=/run/$SERVICE
 Restart=on-failure
-RestartSec=1
-RestartSteps=5
-RestartMaxDelaySec=30
+$api_restart
 TimeoutStopSec=75
 UMask=0077
 NoNewPrivileges=true
@@ -2466,15 +2466,27 @@ ProtectHome=true
 ReadWritePaths=$DATA_PATH
 EOF
 }
-# The release the runtime unit was last (re)started from: an update that only
-# restarts the API leaves the runtime running there (design doc 6.2).
-running_runtime_release() {
-  local recorded
-  [[ -f "$APP_DIR/.runtime-release" ]] || return 1
-  recorded=$(cat -- "$APP_DIR/.runtime-release") || return 1
-  [[ "$recorded" == "$APP_DIR/releases/"* && "${recorded##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ &&
-     -d "$recorded" && ! -L "$recorded" && -f "$recorded/.managed-release" ]] || return 1
-  printf '%s' "$recorded"
+managed_release() {
+  [[ "$1" == "$APP_DIR/releases/"* && "${1##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ &&
+     -d "$1" && ! -L "$1" && -f "$1/.managed-release" ]] || return 1
+  printf '%s' "$1"
+}
+# The release the running runtime started from (design doc 6.2): systemd enters
+# the working directory through current, so the main process's working
+# directory is that release, also after a restart outside the installer. An
+# update that only restarts the API leaves the runtime there.
+live_runtime_release() {
+  local pid directory releases
+  pid=$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null) && [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  directory=$(readlink -e -- "/proc/$pid/cwd") || return 1
+  releases=$(realpath -e -- "$APP_DIR/releases") || return 1
+  [[ "${directory%/*}" == "$releases" ]] || return 1
+  managed_release "$APP_DIR/releases/${directory##*/}"
+}
+# What the runtime was last started with by a full activation besides its code:
+# the unit, the environment file, Node and the installer revision.
+runtime_deployment_key() {
+  { cat -- "$work_dir/service" "$ENV_FILE"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash
 }
 release_runtime_key() {
   local key
@@ -2493,11 +2505,11 @@ migration_settled() {
 # otherwise (design doc 6.2). Shared code outside server/api counts as runtime.
 activation_scope() {
   local running key
-  if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$API_UNIT_FILE" && -f "$APP_DIR/.last-successful.env" ]] &&
-     cmp -s "$work_dir/service" "$UNIT_FILE" && cmp -s "$ENV_FILE" "$APP_DIR/.last-successful.env" &&
-     running=$(running_runtime_release) && key=$(release_runtime_key "$release") &&
-     [[ "$(release_runtime_key "$running")" == "$key" ]] &&
-     systemctl is-active --quiet "$SERVICE" && migration_settled "$release"; then
+  if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$API_UNIT_FILE" && -f "$APP_DIR/.runtime-deployment" ]] &&
+     cmp -s "$work_dir/service" "$UNIT_FILE" && [[ "$(cat -- "$APP_DIR/.runtime-deployment")" == "$(runtime_deployment_key)" ]] &&
+     systemctl is-active --quiet "$SERVICE" && running=$(live_runtime_release) &&
+     key=$(release_runtime_key "$release") && [[ "$(release_runtime_key "$running")" == "$key" ]] &&
+     migration_settled "$release"; then
     printf api
   else
     printf full
@@ -2505,7 +2517,11 @@ activation_scope() {
 }
 prune_releases() {
   local directory runtime_release
-  runtime_release=$(running_runtime_release) || runtime_release=
+  if ! runtime_release=$(live_runtime_release); then
+    # The runtime may still run from any release while its own is unknown.
+    if systemctl is-active --quiet "$SERVICE"; then log '无法确认运行时所在的版本目录；本次不清理旧版本。'; return 0; fi
+    runtime_release=
+  fi
   while IFS= read -r directory; do
     if [[ "$directory" == "$release" || "$directory" == "$previous_release" || "$directory" == "$runtime_release" ]]; then continue; fi
     [[ -f "$directory/.managed-release" ]] || continue
@@ -2531,7 +2547,7 @@ prune_caches() {
   local removed=0 failed=0 source_keys=0
   local -A keep=() keep_python=()
   local -a roots=()
-  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "$(running_runtime_release || true)"; do
+  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "$(live_runtime_release || true)"; do
     [[ -n "$root" && -e "$root" ]] || continue
     root=$(realpath -e -- "$root") || return 1
     roots+=("$root")
@@ -2695,6 +2711,7 @@ main() {
   fi
   if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
   if [[ -f "$APP_DIR/.aster-python-path" ]]; then ASTER_PYTHON_PATH=$(cat "$APP_DIR/.aster-python-path"); fi
+  systemd_version=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 + 0 }') || systemd_version=0
   write_unit
   deployment_key=$({ cat "$ENV_FILE" "$work_dir/service" "$work_dir/api.service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   # Both deployment modes consume exactly the selected stable release. The
@@ -2760,8 +2777,8 @@ main() {
     fi
     systemctl restart "$API_SERVICE"
   else
-    # Until the restart below the record may name a release no runtime runs.
-    rm -f -- "$APP_DIR/.runtime-release"
+    # Recorded again once the restarted runtime is healthy.
+    rm -f -- "$APP_DIR/.runtime-deployment"
     migrate_embedded_modules "$release"
     if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
     units_changed=0
@@ -2771,11 +2788,13 @@ main() {
     systemctl enable "$SERVICE" >/dev/null
     # PartOf= restarts a running API with the runtime and Wants= starts a stopped one.
     systemctl restart "$SERVICE"
-    atomic_record "$APP_DIR/.runtime-release" "$release"
   fi
   ci_update_progress finalize '' healthcheck
   wait_healthy || fail '服务未在 30 次健康检查内就绪。'
   finish_activation
+  if [[ "$activation_scope" == full ]]; then
+    atomic_record "$APP_DIR/.runtime-deployment" "$(runtime_deployment_key)" || log '无法记录运行时的部署配置；下次安装会整体重启。'
+  fi
   atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
   atomic_record "$release/.install-ready" "$application_key"
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"

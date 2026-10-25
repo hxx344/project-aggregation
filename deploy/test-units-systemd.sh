@@ -81,7 +81,9 @@ JS
 touch "$release_one/.managed-release"
 chmod -R a+rX,go-w "$APP_DIR"
 atomic_link "$release_one" "$APP_DIR/current"
+systemd_version=$(systemctl --version | awk 'NR == 1 { print $2 + 0 }')
 write_unit
+if (( systemd_version >= 254 )); then grep -qx 'RestartSteps=5' "$work_dir/api.service"; else grep -qx 'RestartSec=5' "$work_dir/api.service"; fi
 install -m 0644 "$work_dir/service" "$UNIT_FILE"
 install -m 0644 "$work_dir/api.service" "$API_UNIT_FILE"
 systemctl daemon-reload
@@ -102,6 +104,7 @@ snapshot=$(state)
 [[ $(field runtime.pid <<< "$snapshot") == "$runtime_pid" && $(field api.pid <<< "$snapshot") == "$api_pid" ]]
 [[ $(field runtime.url <<< "$snapshot") == "file://$release_one/server/runtime/main.mjs" ]] # Node runs the release, not current.
 [[ $(field api.runDirWritable <<< "$snapshot") == False ]]
+[[ $(live_runtime_release) == "$release_one" ]] # The installer reads the release from the runtime's working directory.
 [[ $(stat -c '%U %a' "/run/$SERVICE") == "$name 700" && $(stat -c %U "$DATA_PATH/runtime-wrote") == "$name" ]]
 [[ $(ps -o uid= -p "$runtime_pid" | tr -d ' ') == "$(id -u "$name")" && $(ps -o uid= -p "$api_pid" | tr -d ' ') == "$(id -u "$name")" ]]
 
@@ -115,6 +118,7 @@ snapshot=$(state)
 [[ $(main_pid "$SERVICE") == "$runtime_pid" && $(field runtime.pid <<< "$snapshot") == "$runtime_pid" ]]
 [[ $(field runtime.url <<< "$snapshot") == "file://$release_one/server/runtime/main.mjs" ]]
 [[ $(field api.url <<< "$snapshot") == "file://$release_two/server/api/main.mjs" && $(field api.pid <<< "$snapshot") != "$api_pid" ]]
+[[ $(live_runtime_release) == "$release_one" ]]
 
 # A crashed API restarts alone.
 api_pid=$(main_pid "$API_SERVICE")
@@ -130,6 +134,7 @@ wait_healthy
 snapshot=$(state)
 [[ $(main_pid "$SERVICE") != "$runtime_pid" && $(main_pid "$API_SERVICE") != "$api_pid" ]]
 [[ $(field runtime.url <<< "$snapshot") == "file://$release_two/server/runtime/main.mjs" ]]
+[[ $(live_runtime_release) == "$release_two" ]]
 
 # A crashed runtime restarts (RestartSec=5) and the API reaches the new instance.
 runtime_pid=$(main_pid "$SERVICE") api_pid=$(main_pid "$API_SERVICE")

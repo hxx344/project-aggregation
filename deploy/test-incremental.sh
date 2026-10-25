@@ -177,11 +177,21 @@ systemctl() {
     is-active) [[ -f "$FIXTURE_ROOT/running-port" ]] ;;
     restart)
       if [[ $(read_setting PORT 0) == 4999 ]]; then rm -f "$FIXTURE_ROOT/running-port"
-      else read_setting PORT 0 > "$FIXTURE_ROOT/running-port"; fi ;;
+      else
+        read_setting PORT 0 > "$FIXTURE_ROOT/running-port"
+        [[ $2 != "$SERVICE" ]] || readlink "$APP_DIR/current" > "$FIXTURE_ROOT/runtime-cwd"
+      fi ;;
     stop) rm -f "$FIXTURE_ROOT/running-port" ;;
     *) return 0 ;;
   esac
 }
+live_runtime_release() {
+  [[ -f "$FIXTURE_ROOT/running-port" && -f "$FIXTURE_ROOT/runtime-cwd" ]] || return 1
+  managed_release "$(cat "$FIXTURE_ROOT/runtime-cwd")"
+}
+# Scoped activation stays off (every activation restarts both units) until the
+# last scenario creates scope-enabled.
+migration_settled() { [[ -f "$FIXTURE_ROOT/scope-enabled" ]]; }
 # Two units answer on /api/ready, one unit on /api/health.
 curl() { [[ -f "$FIXTURE_ROOT/running-port" && "${@: -1}" == "http://127.0.0.1:$(cat "$FIXTURE_ROOT/running-port")/api/$([[ -f "$API_UNIT_FILE" ]] && echo ready || echo health)" ]]; }
 wait_healthy() { healthy; }
@@ -365,4 +375,20 @@ repaired_dependency_cache=$(find "$fixture/application/cache" -maxdepth 1 -type 
 [[ $(wc -l <<< "$repaired_dependency_cache") == 1 && "$repaired_dependency_cache" != "$active_dependency_cache" ]]
 run_install
 expect_counts 5 7 11 10 13
+# Source mode, design doc 6.2: a frontend change restarts only the API; a
+# change to code the runtime unit runs restarts both units.
+touch "$fixture/scope-enabled"
+calls=$(wc -l < "$fixture/systemctl.calls")
+new_calls() { tail -n "+$((calls + 1))" "$fixture/systemctl.calls"; }
+runtime_release=$(cat "$fixture/runtime-cwd")
+echo scoped >> "$fixture/source/src/app.ts"; commit_source scoped-frontend
+run_install
+new_calls | grep -qx "restart $service-api"
+if new_calls | grep -Eq "^(restart|stop) $service\$"; then echo 'Frontend change restarted the runtime unit' >&2; exit 1; fi
+[[ $(readlink "$fixture/application/current") != "$runtime_release" && $(cat "$fixture/runtime-cwd") == "$runtime_release" ]]
+calls=$(wc -l < "$fixture/systemctl.calls")
+echo scoped >> "$fixture/source/server/index.mjs"; commit_source scoped-runtime
+run_install
+new_calls | grep -qx "restart $service"
+[[ $(cat "$fixture/runtime-cwd") == "$(readlink "$fixture/application/current")" ]]
 printf 'Incremental installer paths passed (docs/tests/backend/frontend/config, failures and environment).\n'

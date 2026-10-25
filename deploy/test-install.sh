@@ -62,33 +62,55 @@ grep -q '^restart project-aggregation$' "$test_root/systemctl.calls"
 
 # Activation scope (design doc 6.2): only the API restarts when the runtime unit
 # would restart into the same code, unit and configuration with no pending migration.
+# A real process stands in for the runtime: its working directory is the release it runs.
 key() { printf '%064d' "$1"; }
 running="$APP_DIR/releases/999999999999-aaaaaaaaaaaaaaaa"
 mkdir -p "$running"
 for directory in "$old_release" "$release" "$running"; do touch "$directory/.managed-release"; key 41 > "$directory/.runtime-component-key"; done
-printf '%s\n' "$running" > "$APP_DIR/.runtime-release"
+(cd "$running" && exec sleep 600) & live_pid=$!
+# Same name as the running release, but outside the releases directory.
+mkdir -p "$test_root/elsewhere/${running##*/}"
+(cd "$test_root/elsewhere/${running##*/}" && exec sleep 600) & outside_pid=$!
+gone="$APP_DIR/releases/888888888888-aaaaaaaaaaaaaaaa"
+mkdir -p "$gone"; touch "$gone/.managed-release"; key 41 > "$gone/.runtime-component-key"
+(cd "$gone" && exec sleep 600) & gone_pid=$!
+trap 'kill "$live_pid" "$outside_pid" "$gone_pid" 2>/dev/null || true; rm -rf -- "$test_root"' EXIT
+for attempt in {1..50}; do [[ $(readlink "/proc/$gone_pid/cwd") != "$gone" ]] || break; read -rt 0.1 <> <(:) || true; done
+rm -rf -- "$gone"
 printf 'runtime unit\n' > "$UNIT_FILE"; cp "$UNIT_FILE" "$work_dir/service"
 printf 'api unit\n' > "$API_UNIT_FILE"
-cp "$ENV_FILE" "$APP_DIR/.last-successful.env"
+runtime_key=$(key 51) build_environment=fixture
+runtime_deployment_key > "$APP_DIR/.runtime-deployment"
+cp "$ENV_FILE" "$test_root/environment.saved"
+runtime_pid=$live_pid
+runtime_stub() {
+  case "$1" in
+    is-active) [[ ! -f "$test_root/runtime-inactive" ]] ;;
+    show) if [[ -f "$test_root/runtime-inactive" ]]; then echo 0; else echo "$runtime_pid"; fi ;;
+  esac
+}
 expect_scope() {
   local actual
   actual=$(
-    systemctl() { [[ "$1 $2" != 'is-active --quiet' || ! -f "$test_root/runtime-inactive" ]]; }
+    systemctl() { runtime_stub "$@"; }
     migration_settled() { [[ ! -f "$test_root/migration-pending" ]]; }
     activation_scope
   )
   [[ "$actual" == "$1" ]] || { echo "Expected activation scope $1, got $actual: $2" >&2; exit 1; }
 }
+[[ "$(systemctl() { runtime_stub "$@"; }; live_runtime_release)" == "$running" ]]
 expect_scope api 'same runtime code, unit and configuration'
 ( old_release=; expect_scope full 'first installation' )
 mv "$API_UNIT_FILE" "$test_root/api.hidden"; expect_scope full 'single unit before the split'; mv "$test_root/api.hidden" "$API_UNIT_FILE"
 printf 'changed\n' >> "$work_dir/service"; expect_scope full 'runtime unit changed'; cp "$UNIT_FILE" "$work_dir/service"
-printf 'PORT=3200\n' >> "$ENV_FILE"; expect_scope full 'environment changed'; cp "$APP_DIR/.last-successful.env" "$ENV_FILE"
-mv "$APP_DIR/.last-successful.env" "$test_root/env.hidden"; expect_scope full 'no successful environment'; mv "$test_root/env.hidden" "$APP_DIR/.last-successful.env"
-rm "$APP_DIR/.runtime-release"; expect_scope full 'no runtime release record'
-printf '%s\n' "$test_root/first" > "$APP_DIR/.runtime-release"; expect_scope full 'record outside the releases'
-printf '%s\n' "$APP_DIR/releases/bbbbbbbbbbbb-cccccccccccccccc" > "$APP_DIR/.runtime-release"; expect_scope full 'recorded release removed'
-printf '%s\n' "$running" > "$APP_DIR/.runtime-release"
+printf 'changed\n' >> "$UNIT_FILE"; expect_scope full 'installed runtime unit edited'; cp "$work_dir/service" "$UNIT_FILE"
+printf 'PORT=3200\n' >> "$ENV_FILE"; expect_scope full 'environment changed'; cp "$test_root/environment.saved" "$ENV_FILE"
+( runtime_key=$(key 52); expect_scope full 'Node changed' )
+( INSTALL_REVISION=999; expect_scope full 'installer revision changed' )
+mv "$APP_DIR/.runtime-deployment" "$test_root/deployment.hidden"; expect_scope full 'no full activation recorded'; mv "$test_root/deployment.hidden" "$APP_DIR/.runtime-deployment"
+( runtime_pid=$outside_pid; expect_scope full 'runtime outside the releases' )
+( runtime_pid=$gone_pid; expect_scope full 'runtime release removed' )
+rm "$running/.managed-release"; expect_scope full 'runtime release not managed'; touch "$running/.managed-release"
 key 42 > "$release/.runtime-component-key"; expect_scope full 'runtime component changed'
 rm "$release/.runtime-component-key"; expect_scope full 'candidate without a component key'
 printf 'not-a-key\n' > "$release/.runtime-component-key"; key 41 | tr 4 x > "$running/.runtime-component-key"; expect_scope full 'invalid keys never match'
@@ -113,9 +135,9 @@ rollback_status=$?
 set -e
 [[ "$rollback_status" == 7 && "$(readlink "$APP_DIR/current")" == "$old_release" ]]
 cmp -s "$old_api_unit_backup" "$API_UNIT_FILE"
-[[ "$(cat "$UNIT_FILE")" == 'runtime unit' && "$(cat "$APP_DIR/.runtime-release")" == "$running" ]]
+[[ "$(cat "$UNIT_FILE")" == 'runtime unit' && -f "$APP_DIR/.runtime-deployment" ]]
 grep -qx 'restart project-aggregation-api' "$test_root/systemctl.calls"
-! grep -Eq '^(stop|restart) project-aggregation$' "$test_root/systemctl.calls"
+if grep -Eq '^(stop|restart) project-aggregation$' "$test_root/systemctl.calls"; then echo 'API rollback touched the runtime unit' >&2; exit 1; fi
 # Rolling a full activation back past the split removes the managed API unit.
 old_api_unit_backup=
 printf '# Managed by project-aggregation installer\n' > "$API_UNIT_FILE"
@@ -127,7 +149,6 @@ rollback_status=$?
 set -e
 [[ "$rollback_status" == 8 && "$(readlink "$APP_DIR/current")" == "$old_release" && ! -e "$API_UNIT_FILE" ]]
 cmp -s "$old_unit_backup" "$UNIT_FILE"
-[[ "$(cat "$APP_DIR/.runtime-release")" == "$old_release" ]]
 grep -qx 'stop project-aggregation-api' "$test_root/systemctl.calls"
 grep -qx 'restart project-aggregation' "$test_root/systemctl.calls"
 # An earlier API unit is restored instead.
@@ -142,11 +163,14 @@ rm -f "$API_UNIT_FILE"
 
 # Release pruning keeps the release the runtime still runs after API-only updates.
 for name in dddddddddddd-eeeeeeeeeeeeeeee ffffffffffff-0000000000000000; do mkdir -p "$APP_DIR/releases/$name"; touch "$APP_DIR/releases/$name/.managed-release"; done
-printf '%s\n' "$running" > "$APP_DIR/.runtime-release"
-( previous_release=$old_release; prune_releases )
+# While the running runtime's release is unknown nothing is removed.
+( runtime_pid=$outside_pid; systemctl() { runtime_stub "$@"; }; previous_release=$old_release; prune_releases )
+[[ -d "$APP_DIR/releases/dddddddddddd-eeeeeeeeeeeeeeee" && -d "$APP_DIR/releases/ffffffffffff-0000000000000000" ]]
+( systemctl() { runtime_stub "$@"; }; previous_release=$old_release; prune_releases )
 [[ -d "$release" && -d "$old_release" && -d "$running" ]]
 [[ ! -e "$APP_DIR/releases/dddddddddddd-eeeeeeeeeeeeeeee" && ! -e "$APP_DIR/releases/ffffffffffff-0000000000000000" ]]
-rm -rf -- "$running" "$APP_DIR/.runtime-release" "$release/deploy"
+kill "$live_pid" "$outside_pid" "$gone_pid" 2>/dev/null || true
+rm -rf -- "$running" "$APP_DIR/.runtime-deployment" "$release/deploy"
 
 # Cache pruning keeps every entry that the active or rollback releases still use.
 cache="$APP_DIR/cache"

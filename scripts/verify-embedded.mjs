@@ -156,9 +156,9 @@ try {
   console.log(JSON.stringify({ recoveryDrill: 'real-five-module-read-only', checkpointAgeAtFaultMs: faultAt - backupStartedAt,
     restoreToReadableMs: Date.now() - restoreStartedAt, scope: 'local-CI-artifact-and-keys', trading: 'quarantine' }));
 
-  // The service entry as the unit runs it (server/index.mjs) over the data of
-  // the first phase: the launcher starts the runtime with the five modules and
-  // then the API. A killed API restarts alone while the runtime and its modules
+  // The launcher of manual runs (server/index.mjs; the units start the same
+  // two entries separately) over the data of the first phase: it starts the
+  // runtime with the five modules and then the API. A killed API restarts alone while the runtime and its modules
   // keep running, collection goes on and the native execution lease keeps its
   // holder, sessions survive it, and SIGTERM to the whole process group (as
   // systemd signals the unit) stops it with status 0 (design doc 5.10).

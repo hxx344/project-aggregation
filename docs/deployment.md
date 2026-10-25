@@ -59,9 +59,9 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 
 安装器把 `GREEKS_PYTHON`、`ASTER_PYTHON` 写入工作台 systemd 单元。ASTER 从自己的 `.env` 继承账户和 relay 设置；运行目录始终指向 `$DATA_DIR/modules/aster`，页面从工作台 Aster 5x 入口打开。关停允许交易引擎等待在途请求完成，systemd 停止上限为 150 秒。
 
-工作台由两个 systemd 单元组成：运行时单元 `project-aggregation.service`（模块、采集与原生执行）和 API 单元 `project-aggregation-api.service`（登录、页面与更新）。运维命令仍作用于 `project-aggregation`：启动时一并拉起 API，停止或重启时 API 随之停止或重启。API 意外退出时单独重启（间隔从 1 秒逐步加到 30 秒），模块与采集不中断，已打开的模块页面需从工作台重新载入。两者经 `/run/project-aggregation` 下的 Unix socket 通信，该目录由 systemd 随运行时单元创建和删除，配置中不能设置 `WORKBENCH_RUNTIME_DIR`。不经 systemd 手动运行（`pnpm start`）时 socket 位于 `$DATA_DIR/run`，路径上限为 100 字节，`DATA_DIR` 不能超过 46 字节，也可用 `WORKBENCH_RUNTIME_DIR` 指定较短的目录。
+工作台由两个 systemd 单元组成：运行时单元 `project-aggregation.service`（模块、采集与原生执行）和 API 单元 `project-aggregation-api.service`（登录、页面与更新）。运维命令仍作用于 `project-aggregation`：启动时一并拉起 API，停止或重启时 API 随之停止或重启。API 意外退出时单独重启（间隔从 1 秒逐步加到 30 秒；systemd 低于 254 时固定 5 秒），模块与采集不中断，已打开的模块页面需从工作台重新载入。两者经 `/run/project-aggregation` 下的 Unix socket 通信，该目录由 systemd 随运行时单元创建和删除，配置中不能设置 `WORKBENCH_RUNTIME_DIR`。不经 systemd 手动运行（`pnpm start`）时 socket 位于 `$DATA_DIR/run`，路径上限为 100 字节，`DATA_DIR` 不能超过 46 字节，也可用 `WORKBENCH_RUNTIME_DIR` 指定较短的目录。
 
-更新时，如果运行时实际运行的版本与新版本的运行时组件相同（`server/api` 与工作台前端以外的代码、模块、依赖都没变），服务单元和环境配置也没变，安装器只重启 API：模块、采集与原生执行不中断，运行时继续使用原版本目录，该目录在版本清理时保留。其他情况与首次安装一样重启整个工作台。只重启 API 的更新失败时只把 API 退回原版本；整体更新失败时恢复原程序、两个单元文件与配置，回滚到拆分前的版本时删除 API 单元。
+更新时，如果运行时实际运行的版本与新版本的运行时组件相同（`server/api` 与工作台前端以外的代码、模块、依赖都没变），服务单元和环境配置也没变，安装器只重启 API：模块、采集与原生执行不中断，运行时继续使用原版本目录，该目录在版本清理时保留。其他情况与首次安装一样重启整个工作台。只重启 API 的更新失败时只把 API 退回原版本；整体更新失败时恢复原程序、两个单元文件与配置，回滚到拆分前的版本时删除 API 单元。手动改用拆分前的旧安装器部署时，它不认识 API 单元，`/etc/systemd/system/project-aggregation-api.service` 会留下但不会被启动，可用 `sudo rm /etc/systemd/system/project-aggregation-api.service && sudo systemctl daemon-reload` 删除。
 
 安装完成后查看首次工作台登录信息：
 
