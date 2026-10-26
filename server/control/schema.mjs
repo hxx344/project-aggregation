@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync } from 'node:fs';
+import { chmodSync, existsSync } from 'node:fs';
 import { moduleCatalog, moduleIds } from '../modules/catalog.mjs';
 import { isSqliteBusy, recordBusy, recordHold, recordWait } from '../sqlite-writes.mjs';
 
@@ -26,15 +26,38 @@ export function immediate(db, fn) {
 }
 
 // Every process that opens hub.sqlite creates the tables; the write lock serializes a concurrent first start.
-export function openHubDatabase(dbPath) {
+// A candidate API slot (design doc api-dual-slot 3.3) passes create: false: the
+// connection is query-only, and the tables and columns are only checked.
+export function openHubDatabase(dbPath, { create = true } = {}) {
+  if (!create && !existsSync(dbPath)) throw new Error('工作台数据库尚未创建');
   const db = new DatabaseSync(dbPath);
   try {
     // busy_timeout first: the runtime and the API may open the database at the same time.
+    if (!create) {
+      db.exec('PRAGMA busy_timeout=5000; PRAGMA query_only=ON; PRAGMA foreign_keys=ON;');
+      if (db.prepare('PRAGMA journal_mode').get()?.journal_mode !== 'wal') throw new Error('工作台数据库未处于 WAL 模式');
+      assertTables(db);
+      return db;
+    }
     db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
     immediate(db, () => db.exec(TABLES));
     if (process.platform !== 'win32') chmodSync(dbPath, 0o600);
   } catch (error) { db.close(); throw error; }
   return db;
+}
+
+// Every table and column TABLES creates must exist; hub.sqlite has no schema version.
+function assertTables(db) {
+  const expected = new DatabaseSync(':memory:');
+  try {
+    expected.exec(TABLES);
+    const columns = (target, table) => target.prepare(`PRAGMA table_info(${JSON.stringify(table)})`).all().map(row => row.name);
+    for (const { name } of expected.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all()) {
+      const present = new Set(columns(db, name));
+      const missing = columns(expected, name).filter(column => !present.has(column));
+      if (!present.size || missing.length) throw new Error(`工作台数据库缺少 ${name}${missing.length && present.size ? `.${missing.join(',')}` : ''}`);
+    }
+  } finally { expected.close(); }
 }
 
 // Seeds and one-time migrations of the project table; each marker records that a step ran, so a later user deletion stays deleted.
@@ -68,4 +91,12 @@ export function seedProjects(store, { embeddedModules }) {
   };
   describe('crossex', '同币种跨交易所永续价差套利模拟', 'updated-crossex-live-description-v1');
   if (!embeddedModules) describe('variational', 'CL/BZ 网格、库存组合与 QQQ / US100 对冲模拟', 'updated-variational-description-v1');
+}
+
+// Whether every step seedProjects runs has run, without writing: a candidate
+// slot relies on the serving slot of the same control code having seeded.
+export function seedComplete({ getSetting, projects }, { embeddedModules }) {
+  const markers = ['seeded', 'updated-crossex-live-description-v1', ...(embeddedModules ? moduleIds : ['crossex', 'variational', 'greeks']).map(id => `seeded-${id}-v1`),
+    ...(embeddedModules ? [] : ['updated-variational-description-v1'])];
+  return markers.every(marker => getSetting(marker)) && (!embeddedModules || moduleCatalog.every(project => projects.exists(project.id)));
 }
