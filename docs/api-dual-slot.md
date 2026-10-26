@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `f3ea48d` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3.1、9.1、11 节与第 15 节的 M4；[控制面与数据面分离](control-data-plane-separation.md)（M3，已全部发布） |
 | 适用范围 | `server/api/`、`server/portal.mjs`、`server/control/`、`server/static-response.mjs`、`server/recovery/`、`server/update-service/registry.py`、`deploy/install.sh` 与相关测试 |
-| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；M4-3a 排空顺序与静态资源回退已实施（`git log --merges --grep M4-3a`）；M4-3b API 侧槽模式已实施（`git log --merges --grep M4-3b`）；其余未实施。第 3 节切流方案于 2026-10-26 批准；第 5.2、6 节的原草案以第 3 节为准改写 |
+| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；M4-3a 排空顺序与静态资源回退已实施（`git log --merges --grep M4-3a`）；M4-3b API 侧槽模式已实施（`git log --merges --grep M4-3b`）；M4-3c 入口进程与定向探针已实施、未接线（`git log --merges --grep M4-3c`）；M4-4 未实施。第 3 节切流方案于 2026-10-26 批准；第 5.2、6 节的原草案以第 3 节为准改写 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 9 节 |
 
 文中 `路径:行号` 均指上述基线，实施时以符号名重新定位。
@@ -166,6 +166,8 @@ B 被排除的关键是没有单一切换点与停服语义；C 是没有切换�
 - 切换只影响之后接受的连接；已建立的连接留在原槽，由原槽排空时的 `Connection: close` 与强制关闭结束（M4-3a 已实现）。
 - 没有有效记录时不接受转发（关闭连接并记录原因），不猜测目标。
 - 单元：`Restart=always`、`RestartSec=1`；入口崩溃期间端口拒连，影响与现在 API 重启相同，但入口代码只做转发，崩溃面更小。
+
+**M4-3c 实现**（`server/entry/main.mjs`、`server/entry/probe.mjs`，共用 `server/slot-protocol.mjs`）：入口以 `WORKBENCH_ENTRY_DIR`（自身 `ctl.sock` 所在目录，须为本用户所有的 0700 目录）、`WORKBENCH_API_SLOT_RECORD` 与 `WORKBENCH_ENTRY_SLOT_ROOT` 启动，三者须为绝对路径；槽目录为 `<ROOT>/project-aggregation-api-<槽>`（`slotDirectory`），M4-4 的模板单元须让 `WORKBENCH_API_SLOT_DIR` 与之一致。启动时记录不可读即退出，记录缺失或无效时照常监听但不转发，之后每个新连接重读记录，读到即开始转发。等待中的连接按目标槽的当前值重试，因此切换前到达、切换后才连上的连接进入新槽；`waiting` 计数单列。私有连接一侧带 FIN 关闭时另一侧写完剩余数据再关，其余关闭按重置传递。重复的警告（无记录、重试预算用尽）每 5 s 记一条并带被合并的条数。`POST /switch` 另核对目标槽 `identity.release` 等于记录版本的真实路径，目标未变时幂等、不增加切换代数；`GET /status` 返回 `{protocol, pid, target, generation, connections: {a, b}, waiting}`。关闭时停止监听，直接断开仍在等待的连接，已转发的连接最多再等 5 s：M4-4 的模板槽须 `After=project-aggregation-entry.service`，整组停止时槽先于入口停止并完成排空。探针 `probe.mjs --dir --slot --release --port [--pid] [--mode] [--entry-dir]` 在标准输出写 `{ok, failures, instanceId}`，全部通过才以 0 退出，`instanceId` 供安装器在 `switch` 时使用；项目 Host 取第一个内置模块的 `portalHost`；`index.html` 与其引用的第一个 `assets/` 文件逐字节比对目标版本的 `dist/`。
 
 ### 3.8 单元关系与恢复入口
 
@@ -402,7 +404,7 @@ WantedBy=project-aggregation.service
 | M4-3c | 按第 3.2、3.7 节：`server/entry/` 连接转发、控制 socket、重连预算与 `probe.mjs` 定向探针；单槽部署不接线 | R3（部署激活） | 中 |
 | M4-4 | 模板单元与槽记录、安装器双槽切换与回滚、首次迁移与回退、更新服务登记、恢复入口、Ubuntu CI 连续请求验证 | R3（部署激活） | 大 |
 
-每个实现批次单独提交、单独审查并发布。M4-1、M4-2 已合入；M4-3a 可在单实例部署先行改善授权、关闭和旧分包加载。第 3 节已批准，M4-3b 已实施，M4-3c 随后实施；M4-4 依赖 M4-1、M4-2、M4-3a/b/c 全部通过并发布，以及 M2a、M3 和 P2b 生产验收前置，不把尚未完成的草案当作可直接实施方案。
+每个实现批次单独提交、单独审查并发布。M4-1、M4-2 已合入；M4-3a 可在单实例部署先行改善授权、关闭和旧分包加载。第 3 节已批准，M4-3b、M4-3c 已实施；M4-4 依赖 M4-1、M4-2、M4-3a/b/c 全部通过并发布，以及 M2a、M3 和 P2b 生产验收前置，不把尚未完成的草案当作可直接实施方案。
 
 ## 10 关联资料
 
