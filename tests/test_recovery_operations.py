@@ -245,22 +245,26 @@ class OperatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
             root = Path(directory)
             runtime, entry, template = root / 'runtime.service', root / 'entry.service', root / 'template.service'
-            def unit(entry_file, user='nobody', link='current'):
-                return f'# Managed by project-aggregation installer\n[Service]\nUser={user}\nExecStart=/bin/sh {operations.APP}/{link}/server/{entry_file}\n'
+            def unit(entry_file, user='nobody', link='current', wants=''):
+                return f'# Managed by project-aggregation installer\n{wants}[Service]\nUser={user}\nExecStart=/bin/sh {operations.APP}/{link}/server/{entry_file}\n'
+            dual = unit('runtime/main.mjs', wants='[Unit]\nWants=network-online.target project-aggregation-entry.service\n')
             def trusted(filename, private=False):
                 if not Path(filename).exists():
                     raise ValueError('MISSING')
                 return Path(filename)
             good = (unit('entry/main.mjs'), unit('api/main.mjs', link='slots/%i'))
             # The release check after the units fails here: nothing is installed under /opt.
-            cases = [(good, 'RELEASE_INVALID'),
-                     ((unit('entry/main.mjs'), unit('api/main.mjs')), 'SERVICE_CONFIG_INVALID'),
-                     ((unit('entry/main.mjs', user='root'), good[1]), 'SERVICE_CONFIG_INVALID'),
-                     ((unit('api/main.mjs'), good[1]), 'SERVICE_CONFIG_INVALID'),
-                     ((good[0], None), 'MISSING')]
-            for (entry_text, template_text), error in cases:
-                with self.subTest(error=error, entry=entry_text, template=template_text):
-                    runtime.write_text(unit('runtime/main.mjs')); entry.write_text(entry_text); template.unlink(missing_ok=True)
+            cases = [(good, 'RELEASE_INVALID', dual),
+                     ((unit('entry/main.mjs'), unit('api/main.mjs')), 'SERVICE_CONFIG_INVALID', dual),
+                     ((unit('entry/main.mjs', user='root'), good[1]), 'SERVICE_CONFIG_INVALID', dual),
+                     ((unit('api/main.mjs'), good[1]), 'SERVICE_CONFIG_INVALID', dual),
+                     ((good[0], None), 'MISSING', dual),
+                     # A leftover entry the runtime does not pull in leaves the single layout and its API unit.
+                     (good, 'MISSING', unit('runtime/main.mjs')),
+                     (good, 'MISSING', unit('runtime/main.mjs', wants='[Unit]\n# Wants=project-aggregation-entry.service\n'))]
+            for (entry_text, template_text), error, runtime_text in cases:
+                with self.subTest(error=error, entry=entry_text, template=template_text, runtime=runtime_text):
+                    runtime.write_text(runtime_text); entry.write_text(entry_text); template.unlink(missing_ok=True)
                     if template_text is not None:
                         template.write_text(template_text)
                     with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'ENTRY_UNIT_FILE', entry), \

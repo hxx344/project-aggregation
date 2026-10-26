@@ -96,6 +96,11 @@ def dropin_directories(name, filesystem):
             yield filesystem / base / directory
 
 
+def wants(source, name):
+    """Whether a unit's own Wants= lines name `name`.service."""
+    return re.search(r'^Wants=(?:.*[ \t])?' + re.escape(name + '.service') + r'(?:[ \t]|$)', source, re.M) is not None
+
+
 def unit_source(module: Module, name, current_path, filesystem, guard=False, entry='', working=''):
     """`working` replaces current (and the module's suffix) where the unit runs from another link."""
     unit = filesystem / 'etc/systemd/system' / (name + '.service')
@@ -162,8 +167,11 @@ def installed(module: Module, filesystem=Path('/')):
         names = (module.service, *module.extra_services)
         entries = module.entries or ('',) * len(names)
         units = [(name, entry, '', module.recovery_guard) for name, entry in zip(names, entries, strict=True)]
+        # Dual-slot is the entry unit plus a runtime unit that pulls it in, as the
+        # installer decides; a leftover entry unit alone leaves the single layout.
         marker = filesystem / 'etc/systemd/system' / (module.dual_services[0][0] + '.service') if module.dual_services else None
-        if marker and (marker.exists() or marker.is_symlink()):
+        layout = 'dual-slot' if marker and (marker.exists() or marker.is_symlink()) and wants(text_file(unit), module.dual_services[0][0]) else 'single'
+        if layout == 'dual-slot':
             units = [units[0], *((name, entry, '' if directory == 'current' else str(root / directory).replace('\\', '/'), guard and module.recovery_guard)
                                  for name, directory, entry, guard in module.dual_services)]
         sources = [unit_source(module, name, current_path, filesystem, guard=guard, entry=entry, working=working)
@@ -186,7 +194,7 @@ def installed(module: Module, filesystem=Path('/')):
         runtime_recorded = (root / '.runtime-deployment').is_file() and not (root / '.runtime-deployment').is_symlink()
         result.update(state='unavailable', currentCommit=checked, currentVersion=checked[:12] if checked else None,
                       reason='尚未检查正式版本', identity=identity, artifactCommit=artifact, applicationKey=application_key,
-                      runtimeKey=runtime_key, runtimeRecorded=runtime_recorded)
+                      runtimeKey=runtime_key, runtimeRecorded=runtime_recorded, layout=layout)
     except (OSError, ValueError, UnicodeError):
         result['reason'] = '本机安装或服务配置不符合受管理目录约定，请使用一键部署命令检查'
     return result

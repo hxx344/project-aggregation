@@ -120,8 +120,9 @@ printf 'not-a-key\n' > "$release/.runtime-component-key"; key 41 | tr 4 x > "$ru
 key 41 > "$release/.runtime-component-key"; key 41 > "$running/.runtime-component-key"; expect_scope api 'keys restored'
 touch "$test_root/runtime-inactive"; expect_scope full 'runtime not running'; rm "$test_root/runtime-inactive"
 touch "$test_root/migration-pending"; expect_scope full 'module migration outstanding'; rm "$test_root/migration-pending"
-# Dual-slot units (design doc api-dual-slot 6.2): the entry unit marks the
-# layout; the slots move alone only from a settled record and entry unit.
+# Dual-slot units (design doc api-dual-slot 6.2): the entry unit and a runtime
+# unit that wants it mark the layout; the slots move alone only from a settled
+# record and entry unit.
 ENTRY_UNIT_FILE="$test_root/entry.service" SLOT_UNIT_FILE="$test_root/slot.service"
 write_slot_record b "$release"; [[ "$(read_slot_record)" == "b $release" ]]
 for bad in '' '{' '[]' '{"slot":"c","release":"/x"}' '{"slot":"a","release":"x"}' '{"slot":"a","release":"/a b"}' '{"slot":"a"}'; do
@@ -135,19 +136,34 @@ for bad in '{"from":"a","to":"a","release":"/x","phase":"candidate"}' '{"from":"
   if read_cutover >/dev/null 2>&1; then echo "Accepted the cutover $bad" >&2; exit 1; fi
 done
 rm "$APP_DIR/.api-cutover"
+cp "$UNIT_FILE" "$test_root/unit.saved"; cp "$APP_DIR/.runtime-deployment" "$test_root/deployment.saved"
+# Units and records as an installer of either layout wrote them.
+wanting_units() {
+  cp "$test_root/unit.saved" "$work_dir/service"; printf 'Wants=network-online.target %s.service\n' "$ENTRY_SERVICE" >> "$work_dir/service"
+  cp "$work_dir/service" "$UNIT_FILE"; runtime_deployment_key > "$APP_DIR/.runtime-deployment"
+}
+restore_units() {
+  cp "$test_root/unit.saved" "$work_dir/service"; cp "$test_root/unit.saved" "$UNIT_FILE"; cp "$test_root/deployment.saved" "$APP_DIR/.runtime-deployment"
+}
 (
   slot_layout=dual
   printf 'entry unit\n' > "$work_dir/entry.service"; cp "$work_dir/entry.service" "$ENTRY_UNIT_FILE"
-  runtime_deployment_key > "$APP_DIR/.runtime-deployment"
+  wanting_units
   write_slot_record a "$old_release"
   expect_scope api 'dual-slot units settled'
-  printf 'changed\n' >> "$work_dir/entry.service"; expect_scope full 'entry unit changed'; cp "$ENTRY_UNIT_FILE" "$work_dir/entry.service"
+  # The recorded deployment follows the new unit, so only the installed entry differs.
+  printf 'changed\n' >> "$work_dir/entry.service"; runtime_deployment_key > "$APP_DIR/.runtime-deployment"
+  expect_scope full 'entry unit changed'; cp "$ENTRY_UNIT_FILE" "$work_dir/entry.service"; runtime_deployment_key > "$APP_DIR/.runtime-deployment"
   write_cutover a b "$release" candidate; expect_scope full 'unresolved cutover'; rm "$APP_DIR/.api-cutover"
   printf '{"slot":"c"}' > "$APP_DIR/.api-slot"; expect_scope full 'invalid record'; write_slot_record a "$old_release"
   expect_scope api 'dual-slot units restored'
   rm "$ENTRY_UNIT_FILE"; expect_scope full 'dual-slot units not installed yet'
 )
-( : > "$ENTRY_UNIT_FILE"; expect_scope full 'single layout with dual-slot units left' ); rm -f "$ENTRY_UNIT_FILE" "$APP_DIR/.api-slot"
+restore_units
+# A leftover entry unit the runtime does not want is no dual-slot install.
+( : > "$ENTRY_UNIT_FILE"; expect_scope api 'single layout with an entry unit left' )
+( : > "$ENTRY_UNIT_FILE"; wanting_units; expect_scope full 'single layout over dual-slot units' ); restore_units
+rm -f "$ENTRY_UNIT_FILE" "$APP_DIR/.api-slot"
 # Design doc 6.2: a running update worker that cannot read the dual-slot units defers them.
 grep -q "^LAYOUTS = .*'dual-slot'" "$(dirname "$0")/../server/update-service/registry.py"
 (
@@ -157,9 +173,11 @@ grep -q "^LAYOUTS = .*'dual-slot'" "$(dirname "$0")/../server/update-service/reg
   touch "$test_root/worker-active"; printf 'MODULES = ()\n' > "$UPDATER_DIR/registry.py"; [[ "$(target_layout)" == single ]]
   printf "LAYOUTS = ('single', 'dual-slot')\n" > "$UPDATER_DIR/registry.py"; [[ "$(target_layout)" == dual ]]
   rm "$UPDATER_DIR/registry.py"; [[ "$(target_layout)" == single ]]
-  : > "$ENTRY_UNIT_FILE"; [[ "$(target_layout)" == dual ]]
+  : > "$ENTRY_UNIT_FILE"; [[ "$(target_layout)" == single ]]
+  wanting_units; [[ "$(target_layout)" == dual ]]
   rm "$ENTRY_UNIT_FILE" "$test_root/worker-active"
 )
+restore_units
 # The generated units (design doc api-dual-slot 6.1).
 (
   work_dir="$test_root/units"; mkdir -p "$work_dir"

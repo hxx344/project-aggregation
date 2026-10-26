@@ -71,7 +71,14 @@ def trusted_environment():
 
 
 def dual_slots():
-    return ENTRY_UNIT_FILE.exists() or ENTRY_UNIT_FILE.is_symlink()
+    """The installer's rule: the entry unit exists and the runtime unit pulls it in."""
+    if not (ENTRY_UNIT_FILE.exists() or ENTRY_UNIT_FILE.is_symlink()):
+        return False
+    try:
+        source = UNIT_FILE.read_text(encoding='utf-8')
+    except OSError:
+        return False
+    return re.search(r'^Wants=(?:.*[ \t])?' + re.escape(ENTRY_SERVICE) + r'(?:[ \t]|$)', source, re.M) is not None
 
 
 def services():

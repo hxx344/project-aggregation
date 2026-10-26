@@ -2585,7 +2585,19 @@ layout_units() {
 # --- Dual-slot units (design doc api-dual-slot 3.5, 3.6, 3.9 and 6) ---
 slot_unit() { printf '%s@%s.service' "$API_SERVICE" "$1"; }
 other_slot() { if [[ $1 == a ]]; then printf b; else printf a; fi; }
-dual_installed() { [[ -f "$ENTRY_UNIT_FILE" ]]; }
+# The entry unit counts only while the runtime unit pulls it in: one an older
+# installer left behind is not a dual-slot layout (design doc api-dual-slot 3.9).
+dual_installed() {
+  [[ -f "$ENTRY_UNIT_FILE" && -f "$UNIT_FILE" ]] && grep -Eq "^Wants=(.*[[:space:]])?$ENTRY_SERVICE\.service([[:space:]]|\$)" "$UNIT_FILE"
+}
+# Stops each of the units given that systemd has loaded, in any active or
+# restarting state; a fresh install has none of them.
+stop_loaded() {
+  local unit
+  for unit in "$@"; do
+    if [[ $(systemctl show -p LoadState --value "$unit" 2>/dev/null) == loaded ]]; then systemctl stop "$unit"; fi
+  done
+}
 # dual or single for this activation (design doc 6.2). An update worker loaded
 # registry.py when its job began; one that does not know the dual-slot units
 # would report a first switch as unconfirmed, so that switch waits for the
@@ -2677,13 +2689,14 @@ api_cutover() {
   from=$(other_slot "$to")
   cutover_from=$from cutover_to=$to
   if (( step == 1 )); then
+    # An interrupted switch may already have recorded this slot (design doc
+    # 3.5); it then stays enabled, so a reboot still starts the recorded slot.
+    if recorded=$(read_slot_record) && [[ "$recorded" == "$to $target" ]]; then mode=serving; fi
     systemctl stop "$(slot_unit "$to")" || return 1
-    systemctl disable "$(slot_unit "$to")" >/dev/null 2>&1 || return 1
+    if [[ "$mode" != serving ]]; then systemctl disable "$(slot_unit "$to")" >/dev/null 2>&1 || return 1; fi
     mkdir -p "$APP_DIR/slots" && atomic_link "$target" "$APP_DIR/slots/$to" || return 1
     write_cutover "$from" "$to" "$target" candidate || return 1
     systemctl start "$(slot_unit "$to")" || return 1
-    # An interrupted switch may already have recorded this slot (design doc 3.5).
-    if recorded=$(read_slot_record) && [[ "$recorded" == "$to $target" ]]; then mode=serving; fi
   else
     answer=$(ctl_request "$(slot_ctl "$to")" GET /identity) && mode=$(json_field mode <<< "$answer") || return 1
   fi
@@ -2718,14 +2731,15 @@ api_cutover() {
 # fixed release, which may still run.
 api_cutover_rollback() {
   local old=$cutover_from new=$cutover_to slot old_target
-  [[ -n "$new" ]] || return 0
   if [[ -n "$old_slot_unit_backup" ]] && ! cmp -s "$old_slot_unit_backup" "$SLOT_UNIT_FILE"; then
     cp -- "$old_slot_unit_backup" "$SLOT_UNIT_FILE" && systemctl daemon-reload
   fi
-  if (( ! cutover_committed )); then
+  [[ -n "$new" ]] || return 0
+  # The record on disk decides: a signal may land between its write and the flag.
+  if (( ! cutover_committed )) && [[ "$(read_slot_record)" == "$old_slot_record" ]]; then
     systemctl stop "$(slot_unit "$new")" >/dev/null 2>&1
-    systemctl disable "$(slot_unit "$new")" >/dev/null 2>&1
-    rm -f -- "$APP_DIR/.api-cutover"
+    # Left behind, the cutover makes the next run stop and disable the candidate.
+    systemctl disable "$(slot_unit "$new")" >/dev/null 2>&1 && rm -f -- "$APP_DIR/.api-cutover"
     wait_healthy
     return
   fi
@@ -2759,11 +2773,9 @@ mirror_recovery_guard() {
 # A full activation of the dual-slot units (design doc 3.6, 3.9): the group
 # stops, then units, slot links, the record and current change, then it starts.
 activate_dual_full() {
-  local recorded slot=a other unit
-  # A fresh install has none of these; one left running would hold the port.
-  for unit in "$SERVICE" "$API_SERVICE" "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)"; do
-    if systemctl is-active --quiet "$unit"; then systemctl stop "$unit"; fi
-  done
+  local recorded slot=a other
+  # One left running would hold the port.
+  stop_loaded "$SERVICE" "$API_SERVICE" "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)"
   migrate_embedded_modules "$release"
   if dual_installed && recorded=$(read_slot_record); then slot=${recorded%% *}; fi
   other=$(other_slot "$slot")
@@ -2789,28 +2801,27 @@ activate_dual_full() {
 # Rollback of a full activation that began with the dual-slot units: their unit
 # files, the recorded slot's link and the record as they were (design doc 6.4).
 restore_dual_units() {
-  local slot target
+  # Without a valid earlier record, slot a takes the restored release.
+  local slot=a target=$old_release
   if [[ -n "$old_entry_unit_backup" ]]; then cp -- "$old_entry_unit_backup" "$ENTRY_UNIT_FILE"; fi
   if [[ -n "$old_slot_unit_backup" ]]; then cp -- "$old_slot_unit_backup" "$SLOT_UNIT_FILE"; fi
   rm -f -- "$API_UNIT_FILE" "$APP_DIR/.api-cutover"
-  if [[ -n "$old_slot_record" ]]; then
-    read -r slot target <<< "$old_slot_record"
-    atomic_link "$target" "$APP_DIR/slots/$slot"
-    write_slot_record "$slot" "$target"
-    systemctl daemon-reload
-    systemctl disable "$(slot_unit "$(other_slot "$slot")")" >/dev/null 2>&1
-    systemctl enable "$(slot_unit "$slot")" >/dev/null 2>&1
-  fi
+  systemctl daemon-reload
+  if [[ -n "$old_slot_record" ]]; then read -r slot target <<< "$old_slot_record"; fi
+  [[ -n "$target" ]] || return 0
+  mkdir -p "$APP_DIR/slots"
+  atomic_link "$target" "$APP_DIR/slots/$slot"
+  write_slot_record "$slot" "$target"
+  systemctl disable "$(slot_unit "$(other_slot "$slot")")" >/dev/null 2>&1
+  systemctl enable "$(slot_unit "$slot")" >/dev/null 2>&1
 }
 # Removes the dual-slot units and their state before a single-unit start
 # (design doc 3.9); left in place, the entry would hold the port.
 dual_teardown() {
-  local slot file unit
+  local slot file
   [[ -e "$ENTRY_UNIT_FILE" || -e "$SLOT_UNIT_FILE" || -e "$APP_DIR/.api-slot" || -e "$APP_DIR/slots" ]] || return 0
-  # Units already gone are not loaded, and disable removes an emptied .wants itself.
-  for unit in "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)"; do
-    if systemctl is-active --quiet "$unit"; then systemctl stop "$unit"; fi
-  done
+  # disable removes an emptied .wants itself.
+  stop_loaded "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)"
   for slot in a b; do systemctl disable "$(slot_unit "$slot")" >/dev/null 2>&1 || true; done
   for file in "$ENTRY_UNIT_FILE" "$SLOT_UNIT_FILE"; do
     if [[ -f "$file" ]] && grep -q '^# Managed by project-aggregation installer$' "$file"; then rm -f -- "$file"; fi
@@ -3078,7 +3089,7 @@ main() {
     grep -q '^# Managed by project-aggregation installer$' "$ENTRY_UNIT_FILE" || fail '同名入口 systemd 服务已存在且不属于本安装脚本。'
     old_entry_unit_backup="$work_dir/previous-entry.service"
     cp -- "$ENTRY_UNIT_FILE" "$old_entry_unit_backup"
-    old_layout=dual
+    if dual_installed; then old_layout=dual; fi
   fi
   if [[ -f "$SLOT_UNIT_FILE" ]]; then
     grep -q '^# Managed by project-aggregation installer$' "$SLOT_UNIT_FILE" || fail '同名 API 槽 systemd 模板已存在且不属于本安装脚本。'
@@ -3176,6 +3187,13 @@ main() {
     resolve_cutover || log '上次未完成的 API 槽切换无法就地恢复；本次整体重启。'
     cutover_from= cutover_to= cutover_committed=0
     old_slot_record=$(read_slot_record) || old_slot_record=
+    # A switch carried through moved current: that release is now the one to restore.
+    if [[ -L "$APP_DIR/current" && "$(realpath -e "$APP_DIR/current")" != "$old_release" ]]; then
+      old_release=$(realpath -e "$APP_DIR/current")
+      [[ "$old_release" == "$APP_DIR/releases/"* && -f "$old_release/.managed-release" ]] || fail 'current 指向未知目录，停止更新。'
+      previous_release=$old_release
+      if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
+    fi
   fi
   activation_scope=$(activation_scope)
   if ! scope_admitted "$activation_scope"; then

@@ -329,9 +329,10 @@ M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup
 
 ### 6.2 何时启用双槽
 
-- 已是双槽（入口单元存在）时保持双槽，回到单槽只经回滚或退回。
+- 双槽的判定：入口单元存在，且运行时单元的 `Wants=` 列出入口单元。只有入口单元而运行时不拉起它（中断的退回、手动残留）仍按单槽处理；安装器（`dual_installed`）、更新服务登记与恢复入口用同一条判定。
+- 已是双槽时保持双槽，回到单槽只经回滚或退回。
 - 首次启用：直接执行安装命令时立即启用。由在线更新执行时，执行进程在任务开始时已加载旧的 `registry.py`，它不认识双槽单元，会把成功的安装判为“安装结果尚未确认”；因此更新执行单元在运行且已安装的 `registry.py` 未声明 `LAYOUTS` 含 `dual-slot` 时，本次仍按单槽安装，安装结束时更新服务随之升级，下一次整体更新（或再次执行安装命令）再启用双槽。
-- 布局不同即整体更新：首次启用与退回都改运行时单元，`activation_scope` 只在两次安装都是双槽、运行时与入口单元文本、运行时部署记录和运行时组件键都未变、且没有未收敛的 `.api-cutover` 时给出 `api`。
+- 布局不同即整体更新：首次启用与退回都改运行时单元，`activation_scope` 只在两次安装都是双槽、运行时与入口单元文本、运行时部署记录和运行时组件键都未变、且没有未收敛的 `.api-cutover` 时给出 `api`。更新服务的预判（`ci_scope`）同样只对登记为 `dual-slot` 布局的安装给出 `api`，单槽安装的 CI 更新一律按整体更新规划。
 
 ### 6.3 只改 API 的切换
 
@@ -352,8 +353,8 @@ M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup
 
 ### 6.5 更新服务登记与恢复入口
 
-- `registry.py`：入口单元存在时按双槽核对运行时、入口（`WorkingDirectory=current`，运行 `server/entry/main.mjs`）与模板（`WorkingDirectory=$APP_DIR/slots/%i`，运行 `slots/%i/server/api/main.mjs`）三份单元及其 drop-in；guard 只允许出现在运行时与模板目录；部署身份纳入三份单元文本。`LAYOUTS` 声明支持的布局，供 6.2 判断。
-- `server/recovery/operations.py`：双槽时停服集合为运行时、入口、`@a`、`@b`，`deployment()` 核对入口与模板的服务用户与 Node 路径，`install_guard` 写运行时与模板 guard 并核对两个实例加载的 drop-in；恢复后只启动运行时。
+- `registry.py`：按 6.2 的判定为双槽时（结果字段 `layout` 为 `dual-slot`，否则为 `single`）核对运行时、入口（`WorkingDirectory=current`，运行 `server/entry/main.mjs`）与模板（`WorkingDirectory=$APP_DIR/slots/%i`，运行 `slots/%i/server/api/main.mjs`）三份单元及其 drop-in；guard 只允许出现在运行时与模板目录；部署身份纳入三份单元文本。`LAYOUTS` 声明支持的布局，供 6.2 判断。
+- `server/recovery/operations.py`：按 6.2 的判定为双槽时停服集合为运行时、入口、`@a`、`@b`，`deployment()` 核对入口与模板的服务用户与 Node 路径，`install_guard` 写运行时与模板 guard 并核对两个实例加载的 drop-in；恢复后只启动运行时。
 
 ### 6.6 影响面与回滚
 

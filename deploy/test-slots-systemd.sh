@@ -17,7 +17,8 @@ node=$(realpath -e "${SLOTS_TEST_NODE:?Pass the verified Node executable}")
 AGG_INSTALL_SOURCE_ONLY=1 source "$repository/deploy/install.sh"
 # The entry finds the slots by the installed names (server/slot-protocol.mjs), so this test uses them.
 DATA_PATH=/var/lib/$SERVICE NODE_BIN=$node GREEKS_PYTHON_PATH=/usr/bin/python3 ASTER_PYTHON_PATH=/usr/bin/python3
-for target in "$APP_DIR" "$DATA_PATH" "$ENV_FILE" "$UNIT_FILE" "$API_UNIT_FILE" "$ENTRY_UNIT_FILE" "$SLOT_UNIT_FILE" "/run/$SERVICE" "/run/$ENTRY_SERVICE"; do
+for target in "$APP_DIR" "$DATA_PATH" "$ENV_FILE" "$UNIT_FILE" "$API_UNIT_FILE" "$ENTRY_UNIT_FILE" "$SLOT_UNIT_FILE" \
+  "$UNIT_FILE.d" "$API_UNIT_FILE.d" "$ENTRY_UNIT_FILE.d" "$SLOT_UNIT_FILE.d" "/run/$SERVICE" "/run/$ENTRY_SERVICE"; do
   [[ ! -e "$target" && ! -L "$target" ]] || { echo "Refusing existing $target" >&2; exit 1; }
 done
 ! getent passwd "$SERVICE_USER" >/dev/null || { echo "Refusing an existing $SERVICE_USER account." >&2; exit 1; }
@@ -36,6 +37,7 @@ cleanup() {
     if [[ -f "$unit" ]] && grep -qx '# Managed by project-aggregation installer' "$unit"; then rm -f -- "$unit"; fi
   done
   rmdir -- "$ENTRY_UNIT_FILE.wants" 2>/dev/null || true
+  rm -rf -- "$UNIT_FILE.d" "$API_UNIT_FILE.d" "$ENTRY_UNIT_FILE.d" "$SLOT_UNIT_FILE.d"
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE" "$ENTRY_SERVICE" "$API_SERVICE@a" "$API_SERVICE@b" "$API_SERVICE" >/dev/null 2>&1 || true
   rm -rf -- "$APP_DIR" "$DATA_PATH" "$ENV_FILE" "$work_dir"
@@ -218,7 +220,8 @@ expect_state b "$release_two"
 [[ $(main_pid "$SERVICE") == "$runtime_pid" && $(main_pid "$ENTRY_SERVICE") == "$entry_pid" ]]
 
 # Interrupted switches (design doc 3.5): a candidate the record never named is
-# stopped; one it already names is carried through.
+# stopped; one it already names is carried through, started again when it no
+# longer runs and from its probe when it still does.
 atomic_link "$release_three" "$APP_DIR/slots/a"
 write_cutover b a "$release_three" candidate
 systemctl start "$(slot_unit a)"
@@ -232,23 +235,36 @@ start_load
 resolve_cutover
 check_load 'interrupted switch carried through'
 expect_state a "$release_three"
+atomic_link "$release_two" "$APP_DIR/slots/b"
+write_cutover a b "$release_two" candidate
+systemctl start "$(slot_unit b)"
+wait_slot b "$release_two" candidate
+candidate_pid=$(main_pid "$(slot_unit b)")
+write_cutover a b "$release_two" switching
+systemctl enable "$(slot_unit b)" >/dev/null 2>&1
+write_slot_record b "$release_two"
+start_load
+resolve_cutover
+check_load 'interrupted switch resumed from its probe'
+expect_state b "$release_two"
+[[ $(main_pid "$(slot_unit b)") == "$candidate_pid" ]]
 
 # A full update (design doc 3.6) restarts the group and keeps the recorded slot.
 release=$release_four
 write_unit
 activate_dual_full
 wait_healthy
-expect_state a "$release_four"
-[[ $(readlink "$APP_DIR/slots/b") == "$release_four" && $(main_pid "$SERVICE") != "$runtime_pid" ]]
+expect_state b "$release_four"
+[[ $(readlink "$APP_DIR/slots/a") == "$release_four" && $(main_pid "$SERVICE") != "$runtime_pid" ]]
 
 # The group stop ends the slot, and its draining, before the entry; the next
 # start brings up only the recorded slot.
 systemctl stop "$SERVICE"
 [[ $(systemctl is-active "$SERVICE" "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)" | sort -u) == inactive ]]
-(( $(systemctl show -p InactiveEnterTimestampMonotonic --value "$(slot_unit a)") <= $(systemctl show -p InactiveEnterTimestampMonotonic --value "$ENTRY_SERVICE") ))
+(( $(systemctl show -p InactiveEnterTimestampMonotonic --value "$(slot_unit b)") <= $(systemctl show -p InactiveEnterTimestampMonotonic --value "$ENTRY_SERVICE") ))
 systemctl start "$SERVICE"
 wait_healthy
-expect_state a "$release_four"
+expect_state b "$release_four"
 
 # Back to the single API unit (design doc 3.9): the dual-slot units and their state go.
 systemctl stop "$SERVICE"
