@@ -305,6 +305,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_RELAY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-aster-relay-systemd.sh
 
+  entropy-lighter-lab:
+    name: Entropy Lighter research lab (Ubuntu 24.04 systemd)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare trusted installation paths on the disposable runner
+        run: |
+          for path in /opt; do
+            test -d "$path" && test ! -L "$path"
+            sudo setfacl --remove-all --remove-default "$path"
+            sudo chown root:root "$path"
+            sudo chmod go-w "$path"
+          done
+      - name: Check research installer syntax and isolated failure paths
+        run: |
+          bash -n deploy/install-entropy-lighter-lab.sh
+          bash -n deploy/test-entropy-lighter-lab-systemd.sh
+          sudo /usr/bin/python3 -I deploy/test-entropy-lighter-lab-install.py -v
+      - name: Verify offline first boot, no-op, data preservation and rollback with real systemd
+        if: ${{ !cancelled() }}
+        run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_LAB_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-entropy-lighter-lab-systemd.sh
+
   release-mirror:
     name: Release mirror (real Nginx and verified downloads)
     runs-on: ubuntu-24.04
@@ -325,7 +348,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-deploy, aster-relay, release-mirror]
+    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-deploy, aster-relay, entropy-lighter-lab, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

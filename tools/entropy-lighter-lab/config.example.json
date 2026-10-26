@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "region": "Tokyo",
+  "recordRaw": true,
+  "maxDataMb": 2048,
+  "retentionDays": 7,
+  "maxBookAgeMs": 750,
+  "maxSourceAgeMs": 2000,
+  "maxPairSkewMs": 500,
+  "sampleIntervalMs": 250,
+  "simulation": {
+    "enabled": false,
+    "verifiedSymbols": [],
+    "entropyTakerFeeBps": null,
+    "lighterTakerFeeBps": 0,
+    "notionalPerLeg": 100,
+    "minEntryEdgeBps": 15,
+    "slippageBpsPerFill": 2,
+    "fundingReserveBpsPerRoundTrip": 2,
+    "holdMs": 5000,
+    "fillWaitMs": 2000,
+    "cooldownMs": 10000,
+    "rebateRatios": [0, 1.1, 1.2],
+    "latencyScenarios": [
+      { "name": "base-assumed", "entropyMs": 200, "lighterMs": 450 },
+      { "name": "stress-assumed", "entropyMs": 500, "lighterMs": 800 }
+    ]
+  }
+}

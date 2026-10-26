@@ -1233,6 +1233,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `two-unit-entry-symlink-20261026`；实际发生日期 2026-10-26（Asia/Shanghai）；不推进全历史复盘检查点。
 
+**同类入口补充（2026-10-26）：** 新增 Entropy/Lighter 研究 CLI 的提交前独立审查，在 `tools/entropy-lighter-lab/cli.mjs` 再次发现手写路径比较；专用服务经 `current` 启动会跳过主块。改为 `import.meta.main`，新增 [研究工具真实入口测试](tests/entropy-lighter-cli.test.mjs)，在 Windows 同卷 junction 与 Linux symlink 下检查实际配置输出；Ubuntu CI 另跑真实 systemd 安装/回滚。事件 `research-cli-entry-symlink-20261026`，为同日独立入口，不额外增加规范升级日期计数；没有把本机桩检查描述成 Linux 验收。
+
 ### L079：新版发现不能读 CDN 缓存的 latest 接口，手动检查间隔须短于自动间隔
 
 **适用条件：** 更新器先用不缓存的 `github.com/.../releases/latest` 跳转确认最新标签，再读 GitHub API 发布元数据；自动检查固定间隔运行，用户也能手动检查。

@@ -53,6 +53,8 @@ python -m venv .venv-aster
 
 ## 检查与文档
 
+Entropy / Lighter 的 SNDK、ANTH 研究可单独运行[24 小时行情采集与 taker 模拟工具](docs/entropy-lighter-lab.md)，含 Linux 一键安装、延迟情景和返佣分账；默认只采集公开行情，不连接实盘执行器。
+
 `pnpm run check` 执行工作台类型检查，`pnpm test` 运行 Node 行为测试；模块集成测试需要先完成 workspace 安装与模块构建，并配置 Greeks 与 ASTER 的独立 Python 环境。Linux 安装、systemd 恢复与 x64 部署包验收由 GitHub Actions 执行。
 
 - [部署与迁移](docs/deployment.md)
