@@ -4,6 +4,7 @@ import { Activity, CircleAlert, Download, LoaderCircle, Play, RefreshCw, Save, S
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, ApiError } from './api';
 import type { LabConfig, LabQuote, LabReport, LabSnapshot, LabSpread, LabSymbol, LabTime } from './entropy-lighter-types';
+import EntropyLighterInsights from './EntropyLighterInsights';
 import './entropy-lighter.css';
 
 const ROOT = '/api/research/entropy-lighter';
@@ -90,16 +91,14 @@ function Configuration({ draft, setDraft, disabled, dirty, busy, onSave, onReset
   </form></details>;
 }
 
-function quoteQuality(quote: LabQuote, config: LabConfig, now: number) {
-  const received = timestamp(quote.receivedAt), source = timestamp(quote.sourceAt);
-  if (!Number.isFinite(received) || now - received > config.maxBookAgeMs || received > now + 100) return { text: '接收报价已过期', tone: 'stale' };
-  if (quote.sourceClockUncertain) return { text: '源时钟待核验', tone: 'stale' };
-  if (!Number.isFinite(source)) return { text: '源时间未知', tone: 'stale' };
-  if (now - source > config.maxSourceAgeMs || source > now + 100) return { text: '源报价已过期', tone: 'stale' };
-  return { text: '有效观测', tone: 'good' };
+function quoteQuality(quote: LabQuote, reportAgeMs: number | null, silenceAfterMs: number | undefined, historical: boolean) {
+  if (historical) return { text: '历史记录，观测待更新', tone: 'pending' };
+  if (typeof quote.receiveAgeMs !== 'number' || !Number.isFinite(quote.receiveAgeMs) || quote.receiveAgeMs < 0 || reportAgeMs === null || typeof silenceAfterMs !== 'number' || !Number.isFinite(silenceAfterMs)) return { text: '等待新版采样 / 质量未知', tone: 'pending' };
+  if (quote.receiveAgeMs + reportAgeMs > silenceAfterMs) return { text: '近期未收到更新', tone: 'stale' };
+  return { text: '最近采样有更新', tone: 'good' };
 }
-function Quotes({ quotes, config, now }: { quotes: LabQuote[]; config: LabConfig; now: number }) {
-  return <section className="panel el-section"><div className="panel-heading"><h2>最新盘口观测</h2><span className="muted">价格单位按原生合约；不跨 USD / USDT 比价格水平</span></div><div className="el-table-scroll"><table className="el-table"><caption className="visually-hidden">最新盘口与逐条时间质量</caption><thead><tr><th>平台 / 标的</th><th>买一</th><th>卖一</th><th>接收时间</th><th>源时间</th><th>质量</th></tr></thead><tbody>{quotes.length ? quotes.map(quote => { const quality = quoteQuality(quote, config, now); return <tr key={`${quote.venue}:${quote.symbol}`}><th scope="row">{venue(quote.venue)} / {quote.symbol}<small>{quote.nativeSymbol}</small></th><td>{num(quote.bid)}</td><td>{num(quote.ask)}</td><td>{time(quote.receivedAt)}</td><td>{time(quote.sourceAt)}</td><td><span className={`el-quality ${quality.tone}`}>{quality.text}</span>{quote.sourceClockUncertain ? <small>源时钟不确定</small> : null}</td></tr>; }) : <tr><td colSpan={6} className="el-table-empty">尚无有效盘口。等待数据源连接与身份检查；采集运行不代表行情已可用。</td></tr>}</tbody></table></div></section>;
+function Quotes({ quotes, reportAgeMs, silenceAfterMs, historical }: { quotes: LabQuote[]; reportAgeMs: number | null; silenceAfterMs: number | undefined; historical: boolean }) {
+  return <section className="panel el-section el-quotes"><div className="panel-heading"><h2>最新盘口观测</h2><span className="muted">价格单位按原生合约；不跨 USD / USDT 比价格水平</span></div><div className="el-table-scroll"><table className="el-table"><caption className="visually-hidden">最新盘口与逐条时间质量</caption><thead><tr><th>平台 / 标的</th><th>买一</th><th>卖一</th><th>接收时间</th><th>源时间</th><th>观测 / 模拟质量</th></tr></thead><tbody>{quotes.length ? quotes.map(quote => { const quality = quoteQuality(quote, reportAgeMs, silenceAfterMs, historical); return <tr key={`${quote.venue}:${quote.symbol}`}><th scope="row">{venue(quote.venue)} / {quote.symbol}<small>{quote.nativeSymbol}</small></th><td>{num(quote.bid)}</td><td>{num(quote.ask)}</td><td>{time(quote.receivedAt)}<small>{typeof quote.receiveAgeMs === 'number' && reportAgeMs !== null ? `约 ${num((quote.receiveAgeMs + reportAgeMs) / 1000)} 秒前收到` : '接收年龄未知'}</small></td><td>{time(quote.sourceAt)}{quote.sourceClockUncertain ? <small className="el-source-clock">源时钟待核验</small> : null}</td><td><span className={`el-quality ${quality.tone}`}>{quality.text}</span><small>{quote.executionQuality === null ? '采样时满足模拟时效' : typeof quote.executionQuality === 'string' ? `该样本未满足模拟时效（${quote.executionQuality}）` : '模拟质量未知'}</small></td></tr>; }) : <tr><td colSpan={6} className="el-table-empty">尚无盘口。等待数据源连接与身份检查；采集运行不代表行情已可用。</td></tr>}</tbody></table></div></section>;
 }
 
 function SpreadChart({ report, config, symbol, onSymbol, historical }: { report: LabReport | null; config: LabConfig; symbol: LabSymbol; onSymbol: (symbol: LabSymbol) => void; historical: boolean }) {
@@ -112,14 +111,14 @@ function SpreadChart({ report, config, symbol, onSymbol, historical }: { report:
       if (previous && point.date - previous.date > Math.max(5000, config.sampleIntervalMs * 4)) result.push({ ...point, date: previous.date + 1, midBasisBps: null, takerEdgeBps: null });
       result.push({ ...point, midBasisBps: Number.isFinite(point.midBasisBps) ? point.midBasisBps : null, takerEdgeBps: Number.isFinite(point.takerEdgeBps) ? point.takerEdgeBps : null });
     }
-    return result;
+    return result.map(point => ({ ...point, midBasisPercent: point.midBasisBps === null ? null : point.midBasisBps / 100, takerEdgePercent: point.takerEdgeBps === null ? null : point.takerEdgeBps / 100 }));
   }, [points, config.sampleIntervalMs]);
   const latest = data.at(-1), basis = report?.basis?.[symbol];
   const hasData = data.some(p => p.midBasisBps !== null || p.takerEdgeBps !== null);
-  return <section className="panel el-section el-spread"><div className="panel-heading"><h2>跨所价差 <span className="el-unit">bps</span></h2><div className="el-symbols" role="group" aria-label="价差标的">{SYMBOLS.map(s => <button key={s} aria-pressed={s === symbol} className={s === symbol ? 'active' : ''} onClick={() => onSymbol(s)}>{s}</button>)}</div></div>
-    <div className="el-chart-readings"><div><span className="el-line-key basis">中间价基差</span><strong>{num(latest?.midBasisBps)}<small>bps</small></strong><small>Entropy / Lighter − 1</small></div><div><span className="el-line-key edge">双向最佳 taker 价差</span><strong>{num(latest?.takerEdgeBps)}<small>bps</small></strong><small>{latest?.buy && latest.sell ? `买 ${venue(latest.buy)} / 卖 ${venue(latest.sell)}` : '尚无可比较盘口'}；未扣费</small></div><div><span>全会话基差均值</span><strong>{num(basis?.meanBps)}<small>bps</small></strong><small>{num(basis?.samples)} 个采样；非图内窗口统计</small></div></div>
+  return <section className="panel el-section el-spread"><div className="panel-heading"><h2>两边价格差了多少 <span className="el-unit">%</span></h2><div className="el-symbols" role="group" aria-label="价差标的">{SYMBOLS.map(s => <button key={s} aria-pressed={s === symbol} className={s === symbol ? 'active' : ''} onClick={() => onSymbol(s)}>{s}</button>)}</div></div>
+    <div className="el-chart-readings"><div><span className="el-line-key basis">两边中间价之差</span><strong>{num(latest?.midBasisPercent)}<small>%</small></strong><small>正数表示 Entropy 较贵</small></div><div><span className="el-line-key edge">吃单入场价差</span><strong>{num(latest?.takerEdgePercent)}<small>%</small></strong><small>{latest?.buy && latest.sell ? `买 ${venue(latest.buy)} / 卖 ${venue(latest.sell)}` : '尚无可比较盘口'}；未扣费与滑点</small></div><div><span>本轮平均价格差</span><strong>{num(basis?.meanBps === undefined ? null : basis.meanBps / 100)}<small>%</small></strong><small>{num(basis?.samples)} 个采样；整个会话统计</small></div></div>
     <div className="el-chart-meta"><span>{data.length ? `${time(data[0].date, true)} – ${time(data.at(-1)!.date, true)}` : '最近 600 个采样点（默认约 20 分钟）'}（本机时区）</span><span>{historical ? '历史观测' : '接收时间观测'} · 采样展示间隔至少 2 秒</span></div>
-    {hasData ? <figure aria-label={`${symbol} 跨所价差时间线，单位bps；空白表示缺失数据。`}><div className="el-chart"><ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 270 }} minWidth={0}><LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 4 }} accessibilityLayer><CartesianGrid vertical={false} stroke="var(--surface-4)" /><XAxis dataKey="date" type="number" domain={['dataMin', 'dataMax']} tickFormatter={v => time(Number(v))} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} minTickGap={48} tickLine={false} axisLine={false} /><YAxis width={54} tickFormatter={v => num(Number(v))} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} tickLine={false} axisLine={false} domain={['auto', 'auto']} /><ReferenceLine y={0} stroke="var(--surface-6)" strokeDasharray="3 4" /><Tooltip labelFormatter={v => time(Number(v), true)} formatter={(value, name) => [`${num(Number(value))} bps`, name]} contentStyle={{ background: 'var(--surface-3)', border: '1px solid var(--surface-6)', borderRadius: 6, fontSize: 12 }} labelStyle={{ color: 'var(--text-secondary)' }} /><Line name="中间价基差" dataKey="midBasisBps" stroke="var(--accent)" strokeWidth={2} dot={data.length === 1} isAnimationActive={false} connectNulls={false} /><Line name="最佳 taker 价差（未扣费）" dataKey="takerEdgeBps" stroke="var(--emerald)" strokeWidth={1.5} strokeDasharray="5 3" dot={data.length === 1} isAnimationActive={false} connectNulls={false} /></LineChart></ResponsiveContainer></div><figcaption className="el-chart-note">缺失与断线区间留空。{latest?.sourceClockUncertain ? '最近样本源时钟不确定；' : ''}接收时间差不能证明交易所先后顺序，taker 价差未扣手续费、滑点和资金费。</figcaption><details className="el-chart-data"><summary>查看图内数值</summary><div className="el-table-scroll"><table className="el-table"><thead><tr><th>接收观测时间</th><th>中间价基差（bps）</th><th>taker 价差（bps）</th><th>源时钟</th></tr></thead><tbody>{(points || []).slice(-600).map((p, i) => <tr key={`${p.at}:${i}`}><td>{time(p.at, true)}</td><td>{num(p.midBasisBps)}</td><td>{num(p.takerEdgeBps)}</td><td>{p.sourceClockUncertain ? '待核验' : '已提供源时间'}</td></tr>)}</tbody></table></div></details></figure> : <div className="el-empty"><Activity size={24} /><strong>尚无 {symbol} 可比较价差</strong><p>需要两侧新鲜盘口及相近的接收时间。缺失数据不会按零补齐。</p></div>}
+    {hasData ? <figure aria-label={`${symbol} 跨所价差时间线，单位百分比；空白表示缺失数据。`}><div className="el-chart"><ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 270 }} minWidth={0}><LineChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 4 }} accessibilityLayer><CartesianGrid vertical={false} stroke="var(--surface-4)" /><XAxis dataKey="date" type="number" domain={['dataMin', 'dataMax']} tickFormatter={v => time(Number(v))} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} minTickGap={48} tickLine={false} axisLine={false} /><YAxis width={58} tickFormatter={v => `${num(Number(v))}%`} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} tickLine={false} axisLine={false} domain={['auto', 'auto']} /><ReferenceLine y={0} stroke="var(--surface-6)" strokeDasharray="3 4" /><Tooltip labelFormatter={v => time(Number(v), true)} formatter={(value, name) => [`${num(Number(value))}%`, name]} contentStyle={{ background: 'var(--surface-3)', border: '1px solid var(--surface-6)', borderRadius: 6, fontSize: 12 }} labelStyle={{ color: 'var(--text-secondary)' }} /><Line name="两边中间价之差" dataKey="midBasisPercent" stroke="var(--accent)" strokeWidth={2} dot={data.length === 1} isAnimationActive={false} connectNulls={false} /><Line name="吃单入场价差（未扣费）" dataKey="takerEdgePercent" stroke="var(--emerald)" strokeWidth={1.5} strokeDasharray="5 3" dot={data.length === 1} isAnimationActive={false} connectNulls={false} /></LineChart></ResponsiveContainer></div><figcaption className="el-chart-note">缺失与断线区间留空。{latest?.sourceClockUncertain ? '最近样本源时钟不确定；' : ''}入场价差未扣手续费、滑点和资金费；价格先变化不等于能抢先成交。</figcaption><details className="el-chart-data"><summary>查看图内数值与 bps</summary><div className="el-table-scroll"><table className="el-table"><thead><tr><th>接收观测时间</th><th>中间价基差（bps）</th><th>taker 价差（bps）</th><th>源时钟</th></tr></thead><tbody>{(points || []).slice(-600).map((p, i) => <tr key={`${p.at}:${i}`}><td>{time(p.at, true)}</td><td>{num(p.midBasisBps)}</td><td>{num(p.takerEdgeBps)}</td><td>{p.sourceClockUncertain ? '待核验' : '已提供源时间'}</td></tr>)}</tbody></table></div></details></figure> : <div className="el-empty"><Activity size={24} /><strong>尚无 {symbol} 可比较价差</strong><p>需要两侧新鲜盘口及相近的接收时间。缺失数据不会按零补齐。</p></div>}
   </section>;
 }
 
@@ -159,14 +158,18 @@ export default function EntropyLighterPage({ onExpired }: { onExpired: () => voi
   const [uncertain, setUncertain] = useState(false);
   const busyRef = useRef('');
   const [loading, setLoading] = useState(false);
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => performance.now());
   const [lastRead, setLastRead] = useState<number | null>(null);
+  const receivedClock = useRef<{ mono: number; serverNow: number | null; reportAgeMs: number | null } | null>(null);
   const [offline, setOffline] = useState(!navigator.onLine);
   const lifetime = useRef<AbortController | null>(null);
   const request = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null);
   const generation = useRef(0);
-  const accept = useCallback((data: LabSnapshot, replaceDraft = false) => {
-    setSnapshot(data); setLastRead(Date.now()); setNow(Date.now()); setLoadError(''); setUncertain(false);
+  const accept = useCallback((data: LabSnapshot, replaceDraft = false, transportAgeMs = 0) => {
+    const mono = performance.now();
+    const age = Math.max(0, transportAgeMs);
+    receivedClock.current = { mono, serverNow: typeof data.serverNow === 'number' && Number.isFinite(data.serverNow) ? data.serverNow + age : null, reportAgeMs: typeof data.reportAgeMs === 'number' && Number.isFinite(data.reportAgeMs) && data.reportAgeMs >= 0 ? data.reportAgeMs + age : null };
+    setSnapshot(data); setLastRead(receivedClock.current.serverNow); setNow(mono); setLoadError(''); setUncertain(false);
     if (!dirtyRef.current || replaceDraft) { setDraft(draftOf(data.config)); dirtyRef.current = false; setDirty(false); }
   }, []);
   const read = useCallback((force = false) => {
@@ -175,9 +178,10 @@ export default function EntropyLighterPage({ onExpired }: { onExpired: () => voi
     request.current?.controller.abort();
     const controller = new AbortController(), version = ++generation.current;
     const signal = AbortSignal.any([controller.signal, lifetime.current.signal]);
+    const requestStarted = performance.now();
     setLoading(true);
     const promise = (async () => {
-      try { const data = await api<LabSnapshot>(ROOT, { signal, timeoutMs: 10_000 }); if (!signal.aborted && version === generation.current) accept(data); }
+      try { const data = await api<LabSnapshot>(ROOT, { signal, timeoutMs: 10_000 }); if (!signal.aborted && version === generation.current) accept(data, false, performance.now() - requestStarted); }
       catch (reason) { if (signal.aborted || version !== generation.current) return; if (reason instanceof ApiError && reason.status === 401) onExpired(); else setLoadError(message(reason)); }
       finally { if (version === generation.current && !lifetime.current?.signal.aborted) setLoading(false); }
     })().finally(() => { if (request.current?.promise === promise) request.current = null; });
@@ -188,16 +192,16 @@ export default function EntropyLighterPage({ onExpired }: { onExpired: () => voi
     let resumeTimer: ReturnType<typeof setTimeout> | undefined;
     const cancelRead = () => { generation.current++; request.current?.controller.abort(); request.current = null; setLoading(false); };
     const resume = () => {
-      setNow(Date.now()); setOffline(!navigator.onLine);
+      setNow(performance.now()); setOffline(!navigator.onLine);
       if (controller.signal.aborted || document.hidden || !navigator.onLine || busyRef.current || resumeTimer !== undefined) return;
       const previous = request.current;
       resumeTimer = setTimeout(() => { resumeTimer = undefined; if (!controller.signal.aborted && !busyRef.current) void read(previous !== null && request.current === previous); }, 250);
     };
-    const suspend = () => { clearTimeout(resumeTimer); resumeTimer = undefined; cancelRead(); setOffline(!navigator.onLine); setNow(Date.now()); };
+    const suspend = () => { clearTimeout(resumeTimer); resumeTimer = undefined; cancelRead(); setOffline(!navigator.onLine); setNow(performance.now()); };
     const visibility = () => { if (document.hidden) suspend(); else resume(); };
     void read();
     const poll = setInterval(() => { if (!busyRef.current && !document.hidden && navigator.onLine && resumeTimer === undefined) void read(); }, 5000);
-    const clock = setInterval(() => { if (!document.hidden) setNow(Date.now()); }, 1000);
+    const clock = setInterval(() => { if (!document.hidden) setNow(performance.now()); }, 1000);
     document.addEventListener('visibilitychange', visibility); window.addEventListener('focus', resume); window.addEventListener('pageshow', resume); window.addEventListener('online', resume); window.addEventListener('offline', suspend);
     return () => { controller.abort(); generation.current++; request.current?.controller.abort(); request.current = null; clearTimeout(resumeTimer); clearInterval(poll); clearInterval(clock); document.removeEventListener('visibilitychange', visibility); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); window.removeEventListener('online', resume); window.removeEventListener('offline', suspend); };
   }, [read]);
@@ -215,28 +219,36 @@ export default function EntropyLighterPage({ onExpired }: { onExpired: () => voi
         const anchor = document.createElement('a'); anchor.href = url; anchor.download = `entropy-lighter-${new Date().toISOString().replace(/[:.]/g, '-')}.json`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
         setNotice('报告已下载。');
       } else {
+        const requestStarted = performance.now();
         const data = await api<LabSnapshot>(`${ROOT}/${action === 'save' ? 'config' : action}`, { method: action === 'save' ? 'PUT' : 'POST', body: JSON.stringify(action === 'save' ? { config } : {}), signal, timeoutMs: 20_000 });
-        if (!signal.aborted) { accept(data, action === 'save'); setNotice(action === 'save' ? '配置已保存。' : action === 'start' ? '已请求启动采集。' : '采集已停止，报告已保留。'); }
+        if (!signal.aborted) { accept(data, action === 'save', performance.now() - requestStarted); setNotice(action === 'save' ? '配置已保存。' : action === 'start' ? '已请求启动采集。' : '采集已停止，报告已保留。'); }
       }
     } catch (reason) { if (!signal.aborted) { if (reason instanceof ApiError && reason.status === 401) onExpired(); else { setActionError(message(reason)); if (action !== 'download' && !(reason instanceof ApiError && reason.status >= 400 && reason.status < 500 && reason.status !== 408)) setUncertain(true); } } }
     finally { busyRef.current = ''; if (!signal.aborted) { setBusy(''); if (action !== 'download') void read(true); } }
   };
   const save = (event: FormEvent) => { event.preventDefault(); if (!draft || !snapshot) return; try { void execute('save', configOf(draft, snapshot.config)); } catch (reason) { setActionError(message(reason)); } };
-  const stale = snapshot?.stale || (lastRead !== null && now - lastRead > 15_000);
-  const historical = snapshot?.state === 'stopped' || !!stale || !!loadError || offline;
+  const anchor = receivedClock.current;
+  const reportAgeMs = anchor?.reportAgeMs !== null && anchor?.reportAgeMs !== undefined ? anchor.reportAgeMs + Math.max(0, now - anchor.mono) : null;
+  const serverNow = anchor?.serverNow !== null && anchor?.serverNow !== undefined ? anchor.serverNow + Math.max(0, now - anchor.mono) : null;
+  const stale = !!snapshot?.stale || (reportAgeMs !== null && reportAgeMs > 15_000);
+  const historical = snapshot?.state === 'stopped' || snapshot?.state === 'fault' || !!snapshot?.report?.stopped || stale || !!loadError || offline;
+  const observation = snapshot?.report?.observation;
+  const receiving = !historical && reportAgeMs !== null && typeof observation?.silenceAfterMs === 'number' && !!snapshot?.report?.latestQuotes.some(quote => typeof quote.receiveAgeMs === 'number' && Number.isFinite(quote.receiveAgeMs) && quote.receiveAgeMs >= 0 && quote.receiveAgeMs + reportAgeMs <= observation.silenceAfterMs);
   const stopped = snapshot?.state === 'stopped';
   return <div className="el-page">
-    <header className="el-heading"><div><h1>Entropy / Lighter</h1><p>公开行情研究与 taker 成交模拟</p></div><div className="el-toolbar"><button className="button secondary" onClick={() => void execute('download')} disabled={!snapshot?.report || !!busy}><Download size={15} />下载报告</button><button className="button secondary" onClick={() => void read(true)} disabled={!!busy || loading || offline} aria-label="刷新研究数据"><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>{stopped ? <button className="button primary" disabled={!!busy || loading || uncertain || dirty || !!loadError || offline} title={dirty ? '请先保存配置' : undefined} onClick={() => void execute('start')}>{busy === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}启动采集</button> : <button className="button secondary" disabled={!snapshot || !!busy || loading || uncertain || offline} onClick={() => void execute('stop')}>{busy === 'stop' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}停止采集</button>}</div></header>
+    <header className="el-heading"><div><h1>Entropy / Lighter</h1><p>先看价差能否覆盖成本，再研究延迟后的机会</p></div><div className="el-toolbar"><button className="button secondary" onClick={() => void execute('download')} disabled={!snapshot?.report || !!busy}><Download size={15} />下载报告</button><button className="button secondary" onClick={() => void read(true)} disabled={!!busy || loading || offline} aria-label="刷新研究数据"><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>{stopped ? <button className="button primary" disabled={!!busy || loading || uncertain || dirty || !!loadError || offline} title={dirty ? '请先保存配置' : undefined} onClick={() => void execute('start')}>{busy === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}启动采集</button> : <button className="button secondary" disabled={!snapshot || !!busy || loading || uncertain || offline} onClick={() => void execute('stop')}>{busy === 'stop' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}停止采集</button>}</div></header>
     {actionError ? <div className="error-box" role="alert">{actionError}{uncertain ? <p>操作结果尚未确认；刷新状态后再操作。</p> : null}</div> : null}{notice ? <div className="el-callout success" role="status">{notice}</div> : null}
     {offline || loadError ? <div className="el-callout warning" role="alert"><CircleAlert size={16} /><span>{offline ? '浏览器网络已断开。' : `研究数据读取失败：${loadError}`} 当前保留最后读取的数据；连接恢复后自动重试。</span></div> : null}
     {!snapshot ? <section className="panel el-empty" role="status">{loading ? <LoaderCircle className="spin" /> : <CircleAlert />}<strong>{loading ? '正在读取采集状态' : '暂未取得研究数据'}</strong><p>{loadError ? '请检查工作台服务，或点击刷新重试。' : '无需连接交易账户。'}</p></section> : <>
-      <section className="panel el-status-panel" aria-label="研究采集状态"><div className="el-state-main"><span className={`el-state ${snapshot.state}`}><Activity size={16} />{stateLabels[snapshot.state]}</span><span>{snapshot.report?.mode === 'paper' ? '模拟会话' : '纯采集'}</span>{stale ? <span className="el-quality stale">报告已过期</span> : null}{snapshot.error ? <p className="el-server-error">{snapshot.error}</p> : null}</div><dl className="el-status-facts"><div><dt>采集心跳</dt><dd>{time(snapshot.heartbeatAt, true)}</dd></div><div><dt>页面读取</dt><dd>{time(lastRead)}{historical ? <small>保留的观测</small> : <small>前台每 5 秒刷新</small>}</dd></div><div><dt>接收盘口 / 候选 / 作废</dt><dd>{num(snapshot.report?.counts?.books)} / {num(snapshot.report?.counts?.candidates)} / {num(snapshot.report?.counts?.invalidated)}</dd></div><div><dt>会话开始</dt><dd>{time(snapshot.report?.startedAt, true)}</dd></div></dl><p className="el-status-note">采集状态仅表示进程与心跳，行情是否可用见逐条报价质量。切换或关闭页面后继续采集。</p></section>
-      <div className="el-callout warning el-identity"><CircleAlert size={16} /><span>ANTH 跨所合约身份尚未自动核验。未经独立核验时仅观察，不纳入成交模拟；USD / USDT 价格水平也不能直接证明领先。</span></div>
+      <section className="panel el-status-panel" aria-label="研究采集状态"><div className="el-state-main"><span className={`el-state ${snapshot.state} ${historical ? 'pending' : ''}`}><Activity size={16} />{historical && !stopped ? '采集状态待更新' : stateLabels[snapshot.state]}</span><span>{snapshot.report?.mode === 'paper' ? '模拟会话' : '纯采集'}</span><span className={`el-quality ${receiving ? 'good' : 'pending'}`}>{historical ? '观测待更新 / 历史记录' : receiving ? '持续收到行情' : reportAgeMs === null ? '等待新版采样' : '等待行情更新'}</span>{snapshot.error ? <p className="el-server-error">{snapshot.error}</p> : null}</div><dl className="el-status-facts"><div><dt>采集心跳</dt><dd>{time(snapshot.heartbeatAt, true)}</dd></div><div><dt>报告距今</dt><dd>{reportAgeMs === null ? '年龄未知' : `${num(reportAgeMs / 1000)} 秒`}<small>{historical ? '保留的观测' : '前台每 5 秒读取'}</small></dd></div><div><dt>本轮收到盘口</dt><dd>{num(snapshot.report?.counts?.books)} 条<small>页面最近读取 {time(lastRead)}</small></dd></div><div><dt>会话开始</dt><dd>{time(snapshot.report?.startedAt, true)}</dd></div></dl><p className="el-status-note">行情是否持续到达与模拟准入分别判断。关闭页面后服务器继续采集；本页不提交交易订单。</p></section>
+      <EntropyLighterInsights insights={reportAgeMs !== null && observation && serverNow !== null ? snapshot.insights : undefined} historical={historical} stopped={stopped} report={snapshot.report} reportAgeMs={reportAgeMs} serverNow={serverNow} />
       <SpreadChart report={snapshot.report} config={snapshot.report?.sessionConfig || snapshot.config} symbol={symbol} onSymbol={setSymbol} historical={historical} />
-      <Quotes quotes={snapshot.report?.latestQuotes || []} config={snapshot.report?.sessionConfig || snapshot.config} now={now} />
-      <PaperResults report={snapshot.report} />
-      {draft ? <Configuration draft={draft} setDraft={changeDraft} disabled={!stopped || uncertain} dirty={dirty} busy={busy === 'save'} onSave={save} onReset={() => { setDraft(draftOf(snapshot.config)); dirtyRef.current = false; setDirty(false); setActionError(''); }} /> : null}
-      <Diagnostics report={snapshot.report} />
+      <details className="el-technical"><summary>技术与模拟明细<span>盘口、成交模拟、连接诊断与参数设置</span></summary><div className="el-technical-content">
+        <Quotes quotes={snapshot.report?.latestQuotes || []} reportAgeMs={reportAgeMs} silenceAfterMs={observation?.silenceAfterMs} historical={historical} />
+        <PaperResults report={snapshot.report} />
+        {draft ? <Configuration draft={draft} setDraft={changeDraft} disabled={!stopped || uncertain} dirty={dirty} busy={busy === 'save'} onSave={save} onReset={() => { setDraft(draftOf(snapshot.config)); dirtyRef.current = false; setDirty(false); setActionError(''); }} /> : null}
+        <Diagnostics report={snapshot.report} />
+      </div></details>
     </>}
   </div>;
 }

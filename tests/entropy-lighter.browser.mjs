@@ -6,6 +6,8 @@ async (page) => {
   const errors = [], writes = [], reads = [], held = [];
   const base = Date.parse('2026-10-27T02:00:00Z');
   let elapsed = 0, state = 'running', failSave = false, failRead = false, stale = false, expire = false, holdNext = false;
+  let frozenReportAt = null, sourceClockUncertain = false, legacyFreshness = false, strictQuoteQuality = null, evidenceLagMs = 0, insightStatusOverride = null;
+  const reportAt = () => base + (frozenReportAt ?? elapsed) - (stale ? 60_000 : 5000);
   let config = {
     schema: 1, region: 'Tokyo', recordRaw: true, maxDataMb: 2048, retentionDays: 7,
     maxBookAgeMs: 750, maxSourceAgeMs: 2000, maxPairSkewMs: 500, sampleIntervalMs: 250,
@@ -17,6 +19,7 @@ async (page) => {
   let sessionConfig = structuredClone(config), omitSessionConfig = false;
   const report = () => ({
     session: 'fixture-research', mode: sessionConfig.simulation.enabled ? 'paper' : 'research',
+    ...(!legacyFreshness ? { observedAt: reportAt(), observation: { asOf: reportAt(), silenceAfterMs: 10000 } } : {}),
     ...(!omitSessionConfig ? { sessionConfig: structuredClone(sessionConfig), configHash: 'fixture-config-hash' } : {}),
     startedAt: new Date(base - 60_000).toISOString(), heartbeatAt: new Date(base + elapsed).toISOString(),
     stopped: state === 'stopped', paperSuspendedReason: null,
@@ -30,8 +33,9 @@ async (page) => {
     leaderMarkouts: { 'SNDK:entropy:300': { samples: 4, directionHitRate: 0.75, meanSignedMoveBps: 1.25 } },
     diagnostics: { counts: { 'lighter:ws_connected': 1 }, last: { 'lighter:ws_connected': { at: base } }, rttMs: { 'entropy:http': [30, 40, 60], 'lighter:ws_ping': [20, 25, 30] } },
     eventLoopDelayMs: { p50: 20, p95: 25, p99: 30 }, assumptions: { orderLatency: 'assumed_not_measured' },
-    latestQuotes: ['entropy', 'lighter'].map(venue => ({ venue, symbol: 'SNDK', nativeSymbol: venue === 'entropy' ? 'SNDK-USD' : 'SNDK', bid: 100, ask: 100.1,
-      receivedAt: base + elapsed - (stale ? 60_000 : 100), sourceAt: base + elapsed - (stale ? 60_000 : 100), sourceClockUncertain: false })),
+    latestQuotes: ['SNDK', 'ANTH'].flatMap(symbol => ['entropy', 'lighter', 'binance'].map(venue => ({ venue, symbol, nativeSymbol: venue === 'entropy' ? `${symbol}-USD` : symbol, bid: 100, ask: 100.1,
+      receivedAt: reportAt() - 100, sourceAt: reportAt() - (sourceClockUncertain ? 3_600_000 : 100), sourceClockUncertain,
+      ...(!legacyFreshness ? { receiveAgeMs: 100, executionQuality: sourceClockUncertain ? 'stale_source' : strictQuoteQuality } : {}) }))),
     recentSpreads: { SNDK: [
       { at: base - 20000, midBasisBps: 3, takerEdgeBps: 6, buy: 'entropy', sell: 'lighter', sourceClockUncertain: false },
       { at: base - 18000, midBasisBps: 5, takerEdgeBps: 8, buy: 'entropy', sell: 'lighter', sourceClockUncertain: false },
@@ -42,7 +46,33 @@ async (page) => {
       { at: base, midBasisBps: 9, takerEdgeBps: 12, buy: 'entropy', sell: 'lighter', sourceClockUncertain: false },
     ], ANTH: [] },
   });
+  const feesKnown = () => Number.isFinite(sessionConfig.simulation.entropyTakerFeeBps) && Number.isFinite(sessionConfig.simulation.lighterTakerFeeBps);
+  const evaluation = () => {
+    const surplus = feesKnown() ? insightStatusOverride === 'no_edge' ? -0.16 : 0.54 : null;
+    const entropyFees = Number.isFinite(sessionConfig.simulation.entropyTakerFeeBps) ? 0.2 : null;
+    return { at: reportAt() - evidenceLagMs, quantity: 1, buyPrice: 100, sellPrice: 100.8, buyNotional: sessionConfig.simulation.notionalPerLeg, sellNotional: sessionConfig.simulation.notionalPerLeg * 1.008,
+      grossCash: insightStatusOverride === 'no_edge' ? 0.1 : 0.8, grossBps: insightStatusOverride === 'no_edge' ? 10 : 80,
+      costs: { feesRoundTripCash: feesKnown() ? 0.2 : null, exitSlippageReserveCash: 0.04, fundingReserveCash: 0.02, totalReserveCash: feesKnown() ? 0.26 : null },
+      surplusBeforeRebateCash: surplus, surplusBeforeRebateBps: surplus === null ? null : insightStatusOverride === 'no_edge' ? -16 : 54,
+      entropyRoundTripFeesCash: entropyFees,
+      rebates: sessionConfig.simulation.rebateRatios.map(ratio => ({ ratio, contingentRebateCash: entropyFees === null ? null : entropyFees * ratio, surplusCash: surplus === null || entropyFees === null ? null : surplus + entropyFees * ratio })),
+      gatePassed: feesKnown() && insightStatusOverride !== 'no_edge', sourceTimeUncertain: false };
+  };
+  const metrics = () => ({ name: 'base-assumed', buy: 'entropy', sell: 'lighter', scenario: { name: 'base-assumed', entropyMs: 200, lighterMs: 450 }, attempts: 40, completed: 40, failed: 0, costed: feesKnown() ? 40 : 0, passedAfterCosts: feesKnown() ? 40 : 0, spanMs: 600000,
+    qualitySpanMs: 310000, qualityFirstAt: base - 310000, qualityLastAt: base,
+    latest: evaluation(), completionRate: 1, passRate: feesKnown() ? 1 : null, meanSurplusBps: feesKnown() ? 54 : null, sampleReady: feesKnown() });
+  const insights = () => ({ asOf: reportAt(), reportAgeMs: base + elapsed - reportAt(), reportCurrent: !stale && state === 'running', evidenceMaxAgeMs: 18000,
+    summary: { status: 'observing', title: '先看观测结论', reason: '把价差换成金额，结合成本与延迟判断。' },
+    bySymbol: Object.fromEntries(['SNDK', 'ANTH'].map(symbol => [symbol, {
+      status: symbol === 'ANTH' ? 'verify_equivalence' : insightStatusOverride || (sessionConfig.simulation.enabled ? 'paper_candidate' : 'unknown_costs'),
+      title: symbol === 'ANTH' ? '先核验合约身份' : insightStatusOverride === 'no_edge' ? '当前价差覆盖不了整轮成本' : sessionConfig.simulation.enabled ? '值得纸面验证' : '先补齐实际费用',
+      reason: symbol === 'ANTH' ? '同名不代表相同资产，暂不推荐收敛套利。' : insightStatusOverride === 'no_edge' ? '本轮价差不足以覆盖整轮成本。' : sessionConfig.simulation.enabled ? '本轮样本扣除成本和延迟后仍有余量。' : 'Entropy 费率未知，尚不能判断成本能否覆盖。',
+      direction: { buy: 'entropy', sell: 'lighter' }, raw: evaluation(), rawMetrics: metrics(), delayed: [metrics()], bestDelayed: metrics(),
+      notional: { buyCash: sessionConfig.simulation.notionalPerLeg, sellCash: sessionConfig.simulation.notionalPerLeg * 1.008, approxRoundTripTurnoverCash: sessionConfig.simulation.notionalPerLeg * 4.016 },
+      blockers: [], nextSteps: [symbol === 'ANTH' ? '核对底层资产与结算口径。' : '继续采集并核对不同延迟情景。'], caveat: '入场余量不是已实现利润。',
+    }])), leader: { status: 'unproven', title: '领先策略待验证', reason: 'Binance 只用于观察相关反应，不证明可交易的领先。', samples: 4, nextSteps: [] }, paper: { scope: 'all_symbols', unresolved: false, openTasks: 0 } });
   const snapshot = () => ({ schema: 1, enabled: state !== 'stopped', state, error: null,
+    ...(!legacyFreshness ? { serverNow: base + elapsed, reportAgeMs: base + elapsed - reportAt(), insights: insights() } : {}),
     heartbeatAt: new Date(base + elapsed - (stale ? 60000 : 0)).toISOString(), stale, config, report: report() });
   page.on('pageerror', error => errors.push(error.message));
   await page.clock.install({ time: new Date(base) });
@@ -96,14 +126,33 @@ async (page) => {
   await page.clock.pauseAt(new Date(base + elapsed));
   assert(new URL(page.url()).searchParams.get('view') === 'research', 'native research route works without any monitor project');
   assert(await page.locator('iframe').count() === 0, 'research renders as a native workbench page');
-  assert((await page.locator('.el-chart-readings').innerText()).includes('12'), 'latest chart values are visible without hovering');
-  assert((await page.locator('.el-assumptions').first().innerText()).includes('Entropy 未知'), 'unknown Entropy fee is never rendered as zero');
+  assert((await page.locator('.el-chart-readings').innerText()).includes('0.12'), 'latest chart percentages are visible without hovering');
+  assert(await page.getByRole('article', { name: 'SNDK 研究结论' }).count() === 1 && await page.getByRole('article', { name: 'ANTH 研究结论' }).count() === 1, 'both symbols have readable conclusions');
+  assert((await page.locator('.el-budget-heading').first().innerText()).includes('一轮双边开平成交额约 $401.60（示例）'), 'round-trip two-venue turnover is shown without extrapolating daily volume');
+  assert((await page.locator('.el-budget').first().innerText()).includes('Entropy 0.2秒 / Lighter 0.45秒'), 'latency evidence uses full venue names and seconds on the main page');
+  assert(!await page.locator('.el-technical').evaluate(element => element.open), 'technical tables do not dominate the initial page');
   await page.locator('.el-chart .recharts-line-curve').first().waitFor();
   const path = await page.locator('.el-chart .recharts-line-curve').first().getAttribute('d');
   assert((path.match(/M/g) || []).length >= 3, 'explicit null samples and long time gaps break the line');
   await overflow();
   await page.screenshot({ path: 'output/playwright/entropy-lighter-desktop.png', fullPage: false });
 
+  await page.locator('.el-technical>summary').click();
+  assert((await page.locator('.el-assumptions').first().innerText()).includes('Entropy 未知'), 'unknown Entropy fee is never rendered as zero');
+  assert(await page.locator('.el-quotes .el-quality.good').count() === 6, 'a report persisted five seconds ago still shows received market observations');
+  await advance(5000, 1);
+  assert(await page.locator('.el-quotes .el-quality.good').count() === 6, 'five-second report and five-second UI polling do not claim the feed stopped');
+  await page.clock.setSystemTime(new Date(base + elapsed + 3_600_000));
+  await refresh();
+  assert(await page.locator('.el-quotes .el-quality.good').count() === 6, 'browser wall clock one hour ahead does not expire server observations');
+  await page.clock.setSystemTime(new Date(base + elapsed));
+  sourceClockUncertain = true; await refresh();
+  assert(await page.locator('.el-quotes .el-quality.good').count() === 6, 'source clock uncertainty does not imply a silent feed');
+  assert(await page.locator('.el-quotes .el-source-clock').count() === 6, 'source clock uncertainty is labeled independently');
+  sourceClockUncertain = false; legacyFreshness = true; await refresh();
+  assert(await page.locator('.el-quotes .el-quality.good').count() === 0, 'legacy reports cannot default to healthy quality');
+  assert(await page.getByText('等待新版采样 / 质量未知', { exact: true }).count() === 6, 'legacy reports explain which quality evidence is missing');
+  legacyFreshness = false; await refresh();
   await page.locator('.el-config>summary').click();
   const notional = page.getByLabel('每腿模拟名义金额（USD）');
   assert(await notional.isDisabled(), 'running configuration is read only');
@@ -153,6 +202,25 @@ async (page) => {
   await page.getByRole('button', { name: '启动采集', exact: true }).click();
   await page.locator('.el-state.running').waitFor();
   await page.locator('.el-config>summary').click();
+  assert(await page.locator('.el-conclusion.candidate').count() === 1, 'only verified SNDK can be a paper research candidate');
+  strictQuoteQuality = 'stale_receive'; evidenceLagMs = 7000; await refresh();
+  assert(await page.locator('.el-conclusion.candidate').count() === 1, 'research evidence older than ten seconds remains valid within the server evidence window');
+  assert(await page.getByText('该样本未满足模拟时效（stale_receive）', { exact: true }).count() === 6, 'strict execution freshness is disclosed independently from the research candidate');
+  evidenceLagMs = 14000; await refresh();
+  assert(await page.locator('.el-conclusion.candidate').count() === 0, 'a candidate is withdrawn when its research evidence exceeds the server evidence window');
+  insightStatusOverride = 'no_edge'; evidenceLagMs = 12000; await refresh();
+  await page.getByRole('heading', { name: '当前价差覆盖不了整轮成本', exact: true }).waitFor();
+  // The sample starts at age 17s; two 1s render ticks cross the strict >18s boundary before the next 5s poll.
+  await advance(2100, 0);
+  assert(await page.getByRole('article', { name: 'SNDK 研究结论' }).getByRole('heading', { name: '观测待更新', exact: true }).count() === 1, 'a negative conclusion also expires between reads when its research evidence ages out');
+  insightStatusOverride = null;
+  strictQuoteQuality = null; evidenceLagMs = 0; await refresh();
+  frozenReportAt = elapsed;
+  await advance(11000);
+  assert(await page.locator('.el-conclusion.candidate').count() === 0, 'successful reads of an unchanged report older than fifteen seconds revoke the candidate');
+  await page.getByRole('heading', { name: '观测保留，暂缓策略判断', exact: true }).waitFor();
+  frozenReportAt = null; await refresh();
+  assert(await page.locator('.el-conclusion.candidate').count() === 1, 'new evidence restores the paper research conclusion');
 
   // Polling is visible-only; wake events coalesce and a delayed pre-wake GET cannot win.
   await advance(5000, 1);
@@ -168,20 +236,23 @@ async (page) => {
   stale = true;
   await page.evaluate(() => { window.dispatchEvent(new Event('focus')); window.dispatchEvent(new Event('pageshow')); });
   await advance(300, 1);
-  await page.getByText('报告已过期', { exact: true }).waitFor();
+  await page.getByText('观测待更新 / 历史记录', { exact: true }).waitFor();
   held.shift()(); await page.waitForTimeout(30);
-  await page.getByText('报告已过期', { exact: true }).waitFor();
-  assert((await page.locator('.el-chart-readings').innerText()).includes('12'), 'stale refresh retains the chart');
-  assert(await page.getByText('接收报价已过期', { exact: true }).count() === 2, 'each quote independently reports its age');
+  await page.getByText('观测待更新 / 历史记录', { exact: true }).waitFor();
+  assert((await page.locator('.el-chart-readings').innerText()).includes('0.12'), 'stale refresh retains the chart');
+  assert(await page.getByText('历史记录，观测待更新', { exact: true }).count() === 6, 'old reports label retained quotes without claiming their current feed is disconnected');
   failRead = true; await refresh();
   await page.getByText(/研究数据读取失败：fixture read failed/).waitFor();
   assert(await page.locator('.el-chart .recharts-line-curve').count() === 2, 'HTTP failure preserves both historical series');
+  assert(await page.locator('.el-conclusion.candidate').count() === 0, 'HTTP failure withdraws the current candidate conclusion');
   failRead = false; stale = false; await refresh();
   await page.getByRole('button', { name: 'ANTH', exact: true }).click();
   await page.getByText('尚无 ANTH 可比较价差', { exact: true }).waitFor();
   await page.getByRole('button', { name: 'SNDK', exact: true }).click();
 
+  await page.locator('.el-technical>summary').click();
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.el-heading').evaluate(element => element.scrollIntoView({ block: 'start', behavior: 'instant' }));
   await overflow();
   await page.screenshot({ path: 'output/playwright/entropy-lighter-mobile.png', fullPage: false });
   const downloadEvent = page.waitForEvent('download');
@@ -201,5 +272,5 @@ async (page) => {
   assert(errors.length === 0, `no browser errors: ${errors.join('; ')}`);
   assert(writes.every(write => ['/stop', '/start', '/config'].some(suffix => write.path === root + suffix)), 'no exchange order writes occur');
   await page.clock.resume();
-  return { checks: 'native-route, read-only controls, stop/save/start, validation, failed-save retention, chart gaps, polling/resume, stale/error preservation, mobile, download, expiry', writes: writes.length, reads: reads.length };
+  return { checks: 'native-route, readable conclusions, server/monotonic age, report/poll cadence, wall-clock skew, source-clock independence, legacy unknown quality, read-only controls, stop/save/start, validation, failed-save retention, chart gaps, polling/resume, stale/error withdrawal, mobile, download, expiry', writes: writes.length, reads: reads.length };
 }

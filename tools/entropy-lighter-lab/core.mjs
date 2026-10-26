@@ -135,6 +135,29 @@ const mid = (b) => (b.bids[0][0] + b.asks[0][0]) / 2;
 const pairKey = (venue, symbol) => `${venue}:${symbol}`;
 const summaries = () => ({ completed: 0, lossesBeforeRebate: 0, settledGrossPnl: 0, fees: 0, entropyFees: 0, costReserve: 0, turnover: { entropy: 0, lighter: 0 }, settledNetBeforeRebate: 0, minNetBeforeRebate: null, failedLegs: 0, unresolved: 0 });
 
+// An entry cash-space estimate, not a realized roundtrip PnL. Both opening
+// sweeps already include slippage; only the two exit slippages are reserved here.
+export function studyEvaluation({ buy, sell, config, at, sourceTimeUncertain = false }) {
+  const s = config.simulation;
+  const entropyCash = buy.venue === 'entropy' ? buy.cash : sell.cash;
+  const lighterCash = buy.venue === 'lighter' ? buy.cash : sell.cash;
+  const knownFees = finite(s.entropyTakerFeeBps) && finite(s.lighterTakerFeeBps);
+  const entropyFees = finite(s.entropyTakerFeeBps) ? 2 * entropyCash * s.entropyTakerFeeBps / 10000 : null;
+  const fees = knownFees ? 2 * (entropyCash * s.entropyTakerFeeBps + lighterCash * s.lighterTakerFeeBps) / 10000 : null;
+  const exitSlippage = (buy.cash + sell.cash) * s.slippageBpsPerFill / 10000;
+  const funding = (buy.cash + sell.cash) / 2 * s.fundingReserveBpsPerRoundTrip / 10000;
+  const total = fees === null ? null : fees + exitSlippage + funding;
+  const gross = sell.cash - buy.cash;
+  const surplus = total === null ? null : gross - total;
+  const surplusBps = surplus === null ? null : surplus / buy.cash * 10000;
+  return { at, quantity: buy.quantity, buyPrice: buy.price, sellPrice: sell.price, buyNotional: buy.cash, sellNotional: sell.cash,
+    grossCash: gross, grossBps: gross / buy.cash * 10000,
+    costs: { feesRoundTripCash: fees, exitSlippageReserveCash: exitSlippage, fundingReserveCash: funding, totalReserveCash: total },
+    surplusBeforeRebateCash: surplus, surplusBeforeRebateBps: surplusBps, entropyRoundTripFeesCash: entropyFees,
+    rebates: s.rebateRatios.map((ratio) => ({ ratio, contingentRebateCash: entropyFees === null ? null : entropyFees * ratio, surplusCash: surplus === null || entropyFees === null ? null : surplus + entropyFees * ratio })),
+    gatePassed: surplusBps !== null && surplusBps >= s.minEntryEdgeBps, sourceTimeUncertain };
+}
+
 export class Lab {
   constructor(config, emit = () => {}) {
     this.config = validateConfig(config);
@@ -149,12 +172,19 @@ export class Lab {
     this.leadStats = new Map();
     this.spreads = new Map();
     this.recentSpreads = new Map(SYMBOLS.map((symbol) => [symbol, []]));
+    this.studyStats = new Map();
+    this.studyProbes = new Map();
+    this.lastStudy = new Map();
+    this.studyIntervalMs = Math.max(2000, Math.min(10000, config.simulation.cooldownMs));
     this.counts = { books: 0, candidates: 0, invalidated: 0, rejected: {} };
     this.results = new Map(config.simulation.latencyScenarios.map((s) => [s.name, summaries()]));
   }
   setMarkets(markets) { this.markets = new Map(markets.map((m) => [pairKey(m.venue, m.symbol), m])); }
   reject(reason) { this.counts.rejected[reason] = (this.counts.rejected[reason] || 0) + 1; }
   invalidate(venue, symbol, reason) {
+    if (venue !== 'binance') for (const probe of [...this.studyProbes.values()]) {
+      if ((!symbol || probe.symbol === symbol) && probe.legs.some((leg) => leg.venue === venue)) this.endStudy(probe, null, 'invalidated');
+    }
     for (const s of symbol ? [symbol] : SYMBOLS) {
       this.books.delete(pairKey(venue, s));
       this.history.delete(pairKey(venue, s));
@@ -209,6 +239,7 @@ export class Lab {
       if (points.length > 600) points.shift();
     }
     this.emit({ type: 'spread', symbol, at: wall, mono: now, entropyMid: mid(a), lighterMid: mid(b), midBasisBps: spread, takerEdgeBps: d.edgeBps, buy: d.buy.venue, sell: d.sell.venue, sourceTimeErrors, observation: 'receive_time_only_not_source_freshness_proof', settlementEquivalence: 'requires_verification' });
+    this.sampleStudy(symbol, a, b, now, wall);
     const s = this.config.simulation;
     if (!s.enabled || !s.verifiedSymbols.includes(symbol)) { this.reject('paper_disabled_or_contract_unverified'); return; }
     if (sourceTimeErrors.some((e) => e.error)) { this.reject('paper_source_time_unverified'); return; }
@@ -233,6 +264,7 @@ export class Lab {
     }
   }
   advance(now, wall, incoming = null) {
+    this.advanceStudies(now, wall, incoming);
     const s = this.config.simulation;
     for (const t of this.tasks.values()) {
       for (const leg of t.legs) {
@@ -267,6 +299,83 @@ export class Lab {
         for (const leg of t.legs) if (leg.state === 'open') { leg.state = 'closing'; leg.due = now + t.scenario[`${leg.venue}Ms`]; }
       }
       if (t.phase === 'exit' && t.legs.every((l) => ['closed', 'rejected', 'unresolved'].includes(l.state))) this.finish(t, now, wall);
+    }
+  }
+  studyMetric(symbol, buy, sell, scenario) {
+    const id = `${symbol}:${scenario ? `latency:${scenario.name}` : 'raw'}:${buy}:${sell}`;
+    if (!this.studyStats.has(id)) this.studyStats.set(id, { symbol, buy, sell, scenario: scenario ? { ...scenario } : null,
+      attempts: 0, completed: 0, failed: 0, costed: 0, passedAfterCosts: 0, sumSurplusBps: 0, minSurplusBps: null,
+      spanMs: 0, firstAt: null, lastAt: null, latest: null, failureReasons: {}, firstMono: null,
+      qualitySpanMs: 0, qualityFirstAt: null, qualityLastAt: null, qualityFirstMono: null, uncertainSourceSamples: 0 });
+    return this.studyStats.get(id);
+  }
+  attemptStudy(metric, now, wall) {
+    metric.attempts++;
+    metric.firstAt ??= wall; metric.firstMono ??= now;
+    metric.lastAt = wall; metric.spanMs = Math.max(0, now - metric.firstMono);
+  }
+  recordStudy(metric, evaluation, reason, now = performance.now()) {
+    if (reason) { metric.failed++; metric.failureReasons[reason] = (metric.failureReasons[reason] || 0) + 1; return; }
+    metric.completed++; metric.latest = evaluation;
+    if (evaluation.sourceTimeUncertain) metric.uncertainSourceSamples++;
+    if (evaluation.surplusBeforeRebateBps !== null && !evaluation.sourceTimeUncertain) {
+      metric.qualityFirstAt ??= evaluation.at; metric.qualityFirstMono ??= now;
+      metric.qualityLastAt = evaluation.at; metric.qualitySpanMs = Math.max(0, now - metric.qualityFirstMono);
+      metric.costed++; metric.sumSurplusBps += evaluation.surplusBeforeRebateBps;
+      metric.minSurplusBps = metric.minSurplusBps === null ? evaluation.surplusBeforeRebateBps : Math.min(metric.minSurplusBps, evaluation.surplusBeforeRebateBps);
+      if (evaluation.gatePassed) metric.passedAfterCosts++;
+    }
+  }
+  sampleStudy(symbol, entropy, lighter, now, wall) {
+    if (now - (this.lastStudy.get(symbol) ?? -Infinity) < this.studyIntervalMs) return;
+    this.lastStudy.set(symbol, now);
+    const markets = ['entropy', 'lighter'].map((v) => this.markets.get(pairKey(v, symbol)));
+    const validMarket = markets.every((m) => m && m.status === 'active' && Number.isInteger(m.sizeDecimals) && bounded(m.sizeDecimals, 0, 10)
+      && Number(m.multiplier) === 1 && positive(Number(m.minQuoteAmount)) && bounded(Number(m.minBaseAmount), 0, 1e10));
+    const decimals = validMarket ? Math.min(...markets.map((m) => m.sizeDecimals)) : 0;
+    const quantity = validMarket ? Math.floor(this.config.simulation.notionalPerLeg / Math.max(mid(entropy), mid(lighter)) * 10 ** decimals) / 10 ** decimals : 0;
+    for (const [buyBook, sellBook] of [[entropy, lighter], [lighter, entropy]]) {
+      const buy = sweep(buyBook, 'buy', quantity, this.config.simulation.slippageBpsPerFill);
+      const sell = sweep(sellBook, 'sell', quantity, this.config.simulation.slippageBpsPerFill);
+      const reason = !validMarket ? 'metadata_unavailable' : !buy || !sell ? 'insufficient_depth'
+        : markets.some((m) => quantity < Number(m.minBaseAmount) || Math.min(buy.cash, sell.cash) < Number(m.minQuoteAmount)) ? 'minimum_order_size' : null;
+      const metric = this.studyMetric(symbol, buyBook.venue, sellBook.venue, null);
+      this.attemptStudy(metric, now, wall);
+      const evaluation = reason ? null : studyEvaluation({ buy: { ...buy, venue: buyBook.venue }, sell: { ...sell, venue: sellBook.venue }, config: this.config, at: wall,
+        sourceTimeUncertain: [buyBook, sellBook].some((b) => b.sourceAt === null || Boolean(validateBook(b, now, wall, this.config))) });
+      this.recordStudy(metric, evaluation, reason, now);
+      for (const scenario of this.config.simulation.latencyScenarios) {
+        const key = `${scenario.name}:${symbol}:${buyBook.venue}:${sellBook.venue}`;
+        if (this.studyProbes.has(key)) continue;
+        const delayed = this.studyMetric(symbol, buyBook.venue, sellBook.venue, scenario);
+        this.attemptStudy(delayed, now, wall);
+        if (reason) { this.recordStudy(delayed, null, reason, now); continue; }
+        this.studyProbes.set(key, { key, symbol, quantity, metric: delayed, signalAt: wall,
+          legs: [{ venue: buyBook.venue, side: 'buy', due: now + scenario[`${buyBook.venue}Ms`], fill: null },
+            { venue: sellBook.venue, side: 'sell', due: now + scenario[`${sellBook.venue}Ms`], fill: null }] });
+      }
+    }
+  }
+  endStudy(probe, evaluation, reason, now = performance.now()) {
+    this.recordStudy(probe.metric, evaluation, reason, now);
+    this.studyProbes.delete(probe.key);
+    this.emit({ type: 'delay_study', symbol: probe.symbol, buy: probe.metric.buy, sell: probe.metric.sell,
+      scenario: probe.metric.scenario, signalAt: probe.signalAt, evaluation, failure: reason || null,
+      assumption: 'alternative_post_arrival_entry_probes_not_roundtrip_profit_or_executable_volume' });
+  }
+  advanceStudies(now, wall, incoming) {
+    for (const probe of [...this.studyProbes.values()]) {
+      if (probe.legs.some((leg) => !leg.fill && now > leg.due + this.config.simulation.fillWaitMs)) { this.endStudy(probe, null, 'timeout'); continue; }
+      if (!incoming || incoming.symbol !== probe.symbol) continue;
+      const leg = probe.legs.find((l) => l.venue === incoming.venue && !l.fill && now >= l.due);
+      if (!leg) continue;
+      const fill = sweep(incoming, leg.side, probe.quantity, this.config.simulation.slippageBpsPerFill);
+      if (!fill) { this.endStudy(probe, null, 'insufficient_depth'); continue; }
+      const market = this.markets.get(pairKey(incoming.venue, probe.symbol));
+      if (!market || fill.cash < Number(market.minQuoteAmount) || probe.quantity < Number(market.minBaseAmount)) { this.endStudy(probe, null, 'minimum_order_size'); continue; }
+      leg.fill = { ...fill, venue: incoming.venue, sourceTimeUncertain: incoming.sourceAt === null || Boolean(validateBook(incoming, now, wall, this.config)) };
+      if (probe.legs.every((l) => l.fill)) this.endStudy(probe, studyEvaluation({ buy: probe.legs[0].fill, sell: probe.legs[1].fill, config: this.config, at: wall,
+        sourceTimeUncertain: probe.legs.some((l) => l.fill.sourceTimeUncertain) }), null, now);
     }
   }
   finish(t, now, wall) {
@@ -326,10 +435,18 @@ export class Lab {
       for (const lagMs of [100, 300, 500, 1000, 2000]) this.leadPending.push({ symbol: b.symbol, venue, lagMs, start: mid(follower), direction: Math.sign(moveBps), moveBps, created: b.receivedMono, due: b.receivedMono + lagMs });
     }
   }
-  report() {
+  report(now = performance.now(), wall = Date.now()) {
     return {
+      observedAt: wall,
+      observation: { asOf: wall, silenceAfterMs: 10000 },
       counts: this.counts,
-      latestQuotes: [...this.books.values()].map((b) => ({ venue: b.venue, symbol: b.symbol, nativeSymbol: b.nativeSymbol, bid: b.bids[0][0], ask: b.asks[0][0], receivedAt: b.receivedAt, sourceAt: b.sourceAt, sourceClockUncertain: b.sourceAt === null || b.receivedAt - b.sourceAt < -100 || b.receivedAt - b.sourceAt > this.config.maxSourceAgeMs })),
+      latestQuotes: [...this.books.values()].map((b) => ({ venue: b.venue, symbol: b.symbol, nativeSymbol: b.nativeSymbol, bid: b.bids[0][0], ask: b.asks[0][0], receivedAt: b.receivedAt, sourceAt: b.sourceAt,
+        receiveAgeMs: now >= b.receivedMono ? now - b.receivedMono : null, executionQuality: b.sourceAt === null ? 'missing_source_time' : validateBook(b, now, wall, this.config),
+        sourceClockUncertain: b.sourceAt === null || b.receivedAt - b.sourceAt < -100 || b.receivedAt - b.sourceAt > this.config.maxSourceAgeMs })),
+      opportunityStudy: { sampleIntervalMs: this.studyIntervalMs, bySymbol: Object.fromEntries(SYMBOLS.map((symbol) => [symbol, {
+        raw: Object.fromEntries([...this.studyStats.values()].filter((m) => m.symbol === symbol && !m.scenario).map(({ firstMono, qualityFirstMono, symbol: ignoredSymbol, ...m }) => [`${m.buy}:${m.sell}`, m])),
+        latency: Object.fromEntries([...this.studyStats.values()].filter((m) => m.symbol === symbol && m.scenario).map(({ firstMono, qualityFirstMono, symbol: ignoredSymbol, ...m }) => [`${m.scenario.name}:${m.buy}:${m.sell}`, m])),
+      }])) },
       recentSpreads: Object.fromEntries(this.recentSpreads),
       basis: Object.fromEntries([...this.spreads].map(([symbol, s]) => [symbol, { samples: s.count, meanBps: s.sum / s.count, minBps: s.min, maxBps: s.max }])),
       leaderMarkouts: Object.fromEntries([...this.leadStats].map(([key, s]) => [key, { samples: s.count, directionHitRate: s.directionHits / s.count, meanSignedMoveBps: s.sumSignedMoveBps / s.count }])),

@@ -44,8 +44,71 @@ export interface LabQuote {
   receivedAt: LabTime;
   sourceAt: LabTime | null;
   sourceClockUncertain: boolean;
+  receiveAgeMs?: number | null;
+  executionQuality?: string | null;
+}
+export interface LabEvaluation {
+  at: number;
+  quantity: number;
+  buyPrice: number;
+  sellPrice: number;
+  buyNotional: number;
+  sellNotional: number;
+  grossCash: number;
+  grossBps: number;
+  costs: { feesRoundTripCash: number | null; exitSlippageReserveCash: number; fundingReserveCash: number; totalReserveCash: number | null };
+  surplusBeforeRebateCash: number | null;
+  surplusBeforeRebateBps: number | null;
+  gatePassed: boolean;
+  sourceTimeUncertain: boolean;
+}
+export interface LabInsightMetrics {
+  name?: string;
+  buy: string;
+  sell: string;
+  scenario: { name: string; entropyMs: number; lighterMs: number } | null;
+  attempts: number;
+  completed: number;
+  failed: number;
+  costed: number;
+  passedAfterCosts: number;
+  spanMs: number;
+  qualitySpanMs?: number;
+  qualityFirstAt?: number | null;
+  qualityLastAt?: number | null;
+  latest: LabEvaluation | null;
+  completionRate?: number | null;
+  passRate?: number | null;
+  meanSurplusBps?: number | null;
+  sampleReady?: boolean;
+}
+export interface LabSymbolInsight {
+  status: 'paper_candidate' | 'no_edge' | 'latency_erases_edge' | 'insufficient_samples' | 'unknown_costs' | 'verify_equivalence' | 'waiting' | 'stale' | 'stopped' | 'blocked';
+  title: string;
+  reason: string;
+  direction: { buy: string; sell: string } | null;
+  raw: LabEvaluation | null;
+  rawMetrics: LabInsightMetrics | null;
+  delayed: LabInsightMetrics[];
+  bestDelayed: LabInsightMetrics | null;
+  notional: { buyCash: number | null; sellCash: number | null; approxRoundTripTurnoverCash: number | null };
+  blockers: string[];
+  nextSteps: string[];
+  caveat: string;
+}
+export interface LabInsights {
+  asOf: number | null;
+  reportAgeMs: number | null;
+  reportCurrent: boolean;
+  evidenceMaxAgeMs: number;
+  summary: { status: string; title: string; reason: string };
+  bySymbol: Partial<Record<LabSymbol, LabSymbolInsight>>;
+  leader: { status: string; title: string; reason: string; samples: number; nextSteps: string[] };
+  paper: { scope: 'all_symbols'; unresolved: boolean; openTasks: number };
 }
 export interface LabReport {
+  observedAt?: number;
+  observation?: { asOf: number; silenceAfterMs: number };
   sessionConfig?: LabConfig;
   configHash?: string;
   session: string;
@@ -87,6 +150,9 @@ export interface LabSnapshot {
   error: string | null;
   heartbeatAt: string | null;
   stale: boolean;
+  serverNow?: number;
+  reportAgeMs?: number | null;
+  insights?: LabInsights;
   config: LabConfig;
   report: LabReport | null;
 }

@@ -4,11 +4,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicJson, validateConfig } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
+import { buildResearchInsights } from './entropy-lighter-insights.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const tool = path.join(root, 'tools/entropy-lighter-lab');
 const defaults = JSON.parse(readFileSync(path.join(tool, 'config.example.json'), 'utf8'));
-const REPORT_KEYS = ['schema', 'session', 'mode', 'startedAt', 'heartbeatAt', 'configHash', 'sessionConfig', 'paperSuspendedReason', 'counts', 'basis', 'leaderMarkouts', 'paper', 'openPaperTasks', 'assumptions', 'diagnostics', 'eventLoopDelayMs', 'stopped', 'latestQuotes', 'recentSpreads'];
+const REPORT_KEYS = ['schema', 'session', 'mode', 'startedAt', 'heartbeatAt', 'observedAt', 'observation', 'opportunityStudy', 'configHash', 'sessionConfig', 'paperSuspendedReason', 'counts', 'basis', 'leaderMarkouts', 'paper', 'openPaperTasks', 'assumptions', 'diagnostics', 'eventLoopDelayMs', 'stopped', 'latestQuotes', 'recentSpreads'];
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;
@@ -65,8 +66,14 @@ export function createEntropyLighterResearch({ dataDir, enabledByDefault = false
         matched = Number.isFinite(age) && age >= -5000 && age <= 15000 && status.session === projection?.session;
       }
     } catch { readFailure ||= '研究状态暂时无法读取'; }
+    const serverNow = now();
+    const reportAt = projection?.observedAt ?? Date.parse(projection?.heartbeatAt || '');
+    const elapsed = serverNow - reportAt;
+    const reportAgeMs = Number.isFinite(elapsed) && elapsed >= -100 ? Math.max(0, elapsed) : null;
+    const stale = !matched || reportAgeMs === null || reportAgeMs > 15000;
     return { schema: 1, enabled, state: child ? matched ? 'running' : 'starting' : failure && !retryTimer ? 'fault' : enabled ? 'starting' : 'stopped',
-      error: failure || readFailure, heartbeatAt, stale: !matched, config: structuredClone(config), report: projection };
+      error: failure || readFailure, heartbeatAt, serverNow, reportAgeMs, stale, config: structuredClone(config), report: projection,
+      insights: buildResearchInsights({ report: projection, serverNow, running: Boolean(child && enabled && !closed), reportCurrent: !stale && projection?.stopped !== true }) };
   }
   function startChild() {
     if (closed || !enabled || child) return;
