@@ -22,6 +22,8 @@ test('service and recovery entries start through a symlinked release path', { sk
   const cases = [
     { entry: 'server/runtime/main.mjs', env: { DATA_DIR: notDirectory }, output: '运行时启动失败' },
     { entry: 'server/api/main.mjs', env: { DATA_DIR: dir }, output: '运行时尚未初始化数据目录' },
+    { entry: 'server/entry/main.mjs', env: {}, output: '稳定入口需要绝对路径' },
+    { entry: 'server/entry/probe.mjs', env: {}, output: '--dir 须为绝对路径' },
     { entry: 'server/launcher.mjs', env: { PORT: '0' }, output: '工作台配置无效' },
     { entry: 'server/recovery/cli.mjs', env: {}, output: 'RECOVERY_' },
   ];

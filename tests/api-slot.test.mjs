@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
-import { execFileSync, fork } from 'node:child_process';
+import { execFile, execFileSync, fork } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -12,6 +12,7 @@ import { slotOptions, startApi } from '../server/api/main.mjs';
 import { unavailableUpdateState } from '../server/updates.mjs';
 import { openHubDatabase, seedComplete, seedProjects } from '../server/control/schema.mjs';
 import { createControlStore } from '../server/control/store.mjs';
+import { probeSlot } from '../server/entry/probe.mjs';
 import { acceptProxyHeader, clientAddress, encodeProxyHeader, localPortOf, parseProxyLine, readSlotRecord, recordNames, slotSockets } from '../server/slot-protocol.mjs';
 
 // The API side of the dual-slot units (design doc api-dual-slot 3.2–3.4): the
@@ -300,4 +301,43 @@ test('a slot refuses an open directory or a socket in use, replaces a stale one,
   assert.equal((await control(sockets.ctl, 'GET', '/identity')).data.mode, 'candidate');
   assert.equal((await control(sockets.ctl, 'POST', '/promote')).status, 503);
   assert.equal(existsSync(sockets.http) && statSync(sockets.http).isFile(), true, 'the file was not removed');
+});
+
+test('the directed probe passes a slot only with its identity, release files and read-only answers', { skip, timeout: 90_000 }, async t => {
+  const { dataDir, env } = await runtimeFixture(t);
+  const record = path.join(dataDir, '.api-slot'), slots = {}, releases = {};
+  for (const name of ['a', 'b']) {
+    releases[name] = path.join(dataDir, `release-${name}`);
+    mkdirSync(path.join(releases[name], 'dist', 'assets'), { recursive: true });
+    writeFileSync(path.join(releases[name], 'dist', 'index.html'), `<!doctype html><script type="module" src="/assets/app-${name}.js"></script>`);
+    writeFileSync(path.join(releases[name], 'dist', 'assets', `app-${name}.js`), `export const slot = '${name}';`);
+    const dir = path.join(dataDir, `slot-${name}`); mkdirSync(dir, { mode: 0o700 });
+    slots[name] = { slot: name, dir, record, release: realpathSync(releases[name]) };
+  }
+  const start = name => startApi({ dataDir, logger: quiet, env, distDir: path.join(releases[name], 'dist'), slot: slots[name], updatesClient: { status: async () => unavailableUpdateState() } });
+  writeFileSync(record, JSON.stringify({ slot: 'a', release: releases.a }));
+  const a = await start('a'); t.after(() => a.close());
+  const b = await start('b'); t.after(() => b.close());
+  const probe = (name, options = {}) => probeSlot({ dir: slots[name].dir, slot: name, release: releases[name], port: 3100, pid: process.pid, mode: name === 'a' ? 'serving' : 'candidate', ...options });
+
+  const serving = await probe('a');
+  assert.deepEqual(serving.failures, []);
+  assert.equal(serving.identity.mode, 'serving');
+  assert.deepEqual((await probe('b')).failures, []);
+  // Each mismatch is reported, not only the first.
+  assert.deepEqual((await probe('b', { mode: 'serving', pid: 1 })).failures, ['槽模式为 candidate，预期 serving', `槽进程为 ${process.pid}，单元 MainPID 为 1`]);
+  const other = await probe('a', { release: releases.b });
+  assert.ok(other.failures.some(item => item.startsWith('槽版本为')), other.failures.join('\n'));
+  assert.ok(other.failures.includes('GET / 返回的不是目标版本的 index.html'), other.failures.join('\n'));
+  assert.deepEqual((await probe('a', { slot: 'b' })).failures, ['槽名为 a，预期 b']);
+
+  // The command the installer runs: JSON on stdout, the exit code says whether it passed.
+  // Asynchronous: the slots it probes answer from this process.
+  const cli = fileURLToPath(new URL('../server/entry/probe.mjs', import.meta.url));
+  const run = args => new Promise(resolve => execFile(process.execPath, [cli, ...args], { encoding: 'utf8', timeout: 30_000 }, (error, stdout) => resolve({ code: error ? error.code : 0, result: JSON.parse(stdout) })));
+  const passed = await run(['--dir', slots.b.dir, '--slot', 'b', '--release', releases.b, '--port', '3100']);
+  assert.deepEqual(passed, { code: 0, result: { ok: true, failures: [], instanceId: (await probe('b')).identity.instanceId } });
+  const refused = await run(['--dir', 'relative', '--slot', 'c', '--port', '0']);
+  assert.equal(refused.code, 1);
+  assert.deepEqual(refused.result.failures, ['--dir 须为绝对路径', '--slot 须为 a 或 b', '缺少 --release', '--port 须为 1 至 65535']);
 });

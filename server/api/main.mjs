@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -18,7 +18,7 @@ import { createRuntimeConnection } from '../runtime/connection.mjs';
 import { createSocketClient } from '../runtime/supervisor-client.mjs';
 import { createSocketDataClient } from '../runtime/data-client.mjs';
 import { runtimeDir } from '../runtime/protocol.mjs';
-import { SLOT_PROTOCOL, SLOTS, acceptProxyHeader, readSlotRecord, recordNames, slotSockets } from '../slot-protocol.mjs';
+import { SLOT_PROTOCOL, SLOTS, acceptProxyHeader, assertPrivateDirectory, listenPrivate, readSlotRecord, recordNames, removeStale, slotSockets } from '../slot-protocol.mjs';
 import { HttpError, send } from '../http-common.mjs';
 import { createApiServer, resolveLoginLimits, supervisorTransports } from './server.mjs';
 
@@ -39,29 +39,6 @@ export function slotOptions(env, release = realpathSync(root)) {
   return { slot, dir, record, release };
 }
 
-// The slot's socket directory is the unit's RuntimeDirectory: this user's and
-// closed to everyone else, which is what keeps the private sockets private.
-function assertPrivateDirectory(dir) {
-  const stat = lstatSync(dir);
-  if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error(`API 槽目录须为本用户所有且权限为 0700：${dir}`);
-}
-// Removes a socket a killed process left; one that still answers is in use,
-// and anything that is not a socket stays and makes listen() fail.
-async function removeStale(file) {
-  try { if (!lstatSync(file).isSocket()) return; } catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  const live = await new Promise(resolve => {
-    const socket = net.connect(file);
-    socket.once('connect', () => { socket.destroy(); resolve(true); });
-    socket.once('error', error => resolve(error.code === 'ENOENT' ? null : error.code !== 'ECONNREFUSED'));
-  });
-  if (live) throw Object.assign(new Error(`API 槽 socket 正被另一个进程使用：${file}`), { code: 'EADDRINUSE' });
-  if (live === false) try { unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-}
-async function listenPrivate(server, file) {
-  await removeStale(file);
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(file, () => { server.off('error', reject); resolve(); }); });
-  chmodSync(file, 0o600);
-}
 const closeListener = server => server.listening ? new Promise(resolve => { server.close(() => resolve()); server.closeAllConnections?.(); }) : null;
 
 // The API process (design doc 3.1): sessions, the update coordinator, project

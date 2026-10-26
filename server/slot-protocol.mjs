@@ -1,4 +1,5 @@
-import { readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, lstatSync, readFileSync, realpathSync, unlinkSync } from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 
@@ -13,6 +14,11 @@ export const SLOTS = ['a', 'b'];
 // traffic, only while serving; ctl.sock: identity and promotion. Traffic never
 // reaches the control socket.
 export const slotSockets = dir => ({ probe: path.join(dir, 'probe.sock'), http: path.join(dir, 'http.sock'), ctl: path.join(dir, 'ctl.sock') });
+
+// The units' runtime directories under one root (/run): each slot's sockets,
+// and the entry's own control socket.
+export const slotDirectory = (root, slot) => path.join(root, `project-aggregation-api-${slot}`);
+export const entrySockets = dir => ({ ctl: path.join(dir, 'ctl.sock') });
 
 // PROXY protocol v1 (haproxy): one line before the connection's own bytes.
 // 107 bytes, CRLF included, is the specification's maximum line length.
@@ -89,4 +95,43 @@ export function readSlotRecord(file) {
 export function recordNames(record, { slot, release }) {
   if (!record || record.slot !== slot) return false;
   try { return realpathSync(record.release) === release; } catch { return false; }
+}
+
+// A slot's or the entry's socket directory is its unit's RuntimeDirectory:
+// this user's and closed to everyone else, which keeps the sockets private.
+export function assertPrivateDirectory(dir) {
+  const stat = lstatSync(dir);
+  if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error(`私有 socket 目录须为本用户所有且权限为 0700：${dir}`);
+}
+// Removes a socket a killed process left; one that still answers is in use,
+// and anything that is not a socket stays and makes listen() fail.
+export async function removeStale(file) {
+  try { if (!lstatSync(file).isSocket()) return; } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  const live = await new Promise(resolve => {
+    const socket = net.connect(file);
+    socket.once('connect', () => { socket.destroy(); resolve(true); });
+    socket.once('error', error => resolve(error.code === 'ENOENT' ? null : error.code !== 'ECONNREFUSED'));
+  });
+  if (live) throw Object.assign(new Error(`私有 socket 正被另一个进程使用：${file}`), { code: 'EADDRINUSE' });
+  if (live === false) try { unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+export async function listenPrivate(server, file) {
+  await removeStale(file);
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(file, () => { server.off('error', reject); resolve(); }); });
+  chmodSync(file, 0o600);
+}
+
+// One JSON request on a control socket (a slot's or the entry's), which
+// carries no PROXY line. Rejects on a connection error, a timeout or a reply
+// that is not JSON; the reply's status is the caller's to judge.
+export function controlRequest(file, method, route, { body, timeoutMs = 2000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const encoded = body === undefined ? undefined : JSON.stringify(body);
+    const req = http.request({ socketPath: file, method, path: route, agent: false, timeout: timeoutMs, headers: encoded ? { 'Content-Type': 'application/json' } : {} }, res => {
+      const chunks = []; res.on('data', chunk => chunks.push(chunk)); res.on('error', reject);
+      res.on('end', () => { try { resolve({ status: res.statusCode, data: JSON.parse(Buffer.concat(chunks).toString()) }); } catch { reject(new Error(`控制接口的应答不是 JSON：${file}`)); } });
+    });
+    req.on('timeout', () => req.destroy(Object.assign(new Error(`控制接口超时：${file}`), { code: 'ETIMEDOUT' })));
+    req.on('error', reject); req.end(encoded);
+  });
 }

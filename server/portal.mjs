@@ -14,6 +14,8 @@ export const HUB_HOST = 'hub.localhost';
 export const PORTAL_COOKIE = 'hub_portal';
 const token = () => randomBytes(32).toString('base64url');
 const digest = value => createHash('sha256').update(value).digest('hex');
+// The host a project's pages are served on; the installer's probe uses it too.
+export const portalHost = id => `p-${digest(String(id)).slice(0, 24)}.${HUB_HOST}`;
 const reservedCookie = name => /^(?:__Host-|__Secure-)?hub_(?:session|portal)$/i.test(name);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
@@ -91,7 +93,6 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
   // draining: the API is closing; upgraded connections and event streams end, other requests finish.
   let closed = false, draining = false;
-  const projectHost = id => `p-${digest(String(id)).slice(0, 24)}.${HUB_HOST}`;
 
   function requestContext(req) {
     const raw = req.headers.host;
@@ -165,7 +166,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     prune();
     const raw = token(); const expires = now() + ticketTtlMs;
     if (!store.issueTicket(digest(raw), { projectId, sessionId, revision, destination, expires }, now(), 300, authGrants.size)) throw new PortalError(429, '项目访问会话过多，请关闭不用的会话后重试');
-    const projectOrigin = `${context.secure ? 'https' : 'http'}://${projectHost(projectId)}${context.suffix}`;
+    const projectOrigin = `${context.secure ? 'https' : 'http'}://${portalHost(projectId)}${context.suffix}`;
     return { url: `${projectOrigin}/__hub/authorize?ticket=${raw}`, expiresAt: new Date(expires).toISOString(), projectOrigin };
   }
 
@@ -448,7 +449,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       if (closed) throw new PortalError(503, '项目代理已关闭');
       context = requestContext(req);
       if ([HUB_HOST, 'localhost', '127.0.0.1'].includes(context.hostname)) return false;
-      const project = getProjects().find(item => projectHost(item.id) === context.hostname);
+      const project = getProjects().find(item => portalHost(item.id) === context.hostname);
       if (!project) throw new PortalError(421, '未知的项目入口');
       checkedPath(req.url);
       const url = new URL(req.url, context.origin);
@@ -492,7 +493,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       if (!isServing()) throw new PortalError(503, CANDIDATE);
       const context = requestContext(req);
       if ([HUB_HOST, 'localhost', '127.0.0.1'].includes(context.hostname)) return false;
-      const project = getProjects().find(item => projectHost(item.id) === context.hostname);
+      const project = getProjects().find(item => portalHost(item.id) === context.hostname);
       if (!project) throw new PortalError(421, '未知项目入口');
       if (req.method !== 'GET' || String(req.headers.upgrade).toLowerCase() !== 'websocket') throw new PortalError(400, '不支持的连接升级');
       checkedPath(req.url); browserBoundary(req, context, { websocket: true });
@@ -526,5 +527,5 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   }
 
   function drain() { draining = true; for (const stream of active) if (stream.long) { stream.destroy(); active.delete(stream); } }
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }
