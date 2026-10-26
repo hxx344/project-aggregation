@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `f3ea48d` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3.1、9.1、11 节与第 15 节的 M4；[控制面与数据面分离](control-data-plane-separation.md)（M3，已全部发布） |
 | 适用范围 | `server/api/`、`server/portal.mjs`、`server/control/`、`server/static-response.mjs`、`server/recovery/`、`server/update-service/registry.py`、`deploy/install.sh` 与相关测试 |
-| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；其余未实施。第 3、5.2、6 节保留原切流草案，须先按上位第 11 节修订并评审，不作为可直接实施的步骤 |
+| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；其余未实施。第 3、5.2、6 节保留原切流草案，须先按上位第 11 节修订并评审，不作为可直接实施的步骤 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 9 节 |
 
 文中 `路径:行号` 均指上述基线，实施时以符号名重新定位。
@@ -109,16 +109,16 @@ CREATE TABLE IF NOT EXISTS login_pending (id TEXT PRIMARY KEY, account TEXT NOT 
 ```sql
 CREATE TABLE IF NOT EXISTS portal_tickets (digest TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, destination TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS portal_grants (digest TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, expires INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS portal_tickets_expires ON portal_tickets(expires);
-CREATE INDEX IF NOT EXISTS portal_grants_expires ON portal_grants(expires);
+CREATE INDEX IF NOT EXISTS idx_portal_tickets_expires ON portal_tickets(expires);
+CREATE INDEX IF NOT EXISTS idx_portal_grants_expires ON portal_grants(expires);
 ```
 
 - 只保存 token 的 SHA-256 摘要，浏览器仍持有原始随机值；表中没有可直接使用的凭证。
 - ticket 消费用一个事务内的 `DELETE ... WHERE digest=? RETURNING ...`，两个槽同时消费同一 ticket 时只有一个拿到行。
-- grant 的有效性仍按现有 `liveGrant`（`server/portal.mjs:101-105`）判断：未过期、会话有效、项目存在且 revision 一致。会话和项目本来就在库里，登出、项目变更、凭据更换由此在两个槽同时生效。
-- 自动登录失败的撤销（`server/portal.mjs:193-197`）改为删除 grant 行。
+- grant 的有效性仍按 `validGrant`（原 `liveGrant` 的判断）进行：未过期、会话有效、项目存在且 revision 一致。会话和项目本来就在库里，登出、项目变更、凭据更换由此在两个槽同时生效。
+- 登出撤销改为删除 grant 行；库忙删不掉时，本进程立即拒绝该 grant，并在每秒清理中重试删除；重试成功前另一槽仍可能放行，若进程在此之前退出且退出时的重试也失败，该行留到过期（浏览器 cookie 已清除）。自动登录失败的撤销只涉及带认证材料的 grant，仍删进程内条目（见 4.4）。活动流复核读库出错时关闭该流（失败关闭）。
 - 300 个的上限改为按表计数，判断与插入在同一事务内。
-- 每秒的清理在各槽分别运行：活动流按库中状态复核，过期行每次至多删 500 行。
+- 每秒的清理在各槽分别运行，只读库：活动流与进程内 grant 按库中状态复核。删除过期或失效行每分钟一次（签发 ticket 前也会做一次），每表每次至多删 500 行；每分钟的删除与撤销重试都不等待写锁，库忙时推迟到下一轮，不影响正确性，因为每次使用都会自行检查过期与有效性。
 - 活动流集合 `active`、自动登录在途集合和资产同步合并 `syncFlights` 仍是进程内状态，它们只描述本进程持有的连接。
 
 ### 4.4 带上游认证材料的 grant
@@ -127,7 +127,7 @@ CREATE INDEX IF NOT EXISTS portal_grants_expires ON portal_grants(expires);
 
 ### 4.5 备份与恢复
 
-恢复时 `server/recovery/restore.mjs:105` 已清空 `sessions` 与三个 `login_*` 表，旧备份中没有的表跳过；M4-2 再将新增 `portal_tickets`、`portal_grants` 纳入清空集合。隔离恢复后登录计数从零开始；普通 API 重启、从已含 M4-1 的版本升级均保留库内风控记录，不能与恢复清理混为一谈。
+恢复时 `server/recovery/restore.mjs:105` 已清空 `sessions` 与三个 `login_*` 表，旧备份中没有的表跳过；M4-2 已将新增 `portal_tickets`、`portal_grants` 纳入清空集合。隔离恢复后登录计数从零开始；普通 API 重启、从已含 M4-1 的版本升级均保留库内风控记录，不能与恢复清理混为一谈。
 
 ## 5 M4-3：API 排空、就绪标记与静态资源
 
@@ -258,7 +258,7 @@ WantedBy=project-aggregation.service
 | M4-3b | 显式候选模式、固定槽身份、私有探针与就绪协议；切流方式先按第 3 节重新评审 | R3（部署激活） | 中 |
 | M4-4 | 模板单元与槽记录、安装器双槽切换与回滚、首次迁移与回退、更新服务登记、恢复入口、Ubuntu CI 连续请求验证 | R3（部署激活） | 大 |
 
-每个实现批次单独提交、单独审查并发布。M4-1 已合入；M4-2 和 M4-3a 可在单实例部署先行改善授权、关闭和旧分包加载。M4-3b 须先完成切流方案评审；M4-4 依赖 M4-1、M4-2、M4-3a/b 全部通过并发布，以及 M2a、M3 和 P2b 生产验收前置，不把尚未完成的草案当作可直接实施方案。
+每个实现批次单独提交、单独审查并发布。M4-1、M4-2 已合入；M4-3a 可在单实例部署先行改善授权、关闭和旧分包加载。M4-3b 须先完成切流方案评审；M4-4 依赖 M4-1、M4-2、M4-3a/b 全部通过并发布，以及 M2a、M3 和 P2b 生产验收前置，不把尚未完成的草案当作可直接实施方案。
 
 ## 10 关联资料
 

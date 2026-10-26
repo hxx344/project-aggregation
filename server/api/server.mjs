@@ -17,6 +17,7 @@ import { coordinatorHooks } from '../runtime/supervisor-client.mjs';
 import { MAX_PROJECTS } from '../control/schema.mjs';
 import { passwordMatches, resetPassword } from '../control/password.mjs';
 import { createLoginGuard } from '../control/login-guard.mjs';
+import { createPortalStore } from '../control/portal-store.mjs';
 import { HttpError, send, readJson, readJsonBody, errorResponder } from '../http-common.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -166,6 +167,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   }
   const notify = (id, change) => runtime.projectChanged(id, change).catch(error => retryNotice(id, change, 1, error));
   const portal = createPortal({
+    store: createPortalStore(control),
     ...(embeddedModules ? { withMutation: updates.withExecutionEntry } : {}),
     ...(resolveTransport ? { resolveTransport } : {}),
     getProjects: () => getProjects().filter(project => project.accessMode === 'proxy'),

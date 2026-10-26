@@ -75,10 +75,14 @@ function framePolicy(value, hubOrigin) {
  * coordinateAssetSync({projectId, revision}): optional shared background Promise<{state, message}>.
  * Client cancellation never cancels that shared background promise.
  * createLaunch is called only by the authenticated, CSRF-protected hub API.
+ * store: server/control/portal-store.mjs; tickets and grants without upstream
+ * authentication live there, shared by every API instance. Grants carrying
+ * authentication material stay in this process (docs/api-dual-slot.md 4.4).
  */
-export function createPortal({ getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
-  if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function')) throw new Error('项目代理需要项目、版本和会话校验回调');
-  const tickets = new Map(); const grants = new Map(); const active = new Set(); const syncFlights = new Map();
+export function createPortal({ store, getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
+  if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function') || !store) throw new Error('项目代理需要授权存储以及项目、版本和会话校验回调');
+  // revoking: stored grants this process revoked whose row could not be deleted yet (busy database).
+  const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
   let closed = false;
   const projectHost = id => `p-${digest(String(id)).slice(0, 24)}.${HUB_HOST}`;
 
@@ -98,19 +102,45 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
 
   function projectFor(id) { return getProjects().find(project => project.id === id && project.enabled && project.apiUrl); }
 
-  function liveGrant(grant) {
-    if (closed || !grant || grant.revoked || grant.expires <= now() || !isSessionValid(grant.sessionId)) return false;
+  // A ticket or grant whose session, project and revision still hold; the same in every API instance.
+  function validGrant(grant) {
+    if (!grant || grant.revoked || grant.expires <= now() || !isSessionValid(grant.sessionId)) return false;
     const project = projectFor(grant.projectId);
     return !!project && getProjectRevision(project.id) === grant.revision;
   }
-
-  function prune() {
-    for (const [id, ticket] of tickets) if (ticket.expires <= now()) tickets.delete(id);
-    for (const [id, grant] of grants) if (!liveGrant(grant)) grants.delete(id);
-    for (const stream of active) if (!liveGrant(stream.grant)) { stream.destroy(); active.delete(stream); }
+  // A stored grant also has to be stored still: another instance may have revoked it.
+  function liveGrant(grant) {
+    if (closed || !validGrant(grant)) return false;
+    if (!grant.digest) return true;
+    if (grant.auth) return authGrants.get(grant.digest) === grant;
+    return !revoking.has(grant.digest) && !!store.grant(grant.digest);
   }
+  // Fails closed: a stream whose grant cannot be checked is closed.
+  const liveOrFailed = grant => { try { return liveGrant(grant); } catch { return false; } };
 
-  const sweep = setInterval(prune, 1000); sweep.unref();
+  // Drops what this process holds that is no longer live; reads the database, and writes
+  // only to retry revocations that could not be stored, without waiting on a busy database.
+  function sweepProcess() {
+    // An entry whose check fails stays; every request checks it again.
+    for (const [id, grant] of authGrants) { try { if (!liveGrant(grant)) authGrants.delete(id); } catch {} }
+    for (const stream of active) if (!liveOrFailed(stream.grant)) { stream.destroy(); active.delete(stream); }
+    if (revoking.size) { const digests = [...revoking]; store.withoutWaiting(() => store.revokeGrants(digests)); for (const digest of digests) revoking.delete(digest); }
+  }
+  // Deletes stored rows that expired or lost their session, project or revision.
+  function pruneStored() {
+    store.prune(now());
+    store.revokeGrants(store.grants().filter(grant => !validGrant(grant)).map(grant => grant.digest));
+  }
+  function prune() { pruneStored(); sweepProcess(); }
+
+  // Stored rows are deleted once a minute, without waiting on a busy database. Every use checks
+  // expiry and validity itself, so a busy database (another instance writing) only defers the
+  // deletion to a later tick.
+  let ticks = 0;
+  const sweep = setInterval(() => {
+    if (++ticks % 60 === 0) try { store.withoutWaiting(pruneStored); } catch {}
+    try { sweepProcess(); } catch {}
+  }, 1000); sweep.unref();
 
   function createLaunch({ projectId, sessionId, req }) {
     if (closed) throw new PortalError(503, '项目代理已关闭');
@@ -125,9 +155,8 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     let destination = '/';
     if (project.url) { const page = new URL(validateUrl(project.url)); destination = checkedPath(page.pathname + page.search) + page.hash; }
     prune();
-    if (tickets.size >= 300 || grants.size >= 300) throw new PortalError(429, '项目访问会话过多，请关闭不用的会话后重试');
     const raw = token(); const expires = now() + ticketTtlMs;
-    tickets.set(digest(raw), { projectId, sessionId, revision, destination, expires });
+    if (!store.issueTicket(digest(raw), { projectId, sessionId, revision, destination, expires }, now(), 300, authGrants.size)) throw new PortalError(429, '项目访问会话过多，请关闭不用的会话后重试');
     const projectOrigin = `${context.secure ? 'https' : 'http'}://${projectHost(projectId)}${context.suffix}`;
     return { url: `${projectOrigin}/__hub/authorize?ticket=${raw}`, expiresAt: new Date(expires).toISOString(), projectOrigin };
   }
@@ -149,7 +178,8 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     const matches = (req.headers.cookie || '').split(';').map(part => part.trim()).filter(part => part.startsWith(`${PORTAL_COOKIE}=`));
     if (matches.length !== 1) throw new PortalError(401, '请从工作台重新打开此项目');
     const raw = matches[0].slice(PORTAL_COOKIE.length + 1);
-    const grant = /^[A-Za-z0-9_-]{43}$/.test(raw) ? grants.get(digest(raw)) : null;
+    const key = /^[A-Za-z0-9_-]{43}$/.test(raw) ? digest(raw) : null;
+    const grant = key ? authGrants.get(key) || store.grant(key) : null;
     if (!grant || grant.projectId !== project.id || !liveGrant(grant)) throw new PortalError(401, '项目访问授权已失效，请从工作台重新打开');
     return grant;
   }
@@ -192,7 +222,9 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
 
   function revokeGrant(grant) {
     grant.revoked = true;
-    for (const [key, value] of grants) if (value === grant) grants.delete(key);
+    // Refused here at once; when the row cannot be deleted now, the sweep retries the deletion.
+    if (grant.auth) authGrants.delete(grant.digest);
+    else { revoking.add(grant.digest); try { store.revokeGrants([grant.digest]); revoking.delete(grant.digest); } catch {} }
     delete grant.auth;
   }
 
@@ -415,14 +447,15 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
         if (req.method !== 'GET') throw new PortalError(405, '授权入口仅支持页面访问');
         browserBoundary(req, context, { authorize: true });
         const raw = url.searchParams.get('ticket');
-        const ticket = raw && /^[A-Za-z0-9_-]{43}$/.test(raw) ? tickets.get(digest(raw)) : null;
-        if (!ticket || ticket.projectId !== project.id || !liveGrant(ticket)) throw new PortalError(401, '项目入口已过期，请从工作台重新打开');
-        tickets.delete(digest(raw));
+        const ticket = raw && /^[A-Za-z0-9_-]{43}$/.test(raw) ? store.takeTicket(digest(raw), project.id, now()) : null;
+        if (!ticket || !liveGrant(ticket)) throw new PortalError(401, '项目入口已过期，请从工作台重新打开');
         const auth = await authenticateGrant(req, res, ticket);
         if (!liveGrant(ticket) || req.aborted || req.socket.destroyed || res.destroyed) throw new PortalError(401, '项目入口已失效，请从工作台重新打开');
-        if (grants.size >= 300) throw new PortalError(429, '项目访问会话过多，请稍后重试');
-        const grantToken = token(); const grant = { ...ticket, ...(auth ? { auth } : {}), expires: Math.min(now() + grantTtlMs, now() + 12 * 3600000, auth?.cookie ? now() + auth.cookie.maxAge * 1000 : Infinity) };
-        grants.set(digest(grantToken), grant);
+        const grantToken = token(); const key = digest(grantToken);
+        const grant = { projectId: ticket.projectId, sessionId: ticket.sessionId, revision: ticket.revision, ...(auth ? { auth, digest: key } : {}), expires: Math.min(now() + grantTtlMs, now() + 12 * 3600000, auth?.cookie ? now() + auth.cookie.maxAge * 1000 : Infinity) };
+        const tooMany = new PortalError(429, '项目访问会话过多，请稍后重试');
+        if (auth) { if (store.liveGrants(now()) + authGrants.size >= 300) throw tooMany; authGrants.set(key, grant); }
+        else if (!store.issueGrant(key, grant, now(), 300, authGrants.size)) throw tooMany;
         res.writeHead(302, { Location: ticket.destination, 'Set-Cookie': `${PORTAL_COOKIE}=${grantToken}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.max(1, Math.floor((grant.expires - now()) / 1000))}${context.secure ? '; Secure' : ''}`, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': `default-src 'none'; frame-ancestors ${context.hubOrigin}` }); res.end(); return true;
       }
       if (url.pathname.startsWith('/__hub/')) throw new PortalError(404, '项目代理接口不存在');
@@ -478,5 +511,5 @@ export function createPortal({ getProjects, getProjectRevision, isSessionValid, 
     return true;
   }
 
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, close() { closed = true; clearInterval(sweep); tickets.clear(); grants.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }
