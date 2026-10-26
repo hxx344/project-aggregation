@@ -2591,11 +2591,15 @@ dual_installed() {
   [[ -f "$ENTRY_UNIT_FILE" && -f "$UNIT_FILE" ]] && grep -Eq "^Wants=(.*[[:space:]])?$ENTRY_SERVICE\.service([[:space:]]|\$)" "$UNIT_FILE"
 }
 # Stops each of the units given that systemd has loaded, in any active or
-# restarting state; a fresh install has none of them.
+# restarting state, and one still running after its unit file went; a fresh
+# install has none of them.
 stop_loaded() {
   local unit
   for unit in "$@"; do
-    if [[ $(systemctl show -p LoadState --value "$unit" 2>/dev/null) == loaded ]]; then systemctl stop "$unit"; fi
+    if [[ $(systemctl show -p LoadState --value "$unit" 2>/dev/null) == loaded ||
+          ! $(systemctl show -p ActiveState --value "$unit" 2>/dev/null) =~ ^(inactive|failed|)$ ]]; then
+      systemctl stop "$unit"
+    fi
   done
 }
 # dual or single for this activation (design doc 6.2). An update worker loaded
@@ -3191,8 +3195,8 @@ main() {
     if [[ -L "$APP_DIR/current" && "$(realpath -e "$APP_DIR/current")" != "$old_release" ]]; then
       old_release=$(realpath -e "$APP_DIR/current")
       [[ "$old_release" == "$APP_DIR/releases/"* && -f "$old_release/.managed-release" ]] || fail 'current 指向未知目录，停止更新。'
-      previous_release=$old_release
-      if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
+      # Resumed onto this run's release, the release it replaced stays previous.
+      if [[ "$old_release" != "$release" ]]; then previous_release=$old_release; fi
     fi
   fi
   activation_scope=$(activation_scope)

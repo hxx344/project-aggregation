@@ -273,6 +273,19 @@ class OperatorTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, error):
                             operations.deployment()
 
+    def test_single_layout_also_stops_dual_slot_units_left_installed(self):
+        with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+            entry, template = Path(directory) / 'entry.service', Path(directory) / 'template.service'
+            with patch.object(operations, 'dual_slots', return_value=False), patch.object(operations, 'ENTRY_UNIT_FILE', entry), \
+                    patch.object(operations, 'SLOT_UNIT_FILE', template):
+                self.assertEqual(operations.services(), operations.SERVICES)
+                entry.write_text('')
+                self.assertEqual(operations.services(), (*operations.SERVICES, operations.ENTRY_SERVICE))
+                template.write_text('')
+                self.assertEqual(operations.services(), (*operations.SERVICES, operations.ENTRY_SERVICE, *operations.SLOT_SERVICES))
+            with patch.object(operations, 'dual_slots', return_value=True):
+                self.assertEqual(operations.services(), operations.DUAL_SERVICES)
+
     def test_dual_slot_operation_stops_the_entry_and_both_slots(self):
         import argparse
         with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:

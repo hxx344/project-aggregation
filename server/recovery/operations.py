@@ -82,8 +82,12 @@ def dual_slots():
 
 
 def services():
-    """The units that hold writers of the data directory, the runtime first."""
-    return DUAL_SERVICES if dual_slots() else SERVICES
+    """The units that hold writers of the data directory, the runtime first. The
+    single layout also covers dual-slot units left installed: a hand start
+    could still run them."""
+    if dual_slots():
+        return DUAL_SERVICES
+    return (*SERVICES, *((ENTRY_SERVICE,) if ENTRY_UNIT_FILE.exists() else ()), *(SLOT_SERVICES if SLOT_UNIT_FILE.exists() else ()))
 
 
 def managed_unit(filename, entry, root='current'):

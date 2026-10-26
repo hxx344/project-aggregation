@@ -354,7 +354,7 @@ M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup
 ### 6.5 更新服务登记与恢复入口
 
 - `registry.py`：按 6.2 的判定为双槽时（结果字段 `layout` 为 `dual-slot`，否则为 `single`）核对运行时、入口（`WorkingDirectory=current`，运行 `server/entry/main.mjs`）与模板（`WorkingDirectory=$APP_DIR/slots/%i`，运行 `slots/%i/server/api/main.mjs`）三份单元及其 drop-in；guard 只允许出现在运行时与模板目录；部署身份纳入三份单元文本。`LAYOUTS` 声明支持的布局，供 6.2 判断。
-- `server/recovery/operations.py`：按 6.2 的判定为双槽时停服集合为运行时、入口、`@a`、`@b`，`deployment()` 核对入口与模板的服务用户与 Node 路径，`install_guard` 写运行时与模板 guard 并核对两个实例加载的 drop-in；恢复后只启动运行时。
+- `server/recovery/operations.py`：按 6.2 的判定为双槽时停服集合为运行时、入口、`@a`、`@b`；单槽时为运行时与 API，另加仍残留的入口与槽实例（手动启动仍可能运行）；`deployment()` 核对入口与模板的服务用户与 Node 路径，`install_guard` 写运行时与模板 guard 并核对两个实例加载的 drop-in；恢复后只启动运行时。
 
 ### 6.6 影响面与回滚
 
@@ -363,7 +363,7 @@ M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup
 | 影响 | `deploy/install.sh`（单元、布局判定、切换、整体更新、回滚、清理、健康检查）、`server/update-service/registry.py`、`server/recovery/operations.py`、CI 与测试；入口、槽与探针代码不变 |
 | 不影响 | 运行时、模块、采集与执行；单槽部署在暂缓启用时保持原路径 |
 | 回滚 | 代码层面还原本批次提交即可：已启用双槽的部署由新版本安装器的整体回滚或退回流程恢复单槽；由 M4 之前的安装器覆盖安装时，先执行 `sudo systemctl stop project-aggregation`，并删除入口与模板单元后 `daemon-reload`（见 3.8） |
-| 验收 | Ubuntu CI 真实 systemd（`deploy/test-slots-systemd.sh`，真实入口与 API 槽，运行时用测试替身与假模块）：首次启用、连续短连接与保活请求下的只改 API 切换（统计拒连、重置、HTTP 失败；保活连接上因服务端关闭空闲连接而失败的请求按浏览器做法重试一次并单独计数，其余非 200 均判失败）、候选失败不影响旧槽、提交后反向切换、中断切换的续作与停止、整体更新保持记录槽、整体停止时槽先于入口、退回单槽；mock 安装测试继续覆盖单槽路径与布局判定 |
+| 验收 | Ubuntu CI 真实 systemd（`deploy/test-slots-systemd.sh`，真实入口与 API 槽，运行时用测试替身与假模块）：首次启用、连续短连接与保活请求下的只改 API 切换（统计拒连、重置、HTTP 失败；保活连接上因服务端关闭空闲连接而失败的请求按浏览器做法重试一次并单独计数，其余非 200 均判失败）、候选失败不影响旧槽、提交后反向切换（含记录已移动而内存标志未置位）、中断切换的续作与停止、整体更新保持记录槽、整体停止时槽先于入口、退回单槽；mock 安装测试继续覆盖单槽路径与布局判定 |
 
 ## 7 兼容、迁移与回滚
 

@@ -18,7 +18,8 @@ AGG_INSTALL_SOURCE_ONLY=1 source "$repository/deploy/install.sh"
 # The entry finds the slots by the installed names (server/slot-protocol.mjs), so this test uses them.
 DATA_PATH=/var/lib/$SERVICE NODE_BIN=$node GREEKS_PYTHON_PATH=/usr/bin/python3 ASTER_PYTHON_PATH=/usr/bin/python3
 for target in "$APP_DIR" "$DATA_PATH" "$ENV_FILE" "$UNIT_FILE" "$API_UNIT_FILE" "$ENTRY_UNIT_FILE" "$SLOT_UNIT_FILE" \
-  "$UNIT_FILE.d" "$API_UNIT_FILE.d" "$ENTRY_UNIT_FILE.d" "$SLOT_UNIT_FILE.d" "/run/$SERVICE" "/run/$ENTRY_SERVICE"; do
+  "$UNIT_FILE.d" "$API_UNIT_FILE.d" "$ENTRY_UNIT_FILE.d" "$SLOT_UNIT_FILE.d" "${SLOT_UNIT_FILE%@.service}@a.service.d" \
+  "${SLOT_UNIT_FILE%@.service}@b.service.d" "/run/$SERVICE" "/run/$ENTRY_SERVICE"; do
   [[ ! -e "$target" && ! -L "$target" ]] || { echo "Refusing existing $target" >&2; exit 1; }
 done
 ! getent passwd "$SERVICE_USER" >/dev/null || { echo "Refusing an existing $SERVICE_USER account." >&2; exit 1; }
@@ -37,7 +38,7 @@ cleanup() {
     if [[ -f "$unit" ]] && grep -qx '# Managed by project-aggregation installer' "$unit"; then rm -f -- "$unit"; fi
   done
   rmdir -- "$ENTRY_UNIT_FILE.wants" 2>/dev/null || true
-  rm -rf -- "$UNIT_FILE.d" "$API_UNIT_FILE.d" "$ENTRY_UNIT_FILE.d" "$SLOT_UNIT_FILE.d"
+  rm -rf -- "$UNIT_FILE.d" "$API_UNIT_FILE.d" "$ENTRY_UNIT_FILE.d" "$SLOT_UNIT_FILE.d" "${SLOT_UNIT_FILE%@.service}@a.service.d" "${SLOT_UNIT_FILE%@.service}@b.service.d"
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE" "$ENTRY_SERVICE" "$API_SERVICE@a" "$API_SERVICE@b" "$API_SERVICE" >/dev/null 2>&1 || true
   rm -rf -- "$APP_DIR" "$DATA_PATH" "$ENV_FILE" "$work_dir"
@@ -218,6 +219,14 @@ api_cutover_rollback
 check_load 'switch a and its rollback'
 expect_state b "$release_two"
 [[ $(main_pid "$SERVICE") == "$runtime_pid" && $(main_pid "$ENTRY_SERVICE") == "$entry_pid" ]]
+# The record on disk decides, not the flag: a signal may land between the two.
+old_slot_record=$(read_slot_record) cutover_committed=0
+start_load
+api_cutover a "$release_three"
+cutover_committed=0
+api_cutover_rollback
+check_load 'rollback of a moved record without the flag'
+expect_state b "$release_two"
 
 # Interrupted switches (design doc 3.5): a candidate the record never named is
 # stopped; one it already names is carried through, started again when it no
