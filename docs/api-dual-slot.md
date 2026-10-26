@@ -310,67 +310,60 @@ M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup
 
 ## 6 M4-4：双槽单元与安装器切换
 
-本节为待替换的原草案，第 3 节已批准方案的 3.5 至 3.9 给出替换后的单元关系、切换步骤与提交点。后续版本须将两槽的启动路径分别绑定不可变 release，按“候选私有验证→可控切流→旧槽排空→完整回执”改写，并登记每步持久化和恢复依据；下述共享 `current`、先监听再验证及不区分应答槽的流程不得原样实施。
+按第 3 节实施；本节记录实施时的取舍、影响面与回滚，原草案（共享 `current`、端口复用、按就绪文件切换）已废弃。
 
-### 6.1 服务单元
+### 6.1 单元与状态文件
 
-`project-aggregation-api.service` 改为模板 `project-aggregation-api@.service`，实例 `a`、`b`，相对 P2 的 API 单元（`docs/control-data-plane-separation.md` 6.1 节）只改以下几项：
+| 对象 | 内容 |
+| --- | --- |
+| 运行时 `project-aggregation.service` | 与单槽相同，只把 `Wants=` 的 API 单元换成入口单元 |
+| 入口 `project-aggregation-entry.service` | 从 `current` 运行 `server/entry/main.mjs`；`PartOf=` 运行时、无 `[Install]`；`Restart=always`、`RestartSec=1`；`RuntimeDirectory=project-aggregation-entry`（0700）；`WORKBENCH_ENTRY_DIR`、`WORKBENCH_API_SLOT_RECORD=$APP_DIR/.api-slot`、`WORKBENCH_ENTRY_SLOT_ROOT=/run` |
+| 槽模板 `project-aggregation-api@.service` | `WorkingDirectory` 与 `ExecStart` 经 `$APP_DIR/slots/%i`；`After=` 运行时与入口、`PartOf=` 运行时；`RuntimeDirectory=project-aggregation-api-%i`（0700）；`WORKBENCH_API_SLOT=%i` 及槽目录、记录路径；其余（重启退避、`TimeoutStopSec=75`、沙箱）与单槽 API 单元相同；`WantedBy=` 入口 |
+| `$APP_DIR/slots/a`、`slots/b` | 指向 `releases/<版本>` 的软链，只在该槽停止时改写 |
+| `$APP_DIR/.api-slot` | `{"slot","release"}`，root 原子写入 |
+| `$APP_DIR/.api-cutover` | `{"from","to","release","phase"}`，切换完成或整体更新时删除 |
 
-```ini
-[Unit]
-Description=Project Aggregation workspace API (slot %i)
-After=project-aggregation.service
-PartOf=project-aggregation.service
+入口用 `PartOf=` 而不是 `StopPropagatedFrom=`：在 systemd 255 上实测两者都会随运行时的重启与崩溃自动重启而重启入口，后者没有收益。运行时崩溃时入口与槽一起重启，影响与现状（API 随运行时重启）相同。
 
-[Service]
-Environment=WORKBENCH_API_SLOT=%i
-Environment=WORKBENCH_API_REUSE_PORT=1
-Environment=WORKBENCH_API_READY_FILE=/run/project-aggregation-api-%i/ready
-RuntimeDirectory=project-aggregation-api-%i
-RuntimeDirectoryMode=0700
+恢复 guard 只加在运行时与槽模板（`project-aggregation-api@.service.d/`）：入口不打开数据目录，不需要 guard（与 3.8 原文“入口与模板”不同，按此实施）。安装器整体更新时把运行时已有的 guard 复制到模板目录，退回单槽时复制到单个 API 单元目录，避免恢复工具上次写入的保护在拓扑变化后失效。
 
-[Install]
-WantedBy=project-aggregation.service
-```
+### 6.2 何时启用双槽
 
-- 运行时单元去掉 `Wants=project-aggregation-api.service`；当前槽以 `systemctl enable project-aggregation-api@<slot>` 在 `project-aggregation.service.wants/` 下建立依赖，开机或整体重启时只拉起当前槽。
-- 安装器把当前槽记在 `$APP_DIR/.api-slot`（内容为 `a` 或 `b`），任何时刻只启用一个槽。
-- `PartOf=` 使 `systemctl stop|restart project-aggregation` 同时作用于正在运行的槽，运维命令含义不变。
-- 两个槽都从 `$APP_DIR/current` 启动。入口经软链解析为真实版本目录后，旧槽继续使用旧版本的代码与 `dist/`，`current` 切换不影响它。
-- 首次安装 M4 的版本时，运行时单元文件变化，按 P2 规则整体更新：安装器停用并删除旧的 `project-aggregation-api.service`，写入模板并启用槽 `a`。
+- 双槽的判定：入口单元存在，且运行时单元的 `Wants=` 列出入口单元。只有入口单元而运行时不拉起它（中断的退回、手动残留）仍按单槽处理；安装器（`dual_installed`）、更新服务登记与恢复入口用同一条判定。
+- 已是双槽时保持双槽，回到单槽只经回滚或退回。
+- 首次启用：直接执行安装命令时立即启用。由在线更新执行时，执行进程在任务开始时已加载旧的 `registry.py`，它不认识双槽单元，会把成功的安装判为“安装结果尚未确认”；因此更新执行单元在运行且已安装的 `registry.py` 未声明 `LAYOUTS` 含 `dual-slot` 时，本次仍按单槽安装，安装结束时更新服务随之升级，下一次整体更新（或再次执行安装命令）再启用双槽。
+- 布局不同即整体更新：首次启用与退回都改运行时单元，`activation_scope` 只在两次安装都是双槽、运行时与入口单元文本、运行时部署记录和运行时组件键都未变、且没有未收敛的 `.api-cutover` 时给出 `api`。更新服务的预判（`ci_scope`）同样只对登记为 `dual-slot` 布局的安装给出 `api`，单槽安装的 CI 更新一律按整体更新规划。
 
-### 6.2 只改 API 时的切换
+### 6.3 只改 API 的切换
 
-`activation_scope` 判为 `api` 时（`deploy/install.sh:2518-2532`，判定条件不变），取代现有的 `systemctl restart`：
+按 3.5 的步骤 1 至 6 实施（`api_cutover`）。候选等待 60 s 内反复运行目标版本的 `server/entry/probe.mjs`（以服务用户执行，`--pid` 取单元 `MainPID`）；晋升与切换经 `curl --unix-socket` 调用槽与入口的 `ctl.sock`；步骤 5 停止旧槽后等待入口统计的旧槽连接归零（10 s）。模板文本变化时先写入并 `daemon-reload`，旧槽的进程不受影响。
 
-```text
-读 .api-slot 得旧槽 old，新槽 new 为另一个
-→ 新槽若仍在运行（上次中断的残留）先停止
-→ current 指向新版本；模板有变化则写入并 daemon-reload
-→ systemctl start project-aggregation-api@new
-→ 等待新槽就绪记录：pid 等于该单元 MainPID，releaseKey 等于新版本，期限 60 s
-   └ 超时或单元失败：停止新槽，current 指回旧版本，旧槽不动，更新以失败结束
-→ systemctl enable 新槽、disable 旧槽，写 .api-slot
-→ systemctl stop project-aggregation-api@old（按 5.1 节排空，至多 75 s）
-→ 原有的端口健康检查与 finish_activation
-```
+失败处理（`rollback` 的 API 分支）：
 
-- 旧槽停止前，两个槽同时提供服务。按第 2 节，它们只在 `server/api/` 与前端上不同，共享表的语义一致；两个槽的更新协调器在并存期间各自轮询，但只改 API 的更新不进入交易维护，不会互相改写维护状态。
-- 切换后的回滚（更新任务失败、或用户回退到上一版本）走同一流程，目标是 `previous`。目标版本不支持双槽（M4 之前的版本）时，运行时单元会不同，按整体更新处理。
-- 安装器中断后重跑：以 `.api-slot` 和两个槽的实际状态为准。只有一个槽在运行时，把记录改成该槽；两个都在运行时，保留记录中的槽并停止另一个。
-- `wait_healthy` 仍检查端口；端口由哪个槽应答无关紧要，新槽是否就绪已由就绪记录确认。
+- 提交点（写 `.api-slot`）之前：停止并停用新槽，删除 `.api-cutover`；旧槽、`current` 与记录都未改动。
+- 提交点之后：以旧槽与其固定版本为目标反向切换；旧槽仍在运行时从步骤 3 开始（`promote` 幂等），已停止时从步骤 1 开始。反向切换也失败时保持新槽服务、报告失败。
 
-### 6.3 更新服务登记与恢复入口
+中断重跑：安装开始时若存在 `.api-cutover`，记录已指向 `to` 则向前完成步骤 4 至 6，否则停止并停用 `to`；仍未收敛则按整体更新处理。
 
-- `registry.py` 的 `extra_services` 改为模板名，校验 `/etc/systemd/system/project-aggregation-api@.service` 的受管标记、`WorkingDirectory`、`User` 与唯一 `ExecStart`。部署身份 `identity` 改为纳入模板文件内容。
-- 恢复 guard 写到 `project-aggregation-api@.service.d/20-recovery-guard.conf`，对两个实例都生效；`operations.install_guard` 校验两个实例的 `DropInPaths` 都只有这一个 guard。
-- 备份、交接与恢复的停服步骤（`server/recovery/operations.py`）改为停止运行时单元及 `project-aggregation-api@a`、`@b`，不依赖哪个槽正在运行；恢复后的启动只启动运行时单元，由其依赖拉起当前槽。
-- 只改 API 的判定（`activation_scope`）比较的是运行时单元文件，模板变化不改变判定，与 P2 中 API 单元变化的处理一致。
+### 6.4 整体更新、首次启用与退回
 
-### 6.4 平台
+按 3.6、3.9 实施（`activate_dual_full`、`dual_teardown`）：先 `systemctl stop` 运行时（经 `PartOf=` 停止入口、槽与单槽 API），再迁移模块、写单元、改写记录槽与另一槽的链接、记录与 `current`，启用记录槽、停用另一槽，最后启动运行时。首次启用删除单个 API 单元，记录槽取 `a`。
 
-- 模板单元、`%i` 与按实例的 `RuntimeDirectory` 在 Debian 12（systemd 252）与 Ubuntu 24.04（systemd 255）都可用；`RestartSteps` 的 254 版本条件沿用 P2-1。
-- `SO_REUSEPORT` 只在 Linux 上使用。非 systemd 的手动运行与 Windows 保持单实例。
+整体回滚：先停组；之前是双槽时恢复三份单元文件、把记录槽链接与记录改回之前的版本；之前是单槽或首次安装时执行 `dual_teardown`（停用两个槽实例，删除入口与模板单元、槽链接、`.api-slot`、`.api-cutover`），恢复单个 API 单元后再启动。删除在启动之前完成，避免入口占住端口。
+
+### 6.5 更新服务登记与恢复入口
+
+- `registry.py`：按 6.2 的判定为双槽时（结果字段 `layout` 为 `dual-slot`，否则为 `single`）核对运行时、入口（`WorkingDirectory=current`，运行 `server/entry/main.mjs`）与模板（`WorkingDirectory=$APP_DIR/slots/%i`，运行 `slots/%i/server/api/main.mjs`）三份单元及其 drop-in；guard 只允许出现在运行时与模板目录；部署身份纳入三份单元文本。`LAYOUTS` 声明支持的布局，供 6.2 判断。
+- `server/recovery/operations.py`：按 6.2 的判定为双槽时停服集合为运行时、入口、`@a`、`@b`；单槽时为运行时与 API，另加仍残留的入口与槽实例（手动启动仍可能运行）；`deployment()` 核对入口与模板的服务用户与 Node 路径，`install_guard` 写运行时与模板 guard 并核对两个实例加载的 drop-in；恢复后只启动运行时。
+
+### 6.6 影响面与回滚
+
+| 项目 | 内容 |
+| --- | --- |
+| 影响 | `deploy/install.sh`（单元、布局判定、切换、整体更新、回滚、清理、健康检查）、`server/update-service/registry.py`、`server/recovery/operations.py`、CI 与测试；入口、槽与探针代码不变 |
+| 不影响 | 运行时、模块、采集与执行；单槽部署在暂缓启用时保持原路径 |
+| 回滚 | 代码层面还原本批次提交即可：已启用双槽的部署由新版本安装器的整体回滚或退回流程恢复单槽；由 M4 之前的安装器覆盖安装时，先执行 `sudo systemctl stop project-aggregation`，并删除入口与模板单元后 `daemon-reload`（见 3.8） |
+| 验收 | Ubuntu CI 真实 systemd（`deploy/test-slots-systemd.sh`，真实入口与 API 槽，运行时用测试替身与假模块）：首次启用、连续短连接与保活请求下的只改 API 切换（统计拒连、重置、HTTP 失败；保活连接上因服务端关闭空闲连接而失败的请求按浏览器做法重试一次并单独计数，其余非 200 均判失败）、候选失败不影响旧槽、提交后反向切换（含记录已移动而内存标志未置位）、中断切换的续作与停止、整体更新保持记录槽、整体停止时槽先于入口、退回单槽；mock 安装测试继续覆盖单槽路径与布局判定 |
 
 ## 7 兼容、迁移与回滚
 

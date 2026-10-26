@@ -219,6 +219,7 @@ jobs:
           bash -n deploy/test-update-service.sh
           bash -n deploy/test-update-systemd.sh
           bash -n deploy/test-units-systemd.sh
+          bash -n deploy/test-slots-systemd.sh
           bash -n deploy/test-all.sh
           bash -n deploy/test-install.sh
           bash -n deploy/test-environment.sh
@@ -245,6 +246,22 @@ jobs:
           python3 deploy/test-release-cache.py -v
           sudo bash deploy/test-update-service.sh
           sudo env AGG_UPDATER_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-update-systemd.sh
+
+  installer-slots:
+    name: Installer (dual-slot units under real systemd)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.15.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify the entry, API slot switches under load, rollback and back-out
+        run: |
+          sudo env SLOTS_TEST_NODE="$(command -v node)" AGG_SLOTS_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-slots-systemd.sh
 
   installer-deploy:
     name: Installer (activation, incremental and stack)
@@ -348,7 +365,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-deploy, aster-relay, entropy-lighter-lab, release-mirror]
+    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

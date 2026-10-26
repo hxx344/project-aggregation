@@ -585,7 +585,7 @@ class Coordinator:
             return 'full'
         item, release = candidates[0]
         key = release.get('runtimeKey')
-        if (item['id'] != 'hub' or not key or item.get('runtimeKey') != key or not item.get('runtimeRecorded')
+        if (item['id'] != 'hub' or item.get('layout') != 'dual-slot' or not key or item.get('runtimeKey') != key or not item.get('runtimeRecorded')
                 or state.get('scopeRefused') == release['commit'] or not all(part in release['installer'] for part in SCOPE_INSTALLER)):
             return 'full'
         return 'api'

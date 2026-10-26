@@ -21,6 +21,13 @@ SERVICE = 'project-aggregation.service'
 API_UNIT_FILE = Path('/etc/systemd/system/project-aggregation-api.service')
 API_SERVICE = 'project-aggregation-api.service'
 SERVICES = (SERVICE, API_SERVICE)
+# With the dual-slot units (design doc api-dual-slot 6.5) the entry and both
+# slot instances replace the API unit; the slots run from their own links.
+ENTRY_UNIT_FILE = Path('/etc/systemd/system/project-aggregation-entry.service')
+ENTRY_SERVICE = 'project-aggregation-entry.service'
+SLOT_UNIT_FILE = Path('/etc/systemd/system/project-aggregation-api@.service')
+SLOT_SERVICES = ('project-aggregation-api@a.service', 'project-aggregation-api@b.service')
+DUAL_SERVICES = (SERVICE, ENTRY_SERVICE, *SLOT_SERVICES)
 KEYS = Path('/etc/project-aggregation-recovery')
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 INSTALL_LOCK = Path('/run/lock/project-aggregation-install.lock')
@@ -63,13 +70,33 @@ def trusted_environment():
     return ENVIRONMENT
 
 
-def managed_unit(filename, entry):
+def dual_slots():
+    """The installer's rule: the entry unit exists and the runtime unit pulls it in."""
+    if not (ENTRY_UNIT_FILE.exists() or ENTRY_UNIT_FILE.is_symlink()):
+        return False
+    try:
+        source = UNIT_FILE.read_text(encoding='utf-8')
+    except OSError:
+        return False
+    return re.search(r'^Wants=(?:.*[ \t])?' + re.escape(ENTRY_SERVICE) + r'(?:[ \t]|$)', source, re.M) is not None
+
+
+def services():
+    """The units that hold writers of the data directory, the runtime first. The
+    single layout also covers dual-slot units left installed: a hand start
+    could still run them."""
+    if dual_slots():
+        return DUAL_SERVICES
+    return (*SERVICES, *((ENTRY_SERVICE,) if ENTRY_UNIT_FILE.exists() else ()), *(SLOT_SERVICES if SLOT_UNIT_FILE.exists() else ()))
+
+
+def managed_unit(filename, entry, root='current'):
     """The service user and Node executable of an installer-written unit running `entry`."""
     unit = trusted(filename).read_text(encoding='utf-8')
     if not unit.startswith('# Managed by project-aggregation installer\n'):
         raise ValueError('RECOVERY_UNMANAGED_SERVICE')
     user = re.search(r'^User=([A-Za-z_][A-Za-z0-9_-]*)$', unit, re.M)
-    command = re.search(r'^ExecStart=(/[^\s]+) ' + re.escape(str(APP / 'current/server' / entry)) + r'$', unit, re.M)
+    command = re.search(r'^ExecStart=(/[^\s]+) ' + re.escape(f'{APP}/{root}/server/{entry}') + r'$', unit, re.M)
     if not user or not command:
         raise ValueError('RECOVERY_SERVICE_CONFIG_INVALID')
     return user[1], command[1]
@@ -79,7 +106,9 @@ def deployment():
     import pwd
     trusted_environment()
     user, command = managed_unit(UNIT_FILE, 'runtime/main.mjs')
-    if managed_unit(API_UNIT_FILE, 'api/main.mjs') != (user, command):
+    others = ([managed_unit(ENTRY_UNIT_FILE, 'entry/main.mjs'), managed_unit(SLOT_UNIT_FILE, 'api/main.mjs', 'slots/%i')]
+              if dual_slots() else [managed_unit(API_UNIT_FILE, 'api/main.mjs')])
+    if any(other != (user, command) for other in others):
         raise ValueError('RECOVERY_SERVICE_CONFIG_INVALID')
     account = pwd.getpwnam(user)
     node = trusted(command)
@@ -119,8 +148,16 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
                   launcher=Path('/usr/local/bin/project-aggregation-recovery')):
     guard = library / 'startup-guard.py'
     safe_directory(library, private=False)
-    # Both units start code that opens the data directory, so both carry the guard.
-    dropins = {unit: units / (unit + '.d') for unit in SERVICES}
+    # The units that start code opening the data directory carry the guard: the
+    # runtime and the API, or the slot template for both instances. The entry
+    # opens nothing and carries no drop-in.
+    if dual_slots():
+        template = units / (SLOT_UNIT_FILE.name + '.d')
+        dropins = {SERVICE: units / (SERVICE + '.d'), **{unit: template for unit in SLOT_SERVICES}}
+        bare = {ENTRY_SERVICE: units / (ENTRY_SERVICE + '.d')}
+    else:
+        dropins = {unit: units / (unit + '.d') for unit in SERVICES}
+        bare = {}
     for directory in dropins.values():
         directory.mkdir(mode=0o755, exist_ok=True)
         for candidate in [directory, *directory.parents]:
@@ -160,7 +197,10 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
             raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
         if dropin.exists() or dropin.is_symlink():
             managed(dropin)
-    for directory in dropins.values():
+    for unit, directory in bare.items():
+        if loaded_dropins(unit) or directory.is_symlink() or directory.exists() and any(directory.glob('*.conf')):
+            raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
+    for directory in set(dropins.values()):
         update(directory / '20-recovery-guard.conf', content, 0o644)
     # Always reloaded, also when nothing was written: NeedDaemonReload misses drop-in
     # directories created since the last reload (measured on systemd 255), and a
@@ -168,7 +208,8 @@ def install_guard(config, *, library=Path('/usr/local/lib/project-aggregation-re
     # also reads drop-ins of shared directories such as service.d, so the loaded
     # result must be exactly each unit's own guard.
     systemctl('daemon-reload', timeout=120)
-    if any(loaded_dropins(unit) != [str(directory / '20-recovery-guard.conf')] for unit, directory in dropins.items()):
+    if any(loaded_dropins(unit) != [str(directory / '20-recovery-guard.conf')] for unit, directory in dropins.items()) or \
+            any(loaded_dropins(unit) for unit in bare):
         raise ValueError('RECOVERY_UNSUPPORTED_SERVICE_OVERRIDE')
     launcher_body = ('# Managed by project-aggregation recovery\n#!/bin/sh\n'
                      f'exec /usr/bin/python3 -I {APP}/current/server/recovery/operations.py "$@"\n').encode()
@@ -186,7 +227,7 @@ def service_state(unit):
 def require_stopped(previous_groups=None):
     """Every unit is stopped and its cgroup, also the one seen before stopping, is empty."""
     states = {}
-    for unit in SERVICES:
+    for unit in services():
         state = states[unit] = service_state(unit)
         if state.get('ActiveState') not in {'inactive', 'failed'} or state.get('MainPID') != '0':
             raise ValueError('RECOVERY_WRITERS_STILL_RUNNING')
@@ -286,13 +327,14 @@ def _main_locked(values):
         run_cli(config, 'keys', *key_arguments)
     elif not all((KEYS / name).is_file() for name in ('data.key', 'secrets.key')):
         raise ValueError('RECOVERY_KEYS_MISSING')
-    before = {unit: service_state(unit) for unit in SERVICES}
+    units = services()
+    before = {unit: service_state(unit) for unit in units}
     groups = {unit: state.get('ControlGroup', '') for unit, state in before.items()}
     was_running = any(state.get('ActiveState') in {'active', 'activating', 'reloading'} for state in before.values())
-    # Both units explicitly: PartOf= alone would leave an API started on its own.
+    # Every unit explicitly: PartOf= alone would leave an API or slot started on its own.
     if was_running:
-        # The API stops first (TimeoutStopSec=75), then the runtime (TimeoutStopSec=150).
-        systemctl('stop', *SERVICES, timeout=260)
+        # The API or slots stop first (TimeoutStopSec=75), then the entry and the runtime (TimeoutStopSec=150).
+        systemctl('stop', *units, timeout=260)
     require_stopped(groups)
     try:
         if values.action != 'restore':

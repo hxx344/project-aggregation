@@ -195,7 +195,7 @@ class RegistryTests(RootFixture):
     def test_runtime_forecast_inputs_are_protected_and_keep_the_identity(self):
         module = registry.BY_ID['hub']; root, release, _ = self.install(module)
         value = registry.installed(module, self.root)
-        self.assertEqual((value['runtimeKey'], value['runtimeRecorded']), (None, False))
+        self.assertEqual((value['runtimeKey'], value['runtimeRecorded'], value['layout']), (None, False, 'single'))
         identity = value['identity']
         key = release / '.runtime-component-key'; key.write_text(RUNTIME_KEY + '\n', encoding='utf8')
         record = root / '.runtime-deployment'; record.write_text('recorded\n', encoding='utf8')
@@ -245,6 +245,53 @@ class RegistryTests(RootFixture):
         self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
         dropins.unlink()
         self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
+
+    def test_dual_slot_units_are_read_from_their_own_links(self):
+        module = registry.BY_ID['hub']; root, release, unit = self.install(module)
+        single = registry.installed(module, self.root)['identity']
+        units = unit.parent
+        current_path = str(root / 'current').replace('\\', '/')
+        slots_path = str(root / 'slots/%i').replace('\\', '/')
+        (units / 'project-aggregation-api.service').unlink()
+        entry = units / 'project-aggregation-entry.service'
+        template = units / 'project-aggregation-api@.service'
+        body = '# Managed by project-aggregation installer\n[Service]\nUser=project-aggregation\nWorkingDirectory={}\nExecStart=/usr/bin/node {}\n'
+        entry.write_text(body.format(current_path, current_path + '/server/entry/main.mjs'), encoding='utf8')
+        template.write_text(body.format(slots_path, slots_path + '/server/api/main.mjs'), encoding='utf8')
+        # An entry unit the runtime does not pull in is a leftover: the single layout still needs its API unit.
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        runtime = unit.read_text(encoding='utf8')
+        for wants in ('Wants=network-online.target\n', 'Wants=project-aggregation-entry.service.bak\n', '# Wants=project-aggregation-entry.service\n'):
+            with self.subTest(wants=wants):
+                unit.write_text(runtime.replace('[Service]\n', '[Unit]\n' + wants + '[Service]\n'), encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        unit.write_text(runtime.replace('[Service]\n', '[Unit]\nWants=network-online.target project-aggregation-entry.service\n[Service]\n'), encoding='utf8')
+        value = registry.installed(module, self.root)
+        self.assertEqual((value['state'], value['layout']), ('unavailable', 'dual-slot'))
+        self.assertNotEqual(value['identity'], single)
+        # Each unit runs only from its own link.
+        for target, text in [(template, body.format(current_path, current_path + '/server/api/main.mjs')),
+                             (template, body.format(slots_path, current_path + '/server/api/main.mjs')),
+                             (entry, body.format(slots_path, slots_path + '/server/entry/main.mjs')),
+                             (entry, body.format(current_path, current_path + '/server/api/main.mjs'))]:
+            with self.subTest(unit=target.name, text=text):
+                previous = target.read_text(encoding='utf8'); target.write_text(text, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+                target.write_text(previous, encoding='utf8')
+        template.unlink()
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        template.write_text(body.format(slots_path, slots_path + '/server/api/main.mjs'), encoding='utf8')
+        # The guard belongs to the runtime and the template, never to the entry or one instance.
+        guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
+                 '${DATA_DIR} /opt/project-aggregation/current/server/execution/account-writer.mjs /usr/local/bin/node\n')
+        for name in ('project-aggregation', 'project-aggregation-api@'):
+            directory = units / (name + '.service.d'); directory.mkdir(); (directory / '20-recovery-guard.conf').write_text(guard, encoding='utf8')
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
+        for name in ('project-aggregation-entry', 'project-aggregation-api@a', 'project-aggregation-api@b', 'project-aggregation-api'):
+            with self.subTest(dropins=name):
+                directory = units / (name + '.service.d'); directory.mkdir(); (directory / '20-recovery-guard.conf').write_text(guard, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged' if name != 'project-aggregation-api' else 'unavailable')
+                (directory / '20-recovery-guard.conf').unlink(); directory.rmdir()
 
     @unittest.skipUnless(LINUX_ROOT, 'Linux ownership/mode protection requires root')
     def test_recovery_guard_must_be_root_owned_and_read_only(self):
@@ -1731,7 +1778,7 @@ class CoordinatorTests(RootFixture):
     def admit_api(self):
         self.network.values['hub']['manifest']['artifacts']['linux-x64']['runtime_key'] = RUNTIME_KEY
         self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.SCOPE_INSTALLER)
-        self.installed[0].update(runtimeKey=RUNTIME_KEY, runtimeRecorded=True)
+        self.installed[0].update(runtimeKey=RUNTIME_KEY, runtimeRecorded=True, layout='dual-slot')
 
     def test_installer_without_scope_admission_is_planned_in_full(self):
         self.admit_api()
@@ -1759,6 +1806,7 @@ class CoordinatorTests(RootFixture):
         changes = {'changed runtime': lambda: self.installed[0].update(runtimeKey='6' * 64),
                    'unknown installed runtime': lambda: self.installed[0].pop('runtimeKey'),
                    'unrecorded deployment': lambda: self.installed[0].update(runtimeRecorded=False),
+                   'single layout': lambda: self.installed[0].update(layout='single'),
                    'legacy package': lambda: self.network.values['hub']['manifest']['artifacts']['linux-x64'].pop('runtime_key')}
         for name, change in changes.items():
             with self.subTest(change=name):

@@ -37,6 +37,8 @@ sed -e "s|/opt/$service|$fixture/application|g" \
     -e "s|/etc/$service.env|$fixture/environment|g" \
     -e "s|/etc/systemd/system/$service.service|$fixture/unit|g" \
     -e "s|/etc/systemd/system/$service-api.service|$fixture/api-unit|g" \
+    -e "s|/etc/systemd/system/$service-entry.service|$fixture/entry-unit|g" \
+    -e "s|/etc/systemd/system/$service-api@.service|$fixture/slot-unit|g" \
     -e "s|/run/lock/$service-install.lock|$fixture/install.lock|g" \
     -e "s|/run/systemd/system|$fixture|g" "$repository/deploy/install.sh" > "$fixture/installer.sh"
 cat > "$fixture/runtime/node" <<'NODE'
@@ -142,6 +144,8 @@ AGG_INSTALL_SOURCE_ONLY=1 source "$FIXTURE_ROOT/installer.sh"
 REPOSITORY="$FIXTURE_ROOT/source"
 SERVICE_USER=root
 ensure_tools() { :; }
+# The mock systemd covers the single API unit; the dual-slot units run under real systemd (test-slots-systemd.sh).
+target_layout() { printf single; }
 validate_embedded_runtime() { :; }
 prepare_greeks_runtime() { :; }
 prepare_aster_runtime() { :; }
