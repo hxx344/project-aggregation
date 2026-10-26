@@ -186,6 +186,26 @@ test('API instances on one hub database share tickets, grants and their revocati
   assert.equal((await b.request('/private', { cookie })).status, 401);
 });
 
+test('a grant revoked by one API instance closes the WebSocket open on the other', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-shared-')); const dbs = [0, 1].map(() => openHubDatabase(join(dir, 'hub.sqlite')));
+  t.after(() => { for (const db of dbs) db.close(); rmSync(dir, { recursive: true, force: true }); });
+  const [a, b] = await Promise.all(dbs.map(db => fixture(t, { store: createPortalStore(createControlStore(db)) })));
+  const { cookie } = await a.authorize();
+  const headers = { Origin: `http://${b.host('asset')}`, Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': randomBytes(16).toString('base64'), 'Sec-WebSocket-Version': '13' };
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: b.port, path: '/ws', headers: { Host: b.host('asset'), Cookie: cookie, ...headers } });
+    req.on('error', reject); req.on('response', res => reject(new Error(`Unexpected response ${res.statusCode}`)));
+    req.on('upgrade', async (_res, socket) => {
+      t.after(() => socket.destroy()); socket.on('error', () => {});
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('WebSocket remained open after the other instance revoked its grant')); }, 2500);
+      socket.once('close', () => { clearTimeout(timer); resolve(); });
+      const logout = await a.request('/api/logout', { method: 'POST', cookie, headers: { Origin: `http://${a.host('asset')}` } });
+      if (logout.status !== 200) reject(new Error(`logout ${logout.status}`));
+    });
+    req.end();
+  });
+});
+
 test('portal requires a grant and tickets are single-use, expire, and bind the project', async t => {
   const f = await fixture(t);
   assert.equal((await f.request('/private')).status, 401); assert.equal(f.calls, 0);

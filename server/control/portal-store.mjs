@@ -30,7 +30,7 @@ export function createPortalStore({ db, stmt }) {
     liveGrants: now => live('portal_grants', now),
     // Every stored grant with its digest, for the Portal's liveness sweep.
     grants: () => stmt.prepare('SELECT * FROM portal_grants').all().map(row => ({ ...record(row), digest: row.digest })),
-    revokeGrant: digest => { stmt.prepare('DELETE FROM portal_grants WHERE digest=?').run(digest); },
+    revokeGrants: digests => immediate(db, () => { for (const digest of digests) stmt.prepare('DELETE FROM portal_grants WHERE digest=?').run(digest); }),
     // Deletes at most PRUNE_BATCH expired rows of each table per call.
     prune: now => {
       for (const table of ['portal_tickets', 'portal_grants']) stmt.prepare(`DELETE FROM ${table} WHERE digest IN (SELECT digest FROM ${table} WHERE expires<=? LIMIT ${PRUNE_BATCH})`).run(now);

@@ -81,7 +81,8 @@ function framePolicy(value, hubOrigin) {
  */
 export function createPortal({ store, getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function') || !store) throw new Error('项目代理需要授权存储以及项目、版本和会话校验回调');
-  const authGrants = new Map(); const active = new Set(); const syncFlights = new Map();
+  // revoking: stored grants this process revoked whose row could not be deleted yet (busy database).
+  const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
   let closed = false;
   const projectHost = id => `p-${digest(String(id)).slice(0, 24)}.${HUB_HOST}`;
 
@@ -111,18 +112,23 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   function liveGrant(grant) {
     if (closed || !validGrant(grant)) return false;
     if (!grant.digest) return true;
-    return grant.auth ? authGrants.get(grant.digest) === grant : !!store.grant(grant.digest);
+    if (grant.auth) return authGrants.get(grant.digest) === grant;
+    return !revoking.has(grant.digest) && !!store.grant(grant.digest);
   }
+  // Fails closed: a stream whose grant cannot be checked is closed.
+  const liveOrFailed = grant => { try { return liveGrant(grant); } catch { return false; } };
 
-  // Drops what this process holds that is no longer live; only reads the database.
+  // Drops what this process holds that is no longer live; reads the database, and writes
+  // only to retry revocations that could not be stored.
   function sweepProcess() {
     for (const [id, grant] of authGrants) if (!liveGrant(grant)) authGrants.delete(id);
-    for (const stream of active) if (!liveGrant(stream.grant)) { stream.destroy(); active.delete(stream); }
+    for (const stream of active) if (!liveOrFailed(stream.grant)) { stream.destroy(); active.delete(stream); }
+    if (revoking.size) { const digests = [...revoking]; store.revokeGrants(digests); for (const digest of digests) revoking.delete(digest); }
   }
   // Also deletes stored rows that expired or lost their session, project or revision.
   function prune() {
     store.prune(now());
-    for (const grant of store.grants()) if (!validGrant(grant)) store.revokeGrant(grant.digest);
+    store.revokeGrants(store.grants().filter(grant => !validGrant(grant)).map(grant => grant.digest));
     sweepProcess();
   }
 
@@ -211,7 +217,9 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
 
   function revokeGrant(grant) {
     grant.revoked = true;
-    if (grant.auth) authGrants.delete(grant.digest); else store.revokeGrant(grant.digest);
+    // Refused here at once; when the row cannot be deleted now, the sweep retries the deletion.
+    if (grant.auth) authGrants.delete(grant.digest);
+    else { revoking.add(grant.digest); try { store.revokeGrants([grant.digest]); revoking.delete(grant.digest); } catch {} }
     delete grant.auth;
   }
 
@@ -498,5 +506,5 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     return true;
   }
 
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, close() { closed = true; clearInterval(sweep); authGrants.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }

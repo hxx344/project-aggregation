@@ -39,7 +39,7 @@ test('the limit counts unexpired rows of every instance and grants held in proce
   assert.equal(b.issueGrant('g2', ticket(now + 5000), now, 2, 1), false);
   assert.equal(b.issueTicket('t4', ticket(now + 5000), now + 1000, 3, 2), false);
   assert.deepEqual(b.grant('g1'), { projectId: 'asset', sessionId: 'session', revision: 'one', expires: now + 5000, digest: 'g1' });
-  b.revokeGrant('g1');
+  b.revokeGrants(['g1']);
   assert.equal(a.grant('g1'), null);
 });
 
