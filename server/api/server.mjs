@@ -233,12 +233,10 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       const ip = req.socket.remoteAddress || 'unknown'; const now = Date.now();
       const accountId = 'global'; // Single-account system
       const lockedError = until => new HttpError(429, `账户已被锁定，请 ${Math.ceil((until - Date.now()) / 60000)} 分钟后重试`);
-      const lockedAt = loginGuard.lockedUntil(accountId, now);
-      if (lockedAt) throw lockedError(lockedAt);
-
       // Reserve before reading the body: partial concurrent requests share one quota.
-      const attempt = loginGuard.reserveIp(ip, now);
-      if (!attempt) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
+      const attempt = loginGuard.admit(accountId, ip, now);
+      if (attempt.locked) throw lockedError(attempt.locked);
+      if (attempt.limited) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
       const body = await bodyOf(req);
 
       // Reserve an account slot after the body arrives, so held-open bodies cannot block logins,
@@ -250,7 +248,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       try {
         const passwordVersion = getSetting('password');
         passwordValid = typeof body.password === 'string' && body.password.length <= 1024 && await passwordMatches(body.password, passwordVersion) && getSetting('password') === passwordVersion;
-      } catch (error) { loginGuard.release(reserved); throw error; }
+      } catch (error) {
+        // Unreleased, the check counts as a failure once its lease expires.
+        try { loginGuard.release(reserved); } catch (releaseError) { log.warn({ err: releaseError, type: 'auth_release_failed' }, '登录校验名额未能释放'); }
+        throw error;
+      }
 
       if (!passwordValid) {
         const { failed, lockedUntil, lockedNow } = loginGuard.failure(reserved, Date.now());
@@ -263,11 +265,10 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
         throw new HttpError(401, '登录密码不正确');
       }
       // A lock set by concurrent failures while this password was being checked still applies.
-      const lockedAfterCheck = loginGuard.success(reserved, Date.now());
+      const lockedAfterCheck = loginGuard.success(reserved, attempt, Date.now());
       if (lockedAfterCheck) throw lockedError(lockedAfterCheck);
 
       log.info({ ip, type: 'auth_success' }, '登录成功');
-      loginGuard.refundIp(attempt);
 
       sessions.deleteExpired(now);
       // Security: Always delete old session and generate new ID on login to prevent session fixation
