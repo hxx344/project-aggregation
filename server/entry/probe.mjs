@@ -39,7 +39,7 @@ export async function probeSlot({ dir, slot, release, port, pid, mode = 'candida
   let identity = null;
   try {
     const reply = await controlRequest(sockets.ctl, 'GET', '/identity', { timeoutMs: REQUEST_TIMEOUT_MS });
-    if (check(reply.status === 200, `identity 返回 ${reply.status}`)) identity = reply.data;
+    if (check(reply.status === 200, `identity 返回 ${reply.status}`) && check(reply.data && typeof reply.data === 'object', 'identity 的应答不是对象')) identity = reply.data;
   } catch (error) { failures.push(`无法读取槽身份：${error.message}`); }
   if (identity) {
     check(identity.protocol === SLOT_PROTOCOL, `槽协议 ${identity.protocol} 与探针的 ${SLOT_PROTOCOL} 不一致`);

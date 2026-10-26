@@ -13,6 +13,9 @@ import { acceptProxyHeader, clientAddress, controlRequest, entrySockets, localPo
 // POSIX only, like the slots themselves.
 const skip = process.platform === 'win32' ? 'POSIX sockets only' : false;
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function until(condition, ms = 5000) {
+  for (const deadline = Date.now() + ms; !condition(); await wait(20)) if (Date.now() > deadline) throw new Error('condition not met in time');
+}
 
 function recorder() {
   const warnings = [];
@@ -39,10 +42,16 @@ async function fixture(t) {
     server.on('connection', socket => { open.add(socket); socket.once('close', () => open.delete(socket)); });
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(file, resolve); }); listening.push(server); return server;
   };
-  // A slot's control socket; identity can be changed in place.
-  async function control(slot, overrides = {}) {
+  // A slot's control socket; identity can be changed in place, and hooks.delayMs
+  // holds each answer back while hooks.active/peak count the requests in progress.
+  async function control(slot, overrides = {}, hooks = {}) {
     const identity = { protocol: 1, slot, instanceId: `instance-${slot}`, pid: 1, release: realpathSync(releases[slot]), mode: 'serving', ...overrides };
-    await listen(http.createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(identity)); }), slotSockets(slotDirectory(root, slot)).ctl);
+    Object.assign(hooks, { active: 0, peak: 0 });
+    await listen(http.createServer(async (req, res) => {
+      hooks.peak = Math.max(hooks.peak, ++hooks.active);
+      await wait(hooks.delayMs || 0); hooks.active -= 1;
+      res.statusCode = hooks.status || 200; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(identity));
+    }), slotSockets(slotDirectory(root, slot)).ctl);
     return identity;
   }
   // A traffic socket echoing every byte, the entry's PROXY line included,
@@ -109,8 +118,7 @@ test('a connection reaches the recorded slot after a PROXY line with its address
   server.end();
   await ended;
   // The entry let go of both sides without waiting for the client's FIN.
-  await wait(50);
-  assert.equal(entry.status().connections.a, 0);
+  await until(() => entry.status().connections.a === 0);
   lingering.socket.destroy();
 });
 
@@ -221,4 +229,80 @@ test('closing the entry stops listening and ends waiting and forwarded connectio
   assert.ok(Date.now() - began >= 150, 'the forwarded connection had its grace');
   assert.ok(f.warnings.some(item => item.message.includes('强制断开')));
   await assert.rejects(new Promise((resolve, reject) => net.connect(entry.ready.port, '127.0.0.1').once('connect', resolve).once('error', reject)), { code: 'ECONNREFUSED' });
+});
+
+test('switches run one at a time, and one that goes away while queued holds up none after it', { skip }, async t => {
+  const f = await fixture(t);
+  f.writeRecord('a'); await f.echo('a');
+  const hooks = { delayMs: 300 };
+  const identity = await f.control('b', {}, hooks);
+  const entry = await f.start();
+  f.writeRecord('b');
+  const ctl = entrySockets(f.dir).ctl;
+  const body = { slot: 'b', instanceId: identity.instanceId };
+  const first = controlRequest(ctl, 'POST', '/switch', { body, timeoutMs: 5000 });
+  await wait(50);
+  // Queued behind the first, then gone: its client gives up after 100 ms.
+  await assert.rejects(controlRequest(ctl, 'POST', '/switch', { body, timeoutMs: 100 }), { code: 'ETIMEDOUT' });
+  const second = controlRequest(ctl, 'POST', '/switch', { body, timeoutMs: 5000 });
+  assert.deepEqual([(await first).data, (await second).data], [{ target: 'b', generation: 1 }, { target: 'b', generation: 1 }]);
+  assert.equal(hooks.peak, 1, 'the slot was asked once at a time');
+  hooks.delayMs = 0;
+  assert.equal((await controlRequest(ctl, 'POST', '/switch', { body })).status, 200);
+  // Bodies: not an object, too large; a slot answering anything but 200.
+  const raw = text => new Promise((resolve, reject) => {
+    const req = http.request({ socketPath: ctl, method: 'POST', path: '/switch', agent: false }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject); req.end(text);
+  });
+  assert.equal(await raw('null'), 400);
+  assert.equal(await raw('x'.repeat(5000)), 413);
+  assert.equal(await raw('{'), 400);
+  hooks.status = 503;
+  assert.equal((await controlRequest(ctl, 'POST', '/switch', { body })).status, 503);
+  assert.equal(entry.status().generation, 1);
+});
+
+test('a client that takes nothing from its slot is reset after the stall limit, releasing the slot side', { skip }, async t => {
+  const f = await fixture(t);
+  f.writeRecord('a');
+  // The slot answers with far more than the socket buffers hold.
+  await f.listen(net.createServer(socket => { socket.on('error', () => {}); socket.write(Buffer.alloc(16 * 1024 * 1024)); }), slotSockets(slotDirectory(f.root, 'a')).http);
+  const entry = await f.start({ stallMs: 300 });
+  const client = connect(entry.ready.port); await client.ready;
+  client.socket.pause();
+  await until(() => entry.status().connections.a === 1);
+  const began = Date.now();
+  await until(() => entry.status().connections.a === 0);
+  assert.ok(Date.now() - began < 3000);
+  client.socket.resume();
+  await client.closed;
+});
+
+test('closing the entry is bounded by a half-closed client that stops reading a large answer', { skip }, async t => {
+  const f = await fixture(t);
+  f.writeRecord('a');
+  await f.listen(net.createServer({ allowHalfOpen: true }, socket => { socket.on('error', () => {}); socket.on('data', () => {}); socket.on('end', () => socket.end(Buffer.alloc(16 * 1024 * 1024))); }), slotSockets(slotDirectory(f.root, 'a')).http);
+  const entry = await f.start({ closeGraceMs: 200 });
+  const client = connect(entry.ready.port); await client.ready;
+  client.socket.pause(); client.socket.end('request');
+  await wait(300);
+  const began = Date.now();
+  await entry.close();
+  assert.ok(Date.now() - began < 2000, 'close() waited for the client');
+  client.socket.resume(); await client.closed;
+});
+
+test('a slot connection that fails mid-way resets the client', { skip }, async t => {
+  const f = await fixture(t);
+  f.writeRecord('a');
+  // The slot reads nothing and goes away with unread data, which the kernel
+  // reports as ECONNRESET rather than an orderly end.
+  await f.listen(net.createServer({ pauseOnConnect: true }, socket => { socket.on('error', () => {}); setTimeout(() => socket.destroy(), 200); }), slotSockets(slotDirectory(f.root, 'a')).http);
+  const entry = await f.start();
+  const client = connect(entry.ready.port); await client.ready;
+  const failure = new Promise(resolve => client.socket.once('error', resolve));
+  client.socket.write('unread');
+  assert.equal((await failure).code, 'ECONNRESET');
+  await client.closed;
+  await until(() => entry.status().connections.a === 0);
 });
