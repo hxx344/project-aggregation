@@ -119,11 +119,12 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   const liveOrFailed = grant => { try { return liveGrant(grant); } catch { return false; } };
 
   // Drops what this process holds that is no longer live; reads the database, and writes
-  // only to retry revocations that could not be stored.
+  // only to retry revocations that could not be stored, without waiting on a busy database.
   function sweepProcess() {
-    for (const [id, grant] of authGrants) if (!liveGrant(grant)) authGrants.delete(id);
+    // An entry whose check fails stays; every request checks it again.
+    for (const [id, grant] of authGrants) { try { if (!liveGrant(grant)) authGrants.delete(id); } catch {} }
     for (const stream of active) if (!liveOrFailed(stream.grant)) { stream.destroy(); active.delete(stream); }
-    if (revoking.size) { const digests = [...revoking]; store.revokeGrants(digests); for (const digest of digests) revoking.delete(digest); }
+    if (revoking.size) { const digests = [...revoking]; store.tryRevokeGrants(digests); for (const digest of digests) revoking.delete(digest); }
   }
   // Also deletes stored rows that expired or lost their session, project or revision.
   function prune() {
