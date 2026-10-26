@@ -1,4 +1,5 @@
 import pino from 'pino';
+import { clientAddress } from './slot-protocol.mjs';
 
 const isDevelopment = process.env.NODE_ENV !== 'production';
 
@@ -23,7 +24,7 @@ export const logger = pino({
     req: (req) => ({
       method: req.method,
       url: req.url,
-      remoteAddress: req.socket?.remoteAddress,
+      remoteAddress: req.socket ? clientAddress(req) : undefined,
     }),
     res: (res) => ({
       statusCode: res.statusCode,

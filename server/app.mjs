@@ -52,7 +52,7 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
     tradingClientFactory, tradingRefreshIntervalMs, tradingNow, tradingTaskTimeoutMs, tradingImportRequest, tradingImportSourceTimeoutMs, tradingImportTimeoutMs,
     executionClientFactory, executionIntervalMs, executionNow,
     warmup, baselineIntervalMs, baselineNow, capabilitiesRequest });
-  const api = createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime: createInProcessDataClient(dataPlane, { log }), executionJobs: createExecutionJobsReader(db), readMaintenance,
+  const api = createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime: createInProcessDataClient(dataPlane, { log }), executionJobs: createExecutionJobsReader(db),
     updatesClient, secureCookies, configuredOrigin, distDir, loginLimits });
   await dataPlane.initialize();
   await api.initialize();

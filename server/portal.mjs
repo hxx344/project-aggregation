@@ -8,6 +8,7 @@ import { validateUrl, validateAuthOrigin, blockedAddress } from './adapters.mjs'
 import { cachePolicy } from './static-cache.mjs';
 import { prepareAssetCompression } from './portal-compression.mjs';
 import { moduleTransport } from './modules/transport.mjs';
+import { localPortOf } from './slot-protocol.mjs';
 
 export const HUB_HOST = 'hub.localhost';
 export const PORTAL_COOKIE = 'hub_portal';
@@ -15,6 +16,11 @@ const token = () => randomBytes(32).toString('base64url');
 const digest = value => createHash('sha256').update(value).digest('hex');
 const reservedCookie = name => /^(?:__Host-|__Secure-)?hub_(?:session|portal)$/i.test(name);
 const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+
+// A candidate API slot (design doc api-dual-slot 3.3) neither issues nor
+// takes tickets and grants and forwards nothing; a request without a grant
+// still gets its 401, which the installer's probe expects.
+const CANDIDATE = '候选实例尚未接管服务';
 
 class PortalError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -79,7 +85,7 @@ function framePolicy(value, hubOrigin) {
  * authentication live there, shared by every API instance. Grants carrying
  * authentication material stay in this process (docs/api-dual-slot.md 4.4).
  */
-export function createPortal({ store, getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup } = {}) {
+export function createPortal({ store, getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup, isServing = () => true } = {}) {
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function') || !store) throw new Error('项目代理需要授权存储以及项目、版本和会话校验回调');
   // revoking: stored grants this process revoked whose row could not be deleted yet (busy database).
   const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
@@ -91,7 +97,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     const raw = req.headers.host;
     if (typeof raw !== 'string' || !/^(?:[a-z0-9.-]+)(?::[0-9]{1,5})?$/i.test(raw)) throw new PortalError(421, '不支持的工作台主机名');
     const parsed = new URL(`http://${raw}`);
-    const localPort = req.socket.localPort;
+    const localPort = localPortOf(req);
     const secure = !!req.socket.encrypted;
     const port = parsed.port ? Number(parsed.port) : secure ? 443 : 80;
     if (!localPort || port !== localPort) throw new PortalError(421, '工作台访问端口不匹配');
@@ -139,12 +145,13 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   // deletion to a later tick.
   let ticks = 0;
   const sweep = setInterval(() => {
-    if (++ticks % 60 === 0) try { store.withoutWaiting(pruneStored); } catch {}
+    if (++ticks % 60 === 0 && isServing()) try { store.withoutWaiting(pruneStored); } catch {}
     try { sweepProcess(); } catch {}
   }, 1000); sweep.unref();
 
   function createLaunch({ projectId, sessionId, req }) {
     if (closed) throw new PortalError(503, '项目代理已关闭');
+    if (!isServing()) throw new PortalError(503, CANDIDATE);
     const context = requestContext(req);
     if (![HUB_HOST, 'localhost', '127.0.0.1'].includes(context.hostname)) throw new PortalError(403, '请从工作台发起项目访问');
     const project = projectFor(projectId);
@@ -448,6 +455,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       if (url.pathname === '/__hub/authorize') {
         if (req.method !== 'GET') throw new PortalError(405, '授权入口仅支持页面访问');
         browserBoundary(req, context, { authorize: true });
+        if (!isServing()) throw new PortalError(503, CANDIDATE);
         const raw = url.searchParams.get('ticket');
         const ticket = raw && /^[A-Za-z0-9_-]{43}$/.test(raw) ? store.takeTicket(digest(raw), project.id, now()) : null;
         if (!ticket || !liveGrant(ticket)) throw new PortalError(401, '项目入口已过期，请从工作台重新打开');
@@ -463,6 +471,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       if (url.pathname.startsWith('/__hub/')) throw new PortalError(404, '项目代理接口不存在');
       browserBoundary(req, context);
       const grant = authorized(req, context, project);
+      if (!isServing()) throw new PortalError(503, CANDIDATE);
       if (withMutation && project.embedded && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
         try {
           await withMutation(() => new Promise((resolve, reject) => {
@@ -480,6 +489,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     socket.on('error', () => {});
     try {
       if (draining) throw new PortalError(503, '项目代理已关闭');
+      if (!isServing()) throw new PortalError(503, CANDIDATE);
       const context = requestContext(req);
       if ([HUB_HOST, 'localhost', '127.0.0.1'].includes(context.hostname)) return false;
       const project = getProjects().find(item => projectHost(item.id) === context.hostname);
