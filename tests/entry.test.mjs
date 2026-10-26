@@ -267,15 +267,19 @@ test('a client that takes nothing keeps its connection while its slot is the tar
   f.writeRecord('a');
   // The slot answers with far more than the socket buffers hold.
   await f.listen(net.createServer(socket => { socket.on('error', () => {}); socket.write(Buffer.alloc(16 * 1024 * 1024)); }), slotSockets(slotDirectory(f.root, 'a')).http);
-  const identity = await f.control('b');
+  const identity = await f.control('b'); await f.control('a');
   const entry = await f.start({ stallMs: 300 });
   const client = connect(entry.ready.port); await client.ready;
   client.socket.pause();
   await until(() => entry.status().connections.a === 1);
   await wait(900);
   assert.equal(entry.status().connections.a, 1, 'the entry cut a connection its target slot still held');
-  f.writeRecord('b');
-  assert.equal((await controlRequest(entrySockets(f.dir).ctl, 'POST', '/switch', { body: { slot: 'b', instanceId: identity.instanceId } })).status, 200);
+  const switchTo = async (slot, instanceId) => { f.writeRecord(slot); assert.equal((await controlRequest(entrySockets(f.dir).ctl, 'POST', '/switch', { body: { slot, instanceId } })).status, 200); };
+  // Moved away and back at once, as a rollback does: the limit ends with it.
+  await switchTo('b', identity.instanceId); await switchTo('a', 'instance-a');
+  await wait(900);
+  assert.equal(entry.status().connections.a, 1, 'the limit outlived the switch back');
+  await switchTo('b', identity.instanceId);
   const began = Date.now();
   await until(() => entry.status().connections.a === 0);
   assert.ok(Date.now() - began < 3000);
