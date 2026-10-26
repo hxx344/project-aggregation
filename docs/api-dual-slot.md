@@ -2,17 +2,17 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | v1.1 上位评审同步稿（切流方案待修订） |
+| 文档版本 | v1.2 切流方案评审稿（第 3 节待批准） |
 | 日期 | 2026-10-26 |
 | 源码基线 | project-aggregation `f3ea48d` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3.1、9.1、11 节与第 15 节的 M4；[控制面与数据面分离](control-data-plane-separation.md)（M3，已全部发布） |
 | 适用范围 | `server/api/`、`server/portal.mjs`、`server/control/`、`server/static-response.mjs`、`server/recovery/`、`server/update-service/registry.py`、`deploy/install.sh` 与相关测试 |
-| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；M4-3a 排空顺序与静态资源回退已实施（`git log --merges --grep M4-3a`）；其余未实施。第 3、5.2、6 节保留原切流草案，须先按上位第 11 节修订并评审，不作为可直接实施的步骤 |
+| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；M4-3a 排空顺序与静态资源回退已实施（`git log --merges --grep M4-3a`）；其余未实施。第 3 节为按上位第 11 节修订的切流评审稿，批准前不实施；第 5.2、6 节的原草案以第 3 节为准改写 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 9 节 |
 
 文中 `路径:行号` 均指上述基线，实施时以符号名重新定位。
 
-本轮只同步上位约束与实施状态，未选定新的稳定入口实现。原草案的端口复用、候选启动写入、两槽共享 `current` 和公共健康检查存在未解决的契约冲突；对应批次不得按旧步骤实施。M4-2 的授权存储与不涉及激活的排空改进可独立推进，M4 激活仍须满足 M2a、M3 和 P2b 生产验收前置。
+v1.2 在第 3 节提出新的稳定入口与切流方案（推荐独立的连接级入口进程），待评审批准。原草案的端口复用、候选启动写入、两槽共享 `current` 和公共健康检查存在未解决的契约冲突；对应批次不得按旧步骤实施。M4-2 的授权存储与不涉及激活的排空改进可独立推进，M4 激活仍须满足 M2a、M3 和 P2b 生产验收前置。
 
 ## 1 结论与范围
 
@@ -31,7 +31,7 @@ M4 让只改 API 的更新做到：
 - 不做 API 多实例常驻与负载均衡（M7），并存只发生在切换的几秒内。
 - 不做持久 SSE 游标与事件重放（M5）。概览流断开后沿用现有协议：重连即收到完整快照（`src/App.tsx:145`）。
 - 不改运行时、模块、采集或原生执行的重启方式；整体更新仍按 P2 的路径整体重启。
-- 稳定入口是否增加进程在第 3 节重新评审，不以“不新增进程”排除上位候选隔离与可控切流要求。
+- 稳定入口是否增加进程由第 3 节评审决定（评审稿推荐新增入口进程），不以“不新增进程”排除上位候选隔离与可控切流要求。
 - Windows、`pnpm dev:server` 与手动运行的启动器（`server/launcher.mjs`）保持单实例，双槽只用于 Linux systemd 部署。
 
 ### 1.3 退出条件（对应上位文档 M4）
@@ -60,17 +60,146 @@ M4 让只改 API 的更新做到：
 | 只改 API 的判定 | 运行时组件键之外的输入只有 `server/api`、`src`、`public`、`index.html`、`vite.config.ts`、`tsconfig.app.json`（`deploy/package-release.py:323`）；其他共享代码一律算运行时（`deploy/install.sh:2518-2532`） | 新旧两槽并存时，二者只可能在上述输入上不同；`server/control/`、`server/portal.mjs` 的变化必然整体重启 |
 | 静态资源 | 各 API 从自身版本目录的 `dist/` 读取（入口经软链启动，`import.meta.url` 为真实路径） | 并存期间两个槽的 `dist/` 不同，见 6.3 |
 
-## 3 方案选择
+## 3 方案选择（v1.2 评审稿，待批准）
 
-本节保留原方案比较作为评审输入，C 不再视为已选定。新选择须满足上位第 11.2 节：验证前不导流、固定槽版本、私有定向探针和可控切流；同时覆盖稳定入口自身更新及恢复工具停止完整服务组的行为。端口可绑定或省去一跳不足以证明满足这些条件。
+本节是第 3 节的修订评审稿，批准前不实施；第 5.2、6 节的原草案以本节为准改写。选择标准取自上位第 11.2 节：验证前不导流、每槽固定版本、私有定向探针、可控切流、旧槽失败隔离、确定回滚，并覆盖稳定入口自身更新与恢复工具停止完整服务组。
 
-| 方案 | 做法 | 取舍 |
+### 3.1 评审结论
+
+推荐 **A1：独立的连接级稳定入口**。新增 `project-aggregation-entry.service`，只持有公共端口，把每个 TCP 连接原样转发到当前槽的私有 UNIX socket；不解析 HTTP。切流是入口内存中的一次目标替换，由安装器在候选私有验证通过、记录写入后发出。
+
+| 判定项 | A1 独立连接入口（推荐） | A2 入口并入运行时进程 | B systemd 套接字共享 | C 内核端口复用 |
+| --- | --- | --- | --- | --- |
+| 验证前不导流 | 满足：候选不创建流量 socket（3.3） | 满足 | 需候选晚于验证才 `accept`，可做到 | 不满足：一监听即分得外部连接 |
+| 切流可控、原子 | 满足：入口替换目标，此后新连接只到新槽 | 满足 | 不满足：两槽共用一个 accept 队列，只能靠各自开始或停止 `accept` 来近似，没有单一切换点 | 不满足：内核按哈希分配，无切换点 |
+| 关闭旧槽时的排队连接 | 不受影响：排队在入口的监听队列 | 同 A1 | 不受影响：systemd 持有描述符 | 被重置：每个 reuseport socket 有独立 accept 队列，需 root 设置 `tcp_migrate_req`，Node 也不能附加 eBPF 选择器 |
+| 旧槽同期崩溃 | 旧槽按固定版本自动重启；入口在重连预算内等待 | 同 A1 | 同 A1 | 新连接散到崩溃槽时被拒 |
+| SSE、WebSocket、项目 Host | 字节透传，无需重新实现 | 同 A1 | 原生 | 原生 |
+| 客户端与本地地址 | 需传递：入口在每条私有连接前写 PROXY v1 头（3.4） | 同 A1 | 原生 | 原生 |
+| 入口自身更新 | 入口与槽协议计入运行时组件键，只随整体更新重启；代码面很小 | 随运行时重启，同样只在整体更新时发生 | 套接字单元几乎不变 | 无入口 |
+| 恢复工具停服 | 普通服务单元，加同一 recovery guard 即可；停止后端口拒连 | 无新增单元 | 停服期间套接字单元仍完成握手，客户端挂起而不是被拒；套接字单元需固定触发服务或占位单元，与模板槽并存时需额外约定 | 无新增单元 |
+| 隔离 | 入口故障只影响接入，不影响运行时与模块 | 弱：公共流量与数据面共用事件循环，入口缺陷或过载会拖住采集与执行 | 好 | 好 |
+| 资源 | 多一个 Node 进程：最小 `net` 服务实测 RSS 约 47 MiB（Node 24.15，`NODE_ENV=production`）；每个连接多一跳本机 socket 拷贝 | 不增加进程 | 不增加 | 不增加 |
+
+B 被排除的关键是没有单一切换点与停服语义；C 是没有切换点且关闭时重置排队连接。A2 省下约 47 MiB，但把未鉴权的公共连接放进数据面进程，与上位第 3.1 节进程边界和 M3 的拆分方向相反；内存紧张时再按测量复议。
+
+### 3.2 组件与路径
+
+| 组件 | 内容 |
+| --- | --- |
+| 入口 `server/entry/main.mjs` | 加载与运行时相同的 `EnvironmentFile`，监听 `HOST:PORT`（从 API 移来，`0.0.0.0`、IPv6 照旧）；目标槽取自 `.api-slot`；每个外部连接打开到目标槽 `http.sock` 的私有连接，先写 PROXY v1 头再双向透传，支持半关闭；按槽统计在途连接数 |
+| 入口控制 socket | `/run/project-aggregation-entry/ctl.sock`（`RuntimeDirectoryMode=0700`，服务用户所有，root 可连），HTTP：`GET /status` 返回目标槽、切换代数、各槽在途连接数；`POST /switch {slot, instanceId}` |
+| 槽私有 socket（`/run/project-aggregation-api-<槽>/`） | `probe.sock`：安装器定向探针，候选与服务模式都有；`http.sock`：入口转发的流量，**只在服务模式下存在**；`ctl.sock`：`GET /identity` 返回 `{protocol, slot, instanceId, pid, release, mode}`，`POST /promote`。转发流量只能到 `http.sock`，到不了控制接口 |
+| 槽协议 `server/slot-protocol.mjs` | PROXY 头读写、socket 路径、`identity`/`promote`/`switch` 格式与协议版本，由入口和 API 共用。放在 `server/api/` 之外，计入运行时组件键：只改 API 的更新不能改变入口与槽之间的契约，回滚到 `previous` 时同样成立 |
+| 槽的版本绑定 | `$APP_DIR/slots/a`、`slots/b` 分别软链到 `releases/<版本>`；模板单元 `ExecStart` 经 `slots/%i` 启动（入口按 `import.meta.main` 判定，L078）。安装器只改停止状态下的槽链接，自动重启仍用该槽固定版本 |
+| 服务记录 `$APP_DIR/.api-slot` | root 原子写入 `{slot, release}`，是“哪个槽在服务”的唯一持久依据；`current` 仍指向记录中的版本，只表示部署选择，供清理与工具读取 |
+| 切换阶段 `$APP_DIR/.api-cutover` | `{from, to, release, phase}`，`phase` 为 `candidate`、`switching`、`draining`；完成后删除，供中断重跑 |
+
+单槽兼容：Windows、`pnpm dev:server`、手动启动器与 M4 之前的部署不设 `WORKBENCH_API_SOCKET`，API 照旧直接监听 TCP，没有入口与 PROXY 头。
+
+### 3.3 槽的模式
+
+槽启动时读取 `.api-slot`：槽名与真实版本路径都与记录一致时以**服务**模式启动，否则以**候选**模式启动。旧槽在候选验证期间崩溃，会从固定旧版本以服务模式恢复；候选崩溃重启仍是候选。
+
+| 模式 | 行为 |
+| --- | --- |
+| 候选 | 只创建 `probe.sock` 与 `ctl.sock`，不创建 `http.sock`，入口连接它只会得到 `ENOENT` 并按 3.7 等待。库连接设 `PRAGMA query_only=ON`，不执行 `openHubDatabase` 的建表事务（`server/control/schema.mjs:34`），改为核对必需的表与列（`hub.sqlite` 目前没有 schema 版本号，不另造）；不调用 `ensurePassword`/`seedProjects`，只核对管理员密码与项目种子已存在；不构造更新协调器：它在构造时就缓存 `pendingPlanId` 与维护值，并可能写回设置（`server/updates.mjs:193-195`、`:242`、`:250`），所以候选不轮询更新、不同步维护，也不会带着候选启动时的缓存进入服务；不上报 SSE 计数；Portal 不签发也不消费 ticket/grant（含 `GET /__hub/authorize`，`server/portal.mjs:451-452`），返回 503，并停掉每 60 s 的 `pruneStored` 清理（`:141-142`）；其余写请求返回 503。任一核对失败即退出 |
+| 服务 | 现有 API 行为：建表、协调器、计数上报、写入按准入提交。整体更新与首次启动仍在服务模式下执行 `ensurePassword`/`seedProjects`（受控准备阶段） |
+
+`POST /promote`：槽重新读取 `.api-slot`，与自身一致才执行：关闭 `query_only`，此时才构造更新协调器（从库内读取当前持久值）并等待 `initialize()` 结束（失败沿用现有处理：记警告，相关写入暂拒），启动 Portal 清理，再创建 `http.sock` 并返回 `mode=serving`；不一致返回 409；重复调用幂等。
+
+定向探针由安装器运行目标版本中的 `server/entry/probe.mjs`，经 `probe.sock` 发送 PROXY 头（源 `127.0.0.1`，目的端口取环境文件的 `PORT`）与固定的工作台 Host `hub.localhost:<PORT>`（`server/api/server.mjs:431` 与 `server/portal.mjs:443` 都放行；curl 默认的 `localhost` 会被 302 到规范地址，`server/api/server.mjs:435-436`；不用 `PUBLIC_ORIGIN`，因其须连端口完全相等才绕过 Portal，`:423`），全部只读、不带会话：`/api/health` 与 `/api/ready` 为 200；`/` 返回本版本 `index.html`，其引用的一个 `assets/` 文件可读；带一个已登记项目 Host 的无授权请求得到 Portal 的 401（不签发 ticket）；`/api/session` 无会话得到 `authenticated: false`。另以 `ctl.sock` 的 `identity` 核对 `pid` 等于单元 `MainPID`、`release` 等于目标版本、`slot` 与 `mode` 正确、`protocol` 与入口一致。不用 curl 的 `--haproxy-protocol`：它在 UNIX socket 上发出的地址不可控。服务模式下 `probe.sock` 只接受 GET、HEAD。公共端口应答不能替代以上检查。
+
+### 3.4 客户端与本地地址
+
+经入口转发后，私有连接上的 `req.socket` 是 UNIX socket，没有对端地址和本地端口：
+
+- `remoteAddress` 用于登录 IP 限流与日志，共 4 处（`server/api/server.mjs:237`、`:306`、`:310`，`server/logger.mjs:26`）；不处理会把所有客户端算作同一来源。
+- `localPort` 用于 Portal 核对 Host 端口（`server/portal.mjs:94-97`）；它在每个请求的第一步执行，不处理会使整站请求与升级连接都返回 421。
+
+处理：入口在每条私有连接开头写 `PROXY TCP4|TCP6 源 目的 源端口 目的端口\r\n`；API 在 `http.sock` 与 `probe.sock` 上先读这一行（限 108 字节、2 s，格式错误、`UNKNOWN` 或超时即断开），把两端地址记在连接上，再交给 HTTP 服务；上述 5 处改读 `clientAddress(req)` 与 `localPortOf(req)`。只在私有 UNIX socket 上接受 PROXY 头，TCP 监听不解析，外部不能伪造来源。`req.socket.encrypted` 不受影响：API 本身不终结 TLS，转发前后都为 false。
+
+### 3.5 只改 API 的切换步骤与提交点
+
+`activation_scope` 为 `api` 时（判定改为比对入口单元而不是单个 API 单元文件，`deploy/install.sh:2523-2524`；存在 `.api-cutover` 时先续完或回滚上一次切换，仍未收敛就按整体更新处理，不给出 `api`；其余条件不变）：
+
+| 步骤 | 动作 | 失败或中断时 |
 | --- | --- | --- |
-| A 常驻前置代理 | 新增一个只做转发的进程监听端口，按记录把请求转到 `a` 或 `b` 的 UNIX socket | 每个请求多一跳；转发 SSE、WebSocket 升级与 Portal 的项目 Host 要再实现一遍；前置代理自身更新又会断连 |
-| B systemd 套接字共享 | `project-aggregation-api.socket` 持有监听，两个槽经 `Sockets=` 继承同一描述符 | 排队队列唯一，关闭一槽不丢连接；但套接字单元需要一个固定的触发服务名，与模板槽冲突；无进程时有连接会自动拉起服务，与恢复 guard 的停服语义冲突 |
-| C 内核端口复用（原草案，待修） | 两个槽都以 `SO_REUSEPORT` 监听同一地址，内核分配新连接 | 原草案记录可绑定同端口，但候选一监听即可能接外部流量，不能满足先验证后切流；需重新论证或替换，不能按本节直接实施 |
+| 1 准备 | 读 `.api-slot` 得旧槽 `old`，`new` 为另一槽；`new` 若在运行先停止；`slots/new` 指向目标版本；写 `.api-cutover` `phase=candidate` | 外部无变化；重跑从本步重来 |
+| 2 候选 | `systemctl start api@new`，等待 `identity` 为候选且身份一致（60 s），执行 3.3 的定向探针 | 停止 `new`、删除 `.api-cutover`，更新失败；`old` 未被触碰 |
+| 3 记录 | `.api-cutover` 写 `phase=switching`；`systemctl enable api@new`；原子写 `.api-slot={new, 版本}`；`current` 指向目标版本 | **提交点**是 `.api-slot` 的写入。之后重跑向前完成 4 至 6，或按回滚流程反向切换 |
+| 4 晋升与切流 | `ctl promote new`；入口 `switch {new, instanceId}`：入口自行读取 `.api-slot` 与 `new` 的 `identity`，须记录槽等于目标、目标为服务模式且实例号一致，才替换目标并返回切换代数 | 失败按回滚流程处理 |
+| 5 排空 | `phase=draining`；`systemctl disable api@old`；`systemctl stop api@old`（按 5.1 节排空，至多 75 s）；入口 `status` 中 `old` 在途连接数归零 | 停止超时由 systemd 强杀；重跑按记录停止并停用非记录槽 |
+| 6 完成 | 经公共端口检查 `/api/ready`，入口 `status` 目标为 `new`；删除 `.api-cutover`；`finish_activation` | 健康失败按回滚流程处理 |
 
-方案 C 还存在关闭监听时排队连接被重置的问题；不能以队列通常为空或浏览器可能重试作为无损证明。连接迁移参数也不能代替候选隔离与切流控制。新方案须按第 1.3 节覆盖真实负载和失败路径，系统参数改动另行评估。
+启用链接先加后减：步骤 3 先启用 `new` 再写记录，步骤 5 才停用 `old`。任意时刻断电，开机时至少拉起记录中的槽：记录未写时 `old` 以服务模式启动、`new` 以候选模式空转；记录已写时 `new` 以服务模式启动、`old` 以候选模式空转。重跑负责停止并停用候选槽。
+
+步骤 3 到 4 之间的窗口：
+
+- 旧槽若恰好崩溃，会以候选模式重启（记录已指向 `new`），没有 `http.sock`；入口目标仍是 `old`，新连接按 3.6 等待，直到步骤 4 完成或回滚。
+- 入口若重启，以记录中的 `new` 为目标；`new` 尚未晋升，没有 `http.sock`，新连接同样按 3.7 等待。
+
+两种情况都不会把真实流量送进候选槽；安装器连续执行步骤 3、4，中断后重跑按 `phase=switching` 续作。重跑时若 `.api-slot` 尚未等于 `phase.to`，从步骤 3 重做；已相等则从步骤 4 继续。
+
+**两个协调器并存**：从步骤 4 晋升到步骤 5 旧槽停止，至多约 75 s 内两个槽都在服务模式。更新协调器（`server/updates.mjs`）、Portal 与控制表都在运行时组件键内，只改 API 的更新中两槽的协调器与 Portal 代码相同、读写同一组共享表；协调器的回调接线在 `server/api/server.mjs:74-90`，属于可随只改 API 的更新变化的代码，M4-3b 须把其中改写共享状态的部分移到 `server/api/` 之外或证明它只做映射；`initialize()` 与维护同步按库内持久值幂等收敛，只改 API 的更新不进入交易维护，因此不会互相改写维护状态。此结论在 M4-4 的 Ubuntu CI 中以“切换期间两槽同时轮询、维护状态与更新任务终态不变”验证。
+
+**回滚**（切流后健康失败、更新任务失败或用户回退）走同一流程，目标为 `previous`：旧槽仍在运行时从步骤 3 开始，并在步骤 4 对它执行 `promote`（它可能已以候选模式重启；仍在服务模式时 `promote` 为幂等）；已停止时从步骤 1 开始，以其固定旧版本作为候选验证。回滚也失败时保持 `new` 服务并报告失败，不宣告成功。目标版本不支持双槽时按整体更新处理（见第 7 节）。
+
+**中断重跑**依据 `.api-cutover`、`.api-slot`、两个槽链接、两个单元的启用状态、`MainPID` 与 `identity`：无 `.api-cutover` 时只校正启用链接并停止非记录槽；有则按阶段续作。不从 `current` 推断哪个槽在服务。
+
+### 3.6 整体更新与整体回滚
+
+整体更新（运行时、入口或共享代码变化）沿用 P2 的停组路径，但必须同时改写槽绑定，不能只改 `current`（现有路径见 `deploy/install.sh:2818`、`:2825`，回滚见 `:1419-1421`）：
+
+1. `systemctl stop project-aggregation`，经 `PartOf=` 停止入口与两个槽。
+2. 写入单元文件；把记录槽 `s` 的链接 `slots/s` 指向目标版本，原子写 `.api-slot={s, 目标版本}`，`current` 指向目标版本；非记录槽停用，其链接也指向目标版本，避免清理一直保留它原来的版本；删除残留的 `.api-cutover`。
+3. 启动运行时，由其 `Wants=` 拉起入口，入口经启用链接拉起 `s`，`s` 以服务模式启动。
+4. 健康检查与 `finish_activation`；失败时整体回滚按同样顺序把 `slots/s`、`.api-slot`、`current` 改回 `previous`。
+
+所有改写都在服务组停止期间进行，中断后重跑从第 1 步重来即可，不存在一半已切换的运行状态。
+
+### 3.7 入口行为与预算
+
+- 目标槽连接失败（`ENOENT`、`ECONNREFUSED`，例如槽在自动重启或尚未晋升）：每 200 ms 重试，单次连接超时 2 s，总预算 10 s；期间暂停读取客户端数据；预算用尽关闭客户端连接并记一条警告。不重试已发出数据的连接。
+- 切换只影响之后接受的连接；已建立的连接留在原槽，由原槽排空时的 `Connection: close` 与强制关闭结束（M4-3a 已实现）。
+- 没有有效记录时不接受转发（关闭连接并记录原因），不猜测目标。
+- 单元：`Restart=always`、`RestartSec=1`；入口崩溃期间端口拒连，影响与现在 API 重启相同，但入口代码只做转发，崩溃面更小。
+
+### 3.8 单元关系与恢复入口
+
+- 运行时单元 `Wants=project-aggregation-entry.service`；入口单元 `PartOf=project-aggregation.service`，**不设 `[Install]`、永不 enable**，只由运行时单元文本拉起；模板槽 `PartOf=project-aggregation.service`，以 `WantedBy=project-aggregation-entry.service` 启用。
+- 回退到 M4 之前的安装器时：它在整体更新开头 `systemctl stop "$SERVICE"`（`deploy/install.sh:2392`），经 `PartOf=` 停掉入口与槽；重写后的运行时单元不再 `Wants=` 入口，入口不再被拉起，挂在入口下的槽启用链接随之失效，不会与旧 API 争端口。这依赖旧安装器先停组而不是直接 `restart`（直接 `restart` 会经 `PartOf=` 把入口一起重启）；实施时核对各受支持旧版本的这一行为。残留单元可手动删除后 `daemon-reload`。
+- `systemctl stop|restart project-aggregation` 经 `PartOf=` 作用于入口与两个槽。恢复工具停止运行时单元及入口、`@a`、`@b`；guard 写入入口与模板两个 drop-in 目录，`install_guard` 分别核对。
+- 入口单元文本、入口与槽协议代码计入整体更新判定：变化即整体重启。模板文本变化不改变判定，新模板在下次启动槽时生效。
+- `prune_releases` 保留两个槽链接指向的版本。
+- 入口与槽的 `ctl.sock` 对同一服务用户的其他进程（如模块）可达：`identity` 只读，`promote` 与 `switch` 都须与 root 写入的记录一致，因此不能借此把流量导向未经记录的槽。同用户进程也能连 `http.sock`、`probe.sock` 并伪造 PROXY 头的来源地址，绕过按 IP 的登录限流；这不比它已能直接读写 `hub.sqlite` 扩大权限，只在此登记。
+
+### 3.9 首次迁移与退回
+
+| 情形 | 处理 |
+| --- | --- |
+| 首次启用双槽 | 整体更新：停组；删除单个 API 单元；写入入口、模板与运行时单元；`slots/a` 指向目标版本，`.api-slot={a, 目标版本}`，启用 `@a`；启动运行时 |
+| 首次启用失败 | 整体回滚：停组；删除入口单元、模板、槽链接、启用链接、`.api-slot`、`.api-cutover`；恢复单个 API 单元与旧运行时单元，`current` 指回 `previous`；启动。未删除入口单元会使其占住端口，所以删除在恢复启动之前完成 |
+| 由 M4 安装器回退到 M4 之前的版本 | 同“首次启用失败”的拆除步骤 |
+| 退回 M4 之前后再升级到 M4 | 视为首次启用：先删除残留的 `.api-slot`、槽链接与启用链接（可能指向已清理的版本），再按首次启用重建，不沿用残留记录 |
+
+### 3.10 影响面
+
+| 部分 | 变化 |
+| --- | --- |
+| `server/api/main.mjs`、`server/api/server.mjs`、`server/portal.mjs`、`server/logger.mjs`、`server/control/schema.mjs` | 候选/服务模式、私有 socket 与 PROXY 头、`clientAddress`/`localPortOf`、只读核对、`identity`/`promote` |
+| `server/slot-protocol.mjs`、`server/entry/`（新增） | 槽协议、连接转发、控制 socket、重连预算、定向探针 |
+| `deploy/install.sh` | 入口与模板单元、槽链接、`.api-slot`/`.api-cutover`、切换与回滚、整体更新改写槽绑定、首次迁移与退回、清理根、`activation_scope` |
+| `server/update-service/registry.py`、`server/recovery/operations.py` | 登记入口与模板单元、guard、停服集合 |
+| 资源 | 多一个约 47 MiB 起的常驻进程；切换期间两个 API 槽并存（API 实测约 75 MiB），至多 75 s |
+| 不变 | 运行时、模块、采集、执行；会话、登录风控、Portal 的共享表 |
+
+### 3.11 待批准事项
+
+1. 接受新增常驻入口进程（A1）及其约 47 MiB 起的内存与一跳本机转发；否则改选 A2。
+2. 槽的模式由 `.api-slot` 决定；候选只读、不创建流量 socket、不调用 `ensurePassword`/`seedProjects`，只改 API 的更新依赖旧槽已完成这两步。
+3. 客户端地址与本地端口经 PROXY v1 头传递，只在私有 UNIX socket 上接受。
+4. 批次按第 9 节的修订拆分：M4-3b 做 API 侧模式、私有接口与槽协议，M4-3c 做入口进程与探针，二者在单槽部署中都不接线；M4-4 接线并在 Ubuntu CI 做连续请求验收。
 
 ## 4 M4-1、M4-2：共享登录风控与 Portal 授权
 
@@ -154,7 +283,7 @@ M4-3a 实施要点（`createApiServer().close()`，原 `closeServer()` 并入其
 
 ### 5.2 端口复用与就绪标记
 
-以下变量仅为原草案，不是已批准实现。重新评审时保留槽、版本和进程身份核对，补每槽私有探针；是否使用端口复用随第 3 节决策，不允许用公共端口应答替代候选检查。
+以下变量仅为原草案，不是已批准实现。第 3 节评审稿以入口持有的公共端口、槽的私有 UNIX socket、槽链接、`.api-slot` 记录与 `identity` 接口取代端口复用与就绪文件（见 3.2、3.3）；批准后按其改写本节。不允许用公共端口应答替代候选检查。
 
 `server/api/main.mjs` 增加两个环境变量，只在双槽单元中设置：
 
@@ -177,7 +306,7 @@ M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup
 
 ## 6 M4-4：双槽单元与安装器切换
 
-本节为待替换的原草案。后续版本须将两槽的启动路径分别绑定不可变 release，按“候选私有验证→可控切流→旧槽排空→完整回执”改写，并登记每步持久化和恢复依据；下述共享 `current`、先监听再验证及不区分应答槽的流程不得原样实施。
+本节为待替换的原草案，第 3 节评审稿的 3.5 至 3.9 给出替换后的单元关系、切换步骤与提交点。后续版本须将两槽的启动路径分别绑定不可变 release，按“候选私有验证→可控切流→旧槽排空→完整回执”改写，并登记每步持久化和恢复依据；下述共享 `current`、先监听再验证及不区分应答槽的流程不得原样实施。
 
 ### 6.1 服务单元
 
@@ -246,18 +375,19 @@ WantedBy=project-aggregation.service
 | 首次启用双槽 | 单元拓扑变化，整体更新；来源尚无持久 Portal 时旧 grant 随进程消失，用户重新打开模块页面。来源已含 M4-1 时保留库内登录风控；更早版本的内存计数不迁移 |
 | M4 之间只改 API | 候选验证后切流，旧槽按预算排空，流断开后恢复；连接失败口径按第 1.3 节验收 |
 | M4 之间改到共享代码或单元 | 整体更新，与 P2 相同 |
-| 回退到 M4 之前的版本 | 运行时单元不同，整体更新；安装器恢复单个 API 单元、删除模板与依赖链接；新表留在库里不影响旧代码 |
+| 回退到 M4 之前的版本 | 运行时单元不同，整体更新；M4 安装器执行回滚时恢复单个 API 单元，删除入口单元、模板、槽链接、`.api-slot` 与 `.api-cutover`；由 M4 之前的安装器执行时，残留单元不再被拉起（见 3.8、3.9），可手动删除后 `daemon-reload`；新表留在库里不影响旧代码 |
 | 新表结构以后需要改动 | 只能先扩展后收缩；由于 `server/control/` 计入运行时组件键，改动必然整体重启，不会出现新旧两槽同时读写不同语义 |
 
 ## 8 风险
 
 | 风险 | 处理 |
 | --- | --- |
-| 关闭监听瞬间排队连接被重置 | 原草案未满足连续性证明，须重新选型并做负载验收，不将浏览器重试或内核参数当成已解决 |
+| 关闭监听瞬间排队连接被重置 | 评审稿由入口持有唯一监听队列，关闭旧槽不涉及公共监听；仍须按第 1.3 节做负载验收，不将浏览器重试或内核参数当成已解决 |
+| 入口成为新的单点 | 入口只做连接转发、计入整体更新；崩溃由 systemd 1 s 内重启，期间影响与现有 API 重启相同；M4-3c 覆盖半关闭、升级连接、重连预算与控制接口 |
 | 登录与 Portal 改为每次读库后的写入竞争 | 每步一个短事务；Portal 的每个请求只读不写，写只发生在签发、消费、撤销与清理；P1-4d-1 的写等待统计可观察影响 |
-| 候选误启动协调器 | 候选验证期间禁止更新轮询及维护同步，晋升后才启用服务中职责；按上位状态边界验证 |
+| 候选误启动协调器 | 候选不构造协调器、不建 `http.sock`，`promote` 时才从库内持久值构造并启用服务中职责（3.3）；按上位状态边界验证 |
 | 旧页面与新 API 的接口兼容 | 与现有整体更新相同，不在本方案内新增约束 |
-| 就绪记录与候选链路不一致 | 受信控制路径核对固定槽版本、单元进程和就绪身份，并做私有 HTTP/Portal/静态探针；文件存在本身不构成就绪 |
+| 槽身份与候选链路不一致 | 安装器以 `ctl.sock` 的 `identity` 核对槽、固定版本、`MainPID` 与协议版本，并经 `probe.sock` 做 HTTP/Portal/静态探针；入口切换时再核对记录与实例号（3.3、3.5） |
 
 ## 9 批次拆分
 
@@ -266,10 +396,11 @@ WantedBy=project-aggregation.service
 | M4-1 | 共享登录风控：`server/control/login-guard.mjs`、建表、登录路由改用共享表、恢复时清空、跨实例测试 | R3（鉴权） | 中 |
 | M4-2 | Portal 持久授权：`server/control/portal-store.mjs`、建表、`createPortal` 改用存储、恢复时清空、跨实例测试 | R3（鉴权） | 中 |
 | M4-3a | 单实例 API 排空顺序与静态资源跨版本回退，不含激活 | R2 | 中 |
-| M4-3b | 显式候选模式、固定槽身份、私有探针与就绪协议；切流方式先按第 3 节重新评审 | R3（部署激活） | 中 |
+| M4-3b | 按第 3.2 至 3.4 节：`server/slot-protocol.mjs`、API 候选/服务模式与只读核对、私有 `probe.sock`/`http.sock`/`ctl.sock`、`identity`/`promote`、PROXY 头与 `clientAddress`/`localPortOf`；单槽部署不接线 | R3（部署激活） | 中 |
+| M4-3c | 按第 3.2、3.7 节：`server/entry/` 连接转发、控制 socket、重连预算与 `probe.mjs` 定向探针；单槽部署不接线 | R3（部署激活） | 中 |
 | M4-4 | 模板单元与槽记录、安装器双槽切换与回滚、首次迁移与回退、更新服务登记、恢复入口、Ubuntu CI 连续请求验证 | R3（部署激活） | 大 |
 
-每个实现批次单独提交、单独审查并发布。M4-1、M4-2 已合入；M4-3a 可在单实例部署先行改善授权、关闭和旧分包加载。M4-3b 须先完成切流方案评审；M4-4 依赖 M4-1、M4-2、M4-3a/b 全部通过并发布，以及 M2a、M3 和 P2b 生产验收前置，不把尚未完成的草案当作可直接实施方案。
+每个实现批次单独提交、单独审查并发布。M4-1、M4-2 已合入；M4-3a 可在单实例部署先行改善授权、关闭和旧分包加载。M4-3b、M4-3c 须在第 3 节评审稿批准后实施；M4-4 依赖 M4-1、M4-2、M4-3a/b/c 全部通过并发布，以及 M2a、M3 和 P2b 生产验收前置，不把尚未完成的草案当作可直接实施方案。
 
 ## 10 关联资料
 
