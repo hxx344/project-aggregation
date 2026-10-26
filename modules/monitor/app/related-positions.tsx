@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import { ArrowUpRight, ChevronDown, Link2 } from "lucide-react";
-import { hubOpenTrading, POSITIONS_TIMEOUT_MS, useHubHost, useHubPositions, type HubPositionItem, type PositionsMarket } from "../lib/hub-bridge";
+import { hubOpenTrading, POSITIONS_TIMEOUT_MS, useHubHost, useHubPositions, type HubPositionItem, type HubPositionsView, type PositionsMarket } from "../lib/hub-bridge";
 import { pairedMarket, relatedSpreadPairs, type RealizedStatus, type SpreadPair, type UnpairedReason, type VenueSpreads } from "../lib/related-pairs";
 import type { SpreadMarket } from "../lib/exchange-quotes";
 
@@ -95,6 +95,19 @@ function PositionRows({ items }: { items: HubPositionItem[] }) {
   </li>)}</ul>;
 }
 
+// Names the failing layer so a screenshot tells where the read stopped.
+function unavailableMessage({ timedOut, reason, httpStatus }: Pick<HubPositionsView, "timedOut" | "reason" | "httpStatus">) {
+  if (timedOut) return `持仓不可用：${POSITIONS_TIMEOUT_MS / 1000} 秒内未收到工作台回复，稍后自动重试`;
+  switch (reason) {
+    case "background": return "持仓不可用：工作台页面不在前台，返回后重新读取";
+    case "timeout": return "持仓不可用：工作台读取持仓超时，稍后自动重试";
+    case "http": return `持仓不可用：工作台读取持仓失败（HTTP ${httpStatus ?? "错误"}），稍后自动重试`;
+    case "network": return "持仓不可用：工作台连接中断，稍后自动重试";
+    case "malformed": return "持仓不可用：持仓数据格式无效，稍后自动重试";
+    default: return "持仓不可用：工作台暂时无法读取持仓，稍后自动重试";
+  }
+}
+
 export default function RelatedPositions({ market, symbols, active, spreads, variant = "panel", extra }: { market: PositionsMarket; symbols: readonly string[]; active: boolean; spreads?: VenueSpreads; variant?: "panel" | "strip"; extra?: ReactNode }) {
   const host = useHubHost();
   const [open, setOpen] = useState(false);
@@ -112,7 +125,7 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
     : positions.status === "empty" ? "无可查询的关联币种"
     : positions.status === "loading" ? "加载中…"
     : positions.status === "unauthorized" ? "未登录工作台，登录后可查看关联持仓"
-    : positions.status === "unavailable" ? positions.timedOut ? `持仓不可用：${POSITIONS_TIMEOUT_MS / 1000} 秒内未收到工作台回复，稍后自动重试` : "持仓不可用：工作台暂时无法读取持仓"
+    : positions.status === "unavailable" ? unavailableMessage(positions)
     : positions.incomplete && !positions.items.length ? "部分数据源不可用"
     : !positions.items.length ? "无关联持仓" : "";
   const partial = sourcesIncomplete && shown.length > 0;

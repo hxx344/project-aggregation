@@ -85,6 +85,8 @@ export default function ProjectPage({ project, snapshot, now, active, background
         void positions.current.read(latest.current.active && document.visibilityState === 'visible').then(outcome => {
           if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('positions')) return;
           post(positionsReply(request, outcome, Date.now()));
+          // A foreground request this page refused means the module missed an activity change; resend it.
+          if (outcome.status === 'unavailable' && outcome.reason === 'background') synchronize();
         });
       } else if (positionsBridge && connected.current && data.type === 'fills-request' && moduleCapabilities.current.includes('fills')) {
         const request = fillsRequest(data); if (!request) return;

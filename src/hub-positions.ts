@@ -3,6 +3,8 @@ import type { PositionCycle, TradingPositionsResponse } from './trading-position
 export const POSITION_MARKETS = ['oil', 'cl-xau', 'hynix', 'perpetual'] as const;
 export type PositionMarket = typeof POSITION_MARKETS[number];
 export type PositionsStatus = 'ok' | 'unavailable' | 'unauthorized';
+/** Why a read is unavailable, so the module can name the failing layer. 'background': the host page was not in the foreground. */
+export type UnavailableReason = 'background' | 'timeout' | 'http' | 'network' | 'malformed';
 export type PositionsRequest = { requestId: string; market: PositionMarket; symbols: string[] };
 export type HubPositionItem = {
   key: string; source: string; exchange: string; exchangeId?: string; symbol: string; base: string; side: 'long' | 'short';
@@ -12,10 +14,13 @@ export type HubPositionItem = {
 };
 export type PositionsReply = {
   type: 'positions'; requestId: string; market: PositionMarket; status: PositionsStatus; generatedAt: string | null; incomplete: boolean; items: HubPositionItem[];
+  /** Present on unavailable replies; `httpStatus` only with reason 'http'. */
+  reason?: UnavailableReason; httpStatus?: number;
   /** Present on successful reads; counts cover provided source/scope lists before the item cap. */
   sourcesIncomplete?: boolean; truncated?: boolean; matchedCount?: number; itemLimit?: number;
 };
-export type PositionsOutcome = { status: 'ok'; data: unknown; at: number } | { status: 'unavailable' | 'unauthorized'; at: number };
+export type PositionsOutcome = { status: 'ok'; data: unknown; at: number } | { status: 'unauthorized'; at: number }
+  | { status: 'unavailable'; at: number; reason?: UnavailableReason; httpStatus?: number };
 
 export const POSITIONS_CAPABILITIES = ['positions', 'open-trading'] as const;
 export const MAX_POSITION_ITEMS = 50;
@@ -112,16 +117,28 @@ export function positionItems(response: unknown, bases: readonly string[], now: 
 }
 
 export function positionsReply(request: PositionsRequest, outcome: PositionsOutcome, now: number): PositionsReply {
-  const failed = (status: 'unavailable' | 'unauthorized'): PositionsReply => ({ type: 'positions', requestId: request.requestId, market: request.market, status, generatedAt: null, incomplete: false, items: [] });
-  if (outcome.status !== 'ok') return failed(outcome.status);
+  const failed = (status: 'unavailable' | 'unauthorized', cause: { reason?: UnavailableReason; httpStatus?: number } = {}): PositionsReply => ({ type: 'positions', requestId: request.requestId, market: request.market, status, generatedAt: null, incomplete: false, items: [], ...cause });
+  if (outcome.status === 'unauthorized') return failed('unauthorized');
+  if (outcome.status === 'unavailable') return failed('unavailable', { ...(outcome.reason ? { reason: outcome.reason } : {}), ...(outcome.httpStatus ? { httpStatus: outcome.httpStatus } : {}) });
   try {
     const selection = positionItems(outcome.data, request.symbols, now);
     const generatedAt = (outcome.data as TradingPositionsResponse).generatedAt;
     return { type: 'positions', requestId: request.requestId, market: request.market, status: 'ok', generatedAt: typeof generatedAt === 'string' && Number.isFinite(Date.parse(generatedAt)) ? generatedAt : null, ...selection };
   } catch (error) {
-    if (error instanceof MalformedPositions) return failed('unavailable');
+    if (error instanceof MalformedPositions) return failed('unavailable', { reason: 'malformed' });
     throw error;
   }
+}
+
+// api() rejects with a TimeoutError, an error carrying the HTTP status (200 for an unreadable body), or a fetch failure.
+export function failedOutcome(error: unknown, at: number): PositionsOutcome {
+  const value = error as { name?: unknown; status?: unknown } | null;
+  if (value?.status === 401) return { status: 'unauthorized', at };
+  if (value?.name === 'TimeoutError') return { status: 'unavailable', at, reason: 'timeout' };
+  if (typeof value?.status === 'number' && Number.isInteger(value.status)) {
+    return value.status >= 200 && value.status < 300 ? { status: 'unavailable', at, reason: 'malformed' } : { status: 'unavailable', at, reason: 'http', httpStatus: value.status };
+  }
+  return { status: 'unavailable', at, reason: 'network' };
 }
 
 // One in-flight read shared by concurrent requests; every outcome, including
@@ -134,11 +151,11 @@ export function createPositionsSource(load: (signal: AbortSignal) => Promise<unk
       const hit = fresh();
       if (hit) return Promise.resolve(hit);
       if (pending) return pending;
-      if (!allowNetwork) return Promise.resolve({ status: 'unavailable', at: clock() });
+      if (!allowNetwork) return Promise.resolve({ status: 'unavailable', at: clock(), reason: 'background' });
       const own = controller = new AbortController();
       const promise: Promise<PositionsOutcome> = load(own.signal).then(
         (data): PositionsOutcome => ({ status: 'ok', data, at: clock() }),
-        (error): PositionsOutcome => ({ status: (error as { status?: unknown } | null)?.status === 401 ? 'unauthorized' : 'unavailable', at: clock() }),
+        (error): PositionsOutcome => failedOutcome(error, clock()),
       ).then(outcome => {
         if (controller === own) { cache = own.signal.aborted ? null : outcome; cacheFor = cacheMsFor(outcome); pending = null; controller = null; }
         return outcome;

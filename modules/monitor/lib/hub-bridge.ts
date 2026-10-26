@@ -71,13 +71,17 @@ export type HubPositionItem = {
 };
 /** Range fields are absent on older hosts and failed reads. */
 type PositionsRange = { truncated: boolean; matchedCount: number; itemLimit: number };
+/** Why the host could not read: it was not in the foreground, its read timed out or failed, or the data was malformed. Older hosts omit it. */
+export type HubUnavailableReason = 'background' | 'timeout' | 'http' | 'network' | 'malformed';
 /** `incomplete` marks unconfirmed sources or a truncated match list. */
-export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; sourcesIncomplete?: boolean; items: HubPositionItem[]; timedOut?: boolean } & Partial<PositionsRange>;
+export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; sourcesIncomplete?: boolean; items: HubPositionItem[]; timedOut?: boolean;
+  reason?: HubUnavailableReason; httpStatus?: number } & Partial<PositionsRange>;
+const UNAVAILABLE_REASONS: ReadonlySet<string> = new Set(['background', 'timeout', 'http', 'network', 'malformed']);
 const POSITION_MARKETS: ReadonlySet<string> = new Set(['oil', 'cl-xau', 'hynix', 'perpetual']);
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/, POSITION_BASE = /^[A-Z0-9]{1,20}$/;
 // Outlasts the host's own positions read deadline (15 s) so a slow but answered read is not reported as silence.
 export const POSITIONS_TIMEOUT_MS = 20_000, POSITIONS_REFRESH_MS = 60_000;
-// Longer than the host's 20 s positions cache so the follow-up reaches Asset again.
+// Longer than the host's 20 s positions cache (which also holds failures) so the follow-up reaches Asset again.
 export const POSITIONS_FOLLOW_UP_MS = 25_000;
 
 export function cleanPositionsRequest(market: unknown, symbols: unknown): { market: PositionsMarket; symbols: string[] } | null {
@@ -133,6 +137,10 @@ export function parsePositionsReply(value: unknown): HubPositionsReply | null {
   // Older hosts omit the flag; treat that as complete rather than rejecting the reply.
   if (reply.incomplete !== undefined && typeof reply.incomplete !== 'boolean') return null;
   if (reply.sourcesIncomplete !== undefined && typeof reply.sourcesIncomplete !== 'boolean') return null;
+  // Diagnostic only: an unknown reason (a newer host) or an inconsistent status is dropped, never the reply.
+  const reason = reply.status === 'unavailable' && typeof reply.reason === 'string' && UNAVAILABLE_REASONS.has(reply.reason) ? reply.reason as HubUnavailableReason : undefined;
+  const httpStatus = reason === 'http' && typeof reply.httpStatus === 'number' && Number.isInteger(reply.httpStatus) && reply.httpStatus >= 100 && reply.httpStatus <= 599 ? reply.httpStatus : undefined;
+  const cause = reason ? { reason, ...(httpStatus !== undefined ? { httpStatus } : {}) } : {};
   let range: Partial<PositionsRange> = {};
   if (reply.truncated !== undefined || reply.matchedCount !== undefined || reply.itemLimit !== undefined) {
     const { truncated, matchedCount, itemLimit } = reply;
@@ -144,7 +152,11 @@ export function parsePositionsReply(value: unknown): HubPositionsReply | null {
   const ok = reply.status === 'ok';
   // Older hosts do not split the reasons; preserve their existing source warning.
   const sourcesIncomplete = reply.sourcesIncomplete ?? reply.incomplete === true;
-  return { requestId: reply.requestId, market: reply.market as PositionsMarket, status: reply.status, generatedAt: reply.generatedAt, incomplete: ok && (reply.incomplete === true || sourcesIncomplete || range.truncated === true), sourcesIncomplete: ok && sourcesIncomplete, items: ok ? items as HubPositionItem[] : [], ...(ok ? range : {}) };
+  return { requestId: reply.requestId, market: reply.market as PositionsMarket, status: reply.status, generatedAt: reply.generatedAt, incomplete: ok && (reply.incomplete === true || sourcesIncomplete || range.truncated === true), sourcesIncomplete: ok && sourcesIncomplete, items: ok ? items as HubPositionItem[] : [], ...(ok ? range : {}), ...cause };
+}
+/** Read again sooner than the regular refresh after a failed read, and while Asset summarizes closed trades. */
+export function positionsFollowUp(reply: HubPositionsReply) {
+  return reply.status === 'unavailable' || reply.status === 'ok' && reply.items.some(item => item.cycle?.status === 'loading');
 }
 const createRequestId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 /** One requester per consumer: only its most recent request may resolve, and silence becomes unavailable. */
@@ -182,6 +194,7 @@ export function useHubHost() {
 export type HubPositionsView = {
   status: 'standalone' | 'connecting' | 'unsupported' | 'empty' | 'loading' | HubPositionsReply['status'];
   items: HubPositionItem[]; generatedAt: string | null; timedOut: boolean; incomplete: boolean; sourcesIncomplete?: boolean;
+  reason?: HubUnavailableReason; httpStatus?: number;
   /** A failed refresh keeps the last good list visible, labelled with its own time. */
   previous: Pick<HubPositionsReply, 'items' | 'generatedAt' | 'incomplete' | 'sourcesIncomplete' | 'truncated' | 'matchedCount' | 'itemLimit'> | null;
 } & Partial<PositionsRange>;
@@ -200,8 +213,7 @@ export function useHubPositions(market: PositionsMarket, symbols: readonly strin
       send: message => post(message),
       onReply: reply => {
         if (followUp) clearTimeout(followUp);
-        // Asset summarizes closed trades in the background; read again sooner than the regular refresh.
-        followUp = reply.status === 'ok' && reply.items.some(item => item.cycle?.status === 'loading') ? setTimeout(run, POSITIONS_FOLLOW_UP_MS) : null;
+        followUp = positionsFollowUp(reply) ? setTimeout(run, POSITIONS_FOLLOW_UP_MS) : null;
         setStored(current => {
         const sameKey = current?.key === requestKey ? current : null;
         const previous = reply.status === 'ok' ? null : sameKey?.reply.status === 'ok' ? sameKey.reply : sameKey?.previous ?? null;
@@ -220,7 +232,7 @@ export function useHubPositions(market: PositionsMarket, symbols: readonly strin
   if (mode) return { status: mode, items: [], generatedAt: null, timedOut: false, incomplete: false, previous: null };
   const current = stored?.key === requestKey ? stored : null;
   if (!current) return { status: 'loading', items: [], generatedAt: null, timedOut: false, incomplete: false, previous: null };
-  return { status: current.reply.status, items: current.reply.items, generatedAt: current.reply.generatedAt, timedOut: Boolean(current.reply.timedOut), incomplete: current.reply.incomplete, sourcesIncomplete: current.reply.sourcesIncomplete, truncated: current.reply.truncated, matchedCount: current.reply.matchedCount, itemLimit: current.reply.itemLimit, previous: current.previous };
+  return { status: current.reply.status, items: current.reply.items, generatedAt: current.reply.generatedAt, timedOut: Boolean(current.reply.timedOut), reason: current.reply.reason, httpStatus: current.reply.httpStatus, incomplete: current.reply.incomplete, sourcesIncomplete: current.reply.sourcesIncomplete, truncated: current.reply.truncated, matchedCount: current.reply.matchedCount, itemLimit: current.reply.itemLimit, previous: current.previous };
 }
 
 export function observeNetworkActivity(update: () => void, source: Pick<Window, 'addEventListener' | 'removeEventListener'> = window) {

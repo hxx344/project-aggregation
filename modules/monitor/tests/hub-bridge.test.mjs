@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { trustedHubOrigin, cleanHubQuery, observeNetworkActivity, hubSelectionUrl, MODULE_CAPABILITIES, hostCapabilityList, canUseHostCapability, isHubMessage, cleanPositionsRequest, parsePositionsReply, createPositionsRequester } from '../lib/hub-bridge.ts';
+import { trustedHubOrigin, cleanHubQuery, observeNetworkActivity, hubSelectionUrl, MODULE_CAPABILITIES, hostCapabilityList, canUseHostCapability, isHubMessage, cleanPositionsRequest, parsePositionsReply, createPositionsRequester, positionsFollowUp } from '../lib/hub-bridge.ts';
 import { relatedSpreadPairs, RELATED_SYMBOLS } from '../lib/related-pairs.ts';
 import { exchangeContracts } from '../lib/exchange-quotes.ts';
 
@@ -135,6 +135,30 @@ test('incomplete is accepted as a boolean, defaults to false for older hosts and
   assert.equal(parsePositionsReply(reply({ incomplete: true, items: [] })).items.length, 0, 'an empty incomplete list is still a valid reply');
   assert.equal(parsePositionsReply(reply({ status: 'unavailable', items: [], generatedAt: null, incomplete: true })).incomplete, false);
   for (const bad of ['yes', 1, null]) assert.equal(parsePositionsReply(reply({ incomplete: bad })), null);
+});
+
+test('an unavailable reply may carry why the host could not read; anything else about the reason is dropped, not the reply', () => {
+  const failed = extra => reply({ status: 'unavailable', items: [], generatedAt: null, ...extra });
+  assert.equal(parsePositionsReply(failed()).reason, undefined, 'older hosts omit the reason');
+  for (const reason of ['background', 'timeout', 'network', 'malformed']) assert.equal(parsePositionsReply(failed({ reason })).reason, reason);
+  assert.deepEqual([parsePositionsReply(failed({ reason: 'http', httpStatus: 503 }))].map(value => [value.reason, value.httpStatus]), [['http', 503]]);
+  for (const [extra, reason] of [[{ reason: 'other' }, undefined], [{ reason: 1 }, undefined], [{ httpStatus: 503 }, undefined], [{ reason: 'timeout', httpStatus: 503 }, 'timeout'], [{ reason: 'http', httpStatus: 99 }, 'http'], [{ reason: 'http', httpStatus: '503' }, 'http']]) {
+    const value = parsePositionsReply(failed(extra));
+    assert.equal(value.status, 'unavailable'); assert.equal(value.reason, reason); assert.equal(value.httpStatus, undefined);
+  }
+  const ok = parsePositionsReply(reply({ reason: 'timeout' }));
+  assert.equal(ok.status, 'ok'); assert.equal(ok.reason, undefined, 'an ok reply has no failure reason');
+});
+
+test('a failed read, or a closed-trade summary still loading, is read again before the regular refresh', () => {
+  const parsed = extra => parsePositionsReply(reply(extra));
+  assert.equal(positionsFollowUp(parsed({ status: 'unavailable', items: [], generatedAt: null })), true);
+  assert.equal(positionsFollowUp(parsed({ status: 'unavailable', items: [], generatedAt: null, reason: 'timeout' })), true);
+  assert.equal(positionsFollowUp(parsed()), false, 'a settled ok reply waits for the regular refresh');
+  const loading = { status: 'loading', since: null, closedQuantity: null, closePrice: null, realizedPnl: null, fees: null, funding: null, net: null, currency: null, note: null, updatedAt: null };
+  assert.equal(positionsFollowUp(parsed({ items: [item({ cycle: loading })] })), true);
+  assert.equal(positionsFollowUp(parsed({ items: [item({ cycle: { ...loading, status: 'complete' } })] })), false);
+  assert.equal(positionsFollowUp(parsed({ status: 'unauthorized', items: [], generatedAt: null })), false, 'login does not come back by itself');
 });
 
 test('position ranges preserve exact totals and truncation always makes the list incomplete', () => {

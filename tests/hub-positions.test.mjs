@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPositionsSource, matchBase, MAX_POSITION_ITEMS, openTradingRequest, positionItems, positionsReply, positionsRequest, POSITIONS_TIMEOUT_MS } from '../src/hub-positions.ts';
+import { createPositionsSource, failedOutcome, matchBase, MAX_POSITION_ITEMS, openTradingRequest, positionItems, positionsReply, positionsRequest, POSITIONS_TIMEOUT_MS } from '../src/hub-positions.ts';
 import { ASSET_POSITIONS_TIMEOUT_MS } from '../server/asset-positions.mjs';
 import { POSITIONS_TIMEOUT_MS as MODULE_POSITIONS_TIMEOUT_MS } from '../modules/monitor/lib/hub-bridge.ts';
 
@@ -134,6 +134,19 @@ test('replies map outcomes and reject malformed responses', () => {
   assert.equal(positionsReply(parsed, { status: 'ok', data: { ...response([]), generatedAt: 'later' }, at: 0 }, now).generatedAt, null);
 });
 
+test('unavailable replies name the failing layer so the module can show it', () => {
+  const parsed = positionsRequest(request());
+  assert.deepEqual(failedOutcome(new DOMException('slow', 'TimeoutError'), 5), { status: 'unavailable', at: 5, reason: 'timeout' });
+  assert.deepEqual(failedOutcome(Object.assign(new Error('down'), { status: 503 }), 5), { status: 'unavailable', at: 5, reason: 'http', httpStatus: 503 });
+  assert.deepEqual(failedOutcome(Object.assign(new Error('bad body'), { status: 200 }), 5), { status: 'unavailable', at: 5, reason: 'malformed' });
+  assert.deepEqual(failedOutcome(Object.assign(new Error('login'), { status: 401 }), 5), { status: 'unauthorized', at: 5 });
+  assert.deepEqual(failedOutcome(new TypeError('Failed to fetch'), 5), { status: 'unavailable', at: 5, reason: 'network' });
+  const reply = positionsReply(parsed, { status: 'unavailable', at: 0, reason: 'http', httpStatus: 503 }, now);
+  assert.equal(reply.reason, 'http'); assert.equal(reply.httpStatus, 503); assert.deepEqual(reply.items, []);
+  assert.equal(positionsReply(parsed, { status: 'unavailable', at: 0, reason: 'background' }, now).httpStatus, undefined);
+  assert.equal(positionsReply(parsed, { status: 'ok', data: null, at: 0 }, now).reason, 'malformed');
+});
+
 test('incomplete marks sources and scopes that could not confirm positions', () => {
   const parsed = positionsRequest(request());
   const reply = data => positionsReply(parsed, { status: 'ok', data, at: 0 }, now);
@@ -154,7 +167,7 @@ test('incomplete marks sources and scopes that could not confirm positions', () 
 test('positions source coalesces reads, caches every outcome for 20 seconds and never retries', async () => {
   let clock = 0, calls = 0, release, fail = null;
   const source = createPositionsSource(() => { calls++; return new Promise((resolve, reject) => { release = () => fail ? reject(fail) : resolve({ sources: [] }); }); }, { clock: () => clock });
-  assert.equal((await source.read(false)).status, 'unavailable', 'inactive pages never start a read');
+  assert.deepEqual(await source.read(false), { status: 'unavailable', at: 0, reason: 'background' }, 'inactive pages never start a read');
   assert.equal(calls, 0);
   const first = source.read(true), second = source.read(true), hidden = source.read(false);
   assert.equal(calls, 1, 'one in-flight read'); release();
@@ -166,7 +179,7 @@ test('positions source coalesces reads, caches every outcome for 20 seconds and 
   assert.equal((await source.read(true)).status, 'unauthorized'); assert.equal(calls, 2, 'failures are cached, not retried');
   clock = 40_000; fail = new DOMException('timeout', 'TimeoutError');
   const timeout = source.read(true); release();
-  assert.equal((await timeout).status, 'unavailable'); assert.equal(calls, 3);
+  assert.deepEqual(await timeout, { status: 'unavailable', at: 40_000, reason: 'timeout' }); assert.equal(calls, 3);
   clock = 60_000; const pending = source.read(true); source.dispose(); release(); await pending;
   assert.equal((await source.read(false)).status, 'unavailable', 'dispose discards the in-flight result');
 });
