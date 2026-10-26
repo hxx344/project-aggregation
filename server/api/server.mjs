@@ -16,6 +16,7 @@ import { RuntimeError, UNAVAILABLE } from '../runtime/protocol.mjs';
 import { coordinatorHooks } from '../runtime/supervisor-client.mjs';
 import { MAX_PROJECTS } from '../control/schema.mjs';
 import { passwordMatches, resetPassword } from '../control/password.mjs';
+import { createLoginGuard } from '../control/login-guard.mjs';
 import { HttpError, send, readJson, readJsonBody, errorResponder } from '../http-common.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -87,12 +88,8 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     return { schemaVersion: 1, enabled: true, modules: status.modules.map(row => ({ ...row,
       maintenanceConfirmed: gates[row.moduleId]?.confirmed ?? null, maintenanceReleasedAt: gates[row.moduleId]?.releasedAt ?? null })) };
   }
-  const loginAttempts = new Map(); // IP-based rate limiting
-  // Account-level lockout: failures within accountLockoutMs of the first one, password checks in flight, and the lock deadline.
-  const accountLockouts = new Map();
-  const ACCOUNT_LOCKOUT_THRESHOLD = 5;
-  // A lock expires at its deadline; unlocked failures expire one lockout period after the first failure.
-  const expireLockouts = now => { for (const [account, lockout] of accountLockouts) if (!lockout.pending && (lockout.until ? lockout.until <= now : now - lockout.firstFailureAt >= accountLockoutMs)) accountLockouts.delete(account); };
+  // IP rate limiting and the account lockout live in hub.sqlite, shared by every API instance.
+  const loginGuard = createLoginGuard(control, { loginWindowMs, accountLockoutMs });
   let closed = false;
   const updateStream = createUpdateStream({ readState: updates.status,
     isSessionActive: id => !closed && sessions.isActive(id),
@@ -234,57 +231,43 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     if (pathname === '/api/login' && req.method === 'POST') {
       sameOrigin(req);
       const ip = req.socket.remoteAddress || 'unknown'; const now = Date.now();
-
-      for (const [address, attempt] of loginAttempts) if (attempt.until < now) loginAttempts.delete(address);
-      expireLockouts(now);
       const accountId = 'global'; // Single-account system
-      const locked = lockout => lockout && lockout.until > Date.now() ? new HttpError(429, `账户已被锁定，请 ${Math.ceil((lockout.until - Date.now()) / 60000)} 分钟后重试`) : null;
-      const lockedError = locked(accountLockouts.get(accountId));
-      if (lockedError) throw lockedError;
+      const lockedError = until => new HttpError(429, `账户已被锁定，请 ${Math.ceil((until - Date.now()) / 60000)} 分钟后重试`);
+      const lockedAt = loginGuard.lockedUntil(accountId, now);
+      if (lockedAt) throw lockedError(lockedAt);
 
-      const attempt = loginAttempts.get(ip) || { count: 0, until: now + loginWindowMs };
-      if (attempt.count >= 10) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
       // Reserve before reading the body: partial concurrent requests share one quota.
-      attempt.count += 1; loginAttempts.set(ip, attempt);
+      const attempt = loginGuard.reserveIp(ip, now);
+      if (!attempt) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
       const body = await bodyOf(req);
 
       // Reserve an account slot after the body arrives, so held-open bodies cannot block logins,
       // and before hashing, so concurrent guesses cannot exceed the remaining failure budget.
-      expireLockouts(Date.now());
-      const reserved = accountLockouts.get(accountId) || { failedAttempts: 0, pending: 0, until: 0, firstFailureAt: 0 };
-      const reservedError = locked(reserved);
-      if (reservedError) throw reservedError;
-      if (reserved.failedAttempts + reserved.pending >= ACCOUNT_LOCKOUT_THRESHOLD) throw new HttpError(429, '登录尝试过多，请稍后重试');
-      reserved.pending += 1; accountLockouts.set(accountId, reserved);
+      const reserved = loginGuard.reserveAccount(accountId, Date.now());
+      if (reserved.locked) throw lockedError(reserved.locked);
+      if (reserved.exhausted) throw new HttpError(429, '登录尝试过多，请稍后重试');
       let passwordValid;
       try {
         const passwordVersion = getSetting('password');
         passwordValid = typeof body.password === 'string' && body.password.length <= 1024 && await passwordMatches(body.password, passwordVersion) && getSetting('password') === passwordVersion;
-      } finally { reserved.pending -= 1; }
+      } catch (error) { loginGuard.release(reserved); throw error; }
 
-      // The record cannot be removed while a check is pending, so update it in place instead of writing back a stale copy.
       if (!passwordValid) {
-        const failedAt = Date.now();
-        if (!reserved.failedAttempts) reserved.firstFailureAt = failedAt;
-        reserved.failedAttempts += 1;
-        log.warn({ ip, failedAttempts: reserved.failedAttempts, type: 'auth_failed' }, '登录失败');
-        const alreadyLocked = locked(reserved);
-        if (alreadyLocked) throw alreadyLocked;
-        if (reserved.failedAttempts >= ACCOUNT_LOCKOUT_THRESHOLD) {
-          reserved.until = failedAt + accountLockoutMs;
-          log.error({ ip, failedAttempts: reserved.failedAttempts, type: 'account_locked' }, '账户已被锁定');
+        const { failed, lockedUntil, lockedNow } = loginGuard.failure(reserved, Date.now());
+        log.warn({ ip, failedAttempts: failed, type: 'auth_failed' }, '登录失败');
+        if (lockedUntil && !lockedNow) throw lockedError(lockedUntil);
+        if (lockedNow) {
+          log.error({ ip, failedAttempts: failed, type: 'account_locked' }, '账户已被锁定');
           throw new HttpError(429, `连续登录失败过多，账户已被锁定 ${Math.ceil(accountLockoutMs / 60000)} 分钟`);
         }
         throw new HttpError(401, '登录密码不正确');
       }
       // A lock set by concurrent failures while this password was being checked still applies.
-      const lockedAfterCheck = locked(reserved);
-      if (lockedAfterCheck) throw lockedAfterCheck;
+      const lockedAfterCheck = loginGuard.success(reserved, Date.now());
+      if (lockedAfterCheck) throw lockedError(lockedAfterCheck);
 
       log.info({ ip, type: 'auth_success' }, '登录成功');
-      reserved.failedAttempts = 0; reserved.firstFailureAt = 0;
-      if (!reserved.pending) accountLockouts.delete(accountId);
-      if (loginAttempts.get(ip) === attempt) { attempt.count -= 1; if (attempt.count === 0) loginAttempts.delete(ip); }
+      loginGuard.refundIp(attempt);
 
       sessions.deleteExpired(now);
       // Security: Always delete old session and generate new ID on login to prevent session fixation

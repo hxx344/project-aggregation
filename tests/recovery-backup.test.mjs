@@ -34,6 +34,8 @@ async function setup(t, { pending = false } = {}) {
   hub.exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
     CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE projects(id TEXT PRIMARY KEY,json TEXT,credentials TEXT);
     CREATE TABLE sessions(id TEXT PRIMARY KEY,csrf TEXT,expires INTEGER); INSERT INTO sessions VALUES('old-session','old-csrf',9999999999999);
+    CREATE TABLE login_account_guard(account TEXT PRIMARY KEY,failed INTEGER,first_failure_at INTEGER,until INTEGER); INSERT INTO login_account_guard VALUES('global',5,1,9999999999999);
+    CREATE TABLE login_ip_attempts(ip TEXT PRIMARY KEY,count INTEGER,until INTEGER); INSERT INTO login_ip_attempts VALUES('127.0.0.1',10,9999999999999);
     CREATE TABLE execution_accounts(exchange TEXT PRIMARY KEY,revision INTEGER,credentials TEXT,account_mode TEXT,identity TEXT,key_label TEXT,verified_at TEXT,snapshot TEXT);
     CREATE TABLE execution_jobs(id TEXT PRIMARY KEY,json TEXT); CREATE TABLE execution_orders(id TEXT PRIMARY KEY,job_id TEXT,json TEXT);
     CREATE TABLE execution_locks(resource TEXT PRIMARY KEY,job_id TEXT); CREATE TABLE execution_stop_requests(job_id TEXT PRIMARY KEY,requested_at INTEGER);
@@ -78,7 +80,7 @@ test('cold encrypted backup covers nested modules and WAL; restoration revokes s
   for (const dir of ['data','secrets']) for (const file of fs.readdirSync(path.join(f.backupOptions.destination,dir))) assert.equal(fs.readFileSync(path.join(f.backupOptions.destination,dir,file)).includes(Buffer.from('sensitive-password-fixture')), false);
   const restored = await f.restore(); const after = readRegistry(restored.targetDir); assert.equal(after.state.state,'quarantine'); assert.notEqual(after.state.authorityId,before.state.authorityId); assert.equal(after.registryId,before.registryId);
   const db = new DatabaseSync(path.join(restored.targetDir,'hub.sqlite')); assert.equal(db.prepare("SELECT value FROM settings WHERE key='wal-only'").get().value,'must-survive');
-  for (const table of ['sessions','execution_previews','execution_lease','execution_entries']) assert.equal(db.prepare('SELECT count(*) n FROM '+table).get().n,0); db.close();
+  for (const table of ['sessions','execution_previews','execution_lease','execution_entries','login_account_guard','login_ip_attempts']) assert.equal(db.prepare('SELECT count(*) n FROM '+table).get().n,0); db.close();
   const registry = new DatabaseSync(path.join(restored.targetDir,'execution-control.sqlite')); assert.equal(registry.prepare("SELECT state FROM aw_operations WHERE operation_id='pending'").get().state,'unknown'); assert.ok(registry.prepare("SELECT count(*) n FROM aw_owners WHERE status='closed'").get().n > 0); registry.close();
   const config = JSON.parse(fs.readFileSync(path.join(restored.targetDir,'modules/asset/config.json'))); assert.equal(config.credentialKey,f.config.credentialKey); assert.notEqual(config.sessionSecret,f.config.sessionSecret);
   await assert.rejects(admitHandoff({ sourceDir:f.source,targetDir:restored.targetDir,sourceLock:f.sourceLock,targetLock:restored.lock,dataKey:f.dataKey,secretsKey:f.secretsKey }),/HANDOFF_REQUIRED/);
