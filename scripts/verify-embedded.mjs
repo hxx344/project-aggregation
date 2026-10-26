@@ -223,16 +223,15 @@ try {
     assert.ok(await until(async () => await checkedAt() > killedAt, 60_000), 'collection went on across the API restart');
     assert.ok(await until(async () => lease()?.owner === holder && lease().expires > expires, 30_000), 'the lease holder renewed the native execution lease');
     assert.equal((await request('/api/projects')).status, 200, 'the session survived the API restart');
-    // Portal grants live in the API process (design doc 1, persistent grants
-    // are M4): a page asks to be reopened, and reopening reaches the same module.
-    const reopened = [];
+    // Portal grants are kept in hub.sqlite (M4-2): open pages go on across the API
+    // restart, and a logout on the new API revokes the grants the previous one issued.
     for (const { project, destination, settings } of portal) {
-      assert.equal((await request(destination, settings)).status, 401, `${project}: a grant of the previous API`);
-      reopened.push(await open(project, 'reopened after the API restart'));
+      const page = await request(destination, settings);
+      assert.equal(page.status, 200, `${project}: a grant of the previous API`); assert.match(page.text, /<html/i);
     }
-    assert.deepEqual(await moduleRows(), rows, 'reopening the pages restarted no module');
+    assert.deepEqual(await moduleRows(), rows, 'the pages restarted no module');
     assert.equal((await request('/api/logout', { method: 'POST' })).status, 200);
-    for (const { project, settings } of reopened) assert.equal((await request('/', settings)).status, 401, `${project} after logout`);
+    for (const { project, settings } of portal) assert.equal((await request('/', settings)).status, 401, `${project} after logout`);
 
     const pids = children();
     process.kill(-entry.pid, 'SIGTERM');
@@ -241,7 +240,7 @@ try {
     for (const signal of ['SIGINT', 'SIGTERM']) process.off(signal, interrupted);
     assert.deepEqual(pids.filter(alive), [], 'the runtime and the API stopped with the launcher');
     assert.equal(existsSync(path.join(dataDir, 'run', 'runtime.json')), false, 'the runtime removed its discovery record');
-    console.log('Service entry passed: launcher, runtime with five real modules, API restart without module restarts, pages reopened, collection and execution lease kept, group SIGTERM exit 0.');
+    console.log('Service entry passed: launcher, runtime with five real modules, API restart without module restarts, open pages kept their Portal grants, collection and execution lease kept, group SIGTERM exit 0.');
   }
 } finally {
   // An interrupt cleans up and exits 130 on its own.
