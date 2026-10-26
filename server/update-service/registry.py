@@ -28,6 +28,10 @@ class Module:
     entries: tuple[str, ...] = ()
     # Every unit may carry the recovery entry's startup guard.
     recovery_guard: bool = False
+    # The units after `service` once the first of them exists (design doc
+    # api-dual-slot 6.5): (unit, directory under the installation that it
+    # works in and runs from, file it runs there, may carry the guard).
+    dual_services: tuple[tuple[str, str, str, bool], ...] = ()
 
 
 MODULES = (
@@ -35,8 +39,13 @@ MODULES = (
            'project-aggregation', 'deploy/install.sh', r'[a-f0-9]{12}-[a-f0-9]{16}',
            ('.managed-release', '.install-ready'), '@.deployed-state', '.source-sha', True,
            extra_services=('project-aggregation-api',), entries=('server/runtime/main.mjs', 'server/api/main.mjs'),
-           recovery_guard=True),
+           recovery_guard=True,
+           dual_services=(('project-aggregation-entry', 'current', 'server/entry/main.mjs', False),
+                          ('project-aggregation-api@', 'slots/%i', 'server/api/main.mjs', True))),
 )
+# The unit layouts this registry reads; the installer enables dual-slot units
+# only while a running update worker has loaded a registry that lists them.
+LAYOUTS = ('single', 'dual-slot')
 BY_ID = {module.id: module for module in MODULES}
 HEX40 = re.compile(r'[a-f0-9]{40}')
 HEX64 = re.compile(r'[a-f0-9]{64}')
@@ -74,9 +83,11 @@ def recovery_guard(module: Module):
 
 def dropin_directories(name, filesystem):
     """The directories systemd reads drop-ins of `name`.service from, except
-    /usr/lib and /lib, which belong to distribution packages."""
+    /usr/lib and /lib, which belong to distribution packages. A template
+    (`name` ending in @) also covers each slot instance's own directory."""
     parts = name.split('-')
-    names = [name + '.service.d', *('-'.join(parts[:index]) + '-.service.d' for index in range(1, len(parts))), 'service.d']
+    instances = [name + slot + '.service.d' for slot in 'ab'] if name.endswith('@') else []
+    names = [name + '.service.d', *instances, *('-'.join(parts[:index]) + '-.service.d' for index in range(1, len(parts))), 'service.d']
     for base in ('etc/systemd/system.control', 'run/systemd/system.control', 'run/systemd/transient',
                  'run/systemd/generator.early', 'etc/systemd/system', 'etc/systemd/system.attached',
                  'run/systemd/system', 'run/systemd/system.attached', 'run/systemd/generator',
@@ -85,7 +96,8 @@ def dropin_directories(name, filesystem):
             yield filesystem / base / directory
 
 
-def unit_source(module: Module, name, current_path, filesystem, guard=False, entry=''):
+def unit_source(module: Module, name, current_path, filesystem, guard=False, entry='', working=''):
+    """`working` replaces current (and the module's suffix) where the unit runs from another link."""
     unit = filesystem / 'etc/systemd/system' / (name + '.service')
     source = text_file(unit)
     properties = {}
@@ -93,7 +105,8 @@ def unit_source(module: Module, name, current_path, filesystem, guard=False, ent
         if '=' in line and not line.lstrip().startswith('#'):
             key, value = line.split('=', 1)
             properties.setdefault(key, []).append(value)
-    expected_work = current_path + module.working_suffix
+    expected_work = working or current_path + module.working_suffix
+    current_path = working or current_path
     if properties.get('WorkingDirectory') != [expected_work] or properties.get('User') != [module.user]:
         raise ValueError('Unexpected service identity')
     if module.root_marker and f'# Managed by {module.service} installer' not in source:
@@ -148,8 +161,13 @@ def installed(module: Module, filesystem=Path('/')):
         current_path = str(root / 'current').replace('\\', '/')
         names = (module.service, *module.extra_services)
         entries = module.entries or ('',) * len(names)
-        sources = [unit_source(module, name, current_path, filesystem, guard=module.recovery_guard, entry=entry)
-                   for name, entry in zip(names, entries, strict=True)]
+        units = [(name, entry, '', module.recovery_guard) for name, entry in zip(names, entries, strict=True)]
+        marker = filesystem / 'etc/systemd/system' / (module.dual_services[0][0] + '.service') if module.dual_services else None
+        if marker and (marker.exists() or marker.is_symlink()):
+            units = [units[0], *((name, entry, '' if directory == 'current' else str(root / directory).replace('\\', '/'), guard and module.recovery_guard)
+                                 for name, directory, entry, guard in module.dual_services)]
+        sources = [unit_source(module, name, current_path, filesystem, guard=guard, entry=entry, working=working)
+                   for name, entry, working, guard in units]
         checked = optional_text((root / module.checked[1:]) if module.checked.startswith('@') else (release / module.checked)) if module.checked else ''
         checked = checked.split()[0] if checked else ''
         artifact = optional_text(release / '.release-commit')

@@ -241,6 +241,102 @@ class OperatorTests(unittest.TestCase):
             with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'API_UNIT_FILE', api), patch.object(operations, 'trusted', side_effect=trusted):
                 self.assertEqual(operations.managed_unit(runtime, 'runtime/main.mjs'), operations.managed_unit(api, 'api/main.mjs'))
 
+    def test_dual_slot_deployment_checks_the_entry_and_the_template(self):
+        with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+            root = Path(directory)
+            runtime, entry, template = root / 'runtime.service', root / 'entry.service', root / 'template.service'
+            def unit(entry_file, user='nobody', link='current'):
+                return f'# Managed by project-aggregation installer\n[Service]\nUser={user}\nExecStart=/bin/sh {operations.APP}/{link}/server/{entry_file}\n'
+            def trusted(filename, private=False):
+                if not Path(filename).exists():
+                    raise ValueError('MISSING')
+                return Path(filename)
+            good = (unit('entry/main.mjs'), unit('api/main.mjs', link='slots/%i'))
+            # The release check after the units fails here: nothing is installed under /opt.
+            cases = [(good, 'RELEASE_INVALID'),
+                     ((unit('entry/main.mjs'), unit('api/main.mjs')), 'SERVICE_CONFIG_INVALID'),
+                     ((unit('entry/main.mjs', user='root'), good[1]), 'SERVICE_CONFIG_INVALID'),
+                     ((unit('api/main.mjs'), good[1]), 'SERVICE_CONFIG_INVALID'),
+                     ((good[0], None), 'MISSING')]
+            for (entry_text, template_text), error in cases:
+                with self.subTest(error=error, entry=entry_text, template=template_text):
+                    runtime.write_text(unit('runtime/main.mjs')); entry.write_text(entry_text); template.unlink(missing_ok=True)
+                    if template_text is not None:
+                        template.write_text(template_text)
+                    with patch.object(operations, 'UNIT_FILE', runtime), patch.object(operations, 'ENTRY_UNIT_FILE', entry), \
+                            patch.object(operations, 'SLOT_UNIT_FILE', template), patch.object(operations, 'API_UNIT_FILE', root / 'absent.service'), \
+                            patch.object(operations, 'trusted_environment'), patch.object(operations, 'trusted', side_effect=trusted):
+                        with self.assertRaisesRegex(ValueError, error):
+                            operations.deployment()
+
+    def test_dual_slot_operation_stops_the_entry_and_both_slots(self):
+        import argparse
+        with tempfile.TemporaryDirectory(prefix='recovery-units-') as directory:
+            keys = Path(directory)
+            states = {unit: {'ActiveState': 'active' if unit == operations.SLOT_SERVICES[1] else 'inactive', 'ControlGroup': '/system.slice/' + unit}
+                      for unit in operations.DUAL_SERVICES}
+            args = argparse.Namespace(action='backup', destination=keys / 'backup', target_dir=None, backup_dir=None)
+            with patch.object(operations, 'dual_slots', return_value=True), patch.object(operations, 'KEYS', keys), \
+                    patch.object(operations, 'deployment', return_value={'source': keys / 'data', 'uid': 1}), \
+                    patch.object(operations, 'run_cli', return_value={'state': 'normal'}), patch.object(operations, 'install_guard'), \
+                    patch.object(operations, 'safe_directory'), patch.object(operations, 'service_state', side_effect=states.__getitem__), \
+                    patch.object(operations, 'require_stopped') as stopped, patch.object(operations, 'systemctl') as controller:
+                operations._main_locked(args)
+            self.assertEqual([call.args for call in controller.call_args_list], [('stop', *operations.DUAL_SERVICES), ('start', operations.SERVICE)])
+            self.assertEqual(stopped.call_args_list[0].args, ({unit: '/system.slice/' + unit for unit in operations.DUAL_SERVICES},))
+            # Every unit of the layout must be stopped, the slots included.
+            running = {**states, operations.SLOT_SERVICES[0]: {'ActiveState': 'active', 'MainPID': '7', 'ControlGroup': ''}}
+            stopped = {unit: {'ActiveState': 'inactive', 'MainPID': '0', 'ControlGroup': ''} for unit in operations.DUAL_SERVICES}
+            with patch.object(operations, 'dual_slots', return_value=True):
+                with patch.object(operations, 'service_state', side_effect=lambda unit: running[unit] if unit == operations.SLOT_SERVICES[0] else stopped[unit]):
+                    with self.assertRaisesRegex(ValueError, 'WRITERS_STILL_RUNNING'):
+                        operations.require_stopped()
+                with patch.object(operations, 'service_state', side_effect=stopped.__getitem__):
+                    self.assertEqual(set(operations.require_stopped()), set(operations.DUAL_SERVICES))
+
+    @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root ownership fixture runs in Linux CI')
+    def test_dual_slot_guard_goes_to_the_runtime_and_the_template_only(self):
+        with tempfile.TemporaryDirectory(prefix='recovery-install-', dir='/run') as directory:
+            root = Path(directory)
+            release = root / 'release'
+            (release / 'server/recovery').mkdir(parents=True)
+            shutil.copyfile(ROOT / 'server/recovery/startup-guard.py', release / 'server/recovery/startup-guard.py')
+            config = {'release': release, 'source': root / 'data', 'node': Path(NODE)}
+            library, units, launcher = root / 'lib', root / 'units', root / 'launcher'
+            units.mkdir()
+            directories = {operations.SERVICE: units / (operations.SERVICE + '.d'), operations.ENTRY_SERVICE: units / (operations.ENTRY_SERVICE + '.d'),
+                           **{unit: units / (operations.SLOT_UNIT_FILE.name + '.d') for unit in operations.SLOT_SERVICES}}
+            extra = {unit: [] for unit in directories}
+
+            def controller(*arguments, **_):
+                if arguments[0] == 'daemon-reload':
+                    return ''
+                unit = arguments[1]
+                return ' '.join([*map(str, sorted(directories[unit].glob('*.conf'))), *extra[unit]])
+
+            with patch.object(operations, 'dual_slots', return_value=True), patch.object(operations, 'systemctl', side_effect=controller):
+                operations.install_guard(config, library=library, units=units, launcher=launcher)
+                runtime_guard = directories[operations.SERVICE] / '20-recovery-guard.conf'
+                template_guard = directories[operations.SLOT_SERVICES[0]] / '20-recovery-guard.conf'
+                self.assertEqual(runtime_guard.read_bytes(), template_guard.read_bytes())
+                self.assertFalse(directories[operations.ENTRY_SERVICE].exists())
+                # The entry carries no drop-in, on disk or loaded from elsewhere.
+                extra[operations.ENTRY_SERVICE] = ['/etc/systemd/system/service.d/zz.conf']
+                with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
+                    operations.install_guard(config, library=library, units=units, launcher=launcher)
+                extra[operations.ENTRY_SERVICE] = []
+                directories[operations.ENTRY_SERVICE].mkdir()
+                (directories[operations.ENTRY_SERVICE] / '20-recovery-guard.conf').write_bytes(runtime_guard.read_bytes())
+                with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
+                    operations.install_guard(config, library=library, units=units, launcher=launcher)
+                (directories[operations.ENTRY_SERVICE] / '20-recovery-guard.conf').unlink()
+                # One instance loading its own drop-in besides the template's is an override.
+                extra[operations.SLOT_SERVICES[1]] = [str(units / 'project-aggregation-api@b.service.d/zz.conf')]
+                with self.assertRaisesRegex(ValueError, 'UNSUPPORTED_SERVICE_OVERRIDE'):
+                    operations.install_guard(config, library=library, units=units, launcher=launcher)
+                extra[operations.SLOT_SERVICES[1]] = []
+                operations.install_guard(config, library=library, units=units, launcher=launcher)
+
     @unittest.skipUnless(os.name == 'posix' and os.geteuid() == 0, 'root ownership fixture runs in Linux CI')
     def test_guard_install_is_incremental_and_rejects_other_overrides(self):
         # The production drop-in requires a root-owned non-writable ancestor

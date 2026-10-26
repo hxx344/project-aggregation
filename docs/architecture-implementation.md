@@ -481,7 +481,7 @@ M1 到 M4 各自拆为可审查的小改动，不能在单个提交同时替换�
 | 模块生命周期 | `tests/embedded-runtime.test.mjs`、`tests/process-split.test.mjs`、`tests/runtime-protocol.test.mjs`、`tests/entry-symlink.test.mjs` | API 重启、监督者丢失、遗留实例、就绪后退出、恢复期间禁止新交易；真实包按单元路径启动和五模块故障组合 |
 | 摘要与机会 | `tests/integration-state.test.mjs`、`tests/adapters.test.mjs`、`tests/embedded-funding.test.mjs` | v1/v2 矩阵、缺失周期、源时间过期、机会切换后旧采集停止 |
 | 授权与推送 | `tests/portal.test.mjs`、`tests/portal-auth.test.mjs`、`tests/login-guard.test.mjs`、`tests/account-lockout.test.mjs`、`tests/api-server.test.mjs` | ticket 并发消费、真实跨槽撤销与登录锁定、崩溃预占、认证材料适用边界、快照游标竞态、慢消费者 |
-| 更新与恢复 | `tests/embedded-updates.test.mjs`、`deploy/test-updater.py`、`deploy/test-incremental.sh`、`deploy/test-units-systemd.sh`、`deploy/test-recovery-systemd.sh` | 候选副作用、定向就绪、固定槽版本、候选失败叠加旧槽崩溃、激活各阶段中断与续作、无变化更新、兼容回滚、备份恢复 |
+| 更新与恢复 | `tests/embedded-updates.test.mjs`、`deploy/test-updater.py`、`deploy/test-incremental.sh`、`deploy/test-units-systemd.sh`、`deploy/test-slots-systemd.sh`、`deploy/test-recovery-systemd.sh` | 候选副作用、定向就绪、固定槽版本、候选失败叠加旧槽崩溃、激活各阶段中断与续作、无变化更新、兼容回滚、备份恢复 |
 | 打包与缓存 | `deploy/test-module-builds.mjs`、`deploy/test-typecheck-cache.mjs`、`deploy/test-workspace.sh` | 新共享输入失效、冷安装、跨目录恢复、正式包真实入口 |
 
 这些是后续开发的检查入口，不表示本次文档交付已经运行业务测试。局部变更先运行直接相关测试；共享生命周期、鉴权、存储和部署变更再扩大对应回归。

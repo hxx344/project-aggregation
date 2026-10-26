@@ -30,6 +30,8 @@ sed -e "s|/opt/$service|$fixture/application|g" \
     -e "s|/etc/$service.env|$fixture/environment|g" \
     -e "s|/etc/systemd/system/$service.service|$fixture/unit|g" \
     -e "s|/etc/systemd/system/$service-api.service|$fixture/api-unit|g" \
+    -e "s|/etc/systemd/system/$service-entry.service|$fixture/entry-unit|g" \
+    -e "s|/etc/systemd/system/$service-api@.service|$fixture/slot-unit|g" \
     -e "s|/run/lock/$service-install.lock|$fixture/install.lock|g" \
     -e "s|/run/systemd/system|$fixture|g" "$repository/deploy/install.sh" > "$fixture/installer.sh"
 cat > "$fixture/runtime/node" <<'NODE'
@@ -82,8 +84,12 @@ if [[ "${FRESH_INSTALL:-0}" == 1 ]]; then
   ENV_FILE="$FIXTURE_ROOT/fresh-environment"
   UNIT_FILE="$FIXTURE_ROOT/fresh-unit"
   API_UNIT_FILE="$FIXTURE_ROOT/fresh-api-unit"
+  ENTRY_UNIT_FILE="$FIXTURE_ROOT/fresh-entry-unit"
+  SLOT_UNIT_FILE="$FIXTURE_ROOT/fresh-slot-unit"
 fi
 ensure_tools() { :; }
+# The mock systemd covers the single API unit; the dual-slot units run under real systemd (test-slots-systemd.sh).
+target_layout() { printf single; }
 validate_embedded_runtime() { :; }
 prepare_greeks_runtime() { :; }
 prepare_aster_runtime() { :; }
@@ -170,6 +176,7 @@ contents = {'.release-commit': commit, '.release-application-key': key,
             '.release-runtime-key': hashlib.sha256(('runtime:' + sys.argv[4]).encode()).hexdigest(),
             'server/app.mjs': 'export {};', 'server/index.mjs': 'export {};', 'server/launcher.mjs': 'export {};',
             'server/runtime/main.mjs': 'export {};', 'server/api/main.mjs': 'export {};',
+            'server/entry/main.mjs': 'export {};', 'server/entry/probe.mjs': 'export {};',
             'package.json': '{"type":"module"}', 'dist/index.html': '<html>' + sys.argv[3] + '</html>',
             'node_modules/ws/package.json': '{}', 'node_modules/decimal.js/package.json': '{}'}
 for name in ('cli.mjs', 'core.mjs', 'feeds.mjs', 'config.example.json'):

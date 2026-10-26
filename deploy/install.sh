@@ -11,6 +11,11 @@ UNIT_FILE=/etc/systemd/system/project-aggregation.service
 # The runtime unit keeps the service name; the API runs in its own unit (design doc 6.1).
 API_SERVICE=project-aggregation-api
 API_UNIT_FILE=/etc/systemd/system/project-aggregation-api.service
+# Dual-slot units (design doc api-dual-slot 6.1): the stable entry holds the
+# port and forwards to slot a or b of the API template.
+ENTRY_SERVICE=project-aggregation-entry
+ENTRY_UNIT_FILE=/etc/systemd/system/project-aggregation-entry.service
+SLOT_UNIT_FILE=/etc/systemd/system/project-aggregation-api@.service
 REPOSITORY=https://github.com/hxx344/project-aggregation.git
 NODE_VERSION=24.15.0
 PNPM_VERSION=11.25.0
@@ -38,6 +43,18 @@ migration_commit_started=0
 old_release=
 old_unit_backup=
 old_api_unit_backup=
+old_entry_unit_backup=
+old_slot_unit_backup=
+# "slot release" of .api-slot when this run began with the dual-slot units.
+old_slot_record=
+old_layout=single
+slot_layout=single
+# The cutover in progress (design doc 3.5): its slots and whether .api-slot moved.
+cutover_from=
+cutover_to=
+cutover_committed=0
+slot_instance=
+probe_failures=
 activation_scope=
 old_environment=
 old_health_url=
@@ -1322,10 +1339,16 @@ restore_environment() {
   HEALTH_URL=$old_health_url
 }
 # With the API unit installed both units must run and /api/ready answers for
-# the runtime too; a release in one unit is checked as before.
+# the runtime too; a release in one unit is checked as before. The dual-slot
+# units need the entry and the recorded slot.
 healthy() {
+  local recorded
   systemctl is-active --quiet "$SERVICE" || return 1
-  if [[ -f "$API_UNIT_FILE" ]]; then
+  if dual_installed; then
+    recorded=$(read_slot_record) || return 1
+    systemctl is-active --quiet "$ENTRY_SERVICE" && systemctl is-active --quiet "$(slot_unit "${recorded%% *}")" &&
+      curl --fail --silent --max-time 3 "${HEALTH_URL%/api/health}/api/ready" >/dev/null
+  elif [[ -f "$API_UNIT_FILE" ]]; then
     systemctl is-active --quiet "$API_SERVICE" && curl --fail --silent --max-time 3 "${HEALTH_URL%/api/health}/api/ready" >/dev/null
   else
     curl --fail --silent --max-time 3 "$HEALTH_URL" >/dev/null
@@ -1361,7 +1384,11 @@ rollback() {
   # Close before recovery. If this optional write fails, leave the interval
   # unknown instead of retrying at EXIT and counting rollback as deployment.
   ci_finish_progress
-  if [[ "$activation_started" == 1 && "$activation_scope" == api ]]; then
+  if [[ "$activation_started" == 1 && "$activation_scope" == api && "$slot_layout" == dual ]]; then
+    # Only the API slots moved (design doc 6.3); the runtime and modules stay.
+    log '新版本 API 槽切换未完成，正在恢复之前的槽；运行时与模块未受影响。'
+    if api_cutover_rollback; then log '已恢复之前的 API 槽；运行时与持久数据保持原样。'; else log '之前的 API 槽未能恢复服务，请查看服务日志。'; fi
+  elif [[ "$activation_started" == 1 && "$activation_scope" == api ]]; then
     # Only the API was restarted: the runtime, its modules, the configuration
     # and the Python paths are those of the earlier release and stay as they are.
     log '新版本 API 启动失败，正在恢复之前的 API；运行时与模块未受影响。'
@@ -1407,6 +1434,9 @@ rollback() {
     elif [[ -f "$API_UNIT_FILE" ]] && grep -q '^# Managed by project-aggregation installer$' "$API_UNIT_FILE"; then
       rm -f -- "$API_UNIT_FILE"
     fi
+    # The dual-slot units come back as they were, or go before anything starts:
+    # a left entry would hold the port (design doc 6.4).
+    if [[ "$old_layout" == dual ]]; then restore_dual_units; else dual_teardown; fi
     if ! restore_python_paths; then
       log '无法恢复上次成功的 Python 路径记录；工作台保持停止，请检查磁盘权限。'
       exit "$exit_code"
@@ -2410,17 +2440,20 @@ finish_activation() {
 # (design doc 6.1). Stopping or restarting the runtime unit also stops or
 # restarts the API (PartOf=); the API restarts alone, with the launcher's
 # backoff of 1 s doubling up to 30 s, and connects to the runtime socket in the
-# runtime unit's RuntimeDirectory.
+# runtime unit's RuntimeDirectory. With the dual-slot units (design doc
+# api-dual-slot 6.1) the runtime pulls in the entry instead, the entry its
+# enabled slot, and PartOf= ties both to the runtime the same way.
 write_unit() {
-  local api_restart=$'RestartSec=1\nRestartSteps=5\nRestartMaxDelaySec=30'
+  local api_restart=$'RestartSec=1\nRestartSteps=5\nRestartMaxDelaySec=30' wanted=$API_SERVICE.service
   # systemd before 254 ignores the backoff and would restart every second.
   (( ${systemd_version:-0} >= 254 )) || api_restart='RestartSec=5'
+  [[ "$slot_layout" != dual ]] || wanted=$ENTRY_SERVICE.service
   cat > "$work_dir/service" <<EOF
 # Managed by project-aggregation installer
 [Unit]
 Description=Project Aggregation workspace runtime
 After=network-online.target
-Wants=network-online.target $API_SERVICE.service
+Wants=network-online.target $wanted
 
 [Service]
 Type=simple
@@ -2473,6 +2506,314 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=$DATA_PATH
 EOF
+  # Never enabled: only the runtime unit's Wants= starts it.
+  cat > "$work_dir/entry.service" <<EOF
+# Managed by project-aggregation installer
+[Unit]
+Description=Project Aggregation workspace entry
+After=network-online.target
+PartOf=$SERVICE.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$APP_DIR/current
+ExecStart=$NODE_BIN $APP_DIR/current/server/entry/main.mjs
+EnvironmentFile=$ENV_FILE
+Environment=WORKBENCH_ENTRY_DIR=/run/$ENTRY_SERVICE
+Environment=WORKBENCH_API_SLOT_RECORD=$APP_DIR/.api-slot
+Environment=WORKBENCH_ENTRY_SLOT_ROOT=/run
+RuntimeDirectory=$ENTRY_SERVICE
+RuntimeDirectoryMode=0700
+Restart=always
+RestartSec=1
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+EOF
+  # Each slot runs the release its link names; After= the entry makes a group
+  # stop end the slots, and their draining, before the entry.
+  cat > "$work_dir/slot.service" <<EOF
+# Managed by project-aggregation installer
+[Unit]
+Description=Project Aggregation workspace API (slot %i)
+After=network-online.target $SERVICE.service $ENTRY_SERVICE.service
+PartOf=$SERVICE.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$APP_DIR/slots/%i
+ExecStart=$NODE_BIN $APP_DIR/slots/%i/server/api/main.mjs
+EnvironmentFile=$ENV_FILE
+Environment=WORKBENCH_RUNTIME_DIR=/run/$SERVICE
+Environment=WORKBENCH_API_SLOT=%i
+Environment=WORKBENCH_API_SLOT_DIR=/run/$API_SERVICE-%i
+Environment=WORKBENCH_API_SLOT_RECORD=$APP_DIR/.api-slot
+RuntimeDirectory=$API_SERVICE-%i
+RuntimeDirectoryMode=0700
+Restart=on-failure
+$api_restart
+TimeoutStopSec=75
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$DATA_PATH
+
+[Install]
+WantedBy=$ENTRY_SERVICE.service
+EOF
+}
+# The unit files a deployment key covers for the layout of this activation.
+layout_units() {
+  if [[ "$slot_layout" == dual ]]; then
+    printf '%s\n' "$work_dir/service" "$work_dir/entry.service" "$work_dir/slot.service"
+  else
+    printf '%s\n' "$work_dir/service" "$work_dir/api.service"
+  fi
+}
+
+# --- Dual-slot units (design doc api-dual-slot 3.5, 3.6, 3.9 and 6) ---
+slot_unit() { printf '%s@%s.service' "$API_SERVICE" "$1"; }
+other_slot() { if [[ $1 == a ]]; then printf b; else printf a; fi; }
+dual_installed() { [[ -f "$ENTRY_UNIT_FILE" ]]; }
+# dual or single for this activation (design doc 6.2). An update worker loaded
+# registry.py when its job began; one that does not know the dual-slot units
+# would report a first switch as unconfirmed, so that switch waits for the
+# next activation, after this one has upgraded the update service.
+target_layout() {
+  if ! dual_installed && systemctl is-active --quiet "$UPDATER_WORKER_SERVICE" &&
+     ! grep -q "^LAYOUTS = .*'dual-slot'" "$UPDATER_DIR/registry.py" 2>/dev/null; then
+    printf single
+  else
+    printf dual
+  fi
+}
+# "slot release" of a valid .api-slot; fails without one.
+read_slot_record() {
+  [[ -f "$APP_DIR/.api-slot" ]] || return 1
+  python3 -I - "$APP_DIR/.api-slot" <<'SLOT_RECORD_PY'
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as stream:
+        value = json.load(stream)
+except (OSError, ValueError):
+    sys.exit(1)
+if not isinstance(value, dict) or value.get('slot') not in ('a', 'b') or not isinstance(value.get('release'), str) or not re.fullmatch(r'/\S+', value['release']):
+    sys.exit(1)
+print(value['slot'], value['release'])
+SLOT_RECORD_PY
+}
+write_slot_record() { atomic_record "$APP_DIR/.api-slot" "{\"slot\":\"$1\",\"release\":\"$2\"}"; }
+# "from to release phase" of .api-cutover.
+read_cutover() {
+  python3 -I - "$APP_DIR/.api-cutover" <<'CUTOVER_PY'
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as stream:
+        value = json.load(stream)
+except (OSError, ValueError):
+    sys.exit(1)
+if not isinstance(value, dict) or {value.get('from'), value.get('to')} != {'a', 'b'} or not isinstance(value.get('release'), str) or \
+        not re.fullmatch(r'/\S+', value['release']) or value.get('phase') not in ('candidate', 'switching', 'draining'):
+    sys.exit(1)
+print(value['from'], value['to'], value['release'], value['phase'])
+CUTOVER_PY
+}
+write_cutover() { atomic_record "$APP_DIR/.api-cutover" "{\"from\":\"$1\",\"to\":\"$2\",\"release\":\"$3\",\"phase\":\"$4\"}"; }
+# A JSON field (dotted path) from standard input.
+json_field() {
+  python3 -I -c 'import json, sys
+value = json.load(sys.stdin)
+for key in sys.argv[1].split("."): value = value[key]
+print(value)' "$1"
+}
+# One request on a private control socket: prints the JSON answer and fails
+# on anything but 200. Arguments: socket method route [body] [seconds].
+ctl_request() {
+  local -a body=()
+  [[ -z "${4:-}" ]] || body=(-H 'Content-Type: application/json' --data "$4")
+  curl --fail --silent --show-error --max-time "${5:-10}" --unix-socket "$1" -X "$2" "${body[@]}" "http://localhost$3"
+}
+slot_ctl() { printf '/run/%s-%s/ctl.sock' "$API_SERVICE" "$1"; }
+entry_ctl() { printf '/run/%s/ctl.sock' "$ENTRY_SERVICE"; }
+# The release's directed probe of slot $1 (design doc 3.3), as the service
+# user, with the unit's MainPID; sets slot_instance or probe_failures.
+slot_probe() {
+  local slot=$1 target=$2 mode=$3 pid output
+  pid=$(systemctl show -p MainPID --value "$(slot_unit "$slot")") && [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { probe_failures='槽单元没有主进程'; return 1; }
+  if ! output=$(run_as_service "$NODE_BIN" "$target/server/entry/probe.mjs" --dir "/run/$API_SERVICE-$slot" --slot "$slot" \
+      --release "$target" --port "$PORT_VALUE" --pid "$pid" --mode "$mode" --entry-dir "/run/$ENTRY_SERVICE"); then
+    probe_failures=$output
+    return 1
+  fi
+  slot_instance=$(json_field instanceId <<< "$output")
+}
+# Up to 60 s for slot $1 to pass the probe as release $2 in mode $3.
+wait_slot() {
+  local attempt
+  probe_failures=
+  for attempt in {1..60}; do
+    if slot_probe "$@"; then return 0; fi
+    sleep 1
+  done
+  log "API 槽 $1 未通过定向检查：${probe_failures:-无结果}"
+  return 1
+}
+# Moves the traffic to slot $1 running release $2 (design doc 3.5). From step
+# 1 the slot starts anew from its link; from step 3 it is taken as it runs.
+# Every failure returns, so rollback can call it with errexit off.
+api_cutover() {
+  local to=$1 target=$2 step=${3:-1} from mode=candidate answer recorded attempt
+  from=$(other_slot "$to")
+  cutover_from=$from cutover_to=$to
+  if (( step == 1 )); then
+    systemctl stop "$(slot_unit "$to")" || return 1
+    systemctl disable "$(slot_unit "$to")" >/dev/null 2>&1 || return 1
+    mkdir -p "$APP_DIR/slots" && atomic_link "$target" "$APP_DIR/slots/$to" || return 1
+    write_cutover "$from" "$to" "$target" candidate || return 1
+    systemctl start "$(slot_unit "$to")" || return 1
+    # An interrupted switch may already have recorded this slot (design doc 3.5).
+    if recorded=$(read_slot_record) && [[ "$recorded" == "$to $target" ]]; then mode=serving; fi
+  else
+    answer=$(ctl_request "$(slot_ctl "$to")" GET /identity) && mode=$(json_field mode <<< "$answer") || return 1
+  fi
+  wait_slot "$to" "$target" "$mode" || return 1
+  write_cutover "$from" "$to" "$target" switching || return 1
+  # Enabled before the record moves and the old slot disabled only after the
+  # switch, so a reboot at any point starts the recorded slot.
+  systemctl enable "$(slot_unit "$to")" >/dev/null 2>&1 || return 1
+  write_slot_record "$to" "$target" || return 1
+  cutover_committed=1
+  atomic_link "$target" "$APP_DIR/current" || return 1
+  answer=$(ctl_request "$(slot_ctl "$to")" POST /promote '' 90) && [[ $(json_field mode <<< "$answer") == serving ]] || return 1
+  ctl_request "$(entry_ctl)" POST /switch "{\"slot\":\"$to\",\"instanceId\":\"$slot_instance\"}" >/dev/null || return 1
+  write_cutover "$from" "$to" "$target" draining || return 1
+  systemctl disable "$(slot_unit "$from")" >/dev/null 2>&1 || return 1
+  # The old slot drains (design doc 5.1, at most 75 s). Its pairs in the entry
+  # go with it, a paused one within the entry's 30 s stall limit; one still
+  # taking its last bytes may stay and does not fail the switch.
+  systemctl stop "$(slot_unit "$from")" || return 1
+  for attempt in {1..200}; do
+    answer=$(ctl_request "$(entry_ctl)" GET /status) || return 1
+    [[ $(json_field "connections.$from" <<< "$answer") != 0 ]] || break
+    sleep .2
+  done
+  [[ $(json_field target <<< "$answer") == "$to" ]] || return 1
+  [[ $(json_field "connections.$from" <<< "$answer") == 0 ]] || log "旧 API 槽 $from 仍有连接在收尾，由入口按停滞上限释放。"
+  wait_healthy || return 1
+  rm -f -- "$APP_DIR/.api-cutover"
+}
+# Undoes a failed api_cutover (design doc 6.3): before the record moved the old
+# slot never changed; after it, the traffic moves back to the old slot and its
+# fixed release, which may still run.
+api_cutover_rollback() {
+  local old=$cutover_from new=$cutover_to slot old_target
+  [[ -n "$new" ]] || return 0
+  if [[ -n "$old_slot_unit_backup" ]] && ! cmp -s "$old_slot_unit_backup" "$SLOT_UNIT_FILE"; then
+    cp -- "$old_slot_unit_backup" "$SLOT_UNIT_FILE" && systemctl daemon-reload
+  fi
+  if (( ! cutover_committed )); then
+    systemctl stop "$(slot_unit "$new")" >/dev/null 2>&1
+    systemctl disable "$(slot_unit "$new")" >/dev/null 2>&1
+    rm -f -- "$APP_DIR/.api-cutover"
+    wait_healthy
+    return
+  fi
+  read -r slot old_target <<< "$old_slot_record"
+  [[ "$slot" == "$old" && -d "$old_target" ]] || return 1
+  cutover_committed=0
+  if systemctl is-active --quiet "$(slot_unit "$old")"; then api_cutover "$old" "$old_target" 3; else api_cutover "$old" "$old_target" 1; fi
+}
+# A cutover an earlier run left behind (design doc 3.5): forward when the
+# record already names its target, otherwise back to the recorded slot.
+resolve_cutover() {
+  local cutover recorded from to target phase
+  [[ -e "$APP_DIR/.api-cutover" ]] || return 0
+  cutover=$(read_cutover) && recorded=$(read_slot_record) || return 1
+  read -r from to target phase <<< "$cutover"
+  if [[ "$recorded" == "$to $target" ]]; then
+    log "上次的 API 槽切换（$phase）已写入记录，继续完成。"
+    if systemctl is-active --quiet "$(slot_unit "$to")"; then api_cutover "$to" "$target" 3; else api_cutover "$to" "$target" 1; fi
+  else
+    log "上次的 API 槽切换（$phase）未写入记录，停止候选槽 $to。"
+    systemctl stop "$(slot_unit "$to")" && systemctl disable "$(slot_unit "$to")" >/dev/null 2>&1 && rm -f -- "$APP_DIR/.api-cutover"
+  fi
+}
+# The recovery entry's startup guard follows the units that open the data
+# directory (design doc 6.1): a copy of the runtime unit's, when it has one.
+mirror_recovery_guard() {
+  local guard="$UNIT_FILE.d/20-recovery-guard.conf"
+  [[ -f "$guard" ]] || return 0
+  install -d -m 0755 "$1" && install -m 0644 "$guard" "$1/20-recovery-guard.conf"
+}
+# A full activation of the dual-slot units (design doc 3.6, 3.9): the group
+# stops, then units, slot links, the record and current change, then it starts.
+activate_dual_full() {
+  local recorded slot=a other
+  systemctl stop "$SERVICE"
+  migrate_embedded_modules "$release"
+  if dual_installed && recorded=$(read_slot_record); then slot=${recorded%% *}; fi
+  other=$(other_slot "$slot")
+  install -m 0644 "$work_dir/service" "$UNIT_FILE"
+  install -m 0644 "$work_dir/entry.service" "$ENTRY_UNIT_FILE"
+  install -m 0644 "$work_dir/slot.service" "$SLOT_UNIT_FILE"
+  # The single API unit would compete with the entry for the port.
+  rm -f -- "$API_UNIT_FILE"
+  mirror_recovery_guard "$SLOT_UNIT_FILE.d"
+  systemctl daemon-reload
+  mkdir -p "$APP_DIR/slots"
+  # The other slot also names this release, so cleanup never keeps an old one for it.
+  atomic_link "$release" "$APP_DIR/slots/$other"
+  atomic_link "$release" "$APP_DIR/slots/$slot"
+  write_slot_record "$slot" "$release"
+  rm -f -- "$APP_DIR/.api-cutover"
+  systemctl disable "$(slot_unit "$other")" >/dev/null 2>&1
+  systemctl enable "$(slot_unit "$slot")" >/dev/null 2>&1
+  atomic_link "$release" "$APP_DIR/current"
+  systemctl enable "$SERVICE" >/dev/null
+  systemctl start "$SERVICE"
+}
+# Rollback of a full activation that began with the dual-slot units: their unit
+# files, the recorded slot's link and the record as they were (design doc 6.4).
+restore_dual_units() {
+  local slot target
+  if [[ -n "$old_entry_unit_backup" ]]; then cp -- "$old_entry_unit_backup" "$ENTRY_UNIT_FILE"; fi
+  if [[ -n "$old_slot_unit_backup" ]]; then cp -- "$old_slot_unit_backup" "$SLOT_UNIT_FILE"; fi
+  rm -f -- "$API_UNIT_FILE" "$APP_DIR/.api-cutover"
+  if [[ -n "$old_slot_record" ]]; then
+    read -r slot target <<< "$old_slot_record"
+    atomic_link "$target" "$APP_DIR/slots/$slot"
+    write_slot_record "$slot" "$target"
+    systemctl daemon-reload
+    systemctl disable "$(slot_unit "$(other_slot "$slot")")" >/dev/null 2>&1
+    systemctl enable "$(slot_unit "$slot")" >/dev/null 2>&1
+  fi
+}
+# Removes the dual-slot units and their state before a single-unit start
+# (design doc 3.9); left in place, the entry would hold the port.
+dual_teardown() {
+  local slot file
+  [[ -e "$ENTRY_UNIT_FILE" || -e "$SLOT_UNIT_FILE" || -e "$APP_DIR/.api-slot" || -e "$APP_DIR/slots" ]] || return 0
+  systemctl stop "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)" >/dev/null 2>&1
+  for slot in a b; do systemctl disable "$(slot_unit "$slot")" >/dev/null 2>&1; done
+  for file in "$ENTRY_UNIT_FILE" "$SLOT_UNIT_FILE"; do
+    if [[ -f "$file" ]] && grep -q '^# Managed by project-aggregation installer$' "$file"; then rm -f -- "$file"; fi
+  done
+  rmdir -- "$ENTRY_UNIT_FILE.wants" 2>/dev/null
+  rm -f -- "$APP_DIR/.api-slot" "$APP_DIR/.api-cutover" "$APP_DIR/slots/a" "$APP_DIR/slots/b"
+  rmdir -- "$APP_DIR/slots" 2>/dev/null
+  if [[ -f "$API_UNIT_FILE" ]]; then mirror_recovery_guard "$API_UNIT_FILE.d"; fi
+  return 0
 }
 managed_release() {
   [[ "$1" == "$APP_DIR/releases/"* && "${1##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ &&
@@ -2499,9 +2840,12 @@ live_runtime_release() {
   managed_release "$APP_DIR/releases/${directory##*/}"
 }
 # What the runtime was last started with by a full activation besides its code:
-# the unit, the environment file, Node and the installer revision.
+# the unit, the environment file, Node and the installer revision. The entry
+# restarts only with the runtime, so its unit counts as the runtime's.
 runtime_deployment_key() {
-  { cat -- "$work_dir/service" "$ENV_FILE"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash
+  local -a units=("$work_dir/service")
+  [[ "$slot_layout" != dual ]] || units+=("$work_dir/entry.service")
+  { cat -- "${units[@]}" "$ENV_FILE"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash
 }
 release_runtime_key() {
   local key
@@ -2518,9 +2862,18 @@ migration_settled() {
 # Prints api when the running runtime would restart into the same code with the
 # same unit and configuration, and no module migration is outstanding; full
 # otherwise (design doc 6.2). Shared code outside server/api counts as runtime.
+# The dual-slot units move only the slots, from a settled record (api-dual-slot
+# 6.2); a change of layout is always full.
+api_layout_settled() {
+  if [[ "$slot_layout" == dual ]]; then
+    dual_installed && cmp -s "$work_dir/entry.service" "$ENTRY_UNIT_FILE" && [[ ! -e "$APP_DIR/.api-cutover" ]] && read_slot_record >/dev/null
+  else
+    [[ -f "$API_UNIT_FILE" ]] && ! dual_installed
+  fi
+}
 activation_scope() {
   local running key
-  if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$API_UNIT_FILE" && -f "$APP_DIR/.runtime-deployment" ]] &&
+  if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$APP_DIR/.runtime-deployment" ]] && api_layout_settled &&
      cmp -s "$work_dir/service" "$UNIT_FILE" && [[ "$(cat -- "$APP_DIR/.runtime-deployment")" == "$(runtime_deployment_key)" ]] &&
      systemctl is-active --quiet "$SERVICE" && running=$(live_runtime_release) &&
      key=$(release_runtime_key "$release") && [[ "$(release_runtime_key "$running")" == "$key" ]] &&
@@ -2535,14 +2888,19 @@ scope_admitted() {
   [[ "$PROJECT_DEPLOY_SCOPE" != api || "$1" == api ]]
 }
 prune_releases() {
-  local directory runtime_release
+  local directory runtime_release slot
+  local -A slot_releases=()
+  # A slot keeps the release its link names until a cutover moves it.
+  for slot in a b; do
+    if directory=$(realpath -e -- "$APP_DIR/slots/$slot" 2>/dev/null); then slot_releases[$directory]=1; fi
+  done
   if ! runtime_release=$(live_runtime_release); then
     # The runtime may still run from any release while its own is unknown.
     if systemctl is-active --quiet "$SERVICE"; then log '无法确认运行时所在的版本目录；本次不清理旧版本。'; return 0; fi
     runtime_release=
   fi
   while IFS= read -r directory; do
-    if [[ "$directory" == "$release" || "$directory" == "$previous_release" || "$directory" == "$runtime_release" ]]; then continue; fi
+    if [[ "$directory" == "$release" || "$directory" == "$previous_release" || "$directory" == "$runtime_release" || -n "${slot_releases[$directory]:-}" ]]; then continue; fi
     [[ -f "$directory/.managed-release" ]] || continue
     [[ "${directory##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ ]] || continue
     safe_remove_release "$directory"
@@ -2575,7 +2933,7 @@ prune_caches() {
       if managed_release "$directory" >/dev/null; then runtime_roots+=("$directory"); fi
     done
   fi
-  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "${runtime_roots[@]}"; do
+  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "$APP_DIR/slots/a" "$APP_DIR/slots/b" "${runtime_roots[@]}"; do
     [[ -n "$root" && -e "$root" ]] || continue
     root=$(realpath -e -- "$root") || return 1
     roots+=("$root")
@@ -2710,6 +3068,17 @@ main() {
     old_api_unit_backup="$work_dir/previous-api.service"
     cp -- "$API_UNIT_FILE" "$old_api_unit_backup"
   fi
+  if [[ -f "$ENTRY_UNIT_FILE" ]]; then
+    grep -q '^# Managed by project-aggregation installer$' "$ENTRY_UNIT_FILE" || fail '同名入口 systemd 服务已存在且不属于本安装脚本。'
+    old_entry_unit_backup="$work_dir/previous-entry.service"
+    cp -- "$ENTRY_UNIT_FILE" "$old_entry_unit_backup"
+    old_layout=dual
+  fi
+  if [[ -f "$SLOT_UNIT_FILE" ]]; then
+    grep -q '^# Managed by project-aggregation installer$' "$SLOT_UNIT_FILE" || fail '同名 API 槽 systemd 模板已存在且不属于本安装脚本。'
+    old_slot_unit_backup="$work_dir/previous-slot.service"
+    cp -- "$SLOT_UNIT_FILE" "$old_slot_unit_backup"
+  fi
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     useradd --system --user-group --home-dir "$DATA_DIR_DEFAULT" --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
@@ -2741,8 +3110,9 @@ main() {
   if [[ -f "$APP_DIR/.greeks-python-path" ]]; then GREEKS_PYTHON_PATH=$(cat "$APP_DIR/.greeks-python-path"); fi
   if [[ -f "$APP_DIR/.aster-python-path" ]]; then ASTER_PYTHON_PATH=$(cat "$APP_DIR/.aster-python-path"); fi
   systemd_version=$(systemd_major)
+  slot_layout=$(target_layout)
   write_unit
-  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service" "$work_dir/api.service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
+  deployment_key=$({ cat "$ENV_FILE"; layout_units | xargs -d '\n' cat --; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
   # Both deployment modes consume exactly the selected stable release. The
   # coordinator passes a pinned manifest; direct installs discover stable once.
   ci_release_resolve hxx344/project-aggregation "$work_dir"
@@ -2751,7 +3121,7 @@ main() {
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
   if [[ ( "$PROJECT_DEPLOY_MODE" == ci || "$PROJECT_DEPLOY_TESTS" == 0 ) && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
-        "$deployed_state" == "$commit $deployment_key" ]] &&
+        "$deployed_state" == "$commit $deployment_key" && ! -e "$APP_DIR/.api-cutover" ]] &&
       { [[ "$PROJECT_DEPLOY_MODE" != source ]] || source_runtime_dependencies_ready "$old_release"; } && healthy; then
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
@@ -2767,7 +3137,8 @@ main() {
     validate_embedded_runtime "$release"
     # The entries are imported, not run: under -e there is no main module, so import.meta.main stays false.
     run_as_service "$NODE_BIN" --input-type=module -e 'for (const file of process.argv.slice(2)) await import(file)' import-check \
-      "$release/server/app.mjs" "$release/server/launcher.mjs" "$release/server/runtime/main.mjs" "$release/server/api/main.mjs"
+      "$release/server/app.mjs" "$release/server/launcher.mjs" "$release/server/runtime/main.mjs" "$release/server/api/main.mjs" \
+      "$release/server/entry/main.mjs" "$release/server/entry/probe.mjs"
   else
   log "准备正式版本 ${commit:0:12} 的源码；不下载预构建运行包。"
   fetch_source
@@ -2780,8 +3151,8 @@ main() {
   prepare_greeks_runtime "$release"
   prepare_aster_runtime "$release"
   write_unit
-  deployment_key=$({ cat "$ENV_FILE" "$work_dir/service" "$work_dir/api.service"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
-  if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" ]] && healthy; then
+  deployment_key=$({ cat "$ENV_FILE"; layout_units | xargs -d '\n' cat --; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
+  if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" && ! -e "$APP_DIR/.api-cutover" ]] && healthy; then
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
     log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
@@ -2795,6 +3166,11 @@ main() {
   if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
   prepare_environment_rollback
   ci_update_progress switch
+  if dual_installed; then
+    resolve_cutover || log '上次未完成的 API 槽切换无法就地恢复；本次整体重启。'
+    cutover_from= cutover_to= cutover_committed=0
+    old_slot_record=$(read_slot_record) || old_slot_record=
+  fi
   activation_scope=$(activation_scope)
   if ! scope_admitted "$activation_scope"; then
     # Nothing is activated yet: rollback only closes progress and exits.
@@ -2803,7 +3179,14 @@ main() {
     rollback "$SCOPE_REFUSED"
   fi
   activation_started=1
-  if [[ "$activation_scope" == api ]]; then
+  if [[ "$activation_scope" == api && "$slot_layout" == dual ]]; then
+    log '运行时代码、服务配置和环境未变化：只切换 API 槽，入口、模块与采集保持运行。'
+    if ! cmp -s "$work_dir/slot.service" "$SLOT_UNIT_FILE"; then
+      install -m 0644 "$work_dir/slot.service" "$SLOT_UNIT_FILE"
+      systemctl daemon-reload
+    fi
+    api_cutover "$(other_slot "${old_slot_record%% *}")" "$release" || fail 'API 槽切换未完成。'
+  elif [[ "$activation_scope" == api ]]; then
     log '运行时代码、服务配置和环境未变化：只重启 API，模块与采集保持运行。'
     if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
     if ! cmp -s "$work_dir/api.service" "$API_UNIT_FILE"; then
@@ -2811,11 +3194,15 @@ main() {
       systemctl daemon-reload
     fi
     systemctl restart "$API_SERVICE"
-  else
+  elif [[ "$slot_layout" == dual ]]; then
     # Recorded again once the restarted runtime is healthy.
+    rm -f -- "$APP_DIR/.runtime-deployment"
+    activate_dual_full
+  else
     rm -f -- "$APP_DIR/.runtime-deployment"
     migrate_embedded_modules "$release"
     if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
+    dual_teardown
     units_changed=0
     if [[ ! -f "$UNIT_FILE" ]] || ! cmp -s "$work_dir/service" "$UNIT_FILE"; then install -m 0644 "$work_dir/service" "$UNIT_FILE"; units_changed=1; fi
     if [[ ! -f "$API_UNIT_FILE" ]] || ! cmp -s "$work_dir/api.service" "$API_UNIT_FILE"; then install -m 0644 "$work_dir/api.service" "$API_UNIT_FILE"; units_changed=1; fi
@@ -2841,7 +3228,9 @@ main() {
   rm -rf -- "$work_dir"
   trap - ERR INT TERM
   log "安装完成：已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha")；监听 $HOST_VALUE:$PORT_VALUE，配置与数据已保留。"
-  log "首次登录密码请在服务器运行：sudo journalctl -u $API_SERVICE --no-pager -n 30"
+  local api_journal=$API_SERVICE
+  [[ "$slot_layout" != dual ]] || api_journal="$API_SERVICE@*"
+  log "首次登录密码请在服务器运行：sudo journalctl -u '$api_journal' --no-pager -n 30"
 }
 
 # CI may source pure helpers without changing its host.

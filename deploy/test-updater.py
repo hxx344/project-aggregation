@@ -246,6 +246,45 @@ class RegistryTests(RootFixture):
         dropins.unlink()
         self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
 
+    def test_dual_slot_units_are_read_from_their_own_links(self):
+        module = registry.BY_ID['hub']; root, release, unit = self.install(module)
+        single = registry.installed(module, self.root)['identity']
+        units = unit.parent
+        current_path = str(root / 'current').replace('\\', '/')
+        slots_path = str(root / 'slots/%i').replace('\\', '/')
+        (units / 'project-aggregation-api.service').unlink()
+        entry = units / 'project-aggregation-entry.service'
+        template = units / 'project-aggregation-api@.service'
+        body = '# Managed by project-aggregation installer\n[Service]\nUser=project-aggregation\nWorkingDirectory={}\nExecStart=/usr/bin/node {}\n'
+        entry.write_text(body.format(current_path, current_path + '/server/entry/main.mjs'), encoding='utf8')
+        template.write_text(body.format(slots_path, slots_path + '/server/api/main.mjs'), encoding='utf8')
+        value = registry.installed(module, self.root)
+        self.assertEqual(value['state'], 'unavailable')
+        self.assertNotEqual(value['identity'], single)
+        # Each unit runs only from its own link.
+        for target, text in [(template, body.format(current_path, current_path + '/server/api/main.mjs')),
+                             (template, body.format(slots_path, current_path + '/server/api/main.mjs')),
+                             (entry, body.format(slots_path, slots_path + '/server/entry/main.mjs')),
+                             (entry, body.format(current_path, current_path + '/server/api/main.mjs'))]:
+            with self.subTest(unit=target.name, text=text):
+                previous = target.read_text(encoding='utf8'); target.write_text(text, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+                target.write_text(previous, encoding='utf8')
+        template.unlink()
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged')
+        template.write_text(body.format(slots_path, slots_path + '/server/api/main.mjs'), encoding='utf8')
+        # The guard belongs to the runtime and the template, never to the entry or one instance.
+        guard = ('# Managed by project-aggregation recovery\n[Service]\nExecStartPre=/usr/bin/python3 -I /usr/local/lib/project-aggregation-recovery/startup-guard.py '
+                 '${DATA_DIR} /opt/project-aggregation/current/server/execution/account-writer.mjs /usr/local/bin/node\n')
+        for name in ('project-aggregation', 'project-aggregation-api@'):
+            directory = units / (name + '.service.d'); directory.mkdir(); (directory / '20-recovery-guard.conf').write_text(guard, encoding='utf8')
+        self.assertEqual(registry.installed(module, self.root)['state'], 'unavailable')
+        for name in ('project-aggregation-entry', 'project-aggregation-api@a', 'project-aggregation-api@b', 'project-aggregation-api'):
+            with self.subTest(dropins=name):
+                directory = units / (name + '.service.d'); directory.mkdir(); (directory / '20-recovery-guard.conf').write_text(guard, encoding='utf8')
+                self.assertEqual(registry.installed(module, self.root)['state'], 'unmanaged' if name != 'project-aggregation-api' else 'unavailable')
+                (directory / '20-recovery-guard.conf').unlink(); directory.rmdir()
+
     @unittest.skipUnless(LINUX_ROOT, 'Linux ownership/mode protection requires root')
     def test_recovery_guard_must_be_root_owned_and_read_only(self):
         module = registry.BY_ID['hub']; root, release, unit = self.install(module)
