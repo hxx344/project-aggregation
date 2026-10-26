@@ -31,11 +31,11 @@ export function createPortalStore({ db, stmt }) {
     // Every stored grant with its digest, for the Portal's liveness sweep.
     grants: () => stmt.prepare('SELECT * FROM portal_grants').all().map(row => ({ ...record(row), digest: row.digest })),
     revokeGrants: digests => immediate(db, () => { for (const digest of digests) stmt.prepare('DELETE FROM portal_grants WHERE digest=?').run(digest); }),
-    // The same without waiting for another writer: throws at once while the database is busy.
-    tryRevokeGrants: digests => {
+    // Runs `fn` without waiting for another writer: a write in it throws at once while the database is busy.
+    withoutWaiting: fn => {
       const { timeout } = db.prepare('PRAGMA busy_timeout').get();
       db.exec('PRAGMA busy_timeout=0');
-      try { return immediate(db, () => { for (const digest of digests) stmt.prepare('DELETE FROM portal_grants WHERE digest=?').run(digest); }); }
+      try { return fn(); }
       finally { db.exec(`PRAGMA busy_timeout=${Number(timeout)}`); }
     },
     // Deletes at most PRUNE_BATCH expired rows of each table per call.

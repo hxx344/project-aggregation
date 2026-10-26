@@ -186,21 +186,29 @@ test('API instances on one hub database share tickets, grants and their revocati
   assert.equal((await b.request('/private', { cookie })).status, 401);
 });
 
-test('a logout that cannot delete its grant while the database is busy is refused at once and retried', { timeout: 30_000 }, async t => {
+test('a logout that cannot delete its grant while the database is busy is refused at once and retried', { timeout: 15_000 }, async t => {
   const dir = mkdtempSync(join(tmpdir(), 'portal-shared-')); const dbs = [0, 1, 2].map(() => openHubDatabase(join(dir, 'hub.sqlite')));
   t.after(() => { for (const db of dbs) db.close(); rmSync(dir, { recursive: true, force: true }); });
   const [a, b] = await Promise.all(dbs.slice(0, 2).map(db => fixture(t, { store: createPortalStore(createControlStore(db)) })));
   const { cookie } = await a.authorize();
   dbs[2].exec('BEGIN IMMEDIATE');
-  let logout;
-  try { logout = await a.request('/api/logout', { method: 'POST', cookie, headers: { Origin: `http://${a.host('asset')}` } }); }
-  catch (error) { dbs[2].exec('ROLLBACK'); throw error; }
-  assert.equal(logout.status, 200); assert.deepEqual(logout.headers['set-cookie'], ['hub_portal=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0']);
-  assert.equal((await a.request('/private', { cookie })).status, 401);
-  assert.equal((await b.request('/private', { cookie })).status, 200);
-  dbs[2].exec('ROLLBACK');
-  await new Promise(resolve => setTimeout(resolve, 1500));
-  assert.equal((await b.request('/private', { cookie })).status, 401);
+  try {
+    const logout = await a.request('/api/logout', { method: 'POST', cookie, headers: { Origin: `http://${a.host('asset')}` } });
+    assert.equal(logout.status, 200); assert.deepEqual(logout.headers['set-cookie'], ['hub_portal=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0']);
+    const started = Date.now();
+    assert.equal((await a.request('/private', { cookie })).status, 401);
+    assert.equal((await b.request('/private', { cookie })).status, 200);
+    // The retry each second must not wait out busy_timeout (5 s) while the lock is held.
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal((await b.request('/private', { cookie })).status, 200);
+    assert.ok(Date.now() - started < 3000, `requests waited ${Date.now() - started} ms on the busy database`);
+  } finally { dbs[2].exec('ROLLBACK'); }
+  // The next sweep tick stores the revocation; poll rather than assume when it runs.
+  let status;
+  for (const deadline = Date.now() + 3000; Date.now() < deadline; await new Promise(resolve => setTimeout(resolve, 100))) {
+    if ((status = (await b.request('/private', { cookie })).status) === 401) break;
+  }
+  assert.equal(status, 401);
 });
 
 test('a grant revoked by one API instance closes the WebSocket open on the other', async t => {

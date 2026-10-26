@@ -124,19 +124,23 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     // An entry whose check fails stays; every request checks it again.
     for (const [id, grant] of authGrants) { try { if (!liveGrant(grant)) authGrants.delete(id); } catch {} }
     for (const stream of active) if (!liveOrFailed(stream.grant)) { stream.destroy(); active.delete(stream); }
-    if (revoking.size) { const digests = [...revoking]; store.tryRevokeGrants(digests); for (const digest of digests) revoking.delete(digest); }
+    if (revoking.size) { const digests = [...revoking]; store.withoutWaiting(() => store.revokeGrants(digests)); for (const digest of digests) revoking.delete(digest); }
   }
-  // Also deletes stored rows that expired or lost their session, project or revision.
-  function prune() {
+  // Deletes stored rows that expired or lost their session, project or revision.
+  function pruneStored() {
     store.prune(now());
     store.revokeGrants(store.grants().filter(grant => !validGrant(grant)).map(grant => grant.digest));
-    sweepProcess();
   }
+  function prune() { pruneStored(); sweepProcess(); }
 
-  // Stored rows are deleted once a minute. Every use checks expiry and validity itself, so
-  // a busy database (another instance writing) only defers the deletion to a later tick.
+  // Stored rows are deleted once a minute, without waiting on a busy database. Every use checks
+  // expiry and validity itself, so a busy database (another instance writing) only defers the
+  // deletion to a later tick.
   let ticks = 0;
-  const sweep = setInterval(() => { try { if (++ticks % 60) sweepProcess(); else prune(); } catch {} }, 1000); sweep.unref();
+  const sweep = setInterval(() => {
+    if (++ticks % 60 === 0) try { store.withoutWaiting(pruneStored); } catch {}
+    try { sweepProcess(); } catch {}
+  }, 1000); sweep.unref();
 
   function createLaunch({ projectId, sessionId, req }) {
     if (closed) throw new PortalError(503, '项目代理已关闭');
