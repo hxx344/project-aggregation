@@ -79,7 +79,7 @@ export async function run({ configPath, data, duration }) {
       if (d.event === 'cooldown') atomicJson(cooldownFile, cooldowns);
       recorder.write({ type: 'diagnostic', ...d });
     });
-    const snapshot = () => ({ schema: 1, pid: process.pid, session, mode: effective.simulation.enabled ? 'paper' : 'research', startedAt, heartbeatAt: new Date().toISOString(), region: config.region, configHash: createHash('sha256').update(source).digest('hex'), paperSuspendedReason, ...lab.report(), metadata, diagnostics, eventLoopDelayMs: { p50: loop.percentile(50) / 1e6, p95: loop.percentile(95) / 1e6, p99: loop.percentile(99) / 1e6 }, stopped: abort.signal.aborted });
+    const snapshot = () => ({ schema: 1, pid: process.pid, session, mode: effective.simulation.enabled ? 'paper' : 'research', startedAt, heartbeatAt: new Date().toISOString(), region: config.region, configHash: createHash('sha256').update(source).digest('hex'), sessionConfig: structuredClone(effective), paperSuspendedReason, ...lab.report(), metadata, diagnostics, eventLoopDelayMs: { p50: loop.percentile(50) / 1e6, p95: loop.percentile(95) / 1e6, p99: loop.percentile(99) / 1e6 }, stopped: abort.signal.aborted });
     const persist = () => {
       const report = snapshot();
       atomicJson(join(data, 'report.json'), report);
@@ -107,7 +107,11 @@ export async function run({ configPath, data, duration }) {
       } finally { refreshing = false; }
     };
     const stop = () => abort.abort();
+    const managedMessage = (message) => { if (message?.type === 'entropy-lighter-stop') stop(); };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
+    process.once('disconnect', stop);
+    process.on('message', managedMessage);
+    if (process.env.ENTROPY_LAB_MANAGED === '1' && !process.connected) stop();
     const ticker = setInterval(safe(() => { lab.advance(performance.now(), Date.now()); }), 50);
     const writer = setInterval(safe(persist), 5000);
     const launchRefresh = () => { refreshPromise = refresh(); refreshPromise.catch(fail); };
@@ -123,6 +127,8 @@ export async function run({ configPath, data, duration }) {
     } finally {
       clearInterval(ticker); clearInterval(writer); clearInterval(refresher); if (deadline) clearTimeout(deadline);
       process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
+      process.removeListener('disconnect', stop);
+      process.removeListener('message', managedMessage);
       if (refreshPromise) await refreshPromise;
       if (feeds) await feeds.stop();
       loop.disable();

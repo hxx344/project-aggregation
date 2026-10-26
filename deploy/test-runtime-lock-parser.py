@@ -159,7 +159,8 @@ exports.parse = content => ({ ...JSON.parse(content), parserProbe });
                     'server/modules/python-module.mjs', 'modules/monitor/dist/client/index.html',
                     'modules/asset/.next/BUILD_ID', 'modules/crossex/dist/index.html',
                     'modules/greeks/requirements.lock', 'modules/aster/dashboard/dist/client/index.html',
-                    'modules/aster/requirements.lock', 'deploy/migrate-modules.py', 'deploy/diagnose-aster-margin.py')
+                    'modules/aster/requirements.lock', 'deploy/migrate-modules.py', 'deploy/diagnose-aster-margin.py',
+                    *(f'tools/entropy-lighter-lab/{name}' for name in package_release.LAB_RUNTIME_FILES))
         for relative in required:
             target = self.source / relative
             target.parent.mkdir(parents=True, exist_ok=True)

@@ -148,6 +148,7 @@ export class Lab {
     this.leadPending = [];
     this.leadStats = new Map();
     this.spreads = new Map();
+    this.recentSpreads = new Map(SYMBOLS.map((symbol) => [symbol, []]));
     this.counts = { books: 0, candidates: 0, invalidated: 0, rejected: {} };
     this.results = new Map(config.simulation.latencyScenarios.map((s) => [s.name, summaries()]));
   }
@@ -157,6 +158,11 @@ export class Lab {
     for (const s of symbol ? [symbol] : SYMBOLS) {
       this.books.delete(pairKey(venue, s));
       this.history.delete(pairKey(venue, s));
+      const points = this.recentSpreads.get(s);
+      if (venue !== 'binance' && points?.length && points.at(-1).midBasisBps !== null) {
+        points.push({ at: Date.now(), midBasisBps: null, takerEdgeBps: null, buy: null, sell: null, sourceClockUncertain: true });
+        if (points.length > 600) points.shift();
+      }
     }
     this.leadPending = this.leadPending.filter((p) => p.venue !== venue && venue !== 'binance');
     this.counts.invalidated++;
@@ -197,6 +203,11 @@ export class Lab {
     directions.sort((x, y) => y.edgeBps - x.edgeBps);
     const d = directions[0];
     const sourceTimeErrors = [a, b].map((book) => ({ venue: book.venue, error: book.sourceAt === null ? 'missing_source_time' : validateBook(book, now, wall, this.config), sourceClockDeltaMs: book.sourceAt === null ? null : wall - book.sourceAt }));
+    const points = this.recentSpreads.get(symbol);
+    if (!points.length || points.at(-1).midBasisBps === null || wall - points.at(-1).at >= 2000) {
+      points.push({ at: wall, midBasisBps: spread, takerEdgeBps: d.edgeBps, buy: d.buy.venue, sell: d.sell.venue, sourceClockUncertain: sourceTimeErrors.some((e) => e.error) });
+      if (points.length > 600) points.shift();
+    }
     this.emit({ type: 'spread', symbol, at: wall, mono: now, entropyMid: mid(a), lighterMid: mid(b), midBasisBps: spread, takerEdgeBps: d.edgeBps, buy: d.buy.venue, sell: d.sell.venue, sourceTimeErrors, observation: 'receive_time_only_not_source_freshness_proof', settlementEquivalence: 'requires_verification' });
     const s = this.config.simulation;
     if (!s.enabled || !s.verifiedSymbols.includes(symbol)) { this.reject('paper_disabled_or_contract_unverified'); return; }
@@ -318,6 +329,8 @@ export class Lab {
   report() {
     return {
       counts: this.counts,
+      latestQuotes: [...this.books.values()].map((b) => ({ venue: b.venue, symbol: b.symbol, nativeSymbol: b.nativeSymbol, bid: b.bids[0][0], ask: b.asks[0][0], receivedAt: b.receivedAt, sourceAt: b.sourceAt, sourceClockUncertain: b.sourceAt === null || b.receivedAt - b.sourceAt < -100 || b.receivedAt - b.sourceAt > this.config.maxSourceAgeMs })),
+      recentSpreads: Object.fromEntries(this.recentSpreads),
       basis: Object.fromEntries([...this.spreads].map(([symbol, s]) => [symbol, { samples: s.count, meanBps: s.sum / s.count, minBps: s.min, maxBps: s.max }])),
       leaderMarkouts: Object.fromEntries([...this.leadStats].map(([key, s]) => [key, { samples: s.count, directionHitRate: s.directionHits / s.count, meanSignedMoveBps: s.sumSignedMoveBps / s.count }])),
       paper: Object.fromEntries([...this.results].map(([key, s]) => {

@@ -43,4 +43,4 @@ export function fakeModules(socketDir, { failMaintenance = {} } = {}) {
   return { startModules, maintenanceCalls, hold };
 }
 // Without background refreshes, so a test sees only the calls it makes.
-export const dataPlaneOptions = { refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0, baselineIntervalMs: 0, warmup: resolveWarmup({ warmupEnabled: false }) };
+export const dataPlaneOptions = { refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0, researchEnabledByDefault: false, baselineIntervalMs: 0, warmup: resolveWarmup({ warmupEnabled: false }) };

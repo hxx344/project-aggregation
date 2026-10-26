@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { fork } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,6 +94,15 @@ test('the launcher runs the runtime and the API as two processes; a crashed API 
   assert.deepEqual((await c.request('/api/projects')).data.projects.map(project => project.id), moduleIds);
   // Forwarded to the data plane in the runtime process.
   assert.equal((await c.request('/api/trading')).status, 200);
+  const researchDirectory = path.join(dataDir, 'entropy-lighter');
+  writeFileSync(path.join(researchDirectory, 'cooldowns.json'), JSON.stringify(Object.fromEntries(['entropy', 'lighter', 'binance'].map(id => [id, Date.now() + 3600000]))));
+  assert.equal((await c.request('/api/research/entropy-lighter/start', { method: 'POST', body: {} })).status, 200);
+  let researchSession;
+  assert.ok(await until(async () => {
+    const value = (await c.request('/api/research/entropy-lighter')).data;
+    if (value?.state !== 'running') return false;
+    researchSession = value.report.session; return true;
+  }), 'the runtime owns a healthy offline collector before the API restart');
   const modules = await c.request('/api/system/modules');
   assert.equal(modules.data.enabled, true); assert.deepEqual(modules.data.modules.map(row => row.moduleId), moduleIds);
   // Portal reaches a module whose transport only the runtime process knows.
@@ -107,6 +116,10 @@ test('the launcher runs the runtime and the API as two processes; a crashed API 
   const d = client(second.port, c.session);
   assert.equal((await d.request('/api/projects')).status, 200, 'sessions are stored in the database, not in the API process');
   assert.equal((await d.request('/api/trading')).status, 200);
+  const retainedResearch = await d.request('/api/research/entropy-lighter');
+  assert.equal(retainedResearch.status, 200);
+  assert.equal(retainedResearch.data.report.session, researchSession, 'the collector session survives an API-only crash/restart');
+  assert.equal((await d.request('/api/research/entropy-lighter/stop', { method: 'POST', body: {} })).status, 200);
   assert.equal((await d.request('/api/logout', { method: 'POST' })).status, 200);
   assert.equal((await d.request('/api/trading')).status, 401);
 

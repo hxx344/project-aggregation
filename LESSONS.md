@@ -275,6 +275,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 本轮关联 `aster-adl-ui-entry-20261016`：同次 ADL 功能交付中的入口补全，设置、状态、报告及其连续修补不拆成多个事件；扩展本条经验，不另建重复条目或推进主线复盘检查点。
 
+**工作台原生入口补充（2026-10-27）：** `3e4de30` 已在聚合仓库交付 Entropy/Lighter 采集与模拟，却仅提供独立 CLI/systemd；用户随后明确要求在工作台内部使用。仓库与发布目标正确仍不足以完成产品接入。新增研究能力先核对侧栏入口、配置/报告路径、后台生命周期及正式包，不能从“Linux 常驻”自行推导为另装服务。本轮补齐原生研究页、已鉴权的 API、runtime 托管进程、四文件发布白名单及增量键；用 [工作台接口测试](tests/entropy-lighter-workbench.test.mjs)、[生产页面夹具](tests/entropy-lighter.browser.mjs) 和 [跨 API 重启用例](tests/process-split.test.mjs) 验证，其中 POSIX 路径在 Windows 跳过、等待 CI，不能描述为本地通过。事件 `research-workbench-entry-20261027`；不推进复盘检查点，历史事件的具体根因与适用边界仍须逐项核验，不仅按条目内日期数量升级规范。
+
 ### L018：固定 Node 执行包管理器时必须取得 JavaScript 入口
 
 **适用条件：** CI 或安装器使用 `node <package-manager>`，以固定 Node 版本运行包管理器。

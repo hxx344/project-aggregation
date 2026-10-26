@@ -1,32 +1,30 @@
 # Entropy / Lighter 24 小时行情研究工具
 
-首版采集公开盘口，研究 SNDK、ANTH 的真实价差、Binance 行情之后的跨所价格变化，以及延迟对 taker 成交结果的影响。默认只采集；不需要 API Key，没有下单、签名、转账或自成交功能。程序独立运行，不接工作台现有交易执行器。
+工具已内置到工作台，用于持续采集公开盘口，研究 SNDK、ANTH 的真实价差、Binance 行情之后的跨所价格变化，以及延迟对 taker 成交结果的影响。默认只采集；不需要 API Key，没有下单、签名、转账或自成交功能。
 
-本次按 R3 交付：行情与纸面计算为 R2；独立 systemd 安装、激活及回滚为 R3。影响仅为新增工具、专用安装入口和对应 CI，不改变工作台现有模块。网络失败暂停对应研究/模拟，保留历史；磁盘写失败退出，交给 systemd 有界恢复。停止本服务即可停用，重新执行旧正式提交的安装器可回滚代码，配置与数据保留。
+工作台运行时管理采集进程，网页沿用工作台登录。采集不依赖浏览器保持打开；单独重启工作台 API 或更新页面时仍继续运行。代码随工作台统一发布，源码构建和预构建运行包均包含工具，不需要另装服务。
 
-## 东京 Linux 一键运行
+## 从工作台运行
 
-在 Ubuntu 24.04 LTS x64、systemd 服务器执行：
+服务器更新工作台后，从侧栏 **监控 → Entropy / Lighter** 打开研究页面。首次默认启动持续采集，可在页面查看运行状态、盘口统计、报告与图表，也可停止、启动或修改配置。停止选择会保存，工作台重启后不会擅自重新启动已停止的采集。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-entropy-lighter-lab.sh | sudo bash
-```
-
-安装器读取本仓库正式发布的 manifest，固定到同一个 commit 下载白名单文件；自动准备缺少的依赖和校验过的 Node 24。已有受信任 Node 可复用，无 npm 依赖、构建或监听端口。配置首次生成后不覆盖。内容、配置、Node 和服务未变化时跳过验证与重启；变化只重启本服务。启动失败恢复旧代码和服务状态。
-
-路径与管理命令：
+尚未安装或需要更新工作台时，在 Ubuntu 24.04 LTS x64、systemd 服务器执行统一命令：
 
 ```bash
-sudo systemctl status entropy-lighter-lab --no-pager
-sudo journalctl -u entropy-lighter-lab -f
-sudo cat /var/lib/entropy-lighter-lab/status.json
-sudo /opt/entropy-lighter-lab/current/node /opt/entropy-lighter-lab/current/tools/entropy-lighter-lab/cli.mjs report --data /var/lib/entropy-lighter-lab
-sudo systemctl stop entropy-lighter-lab
+curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-all.sh | sudo bash
 ```
 
-配置为 `/etc/entropy-lighter-lab/config.json`，数据为 `/var/lib/entropy-lighter-lab`，代码在 `/opt/entropy-lighter-lab/current`。服务以专用非 root 用户运行；离线启动也有本地心跳，心跳存活与交易所行情有效分别判断。
+重复执行增量更新并保留已有配置与数据。研究代码变化会更新并重启工作台运行时；仅 API 或工作台页面变化时，复用运行时，采集继续。无变化时跳过依赖安装、构建和服务重启。运行数据位于 `DATA_DIR/entropy-lighter`，默认是 `/var/lib/project-aggregation/entropy-lighter`，与运行代码的发布目录分开保存。
 
-本地直接启动（Node 24.15+）：
+如果以前安装过独立 `entropy-lighter-lab` 服务，先停用旧服务及其开机启动，避免两套采集同时运行：
+
+```bash
+sudo systemctl disable --now entropy-lighter-lab
+```
+
+工作台不会自动迁移独立服务的 `/etc/entropy-lighter-lab/config.json` 或 `/var/lib/entropy-lighter-lab`。[独立安装器](../deploy/install-entropy-lighter-lab.sh)保留为可选 CLI 运行方式；工作台入口与统一更新不依赖它。离线启动也有本地心跳，进程存活与交易所行情有效分别判断。
+
+本地研究或短时诊断仍可直接使用 CLI（Node 24.15+）：
 
 ```bash
 node tools/entropy-lighter-lab/cli.mjs check
@@ -74,7 +72,7 @@ node tools/entropy-lighter-lab/cli.mjs report
 
 ## 可选纸面基线
 
-完成合约核验并确认账户实付费率后，编辑配置：`simulation.enabled=true`、`verifiedSymbols=["SNDK"]`、`entropyTakerFeeBps=实际总费率bps`，再运行 `check --config /etc/entropy-lighter-lab/config.json` 并重启本服务。首版建议保持 ANTH 未核验状态。
+完成合约核验并确认账户实付费率后，在工作台页面修改配置：`simulation.enabled=true`、`verifiedSymbols=["SNDK"]`、`entropyTakerFeeBps=实际总费率bps`。保存后按页面状态启动采集。CLI 使用者可先运行 `check --config /absolute/path/config.json`，再重启相应采集进程。ANTH 默认保持未核验状态。
 
 基线只用于检验价差是否经得住执行：同数量两腿 taker 开仓，固定持有默认 5 秒，然后 taker 平仓。开仓门槛要求扣除开平四次手续费、滑点和资金费准备后仍有额外安全边际；不把返佣作为入场依据。它不是经过验证的最优退出策略，也不保证每笔赚钱。
 
@@ -84,7 +82,7 @@ node tools/entropy-lighter-lab/cli.mjs report
 
 默认延迟为 Entropy 200 / Lighter 450ms 和压力情景 500 / 800ms，均为未实测假设。东京服务器采集的行情 RTT 用于诊断，实际下单 submit→ACK、submit→fill、失败重试和对冲完成时间仍需以后从正常真实成交记录测量。先看 24–72h 样本中的价差寿命和压力情景结果，再决定是否开发实盘；本首版没有实盘开关。
 
-崩溃/重启时，未清洁结束的 paper session 或未决任务会使新进程降为只采集，最初报告保存在 `unresolved-paper.json`，后续重启不会覆盖。先停服务并复核该报告；需要新的独立实验时使用新的数据目录，旧数据保留。正常独占锁会自动识别死 PID；若进程恰在启动仲裁瞬间被强杀留下 `run.claim`，会明确拒绝启动，需要停服务并核对没有运行进程后清理该空目录。
+崩溃/重启时，未清洁结束的 paper session 或未决任务会使新进程降为只采集，最初报告保存在 `unresolved-paper.json`，后续重启不会覆盖。先停止采集并复核该报告；需要新的独立实验时使用新的数据目录，旧数据保留。正常独占锁会自动识别死 PID；若进程恰在启动仲裁瞬间被强杀留下 `run.claim`，会明确拒绝启动，需要停止采集并核对没有运行进程后清理该空目录。
 
 ## 验证和回滚
 
@@ -92,9 +90,10 @@ Windows 原生测试：
 
 ```bash
 node --test tests/entropy-lighter-lab.test.mjs tests/entropy-lighter-feeds.test.mjs tests/entropy-lighter-cli.test.mjs
-python deploy/test-entropy-lighter-lab-install.py -v
+python deploy/test-package-layout.py -v
+python deploy/test-release.py -v
 ```
 
-后一个命令在 Windows 仅执行跨平台案例，其余权限/事务案例由 Ubuntu CI 执行。新增 CI 使用真实 systemd，覆盖离线首次启动、current 符号链接入口、非 root 隔离、无变化升级、配置与数据保留、代码更新及启动失败回滚，并纳入正式发布门槛。未使用 WSL，短时公开接口采集不等于已完成东京 24 小时验收。
+发布测试分别覆盖完整包的四文件白名单与可运行 CLI、源码发布命令的固定提交提取，以及研究代码的缓存失效范围。Windows 的原生 Git Bash 可运行跨平台输入分类测试 `bash deploy/test-inputs.sh`；Linux 权限、systemd 激活、增量安装与回滚由现有 Ubuntu CI 验证。短时公开接口采集不等于已完成东京 24 小时验收。
 
-停用只需 `systemctl stop`；不删除配置和数据。回滚可以取本仓旧正式 commit 的专用安装器，并传入同一 commit 的受信任源码目录 `--source /absolute/root-owned-checkout --revision FULL_COMMIT`。不要把未知来源或服务用户可写的源码作为 root 安装输入。
+本次包含部署交付路径变更，按 R3 审查。网络失败暂停对应研究/模拟并保留历史，磁盘写失败会停止采集。可从页面停止采集，配置和数据保留；回滚沿用工作台旧正式版本，保留 `DATA_DIR/entropy-lighter`，旧工作台不读取该研究目录。独立 CLI 安装方式仍可使用旧正式提交的专用安装器回滚，其数据与工作台目录分别保留。

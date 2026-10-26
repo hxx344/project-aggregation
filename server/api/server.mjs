@@ -341,6 +341,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       }
       throw new HttpError(404, '更新接口不存在');
     }
+    if (pathname === '/api/research/entropy-lighter' || pathname.startsWith('/api/research/entropy-lighter/')) {
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取研究数据');
+      if (req.headers.origin) sameOrigin(req);
+      await forward(req, res, url, current); return;
+    }
     if (pathname === '/api/trading' || pathname.startsWith('/api/trading/')) {
       if (!admitted(pathname, req.method)) { await forward(req, res, url, current); return; }
       // The body is read first, so its errors still come before an admission refusal; its bytes are forwarded unchanged.

@@ -149,6 +149,7 @@ class RuntimeDependencyTests(unittest.TestCase):
     def test_five_module_package_includes_aster_static_and_python_without_vinext(self):
         from unittest.mock import patch
         required = self.prepare_five_modules()
+        self.prepare_research_tool()
         with patch.object(module, 'read_runtime_lock', return_value=self.lock):
             module.stage_runtime(self.source, self.target)
         for name in required:
@@ -156,6 +157,49 @@ class RuntimeDependencyTests(unittest.TestCase):
         self.assertFalse((self.target / 'node_modules/vinext').exists())
         self.assertFalse((self.target / 'modules/aster/dashboard/node_modules').exists())
         self.assertTrue((self.target / 'node_modules/runtime/package.json').is_file())
+        self.assert_research_tool_runs(self.target)
+
+    def prepare_research_tool(self):
+        repository = Path(__file__).resolve().parent.parent
+        target = self.source / 'tools/entropy-lighter-lab'
+        target.mkdir(parents=True)
+        for name in module.LAB_RUNTIME_FILES:
+            shutil.copy2(repository / 'tools/entropy-lighter-lab' / name, target / name)
+        (target / 'config.json').write_text('private configuration must not ship')
+        (target / 'events-fixture.jsonl').write_text('research data must not ship')
+
+    def assert_research_tool_runs(self, root):
+        directory = root / 'tools/entropy-lighter-lab'
+        self.assertEqual(set(module.LAB_RUNTIME_FILES), {path.name for path in directory.iterdir()})
+        result = subprocess.run(['node', str(directory / 'cli.mjs'), 'check'], cwd=root,
+                                capture_output=True, text=True, check=True)
+        self.assertIn('Configuration valid', result.stdout)
+
+    def test_full_package_rejects_missing_research_runtime(self):
+        from unittest.mock import patch
+        self.prepare_five_modules()
+        self.prepare_research_tool()
+        for name in module.LAB_RUNTIME_FILES:
+            with self.subTest(name=name):
+                file = self.source / 'tools/entropy-lighter-lab' / name
+                content = file.read_bytes(); file.unlink()
+                try:
+                    with patch.object(module, 'read_runtime_lock', return_value=self.lock):
+                        with self.assertRaisesRegex(ValueError, 'Missing trusted research runtime file: ' + name):
+                            module.stage_runtime(self.source, self.target)
+                finally:
+                    file.write_bytes(content)
+                    shutil.rmtree(self.target)
+
+    def test_full_package_rejects_linked_research_runtime_directory(self):
+        self.prepare_five_modules()
+        self.prepare_research_tool()
+        directory = self.source / 'tools/entropy-lighter-lab'
+        outside = self.source.parent / 'outside-lab'
+        directory.rename(outside)
+        self.link(directory, outside)
+        with self.assertRaisesRegex(ValueError, 'Missing trusted research runtime directory: tools/entropy-lighter-lab'):
+            module.stage_runtime(self.source, self.target)
 
     def test_embedded_stage_omits_hub_outputs_and_dependency_materialization(self):
         from unittest.mock import patch
@@ -223,8 +267,10 @@ class RuntimeDependencyTests(unittest.TestCase):
             changed, same = commit(relative, relative)
             self.assertNotEqual(changed, application, relative); self.assertEqual(same, runtime, relative)
             application = changed
-        for relative in ('server/app.mjs', 'server/api-helpers.mjs', 'server/runtime/main.mjs', 'modules/greeks/main.py', 'package.json', 'tsconfig.json'):
+        for relative in ('server/app.mjs', 'server/api-helpers.mjs', 'server/runtime/main.mjs', 'modules/greeks/main.py', 'package.json', 'tsconfig.json',
+                         *(f'tools/entropy-lighter-lab/{name}' for name in module.LAB_RUNTIME_FILES)):
             changed, other = commit(relative, relative + ' changed')
+            self.assertNotEqual(changed, application, relative)
             self.assertNotEqual(other, runtime, relative)
             application, runtime = changed, other
         self.assertNotEqual(module.runtime_component_key(git, 'arm64'), runtime)

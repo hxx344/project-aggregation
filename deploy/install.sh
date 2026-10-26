@@ -1568,10 +1568,10 @@ input_keys() {
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
     modules/asset/scripts/prepare-ledger.mjs modules/asset/lib/example-ledger.json) || return
   typecheck_tree=$(tree_hash src "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
-  test_tree=$(tree_hash modules scripts src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
+  test_tree=$(tree_hash modules scripts src public server tools/entropy-lighter-lab tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash src public "${navigation_inputs[@]}" tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local deploy/build-artifact-cache.py) || return
-  runtime_tree=$(tree_hash server package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
-  runtime_listing=$(git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- server package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
+  runtime_tree=$(tree_hash server tools/entropy-lighter-lab package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
+  runtime_listing=$(git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- server tools/entropy-lighter-lab package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
   runtime_component_tree=$(printf '%s\n' "$runtime_listing" | awk -F '\t' '$2 !~ /^server\/api\//' | hash)
   embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py deploy/diagnose-aster-margin.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
@@ -1975,7 +1975,7 @@ prepare_application() {
   mkdir "$work_dir/publish"
   ci_update_progress extract
   # Re-extract runtime source as root; tests/builds cannot modify published code.
-  git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$work_dir/publish"
+  git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,config.example.json} | tar -x -C "$work_dir/publish"
   build_artifact_cache restore "$built" "$build_key" "$work_dir/publish/dist"
   if (( has_modules )); then
     cp -a --reflink=auto "$embedded/modules" "$embedded/deploy" "$work_dir/publish/"

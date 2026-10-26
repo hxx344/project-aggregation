@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -89,4 +89,22 @@ test('unclean paper session suspends paper on restart even before first five-sec
     assert.equal(third.code, 0, third.stderr);
     assert.equal(JSON.parse(readFileSync(join(dir, 'unresolved-paper.json'), 'utf8')).session, status.session);
   } finally { rmSync(dir, { recursive: true }); }
+});
+
+test('a managed collector exits when its parent IPC disconnects and preserves the final snapshot', async () => {
+  const dir = fixture(); let worker;
+  try {
+    worker = spawn(process.execPath, [entry, 'run', '--data', dir], { windowsHide: true, env: { ...process.env, ENTROPY_LAB_MANAGED: '1' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    worker.stdout.resume(); worker.stderr.resume();
+    const exited = new Promise((resolve) => worker.once('exit', (code) => resolve(code)));
+    await waitStatus(dir, worker.pid); worker.disconnect();
+    const deadline = delay(3000).then(() => { throw new Error('Orphan collector did not exit'); });
+    assert.equal(await Promise.race([exited, deadline]), 0);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8')).stopped, true);
+    assert.equal(existsSync(join(dir, 'run.lock')), false);
+  } finally {
+    if (worker?.exitCode === null) worker.kill('SIGKILL');
+    worker?.stdout.destroy(); worker?.stderr.destroy();
+    rmSync(dir, { recursive: true });
+  }
 });

@@ -57,7 +57,23 @@ echo test >> "$source_dir/tests/app.test.mjs"; refresh; compare 0 0 1 0 0
 capture
 echo backend >> "$source_dir/server/index.mjs"; refresh; compare 0 0 1 0 1
 capture
+# Research collection is a runtime input, independent of UI/module builds and dependencies.
+mkdir -p "$source_dir/tools/entropy-lighter-lab"
+for file in cli.mjs core.mjs feeds.mjs config.example.json; do
+  embedded_before=$embedded_key
+  runtime_component_before=$runtime_component_key
+  echo research > "$source_dir/tools/entropy-lighter-lab/$file"; refresh; compare 0 0 1 0 1
+  compare_module_inputs 0 0 0 0
+  [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
+  capture
+done
+runtime_component_before=$runtime_component_key
 echo frontend >> "$source_dir/src/app.ts"; refresh; compare 0 1 1 1 1
+[[ $runtime_component_key == "$runtime_component_before" ]]
+capture
+mkdir -p "$source_dir/server/api"
+echo api > "$source_dir/server/api/server.mjs"; refresh; compare 0 0 1 0 1
+[[ $runtime_component_key == "$runtime_component_before" ]]
 capture
 echo config >> "$source_dir/tsconfig.json"; refresh; compare 0 1 1 1 1
 capture

@@ -190,3 +190,16 @@ test('recorder retention only deletes its own segments, leaving configuration an
     assert.equal(readdirSync(dir).filter((f) => f.startsWith('events-')).length, 1);
   } finally { rmSync(dir, { recursive: true }); }
 });
+
+test('dashboard history is bounded and invalidation creates an explicit gap without zero prices', () => {
+  const { l } = lab(structuredClone(template));
+  for (let i = 0; i < 650; i++) {
+    l.book(book('entropy', i * 2000, 99, 100));
+    l.book(book('lighter', i * 2000, 100, 101));
+  }
+  assert.equal(l.report().recentSpreads.SNDK.length, 600);
+  assert.equal(l.report().latestQuotes.length, 2);
+  l.invalidate('lighter', 'SNDK', 'nonce_gap');
+  assert.equal(l.report().recentSpreads.SNDK.at(-1).midBasisBps, null);
+  assert.equal(l.report().latestQuotes.some((q) => q.venue === 'lighter'), false);
+});
