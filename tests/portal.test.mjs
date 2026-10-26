@@ -6,7 +6,11 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPortal, HUB_HOST, PORTAL_COOKIE } from '../server/portal.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { registerModuleTransport } from '../server/modules/transport.mjs';
+import { openHubDatabase } from '../server/control/schema.mjs';
+import { createControlStore } from '../server/control/store.mjs';
+import { createPortalStore } from '../server/control/portal-store.mjs';
 
 test('portal streams compressed public assets while preserving identity, HEAD and conditional reads', async t => {
   const body = Buffer.from('export const message = "ASTER static build fixture";\n'.repeat(1000));
@@ -148,7 +152,9 @@ async function fixture(t, options = {}) {
       catch (error) { res.writeHead(error.status || 500); res.end(error.message); }
     } else { res.writeHead(200); res.end('hub'); }
   });
-  portal = createPortal({ getProjects: () => projects, getProjectRevision: () => revision, isSessionValid: id => validSession && id === 'hashed-session-id', now: () => time, ...options });
+  const dir = mkdtempSync(join(tmpdir(), 'portal-')); const db = openHubDatabase(join(dir, 'hub.sqlite'));
+  t.after(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
+  portal = createPortal({ store: createPortalStore(createControlStore(db)), getProjects: () => projects, getProjectRevision: () => revision, isSessionValid: id => validSession && id === 'hashed-session-id', now: () => time, ...options });
   server.on('upgrade', async (req, socket, head) => { if (!await portal.handleUpgrade(req, socket, head)) socket.destroy(); });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
@@ -164,6 +170,21 @@ async function fixture(t, options = {}) {
   t.after(async () => { portal.close(); for (const socket of upgradedSockets) socket.destroy(); server.closeAllConnections(); upstream.closeAllConnections(); await Promise.all([new Promise(resolve => server.close(resolve)), new Promise(resolve => upstream.close(resolve))]); });
   return { portal, projects, request, launch, authorize, host, port, upstream, get calls() { return upstreamCalls; }, get ledgerReads() { return ledgerReads; }, revoke() { validSession = false; }, revise() { revision = 'revision-two'; }, advance(ms) { time += ms; } };
 }
+
+test('API instances on one hub database share tickets, grants and their revocation', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-shared-')); const dbs = [0, 1].map(() => openHubDatabase(join(dir, 'hub.sqlite')));
+  t.after(() => { for (const db of dbs) db.close(); rmSync(dir, { recursive: true, force: true }); });
+  const [a, b] = await Promise.all(dbs.map(db => fixture(t, { store: createPortalStore(createControlStore(db)) })));
+  const navigate = f => ({ headers: { Origin: `http://${f.host(null)}`, 'Sec-Fetch-Site': 'same-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'iframe' } });
+  const launched = new URL((await a.launch()).url); const ticket = launched.pathname + launched.search;
+  const granted = await b.request(ticket, navigate(b));
+  assert.equal(granted.status, 302); const cookie = granted.headers['set-cookie'][0].split(';')[0];
+  assert.equal((await a.request(ticket, navigate(a))).status, 401);
+  assert.equal((await a.request('/private', { cookie })).status, 200);
+  const logout = await a.request('/api/logout', { method: 'POST', cookie, headers: { Origin: `http://${a.host('asset')}` } });
+  assert.equal(logout.status, 200);
+  assert.equal((await b.request('/private', { cookie })).status, 401);
+});
 
 test('portal requires a grant and tickets are single-use, expire, and bind the project', async t => {
   const f = await fixture(t);

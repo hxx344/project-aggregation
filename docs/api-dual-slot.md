@@ -105,8 +105,8 @@ CREATE TABLE IF NOT EXISTS login_pending (id TEXT PRIMARY KEY, account TEXT NOT 
 ```sql
 CREATE TABLE IF NOT EXISTS portal_tickets (digest TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, destination TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS portal_grants (digest TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, revision TEXT NOT NULL, expires INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS portal_tickets_expires ON portal_tickets(expires);
-CREATE INDEX IF NOT EXISTS portal_grants_expires ON portal_grants(expires);
+CREATE INDEX IF NOT EXISTS idx_portal_tickets_expires ON portal_tickets(expires);
+CREATE INDEX IF NOT EXISTS idx_portal_grants_expires ON portal_grants(expires);
 ```
 
 - 只保存 token 的 SHA-256 摘要，浏览器仍持有原始随机值；表中没有可直接使用的凭证。
@@ -114,7 +114,7 @@ CREATE INDEX IF NOT EXISTS portal_grants_expires ON portal_grants(expires);
 - grant 的有效性仍按现有 `liveGrant`（`server/portal.mjs:101-105`）判断：未过期、会话有效、项目存在且 revision 一致。会话和项目本来就在库里，登出、项目变更、凭据更换由此在两个槽同时生效。
 - 自动登录失败的撤销（`server/portal.mjs:193-197`）改为删除 grant 行。
 - 300 个的上限改为按表计数，判断与插入在同一事务内。
-- 每秒的清理在各槽分别运行：活动流按库中状态复核，过期行每次至多删 500 行。
+- 每秒的清理在各槽分别运行，只读库：活动流与进程内 grant 按库中状态复核。删除过期或失效行每分钟一次（签发 ticket 前也会做一次），每表每次至多删 500 行；库忙时推迟到下一轮，不影响正确性，因为每次使用都会自行检查过期与有效性。
 - 活动流集合 `active`、自动登录在途集合和资产同步合并 `syncFlights` 仍是进程内状态，它们只描述本进程持有的连接。
 
 ### 4.4 带上游认证材料的 grant
