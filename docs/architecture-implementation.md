@@ -454,6 +454,7 @@ Windows 原生环境覆盖可运行的单元与集成检查。Linux 的 systemd�
 
 ## 18 关联资料
 
+- [控制面与数据面分离](control-data-plane-separation.md)与 [API 双槽](api-dual-slot.md)：M3 与 M4 的实现方案和批次。
 - [接入协议](integration.md)：当前摘要、Portal、后台同步与新鲜度语义。
 - [备份与恢复](backup-recovery.md)：M2 当前冷备份、隔离恢复、一次性交接与验收边界。
 - [现有运行入口](../server/index.mjs)、[应用编排](../server/app.mjs)与[模块监督](../server/modules/runtime.mjs)：进程生命周期基线。
