@@ -2805,16 +2805,19 @@ restore_dual_units() {
 # Removes the dual-slot units and their state before a single-unit start
 # (design doc 3.9); left in place, the entry would hold the port.
 dual_teardown() {
-  local slot file
+  local slot file unit
   [[ -e "$ENTRY_UNIT_FILE" || -e "$SLOT_UNIT_FILE" || -e "$APP_DIR/.api-slot" || -e "$APP_DIR/slots" ]] || return 0
-  systemctl stop "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)" >/dev/null 2>&1
-  for slot in a b; do systemctl disable "$(slot_unit "$slot")" >/dev/null 2>&1; done
+  # Units already gone are not loaded, and disable removes an emptied .wants itself.
+  for unit in "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)"; do
+    if systemctl is-active --quiet "$unit"; then systemctl stop "$unit"; fi
+  done
+  for slot in a b; do systemctl disable "$(slot_unit "$slot")" >/dev/null 2>&1 || true; done
   for file in "$ENTRY_UNIT_FILE" "$SLOT_UNIT_FILE"; do
     if [[ -f "$file" ]] && grep -q '^# Managed by project-aggregation installer$' "$file"; then rm -f -- "$file"; fi
   done
-  rmdir -- "$ENTRY_UNIT_FILE.wants" 2>/dev/null
+  rmdir -- "$ENTRY_UNIT_FILE.wants" 2>/dev/null || true
   rm -f -- "$APP_DIR/.api-slot" "$APP_DIR/.api-cutover" "$APP_DIR/slots/a" "$APP_DIR/slots/b"
-  rmdir -- "$APP_DIR/slots" 2>/dev/null
+  rmdir -- "$APP_DIR/slots" 2>/dev/null || true
   if [[ -f "$API_UNIT_FILE" ]]; then mirror_recovery_guard "$API_UNIT_FILE.d"; fi
   return 0
 }
