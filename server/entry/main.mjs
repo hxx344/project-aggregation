@@ -78,7 +78,7 @@ export async function startEntry({ host, port, dir, record, slotRoot, logger = d
   const reset = socket => { if (!socket.destroyed) socket.resetAndDestroy(); };
 
   function pipe(client, upstream, slot) {
-    const pair = { client, upstream }, set = forwarded[slot];
+    const pair = { client, upstream, watch: null }, set = forwarded[slot];
     set.add(pair);
     upstream.once('close', () => set.delete(pair));
     upstream.on('error', () => {});
@@ -88,20 +88,27 @@ export async function startEntry({ host, port, dir, record, slotRoot, logger = d
     // Closes that are not an orderly FIN pass on as a reset, either way.
     client.once('close', () => { if (!client.readableEnded) upstream.destroy(); });
     upstream.once('close', () => { if (!upstream.readableEnded) reset(client); });
-    // The pipe pauses the slot's side while the client takes nothing.
-    let stalled = null;
-    upstream.on('pause', () => { clearTimeout(stalled); stalled = setTimeout(() => { reset(client); upstream.destroy(); }, stallMs); });
-    upstream.on('resume', () => clearTimeout(stalled));
-    upstream.once('close', () => clearTimeout(stalled));
+    // While its slot is the target, the slot decides the connection's life, as
+    // the API did facing the client itself: a slow or idle reader only pauses
+    // the slot's side. A paused side cannot see its slot go away, though, so
+    // once the slot is no longer the target, a paused client that completes no
+    // write for stallMs is reset; the socket timeout restarts with each write.
+    let paused = false, ended = false;
+    pair.watch = () => { if (!ended) client.setTimeout(paused && slot !== target ? stallMs : 0); };
+    client.on('timeout', () => { reset(client); upstream.destroy(); });
+    upstream.on('pause', () => { paused = true; pair.watch(); });
+    upstream.on('resume', () => { paused = false; pair.watch(); });
     upstream.write(header);
     client.pipe(upstream); upstream.pipe(client);
     // The client's FIN leaves the slot free to answer (half-close). The slot's
     // FIN ends the connection, as it would from the API itself: the slot's
-    // side closes at once, the client's once its last bytes are written, or
-    // when it stops taking them.
+    // side closes at once, the client's once its last bytes are written. The
+    // entry alone holds these, so a client that takes none of them for
+    // stallMs (no write completes) is reset.
     upstream.once('end', () => {
+      ended = true;
       client.unpipe(upstream); upstream.end();
-      client.setTimeout(stallMs, () => reset(client));
+      client.setTimeout(stallMs);
       client.destroySoon();
     });
   }
@@ -163,6 +170,7 @@ export async function startEntry({ host, port, dir, record, slotRoot, logger = d
       throw new HttpError(409, '目标槽的身份与记录或预期实例不一致');
     if (target !== slot) {
       const from = target; target = slot; generation += 1;
+      if (from) for (const pair of forwarded[from]) pair.watch();
       logger.info({ from, to: slot, instanceId, generation, type: 'entry' }, '入口已切换目标槽');
     }
     return { target, generation };

@@ -262,15 +262,20 @@ test('switches run one at a time, and one that goes away while queued holds up n
   assert.equal(entry.status().generation, 1);
 });
 
-test('a client that takes nothing from its slot is reset after the stall limit, releasing the slot side', { skip }, async t => {
+test('a client that takes nothing keeps its connection while its slot is the target, and is reset once it drains', { skip }, async t => {
   const f = await fixture(t);
   f.writeRecord('a');
   // The slot answers with far more than the socket buffers hold.
   await f.listen(net.createServer(socket => { socket.on('error', () => {}); socket.write(Buffer.alloc(16 * 1024 * 1024)); }), slotSockets(slotDirectory(f.root, 'a')).http);
+  const identity = await f.control('b');
   const entry = await f.start({ stallMs: 300 });
   const client = connect(entry.ready.port); await client.ready;
   client.socket.pause();
   await until(() => entry.status().connections.a === 1);
+  await wait(900);
+  assert.equal(entry.status().connections.a, 1, 'the entry cut a connection its target slot still held');
+  f.writeRecord('b');
+  assert.equal((await controlRequest(entrySockets(f.dir).ctl, 'POST', '/switch', { body: { slot: 'b', instanceId: identity.instanceId } })).status, 200);
   const began = Date.now();
   await until(() => entry.status().connections.a === 0);
   assert.ok(Date.now() - began < 3000);
