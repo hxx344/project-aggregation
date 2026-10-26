@@ -34,13 +34,12 @@ export function createLoginGuard({ db, stmt }, { loginWindowMs, accountLockoutMs
   // A lock expires at its deadline; unlocked failures expire one lockout period
   // after the first one. A record with a check in flight stays, so that check's
   // failure still counts against it. Lapsed checks become failures at the moment
-  // their lease ended, however late this runs. Returns the account's record and
-  // whether a lapsed check set the lock in force.
+  // their lease ended, however late this runs; the record they count against was
+  // kept for them, so it is not judged stale before they are counted. Returns the
+  // account's record and whether a lapsed check set the lock in force.
   function expire(account, now) {
     let lockedNow = false;
     for (const lapsed of stmt.prepare('DELETE FROM login_pending WHERE expires<=? RETURNING account, expires').all(now).sort((x, y) => x.expires - y.expires)) {
-      const row = guardRow(lapsed.account);
-      if (row && stale(row, lapsed.expires)) stmt.prepare('DELETE FROM login_account_guard WHERE account=?').run(lapsed.account);
       const result = addFailures(lapsed.account, 1, lapsed.expires);
       if (lapsed.account === account && result.lockedNow && result.lockedUntil > now) lockedNow = true;
     }

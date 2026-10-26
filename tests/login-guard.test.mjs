@@ -88,8 +88,20 @@ test('a check found lapsed long after its lease counts at its expiry, so an old 
   for (let i = 1; i < ACCOUNT_LOCKOUT_THRESHOLD; i++) a.failure(a.reserveAccount('global', now), now);
   a.reserveAccount('global', now);
   const later = now + 30_000 + limits.accountLockoutMs;
+  assert.deepEqual(b.admit('global', '10.0.0.1', later - 1), { locked: later, lockedNow: true });
   assert.deepEqual(b.admit('global', '10.0.0.1', later), { ip: '10.0.0.1', until: later + limits.loginWindowMs });
   assert.ok(b.reserveAccount('global', later).id);
+});
+
+test('a lapsed check counts against the record its overlapping checks kept', async t => {
+  const [a, b] = await instances(t);
+  const now = Date.now(), s = 1000;
+  for (let i = 0; i < 3; i++) a.failure(a.reserveAccount('global', now), now);
+  a.reserveAccount('global', now + 50 * s); // its process dies; the lease ends at 80 s
+  const overlapping = b.reserveAccount('global', now + 55 * s);
+  assert.equal(b.failure(overlapping, now + 79 * s).failed, 4);
+  // The first failure is more than a lockout period old at 80 s, yet both checks began within it.
+  assert.deepEqual(b.reserveAccount('global', now + 83 * s), { locked: now + 80 * s + limits.accountLockoutMs, lockedNow: true });
 });
 
 test('refusals visible without the write lock do not wait for it', async t => {
