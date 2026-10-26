@@ -2759,8 +2759,11 @@ mirror_recovery_guard() {
 # A full activation of the dual-slot units (design doc 3.6, 3.9): the group
 # stops, then units, slot links, the record and current change, then it starts.
 activate_dual_full() {
-  local recorded slot=a other
-  systemctl stop "$SERVICE"
+  local recorded slot=a other unit
+  # A fresh install has none of these; one left running would hold the port.
+  for unit in "$SERVICE" "$API_SERVICE" "$ENTRY_SERVICE" "$(slot_unit a)" "$(slot_unit b)"; do
+    if systemctl is-active --quiet "$unit"; then systemctl stop "$unit"; fi
+  done
   migrate_embedded_modules "$release"
   if dual_installed && recorded=$(read_slot_record); then slot=${recorded%% *}; fi
   other=$(other_slot "$slot")
