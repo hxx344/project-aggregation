@@ -1253,6 +1253,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `update-discovery-cdn-lag-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；关联 L013 的检查节奏，不推进全历史复盘检查点。
 
+### L080：自动费率须区分公共费表、账户实付与返佣基数
+
+**适用条件：** 研究、模拟或交易服务自动读取手续费，并据此计算价差收益或渠道返佣。
+
+**根因：** 同一个接口可能同时返回公共费表和特定账户费率。2026-10-27 实测 Hyperliquid 零地址的 `userCrossRate` 为 `0.0004`，而 `feeSchedule.cross` 为 `0.00045`；把前者当默认费率会低估成本。Entropy 官方返佣按自身分成计算，用户另行取得的渠道优惠则可能按全部手续费计算，两者不能互换。直接用最新全局费率重算历史，也会改变已经产生的模拟结论。
+
+**以后做法：** 公共模式只使用官方公共费表及已核验的合约系数，明确标注默认档、无账户折扣和无附加 builder 费用；未知费用不得当作零。为费率记录来源、有效期和语义版本，每次评价及在途任务锁定当时快照；同版本刷新只续来源有效期，版本改变或到期后撤回当前结论并重新收集样本。返佣基数按已确认的渠道条款单独表达，本次 110% / 120% 为用户确认的全部 Entropy 手续费额外返佣，不能推广为官方规则。
+
+**如何验证：** [费率接入测试](tests/entropy-lighter-feeds.test.mjs) 覆盖公共费表与账户字段、费率单位及未知系数；[自动费率测试](tests/entropy-lighter-auto-fees.test.mjs) 覆盖逐标的费率、版本切换、单调时钟到期及历史快照；[生产页面夹具](tests/entropy-lighter.browser.mjs) 覆盖固定两档返佣和下次读取前费率到期时撤回当前结论。
+
+**证据：** project-aggregation 基线 `0de9312` 的研究模块仍要求手填费用。2026-10-27 用户要求自动获取并确认渠道返佣按全部手续费计算；[官方 userFees 接口](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#query-a-users-fees)、[HIP-3 费用系数](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions) 及 [Entropy 官方返佣说明](https://docs.entropy.io/about-entropy/referrals) 与 [接入实现](tools/entropy-lighter-lab/feeds.mjs)、[快照实现](tools/entropy-lighter-lab/core.mjs) 对照核验。
+
+**事件记录：** `entropy-public-fees-and-rebate-basis-20261027`；实际发生日期 2026-10-27（Asia/Shanghai）；不推进全历史复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

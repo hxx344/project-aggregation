@@ -1,8 +1,17 @@
 // Independent, public-data research. This module never creates or sends orders.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export const SYMBOLS = ['SNDK', 'ANTH'];
+export const REBATE_RATIOS = Object.freeze([0, 1.1, 1.2]);
+export function automaticConfig(value) {
+  const config = structuredClone(value);
+  config.simulation.entropyTakerFeeBps = null;
+  config.simulation.lighterTakerFeeBps = null;
+  config.simulation.rebateRatios = [...REBATE_RATIOS];
+  return config;
+}
 const finite = (n) => typeof n === 'number' && Number.isFinite(n);
 const positive = (n) => finite(n) && n > 0;
 const bounded = (n, lo, hi) => finite(n) && n >= lo && n <= hi;
@@ -22,7 +31,6 @@ export function validateConfig(c) {
   if (!Array.isArray(s.verifiedSymbols) || new Set(s.verifiedSymbols).size !== s.verifiedSymbols.length || s.verifiedSymbols.some((v) => !SYMBOLS.includes(v))) fail('verifiedSymbols');
   for (const key of ['entropyTakerFeeBps', 'lighterTakerFeeBps']) {
     if (s[key] !== null && !bounded(s[key], 0, 100)) fail(key);
-    if (s.enabled && s[key] === null) fail(`${key}: required for paper mode`);
   }
   if (s.enabled && !s.verifiedSymbols.length) fail('verifiedSymbols: required for paper mode');
   for (const [key, lo, hi] of [
@@ -137,7 +145,7 @@ const summaries = () => ({ completed: 0, lossesBeforeRebate: 0, settledGrossPnl:
 
 // An entry cash-space estimate, not a realized roundtrip PnL. Both opening
 // sweeps already include slippage; only the two exit slippages are reserved here.
-export function studyEvaluation({ buy, sell, config, at, sourceTimeUncertain = false }) {
+export function studyEvaluation({ buy, sell, config, at, sourceTimeUncertain = false, feeSnapshot = null }) {
   const s = config.simulation;
   const entropyCash = buy.venue === 'entropy' ? buy.cash : sell.cash;
   const lighterCash = buy.venue === 'lighter' ? buy.cash : sell.cash;
@@ -155,11 +163,11 @@ export function studyEvaluation({ buy, sell, config, at, sourceTimeUncertain = f
     costs: { feesRoundTripCash: fees, exitSlippageReserveCash: exitSlippage, fundingReserveCash: funding, totalReserveCash: total },
     surplusBeforeRebateCash: surplus, surplusBeforeRebateBps: surplusBps, entropyRoundTripFeesCash: entropyFees,
     rebates: s.rebateRatios.map((ratio) => ({ ratio, contingentRebateCash: entropyFees === null ? null : entropyFees * ratio, surplusCash: surplus === null || entropyFees === null ? null : surplus + entropyFees * ratio })),
-    gatePassed: surplusBps !== null && surplusBps >= s.minEntryEdgeBps, sourceTimeUncertain };
+    gatePassed: surplusBps !== null && surplusBps >= s.minEntryEdgeBps, sourceTimeUncertain, ...(feeSnapshot ? { feeSnapshot: structuredClone(feeSnapshot) } : {}) };
 }
 
 export class Lab {
-  constructor(config, emit = () => {}) {
+  constructor(config, emit = () => {}, { automaticFees = false } = {}) {
     this.config = validateConfig(config);
     this.emit = emit;
     this.books = new Map();
@@ -178,8 +186,53 @@ export class Lab {
     this.studyIntervalMs = Math.max(2000, Math.min(10000, config.simulation.cooldownMs));
     this.counts = { books: 0, candidates: 0, invalidated: 0, rejected: {} };
     this.results = new Map(config.simulation.latencyScenarios.map((s) => [s.name, summaries()]));
+    this.useAutomaticFees = automaticFees;
+    this.feeClocks = new Map();
+    this.feeEpochs = new Map();
   }
-  setMarkets(markets) { this.markets = new Map(markets.map((m) => [pairKey(m.venue, m.symbol), m])); }
+  setMarkets(markets, now = performance.now(), wall = Date.now()) {
+    this.markets = new Map(markets.map((m) => [pairKey(m.venue, m.symbol), m]));
+    this.feeClocks = new Map(markets.filter((m) => m.fee).map((m) => [pairKey(m.venue, m.symbol), {
+      expiresMono: now + (m.fee.expiresAt - wall), fetchedAt: m.fee.fetchedAt,
+    }]));
+    this.syncFeeEpochs(now, wall);
+  }
+  feeSnapshot(symbol, now = performance.now(), wall = Date.now()) {
+    const facts = ['entropy', 'lighter'].map((venue) => {
+      const key = pairKey(venue, symbol), fee = this.markets.get(key)?.fee, clock = this.feeClocks.get(key);
+      const expired = fee?.status === 'available' && (!clock || now >= clock.expiresMono || wall >= fee.expiresAt);
+      const valid = fee?.status === 'available' && !expired && bounded(fee.takerFeeBps, 0, 10000)
+        && finite(fee.fetchedAt) && wall >= fee.fetchedAt - 100 && finite(fee.expiresAt) && fee.expiresAt > fee.fetchedAt && typeof fee.revision === 'string';
+      return { fee: fee ? structuredClone(fee) : null, status: valid ? 'available' : expired ? 'expired' : 'unavailable', rate: valid ? fee.takerFeeBps : null };
+    });
+    const available = facts.every((f) => f.status === 'available');
+    const revision = available ? createHash('sha256').update(JSON.stringify(facts.map((f) => f.fee.revision))).digest('hex') : null;
+    const times = facts.map((f) => f.fee?.fetchedAt).filter(finite), expiries = facts.map((f) => f.fee?.expiresAt).filter(finite);
+    return { mode: 'auto', symbol, status: available ? 'available' : facts.some((f) => f.status === 'expired') ? 'expired' : 'unavailable', revision,
+      entropy: facts[0].fee, lighter: facts[1].fee, takerBps: { entropy: facts[0].rate, lighter: facts[1].rate },
+      fetchedAt: times.length ? Math.min(...times) : null, expiresAt: expiries.length ? Math.min(...expiries) : null,
+      rebateBasis: 'total_entropy_fees', rebateRatios: [1.1, 1.2] };
+  }
+  costContext(symbol, now, wall) {
+    const config = structuredClone(this.config);
+    if (!this.useAutomaticFees) return { config, feeSnapshot: null };
+    const feeSnapshot = this.feeSnapshot(symbol, now, wall);
+    config.simulation.entropyTakerFeeBps = feeSnapshot.takerBps.entropy;
+    config.simulation.lighterTakerFeeBps = feeSnapshot.takerBps.lighter;
+    config.simulation.rebateRatios = [...REBATE_RATIOS];
+    return { config, feeSnapshot };
+  }
+  syncFeeEpochs(now, wall) {
+    if (!this.useAutomaticFees) return;
+    for (const symbol of SYMBOLS) {
+      const snapshot = this.feeSnapshot(symbol, now, wall), version = snapshot.revision || snapshot.status;
+      if (this.feeEpochs.get(symbol) === version) continue;
+      for (const probe of [...this.studyProbes.values()]) if (probe.symbol === symbol) this.endStudy(probe, null, 'fee_revision_changed', now);
+      for (const [key, metric] of this.studyStats) if (metric.symbol === symbol) this.studyStats.delete(key);
+      this.lastStudy.delete(symbol); this.feeEpochs.set(symbol, version);
+      this.emit({ type: 'fee_epoch', symbol, at: wall, feeSnapshot: snapshot });
+    }
+  }
   reject(reason) { this.counts.rejected[reason] = (this.counts.rejected[reason] || 0) + 1; }
   invalidate(venue, symbol, reason) {
     if (venue !== 'binance') for (const probe of [...this.studyProbes.values()]) {
@@ -221,6 +274,7 @@ export class Lab {
     return b && !validateBook(requireSourceTime ? b : { ...b, sourceAt: null }, now, wall, this.config) ? b : null;
   }
   samplePair(symbol, now, wall) {
+    this.syncFeeEpochs(now, wall);
     const a = this.fresh('entropy', symbol, now, wall, false), b = this.fresh('lighter', symbol, now, wall, false);
     if (!a || !b) { this.reject('missing_or_stale_pair'); return; }
     if (a.quote !== b.quote || Math.abs(a.receivedMono - b.receivedMono) > this.config.maxPairSkewMs) { this.reject('quote_or_time_mismatch'); return; }
@@ -240,8 +294,9 @@ export class Lab {
     }
     this.emit({ type: 'spread', symbol, at: wall, mono: now, entropyMid: mid(a), lighterMid: mid(b), midBasisBps: spread, takerEdgeBps: d.edgeBps, buy: d.buy.venue, sell: d.sell.venue, sourceTimeErrors, observation: 'receive_time_only_not_source_freshness_proof', settlementEquivalence: 'requires_verification' });
     this.sampleStudy(symbol, a, b, now, wall);
-    const s = this.config.simulation;
+    const context = this.costContext(symbol, now, wall), s = context.config.simulation;
     if (!s.enabled || !s.verifiedSymbols.includes(symbol)) { this.reject('paper_disabled_or_contract_unverified'); return; }
+    if (!finite(s.entropyTakerFeeBps) || !finite(s.lighterTakerFeeBps)) { this.reject('automatic_fees_unavailable'); return; }
     if (sourceTimeErrors.some((e) => e.error)) { this.reject('paper_source_time_unverified'); return; }
     const ma = this.markets.get(pairKey('entropy', symbol)), mb = this.markets.get(pairKey('lighter', symbol));
     if (!ma || !mb || ma.status !== 'active' || mb.status !== 'active' || [ma, mb].some((m) => !Number.isInteger(m.sizeDecimals) || !bounded(m.sizeDecimals, 0, 10) || Number(m.multiplier) !== 1 || !bounded(Number(m.minBaseAmount), 0, 1e10) || !positive(Number(m.minQuoteAmount)))) { this.reject('metadata_unavailable'); return; }
@@ -258,15 +313,16 @@ export class Lab {
       const key = `${scenario.name}:${symbol}`;
       if (this.tasks.has(key) || now < (this.next.get(key) || 0)) continue;
       const legs = [d.buy, d.sell].map((book, i) => ({ venue: book.venue, side: i === 0 ? 'buy' : 'sell', due: now + scenario[`${book.venue}Ms`], state: 'pending', entry: null, exit: null }));
-      const task = { key, symbol, scenario, quantity, signalAt: wall, signalMono: now, edgeBps: executableEdge, phase: 'entry', legs, failed: false };
+      const task = { key, symbol, scenario, quantity, signalAt: wall, signalMono: now, edgeBps: executableEdge, phase: 'entry', legs, failed: false,
+        costConfig: context.config, feeSnapshot: context.feeSnapshot };
       this.tasks.set(key, task); this.counts.candidates++;
       this.emit({ type: 'paper_signal', ...task, assumption: 'independent_latency_scenarios_not_additive' });
     }
   }
   advance(now, wall, incoming = null) {
     this.advanceStudies(now, wall, incoming);
-    const s = this.config.simulation;
     for (const t of this.tasks.values()) {
+      const s = t.costConfig.simulation;
       for (const leg of t.legs) {
         if (leg.state !== 'pending' && leg.state !== 'closing') continue;
         const closing = leg.state === 'closing';
@@ -286,7 +342,8 @@ export class Lab {
           continue;
         }
         const feeBps = leg.venue === 'entropy' ? s.entropyTakerFeeBps : s.lighterTakerFeeBps;
-        const record = { ...fill, fee: fill.cash * feeBps / 10000, receivedAt: wall, receivedMono: now, sourceAt: incoming.sourceAt, sequence: incoming.sequence };
+        const record = { ...fill, fee: fill.cash * feeBps / 10000, receivedAt: wall, receivedMono: now, sourceAt: incoming.sourceAt, sequence: incoming.sequence,
+          ...(t.feeSnapshot ? { feeSnapshot: t.feeSnapshot } : {}) };
         leg[closing ? 'exit' : 'entry'] = record;
         leg.state = closing ? 'closed' : 'open';
         this.emit({ type: 'paper_fill', key: t.key, symbol: t.symbol, venue: leg.venue, phase: closing ? 'exit' : 'entry', ...record });
@@ -304,6 +361,7 @@ export class Lab {
   studyMetric(symbol, buy, sell, scenario) {
     const id = `${symbol}:${scenario ? `latency:${scenario.name}` : 'raw'}:${buy}:${sell}`;
     if (!this.studyStats.has(id)) this.studyStats.set(id, { symbol, buy, sell, scenario: scenario ? { ...scenario } : null,
+      feeRevision: this.useAutomaticFees ? this.feeEpochs.get(symbol) || null : null,
       attempts: 0, completed: 0, failed: 0, costed: 0, passedAfterCosts: 0, sumSurplusBps: 0, minSurplusBps: null,
       spanMs: 0, firstAt: null, lastAt: null, latest: null, failureReasons: {}, firstMono: null,
       qualitySpanMs: 0, qualityFirstAt: null, qualityLastAt: null, qualityFirstMono: null, uncertainSourceSamples: 0 });
@@ -329,6 +387,7 @@ export class Lab {
   sampleStudy(symbol, entropy, lighter, now, wall) {
     if (now - (this.lastStudy.get(symbol) ?? -Infinity) < this.studyIntervalMs) return;
     this.lastStudy.set(symbol, now);
+    const context = this.costContext(symbol, now, wall);
     const markets = ['entropy', 'lighter'].map((v) => this.markets.get(pairKey(v, symbol)));
     const validMarket = markets.every((m) => m && m.status === 'active' && Number.isInteger(m.sizeDecimals) && bounded(m.sizeDecimals, 0, 10)
       && Number(m.multiplier) === 1 && positive(Number(m.minQuoteAmount)) && bounded(Number(m.minBaseAmount), 0, 1e10));
@@ -341,7 +400,7 @@ export class Lab {
         : markets.some((m) => quantity < Number(m.minBaseAmount) || Math.min(buy.cash, sell.cash) < Number(m.minQuoteAmount)) ? 'minimum_order_size' : null;
       const metric = this.studyMetric(symbol, buyBook.venue, sellBook.venue, null);
       this.attemptStudy(metric, now, wall);
-      const evaluation = reason ? null : studyEvaluation({ buy: { ...buy, venue: buyBook.venue }, sell: { ...sell, venue: sellBook.venue }, config: this.config, at: wall,
+      const evaluation = reason ? null : studyEvaluation({ buy: { ...buy, venue: buyBook.venue }, sell: { ...sell, venue: sellBook.venue }, config: context.config, feeSnapshot: context.feeSnapshot, at: wall,
         sourceTimeUncertain: [buyBook, sellBook].some((b) => b.sourceAt === null || Boolean(validateBook(b, now, wall, this.config))) });
       this.recordStudy(metric, evaluation, reason, now);
       for (const scenario of this.config.simulation.latencyScenarios) {
@@ -350,7 +409,7 @@ export class Lab {
         const delayed = this.studyMetric(symbol, buyBook.venue, sellBook.venue, scenario);
         this.attemptStudy(delayed, now, wall);
         if (reason) { this.recordStudy(delayed, null, reason, now); continue; }
-        this.studyProbes.set(key, { key, symbol, quantity, metric: delayed, signalAt: wall,
+        this.studyProbes.set(key, { key, symbol, quantity, metric: delayed, signalAt: wall, costConfig: context.config, feeSnapshot: context.feeSnapshot,
           legs: [{ venue: buyBook.venue, side: 'buy', due: now + scenario[`${buyBook.venue}Ms`], fill: null },
             { venue: sellBook.venue, side: 'sell', due: now + scenario[`${sellBook.venue}Ms`], fill: null }] });
       }
@@ -374,7 +433,7 @@ export class Lab {
       const market = this.markets.get(pairKey(incoming.venue, probe.symbol));
       if (!market || fill.cash < Number(market.minQuoteAmount) || probe.quantity < Number(market.minBaseAmount)) { this.endStudy(probe, null, 'minimum_order_size'); continue; }
       leg.fill = { ...fill, venue: incoming.venue, sourceTimeUncertain: incoming.sourceAt === null || Boolean(validateBook(incoming, now, wall, this.config)) };
-      if (probe.legs.every((l) => l.fill)) this.endStudy(probe, studyEvaluation({ buy: probe.legs[0].fill, sell: probe.legs[1].fill, config: this.config, at: wall,
+      if (probe.legs.every((l) => l.fill)) this.endStudy(probe, studyEvaluation({ buy: probe.legs[0].fill, sell: probe.legs[1].fill, config: probe.costConfig, feeSnapshot: probe.feeSnapshot, at: wall,
         sourceTimeUncertain: probe.legs.some((l) => l.fill.sourceTimeUncertain) }), null, now);
     }
   }
@@ -388,9 +447,10 @@ export class Lab {
       if (l.entry) entryNotional += l.entry.cash;
       if (l.exit) gross += l.side === 'buy' ? l.exit.cash - l.entry.cash : l.entry.cash - l.exit.cash;
     }
-    const reserve = entryNotional / 2 * this.config.simulation.fundingReserveBpsPerRoundTrip / 10000;
+    const reserve = entryNotional / 2 * t.costConfig.simulation.fundingReserveBpsPerRoundTrip / 10000;
     const net = unresolved ? null : gross - fees - reserve;
-    const outcome = { type: 'paper_result', key: t.key, symbol: t.symbol, at: wall, scenario: t.scenario.name, failed: t.failed, unresolved, grossPnl: unresolved ? null : gross, fees, entropyFees, costReserve: reserve, netBeforeRebate: net, turnover, durationMs: now - t.signalMono, rebateScenarios: this.config.simulation.rebateRatios.map((ratio) => ({ ratio, contingentRebate: entropyFees * ratio, net: net === null ? null : net + entropyFees * ratio })), legs: t.legs };
+    const outcome = { type: 'paper_result', key: t.key, symbol: t.symbol, at: wall, scenario: t.scenario.name, failed: t.failed, unresolved, grossPnl: unresolved ? null : gross, fees, entropyFees, costReserve: reserve, netBeforeRebate: net, turnover, durationMs: now - t.signalMono, rebateScenarios: t.costConfig.simulation.rebateRatios.map((ratio) => ({ ratio, contingentRebate: entropyFees * ratio, net: net === null ? null : net + entropyFees * ratio })), legs: t.legs,
+      ...(t.feeSnapshot ? { feeSnapshot: t.feeSnapshot } : {}) };
     r.turnover.entropy += turnover.entropy; r.turnover.lighter += turnover.lighter;
     r.fees += fees; r.entropyFees += entropyFees; r.costReserve += reserve;
     if (unresolved) {
@@ -436,7 +496,10 @@ export class Lab {
     }
   }
   report(now = performance.now(), wall = Date.now()) {
+    this.syncFeeEpochs(now, wall);
     return {
+      ...(this.useAutomaticFees ? { automaticFees: { mode: 'auto', rebateBasis: 'total_entropy_fees', rebateRatios: [1.1, 1.2],
+        bySymbol: Object.fromEntries(SYMBOLS.map((symbol) => [symbol, this.feeSnapshot(symbol, now, wall)])) } } : {}),
       observedAt: wall,
       observation: { asOf: wall, silenceAfterMs: 10000 },
       counts: this.counts,

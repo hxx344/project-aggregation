@@ -22,13 +22,12 @@ function lab(c = config()) {
 }
 function signal(l) { l.book(book('entropy', 0, 99, 100)); l.book(book('lighter', 0, 110, 111)); }
 
-test('default collects with unknown fee and no verified contracts; paper fails closed', () => {
+test('paper can await automatic fees but still requires contract verification and valid latency', () => {
   validateConfig(template);
   const c = structuredClone(template); c.simulation.enabled = true;
-  assert.throws(() => validateConfig(c), /entropyTakerFeeBps/);
-  c.simulation.entropyTakerFeeBps = 5;
   assert.throws(() => validateConfig(c), /verifiedSymbols/);
-  c.simulation.verifiedSymbols = ['SNDK']; c.simulation.latencyScenarios[0].lighterMs = 299;
+  c.simulation.verifiedSymbols = ['SNDK']; validateConfig(c);
+  c.simulation.latencyScenarios[0].lighterMs = 299;
   assert.throws(() => validateConfig(c), /300ms/);
 });
 

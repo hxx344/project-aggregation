@@ -55,6 +55,9 @@ test('offline run emits actual service heartbeat, bounded shutdown and readable 
     const report = await child([entry, 'report', '--data', dir]).done;
     assert.equal(JSON.parse(report.stdout).stopped, true);
     assert.equal(JSON.parse(report.stdout).counts.books, 0);
+    assert.equal(JSON.parse(report.stdout).automaticFees.mode, 'auto');
+    assert.deepEqual(JSON.parse(report.stdout).automaticFees.rebateRatios, [1.1, 1.2]);
+    assert.equal(JSON.parse(report.stdout).sessionConfig.simulation.entropyTakerFeeBps, null);
   } finally { rmSync(dir, { recursive: true }); }
 });
 

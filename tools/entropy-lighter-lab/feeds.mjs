@@ -1,4 +1,5 @@
-// Public market data only. No account, signing, order or credential endpoints.
+// Public data only. No real account, signing, order or credential requests.
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export const SOURCES = Object.freeze({
@@ -8,10 +9,14 @@ export const SOURCES = Object.freeze({
   hyperliquidWs: 'https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions',
   hyperliquidMinimum: 'https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses',
   hyperliquidLotSize: 'https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size',
+  hyperliquidFees: 'https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees',
+  hyperliquidFeeSchedule: 'https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#query-a-users-fees',
+  hyperliquidDeployerFees: 'https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions',
   lighterMarketData: 'https://apidocs.lighter.xyz/docs/market-data',
   lighterWs: 'https://apidocs.lighter.xyz/docs/websocket-reference',
   lighterTimestamps: 'https://apidocs.lighter.xyz/docs/timestamps',
   lighterAccounts: 'https://apidocs.lighter.xyz/docs/account-types',
+  lighterFeeTiers: 'https://apidocs.lighter.xyz/reference/feetiers',
   lighterPreIpo: 'https://docs.lighter.xyz/trading/real-world-assets-rwas/pre-ipo-markets',
   binanceSndk: 'https://www.binance.com/en/support/announcement/detail/80549fadb3e447d1a859b8cedd0ccd69',
   binanceAnth: 'https://www.binance.com/en/support/announcement/detail/2b9ff1e1acf8433793bc40c59a0cb852',
@@ -28,6 +33,9 @@ const ENDPOINTS = Object.freeze({
   lighter: 'https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails',
   binance: 'https://fapi.binance.com/fapi/v1/exchangeInfo',
 });
+const LIGHTER_FEE_ENDPOINT = 'https://mainnet.zklighter.elliot.ai/api/v1/feeTiers?filter=perps';
+const FEE_SCOPE = 'public_default_tier_no_builder';
+const FEE_TTL_MS = 20 * 60_000;
 const sharedCooldowns = {};
 const sequence = value => typeof value === 'string' && /^\d+$/.test(value)
   ? value : Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
@@ -52,7 +60,7 @@ export function retryNotBefore({ status, headers, body, now = Date.now() }) {
   return Math.max(now, Number.isFinite(headerAt) ? headerAt : 0, banAt, defaultAt);
 }
 
-async function readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns }) {
+async function readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns }, purpose = 'metadata') {
   const until = cooldownAt(cooldowns, venue);
   if (until > Date.now()) {
     const error = new Error('venue_cooldown');
@@ -62,13 +70,22 @@ async function readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns }) {
   // At most three read attempts, 8s each; only transport/5xx failures retry.
   for (let attempt = 0; attempt < 3; attempt++) {
     signal?.throwIfAborted();
+    const retryUntil = cooldownAt(cooldowns, venue);
+    if (retryUntil > Date.now()) {
+      const error = new Error('venue_cooldown');
+      error.retryNotBefore = retryUntil;
+      throw error;
+    }
     const started = performance.now();
     try {
-      const response = await fetchImpl(ENDPOINTS[venue], {
+      const response = await fetchImpl(venue === 'lighter' && purpose === 'fees' ? LIGHTER_FEE_ENDPOINT : ENDPOINTS[venue], {
         method: venue === 'entropy' ? 'POST' : 'GET',
         ...(venue === 'entropy' ? {
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'metaAndAssetCtxs', dex: 'io' }),
+          // The immutable zero address is used only to retrieve the global schedule.
+          body: JSON.stringify(purpose === 'fees'
+            ? { type: 'userFees', user: '0x0000000000000000000000000000000000000000' }
+            : { type: 'metaAndAssetCtxs', dex: 'io' }),
         } : {}),
         signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(8_000)]),
       });
@@ -83,7 +100,7 @@ async function readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns }) {
       text += decoder.decode();
       diagnostic(onDiagnostic, { level: 'info', event: 'http_rtt', venue,
         message: 'Public metadata request RTT; not order acknowledgement or fill latency.',
-        details: { rttMs: performance.now() - started, status: response.status, measurement: 'public_http_body', notOrderLatency: true } });
+        details: { rttMs: performance.now() - started, status: response.status, purpose, measurement: 'public_http_body', notOrderLatency: true } });
       let body;
       try { body = JSON.parse(text); }
       catch { if (response.ok) throw new Error('metadata_invalid_json'); body = null; }
@@ -102,8 +119,11 @@ async function readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns }) {
         error.status = response.status;
         throw error;
       }
-      if (venue === 'lighter' && body?.code !== 200) throw new Error('metadata_api_error');
-      return body;
+      if (venue === 'lighter' && (purpose === 'metadata' ? body?.code !== 200 : body?.code !== undefined && body.code !== 200)) {
+        throw new Error('metadata_api_error');
+      }
+      // Discard all zero-address account rates, volumes, referral and staking state.
+      return venue === 'entropy' && purpose === 'fees' ? { feeSchedule: { cross: body?.feeSchedule?.cross } } : body;
     } catch (error) {
       if (error instanceof CallbackFailure || signal?.aborted || error.retryNotBefore || error.status && error.status < 500
         || !['TypeError', 'TimeoutError'].includes(error.name) && !(error.status >= 500)) throw error;
@@ -115,11 +135,79 @@ async function readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns }) {
   }
 }
 
+const feeNumber = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
+  ? value : typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) && Number.isFinite(Number(value)) ? Number(value) : null;
+
+/** Public default fee facts only; never an estimate of a connected user's fee tier. */
+export function deriveAutoFees({ venue, markets, feeBody, feeError = null, fetchedAt = Date.now(), ttlMs = FEE_TTL_MS }) {
+  if (!Number.isSafeInteger(fetchedAt) || fetchedAt <= 0 || !Number.isSafeInteger(ttlMs) || ttlMs <= 0
+    || !Number.isSafeInteger(fetchedAt + ttlMs)) throw new Error('invalid_fee_lifetime');
+  const sourceUrls = venue === 'entropy'
+    ? [ENDPOINTS.entropy, SOURCES.hyperliquidFeeSchedule, SOURCES.hyperliquidFees, SOURCES.hyperliquidDeployerFees]
+    : venue === 'lighter' ? [LIGHTER_FEE_ENDPOINT, ENDPOINTS.lighter, SOURCES.lighterFeeTiers, SOURCES.lighterAccounts] : [];
+  return new Map(markets.map(market => {
+    const fee = {
+      status: 'unavailable', takerFeeBps: null, baseTakerBps: null, growthMultiplier: null, deployerFeeScale: null,
+      scope: FEE_SCOPE, accountTier: venue === 'lighter' ? 'standard' : 'default',
+      sourceUrls, fetchedAt, expiresAt: fetchedAt + ttlMs, revision: null, reason: null,
+      assumptions: ['public_default_tier_not_actual_account_rate', 'no_builder_fee_added', 'no_account_referral_or_staking_discount'],
+    };
+    if (!['entropy', 'lighter'].includes(venue)) fee.reason = 'research_source_only';
+    else if (feeError) fee.reason = 'fee_request_unavailable';
+    else if (!feeBody) fee.reason = 'fee_schedule_missing';
+    else if (venue === 'entropy') {
+      const baseRate = feeNumber(feeBody.feeSchedule?.cross);
+      const scale = feeNumber(market.raw?.deployerFeeScale);
+      const growthMode = market.raw?.growthMode;
+      if (baseRate === null || baseRate <= 0 || baseRate >= 1) fee.reason = 'invalid_base_fee_schedule';
+      else if (market.collateralToken !== 0) fee.reason = 'unsupported_collateral_token';
+      else if (!['enabled', 'disabled'].includes(growthMode)) fee.reason = 'unknown_growth_mode';
+      else if (scale === null || (growthMode === 'enabled' ? scale >= 10 : scale > 3)) fee.reason = 'invalid_deployer_fee_scale';
+      else {
+        fee.baseTakerBps = baseRate * 10_000;
+        fee.deployerFeeScale = scale;
+        fee.growthMultiplier = growthMode === 'enabled' ? 0.1 : 1;
+        // Official fee formula: scale < 1 => 1 + scale; otherwise 2 * scale.
+        fee.takerFeeBps = fee.baseTakerBps * (scale < 1 ? 1 + scale : 2 * scale) * fee.growthMultiplier;
+        fee.assumptions.push('native_usdc_collateral_no_aligned_quote_discount');
+      }
+    } else {
+      const standard = Array.isArray(feeBody.user_tiers) ? feeBody.user_tiers.filter(row => row?.name === 'standard') : [];
+      const ticks = standard.length === 1 ? standard[0].taker_fee_ticks : null;
+      if (!Number.isSafeInteger(ticks) || ticks < 0) fee.reason = 'invalid_standard_fee_tier';
+      // Nonzero market fees need a separate verified unit and composition contract.
+      else if (feeNumber(market.raw?.taker_fee) !== 0 || market.raw?.is_taker_fee_enabled !== true) {
+        fee.reason = 'unsupported_market_fee';
+      } else {
+        fee.baseTakerBps = ticks / 100; // 1 fee tick = 0.0001% = 0.01 bps.
+        fee.takerFeeBps = fee.baseTakerBps;
+        fee.growthMultiplier = 1;
+        fee.assumptions.push('standard_account_regular_taker_order', 'market_specific_taker_fee_is_zero');
+      }
+    }
+    if (fee.reason === null) {
+      fee.status = 'available';
+      fee.revision = createHash('sha256').update(JSON.stringify({
+        venue, symbol: market.symbol, nativeSymbol: market.nativeSymbol, scope: fee.scope, accountTier: fee.accountTier,
+        takerFeeBps: fee.takerFeeBps, baseTakerBps: fee.baseTakerBps, growthMultiplier: fee.growthMultiplier,
+        deployerFeeScale: fee.deployerFeeScale, collateralToken: market.collateralToken ?? null, noBuilder: true,
+      })).digest('hex');
+    }
+    return [market.nativeSymbol, fee];
+  }));
+}
+
+export function attachFeeFacts(markets, options = {}) {
+  const byVenue = new Map([...new Set(markets.map(market => market.venue))].map(venue => [venue,
+    deriveAutoFees({ ...options, venue, markets: markets.filter(market => market.venue === venue) })]));
+  return markets.map(market => ({ ...market, fee: byVenue.get(market.venue).get(market.nativeSymbol) }));
+}
+
 export function parseMetadata(venue, body) {
   const universe = venue === 'entropy' ? body?.[0]?.universe
     : venue === 'lighter' ? body?.order_book_details : body?.symbols;
   if (!Array.isArray(universe)) throw new Error('metadata_schema_error');
-  return Object.entries(SYMBOLS[venue]).map(([symbol, nativeSymbol]) => {
+  return attachFeeFacts(Object.entries(SYMBOLS[venue]).map(([symbol, nativeSymbol]) => {
     const raw = universe.find(row => (venue === 'entropy' ? row.name : row.symbol) === nativeSymbol);
     if (!raw) throw new Error(`missing_market:${nativeSymbol}`);
     if (venue === 'binance' && (raw.quoteAsset !== 'USDT' || raw.contractType !== 'PERPETUAL')) {
@@ -134,6 +222,7 @@ export function parseMetadata(venue, body) {
     const ntlFilter = raw.filters?.find(row => row.filterType === 'MIN_NOTIONAL');
     return {
       venue, symbol, nativeSymbol, quote: venue === 'binance' ? 'USDT' : 'USDC',
+      collateralToken: venue === 'entropy' ? body[0].collateralToken ?? null : null,
       priceUnit: venue === 'binance' ? 'USDT' : 'USD', settlement: venue === 'binance' ? 'USDT' : 'USDC',
       marketId: venue === 'lighter' ? raw.market_id : null,
       status: venue === 'entropy' ? raw.isDelisted ? 'delisted' : 'active'
@@ -159,12 +248,31 @@ export function parseMetadata(venue, body) {
       role: venue === 'binance' ? 'leader_research_only' : 'simulated_taker_leg',
       raw, context: venue === 'entropy' ? body[1]?.[index] ?? null : null,
     };
-  });
+  }));
 }
 
 export async function discover({ signal, onDiagnostic, fetchImpl = fetch, cooldowns = sharedCooldowns } = {}) {
   const results = await Promise.all(Object.keys(SYMBOLS).map(async venue => {
-    try { return parseMetadata(venue, await readJson(venue, { signal, fetchImpl, onDiagnostic, cooldowns })); }
+    try {
+      const options = { signal, fetchImpl, onDiagnostic, cooldowns };
+      const fetchedAt = Date.now();
+      const [metadata, fees] = await Promise.allSettled([
+        readJson(venue, options),
+        venue === 'binance' ? Promise.resolve(null) : readJson(venue, options, 'fees'),
+      ]);
+      if (metadata.status === 'rejected') throw metadata.reason;
+      if (fees.status === 'rejected' && (fees.reason instanceof CallbackFailure || signal?.aborted)) throw fees.reason;
+      const parsed = attachFeeFacts(parseMetadata(venue, metadata.value), {
+        feeBody: fees.status === 'fulfilled' ? fees.value : null,
+        feeError: fees.status === 'rejected' ? fees.reason : null, fetchedAt,
+      });
+      if (parsed.some(market => market.fee.status === 'unavailable') && venue !== 'binance') {
+        diagnostic(onDiagnostic, { level: 'warn', event: 'fees_unavailable', venue,
+          message: 'Public default fee unavailable; market data remains usable, simulated entry requires valid fees.',
+          details: { reasons: [...new Set(parsed.map(market => market.fee.reason).filter(Boolean))] } });
+      }
+      return parsed;
+    }
     catch (error) {
       if (error instanceof CallbackFailure || signal?.aborted) throw error;
       diagnostic(onDiagnostic, { level: 'error', event: 'metadata_unavailable', venue,
@@ -172,12 +280,12 @@ export async function discover({ signal, onDiagnostic, fetchImpl = fetch, cooldo
         details: { category: error.message.split(':')[0], retryNotBefore: error.retryNotBefore || null } });
       // Binance remains a public-data research source based on official listing announcements.
       // Its venue cooldown still blocks connecting before the server's deadline.
-      return venue !== 'binance' ? [] : Object.entries(SYMBOLS.binance).map(([symbol, nativeSymbol]) => ({
+      return venue !== 'binance' ? [] : attachFeeFacts(Object.entries(SYMBOLS.binance).map(([symbol, nativeSymbol]) => ({
         venue, symbol, nativeSymbol, quote: 'USDT', priceUnit: 'USDT', settlement: 'USDT',
         status: 'unverified', identityVerified: false, simulationEnabled: false,
         settlementEquivalence: 'unverified', role: 'leader_research_only', raw: null,
         retryNotBefore: error.retryNotBefore || null,
-      }));
+      })));
     }
   }));
   return { markets: results.flat(), sources: SOURCES, discoveredAt: Date.now() };

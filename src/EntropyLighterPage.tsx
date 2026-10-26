@@ -21,8 +21,6 @@ function message(reason: unknown) { return reason instanceof Error ? reason.mess
 
 type NumericField = { key: string; label: string; min: number; max: number; nullable?: boolean; hint?: string };
 const simulationFields: NumericField[] = [
-  { key: 'entropyTakerFeeBps', label: 'Entropy 实际 taker 费率（bps）', min: 0, max: 100, nullable: true, hint: '未知可留空；启用模拟前必须填写实际费率。' },
-  { key: 'lighterTakerFeeBps', label: 'Lighter taker 费率（bps）', min: 0, max: 100, nullable: true, hint: '按实际账户费率填写；未知可留空。' },
   { key: 'notionalPerLeg', label: '每腿模拟名义金额（USD）', min: 1, max: 100000 },
   { key: 'minEntryEdgeBps', label: '最小开仓价差（bps）', min: 0, max: 1000 },
   { key: 'holdMs', label: '模拟持有时间（ms）', min: 100, max: 60000 },
@@ -41,14 +39,14 @@ const collectionFields: NumericField[] = [
 ];
 type Draft = {
   region: string; recordRaw: boolean; simulationEnabled: boolean; verifiedSymbols: LabSymbol[];
-  values: Record<string, string>; rebateRatios: string;
+  values: Record<string, string>;
   latencyScenarios: { name: string; entropyMs: string; lighterMs: string }[];
 };
 function draftOf(config: LabConfig): Draft {
   const sim = config.simulation;
   return { region: config.region, recordRaw: config.recordRaw, simulationEnabled: sim.enabled, verifiedSymbols: [...sim.verifiedSymbols],
     values: Object.fromEntries([...collectionFields.map(f => [f.key, config[f.key as keyof LabConfig]]), ...simulationFields.map(f => [f.key, sim[f.key as keyof typeof sim]])].map(([key, value]) => [key, value === null ? '' : String(value)])),
-    rebateRatios: sim.rebateRatios.join(', '), latencyScenarios: sim.latencyScenarios.map(s => ({ name: s.name, entropyMs: String(s.entropyMs), lighterMs: String(s.lighterMs) })) };
+    latencyScenarios: sim.latencyScenarios.map(s => ({ name: s.name, entropyMs: String(s.entropyMs), lighterMs: String(s.lighterMs) })) };
 }
 function configOf(draft: Draft, current: LabConfig): LabConfig {
   const parse = (raw: string, label: string, min: number, max: number, nullable = false): number | null => {
@@ -64,13 +62,13 @@ function configOf(draft: Draft, current: LabConfig): LabConfig {
   config.simulation.enabled = draft.simulationEnabled;
   config.simulation.verifiedSymbols = [...draft.verifiedSymbols];
   for (const field of simulationFields) Object.assign(config.simulation, { [field.key]: parse(draft.values[field.key], field.label, field.min, field.max, field.nullable) });
-  if (draft.simulationEnabled && (!draft.verifiedSymbols.length || config.simulation.entropyTakerFeeBps === null || config.simulation.lighterTakerFeeBps === null)) throw new Error('启用模拟需要至少一个已核验标的，并填写两个平台的实际 taker 费率。');
+  if (draft.simulationEnabled && !draft.verifiedSymbols.length) throw new Error('启用模拟需要至少一个已核验标的。');
+  config.simulation.entropyTakerFeeBps = null;
+  config.simulation.lighterTakerFeeBps = null;
   config.simulation.latencyScenarios = draft.latencyScenarios.map(s => ({ name: s.name,
     entropyMs: parse(s.entropyMs, `${s.name} Entropy 延迟`, 0, 10000)!,
     lighterMs: parse(s.lighterMs, `${s.name} Lighter 延迟`, 300, 10000)! }));
-  const ratios = draft.rebateRatios.split(',').map(v => parse(v, '返佣比例', 0, 2)!);
-  if (!ratios.length || ratios.length > 10) throw new Error('返佣比例需有 1–10 项，用英文逗号分隔。');
-  config.simulation.rebateRatios = ratios;
+  config.simulation.rebateRatios = [0, 1.1, 1.2];
   return config;
 }
 
@@ -82,11 +80,11 @@ function Configuration({ draft, setDraft, disabled, dirty, busy, onSave, onReset
   const fields = (items: NumericField[]) => items.map(f => <Field key={f.key} label={f.label} hint={f.hint}><input type="number" inputMode="decimal" min={f.min} max={f.max} step="any" value={draft.values[f.key]} onChange={e => update(f.key, e.target.value)} /></Field>);
   return <details className="el-config panel"><summary><span>采集与模拟设置</span><span className="el-detail-hint">{disabled ? '停止采集后可编辑' : dirty ? '有未保存的修改' : '展开配置'}</span></summary><form noValidate onSubmit={onSave}>
     <fieldset disabled={disabled || busy}>
-      <div className="el-config-intro"><p>使用公开行情；模拟不会向交易所提交订单。关闭或切换页面后，服务器继续采集。</p><label className="el-check"><input type="checkbox" checked={draft.simulationEnabled} onChange={e => setDraft({ ...draft, simulationEnabled: e.target.checked })} />启用成交模拟</label><small>{draft.simulationEnabled ? '仅对已核验标的按保存的费用和延迟假设模拟。' : '当前只采集行情与研究价差。'}</small></div>
+      <div className="el-config-intro"><p>使用公开行情；模拟不会向交易所提交订单。关闭或切换页面后，服务器继续采集。</p><label className="el-check"><input type="checkbox" checked={draft.simulationEnabled} onChange={e => setDraft({ ...draft, simulationEnabled: e.target.checked })} />启用成交模拟</label><small>{draft.simulationEnabled ? '仅对已核验标的按自动取得的公开费用和延迟假设模拟；费用未就绪时暂停新增信号，行情继续采集。' : '自动获取公开费用，并同时计算 110% / 120% 返佣情景。'}</small></div>
       <div className="el-verified"><strong>已核验跨所合约身份</strong><div>{SYMBOLS.map(symbol => <label key={symbol} className="el-check"><input type="checkbox" checked={draft.verifiedSymbols.includes(symbol)} onChange={e => setDraft({ ...draft, verifiedSymbols: e.target.checked ? [...draft.verifiedSymbols, symbol] : draft.verifiedSymbols.filter(s => s !== symbol) })} />{symbol}</label>)}</div><p>请先核对底层资产、合约与结算口径。ANTH 同名合约的身份尚未自动核验，勾选表示你已独立核对。</p></div>
-      <div className="el-form-grid">{fields(simulationFields.slice(0, 8))}</div>
+      <div className="el-form-grid">{fields(simulationFields.slice(0, 6))}</div>
       <div className="el-latency"><h3>假设订单延迟</h3><p>Lighter Standard taker 至少 300 ms；各情景独立计算，结果不可相加。</p>{draft.latencyScenarios.map((scenario, index) => <div className="el-latency-row" key={scenario.name}><strong>{scenario.name}</strong>{(['entropyMs', 'lighterMs'] as const).map(key => <Field key={key} label={`${venue(key === 'entropyMs' ? 'entropy' : 'lighter')} 延迟（ms）`}><input type="number" min={key === 'lighterMs' ? 300 : 0} max={10000} step="any" value={scenario[key]} onChange={e => setDraft({ ...draft, latencyScenarios: draft.latencyScenarios.map((s, i) => i === index ? { ...s, [key]: e.target.value } : s) })} /></Field>)}</div>)}</div>
-      <details className="el-advanced"><summary>高级采集参数与返佣假设</summary><div className="el-form-grid"><Field label="采集地区"><input maxLength={100} value={draft.region} onChange={e => setDraft({ ...draft, region: e.target.value })} /></Field>{fields(collectionFields)}{fields(simulationFields.slice(8))}<Field label="假设返佣比例" hint="英文逗号分隔，0–2；1.1 表示 Entropy 手续费的 110%，不是已到账返佣。"><input value={draft.rebateRatios} onChange={e => setDraft({ ...draft, rebateRatios: e.target.value })} /></Field></div><label className="el-check"><input type="checkbox" checked={draft.recordRaw} onChange={e => setDraft({ ...draft, recordRaw: e.target.checked })} />记录原始行情与诊断</label></details>
+      <details className="el-advanced"><summary>高级采集参数</summary><div className="el-form-grid"><Field label="采集地区"><input maxLength={100} value={draft.region} onChange={e => setDraft({ ...draft, region: e.target.value })} /></Field>{fields(collectionFields)}{fields(simulationFields.slice(6))}</div><label className="el-check"><input type="checkbox" checked={draft.recordRaw} onChange={e => setDraft({ ...draft, recordRaw: e.target.checked })} />记录原始行情与诊断</label></details>
     </fieldset><div className="el-form-actions"><span>{disabled ? '采集运行时配置只读。' : dirty ? '保存后再启动，开始新的采集会话。' : '配置已同步。'}</span><div><button type="button" className="button secondary" disabled={!dirty || busy || disabled} onClick={onReset}>恢复已保存配置</button><button className="button primary" disabled={!dirty || busy || disabled} type="submit">{busy ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存配置</button></div></div>
   </form></details>;
 }
@@ -129,10 +127,10 @@ function PaperResults({ report }: { report: LabReport | null }) {
   return <section className="panel el-section el-paper"><div className="panel-heading"><h2>成交模拟</h2><span className="muted">{report?.mode === 'paper' ? '报告会话启用' : '报告会话未启用'}</span></div>
     <p className="el-section-note">订单延迟为假设值；成交按到达后的公开盘口估算，不代表真实成交与可执行容量。金额为 USD 模拟口径，各延迟情景不可相加。</p>
     {report?.paperSuspendedReason ? <div className="el-callout warning" role="status">模拟已暂停：前次会话存在未解决的模拟敞口，请下载报告核对。</div> : null}
-    {!hasActivity ? <div className="el-empty compact"><p>{report?.mode === 'paper' ? '尚无模拟成交。请查看行情质量、开仓门槛与拒绝原因。' : '只读采集模式。停止采集后可填写实际费用、核验标的并启用模拟。'}</p></div> : <>
+    {!hasActivity ? <div className="el-empty compact"><p>{report?.mode === 'paper' ? '尚无模拟成交。请查看自动费用状态、行情质量、开仓门槛与拒绝原因。' : '只读采集模式。费用自动获取；停止采集后可核验标的并启用模拟。'}</p></div> : <>
       <div className="el-table-scroll"><table className="el-table"><caption className="visually-hidden">各延迟情景独立的模拟结果</caption><thead><tr><th>延迟情景</th><th>完成 / 未结</th><th>失败腿</th><th>成交额 E / L（USD）</th><th>毛收益（USD）</th><th>手续费（USD）</th><th>预留成本（USD）</th><th>返佣前净收益（USD）</th></tr></thead><tbody>{results.map(([name, result]) => <tr key={name}><th scope="row">{name}{sessionConfig?.simulation.latencyScenarios.find(s => s.name === name) ? <small>E {num(sessionConfig.simulation.latencyScenarios.find(s => s.name === name)!.entropyMs)} / L {num(sessionConfig.simulation.latencyScenarios.find(s => s.name === name)!.lighterMs)} ms</small> : null}</th><td>{num(result.completed)} / {num(result.openTasks + result.unresolved)}</td><td>{num(result.failedLegs)}</td><td>{num(result.turnover?.entropy)} / {num(result.turnover?.lighter)}</td><td>{num(result.grossPnl, '待结算')}</td><td>{num(result.fees, '未知')}</td><td>{num(result.costReserve)}</td><td>{num(result.netBeforeRebate, '待结算')}</td></tr>)}</tbody></table></div>
       <div className="el-table-scroll"><table className="el-table"><caption>假设返佣敏感性：按已知 Entropy 手续费计算，未到账</caption><thead><tr><th>延迟情景</th><th>返佣比例</th><th>假设返佣（USD）</th><th>返佣后净收益（USD）</th></tr></thead><tbody>{results.flatMap(([name, result]) => (result.rebateScenarios || []).map((rebate, i) => <tr key={`${name}:${i}`}><th scope="row">{name}</th><td>{num(rebate.ratio * 100)}%</td><td>{num(rebate.contingentRebate)}</td><td>{num(rebate.net, '待结算')}</td></tr>))}</tbody></table></div></>}
-    <div className="el-assumptions">{sessionConfig ? <>报告会话费率：Entropy {sessionConfig.simulation.entropyTakerFeeBps === null ? '未知' : `${num(sessionConfig.simulation.entropyTakerFeeBps)} bps`}；Lighter {sessionConfig.simulation.lighterTakerFeeBps === null ? '未知' : `${num(sessionConfig.simulation.lighterTakerFeeBps)} bps`}。</> : report ? '该历史报告未记录参数。' : '尚无采集报告。'}更改配置不重算历史报告；资金费采用预留值，返佣仅为情景假设。</div>
+    <div className="el-assumptions">{report?.automaticFees ? '当前公开费率见各标的研究卡；每笔模拟按信号创建时锁定的费用版本结算，版本与来源可在下载报告的 feeSnapshot 核对。' : report ? '该历史报告未记录自动费用版本，历史费用来源未知；保留原始结果。' : '尚无采集报告。'}更改配置或更新费用不重算历史记录；资金费采用预留值，110% / 120% 按 Entropy 整轮总手续费分别计算，返佣未到账。</div>
   </section>;
 }
 

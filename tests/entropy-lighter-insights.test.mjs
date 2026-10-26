@@ -40,6 +40,40 @@ function insights(report = makeReport(), options = {}) {
 const main = (report, options) => insights(report, options).bySymbol.SNDK;
 const forwardDelay = (report) => report.opportunityStudy.bySymbol.SNDK.latency['base-assumed:entropy:lighter'];
 
+function autoReport() {
+  const report = makeReport();
+  report.sessionConfig.simulation.entropyTakerFeeBps = null; report.sessionConfig.simulation.lighterTakerFeeBps = null;
+  report.automaticFees = { mode: 'auto', rebateBasis: 'total_entropy_fees', rebateRatios: [1.1, 1.2], bySymbol: {} };
+  for (const symbol of ['SNDK', 'ANTH']) {
+    const fee = { mode: 'auto', symbol, status: 'available', revision: `${symbol}-fee-v1`, fetchedAt: now - 1000, expiresAt: now + 600000,
+      takerBps: { entropy: 0.9, lighter: 0 }, rebateBasis: 'total_entropy_fees', rebateRatios: [1.1, 1.2] };
+    report.automaticFees.bySymbol[symbol] = fee;
+    for (const metric of [...Object.values(report.opportunityStudy.bySymbol[symbol].raw), ...Object.values(report.opportunityStudy.bySymbol[symbol].latency)]) {
+      metric.feeRevision = fee.revision; metric.latest.feeSnapshot = structuredClone(fee);
+    }
+  }
+  return report;
+}
+
+test('automatic per-market fees support conclusions with both legacy input fields null', () => {
+  assert.equal(main(autoReport()).status, 'paper_candidate');
+});
+
+test('expired or missing automatic fees withdraw current conclusions without requesting manual input', () => {
+  const expired = autoReport(); expired.automaticFees.bySymbol.SNDK.expiresAt = now;
+  const result = main(expired); assert.equal(result.status, 'unknown_costs'); assert.match(result.title, /自动费率待刷新/);
+  assert.match(result.nextSteps.join(''), /无需手填/);
+  const missing = autoReport(); missing.automaticFees.bySymbol.SNDK.status = 'unavailable';
+  assert.equal(main(missing).status, 'unknown_costs');
+});
+
+test('a new fee revision cannot borrow qualified study evidence from the previous version', () => {
+  const report = autoReport(); report.automaticFees.bySymbol.SNDK.revision = 'new-fee-v2';
+  const result = main(report); assert.notEqual(result.status, 'paper_candidate'); assert.match(result.title, /等待同一版本/);
+  const rawMismatch = autoReport(); rawMismatch.opportunityStudy.bySymbol.SNDK.raw['entropy:lighter'].feeRevision = 'old';
+  assert.notEqual(main(rawMismatch).status, 'paper_candidate');
+});
+
 test('sufficient delayed evidence only shortlists paper verification and keeps per-leg turnover explicit', () => {
   const result = main(makeReport());
   assert.equal(result.status, 'paper_candidate');

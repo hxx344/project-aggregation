@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { Lab, Recorder, atomicJson, readPreviousReport, validateConfig } from './core.mjs';
+import { Lab, Recorder, atomicJson, automaticConfig, readPreviousReport, validateConfig } from './core.mjs';
 import { discover, startFeeds } from './feeds.mjs';
 
 function argumentsFor(argv) {
@@ -21,7 +21,7 @@ function argumentsFor(argv) {
 
 export async function run({ configPath, data, duration }) {
   const source = readFileSync(configPath, 'utf8');
-  const config = validateConfig(JSON.parse(source));
+  const config = validateConfig(automaticConfig(JSON.parse(source)));
   mkdirSync(data, { recursive: true, mode: 0o700 });
   // An exclusive mkdir, with PID ownership verification on recovery, prevents two
   // collectors from writing one data directory or consuming the same paper book.
@@ -65,7 +65,7 @@ export async function run({ configPath, data, duration }) {
     for (const [key, value] of Object.entries(cooldowns)) if (!['entropy', 'lighter', 'binance'].includes(key) || !Number.isFinite(value) || value < 0) throw new Error('Invalid persisted API cooldown');
     const fail = (error) => { if (!fatal) { fatal = error; abort.abort(); } };
     const safe = (fn) => (...args) => { if (fatal) return; try { fn(...args); } catch (e) { fail(e); } };
-    const lab = new Lab(effective, safe((event) => recorder.write(event)));
+    const lab = new Lab(effective, safe((event) => recorder.write(event)), { automaticFees: true });
     const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
     const diagnostic = safe((d) => {
       const key = `${d.venue || 'collector'}:${d.event}`;
@@ -93,14 +93,22 @@ export async function run({ configPath, data, duration }) {
       if (refreshing || abort.signal.aborted) return;
       refreshing = true;
       try {
-        if (feeds) { await feeds.stop(); feeds = null; }
-        for (const venue of ['entropy', 'lighter', 'binance']) lab.invalidate(venue, undefined, 'metadata_refresh');
-        metadata = await discover({ signal: abort.signal, onDiagnostic: diagnostic, cooldowns });
+        const next = await discover({ signal: abort.signal, onDiagnostic: diagnostic, cooldowns });
         if (abort.signal.aborted) return;
+        // Fee timestamps and prices do not change subscriptions. Refresh them
+        // in place, so a routine fee refresh never tears down healthy books.
+        const subscriptions = (value) => JSON.stringify((value?.markets || []).map((m) => [m.venue, m.symbol, m.nativeSymbol, m.marketId, m.status, m.quote, m.sizeDecimals, m.multiplier]).sort());
+        const changed = !feeds || subscriptions(metadata) !== subscriptions(next);
+        if (changed && feeds) { await feeds.stop(); feeds = null; }
+        if (abort.signal.aborted) return;
+        if (changed) for (const venue of ['entropy', 'lighter', 'binance']) lab.invalidate(venue, undefined, 'metadata_refresh');
+        metadata = next;
         lab.setMarkets(metadata.markets);
         recorder.write({ type: 'metadata', ...metadata });
-        feeds = startFeeds({ markets: metadata.markets, signal: abort.signal, cooldowns, onDiagnostic: diagnostic, onBook: safe((b) => lab.book(b)), onRaw: config.recordRaw ? safe((r) => recorder.write({ type: 'raw', ...r })) : undefined });
-        feeds.done.catch(fail);
+        if (changed) {
+          feeds = startFeeds({ markets: metadata.markets, signal: abort.signal, cooldowns, onDiagnostic: diagnostic, onBook: safe((b) => lab.book(b)), onRaw: config.recordRaw ? safe((r) => recorder.write({ type: 'raw', ...r })) : undefined });
+          feeds.done.catch(fail);
+        }
         persist();
       } catch (e) {
         if (!abort.signal.aborted) diagnostic({ level: 'error', event: 'discovery_failed', message: 'Metadata unavailable; retry in 60 seconds', at: Date.now() });
@@ -117,7 +125,9 @@ export async function run({ configPath, data, duration }) {
     const launchRefresh = () => { refreshPromise = refresh(); refreshPromise.catch(fail); };
     const refresher = setInterval(() => {
       const missingTradingFeed = !metadata || ['entropy', 'lighter'].some((v) => !metadata.markets.some((m) => m.venue === v && m.status === 'active'));
-      if (missingTradingFeed || Date.now() - metadata.discoveredAt >= 900000) launchRefresh();
+      const missingFees = !metadata || metadata.markets.some((m) => ['entropy', 'lighter'].includes(m.venue)
+        && (m.fee?.status !== 'available' || !(m.fee.expiresAt > Date.now() + 60000)));
+      if (missingTradingFeed || missingFees || Date.now() - metadata.discoveredAt >= 900000) launchRefresh();
     }, 60000);
     const deadline = duration === null ? null : setTimeout(stop, duration * 1000);
     cleanupReady = true;
@@ -148,7 +158,7 @@ export async function run({ configPath, data, duration }) {
 async function main() {
   const args = argumentsFor(process.argv.slice(2));
   if (args.command === 'check') {
-    validateConfig(JSON.parse(readFileSync(args.configPath, 'utf8')));
+    validateConfig(automaticConfig(JSON.parse(readFileSync(args.configPath, 'utf8'))));
     process.stdout.write('Configuration valid; public-data research/paper only.\n');
   } else if (args.command === 'run') await run(args);
   else if (args.command === 'report') {

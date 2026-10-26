@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -24,11 +24,31 @@ function fakeWorker({ ignoreTerm = false } = {}) {
 }
 
 test('HTTP configuration accepts only known data fields and never process/path overrides', () => {
-  assert.deepEqual(strictLabConfig(config), config);
+  const normalized = strictLabConfig(config);
+  assert.equal(normalized.simulation.entropyTakerFeeBps, null); assert.equal(normalized.simulation.lighterTakerFeeBps, null);
+  assert.equal(normalized.simulation.notionalPerLeg, config.simulation.notionalPerLeg);
   assert.throws(() => strictLabConfig({ ...config, command: 'node' }), /不支持/);
   assert.throws(() => strictLabConfig({ ...config, simulation: { ...config.simulation, privateKey: 'example' } }), /不支持/);
   const bad = structuredClone(config); bad.simulation.latencyScenarios[0].cwd = '/tmp';
   assert.throws(() => strictLabConfig(bad), /不支持/);
+});
+
+test('upgrade preserves a one-time original configuration backup while taking automatic costs', async () => {
+  const directory = fixtureDir(); mkdirSync(join(directory, 'entropy-lighter'));
+  const old = structuredClone(config); Object.assign(old.simulation, { entropyTakerFeeBps: 9, lighterTakerFeeBps: 3, rebateRatios: [0.5] });
+  writeFileSync(join(directory, 'entropy-lighter/config.json'), JSON.stringify(old));
+  let manager = createEntropyLighterResearch({ dataDir: directory, log: silent });
+  try {
+    await manager.initialize(); assert.equal(manager.state().config.simulation.entropyTakerFeeBps, null);
+    assert.deepEqual(manager.state().config.simulation.rebateRatios, [0, 1.1, 1.2]);
+    assert.deepEqual(JSON.parse(readFileSync(join(manager.directory, 'config.before-auto-fees.json'))), old);
+    await manager.save(manager.state().config); await manager.close();
+    manager = createEntropyLighterResearch({ dataDir: directory, log: silent }); await manager.initialize();
+    assert.deepEqual(JSON.parse(readFileSync(join(manager.directory, 'config.before-auto-fees.json'))), old);
+    await manager.close(); unlinkSync(join(manager.directory, 'config.json'));
+    manager = createEntropyLighterResearch({ dataDir: directory, log: silent }); await manager.initialize();
+    assert.deepEqual(JSON.parse(readFileSync(join(manager.directory, 'config.before-auto-fees.json'))), old, 'a missing current configuration must never overwrite the one-time backup');
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
 test('managed real CLI merges concurrent starts, publishes heartbeat and persists stop across runtime restart', async () => {

@@ -47,6 +47,34 @@ export interface LabQuote {
   receiveAgeMs?: number | null;
   executionQuality?: string | null;
 }
+export interface LabFeeFact {
+  status: 'available' | 'unavailable';
+  takerFeeBps: number | null;
+  baseTakerBps: number | null;
+  growthMultiplier: number | null;
+  deployerFeeScale: number | null;
+  scope: 'public_default_tier_no_builder';
+  accountTier: 'default' | 'standard';
+  sourceUrls: string[];
+  fetchedAt: number;
+  expiresAt: number;
+  revision: string | null;
+  reason: string | null;
+  assumptions: string[];
+}
+export interface LabFeeSnapshot {
+  mode: 'auto';
+  symbol: LabSymbol;
+  status: 'available' | 'unavailable' | 'expired';
+  revision: string | null;
+  entropy: LabFeeFact | null;
+  lighter: LabFeeFact | null;
+  takerBps: { entropy: number | null; lighter: number | null };
+  fetchedAt: number | null;
+  expiresAt: number | null;
+  rebateBasis: 'total_entropy_fees';
+  rebateRatios: [1.1, 1.2];
+}
 export interface LabEvaluation {
   at: number;
   quantity: number;
@@ -59,11 +87,15 @@ export interface LabEvaluation {
   costs: { feesRoundTripCash: number | null; exitSlippageReserveCash: number; fundingReserveCash: number; totalReserveCash: number | null };
   surplusBeforeRebateCash: number | null;
   surplusBeforeRebateBps: number | null;
+  entropyRoundTripFeesCash?: number | null;
+  rebates?: { ratio: number; contingentRebateCash: number | null; surplusCash: number | null }[];
+  feeSnapshot?: LabFeeSnapshot;
   gatePassed: boolean;
   sourceTimeUncertain: boolean;
 }
 export interface LabInsightMetrics {
   name?: string;
+  feeRevision?: string | null;
   buy: string;
   sell: string;
   scenario: { name: string; entropyMs: number; lighterMs: number } | null;
@@ -111,6 +143,12 @@ export interface LabReport {
   observation?: { asOf: number; silenceAfterMs: number };
   sessionConfig?: LabConfig;
   configHash?: string;
+  automaticFees?: {
+    mode: 'auto';
+    rebateBasis: 'total_entropy_fees';
+    rebateRatios: [1.1, 1.2];
+    bySymbol: Partial<Record<LabSymbol, LabFeeSnapshot>>;
+  };
   session: string;
   mode: 'research' | 'paper';
   startedAt: string;

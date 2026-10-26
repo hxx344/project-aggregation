@@ -36,7 +36,7 @@ node tools/entropy-lighter-lab/cli.mjs report
 
 ## 已核实的市场与成本
 
-以下为 2026-10-26 查验结果，程序运行时重新读取市场目录，不固定 Lighter market ID。
+以下为 2026-10-27 查验结果，程序运行时重新读取市场目录，不固定 Lighter market ID。
 
 | 研究标的 | Entropy | Lighter | Binance，只研究领先信号 |
 | --- | --- | --- | --- |
@@ -45,11 +45,15 @@ node tools/entropy-lighter-lab/cli.mjs report
 
 [Entropy 是 Hyperliquid HIP-3 的 io 市场](https://docs.entropy.io/about-entropy/readme)。公开信息读取用 Hyperliquid `/info`，WS 用 `l2Book` 的 `fast:true` 完整快照。Lighter 用官方 `orderBookDetails` 和 WS `order_book`，按 `begin_nonce == previous nonce` 校验增量连续性，缺口立即失效并要求新快照。Binance 用完整 top-20 部分深度帧，不把它误当作可直接拼接的增量。
 
-[Lighter Standard](https://apidocs.lighter.xyz/docs/account-types) 当前普通 taker 零手续费，固定 taker 等待 300ms。该等待不包含全部网络、服务端处理和回报时间；本工具配置的 Lighter 延迟不得低于 300ms。Plus/Premium 的费率不同，换 tier 后必须修改参数。本工具只按普通 taker 研究，不使用 maker 或 TWAP。
+[Lighter Standard](https://apidocs.lighter.xyz/docs/account-types) 当前普通 taker 零手续费，固定 taker 等待 300ms。该等待不包含全部网络、服务端处理和回报时间；本工具配置的 Lighter 延迟不得低于 300ms。费用通过公开 `feeTiers?filter=perps` 自动读取 Standard 档；Plus/Premium 的费用不同，本工具不读取实际账户 tier，也不把默认档称为账户实付费率。本工具只按普通 taker 研究，不使用 maker 或 TWAP。
 
-[Entropy 费率](https://docs.entropy.io/equity-perp-mechanics/fees) 随 HIP-3、growth mode、账户费档等变化。当前两市场返回 growth mode enabled；公开默认档的计算例子为 `0.090% × 0.1 = 0.009% = 0.9 bps`，这不是对你账户实际收费的确认，前端 builder 费用也可能影响实付。因此默认 `entropyTakerFeeBps: null`，模拟需先填入实际总费率。`1 bps = 0.01%`。
+[Entropy 费率](https://docs.entropy.io/equity-perp-mechanics/fees) 已自动获取，无需输入：读取 Hyperliquid 公共 `userFees` 的全局 `feeSchedule.cross`，再结合每个市场的 `deployerFeeScale`、growth mode 与抵押币种。请求使用固定零地址，仅保留全局费表，忽略零地址的账户费率、折扣和交易量；不读取用户账户。当前两个市场默认费率均为 `0.009% = 0.9 bps`，数值随公共费表和市场参数刷新，不在程序中固定为 0.9。`1 bps = 0.01%`。
 
-110%–120% 返佣暂按用户提供的假设计算，尚未取得资格、计费基数、上限、结算周期与领取条件。若实际费率为 `f`、返佣比例为 `r`，单次 Entropy 成交额的净补贴仅为 `f × (r−1)`。例如 `f=0.9 bps` 时，单次仅补贴 `0.09–0.18 bps`；Entropy 开平两次合计 `0.18–0.36 bps`，很容易被价差、滑点与延迟吃掉。不可仅因有返佣提高周转。
+费用口径为公开默认档、无账户个别折扣、无 builder 加费的 API 研究情景，不是对账户实付费率的确认。正常每 15 分钟刷新，缺失/将过期时每分钟有限重试并遵守服务器冷却；20 分钟有效期不会被报告心跳续期。只更新费用不会重连健康盘口。未知字段或获取失败保留行情采集，但暂停新增模拟信号并等待自动恢复。原 schema 1 的手填字段仍可读取，但新运行统一采用自动费用，不再用旧数值覆盖它。
+
+返佣固定展示 110% 和 120% 两档，无需输入。用户已确认这是额外渠道、以**全部 Entropy 手续费**为基数；它区别于 Entropy 官方以自身分成为基数的返佣规则。程序按每条结果锁定的 Entropy 整轮总手续费分别乘 1.1、1.2，显示假设返佣金额与返佣后余量，不对 Lighter 手续费返佣。资格、上限、实际结算和领取尚未核对，均标为未到账情景。
+
+若默认费率为 `f`、返佣比例为 `r`，单次 Entropy 成交额的净补贴为 `f × (r−1)`。以本次自动读得的 `f=0.9 bps` 为例，单次净补贴 `0.09–0.18 bps`，Entropy 开平两次合计 `0.18–0.36 bps`。返佣前亏损的方案不会仅因返佣假设转正就升级为候选。
 
 ## ANTH 必须先核对合约等价性
 
@@ -79,6 +83,7 @@ SNDK 最多进入“值得纸面验证”：同一方向和延迟情景需至少
 - `openPaperTasks`、`unresolved`：未完成或无法估值的纸面敞口。有这些状态时，该情景总净额为 `null`，已完成部分另列 `settledNetBeforeRebate`；已知手续费仍保留。
 - `observedAt`、`observation`、`latestQuotes.receiveAgeMs`：生成报告时的采集器时间、观察窗口及单调接收年龄；`executionQuality` 独立保留严格模拟时效结果。
 - `opportunityStudy`：按标的、买卖方向和延迟情景隔离的入场研究。`completed` 为双腿观测完成数，`costed`、`qualitySpanMs` 只涵盖源时间可信且成本已知的样本；不与现有跨标的 `paper` 汇总混用。
+- `automaticFees` 与每条 `feeSnapshot`：当前自动费用与当时计算所用的费用版本/来源；同费率仅刷新时间不清空统计，费率语义改变会隔离研究样本，纸面在途任务仍按创建时的费用快照完成。历史结果不使用后来费率重算。
 
 `events-*.jsonl` 保存原始帧、标准化盘口、目录、信号、每腿模拟成交、失败与结束报告，可离线重新研究。`report.json` 每 5 秒更新当前 session 汇总；`status.json` 是轻量心跳。默认最多约 2 GiB 行情文件、7 天保留上限；哪个先触发就先删除最旧的工具日志，不能理解成一定保存足 7 天。每段约 8 MiB，磁盘不足或写入失败会停止运行。该限额不清理用户其他文件。
 
@@ -86,7 +91,7 @@ SNDK 最多进入“值得纸面验证”：同一方向和延迟情景需至少
 
 ## 可选纸面基线
 
-完成合约核验并确认账户实付费率后，在工作台页面修改配置：`simulation.enabled=true`、`verifiedSymbols=["SNDK"]`、`entropyTakerFeeBps=实际总费率bps`。保存后按页面状态启动采集。CLI 使用者可先运行 `check --config /absolute/path/config.json`，再重启相应采集进程。ANTH 默认保持未核验状态。
+费用和返佣自动准备，默认只采集就能看到成本与策略研究结论。若要开启完整纸面开平仓，在工作台勾选已核验标的并启用模拟即可；无需填写费率或返佣，自动费用未就绪时等待恢复而不发送模拟信号。保存后按页面状态启动采集。CLI 使用者可先运行 `check --config /absolute/path/config.json`，再重启相应采集进程。ANTH 默认保持未核验状态。
 
 基线只用于检验价差是否经得住执行：同数量两腿 taker 开仓，固定持有默认 5 秒，然后 taker 平仓。开仓门槛要求扣除开平四次手续费、滑点和资金费准备后仍有额外安全边际；不把返佣作为入场依据。它不是经过验证的最优退出策略，也不保证每笔赚钱。
 
@@ -111,3 +116,5 @@ python deploy/test-release.py -v
 发布测试分别覆盖完整包的四文件白名单与可运行 CLI、源码发布命令的固定提交提取，以及研究代码的缓存失效范围。Windows 的原生 Git Bash 可运行跨平台输入分类测试 `bash deploy/test-inputs.sh`；Linux 权限、systemd 激活、增量安装与回滚由现有 Ubuntu CI 验证。短时公开接口采集不等于已完成东京 24 小时验收。
 
 本次包含部署交付路径变更，按 R3 审查。网络失败暂停对应研究/模拟并保留历史，磁盘写失败会停止采集。可从页面停止采集，配置和数据保留；回滚沿用工作台旧正式版本，保留 `DATA_DIR/entropy-lighter`，旧工作台不读取该研究目录。独立 CLI 安装方式仍可使用旧正式提交的专用安装器回滚，其数据与工作台目录分别保留。
+
+自动费用版本的工作台会在研究目录保留一次 `config.before-auto-fees.json`，不会覆盖。若新版保存过“启用 paper 且旧费率字段为 null”的配置，旧版会因要求手填费用而拒绝启动；回退前先停止研究并关闭 paper，或停服后恢复该升级前备份，再回退工作台。始终保留原始记录、未决纸面敞口及暂停标记，不为回滚清空风险状态。

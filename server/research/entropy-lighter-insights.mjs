@@ -78,6 +78,11 @@ function leaderInsights(report) {
 }
 
 function symbolInsights({ symbol, report, simulation, live, reportAgeMs, windowMs, evidenceMaxAgeMs, now, paper, hasParameters, hasStudy, stopped }) {
+  const automatic = report?.automaticFees?.mode === 'auto';
+  const autoFee = automatic ? report.automaticFees.bySymbol?.[symbol] : null;
+  const validAutoFee = autoFee?.status === 'available' && nonnegative(autoFee.takerBps?.entropy) && nonnegative(autoFee.takerBps?.lighter)
+    && finite(autoFee.fetchedAt) && autoFee.fetchedAt <= now + 100 && finite(autoFee.expiresAt) && autoFee.expiresAt > now && typeof autoFee.revision === 'string';
+  const versionMatches = (row) => !automatic || validAutoFee && row?.feeRevision === autoFee.revision && row.latest?.feeSnapshot?.revision === autoFee.revision;
   const scenarios = Array.isArray(simulation?.latencyScenarios) ? simulation.latencyScenarios : [];
   const source = report?.opportunityStudy?.bySymbol?.[symbol];
   const rawRows = studyRows(source?.raw, scenarios).filter((row) => row.scenario === null).sort((a, b) => evaluationScore(b) - evaluationScore(a));
@@ -85,7 +90,7 @@ function symbolInsights({ symbol, report, simulation, live, reportAgeMs, windowM
     .sort((a, b) => evaluationScore(b) - evaluationScore(a));
   const rawMetrics = rawRows[0] || null;
   const currentQuotes = report ? quoteState(report, symbol, reportAgeMs, windowMs) : '等待首次行情报告';
-  const feesKnown = nonnegative(simulation?.entropyTakerFeeBps) && nonnegative(simulation?.lighterTakerFeeBps);
+  const feesKnown = automatic ? validAutoFee : nonnegative(simulation?.entropyTakerFeeBps) && nonnegative(simulation?.lighterTakerFeeBps);
   const thresholdKnown = nonnegative(simulation?.minEntryEdgeBps);
   const blockers = [];
   if (!hasParameters) blockers.push('该报告未记录本次会话参数，不能套用后来保存的配置');
@@ -93,14 +98,14 @@ function symbolInsights({ symbol, report, simulation, live, reportAgeMs, windowM
   if (stopped) blockers.push('采集未处于运行状态');
   else if (!live) blockers.push('报告与当前采集会话不匹配，或已超出观察窗口');
   if (currentQuotes) blockers.push(currentQuotes);
-  if (hasParameters && !feesKnown) blockers.push('至少一侧手续费未知，成本和余量保持未知');
+  if (hasParameters && !feesKnown) blockers.push(automatic ? '自动费率尚未就绪或已过期，等待系统刷新后计算' : '旧报告缺少自动费率证据，等待新版采样');
   if (hasParameters && !thresholdKnown) blockers.push('本次会话未记录有效的入场余量门槛');
   if (!Array.isArray(simulation?.verifiedSymbols) || !simulation.verifiedSymbols.includes(symbol)) blockers.push('跨平台合约的经济等价身份尚未核验');
   if (paper.unresolved) blockers.push('全局纸面模拟仍有在途或未决敞口，先核对现有任务');
 
   const eligible = delayed.find((row) => {
     const matchingRaw = rawRows.find((rawRow) => rawRow.buy === row.buy && rawRow.sell === row.sell);
-    return row.sampleReady && knownCosts(row.latest) && row.latest.gatePassed === true
+    return row.sampleReady && versionMatches(row) && versionMatches(matchingRaw) && knownCosts(row.latest) && row.latest.gatePassed === true
       && row.latest.sourceTimeUncertain === false && thresholdKnown && row.latest.surplusBeforeRebateBps >= simulation.minEntryEdgeBps
       && finite(row.lastAt) && row.lastAt <= row.latest.at && recent(row.latest.at, now, evidenceMaxAgeMs)
       && knownCosts(matchingRaw?.latest) && matchingRaw.latest.sourceTimeUncertain === false
@@ -133,8 +138,14 @@ function symbolInsights({ symbol, report, simulation, live, reportAgeMs, windowM
   } else if (!live && report) {
     result.status = 'stale'; result.title = '当前报告待更新';
     result.reason = '报告已超出观察窗口或不属于当前运行会话，暂时撤回策略筛选结论，保留历史数值。';
+  } else if (automatic && !validAutoFee) {
+    result.status = 'unknown_costs'; result.title = autoFee?.status === 'expired' || finite(autoFee?.expiresAt) && autoFee.expiresAt <= now ? '自动费率待刷新' : '正在自动获取手续费';
+    result.reason = '系统正在读取官方公共费表和市场倍率，无需手填；有效费用到达后自动计算两档返佣与成本后空间。';
   } else if (!selectedEvaluation) {
     result.reason = '等待新报告中的双向价差、整轮成本与延迟后余量。';
+  } else if (!versionMatches(selectedRaw) || selectedDelayed && !versionMatches(selectedDelayed)) {
+    result.title = '自动费率已更新，等待同一版本的新样本';
+    result.reason = '保留旧记录，但不将不同费用口径混成当前策略证据。';
   } else if (!recent(selectedEvaluation.at, now, evidenceMaxAgeMs)
     || (selectedDelayed?.latest && !recent(selectedDelayed.latest.at, now, evidenceMaxAgeMs))) {
     result.title = '最近研究样本待更新';
@@ -161,7 +172,7 @@ function symbolInsights({ symbol, report, simulation, live, reportAgeMs, windowM
   if (result.status === 'paper_candidate') {
     result.nextSteps = ['只继续纸面模拟；等待通过严格时效检查的新盘口，再由现有纸面执行门槛触发。', '逐笔核对延迟后成交、失败腿和退出成本，记录每腿金额与大致单轮周转，不外推每天成交额或每笔盈利。'];
   } else if (result.status === 'unknown_costs') {
-    result.nextSteps = ['填写本次会话可核对的实际手续费，再重新开始采样。', '返佣保持单独的未到账情景，先看不含返佣的余量。'];
+    result.nextSteps = ['保持采集，系统会自动读取和重试费率，无需手填手续费或返佣。', '同时展示按全部 Entropy 手续费返 110% / 120% 的未到账渠道情景，筛选仍先看返佣前余量。'];
   } else if (result.status === 'latency_erases_edge' || result.status === 'no_edge') {
     result.nextSteps = ['继续比较两种买卖方向的成本后余量，优先观察更宽且能持续到延迟后的价差。', '先确认报价与成本口径，不从返佣假设推导盈利。'];
   } else {

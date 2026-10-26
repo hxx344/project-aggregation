@@ -2,14 +2,14 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, lstatSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { atomicJson, validateConfig } from '../../tools/entropy-lighter-lab/core.mjs';
+import { atomicJson, automaticConfig, validateConfig } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
 import { buildResearchInsights } from './entropy-lighter-insights.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const tool = path.join(root, 'tools/entropy-lighter-lab');
 const defaults = JSON.parse(readFileSync(path.join(tool, 'config.example.json'), 'utf8'));
-const REPORT_KEYS = ['schema', 'session', 'mode', 'startedAt', 'heartbeatAt', 'observedAt', 'observation', 'opportunityStudy', 'configHash', 'sessionConfig', 'paperSuspendedReason', 'counts', 'basis', 'leaderMarkouts', 'paper', 'openPaperTasks', 'assumptions', 'diagnostics', 'eventLoopDelayMs', 'stopped', 'latestQuotes', 'recentSpreads'];
+const REPORT_KEYS = ['schema', 'session', 'mode', 'startedAt', 'heartbeatAt', 'observedAt', 'observation', 'opportunityStudy', 'automaticFees', 'configHash', 'sessionConfig', 'paperSuspendedReason', 'counts', 'basis', 'leaderMarkouts', 'paper', 'openPaperTasks', 'assumptions', 'diagnostics', 'eventLoopDelayMs', 'stopped', 'latestQuotes', 'recentSpreads'];
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;
@@ -29,7 +29,7 @@ export function strictLabConfig(value) {
   shape(value.simulation, defaults.simulation);
   if (!Array.isArray(value.simulation.latencyScenarios)) throw new HttpError(400, '延迟情景格式不正确');
   for (const row of value.simulation.latencyScenarios) shape(row, defaults.simulation.latencyScenarios[0]);
-  try { return structuredClone(validateConfig(value)); }
+  try { return structuredClone(validateConfig(automaticConfig(value))); }
   catch { throw new HttpError(400, '研究参数无效，请核对费率、已核验标的和延迟范围'); }
 }
 
@@ -37,7 +37,7 @@ export function createEntropyLighterResearch({ dataDir, enabledByDefault = false
   launch = spawn, now = Date.now, stopGraceMs = 5000, killWaitMs = 2000, retryDelays = [1000, 2000, 4000, 8000, 16000] } = {}) {
   const directory = path.join(dataDir, 'entropy-lighter');
   const configPath = path.join(directory, 'config.json'), controlPath = path.join(directory, 'control.json');
-  let config = structuredClone(defaults), configValid = true, enabled = enabledByDefault, child = null, closed = false, initialized = false;
+  let config = automaticConfig(defaults), configValid = true, enabled = enabledByDefault, child = null, closed = false, initialized = false;
   let failure = null, readFailure = null, retry = 0, retryTimer = null, generationStarted = 0;
   let operation = Promise.resolve();
   const cleared = () => { clearTimeout(retryTimer); retryTimer = null; };
@@ -137,8 +137,14 @@ export function createEntropyLighterResearch({ dataDir, enabledByDefault = false
       initialized = true;
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       try {
-        if (existsSync(configPath)) config = strictLabConfig(readBounded(configPath, 64 * 1024));
-        else atomicJson(configPath, config);
+        if (existsSync(configPath)) {
+          const saved = readBounded(configPath, 64 * 1024);
+          config = strictLabConfig(saved);
+          if (!existsSync(path.join(directory, 'config.before-auto-fees.json'))) atomicJson(path.join(directory, 'config.before-auto-fees.json'), saved);
+        } else {
+          atomicJson(configPath, config);
+          if (!existsSync(path.join(directory, 'config.before-auto-fees.json'))) atomicJson(path.join(directory, 'config.before-auto-fees.json'), config);
+        }
         const prior = readBounded(controlPath, 4096);
         if (prior) {
           if (prior.schema !== 1 || typeof prior.enabled !== 'boolean' || Object.keys(prior).some((k) => !['schema', 'enabled'].includes(k))) throw new Error('invalid_control');
