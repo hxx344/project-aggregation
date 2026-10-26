@@ -37,7 +37,7 @@ export async function startApi({ dataDir, logger = defaultLogger, signal, fail =
   function close() {
     return closing ??= (async () => {
       const results = [];
-      for (const action of [() => api?.close(), () => api?.closeServer(), stopWriteLog, () => db?.close(), () => lock?.close()]) { try { await action(); } catch (error) { results.push(error); } }
+      for (const action of [() => api?.close(), stopWriteLog, () => db?.close(), () => lock?.close()]) { try { await action(); } catch (error) { results.push(error); } }
       if (results.length) throw new AggregateError(results, 'API 关闭失败');
     })();
   }

@@ -61,6 +61,15 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   return {
     server: api.server, check, refresh, assetSync, trading, execution, baseline: dataPlane.baseline, dataDir: resolvedData, resynchronizeModules: api.updates.resynchronize,
     resetPassword: api.resetPassword,
-    async close() { dataPlane.stop(); await api.close(); await dataPlane.close(); await api.closeServer(); db.close(); },
+    // The data plane closes with this process, so it cancels the work still in
+    // flight while the API drains; their requests then answer with that outcome.
+    async close() {
+      dataPlane.stop();
+      const results = await Promise.allSettled([api.close(), dataPlane.close()]);
+      try { db.close(); } catch (error) { results.push({ status: 'rejected', reason: error }); }
+      const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length) throw new AggregateError(errors, '工作台关闭失败');
+    },
   };
 }

@@ -6,7 +6,7 @@ import { validateUrl, validateAuthOrigin } from '../adapters.mjs';
 import { createPortal } from '../portal.mjs';
 import { loginForPortal } from '../portal-auth.mjs';
 import { createOverviewEncoder } from '../overview-stream.mjs';
-import { createStaticResponder } from '../static-response.mjs';
+import { createReleaseAssetLookup, createStaticResponder } from '../static-response.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from '../updates.mjs';
 import { createUpdateStream } from '../update-stream.mjs';
 import { moduleIds } from '../modules/catalog.mjs';
@@ -42,7 +42,7 @@ const admitted = (pathname, method) => /^\/api\/trading\/execution\/accounts\/(?
 // files. Business routes go to the data plane through `runtime`, module
 // supervision through `supervisor`; neither is reached any other way.
 // The browser request's budget, which a forwarded call keeps (design doc 5.2).
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 60_000, HANDLER_GRACE_MS = 2000, COORDINATOR_CLOSE_MS = 5000;
 // Overview streams get a frame at least this often, and project changes are
 // retried this many times at these delays (initial design values).
 const OVERVIEW_HEARTBEAT_MS = 15_000, RUNTIME_STALE_MS = 30_000, NOTICE_RETRY_MS = [1000, 5000];
@@ -67,7 +67,7 @@ export function supervisorTransports(supervisor) {
 
 export function createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime, executionJobs, readMaintenance,
   updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits(), resolveTransport,
-  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS, statsIntervalMs = STATS_INTERVAL_MS }) {
+  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS, statsIntervalMs = STATS_INTERVAL_MS, drainMs = REQUEST_TIMEOUT_MS }) {
   const { loginWindowMs, accountLockoutMs } = loginLimits;
   const { getSetting, setSetting, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
@@ -91,7 +91,9 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   }
   // IP rate limiting and the account lockout live in hub.sqlite, shared by every API instance.
   const loginGuard = createLoginGuard(control, { loginWindowMs, accountLockoutMs });
-  let closed = false;
+  // draining: the listener is closing and the requests in flight may finish;
+  // closed: they have, and the control-plane services are ending.
+  let draining = false, closed = false, closing = null;
   const updateStream = createUpdateStream({ readState: updates.status,
     isSessionActive: id => !closed && sessions.isActive(id),
   });
@@ -119,7 +121,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   });
   const statsTimer = setInterval(reportStats, statsIntervalMs); statsTimer.unref?.();
   reportStats();
-  const serveStatic = createStaticResponder();
+  const serveStatic = createStaticResponder(), releaseAsset = createReleaseAssetLookup(distDir);
   // Ends the streams whose session is gone; the others get the next overview.
   const pruneStreams = () => {
     const size = streams.size;
@@ -225,7 +227,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     if (pathname === '/api/health' && req.method === 'GET') { send(res, 200, { status: 'ok' }); return; }
     // Ready once a compatible runtime reports ready; a probe learns nothing more.
     if (pathname === '/api/ready' && req.method === 'GET') {
-      const ready = !closed && (await supervisor.status().catch(() => null))?.ready === true;
+      const ready = !draining && (await supervisor.status().catch(() => null))?.ready === true;
       send(res, ready ? 200 : 503, { ready }); return;
     }
     const current = session(req);
@@ -353,7 +355,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       // Read before the limit check, so concurrent subscribers cannot all pass it during the read.
       const initial = await readOverview();
       if (res.destroyed) return;
-      if (closed) throw new HttpError(503, '工作台正在关闭');
+      if (draining) throw new HttpError(503, '工作台正在关闭');
       if (!sessions.isActive(current.id)) throw new HttpError(401, '登录已失效，请重新登录');
       if (streams.size >= 60 || [...streams.values()].filter(value => value.id === current.id).length >= 12) throw new HttpError(429, '状态订阅过多');
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
@@ -408,8 +410,16 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   }
 
   const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.json': 'application/json' };
-  const server = http.createServer(async (req, res) => {
+  // Responses not finished yet, while draining each one closes its connection;
+  // handlers still running; upgraded sockets, which server.close() waits for
+  // but closeAllConnections() does not reach.
+  const inFlight = new Set(), handlers = new Set(), upgrades = new Set();
+  const server = http.createServer((req, res) => { const task = handle(req, res), done = () => handlers.delete(task); handlers.add(task); task.then(done, error => { done(); log.error({ err: error, type: 'request' }, '请求处理失败'); }); });
+  async function handle(req, res) {
     receivedAt.set(req, Date.now());
+    inFlight.add(res);
+    res.once('close', () => { inFlight.delete(res); if (draining) setImmediate(() => server.closeIdleConnections()); });
+    if (draining) res.setHeader('Connection', 'close');
     try { if ((!configuredOrigin || req.headers.host !== new URL(configuredOrigin).host) && await portal.handle(req, res)) return; }
     catch { if (!res.headersSent) send(res, 502, { error: '项目页面暂时不可用，请从工作台重新打开' }); else res.destroy(); return; }
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Frame-Options', 'DENY');
@@ -428,12 +438,20 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       let decoded; try { decoded = decodeURIComponent(url.pathname); } catch { throw new HttpError(400, '地址格式不正确'); }
       let filename = path.resolve(distDir, `.${decoded}`);
       if (!filename.startsWith(`${path.resolve(distDir)}${path.sep}`)) filename = path.join(distDir, 'index.html');
-      if (!existsSync(filename) || !statSync(filename).isFile()) { if (path.extname(decoded)) throw new HttpError(404, '文件不存在'); filename = path.join(distDir, 'index.html'); }
+      if (!existsSync(filename) || !statSync(filename).isFile()) {
+        const other = decoded.startsWith('/assets/') ? releaseAsset(decoded.slice(8)) : null;
+        if (other) filename = other;
+        else if (path.extname(decoded)) throw new HttpError(404, '文件不存在');
+        else filename = path.join(distDir, 'index.html');
+      }
       if (!existsSync(filename)) { send(res, 503, { error: '前端尚未构建，请先执行 npm run build' }); return; }
       await serveStatic(req, res, filename, { 'Content-Type': mime[path.extname(filename)] || 'application/octet-stream', 'Cache-Control': path.basename(filename) === 'index.html' ? 'no-cache' : 'public, max-age=3600' });
     } catch (error) { if (!res.headersSent) { const reply = respond(error); send(res, reply.status, reply.body); } else res.end(); }
+  }
+  server.on('upgrade', (req, socket, head) => {
+    upgrades.add(socket); socket.once('close', () => upgrades.delete(socket));
+    void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) { socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroySoon(); } }).catch(() => socket.destroy());
   });
-  server.on('upgrade', (req, socket, head) => { void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); }).catch(() => socket.destroy()); });
   server.requestTimeout = REQUEST_TIMEOUT_MS; server.headersTimeout = 10000; server.maxHeadersCount = 80;
 
   return {
@@ -443,10 +461,37 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     reportStats,
     initialize: () => updates.initialize(),
     async resetPassword() { const password = await resetPassword(control); pruneStreams(); updateStream.revalidate(); return password; },
-    // close() ends the control-plane services; closeServer() then waits for the listener.
-    async close() {
-      const reported = closed ? null : finalReport();
-      closed = true; unsubscribe(); clearInterval(heartbeat); clearInterval(statsTimer); for (const timer of retries) clearTimeout(timer); retries.clear(); await updates.close(); for (const res of streams.keys()) res.end(); streams.clear(); await updateStream.close(); portal.close(); await reported; },
-    async closeServer() { if (server.listening) await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },
+    // Drains, then ends the control-plane services (design doc api-dual-slot 5.1):
+    // the listener stops and kept-alive connections close after their response;
+    // the overview and update streams end, and so do Portal's upgraded connections
+    // and event streams, which the pages reconnect; drainMs after close() began,
+    // every connection left is destroyed, and handlers still running get
+    // HANDLER_GRACE_MS more. Only then do the coordinator (at most
+    // COORDINATOR_CLOSE_MS), the last stream-count report and Portal end,
+    // within the API unit's TimeoutStopSec.
+    close() {
+      return closing ??= (async () => {
+        draining = true;
+        const listener = server.listening ? new Promise(resolve => server.close(resolve)) : null;
+        const forced = listener && setTimeout(() => {
+          log.warn({ requests: inFlight.size, upgrades: upgrades.size, type: 'shutdown' }, '在途请求未在期限内结束，已关闭其连接');
+          server.closeAllConnections(); for (const socket of upgrades) socket.destroy();
+        }, drainMs);
+        for (const res of inFlight) if (!res.headersSent) res.setHeader('Connection', 'close');
+        server.closeIdleConnections();
+        for (const res of streams.keys()) res.end(); streams.clear();
+        portal.drain();
+        await updateStream.close();
+        if (listener) { await listener; clearTimeout(forced); }
+        let grace; await Promise.race([Promise.allSettled([...handlers]), new Promise(resolve => { grace = setTimeout(resolve, HANDLER_GRACE_MS); })]); clearTimeout(grace);
+        const reported = finalReport();
+        closed = true; unsubscribe(); clearInterval(heartbeat); clearInterval(statsTimer); for (const timer of retries) clearTimeout(timer); retries.clear();
+        // A status read or module synchronization in flight gets COORDINATOR_CLOSE_MS; closing does not wait longer.
+        const coordinator = updates.close(); let bound;
+        const late = await Promise.race([coordinator.then(() => false), new Promise(resolve => { bound = setTimeout(() => resolve(true), COORDINATOR_CLOSE_MS); })]); clearTimeout(bound);
+        if (late) { log.warn({ type: 'shutdown' }, '更新协调器未在期限内结束，继续关闭'); coordinator.catch(error => log.warn({ err: error, type: 'shutdown' }, '更新协调器关闭失败')); }
+        portal.close(); await reported;
+      })();
+    },
   };
 }

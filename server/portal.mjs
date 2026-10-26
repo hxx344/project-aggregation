@@ -83,7 +83,8 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function') || !store) throw new Error('项目代理需要授权存储以及项目、版本和会话校验回调');
   // revoking: stored grants this process revoked whose row could not be deleted yet (busy database).
   const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
-  let closed = false;
+  // draining: the API is closing; upgraded connections and event streams end, other requests finish.
+  let closed = false, draining = false;
   const projectHost = id => `p-${digest(String(id)).slice(0, 24)}.${HUB_HOST}`;
 
   function requestContext(req) {
@@ -412,6 +413,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       try {
         if (!liveGrant(grant)) throw new PortalError(401, '项目访问授权已失效');
         if (automaticAuthFailed(incoming, grant, project, target, req.url)) { incoming.destroy(); sendAutomaticAuthFailure(res, context, grant); return; }
+        if (/^text\/event-stream\b/i.test(incoming.headers['content-type'] || '')) { stream.long = true; if (draining) { stream.destroy(); return; } }
         const headers = responseHeaders(incoming.headers, context, target, req.url, grant, incoming.statusCode);
         if (req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/logout' && incoming.statusCode >= 200 && incoming.statusCode < 300) {
           revokeGrant(grant); headers['set-cookie'] = [...(headers['set-cookie'] || []), clearPortalCookie(context)];
@@ -477,6 +479,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   async function handleUpgrade(req, socket, head) {
     socket.on('error', () => {});
     try {
+      if (draining) throw new PortalError(503, '项目代理已关闭');
       const context = requestContext(req);
       if ([HUB_HOST, 'localhost', '127.0.0.1'].includes(context.hostname)) return false;
       const project = getProjects().find(item => projectHost(item.id) === context.hostname);
@@ -485,6 +488,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       checkedPath(req.url); browserBoundary(req, context, { websocket: true });
       const grant = authorized(req, context, project);
       const target = await targetFor(project);
+      if (draining) throw new PortalError(503, '项目代理已关闭');
       if (!liveGrant(grant) || req.aborted || socket.destroyed) throw new PortalError(401, '项目访问授权已失效');
       const path = checkedProxyPath(target.base.pathname.replace(/\/$/, '') + req.url);
       const upstream = (target.base.protocol === 'https:' ? https : http).request(target.base, { ...(target.transport ? { socketPath: target.transport.socketPath, agent: false } : {}), method: 'GET', path, headers: requestHeaders(req, context, target, true, grant), lookup: (_host, options, callback) => options.all ? callback(null, [target.address]) : callback(null, target.address.address, target.address.family) });
@@ -492,7 +496,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       const connectionTimer = setTimeout(() => upstream.destroy(), connectTimeoutMs);
       upstream.once('socket', peerSocket => { if (!peerSocket.connecting) clearTimeout(connectionTimer); else peerSocket.once(target.base.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectionTimer)); });
       let peer;
-      const stream = { grant, destroy: () => { upstream.destroy(); peer?.destroy(); socket.destroy(); } }; active.add(stream);
+      const stream = { grant, long: true, destroy: () => { upstream.destroy(); peer?.destroy(); socket.destroy(); } }; active.add(stream);
       socket.once('close', () => { clearTimeout(timer); clearTimeout(connectionTimer); active.delete(stream); upstream.destroy(); peer?.destroy(); });
       upstream.once('upgrade', (response, targetSocket, targetHead) => {
         clearTimeout(timer); peer = targetSocket;
@@ -507,9 +511,10 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       });
       upstream.once('response', response => { response.resume(); stream.destroy(); });
       upstream.on('error', () => stream.destroy()); upstream.end();
-    } catch (error) { const status = error instanceof PortalError ? error.status : 502; socket.end(`HTTP/1.1 ${status} Proxy Request Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); }
+    } catch (error) { const status = error instanceof PortalError ? error.status : 502; socket.end(`HTTP/1.1 ${status} Proxy Request Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); socket.destroySoon(); }
     return true;
   }
 
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  function drain() { draining = true; for (const stream of active) if (stream.long) { stream.destroy(); active.delete(stream); } }
+  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,6 +13,7 @@ import { ensurePassword } from '../server/control/password.mjs';
 import { createRuntimeService } from '../server/runtime/service.mjs';
 import { createInProcessClient } from '../server/runtime/supervisor-client.mjs';
 import http from 'node:http';
+import net from 'node:net';
 import { createDataPlane, API_STATS_MAX_AGE_MS } from '../server/runtime/data-plane.mjs';
 import { createExecutionJobsReader } from '../server/control/execution-jobs.mjs';
 
@@ -53,7 +54,7 @@ async function fixture(t, { projectChanged = async () => { throw new Error('data
   await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${api.server.address().port}`;
   let closed = false;
-  t.after(async () => { if (!closed) await api.close(); await api.closeServer(); db.close(); await rm(dataDir, { recursive: true, force: true }); });
+  t.after(async () => { if (!closed) await api.close(); db.close(); await rm(dataDir, { recursive: true, force: true }); });
   const login = await fetch(origin + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify({ password: PASSWORD }) });
   const cookie = login.headers.get('set-cookie').split(';')[0], csrf = (await login.json()).csrfToken;
   const request = (route, { method = 'GET', body } = {}) => fetch(origin + route, { method,
@@ -97,6 +98,77 @@ test('a subscription whose first overview read outlasts shutdown or logout is re
 
 const settle = async (predicate, ms = 2000) => { const end = Date.now() + ms; while (!predicate() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 5)); };
 const failures = f => f.warnings.filter(entry => entry.message === '项目变更未能通知运行时');
+
+// A GET on its own keep-alive connection; resolves with the status, the Connection header and the body.
+const get = (f, route, agent) => new Promise((resolve, reject) => {
+  const req = http.get(f.origin + route, { agent, headers: { Cookie: f.cookie } }, res => { let body = ''; res.setEncoding('utf8'); res.on('data', chunk => { body += chunk; }); res.on('end', () => resolve({ status: res.statusCode, connection: res.headers.connection, body })); });
+  req.on('error', reject);
+});
+const settled = promise => Promise.race([promise.then(() => true, () => true), new Promise(resolve => setTimeout(() => resolve(false), 50))]);
+
+test('a closing API stops listening and ends its streams first, then lets the requests in flight finish on closing connections', { timeout: 10_000 }, async t => {
+  const f = await fixture(t);
+  const idle = new http.Agent({ keepAlive: true }), busy = new http.Agent({ keepAlive: true }); t.after(() => { idle.destroy(); busy.destroy(); });
+  assert.equal((await get(f, '/api/health', idle)).connection, 'keep-alive');
+  const idleSocket = Object.values(idle.freeSockets).flat()[0], idleClosed = once(idleSocket, 'close');
+  // An event stream whose headers went out as keep-alive: its connection still closes once it ends.
+  const streamAgent = new http.Agent({ keepAlive: true }); t.after(() => streamAgent.destroy());
+  const stream = get(f, '/api/overview/events', streamAgent);
+  while (!f.api.streamCount()) await new Promise(resolve => setTimeout(resolve, 5));
+  const streamSocket = Object.values(streamAgent.sockets).flat()[0], streamClosed = once(streamSocket, 'close');
+  const held = f.hold(); const inFlight = get(f, '/api/overview', busy); await held.started;
+  const closing = f.close();
+  await idleClosed;
+  assert.equal((await stream).status, 200); await streamClosed;
+  await assert.rejects(fetch(f.origin + '/api/health'), /fetch failed/);
+  assert.equal(await settled(closing), false, 'close waits for the request in flight');
+  held.release();
+  const reply = await inFlight; assert.equal(reply.status, 200); assert.equal(reply.connection, 'close');
+  await closing;
+  assert.deepEqual(counts(f).at(-1), [0, 0]);
+});
+
+test('a refused upgrade whose client keeps its side open does not hold the closing API', { timeout: 10_000 }, async t => {
+  const f = await fixture(t, { drainMs: 5000 });
+  const socket = net.connect({ port: new URL(f.origin).port, host: '127.0.0.1', allowHalfOpen: true }); t.after(() => socket.destroy());
+  socket.on('error', () => {});
+  const reply = new Promise(resolve => socket.once('data', resolve));
+  socket.write(`GET /ws HTTP/1.1\r\nHost: hub.localhost:${new URL(f.origin).port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`);
+  assert.match(String(await reply), /^HTTP\/1\.1 404/);
+  const started = performance.now(); await f.close();
+  assert.ok(performance.now() - started < 2000, 'close did not wait for the drain period');
+});
+
+test('a request still in flight after the drain period has its connection closed', { timeout: 10_000 }, async t => {
+  const f = await fixture(t, { drainMs: 100 });
+  const held = f.hold(); const refused = assert.rejects(get(f, '/api/overview', new http.Agent()), /socket hang up|ECONNRESET/); await held.started;
+  // The handler still waits for its read: close() gives it the 2 s grace, then goes on.
+  const started = performance.now(); await f.close(); held.release();
+  const elapsed = performance.now() - started; assert.ok(elapsed >= 1900 && elapsed < 5000, `close took ${elapsed} ms`);
+  await refused;
+  assert.ok(f.warnings.some(entry => entry.message === '在途请求未在期限内结束，已关闭其连接' && entry.fields.requests === 1));
+});
+
+test('a hashed asset missing from this release is served from the current or previous release only', async t => {
+  const appDir = await mkdtemp(path.join(os.tmpdir(), 'hub-releases-')); t.after(() => rm(appDir, { recursive: true, force: true }));
+  const release = name => path.join(appDir, 'releases', name);
+  const [own, newer, older, stray] = ['aaaaaaaaaaaa-aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbb-bbbbbbbbbbbbbbbb', 'cccccccccccc-cccccccccccccccc', 'dddddddddddd-dddddddddddddddd'];
+  for (const name of [own, newer, older, stray]) await mkdir(path.join(release(name), 'dist', 'assets'), { recursive: true });
+  await writeFile(path.join(release(own), 'dist', 'index.html'), 'own index');
+  await writeFile(path.join(release(newer), 'dist', 'assets', 'app-new.js'), 'newer');
+  await writeFile(path.join(release(older), 'dist', 'assets', 'app-old.js'), 'older');
+  await writeFile(path.join(release(stray), 'dist', 'assets', 'app-stray.js'), 'stray');
+  await symlink(release(stray) + '/dist/assets/app-stray.js', path.join(release(newer), 'dist', 'assets', 'linked.js'));
+  await symlink(release(newer), path.join(appDir, 'current')); await symlink(release(older), path.join(appDir, 'previous'));
+  const f = await fixture(t, { distDir: path.join(release(own), 'dist') });
+  const read = route => new Promise((resolve, reject) => {
+    http.get(f.origin + route, { headers: { Host: `hub.localhost:${new URL(f.origin).port}` } }, res => { let body = ''; res.setEncoding('utf8'); res.on('data', chunk => { body += chunk; }); res.on('end', () => resolve([res.statusCode, body])); }).on('error', reject);
+  });
+  assert.deepEqual(await read('/assets/app-new.js'), [200, 'newer']);
+  assert.deepEqual(await read('/assets/app-old.js'), [200, 'older']);
+  for (const route of ['/assets/app-stray.js', '/assets/linked.js', '/assets/..%2Freleases%2Fapp.js', '/app-new.js']) assert.equal((await read(route))[0], 404, route);
+  assert.deepEqual(await read('/settings'), [200, 'own index']);
+});
 
 test('project writes succeed, retry the change notice and log the reason once it is given up', async t => {
   const f = await fixture(t);
