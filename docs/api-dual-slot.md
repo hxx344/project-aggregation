@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS login_pending (id TEXT PRIMARY KEY, account TEXT NOT 
 | 成功 | 校验后若已被并发失败锁定仍拒绝；否则清零失败数、退回 IP 预占 | 一个事务内删除 `login_pending` 行、复核锁定、清零并把 IP 计数减一 |
 | 过期 | 失败在首次失败后 `accountLockoutMs` 过期，锁在截止时刻过期 | 相同，判定时一并删除；有未过期的 `login_pending` 行时不删账户行 |
 
-进程崩溃时预占无法退回：IP 计数留到窗口结束，与现状一致，均为失败关闭；`login_pending` 行带 30 s 期限（远大于一次密码校验的耗时），期满仍未结束的校验（进程崩溃，或记录结果的写入失败）计为一次失败，之后迟到的结果不再重复计数。锁定检查与 IP 预占合并为一个事务，已能在只读查询中判定的拒绝（已锁定、IP 配额用尽）不取写锁。各槽的 `loginWindowMs`、`accountLockoutMs` 来自同一环境文件。
+进程崩溃时预占无法退回：IP 计数留到窗口结束，与现状一致，均为失败关闭；`login_pending` 行带 30 s 期限（远大于一次密码校验的耗时），期满仍未结束的校验（进程崩溃，或记录结果的写入失败，密码正确时也一样）按租约到期时刻计为一次失败，由此触发的锁定同样记 `account_locked` 日志，之后迟到的结果不再重复计数。锁定检查与 IP 预占合并为一个事务，已能在只读查询中判定的拒绝（已锁定、IP 配额用尽）不取写锁。各槽的 `loginWindowMs`、`accountLockoutMs` 来自同一环境文件。
 
 账户仍为单账户 `global`；错误文案、状态码与日志字段不变。
 

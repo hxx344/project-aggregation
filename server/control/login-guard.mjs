@@ -30,32 +30,40 @@ export function createLoginGuard({ db, stmt }, { loginWindowMs, accountLockoutMs
       .run(account, failed, firstFailureAt, until);
     return { failed, lockedUntil: until, lockedNow: until > 0 };
   }
-  // Expired checks become failures. A lock expires at its deadline; unlocked
-  // failures expire one lockout period after the first one. A record with a
-  // check in flight stays, so that check's failure still counts against it.
+  const stale = (row, at) => row.until ? row.until <= at : at - row.first_failure_at >= accountLockoutMs;
+  // A lock expires at its deadline; unlocked failures expire one lockout period
+  // after the first one. A record with a check in flight stays, so that check's
+  // failure still counts against it. Lapsed checks become failures at the moment
+  // their lease ended, however late this runs. Returns the account's record and
+  // whether a lapsed check set the lock in force.
   function expire(account, now) {
-    const lapsed = stmt.prepare('SELECT account, COUNT(*) AS n FROM login_pending WHERE expires<=? GROUP BY account').all(now);
-    stmt.prepare('DELETE FROM login_pending WHERE expires<=?').run(now);
-    for (const item of lapsed) addFailures(item.account, item.n, now);
-    const row = guardRow(account);
-    if (row && !pending(account, now) && (row.until ? row.until <= now : now - row.first_failure_at >= accountLockoutMs)) {
-      stmt.prepare('DELETE FROM login_account_guard WHERE account=?').run(account);
-      return null;
+    let lockedNow = false;
+    for (const lapsed of stmt.prepare('DELETE FROM login_pending WHERE expires<=? RETURNING account, expires').all(now).sort((x, y) => x.expires - y.expires)) {
+      const row = guardRow(lapsed.account);
+      if (row && stale(row, lapsed.expires)) stmt.prepare('DELETE FROM login_account_guard WHERE account=?').run(lapsed.account);
+      const result = addFailures(lapsed.account, 1, lapsed.expires);
+      if (lapsed.account === account && result.lockedNow && result.lockedUntil > now) lockedNow = true;
     }
-    return row || null;
+    const row = guardRow(account);
+    if (row && !pending(account, now) && stale(row, now)) {
+      stmt.prepare('DELETE FROM login_account_guard WHERE account=?').run(account);
+      return { row: null, lockedNow: false };
+    }
+    return { row: row || null, lockedNow };
   }
   const ipExhausted = (row, now) => row && row.until >= now && row.count >= IP_ATTEMPT_LIMIT;
   return {
-    // Admits a login attempt before its body is read: { locked: until } when the
-    // account is locked, { limited: true } when the IP's quota is used up, otherwise
-    // the counted attempt { ip, until }. Refusals visible without the write lock skip it.
+    // Admits a login attempt before its body is read: { locked: until, lockedNow }
+    // when the account is locked (lockedNow: a lapsed check just locked it),
+    // { limited: true } when the IP's quota is used up, otherwise the counted
+    // attempt { ip, until }. Refusals visible without the write lock skip it.
     admit: (account, ip, now) => {
       const row = guardRow(account);
-      if (lockedUntil(row) > now) return { locked: row.until };
+      if (lockedUntil(row) > now) return { locked: row.until, lockedNow: false };
       if (ipExhausted(ipRow(ip), now)) return { limited: true };
       return immediate(db, () => {
         const current = expire(account, now);
-        if (lockedUntil(current) > now) return { locked: current.until };
+        if (lockedUntil(current.row) > now) return { locked: current.row.until, lockedNow: current.lockedNow };
         stmt.prepare('DELETE FROM login_ip_attempts WHERE until<?').run(now);
         const attempts = ipRow(ip);
         if (ipExhausted(attempts, now)) return { limited: true };
@@ -65,10 +73,11 @@ export function createLoginGuard({ db, stmt }, { loginWindowMs, accountLockoutMs
       });
     },
     // Takes one of the account's remaining failures for a password check:
-    // { locked: until }, { exhausted: true } or { id } to finish with failure(), success() or release().
+    // { locked: until, lockedNow } as admit() reports it, { exhausted: true } or { id }
+    // to finish with failure(), success() or release().
     reserveAccount: (account, now) => immediate(db, () => {
-      const row = expire(account, now);
-      if (lockedUntil(row) > now) return { locked: row.until };
+      const { row, lockedNow } = expire(account, now);
+      if (lockedUntil(row) > now) return { locked: row.until, lockedNow };
       if ((row?.failed || 0) + pending(account, now) >= ACCOUNT_LOCKOUT_THRESHOLD) return { exhausted: true };
       const id = randomUUID();
       stmt.prepare('INSERT INTO login_pending(id,account,expires) VALUES (?,?,?)').run(id, account, now + PENDING_MS);

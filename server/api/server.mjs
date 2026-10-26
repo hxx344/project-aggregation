@@ -233,16 +233,21 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       const ip = req.socket.remoteAddress || 'unknown'; const now = Date.now();
       const accountId = 'global'; // Single-account system
       const lockedError = until => new HttpError(429, `账户已被锁定，请 ${Math.ceil((until - Date.now()) / 60000)} 分钟后重试`);
+      // A check that never finished is counted when its lease expires, and may set the lock then.
+      const refuseLocked = ({ locked, lockedNow }) => {
+        if (lockedNow) log.error({ ip, type: 'account_locked', reason: 'lapsed_check' }, '账户已被锁定');
+        return lockedError(locked);
+      };
       // Reserve before reading the body: partial concurrent requests share one quota.
       const attempt = loginGuard.admit(accountId, ip, now);
-      if (attempt.locked) throw lockedError(attempt.locked);
+      if (attempt.locked) throw refuseLocked(attempt);
       if (attempt.limited) throw new HttpError(429, '登录尝试过多，请 15 分钟后重试');
       const body = await bodyOf(req);
 
       // Reserve an account slot after the body arrives, so held-open bodies cannot block logins,
       // and before hashing, so concurrent guesses cannot exceed the remaining failure budget.
       const reserved = loginGuard.reserveAccount(accountId, Date.now());
-      if (reserved.locked) throw lockedError(reserved.locked);
+      if (reserved.locked) throw refuseLocked(reserved);
       if (reserved.exhausted) throw new HttpError(429, '登录尝试过多，请稍后重试');
       let passwordValid;
       try {

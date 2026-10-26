@@ -9,10 +9,12 @@ import { createLoginGuard, ACCOUNT_LOCKOUT_THRESHOLD, IP_ATTEMPT_LIMIT } from '.
 
 const limits = { loginWindowMs: 15 * 60000, accountLockoutMs: 60000 };
 
+let dbPath;
 // Two API instances: separate connections to one hub.sqlite.
 async function instances(t) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'login-guard-'));
-  const dbs = [0, 1].map(() => openHubDatabase(path.join(dir, 'hub.sqlite')));
+  dbPath = path.join(dir, 'hub.sqlite');
+  const dbs = [0, 1].map(() => openHubDatabase(dbPath));
   t.after(async () => { for (const db of dbs) db.close(); await rm(dir, { recursive: true, force: true }); });
   return dbs.map(db => createLoginGuard(createControlStore(db), limits));
 }
@@ -29,8 +31,8 @@ test('failures alternating between instances lock the account on both', async t 
   }
   const last = b.failure(b.reserveAccount('global', now), now);
   assert.deepEqual(last, { failed: ACCOUNT_LOCKOUT_THRESHOLD, lockedUntil: now + limits.accountLockoutMs, lockedNow: true });
-  assert.deepEqual(a.admit('global', '10.0.0.1', now), { locked: now + limits.accountLockoutMs });
-  assert.deepEqual(a.reserveAccount('global', now), { locked: now + limits.accountLockoutMs });
+  assert.deepEqual(a.admit('global', '10.0.0.1', now), { locked: now + limits.accountLockoutMs, lockedNow: false });
+  assert.deepEqual(a.reserveAccount('global', now), { locked: now + limits.accountLockoutMs, lockedNow: false });
   const after = now + limits.accountLockoutMs;
   assert.deepEqual(b.admit('global', '10.0.0.1', after), { ip: '10.0.0.1', until: after + limits.loginWindowMs });
 });
@@ -53,11 +55,15 @@ test('a success is refused when another instance locked the account during its c
   const [a, b] = await instances(t);
   const now = Date.now();
   for (let i = 1; i < ACCOUNT_LOCKOUT_THRESHOLD; i++) b.failure(b.reserveAccount('global', now), now);
+  const counted = a.admit('global', '10.0.0.1', now);
   const checking = a.reserveAccount('global', now);
-  // The other instance cannot take a slot while this check holds the last one.
-  assert.deepEqual(b.reserveAccount('global', now), { exhausted: true });
-  assert.equal(a.failure(checking, now).lockedNow, true);
-  assert.equal(a.success(checking, attempt, now + 1), now + limits.accountLockoutMs);
+  for (let i = 1; i < IP_ATTEMPT_LIMIT; i++) b.admit('other', '10.0.0.1', now);
+  // The slow correct password outlives its lease: the other instance counts it as the fifth failure.
+  const expiry = now + 30_000;
+  assert.deepEqual(b.reserveAccount('global', expiry + 1), { locked: expiry + limits.accountLockoutMs, lockedNow: true });
+  assert.equal(a.success(checking, counted, expiry + 2), expiry + limits.accountLockoutMs);
+  // The refused success gave no IP attempt back.
+  assert.deepEqual(b.admit('other', '10.0.0.1', expiry + 2), { limited: true });
 });
 
 test('a check that never finished counts as a failure once its lease expires, and only once', async t => {
@@ -73,7 +79,31 @@ test('a check that never finished counts as a failure once its lease expires, an
   // The late result of a lapsed check is not counted again.
   assert.deepEqual(a.failure(stuck[0], expiry), { failed: ACCOUNT_LOCKOUT_THRESHOLD - 1, lockedUntil: 0, lockedNow: false });
   assert.deepEqual(b.failure(next, expiry), { failed: ACCOUNT_LOCKOUT_THRESHOLD, lockedUntil: expiry + limits.accountLockoutMs, lockedNow: true });
-  assert.deepEqual(a.admit('global', '10.0.0.1', expiry + 1), { locked: expiry + limits.accountLockoutMs });
+  assert.deepEqual(a.admit('global', '10.0.0.1', expiry + 1), { locked: expiry + limits.accountLockoutMs, lockedNow: false });
+});
+
+test('a check found lapsed long after its lease counts at its expiry, so an old lock does not apply', async t => {
+  const [a, b] = await instances(t);
+  const now = Date.now();
+  for (let i = 1; i < ACCOUNT_LOCKOUT_THRESHOLD; i++) a.failure(a.reserveAccount('global', now), now);
+  a.reserveAccount('global', now);
+  const later = now + 30_000 + limits.accountLockoutMs;
+  assert.deepEqual(b.admit('global', '10.0.0.1', later), { ip: '10.0.0.1', until: later + limits.loginWindowMs });
+  assert.ok(b.reserveAccount('global', later).id);
+});
+
+test('refusals visible without the write lock do not wait for it', async t => {
+  const [a] = await instances(t);
+  const now = Date.now();
+  for (let i = 0; i < ACCOUNT_LOCKOUT_THRESHOLD; i++) a.failure(a.reserveAccount('global', now), now);
+  for (let i = 0; i < IP_ATTEMPT_LIMIT; i++) a.admit('other', '10.0.0.1', now);
+  const holder = openHubDatabase(dbPath);
+  holder.exec('BEGIN IMMEDIATE');
+  t.after(() => { holder.exec('ROLLBACK'); holder.close(); });
+  const started = Date.now();
+  assert.deepEqual(a.admit('global', '10.0.0.2', now), { locked: now + limits.accountLockoutMs, lockedNow: false });
+  assert.deepEqual(a.admit('other', '10.0.0.1', now), { limited: true });
+  assert.ok(Date.now() - started < 1000);
 });
 
 test('the IP quota is shared and a success only refunds within its window', async t => {
