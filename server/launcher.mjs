@@ -7,9 +7,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // Initial design values (design doc 3.1): a crashed API restarts with this
 // backoff, which resets once an instance stayed up API_STABLE_MS; an API that
 // is not ready within API_READY_MS or does not stop within API_STOP_MS is
-// ended. The runtime gets no deadline here: the service manager's apply.
+// ended; API_STOP_MS covers the API's 60 s drain, like its unit's
+// TimeoutStopSec. The runtime gets no deadline here: the service manager's apply.
 const API_BACKOFF_MS = [1000, 2000, 4000, 8000, 16_000, 30_000];
-const API_STABLE_MS = 60_000, API_READY_MS = 60_000, API_STOP_MS = 30_000;
+const API_STABLE_MS = 60_000, API_READY_MS = 60_000, API_STOP_MS = 75_000;
 const running = child => child.exitCode === null && child.signalCode === null;
 
 // Runs the runtime and the API as two child processes of one service unit.

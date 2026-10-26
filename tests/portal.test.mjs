@@ -364,6 +364,34 @@ test('WebSockets reject missing grants and sibling Origins, and close after logo
 });
 
 
+test('draining ends upgraded connections and event streams, lets other requests finish and refuses new upgrades', async t => {
+  let slowArrived; const arrived = new Promise(resolve => { slowArrived = resolve; });
+  const f = await fixture(t, { onUpstream: (req, res) => {
+    if (req.url === '/slow-header') slowArrived();
+    if (req.url !== '/open-sse') return false;
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.write('data: first\n\n'); return true;
+  } });
+  const { cookie } = await f.authorize();
+  const headers = { Host: f.host('asset'), Cookie: cookie, Origin: `http://${f.host('asset')}`, Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': randomBytes(16).toString('base64'), 'Sec-WebSocket-Version': '13' };
+  const socket = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: f.port, path: '/ws', headers });
+    req.on('error', reject); req.on('response', res => reject(new Error(`Unexpected response ${res.statusCode}`)));
+    req.on('upgrade', (_res, upgraded) => { t.after(() => upgraded.destroy()); upgraded.on('error', () => {}); resolve(upgraded); }); req.end();
+  });
+  const stream = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: f.port, path: '/open-sse', headers: { Host: f.host('asset'), Cookie: cookie } }, res => res.once('data', () => resolve(res)));
+    req.on('error', reject); req.end();
+  });
+  const slow = f.request('/slow-header', { cookie });
+  await arrived;
+  const socketClosed = new Promise(resolve => socket.once('close', resolve)), streamClosed = new Promise(resolve => stream.once('close', resolve));
+  stream.on('error', () => {});
+  f.portal.drain();
+  await Promise.all([socketClosed, streamClosed]);
+  const finished = await slow; assert.equal(finished.status, 200); assert.equal(finished.body.toString(), 'completed');
+  assert.equal((await f.request('/ws', { cookie, headers })).status, 503);
+});
+
 test('asset page sync verifies its browser login and merges concurrent worker runs before returning real ledger', async t => {
   let calls = 0; let version = 0; let release;
   const gate = new Promise(resolve => { release = resolve; });

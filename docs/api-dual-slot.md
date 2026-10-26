@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `f3ea48d` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3.1、9.1、11 节与第 15 节的 M4；[控制面与数据面分离](control-data-plane-separation.md)（M3，已全部发布） |
 | 适用范围 | `server/api/`、`server/portal.mjs`、`server/control/`、`server/static-response.mjs`、`server/recovery/`、`server/update-service/registry.py`、`deploy/install.sh` 与相关测试 |
-| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；其余未实施。第 3、5.2、6 节保留原切流草案，须先按上位第 11 节修订并评审，不作为可直接实施的步骤 |
+| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；M4-3a 排空顺序与静态资源回退已实施（`git log --merges --grep M4-3a`）；其余未实施。第 3、5.2、6 节保留原切流草案，须先按上位第 11 节修订并评审，不作为可直接实施的步骤 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 9 节 |
 
 文中 `路径:行号` 均指上述基线，实施时以符号名重新定位。
@@ -143,6 +143,15 @@ CREATE INDEX IF NOT EXISTS idx_portal_grants_expires ON portal_grants(expires);
 
 单实例部署同样受益：关闭期间不再有请求撞上已关闭的 Portal。API 单元的 `TimeoutStopSec=75` 覆盖上述 60 s 加余量，不变。
 
+M4-3a 实施要点（`createApiServer().close()`，原 `closeServer()` 并入其中）：
+
+- 第 1 步对尚未写出响应头的在途请求补 `Connection: close`，此后每个响应结束时再关一次空闲连接；只调用 `server.close()` 时，响应头已发出的保活连接会留到 `keepAliveTimeout` 才断开。
+- 第 3 步是新增的 `portal.drain()`：只断开升级连接和响应类型为 `text/event-stream` 的代理流，排空期间到达的事件流与升级请求直接结束或返回 503；普通代理请求、自动登录与资产协调继续完成。第 5 步的 `portal.close()` 再结束其余部分。
+- 排空期间 `/api/ready` 返回 503，新的概览流返回 503；`/api/health` 不变。
+- 60 s 期限从 `close()` 开始计时，覆盖等待更新流读取的时间；期满时关闭剩余 HTTP 连接和已升级的套接字（`closeAllConnections()` 不处理后者，而 `server.close()` 会等它们），并记录一条警告与剩余数。被拒绝的升级请求写完响应即销毁套接字，不因客户端半开而拖住关闭。之后最多再等 2 s 让仍在执行的处理函数结束，再关协调器、数据库与锁；协调器收尾（进行中的状态读取与模块同步）最多再等 5 s；最坏合计约 60 + 2 + 5，在 75 s 内。
+- 单进程 `createApp` 的数据面随进程关闭：排空与数据面关闭并行，在途的导入、交易读取被取消后仍以其结果答复，不必等满 60 s。
+- 手动运行的启动器 `API_STOP_MS` 由 30 s 改为 75 s，与 API 单元的 `TimeoutStopSec` 一致，避免排空中的 API 被提前强杀。
+
 ### 5.2 端口复用与就绪标记
 
 以下变量仅为原草案，不是已批准实现。重新评审时保留槽、版本和进程身份核对，补每槽私有探针；是否使用端口复用随第 3 节决策，不允许用公共端口应答替代候选检查。
@@ -163,6 +172,8 @@ CREATE INDEX IF NOT EXISTS idx_portal_grants_expires ON portal_grants(expires);
 静态响应在自身 `dist/` 中找不到文件、且路径位于 Vite 产出的 `assets/` 目录时，依次在 `$APP_DIR/current/dist/` 与 `$APP_DIR/previous/dist/` 中查找，找到即返回。`assets/` 下的文件名含内容哈希，同名即同内容，跨版本返回不会混用不同内容。路径校验与现有规则相同（`server/api/server.mjs:436-441`），只查这两个固定目录，不跟随其他软链；`APP_DIR` 由版本目录的上两级得出，不来自请求。
 
 这也修复了现有问题：整体更新后仍开着的旧页面加载旧分包会 404。
+
+M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup`：只在 `<APP_DIR>/releases/<12 位提交>-<16 位键>/dist` 布局下生效（开发目录与 Windows 不查找）；`current`、`previous` 解析后须仍是 `releases/` 下的发布目录且不是自身；文件名只允许单段 `[A-Za-z0-9_.-]`，文件须是普通文件且真实路径不变，不跟随发布目录内的软链。
 
 ## 6 M4-4：双槽单元与安装器切换
 
