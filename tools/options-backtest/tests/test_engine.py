@@ -230,6 +230,16 @@ class EngineTest(unittest.TestCase):
                          [(FRIDAY_21 - 1, SUNDAY_08), (FRIDAY_21, SUNDAY_08), (SUNDAY_08, NEXT_FRIDAY_08), (SUNDAY_08 + 12, NEXT_FRIDAY_08)])
         self.assertAlmostEqual(fees, 6 * fee, places=2)  # opens: 2 Friday + Sunday 20:00; closes: 1 Sunday 08:00 + 2 next Friday
 
+    def test_beyond_finds_its_leg_by_spec_index_after_a_perp(self):
+        raw = {"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "expiry": {"weekday": "sun"},
+               "legs": [{"side": "buy", "type": "perp"}, {"side": "sell", "type": "put", "delta": 0.3},
+                        {"side": "buy", "type": "put", "delta": 0.1, "beyond": 1}]}
+        market = FakeMarket(flat())
+        position, _ = engine.open_position(market.chain(FRIDAY_21), FRIDAY_21, specs.validate(raw), market.perp(FRIDAY_21))
+        perp, short, wing = position.legs
+        self.assertTrue(perp.is_perp)
+        self.assertLess(wing.strike, short.strike)
+
     def test_max_loss_tolerates_float_quantities(self):
         legs = [engine.Leg(i, sign, SUNDAY_08, strike, True, qty, 0.0, 0.0, 0.5)
                 for i, (sign, strike, qty) in enumerate([(-1, 100.0, 0.1), (-1, 110.0, 0.2), (1, 120.0, 0.3)])]
@@ -263,6 +273,55 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(skipped, {"max_open": 2})
         self.assertEqual(engine.run(condor(), FakeMarket({FRIDAY_21 - 1: 40000.0, FRIDAY_21 + 1: 40000.0}))[1], {"no_data": 1})
 
+    def test_trend_picks_legs_by_the_trailing_mean(self):
+        raw = {"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "expiry": {"weekday": "sun"},
+               "trend": {"ma_days": 1}, "legs": [{"side": "sell", "type": "put", "delta": 0.3, "when": "above"},
+                                                 {"side": "sell", "type": "call", "delta": 0.3, "when": "below"}]}
+        spec = specs.validate(raw)
+
+        def market(before):
+            return FakeMarket({**{hour: before for hour in range(FRIDAY_21 - 30, FRIDAY_21)}, **flat()}, settlements={SUNDAY_08: 40000.0})
+
+        rising, falling = engine.run(spec, market(39000.0))[0], engine.run(spec, market(41000.0))[0]
+        self.assertEqual([(t["trend"], t["legs"][-1]) for t in rising + falling], [("above", "P"), ("below", "C")])
+        summary = report.summarize(rising, {}, (FRIDAY_21, SUNDAY_08))
+        self.assertEqual(summary["by_trend"], {"above": {"trades": 1, "pnl": rising[0]["pnl"], "wins": int(rising[0]["pnl"] > 0)}})
+        self.assertIn("by trend (1-day mean) above", "\n".join(report.text(spec, summary)))
+        above_only = specs.validate({**raw, "legs": raw["legs"][:1]})
+        self.assertEqual(engine.run(above_only, market(41000.0))[:2], ([], {"flat_below": 1}))
+        self.assertEqual(engine.run(spec, FakeMarket(flat(), settlements={SUNDAY_08: 40000.0}))[:2], ([], {"no_trend_data": 1}))
+        gappy = market(39000.0)
+        for hour in range(FRIDAY_21 - 20, FRIDAY_21 - 18):  # 2 of 24 hours missing still counts, the entry hour must exist
+            del gappy.forwards[hour]
+        self.assertEqual(engine.trend_state(gappy, FRIDAY_21, 1), "above")
+        del gappy.forwards[FRIDAY_21 - 1]
+        self.assertIsNone(engine.trend_state(gappy, FRIDAY_21, 1))
+        self.assertEqual(engine.trend_state(market(40000.0), FRIDAY_21, 1), "below")  # equal to the mean is not above
+        wavy = FakeMarket({hour: 40000.0 + 900 * math.sin(hour / 7) for hour in range(FRIDAY_21 - 80, NEXT_FRIDAY_08)
+                           if hour % 29 and not FRIDAY_21 + 70 <= hour < FRIDAY_21 + 74})  # scattered gaps and a 4-hour hole
+        for days in (1, 2):
+            window = engine.TrendWindow(wavy, days)
+            hours = [*range(FRIDAY_21, FRIDAY_21 + 60, 1), *range(FRIDAY_21 + 61, NEXT_FRIDAY_08, 9), FRIDAY_21 + 5]  # steps, jumps, back
+            states = [window.state(hour) for hour in hours]
+            self.assertEqual(states, [engine.trend_state(wavy, hour, days) for hour in hours])
+            self.assertEqual({None, "above", "below"}, set(states))
+        self.assertEqual(engine.run(specs.validate({k: v for k, v in raw.items() if k != "trend"} | {"legs": [raw["legs"][0] | {"when": None}]}),
+                                    market(41000.0))[0][0]["trend"], None)
+
+    def test_trend_flip_closes_the_perp_instead_of_holding_it(self):
+        def spec(below_side):
+            return specs.validate({"start": "2024-01-06", "end": "2024-01-07", "entry": {"hours": [8]}, "expiry": {"dte": 1}, "trend": {"ma_days": 1},
+                                   "legs": [{"side": "buy", "type": "perp", "when": "above"}, {"side": "sell", "type": "call", "delta": 0.3, "when": "above"},
+                                            {"side": below_side, "type": "perp", "when": "below"}, {"side": "sell", "type": "put", "delta": 0.3, "when": "below"}]})
+
+        forwards = {hour: 39000.0 if hour < SATURDAY_08 else 41000.0 if hour < SUNDAY_08 else 38000.0
+                    for hour in range(SATURDAY_08 - 30, NEXT_FRIDAY_08 + 1)}
+        market = FakeMarket(forwards, settlements={SUNDAY_08: 38000.0, NEXT_FRIDAY_08: 38000.0})
+        flipped, held = engine.run(spec("sell"), market)[0], engine.run(spec("buy"), market)[0]
+        self.assertEqual([(t["trend"], t["exit_hour"]) for t in flipped], [("above", SUNDAY_08), ("below", NEXT_FRIDAY_08)])
+        self.assertRegex(flipped[1]["legs"], r"^-1 \w+-PERP")
+        self.assertAlmostEqual(sum(t["fees"] for t in flipped) - sum(t["fees"] for t in held), 2 * 0.0005 * 38000.0, places=2)
+
 
 class SpecTest(unittest.TestCase):
     def test_defaults_and_errors(self):
@@ -272,7 +331,15 @@ class SpecTest(unittest.TestCase):
         for bad, message in [({"legz": []}, "unknown keys"), ({"legs": []}, "non-empty"),
                              ({"legs": [{"side": "sell", "type": "call", "delta": 1.5}]}, "delta"),
                              ({"legs": [{"side": "buy", "type": "put", "delta": 0.1, "beyond": 0}]}, "beyond"),
-                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3}], "fill": "best"}, "fill")]:
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3}], "fill": "best"}, "fill"),
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3, "when": "above"}]}, "needs trend.ma_days"),
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3}], "trend": {"ma_days": 50}}, "needs at least one leg with when"),
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3, "when": "up"}], "trend": {"ma_days": 50}}, "above or below"),
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3, "when": "above"}], "trend": {"ma_days": 0.5}}, "integer"),
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3, "when": "above"},
+                                        {"side": "buy", "type": "put", "delta": 0.1, "beyond": 0, "when": "below"}], "trend": {"ma_days": 50}}, "same trend state"),
+                             ({"legs": [{"side": "sell", "type": "put", "delta": 0.3, "when": "above"}, {"side": "buy", "type": "perp", "when": "below"}],
+                               "trend": {"ma_days": 50}}, "below the mean need at least one option leg")]:
             with self.assertRaisesRegex(specs.SpecError, message):
                 specs.validate(bad)
 
@@ -289,11 +356,12 @@ class SpecTest(unittest.TestCase):
         self.assertEqual(specs.load('{"name": "inline"}'), {"name": "inline"})
 
     def test_written_spec_reruns_and_compact_dates(self):
+        for spec in (condor(), specs.validate(specs.load("trend_premium"))):
+            with tempfile.TemporaryDirectory() as folder:
+                report.write(Path(folder), spec, [], {})
+                again = specs.validate(specs.load(str(Path(folder) / "spec.json")))
+            self.assertEqual(again, spec)
         spec = condor()
-        with tempfile.TemporaryDirectory() as folder:
-            report.write(Path(folder), spec, [], {})
-            again = specs.validate(specs.load(str(Path(folder) / "spec.json")))
-        self.assertEqual(again, spec)
         self.assertEqual(condor(end="20240105")["end_hour"], spec["end_hour"])
         for exact in ("2024-01-05T00:00", "2024-01-05t00", "2024-01-05 00:00"):
             self.assertEqual(condor(end=exact)["end_hour"], spec["end_hour"] - 23)

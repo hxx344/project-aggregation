@@ -22,10 +22,12 @@ DEFAULTS = {
     "fees": {"rate": 0.0003, "cap_pct": 0.07, "settle_rate": 0.00015, "settle_cap_pct": 0.125, "perp_rate": 0.0005},
     "exit": {"take_profit_pct": None, "stop_loss_pct": None, "close_hours_before_expiry": None},
     "max_open": 1,
+    "trend": {"ma_days": None},  # legs with `when` trade only above/below the perp's trailing mean
     "margin": {"mode": "regular", "mm_factor": 0.03, "max_im_factor": 0.10, "min_im_factor": 0.05, "liquidation_fee_rate": 0.002,
                "perp_im": 0.10},
 }
-LEG_DEFAULTS = {"side": None, "type": None, "delta": None, "qty": 1.0, "beyond": None, "expiry": None}
+LEG_DEFAULTS = {"side": None, "type": None, "delta": None, "qty": 1.0, "beyond": None, "expiry": None, "when": None}
+TRENDS = ("above", "below")
 
 
 class SpecError(ValueError):
@@ -161,14 +163,29 @@ def validate(raw):
         else:
             leg["delta"] = _number(leg["delta"], f"{where}.delta", 0, 1, open_low=True)
         leg["qty"] = _number(leg["qty"], f"{where}.qty", 0, 1000, open_low=True)
+        if leg["when"] not in (None, *TRENDS):
+            raise SpecError(f"{where}.when must be null, above or below")
         if leg["beyond"] is not None:
             if not isinstance(leg["beyond"], int) or not 0 <= leg["beyond"] < index or spec["legs"][leg["beyond"]].get("type") != leg["type"]:
                 raise SpecError(f"{where}.beyond must be the index of an earlier {leg['type']} leg")
+            if spec["legs"][leg["beyond"]].get("when") not in (None, leg["when"]):
+                raise SpecError(f"{where}.beyond must point at a leg traded in the same trend state")
         leg["expiry"] = None if leg["expiry"] is None else _expiry_rule(leg["expiry"], f"{where}.expiry")
         legs.append(leg)
     spec["legs"] = legs
     if all(leg["type"] == "perp" for leg in legs):
         raise SpecError("legs need at least one option leg; perp legs close at its expiry")
+    trend = spec["trend"] = _merge(DEFAULTS["trend"], spec["trend"], "trend")
+    days = trend["ma_days"]
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 400):
+        raise SpecError("trend.ma_days must be an integer number of days in [1, 400] or null")
+    conditional = any(leg["when"] for leg in legs)
+    if conditional != (days is not None):
+        raise SpecError("legs.N.when needs trend.ma_days, and trend.ma_days needs at least one leg with when")
+    for state in TRENDS if conditional else ():
+        active = [leg for leg in legs if leg["when"] in (None, state)]
+        if active and all(leg["type"] == "perp" for leg in active):
+            raise SpecError(f"legs traded {state} the mean need at least one option leg")
     spec["qty"] = _number(spec["qty"], "qty", 0, 1000, open_low=True)
     if spec["fill"] not in FILLS:
         raise SpecError(f"fill must be one of {FILLS}")

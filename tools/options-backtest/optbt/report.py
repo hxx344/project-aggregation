@@ -47,6 +47,13 @@ def summarize(trades, skipped, window):
         "fallback_fill_rate": round(sum(trade["fallback_fills"] for trade in trades) / fills, 4) if fills else 0.0,
         "by_year": by_year,
     })
+    if any(trade.get("trend") for trade in trades):
+        by_trend = summary["by_trend"] = {}
+        for trade in trades:
+            row = by_trend.setdefault(trade["trend"], {"trades": 0, "pnl": 0.0, "wins": 0})
+            row["trades"] += 1
+            row["pnl"] = round(row["pnl"] + trade["pnl"], 2)
+            row["wins"] += trade["pnl"] > 0
     if any(trade.get("perp_pnl") or trade.get("funding") for trade in trades):
         summary["perp_pnl"] = round(sum(trade.get("perp_pnl", 0.0) for trade in trades), 2)
         summary["funding"] = round(sum(trade.get("funding", 0.0) for trade in trades), 2)
@@ -73,12 +80,15 @@ def text(spec, summary):
         *([f"perp leg price {money(s['perp_pnl'])}  funding paid {money(s['funding'])}  options and all fees {money(s['options_pnl'])}"]
           if "perp_pnl" in s else []),
         "by year " + " | ".join(f"{year} {money(row['pnl'])} ({row['trades']}, win {row['wins'] / row['trades']:.0%})" for year, row in s["by_year"].items()),
+        *([f"by trend ({spec['trend']['ma_days']}-day mean) " + " | ".join(
+            f"{state} {money(row['pnl'])} ({row['trades']}, win {row['wins'] / row['trades']:.0%})" for state, row in sorted(s["by_trend"].items()))]
+          if "by_trend" in s else []),
     ]
     return lines
 
 
 TRADE_FIELDS = ["entry", "exit", "reason", "legs", "deltas", "forward", "settlement", "credit", "fees", "pnl", "margin", "max_loss",
-                "worst_open_pnl", "fallback_fills", "missing_hours", "perp_pnl", "funding"]
+                "worst_open_pnl", "fallback_fills", "missing_hours", "perp_pnl", "funding", "trend"]
 
 
 def write(directory, spec, trades, summary):
