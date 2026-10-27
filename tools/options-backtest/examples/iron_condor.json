@@ -1,0 +1,13 @@
+{
+  "name": "iron-condor-live",
+  "description": "Live strategy: Friday 21:00 UTC, Sunday expiry, short 0.45-delta call/put, long 0.10-delta wings",
+  "entry": {"weekdays": ["fri"], "hours": [21]},
+  "expiry": {"weekday": "sun"},
+  "legs": [
+    {"side": "sell", "type": "call", "delta": 0.45},
+    {"side": "sell", "type": "put", "delta": 0.45},
+    {"side": "buy", "type": "call", "delta": 0.10, "beyond": 0},
+    {"side": "buy", "type": "put", "delta": 0.10, "beyond": 1}
+  ],
+  "fill": "mid"
+}

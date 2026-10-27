@@ -347,6 +347,20 @@ jobs:
         if: ${{ !cancelled() }}
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_LAB_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-entropy-lighter-lab-systemd.sh
 
+  options-backtest:
+    name: Options backtest engine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Standard-library tests (engine, spec, report)
+        run: python3 -m unittest discover -s tools/options-backtest/tests -v
+      - name: Data-layer tests with the pinned numpy/pyarrow
+        run: |
+          python3 -m venv "$RUNNER_TEMP/optbt"
+          "$RUNNER_TEMP/optbt/bin/pip" install --quiet --only-binary :all: -r tools/options-backtest/requirements.txt
+          "$RUNNER_TEMP/optbt/bin/python" -m unittest discover -s tools/options-backtest/tests -v
+
   release-mirror:
     name: Release mirror (real Nginx and verified downloads)
     runs-on: ubuntu-24.04

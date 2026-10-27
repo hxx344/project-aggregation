@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run the options backtester, creating its private venv (numpy + pyarrow) on first use.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+venv=${OPTBT_VENV:-$HOME/.local/share/options-backtest/venv}
+if [ ! -x "$venv/bin/python" ] || ! cmp -s "$here/requirements.txt" "$venv/requirements.txt"; then
+  echo "[bt] preparing $venv" >&2
+  if command -v uv >/dev/null 2>&1; then
+    UV_NO_CONFIG=1 uv venv -q --allow-existing --python "${OPTBT_PYTHON:-python3}" --no-python-downloads "$venv"
+    UV_NO_CONFIG=1 uv pip install -q --python "$venv/bin/python" --only-binary :all: -r "$here/requirements.txt"
+  else
+    "${OPTBT_PYTHON:-python3}" -m venv "$venv"
+    "$venv/bin/python" -m pip install -q --only-binary :all: -r "$here/requirements.txt"
+  fi
+  cp "$here/requirements.txt" "$venv/requirements.txt"
+fi
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec "$venv/bin/python" -m optbt "$@"

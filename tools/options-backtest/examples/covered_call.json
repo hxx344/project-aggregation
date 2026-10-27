@@ -1,0 +1,24 @@
+{
+  "name": "covered-call-perp",
+  "description": "Covered call with a long Binance BTCUSDT perp instead of spot: daily 08:00 UTC roll, long 1 perp + short 0.3-delta call, ~7 DTE; funding included",
+  "entry": {
+    "hours": [
+      8
+    ]
+  },
+  "expiry": {
+    "dte": 7
+  },
+  "legs": [
+    {
+      "side": "buy",
+      "type": "perp"
+    },
+    {
+      "side": "sell",
+      "type": "call",
+      "delta": 0.3
+    }
+  ],
+  "fill": "mid"
+}
