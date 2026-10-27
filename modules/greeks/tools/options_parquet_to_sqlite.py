@@ -358,10 +358,124 @@ def slim(args):
     return 0
 
 
+ERF = np.frompyfunc(math.erf, 1, 1)
+DTE_EDGES = [0, 1, 3, 7, 30, 90, math.inf]
+DELTA_EDGES = [0, 0.1, 0.25, 0.4, 0.6, 1.01]
+
+
+def black(forward, strike, years, iv, is_call):
+    """Undiscounted Black-76 USD price and delta."""
+    sd = iv * np.sqrt(years)
+    d1 = np.log(forward / strike) / sd + sd / 2
+    n1 = 0.5 + 0.5 * ERF(d1 / math.sqrt(2)).astype("float64")
+    n2 = 0.5 + 0.5 * ERF((d1 - sd) / math.sqrt(2)).astype("float64")
+    call = forward * n1 - strike * n2
+    return np.where(is_call, call, call - forward + strike), np.where(is_call, n1, n1 - 1)
+
+
+def stats(values):
+    values = np.abs(values[np.isfinite(values)])
+    return (float(np.median(values)), float(np.percentile(values, 95))) if values.size else (math.nan, math.nan)
+
+
+def verify(args):
+    """Rebuild every raw quote from the smile cache and compare with the raw mark/bid/ask."""
+    files = files_in(args.directory)
+    columns = detect(pq.read_schema(files[0]).names, dict(args.map))
+    require(columns)
+    db = sqlite3.connect(f"file:{Path(args.db).resolve().as_posix()}?mode=ro", uri=True)
+    rows = db.execute("SELECT hour, expiry, forward, atm_iv, nodes FROM smiles ORDER BY hour, expiry").fetchall()
+    keys = np.array([h * 1_000_000 + e for h, e, *_ in rows], dtype="int64")
+    smile_forward = np.array([row[2] for row in rows], dtype="float64") / 100
+    smile_atm = np.array([row[3] for row in rows], dtype="float64") / 10000
+    smile_nodes = np.frombuffer(b"".join(row[4] for row in rows), "<u2").reshape(len(rows), NODES.size).astype("float64") / 10000
+    rng = np.random.default_rng(0)
+    coverage = np.zeros((len(DTE_EDGES) - 1, 3), dtype="int64")  # no smile, outside stored nodes, rebuilt
+    samples = []
+    for path in files:
+        _, data = load(path, columns)
+        names = {name.lower(): name for name in pq.read_schema(path).names}
+        prices = {role: names[name] for role, name in (("mark", "mark_price"), ("bid", "bid_price"), ("ask", "ask_price"),
+                                                       ("bid", "best_bid_price"), ("ask", "best_ask_price")) if name in names}
+        if prices:
+            table = pq.read_table(path, columns=sorted(set(prices.values())))
+            data.update({f"{role}_price": numbers(table[column]) for role, column in prices.items()})
+        data = latest_per_hour(data)
+        expiry_hour = np.round(data["expiry"] / 3600)
+        label_years = (expiry_hour - data["hour"]) / 8760
+        ok = (label_years > 0.5 / 8760) & np.isfinite(data["iv"]) & (data["iv"] > 0.01) & (data["iv"] < 5) & (data["forward"] > 0)
+        data = {key: value[ok] for key, value in data.items()}
+        expiry_hour, label_years = expiry_hour[ok], label_years[ok]
+        dte = np.digitize(label_years * 365, DTE_EDGES) - 1
+        wanted = data["hour"].astype("int64") * 1_000_000 + expiry_hour.astype("int64")
+        position = np.clip(np.searchsorted(keys, wanted), 0, max(keys.size - 1, 0))
+        found = (keys[position] == wanted) if keys.size else np.zeros(wanted.size, bool)
+        forward, atm = smile_forward[position], smile_atm[position]
+        z = np.log(data["strike"] / forward) / (atm * np.sqrt(label_years))
+        node = (z - NODES[0]) / (NODES[1] - NODES[0])
+        low = np.clip(np.floor(node).astype("int64"), 0, NODES.size - 2)
+        weight = node - low
+        iv_low, iv_high = smile_nodes[position, low], smile_nodes[position, low + 1]
+        rebuilt = found & (node >= 0) & (node <= NODES.size - 1) & (iv_low > 0) & (iv_high > 0)
+        np.add.at(coverage, (dte, np.where(~found, 0, np.where(rebuilt, 2, 1))), 1)
+        picked = np.flatnonzero(rebuilt)
+        if picked.size > args.sample:
+            picked = np.sort(rng.choice(picked, args.sample, replace=False))
+        pick = lambda values: values[picked]
+        k, call, mark_iv, own_forward = pick(data["strike"]), pick(data["is_call"]), pick(data["iv"]), pick(data["forward"])
+        actual_years = (pick(data["expiry"]) - pick(data["time"])) / (365 * 86400)
+        smile_iv = pick(iv_low) * (1 - pick(weight)) + pick(iv_high) * pick(weight)
+        formula, delta = black(own_forward, k, actual_years, mark_iv, call)
+        steps = [formula,
+                 black(own_forward, k, pick(label_years), mark_iv, call)[0],
+                 black(pick(forward), k, pick(label_years), mark_iv, call)[0],
+                 black(pick(forward), k, pick(label_years), smile_iv, call)[0]]
+        to_usd = lambda name: pick(data[name]) * (own_forward if np.nanmedian(data[name]) < 5 else 1) if name in data else np.full(picked.size, math.nan)
+        mark, bid, ask = to_usd("mark_price"), to_usd("bid_price"), to_usd("ask_price")
+        quoted = (bid > 0) & (ask >= bid)
+        samples.append({"dte": pick(dte), "delta": np.abs(delta), "iv_error": smile_iv - mark_iv,
+                        "reference": np.where(np.isfinite(mark), mark, formula), "rebuilt": steps[-1], "steps": steps,
+                        "mark": mark, "spread": np.where(quoted, ask - bid, math.nan),
+                        "inside": np.where(quoted, (steps[-1] >= bid) & (steps[-1] <= ask), math.nan)})
+        print(f"  {path.name}: {int(ok.sum()):,} quotes, {int(rebuilt.sum()):,} rebuilt, {picked.size:,} sampled")
+    joined = {key: np.concatenate([sample[key] for sample in samples]) for key in samples[0] if key != "steps"}
+    steps = [np.concatenate([sample["steps"][i] for sample in samples]) for i in range(4)]
+    labels = [f"{DTE_EDGES[i]:g}-{DTE_EDGES[i + 1]:g}d" for i in range(len(DTE_EDGES) - 1)]
+    print("\ncoverage by DTE (share of raw quotes the cache can rebuild; the rest are beyond +-3 sd or have no smile):")
+    for label, (missing, outside, ok_count) in zip(labels, coverage):
+        total = missing + outside + ok_count
+        if total:
+            print(f"  {label:>8}: {total:>10,} quotes, {ok_count / total:6.1%} rebuilt, {outside / total:6.1%} beyond stored nodes, {missing / total:6.1%} no smile")
+    has_mark = np.isfinite(joined["mark"]).any()
+    print("\nerror sources, |USD| median / p95 per step:")
+    sources = ([("Black-76(mark_iv) vs raw mark_price", steps[0] - joined["mark"])] if has_mark else []) + [
+        ("snapshot time -> hour label T", steps[1] - steps[0]), ("own forward -> cached forward", steps[2] - steps[1]),
+        ("mark_iv -> smile IV", steps[3] - steps[2]), ("total vs " + ("raw mark_price" if has_mark else "Black-76(mark_iv)"), joined["rebuilt"] - joined["reference"])]
+    for name, values in sources:
+        print(f"  {name:<38} {stats(values)[0]:>9.2f} / {stats(values)[1]:>9.2f}")
+    print("\nrebuilt vs reference by DTE x |delta|: IV error (vol pts) median|abs| / p95|abs| / bias, USD median|abs| / p95|abs|, "
+          "error / bid-ask spread median / p95, rebuilt price inside bid-ask")
+    error = joined["rebuilt"] - joined["reference"]
+    delta_bucket = np.digitize(joined["delta"], DELTA_EDGES) - 1
+    for d in range(len(DTE_EDGES) - 1):
+        for b in range(len(DELTA_EDGES) - 1):
+            mask = (joined["dte"] == d) & (delta_bucket == b)
+            if mask.sum() < 20:
+                continue
+            iv_error = joined["iv_error"][mask] * 100
+            usd, ratio = stats(error[mask]), stats(error[mask] / joined["spread"][mask])
+            inside = joined["inside"][mask]
+            inside = f"{np.nanmean(inside):6.1%}" if np.isfinite(inside).any() else "     -"
+            print(f"  {labels[d]:>8} delta {DELTA_EDGES[b]:.2f}-{min(DELTA_EDGES[b + 1], 1):.2f} n={int(mask.sum()):>7,}  "
+                  f"iv {stats(iv_error)[0]:5.2f} / {stats(iv_error)[1]:5.2f} / {np.mean(iv_error):+5.2f}  "
+                  f"usd {usd[0]:8.2f} / {usd[1]:8.2f}  spread {ratio[0]:5.2f} / {ratio[1]:5.2f}  inside {inside}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "convert", "slim"):
+    for name in ("inspect", "convert", "slim", "verify"):
         command = commands.add_parser(name)
         command.add_argument("directory", help="folder with YYYY-MM.parquet files")
         command.add_argument("--map", action="append", default=[], type=lambda text: tuple(text.split("=", 1)),
@@ -373,8 +487,11 @@ def main(argv=None):
     slim_parser = commands.choices["slim"]
     slim_parser.add_argument("-o", "--output", default="options_hourly_slim", help="folder for the slimmed parquet files")
     slim_parser.add_argument("--max-dte", type=int, default=0, help="drop expiries further than this many days (0 = keep all)")
+    verify_parser = commands.choices["verify"]
+    verify_parser.add_argument("--db", default="btc_smiles.sqlite3", help="smile cache written by convert")
+    verify_parser.add_argument("--sample", type=int, default=20000, help="rebuilt quotes sampled per file for the error tables")
     args = parser.parse_args(argv)
-    return {"inspect": inspect, "convert": convert, "slim": slim}[args.command](args)
+    return {"inspect": inspect, "convert": convert, "slim": slim, "verify": verify}[args.command](args)
 
 
 if __name__ == "__main__":
