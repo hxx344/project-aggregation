@@ -52,7 +52,7 @@ class FakeMarket:
 
 def condor(**overrides):
     raw = specs.load("iron_condor")
-    raw.update(start="2024-01-05", end="2024-01-05", **overrides)
+    raw.update({"start": "2024-01-05", "end": "2024-01-05", **overrides})
     return specs.validate(raw)
 
 
@@ -126,6 +126,29 @@ class EngineTest(unittest.TestCase):
         self.assertEqual((trade["reason"], trade["exit_hour"]), ("stop_loss", FRIDAY_21 + 5))
         self.assertLessEqual(trade["pnl"], -0.5 * trade["credit"])
 
+    def test_cross_fills_pay_the_spread_on_entry_and_exit(self):
+        market = FakeMarket(flat(), settlements={SUNDAY_08: 40000.0})
+        spec = condor(fill="cross", exit={"close_hours_before_expiry": 3})
+        trade = engine.run(spec, market)[0][0]
+        position, _ = engine.open_position(market.chain(FRIDAY_21), FRIDAY_21, spec)
+        credit = cash = fees = 0.0
+        for leg in position.legs:
+            opening = market.quote(FRIDAY_21, SUNDAY_08, leg.strike, leg.is_call)
+            closing = market.quote(SUNDAY_08 - 3, SUNDAY_08, leg.strike, leg.is_call)
+            paid, received = (opening.ask, closing.bid) if leg.sign > 0 else (opening.bid, closing.ask)
+            credit -= leg.sign * paid
+            cash += leg.sign * received
+            fees += min(0.0003 * 40000.0, 0.07 * paid) + min(0.0003 * 40000.0, 0.07 * received)
+        self.assertEqual(trade["reason"], "time_exit")
+        self.assertAlmostEqual(trade["credit"], credit, places=2)
+        self.assertAlmostEqual(trade["pnl"], credit + cash - fees, places=2)
+
+    def test_max_loss_tolerates_float_quantities(self):
+        legs = [engine.Leg(i, sign, SUNDAY_08, strike, True, qty, 0.0, 0.0, 0.5)
+                for i, (sign, strike, qty) in enumerate([(-1, 100.0, 0.1), (-1, 110.0, 0.2), (1, 120.0, 0.3)])]
+        self.assertAlmostEqual(engine.max_loss(legs, 0.0), 0.1 * 20 + 0.2 * 10)
+        self.assertIsNone(engine.max_loss(legs[:2], 0.0))
+
     def test_fill_models_and_mark_fallback(self):
         quote = Quote(SUNDAY_08, 40000.0, True, 0, 40000.0, 0.5, 100.0, 90.0, 110.0)
         self.assertEqual(engine.fill_price(quote, True, "cross"), (110.0, False))
@@ -178,6 +201,15 @@ class SpecTest(unittest.TestCase):
         self.assertEqual(specs.parse_choices("null,0.5"), [None, 0.5])
         self.assertEqual(specs.load('{"name": "inline"}'), {"name": "inline"})
 
+    def test_written_spec_reruns_and_compact_dates(self):
+        spec = condor()
+        with tempfile.TemporaryDirectory() as folder:
+            report.write(Path(folder), spec, [], {})
+            again = specs.validate(specs.load(str(Path(folder) / "spec.json")))
+        self.assertEqual(again, spec)
+        self.assertEqual(condor(end="20240105")["end_hour"], spec["end_hour"])
+        self.assertEqual(condor(end="2024-01-05T00:00")["end_hour"], spec["end_hour"] - 23)
+
 
 class ReportTest(unittest.TestCase):
     def test_drawdown_and_summary(self):
@@ -210,7 +242,8 @@ class ParquetMarketTest(unittest.TestCase):
         boundary = int(datetime(2024, 2, 1, tzinfo=timezone.utc).timestamp())
         expiry = boundary + 2 * 86400 + 8 * 3600
         rows = {"jan": [(boundary - 30, 40000.0, True, 0.010), (boundary - 30, 40000.0, False, 0.011)],
-                "feb": [(boundary, 40000.0, True, 0.012), (boundary + 3000, 41000.0, True, 0.013)]}
+                "feb": [(boundary, 40000.0, True, 0.012), (boundary + 3000, 41000.0, True, 0.013),
+                        (boundary + 3000, 42000.0, True, math.nan)]}
         with tempfile.TemporaryDirectory() as folder:
             for name, month in (("jan", "2024-01"), ("feb", "2024-02")):
                 times, strikes, calls, marks = zip(*rows[name])
@@ -231,6 +264,7 @@ class ParquetMarketTest(unittest.TestCase):
                 self.assertEqual(chain[0].expiry, expiry // 3600)
                 self.assertIsNotNone(market.quote(hour + 1, expiry // 3600, 41000.0, True))
                 self.assertIsNone(market.quote(hour + 1, expiry // 3600, 40000.0, True))
+                self.assertIsNone(market.quote(hour + 1, expiry // 3600, 42000.0, True))  # no mark price
                 self.assertEqual(market.span(), (hour, hour + 1))
             self.assertTrue((Path(folder) / ".optbt-cache").is_dir())
 

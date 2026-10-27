@@ -67,6 +67,9 @@ def sweep_command(args):
     grid = [(path, specs.parse_choices(values)) for path, values in args.set]
     if not grid:
         sys.exit("sweep needs at least one --set PATH=V1,V2")
+    key = dict((label, field) for label, field, _ in COLUMNS).get(args.sort, args.sort)
+    if key not in {field for _, field, _ in COLUMNS}:
+        sys.exit(f"--sort must be one of {', '.join(label for label, _, _ in COLUMNS)}")
     combos = list(itertools.product(*(values for _, values in grid)))
     market = market_for(args)
     rows = []
@@ -78,7 +81,6 @@ def sweep_command(args):
         rows.append({**{path: value for path, value in sets}, **{key: summary.get(key) for _, key, _ in COLUMNS}})
         print(f"\r  {number}/{len(combos)}", end="", file=sys.stderr, flush=True)
     print(file=sys.stderr)
-    key = dict((label, field) for label, field, _ in COLUMNS).get(args.sort, args.sort)
     rows.sort(key=lambda row: (row.get(key) is None, -(row.get(key) or 0)))
     directory = out_dir(args, f"{raw.get('name', 'backtest')}-sweep")
     directory.mkdir(parents=True, exist_ok=True)

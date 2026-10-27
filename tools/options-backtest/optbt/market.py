@@ -1,4 +1,5 @@
 """Raw-quote market over monthly YYYY-MM.parquet files (output of `bt slim`), loaded lazily."""
+import hashlib
 import os
 import re
 from collections import OrderedDict
@@ -14,9 +15,10 @@ from .engine import Quote
 
 DEFAULT_DATA = os.environ.get("OPTBT_DATA", "~/data/options_hourly/BTC")
 # Parsed months are kept as .npy files next to the data and memory-mapped. A month's cache is
-# rebuilt when its parquet file's size or mtime changes, or when CACHE_VERSION is bumped
-# (bump it whenever _load's output changes).
+# rebuilt when its parquet file's size or mtime changes, when market.py or parquet.py changes
+# (CODE), or when CACHE_VERSION is bumped (bump it when the cache layout changes).
 CACHE_VERSION = 1
+CODE = hashlib.sha256(b"".join(Path(__file__).with_name(name).read_bytes() for name in ("market.py", "parquet.py"))).hexdigest()[:16]
 FLOAT32 = ("iv", "mark", "bid", "ask", "strike")
 STRIKE_BITS, OFFSET_BITS = 21, 14  # strike < 2.1M USD, expiry < 682 days after the quote hour
 COLUMNS = ("time", "forward", "iv", "mark", "bid", "ask")
@@ -60,7 +62,7 @@ class ParquetMarket:
     def _cached(self, path):
         folder = path.parent / ".optbt-cache" / f"v{CACHE_VERSION}" / path.stem
         stat = path.stat()
-        stamp = f"{stat.st_size}:{stat.st_mtime_ns}"
+        stamp = f"{stat.st_size}:{stat.st_mtime_ns}:{CODE}"
         try:
             if (folder / "source.txt").read_text() == stamp:
                 return {file.stem: np.load(file, mmap_mode="r") for file in folder.glob("*.npy")}
@@ -72,8 +74,14 @@ class ParquetMarket:
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "source.txt").unlink(missing_ok=True)
             for name, values in arrays.items():
-                np.save(folder / f"{name}.npy", values)
-            (folder / "source.txt").write_text(stamp)  # written last: marks the month complete
+                # Replace instead of overwrite: another bt process may have the old file memory-mapped.
+                temporary = folder / f".{name}.{os.getpid()}.tmp"
+                with open(temporary, "wb") as handle:
+                    np.save(handle, values)
+                os.replace(temporary, folder / f"{name}.npy")
+            temporary = folder / f".source.{os.getpid()}.tmp"
+            temporary.write_text(stamp)
+            os.replace(temporary, folder / "source.txt")  # written last: marks the month complete
         except OSError:
             return arrays  # read-only data folder: keep working uncached
         return {name: np.load(folder / f"{name}.npy", mmap_mode="r") for name in arrays}
@@ -90,11 +98,12 @@ class ParquetMarket:
         hour = data["hour"].astype("int64")
         expiry = np.round(data["expiry"] / 3600).astype("int64")
         strike = np.round(data["strike"]).astype("int64")
-        keep = (expiry >= hour) & (expiry - hour < 1 << OFFSET_BITS) & (strike > 0) & (strike < 1 << STRIKE_BITS) & (data["forward"] > 0)
+        mark = parquet.usd(data, "mark_price")
+        keep = (expiry >= hour) & (expiry - hour < 1 << OFFSET_BITS) & (strike > 0) & (strike < 1 << STRIKE_BITS) & (data["forward"] > 0) & np.isfinite(mark)
         arrays = {
             "key": encode(hour, expiry, strike, data["is_call"].astype("int64"))[keep],
             "time": data["time"][keep], "forward": data["forward"][keep], "iv": data["iv"][keep],
-            "mark": parquet.usd(data, "mark_price")[keep],
+            "mark": mark[keep],
             "bid": parquet.usd(data, "bid_price")[keep] if "bid_price" in data else np.full(int(keep.sum()), np.nan),
             "ask": parquet.usd(data, "ask_price")[keep] if "ask_price" in data else np.full(int(keep.sum()), np.nan),
             "strike": data["strike"][keep],

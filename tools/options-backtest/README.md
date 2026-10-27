@@ -50,7 +50,7 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 
 **价格**
 
-- 使用原始 `mark_price` / `bid_price` / `ask_price`。原始单位是 BTC，按该合约自己的远期价换算成美元。
+- 使用原始 `mark_price` / `bid_price` / `ask_price`，标记价缺失的报价丢弃。原始单位是 BTC，按该合约自己的远期价换算成美元。
 - 数据来自 Deribit，用来近似实盘所在的 Bybit。
 - 选腿时的 delta 用 `mark_iv` 和合约远期价，按 Black-76 现算。
 
@@ -77,7 +77,7 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 
 **保证金**
 
-- `regular` 模式用 Bybit 常规 Order IM 公式（同 `app/risk.py` 的 `short_order_margin`）。
+- `regular` 模式用 Bybit 常规 Order IM 公式（同 `app/risk.py` 的 `short_order_margin`），但标的价用合约远期价代替指数价（数据无指数价列）；手续费同样用远期价。
 - 摘要里的 `mean return/margin` 是每笔盈亏 ÷ 该笔保证金的平均值。
 
 **暂不支持**：Delta 对冲、成交量与冲击成本、提前行权（Deribit 期权是欧式，不涉及）。
@@ -91,7 +91,8 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 **月度缓存**：放在 `<数据目录>/.optbt-cache/v<版本>/YYYY-MM/`。以下任一情况会重建：
 
 - 对应 parquet 的大小或修改时间变化；
-- `market.py` 的 `CACHE_VERSION` 升级（`_load` 的输出改变时必须升级）。
+- `market.py` 或 `parquet.py` 的源码变化（按内容哈希判断）；
+- `market.py` 的 `CACHE_VERSION` 升级（缓存目录结构改变时升级）。
 
 **增加数据**：
 

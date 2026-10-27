@@ -2,6 +2,7 @@
 import copy
 import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -107,15 +108,22 @@ def _hour(value, where, end=False):
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     hour = int(moment.timestamp() // 3600)
-    return hour + 23 if end and len(str(value)) == 10 else hour
+    return hour + 23 if end and not re.search(r"[T ]", str(value)) else hour
+
+
+def _weekday(value, where):
+    """0-6 from a day name ("fri", "Friday") or an index, as written back to a result's spec.json."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 6:
+        return value
+    if str(value).lower()[:3] not in WEEKDAYS:
+        raise SpecError(f"{where} must be one of {WEEKDAYS}")
+    return WEEKDAYS.index(str(value).lower()[:3])
 
 
 def _expiry_rule(rule, where):
     rule = _merge(DEFAULTS["expiry"], rule, where)
     if rule["weekday"] is not None:
-        if str(rule["weekday"]).lower()[:3] not in WEEKDAYS:
-            raise SpecError(f"{where}.weekday must be one of {WEEKDAYS}")
-        rule["weekday"] = WEEKDAYS.index(str(rule["weekday"]).lower()[:3])
+        rule["weekday"] = _weekday(rule["weekday"], f"{where}.weekday")
     rule["dte"] = _number(rule["dte"], f"{where}.dte", 0, 800)
     rule["min_hours"] = _number(rule["min_hours"], f"{where}.min_hours", 0, 24 * 800)
     return rule
@@ -128,10 +136,9 @@ def validate(raw):
     spec["start_hour"], spec["end_hour"] = _hour(spec["start"], "start"), _hour(spec["end"], "end", end=True)
     entry = spec["entry"] = _merge(DEFAULTS["entry"], spec["entry"], "entry")
     if entry["weekdays"] is not None:
-        days = [str(day).lower()[:3] for day in entry["weekdays"]]
-        if not days or any(day not in WEEKDAYS for day in days):
+        if not isinstance(entry["weekdays"], list) or not entry["weekdays"]:
             raise SpecError(f"entry.weekdays must list days from {WEEKDAYS} (or be null for every day)")
-        entry["weekdays"] = sorted({WEEKDAYS.index(day) for day in days})
+        entry["weekdays"] = sorted({_weekday(day, "entry.weekdays") for day in entry["weekdays"]})
     hours = entry["hours"]
     if not isinstance(hours, list) or not hours or any(isinstance(h, bool) or not isinstance(h, int) or not 0 <= h <= 23 for h in hours):
         raise SpecError("entry.hours must be a non-empty list of UTC hours 0-23")

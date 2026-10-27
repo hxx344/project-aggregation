@@ -111,7 +111,7 @@ def max_loss(legs, credit):
     """Worst expiry loss for single-expiry structures; None when unbounded or calendar."""
     if len({leg.expiry for leg in legs}) != 1:
         return None
-    if sum(leg.sign * leg.qty for leg in legs if leg.is_call) < 0:
+    if sum(leg.sign * leg.qty for leg in legs if leg.is_call) < -1e-9:  # tolerate float qty sums like 0.1+0.2-0.3
         return None
     value = lambda s: sum(leg.sign * leg.qty * payoff(s, leg.strike, leg.is_call) for leg in legs)
     worst = min(value(s) for s in [0.0] + [leg.strike for leg in legs])
