@@ -208,7 +208,8 @@ class SpecTest(unittest.TestCase):
             again = specs.validate(specs.load(str(Path(folder) / "spec.json")))
         self.assertEqual(again, spec)
         self.assertEqual(condor(end="20240105")["end_hour"], spec["end_hour"])
-        self.assertEqual(condor(end="2024-01-05T00:00")["end_hour"], spec["end_hour"] - 23)
+        for exact in ("2024-01-05T00:00", "2024-01-05t00", "2024-01-05 00:00"):
+            self.assertEqual(condor(end=exact)["end_hour"], spec["end_hour"] - 23)
 
 
 class ReportTest(unittest.TestCase):

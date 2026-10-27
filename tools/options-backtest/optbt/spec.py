@@ -108,7 +108,8 @@ def _hour(value, where, end=False):
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     hour = int(moment.timestamp() // 3600)
-    return hour + 23 if end and not re.search(r"[T ]", str(value)) else hour
+    date_only = re.fullmatch(r"\d{4}-?\d{2}-?\d{2}(Z|[+-]\d{2}(:?\d{2})?)?", str(value).strip(), re.IGNORECASE)
+    return hour + 23 if end and date_only else hour
 
 
 def _weekday(value, where):
