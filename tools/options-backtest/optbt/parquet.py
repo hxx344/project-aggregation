@@ -1,9 +1,10 @@
 """Inspect hourly BTC option parquet files and compress them into a small SQLite smile cache.
 
-Usage (needs Python 3.9+ with `pip install pyarrow numpy`):
-  python options_parquet_to_sqlite.py inspect  options_hourly/BTC
-  python options_parquet_to_sqlite.py convert  options_hourly/BTC -o btc_smiles.sqlite3
-  python options_parquet_to_sqlite.py slim     options_hourly/BTC -o options_hourly_slim
+Standalone usage (needs Python 3.9+ with `pip install pyarrow numpy`; on the server use `bt` instead):
+  python parquet.py inspect  options_hourly/BTC
+  python parquet.py convert  options_hourly/BTC -o btc_smiles.sqlite3
+  python parquet.py slim     options_hourly/BTC -o options_hourly_slim
+  python parquet.py verify   options_hourly/BTC --db btc_smiles.sqlite3
 
 `slim` rewrites the parquet files with only each hour's latest snapshot and the
 columns a backtest needs (time, expiry, strike, type, IVs, prices, forward), for
@@ -45,7 +46,7 @@ ROLES = {
     "bid_iv": ["bid_iv"],
     "ask_iv": ["ask_iv"],
 }
-PRICES = ["mark_price", "bid_price", "ask_price", "best_bid_price", "best_ask_price"]
+PRICES = {"mark_price": ["mark_price"], "bid_price": ["best_bid_price", "bid_price"], "ask_price": ["best_ask_price", "ask_price"]}
 NODES = np.arange(-3.0, 3.01, 0.5)
 SNAPSHOT_WINDOW = 15 * 60
 INSTRUMENT = re.compile(r"^[A-Z]+-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:[.d]\d+)?)-([CP])$")
@@ -144,8 +145,8 @@ def load(path, columns):
         if np.all(np.nan_to_num(data["expiry"]) % 86400 == 0):
             data["expiry"] = data["expiry"] + 8 * 3600  # date-only expiries: Deribit settles 08:00 UTC
         data["strike"] = numbers(table[columns["strike"]])
-        kinds = pc.utf8_lower(pc.cast(table[columns["type"]], pa.string())).to_numpy(zero_copy_only=False)
-        data["is_call"] = np.array([str(value).startswith("c") for value in kinds])
+        kinds = pc.utf8_lower(pc.cast(table[columns["type"]], pa.string()))
+        data["is_call"] = pc.fill_null(pc.starts_with(kinds, "c"), False).to_numpy(zero_copy_only=False).astype(bool)
     else:
         data["expiry"], data["strike"], data["is_call"] = parse_instruments(table[columns["instrument"]])
     iv = numbers(table[columns["iv"]])
@@ -157,6 +158,23 @@ def load(path, columns):
     if columns["index"]:
         data["index"] = numbers(table[columns["index"]])
     return len(table), data
+
+
+def load_prices(path, data):
+    """Add the raw mark/bid/ask option prices (as stored, BTC or USD) under their canonical names."""
+    names = {name.lower(): name for name in pq.read_schema(path).names}
+    found = {role: names[next(c for c in candidates if c in names)] for role, candidates in PRICES.items() if any(c in names for c in candidates)}
+    if found:
+        table = pq.read_table(path, columns=sorted(set(found.values())))
+        data.update({role: numbers(table[column]) for role, column in found.items()})
+    return list(found)
+
+
+def usd(data, role):
+    """A price column in USD: Deribit quotes option prices in BTC, converted at the contract's own forward."""
+    values = data[role]
+    finite = values[np.isfinite(values)]
+    return values * data["forward"] if finite.size and np.median(finite) < 5 else values
 
 
 def require(columns):
@@ -327,11 +345,7 @@ def slim(args):
             print(f"  {path.name}: already in {output}, skipped")
             continue
         rows, data = load(path, columns)
-        names = {name.lower(): name for name in pq.read_schema(path).names}
-        prices = [name for name in PRICES if name in names]
-        if prices:
-            table = pq.read_table(path, columns=[names[name] for name in prices])
-            data.update({name: numbers(table[names[name]]) for name in prices})
+        prices = load_prices(path, data)
         data = latest_per_hour(data)
         if args.max_dte:
             keep = data["expiry"] - data["hour"] * 3600 <= args.max_dte * 86400
@@ -394,12 +408,7 @@ def verify(args):
     samples = []
     for path in files:
         _, data = load(path, columns)
-        names = {name.lower(): name for name in pq.read_schema(path).names}
-        prices = {role: names[name] for role, name in (("mark", "mark_price"), ("bid", "bid_price"), ("ask", "ask_price"),
-                                                       ("bid", "best_bid_price"), ("ask", "best_ask_price")) if name in names}
-        if prices:
-            table = pq.read_table(path, columns=sorted(set(prices.values())))
-            data.update({f"{role}_price": numbers(table[column]) for role, column in prices.items()})
+        load_prices(path, data)
         data = latest_per_hour(data)
         expiry_hour = np.round(data["expiry"] / 3600)
         label_years = (expiry_hour - data["hour"]) / 8760
@@ -430,7 +439,7 @@ def verify(args):
                  black(own_forward, k, pick(label_years), mark_iv, call)[0],
                  black(pick(forward), k, pick(label_years), mark_iv, call)[0],
                  black(pick(forward), k, pick(label_years), smile_iv, call)[0]]
-        to_usd = lambda name: pick(data[name]) * (own_forward if np.nanmedian(data[name]) < 5 else 1) if name in data else np.full(picked.size, math.nan)
+        to_usd = lambda name: pick(usd(data, name)) if name in data else np.full(picked.size, math.nan)
         mark, bid, ask = to_usd("mark_price"), to_usd("bid_price"), to_usd("ask_price")
         quoted = (bid > 0) & (ask >= bid)
         samples.append({"dte": pick(dte), "delta": np.abs(delta), "iv_error": smile_iv - mark_iv,

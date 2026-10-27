@@ -347,6 +347,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_LAB_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-entropy-lighter-lab-systemd.sh
 
+  options-backtest:
+    name: Options backtest engine (standard-library tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s tools/options-backtest/tests -v
+
   release-mirror:
     name: Release mirror (real Nginx and verified downloads)
     runs-on: ubuntu-24.04

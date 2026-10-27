@@ -46,6 +46,7 @@ project_aggregation/
 | `scripts/review-gate.mjs`、`.githooks/` | 可机械判定的提交门禁：`pre-commit` 查内容、`commit-msg` 查证据，由 `scripts/install-hooks.mjs` 在安装时启用 |
 | `CLAUDE.md`、`CONVENTIONS.md`、`.codebuddy/CODEBUDDY.md`、`.cursor/rules/`、`.cursorrules`、`.clinerules`、`.roo/rules/`、`.github/copilot-instructions.md`、`.github/instructions/` | 工具入口，只引用 `AGENTS.md`，不复制规则正文 |
 | `.claude/commands/review.md`、`.codebuddy/commands/review.md` | 客户端只读审查命令，按权威流程输出意见 |
+| `.claude/skills/options-backtest/SKILL.md` | Claude 回测技能入口，只引用 `tools/options-backtest/README.md` |
 
 根目录 `code-standards.md` 仅保留兼容链接。权威文件路径变化时同步更新上述入口的引用。
 
@@ -57,6 +58,10 @@ project_aggregation/
 - `force-reinstall.sh`, `kill-all-processes.sh` - 停止工作台 systemd 服务与重新安装
 - `local-route-helper.mjs`, `start-local-route.ps1`, `inspect-ssh-route.ps1` - 本地路由
 - `benchmark-overview.mjs` - 性能基准测试
+
+### tools/ 目录
+不随工作台模块发布的独立工具：
+- `options-backtest/` - BTC 期权回测引擎与 parquet 数据工具，用法与口径见其 `README.md`
 
 ### deploy/ 目录
 部署和安装脚本：
