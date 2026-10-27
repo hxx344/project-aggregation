@@ -19,10 +19,11 @@ DEFAULTS = {
     "legs": [],
     "qty": 1.0,
     "fill": "mid",
-    "fees": {"rate": 0.0003, "cap_pct": 0.07, "settle_rate": 0.00015, "settle_cap_pct": 0.125},
+    "fees": {"rate": 0.0003, "cap_pct": 0.07, "settle_rate": 0.00015, "settle_cap_pct": 0.125, "perp_rate": 0.0005},
     "exit": {"take_profit_pct": None, "stop_loss_pct": None, "close_hours_before_expiry": None},
     "max_open": 1,
-    "margin": {"mode": "regular", "mm_factor": 0.03, "max_im_factor": 0.10, "min_im_factor": 0.05, "liquidation_fee_rate": 0.002},
+    "margin": {"mode": "regular", "mm_factor": 0.03, "max_im_factor": 0.10, "min_im_factor": 0.05, "liquidation_fee_rate": 0.002,
+               "perp_im": 0.10},
 }
 LEG_DEFAULTS = {"side": None, "type": None, "delta": None, "qty": 1.0, "beyond": None, "expiry": None}
 
@@ -152,9 +153,13 @@ def validate(raw):
         leg = _merge(LEG_DEFAULTS, leg, where)
         if leg["side"] not in ("buy", "sell"):
             raise SpecError(f"{where}.side must be buy or sell")
-        if leg["type"] not in ("call", "put"):
-            raise SpecError(f"{where}.type must be call or put")
-        leg["delta"] = _number(leg["delta"], f"{where}.delta", 0, 1, open_low=True)
+        if leg["type"] not in ("call", "put", "perp"):
+            raise SpecError(f"{where}.type must be call, put or perp")
+        if leg["type"] == "perp":
+            if leg["delta"] is not None or leg["beyond"] is not None or leg["expiry"] is not None:
+                raise SpecError(f"{where}: a perp leg takes no delta, beyond or expiry (it closes with the options)")
+        else:
+            leg["delta"] = _number(leg["delta"], f"{where}.delta", 0, 1, open_low=True)
         leg["qty"] = _number(leg["qty"], f"{where}.qty", 0, 1000, open_low=True)
         if leg["beyond"] is not None:
             if not isinstance(leg["beyond"], int) or not 0 <= leg["beyond"] < index or spec["legs"][leg["beyond"]].get("type") != leg["type"]:
@@ -162,6 +167,8 @@ def validate(raw):
         leg["expiry"] = None if leg["expiry"] is None else _expiry_rule(leg["expiry"], f"{where}.expiry")
         legs.append(leg)
     spec["legs"] = legs
+    if all(leg["type"] == "perp" for leg in legs):
+        raise SpecError("legs need at least one option leg; perp legs close at its expiry")
     spec["qty"] = _number(spec["qty"], "qty", 0, 1000, open_low=True)
     if spec["fill"] not in FILLS:
         raise SpecError(f"fill must be one of {FILLS}")
@@ -177,6 +184,6 @@ def validate(raw):
     margin = spec["margin"] = _merge(DEFAULTS["margin"], spec["margin"], "margin")
     if margin["mode"] not in ("regular", "max_loss"):
         raise SpecError("margin.mode must be regular (Bybit regular option IM) or max_loss")
-    for key in ("mm_factor", "max_im_factor", "min_im_factor", "liquidation_fee_rate"):
+    for key in ("mm_factor", "max_im_factor", "min_im_factor", "liquidation_fee_rate", "perp_im"):
         margin[key] = _number(margin[key], f"margin.{key}", 0, 1)
     return spec

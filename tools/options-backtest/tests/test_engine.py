@@ -20,10 +20,12 @@ NEXT_FRIDAY_08 = SUNDAY_08 + 5 * 24
 class FakeMarket:
     """Flat-IV chains around a forward path; bid/ask are mark -/+ `spread` of the mark."""
 
-    def __init__(self, forwards, iv=0.5, spread=0.02, settlements=None):
-        """`iv` is a number or a function of the hour."""
+    def __init__(self, forwards, iv=0.5, spread=0.02, settlements=None, perp_offset=0.0, funding_rate=0.0):
+        """`iv` is a number or a function of the hour; the perp trades at forward + `perp_offset` and
+        charges `funding_rate` every 8 hours (00/08/16 UTC)."""
         self.forwards, self.iv, self.spread = forwards, iv, spread
         self.settlements = settlements or {}
+        self.perp_offset, self.funding_rate = perp_offset, funding_rate
 
     def span(self):
         return min(self.forwards), max(self.forwards)
@@ -48,6 +50,12 @@ class FakeMarket:
 
     def settlement(self, expiry):
         return self.settlements.get(expiry)
+
+    def perp(self, hour):
+        return self.forwards[hour] + self.perp_offset if hour in self.forwards else None
+
+    def funding(self, after, upto):
+        return sum(self.funding_rate * self.perp(hour) for hour in range(after + 1, upto + 1) if hour % 8 == 0 and hour in self.forwards)
 
 
 def condor(**overrides):
@@ -143,6 +151,57 @@ class EngineTest(unittest.TestCase):
         self.assertAlmostEqual(trade["credit"], credit, places=2)
         self.assertAlmostEqual(trade["pnl"], credit + cash - fees, places=2)
 
+    def test_covered_call_with_long_perp(self):
+        raw = {"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "expiry": {"weekday": "sun"},
+               "legs": [{"side": "buy", "type": "perp"}, {"side": "sell", "type": "call", "delta": 0.3}]}
+        spec = specs.validate(raw)
+        moves = {**flat(), **{hour: 41000.0 for hour in range(FRIDAY_21 + 1, SUNDAY_08 + 1)}}
+        events = [hour for hour in range(FRIDAY_21 + 1, SUNDAY_08 + 1) if hour % 8 == 0]  # funding times while held
+        for settle_at in (37000.0, 43000.0):
+            market = FakeMarket(moves, settlements={SUNDAY_08: settle_at}, perp_offset=20.0, funding_rate=0.0001)
+            trade = engine.run(spec, market)[0][0]
+            position, _ = engine.open_position(market.chain(FRIDAY_21), FRIDAY_21, spec, market.perp(FRIDAY_21))
+            perp, call = position.legs
+            self.assertEqual((perp.is_perp, perp.price, perp.expiry), (True, 40020.0, SUNDAY_08))
+            quote = market.quote(FRIDAY_21, SUNDAY_08, call.strike, True)
+            premium = (quote.bid + quote.ask) / 2
+            intrinsic = max(0.0, settle_at - call.strike)
+            paid = sum(0.0001 * market.perp(hour) for hour in events)
+            fees = (0.0005 * 40020.0 + 0.0005 * 41020.0 + min(0.0003 * 40000.0, 0.07 * premium)
+                    + min(0.00015 * settle_at, 0.125 * intrinsic))
+            self.assertAlmostEqual(trade["credit"], premium, places=2)  # the perp adds no premium
+            self.assertAlmostEqual(trade["perp_pnl"], 1000.0, places=2)  # closed at the expiry hour's perp price
+            self.assertAlmostEqual(trade["funding"], paid, places=2)
+            self.assertAlmostEqual(trade["pnl"], 1000.0 - paid + premium - intrinsic - fees, places=2)
+            self.assertRegex(trade["legs"], r"^\+1 \w+-PERP -1 \w+-\d+-C$")
+        trade = engine.run(specs.validate({**raw, "exit": {"close_hours_before_expiry": 3}}), market)[0][0]
+        closing = market.quote(SUNDAY_08 - 3, SUNDAY_08, call.strike, True)
+        buyback = (closing.bid + closing.ask) / 2
+        paid = sum(0.0001 * market.perp(hour) for hour in events if hour <= SUNDAY_08 - 3)
+        fees = (0.0005 * 40020.0 + 0.0005 * 41020.0 + min(0.0003 * 40000.0, 0.07 * premium)
+                + min(0.0003 * 41000.0, 0.07 * buyback))
+        self.assertEqual(trade["reason"], "time_exit")
+        self.assertAlmostEqual(trade["pnl"], 1000.0 - paid + premium - buyback - fees, places=2)
+        summary = report.summarize([trade], {}, (FRIDAY_21, SUNDAY_08))
+        self.assertAlmostEqual(summary["funding"], paid, places=2)
+        for legs, message in [([{"side": "buy", "type": "perp", "expiry": {"dte": 30}}, raw["legs"][1]], "no delta, beyond or expiry"),
+                              ([{"side": "buy", "type": "perp", "delta": 0.5}, raw["legs"][1]], "no delta, beyond or expiry"),
+                              ([{"side": "buy", "type": "perp"}], "at least one option leg")]:
+            with self.assertRaisesRegex(specs.SpecError, message):
+                specs.validate({**raw, "legs": legs})
+        self.assertEqual(engine.open_position(market.chain(FRIDAY_21), FRIDAY_21, spec, None), (None, "no_perp"))
+
+    def test_back_to_back_rolls_hold_the_perp_without_new_entry_fees(self):
+        raw = {"start": "2024-01-06", "end": "2024-01-07", "entry": {"hours": [8]}, "expiry": {"dte": 1},
+               "legs": [{"side": "buy", "type": "perp"}, {"side": "sell", "type": "call", "delta": 0.3}]}
+        market = FakeMarket(flat(hours=range(FRIDAY_21, NEXT_FRIDAY_08 + 1)), settlements={SUNDAY_08: 40000.0, NEXT_FRIDAY_08: 40000.0})
+        with_perp = engine.run(specs.validate(raw), market)[0]
+        calls_only = engine.run(specs.validate({**raw, "legs": raw["legs"][1:]}), market)[0]
+        self.assertEqual([t["exit_hour"] for t in with_perp], [SUNDAY_08, NEXT_FRIDAY_08])  # rolled at Sunday 08:00
+        perp_fees = sum(t["fees"] for t in with_perp) - sum(t["fees"] for t in calls_only)
+        self.assertAlmostEqual(perp_fees, 0.0005 * 40000.0 * 2, places=2)  # held through the roll: one open, one close
+        self.assertAlmostEqual(sum(t["pnl"] for t in calls_only) - sum(t["pnl"] for t in with_perp), perp_fees, places=2)
+
     def test_max_loss_tolerates_float_quantities(self):
         legs = [engine.Leg(i, sign, SUNDAY_08, strike, True, qty, 0.0, 0.0, 0.5)
                 for i, (sign, strike, qty) in enumerate([(-1, 100.0, 0.1), (-1, 110.0, 0.2), (1, 120.0, 0.3)])]
@@ -232,6 +291,36 @@ try:
     HAS_ARROW = True
 except ImportError:
     HAS_ARROW = False
+
+
+class BinanceTest(unittest.TestCase):
+    def test_archives_parse_and_funding_sums_without_network(self):
+        import io
+        import zipfile
+        from optbt import binance
+
+        def archive(text):
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as handle:
+                handle.writestr("data.csv", text)
+            return buffer.getvalue()
+
+        hour = FRIDAY_21 - 5  # a funding hour (multiple of 8)
+        klines = "".join(f"{(hour + i - 1) * 3_600_000},0,0,0,{40000 + 100 * i},0,0,0,0,0,0,0\n" for i in range(3))
+        funding = f"calc_time,funding_interval_hours,last_funding_rate\n{hour * 3_600_000 + 7},8,0.0001\n"
+        self.assertEqual(binance.parse(archive("open_time,open,high,low,close\n" + klines), "klines")[0], (hour, 40000.0))
+        self.assertEqual(binance.parse(archive(klines), "klines")[2], (hour + 2, 40200.0))  # older archives have no header
+        self.assertEqual(binance.parse(archive(funding), "funding"), [(hour, 0.0001)])
+        with tempfile.TemporaryDirectory() as folder:
+            month = binance.month_name(engine.utc(hour).year * 12 + engine.utc(hour).month - 1)
+            target = Path(folder) / "BTCUSDT"
+            target.mkdir()
+            (target / f"klines-{month}.csv").write_text("".join(f"{h},{p}\n" for h, p in binance.parse(archive(klines), "klines")))
+            (target / f"funding-{month}.csv").write_text(f"{hour},0.0001\n")
+            perp = binance.BinancePerp([engine.utc(hour).year * 12 + engine.utc(hour).month - 1], directory=folder)  # no download
+        self.assertEqual((perp.price(hour + 1), perp.price(hour + 9)), (40100.0, None))
+        self.assertAlmostEqual(perp.funding(hour - 1, hour), 4.0)  # 0.01% of 40,000 at the funding hour
+        self.assertEqual(perp.funding(hour, hour + 2), 0.0)  # (after, upto]: entering at the funding hour pays nothing
 
 
 @unittest.skipUnless(HAS_ARROW, "needs numpy and pyarrow")

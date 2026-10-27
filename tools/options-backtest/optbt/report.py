@@ -47,6 +47,10 @@ def summarize(trades, skipped, window):
         "fallback_fill_rate": round(sum(trade["fallback_fills"] for trade in trades) / fills, 4) if fills else 0.0,
         "by_year": by_year,
     })
+    if any(trade.get("perp_pnl") or trade.get("funding") for trade in trades):
+        summary["perp_pnl"] = round(sum(trade.get("perp_pnl", 0.0) for trade in trades), 2)
+        summary["funding"] = round(sum(trade.get("funding", 0.0) for trade in trades), 2)
+        summary["options_pnl"] = round(summary["total_pnl"] - summary["perp_pnl"] + summary["funding"], 2)  # incl. all fees
     return summary
 
 
@@ -66,13 +70,15 @@ def text(spec, summary):
         f"mean credit {money(s['mean_credit'])}  fees {money(s['total_fees'])}  mean margin {money(s['mean_margin'])}  mean return/margin {roi}",
         "exits " + ", ".join(f"{reason} {count}" for reason, count in s["exits"].items())
         + f"  mark-fallback fills {s['fallback_fill_rate']:.1%}" + (f"  skipped {s['skipped']}" if s["skipped"] else ""),
+        *([f"perp leg price {money(s['perp_pnl'])}  funding paid {money(s['funding'])}  options and all fees {money(s['options_pnl'])}"]
+          if "perp_pnl" in s else []),
         "by year " + " | ".join(f"{year} {money(row['pnl'])} ({row['trades']}, win {row['wins'] / row['trades']:.0%})" for year, row in s["by_year"].items()),
     ]
     return lines
 
 
 TRADE_FIELDS = ["entry", "exit", "reason", "legs", "deltas", "forward", "settlement", "credit", "fees", "pnl", "margin", "max_loss",
-                "worst_open_pnl", "fallback_fills", "missing_hours"]
+                "worst_open_pnl", "fallback_fills", "missing_hours", "perp_pnl", "funding"]
 
 
 def write(directory, spec, trades, summary):

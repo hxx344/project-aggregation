@@ -59,7 +59,8 @@ def run_command(args):
 
 
 COLUMNS = [("trades", "trades", "{}"), ("win", "win_rate", "{:.1%}"), ("total", "total_pnl", "{:,.0f}"), ("mean", "mean_pnl", "{:,.1f}"),
-           ("worst", "worst", "{:,.0f}"), ("maxDD", "max_drawdown", "{:,.0f}"), ("sharpe", "sharpe", "{}"), ("ret/margin", "mean_return_on_margin", "{:.2%}")]
+           ("worst", "worst", "{:,.0f}"), ("maxDD", "max_drawdown", "{:,.0f}"), ("sharpe", "sharpe", "{}"), ("ret/margin", "mean_return_on_margin", "{:.2%}"),
+           ("perp", "perp_pnl", "{:,.0f}"), ("funding", "funding", "{:,.0f}"), ("options", "options_pnl", "{:,.0f}")]
 
 
 def sweep_command(args):
@@ -89,8 +90,9 @@ def sweep_command(args):
         writer.writeheader()
         writer.writerows(rows)
     paths = [path for path, _ in grid]
-    header = paths + [label for label, _, _ in COLUMNS]
-    table = [[json.dumps(row[path]) for path in paths] + [("-" if row[field] is None else fmt.format(row[field])) for _, field, fmt in COLUMNS]
+    columns = [column for column in COLUMNS if any(row[column[1]] is not None for row in rows)]  # drop perp columns without perp legs
+    header = paths + [label for label, _, _ in columns]
+    table = [[json.dumps(row[path]) for path in paths] + [("-" if row[field] is None else fmt.format(row[field])) for _, field, fmt in columns]
              for row in rows[:args.top]]
     widths = [max(len(str(cell)) for cell in column) for column in zip(header, *table)]
     for line in [header] + table:

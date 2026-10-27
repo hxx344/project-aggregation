@@ -10,6 +10,9 @@ dist/
 
 # Data directories
 .data*/
+# Option backtest market data and caches live under ~/data; never commit them
+*.parquet
+.optbt-cache/
 
 # Agent company run artifacts (local operational logs; company definitions stay tracked)
 .company/runs/

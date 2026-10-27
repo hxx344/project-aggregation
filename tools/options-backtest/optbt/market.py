@@ -47,6 +47,20 @@ class ParquetMarket:
         self.cache_months = cache_months
         self._months = OrderedDict()
         self._span = None
+        self._perp = None
+
+    def _binance(self):
+        if self._perp is None:
+            from .binance import BinancePerp
+            self._perp = BinancePerp(self.files)  # the option data's months; downloaded on first use
+        return self._perp
+
+    def perp(self, hour):
+        """Binance BTCUSDT perpetual price at hour H (close of the candle ending at H)."""
+        return self._binance().price(hour)
+
+    def funding(self, after, upto):
+        return self._binance().funding(after, upto)
 
     def _month(self, month):
         if month in self._months:

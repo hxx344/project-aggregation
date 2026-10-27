@@ -31,15 +31,16 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 | `expiry.weekday` | `null` | 设置后选距开仓至少 `min_hours` 小时的第一个该星期几到期日（实盘规则是 `"sun"`） |
 | `expiry.dte` | `2` | 未设 `weekday` 时，选离"开仓时间 + dte 天"最近的已上市到期日 |
 | `expiry.min_hours` | `1` | 到期日距开仓的最少小时数 |
-| `legs[]` | 必填 | 每条腿：`side` 为 `buy`/`sell`；`type` 为 `call`/`put`；`delta` 是目标绝对值，取最接近的行权价；`qty` 是相对数量；`beyond: i` 表示只在第 i 条腿的更虚值一侧选（翼）；`expiry` 可单独设置，用于日历价差 |
+| `legs[]` | 必填 | 每条腿：`side` 为 `buy`/`sell`；`type` 为 `call`/`put`/`perp`（Binance 永续，见下方"永续腿"）；`delta` 是目标绝对值，取最接近的行权价；`qty` 是相对数量；`beyond: i` 表示只在第 i 条腿的更虚值一侧选（翼）；`expiry` 可单独设置，用于日历价差 |
 | `qty` | `1` | 每条腿的张数（1 张 = 1 BTC） |
 | `fill` | `mid` | 成交价模型，见下方"成交价" |
-| `fees` | 见下方"手续费" | `rate` / `cap_pct` / `settle_rate` / `settle_cap_pct` |
+| `fees` | 见下方"手续费" | `rate` / `cap_pct` / `settle_rate` / `settle_cap_pct` / `perp_rate` |
 | `exit.take_profit_pct` | `null` | 浮盈 ≥ 净权利金 × 该比例时平仓 |
 | `exit.stop_loss_pct` | `null` | 浮亏 ≥ 净权利金 × 该比例时平仓 |
 | `exit.close_hours_before_expiry` | `null` | 到期前 N 小时平仓 |
 | `max_open` | `1` | 同时持有的组合数上限，超出的开仓机会记为跳过 |
 | `margin.mode` | `regular` | `regular` 为 Bybit 常规期权 Order IM；`max_loss` 用到期最大亏损，无限亏损的结构仍用 IM |
+| `margin.perp_im` | `0.10` | 永续腿保证金 = 该比例 × 名义价值（默认 10 倍杠杆） |
 
 ## 口径
 
@@ -68,12 +69,21 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 **手续费**
 
 - 交易费：每条腿 `min(rate × 标的价, cap_pct × 成交价) × 数量`，和实盘 `app/strategy.py` 一致。
+- 永续腿：`perp_rate × 成交价 × 数量`，默认 0.05%（Binance 吃单）。
 - 交割费：每条实值腿 `min(settle_rate × 交割价, settle_cap_pct × 内在价值)`。0.015% 和 12.5% 是按 Bybit 公开费率填的假设值，用前请核对。
 
 **结算**
 
 - 到期小时用到期合约在最后一次快照里的远期价，近似 Deribit 交割价（交割价是 08:00 前 30 分钟的指数 TWAP）。
 - 找不到时，依次退回到更晚到期合约的远期价、前 1–2 小时的快照、最后一次估值时的远期价。用最后一次估值远期价结算的交易，退出原因记为 `expiry_last_forward`。
+
+**永续腿（perp）**
+
+- 用 Binance USDⓈ-M BTCUSDT 永续的小时 K 线：小时 H 的价格是 (H−1h, H] 这根 K 线的收盘价。用于开仓、逐小时估值和平仓，不计买卖价差。
+- 不需要 `delta` / `beyond` / `expiry`，随组合里最早到期的期权一起平仓。到期时按该小时的永续价平仓；缺这一小时的数据时，用期权交割价代替。
+- 资金费：持仓期间 (开仓, 平仓] 的每个资金费时点，按 `费率 × 当时 K 线收盘价` 计入（多头费率为正时付出），汇总在 `funding`。
+- 连续持有：上一笔的永续腿在某小时平仓、新一笔在同一小时开出永续腿时，视为一直持有。新一笔不收开仓费，上一笔的平仓费退回，所以每段连续持有只收一次开仓费和一次平仓费。用于 covered call 等滚动策略。
+- 摘要多一行 `perp leg price / funding paid / options and all fees`，把盈亏拆成永续价格、资金费、期权加全部手续费；`sweep` 表对应 `perp` / `funding` / `options` 列。
 
 **保证金**
 
@@ -87,6 +97,14 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 - 默认读取 `~/data/options_hourly/BTC/YYYY-MM.parquet`，可用 `--data` 或环境变量 `OPTBT_DATA` 改。
 - 文件来自用户本机原始数据经 `slim` 瘦身：每小时只保留最新快照，只留回测需要的列。
 - 当前数据覆盖 2023-03-20 至 2026-03-25。
+
+**Binance 永续数据**：只在策略含永续腿时使用。
+
+- 首次使用时，从 data.binance.vision 的月度归档下载期权数据覆盖月份的 1 小时 K 线和资金费率，每月约 40 KB。
+- 保存到 `~/data/binance/BTCUSDT/{klines,funding}-YYYY-MM.csv`，可用环境变量 `OPTBT_PERP_DATA` 改目录。
+- 已发布的月份不会再变，所以文件已存在就不再下载。删掉某个月的文件即可重新下载。
+- 每个文件下载超时 30 秒，最多尝试 3 次。仍然失败，或该月尚未发布（404）时直接报错并给出 URL，不会用缺失数据继续回测。
+- 行情数据和回测结果都放在仓库外的 `~/data/` 下，不提交到 git。
 
 **月度缓存**：放在 `<数据目录>/.optbt-cache/v<版本>/YYYY-MM/`。以下任一情况会重建：
 
