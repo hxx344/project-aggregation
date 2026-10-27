@@ -58,6 +58,8 @@ test('offline run emits actual service heartbeat, bounded shutdown and readable 
     assert.equal(JSON.parse(report.stdout).automaticFees.mode, 'auto');
     assert.deepEqual(JSON.parse(report.stdout).automaticFees.rebateRatios, [1.1, 1.2]);
     assert.equal(JSON.parse(report.stdout).sessionConfig.simulation.entropyTakerFeeBps, null);
+    assert.equal(JSON.parse(report.stdout).binanceScalper.enabled, true);
+    assert.equal(JSON.parse(report.stdout).binanceScalper.suspendedReason, null);
   } finally { rmSync(dir, { recursive: true }); }
 });
 
@@ -110,4 +112,59 @@ test('a managed collector exits when its parent IPC disconnects and preserves th
     worker?.stdout.destroy(); worker?.stderr.destroy();
     rmSync(dir, { recursive: true });
   }
+});
+
+test('unclean research session suspends the directional study even before its first trade snapshot', async () => {
+  const dir = fixture(); let first;
+  try {
+    first = child([entry, 'run', '--data', dir, '--duration', '30']);
+    const status = await waitStatus(dir, first.processChild.pid);
+    assert.equal(status.mode, 'research');
+    first.processChild.kill('SIGKILL'); await first.done;
+    const second = await child([entry, 'run', '--data', dir, '--duration', '1']).done;
+    assert.equal(second.code, 0, second.stderr);
+    const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
+    assert.equal(report.mode, 'research'); assert.equal(report.paperSuspendedReason, null);
+    assert.match(report.binanceScalper.suspendedReason, /previous_session/);
+    assert.equal(report.binanceScalper.openTasks.length, 0);
+    assert.equal(report.binanceScalper.enabled, false);
+    assert.equal(report.binanceScalper.previousSession.session, status.session);
+    for (const symbol of Object.values(report.binanceScalper.bySymbol)) for (const scenario of Object.values(symbol.scenarios)) {
+      assert.equal(scenario.stats.netBeforeRebate, null);
+      assert.ok(scenario.stats.rebateScenarios.every(value => value.net === null));
+    }
+    const original = JSON.parse(readFileSync(join(dir, 'unresolved-scalper.json'), 'utf8'));
+    assert.equal(original.session, status.session); assert.equal(original.stopped, false);
+    const third = await child([entry, 'run', '--data', dir, '--duration', '1']).done;
+    assert.equal(third.code, 0, third.stderr);
+    assert.match(JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8')).binanceScalper.suspendedReason, /previous_session/);
+    assert.equal(JSON.parse(readFileSync(join(dir, 'unresolved-scalper.json'), 'utf8')).session, status.session);
+  } finally {
+    if (first?.processChild.exitCode === null) { first.processChild.kill('SIGKILL'); await first.done; }
+    rmSync(dir, { recursive: true });
+  }
+});
+
+test('a cleanly stopped research report with a pending directional exit keeps its original evidence', async () => {
+  const dir = fixture();
+  try {
+    const original = { session: 'stopped-with-position', mode: 'research', observedAt: 1793000000000, stopped: true, counts: {}, binanceScalper: {
+      enabled: true, suspendedReason: null, observedAt: 1793000000000,
+      openTasks: [{ symbol: 'SNDK', state: 'exit_pending', entry: { cash: 100, fee: 0.05 } }],
+      bySymbol: { SNDK: { scenarios: { base: { state: 'exit_pending', position: { direction: 'long', entryPrice: 100 },
+        stats: { completed: 2, lossesBeforeRebate: 1, fees: 0.15, turnover: 300, settledNetBeforeRebate: -3,
+          netBeforeRebate: null, grossPnl: null, rebateScenarios: [{ ratio: 1.1, contingentRebate: 0.165, net: null }] },
+        recentTrades: [{ id: 'prior-loss', netBeforeRebate: -3 }] } } } },
+    } };
+    writeFileSync(join(dir, 'report.json'), JSON.stringify(original));
+    const result = await child([entry, 'run', '--data', dir, '--duration', '1']).done;
+    assert.equal(result.code, 0, result.stderr);
+    const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
+    assert.match(report.binanceScalper.suspendedReason, /previous_session/);
+    assert.deepEqual(report.binanceScalper.openTasks, original.binanceScalper.openTasks);
+    assert.deepEqual(report.binanceScalper.bySymbol, original.binanceScalper.bySymbol);
+    assert.equal(report.binanceScalper.observedAt, original.observedAt);
+    assert.equal(report.binanceScalper.previousSession.session, original.session);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'unresolved-scalper.json'), 'utf8')), original);
+  } finally { rmSync(dir, { recursive: true }); }
 });

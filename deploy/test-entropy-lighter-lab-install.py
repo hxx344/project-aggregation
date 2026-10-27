@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "deploy/install-entropy-lighter-lab.sh"
 TEXT = INSTALLER.read_text(encoding="utf-8")
 FILES = ("tools/entropy-lighter-lab/cli.mjs", "tools/entropy-lighter-lab/core.mjs",
-         "tools/entropy-lighter-lab/feeds.mjs", "tools/entropy-lighter-lab/config.example.json",
+         "tools/entropy-lighter-lab/feeds.mjs", "tools/entropy-lighter-lab/binance-scalper.mjs",
+         "tools/entropy-lighter-lab/config.example.json",
          "deploy/install-entropy-lighter-lab.sh")
 REVISION = "a" * 40
 LINUX_ROOT = (sys.platform == "linux" and os.geteuid() == 0

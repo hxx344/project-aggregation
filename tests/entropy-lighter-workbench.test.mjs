@@ -59,6 +59,8 @@ test('managed real CLI merges concurrent starts, publishes heartbeat and persist
     await Promise.all([manager.start(), manager.start()]);
     await until(() => manager.state().state === 'running');
     const first = manager.state(); assert.equal(first.enabled, true); assert.equal(first.report.mode, 'research'); assert.equal(first.stale, false);
+    assert.equal(first.report.binanceScalper.strategy, 'binance_depth4_entropy_taker');
+    assert.equal(first.report.binanceScalper.enabled, true);
     assert.equal(first.report.sessionConfig.region, 'Tokyo');
     assert.equal(Object.hasOwn(first.report, 'pid'), false);
     await assert.rejects(manager.save(config), /先停止/);

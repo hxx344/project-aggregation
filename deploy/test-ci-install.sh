@@ -9,7 +9,7 @@ export FIXTURE_ROOT=$fixture
 mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/source/deploy" "$fixture/runtime"
 cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-artifact-cache.py"
 mkdir -p "$fixture/source/tools/entropy-lighter-lab"
-cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,config.example.json} "$fixture/source/tools/entropy-lighter-lab/"
+cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$fixture/source/tools/entropy-lighter-lab/"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
 printf '{}\n' > "$fixture/source/pnpm-lock.yaml"
 printf 'packages: []\n' > "$fixture/source/pnpm-workspace.yaml"
@@ -179,7 +179,7 @@ contents = {'.release-commit': commit, '.release-application-key': key,
             'server/entry/main.mjs': 'export {};', 'server/entry/probe.mjs': 'export {};',
             'package.json': '{"type":"module"}', 'dist/index.html': '<html>' + sys.argv[3] + '</html>',
             'node_modules/ws/package.json': '{}', 'node_modules/decimal.js/package.json': '{}'}
-for name in ('cli.mjs', 'core.mjs', 'feeds.mjs', 'config.example.json'):
+for name in ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json'):
     relative = 'tools/entropy-lighter-lab/' + name
     contents[relative] = subprocess.check_output(['git', '-C', str(root / 'source'), 'show', commit + ':' + relative], text=True)
 with tarfile.open(root / 'package.tar.gz', 'w:gz') as archive:

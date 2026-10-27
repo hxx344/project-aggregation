@@ -5,6 +5,7 @@ import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Too
 import { api, ApiError } from './api';
 import type { LabConfig, LabQuote, LabReport, LabSnapshot, LabSpread, LabSymbol, LabTime } from './entropy-lighter-types';
 import EntropyLighterInsights from './EntropyLighterInsights';
+import EntropyBinanceScalper from './EntropyBinanceScalper';
 import './entropy-lighter.css';
 
 const ROOT = '/api/research/entropy-lighter';
@@ -239,6 +240,7 @@ export default function EntropyLighterPage({ onExpired }: { onExpired: () => voi
     {offline || loadError ? <div className="el-callout warning" role="alert"><CircleAlert size={16} /><span>{offline ? '浏览器网络已断开。' : `研究数据读取失败：${loadError}`} 当前保留最后读取的数据；连接恢复后自动重试。</span></div> : null}
     {!snapshot ? <section className="panel el-empty" role="status">{loading ? <LoaderCircle className="spin" /> : <CircleAlert />}<strong>{loading ? '正在读取采集状态' : '暂未取得研究数据'}</strong><p>{loadError ? '请检查工作台服务，或点击刷新重试。' : '无需连接交易账户。'}</p></section> : <>
       <section className="panel el-status-panel" aria-label="研究采集状态"><div className="el-state-main"><span className={`el-state ${snapshot.state} ${historical ? 'pending' : ''}`}><Activity size={16} />{historical && !stopped ? '采集状态待更新' : stateLabels[snapshot.state]}</span><span>{snapshot.report?.mode === 'paper' ? '模拟会话' : '纯采集'}</span><span className={`el-quality ${receiving ? 'good' : 'pending'}`}>{historical ? '观测待更新 / 历史记录' : receiving ? '持续收到行情' : reportAgeMs === null ? '等待新版采样' : '等待行情更新'}</span>{snapshot.error ? <p className="el-server-error">{snapshot.error}</p> : null}</div><dl className="el-status-facts"><div><dt>采集心跳</dt><dd>{time(snapshot.heartbeatAt, true)}</dd></div><div><dt>报告距今</dt><dd>{reportAgeMs === null ? '年龄未知' : `${num(reportAgeMs / 1000)} 秒`}<small>{historical ? '保留的观测' : '前台每 5 秒读取'}</small></dd></div><div><dt>本轮收到盘口</dt><dd>{num(snapshot.report?.counts?.books)} 条<small>页面最近读取 {time(lastRead)}</small></dd></div><div><dt>会话开始</dt><dd>{time(snapshot.report?.startedAt, true)}</dd></div></dl><p className="el-status-note">行情是否持续到达与模拟准入分别判断。关闭页面后服务器继续采集；本页不提交交易订单。</p></section>
+      <EntropyBinanceScalper report={snapshot.report} symbol={symbol} onSymbol={setSymbol} historical={historical} stopped={stopped} reportAgeMs={reportAgeMs} serverNow={serverNow} />
       <EntropyLighterInsights insights={reportAgeMs !== null && observation && serverNow !== null ? snapshot.insights : undefined} historical={historical} stopped={stopped} report={snapshot.report} reportAgeMs={reportAgeMs} serverNow={serverNow} />
       <SpreadChart report={snapshot.report} config={snapshot.report?.sessionConfig || snapshot.config} symbol={symbol} onSymbol={setSymbol} historical={historical} />
       <details className="el-technical"><summary>技术与模拟明细<span>盘口、成交模拟、连接诊断与参数设置</span></summary><div className="el-technical-content">

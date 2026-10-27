@@ -24,7 +24,7 @@ unit=/etc/systemd/system/entropy-lighter-lab.service
 service=entropy-lighter-lab
 repository=hxx344/project-aggregation
 node_version=24.15.0
-files=(tools/entropy-lighter-lab/cli.mjs tools/entropy-lighter-lab/core.mjs tools/entropy-lighter-lab/feeds.mjs tools/entropy-lighter-lab/config.example.json deploy/install-entropy-lighter-lab.sh)
+files=(tools/entropy-lighter-lab/cli.mjs tools/entropy-lighter-lab/core.mjs tools/entropy-lighter-lab/feeds.mjs tools/entropy-lighter-lab/binance-scalper.mjs tools/entropy-lighter-lab/config.example.json deploy/install-entropy-lighter-lab.sh)
 system_ready() {
   local tool
   for tool in python3 curl sha256sum flock systemctl systemd-run useradd runuser tar xz; do command -v "$tool" >/dev/null || return 1; done
@@ -148,7 +148,7 @@ PY
     printf '[entropy-lighter-lab] Stable source unchanged; download skipped.\n'
   else
     [[ ! -e $source_dir ]] || die 'Incomplete source cache; inspect it before retrying.'
-    printf '[entropy-lighter-lab] Downloading five allowlisted files from stable commit %.12s.\n' "$source_revision"
+    printf '[entropy-lighter-lab] Downloading six allowlisted files from stable commit %.12s.\n' "$source_revision"
     for name in "${files[@]}"; do
       mkdir -p "$scratch/source/$(dirname -- "$name")"
       download "https://raw.githubusercontent.com/$repository/$source_revision/$name" "$scratch/source/$name" 1048576

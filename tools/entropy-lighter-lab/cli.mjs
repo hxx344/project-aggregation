@@ -52,6 +52,12 @@ export async function run({ configPath, data, duration }) {
     const session = randomUUID(), startedAt = new Date().toISOString();
     const abort = new AbortController();
     const previous = readPreviousReport(data);
+    const previousScalper = previous?.binanceScalper;
+    const previousScalperUnresolved = previousScalper?.suspendedReason || previousScalper?.openTasks?.length
+      || Object.values(previousScalper?.bySymbol || {}).some((row) => Object.values(row?.scenarios || {}).some((scenario) => scenario.stats?.unresolved > 0))
+      || (previousScalper?.enabled === true && !previous.stopped);
+    const scalperSuspendedReason = previousScalperUnresolved ? 'previous_session_has_unresolved_scalper_exposure' : null;
+    if (scalperSuspendedReason && previous && !existsSync(join(data, 'unresolved-scalper.json'))) atomicJson(join(data, 'unresolved-scalper.json'), previous);
     const previousUnresolved = previous?.openPaperTasks?.length || Object.values(previous?.paper || {}).some((r) => r.unresolved > 0) || previous?.paperSuspendedReason || (previous?.mode === 'paper' && !previous.stopped);
     const paperSuspendedReason = previousUnresolved ? 'previous_session_has_unresolved_paper_exposure_review_previous_report' : null;
     if (paperSuspendedReason && previous && !existsSync(join(data, 'unresolved-paper.json'))) atomicJson(join(data, 'unresolved-paper.json'), previous);
@@ -65,7 +71,7 @@ export async function run({ configPath, data, duration }) {
     for (const [key, value] of Object.entries(cooldowns)) if (!['entropy', 'lighter', 'binance'].includes(key) || !Number.isFinite(value) || value < 0) throw new Error('Invalid persisted API cooldown');
     const fail = (error) => { if (!fatal) { fatal = error; abort.abort(); } };
     const safe = (fn) => (...args) => { if (fatal) return; try { fn(...args); } catch (e) { fail(e); } };
-    const lab = new Lab(effective, safe((event) => recorder.write(event)), { automaticFees: true });
+    const lab = new Lab(effective, safe((event) => recorder.write(event)), { automaticFees: true, scalperSuspendedReason });
     const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
     const diagnostic = safe((d) => {
       const key = `${d.venue || 'collector'}:${d.event}`;
@@ -79,7 +85,28 @@ export async function run({ configPath, data, duration }) {
       if (d.event === 'cooldown') atomicJson(cooldownFile, cooldowns);
       recorder.write({ type: 'diagnostic', ...d });
     });
-    const snapshot = () => ({ schema: 1, pid: process.pid, session, mode: effective.simulation.enabled ? 'paper' : 'research', startedAt, heartbeatAt: new Date().toISOString(), region: config.region, configHash: createHash('sha256').update(source).digest('hex'), sessionConfig: structuredClone(effective), paperSuspendedReason, ...lab.report(), metadata, diagnostics, eventLoopDelayMs: { p50: loop.percentile(50) / 1e6, p95: loop.percentile(95) / 1e6, p99: loop.percentile(99) / 1e6 }, stopped: abort.signal.aborted });
+    const snapshot = () => {
+      const research = lab.report();
+      if (scalperSuspendedReason) {
+        // Preserve the original visible evidence across every restart. The new
+        // engine stays suspended; none of the old tasks is resumed or re-priced.
+        const retained = structuredClone(previousScalper);
+        for (const symbol of Object.values(retained.bySymbol || {})) for (const scenario of Object.values(symbol?.scenarios || {})) {
+          if (!scenario.stats) continue;
+          scenario.stats.netBeforeRebate = null; scenario.stats.grossPnl = null;
+          for (const rebate of scenario.stats.rebateScenarios || []) rebate.net = null;
+        }
+        research.binanceScalper = { ...research.binanceScalper, ...retained, enabled: false,
+          suspendedReason: scalperSuspendedReason,
+          observedAt: retained.observedAt ?? previous.observedAt ?? null,
+          previousSession: retained.previousSession || { session: previous.session, stopped: previous.stopped === true,
+            heartbeatAt: previous.heartbeatAt ?? null, exposureUnconfirmed: true } };
+      }
+      return { schema: 1, pid: process.pid, session, mode: effective.simulation.enabled ? 'paper' : 'research', startedAt,
+        heartbeatAt: new Date().toISOString(), region: config.region, configHash: createHash('sha256').update(source).digest('hex'),
+        sessionConfig: structuredClone(effective), paperSuspendedReason, ...research, metadata, diagnostics,
+        eventLoopDelayMs: { p50: loop.percentile(50) / 1e6, p95: loop.percentile(95) / 1e6, p99: loop.percentile(99) / 1e6 }, stopped: abort.signal.aborted };
+    };
     const persist = () => {
       const report = snapshot();
       atomicJson(join(data, 'report.json'), report);

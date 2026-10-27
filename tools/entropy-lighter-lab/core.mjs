@@ -2,6 +2,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { BinanceScalper } from './binance-scalper.mjs';
 
 export const SYMBOLS = ['SNDK', 'ANTH'];
 export const REBATE_RATIOS = Object.freeze([0, 1.1, 1.2]);
@@ -167,7 +168,7 @@ export function studyEvaluation({ buy, sell, config, at, sourceTimeUncertain = f
 }
 
 export class Lab {
-  constructor(config, emit = () => {}, { automaticFees = false } = {}) {
+  constructor(config, emit = () => {}, { automaticFees = false, scalperSuspendedReason = null } = {}) {
     this.config = validateConfig(config);
     this.emit = emit;
     this.books = new Map();
@@ -189,6 +190,12 @@ export class Lab {
     this.useAutomaticFees = automaticFees;
     this.feeClocks = new Map();
     this.feeEpochs = new Map();
+    this.scalper = new BinanceScalper(config, emit, {
+      fresh: (venue, symbol, now, wall) => this.fresh(venue, symbol, now, wall),
+      market: (venue, symbol) => this.markets.get(pairKey(venue, symbol)),
+      entropyFee: (symbol, now, wall) => this.entropyFeeSnapshot(symbol, now, wall),
+      sweep, suspendedReason: scalperSuspendedReason,
+    });
   }
   setMarkets(markets, now = performance.now(), wall = Date.now()) {
     this.markets = new Map(markets.map((m) => [pairKey(m.venue, m.symbol), m]));
@@ -222,6 +229,15 @@ export class Lab {
     config.simulation.rebateRatios = [...REBATE_RATIOS];
     return { config, feeSnapshot };
   }
+  entropyFeeSnapshot(symbol, now = performance.now(), wall = Date.now()) {
+    const snapshot = this.feeSnapshot(symbol, now, wall), fee = snapshot.entropy;
+    const available = finite(snapshot.takerBps.entropy);
+    return { mode: 'auto_entropy', symbol,
+      status: available ? 'available' : fee?.status === 'available' && (wall >= fee.expiresAt || now >= (this.feeClocks.get(pairKey('entropy', symbol))?.expiresMono ?? -Infinity)) ? 'expired' : 'unavailable',
+      revision: available ? fee.revision : null, takerBps: snapshot.takerBps.entropy,
+      fetchedAt: fee?.fetchedAt ?? null, expiresAt: fee?.expiresAt ?? null, entropy: fee,
+      rebateBasis: 'total_entropy_fees', rebateRatios: [1.1, 1.2] };
+  }
   syncFeeEpochs(now, wall) {
     if (!this.useAutomaticFees) return;
     for (const symbol of SYMBOLS) {
@@ -235,6 +251,7 @@ export class Lab {
   }
   reject(reason) { this.counts.rejected[reason] = (this.counts.rejected[reason] || 0) + 1; }
   invalidate(venue, symbol, reason) {
+    this.scalper.invalidate(venue, symbol, reason);
     if (venue !== 'binance') for (const probe of [...this.studyProbes.values()]) {
       if ((!symbol || probe.symbol === symbol) && probe.legs.some((leg) => leg.venue === venue)) this.endStudy(probe, null, 'invalidated');
     }
@@ -320,6 +337,7 @@ export class Lab {
     }
   }
   advance(now, wall, incoming = null) {
+    this.scalper.advance(now, wall, incoming);
     this.advanceStudies(now, wall, incoming);
     for (const t of this.tasks.values()) {
       const s = t.costConfig.simulation;
@@ -501,6 +519,7 @@ export class Lab {
       ...(this.useAutomaticFees ? { automaticFees: { mode: 'auto', rebateBasis: 'total_entropy_fees', rebateRatios: [1.1, 1.2],
         bySymbol: Object.fromEntries(SYMBOLS.map((symbol) => [symbol, this.feeSnapshot(symbol, now, wall)])) } } : {}),
       observedAt: wall,
+      binanceScalper: this.scalper.report(now, wall),
       observation: { asOf: wall, silenceAfterMs: 10000 },
       counts: this.counts,
       latestQuotes: [...this.books.values()].map((b) => ({ venue: b.venue, symbol: b.symbol, nativeSymbol: b.nativeSymbol, bid: b.bids[0][0], ask: b.asks[0][0], receivedAt: b.receivedAt, sourceAt: b.sourceAt,

@@ -162,3 +162,61 @@
   .el-config>summary{padding:15px 16px 34px}.el-detail-hint{left:32px;right:auto;top:39px;font-size:.625rem}.el-config fieldset{padding:16px 16px 0}.el-form-grid{grid-template-columns:minmax(0,1fr);gap:14px}.el-field input{height:40px;font-size:16px}.el-latency-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.el-latency-row>strong{grid-column:1/-1}.el-form-actions{flex-direction:column;align-items:stretch;padding:14px 16px;gap:10px}.el-form-actions>div{display:grid;grid-template-columns:1fr 1fr}.el-form-actions .button{min-height:42px;padding:8px 6px;font-size:.6875rem}.el-check{min-height:36px}.el-diagnostic-details>summary{padding:15px 16px;min-height:44px}
 }
 @media(prefers-reduced-motion:reduce){.el-page .spin{animation:none}}
+.el-scalper{min-width:0;overflow:hidden}
+.el-scalper-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 22px 14px}
+.el-scalper-eyebrow{display:block;font-size:.625rem;letter-spacing:.09em;color:var(--text-tertiary);margin-bottom:7px}
+.el-scalper-heading h2{font-size:1rem;font-weight:650;line-height:1.5}
+.el-scalper-conclusion{padding:0 22px 16px}
+.el-scalper-conclusion h3{font-size:1.125rem;font-weight:600;line-height:1.6}
+.el-scalper-conclusion p{font-size:.75rem;line-height:1.8;color:var(--text-secondary);max-width:100ch;margin-top:4px}
+.el-scalper-scope{padding:10px 22px;background:var(--surface-1);border-top:1px solid var(--surface-4);border-bottom:1px solid var(--surface-4);font-size:.6875rem;line-height:1.8;color:var(--text-secondary)}
+.el-scalper-scenarios{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+.el-scalper-scenario{min-width:0;padding:18px 22px}
+.el-scalper-scenario+.el-scalper-scenario{border-left:1px solid var(--surface-4)}
+.el-scalper-scenario-heading{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.el-scalper-scenario-heading h3{font-size:.875rem;font-weight:600}
+.el-scalper-scenario-heading>span{font-size:.625rem;color:var(--text-tertiary)}
+.el-scalper-stage{margin-top:14px;border-left:2px solid var(--accent);padding-left:10px}
+.el-scalper-stage strong{font-size:.8125rem;font-weight:550}
+.el-scalper-stage p{font-size:.6875rem;color:var(--text-secondary);line-height:1.8;margin-top:3px}
+.el-scalper-stage.alert{border-color:var(--warning)}
+.el-scalper-stage.alert strong{color:var(--warning)}
+.el-scalper-triggers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:17px 0 0;padding:12px 0;border-top:1px solid var(--surface-4);border-bottom:1px solid var(--surface-4)}
+.el-scalper-triggers dt{font-size:.625rem;color:var(--text-secondary);line-height:1.7}
+.el-scalper-triggers dd{margin:5px 0 0;font-size:1rem;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.el-scalper-triggers dd small{display:block;font-size:.625rem;color:var(--text-tertiary);line-height:1.8;margin-top:3px}
+.el-scalper-position{font-size:.6875rem;line-height:1.8;color:var(--text-secondary);margin-top:10px}
+.el-scalper-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:17px 16px;margin:18px 0}
+.el-scalper-metrics dt{font-size:.6875rem;color:var(--text-secondary);margin-bottom:5px}
+.el-scalper-metrics dd{margin:0;font-size:1.125rem;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;line-height:1.4}
+.el-scalper-metrics dd small{display:block;font-size:.625rem;color:var(--text-tertiary);line-height:1.7;margin-top:4px}
+.el-scalper-metrics dd small.el-scalper-unit{display:inline}
+.el-scalper-metrics dd.pending{color:var(--text-secondary)}
+.el-scalper-metrics dd.negative{color:var(--warning)}
+.el-scalper-rebates{padding-top:12px;border-top:1px solid var(--surface-4)}
+.el-scalper-rebates>p{display:flex;flex-wrap:wrap;justify-content:space-between;gap:5px 10px;font-size:.625rem;line-height:1.8}
+.el-scalper-rebates>p strong{font-weight:550;color:var(--text-secondary)}
+.el-scalper-rebates>p span{color:var(--text-tertiary)}
+.el-scalper-rebates dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:10px 0 0}
+.el-scalper-rebates dt{font-size:.6875rem;color:var(--text-secondary)}
+.el-scalper-rebates dd{margin:5px 0 0;font-size:1.125rem;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.el-scalper-rebates dd small{display:block;font-size:.625rem;color:var(--text-tertiary);line-height:1.8;margin-top:4px}
+.el-scalper-costs{font-size:.625rem;color:var(--text-tertiary);line-height:1.8;margin-top:14px;overflow-wrap:anywhere}
+.el-scalper-trades{margin-top:14px;border-top:1px solid var(--surface-4)}
+.el-scalper-trades>summary{font-size:.6875rem;line-height:1.8;padding:11px 0;cursor:pointer;color:var(--text-secondary)}
+.el-scalper-trades>summary span{display:block;font-size:.625rem;color:var(--text-tertiary);margin-left:15px}
+.el-scalper-trades .el-table{font-size:.6875rem}
+.el-scalper-trades .el-table caption{padding:10px 0;font-size:.625rem}
+.el-scalper-trades .el-table th,.el-scalper-trades .el-table td{padding:9px 10px}
+.el-scalper-trades .el-table td small:first-child{margin-top:0;color:var(--text-secondary)}
+.el-scalper-policy{padding:0 22px 14px;border-top:1px solid var(--surface-4)}
+.el-scalper-policy summary{font-size:.75rem;color:var(--text-secondary);padding:13px 0 0;cursor:pointer}
+.el-scalper-policy p{font-size:.6875rem;line-height:1.9;color:var(--text-secondary);margin-top:9px;max-width:130ch}
+.el-scalper-empty{grid-column:1/-1;padding:18px 22px;font-size:.75rem;color:var(--text-secondary)}
+@media(max-width:850px){.el-scalper-scenarios{grid-template-columns:minmax(0,1fr)}.el-scalper-scenario+.el-scalper-scenario{border-left:0;border-top:1px solid var(--surface-4)}}
+@media(max-width:650px){
+  .el-scalper-heading{padding:17px 16px 13px;align-items:flex-start;flex-direction:column;gap:12px}.el-scalper-heading h2{font-size:.9375rem}.el-scalper-heading .el-symbols{align-self:flex-start}.el-scalper-heading .el-symbols button{min-height:40px}
+  .el-scalper-conclusion{padding:0 16px 14px}.el-scalper-conclusion h3{font-size:1rem}.el-scalper-conclusion p{font-size:.6875rem}.el-scalper-scope{padding:10px 16px}
+  .el-scalper-scenario{padding:17px 16px}.el-scalper-metrics{gap:16px 12px}.el-scalper-metrics dd{font-size:1rem}.el-scalper-metrics dt{font-size:.625rem}.el-scalper-rebates dd{font-size:1rem}
+  .el-scalper-policy{padding:0 16px 14px}.el-scalper-policy summary,.el-scalper-trades>summary{min-height:44px}.el-scalper-triggers{gap:10px}.el-scalper-triggers dd{font-size:.9375rem}
+}

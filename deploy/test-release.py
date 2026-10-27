@@ -77,7 +77,7 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         (source / 'package.json').write_text('{"type":"module"}')
         lab = source / 'tools/entropy-lighter-lab'
         lab.mkdir(parents=True)
-        names = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'config.example.json')
+        names = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')
         for name in names:
             shutil.copy2(ROOT / 'tools/entropy-lighter-lab' / name, lab / name)
         (lab / 'config.json').write_text('private configuration must not ship')

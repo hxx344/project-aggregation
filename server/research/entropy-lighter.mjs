@@ -9,7 +9,7 @@ import { buildResearchInsights } from './entropy-lighter-insights.mjs';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const tool = path.join(root, 'tools/entropy-lighter-lab');
 const defaults = JSON.parse(readFileSync(path.join(tool, 'config.example.json'), 'utf8'));
-const REPORT_KEYS = ['schema', 'session', 'mode', 'startedAt', 'heartbeatAt', 'observedAt', 'observation', 'opportunityStudy', 'automaticFees', 'configHash', 'sessionConfig', 'paperSuspendedReason', 'counts', 'basis', 'leaderMarkouts', 'paper', 'openPaperTasks', 'assumptions', 'diagnostics', 'eventLoopDelayMs', 'stopped', 'latestQuotes', 'recentSpreads'];
+const REPORT_KEYS = ['schema', 'session', 'mode', 'startedAt', 'heartbeatAt', 'observedAt', 'observation', 'opportunityStudy', 'automaticFees', 'binanceScalper', 'configHash', 'sessionConfig', 'paperSuspendedReason', 'counts', 'basis', 'leaderMarkouts', 'paper', 'openPaperTasks', 'assumptions', 'diagnostics', 'eventLoopDelayMs', 'stopped', 'latestQuotes', 'recentSpreads'];
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;

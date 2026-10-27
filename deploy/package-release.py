@@ -19,7 +19,7 @@ MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
 # ASTER's dashboard is prebuilt static content served by its Python bridge.
 # Its vinext/React build graph must not become server runtime dependencies.
 IMPORTERS = ('.', 'modules/monitor', 'modules/asset', 'modules/crossex')
-LAB_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'config.example.json')
+LAB_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')
 EXCLUDED = {'node_modules', '.git', '.venv', '.venv-aster', '.vinext', '.wrangler', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',
             '.mypy_cache', 'tests', 'test-results', 'output', 'runtime-data', '.data',
             '.env', '.env.local', '.env.production', '.env.production.local', '.env.linux'}

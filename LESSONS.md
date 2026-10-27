@@ -1277,6 +1277,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `entropy-public-fees-and-rebate-basis-20261027`；实际发生日期 2026-10-27（Asia/Shanghai）；不推进全历史复盘检查点。
 
+### L081：暂停研究执行须保留可见的未决敞口与原会话统计
+
+**适用条件：** 行情采集进程内默认运行方向模拟，重启会新建会话；上次有未平任务、未知退出或未清洁结束，需要暂停新的模拟。
+
+**根因：** 仅把旧报告写入备份并给新引擎传暂停标记，仍会创建空持仓、零费用和零净收益的新报告。后台阻断生效，但真实页面不再显示旧敞口、亏损及成交额，用户看到的零值会掩盖尚未确认的结果。默认方向模拟可能运行在 `mode=research`，只检查旧 `mode=paper` 也会漏掉启动后首次五秒写盘前的崩溃。
+
+**以后做法：** 恢复检查跟随实际模拟功能而非总模式名称。暂停执行与保留证据分别处理：不把旧任务装入新引擎，继续投影原会话任务、统计、费率和观测时间，标明来源会话；所有未确认的总净收益及返佣后收益保持未知，已知费用、成交额和逐笔历史保留。连续重启不覆盖最初归档、不递归嵌套报告。正常新会话的指标明确本会话口径，不冒充全历史累计。
+
+**如何验证：** [真实 CLI 重启测试](tests/entropy-lighter-cli.test.mjs) 用带开仓、已平亏损、费用和成交额的报告验证重启后保留原状态，并覆盖首次定期快照前强杀及连续重启；[生产方向页夹具](tests/entropy-lighter-scalper.browser.mjs) 验证旧会话未决与无任务但未清洁结束时净收益未知、历史仍可见。
+
+**证据：** 基于 project-aggregation `fea7af6` 的本次未发布剥头皮实现，2026-10-27 独立审查用真实 CLI 复现归档保留但页面投影 `openTasks=0/fees=0/turnover=0/net=0`。修复后连续两次重启保留原 `openTasks=1/completed=2/fees=0.15/turnover=300/settledNet=-3`，净收益及返佣后净收益保持 null；见 [恢复投影](tools/entropy-lighter-lab/cli.mjs) 与 [审查记录](docs/reviews/2026-10-27-binance-depth4-scalper.md)。不是基线正式版的逃逸缺陷。
+
+**事件记录：** `scalper-restart-unresolved-visible-evidence-20261027`；实际发生日期 2026-10-27（Asia/Shanghai）；不推进全历史复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

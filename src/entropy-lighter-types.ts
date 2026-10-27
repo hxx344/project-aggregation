@@ -139,6 +139,7 @@ export interface LabInsights {
   paper: { scope: 'all_symbols'; unresolved: boolean; openTasks: number };
 }
 export interface LabReport {
+  binanceScalper?: LabBinanceScalper;
   observedAt?: number;
   observation?: { asOf: number; silenceAfterMs: number };
   sessionConfig?: LabConfig;
@@ -180,6 +181,105 @@ export interface LabReport {
   assumptions: Record<string, string>;
   latestQuotes: LabQuote[];
   recentSpreads: Partial<Record<LabSymbol, LabSpread[]>>;
+}
+export interface LabScalperRebate {
+  ratio: number;
+  contingentRebate: number;
+  net: number | null;
+}
+export interface LabScalperFeeSnapshot {
+  mode: 'auto_entropy';
+  symbol: LabSymbol;
+  status: 'available' | 'unavailable' | 'expired';
+  revision: string | null;
+  takerBps: number | null;
+  entropy: LabFeeFact | null;
+  fetchedAt: number | null;
+  expiresAt: number | null;
+  rebateBasis: 'total_entropy_fees';
+  rebateRatios: [1.1, 1.2];
+}
+export interface LabScalperTrade {
+  id: string;
+  at: number;
+  direction: 'long' | 'short';
+  outcome: 'completed' | 'failed_entry' | 'unresolved';
+  entryPrice: number | null;
+  exitPrice: number | null;
+  exitReason: string | null;
+  durationMs: number | null;
+  grossPnl: number | null;
+  fees: number;
+  costReserve: number;
+  netBeforeRebate: number | null;
+  turnover: number;
+  rebateScenarios: LabScalperRebate[];
+  feeSnapshot?: LabScalperFeeSnapshot;
+}
+export interface LabScalperScenario {
+  name: string;
+  entropyMs: number;
+  state: 'waiting' | 'armed' | 'entry_pending' | 'holding' | 'exit_pending' | 'cooldown' | 'unresolved';
+  reason: string | null;
+  armed: { at: number; upper: number; lower: number; sequence: number | string } | null;
+  position: {
+    direction: 'long' | 'short';
+    triggerPrice: number;
+    signalAt: number;
+    entryAt: number | null;
+    entryPrice: number | null;
+    quantity: number;
+    entryCash: number | null;
+    entryDueAt?: number;
+    exitDueAt?: number | null;
+    exitIntent?: { reason: string; [key: string]: unknown } | null;
+    feeSnapshot?: LabScalperFeeSnapshot;
+  } | null;
+  stats: {
+    signals: number;
+    completed: number;
+    failedEntries: number;
+    unresolved: number;
+    lossesBeforeRebate: number;
+    turnover: number;
+    fees: number;
+    costReserve: number;
+    settledGrossPnl?: number;
+    settledNetBeforeRebate?: number;
+    grossPnl: number | null;
+    netBeforeRebate: number | null;
+    hasOpenExposure: boolean;
+    nonLossRateBeforeRebate?: number | null;
+    rebateScenarios: LabScalperRebate[];
+  };
+  recentTrades: LabScalperTrade[];
+  lastEventAt: number | null;
+}
+export interface LabBinanceScalper {
+  schema: 1;
+  strategy: 'binance_depth4_entropy_taker';
+  mode: 'directional_research';
+  enabled: boolean;
+  suspendedReason: string | null;
+  observedAt: number;
+  previousSession?: { session: string; stopped: boolean; heartbeatAt: string | null };
+  policy: {
+    level: 4;
+    maxHoldMs: number;
+    cooldownMs: number;
+    notionalPerTrade: number;
+    slippageBpsPerFill: number;
+    fundingReserveBpsPerRoundTrip: number;
+    latency: 'assumed';
+    entry: string;
+    exit: string;
+  };
+  bySymbol: Partial<Record<LabSymbol, {
+    leader?: { status: 'available' | 'unavailable'; nativeSymbol: string | null; identityVerified: boolean; settlementEquivalence: string | boolean; reason: string | null };
+    scenarios: Record<string, LabScalperScenario>;
+  }>>;
+  openTasks: unknown[];
+  assumptions: Record<string, unknown>;
 }
 export interface LabSnapshot {
   schema: 1;
