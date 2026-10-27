@@ -301,7 +301,8 @@ class EngineTest(unittest.TestCase):
                            if hour % 29 and not FRIDAY_21 + 70 <= hour < FRIDAY_21 + 74})  # scattered gaps and a 4-hour hole
         for days in (1, 2):
             window = engine.TrendWindow(wavy, days)
-            hours = [*range(FRIDAY_21, FRIDAY_21 + 60, 1), *range(FRIDAY_21 + 61, NEXT_FRIDAY_08, 9), FRIDAY_21 + 5]  # steps, jumps, back
+            hours = [*range(FRIDAY_21, FRIDAY_21 + 60, 1), *range(FRIDAY_21 + 61, FRIDAY_21 + 100, 9),
+                     FRIDAY_21 + 97 + days * 24, FRIDAY_21 + 98 + days * 24 + 30, NEXT_FRIDAY_08 - 1, FRIDAY_21 + 5]  # steps, one window, more, back
             states = [window.state(hour) for hour in hours]
             self.assertEqual(states, [engine.trend_state(wavy, hour, days) for hour in hours])
             self.assertEqual({None, "above", "below"}, set(states))
