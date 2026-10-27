@@ -3,6 +3,11 @@
 Usage (needs Python 3.9+ with `pip install pyarrow numpy`):
   python options_parquet_to_sqlite.py inspect  options_hourly/BTC
   python options_parquet_to_sqlite.py convert  options_hourly/BTC -o btc_smiles.sqlite3
+  python options_parquet_to_sqlite.py slim     options_hourly/BTC -o options_hourly_slim
+
+`slim` rewrites the parquet files with only each hour's latest snapshot and the
+columns a backtest needs (time, expiry, strike, type, IVs, prices, forward), for
+uploading the raw quotes; its output still works with `inspect` and `convert`.
 
 Raw quotes (every strike, every hour) do not fit in 20 MB, so `convert` keeps one
 row per (UTC hour, expiry): the forward, ATM IV, the median bid/ask IV spread near
@@ -40,6 +45,7 @@ ROLES = {
     "bid_iv": ["bid_iv"],
     "ask_iv": ["ask_iv"],
 }
+PRICES = ["mark_price", "bid_price", "ask_price", "best_bid_price", "best_ask_price"]
 NODES = np.arange(-3.0, 3.01, 0.5)
 SNAPSHOT_WINDOW = 15 * 60
 INSTRUMENT = re.compile(r"^[A-Z]+-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:[.d]\d+)?)-([CP])$")
@@ -305,10 +311,57 @@ def convert(args):
     return 0
 
 
+def slim(args):
+    """Copy the parquet files keeping each hour's latest quote per contract and only the columns a backtest needs."""
+    files = files_in(args.directory)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    columns = detect(pq.read_schema(files[0]).names, dict(args.map))
+    require(columns)
+    before = after = 0
+    for path in files:
+        target = output / path.name
+        before += path.stat().st_size
+        if target.exists():
+            after += target.stat().st_size
+            print(f"  {path.name}: already in {output}, skipped")
+            continue
+        rows, data = load(path, columns)
+        names = {name.lower(): name for name in pq.read_schema(path).names}
+        prices = [name for name in PRICES if name in names]
+        if prices:
+            table = pq.read_table(path, columns=[names[name] for name in prices])
+            data.update({name: numbers(table[names[name]]) for name in prices})
+        data = latest_per_hour(data)
+        if args.max_dte:
+            keep = data["expiry"] - data["hour"] * 3600 <= args.max_dte * 86400
+            data = {key: value[keep] for key, value in data.items()}
+        real = lambda values: pa.array(values.astype("float32"), from_pandas=True)
+        fields = {
+            "timestamp": pa.array(np.round(data["time"] * 1000).astype("int64"), pa.timestamp("ms", "UTC")),
+            "expiration": pa.array(np.round(data["expiry"]).astype("int64"), pa.timestamp("s", "UTC")),
+            "strike_price": real(data["strike"]),
+            "type": pa.array(np.where(data["is_call"], "call", "put")).dictionary_encode(),
+            "mark_iv": real(data["iv"]), "bid_iv": real(data["bid_iv"]), "ask_iv": real(data["ask_iv"]),
+        }
+        if columns["forward"]:
+            fields["underlying_price"] = pa.array(data["forward"], from_pandas=True)
+        if columns["index"]:
+            fields["index_price"] = pa.array(data["index"], from_pandas=True)
+        fields.update({name: real(data[name]) for name in prices})
+        partial = target.with_name(target.name + ".partial")
+        pq.write_table(pa.table(fields), partial, compression="zstd", compression_level=9)
+        partial.replace(target)
+        after += target.stat().st_size
+        print(f"  {path.name}: {rows:,} -> {data['time'].size:,} rows, {path.stat().st_size / 1e6:.1f} -> {target.stat().st_size / 1e6:.1f} MB")
+    print(f"total {before / 1e6:,.1f} -> {after / 1e6:,.1f} MB in {output}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "convert"):
+    for name in ("inspect", "convert", "slim"):
         command = commands.add_parser(name)
         command.add_argument("directory", help="folder with YYYY-MM.parquet files")
         command.add_argument("--map", action="append", default=[], type=lambda text: tuple(text.split("=", 1)),
@@ -317,8 +370,11 @@ def main(argv=None):
     convert_parser.add_argument("-o", "--output", default="btc_smiles.sqlite3")
     convert_parser.add_argument("--max-dte", type=int, default=0, help="drop expiries further than this many days (0 = keep all)")
     convert_parser.add_argument("--limit-mb", type=float, default=20)
+    slim_parser = commands.choices["slim"]
+    slim_parser.add_argument("-o", "--output", default="options_hourly_slim", help="folder for the slimmed parquet files")
+    slim_parser.add_argument("--max-dte", type=int, default=0, help="drop expiries further than this many days (0 = keep all)")
     args = parser.parse_args(argv)
-    return inspect(args) if args.command == "inspect" else convert(args)
+    return {"inspect": inspect, "convert": convert, "slim": slim}[args.command](args)
 
 
 if __name__ == "__main__":
