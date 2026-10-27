@@ -254,12 +254,12 @@ class InstallerTransactionTests(unittest.TestCase):
 
     def test_remote_download_is_allowlisted_pinned_and_same_content_updates_identity(self):
         old = self.h.success(remote=True)
-        self.assertEqual(self.h.count("downloads"), 5)
+        self.assertEqual(self.h.count("downloads"), len(FILES))
         self.assertEqual(self.h.success(remote=True), old)
-        self.assertEqual(self.h.count("downloads"), 5)
+        self.assertEqual(self.h.count("downloads"), len(FILES))
         (self.h.base / "revision").write_text("b" * 40)
         self.assertEqual(self.h.success(remote=True), old)
-        self.assertEqual(self.h.count("downloads"), 10)
+        self.assertEqual(self.h.count("downloads"), 2 * len(FILES))
         self.assertEqual(self.h.count("validation"), 1)
         self.assertEqual((old / ".install-revision").read_text().strip(), "b" * 40)
 
