@@ -131,6 +131,28 @@ class SabrCacheTests(unittest.TestCase):
         self.assertEqual(cache.surfaces(START, START + 3600, "1h", refresh=False), [])
         self.assertEqual(cache.status()["empty"], 2)
 
+    def test_header_only_response_covers_buckets_as_empty(self):
+        self.upstream.responder = lambda request: httpx.Response(200, text=HEADER + "\n")
+        cache = self.cache()
+        cache.sync(START, START + 3600, "1h")
+        self.assertEqual((cache.status()["buckets"], cache.status()["empty"]), (2, 2))
+
+    def test_refetch_never_drops_a_bucket_that_had_a_surface(self):
+        self.clock.now = START + 3600
+        cache = self.cache()
+        cache.sync(START, START + 3600, "1h")
+        self.upstream.responder = lambda request: httpx.Response(200, text=csv_body([START + 3600], expiries=("3MAY26",)))
+        self.clock.now = START + 10 * 3600
+        cache.sync(START, START + 3600, "1h")
+        rows = cache.surfaces(START, START + 3600, "1h", refresh=False)
+        self.assertEqual({(row["query_time"], row["expiry"]) for row in rows},
+                         {(START, "2MAY26"), (START, "29MAY26"), (START + 3600, "3MAY26")})
+        self.assertEqual(cache.status()["provisional"], 1)
+        self.upstream.responder = lambda request: httpx.Response(200, text=csv_body(grid_points(request)))
+        self.clock.now += 900
+        self.assertEqual(cache.sync(START, START + 3600, "1h").fetched, 1)
+        self.assertEqual(cache.status()["provisional"], 0)
+
     def test_local_hourly_budget_survives_restart_and_keeps_progress(self):
         self.clock.now = START + 30 * 86400 + 10
         cache = self.cache(hourly_budget=2)
@@ -166,6 +188,18 @@ class SabrCacheTests(unittest.TestCase):
         self.assertEqual(self.cache().sync(START, START + 3600, "1h", wait=True).fetched, 2)
         self.assertEqual(self.clock.sleeps, [121.0])
 
+    def test_upstream_429_without_usable_retry_after_pauses_to_next_hour(self):
+        for header in ({}, {"Retry-After": "inf"}):
+            with self.subTest(header=header):
+                self.clock.now = (self.clock.now // 3600 + 1) * 3600 + 100
+                self.path = Path(self.directory.name) / f"cache-{len(self.caches)}.sqlite3"
+                self.upstream = Upstream(lambda request, header=header: httpx.Response(429, headers=header, json={"detail": "busy"}))
+                cache = self.cache()
+                with self.assertRaises(GreeksLiveError) as raised:
+                    cache.sync(START, START + 3600, "1h")
+                self.assertEqual(raised.exception.retry_at, self.clock.now - 100 + 3600)
+                self.assertEqual(cache.status()["paused_until"], utc_iso(self.clock.now - 100 + 3600))
+
     def test_failures_are_classified_without_storing_rows(self):
         cases = [
             (lambda request: httpx.Response(401, json={"detail": "Invalid API key"}), "auth", "Invalid API key", 1),
@@ -173,6 +207,11 @@ class SabrCacheTests(unittest.TestCase):
             (lambda request: httpx.Response(503, text="<html>secret page</html>"), "upstream", "non-JSON error body", 3),
             (lambda request: httpx.Response(200, text=csv_body([START + 7200])), "format", "outside the requested grid", 1),
             (lambda request: httpx.Response(200, text=HEADER.replace(",alpha", "") + "\n"), "format", "lacks columns: alpha", 1),
+            (lambda request: httpx.Response(404, text="<html>secret page</html>"), "upstream", "HTTP 404: non-JSON error body", 1),
+            (lambda request: httpx.Response(404, json={"detail": "Not Found"}), "upstream", "HTTP 404: Not Found", 1),
+            (lambda request: httpx.Response(200, text=""), "format", "empty SABR response", 1),
+            (lambda request: httpx.Response(200, text=csv_body([START]).rsplit(",", 3)[0] + "\n"), "format", "unreadable row at line 3", 1),
+            (lambda request: httpx.Response(200, text=csv_body([START]).rstrip() + ",extra\n"), "format", "unreadable row at line 3", 1),
         ]
         for responder, kind, message, attempts in cases:
             with self.subTest(kind=kind, message=message):

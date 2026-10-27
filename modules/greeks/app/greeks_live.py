@@ -79,10 +79,17 @@ def _number(value):
     return number if math.isfinite(number) else None
 
 
+def _json_detail(response: httpx.Response):
+    try:
+        return json.loads(response.content[:ERROR_BODY_LIMIT].decode("utf-8", "replace")).get("detail")
+    except (ValueError, AttributeError):
+        raise ValueError("non-JSON error body") from None
+
+
 def _error_detail(response: httpx.Response) -> str:
     try:
-        detail = json.loads(response.content[:ERROR_BODY_LIMIT].decode("utf-8", "replace")).get("detail")
-    except (ValueError, AttributeError):
+        detail = _json_detail(response)
+    except ValueError:
         return "non-JSON error body"
     if detail is None:
         return "no detail"
@@ -95,27 +102,38 @@ def _response_error(response: httpx.Response) -> GreeksLiveError:
     retry_after = None
     if status == 429:
         try:
-            retry_after = max(0.0, float(response.headers.get("retry-after", "")))
+            retry_after = float(response.headers.get("retry-after", ""))
+            retry_after = min(max(0.0, retry_after), 3600.0) if math.isfinite(retry_after) else None
         except ValueError:
             retry_after = None
     return GreeksLiveError(kind, f"Greeks.live HTTP {status}: {_error_detail(response)}", status, retry_after)
 
 
+def _upstream_has_no_data(response: httpx.Response) -> bool:
+    # Only the API's own JSON 404 means "no surface in the grid"; a gateway page or
+    # the framework's unknown-route "Not Found" (wrong base URL) must not cache empty buckets.
+    try:
+        detail = _json_detail(response)
+    except ValueError:
+        return False
+    return isinstance(detail, str) and detail.strip() not in ("", "Not Found")
+
+
 def _sabr_rows(response: httpx.Response) -> list[dict]:
-    if response.status_code == 404:
+    if response.status_code == 404 and _upstream_has_no_data(response):
         return []
     if response.status_code != 200:
         raise _response_error(response)
     reader = csv.DictReader(io.StringIO(response.text))
     if reader.fieldnames is None:
-        return []
+        raise GreeksLiveError("format", "Greeks.live returned an empty SABR response")
     missing = {"query_time", "source_time", "expiry", *FLOAT_FIELDS} - set(reader.fieldnames)
     if missing:
         raise GreeksLiveError("format", f"Greeks.live SABR CSV lacks columns: {', '.join(sorted(missing))}")
     rows = []
     for record in reader:
         try:
-            if record.get("asset") not in (None, "", "BTC") or not record["expiry"]:
+            if None in record or None in record.values() or record.get("asset", "BTC") not in ("", "BTC") or not record["expiry"]:
                 raise ValueError
             row = {"query_time": parse_utc(record["query_time"]), "source_time": parse_utc(record["source_time"]), "expiry": record["expiry"],
                    **{field: _number(record[field]) for field in FLOAT_FIELDS},
@@ -147,7 +165,7 @@ class GreeksLiveClient:
             retry = attempt < len(RETRY_DELAYS)
             try:
                 response = self._http.get(SABR_PATH, params=params)
-            except httpx.TransportError as exc:
+            except httpx.RequestError as exc:
                 if retry:
                     self._sleep(RETRY_DELAYS[attempt])
                     continue
@@ -236,11 +254,17 @@ class SabrCache:
         if stray is not None:
             raise GreeksLiveError("format", f"Greeks.live returned query_time {utc_iso(stray['query_time'])} outside the requested grid")
         fetched_at = int(self._clock())
+        returned = {row["query_time"] for row in rows}
+        # A bucket that once had a surface cannot lose it under as-of lookup; keep the old
+        # rows and leave the bucket provisional instead of finalizing a degraded empty answer.
+        kept = {point for (point,) in self._db.execute("SELECT DISTINCT query_time FROM sabr WHERE query_time BETWEEN ? AND ?", (run[0], run[-1]))
+                if point in wanted and point not in returned}
         with self._db:
-            self._db.executemany("DELETE FROM sabr WHERE query_time = ?", ((point,) for point in run))
+            self._db.executemany("DELETE FROM sabr WHERE query_time = ?", ((point,) for point in run if point not in kept))
             self._db.executemany(f"INSERT OR REPLACE INTO sabr ({', '.join(COLUMNS)}) VALUES ({', '.join('?' * len(COLUMNS))})",
                                  (tuple(row[column] for column in COLUMNS) for row in rows))
-            self._db.executemany("INSERT OR REPLACE INTO sabr_coverage (query_time, fetched_at) VALUES (?, ?)", ((point, fetched_at) for point in run))
+            self._db.executemany("INSERT OR REPLACE INTO sabr_coverage (query_time, fetched_at) VALUES (?, ?)",
+                                 ((point, fetched_at) for point in run if point not in kept))
 
     def sync(self, start: int, end: int, interval: str = "1h", *, wait: bool = False) -> SyncResult:
         """Fetch missing buckets; each request's rows are committed before the next, so a stopped sync resumes."""
