@@ -90,7 +90,8 @@ def sweep_command(args):
         writer.writeheader()
         writer.writerows(rows)
     paths = [path for path, _ in grid]
-    columns = [column for column in COLUMNS if any(row[column[1]] is not None for row in rows)]  # drop perp columns without perp legs
+    perp_fields = {"perp_pnl", "funding", "options_pnl"}
+    columns = [column for column in COLUMNS if column[1] not in perp_fields or any(row[column[1]] is not None for row in rows)]  # no perp legs
     header = paths + [label for label, _, _ in columns]
     table = [[json.dumps(row[path]) for path in paths] + [("-" if row[field] is None else fmt.format(row[field])) for _, field, fmt in columns]
              for row in rows[:args.top]]

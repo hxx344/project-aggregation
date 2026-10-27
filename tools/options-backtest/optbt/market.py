@@ -52,7 +52,7 @@ class ParquetMarket:
     def _binance(self):
         if self._perp is None:
             from .binance import BinancePerp
-            self._perp = BinancePerp(self.files)  # the option data's months; downloaded on first use
+            self._perp = BinancePerp()  # months are downloaded when a position first needs them
         return self._perp
 
     def perp(self, hour):

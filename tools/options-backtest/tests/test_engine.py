@@ -202,6 +202,34 @@ class EngineTest(unittest.TestCase):
         self.assertAlmostEqual(perp_fees, 0.0005 * 40000.0 * 2, places=2)  # held through the roll: one open, one close
         self.assertAlmostEqual(sum(t["pnl"] for t in calls_only) - sum(t["pnl"] for t in with_perp), perp_fees, places=2)
 
+    def test_carry_after_early_exit_and_only_one_refund_per_reopen(self):
+        perp, call = {"side": "buy", "type": "perp"}, {"side": "sell", "type": "call", "delta": 0.3}
+
+        def perp_fees(raw, market):
+            with_perp = engine.run(specs.validate(raw), market)[0]
+            calls_only = engine.run(specs.validate({**raw, "legs": [call]}), market)[0]
+            self.assertEqual([t["exit_hour"] for t in with_perp], [t["exit_hour"] for t in calls_only])
+            for trade in with_perp:
+                self.assertLessEqual(trade["worst_open_pnl"], trade["pnl"])
+            return with_perp, sum(t["fees"] for t in with_perp) - sum(t["fees"] for t in calls_only)
+
+        fee = 0.0005 * 40000.0
+        market = FakeMarket(flat(hours=range(FRIDAY_21, SUNDAY_08 + 1)), settlements={SUNDAY_08: 40000.0})
+        rolled = {"start": "2024-01-05", "end": "2024-01-06", "entry": {"hours": [21]}, "expiry": {"weekday": "sun"},
+                  "exit": {"close_hours_before_expiry": 11}, "legs": [perp, call]}
+        trades, fees = perp_fees(rolled, market)  # time exit at Sat 21:00 and reopen in the same hour
+        self.assertEqual([(t["reason"], t["exit_hour"]) for t in trades], [("time_exit", SUNDAY_08 - 11), ("time_exit", SUNDAY_08 - 10)])
+        self.assertAlmostEqual(fees, 2 * fee, places=2)
+        trades, fees = perp_fees({**rolled, "end": "2024-01-07", "entry": {"hours": [8, 21]}, "exit": {}}, market)
+        self.assertEqual(len(trades), 1)  # Sunday 08:00 reopen fails (no later Sunday listed): no refund
+        self.assertAlmostEqual(fees, 2 * fee, places=2)
+        market = FakeMarket(flat(hours=range(FRIDAY_21 - 1, NEXT_FRIDAY_08 + 1)), settlements={SUNDAY_08: 40000.0, NEXT_FRIDAY_08: 40000.0})
+        two = {"start": "2024-01-05", "end": "2024-01-07", "entry": {"hours": [8, 20, 21]}, "expiry": {"dte": 2}, "max_open": 2, "legs": [perp, call]}
+        trades, fees = perp_fees(two, market)  # two close at Sunday 08:00, one reopens then, one more at 20:00
+        self.assertEqual([(t["entry_hour"], t["exit_hour"]) for t in trades],
+                         [(FRIDAY_21 - 1, SUNDAY_08), (FRIDAY_21, SUNDAY_08), (SUNDAY_08, NEXT_FRIDAY_08), (SUNDAY_08 + 12, NEXT_FRIDAY_08)])
+        self.assertAlmostEqual(fees, 6 * fee, places=2)  # opens: 2 Friday + Sunday 20:00; closes: 1 Sunday 08:00 + 2 next Friday
+
     def test_max_loss_tolerates_float_quantities(self):
         legs = [engine.Leg(i, sign, SUNDAY_08, strike, True, qty, 0.0, 0.0, 0.5)
                 for i, (sign, strike, qty) in enumerate([(-1, 100.0, 0.1), (-1, 110.0, 0.2), (1, 120.0, 0.3)])]
@@ -296,31 +324,44 @@ except ImportError:
 class BinanceTest(unittest.TestCase):
     def test_archives_parse_and_funding_sums_without_network(self):
         import io
-        import zipfile
         from optbt import binance
-
-        def archive(text):
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "w") as handle:
-                handle.writestr("data.csv", text)
-            return buffer.getvalue()
 
         hour = FRIDAY_21 - 5  # a funding hour (multiple of 8)
         klines = "".join(f"{(hour + i - 1) * 3_600_000},0,0,0,{40000 + 100 * i},0,0,0,0,0,0,0\n" for i in range(3))
         funding = f"calc_time,funding_interval_hours,last_funding_rate\n{hour * 3_600_000 + 7},8,0.0001\n"
-        self.assertEqual(binance.parse(archive("open_time,open,high,low,close\n" + klines), "klines")[0], (hour, 40000.0))
-        self.assertEqual(binance.parse(archive(klines), "klines")[2], (hour + 2, 40200.0))  # older archives have no header
-        self.assertEqual(binance.parse(archive(funding), "funding"), [(hour, 0.0001)])
+        self.assertEqual(binance.parse("open_time,open,high,low,close\n" + klines, "klines")[0], (hour, 40000.0))
+        self.assertEqual(binance.parse(klines, "klines")[2], (hour + 2, 40200.0))  # older archives have no header
+        self.assertEqual(binance.parse(funding, "funding"), [(hour, 0.0001)])
         with tempfile.TemporaryDirectory() as folder:
             month = binance.month_name(engine.utc(hour).year * 12 + engine.utc(hour).month - 1)
             target = Path(folder) / "BTCUSDT"
             target.mkdir()
-            (target / f"klines-{month}.csv").write_text("".join(f"{h},{p}\n" for h, p in binance.parse(archive(klines), "klines")))
+            (target / f"klines-{month}.csv").write_text("".join(f"{h},{p}\n" for h, p in binance.parse(klines, "klines")))
             (target / f"funding-{month}.csv").write_text(f"{hour},0.0001\n")
-            perp = binance.BinancePerp([engine.utc(hour).year * 12 + engine.utc(hour).month - 1], directory=folder)  # no download
-        self.assertEqual((perp.price(hour + 1), perp.price(hour + 9)), (40100.0, None))
-        self.assertAlmostEqual(perp.funding(hour - 1, hour), 4.0)  # 0.01% of 40,000 at the funding hour
-        self.assertEqual(perp.funding(hour, hour + 2), 0.0)  # (after, upto]: entering at the funding hour pays nothing
+            perp = binance.BinancePerp(directory=folder)  # month files exist: no download
+            self.assertEqual((perp.price(hour + 1), perp.price(hour + 9)), (40100.0, None))
+            self.assertAlmostEqual(perp.funding(hour - 1, hour), 4.0)  # 0.01% of 40,000 at the funding hour
+            self.assertEqual(perp.funding(hour, hour + 2), 0.0)  # (after, upto]: entering at the funding hour pays nothing
+            (target / f"funding-{month}.csv").write_text(f"{hour},0.0001\n{hour + 8},0.0001\n")
+            with self.assertRaisesRegex(binance.PerpDataError, "no price at funding time"):
+                binance.BinancePerp(directory=folder).funding(hour - 1, hour)  # never drops a payment silently
+        calls, original = [], (binance.urllib.request.urlopen, binance.time.sleep)
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        binance.urllib.request.urlopen = lambda url, timeout: calls.append(url) or Response(b"not a zip")
+        binance.time.sleep = lambda seconds: None
+        try:
+            with self.assertRaisesRegex(binance.PerpDataError, "after 3 attempts"):
+                binance.fetch("https://example.invalid/x.zip")  # a corrupt archive is retried, then reported
+        finally:
+            binance.urllib.request.urlopen, binance.time.sleep = original
+        self.assertEqual(len(calls), 3)
 
 
 @unittest.skipUnless(HAS_ARROW, "needs numpy and pyarrow")

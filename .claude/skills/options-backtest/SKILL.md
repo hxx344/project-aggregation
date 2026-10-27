@@ -13,6 +13,6 @@ description: Backtest BTC option strategies (iron condor, strangle, spreads, leg
 4. 结果目录在摘要最后一行；分析逐笔时读 `trades.csv` 的相关列，不整份打印。
 5. 选腿或价格看起来不对时，用 `bt chain <UTC 小时> --dte N` 查看那一小时的期权链。
 
-含永续腿时，把盈亏拆成永续价格、资金费和期权部分（摘要和 sweep 表都有），并和单纯持有永续的基准对比。
+含永续腿时，把盈亏拆成永续价格、资金费和期权部分（摘要和 sweep 表都有），并和单纯持有永续的基准（`perp_pnl − funding`）对比，期权部分（`options`）才是策略相对基准的增量。
 
 向用户报告时说明：成交价模型（`mid` 偏乐观，`cross` 为吃单）、数据为 Deribit（实盘是 Bybit）、时间范围与交易笔数；不要只报总盈亏，带上最大回撤、最差单笔和按年份分布。

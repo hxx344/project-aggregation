@@ -220,7 +220,7 @@ def close_value(position, quotes, spec):
     return cash, fees, fallbacks
 
 
-def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, paid_funding=0.0, perp_pnl=0.0, perp_fee=0.0):
+def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, paid_funding=0.0, perp_pnl=0.0, perp_fee=0.0, carried=True):
     pnl = position.credit - position.fees + cash - fees - paid_funding
     return {
         "entry": utc(position.entry_hour).strftime("%Y-%m-%d %H:%M"), "exit": utc(hour).strftime("%Y-%m-%d %H:%M"),
@@ -231,9 +231,10 @@ def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, pai
         "credit": round(position.credit, 2), "fees": round(position.fees + fees, 2), "pnl": round(pnl, 2),
         "margin": round(position.margin, 2), "max_loss": None if position.max_loss is None else round(position.max_loss, 2),
         "worst_open_pnl": round(min(position.worst, pnl), 2), "fallback_fills": position.fallback_fills + fallbacks,
-        "fills": len(position.legs) + sum(reason != "expiry" or leg.expiry != position.expiry for leg in position.legs),
+        "fills": len(position.legs) + sum(reason != "expiry" or leg.expiry != position.expiry or leg.is_perp for leg in position.legs),
         "missing_hours": position.missing_hours, "perp_pnl": round(perp_pnl, 2), "funding": round(paid_funding, 2),
-        "_perp_close_fee": perp_fee,  # refunded by run() when the next position holds the perp on
+        # run() refunds the perp close fee when the next position holds the perp on from this same hour and price
+        "_carry": (perp_fee, position.worst) if carried and any(leg.is_perp for leg in position.legs) else None,
     }
 
 
@@ -241,9 +242,12 @@ def settle(position, market, hour, spec, price):
     """Settle legs expiring now at `price`; close any later legs at market."""
     cash = fees = perp_pnl = perp_fee = 0.0
     fallbacks = 0
+    carried = False
     for leg in position.legs:
         if leg.is_perp:  # closed at the option expiry hour's perp price (delivery estimate if missing)
-            close = market.perp(position.expiry) or price
+            close = market.perp(position.expiry)
+            carried = close is not None and hour == position.expiry
+            close = close or price
             perp_pnl += leg.sign * leg.value(close) * leg.qty
             perp_fee += leg_fee(spec["fees"], leg, close, close)
             continue
@@ -260,7 +264,7 @@ def settle(position, market, hour, spec, price):
         cash += leg.sign * leg.value(fill) * leg.qty
         fees += leg_fee(spec["fees"], leg, quote.forward, fill)
     return finish(position, hour, "expiry", cash + perp_pnl, fees + perp_fee, settlement=price, fallbacks=fallbacks,
-                  paid_funding=funding(position, market, position.expiry), perp_pnl=perp_pnl, perp_fee=perp_fee)
+                  paid_funding=funding(position, market, position.expiry), perp_pnl=perp_pnl, perp_fee=perp_fee, carried=carried)
 
 
 def step(position, market, hour, spec):
@@ -321,7 +325,7 @@ def run(spec, market, progress=None):
             trade = step(position, market, hour, spec)
             if trade:
                 trades.append(trade)
-                if any(leg.is_perp for leg in position.legs):
+                if trade["_carry"]:
                     closed_perps.append(trade)
             else:
                 still_open.append(position)
@@ -336,9 +340,11 @@ def run(spec, market, progress=None):
                     open_positions.append(position)
                     if closed_perps:  # the perp was held on, never closed: refund that close fee
                         held = closed_perps.pop()
-                        held["fees"] = round(held["fees"] - held["_perp_close_fee"], 2)
-                        held["pnl"] = round(held["pnl"] + held["_perp_close_fee"], 2)
-                        held["_perp_close_fee"] = 0.0
+                        fee, worst = held["_carry"]
+                        held["fees"] = round(held["fees"] - fee, 2)
+                        held["pnl"] = round(held["pnl"] + fee, 2)
+                        held["worst_open_pnl"] = round(min(worst, held["pnl"]), 2)
+                        held["_carry"] = None
                 else:
                     skipped[reason] = skipped.get(reason, 0) + 1
             if progress:
@@ -347,5 +353,5 @@ def run(spec, market, progress=None):
     for position in open_positions:
         skipped["open_at_data_end"] = skipped.get("open_at_data_end", 0) + 1
     for trade in trades:
-        del trade["_perp_close_fee"]
+        del trade["_carry"]
     return trades, skipped, (start, end)

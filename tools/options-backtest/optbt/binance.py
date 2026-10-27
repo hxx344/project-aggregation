@@ -1,9 +1,10 @@
 """Binance USD-M perpetual hourly prices and funding rates from the data.binance.vision monthly archives.
 
-Each month is downloaded once and kept as two-column CSVs under <directory>/<SYMBOL>/; a published
-month never changes, so a month is fetched again only when its CSV is missing. Downloads time out
-after 30 s and are tried 3 times; a month that still fails, or is not published yet (404), raises
-PerpDataError naming the URL. Standard library only.
+Months are loaded on demand, so a backtest only needs the months its positions touch. Each month is
+downloaded once and kept as two-column CSVs under <directory>/<SYMBOL>/; a published month never
+changes, so a month is fetched again only when its CSV is missing. Downloads time out after 30 s
+and are tried 3 times (a corrupt archive counts as a failed try); a month that still fails, or is
+not published yet (404), raises PerpDataError naming the URL. Standard library only.
 """
 import csv
 import io
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from bisect import bisect_right
+from datetime import datetime, timezone
 from pathlib import Path
 
 BASE = "https://data.binance.vision/data/futures/um/monthly"
@@ -30,27 +32,33 @@ def month_name(month):
     return f"{month // 12:04d}-{month % 12 + 1:02d}"
 
 
+def month_of_hour(hour):
+    moment = datetime.fromtimestamp(hour * 3600, timezone.utc)
+    return moment.year * 12 + moment.month - 1
+
+
 def fetch(url):
+    """The archive's CSV text."""
     error = None
     for attempt in range(ATTEMPTS):
         try:
             with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
-                return response.read()
+                body = response.read()
+            with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                return archive.read(archive.namelist()[0]).decode()
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                raise PerpDataError(f"{url} is not published (404)") from exc
+                raise PerpDataError(f"{url} is not published (404); limit the backtest with start/end") from exc
             error = exc
-        except (urllib.error.URLError, OSError) as exc:
+        except (urllib.error.URLError, OSError, zipfile.BadZipFile, IndexError, UnicodeDecodeError) as exc:
             error = exc
         if attempt + 1 < ATTEMPTS:
             time.sleep(2 * (attempt + 1))
     raise PerpDataError(f"download failed after {ATTEMPTS} attempts: {url}: {error}")
 
 
-def parse(body, kind):
+def parse(text, kind):
     """(hour, value) rows: a 1h candle's close labelled with the hour it ends at, or a funding rate at its hour."""
-    with zipfile.ZipFile(io.BytesIO(body)) as archive:
-        text = archive.read(archive.namelist()[0]).decode()
     rows = []
     for row in csv.reader(text.splitlines()):
         if not row or not row[0].strip().isdigit():
@@ -63,21 +71,13 @@ def parse(body, kind):
 
 
 class BinancePerp:
-    def __init__(self, months, symbol="BTCUSDT", directory=DEFAULT_DIR):
+    def __init__(self, symbol="BTCUSDT", directory=DEFAULT_DIR):
         self.folder = Path(directory).expanduser() / symbol
         self.symbol = symbol
-        self.prices = {}
-        for month in sorted(months):
-            self.prices.update(self._month(month, "klines"))
-        # Funding paid by a long per 1 BTC at each funding time: rate x price then; prefix sums for range queries.
-        events = sorted((hour, rate * self.prices[hour]) for month in sorted(months)
-                        for hour, rate in self._month(month, "funding") if hour in self.prices)
-        self.funding_hours = [hour for hour, _ in events]
-        self.cumulative = [0.0]
-        for _, amount in events:
-            self.cumulative.append(self.cumulative[-1] + amount)
+        self._prices = {}   # month -> {hour: price}, by the month of the candle's open
+        self._funding = {}  # month -> (hours, prefix sums of what a 1 BTC long pays)
 
-    def _month(self, month, kind):
+    def _rows(self, month, kind):
         path = self.folder / f"{kind}-{month_name(month)}.csv"
         if not path.exists():
             name = f"{self.symbol}-1h-{month_name(month)}.zip" if kind == "klines" else f"{self.symbol}-fundingRate-{month_name(month)}.zip"
@@ -93,8 +93,30 @@ class BinancePerp:
             return [(int(hour), float(value)) for hour, value in csv.reader(handle)]
 
     def price(self, hour):
-        return self.prices.get(hour)
+        """Close of the candle ending at `hour`, i.e. the last price in (hour-1h, hour]; None if missing."""
+        month = month_of_hour(hour - 1)
+        if month not in self._prices:
+            self._prices[month] = dict(self._rows(month, "klines"))
+        return self._prices[month].get(hour)
+
+    def _month_funding(self, month):
+        if month not in self._funding:
+            hours, cumulative = [], [0.0]
+            for hour, rate in sorted(self._rows(month, "funding")):
+                price = self.price(hour)
+                if price is None:
+                    raise PerpDataError(f"{self.symbol} has no price at funding time {datetime.fromtimestamp(hour * 3600, timezone.utc):%Y-%m-%d %H:%M} UTC")
+                hours.append(hour)
+                cumulative.append(cumulative[-1] + rate * price)
+            self._funding[month] = (hours, cumulative)
+        return self._funding[month]
 
     def funding(self, after, upto):
         """Funding a 1 BTC long pays for funding times in (after, upto]; negative when it receives."""
-        return self.cumulative[bisect_right(self.funding_hours, upto)] - self.cumulative[bisect_right(self.funding_hours, after)]
+        total = 0.0
+        if upto <= after:
+            return total
+        for month in range(month_of_hour(after + 1), month_of_hour(upto) + 1):
+            hours, cumulative = self._month_funding(month)
+            total += cumulative[bisect_right(hours, upto)] - cumulative[bisect_right(hours, after)]
+        return total
