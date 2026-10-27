@@ -1,0 +1,12 @@
+{
+  "name": "trend-premium",
+  "description": "Sell 7-day premium with the trend: daily 08:00 UTC check, short 0.4-delta put above the Binance perp's 50-day mean, short 0.3-delta call below; taker fills",
+  "entry": {"hours": [8]},
+  "expiry": {"dte": 7},
+  "trend": {"ma_days": 50},
+  "legs": [
+    {"side": "sell", "type": "put", "delta": 0.4, "when": "above"},
+    {"side": "sell", "type": "call", "delta": 0.3, "when": "below"}
+  ],
+  "fill": "cross"
+}

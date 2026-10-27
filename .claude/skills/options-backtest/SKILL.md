@@ -7,7 +7,7 @@ description: Backtest BTC option strategies (iron condor, strangle, spreads, leg
 
 用法与口径以 `tools/options-backtest/README.md` 为准；本文件只给调用要点。
 
-1. 先用 `tools/options-backtest/bt examples` 找到最接近的示例。实盘铁鹰是 `iron_condor`，实盘卖宽跨是 `short_strangle`；用永续多头代替现货的备兑看涨是 `covered_call`（`type: perp`，含资金费）。
+1. 先用 `tools/options-backtest/bt examples` 找到最接近的示例。实盘铁鹰是 `iron_condor`，实盘卖宽跨是 `short_strangle`；用永续多头代替现货的备兑看涨是 `covered_call`（`type: perp`，含资金费）。顺势卖权（50 日均线上方卖看跌、下方卖看涨）是 `trend_premium`，均线天数用 `--set trend.ma_days=…` 扫描。
 2. 小改用 `--set path=value`（如 `legs.0.delta=0.3`、`fill=cross`、`exit.take_profit_pct=0.5`、`start=2024-01-01`）。结构不同时写内联 JSON 或在结果目录外新建 spec 文件，字段表见 README。
 3. 比较多组参数用 `bt sweep SPEC --set a+b=v1,v2 --set c=x,y`，看排序表，需要细节再读 `sweep.csv`。
 4. 结果目录在摘要最后一行；分析逐笔时读 `trades.csv` 的相关列，不整份打印。

@@ -5,6 +5,7 @@ quotes. Prices are USD per 1 BTC contract; Deribit data stands in for Bybit, and
 fee and margin formulas follow the live strategy (modules/greeks/app/strategy.py).
 """
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from statistics import median
@@ -159,12 +160,68 @@ def regular_margin(legs, quotes, spec, forward):
     return total
 
 
-def open_position(chain, hour, spec, perp=None, carry=False):
+def trend_state(market, hour, days):
+    """"above"/"below": the perp price at `hour` against the mean of the `days` x 24 hourly closes up to
+    and including it; None when that price or more than 10% of the window is missing. Reference for
+    TrendWindow, which run() uses."""
+    window = [market.perp(h) for h in range(hour - days * 24 + 1, hour + 1)]
+    known = [price for price in window if price is not None]
+    if window[-1] is None or len(known) < 0.9 * len(window):
+        return None
+    return "above" if window[-1] > sum(known) / len(known) else "below"
+
+
+class TrendWindow:
+    """trend_state() for hours that only move forward, as in run(): each close is read once and the
+    window keeps a running sum, so long means and hourly entries stay cheap."""
+
+    def __init__(self, market, days):
+        self.market, self.size = market, days * 24
+        self.window, self.total, self.known, self.last = deque(), 0.0, 0, None
+
+    def state(self, hour):
+        first = hour - self.size + 1
+        if self.last is None or self.last < first - 1 or hour < self.last:
+            self.window, self.total, self.known, self.last = deque(), 0.0, 0, first - 1
+        for h in range(self.last + 1, hour + 1):
+            price = self.market.perp(h)
+            self.window.append((h, price))
+            if price is not None:
+                self.total += price
+                self.known += 1
+        self.last = max(self.last, hour)
+        while self.window[0][0] < first:
+            _, price = self.window.popleft()
+            if price is not None:
+                self.total -= price
+                self.known -= 1
+        price = self.window[-1][1]
+        if price is None or self.known < 0.9 * self.size:
+            return None
+        return "above" if price > self.total / self.known else "below"
+
+
+def active_legs(spec, state):
+    """(index, leg spec) pairs traded in trend `state`; legs without `when` always trade."""
+    return [(index, leg) for index, leg in enumerate(spec["legs"]) if leg["when"] in (None, state)]
+
+
+def perp_signature(spec, state):
+    """What a perp leg opened in `state` holds, comparable with a closed trade's `_carry` signature."""
+    return tuple((leg["side"], leg["qty"] * spec["qty"]) for _, leg in active_legs(spec, state) if leg["type"] == "perp")
+
+
+def open_position(chain, hour, spec, perp=None, carry=False, state=None):
     """Select legs by delta and fill them; returns (Position, None) or (None, skip reason).
+
+    `state` is the trend state ("above"/"below") that picks the legs with a matching `when`.
 
     `perp` is the perpetual price at `hour`; perp legs close with the position's first option expiry.
     `carry` means the previous position's perp closed this same hour, so the perp is simply held on and
     pays no entry fee; run() also refunds that previous close fee, leaving one open and one close fee."""
+    chosen = active_legs(spec, state)
+    if not chosen:
+        return None, f"flat_{state}"
     if not chain:
         return None, "no_data"
     by_expiry = {}
@@ -172,7 +229,7 @@ def open_position(chain, hour, spec, perp=None, carry=False):
         if quote.mark > 0 and quote.iv > 0 and quote.forward > 0 and quote.years > 0:
             by_expiry.setdefault(quote.expiry, []).append(quote)
     legs, quotes, fallbacks = [], [], 0
-    for index, leg_spec in enumerate(spec["legs"]):
+    for index, leg_spec in chosen:
         sign = 1 if leg_spec["side"] == "buy" else -1
         if leg_spec["type"] == "perp":
             continue
@@ -182,7 +239,7 @@ def open_position(chain, hour, spec, perp=None, carry=False):
         is_call = leg_spec["type"] == "call"
         options = [q for q in sorted(by_expiry[expiry], key=lambda q: q.strike) if q.is_call == is_call]
         if leg_spec["beyond"] is not None:
-            inner = legs[leg_spec["beyond"]].strike
+            inner = next(leg.strike for leg in legs if leg.index == leg_spec["beyond"])
             options = [q for q in options if (q.strike > inner if is_call else q.strike < inner)]
         if not options:
             return None, "no_strike"
@@ -191,7 +248,7 @@ def open_position(chain, hour, spec, perp=None, carry=False):
         fallbacks += fallback
         legs.append(Leg(index, sign, quote.expiry, quote.strike, quote.is_call, leg_spec["qty"] * spec["qty"], price, quote.delta, quote.iv))
         quotes.append(quote)
-    for index, leg_spec in enumerate(spec["legs"]):
+    for index, leg_spec in chosen:
         if leg_spec["type"] == "perp":
             if perp is None:
                 return None, "no_perp"
@@ -205,7 +262,7 @@ def open_position(chain, hour, spec, perp=None, carry=False):
     fees = sum(leg_fee(spec["fees"], leg, q.forward, leg.price) for leg, q in zip(legs, quotes) if not (carry and leg.is_perp))
     loss = max_loss(legs, credit - fees)
     margin = regular_margin(legs, quotes, spec, forward) if spec["margin"]["mode"] == "regular" or loss is None else loss
-    return Position(hour, legs, credit, fees, margin, loss, forward, fallbacks), None
+    return Position(hour, legs, credit, fees, margin, loss, forward, fallbacks, extra={"trend": state}), None
 
 
 def close_value(position, quotes, spec):
@@ -233,8 +290,10 @@ def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, pai
         "worst_open_pnl": round(min(position.worst, pnl), 2), "fallback_fills": position.fallback_fills + fallbacks,
         "fills": len(position.legs) + sum(reason != "expiry" or leg.expiry != position.expiry or leg.is_perp for leg in position.legs),
         "missing_hours": position.missing_hours, "perp_pnl": round(perp_pnl, 2), "funding": round(paid_funding, 2),
+        "trend": position.extra.get("trend"),
         # run() refunds the perp close fee when the next position holds the perp on from this same hour and price
-        "_carry": (perp_fee, position.worst) if carried and any(leg.is_perp for leg in position.legs) else None,
+        "_carry": (perp_fee, position.worst, tuple(("buy" if leg.sign > 0 else "sell", leg.qty) for leg in position.legs if leg.is_perp))
+        if carried and any(leg.is_perp for leg in position.legs) else None,
     }
 
 
@@ -317,7 +376,8 @@ def run(spec, market, progress=None):
     start = max(first, spec["start_hour"] if spec["start_hour"] is not None else first)
     end = min(last, spec["end_hour"] if spec["end_hour"] is not None else last)
     trades, skipped, open_positions = [], {}, []
-    has_perp = any(leg["type"] == "perp" for leg in spec["legs"])
+    days = spec["trend"]["ma_days"]
+    trend = TrendWindow(market, days) if days else None
     hour = start
     while hour <= last and (hour <= end or open_positions):
         still_open, closed_perps = [], []
@@ -331,16 +391,21 @@ def run(spec, market, progress=None):
                 still_open.append(position)
         open_positions = still_open
         if hour <= end and is_entry_hour(hour, spec):
+            state = None
             if len(open_positions) >= spec["max_open"]:
                 skipped["max_open"] = skipped.get("max_open", 0) + 1
+            elif trend and (state := trend.state(hour)) is None:
+                skipped["no_trend_data"] = skipped.get("no_trend_data", 0) + 1
             else:
-                perp = market.perp(hour) if has_perp else None
-                position, reason = open_position(market.chain(hour), hour, spec, perp, carry=bool(closed_perps))
+                signature = perp_signature(spec, state)
+                carry = bool(signature) and any(trade["_carry"][2] == signature for trade in closed_perps)
+                perp = market.perp(hour) if signature else None
+                position, reason = open_position(market.chain(hour), hour, spec, perp, carry=carry, state=state)
                 if position:
                     open_positions.append(position)
-                    if closed_perps:  # the perp was held on, never closed: refund that close fee
-                        held = closed_perps.pop()
-                        fee, worst = held["_carry"]
+                    if carry:  # the same perp was held on, never closed: refund that close fee
+                        held = closed_perps.pop(max(i for i, trade in enumerate(closed_perps) if trade["_carry"][2] == signature))
+                        fee, worst, _ = held["_carry"]
                         held["fees"] = round(held["fees"] - fee, 2)
                         held["pnl"] = round(held["pnl"] + fee, 2)
                         held["worst_open_pnl"] = round(min(worst, held["pnl"]), 2)
