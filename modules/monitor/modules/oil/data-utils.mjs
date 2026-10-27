@@ -37,12 +37,13 @@ export function filterRows(rows, range, intervalMs = 0) {
 /** Compute on complete, validated history before filtering the display range.
  * Fixed windows require all paired candles; all-history means use only the
  * observations available up to each point. Neither mode reads future samples.
+ * `field` picks the averaged metric: percent `spread` or `absolute` USDT.
  */
-export function rollingAverages(rows, range, intervalMs) {
+export function rollingAverages(rows, range, intervalMs, field = 'spread') {
   if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) throw Error('Invalid candle interval');
   if (!['1d', '1w', '1m', 'all'].includes(range)) throw Error('Invalid average range');
   const totals = [0];
-  for (const row of rows) totals.push(totals.at(-1) + row.spread);
+  for (const row of rows) totals.push(totals.at(-1) + row[field]);
   return rows.map((row, index) => {
     const end = row.time + intervalMs;
     const start = range === 'all' ? rows[0].time : rangeStart(end, range);
@@ -61,15 +62,15 @@ export function rollingAverages(rows, range, intervalMs) {
   });
 }
 
-export function summarize(rows) {
+export function summarize(rows, field = 'spread') {
   if (!rows.length) throw new Error('Cannot summarize empty observations');
-  return { average: rows.reduce((sum, row) => sum + row.spread, 0) / rows.length, min: rows.reduce((a, b) => b.spread < a.spread ? b : a), max: rows.reduce((a, b) => b.spread > a.spread ? b : a), latest: rows.at(-1), first: rows[0], count: rows.length };
+  return { average: rows.reduce((sum, row) => sum + row[field], 0) / rows.length, min: rows.reduce((a, b) => b[field] < a[field] ? b : a), max: rows.reduce((a, b) => b[field] > a[field] ? b : a), latest: rows.at(-1), first: rows[0], count: rows.length };
 }
 
-export function monthlyAverages(rows) {
+export function monthlyAverages(rows, field = 'spread') {
   const groups = new Map();
   for (const row of rows) { const month = row.date.slice(0, 7); const group = groups.get(month) ?? []; group.push(row); groups.set(month, group); }
-  return [...groups].map(([month, group]) => ({ month, average: summarize(group).average, count: group.length }));
+  return [...groups].map(([month, group]) => ({ month, average: summarize(group, field).average, count: group.length }));
 }
 
 export function chartDomain(values) {

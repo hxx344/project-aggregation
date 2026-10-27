@@ -1,18 +1,23 @@
 import { TRADE_TYPES, tradeVenueKey } from './trades.mjs';
 import { nearestTimeIndex } from './chart-performance.mjs';
 import { OIL_CANDLE_MS } from './intraday.mjs';
+import { decimalDifference } from './spread.mjs';
 
 const ns = 'http://www.w3.org/2000/svg';
-export function visibleTradeMarkers(events, rows) {
+/** Absolute spreads are left − right in the venue's own quote currency. */
+const absoluteSpread = venue => venue?.prices ? decimalDifference(venue.prices.left, venue.prices.right) : null;
+/** unit selects the chart metric: `percent` (row.spread) or `absolute` (row.absolute). */
+export function visibleTradeMarkers(events, rows, unit = 'percent') {
   if (!rows.length) return [];
-  const start = rows[0].time, end = rows.at(-1).time;
+  const start = rows[0].time, end = rows.at(-1).time, field = unit === 'absolute' ? 'absolute' : 'spread';
   return events.filter(event => event.time >= start && event.time <= end).map(event => {
     const nearest = rows[nearestTimeIndex(rows, event.time)];
-    const chartSpread = nearest && Math.abs(nearest.time - event.time) <= OIL_CANDLE_MS && Number.isFinite(nearest.spread) ? nearest.spread : null;
-    return { event, chartSpread, value: event.spread ?? chartSpread, basis: event.spread === null ? '图表价差' : '成交价差' };
+    const chartSpread = nearest && Math.abs(nearest.time - event.time) <= OIL_CANDLE_MS && Number.isFinite(nearest[field]) ? nearest[field] : null;
+    const traded = unit === 'absolute' ? absoluteSpread(event.spreadVenue) : event.spread;
+    return { event, unit, chartSpread, value: traded ?? chartSpread, basis: traded === null ? '图表价差' : '成交价差' };
   });
 }
-const spreadText = value => value === null ? '未知' : `${value.toFixed(3)}%`;
+const spreadText = (value, unit = 'percent') => value === null ? '未知' : unit === 'absolute' ? `${value < 0 ? '−' : ''}${Math.abs(value).toFixed(3)}` : `${value.toFixed(3)}%`;
 const cashText = totals => totals.map(item => `${item.amount === null ? item.known === null ? '未知' : `未知（已知 ${item.known}）` : item.amount} ${item.currency}`).join('；') || '未知';
 function venueLabels(venues) {
   const groups = new Map(), labels = new Map();
@@ -29,7 +34,7 @@ function venueLabels(venues) {
 }
 /** priceUnit, chartLabel and chartNote describe the market's quote unit, chart metric and sampling. */
 export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chartLabel = '图表同时刻价差', chartNote = '最近 15 分钟 K 线' } = {}) {
-  const { event, chartSpread, basis, value } = marker, type = TRADE_TYPES[event.type];
+  const { event, chartSpread, basis, value, unit = 'percent' } = marker, type = TRADE_TYPES[event.type];
   const labels = venueLabels(event.venues);
   const effects = { open: '开仓', close: '平仓', unknown: '开平未知' };
   const byFill = new Map();
@@ -40,12 +45,12 @@ export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chart
   return [
     `${type.symbol} ${type.label} · ${formatTime(event.time)} 北京时间`,
     `${event.fills.length} 笔成交 · 至 ${formatTime(event.end)}${event.stale ? ' · 保留旧数据' : ''}`,
-    `${basis} ${spreadText(value)}${event.spreadVenue ? ` · ${labels.get(event.spreadVenue.key)}` : ''}`,
-    `${chartLabel} ${spreadText(chartSpread)}（${chartNote}）`,
+    `${basis} ${spreadText(value, unit)}${event.spreadVenue ? ` · ${labels.get(event.spreadVenue.key)}` : ''}`,
+    `${chartLabel} ${spreadText(chartSpread, unit)}（${chartNote}）`,
     ...event.venues.flatMap(venue => [
       `${labels.get(venue.key)} · ${venue.direction}`,
       ...venue.legs.map(leg => `${leg.base} ${leg.sides.map(side => side === 'buy' ? '买' : '卖').join('/')} ${leg.quantity} ${leg.quantityUnit} @ ${leg.price} ${leg.currency}${priceUnit} · ${leg.scopes.join(' / ')}`),
-      `成交价差 ${spreadText(venue.spread)}${venue.currency ? `（${venue.currency}）` : ''}`,
+      `成交价差 ${spreadText(unit === 'absolute' ? absoluteSpread(venue) : venue.spread, unit)}${venue.currency ? `（${venue.currency}${unit === 'absolute' ? priceUnit : ''}）` : ''}`,
       `手续费 ${cashText(venue.fees)} · 已实现盈亏 ${cashText(venue.realizedPnl)}`,
     ]),
     `手续费合计 ${cashText(event.fees)}（支出为负，返佣为正）`,
@@ -87,7 +92,7 @@ export function renderTradeMarkers(svg, markers, chart, { formatTime, show, hide
     node.setAttribute('transform', `translate(${px},${py})`);
     node.setAttribute('tabindex', '0'); node.setAttribute('role', 'button');
     node.setAttribute('data-trade-key', event.key);
-    node.setAttribute('aria-label', `${type.label} · ${formatTime(event.time)} 北京时间 · ${marker.basis} ${spreadText(marker.value)}，查看成交明细`);
+    node.setAttribute('aria-label', `${type.label} · ${formatTime(event.time)} 北京时间 · ${marker.basis} ${spreadText(marker.value, marker.unit)}，查看成交明细`);
     const hit = doc.createElementNS(ns, 'circle');
     hit.setAttribute('r', '12'); hit.setAttribute('fill', 'transparent');
     const symbol = doc.createElementNS(ns, 'text');
@@ -141,7 +146,7 @@ export function createTradeLayer(root, formatTime) {
         const button = list.ownerDocument.createElement('button'), type = TRADE_TYPES[marker.event.type];
         button.type = 'button'; button.className = 'oil-trade-list-item';
         button.setAttribute('data-trade-type', marker.event.type);
-        button.textContent = `${type.symbol} ${formatTime(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${spreadText(marker.value)}`;
+        button.textContent = `${type.symbol} ${formatTime(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${spreadText(marker.value, marker.unit)}`;
         button.addEventListener('click', () => {
           const node = markerNodes.get(marker.event.key);
           node?.focus(); node?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });

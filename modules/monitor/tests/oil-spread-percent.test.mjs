@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { oilSpreadPercent } from '../modules/oil/spread.mjs';
 import { intradayChartRows, createIntradaySnapshot, OIL_CANDLE_MS } from '../modules/oil/intraday.mjs';
-import { summarize, monthlyAverages } from '../modules/oil/data-utils.mjs';
+import { summarize, monthlyAverages, rollingAverages } from '../modules/oil/data-utils.mjs';
 import { initialSummaries } from '../lib/initial-market.ts';
 import { oilSummary } from '../lib/monitor-summary.ts';
 
@@ -38,4 +38,20 @@ test('saved prices are recalculated per bar before averaging and SSR matches the
   assert.deepEqual(initial.trend, live.trend);
   assert.equal(initial.trend.unit, '%');
   assert.deepEqual(candles, saved);
+});
+
+test('absolute spread is Brent − WTI per bar with decimal precision and drives the same aggregates', () => {
+  const start = Date.UTC(2026, 8, 20), fetchedAt = new Date(start + 3 * OIL_CANDLE_MS).toISOString();
+  const rows = intradayChartRows(createIntradaySnapshot([
+    { time: start, brent: 70.1, wti: 66.2 },
+    { time: start + OIL_CANDLE_MS, brent: 65.3, wti: 65.3 },
+    { time: start + 2 * OIL_CANDLE_MS, brent: 64.9, wti: 66.4 },
+  ], fetchedAt));
+  assert.deepEqual(rows.map(row => row.absolute), [3.9, 0, -1.5]);
+  const summary = summarize(rows, 'absolute');
+  assert.equal(summary.average, 2.4 / 3);
+  assert.equal(summary.max.absolute, 3.9); assert.equal(summary.min.absolute, -1.5);
+  assert.equal(summarize(rows).max.spread, rows[0].spread, 'percent remains the default metric');
+  assert.equal(monthlyAverages(rows, 'absolute')[0].average, 2.4 / 3);
+  assert.deepEqual(rollingAverages(rows, 'all', OIL_CANDLE_MS, 'absolute').map(row => row.average), [3.9, 3.9 / 2, 2.4 / 3]);
 });

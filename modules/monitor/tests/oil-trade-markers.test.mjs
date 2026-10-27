@@ -30,6 +30,19 @@ test('markers use real fill time and filter to the visible range with a bounded 
   assert.deepEqual(visibleTradeMarkers([eventAt(start)], []), []);
 });
 
+test('absolute markers use paired fill prices and the absolute chart value', () => {
+  const absoluteRows = rows.map((row, i) => ({ ...row, absolute: 1.5 + i }));
+  const paired = groupTradeEvents([fill({ price: '66.2' }), fill({ key: 'bz', symbol: 'BZUSDT', base: 'BZ', quantityUnit: 'BZ', price: '70.1', side: 'sell', positionAfter: '-2' })]);
+  const [traded] = visibleTradeMarkers(paired, absoluteRows, 'absolute');
+  assert.equal(traded.value, 3.9); assert.equal(traded.basis, '成交价差'); assert.equal(traded.chartSpread, 1.5);
+  const lines = tradeDetailLines(traded, String).join('\n');
+  assert.match(lines, /成交价差 3\.900 · /); assert.match(lines, /图表同时刻价差 1\.500（/); assert.match(lines, /成交价差 3\.900（USDT\/桶）/);
+  const [single] = visibleTradeMarkers([eventAt(start + bar, 12)], absoluteRows, 'absolute');
+  assert.equal(single.value, 2.5, 'a single-leg event falls back to the chart even when a percent spread is set');
+  assert.equal(single.basis, '图表价差');
+  assert.equal(visibleTradeMarkers(paired, rows)[0].value, paired[0].spread, 'percent stays the default');
+});
+
 class Element {
   constructor(ownerDocument, tag) { this.ownerDocument = ownerDocument; this.tag = tag; this.children = []; this.attributes = {}; this.listeners = {}; this.style = {}; this.hidden = false; this.clientWidth = 500; this.offsetWidth = 200; }
   set innerHTML(_value) { throw Error('User-controlled content must never reach HTML'); }
