@@ -154,7 +154,21 @@ class ManagedWriter:
         action = path.rsplit("/", 1)[-1]
         operation = "greeks:" + action + ":" + identity
         if action == "amend":
-            operation += ":" + _digest(body)
+            entry = self.engine.order_journal.get(identity)
+            if not isinstance(entry, dict) or entry.get("symbol") != body.get("symbol"):
+                raise ValueError("改单缺少匹配的原订单持久记录")
+            sequence = entry.get("amendment_sequence", 0)
+            if type(sequence) is not int or sequence < 0:
+                raise ValueError("原订单改单序号无效，禁止发送交易请求")
+            # A new identity must not bypass an earlier amendment whose result
+            # is still unknown or sending, including legacy body-hash IDs.
+            if any(row["operationId"].startswith(operation + ":") for row in self.registry.unresolved(ticket)):
+                raise ValueError("原订单的改单结果尚未核实，禁止重复发送")
+            entry["amendment_sequence"] = sequence + 1
+            # Persist the reservation before preparing or sending. A skipped
+            # number is safe; reusing an already sent number after restart is not.
+            self.engine._save_state()
+            operation += ":" + str(entry["amendment_sequence"])
         payload = {"method": method, "path": path, "body": body}
         # The parent mapping is saved before the gather starts. Every child
         # keeps its own complete semantic payload and original order identity.

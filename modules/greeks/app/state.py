@@ -15,6 +15,7 @@ class JournalEntry(BaseModel):
     status: str
     terminal: bool
     filledQty: float = Field(ge=0)
+    amendment_sequence: int = Field(default=0, ge=0, strict=True)
 
     @model_validator(mode="after")
     def check_fill(self):

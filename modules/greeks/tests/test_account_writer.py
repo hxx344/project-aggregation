@@ -6,11 +6,13 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from datetime import datetime, timezone
 
 import httpx
 
+from app.account_writer import _digest
 from app.config import Settings
 from app.engine import TradingEngine
 from app.models import TradePlanRequest, TradeTaskRequest
@@ -64,6 +66,11 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(writer.close)
         writer.bind("bybit", identity, "credential-one")
         return writer
+
+    def register_order(self, engine, link="original-link", symbol="BTC-OPTION"):
+        engine.order_journal[link] = {"symbol": symbol, "side": "Buy", "qty": 1.0,
+            "reduce_only": False, "status": "unknown", "terminal": False, "filledQty": 0.0}
+        engine._save_state()
 
     async def test_exchange_uid_and_private_environment_are_used(self):
         engine = await self.engine()
@@ -223,6 +230,170 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
                     other.claim([{"authority": "bybit", "environment": "testnet", "accountId": "123"}])
                 self.assertEqual(caught.exception.code, "UNVERIFIED_BINDING")
 
+    async def test_bbo_price_round_trip_uses_distinct_persisted_amendments(self):
+        engine = await self.engine()
+        engine.settings.bbo_poll_seconds = .001
+        engine.settings.bbo_order_timeout_seconds = 3
+        engine.chain = demo_chain(datetime.now(timezone.utc))
+        symbol = engine.chain[0].symbol
+        await engine.client.close()
+        prices = iter((1, 2, 3, 2))
+        posted = []
+
+        def respond(request):
+            if request.method == "POST":
+                body = json.loads(request.content)
+                posted.append((request.url.path, body))
+                if request.url.path.endswith("/amend"):
+                    saved = json.loads(Path(engine.settings.state_file).read_text())
+                    count = sum(path.endswith("/amend") for path, _ in posted)
+                    self.assertEqual(saved["order_journal"]["original-link"]["amendment_sequence"], count)
+                result = {"orderId": "remote-original", "orderLinkId": "original-link"}
+            elif request.url.path == "/v5/market/tickers":
+                result = {"list": [{"bid1Price": str(next(prices))}]}
+            else:
+                filled = sum(path.endswith("/amend") for path, _ in posted) == 3
+                result = {"list": [{"symbol": symbol, "orderLinkId": "original-link", "orderId": "remote-original",
+                    "side": "Buy", "qty": "1", "cumExecQty": "1" if filled else "0", "orderStatus": "Filled" if filled else "New"}]}
+            return httpx.Response(200, json={"retCode": 0, "result": result})
+
+        engine.client._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        registry = engine.account_writer.registry
+        with patch.object(registry, "prepare", wraps=registry.prepare) as prepare:
+            outcome = await engine.follow_bbo_order(SimpleNamespace(symbol=symbol, side="Buy"), 1, "original-link")
+        self.assertEqual(outcome["status"], "filled")
+        self.assertEqual([body["price"] for path, body in posted if path.endswith("/amend")], ["2.0", "3.0", "2.0"])
+        self.assertFalse(any(path.endswith("/cancel") for path, _ in posted))
+        self.assertEqual([call.args[1] for call in prepare.call_args_list], ["greeks:create:original-link",
+            "greeks:amend:original-link:1", "greeks:amend:original-link:2", "greeks:amend:original-link:3"])
+
+    async def test_amendment_sequence_continues_after_restart_and_original_observation(self):
+        engine = await self.engine()
+        self.register_order(engine)
+        await engine.client.amend_order("BTC-OPTION", "original-link", 2)
+        engine.account_writer.close()
+        restarted = await self.engine()
+        self.assertEqual(restarted.order_journal["original-link"]["amendment_sequence"], 1)
+        await restarted.client.close()
+
+        def respond(request):
+            if request.method == "GET":
+                result = {"list": [{"symbol": "BTC-OPTION", "orderLinkId": "original-link", "orderId": "remote-original",
+                    "side": "Buy", "qty": "1", "cumExecQty": "0", "orderStatus": "New"}]}
+            else:
+                result = {"orderId": "remote-original", "orderLinkId": "original-link"}
+            return httpx.Response(200, json={"retCode": 0, "result": result})
+
+        restarted.client._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        await restarted.client.order("BTC-OPTION", "original-link")
+        registry = restarted.account_writer.registry
+        with patch.object(registry, "prepare", wraps=registry.prepare) as prepare:
+            await restarted.client.amend_order("BTC-OPTION", "original-link", 2)
+        self.assertEqual(prepare.call_args.args[1], "greeks:amend:original-link:2")
+        saved = json.loads(Path(restarted.settings.state_file).read_text())
+        self.assertEqual(saved["order_journal"]["original-link"]["amendment_sequence"], 2)
+
+    async def test_legacy_hash_amendments_still_block_resend_until_original_terminal(self):
+        engine = await self.engine()
+        self.register_order(engine)
+        writer = engine.account_writer
+        for index, state in enumerate(("sending", "unknown")):
+            with self.subTest(state=state):
+                body = {"category": "option", "symbol": "BTC-OPTION", "orderLinkId": "original-link", "price": str(index + 2)}
+                old_id = "greeks:amend:original-link:" + _digest(body)
+                operation = writer.registry.prepare(writer.claim(), old_id,
+                    {"method": "POST", "path": "/v5/order/amend", "body": body, "groupId": "greeks:order:original-link",
+                     "intentAction": "amend", "intentTarget": {"symbol": "BTC-OPTION", "clientOrderId": "original-link"}})
+                if state == "unknown":
+                    writer.finish(operation, "unknown")
+                writer.close()
+                engine = await self.engine()
+                writer = engine.account_writer
+                with self.assertRaisesRegex(ValueError, "尚未核实"):
+                    await engine.client.amend_order("BTC-OPTION", "original-link", index + 2)
+                pending = writer.registry.unresolved(writer.current.get())
+                self.assertEqual([(row["operationId"], row["state"]) for row in pending
+                    if row["operationId"].startswith("greeks:amend:")], [(old_id, state)])
+                writer.observe_order("BTC-OPTION", "original-link", {"symbol": "BTC-OPTION", "orderLinkId": "original-link",
+                    "orderId": "remote-original", "side": "Buy", "qty": "1", "cumExecQty": "0", "orderStatus": "Cancelled"})
+                self.assertEqual(writer.registry.unresolved(writer.current.get()), [])
+        self.assertEqual(engine.order_journal["original-link"].get("amendment_sequence", 0), 0)
+        self.assertTrue(all(request.method == "GET" for request in self.requests))
+
+    async def test_same_original_amendment_cannot_be_sent_again_while_sending(self):
+        engine = await self.engine()
+        self.register_order(engine)
+        await engine.client.close()
+        entered, release = asyncio.Event(), asyncio.Event()
+        posted = []
+
+        async def respond(request):
+            posted.append(json.loads(request.content))
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, json={"retCode": 0, "result": {"orderId": "remote-original", "orderLinkId": "original-link"}})
+
+        engine.client._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        first = asyncio.create_task(engine.client.amend_order("BTC-OPTION", "original-link", 2))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        try:
+            with self.assertRaisesRegex(ValueError, "尚未核实"):
+                await engine.client.amend_order("BTC-OPTION", "original-link", 2)
+        finally:
+            release.set()
+        await first
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(engine.order_journal["original-link"]["amendment_sequence"], 1)
+
+    async def test_amendment_save_failure_never_prepares_or_sends(self):
+        engine = await self.engine()
+        self.register_order(engine)
+        path = Path(engine.settings.state_file)
+        previous = path.read_bytes()
+        registry = engine.account_writer.registry
+        with patch("app.engine.os.fsync", side_effect=OSError("disk unavailable")), patch.object(registry, "prepare", wraps=registry.prepare) as prepare:
+            with self.assertRaisesRegex(ValueError, "could not be saved"):
+                await engine.client.amend_order("BTC-OPTION", "original-link", 2)
+        prepare.assert_not_called()
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(registry.unresolved(engine.account_writer.current.get()), [])
+        self.assertTrue(all(request.method == "GET" for request in self.requests))
+        self.assertIsNotNone(engine.state_error)
+
+    async def test_managed_amend_requires_matching_registered_original_and_valid_sequence(self):
+        engine = await self.engine()
+        registry = engine.account_writer.registry
+        with patch.object(registry, "prepare", wraps=registry.prepare) as prepare:
+            with self.assertRaisesRegex(ValueError, "缺少匹配"):
+                await engine.client.amend_order("BTC-OPTION", "original-link", 2)
+            self.register_order(engine)
+            with self.assertRaisesRegex(ValueError, "缺少匹配"):
+                await engine.client.amend_order("OTHER-OPTION", "original-link", 2)
+            for invalid in (None, -1, True, False, 1.5, "1", {}, []):
+                with self.subTest(sequence=invalid):
+                    engine.order_journal["original-link"]["amendment_sequence"] = invalid
+                    with self.assertRaisesRegex(ValueError, "序号无效"):
+                        await engine.client.amend_order("BTC-OPTION", "original-link", 2)
+        prepare.assert_not_called()
+        self.assertTrue(all(request.method == "GET" for request in self.requests))
+
+    async def test_corrupt_persisted_amendment_sequence_blocks_state_recovery(self):
+        engine = await self.engine()
+        self.register_order(engine)
+        path = Path(engine.settings.state_file)
+        saved = json.loads(path.read_text())
+        with patch.dict(os.environ, {"WORKSPACE_MANAGED": "0"}):
+            legacy = TradingEngine(engine.settings)
+            self.assertIsNone(legacy.state_error)
+            self.assertEqual(legacy.order_journal["original-link"]["amendment_sequence"], 0)
+            for invalid in (None, -1, True, False, 1.5, "1", {}, []):
+                with self.subTest(sequence=invalid):
+                    saved["order_journal"]["original-link"]["amendment_sequence"] = invalid
+                    path.write_text(json.dumps(saved))
+                    restored = TradingEngine(engine.settings)
+                    self.assertIsNotNone(restored.state_error)
+                    self.assertEqual(restored.order_journal, {})
+
     async def test_amend_unknown_allows_only_verified_original_cancel_until_terminal(self):
         engine = await self.engine()
         engine.settings.failed_leg_position_checks = 1
@@ -267,7 +438,9 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         engine = await self.engine()
         engine.execution_groups["persisted-parent"] = {"type": "open", "legs": {}}
         for index in range(4):
-            engine.execution_group_links["leg-" + str(index)] = "persisted-parent"
+            link = "leg-" + str(index)
+            engine.execution_group_links[link] = "persisted-parent"
+            self.register_order(engine, link, "BTC-" + str(index))
         engine._save_state()
         await engine.client.close()
         requests, current, maximum = [], 0, 0
@@ -286,6 +459,9 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(maximum, 4)
         self.assertEqual(len(requests), 8)
         self.assertEqual([body["price"] for path, body in requests if path.endswith("/amend")], ["1", "2", "3", "4"])
+        saved = json.loads(Path(engine.settings.state_file).read_text())
+        self.assertEqual({link: entry["amendment_sequence"] for link, entry in saved["order_journal"].items()},
+            {"leg-" + str(index): 1 for index in range(4)})
 
     async def test_unrelated_rfq_and_order_cannot_share_parallel_write_admission(self):
         engine = await self.engine()
