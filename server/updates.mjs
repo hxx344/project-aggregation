@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { newUpdateOwner, trackUpdateOwner, finishUpdateOwner, updateOwnerAlive } from './control/update-owner.mjs';
 import { EXECUTION_MAINTENANCE as MAINTENANCE, FINAL_EXECUTION } from './control/execution-jobs.mjs';
 
 const SOCKET_PATH = '/run/project-aggregation-updater/control.sock';
@@ -185,11 +187,13 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
 }
 
 /** Serializes update acceptance with live-entry operations, without touching stop/reconcile. */
-export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, setModuleMaintenance = async () => {}, tradingModules = [], moduleIds = tradingModules, prepareApply = async () => {}, releasePollMs = 5000, now = Date.now }) {
+export function createUpdateCoordinator({ client, execution, readMaintenance = () => false, writeMaintenance = () => {}, readPendingPlanId = () => null, writePendingPlanId = () => {}, readPendingDeployMode = () => 'source', writePendingDeployMode = () => {}, readAdmissionToken, writeAdmissionToken, readAdmissionOwner, writeAdmissionOwner, setModuleMaintenance = async () => {}, tradingModules = [], moduleIds = tradingModules, prepareApply = async () => {}, releasePollMs = 5000, now = Date.now }) {
   // Without these the idle check would skip open entries or run outside the write lock.
   // writeMaintenance and writePendingPlanId must use the connection of
   // execution.transaction, or they wait out busy_timeout under its write lock.
   if (!['state', 'openEntries', 'transaction'].every(name => typeof execution?.[name] === 'function')) throw new TypeError('createUpdateCoordinator requires execution.state, openEntries and transaction');
+  const shared = readAdmissionToken !== undefined || writeAdmissionToken !== undefined;
+  if (shared && ![readAdmissionToken, writeAdmissionToken, readAdmissionOwner, writeAdmissionOwner].every(value => typeof value === 'function')) throw new TypeError('Shared update admission requires token and owner callbacks');
   let pendingPlanId = readPendingPlanId();
   let pendingDeployMode = readPendingDeployMode();
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
@@ -197,6 +201,45 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   // plan id, so a later read never makes them stale (design doc 6.5).
   let plan = { id: null, scopes: null };
   let moduleSync = Promise.resolve(), watcher = null, polling = null, closed = false;
+  const assertOpen = () => { if (closed) throw new UpdateError(503, '更新协调器正在关闭'); };
+  const currentToken = () => shared ? readAdmissionToken() : null;
+  // All shared changes use the execution write transaction. A status read or
+  // failed apply may change only the generation it started with, never a
+  // newer admission owned by the other API slot. Tokens do not expire: after
+  // a crash, the existing pending-plan/root-job recovery remains authoritative.
+  function reloadShared() {
+    if (!shared) return;
+    maintenance = readMaintenance(); pendingPlanId = readPendingPlanId(); pendingDeployMode = readPendingDeployMode();
+  }
+  function restore(value) { rememberPending(value.pendingPlanId, value.pendingDeployMode); remember(value.maintenance); }
+  function recoverOwner() {
+    const owner = readAdmissionOwner();
+    if (!owner) return false;
+    if (updateOwnerAlive(owner)) throw new UpdateError(409, MAINTENANCE);
+    if (owner.phase === 'preparing') restore(owner.baseline);
+    writeAdmissionOwner(null);
+    return true;
+  }
+  function changeShared(expected, change, { owned = false, force = false } = {}) {
+    if (closed) return false;
+    if (!shared) { change(); return true; }
+    let previous;
+    try {
+      return execution.transaction(() => {
+        const actual = currentToken(); reloadShared();
+        if (actual !== expected) return false;
+        previous = { maintenance, pendingPlanId, pendingDeployMode };
+        if (!owned) {
+          const owner = readAdmissionOwner();
+          if (owner && updateOwnerAlive(owner)) return false;
+          if (owner) force = recoverOwner();
+        }
+        change();
+        if (force || maintenance !== previous.maintenance || pendingPlanId !== previous.pendingPlanId || pendingDeployMode !== previous.pendingDeployMode) writeAdmissionToken(randomUUID());
+        return true;
+      });
+    } catch (error) { if (previous) ({ maintenance, pendingPlanId, pendingDeployMode } = previous); throw error; }
+  }
   // The maintenance value each trading module last acknowledged; null is unknown.
   // `instances` holds the module generation that acknowledged it, where the
   // runtime reports one (observeModules).
@@ -205,6 +248,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   // Rejects when any module fails, so initialize() and apply() stay all-or-nothing.
   const synchronizeModules = (ids = tradingModules) => {
     const next = moduleSync.catch(() => {}).then(async () => {
+      if (closed) return;
       const active = maintenance;
       let failed = [], reported = {};
       try { reported = (await setModuleMaintenance(active, ids))?.generations ?? {}; }
@@ -239,15 +283,16 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     }, releasePollMs);
     watcher.unref?.();
   }
-  function remember(value) { if (maintenance !== value) { writeMaintenance(value); maintenance = value; } }
+  function remember(value) { if (!closed && maintenance !== value) { writeMaintenance(value); maintenance = value; } }
   function rememberPending(value, deployMode = 'source') {
+    if (closed) return;
     const rememberMode = () => { if (pendingDeployMode !== deployMode) { writePendingDeployMode(deployMode); pendingDeployMode = deployMode; } };
     // Record mode before a new plan, and clear the plan before resetting mode.
     if (value) rememberMode();
     if (pendingPlanId !== value) { writePendingPlanId(value); pendingPlanId = value; }
     if (!value) rememberMode();
   }
-  if (pendingPlanId) remember(true);
+  if (pendingPlanId) changeShared(currentToken(), () => { if (pendingPlanId) remember(true); });
   function learn(state) {
     if (state.planId) plan = { id: state.planId, scopes: state.planScopes ?? null };
     return state;
@@ -263,23 +308,27 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     return state;
   }
   async function status() {
-    const version = generation;
+    assertOpen();
+    const version = generation, observedToken = currentToken();
     const state = learn(publicUpdateState(await client.status()));
     // A read that returns during shutdown must not write state or call modules.
     if (closed) return state;
-    if (!applying && version === generation) observe(state);
+    if (!applying && version === generation) changeShared(observedToken, () => observe(state));
     // One restarting module must not hide the updater state; the result is per module.
     await synchronizeModules().catch(() => {});
     return withModules(state);
   }
   async function check() {
-    const version = generation;
+    assertOpen();
+    const version = generation, observedToken = currentToken();
     const state = learn(publicUpdateState(await client.check()));
-    if (!applying && version === generation) observe(state);
+    if (closed) return state;
+    if (!applying && version === generation) changeShared(observedToken, () => observe(state));
     await synchronizeModules().catch(() => {});
     return withModules(state);
   }
   async function token(value, authorize) {
+    assertOpen();
     authorize();
     if (applying) throw new UpdateError(409, TOKEN_BUSY);
     // Credential writes do not enter or clear the trading maintenance gate.
@@ -287,6 +336,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   }
   /** scope is 'native' or a module id; without one every trading module must be confirmed. */
   async function withExecutionEntry(operation, { scope } = {}) {
+    assertOpen();
     // An unknown scope would match no gate, so it is refused rather than allowed.
     if (scope !== undefined && scope !== 'native' && !moduleIds.includes(scope) && !tradingModules.includes(scope)) throw new UpdateError(503, SCOPE_INVALID);
     if (applying?.scope === 'full') throw new UpdateError(409, MAINTENANCE);
@@ -294,6 +344,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     entries += 1;
     try {
       await status();
+      assertOpen();
       if (maintenance || applying?.scope === 'full') throw new UpdateError(409, MAINTENANCE);
       // Only the target trading module's gate matters; other scopes need none.
       const required = scope === undefined ? tradingModules : tradingModules.filter(id => id === scope);
@@ -302,51 +353,71 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     } finally { entries -= 1; }
   }
   function apply(planId, authorize, deployMode = 'source') {
+    assertOpen();
     authorize();
     validateUpdateBody('apply', { planId, deployMode });
     if (applying) {
       if (applying.planId !== planId || applying.deployMode !== deployMode) throw new UpdateError(409, MAINTENANCE);
       return applying.promise;
     }
-    if (pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
+    if (!shared && pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
     // A pending plan may already be accepted as full, so it keeps that admission.
-    if (!pendingPlanId && plan.id === planId && plan.scopes?.[deployMode] === 'api') return applyApi(planId, authorize, deployMode);
+    if (!(shared ? readPendingPlanId() : pendingPlanId) && plan.id === planId && plan.scopes?.[deployMode] === 'api') return applyApi(planId, authorize, deployMode);
     const busy = () => entries || execution.openEntries() || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status));
     if (busy()) throw new UpdateError(409, EXECUTION_BUSY);
     const previous = { maintenance, pendingPlanId, pendingDeployMode };
+    let rollbackState = previous;
+    let admissionToken = null, owner = null;
     // The idle check and the maintenance write share one write transaction, so
     // an execution entry the runtime records concurrently is either seen here
     // or refused by the committed flag (design doc 5.5). Persist the plan
     // first; restoration also treats a pending plan as maintenance.
     try {
       execution.transaction(() => {
+        reloadShared();
+        rollbackState = { maintenance, pendingPlanId, pendingDeployMode };
+        if (shared) recoverOwner();
+        Object.assign(previous, { maintenance, pendingPlanId, pendingDeployMode });
+        if (pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
         if (busy()) throw new UpdateError(409, EXECUTION_BUSY);
         rememberPending(planId, deployMode);
         remember(true);
+        if (shared) { admissionToken = randomUUID(); owner = newUpdateOwner({ ...previous }); writeAdmissionOwner(owner); writeAdmissionToken(admissionToken); }
       });
     } catch (error) {
       // A rolled-back write leaves the durable values; the cached ones follow them.
-      ({ maintenance, pendingPlanId, pendingDeployMode } = previous);
+      ({ maintenance, pendingPlanId, pendingDeployMode } = rollbackState);
       throw error;
     }
+    if (owner) trackUpdateOwner(owner);
     generation += 1;
-    const pending = { planId, deployMode, scope: 'full', promise: null };
+    const pending = { planId, deployMode, scope: 'full', promise: null, owner, admissionToken, sending: false };
     applying = pending;
     pending.promise = (async () => {
       try {
         await synchronizeModules();
+        assertOpen();
         await prepareApply();
+        assertOpen();
         // Run authorization again immediately before sending the privileged request.
         authorize();
+        if (shared) {
+          if (!changeShared(pending.admissionToken, () => writeAdmissionOwner({ ...owner, phase: 'sending' }), { owned: true, force: true })) throw new UpdateError(409, MAINTENANCE);
+          pending.admissionToken = currentToken();
+        }
+        pending.sending = true;
         const state = learn(publicUpdateState(await client.apply(planId, deployMode)));
-        rememberPending(null);
-        observe(state);
+        changeShared(pending.admissionToken, () => { if (shared) writeAdmissionOwner(null); rememberPending(null); observe(state); }, { owned: true, force: shared });
         return state;
       } catch (error) {
         // A timeout may follow successful acceptance. Keep the durable latch until status confirms completion.
-        if (error instanceof UpdateError && !error.uncertain) { rememberPending(previous.pendingPlanId, previous.pendingDeployMode); remember(previous.maintenance); }
+        if (shared || error instanceof UpdateError && !error.uncertain) changeShared(pending.admissionToken, () => {
+          if (shared) writeAdmissionOwner(null);
+          if (!pending.sending || error instanceof UpdateError && !error.uncertain) restore(previous);
+        }, { owned: true, force: shared });
         throw error;
       } finally {
+        finishUpdateOwner(owner);
         if (applying === pending) { generation += 1; applying = null; }
         await synchronizeModules();
       }
@@ -359,6 +430,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   // accepts the scope only for a plan it forecast as 'api', and the installer
   // refuses rather than widen it.
   function applyApi(planId, authorize, deployMode) {
+    const observedToken = currentToken();
     generation += 1;
     const pending = { planId, deployMode, scope: 'api', promise: null };
     applying = pending;
@@ -366,7 +438,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       try {
         authorize();
         const state = learn(publicUpdateState(await client.apply(planId, deployMode, 'api')));
-        observe(state);
+        changeShared(observedToken, () => observe(state));
         return state;
       } finally {
         if (applying === pending) { generation += 1; applying = null; }
@@ -398,6 +470,14 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   function moduleMaintenance() {
     return Object.fromEntries(tradingModules.map(id => [id, { confirmed: confirmed(id), maintenance, releasedAt: releasedAt.get(id) ?? null }]));
   }
-  async function close() { closed = true; clearTimeout(watcher); await polling; }
+  async function close() {
+    try {
+      if (shared && applying?.owner) changeShared(applying.admissionToken, () => {
+        if (!applying.sending) restore(applying.owner.baseline);
+        writeAdmissionOwner(null);
+      }, { owned: true, force: true });
+    } finally { closed = true; clearTimeout(watcher); finishUpdateOwner(applying?.owner); }
+    await Promise.allSettled([polling, moduleSync]);
+  }
   return { status, check, apply, token, withExecutionEntry, initialize: () => synchronizeModules(), resynchronize, observeModules, moduleMaintenance, close };
 }

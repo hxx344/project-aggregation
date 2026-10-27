@@ -233,7 +233,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     grant.revoked = true;
     // Refused here at once; when the row cannot be deleted now, the sweep retries the deletion.
     if (grant.auth) authGrants.delete(grant.digest);
-    else { revoking.add(grant.digest); try { store.revokeGrants([grant.digest]); revoking.delete(grant.digest); } catch {} }
+    else { revoking.add(grant.digest); try { store.withoutWaiting(() => store.revokeGrants([grant.digest])); revoking.delete(grant.digest); } catch {} }
     delete grant.auth;
   }
 
@@ -527,5 +527,5 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   }
 
   function drain() { draining = true; for (const stream of active) if (stream.long) { stream.destroy(); active.delete(stream); } }
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.revokeGrants([...revoking]); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.withoutWaiting(() => store.revokeGrants([...revoking])); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }

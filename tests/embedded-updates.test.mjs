@@ -429,6 +429,41 @@ test('closing during a background status read neither persists the result nor ca
   assert.deepEqual(f.active, { crossex: true, greeks: true, aster: true });
 });
 
+test('closing discards queued module synchronizations and does not admit waiting writes', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  await f.coordinator.initialize();
+  f.updaterState = state();
+  f.handlers['gate:aster'] = async active => { entered.resolve(); await release.promise; return { data: { active } }; };
+  const first = f.coordinator.status();
+  await entered.promise;
+  let written = false;
+  const write = assert.rejects(f.coordinator.withExecutionEntry(() => { written = true; }, { scope: 'aster' }), error => error.status === 503);
+  const queued = f.coordinator.check();
+  await new Promise(resolve => setImmediate(resolve));
+  const started = f.events.filter(value => /gate:.*:start$/.test(value)).length;
+  const closing = f.coordinator.close();
+  release.resolve();
+  await Promise.all([closing, first, queued, write]);
+  assert.equal(written, false);
+  assert.equal(f.events.filter(value => /gate:.*:start$/.test(value)).length, started, 'queued syncs never begin after close');
+  assert.throws(() => f.apply(), error => error.status === 503);
+});
+
+test('an apply still preparing at shutdown keeps its durable latch and never contacts root', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  f.handlers['status:aster'] = async () => { entered.resolve(); await release.promise; return { data: { busy: false } }; };
+  const apply = assert.rejects(f.apply(), error => error.status === 503);
+  await entered.promise;
+  await f.coordinator.close();
+  const events = f.events.length;
+  release.resolve();
+  await apply;
+  assert.equal(f.calls.includes('apply'), false);
+  assert.equal(f.persisted.maintenance, true);
+  assert.equal(f.persisted.pendingPlanId, planId);
+  assert.equal(f.events.slice(events).some(value => value.startsWith('persist:') || value.startsWith('gate:')), false);
+});
+
 test('a restarted trading module is released without a browser status read and stays held under a durable latch', async t => {
   for (const maintenance of [false, true]) {
     await t.test(`maintenance ${maintenance}`, async t => {

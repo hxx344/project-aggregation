@@ -7,7 +7,7 @@
 | 源码基线 | project-aggregation `f3ea48d` |
 | 上位文档 | [架构实现方案](architecture-implementation.md) 第 3.1、9.1、11 节与第 15 节的 M4；[控制面与数据面分离](control-data-plane-separation.md)（M3，已全部发布） |
 | 适用范围 | `server/api/`、`server/portal.mjs`、`server/control/`、`server/static-response.mjs`、`server/recovery/`、`server/update-service/registry.py`、`deploy/install.sh` 与相关测试 |
-| 设计状态 | M4-1 已在 `462e43a` 合入并通过 Checks；M4-2 持久 Portal 授权已合入（合并提交见 `git log --merges --grep M4-2`）；M4-3a 排空顺序与静态资源回退已实施（`git log --merges --grep M4-3a`）；M4-3b API 侧槽模式已实施（`git log --merges --grep M4-3b`）；M4-3c 入口进程与定向探针已实施、未接线（`git log --merges --grep M4-3c`）；M4-4 未实施。第 3 节切流方案于 2026-10-26 批准；第 5.2、6 节的原草案以第 3 节为准改写 |
+| 设计状态 | M4-1 至 M4-4 已合入；M4-3c 为 `47ff929`，M4-4 为 `6ab243e`。合入和 CI 不等于生产验收；本轮修复与证据见 [合入审查修复记录](m0-m4-review-fixes.md)。第 3 节切流方案于 2026-10-26 批准，第 5.2、6 节的原草案以第 3 节为准 |
 | 改动分级 | 本文为 R1 文档；实现批次的等级见第 9 节 |
 
 文中 `路径:行号` 均指上述基线，实施时以符号名重新定位。
@@ -281,7 +281,7 @@ M4-3a 实施要点（`createApiServer().close()`，原 `closeServer()` 并入其
 - 第 1 步对尚未写出响应头的在途请求补 `Connection: close`，此后每个响应结束时再关一次空闲连接；只调用 `server.close()` 时，响应头已发出的保活连接会留到 `keepAliveTimeout` 才断开。
 - 第 3 步是新增的 `portal.drain()`：只断开升级连接和响应类型为 `text/event-stream` 的代理流，排空期间到达的事件流与升级请求直接结束或返回 503；普通代理请求、自动登录与资产协调继续完成。第 5 步的 `portal.close()` 再结束其余部分。
 - 排空期间 `/api/ready` 返回 503，新的概览流返回 503；`/api/health` 不变。
-- 60 s 期限从 `close()` 开始计时，覆盖等待更新流读取的时间；期满时关闭剩余 HTTP 连接和已升级的套接字（`closeAllConnections()` 不处理后者，而 `server.close()` 会等它们），并记录一条警告与剩余数。被拒绝的升级请求写完响应即销毁套接字，不因客户端半开而拖住关闭。之后最多再等 2 s 让仍在执行的处理函数结束，再关协调器、数据库与锁；协调器收尾（进行中的状态读取与模块同步）最多再等 5 s；最坏合计约 60 + 2 + 5，在 75 s 内。
+- 60 s 期限从 `close()` 开始计时；更新流立即结束连接、停止定时器，其状态读取与 HTTP 排空并行，不在排空前串行等待。期满时关闭剩余 HTTP 连接和已升级的套接字，并记录一条警告与剩余数。被拒绝的升级请求写完响应即销毁套接字，不因客户端半开而拖住关闭。之后最多再等 2 s 让仍在执行的处理函数结束，再关闭协调器；尚未开始的维护同步被取消，迟到的检查、准入及收尾不再写控制库或发送新的更新请求。协调器与状态流共同使用最后 5 s 收尾预算，再关数据库与锁；最坏合计约 60 + 2 + 5，在 75 s 内。
 - 单进程 `createApp` 的数据面随进程关闭：排空与数据面关闭并行，在途的导入、交易读取被取消后仍以其结果答复，不必等满 60 s。
 - 手动运行的启动器 `API_STOP_MS` 由 30 s 改为 75 s，与 API 单元的 `TimeoutStopSec` 一致，避免排空中的 API 被提前强杀。
 
@@ -302,11 +302,11 @@ M4-3a 实施要点（`createApiServer().close()`，原 `closeServer()` 并入其
 
 两个槽并存的几秒内，浏览器可能从新槽拿到 `index.html`，再经另一条连接从旧槽请求新版本的脚本；或者已打开的旧页面在切换后按需加载旧版本的分包。两种情况下对方的 `dist/` 都没有该文件，会返回 404。
 
-静态响应在自身 `dist/` 中找不到文件、且路径位于 Vite 产出的 `assets/` 目录时，依次在 `$APP_DIR/current/dist/` 与 `$APP_DIR/previous/dist/` 中查找，找到即返回。`assets/` 下的文件名含内容哈希，同名即同内容，跨版本返回不会混用不同内容。路径校验与现有规则相同（`server/api/server.mjs:436-441`），只查这两个固定目录，不跟随其他软链；`APP_DIR` 由版本目录的上两级得出，不来自请求。
+静态响应在自身 `dist/` 中找不到文件、且路径位于 Vite 产出的 `assets/` 目录时，依次从 `$APP_DIR/current`、`previous`、`slots/a`、`slots/b` 指向的发布目录查找。槽链接覆盖 `current` 已切换而 `previous` 尚未更新的窗口，也保留回滚前已返回页面所需的分包；安装器清理继续保留槽链接引用的发布目录。`APP_DIR` 由当前版本目录推导，不来自请求；不扫描其他发布目录、不新增来源缓存，链接移动或删除在下一次查找生效。
 
 这也修复了现有问题：整体更新后仍开着的旧页面加载旧分包会 404。
 
-M4-3a 按此实现于 `server/static-response.mjs` 的 `createReleaseAssetLookup`：只在 `<APP_DIR>/releases/<12 位提交>-<16 位键>/dist` 布局下生效（开发目录与 Windows 不查找）；`current`、`previous` 解析后须仍是 `releases/` 下的发布目录且不是自身；文件名只允许单段 `[A-Za-z0-9_.-]`，文件须是普通文件且真实路径不变，不跟随发布目录内的软链。
+`server/static-response.mjs` 的 `createReleaseAssetLookup` 只在 `<APP_DIR>/releases/<12 位提交>-<16 位键>/dist` 布局下生效，普通开发目录不查找。四个固定链接解析后须仍是同一 `releases/` 下的合法发布目录且不是自身；文件名只允许单段 `[A-Za-z0-9_.-]`，文件须是普通文件且真实路径不变，不跟随发布目录内的软链。Windows 测试用目录 junction 验证同一规则。回滚到尚未包含该能力的旧程序，不能获得新程序的跨槽资源保障。
 
 ## 6 M4-4：双槽单元与安装器切换
 

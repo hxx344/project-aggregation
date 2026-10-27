@@ -514,14 +514,18 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
         server.closeIdleConnections();
         for (const res of streams.keys()) res.end(); streams.clear();
         portal.drain();
-        await updateStream.close();
+        // End stream clients now, but drain requests before waiting for its
+        // shared status read. That read may be behind slow module syncs.
+        const streamClosing = updateStream.close();
         if (listener) { await listener; clearTimeout(forced); }
         let grace; await Promise.race([Promise.allSettled([...handlers]), new Promise(resolve => { grace = setTimeout(resolve, HANDLER_GRACE_MS); })]); clearTimeout(grace);
         // A candidate that never served has reported nothing and reports nothing now.
         const reported = candidate ? Promise.resolve() : finalReport();
         closed = true; unsubscribe(); clearInterval(heartbeat); clearInterval(statsTimer); for (const timer of retries) clearTimeout(timer); retries.clear();
         // A status read or module synchronization in flight gets COORDINATOR_CLOSE_MS; closing does not wait longer.
-        const ending = updates ? updates.close() : Promise.resolve(); let bound;
+        const ending = Promise.allSettled([updates ? updates.close() : Promise.resolve(), streamClosing]).then(results => {
+          for (const result of results) if (result.status === 'rejected') log.warn({ err: result.reason, type: 'shutdown' }, '更新协调器关闭失败');
+        }); let bound;
         const late = await Promise.race([ending.then(() => false), new Promise(resolve => { bound = setTimeout(() => resolve(true), COORDINATOR_CLOSE_MS); })]); clearTimeout(bound);
         if (late) { log.warn({ type: 'shutdown' }, '更新协调器未在期限内结束，继续关闭'); ending.catch(error => log.warn({ err: error, type: 'shutdown' }, '更新协调器关闭失败')); }
         portal.close(); await reported;

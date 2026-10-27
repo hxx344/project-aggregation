@@ -277,6 +277,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **工作台原生入口补充（2026-10-27）：** `3e4de30` 已在聚合仓库交付 Entropy/Lighter 采集与模拟，却仅提供独立 CLI/systemd；用户随后明确要求在工作台内部使用。仓库与发布目标正确仍不足以完成产品接入。新增研究能力先核对侧栏入口、配置/报告路径、后台生命周期及正式包，不能从“Linux 常驻”自行推导为另装服务。本轮补齐原生研究页、已鉴权的 API、runtime 托管进程、四文件发布白名单及增量键；用 [工作台接口测试](tests/entropy-lighter-workbench.test.mjs)、[生产页面夹具](tests/entropy-lighter.browser.mjs) 和 [跨 API 重启用例](tests/process-split.test.mjs) 验证，其中 POSIX 路径在 Windows 跳过、等待 CI，不能描述为本地通过。事件 `research-workbench-entry-20261027`；不推进复盘检查点，历史事件的具体根因与适用边界仍须逐项核验，不仅按条目内日期数量升级规范。
 
+**双槽资源逃逸（2026-10-27）：** 审查已合入 `6ab243e` 确认：`84aa260` 的切流先移动 `current`，旧槽排空后才更新 `previous`；仅测试健康接口和目标 HTML，遗漏旧页面延迟分包与回滚后的新页面分包。实际资源查找复现两个方向 404，属于 P1 逃逸。资源来源须覆盖两个固定槽所引用的合法发布目录，仍拒绝任意其他版本和目录内链接；[资源 HTTP 回归](tests/release-assets.test.mjs) 与 [systemd 公共入口](deploy/test-slots-systemd.sh) 检查先取页面、再切流/回滚、最后请求分包及复用授权。事件 `api-slot-delayed-assets-20261027`；不推进复盘检查点。
+
 ### L018：固定 Node 执行包管理器时必须取得 JavaScript 入口
 
 **适用条件：** CI 或安装器使用 `node <package-manager>`，以固定 Node 版本运行包管理器。
@@ -588,6 +590,10 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **同轮补充：** `c826f18` 的 [Ubuntu 26.04 CI](https://github.com/hxx344/project-aggregation/actions/runs/38635180672/job/116096379982) 在连接上限测试退出时抛出 `CancelledError`。事件控制的 Windows 回归确认：接收任务正常结束、发送任务停在收尾时，取消父处理器会让 `gather` 用最后一个子任务的空取消信息替代父信息，导致 AnyIO 无法识别自己的取消范围。先释放名额后用 `shield` 隔离等待，遇到父取消时再次取消子任务并原样抛出，保留父取消身份；不吞取消，也不留后台子任务。新增回归断言取消信息、子任务结束和名额归零，并保留原双重取消用例；Ubuntu 26.04 的真实 systemd/TLS 检查仍须通过。
 
 **事件记录：** `relay-cancelled-cleanup-slot-leak-20261015`；发布检查暴露的一次连接清理缺陷。
+
+**API 关闭与忙锁补充（2026-10-27）：** 审查 `6ab243e` 的 [API 排空](server/api/server.mjs) 复现更新流等待串行维护同步时越过声明的关闭预算；先同步停止流和定时器，再将 pending 与协调器纳入共同预算，关闭后取消排队任务，迟到返回不再写已关闭的库。不能只在连接上设期限却遗漏其等待的任务。[API 回归](tests/api-server.test.mjs) 用有限耗时的真实 HTTP/SSE 队列验证关闭上限；[更新回归](tests/embedded-updates.test.mjs) 验证等待中的写入和准入不在关闭后继续。事件 `api-drain-status-queue-20261027`。
+
+同轮 [Portal](server/portal.mjs) 首次撤销与关闭时的重试仍等待 SQLite 的 5 s busy_timeout；[Portal 回归](tests/portal.test.mjs) 将计时起点移到登出请求前，确认首次撤销、后台重试与关闭都不阻塞事件循环，锁释放后仍完成跨实例撤销。事件 `portal-initial-revocation-busy-20261027`。两项均限于本次已核实的失败路径，不据此扩大其他模块的关闭约定。
 
 ### L038：内部十进制计算结果不重新套用输入长度限制
 
@@ -1005,6 +1011,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **同类拒绝补全：** 实际 HTTPX 回归还复现 HTTP400/既有明确拒绝码 `-2019` 后私库 rejected、共享 UNKNOWN，下一轮无法发出。划转专用类型只沿用既有拒绝白名单和固定端点；单次已发送请求的明确拒绝也须先持久化原体回执再结算。不能将“已发送”直接等同“已接受”，也不能把多笔批次中一笔拒绝推广为全部拒绝；混合结果、`-1007` 和网络超时继续保留 UNKNOWN。此为同一逃逸路径的补全，不新增事件。
 
+**Greeks 改单逃逸（2026-10-27）：** 已发布 `519d2e8` 的改单身份仅由原订单与正文摘要组成，审查 `6ab243e` 实测价格 `2→3→2` 时第三个新意图误中 `ALREADY_SUBMITTED` 并进入撤单核对，属于 P1 逃逸。新意图须有先持久化的独立递增序号；参数再次相同不等于同一个意图重试。原单尚有 `sending/unknown` 时不能靠换号绕过，共享旧摘要 ID 及撤单/终态核对保持兼容。[Greeks 账户测试](modules/greeks/tests/test_account_writer.py) 覆盖真实追价、重启续号、遗留未决、同单并发及状态写失败零发送。事件 `greeks-amend-intent-reuse-20261027`；不推进复盘检查点。
+
 ### L063：恢复检查点须保留秘密材料、真实未决状态与原服务可用性
 
 **适用条件：** 跨模块制作冷备份、隔离恢复或一次性转移交易 authority，尤其由 root 工具操作服务账户拥有的 SQLite 数据。
@@ -1148,6 +1156,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `d1939d3`。2026-10-22 用户截图显示更新回来后 Aster 5x「数据过期」，运行详情为 xau01、xau02「资金快照已过期（超过 120 秒）」与「项目数据已过期」，手动重新载入或等待后恢复。服务器日志未取得，「回来后才释放」的时序由源码推断，未在服务器复现。
 
 **事件记录：** `update-latch-browser-release-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；不推进全历史复盘检查点。
+
+**跨 API 所有权补充（2026-10-27）：** 审查 `6ab243e` 的两个真实协调器和特权更新器，确认同计划同模式下较晚返回的停机证据失败，能用本地旧值清掉另一实例已接受的维护标记；真实 worker 完成锁与身份核验后观察到维护为 false。普通在线切流的 ACTIVE job、CLI stack lock 和版本身份重核是反证，不能只凭双实例调用就宣称正常切流必然触发。持久准入代号、独占 owner 与维护/pending 须在同一事务中写入，活 owner 期间同计划的另一实例也不能覆盖它；不能只比较最后一个 token 而嵌套原状态，否则全部确定失败会遗留锁。owner 记录准备/发送边界，确认死亡的 preparing 可回原状态，sending 仍保留不确定 pending；所有退休（含关闭与未知结果）都换代，旧请求不改新一代。状态不按时间自动开闸。[共享协调器回归](tests/update-coordinator-sharing.test.mjs) 使用真实 Python 接受/执行逻辑，包含两条反证、全部失败及真实进程终止；POSIX 用实际槽/入口和被终止的 CLI 锁进程验证中断场景，由既有特权 CI 执行，不把 Windows 跳过写成通过。事件 `cross-api-maintenance-ownership-20261027`；不推进复盘检查点。
 
 ### L073：按市场分支的配对展示须覆盖每个有同构报价的市场
 

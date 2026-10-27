@@ -259,6 +259,8 @@ jobs:
           node-version: '24.15.0'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Verify shared update ownership across API slots and interrupted cutovers
+        run: sudo "$(command -v node)" --test tests/update-coordinator-sharing.test.mjs
       - name: Verify the entry, API slot switches under load, rollback and back-out
         run: |
           sudo env SLOTS_TEST_NODE="$(command -v node)" AGG_SLOTS_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-slots-systemd.sh

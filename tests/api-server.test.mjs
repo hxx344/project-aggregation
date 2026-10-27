@@ -149,6 +149,32 @@ test('a request still in flight after the drain period has its connection closed
   assert.ok(f.warnings.some(entry => entry.message === '在途请求未在期限内结束，已关闭其连接' && entry.fields.requests === 1));
 });
 
+test('closing bounds a status stream behind queued module synchronizations', { timeout: 15_000 }, async t => {
+  let slow = false, syncs = 0, reads = 0;
+  const f = await fixture(t, { embeddedModules: true, drainMs: 100,
+    updatesClient: { async status() { reads++; return updateState(); } },
+    supervisor: { async syncMaintenance(ids) {
+      syncs++;
+      if (slow) await new Promise(resolve => setTimeout(resolve, 500));
+      return { active: false, modules: ids.map(id => ({ id, confirmed: true, generation: 1 })) };
+    } },
+  });
+  slow = true;
+  const requests = Array.from({ length: 20 }, () => f.request('/api/system/updates').then(res => res.arrayBuffer()).catch(() => {}));
+  const stream = await f.request('/api/system/updates/events');
+  const reading = stream.arrayBuffer().catch(() => {});
+  for (const until = Date.now() + 3000; reads < 21 && Date.now() < until;) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(reads, 21, 'the shared stream read must be queued behind concurrent requests');
+  const started = performance.now();
+  await f.close();
+  assert.ok(performance.now() - started < 5000, 'stream cleanup must not drain every queued module sync');
+  const completed = syncs;
+  assert.ok(completed < 21, 'queued module work is cancelled after the handler grace');
+  await Promise.all([...requests, reading]);
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(syncs, completed, 'closed coordinators start no more module work');
+});
+
 test('a hashed asset missing from this release is served from the current or previous release only', async t => {
   const appDir = await mkdtemp(path.join(os.tmpdir(), 'hub-releases-')); t.after(() => rm(appDir, { recursive: true, force: true }));
   const release = name => path.join(appDir, 'releases', name);
@@ -158,16 +184,21 @@ test('a hashed asset missing from this release is served from the current or pre
   await writeFile(path.join(release(newer), 'dist', 'assets', 'app-new.js'), 'newer');
   await writeFile(path.join(release(older), 'dist', 'assets', 'app-old.js'), 'older');
   await writeFile(path.join(release(stray), 'dist', 'assets', 'app-stray.js'), 'stray');
-  await symlink(release(stray) + '/dist/assets/app-stray.js', path.join(release(newer), 'dist', 'assets', 'linked.js'));
-  await symlink(release(newer), path.join(appDir, 'current')); await symlink(release(older), path.join(appDir, 'previous'));
+  const directoryLink = process.platform === 'win32' ? 'junction' : 'dir';
+  await symlink(release(newer), path.join(appDir, 'current'), directoryLink); await symlink(release(older), path.join(appDir, 'previous'), directoryLink);
   const f = await fixture(t, { distDir: path.join(release(own), 'dist') });
   const read = route => new Promise((resolve, reject) => {
     http.get(f.origin + route, { headers: { Host: `hub.localhost:${new URL(f.origin).port}` } }, res => { let body = ''; res.setEncoding('utf8'); res.on('data', chunk => { body += chunk; }); res.on('end', () => resolve([res.statusCode, body])); }).on('error', reject);
   });
   assert.deepEqual(await read('/assets/app-new.js'), [200, 'newer']);
   assert.deepEqual(await read('/assets/app-old.js'), [200, 'older']);
-  for (const route of ['/assets/app-stray.js', '/assets/linked.js', '/assets/..%2Freleases%2Fapp.js', '/app-new.js']) assert.equal((await read(route))[0], 404, route);
+  for (const route of ['/assets/app-stray.js', '/assets/..%2Freleases%2Fapp.js', '/app-new.js']) assert.equal((await read(route))[0], 404, route);
   assert.deepEqual(await read('/settings'), [200, 'own index']);
+  await t.test('a file symlink inside another release is refused', async t => {
+    try { await symlink(path.join(release(stray), 'dist', 'assets', 'app-stray.js'), path.join(release(newer), 'dist', 'assets', 'linked.js')); }
+    catch (error) { if (process.platform === 'win32' && error.code === 'EPERM') { t.skip('Windows file symlink permission unavailable'); return; } throw error; }
+    assert.equal((await read('/assets/linked.js'))[0], 404);
+  });
 });
 
 test('project writes succeed, retry the change notice and log the reason once it is given up', async t => {

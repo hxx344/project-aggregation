@@ -193,9 +193,11 @@ test('a logout that cannot delete its grant while the database is busy is refuse
   const { cookie } = await a.authorize();
   dbs[2].exec('BEGIN IMMEDIATE');
   try {
+    const started = Date.now();
+    const turn = new Promise(resolve => setTimeout(() => resolve(Date.now() - started), 25));
     const logout = await a.request('/api/logout', { method: 'POST', cookie, headers: { Origin: `http://${a.host('asset')}` } });
     assert.equal(logout.status, 200); assert.deepEqual(logout.headers['set-cookie'], ['hub_portal=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0']);
-    const started = Date.now();
+    assert.ok(await turn < 1000, 'the first revocation must not block the API event loop');
     assert.equal((await a.request('/private', { cookie })).status, 401);
     assert.equal((await b.request('/private', { cookie })).status, 200);
     // The retry each second must not wait out busy_timeout (5 s) while the lock is held.
@@ -209,6 +211,19 @@ test('a logout that cannot delete its grant while the database is busy is refuse
     if ((status = (await b.request('/private', { cookie })).status) === 401) break;
   }
   assert.equal(status, 401);
+});
+
+test('closing with a queued grant revocation never waits for a database writer', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-closing-')); const dbs = [0, 1].map(() => openHubDatabase(join(dir, 'hub.sqlite')));
+  t.after(() => { for (const db of dbs) db.close(); rmSync(dir, { recursive: true, force: true }); });
+  const f = await fixture(t, { store: createPortalStore(createControlStore(dbs[0])) });
+  const { cookie } = await f.authorize();
+  dbs[1].exec('BEGIN IMMEDIATE');
+  try {
+    assert.equal((await f.request('/api/logout', { method: 'POST', cookie, headers: { Origin: `http://${f.host('asset')}` } })).status, 200);
+    const started = Date.now(); f.portal.close();
+    assert.ok(Date.now() - started < 1000, 'shutdown must not wait out busy_timeout');
+  } finally { dbs[1].exec('ROLLBACK'); }
 });
 
 test('a grant revoked by one API instance closes the WebSocket open on the other', async t => {
