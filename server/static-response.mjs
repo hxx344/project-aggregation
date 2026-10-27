@@ -53,11 +53,13 @@ export function createStaticResponder({ maxBytes = 16 * 1024 * 1024 } = {}) {
 }
 
 // An installed release lives in `<APP_DIR>/releases/<commit>-<key>`, next to the
-// `current` and `previous` links. A hashed Vite asset missing from this release's
-// dist/ may still be wanted by a page another release served (one opened before
+// `current`, `previous` and API slot links. A hashed Vite asset missing from
+// this release's dist/ may still be wanted by a page another release served (one opened before
 // an update, or an index.html from the other API slot); the same name is the same
-// content, so it is looked up in those two releases only. Outside that layout
-// nothing is looked up. Returns the file's real path or null.
+// content, so it is looked up in those linked releases only. Slot links cover
+// the cutover before `previous` moves and delayed loads after a rollback.
+// The links are resolved on each lookup; outside that layout nothing is looked
+// up. Returns the file's real path or null.
 const RELEASE_NAME = /^[a-f0-9]{12}-[a-f0-9]{16}$/;
 export function createReleaseAssetLookup(distDir) {
   const release = path.dirname(path.resolve(distDir)), releases = path.dirname(release);
@@ -65,7 +67,7 @@ export function createReleaseAssetLookup(distDir) {
   const appDir = path.dirname(releases);
   return name => {
     if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(name)) return null;
-    for (const link of ['current', 'previous']) {
+    for (const link of ['current', 'previous', 'slots/a', 'slots/b']) {
       try {
         const target = realpathSync(path.join(appDir, link));
         if (target === release || path.dirname(target) !== releases || !RELEASE_NAME.test(path.basename(target))) continue;

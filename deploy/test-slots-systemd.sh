@@ -51,8 +51,9 @@ useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /
 port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 PORT_VALUE=$port HEALTH_URL=$(health_url 127.0.0.1 "$port")
 install -m 0640 -o root -g "$SERVICE_USER" /dev/null "$ENV_FILE"
+initial_password=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
 printf 'HOST=127.0.0.1\nPORT=%s\nDATA_DIR=%s\nNODE_ENV=production\nINITIAL_PASSWORD=%s\nMODULE_SOCKET_DIR=%s/modules\n' \
-  "$port" "$DATA_PATH" "$(python3 -c 'import secrets; print(secrets.token_hex(16))')" "$DATA_PATH" > "$ENV_FILE"
+  "$port" "$DATA_PATH" "$initial_password" "$DATA_PATH" > "$ENV_FILE"
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH" "$DATA_PATH/modules"
 
 # pino and what it needs, flat, from the checkout's locked install.
@@ -166,6 +167,52 @@ inactive() { [[ $(systemctl is-active "$1") != active ]]; }
 release_tag() { tr -d '\n' < "$1/dist/index.html" | sed 's#.*<title>\([^<]*\)</title>.*#\1#'; }
 # The page the public port serves on the workbench's canonical host.
 page_is() { [[ $(curl --fail --silent --max-time 3 -H "Host: hub.localhost:$port" "${HEALTH_URL%/api/health}/" | sed -n 's#.*<title>\([^<]*\)</title>.*#\1#p') == "$(release_tag "$1")" ]]; }
+# Capture a page's resource before switching; fetch it only after the new slot
+# serves, or after rollback. This uses the same public entry as the browser.
+page_asset() { curl --fail --silent --max-time 3 -H "Host: hub.localhost:$port" "${HEALTH_URL%/api/health}/" | sed -n 's#.*src="\([^"]*\)".*#\1#p'; }
+asset_is() {
+  local body
+  body=$(curl --fail --silent --max-time 3 -H "Host: hub.localhost:$port" "${HEALTH_URL%/api/health}$1") || return 1
+  [[ "$body" == "document.title = '$2';" ]]
+}
+
+# A real login, launch ticket and Portal grant through the public entry. Keep
+# their cookies across cutover and rollback; a static fallback must not disturb
+# the existing shared authentication path.
+cat > "$work_dir/public-session.mjs" <<'JS'
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { readFileSync, writeFileSync } from 'node:fs';
+const [port, mode, file] = process.argv.slice(2), host = `hub.localhost:${port}`;
+const request = (route, { method = 'GET', body, headers = {} } = {}) => new Promise((resolve, reject) => {
+  const encoded = body === undefined ? undefined : JSON.stringify(body);
+  const req = http.request({ hostname: '127.0.0.1', port, path: route, method, agent: false, timeout: 5000,
+    headers: { Host: host, Origin: `http://${host}`, ...(encoded ? { 'Content-Type': 'application/json' } : {}), ...headers } }, res => {
+    const chunks = []; res.on('data', chunk => chunks.push(chunk)); res.on('error', reject);
+    res.on('end', () => { const text = Buffer.concat(chunks).toString(); let data; try { data = JSON.parse(text); } catch {} resolve({ status: res.statusCode, headers: res.headers, text, data }); });
+  });
+  req.on('timeout', () => req.destroy(new Error('Public session request timed out'))); req.on('error', reject); req.end(encoded);
+});
+let state;
+if (mode === 'open') {
+  const login = await request('/api/login', { method: 'POST', body: { password: process.env.SLOTS_TEST_PASSWORD } });
+  assert.equal(login.status, 200, login.text);
+  state = { cookie: login.headers['set-cookie'][0].split(';')[0], csrf: login.data.csrfToken };
+  const launch = await request('/api/projects/monitor/launch', { method: 'POST', headers: { Cookie: state.cookie, 'X-CSRF-Token': state.csrf } });
+  assert.equal(launch.status, 200, launch.text);
+  const url = new URL(launch.data.url);
+  const grant = await request(url.pathname + url.search, { headers: { Host: url.host } });
+  assert.equal(grant.status, 302, grant.text);
+  state.portalHost = url.host; state.portalCookie = grant.headers['set-cookie'][0].split(';')[0];
+  writeFileSync(file, JSON.stringify(state), { mode: 0o600 });
+} else state = JSON.parse(readFileSync(file, 'utf8'));
+assert.equal((await request('/api/health')).status, 200);
+const projects = await request('/api/projects', { headers: { Cookie: state.cookie } });
+assert.equal(projects.status, 200, projects.text);
+const portal = await request('/', { headers: { Host: state.portalHost, Origin: `http://${state.portalHost}`, Cookie: state.portalCookie } });
+assert.equal(portal.status, 200, portal.text); assert.equal(portal.data.module, 'monitor');
+JS
+public_session() { SLOTS_TEST_PASSWORD="$initial_password" "$node" "$work_dir/public-session.mjs" "$port" "$1" "$work_dir/public-session.json"; }
 
 expect_state() { # slot release
   [[ $(read_slot_record) == "$1 $2" && $(readlink "$APP_DIR/current") == "$2" && $(readlink "$APP_DIR/slots/$1") == "$2" ]]
@@ -188,6 +235,9 @@ expect_state a "$release_one"
 [[ $(stat -c '%U %a' "/run/$ENTRY_SERVICE") == "$SERVICE_USER 700" && $(stat -c '%U %a' "/run/$API_SERVICE-a") == "$SERVICE_USER 700" ]]
 [[ ! -e "$API_UNIT_FILE" && $(identity a | json_field pid) == "$(main_pid "$API_SERVICE@a")" ]]
 runtime_pid=$(main_pid "$SERVICE") entry_pid=$(main_pid "$ENTRY_SERVICE")
+public_session open
+delayed_one_asset=$(page_asset)
+[[ "$delayed_one_asset" == /assets/app-one.js ]]
 
 # An API-only update (design doc 3.5) moves the traffic to slot b under load;
 # the runtime and the entry keep running.
@@ -195,6 +245,8 @@ start_load
 api_cutover b "$release_two"
 check_load 'switch a -> b'
 expect_state b "$release_two"
+asset_is "$delayed_one_asset" one
+public_session check
 [[ $(main_pid "$SERVICE") == "$runtime_pid" && $(main_pid "$ENTRY_SERVICE") == "$entry_pid" ]]
 [[ $(entry_status | json_field connections.a) == 0 ]]
 
@@ -214,10 +266,14 @@ old_slot_record=$(read_slot_record) cutover_committed=0
 start_load
 api_cutover a "$release_three"
 expect_state a "$release_three"
+delayed_three_asset=$(page_asset)
+[[ "$delayed_three_asset" == /assets/app-three.js ]]
 (( cutover_committed ))
 api_cutover_rollback
 check_load 'switch a and its rollback'
 expect_state b "$release_two"
+asset_is "$delayed_three_asset" three
+public_session check
 [[ $(main_pid "$SERVICE") == "$runtime_pid" && $(main_pid "$ENTRY_SERVICE") == "$entry_pid" ]]
 # The record on disk decides, not the flag: a signal may land between the two.
 old_slot_record=$(read_slot_record) cutover_committed=0
