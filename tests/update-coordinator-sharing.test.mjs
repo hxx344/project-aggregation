@@ -15,6 +15,7 @@ import { createExecutionJobsReader } from '../server/control/execution-jobs.mjs'
 import { createModuleUpdateGuard, tradingModules } from '../server/modules/updates.mjs';
 import { moduleCapabilities } from '../server/modules/capabilities.mjs';
 import { createRuntimeService } from '../server/runtime/service.mjs';
+import { loadCredentialCipher } from '../server/runtime/credentials.mjs';
 import { coordinatorHooks, createInProcessClient } from '../server/runtime/supervisor-client.mjs';
 import { createUpdateCoordinator, UpdateError } from '../server/updates.mjs';
 import { startApi } from '../server/api/main.mjs';
@@ -63,7 +64,7 @@ function linesChild(t, args) {
     } };
 }
 
-async function fixture(t) {
+async function fixture(t, { runtimeBootstrap = false } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'update-sharing-'));
   const cleanups = [], cleanup = { after: action => cleanups.push(action) };
   // Explicit reverse ownership order also works when the test assertion fails.
@@ -71,6 +72,9 @@ async function fixture(t) {
     try { for (const close of cleanups.reverse()) await close(); }
     finally { await rm(root, { recursive: true, force: true }); }
   });
+  // A real runtime creates its credential key before hub.sqlite. This fixture
+  // precreates the database for the Python boundary, so preserve that order.
+  if (runtimeBootstrap) loadCredentialCipher(root, { info() {} });
   const database = path.join(root, 'hub.sqlite'), databases = [];
   const connect = () => { const db = openHubDatabase(database); databases.push(db); return createControlStore(db); };
   const durable = connect(); cleanup.after(() => { for (const db of databases.reverse()) db.close(); });
@@ -128,6 +132,16 @@ test('conflicting deployment modes are refused across APIs before privileged acc
   assert.equal(result.beforeInstaller.length, 1);
   assert.equal(result.beforeInstaller[0].maintenance, true);
   assert.deepEqual(active, Object.fromEntries(tradingModules.map(id => [id, true])));
+});
+
+test('the runtime sharing fixture preserves credential bootstrap before its precreated database', { skip: protectedSkip, timeout: 30_000 }, async t => {
+  const f = await fixture(t, { runtimeBootstrap: true });
+  // Re-enter the real loader after SQLite exists, as startRuntime does. It
+  // must reuse the original key and keep existing ciphertext readable.
+  const first = loadCredentialCipher(f.root, { info() {} }), value = { fixture: 'offline' };
+  const encrypted = first.encrypt(value);
+  const restarted = loadCredentialCipher(f.root, { info() {} });
+  assert.deepEqual(restarted.decrypt(encrypted), value);
 });
 
 test('the same-plan competing API waits for the first real stop check to finish before retrying', { skip: protectedSkip, timeout: 30_000 }, async t => {
@@ -407,7 +421,7 @@ function publicClient(port, session = {}, agent = false) {
 
 test('SIGKILL between CLI switch and old-slot stop leaves an old keepalive and a new connection able to request the same full update',
   { skip: process.platform === 'win32' ? 'Linux slot/entry lifecycle; executed by the existing privileged CI job' : protectedSkip, timeout: 60_000 }, async t => {
-    const f = await fixture(t), quiet = { info() {}, debug() {}, warn() {}, error() {} };
+    const f = await fixture(t, { runtimeBootstrap: true }), quiet = { info() {}, debug() {}, warn() {}, error() {} };
     const moduleDir = path.join(f.root, 'modules'), slotRoot = path.join(f.root, 'slots'), entryDir = path.join(f.root, 'entry');
     for (const dir of [moduleDir, slotRoot, entryDir]) mkdirSync(dir, { mode: 0o700 });
     const { WORKBENCH_RUNTIME_DIR: _runtime, WORKBENCH_API_SLOT: _slot, ...inherited } = process.env;
@@ -460,11 +474,11 @@ test('SIGKILL between CLI switch and old-slot stop leaves an old keepalive and a
     assert.equal(updateSettings(f.durable).readAdmissionOwner(), null);
     const accepted = await next.request('/api/system/updates/apply', { method: 'POST', body: { planId: f.planId, deployMode: 'source' } });
     assert.equal(accepted.status, 202, JSON.stringify(accepted.data)); assert.equal(accepted.data.job.status, 'queued');
-    const result = await f.rootUpdater.call('run');
-    assert.equal(result.beforeInstaller.length, 1, 'after CLI SIGKILL the real root worker passed the shared lock and identity checks');
-    assert.equal(result.beforeInstaller[0].maintenance, true, JSON.stringify(result.beforeInstaller));
     for (const id of tradingModules) {
       const response = await controlRequest(path.join(moduleDir, `${id}.sock`), 'GET', '/maintenance-state');
       assert.equal(response.data.active, true, `${id} must remain in maintenance until the accepted full update completes`);
     }
+    const result = await f.rootUpdater.call('run');
+    assert.equal(result.beforeInstaller.length, 1, 'after CLI SIGKILL the real root worker passed the shared lock and identity checks');
+    assert.equal(result.beforeInstaller[0].maintenance, true, JSON.stringify(result.beforeInstaller));
   });

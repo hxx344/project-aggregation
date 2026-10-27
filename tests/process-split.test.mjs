@@ -176,6 +176,7 @@ test('over the socket, execution entries keep the runtime\'s 409 and 503 and out
   const quiet = { info() {}, debug() {}, warn() {}, error() {} };
   // Every exchange call of the runtime waits while `gate` is set.
   let gate = null;
+  const admissionHolds = [];
   const executionClientFactory = () => Object.fromEntries(['verify', 'account', 'market', 'create', 'inspect', 'stop'].map(method => [method, async () => {
     await gate?.promise;
     return method === 'verify' ? { identity: null } : { identity: null, modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] };
@@ -183,7 +184,7 @@ test('over the socket, execution entries keep the runtime\'s 409 and 503 and out
   const modules = fakeModules(path.join(dataDir, 'modules'));
   const runtime = await startRuntime({ dataDir, logger: quiet, env, startModules: modules.startModules, dataPlaneOptions: { ...dataPlaneOptions, executionClientFactory } });
   // Closing drains the held operation, so a failed assertion releases it first.
-  t.after(() => { gate?.resolve(); return runtime.close(); });
+  t.after(() => { for (const release of admissionHolds) release(); gate?.resolve(); return runtime.close(); });
   const db = new DatabaseSync(path.join(dataDir, 'hub.sqlite'));
   t.after(() => db.close());
   const entries = () => db.prepare('SELECT COUNT(*) AS count FROM execution_entries').get().count;
@@ -193,19 +194,30 @@ test('over the socket, execution entries keep the runtime\'s 409 and 503 and out
   const first = spawnFixture(t, 'split-api.mjs', env);
   const { port } = await first.next('ready'), c = client(port);
   await c.login();
-  // Another process committed maintenance the API has not seen: the runtime refuses, and the API keeps its reply.
-  setMaintenance('1');
-  const refused = await connect(c);
+  // Hold the module synchronization after the API's admission transaction, so
+  // the conflict is introduced at the runtime boundary, not caught by the API.
+  async function holdAfterAdmission() {
+    const before = modules.maintenanceCalls.aster, release = modules.hold('aster');
+    admissionHolds.push(release);
+    const reply = connect(c); void reply.catch(() => {});
+    assert.ok(await until(() => modules.maintenanceCalls.aster > before), 'the API passed its admission transaction');
+    return { reply, release };
+  }
+  // Another process commits maintenance after API admission: the runtime refuses, and the API keeps its reply.
+  const maintenanceRace = await holdAfterAdmission();
+  setMaintenance('1'); maintenanceRace.release();
+  const refused = await maintenanceRace.reply;
   assert.equal(refused.status, 409, refused.text); assert.equal(refused.data.error, EXECUTION_MAINTENANCE);
   setMaintenance('0');
 
   // A write lock held past busy_timeout (5 s) is a retryable 503 in either process. The runtime
   // runs in this process, so its wait blocks this thread while the API process waits beside it.
   // Only the two requests write meanwhile: `dataPlaneOptions` turns the runtime's background writes off.
+  const writeRace = await holdAfterAdmission();
   const { busy: busyBefore, busyReplies: repliesBefore } = writeWaitStats();
   db.exec('BEGIN IMMEDIATE');
   let busy;
-  try { busy = await Promise.all([connect(c), client(port).request('/api/login', { method: 'POST', body: { password } })]); }
+  try { writeRace.release(); busy = await Promise.all([writeRace.reply, client(port).request('/api/login', { method: 'POST', body: { password } })]); }
   finally { db.exec('ROLLBACK'); }
   for (const reply of busy) { assert.equal(reply.status, 503, reply.text); assert.equal(reply.data.error, DATABASE_BUSY); }
   assert.ok(writeWaitStats().busy > busyBefore, 'the runtime counted its write that ran out of busy_timeout');
