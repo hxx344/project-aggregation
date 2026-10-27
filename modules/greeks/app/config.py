@@ -50,10 +50,6 @@ class Settings(BaseSettings):
     bbo_poll_seconds: float = Field(default=1.0, ge=0.2, le=10)
     bbo_order_timeout_seconds: int = Field(default=600, ge=60, le=1800)
     allow_market_fallback: bool = False
-    greeks_live_api_key: SecretStr = SecretStr("")
-    greeks_live_base_url: str = "https://backtest.glvs.ai"
-    greeks_live_cache_file: str = ""
-    greeks_live_hourly_budget: int = Field(default=55, ge=1, le=60)
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", allow_inf_nan=False)
 
     @field_validator("dashboard_password")
