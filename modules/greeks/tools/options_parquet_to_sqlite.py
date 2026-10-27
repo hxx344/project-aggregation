@@ -5,10 +5,14 @@ Usage (needs Python 3.9+ with `pip install pyarrow numpy`):
   python options_parquet_to_sqlite.py convert  options_hourly/BTC -o btc_smiles.sqlite3
 
 Raw quotes (every strike, every hour) do not fit in 20 MB, so `convert` keeps one
-row per (UTC hour, expiry): the forward, ATM IV and the OTM implied-vol smile
-sampled at fixed standardized moneyness nodes z = ln(K/F) / (atm_iv * sqrt(T)).
-Nodes outside the quoted strike range are stored as 0 (no extrapolation).
-IVs are stored as uint16 in units of 0.0001 (0.01 vol point); forwards in USD cents.
+row per (UTC hour, expiry): the forward, ATM IV, the median bid/ask IV spread near
+ATM and the OTM implied-vol smile sampled at fixed standardized moneyness nodes
+z = ln(K/F) / (atm_iv * sqrt(T)). Nodes outside the quoted strike range are stored
+as 0 (no extrapolation). IVs are uint16 in units of 0.0001 (0.01 vol point);
+prices are USD cents.
+
+Hour H holds the latest snapshot taken in (H-1h, H], so a backtest acting at H
+never sees later quotes; with open/close snapshots per hour this keeps "close".
 Column names are detected automatically; override with --map role=column.
 """
 import argparse
@@ -33,8 +37,11 @@ ROLES = {
     "iv": ["mark_iv", "iv", "implied_volatility", "mark_implied_volatility", "markiv", "impliedvol", "mid_iv", "mark_vol", "vol"],
     "forward": ["forward", "forward_price", "underlying_price", "futures_price", "underlying"],
     "index": ["index_price", "spot", "spot_price", "underlying_index_price", "index"],
+    "bid_iv": ["bid_iv"],
+    "ask_iv": ["ask_iv"],
 }
 NODES = np.arange(-3.0, 3.01, 0.5)
+SNAPSHOT_WINDOW = 15 * 60
 INSTRUMENT = re.compile(r"^[A-Z]+-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:[.d]\d+)?)-([CP])$")
 MONTHS = {name: index for index, name in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 SCHEMA = """
@@ -44,10 +51,11 @@ CREATE TABLE smiles (
   expiry INTEGER NOT NULL,    -- UTC hours since epoch
   forward INTEGER NOT NULL,   -- USD cents
   atm_iv INTEGER NOT NULL,    -- 0.0001 units
+  iv_spread INTEGER NOT NULL, -- median ask_iv - bid_iv of OTM quotes within 1 sd of ATM, 0.0001 units, 0 = unknown
   n_strikes INTEGER NOT NULL,
   nodes BLOB NOT NULL,        -- little-endian uint16 IV per z node, 0 = not quoted
   PRIMARY KEY (hour, expiry)) WITHOUT ROWID;
-CREATE TABLE spot (hour INTEGER PRIMARY KEY, index_price INTEGER NOT NULL) WITHOUT ROWID;  -- USD cents
+CREATE TABLE spot (hour INTEGER PRIMARY KEY, price INTEGER NOT NULL) WITHOUT ROWID;  -- USD cents, see meta.spot_source
 """
 
 
@@ -135,9 +143,13 @@ def load(path, columns):
     else:
         data["expiry"], data["strike"], data["is_call"] = parse_instruments(table[columns["instrument"]])
     iv = numbers(table[columns["iv"]])
-    data["iv"] = iv / 100 if np.nanmedian(iv) > 3 else iv
+    scale = 100 if np.nanmedian(iv) > 3 else 1
+    data["iv"] = iv / scale
+    for side in ("bid_iv", "ask_iv"):
+        data[side] = numbers(table[columns[side]]) / scale if columns[side] else np.full(iv.size, np.nan)
     data["forward"] = numbers(table[columns["forward"] or columns["index"]])
-    data["index"] = numbers(table[columns["index"]]) if columns["index"] else None
+    if columns["index"]:
+        data["index"] = numbers(table[columns["index"]])
     return len(table), data
 
 
@@ -151,20 +163,40 @@ def require(columns):
         sys.exit(f"Cannot detect columns for: {', '.join(missing)}. Pass --map role=column (roles: {', '.join(ROLES)}).")
 
 
+def latest_per_hour(data):
+    """Label each quote with the hour that closes its snapshot and keep the latest quote per (hour, contract).
+
+    Quotes more than SNAPSHOT_WINDOW older than the hour's newest quote are dropped, so a contract
+    missing from the close snapshot does not put a stale open-snapshot IV into the smile."""
+    hour = np.ceil(data["time"] / 3600)
+    ok = np.isfinite(hour) & np.isfinite(data["expiry"]) & (data["strike"] > 0)
+    if ok.any():
+        labels, inverse = np.unique(hour[ok], return_inverse=True)
+        newest = np.full(labels.size, -np.inf)
+        np.maximum.at(newest, inverse, data["time"][ok])
+        ok[np.flatnonzero(ok)] = data["time"][ok] >= newest[inverse] - SNAPSHOT_WINDOW
+    picked = {key: value[ok] for key, value in data.items()}
+    picked["hour"] = hour[ok]
+    order = np.lexsort((picked["time"], picked["is_call"], picked["strike"], picked["expiry"], picked["hour"]))
+    picked = {key: value[order] for key, value in picked.items()}
+    keys = (picked["hour"], picked["expiry"], picked["strike"], picked["is_call"])
+    last = np.r_[np.any([np.diff(key.astype("float64")) != 0 for key in keys], axis=0), True] if order.size else np.zeros(0, bool)
+    return {key: value[last] for key, value in picked.items()}
+
+
 def smiles(data):
-    """Yield (hour, expiry_hour, forward, atm_iv, n_strikes, node_ivs) per (hour, expiry)."""
-    hour = np.floor(data["time"] / 3600)
+    """Yield (hour, expiry_hour, forward, atm_iv, iv_spread, n_strikes, node_ivs) per (hour, expiry)."""
+    data = latest_per_hour(data)
+    hour = data["hour"]
     years = (data["expiry"] - hour * 3600) / (365 * 86400)
-    ok = np.isfinite(hour) & np.isfinite(data["expiry"]) & (years > 0.5 / 8760) & (data["strike"] > 0) \
-        & np.isfinite(data["iv"]) & (data["iv"] > 0.01) & (data["iv"] < 5) & (data["forward"] > 0)
+    ok = (years > 0.5 / 8760) & np.isfinite(data["iv"]) & (data["iv"] > 0.01) & (data["iv"] < 5) & (data["forward"] > 0)
     hour, expiry, years = hour[ok], data["expiry"][ok], years[ok]
     strike, is_call, iv, forward = data["strike"][ok], data["is_call"][ok], data["iv"][ok], data["forward"][ok]
-    order = np.lexsort((strike, expiry, hour))
-    hour, expiry, years, strike, is_call, iv, forward = (a[order] for a in (hour, expiry, years, strike, is_call, iv, forward))
+    spread = data["ask_iv"][ok] - data["bid_iv"][ok]
     edges = np.flatnonzero((np.diff(hour) != 0) | (np.diff(expiry) != 0)) + 1
     for start, stop in zip(np.r_[0, edges], np.r_[edges, hour.size]):
         f = float(np.median(forward[start:stop]))
-        k, c, v = strike[start:stop], is_call[start:stop], iv[start:stop]
+        k, c, v, w = strike[start:stop], is_call[start:stop], iv[start:stop], spread[start:stop]
         otm = (c & (k >= f)) | (~c & (k <= f))
         if otm.sum() < 3:
             continue
@@ -174,9 +206,11 @@ def smiles(data):
         if x.size < 3 or not (x[0] <= 0 <= x[-1]):
             continue
         atm = float(np.interp(0.0, x, smile))
-        targets = NODES * atm * math.sqrt(float(years[start]))
+        width = atm * math.sqrt(float(years[start]))
+        near = (np.abs(x_all) <= width) & np.isfinite(w[otm]) & (w[otm] >= 0)
+        targets = NODES * width
         nodes = np.where((targets >= x[0]) & (targets <= x[-1]), np.interp(targets, x, smile), 0.0)
-        yield int(hour[start]), int(round(expiry[start] / 3600)), f, atm, int(x.size), nodes
+        yield int(hour[start]), int(round(expiry[start] / 3600)), f, atm, float(np.median(w[otm][near])) if near.any() else 0.0, int(x.size), nodes
 
 
 def encode_iv(values):
@@ -202,13 +236,14 @@ def inspect(args):
     require(columns)
     if not columns["forward"]:
         print("note: no forward/underlying column, smiles are centred on the index price instead of each expiry's forward")
-    total_rows = total_groups = 0
+    total_rows = total_groups = kept = 0
     hours = set()
     for path in files:
         if pq.read_schema(path).names != schema.names:
             print(f"  ! {path.name} has different columns: {pq.read_schema(path).names}")
             continue
         rows, data = load(path, columns)
+        kept += int(latest_per_hour(data)["hour"].size)
         groups = list(smiles(data))
         file_hours = {g[0] for g in groups}
         hours |= file_hours
@@ -218,8 +253,9 @@ def inspect(args):
         print(f"  {path.name}: {rows:>9,} rows, {len(file_hours):>4} hours, {len(groups):>6} hour x expiry smiles"
               + (f", {bad} unparsed instruments" if bad else "")
               + (f", {utc(min(file_hours) * 3600)} .. {utc(max(file_hours) * 3600)}" if file_hours else ""))
-    print(f"total: {total_rows:,} rows, {len(hours):,} hours, {total_groups:,} smiles, {total_rows / max(len(hours), 1):.0f} quotes per hour")
-    print(f"raw rows in SQLite would be roughly {total_rows * 60 / 1e6:,.0f} MB; compact smile cache roughly {total_groups * (60 + 2 * NODES.size) / 1e6:.1f} MB")
+    print(f"total: {total_rows:,} rows, {len(hours):,} hours, {total_groups:,} smiles; "
+          f"{kept / max(len(hours), 1):.0f} contracts per hour after keeping the latest snapshot ({total_rows / max(len(hours), 1):.0f} quotes before)")
+    print(f"raw rows in SQLite would be roughly {kept * 60 / 1e6:,.0f} MB; compact smile cache roughly {total_groups * (25 + 2 * NODES.size) / 1e6:.1f} MB")
 
 
 def convert(args):
@@ -236,20 +272,25 @@ def convert(args):
     db.executemany("INSERT INTO meta VALUES (?, ?)", [
         ("asset", "BTC"), ("nodes_z", ",".join(f"{z:g}" for z in NODES)), ("iv_scale", "10000"), ("price_scale", "100"),
         ("node_definition", "z = ln(K/F) / (atm_iv * sqrt(T)), T = (expiry - hour) / 365 days, OTM quotes, linear in ln(K/F)"),
-        ("max_dte", str(args.max_dte or "")), ("source_files", f"{files[0].name}..{files[-1].name}"), ("columns", repr(columns))])
+        ("max_dte", str(args.max_dte or "")), ("hour_label", "latest snapshot in (hour-1h, hour]"),
+        ("spot_source", "index column" if columns["index"] else "forward of the nearest expiry (no index column)"), ("source_files", f"{files[0].name}..{files[-1].name}"), ("columns", repr(columns))])
     written = 0
     for path in files:
         _, data = load(path, columns)
-        rows = [(h, e, int(round(f * 100)), int(encode_iv([a])[0]), n, encode_iv(nodes).tobytes())
-                for h, e, f, a, n, nodes in smiles(data) if not args.max_dte or e - h <= args.max_dte * 24]
-        db.executemany("INSERT OR REPLACE INTO smiles VALUES (?, ?, ?, ?, ?, ?)", rows)
-        if data["index"] is not None:
-            hour = np.floor(data["time"] / 3600)
-            ok = np.isfinite(hour) & (data["index"] > 0)
+        rows = [(h, e, int(round(f * 100)), int(encode_iv([a])[0]), int(encode_iv([w])[0]), n, encode_iv(nodes).tobytes())
+                for h, e, f, a, w, n, nodes in smiles(data) if not args.max_dte or e - h <= args.max_dte * 24]
+        db.executemany("INSERT OR REPLACE INTO smiles VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        if columns["index"]:
+            quotes = latest_per_hour(data)
             spot = {}
-            for h, value in zip(hour[ok].astype(int).tolist(), data["index"][ok].tolist()):
-                spot.setdefault(h, value)
-            db.executemany("INSERT OR REPLACE INTO spot VALUES (?, ?)", [(h, int(round(v * 100))) for h, v in spot.items()])
+            for h, value in zip(quotes["hour"].astype(int).tolist(), quotes["index"].tolist()):
+                if value > 0:
+                    spot[h] = value
+        else:
+            spot = {}
+            for h, e, f, *_ in sorted(rows, key=lambda row: (row[0], -row[1])):
+                spot[h] = f / 100
+        db.executemany("INSERT OR REPLACE INTO spot VALUES (?, ?)", [(h, int(round(v * 100))) for h, v in spot.items()])
         db.commit()
         written += len(rows)
         print(f"  {path.name}: {len(rows):,} smiles")
