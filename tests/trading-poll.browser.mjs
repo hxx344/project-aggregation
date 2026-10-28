@@ -126,7 +126,7 @@ async (page) => {
   await advance(5000, 0);
   const returning = tradingResponse();
   await page.getByRole('button', { name: '交易中心', exact: true }).click();
-  await page.getByRole('button', { name: '原油四腿套利', exact: true }).click();
+  await page.getByRole('button', { name: '套利交易', exact: true }).click();
   await settle(returning); await checkFresh();
   expire = true;
   const expiredReads = reads.length, expiredResponse = tradingResponse();
