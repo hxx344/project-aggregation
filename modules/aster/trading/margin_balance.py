@@ -11,6 +11,7 @@ from decimal import Decimal
 from fractions import Fraction
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -24,6 +25,8 @@ from eth_account.messages import encode_typed_data
 from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, TransferRejected, api_wait_notice, credentials_for
 from .models import TradingError, dec, decimal_value, positive, wire
 from .pair_planning import PairRecoveryConflict
+
+LOG = logging.getLogger("aster.trading")
 
 
 DEFAULT_MARGIN = {"enabled": False, "master_env_prefix": "", "check_interval_seconds": 5,
@@ -848,7 +851,12 @@ class MarginBalancer:
                     return self._refresh_acknowledged(pair, members, state, config)
                 return self._reconcile(pair, members, state, config)
             if self.engine.workspace.active:
-                return self._view(state, config, "paused", "工作台维护中，暂停新划转", blocks=True)
+                reason = "工作台维护中，暂停新划转"
+                workspace = self.engine.workspace
+                if (not workspace.reads_paused and snapshot_loader is not None and config["enabled"]
+                        and pair.get("enabled") and now >= workspace.display_due.get(pair["id"], 0)):
+                    reason = self._maintenance_read(pair, config, now, snapshot_loader) or reason
+                return self._view(state, config, "paused", reason, blocks=True)
             if not config["enabled"]:
                 return self._view(state, config, "disabled", "自动保证金平衡未启用")
             if not pair.get("enabled"):
@@ -944,6 +952,23 @@ class MarginBalancer:
         except Exception:
             state = self._record_failure(pair, state, "保证金日志或账户读取失败，禁止新划转")
             return self._view(state, config, self._failure_status(state), "保证金日志或账户读取失败，禁止新划转", blocks=True)
+
+    def _maintenance_read(self, pair, config, now, snapshot_loader):
+        """Refresh displayed balances during an admitted update; never plans a transfer."""
+        due = self.engine.workspace.display_due
+        due[pair["id"]] = now + config["check_interval_seconds"]
+        try:
+            snapshot_loader()
+        except Exception as exc:
+            # A display read leaves no failure record behind for the transfer path.
+            if not isinstance(exc, TradingError):
+                LOG.exception("维护期间余额显示读取失败 pair=%s", pair["id"])
+            due[pair["id"]] = max(due[pair["id"]], now + (getattr(exc, "retry_after", 0) or 0))
+            notice = api_wait_notice(exc) if isinstance(exc, TradingError) else None
+            detail = (notice["text"] if notice else self._read_error_detail(exc) if isinstance(exc, ExchangeError)
+                      else str(exc) if isinstance(exc, TradingError) else "账户读取失败")
+            return f"工作台维护中，暂停新划转；余额读取失败（{detail}），下次检查时重试"
+        return None
 
     @staticmethod
     def _read_error_detail(exc):

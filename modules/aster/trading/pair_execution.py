@@ -259,6 +259,13 @@ class PairTrader:
                 guard()
             yield
 
+    @staticmethod
+    def _display_due(pair, state):
+        """Keep display-only reads at the idle observation cadence of _ordinary_wait."""
+        interval = min(5, pair["margin"]["check_interval_seconds"]) if pair["margin"]["enabled"] else 5
+        stamps = [value.get("timestamp") for value in (state.get("snapshots") or {}).values() if isinstance(value, dict)]
+        return not stamps or not all(type(stamp) in (int, float) and 0 <= time.time() - stamp < interval for stamp in stamps)
+
     def _publish_snapshots(self, state, snapshots, symbol):
         from .engine import snapshot_json
         state["snapshots"] = {key: snapshot_json(value, [symbol]) for key, value in snapshots.items()}
@@ -395,6 +402,15 @@ class PairTrader:
                 return state
             if self.engine.workspace.active:
                 state.update(phase="maintenance", reason="工作台维护中，保留策略配置并暂停新交易")
+                if pair["enabled"] and not self.engine.workspace.reads_paused and self._display_due(pair, state):
+                    # Display-only refresh during an admitted update; every write stays refused.
+                    try:
+                        snapshots, _ = self._read(brokers, symbol)
+                    except ExchangeError as exc:
+                        notice = api_wait_notice(exc)
+                        state["reason"] += "；持仓读取失败（" + (notice["text"] if notice else "稍后自动重试") + "）"
+                    else:
+                        self._publish_snapshots(state, snapshots, symbol)
                 return state
             if margin_result.get("blocks_trading"):
                 state.update(phase="margin_wait", reason=margin_result.get("reason", "保证金划转等待核对"))

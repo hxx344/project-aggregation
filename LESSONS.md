@@ -1167,6 +1167,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **跨 API 所有权补充（2026-10-27）：** 审查 `6ab243e` 的两个真实协调器和特权更新器，确认同计划同模式下较晚返回的停机证据失败，能用本地旧值清掉另一实例已接受的维护标记；真实 worker 完成锁与身份核验后观察到维护为 false。普通在线切流的 ACTIVE job、CLI stack lock 和版本身份重核是反证，不能只凭双实例调用就宣称正常切流必然触发。持久准入代号、独占 owner 与维护/pending 须在同一事务中写入，活 owner 期间同计划的另一实例也不能覆盖它；不能只比较最后一个 token 而嵌套原状态，否则全部确定失败会遗留锁。owner 记录准备/发送边界，确认死亡的 preparing 可回原状态，sending 仍保留不确定 pending；所有退休（含关闭与未知结果）都换代，旧请求不改新一代。状态不按时间自动开闸。[共享协调器回归](tests/update-coordinator-sharing.test.mjs) 使用真实 Python 接受/执行逻辑，包含两条反证、全部失败及真实进程终止；POSIX 用实际槽/入口和被终止的 CLI 锁进程验证中断场景，由既有特权 CI 执行，不把 Windows 跳过写成通过。事件 `cross-api-maintenance-ownership-20261027`；不推进复盘检查点。
 
+**更新进行中停读补充（2026-10-28）：** 用户截图显示全量更新解包阶段 Aster 两侧账户「最近快照 · 更新延迟」，快照停在更新开始时刻。根因是维护门同时承担了停机证据所需的读取静止：[账户调度](modules/aster/trading/engine.py)、[保证金平衡](modules/aster/trading/margin_balance.py) 与 [配对执行](modules/aster/trading/pair_execution.py) 在维护期间整段不读，而全量更新从提交就进入维护，覆盖下载、构建和验证数分钟。所有读取都在账户锁内，[维护控制](modules/aster/trading/workspace_control.py) 取证全程持有全部账户锁，因此只需在取证前静止：`reads_paused` 随进入维护置位，取证成功后清除，重试取证再次置位；交易与划转仍由维护门和发送门拒绝。维护期间的显示读取按原检查周期或空闲观察周期执行，节奏只存在内存，不移动持久的划转检查时间；失败只写入当前视图，不留下影响划转路径的持久失败记录（独立审查曾指出复用 `next_check_at` 会推迟维护后的首次划转评估）。CrossEx、Greeks 维护期间本来只拦交易、不停读取。根治方向是只在切换前进入维护，另行处理。[维护测试](modules/aster/tests/test_workspace.py) 的两条新用例在修复前失败。事件 `aster-update-maintenance-reads-20261028`；服务器日志未取得，时序由截图与源码推断。
+
 ### L073：按市场分支的配对展示须覆盖每个有同构报价的市场
 
 **适用条件：** Monitor 关联交易面板按市场计算两腿配对指标（开仓价差、当前价差），而多个市场共用同一套报价对比组件与持仓列表（原油 CL/BZ、海力士 ADR/正股）。

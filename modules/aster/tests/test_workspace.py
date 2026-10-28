@@ -8,7 +8,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 import httpx
@@ -192,6 +192,33 @@ class WorkspaceTests(unittest.TestCase):
         broker.set_leverage("XAUUSD1", 10)
         self.assertEqual(broker.state["leverages"]["XAUUSD1"], 10)
         self.assertEqual(self.store.account("paper"), original)
+
+    def test_account_reads_resume_after_update_evidence_while_writes_stay_refused(self):
+        value = account("paper")
+        self.store.save_account(value)
+        broker = self.engine.broker(value)
+        self.assertTrue(self.engine.workspace.reads_paused)
+        self.assertFalse(self.engine.workspace.update_status()["busy"])
+        self.assertFalse(self.engine.workspace.reads_paused)
+        with patch.object(broker, "snapshot", wraps=broker.snapshot) as read, \
+             patch.object(broker, "submit", side_effect=AssertionError("maintenance must not trade")), \
+             patch.object(self.engine, "capacities", side_effect=AssertionError("maintenance must not plan new work")):
+            self.assertEqual(self.engine.tick_account("paper"), 5)
+        read.assert_called_once()
+        with self.assertRaises(RequestNotSent):
+            broker.set_leverage("XAUUSD1", 10)
+        # A retried check pauses resumed readers again, even when it fails.
+        with patch.object(self.engine.workspace, "_owned", return_value=False):
+            self.assertTrue(self.engine.workspace.update_status()["busy"])
+        self.assertTrue(self.engine.workspace.reads_paused)
+        self.assertFalse(self.engine.workspace.update_status()["busy"])
+        self.engine.workspace.set_maintenance(False)
+        self.assertFalse(self.engine.workspace.reads_paused)
+        self.engine.workspace.set_maintenance(True)
+        self.assertTrue(self.engine.workspace.reads_paused)
+        with patch.dict(os.environ, {"WORKSPACE_MAINTENANCE": "1"}):
+            restarted = Engine(self.store, market=DemoMarket())
+        self.assertTrue(restarted.workspace.reads_paused)
 
     def test_fresh_complete_open_orders_do_not_trust_unknown_snapshot(self):
         calls = []
@@ -737,6 +764,48 @@ class WorkspaceTests(unittest.TestCase):
             self.assertTrue(balancer.tick(pair, {})["blocks_trading"])
         self.assertEqual(self.store.pair("gold"), pair)
         self.assertIsNone(self.store.get("pair_runtime:gold")["pending"])
+
+    def test_pair_and_margin_display_reads_resume_after_update_evidence(self):
+        for aid in ("long", "short"):
+            value = account(aid)
+            value["enabled"] = False
+            self.store.save_account(value)
+        pair = self.store.save_pair(validate_pair({"id": "gold", "name": "Pair", "long_account_id": "long",
+            "short_account_id": "short", "enabled": True, "ordinary": {"enabled": True},
+            "margin": {"enabled": True, "master_env_prefix": "ASTER_MASTER"}}), create=True)
+        self.assertFalse(self.engine.workspace.update_status()["busy"])
+        trader = PairTrader(self.engine)
+        with patch.object(trader, "_read", wraps=trader._read) as read:
+            state = trader.tick(pair, margin_result={"blocks_trading": False})
+            self.assertEqual(state["phase"], "maintenance")
+            self.assertEqual(set(state["snapshots"]), {"long", "short"})
+            # A second tick inside the idle observation interval reuses the read.
+            trader.tick(pair, margin_result={"blocks_trading": False})
+        read.assert_called_once()
+        self.store.put("pair_runtime:gold", {**self.store.get("pair_runtime:gold"), "snapshots": {}})
+        with patch.object(trader, "_read", side_effect=ExchangeError("Aster 网络连接失败")):
+            state = trader.tick(pair, margin_result={"blocks_trading": False})
+        self.assertEqual(state["phase"], "maintenance")
+        self.assertIn("持仓读取失败", state["reason"])
+        balancer = MarginBalancer(self.engine)
+        loader = Mock(return_value=({}, {}))
+        with patch.object(balancer, "_plan", side_effect=AssertionError("no new transfer plan during maintenance")):
+            view = balancer.tick(pair, {}, snapshot_loader=loader)
+            self.assertTrue(view["blocks_trading"])
+            self.assertEqual(view["status"], "paused")
+            balancer.tick(pair, {}, snapshot_loader=loader)
+        loader.assert_called_once()
+        self.engine.workspace.display_due.clear()
+        loader.side_effect = TradingError("读取暂不可用")
+        view = balancer.tick(pair, {}, snapshot_loader=loader)
+        self.assertIn("余额读取失败（读取暂不可用）", view["reason"])
+        # Display reads leave the durable transfer schedule and failure state alone,
+        # so the first check after maintenance is not deferred.
+        margin = self.store.get("pair_margin:gold") or {}
+        for field in ("checked_at", "next_check_at", "blocked_reason", "api_notice"):
+            self.assertNotIn(field, margin)
+        self.engine.workspace.set_maintenance(False)
+        self.assertEqual(self.engine.workspace.display_due, {})
 
     def test_running_account_worker_keeps_update_busy(self):
         value = account("paper")
