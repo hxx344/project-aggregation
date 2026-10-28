@@ -832,7 +832,9 @@ class Engine:
             account = self.store.account(account_id)
             if not account:
                 return 5
-            if (self.workspace.active and not self.store.intent(account_id)
+            # Maintenance still reads snapshots once update evidence is taken;
+            # the check after the read yields before any new work.
+            if (self.workspace.reads_paused and not self.store.intent(account_id)
                     and not self.store.get("post_fill_check:" + account_id)):
                 return 5
             pending = None

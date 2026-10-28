@@ -24,6 +24,12 @@ class WorkspaceControl:
         self.lock = threading.RLock()
         self.check_lock = threading.Lock()
         self.active = os.environ.get("WORKSPACE_MAINTENANCE") == "1"
+        # Account reads stop with maintenance so update evidence finds idle
+        # workers, and resume once that evidence is taken. Writes stay refused.
+        self.reads_paused = self.active
+        # Display-only read deadlines, by pair, for this maintenance period;
+        # durable transfer schedules are never moved by them.
+        self.display_due = {}
         self.generation = 0
         self.inflight = 0
 
@@ -36,6 +42,8 @@ class WorkspaceControl:
         with self.lock:
             if self.active != active:
                 self.active = active
+                self.reads_paused = active
+                self.display_due.clear()
                 self.generation += 1
         self.engine.scheduler_event.set()
         return {"active": active, "maintenance": active}
@@ -256,6 +264,8 @@ class WorkspaceControl:
         try:
             with self.lock:
                 generation = self.generation
+                # A retried check quiesces readers resumed by an earlier one.
+                self.reads_paused = self.reads_paused or self.active
                 if not self.active or self.inflight or not self._owned():
                     return {**result, "reason": "维护门、在途请求或执行进程锁尚未核实"}
             accounts, pairs = self.engine.store.accounts(), self.engine.store.pairs()
@@ -322,7 +332,9 @@ class WorkspaceControl:
                         return {**result, "reason": "核查期间维护状态、账户配置或执行状态发生变化"}
                     if not 0 <= time.monotonic() - started <= 30:
                         return {**result, "reason": "订单核查结果已过期，请重新核对"}
-                return {"busy": False, "maintenance": True, "checkedAccounts": len(live)}
+                    self.reads_paused = False
+            self.engine.scheduler_event.set()
+            return {"busy": False, "maintenance": True, "checkedAccounts": len(live)}
         except UpdateEvidenceError as exc:
             return {**result, "reason": str(exc)}
         except Exception:
