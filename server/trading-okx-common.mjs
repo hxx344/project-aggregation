@@ -5,8 +5,11 @@ import { decimal, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 // instruments on 2026-10-09. Private requests are restricted to this allowlist.
 // https://www.okx.com/docs-v5/en/#overview-rest-authentication
 // https://www.okx.com/docs-v5/en/#public-data-rest-api-get-instruments
+// The read-only ledger stays on oil; execution also trades the SK hynix
+// ADR/ordinary pair (public instruments checked 2026-10-28, ctVal 1 share).
 export const OKX_SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
-const INSTRUMENTS = Object.freeze({ CLUSDT: 'CL-USDT-SWAP', BZUSDT: 'BZ-USDT-SWAP' });
+export const OKX_EXECUTION_SYMBOLS = Object.freeze([...OKX_SYMBOLS, 'SKHYUSDT', 'SKHYNIXUSDT']);
+const INSTRUMENTS = Object.freeze({ CLUSDT: 'CL-USDT-SWAP', BZUSDT: 'BZ-USDT-SWAP', SKHYUSDT: 'SKHY-USDT-SWAP', SKHYNIXUSDT: 'SKHYNIX-USDT-SWAP' });
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const SCALE = 10n ** 18n;
 const ROUTES = Object.freeze({

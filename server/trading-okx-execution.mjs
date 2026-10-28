@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { compareDecimals } from './trading-decimal.mjs';
+import { executionSymbols } from './trading-markets.mjs';
 import {
-  OKX_SYMBOLS, OkxProtocolError, createOkxProtocol, fail, object, requireObject, list, one, amount,
+  OKX_EXECUTION_SYMBOLS, OkxProtocolError, createOkxProtocol, fail, object, requireObject, list, one, amount,
   optionalPrice, id, iso, instrumentId, validateConfig, positionSize, multiply, multiple, checkAbort,
 } from './trading-okx-common.mjs';
 
@@ -36,7 +37,7 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
   const wrapped = fn => async (...args) => { try { return await fn(...args); } catch (error) { throw convert(error); } };
   function modeOf(value) { const mode = value ?? 'cross'; if (!['cross', 'isolated'].includes(mode)) fail('account_mode'); return mode; }
   function specOf(value, requireId = false) {
-    if (!object(value) || !OKX_SYMBOLS.includes(value.symbol) || !['buy', 'sell'].includes(value.side)
+    if (!object(value) || !OKX_EXECUTION_SYMBOLS.includes(value.symbol) || !['buy', 'sell'].includes(value.side)
       || !Object.hasOwn(POSITION_SIDES, value.positionSide) || typeof value.reduceOnly !== 'boolean'
       || typeof value.clientId !== 'string' || !/^[.A-Z:/a-z0-9_-]{1,32}$/.test(value.clientId)) fail('input');
     let quantity, stopPrice;
@@ -139,17 +140,19 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     const result = await permissionSnapshot(credentials, signal);
     return { identity: result.identity };
   });
-  const account = wrapped(async (credentials, { accountMode, signal } = {}) => {
-    const mode = modeOf(accountMode), config = await permissionSnapshot(credentials, signal);
+  const account = wrapped(async (credentials, { accountMode, signal, symbols } = {}) => {
+    const mode = modeOf(accountMode), selected = executionSymbols(symbols);
+    if (!selected || selected.some(symbol => !OKX_EXECUTION_SYMBOLS.includes(symbol))) fail('input');
+    const config = await permissionSnapshot(credentials, signal);
     const positions = [], openOrders = [], modes = {}, seen = new Set();
-    for (const symbol of OKX_SYMBOLS) {
+    for (const symbol of selected) {
       modes[symbol] = config.positionMode;
       for (const row of list(await protocol.request('positions', credentials, { instType: 'SWAP', instId: instrumentId(symbol) }, { signal }), 20)) {
         const size = positionSize(row, symbol, config.positionMode);
         if (!size) continue;
         if (row.mgnMode !== mode) {
           const error = new OkxProtocolError('account_mode');
-          error.message = 'OKX 原油合约存在另一保证金模式的仓位，请先核对；系统不会切换模式或自动平仓'; throw error;
+          error.message = `OKX ${symbol} 存在另一保证金模式的仓位，请先核对；系统不会切换模式或自动平仓`; throw error;
         }
         const key = `${symbol}:${row.posSide}`;
         if (seen.has(key)) fail(); seen.add(key);

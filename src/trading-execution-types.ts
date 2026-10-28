@@ -1,5 +1,7 @@
 import type { OilSymbol, TradingAccountMode, TradingExchange } from './trading-types';
 
+export type ExecutionMarket = 'oil' | 'hynix';
+export type ExecutionSymbol = OilSymbol | 'SKHYUSDT' | 'SKHYNIXUSDT';
 export type ExecutionPreset = 'four-leg' | 'same-exchange' | 'cross-exchange';
 export type ExecutionAction = 'open' | 'close';
 export type ExecutionSide = 'long' | 'short';
@@ -8,13 +10,15 @@ export type ExecutionConnection = {
   identity: string | null; keyLabel: string | null; verifiedAt: string | null; locked: boolean;
 };
 export type ExecutionPosition = {
-  exchange: TradingExchange; symbol: OilSymbol; side: ExecutionSide; quantity: string; fetchedAt: string;
+  exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string; fetchedAt: string;
 };
 export type ExecutionLegInput = {
-  exchange: TradingExchange; symbol: OilSymbol; side: ExecutionSide; quantity: string; stopPrice: string;
+  exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string; stopPrice: string;
 };
+/** With equalSize the server sizes every leg: oil in barrels, SK hynix in USDT notional. */
 export type ExecutionPlanInput = {
-  preset: ExecutionPreset; action: ExecutionAction; legs: ExecutionLegInput[];
+  market: ExecutionMarket; preset: ExecutionPreset; action: ExecutionAction;
+  legs: (Omit<ExecutionLegInput, 'quantity'> & { quantity?: string })[]; equalSize?: string;
   batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
 };
 export type ExecutionPreviewLeg = ExecutionLegInput & {
@@ -24,16 +28,18 @@ export type ExecutionPreviewLeg = ExecutionLegInput & {
   rule?: { instrumentId?: string; quantityUnit?: string; contractSize?: string };
 };
 export type ExecutionPreview = {
-  id: string; expiresAt: string; preset: ExecutionPreset; action: ExecutionAction; resumeJobId?: string | null;
+  id: string; expiresAt: string; market: ExecutionMarket; equalSize: string | null; preset: ExecutionPreset; action: ExecutionAction; resumeJobId?: string | null;
   batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
   connections: ExecutionConnection[]; legs: ExecutionPreviewLeg[]; notes: string[];
 };
 export type ExecutionOrder = {
   id: string | null; clientId: string | null; kind: 'order' | 'strategy'; state: string;
   lastCheckedAt: string | null; price: string | null; filledQuantity: string; unknown: boolean;
+  /** Bybit strategy without an ID: earliest time it can be confirmed as not created. */
+  confirmAfter?: string;
 };
 export type ExecutionJob = {
-  id: string; preset: ExecutionPreset; action: ExecutionAction;
+  id: string; market: ExecutionMarket; preset: ExecutionPreset; action: ExecutionAction;
   status: 'queued' | 'running' | 'stopping' | 'paused' | 'attention' | 'completed' | 'stopped';
   createdAt: string; updatedAt: string; deadlineAt: string; batchIndex: number; batchCount: number;
   reason: string | null; canResume: boolean;

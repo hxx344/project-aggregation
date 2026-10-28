@@ -24,15 +24,18 @@ async (page) => {
     if (input.resumeJobId) assert(resume, 'resume references an existing job');
     const plan = resume ? { preset: resume.preset, action: resume.action, legs: resume.legs.map(leg => ({ exchange: leg.exchange, symbol: leg.symbol, side: leg.side, quantity: leg.remainingQuantity, stopPrice: leg.stopPrice })), batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300000 } : input;
     assert([2, 4].includes(plan.legs.length), 'preview has complete preset legs');
-    assert(plan.legs.every(leg => typeof leg.quantity === 'string' && typeof leg.stopPrice === 'string'), 'financial inputs remain strings');
-    const result = { ...plan, id: `fixture-preview-${++previewSequence}`, expiresAt: new Date(Date.now() + 60_000).toISOString(), resumeJobId: input.resumeJobId || null,
+    assert(plan.legs.every(leg => typeof leg.stopPrice === 'string'), 'stop prices remain strings');
+    if (plan.equalSize !== undefined) assert(typeof plan.equalSize === 'string' && plan.legs.every(leg => leg.quantity === undefined), 'equal sizing sends one amount and no per-leg quantity');
+    else assert(plan.legs.every(leg => typeof leg.quantity === 'string'), 'per-leg quantities remain strings');
+    const sized = plan.equalSize === undefined ? plan : { ...plan, legs: plan.legs.map(leg => ({ ...leg, quantity: (plan.market ?? 'oil') === 'oil' ? plan.equalSize : '0.5' })) };
+    const result = { ...sized, market: plan.market ?? 'oil', equalSize: plan.equalSize ?? null, id: `fixture-preview-${++previewSequence}`, expiresAt: new Date(Date.now() + 60_000).toISOString(), resumeJobId: input.resumeJobId || null,
       connections: connections.filter(connection => plan.legs.some(leg => leg.exchange === connection.exchange)),
-      legs: plan.legs.map((leg, index) => ({ ...leg, id: `leg-${index}`, orderSide: (plan.action === 'open') === (leg.side === 'long') ? 'buy' : 'sell', positionMode: 'hedge', accountRevision: connections.find(connection => connection.exchange === leg.exchange).revision, currentQuantity: '2', batchQuantities: plan.batchCount === 2 ? ['1', '1'] : [leg.quantity], estimatedNotional: '140.123456789012345678', bid: '70.01', ask: '70.02', quoteAt: stamp() })),
+      legs: sized.legs.map((leg, index) => ({ ...leg, id: `leg-${index}`, orderSide: (plan.action === 'open') === (leg.side === 'long') ? 'buy' : 'sell', positionMode: 'hedge', accountRevision: connections.find(connection => connection.exchange === leg.exchange).revision, currentQuantity: '2', batchQuantities: plan.batchCount === 2 ? ['1', '1'] : [leg.quantity], estimatedNotional: '140.123456789012345678', bid: '70.01', ask: '70.02', quoteAt: stamp() })),
       notes: ['模拟预览：不会访问交易所。'] };
     previews.set(result.id, structuredClone(result)); return result;
   }
   function makeJob(preview, id) {
-    return { id, preset: preview.preset, action: preview.action, status: 'running', createdAt: stamp(), updatedAt: stamp(), deadlineAt: new Date(Date.now() + preview.timeoutMs).toISOString(), batchIndex: 0, batchCount: preview.batchCount, reason: null, canResume: false,
+    return { id, market: preview.market, preset: preview.preset, action: preview.action, status: 'running', createdAt: stamp(), updatedAt: stamp(), deadlineAt: new Date(Date.now() + preview.timeoutMs).toISOString(), batchIndex: 0, batchCount: preview.batchCount, reason: null, canResume: false,
       legs: preview.legs.map(leg => ({ ...leg, filledQuantity: '0.5', remainingQuantity: '1.5', currentOrder: { id: leg.exchange === 'bybit' ? 'f6290c90-5a55-42cf-96b9-9c39d5f04f36' : leg.id === 'leg-0' ? null : `fixture-order-${leg.id}`, clientId: leg.exchange === 'binance' ? 'fixture-client-12345678901234567890123' : null, kind: leg.exchange === 'bybit' ? 'strategy' : 'order', state: '部分成交', lastCheckedAt: stamp(), price: '70.01', filledQuantity: '0.5', unknown: false } })),
       events: [{ time: stamp(), message: '模拟执行已受理，等待各腿完成。' }] };
   }
@@ -93,9 +96,10 @@ async (page) => {
   });
   const refresh = async () => { const response = page.waitForResponse(value => new URL(value.url()).pathname === '/api/trading/execution' && value.request().method() === 'GET'); await page.evaluate(() => window.dispatchEvent(new Event('online'))); await response; };
   const panel = page.locator('.execution-panel');
-  const fillLegs = async () => {
+  const fillLegs = async (perLeg = true) => {
     for (const leg of await panel.locator('.execution-leg-input').all()) {
-      await leg.getByLabel('数量 · 原生合约单位', { exact: true }).fill('2');
+      if (perLeg) await leg.getByLabel('数量 · 原生合约单位', { exact: true }).fill('2');
+      else assert(await leg.getByLabel('数量 · 原生合约单位', { exact: true }).count() === 0, 'equal sizing hides per-leg quantity');
       await leg.getByLabel(/追价停止/).fill(await leg.getByLabel(/买单追价/).count() ? '80' : '60');
     }
   };
@@ -121,9 +125,13 @@ async (page) => {
   await panel.getByRole('combobox', { name: '开仓方向', exact: true }).selectOption('forward');
   assert(await panel.locator('.execution-leg-input').count() === 4, 'four-leg preset exposes four complete legs');
   for (const input of await panel.locator('.execution-leg-input input').all()) assert(await input.inputValue() === '', 'financial inputs start blank');
-  await fillLegs(); await panel.getByLabel('拆分批数', { exact: true }).fill('2');
+  assert(await panel.getByRole('combobox', { name: '数量方式', exact: true }).inputValue() === 'equal', 'oil defaults to equal barrels');
+  await panel.getByLabel(/^每腿桶数/).fill('2');
+  await fillLegs(false); await panel.getByLabel('拆分批数', { exact: true }).fill('2');
   await panel.getByRole('button', { name: '预览开仓组合' }).click();
-  await panel.getByRole('heading', { name: '确认四腿组合开仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油四腿组合开仓' }).waitFor();
+  const equalPreview = requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
+  assert(equalPreview.market === 'oil' && equalPreview.equalSize === '2', 'equal barrels are sent once for every leg');
   assert(requests.filter(request => request.path.endsWith('/jobs')).length === 0, 'preview creates no execution');
   assert(await panel.locator('.execution-review-legs article').count() === 4, 'review includes every leg');
   assert((await panel.locator('.execution-review').innerText()).includes('140.123456789012345678'), 'review retains fractional precision');
@@ -148,15 +156,17 @@ async (page) => {
 
   jobs[0].status = 'paused'; jobs[0].canResume = true; jobs[0].reason = '模拟某腿暂停，保留已成交数量';
   await refresh(); await panel.getByRole('button', { name: '预览继续剩余' }).click();
-  await panel.getByRole('heading', { name: '确认剩余数量的四腿组合开仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认剩余数量的原油四腿组合开仓' }).waitFor();
   const resumed = requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
   assert(Object.keys(resumed).join(',') === 'resumeJobId', 'resume preview is derived by the server');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
   jobs[0].status = 'attention'; jobs[0].canResume = false;
-  const unknown = jobs[0].legs.find(leg => leg.exchange === 'bybit'); unknown.currentOrder = { ...unknown.currentOrder, id: null, state: 'unknown', unknown: true };
+  const unknown = jobs[0].legs.find(leg => leg.exchange === 'bybit'); unknown.currentOrder = { ...unknown.currentOrder, id: null, state: 'unknown', unknown: true, confirmAfter: '2026-10-28T02:00:00.000Z' };
   await refresh();
   const reconcileForm = panel.locator('.execution-reconcile');
   assert(await reconcileForm.getByRole('button', { name: '核对并停止策略余单' }).isDisabled(), 'unknown strategy is never guessed');
+  assert(await reconcileForm.getByRole('button', { name: '确认策略未创建' }).isDisabled(), 'absent strategy needs explicit acknowledgment');
+  assert((await reconcileForm.textContent()).includes('2026/10/28 10:00:00 后可确认'), 'confirm time comes from the server window');
   await reconcileForm.getByLabel('对应策略 ID', { exact: true }).fill('fixture-manually-verified-strategy');
   await reconcileForm.getByLabel('我已核对这是此交易腿提交的策略').check();
   await reconcileForm.getByRole('button', { name: '核对并停止策略余单' }).click();
@@ -169,6 +179,7 @@ async (page) => {
   await panel.getByRole('combobox', { name: '交易所', exact: true }).selectOption('bybit');
   await panel.getByRole('combobox', { name: '交易动作', exact: true }).selectOption('close');
   await panel.getByRole('combobox', { name: '待平仓方向', exact: true }).selectOption('reverse');
+  await panel.getByRole('combobox', { name: '数量方式', exact: true }).selectOption('per-leg');
   assert(await panel.locator('.execution-leg-input').count() === 2, 'same-exchange preset has two legs');
   for (const leg of await panel.locator('.execution-leg-input').all()) {
     await leg.getByRole('button', { name: '填入当前数量' }).click();
@@ -176,7 +187,7 @@ async (page) => {
     await leg.getByLabel(/追价停止/).fill(await leg.getByLabel(/买单追价/).count() ? '80' : '60');
   }
   await panel.getByRole('button', { name: '预览平仓组合' }).click();
-  await panel.getByRole('heading', { name: '确认同所两腿平仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油同所两腿平仓' }).waitFor();
   const closePreview = [...previews.values()].at(-1);
   assert(closePreview.legs.every(leg => leg.exchange === 'bybit') && closePreview.legs[0].orderSide === 'buy' && closePreview.legs[1].orderSide === 'sell', 'close reverses order side while preserving position side');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
@@ -187,7 +198,7 @@ async (page) => {
 
   await fillLegs(); dropNextBeforeSave = true;
   await panel.getByRole('button', { name: '预览平仓组合' }).click();
-  await panel.getByRole('heading', { name: '确认跨所两腿平仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油跨所两腿平仓' }).waitFor();
   await panel.getByRole('button', { name: '确认并一键平仓' }).click();
   await panel.getByText('模拟服务未保存提交，请核对本次请求', { exact: true }).waitFor();
   assert(jobs.length === 1, 'failed pre-save submission creates no execution');
@@ -200,8 +211,21 @@ async (page) => {
   assert(await panel.getByRole('button', { name: '返回修改参数' }).isEnabled(), 'definite expiry rejection releases editing after uncertain submission');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
   await panel.getByRole('button', { name: '预览平仓组合' }).click();
-  await panel.getByRole('heading', { name: '确认跨所两腿平仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油跨所两腿平仓' }).waitFor();
   assert([...previews.keys()].at(-1) !== unsavedRequest.previewId && jobs.length === 1, 'fresh preview follows definite rejection without creating an order');
+  await panel.getByRole('button', { name: '返回修改参数' }).click();
+
+  await panel.getByRole('combobox', { name: '品种', exact: true }).selectOption('hynix');
+  await panel.getByRole('combobox', { name: '交易动作', exact: true }).selectOption('open');
+  await panel.getByRole('combobox', { name: '合约', exact: true }).selectOption('SKHYNIXUSDT');
+  await panel.getByRole('combobox', { name: '开仓方向', exact: true }).selectOption('forward');
+  await panel.getByRole('combobox', { name: '数量方式', exact: true }).selectOption('equal');
+  await panel.getByLabel(/^每腿名义金额/).fill('1000');
+  await fillLegs(false);
+  await panel.getByRole('button', { name: '预览开仓组合' }).click();
+  await panel.getByRole('heading', { name: '确认海力士跨所两腿开仓' }).waitFor();
+  const hynixPreview = requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
+  assert(hynixPreview.market === 'hynix' && hynixPreview.equalSize === '1000' && hynixPreview.legs.every(leg => leg.symbol === 'SKHYNIXUSDT'), 'SK hynix sends equal notional for share contracts');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
 
   readFailure = true; await refresh(); await panel.getByText('模拟读取故障', { exact: true }).waitFor();
@@ -209,7 +233,7 @@ async (page) => {
   readFailure = false; await refresh();
   await page.evaluate(() => window.dispatchEvent(new Event('offline')));
   await panel.getByText('网络已断开，显示最后取得的执行状态。', { exact: false }).waitFor();
-  assert(await panel.getByRole('button', { name: '预览平仓组合' }).isDisabled(), 'offline disables new writes');
+  assert(await panel.getByRole('button', { name: '预览开仓组合' }).isDisabled(), 'offline disables new writes');
   await refresh();
   await page.setViewportSize({ width: 390, height: 844 });
   await panel.locator('.execution-history > summary').click();
@@ -228,5 +252,5 @@ async (page) => {
   await page.getByRole('button', { name: /登录|进入工作台/ }).first().waitFor();
   assert(await panel.count() === 0, 'session expiry removes execution data and secrets');
   assert(pageErrors.length === 0, `no browser exceptions: ${pageErrors.join('; ')}`);
-  return { passed: true, scenarios: ['credential separation', 'preset direction and precision', 'preview without orders', 'idempotent uncertain retry', 'definite rejection after unknown submission', 'visible order and strategy IDs', 'resume preview', 'unknown strategy acknowledgment', 'stop retains fills', 'close direction', 'cross-symbol preset', 'stale and offline recovery', 'mobile', 'session expiry'], requests: requests.length };
+  return { passed: true, scenarios: ['credential separation', 'preset direction and precision', 'equal barrels and SK hynix equal notional', 'preview without orders', 'idempotent uncertain retry', 'definite rejection after unknown submission', 'visible order and strategy IDs', 'resume preview', 'unknown strategy acknowledgment', 'stop retains fills', 'close direction', 'cross-symbol preset', 'stale and offline recovery', 'mobile', 'session expiry'], requests: requests.length };
 }

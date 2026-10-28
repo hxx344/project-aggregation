@@ -102,7 +102,7 @@ for (const mode of ['standard', 'portfolio-margin']) {
       if (call.url.pathname.endsWith('apiRestrictions')) return binancePermission(mode === 'portfolio-margin');
       if (call.url.pathname.endsWith('accountConfig')) return { canTrade: true, dualSidePosition: true };
     });
-    const result = await client.account(credentials, { accountMode: mode });
+    const result = await client.account(credentials, { accountMode: mode, symbols: ['CLUSDT', 'BZUSDT'] });
     assert.deepEqual(result, { identity: null, modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] });
     assert.ok(calls.some(call => call.url.pathname === (mode === 'standard' ? '/fapi/v1/accountConfig' : '/papi/v1/um/accountConfig')));
     for (const call of calls) authenticatedSignature('binance', call);
@@ -459,7 +459,7 @@ test('Bybit permission checks reject read-only, missing Wallet, withdrawal, tran
 test('Bybit account preserves zero-position mode and refuses empty or incomplete hedge-mode evidence', async () => {
   const healthy = harness('bybit', call => call.url.pathname.endsWith('position/list') ? { category: 'linear',
     list: [{ symbol: call.parameters.symbol, positionIdx: 1, side: '', size: '0' }, { symbol: call.parameters.symbol, positionIdx: 2, side: 'Sell', size: '3' }], nextPageCursor: '' } : undefined);
-  const snapshot = await healthy.client.account(credentials);
+  const snapshot = await healthy.client.account(credentials, { symbols: ['BZUSDT', 'CLUSDT'] });
   assert.deepEqual(snapshot.modes, { CLUSDT: 'hedge', BZUSDT: 'hedge' });
   assert.deepEqual(snapshot.positions, [{ symbol: 'CLUSDT', side: 'short', quantity: '3' }, { symbol: 'BZUSDT', side: 'short', quantity: '3' }]);
   for (const list of [[], [{ symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }], [{ symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }, { symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }]]) {
@@ -594,4 +594,16 @@ test('managed Binance unavailable or malformed UID yields read-only identity and
     assert.equal(calls.filter(call => call.url.pathname === '/api/v3/account').length, 2);
     assert.ok(calls.every(call => call.init.method === 'GET'));
   }
+});
+
+test('Binance TradFi perpetual rules and SK hynix symbols are tradable; account reads only requested symbols', async () => {
+  const { client, calls } = harness('binance', call => call.url.pathname === '/fapi/v1/exchangeInfo'
+    ? { symbols: ['SKHYUSDT', 'SKHYNIXUSDT'].map(symbol => ({ ...binanceRule(symbol), contractType: 'TRADIFI_PERPETUAL' })) } : undefined);
+  assert.equal((await client.market('SKHYNIXUSDT')).rule.quantityStep, '0.001');
+  const snapshot = await client.account(credentials, { symbols: ['SKHYUSDT'] });
+  assert.deepEqual(snapshot.modes, { SKHYUSDT: 'one-way' });
+  const read = calls.filter(call => call.url.pathname.endsWith('/positionRisk')).map(call => call.url.searchParams.get('symbol'));
+  assert.deepEqual(read, ['SKHYUSDT']);
+  assert.deepEqual(Object.keys((await client.account(credentials)).modes), ['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT']);
+  for (const symbols of [[], ['ETHUSDT'], 'CLUSDT']) await assert.rejects(client.account(credentials, { symbols }), isError('input'));
 });
