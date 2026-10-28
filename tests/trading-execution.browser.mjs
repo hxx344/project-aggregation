@@ -96,18 +96,20 @@ async (page) => {
   });
   const refresh = async () => { const response = page.waitForResponse(value => new URL(value.url()).pathname === '/api/trading/execution' && value.request().method() === 'GET'); await page.evaluate(() => window.dispatchEvent(new Event('online'))); await response; };
   const panel = page.locator('.execution-panel');
+  const choose = (group, option) => panel.getByRole('group', { name: group, exact: true }).getByRole('button', { name: option, exact: true }).click();
+  const direction = (group, index) => panel.getByRole('group', { name: group, exact: true }).getByRole('button').nth(index).click();
   const fillLegs = async (perLeg = true) => {
     for (const leg of await panel.locator('.execution-leg-input').all()) {
       if (perLeg) await leg.getByLabel('数量 · 原生合约单位', { exact: true }).fill('2');
       else assert(await leg.getByLabel('数量 · 原生合约单位', { exact: true }).count() === 0, 'equal sizing hides per-leg quantity');
-      await leg.getByLabel(/追价停止/).fill(await leg.getByLabel(/买单追价/).count() ? '80' : '60');
+      await leg.getByLabel(/^追价[上下]限/).fill(await leg.getByLabel(/^追价上限/).count() ? '80' : '60');
     }
   };
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await panel.getByRole('heading', { name: '组合交易', exact: true }).waitFor();
   assert(await panel.getByRole('button', { name: '预览开仓组合' }).isDisabled(), 'unconnected execution cannot preview');
-  assert(await panel.getByRole('combobox', { name: '开仓方向', exact: true }).inputValue() === '', 'direction starts unselected');
+  assert(await panel.getByRole('group', { name: '开仓方向', exact: true }).locator('[aria-pressed=true]').count() === 0, 'direction starts unselected');
   assert(requests.every(request => request.method === 'GET'), 'initial page and polling never write');
 
   await panel.locator('.execution-connections > summary').click();
@@ -122,18 +124,21 @@ async (page) => {
     assert(await form.getByLabel(`${name} 实盘 API Secret`, { exact: true }).inputValue() === '', 'saved secret cleared from field');
   }
   await panel.locator('.execution-connections > summary').click();
-  await panel.getByRole('combobox', { name: '开仓方向', exact: true }).selectOption('forward');
+  await direction('开仓方向', 0);
   assert(await panel.locator('.execution-leg-input').count() === 4, 'four-leg preset exposes four complete legs');
   for (const input of await panel.locator('.execution-leg-input input').all()) assert(await input.inputValue() === '', 'financial inputs start blank');
-  assert(await panel.getByRole('combobox', { name: '数量方式', exact: true }).inputValue() === 'equal', 'oil defaults to equal barrels');
+  assert(await panel.getByRole('group', { name: '数量方式', exact: true }).getByRole('button', { name: '等桶', exact: true }).getAttribute('aria-pressed') === 'true', 'oil defaults to equal barrels');
   await panel.getByLabel(/^每腿桶数/).fill('2');
-  await fillLegs(false); await panel.getByLabel('拆分批数', { exact: true }).fill('2');
+  await fillLegs(false);
+  assert(!(await panel.getByLabel('拆分批数', { exact: true }).isVisible()), 'execution settings start collapsed');
+  await panel.locator('.execution-advanced > summary').click(); await panel.getByLabel('拆分批数', { exact: true }).fill('2');
+  await panel.locator('.execution-builder').screenshot({ path: 'output/playwright/trading-execution-desktop-form.png' });
   await panel.getByRole('button', { name: '预览开仓组合' }).click();
   await panel.getByRole('heading', { name: '确认原油四腿组合开仓' }).waitFor();
   const equalPreview = requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
   assert(equalPreview.market === 'oil' && equalPreview.equalSize === '2', 'equal barrels are sent once for every leg');
   assert(requests.filter(request => request.path.endsWith('/jobs')).length === 0, 'preview creates no execution');
-  assert(await panel.locator('.execution-review-legs article').count() === 4, 'review includes every leg');
+  assert(await panel.locator('.execution-review-legs tbody tr').count() === 4, 'review includes every leg');
   assert((await panel.locator('.execution-review').innerText()).includes('140.123456789012345678'), 'review retains fractional precision');
   await panel.screenshot({ path: 'output/playwright/trading-execution-desktop-preview.png' });
   await panel.getByRole('button', { name: '确认并一键开仓' }).click();
@@ -176,24 +181,25 @@ async (page) => {
   assert(jobs[0].legs.every(leg => leg.filledQuantity === '0.5'), 'stopping does not pretend to close filled positions');
 
   await panel.getByRole('button', { name: /^同所两腿/ }).click();
-  await panel.getByRole('combobox', { name: '交易所', exact: true }).selectOption('bybit');
-  await panel.getByRole('combobox', { name: '交易动作', exact: true }).selectOption('close');
-  await panel.getByRole('combobox', { name: '待平仓方向', exact: true }).selectOption('reverse');
-  await panel.getByRole('combobox', { name: '数量方式', exact: true }).selectOption('per-leg');
+  await choose('交易所', 'Bybit');
+  await choose('交易动作', '平仓');
+  await direction('待平仓方向', 1);
+  await choose('数量方式', '逐腿填写');
   assert(await panel.locator('.execution-leg-input').count() === 2, 'same-exchange preset has two legs');
   for (const leg of await panel.locator('.execution-leg-input').all()) {
     await leg.getByRole('button', { name: '填入当前数量' }).click();
     assert(await leg.getByLabel('数量 · 原生合约单位', { exact: true }).inputValue() === '2', 'close copies explicit current-side quantity only after click');
-    await leg.getByLabel(/追价停止/).fill(await leg.getByLabel(/买单追价/).count() ? '80' : '60');
+    await leg.getByLabel(/^追价[上下]限/).fill(await leg.getByLabel(/^追价上限/).count() ? '80' : '60');
   }
+  await panel.locator('.execution-builder').screenshot({ path: 'output/playwright/trading-execution-desktop-per-leg.png' });
   await panel.getByRole('button', { name: '预览平仓组合' }).click();
   await panel.getByRole('heading', { name: '确认原油同所两腿平仓' }).waitFor();
   const closePreview = [...previews.values()].at(-1);
   assert(closePreview.legs.every(leg => leg.exchange === 'bybit') && closePreview.legs[0].orderSide === 'buy' && closePreview.legs[1].orderSide === 'sell', 'close reverses order side while preserving position side');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
   await panel.getByRole('button', { name: /^跨所两腿/ }).click();
-  await panel.getByRole('combobox', { name: '合约', exact: true }).selectOption('BZUSDT');
-  await panel.getByRole('combobox', { name: '待平仓方向', exact: true }).selectOption('forward');
+  await choose('合约', 'BZUSDT');
+  await direction('待平仓方向', 0);
   assert(await panel.locator('.execution-leg-input').count() === 2 && (await panel.locator('.execution-leg-inputs').innerText()).includes('Binance BZUSDT') && (await panel.locator('.execution-leg-inputs').innerText()).includes('Bybit BZUSDT'), 'cross-exchange preset preserves one symbol across both venues');
 
   await fillLegs(); dropNextBeforeSave = true;
@@ -215,11 +221,11 @@ async (page) => {
   assert([...previews.keys()].at(-1) !== unsavedRequest.previewId && jobs.length === 1, 'fresh preview follows definite rejection without creating an order');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
 
-  await panel.getByRole('combobox', { name: '品种', exact: true }).selectOption('hynix');
-  await panel.getByRole('combobox', { name: '交易动作', exact: true }).selectOption('open');
-  await panel.getByRole('combobox', { name: '合约', exact: true }).selectOption('SKHYNIXUSDT');
-  await panel.getByRole('combobox', { name: '开仓方向', exact: true }).selectOption('forward');
-  await panel.getByRole('combobox', { name: '数量方式', exact: true }).selectOption('equal');
+  await choose('品种', '海力士');
+  await choose('交易动作', '开仓');
+  await choose('合约', 'SKHYNIXUSDT');
+  await direction('开仓方向', 0);
+  await choose('数量方式', '等金额');
   await panel.getByLabel(/^每腿名义金额/).fill('1000');
   await fillLegs(false);
   await panel.getByRole('button', { name: '预览开仓组合' }).click();
