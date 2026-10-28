@@ -683,6 +683,19 @@ test('five-second heartbeat isolates one account while renewing unrelated accoun
   assert.equal(writer.retired, false);
 });
 
+test('heartbeat retries a briefly locked registry instead of retiring the writer', async (t) => {
+  const f = fixture(t); let now = 1000;
+  const writer = f.writer('hub', { now: () => now }); const ticket = bindClaim(writer, [identity('73')]);
+  const blocker = new DatabaseSync(f.databasePath); blocker.exec('PRAGMA busy_timeout=2000; BEGIN IMMEDIATE');
+  now = 2000;
+  try { await new Promise((resolve) => setTimeout(resolve, 5200)); } finally { blocker.exec('COMMIT'); blocker.close(); }
+  assert.equal(writer.retired, false);
+  now = 3000;
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  assert.equal(readRow(f.databasePath, 'SELECT lease_until FROM aw_accounts WHERE account_key=?', accountKey(identity('73'))).lease_until, 63000);
+  assert.equal(writer.assertOwned(ticket, 0), true);
+});
+
 test('quarantine gates Node and Python late send while preserving zero budget recovery', async (t) => {
   const f = fixture(t); const node = f.writer('hub');
   const nodeTicket = bindClaim(node, [identity('8811')]);
@@ -765,5 +778,5 @@ test('Python registry contract and failure scenarios run under the normal Node t
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 28 tests/);
+  assert.match(result.stderr, /Ran 29 tests/);
 });

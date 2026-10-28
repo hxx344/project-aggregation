@@ -22,6 +22,8 @@ function fixture(exchange) {
       else rows.push(arrayRow(open));
     }
     if (exchange === 'bybit' || exchange === 'okx') rows.reverse();
+    // OKX history-candles silently keeps only the newest `limit` (max 100) rows.
+    if (exchange === 'okx') { const limit = Number(url.searchParams.get('limit')); assert.ok(limit <= 100); rows.splice(limit); }
     const result = exchange === 'bybit' ? { retCode: 0, result: { category: 'linear', symbol: contract.symbol, list: rows } } : ['okx', 'bitget'].includes(exchange) ? { code: exchange === 'okx' ? '0' : '00000', data: rows } : rows;
     return { ok: true, json: async () => result };
   } });
@@ -32,7 +34,7 @@ for (const exchange of ['binance', 'aster', 'bybit', 'gate', 'okx', 'bitget', 'h
     const f = fixture(exchange), points = await f.read(f.contract, RANGE);
     assert.equal(points.length, 720); assert.equal(points[0].time, RANGE.from + HOUR); assert.equal(points.at(-1).time, NOW);
     assert.ok(points.every((point, i) => point.close === 123 && (!i || point.time - points[i - 1].time === HOUR)));
-    assert.equal(f.urls.length, 5); assert.ok(f.urls.every(url => !/mark[-P]|index[-P]/i.test(url.pathname)));
+    assert.equal(f.urls.length, exchange === 'okx' ? 8 : 5); assert.ok(f.urls.every(url => !/mark[-P]|index[-P]/i.test(url.pathname)));
   });
 }
 test('closed candles only, multiplier normalized once, missing hours stay missing', () => {

@@ -320,12 +320,14 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     resolveOrder(order, ticket); return true;
   }
   async function reconcileOrder(order, client, knownOrders, deadline = Infinity) {
-    let result = knownOrders.find(o => (order.orderId && String(o.order_id) === order.orderId) || o.text === order.text);
+    // Once an order id is known it is the only identity: external clients (web/app) can share one text.
+    const matches = o => order.orderId ? String(o.order_id) === order.orderId : o.text === order.text;
+    let result = knownOrders.find(matches);
     if (!result) {
       try { result = await withinDeadline(() => client.getOrder(order.orderId || order.text), deadline); }
       catch {
         try { const history = await withinDeadline(() => client.getHistoryOrders({ symbol: order.symbol, from: order.createdAt - 60000, to: clock() }), deadline);
-          if (Array.isArray(history)) result = history.find(o => o.text === order.text || (order.orderId && String(o.order_id) === order.orderId));
+          if (Array.isArray(history)) result = history.find(matches);
         } catch { /* Missing history never proves an order was not accepted. */ }
       }
     }
@@ -533,7 +535,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   // Capacity reads do not enter the execution queue. Capture balances as well as
   // positions/orders: the preview fingerprint deliberately excludes balances.
-  const capacitySignature = () => hash([connectionRecord(), cacheRecord(), configFingerprint(),
+  // asOf alone changes on every background poll; freshness is checked separately.
+  const capacitySignature = () => hash([connectionRecord(), { ...cacheRecord(), asOf: null }, configFingerprint(),
     activeOrders().map(o => [o.id, o.version, o.status, o.executedQty]), executionRecords().map(e => [e.id, e.createdAt])]);
   function capacityRead(key, read) {
     const now = clock();
@@ -838,7 +841,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!order) {
       const raw = cache.openOrders.find(o => String(o.order_id) === orderId);
       if (!raw || !ACTIVE.has(raw.state) || !['BUY', 'SELL'].includes(raw.side) || typeof raw.text !== 'string' || !positive(raw.qty)) fail('可撤订单不存在或信息不足');
-      order = { id: id(), executionId: `external-${id()}`, index: 0, text: raw.text || `external-${raw.order_id}`, clientText: raw.text, version: record.version, orderId: String(raw.order_id), symbol: raw.symbol,
+      order = { id: id(), executionId: `external-${id()}`, index: 0, text: `external-${raw.order_id}`, clientText: raw.text, version: record.version, orderId: String(raw.order_id), symbol: raw.symbol,
         exchange: exchangeOf(raw.symbol), side: raw.side, positionSide: raw.position_side, orderType: raw.type, timeInForce: raw.time_in_force, quantity: D(raw.qty).toString(), price: raw.price, executedQty: D(raw.executed_qty).toString(),
         reduceOnly: String(raw.reduce_only) === 'true', status: raw.state, createdAt: clock(), updatedAt: clock(), external: true, raw };
     }
@@ -927,7 +930,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!knownMode) reasons.push('账户持仓模式不明');
     if (record?.tradePermission === 'denied') reasons.push('此凭据只有读取权限');
     if (!owns()) reasons.push('本实例未持有执行锁');
-    const externalOrders = cache.openOrders.filter(raw => !current.some(o => o.orderId === String(raw.order_id) || o.text === raw.text));
+    const externalOrders = cache.openOrders.filter(raw => !current.some(o => o.orderId ? o.orderId === String(raw.order_id) : o.text === raw.text));
     const byExecution = new Map();
     for (const order of tracked) {
       if (!byExecution.has(order.executionId)) byExecution.set(order.executionId, []);
@@ -949,7 +952,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const record = connectionRecord(), cache = cacheRecord(), connected = !!record?.enabled;
     const orders = orderRecords().filter(o => o.version === record?.version), unknown = orders.filter(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status));
     const stale = !cache.asOf || clock() - cache.asOf > freshnessMs || cache.asOf > clock() + 1000;
-    const externalOrders = cache.openOrders.filter(raw => !orders.some(o => o.orderId === String(raw.order_id) || o.text === raw.text));
+    const externalOrders = cache.openOrders.filter(raw => !orders.some(o => o.orderId ? o.orderId === String(raw.order_id) : o.text === raw.text));
     const knownMode = ['SINGLE', 'DUAL'].includes(cache.account?.position_mode) && ['CROSS_EXCHANGE', 'ISOLATED_EXCHANGE'].includes(cache.account?.account_mode);
     const state = !connected ? 'offline' : cache.error || unknown.length || !knownMode || !record.accountUid || writerError ? 'partial' : stale ? 'stale' : 'online';
     const message = !connected ? '尚未连接 Gate CrossEx 实盘账户' : cache.error || writerError || (!record.accountUid ? '账户 UID 尚未核实，仅允许读取和预览' : unknown.length ? '存在未知或待确认订单，仅继续只读对账' : !knownMode ? '账户模式尚未核实，仅可查看' : stale ? '账户快照已过期' : '实盘账户已同步，仅接受手动确认下单');

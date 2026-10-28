@@ -348,6 +348,33 @@ class PositionObservationTests(unittest.TestCase):
             db.execute("UPDATE pairs SET data=? WHERE id='pair'", (dumps(changed),))
             self.assertFalse(observations.current(db, row))
 
+    def test_busy_pair_tick_is_a_missing_sample_not_a_suppression(self):
+        self.pair()
+        self.pair_state()
+        self.engine.notify()
+        self.now += 30
+        self.pair_state()
+        acquired, release = threading.Event(), threading.Event()
+        def worker():
+            with self.engine.pairs.group_lock("pair"):
+                acquired.set()
+                release.wait(5)
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            self.assertTrue(acquired.wait(2))
+            row = self.collect()[0]
+            self.assertFalse(row["suppressed"])
+            self.assertEqual(row["sample_times"], [])
+            self.engine.notify()
+        finally:
+            release.set()
+            thread.join(2)
+        self.now += 30
+        self.pair_state()
+        self.engine.notify()
+        self.sender.assert_called_once()
+
     def test_no_fresh_pair_evidence_never_advances_confirmation(self):
         self.pair()
         self.pair_state()

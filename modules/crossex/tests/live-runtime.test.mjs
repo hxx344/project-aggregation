@@ -1009,6 +1009,21 @@ test('external cancellation retains descriptors and accepts its matching termina
   assert.equal(f.calls.cancel.length, 1); assert.equal(f.calls.create.length, 0);
 });
 
+test('external orders sharing one client text stay distinct after one is cancelled', async t => {
+  const f = fixture(t); const base = { text: 'web', symbol: symbols[0], type: 'LIMIT', time_in_force: 'GTC', side: 'BUY',
+    position_side: 'LONG', qty: '1', price: '100', executed_qty: '0', state: 'OPEN', reduce_only: false };
+  const first = { ...base, order_id: 'external-web-a' }, second = { ...base, order_id: 'external-web-b' };
+  f.orders([first, second]); f.client.cancelOrder = async key => { f.calls.cancel.push(key); return { ...first, state: 'CANCELLED' }; };
+  await f.connect(); const result = await f.runtime.cancel({ orderId: first.order_id, requestId: 'external-web-cancel-1' });
+  assert.equal(result.order.status, 'CANCELLED');
+  f.orders([second]); await f.runtime.refresh();
+  const orders = f.runtime.view().live.orders;
+  assert.equal(orders.find(o => o.id === result.order.id).status, 'CANCELLED');
+  assert.ok(orders.some(o => o.orderId === second.order_id), 'the other web order stays visible and cancellable');
+  const other = await f.runtime.cancel({ orderId: second.order_id, requestId: 'external-web-cancel-2' });
+  assert.equal(f.calls.cancel.length, 2); assert.notEqual(other.order.id, result.order.id);
+});
+
 test('workspace update readiness blocks queued work and unsettled orders but permits ordinary positions', async t => {
   const f = fixture(t);
   await f.connect();

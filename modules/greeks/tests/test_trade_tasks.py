@@ -550,6 +550,8 @@ class TradeTaskTests(unittest.IsolatedAsyncioTestCase):
         self.client.place_ioc_order.assert_not_awaited()
 
     async def test_stop_after_order_read_prevents_amendment(self):
+        # The stop event ends the loop; a 40 ms deadline can expire before the first order read on a loaded runner.
+        self.settings.bbo_order_timeout_seconds = 60
         event = asyncio.Event()
         instrument = self.engine.chain[0]
         calls = 0

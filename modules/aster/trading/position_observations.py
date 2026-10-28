@@ -148,6 +148,10 @@ def collect(engine):
         result.extend(rows.values())
         with ExitStack() as stack:
             if not acquire(stack, [engine.pairs.group_lock(pair["id"])] + [engine.account_lock(aid) for aid in sorted(aids)]):
+                # A busy 2 s pair tick is only a missing sample, like a busy account
+                # worker; execution evidence still suppresses on the next locked read.
+                for row in rows.values():
+                    row["suppressed"] = False
                 continue
             with engine.store.read_snapshot() as store:
                 current = store.pair(pair["id"])

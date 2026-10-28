@@ -909,6 +909,9 @@ class AccountWriter:
                                         raise
                         self._transaction(action)
                     except AccountWriterError as error:
+                        # A briefly locked registry is retried next beat; an expired lease still retires via _validate.
+                        if error.code == "REGISTRY_BUSY" and not self.retired:
+                            continue
                         self.retired = True
                         self._stop.set()
 

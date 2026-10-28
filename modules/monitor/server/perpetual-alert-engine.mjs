@@ -53,9 +53,10 @@ export function createPerpetualConditionTracker(rule) {
     observe(result, now) {
       const second = Math.floor(now / 1000);
       if (lastObservedAt !== null && now < lastObservedAt) { points.clear(); hitCount = 0; validCount = 0; continuousSince = null; lastSecond = null; }
-      lastObservedAt = now;
+      const previousAt = lastObservedAt; lastObservedAt = now;
       if (lastSecond === null || second > lastSecond) {
-        if (!result.hit || lastSecond === null || second - lastSecond !== 1) continuousSince = result.hit ? now : null;
+        // Gap by elapsed time, not second buckets: a 1 s timer drifts and occasionally skips a bucket; a missed beat still interrupts.
+        if (!result.hit || lastSecond === null || now - previousAt > 1500) continuousSince = result.hit ? now : null;
         if (result.hit && continuousSince === null) continuousSince = now;
         points.set(second, { hit: result.hit, valid: result.valid });
         hitCount += Number(result.hit); validCount += Number(result.valid); lastSecond = second;

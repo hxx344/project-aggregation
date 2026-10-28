@@ -13,6 +13,26 @@ class BybitError(RuntimeError):
     pass
 
 
+class BybitRejected(BybitError):
+    """A V5 envelope whose retCode proves the request was refused before execution."""
+
+    def __init__(self, message: str, ret_code: int):
+        super().__init__(message)
+        self.ret_code = ret_code
+
+
+# Only codes that prove a pre-execution refusal; anything else (server timeout/internal error,
+# duplicate request, orderLinkId already exists, order still processing, undocumented codes) stays unknown.
+REJECTED_COMMON_RET_CODES = frozenset({10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10017, 10018, 10024, 10027, 10029})
+UNKNOWN_TRADE_RET_CODES = frozenset({110072, 110079})
+
+
+def is_rejection(ret_code: int) -> bool:
+    if ret_code in REJECTED_COMMON_RET_CODES:
+        return True
+    return 110000 <= ret_code <= 110999 and ret_code not in UNKNOWN_TRADE_RET_CODES
+
+
 class BybitClient:
     def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = True, recv_window: int = 5000, market_testnet: bool = False):
         self.api_key = api_key
@@ -75,9 +95,9 @@ class BybitClient:
             result = self._response_result(response)
             if writer is not None:
                 writer.validate_response(path, body, result)
-        except BaseException:
+        except BaseException as exc:
             if writer is not None and operation is not None:
-                writer.finish(operation, "unknown")
+                writer.finish(operation, "rejected" if isinstance(exc, BybitRejected) else "unknown")
             raise
         finally:
             self._writer_prepared.reset(token)
@@ -95,7 +115,10 @@ class BybitClient:
         if not isinstance(data, dict) or type(data.get("retCode")) is not int:
             raise BybitError("Invalid Bybit response envelope")
         if data["retCode"] != 0:
-            raise BybitError(data.get("retMsg", "Bybit request failed"))
+            message = data.get("retMsg", "Bybit request failed")
+            if is_rejection(data["retCode"]):
+                raise BybitRejected(message, data["retCode"])
+            raise BybitError(message)
         if not isinstance(data.get("result"), dict):
             raise BybitError("Invalid Bybit response result")
         return data["result"]

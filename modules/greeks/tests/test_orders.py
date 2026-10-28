@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 
-from app.bybit import BybitClient
+from app.bybit import BybitClient, BybitRejected
 from app.config import Settings
 from app.engine import TradingEngine
 from app.models import CloseRequest, OpenRequest
@@ -62,6 +62,16 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["filledQty"], 0.01)
         self.assertTrue(result["terminal"])
+
+    async def test_explicit_create_rejection_is_terminal_without_reconciliation(self):
+        self.client.place_limit_order.side_effect = BybitRejected("insufficient margin", 110007)
+        result = await self.run_leg()
+        self.client.place_limit_order.assert_awaited_once()
+        self.client.cancel_order.assert_not_awaited()
+        self.client.order.assert_not_awaited()
+        self.assertEqual(result["status"], "not_submitted")
+        self.assertTrue(result["terminal"])
+        self.assertFalse(any(not entry.get("terminal") for entry in self.engine.order_journal.values()))
 
     async def test_amend_failure_always_runs_cancellation(self):
         self.client.tickers.side_effect = [[{"ask1Price": "12"}], [{"ask1Price": "13"}]]
@@ -244,7 +254,8 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         results, _ = await self.engine.close_position(CloseRequest(confirm_live=True))
         self.assertEqual(sum(result.status == "partial" for result in results), 1)
         self.assertEqual(self.engine.active_strategy_symbols, {self.leg.symbol})
-        self.assertAlmostEqual(self.engine.active_strategy_sizes[f"{self.leg.symbol}|{self.leg.side}"], 0.02)
+        # Exact, not approximate: the remaining size is sent verbatim as the next close quantity.
+        self.assertEqual(self.engine.active_strategy_sizes[f"{self.leg.symbol}|{self.leg.side}"], 0.02)
         for link, outcome in list(self.engine.order_journal.items()):
             self.engine._record_order(link, outcome.copy())
         self.assertAlmostEqual(self.engine.active_strategy_sizes[f"{self.leg.symbol}|{self.leg.side}"], 0.02)

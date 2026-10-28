@@ -571,6 +571,8 @@ export class AccountWriter {
           }
         });
       } catch (error) {
+        // A briefly locked registry is retried next beat; an expired lease still retires via _validate.
+        if (error?.code === 'REGISTRY_BUSY' && !this.retired) return;
         this.retired = true; clearInterval(this.timer); this.timer = null;
       }
     }, HEARTBEAT_MS);

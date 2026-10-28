@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import httpx
 
 from app.account_writer import _digest
+from app.bybit import BybitClient, BybitError, BybitRejected
 from app.config import Settings
 from app.engine import TradingEngine
 from app.models import TradePlanRequest, TradeTaskRequest
@@ -36,6 +37,7 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         self.uid = 123
         self.after_send = lambda: None
         self.fail_write = False
+        self.write_ret_code = 0
 
     async def engine(self, **settings):
         engine = TradingEngine(Settings(_env_file=None, state_file=str(Path(self.directory.name) / "state.json"),
@@ -51,6 +53,8 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
                 if self.fail_write:
                     raise httpx.ReadTimeout("injected response loss", request=request)
                 result = {"orderId": "remote-order", "orderLinkId": "original-link"}
+                if self.write_ret_code:
+                    return httpx.Response(200, json={"retCode": self.write_ret_code, "retMsg": "injected", "result": {}})
             return httpx.Response(200, json={"retCode": 0, "result": result})
         engine.client._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         self.addAsyncCleanup(engine.client.close)
@@ -117,6 +121,46 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Exception):
             await restarted.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "original-link")
         self.assertEqual(sum(request.method == "POST" for request in self.requests), 1)
+
+    async def test_explicit_exchange_rejection_does_not_freeze_later_writes(self):
+        engine = await self.engine()
+        self.write_ret_code = 110007
+        with self.assertRaises(BybitRejected):
+            await engine.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "rejected-link")
+        self.assertEqual(engine.account_writer.registry.unresolved(engine.account_writer.current.get()), [])
+        self.write_ret_code = 0
+        await engine.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "original-link")
+        self.assertEqual(sum(request.method == "POST" for request in self.requests), 2)
+
+    async def test_ambiguous_server_error_envelope_stays_unknown(self):
+        engine = await self.engine()
+        self.write_ret_code = 10016
+        with self.assertRaises(BybitError) as raised:
+            await engine.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "ambiguous-link")
+        self.assertNotIsInstance(raised.exception, BybitRejected)
+        self.write_ret_code = 0
+        with self.assertRaises(Exception):
+            await engine.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "original-link")
+        self.assertEqual(sum(request.method == "POST" for request in self.requests), 1)
+
+    def test_only_pre_execution_ret_codes_are_rejections(self):
+        class Envelope:
+            def __init__(self, code):
+                self.code = code
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"retCode": self.code, "retMsg": "failed"}
+
+        for code in (10001, 10006, 110007, 110017):
+            with self.subTest(code=code), self.assertRaises(BybitRejected):
+                BybitClient._response_result(Envelope(code))
+        for code in (10000, 10014, 10016, 110072, 110079, 170001, 999999):
+            with self.subTest(code=code), self.assertRaises(BybitError) as raised:
+                BybitClient._response_result(Envelope(code))
+            self.assertNotIsInstance(raised.exception, BybitRejected)
 
     async def test_late_response_and_state_save_are_rejected_after_binding_changes(self):
         engine = await self.engine()

@@ -24,10 +24,11 @@ export async function sendFeishu(config, text, { fetcher = fetch, now = Date.now
   let response;
   try {
     response = await fetcher(url, { method: "POST", headers: { "Content-Type": "application/json" }, body, redirect: "error", signal: AbortSignal.timeout(8_000) });
-  } catch { throw new Error("飞书连接失败或超时，将在条件仍满足时重试。"); }
-  if (!response.ok) throw new Error(`飞书返回 HTTP ${response.status}。`);
+  // `uncertain`: the robot may already have posted, so callers must not resend blindly.
+  } catch { throw Object.assign(new Error("飞书连接失败或超时，将在条件仍满足时重试。"), { uncertain: true }); }
+  if (!response.ok) throw Object.assign(new Error(`飞书返回 HTTP ${response.status}。`), { uncertain: response.status >= 500 });
   let result;
-  try { result = await response.json(); } catch { throw new Error("飞书返回了无法识别的响应。"); }
+  try { result = await response.json(); } catch { throw Object.assign(new Error("飞书返回了无法识别的响应。"), { uncertain: true }); }
   if (result?.code !== 0) {
     const code = Number.isInteger(result?.code) ? result.code : "未知";
     throw new Error(`飞书发送失败（${code}）：${failures[code] ?? "请检查机器人配置"}。`);

@@ -2,6 +2,8 @@ import { PRICE_HOUR_MS as HOUR } from '../lib/perpetual-price-history.ts';
 
 const SUPPORTED = new Set(['binance', 'aster', 'bybit', 'gate', 'okx', 'bitget', 'hyperliquid', 'entropy']);
 const MAX_CHUNK = 168 * HOUR;
+// OKX history-candles returns at most 100 rows per request (its live candles allow 300).
+const OKX_CHUNK = 100 * HOUR;
 const unsupported = reason => Object.assign(new Error(reason), { code: 'UNSUPPORTED' });
 const numeric = input => {
   if (typeof input !== 'number' && (typeof input !== 'string' || !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(input))) throw Error('成交价历史数值无效');
@@ -59,8 +61,8 @@ export function normalizePerpetualPriceCandles(exchange, rows, market, range, no
   return [...points].filter(([time]) => time > range.from && time <= range.to).sort(([a], [b]) => a - b).map(([time, close]) => ({ time, close }));
 }
 
-/** Time pages stay below the smallest venue limit (Bitget: 200). A 30-day
- * request requires at most five pages; the service normally asks one page.
+/** Time pages stay below each venue limit (OKX history: 100, others: 200). A
+ * 30-day request needs at most five pages (eight on OKX); the service normally asks one page.
  * Official contracts checked 2026-10-11:
  * Binance: developers.binance.com/.../Kline-Candlestick-Data
  * Aster: asterdex.github.io/aster-api-website/futures/market-data/#klinecandlestick-data
@@ -99,7 +101,7 @@ export function createPerpetualPriceReader({ fetchImpl = fetch, clock = Date.now
     // Work backwards so recent history becomes available first at the service.
     for (let end = to; end > from;) {
       signal?.throwIfAborted();
-      const start = Math.max(from, end - MAX_CHUNK), exchange = market.exchange;
+      const exchange = market.exchange, start = Math.max(from, end - (exchange === 'okx' ? OKX_CHUNK : MAX_CHUNK));
       let rows;
       if (exchange === 'binance' || exchange === 'aster') {
         rows = await request(exchange === 'binance' ? 'https://fapi.binance.com/fapi/v1/klines' : 'https://fapi.asterdex.com/fapi/v1/klines', { symbol: market.symbol, interval: '1h', startTime: String(start), endTime: String(end - 1), limit: '200' });
@@ -110,7 +112,7 @@ export function createPerpetualPriceReader({ fetchImpl = fetch, clock = Date.now
       } else if (exchange === 'gate') {
         rows = await request('https://api.gateio.ws/api/v4/futures/usdt/candlesticks', { contract: market.symbol, interval: '1h', from: String(start / 1000), to: String(end / 1000 - 1) });
       } else if (exchange === 'okx') {
-        const data = await request('https://www.okx.com/api/v5/market/history-candles', { instId: market.symbol, bar: '1H', before: String(start - 1), after: String(end), limit: '300' });
+        const data = await request('https://www.okx.com/api/v5/market/history-candles', { instId: market.symbol, bar: '1H', before: String(start - 1), after: String(end), limit: '100' });
         if (data?.code !== '0') throw Error('OKX 成交价历史响应无效');
         rows = data.data;
       } else if (exchange === 'bitget') {

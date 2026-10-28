@@ -243,8 +243,10 @@ async def dashboard_performance():
 
 
 async def _build_account_dashboard():
+    # load_positions returns the cached pre-trade list while a trade holds the lock.
+    positions_cached = engine.settings.can_send_orders and engine.lock.locked()
     position_result, health_result, execution_result = await asyncio.gather(engine.load_positions(), engine.load_account_health(), engine.load_recent_executions(), return_exceptions=True)
-    positions_available = not isinstance(position_result, Exception)
+    positions_available = not isinstance(position_result, Exception) and not positions_cached
     if isinstance(position_result, Exception):
         engine.log("WARNING", f"Could not refresh dashboard positions: {position_result}")
         position_result = engine.positions
