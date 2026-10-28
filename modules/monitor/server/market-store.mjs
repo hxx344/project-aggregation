@@ -36,7 +36,8 @@ function hedgePriceObservations(value) {
   const hours = new Map();
   for (const leg of value.legs) for (const row of leg.rows) {
     const hour = hours.get(row.time) ?? { time: row.time, legs: [] };
-    hour.legs.push({ exchange: leg.exchange, symbol: leg.symbol, price: row.price, fetchedAt: leg.fetchedAt });
+    // Leg fetch time changes every refresh; keeping it here would rewrite every unchanged hour (source_ms records the dataset time).
+    hour.legs.push({ exchange: leg.exchange, symbol: leg.symbol, price: row.price });
     hours.set(row.time, hour);
   }
   return [...hours.values()].sort((a, b) => a.time - b.time);

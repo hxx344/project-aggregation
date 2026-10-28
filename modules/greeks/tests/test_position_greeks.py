@@ -86,8 +86,8 @@ class DashboardGreeksTests(unittest.IsolatedAsyncioTestCase):
         from app.main import _build_account_dashboard
         from app.models import AccountHealth
 
-        reads = [RuntimeError("positions offline"), [], RuntimeError("positions offline"), []]
-        with patch("app.main.engine.load_positions", new=AsyncMock(side_effect=reads)), \
+        reads = [RuntimeError("positions offline"), ([], True), RuntimeError("positions offline"), ([], True)]
+        with patch("app.main.engine.load_positions_snapshot", new=AsyncMock(side_effect=reads)), \
              patch("app.main.engine.positions", []), \
              patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), \
              patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), \
@@ -112,7 +112,7 @@ class DashboardGreeksTests(unittest.IsolatedAsyncioTestCase):
         from app.models import AccountHealth
 
         held = [position("C1", "Sell", 1)]
-        with patch("app.main.engine.load_positions", new=AsyncMock(side_effect=[held, RuntimeError("positions offline")])), \
+        with patch("app.main.engine.load_positions_snapshot", new=AsyncMock(side_effect=[(held, True), RuntimeError("positions offline")])), \
              patch("app.main.engine.positions", held), \
              patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), \
              patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), \
@@ -139,7 +139,7 @@ class DashboardGreeksTests(unittest.IsolatedAsyncioTestCase):
         from app.main import _build_account_dashboard
         from app.models import AccountHealth
         held = [position("C1", "Sell", 1)]
-        with patch("app.main.engine.load_positions", new=AsyncMock(return_value=held)), \
+        with patch("app.main.engine.load_positions_snapshot", new=AsyncMock(return_value=(held, True))), \
              patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), \
              patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), \
              patch("app.main.engine.ticker_greeks", {"C1": FULL}), patch("app.main.engine.chain_source", "bybit"), \
@@ -148,6 +148,41 @@ class DashboardGreeksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["greeks"]["status"], "ok")
         self.assertAlmostEqual(payload["greeks"]["totals"]["delta"], -0.2)
         self.assertFalse(payload["greeks"]["stale"])
+
+
+    async def test_lock_taken_after_dashboard_starts_marks_positions_cached(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from app.config import Settings
+        from app.main import _build_account_dashboard, engine
+        from app.models import AccountHealth
+
+        held = [position("C1", "Sell", 1)]
+        live = Settings(_env_file=None, live_trading=True, bybit_testnet=False, bybit_api_key="k", bybit_api_secret="s")
+        release = asyncio.Event()
+
+        async def trade():
+            async with engine.lock:
+                await release.wait()
+
+        with patch.object(engine, "settings", live), patch.object(engine, "positions", held), \
+             patch.object(engine.client, "positions", new=AsyncMock(side_effect=AssertionError("must not sync under a trade"))), \
+             patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), \
+             patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), \
+             patch("app.main.engine.ticker_greeks", {"C1": FULL}), patch("app.main.engine.chain_source", "bybit"), \
+             patch("app.main.engine.chain_updated_at", datetime.now(timezone.utc)):
+            # The trade claims the lock after the dashboard starts but before its position read runs.
+            build = asyncio.create_task(_build_account_dashboard())
+            holder = asyncio.create_task(trade())
+            try:
+                payload = await build
+            finally:
+                release.set()
+                await holder
+        self.assertEqual(payload["positions"]["items"], [held[0].model_dump(mode="json")])
+        self.assertFalse(payload["positions"]["available"])
+        self.assertFalse(payload["greeks"]["positions_available"])
+        self.assertTrue(payload["greeks"]["stale"])
 
 
 if __name__ == "__main__":

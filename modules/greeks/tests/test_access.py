@@ -93,10 +93,10 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         from app.main import _build_account_dashboard
         from app.models import AccountHealth
 
-        with patch("app.main.engine.load_positions", new=AsyncMock(side_effect=RuntimeError("offline"))), patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), patch("app.main.engine.positions", []):
+        with patch("app.main.engine.load_positions_snapshot", new=AsyncMock(side_effect=RuntimeError("offline"))), patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])), patch("app.main.engine.positions", []):
             payload = await _build_account_dashboard()
             self.assertFalse(payload["positions"]["available"])
-        with patch("app.main.engine.load_positions", new=AsyncMock(return_value=[])), patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])):
+        with patch("app.main.engine.load_positions_snapshot", new=AsyncMock(return_value=([], True))), patch("app.main.engine.load_account_health", new=AsyncMock(return_value=AccountHealth())), patch("app.main.engine.load_recent_executions", new=AsyncMock(return_value=[])):
             payload = await _build_account_dashboard()
             self.assertTrue(payload["positions"]["available"])
 

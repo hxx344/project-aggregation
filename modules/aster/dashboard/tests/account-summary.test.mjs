@@ -205,3 +205,36 @@ test('invalid and future balance times never become healthy scheduled records', 
     assert.match(view.label, /时间异常/);
   }
 });
+
+test('an ordinary pair member keeps the eight-second pair snapshot rule, not the 60-second display cadence', () => {
+  const { account, pair } = fixture();
+  Object.assign(account, {
+    status: 'ok',
+    reason: '',
+    pair_id: 'pair',
+    snapshot_refresh: { interval_seconds: 60 },
+    snapshot: { ...account.snapshot, timestamp: now - 20 },
+  });
+  pair.ordinary.enabled = true;
+  pair.margin.enabled = false;
+  const view = accountSummaryView(account, pair, now);
+  assert.equal(view.fundsOnly, false);
+  assert.equal(view.warning, true);
+  assert.match(view.label, /更新延迟/);
+  // A member whose pair object is not loaded is held to the same rule.
+  assert.equal(accountSummaryView(account, undefined, now).warning, true);
+  // An unpaired account keeps its scheduled display cadence.
+  delete account.pair_id;
+  assert.equal(accountSummaryView(account, undefined, now).warning, false);
+});
+
+test('a funds-only member with an unresolved trading batch keeps its position snapshot, matching the hub', () => {
+  const { account, pair } = fixture();
+  pair.state.pending = { kind: 'leverage', id: 'batch' };
+  const view = accountSummaryView(account, pair, now);
+  assert.equal(view.fundsOnly, false);
+  assert.equal(view.snapshot, account.snapshot);
+  assert.equal(view.warning, true);
+  pair.state.pending = {};
+  assert.equal(accountSummaryView(account, pair, now).fundsOnly, true);
+});

@@ -164,16 +164,23 @@ class ReconciliationMixin:
                 self.log("WARNING", f"Position reconciliation incomplete: {exc}")
         return self.positions
 
-    async def load_positions(self) -> list[Position]:
-        if not self.settings.can_send_orders or self.lock.locked():
-            return self.positions
+    async def load_positions_snapshot(self) -> tuple[list[Position], bool]:
+        """Return positions and whether they reflect the exchange as of this read.
+
+        Without order sending the in-memory book is the simulated source of
+        truth. A held trade lock returns the cached pre-trade list, not fresh.
+        Read paths (dashboard GETs) never cancel or reconcile orders; that is
+        left to background reconciliation.
+        """
+        if not self.settings.can_send_orders:
+            return self.positions, True
+        if self.lock.locked():
+            return self.positions, False
         async with self.lock:
-            if not self.state_error:
-                try:
-                    await self._reconcile_pending_orders()
-                except ValueError as exc:
-                    self.log("WARNING", str(exc))
-            return await self._sync_positions()
+            return await self._sync_positions(), True
+
+    async def load_positions(self) -> list[Position]:
+        return (await self.load_positions_snapshot())[0]
 
     async def reconcile_once(self) -> None:
         if not self.settings.can_send_orders:

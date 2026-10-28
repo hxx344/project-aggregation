@@ -27,7 +27,7 @@ from .ordinary_selection import ordinary_add_blocks, ordinary_add_symbols, ordin
 from .account_legacy import legacy_block_reason, legacy_intent, legacy_position, LEGACY_PENDING_REASON, without_removed_config
 from .lock import ProcessLock
 from .listings import ListingMonitor, POLL_SECONDS as LISTING_POLL_SECONDS, STALE_SECONDS as LISTING_STALE_SECONDS
-from .models import AccountModeError, Book, MARKET_SYMBOLS, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, leverage_cap, leverage_candidates, minimum_open_leverage, next_leverage, opening_margin_limit, ordinary_leverage_wait, plan_pair, positive, wire
+from .models import AccountModeError, Book, MARKET_SYMBOLS, MIN_BATCH_NOTIONAL, MIN_OPEN_LEVERAGE, SYMBOLS, TIERS, TradingError, dec, decimal_text, leverage_cap, leverage_candidates, minimum_open_leverage, next_leverage, opening_margin_limit, ordinary_leverage_wait, plan_pair, positive, wire
 from .recovery import leverage_cooldown_active
 from .paper import DemoMarket, PaperBroker
 from .scheduling import AccountWork, PollBackoff
@@ -1145,6 +1145,9 @@ class Engine:
             policy_changes = changes
             if any(value is None or (key != "min_open_leverage" and not isinstance(value, str)) for key, value in policy_changes.items()):
                 raise TradingError("策略配置字段类型无效")
+            for key in ("threshold", "order_notional", "margin_limit", "spread_limit"):
+                if key in policy_changes:
+                    decimal_text(policy_changes[key], "策略金额与比例必须为普通十进制数")
             account["policy"] = {**account["policy"], **policy_changes}
             validate_account(account)
             if "min_open_leverage" in changes:

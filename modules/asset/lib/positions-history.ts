@@ -77,6 +77,23 @@ export function historyWindows<T>(end: number, read: (start: number, end: number
     return page;
   };
 }
+// Binance startTime-only covers 7d; reserve 120s for 60s clock skew + the 45s refresh deadline.
+export const BINANCE_LATEST_WINDOW_MS = WEEK - 120_000;
+// Bybit startTime-only covers 24h since https://bybit-exchange.github.io/docs/changelog/v5#2025-04-24.
+// Read the latest 23h so the implicit end leaves 1h for clock skew and request latency.
+const BYBIT_DEFAULT_WINDOW_MS = 24 * 60 * 60_000;
+export const BYBIT_LATEST_WINDOW_MS = BYBIT_DEFAULT_WINDOW_MS - 60 * 60_000;
+/** Newest window first with no local upper bound (end null), then closed weekly windows back to start.
+ * Omitting the latest endTime lets the exchange include already-executed trades stamped ahead of our clock. */
+export function latestOpenWindows<T>(start: number, end: number, latestWindow: number, read: (start: number, end: number | null) => Promise<T[]>) {
+  const latestStart = Math.max(start, end - latestWindow);
+  const older = historyWindows(latestStart - 1, read, start);
+  let latest = true;
+  return async () => {
+    if (latest) { latest = false; return read(latestStart, null); }
+    return older();
+  };
+}
 /** A full Binance page does not prove coverage; split until both inclusive subwindows fit. */
 export async function binanceRange(ctx: HistoryContext, path: string, params: Record<string, string>, start: number, end: number, depth = 0, openEnd = false): Promise<Json[]> {
   const list = rows(await ctx.get(path, { ...params, startTime: String(start), ...(openEnd ? {} : { endTime: String(end) }), limit: '1000' }));

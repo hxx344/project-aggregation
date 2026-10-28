@@ -14,7 +14,7 @@ import { readSnapshotHistory } from './snapshot-history';
 import { hubPositionsService } from './hub-positions';
 import { yuanQuote } from './fx';
 import { mapConcurrent, settleIndependent } from './concurrency';
-import { knownAssetValue, snapshotValues, refreshMarketAsset, withMarketQuantity } from './asset-values';
+import { knownAssetValue, snapshotValues, configuredExchanges, refreshMarketAsset, withMarketQuantity } from './asset-values';
 import type { Asset, Ledger, Connection, Withdrawal, FxStatus, AsterAccount } from './types';
 
 export const chinaDate=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});
@@ -60,7 +60,7 @@ async function saveAsset(owner:string,a:Asset){await db().prepare('UPDATE assets
 async function setting(owner:string,key:string,value:unknown){await db().prepare('INSERT INTO settings(owner,key,value) VALUES(?,?,?) ON CONFLICT(owner,key) DO UPDATE SET value=excluded.value').bind(owner,key,typeof value==='string'?value:JSON.stringify(value)).run();}
 async function snapshot(owner:string){
   const ledger=await getCurrentLedger(owner);
-  const {total,partial,missingValues}=snapshotValues(ledger.assets,ledger.fxStatus), date=chinaDate();
+  const {total,partial,missingValues}=snapshotValues(ledger.assets,ledger.fxStatus,Date.now(),configuredExchanges(ledger.connections)), date=chinaDate();
   // Holdings come from the positions cache only, so writing a snapshot never waits on exchange reads.
   const scopes=await hubPositionsService.peek(db(),owner).catch(()=>null), updatedAt=new Date().toISOString();
   const data={id:'daily-'+date,date,total,fx:ledger.fx,fxStatus:ledger.fxStatus,cny:total*ledger.fx,future:false,difference:0,partial,missingValues,withdrawn:embeddedWithdrawals(ledger.assets),updatedAt,assets:ledger.assets,...(scopes?{positions:{capturedAt:updatedAt,scopes}}:{})};

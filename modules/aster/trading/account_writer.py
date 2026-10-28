@@ -438,7 +438,9 @@ class ManagedWriter:
 
     @staticmethod
     def validate_response(path, params, result):
+        """Return batch row indices that remain unknown; raise if the whole call is."""
         from .exchange import AmbiguousOrder, ORDER_REJECTION_CODES
+        unconfirmed = []
         if path.endswith("/subAccountTransfer"):
             if not isinstance(result, dict) or result.get("code") not in (0, 200, "0", "200") or str(result.get("msg", "")).lower() != "success":
                 raise AmbiguousOrder("划转回执尚未明确确认")
@@ -450,14 +452,21 @@ class ManagedWriter:
             rows = result if isinstance(result, list) else [result]
             if len(rows) != len(orders):
                 raise AmbiguousOrder("交易所回执数量与原始订单不一致")
-            for order, row in zip(orders, rows):
+            for index, (order, row) in enumerate(zip(orders, rows)):
                 if isinstance(row, dict) and type(row.get("code")) is int and row["code"] in ORDER_REJECTION_CODES:
+                    continue
+                if (path.endswith("/batchOrders") and isinstance(row, dict) and type(row.get("code")) is int
+                        and row["code"] < 0 and "clientOrderId" not in row and "orderId" not in row):
+                    # Another code (including -1006/-1007) proves nothing for
+                    # this leg; the caller must confirm it by original ID.
+                    unconfirmed.append(index)
                     continue
                 cid = order.get("newClientOrderId") or order.get("origClientOrderId")
                 if not isinstance(row, dict) or row.get("clientOrderId") != cid or row.get("symbol") != order.get("symbol") or not row.get("orderId"):
                     raise AmbiguousOrder("交易所回执缺少匹配的原始订单身份")
                 if "newClientOrderId" in order and not ManagedWriter._verified_receipt(order, row):
                     raise AmbiguousOrder("交易所回执与原始订单方向或数量不一致")
+        return unconfirmed
 
     def before_send(self, prepared, request=None):
         if prepared is not None:
@@ -633,7 +642,12 @@ class ManagedWriter:
                 return None
         except TradingError:
             return None
-        return "rejected" if row.get("local_not_sent") is True or row.get("reject_code") in ORDER_REJECTION_CODES else None
+        from .exchange import definitive_order_error
+        if row.get("local_not_sent") is True or row.get("reject_code") in ORDER_REJECTION_CODES:
+            return "rejected"
+        # An explicit non-whitelisted code is a rejection only after the
+        # original-ID read returned a clean -2013 (persisted as query_absent).
+        return "rejected" if row.get("query_absent") is True and definitive_order_error(row.get("reject_code")) else None
 
     def observe_order(self, connection, symbol, client_id, row, *, persisted=False):
         """Resolve from matching original-ID reads or persisted verified receipts."""

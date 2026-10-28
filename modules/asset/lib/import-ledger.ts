@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { chinaDate, db, getLedger, lock, unlock } from './store';
 import { seedLedger, type SourceLedger } from './seed';
 import { EXAMPLE_SOURCE, parseSource, isGateProject } from './source-ledger';
-import { snapshotValues, quantityValue, withMarketQuantity, UNKNOWN_QUANTITY_ERROR } from './asset-values';
+import { snapshotValues, configuredExchanges, quantityValue, withMarketQuantity, UNKNOWN_QUANTITY_ERROR } from './asset-values';
 import type { Asset, Ledger } from './types';
 
 function importPlan(source: SourceLedger, current: Ledger, previous: SourceLedger) {
@@ -83,7 +83,7 @@ export async function importLedger(owner: string, input: unknown, apply: boolean
       ...previous.periods.map(({ rows, ...period }) => ({ ...period, assets: rows })),
       ...snapshots.results.map(row => JSON.parse(row.data)),
     ].map((period, index) => ({ ...period, id: `archive-${batchId}-${index}`, archived: true }));
-    const date = chinaDate(), { total, partial, missingValues } = snapshotValues(plan.ledger.assets, plan.ledger.fxStatus);
+    const date = chinaDate(), { total, partial, missingValues } = snapshotValues(plan.ledger.assets, plan.ledger.fxStatus, Date.now(), configuredExchanges(current.connections));
     const today = { id: 'daily-' + date, date, total, fx: plan.ledger.fx, fxStatus: plan.ledger.fxStatus, cny: total * plan.ledger.fx, future: false, difference: 0,
       partial, missingValues,
       updatedAt: new Date().toISOString(), assets: plan.ledger.assets };

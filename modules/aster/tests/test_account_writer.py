@@ -61,16 +61,22 @@ class AccountWriterTests(unittest.TestCase):
         self.invalid_identity = False
         self.invalid_order = False
         self.extra_orders = {}
+        self.batch_rows = None
+        self.order_query = None
         for aid in ("long", "short"):
             def respond(request, aid=aid):
                 self.requests.append((aid, request.method, request.url.path))
                 if request.method == "GET":
                     if request.url.path == "/fapi/v3/order":
+                        if self.order_query is not None:
+                            return self.order_query(request.url.params["origClientOrderId"])
                         return httpx.Response(200, json=self.receipt(aid))
                     return httpx.Response(200, json={} if self.invalid_identity else {"assets": [], "positions": []})
                 self.after_send()
                 if self.fail_write:
                     raise httpx.ReadTimeout("injected", request=request)
+                if request.url.path == "/fapi/v3/batchOrders" and self.batch_rows is not None:
+                    return httpx.Response(200, json=self.batch_rows)
                 params = dict(parse_qsl(request.content.decode()))
                 order = self.extra_orders.get(params.get("newClientOrderId"))
                 receipt = ({**order, "clientOrderId": order["newClientOrderId"], "orderId": "remote-" + order["newClientOrderId"],
@@ -186,6 +192,130 @@ class AccountWriterTests(unittest.TestCase):
             with self.assertRaises(AmbiguousOrder):
                 self.engine.broker(self.store.account("long")).submit([self.orders["long"]])
             self.assertEqual(len(writer.registry.unresolved(ticket)), 1)
+
+    def mixed_batch(self, rejected_row, query):
+        """Managed same-account batch: LONG fills, SHORT gets an error-code row."""
+        orders = [Executor.order("XAUUSD1", "LONG", "BUY", 1, "mixed-long"),
+                  Executor.order("XAUUSD1", "SHORT", "SELL", 1, "mixed-short")]
+        filled = {**orders[0], "clientOrderId": "mixed-long", "orderId": "remote-mixed-long", "origQty": "1",
+                  "executedQty": "1", "avgPrice": "100", "status": "FILLED"}
+        self.batch_rows, self.order_query = [filled, rejected_row], query
+        account = self.store.account("long")
+        broker = self.engine.broker(account)
+        executor = Executor(self.store, broker, self.engine.market)
+        intent = {"id": "managed-mixed", "kind": "pair", "account_id": "long", "symbol": "XAUUSD1", "leverage": 5,
+                  "status": "pending", "created_at": time.time(), "baseline": {"LONG": "0", "SHORT": "0"},
+                  "orders": orders, "receipts": {}, "repairs": [], "repair_attempts": 0}
+        self.store.save_intent(intent)
+        writer = self.engine.account_writer
+        with writer.accounts(["long"]) as ticket:
+            executor.send(intent, orders)
+            after_send = len(writer.registry.unresolved(ticket))
+            # Stop at the existing repair path's position read; reaching it is the point.
+            with patch.object(broker, "snapshot", side_effect=TradingError("stop before repair")):
+                try:
+                    result = executor.reconcile(account, intent)
+                except TradingError as exc:
+                    result = str(exc)
+            unresolved = writer.registry.unresolved(ticket)
+        return after_send, result, self.store.intent("long"), unresolved
+
+    def test_managed_partial_batch_rejection_confirms_only_the_unknown_leg(self):
+        rejected = {"code": -4164, "msg": "Order's notional must be no smaller than 5."}
+        absent = lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."})
+        after_send, result, intent, unresolved = self.mixed_batch(rejected, absent)
+        # The other leg's fill is kept; only the coded leg is unknown until queried.
+        self.assertEqual(after_send, 1)
+        self.assertEqual(intent["receipts"]["mixed-long"]["status"], "FILLED")
+        short = intent["receipts"]["mixed-short"]
+        self.assertEqual((short["status"], short["reject_code"], short["query_absent"]), ("REJECTED", -4164, True))
+        self.assertEqual(unresolved, [])
+        self.assertEqual(result, "stop before repair")
+        self.assertEqual([(m, p) for _, m, p in self.requests if p.endswith("Orders") or p.endswith("/order")],
+                         [("POST", "/fapi/v3/batchOrders"), ("GET", "/fapi/v3/order")])
+
+    def test_managed_partial_batch_found_order_counts_as_submitted(self):
+        def found(cid):
+            order = Executor.order("XAUUSD1", "SHORT", "SELL", 1, cid)
+            return httpx.Response(200, json={**order, "clientOrderId": cid, "orderId": "remote-" + cid, "origQty": "1",
+                                             "executedQty": "1", "avgPrice": "100", "status": "FILLED"})
+        _, result, intent, unresolved = self.mixed_batch({"code": -2022, "msg": "ReduceOnly Order is rejected."}, found)
+        self.assertEqual(intent["receipts"]["mixed-short"]["status"], "FILLED")
+        self.assertNotIn("query_absent", intent["receipts"]["mixed-short"])
+        self.assertEqual(unresolved, [])
+        self.assertEqual(result, "stop before repair")
+
+    def assert_leg_stays_unknown(self, row, query):
+        _, result, intent, unresolved = self.mixed_batch(row, query)
+        self.assertEqual(intent["receipts"]["mixed-long"]["status"], "FILLED")
+        self.assertNotIn("mixed-short", intent["receipts"])
+        self.assertEqual(len(unresolved), 1)
+        self.assertNotEqual(result, "stop before repair")
+        self.assertFalse(any(m == "POST" and p == "/fapi/v3/order" for _, m, p in self.requests))
+
+    def test_managed_partial_batch_failed_lookup_stays_unknown(self):
+        self.assert_leg_stays_unknown({"code": -4164, "msg": "min notional"}, lambda cid: httpx.Response(503, json={}))
+
+    def test_managed_partial_batch_throttled_lookup_is_not_absence(self):
+        self.assert_leg_stays_unknown({"code": -4164, "msg": "min notional"},
+            lambda cid: httpx.Response(429, json={"code": -2013, "msg": "Order does not exist."}))
+
+    def test_managed_partial_batch_timeout_row_is_not_rejected_by_absence(self):
+        self.assert_leg_stays_unknown({"code": -1007, "msg": "Timeout waiting for response."},
+            lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."}))
+
+    def test_managed_partial_batch_unknown_server_error_is_not_rejected_by_absence(self):
+        self.assert_leg_stays_unknown({"code": -1000, "msg": "An unknown error occurred."},
+            lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."}))
+
+    def test_managed_partial_batch_internal_error_is_not_rejected_by_absence(self):
+        self.assert_leg_stays_unknown({"code": -1001, "msg": "Internal error; unable to process your request."},
+            lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."}))
+
+    def pair_repair_after_coded_leg(self, query):
+        """Managed pair: LONG filled, SHORT got HTTP 400 -4164; then repair LONG."""
+        pair = self.pair()
+        state = self.terminal_pair(pair)
+        pending = state["pending"]
+        operation = "aster:pair-orders:" + pending["id"] + ":long-original:short-original"
+        pending["writer_dispatches"] = [{"operationId": operation, "clientOrderIds": ["long-original", "short-original"]}]
+        for leg in pending["legs"]:
+            leg.update(submit_evidence_version=2, submit_evidence={"kind": "receipt"})
+        pending["legs"][1].update(receipt=None, submit_error="Aster 拒绝请求（代码 -4164）：min notional",
+                                  submit_evidence={"kind": "exchange_error", "code": -4164, "http_status": 400})
+        self.store.put("pair_runtime:gold", state)
+        self.order_query = query
+        repair = {"key": "long", "order": Executor.order("XAUUSD1", "LONG", "SELL", 1, "long-repair"), "receipt": None}
+        self.extra_orders["long-repair"] = repair["order"]
+        writer, trader = self.engine.account_writer, PairTrader(self.engine)
+        with writer.accounts(["long", "short"]) as ticket:
+            writer.registry.prepare(ticket, operation, {"orders": [leg["order"] for leg in pending["legs"]]})
+            terminal = trader._query(pair, state, self.engine.brokers)
+            pending["repairs"].append(repair)
+            trader._dispatch(pair, state, self.engine.brokers, [repair], reconciliation=True)
+            unresolved = writer.registry.unresolved(ticket)
+        return terminal, state, repair, unresolved
+
+    def test_managed_pair_clean_absence_settles_original_so_repair_is_sent(self):
+        terminal, state, repair, unresolved = self.pair_repair_after_coded_leg(
+            lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."}))
+        self.assertTrue(terminal)
+        receipt = state["pending"]["legs"][1]["receipt"]
+        self.assertEqual((receipt["status"], receipt["reject_code"], receipt["query_absent"]), ("REJECTED", -4164, True))
+        self.assertEqual(repair["receipt"]["status"], "FILLED")
+        self.assertIn(("long", "POST", "/fapi/v3/order"), self.requests)
+        self.assertEqual(unresolved, [])
+
+    def test_managed_pair_refused_repair_admission_records_no_send(self):
+        terminal, state, repair, unresolved = self.pair_repair_after_coded_leg(lambda cid: httpx.Response(503, json={}))
+        self.assertFalse(terminal)
+        self.assertIsNone(state["pending"]["legs"][1]["receipt"])
+        self.assertEqual((repair["receipt"]["status"], repair["receipt"]["local_not_sent"]), ("REJECTED", True))
+        self.assertEqual(repair["submit_evidence"]["kind"], "request_not_sent")
+        self.assertEqual(len(unresolved), 1)
+        self.assertNotIn(("long", "POST", "/fapi/v3/order"), self.requests)
+        self.assertFalse(any("long-repair" in dispatch["clientOrderIds"] for dispatch in state["pending"]["writer_dispatches"]),
+                         "a refused admission must not use up the bounded dispatch list")
 
     def restart_writer(self):
         self.engine.account_writer.close()

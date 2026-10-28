@@ -17,7 +17,11 @@ export async function readHubSummary(services, now = Date.now(), monitorId = 'oi
   const runtime = services.get(monitorId)?.runtime?.();
   if (runtime && (!runtime.enabled || runtime.error)) return { updatedAt: null, health: { state: 'offline', message: `${entry.title}：${runtime.error || '监控已关闭'}`, staleAfterSeconds: 30 }, metrics: [modules] };
   if (monitorId === 'perpetual') {
-    const value = services.get('perpetual')?.summary?.() ?? { state: 'offline', updatedAt: null, message: '永续采集未就绪', quoteCount: 0, exchangeCount: 0, liveExchangeCount: 0 };
+    const offline = message => ({ state: 'offline', updatedAt: null, message, quoteCount: 0, exchangeCount: 0, liveExchangeCount: 0 });
+    let value;
+    // A module that is starting or switching (423) is offline for the hub, not a failed summary request.
+    try { value = services.get('perpetual')?.summary?.() ?? offline('永续采集未就绪'); }
+    catch (error) { if (error?.status !== 423) throw error; value = offline(`永续合约监控：${error.message}`); }
     return { updatedAt: timestamp(value.updatedAt) ? new Date(value.updatedAt).toISOString() : null,
       health: { state: value.state, message: healthMessage(value.message || '永续合约监控已连接；更新时间取启用交易所最早消息时间'), staleAfterSeconds: 30 },
       metrics: [metric('exchanges', '启用交易所', value.exchangeCount, '个'), metric('live_exchanges', '在线交易所', value.liveExchangeCount, '个'), metric('quotes', '报价合约', value.quoteCount, '个'), modules] };

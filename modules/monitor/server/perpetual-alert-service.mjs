@@ -62,7 +62,8 @@ export function createPerpetualAlertService({ store, getQuote, isVenueLive, noti
         } catch (error) {
           event.status = 'failed'; event.error = error?.uncertain ? '飞书投递结果不确定（可能已发出），不再重发；条件回落后再次达标才会提醒' : error instanceof Error ? error.message.slice(0, 200) : '提醒发送失败';
           // A definite non-delivery re-arms after the cooldown; an uncertain one is never resent.
-          if (!error?.uncertain) saved.armed = true;
+          // A possibly posted message counts as sent for the cooldown.
+          if (!error?.uncertain) saved.armed = true; else saved.lastSentAt = clock();
         }
         await serial(persist);
         sendingRuleId = null;

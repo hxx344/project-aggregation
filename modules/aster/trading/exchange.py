@@ -87,6 +87,25 @@ LEVERAGE_REJECTION_HTTP_STATUSES = frozenset({403, 418, 429})
 ORDER_REJECTION_CODES = LEVERAGE_REJECTION_CODES | {-2010, -2029, -5018}
 
 
+# Unknown, disconnected/internal and timeout codes never describe the order's fate.
+UNCERTAIN_ORDER_CODES = frozenset({-1000, -1001, -1006, -1007})
+
+
+def definitive_order_error(code, http_status=None):
+    """The exchange answered this order with an explicit, non-timeout error code.
+
+    This alone is not a rejection: only a later original-ID read returning
+    `order_absent` proves the order was never created."""
+    return (type(code) is int and code < 0 and code not in UNCERTAIN_ORDER_CODES
+            and http_status != 408 and not (type(http_status) is int and http_status >= 500))
+
+
+def order_absent(exc):
+    """A clean -2013 for the original client ID, not a throttled or uncertain read."""
+    return (isinstance(exc, ExchangeError) and not isinstance(exc, (AmbiguousOrder, RequestNotSent))
+            and exc.code == -2013 and not exc.retry_after and exc.http_status in (None, 400, 404))
+
+
 class BudgetWait(RequestNotSent):
     """The local scheduler must wait; this is not an exchange rejection."""
 
@@ -426,8 +445,9 @@ class API:
         try:
             try:
                 result = self._call(method, path, params, signed, weight, timeout=timeout)
-                if writer is not None:
-                    writer.validate_response(path, params or {}, result)
+                # Batch rows with a non-whitelisted error code leave only that
+                # leg unknown; the other legs' receipts must reach the caller.
+                unconfirmed = writer.validate_response(path, params or {}, result) if writer is not None else ()
             except BaseException as exc:
                 if writer is not None:
                     transfer_rejected = False
@@ -439,7 +459,10 @@ class API:
                     writer.finish(prepared, "rejected" if isinstance(exc, RequestNotSent) or transfer_rejected else "unknown")
                 raise
             if writer is not None:
-                writer.finish(prepared, "confirmed")
+                writer.finish(prepared, "unknown" if unconfirmed else "confirmed")
+            if unconfirmed:
+                result = [{**row, "writer_unconfirmed": True} if index in unconfirmed else row
+                          for index, row in enumerate(result)]
             return result
         finally:
             self._writer_prepared.reset(token)

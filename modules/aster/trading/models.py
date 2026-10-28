@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import math
+import re
 import time
 
 
@@ -95,6 +96,21 @@ def floor_step(value, step):
     amount = value if isinstance(value, Fraction) else Fraction(dec(value))
     quantum = Fraction(positive(step))
     return decimal_value(int(amount / quantum) * quantum, exact=True)
+
+
+# L044: the dashboard editors' decimal grammar (ASCII digits, no sign other
+# than "+", bounded written exponent). Python Decimal also accepts "1_000",
+# full-width digits and "-0", which the editors cannot reopen and resave.
+DECIMAL_TEXT = re.compile(r"\+?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE]([+-]?[0-9]+))?")
+
+
+def decimal_text(value, message):
+    if type(value) is not str or len(value) > 128:
+        raise TradingError(message)
+    match = DECIMAL_TEXT.fullmatch(value.strip())
+    if not match or abs(int(match.group(1) or 0)) > 100:
+        raise TradingError(message)
+    return value
 
 
 def wire(value):

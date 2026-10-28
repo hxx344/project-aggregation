@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { knownAssetValue, knownWorkbookValue, sumKnownValues, sumWorkbookValues, snapshotValues, quantityValue, refreshMarketAsset, withMarketQuantity, workbookMissingValueSql } from '../lib/asset-values.ts';
+import { knownAssetValue, knownWorkbookValue, sumKnownValues, sumWorkbookValues, snapshotValues, configuredExchanges, quantityValue, refreshMarketAsset, withMarketQuantity, workbookMissingValueSql } from '../lib/asset-values.ts';
 import { openDatabase } from '../lib/sqlite.ts';
 import type { Asset } from '../lib/types.ts';
 
@@ -48,6 +48,30 @@ test('snapshot completeness still includes FX failures, asset errors and source 
     { ...asset(10, 'market'), updatedAt: '' },
   ]) assert.equal(snapshotValues([row], { error: null }, now).partial, true);
   assert.equal(snapshotValues([{ ...asset(10), updatedAt: '2020-01-01' }], { error: null }, now).partial, false);
+});
+
+test('unconnected exchange rows keep their valuation without making a snapshot partial; configured failures still do', () => {
+  const old = '2026-09-21T00:00:00+08:00';
+  for (const mode of ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational'] as const) {
+    const placeholder = { ...asset(100, mode), updatedAt: old, status: '待连接 · 表格值' };
+    const disconnected = { ...placeholder, status: '已断开 · 保留旧值', error: 'Previous sync failed' };
+    const rows = [placeholder, { ...asset(5), id: 'row-2' }];
+    assert.deepEqual(snapshotValues(rows, { error: null }, now, []), { total: 105, missingValues: 0, partial: false }, mode);
+    assert.equal(snapshotValues([disconnected], { error: null }, now, ['market']).partial, false, mode);
+    assert.equal(snapshotValues(rows, { error: null }, now).partial, true, 'missing connection context stays conservative');
+    assert.equal(snapshotValues(rows, { error: null }, now, [mode]).partial, true, 'a configured exchange must still refresh');
+    assert.equal(snapshotValues([{ ...asset(100, mode), error: 'read failed' }], { error: null }, now, [mode]).partial, true, 'a configured read failure is partial');
+    assert.deepEqual(snapshotValues([{ ...placeholder, value: null }], { error: null }, now, []), { total: 0, missingValues: 1, partial: true }, 'an unknown retained value is still missing');
+  }
+  assert.equal(snapshotValues([{ ...asset(10, 'market'), updatedAt: old }], { error: null }, now, []).partial, true, 'market quotes are never retained');
+  assert.equal(snapshotValues([asset(10)], { error: 'FX failed' }, now, []).partial, true);
+});
+
+test('configured exchanges follow saved connections, including any configured Aster account', () => {
+  const connection = (configured: boolean) => ({ configured, lastSync: null, error: null, scope: '' });
+  assert.deepEqual(configuredExchanges({
+    bybit: connection(false), aster: connection(true), binance: connection(false), okx: connection(true), gate: connection(false), variational: connection(false),
+  }), ['aster', 'okx']);
 });
 
 test('non-finite values are missing rather than poisoning a known subtotal', () => {

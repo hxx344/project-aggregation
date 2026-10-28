@@ -39,7 +39,7 @@ class HubSummaryTests(unittest.TestCase):
     def test_reads_only_existing_memory_and_uses_source_time(self):
         engine = snapshot()
         before = copy.deepcopy(vars(engine))
-        for name in ("make_preview", "refresh_chain", "load_positions", "_save_state", "performance_report",
+        for name in ("make_preview", "refresh_chain", "load_positions", "load_positions_snapshot", "_save_state", "performance_report",
                      "sync_performance", "sample_performance", "refresh_rfq", "reconciliation_health"):
             setattr(engine, name, Mock(side_effect=AssertionError("Summary must not call engine methods")))
         payload = build_summary(engine, NOW)

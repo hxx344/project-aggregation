@@ -99,3 +99,16 @@ test('all selected module health messages fit the hub 500-character contract', a
     assert.equal(summary.health.state, 'partial'); assert.equal(summary.health.message.length, 500); assert.match(summary.health.message, /来源错误/);
   }
 });
+
+test('a perpetual module that is switching degrades to an offline summary instead of failing the request', async () => {
+  await assert.rejects(readHubSummary(services({ perpetual: { summary: () => { throw TypeError('broken'); } } }), now, 'perpetual'), /broken/, 'a real summary failure is not masked as offline');
+  const switching = { summary: () => { throw Object.assign(Error('该监控已关闭或正在切换，请开启后重试。'), { status: 423 }); } };
+  const summary = await readHubSummary(services({ perpetual: switching }), now, 'perpetual');
+  assert.equal(summary.health.state, 'offline'); assert.equal(summary.updatedAt, null); assert.match(summary.health.message, /正在切换/);
+  const server = createServer(createHandler({ services: services({ perpetual: switching }), username: 'test', password: 'test-password', nextHandler: (_q, r) => r.end() }));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch('http://127.0.0.1:' + server.address().port + '/api/hub/summary?schemaVersion=2&monitor=perpetual', { headers: { Authorization: 'Basic ' + Buffer.from('test:test-password').toString('base64') } });
+    assert.equal(response.status, 200); assert.equal((await response.json()).data.health.state, 'offline');
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});

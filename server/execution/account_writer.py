@@ -502,7 +502,8 @@ class AccountWriter:
     def recoveryProtectionVersion(self):
         return RECOVERY_SCHEMA_VERSION
 
-    def __init__(self, database_path, module_id, runtime_id, owner_id=None, pid=None, now=None, process_alive=None):
+    def __init__(self, database_path, module_id, runtime_id, owner_id=None, pid=None, now=None, process_alive=None, heartbeat_ms=HEARTBEAT_MS):
+        # heartbeat_ms only shortens the renewal beat (tests); it can never exceed the production 5s beat.
         self.module_id = _identifier(module_id)
         self.runtime_id = _identifier(runtime_id)
         self.owner_id = _identifier(owner_id if owner_id is not None else str(uuid.uuid4()))
@@ -511,6 +512,9 @@ class AccountWriter:
         self.process_alive = process_alive if process_alive is not None else _default_alive
         if isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid <= 0 or not callable(self.now) or not callable(self.process_alive):
             _fail("INVALID_OPTIONS")
+        if isinstance(heartbeat_ms, bool) or not isinstance(heartbeat_ms, int) or not 1 <= heartbeat_ms <= HEARTBEAT_MS:
+            _fail("INVALID_OPTIONS")
+        self.heartbeat_ms = heartbeat_ms
         self.retired = False
         self.closed = False
         self._last_now = None
@@ -891,7 +895,7 @@ class AccountWriter:
             return
 
         def heartbeat():
-            while not self._stop.wait(HEARTBEAT_MS / 1000):
+            while not self._stop.wait(self.heartbeat_ms / 1000):
                 with self._lock:
                     if not self._held:
                         continue
@@ -1073,7 +1077,7 @@ class AccountWriter:
                 bindings = [{"authority": row["authority"], "environment": row["environment"], "moduleId": row["module_id"], "verified": bool(row["verified"]), "count": row["count"]} for row in self._db.execute("SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified")]
                 operations = [{"moduleId": row["module_id"], "state": row["state"], "count": row["count"]} for row in self._db.execute("SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state")]
                 isolations = [{"authority": row["authority"], "environment": row["environment"], "reason": row["reason"], "moduleId": row["module_id"]} for row in self._db.execute("SELECT authority,environment,reason,module_id FROM aw_isolations ORDER BY authority,environment,module_id")]
-                return {"accounts": accounts, "bindings": bindings, "operations": operations, "isolations": isolations, "recovery": recovery}
+                return {"accounts": accounts, "bindings": bindings, "operations": operations, "isolations": isolations, "recovery": recovery, "writerRetired": self.retired}
             except Exception as error:
                 self._error(error)
 

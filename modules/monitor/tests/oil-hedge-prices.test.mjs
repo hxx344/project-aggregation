@@ -274,3 +274,21 @@ test('Next/Sites route exposes only the oil price action and preserves no-store 
   assert.equal((await GET(request, context('oil', `${ACTION}/extra`))).status, 404);
   assert.equal((await (await loadRoute(true)).GET(request, context('oil'))).status, 503);
 });
+
+test('refreshing unchanged hourly prices does not rewrite their stored observations', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const directory = await mkdtemp(join(tmpdir(), 'oil-hedge-observations-')), filename = join(directory, 'market.sqlite');
+  let now = NOW, store;
+  try {
+    store = await openMarketStore(filename, { clock: () => now });
+    store.write('oil', ACTION, prices(now));
+    now += HEDGE_PRICES_REFRESH_MS; store.write('oil', ACTION, prices(now));
+    store.close(); store = null;
+    const db = new DatabaseSync(filename);
+    try {
+      const rows = db.prepare('SELECT source_ms FROM market_observations WHERE dataset=?').all(storageKey(`oil/${ACTION}`));
+      assert.equal(rows.length, 2);
+      assert.deepEqual(rows.map(row => row.source_ms), [NOW, NOW], 'unchanged hours keep their first stored version');
+    } finally { db.close(); }
+  } finally { store?.close(); await rm(directory, { recursive: true, force: true }); }
+});

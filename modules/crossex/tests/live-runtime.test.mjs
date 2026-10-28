@@ -1024,6 +1024,70 @@ test('external orders sharing one client text stay distinct after one is cancell
   assert.equal(f.calls.cancel.length, 2); assert.notEqual(other.order.id, result.order.id);
 });
 
+test('an external order cancelled long after creation is reconciled from history by its exchange creation time', async t => {
+  const f = fixture(t), created = epoch - 3600000;
+  const raw = { order_id: 'external-old', text: 'web', symbol: symbols[0], type: 'LIMIT', time_in_force: 'GTC', side: 'BUY', position_side: 'LONG',
+    qty: '1', price: '100', executed_qty: '0', state: 'OPEN', reduce_only: false, create_time: String(created), update_time: String(created) };
+  f.orders([raw]); f.client.cancelOrder = async key => { f.calls.cancel.push(key); return { order_id: key, text: raw.text }; };
+  // Gate filters history by creation time; an order created before `from` is not returned.
+  f.client.getHistoryOrders = async input => { f.calls.history.push(input); return created >= input.from && created <= input.to ? [{ ...raw, state: 'CANCELLED', update_time: String(epoch) }] : []; };
+  await f.connect(); const result = await f.runtime.cancel({ orderId: raw.order_id, requestId: 'external-old-cancel-1' });
+  assert.equal(result.order.status, 'CANCEL_PENDING');
+  f.orders([]); f.advance(1000); await f.runtime.refresh();
+  assert.ok(f.calls.history.at(-1).from <= created);
+  assert.equal(f.runtime.view().live.orders.find(o => o.id === result.order.id).status, 'CANCELLED');
+});
+
+test('a fresh position read that does not yet reflect a recent fill blocks the next preview for a bounded time', async t => {
+  const f = fixture(t), stale = { user_id: '123', symbol: symbols[0], position_side: 'LONG', position_qty: '2', mark_price: '100', update_time: String(epoch - 5000) };
+  f.positions([stale]); f.mutate(row => { row.update_time = String(epoch); }); await f.connect();
+  const first = await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' });
+  assert.equal((await f.confirm(first)).state, 'completed');
+  // Gate still returns the pre-fill position: the old quantity must not size the next order.
+  f.advance(1000);
+  await assert.rejects(f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' }), /尚未反映最近成交/);
+  f.positions([{ ...stale, position_qty: '1', update_time: String(epoch) }]);
+  const next = await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' });
+  assert.equal(next.positions[0].heldQuantity, '1');
+  // A position endpoint that never advances its timestamp cannot freeze trading forever.
+  f.positions([stale]); f.advance(30000);
+  await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' });
+  assert.equal(f.calls.create.length, 1);
+});
+
+test('position projection only checks the traded direction and tolerates an IOC cancel stamp after the last fill', async t => {
+  const f = fixture(t), at = String(epoch - 5000);
+  const long = { user_id: '123', symbol: symbols[0], position_side: 'LONG', position_qty: '2', mark_price: '100', update_time: at };
+  const short = { user_id: '123', symbol: symbols[0], position_side: 'SHORT', position_qty: '-2', mark_price: '100', update_time: at };
+  f.positions([long, short]); f.mutate(row => { row.update_time = String(epoch + 500); }); await f.connect();
+  await f.confirm(await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' }));
+  f.advance(1000);
+  // The LONG fill says nothing about SHORT; its stale LONG row must not block the other side.
+  await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:SHORT`, quantity: '1' });
+  await assert.rejects(f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' }), /尚未反映最近成交/);
+  // Order update_time is the IOC cancel moment, 500 ms after the position's last fill.
+  f.positions([{ ...long, position_qty: '1', update_time: String(epoch) }, short]);
+  assert.equal((await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' })).positions[0].heldQuantity, '1');
+  // A missing position timestamp cannot prove the fill: wait, but only within the bounded window.
+  const { update_time: _, ...untimed } = long;
+  f.positions([{ ...untimed, position_qty: '1' }, short]);
+  await assert.rejects(f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' }), /尚未反映最近成交/);
+  f.advance(30000); await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' });
+});
+
+test('external order history lookback is bounded and an older order stays pending with a visible reason', async t => {
+  const f = fixture(t), created = epoch - 30 * 86400000;
+  const raw = { order_id: 'external-ancient', text: 'app', symbol: symbols[0], type: 'LIMIT', time_in_force: 'GTC', side: 'BUY', position_side: 'LONG',
+    qty: '1', price: '100', executed_qty: '0', state: 'OPEN', reduce_only: false, create_time: String(created), update_time: String(created) };
+  f.orders([raw]); f.client.cancelOrder = async key => { f.calls.cancel.push(key); return { order_id: key, text: raw.text }; };
+  f.client.getHistoryOrders = async input => { f.calls.history.push(input); return created >= input.from && created <= input.to ? [{ ...raw, state: 'CANCELLED', update_time: String(epoch) }] : []; };
+  await f.connect(); const result = await f.runtime.cancel({ orderId: raw.order_id, requestId: 'external-ancient-cancel' });
+  f.orders([]); f.advance(1000); await f.runtime.refresh();
+  assert.ok(f.calls.history.at(-1).from >= f.now - 7 * 86400000);
+  const order = f.runtime.view().live.orders.find(o => o.id === result.order.id);
+  assert.equal(order.status, 'CANCEL_PENDING'); assert.match(order.error, /历史查询上限/);
+});
+
 test('workspace update readiness blocks queued work and unsettled orders but permits ordinary positions', async t => {
   const f = fixture(t);
   await f.connect();

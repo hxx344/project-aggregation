@@ -685,15 +685,35 @@ test('five-second heartbeat isolates one account while renewing unrelated accoun
 
 test('heartbeat retries a briefly locked registry instead of retiring the writer', async (t) => {
   const f = fixture(t); let now = 1000;
-  const writer = f.writer('hub', { now: () => now }); const ticket = bindClaim(writer, [identity('73')]);
+  const writer = f.writer('hub', { now: () => now, heartbeatMs: 50 }); const ticket = bindClaim(writer, [identity('73')]);
+  const lease = () => readRow(f.databasePath, 'SELECT lease_until FROM aw_accounts WHERE account_key=?', accountKey(identity('73'))).lease_until;
   const blocker = new DatabaseSync(f.databasePath); blocker.exec('PRAGMA busy_timeout=2000; BEGIN IMMEDIATE');
   now = 2000;
-  try { await new Promise((resolve) => setTimeout(resolve, 5200)); } finally { blocker.exec('COMMIT'); blocker.close(); }
+  // The first 50ms beat blocks synchronously on busy_timeout before this timer can release the lock.
+  try { await new Promise((resolve) => setTimeout(resolve, 400)); } finally { blocker.exec('COMMIT'); blocker.close(); }
+  assert.equal(lease(), 61000);
   assert.equal(writer.retired, false);
   now = 3000;
-  await new Promise((resolve) => setTimeout(resolve, 5000));
-  assert.equal(readRow(f.databasePath, 'SELECT lease_until FROM aw_accounts WHERE account_key=?', accountKey(identity('73'))).lease_until, 63000);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(lease(), 63000);
   assert.equal(writer.assertOwned(ticket, 0), true);
+  assert.equal(writer.snapshot().writerRetired, false);
+  for (const heartbeatMs of [0, 5001, 1.5, '50']) assert.throws(() => createAccountWriter({ databasePath: f.databasePath, moduleId: 'hub', runtimeId: 'x', heartbeatMs }), code('INVALID_OPTIONS'));
+});
+
+test('heartbeat locked past the lease TTL retires with LEASE_EXPIRED once the registry is released', async (t) => {
+  const f = fixture(t); let now = 1000;
+  const writer = f.writer('hub', { now: () => now, heartbeatMs: 50 }); const ticket = bindClaim(writer, [identity('74')]);
+  const blocker = new DatabaseSync(f.databasePath); blocker.exec('PRAGMA busy_timeout=2000; BEGIN IMMEDIATE');
+  now = 61000;
+  try { await new Promise((resolve) => setTimeout(resolve, 400)); } finally { blocker.exec('COMMIT'); blocker.close(); }
+  assert.equal(writer.retired, false);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(writer.retired, true);
+  assert.equal(writer.timer, null);
+  assert.equal(readRow(f.databasePath, 'SELECT lease_until FROM aw_accounts WHERE account_key=?', accountKey(identity('74'))).lease_until, 61000);
+  assert.throws(() => writer.assertOwned(ticket, 0), code('WRITER_RETIRED'));
+  assert.equal(writer.snapshot().writerRetired, true);
 });
 
 test('quarantine gates Node and Python late send while preserving zero budget recovery', async (t) => {
@@ -778,5 +798,5 @@ test('Python registry contract and failure scenarios run under the normal Node t
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 29 tests/);
+  assert.match(result.stderr, /Ran 30 tests/);
 });

@@ -576,25 +576,53 @@ class AccountWriterTests(unittest.TestCase):
             row = database.execute("SELECT lease_until FROM aw_accounts WHERE account_key=?", (account_key(identity("72")),)).fetchone()
         self.assertEqual(row[0], 62000)
 
+    def lease_until(self, value):
+        with closing(sqlite3.connect(self.database_path)) as database:
+            return database.execute("SELECT lease_until FROM aw_accounts WHERE account_key=?", (account_key(value),)).fetchone()[0]
+
     def test_heartbeat_retries_a_briefly_locked_registry_instead_of_retiring(self):
         current = [1000]
-        writer = self.writer(now=lambda: current[0])
+        writer = self.writer(now=lambda: current[0], heartbeat_ms=50)
         ticket = self.ticket(writer)
         lock = sqlite3.connect(self.database_path, isolation_level=None)
         try:
             lock.execute("BEGIN IMMEDIATE")
-            time.sleep(5.2)
+            current[0] = 2000
+            # Long enough for at least one 50ms beat to exhaust the 750ms busy timeout.
+            time.sleep(1.2)
         finally:
             lock.rollback()
             lock.close()
         self.assertFalse(writer.retired)
-        current[0] = 2000
-        time.sleep(5.2)
+        current[0] = 3000
+        time.sleep(0.4)
         self.assertFalse(writer.retired)
         self.assertTrue(writer.assert_owned(ticket, 0))
-        with closing(sqlite3.connect(self.database_path)) as database:
-            row = database.execute("SELECT lease_until FROM aw_accounts WHERE account_key=?", (account_key(identity()),)).fetchone()
-        self.assertEqual(row[0], 62000)
+        self.assertEqual(self.lease_until(identity()), 63000)
+        self.assertFalse(writer.snapshot()["writerRetired"])
+        for heartbeat_ms in (0, 5001, 1.5, True, "50"):
+            self.error("INVALID_OPTIONS", lambda: AccountWriter(self.database_path, "greeks", "invalid-heartbeat", heartbeat_ms=heartbeat_ms))
+
+    def test_heartbeat_locked_past_lease_ttl_retires_with_lease_expired_after_release(self):
+        current = [1000]
+        writer = self.writer(now=lambda: current[0], heartbeat_ms=50)
+        ticket = self.ticket(writer)
+        lock = sqlite3.connect(self.database_path, isolation_level=None)
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+            current[0] = 61000
+            time.sleep(1.2)
+            self.assertFalse(writer.retired)
+        finally:
+            lock.rollback()
+            lock.close()
+        deadline = time.monotonic() + 2
+        while not writer.retired and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(writer.retired)
+        self.assertEqual(self.lease_until(identity()), 61000)
+        self.error("WRITER_RETIRED", lambda: writer.assert_owned(ticket, 0))
+        self.assertTrue(writer.snapshot()["writerRetired"])
 
     def test_same_client_id_on_other_account_is_not_same_cancel_target(self):
         writer = self.writer()

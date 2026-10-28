@@ -2,6 +2,7 @@ import type { Account } from './desk-types';
 import { accountSnapshotView } from './account-modes.ts';
 import { pairHasPending, pairMarginOnly, type Pair } from './pairs.ts';
 import { pairScheduledMarginWait } from './pair-notices.ts';
+import { pairedSnapshotRefresh } from './account-positions.ts';
 
 type SummarySnapshot = {
   timestamp: number;
@@ -32,7 +33,15 @@ export function accountSummaryView(
           ? 'short'
           : undefined
       : undefined;
-  const fundsOnly = Boolean(side && pair && pairMarginOnly(pair));
+  // Like the hub, an unresolved trading batch keeps the position snapshot;
+  // a legacy cycle reaches the funds view as an attention phase error. Unlike
+  // the hub, a paused margin-only pair keeps the funds view with its paused label.
+  const tradingPending = Boolean(
+    pair?.state?.pending && Object.keys(pair.state.pending).length,
+  );
+  const fundsOnly = Boolean(
+    side && pair && pairMarginOnly(pair) && !tradingPending,
+  );
   if (!fundsOnly) {
     return {
       fundsOnly,
@@ -41,7 +50,7 @@ export function accountSummaryView(
         account?.snapshot,
         now,
         connectionError,
-        account?.snapshot_refresh,
+        pairedSnapshotRefresh(account, side ? pair : undefined),
         account?.status === 'error' ? account.reason : undefined,
       ),
     };
