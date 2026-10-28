@@ -49,6 +49,29 @@ test('alert evaluation excludes unavailable fees, mismatched identity, stale boo
   assert.match(evaluatePerpetualAlertQuote(rule(), key => unknown.get(key), NOW).reason, /费率/);
 });
 
+test('a drifting one-second timer that skips a second bucket keeps continuity', () => {
+  const tracker = createPerpetualConditionTracker(rule()), hit = { valid: true, hit: true };
+  tracker.observe(hit, NOW + 999);
+  tracker.observe(hit, NOW + 2000);
+  assert.equal(tracker.observe(hit, NOW + 3001).continuousSeconds, 2);
+  assert.equal(tracker.observe(hit, NOW + 4800).continuousSeconds, 0, 'a missed beat (1.8 s gap) still interrupts');
+});
+
+test('definite delivery failure re-arms after cooldown while an uncertain one is never resent', async t => {
+  let failure = Object.assign(Error('飞书返回 HTTP 400。'), { uncertain: false });
+  const f = fixture({ send: async () => { if (failure) throw failure; } }); t.after(() => f.service.stop()); await f.configure();
+  for (let second = 0; second <= 3; second++) await f.tick(second);
+  assert.equal(f.sent.length, 1); assert.equal(f.service.view().history[0].status, 'failed');
+  for (let second = 4; second <= 28; second++) await f.tick(second);
+  assert.equal(f.sent.length, 1, 'cooldown still applies');
+  failure = Object.assign(Error('飞书连接失败或超时'), { uncertain: true });
+  for (let second = 29; second <= 36; second++) await f.tick(second);
+  assert.equal(f.sent.length, 2);
+  failure = null;
+  for (let second = 37; second <= 80; second++) await f.tick(second);
+  assert.equal(f.sent.length, 2, 'uncertain delivery waits for price re-entry instead of resending');
+});
+
 test('continuous time uses elapsed seconds and window ratio includes missing startup and outage seconds', () => {
   const tracker = createPerpetualConditionTracker(rule()), hit = { valid: true, hit: true };
   assert.deepEqual(tracker.observe(hit, NOW), { continuousSeconds: 0, hitRatio: 0.2, coverage: 0.2, ready: false });

@@ -2,6 +2,7 @@ import asyncio
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from math import isclose, isfinite
 
+from .bybit import BybitRejected
 from .order_activity import EXCHANGE_STATUSES
 
 
@@ -131,7 +132,12 @@ class OrderExecutor:
                 check_stop()
                 attempted = True
                 self._observe(observer, "submitting", requested_price=price)
-                response = await self.client.place_ioc_order(instrument.symbol, side, qty, price, link, reduce_only)
+                try:
+                    response = await self.client.place_ioc_order(instrument.symbol, side, qty, price, link, reduce_only)
+                except BybitRejected:
+                    # The exchange refused the create: no order exists to reconcile.
+                    attempted = False
+                    raise
                 outcome["orderId"] = response.get("orderId", "")
                 check_stop()
                 self._observe(observer, "reconciling", order_id=outcome["orderId"])
@@ -169,7 +175,12 @@ class OrderExecutor:
                             # Set before awaiting: a lost response can hide an accepted order.
                             attempted = True
                             self._observe(observer, "submitting", requested_price=price)
-                            response = await self.client.place_limit_order(instrument.symbol, side, qty, price, link, reduce_only)
+                            try:
+                                response = await self.client.place_limit_order(instrument.symbol, side, qty, price, link, reduce_only)
+                            except BybitRejected:
+                                # The exchange refused the create: no order exists to reconcile.
+                                attempted = False
+                                raise
                             outcome["orderId"] = response.get("orderId", "")
                             self._observe(observer, "reconciling", order_id=outcome["orderId"])
                             last_price = price

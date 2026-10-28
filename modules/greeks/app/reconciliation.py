@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 from math import isfinite
 
 from .models import Position
@@ -301,7 +302,8 @@ class ReconciliationMixin:
                 continue
             key = (execution.symbol, execution.side)
             bucket = execution_groups.setdefault(group_id, {})
-            bucket[key] = bucket.get(key, 0.0) + execution.exec_qty
+            # Decimal sum: float accumulation (0.7 + 0.1) can land below the lot grid.
+            bucket[key] = float(Decimal(str(bucket.get(key, 0.0))) + Decimal(str(execution.exec_qty)))
             execution_times[group_id] = max(execution_times.get(group_id, ""), execution.exec_time.isoformat())
         for group_id, legs in execution_groups.items():
             # Existing original metadata wins over an incomplete fill history.

@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from math import isclose, isfinite
 from pathlib import Path
 from uuid import uuid4
@@ -406,19 +407,21 @@ class TradingEngine(TradeTaskMixin, RfqMixin, ReconciliationMixin, PerformanceMi
             return
         entry.update(outcome)
         entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-        delta = max(0.0, float(entry.get("filledQty", 0)) - previous_filled)
+        # Decimal steps keep tracked sizes on the lot grid; float drift (0.03 - 0.01)
+        # would otherwise send an off-step close quantity such as 0.019999999999999997.
+        delta = max(Decimal(0), Decimal(str(float(entry.get("filledQty", 0)))) - Decimal(str(previous_filled)))
         group_id = self.execution_group_links.get(link)
         group = self.execution_groups.get(group_id, {})
         if delta > 0 and group:
             position_side = ("Sell" if entry["side"] == "Buy" else "Buy") if entry["reduce_only"] else entry["side"]
             key = f"{entry['symbol']}|{position_side}"
             if entry["reduce_only"]:
-                self.active_strategy_sizes[key] = max(0.0, self.active_strategy_sizes.get(key, 0) - delta)
+                self.active_strategy_sizes[key] = max(0.0, float(Decimal(str(self.active_strategy_sizes.get(key, 0))) - delta))
                 if self.active_strategy_sizes[key] <= 1e-9:
                     self.active_strategy_sizes.pop(key, None)
                     self.active_strategy_symbols.discard(entry["symbol"])
             else:
-                self.active_strategy_sizes[key] = self.active_strategy_sizes.get(key, 0) + delta
+                self.active_strategy_sizes[key] = float(Decimal(str(self.active_strategy_sizes.get(key, 0))) + delta)
                 self.active_strategy_symbols.add(entry["symbol"])
                 self.active_strategy_group_id = group_id
         self._save_state()

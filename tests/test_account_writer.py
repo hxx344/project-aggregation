@@ -576,6 +576,26 @@ class AccountWriterTests(unittest.TestCase):
             row = database.execute("SELECT lease_until FROM aw_accounts WHERE account_key=?", (account_key(identity("72")),)).fetchone()
         self.assertEqual(row[0], 62000)
 
+    def test_heartbeat_retries_a_briefly_locked_registry_instead_of_retiring(self):
+        current = [1000]
+        writer = self.writer(now=lambda: current[0])
+        ticket = self.ticket(writer)
+        lock = sqlite3.connect(self.database_path, isolation_level=None)
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+            time.sleep(5.2)
+        finally:
+            lock.rollback()
+            lock.close()
+        self.assertFalse(writer.retired)
+        current[0] = 2000
+        time.sleep(5.2)
+        self.assertFalse(writer.retired)
+        self.assertTrue(writer.assert_owned(ticket, 0))
+        with closing(sqlite3.connect(self.database_path)) as database:
+            row = database.execute("SELECT lease_until FROM aw_accounts WHERE account_key=?", (account_key(identity()),)).fetchone()
+        self.assertEqual(row[0], 62000)
+
     def test_same_client_id_on_other_account_is_not_same_cancel_target(self):
         writer = self.writer()
         ticket = self.ticket(writer, [identity("71"), identity("72")])
