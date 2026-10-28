@@ -46,8 +46,8 @@ export default function TradingPage({ cache, onExpired, onProject, navigationSea
   return <div className="trading-center">
     <nav className="trading-sections" aria-label="交易模块">
       <button type="button" aria-current={section === 'positions' ? 'page' : undefined} onClick={() => select('positions')}><Wallet size={17} />交易所仓位</button>
-      <button type="button" aria-current={section === 'oil' ? 'page' : undefined} onClick={() => select('oil')} onMouseEnter={preloadOilPage} onFocus={preloadOilPage}><Gauge size={17} />原油四腿套利</button>
+      <button type="button" aria-current={section === 'oil' ? 'page' : undefined} onClick={() => select('oil')} onMouseEnter={preloadOilPage} onFocus={preloadOilPage}><Gauge size={17} />套利交易</button>
     </nav>
-    {section === 'positions' ? <TradingPositions onExpired={onExpired} onProject={onProject} navigationSearch={navigationSearch} /> : <Suspense fallback={<div className="positions-empty" role="status"><LoaderCircle className="spin" size={22} /><p>正在加载原油套利…</p></div>}><OilTradingPage cache={cache} onExpired={onExpired} /></Suspense>}
+    {section === 'positions' ? <TradingPositions onExpired={onExpired} onProject={onProject} navigationSearch={navigationSearch} /> : <Suspense fallback={<div className="positions-empty" role="status"><LoaderCircle className="spin" size={22} /><p>正在加载套利交易…</p></div>}><OilTradingPage cache={cache} onExpired={onExpired} /></Suspense>}
   </div>;
 }

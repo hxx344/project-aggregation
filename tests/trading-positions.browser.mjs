@@ -110,18 +110,18 @@ async (page) => {
   assert(new URL(page.url()).searchParams.get('tradingSection') === 'positions' && oilReads() === 0, 'main navigation enters positions explicitly');
 
   await page.goto(`${origin}/?view=trading&tradingDays=30&tradingPair=binance,okx`);
-  await page.getByRole('heading', { name: '原油四腿资金费套利', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '套利交易', exact: true }).waitFor();
   await page.locator('.trading-funding').waitFor();
   assert(requests.some(request => request.path === '/api/trading' && new URLSearchParams(request.search).get('days') === '30' && new URLSearchParams(request.search).get('pair') === 'binance,okx'), 'legacy oil links preserve range and pair');
   await page.getByRole('button', { name: '交易所仓位', exact: true }).click();
   await page.locator('[data-position-id="btc-long"]').waitFor();
   assert(new URL(page.url()).searchParams.get('tradingSection') === 'positions', 'explicit positions overrides old oil parameters');
   await page.goBack();
-  await page.getByRole('heading', { name: '原油四腿资金费套利', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '套利交易', exact: true }).waitFor();
   await page.goForward();
   await page.locator('[data-position-id="btc-long"]').waitFor();
-  await page.getByRole('button', { name: '原油四腿套利', exact: true }).click();
-  await page.getByRole('heading', { name: '原油四腿资金费套利', exact: true }).waitFor();
+  await page.getByRole('button', { name: '套利交易', exact: true }).click();
+  await page.getByRole('heading', { name: '套利交易', exact: true }).waitFor();
   assert(new URL(page.url()).searchParams.get('tradingDays') === '30', 'return to oil preserves cached range');
   await page.getByRole('button', { name: '交易所仓位', exact: true }).click();
   await page.locator('[data-position-id="btc-long"]').waitFor();

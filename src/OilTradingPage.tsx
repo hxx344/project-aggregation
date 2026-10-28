@@ -289,7 +289,7 @@ export default function OilTradingPage({ cache, onExpired }: { cache: TradingCac
   };
 
   return <div className="trading-page">
-    <header className="trading-heading"><div><div className="trading-title-line"><h1>原油四腿资金费套利</h1></div><p>{exchanges.map(exchange => exchangeNames[exchange]).join(" 与 ")} · CL / BZ 永续合约</p></div><button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button></header>
+    <header className="trading-heading"><div><div className="trading-title-line"><h1>套利交易</h1></div><p>{exchanges.map(exchange => exchangeNames[exchange]).join(" 与 ")} · 原油 CL / BZ 与海力士永续合约</p></div><button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button></header>
     <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div>
     <TradingExecution pair={pair} onExpired={onExpired} />
     {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
@@ -299,7 +299,7 @@ export default function OilTradingPage({ cache, onExpired }: { cache: TradingCac
     {data ? <div className={`trading-notice trading-cache-status${oldCache || data.cache.error ? ' warning' : ''}`} role={data.cache.error ? 'alert' : 'status'}><span>{data.cache.error ? `${data.cache.error.message} 失败时间：${formatDate(data.cache.error.at)}（北京时间）。` : oldCache ? '当前显示旧缓存，等待更新。' : data.cache.rebuilding ? '后台正在更新缓存，当前显示上次数据。' : reading ? '已显示缓存，正在检查更新。' : '已显示缓存。'} 缓存生成：{formatDate(data.cache.builtAt)}{data.cache.builtAt ? '（北京时间）' : ''}</span></div> : null}
     {!data ? <div className="trading-initial" role="status">{reading ? <><LoaderCircle className="spin" size={22} /><span>正在读取交易账户状态…</span></> : <span>尚未获取交易数据</span>}</div> : <>
       <section className="trading-panel trading-positions" aria-labelledby="trading-positions-title">
-        <div className="trading-panel-heading"><div><h2 id="trading-positions-title">四腿仓位</h2><p>按实际持仓显示方向 · OKX 数量为张，价格为 USDT/底层单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
+        <div className="trading-panel-heading"><div><h2 id="trading-positions-title">原油四腿仓位</h2><p>按实际持仓显示方向 · OKX 数量为张，价格为 USDT/底层单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
         <div className="trading-account-statuses">{selectedAccounts.map(account => <div className="trading-account-status" key={account.exchange}><div><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.positions.state} />{account.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div><p>仓位读取：{formatDate(account.positions.fetchedAt)}{account.positions.fetchedAt ? '（北京时间）' : ''}</p>{account.positions.error ? <p className="trading-warning">{account.positions.error}</p> : null}</div>)}</div>
         {!connected ? <div className="trading-connect-empty"><ShieldCheck size={27} /><h3>连接账户，查看四腿的真实仓位</h3><p>使用所选两家交易所的只读密钥。连接后，这里会显示持仓方向、名义价值和资金费账单。</p><button className="button primary" onClick={openConnections}>连接只读账户</button></div> : null}
         <div className={`trading-structure ${data.structure.state}`}><span>跨所方向</span><strong>{data.structure.message}</strong></div>
@@ -309,7 +309,7 @@ export default function OilTradingPage({ cache, onExpired }: { cache: TradingCac
       </section>
 
       <section className="trading-panel trading-pnl" aria-labelledby="trading-pnl-title">
-        <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">四腿总盈亏</h2><p>持仓浮盈亏＋区间累计已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
+        <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">原油四腿总盈亏</h2><p>持仓浮盈亏＋区间累计已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
         {days !== data.period.days ? <p className="trading-window-loading" role="status">{reading ? `正在读取近${days}天缓存；下方仍显示近${data.period.days}天的数据。` : `所选区间尚未取得，保留近${data.period.days}天的数据。`}</p> : null}
         <p className="trading-caption">资金费累计起点：{formatDate(data.period.start)}（北京时间）；每个采样点仅累计到该时刻。</p>
         <TradingPnlChart pnl={data.pnl} />
