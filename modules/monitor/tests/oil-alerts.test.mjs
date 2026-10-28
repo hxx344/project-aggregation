@@ -214,3 +214,30 @@ test('file persistence survives reopen; overlapping writers and corrupt files fa
     await writeFile(path.join(directory, 'monitor.json'), '{bad'); await assert.rejects(other.read());
   } finally { await store.release(); await other.release(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test('configuration saves are not blocked by an in-flight notification, and the result keeps the saved configuration', async () => {
+  let release; const blocked = new Promise(resolve => { release = resolve; });
+  const f = fixture({ send: () => blocked });
+  const ticking = f.monitor.tick();
+  for (let i = 0; i < 50 && !f.messages.length; i++) await new Promise(resolve => setTimeout(resolve, 2));
+  assert.equal(f.messages.length, 1);
+  const saved = await Promise.race([f.monitor.configure({ enabled: true, rules: [rule({ label: '改名' })] }, 0), new Promise(resolve => setTimeout(() => resolve('blocked'), 100))]);
+  assert.notEqual(saved, 'blocked');
+  await f.monitor.tick(); assert.equal(f.messages.length, 1, 'no second batch while one is in flight');
+  let stopped = false; const stopping = f.monitor.stop().then(() => { stopped = true; });
+  await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(stopped, false, 'stop waits for the in-flight notification');
+  release(); await ticking; await stopping;
+  assert.equal(f.persisted.config.rules[0].label, '改名'); assert.equal(f.persisted.revision, 1);
+  assert.equal(f.persisted.events[0].status, 'sent'); assert.equal(f.persisted.states['test-rule'].alerted, true);
+});
+
+test('a rule changed during an in-flight notification does not inherit its delivery state', async () => {
+  let release; const blocked = new Promise(resolve => { release = resolve; });
+  const f = fixture({ send: () => blocked });
+  const ticking = f.monitor.tick();
+  for (let i = 0; i < 50 && !f.messages.length; i++) await new Promise(resolve => setTimeout(resolve, 2));
+  await f.monitor.configure({ enabled: true, rules: [rule({ threshold: 4 })] }, 0);
+  release(); await ticking;
+  assert.equal(f.persisted.events[0].status, 'sent'); assert.equal(f.persisted.states['test-rule'], undefined);
+  await f.monitor.tick(); assert.equal(f.messages.length, 2, 'the new threshold starts its own episode');
+});

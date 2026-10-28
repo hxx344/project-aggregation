@@ -7,7 +7,7 @@ from fractions import Fraction
 
 from .ordinary_selection import ordinary_add_block_reason
 from .account_legacy import legacy_intent, legacy_block_reason, LEGACY_PENDING_REASON
-from .exchange import AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent
+from .exchange import UNCERTAIN_ORDER_CODES, AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent, definitive_order_error, order_absent
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, opening_margin_limit, ordinary_leverage_wait, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
@@ -92,10 +92,17 @@ class Executor:
                 cid = order["newClientOrderId"]
                 if isinstance(row, dict) and isinstance(row.get("code"), int) and row["code"] < 0:
                     # A batch-level timeout still needs a query, even inside HTTP 200.
-                    if row["code"] not in (-1006, -1007):
+                    reason = exchange_reason(row.get("msg")) or MISSING_REJECT_REASON
+                    if row.get("writer_unconfirmed") is True:
+                        # Managed mode: only a later clean -2013 for this ID
+                        # proves absence; the other legs keep their receipts.
+                        if definitive_order_error(row["code"]):
+                            intent.setdefault("submit_errors", {})[cid] = {"code": row["code"], "reason": reason}
+                        rejections.append(f"{'多头' if order['positionSide'] == 'LONG' else '空头'} 结果待按原编号核对"
+                                          f"（code={row['code']}）：{reason}")
+                    elif row["code"] not in UNCERTAIN_ORDER_CODES:
                         intent["receipts"][cid] = {**order, "clientOrderId": cid, "status": "REJECTED", "executedQty": "0",
-                                                   "avgPrice": "0", "reject_code": row["code"],
-                                                   "reject_reason": exchange_reason(row.get("msg")) or MISSING_REJECT_REASON}
+                                                   "avgPrice": "0", "reject_code": row["code"], "reject_reason": reason}
                         rejections.append(self.order_outcome(order, intent["receipts"][cid]))
                 else:
                     self.validate_receipt(order, row)
@@ -120,6 +127,12 @@ class Executor:
             intent["last_error"] = str(exc)
             if isinstance(exc, ExchangeError) and not isinstance(exc, AmbiguousOrder) and exc.code not in (-1006, -1007):
                 rejections.append(str(exc))
+                if definitive_order_error(exc.code, exc.http_status):
+                    # The whole request got an explicit error code. Each order
+                    # still stays unknown until its original-ID read says -2013.
+                    for order in orders:
+                        intent.setdefault("submit_errors", {})[order["newClientOrderId"]] = {
+                            "code": exc.code, "reason": str(exc)}
         self.store.save_intent(intent)
         if not repair and intent.get("kind") == "pair" and "capacity_timing" in intent:
             self.store.event(intent["account_id"], "order", f"{intent['symbol']} {intent['leverage']}x 本批开仓耗时"
@@ -419,6 +432,7 @@ class Executor:
             return self._recover_current(account, intent)
         orders = intent["orders"] + intent["repairs"]
         unresolved = []
+        queried_absent = False
         for order in orders:
             cid = order["newClientOrderId"]
             known = intent["receipts"].get(cid)
@@ -447,12 +461,26 @@ class Executor:
                         # Save the refund and terminal receipt together below.
                         # A retry may already have reset the attempt counter.
                         intent["repair_attempts"] = max(0, intent["repair_attempts"] - 1)
+                elif known is None and cid in intent.get("submit_errors", {}) and order_absent(exc):
+                    # The exchange answered this exact order with an explicit
+                    # error code and the original ID now cleanly does not exist.
+                    error = intent["submit_errors"][cid]
+                    intent["receipts"][cid] = {**order, "clientOrderId": cid, "status": "REJECTED", "executedQty": "0",
+                                               "avgPrice": "0", "reject_code": error["code"],
+                                               "reject_reason": error["reason"], "query_absent": True}
+                    queried_absent = True
                 else:
                     unresolved.append(cid)
                     intent["last_error"] = str(exc)
             except TradingError as exc:
                 return self.attention(account, intent, str(exc))
         self.store.save_intent(intent)
+        if queried_absent:
+            # Settle the shared batch now, so the existing repair path below is
+            # not refused by the batch's own unknown operation.
+            writer = getattr(self.store, "account_writer", None)
+            if writer is not None:
+                writer.settle_intent(intent)
         if unresolved:
             if recovery.due(intent, unresolved):
                 return self._recover_current(account, intent)

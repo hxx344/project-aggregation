@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  pairedSnapshotRefresh,
   accountPositionsView,
   latestPositionsSnapshot,
   positionLeverageLabel,
@@ -417,4 +418,30 @@ test('nullable numeric cells remain unknown and tiny or invalid quantities do no
     visiblePositions(snapshot(100, [...unknown, ...zero])),
     unknown,
   );
+});
+
+test('ordinary pair positions use the eight-second pair snapshot rule', () => {
+  const pair = {
+    ...fundsPair(1000),
+    ordinary: { enabled: true },
+    margin: { enabled: false, check_interval_seconds: 5 },
+  };
+  const account = {
+    id: 'a',
+    pair_id: 'pair',
+    snapshot_refresh: { interval_seconds: 60 },
+    snapshot: snapshot(980, [position('XAUUSD1', 'LONG', '2')]),
+  };
+  const view = accountPositionsView({ account, pair, side: 'long', now: 1000 });
+  assert.equal(view.warning, true);
+  const unpaired = { ...account, pair_id: undefined };
+  assert.equal(accountPositionsView({ account: unpaired, now: 1000 }).warning, false);
+});
+
+test('a margin-only pair keeps its check interval only while nothing is pending', () => {
+  const base = fundsPair(1000);
+  const pair = { ...base, margin: { ...base.margin, check_interval_seconds: 60 } };
+  assert.deepEqual(pairedSnapshotRefresh(undefined, pair), { interval_seconds: 60 });
+  const pending = { ...pair, state: { ...pair.state, pending: { batch: {} } } };
+  assert.equal(pairedSnapshotRefresh(undefined, pending), undefined);
 });

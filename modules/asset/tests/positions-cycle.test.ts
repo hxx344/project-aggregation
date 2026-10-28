@@ -55,7 +55,7 @@ function mock(handler: (url: URL) => unknown) {
   return { fetcher, calls };
 }
 const inRange = (url: URL, time: number) => time >= Number(url.searchParams.get('startTime') ?? url.searchParams.get('begin') ?? 0)
-  && time <= Number(url.searchParams.get('endTime') ?? url.searchParams.get('end'));
+  && time <= Number(url.searchParams.get('endTime') ?? url.searchParams.get('end') ?? Infinity);
 
 test('Binance walks weekly windows back to the opening fill, follows the hedge side and reads funding from the opening', async () => {
   const trades = [
@@ -141,6 +141,33 @@ test('OKX pages fills by billId until the opening fill and reads funding bills f
   assert.equal(calls[1].searchParams.get('begin'), String(at - 2 * hour)); assert.equal(calls[1].searchParams.get('type'), '8');
   assert.equal(cycle.closedQuantity, '1'); assert.equal(cycle.closePrice, '60000'); assert.equal(cycle.realizedPnl, '30');
   assert.equal(cycle.fees, '-1.2'); assert.equal(cycle.funding, '0.4'); assert.equal(cycle.net, '29.2');
+});
+
+test('fills and funding stamped ahead of the local clock are still read, so the cycle retries or counts them', async () => {
+  const ahead = at + 30_000, opts = (fetcher: typeof fetch) => ({ fetcher, now: () => at, spacing: false });
+  const trade = (id: number, time: number) => ({ symbol: 'ETHUSDT', id, side: 'BUY', positionSide: 'BOTH', price: '3000', qty: '1', realizedPnl: '0', commission: '0.3', commissionAsset: 'USDT', time });
+  const trades = [trade(2, ahead), trade(1, at - hour)];
+  const binance = mock(url => url.pathname.endsWith('userTrades') ? trades.filter(row => inRange(url, row.time)) : []);
+  await assert.rejects(readPositionCycle({ exchange: 'binance', ...keys }, 'um', { position: held('long', '2', 'ETHUSDT', 'ETH'), siblings: [], snapshotAt: at }, opts(binance.fetcher)), CycleRetry);
+  assert.equal(binance.calls[0].searchParams.get('endTime'), null, 'the newest trade window has no local upper bound');
+
+  const row = (id: string, time: number, size: string) => ({ id, symbol: 'SOLUSDT', category: 'linear', currency: 'USDT', transactionTime: String(time), type: 'TRADE', side: 'Buy', qty: '1', size, tradePrice: '150', cashFlow: '0', fee: '0.01', funding: '' });
+  const ledger = [row('2', ahead, '2'), row('1', at - hour, '1')];
+  const bybit = mock(url => ({ retCode: 0, result: { list: ledger.filter(item => inRange(url, Number(item.transactionTime))), nextPageCursor: '' } }));
+  await assert.rejects(readPositionCycle({ exchange: 'bybit', ...keys, region: 'global' }, 'linear-usdt', { position: held('long', '2', 'SOLUSDT', 'SOL'), siblings: [], snapshotAt: at }, opts(bybit.fetcher)), CycleRetry);
+  assert.equal(bybit.calls[0].searchParams.get('endTime'), null);
+
+  const okxFill = (billId: string, ts: number) => ({ instId: 'BTC-USDT-SWAP', billId, ts: String(ts), side: 'buy', posSide: 'net', fillSz: '1', fillPx: '60000', fillPnl: '0', fee: '-0.3', feeCcy: 'USDT' });
+  const okx = (fills: unknown[]) => mock(url => {
+    const before = (ts: string) => !url.searchParams.get('end') || Number(ts) < Number(url.searchParams.get('end'));
+    const bills = [{ instId: 'BTC-USDT-SWAP', billId: '7', ts: String(ahead), type: '8', subType: '174', pnl: '0.4', ccy: 'USDT' }];
+    return { code: '0', data: (url.pathname.endsWith('fills-history') ? fills as { ts: string }[] : bills).filter(item => before(item.ts)) };
+  });
+  const credential: Credentials = { exchange: 'okx', ...keys, passphrase: 'synthetic' };
+  const okxRequest = (quantity: string) => ({ position: held('long', quantity, 'BTC-USDT-SWAP', '张（BTC/张）'), siblings: [], snapshotAt: at });
+  const funded = await readPositionCycle(credential, 'SWAP', okxRequest('1'), opts(okx([okxFill('10', at - hour)]).fetcher));
+  assert.equal(funded.status, 'complete'); assert.equal(funded.funding, '0.4', 'a funding bill stamped ahead of our clock is counted');
+  await assert.rejects(readPositionCycle(credential, 'SWAP', okxRequest('2'), opts(okx([okxFill('11', ahead), okxFill('10', at - hour)]).fetcher)), CycleRetry);
 });
 
 test('same-millisecond fills keep execution order by numeric id, or by listing order otherwise', () => {

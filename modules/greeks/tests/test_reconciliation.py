@@ -197,6 +197,31 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(e.order_journal["ic-pending"]["terminal"])
         self.assertEqual(e.reconciliation_health()["pending_orders"], 0)
 
+    async def test_position_read_never_cancels_pending_orders(self):
+        # Dashboard GETs share this path; cancellation belongs to background reconciliation only.
+        e = self.engine
+        leg = self.preview.legs[0]
+        e.order_journal["ic-pending"] = {"symbol": leg.symbol, "side": leg.side, "qty": 0.01,
+                                        "reduce_only": False, "terminal": False, "status": "unknown", "filledQty": 0.0}
+        e.client.cancel_order = AsyncMock(return_value={})
+        e.client.order = AsyncMock(return_value={"side": leg.side, "qty": "0.01", "cumExecQty": "0", "orderStatus": "New"})
+        e.client.positions.return_value = [{"symbol": leg.symbol, "side": leg.side, "size": "0.01"}]
+        positions, fresh = await e.load_positions_snapshot()
+        self.assertTrue(fresh)
+        self.assertEqual([item.symbol for item in positions], [leg.symbol])
+        self.assertEqual([item.symbol for item in await e.load_positions()], [leg.symbol])
+        e.client.cancel_order.assert_not_awaited()
+        e.client.order.assert_not_awaited()
+        self.assertFalse(e.order_journal["ic-pending"]["terminal"])
+
+    async def test_position_snapshot_reports_cached_positions_under_trade_lock(self):
+        self.track()
+        async with self.engine.lock:
+            positions, fresh = await self.engine.load_positions_snapshot()
+        self.assertFalse(fresh)
+        self.assertIs(positions, self.engine.positions)
+        self.engine.client.positions.assert_not_awaited()
+
     async def test_background_loop_recovers_after_error_and_propagates_cancellation(self):
         e = self.engine
         e.reconcile_once = AsyncMock(side_effect=[RuntimeError("temporary"), None])

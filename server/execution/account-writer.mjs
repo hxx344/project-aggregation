@@ -318,10 +318,11 @@ export function createAccountWriter(options) { return new AccountWriter(options)
 
 export class AccountWriter {
   get recoveryProtectionVersion() { return RECOVERY_SCHEMA_VERSION; }
-  constructor({ databasePath, moduleId, runtimeId, ownerId = randomUUID(), pid = process.pid, now = Date.now, processAlive = defaultAlive }) {
+  // heartbeatMs only shortens the renewal beat (tests); it can never exceed the production 5s beat.
+  constructor({ databasePath, moduleId, runtimeId, ownerId = randomUUID(), pid = process.pid, now = Date.now, processAlive = defaultAlive, heartbeatMs = HEARTBEAT_MS }) {
     this.moduleId = identifier(moduleId); this.runtimeId = identifier(runtimeId); this.ownerId = identifier(ownerId);
-    if (!Number.isSafeInteger(pid) || pid <= 0 || typeof now !== 'function' || typeof processAlive !== 'function') fail('INVALID_OPTIONS');
-    this.pid = pid; this.now = now; this.processAlive = processAlive; this.retired = false; this.closed = false; this.timer = null; this.held = new Map();
+    if (!Number.isSafeInteger(pid) || pid <= 0 || typeof now !== 'function' || typeof processAlive !== 'function' || !Number.isSafeInteger(heartbeatMs) || heartbeatMs < 1 || heartbeatMs > HEARTBEAT_MS) fail('INVALID_OPTIONS');
+    this.pid = pid; this.now = now; this.processAlive = processAlive; this.heartbeatMs = heartbeatMs; this.retired = false; this.closed = false; this.timer = null; this.held = new Map();
     try {
       this.databasePath = safeDatabasePath(databasePath);
       if (fs.statSync(this.databasePath).size > 0) {
@@ -575,7 +576,7 @@ export class AccountWriter {
         if (error?.code === 'REGISTRY_BUSY' && !this.retired) return;
         this.retired = true; clearInterval(this.timer); this.timer = null;
       }
-    }, HEARTBEAT_MS);
+    }, this.heartbeatMs);
     this.timer.unref();
   }
   _operationTicket(ticket, operationId, bodyHash, state) { return { ...JSON.parse(JSON.stringify(ticket)), operationId, bodyHash, state }; }
@@ -684,7 +685,7 @@ export class AccountWriter {
       const accounts = this.db.prepare('SELECT authority,environment,module_id,lease_until,owner_id FROM aw_accounts ORDER BY authority,environment,module_id').all();
       const current = this.now();
       const isolations = this.db.prepare('SELECT authority,environment,reason,module_id FROM aw_isolations ORDER BY authority,environment,module_id').all().map((row) => ({ authority: row.authority, environment: row.environment, reason: row.reason, moduleId: row.module_id }));
-      return { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations, recovery };
+      return { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations, recovery, writerRetired: this.retired };
     } catch (error) { this._error(error); }
   }
   close() {

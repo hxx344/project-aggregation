@@ -9,6 +9,7 @@ import { bindPositionAction, positionKey, positionDirection, validatePositionLeg
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
 const ACTIVE = new Set(['NEW', 'OPEN', 'PARTIALLY_FILLED']);
 const REMOTE = new Set([...ACTIVE, 'FILLED', 'CANCELLED', 'FAIL', 'REJECT']);
+const POSITION_PROJECTION_WAIT_MS = 30000, POSITION_PROJECTION_TOLERANCE_MS = 1000, HISTORY_LOOKBACK_MS = 7 * 86400000;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy = value => JSON.parse(JSON.stringify(value));
 const id = () => randomUUID();
@@ -322,17 +323,23 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   async function reconcileOrder(order, client, knownOrders, deadline = Infinity) {
     // Once an order id is known it is the only identity: external clients (web/app) can share one text.
     const matches = o => order.orderId ? String(o.order_id) === order.orderId : o.text === order.text;
-    let result = knownOrders.find(matches);
+    let result = knownOrders.find(matches), beyondHistory = false;
     if (!result) {
       try { result = await withinDeadline(() => client.getOrder(order.orderId || order.text), deadline); }
       catch {
-        try { const history = await withinDeadline(() => client.getHistoryOrders({ symbol: order.symbol, from: order.createdAt - 60000, to: clock() }), deadline);
+        // Gate filters history by exchange creation time. An external order is
+        // recorded only when cancelled, so its own create_time bounds the window.
+        // The lookback is bounded so one very old order cannot turn every
+        // refresh into a full-account history scan beyond the page limit.
+        const exchangeCreated = Number(order.raw?.create_time), since = Number.isSafeInteger(exchangeCreated) && exchangeCreated > 0 ? Math.min(order.createdAt, exchangeCreated) : order.createdAt;
+        const earliest = clock() - HISTORY_LOOKBACK_MS; beyondHistory = since - 60000 < earliest;
+        try { const history = await withinDeadline(() => client.getHistoryOrders({ symbol: order.symbol, from: Math.max(0, since - 60000, earliest), to: clock() }), deadline);
           if (Array.isArray(history)) result = history.find(matches);
         } catch { /* Missing history never proves an order was not accepted. */ }
       }
     }
     if (result) applyResult(order, result);
-    else if (mayPersist()) { order.status = order.status === 'CANCEL_PENDING' ? 'CANCEL_PENDING' : 'UNKNOWN'; order.error = '未能确认原订单状态；不会重新发单，请等待或在交易所核对'; writeOrder(order); }
+    else if (mayPersist()) { order.status = order.status === 'CANCEL_PENDING' ? 'CANCEL_PENDING' : 'UNKNOWN'; order.error = beyondHistory ? '订单创建早于历史查询上限（7 天），无法自动确认终态；不会重新发单，请在交易所核对' : '未能确认原订单状态；不会重新发单，请等待或在交易所核对'; writeOrder(order); }
   }
   async function readConnectionAccount(client, exchangeType) {
     try { return { account: await bounded(client.getAccount(exchangeType)), exchangeType }; }
@@ -523,12 +530,32 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!positive(plan.limits?.maxTotalNotional) || total.gt(plan.limits.maxTotalNotional)) fail('订单超过账户总名义额上限');
     checkCooldown(plan);
   }
+  // L054: a fresh REST read can still return the pre-fill position. For a
+  // bounded window after a fill, the direction the plan trades must carry an
+  // exchange update time covering it; otherwise the old quantity would size the
+  // order. Gate orders expose no separate fill time: update_time can be the IOC
+  // auto-cancel moment just after the last fill, hence a small tolerance. A
+  // missing position timestamp cannot prove the fill and also waits, but only
+  // until the window ends, so it never freezes trading.
+  function checkPositionProjection(plan, cache) {
+    const single = cache.account?.position_mode === 'SINGLE', version = connectionRecord()?.version;
+    const sideKey = (symbol, side) => single ? symbol : `${symbol}:${side}`;
+    const traded = new Set(plan.legs.map(l => sideKey(l.symbol, l.positionSide)));
+    for (const order of orderRecords()) {
+      const filledAt = Number(order.raw?.update_time);
+      if (order.version !== version || !traded.has(sideKey(order.symbol, order.positionSide)) || !TERMINAL.has(order.status) || !positive(order.executedQty) || !Number.isSafeInteger(filledAt) || filledAt <= 0 || clock() - filledAt >= POSITION_PROJECTION_WAIT_MS) continue;
+      const rows = cache.positions.filter(p => sideKey(p.symbol, p.position_side) === sideKey(order.symbol, order.positionSide));
+      // A fully reduced position may be omitted; a remaining old row is not proof.
+      if (rows.length ? rows.some(p => !(Number(p.update_time) >= filledAt - POSITION_PROJECTION_TOLERANCE_MS)) : !order.reduceOnly) fail('持仓尚未反映最近成交，请稍后刷新再操作');
+    }
+  }
   function checkConflicts(plan, cache) {
     if (activeOrders().some(o => ['UNKNOWN', 'INVALID', 'SENDING', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state))) fail('存在未知或待确认订单，暂停新的交易');
     if (['open', 'position'].includes(plan.kind) && (activeOrders().length || cache.openOrders.some(o => !TERMINAL.has(o.state)))) fail('账户仍有活动委托，请先核实或撤销挂单后再调整仓位');
     const symbols = new Set(plan.legs.map(l => l.symbol));
     if (activeOrders().some(o => symbols.has(o.symbol)) || cache.openOrders.some(o => symbols.has(o.symbol) && !TERMINAL.has(o.state))) fail('同一合约已有挂单，请先核实或手动撤单');
     if (plan.kind === 'open' && cache.positions.some(p => symbols.has(p.symbol) && !D(p.position_qty).isZero())) fail('同一合约已有实际持仓，请先管理现有敞口');
+    checkPositionProjection(plan, cache);
   }
   function direction(p, mode = cacheRecord().account?.position_mode) {
     return positionDirection(p, mode);

@@ -87,6 +87,27 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
             self.assertEqual(dec(saved["margin_limit"]), dec("1e-50"))
             self.assertEqual(saved["min_open_leverage"], 10)
 
+    def test_amounts_use_the_dashboard_decimal_grammar(self):
+        # Python Decimal accepts these, but the dashboard editors cannot reopen them (L044).
+        original = self.f.store.account("test")
+        for field, value in (("threshold", "1_000"), ("threshold", "\uff11\uff10\uff10\uff10"), ("threshold", "-0"),
+                             ("order_notional", "1_000"), ("margin_limit", "0.5_0"), ("margin_limit", "5e-1000")):
+            with self.subTest(field=field, value=value):
+                response = self.update({field: value})
+                self.assertIn(response.status_code, (409, 422), response.text)
+                self.assertEqual(self.f.store.account("test"), original)
+        for field, value in (("threshold", "+1000"), ("threshold", " 1e3 "), ("margin_limit", ".5")):
+            with self.subTest(field=field, value=value):
+                self.assertEqual(self.update({field: value}).status_code, 200)
+        with self.assertRaisesRegex(TradingError, "普通十进制数"):
+            from trading.pairing import validate_pair
+            validate_pair({"id": "gold", "name": "gold", "long_account_id": "a", "short_account_id": "b",
+                           "ordinary": {"enabled": True, "threshold": "-0"}})
+        for value in ("1_000", "\uff11\uff10\uff10\uff10"):
+            with self.subTest(pair_threshold=value), self.assertRaisesRegex(TradingError, "普通十进制数"):
+                validate_pair({"id": "gold", "name": "gold", "long_account_id": "a", "short_account_id": "b",
+                               "ordinary": {"enabled": True, "threshold": value}})
+
     def test_invalid_updates_are_atomic_and_do_not_persist_any_other_supplied_field(self):
         invalid = [{"min_open_leverage": value} for value in (None, True, False, 0, 1, 2, 4, 7, 125, 126, 5.0, 1.5, "5", [], {})]
         invalid += [{"margin_limit": value} for value in (None, True, False, 0.7, "0", "-0.1", "1.00001", "NaN", "Infinity", "")]

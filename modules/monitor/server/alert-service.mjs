@@ -40,7 +40,7 @@ export function createAlertService(store, { getQuote = loadQuote, deliver = send
   const check = () => {
     if (stopped) return Promise.resolve();
     if (pendingPoll) return pendingPoll;
-    pendingPoll = serial(async () => {
+    const evaluate = serial(async () => {
       const state = store.get();
       let quote;
       try {
@@ -53,38 +53,53 @@ export function createAlertService(store, { getQuote = loadQuote, deliver = send
         state.status.checkedAt = new Date(clock()).toISOString();
         state.status.lastError = liveQuoteError;
         await persist(state);
-        return;
+        return null;
       }
       const now = clock();
       state.status = { checkedAt: new Date(now).toISOString(), lastSuccessAt: new Date(now).toISOString(), lastError: "", lastQuote: quote };
       const evaluated = evaluateRules(state.config, state.ruleStates, quote.premium, now);
       state.ruleStates = evaluated.states;
       const rules = evaluated.triggered;
-      if (!rules.length || (notifications && !notifications.configured())) { await persist(state); return; }
+      if (!rules.length || (notifications && !notifications.configured())) { await persist(state); return null; }
       for (const rule of rules) state.ruleStates[rule.id].lastAttemptAt = now;
       // Persist the attempt before external delivery; restart cannot cause immediate retries.
       await persist(state);
       if (!isFreshQuote(quote, clock())) {
         state.status.lastError = "报价在发送前已过期，等待下一轮实时报价。";
         await persist(state);
-        return;
+        return null;
       }
+      return { quote, rules, now, config: state.config };
+    });
+    pendingPoll = evaluate.then(async pending => {
+      if (!pending) return;
+      const { quote, rules, now, config } = pending;
       const text = formatAlert(quote, rules);
+      let failure = null;
+      // The configuration queue is released during network delivery; pendingPoll keeps checks single-flight.
       try {
         if (notifications) await notifications.send(text, () => {
           if (!isFreshQuote(quote, clock())) throw new Error("报价在发送前已过期，等待下一轮实时报价。");
         });
-        else await deliver(state.config, text, { now });
-        for (const rule of rules) {
-          state.ruleStates[rule.id].armed = false;
-          state.ruleStates[rule.id].lastSentAt = clock();
+        else await deliver(config, text, { now });
+      } catch (error) { failure = error; }
+      await serial(async () => {
+        const state = store.get();
+        // Only tiers still holding this attempt take its result; an edited tier starts fresh.
+        const attempted = rules.map(rule => state.ruleStates[rule.id]).filter(ruleState => ruleState?.lastAttemptAt === now);
+        if (!failure) {
+          for (const ruleState of attempted) { ruleState.armed = false; ruleState.lastSentAt = clock(); }
+          record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "sent", premium: quote.premium, rules: rules.map(rule => rule.name), error: "" });
+        } else {
+          // An uncertain delivery may already have posted: wait for a re-entry beyond hysteresis instead of resending.
+          // It counts as sent for the cooldown, so a quick re-entry is not a second message within it.
+          if (failure.uncertain) for (const ruleState of attempted) { ruleState.armed = false; ruleState.lastSentAt = clock(); }
+          const message = failure.uncertain ? "飞书投递结果不确定（可能已发出），不再重发；溢价回到回差以外后再次达标才会提醒。" : failure.message;
+          state.status.lastError = message;
+          record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "failed", premium: quote.premium, rules: rules.map(rule => rule.name), error: message });
         }
-        record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "sent", premium: quote.premium, rules: rules.map(rule => rule.name), error: "" });
-      } catch (error) {
-        state.status.lastError = error.message;
-        record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "failed", premium: quote.premium, rules: rules.map(rule => rule.name), error: error.message });
-      }
-      await persist(state);
+        await persist(state);
+      });
     }).finally(() => { pendingPoll = undefined; });
     return pendingPoll;
   };
@@ -146,6 +161,6 @@ export function createAlertService(store, { getQuote = loadQuote, deliver = send
       polling = setInterval(tick, 10_000);
       tick();
     },
-    async stop() { stopped = true; clearInterval(polling); polling = undefined; await queue; },
+    async stop() { stopped = true; clearInterval(polling); polling = undefined; await pendingPoll?.catch(() => {}); await queue; },
   };
 }

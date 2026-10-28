@@ -8,6 +8,17 @@ import { accountSnapshotView } from './account-modes.ts';
 import { pairHasPending, pairMarginOnly, type Pair } from './pairs.ts';
 import { pairScheduledMarginWait } from './pair-notices.ts';
 
+// L040: a paired member shows the pair runtime snapshot, whose validity stays
+// eight seconds. The single-account display cadence (at least 60 seconds for
+// paired members) must not stretch it; only a margin-only pair has its own
+// scheduled check, and only while nothing is pending. A member whose pair is
+// not loaded uses the strict rule.
+export function pairedSnapshotRefresh(account?: Account, pair?: Pair) {
+  if (pair && pairMarginOnly(pair) && !pairHasPending(pair))
+    return { interval_seconds: Math.max(8, pair.margin.check_interval_seconds) };
+  return pair || account?.pair_id ? undefined : account?.snapshot_refresh;
+}
+
 export function latestPositionsSnapshot(
   ...candidates: (PositionsSnapshot | null | undefined)[]
 ): PositionsSnapshot | undefined {
@@ -90,14 +101,11 @@ export function accountPositionsView({
     displayError ||
     (!fromDisplay && account?.status === 'error' ? account.reason : undefined);
   const marginOnly = Boolean(pair && pairMarginOnly(pair));
-  const refresh = marginOnly
-    ? { interval_seconds: Math.max(8, pair!.margin.check_interval_seconds) }
-    : account?.snapshot_refresh;
   let view = accountSnapshotView(
     snapshot,
     now,
     connectionError,
-    refresh,
+    pairedSnapshotRefresh(account, pair),
     error,
   );
   const scheduled =

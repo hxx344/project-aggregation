@@ -1,4 +1,4 @@
-import type { Asset, FxStatus } from './types.ts';
+import type { Asset, Connection, FxStatus } from './types.ts';
 
 type ValuedRow = { value: number | null; mode?: string | null; quantity?: number | null };
 export const UNKNOWN_QUANTITY_ERROR = '持仓数量未知，请填写数量后计算估值';
@@ -42,9 +42,23 @@ export function workbookMissingValueSql(row: string) {
   return `(${missingValueSql(row)} AND NOT (${blank}))`;
 }
 
-export function snapshotValues(assets: readonly Asset[], fxStatus: Pick<FxStatus, 'error'>, now = Date.now()) {
+const EXCHANGE_MODES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational'] as const;
+type ExchangeConnections = Record<(typeof EXCHANGE_MODES)[number], Pick<Connection, 'configured'>>;
+
+/** Exchanges whose credentials are currently saved; Aster counts as configured while any account is. */
+export function configuredExchanges(connections: ExchangeConnections): string[] {
+  return EXCHANGE_MODES.filter(mode => connections[mode].configured);
+}
+
+/**
+ * An exchange row with no saved connection keeps its workbook or last synced valuation and is no longer
+ * expected to refresh, so its age and previous error do not make the snapshot partial; an unknown value still does.
+ * Without connection context every non-manual row stays subject to the freshness check.
+ */
+export function snapshotValues(assets: readonly Asset[], fxStatus: Pick<FxStatus, 'error'>, now = Date.now(), connected?: readonly string[]) {
   const values = sumKnownValues(assets);
-  const partial = values.partial || !!fxStatus.error || assets.some(asset => asset.mode !== 'manual' &&
+  const retained = (asset: Asset) => connected !== undefined && (EXCHANGE_MODES as readonly string[]).includes(asset.mode) && !connected.includes(asset.mode);
+  const partial = values.partial || !!fxStatus.error || assets.some(asset => asset.mode !== 'manual' && !retained(asset) &&
     (!!asset.error || !Number.isFinite(Date.parse(asset.updatedAt)) || now - Date.parse(asset.updatedAt) > 900_000));
   return { ...values, partial };
 }

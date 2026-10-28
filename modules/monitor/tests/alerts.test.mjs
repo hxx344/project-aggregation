@@ -294,3 +294,42 @@ test("saved per-rule seconds and hysteresis survive restart with sent state inta
   now = 190000; await restarted.check(); assert.equal(sent, 2);
   await restarted.stop();
 });
+
+test("an uncertain Feishu delivery is not resent while the premium stays above; a definite failure still retries", async () => {
+  let now = 100000, premium = 45, attempts = 0, failure = Object.assign(new Error("飞书连接失败或超时"), { uncertain: true });
+  const cooldownMs = DEFAULT_CONFIG.cooldownSeconds * 1000;
+  const service = createAlertService(memoryStore(), { clock: () => now, getQuote: async () => point(premium, now), deliver: async () => { attempts++; if (failure) throw failure; } });
+  await service.update({ ...config([rule("up", 40)]), revision: 0 });
+  await service.check(); assert.equal(attempts, 1);
+  assert.equal(service.view().ruleStates.up.armed, false);
+  assert.match(service.view().history[0].error, /不确定.*不再重发/);
+  now += 31000; await service.check(); assert.equal(attempts, 1, "uncertain delivery may already have posted");
+  now += 10000; premium = 39.4; await service.check();
+  now += 10000; premium = 41; await service.check(); assert.equal(attempts, 1, "a possibly posted message still holds the cooldown");
+  now += 31000; premium = 39.4; await service.check();
+  now += cooldownMs; premium = 41; failure = Object.assign(new Error("飞书返回 HTTP 400。"), { uncertain: false }); await service.check(); assert.equal(attempts, 2, "re-entry after hysteresis and cooldown alerts again");
+  now += 31000; failure = null; await service.check(); assert.equal(attempts, 3, "definite failure retries while the signal holds");
+});
+
+test("saving alert settings is not blocked by an in-flight delivery, and the delivery result keeps the saved settings", async () => {
+  let now = 100000, release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const service = createAlertService(memoryStore(), { clock: () => now, getQuote: async () => point(45, now), deliver: async () => { entered(); await blocked; } });
+  await service.update({ ...config([rule("up", 40)]), revision: 0 });
+  const checking = service.check(); await started;
+  const saved = await Promise.race([service.update({ ...config([rule("up", 40)]), cooldownSeconds: 600, revision: 1 }), new Promise(resolve => setTimeout(() => resolve("blocked"), 100))]);
+  release(); await checking;
+  assert.notEqual(saved, "blocked");
+  const view = service.view();
+  assert.equal(view.config.cooldownSeconds, 600); assert.equal(view.revision, 2);
+  assert.equal(view.ruleStates.up.armed, false); assert.equal(view.history[0].status, "sent");
+  let stopRelease; const stopBlocked = new Promise(resolve => { stopRelease = resolve; });
+  const stopper = createAlertService(memoryStore(), { clock: () => now, getQuote: async () => point(45, now), deliver: async () => { await stopBlocked; } });
+  await stopper.update({ ...config([rule("up", 40)]), revision: 0 });
+  void stopper.check(); await new Promise(resolve => setTimeout(resolve, 10));
+  let stopped = false; const stopping = stopper.stop().then(() => { stopped = true; });
+  await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(stopped, false, "stop waits for the in-flight delivery");
+  stopRelease(); await stopping; assert.equal(stopper.view().history[0].status, "sent");
+});

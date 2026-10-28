@@ -208,9 +208,11 @@ class PairSubmitEvidenceTests(TestCase):
         f.assert_baseline()
 
     def test_unknown_error_code_cannot_be_classified_from_message(self):
+        # The message names a whitelisted code, but only the typed code and a
+        # successful original-ID read count; a failed read keeps it unknown.
         f = self.fixture()
         with patch.object(f.brokers["long"], "submit", side_effect=ExchangeError(REJECTION, code=-98765)), \
-                patch.object(f.brokers["long"], "query", side_effect=ExchangeError("not found", code=-2013)):
+                patch.object(f.brokers["long"], "query", side_effect=ExchangeError("Aster 网络连接失败")):
             state = f.tick()
             f.trader = PairTrader(f.engine)
             state = f.tick()
@@ -218,6 +220,43 @@ class PairSubmitEvidenceTests(TestCase):
         self.assertEqual(leg["submit_evidence"], {"kind": "exchange_error", "code": -98765, "retry_after": 0})
         self.assertIsNone(leg["receipt"])
         self.assertEqual(state["pending"]["repairs"], [])
+
+    def test_unknown_error_code_with_clean_absent_lookup_repairs_other_leg(self):
+        f = self.fixture()
+        with patch.object(f.brokers["long"], "submit", side_effect=ExchangeError(
+                "Aster 拒绝请求（代码 -4164）：min notional", code=-4164, http_status=400)), \
+                patch.object(f.brokers["long"], "query", side_effect=ExchangeError(
+                    "Order does not exist.", code=-2013, http_status=400)) as query:
+            state = f.tick()
+            for _ in range(3):
+                if state["phase"] == "repairing":
+                    break
+                f.trader = PairTrader(f.engine)
+                state = f.tick()
+        self.assertEqual(state["phase"], "repairing", state)
+        self.assertGreaterEqual(query.call_count, 1)
+        leg = state["pending"]["legs"][0]
+        self.assertEqual((leg["receipt"]["status"], leg["receipt"]["reject_code"], leg["receipt"]["query_absent"]),
+                         ("REJECTED", -4164, True))
+        self.assertFalse(leg["receipt"]["local_not_sent"])
+        self.assertIsNone(f.tick()["pending"])
+        f.assert_baseline()
+
+    def test_clean_absent_lookup_cannot_reject_uncertain_submissions(self):
+        errors = (AmbiguousOrder("Aster 请求超时，需核对订单", code=-1007),
+                  ExchangeError("timeout", code=-1007, http_status=400),
+                  ExchangeError("gateway", code=-4164, http_status=503))
+        for error in errors:
+            with self.subTest(code=error.code, status=error.http_status):
+                f = self.fixture()
+                with patch.object(f.brokers["long"], "submit", side_effect=error), \
+                        patch.object(f.brokers["long"], "query", side_effect=ExchangeError(
+                            "Order does not exist.", code=-2013, http_status=400)):
+                    state = f.tick()
+                    f.trader = PairTrader(f.engine)
+                    state = f.tick()
+                self.assertIsNone(state["pending"]["legs"][0]["receipt"])
+                self.assertEqual(state["pending"]["repairs"], [])
 
     def test_invalid_structured_responses_do_not_prove_rejection(self):
         responses = ({"code": -5018}, [], [{"code": -5018}, {"code": -5018}],

@@ -12,7 +12,8 @@ import time
 import uuid
 
 from .exchange import (AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent,
-                       LeverageRejected, ORDER_REJECTION_CODES, api_wait_notice)
+                       LeverageRejected, ORDER_REJECTION_CODES, api_wait_notice, definitive_order_error,
+                       order_absent)
 from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, positive, wire, floor_step, opening_margin_limit
@@ -592,6 +593,7 @@ class PairTrader:
         pending = state.get("pending") or {}
         writer = writer_for(self.engine)
         operation = None
+        new_dispatch = None
         if writer.enabled:
             if not isinstance(pending.get("id"), str) or not pending["id"]:
                 raise PairPositionError("受管理配对发送缺少持久原批次标识，未发送请求")
@@ -605,6 +607,7 @@ class PairTrader:
                 if len(dispatches) == 32:
                     raise PairPositionError("配对发送分组达到恢复上限，停止发送并保留原订单")
                 dispatches.append(dispatch)
+                new_dispatch = (dispatches, dispatch)
         # A crash between this commit and HTTP leaves an uncertain request, not
         # permission to repeat it. Each leg retains its own durable client ID.
         for leg in legs:
@@ -674,7 +677,24 @@ class PairTrader:
                 paired_error = exc if isinstance(exc, RequestNotSent) else RequestNotSent(
                     str(exc), retry_after=getattr(exc, "retry_after", 0))
         batch = writer.batch(operation, {"orders": [leg["order"] for leg in legs]}) if writer.enabled else nullcontext()
-        with batch, ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order") as pool:
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(batch)
+            except RequestNotSent as exc:
+                # Shared admission refused before any HTTP: record the same
+                # durable no-send receipt a refused leg gets, not "sending".
+                evidence = self._submit_evidence("request_not_sent", error=exc)
+                for leg in legs:
+                    leg["receipt"] = {**self._absent(leg["order"], str(exc)),
+                                      "retry_after": max(1, evidence.get("retry_after", 0))}
+                    leg["error"], leg["submit_evidence"], leg["submit_error"] = None, evidence, str(exc)
+                if new_dispatch is not None:
+                    # Nothing was prepared, so this group has no shared operation;
+                    # a lasting refusal must not use up the bounded group list.
+                    new_dispatch[0].remove(new_dispatch[1])
+                self._save(pair, state)
+                return
+            pool = stack.enter_context(ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-order"))
             futures = [(leg, pool.submit(writer.wrap(send), leg)) for leg in legs]
             for index, (leg, future) in enumerate(futures):
                 receipt, error, evidence = future.result()
@@ -708,11 +728,25 @@ class PairTrader:
         return {**self._absent(order, original_reason, local=False), "reject_code": -2029,
                 "recovered_from_submit_error": True}
 
+    def _queried_rejection(self, leg, exc):
+        """An explicit non-whitelisted submit code plus a clean -2013 for that ID."""
+        evidence = leg.get("submit_evidence")
+        if (leg.get("receipt") is not None or leg.get("dispatch") != "sending"
+                or leg.get("submit_evidence_version") != 2 or not isinstance(evidence, dict)
+                or evidence.get("kind") != "exchange_error"
+                or not definitive_order_error(evidence.get("code"), evidence.get("http_status"))
+                or not order_absent(exc)):
+            return None
+        reason = leg.get("submit_error") or f"Aster 拒绝订单（代码 {evidence['code']}）"
+        return {**self._absent(leg["order"], reason + "；按原客户端编号查询确认订单不存在", local=False),
+                "reject_code": evidence["code"], "query_absent": True}
+
     def _query(self, pair, state, brokers):
         symbol = pair["symbol"]
         require_runtime_symbols(pair, state)
         pending = state["pending"]
         writer_for(self.engine).settle_pair(pair, state)
+        queried_absent = False
         for leg in pending["legs"] + pending["repairs"]:
             receipt, order = leg.get("receipt"), leg["order"]
             if receipt is not None:
@@ -772,9 +806,16 @@ class PairTrader:
                 if notice is not None:
                     state["api_notice"] = notice
                 restored = self._legacy_notional_rejection(pending, leg, exc)
+                if restored is None and not active:
+                    restored = self._queried_rejection(leg, exc)
                 if restored is not None:
                     leg["receipt"] = restored
+                    queried_absent = queried_absent or restored.get("query_absent") is True
             self._save(pair, state)
+        if queried_absent:
+            # The private journal now proves non-submission; settle the shared
+            # operation in this round so a repair is not refused as unresolved.
+            writer_for(self.engine).settle_pair(pair, state)
         return all(leg.get("receipt") and leg["receipt"]["status"] in TERMINAL
                    for leg in pending["legs"] + pending["repairs"])
 

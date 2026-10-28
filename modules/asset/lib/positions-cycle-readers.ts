@@ -6,7 +6,7 @@ import { decimal, rows, text, POSITIONS_INVALID } from './positions-values.ts';
 import { CYCLE_CURRENCY, CYCLE_LOOKBACK_MS, CYCLE_MISMATCH, cycleUnavailable, locateCycle, negate, newestFirst, summarizeCycle } from './positions-cycle.ts';
 import type { CycleCash, CycleFill } from './positions-cycle.ts';
 
-import { WEEK, SNAPSHOT_SKEW_MS, MAX_FILLS, TOO_MANY, CycleUnavailable, historyContext as context, millis, identifier, positive, bybitAmount, historyWindows as windows, binanceRange, bybitPages, okxFillPages, BYBIT_FILLS } from './positions-history.ts';
+import { WEEK, SNAPSHOT_SKEW_MS, MAX_FILLS, TOO_MANY, CycleUnavailable, historyContext as context, millis, identifier, positive, bybitAmount, binanceRange, bybitPages, okxFillPages, BYBIT_FILLS, latestOpenWindows, BINANCE_LATEST_WINDOW_MS, BYBIT_LATEST_WINDOW_MS } from './positions-history.ts';
 import type { HistoryOptions } from './positions-history.ts';
 export { CycleUnavailable } from './positions-history.ts';
 
@@ -55,9 +55,10 @@ async function binanceCycle(c: BinanceCredential, scope: string, request: CycleR
   const pm = scope === 'pm-um', tradesPath = pm ? '/papi/v1/um/userTrades' : '/fapi/v1/userTrades', incomePath = pm ? '/papi/v1/um/income' : '/fapi/v1/income';
   const own = position.side === 'long' ? 'LONG' : 'SHORT', other = position.side === 'long' ? 'SHORT' : 'LONG', otherTimes: number[] = [];
   const range = (path: string, params: Record<string, string>, start: number, end: number) => binanceRange(ctx, path, { symbol, ...params }, start, end);
-  const walked = await walk(request, now, windows(now, async (start, end) => (await range(tradesPath, {}, start, end)).flatMap((row): CycleFill[] => {
+  // The newest window has no endTime, so fills the exchange stamped ahead of our clock are seen and ask for a retry.
+  const walked = await walk(request, now, latestOpenWindows(now - CYCLE_LOOKBACK_MS, now, BINANCE_LATEST_WINDOW_MS, async (start, end) => (await binanceRange(ctx, tradesPath, { symbol }, start, end ?? now, 0, end === null)).flatMap((row): CycleFill[] => {
     const time = millis(row.time);
-    if (row.symbol !== symbol || time < start || time > end || (row.side !== 'BUY' && row.side !== 'SELL')) throw new Error(POSITIONS_INVALID);
+    if (row.symbol !== symbol || time < start || (end !== null && time > end) || (row.side !== 'BUY' && row.side !== 'SELL')) throw new Error(POSITIONS_INVALID);
     if (row.positionSide === other) { otherTimes.push(time); return []; }
     if (row.positionSide !== 'BOTH' && row.positionSide !== own) throw new Error(POSITIONS_INVALID);
     // commission is the charged amount (positive), so the cash flow is its negation; a rebate arrives negative.
@@ -84,13 +85,13 @@ async function bybitCycle(c: BybitCredential, scope: string, request: CycleReque
   const ctx = context('bybit', c, options), now = ctx.now(), symbol = position.instrumentId, currency = scope === 'linear-usdc' ? 'USDC' : 'USDT';
   const cash: CycleCash[] = [];
   let order = 0;
-  const walked = await walk(request, now, windows(now, async (start, end) => {
+  const walked = await walk(request, now, latestOpenWindows(now - CYCLE_LOOKBACK_MS, now, BYBIT_LATEST_WINDOW_MS, async (start, end) => {
     const fills: CycleFill[] = [];
     await bybitPages(ctx, { accountType: 'UNIFIED', category: 'linear', baseCoin: position.quantityUnit,
-        currency, startTime: String(start), endTime: String(end) }, row => {
+        currency, startTime: String(start), ...(end === null ? {} : { endTime: String(end) }) }, row => {
         if (row.symbol !== symbol) return;
         const time = millis(row.transactionTime);
-        if (time < start || time > end || row.currency !== currency) throw new Error(POSITIONS_INVALID);
+        if (time < start || (end !== null && time > end) || row.currency !== currency) throw new Error(POSITIONS_INVALID);
         const id = identifier(row.id);
         if (BYBIT_FILLS.has(String(row.type))) {
           if (row.side !== 'Buy' && row.side !== 'Sell') throw new Error(POSITIONS_INVALID);
@@ -118,7 +119,8 @@ async function okxCycle(c: OkxCredential, request: CycleRequest, options: CycleO
   async function pages(path: string, params: Record<string, string>, collect: (row: Json) => void) {
     let after = '';
     for (;;) {
-      const list = rows(await ctx.get(path, { ...params, end: String(now), limit: '100', ...(after ? { after } : {}) }));
+      // No end bound: a funding bill stamped ahead of our clock still belongs to the held position.
+      const list = rows(await ctx.get(path, { ...params, limit: '100', ...(after ? { after } : {}) }));
       for (const row of list) {
         const billId = identifier(row.billId);
         if (!/^\d+$/.test(billId) || (after && BigInt(billId) >= BigInt(after))) throw new Error(POSITIONS_INVALID);
@@ -129,7 +131,8 @@ async function okxCycle(c: OkxCredential, request: CycleRequest, options: CycleO
     }
   }
   // fills-history pages by billId, newest first; each call reads one page so the walk can stop at the opening fill.
-  const pagesNext = okxFillPages(ctx, instId, Number(begin), now);
+  // No end bound, so fills stamped ahead of our clock are seen and ask for a retry.
+  const pagesNext = okxFillPages(ctx, instId, Number(begin));
   const next = async () => {
     const list = await pagesNext();
     if (!list) return null;

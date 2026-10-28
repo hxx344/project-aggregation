@@ -13,7 +13,7 @@ from .pair_legacy import without_cycle, has_legacy_cycle, require_no_legacy_cycl
 from .adl_config import validate_adl
 from .exchange import LiveBroker
 from .margin_balance import DEFAULT_MARGIN, validate_margin
-from .models import AccountModeError, TradingError, dec, positive, wire
+from .models import AccountModeError, TradingError, dec, decimal_text, positive, wire
 
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, get_symbol_config, validate_symbol
 from .account_writer import protected_pair_id
@@ -25,8 +25,7 @@ PAIR_FIELDS = {"id", "name", "long_account_id", "short_account_id", "symbol", "e
 
 def _decimal_fields(config, keys):
     for key in keys:
-        if not isinstance(config[key], str) or len(config[key]) > 128:
-            raise TradingError("配对金额及比例必须为十进制字符串")
+        decimal_text(config[key], "配对金额及比例必须为普通十进制数")
         config[key] = wire(positive(config[key], True))
 
 

@@ -49,7 +49,7 @@ async function fixture(t, options = {}) {
     }
     if (method === 'stop') { if (guarded) args[2].beforeMutation(); Object.assign(record, { status: 'terminal', terminal: true, childrenSettled: true }); }
   }]));
-  const create = () => createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, accountWriter: writer, ...executionOptions });
+  const create = (overrides = {}) => createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: factory, accountWriter: writer, ...executionOptions, ...overrides });
   instance = create();
   t.after(async () => { await instance.close(); writer?.close(); db.close(); if (directory) rmSync(directory, { recursive: true, force: true }); });
   await instance.initializeProtection();
@@ -132,6 +132,25 @@ test('managed final transport rejects a changed binding, preserves the durable i
   const local = f.db.prepare('SELECT json FROM execution_orders').all().map(row => JSON.parse(row.json)).find(row => row.exchange === 'binance');
   assert.equal(local.remoteId, null); assert.equal(local.writerOperation.state, 'sending');
   assert.equal(f.service.stop(f.job.id, {}).jobs[0].stopRequested, true);
+});
+
+test('managed stop accepted after the account writer retires still ends stopped after restart', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  assert.equal(f.creates.length, 2);
+  f.writer.retired = true; // As after a heartbeat LEASE_EXPIRED: no further account write is admitted.
+  const accepted = f.service.stop(f.job.id, {}).jobs[0];
+  assert.equal(accepted.stopRequested, true); assert.equal(accepted.status, 'running');
+  assert.ok(f.service.state().connections.every(row => /所有权已失效/.test(row.writeProtection.reason)));
+  await f.service.close(); f.writer.close();
+  const writer = createAccountWriter({ databasePath: join(f.directory, 'execution-control.sqlite'), moduleId: 'hub', runtimeId: randomUUID(), now: () => f.time });
+  try {
+    f.service = f.create({ accountWriter: writer }); await f.service.initializeProtection(); await f.service.tick();
+    assert.equal(f.job.status, 'stopped');
+    assert.ok(f.service.state().connections.every(row => !/所有权已失效/.test(row.writeProtection.reason ?? '')));
+    assert.equal(f.creates.length, 2);
+    assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM execution_locks').get().count, 0);
+  } finally { await f.service.close(); writer.close(); }
 });
 
 test('managed unknown native amendment permits only cancellation of the verified original order', async t => {

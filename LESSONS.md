@@ -627,6 +627,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **2026-10-17 补充证据：** 基线 `d135996` 的配对恢复虽然限制原单查询次数，观察期仍每约 3 秒读取两侧交易快照，现实核验失败后又按待处理调度反复读取。`_read_members` 强制刷新账户模式并另查两侧全账户挂单，冷读预估 `2 × (72 + 40) = 224` 权重，与用户截图中的准入需求相符。市价恢复移除全账户挂单查询与显示专用重复快照，失败期限持久化，自动、手动及重启共同遵守；最终持仓、模式与身份新鲜度不变。发送前 `_config_guard` 的失败也须归为结构化“未发送”，而实际 POST 的未知结果仍保留。固定差异 `4229052` 的离线时序复现另发现：活动回执若在原编号检查后、快照捕获新代次前到达，仅靠快照代次仍可提前结束批次；恢复须在快照后再次补读本地回执，并在原身份、快照锁和事务 CAS 保护下持久化，不能等缓存过期后丢失已知活动状态。对应 [恢复预算检查](modules/aster/tests/test_pair_recovery_budget.py)、[未知单观察检查](modules/aster/tests/test_pair_unknown_observation.py)、[晚到回执检查](modules/aster/tests/test_pair_late_receipt_recovery.py) 及发送证据检查；本地离线结果不表示已验证服务器现场。事件 `pair-recovery-weight-starvation-20261017`。
 
+**2026-10-28 补充：** `-2013`（查无订单）只有在原始错误码是确定性错误时才能证明未提交；`-1000`/`-1001`/`-1006`/`-1007` 与 408/5xx 等不确定提交即使查不到订单，也仍按有界恢复流程处理，见 L062 批量逐条判定。
+
 **ADL 路径补充：** 同日核查基线 `7642f4e` 时，[ADL 控制器](modules/aster/trading/adl.py) 的两侧现场每轮消耗 `2 × (5 + 5 + 30 + 40) = 160` 权重；本地注入连续三次明确未发送的预算拒绝，第四轮被误判为“连续三批未成交”并永久停止。现场读取的 120 秒预算等待也被统一改成 10 秒。市价订单路径按持久记录确认类型后省去全账户挂单、整组准入降至 80 权重；缺少类型或非市价记录仍保留完整核验。明确未发送保留审计但不占实际批次与未成交上限，现场及完成后观察共同遵守持久重试期限。等待期间只补读本地流回执，已知活动原单持续按原编号低频追踪至终态；完成后观察及新 ADL 事件也必须继承这些原单，不能因缓存过期、旧归档标记或新事件丢失。旧升杠杆记录兼容现有字段，并按最近可能发送时间保留观察窗口。[ADL 预算检查](modules/aster/tests/test_adl_budget.py)、[恢复检查](modules/aster/tests/test_adl_recovery.py) 和 [存活性与晚到回执检查](modules/aster/tests/test_adl_liveness.py) 覆盖这些离线故障场景及重启、身份、事务竞争；保证金待核对日志不阻止 ADL 接管，也不被清空。此为上述恢复问题的 ADL 路径补齐，不另计复发日期。
 
 ### L040：显示调度周期不能延长配对快照有效期
@@ -718,6 +720,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基于 `b1426b4` 的 2026-10-15 单币额度条件开发中，只读联检确认首版 [后端校验](modules/aster/trading/monitoring.py) 直接使用 `monitor.number`，与 [前端条件解析](modules/aster/dashboard/lib/monitoring-notifications.ts) 语法不同。该首版未提交；已统一校验并增加 API、Store 和前端回归。
 
 **事件记录：** `aster-capacity-condition-input-grammar-20261015`；一次首次提交前审查发现，不推进主线复盘检查点。
+
+**2026-10-28 补充：** 策略更新与配对 API 入口也通过 [`models.decimal_text`](modules/aster/trading/models.py) 强制同一小数语法（仅字符串、长度 ≤128、指数绝对值 ≤100），与看板解析一致。
 
 ### L045：全历史收益必须核对服务端读取窗口
 
@@ -1010,6 +1014,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **新增独立事件：** `aster-margin-preflight-shared-unknown-20261019`，同次用户故障定位及连续修补；历史复盘检查点不变。
 
 **同类拒绝补全：** 实际 HTTPX 回归还复现 HTTP400/既有明确拒绝码 `-2019` 后私库 rejected、共享 UNKNOWN，下一轮无法发出。划转专用类型只沿用既有拒绝白名单和固定端点；单次已发送请求的明确拒绝也须先持久化原体回执再结算。不能将“已发送”直接等同“已接受”，也不能把多笔批次中一笔拒绝推广为全部拒绝；混合结果、`-1007` 和网络超时继续保留 UNKNOWN。此为同一逃逸路径的补全，不新增事件。
+
+**批量逐条判定（2026-10-28）：** 用户决定改变“混合结果整批保留 UNKNOWN”：整批未知会让已提交腿的单边暴露得不到修复。ASTER 批量回包逐条判定：明确成功回执算已提交，白名单码算拒单；非白名单且无订单编号的一条只把该条记为 unknown，其余照常结算。该条按原 clientOrderId 查询：查到算已提交；仅当原始码是确定性错误（负数，且不属于 `-1000`/`-1001`/`-1006`/`-1007` 未知、内部错误、超时类，非 408/5xx）且查询返回干净的 `-2013`（非含糊、无 retry_after、HTTP 400/404/无）时，才证明未提交并结算该写入操作；查询失败、429 或上述不确定原始码一律保持 unknown 并阻塞。配对路径补记 `query_absent` 后须在同一轮先写私库、再 `settle_pair` 结算共享操作，否则紧随的补偿单会被 `ACCOUNT_UNRESOLVED` 挡在 sending；共享准入拒绝时该批腿记为 `local_not_sent`，不得停在 sending。Greeks 同理只把 Bybit 执行前拒绝码（`10001`–`10010`、`10017`/`10018`/`10024`/`10027`/`10029` 及 `110xxx` 中除 `110072`/`110079` 外）当作拒单，`10000`/`10014`/`10016` 与未登记码保持 unknown。[ASTER 保护测试](modules/aster/tests/test_account_writer.py)、[配对发送证据](modules/aster/tests/test_pair_submit_evidence.py)与 [Greeks 账户测试](modules/greeks/tests/test_account_writer.py)覆盖。此为设计调整，不新增事件。
 
 **Greeks 改单逃逸（2026-10-27）：** 已发布 `519d2e8` 的改单身份仅由原订单与正文摘要组成，审查 `6ab243e` 实测价格 `2→3→2` 时第三个新意图误中 `ALREADY_SUBMITTED` 并进入撤单核对，属于 P1 逃逸。新意图须有先持久化的独立递增序号；参数再次相同不等于同一个意图重试。原单尚有 `sending/unknown` 时不能靠换号绕过，共享旧摘要 ID 及撤单/终态核对保持兼容。[Greeks 账户测试](modules/greeks/tests/test_account_writer.py) 覆盖真实追价、重启续号、遗留未决、同单并发及状态写失败零发送。事件 `greeks-amend-intent-reuse-20261027`；不推进复盘检查点。
 

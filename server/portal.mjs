@@ -498,6 +498,9 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       if (req.method !== 'GET' || String(req.headers.upgrade).toLowerCase() !== 'websocket') throw new PortalError(400, '不支持的连接升级');
       checkedPath(req.url); browserBoundary(req, context, { websocket: true });
       const grant = authorized(req, context, project);
+      // Embedded module workers never accept upgrades, and a long-lived socket cannot hold the maintenance gate
+      // (withMutation) the way an HTTP mutation does, so refuse it here instead of tunnelling past that gate.
+      if (project.embedded) throw new PortalError(403, '内置模块不提供 WebSocket 连接');
       const target = await targetFor(project);
       if (draining) throw new PortalError(503, '项目代理已关闭');
       if (!liveGrant(grant) || req.aborted || socket.destroyed) throw new PortalError(401, '项目访问授权已失效');

@@ -125,16 +125,45 @@ class RejectionPersistenceTests(unittest.TestCase):
         self.assertIn("Example repair rejection.", messages)
         self.assertNotIn("本批未形成新增双向仓位", messages)
 
+    def test_uncertain_batch_row_code_is_not_recorded_as_rejection(self):
+        rows = [{"code": -5018, "msg": "Example long rejection."},
+                {"code": -1000, "msg": "An unknown error occurred."}]
+        with patch.object(self.f.broker, "submit", return_value=rows), \
+             patch.object(self.executor, "reconcile", return_value="simulated process stop"):
+            self.open()
+        receipts = Store(self.f.store.path).intent("test")["receipts"]
+        self.assertEqual([row["reject_code"] for row in receipts.values()], [-5018],
+                         "-1000 may hide an accepted order and stays for recovery")
+
     def test_top_level_reason_is_visible_while_existing_query_flow_continues(self):
         error = ExchangeError("Aster 拒绝请求（代码 -5018）：Example rejection.", code=-5018)
         with patch.object(self.f.broker, "submit", side_effect=error) as submit, \
-             patch.object(self.f.broker, "query", side_effect=ExchangeError("not yet visible", code=-2013)):
+             patch.object(self.f.broker, "query", side_effect=ExchangeError("Aster 网络连接失败")):
             self.open()
             self.executor.reconcile(self.f.account)
         submit.assert_called_once()
         self.assertEqual(self.f.store.intent("test")["receipts"], {})
         self.assertIn("Example rejection.", self.f.store.events()[0]["message"])
         self.assertIsNone(self.executor.last_completed_intent)
+
+    def test_top_level_rejection_settles_after_clean_absent_lookup(self):
+        error = ExchangeError("Aster 拒绝请求（代码 -4164）：Example rejection.", code=-4164, http_status=400)
+        with patch.object(self.f.broker, "submit", side_effect=error) as submit, \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError(
+                 "Order does not exist.", code=-2013, http_status=400)) as query:
+            self.open()
+        submit.assert_called_once()
+        self.assertEqual(query.call_count, 2)
+        self.assertIsNone(self.f.store.intent("test"))
+        self.assertIn("订单已核对", self.f.store.events()[0]["message"])
+
+    def test_timeout_submission_is_not_settled_by_absent_lookup(self):
+        error = ExchangeError("Aster 拒绝请求（代码 -1007）", code=-1007, http_status=400)
+        with patch.object(self.f.broker, "submit", side_effect=error), \
+             patch.object(self.f.broker, "query", side_effect=ExchangeError(
+                 "Order does not exist.", code=-2013, http_status=400)):
+            self.open()
+        self.assertEqual(self.f.store.intent("test")["receipts"], {})
 
 
 if __name__ == "__main__":

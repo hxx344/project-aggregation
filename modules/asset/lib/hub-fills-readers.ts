@@ -4,15 +4,8 @@ import type { FillMarket, ReadFill } from './hub-fills-types.ts';
 import { decimal, text, POSITIONS_INVALID } from './positions-values.ts';
 import { negate } from './positions-cycle.ts';
 import { cycleSupported } from './positions-cycle-readers.ts';
-import { historyContext, historyWindows, binanceRange, bybitPages, okxFillPages, BYBIT_FILLS, bybitAmount, positive, millis, identifier, MAX_FILLS, WEEK } from './positions-history.ts';
+import { historyContext, latestOpenWindows, binanceRange, bybitPages, okxFillPages, BYBIT_FILLS, bybitAmount, positive, millis, identifier, MAX_FILLS, BINANCE_LATEST_WINDOW_MS, BYBIT_LATEST_WINDOW_MS } from './positions-history.ts';
 import type { HistoryOptions } from './positions-history.ts';
-
-// Binance startTime-only covers 7d; reserve 120s for 60s clock skew + the 45s refresh deadline.
-const BINANCE_LATEST_WINDOW_MS = WEEK - 120_000;
-// Bybit startTime-only covers 24h since https://bybit-exchange.github.io/docs/changelog/v5#2025-04-24.
-// Read the latest 23h so the implicit end leaves 1h for clock skew and request latency.
-const BYBIT_DEFAULT_WINDOW_MS = 24 * 60 * 60_000;
-const BYBIT_LATEST_WINDOW_MS = BYBIT_DEFAULT_WINDOW_MS - 60 * 60_000;
 
 /** end anchors historical windows locally; the newest window omits the local upper bound. */
 export type FillsRequest = { market: FillMarket; start: number; end: number };
@@ -24,14 +17,7 @@ function inRange(value: unknown, start: number, end: number | null) {
   return new Date(time).toISOString();
 }
 function fillWindows<T>(request: FillsRequest, latestWindow: number, read: (start: number, end: number | null) => Promise<T[]>) {
-  // Omitting the latest endTime lets the exchange include already-executed trades ahead of our clock.
-  const latestStart = Math.max(request.start, request.end - latestWindow);
-  const older = historyWindows(latestStart - 1, read, request.start);
-  let latest = true;
-  return async () => {
-    if (latest) { latest = false; return read(latestStart, null); }
-    return older();
-  };
+  return latestOpenWindows(request.start, request.end, latestWindow, read);
 }
 
 /** A market's fixed instruments are read even when all current positions have closed.

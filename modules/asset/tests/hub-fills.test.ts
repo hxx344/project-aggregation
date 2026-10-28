@@ -394,7 +394,8 @@ test('scope cap replays before trimming and response cap keeps the globally newe
 test('scheduler allows one scope per exchange across services and markets, other exchanges in parallel, and deadline releases a stalled provider', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   const pending = deferred<ReadFill[]>(); let active = 0, maximum = 0;
-  const service = createFillsService({ now: () => at, deadline: 30, read: async () => [], fills: async () => {
+  // The default deadline: the serialization check must not race a short timeout that releases the slot (covered below).
+  const service = createFillsService({ now: () => at, read: async () => [], fills: async () => {
     active++; maximum = Math.max(maximum, active); try { return await pending.promise; } finally { active--; }
   } });
   const second = createFillsService({ now: () => at, read: async () => [], fills: async () => { maximum = Math.max(maximum, active + 1); return []; } });
@@ -413,6 +414,12 @@ test('scheduler allows one scope per exchange across services and markets, other
   const stuck = createFillsService({ now: () => at, deadline: 10, read: async () => new Promise(() => {}), fills: async () => assert.fail('deadline prevents fills') });
   await stuck.read(g.database, 'owner', g.unseal); await stuck.idle();
   assert.equal(scope(await stuck.read(g.database, 'owner', g.unseal)).status, 'error');
+  // The stalled provider never settles, yet the deadline handed its exchange slot to the next scope.
+  const h = fixture(); t.after(() => h.database.close()); await h.save();
+  let released = false;
+  const next = createFillsService({ now: () => at, read: async () => [], fills: async () => { released = true; return []; } });
+  await next.read(h.database, 'owner', h.unseal); await next.idle();
+  assert.equal(released, true);
 });
 
 test('history requests have a shared spacing reservation and refuse a page beyond the 80 request budget', async () => {

@@ -140,7 +140,7 @@ async function fixture(t, options = {}) {
     t.after(() => unregister());
   } else await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const upstreamOrigin = options.embedded ? 'http://asset.workspace.internal' : `http://127.0.0.1:${upstream.address().port}`;
-  const projects = [{ id: 'asset', enabled: true, ...(options.assetLedger ? { adapter: 'asset', autoSync: true, hasCredentials: true } : {}), apiUrl: upstreamOrigin, url: 'http://127.0.0.1:5678/?view=ledger', authOrigin: '' }, { id: 'monitor', enabled: true, apiUrl: upstreamOrigin, url: 'http://127.0.0.1:3000/?monitor=oil', authOrigin: '' }];
+  const projects = [{ id: 'asset', enabled: true, ...(options.embedded ? { embedded: true } : {}), ...(options.assetLedger ? { adapter: 'asset', autoSync: true, hasCredentials: true } : {}), apiUrl: upstreamOrigin, url: 'http://127.0.0.1:5678/?view=ledger', authOrigin: '' }, { id: 'monitor', enabled: true, apiUrl: upstreamOrigin, url: 'http://127.0.0.1:3000/?monitor=oil', authOrigin: '' }];
   let portal;
   const server = http.createServer(async (req, res) => {
     options.onRequest?.(req, res);
@@ -284,6 +284,17 @@ test('portal blocks WebSocket upgrades to Asset export before opening upstream',
     req.on('response', res => { res.resume(); resolve(res.statusCode); }); req.on('upgrade', (_res, socket) => { socket.destroy(); reject(new Error('Unexpected upgrade')); }); req.on('error', reject); req.end();
   });
   assert.equal(status, 403); assert.equal(f.calls, before);
+});
+
+test('portal refuses WebSocket upgrades to embedded modules before the maintenance gate or upstream', async t => {
+  let entries = 0;
+  const f = await fixture(t, { embedded: true, withMutation: async task => { entries++; return task(); } });
+  const { cookie } = await f.authorize(); const before = f.calls;
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: f.port, path: '/ws', headers: { Host: f.host('asset'), Cookie: cookie, Origin: `http://${f.host('asset')}`, Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version': '13' } });
+    req.on('response', res => { res.resume(); resolve(res.statusCode); }); req.on('upgrade', (_res, socket) => { socket.destroy(); reject(new Error('Unexpected upgrade')); }); req.on('error', reject); req.end();
+  });
+  assert.equal(status, 403); assert.equal(f.calls, before); assert.equal(entries, 0);
 });
 
 test('logout, configuration changes, and project disablement revoke granted reads', async t => {

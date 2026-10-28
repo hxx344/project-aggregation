@@ -13,7 +13,7 @@ export class Monitor {
   constructor({ store, data, fetchMarket, notify, webhookConfigured, pollSeconds = 30, clock = Date.now, definition = oilDefinition, canRun = () => true, beforeSend }) {
     Object.assign(this, { store, data, fetchMarket, notify, webhookConfigured, pollSeconds, clock, definition, canRun, beforeSend });
     this.market = null; this.lastAttemptAt = null; this.error = null; this.deliveryError = null;
-    this.storageError = null; this.queue = Promise.resolve(); this.stopped = true; this.lastTestAt = null;
+    this.storageError = null; this.queue = Promise.resolve(); this.stopped = true; this.lastTestAt = null; this.delivery = null;
   }
   serial(action) { const result = this.queue.then(action); this.queue = result.catch(() => {}); return result; }
   async persist(next) {
@@ -45,15 +45,15 @@ export class Monitor {
       enabledRules: this.data.config.rules.filter(rule => rule.enabled).length };
   }
   async tick() {
-    return this.serial(async () => {
-      if (this.storageError || !this.canRun()) return;
+    const pending = await this.serial(async () => {
+      if (this.storageError || !this.canRun()) return null;
       this.lastAttemptAt = new Date(this.clock()).toISOString();
       let values, market;
       try { market = await this.fetchMarket(); values = this.definition.marketValues(market, this.clock()); }
       catch (error) {
         const reason = staleMarketReason(error);
         this.error = reason ? `${reason}；暂停阈值判断` : error.message.startsWith('Binance') ? error.message : '行情获取失败或已过期，暂停阈值判断';
-        return;
+        return null;
       }
       this.market = market; this.error = null;
       const now = this.clock(), next = structuredClone(this.data), due = [];
@@ -61,33 +61,51 @@ export class Monitor {
         if (!rule.enabled) continue;
         const { state, shouldSend } = evaluateRule(rule, next.states[rule.id], values[rule.metric], now);
         next.states[rule.id] = state;
-        if (shouldSend && next.config.enabled && this.notificationConfigured()) {
+        // One batch at a time: a later tick still tracks state but waits for the in-flight result.
+        if (shouldSend && next.config.enabled && this.notificationConfigured() && !this.delivery) {
           state.eventId ||= randomUUID(); state.nextAttemptAt = now + 60_000;
           due.push({ rule, value: values[rule.metric], id: state.eventId });
         }
       }
       if (!due.length) {
         if (JSON.stringify(next.states) !== JSON.stringify(this.data.states)) await this.persist(next);
-        return;
+        return null;
       }
       // Persist attempt IDs before external I/O; an uncertain retry retains its ID.
       const batchId = randomUUID();
       next.events.unshift({ id: batchId, source: this.definition.source ?? 'binance', time: new Date(now).toISOString(), status: 'sending', rules: due.map(item => ({ id: item.id, label: item.rule.label, metric: item.rule.metric, operator: item.rule.operator, threshold: item.rule.threshold, value: item.value })) });
       next.events = next.events.slice(0, 100);
       await this.persist(next);
-      const message = this.definition.message(market, values, due);
-      const delivered = structuredClone(this.data), event = delivered.events.find(item => item.id === batchId);
+      let finish;
+      this.delivery = new Promise(resolve => { finish = resolve; });
+      return { market, values, due, batchId, finish };
+    });
+    if (!pending) return;
+    const { market, values, due, batchId, finish } = pending;
+    try {
+      // The queue is released during delivery so configuration saves are not held behind the shared notifier.
+      let failure = null;
       try {
-        await this.notify(message, () => {
+        await this.notify(this.definition.message(market, values, due), () => {
           if (!this.canRun()) throw new Error('监控已关闭，取消本次告警');
           this.definition.marketValues(market, this.clock());
           this.beforeSend?.(market, due);
         });
-        this.deliveryError = null; event.status = 'sent';
-        for (const item of due) { delivered.states[item.rule.id].alerted = true; delivered.states[item.rule.id].lastSentAt = this.clock(); }
-      } catch (error) { event.status = 'failed'; event.error = error.message; this.deliveryError = error.message; }
-      await this.persist(delivered);
-    });
+      } catch (error) { failure = error; }
+      await this.serial(async () => {
+        const delivered = structuredClone(this.data), event = delivered.events.find(item => item.id === batchId);
+        if (event) { event.status = failure ? 'failed' : 'sent'; if (failure) event.error = failure.message; }
+        this.deliveryError = failure ? failure.message : null;
+        if (!failure) for (const item of due) {
+          const state = delivered.states[item.rule.id], current = delivered.config.rules.find(rule => rule.id === item.rule.id);
+          // A rule edited meanwhile starts its own episode; the same rule keeps the delivered cooldown.
+          if (!state || !current || ruleFingerprint(current) !== ruleFingerprint(item.rule)) continue;
+          if (state.eventId === item.id) state.alerted = true;
+          state.lastSentAt = this.clock();
+        }
+        await this.persist(delivered);
+      });
+    } finally { this.delivery = null; finish(); }
   }
   async testNotification() {
     return this.serial(async () => {
@@ -112,5 +130,5 @@ export class Monitor {
     };
     void run();
   }
-  async stop() { this.stopped = true; clearTimeout(this.timer); await this.queue; }
+  async stop() { this.stopped = true; clearTimeout(this.timer); await this.queue; await this.delivery; await this.queue; }
 }

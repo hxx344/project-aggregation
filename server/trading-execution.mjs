@@ -233,7 +233,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   function connection(row) {
     return { exchange: row.exchange, connected: !!row.credentials, revision: row.revision, accountMode: row.account_mode,
       identity: row.identity, keyLabel: row.key_label, verifiedAt: row.verified_at, locked: locked(row.exchange),
-      ...(accountWriter ? { writeProtection: { identityVerified: verifiedAccounts.get(row.exchange)?.revision === row.revision, reason: protectionErrors.get(row.exchange) || null } } : {}) };
+      ...(accountWriter ? { writeProtection: { identityVerified: verifiedAccounts.get(row.exchange)?.revision === row.revision, reason: accountWriter.retired ? '账户写入所有权已失效，仅允许读取与本地停止；请重启服务后核对任务' : protectionErrors.get(row.exchange) || null } } : {}) };
   }
   function context(exchange, revision) {
     const row = accountRow(exchange);
@@ -542,7 +542,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     requireLease();
     const latest = jobFor(job.id), all = orders(job.id);
     if (all.every(order => order.settled)) {
-      latest.status = latest.stopTarget === 'stopped' ? 'stopped' : 'paused';
+      // A durable stop request outlives a pause that could not be saved (lost account ownership, restart recovery).
+      latest.status = latest.stopTarget === 'stopped' || stopRequested(latest.id) ? 'stopped' : 'paused';
       event(latest, latest.status === 'stopped' ? '所有已知委托已结束；任务停止，已成交仓位保留' : '余单已核对结束；保留已成交仓位，继续需重新预览剩余数量');
       transaction(() => { saveJob(latest); if (latest.status === 'stopped') stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(job.id); });
     } else {

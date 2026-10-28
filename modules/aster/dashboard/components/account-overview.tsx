@@ -17,6 +17,7 @@ import { accountModeView, accountSnapshotView } from '@/lib/account-modes';
 import { accountConfigurationLock } from '@/lib/account-config';
 import {
   accountPositionsView,
+  pairedSnapshotRefresh,
   visiblePositions,
 } from '@/lib/account-positions';
 import { pairMarginOnly, type Pair } from '@/lib/pairs';
@@ -78,7 +79,7 @@ export function AccountOverview({
     snapshot,
     now,
     connectionError,
-    account.snapshot_refresh,
+    pairedSnapshotRefresh(account, pair),
     account.status === 'error' ? account.reason : undefined,
   );
   const {
