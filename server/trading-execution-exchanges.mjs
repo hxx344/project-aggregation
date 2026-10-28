@@ -1,6 +1,7 @@
 import { createHmac, createHash } from 'node:crypto';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
+import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
 
 /**
  * Restricted live execution protocol. No caller-supplied host, path, order type,
@@ -60,7 +61,7 @@ import { createOkxExecutionClient } from './trading-okx-execution.mjs';
  * https://bybit-exchange.github.io/docs/v5/user/apikey-info
  */
 
-const SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
+const SYMBOLS = EXECUTION_ALL_SYMBOLS;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_PAGES = 40;
 const MAX_ROWS = 2000;
@@ -464,11 +465,12 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     return { identity: snapshot.identity };
   }
 
-  async function account(credentials, { accountMode, signal, requireIdentity = false } = {}) {
-    const options = { accountMode: modeOf(accountMode), signal, requireIdentity };
+  async function account(credentials, { accountMode, signal, requireIdentity = false, symbols } = {}) {
+    const options = { accountMode: modeOf(accountMode), signal, requireIdentity }, selected = executionSymbols(symbols);
+    if (!selected) fail('input');
     const snapshot = await permissionSnapshot(credentials, options);
     const positions = [], openOrders = [], strategies = [], modes = {}, seenOrders = new Set(), seenStrategies = new Set();
-    for (const symbol of SYMBOLS) {
+    for (const symbol of selected) {
       if (exchange === 'binance') {
         modes[symbol] = snapshot.positionMode;
         const rows = array(await request('positions', credentials, { symbol }, options), 20), seen = new Set();
@@ -553,7 +555,8 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       const matches = array(info.symbols, 5000).filter(row => row?.symbol === symbol);
       if (matches.length !== 1) fail('not_tradable');
       const row = matches[0];
-      if (row.status !== 'TRADING' || row.contractType !== 'PERPETUAL' || row.quoteAsset !== 'USDT' || row.marginAsset !== 'USDT'
+      // Oil and equity perpetuals are listed as TRADIFI_PERPETUAL; both settle as ordinary USDT-M perpetuals.
+      if (row.status !== 'TRADING' || !['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(row.contractType) || row.quoteAsset !== 'USDT' || row.marginAsset !== 'USDT'
         || !Array.isArray(row.orderTypes) || !row.orderTypes.includes('LIMIT') || !Array.isArray(row.timeInForce) || !row.timeInForce.includes('GTX')) fail('not_tradable');
       const filters = array(row.filters, 50);
       const getFilter = name => { const values = filters.filter(filter => filter?.filterType === name); if (values.length !== 1) fail(); return values[0]; };

@@ -161,7 +161,7 @@ test('OKX hedge observations and execution account sizes use positive contracts 
   for (const readOnly of [true, false]) {
     const h = harness({ readOnly, handler: call => call.url.pathname.endsWith('/positions') ? [position(call.parameters.instId, { posSide: 'long', pos: '10' }), position(call.parameters.instId, { posSide: 'short', pos: '20' })] : undefined });
     h.state.config.posMode = 'long_short_mode';
-    const value = readOnly ? await h.client.positions(credentials) : await h.client.account(credentials);
+    const value = readOnly ? await h.client.positions(credentials) : await h.client.account(credentials, { symbols: ['CLUSDT', 'BZUSDT'] });
     assert.deepEqual(value.positions.map(row => [row.side, row.quantity]), [['long', '10'], ['short', '20'], ['long', '10'], ['short', '20']]);
     if (!readOnly) assert.deepEqual(value.modes, { CLUSDT: 'hedge', BZUSDT: 'hedge' });
   }
@@ -466,4 +466,17 @@ test('OKX lease guard errors remain original and an aborted dispatched order rem
   } });
   await assert.rejects(aborted.client.create(credentials, spec, { signal: controller.signal }), isExecutionError('aborted', true));
   assert.equal(mutations(aborted.calls).length, 1);
+});
+
+test('OKX execution trades SK hynix share contracts while the read-only ledger stays on oil', async () => {
+  const hynixRule = instId => rule(instId, { ctValCcy: instId.split('-')[0], ctVal: '1', tickSz: instId.startsWith('SKHYNIX-') ? '0.1' : '0.01', lotSz: '0.001', minSz: '0.001' });
+  const h = harness({ handler: call => call.url.pathname.endsWith('/instruments') ? [hynixRule(call.parameters.instId)] : undefined });
+  const market = await h.client.market('SKHYNIXUSDT');
+  assert.equal(market.rule.instrumentId, 'SKHYNIX-USDT-SWAP'); assert.equal(market.rule.contractSize, '1'); assert.equal(market.rule.quantityStep, '0.001');
+  const account = await h.client.account(credentials, { symbols: ['SKHYUSDT', 'SKHYNIXUSDT'] });
+  assert.deepEqual(Object.keys(account.modes), ['SKHYUSDT', 'SKHYNIXUSDT']);
+  assert.deepEqual([...new Set(h.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['SKHY-USDT-SWAP', 'SKHYNIX-USDT-SWAP']);
+  const readOnly = harness({ readOnly: true });
+  await readOnly.client.positions(credentials);
+  assert.deepEqual([...new Set(readOnly.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['CL-USDT-SWAP', 'BZ-USDT-SWAP']);
 });

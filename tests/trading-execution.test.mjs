@@ -638,3 +638,207 @@ test('restart reconciles an in-flight native amendment and ignores its former ow
   assert.deepEqual(f.db.prepare('SELECT json FROM execution_orders ORDER BY rowid').all(), before);
   assert.equal(f.job.status, 'paused'); assert.equal(f.job.legs[0].filledQuantity, '0.6'); assert.equal(f.creates.length, 2);
 });
+
+test('oil equal-barrel legs convert each venue contract size to native quantities', async t => {
+  const f = await fixture(t);
+  const legs = [['binance', 'CLUSDT', 'long'], ['binance', 'BZUSDT', 'short'], ['okx', 'CLUSDT', 'short'], ['okx', 'BZUSDT', 'long']]
+    .map(([exchange, symbol, side]) => ({ exchange, symbol, side, stopPrice: side === 'long' ? '90' : '50' }));
+  const preview = await f.preview(intent({ market: 'oil', preset: 'four-leg', batchCount: 1, equalSize: '2', legs }));
+  assert.deepEqual(Object.fromEntries(preview.legs.map(leg => [leg.id, leg.quantity])),
+    { 'binance:BZUSDT:short': '2', 'binance:CLUSDT:long': '2', 'okx:BZUSDT:long': '200', 'okx:CLUSDT:short': '20' });
+  assert.match(preview.notes[0], /等桶配腿：每腿 2 桶/);
+  await assert.rejects(f.preview(intent({ preset: 'four-leg', batchCount: 1, equalSize: '0.05', legs })), /0\.1 桶的整数倍/);
+  assert.throws(() => normalizeIntent(intent({ equalSize: '2' })), /只能选择一种/);
+  assert.throws(() => normalizeIntent(intent({ legs: intent().legs.map(({ quantity, ...leg }) => leg) })), /请填写每腿数量/);
+});
+
+test('SK hynix equal-notional legs size from the passive price and keep other symbols in the position snapshot', async t => {
+  const f = await fixture(t);
+  Object.assign(f.accounts.binance.modes, { SKHYUSDT: 'hedge', SKHYNIXUSDT: 'hedge' });
+  f.handlers['binance:account'] = (credentials, options) => { const value = structuredClone(f.accounts.binance); value.positions = value.positions.filter(row => options.symbols.includes(row.symbol)); return value; };
+  const prices = { CLUSDT: ['70', '70.01'], BZUSDT: ['70', '70.01'], SKHYUSDT: ['100', '100.01'], SKHYNIXUSDT: ['1000', '1000.1'] };
+  f.handlers['binance:market'] = symbol => ({ symbol, bid: prices[symbol][0], ask: prices[symbol][1], at: new Date(f.time).toISOString(),
+    rule: { tickSize: symbol === 'SKHYNIXUSDT' ? '0.1' : '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
+  f.accounts.binance.positions = [{ symbol: 'CLUSDT', side: 'long', quantity: '2' }];
+  await f.preview(intent({ preset: 'same-exchange', batchCount: 1, legs: [
+    { exchange: 'binance', symbol: 'CLUSDT', side: 'long', quantity: '1', stopPrice: '90' },
+    { exchange: 'binance', symbol: 'BZUSDT', side: 'short', quantity: '1', stopPrice: '50' }] }));
+  f.advance(1000);
+  const legs = [{ exchange: 'binance', symbol: 'SKHYUSDT', side: 'long', stopPrice: '110' }, { exchange: 'binance', symbol: 'SKHYNIXUSDT', side: 'short', stopPrice: '900' }];
+  assert.throws(() => normalizeIntent(intent({ market: 'hynix', preset: 'same-exchange', equalSize: '10000', legs: [{ ...legs[0], symbol: 'CLUSDT' }, legs[1]] })), /合约、交易所或仓位方向无效/);
+  const preview = await f.preview(intent({ market: 'hynix', preset: 'same-exchange', batchCount: 1, equalSize: '10000', legs }));
+  assert.equal(preview.market, 'hynix');
+  assert.deepEqual(preview.legs.map(leg => [leg.symbol, leg.quantity, leg.estimatedNotional]), [['SKHYNIXUSDT', '9.999', '9999.9999'], ['SKHYUSDT', '100', '10000']]);
+  assert.match(preview.notes[0], /等金额配腿/);
+  const positions = f.service.state().positions.filter(row => row.exchange === 'binance');
+  assert.deepEqual(positions.map(row => [row.symbol, row.fetchedAt]), [['CLUSDT', new Date(baseTime).toISOString()]]);
+  f.start(preview); await f.service.tick();
+  assert.equal(f.job.market, 'hynix'); assert.deepEqual(f.creates.map(call => call.args[1].symbol).sort(), ['SKHYNIXUSDT', 'SKHYUSDT']);
+});
+
+test('unanswered Binance create that never reached the venue settles after the arrival window and releases the writer', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.handlers['binance:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const pendingCreate = () => f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state));
+  const reads = () => f.calls.filter(call => call.exchange === 'binance' && call.method === 'account').length;
+  // Within the 120 s observation window a missing client ID proves nothing.
+  f.advance(50_000); await f.service.tick();
+  assert.equal(f.job.status, 'attention'); assert.equal(pendingCreate(), true);
+  f.advance(50_000); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  // A position that moved beyond known fills keeps the order unconfirmed.
+  f.accounts.binance.positions = [{ symbol: 'CLUSDT', side: 'long', quantity: '2' }];
+  f.advance(25_000); await f.service.tick();
+  f.advance(15_000); await f.service.tick();
+  assert.equal(f.job.status, 'attention'); assert.equal(pendingCreate(), true);
+  assert.match(f.job.events.map(item => item.message).join('\n'), /仓位或挂单与已知成交不一致/);
+  // A known mismatch is not re-read on every attention tick.
+  const before = reads();
+  f.accounts.binance.positions = []; f.accounts.binance.openOrders = [{ id: 'other', symbol: 'CLUSDT' }];
+  f.advance(15_000); await f.service.tick();
+  assert.equal(reads(), before);
+  // Any other order on the symbol also keeps it unconfirmed.
+  f.advance(50_000); await f.service.tick();
+  assert.equal(reads(), before + 1); assert.equal(f.job.status, 'attention');
+  f.accounts.binance.openOrders = [];
+  f.advance(50_000); await f.service.tick(); f.advance(15_000); await f.service.tick();
+  assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true); assert.equal(pendingCreate(), false);
+  assert.match(f.job.events.map(item => item.message).join('\n'), /判定未送达/);
+  assert.equal(f.creates.length, 2);
+  delete f.handlers['binance:create'];
+  f.start(await f.preview({ resumeJobId: f.job.id })); await f.service.tick();
+  assert.equal(f.creates.length, 4);
+});
+
+test('a cancel that leaves the order working is retried on attention ticks up to the attempt cap', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const stops = () => f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length;
+  assert.equal(stops(), 1);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(stops(), 5); assert.equal(f.job.status, 'attention'); assert.equal(f.creates.length, 2);
+});
+
+test('a rejected cancel is resent with spacing under the same attempt cap', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('rejected'); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const stops = () => f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length;
+  for (let i = 0; i < 10; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(stops(), 5); assert.equal(f.job.status, 'attention');
+});
+
+test('without a shared writer a repeated cancel keeps the same attempt cap', async t => {
+  const f = await fixture(t);
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async () => { throw new ExecutionExchangeError('rejected'); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  for (let i = 0; i < 10; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length, 5);
+});
+
+test('a cancel left sending by a crash is resent after restart', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const stops = () => f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length;
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  assert.equal(order.writerOperation.action, 'cancel');
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending';
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  await f.service.close(); f.service = f.create(); await f.service.initializeProtection();
+  delete f.handlers['binance:stop'];
+  f.advance(15_000); await f.service.tick();
+  assert.equal(stops(), 2); assert.equal(f.job.status, 'stopped');
+  assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
+});
+
+test('connecting reads only the oil symbols so another market cannot block it', async t => {
+  const f = await fixture(t);
+  const reads = f.calls.filter(call => call.method === 'account');
+  assert.equal(reads.length, 3);
+  for (const call of reads) assert.deepEqual(call.args[1].symbols, ['CLUSDT', 'BZUSDT']);
+});
+
+test('an uncertain cancel is retried once the order is still working and then stops the job', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  delete f.handlers['binance:stop'];
+  f.advance(15_000); await f.service.tick();
+  assert.equal(f.job.status, 'stopped');
+  assert.equal(f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length, 2);
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+});
+
+test('Bybit strategy create without an answer can be confirmed absent only after the window and with no nearby strategy', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.handlers['bybit:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const bybit = f.job.legs.find(row => row.exchange === 'bybit'), binance = f.job.legs.find(row => row.exchange === 'binance');
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /仍可能送达/);
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true }), /确认未创建/);
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: binance.id, notCreated: true, acknowledge: true }), /没有待核对委托|确认未创建/);
+  const createdAt = new Date(f.time).toISOString();
+  f.advance(50_000); await f.service.tick(); f.advance(50_000); await f.service.tick();
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /仍可能送达/);
+  f.advance(25_000); await f.service.tick();
+  const strategy = { id: 'late', symbol: 'CLUSDT', side: 'sell', quantity: '2', filledQuantity: '0', status: 'terminal', reduceOnly: false, createdAt };
+  f.accounts.bybit.strategies = [strategy];
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /策略编号/);
+  // A venue clock 200 s ahead still places the strategy around the request.
+  f.accounts.bybit.strategies = [{ ...strategy, createdAt: new Date(Date.parse(createdAt) + 200_000).toISOString() }];
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /下单时段前后/);
+  // A live strategy blocks confirmation whatever its creation time.
+  f.accounts.bybit.strategies = [{ ...strategy, status: 'running', createdAt: new Date(Date.parse(createdAt) - 3_600_000).toISOString() }];
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /运行中的追逐策略/);
+  f.accounts.bybit.strategies = []; f.accounts.bybit.positions = [{ symbol: 'CLUSDT', side: 'short', quantity: '1' }];
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /仓位或挂单与本任务已知成交不一致/);
+  // A terminal strategy another Hub job already claimed does not block it.
+  f.db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run('earlier-order', 'earlier-job', JSON.stringify({ exchange: 'bybit', remoteId: 'earlier-strategy' }));
+  f.accounts.bybit.positions = []; f.accounts.bybit.strategies = [{ ...strategy, id: 'earlier-strategy' }];
+  await f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true });
+  assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true);
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  assert.equal(f.creates.length, 2);
+});
+
+test('per-leg open quantities must balance long and short exposure in underlying units', async t => {
+  const f = await fixture(t);
+  const legs = quantity => [
+    { exchange: 'binance', symbol: 'CLUSDT', side: 'long', quantity: '2', stopPrice: '90' },
+    { exchange: 'okx', symbol: 'CLUSDT', side: 'short', quantity, stopPrice: '50' },
+  ];
+  await assert.rejects(f.preview(intent({ batchCount: 1, legs: legs('2') })), /多空两侧不平衡：多头合计 2 桶，空头合计 0\.2 桶/);
+  const preview = await f.preview(intent({ batchCount: 1, legs: legs('20') }));
+  assert.match(preview.notes[0], /逐腿数量：多头合计 2 桶，空头合计 2 桶。/);
+});
+
+test('four-leg per-leg opens balance each symbol across venues so one venue unit mistake cannot cancel out', async t => {
+  const f = await fixture(t);
+  const legs = (cl, bz) => [
+    { exchange: 'binance', symbol: 'CLUSDT', side: 'long', quantity: '2', stopPrice: '90' },
+    { exchange: 'binance', symbol: 'BZUSDT', side: 'short', quantity: '2', stopPrice: '50' },
+    { exchange: 'okx', symbol: 'CLUSDT', side: 'short', quantity: cl, stopPrice: '50' },
+    { exchange: 'okx', symbol: 'BZUSDT', side: 'long', quantity: bz, stopPrice: '90' },
+  ];
+  // OKX entered in barrels: totals still match (2.2 vs 2.2) but each symbol does not.
+  await assert.rejects(f.preview(intent({ preset: 'four-leg', batchCount: 1, legs: legs('2', '20') })), /多空两侧不平衡：BZUSDT 跨所多头合计 0\.2 桶，空头合计 2 桶/);
+  const preview = await f.preview(intent({ preset: 'four-leg', batchCount: 1, legs: legs('20', '200') }));
+  assert.match(preview.notes[0], /逐腿数量：多头合计 4 桶，空头合计 4 桶。/);
+});

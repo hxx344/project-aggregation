@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
-import { TRADING_NAMES } from './trading-markets.mjs';
+import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
+import { TRADING_NAMES, EXECUTION_MARKETS } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL } from './control/execution-jobs.mjs';
@@ -11,6 +11,15 @@ import { immediate } from './control/schema.mjs';
 const iso = time => new Date(time).toISOString();
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
 const PREVIEW_TTL = 30_000, LEASE_TTL = 60_000;
+// Binance rejects signed requests older than recvWindow (5s) and OKX rejects
+// timestamps older than 30s, so after the call deadline plus this margin an
+// unanswered create can no longer be accepted by either venue.
+const CREATE_ARRIVAL_MARGIN_MS = 60_000, CREATE_OBSERVE_MS = 120_000, ABSENT_CREATE_CHECKS = 2;
+const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5, MISMATCH_RECHECK_MS = 60_000;
+// Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
+const VENUE_CLOCK_TOLERANCE_MS = 300_000;
+// Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
+const CONNECT_SYMBOLS = EXECUTION_MARKETS.oil.symbols;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
 const validRevision = value => Number.isSafeInteger(value) && value >= 0;
@@ -42,6 +51,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const owner = randomUUID(), clients = new Map(EXECUTION_EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const pending = new Set(), controllers = new Set(), busyJobs = new Set(), connecting = new Set();
   const writerTickets = new Map(), verifiedAccounts = new Map(), protectionErrors = new Map(), recoveredWriterJobs = new Set();
+  const attentionChecks = new Map();
   let protectionReady = !accountWriter;
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
   function lostLease() {
@@ -252,22 +262,33 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const unsettled = order => !order.settled;
   function publicJob(job) {
     const all = orders(job.id);
-    return { id: job.id, preset: job.plan.preset, action: job.plan.action, status: job.status,
+    return { id: job.id, market: job.plan.market ?? 'oil', preset: job.plan.preset, action: job.plan.action, status: job.status,
       createdAt: job.createdAt, updatedAt: job.updatedAt, deadlineAt: job.deadlineAt, batchIndex: job.batchIndex, batchCount: job.plan.batchCount,
       reason: job.reason, ...(stopRequested(job.id) ? { stopRequested: true } : {}), canResume: job.status === 'paused' && all.every(order => order.settled) && job.totals.some(leg => compareDecimals(totalFilled(all, leg.id), leg.quantity) < 0),
       legs: job.totals.map(leg => {
         const filledQuantity = totalFilled(all, leg.id), last = all.filter(order => order.legId === leg.id).at(-1);
         return { id: leg.id, exchange: leg.exchange, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, quantity: leg.quantity, stopPrice: leg.stopPrice,
           filledQuantity, remainingQuantity: subtract(leg.quantity, filledQuantity),
-          currentOrder: last ? { id: last.remoteId, clientId: last.spec.clientId, kind: last.kind, state: last.state, lastCheckedAt: last.lastCheckedAt, price: last.price, filledQuantity: last.filledQuantity, unknown: last.unknown } : null };
+          currentOrder: last ? { id: last.remoteId, clientId: last.spec.clientId, kind: last.kind, state: last.state, lastCheckedAt: last.lastCheckedAt, price: last.price, filledQuantity: last.filledQuantity, unknown: last.unknown,
+            ...(last.exchange === 'bybit' && last.unknown && !last.remoteId ? { confirmAfter: iso(createSettledAt(last)) } : {}) } : null };
       }), events: job.events };
+  }
+  // A preview reads only its own symbols; keep the other symbols' last positions with their own read time.
+  function mergeSnapshot(previous, account, symbols) {
+    const at = iso(now()), covered = new Set(symbols);
+    let old = null;
+    try { old = previous ? JSON.parse(previous) : null; } catch { old = null; }
+    const kept = old?.account?.positions?.filter(position => !covered.has(position.symbol)) ?? [];
+    const symbolsAt = Object.fromEntries(kept.map(position => [position.symbol, old.symbolsAt?.[position.symbol] ?? old.at]));
+    for (const symbol of symbols) symbolsAt[symbol] = at;
+    return { at, symbolsAt, account: { ...account, positions: [...kept, ...account.positions] } };
   }
   function state() {
     const rows = EXECUTION_EXCHANGES.map(accountRow);
     return { generatedAt: iso(now()), connections: rows.map(connection), positions: rows.flatMap(row => {
       if (!row.snapshot) return [];
       const snapshot = JSON.parse(row.snapshot);
-      return snapshot.account.positions.map(position => ({ exchange: row.exchange, ...position, fetchedAt: snapshot.at }));
+      return snapshot.account.positions.map(position => ({ exchange: row.exchange, ...position, fetchedAt: snapshot.symbolsAt?.[position.symbol] ?? snapshot.at }));
     }), jobs: (() => { const sorted = jobs().sort((a, b) => b.createdAt.localeCompare(a.createdAt)); return [...sorted.filter(job => !FINAL.has(job.status)), ...sorted.filter(job => FINAL.has(job.status)).slice(0, 30)].map(publicJob); })() };
   }
   function checkAvailable(exchange, revision) {
@@ -287,7 +308,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     let rebound = false;
     try {
       const credentials = { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
-      const result = await call(async signal => { const options = { accountMode: mode, signal, requireIdentity: !!accountWriter }; const verified = await client.verify(credentials, options); const account = await client.account(credentials, options); return { verified, account }; });
+      const result = await call(async signal => { const options = { accountMode: mode, signal, requireIdentity: !!accountWriter }; const verified = await client.verify(credentials, options); const account = await client.account(credentials, { ...options, symbols: [...CONNECT_SYMBOLS] }); return { verified, account }; });
       checkSession(session); checkAvailable(exchange, body.revision);
       if (result.verified.identity && result.account.identity && result.verified.identity !== result.account.identity) throw new ExecutionError(409, '交易账户身份不一致');
       if (accountWriter) {
@@ -298,7 +319,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         } catch { throw new ExecutionError(409, '原账户仍有未核对操作或账户保护不可用，请先恢复原操作'); }
       }
       stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=?,account_mode=?,identity=?,key_label=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(
-        encrypt({ purpose: 'execution', exchange, ...credentials }), mode, result.verified.identity ?? null, body.apiKey.slice(-4), iso(now()), JSON.stringify({ at: iso(now()), account: result.account }), exchange, body.revision);
+        encrypt({ purpose: 'execution', exchange, ...credentials }), mode, result.verified.identity ?? null, body.apiKey.slice(-4), iso(now()), JSON.stringify(mergeSnapshot(null, result.account, CONNECT_SYMBOLS)), exchange, body.revision);
       return state();
     } catch (error) {
       if (rebound) {
@@ -321,7 +342,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     await Promise.all(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
-      const account = await call(async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity) throw new ExecutionError(409, '交易账户身份不一致'); return snapshot; });
+      const symbols = [...new Set(legs.filter(leg => leg.exchange === exchange).map(leg => leg.symbol))];
+      const account = await call(async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity) throw new ExecutionError(409, '交易账户身份不一致'); return snapshot; });
       requireLease();
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
@@ -330,7 +352,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         bindAccount(exchange, ctx.row.revision, account.identity);
       }
       snapshots.set(exchange, account); connections.set(exchange, connection(ctx.row));
-      stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify({ account, at: iso(now()) }), exchange, ctx.row.revision);
+      stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(mergeSnapshot(ctx.row.snapshot, account, symbols)), exchange, ctx.row.revision);
     }));
     await Promise.all(legs.map(async leg => {
       const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })); markets.set(`${leg.exchange}:${leg.symbol}`, value);
@@ -346,7 +368,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const job = jobFor(body.resumeJobId), view = publicJob(job);
       if (!view.canResume) throw new ExecutionError(409, '任务尚有未核对委托或不可继续，请先处理异常');
       resumeJobId = job.id;
-      intent = { ...job.plan, batchCount: Math.max(1, job.plan.batchCount - job.batchIndex), legs: view.legs.filter(leg => compareDecimals(leg.remainingQuantity, '0') > 0).map(leg => ({ exchange: leg.exchange, symbol: leg.symbol, side: leg.side, quantity: leg.remainingQuantity, stopPrice: leg.stopPrice })) };
+      intent = { ...job.plan, market: job.plan.market ?? 'oil', equalSize: null, batchCount: Math.max(1, job.plan.batchCount - job.batchIndex), legs: view.legs.filter(leg => compareDecimals(leg.remainingQuantity, '0') > 0).map(leg => ({ exchange: leg.exchange, symbol: leg.symbol, side: leg.side, quantity: leg.remainingQuantity, stopPrice: leg.stopPrice })) };
     } else intent = normalizeIntent(body);
     for (const leg of intent.legs) {
       const lock = stmt.prepare('SELECT job_id FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`);
@@ -354,7 +376,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     }
     let collected;
     try { collected = await collect(intent.legs); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
-    const plan = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now());
+    const plan = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now(), { resume: !!resumeJobId });
     const value = { ...plan, id: randomUUID(), expiresAt: iso(now() + PREVIEW_TTL), resumeJobId, connections: [...collected.connections.values()] };
     writable(); checkSession(session); stmt.prepare('DELETE FROM execution_previews WHERE expires<? AND consumed IS NULL').run(now());
     stmt.prepare('INSERT INTO execution_previews(id,session,expires,json) VALUES (?,?,?,?)').run(value.id, session, now() + PREVIEW_TTL, JSON.stringify(value));
@@ -407,7 +429,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     requireLease();
     if (order.exchange === 'bybit' && !order.remoteId && !explicitId) return false;
     const ctx = context(order.exchange, order.accountRevision);
-    const value = await call(signal => ctx.client.inspect(ctx.credentials, { ...order.spec, id: explicitId ?? order.remoteId }, { ...ctx.options, signal, cancelRecovery }));
+    let value;
+    try { value = await call(signal => ctx.client.inspect(ctx.credentials, { ...order.spec, id: explicitId ?? order.remoteId }, { ...ctx.options, signal, cancelRecovery })); }
+    catch (error) { if (error?.notFound && await absentCreate(order)) return true; throw error; }
     requireLease();
     const current = orderFor(order.localId), filledQuantity = validateInspection(current, value, { explicit: !!explicitId, cancelRecovery });
     if (accountWriter) {
@@ -422,6 +446,97 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     Object.assign(current, { remoteId: value.id, filledQuantity, unknown: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
     saveOrder(current); return true;
   }
+  // Every create left unknown had an uncertain result (timeout, 5xx, unknown
+  // code), so a missing client ID is not proof by itself (L039/L062). After the
+  // bounded observation window (no request can still arrive: Binance recvWindow
+  // 5 s, OKX 30 s timestamp expiry) and spaced misses, a fresh account read with
+  // no other order on the symbol and the position equal to the preview baseline
+  // plus known fills adopts reality. Bybit strategies have no client ID and are
+  // confirmed by the operator.
+  const createSettledAt = order => Date.parse(order.createdAt) + Math.max(CREATE_OBSERVE_MS, callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS);
+  async function absentCreate(order) {
+    requireLease();
+    const current = orderFor(order.localId);
+    if (!['binance', 'okx'].includes(current.exchange) || current.remoteId || !current.unknown || current.settled) return false;
+    const expired = now() >= createSettledAt(current);
+    // Misses count only once per spaced check, so one pass cannot confirm itself.
+    if (!expired) current.absentChecks = 0;
+    else if (!current.absentAt || now() - Date.parse(current.absentAt) >= ATTENTION_RETRY_MS / 3) { current.absentChecks = (current.absentChecks || 0) + 1; current.absentAt = iso(now()); }
+    if (!expired || current.absentChecks < ABSENT_CREATE_CHECKS) { saveOrder(current); return false; }
+    // A known mismatch is re-read at a slower cadence than the attention tick.
+    if (current.positionCheckedAt && now() - Date.parse(current.positionCheckedAt) < MISMATCH_RECHECK_MS) { saveOrder(current); return false; }
+    current.positionCheckedAt = iso(now()); saveOrder(current);
+    const { matches } = await freshPosition(current);
+    const latest = orderFor(current.localId);
+    if (latest.settled || latest.remoteId) return false;
+    if (!matches) {
+      if (!latest.positionMismatchAt) { latest.positionMismatchAt = iso(now()); saveOrder(latest); const job = jobFor(latest.jobId); event(job, `${TRADING_NAMES[latest.exchange]} ${latest.spec.symbol} 查无原委托，但当前仓位或挂单与已知成交不一致，继续保留待核对`); saveJob(job); }
+      return false;
+    }
+    settleNotCreated(latest, `${TRADING_NAMES[latest.exchange]} ${latest.spec.symbol} 结果未知的委托超过观察窗口后多次按客户订单号查询均不存在，且该合约无其他挂单、仓位与已知成交一致，按现实判定未送达`);
+    return true;
+  }
+  // Fresh single-symbol read. It matches only when the position equals the
+  // preview baseline plus this phase's known fills and the symbol carries no
+  // order or strategy other than this job's settled ones.
+  async function freshPosition(order) {
+    const job = jobFor(order.jobId), leg = job.plan.legs.find(item => item.id === order.legId);
+    const ctx = context(order.exchange, order.accountRevision);
+    const account = await call(signal => ctx.client.account(ctx.credentials, { ...ctx.options, signal, symbols: [order.spec.symbol] }));
+    requireLease();
+    if (!leg?.currentQuantity || !Array.isArray(account?.openOrders) || !Array.isArray(account?.strategies)) return { account, matches: false };
+    const busy = account.openOrders.some(item => item.symbol === order.spec.symbol) || account.strategies.some(item => item.symbol === order.spec.symbol && item.status !== 'terminal');
+    const filled = totalFilled(orders(job.id), leg.id, job.phase);
+    const expected = job.plan.action === 'open' ? addDecimals([leg.currentQuantity, filled]) : subtract(leg.currentQuantity, filled);
+    return { account, matches: !busy && compareDecimals(currentPosition(account, leg), expected) === 0 };
+  }
+  function settleNotCreated(current, message) {
+    if (accountWriter) {
+      const ticket = protectJob(jobFor(current.jobId)), operationId = `hub:create:${current.localId}`;
+      if (accountWriter.unresolved(ticket).some(operation => operation.operationId === operationId)) accountWriter.resolve(operationId, ticket, 'rejected');
+      if (current.writerOperation?.operationId === operationId) { current.writerOperation.state = 'rejected'; current.writerDispatch = 'rejected'; }
+    }
+    Object.assign(current, { state: 'rejected', settled: true, unknown: false, lastCheckedAt: iso(now()) });
+    saveOrder(current);
+    const job = jobFor(current.jobId); event(job, message); saveJob(job);
+  }
+  // Operator confirmation for a Bybit strategy create without an answer. It is
+  // accepted only after the request can no longer arrive, while the symbol has
+  // no live strategy, no unclaimed strategy created around the request (venue
+  // clock tolerance included), and the position matches the known fills.
+  async function confirmNotCreated(order) {
+    const created = Date.parse(order.createdAt);
+    if (!Number.isFinite(created) || now() < createSettledAt(order)) throw new ExecutionError(409, '下单请求仍可能送达交易所，请稍后再确认');
+    const { account, matches } = await freshPosition(order);
+    if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
+    // Strategies any Hub job already claimed are accounted for by that job.
+    const claimed = new Set(stmt.prepare("SELECT json_extract(json,'$.remoteId') AS id FROM execution_orders WHERE json_extract(json,'$.exchange')='bybit' AND json_extract(json,'$.remoteId') IS NOT NULL").all().map(row => row.id));
+    const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS; };
+    const candidates = account.strategies.filter(strategy => strategy.symbol === order.spec.symbol && !claimed.has(strategy.id));
+    if (candidates.some(strategy => strategy.status !== 'terminal')) throw new ExecutionError(409, 'Bybit 该合约仍有运行中的追逐策略，请填写其策略编号核对');
+    if (candidates.some(nearby)) throw new ExecutionError(409, 'Bybit 存在下单时段前后创建的同合约追逐策略，请填写其策略编号核对');
+    if (!matches) throw new ExecutionError(409, 'Bybit 当前仓位或挂单与本任务已知成交不一致，不能确认策略未创建');
+    const current = orderFor(order.localId);
+    if (current.settled || current.remoteId) return;
+    settleNotCreated(current, `Bybit ${current.spec.symbol} 经人工确认且交易所无对应追逐策略，判定未创建`);
+  }
+  // A cancel that was sent but left the order working is retried a bounded
+  // number of times; repeating an exact-ID cancel can only reduce exposure.
+  // `sending` survives here only when the process stopped during the request.
+  const cancelSpent = order => (order.cancelAttempt || 0) + 1 >= CANCEL_ATTEMPTS;
+  const cancelRecent = order => !!order.cancelRequestedAt && now() - Date.parse(order.cancelRequestedAt) < CANCEL_RETRY_MS;
+  function retryCancel(order, operation) {
+    if (order.settled || !order.remoteId || cancelSpent(order)) return false;
+    if (order.writerOperation?.operationId !== operation.operationId || !['sending', 'unknown', 'confirmed'].includes(order.writerOperation.state)) return false;
+    if (!order.cancelRequestedAt || cancelRecent(order)) return false;
+    if (accountWriter && order.writerOperation.state !== 'confirmed') {
+      const ticket = protectJob(jobFor(order.jobId));
+      if (accountWriter.unresolved(ticket).some(item => item.operationId === operation.operationId)) accountWriter.resolve(operation.operationId, ticket, 'rejected');
+      order.writerOperation.state = 'rejected';
+    }
+    order.cancelAttempt = (order.cancelAttempt || 0) + 1; saveOrder(order);
+    return true;
+  }
   async function cancelOrder(order) {
     requireLease();
     if (order.settled) return;
@@ -435,11 +550,23 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (!order.remoteId || order.settled) return;
     }
     const ctx = context(order.exchange, order.accountRevision);
-    if (order.writerOperation?.action === 'cancel' && order.writerOperation.state === 'rejected') order.cancelAttempt = (order.cancelAttempt || 0) + 1;
+    // A rejected cancel, or any repeat cancel when no shared writer records
+    // outcomes, is resent under the same attempt limit and spacing.
+    if (order.writerOperation?.action === 'cancel' && order.writerOperation.state === 'rejected' || !accountWriter && order.cancelRequestedAt) {
+      if (cancelSpent(order) || cancelRecent(order)) { await inspectOrder(order, undefined, true); return; }
+      order.cancelAttempt = (order.cancelAttempt || 0) + 1;
+    }
     let operation;
     try { operation = prepareWrite(order, 'cancel'); }
     catch { await inspectOrder(order, undefined, true); return; }
-    if (operation?.skip) { await inspectOrder(order, undefined, true); return; }
+    if (operation?.skip) {
+      await inspectOrder(order, undefined, true);
+      if (!retryCancel(orderFor(order.localId), operation)) return;
+      order = orderFor(order.localId);
+      try { operation = prepareWrite(order, 'cancel'); }
+      catch { await inspectOrder(order, undefined, true); return; }
+      if (operation?.skip) return;
+    }
     order.cancelRequestedAt = iso(now()); order.state = 'canceling'; saveOrder(order);
     try {
       await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) accountWriter.assertOwned(operation, callTimeoutMs); } }));
@@ -556,7 +683,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       requireLease(); let job = jobFor(id);
       protectAndRecover(job);
       if (stopRequested(id) && ACTIVE.has(job.status) && job.status !== 'stopping') { pause(id, '用户停止：等待当前合法写者核对原委托', 'stopped'); job = jobFor(id); }
-      if (job.status === 'stopping') { await stopping(job); return; }
+      if (job.status === 'stopping' || job.status === 'attention') { await stopping(job); return; }
       if (!['queued', 'running'].includes(job.status)) return;
       protectJob(job);
       if (now() >= Date.parse(job.deadlineAt)) { pause(id, '执行时间已到，停止追价并撤销余单'); await stopping(jobFor(id)); return; }
@@ -617,17 +744,27 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       await Promise.all(candidates.map(({ leg, quantity }) => submit(job, leg, quantity, markets.get(`${leg.exchange}:${leg.symbol}`))));
       if (jobFor(id).status === 'stopping') await stopping(jobFor(id));
     } catch (error) {
-      try { requireLease(); pause(id, safeError(error)); await stopping(jobFor(id)); } catch { /* A new lease owner will reconcile durable intents. */ }
+      try {
+        requireLease();
+        const latest = jobFor(id), message = safeError(error);
+        // A failed attention check stays in attention for the next spaced check; a repeated error is logged once.
+        if (latest.status === 'attention') { if (latest.attentionError !== message) { latest.attentionError = message; event(latest, message); saveJob(latest); } }
+        else { pause(id, message); await stopping(jobFor(id)); }
+      } catch { /* A new lease owner will reconcile durable intents. */ }
     } finally {
       busyJobs.delete(id);
-      if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); }
+      if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); attentionChecks.delete(id); }
     }
   }
   function tick() {
     if (closed || closing || !protectionReady) return Promise.resolve();
     if (ticking) return ticking;
     if (!acquire()) return Promise.resolve();
-    ticking = Promise.allSettled(jobs().filter(job => ACTIVE.has(job.status)).map(job => runJob(job.id))).finally(() => { ticking = null; });
+    // Unconfirmed jobs are re-read at a low rate until every order settles.
+    const due = job => ACTIVE.has(job.status) || job.status === 'attention' && now() - (attentionChecks.get(job.id) ?? 0) >= ATTENTION_RETRY_MS;
+    const selected = jobs().filter(due);
+    for (const job of selected) if (job.status === 'attention') attentionChecks.set(job.id, now());
+    ticking = Promise.allSettled(selected.map(job => runJob(job.id))).finally(() => { ticking = null; });
     return ticking;
   }
   function stop(id, body, session) {
@@ -641,16 +778,19 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     return state();
   }
   async function reconcile(id, body, session) {
-    exactKeys(body, ['legId', 'strategyId', 'acknowledge']); writable(); checkSession(session);
+    exactKeys(body, ['legId', 'strategyId', 'acknowledge', 'notCreated']); writable(); checkSession(session);
     const job = jobFor(id);
     if (!['attention', 'paused'].includes(job.status) || busyJobs.has(id)) throw new ExecutionError(409, '任务正在执行或核对中');
     const order = orders(id).filter(item => item.legId === body.legId && !item.settled).at(-1);
     if (!order) throw new ExecutionError(409, '该交易腿没有待核对委托');
-    if (order.exchange === 'bybit' && !order.remoteId && (body.acknowledge !== true || typeof body.strategyId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(body.strategyId))) throw new ExecutionError(400, '请核对并填写交易所显示的原生追价策略编号');
+    const notCreated = body.notCreated !== undefined;
+    if (notCreated && (body.notCreated !== true || body.acknowledge !== true || body.strategyId !== undefined || order.exchange !== 'bybit' || order.remoteId)) throw new ExecutionError(400, '只有尚无策略编号的 Bybit 交易腿可以确认未创建');
+    if (!notCreated && order.exchange === 'bybit' && !order.remoteId && (body.acknowledge !== true || typeof body.strategyId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(body.strategyId))) throw new ExecutionError(400, '请核对并填写交易所显示的原生追价策略编号');
     if (order.exchange !== 'bybit' && body.strategyId !== undefined) throw new ExecutionError(400, '此交易所按本任务客户订单号核对');
     busyJobs.add(id);
     try {
-      await inspectOrder(order, order.exchange === 'bybit' && !order.remoteId ? body.strategyId : undefined, true);
+      if (notCreated) await confirmNotCreated(order);
+      else await inspectOrder(order, order.exchange === 'bybit' && !order.remoteId ? body.strategyId : undefined, true);
       pause(id, '正在核对并撤销确认的剩余委托', job.stopTarget || 'paused');
       await stopping(jobFor(id)); return state();
     } catch (error) { throw new ExecutionError(409, safeError(error)); } finally { busyJobs.delete(id); }
