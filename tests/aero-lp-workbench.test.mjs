@@ -110,6 +110,23 @@ test('saving parameters while running takes effect at once through a reload', as
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
+test('gas and reward totals come from the child ledger for the current wallet only', async () => {
+  const directory = fixtureDir();
+  const { manager } = managerWith(directory);
+  try {
+    await manager.initialize();
+    assert.equal(manager.state().ledger, null, 'no wallet, no totals');
+    await manager.setKey(KEY);
+    assert.deepEqual(manager.state().ledger, { txs: 0, failed: 0, gasEth: '0', reward: '0', since: null });
+    const line = (n, over) => JSON.stringify({ hash: '0x' + n.toString(16).padStart(64, '0'), wallet: ADDRESS, status: 'ok', fee: '1000000000000000', reward: '0', at: `2026-10-29T0${n}:00:00.000Z`, ...over }) + '\n';
+    const ledger = join(directory, 'aero-lp/txs.jsonl');
+    writeFileSync(ledger, line(1) + line(2, { status: 'reverted', reward: '2500000000000000000' }) + line(3, { wallet: '0x00000000000000000000000000000000000000AA' }));
+    assert.deepEqual(manager.state().ledger, { txs: 2, failed: 1, gasEth: '0.002', reward: '2.5', since: '2026-10-29T01:00:00.000Z' });
+    writeFileSync(ledger, line(4), { flag: 'a' });
+    assert.equal(manager.state().ledger.txs, 3, 'appended lines are picked up');
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
 test('stop is graceful, returns at once and allows replacing then clearing the key', async () => {
   const directory = fixtureDir();
   const { manager, workers } = managerWith(directory);

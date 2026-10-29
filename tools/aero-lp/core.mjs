@@ -78,6 +78,32 @@ export function planCycle({ currentTick, twapTick = null, twapUnavailable = fals
   return { target, actions, notes, status };
 }
 
+// 以下为展示用浮点估算，不参与交易数量计算。
+const SECONDS_PER_YEAR = 365 * 86_400;
+
+// 头寸按当前价格折算的两种代币数量（已除以精度）。sqrtPrice 为 sqrt(token1 原始单位 / token0 原始单位)。
+export function positionAmounts({ liquidity, tickLower, tickUpper }, sqrtPrice, decimals0, decimals1) {
+  const L = Number(liquidity), sa = 1.0001 ** (tickLower / 2), sb = 1.0001 ** (tickUpper / 2);
+  const sp = Math.min(Math.max(sqrtPrice, sa), sb);
+  return { amount0: (L * (sb - sp)) / (sp * sb) / 10 ** decimals0, amount1: (L * (sp - sa)) / 10 ** decimals1 };
+}
+
+// 质押头寸的 AERO 排放年化：头寸按流动性占活跃质押流动性的比例分得排放。
+// 价格低于区间时头寸不在活跃流动性里，按「价格刚进入下沿」估算：分母加上本头寸，价值按下沿价格折算。
+export function emissionApr({ rewardPerSecond, rewardPrice, stakedLiquidity, position, price, decimals0, decimals1 }) {
+  const L = Number(position.liquidity);
+  if (!(rewardPerSecond > 0) || !(rewardPrice > 0) || !(L > 0)) return null;
+  const sqrtLower = 1.0001 ** (position.tickLower / 2);
+  if (price.tick >= position.tickUpper) return { apr: 0, estimated: false };
+  const entering = price.tick < position.tickLower;
+  const share = L / (Number(stakedLiquidity) + (entering ? L : 0));
+  const sqrt = entering ? sqrtLower : price.sqrt;
+  const { amount0, amount1 } = positionAmounts(position, sqrt, decimals0, decimals1);
+  const value = amount0 * sqrt * sqrt * 10 ** (decimals0 - decimals1) + amount1;
+  if (!(value > 0) || !(share > 0) || share > 1) return null;
+  return { apr: (rewardPerSecond * SECONDS_PER_YEAR * rewardPrice * share) / value, estimated: entering };
+}
+
 // 可配置参数（工作台页面与 CLI 共用同一套校验）。连接类参数变化时需要重连链上合约。
 export const SETTING_KEYS = ['rpcUrl', 'pool', 'factory', 'nft', 'token', 'upperPrice', 'gapBps', 'intervalSec', 'twapSec', 'maxTwapDeviationBps', 'slippageBps', 'keepInWallet', 'minDeploy', 'minEthForGas'];
 export const CONNECTION_KEYS = ['rpcUrl', 'pool', 'factory', 'nft', 'token'];
@@ -109,4 +135,32 @@ export function validateSettings(value, { extra = [] } = {}) {
   for (const k of Object.keys(value)) if (!SETTING_KEYS.includes(k) && !extra.includes(k)) throw new Error(`config.${k} is not supported`);
   for (const k of SETTING_KEYS) if (!SETTING_RULES[k](value[k])) throw new Error(`config.${k} is invalid: ${JSON.stringify(value[k])}`);
   return Object.fromEntries(SETTING_KEYS.map((k) => [k, value[k]]));
+}
+
+// 交易账本 txs.jsonl：每行一笔已签名交易的回执摘要（fee/reward 为 wei 十进制字符串）。
+// 同一哈希可能被并发进程重复写入，按哈希去重；损坏的行跳过。
+export function parseLedger(text) {
+  const entries = new Map();
+  for (const line of text.split('\n')) {
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (!e || typeof e.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(e.hash)) continue;
+    entries.set(e.hash.toLowerCase(), e);
+  }
+  return [...entries.values()];
+}
+
+const wei = (v) => (typeof v === 'string' && /^\d{1,78}$/.test(v) ? BigInt(v) : 0n);
+
+export function summarizeLedger(entries, wallet) {
+  const sum = { txs: 0, failed: 0, fee: 0n, reward: 0n, since: null };
+  const owner = wallet?.toLowerCase();
+  for (const e of entries) {
+    if (typeof e.wallet !== 'string' || e.wallet.toLowerCase() !== owner) continue;
+    sum.txs++;
+    if (e.status !== 'ok') sum.failed++;
+    sum.fee += wei(e.fee); sum.reward += wei(e.reward);
+    if (typeof e.at === 'string' && (!sum.since || e.at < sum.since)) sum.since = e.at;
+  }
+  return sum;
 }

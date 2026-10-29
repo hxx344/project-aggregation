@@ -6,8 +6,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Wallet, formatEther, formatUnits, getAddress, parseEther, parseUnits } from 'ethers';
-import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, nearestUsableTick, planCycle, targetRange, tickToPrice, validateSettings } from './core.mjs';
-import { connect, errorText, execute, provider, readState } from './chain.mjs';
+import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, nearestUsableTick, planCycle, positionAmounts, targetRange, tickToPrice, validateSettings } from './core.mjs';
+import { connect, errorText, execute, provider, readRewards, readState, reconcileLedger } from './chain.mjs';
 
 const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]  |  lp run --managed --config FILE --data DIR';
 const KEY_TIMEOUT_MS = 10_000;
@@ -89,7 +89,48 @@ function acquireLock(dataDir, wallet) {
   return () => rmSync(lock, { recursive: true, force: true });
 }
 
-async function cycle(ctx, config, wallet, log, { dryRun, paused = () => false, onExecute = () => {} }) {
+const round = (v, digits = 6) => (Number.isFinite(v) ? Number(v.toPrecision(digits)) : null);
+
+function ledgerWriter(dataDir) {
+  const file = join(dataDir, 'txs.jsonl');
+  return (entry) => appendFileSync(file, JSON.stringify(entry) + '\n', { mode: 0o600 });
+}
+
+// 账本补记失败只记日志，不影响本轮调仓；dry-run 不加锁，也不写账本。
+async function reconcile(ctx, dataDir, wallet, log, dryRun) {
+  if (dryRun) return;
+  try { await reconcileLedger(ctx, dataDir, wallet, ledgerWriter(dataDir)); } catch (error) { log({ event: 'ledger_error', error: errorText(error) }); }
+}
+
+// 奖励展示数据：池子排放速率由相邻两轮的 rewardGrowthGlobalX128 差值除以池子更新时间差得到，
+// 即单位质押流动性每秒分得的奖励；第一轮或池子期间无更新时沿用上一次的速率。
+function rewardView(ctx, state, rewards, memory) {
+  const previous = memory.sample;
+  if (previous && rewards.updatedAt > previous.updatedAt && rewards.growth >= previous.growth) {
+    memory.perLiquidity = Number(rewards.growth - previous.growth) / 2 ** 128 / (rewards.updatedAt - previous.updatedAt);
+  }
+  if (!previous || rewards.updatedAt > previous.updatedAt) memory.sample = { growth: rewards.growth, updatedAt: rewards.updatedAt };
+  const perSecond = memory.perLiquidity === undefined ? null : (memory.perLiquidity * Number(rewards.stakedLiquidity)) / 1e18;
+  const price = { tick: state.tick, sqrt: state.sqrtPrice };
+  const positions = state.positions.map((p) => {
+    const { amount0, amount1 } = positionAmounts(p, state.sqrtPrice, ctx.decimals0, ctx.decimals1);
+    const value = amount0 * tickToPrice(state.tick, ctx.decimals0, ctx.decimals1) + amount1;
+    const apr = p.staked && perSecond !== null ? emissionApr({ rewardPerSecond: perSecond, rewardPrice: rewards.price, stakedLiquidity: rewards.stakedLiquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 }) : null;
+    return { amount0: round(amount0), amount1: round(amount1), value: round(value), apr: apr && round(apr.apr, 4), aprEstimated: apr?.estimated ?? false };
+  });
+  return {
+    summary: {
+      price: rewards.price === null ? null : round(rewards.price),
+      poolPerDay: perSecond === null ? null : round(perSecond * 86_400),
+      pending: formatUnits(rewards.pending, 18),
+      deferred: formatUnits(rewards.deferred, 18),
+    },
+    positions,
+  };
+}
+
+async function cycle(ctx, config, wallet, log, { dryRun, dataDir, memory = {}, paused = () => false, onExecute = () => {} }) {
+  await reconcile(ctx, dataDir, wallet, log, dryRun);
   const amounts = {
     keepInWallet: parseUnits(config.keepInWallet, ctx.decimals0),
     minDeploy: parseUnits(config.minDeploy, ctx.decimals0),
@@ -104,16 +145,27 @@ async function cycle(ctx, config, wallet, log, { dryRun, paused = () => false, o
     penalty: state.penalty, blockNumber: state.blockNumber,
   });
   const price = (t) => Number(tickToPrice(t, ctx.decimals0, ctx.decimals1).toPrecision(6));
+  let rewards = null, rewardsError = null;
+  try {
+    const raw = await readRewards(ctx, wallet, state.positions.filter((p) => p.staked).map((p) => p.tokenId));
+    rewards = { ...rewardView(ctx, state, raw, memory), raw };
+  } catch (error) { rewardsError = errorText(error); }
   log({
     event: 'cycle',
     block: state.blockNumber,
+    symbols: [ctx.symbol0, ctx.symbol1],
     price: price(state.tick),
     twapPrice: state.twapTick === null ? null : price(state.twapTick),
     ...(state.twapError && { twapError: state.twapError }),
     target: plan.target && [price(plan.target.tickLower), price(plan.target.tickUpper)],
-    positions: state.positions.map((p) => ({ id: String(p.tokenId), range: [price(p.tickLower), price(p.tickUpper)], staked: p.staked, liquidity: String(p.liquidity) })),
+    positions: state.positions.map((p, i) => ({ id: String(p.tokenId), range: [price(p.tickLower), price(p.tickUpper)], staked: p.staked, liquidity: String(p.liquidity), ...rewards?.positions[i] })),
     status: plan.status,
-    wallet: { [ctx.symbol0]: formatUnits(state.walletToken0, ctx.decimals0), ETH: formatEther(state.walletEth) },
+    wallet: {
+      [ctx.symbol0]: formatUnits(state.walletToken0, ctx.decimals0), ETH: formatEther(state.walletEth),
+      ...(rewards && { AERO: formatUnits(rewards.raw.aero, 18) }), ...(rewards?.raw.xaero != null && { xAERO: formatUnits(rewards.raw.xaero, 18) }),
+    },
+    rewards: rewards?.summary ?? null,
+    ...(rewardsError && { rewardsError }),
     actions: plan.actions.map((a) => a.type + (a.tokenId !== undefined ? `#${a.tokenId}` : '')),
     notes: plan.notes,
   });
@@ -122,7 +174,8 @@ async function cycle(ctx, config, wallet, log, { dryRun, paused = () => false, o
   if (state.walletEth < parseEther(config.minEthForGas)) { log({ event: 'skip', reason: `ETH balance below minEthForGas ${config.minEthForGas}` }); return; }
   if (paused()) { log({ event: 'skip', reason: 'workbench maintenance in progress' }); return; }
   onExecute();
-  await execute(ctx, log, wallet, plan, { ...amounts, slippageBps: config.slippageBps, retarget });
+  try { await execute(ctx, log, wallet, plan, { ...amounts, slippageBps: config.slippageBps, retarget }); }
+  finally { await reconcile(ctx, dataDir, wallet, log, dryRun); }
 }
 
 // 工作台托管：先发 ready，收到 IPC 私钥后开始循环；私钥不落盘、不进环境变量。
@@ -151,7 +204,7 @@ async function managed({ configPath, dataDir }) {
   if (!PRIVATE_KEY_PATTERN.test(key)) throw new Error('private key must be 64 hex characters (optionally 0x-prefixed)');
   const wallet = new Wallet(key).address;
   const release = acquireLock(dataDir, wallet);
-  let ctx = null, connection = null;
+  let ctx = null, connection = null, memory = {};
   try {
     while (!stopping) {
       let intervalSec = 60;
@@ -163,11 +216,11 @@ async function managed({ configPath, dataDir }) {
           ctx = null; connection = null;
           phase('connecting');
           ctx = await connect(config, new Wallet(key, provider(config.rpcUrl)));
-          connection = wanted;
+          connection = wanted; memory = {};
           log({ event: 'start', command: 'managed', wallet, pool: ctx.addresses.pool, gauge: ctx.addresses.gauge, pair: `${ctx.symbol0}/${ctx.symbol1}` });
         }
         phase('cycle');
-        await cycle(ctx, config, wallet, log, { dryRun: false, paused: () => paused, onExecute: () => phase('executing') });
+        await cycle(ctx, config, wallet, log, { dryRun: false, dataDir, memory, paused: () => paused, onExecute: () => phase('executing') });
       } catch (error) {
         log({ event: 'cycle_error', error: errorText(error) });
       }
@@ -198,15 +251,16 @@ async function main() {
 
   const release = options.dryRun ? () => {} : acquireLock(config.dataDir, wallet);
   if (options.command !== 'run') {
-    try { await cycle(ctx, config, wallet, log, options); } finally { release(); }
+    try { await cycle(ctx, config, wallet, log, { ...options, dataDir: config.dataDir }); } finally { release(); }
     return;
   }
+  const memory = {};
   let stopping = false, wake = null;
   const stop = () => { stopping = true; wake?.(); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
   try {
     while (!stopping) {
-      try { await cycle(ctx, config, wallet, log, options); } catch (error) {
+      try { await cycle(ctx, config, wallet, log, { ...options, dataDir: config.dataDir, memory }); } catch (error) {
         log({ event: 'cycle_error', error: errorText(error) });
       }
       if (stopping) break;

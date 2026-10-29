@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { CircleAlert, Droplets, KeyRound, LoaderCircle, Play, RefreshCw, Save, Square, Trash2 } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { AeroLpConfig, AeroLpEvent, AeroLpSnapshot } from './aero-lp-types';
+import type { AeroLpConfig, AeroLpCycle, AeroLpEvent, AeroLpLedger, AeroLpPosition, AeroLpSnapshot } from './aero-lp-types';
 import './aero-lp.css';
 
 const ROOT = '/api/automation/aero-lp';
@@ -10,14 +10,72 @@ const stateLabels = { starting: '正在启动', running: '运行中', stopping: 
 const phaseLabels: Record<string, string> = { connecting: '正在连接链上合约', cycle: '正在检查区间', executing: '正在发送交易', sleeping: '等待下一轮' };
 const eventLabels: Record<string, string> = {
   start: '已连接', stop: '已停止', cycle_error: '本轮出错', skip: '跳过执行', tx_signed: '交易已签名', tx_confirmed: '交易已确认',
-  close_quote: '撤出报价', minted: '已开仓', mint_skipped: '未开仓', stake_failed: '质押失败',
+  close_quote: '撤出报价', minted: '已开仓', mint_skipped: '未开仓', stake_failed: '质押失败', ledger_error: '记账失败',
 };
 const dates = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const prices = new Intl.NumberFormat('zh-CN', { maximumSignificantDigits: 6 });
 function time(value: string | number | null | undefined) { const ms = typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(ms) ? dates.format(ms) : '—'; }
 function price(value: number | null | undefined) { return typeof value === 'number' && Number.isFinite(value) ? prices.format(value) : '—'; }
+const amountFormats = [{ maximumSignificantDigits: 4 }, { maximumFractionDigits: 4 }, { maximumFractionDigits: 2 }].map(options => new Intl.NumberFormat('zh-CN', options));
+const percents = new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 2 });
+// Wallet and position amounts: fewer decimals as the magnitude grows; dust shows as a bound, not 18 digits.
+function amount(value: string | number | null | undefined) {
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+  if (n === 0) return '0';
+  const size = Math.abs(n);
+  if (size < 0.000001) return n < 0 ? '>-0.000001' : '<0.000001';
+  return amountFormats[size >= 1000 ? 2 : size >= 1 ? 1 : 0].format(n);
+}
+function percent(value: number | null | undefined) { return typeof value === 'number' && Number.isFinite(value) ? percents.format(value) : '—'; }
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '请求失败，请重试。'; }
 const short = (address: string) => `${address.slice(0, 6)}…${address.slice(-4)}`;
+
+// Where the current price sits relative to a range, on a log-price axis padded around both.
+function spot(range: [number, number], current: number) {
+  const [lower, upper] = range;
+  const state = current < lower ? 'below' : current >= upper ? 'above' : 'in';
+  const text = state === 'below' ? `低于下沿 ${percent(lower / current - 1)}` : state === 'above' ? `高于上沿 ${percent(current / upper - 1)}` : `区间内 ${percent((current - lower) / (upper - lower))}`;
+  const lo = Math.log(Math.min(lower, current)), hi = Math.log(Math.max(upper, current)), pad = (hi - lo) * 0.06 || 0.01;
+  const at = (v: number) => ((Math.log(v) - lo + pad) / (hi - lo + pad * 2)) * 100;
+  return { state, text, left: at(lower), width: at(upper) - at(lower), marker: at(current) };
+}
+function RangeSpot({ range, current }: { range: [number, number]; current: number }) {
+  if (!(current > 0 && range[0] > 0 && range[1] > 0)) return <>—</>;
+  const s = spot(range, current);
+  return <div className={`lp-spot ${s.state}`}><span className="lp-spot-bar" aria-hidden="true"><span className="lp-spot-range" style={{ left: `${s.left}%`, width: `${s.width}%` }} /><span className="lp-spot-marker" style={{ left: `${s.marker}%` }} /></span><span>{s.text}</span></div>;
+}
+// The headline position: the first live one, staked first.
+function mainPosition(cycle: AeroLpCycle | null | undefined): AeroLpPosition | undefined {
+  const live = cycle?.positions.filter(p => p.liquidity !== '0') ?? [];
+  return live.find(p => p.staked) ?? live[0];
+}
+function aprFact(cycle: AeroLpCycle | null | undefined, quote: string) {
+  const rewards = cycle?.rewards;
+  const pool = typeof rewards?.poolPerDay === 'number' ? `池子排放 ${amount(rewards.poolPerDay)} AERO/天` : null;
+  const priced = typeof rewards?.price === 'number' ? `AERO ${price(rewards.price)} ${quote}` : null;
+  const p = mainPosition(cycle);
+  if (!cycle) return { value: '—', hint: '尚未完成检查' };
+  if (!rewards) return { value: '—', hint: cycle.rewardsError ? '奖励数据读取失败，下一轮重试' : '奖励数据暂不可用' };
+  if (!p) return { value: '—', hint: [pool, '暂无头寸'].filter(Boolean).join(' · ') };
+  if (!p.staked) return { value: '—', hint: '头寸未质押，不分 AERO 排放' };
+  if (typeof p.apr !== 'number') return { value: '—', hint: rewards.poolPerDay === null ? '需要两轮检查测出排放速率' : priced ? '头寸价值无法估算' : 'AERO 报价不可用' };
+  const basis = p.apr === 0 ? '价格高于上沿，不分排放' : p.aprEstimated ? '价格低于区间：按刚进入下沿时估算' : '区间内实时';
+  return { value: percent(p.apr), hint: [basis, priced, pool].filter(Boolean).join(' · ') };
+}
+function rewardFact(cycle: AeroLpCycle | null | undefined, ledger: AeroLpLedger | null, quote: string) {
+  const rewards = cycle?.rewards;
+  const parts: string[] = [];
+  if (rewards && Number(rewards.deferred) > 0) parts.push(`延后发放 ${amount(rewards.deferred)}`);
+  if (ledger) parts.push(`累计到账 ${amount(ledger.reward)}`);
+  if (rewards && typeof rewards.price === 'number') parts.push(`≈ ${amount(Number(rewards.pending) * rewards.price)} ${quote}`);
+  return { value: rewards ? `待领取 ${amount(rewards.pending)}` : '—', hint: parts.join(' · ') || undefined };
+}
+function gasFact(ledger: AeroLpLedger | null) {
+  if (!ledger) return { value: '—', hint: '交易账本暂不可用' };
+  const failed = ledger.failed ? `，${ledger.failed} 笔回滚或未上链` : '';
+  return { value: `${amount(ledger.gasEth)} ETH`, hint: `${ledger.txs} 笔交易${failed}${ledger.since ? ` · 自 ${time(ledger.since)}` : ''}` };
+}
 
 type Field = { key: keyof AeroLpConfig; label: string; kind: 'text' | 'integer' | 'number'; hint?: string; wide?: boolean };
 const strategyFields: Field[] = [
@@ -130,6 +188,8 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
   const cycle = snapshot?.lastCycle;
   const idle = snapshot?.state === 'stopped' || snapshot?.state === 'fault';
   const symbols = cycle ? Object.keys(cycle.wallet) : [];
+  const [symbol0, symbol1] = cycle?.symbols ?? [symbols[0] ?? '代币', 'USDC'];
+  const apr = aprFact(cycle, symbol1), reward = rewardFact(cycle, snapshot?.ledger ?? null, symbol1), gas = gasFact(snapshot?.ledger ?? null);
   return <div className="lp-page">
     <header className="lp-heading"><div><h1>Aero LP 单边调仓</h1><p>Aerodrome Slipstream（Base）· 价格跌出区间时把下沿移到现价上方，上沿固定</p></div><div className="lp-toolbar">
       <button className="button secondary" onClick={() => void read()} disabled={!!busy || loading} aria-label="刷新状态"><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
@@ -149,11 +209,16 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
           <Fact label="现价（USDC）" hint={cycle ? `区块 ${cycle.block} · ${time(cycle.at)}` : '尚未完成检查'}>{price(cycle?.price)}</Fact>
           <Fact label="TWAP" hint={cycle?.twapError ? 'TWAP 读取失败，本轮暂缓调仓' : `${snapshot.config.twapSec} 秒窗口`}>{price(cycle?.twapPrice)}</Fact>
           <Fact label="目标区间" hint={cycle && !cycle.target ? '价格已到上沿或以上' : undefined}>{cycle?.target ? `${price(cycle.target[0])} – ${price(cycle.target[1])}` : '—'}</Fact>
-          <Fact label="钱包余额" hint={snapshot.wallet ? short(snapshot.wallet) : '未设置私钥'}>{symbols.length ? symbols.map(s => <span className="lp-balance" key={s}>{s} {cycle!.wallet[s]}</span>) : '—'}</Fact>
+          <Fact label="钱包余额" hint={snapshot.wallet ? short(snapshot.wallet) : '未设置私钥'}>{symbols.length ? symbols.map(s => <span className="lp-balance" key={s}>{s} {amount(cycle!.wallet[s])}</span>) : '—'}</Fact>
+          <Fact label="AERO 年化" hint={apr.hint}>{apr.value}</Fact>
+          <Fact label="AERO 奖励" hint={reward.hint}>{reward.value}</Fact>
+          <Fact label="累计 Gas" hint={gas.hint}>{gas.value}</Fact>
         </dl>
-        <div className="lp-table-scroll"><table className="lp-table"><caption className="visually-hidden">本钱包在池中的头寸</caption><thead><tr><th>头寸</th><th>区间（USDC）</th><th>质押</th><th>流动性</th></tr></thead><tbody>
-          {cycle?.positions.length ? cycle.positions.map(p => <tr key={p.id}><th scope="row">#{p.id}</th><td>{price(p.range[0])} – {price(p.range[1])}</td><td>{p.staked ? '已质押' : '未质押'}</td><td>{p.liquidity}</td></tr>)
-            : <tr><td colSpan={4} className="lp-table-empty">{cycle ? '本池暂无头寸' : '等待第一轮检查'}</td></tr>}
+        <div className="lp-table-scroll"><table className="lp-table"><caption className="visually-hidden">本钱包在池中的头寸</caption><thead><tr><th>头寸</th><th>区间（USDC）</th><th>现价位置</th><th>持有</th><th>价值（USDC）</th><th>AERO 年化</th><th>质押</th></tr></thead><tbody>
+          {cycle?.positions.length ? cycle.positions.map(p => <tr key={p.id}><th scope="row">#{p.id}</th><td>{price(p.range[0])} – {price(p.range[1])}</td><td><RangeSpot range={p.range} current={cycle.price} /></td>
+            <td>{typeof p.amount0 === 'number' ? <>{amount(p.amount0)} {symbol0}{p.amount1 ? <><br />{amount(p.amount1)} {symbol1}</> : null}</> : '—'}</td><td>{amount(p.value)}</td>
+            <td>{typeof p.apr === 'number' ? `${percent(p.apr)}${p.aprEstimated ? '（估）' : ''}` : '—'}</td><td>{p.staked ? '已质押' : '未质押'}</td></tr>)
+            : <tr><td colSpan={7} className="lp-table-empty">{cycle ? '本池暂无头寸' : '等待第一轮检查'}</td></tr>}
         </tbody></table></div>
         {cycle ? <p className="lp-plan"><span>本轮动作：{cycle.actions.length ? cycle.actions.join('、') : '无'}</span>{cycle.notes.map(note => <span key={note}>{note}</span>)}</p> : null}
       </section>
