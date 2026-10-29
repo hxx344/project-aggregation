@@ -6,7 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Wallet, formatEther, formatUnits, getAddress, parseEther, parseUnits } from 'ethers';
-import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
+import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, emissionPerDay, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
 import { connect, errorText, execute, provider, readRewards, readState, reconcileLedger } from './chain.mjs';
 
 const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]  |  lp run --managed --config FILE --data DIR';
@@ -116,7 +116,9 @@ function rewardView(ctx, state, rewards, memory) {
     const { amount0, amount1 } = positionAmounts(p, state.sqrtPrice, ctx.decimals0, ctx.decimals1);
     const value = amount0 * tickToPrice(state.tick, ctx.decimals0, ctx.decimals1) + amount1;
     const apr = p.staked && perSecond !== null ? emissionApr({ rewardPerSecond: perSecond, rewardPrice: rewards.price, stakedLiquidity: rewards.stakedLiquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 }) : null;
-    return { amount0: round(amount0), amount1: round(amount1), value: round(value), apr: apr && round(apr.apr, 4), aprEstimated: apr?.estimated ?? false };
+    const daily = p.staked && perSecond !== null ? emissionPerDay({ rewardPerSecond: perSecond, stakedLiquidity: rewards.stakedLiquidity, position: p, price }) : null;
+    return { amount0: round(amount0), amount1: round(amount1), value: round(value), apr: apr && round(apr.apr, 4), aprEstimated: apr?.estimated ?? false,
+      aeroPerDay: daily && round(daily.perDay), aeroPerDayEstimated: daily?.estimated ?? false };
   });
   return {
     summary: {

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { belowTwap, emissionApr, nearestUsableTick, parseLedger, planCycle, positionAmounts, rangeState, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
+import { belowTwap, emissionApr, emissionPerDay, nearestUsableTick, parseLedger, planCycle, positionAmounts, rangeState, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
 import { Interface, ZeroAddress, getAddress } from 'ethers';
 import { connect, execute, readRewards, reconcileLedger } from '../tools/aero-lp/chain.mjs';
 import { validateSettings } from '../tools/aero-lp/core.mjs';
@@ -192,6 +192,26 @@ test('ledger reconcile records fees with the L1 fee and reward transfers into th
   ], 'newest signatures first; a recent tx without a receipt waits for the next cycle');
 });
 
+test('ledger counts a gauge withdraw reward once: xAERO minted and burned elsewhere, new AERO minted to the wallet', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-lp-reward-'));
+  const NEW = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee', XAERO = '0x6CdDa0E730744DC6fF67654B35350Adad05EceE7', CONVERTER = '0x8c37000000000000000000000000000000000000';
+  const now = Date.parse('2026-10-29T12:00:00Z');
+  writeFileSync(join(dir, 'events.jsonl'), JSON.stringify({ at: '2026-10-29T11:00:00.000Z', event: 'tx_signed', label: 'withdraw', hash: hash(7) }) + '\n');
+  const topic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const pad = (a) => '0x' + a.slice(2).toLowerCase().padStart(64, '0');
+  const amount = '0x' + (59n).toString(16).padStart(64, '0');
+  const receipt = { from: WALLET, status: '0x1', blockNumber: '0x20', gasUsed: '0x1', effectiveGasPrice: '0x1', logs: [
+    { address: XAERO, topics: [topic, pad(ZeroAddress), pad(CONVERTER)], data: amount },
+    { address: XAERO, topics: [topic, pad(CONVERTER), pad(ZeroAddress)], data: amount },
+    { address: NEW, topics: [topic, pad(ZeroAddress), pad(WALLET)], data: amount },
+  ] };
+  const ctx = { rewardTokens: [NEW, XAERO], rpc: { send: async () => receipt } };
+  const written = [];
+  await reconcileLedger(ctx, dir, WALLET, (e) => written.push(e), { now });
+  assert.equal(written.length, 1);
+  assert.equal(written[0].reward, '59');
+});
+
 test('reward reads give up after the time budget instead of delaying the cycle', async () => {
   const never = () => new Promise(() => {});
   const ctx = { pool: { rewardGrowthGlobalX128: never, lastUpdated: never, stakedLiquidity: never }, gauge: { deferredEmissions: never }, aero: { balanceOf: never }, xaero: null, routerFactory: null };
@@ -206,6 +226,34 @@ test('range state follows the pool: lower tick inclusive, upper tick exclusive',
   assert.equal(rangeState(p, -337000), 'in');
   assert.equal(rangeState(p, -330001), 'in');
   assert.equal(rangeState(p, -330000), 'above');
+});
+
+test('daily AERO estimate: live share in range, entry estimate below, zero above, no price needed', () => {
+  const position = { liquidity: 10n ** 18n, tickLower: -337000, tickUpper: UPPER };
+  const common = { rewardPerSecond: 0.1, stakedLiquidity: 9n * 10n ** 18n, position };
+  const day = 0.1 * 86_400;
+  const inside = emissionPerDay({ ...common, price: { tick: -333000 } });
+  close(inside.perDay, day / 9, 'in range: L / stakedLiquidity');
+  assert.equal(inside.estimated, false);
+  const below = emissionPerDay({ ...common, price: { tick: -337100 } });
+  close(below.perDay, day / 10, 'below adds own liquidity');
+  assert.equal(below.estimated, true);
+  assert.deepEqual(emissionPerDay({ ...common, price: { tick: UPPER } }), { perDay: 0, estimated: false });
+  assert.equal(emissionPerDay({ ...common, rewardPerSecond: null, price: { tick: -333000 } }), null);
+});
+
+test('AERO is priced from the deeper legacy token; the new token only when the legacy one has no route', async () => {
+  const NEW = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee', LEGACY = '0x940181a94A35A4569E4529A3CDfB74e38FD98631';
+  const quotes = { [NEW]: 900_000n, [LEGACY]: 661_459n };
+  const ctx = {
+    pool: { rewardGrowthGlobalX128: async () => 0n, lastUpdated: async () => 1n, stakedLiquidity: async () => 0n },
+    gauge: { deferredEmissions: async () => 0n }, aero: { balanceOf: async () => 5n }, xaero: null,
+    routerFactory: '0x' + '55'.repeat(20), token1: '0x' + '66'.repeat(20), decimals1: 6,
+    router: { getAmountsOut: async (amount, [route]) => [amount, quotes[route.from]] },
+  };
+  assert.equal((await readRewards(ctx, WALLET, [])).price, 0.661459, 'a thin new-token pool does not override the 1:1 legacy quote');
+  quotes[LEGACY] = 0n;
+  assert.equal((await readRewards(ctx, WALLET, [])).price, 0.9);
 });
 
 // 只读调用按函数名应答的假 RPC：可以伪造任意只读结果，用来确认签名目标只取自配置。
@@ -236,6 +284,7 @@ test('approve target comes from config: an RPC that reports another gauge is ref
   assert.equal(ctx.addresses.gauge, getAddress(config.gauge));
   assert.equal(ctx.gauge.target, getAddress(config.gauge));
   assert.equal(ctx.nft.target, getAddress(config.nft));
+  assert.ok(ctx.rewardTokens.includes('0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee'), 'rewards minted as the new AERO count in the ledger');
   const forged = '0x' + '44'.repeat(20);
   // 伪造的 gauge 自报的 pool/nft 也全部「匹配」，仍然拒绝连接。
   await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, gauge: forged }) }), /config\.gauge/);

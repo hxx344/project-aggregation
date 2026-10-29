@@ -62,9 +62,23 @@ function aprFact(cycle: AeroLpCycle | null | undefined, quote: string) {
   if (!rewards) return { value: '—', hint: cycle.rewardsError ? '奖励数据读取失败，下一轮重试' : '奖励数据暂不可用' };
   if (!p) return { value: '—', hint: [pool, '暂无头寸'].filter(Boolean).join(' · ') };
   if (!p.staked) return { value: '—', hint: '头寸未质押，不分 AERO 排放' };
-  if (typeof p.apr !== 'number') return { value: '—', hint: rewards.poolPerDay === null ? '需要两轮检查测出排放速率' : priced ? '头寸价值无法估算' : 'AERO 报价不可用' };
+  if (typeof p.apr !== 'number') return { value: '—', hint: rewards.poolPerDay === null ? '需要两轮检查测出排放速率' : rewards.poolPerDay === 0 ? '池子当前无排放' : priced ? '头寸价值无法估算' : 'AERO 报价不可用' };
   const basis = p.apr === 0 ? '价格高于上沿，不分排放' : p.aprEstimated ? '价格低于区间：按刚进入下沿时估算' : '区间内实时';
   return { value: percent(p.apr), hint: [basis, priced, pool].filter(Boolean).join(' · ') };
+}
+// Expected AERO per day across the live staked positions; below-range positions count at their lower-bound entry estimate.
+function dailyFact(cycle: AeroLpCycle | null | undefined, quote: string) {
+  const rewards = cycle?.rewards;
+  if (!cycle) return { value: '—', hint: '尚未完成检查' };
+  if (!rewards) return { value: '—', hint: cycle.rewardsError ? '奖励数据读取失败，下一轮重试' : '奖励数据暂不可用' };
+  const staked = cycle.positions.filter(p => p.staked && p.liquidity !== '0');
+  if (!staked.length) return { value: '—', hint: cycle.positions.some(p => p.liquidity !== '0') ? '头寸未质押，不分 AERO 排放' : '暂无头寸' };
+  const known = staked.filter(p => typeof p.aeroPerDay === 'number');
+  if (known.length < staked.length) return { value: '—', hint: rewards.poolPerDay === null ? '需要两轮检查测出排放速率' : rewards.poolPerDay === 0 ? '池子当前无排放' : '头寸份额无法估算' };
+  const total = known.reduce((sum, p) => sum + p.aeroPerDay!, 0);
+  const basis = total === 0 ? '价格高于上沿，不分排放' : known.some(p => p.aeroPerDayEstimated) ? '价格低于区间：按刚进入下沿时估算' : '区间内实时';
+  const worth = typeof rewards.price === 'number' ? `≈ ${amount(total * rewards.price)} ${quote}/天` : null;
+  return { value: `${amount(total)} AERO`, hint: [basis, worth, staked.length > 1 ? `${staked.length} 个质押头寸合计` : null].filter(Boolean).join(' · ') };
 }
 function rewardFact(cycle: AeroLpCycle | null | undefined, ledger: AeroLpLedger | null, quote: string) {
   const rewards = cycle?.rewards;
@@ -195,7 +209,7 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
   const idle = snapshot?.state === 'stopped' || snapshot?.state === 'fault';
   const symbols = cycle ? Object.keys(cycle.wallet) : [];
   const [symbol0, symbol1] = cycle?.symbols ?? [symbols[0] ?? '代币', 'USDC'];
-  const apr = aprFact(cycle, symbol1), reward = rewardFact(cycle, snapshot?.ledger ?? null, symbol1), gas = gasFact(snapshot?.ledger ?? null);
+  const apr = aprFact(cycle, symbol1), daily = dailyFact(cycle, symbol1), reward = rewardFact(cycle, snapshot?.ledger ?? null, symbol1), gas = gasFact(snapshot?.ledger ?? null);
   return <div className="lp-page">
     <header className="lp-heading"><div><h1>Aero LP 单边调仓</h1><p>Aerodrome Slipstream（Base）· 价格跌出区间时把下沿移到现价上方，上沿固定</p></div><div className="lp-toolbar">
       <button className="button secondary" onClick={() => void read()} disabled={!!busy || loading} aria-label="刷新状态"><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
@@ -217,14 +231,16 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
           <Fact label="目标区间" hint={cycle && !cycle.target ? '价格已到上沿或以上' : undefined}>{cycle?.target ? `${price(cycle.target[0])} – ${price(cycle.target[1])}` : '—'}</Fact>
           <Fact label="钱包余额" hint={snapshot.wallet ? short(snapshot.wallet) : '未设置私钥'}>{symbols.length ? symbols.map(s => <span className="lp-balance" key={s}>{s} {amount(cycle!.wallet[s])}</span>) : '—'}</Fact>
           <Fact label="AERO 年化" hint={apr.hint}>{apr.value}</Fact>
+          <Fact label="预估每日 AERO" hint={daily.hint}>{daily.value}</Fact>
           <Fact label="AERO 奖励" hint={reward.hint}>{reward.value}</Fact>
           <Fact label="累计 Gas" hint={gas.hint}>{gas.value}</Fact>
         </dl>
-        <div className="lp-table-scroll"><table className="lp-table"><caption className="visually-hidden">本钱包在池中的头寸</caption><thead><tr><th>头寸</th><th>区间（USDC）</th><th>现价位置</th><th>持有</th><th>价值（USDC）</th><th>AERO 年化</th><th>质押</th></tr></thead><tbody>
+        <div className="lp-table-scroll"><table className="lp-table"><caption className="visually-hidden">本钱包在池中的头寸</caption><thead><tr><th>头寸</th><th>区间（USDC）</th><th>现价位置</th><th>持有</th><th>价值（USDC）</th><th>AERO 年化</th><th>AERO/天</th><th>质押</th></tr></thead><tbody>
           {cycle?.positions.length ? cycle.positions.map(p => <tr key={p.id}><th scope="row">#{p.id}</th><td>{price(p.range[0])} – {price(p.range[1])}</td><td><RangeSpot range={p.range} current={cycle.price} state={p.state} /></td>
             <td>{typeof p.amount0 === 'number' ? <>{amount(p.amount0)} {symbol0}{p.amount1 ? <><br />{amount(p.amount1)} {symbol1}</> : null}</> : '—'}</td><td>{amount(p.value)}</td>
-            <td>{typeof p.apr === 'number' ? `${percent(p.apr)}${p.aprEstimated ? '（估）' : ''}` : '—'}</td><td>{p.staked ? '已质押' : '未质押'}</td></tr>)
-            : <tr><td colSpan={7} className="lp-table-empty">{cycle ? '本池暂无头寸' : '等待第一轮检查'}</td></tr>}
+            <td>{typeof p.apr === 'number' ? `${percent(p.apr)}${p.aprEstimated ? '（估）' : ''}` : '—'}</td>
+            <td>{typeof p.aeroPerDay === 'number' ? `${amount(p.aeroPerDay)}${p.aeroPerDayEstimated ? '（估）' : ''}` : '—'}</td><td>{p.staked ? '已质押' : '未质押'}</td></tr>)
+            : <tr><td colSpan={8} className="lp-table-empty">{cycle ? '本池暂无头寸' : '等待第一轮检查'}</td></tr>}
         </tbody></table></div>
         {cycle ? <p className="lp-plan"><span>本轮动作：{cycle.actions.length ? cycle.actions.join('、') : '无'}</span>{cycle.notes.map(note => <span key={note}>{note}</span>)}</p> : null}
       </section>

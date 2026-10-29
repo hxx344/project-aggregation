@@ -10,8 +10,10 @@ const READ_ATTEMPTS = 3;
 const RECEIPT_TIMEOUT_MS = 180_000;
 const DEADLINE_SEC = 600;
 const MAX_UINT128 = (1n << 128n) - 1n;
-// 奖励代币报价用 Aerodrome 主路由（volatile 池，默认工厂）；xAERO 是排放收据代币，地址从 gauge 的 voter 读取。
-const AERO = '0x940181a94A35A4569E4529A3CDfB74e38FD98631';
+// gauge 解押时奖励先记为 xAERO（排放收据代币，地址从 gauge 的 voter 读取），随即销毁并 1:1 铸成新 AERO 发到钱包；
+// 旧 AERO 仍计入奖励到账。报价用 Aerodrome 主路由（volatile 池，默认工厂）：两者 1:1，优先用池子更深的旧 AERO 报价，避免新 AERO 的薄池带偏；旧 AERO 报不出价时才用新 AERO。
+const AERO = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee';
+const LEGACY_AERO = '0x940181a94A35A4569E4529A3CDfB74e38FD98631';
 const ROUTER = '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';
 const TRANSFER_TOPIC = id('Transfer(address,address,uint256)');
 
@@ -136,7 +138,7 @@ export async function connect({ rpcUrl, pool: poolAddress, token, token1: expect
     xaero: receiptToken && new Contract(receiptToken, ERC20_ABI, rpc),
     router, routerFactory,
     // 池内代币（例如 AERO 本身是池子一侧）撤仓收回时不算奖励。
-    rewardTokens: [AERO, receiptToken].filter((a) => a && ![token0, token1].some((t) => getAddress(t) === a)),
+    rewardTokens: [AERO, LEGACY_AERO, receiptToken].filter((a) => a && ![token0, token1].some((t) => getAddress(t) === a)),
     addresses: { pool: getAddress(poolAddress), gauge, nft: getAddress(expectedNft), factory: factoryAddress, gaugeFactory: gaugeFactoryAddress },
   };
 }
@@ -303,9 +305,8 @@ export async function readRewards(ctx, wallet, stakedIds, budgetMs = REWARDS_BUD
 }
 
 async function rewardReads(ctx, wallet, stakedIds) {
-  const quote = ctx.routerFactory
-    ? ctx.router.getAmountsOut(10n ** 18n, [{ from: AERO, to: ctx.token1, stable: false, factory: ctx.routerFactory }]).then((amounts) => Number(formatUnits(amounts[1], ctx.decimals1)), () => null)
-    : null;
+  const quoteOf = (from) => ctx.router.getAmountsOut(10n ** 18n, [{ from, to: ctx.token1, stable: false, factory: ctx.routerFactory }]).then((amounts) => Number(formatUnits(amounts[1], ctx.decimals1)), () => null);
+  const quote = ctx.routerFactory ? Promise.all([quoteOf(AERO), quoteOf(LEGACY_AERO)]).then(([current, legacy]) => legacy || current || null) : null;
   const [growth, updatedAt, stakedLiquidity, pending, deferred, aero, xaero, price] = await Promise.all([
     ctx.pool.rewardGrowthGlobalX128(), ctx.pool.lastUpdated(), ctx.pool.stakedLiquidity(),
     stakedIds.length ? ctx.gauge.earned(wallet, stakedIds) : 0n,
@@ -332,7 +333,7 @@ function readTail(file, bytes) {
 }
 
 // 按事件日志里已签名的哈希补读回执，追加到 txs.jsonl（不轮转）：手续费含 Base 的 L1 数据费，
-// reward 为本交易转入钱包的 AERO/xAERO。回执未出现的下轮再查，签名超过 1 天仍无回执按 wallet 记为 missing。
+// reward 为本交易转入钱包的 AERO（新旧合约）/xAERO。回执未出现的下轮再查，签名超过 1 天仍无回执按 wallet 记为 missing。
 // 每次最多查 20 笔（新签名的优先），总耗时超过 15 秒剩余的留到下轮。
 export async function reconcileLedger(ctx, dataDir, wallet, append, { now = Date.now(), budgetMs = RECONCILE_BUDGET_MS } = {}) {
   const known = new Set(parseLedger(readOptional(join(dataDir, LEDGER_FILE))).map((e) => e.hash.toLowerCase()));

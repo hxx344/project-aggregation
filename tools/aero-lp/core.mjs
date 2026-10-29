@@ -88,20 +88,35 @@ export function positionAmounts({ liquidity, tickLower, tickUpper }, sqrtPrice, 
   return { amount0: (L * (sb - sp)) / (sp * sb) / 10 ** decimals0, amount1: (L * (sp - sa)) / 10 ** decimals1 };
 }
 
-// 质押头寸的 AERO 排放年化：头寸按流动性占活跃质押流动性的比例分得排放。
-// 价格低于区间时头寸不在活跃流动性里，按「价格刚进入下沿」估算：分母加上本头寸，价值按下沿价格折算。
-export function emissionApr({ rewardPerSecond, rewardPrice, stakedLiquidity, position, price, decimals0, decimals1 }) {
+// 头寸占活跃质押流动性的比例：价格低于区间时头寸不在活跃流动性里，按「价格刚进入下沿」估算（分母加上本头寸）；
+// 价格在上沿或以上时不分排放。
+function emissionShare({ stakedLiquidity, position, price }) {
   const L = Number(position.liquidity);
-  if (!(rewardPerSecond > 0) || !(rewardPrice > 0) || !(L > 0)) return null;
-  const sqrtLower = 1.0001 ** (position.tickLower / 2);
-  if (price.tick >= position.tickUpper) return { apr: 0, estimated: false };
+  if (!(L > 0)) return null;
+  if (price.tick >= position.tickUpper) return { share: 0, entering: false };
   const entering = price.tick < position.tickLower;
   const share = L / (Number(stakedLiquidity) + (entering ? L : 0));
-  const sqrt = entering ? sqrtLower : price.sqrt;
+  return share > 0 && share <= 1 ? { share, entering } : null;
+}
+
+// 质押头寸预估每天分得的 AERO 数量（不依赖报价）。
+export function emissionPerDay({ rewardPerSecond, stakedLiquidity, position, price }) {
+  if (!(rewardPerSecond > 0)) return null;
+  const s = emissionShare({ stakedLiquidity, position, price });
+  return s && { perDay: rewardPerSecond * 86_400 * s.share, estimated: s.entering };
+}
+
+// 质押头寸的 AERO 排放年化：按 emissionShare 分得排放，价格低于区间时价值按下沿价格折算。
+export function emissionApr({ rewardPerSecond, rewardPrice, stakedLiquidity, position, price, decimals0, decimals1 }) {
+  if (!(rewardPerSecond > 0) || !(rewardPrice > 0)) return null;
+  const s = emissionShare({ stakedLiquidity, position, price });
+  if (!s) return null;
+  if (s.share === 0) return { apr: 0, estimated: false };
+  const sqrt = s.entering ? 1.0001 ** (position.tickLower / 2) : price.sqrt;
   const { amount0, amount1 } = positionAmounts(position, sqrt, decimals0, decimals1);
   const value = amount0 * sqrt * sqrt * 10 ** (decimals0 - decimals1) + amount1;
-  if (!(value > 0) || !(share > 0) || share > 1) return null;
-  return { apr: (rewardPerSecond * SECONDS_PER_YEAR * rewardPrice * share) / value, estimated: entering };
+  if (!(value > 0)) return null;
+  return { apr: (rewardPerSecond * SECONDS_PER_YEAR * rewardPrice * s.share) / value, estimated: s.entering };
 }
 
 // 可配置参数（工作台页面与 CLI 共用同一套校验）。连接类参数变化时需要重连链上合约。
