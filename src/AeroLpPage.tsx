@@ -84,7 +84,7 @@ type Field = { key: keyof AeroLpConfig; label: string; kind: 'text' | 'integer' 
 const strategyFields: Field[] = [
   { key: 'upperPrice', label: '固定上沿价格（USDC）', kind: 'number', hint: '按最近的可用格点取整' },
   { key: 'gapBps', label: '下沿高于现价（bps）', kind: 'integer', hint: '40 = 0.4%，再向上取到格点' },
-  { key: 'intervalSec', label: '检查间隔（秒）', kind: 'integer', hint: '60–86400' },
+  { key: 'intervalSec', label: '检查间隔（秒）', kind: 'integer', hint: '10–86400' },
   { key: 'minDeploy', label: '最小开仓数量（代币）', kind: 'text', hint: '可投入余额低于此值不开仓' },
   { key: 'keepInWallet', label: '钱包保留数量（代币）', kind: 'text', hint: '这部分不投入' },
   { key: 'minEthForGas', label: '最低 ETH 余额', kind: 'text', hint: '低于此值只记日志，不发交易' },
@@ -98,8 +98,11 @@ const connectionFields: Field[] = [
   { key: 'rpcUrl', label: 'Base RPC（https）', kind: 'text', wide: true },
   { key: 'pool', label: '池子地址', kind: 'text', wide: true },
   { key: 'token', label: '投入代币（token0）', kind: 'text', wide: true },
+  { key: 'token1', label: '计价代币（token1）', kind: 'text', wide: true },
+  { key: 'tickSpacing', label: '格点间距', kind: 'integer', hint: '须与池子一致' },
   { key: 'factory', label: '池工厂', kind: 'text', wide: true },
   { key: 'nft', label: '头寸 NFT 合约', kind: 'text', wide: true },
+  { key: 'gauge', label: '质押 gauge（NFT 只授权给它）', kind: 'text', wide: true },
 ];
 const allFields = [...strategyFields, ...guardFields, ...connectionFields];
 type Draft = Record<keyof AeroLpConfig, string>;
@@ -206,7 +209,7 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
       <section className="panel lp-status" aria-label="运行状态">
         <div className="lp-state-line"><span className={`lp-state ${snapshot.state}`}><Droplets size={16} />{stateLabels[snapshot.state]}</span>
           {snapshot.phase ? <span>{phaseLabels[snapshot.phase.name] || snapshot.phase.name}{snapshot.phase.name === 'sleeping' && snapshot.phase.nextAt ? `，下一轮 ${time(snapshot.phase.nextAt)}` : ''}</span> : null}
-          {snapshot.paused ? <span className="lp-paused">工作台更新维护中：只检查不发交易</span> : null}
+          {snapshot.paused ? <span className="lp-paused">{snapshot.pauseReason === 'recovery' ? '账户写入隔离恢复中' : '工作台更新维护中'}：只检查不发交易</span> : null}
           {snapshot.error ? <p className="lp-error">{snapshot.error}</p> : null}</div>
         <dl className="lp-facts">
           <Fact label="现价（USDC）" hint={cycle ? `区块 ${cycle.block} · ${time(cycle.at)}` : '尚未完成检查'}>{price(cycle?.price)}</Fact>

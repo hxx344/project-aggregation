@@ -93,8 +93,9 @@ export function provider(rpcUrl) {
 }
 
 // 从池地址出发解析 gauge 与 NFT 管理器，并与配置里固定的工厂、NFT 管理器地址逐项比对：
-// 池地址写错或被替换时，不会把代币授权给池子自报的合约。
-export async function connect({ rpcUrl, pool: poolAddress, token, factory: expectedFactory, nft: expectedNft }, runner) {
+// 池地址写错或被替换时，不会把代币授权给池子自报的合约。NFT 的授权对象 gauge 同样由配置固定：
+// RPC 被篡改时可以伪造全部只读结果，但签名交易的目标与开仓定位池子的参数都只取自配置。
+export async function connect({ rpcUrl, pool: poolAddress, token, token1: expectedToken1, tickSpacing: expectedSpacing, factory: expectedFactory, nft: expectedNft, gauge: expectedGauge }, runner) {
   const rpc = runner?.provider || provider(rpcUrl);
   const chainId = await read('chainId', () => rpc.send('eth_chainId', []));
   if (Number(chainId) !== BASE_CHAIN_ID) throw new Error(`rpc chainId ${Number(chainId)} is not Base (${BASE_CHAIN_ID})`);
@@ -102,12 +103,16 @@ export async function connect({ rpcUrl, pool: poolAddress, token, factory: expec
   const [token0, token1, spacing, gaugeAddress, factoryAddress] = await read('pool', () => Promise.all([pool.token0(), pool.token1(), pool.tickSpacing(), pool.gauge(), pool.factory()]));
   if (getAddress(token0) !== getAddress(token)) throw new Error(`pool token0 ${token0} is not configured token ${token}; single-sided range above price requires the asset to be token0`);
   if (getAddress(factoryAddress) !== getAddress(expectedFactory)) throw new Error(`pool factory ${factoryAddress} != config.factory ${expectedFactory}`);
+  if (getAddress(token1) !== getAddress(expectedToken1)) throw new Error(`pool token1 ${token1} != config.token1 ${expectedToken1}`);
+  if (Number(spacing) !== expectedSpacing) throw new Error(`pool tickSpacing ${spacing} != config.tickSpacing ${expectedSpacing}`);
+  if (getAddress(gaugeAddress) !== getAddress(expectedGauge)) throw new Error(`pool gauge ${gaugeAddress} != config.gauge ${expectedGauge}`);
   const factory = new Contract(factoryAddress, FACTORY_ABI, rpc);
   const registered = await read('factory.getPool', () => factory.getPool(token0, token1, spacing));
   if (getAddress(registered) !== getAddress(poolAddress)) throw new Error(`factory ${factoryAddress} does not list pool ${poolAddress}`);
-  const gaugeRead = new Contract(gaugeAddress, GAUGE_ABI, rpc);
+  const gauge = getAddress(expectedGauge);
+  const gaugeRead = new Contract(gauge, GAUGE_ABI, rpc);
   const [nftAddress, gaugePool, gaugeFactoryAddress] = await read('gauge', () => Promise.all([gaugeRead.nft(), gaugeRead.pool(), gaugeRead.gaugeFactory()]));
-  if (getAddress(gaugePool) !== getAddress(poolAddress)) throw new Error(`gauge ${gaugeAddress} points to pool ${gaugePool}`);
+  if (getAddress(gaugePool) !== getAddress(poolAddress)) throw new Error(`gauge ${gauge} points to pool ${gaugePool}`);
   if (getAddress(nftAddress) !== getAddress(expectedNft)) throw new Error(`gauge nft ${nftAddress} != config.nft ${expectedNft}`);
   const t0 = new Contract(token0, ERC20_ABI, rpc), t1 = new Contract(token1, ERC20_ABI, rpc);
   const [decimals0, decimals1, symbol0, symbol1] = await read('tokens', () => Promise.all([t0.decimals(), t1.decimals(), t0.symbol(), t1.symbol()]));
@@ -120,19 +125,19 @@ export async function connect({ rpcUrl, pool: poolAddress, token, factory: expec
   return {
     rpc,
     runner,
-    spacing: Number(spacing),
-    token0, token1, decimals0: Number(decimals0), decimals1: Number(decimals1), symbol0, symbol1,
+    spacing: expectedSpacing,
+    token0: getAddress(token), token1: getAddress(expectedToken1), decimals0: Number(decimals0), decimals1: Number(decimals1), symbol0, symbol1,
     pool,
-    gauge: new Contract(gaugeAddress, GAUGE_ABI, signerOrProvider),
+    gauge: new Contract(gauge, GAUGE_ABI, signerOrProvider),
     gaugeFactory: new Contract(gaugeFactoryAddress, GAUGE_FACTORY_ABI, rpc),
-    nft: new Contract(nftAddress, NFT_ABI, signerOrProvider),
+    nft: new Contract(getAddress(expectedNft), NFT_ABI, signerOrProvider),
     erc0: new Contract(token0, ERC20_ABI, signerOrProvider),
     aero: new Contract(AERO, ERC20_ABI, rpc),
     xaero: receiptToken && new Contract(receiptToken, ERC20_ABI, rpc),
     router, routerFactory,
     // 池内代币（例如 AERO 本身是池子一侧）撤仓收回时不算奖励。
     rewardTokens: [AERO, receiptToken].filter((a) => a && ![token0, token1].some((t) => getAddress(t) === a)),
-    addresses: { pool: getAddress(poolAddress), gauge: gaugeAddress, nft: nftAddress, factory: factoryAddress, gaugeFactory: gaugeFactoryAddress },
+    addresses: { pool: getAddress(poolAddress), gauge, nft: getAddress(expectedNft), factory: factoryAddress, gaugeFactory: gaugeFactoryAddress },
   };
 }
 
@@ -184,10 +189,13 @@ export async function readState(ctx, wallet, twapSec) {
 
 // 写交易：本地签名后先记录哈希再广播，广播超时也能按哈希核对；只发送一次，
 // 回执最多等 180 秒，超时或回滚都抛出，不在本轮重发（下一轮按链上状态继续）。
+// 每笔签名前检查 halted（工作台维护或账户恢复隔离），为真时不签名并结束本轮剩余步骤。
 async function send(ctx, log, label, method, args) {
   let hash = null;
   try {
     const populated = await ctx.runner.populateTransaction(await method.populateTransaction(...args));
+    // 填充 nonce 与 gas 需要访问 RPC，暂停可能在此期间到达，所以紧挨签名检查。
+    if (ctx.halted?.()) throw Object.assign(new Error(`${label} not sent: workbench halted transactions`), { halted: true });
     const signed = await ctx.runner.signTransaction(populated);
     hash = keccak256(signed);
     log({ event: 'tx_signed', label, hash, nonce: populated.nonce });
@@ -197,6 +205,7 @@ async function send(ctx, log, label, method, args) {
     log({ event: 'tx_confirmed', label, hash, block: receipt.blockNumber });
     return receipt;
   } catch (error) {
+    if (error.halted) { error.signed = false; throw error; }
     const wrapped = new Error(`${label} failed${hash ? ` (${hash})` : ''}: ${errorText(error)}`);
     wrapped.signed = hash !== null; // 已签名：交易可能已上链，结果未知
     throw wrapped;
@@ -260,13 +269,15 @@ async function mint(ctx, log, wallet, { tickLower, tickUpper }, { keepInWallet, 
 // 下一轮再试。已签名的交易结果未知，照常抛出结束本轮，由下一轮按链上状态继续。
 async function tryStake(ctx, log, tokenId) {
   try { await stake(ctx, log, tokenId); } catch (error) {
-    if (error.signed) throw error;
+    if (error.signed || error.halted) throw error;
     log({ event: 'stake_failed', tokenId: String(tokenId), error: errorText(error) });
   }
 }
 
 // 按计划顺序执行：清理 → 补质押 → 撤仓 → 用钱包余额建新仓并质押。除质押外任何一步失败即停止本轮。
-export async function execute(ctx, log, wallet, plan, options) {
+// 中途停止留下的状态（已解押未撤仓、已撤仓未开仓、已开仓未质押）都由下一轮按链上状态继续处理。
+export async function execute(baseCtx, log, wallet, plan, options) {
+  const ctx = options.halted ? { ...baseCtx, halted: options.halted } : baseCtx;
   for (const a of plan.actions) {
     if (a.type === 'cleanup') { if (a.staked) await unstake(ctx, log, a.tokenId); await closePosition(ctx, log, wallet, a.tokenId, options.slippageBps); }
     else if (a.type === 'stake') await tryStake(ctx, log, a.tokenId);

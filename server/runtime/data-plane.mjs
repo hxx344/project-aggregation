@@ -54,7 +54,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const { stmt, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
   const research = createEntropyLighterResearch({ dataDir, enabledByDefault: researchEnabledByDefault, log });
-  const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1', log });
+  const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
+    readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
   const writerDatabase = path.join(dataDir, 'execution-control.sqlite');
   // A legacy external-module launch must not turn off protection for data that
@@ -367,6 +368,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
+    prepareStop: () => aeroLp.prepareStop(),
     initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,

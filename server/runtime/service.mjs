@@ -5,7 +5,9 @@ import { PROTOCOL_VERSION, RuntimeError, validateMaintenanceIds, validateModuleI
 const MODULES_DISABLED = '未启用内嵌模块';
 // The runtime side of the internal protocol. Both the in-process client and the
 // internal HTTP server call these methods; neither adds behaviour of its own.
-export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime = null, guard = null, readMaintenance, isReady = () => true }) {
+// prepareAutomation is the data plane's own stop check (the Aero LP signer); it
+// runs beside the module guard and refuses the same way.
+export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime = null, guard = null, readMaintenance, isReady = () => true, prepareAutomation = async () => {} }) {
   if (typeof readMaintenance !== 'function') throw new Error('Runtime service needs the durable maintenance reader');
   function status() {
     const modules = moduleRuntime ? moduleRuntime.status() : [];
@@ -46,8 +48,13 @@ export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime 
   }
   async function prepareStop() {
     if (!guard) throw new RuntimeError(404, MODULES_DISABLED);
-    try { await guard.prepareApply(); }
-    catch (error) { throw error?.status === 409 || error?.status === 503 ? new RuntimeError(error.status, error.message) : new RuntimeError(503, '无法确认内嵌模块的停机条件，暂不能更新'); }
+    const fallback = ['无法确认内嵌模块的停机条件，暂不能更新', '无法确认 LP 调仓的停机条件，暂不能更新'];
+    const results = await Promise.allSettled([guard.prepareApply(), prepareAutomation()]);
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') return;
+      const error = result.reason;
+      throw error?.status === 409 || error?.status === 503 ? new RuntimeError(error.status, error.message) : new RuntimeError(503, fallback[index]);
+    });
     return { ready: true };
   }
   function restartModule(id) {

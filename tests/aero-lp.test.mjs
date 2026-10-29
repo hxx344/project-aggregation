@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { belowTwap, emissionApr, nearestUsableTick, parseLedger, planCycle, positionAmounts, rangeState, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
-import { readRewards, reconcileLedger } from '../tools/aero-lp/chain.mjs';
+import { Interface, ZeroAddress, getAddress } from 'ethers';
+import { connect, execute, readRewards, reconcileLedger } from '../tools/aero-lp/chain.mjs';
+import { validateSettings } from '../tools/aero-lp/core.mjs';
 
 // RSGP(18) / USDC(6)，tickSpacing 100，上沿 0.005 落在最近格点 -329300（≈0.005005）。
 const SPACING = 100;
@@ -204,4 +206,57 @@ test('range state follows the pool: lower tick inclusive, upper tick exclusive',
   assert.equal(rangeState(p, -337000), 'in');
   assert.equal(rangeState(p, -330001), 'in');
   assert.equal(rangeState(p, -330000), 'above');
+});
+
+// 只读调用按函数名应答的假 RPC：可以伪造任意只读结果，用来确认签名目标只取自配置。
+function fakeRpc(answers) {
+  const iface = new Interface([
+    'function token0() view returns (address)', 'function token1() view returns (address)', 'function tickSpacing() view returns (int24)',
+    'function gauge() view returns (address)', 'function factory() view returns (address)', 'function getPool(address, address, int24) view returns (address)',
+    'function nft() view returns (address)', 'function pool() view returns (address)', 'function gaugeFactory() view returns (address)',
+    'function decimals() view returns (uint8)', 'function symbol() view returns (string)',
+  ]);
+  return {
+    send: async () => '0x2105',
+    call: async (tx) => {
+      const fn = iface.getFunction(tx.data.slice(0, 10));
+      if (!fn || !(fn.name in answers)) throw new Error(`unexpected call ${tx.data.slice(0, 10)}`);
+      return iface.encodeFunctionResult(fn, [answers[fn.name]]);
+    },
+  };
+}
+
+test('approve target comes from config: an RPC that reports another gauge is refused', async () => {
+  const config = validateSettings(JSON.parse(readFileSync(new URL('../tools/aero-lp/config.example.json', import.meta.url), 'utf8')), { extra: ['keyFile', 'address', 'dataDir'] });
+  const answers = {
+    token0: config.token, token1: config.token1, tickSpacing: config.tickSpacing, gauge: config.gauge, factory: config.factory,
+    getPool: config.pool, nft: config.nft, pool: config.pool, gaugeFactory: '0x' + '33'.repeat(20), decimals: 18, symbol: 'X',
+  };
+  const ctx = await connect(config, { provider: fakeRpc(answers) });
+  assert.equal(ctx.addresses.gauge, getAddress(config.gauge));
+  assert.equal(ctx.gauge.target, getAddress(config.gauge));
+  assert.equal(ctx.nft.target, getAddress(config.nft));
+  const forged = '0x' + '44'.repeat(20);
+  // 伪造的 gauge 自报的 pool/nft 也全部「匹配」，仍然拒绝连接。
+  await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, gauge: forged }) }), /config\.gauge/);
+  // mint 按 (token0, token1, tickSpacing) 定位池子：RPC 自报的另一组（连同伪造的 getPool）同样拒绝。
+  assert.equal(ctx.token1, getAddress(config.token1)); assert.equal(ctx.spacing, config.tickSpacing);
+  await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, token1: forged }) }), /config\.token1/);
+  await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, tickSpacing: 200 }) }), /config\.tickSpacing/);
+});
+
+test('a hold arriving before signing stops the cycle without signing or logging a stake failure', async () => {
+  let signed = 0;
+  const events = [];
+  const tx = { populateTransaction: async () => ({}) };
+  const ctx = {
+    runner: { populateTransaction: async (t) => t, signTransaction: async () => { signed++; return '0x'; } },
+    nft: { getApproved: async () => ZeroAddress, approve: tx },
+    gauge: { deposit: tx, withdraw: tx },
+    addresses: { gauge: '0x' + '55'.repeat(20) },
+  };
+  const plan = { actions: [{ type: 'stake', tokenId: 7n }, { type: 'close', tokenId: 8n, staked: true }] };
+  await assert.rejects(execute(ctx, (e) => events.push(e), ZeroAddress, plan, { halted: () => true }), (error) => error.halted === true && error.signed === false);
+  assert.equal(signed, 0);
+  assert.deepEqual(events, []);
 });
