@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from tests.helpers import Fixture, account
+from tests.helpers import Fixture, account, clear_of_utc_midnight
 from tests.account_fixtures import (ACCOUNT, BRACKET, ORDERS, RISK, SYMBOL,
     LocalQuoteMarket, join_margin_responses, risk_row)
 from tests.test_exchange_hardening import FixtureAPI
@@ -25,6 +25,7 @@ def pair_config(**changes):
 
 class PairIntegrationTests(unittest.TestCase):
     def setUp(self):
+        clear_of_utc_midnight(self)
         self.f = Fixture()
         self.addCleanup(self.f.close)
         for aid in ("test", "second", "third"):

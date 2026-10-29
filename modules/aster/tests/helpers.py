@@ -1,10 +1,27 @@
 from pathlib import Path
 import tempfile
 import time
+from unittest import mock
 
 from trading.engine import DEFAULT_POLICY
 from trading.paper import DemoMarket, PaperBroker
 from trading.store import Store
+
+
+def clear_of_utc_midnight(test, margin=3900):
+    """Keep the test clock on one UTC date, at least ``margin`` seconds from midnight.
+
+    Pair fixtures date unfinished batches an hour back while fills are stamped
+    now; a batch spanning UTC midnight rightly leaves its daily volume unknown,
+    so near midnight the clock moves within the same date instead.
+    """
+    since = time.time() % 86400
+    shift = max(margin - since, 0) + min(86400 - margin - since, 0)
+    if shift:
+        real = time.time
+        patcher = mock.patch("time.time", lambda: real() + shift)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 def seed_market_capacity(engine, *, now=None, symbols=("XAUUSD1",)):
