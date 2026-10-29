@@ -91,7 +91,7 @@ stage_release() {
   cp -a "$repository/server" "$dir/server"
   # What server/ reads outside itself.
   install -D -m 0644 "$repository/modules/asset/lib/auth-core.ts" "$dir/modules/asset/lib/auth-core.ts"
-  mkdir -p "$dir/tools" && cp -a "$repository/tools/entropy-lighter-lab" "$dir/tools/"
+  mkdir -p "$dir/tools" && cp -a "$repository/tools/entropy-lighter-lab" "$repository/tools/aero-lp" "$dir/tools/"
   cp -a "$work_dir/node_modules" "$dir/node_modules"
   cp "$repository/tests/fixtures/split-runtime.mjs" "$repository/tests/fixtures/split-modules.mjs" "$dir/tests/fixtures/"
   mv "$dir/server/runtime/main.mjs" "$dir/server/runtime/real-main.mjs"

@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 // Aerodrome Slipstream 单边 token0 流动性调仓：status / once / run。
-import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+// run --managed 由工作台运行时托管：私钥经 IPC 传入，每轮重读配置。
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Wallet, formatEther, formatUnits, getAddress, parseEther, parseUnits } from 'ethers';
-import { belowTwap, nearestUsableTick, planCycle, targetRange, tickToPrice } from './core.mjs';
+import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, nearestUsableTick, planCycle, targetRange, tickToPrice, validateSettings } from './core.mjs';
 import { connect, errorText, execute, provider, readState } from './chain.mjs';
 
-const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]';
+const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]  |  lp run --managed --config FILE --data DIR';
+const KEY_TIMEOUT_MS = 10_000;
+const LOG_ROTATE_BYTES = 2 * 1024 * 1024;
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -16,33 +19,30 @@ function parseArgs(argv) {
   const options = { command, dryRun: command === 'status', configPath: join(dirname(fileURLToPath(import.meta.url)), 'config.json') };
   for (let i = 0; i < rest.length; i++) {
     if (rest[i] === '--dry-run') options.dryRun = true;
+    else if (rest[i] === '--managed' && command === 'run') options.managed = true;
     else if (rest[i] === '--config' && rest[i + 1]) options.configPath = resolve(rest[++i]);
+    else if (rest[i] === '--data' && rest[i + 1]) options.dataDir = resolve(rest[++i]);
     else throw new Error(USAGE);
   }
+  if (Boolean(options.managed) !== Boolean(options.dataDir) || (options.managed && options.dryRun)) throw new Error(USAGE);
   return options;
 }
 
 const expandHome = (p) => (p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
 
+const withAddresses = (c) => ({ ...c, pool: getAddress(c.pool), token: getAddress(c.token), factory: getAddress(c.factory), nft: getAddress(c.nft) });
+
+// 托管模式的配置只含可在页面上修改的参数。
+export const loadSettings = (source) => withAddresses(validateSettings(JSON.parse(source)));
+
 export function loadConfig(source) {
   const c = JSON.parse(source);
-  const need = (k, ok) => { if (!ok(c[k])) throw new Error(`config.${k} is invalid: ${JSON.stringify(c[k])}`); };
-  need('rpcUrl', (v) => typeof v === 'string' && /^https:\/\//.test(v));
-  for (const k of ['pool', 'token', 'factory', 'nft']) need(k, (v) => typeof v === 'string');
-  need('upperPrice', (v) => typeof v === 'number' && v > 0);
-  need('gapBps', (v) => Number.isInteger(v) && v >= 0 && v <= 10_000);
-  need('intervalSec', (v) => Number.isInteger(v) && v >= 60);
-  // 池子每块最多一条观测（本池容量 900，Base 约 2 秒一块），窗口过长时 observe 会回滚。
-  need('twapSec', (v) => Number.isInteger(v) && v >= 0 && v <= 3_600);
-  need('maxTwapDeviationBps', (v) => Number.isInteger(v) && v >= 1 && v <= 5_000);
-  need('slippageBps', (v) => Number.isInteger(v) && v >= 1 && v <= 500);
-  for (const k of ['keepInWallet', 'minDeploy', 'minEthForGas']) need(k, (v) => typeof v === 'string' && /^\d+(\.\d+)?$/.test(v));
+  const settings = validateSettings(c, { extra: ['keyFile', 'address', 'dataDir'] });
+  for (const k of ['keyFile', 'address', 'dataDir']) {
+    if (c[k] !== undefined && c[k] !== null && typeof c[k] !== 'string') throw new Error(`config.${k} is invalid: ${JSON.stringify(c[k])}`);
+  }
   return {
-    ...c,
-    pool: getAddress(c.pool),
-    token: getAddress(c.token),
-    factory: getAddress(c.factory),
-    nft: getAddress(c.nft),
+    ...withAddresses(settings),
     address: c.address ? getAddress(c.address) : null,
     keyFile: c.keyFile ? expandHome(c.keyFile) : null,
     dataDir: expandHome(c.dataDir || '~/.local/share/aero-lp'),
@@ -57,12 +57,16 @@ function loadKey(config) {
   return readFileSync(config.keyFile, 'utf8').trim();
 }
 
-function logger(dataDir) {
+// 托管模式下事件经 IPC 交给工作台，日志文件超过 2MB 时轮转为 events.1.jsonl。
+function logger(dataDir, { managed = false } = {}) {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const file = join(dataDir, 'events.jsonl');
   return (entry) => {
-    const line = JSON.stringify({ at: new Date().toISOString(), ...entry });
-    console.log(line);
+    const record = { at: new Date().toISOString(), ...entry };
+    const line = JSON.stringify(record);
+    if (managed) { if (process.connected) process.send({ type: 'aero-lp-event', entry: record }); }
+    else console.log(line);
+    try { if (managed && statSync(file).size > LOG_ROTATE_BYTES) renameSync(file, join(dataDir, 'events.1.jsonl')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     appendFileSync(file, line + '\n', { mode: 0o600 });
   };
 }
@@ -85,7 +89,7 @@ function acquireLock(dataDir, wallet) {
   return () => rmSync(lock, { recursive: true, force: true });
 }
 
-async function cycle(ctx, config, wallet, log, { dryRun }) {
+async function cycle(ctx, config, wallet, log, { dryRun, paused = () => false, onExecute = () => {} }) {
   const amounts = {
     keepInWallet: parseUnits(config.keepInWallet, ctx.decimals0),
     minDeploy: parseUnits(config.minDeploy, ctx.decimals0),
@@ -116,17 +120,75 @@ async function cycle(ctx, config, wallet, log, { dryRun }) {
   if (plan.actions.length === 0 || dryRun) return;
   if (state.inflight) { log({ event: 'skip', reason: 'wallet has pending transactions; waiting for them to settle' }); return; }
   if (state.walletEth < parseEther(config.minEthForGas)) { log({ event: 'skip', reason: `ETH balance below minEthForGas ${config.minEthForGas}` }); return; }
+  if (paused()) { log({ event: 'skip', reason: 'workbench maintenance in progress' }); return; }
+  onExecute();
   await execute(ctx, log, wallet, plan, { ...amounts, slippageBps: config.slippageBps, retarget });
+}
+
+// 工作台托管：先发 ready，收到 IPC 私钥后开始循环；私钥不落盘、不进环境变量。
+// 每轮重读配置，连接类参数变化时重连；reload 立即开始下一轮，stop 或 IPC 断开时等当前轮结束后退出。
+async function managed({ configPath, dataDir }) {
+  if (typeof process.send !== 'function') throw new Error('--managed requires an IPC channel');
+  const log = logger(dataDir, { managed: true });
+  const phase = (name, extra = {}) => { if (process.connected) process.send({ type: 'aero-lp-phase', phase: name, ...extra }); };
+  let stopping = false, paused = false, pendingWake = false, wake = null, receive = null;
+  const stop = () => { stopping = true; wake?.(); receive?.(null); };
+  const key = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('private key was not received from the workbench')), KEY_TIMEOUT_MS);
+    receive = (value) => { clearTimeout(timer); receive = null; resolve(value); };
+    process.on('message', (message) => {
+      if (!message || typeof message !== 'object') return;
+      if (message.type === 'aero-lp-key' && typeof message.key === 'string') { paused = message.paused === true; receive?.(message.key); }
+      else if (message.type === 'aero-lp-stop') stop();
+      else if (message.type === 'aero-lp-reload') { pendingWake = true; wake?.(); }
+      else if (message.type === 'aero-lp-pause') paused = message.paused === true;
+    });
+    process.once('disconnect', stop);
+    process.on('SIGINT', stop); process.on('SIGTERM', stop);
+    process.send({ type: 'aero-lp-ready' });
+  });
+  if (key === null) return;
+  if (!PRIVATE_KEY_PATTERN.test(key)) throw new Error('private key must be 64 hex characters (optionally 0x-prefixed)');
+  const wallet = new Wallet(key).address;
+  const release = acquireLock(dataDir, wallet);
+  let ctx = null, connection = null;
+  try {
+    while (!stopping) {
+      let intervalSec = 60;
+      try {
+        const config = loadSettings(readFileSync(configPath, 'utf8'));
+        intervalSec = config.intervalSec;
+        const wanted = JSON.stringify(CONNECTION_KEYS.map((k) => config[k]));
+        if (wanted !== connection) {
+          ctx = null; connection = null;
+          phase('connecting');
+          ctx = await connect(config, new Wallet(key, provider(config.rpcUrl)));
+          connection = wanted;
+          log({ event: 'start', command: 'managed', wallet, pool: ctx.addresses.pool, gauge: ctx.addresses.gauge, pair: `${ctx.symbol0}/${ctx.symbol1}` });
+        }
+        phase('cycle');
+        await cycle(ctx, config, wallet, log, { dryRun: false, paused: () => paused, onExecute: () => phase('executing') });
+      } catch (error) {
+        log({ event: 'cycle_error', error: errorText(error) });
+      }
+      if (stopping) break;
+      if (pendingWake) { pendingWake = false; continue; }
+      phase('sleeping', { nextAt: new Date(Date.now() + intervalSec * 1000).toISOString() });
+      await new Promise((r) => { const timer = setTimeout(r, intervalSec * 1000); wake = () => { clearTimeout(timer); r(); }; });
+      wake = null; pendingWake = false;
+    }
+  } finally { release(); log({ event: 'stop' }); }
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.managed) { await managed(options); process.exit(0); }
   const config = loadConfig(readFileSync(options.configPath, 'utf8'));
   const log = logger(config.dataDir);
   const key = loadKey(config);
   if (!key && !options.dryRun) throw new Error('private key required: set AERO_LP_PRIVATE_KEY or config.keyFile (or use --dry-run with config.address)');
   // 格式错误时 ethers 的报错会带出原始输入，先校验，只报固定提示。
-  if (key && !/^(0x)?[0-9a-fA-F]{64}$/.test(key)) throw new Error('private key must be 64 hex characters (optionally 0x-prefixed)');
+  if (key && !PRIVATE_KEY_PATTERN.test(key)) throw new Error('private key must be 64 hex characters (optionally 0x-prefixed)');
   const signer = key ? new Wallet(key, provider(config.rpcUrl)) : null;
   const wallet = signer ? signer.address : config.address;
   if (!wallet) throw new Error('config.address is required for --dry-run without a key');

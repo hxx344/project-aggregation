@@ -3,7 +3,6 @@
 
 const LN_TICK = Math.log(1.0001);
 
-
 export function tickToPrice(tick, decimals0, decimals1) {
   return 1.0001 ** tick * 10 ** (decimals0 - decimals1);
 }
@@ -77,4 +76,37 @@ export function planCycle({ currentTick, twapTick = null, twapUnavailable = fals
 
   const status = live.length === 0 ? 'none' : live.map((p) => `#${p.tokenId}:${rangeState(p, currentTick)}${p.staked ? '' : ':unstaked'}`).join(',');
   return { target, actions, notes, status };
+}
+
+// 可配置参数（工作台页面与 CLI 共用同一套校验）。连接类参数变化时需要重连链上合约。
+export const SETTING_KEYS = ['rpcUrl', 'pool', 'factory', 'nft', 'token', 'upperPrice', 'gapBps', 'intervalSec', 'twapSec', 'maxTwapDeviationBps', 'slippageBps', 'keepInWallet', 'minDeploy', 'minEthForGas'];
+export const CONNECTION_KEYS = ['rpcUrl', 'pool', 'factory', 'nft', 'token'];
+export const PRIVATE_KEY_PATTERN = /^(0x)?[0-9a-fA-F]{64}$/;
+
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const DECIMAL = /^\d{1,30}(\.\d{1,18})?$/;
+const SETTING_RULES = {
+  rpcUrl: (v) => typeof v === 'string' && v.length <= 512 && /^https:\/\/[^\s/?#]+[^\s]*$/.test(v),
+  pool: (v) => typeof v === 'string' && ADDRESS.test(v),
+  factory: (v) => typeof v === 'string' && ADDRESS.test(v),
+  nft: (v) => typeof v === 'string' && ADDRESS.test(v),
+  token: (v) => typeof v === 'string' && ADDRESS.test(v),
+  upperPrice: (v) => typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1e12,
+  gapBps: (v) => Number.isInteger(v) && v >= 0 && v <= 10_000,
+  intervalSec: (v) => Number.isInteger(v) && v >= 60 && v <= 86_400,
+  // 池子每块最多一条观测（本池容量 900，Base 约 2 秒一块），窗口过长时 observe 会回滚。
+  twapSec: (v) => Number.isInteger(v) && v >= 0 && v <= 3_600,
+  maxTwapDeviationBps: (v) => Number.isInteger(v) && v >= 1 && v <= 5_000,
+  slippageBps: (v) => Number.isInteger(v) && v >= 1 && v <= 500,
+  keepInWallet: (v) => typeof v === 'string' && DECIMAL.test(v),
+  minDeploy: (v) => typeof v === 'string' && DECIMAL.test(v),
+  minEthForGas: (v) => typeof v === 'string' && DECIMAL.test(v),
+};
+
+// 返回只含 SETTING_KEYS 的新对象；extra 列出调用方允许额外出现、由调用方自行处理的键。
+export function validateSettings(value, { extra = [] } = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('config must be an object');
+  for (const k of Object.keys(value)) if (!SETTING_KEYS.includes(k) && !extra.includes(k)) throw new Error(`config.${k} is not supported`);
+  for (const k of SETTING_KEYS) if (!SETTING_RULES[k](value[k])) throw new Error(`config.${k} is invalid: ${JSON.stringify(value[k])}`);
+  return Object.fromEntries(SETTING_KEYS.map((k) => [k, value[k]]));
 }

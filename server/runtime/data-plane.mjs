@@ -20,6 +20,7 @@ import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
+import { createAeroLp } from '../automation/aero-lp.mjs';
 
 const respond = errorResponder([HttpError, TradingError, ExecutionError, UpdateError, RuntimeError]);
 // The API reports every 15 s; a sample needs a report at most this old (design doc 5.8).
@@ -53,6 +54,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const { stmt, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
   const research = createEntropyLighterResearch({ dataDir, enabledByDefault: researchEnabledByDefault, log });
+  const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1', log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
   const writerDatabase = path.join(dataDir, 'execution-control.sqlite');
   // A legacy external-module launch must not turn off protection for data that
@@ -233,6 +235,29 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '启动和停止不接受额外参数');
       return reply(200, await research[action](authorize));
     }
+    if (pathname === '/api/automation/aero-lp' || pathname.startsWith('/api/automation/aero-lp/')) {
+      if (url.search) throw new HttpError(400, 'LP 接口不接受查询参数');
+      if (pathname === '/api/automation/aero-lp' && method === 'GET') return reply(200, aeroLp.state());
+      const action = pathname === '/api/automation/aero-lp/config' && method === 'PUT' ? 'save'
+        : pathname === '/api/automation/aero-lp/wallet' && method === 'PUT' ? 'setKey'
+          : pathname === '/api/automation/aero-lp/wallet/clear' && method === 'POST' ? 'clearKey'
+            : pathname === '/api/automation/aero-lp/start' && method === 'POST' ? 'start'
+              : pathname === '/api/automation/aero-lp/stop' && method === 'POST' ? 'stop' : null;
+      if (!action) throw new HttpError(404, 'LP 接口不存在');
+      const body = await bodyOf();
+      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
+      authorize();
+      if (action === 'save') {
+        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供 LP 参数');
+        return reply(200, await aeroLp.save(body.config, authorize));
+      }
+      if (action === 'setKey') {
+        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'privateKey')) throw new HttpError(400, '请提供钱包私钥');
+        return reply(200, await aeroLp.setKey(body.privateKey, authorize));
+      }
+      if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      return reply(200, await aeroLp[action](authorize));
+    }
     if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery') {
       if (method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
@@ -342,7 +367,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -354,6 +379,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await research.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await research.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

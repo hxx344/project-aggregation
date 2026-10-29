@@ -4,6 +4,8 @@
 
 Entropy / Lighter 行情研究也已内置，统一更新后从侧栏 **监控 → Entropy / Lighter** 打开；支持持续采集、启动停止、配置、报告和图表，默认只采集公开行情。工具随工作台运行时管理，关闭页面或单独重启 API 不会中断采集。详见 [研究工具说明](docs/entropy-lighter-lab.md)。
 
+Aerodrome 单边 LP 自动调仓从侧栏 **交易 → Aero LP** 打开：在页面填写钱包私钥（加密保存、只显示地址）和调仓参数，保存后立即生效；随工作台运行时管理，默认停止。详见 [工具说明](tools/aero-lp/README.md)。
+
 市场监控的合约价差、资金费机会可在列表或详情点击 **导入 CrossEx**，直接打开 Gate CrossEx 的「跨所对冲」，填入精确多空合约并清空数量。需从工作台内打开，目标合约不在最新目录时会提示原因，不会替换成其它合约；填写数量后仍须手动预览与确认。
 
 CrossEx 内的资金费机会入口：**Gate CrossEx → 跨所对冲 → 开仓区域下方的 Monitor 机会 → 资金费机会**，可切换回价差机会。优先列出可参考机会，再按 8h 等效费率差从高到低排列；保留两腿原始费率、结算周期、下次结算时间和独立的开仓毛价差；等效费差不是下一次结算净收入。缺失周期不默认 8h，数据过期或缺少启用的现货/充提筛选证据时禁止一键填入。选择机会只预填精确合约和多空方向、清空数量，仍须手动预览与确认。内置模块随本工作台统一发布，更新独立 CrossEx 仓库不会改变此页面。
@@ -51,6 +53,7 @@ python -m venv .venv-aster
 | `modules/greeks/` | Greeks Python 业务及页面 |
 | `modules/aster/` | ASTER Python 交易引擎与静态 dashboard |
 | `tools/entropy-lighter-lab/` | 内置 Entropy / Lighter 行情采集与纸面模拟 |
+| `tools/aero-lp/` | 内置 Aerodrome 单边 LP 调仓（`server/automation/aero-lp.mjs` 管理进程） |
 | `deploy/` | 统一安装、迁移、打包与发布检查 |
 | `tests/` | 行为、集成及浏览器检查 |
 
