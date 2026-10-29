@@ -218,6 +218,50 @@ if run_install; then echo 'A module source link reached direct compilation' >&2;
 expect_modules 4 2 3 4
 [[ $(stops) == "$saved_stops" && $(restarts) == 7 && $(readlink "$fixture/application/current") == "$current" ]]
 cmp "$fixture/success-state" "$fixture/application/.deployed-state"
+rm "$fixture/source/modules/crossex/unsafe-source.ts"
+
+# With a recognized lockfile, a root-only dependency (like ethers for server/
+# tools) reinstalls the workspace but rebuilds no module; a change inside one
+# importer's locked closure rebuilds only that module.
+cp "$repository/deploy/pnpm-module-inputs.py" "$fixture/source/deploy/pnpm-module-inputs.py"
+write_closure_lock() {
+  local root_extra=$1 leaf=$2 importer name
+  {
+    printf "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\nimporters:\n\n"
+    printf '  .:\n    dependencies:\n'
+    [[ -z $root_extra ]] || printf '      root-extra:\n        specifier: %s\n        version: %s\n' "$root_extra" "$root_extra"
+    printf '      root-only:\n        specifier: 1.0.0\n        version: 1.0.0\n\n'
+    for importer in modules/asset modules/aster/dashboard modules/crossex modules/monitor; do
+      name=shared
+      [[ $importer != modules/monitor ]] || name=monitor-tool
+      printf '  %s:\n    dependencies:\n      %s:\n        specifier: 1.0.0\n        version: 1.0.0\n\n' "$importer" "$name"
+    done
+    printf 'packages:\n\n'
+    printf '  leaf@%s:\n    resolution: {integrity: sha512-leaf}\n\n' "$leaf"
+    printf '  monitor-tool@1.0.0:\n    resolution: {integrity: sha512-tool}\n\n'
+    [[ -z $root_extra ]] || printf '  root-extra@%s:\n    resolution: {integrity: sha512-extra}\n\n' "$root_extra"
+    printf '  root-only@1.0.0:\n    resolution: {integrity: sha512-root}\n\n  shared@1.0.0:\n    resolution: {integrity: sha512-shared}\n\n'
+    printf 'snapshots:\n\n  leaf@%s: {}\n\n  monitor-tool@1.0.0:\n    dependencies:\n      leaf: %s\n\n' "$leaf" "$leaf"
+    [[ -z $root_extra ]] || printf '  root-extra@%s: {}\n\n' "$root_extra"
+    printf '  root-only@1.0.0: {}\n\n  shared@1.0.0: {}\n'
+  } > "$fixture/source/pnpm-lock.yaml"
+  printf '{"name":"fixture","version":"1.0.0","type":"module","scripts":{"prepare":"node scripts/install-hooks.mjs"},"dependencies":{"root-only":"1.0.0"%s}}\n' \
+    "${root_extra:+,\"root-extra\":\"$root_extra\"}" > "$fixture/source/package.json"
+}
+write_closure_lock '' 1.0.0
+commit_source closure-lock
+run_install
+expect_modules 5 3 4 5
+installs=$(count install)
+write_closure_lock 2.0.0 1.0.0
+commit_source root-only-dependency
+run_install
+expect_modules 5 3 4 5
+[[ $(count install) == $((installs + 1)) ]]
+write_closure_lock 2.0.0 1.0.1
+commit_source monitor-closure
+run_install
+expect_modules 6 3 4 5
 
 bash "$repository/deploy/test-module-cache-migration.sh"
 printf 'Module cache reuse, lazy workspaces, test hydration, complete artifact checks and pre-activation failure recovery passed.\n'

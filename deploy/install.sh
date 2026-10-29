@@ -74,6 +74,8 @@ declare -A MODULE_BUILD_ENTRIES=([monitor]=client/index.html [asset]=BUILD_ID [c
 declare -A module_build_keys=()
 declare -A module_build_recipes=()
 declare -A legacy_module_build_keys=()
+# module-artifacts-v2 keys of the same inputs: whole-workspace dependencies.
+declare -A previous_module_build_keys=()
 # Only this complete runner blob has been checked for equivalent direct build
 # commands. Recipe digests also bind that equivalence to this installer code.
 LEGACY_MODULE_RUNNER_BLOB=e7eb0c0c6bc14fb450bea423294fe56f75dbb768
@@ -1586,6 +1588,23 @@ module_build_recipe() {
 read_build_environment() {
   "$NODE_BIN" -e 'console.log(JSON.stringify(Object.entries(process.env).filter(([key]) => key === "NODE_ENV" || /^(VITE_|NEXT_PUBLIC_)/.test(key)).sort(([a], [b]) => a.localeCompare(b))))'
 }
+read_module_dependency_digests() {
+  # Prints "IMPORTER DIGEST" for every module importer, or fails so the caller
+  # keeps the whole-workspace key. Only the pinned commit's own helper runs, as
+  # isolated Python on bytes read from the root-owned repository object.
+  local program output line importer digest count=0
+  local -A seen=()
+  program=$(git --git-dir="$APP_DIR/repository.git" show "$commit:deploy/pnpm-module-inputs.py" 2>/dev/null) || return 1
+  output=$(python3 -I -c "$program" "$APP_DIR/repository.git" "$commit" "${MODULE_BUILD_IMPORTERS[@]}") || return 1
+  while IFS= read -r line; do
+    importer=${line% *} digest=${line##* }
+    [[ "$line" == "$importer $digest" && "$digest" =~ ^[a-f0-9]{64}$ && -z ${seen[$importer]:-} ]] || return 1
+    seen[$importer]=1 count=$((count + 1))
+  done <<< "$output"
+  (( count == ${#MODULE_BUILD_IMPORTERS[@]} )) || return 1
+  for importer in "${MODULE_BUILD_IMPORTERS[@]}"; do [[ -n ${seen[$importer]:-} ]] || return 1; done
+  printf '%s\n' "$output"
+}
 atomic_record() {
   local destination=$1 value=$2 temporary="${1}.new.$$"
   printf '%s\n' "$value" > "$temporary" || return 1
@@ -1595,10 +1614,14 @@ input_keys() {
   # Read git trees separately so a failed read cannot be masked by printf/hash.
   local dependency_tree typecheck_tree test_tree build_tree runtime_tree embedded_tree runtime_dependency_tree module module_tree
   local legacy_runner_blob legacy_tree module_recipe module_artifacts_key runtime_listing runtime_component_tree
+  local dependency_recipe='pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger'
+  local module_digests module_digest_helper module_dependency_key importer digest
+  local -A module_dependency_digests=()
   local -a navigation_inputs=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts)
   local -a module_shared_inputs=("${navigation_inputs[@]}" server/capital-metrics.mjs server/capital-metrics.d.mts)
   local -a module_inputs
   legacy_module_build_keys=()
+  previous_module_build_keys=()
   dependency_tree=$(tree_hash package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc scripts/install-hooks.mjs \
     modules/monitor/package.json modules/asset/package.json modules/crossex/package.json modules/aster/dashboard/package.json \
     modules/monitor/.npmrc modules/asset/.npmrc modules/crossex/.npmrc modules/aster/dashboard/.npmrc \
@@ -1612,7 +1635,7 @@ input_keys() {
   embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py deploy/diagnose-aster-margin.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
-  dependency_key=$(printf 'pnpm-workspace-dependencies-v1:frozen,include-dev,copy,prepare-ledger\n%s\n%s\n%s' "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
+  dependency_key=$(printf '%s\n%s\n%s\n%s' "$dependency_recipe" "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
   runtime_dependency_key=$(printf 'production-dependencies-v1:immutable,fixed-importers\n%s\n%s' "$dependency_key" "$runtime_dependency_tree" | hash)
   typecheck_key=$(printf 'typecheck-v3\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
   test_key=$(printf 'tests-v2\n%s\n%s' "$test_tree" "$dependency_key" | hash)
@@ -1624,6 +1647,17 @@ input_keys() {
   typecheck_stamp="$APP_DIR/cache/typechecked-$typecheck_key"
   test_stamp="$APP_DIR/cache/tested-$test_key"
   legacy_runner_blob=$(git --git-dir="$APP_DIR/repository.git" rev-parse "$commit:scripts/modules.mjs" 2>/dev/null) || legacy_runner_blob=
+  # The shared install above still covers the whole workspace. A module build
+  # only depends on its importer's locked closure plus workspace-wide install
+  # settings, so unrelated root or sibling dependency changes keep its cache.
+  # Unknown lockfile shapes, older commits and helper failures keep the
+  # conservative whole-workspace key.
+  if module_digests=$(read_module_dependency_digests); then
+    module_digest_helper=$(git --git-dir="$APP_DIR/repository.git" rev-parse "$commit:deploy/pnpm-module-inputs.py") || return
+    while read -r importer digest; do module_dependency_digests[$importer]=$digest; done <<< "$module_digests"
+  elif git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:deploy/pnpm-module-inputs.py" 2>/dev/null; then
+    log '模块依赖闭包无法精确识别，模块构建缓存沿用整个工作区依赖键。'
+  fi
   for module in "${MODULE_BUILD_IDS[@]}"; do
     # ASTER serves a static dashboard. Its Python runtime is not a frontend input.
     if [[ "$module" == aster ]]; then
@@ -1638,7 +1672,17 @@ input_keys() {
     module_tree=$(tree_hash "${module_inputs[@]}") || return
     module_recipe=$(module_build_recipe "$module") || return
     module_build_recipes[$module]=$module_recipe
-    module_build_keys[$module]=$(printf 'module-artifacts-v2\n%s\n%s\n%s\n%s\n%s' "$module" "$module_tree" "$dependency_key" "$build_environment" "$module_recipe" | hash)
+    importer=${MODULE_BUILD_IMPORTERS[$module]}
+    if [[ -n ${module_dependency_digests[$importer]:-} ]]; then
+      module_dependency_key=$(printf 'pnpm-importer-dependencies-v1\n%s\n%s\n%s\n%s\n%s\n%s' "$dependency_recipe" "$importer" \
+        "${module_dependency_digests[$importer]}" "$module_digest_helper" "$runtime_key" "$PNPM_VERSION" | hash)
+    else
+      module_dependency_key=$(printf 'pnpm-workspace-dependencies\n%s' "$dependency_key" | hash)
+    fi
+    module_build_keys[$module]=$(printf 'module-artifacts-v3\n%s\n%s\n%s\n%s\n%s' "$module" "$module_tree" "$module_dependency_key" "$build_environment" "$module_recipe" | hash)
+    # A v2 artifact was built from these exact module, recipe, environment and
+    # whole-workspace inputs, a superset of what the v3 key reads.
+    previous_module_build_keys[$module]=$(printf 'module-artifacts-v2\n%s\n%s\n%s\n%s\n%s' "$module" "$module_tree" "$dependency_key" "$build_environment" "$module_recipe" | hash)
     if [[ "$legacy_runner_blob" == "$LEGACY_MODULE_RUNNER_BLOB" && "$module_recipe" == "${LEGACY_MODULE_BUILD_RECIPES[$module]}" ]]; then
       legacy_tree=$(tree_hash "${module_inputs[@]}" scripts/modules.mjs) || return
       legacy_module_build_keys[$module]=$(printf 'module-artifacts-v1\n%s\n%s\n%s\n%s' "$module" "$legacy_tree" "$dependency_key" "$build_environment" | hash)
@@ -1859,14 +1903,21 @@ artifact_cache_ready() {
   build_artifact_cache verify "$1" "$2"
 }
 migrate_module_build_cache() {
-  local module=$1 legacy_key=${legacy_module_build_keys[$1]:-} key=${module_build_keys[$1]} recipe
+  local module=$1 legacy_key=${legacy_module_build_keys[$1]:-} previous_key=${previous_module_build_keys[$1]:-} key=${module_build_keys[$1]} recipe
   local old_cache cache stage artifact
-  [[ -n "$legacy_key" ]] || return 1
-  recipe=$(module_build_recipe "$module") || return
-  [[ "$recipe" == "${LEGACY_MODULE_BUILD_RECIPES[$module]}" && "$recipe" == "${module_build_recipes[$module]}" ]] || return 1
-  old_cache="$APP_DIR/cache/module-$module-$legacy_key"
   cache="$APP_DIR/cache/module-$module-$key"
-  artifact_cache_ready "$old_cache" "$legacy_key" || return 1
+  # v2 differs from v3 only by a broader dependency input, so its key already
+  # binds the current recipe; v1 still needs the audited legacy recipe check.
+  old_cache="$APP_DIR/cache/module-$module-$previous_key"
+  if [[ -n "$previous_key" ]] && artifact_cache_ready "$old_cache" "$previous_key"; then
+    legacy_key=$previous_key
+  else
+    [[ -n "$legacy_key" ]] || return 1
+    recipe=$(module_build_recipe "$module") || return
+    [[ "$recipe" == "${LEGACY_MODULE_BUILD_RECIPES[$module]}" && "$recipe" == "${module_build_recipes[$module]}" ]] || return 1
+    old_cache="$APP_DIR/cache/module-$module-$legacy_key"
+    artifact_cache_ready "$old_cache" "$legacy_key" || return 1
+  fi
   updater_safe_path "$work_dir" || return 1
   stage=$(mktemp -d "$work_dir/module-cache-migration-$module.XXXXXXXX") || return
   artifact="$stage/${MODULE_BUILD_OUTPUTS[$module]##*/}"
