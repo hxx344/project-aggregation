@@ -342,7 +342,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
         };
         authorize();
         try {
-          const state = action === 'check' ? await updates.check() : action === 'token' ? await updates.token(body.token, authorize) : await updates.apply(body.planId, authorize, body.deployMode);
+          const state = action === 'check' ? await updates.check() : action === 'token' ? await updates.token(body.token, authorize) : await updates.apply(body.planId, authorize, body.deployMode, body.phase);
           send(res, action === 'token' ? 200 : 202, state);
         }
         finally { void updateStream.refresh(); }

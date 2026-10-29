@@ -393,6 +393,11 @@ class ScopeContractTests(unittest.TestCase):
         for part in updater.SCOPE_INSTALLER:
             self.assertIn(part, source)
 
+    def test_installer_honours_the_prepare_contract_of_the_update_service(self):
+        source = (Path(__file__).resolve().parent / 'install.sh').read_bytes()
+        for part in updater.PREPARE_INSTALLER:
+            self.assertIn(part, source)
+
 
 class CoordinatorTests(RootFixture):
     def setUp(self):
@@ -404,7 +409,7 @@ class CoordinatorTests(RootFixture):
                            'latestVersion': None, 'currentCommit': OLD, 'latestCommit': None, 'applicationKey': OLD_KEY,
                            'artifactCommit': OLD, 'identity': hashlib.sha256(module.id.encode()).hexdigest()}
                           for module in registry.MODULES]
-        self.launches = []; self.executed = []; self.executed_modes = []; self.executed_scopes = []; self.syntaxes = []
+        self.launches = []; self.executed = []; self.executed_modes = []; self.executed_scopes = []; self.executed_phases = []; self.syntaxes = []
         self.installer_hook = None
         self.alive = False
         self.coordinator = self.make_coordinator()
@@ -415,16 +420,19 @@ class CoordinatorTests(RootFixture):
                                    alive=lambda: self.alive, installer=self.install, syntax=lambda p: self.syntaxes.append(p.stem),
                                    clock=lambda: self.clock, stack_lock=self.root / 'stack.lock')
 
-    def install(self, script, manifest, log, deploy_mode='source', scope='full'):
+    def install(self, script, manifest, log, deploy_mode='source', scope='full', phase='activate'):
         key = script.name.removesuffix('.install.sh')
         self.executed.append(key)
         self.executed_modes.append(deploy_mode)
         self.executed_scopes.append(scope)
+        self.executed_phases.append(phase)
         log.write_text('api_secret=PRIVATE_DEPLOYMENT_CREDENTIAL\n', encoding='utf8')
         if self.installer_hook:
             code = self.installer_hook(key)
             if code:
                 return code
+        if phase == 'prepare' and not self.installer_hook:
+            return updater.DEPLOY_PREPARED
         value = next(item for item in self.installed if item['id'] == key)
         value.update(currentCommit=NEW, currentVersion=NEW[:12], applicationKey=NEW_KEY,
                      identity=hashlib.sha256((key + NEW).encode()).hexdigest())
@@ -1780,6 +1788,91 @@ class CoordinatorTests(RootFixture):
         self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.SCOPE_INSTALLER)
         self.installed[0].update(runtimeKey=RUNTIME_KEY, runtimeRecorded=True, layout='dual-slot')
 
+    def test_prepared_release_keeps_the_plan_until_its_activation(self):
+        self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.PREPARE_INSTALLER)
+        checked = self.check()
+        plan = checked['planId']
+        self.assertTrue(checked['planPrepare'])
+        self.assertIsNone(checked['prepared'])
+        accepted = self.coordinator.apply(plan, 'ci', 'full', 'prepare')
+        self.assertEqual((accepted['job']['phase'], accepted['job']['status']), ('prepare', 'queued'))
+        # A repeated request joins the job; another phase of the same plan does not.
+        self.assertEqual(self.coordinator.apply(plan, 'ci', 'full', 'prepare')['job']['id'], accepted['job']['id'])
+        with self.assertRaises(updater.UpdateError) as caught:
+            self.coordinator.apply(plan, 'ci')
+        self.assertEqual(caught.exception.status, 409)
+        self.clock += updater.PLAN_TTL - 60
+        self.coordinator.run()
+        state = self.coordinator.status()
+        self.assertEqual((state['job']['status'], state['job']['phase']), ('succeeded', 'prepare'))
+        self.assertEqual(state['job']['steps'][0]['status'], 'succeeded')
+        self.assertEqual(state['modules'][0]['currentCommit'], OLD)
+        self.assertFalse((self.coordinator.directory / 'hub.receipt.json').exists(), 'nothing was activated')
+        self.assertEqual((state['planId'], state['prepared']), (plan, {'planId': plan, 'deployMode': 'ci'}))
+        # The wait for the switch outlives an ordinary plan.
+        self.assertEqual(updater.timestamp(state['expiresAt']), self.clock + updater.PREPARED_PLAN_TTL)
+        self.clock += updater.PLAN_TTL + 1
+        self.assertEqual(self.coordinator.status()['prepared'], {'planId': plan, 'deployMode': 'ci'})
+        self.assertEqual(self.coordinator.read_plan(plan)['expiresAt'], state['expiresAt'])
+        self.assertEqual(self.check()['planId'], plan, 'an unchanged check keeps the prepared plan')
+        self.coordinator.apply(plan, 'ci'); self.coordinator.run()
+        state = self.coordinator.status()
+        self.assertEqual((state['job']['status'], state['job']['phase']), ('succeeded', 'activate'))
+        self.assertEqual((state['planId'], state['prepared']), (None, None))
+        self.assertEqual(self.executed_phases, ['prepare', 'activate'])
+        self.assertEqual(updater.read_json(self.coordinator.directory / 'hub.receipt.json')['commit'], NEW)
+
+    def test_prepare_requires_an_installer_that_stops_before_activation(self):
+        for missing in updater.PREPARE_INSTALLER:
+            with self.subTest(missing=missing):
+                self.network.values['hub']['installer'] = INSTALLER + b''.join(part for part in updater.PREPARE_INSTALLER if part != missing)
+                self.clock += 180
+                checked = self.check()
+                self.assertFalse(checked['planPrepare'])
+                with self.assertRaises(updater.UpdateError) as caught:
+                    self.coordinator.apply(checked['planId'], 'ci', 'full', 'prepare')
+                self.assertEqual(caught.exception.status, 409)
+        for scope, phase in (('api', 'prepare'), ('full', 'switch'), ('full', None)):
+            with self.subTest(scope=scope, phase=phase), self.assertRaises(updater.UpdateError) as caught:
+                self.coordinator.apply(checked['planId'], 'ci', scope, phase)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(self.launches, [])
+        # An installer that activates during a prepare job is checked like any completed update.
+        self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.PREPARE_INSTALLER)
+        self.clock += 180
+        plan = self.check()['planId']
+        self.installer_hook = lambda key: 0
+        self.coordinator.apply(plan, 'ci', 'full', 'prepare'); self.coordinator.run()
+        state = self.coordinator.status()
+        self.assertEqual((state['job']['status'], state['planId'], state['prepared']), ('succeeded', None, None))
+        self.assertEqual(state['modules'][0]['currentCommit'], NEW)
+
+    def test_prepare_is_refused_for_an_api_only_plan(self):
+        self.admit_api()
+        self.network.values['hub']['installer'] += b''.join(updater.PREPARE_INSTALLER)
+        checked = self.check()
+        self.assertEqual((checked['planScopes']['ci'], checked['planPrepare']), ('api', True))
+        with self.assertRaises(updater.UpdateError) as caught:
+            self.coordinator.apply(checked['planId'], 'ci', 'full', 'prepare')
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.launches, [])
+
+    def test_failed_preparation_says_nothing_was_switched(self):
+        self.network.values['hub']['installer'] = INSTALLER + b''.join(updater.PREPARE_INSTALLER)
+        self.installer_hook = lambda key: 1
+        self.coordinator.apply(self.check()['planId'], 'ci', 'full', 'prepare'); self.coordinator.run()
+        state = self.coordinator.status()
+        self.assertEqual((state['job']['status'], state['planId'], state['prepared']), ('failed', None, None))
+        self.assertIn('未切换版本', state['job']['message'])
+        self.assertEqual(state['job']['steps'][0]['message'], '准备未完成，未切换版本')
+        self.assertEqual(state['modules'][0]['currentCommit'], OLD)
+
+    def test_prepare_exit_status_of_an_activation_is_a_failure(self):
+        self.installer_hook = lambda key: updater.DEPLOY_PREPARED
+        self.coordinator.apply(self.prepare(), 'ci'); self.coordinator.run()
+        state = self.coordinator.status()
+        self.assertEqual((state['job']['status'], state['planId'], state['prepared']), ('failed', None, None))
+
     def test_installer_without_scope_admission_is_planned_in_full(self):
         self.admit_api()
         complete = self.network.values['hub']['installer']
@@ -1942,6 +2035,12 @@ class CoordinatorTests(RootFixture):
         self.assertEqual((status, accepted['job']['scope']), (202, 'api'))
         self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci'}))[0], 409)
         self.assertEqual(len(self.launches), 1)
+        for phase in (None, True, '', 'PREPARE', 'switch'):
+            self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci', 'phase': phase}))[0], 400)
+        self.assertEqual(request(encoded({'planId': plan, 'deployMode': 'ci', 'scope': 'api', 'phase': 'prepare'}))[0], 400)
+        self.assertEqual(request(encoded({'planId': plan, 'other': 1}))[0], 400)
+        status, joined = request(encoded({'planId': plan, 'deployMode': 'ci', 'scope': 'api', 'phase': 'activate'}))
+        self.assertEqual((status, joined['job']['id']), (202, accepted['job']['id']))
 
     def test_control_and_worker_use_separate_process_services_and_fixed_arguments(self):
         with patch.object(updater.subprocess, 'run') as run:
@@ -2003,6 +2102,17 @@ class CoordinatorTests(RootFixture):
         for scope in (None, 'API', 'api;id', 'partial'):
             with patch.object(updater.subprocess, 'run') as run, self.assertRaises(updater.UpdateError):
                 updater.run_installer(script, manifest, self.root / 'invalid.log', 'ci', scope)
+            run.assert_not_called()
+            self.assertFalse((self.root / 'invalid.log').exists())
+        with patch.object(updater.subprocess, 'run', return_value=SimpleNamespace(returncode=updater.DEPLOY_PREPARED)) as run:
+            self.assertEqual(updater.run_installer(script, manifest, self.root / 'prepare.log', 'ci', 'full', 'prepare'), updater.DEPLOY_PREPARED)
+        self.assertEqual(run.call_args.kwargs['env'], {
+            **updater.ENVIRONMENT, 'PROJECT_DEPLOY_MODE': 'ci', 'PROJECT_DEPLOY_TESTS': '0',
+            'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest), 'PROJECT_DEPLOY_PHASE': 'prepare',
+            'PROJECT_UPDATE_PROGRESS_FILE': str(self.root / 'progress.json')})
+        for scope, phase in (('api', 'prepare'), ('full', 'PREPARE'), ('full', None)):
+            with patch.object(updater.subprocess, 'run') as run, self.assertRaises(updater.UpdateError):
+                updater.run_installer(script, manifest, self.root / 'invalid.log', 'ci', scope, phase)
             run.assert_not_called()
             self.assertFalse((self.root / 'invalid.log').exists())
 

@@ -35,6 +35,10 @@ PROJECT_DEPLOY_MODE=${PROJECT_DEPLOY_MODE-source}
 PROJECT_DEPLOY_SCOPE=${PROJECT_DEPLOY_SCOPE-}
 # Exit status of a refused api-scope update; the update service plans it in full next time.
 SCOPE_REFUSED=75
+# prepare: build and verify the release, then stop before activation (design doc 6.9).
+PROJECT_DEPLOY_PHASE=${PROJECT_DEPLOY_PHASE-}
+# Exit status of a prepare run that left a release ready to activate.
+DEPLOY_PREPARED=76
 # The hub backend uses only Node built-ins. CrossEx also keeps runtime packages.
 RUNTIME_DEPENDENCIES=0
 activation_started=0
@@ -1381,6 +1385,8 @@ rollback() {
   set +e
   # Only the scope check reports SCOPE_REFUSED; another step's status 75 is an ordinary failure.
   if [[ "$exit_code" == "$SCOPE_REFUSED" && "$scope_refused" != 1 ]]; then exit_code=1; fi
+  # DEPLOY_PREPARED is returned only past the prepare checkpoint, never through rollback.
+  if [[ "$exit_code" == "$DEPLOY_PREPARED" ]]; then exit_code=1; fi
   # Close before recovery. If this optional write fails, leave the interval
   # unknown instead of retrying at EXIT and counting rollback as deployment.
   ci_finish_progress
@@ -2908,8 +2914,17 @@ activation_scope() {
 scope_admitted() {
   [[ "$PROJECT_DEPLOY_SCOPE" != api || "$1" == api ]]
 }
+prepared_record() {
+  # Line 1 is the prepared release, lines 2-3 its Greeks and ASTER interpreters.
+  # A record whose release is gone (pruned by an older installer) protects nothing.
+  local prepared
+  [[ -f "$APP_DIR/.prepared-release" ]] || return 1
+  prepared=$(sed -n 1p -- "$APP_DIR/.prepared-release")
+  [[ -n "$prepared" && -f "$prepared/.managed-release" ]] || return 1
+  sed -n "${1}p" -- "$APP_DIR/.prepared-release"
+}
 prune_releases() {
-  local directory runtime_release slot
+  local directory runtime_release slot prepared=
   local -A slot_releases=()
   # A slot keeps the release its link names until a cutover moves it.
   for slot in a b; do
@@ -2920,8 +2935,11 @@ prune_releases() {
     if systemctl is-active --quiet "$SERVICE"; then log '无法确认运行时所在的版本目录；本次不清理旧版本。'; return 0; fi
     runtime_release=
   fi
+  prepared=$(prepared_record 1) || prepared=
   while IFS= read -r directory; do
     if [[ "$directory" == "$release" || "$directory" == "$previous_release" || "$directory" == "$runtime_release" || -n "${slot_releases[$directory]:-}" ]]; then continue; fi
+    # A prepared release waits for its activation run (design doc 6.9).
+    if [[ -n "$prepared" && "$directory" == "$prepared" ]]; then continue; fi
     [[ -f "$directory/.managed-release" ]] || continue
     [[ "${directory##*/}" =~ ^[a-f0-9]{12}-[a-f0-9]{16}$ ]] || continue
     safe_remove_release "$directory"
@@ -2954,7 +2972,7 @@ prune_caches() {
       if managed_release "$directory" >/dev/null; then runtime_roots+=("$directory"); fi
     done
   fi
-  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "$APP_DIR/slots/a" "$APP_DIR/slots/b" "${runtime_roots[@]}"; do
+  for root in "${release:-}" "${previous_release:-}" "${old_release:-}" "$APP_DIR/current" "$APP_DIR/previous" "$APP_DIR/slots/a" "$APP_DIR/slots/b" "$(prepared_record 1 || true)" "${runtime_roots[@]}"; do
     [[ -n "$root" && -e "$root" ]] || continue
     root=$(realpath -e -- "$root") || return 1
     roots+=("$root")
@@ -3027,6 +3045,9 @@ prune_caches() {
       interpreter=$(cat -- "$recorded") || return 1
       if [[ "$interpreter" =~ ^"$directory/"([a-f0-9]{64})/bin/python$ ]]; then keep_python[${BASH_REMATCH[1]}]=1; fi
     done
+    interpreter=
+    if [[ "$module" == greeks ]]; then interpreter=$(prepared_record 2) || interpreter=; else interpreter=$(prepared_record 3) || interpreter=; fi
+    if [[ "$interpreter" =~ ^"$directory/"([a-f0-9]{64})/bin/python$ ]]; then keep_python[${BASH_REMATCH[1]}]=1; fi
     for entry in "$directory"/* "$directory"/.prune.*; do
       [[ -e "$entry" || -L "$entry" ]] || continue
       name=${entry##*/}
@@ -3053,6 +3074,8 @@ main() {
     *) fail 'PROJECT_DEPLOY_TESTS 必须是 0 或 1。'; return 1 ;;
   esac
   case "$PROJECT_DEPLOY_SCOPE" in ''|full|api) ;; *) fail 'PROJECT_DEPLOY_SCOPE 必须是 api 或 full。'; return 1 ;; esac
+  case "$PROJECT_DEPLOY_PHASE" in ''|prepare) ;; *) fail 'PROJECT_DEPLOY_PHASE 只能是 prepare。'; return 1 ;; esac
+  [[ "$PROJECT_DEPLOY_PHASE" != prepare || "$PROJECT_DEPLOY_SCOPE" != api ]] || { fail '只重启 API 的更新不需要准备阶段。'; return 1; }
   [[ "$(uname -s)" == Linux ]] || fail '安装脚本仅用于 Linux；开发环境请使用 pnpm 命令。'
   [[ "$EUID" == 0 ]] || fail '请使用 sudo bash install.sh。'
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || fail '需要正在运行 systemd 的 Linux 主机。'
@@ -3185,6 +3208,14 @@ main() {
   fi
   previous_release=$old_release
   if [[ "$old_release" == "$release" && -L "$APP_DIR/previous" ]]; then previous_release=$(realpath -e "$APP_DIR/previous"); fi
+  if [[ "$PROJECT_DEPLOY_PHASE" == prepare ]]; then
+    # Nothing outside the release and the caches changed; the activation run reuses both.
+    atomic_record "$APP_DIR/.prepared-release" "$release"$'\n'"$GREEKS_PYTHON_PATH"$'\n'"$ASTER_PYTHON_PATH"
+    rm -rf -- "$work_dir"
+    trap - ERR INT TERM
+    log "已准备正式版本 ${commit:0:12}：下载、依赖、验证和构建已完成，尚未切换，服务保持运行。"
+    return "$DEPLOY_PREPARED"
+  fi
   prepare_environment_rollback
   ci_update_progress switch
   if dual_installed; then
@@ -3250,6 +3281,8 @@ main() {
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"
   if [[ -n "$old_release" && "$old_release" != "$release" ]]; then remember_previous_python_paths "$old_release"; fi
   if [[ -n "$previous_release" && "$previous_release" != "$release" ]]; then atomic_link "$previous_release" "$APP_DIR/previous"; fi
+  # Activated or superseded: a release prepared earlier no longer needs protection.
+  rm -f -- "$APP_DIR/.prepared-release"
   finish_update_service "$release"
   prune_releases
   prune_caches || log '部分旧缓存未能清理；已上线版本不受影响，下次成功部署会重试。'

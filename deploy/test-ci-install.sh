@@ -359,4 +359,25 @@ cmp -s "$fixture/application/.deployed-state" "$fixture/success-state"
 cmp -s "$fixture/application/.runtime-deployment" "$fixture/success-runtime"
 [[ $(new_calls | grep -cx "restart $service-api") == 2 ]]
 api_only
+# Design doc 6.9: a prepare run builds and verifies the release, then stops
+# before activation; the activation run that follows switches to that release.
+calls=$(wc -l < "$fixture/systemctl.calls")
+before=$(readlink "$fixture/application/current")
+runtime_before=$(live)
+cp "$fixture/application/.deployed-state" "$fixture/success-state"
+echo prepared >> "$fixture/source/server/index.mjs"; commit_source prepared
+make_package prepared runtime-three
+code=0; PROJECT_DEPLOY_PHASE=prepare bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code == 76 && $(readlink "$fixture/application/current") == "$before" && $(live) == "$runtime_before" ]] || { cat "$fixture/last.log"; exit 1; }
+cmp -s "$fixture/application/.deployed-state" "$fixture/success-state"
+if new_calls | grep -Eq '^(restart|stop|start|daemon-reload)'; then echo 'A prepare run touched a unit' >&2; exit 1; fi
+prepared=$(sed -n 1p "$fixture/application/.prepared-release")
+[[ -d "$prepared" && "$prepared" != "$before" && ! -f "$prepared/.install-ready" ]]
+code=0; PROJECT_DEPLOY_PHASE=prepare PROJECT_DEPLOY_SCOPE=api bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code != 0 && $code != 76 && $(readlink "$fixture/application/current") == "$before" ]]
+code=0; PROJECT_DEPLOY_PHASE=activate bash "$fixture/run.sh" > "$fixture/last.log" 2>&1 || code=$?
+[[ $code != 0 && $code != 76 && $(readlink "$fixture/application/current") == "$before" ]]
+run_install
+full_restart
+[[ $(readlink "$fixture/application/current") == "$prepared" && $(live) == "$prepared" && ! -e "$fixture/application/.prepared-release" ]]
 printf 'CI package migration, no-op, content identity, corruption, rollback and activation scope checks passed.\n'

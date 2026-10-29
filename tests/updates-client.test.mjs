@@ -177,6 +177,35 @@ test('plan scopes and the api scope cross the client only as fixed values', asyn
     finishedAt: null, activeModule: null, message: '准备更新', steps: [] } }), error => error.status === 503);
 });
 
+test('the prepare phase and its plan fields cross the client only as fixed values', async t => {
+  const calls = [];
+  const client = await fixture(t, async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString()); calls.push(body);
+    res.end(JSON.stringify({ ...state(), planPrepare: true, prepared: null, job: {
+      id: 'current-job', status: 'queued', deployMode: body.deployMode || 'source', scope: 'full', phase: body.phase || 'activate', startedAt: now,
+      finishedAt: null, activeModule: null, message: '准备更新', steps: [],
+    } }));
+  });
+  const result = await client.apply(planId, 'ci', 'full', 'prepare');
+  assert.equal(result.job.phase, 'prepare');
+  assert.equal(result.planPrepare, true);
+  assert.equal(result.prepared, null);
+  assert.equal((await client.apply(planId)).job.phase, 'activate');
+  assert.deepEqual(calls, [{ planId, deployMode: 'ci', phase: 'prepare' }, { planId }], 'activation stays the legacy request');
+  for (const phase of [null, '', 'PREPARE', 'switch']) assert.throws(() => client.apply(planId, 'ci', 'full', phase), error => error.status === 400);
+  assert.throws(() => client.apply(planId, 'ci', 'api', 'prepare'), error => error.status === 400);
+  assert.equal(calls.length, 2);
+  validateUpdateBody('apply', { planId, deployMode: 'ci', phase: 'prepare' });
+  assert.throws(() => validateUpdateBody('apply', { planId, phase: 'switch' }), error => error.status === 400);
+  assert.equal(publicUpdateState(state()).planPrepare, undefined, 'a legacy updater never offers the prepare phase');
+  assert.deepEqual(publicUpdateState({ ...state(), prepared: { planId, deployMode: 'ci', path: '/private' } }).prepared, { planId, deployMode: 'ci' });
+  for (const extra of [{ planPrepare: 'yes' }, { prepared: { planId: 'another-plan-12345678', deployMode: 'ci' } }, { prepared: { planId, deployMode: 'auto' } },
+    { prepared: true }, { job: { id: 'current-job', status: 'queued', phase: 'switch', startedAt: now, finishedAt: null, activeModule: null, message: '准备更新', steps: [] } }]) {
+    assert.throws(() => publicUpdateState({ ...state(), ...extra }), error => error.status === 503);
+  }
+});
+
 test('updater client bounds total request time including a trickling response', async t => {
   const client = await fixture(t, (req, res) => {
     res.write('{'); const timer = setInterval(() => res.write(' '), 10);

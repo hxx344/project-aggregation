@@ -50,6 +50,12 @@ work_dir="$test_root/work"
 mkdir "$work_dir"
 remember_environment
 prepare_environment_rollback
+set +e
+# A stray status 76 from a failing step is not a completed preparation.
+( activation_started=0; (exit "$DEPLOY_PREPARED"); rollback )
+rollback_status=$?
+set -e
+[[ "$rollback_status" == 1 && "$(readlink "$APP_DIR/current")" == "$release" ]]
 activation_started=1
 set +e
 ( (exit 9); rollback )
@@ -344,6 +350,20 @@ touch "$other/.managed-release"; printf '%s\n' "$(key 18)" > "$other/.runtime-de
 mkdir -p "$cache/runtime-dependencies-$(key 18)/node_modules"
 ( systemctl() { [[ $1 != show ]] || echo 0; [[ $1 != is-active ]]; }; prune_caches )
 [[ ! -e "$cache/runtime-dependencies-$(key 18)" ]]
+# Design doc 6.9: a prepared release, its dependencies and interpreters outlive pruning until activated.
+mkdir -p "$cache/runtime-dependencies-$(key 18)/node_modules" "$APP_DIR/python/$(key 27)"
+printf '%s\n%s\n%s\n' "$other" "$APP_DIR/python/$(key 27)/bin/python" '' > "$APP_DIR/.prepared-release"
+printf '%s\n%s\n' "$previous_target" "$APP_DIR/python/$(key 25)/bin/python" > "$APP_DIR/.previous-greeks-python-path"
+( live_runtime_release() { printf '%s' "$release"; }; inactive prune_caches )
+[[ -d "$cache/runtime-dependencies-$(key 18)" && -d "$APP_DIR/python/$(key 27)" ]]
+( live_runtime_release() { printf '%s' "$release"; }; previous_release=$old_release; prune_releases )
+[[ -d "$other" ]]
+rm "$APP_DIR/.prepared-release"
+( live_runtime_release() { printf '%s' "$release"; }; inactive prune_caches )
+[[ ! -e "$cache/runtime-dependencies-$(key 18)" && ! -e "$APP_DIR/python/$(key 27)" ]]
+( live_runtime_release() { printf '%s' "$release"; }; previous_release=$old_release; prune_releases )
+[[ ! -e "$other" ]]
+rm "$APP_DIR/.previous-greeks-python-path"
 rm -rf -- "$other"
 
 # A failed removal is reported without the ERR trap and keeps the entry under its original key.
