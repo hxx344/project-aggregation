@@ -29,10 +29,11 @@ export async function sendFeishu(config, text, { fetcher = fetch, now = Date.now
   if (!response.ok) throw Object.assign(new Error(`飞书返回 HTTP ${response.status}。`), { uncertain: response.status >= 500 });
   let result;
   try { result = await response.json(); } catch { throw Object.assign(new Error("飞书返回了无法识别的响应。"), { uncertain: true }); }
-  if (result?.code !== 0) {
-    const code = Number.isInteger(result?.code) ? result.code : "未知";
-    throw new Error(`飞书发送失败（${code}）：${failures[code] ?? "请检查机器人配置"}。`);
+  // Only an integer business code is a receipt; any other body cannot prove the message was not posted.
+  if (typeof result !== "object" || result === null || Array.isArray(result) || !Number.isInteger(result.code)) {
+    throw Object.assign(new Error("飞书返回了无法识别的响应。"), { uncertain: true });
   }
+  if (result.code !== 0) throw new Error(`飞书发送失败（${result.code}）：${failures[result.code] ?? "请检查机器人配置"}。`);
 }
 
 export function formatAlert(quote, rules) {

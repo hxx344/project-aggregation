@@ -98,7 +98,12 @@ test("Feishu checks application response codes, disallows redirects, and signs w
   } });
   await assert.rejects(sendFeishu({ webhookUrl }, "test", { fetcher: async () => Response.json({ code: 19021 }) }), /19021/);
   await assert.rejects(sendFeishu({ webhookUrl }, "test", { fetcher: async () => Response.json({ code: 0 }, { status: 429 }) }), /HTTP 429/);
-  await assert.rejects(sendFeishu({ webhookUrl }, "test", { fetcher: async () => Response.json({ StatusCode: 0 }) }));
+  await assert.rejects(sendFeishu({ webhookUrl }, "test", { fetcher: async () => Response.json({ code: 19021 }) }), error => !error.uncertain, "a business rejection proves non-delivery");
+  // A parseable body without an integer business code is no receipt either way.
+  for (const body of [{}, null, [], "ok", { code: "0" }, { code: 1.5 }, { StatusCode: 0 }]) {
+    await assert.rejects(sendFeishu({ webhookUrl }, "test", { fetcher: async () => Response.json(body) }), error => error.uncertain === true, JSON.stringify(body));
+  }
+  await assert.rejects(sendFeishu({ webhookUrl }, "test", { fetcher: async () => new Response("<html>") }), error => error.uncertain === true);
 });
 
 test("background checks deliver without any browser request and survive restart without duplicate delivery", async t => {

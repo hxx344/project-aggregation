@@ -8,6 +8,7 @@ import { createPerpetualAlertService } from '../server/perpetual-alert-service.m
 import { initialPerpetualAlertState, validatePerpetualAlertConfig, evaluatePerpetualAlertQuote, createPerpetualConditionTracker } from '../server/perpetual-alert-engine.mjs';
 import { openPerpetualAlertStore } from '../server/perpetual-alert-store.mjs';
 import { createHandler } from '../server/http.mjs';
+import { sendFeishu } from '../server/feishu.mjs';
 
 const NOW = 1_800_000_000_000;
 const rule = (patch = {}) => ({ id: 'btc-bg', name: 'BTC Binance to Gate', enabled: true, base: 'BTC', longKey: 'binance:BTCUSDT', shortKey: 'gate:BTCUSDT', thresholdPercent: 0.3, durationSeconds: 2, windowSeconds: 5, minHitRatio: 0.6, cooldownSeconds: 30, maxAgeSeconds: 10, budget: { slippagePercent: 0.1, takerOverrides: {} }, ...patch });
@@ -70,6 +71,21 @@ test('definite delivery failure re-arms after cooldown while an uncertain one is
   failure = null;
   for (let second = 37; second <= 80; second++) await f.tick(second);
   assert.equal(f.sent.length, 2, 'uncertain delivery waits for price re-entry instead of resending');
+});
+
+test('a Feishu reply without a business code is not resent after the cooldown while the condition holds', async t => {
+  let reply = {};
+  const webhookUrl = 'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook';
+  const f = fixture({ send: text => sendFeishu({ webhookUrl }, text, { fetcher: async () => Response.json(reply) }) }); t.after(() => f.service.stop()); await f.configure();
+  for (let second = 0; second <= 3; second++) await f.tick(second);
+  assert.equal(f.sent.length, 1); assert.match(f.service.view().history[0].error, /不确定/);
+  reply = { code: 0 };
+  for (let second = 4; second <= 80; second++) await f.tick(second);
+  assert.equal(f.sent.length, 1, 'the unknown reply may have posted');
+  // A real fall below the threshold and a fresh qualifying run alert again.
+  for (let second = 81; second <= 84; second++) await f.tick(second, { bid: 100, ask: 100.01 });
+  for (let second = 85; second <= 90; second++) await f.tick(second);
+  assert.equal(f.sent.length, 2); assert.equal(f.service.view().history[0].status, 'sent');
 });
 
 test('continuous time uses elapsed seconds and window ratio includes missing startup and outage seconds', () => {
