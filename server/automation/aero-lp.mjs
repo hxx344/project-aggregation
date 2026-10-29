@@ -2,8 +2,8 @@ import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getAddress, Wallet } from 'ethers';
-import { PRIVATE_KEY_PATTERN, SETTING_KEYS, validateSettings } from '../../tools/aero-lp/core.mjs';
+import { formatEther, getAddress, Wallet } from 'ethers';
+import { PRIVATE_KEY_PATTERN, SETTING_KEYS, parseLedger, summarizeLedger, validateSettings } from '../../tools/aero-lp/core.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
 
@@ -12,6 +12,7 @@ const tool = path.join(root, 'tools/aero-lp');
 const example = JSON.parse(readFileSync(path.join(tool, 'config.example.json'), 'utf8'));
 export const AERO_LP_DEFAULTS = Object.freeze(Object.fromEntries(SETTING_KEYS.map((key) => [key, example[key]])));
 const EVENT_LIMIT = 50;
+const LEDGER_LIMIT = 16 * 1024 * 1024;
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;
@@ -40,9 +41,11 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
   retryDelays = [1000, 2000, 4000, 8000, 16000] } = {}) {
   const directory = path.join(dataDir, 'aero-lp');
   const configPath = path.join(directory, 'config.json'), controlPath = path.join(directory, 'control.json'), walletPath = path.join(directory, 'wallet.json');
+  const ledgerPath = path.join(directory, 'txs.jsonl');
   let config = structuredClone(AERO_LP_DEFAULTS), configValid = true, enabled = false, address = null, child = null, closed = false, initialized = false;
   let stopping = null, failure = null, retry = 0, retryTimer = null, generationStarted = 0, phase = null, lastCycle = null, paused = false, maintenanceTimer = null;
   const events = [];
+  let ledgerCache = null;
   let operation = Promise.resolve();
   const cleared = () => { clearTimeout(retryTimer); retryTimer = null; };
   const serial = (fn) => {
@@ -58,10 +61,25 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     if (typeof key !== 'string' || !PRIVATE_KEY_PATTERN.test(key) || new Wallet(key).address !== saved.address) throw new Error('invalid_wallet');
     return key;
   }
+  // The child appends txs.jsonl; re-parse only when its size or mtime changes.
+  function ledger() {
+    if (!address) return null;
+    try {
+      if (!existsSync(ledgerPath)) return { txs: 0, failed: 0, gasEth: '0', reward: '0', since: null };
+      const info = lstatSync(ledgerPath);
+      if (!info.isFile() || info.size > LEDGER_LIMIT) return null;
+      const stamp = `${info.size}:${info.mtimeMs}:${address}`;
+      if (ledgerCache?.stamp !== stamp) {
+        const sum = summarizeLedger(parseLedger(readFileSync(ledgerPath, 'utf8')), address);
+        ledgerCache = { stamp, value: { txs: sum.txs, failed: sum.failed, gasEth: formatEther(sum.fee), reward: formatEther(sum.reward), since: sum.since } };
+      }
+      return structuredClone(ledgerCache.value);
+    } catch { return null; }
+  }
   function state() {
     return { schema: 1, enabled, state: stopping ? 'stopping' : child ? phase ? 'running' : 'starting' : failure && !retryTimer ? 'fault' : enabled ? 'starting' : 'stopped',
       error: failure, wallet: address, paused, phase: phase && structuredClone(phase), lastCycle: lastCycle && structuredClone(lastCycle),
-      events: structuredClone(events), config: structuredClone(config), defaults: structuredClone(AERO_LP_DEFAULTS), serverNow: now() };
+      events: structuredClone(events), ledger: ledger(), config: structuredClone(config), defaults: structuredClone(AERO_LP_DEFAULTS), serverNow: now() };
   }
   function record(entry) {
     if (!entry || typeof entry !== 'object' || typeof entry.event !== 'string') return;

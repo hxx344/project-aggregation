@@ -1,5 +1,8 @@
 // 链上读取与交易执行。每轮都从链上重建状态，不依赖本地记录，交易结果未知时下一轮按现状继续。
-import { Contract, FetchRequest, JsonRpcProvider, Network, formatUnits, getAddress, keccak256 } from 'ethers';
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { Contract, FetchRequest, JsonRpcProvider, Network, formatUnits, getAddress, id, keccak256 } from 'ethers';
+import { parseLedger } from './core.mjs';
 
 const BASE_CHAIN_ID = 8453;
 const RPC_TIMEOUT_MS = 20_000;
@@ -7,6 +10,10 @@ const READ_ATTEMPTS = 3;
 const RECEIPT_TIMEOUT_MS = 180_000;
 const DEADLINE_SEC = 600;
 const MAX_UINT128 = (1n << 128n) - 1n;
+// 奖励代币报价用 Aerodrome 主路由（volatile 池，默认工厂）；xAERO 是排放收据代币，地址从 gauge 的 voter 读取。
+const AERO = '0x940181a94A35A4569E4529A3CDfB74e38FD98631';
+const ROUTER = '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';
+const TRANSFER_TOPIC = id('Transfer(address,address,uint256)');
 
 const POOL_ABI = [
   'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, bool)',
@@ -16,6 +23,9 @@ const POOL_ABI = [
   'function gauge() view returns (address)',
   'function factory() view returns (address)',
   'function observe(uint32[]) view returns (int56[] tickCumulatives, uint160[])',
+  'function rewardGrowthGlobalX128() view returns (uint256)',
+  'function lastUpdated() view returns (uint32)',
+  'function stakedLiquidity() view returns (uint128)',
 ];
 const FACTORY_ABI = ['function getPool(address, address, int24) view returns (address)'];
 const GAUGE_ABI = [
@@ -26,6 +36,14 @@ const GAUGE_ABI = [
   'function depositBlock(uint256) view returns (uint256)',
   'function deposit(uint256)',
   'function withdraw(uint256)',
+  'function voter() view returns (address)',
+  'function earned(address, uint256[]) view returns (uint256)',
+  'function deferredEmissions(address) view returns (uint256)',
+];
+const VOTER_ABI = ['function RECEIPT_TOKEN() view returns (address)'];
+const ROUTER_ABI = [
+  'function defaultFactory() view returns (address)',
+  'function getAmountsOut(uint256, (address from, address to, bool stable, address factory)[]) view returns (uint256[])',
 ];
 const GAUGE_FACTORY_ABI = ['function effectivePenaltyConfig(address) view returns (uint256 minStakeBlocks, uint256 penaltyRate)'];
 const NFT_ABI = [
@@ -94,6 +112,11 @@ export async function connect({ rpcUrl, pool: poolAddress, token, factory: expec
   const t0 = new Contract(token0, ERC20_ABI, rpc), t1 = new Contract(token1, ERC20_ABI, rpc);
   const [decimals0, decimals1, symbol0, symbol1] = await read('tokens', () => Promise.all([t0.decimals(), t1.decimals(), t0.symbol(), t1.symbol()]));
   const signerOrProvider = runner || rpc;
+  // 奖励相关只用于展示：读不到时不影响调仓。
+  const router = new Contract(ROUTER, ROUTER_ABI, rpc);
+  let receiptToken = null, routerFactory = null;
+  try { receiptToken = getAddress(await new Contract(await gaugeRead.voter(), VOTER_ABI, rpc).RECEIPT_TOKEN()); } catch {}
+  try { routerFactory = await router.defaultFactory(); } catch {}
   return {
     rpc,
     runner,
@@ -104,6 +127,11 @@ export async function connect({ rpcUrl, pool: poolAddress, token, factory: expec
     gaugeFactory: new Contract(gaugeFactoryAddress, GAUGE_FACTORY_ABI, rpc),
     nft: new Contract(nftAddress, NFT_ABI, signerOrProvider),
     erc0: new Contract(token0, ERC20_ABI, signerOrProvider),
+    aero: new Contract(AERO, ERC20_ABI, rpc),
+    xaero: receiptToken && new Contract(receiptToken, ERC20_ABI, rpc),
+    router, routerFactory,
+    // 池内代币（例如 AERO 本身是池子一侧）撤仓收回时不算奖励。
+    rewardTokens: [AERO, receiptToken].filter((a) => a && ![token0, token1].some((t) => getAddress(t) === a)),
     addresses: { pool: getAddress(poolAddress), gauge: gaugeAddress, nft: nftAddress, factory: factoryAddress, gaugeFactory: gaugeFactoryAddress },
   };
 }
@@ -143,6 +171,7 @@ export async function readState(ctx, wallet, twapSec) {
   return {
     blockNumber,
     tick: Number(slot0.tick),
+    sqrtPrice: Number(slot0.sqrtPriceX96) / 2 ** 96,
     twapTick: observed ? Math.floor(Number(observed.tickCumulatives[1] - observed.tickCumulatives[0]) / twapSec) : null,
     twapError,
     walletToken0,
@@ -251,4 +280,75 @@ export async function execute(ctx, log, wallet, plan, options) {
   if (!target) { log({ event: 'mint_skipped', reason: 'latest price is at/above upper bound or below the TWAP guard' }); return; }
   const tokenId = await mint(ctx, log, wallet, target, options);
   if (tokenId !== null) await tryStake(ctx, log, tokenId);
+}
+
+const REWARDS_BUDGET_MS = 5_000;
+
+// 奖励与价格只读一次、不重试，总耗时超过 5 秒按失败处理：本轮只缺展示数据，不推迟调仓。
+export async function readRewards(ctx, wallet, stakedIds, budgetMs = REWARDS_BUDGET_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`reward reads exceeded ${budgetMs} ms`)), budgetMs); });
+  try { return await Promise.race([rewardReads(ctx, wallet, stakedIds), timeout]); } finally { clearTimeout(timer); }
+}
+
+async function rewardReads(ctx, wallet, stakedIds) {
+  const quote = ctx.routerFactory
+    ? ctx.router.getAmountsOut(10n ** 18n, [{ from: AERO, to: ctx.token1, stable: false, factory: ctx.routerFactory }]).then((amounts) => Number(formatUnits(amounts[1], ctx.decimals1)), () => null)
+    : null;
+  const [growth, updatedAt, stakedLiquidity, pending, deferred, aero, xaero, price] = await Promise.all([
+    ctx.pool.rewardGrowthGlobalX128(), ctx.pool.lastUpdated(), ctx.pool.stakedLiquidity(),
+    stakedIds.length ? ctx.gauge.earned(wallet, stakedIds) : 0n,
+    ctx.gauge.deferredEmissions(wallet),
+    ctx.aero.balanceOf(wallet),
+    ctx.xaero ? ctx.xaero.balanceOf(wallet) : null,
+    quote,
+  ]);
+  return { growth, updatedAt: Number(updatedAt), stakedLiquidity, pending, deferred, aero, xaero, price };
+}
+
+const LEDGER_FILE = 'txs.jsonl';
+const RECONCILE_LIMIT = 20;
+const RECONCILE_BUDGET_MS = 15_000;
+const MISSING_AFTER_MS = 86_400_000;
+const EVENTS_TAIL_BYTES = 4 * 1024 * 1024;
+const readOptional = (file) => (existsSync(file) ? readFileSync(file, 'utf8') : '');
+// 非托管 run 不轮转事件日志，只读文件尾部；被截断的首行解析失败后跳过。
+function readTail(file, bytes) {
+  if (!existsSync(file)) return '';
+  const size = statSync(file).size, length = Math.min(size, bytes), buffer = Buffer.alloc(length), fd = openSync(file, 'r');
+  try { readSync(fd, buffer, 0, length, size - length); } finally { closeSync(fd); }
+  return buffer.toString('utf8');
+}
+
+// 按事件日志里已签名的哈希补读回执，追加到 txs.jsonl（不轮转）：手续费含 Base 的 L1 数据费，
+// reward 为本交易转入钱包的 AERO/xAERO。回执未出现的下轮再查，签名超过 1 天仍无回执按 wallet 记为 missing。
+// 每次最多查 20 笔（新签名的优先），总耗时超过 15 秒剩余的留到下轮。
+export async function reconcileLedger(ctx, dataDir, wallet, append, { now = Date.now(), budgetMs = RECONCILE_BUDGET_MS } = {}) {
+  const known = new Set(parseLedger(readOptional(join(dataDir, LEDGER_FILE))).map((e) => e.hash.toLowerCase()));
+  const signed = new Map();
+  for (const name of ['events.1.jsonl', 'events.jsonl']) {
+    for (const line of readTail(join(dataDir, name), EVENTS_TAIL_BYTES).split('\n')) {
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e?.event === 'tx_signed' && typeof e.hash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(e.hash) && !known.has(e.hash.toLowerCase())) signed.set(e.hash.toLowerCase(), e);
+    }
+  }
+  const rewardTokens = new Set(ctx.rewardTokens.map((a) => a.toLowerCase()));
+  const deadline = Date.now() + budgetMs;
+  for (const [hash, e] of [...signed].reverse().slice(0, RECONCILE_LIMIT)) {
+    if (Date.now() > deadline) break;
+    const r = await read(`receipt ${hash}`, () => ctx.rpc.send('eth_getTransactionReceipt', [hash]));
+    if (!r) {
+      if (!(now - Date.parse(e.at) > MISSING_AFTER_MS)) continue;
+      append({ hash, at: e.at, label: e.label, wallet: getAddress(wallet), status: 'missing', fee: '0', reward: '0' });
+      continue;
+    }
+    const from = getAddress(r.from), recipient = '0x' + from.slice(2).toLowerCase().padStart(64, '0');
+    let reward = 0n;
+    for (const l of r.logs) {
+      if (rewardTokens.has(l.address.toLowerCase()) && l.topics[0] === TRANSFER_TOPIC && l.topics[2]?.toLowerCase() === recipient) reward += BigInt(l.data);
+    }
+    const fee = BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice) + BigInt(r.l1Fee ?? 0);
+    append({ hash, at: e.at, label: e.label, wallet: from, block: Number(r.blockNumber), status: Number(r.status) === 1 ? 'ok' : 'reverted', fee: String(fee), reward: String(reward) });
+  }
 }
