@@ -32,17 +32,20 @@ function message(reason: unknown) { return reason instanceof Error ? reason.mess
 const short = (address: string) => `${address.slice(0, 6)}…${address.slice(-4)}`;
 
 // Where the current price sits relative to a range, on a log-price axis padded around both.
-function spot(range: [number, number], current: number) {
+// The child's tick-based state is the pool's own test and wins; price comparison is the fallback for older cycles.
+function spot(range: [number, number], current: number, given?: 'below' | 'in' | 'above') {
   const [lower, upper] = range;
-  const state = current < lower ? 'below' : current >= upper ? 'above' : 'in';
-  const text = state === 'below' ? `低于下沿 ${percent(lower / current - 1)}` : state === 'above' ? `高于上沿 ${percent(current / upper - 1)}` : `区间内 ${percent((current - lower) / (upper - lower))}`;
+  const state = given ?? (current < lower ? 'below' : current >= upper ? 'above' : 'in');
+  const gap = (v: number) => (v >= 0.00005 ? percent(v) : '<0.01%');
+  const text = state === 'below' ? `低于下沿 ${gap(lower / current - 1)}` : state === 'above' ? `高于上沿 ${gap(current / upper - 1)}`
+    : `区间内 ${percent(Math.min(Math.max((current - lower) / (upper - lower), 0), 1))}`;
   const lo = Math.log(Math.min(lower, current)), hi = Math.log(Math.max(upper, current)), pad = (hi - lo) * 0.06 || 0.01;
   const at = (v: number) => ((Math.log(v) - lo + pad) / (hi - lo + pad * 2)) * 100;
   return { state, text, left: at(lower), width: at(upper) - at(lower), marker: at(current) };
 }
-function RangeSpot({ range, current }: { range: [number, number]; current: number }) {
+function RangeSpot({ range, current, state }: { range: [number, number]; current: number; state?: 'below' | 'in' | 'above' }) {
   if (!(current > 0 && range[0] > 0 && range[1] > 0)) return <>—</>;
-  const s = spot(range, current);
+  const s = spot(range, current, state);
   return <div className={`lp-spot ${s.state}`}><span className="lp-spot-bar" aria-hidden="true"><span className="lp-spot-range" style={{ left: `${s.left}%`, width: `${s.width}%` }} /><span className="lp-spot-marker" style={{ left: `${s.marker}%` }} /></span><span>{s.text}</span></div>;
 }
 // The headline position: the first live one, staked first.
@@ -215,7 +218,7 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
           <Fact label="累计 Gas" hint={gas.hint}>{gas.value}</Fact>
         </dl>
         <div className="lp-table-scroll"><table className="lp-table"><caption className="visually-hidden">本钱包在池中的头寸</caption><thead><tr><th>头寸</th><th>区间（USDC）</th><th>现价位置</th><th>持有</th><th>价值（USDC）</th><th>AERO 年化</th><th>质押</th></tr></thead><tbody>
-          {cycle?.positions.length ? cycle.positions.map(p => <tr key={p.id}><th scope="row">#{p.id}</th><td>{price(p.range[0])} – {price(p.range[1])}</td><td><RangeSpot range={p.range} current={cycle.price} /></td>
+          {cycle?.positions.length ? cycle.positions.map(p => <tr key={p.id}><th scope="row">#{p.id}</th><td>{price(p.range[0])} – {price(p.range[1])}</td><td><RangeSpot range={p.range} current={cycle.price} state={p.state} /></td>
             <td>{typeof p.amount0 === 'number' ? <>{amount(p.amount0)} {symbol0}{p.amount1 ? <><br />{amount(p.amount1)} {symbol1}</> : null}</> : '—'}</td><td>{amount(p.value)}</td>
             <td>{typeof p.apr === 'number' ? `${percent(p.apr)}${p.aprEstimated ? '（估）' : ''}` : '—'}</td><td>{p.staked ? '已质押' : '未质押'}</td></tr>)
             : <tr><td colSpan={7} className="lp-table-empty">{cycle ? '本池暂无头寸' : '等待第一轮检查'}</td></tr>}

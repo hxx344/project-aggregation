@@ -6,7 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Wallet, formatEther, formatUnits, getAddress, parseEther, parseUnits } from 'ethers';
-import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, nearestUsableTick, planCycle, positionAmounts, targetRange, tickToPrice, validateSettings } from './core.mjs';
+import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
 import { connect, errorText, execute, provider, readRewards, readState, reconcileLedger } from './chain.mjs';
 
 const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]  |  lp run --managed --config FILE --data DIR';
@@ -158,7 +158,7 @@ async function cycle(ctx, config, wallet, log, { dryRun, dataDir, memory = {}, p
     twapPrice: state.twapTick === null ? null : price(state.twapTick),
     ...(state.twapError && { twapError: state.twapError }),
     target: plan.target && [price(plan.target.tickLower), price(plan.target.tickUpper)],
-    positions: state.positions.map((p, i) => ({ id: String(p.tokenId), range: [price(p.tickLower), price(p.tickUpper)], staked: p.staked, liquidity: String(p.liquidity), ...rewards?.positions[i] })),
+    positions: state.positions.map((p, i) => ({ id: String(p.tokenId), range: [price(p.tickLower), price(p.tickUpper)], staked: p.staked, liquidity: String(p.liquidity), state: rangeState(p, state.tick), ...rewards?.positions[i] })),
     status: plan.status,
     wallet: {
       [ctx.symbol0]: formatUnits(state.walletToken0, ctx.decimals0), ETH: formatEther(state.walletEth),
