@@ -1,0 +1,13 @@
+{
+  "name": "aero-lp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Aerodrome Slipstream 单边 RSGP 流动性自动调仓",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "dependencies": {
+    "ethers": "6.17.0"
+  }
+}

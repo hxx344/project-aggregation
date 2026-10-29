@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 首次运行时在本目录安装锁定版本的依赖，然后执行 cli.mjs。
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ ! -d "$here/node_modules/ethers" ]; then
+  (cd "$here" && pnpm install --ignore-workspace --frozen-lockfile >&2)
+fi
+exec node "$here/cli.mjs" "$@"
