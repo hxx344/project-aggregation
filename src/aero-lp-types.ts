@@ -1,6 +1,6 @@
 // Mirrors server/automation/aero-lp.mjs state(); the private key is never part of it.
 export type AeroLpConfig = {
-  rpcUrl: string; pool: string; factory: string; nft: string; gauge: string; token: string;
+  rpcUrl: string; pool: string; factory: string; nft: string; gauge: string; token: string; token1: string; tickSpacing: number;
   upperPrice: number; gapBps: number; intervalSec: number; twapSec: number; maxTwapDeviationBps: number; slippageBps: number;
   keepInWallet: string; minDeploy: string; minEthForGas: string;
 };

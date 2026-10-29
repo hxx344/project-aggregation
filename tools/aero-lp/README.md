@@ -73,6 +73,8 @@ mkdir -p ~/.config/aero-lp
 | `nft` | `0x4857…c60b` | 头寸 NFT 管理合约，必须与 gauge 的 `nft()` 一致；代币只授权给它 |
 | `gauge` | `0x77e3…72b1` | 质押用的 gauge，必须与池子的 `gauge()` 一致；NFT 只授权给它。授权对象由配置固定，RPC 返回不同地址时拒绝连接 |
 | `token` | RSGP | 必须是池子的 token0（单边投入的币） |
+| `token1` | USDC | 池子的 token1；开仓按 (token0, token1, tickSpacing) 定位池子，三者都由配置固定 |
+| `tickSpacing` | `100` | 池子的格点间距，必须与池子一致 |
 | `upperPrice` | `0.005` | 固定上沿，单位为 token1/token0（USDC/RSGP） |
 | `gapBps` | `40` | 下沿至少高于现价多少（万分比） |
 | `intervalSec` | `600` | 检查间隔（秒），10–86400；公共 RPC 建议不低于 10 秒 |

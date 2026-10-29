@@ -98,6 +98,8 @@ const connectionFields: Field[] = [
   { key: 'rpcUrl', label: 'Base RPC（https）', kind: 'text', wide: true },
   { key: 'pool', label: '池子地址', kind: 'text', wide: true },
   { key: 'token', label: '投入代币（token0）', kind: 'text', wide: true },
+  { key: 'token1', label: '计价代币（token1）', kind: 'text', wide: true },
+  { key: 'tickSpacing', label: '格点间距', kind: 'integer', hint: '须与池子一致' },
   { key: 'factory', label: '池工厂', kind: 'text', wide: true },
   { key: 'nft', label: '头寸 NFT 合约', kind: 'text', wide: true },
   { key: 'gauge', label: '质押 gauge（NFT 只授权给它）', kind: 'text', wide: true },

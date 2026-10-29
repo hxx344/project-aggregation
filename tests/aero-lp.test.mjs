@@ -229,7 +229,7 @@ function fakeRpc(answers) {
 test('approve target comes from config: an RPC that reports another gauge is refused', async () => {
   const config = validateSettings(JSON.parse(readFileSync(new URL('../tools/aero-lp/config.example.json', import.meta.url), 'utf8')), { extra: ['keyFile', 'address', 'dataDir'] });
   const answers = {
-    token0: config.token, token1: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', tickSpacing: 100, gauge: config.gauge, factory: config.factory,
+    token0: config.token, token1: config.token1, tickSpacing: config.tickSpacing, gauge: config.gauge, factory: config.factory,
     getPool: config.pool, nft: config.nft, pool: config.pool, gaugeFactory: '0x' + '33'.repeat(20), decimals: 18, symbol: 'X',
   };
   const ctx = await connect(config, { provider: fakeRpc(answers) });
@@ -239,6 +239,10 @@ test('approve target comes from config: an RPC that reports another gauge is ref
   const forged = '0x' + '44'.repeat(20);
   // 伪造的 gauge 自报的 pool/nft 也全部「匹配」，仍然拒绝连接。
   await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, gauge: forged }) }), /config\.gauge/);
+  // mint 按 (token0, token1, tickSpacing) 定位池子：RPC 自报的另一组（连同伪造的 getPool）同样拒绝。
+  assert.equal(ctx.token1, getAddress(config.token1)); assert.equal(ctx.spacing, config.tickSpacing);
+  await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, token1: forged }) }), /config\.token1/);
+  await assert.rejects(connect(config, { provider: fakeRpc({ ...answers, tickSpacing: 200 }) }), /config\.tickSpacing/);
 });
 
 test('a hold arriving before signing stops the cycle without signing or logging a stake failure', async () => {

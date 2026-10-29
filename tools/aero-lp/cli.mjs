@@ -30,7 +30,7 @@ function parseArgs(argv) {
 
 const expandHome = (p) => (p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
 
-const withAddresses = (c) => ({ ...c, pool: getAddress(c.pool), token: getAddress(c.token), factory: getAddress(c.factory), nft: getAddress(c.nft), gauge: getAddress(c.gauge) });
+const withAddresses = (c) => ({ ...c, pool: getAddress(c.pool), token: getAddress(c.token), factory: getAddress(c.factory), nft: getAddress(c.nft), gauge: getAddress(c.gauge), token1: getAddress(c.token1) });
 
 // 托管模式的配置只含可在页面上修改的参数。
 export const loadSettings = (source) => withAddresses(validateSettings(JSON.parse(source)));
@@ -189,7 +189,7 @@ async function managed({ configPath, dataDir }) {
   const log = logger(dataDir, { managed: true });
   const phase = (name, extra = {}) => { if (process.connected) process.send({ type: 'aero-lp-phase', phase: name, ...extra }); };
   // 回报已生效的暂停状态：IPC 消息有序，工作台收到回报时已看到此前发出的 executing 阶段。
-  const held = () => { if (process.connected) process.send({ type: 'aero-lp-hold', paused }); };
+  const held = (seq) => { if (process.connected) process.send({ type: 'aero-lp-hold', paused, seq }); };
   let stopping = false, paused = false, pendingWake = false, wake = null, receive = null;
   const stop = () => { stopping = true; wake?.(); receive?.(null); };
   const key = await new Promise((resolve, reject) => {
@@ -197,10 +197,10 @@ async function managed({ configPath, dataDir }) {
     receive = (value) => { clearTimeout(timer); receive = null; resolve(value); };
     process.on('message', (message) => {
       if (!message || typeof message !== 'object') return;
-      if (message.type === 'aero-lp-key' && typeof message.key === 'string') { paused = message.paused === true; held(); receive?.(message.key); }
+      if (message.type === 'aero-lp-key' && typeof message.key === 'string') { paused = message.paused === true; held(message.seq); receive?.(message.key); }
       else if (message.type === 'aero-lp-stop') stop();
       else if (message.type === 'aero-lp-reload') { pendingWake = true; wake?.(); }
-      else if (message.type === 'aero-lp-pause') { paused = message.paused === true; held(); }
+      else if (message.type === 'aero-lp-pause') { paused = message.paused === true; held(message.seq); }
     });
     process.once('disconnect', stop);
     process.on('SIGINT', stop); process.on('SIGTERM', stop);

@@ -21,7 +21,7 @@ function readBounded(file, limit) {
   return JSON.parse(readFileSync(file, 'utf8'));
 }
 
-const ADDRESS_KEYS = ['pool', 'factory', 'nft', 'gauge', 'token'];
+const ADDRESS_KEYS = ['pool', 'factory', 'nft', 'gauge', 'token', 'token1'];
 
 export function strictAeroLpConfig(value) {
   let next;
@@ -34,11 +34,12 @@ export function strictAeroLpConfig(value) {
   return next;
 }
 
-// Settings saved before the gauge was pinned get it only for the default pool,
-// whose gauge is known; any other pool must be saved again with its gauge.
-function withPinnedGauge(saved) {
-  if (!saved || typeof saved !== 'object' || Object.hasOwn(saved, 'gauge') || typeof saved.pool !== 'string' || saved.pool.toLowerCase() !== AERO_LP_DEFAULTS.pool.toLowerCase()) return saved;
-  return { ...saved, gauge: AERO_LP_DEFAULTS.gauge };
+// Settings saved before these keys were pinned get them only for the default
+// pool, whose values are known; any other pool must be saved again with its own.
+const PINNED_KEYS = ['gauge', 'token1', 'tickSpacing'];
+function withPinnedKeys(saved) {
+  if (!saved || typeof saved !== 'object' || typeof saved.pool !== 'string' || saved.pool.toLowerCase() !== AERO_LP_DEFAULTS.pool.toLowerCase()) return saved;
+  return { ...Object.fromEntries(PINNED_KEYS.map((key) => [key, AERO_LP_DEFAULTS[key]])), ...saved };
 }
 
 const RECOVERY_HOLD = '账户写入处于隔离恢复状态，LP 调仓暂停，恢复正常后自动启动';
@@ -56,7 +57,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
   let config = structuredClone(AERO_LP_DEFAULTS), configValid = true, enabled = false, address = null, child = null, closed = false, initialized = false;
   let stopping = null, failure = null, retry = 0, retryTimer = null, generationStarted = 0, phase = null, lastCycle = null, paused = false, maintenanceTimer = null;
   // hold: why signing is held (maintenance / recovery); childPaused: the hold the child last confirmed.
-  let hold = null, childPaused = false, keyHanded = false, heldByRecovery = false;
+  // Every hold message carries a new holdSeq; only the child's echo of the latest one counts.
+  let hold = null, holdSeq = 0, childPaused = false, keyHanded = false, heldByRecovery = false;
   const events = [];
   let ledgerCache = null;
   let operation = Promise.resolve();
@@ -120,8 +122,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     current.stderr?.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-2000); });
     current.on('message', (message) => {
       if (child !== current || !message || typeof message !== 'object') return;
-      if (message.type === 'aero-lp-ready' && key) { pollHold(); send({ type: 'aero-lp-key', key, paused }); key = null; keyHanded = true; }
-      else if (message.type === 'aero-lp-hold') childPaused = message.paused === true;
+      if (message.type === 'aero-lp-ready' && key) { pollHold(); childPaused = false; send({ type: 'aero-lp-key', key, paused, seq: ++holdSeq }); key = null; keyHanded = true; }
+      else if (message.type === 'aero-lp-hold' && message.seq === holdSeq) childPaused = message.paused === true;
       else if (message.type === 'aero-lp-event') record(message.entry);
       else if (message.type === 'aero-lp-phase' && typeof message.phase === 'string') phase = { name: message.phase, at: now(), nextAt: typeof message.nextAt === 'string' ? message.nextAt : null };
     });
@@ -181,8 +183,9 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
   function pollHold() {
     hold = readHold();
     const next = hold !== null;
-    if (next !== paused) { paused = next; send({ type: 'aero-lp-pause', paused }); }
-    if (heldByRecovery && hold !== 'recovery' && enabled && !child && !retryTimer && !stopping && !closed) startChild();
+    if (next !== paused) { paused = next; childPaused = false; send({ type: 'aero-lp-pause', paused, seq: ++holdSeq }); }
+    // Resume only with no hold at all, so the update stop check never starts a signer.
+    if (heldByRecovery && hold === null && enabled && !child && !retryTimer && !stopping && !closed) startChild();
   }
   // Update stop check: hold the child now, wait for it to confirm, and refuse
   // while it is inside a transaction step. The child signs nothing once it has
@@ -212,8 +215,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
         address = typeof savedWallet?.address === 'string' ? savedWallet.address : null;
         const saved = readBounded(configPath, 64 * 1024);
         if (saved) {
-          config = validateSettings(withPinnedGauge(saved));
-          if (!Object.hasOwn(saved, 'gauge')) atomicJson(configPath, config);
+          config = validateSettings(withPinnedKeys(saved));
+          if (PINNED_KEYS.some((key) => !Object.hasOwn(saved, key))) atomicJson(configPath, config);
         } else atomicJson(configPath, config);
         const prior = readBounded(controlPath, 4096);
         if (prior) {

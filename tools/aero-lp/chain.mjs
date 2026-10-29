@@ -94,8 +94,8 @@ export function provider(rpcUrl) {
 
 // 从池地址出发解析 gauge 与 NFT 管理器，并与配置里固定的工厂、NFT 管理器地址逐项比对：
 // 池地址写错或被替换时，不会把代币授权给池子自报的合约。NFT 的授权对象 gauge 同样由配置固定：
-// RPC 被篡改时可以伪造全部只读结果，但签名交易只发往配置里的地址。
-export async function connect({ rpcUrl, pool: poolAddress, token, factory: expectedFactory, nft: expectedNft, gauge: expectedGauge }, runner) {
+// RPC 被篡改时可以伪造全部只读结果，但签名交易的目标与开仓定位池子的参数都只取自配置。
+export async function connect({ rpcUrl, pool: poolAddress, token, token1: expectedToken1, tickSpacing: expectedSpacing, factory: expectedFactory, nft: expectedNft, gauge: expectedGauge }, runner) {
   const rpc = runner?.provider || provider(rpcUrl);
   const chainId = await read('chainId', () => rpc.send('eth_chainId', []));
   if (Number(chainId) !== BASE_CHAIN_ID) throw new Error(`rpc chainId ${Number(chainId)} is not Base (${BASE_CHAIN_ID})`);
@@ -103,6 +103,8 @@ export async function connect({ rpcUrl, pool: poolAddress, token, factory: expec
   const [token0, token1, spacing, gaugeAddress, factoryAddress] = await read('pool', () => Promise.all([pool.token0(), pool.token1(), pool.tickSpacing(), pool.gauge(), pool.factory()]));
   if (getAddress(token0) !== getAddress(token)) throw new Error(`pool token0 ${token0} is not configured token ${token}; single-sided range above price requires the asset to be token0`);
   if (getAddress(factoryAddress) !== getAddress(expectedFactory)) throw new Error(`pool factory ${factoryAddress} != config.factory ${expectedFactory}`);
+  if (getAddress(token1) !== getAddress(expectedToken1)) throw new Error(`pool token1 ${token1} != config.token1 ${expectedToken1}`);
+  if (Number(spacing) !== expectedSpacing) throw new Error(`pool tickSpacing ${spacing} != config.tickSpacing ${expectedSpacing}`);
   if (getAddress(gaugeAddress) !== getAddress(expectedGauge)) throw new Error(`pool gauge ${gaugeAddress} != config.gauge ${expectedGauge}`);
   const factory = new Contract(factoryAddress, FACTORY_ABI, rpc);
   const registered = await read('factory.getPool', () => factory.getPool(token0, token1, spacing));
@@ -123,8 +125,8 @@ export async function connect({ rpcUrl, pool: poolAddress, token, factory: expec
   return {
     rpc,
     runner,
-    spacing: Number(spacing),
-    token0, token1, decimals0: Number(decimals0), decimals1: Number(decimals1), symbol0, symbol1,
+    spacing: expectedSpacing,
+    token0: getAddress(token), token1: getAddress(expectedToken1), decimals0: Number(decimals0), decimals1: Number(decimals1), symbol0, symbol1,
     pool,
     gauge: new Contract(gauge, GAUGE_ABI, signerOrProvider),
     gaugeFactory: new Contract(gaugeFactoryAddress, GAUGE_FACTORY_ABI, rpc),
