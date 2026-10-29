@@ -132,6 +132,32 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         await engine.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "original-link")
         self.assertEqual(sum(request.method == "POST" for request in self.requests), 2)
 
+    async def test_unlisted_trade_code_keeps_the_create_unknown_through_order_recovery(self):
+        code = 110999  # inside the old 110xxx block but not documented
+        engine = await self.engine()
+        engine.settings.bbo_poll_seconds = .001
+        engine.settings.bbo_order_timeout_seconds = .05
+        engine.chain = demo_chain(datetime.now(timezone.utc))
+        symbol = engine.chain[0].symbol
+        await engine.client.close()
+        posted = []
+
+        def respond(request):
+            if request.url.path == "/v5/user/query-api":
+                return httpx.Response(200, json={"retCode": 0, "result": {"userID": self.uid, "isMaster": False, "parentUid": "111", "readOnly": 0}})
+            if request.method == "POST":
+                posted.append(request.url.path)
+                return httpx.Response(200, json={"retCode": code, "retMsg": "injected", "result": {}})
+            if request.url.path == "/v5/market/tickers":
+                return httpx.Response(200, json={"retCode": 0, "result": {"list": [{"bid1Price": "1"}]}})
+            return httpx.Response(200, json={"retCode": 0, "result": {"list": []}})
+
+        engine.client._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        outcome = await engine.follow_bbo_order(SimpleNamespace(symbol=symbol, side="Buy"), 1, f"unknown-{code}")
+        self.assertEqual((outcome["status"], outcome["terminal"]), ("unknown", False))
+        self.assertEqual(posted.count("/v5/order/create"), 1, "the original intent is never resent")
+        self.assertNotEqual(engine.account_writer.registry.unresolved(engine.account_writer.current.get()), [])
+
     async def test_ambiguous_server_error_envelope_stays_unknown(self):
         engine = await self.engine()
         self.write_ret_code = 10016
@@ -154,13 +180,27 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
             def json(self):
                 return {"retCode": self.code, "retMsg": "failed"}
 
-        for code in (10001, 10006, 110007, 110017):
-            with self.subTest(code=code), self.assertRaises(BybitRejected):
-                BybitClient._response_result(Envelope(code))
-        for code in (10000, 10014, 10016, 110072, 110079, 170001, 999999):
-            with self.subTest(code=code), self.assertRaises(BybitError) as raised:
-                BybitClient._response_result(Envelope(code))
+        rejected = [(path, code) for path in ("/v5/order/create", "/v5/order/cancel", "/v5/rfq/execute-quote") for code in (10001, 10006)]
+        rejected += [("/v5/order/create", 110007), ("/v5/order/create", 110017), ("/v5/order/cancel", 110001),
+                     ("/v5/order/amend", 110008), ("/v5/rfq/create-rfq", 110303), ("/v5/rfq/cancel-rfq", 110300)]
+        for path, code in rejected:
+            with self.subTest(path=path, code=code), self.assertRaises(BybitRejected):
+                BybitClient._response_result(Envelope(code), path)
+        # Unlisted codes inside the 110xxx block, the retired 110030, codes listed only for another endpoint,
+        # and duplicate/processing/server codes all stay unknown.
+        unknown = [("/v5/order/create", code) for code in (10000, 10014, 10016, 110030, 110072, 110079, 110999, 110001, 110300, 170001, 999999)]
+        unknown += [("/v5/order/cancel", 110007), ("/v5/rfq/execute-quote", 110007), ("/v5/rfq/create-rfq", 110307)]
+        for path, code in unknown:
+            with self.subTest(path=path, code=code), self.assertRaises(BybitError) as raised:
+                BybitClient._response_result(Envelope(code), path)
             self.assertNotIsInstance(raised.exception, BybitRejected)
+
+    def test_allowed_trade_codes_stay_in_their_documented_blocks_and_exclude_unknowns(self):
+        from app.bybit import REJECTED_TRADE_RET_CODES
+        create = REJECTED_TRADE_RET_CODES["/v5/order/create"]
+        self.assertTrue({110030, 110072, 110079}.isdisjoint(set().union(*REJECTED_TRADE_RET_CODES.values())))
+        self.assertTrue(all(110000 <= code <= 110137 for code in create))
+        self.assertTrue(all(110300 <= code <= 110323 for path, codes in REJECTED_TRADE_RET_CODES.items() if path.startswith("/v5/rfq/") for code in codes))
 
     async def test_late_response_and_state_save_are_rejected_after_binding_changes(self):
         engine = await self.engine()

@@ -85,6 +85,8 @@ export function createRuntimeConnection({ dir, protocols = SUPPORTED_PROTOCOLS, 
         arm(); pending = Buffer.concat([pending, chunk]);
         for (let index; !closed && (index = pending.indexOf(10)) !== -1;) {
           const line = pending.subarray(0, index); pending = pending.subarray(index + 1);
+          // A complete line obeys the same cap as a partial one, whichever chunk brought its newline.
+          if (line.length > maxLineBytes) { end(unavailable()); return; }
           let value;
           try { value = JSON.parse(line.toString('utf8')); } catch { end(unavailable()); return; }
           try { onLine(value); } catch (error) { end(error); return; }

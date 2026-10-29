@@ -24,13 +24,29 @@ class BybitRejected(BybitError):
 # Only codes that prove a pre-execution refusal; anything else (server timeout/internal error,
 # duplicate request, orderLinkId already exists, order still processing, undocumented codes) stays unknown.
 REJECTED_COMMON_RET_CODES = frozenset({10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10017, 10018, 10024, 10027, 10029})
-UNKNOWN_TRADE_RET_CODES = frozenset({110072, 110079})
+# Trade codes are an allowlist per write endpoint, never a numeric range: 110072 (orderLinkId duplicate),
+# 110079 (order processing), the retired 110030 and every unlisted code stay unknown.
+# Source: bybit-exchange/docs docs/v5/error.mdx at ff8d45f2 (UTA and RFQ tables), checked 2026-10-29.
+_ORDER_STATE_REFUSALS = frozenset({110001, 110008, 110010})  # order missing, already completed or cancelled
+_ORDER_PRICE_REFUSALS = frozenset({110003, 110120, 110121})  # outside the allowed price range or price limit
+_TRADING_CLOSED_REFUSALS = frozenset({110063, 110066, 110074, 110134})  # settlement, trading disallowed, not live, suspended
+REJECTED_TRADE_RET_CODES = {
+    "/v5/order/create": _ORDER_PRICE_REFUSALS | _TRADING_CLOSED_REFUSALS | frozenset({
+        110004, 110006, 110007, 110012, 110044, 110045,  # balance or margin insufficient
+        110017, 110094,  # quantity truncated to zero, notional below the minimum
+        110020, 110021, 110023, 110042,  # active-order limit, open-interest limit, reduce-only contract
+        110032, 110040,  # order illegal, would trigger liquidation
+    }),
+    "/v5/order/amend": _ORDER_STATE_REFUSALS | _ORDER_PRICE_REFUSALS | _TRADING_CLOSED_REFUSALS | frozenset({110022, 110064}),
+    "/v5/order/cancel": _ORDER_STATE_REFUSALS,
+    "/v5/rfq/create-rfq": frozenset({110302, 110303, 110308, 110309, 110310, 110311, 110313, 110314, 110315, 110316, 110317, 110318, 110319, 110321}),
+    "/v5/rfq/execute-quote": frozenset({110300, 110301, 110302, 110304, 110312}),
+    "/v5/rfq/cancel-rfq": frozenset({110300}),
+}
 
 
-def is_rejection(ret_code: int) -> bool:
-    if ret_code in REJECTED_COMMON_RET_CODES:
-        return True
-    return 110000 <= ret_code <= 110999 and ret_code not in UNKNOWN_TRADE_RET_CODES
+def is_rejection(ret_code: int, path: str) -> bool:
+    return ret_code in REJECTED_COMMON_RET_CODES or ret_code in REJECTED_TRADE_RET_CODES.get(path, frozenset())
 
 
 class BybitClient:
@@ -92,7 +108,7 @@ class BybitClient:
             client.event_hooks["request"].append(self._before_account_request)
         try:
             response = await client.request(method, base_url + path, **request_kwargs)
-            result = self._response_result(response)
+            result = self._response_result(response, path)
             if writer is not None:
                 writer.validate_response(path, body, result)
         except BaseException as exc:
@@ -106,7 +122,7 @@ class BybitClient:
         return result
 
     @staticmethod
-    def _response_result(response):
+    def _response_result(response, path: str):
         response.raise_for_status()
         try:
             data = response.json()
@@ -116,7 +132,7 @@ class BybitClient:
             raise BybitError("Invalid Bybit response envelope")
         if data["retCode"] != 0:
             message = data.get("retMsg", "Bybit request failed")
-            if is_rejection(data["retCode"]):
+            if is_rejection(data["retCode"], path):
                 raise BybitRejected(message, data["retCode"])
             raise BybitError(message)
         if not isinstance(data.get("result"), dict):
