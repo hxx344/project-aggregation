@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from tests.helpers import Fixture, account
+from tests.helpers import Fixture, account, clear_of_utc_midnight
 from tests.test_pair_integration import pair_config
 from trading.engine import Engine
 from trading.server import create_app
@@ -13,6 +13,7 @@ from trading.server import create_app
 
 class PairApiTests(unittest.TestCase):
     def setUp(self):
+        clear_of_utc_midnight(self)
         self.f = Fixture()
         self.addCleanup(self.f.close)
         for aid in ("test", "second"):
