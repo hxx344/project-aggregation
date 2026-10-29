@@ -56,7 +56,7 @@ printf 'HOST=127.0.0.1\nPORT=%s\nDATA_DIR=%s\nNODE_ENV=production\nINITIAL_PASSW
   "$port" "$DATA_PATH" "$initial_password" "$DATA_PATH" > "$ENV_FILE"
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH" "$DATA_PATH/modules"
 
-# pino and what it needs, flat, from the checkout's locked install.
+# pino and ethers (the Aero LP manager) with what they need, flat, from the checkout's locked install.
 cat > "$work_dir/collect.mjs" <<'JS'
 import { cpSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -79,6 +79,7 @@ const visit = (from, name, optional) => {
   cpSync(dir, path.join(out, name), { recursive: true, dereference: true });
 };
 visit(root, 'pino', false);
+visit(root, 'ethers', false);
 JS
 "$node" "$work_dir/collect.mjs" "$repository" "$work_dir/node_modules"
 
