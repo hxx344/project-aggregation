@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Wallet } from 'ethers';
+import { getAddress, Wallet } from 'ethers';
 import { PRIVATE_KEY_PATTERN, SETTING_KEYS, validateSettings } from '../../tools/aero-lp/core.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
@@ -20,9 +20,17 @@ function readBounded(file, limit) {
   return JSON.parse(readFileSync(file, 'utf8'));
 }
 
+const ADDRESS_KEYS = ['pool', 'factory', 'nft', 'token'];
+
 export function strictAeroLpConfig(value) {
-  try { return structuredClone(validateSettings(value)); }
+  let next;
+  try { next = structuredClone(validateSettings(value)); }
   catch (error) { throw new HttpError(400, `LP 参数无效：${error.message}`); }
+  // A mixed-case address with a wrong checksum would pass the shape check but fail every cycle in the child.
+  for (const key of ADDRESS_KEYS) {
+    try { getAddress(next[key]); } catch { throw new HttpError(400, `LP 参数无效：config.${key} 地址校验和错误`); }
+  }
+  return next;
 }
 
 // The private key is write-only: it is stored encrypted with the credential
@@ -167,7 +175,15 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       if (stopping) throw new HttpError(409, '上一次停止尚未完成，请稍候');
       enabled = true; persistWanted(); retry = 0; startChild(); return state();
     }),
-    stop: (authorize = () => {}) => serial(() => { authorize(); enabled = false; persistWanted(); failure = null; void beginHalt(); return state(); }),
+    // Halt first: a failed control.json write must never keep the signer running.
+    stop: (authorize = () => {}) => serial(() => {
+      authorize(); enabled = false; failure = null; void beginHalt();
+      try { persistWanted(); } catch (error) {
+        log.warn?.({ type: 'aero-lp', err: error }, 'LP 启停设置保存失败');
+        failure = '已停止，但启停设置保存失败，工作台重启后可能自动启动，请检查数据目录权限';
+      }
+      return state();
+    }),
     // Takes effect at once: the child re-reads the file at the start of every cycle.
     save: (value, authorize = () => {}) => serial(() => {
       authorize();
@@ -183,7 +199,9 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       const key = privateKey.trim();
       const wallet = new Wallet(key).address;
       atomicJson(walletPath, { schema: 1, address: wallet, key: encrypt(key) });
-      address = wallet; failure = null;
+      // A fault leaves enabled=true without a child; a new key must not auto-start on the next restart.
+      enabled = false; persistWanted();
+      address = wallet; failure = null; lastCycle = null;
       return state();
     }),
     clearKey: (authorize = () => {}) => serial(() => {
@@ -191,7 +209,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       requireStopped();
       enabled = false; persistWanted();
       rmSync(walletPath, { force: true });
-      address = null; failure = null; return state();
+      address = null; failure = null; lastCycle = null; return state();
     }),
     async close() {
       closed = true; cleared(); clearInterval(maintenanceTimer);

@@ -134,7 +134,7 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
     <header className="lp-heading"><div><h1>Aero LP 单边调仓</h1><p>Aerodrome Slipstream（Base）· 价格跌出区间时把下沿移到现价上方，上沿固定</p></div><div className="lp-toolbar">
       <button className="button secondary" onClick={() => void read()} disabled={!!busy || loading} aria-label="刷新状态"><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
       {idle ? <button className="button primary" disabled={!snapshot || !!busy || !snapshot.wallet || dirty} title={dirty ? '请先保存参数' : !snapshot?.wallet ? '请先填写私钥' : undefined} onClick={() => void execute('start', {}, '已请求启动。')}>{busy === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}启动</button>
-        : <button className="button secondary" disabled={!snapshot || !!busy || snapshot.state === 'stopping'} onClick={() => void execute('stop', {}, '已请求停止；正在执行的交易会先完成。')}>{busy === 'stop' || snapshot?.state === 'stopping' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}停止</button>}
+        : <button className="button secondary" disabled={!snapshot || !!busy || snapshot.state === 'stopping'} onClick={() => void execute('stop', {}, '已请求停止；正在执行的交易最多再等 90 秒，超时强制结束，下次启动按链上状态继续。')}>{busy === 'stop' || snapshot?.state === 'stopping' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}停止</button>}
     </div></header>
     {actionError ? <div className="error-box" role="alert">{actionError}</div> : null}
     {notice ? <div className="lp-callout success" role="status">{notice}</div> : null}

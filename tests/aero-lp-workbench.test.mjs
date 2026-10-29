@@ -45,6 +45,10 @@ test('LP configuration accepts only the page parameters with their ranges', () =
   for (const bad of [{ rpcUrl: 'http://mainnet.base.org' }, { pool: 'pool' }, { intervalSec: 30 }, { twapSec: 7200 }, { slippageBps: 0 }, { gapBps: 1.5 }, { minDeploy: '1e3' }, { upperPrice: -1 }]) {
     assert.throws(() => strictAeroLpConfig({ ...AERO_LP_DEFAULTS, ...bad }), /LP 参数无效/, JSON.stringify(bad));
   }
+  const pool = AERO_LP_DEFAULTS.pool.toLowerCase();
+  assert.equal(strictAeroLpConfig({ ...AERO_LP_DEFAULTS, pool }).pool, pool);
+  const badChecksum = '0x' + pool.slice(2).replace(/[a-f]/, (c) => c.toUpperCase());
+  assert.throws(() => strictAeroLpConfig({ ...AERO_LP_DEFAULTS, pool: badChecksum }), /校验和/);
   const { rpcUrl, ...missing } = AERO_LP_DEFAULTS;
   assert.throws(() => strictAeroLpConfig(missing), /rpcUrl/);
 });
@@ -123,6 +127,22 @@ test('stop is graceful, returns at once and allows replacing then clearing the k
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
+test('stop still halts the child when the run setting cannot be saved', async () => {
+  const directory = fixtureDir();
+  const { manager, workers } = managerWith(directory);
+  try {
+    await manager.initialize(); await manager.setKey(KEY); await manager.start();
+    const control = join(directory, 'aero-lp/control.json');
+    rmSync(control); mkdirSync(control);
+    const stopping = await manager.stop();
+    assert.equal(stopping.state, 'stopping'); assert.match(stopping.error, /启停设置保存失败/);
+    assert.deepEqual(workers[0].sent.at(-1), { type: 'aero-lp-stop' });
+    // The child is gone; the unsaved run setting stays visible as a fault.
+    await until(() => manager.state().state === 'fault');
+    assert.equal(workers.length, 1);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
 test('a hung child is killed after the grace period and is never replaced before it exits', async () => {
   const directory = fixtureDir();
   const { manager, workers } = managerWith(directory, { worker: { ignoreStop: true }, manager: { stopGraceMs: 50, killWaitMs: 20 } });
@@ -149,6 +169,11 @@ test('unexpected exits restart with backoff, then fault', async () => {
     await until(() => manager.state().state === 'fault');
     assert.match(manager.state().error, /多次退出/);
     await delay(30); assert.equal(workers.length, 3);
+    // Replacing the key after a fault leaves the bot stopped instead of a phantom 'starting'.
+    const replaced = await manager.setKey('0x' + '22'.repeat(32));
+    assert.equal(replaced.state, 'stopped'); assert.equal(replaced.enabled, false); assert.equal(replaced.lastCycle, null);
+    assert.equal(JSON.parse(readFileSync(join(directory, 'aero-lp/control.json'), 'utf8')).enabled, false);
+    assert.equal(workers.length, 3);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
