@@ -223,6 +223,7 @@ capture
 embedded_before=$embedded_key
 # An actual compiler dispatch change invalidates both the module artifacts and
 # the assembled runtime; an existing embedded cache cannot bypass the new recipe.
+original_run_module_build=$(declare -f run_module_build)
 run_module_build() { printf 'changed build recipe\n'; }
 input_keys
 compare 0 0 0 0 1
@@ -233,4 +234,118 @@ for module in "${MODULE_BUILD_IDS[@]}"; do
 done
 commit=invalid-source
 if input_keys 2>/dev/null; then echo 'Invalid git source was silently hashed' >&2; exit 1; fi
-printf 'Git input classification passed, including module recipes, shared inputs, build env and failed reads.\n'
+# Module builds read only their importer's locked closure. The pinned commit's
+# own helper narrows a real lockfile; unknown shapes keep the workspace key.
+unset -f run_module_build
+eval "$original_run_module_build"
+source_dir="$fixture/closure-source"
+APP_DIR="$fixture/closure-application"
+mkdir -p "$APP_DIR" "$source_dir/deploy"
+for importer in monitor asset crossex aster/dashboard; do
+  mkdir -p "$source_dir/modules/$importer"
+  printf '{"name":"%s"}\n' "${importer%%/*}" > "$source_dir/modules/$importer/package.json"
+done
+cp "$(dirname "$0")/pnpm-module-inputs.py" "$source_dir/deploy/"
+printf 'packages:\n  - modules/*\ncatalog:\n  shared: 1.0.0\n' > "$source_dir/pnpm-workspace.yaml"
+git -C "$source_dir" init -q -b main
+git -C "$source_dir" config core.autocrlf false
+git -C "$source_dir" config user.name fixture
+git -C "$source_dir" config user.email fixture@example.invalid
+git clone -q --bare "$source_dir" "$APP_DIR/repository.git" 2>/dev/null
+# leaf/shared/crossex: versions; extra: root-only package added like ethers;
+# style: root resolves monitor's unresolved optional peer; override/link: shapes.
+declare -A lock=([leaf]=1.0.0 [shared]=sha512-shared [crossex]=1.0.0 [extra]=0 [style]=0 [styleint]=sha512-style [override]=0 [link]=0)
+write_lock() {
+  local root_extra='' root_package='' root_snapshot='' style='' style_package='' style_snapshot='' crossex_ref=${lock[crossex]}
+  if (( lock[extra] )); then
+    root_extra=$'      root-extra:\n        specifier: 2.0.0\n        version: 2.0.0\n'
+    root_package=$'  root-extra@2.0.0:\n    resolution: {integrity: sha512-extra}\n\n'
+    root_snapshot=$'  root-extra@2.0.0:\n    dependencies:\n      leaf: 1.0.0\n\n'
+  fi
+  if (( lock[style] )); then
+    style=$'      style-engine:\n        specifier: 1.0.0\n        version: 1.0.0\n'
+    style_package="  style-engine@1.0.0:"$'\n'"    resolution: {integrity: ${lock[styleint]}}"$'\n\n'
+    style_snapshot=$'\n  style-engine@1.0.0: {}\n'
+  fi
+  (( ! lock[link] )) || crossex_ref=link:../shared-lib
+  {
+    printf "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\n"
+    (( ! lock[override] )) || printf "overrides:\n  leaf: 1.0.0\n\n"
+    printf "catalogs:\n  default:\n    shared:\n      specifier: 1.0.0\n      version: 1.0.0\n\n"
+    printf 'importers:\n\n  .:\n    dependencies:\n%s      root-only:\n        specifier: 1.0.0\n        version: 1.0.0\n%s\n' "$root_extra" "$style"
+    printf "  modules/asset:\n    dependencies:\n      shared:\n        specifier: 'catalog:'\n        version: 1.0.0\n\n"
+    printf "  modules/aster/dashboard:\n    dependencies:\n      shared:\n        specifier: 'catalog:'\n        version: 1.0.0\n\n"
+    printf '  modules/crossex:\n    dependencies:\n      crossex-only:\n        specifier: ^1.0.0\n        version: %s\n\n' "$crossex_ref"
+    printf '  modules/monitor:\n    devDependencies:\n      bundler:\n        specifier: 1.0.0\n        version: 1.0.0(shared@1.0.0)\n\n'
+    printf 'packages:\n\n'
+    printf '  bundler@1.0.0:\n    resolution: {integrity: sha512-bundler}\n    peerDependencies:\n      shared: ^1.0.0\n      style-engine: ^1.0.0\n'
+    printf '    peerDependenciesMeta:\n      style-engine:\n        optional: true\n\n'
+    printf '  crossex-only@%s:\n    resolution: {integrity: sha512-crossex}\n\n' "${lock[crossex]}"
+    printf '  leaf@%s:\n    resolution: {integrity: sha512-leaf}\n\n' "${lock[leaf]}"
+    printf '%s  root-only@1.0.0:\n    resolution: {integrity: sha512-root}\n\n' "$root_package"
+    printf "  shared@1.0.0:\n    resolution: {integrity: %s}\n    engines: {node: '>=18'}\n\n%s" "${lock[shared]}" "$style_package"
+    printf 'snapshots:\n\n  bundler@1.0.0(shared@1.0.0):\n    dependencies:\n      leaf: %s\n      shared: 1.0.0\n\n' "${lock[leaf]}"
+    printf '  crossex-only@%s: {}\n\n  leaf@%s: {}\n\n%s  root-only@1.0.0: {}\n\n  shared@1.0.0: {}\n%s' \
+      "${lock[crossex]}" "${lock[leaf]}" "$root_snapshot" "$style_snapshot"
+  } > "$source_dir/pnpm-lock.yaml"
+}
+root_manifest() { printf '{"name":"fixture","packageManager":"pnpm@11.25.0","scripts":{"build":"%s"},"dependencies":{%s}}\n' "$1" "$2" > "$source_dir/package.json"; }
+root_manifest vite '"root-only":"1.0.0"'
+write_lock
+refresh
+read_module_dependency_digests > /dev/null
+capture
+# Same shape as adding ethers for server/tools only: no module rebuilds.
+lock[extra]=1; write_lock; root_manifest vite '"root-only":"1.0.0","root-extra":"2.0.0"'; refresh
+compare 1 1 1 1 1
+compare_module_inputs 0 0 0 0
+capture
+root_manifest 'vite build' '"root-only":"1.0.0","root-extra":"2.0.0"'; refresh
+compare 1 1 1 1 1
+compare_module_inputs 0 0 0 0
+capture
+lock[crossex]=1.1.0; write_lock; refresh; compare_module_inputs 0 0 1 0
+capture
+lock[leaf]=1.0.1; write_lock; refresh; compare_module_inputs 1 0 0 0
+capture
+lock[shared]=sha512-changed; write_lock; refresh; compare_module_inputs 1 1 0 1
+capture
+# Root now provides monitor's unresolved optional peer through hoisting.
+lock[style]=1; write_lock; refresh; compare_module_inputs 1 0 0 0
+capture
+# The hoisted peer candidate's own resolution changes under the same key.
+lock[styleint]=sha512-style2; write_lock; refresh; compare_module_inputs 1 0 0 0
+capture
+printf 'packages:\n  - modules/*\ncatalog:\n  shared: 1.0.1\n' > "$source_dir/pnpm-workspace.yaml"; refresh
+compare_module_inputs 0 0 0 0
+capture
+printf 'packages:\n  - modules/*\ncatalog:\n  shared: 1.0.1\nhoistPattern:\n  - none\n' > "$source_dir/pnpm-workspace.yaml"; refresh
+compare_module_inputs 1 1 1 1
+capture
+lock[override]=1; write_lock; refresh; compare_module_inputs 1 1 1 1
+capture
+root_manifest 'vite build' '"root-only":"1.0.0","root-extra":"2.0.0"'
+sed -i 's/"name":"fixture",/"name":"fixture","pnpm":{"neverBuiltDependencies":[]},/' "$source_dir/package.json"; refresh
+compare_module_inputs 1 1 1 1
+capture
+echo 'audit=false' > "$source_dir/.npmrc"; refresh; compare_module_inputs 1 1 1 1
+capture
+echo '{"name":"monitor","private":true}' > "$source_dir/modules/monitor/package.json"; refresh; compare_module_inputs 1 0 0 0
+capture
+# An unrecognized lockfile shape falls back to the whole-workspace key for all.
+lock[link]=1; write_lock; refresh > "$fixture/fallback.log"
+grep -q '沿用整个工作区依赖键' "$fixture/fallback.log"
+if read_module_dependency_digests > /dev/null 2>&1; then echo 'Local link was narrowed' >&2; exit 1; fi
+compare_module_inputs 1 1 1 1
+capture
+lock[extra]=0; write_lock; root_manifest 'vite build' '"root-only":"1.0.0"'; refresh > /dev/null
+compare_module_inputs 1 1 1 1
+for module in "${MODULE_BUILD_IDS[@]}"; do
+  [[ -n ${previous_module_build_keys[$module]} && ${previous_module_build_keys[$module]} != "${module_build_keys[$module]}" ]]
+done
+capture
+# The helper is pinned with the commit; changing it re-keys narrowed modules.
+lock[link]=0; write_lock; refresh > /dev/null; capture
+echo '# helper change' >> "$source_dir/deploy/pnpm-module-inputs.py"; refresh; compare_module_inputs 1 1 1 1
+printf 'Git input classification passed, including module recipes, shared inputs, build env, dependency closures and failed reads.\n'
+

@@ -85,6 +85,21 @@ v1_key() {
     deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local | sha256sum | cut -d ' ' -f 1)
   printf 'module-artifacts-v1\n%s\n%s\n%s\n%s' "$module" "$tree" "$dependency_key" "$build_environment" | sha256sum | cut -d ' ' -f 1
 }
+# v2 keyed every module by the whole pnpm workspace; v3 narrows that input.
+v2_key() {
+  local module=$1 tree
+  local -a inputs=("modules/$module")
+  if [[ $module == aster ]]; then
+    inputs=(modules/aster/dashboard modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local)
+  elif [[ $module == monitor || $module == crossex ]]; then
+    inputs+=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts
+      server/capital-metrics.mjs server/capital-metrics.d.mts)
+  fi
+  tree=$(git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- "${inputs[@]}" \
+    deploy/build-artifact-cache.py .env .env.local .env.production .env.production.local | sha256sum | cut -d ' ' -f 1)
+  printf 'module-artifacts-v2\n%s\n%s\n%s\n%s\n%s' "$module" "$tree" "$dependency_key" "$build_environment" \
+    "$(module_build_recipe "$module")" | sha256sum | cut -d ' ' -f 1
+}
 declare -A old_keys=()
 start_case() {
   APP_DIR="$fixture/$1"
@@ -98,7 +113,7 @@ start_case() {
   module_outputs_prepared=()
   old_keys=()
   for module in "${MODULE_BUILD_IDS[@]}"; do
-    key=$(v1_key "$module")
+    key=$("${seed_key:-v1_key}" "$module")
     old_keys[$module]=$key
     artifact="$APP_DIR/seed/$module/$(basename "${MODULE_BUILD_OUTPUTS[$module]}")"
     mkdir -p "$artifact/$(dirname "${MODULE_BUILD_ENTRIES[$module]}")" "$artifact/assets"
@@ -135,12 +150,29 @@ prepare_module_builds cache-only
 [[ $(cat "$APP_DIR/cache/module-monitor-${module_build_keys[monitor]}/artifact/assets/chunk.js") == 'rebuilt chunk' ]]
 [[ $(cat "$APP_DIR/cache/module-aster-${module_build_keys[aster]}/artifact/assets/chunk.js") == 'old aster chunk' ]]
 
+# The v2 -> v3 key upgrade reuses verified artifacts of identical inputs
+# without a workspace; a damaged v2 cache still rebuilds only that module.
+seed_key=v2_key start_case v2-valid
+prepare_module_builds cache-only
+[[ $(build_count) == 2 && ! -e "$work_dir/source" ]]
+for module in "${MODULE_BUILD_IDS[@]}"; do
+  [[ ${old_keys[$module]} == "${previous_module_build_keys[$module]}" && ${old_keys[$module]} != "${module_build_keys[$module]}" ]]
+  build_artifact_cache verify "$APP_DIR/cache/module-$module-${old_keys[$module]}" "${old_keys[$module]}"
+  [[ $(cat "$APP_DIR/cache/module-$module-${module_build_keys[$module]}/artifact/assets/chunk.js") == "old $module chunk" ]]
+done
+seed_key=v2_key start_case v2-damaged
+printf 'corrupt\n' >> "$APP_DIR/cache/module-crossex-${old_keys[crossex]}/artifact/assets/chunk.js"
+prepare_module_builds cache-only
+[[ $(build_count) == 3 && $(tail -n 1 "$fixture/build.calls") == crossex ]]
+[[ $(cat "$APP_DIR/cache/module-crossex-${module_build_keys[crossex]}/artifact/assets/chunk.js") == 'rebuilt chunk' ]]
+[[ $(cat "$APP_DIR/cache/module-monitor-${module_build_keys[monitor]}/artifact/assets/chunk.js") == 'old monitor chunk' ]]
+
 printf '// unknown dispatcher\n' >> "$source_dir/scripts/modules.mjs"
 commit_source unknown-runner
 start_case unknown
 for module in "${MODULE_BUILD_IDS[@]}"; do [[ -z ${legacy_module_build_keys[$module]:-} ]]; done
 prepare_module_builds cache-only
-[[ $(build_count) == 6 ]]
+[[ $(build_count) == 7 ]]
 
 git -C "$source_dir" restore --source="$known_commit" scripts/modules.mjs
 commit_source restore-runner
@@ -152,5 +184,5 @@ input_keys
 [[ ${module_build_keys[asset]} != "$before_key" ]]
 for module in "${MODULE_BUILD_IDS[@]}"; do [[ -z ${legacy_module_build_keys[$module]:-} ]]; done
 prepare_module_builds cache-only
-[[ $(build_count) == 10 ]]
-printf 'Verified v1 migration, direct module commands, hydration and invalid-cache fallback passed.\n'
+[[ $(build_count) == 11 ]]
+printf 'Verified v1 and v2 migration, direct module commands, hydration and invalid-cache fallback passed.\n'
