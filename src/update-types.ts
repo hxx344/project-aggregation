@@ -15,6 +15,9 @@ export type UpdateDeployMode = 'source' | 'ci';
 
 export type UpdateScope = 'full' | 'api';
 
+/** prepare: download, build and verify without switching; activate: the ordinary update (design doc 6.9). */
+export type UpdatePhase = 'activate' | 'prepare';
+
 export type UpdateJob = {
   id: string;
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted';
@@ -31,6 +34,7 @@ export type UpdateJob = {
   deployMode?: UpdateDeployMode;
   /** api: only the API restarted; trading kept running without maintenance. */
   scope?: UpdateScope;
+  phase?: UpdatePhase;
   progress?: UpdateProgress;
   stageTimings?: { entries: Array<{ stage: UpdateStage; detail?: string; durationMs: number | null }> };
 };
@@ -48,6 +52,10 @@ export type UpdateState = {
   planId: string | null;
   /** Restart scope of the plan per deployment mode; a missing value means full. */
   planScopes?: Partial<Record<UpdateDeployMode, UpdateScope>> | null;
+  /** Whether a full update of this plan can be prepared before the switch; absent from older updaters. */
+  planPrepare?: boolean | null;
+  /** The current plan's release is prepared for this mode and waits for the switch. */
+  prepared?: { planId: string; deployMode: UpdateDeployMode } | null;
   expiresAt: string | null;
   modules: UpdateModule[];
   job: UpdateJob | null;

@@ -15,6 +15,10 @@ const TOKEN_BUSY = '正在检查版本或执行更新，请完成后再修改 Gi
 const TOKEN_INVALID = 'GitHub Token 格式无效，请粘贴完整 Token，且不要包含空格或换行';
 const DEPLOYMENT_MODES = new Set(['source', 'ci']);
 const SCOPES = new Set(['full', 'api']);
+// Design doc 6.9: 'prepare' builds a full update without activating it.
+const PHASES = new Set(['activate', 'prepare']);
+const PREPARE_UNSUPPORTED = '该版本不支持先准备后切换，请重新检查更新';
+const PREPARING = '新版本正在准备，完成后再切换';
 
 export class UpdateError extends Error {
   constructor(status, message, { uncertain = false } = {}) { super(message); this.status = status; this.uncertain = uncertain; }
@@ -85,6 +89,9 @@ export function publicUpdateState(value) {
     || value.deploymentModes.some(mode => !DEPLOYMENT_MODES.has(mode)))) invalid();
   if (value.planScopes !== undefined && value.planScopes !== null && (!object(value.planScopes)
     || Object.keys(value.planScopes).some(mode => !DEPLOYMENT_MODES.has(mode)) || Object.values(value.planScopes).some(scope => !SCOPES.has(scope)))) invalid();
+  if (value.planPrepare !== undefined && value.planPrepare !== null && typeof value.planPrepare !== 'boolean') invalid();
+  if (value.prepared !== undefined && value.prepared !== null && (!object(value.prepared) || value.prepared.planId !== value.planId
+    || typeof value.prepared.planId !== 'string' || !DEPLOYMENT_MODES.has(value.prepared.deployMode))) invalid();
   const modules = value.modules.map(row => {
     if (!object(row) || !identifier(row.id) || !text(row.name, 120) || !['current', 'available', 'unavailable', 'unmanaged'].includes(row.state)
       || !['currentVersion', 'latestVersion', 'currentCommit', 'latestCommit'].every(key => nullable(row[key], value => text(value, 128)))
@@ -102,7 +109,8 @@ export function publicUpdateState(value) {
       || !timestamp(row.startedAt) || !nullable(row.finishedAt, timestamp) || !nullable(row.activeModule, identifier)
       || !text(row.message) || !Array.isArray(row.steps) || row.steps.length > 128
       || row.deployMode !== undefined && !DEPLOYMENT_MODES.has(row.deployMode)
-      || row.scope !== undefined && !SCOPES.has(row.scope)) invalid();
+      || row.scope !== undefined && !SCOPES.has(row.scope)
+      || row.phase !== undefined && !PHASES.has(row.phase)) invalid();
     const steps = row.steps.map(step => {
       if (!object(step) || !identifier(step.id) || !text(step.name, 120) || !['pending', 'running', 'succeeded', 'failed', 'skipped'].includes(step.status)
         || step.message !== undefined && !text(step.message)) invalid();
@@ -111,6 +119,7 @@ export function publicUpdateState(value) {
     job = { id: row.id, status: row.status, startedAt: row.startedAt, finishedAt: row.finishedAt, activeModule: row.activeModule, steps, message: row.message };
     if (row.deployMode !== undefined) job.deployMode = row.deployMode;
     if (row.scope !== undefined) job.scope = row.scope;
+    if (row.phase !== undefined) job.phase = row.phase;
     const progress = publicProgress(row.progress, row);
     if (progress) job.progress = progress;
     const stageTimings = publicStageTimings(row.stageTimings, row);
@@ -121,15 +130,19 @@ export function publicUpdateState(value) {
     ...(value.deploymentModes === undefined ? {} : { deploymentModes: [...value.deploymentModes] }),
     // Restart scope of the plan per deployment mode; a missing mode or value means full.
     ...(value.planScopes === undefined ? {} : { planScopes: value.planScopes === null ? null : Object.fromEntries(Object.entries(value.planScopes)) }),
+    // Only an updater that knows the prepare phase reports these; without them every full update is single-phase.
+    ...(value.planPrepare === undefined ? {} : { planPrepare: value.planPrepare }),
+    ...(value.prepared === undefined ? {} : { prepared: value.prepared === null ? null : { planId: value.prepared.planId, deployMode: value.prepared.deployMode } }),
     ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }),
     ...(value.moduleMaintenance === undefined ? {} : { moduleMaintenance: value.moduleMaintenance.map(row => ({ id: row.id, confirmed: row.confirmed })) }) };
 }
 
 export function validateUpdateBody(action, body) {
-  const fields = action === 'apply' ? ['planId', 'deployMode'] : action === 'token' ? ['token'] : [];
+  const fields = action === 'apply' ? ['planId', 'deployMode', 'phase'] : action === 'token' ? ['token'] : [];
   if (!['check', 'apply', 'token'].includes(action) || !object(body) || Object.keys(body).some(key => !fields.includes(key))) throw new UpdateError(400, '更新请求包含不支持的字段');
   if (action === 'apply' && (typeof body.planId !== 'string' || !PLAN_ID.test(body.planId))) throw new UpdateError(400, '更新计划无效，请重新检查更新');
   if (action === 'apply' && body.deployMode !== undefined && !DEPLOYMENT_MODES.has(body.deployMode)) throw new UpdateError(400, '更新模式无效');
+  if (action === 'apply' && body.phase !== undefined && !PHASES.has(body.phase)) throw new UpdateError(400, '更新阶段无效');
   if (action === 'token' && (typeof body.token !== 'string' || body.token !== '' && (!GITHUB_TOKEN.test(body.token) || body.token.trim() !== body.token))) throw new UpdateError(400, TOKEN_INVALID);
 }
 
@@ -176,11 +189,12 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
   return {
     async status() { try { return await request('GET', '/status'); } catch { return unavailableUpdateState(); } },
     check() { return request('POST', '/check', {}); },
-    apply(planId, deployMode = 'source', scope = 'full') {
-      validateUpdateBody('apply', { planId, deployMode });
-      if (!SCOPES.has(scope)) throw new UpdateError(400, '更新范围无效');
-      // Keep source and full updates compatible with helpers installed before mode and scope selection.
-      return request('POST', '/apply', { planId, ...(deployMode === 'source' ? {} : { deployMode }), ...(scope === 'full' ? {} : { scope }) });
+    apply(planId, deployMode = 'source', scope = 'full', phase = 'activate') {
+      validateUpdateBody('apply', { planId, deployMode, phase });
+      if (!SCOPES.has(scope) || phase === 'prepare' && scope !== 'full') throw new UpdateError(400, '更新范围无效');
+      // Keep source and full updates compatible with helpers installed before mode, scope and phase selection.
+      return request('POST', '/apply', { planId, ...(deployMode === 'source' ? {} : { deployMode }), ...(scope === 'full' ? {} : { scope }),
+        ...(phase === 'activate' ? {} : { phase }) });
     },
     token(token) { validateUpdateBody('token', { token }); return request('POST', '/token', { token }); },
   };
@@ -199,7 +213,9 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   let maintenance = readMaintenance(), generation = 0, entries = 0, applying = null;
   // Restart scopes the updater reported for its latest plan. They are fixed per
   // plan id, so a later read never makes them stale (design doc 6.5).
-  let plan = { id: null, scopes: null };
+  let plan = { id: null, scopes: null, prepare: false };
+  // The latest job the updater reported; a prepare job still running refuses a switch before maintenance.
+  let latestJob = null;
   let moduleSync = Promise.resolve(), watcher = null, polling = null, closed = false;
   const assertOpen = () => { if (closed) throw new UpdateError(503, '更新协调器正在关闭'); };
   const currentToken = () => shared ? readAdmissionToken() : null;
@@ -294,15 +310,17 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   }
   if (pendingPlanId) changeShared(currentToken(), () => { if (pendingPlanId) remember(true); });
   function learn(state) {
-    if (state.planId) plan = { id: state.planId, scopes: state.planScopes ?? null };
+    if (state.planId) plan = { id: state.planId, scopes: state.planScopes ?? null, prepare: state.planPrepare === true };
+    if (state.enabled) latestJob = state.job;
     return state;
   }
   function observe(state) {
     if (state.enabled) {
       // A timed-out request may still be waiting for root's lock. Idle state is
       // conclusive only after that request's plan can no longer be accepted.
-      // An API-scope job leaves the runtime running, so it needs no maintenance.
-      if (ACTIVE.has(state.job?.status) && state.job.scope !== 'api' || pendingPlanId && state.planId === pendingPlanId) remember(true);
+      // An API-scope job leaves the runtime running, so it needs no maintenance;
+      // neither does a prepare job, which stops before activation (design doc 6.9).
+      if (ACTIVE.has(state.job?.status) && state.job.scope !== 'api' && state.job.phase !== 'prepare' || pendingPlanId && state.planId === pendingPlanId) remember(true);
       else { rememberPending(null); remember(false); }
     }
     return state;
@@ -352,17 +370,21 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
       return await operation();
     } finally { entries -= 1; }
   }
-  function apply(planId, authorize, deployMode = 'source') {
+  function apply(planId, authorize, deployMode = 'source', phase = 'activate') {
     assertOpen();
     authorize();
-    validateUpdateBody('apply', { planId, deployMode });
+    validateUpdateBody('apply', { planId, deployMode, phase });
     if (applying) {
-      if (applying.planId !== planId || applying.deployMode !== deployMode) throw new UpdateError(409, MAINTENANCE);
+      if (applying.planId !== planId || applying.deployMode !== deployMode || applying.phase !== phase) throw new UpdateError(409, applying.phase === 'prepare' ? PREPARING : MAINTENANCE);
       return applying.promise;
     }
     if (!shared && pendingPlanId && (pendingPlanId !== planId || pendingDeployMode !== deployMode)) throw new UpdateError(409, MAINTENANCE);
+    const pendingPlan = shared ? readPendingPlanId() : pendingPlanId;
+    if (phase === 'prepare') return applyPrepare(planId, authorize, deployMode, pendingPlan);
     // A pending plan may already be accepted as full, so it keeps that admission.
-    if (!(shared ? readPendingPlanId() : pendingPlanId) && plan.id === planId && plan.scopes?.[deployMode] === 'api') return applyApi(planId, authorize, deployMode);
+    if (!pendingPlan && plan.id === planId && plan.scopes?.[deployMode] === 'api') return applyApi(planId, authorize, deployMode);
+    // The updater refuses it too, but only after maintenance and module evidence.
+    if (!pendingPlan && ACTIVE.has(latestJob?.status) && latestJob.phase === 'prepare') throw new UpdateError(409, PREPARING);
     const busy = () => entries || execution.openEntries() || execution.state().jobs.some(job => !FINAL_EXECUTION.has(job.status));
     if (busy()) throw new UpdateError(409, EXECUTION_BUSY);
     const previous = { maintenance, pendingPlanId, pendingDeployMode };
@@ -391,7 +413,7 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     }
     if (owner) trackUpdateOwner(owner);
     generation += 1;
-    const pending = { planId, deployMode, scope: 'full', promise: null, owner, admissionToken, sending: false };
+    const pending = { planId, deployMode, phase, scope: 'full', promise: null, owner, admissionToken, sending: false };
     applying = pending;
     pending.promise = (async () => {
       try {
@@ -432,12 +454,35 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
   function applyApi(planId, authorize, deployMode) {
     const observedToken = currentToken();
     generation += 1;
-    const pending = { planId, deployMode, scope: 'api', promise: null };
+    const pending = { planId, deployMode, phase: 'activate', scope: 'api', promise: null };
     applying = pending;
     pending.promise = (async () => {
       try {
         authorize();
         const state = learn(publicUpdateState(await client.apply(planId, deployMode, 'api')));
+        changeShared(observedToken, () => observe(state));
+        return state;
+      } finally {
+        if (applying === pending) { generation += 1; applying = null; }
+      }
+    })();
+    return pending.promise;
+  }
+  // Design doc 6.9: a prepare job downloads, builds and verifies a full update
+  // and stops before activation, so trading and reads continue without
+  // maintenance or stop evidence. The switch is a later ordinary apply of the
+  // same plan, with its idle check, module evidence and authorization.
+  function applyPrepare(planId, authorize, deployMode, pendingPlan) {
+    if (pendingPlan) throw new UpdateError(409, MAINTENANCE);
+    if (plan.id !== planId || !plan.prepare || plan.scopes?.[deployMode] === 'api') throw new UpdateError(409, PREPARE_UNSUPPORTED);
+    const observedToken = currentToken();
+    generation += 1;
+    const pending = { planId, deployMode, phase: 'prepare', scope: 'prepare', promise: null };
+    applying = pending;
+    pending.promise = (async () => {
+      try {
+        authorize();
+        const state = learn(publicUpdateState(await client.apply(planId, deployMode, 'full', 'prepare')));
         changeShared(observedToken, () => observe(state));
         return state;
       } finally {

@@ -35,6 +35,8 @@ SOCKET_DIR = Path('/run/project-aggregation-updater')
 WORKER = 'project-aggregation-update-worker.service'
 STACK_LOCK = Path('/run/lock/project-aggregation-stack.lock')
 PLAN_TTL = 30 * 60
+# A prepared release waits for the user to pick a moment to pause trading.
+PREPARED_PLAN_TTL = 24 * 60 * 60
 # Keep a small diagnostic history in addition to the current (possibly active) job.
 JOB_HISTORY_LIMIT = 10
 # Removal runs under the shared state lock; a backlog left by older versions is
@@ -67,6 +69,13 @@ SCOPE_REFUSED = 75
 # What the planned installer must contain to honour an 'api' admission; an
 # installer without it decides alone and may restart the runtime.
 SCOPE_INSTALLER = (b'PROJECT_DEPLOY_SCOPE=${PROJECT_DEPLOY_SCOPE-}\n', b'\nSCOPE_REFUSED=%d\n' % SCOPE_REFUSED)
+# A full update may first run as 'prepare' (design doc 6.9): the installer builds
+# and verifies, then stops before activation with DEPLOY_PREPARED. The later
+# 'activate' job is the ordinary update and reuses the prepared release.
+PHASES = ('activate', 'prepare')
+DEPLOY_PREPARED = 76
+# An installer without both parts would activate during a prepare job.
+PREPARE_INSTALLER = (b'PROJECT_DEPLOY_PHASE=${PROJECT_DEPLOY_PHASE-}\n', b'\nDEPLOY_PREPARED=%d\n' % DEPLOY_PREPARED)
 TOKEN = re.compile(r'[a-f0-9]{32}')
 MAX_CREDENTIALS = 1024
 PUBLIC_MODULE = ('id', 'name', 'state', 'currentVersion', 'latestVersion', 'currentCommit', 'latestCommit', 'reason', 'releaseNotes', 'recovery')
@@ -189,12 +198,19 @@ def validate_scope(value):
     return value
 
 
-def run_installer(script, manifest, log, deploy_mode='source', scope='full'):
+def validate_phase(value, scope='full'):
+    if not isinstance(value, str) or value not in PHASES or value == 'prepare' and scope != 'full':
+        raise UpdateError(400, '更新阶段无效')
+    return value
+
+
+def run_installer(script, manifest, log, deploy_mode='source', scope='full', phase='activate'):
     environment = {**ENVIRONMENT, 'PROJECT_DEPLOY_MODE': validate_deploy_mode(deploy_mode), 'PROJECT_DEPLOY_TESTS': '0',
                    'PROJECT_DEPLOY_MANIFEST_FILE': str(manifest),
                    'PROJECT_UPDATE_PROGRESS_FILE': str(log.parent / 'progress.json'),
-                   **({'PROJECT_DEPLOY_SCOPE': 'api'} if validate_scope(scope) == 'api' else {})}
-    # Only the validated mode and scope enter the fixed environment; no shell command string.
+                   **({'PROJECT_DEPLOY_SCOPE': 'api'} if validate_scope(scope) == 'api' else {}),
+                   **({'PROJECT_DEPLOY_PHASE': 'prepare'} if validate_phase(phase, scope) == 'prepare' else {})}
+    # Only the validated mode, scope and phase enter the fixed environment; no shell command string.
     with log.open('xb') as output:
         os.chmod(log, 0o600)
         result = subprocess.run(['/bin/bash', str(script)], cwd='/', env=environment,
@@ -356,6 +372,8 @@ class Coordinator:
         result = {'enabled': True, **{key: state.get(key) for key in
                 ('checking', 'checkedAt', 'checkError', 'planId', 'expiresAt', 'job')},
                 'planScopes': state.get('planScopes') if state.get('planId') else None,
+                'planPrepare': bool(state.get('planPrepare')) if state.get('planId') else None,
+                'prepared': None,
                 'modules': [{key: item[key] for key in PUBLIC_MODULE if key in item} for item in state['modules']],
                 'githubToken': {'configured': bool(self.read_token())}, 'deploymentModes': list(DEPLOYMENT_MODES)}
         if result['job']:
@@ -365,6 +383,7 @@ class Coordinator:
                                   if key not in ('progress', 'stageTimings')}
             job.setdefault('deployMode', 'source')
             job.setdefault('scope', 'full')
+            job.setdefault('phase', 'activate')
             if job['status'] == 'running' and TOKEN.fullmatch(job['id']):
                 progress = get_progress(self.jobs / job['id'] / 'progress.json',
                                         timestamp(job['startedAt']) * 1000, self.clock())
@@ -374,6 +393,10 @@ class Coordinator:
                 timings = get_stage_timings(self.jobs / job['id'] / 'stage-timings.json')
                 if timings is not None:
                     job['stageTimings'] = timings
+        prepared = state.get('prepared')
+        # Only the current plan's prepared release can be activated without rebuilding.
+        if isinstance(prepared, dict) and state.get('planId') and prepared.get('planId') == state['planId']:
+            result['prepared'] = {'planId': prepared['planId'], 'deployMode': prepared.get('deployMode', 'source')}
         now = self.clock()
         server_wait = state.get('retryNotBefore', 0) - now
         local_wait = state.get('nextCheckNotBefore', 0) - now
@@ -605,6 +628,7 @@ class Coordinator:
             plan_id = None
             expires = None
             scopes = None
+            prepare = False
             # A partial check never silently drops an installed module from the plan.
             if candidates and not failed:
                 entries = []
@@ -618,12 +642,13 @@ class Coordinator:
                     return
                 if candidates and not failed:
                     scopes = {'source': 'full', 'ci': self.ci_scope(candidates, state)}
+                    prepare = all(part in release['installer'] for _, release in candidates for part in PREPARE_INSTALLER)
                     previous = state.get('planId')
                     try:
                         plan = self.read_plan(previous) if previous else None
                     except (UpdateError, OSError, ValueError):
                         plan = None
-                    if plan and plan['entries'] == entries and plan.get('scopes') == scopes:
+                    if plan and plan['entries'] == entries and plan.get('scopes') == scopes and plan.get('prepare', False) == prepare:
                         plan_id, expires = plan['id'], plan['expiresAt']
                     if not plan_id:
                         # Publish files and their state reference under the same lock as pruning.
@@ -634,14 +659,14 @@ class Coordinator:
                             write_bytes(plan_directory / (item['id'] + '.manifest.json'), release['manifestBytes'])
                             write_bytes(plan_directory / (item['id'] + '.install.sh'), release['installer'])
                         write_json(plan_directory / 'plan.json', {'schema': 1, 'id': plan_id, 'expiresAt': expires, 'entries': entries,
-                                                                  'scopes': scopes})
+                                                                  'scopes': scopes, 'prepare': prepare})
                 state.update(modules=modules)
                 if failed:
                     self._record_check_failure(state, '部分模块检查失败，暂不能开始更新', retry_at)
                 else:
                     state.update(checking=False, checkId=None, checkedAt=iso(self.clock()), checkError=None,
                                  failureCount=0, nextCheckNotBefore=0, retryNotBefore=0, planId=plan_id, expiresAt=expires,
-                                 planScopes=scopes)
+                                 planScopes=scopes, planPrepare=bool(plan_id and prepare))
                 self.save(state)
                 self.prune(state)
         except Exception:
@@ -686,14 +711,16 @@ class Coordinator:
                     raise UpdateError(409, '计划文件校验失败，请重新检查')
         return plan
 
-    def apply(self, plan_id, deploy_mode='source', scope='full'):
+    def apply(self, plan_id, deploy_mode='source', scope='full', phase='activate'):
         validate_deploy_mode(deploy_mode)
         validate_scope(scope)
+        validate_phase(phase, scope)
         with self.lock():
             state = self.load()
             job = state['job']
             if job and job['status'] in ACTIVE:
-                if state.get('jobPlanId') == plan_id and job.get('deployMode', 'source') == deploy_mode and job.get('scope', 'full') == scope:
+                if (state.get('jobPlanId') == plan_id and job.get('deployMode', 'source') == deploy_mode and job.get('scope', 'full') == scope
+                        and job.get('phase', 'activate') == phase):
                     return self.public(state)
                 raise UpdateError(409, '已有更新任务正在执行')
             if state['checking'] or state.get('checkError') or not plan_id or state['planId'] != plan_id:
@@ -705,13 +732,18 @@ class Coordinator:
             # A caller that skipped trading maintenance may only run a plan forecast as 'api'.
             if scope == 'api' and plan['scopes'][deploy_mode] != 'api':
                 raise UpdateError(409, '更新范围已改变，请重新检查')
+            if phase == 'prepare' and plan.get('prepare') is not True:
+                raise UpdateError(409, '该版本的安装器不支持先准备后切换，请重新检查')
+            if phase == 'prepare' and plan['scopes'][deploy_mode] == 'api':
+                raise UpdateError(409, '本次只重启工作台 API，无需先准备，请直接更新')
             current = {item['id']: item for item in self.inspect()}
             if any(current.get(entry['id'], {}).get('identity') != entry['installedIdentity'] for entry in plan['entries']):
                 raise UpdateError(409, '本机版本已改变，请重新检查')
             job_id = uuid.uuid4().hex
             private_directory(self.jobs / job_id)
-            state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'deployMode': deploy_mode, 'scope': scope, 'startedAt': iso(self.clock()),
-                         'finishedAt': None, 'activeModule': None, 'message': '已提交，正在准备正式版本更新',
+            state.pop('prepared', None)
+            state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'deployMode': deploy_mode, 'scope': scope, 'phase': phase,
+                         'startedAt': iso(self.clock()), 'finishedAt': None, 'activeModule': None, 'message': '已提交，正在准备正式版本更新',
                          'steps': [{'id': entry['id'], 'name': BY_ID[entry['id']].name, 'status': 'pending'} for entry in plan['entries']]})
             self.save(state)
             self.prune(state)
@@ -757,9 +789,11 @@ class Coordinator:
             job_id, plan_id = state['job']['id'], state['jobPlanId']
             deploy_mode = state['job'].get('deployMode', 'source')
             scope = state['job'].get('scope', 'full')
+            phase = state['job'].get('phase', 'activate')
         try:
             validate_deploy_mode(deploy_mode)
             validate_scope(scope)
+            validate_phase(phase, scope)
             with file_lock(self.stack_lock, blocking=False):
                 plan = self.read_plan(plan_id)
                 def begin(state, job):
@@ -776,6 +810,9 @@ class Coordinator:
                     self.syntax(self.plans / plan_id / (entry['id'] + '.install.sh'))
                 if scope == 'api' and plan['scopes'][deploy_mode] != 'api':
                     raise UpdateError(409, '更新范围已改变，未开始部署，请重新检查')
+                if phase == 'prepare' and plan.get('prepare') is not True:
+                    raise UpdateError(409, '该版本的安装器不支持先准备后切换，未开始部署，请重新检查')
+                prepared = False
                 for entry in plan['entries']:
                     key = entry['id']
                     def running(state, job):
@@ -784,12 +821,21 @@ class Coordinator:
                     self.progress(job_id, running)
                     plan_directory = self.plans / plan_id
                     code = self.installer(plan_directory / (key + '.install.sh'), plan_directory / (key + '.manifest.json'),
-                                          self.jobs / job_id / (key + '.log'), deploy_mode, scope)
+                                          self.jobs / job_id / (key + '.log'), deploy_mode, scope,
+                                          **({'phase': phase} if phase == 'prepare' else {}))
+                    if code == DEPLOY_PREPARED and phase == 'prepare':
+                        # Built and verified, not activated: the module keeps its version and no receipt is written.
+                        prepared = True
+                        self.progress(job_id, lambda state, job, key=key: next(step for step in job['steps'] if step['id'] == key).update(
+                            status='succeeded', message='已准备，等待切换'))
+                        continue
                     if code == SCOPE_REFUSED and scope == 'api':
                         # The installer stopped before activation; the next check plans this release in full.
                         commit = entry['commit']
                         self.progress(job_id, lambda state, job: state.update(scopeRefused=commit))
                         raise UpdateError(409, BY_ID[key].name + ' 需要整体重启，未切换版本；请重新检查后再更新（将暂停交易）')
+                    if code != 0 and phase == 'prepare':
+                        raise UpdateError(500, BY_ID[key].name + ' 准备失败，未切换版本，运行中的服务不受影响；详情请查看服务器部署日志')
                     if code != 0:
                         raise UpdateError(500, BY_ID[key].name + ' 更新失败；已完成的模块保留，恢复结果请查看服务器部署日志')
                     observed = next((item for item in self.inspect() if item['id'] == key), None)
@@ -807,8 +853,17 @@ class Coordinator:
                             module.update(state='current', currentCommit=entry['commit'], currentVersion=entry['version'], reason='已是所选正式版本')
                     self.progress(job_id, succeeded)
                 def finish(state, job):
-                    job.update(status='succeeded', activeModule=None, finishedAt=iso(self.clock()), message='所选正式版本更新完成')
-                    state.update(planId=None, expiresAt=None)
+                    if not prepared:
+                        job.update(status='succeeded', activeModule=None, finishedAt=iso(self.clock()), message='所选正式版本更新完成')
+                        state.update(planId=None, expiresAt=None)
+                        return
+                    job.update(status='succeeded', activeModule=None, finishedAt=iso(self.clock()),
+                               message='新版本已准备好，尚未切换；切换时交易模块会短暂暂停')
+                    # The activation reuses this plan; renew it so the wait does not expire it.
+                    if state.get('planId') == plan_id:
+                        expires = iso(self.clock() + PREPARED_PLAN_TTL)
+                        write_json(self.plans / plan_id / 'plan.json', {**plan, 'expiresAt': expires})
+                        state.update(expiresAt=expires, prepared={'planId': plan_id, 'deployMode': deploy_mode})
                 self.progress(job_id, finish)
         except Exception as error:
             message = str(error) if isinstance(error, (UpdateError, ReleaseError)) else '更新未完成，请检查服务器部署日志后重新检查版本'
@@ -818,7 +873,7 @@ class Coordinator:
                 job.update(status='failed', activeModule=None, finishedAt=iso(self.clock()), message=message)
                 for step in job['steps']:
                     if step['status'] == 'running':
-                        step.update(status='failed', message='请查看服务器部署日志中的恢复结果')
+                        step.update(status='failed', message='准备未完成，未切换版本' if phase == 'prepare' else '请查看服务器部署日志中的恢复结果')
                     elif step['status'] == 'pending':
                         step.update(status='skipped', message='尚未执行')
                 state.update(planId=None, expiresAt=None)
@@ -859,15 +914,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.headers.get_content_type() != 'application/json':
                 raise UpdateError(415, '请求需使用 JSON')
             body = json.loads(self.rfile.read(int(length)), object_pairs_hook=unique_json_object)
-            expected = {'/check': [set()], '/apply': [{'planId'}, {'planId', 'deployMode'}, {'planId', 'scope'}, {'planId', 'deployMode', 'scope'}],
-                        '/token': [{'token'}]}[self.path]
-            if not isinstance(body, dict) or set(body) not in expected:
+            if not isinstance(body, dict) or not {'/check': set(body) == set(), '/token': set(body) == {'token'},
+                                                   '/apply': 'planId' in body and set(body) <= {'planId', 'deployMode', 'scope', 'phase'}}[self.path]:
                 raise UpdateError(400, '更新参数无效')
             if self.path == '/token':
                 self.answer(200, self.server.coordinator.set_token(body['token']))
             else:
                 result = self.server.coordinator.check() if self.path == '/check' else self.server.coordinator.apply(
-                    body['planId'], body.get('deployMode', 'source'), body.get('scope', 'full'))
+                    body['planId'], body.get('deployMode', 'source'), body.get('scope', 'full'), body.get('phase', 'activate'))
                 self.answer(202, result)
         except UpdateError as error:
             self.answer(error.status, {'error': str(error)})

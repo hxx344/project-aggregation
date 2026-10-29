@@ -59,13 +59,13 @@ function fixture({ maintenance = false, pendingPlanId = null, pendingDeployMode 
       return snapshot;
     },
     async check() { calls.push('check'); return structuredClone(updaterState); },
-    async apply(id, deployMode, scope = 'full') {
-      calls.push(scope === 'api' ? 'apply:api' : 'apply'); events.push('updater:apply'); assert.equal(id, planId);
-      if (scope === 'full') {
+    async apply(id, deployMode, scope = 'full', phase = 'activate') {
+      calls.push(scope === 'api' ? 'apply:api' : phase === 'prepare' ? 'apply:prepare' : 'apply'); events.push('updater:apply'); assert.equal(id, planId);
+      if (scope === 'full' && phase === 'activate') {
         assert.equal(persisted.maintenance, true, 'hub durable latch must precede updater submission');
         assert.equal(persisted.pendingPlanId, planId);
       }
-      if (handlers.apply) return handlers.apply(deployMode, scope);
+      if (handlers.apply) return handlers.apply(deployMode, scope, phase);
       return state('running');
     },
   };
@@ -80,7 +80,7 @@ function fixture({ maintenance = false, pendingPlanId = null, pendingDeployMode 
     releasePollMs,
   });
   return { coordinator, guard, persisted, active, events, handlers, calls,
-    apply: deployMode => coordinator.apply(planId, () => events.push('authorize'), deployMode),
+    apply: (deployMode, phase) => coordinator.apply(planId, () => events.push('authorize'), deployMode, phase),
     set updaterState(value) { updaterState = value; },
     holdNextStatus() { const gate = { entered: deferred(), release: deferred() }; gates.status = gate; return gate; } };
 }
@@ -552,6 +552,77 @@ test('the full admission stays for source mode, other plans, legacy updaters and
     await f.apply('ci');
     assert.deepEqual(f.calls.filter(call => call.startsWith('apply')), ['apply']);
     assert.ok(f.events.includes('prepare'));
+  });
+});
+
+// Design doc 6.9: a full plan whose installer can stop before activation.
+const preparePlan = (status = null, { phase = 'prepare', prepared = false } = {}) => {
+  const value = { ...state(status), planScopes: { source: 'full', ci: 'full' }, planPrepare: true, prepared: prepared ? { planId, deployMode: 'ci' } : null };
+  if (value.job) Object.assign(value.job, { scope: 'full', phase });
+  return value;
+};
+
+test('a prepare job runs without trading maintenance and the switch is the ordinary full update', async () => {
+  const jobs = [{ status: 'running' }];
+  const f = fixture({ jobs });
+  f.updaterState = preparePlan();
+  await f.coordinator.status();
+  const before = f.events.length;
+  f.handlers.apply = (mode, scope, phase) => { assert.deepEqual([mode, scope, phase], ['ci', 'full', 'prepare']); return preparePlan('queued'); };
+  assert.equal((await f.apply('ci', 'prepare')).job.phase, 'prepare');
+  assert.deepEqual(f.events.slice(before), ['authorize', 'authorize', 'updater:apply'], 'no gate, stop evidence or durable write');
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  // A running prepare job keeps trading writable, also for a restarted API reading it.
+  f.updaterState = preparePlan('running');
+  await f.coordinator.status();
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  assert.equal(await f.coordinator.withExecutionEntry(() => 'aster', { scope: 'aster' }), 'aster');
+  const restarted = fixture();
+  restarted.updaterState = preparePlan('running');
+  await restarted.coordinator.status();
+  assert.equal(restarted.persisted.maintenance, false);
+  // The switch waits for the prepare job without entering maintenance.
+  jobs.length = 0;
+  assert.throws(() => f.apply('ci'), error => error.status === 409 && error.message.includes('正在准备'));
+  assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+  assert.equal(f.events.some(value => value.startsWith('gate:') && value.includes(':true:')), false);
+  f.updaterState = preparePlan('succeeded', { prepared: true });
+  assert.deepEqual((await f.coordinator.status()).prepared, { planId, deployMode: 'ci' });
+  assert.equal(f.persisted.maintenance, false);
+  f.handlers.apply = (mode, scope, phase) => { assert.deepEqual([mode, scope, phase], ['ci', 'full', 'activate']); return preparePlan('running', { phase: 'activate' }); };
+  await f.apply('ci');
+  assert.deepEqual(f.calls.filter(call => call.startsWith('apply')), ['apply:prepare', 'apply']);
+  assert.ok(f.events.includes('prepare'), 'the switch collects module stop evidence');
+  assert.equal(f.persisted.maintenance, true);
+});
+
+test('a prepare request is refused for other plans, legacy updaters, api plans and a pending plan', async t => {
+  for (const [name, reported] of [['legacy updater', { ...preparePlan(), planPrepare: undefined }], ['unsupported installer', { ...preparePlan(), planPrepare: false }],
+    ['another plan', { ...preparePlan(), planId: 'another-update-plan-1234', prepared: null }], ['api plan', { ...preparePlan(), planScopes: { source: 'full', ci: 'api' } }]]) {
+    await t.test(name, async () => {
+      const f = fixture();
+      f.updaterState = reported; await f.coordinator.status();
+      assert.throws(() => f.apply('ci', 'prepare'), error => error.status === 409);
+      assert.equal(f.calls.some(call => call.startsWith('apply')), false);
+      assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
+    });
+  }
+  await t.test('pending plan', async () => {
+    const f = fixture({ pendingPlanId: planId, pendingDeployMode: 'ci' });
+    f.updaterState = preparePlan(); await f.coordinator.status();
+    assert.throws(() => f.apply('ci', 'prepare'), error => error.status === 409);
+    assert.equal(f.calls.some(call => call.startsWith('apply')), false);
+  });
+  await t.test('a prepare request in flight', async () => {
+    const f = fixture();
+    f.updaterState = preparePlan(); await f.coordinator.status();
+    const gate = deferred();
+    f.handlers.apply = async () => { await gate.promise; return preparePlan('queued'); };
+    const preparing = f.apply('ci', 'prepare');
+    assert.equal(f.apply('ci', 'prepare'), preparing, 'a repeated request joins it');
+    assert.throws(() => f.apply('ci'), error => error.status === 409 && error.message.includes('正在准备'));
+    gate.resolve(); await preparing;
+    assert.deepEqual(f.persisted, { maintenance: false, pendingPlanId: null });
   });
 });
 
