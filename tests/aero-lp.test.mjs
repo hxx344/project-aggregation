@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { belowTwap, emissionApr, nearestUsableTick, parseLedger, planCycle, positionAmounts, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
+import { belowTwap, emissionApr, nearestUsableTick, parseLedger, planCycle, positionAmounts, rangeState, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
 import { readRewards, reconcileLedger } from '../tools/aero-lp/chain.mjs';
 
 // RSGP(18) / USDC(6)，tickSpacing 100，上沿 0.005 落在最近格点 -329300（≈0.005005）。
@@ -196,4 +196,12 @@ test('reward reads give up after the time budget instead of delaying the cycle',
   const started = Date.now();
   await assert.rejects(readRewards(ctx, WALLET, [], 50), /exceeded 50 ms/);
   assert.ok(Date.now() - started < 1000);
+});
+
+test('range state follows the pool: lower tick inclusive, upper tick exclusive', () => {
+  const p = { tickLower: -337000, tickUpper: -330000 };
+  assert.equal(rangeState(p, -337001), 'below', 'a swap landing exactly on the lower bound leaves tick = lower - 1');
+  assert.equal(rangeState(p, -337000), 'in');
+  assert.equal(rangeState(p, -330001), 'in');
+  assert.equal(rangeState(p, -330000), 'above');
 });

@@ -4,9 +4,10 @@ export type AeroLpConfig = {
   upperPrice: number; gapBps: number; intervalSec: number; twapSec: number; maxTwapDeviationBps: number; slippageBps: number;
   keepInWallet: string; minDeploy: string; minEthForGas: string;
 };
-// amount/value/apr are display estimates from the child; absent when reward reads failed that cycle.
+// state is the pool's own in-range test on ticks (lower inclusive, upper exclusive); amount/value/apr are
+// display estimates from the child, absent when reward reads failed that cycle.
 export type AeroLpPosition = {
-  id: string; range: [number, number]; staked: boolean; liquidity: string;
+  id: string; range: [number, number]; staked: boolean; liquidity: string; state?: 'below' | 'in' | 'above';
   amount0?: number | null; amount1?: number | null; value?: number | null; apr?: number | null; aprEstimated?: boolean;
 };
 export type AeroLpRewards = { price: number | null; poolPerDay: number | null; pending: string; deferred: string };
