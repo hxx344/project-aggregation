@@ -284,3 +284,37 @@ test('socket: callers that give up before the shared probe fails leave no unhand
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.deepEqual(rejections, []);
 });
+
+test('socket: an events line over the byte limit ends the stream before it is parsed, however the chunks split it', { skip: windows }, async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'dp-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  let chunks = [];
+  const server = http.createServer(async (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    // Separate writes with a pause so each one arrives as its own data chunk.
+    for (const chunk of chunks) { res.write(chunk); await new Promise(resolve => setTimeout(resolve, 15)); }
+  });
+  const socketPath = path.join(dir, 'events.sock');
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const connection = createRuntimeConnection({ dir });
+  const limit = 16;
+  // A JSON string line of exactly `bytes` bytes; 'é' is two bytes, so the cap counts bytes, not characters.
+  const line = (bytes, fill = 'x') => `"${fill.repeat((bytes - 2) / Buffer.byteLength(fill))}"`;
+  const run = parts => new Promise(resolve => {
+    chunks = parts; const lines = []; let closes = 0;
+    connection.stream({ socketPath, secret: 's' }, { route: '/internal/v1/overview/events', idleMs: 200, maxLineBytes: limit,
+      onLine: value => lines.push(value),
+      onClose: error => { closes += 1; setTimeout(() => resolve({ lines, closes, status: error?.status }), 30); } });
+  });
+
+  const exact = line(limit), over = line(limit + 2), overWide = line(limit + 2, 'é');
+  assert.deepEqual(await run([`${exact}\n`]), { lines: ['x'.repeat(limit - 2)], closes: 1, status: 503 });
+  for (const parts of [
+    [`${over}\n`],
+    [over.slice(0, limit - 1), `${over.slice(limit - 1)}\n`],
+    [over, '\n'],
+    [`${overWide}\n`],
+  ]) assert.deepEqual(await run(parts), { lines: [], closes: 1, status: 503 }, JSON.stringify(parts));
+  // One chunk may carry several lines whose total passes the cap, as long as each line fits.
+  assert.deepEqual((await run([`${exact}\n${exact}\n${exact}\n`])).lines.length, 3);
+});
