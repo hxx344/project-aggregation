@@ -26,7 +26,7 @@ async function directory(t) {
 }
 // A runtime with a scripted module supervisor and maintenance guard.
 function runtime({ instanceId } = {}) {
-  const state = { maintenance: false, states: Object.fromEntries(moduleIds.map(id => [id, 'ready'])), failing: [], syncCalls: [], restarts: [], prepare: async () => {}, rows: null };
+  const state = { maintenance: false, states: Object.fromEntries(moduleIds.map(id => [id, 'ready'])), failing: [], syncCalls: [], restarts: [], prepare: async () => {}, automation: async () => {}, rows: null };
   const moduleRuntime = {
     status: () => state.rows ?? moduleIds.map(id => row(id, state.states[id])),
     restart: id => { state.restarts.push(id); return state.states[id] === 'fault'; },
@@ -39,7 +39,7 @@ function runtime({ instanceId } = {}) {
     },
     prepareApply: () => state.prepare(),
   };
-  const service = createRuntimeService({ instanceId, moduleRuntime, guard, readMaintenance: () => state.maintenance });
+  const service = createRuntimeService({ instanceId, moduleRuntime, guard, readMaintenance: () => state.maintenance, prepareAutomation: () => state.automation() });
   return { state, service };
 }
 const implementations = {
@@ -119,6 +119,12 @@ for (const [name, connect] of Object.entries(implementations)) {
     await assert.rejects(client.prepareStop(), error => error.status === 409 && error.message === 'a'.repeat(399));
     state.prepare = async () => { throw new TypeError('socket /private/path failed'); };
     await assert.rejects(client.prepareStop(), error => error.status === 503 && !error.message.includes('/private'));
+    // The data plane's LP signer refuses beside the modules, with the same mapping.
+    state.prepare = async () => {};
+    state.automation = async () => { throw new UpdateError(409, 'LP 调仓正在执行链上交易，尚未满足安全停机条件，请稍后重试'); };
+    await assert.rejects(client.prepareStop(), error => error.status === 409 && error.message.startsWith('LP 调仓正在执行链上交易'));
+    state.automation = async () => { throw new TypeError('ipc /private/path failed'); };
+    await assert.rejects(client.prepareStop(), error => error.status === 503 && error.message === '无法确认 LP 调仓的停机条件，暂不能更新');
   });
 
   test(`${name}: operator restart accepts only a faulted known module`, async t => {

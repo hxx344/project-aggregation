@@ -104,7 +104,7 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
     db = openHubDatabase(path.join(resolvedData, 'hub.sqlite'));
     const control = createControlStore(db);
     const readMaintenance = () => control.getSetting('updates-maintenance') === '1';
-    service = createRuntimeService({ moduleRuntime: modules, guard: createModuleUpdateGuard(), readMaintenance, isReady: () => ready });
+    service = createRuntimeService({ moduleRuntime: modules, guard: createModuleUpdateGuard(), readMaintenance, isReady: () => ready, prepareAutomation: () => dataPlane?.prepareStop() });
     dataPlane = createDataPlane({ db, control, catalog: createProjectCatalog({ control, embeddedModules: true, decrypt }), encrypt, decrypt, embeddedModules: true,
       dataDir: resolvedData, log: logger, accountWriter, ...dataPlaneOptions });
     await dataPlane.initialize();

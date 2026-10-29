@@ -71,10 +71,11 @@ mkdir -p ~/.config/aero-lp
 | `pool` | RSGP/USDC CL 池 | Slipstream 池地址；启动时校验工厂、gauge 和 token0 是否匹配 |
 | `factory` | `0x9cb2…7a76` | Slipstream 池工厂，必须与池子的 `factory()` 一致 |
 | `nft` | `0x4857…c60b` | 头寸 NFT 管理合约，必须与 gauge 的 `nft()` 一致；代币只授权给它 |
+| `gauge` | `0x77e3…72b1` | 质押用的 gauge，必须与池子的 `gauge()` 一致；NFT 只授权给它。授权对象由配置固定，RPC 返回不同地址时拒绝连接 |
 | `token` | RSGP | 必须是池子的 token0（单边投入的币） |
 | `upperPrice` | `0.005` | 固定上沿，单位为 token1/token0（USDC/RSGP） |
 | `gapBps` | `40` | 下沿至少高于现价多少（万分比） |
-| `intervalSec` | `600` | 检查间隔（秒），60–86400 |
+| `intervalSec` | `600` | 检查间隔（秒），10–86400；公共 RPC 建议不低于 10 秒 |
 | `twapSec` | `900` | 防砸盘保护的 TWAP 窗口（秒），0 表示关闭，最大 3600；本池观测记录约覆盖 30 分钟，窗口过长会读不到 TWAP |
 | `maxTwapDeviationBps` | `300` | 现价低于 TWAP 超过这个幅度（万分比）时暂缓调仓 |
 | `slippageBps` | `50` | 撤出与开仓的最小到账保护 |

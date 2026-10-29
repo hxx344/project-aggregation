@@ -1,6 +1,6 @@
 // Mirrors server/automation/aero-lp.mjs state(); the private key is never part of it.
 export type AeroLpConfig = {
-  rpcUrl: string; pool: string; factory: string; nft: string; token: string;
+  rpcUrl: string; pool: string; factory: string; nft: string; gauge: string; token: string;
   upperPrice: number; gapBps: number; intervalSec: number; twapSec: number; maxTwapDeviationBps: number; slippageBps: number;
   keepInWallet: string; minDeploy: string; minEthForGas: string;
 };
@@ -20,7 +20,7 @@ export type AeroLpCycle = {
 export type AeroLpEvent = { at: string; event: string } & Record<string, unknown>;
 export type AeroLpState = 'starting' | 'running' | 'stopping' | 'stopped' | 'fault';
 export type AeroLpSnapshot = {
-  schema: 1; enabled: boolean; state: AeroLpState; error: string | null; wallet: string | null; paused: boolean;
+  schema: 1; enabled: boolean; state: AeroLpState; error: string | null; wallet: string | null; paused: boolean; pauseReason: 'maintenance' | 'recovery' | null;
   phase: { name: string; at: number; nextAt: string | null } | null; lastCycle: AeroLpCycle | null; events: AeroLpEvent[]; ledger: AeroLpLedger | null;
   config: AeroLpConfig; defaults: AeroLpConfig; serverNow: number;
 };

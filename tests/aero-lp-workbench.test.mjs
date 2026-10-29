@@ -21,11 +21,18 @@ async function until(predicate, message = 'Expected LP state did not arrive', ro
   throw new Error(message);
 }
 // A child that answers the stop message like cli.mjs does, unless told to hang.
-function fakeWorker({ ignoreStop = false } = {}) {
+function fakeWorker({ ignoreStop = false, ackHold = false } = {}) {
   const worker = new EventEmitter(); worker.pid = 4242; worker.stdout = new EventEmitter(); worker.stderr = new EventEmitter();
   worker.connected = true; worker.sent = []; worker.signals = [];
   const exit = () => { worker.connected = false; setTimeout(() => worker.emit('close', 0), 5); };
-  worker.send = (message, callback) => { worker.sent.push(message); if (message.type === 'aero-lp-stop' && !ignoreStop) exit(); callback?.(null); return true; };
+  // ackHold: confirm the key's and every pause message's hold like cli.mjs does.
+  worker.ackHold = ackHold;
+  worker.send = (message, callback) => {
+    worker.sent.push(message);
+    if (message.type === 'aero-lp-stop' && !ignoreStop) exit();
+    if (worker.ackHold && (message.type === 'aero-lp-key' || message.type === 'aero-lp-pause')) setImmediate(() => worker.emit('message', { type: 'aero-lp-hold', paused: message.paused }));
+    callback?.(null); return true;
+  };
   worker.kill = (signal) => { worker.signals.push(signal); if (signal === 'SIGKILL' || !ignoreStop) exit(); return true; };
   return worker;
 }
@@ -42,13 +49,14 @@ test('LP configuration accepts only the page parameters with their ranges', () =
   for (const extra of [{ keyFile: '/tmp/key' }, { dataDir: '/tmp' }, { privateKey: KEY }, { command: 'node' }]) {
     assert.throws(() => strictAeroLpConfig({ ...AERO_LP_DEFAULTS, ...extra }), /不支持|not supported/);
   }
-  for (const bad of [{ rpcUrl: 'http://mainnet.base.org' }, { pool: 'pool' }, { intervalSec: 30 }, { twapSec: 7200 }, { slippageBps: 0 }, { gapBps: 1.5 }, { minDeploy: '1e3' }, { upperPrice: -1 }]) {
+  for (const bad of [{ rpcUrl: 'http://mainnet.base.org' }, { pool: 'pool' }, { gauge: 'gauge' }, { intervalSec: 9 }, { twapSec: 7200 }, { slippageBps: 0 }, { gapBps: 1.5 }, { minDeploy: '1e3' }, { upperPrice: -1 }]) {
     assert.throws(() => strictAeroLpConfig({ ...AERO_LP_DEFAULTS, ...bad }), /LP 参数无效/, JSON.stringify(bad));
   }
   const pool = AERO_LP_DEFAULTS.pool.toLowerCase();
   assert.equal(strictAeroLpConfig({ ...AERO_LP_DEFAULTS, pool }).pool, pool);
   const badChecksum = '0x' + pool.slice(2).replace(/[a-f]/, (c) => c.toUpperCase());
   assert.throws(() => strictAeroLpConfig({ ...AERO_LP_DEFAULTS, pool: badChecksum }), /校验和/);
+  assert.equal(strictAeroLpConfig({ ...AERO_LP_DEFAULTS, intervalSec: 10 }).intervalSec, 10);
   const { rpcUrl, ...missing } = AERO_LP_DEFAULTS;
   assert.throws(() => strictAeroLpConfig(missing), /rpcUrl/);
 });
@@ -207,6 +215,93 @@ test('workbench maintenance pauses transactions in the running child', async () 
     maintenance = false;
     await until(() => workers[0].sent.some((m) => m.type === 'aero-lp-pause' && m.paused === false));
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('account recovery quarantine refuses start and holds a running child like maintenance', async () => {
+  const directory = fixtureDir(); let admitted = true;
+  const { manager, workers, launches } = managerWith(directory, { manager: { readAdmission: () => admitted } });
+  try {
+    await manager.initialize(); await manager.setKey(KEY);
+    admitted = false;
+    await assert.rejects(manager.start(), (error) => error.status === 409 && /隔离恢复/.test(error.message));
+    assert.equal(launches.length, 0); assert.equal(manager.state().enabled, false);
+    admitted = true; await manager.start(); assert.equal(launches.length, 1);
+    admitted = false;
+    await until(() => workers[0].sent.some((m) => m.type === 'aero-lp-pause' && m.paused === true));
+    assert.equal(manager.state().pauseReason, 'recovery');
+    // The key handoff reads the hold again instead of reusing a stale value.
+    workers[0].emit('message', { type: 'aero-lp-ready' });
+    assert.equal(workers[0].sent.find((m) => m.type === 'aero-lp-key').paused, true);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a restart during quarantine starts the signer only after admission returns', async () => {
+  const directory = fixtureDir(); let admitted = true;
+  const first = managerWith(directory);
+  try { await first.manager.initialize(); await first.manager.setKey(KEY); await first.manager.start(); }
+  finally { await first.manager.close(); }
+  admitted = false;
+  const { manager, launches } = managerWith(directory, { manager: { readAdmission: () => { if (admitted === null) throw new Error('writer closed'); return admitted; } } });
+  try {
+    await manager.initialize();
+    assert.equal(launches.length, 0);
+    assert.match(manager.state().error, /隔离恢复/);
+    admitted = null; await delay(60);
+    assert.equal(launches.length, 0, 'an unreadable recovery state holds the signer');
+    admitted = true;
+    await until(() => launches.length === 1);
+    assert.equal(manager.state().error, null);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('update stop check waits for the child to confirm the hold and refuses mid-transaction', async () => {
+  const directory = fixtureDir(); let maintenance = false;
+  const { manager, workers } = managerWith(directory, { worker: { ackHold: true }, manager: { readMaintenance: () => maintenance, maintenancePollMs: 60_000 } });
+  try {
+    await manager.initialize(); await manager.setKey(KEY); await manager.start();
+    // Before the key handoff the child cannot sign, and the handoff carries the hold.
+    maintenance = true;
+    await manager.prepareStop();
+    workers[0].emit('message', { type: 'aero-lp-ready' });
+    assert.equal(workers[0].sent.find((m) => m.type === 'aero-lp-key').paused, true);
+    await manager.prepareStop();
+    workers[0].emit('message', { type: 'aero-lp-phase', phase: 'executing' });
+    await assert.rejects(manager.prepareStop(), (error) => error.status === 409 && /执行链上交易/.test(error.message));
+    workers[0].emit('message', { type: 'aero-lp-phase', phase: 'sleeping' });
+    await manager.prepareStop();
+    // Outside maintenance the stop check never reports ready.
+    maintenance = false;
+    await assert.rejects(manager.prepareStop(), (error) => error.status === 503);
+    await until(() => !manager.state().paused);
+    await delay(20);
+    // A child that never confirms the new hold is not trusted to have stopped signing.
+    workers[0].ackHold = false; maintenance = true;
+    await assert.rejects(manager.prepareStop({ confirmMs: 100, stepMs: 10 }), (error) => error.status === 503 && /无法确认/.test(error.message));
+    assert.equal(workers[0].sent.at(-1).type, 'aero-lp-pause');
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('settings saved before the gauge was pinned get it only for the default pool', async () => {
+  const { gauge, ...legacy } = AERO_LP_DEFAULTS;
+  const directory = fixtureDir();
+  mkdirSync(join(directory, 'aero-lp'), { recursive: true });
+  writeFileSync(join(directory, 'aero-lp', 'config.json'), JSON.stringify({ ...legacy, intervalSec: 30 }));
+  const { manager } = managerWith(directory);
+  try {
+    await manager.initialize();
+    assert.equal(manager.state().config.gauge, gauge);
+    assert.equal(manager.state().config.intervalSec, 30);
+    assert.equal(JSON.parse(readFileSync(join(directory, 'aero-lp', 'config.json'), 'utf8')).gauge, gauge);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+  const other = fixtureDir();
+  mkdirSync(join(other, 'aero-lp'), { recursive: true });
+  writeFileSync(join(other, 'aero-lp', 'config.json'), JSON.stringify({ ...legacy, pool: '0x' + '22'.repeat(20) }));
+  const second = managerWith(other);
+  try {
+    await second.manager.initialize();
+    assert.match(second.manager.state().error, /配置/);
+    await assert.rejects(second.manager.start(), (error) => error.status === 409);
+  } finally { await second.manager.close(); rmSync(other, { recursive: true }); }
 });
 
 test('workbench LP API requires login, same origin and CSRF, and accepts only strict bodies', async () => {
