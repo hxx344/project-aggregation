@@ -67,6 +67,16 @@ for file in cli.mjs core.mjs feeds.mjs binance-scalper.mjs config.example.json; 
   [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
   capture
 done
+# The LP rebalancer runs in the runtime unit like the research collector.
+mkdir -p "$source_dir/tools/aero-lp"
+for file in cli.mjs core.mjs chain.mjs config.example.json; do
+  embedded_before=$embedded_key
+  runtime_component_before=$runtime_component_key
+  echo lp > "$source_dir/tools/aero-lp/$file"; refresh; compare 0 0 1 0 1
+  compare_module_inputs 0 0 0 0
+  [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
+  capture
+done
 runtime_component_before=$runtime_component_key
 echo frontend >> "$source_dir/src/app.ts"; refresh; compare 0 1 1 1 1
 [[ $runtime_component_key == "$runtime_component_before" ]]

@@ -63,6 +63,10 @@ project_aggregation/
 不随工作台模块发布的独立工具：
 - `options-backtest/` - BTC 期权回测引擎与 parquet 数据工具，用法与口径见其 `README.md`
 
+随工作台运行时发布的工具（运行文件登记在 `deploy/package-release.py` 与 `deploy/install.sh`）：
+- `entropy-lighter-lab/` - Entropy / Lighter 行情采集，由 `server/research/entropy-lighter.mjs` 管理
+- `aero-lp/` - Aerodrome 单边 LP 调仓，由 `server/automation/aero-lp.mjs` 管理；`cli.mjs` 也可脱离工作台单独运行
+
 ### deploy/ 目录
 部署和安装脚本：
 - `install.sh`, `install-all.sh` - 安装脚本

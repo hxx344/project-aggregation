@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# 依赖（ethers）随仓库根目录的 pnpm install 安装。
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$here/cli.mjs" "$@"

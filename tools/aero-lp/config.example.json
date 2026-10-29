@@ -1,0 +1,19 @@
+{
+  "rpcUrl": "https://mainnet.base.org",
+  "pool": "0x8e859b6cf564c4ac2b848693c85c496e81dbf6c8",
+  "factory": "0x9cb220581b91b0c83223012fe69688b92ad07a76",
+  "nft": "0x4857db576ee0e45f10525ec59527bfd10beec60b",
+  "token": "0x44B63aF715D5ef02CC3646a6CE96875e11d69E85",
+  "upperPrice": 0.005,
+  "gapBps": 40,
+  "intervalSec": 600,
+  "twapSec": 900,
+  "maxTwapDeviationBps": 300,
+  "slippageBps": 50,
+  "keepInWallet": "0",
+  "minDeploy": "1000",
+  "minEthForGas": "0.0002",
+  "keyFile": "~/.config/aero-lp/key",
+  "address": null,
+  "dataDir": "~/.local/share/aero-lp"
+}

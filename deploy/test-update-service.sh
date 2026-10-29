@@ -214,6 +214,8 @@ cp "$case_root/release/server/update-service/"*.py "$source_dir/server/update-se
 cp "$repository/deploy/build-artifact-cache.py" "$source_dir/deploy/build-artifact-cache.py"
 mkdir -p "$source_dir/tools/entropy-lighter-lab"
 cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$source_dir/tools/entropy-lighter-lab/"
+mkdir -p "$source_dir/tools/aero-lp"
+cp "$repository"/tools/aero-lp/{cli.mjs,core.mjs,chain.mjs,config.example.json} "$source_dir/tools/aero-lp/"
 printf '{"name":"source-permission-fixture"}\n' > "$source_dir/package.json"
 printf '#!/bin/sh\nexit 0\n' > "$source_dir/server/executable.sh"
 chmod 0755 "$source_dir/server/executable.sh"

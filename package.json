@@ -23,6 +23,7 @@
     "prepare": "node scripts/install-hooks.mjs"
   },
   "dependencies": {
+    "ethers": "6.17.0",
     "lucide-react": "catalog:",
     "pino": "^10.4.0",
     "pino-pretty": "^13.2.0",

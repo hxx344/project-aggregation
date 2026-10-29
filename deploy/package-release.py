@@ -20,6 +20,7 @@ MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
 # Its vinext/React build graph must not become server runtime dependencies.
 IMPORTERS = ('.', 'modules/monitor', 'modules/asset', 'modules/crossex')
 LAB_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')
+AERO_LP_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'chain.mjs', 'config.example.json')
 EXCLUDED = {'node_modules', '.git', '.venv', '.venv-aster', '.vinext', '.wrangler', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',
             '.mypy_cache', 'tests', 'test-results', 'output', 'runtime-data', '.data',
             '.env', '.env.local', '.env.production', '.env.production.local', '.env.linux'}
@@ -289,17 +290,17 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
                 raise ValueError('Runtime directory cannot be a link: ' + relative)
             shutil.copytree(source / relative, stage / relative, ignore=checked_ignore({'__pycache__'}))
         shutil.copy2(source / 'package.json', stage / 'package.json')
-        for relative in ('tools', 'tools/entropy-lighter-lab'):
+        for relative in ('tools', 'tools/entropy-lighter-lab', 'tools/aero-lp'):
             origin = source / relative
             if not origin.is_dir() or is_link(origin):
                 raise ValueError('Missing trusted research runtime directory: ' + relative)
-        lab = Path('tools/entropy-lighter-lab')
-        (stage / lab).mkdir(parents=True)
-        for name in LAB_RUNTIME_FILES:
-            origin = source / lab / name
-            if not origin.is_file() or is_link(origin):
-                raise ValueError('Missing trusted research runtime file: ' + name)
-            shutil.copy2(origin, stage / lab / name)
+        for lab, names in ((Path('tools/entropy-lighter-lab'), LAB_RUNTIME_FILES), (Path('tools/aero-lp'), AERO_LP_RUNTIME_FILES)):
+            (stage / lab).mkdir(parents=True)
+            for name in names:
+                origin = source / lab / name
+                if not origin.is_file() or is_link(origin):
+                    raise ValueError('Missing trusted research runtime file: ' + str(lab / name))
+                shutil.copy2(origin, stage / lab / name)
         for notice in ('LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md'):
             if (source / notice).is_file():
                 shutil.copy2(source / notice, stage / notice)
@@ -325,7 +326,7 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
     shutil.copy2(diagnostic, stage / 'deploy/diagnose-aster-margin.py')
 
 
-APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'tools/entropy-lighter-lab', 'scripts/modules.mjs',
+APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'tools/entropy-lighter-lab', 'tools/aero-lp', 'scripts/modules.mjs',
                       'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
                       'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
                       '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',
