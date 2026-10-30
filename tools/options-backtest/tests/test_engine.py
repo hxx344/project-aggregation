@@ -24,10 +24,12 @@ NEXT_FRIDAY_08 = SUNDAY_08 + 5 * 24
 class FakeMarket:
     """Flat-IV chains around a forward path; bid/ask are mark -/+ `spread` of the mark."""
 
-    def __init__(self, forwards, iv=0.5, spread=0.02, settlements=None, perp_offset=0.0, funding_rate=0.0):
+    def __init__(self, forwards, iv=0.5, spread=0.02, settlements=None, perp_offset=0.0, funding_rate=0.0, expiring=False):
         """`iv` is a number or a function of the hour; the perp trades at forward + `perp_offset` and
-        charges `funding_rate` every 8 hours (00/08/16 UTC)."""
+        charges `funding_rate` every 8 hours (00/08/16 UTC). `expiring` also lists a contract at its
+        expiry hour from the 07:59 snapshot, as the parquet market does."""
         self.forwards, self.iv, self.spread = forwards, iv, spread
+        self.expiring = expiring
         self.settlements = settlements or {}
         self.perp_offset, self.funding_rate = perp_offset, funding_rate
 
@@ -47,10 +49,13 @@ class FakeMarket:
         forward = self.forwards[hour]
         strikes = [round(forward / 500) * 500 + 500 * step for step in range(-12, 13)]
         return [self._quote(hour, expiry, strike, is_call) for expiry in (SATURDAY_08, SUNDAY_08, NEXT_FRIDAY_08)
-                if expiry > hour for strike in strikes for is_call in (True, False)]
+                if self._listed(hour, expiry) for strike in strikes for is_call in (True, False)]
+
+    def _listed(self, hour, expiry):
+        return expiry > hour or (self.expiring and expiry == hour)
 
     def quote(self, hour, expiry, strike, is_call):
-        return self._quote(hour, expiry, strike, is_call) if hour in self.forwards and expiry > hour else None
+        return self._quote(hour, expiry, strike, is_call) if hour in self.forwards and self._listed(hour, expiry) else None
 
     def settlement(self, expiry):
         return self.settlements.get(expiry)
@@ -326,6 +331,64 @@ class EngineTest(unittest.TestCase):
         self.assertEqual([(t["trend"], t["exit_hour"]) for t in flipped], [("above", SUNDAY_08), ("below", NEXT_FRIDAY_08)])
         self.assertRegex(flipped[1]["legs"], r"^-1 \w+-PERP")
         self.assertAlmostEqual(sum(t["fees"] for t in flipped) - sum(t["fees"] for t in held), 2 * 0.0005 * 38000.0, places=2)
+
+    def test_never_opens_a_contract_expiring_at_the_decision_hour(self):
+        market = FakeMarket(flat(hours=range(FRIDAY_21, NEXT_FRIDAY_08 + 1)), settlements={SUNDAY_08: 40000.0}, expiring=True)
+        self.assertIn(SUNDAY_08, {q.expiry for q in market.chain(SUNDAY_08)})  # 07:59 snapshot, still has time value
+        spec = specs.validate({"start": "2024-01-07T08", "end": "2024-01-07T08", "entry": {"hours": [8]},
+                               "expiry": {"weekday": "sun", "min_hours": 0}, "legs": [{"side": "sell", "type": "call", "delta": 0.5}]})
+        self.assertEqual(engine.open_position(market.chain(SUNDAY_08), SUNDAY_08, spec), (None, "no_expiry"))
+        self.assertEqual(engine.run(spec, market)[:2], ([], {"no_expiry": 1}))
+        rule = {"weekday": None, "dte": 0, "min_hours": 0}
+        self.assertEqual(engine.choose_expiry([SUNDAY_08, NEXT_FRIDAY_08], SUNDAY_08, rule), NEXT_FRIDAY_08)
+        self.assertIsNone(engine.choose_expiry([SUNDAY_08], SUNDAY_08, rule))
+
+    def test_calendar_legs_settle_at_their_own_expiry(self):
+        spec = specs.validate({"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "fill": "mark",
+                               "legs": [{"side": "sell", "type": "put", "delta": 0.5, "expiry": {"weekday": "sat"}},
+                                        {"side": "buy", "type": "call", "delta": 0.5, "expiry": {"weekday": "sun"}}]})
+        marked = range(FRIDAY_21, SATURDAY_08)  # both legs quoted until the near expiry
+        both = {SATURDAY_08: 40000.0, SUNDAY_08: 40000.0}
+        position, _ = engine.open_position(FakeMarket(flat()).chain(FRIDAY_21), FRIDAY_21, spec)
+        put, call = position.legs
+        self.assertEqual((put.expiry, call.expiry), (SATURDAY_08, SUNDAY_08))
+
+        def run(hours, settlements):
+            return engine.run(spec, FakeMarket(flat(hours=hours), settlements=settlements, expiring=True))
+
+        def settled(leg, price):
+            value = payoff(price, leg.strike, leg.is_call)
+            return leg.sign * value - min(0.00015 * price, 0.125 * value)
+
+        def closed(leg, market, hour):
+            mark = market.quote(hour, leg.expiry, leg.strike, leg.is_call).mark
+            return leg.sign * mark - min(0.0003 * 40000.0, 0.07 * mark)
+
+        # Normal calendar: the near leg settles, the far leg closes at market the same hour.
+        trade = run(range(FRIDAY_21, SUNDAY_08 + 1), both)[0][0]
+        market = FakeMarket(flat(), expiring=True)
+        self.assertEqual((trade["reason"], trade["exit_hour"], trade["fills"]), ("expiry", SATURDAY_08, 3))
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + closed(call, market, SATURDAY_08), places=2)
+        # Far quote missing at the near expiry: wait for the first quote while it is still alive.
+        trade = run([*marked, *range(SATURDAY_08 + 4, SUNDAY_08 + 1)], both)[0][0]
+        self.assertEqual((trade["reason"], trade["exit_hour"]), ("expiry", SATURDAY_08 + 4))
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + closed(call, market, SATURDAY_08 + 4), places=2)
+        # The far leg expires while waiting: its 07:59 quote is not tradable, it settles at its own delivery price.
+        trade = run([*marked, SUNDAY_08], both)[0][0]
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + settled(call, 40000.0), places=2)
+        self.assertEqual((trade["reason"], trade["exit_hour"], trade["settlement"], trade["fills"]), ("expiry", SUNDAY_08, 40000.0, 2))
+        far_up = run([*marked, SUNDAY_08], {SATURDAY_08: 40000.0, SUNDAY_08: 41000.0})[0][0]
+        self.assertAlmostEqual(far_up["pnl"], position.credit - position.fees + settled(put, 40000.0) + settled(call, 41000.0), places=2)
+        # No delivery evidence for the far expiry: unresolved and flagged, then the last marked forward after six hours.
+        self.assertEqual(run([*marked, *range(SUNDAY_08, SUNDAY_08 + 4)], {SATURDAY_08: 40000.0})[:2], ([], {"unsettled_at_data_end": 1}))
+        trade = run([*marked, *range(SUNDAY_08, SUNDAY_08 + 7)], {SATURDAY_08: 40000.0})[0][0]
+        self.assertEqual((trade["reason"], trade["exit_hour"]), ("expiry_last_forward", SUNDAY_08 + 6))
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + settled(call, 40000.0), places=2)
+        # A live far leg without quotes until the data ends stays open, not unsettled.
+        market = FakeMarket(flat(hours=[*marked, SATURDAY_08 + 1]), settlements=both, expiring=True)
+        quote = market.quote
+        market.quote = lambda hour, expiry, *rest: None if hour >= SATURDAY_08 else quote(hour, expiry, *rest)
+        self.assertEqual(engine.run(spec, market)[:2], ([], {"open_at_data_end": 1}))
 
 
 class SpecTest(unittest.TestCase):

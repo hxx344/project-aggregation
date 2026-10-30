@@ -123,7 +123,8 @@ def funding(position, market, upto):
 
 
 def choose_expiry(expiries, hour, rule):
-    candidates = sorted(e for e in expiries if e - hour >= rule["min_hours"])
+    """An expiry still alive at decision hour `hour` (strictly later, whatever min_hours allows)."""
+    candidates = sorted(e for e in expiries if e > hour and e - hour >= rule["min_hours"])
     if rule["weekday"] is not None:
         return next((e for e in candidates if utc(e).weekday() == rule["weekday"]), None)
     target = hour + rule["dte"] * 24
@@ -226,7 +227,9 @@ def open_position(chain, hour, spec, perp=None, carry=False, state=None):
         return None, "no_data"
     by_expiry = {}
     for quote in chain:
-        if quote.mark > 0 and quote.iv > 0 and quote.forward > 0 and quote.years > 0:
+        # The contract must be alive at the decision hour; `years` (time left at the quote's own
+        # snapshot) only says the quote can be priced: a 07:59 snapshot labelled 08:00 is not tradable at 08:00.
+        if quote.expiry > hour and quote.mark > 0 and quote.iv > 0 and quote.forward > 0 and quote.years > 0:
             by_expiry.setdefault(quote.expiry, []).append(quote)
     legs, quotes, fallbacks = [], [], 0
     for index, leg_spec in chosen:
@@ -277,7 +280,8 @@ def close_value(position, quotes, spec):
     return cash, fees, fallbacks
 
 
-def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, paid_funding=0.0, perp_pnl=0.0, perp_fee=0.0, carried=True):
+def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, paid_funding=0.0, perp_pnl=0.0, perp_fee=0.0, carried=True, fills=None):
+    """`fills` counts the closing fills (default: every leg); legs settled at a delivery price have none."""
     pnl = position.credit - position.fees + cash - fees - paid_funding
     return {
         "entry": utc(position.entry_hour).strftime("%Y-%m-%d %H:%M"), "exit": utc(hour).strftime("%Y-%m-%d %H:%M"),
@@ -288,7 +292,7 @@ def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, pai
         "credit": round(position.credit, 2), "fees": round(position.fees + fees, 2), "pnl": round(pnl, 2),
         "margin": round(position.margin, 2), "max_loss": None if position.max_loss is None else round(position.max_loss, 2),
         "worst_open_pnl": round(min(position.worst, pnl), 2), "fallback_fills": position.fallback_fills + fallbacks,
-        "fills": len(position.legs) + sum(reason != "expiry" or leg.expiry != position.expiry or leg.is_perp for leg in position.legs),
+        "fills": len(position.legs) + (len(position.legs) if fills is None else fills),
         "missing_hours": position.missing_hours, "perp_pnl": round(perp_pnl, 2), "funding": round(paid_funding, 2),
         "trend": position.extra.get("trend"),
         # run() refunds the perp close fee when the next position holds the perp on from this same hour and price
@@ -297,10 +301,32 @@ def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, pai
     }
 
 
-def settle(position, market, hour, spec, price):
-    """Settle legs expiring now at `price`; close any later legs at market."""
+def delivery(position, market, hour, expiry):
+    """(delivery price, taken from the last marked forward) for one expiry the position holds, or None
+    while unknown. Six hours after that expiry without an estimate, the forward its legs had at the
+    last marked hour stands in."""
+    price = market.settlement(expiry)
+    if price is not None:
+        return price, False
+    last = position.extra.get("last_forward", {}).get(expiry)
+    if hour - expiry >= 6 and last is not None:
+        return last, True
+    return None
+
+
+def settle(position, market, hour, spec):
+    """From the first expiry on: settle every option leg already expired at `hour` at its own expiry's
+    delivery price (never at a pre-expiry quote) and close the live legs at market. Returns None while
+    an expired leg has no delivery price or a live leg has no quote, noting which in extra["pending"]."""
+    prices = {}
+    for expiry in sorted({leg.expiry for leg in position.legs if not leg.is_perp and leg.expiry <= hour}):
+        prices[expiry] = delivery(position, market, hour, expiry)
+        if prices[expiry] is None:
+            position.extra["pending"] = "settlement"
+            return None
+    price = prices[position.expiry][0]
     cash = fees = perp_pnl = perp_fee = 0.0
-    fallbacks = 0
+    fallbacks = fills = 0
     carried = False
     for leg in position.legs:
         if leg.is_perp:  # closed at the option expiry hour's perp price (delivery estimate if missing)
@@ -309,40 +335,40 @@ def settle(position, market, hour, spec, price):
             close = close or price
             perp_pnl += leg.sign * leg.value(close) * leg.qty
             perp_fee += leg_fee(spec["fees"], leg, close, close)
+            fills += 1
             continue
-        if leg.expiry == position.expiry:
-            value = payoff(price, leg.strike, leg.is_call)
+        if leg.expiry in prices:
+            delivered = prices[leg.expiry][0]
+            value = payoff(delivered, leg.strike, leg.is_call)
             cash += leg.sign * value * leg.qty
-            fees += min(spec["fees"]["settle_rate"] * price, spec["fees"]["settle_cap_pct"] * value) * leg.qty
+            fees += min(spec["fees"]["settle_rate"] * delivered, spec["fees"]["settle_cap_pct"] * value) * leg.qty
             continue
         quote = market.quote(hour, leg.expiry, leg.strike, leg.is_call)
         if quote is None:
+            position.extra["pending"] = "quote"
             return None
         fill, fallback = fill_price(quote, leg.sign < 0, spec["fill"])
         fallbacks += fallback
+        fills += 1
         cash += leg.sign * leg.value(fill) * leg.qty
         fees += leg_fee(spec["fees"], leg, quote.forward, fill)
-    return finish(position, hour, "expiry", cash + perp_pnl, fees + perp_fee, settlement=price, fallbacks=fallbacks,
-                  paid_funding=funding(position, market, position.expiry), perp_pnl=perp_pnl, perp_fee=perp_fee, carried=carried)
+    reason = "expiry_last_forward" if any(stand_in for _, stand_in in prices.values()) else "expiry"
+    return finish(position, hour, reason, cash + perp_pnl, fees + perp_fee, settlement=price, fallbacks=fallbacks,
+                  paid_funding=funding(position, market, position.expiry), perp_pnl=perp_pnl, perp_fee=perp_fee, carried=carried, fills=fills)
 
 
 def step(position, market, hour, spec):
     """Mark an open position at `hour`; returns a finished trade when an exit fires."""
     if hour >= position.expiry:
-        price = market.settlement(position.expiry)
-        if price is not None:
-            return settle(position, market, hour, spec, price)
-        if hour - position.expiry >= 6 and "last_forward" in position.extra:
-            trade = settle(position, market, hour, spec, position.extra["last_forward"])
-            return trade and {**trade, "reason": "expiry_last_forward"}
-        return None
+        return settle(position, market, hour, spec)
     quotes = [perp_quote(market.perp(hour), leg.expiry, hour) if leg.is_perp else market.quote(hour, leg.expiry, leg.strike, leg.is_call)
               for leg in position.legs]
     if any(quote is None for quote in quotes):
         position.missing_hours += 1
         return None
     position.marked_hours += 1
-    position.extra["last_forward"] = median(q.forward for q, leg in zip(quotes, position.legs) if leg.expiry == position.expiry and not leg.is_perp)
+    options = [(leg.expiry, q.forward) for leg, q in zip(position.legs, quotes) if not leg.is_perp]
+    position.extra["last_forward"] = {expiry: median(f for e, f in options if e == expiry) for expiry, _ in options}
     paid = funding(position, market, hour)
     marked = position.credit - position.fees - paid + sum(leg.sign * leg.value(q.mark) * leg.qty for leg, q in zip(position.legs, quotes))
     position.worst = min(position.worst, marked)
@@ -415,8 +441,9 @@ def run(spec, market, progress=None):
             if progress:
                 progress(hour, len(trades))
         hour += 1
-    for position in open_positions:
-        skipped["open_at_data_end"] = skipped.get("open_at_data_end", 0) + 1
+    for position in open_positions:  # an expired leg without a delivery price stays unresolved, never guessed
+        key = "unsettled_at_data_end" if position.extra.get("pending") == "settlement" else "open_at_data_end"
+        skipped[key] = skipped.get(key, 0) + 1
     for trade in trades:
         del trade["_carry"]
     return trades, skipped, (start, end)
