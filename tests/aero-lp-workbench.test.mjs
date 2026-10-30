@@ -78,11 +78,20 @@ test('the wallet counts as known only once its file was read, so Asset is never 
     await corrupt.setKey(KEY);
     assert.equal(corrupt.walletKnown(), true, 'saving a key replaces the unreadable file');
     await corrupt.close();
-    writeFileSync(join(broken, 'aero-lp', 'wallet.json'), '{"schema":1}');
-    const empty = managerWith(broken).manager;
-    await empty.initialize();
-    assert.equal(empty.walletKnown(), false, 'a wallet file without an address is damaged too');
-    await empty.close();
+    const restored = managerWith(broken).manager;
+    await restored.initialize();
+    assert.equal(restored.walletKnown(), true);
+    assert.equal(restored.state().wallet, ADDRESS);
+    await restored.close();
+    for (const content of ['{"schema":1}', 'null', '{"schema":1,"address":""}']) {
+      writeFileSync(join(broken, 'aero-lp', 'wallet.json'), content);
+      const empty = managerWith(broken).manager;
+      await empty.initialize();
+      assert.equal(empty.state().error, null, `${content} is read without failing initialize`);
+      assert.equal(empty.state().wallet, null);
+      assert.equal(empty.walletKnown(), false, `a wallet file holding ${content} is damaged too`);
+      await empty.close();
+    }
   } finally { rmSync(blank, { recursive: true, force: true }); rmSync(broken, { recursive: true, force: true }); }
 });
 
