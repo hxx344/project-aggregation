@@ -91,6 +91,7 @@ export function PairAdlPanel({
       <p className="muted">
         监测绑定两账户的全部原生合约，包含手工仓位。确认真实 ADL
         后暂停策略，重新核实两账户总多空数量，按批次市价关闭多余的腿。每批按现场标记价折算上限，实际成交金额随市价变化。
+        已运行的保证金平衡在 ADL 处理、受阻及完成观察期间继续；手动暂停配对组会停止新划转，ADL 应急处理继续。
       </p>
       {!(config?.enabled ?? true) ? (
         <p className="amber">
@@ -130,7 +131,7 @@ export function PairAdlPanel({
             <p className="muted">
               完成于 {date(incident.completed_at)}。
               {incident.hold
-                ? '配对组保持暂停观察；请先核对报告，再决定是否手动启动。'
+                ? '策略保持暂停观察；请先核对报告，再决定是否手动启动。'
                 : '本次处理记录已归档。'}
             </p>
           ) : null}
@@ -138,7 +139,7 @@ export function PairAdlPanel({
       ) : (
         <p className="muted">
           尚无 ADL
-          处理记录。处理完成后保持暂停，初报、受阻告警与完整报告使用飞书事件机器人。
+          处理记录。处理完成后策略保持暂停，初报、受阻告警与完整报告使用飞书事件机器人。
         </p>
       )}
       <div className="pair-adl-notification">

@@ -23,6 +23,7 @@ from .pair_planning import (SIDES, PairPositionError, PairRecoveryConflict, posi
                             require_runtime_symbols)
 from .store import dumps
 from .pair_legacy import require_no_legacy_cycle
+from .margin_control import margin_running
 
 LOG = logging.getLogger("aster.trading")
 
@@ -181,7 +182,8 @@ class PairTrader:
 
     def _margin_guard(self, pair, identities):
         current = self.store.pair(pair["id"])
-        if (not current or current.get("revision") != pair.get("revision") or not current["enabled"]
+        if (not current or current.get("revision") != pair.get("revision")
+                or not margin_running(current, self.store.get("pair_margin_control:" + pair["id"]))
                 or not current["margin"]["enabled"] or self.engine.workspace.active or self.engine.shutdown.is_set()):
             raise RequestNotSent("保证金配置已变化、配对组暂停或工作台正在停止，未发送请求")
         accounts, brokers, actual = self._members(current)
@@ -214,6 +216,7 @@ class PairTrader:
         self._margin_identity.set((pair["id"], pair.get("revision"), deepcopy(identities)))
         transfer_pending = isinstance(margin, dict) and margin.get("pending") is not None
         result = self._balance(pair, state, brokers, identities, pending_orders=bool(state.get("pending")))
+        result["running"] = margin_running(pair, self.store.get("pair_margin_control:" + pair["id"]))
         if transfer_pending or result.get("status") in {"acknowledged", "confirmed", "skipped", "paper_confirmed"}:
             self._ordinary_observations.pop(pair["id"], None)
         state["updated_at"] = time.time()
@@ -421,7 +424,8 @@ class PairTrader:
                     and time.time() < margin_state.get("next_check_at", 0)):
                 # A failed balance preparation blocks new work. Re-reading both
                 # accounts during its quota backoff cannot authorize anything.
-                margin = MarginBalancer.status_view(pair, margin_state, state.get("margin"))
+                margin = MarginBalancer.status_view(pair, margin_state, state.get("margin"),
+                    control=self.store.get("pair_margin_control:" + pair["id"]))
                 if margin.get("blocks_trading"):
                     state.update(margin=margin, phase="margin_wait", reason=margin["reason"])
                     margin_delay = max(0, margin_state["next_check_at"] - time.time())

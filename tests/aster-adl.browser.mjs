@@ -105,7 +105,7 @@ async (page) => {
           completed_at: Date.now() / 1000, batch_count: 1, config: { enabled: true, batch_notional: '1000' } } };
       await refresh();
       await panel.getByText('处理完成 · 保持暂停', { exact: true }).waitFor();
-      assert((await panel.innerText()).includes('配对组保持暂停观察；请先核对报告，再决定是否手动启动。'), 'completion does not instruct a compulsory restart');
+      assert((await panel.innerText()).includes('策略保持暂停观察；请先核对报告，再决定是否手动启动。'), 'completion does not instruct a compulsory restart');
       assert(!(await app.getByRole('button', { name: '启动配对组', exact: true }).isDisabled()), 'completed hold permits a deliberate manual start');
       observations.push('legacy six-field state fallback, pending ADL event label/start/config locks, completed-hold copy');
     };

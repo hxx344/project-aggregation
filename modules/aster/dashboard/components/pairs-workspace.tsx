@@ -51,6 +51,7 @@ import {
   pairHasPending,
   pairMarginStatus,
   pairMarginOnly,
+  pairMarginRunning,
   pairNetQuantity,
   pairSnapshotStatus,
   pairStartRecoveryBlock,
@@ -125,7 +126,11 @@ export function PairsWorkspace({ pairs, ...props }: Props) {
                 {items.map((item) => (
                   <SelectItem key={item.id} value={item.id}>
                     {item.name} · {item.symbol ?? DEFAULT_PAIR_SYMBOL.symbol} ·{' '}
-                    {item.enabled ? '执行已启用' : '执行已暂停'}
+                    {item.enabled
+                      ? '执行已启用'
+                      : pairMarginRunning(item)
+                        ? '策略暂停 · 保证金运行中'
+                        : '执行已暂停'}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -323,6 +328,7 @@ function PairDetail({
   const net = pairNetQuantity(snapshots, symbol);
   const pending = pairHasPending(pair);
   const margin = pair.state?.margin;
+  const marginRunning = pairMarginRunning(pair);
   const reservedTransferOnly =
     !pair.state?.pending &&
     margin?.status === 'unknown' &&
@@ -356,10 +362,14 @@ function PairDetail({
           <div>
             <h2>
               <span
-                className={`run-indicator ${pair.enabled ? 'mint' : 'muted'}`}
+                className={`run-indicator ${pair.enabled || marginRunning ? 'mint' : 'muted'}`}
               >
                 <i />
-                {pair.enabled ? '配对组执行已启用' : '配对组执行已暂停'}
+                {pair.enabled
+                  ? '配对组执行已启用'
+                  : marginRunning
+                    ? '策略保持暂停 · 保证金平衡运行中'
+                    : '配对组执行已暂停'}
               </span>
             </h2>
             <p className="muted">
@@ -371,7 +381,9 @@ function PairDetail({
                   : '环境待确认'}{' '}
               ·{' '}
               {pair.margin.enabled
-                ? '自动保证金平衡已配置，组启用后可按条件划转'
+                ? marginRunning
+                  ? '自动保证金平衡运行中，按条件划转'
+                  : '自动保证金平衡已配置，当前未运行'
                 : '自动保证金平衡未开启'}
             </p>
           </div>
@@ -389,9 +401,27 @@ function PairDetail({
               <CirclePlay size={16} />
               启动配对组
             </Button>
+            {pair.state?.adl?.margin_start_allowed === true ? (
+              <Button
+                variant="outline"
+                disabled={busy || offline || draft.dirty}
+                title="仅启动保证金平衡，策略保持暂停，ADL 应急处理继续"
+                onClick={async () => {
+                  if (
+                    await action(`/api/pairs/${pair.id}/adl-margin-enable`, {})
+                  ) {
+                    setNotice('保证金平衡已启动，策略保持暂停，ADL 应急处理继续。');
+                  }
+                }}
+              >
+                <CirclePlay size={16} />
+                启动保证金平衡
+              </Button>
+            ) : null}
             <Button
               variant="outline"
-              disabled={busy || !pair.enabled}
+              disabled={busy || (!pair.enabled && !marginRunning)}
+              title="停止新开仓和新划转，既有请求继续核对，ADL 应急处理继续"
               onClick={() => void action(`/api/pairs/${pair.id}/pause`)}
             >
               <CirclePause size={16} />
@@ -486,7 +516,7 @@ function PairDetail({
           ) : null}
           <p className="muted">
             {adlLock
-              ? 'ADL 期间由应急处理接管核实与减仓，普通策略和新划转保持暂停。'
+              ? 'ADL 期间由应急处理接管核实与减仓，普通策略保持暂停；已运行的保证金平衡继续按条件划转。手动暂停配对组会停止新划转，ADL 应急处理继续。'
               : '组暂停会阻止新开仓和新划转；既有订单与划转请求继续查询。'}
           </p>
           {!pair.enabled ? (

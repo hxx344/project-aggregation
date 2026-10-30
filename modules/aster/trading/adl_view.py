@@ -8,6 +8,7 @@ from .adl_notifications import format_messages
 from .exchange import LiveBroker
 from .exchange_messages import exchange_reason
 from .models import TradingError
+from .margin_control import adl_margin_start_allowed
 
 MONITOR_MAX_AGE = 120
 _PHASES = {"active": "detected", "blocked": "blocked", "completed": "completed"}
@@ -136,6 +137,8 @@ def status_view(engine, reader, pair, runtime, *, now=None):
                       and isinstance(runtime, dict)
                       and isinstance(reader.get("pair_margin:" + pair["id"], {}), dict))
     return {"monitoring": _monitoring(engine, reader, pair, now), "incident": projection,
+            "margin_start_allowed": adl_margin_start_allowed(pair, incident,
+                reader.get("pair_margin_control:" + pair["id"])),
             "report_available": incident is not None, "pending_event": pending_event,
             "configuration_locked": bool(reason), "lock_reason": reason,
             "margin_only_switch_allowed": switch_allowed}

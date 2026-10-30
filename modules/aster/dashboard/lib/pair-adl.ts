@@ -26,6 +26,7 @@ export type PairAdlState = {
   configuration_locked: boolean;
   lock_reason: string;
   margin_only_switch_allowed?: boolean;
+  margin_start_allowed?: boolean;
 };
 
 export type AdlReport = {

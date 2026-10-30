@@ -13,6 +13,7 @@ import {
   pairMarginLimitFieldVisible,
   pairMarginStatus,
   pairMarginOnly,
+  pairMarginRunning,
   pairNetQuantity,
   pairPhaseLabel,
   pairSnapshotStatus,
@@ -20,6 +21,26 @@ import {
   pairTransferStatus,
   parsePairDraft,
 } from '../lib/pairs.ts';
+
+test('margin runtime state stays independent from strategy activation and saved configuration', () => {
+  const fixture = {
+    enabled: false,
+    margin: { enabled: true },
+    state: { margin: { running: true } },
+  };
+  assert.equal(pairMarginRunning(fixture), true);
+  fixture.state.margin.running = false;
+  assert.equal(pairMarginRunning(fixture), false);
+  fixture.enabled = true;
+  assert.equal(pairMarginRunning(fixture), false);
+  delete fixture.state.margin.running;
+  assert.equal(pairMarginRunning(fixture), true);
+  fixture.enabled = false;
+  assert.equal(pairMarginRunning(fixture), false);
+  fixture.enabled = true;
+  fixture.margin.enabled = false;
+  assert.equal(pairMarginRunning(fixture), false);
+});
 
 test('funds-only activation keeps pending recovery separate from trading activation', () => {
   const fixture = {

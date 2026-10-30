@@ -514,6 +514,10 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     def switch_pair_to_margin_only(pair_id: str, body: PairMarginOnly):
         return {"ok": True, "pair": engine.pairs.switch_to_margin_only(pair_id)}
 
+    @app.post("/api/pairs/{pair_id}/adl-margin-enable", dependencies=write_dependencies)
+    def enable_pair_adl_margin(pair_id: str, body: PairMarginOnly):
+        return {"ok": True, "pair": engine.pairs.enable_adl_margin(pair_id)}
+
     @app.post("/api/pairs/{pair_id}/pause", dependencies=write_dependencies)
     def pause_pair(pair_id: str):
         return {"ok": True, "pair": engine.pairs.enable(pair_id, False)}
