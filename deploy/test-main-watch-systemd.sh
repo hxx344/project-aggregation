@@ -168,11 +168,17 @@ bash "${sender[@]}" --uninstall
 systemctl is-active --quiet main-watch.timer
 
 echo '== a hand-edited heartbeat token redeploys the receiver instead of skipping'
+# 推送端重装改写了共用程序：先消化这次差异并确认基线会跳过，后面的“不跳过”才只由手改配置引起。
+bash "${installer[@]}" >/dev/null
+bash "${installer[@]}" | tee "$fixture/hand-edit-base.log"
+grep -q '跳过部署' "$fixture/hand-edit-base.log"
+receiver_started=$(systemctl show --property=ActiveEnterTimestampMonotonic --value main-watch-heartbeat.service)
 sleep 1  # 让配置的修改时间晚于接收服务的启动时间
 sed -i "s/^HEARTBEAT_TOKEN=.*/HEARTBEAT_TOKEN=$(printf 'h%.0s' {1..40})/" /etc/main-watch/config
 [[ $(stat -c '%U:%G %a' /etc/main-watch/config) == "root:$service 640" ]]  # 只有接收服务过旧这一项不一致
 bash "${installer[@]}" | tee "$fixture/hand-edit.log"
 if grep -q '跳过部署' "$fixture/hand-edit.log"; then echo 'Stale heartbeat receiver was skipped' >&2; exit 1; fi
+(( $(systemctl show --property=ActiveEnterTimestampMonotonic --value main-watch-heartbeat.service) > receiver_started ))
 bash "${installer[@]}" | tee "$fixture/hand-edit-noop.log"
 grep -q '跳过部署' "$fixture/hand-edit-noop.log"
 bash "${installer[@]}" --heartbeat-listen ''

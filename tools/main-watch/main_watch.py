@@ -279,7 +279,7 @@ def serve(config, state_dir, log, ready=None):
                     # 未鉴权请求可以任意发送，拒绝日志每分钟最多一条，其余只计数。
                     now = time.time()
                     if now - rejected['logged'] >= REJECT_LOG_INTERVAL:
-                        extra = f'（此前 1 分钟内另有 {rejected["skipped"]} 条被拒）' if rejected['skipped'] else ''
+                        extra = f'（上次记录后另有 {rejected["skipped"]} 条被拒）' if rejected['skipped'] else ''
                         log(f'拒绝来自 {self.client_address[0]} 的心跳：{error}{extra}')
                         rejected.update(logged=now, skipped=0)
                     else:
