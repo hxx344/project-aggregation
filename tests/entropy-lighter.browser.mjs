@@ -315,9 +315,16 @@ async (page) => {
   assert(await page.locator('.el-chart .recharts-line-curve').count() === 2, 'HTTP failure preserves both historical series');
   assert(await page.locator('.el-conclusion.candidate').count() === 0, 'HTTP failure withdraws the current candidate conclusion');
   failRead = false; stale = false; await refresh();
-  await page.getByRole('button', { name: 'ANTH', exact: true }).click();
+  // The direction panel and the spread chart each show symbol buttons; both drive one shared page symbol.
+  const spreadSymbols = page.getByRole('group', { name: '价差标的', exact: true });
+  const scalperSymbols = page.getByRole('group', { name: '方向研究标的', exact: true });
+  const selected = async (group) => (await group.locator('button[aria-pressed="true"]').allInnerTexts()).join(',');
+  await spreadSymbols.getByRole('button', { name: 'ANTH', exact: true }).click();
   await page.getByText('尚无 ANTH 可比较价差', { exact: true }).waitFor();
-  await page.getByRole('button', { name: 'SNDK', exact: true }).click();
+  assert(await selected(spreadSymbols) === 'ANTH' && await selected(scalperSymbols) === 'ANTH', 'spread symbol switch also selects the direction-research symbol');
+  await scalperSymbols.getByRole('button', { name: 'SNDK', exact: true }).click();
+  await page.getByText('尚无 ANTH 可比较价差', { exact: true }).waitFor({ state: 'detached' });
+  assert(await selected(spreadSymbols) === 'SNDK' && await selected(scalperSymbols) === 'SNDK', 'direction-research symbol switch also switches the spread chart');
 
   await page.locator('.el-technical>summary').click();
   await page.setViewportSize({ width: 390, height: 844 });
@@ -342,5 +349,5 @@ async (page) => {
   assert(errors.length === 0, `no browser errors: ${errors.join('; ')}`);
   assert(writes.every(write => ['/stop', '/start', '/config'].some(suffix => write.path === root + suffix)), 'no exchange order writes occur');
   await page.clock.resume();
-  return { checks: 'native-route, automatic-public-fees, symbol-fee-scope, 110/120-full-Entropy-fee-rebates, unavailable/expired-fees, locked-historical-fees, legacy-fee-provenance, readable conclusions, server/monotonic age, report/poll cadence, wall-clock skew, source-clock independence, legacy unknown quality, read-only controls, stop/save/start, validation, failed-save retention, chart gaps, polling/resume, stale/error withdrawal, mobile, download, expiry', writes: writes.length, reads: reads.length };
+  return { checks: 'native-route, automatic-public-fees, symbol-fee-scope, 110/120-full-Entropy-fee-rebates, unavailable/expired-fees, locked-historical-fees, legacy-fee-provenance, readable conclusions, server/monotonic age, report/poll cadence, wall-clock skew, source-clock independence, legacy unknown quality, read-only controls, stop/save/start, validation, failed-save retention, chart gaps, shared symbol switch, polling/resume, stale/error withdrawal, mobile, download, expiry', writes: writes.length, reads: reads.length };
 }
