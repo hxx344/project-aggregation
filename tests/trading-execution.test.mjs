@@ -765,6 +765,95 @@ test('a cancel left sending by a crash is resent after restart', async t => {
   assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
 });
 
+// Records the venue time of every Binance cancel that reached transport.
+function rejectBinanceCancels(f) {
+  const posts = [];
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation?.(); posts.push(f.time); throw new ExecutionExchangeError('rejected'); };
+  return posts;
+}
+const restart = async f => { await f.service.close(); f.service = f.create(); await f.service.initializeProtection(); };
+const spaced = posts => posts.slice(1).every((time, index) => time - posts[index] >= 10_000);
+async function finishCancelledOriginal(f) {
+  delete f.handlers['binance:stop'];
+  const original = f.records.get(JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%').json).remoteId);
+  Object.assign(original, { status: 'terminal', terminal: true, childrenSettled: true });
+  f.advance(15_000); await f.service.tick();
+  assert.equal(f.job.status, 'stopped'); assert.equal(f.creates.length, 2);
+  assert.deepEqual(f.accounts.binance.positions, []);
+  assert.equal(f.writer?.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)) ?? false, false);
+}
+
+test('a rejected cancel restarted between attempts still gets five spaced POSTs', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(posts.length, 1); assert.equal(f.job.status, 'attention');
+  for (let i = 0; i < 8; i += 1) {
+    // Recovering the rejected cancel neither burns a send nor drops the spacing.
+    f.advance(1000); await restart(f); await f.service.tick();
+    f.advance(15_000); await f.service.tick();
+  }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
+test('a cancel prepared but never sent before a crash does not use up the cancel budget', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(posts.length, 1);
+  // The shared prepare succeeds, then every private write after `prepared`
+  // fails, as if the process died before transport.
+  const prepare = f.db.prepare.bind(f.db);
+  f.db.prepare = sql => {
+    const statement = prepare(sql);
+    if (sql.startsWith('INSERT INTO execution_orders')) {
+      const run = statement.run.bind(statement);
+      statement.run = (...args) => { const value = JSON.parse(args[2]); if (value.writerOperation?.action === 'cancel' && value.writerOperation.state !== 'prepared') throw new Error('SQLITE_IOERR'); return run(...args); };
+    }
+    return statement;
+  };
+  f.advance(15_000); await f.service.tick(); f.db.prepare = prepare;
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%').json).writerDispatch, 'prepared');
+  await restart(f); await f.service.tick();
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
+test('a cancel left sending by a crash counts once toward the cancel budget', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  f.advance(15_000); await f.service.tick();
+  assert.equal(posts.length, 2);
+  // The second request was in flight when the process stopped.
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending';
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  f.advance(1000); await restart(f); await f.service.tick();
+  assert.equal(posts.length, 2);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
+test('without a shared writer a rejected cancel gets five spaced POSTs and stops on the terminal original', async t => {
+  const f = await fixture(t);
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  for (let i = 0; i < 20; i += 1) { f.advance(5000); await f.service.tick(); }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
 test('connecting reads only the oil symbols so another market cannot block it', async t => {
   const f = await fixture(t);
   const reads = f.calls.filter(call => call.method === 'account');

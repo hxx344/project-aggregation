@@ -150,7 +150,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (order.writerDispatch === 'prepared' || operation.state === 'rejected' || imported.state === 'rejected') {
       accountWriter.resolve(operation.operationId, ticket, 'rejected'); operation.state = 'rejected';
       if (operation.action === 'create') Object.assign(order, { state: 'rejected', settled: true, unknown: false });
-      else { order.unknown = false; order.amendPending = false; if (operation.action === 'cancel') { order.cancelAttempt = (order.cancelAttempt || 0) + 1; order.cancelRequestedAt = null; } }
+      // A recovered cancel keeps its sequence, send count and send time; the
+      // next cancel takes a new sequence and still honours the spacing.
+      else { order.unknown = false; order.amendPending = false; }
     } else if (operation.state === 'confirmed' || order.settled) accountWriter.resolve(operation.operationId, ticket);
     saveOrder(order);
   }
@@ -523,7 +525,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // A cancel that was sent but left the order working is retried a bounded
   // number of times; repeating an exact-ID cancel can only reduce exposure.
   // `sending` survives here only when the process stopped during the request.
-  const cancelSpent = order => (order.cancelAttempt || 0) + 1 >= CANCEL_ATTEMPTS;
+  // `cancelAttempt` only names the shared operation; the budget counts
+  // requests that may have reached the venue (`cancelSent`). Older records
+  // without it assume every past sequence number was sent.
+  const cancelSends = order => order.cancelSent ?? (order.cancelRequestedAt || order.cancelAttempt ? (order.cancelAttempt || 0) + 1 : 0);
+  const cancelSpent = order => cancelSends(order) >= CANCEL_ATTEMPTS;
   const cancelRecent = order => !!order.cancelRequestedAt && now() - Date.parse(order.cancelRequestedAt) < CANCEL_RETRY_MS;
   function retryCancel(order, operation) {
     if (order.settled || !order.remoteId || cancelSpent(order)) return false;
@@ -567,12 +573,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       catch { await inspectOrder(order, undefined, true); return; }
       if (operation?.skip) return;
     }
-    order.cancelRequestedAt = iso(now()); order.state = 'canceling'; saveOrder(order);
+    // Count the request before transport so a crash mid-request stays counted;
+    // only a guard refusal (nothing sent) gives the attempt and spacing back.
+    const sentBefore = cancelSends(order), requestedBefore = order.cancelRequestedAt;
+    order.cancelRequestedAt = iso(now()); order.cancelSent = sentBefore + 1; order.state = 'canceling'; saveOrder(order);
     try {
-      await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) accountWriter.assertOwned(operation, callTimeoutMs); } }));
+      await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次撤单未发送'); } } } }));
       finishWrite(operation, 'confirmed', order); saveOrder(order);
     }
     catch (error) {
+      if (error instanceof NotSubmittedError) Object.assign(order, { cancelSent: sentBefore, cancelRequestedAt: requestedBefore });
       finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', order);
       saveOrder(order);
       /* Even a failed or timed-out stop must be reconciled by a fresh query. */
