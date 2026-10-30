@@ -1158,3 +1158,31 @@ test('workspace update readiness cannot be authorized by a follower or expired e
   f.store.prepare('UPDATE live_owner SET expires_at=? WHERE singleton=1').run(f.now + 60000);
   assert.equal(f.runtime.updateStatus().busy, true, 'a lost lease remains invalid after a late extension');
 });
+
+test('finished local history never pushes active local or external orders out of the live view', async t => {
+  const { visibleOrders, CLOSED_ORDER_DISPLAY_LIMIT } = await import('../src/live-display.ts');
+  for (const closedCount of [300, 301]) {
+    const f = fixture(t);
+    f.orders([{ user_id: '123', order_id: 'remote-local', text: 'local-active-text', symbol: symbols[0], side: 'BUY', state: 'NEW', qty: '1', executed_qty: '0' },
+      { user_id: '123', order_id: 'external-new', text: 'external-new-text', symbol: symbols[1], side: 'SELL', state: 'NEW', qty: '2', executed_qty: '0' }]);
+    await f.connect();
+    const version = f.runtime.connectionView().version;
+    const insert = f.store.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)');
+    const save = (order, updatedAt) => insert.run(order.id, order.executionId, order.text, version, order.status, updatedAt,
+      JSON.stringify({ symbol: symbols[0], side: 'BUY', quantity: '1', executedQty: '1', reduceOnly: false, version, updatedAt, ...order }));
+    // The tracked active order is older than every finished order, so a shared cap would drop it first.
+    save({ id: 'local-active', executionId: 'execution-active', text: 'local-active-text', orderId: 'remote-local', status: 'NEW', executedQty: '0' }, f.now - closedCount - 1);
+    for (let i = 0; i < closedCount; i++) save({ id: `closed-${i}`, executionId: `execution-${i}`, text: `closed-text-${i}`, orderId: `closed-order-${i}`, status: 'FILLED' }, f.now - i);
+    const live = f.runtime.view().live;
+    const active = live.orders.filter(o => !['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT'].includes(o.status));
+    assert.deepEqual(active.map(o => [o.id, o.external, o.canCancel]), [['local-active', false, true], ['external-new', true, true]], `${closedCount} finished orders`);
+    assert.equal(live.orders.length, 302); assert.equal(live.closedOrdersOmitted, closedCount - 300);
+    assert.equal(f.runtime.summary().metrics.find(m => m.key === 'liveOrders').value, active.length, 'summary count matches the visible active orders');
+    const hidden = visibleOrders(live.orders, false, live.closedOrdersOmitted);
+    assert.deepEqual(hidden.orders.map(o => o.id), ['local-active', 'external-new']); assert.equal(hidden.hiddenClosed, 0);
+    const shown = visibleOrders(live.orders, true, live.closedOrdersOmitted);
+    assert.equal(shown.orders.length, 2 + CLOSED_ORDER_DISPLAY_LIMIT);
+    assert.deepEqual(shown.orders.slice(0, 2).map(o => o.id), ['local-active', 'external-new']);
+    assert.equal(shown.hiddenClosed, closedCount - CLOSED_ORDER_DISPLAY_LIMIT, 'the panel reports finished orders beyond both limits');
+  }
+});

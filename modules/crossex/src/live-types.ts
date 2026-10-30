@@ -42,6 +42,8 @@ export type LiveView = {
   status: string; freshnessState: string; stale: boolean; partial: boolean; asOf: number | null;
   tradingAllowed: boolean; reasons: string[]; account: Record<string, unknown> | null;
   balances: Record<string, unknown>[]; positions: LivePosition[]; orders: LiveOrder[];
+  /** Finished local orders beyond the server limit; active and external orders are never omitted. */
+  closedOrdersOmitted?: number;
   executions: LiveExecution[]; alerts: (string | { message?: string; reason?: string })[];
   recentTrades?: Record<string, unknown>[]; accountBook?: Record<string, unknown>[]; fees?: Record<string, unknown>[];
   recentTradesAsOf?: number | null; recentTradesError?: string | null;
