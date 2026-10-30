@@ -44,6 +44,15 @@
 .fd-preview-section dt{color:var(--text-secondary)}
 .fd-preview-section dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .fd-preview-section dd span{display:block}
+.fd-preview-section dl>div.fd-wide{grid-template-columns:minmax(0,1fr);gap:2px}
+.fd-preview-section dd strong{display:block;margin:8px 0 4px;font-weight:600}
+.fd-preview-section dd strong:first-child{margin-top:2px}
+.fd-table{overflow-x:auto;border:1px solid var(--surface-4);border-radius:var(--radius-sm)}
+.fd-table table{width:100%;border-collapse:collapse;overflow-wrap:normal}
+.fd-table th,.fd-table td{padding:4px 8px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--surface-4)}
+.fd-table th{font-weight:600;color:var(--text-secondary);background:var(--surface-2)}
+.fd-table tbody tr:last-child td{border-bottom:0}
+.fd-table .right{text-align:right}
 .fd-omitted{margin-top:12px;color:var(--warning)}
 @media (max-width:1100px){.fd-layout{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:560px){.fd-grid,.fd-metrics{grid-template-columns:minmax(0,1fr)}}

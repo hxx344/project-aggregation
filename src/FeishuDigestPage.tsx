@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { BellRing, CircleAlert, KeyRound, LoaderCircle, RefreshCw, Save, Send, Trash2 } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { DigestConfig, DigestHistoryEntry, DigestLevel, DigestPreview, DigestSection, DigestSnapshot } from './feishu-digest-types';
+import type { DigestConfig, DigestGroup, DigestHistoryEntry, DigestLevel, DigestMetric, DigestPreview, DigestSection, DigestSnapshot } from './feishu-digest-types';
 import './aero-lp.css';
 import './feishu-digest.css';
 
@@ -15,10 +15,25 @@ const when = (value: string | number | null) => { const ms = typeof value === 'n
 const message = (reason: unknown) => reason instanceof Error ? reason.message : '请求失败，请重试。';
 const timeList = (text: string) => text.split(/[\s,，、]+/).filter(Boolean);
 
+function PreviewTable({ group }: { group: DigestGroup }) {
+  return <>
+    <strong>{group.title}</strong>
+    <div className="fd-table"><table>
+      <thead><tr>{group.columns.map(column => <th key={column.key} scope="col" className={column.align}>{column.label}</th>)}</tr></thead>
+      <tbody>{group.rows.map((row, index) => <tr key={index}>{group.columns.map(column => <td key={column.key} className={column.align}>{row[column.key]}</td>)}</tr>)}</tbody>
+    </table></div>
+  </>;
+}
+function PreviewMetric({ metric }: { metric: DigestMetric }) {
+  return <div className={metric.groups?.length ? 'fd-wide' : undefined}>
+    <dt>{metric.label}</dt>
+    <dd>{metric.groups?.length ? metric.groups.map(group => <PreviewTable key={group.title} group={group} />) : metric.lines?.length ? metric.lines.map((line, index) => <span key={index}>{line}</span>) : metric.text}</dd>
+  </div>;
+}
 function PreviewSection({ section }: { section: DigestSection }) {
   return <section className={`fd-preview-section ${section.level}`}>
     <h3><span className="fd-dot" aria-hidden="true" />{section.name}<small>{section.status}{section.asOf ? ` · 数据 ${when(section.asOf)}` : ''}</small></h3>
-    {section.metrics.length ? <dl>{section.metrics.map(metric => <div key={metric.key}><dt>{metric.label}</dt><dd>{metric.lines?.length ? metric.lines.map(line => <span key={line}>{line}</span>) : metric.text}</dd></div>)}</dl> : null}
+    {section.metrics.length ? <dl>{section.metrics.map(metric => <PreviewMetric key={metric.key} metric={metric} />)}</dl> : null}
   </section>;
 }
 

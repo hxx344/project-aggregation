@@ -8,7 +8,9 @@ export type DigestSnapshot = {
   nextAt: string | null; history: DigestHistoryEntry[]; loadError: string | null; serverNow: number; result?: DigestHistoryEntry | null;
 };
 export type DigestLevel = 'ok' | 'notice' | 'idle' | 'warn' | 'alert';
-export type DigestMetric = { key: string; label: string; text: string; lines?: string[] };
+export type DigestColumn = { key: string; label: string; align?: 'left' | 'right' };
+export type DigestGroup = { title: string; columns: DigestColumn[]; rows: Record<string, string>[] };
+export type DigestMetric = { key: string; label: string; text: string; lines?: string[]; groups?: DigestGroup[] };
 export type DigestSection = { id: string; name: string; level: DigestLevel; status: string; asOf: number | null; metrics: DigestMetric[]; issues: string[] };
 export type DigestPreview = {
   digest: { title: string; at: string; clock: string; level: 'ok' | 'warn' | 'alert'; sections: DigestSection[]; attention: { name: string; level: DigestLevel; status: string; issues: string[] }[] };
