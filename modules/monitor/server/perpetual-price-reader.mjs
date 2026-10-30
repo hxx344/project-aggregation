@@ -1,4 +1,5 @@
 import { PRICE_HOUR_MS as HOUR } from '../lib/perpetual-price-history.ts';
+import { perpetualContractSymbolPattern } from '../lib/perpetual-chart-state.ts';
 
 const SUPPORTED = new Set(['binance', 'aster', 'bybit', 'gate', 'okx', 'bitget', 'hyperliquid', 'entropy']);
 const MAX_CHUNK = 168 * HOUR;
@@ -17,7 +18,7 @@ const timestamp = input => {
   return value;
 };
 function validateMarket(market) {
-  if (!market || !/^[a-z][a-z0-9-]{0,39}$/.test(market.exchange) || typeof market.symbol !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(market.symbol)) throw Error('成交价历史合约无效');
+  if (!market || !/^[a-z][a-z0-9-]{0,39}$/.test(market.exchange) || typeof market.symbol !== 'string' || !perpetualContractSymbolPattern.test(market.symbol)) throw Error('成交价历史合约无效');
   if (!SUPPORTED.has(market.exchange)) throw unsupported('该平台尚未接入已核实的成交价小时线。');
   if (!Number.isFinite(market.multiplier ?? 1) || (market.multiplier ?? 1) <= 0) throw Error('合约价格倍率无效');
   // Hyperliquid perps all settle in USDC; the directory labels BTC/ETH etc.

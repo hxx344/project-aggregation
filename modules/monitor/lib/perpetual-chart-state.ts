@@ -3,8 +3,12 @@ import type { FundingHistoryPairRequest } from './perpetual-funding-history.ts';
 export type PerpetualChartDays = 3 | 7 | 30;
 export interface PerpetualChartSelection extends FundingHistoryPairRequest { days: PerpetualChartDays }
 const parameters = ['perpView', 'chartBase', 'chartLong', 'chartShort', 'chartDays'] as const;
-const basePattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
-const keyPattern = /^[a-z][a-z0-9-]{0,39}:[A-Za-z0-9][A-Za-z0-9._:-]{0,118}$/;
+// Directory-accepted native codes may be Unicode letters/numbers (Binance
+// 币安人生USDT). Whitespace, controls, URL separators and other punctuation
+// stay rejected; the server reuses this grammar before its directory checks.
+export const perpetualContractSymbolPattern = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,159}$/u;
+const basePattern = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,99}$/u;
+const keyPattern = /^[a-z][a-z0-9-]{0,39}:[\p{L}\p{N}][\p{L}\p{N}._:-]{0,118}$/u;
 
 export function validPerpetualChartSelection(value: unknown): value is PerpetualChartSelection {
   if (!value || typeof value !== 'object') return false;
