@@ -7,6 +7,8 @@ export type PositionFundingRate = FundingLeg & { expiresAt: number };
 export type LivePosition = {
   id: string; symbol: string; exchange: string; side: string;
   quantity: string; baseQuantity: string | null; baseCurrency: string; quoteCurrency: string;
+  /** Verified 1:1 asset identity from the server (Gate/OKX LUNA = Binance LUNA2); baseCurrency stays native. */
+  canonicalBase?: string;
   entryPrice: string | null; markPrice: string | null; unrealizedPnl: string | null; pnlCurrency: string;
   margin: string | null; marginCurrency: string; liquidationPrice: string | null;
   external: boolean; updatedAt: number | null; openedAt?: number | null;

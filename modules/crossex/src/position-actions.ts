@@ -10,12 +10,14 @@ export function actionDecimal(value: unknown): Decimal | null {
 }
 function positive(value: unknown) { const n = actionDecimal(value); return n?.gt(0) ? n : null; }
 function inputQuantity(value: string) { return /^\d+(?:\.\d+)?$/.test(value) ? positive(value) : null; }
+/** Pair identity uses the server's verified canonical base; snapshots without it fall back to the native name. */
+export const positionAsset = (position: Pick<LivePosition, 'baseCurrency' | 'canonicalBase'>) => position.canonicalBase || position.baseCurrency;
 
 export function positionPairProblem(legs: LivePosition[]): string | null {
   if (legs.length !== 2 || legs[0].id === legs[1].id) return '需要恰好两条不同的持仓腿';
   if (!legs.some(p => p.side.toUpperCase() === 'LONG') || !legs.some(p => p.side.toUpperCase() === 'SHORT')) return '需要一条多仓和一条空仓';
   if (!legs[0].exchange || !legs[1].exchange || legs[0].exchange === legs[1].exchange) return '双腿需要来自不同交易所';
-  if (!legs[0].baseCurrency || legs[0].baseCurrency !== legs[1].baseCurrency) return '双腿基础币不同或缺失';
+  if (!positionAsset(legs[0]) || positionAsset(legs[0]) !== positionAsset(legs[1])) return '双腿基础币不同或缺失';
   if (!legs[0].quoteCurrency || legs[0].quoteCurrency !== legs[1].quoteCurrency) return '双腿计价币不同或缺失';
   if (legs.some(p => !positive(actionDecimal(p.baseQuantity)?.abs().toFixed()))) return '持仓基础币数量缺失或无效';
   return null;
@@ -102,11 +104,11 @@ export function positionActionInput(plan: PositionActionPlan, action: 'add' | 'b
 /** Price updates are harmless; quantity, direction, identity or account changes invalidate the frozen intent. */
 export function positionSnapshotChanged(group: PositionGroup, version: string | number, accountId: string | null, live: LiveView): boolean {
   if (version !== live.connection.version || accountId !== live.connection.accountId) return true;
-  const current = live.positions.filter(p => p.baseCurrency === group.base || group.legs.some(old => old.id === p.id));
+  const current = live.positions.filter(p => positionAsset(p) === group.base || group.legs.some(old => old.id === p.id));
   return current.length !== group.legs.length || group.legs.some(old => {
     const next = current.find(p => p.id === old.id), previousQuantity = actionDecimal(old.baseQuantity)?.abs(), nextQuantity = actionDecimal(next?.baseQuantity)?.abs();
     return !next || !previousQuantity || !nextQuantity || !previousQuantity.eq(nextQuantity) || old.side.toUpperCase() !== next.side.toUpperCase()
-      || old.symbol !== next.symbol || old.exchange !== next.exchange || old.baseCurrency !== next.baseCurrency || old.quoteCurrency !== next.quoteCurrency;
+      || old.symbol !== next.symbol || old.exchange !== next.exchange || old.baseCurrency !== next.baseCurrency || positionAsset(old) !== positionAsset(next) || old.quoteCurrency !== next.quoteCurrency;
   });
 }
 
@@ -114,8 +116,8 @@ export function positionPreviewChanged(input: PositionActionInput, live: LiveVie
   if (input.connectionVersion !== live.connection.version || input.positions.length !== 2) return true;
   const positions = input.positions.map(expected => live.positions.find(p => p.id === expected.positionId));
   if (positions.some(position => !position)) return true;
-  const base = positions[0]!.baseCurrency;
-  if (!base || positions[1]!.baseCurrency !== base || live.positions.filter(p => p.baseCurrency === base).length !== 2) return true;
+  const base = positionAsset(positions[0]!);
+  if (!base || positionAsset(positions[1]!) !== base || live.positions.filter(p => positionAsset(p) === base).length !== 2) return true;
   return input.positions.some((expected, index) => {
     const current = positions[index]!, quantity = actionDecimal(current.baseQuantity)?.abs();
     return !quantity || !quantity.eq(expected.expectedQuantity) || current.side.toUpperCase() !== expected.expectedSide;

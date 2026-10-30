@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { registerHooks } from 'node:module';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
@@ -236,6 +237,67 @@ test('confirmed native aliases preserve their raw contracts and still reject hid
   const request = f.input(); f.positions.push({ ...f.positions[0], position_id: 'alias-third', symbol: 'OKX_FUTURE_LUNA_USDT' });
   await assert.rejects(f.runtime.preview(request), /额外持仓/);
   await assert.rejects(f.confirm(preview), /已变化/); assert.equal(f.calls.length, 0);
+});
+
+test('live LUNA/LUNA2 projections group, plan and preview as one pair while LUNC and other quotes stay separate', async t => {
+  const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
+    return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && ['./live-display', './position-actions'].includes(specifier) ? `${specifier}.ts` : specifier, context);
+  } });
+  const { groupPositions } = await import('../src/position-view.ts');
+  sourceResolution.deregister();
+  const { planPositionAction, positionActionInput, positionPairProblem, positionPreviewChanged, positionSnapshotChanged } = await import('../src/position-actions.ts');
+  for (const venue of ['gate', 'okx']) {
+    const f = fixture(t, { config: { maxOpen: 3, notionalPerLeg: 500, maxTotalNotional: 2000 } }), aliasSymbols = [`${venue.toUpperCase()}_FUTURE_LUNA_USDT`, 'BINANCE_FUTURE_LUNA2_USDT'];
+    f.positions.forEach((p, index) => { p.symbol = aliasSymbols[index]; });
+    f.positions.push({ position_id: 'terra-classic', symbol: 'BYBIT_FUTURE_LUNC_USDT', position_side: 'LONG', position_qty: '5', mark_price: '0.0001', user_id: '123' });
+    const rules = aliasSymbols.map((symbol, index) => ({ ...catalog[0], symbol, exchange_type: index ? 'BINANCE' : venue.toUpperCase(), max_limit_size: '10000' }));
+    f.rules(rules);
+    f.identity(symbol => {
+      const native = !symbol.startsWith('BINANCE'), exchange = native ? venue : 'binance';
+      return quote(exchange, epoch, { base: 'LUNA2', rawBase: native ? 'LUNA' : 'LUNA2', symbol: !native ? 'LUNA2USDT' : venue === 'gate' ? 'LUNA_USDT' : 'LUNA-USDT-SWAP', settlementCurrency: 'USDT',
+        collateralCurrency: 'USDT', counterCurrency: 'USDT', contractKind: 'linear', crossexSymbol: symbol, identityScope: 'manual',
+        nativeUnit: '1', identitySource: 'exchange-instrument-metadata', comparable: true });
+    });
+    await f.connect();
+    const live = f.runtime.view().live;
+    assert.deepEqual(live.positions.map(p => [p.symbol, p.baseCurrency, p.canonicalBase]),
+      [[aliasSymbols[0], 'LUNA', 'LUNA2'], [aliasSymbols[1], 'LUNA2', 'LUNA2'], ['BYBIT_FUTURE_LUNC_USDT', 'LUNC', 'LUNC']]);
+    const groups = groupPositions(live.positions, { now: epoch });
+    assert.deepEqual(groups.map(g => [g.base, g.legs.map(p => p.symbol), g.net]), [['LUNA2', aliasSymbols, '0'], ['LUNC', ['BYBIT_FUTURE_LUNC_USDT'], '5']]);
+    const pair = groups[0];
+    assert.equal(positionPairProblem(pair.legs), null); assert.equal(pair.metrics.applicable, true);
+    const instruments = rules.map((rule, index) => ({ ...rule, exchange: index ? 'binance' : venue }));
+    const plan = planPositionAction(pair, instruments, 'add', '1');
+    assert.deepEqual(plan.errors, []);
+    const input = positionActionInput(plan, 'add', 'reduce', live.connection.version);
+    assert.equal(positionPreviewChanged(input, live), false);
+    assert.equal(positionSnapshotChanged(pair, live.connection.version, live.connection.accountId, live), false);
+    assert.equal(positionSnapshotChanged(pair, live.connection.version, 'another-account', live), true, 'an account switch invalidates the frozen intent');
+    const preview = await f.runtime.preview(input);
+    assert.equal(preview.base, 'LUNA2'); assert.equal(preview.targetQuantity, '2');
+    assert.deepEqual(preview.legs.map(l => [l.symbol, l.quantity]), [[aliasSymbols[0], '1'], [aliasSymbols[1], '1']], 'native contracts and base units are kept');
+
+    // A third alias leg joins the same canonical group and invalidates the old two-leg intent on both sides.
+    f.positions.push({ ...f.positions[0], position_id: 'alias-third', symbol: venue === 'gate' ? 'OKX_FUTURE_LUNA_USDT' : 'GATE_FUTURE_LUNA_USDT' });
+    await f.runtime.refresh();
+    const tripled = f.runtime.view().live, tripledPair = groupPositions(tripled.positions, { now: epoch })[0];
+    assert.equal(tripledPair.legs.length, 3); assert.match(positionPairProblem(tripledPair.legs), /恰好两条/);
+    assert.equal(positionPreviewChanged(input, tripled), true); assert.equal(positionSnapshotChanged(pair, tripled.connection.version, tripled.connection.accountId, tripled), true);
+    await assert.rejects(f.runtime.preview(input), /额外持仓/);
+    f.positions.pop();
+
+    // Unequal alias legs are balanced through the same identity; a different quote currency is never merged.
+    f.positions[1].position_qty = '2'; await f.runtime.refresh();
+    const unequal = groupPositions(f.runtime.view().live.positions, { now: epoch })[0];
+    const balance = planPositionAction(unequal, instruments, 'balance', '', 'reduce');
+    assert.deepEqual(balance.errors, []); assert.equal(balance.targetQuantity, '1');
+    assert.equal((await f.runtime.preview(positionActionInput(balance, 'balance', 'reduce', live.connection.version))).targetQuantity, '1');
+    f.positions[1].symbol = 'BINANCE_FUTURE_LUNA2_USDC'; f.positions[1].position_qty = '1'; await f.runtime.refresh();
+    const mixed = f.runtime.view().live, mixedPair = groupPositions(mixed.positions, { now: epoch })[0];
+    assert.match(positionPairProblem(mixedPair.legs), /计价币/);
+    await assert.rejects(f.runtime.preview(input), /同一资产及计价币/);
+    assert.equal(f.calls.length, 0);
+  }
 });
 
 test('confirmation rechecks changed market valuation against position increase budgets and total exposure', async t => {

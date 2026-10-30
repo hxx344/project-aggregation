@@ -2,6 +2,7 @@ import Decimal from 'decimal.js';
 import type { LiveView } from './live-types';
 import { amountClass, exact } from './live-display';
 import { decimalField, percentage, sumNative } from './position-view';
+import { positionAsset } from './position-actions';
 import DecimalValue from './DecimalValue';
 import { time } from './display';
 
@@ -16,7 +17,7 @@ export default function AccountOverview({ live, stale }: { live: LiveView; stale
   const equity = decimalField(account, 'margin_balance'), available = decimalField(account, 'available_margin');
   const maintenanceRate = decimalField(account, 'maintenance_margin_rate'), initialRate = decimalField(account, 'initial_margin_rate');
   const pnl = sumNative(live.positions, p => p.unrealizedPnl, p => p.pnlCurrency);
-  const coins = new Set(live.positions.map(p => p.baseCurrency || p.symbol)).size;
+  const coins = new Set(live.positions.map(p => positionAsset(p) || p.symbol)).size;
   const availableShare = share(available, equity), width = meterWidth(maintenanceRate);
   const old = stale ? <span className="old" title="账户数据未及时更新，显示上次已知值">旧</span> : null;
   const rate = (value: string | null) => <span className="numeric-value" title={value == null ? undefined : `${exact(value)}（原始比例）`}>{percentage(value)}</span>;

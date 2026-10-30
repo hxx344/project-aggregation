@@ -3,7 +3,7 @@ import { AppError } from './model.mjs';
 import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
-import { isBaseBlocked } from '../../../server/asset-identity.mjs';
+import { canonicalBase, isBaseBlocked } from '../../../server/asset-identity.mjs';
 import { bindPositionAction, positionKey, positionDirection, validatePositionLegs } from './position-actions.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
@@ -920,7 +920,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const openedAt = Number.isSafeInteger(createdAt) && createdAt > 0 && createdAt <= Math.min(sourceAt ?? at, at) ? createdAt : null;
     return { ...p, id: positionKey(p), exchange: exchangeOf(p.symbol), side: side || 'UNKNOWN', directionSource, quantity, baseQuantity: quantity,
       signedQuantity: side ? D(quantity).times(side === 'SHORT' ? -1 : 1).toString() : null,
-      baseCurrency: parts[2] || '', quoteCurrency: parts.slice(3).join('_'), entryPrice: p.avg_price ?? p.entry_price ?? null,
+      // baseCurrency keeps the native coin name; canonicalBase is the verified 1:1 identity used to pair legs.
+      baseCurrency: parts[2] || '', canonicalBase: parts[2] ? canonicalBase(exchangeOf(p.symbol), parts[2]) : '', quoteCurrency: parts.slice(3).join('_'), entryPrice: p.avg_price ?? p.entry_price ?? null,
       markPrice: p.mark_price ?? null, notional: numeric(p.position_value)?.abs().toString() ?? null, positionValue: p.position_value ?? null,
       unrealizedPnl: p.upnl ?? null, unrealizedPnlRate: p.upnl_rate ?? null, pnlCurrency: p.currency || parts.at(-1), margin: p.initial_margin ?? null,
       maintenanceMargin: p.maintenance_margin ?? null, leverage: p.leverage ?? null, maxLeverage: p.max_leverage ?? null, riskLimit: p.risk_limit ?? null,
