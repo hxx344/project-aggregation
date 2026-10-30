@@ -28,14 +28,20 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
   tickMs = 20000, retryMs = 60000, maxAttempts = 3 } = {}) {
   const directory = path.join(dataDir, 'feishu-digest');
   const configPath = path.join(directory, 'config.json'), channelPath = path.join(directory, 'channel.json'), statePath = path.join(directory, 'state.json');
-  let config = structuredClone(DIGEST_DEFAULTS), loadError = null, channelHost = null, channelError = null;
+  let config = structuredClone(DIGEST_DEFAULTS), loadError = null, stateError = null, channelHost = null, channelError = null;
   let lastSlot = 0, history = [], retry = null, sending = null, controller = null, timer = null, closed = false, epoch = 0, previewRead = null;
   const minuteNow = () => Math.floor(now() / 60000);
   const hostOf = url => new URL(url).hostname;
 
-  function persistState() {
-    try { atomicJson(statePath, { lastSlot, history }); }
-    catch (error) { log.warn({ err: error, type: 'feishu-digest' }, '飞书汇总状态写入失败'); }
+  function persistState(nextSlot = lastSlot) {
+    try {
+      atomicJson(statePath, { lastSlot: nextSlot, history }); stateError = null;
+      return true;
+    } catch (error) {
+      stateError = '发送状态无法保存，新的定时发送将等待存储恢复';
+      log.warn({ err: error, type: 'feishu-digest' }, '飞书汇总状态写入失败');
+      return false;
+    }
   }
   function record(entry) {
     // Quiet checks collapse into one row, so a frequent schedule cannot push failures out.
@@ -85,7 +91,10 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     if (closed || sending || !config.enabled || !channelHost) return;
     const slot = latestSlot(config.schedule, minuteNow(), GRACE_MINUTES);
     if (slot !== null && slot > lastSlot) {
-      lastSlot = slot; retry = null; persistState();
+      // Claim the slot on disk before consuming it in memory or making an external request.
+      // A failed write leaves the same slot eligible for a later tick inside the grace window.
+      if (!persistState(slot)) return;
+      lastSlot = slot; retry = null;
       void deliver('schedule', slot, 1);
     } else if (retry && now() >= retry.at) {
       const { slot: failed, attempt } = retry; retry = null;
@@ -96,7 +105,7 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     const minute = minuteNow();
     const next = config.enabled && channelHost ? nextSlot(config.schedule, minute) : null;
     return { schema: 1, config: structuredClone(config), channel: { configured: !!channelHost, host: channelHost, error: channelError }, sending: !!sending,
-      nextAt: next === null ? null : new Date(next * 60000).toISOString(), history: structuredClone(history), loadError, serverNow: now() };
+      nextAt: next === null ? null : new Date(next * 60000).toISOString(), history: structuredClone(history), loadError: loadError ?? stateError, serverNow: now() };
   }
   return {
     state,
@@ -116,9 +125,21 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
       if (next.enabled && !channelHost) throw new HttpError(409, '启用前请先保存飞书机器人 Webhook');
       // Saving must not deliver a slot that was already due before this schedule existed.
       const rescheduled = next.enabled && (!config.enabled || JSON.stringify(next.schedule) !== JSON.stringify(config.schedule));
-      if (rescheduled) { lastSlot = Math.max(lastSlot, minuteNow()); persistState(); }
+      const nextSlot = rescheduled ? Math.max(lastSlot, minuteNow()) : lastSlot;
+      if (rescheduled) {
+        if (!persistState(nextSlot)) throw new HttpError(503, '发送状态无法保存，发送计划未更改，请恢复存储后重试');
+      }
+      try { atomicJson(configPath, next); }
+      catch (error) {
+        // Nothing was sent between these synchronous writes. Restore the old schedule's
+        // claim if its replacement was not saved, so a failed edit cannot consume its slot.
+        const restored = !rescheduled || persistState(lastSlot);
+        if (!restored) stateError = '发送计划保存失败，原发送状态也未能恢复，请恢复存储后重新保存';
+        log.warn({ err: error, type: 'feishu-digest' }, '飞书汇总配置写入失败');
+        throw new HttpError(503, restored ? '汇总配置无法保存，发送计划未更改，请恢复存储后重试' : stateError);
+      }
+      lastSlot = nextSlot;
       if (rescheduled || !next.enabled) invalidate();
-      atomicJson(configPath, next);
       config = next; loadError = null;
       return state();
     },

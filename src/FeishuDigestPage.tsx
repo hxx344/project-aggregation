@@ -62,14 +62,15 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   busyRef.current = !!busy;
   const fail = useCallback((reason: unknown, show: (text: string) => void) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else show(message(reason)); }, [onExpired]);
   // An unsaved draft stays; polling refreshes only the send records and channel state.
-  const accept = useCallback((data: DigestSnapshot, replace: boolean) => {
+  const accept = useCallback((data: DigestSnapshot, replace?: boolean) => {
     setSnapshot(data); setLoadError('');
-    if (replace || !dirtyRef.current) { setDraft(data.config); setTimesText(data.config.schedule.times.join(', ')); }
+    if (replace ?? !dirtyRef.current) { setDraft(data.config); setTimesText(data.config.schedule.times.join(', ')); }
   }, []);
   const read = useCallback(async () => {
-    const signal = lifetime.current?.signal, version = ++generation.current;
-    if (!signal) return;
-    try { const data = await api<DigestSnapshot>(ROOT, { signal, timeoutMs: 10_000 }); if (!signal.aborted && version === generation.current) accept(data, false); }
+    const signal = lifetime.current?.signal;
+    if (!signal || signal.aborted || busyRef.current) return;
+    const version = ++generation.current;
+    try { const data = await api<DigestSnapshot>(ROOT, { signal, timeoutMs: 10_000 }); if (!signal.aborted && version === generation.current) accept(data); }
     catch (reason) { if (!signal.aborted && version === generation.current) fail(reason, setLoadError); }
   }, [accept, fail]);
   useEffect(() => {
@@ -93,9 +94,12 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     const timer = setTimeout(() => void loadPreview(draft), 400);
     return () => clearTimeout(timer);
   }, [draft, loadPreview]);
-  const execute = async (name: string, path: string, method: string, body: unknown, done: string, replace: () => boolean = () => false) => {
+  const execute = async (name: string, path: string, method: string, body: unknown, done: string, replace: () => boolean | undefined = () => undefined) => {
     const signal = lifetime.current?.signal;
-    if (!signal || busy) return null;
+    if (!signal || signal.aborted || busyRef.current) return null;
+    busyRef.current = true;
+    // A GET started before this write must not replace its confirmed snapshot or clean draft.
+    generation.current++;
     setBusy(name); setActionError(''); setNotice('');
     try {
       const data = await api<DigestSnapshot>(ROOT + path, { method, body: JSON.stringify(body), signal, timeoutMs: 30_000 });
@@ -103,7 +107,7 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
       accept(data, replace()); setNotice(done);
       return data;
     } catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
-    finally { if (!signal.aborted) setBusy(''); }
+    finally { busyRef.current = false; if (!signal.aborted) setBusy(''); }
   };
   const change = (next: Partial<DigestConfig>) => setDraft(current => current && { ...current, ...next });
   const changeSchedule = (next: Partial<DigestConfig['schedule']>) => setDraft(current => current && { ...current, schedule: { ...current.schedule, ...next } });

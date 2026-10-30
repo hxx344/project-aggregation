@@ -114,10 +114,14 @@ export function aeroSection(state, now) {
   const late = state.state === 'running' && !state.paused && asOf !== null && now - asOf > limit;
   const issues = [...(state.error ? [state.error] : []), ...(late ? ['最近一轮检查已过期'] : [])];
   const level = state.state === 'fault' ? 'alert' : issues.length ? 'warn' : state.state === 'running' && !state.paused ? 'ok' : 'notice';
+  const total = rewards?.dailyTotal;
+  const daily = amount(total?.perDay);
+  const dailyBasis = total?.scenario === 'same-lower' ? '（同下沿估计，假设其他活跃流动性不变）'
+    : ['different-lower', 'mixed-ranges'].includes(total?.reason) ? '（逐仓独立估计，不合计）' : '';
   return section(id, name, level, status, { asOf, issues, metrics: [
     metric('price', '现价', cycle ? `${amount(cycle.price)} ${quote}`.trim() : MISSING), metric('range', '头寸位置', position ? RANGE[position.state] ?? MISSING : '暂无头寸'),
     metric('value', '头寸价值', typeof position?.value === 'number' ? `${amount(position.value)} ${quote}`.trim() : MISSING), metric('apr', 'AERO 年化', percent(position?.apr)),
-    metric('aeroPerDay', '预估每日 AERO', amount(position?.aeroPerDay)), metric('feeApr', '手续费年化（不质押）', percent(position?.feeApr)),
+    metric('aeroPerDay', '预估每日 AERO', `${daily}${dailyBasis}`), metric('feeApr', '手续费年化（不质押）', percent(position?.feeApr)),
     metric('pending', '待领取 AERO', amount(rewards?.pending)), metric('reward', '累计领取 AERO', amount(state.ledger?.reward)), metric('gas', '累计 Gas', state.ledger ? `${amount(state.ledger.gasEth)} ETH` : MISSING)] });
 }
 
