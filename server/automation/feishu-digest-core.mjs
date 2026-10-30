@@ -68,11 +68,15 @@ export function localClock(ms, timezone) {
   const time = `${parts.hour}:${parts.minute}`;
   return { weekday: WEEKDAYS[parts.weekday], time, minuteOfDay: Number(parts.hour) * 60 + Number(parts.minute), label: `${parts.month}-${parts.day} ${time}` };
 }
+// When clocks go back a local time happens twice; shifts are 30 or 60 minutes in every current zone.
+const repeated = (minute, timezone, label) => [30, 60].some(shift => localClock((minute - shift) * 60000, timezone).label === label);
 // A slot is a minute since the epoch; matching on local clock parts keeps it right across DST.
+// A repeated local time counts once, and one skipped by the spring change has no slot that day.
 function isDue(plan, minute) {
   const clock = localClock(minute * 60000, plan.timezone);
   if (!plan.weekdays.includes(clock.weekday)) return false;
-  return plan.mode === 'times' ? plan.times.includes(clock.time) : clock.minuteOfDay % plan.intervalMinutes === 0;
+  const matches = plan.mode === 'times' ? plan.times.includes(clock.time) : clock.minuteOfDay % plan.intervalMinutes === 0;
+  return matches && !repeated(minute, plan.timezone, clock.label);
 }
 export function latestSlot(plan, minute, graceMinutes) {
   for (let slot = minute; slot > minute - graceMinutes; slot--) if (isDue(plan, slot)) return slot;

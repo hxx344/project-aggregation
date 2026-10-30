@@ -5,7 +5,7 @@ export type DigestConfig = { enabled: boolean; title: string; onlyOnAttention: b
 export type DigestHistoryEntry = { at: string; kind: 'schedule' | 'manual'; status: 'sent' | 'skipped' | 'failed' | 'uncertain'; attention: number; error: string | null };
 export type DigestSnapshot = {
   schema: 1; config: DigestConfig; channel: { configured: boolean; host: string | null; error: string | null }; sending: boolean;
-  nextAt: string | null; history: DigestHistoryEntry[]; loadError: string | null; serverNow: number; result?: DigestHistoryEntry;
+  nextAt: string | null; history: DigestHistoryEntry[]; loadError: string | null; serverNow: number; result?: DigestHistoryEntry | null;
 };
 export type DigestLevel = 'ok' | 'notice' | 'idle' | 'warn' | 'alert';
 export type DigestMetric = { key: string; label: string; text: string; lines?: string[] };

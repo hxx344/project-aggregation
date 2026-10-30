@@ -1,8 +1,8 @@
 // Turns each module's existing read model into one digest section:
 // { id, name, level, status, asOf, metrics: [{ key, label, text, lines? }], issues }.
 // level: ok / notice / idle stay out of "needs attention"; warn / alert enter it.
-// Sections only read published state: no exchange call starts here, a missing
-// value stays '—' and never becomes 0.
+// Sections go through each module's own read path and its cache, never place
+// or change anything; a missing value stays '—' and never becomes 0.
 const ATTENTION_DELAY_MS = 120_000;
 const MISSING = '—';
 const ISSUE_LIMIT = 6;
@@ -20,7 +20,9 @@ const amount = (value, unit = '') => { const number = numeric(value); return num
 const percent = value => { const number = numeric(value); return number === null ? MISSING : `${digits(number * 100)}%`; };
 const metric = (key, label, text) => ({ key, label, text });
 const rows = (key, label, lines, total = lines.length) => ({ key, label, text: total ? `${total} 项` : '无', lines: total > lines.length ? [...lines, `其余 ${total - lines.length} 项请到工作台查看`] : lines });
-const section = (id, name, level, status, { asOf = null, metrics = [], issues = [] } = {}) => ({ id, name: clean(name, 60), level, status: clean(status, 40), asOf, metrics, issues: issues.slice(0, ISSUE_LIMIT).map(issue => clean(issue)) });
+// Upstream error text can quote a request URL, and a group chat is a wider audience than the workbench.
+const redacted = text => String(text).replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, '[地址已隐藏]');
+const section = (id, name, level, status, { asOf = null, metrics = [], issues = [] } = {}) => ({ id, name: clean(name, 60), level, status: clean(status, 40), asOf, metrics, issues: issues.slice(0, ISSUE_LIMIT).map(issue => clean(redacted(issue))) });
 
 function metricText({ value, unit }) {
   if (value === null || value === undefined) return MISSING;
@@ -32,7 +34,7 @@ const PROJECT_STATES = { online: '正常', partial: '部分异常', stale: '数�
 export function projectSection(snapshot, now) {
   const { project, state, diagnostics } = snapshot, id = `project:${project.id}`, status = PROJECT_STATES[state] ?? state;
   if (state === 'disabled' || state === 'unconfigured') return section(id, project.name, 'idle', status);
-  const raw = diagnostics ?? (state === 'online' ? [] : [{ id: 'hub:legacy-health', kind: state === 'unauthorized' ? 'action' : 'fault', message: snapshot.message, firstSeenAt: '' }]);
+  const raw = diagnostics ?? (state === 'online' ? [] : [{ id: 'hub:legacy-health', kind: state === 'unauthorized' ? 'action' : 'fault', message: snapshot.message || '项目状态异常，请进入项目查看', firstSeenAt: '' }]);
   const actions = raw.filter(issue => issue.kind === 'action');
   const faults = raw.filter(issue => issue.kind === 'fault' && (diagnostics === undefined || now - Date.parse(issue.firstSeenAt) >= ATTENTION_DELAY_MS));
   const level = actions.length || (faults.length && ['offline', 'unauthorized'].includes(state)) ? 'alert' : faults.length ? 'warn' : state === 'online' ? 'ok' : 'notice';
@@ -54,7 +56,7 @@ export function positionsSection(data) {
       const fetched = stamp(scope.fetchedAt);
       if (['live', 'stale'].includes(scope.status) && fetched !== null) oldest = oldest === null ? fetched : Math.min(oldest, fetched);
       for (const position of scope.positions) {
-        const unrealized = numeric(position.unrealizedPnl), cycle = numeric(position.cycle?.net);
+        const unrealized = numeric(position.unrealizedPnl), cycle = position.cycle?.status === 'complete' ? numeric(position.cycle.net) : null;
         if (unrealized === null || !position.pnlCurrency) pnlMissing++; else add(pnl, position.pnlCurrency, unrealized);
         if (cycle === null || !position.cycle?.currency) netMissing++; else add(net, position.cycle.currency, cycle);
         items.push({ size: Math.abs(numeric(position.notional) ?? 0), line: `${exchange.name} ${position.symbol} ${position.side === 'long' ? '多' : '空'} ${amount(position.quantity)}${position.quantityUnit ? ` ${position.quantityUnit}` : ''} · 浮动 ${signed(position.unrealizedPnl)}${position.pnlCurrency ? ` ${position.pnlCurrency}` : ''}` });
@@ -77,7 +79,7 @@ export function fundingSection(state) {
     if (account.funding.state !== 'live') issues.push(`${account.name} 资金费：${account.funding.error || '数据过期'}`);
   }
   const latest = state.pnl?.latest ?? null, currency = state.funding.currency ?? 'USDT';
-  return section(id, name, issues.length ? 'warn' : 'ok', issues.length ? '部分来源异常' : '正常', { asOf: stamp(latest?.time), issues, metrics: [
+  return section(id, name, issues.length ? 'warn' : 'ok', issues.length ? '部分来源异常' : '正常', { asOf: state.pnl?.status === 'incomplete' ? null : stamp(latest?.time), issues, metrics: [
     metric('funding7d', '近 7 天资金费净额', `${signed(state.funding.net)} ${currency}${state.funding.complete ? '' : '（不完整）'}`),
     metric('unrealized', '未实现盈亏', `${signed(latest?.unrealizedPnl)} ${currency}`), metric('total', '累计盈亏', `${signed(latest?.totalPnl)} ${currency}`)] });
 }
@@ -90,8 +92,9 @@ export function executionSection(state) {
   if (!connected && !active.length) return section(id, name, 'idle', '未连接账户');
   const label = job => `${MARKETS[job.market] ?? job.market} ${job.action} · ${JOB_STATUS[job.status] ?? job.status} · 批次 ${job.batchIndex}/${job.batchCount}`;
   const stuck = active.filter(job => ['attention', 'paused'].includes(job.status));
+  const fetched = state.positions.map(position => stamp(position.fetchedAt)).filter(value => value !== null);
   return section(id, name, active.some(job => job.status === 'attention') ? 'alert' : stuck.length ? 'warn' : 'ok', stuck.length ? '任务需要关注' : active.length ? '任务运行中' : '正常', {
-    asOf: stamp(state.generatedAt), issues: stuck.map(job => `${label(job)}${job.reason ? `：${job.reason}` : ''}`), metrics: [
+    asOf: fetched.length ? Math.min(...fetched) : null, issues: stuck.map(job => `${label(job)}${job.reason ? `：${job.reason}` : ''}`), metrics: [
       metric('accounts', '已连接账户', `${connected} / ${state.connections.length}`), metric('positions', '账户持仓', `${state.positions.length} 笔`),
       rows('jobs', '进行中任务', active.slice(0, ROW_LIMIT).map(label), active.length)] });
 }

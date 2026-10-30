@@ -8,6 +8,8 @@ const FILE_LIMIT = 256 * 1024;
 const HISTORY_LIMIT = 20;
 // A restart inside this window still delivers the slot it missed.
 const GRACE_MINUTES = 15;
+// Typing in the form previews every 400 ms; one read serves them until this expires or fails.
+const PREVIEW_CACHE_MS = 15000;
 
 function readBounded(file) {
   if (!existsSync(file)) return null;
@@ -27,7 +29,7 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
   const directory = path.join(dataDir, 'feishu-digest');
   const configPath = path.join(directory, 'config.json'), channelPath = path.join(directory, 'channel.json'), statePath = path.join(directory, 'state.json');
   let config = structuredClone(DIGEST_DEFAULTS), loadError = null, channelHost = null, channelError = null;
-  let lastSlot = 0, history = [], retry = null, sending = null, controller = null, timer = null, closed = false;
+  let lastSlot = 0, history = [], retry = null, sending = null, controller = null, timer = null, closed = false, epoch = 0, previewRead = null;
   const minuteNow = () => Math.floor(now() / 60000);
   const hostOf = url => new URL(url).hostname;
 
@@ -36,7 +38,8 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     catch (error) { log.warn({ err: error, type: 'feishu-digest' }, '飞书汇总状态写入失败'); }
   }
   function record(entry) {
-    history = [entry, ...history].slice(0, HISTORY_LIMIT); persistState();
+    // Quiet checks collapse into one row, so a frequent schedule cannot push failures out.
+    history = [entry, ...(entry.status === 'skipped' && history[0]?.status === 'skipped' ? history.slice(1) : history)].slice(0, HISTORY_LIMIT); persistState();
     if (entry.status === 'failed' || entry.status === 'uncertain') log.warn({ status: entry.status, kind: entry.kind, error: entry.error, type: 'feishu-digest' }, '飞书汇总发送失败');
   }
   function readChannel() {
@@ -44,20 +47,34 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     if (!saved) throw new HttpError(409, '请先保存飞书机器人 Webhook');
     return decrypt(saved.value);
   }
+  // A send already under way must not bring back a retry the user has cancelled.
+  function invalidate() { epoch++; retry = null; }
+  function previewSections() {
+    if (!previewRead || now() - previewRead.at >= PREVIEW_CACHE_MS) {
+      const read = { at: now(), items: readSections() };
+      previewRead = read;
+      read.items.catch(() => { if (previewRead === read) previewRead = null; });
+    }
+    return previewRead.items;
+  }
   function deliver(kind, slot, attempt) {
-    const started = now(), current = config;
+    const started = now(), current = config, run = epoch;
     const active = new AbortController(); controller = active;
+    const stopped = new Promise(resolve => active.signal.addEventListener('abort', () => resolve(null), { once: true }));
     sending = (async () => {
       const entry = { at: new Date(started).toISOString(), kind, status: 'sent', attention: 0, error: null };
       try {
-        const digest = buildDigest(await readSections(), current, now());
+        const items = await Promise.race([readSections(), stopped]);
+        // Cleared or shutting down before anything went out: there is nothing to record.
+        if (active.signal.aborted) return null;
+        const digest = buildDigest(items, current, now());
         entry.attention = digest.attention.length;
         if (kind === 'schedule' && current.onlyOnAttention && !entry.attention) entry.status = 'skipped';
         else await postCard(readChannel(), renderCard(digest, current).card, { fetcher, now: now(), signal: active.signal });
       } catch (error) {
         entry.status = error.uncertain ? 'uncertain' : 'failed';
         entry.error = error.message;
-        if (kind === 'schedule' && !error.uncertain && attempt < maxAttempts) retry = { slot, attempt: attempt + 1, at: now() + retryMs };
+        if (kind === 'schedule' && !error.uncertain && attempt < maxAttempts && run === epoch) retry = { slot, attempt: attempt + 1, at: now() + retryMs };
       }
       record(entry);
       return entry;
@@ -98,8 +115,9 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
       const next = checked(validateDigestConfig, value);
       if (next.enabled && !channelHost) throw new HttpError(409, '启用前请先保存飞书机器人 Webhook');
       // Saving must not deliver a slot that was already due before this schedule existed.
-      if (next.enabled && (!config.enabled || JSON.stringify(next.schedule) !== JSON.stringify(config.schedule))) { lastSlot = Math.max(lastSlot, minuteNow()); persistState(); }
-      if (!next.enabled) retry = null;
+      const rescheduled = next.enabled && (!config.enabled || JSON.stringify(next.schedule) !== JSON.stringify(config.schedule));
+      if (rescheduled) { lastSlot = Math.max(lastSlot, minuteNow()); persistState(); }
+      if (rescheduled || !next.enabled) invalidate();
       atomicJson(configPath, next);
       config = next; loadError = null;
       return state();
@@ -112,11 +130,12 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     },
     clearChannel() {
       if (config.enabled) { const next = { ...config, enabled: false }; atomicJson(configPath, next); config = next; }
-      retry = null; rmSync(channelPath, { force: true }); channelHost = null; channelError = null;
+      invalidate(); controller?.abort();
+      rmSync(channelPath, { force: true }); channelHost = null; channelError = null;
       return state();
     },
     async preview(value) {
-      const next = checked(validateDigestConfig, value), items = await readSections();
+      const next = checked(validateDigestConfig, value), items = await previewSections();
       const digest = buildDigest(items, next, now()), { bytes, omitted } = renderCard(digest, next);
       return { digest, bytes, omitted, catalog: items.map(({ id, name, level, status, metrics }) => ({ id, name, level, status, metrics: metrics.map(({ key, label }) => ({ key, label })) })) };
     },

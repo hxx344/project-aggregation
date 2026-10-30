@@ -64,6 +64,14 @@ test('slots follow the configured timezone, weekdays and interval', () => {
   // 2026-11-01 repeats 01:00 in New York; the fall-back day is 25 hours long and keeps local 09:00.
   const ny = { ...plan, timezone: 'America/New_York' };
   assert.equal(localClock(nextSlot(ny, Date.parse('2026-11-01T05:00:00Z') / 60000) * 60000, ny.timezone).time, '09:00');
+  const at = iso => Date.parse(iso) / 60000, night = { ...ny, times: ['01:30'] };
+  assert.equal(latestSlot(night, at('2026-11-01T05:30:00Z'), 15), at('2026-11-01T05:30:00Z'));
+  assert.equal(latestSlot(night, at('2026-11-01T06:30:00Z'), 15), null, 'the repeated 01:30 does not fire again');
+  const hourly = { ...ny, mode: 'interval', intervalMinutes: 60 };
+  assert.equal(latestSlot(hourly, at('2026-11-01T05:00:00Z'), 1), at('2026-11-01T05:00:00Z'));
+  assert.equal(latestSlot(hourly, at('2026-11-01T06:00:00Z'), 1), null);
+  assert.equal(latestSlot(hourly, at('2026-11-01T07:00:00Z'), 1), at('2026-11-01T07:00:00Z'));
+  assert.equal(nextSlot({ ...ny, times: ['02:30'] }, at('2027-03-14T05:00:00Z')), at('2027-03-15T06:30:00Z'), 'a skipped local time has no slot that day');
 });
 
 test('the digest honours section and metric choices and reports the worst level', () => {
@@ -181,6 +189,58 @@ test('a definite refusal retries a bounded number of times; an uncertain send ne
   await unknown.digest.close();
 });
 
+test('a retry from a send that was under way does not survive disabling or clearing', async () => {
+  let release;
+  const reads = [], refused = [];
+  const hold = () => new Promise(resolve => { release = () => resolve([section('hub:a')]); });
+  const { digest, clock } = manager({ at: AT_NINE - 60000, manager: { readSections: () => { reads.push(1); return hold(); }, fetcher: async (url, init) => { refused.push(init); return { ok: true, status: 200, json: async () => ({ code: 11232 }) }; } } });
+  enable(digest);
+  clock.now = AT_NINE; digest.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  digest.save(defaults({ enabled: false }));
+  release(); await settled(digest);
+  assert.equal(refused.length, 1);
+  assert.equal(digest.state().history[0].status, 'failed');
+  clock.now = AT_NINE + 120000;
+  digest.save(defaults({ enabled: true, schedule: { ...DIGEST_DEFAULTS.schedule, times: ['23:00'] } }));
+  clock.now += 120000; digest.tick(); await settled(digest);
+  assert.equal(refused.length, 1, 'the cancelled slot is not retried after enabling again');
+  await digest.close();
+});
+
+test('clearing the webhook or closing while reading sends nothing and records nothing', async () => {
+  const posted = [];
+  const hanging = () => new Promise(() => {});
+  const first = manager({ at: AT_NINE - 60000, manager: { readSections: hanging, fetcher: async (url, init) => { posted.push(init); return { ok: true, status: 200, json: async () => ({ code: 0 }) }; } } });
+  enable(first.digest);
+  first.clock.now = AT_NINE; first.digest.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  first.digest.clearChannel();
+  await settled(first.digest);
+  assert.equal(posted.length, 0);
+  assert.deepEqual(first.digest.state().history, []);
+  await first.digest.close();
+  const second = manager({ at: AT_NINE - 60000, manager: { readSections: hanging } });
+  enable(second.digest);
+  second.clock.now = AT_NINE; second.digest.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  await second.digest.close();
+  assert.deepEqual(second.digest.state().history, []);
+});
+
+test('previews share one read until it expires, and a failed read is not kept', async () => {
+  let reads = 0, broken = false;
+  const { digest, clock } = manager({ manager: { readSections: async () => { reads++; if (broken) throw new Error('down'); return [section('hub:a')]; } } });
+  await digest.preview(defaults()); await digest.preview(defaults({ title: '另一个' }));
+  assert.equal(reads, 1);
+  clock.now += 15000; broken = true;
+  await assert.rejects(digest.preview(defaults()));
+  broken = false;
+  await digest.preview(defaults());
+  assert.equal(reads, 3);
+  await digest.close();
+});
+
 test('attention-only mode skips a quiet digest but not one with a problem or a manual send', async () => {
   let level = 'ok';
   const { digest, clock, calls } = manager({ at: AT_NINE - 60000, manager: { readSections: async () => [section('hub:a', level)] } });
@@ -189,9 +249,13 @@ test('attention-only mode skips a quiet digest but not one with a problem or a m
   clock.now = AT_NINE; digest.tick(); await settled(digest);
   assert.equal(calls.length, 0);
   assert.equal(digest.state().history[0].status, 'skipped');
+  clock.now = AT_NINE + 60000 * 5; digest.save(defaults({ enabled: true, onlyOnAttention: true, schedule: { ...DIGEST_DEFAULTS.schedule, times: ['09:00', '09:05', '09:06'] } }));
+  clock.now += 60000; digest.tick(); await settled(digest);
+  assert.equal(digest.state().history.length, 1, 'consecutive skips collapse so failures stay visible');
+  clock.now = AT_NINE;
   assert.equal((await digest.send()).result.status, 'sent');
   assert.equal(calls.length, 1);
-  level = 'alert'; clock.now = AT_NINE + 5 * 60000; digest.tick(); await settled(digest);
+  level = 'alert'; digest.save(defaults({ enabled: true, onlyOnAttention: true, schedule: { ...DIGEST_DEFAULTS.schedule, times: ['09:20'] } })); clock.now = AT_NINE + 20 * 60000; digest.tick(); await settled(digest);
   assert.equal(calls.length, 2);
   await digest.close();
 });
@@ -250,9 +314,10 @@ test('a project section keeps units and missing values and follows the overview 
   assert.equal(projectSection(project({ state: 'partial', diagnostics: [{ id: 'x', kind: 'notice', message: '提示', firstSeenAt: '' }] }), AT_NINE).level, 'notice');
   assert.equal(projectSection(project({ state: 'unauthorized', diagnostics: [{ id: 'hub:auth', kind: 'action', message: '请重新登录', firstSeenAt: '' }] }), AT_NINE).level, 'alert');
   assert.equal(projectSection(project({ state: 'disabled' }), AT_NINE).level, 'idle');
+  assert.deepEqual(projectSection(project({ state: 'offline', diagnostics: undefined, message: undefined }), AT_NINE).issues, ['项目状态异常，请进入项目查看']);
 });
 
-const position = (extra = {}) => ({ symbol: 'CLUSDT', side: 'long', quantity: '10', quantityUnit: '桶', notional: '700', unrealizedPnl: '3.2', pnlCurrency: 'USDT', cycle: { net: '-1.5', currency: 'USDT' }, ...extra });
+const position = (extra = {}) => ({ symbol: 'CLUSDT', side: 'long', quantity: '10', quantityUnit: '桶', notional: '700', unrealizedPnl: '3.2', pnlCurrency: 'USDT', cycle: { status: 'complete', net: '-1.5', currency: 'USDT' }, ...extra });
 const positions = (scopes, extra = {}) => ({ sources: [{ name: 'Asset', error: null, data: { exchanges: [{ name: 'Binance', accounts: [{ scopes }] }] }, ...extra }] });
 test('position totals stay per currency and say when they are incomplete', () => {
   const full = positionsSection(positions([{ label: 'U 本位', status: 'live', fetchedAt: new Date(AT_NINE).toISOString(), positions: [position(), position({ symbol: 'BZUSDT', side: 'short', notional: '900', unrealizedPnl: '-1', pnlCurrency: 'USDC', cycle: null })] }]));
@@ -262,12 +327,16 @@ test('position totals stay per currency and say when they are incomplete', () =>
   assert.equal(value('cycleNet').text, '-1.5 USDT（1 笔未计入）');
   assert.match(value('positions').lines[0], /^Binance BZUSDT 空/);
   const broken = positionsSection(positions([{ label: 'U 本位', status: 'error', fetchedAt: null, error: '接口失败', positions: [position()] }]));
+  const quoted = positionsSection(positions([{ label: 'U 本位', status: 'error', fetchedAt: null, error: '请求失败 https://rpc.example/v2/key-123?token=abc 超时', positions: [] }]));
+  assert.deepEqual(quoted.issues, ['Binance U 本位：请求失败 [地址已隐藏] 超时']);
   assert.equal(broken.level, 'warn');
   assert.deepEqual(broken.issues, ['Binance U 本位：接口失败']);
   assert.match(broken.metrics[0].text, /来源不完整/);
   const missing = positionsSection(positions([{ label: 'U 本位', status: 'live', fetchedAt: null, positions: [position({ unrealizedPnl: null })] }]));
   assert.equal(missing.metrics.find(item => item.key === 'pnl').text, '—');
   assert.equal(positionsSection({ sources: [] }).level, 'idle');
+  const partial = positionsSection(positions([{ label: 'U 本位', status: 'live', fetchedAt: null, positions: [position({ cycle: { status: 'partial', net: '9', currency: 'USDT' } })] }]));
+  assert.equal(partial.metrics.find(item => item.key === 'cycleNet').text, '—', 'a partial cycle is not a total');
   // A source nobody set up is not a fault; the Asset project section already says so.
   assert.equal(positionsSection({ sources: [{ name: 'Asset', status: 'unconfigured', error: '请保存地址', data: null }] }).level, 'idle');
   const many = positionsSection(positions([{ label: 'U', status: 'live', fetchedAt: null, positions: Array.from({ length: 15 }, (_, index) => position({ symbol: `S${index}` })) }]));
@@ -280,6 +349,8 @@ test('funding, execution, Aero and research sections show their own state', () =
   const funding = (extra = {}) => ({ strategy: { name: '原油四腿资金费套利' }, exchanges: ['binance', 'bybit'], accounts: [account, { ...account, exchange: 'bybit', name: 'Bybit' }], funding: { complete: true, net: '12.5', currency: 'USDT' }, pnl: { latest: { time: AT_NINE, unrealizedPnl: null, totalPnl: '30' } }, ...extra });
   const ok = fundingSection(funding());
   assert.deepEqual(ok.metrics.map(item => item.text), ['+12.5 USDT', '— USDT', '+30 USDT']);
+  assert.equal(ok.asOf, AT_NINE);
+  assert.equal(fundingSection(funding({ pnl: { status: 'incomplete', latest: { time: AT_NINE, unrealizedPnl: null, totalPnl: null } } })).asOf, null, 'an expired curve must not look fresh');
   assert.equal(fundingSection(funding({ accounts: [{ ...account, connected: false }] })).level, 'idle');
   assert.equal(fundingSection(funding({ accounts: [account, { ...account, exchange: 'bybit', name: 'Bybit', positions: { state: 'stale', error: null } }], funding: { complete: false, net: null } })).level, 'warn');
 
@@ -287,6 +358,8 @@ test('funding, execution, Aero and research sections show their own state', () =
   const execution = jobs => ({ generatedAt: new Date(AT_NINE).toISOString(), connections: [{ connected: true }, { connected: false }], positions: [{}], jobs });
   assert.equal(executionSection({ ...execution([]), connections: [{ connected: false }] }).level, 'idle');
   assert.equal(executionSection(execution([job('completed')])).level, 'ok');
+  assert.equal(executionSection(execution([])).asOf, null);
+  assert.equal(executionSection({ ...execution([]), positions: [{ fetchedAt: new Date(AT_NINE - 9000).toISOString() }, { fetchedAt: new Date(AT_NINE).toISOString() }] }).asOf, AT_NINE - 9000);
   assert.equal(executionSection(execution([job('running')])).status, '任务运行中');
   assert.equal(executionSection(execution([job('paused')])).level, 'warn');
   const attention = executionSection(execution([job('attention', '委托待核对')]));

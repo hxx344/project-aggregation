@@ -41,6 +41,8 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   const dirty = !!snapshot && !!draft && JSON.stringify(draft) !== JSON.stringify(snapshot.config);
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   const busyRef = useRef(false);
   busyRef.current = !!busy;
   const fail = useCallback((reason: unknown, show: (text: string) => void) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else show(message(reason)); }, [onExpired]);
@@ -76,14 +78,14 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     const timer = setTimeout(() => void loadPreview(draft), 400);
     return () => clearTimeout(timer);
   }, [draft, loadPreview]);
-  const execute = async (name: string, path: string, method: string, body: unknown, done: string, replace = false) => {
+  const execute = async (name: string, path: string, method: string, body: unknown, done: string, replace: () => boolean = () => false) => {
     const signal = lifetime.current?.signal;
     if (!signal || busy) return null;
     setBusy(name); setActionError(''); setNotice('');
     try {
       const data = await api<DigestSnapshot>(ROOT + path, { method, body: JSON.stringify(body), signal, timeoutMs: 30_000 });
       if (signal.aborted) return null;
-      accept(data, replace); setNotice(done);
+      accept(data, replace()); setNotice(done);
       return data;
     } catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { if (!signal.aborted) setBusy(''); }
@@ -91,6 +93,12 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   const change = (next: Partial<DigestConfig>) => setDraft(current => current && { ...current, ...next });
   const changeSchedule = (next: Partial<DigestConfig['schedule']>) => setDraft(current => current && { ...current, schedule: { ...current.schedule, ...next } });
   const changeSection = (id: string, next: Partial<{ enabled: boolean; hidden: string[] }>) => setDraft(current => current && { ...current, sections: { ...current.sections, [id]: { ...(current.sections[id] ?? { enabled: true, hidden: [] }), ...next } } });
+  const save = async () => {
+    if (!draft) return;
+    // Edits made while the save is in flight stay in the form as unsaved changes.
+    const submitted = JSON.stringify(draft);
+    await execute('save', '/config', 'PUT', { config: draft }, '设置已保存', () => JSON.stringify(draftRef.current) === submitted);
+  };
   const saveChannel = async (event: FormEvent) => {
     event.preventDefault();
     const saved = await execute('channel', '/channel', 'PUT', { webhookUrl, signingSecret }, '机器人已保存');
@@ -105,7 +113,7 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   const heading = <header className="lp-heading"><div><h1>飞书汇总</h1><p>由工作台服务器定时发送，不需要打开页面；只读取各模块已有状态，不下单、不改设置</p></div><div className="lp-toolbar">
     <button className="button secondary" disabled={!!busy} onClick={() => { void read(); if (draft) void loadPreview(draft); }}><RefreshCw size={15} className={previewing ? 'spin' : ''} />刷新</button>
     <button className="button secondary" disabled={!snapshot?.channel.configured || dirty || !!busy} title={dirty ? '请先保存设置' : !snapshot?.channel.configured ? '请先保存机器人' : undefined} onClick={() => void send()}>{busy === 'send' ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}立即发送</button>
-    <button className="button primary" disabled={!dirty || !!busy} onClick={() => { if (draft) void execute('save', '/config', 'PUT', { config: draft }, '设置已保存', true); }}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
+    <button className="button primary" disabled={!dirty || !!busy} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
   </div></header>;
   return <div className="lp-page">
     {heading}
