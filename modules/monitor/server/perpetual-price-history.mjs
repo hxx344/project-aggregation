@@ -1,4 +1,5 @@
 import { createPerpetualPriceReader } from './perpetual-price-reader.mjs';
+import { validPerpetualChartSelection } from '../lib/perpetual-chart-state.ts';
 import { perpetualPriceIdentity, validatePerpetualPriceHistory, PRICE_HOUR_MS as HOUR, PRICE_HISTORY_LOOKBACK_MS as LOOKBACK } from '../lib/perpetual-price-history.ts';
 
 const keyOf = market => `${market.exchange}:${market.symbol}`;
@@ -112,7 +113,9 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
     collect,
     read(input) {
       const pair = input?.pair;
-      if (!pair || ![3, 7, 30].includes(input.days) || typeof pair.base !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(pair.base) || typeof pair.longKey !== 'string' || typeof pair.shortKey !== 'string' || pair.longKey.length > 160 || pair.shortKey.length > 160 || pair.longKey === pair.shortKey) throw invalid();
+      // Same grammar as the chart URL, so a directory-accepted Unicode code
+      // can be shared and reloaded; directory identity is checked below.
+      if (!pair || typeof pair !== 'object' || !validPerpetualChartSelection({ base: pair.base, longKey: pair.longKey, shortKey: pair.shortKey, days: input.days })) throw invalid();
       const quotes = new Map(getSnapshot().quotes.map(quote => [keyOf(quote), quote])), requested = new Map();
       // Both current quotes and the current directory must agree. A persisted
       // quote alone is never permission to fetch an arbitrary contract.

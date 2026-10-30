@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createPerpetualPriceReader, normalizePerpetualPriceCandles } from '../server/perpetual-price-reader.mjs';
 
 const HOUR = 3_600_000, NOW = Date.UTC(2026, 9, 11, 12), RANGE = { from: NOW - 720 * HOUR, to: NOW };
-const market = (exchange, extra = {}) => ({ exchange, symbol: exchange === 'gate' ? 'BTC_USDT' : exchange === 'okx' ? 'BTC-USDT-SWAP' : exchange === 'hyperliquid' ? 'BTC' : exchange === 'entropy' ? 'io:BTC' : 'BTCUSDT', base: 'BTC', quoteCurrency: ['hyperliquid', 'entropy'].includes(exchange) ? 'USDC' : 'USDT', multiplier: 1, ...extra });
+const market = (exchange, extra = {}) => ({ exchange, symbol: exchange === 'gate' ? 'BTC_USDT' : exchange === 'okx' ? 'BTC-USDT-SWAP' : exchange === 'hyperliquid' ? 'BTC' : exchange === 'entropy' ? 'io:BTC' : 'BTCUSDT', base: 'BTC', quoteCurrency: exchange === 'entropy' ? 'USDC' : 'USDT', ...(exchange === 'hyperliquid' ? { settlementCurrency: 'USDC' } : {}), multiplier: 1, ...extra });
 const arrayRow = (open, close = '123') => [open, '123', '124', '122', close, '10', open + HOUR - 1, '1230', '1'];
 function fixture(exchange) {
   const contract = market(exchange), urls = [], body = [];

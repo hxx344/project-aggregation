@@ -1,4 +1,5 @@
 import { PRICE_HOUR_MS as HOUR } from '../lib/perpetual-price-history.ts';
+import { perpetualContractSymbolPattern } from '../lib/perpetual-chart-state.ts';
 
 const SUPPORTED = new Set(['binance', 'aster', 'bybit', 'gate', 'okx', 'bitget', 'hyperliquid', 'entropy']);
 const MAX_CHUNK = 168 * HOUR;
@@ -17,11 +18,19 @@ const timestamp = input => {
   return value;
 };
 function validateMarket(market) {
-  if (!market || !/^[a-z][a-z0-9-]{0,39}$/.test(market.exchange) || typeof market.symbol !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(market.symbol)) throw Error('成交价历史合约无效');
+  if (!market || !/^[a-z][a-z0-9-]{0,39}$/.test(market.exchange) || typeof market.symbol !== 'string' || !perpetualContractSymbolPattern.test(market.symbol)) throw Error('成交价历史合约无效');
   if (!SUPPORTED.has(market.exchange)) throw unsupported('该平台尚未接入已核实的成交价小时线。');
   if (!Number.isFinite(market.multiplier ?? 1) || (market.multiplier ?? 1) <= 0) throw Error('合约价格倍率无效');
-  const currencies = ['binance', 'aster'].includes(market.exchange) ? ['USDT', 'USDC', 'USD1'] : ['hyperliquid', 'entropy'].includes(market.exchange) ? ['USDC', 'USD'] : ['USDT', 'USDC'];
-  if (!currencies.includes(market.quoteCurrency)) throw unsupported('该计价币的成交价历史接口尚未核实。');
+  // Hyperliquid perps all settle in USDC; the directory labels BTC/ETH etc.
+  // as USDT-quoted (oracle reference) and HYPE/PURR as USDC-quoted. Its
+  // candleSnapshot is the perp's own trade price, i.e. the same unit as the
+  // book quote, so the leg keeps the directory quoteCurrency unchanged.
+  if (market.exchange === 'hyperliquid') {
+    if (market.settlementCurrency !== 'USDC' || !['USDT', 'USDC'].includes(market.quoteCurrency)) throw unsupported('该计价币的成交价历史接口尚未核实。');
+  } else {
+    const currencies = ['binance', 'aster'].includes(market.exchange) ? ['USDT', 'USDC', 'USD1'] : market.exchange === 'entropy' ? ['USDC', 'USD'] : ['USDT', 'USDC'];
+    if (!currencies.includes(market.quoteCurrency)) throw unsupported('该计价币的成交价历史接口尚未核实。');
+  }
   if (market.exchange === 'gate' && (market.quoteCurrency !== 'USDT' || !/^[A-Z0-9._]+_USDT$/.test(market.symbol))) throw unsupported('Gate 暂只接入 USDT 永续成交价历史。');
   if (market.exchange === 'bitget' && market.productType !== undefined && market.productType !== `${market.quoteCurrency}-FUTURES`) throw Error('Bitget 产品类型不匹配');
   if (market.exchange === 'entropy' && !/^io:[A-Za-z0-9._-]+$/.test(market.symbol)) throw Error('Entropy 合约命名空间不匹配');

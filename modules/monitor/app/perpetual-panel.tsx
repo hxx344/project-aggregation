@@ -475,8 +475,17 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
   }, [summaryStatus, summaryTime, onSummary, availableBases, liveExchanges, exchanges.length, expired, paused]);
 
   function selectChart(selection: PerpetualChartSelection) {
+    // Build the URL first: a rejected selection must not leave chart state and
+    // the address bar describing different contracts.
+    let next: string;
+    try { next = perpetualChartUrl(window.location.href, selection); }
+    catch {
+      setInspection(null); setChartSelection(null); setChartLinkError("该组合的合约代码无法生成图表链接，请从套利组合重新选择。"); setWorkspace("chart");
+      const cleared = perpetualChartUrl(window.location.href, null);
+      if (cleared !== window.location.href) window.history.pushState(window.history.state, "", cleared);
+      return;
+    }
     setInspection(null); setChartSelection(selection); setChartLinkError(""); setWorkspace("chart");
-    const next = perpetualChartUrl(window.location.href, selection);
     if (next !== window.location.href) window.history.pushState(window.history.state, "", next);
     requestAnimationFrame(() => { const heading = document.getElementById("perpetual-chart-heading"); heading?.focus({ preventScroll: true }); heading?.scrollIntoView({ block: "nearest" }); });
   }
