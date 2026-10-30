@@ -857,6 +857,22 @@ test('an older cancel record without a send count keeps its original budget', as
   assert.equal(posts.length, 3);
 });
 
+test('a cancel retried after restart keeps the budget of a record without a send count', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending'; delete order.cancelSent; // One request sent, not yet counted.
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  const posts = rejectBinanceCancels(f);
+  await restart(f);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 4, 'the four requests left of the budget of five');
+});
+
 // Records the venue time of every Binance cancel that reached transport.
 function rejectBinanceCancels(f) {
   const posts = [];
@@ -1046,6 +1062,21 @@ test('Bybit not-created confirmation reads ended strategies near the request thr
   venue.filterByEnd = true;
   venue.ended = [{ ...row(1, created + 2000), endedAt: f.time }];
   await assert.rejects(confirm(), /下单时段前后/);
+  // A venue clock ahead of ours: a strategy it already stamped as ended is still read.
+  venue.ended = [{ ...row(1, created + 2000), endedAt: f.time + 120_000 }];
+  await assert.rejects(confirm(), /下单时段前后/);
+  // Older than one venue window: history is read in segments through now, never truncated.
+  const bybitOrder = () => JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"bybit"%').json);
+  const setCreatedAt = value => { const order = bybitOrder(); order.createdAt = new Date(value).toISOString(); f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId); };
+  const originalCreatedAt = Date.parse(bybitOrder().createdAt), aged = originalCreatedAt - 8 * 86_400_000;
+  setCreatedAt(aged);
+  lists.length = 0;
+  venue.ended = [{ ...row(1, aged + 2000), endedAt: f.time }];
+  await assert.rejects(confirm(), /下单时段前后/);
+  const segments = lists.filter(query => query.status === '3');
+  assert.equal(segments.length, 2);
+  assert.ok(segments.every(query => Number(query.endTimeE0) - Number(query.beginTimeE0) <= 7 * 86_400));
+  setCreatedAt(originalCreatedAt);
   venue.filterByEnd = false; venue.ended = [row(1, created + 2000)];
   // Incomplete pagination proves nothing.
   venue.endlessPages = true;

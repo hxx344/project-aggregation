@@ -18,6 +18,8 @@ const CREATE_ARRIVAL_MARGIN_MS = 60_000, CREATE_OBSERVE_MS = 120_000, ABSENT_CRE
 const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5, MISMATCH_RECHECK_MS = 60_000;
 // Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
 const VENUE_CLOCK_TOLERANCE_MS = 300_000;
+// The client rounds the window out to whole seconds; stay inside its limit after rounding.
+const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
 // Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
 const CONNECT_SYMBOLS = EXECUTION_MARKETS.oil.symbols;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
@@ -514,11 +516,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const { account, matches } = await freshPosition(order);
     if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
     const window = callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS, ctx = context(order.exchange, order.accountRevision);
-    // Runs through now: a strategy created near the request may have ended much later.
-    const startTime = created - window, endTime = Math.min(Math.max(created + window, now()), startTime + MAX_STRATEGY_WINDOW);
-    const ended = await call(signal => ctx.client.endedStrategies(ctx.credentials, { ...ctx.options, signal, symbol: order.spec.symbol, startTime, endTime }));
-    requireLease();
-    if (!Array.isArray(ended)) throw new ExecutionError(502, '无法读取 Bybit 已终结追逐策略，暂不确认');
+    // Runs through now plus clock skew, in segments: a strategy created near the
+    // request may have ended much later, and truncating the range would miss it.
+    const startTime = created - window, endTime = Math.max(created + window, now() + VENUE_CLOCK_TOLERANCE_MS), ended = [];
+    for (let from = startTime; from < endTime; from += STRATEGY_QUERY_STEP_MS) {
+      const range = { startTime: from, endTime: Math.min(from + STRATEGY_QUERY_STEP_MS, endTime) };
+      const rows = await call(signal => ctx.client.endedStrategies(ctx.credentials, { ...ctx.options, signal, symbol: order.spec.symbol, ...range }));
+      requireLease();
+      if (!Array.isArray(rows)) throw new ExecutionError(502, '无法读取 Bybit 已终结追逐策略，暂不确认');
+      ended.push(...rows);
+    }
     // Strategies any Hub job already claimed are accounted for by that job.
     const claimed = new Set(stmt.prepare("SELECT json_extract(json,'$.remoteId') AS id FROM execution_orders WHERE json_extract(json,'$.exchange')='bybit' AND json_extract(json,'$.remoteId') IS NOT NULL").all().map(row => row.id));
     const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= window; };
