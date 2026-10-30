@@ -77,7 +77,7 @@ async (page) => {
     moduleOrigin = new URL(await iframe.getAttribute('src'), origin).origin;
     frame = page.frames().find(candidate => candidate.url().startsWith(moduleOrigin + '/'));
     assert(frame, 'real Asset production iframe loaded');
-    const metrics = app.getByRole('region', { name: '收益指标', exact: true });
+    const metrics = app.getByRole('region', { name: '资产变化指标', exact: true });
     const cards = metrics.locator('.performance-card');
     const details = metrics.locator('details.performance-monthly');
     const summary = details.locator('summary');
@@ -139,7 +139,7 @@ async (page) => {
     assert(!await isOpen(), 'Enter collapses native details');
     await openTable();
     const headers = await table.locator('thead th').allTextContents();
-    assert(JSON.stringify(headers) === JSON.stringify(['月份 / 快照区间', '收益金额', '收益率', '期末调整后资产']), 'monthly table exposes the four expected columns');
+    assert(JSON.stringify(headers) === JSON.stringify(['月份 / 快照区间', '变化金额', '变化率', '期末调整后资产']), 'monthly table exposes the four expected columns');
     assert(await rows.count() === 3, 'three observed calendar months are shown');
     const rowMonths = await rows.locator('th[scope="row"]').allTextContents();
     assert([currentMonth, priorMonth, earlierMonth].every((month, index) => rowMonths[index].startsWith(month)), 'months are newest first');
@@ -209,7 +209,7 @@ async (page) => {
     assert((await cards.nth(0).innerText()).includes('上个自然月没有快照'), 'missing previous month explains the unavailable metric');
     assert(await cards.nth(1).locator('strong').innerText() === percent(annualize(0.2, date(-2, 1), today)), 'missing previous month still permits the overall metric');
     await openTable();
-    assert((await rowFor(currentMonth).innerText()).includes('仅一个日期，无法计算收益'), 'a singleton month explains its unavailable monthly return');
+    assert((await rowFor(currentMonth).innerText()).includes('仅一个日期，无法计算变化'), 'a singleton month explains its unavailable monthly return');
     scenarios.push('missing previous month stays unavailable while full-history annualization remains valid');
 
     await setHistory([{ date: date(-1, 1), value: 10000 }, { date: date(0, 0), value: 11000 }, { date: today, value: 12000, partial: true }]);
