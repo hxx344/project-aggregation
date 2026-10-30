@@ -326,7 +326,8 @@ class HeartbeatEndToEndTests(unittest.TestCase):
             urllib.request.urlopen(f'http://{self.listen}/heartbeat', timeout=5)
         self.assertEqual(caught.exception.code, 404)
         self.assertEqual(self.beat(), before)
-        self.assertTrue(any('重放' in line for line in self.logs) and any('签名不符' in line for line in self.logs))
+        self.assertEqual(len(self.logs), 2, '启动日志与每分钟最多一条拒绝日志')
+        self.assertIn('签名不符', self.logs[1])
 
 
 if __name__ == '__main__':

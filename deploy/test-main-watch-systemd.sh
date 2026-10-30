@@ -80,7 +80,8 @@ bash "${installer[@]}" --main "127.0.0.1:$port" --checks "http://127.0.0.1:$port
 grep -q '监控告警通道正常' "$fixture/posts.log"
 grep -q 'sign' "$fixture/posts.log"
 grep -q '服务异常' "$fixture/posts.log"  # threshold 1: the real systemd round alerted on /down
-systemctl is-enabled --quiet main-watch.timer && systemctl is-active --quiet main-watch.timer
+systemctl is-enabled --quiet main-watch.timer
+systemctl is-active --quiet main-watch.timer
 [[ $(stat -c '%U:%G %a' /etc/main-watch/config) == "root:$service 640" ]]
 state=$(readlink -f /var/lib/main-watch)/state.json
 [[ $(stat -c %U "$state") == "$service" ]]
@@ -123,7 +124,8 @@ bash "${installer[@]}" --heartbeat-listen "127.0.0.1:$hb_port" | tee "$fixture/h
 token=$(sed -n 's/^HEARTBEAT_TOKEN=//p' /etc/main-watch/config)
 [[ ${#token} -ge 32 ]]
 grep -qF -- "--sender --send-to http://127.0.0.1:$hb_port/heartbeat --heartbeat-token $token" "$fixture/heartbeat.log"
-systemctl is-enabled --quiet main-watch-heartbeat.service && systemctl is-active --quiet main-watch-heartbeat.service
+systemctl is-enabled --quiet main-watch-heartbeat.service
+systemctl is-active --quiet main-watch-heartbeat.service
 grep -q "失败 heartbeat://127.0.0.1:$hb_port：尚未收到主服务器心跳" "$fixture/heartbeat.log"
 sender=("${installer[@]}" --sender)
 
@@ -138,7 +140,8 @@ fails '只用于副服务器巡检' bash "${sender[@]}" --webhook "http://127.0.
 echo '== a real heartbeat makes the watcher healthy'
 bash "${sender[@]}" --send-to "http://127.0.0.1:$hb_port/heartbeat" --heartbeat-token "$token" \
   --ready-url "http://127.0.0.1:$port/api/ready"
-systemctl is-enabled --quiet main-watch-sender.timer && systemctl is-active --quiet main-watch-sender.timer
+systemctl is-enabled --quiet main-watch-sender.timer
+systemctl is-active --quiet main-watch-sender.timer
 [[ $(stat -c '%U:%G %a' /etc/main-watch/sender) == "root:$service 640" ]]
 beat=$(readlink -f /var/lib/main-watch)/heartbeat.json
 python3 -I -c 'import json, sys; beat = json.load(open(sys.argv[1])); assert beat["ready"] is True and beat["peer"] == "127.0.0.1", beat' "$beat"
@@ -146,6 +149,10 @@ python3 -I -c 'import json, sys; beat = json.load(open(sys.argv[1])); assert bea
 /usr/local/bin/main-watch-sender check
 bash "${sender[@]}" | tee "$fixture/sender-noop.log"
 grep -q '跳过部署' "$fixture/sender-noop.log"
+
+echo '== the heartbeat alert from before the sender existed recovers'
+systemctl start main-watch.service
+grep -q "服务恢复" "$fixture/posts.log"
 
 echo '== an unready workbench is reported through the heartbeat'
 before=$(posts)
@@ -159,6 +166,15 @@ echo '== removing the sender keeps the watcher; disabling heartbeat stops the re
 bash "${sender[@]}" --uninstall
 [[ ! -e /etc/systemd/system/main-watch-sender.timer && ! -e /usr/local/bin/main-watch-sender && -f /opt/main-watch/main_watch.py ]]
 systemctl is-active --quiet main-watch.timer
+
+echo '== a hand-edited heartbeat token redeploys the receiver instead of skipping'
+sleep 1  # 让配置的修改时间晚于接收服务的启动时间
+sed -i "s/^HEARTBEAT_TOKEN=.*/HEARTBEAT_TOKEN=$(printf 'h%.0s' {1..40})/" /etc/main-watch/config
+[[ $(stat -c '%U:%G %a' /etc/main-watch/config) == "root:$service 640" ]]  # 只有接收服务过旧这一项不一致
+bash "${installer[@]}" | tee "$fixture/hand-edit.log"
+if grep -q '跳过部署' "$fixture/hand-edit.log"; then echo 'Stale heartbeat receiver was skipped' >&2; exit 1; fi
+bash "${installer[@]}" | tee "$fixture/hand-edit-noop.log"
+grep -q '跳过部署' "$fixture/hand-edit-noop.log"
 bash "${installer[@]}" --heartbeat-listen ''
 if systemctl is-active --quiet main-watch-heartbeat.service || systemctl is-enabled --quiet main-watch-heartbeat.service; then
   echo 'Heartbeat receiver still running after disabling heartbeat' >&2; exit 1

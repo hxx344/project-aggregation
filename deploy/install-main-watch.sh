@@ -188,6 +188,8 @@ targets=("$root/main_watch.py" "${units[@]/#/$systemd_dir/}" "$command_path" "$c
 config_index=$((${#targets[@]} - 1)) command_index=$((${#targets[@]} - 2))
 restore() {
   local index target name
+  # 先在单元文件还在时停用，避免删掉文件后留下悬空的启用链接。
+  systemctl disable --now "${units[@]:1}" >/dev/null 2>&1 || true
   for index in "${!targets[@]}"; do
     target=${targets[$index]}
     if [[ -f $backup/$index ]]; then cp -p -- "$backup/$index" "$target"; else rm -f -- "$target"; fi
@@ -309,16 +311,16 @@ fi
 # 副服务器开启心跳时取出：监听地址、本机可连地址与端口、令牌。
 heartbeat=()
 if ((!sender)); then
-  read -r -a heartbeat < <("$python_bin" -I -B - "$(dirname -- "$program")" "$scratch/config" <<'PY'
+  heartbeat_line=$("$python_bin" -I -B - "$(dirname -- "$program")" "$scratch/config" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
 import main_watch
 with open(sys.argv[2], encoding='utf-8') as handle:
     config = main_watch.validate(main_watch.parse_config(handle.read()))
-if config['heartbeat']:
-    print(config['listen'], *main_watch.local_address(config['listen']), config['token'])
+print(' '.join([config['listen'], *map(str, main_watch.local_address(config['listen'])), config['token']]) if config['heartbeat'] else 'off')
 PY
-  ) || true
+  ) || die '读取心跳配置失败，未做任何改动。'
+  [[ $heartbeat_line == off ]] || read -r -a heartbeat <<< "$heartbeat_line"
 fi
 
 hardening='UMask=0077
@@ -423,6 +425,8 @@ WorkingDirectory=/var/lib/$service
 ExecStart=$python_bin -I $root/main_watch.py --config $config --serve
 Restart=always
 RestartSec=5
+# 配置错误（退出码 2）不反复重启，重跑安装器修复。
+RestartPreventExitStatus=2
 $hardening
 
 [Install]
@@ -432,7 +436,9 @@ UNIT
 #!/bin/sh
 # main-watch 管理命令，由 install-main-watch.sh 生成。
 case "\$1" in
-  check|probe|test) exec $python_bin -I $root/main_watch.py --config $config --"\$1" ;;
+  check) exec $python_bin -I $root/main_watch.py --config $config --check ;;
+  # 探测会读服务账号写的心跳记录，与测试消息一样以服务账号运行。
+  probe|test) exec runuser -u $service -- $python_bin -I $root/main_watch.py --config $config --"\$1" ;;
   status) systemctl list-timers main-watch.timer --no-pager; exec systemctl status main-watch.service main-watch-heartbeat.service --no-pager ;;
   logs) exec journalctl -u main-watch.service -u main-watch-heartbeat.service -n "\${2:-50}" --no-pager ;;
   *) echo "用法: sudo main-watch check|probe|test|status|logs [行数]" >&2; exit 2 ;;
@@ -456,9 +462,13 @@ if [[ -f $config && $(stat -c '%U:%G %a' "$config") == "root:$service 640" && $(
 for name in "${units[@]}"; do
   [[ $(systemctl show --property=NeedDaemonReload --value "$name") == no ]] || healthy=0
 done
+# 常驻的接收服务只在启动时读配置与程序：比它们旧（例如手工改过令牌）也要重新部署。
+# 按 UTC 取时间：本地时区缩写（如 CST）会被 date 误解。
+started_at() { local value; value=$(TZ=UTC systemctl show --property=ActiveEnterTimestamp --value "$1"); [[ -n $value ]] && TZ=UTC date -d "$value" +%s || echo 0; }
 if ((!sender)); then
   if ((${#heartbeat[@]})); then
-    systemctl is-enabled --quiet main-watch-heartbeat.service && systemctl is-active --quiet main-watch-heartbeat.service || healthy=0
+    if ! systemctl is-enabled --quiet main-watch-heartbeat.service || ! systemctl is-active --quiet main-watch-heartbeat.service ||
+        (( $(started_at main-watch-heartbeat.service) < $(stat -c %Y "$config" "$root/main_watch.py" | sort -n | tail -n 1) )); then healthy=0; fi
   elif systemctl is-active --quiet main-watch-heartbeat.service; then healthy=0; fi
 fi
 if ((${#changed[@]} == 0 && healthy)); then
@@ -473,6 +483,8 @@ for index in "${!targets[@]}"; do
 done
 install -d -m 750 -o root -g "$service" "$etc"
 switched=1
+# 先停定时器与进行中的一轮，部署后的首轮必定按新文件运行；失败时 restore 按原状态恢复。
+systemctl stop "${units[1]}" "${units[0]}" >/dev/null 2>&1 || true
 for index in "${!targets[@]}"; do
   group=root mode=644
   if ((index == config_index)); then group=$service mode=640; elif ((index == command_index)); then mode=755; fi
@@ -536,7 +548,7 @@ systemctl restart main-watch.timer
 systemctl is-active --quiet main-watch.timer || die '定时器未能启动。'
 switched=0
 say "已部署版本 $revision_label，每分钟巡检一次。当前探测结果："
-"$python_bin" -I "$root/main_watch.py" --config "$config" --probe || say '注意：有目标当前不可达。若主服务器实际正常，请检查地址、端口放通、工作台监听地址或心跳推送。'
+runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --probe || say '注意：有目标当前不可达。若主服务器实际正常，请检查地址、端口放通、工作台监听地址或心跳推送。'
 if ((${#heartbeat[@]} && config_changed)); then
   host=${heartbeat[0]%:*}
   case $host in 0.0.0.0|'[::]') host='<副服务器公网IP>' ;; esac

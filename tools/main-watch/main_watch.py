@@ -17,7 +17,9 @@ MAX_CHECKS = 20
 STATE_DIR = '/var/lib/main-watch'
 HEARTBEAT_FILE = 'heartbeat.json'
 HEARTBEAT_STALE = 90  # 发送端每 30 秒一次，连丢两次以上才算本轮失败
-HEARTBEAT_SKEW = 300  # 两台服务器时钟允许的偏差（秒）
+HEARTBEAT_SKEW = 120  # 两台服务器时钟允许的偏差（秒），也是在途心跳可被拖延的上限
+HEARTBEAT_CONNECTIONS = 16  # 接收服务同时处理的连接上限，超出的直接关闭
+REJECT_LOG_INTERVAL = 60
 HEARTBEAT_MAX_BODY = 4096
 SIGNATURE_HEADER = 'X-Main-Watch-Signature'
 TOKEN_PATTERN = re.compile(r'[A-Za-z0-9_-]{32,256}')
@@ -197,7 +199,7 @@ def accept_heartbeat(token, body, signature, now, last_sent):
     if type(sent) is not int or not isinstance(ready, bool) or not isinstance(detail, str):
         return None, '格式错误'
     if abs(now * 1000 - sent) > HEARTBEAT_SKEW * 1000:
-        return None, '时间戳与本机相差超过 5 分钟，请校准两台服务器时钟'
+        return None, f'时间戳与本机相差超过 {HEARTBEAT_SKEW} 秒，请校准两台服务器时钟'
     if sent <= last_sent:
         return None, '重放或乱序的心跳'
     return {'received_at': now, 'sent_at': sent, 'ready': ready, 'detail': detail[:200]}, None
@@ -244,6 +246,7 @@ def serve(config, state_dir, log, ready=None):
     except (OSError, ValueError, KeyError, TypeError):
         last = [0]
     lock = threading.Lock()
+    rejected = {'logged': 0.0, 'skipped': 0}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         timeout = 10
@@ -273,7 +276,14 @@ def serve(config, state_dir, log, ready=None):
             with lock:
                 beat, error = accept_heartbeat(config['token'], body, self.headers.get(SIGNATURE_HEADER), time.time(), last[0])
                 if error:
-                    log(f'拒绝来自 {self.client_address[0]} 的心跳：{error}')
+                    # 未鉴权请求可以任意发送，拒绝日志每分钟最多一条，其余只计数。
+                    now = time.time()
+                    if now - rejected['logged'] >= REJECT_LOG_INTERVAL:
+                        extra = f'（此前 1 分钟内另有 {rejected["skipped"]} 条被拒）' if rejected['skipped'] else ''
+                        log(f'拒绝来自 {self.client_address[0]} 的心跳：{error}{extra}')
+                        rejected.update(logged=now, skipped=0)
+                    else:
+                        rejected['skipped'] += 1
                     return self.reply(403)
                 save_state(path, {**beat, 'peer': self.client_address[0]})
                 last[0] = beat['sent_at']
@@ -281,8 +291,28 @@ def serve(config, state_dir, log, ready=None):
 
     parts = urlsplit(f'tcp://{config["listen"]}')
     host, port = parts.hostname, parts.port
-    server_class = type('Server', (http.server.ThreadingHTTPServer,), {'address_family': socket.AF_INET6 if ':' in host else socket.AF_INET})
-    with server_class((host, port), Handler) as server:
+
+    class Server(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ':' in host else socket.AF_INET
+        slots = threading.BoundedSemaphore(HEARTBEAT_CONNECTIONS)
+
+        def process_request(self, request, client_address):
+            if not self.slots.acquire(blocking=False):
+                self.shutdown_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except Exception:
+                self.slots.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self.slots.release()
+
+    with Server((host, port), Handler) as server:
         log(f'心跳接收已启动：{config["listen"]}')
         if ready:
             ready(server)
