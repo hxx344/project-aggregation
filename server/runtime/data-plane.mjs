@@ -21,6 +21,8 @@ import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
 import { createAeroLp } from '../automation/aero-lp.mjs';
+import { createFeishuDigest } from '../automation/feishu-digest.mjs';
+import { collectSections } from '../automation/feishu-digest-sources.mjs';
 
 const respond = errorResponder([HttpError, TradingError, ExecutionError, UpdateError, RuntimeError]);
 // The API reports every 15 s; a sample needs a report at most this old (design doc 5.8).
@@ -122,6 +124,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // Background reads keep Asset's per-scope fills warm, so opening a chart serves fresh trades at once.
   const assetFillsByMarket = Object.fromEntries(Object.keys(FILL_MARKETS).map(market => [market, createAssetFills({ market, listTargets: assetTargets, request: assetFillsRequest,
     cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
+  const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
+    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), aero: () => aeroLp.state(), research: () => research.state() }) });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
     close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),
@@ -259,6 +263,25 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await aeroLp[action](authorize));
     }
+    if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {
+      if (url.search) throw new HttpError(400, '汇总接口不接受查询参数');
+      if (pathname === '/api/automation/feishu-digest' && method === 'GET') return reply(200, feishuDigest.state());
+      const action = pathname === '/api/automation/feishu-digest/config' && method === 'PUT' ? 'save'
+        : pathname === '/api/automation/feishu-digest/channel' && method === 'PUT' ? 'setChannel'
+          : pathname === '/api/automation/feishu-digest/channel/clear' && method === 'POST' ? 'clearChannel'
+            : pathname === '/api/automation/feishu-digest/preview' && method === 'POST' ? 'preview'
+              : pathname === '/api/automation/feishu-digest/send' && method === 'POST' ? 'send' : null;
+      if (!action) throw new HttpError(404, '汇总接口不存在');
+      const body = await bodyOf();
+      if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+      if (action === 'save' || action === 'preview') {
+        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供汇总配置');
+        return reply(200, await feishuDigest[action](body.config));
+      }
+      if (action === 'setChannel') return reply(200, feishuDigest.setChannel(body));
+      if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      return reply(200, await feishuDigest[action]());
+    }
     if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery') {
       if (method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
@@ -369,7 +392,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
     prepareStop: () => aeroLp.prepareStop(),
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); feishuDigest.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -381,6 +404,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await research.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }
