@@ -394,14 +394,24 @@ async function commandRun(root, options) {
       const result = await definition.run(stageContext);
       if (result?.deferred) {
         results[item.id] = { status: STATUS.deferred, reason: result.reason, durationMs: Date.now() - stageStarted };
-        stageLogger.warn('stage.deferred', result.reason);
-        context.journal({ type: 'stage.deferred', stage: item.id, reason: result.reason });
         // 目标不可用说明本轮没有生效：旧成功记录不能继续代表当前提交，整轮也不能报 ok。
         if (result.targetUnavailable && !options.dryRun) {
           targetUnavailable = true;
           delete context.state.stages[item.id];
+          // 激活未发生，但 --apply 可能已改写系统配置；只补偿本轮配置，保留构建/发布产物。
+          // 此分支负责一次补偿，后续记录或补偿失败不能进入通用失败出口再次恢复。
+          if (options.apply && executed.includes('config')) {
+            const { failures, errors } = await rollbackRun(context, ['config'], { reason: result.reason });
+            const status = failures.length ? STATUS.failed : STATUS.rolledBack;
+            results.config = { ...results.config, status, reason: errors[0]?.message ?? '目标不可用，已恢复本轮配置' };
+            if (context.state.stages.config) context.state.stages.config.status = status;
+            if (errors.length) throw errors[0];
+            if (context.recordingFailed) throw new Error('配置已恢复，但恢复记录写入失败；请保留运行目录与备份');
+          }
           writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
         }
+        stageLogger.warn('stage.deferred', result.reason);
+        context.journal({ type: 'stage.deferred', stage: item.id, reason: result.reason });
         continue;
       }
       const validatedOutputs = !options.dryRun && definition.validate ? await definition.validate(stageContext, result) : [];
@@ -439,7 +449,7 @@ async function commandRun(root, options) {
     if (context) {
       const recovery = recoveryContext(context);
       const stage = currentStage?.id;
-      if (error.detail?.terminationUnconfirmed) context.unsafeTermination = { pid: error.detail.pid, commandId: error.detail.commandId, stage, reason: error.detail.terminationReason };
+      if (error.detail?.terminationUnconfirmed) context.unsafeTermination ??= { pid: error.detail.pid, commandId: error.detail.commandId, stage, reason: error.detail.terminationReason };
       if (stage) {
         const durationMs = Date.now() - currentStage.startedAt;
         results[stage] = { status: STATUS.failed, reason: error.message.split('\n')[0], durationMs };
@@ -451,7 +461,7 @@ async function commandRun(root, options) {
       recovery.logger.error('run.failed', `运行失败：${error.message}`);
       if (context.unsafeTermination) {
         recovery.journal({ type: 'run.quarantined', ...context.unsafeTermination });
-      } else {
+      } else if (!targetUnavailable) {
         const { compensated, failures } = await rollbackRun(context, executed, { reason: `${stage ?? '运行收尾'} 失败` });
         for (const id of failures) {
           if (results[id]) results[id].status = STATUS.failed;
@@ -507,6 +517,7 @@ async function rollbackRun(context, executed, { reason }) {
   const manual = [];
   const compensated = [];
   const failures = [];
+  const errors = [];
   for (const id of stages) {
     const definition = STAGES[id];
     const snapshot = context.snapshots[id];
@@ -521,6 +532,7 @@ async function rollbackRun(context, executed, { reason }) {
       }
     } catch (error) {
       failures.push(id);
+      errors.push(error);
       logger.error('rollback.failed', `回滚 ${id} 失败：${error.message}`);
       recovery.journal({ type: 'rollback.failed', stage: id, message: error.message });
       if (error.detail?.terminationUnconfirmed) {
@@ -534,7 +546,7 @@ async function rollbackRun(context, executed, { reason }) {
     logger.warn('rollback.manual', `以下阶段需要人工回滚：\n${manual.map(item => `  - ${item.stage}: ${item.instruction}`).join('\n')}`);
   }
   if (!stages.length) logger.warn('rollback.empty', '失败发生在首个可回滚阶段之前，没有需要恢复的本地状态');
-  return { compensated, manual, failures };
+  return { compensated, manual, failures, errors };
 }
 
 async function commandRollback(root, options) {
