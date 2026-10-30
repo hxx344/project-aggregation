@@ -308,6 +308,7 @@ async function commandRun(root, options) {
   const executed = [];
   const results = {};
   let currentStage = null;
+  let targetUnavailable = false;
   let plan = [];
   try {
     context = await createContext(root, options, { runId, state, commandLock: lock });
@@ -354,9 +355,25 @@ async function commandRun(root, options) {
       });
       currentStage.inputKey = inputKey;
       const outputPaths = (spec.outputs ?? []).map(item => expandPath(context, item));
-      const decision = definition.alwaysRun || (item.id === 'config' && options.apply)
+      let decision = definition.alwaysRun || (item.id === 'config' && options.apply)
         ? { skip: false, reason: '每轮必跑' }
         : shouldSkip({ state: context.state, stageId: item.id, inputKey, root, outputPaths, force: options.force });
+
+      // 外部运行态不能由文件缓存证明：命中缓存后仍须核验，失败则撤销旧成功记录并重新执行。
+      if (decision.skip && definition.revalidate) {
+        try {
+          await definition.revalidate(stageContext);
+          decision = { skip: true, reason: `${decision.reason}，运行态核验通过` };
+        } catch (error) {
+          stageLogger.warn('stage.revalidate', `运行态核验未通过：${error.message}`);
+          context.journal({ type: 'stage.revalidate.failed', stage: item.id, message: error.message, inputKey });
+          if (!options.dryRun) {
+            delete context.state.stages[item.id];
+            writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
+          }
+          decision = { skip: false, reason: `运行态核验未通过：${error.message.split('\n')[0]}` };
+        }
+      }
 
       if (decision.skip) {
         results[item.id] = { status: STATUS.skipped, reason: decision.reason, durationMs: 0 };
@@ -379,6 +396,12 @@ async function commandRun(root, options) {
         results[item.id] = { status: STATUS.deferred, reason: result.reason, durationMs: Date.now() - stageStarted };
         stageLogger.warn('stage.deferred', result.reason);
         context.journal({ type: 'stage.deferred', stage: item.id, reason: result.reason });
+        // 目标不可用说明本轮没有生效：旧成功记录不能继续代表当前提交，整轮也不能报 ok。
+        if (result.targetUnavailable && !options.dryRun) {
+          targetUnavailable = true;
+          delete context.state.stages[item.id];
+          writeState(stateFile, { ...context.state, lastRunId: runId, commit: git.commit, configFingerprint: context.configFingerprint });
+        }
         continue;
       }
       const validatedOutputs = !options.dryRun && definition.validate ? await definition.validate(stageContext, result) : [];
@@ -400,7 +423,7 @@ async function commandRun(root, options) {
     }
 
     currentStage = null;
-    const status = options.dryRun ? 'planned' : 'ok';
+    const status = options.dryRun ? 'planned' : targetUnavailable ? STATUS.deferred : 'ok';
     context.journal({ type: 'run.end', status, durationMs: Date.now() - startedAt });
     const summary = {
       runId, env: options.env, trigger: options.trigger, commit: git.commit, status,

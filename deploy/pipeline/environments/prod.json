@@ -98,9 +98,11 @@
       "enabled": true,
       "requiresApply": true,
       "commands": [
-        { "cmd": "sudo", "args": ["bash", "deploy/install-all.sh"], "timeoutMs": 1800000 }
+        { "cmd": "sudo", "args": ["bash", "deploy/install-all.sh", "--expect-commit", "{commit}"], "timeoutMs": 1800000 }
       ],
-      "healthUrl": "http://127.0.0.1:{PORT}/api/health"
+      "targetMismatchExitCode": 75,
+      "healthUrl": "http://127.0.0.1:{PORT}/api/health",
+      "deployedRecord": "/opt/project-aggregation/.deployed-state"
     }
   }
 }

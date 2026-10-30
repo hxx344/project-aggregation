@@ -55,9 +55,11 @@ deploy/pipeline/
 | 5 | `verify` | `tsc --noEmit`、行为测试 | 命令退出码 | 只读 |
 | 6 | `package` | 打包后执行 `deploy/merge-release-manifests.py` | schema、仓库、提交、标签、架构、路径、真实包 SHA-256 与合并内容一致 | 自动恢复上一份清单 |
 | 7 | `publish` | `deploy/publish-release.py` | 清单有效，origin/HEAD 与发布环境身份一致 | 人工（远端 Release） |
-| 8 | `activate` | `deploy/install-all.sh` | `/api/health` 连续探测 | 安装器负责（保留上一版本） |
+| 8 | `activate` | `deploy/install-all.sh --expect-commit {commit}` | `/api/health` 连续探测，且部署记录等于本轮提交 | 安装器负责（保留上一版本） |
 
 `dev` 只执行 1–5；`test` 执行 1–6；`prod` 执行 1–8，其中 `publish` 需要确认，`activate` 需要 `--apply`。
+
+`activate` 只部署本轮提交。当前正式版不是它（尚未晋级，或已被其他版本替换）时，安装器不运行任何项目安装器并以退出码 75 结束，流水线记为 `deferred`，撤销该阶段旧的成功记录，整轮状态也为 `deferred`（退出码仍为 0，这不是失败）；晋级后重跑即可，不回落到 latest，也不安装未晋级的候选。相同输入命中缓存时仍读取健康端点和部署记录：一致则跳过，安装器不重复运行；不一致则撤销旧成功记录，并回落到幂等安装器。
 
 `test`/`prod` 当前显式打包 x64，目录分别为 `output/release/test`、`output/release/prod`；`{releaseDirectory}` 来自 `package.releaseDirectory`。打包前清理目标清单，打包后生成 `release-manifest-x64.json` 与 `release-manifest.json`，历史清单不能补足本次缺失的产物。既有 CI 仍使用 `output/release`：无参数运行 `python3 deploy/merge-release-manifests.py` 仍只读取该目录的 x64 清单，不自动合并历史 arm64 文件；新增摘要校验要求同目录存在清单所指向的真实包。
 
@@ -212,7 +214,7 @@ node deploy/pipeline/cli.mjs rollback --env prod --run <runId> --yes
 
 相关验证入口（实际结果以对应版本的运行记录为准）：
 
-- `node --test tests/pipeline.test.mjs tests/pipeline-recovery.test.mjs`：配置、缓存、发布身份、实际目标恢复、锁写入故障、强制终止即隔离与有界结算。
+- `node --test tests/pipeline.test.mjs tests/pipeline-recovery.test.mjs tests/pipeline-activate.test.mjs`：配置、缓存、发布身份、实际目标恢复、锁写入故障、强制终止即隔离与有界结算；激活绑定本轮提交与缓存命中后的运行态核验。
 - `py -X utf8 -B deploy/test-package-layout.py -v`（Linux 使用 `python3`）：包布局、合并器真实产物摘要、默认 x64 与无参数 CI 调用兼容性。
 - 对 `deploy/pipeline/*.mjs` 和两份流水线测试逐文件执行 `node --check`，再执行 `git diff --check`。
 - Windows 原生测试验证 Job 对象与可注入进程夹具；实际 Linux 的忽略 TERM、后代持有管道等场景在 Windows 跳过，须在 Linux CI 验证，不使用 WSL。

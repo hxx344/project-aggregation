@@ -5,7 +5,7 @@
  * 只有配置、打包两个阶段会自动回滚；发布与激活必须人工确认后处理，
  * 因为远端 Release 和服务器切换不能靠本地文件恢复。
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnvFile, renderEnvFile } from './config.mjs';
@@ -20,7 +20,7 @@ export function expandPath(ctx, template) {
   const config = ctx.profile?.stages?.config;
   return template.replaceAll('{releaseDirectory}', ctx.profile?.stages?.package?.releaseDirectory ?? '')
     .replaceAll('{target}', config?.target ?? '').replaceAll('{applyTarget}', config?.applyTarget ?? '')
-    .replaceAll('{env}', ctx.env);
+    .replaceAll('{env}', ctx.env).replaceAll('{commit}', ctx.git?.commit ?? '');
 }
 
 /** 健康检查地址支持 {env} 与 {PORT}，避免端口改了但探测地址没跟着改。 */
@@ -44,7 +44,8 @@ function requireStage(ctx, id) {
   return spec;
 }
 
-async function runCommands(ctx, id, commands) {
+/** deferCode：命令以该退出码结束表示“未做任何改动、目标尚不可用”，交由调用阶段记为 deferred。 */
+async function runCommands(ctx, id, commands, { deferCode } = {}) {
   for (const [index, original] of commands.entries()) {
     const command = { ...original, args: (original.args ?? []).map(arg => expandPath(ctx, arg)) };
     const result = await ctx.exec(command, id);
@@ -71,6 +72,7 @@ async function runCommands(ctx, id, commands) {
       continue;
     }
     if (result.timedOut) throw new Error(`命令超时（${command.timeoutMs ?? '默认'}ms）：${line}`);
+    if (deferCode !== undefined && result.code === deferCode) return { deferred: true };
     if (result.code !== 0) {
       const tail = result.tail ? `\n${result.tail}` : '';
       throw new Error(`命令失败（退出码 ${result.code}）：${line}${tail}`);
@@ -345,17 +347,56 @@ export const STAGES = {
       if (spec.requiresApply && !ctx.options.apply) {
         return { deferred: true, reason: '需要 --apply 才会执行服务器切换' };
       }
-      await runCommands(ctx, 'activate', spec.commands ?? []);
+      // 安装器只部署本轮提交：当前正式版不是它（未晋级或已被替换）时什么也不装，记为 deferred。
+      const outcome = await runCommands(ctx, 'activate', spec.commands ?? [], { deferCode: spec.targetMismatchExitCode });
+      if (outcome?.deferred) {
+        return { deferred: true, targetUnavailable: true, reason: `当前正式版不是本轮提交 ${ctx.git.commit.slice(0, 12)}，未安装任何版本；晋级为正式版后重跑` };
+      }
     },
     async validate(ctx) {
-      const spec = requireStage(ctx, 'activate');
-      if (!spec.healthUrl) return [];
-      await checkHealth(expandUrl(ctx, spec.healthUrl), { logger: ctx.logger, attempts: ctx.options.dryRun ? 1 : 30 });
+      await verifyActivation(ctx, { attempts: ctx.options.dryRun ? 1 : undefined });
       return [];
+    },
+    // 缓存只说明安装输入未变，不说明服务仍在运行本轮提交：命中缓存时仍须核验运行态。
+    async revalidate(ctx) {
+      await verifyActivation(ctx, { attempts: 1 });
     },
     manualRollback: '服务切换的回滚由安装器负责：保留的上一版本与部署记录可恢复旧程序、单元和配置；业务数据库写入不回滚。',
   },
 };
+
+/**
+ * 激活结果核验：服务健康，且安装器的部署记录（与在线更新读取的当前版本同源）
+ * 等于本轮提交。健康端点只返回 {status:'ok'}；运行目录的 .source-sha 在内容未变时
+ * 可以是更早的提交，不能代表已部署身份。
+ */
+export async function verifyActivation(ctx, { attempts } = {}) {
+  const spec = requireStage(ctx, 'activate');
+  if (spec.healthUrl) {
+    await checkHealth(expandUrl(ctx, spec.healthUrl), {
+      logger: ctx.logger, attempts: attempts ?? spec.healthAttempts ?? 30, intervalMs: spec.healthIntervalMs ?? 2000,
+    });
+  }
+  if (!spec.deployedRecord) return;
+  const deployed = readDeployedCommit(spec.deployedRecord);
+  if (deployed !== ctx.git.commit) {
+    throw new Error(`部署记录显示当前版本 ${deployed.slice(0, 12)}，不是本轮提交 ${ctx.git.commit.slice(0, 12)}：${spec.deployedRecord}`);
+  }
+  ctx.logger.info('activate.identity', `部署记录与本轮提交一致：${deployed.slice(0, 12)}`);
+}
+
+export function readDeployedCommit(file) {
+  let text;
+  try {
+    if (!lstatSync(file).isFile()) throw new Error('不是普通文件');
+    text = readFileSync(file, 'utf8');
+  } catch (error) {
+    throw new Error(`无法读取部署记录 ${file}：${error.message}`);
+  }
+  const commit = text.trim().split(/\s+/)[0] ?? '';
+  if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error(`部署记录缺少有效提交：${file}`);
+  return commit;
+}
 
 export async function checkHealth(url, { logger, attempts = 30, intervalMs = 2000, fetchImpl = fetch } = {}) {
   let lastError = null;
