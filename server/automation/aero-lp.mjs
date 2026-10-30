@@ -214,10 +214,11 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       maintenanceTimer = setInterval(pollHold, maintenancePollMs);
       maintenanceTimer.unref?.();
       try {
+        // A file that exists but holds no address (including JSON null or "") is damaged, not an absent wallet.
+        const walletPresent = existsSync(walletPath);
         const savedWallet = readBounded(walletPath, 16 * 1024);
-        address = typeof savedWallet?.address === 'string' ? savedWallet.address : null;
-        // A file that exists but holds no address is damaged, not an absent wallet.
-        walletKnown = savedWallet === null || address !== null;
+        address = typeof savedWallet?.address === 'string' && savedWallet.address ? savedWallet.address : null;
+        walletKnown = !walletPresent || address !== null;
         const saved = readBounded(configPath, 64 * 1024);
         if (saved) {
           config = validateSettings(withPinnedKeys(saved));
