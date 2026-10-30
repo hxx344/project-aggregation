@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createExecutionExchangeClient, ExecutionExchangeError } from './trading-execution-exchanges.mjs';
+import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS } from './trading-markets.mjs';
@@ -506,7 +506,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // accepted only after the request can no longer arrive, while the symbol has
   // no live strategy, no unclaimed strategy created around the request (venue
   // clock tolerance included), including ones that already ended (status 3,
-  // read from a bounded window around the request), and the position matches
+  // read from a bounded window starting at the request), and the position matches
   // the known fills.
   async function confirmNotCreated(order) {
     const created = Date.parse(order.createdAt);
@@ -514,7 +514,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const { account, matches } = await freshPosition(order);
     if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
     const window = callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS, ctx = context(order.exchange, order.accountRevision);
-    const ended = await call(signal => ctx.client.endedStrategies(ctx.credentials, { ...ctx.options, signal, symbol: order.spec.symbol, startTime: created - window, endTime: created + window }));
+    // Runs through now: a strategy created near the request may have ended much later.
+    const startTime = created - window, endTime = Math.min(Math.max(created + window, now()), startTime + MAX_STRATEGY_WINDOW);
+    const ended = await call(signal => ctx.client.endedStrategies(ctx.credentials, { ...ctx.options, signal, symbol: order.spec.symbol, startTime, endTime }));
     requireLease();
     if (!Array.isArray(ended)) throw new ExecutionError(502, '无法读取 Bybit 已终结追逐策略，暂不确认');
     // Strategies any Hub job already claimed are accounted for by that job.
@@ -540,13 +542,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   function retryCancel(order, operation) {
     if (order.settled || !order.remoteId || cancelSpent(order)) return false;
     if (order.writerOperation?.operationId !== operation.operationId || !['sending', 'unknown', 'confirmed'].includes(order.writerOperation.state)) return false;
-    if (!order.cancelRequestedAt || cancelRecent(order)) return false;
+    if (cancelRecent(order)) return false;
     if (accountWriter && order.writerOperation.state !== 'confirmed') {
       const ticket = protectJob(jobFor(order.jobId));
       if (accountWriter.unresolved(ticket).some(item => item.operationId === operation.operationId)) accountWriter.resolve(operation.operationId, ticket, 'rejected');
       order.writerOperation.state = 'rejected';
     }
-    order.cancelAttempt = (order.cancelAttempt || 0) + 1; saveOrder(order);
+    order.cancelSent ??= cancelSends(order); order.cancelAttempt = (order.cancelAttempt || 0) + 1; saveOrder(order);
     return true;
   }
   async function cancelOrder(order) {
@@ -566,7 +568,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     // outcomes, is resent under the same attempt limit and spacing.
     if (order.writerOperation?.action === 'cancel' && order.writerOperation.state === 'rejected' || !accountWriter && order.cancelRequestedAt) {
       if (cancelSpent(order) || cancelRecent(order)) { await inspectOrder(order, undefined, true); return; }
-      order.cancelAttempt = (order.cancelAttempt || 0) + 1;
+      order.cancelSent ??= cancelSends(order); order.cancelAttempt = (order.cancelAttempt || 0) + 1;
     }
     let operation;
     try { operation = prepareWrite(order, 'cancel'); }

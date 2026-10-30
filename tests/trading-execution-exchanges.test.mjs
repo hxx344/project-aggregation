@@ -547,8 +547,8 @@ test('Bybit ended-strategy lookup is bounded to a creation window, status 3 and 
   const result = await client.endedStrategies(credentials, window);
   assert.deepEqual(result, [{ id: STRATEGY, symbol: 'CLUSDT', side: 'sell', quantity: '2', filledQuantity: '0', status: 'terminal', reduceOnly: false, createdAt: new Date(NOW).toISOString() }]);
   const query = calls.find(call => call.url.pathname === '/v5/strategy/list').parameters;
-  assert.deepEqual(query, { category: 'UTA_USDT', symbol: 'CLUSDT', strategyType: 'chaseOrder', status: '3', startTime: String(window.startTime), endTime: String(window.endTime), pageSize: '50' });
-  for (const invalid of [{ ...window, endTime: window.startTime + 3_600_001 }, { ...window, startTime: undefined }, { ...window, endTime: window.startTime }, { ...window, symbol: 'BTCUSDT' }]) {
+  assert.deepEqual(query, { category: 'UTA_USDT', symbol: 'CLUSDT', strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(window.startTime / 1000)), endTimeE0: String(Math.ceil(window.endTime / 1000)), pageSize: '50' });
+  for (const invalid of [{ ...window, endTime: window.startTime + 7 * 86_400_000 + 1 }, { ...window, startTime: undefined }, { ...window, endTime: window.startTime }, { ...window, symbol: 'BTCUSDT' }]) {
     const rejected = harness('bybit');
     await assert.rejects(rejected.client.endedStrategies(credentials, invalid), isError('input'));
     assert.equal(rejected.calls.length, 0);

@@ -808,6 +808,55 @@ test('a cancel left sending by a crash is resent after restart', async t => {
   assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
 });
 
+test('a first cancel lost between sending and its timestamp is resent after restart', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  const stops = () => f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length;
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending'; delete order.cancelRequestedAt; delete order.cancelSent;
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  await f.service.close(); f.service = f.create(); await f.service.initializeProtection();
+  delete f.handlers['binance:stop'];
+  await f.service.tick();
+  assert.equal(stops(), 2); assert.equal(f.job.status, 'stopped');
+});
+
+test('a cancel the send guard refuses spends neither budget nor spacing', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  let posts = 0;
+  const assertOwned = f.writer.assertOwned.bind(f.writer);
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => {
+    f.writer.assertOwned = () => { throw new Error('lease moved'); };
+    try { options.beforeMutation(); } finally { f.writer.assertOwned = assertOwned; }
+    posts += 1;
+  };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  const stored = () => JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%').json);
+  assert.equal(posts, 0); assert.equal(stored().cancelSent, 0); assert.ok(!stored().cancelRequestedAt);
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); posts += 1; };
+  await f.service.tick();
+  assert.equal(posts, 1); assert.equal(stored().cancelSent, 1);
+});
+
+test('an older cancel record without a send count keeps its original budget', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(posts.length, 1);
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.cancelAttempt = 2; delete order.cancelSent; // Sequence 2: three requests already sent.
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  await restart(f);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 3);
+});
+
 // Records the venue time of every Binance cancel that reached transport.
 function rejectBinanceCancels(f) {
   const posts = [];
@@ -973,7 +1022,11 @@ test('Bybit not-created confirmation reads ended strategies near the request thr
       lists.push(query);
       if (query.status !== '3') result = { list: [], nextCursor: '' };
       else if (venue.endlessPages) result = { list: [row(90, created)], nextCursor: 'again' };
-      else result = { list: venue.ended.filter(item => venue.ignoreWindow || Number(item.createdTimeE3) >= Number(query.startTime) && Number(item.createdTimeE3) <= Number(query.endTime)), nextCursor: '' };
+      else {
+        if (query.startTime || query.endTime) throw new Error('Unsupported strategy time parameters');
+        const stamp = item => Number(venue.filterByEnd ? item.endedAt : item.createdTimeE3);
+        result = { list: venue.ended.filter(item => venue.ignoreWindow || stamp(item) >= Number(query.beginTimeE0) * 1000 && stamp(item) <= Number(query.endTimeE0) * 1000), nextCursor: '' };
+      }
     } else throw new Error(`Unhandled fixture route ${path}`);
     return new Response(JSON.stringify({ retCode: 0, retMsg: 'OK', result }), { status: 200 });
   } });
@@ -985,8 +1038,15 @@ test('Bybit not-created confirmation reads ended strategies near the request thr
   await assert.rejects(confirm(), /下单时段前后/);
   const history = lists.filter(query => query.status === '3');
   assert.equal(history.length, 1);
-  assert.ok(Number(history[0].startTime) <= created - 300_000 && Number(history[0].endTime) >= created + 300_000);
-  assert.ok(Number(history[0].endTime) - Number(history[0].startTime) <= 3_600_000);
+  assert.ok(Number(history[0].beginTimeE0) * 1000 <= created - 300_000 && Number(history[0].endTimeE0) * 1000 >= created + 300_000);
+  assert.ok(Number(history[0].endTimeE0) - Number(history[0].beginTimeE0) <= 7 * 86_400);
+  // The venue does not say which timestamp it filters: one that ended long after
+  // the request is still found when the window applies to the end time.
+  for (const edge = Number(history[0].endTimeE0) * 1000; f.time <= edge + 1000;) { f.advance(20_000); await f.service.tick(); }
+  venue.filterByEnd = true;
+  venue.ended = [{ ...row(1, created + 2000), endedAt: f.time }];
+  await assert.rejects(confirm(), /下单时段前后/);
+  venue.filterByEnd = false; venue.ended = [row(1, created + 2000)];
   // Incomplete pagination proves nothing.
   venue.endlessPages = true;
   await assert.rejects(confirm(), /分页结果不完整/);
@@ -1004,7 +1064,7 @@ test('Bybit not-created confirmation reads ended strategies near the request thr
   assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true);
   assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
   // Routine account reads only query the active status buckets.
-  assert.deepEqual([...new Set(lists.filter(query => !query.startTime).map(query => query.status))].sort(), ['2', '4', '5', '6']);
+  assert.deepEqual([...new Set(lists.filter(query => !query.beginTimeE0).map(query => query.status))].sort(), ['2', '4', '5', '6']);
   assert.equal(f.creates.length, 2);
 });
 

@@ -71,7 +71,7 @@ const MAX_PAGES = 40;
 const MAX_ROWS = 2000;
 const MAX_CLOCK_OFFSET = 300_000;
 const RULE_TTL = 60_000;
-const MAX_STRATEGY_WINDOW = 3_600_000;
+export const MAX_STRATEGY_WINDOW = 7 * 86_400_000;
 const RECV_WINDOW = '5000';
 const ID_KEYS = new Set(['orderId', 'tranId', 'userID', 'userIDInt64', 'uid']);
 const BINANCE_RISKY_PERMISSIONS = ['enableWithdrawals', 'enableInternalTransfer', 'permitsUniversalTransfer', 'enableMargin', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
@@ -554,12 +554,14 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   // Operator confirmation only. Ended strategies (status 3) are outside the
   // routine account snapshot, so a create that ended without a fill is looked
   // up in a bounded window around the request instead of scanning history.
-  // The caller filters by creation time again; incomplete pagination fails.
+  // The venue takes whole seconds and does not say which timestamp it filters,
+  // so the caller's window spans creation through now and it filters by
+  // creation time again; incomplete pagination fails.
   async function endedStrategies(credentials, { accountMode, signal, symbol, startTime, endTime } = {}) {
     if (exchange !== 'bybit' || !SYMBOLS.includes(symbol) || !Number.isSafeInteger(startTime) || !Number.isSafeInteger(endTime)
       || startTime < 0 || endTime <= startTime || endTime - startTime > MAX_STRATEGY_WINDOW) fail('input');
     const options = { accountMode: modeOf(accountMode), signal }, seen = new Set(), strategies = [];
-    const rows = await pages('strategies', credentials, { category: 'UTA_USDT', symbol, strategyType: 'chaseOrder', status: '3', startTime: String(startTime), endTime: String(endTime), pageSize: '50' }, options, { cursorField: 'nextCursor' });
+    const rows = await pages('strategies', credentials, { category: 'UTA_USDT', symbol, strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(startTime / 1000)), endTimeE0: String(Math.ceil(endTime / 1000)), pageSize: '50' }, options, { cursorField: 'nextCursor' });
     for (const row of rows) {
       const strategy = parseStrategy(row);
       if (strategy.symbol !== symbol || seen.has(strategy.id)) fail();
