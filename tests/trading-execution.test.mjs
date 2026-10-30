@@ -1015,6 +1015,111 @@ test('Bybit strategy create without an answer can be confirmed absent only after
   assert.equal(f.creates.length, 2);
 });
 
+async function unknownBybitFixture(t) {
+  const f = await fixture(t, { guarded: true });
+  f.handlers['bybit:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  for (const step of [50_000, 50_000, 25_000]) { f.advance(step); await f.service.tick(); }
+  const leg = f.job.legs.find(row => row.exchange === 'bybit');
+  const stored = () => JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE job_id=? AND json_extract(json,\'$.legId\')=?').get(f.job.id, leg.id).json);
+  const operationState = () => {
+    const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'), { readOnly: true });
+    try { return shared.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(stored().writerOperation.operationId)?.state; } finally { shared.close(); }
+  };
+  return Object.assign(f, { stored, operationState, confirm: () => f.service.reconcile(f.job.id, { legId: leg.id, notCreated: true, acknowledge: true }), assertUnknown() {
+    const order = stored();
+    assert.equal(order.settled, false); assert.equal(order.unknown, true);
+    assert.equal(order.writerOperation.state, 'unknown');
+    assert.equal(operationState(), 'unknown');
+    assert.equal(f.job.canResume, false); assert.equal(f.creates.length, 2);
+  } });
+}
+
+test('Bybit not-created confirmation rejects account changes during the last history segment', async t => {
+  const scenarios = [
+    ['position', f => { f.accounts.bybit.positions = [{ symbol: 'CLUSDT', side: 'short', quantity: '1' }]; }, /仓位或挂单与本任务已知成交不一致/],
+    ['open order', f => { f.accounts.bybit.openOrders = [{ id: 'late-order', symbol: 'CLUSDT' }]; }, /仓位或挂单与本任务已知成交不一致/],
+    ['active strategy', f => { f.accounts.bybit.strategies = [{ id: 'late-strategy', symbol: 'CLUSDT', status: 'running', createdAt: new Date(f.time).toISOString() }]; }, /运行中的追逐策略/],
+  ];
+  for (const [name, change, reason] of scenarios) await t.test(name, async t => {
+    const f = await unknownBybitFixture(t), arrived = deferred(), release = deferred();
+    const order = f.stored(); order.createdAt = new Date(Date.parse(order.createdAt) - 8 * 86_400_000).toISOString();
+    f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+    let segments = 0;
+    f.handlers['bybit:endedStrategies'] = async () => { if (++segments === 2) { arrived.resolve(); await release.promise; } return []; };
+    const confirmation = f.confirm(); await arrived.promise;
+    change(f); release.resolve();
+    await assert.rejects(confirmation, reason);
+    assert.equal(segments, 2); f.assertUnknown();
+  });
+});
+
+test('Bybit not-created confirmation takes its final account proof after history and still requires a resume preview', async t => {
+  const f = await unknownBybitFixture(t), arrived = deferred(), release = deferred(), reads = [];
+  f.handlers['bybit:endedStrategies'] = async () => { reads.push('history'); arrived.resolve(); await release.promise; return []; };
+  f.handlers['bybit:account'] = async () => { reads.push('account'); return structuredClone(f.accounts.bybit); };
+  const confirmation = f.confirm(); await arrived.promise; release.resolve(); await confirmation;
+  assert.deepEqual(reads, ['history', 'account']);
+  const order = f.stored();
+  assert.equal(order.settled, true); assert.equal(order.unknown, false); assert.equal(order.writerOperation.state, 'rejected');
+  assert.equal(f.operationState(), 'rejected');
+  assert.equal(f.service.state().jobs[0].status, 'paused'); assert.equal(f.service.state().jobs[0].canResume, true);
+  assert.equal(f.creates.length, 2);
+  await f.service.tick(); assert.equal(f.creates.length, 2);
+  const preview = await f.preview({ resumeJobId: f.job.id });
+  assert.equal(preview.resumeJobId, f.job.id); assert.equal(f.creates.length, 2);
+});
+
+test('Bybit not-created confirmation preserves unknown if its final account read fails', async t => {
+  const f = await unknownBybitFixture(t);
+  let historyRead = false;
+  f.handlers['bybit:endedStrategies'] = async () => { historyRead = true; return []; };
+  f.handlers['bybit:account'] = async () => { if (historyRead) throw new ExecutionExchangeError('transport'); return structuredClone(f.accounts.bybit); };
+  await assert.rejects(f.confirm(), /交易所连接失败/);
+  f.assertUnknown();
+});
+
+test('Bybit not-created confirmation keeps lease and account revision guards through its final read', async t => {
+  for (const boundary of ['history lease', 'account lease', 'writer lease', 'account revision']) await t.test(boundary, async t => {
+    const f = await unknownBybitFixture(t), arrived = deferred(), release = deferred();
+    const method = boundary.startsWith('history') ? 'endedStrategies' : 'account';
+    f.handlers[`bybit:${method}`] = async () => { arrived.resolve(); await release.promise; return method === 'account' ? structuredClone(f.accounts.bybit) : []; };
+    const confirmation = f.confirm(); await arrived.promise;
+    if (boundary === 'writer lease') {
+      const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+      shared.prepare("UPDATE aw_accounts SET lease_until=0 WHERE authority='bybit'").run(); shared.close();
+    } else if (boundary.endsWith('lease')) f.db.prepare('UPDATE execution_lease SET owner=?').run('new-owner');
+    else f.db.prepare("UPDATE execution_accounts SET revision=revision+1 WHERE exchange='bybit'").run();
+    release.resolve();
+    await assert.rejects(confirmation, boundary === 'writer lease' ? /账户写入所有权/ : boundary.endsWith('lease') ? /运行锁/ : /实盘连接已改变/);
+    f.assertUnknown();
+  });
+});
+
+test('Bybit not-created confirmation rechecks claimed strategies after its final account read', async t => {
+  const f = await unknownBybitFixture(t), arrived = deferred(), release = deferred();
+  const strategy = { id: 'earlier-strategy', symbol: 'CLUSDT', status: 'terminal', createdAt: f.stored().createdAt };
+  f.db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run('earlier-order', 'earlier-job', JSON.stringify({ exchange: 'bybit', remoteId: strategy.id }));
+  f.handlers['bybit:endedStrategies'] = async () => [strategy];
+  f.handlers['bybit:account'] = async () => { arrived.resolve(); await release.promise; return structuredClone(f.accounts.bybit); };
+  const confirmation = f.confirm(); await arrived.promise;
+  f.db.prepare('DELETE FROM execution_orders WHERE id=?').run('earlier-order'); release.resolve();
+  await assert.rejects(confirmation, /下单时段前后/);
+  f.assertUnknown();
+});
+
+test('Bybit not-created confirmation does not settle an order that is no longer unknown', async t => {
+  const f = await unknownBybitFixture(t), arrived = deferred(), release = deferred();
+  f.handlers['bybit:endedStrategies'] = async () => { arrived.resolve(); await release.promise; return []; };
+  const confirmation = f.confirm(); await arrived.promise;
+  const order = f.stored(); order.unknown = false;
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId); release.resolve();
+  await assert.rejects(confirmation, /待核对委托已变化/);
+  assert.equal(f.stored().settled, false);
+  assert.equal(f.operationState(), 'unknown');
+  assert.equal(f.creates.length, 2);
+});
+
 test('Bybit not-created confirmation reads ended strategies near the request through the real adapter', async t => {
   const f = await fixture(t, { guarded: true });
   f.handlers['bybit:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };

@@ -513,8 +513,6 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   async function confirmNotCreated(order) {
     const created = Date.parse(order.createdAt);
     if (!Number.isFinite(created) || now() < createSettledAt(order)) throw new ExecutionError(409, '下单请求仍可能送达交易所，请稍后再确认');
-    const { account, matches } = await freshPosition(order);
-    if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
     const window = callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS, ctx = context(order.exchange, order.accountRevision);
     // Runs through now plus clock skew, in segments: a strategy created near the
     // request may have ended much later, and truncating the range would miss it.
@@ -526,6 +524,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (!Array.isArray(rows)) throw new ExecutionError(502, '无法读取 Bybit 已终结追逐策略，暂不确认');
       ended.push(...rows);
     }
+    // History can span several awaited reads. Take the current position/orders
+    // only after all segments finish, then keep the final checks synchronous.
+    const { account, matches } = await freshPosition(order);
+    context(order.exchange, order.accountRevision);
+    if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
     // Strategies any Hub job already claimed are accounted for by that job.
     const claimed = new Set(stmt.prepare("SELECT json_extract(json,'$.remoteId') AS id FROM execution_orders WHERE json_extract(json,'$.exchange')='bybit' AND json_extract(json,'$.remoteId') IS NOT NULL").all().map(row => row.id));
     const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= window; };
@@ -535,6 +538,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (!matches) throw new ExecutionError(409, 'Bybit 当前仓位或挂单与本任务已知成交不一致，不能确认策略未创建');
     const current = orderFor(order.localId);
     if (current.settled || current.remoteId) return;
+    if (!current.unknown) throw new ExecutionError(409, '待核对委托已变化，请重新核对');
     settleNotCreated(current, `Bybit ${current.spec.symbol} 经人工确认且交易所无对应追逐策略，判定未创建`);
   }
   // A cancel that was sent but left the order working is retried a bounded

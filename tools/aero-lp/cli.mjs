@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // Aerodrome Slipstream 单边 token0 流动性调仓：status / once / run。
 // run --managed 由工作台运行时托管：私钥经 IPC 传入，每轮重读配置。
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Wallet, formatEther, formatUnits, getAddress, parseEther, parseUnits } from 'ethers';
-import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, emissionPerDay, feeApr, feeRate, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
+import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, emissionPerDay, emissionTotalPerDay, feeApr, feeRate, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
 import { connect, errorText, execute, provider, readRewards, readState, reconcileLedger } from './chain.mjs';
 
 const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]  |  lp run --managed --config FILE --data DIR';
@@ -75,18 +76,48 @@ function logger(dataDir, { managed = false } = {}) {
 // 只在同一 dataDir 内有效：多份配置共用私钥时须共用 dataDir。
 function acquireLock(dataDir, wallet) {
   const lock = join(dataDir, `run-${wallet.toLowerCase()}.lock`);
-  try { mkdirSync(lock, { mode: 0o700 }); } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    let pid = null;
-    try { pid = JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')).pid; } catch {}
-    if (Number.isInteger(pid) && pid > 0) {
-      try { process.kill(pid, 0); throw new Error(`another aero-lp process (pid ${pid}) holds ${lock}`); } catch (e) { if (e.code !== 'ESRCH') throw e; }
+  const guard = `${lock}.guard`, token = randomUUID();
+  // All create/reclaim/release operations share this short-lived guard. An abandoned
+  // guard is never reclaimed automatically: ownership cannot be established safely.
+  const guarded = (work, attempts = 1) => {
+    for (let attempt = 1; ; attempt++) {
+      try { mkdirSync(guard, { mode: 0o700 }); break; }
+      catch (error) {
+        if (error.code !== 'EEXIST' || attempt >= attempts) throw new Error(`aero-lp lock guard unavailable (${error.code || 'unknown'}): ${guard}; verify all writers have stopped before manual cleanup`);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
     }
-    rmSync(lock, { recursive: true });
-    mkdirSync(lock, { mode: 0o700 });
-  }
-  writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }), { mode: 0o600 });
-  return () => rmSync(lock, { recursive: true, force: true });
+    try { return work(); } finally { rmdirSync(guard); }
+  };
+  const owner = () => {
+    let value;
+    try { value = JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')); } catch { /* Unknown ownership must fail closed. */ }
+    if (!value || !Number.isSafeInteger(value.pid) || value.pid <= 0
+      || (value.token !== undefined && (typeof value.token !== 'string' || !value.token))) throw new Error(`aero-lp lock owner missing or invalid; manual verification required: ${lock}`);
+    return value;
+  };
+  return guarded(() => {
+    try { mkdirSync(lock, { mode: 0o700 }); } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const { pid } = owner(); // Accept legacy {pid}, but only ESRCH proves it can be reclaimed.
+      try { process.kill(pid, 0); throw new Error(`another aero-lp process (pid ${pid}) holds ${lock}`); }
+      catch (error) { if (error.code !== 'ESRCH') throw error; }
+      rmSync(lock, { recursive: true });
+      mkdirSync(lock, { mode: 0o700 });
+    }
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, token }), { flag: 'wx', mode: 0o600 });
+    let released = false;
+    return () => {
+      if (released) return;
+      guarded(() => {
+        // A missing or damaged owner is preserved, never treated as ours.
+        let current;
+        try { current = owner(); } catch { return; }
+        if (current.token === token) rmSync(lock, { recursive: true });
+        released = true;
+      }, 50);
+    };
+  });
 }
 
 const round = (v, digits = 6) => (Number.isFinite(v) ? Number(v.toPrecision(digits)) : null);
@@ -114,6 +145,7 @@ function rewardView(ctx, state, rewards, memory, now = Date.now()) {
   const price = { tick: state.tick, sqrt: state.sqrtPrice };
   const fees = [rewards.liquidity, rewards.feeGrowth0, rewards.feeGrowth1].includes(null) ? memory.feeResult ?? null
     : feeRate(memory, rewards.feeGrowth0, rewards.feeGrowth1, rewards.liquidity, rewards.stakedLiquidity, now);
+  const dailyTotal = emissionTotalPerDay({ rewardPerSecond: perSecond, stakedLiquidity: rewards.stakedLiquidity, positions: state.positions, price });
   const positions = state.positions.map((p) => {
     const { amount0, amount1 } = positionAmounts(p, state.sqrtPrice, ctx.decimals0, ctx.decimals1);
     const value = amount0 * tickToPrice(state.tick, ctx.decimals0, ctx.decimals1) + amount1;
@@ -127,6 +159,7 @@ function rewardView(ctx, state, rewards, memory, now = Date.now()) {
     summary: {
       price: rewards.price === null ? null : round(rewards.price),
       poolPerDay: perSecond === null ? null : round(perSecond * 86_400),
+      dailyTotal: { ...dailyTotal, perDay: dailyTotal.perDay === null ? null : round(dailyTotal.perDay) },
       feeWindowSec: fees && Math.round(fees.seconds),
       pending: formatUnits(rewards.pending, 18),
       deferred: formatUnits(rewards.deferred, 18),

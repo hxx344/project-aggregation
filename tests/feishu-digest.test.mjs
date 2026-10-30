@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../server/app.mjs';
@@ -145,6 +145,99 @@ test('each slot goes out once, including across a restart', async () => {
   reopened.digest.tick(); await settled(reopened.digest);
   assert.equal(reopened.calls.length, 0);
   await reopened.digest.close();
+});
+
+// Keep the old durable state while making the atomic rename fail on both Windows and POSIX.
+function blockStateWrite(dataDir, name = 'state.json') {
+  const file = join(dataDir, 'feishu-digest', name), backup = `${file}.before-test`;
+  renameSync(file, backup); mkdirSync(file);
+  let restored = false;
+  return () => {
+    if (restored) return;
+    rmdirSync(file); renameSync(backup, file); restored = true;
+  };
+}
+
+test('a failed durable slot claim sends nothing and can retry once after storage recovers', async t => {
+  const f = manager({ at: AT_NINE - 60000 });
+  enable(f.digest);
+  const restore = blockStateWrite(f.dataDir);
+  t.after(async () => { restore(); await f.digest.close(); rmSync(f.dataDir, { recursive: true, force: true }); });
+  f.clock.now = AT_NINE;
+  f.digest.tick(); await settled(f.digest);
+  f.digest.tick(); await settled(f.digest);
+  assert.equal(f.calls.length, 0, 'no external request before the slot claim is durable');
+  assert.match(f.digest.state().loadError, /状态.*保存|保存.*状态/);
+  assert.deepEqual(f.digest.state().history, []);
+  restore();
+  f.clock.now += 60000;
+  f.digest.tick(); await settled(f.digest);
+  assert.equal(f.calls.length, 1, 'failed persistence must not consume the in-memory slot');
+  assert.equal(f.digest.state().loadError, null);
+  f.digest.tick(); await settled(f.digest);
+  assert.equal(f.calls.length, 1);
+  await f.digest.close();
+  const reopened = manager({ dataDir: f.dataDir, at: AT_NINE + 120000 });
+  try { reopened.digest.tick(); await settled(reopened.digest); assert.equal(reopened.calls.length, 0); }
+  finally { await reopened.digest.close(); }
+});
+
+test('a failed durable schedule-save keeps the prior schedule and its unsent slot', async t => {
+  const f = manager({ at: AT_NINE - 60000 });
+  enable(f.digest);
+  const oldConfig = f.digest.state().config, restore = blockStateWrite(f.dataDir);
+  t.after(async () => { restore(); await f.digest.close(); rmSync(f.dataDir, { recursive: true, force: true }); });
+  f.clock.now = AT_NINE;
+  const next = { ...oldConfig, schedule: { ...oldConfig.schedule, times: ['10:00'] } };
+  assert.throws(() => f.digest.save(next), error => error.status === 503);
+  assert.deepEqual(f.digest.state().config, oldConfig);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.dataDir, 'feishu-digest', 'config.json'), 'utf8')), oldConfig);
+  restore();
+  f.digest.tick(); await settled(f.digest);
+  assert.equal(f.calls.length, 1, 'the failed schedule change must not claim the old 09:00 slot');
+  f.digest.save(next);
+  assert.deepEqual(f.digest.state().config.schedule.times, ['10:00']);
+});
+
+test('a durable slot claim prevents restart duplication even if the send history cannot be saved', async t => {
+  let f, restore, sends = 0;
+  f = manager({ at: AT_NINE - 60000, manager: { fetcher: async () => {
+    sends++; restore = blockStateWrite(f.dataDir);
+    return { ok: true, status: 200, json: async () => ({ code: 0 }) };
+  } } });
+  t.after(async () => { restore?.(); await f.digest.close(); rmSync(f.dataDir, { recursive: true, force: true }); });
+  enable(f.digest);
+  f.clock.now = AT_NINE; f.digest.tick(); await settled(f.digest);
+  assert.equal(sends, 1);
+  assert.equal(f.digest.state().history[0].status, 'sent');
+  assert.match(f.digest.state().loadError, /状态.*保存|保存.*状态/);
+  restore(); await f.digest.close();
+  const reopened = manager({ dataDir: f.dataDir, at: AT_NINE + 120000 });
+  try { reopened.digest.tick(); await settled(reopened.digest); assert.equal(reopened.calls.length, 0); }
+  finally { await reopened.digest.close(); }
+});
+
+test('a failed config write restores the old durable slot and keeps the prior plan sendable after restart', async t => {
+  const f = manager({ at: AT_NINE - 60000 });
+  enable(f.digest);
+  const oldConfig = f.digest.state().config;
+  const statePath = join(f.dataDir, 'feishu-digest', 'state.json');
+  const before = JSON.parse(readFileSync(statePath, 'utf8'));
+  const restore = blockStateWrite(f.dataDir, 'config.json');
+  t.after(async () => { restore(); await f.digest.close(); rmSync(f.dataDir, { recursive: true, force: true }); });
+  f.clock.now = AT_NINE;
+  assert.throws(() => f.digest.save({ ...oldConfig, schedule: { ...oldConfig.schedule, times: ['10:00'] } }), error => error.status === 503);
+  assert.deepEqual(f.digest.state().config, oldConfig);
+  assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')), before, 'failed config replacement restores the durable claim');
+  assert.equal(f.calls.length, 0);
+  restore(); await f.digest.close();
+  const reopened = manager({ dataDir: f.dataDir, at: AT_NINE + 60000 });
+  try {
+    assert.deepEqual(reopened.digest.state().config, oldConfig);
+    reopened.digest.tick(); await settled(reopened.digest);
+    assert.equal(reopened.calls.length, 1, 'the old 09:00 plan was not consumed by a failed edit');
+    reopened.digest.tick(); await settled(reopened.digest); assert.equal(reopened.calls.length, 1);
+  } finally { await reopened.digest.close(); }
 });
 
 test('a slot missed during a restart is delivered only inside the grace window', async () => {
@@ -421,6 +514,23 @@ test('funding, execution, Aero and research sections show their own state', () =
   assert.equal(researchSection({ enabled: false, state: 'stopped' }).level, 'idle');
   assert.equal(researchSection({ enabled: true, state: 'running', stale: false, error: null, insights: { asOf: AT_NINE, summary: { title: '无优势' }, leader: { title: 'SNDK', samples: 12 } } }).metrics[2].text, '12');
   assert.equal(researchSection({ enabled: true, state: 'running', stale: true, error: null, insights: null }).level, 'warn');
+});
+
+test('Aero digest uses the common wallet total instead of one independently estimated position', () => {
+  const cycle = { at: new Date(AT_NINE).toISOString(), symbols: ['RSGP', 'USDC'], positions: [
+    { liquidity: '200', staked: true, state: 'below', aeroPerDay: 57600, aeroPerDayEstimated: true },
+    { liquidity: '200', staked: true, state: 'below', aeroPerDay: 57600, aeroPerDayEstimated: true },
+  ], rewards: { dailyTotal: { perDay: 69120, scenario: 'same-lower', reason: null } } };
+  const value = () => aeroSection({ enabled: true, state: 'running', paused: false, lastCycle: cycle, config: { intervalSec: 60 } }, AT_NINE).metrics.find(item => item.key === 'aeroPerDay').text;
+  assert.equal(value(), '69,120（同下沿估计，假设其他活跃流动性不变）');
+  for (const reason of ['different-lower', 'mixed-ranges']) {
+    cycle.rewards.dailyTotal = { perDay: null, scenario: null, reason };
+    assert.equal(value(), '—（逐仓独立估计，不合计）');
+  }
+  cycle.rewards.dailyTotal = { perDay: 0, scenario: 'no-emissions', reason: null };
+  assert.equal(value(), '0');
+  delete cycle.rewards.dailyTotal;
+  assert.equal(value(), '—', 'old snapshots must not silently fall back to one position');
 });
 
 test('one failing source costs only its own section', async () => {

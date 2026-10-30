@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadProfile } from '../deploy/pipeline/config.mjs';
 
 // 激活阶段绑定本轮提交（#94）且缓存命中仍核验运行态（#93）。
@@ -29,7 +29,7 @@ const installer = [
   "if(!fs.existsSync('broken')){fs.writeFileSync('service-up','');fs.rmSync('runtime-down',{force:true});}",
 ].join('');
 
-async function fixture(t) {
+async function fixture(t, { withConfig = false, apply = true } = {}) {
   const directory = mkdtempSync(path.join(tmpdir(), 'pipeline-activate-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const git = args => {
@@ -57,26 +57,38 @@ async function fixture(t) {
   t.after(() => new Promise(resolve => server.close(resolve)));
 
   const record = path.join(directory, 'deployed-state');
-  writeFileSync(path.join(directory, 'deploy/pipeline/environments/dev.json'), JSON.stringify({
-    schema: 1, description: '激活绑定夹具', toolchain: { node: '>=22.0.0', pnpm: '>=11.0.0' }, triggers: { local: {} }, config: [],
-    stages: { activate: {
+  const profile = {
+    schema: 1, description: '激活绑定夹具', toolchain: { node: '>=22.0.0', pnpm: '>=11.0.0' }, triggers: { local: {} },
+    config: withConfig ? [{ name: 'PORT', type: 'port', required: true, default: 3200 }] : [],
+    stages: { ...(withConfig ? {
+      config: {
+        target: 'runtime.env', applyTarget: path.join(directory, 'system.env'), outputs: ['runtime.env'],
+        // 保留真实配置阶段和快照恢复，仅将 sudo install 换成本机文件复制。
+        applyCommands: [{ cmd: process.execPath, args: ['-e', "const fs=require('node:fs');fs.copyFileSync(process.argv[1],process.argv[2]);fs.chmodSync(process.argv[2],0o600);", '{target}', '{applyTarget}'], timeoutMs: 10000 }],
+      },
+      build: { outputs: ['artifact.txt'], commands: [{ cmd: process.execPath, args: ['-e', "require('node:fs').writeFileSync('artifact.txt','built');"], timeoutMs: 10000 }] },
+    } : {}), activate: {
       requiresApply: true,
       commands: [{ cmd: process.execPath, args: ['-e', installer, '--', '--expect-commit', '{commit}', record], timeoutMs: 10000 }],
       targetMismatchExitCode: 75,
       healthUrl: `http://127.0.0.1:${server.address().port}${probe}`, healthAttempts: 2, healthIntervalMs: 20,
       deployedRecord: record,
     } },
-  }));
+  };
+  const save = () => writeFileSync(path.join(directory, 'deploy/pipeline/environments/dev.json'), JSON.stringify(profile));
+  save();
   const pnpmStub = path.join(directory, 'pnpm-fixture.mjs');
   writeFileSync(pnpmStub, "process.stdout.write('11.25.0\\n');");
 
   // 异步运行真实 CLI，本进程的 HTTP 端点才能应答。只有成功阶段会更新 lastRunId，故按新增运行目录取摘要。
   const runs = () => (existsSync(path.join(directory, '.pipeline/runs')) ? readdirSync(path.join(directory, '.pipeline/runs')) : []);
+  const environment = withConfig ? { PORT: '3200' } : {};
   let summary = null;
+  let runDir = null;
   const run = (...args) => new Promise((resolve, reject) => {
     const before = new Set(runs());
-    const child = spawn(process.execPath, [path.join(directory, 'deploy/pipeline/cli.mjs'), 'run', '--env', 'dev', '--apply', ...args], {
-      cwd: directory, env: { ...process.env, npm_execpath: pnpmStub }, stdio: ['ignore', 'pipe', 'pipe'],
+    const child = spawn(process.execPath, [path.join(directory, 'deploy/pipeline/cli.mjs'), 'run', '--env', 'dev', ...(apply ? ['--apply'] : []), ...args], {
+      cwd: directory, env: { ...process.env, ...environment, npm_execpath: pnpmStub }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
     child.stdout.on('data', chunk => { output += chunk; });
@@ -86,7 +98,8 @@ async function fixture(t) {
     child.on('close', status => {
       clearTimeout(timer);
       const [created] = runs().filter(id => !before.has(id));
-      summary = created ? JSON.parse(readFileSync(path.join(directory, '.pipeline/runs', created, 'summary.json'), 'utf8')) : null;
+      runDir = created ? path.join(directory, '.pipeline/runs', created) : null;
+      summary = runDir && existsSync(path.join(runDir, 'summary.json')) ? JSON.parse(readFileSync(path.join(runDir, 'summary.json'), 'utf8')) : null;
       resolve({ status, output });
     });
   });
@@ -97,8 +110,163 @@ async function fixture(t) {
   const state = () => (existsSync(file('.pipeline/state/dev.json')) ? JSON.parse(readFileSync(file('.pipeline/state/dev.json'), 'utf8')) : { stages: {} });
   const activate = () => summary.stages.activate;
   const deployed = () => readFileSync(record, 'utf8').split(' ')[0];
-  return { commit, health, record, run, write, remove, calls, state, activate, deployed, runStatus: () => summary.status };
+  const journal = () => readFileSync(path.join(runDir, 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  return { commit, health, record, run, write, remove, calls, state, activate, deployed, file, environment, profile, save, journal, summary: () => summary, runStatus: () => summary.status };
 }
+
+test('目标不可用时恢复本轮已应用配置及原权限，保留构建缓存；晋级后重新应用并激活', async t => {
+  const f = await fixture(t, { withConfig: true });
+  f.write('latest.txt', f.commit);
+  assert.equal((await f.run()).status, 0);
+  const build = f.state().stages.build;
+  f.write('latest.txt', other);
+  f.write('deployed-state', `${other} key\n`);
+  f.write('system.env', 'PORT=3100\n');
+  f.write('runtime.env', 'PORT=3101\n');
+  chmodSync(f.file('system.env'), 0o640);
+  chmodSync(f.file('runtime.env'), 0o644);
+  const systemMode = statSync(f.file('system.env')).mode & 0o777;
+  const renderMode = statSync(f.file('runtime.env')).mode & 0o777;
+
+  const pending = await f.run();
+  assert.equal(pending.status, 0, pending.output);
+  assert.equal(readFileSync(f.file('system.env'), 'utf8'), 'PORT=3100\n');
+  assert.equal(readFileSync(f.file('runtime.env'), 'utf8'), 'PORT=3101\n');
+  assert.equal(statSync(f.file('system.env')).mode & 0o777, systemMode);
+  assert.equal(statSync(f.file('runtime.env')).mode & 0o777, renderMode);
+  assert.equal(f.deployed(), other);
+  assert.equal(f.runStatus(), 'deferred');
+  assert.equal(f.summary().stages.config.status, 'rolled_back');
+  assert.equal(f.state().stages.config.status, 'rolled_back');
+  assert.equal(f.state().stages.activate, undefined);
+  assert.deepEqual(f.state().stages.build, build, '未改变的构建缓存继续有效');
+  assert.equal(f.journal().filter(record => record.type === 'rollback.ok' && record.stage === 'config').length, 1);
+
+  f.write('latest.txt', f.commit);
+  const promoted = await f.run();
+  assert.equal(promoted.status, 0, promoted.output);
+  assert.match(readFileSync(f.file('system.env'), 'utf8'), /^PORT=3200$/m);
+  assert.equal(f.deployed(), f.commit);
+  assert.equal(f.state().stages.config.status, 'ok');
+  assert.equal(f.state().stages.activate.status, 'ok');
+  assert.deepEqual(f.state().stages.build, build);
+});
+
+test('目标不可用且原配置不存在时删除本轮创建的系统与渲染文件', async t => {
+  const f = await fixture(t, { withConfig: true });
+  f.write('latest.txt', other);
+  f.write('deployed-state', `${other} key\n`);
+  const pending = await f.run();
+  assert.equal(pending.status, 0, pending.output);
+  assert.equal(existsSync(f.file('system.env')), false);
+  assert.equal(existsSync(f.file('runtime.env')), false);
+  assert.equal(f.deployed(), other);
+  assert.equal(f.runStatus(), 'deferred');
+  assert.equal(f.state().stages.config.status, 'rolled_back');
+  assert.equal(f.state().stages.build.status, 'ok');
+});
+
+test('目标不可用但本轮未执行配置时不恢复历史配置快照', async t => {
+  const f = await fixture(t, { withConfig: true });
+  f.write('latest.txt', f.commit);
+  assert.equal((await f.run()).status, 0);
+  const config = f.state().stages.config;
+  f.write('system.env', 'PORT=3300\n');
+  f.write('latest.txt', other);
+  const pending = await f.run('--only', 'activate', '--force');
+  assert.equal(pending.status, 0, pending.output);
+  assert.equal(readFileSync(f.file('system.env'), 'utf8'), 'PORT=3300\n');
+  assert.match(readFileSync(f.file('runtime.env'), 'utf8'), /^PORT=3200$/m);
+  assert.deepEqual(f.state().stages.config, config);
+  assert.equal(f.journal().some(record => record.type.startsWith('rollback.')), false);
+});
+
+test('未加 apply 的普通延后保留渲染配置，未触碰系统文件', async t => {
+  const f = await fixture(t, { withConfig: true, apply: false });
+  f.write('system.env', 'PORT=3100\n');
+  const planned = await f.run();
+  assert.equal(planned.status, 0, planned.output);
+  assert.equal(readFileSync(f.file('system.env'), 'utf8'), 'PORT=3100\n');
+  assert.match(readFileSync(f.file('runtime.env'), 'utf8'), /^PORT=3200$/m);
+  assert.equal(f.summary().stages.config.status, 'deferred');
+  assert.equal(f.activate().status, 'deferred');
+  assert.equal(f.journal().some(record => record.type.startsWith('rollback.')), false);
+  assert.deepEqual(f.calls(), []);
+});
+
+for (const fault of ['restore', 'restore-and-log', 'log']) {
+  test(`目标不可用后 ${fault} 失败必须非零退出，保留备份且不重复恢复`, async t => {
+    const f = await fixture(t, { withConfig: true });
+    f.write('latest.txt', other);
+    f.write('deployed-state', `${other} key\n`);
+    f.write('system.env', 'PORT=3100\n');
+    f.write('runtime.env', 'PORT=3101\n');
+    const inject = f.file('rollback-fault.mjs');
+    writeFileSync(inject, [
+      "import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';",
+      `const fault=${JSON.stringify(fault)}; const originalCopy=fs.copyFileSync;`,
+      "fs.copyFileSync=function(source,target,...args){",
+      "if(String(source).replaceAll('\\\\','/').endsWith('/backups/applied.env')){",
+      "fs.appendFileSync('restore-attempts.txt','x');",
+      "if(fault.startsWith('restore'))throw new Error('注入系统配置恢复失败');}",
+      "return originalCopy.call(this,source,target,...args);};",
+      "if(fault.includes('log'))for(const name of ['writeFileSync','appendFileSync']){",
+      "const original=fs[name];fs[name]=function(file,data,...args){",
+      "if(String(file).endsWith('journal.jsonl')&&String(data).includes('\"type\":\"rollback.'))throw new Error('注入回滚日志失败');",
+      "return original.call(this,file,data,...args);};}syncBuiltinESMExports();",
+    ].join('\n'));
+    f.environment.NODE_OPTIONS = `--import=${pathToFileURL(inject).href}`;
+    const failed = await f.run();
+    assert.equal(failed.status, 1, failed.output);
+    assert.equal(f.runStatus(), 'failed');
+    assert.equal(f.state().stages.config.status, fault === 'log' ? 'rolled_back' : 'failed');
+    assert.notEqual(f.state().stages.activate?.status, 'ok');
+    assert.equal(f.state().stages.build.status, 'ok');
+    assert.equal(readFileSync(f.file('restore-attempts.txt'), 'utf8'), 'x', '失败收尾不能再次补偿');
+    assert.equal(readFileSync(f.file('runtime.env'), 'utf8'), 'PORT=3101\n', '系统文件恢复失败仍尝试恢复渲染文件');
+    const snapshot = f.journal().find(record => record.type === 'snapshot' && record.stage === 'config').data;
+    assert.equal(readFileSync(snapshot.applied.backup, 'utf8'), 'PORT=3100\n');
+    assert.equal(readFileSync(snapshot.backup, 'utf8'), 'PORT=3101\n');
+    assert.equal(f.deployed(), other);
+    if (fault.startsWith('restore')) assert.match(failed.output, /运行失败：配置未完全回滚：.*注入系统配置恢复失败/);
+    else assert.equal(readFileSync(f.file('system.env'), 'utf8'), 'PORT=3100\n');
+    if (fault.includes('log')) assert.match(failed.output, /恢复记录写入失败/);
+  });
+}
+
+test('目标不可用后配置恢复终止未确认时保留隔离锁，不继续恢复或允许下一轮', async t => {
+  const f = await fixture(t, { withConfig: true });
+  f.profile.stages.config.applyWithSudo = true;
+  f.save();
+  f.write('latest.txt', other);
+  f.write('deployed-state', `${other} key\n`);
+  f.write('system.env', 'PORT=3100\n');
+  f.write('runtime.env', 'PORT=3101\n');
+  const executor = f.file('deploy/pipeline/exec.mjs');
+  writeFileSync(f.file('deploy/pipeline/exec-real.mjs'), readFileSync(executor));
+  // 提权快照仍调用真实文件辅助入口；恢复用执行器原有未确认终止路径注入，不启动 sudo。
+  writeFileSync(executor, [
+    "import {EventEmitter} from 'node:events'; import {PassThrough} from 'node:stream';",
+    "import {runCommand as real} from './exec-real.mjs';",
+    "export {CommandError,probeVersion,formatInvocation} from './exec-real.mjs';",
+    "export const runCommand=options=>{const command=options.command;",
+    "if(options.stageId!=='config'||command.cmd!=='sudo')return real(options);",
+    "if(command.args[3]==='snapshot')return real({...options,command:{...command,cmd:command.args[1],args:command.args.slice(2)}});",
+    "const child=Object.assign(new EventEmitter(),{pid:999999,exitCode:null,signalCode:null,stdout:new PassThrough(),stderr:new PassThrough(),unref(){},kill(){return true;}});",
+    "return real({...options,platform:'win32',spawnImpl:()=>child,timeoutMs:10,termGraceMs:20,killGraceMs:30});};",
+  ].join('\n'));
+  const failed = await f.run();
+  assert.equal(failed.status, 1, failed.output);
+  assert.equal(f.runStatus(), 'failed');
+  assert.equal(f.state().stages.config.status, 'failed');
+  assert.match(readFileSync(f.file('system.env'), 'utf8'), /^PORT=3200$/m);
+  assert.match(readFileSync(f.file('runtime.env'), 'utf8'), /^PORT=3200$/m, '停止配置恢复以避开未知进程');
+  assert.equal(f.deployed(), other);
+  const lock = JSON.parse(readFileSync(f.file('.pipeline/locks/dev.lock'), 'utf8'));
+  assert.equal(lock.terminationUnconfirmed.stage, 'config', '隔离归属保持为实际恢复命令');
+  assert.equal(f.journal().filter(record => record.type === 'rollback.failed' && record.stage === 'config').length, 1);
+  assert.equal((await f.run()).status, 4, '下一轮仍被隔离锁拒绝');
+});
 
 test('候选 A 未晋级、正式版为 B 时不安装 B，记为 deferred；晋级后固定安装 A 并核对部署记录', async t => {
   const f = await fixture(t);
