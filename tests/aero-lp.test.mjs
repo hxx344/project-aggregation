@@ -301,6 +301,10 @@ test('AERO is priced from the deeper legacy token; the new token only when the l
   assert.equal((await readRewards(ctx, WALLET, [])).price, 0.661459, 'a thin new-token pool does not override the 1:1 legacy quote');
   quotes[LEGACY] = 0n;
   assert.equal((await readRewards(ctx, WALLET, [])).price, 0.9);
+  ctx.pool.feeGrowthGlobal0X128 = async () => { throw new Error('rate limited'); };
+  const partial = await readRewards(ctx, WALLET, []);
+  assert.equal(partial.feeGrowth0, null, 'a failed fee read only blanks the fee data');
+  assert.equal(partial.aero, 5n);
 });
 
 // 只读调用按函数名应答的假 RPC：可以伪造任意只读结果，用来确认签名目标只取自配置。

@@ -119,7 +119,7 @@ function rewardView(ctx, state, rewards, memory, now = Date.now()) {
     const value = amount0 * tickToPrice(state.tick, ctx.decimals0, ctx.decimals1) + amount1;
     const apr = p.staked && perSecond !== null ? emissionApr({ rewardPerSecond: perSecond, rewardPrice: rewards.price, stakedLiquidity: rewards.stakedLiquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 }) : null;
     const daily = p.staked && perSecond !== null ? emissionPerDay({ rewardPerSecond: perSecond, stakedLiquidity: rewards.stakedLiquidity, position: p, price }) : null;
-    const fee = fees && rewards.liquidity !== null && feeApr({ feesPerSecond0: fees.perSecond0, feesPerSecond1: fees.perSecond1, activeLiquidity: rewards.liquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 });
+    const fee = fees && rewards.liquidity !== null ? feeApr({ feesPerSecond0: fees.perSecond0, feesPerSecond1: fees.perSecond1, activeLiquidity: rewards.liquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 }) : null;
     return { amount0: round(amount0), amount1: round(amount1), value: round(value), apr: apr && round(apr.apr, 4), aprEstimated: apr?.estimated ?? false,
       aeroPerDay: daily && round(daily.perDay), aeroPerDayEstimated: daily?.estimated ?? false, feeApr: fee && round(fee.apr, 4), feeAprEstimated: fee?.estimated ?? false };
   });
