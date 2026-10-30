@@ -76,7 +76,7 @@ export function openDatabase(filename: string, migrations = resolve('drizzle')) 
       } catch (error) { connection.exec('ROLLBACK'); throw error; }
     },
     /** Check and write in one short transaction. `run` must stay synchronous: no external calls inside. */
-    transaction<T>(run: () => T): T {
+    transaction<T>(run: () => T extends PromiseLike<unknown> ? never : T): T {
       connection.exec('BEGIN IMMEDIATE');
       try {
         const result = run();

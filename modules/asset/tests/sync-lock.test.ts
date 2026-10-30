@@ -65,3 +65,20 @@ test('a live task renews its lease, but only until the overall hold limit', asyn
   assert.equal(f.lockToken(), next.token);
   assert.deepEqual(f.writes(), ['renewed']);
 });
+
+test('a renewal that throws stops renewing instead of escaping the timer', async t => {
+  const f = fixture(t);
+  const lease = await f.acquire();
+  const prepare = f.database.prepare.bind(f.database);
+  t.mock.method(f.database, 'prepare', (sql: string) => {
+    if (sql.startsWith('UPDATE sync_locks')) throw new Error('SQLITE_BUSY');
+    return prepare(sql);
+  });
+  f.clock.at += 30_000;
+  assert.doesNotThrow(() => t.mock.timers.tick(30_000));
+  // Renewal stopped, so the lease lapses at its original TTL and later writes are refused.
+  f.clock.at += 90_001;
+  assert.throws(() => lease.write(f.probe('late')), { message: LOCK_LOST });
+  assert.deepEqual(f.writes(), []);
+  await lease.release();
+});

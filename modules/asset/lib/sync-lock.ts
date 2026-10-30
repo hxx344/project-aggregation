@@ -12,9 +12,11 @@ export const LOCK_LOST = '资产更新超时或已被其他操作接替，本次
 export type SyncLease = {
   readonly token: string;
   /** Verify ownership and run the synchronous writes in one transaction; throws LOCK_LOST and writes nothing once ownership is gone. */
-  write<T>(run: () => T): T;
+  write<T>(run: () => Synchronous<T>): T;
   release(): Promise<void>;
 };
+/** Writes run inside a transaction, so an async callback (writing after an await, outside it) is a type error. */
+export type Synchronous<T> = T extends PromiseLike<unknown> ? never : T;
 type Options = { now?: () => number; ttlMs?: number; renewMs?: number; maxHoldMs?: number };
 
 /**
@@ -31,8 +33,12 @@ export async function acquireSyncLock(database: Database, owner: string, options
     const at = now();
     // Past the hold limit the lease is left to expire; a stuck task cannot keep others out forever.
     if (at - acquiredAt >= maxHold) return stop();
-    const renewed = database.prepare('UPDATE sync_locks SET expires = ? WHERE owner = ? AND token = ? AND expires >= ?').bind(Math.min(at + ttl, acquiredAt + maxHold), owner, token, at).execute();
-    if (!renewed.meta.changes) stop();
+    // A failed renewal (busy or closed database) must not escape the timer and crash the process;
+    // the lease then simply expires and later writes are refused.
+    try {
+      const renewed = database.prepare('UPDATE sync_locks SET expires = ? WHERE owner = ? AND token = ? AND expires >= ?').bind(Math.min(at + ttl, acquiredAt + maxHold), owner, token, at).execute();
+      if (!renewed.meta.changes) stop();
+    } catch { stop(); }
   }, options.renewMs ?? LOCK_RENEW_MS);
   timer.unref?.();
   function stop() { clearInterval(timer); timer = undefined; }
