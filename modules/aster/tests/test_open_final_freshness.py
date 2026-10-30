@@ -4,6 +4,7 @@ The real shared SQLite writer, ManagedWriter, LiveBroker and API are used.
 Only the final network is an httpx.MockTransport, and account reads come from
 a paper ledger fixture stamped with the live broker's read generation.
 """
+import contextlib
 import json
 import sqlite3
 import time
@@ -86,7 +87,7 @@ class OpenFinalFreshnessTests(unittest.TestCase):
             return json.loads(db.execute("SELECT data FROM intents ORDER BY rowid DESC LIMIT 1").fetchone()[0])
 
     def operation_states(self):
-        with sqlite3.connect(self.environment["WORKSPACE_WRITER_DB"]) as db:
+        with contextlib.closing(sqlite3.connect(self.environment["WORKSPACE_WRITER_DB"])) as db:
             return [row[0] for row in db.execute("SELECT state FROM aw_operations ORDER BY rowid")]
 
     def assert_not_sent(self, reason):

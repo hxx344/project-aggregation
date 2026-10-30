@@ -57,6 +57,10 @@ class ParquetMarket:
         self._span = None
         self._perp = None
 
+    def close(self):
+        """Drop the cached months: each one holds memory maps that lock the .npy files on Windows."""
+        self._months.clear()
+
     def _binance(self):
         if self._perp is None:
             from .binance import BinancePerp

@@ -556,17 +556,17 @@ class ParquetMarketTest(unittest.TestCase):
                     "mark_price": marks, "bid_price": [m - 0.001 for m in marks], "ask_price": [m + 0.001 for m in marks]}),
                     Path(folder) / f"{month}.parquet")
             for attempt in range(2):  # second pass reads the .npy cache
-                market = ParquetMarket(folder)
-                hour = boundary // 3600
-                chain = sorted(market.chain(hour), key=lambda q: (q.strike, not q.is_call))
-                self.assertEqual([(q.strike, q.is_call) for q in chain], [(40000.0, True), (40000.0, False)])
-                self.assertAlmostEqual(chain[0].mark, 0.012 * 40100.0, places=1)  # Feb file's 00:00 snapshot is newer
-                self.assertAlmostEqual(chain[0].bid, 0.011 * 40100.0, places=1)
-                self.assertEqual(chain[0].expiry, expiry // 3600)
-                self.assertIsNotNone(market.quote(hour + 1, expiry // 3600, 41000.0, True))
-                self.assertIsNone(market.quote(hour + 1, expiry // 3600, 40000.0, True))
-                self.assertIsNone(market.quote(hour + 1, expiry // 3600, 42000.0, True))  # no mark price
-                self.assertEqual(market.span(), (hour, hour + 1))
+                with contextlib.closing(ParquetMarket(folder)) as market:
+                    hour = boundary // 3600
+                    chain = sorted(market.chain(hour), key=lambda q: (q.strike, not q.is_call))
+                    self.assertEqual([(q.strike, q.is_call) for q in chain], [(40000.0, True), (40000.0, False)])
+                    self.assertAlmostEqual(chain[0].mark, 0.012 * 40100.0, places=1)  # Feb file's 00:00 snapshot is newer
+                    self.assertAlmostEqual(chain[0].bid, 0.011 * 40100.0, places=1)
+                    self.assertEqual(chain[0].expiry, expiry // 3600)
+                    self.assertIsNotNone(market.quote(hour + 1, expiry // 3600, 41000.0, True))
+                    self.assertIsNone(market.quote(hour + 1, expiry // 3600, 40000.0, True))
+                    self.assertIsNone(market.quote(hour + 1, expiry // 3600, 42000.0, True))  # no mark price
+                    self.assertEqual(market.span(), (hour, hour + 1))
             self.assertTrue((Path(folder) / ".optbt-cache").is_dir())
 
     def test_appending_later_quotes_keeps_earlier_prices_and_pnl(self):
@@ -581,10 +581,10 @@ class ParquetMarketTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             for rows in ([call, expiring], [call, expiring] + deep_puts):  # rewrite the month with quotes after the backtest end
                 write_quotes(Path(folder) / "2024-01.parquet", rows)
-                market = ParquetMarket(folder)
-                quote = market.quote(FRIDAY_21, SUNDAY_08, 41000.0, True)
-                trades = engine.run(spec, market)[0]
-                results.append(((quote.mark, quote.bid, quote.ask), [(t["credit"], t["fees"], t["pnl"]) for t in trades]))
+                with contextlib.closing(ParquetMarket(folder)) as market:
+                    quote = market.quote(FRIDAY_21, SUNDAY_08, 41000.0, True)
+                    trades = engine.run(spec, market)[0]
+                    results.append(((quote.mark, quote.bid, quote.ask), [(t["credit"], t["fees"], t["pnl"]) for t in trades]))
         self.assertEqual(results[0], results[1])
         (mark, bid, ask), trades = results[0]
         self.assertAlmostEqual(mark, 400.0, places=2)
