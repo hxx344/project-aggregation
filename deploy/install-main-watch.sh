@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 副服务器一键部署主服务器巡检：每分钟探测一次，连续失败发飞书告警，恢复后通知。
-# 可重复执行升级；未传参数时保留已有配置，内容未变且定时器正常时直接结束。
+# 可选心跳模式：副服务器常驻接收签名心跳，主服务器用 --sender 安装每 30 秒一次的心跳推送。
+# 可重复执行升级；未传参数时保留已有配置，内容未变且服务正常时直接结束。
 set -Eeuo pipefail
 umask 077
 export PYTHONDONTWRITEBYTECODE=1
@@ -9,10 +10,13 @@ say() { printf '[main-watch] %s\n' "$*"; }
 die() { printf '[main-watch] %s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'USAGE'
-用法: sudo bash install-main-watch.sh [选项]
+用法（副服务器，巡检与告警）: sudo bash install-main-watch.sh [选项]
   --main HOST:PORT     主服务器工作台地址，检查 http://HOST:PORT/api/ready
   --checks "目标 ..."  额外检查目标：http(s)://... 或 tcp://主机:端口，空格分隔；传空串清除
                        --main 与 --checks 分开保存，只改其中一项不影响另一项
+  --heartbeat-listen HOST:PORT
+                       接收主服务器心跳的监听地址，如 0.0.0.0:8792；传空串关闭心跳模式
+  --heartbeat-token T  心跳共享令牌（32~256 位字母数字-_）；开启心跳且未设置时自动生成
   --webhook URL        飞书群机器人 Webhook
   --secret SECRET      机器人开启“签名校验”时的密钥
   --name NAME          告警里显示的服务器名称，默认“主服务器”
@@ -20,7 +24,14 @@ usage() {
   --remind MINUTES     故障持续时每隔多少分钟再提醒，默认 30
   --test               部署后发送测试消息（配置变化时总会发送）
   --uninstall          停止并移除巡检服务，保留 /etc/main-watch 配置
-首次安装需要 --main 或 --checks，以及 --webhook；之后不带参数重复执行即为升级。
+首次安装需要 --main、--checks 或 --heartbeat-listen 之一，以及 --webhook；之后不带参数重复执行即为升级。
+
+用法（主服务器，心跳推送）: sudo bash install-main-watch.sh --sender [选项]
+  --send-to URL        副服务器心跳地址，如 http://副服务器IP:8792/heartbeat
+  --heartbeat-token T  与副服务器相同的心跳令牌
+  --ready-url URL      本机工作台就绪接口，默认按 /etc/project-aggregation.env 的 HOST/PORT 推算
+  --uninstall          停止并移除心跳推送，保留 /etc/main-watch/sender 配置
+首次安装需要 --send-to 与 --heartbeat-token；之后 sudo bash install-main-watch.sh --sender 即为升级。
 USAGE
 }
 [[ $(uname -s) == Linux && $EUID -eq 0 ]] || die '请在 Linux 上以 root 或 sudo 运行。'
@@ -28,19 +39,19 @@ USAGE
 
 root=/opt/main-watch
 etc=/etc/main-watch
-config=$etc/config
 service=main-watch
-unit=/etc/systemd/system/main-watch.service
-timer=/etc/systemd/system/main-watch.timer
-command_path=/usr/local/bin/main-watch
+systemd_dir=/etc/systemd/system
 repository=hxx344/project-aggregation
 files=(tools/main-watch/main_watch.py deploy/install-main-watch.sh)
+# 两种角色共用程序目录与服务账号，各自的配置、单元与管理命令互不覆盖。
+watch_units=(main-watch.service main-watch.timer main-watch-heartbeat.service)
+sender_units=(main-watch-sender.service main-watch-sender.timer)
 
-args=("$@") source_dir='' source_revision='' send_test=0 uninstall=0
-settings=()
+args=("$@") source_dir='' source_revision='' send_test=0 uninstall=0 sender=0
+settings=() watch_only='' sender_only=''
 while (($#)); do
   case $1 in
-    --main|--checks|--webhook|--secret|--name|--threshold|--remind|--source|--revision)
+    --main|--checks|--webhook|--secret|--name|--threshold|--remind|--heartbeat-listen|--heartbeat-token|--send-to|--ready-url|--source|--revision)
       [[ $# -ge 2 ]] || die "$1 需要一个值"
       case $1 in
         --main)
@@ -52,17 +63,36 @@ while (($#)); do
         --name) settings+=("NAME=$2") ;;
         --threshold) settings+=("FAIL_THRESHOLD=$2") ;;
         --remind) settings+=("REMIND_MINUTES=$2") ;;
+        --heartbeat-listen) settings+=("HEARTBEAT_LISTEN=$2") ;;
+        --heartbeat-token) settings+=("HEARTBEAT_TOKEN=$2") ;;
+        --send-to) settings+=("HEARTBEAT_URL=$2") ;;
+        --ready-url) settings+=("READY_URL=$2") ;;
         --source) source_dir=$2 ;;
         --revision) source_revision=$2 ;;
       esac
+      case $1 in
+        --send-to|--ready-url) sender_only=$1 ;;
+        --heartbeat-token|--source|--revision) ;;
+        *) watch_only=$1 ;;
+      esac
       shift 2 ;;
-    --test) send_test=1; shift ;;
+    --test) send_test=1 watch_only=$1; shift ;;
+    --sender) sender=1; shift ;;
     --uninstall) uninstall=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; die "未知参数：$1" ;;
   esac
 done
 [[ -z $source_revision || $source_revision =~ ^[a-f0-9]{40}$ ]] || die '--revision 必须是 40 位提交号。'
+if ((sender)); then
+  [[ -z $watch_only ]] || die "$watch_only 只用于副服务器巡检，不能与 --sender 一起使用。"
+  config=$etc/sender command_path=/usr/local/bin/main-watch-sender units=("${sender_units[@]}") other_units=("${watch_units[@]}")
+else
+  [[ -z $sender_only ]] || die "$sender_only 只用于主服务器心跳推送，需要同时传 --sender。"
+  config=$etc/config command_path=/usr/local/bin/main-watch units=("${watch_units[@]}") other_units=("${sender_units[@]}")
+fi
+role_args=()
+if ((sender)); then role_args=(--sender); fi
 
 # 不解析符号链接：系统升级换掉 python3.X 后，单元仍指向有效的 python3。依赖检查与服务使用同一个解释器。
 pick_python() { if [[ -x /usr/bin/python3 ]]; then python_bin=/usr/bin/python3; else python_bin=$(command -v python3 || true); fi; }
@@ -126,36 +156,49 @@ print(source_digest(sys.argv[1], sys.argv[2:]))
 PY
 }
 
-trusted "$root" "$etc" "$unit" "$timer" "$command_path"
+trusted "$root" "$etc" "${watch_units[@]/#/$systemd_dir/}" "${sender_units[@]/#/$systemd_dir/}" /usr/local/bin/main-watch /usr/local/bin/main-watch-sender
 install -d -m 755 "$root" "$root/sources"
 exec 9>"$root/upgrade.lock"
 flock -n 9 || die '另一个 main-watch 安装正在运行。'
 
 if ((uninstall)); then
-  systemctl disable --now main-watch.timer >/dev/null 2>&1 || true
-  systemctl stop main-watch.service >/dev/null 2>&1 || true
-  rm -f -- "$unit" "$timer" "$command_path"
-  rm -rf -- "$root"
+  systemctl disable --now "${units[@]:1}" >/dev/null 2>&1 || true
+  systemctl stop "${units[0]}" >/dev/null 2>&1 || true
+  rm -f -- "${units[@]/#/$systemd_dir/}" "$command_path"
+  # 另一角色仍在本机时保留共用的程序目录。
+  other_left=0
+  for name in "${other_units[@]}"; do [[ ! -e $systemd_dir/$name ]] || other_left=1; done
+  ((other_left)) || rm -rf -- "$root"
   systemctl daemon-reload
-  systemctl reset-failed main-watch.service main-watch.timer >/dev/null 2>&1 || true
-  say "已移除巡检服务。配置保留在 $etc，状态在 /var/lib/$service；不再需要时可手工删除，并执行 userdel $service。"
+  systemctl reset-failed "${units[@]}" >/dev/null 2>&1 || true
+  if ((sender)); then say "已移除心跳推送。配置保留在 $config。"
+  else say "已移除巡检服务。配置保留在 $etc，状态在 /var/lib/$service；不再需要时可手工删除，并执行 userdel $service。"; fi
   exit 0
 fi
 
 scratch=$(mktemp -d "$root/.install-XXXXXX")
-backup="$scratch/backup" switched=0 timer_was_enabled=0 timer_was_active=0
-systemctl is-enabled --quiet main-watch.timer 2>/dev/null && timer_was_enabled=1
-systemctl is-active --quiet main-watch.timer 2>/dev/null && timer_was_active=1
-targets=("$root/main_watch.py" "$unit" "$timer" "$command_path" "$config")
+backup="$scratch/backup" switched=0
+# 记录定时器与心跳接收服务原来的启用与运行状态，失败时按原样恢复。
+declare -A was_enabled=() was_active=()
+for name in "${units[@]:1}"; do
+  systemctl is-enabled --quiet "$name" 2>/dev/null && was_enabled[$name]=1
+  systemctl is-active --quiet "$name" 2>/dev/null && was_active[$name]=1
+done
+targets=("$root/main_watch.py" "${units[@]/#/$systemd_dir/}" "$command_path" "$config")
+config_index=$((${#targets[@]} - 1)) command_index=$((${#targets[@]} - 2))
 restore() {
-  local index target
+  local index target name
+  # 先在单元文件还在时停用，避免删掉文件后留下悬空的启用链接。
+  systemctl disable --now "${units[@]:1}" >/dev/null 2>&1 || true
   for index in "${!targets[@]}"; do
     target=${targets[$index]}
     if [[ -f $backup/$index ]]; then cp -p -- "$backup/$index" "$target"; else rm -f -- "$target"; fi
   done
   systemctl daemon-reload || true
-  if ((timer_was_enabled)); then systemctl enable main-watch.timer >/dev/null 2>&1 || true; else systemctl disable main-watch.timer >/dev/null 2>&1 || true; fi
-  if ((timer_was_active)); then systemctl restart main-watch.timer || true; else systemctl stop main-watch.timer >/dev/null 2>&1 || true; fi
+  for name in "${units[@]:1}"; do
+    if [[ -n ${was_enabled[$name]:-} ]]; then systemctl enable "$name" >/dev/null 2>&1 || true; else systemctl disable "$name" >/dev/null 2>&1 || true; fi
+    if [[ -n ${was_active[$name]:-} ]]; then systemctl restart "$name" || true; else systemctl stop "$name" >/dev/null 2>&1 || true; fi
+  done
 }
 cleanup() {
   local result=$?
@@ -218,51 +261,69 @@ program="$source_dir/tools/main-watch/main_watch.py"
 revision_label=${source_revision:-local:$(source_digest "$source_dir" | cut -c1-12)}
 
 # 合并配置：命令行给出的项覆盖已有配置，其余保留；未传参数时不改动配置文件。
-if [[ ! -f $config && ${#settings[@]} -eq 0 ]]; then usage >&2; die '首次安装需要 --main 或 --checks，以及 --webhook。'; fi
+if [[ ! -f $config && ${#settings[@]} -eq 0 ]]; then
+  usage >&2
+  if ((sender)); then die '首次安装需要 --send-to 与 --heartbeat-token。'; fi
+  die '首次安装需要 --main、--checks 或 --heartbeat-listen 之一，以及 --webhook。'
+fi
+# 主服务器首次安装且未指定 --ready-url 时，按工作台环境文件推算本机就绪接口。
+ready_given=0
+for item in "${settings[@]}"; do [[ $item != READY_URL=* ]] || ready_given=1; done
+if ((sender && !ready_given)) && [[ ! -f $config && -f /etc/project-aggregation.env ]] && trusted /etc/project-aggregation.env 2>/dev/null; then
+  app_host=$(sed -n 's/^HOST=//p' /etc/project-aggregation.env | tail -n 1 | tr -d "\"' ")
+  app_port=$(sed -n 's/^PORT=//p' /etc/project-aggregation.env | tail -n 1 | tr -d "\"' ")
+  app_host=${app_host:-127.0.0.1}
+  case $app_host in 0.0.0.0) app_host=127.0.0.1 ;; ::) app_host='[::1]' ;; *:*) app_host="[$app_host]" ;; esac
+  settings+=("READY_URL=http://$app_host:${app_port:-3100}/api/ready")
+fi
 if ((${#settings[@]})); then
-  python3 -I -B - "$(dirname -- "$program")" "$config" "$scratch/config" "${settings[@]}" <<'PY'
-import os, sys
+  python3 -I -B - "$(dirname -- "$program")" "$config" "$scratch/config" "$sender" "${settings[@]}" <<'PY'
+import os, secrets, sys
 sys.path.insert(0, sys.argv[1])
 import main_watch
+sender = sys.argv[4] == '1'
+keys, validate = main_watch.role(sender)
 existing = {}
 try:
     if os.path.exists(sys.argv[2]):
         with open(sys.argv[2], encoding='utf-8') as handle:
-            existing = main_watch.parse_config(handle.read())
-    for item in sys.argv[4:]:
+            existing = main_watch.parse_config(handle.read(), keys)
+    for item in sys.argv[5:]:
         key, _, value = item.partition('=')
         if any(ch in value for ch in '\r\n'):
             raise main_watch.ConfigError(f'{key} 不能包含换行')
         existing[key] = value.strip()
-    main_watch.validate(existing)
+    # 开启心跳且没有令牌时自动生成，部署结束时打印给主服务器使用。
+    if not sender and existing.get('HEARTBEAT_LISTEN') and not existing.get('HEARTBEAT_TOKEN'):
+        existing['HEARTBEAT_TOKEN'] = secrets.token_urlsafe(32)
+    validate(existing)
 except main_watch.ConfigError as error:
     sys.exit(f'[main-watch] 配置无效，未做任何改动：{error}')
-lines = ['# 由 install-main-watch.sh 维护；手工修改后执行 sudo main-watch check 校验']
-lines += [f'{key}={existing[key]}' for key in main_watch.KEYS if key in existing]
+lines = ['# 由 install-main-watch.sh 维护；手工修改后执行 sudo ' + ('main-watch-sender' if sender else 'main-watch') + ' check 校验']
+lines += [f'{key}={existing[key]}' for key in keys if key in existing]
 with open(sys.argv[3], 'w', encoding='utf-8') as handle:
     handle.write('\n'.join(lines) + '\n')
 PY
 else
   cp -p -- "$config" "$scratch/config"
 fi
-"$python_bin" -I "$program" --config "$scratch/config" --check >/dev/null || die '配置无效，未做任何改动。'
+"$python_bin" -I "$program" "${role_args[@]}" --config "$scratch/config" --check >/dev/null || die '配置无效，未做任何改动。'
+# 副服务器开启心跳时取出：监听地址、本机可连地址与端口、令牌。
+heartbeat=()
+if ((!sender)); then
+  heartbeat_line=$("$python_bin" -I -B - "$(dirname -- "$program")" "$scratch/config" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import main_watch
+with open(sys.argv[2], encoding='utf-8') as handle:
+    config = main_watch.validate(main_watch.parse_config(handle.read()))
+print(' '.join([config['listen'], *map(str, main_watch.local_address(config['listen'])), config['token']]) if config['heartbeat'] else 'off')
+PY
+  ) || die '读取心跳配置失败，未做任何改动。'
+  [[ $heartbeat_line == off ]] || read -r -a heartbeat <<< "$heartbeat_line"
+fi
 
-cat > "$scratch/service" <<UNIT
-[Unit]
-Description=Main server watch with Feishu alerts
-Documentation=https://github.com/$repository/blob/main/docs/main-watch.md
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=$service
-Group=$service
-StateDirectory=$service
-WorkingDirectory=/var/lib/$service
-ExecStart=$python_bin -I $root/main_watch.py --config $config
-TimeoutStartSec=15min
-UMask=0077
+hardening='UMask=0077
 NoNewPrivileges=true
 CapabilityBoundingSet=
 PrivateTmp=true
@@ -274,9 +335,68 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-LockPersonality=true
+LockPersonality=true'
+documentation="https://github.com/$repository/blob/main/docs/main-watch.md"
+if ((sender)); then
+  cat > "$scratch/service" <<UNIT
+[Unit]
+Description=Push main server heartbeat to main-watch
+Documentation=$documentation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$service
+Group=$service
+WorkingDirectory=/
+ExecStart=$python_bin -I $root/main_watch.py --sender --config $config
+TimeoutStartSec=2min
+$hardening
 UNIT
-cat > "$scratch/timer" <<'UNIT'
+  cat > "$scratch/timer" <<'UNIT'
+[Unit]
+Description=Push main-watch heartbeat every 30 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  cat > "$scratch/command" <<CMD
+#!/bin/sh
+# main-watch-sender 管理命令，由 install-main-watch.sh 生成。
+case "\$1" in
+  check|probe) exec $python_bin -I $root/main_watch.py --sender --config $config --"\$1" ;;
+  send) exec $python_bin -I $root/main_watch.py --sender --config $config ;;
+  status) systemctl list-timers main-watch-sender.timer --no-pager; exec systemctl status main-watch-sender.service --no-pager ;;
+  logs) exec journalctl -u main-watch-sender.service -n "\${2:-50}" --no-pager ;;
+  *) echo "用法: sudo main-watch-sender check|probe|send|status|logs [行数]" >&2; exit 2 ;;
+esac
+CMD
+  desired=("$program" "$scratch/service" "$scratch/timer" "$scratch/command" "$scratch/config")
+else
+  cat > "$scratch/service" <<UNIT
+[Unit]
+Description=Main server watch with Feishu alerts
+Documentation=$documentation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$service
+Group=$service
+StateDirectory=$service
+WorkingDirectory=/var/lib/$service
+ExecStart=$python_bin -I $root/main_watch.py --config $config
+TimeoutStartSec=15min
+$hardening
+UNIT
+  cat > "$scratch/timer" <<'UNIT'
 [Unit]
 Description=Run main-watch every minute
 
@@ -288,18 +408,44 @@ AccuracySec=5s
 [Install]
 WantedBy=timers.target
 UNIT
-cat > "$scratch/command" <<CMD
+  cat > "$scratch/receiver" <<UNIT
+[Unit]
+Description=Receive main server heartbeats for main-watch
+Documentation=$documentation
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$service
+Group=$service
+StateDirectory=$service
+WorkingDirectory=/var/lib/$service
+ExecStart=$python_bin -I $root/main_watch.py --config $config --serve
+Restart=always
+RestartSec=5
+# 配置错误（退出码 2）不反复重启，重跑安装器修复。
+RestartPreventExitStatus=2
+$hardening
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  cat > "$scratch/command" <<CMD
 #!/bin/sh
 # main-watch 管理命令，由 install-main-watch.sh 生成。
 case "\$1" in
-  check|probe|test) exec $python_bin -I $root/main_watch.py --config $config --"\$1" ;;
-  status) systemctl list-timers main-watch.timer --no-pager; exec systemctl status main-watch.service --no-pager ;;
-  logs) exec journalctl -u main-watch.service -n "\${2:-50}" --no-pager ;;
+  check) exec $python_bin -I $root/main_watch.py --config $config --check ;;
+  # 探测会读服务账号写的心跳记录，与测试消息一样以服务账号运行。
+  probe|test) exec runuser -u $service -- $python_bin -I $root/main_watch.py --config $config --"\$1" ;;
+  status) systemctl list-timers main-watch.timer --no-pager; exec systemctl status main-watch.service main-watch-heartbeat.service --no-pager ;;
+  logs) exec journalctl -u main-watch.service -u main-watch-heartbeat.service -n "\${2:-50}" --no-pager ;;
   *) echo "用法: sudo main-watch check|probe|test|status|logs [行数]" >&2; exit 2 ;;
 esac
 CMD
-desired=("$program" "$scratch/service" "$scratch/timer" "$scratch/command" "$scratch/config")
-modes=(644 644 644 755 640)
+  desired=("$program" "$scratch/service" "$scratch/timer" "$scratch/receiver" "$scratch/command" "$scratch/config")
+fi
 
 changed=()
 for index in "${!targets[@]}"; do
@@ -307,15 +453,26 @@ for index in "${!targets[@]}"; do
 done
 id "$service" >/dev/null 2>&1 || useradd --system --user-group --no-create-home --home-dir /var/lib/$service --shell /usr/sbin/nologin "$service"
 [[ $(id -u "$service") != 0 ]] || die '服务账号不能是 root。'
-# 跳过标准与部署成功标准一致：文件与权限不变、定时器在运行，且 systemd 下最近一轮巡检成功。
+# 跳过标准与部署成功标准一致：文件与权限不变、定时器在运行、最近一轮在 systemd 下成功，
+# 心跳接收服务的运行状态与配置一致。
 healthy=0
 if [[ -f $config && $(stat -c '%U:%G %a' "$config") == "root:$service 640" && $(stat -c '%U:%G %a' "$etc") == "root:$service 750" ]] &&
-    systemctl is-enabled --quiet main-watch.timer && systemctl is-active --quiet main-watch.timer &&
-    [[ $(systemctl show --property=NeedDaemonReload --value main-watch.service) == no &&
-       $(systemctl show --property=NeedDaemonReload --value main-watch.timer) == no &&
-       $(systemctl show --property=Result --value main-watch.service) == success ]]; then healthy=1; fi
+    systemctl is-enabled --quiet "${units[1]}" && systemctl is-active --quiet "${units[1]}" &&
+    [[ $(systemctl show --property=Result --value "${units[0]}") == success ]]; then healthy=1; fi
+for name in "${units[@]}"; do
+  [[ $(systemctl show --property=NeedDaemonReload --value "$name") == no ]] || healthy=0
+done
+# 常驻的接收服务只在启动时读配置与程序：比它们旧（例如手工改过令牌）也要重新部署。
+# 按 UTC 取时间：本地时区缩写（如 CST）会被 date 误解。
+started_at() { local value; value=$(TZ=UTC systemctl show --property=ActiveEnterTimestamp --value "$1"); [[ -n $value ]] && TZ=UTC date -d "$value" +%s || echo 0; }
+if ((!sender)); then
+  if ((${#heartbeat[@]})); then
+    if ! systemctl is-enabled --quiet main-watch-heartbeat.service || ! systemctl is-active --quiet main-watch-heartbeat.service ||
+        (( $(started_at main-watch-heartbeat.service) < $(stat -c %Y "$config" "$root/main_watch.py" | sort -n | tail -n 1) )); then healthy=0; fi
+  elif systemctl is-active --quiet main-watch-heartbeat.service; then healthy=0; fi
+fi
 if ((${#changed[@]} == 0 && healthy)); then
-  say "版本 $revision_label：程序、配置与定时器均未变化，跳过部署。"
+  say "版本 $revision_label：程序、配置与服务均未变化，跳过部署。"
   if ((send_test)); then runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test; fi
   exit 0
 fi
@@ -326,18 +483,62 @@ for index in "${!targets[@]}"; do
 done
 install -d -m 750 -o root -g "$service" "$etc"
 switched=1
+# 先停定时器与进行中的一轮，部署后的首轮必定按新文件运行；失败时 restore 按原状态恢复。
+systemctl stop "${units[1]}" "${units[0]}" >/dev/null 2>&1 || true
 for index in "${!targets[@]}"; do
-  group=root
-  if ((index == 4)); then group=$service; fi
-  install -m "${modes[$index]}" -o root -g "$group" "${desired[$index]}" "${targets[$index]}.next"
+  group=root mode=644
+  if ((index == config_index)); then group=$service mode=640; elif ((index == command_index)); then mode=755; fi
+  install -m "$mode" -o root -g "$group" "${desired[$index]}" "${targets[$index]}.next"
   mv -f -- "${targets[$index]}.next" "${targets[$index]}"
 done
 systemctl daemon-reload
 config_changed=0
-for index in "${changed[@]}"; do if ((index == 4)); then config_changed=1; fi; done
+for index in "${changed[@]}"; do if ((index == config_index)); then config_changed=1; fi; done
+
+if ((sender)); then
+  # 按 systemd 的真实启动路径推送首个心跳，确认地址、端口放通与令牌。
+  say '向副服务器推送首个心跳，确认地址、端口与令牌。'
+  systemctl reset-failed main-watch-sender.service >/dev/null 2>&1 || true
+  systemctl start main-watch-sender.service || {
+    journalctl -u main-watch-sender.service -n 20 --no-pager >&2 || true
+    die '心跳推送失败：请确认副服务器已开启心跳接收、安全组放通本机到副服务器的端口，且两端令牌一致。'
+  }
+  systemctl enable main-watch-sender.timer >/dev/null 2>&1
+  systemctl restart main-watch-sender.timer
+  systemctl is-active --quiet main-watch-sender.timer || die '心跳定时器未能启动。'
+  switched=0
+  say "已部署版本 $revision_label，每 30 秒推送一次心跳。本机工作台就绪检查："
+  "$python_bin" -I "$root/main_watch.py" --sender --config "$config" --probe || say '注意：本机工作台当前未就绪，副服务器会据此告警“自检未就绪”。'
+  say '管理命令：sudo main-watch-sender status | logs | probe | send'
+  exit 0
+fi
+
 if ((send_test || config_changed)); then
   say '发送飞书测试消息，确认告警通道可用。'
   runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test || die '飞书测试消息发送失败，请检查 Webhook 与签名密钥。'
+fi
+receiver_up() {
+  # 只认本服务的应答（GET 返回 404 且 Server 为 main-watch），端口被其他程序占用不算启动成功。
+  "$python_bin" -I - "$1" "$2" <<'PY'
+import sys, urllib.error, urllib.request
+host = f'[{sys.argv[1]}]' if ':' in sys.argv[1] else sys.argv[1]
+try:
+    urllib.request.build_opener(urllib.request.ProxyHandler({})).open(f'http://{host}:{sys.argv[2]}/heartbeat', timeout=2)
+except urllib.error.HTTPError as error:
+    sys.exit(0 if error.code == 404 and (error.headers.get('Server') or '').startswith('main-watch') else 1)
+except Exception:
+    pass
+sys.exit(1)
+PY
+}
+if ((${#heartbeat[@]})); then
+  systemctl enable main-watch-heartbeat.service >/dev/null 2>&1
+  systemctl restart main-watch-heartbeat.service
+  up=0
+  for _ in {1..40}; do if receiver_up "${heartbeat[1]}" "${heartbeat[2]}"; then up=1; break; fi; sleep 0.25; done
+  ((up)) || { journalctl -u main-watch-heartbeat.service -n 20 --no-pager >&2 || true; die "心跳接收服务未能监听 ${heartbeat[0]}，端口可能已被占用。"; }
+else
+  systemctl disable --now main-watch-heartbeat.service >/dev/null 2>&1 || true
 fi
 # 按 systemd 的真实启动路径跑一轮，确认服务账号能读配置、写状态。
 systemctl reset-failed main-watch.service >/dev/null 2>&1 || true
@@ -347,5 +548,12 @@ systemctl restart main-watch.timer
 systemctl is-active --quiet main-watch.timer || die '定时器未能启动。'
 switched=0
 say "已部署版本 $revision_label，每分钟巡检一次。当前探测结果："
-"$python_bin" -I "$root/main_watch.py" --config "$config" --probe || say '注意：有目标当前不可达。若主服务器实际正常，请检查地址、端口放通和工作台监听地址。'
+runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --probe || say '注意：有目标当前不可达。若主服务器实际正常，请检查地址、端口放通、工作台监听地址或心跳推送。'
+if ((${#heartbeat[@]} && config_changed)); then
+  host=${heartbeat[0]%:*}
+  case $host in 0.0.0.0|'[::]') host='<副服务器公网IP>' ;; esac
+  say "心跳接收监听 ${heartbeat[0]}。请在安全组放通主服务器到本机 TCP ${heartbeat[2]}，然后在主服务器执行："
+  printf '  curl -fsSL https://raw.githubusercontent.com/%s/main/deploy/install-main-watch.sh | sudo bash -s -- --sender --send-to http://%s:%s/heartbeat --heartbeat-token %s\n' \
+    "$repository" "$host" "${heartbeat[2]}" "${heartbeat[3]}"
+fi
 say '管理命令：sudo main-watch status | logs | probe | test'

@@ -1,5 +1,5 @@
 """巡检逻辑与真实 HTTP 收发检查：只用标准库，在任意系统可运行。"""
-import base64, hashlib, hmac, http.server, json, os, sys, tempfile, threading, unittest
+import base64, hashlib, hmac, http.server, json, os, sys, tempfile, threading, unittest, urllib.error, urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -7,6 +7,7 @@ import main_watch as watch  # noqa: E402
 
 READY = 'http://10.0.0.5:3100/api/ready'
 PORT = 'tcp://10.0.0.5:22'
+TOKEN = 't' * 40
 BASE = {'FEISHU_WEBHOOK': 'https://open.feishu.cn/open-apis/bot/v2/hook/x', 'CHECKS': f'{READY} {PORT}', 'FAIL_THRESHOLD': '3', 'REMIND_MINUTES': '30'}
 
 
@@ -207,6 +208,126 @@ class EndToEndTests(unittest.TestCase):
     def test_invalid_config_exits_2(self):
         self.write(CHECKS='nonsense')
         self.assertEqual(self.main('--check'), 2)
+
+
+
+class HeartbeatTests(unittest.TestCase):
+    def test_heartbeat_config(self):
+        config = watch.validate({**BASE, 'CHECKS': '', 'HEARTBEAT_LISTEN': '0.0.0.0:8792', 'HEARTBEAT_TOKEN': TOKEN})
+        self.assertEqual((config['checks'], config['heartbeat']), (['heartbeat://0.0.0.0:8792'], 'heartbeat://0.0.0.0:8792'))
+        self.assertIsNone(watch.validate(BASE)['heartbeat'])
+        for change in ({'HEARTBEAT_LISTEN': '0.0.0.0:8792'}, {'HEARTBEAT_LISTEN': '0.0.0.0:8792', 'HEARTBEAT_TOKEN': 'short'},
+                       {'HEARTBEAT_LISTEN': '0.0.0.0:80', 'HEARTBEAT_TOKEN': TOKEN}, {'HEARTBEAT_LISTEN': '8792', 'HEARTBEAT_TOKEN': TOKEN}):
+            with self.subTest(change=change), self.assertRaises(watch.ConfigError):
+                watch.validate({**BASE, **change})
+        sender = watch.validate_sender({'HEARTBEAT_URL': 'http://10.0.0.6:8792/heartbeat', 'HEARTBEAT_TOKEN': TOKEN})
+        self.assertEqual(sender['ready'], 'http://127.0.0.1:3100/api/ready')
+        for change in ({'HEARTBEAT_URL': 'tcp://10.0.0.6:8792'}, {'HEARTBEAT_TOKEN': 'x' * 31},
+                       {'READY_URL': 'tcp://127.0.0.1:3100'}, {'TIMEOUT': '0'}):
+            with self.subTest(change=change), self.assertRaises(watch.ConfigError):
+                watch.validate_sender({'HEARTBEAT_URL': 'http://10.0.0.6:8792/heartbeat', 'HEARTBEAT_TOKEN': TOKEN, **change})
+        with self.assertRaises(watch.ConfigError):
+            watch.parse_config('FEISHU_WEBHOOK=x', watch.SENDER_KEYS)
+
+    def test_accept_checks_signature_clock_and_order(self):
+        body = watch.heartbeat_body(None, 1000)
+        sign = watch.heartbeat_signature(TOKEN, body)
+        beat, error = watch.accept_heartbeat(TOKEN, body, sign, 1001, 0)
+        self.assertEqual((beat['ready'], beat['sent_at'], error), (True, 1000000, None))
+        cases = [(TOKEN, body, watch.heartbeat_signature('u' * 40, body), 1001, 0, '签名'),
+                 (TOKEN, body, None, 1001, 0, '签名'), (TOKEN, body, '签名非ascii', 1001, 0, '签名'),
+                 (TOKEN, body, sign, 1000 + watch.HEARTBEAT_SKEW + 1, 0, '时间戳'),
+                 (TOKEN, body, sign, 1001, 1000000, '重放')]
+        for token, data, signature, now, last, reason in cases:
+            with self.subTest(reason=reason, now=now):
+                self.assertIn(reason, watch.accept_heartbeat(token, data, signature, now, last)[1])
+        for bad in (b'{}', b'[1]', b'{"sent_at": 1000000.5, "ready": true}', b'{"sent_at": 1000000, "ready": "yes"}'):
+            with self.subTest(bad=bad):
+                self.assertEqual(watch.accept_heartbeat(TOKEN, bad, watch.heartbeat_signature(TOKEN, bad), 1000, 0)[1], '格式错误')
+
+    def test_freshness_and_readiness(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, watch.HEARTBEAT_FILE)
+            listen = '127.0.0.1:1'  # 无人监听：缺心跳时附带接收服务未运行
+            self.assertIn('本机心跳接收服务未运行', watch.heartbeat_error(path, 1000, listen, 1))
+            watch.save_state(path, {'received_at': 1000, 'sent_at': 1, 'ready': True, 'detail': ''})
+            self.assertIsNone(watch.heartbeat_error(path, 1000 + watch.HEARTBEAT_STALE, listen, 1))
+            self.assertIn('秒未收到', watch.heartbeat_error(path, 1001 + watch.HEARTBEAT_STALE, listen, 1))
+            watch.save_state(path, {'received_at': 1000, 'sent_at': 1, 'ready': False, 'detail': 'HTTP 503'})
+            self.assertEqual(watch.heartbeat_error(path, 1010, listen, 1), '主服务器自检未就绪：HTTP 503')
+            Path(path).write_text('{"received_at": "x"}')
+            self.assertIn('损坏', watch.heartbeat_error(path, 1010, listen, 1))
+
+
+class HeartbeatEndToEndTests(unittest.TestCase):
+    """真实接收服务 + 真实发送端 + 假工作台就绪接口。"""
+
+    def setUp(self):
+        self.app = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.app.posts, self.app.reply = [], {'code': 0}
+        threading.Thread(target=self.app.serve_forever, daemon=True).start()
+        self.addCleanup(self.app.server_close)
+        self.addCleanup(self.app.shutdown)
+        self.base = f'http://127.0.0.1:{self.app.server_port}'
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        started = threading.Event()
+        receiver = {'token': TOKEN, 'listen': '127.0.0.1:0'}
+        self.logs = []
+
+        def ready(server):
+            self.receiver = server
+            started.set()
+        threading.Thread(target=watch.serve, args=(receiver, self.dir.name, self.logs.append, ready), daemon=True).start()
+        self.assertTrue(started.wait(5))
+        self.addCleanup(self.receiver.server_close)
+        self.addCleanup(self.receiver.shutdown)
+        self.listen = f'127.0.0.1:{self.receiver.server_port}'
+        self.sender = os.path.join(self.dir.name, 'sender')
+        self.watch = os.path.join(self.dir.name, 'config')
+        Path(self.watch).write_text(f'FEISHU_WEBHOOK={self.base}/hook\nHEARTBEAT_LISTEN={self.listen}\nHEARTBEAT_TOKEN={TOKEN}\nFAIL_THRESHOLD=1\n')
+
+    def send(self, token=TOKEN, ready='/api/ready'):
+        Path(self.sender).write_text(f'HEARTBEAT_URL=http://{self.listen}/heartbeat\nHEARTBEAT_TOKEN={token}\nREADY_URL={self.base}{ready}\n')
+        return watch.main(['--sender', '--config', self.sender])
+
+    def beat(self):
+        return json.loads(Path(self.dir.name, watch.HEARTBEAT_FILE).read_text())
+
+    def run_watch(self, *args):
+        return watch.main(['--config', self.watch, '--state', os.path.join(self.dir.name, 'state.json'), *args])
+
+    def test_signed_heartbeat_reaches_watcher(self):
+        self.assertEqual(self.run_watch('--probe'), 1, 'no heartbeat yet')
+        self.assertEqual(watch.main(['--sender', '--config', self.sender, '--check']), 2, 'missing sender config')
+        self.assertEqual(self.send(), 0)
+        self.assertEqual((self.beat()['ready'], self.beat()['peer']), (True, '127.0.0.1'))
+        self.assertEqual(self.run_watch('--probe'), 0)
+        self.assertEqual(self.run_watch(), 0)
+        self.assertEqual(self.app.posts, [], 'healthy heartbeat sends nothing')
+        self.assertEqual(self.send(ready='/down'), 0, 'delivered even when the workbench is not ready')
+        self.assertIs(self.beat()['ready'], False)
+        self.assertEqual(self.run_watch(), 0)
+        self.assertIn('主服务器自检未就绪：HTTP 503', self.app.posts[-1]['content']['text'])
+
+    def test_receiver_rejects_wrong_token_replay_and_junk(self):
+        self.assertEqual(self.send(), 0)
+        before = self.beat()
+        self.assertEqual(self.send(token='w' * 40), 1)
+        self.assertEqual(self.beat(), before)
+        body = watch.heartbeat_body(None, before['sent_at'] / 1000)
+        url = f'http://{self.listen}/heartbeat'
+        for data, headers, code in ((body, {watch.SIGNATURE_HEADER: watch.heartbeat_signature(TOKEN, body)}, 403),
+                                    (b'x' * (watch.HEARTBEAT_MAX_BODY + 1), {}, 413)):
+            with self.subTest(code=code), self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(urllib.request.Request(url, data, headers), timeout=5)
+            self.assertEqual(caught.exception.code, code)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f'http://{self.listen}/heartbeat', timeout=5)
+        self.assertEqual(caught.exception.code, 404)
+        self.assertEqual(self.beat(), before)
+        self.assertEqual(len(self.logs), 2, '启动日志与每分钟最多一条拒绝日志')
+        self.assertIn('签名不符', self.logs[1])
 
 
 if __name__ == '__main__':

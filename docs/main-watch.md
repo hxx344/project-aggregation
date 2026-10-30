@@ -1,6 +1,6 @@
 # 主服务器巡检与飞书告警
 
-巡检服务部署在副服务器上，每分钟探测一次主服务器工作台。连续失败达到阈值时向飞书群发送告警；故障持续期间按间隔重复提醒，恢复后发送恢复通知，附带中断时长。它只依赖 Python 3.8+ 标准库与 systemd，不需要交易凭据，不监听任何端口，也不安装 Node.js 或工作台。
+巡检服务部署在副服务器上，每分钟探测一次主服务器工作台。连续失败达到阈值时向飞书群发送告警；故障持续期间按间隔重复提醒，恢复后发送恢复通知，附带中断时长。它只依赖 Python 3.8+ 标准库与 systemd，不需要交易凭据，也不安装 Node.js 或工作台。默认不监听任何端口；开启[心跳模式](#心跳模式)后才在副服务器上常驻一个心跳接收服务。
 
 ## 一键部署
 
@@ -34,19 +34,62 @@ curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/dep
 | `--test` | 部署后补发一条测试消息 | — |
 | `--uninstall` | 移除服务，保留配置、状态与服务账号 | — |
 
-Webhook 和签名密钥在安装期间会短暂出现在进程参数里；副服务器有其他不受信任的登录用户时，之后更换密钥改为直接编辑配置文件（见下文），不要再通过参数传入。首次安装失败回滚后，会留下空的 `/etc/main-watch`、`/opt/main-watch`（源码缓存与锁文件）和 `main-watch` 服务账号，不影响重新安装。
+Webhook、签名密钥和 `--heartbeat-token` 在安装期间会短暂出现在进程参数里；副服务器有其他不受信任的登录用户时，之后更换密钥改为直接编辑配置文件（见下文），不要再通过参数传入。首次安装失败回滚后，会留下空的 `/etc/main-watch`、`/opt/main-watch`（源码缓存与锁文件）和 `main-watch` 服务账号，不影响重新安装。
+
+## 心跳模式
+
+拉取式检查要求主服务器对副服务器开放入站端口。心跳模式反过来：主服务器每 30 秒在本机检查一次工作台 `/api/ready`，把结果作为签名心跳推送给副服务器；副服务器常驻接收，每轮巡检把心跳当作一个检查目标。两种方式可以同时开启。
+
+心跳模式额外能发现主服务器连不出去的情况，例如出站网络中断。这时主服务器也连不上交易所。主服务器整机宕机、工作台进程停止、心跳推送程序失败时，副服务器都会因收不到心跳而告警。
+
+1. 副服务器开启接收。可在首次安装时一起传，也可对已安装的副服务器补传：
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-main-watch.sh | \
+     sudo bash -s -- --heartbeat-listen 0.0.0.0:8792
+   ```
+
+   没传 `--heartbeat-token` 时自动生成令牌，部署结束时打印主服务器要执行的完整命令（含令牌）。之后可用 `sudo grep HEARTBEAT_TOKEN /etc/main-watch/config` 再查。
+2. 在副服务器的安全组放通**来源为主服务器 IP** 的 TCP 8792。主服务器不需要开放任何入站端口。
+3. 在主服务器执行第 1 步打印的命令：
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/hxx344/project-aggregation/main/deploy/install-main-watch.sh | \
+     sudo bash -s -- --sender --send-to http://<副服务器IP>:8792/heartbeat --heartbeat-token <令牌>
+   ```
+
+   安装器从 `/etc/project-aggregation.env` 的 `HOST`/`PORT` 推算本机就绪接口（默认 `http://127.0.0.1:3100/api/ready`），也可用 `--ready-url` 指定。部署时会在 systemd 下推送首个心跳；副服务器没开接收、端口没放通或令牌不一致时，整次部署回滚并说明原因。
+
+| 副服务器判定 | 告警内容 |
+| --- | --- |
+| 最近 90 秒内收到心跳，且主服务器自检就绪 | 正常 |
+| 从未收到 / 超过 90 秒没收到心跳 | `尚未收到主服务器心跳` / `已 N 秒未收到主服务器心跳`；本机接收服务没在运行时附带说明 |
+| 收到心跳，但主服务器自检未就绪 | `主服务器自检未就绪：HTTP 503` 等 |
+
+告警阈值、提醒间隔、恢复通知与拉取式检查相同（默认连续 3 轮失败才告警）。心跳用令牌做 HMAC-SHA256 签名，并带毫秒时间戳：签名不符、与副服务器时钟相差超过 120 秒、时间戳不晚于上一条的心跳一律拒绝。所以走明文 HTTP 时，链路上的第三方无法伪造或重放心跳，最多把一条真实心跳拖延 120 秒，故障发现相应推迟。心跳内容只有就绪结果，不含凭据。两台服务器都需要开启时间同步。接收服务同时最多处理 16 个连接，被拒心跳的日志每分钟最多记一条；安全组仍应只对主服务器 IP 放通。
+
+主服务器端的日常操作：
+
+```bash
+sudo main-watch-sender status   # 推送定时器与最近一次结果
+sudo main-watch-sender logs 50
+sudo main-watch-sender probe    # 只检查本机就绪接口
+sudo main-watch-sender send     # 立即推送一次
+```
+
+升级主服务器端：`... | sudo bash -s -- --sender`。卸载：`... | sudo bash -s -- --sender --uninstall`。副服务器关闭心跳：`--heartbeat-listen ""`。
 
 ## 升级与修改
 
 不带参数重复执行同一条命令即为升级：保留已有配置。程序、配置、权限和定时器都没变化，且 systemd 下最近一轮巡检成功时，直接结束，不发消息也不重启；最近一轮失败（例如配置被改坏、目录权限被改）时会重新部署并修复。带参数执行时只覆盖给出的项，其他项保留，例如 `... | sudo bash -s -- --threshold 5`。配置有变化时会重发测试消息确认通道可用。
 
-也可以直接编辑 `/etc/main-watch/config`，然后运行 `sudo main-watch check` 校验。下一轮巡检自动生效，不需要重启。
+也可以直接编辑 `/etc/main-watch/config`，然后运行 `sudo main-watch check` 校验。下一轮巡检自动生效，不需要重启。`HEARTBEAT_LISTEN`、`HEARTBEAT_TOKEN` 例外：常驻的接收服务只在启动时读取，手工修改后执行 `sudo systemctl restart main-watch-heartbeat`，或不带参数重跑安装器（接收服务比配置旧时不会跳过部署）。
 
 ## 日常操作
 
 ```bash
 sudo main-watch status   # 定时器与最近一轮的运行状态
-sudo main-watch logs 100 # 最近的巡检失败、告警发送记录
+sudo main-watch logs 100 # 最近的巡检失败、告警发送、被拒绝的心跳记录
 sudo main-watch probe    # 立即探测所有目标，不发告警
 sudo main-watch test     # 发送测试消息
 sudo systemctl stop main-watch.timer   # 维护期间暂停；恢复用 start
@@ -62,4 +105,4 @@ sudo systemctl stop main-watch.timer   # 维护期间暂停；恢复用 start
 
 ## 验证范围
 
-CI 在 Ubuntu 24.04 的真实 systemd 上验证：首次安装被飞书拒绝时不留下服务、首次安装、测试消息与签名、systemd 下的告警轮次、无变化跳过、升级时飞书拒绝的回滚、非法参数不改动、只改额外目标时保留就绪检查、部署损坏时修复而不跳过，以及卸载。从 GitHub 下载正式版的引导路径依赖正式发布，CI 不覆盖，以实际部署结果为准。
+CI 在 Ubuntu 24.04 的真实 systemd 上验证：首次安装被飞书拒绝时不留下服务、首次安装、测试消息与签名、systemd 下的告警轮次、无变化跳过、升级时飞书拒绝的回滚、非法参数不改动、只改额外目标时保留就绪检查、部署损坏时修复而不跳过，以及卸载。心跳模式在同一台机器上同时安装接收端与推送端，验证令牌错误时推送端回滚、真实心跳送达后巡检判定正常并发出恢复通知、工作台未就绪时告警“自检未就绪”、推送端无变化跳过、单独卸载推送端不影响巡检、手工改令牌后重跑不被跳过，以及关闭心跳后接收服务停止。从 GitHub 下载正式版的引导路径依赖正式发布，CI 不覆盖，以实际部署结果为准。
