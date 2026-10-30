@@ -105,10 +105,22 @@ class RoundTests(unittest.TestCase):
         self.assertEqual([text[0] for text in fake.sent], ['🔴', '🟢'])
         self.assertEqual(state[READY], watch.fresh())
 
-    def test_pending_recovery_is_dropped_when_target_fails_again(self):
-        state = {READY: {**watch.fresh(), 'recovery': '• old'}}
-        state = rounds(Fake(down=[READY]), 1, state)
+    def test_pending_recovery_survives_a_short_relapse(self):
+        fake = Fake(down=[READY])
+        state = rounds(fake, 1, state={READY: {**watch.fresh(), 'recovery': '• old'}})
+        self.assertEqual(state[READY]['recovery'], '• old')
+        fake.down.clear()
+        state = rounds(fake, 1, state, start=1060)
+        self.assertEqual(fake.sent, ['🟢 主服务器 服务恢复 ' + fake.sent[0].split('恢复 ', 1)[1]])
+        self.assertTrue(fake.sent[0].endswith('• old'))
+
+    def test_new_alert_replaces_pending_recovery(self):
+        fake = Fake(down=[READY])
+        state = rounds(fake, 3, state={READY: {**watch.fresh(), 'recovery': '• old'}})
         self.assertNotIn('recovery', state[READY])
+        fake.down.clear()
+        rounds(fake, 1, state, start=1180)
+        self.assertNotIn('• old', fake.sent[-1])
 
     def test_corrupt_state_entries_restart_counting(self):
         fake = Fake(down=[READY])

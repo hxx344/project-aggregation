@@ -62,13 +62,15 @@ port=$(cat "$fixture/port")
 installer=("$fixture/source/deploy/install-main-watch.sh" --source "$fixture/source")
 posts() { [[ -f $fixture/posts.log ]] && wc -l < "$fixture/posts.log" || echo 0; }
 
-fails() { if "$@"; then echo "Expected failure: $*" >&2; exit 1; fi; }
+# Expect a failure whose output names the intended reason, so unrelated errors cannot pass.
+fails() { local reason=$1 output; shift; if output=$("$@" 2>&1); then echo "Expected failure: $*" >&2; exit 1; fi
+  grep -q -- "$reason" <<< "$output" || { printf 'Unexpected failure reason for %s:\n%s\n' "$*" "$output" >&2; exit 1; }; }
 
 echo '== a rejected first install leaves no service behind'
 touch "$fixture/fail"
-fails bash "${installer[@]}" --main "127.0.0.1:$port" --webhook "http://127.0.0.1:$port/hook"
+fails '飞书测试消息发送失败' bash "${installer[@]}" --main "127.0.0.1:$port" --webhook "http://127.0.0.1:$port/hook"
 [[ ! -e /opt/main-watch/main_watch.py && ! -e /etc/systemd/system/main-watch.timer && ! -e /etc/main-watch/config && ! -e /usr/local/bin/main-watch ]]
-fails systemctl is-enabled --quiet main-watch.timer
+if systemctl is-enabled --quiet main-watch.timer; then echo 'Timer enabled after a rejected install' >&2; exit 1; fi
 rm "$fixture/fail"
 
 echo '== first install sends a test message and runs one real round'
@@ -98,13 +100,13 @@ grep -q '跳过部署' "$fixture/noop.log"
 
 echo '== a rejected webhook rolls back configuration and keeps the timer running'
 touch "$fixture/fail"
-fails bash "${installer[@]}" --threshold 5
+fails '飞书测试消息发送失败' bash "${installer[@]}" --threshold 5
 [[ $(sha256sum /etc/main-watch/config) == "$config_before" ]]
 systemctl is-active --quiet main-watch.timer
 rm "$fixture/fail"
 
 echo '== invalid arguments change nothing'
-fails bash "${installer[@]}" --checks 'ftp://nope'
+fails '配置无效' bash "${installer[@]}" --checks 'ftp://nope'
 [[ $(sha256sum /etc/main-watch/config) == "$config_before" ]]
 
 echo '== changing only the extra checks keeps the readiness check'
@@ -115,8 +117,11 @@ probe=$(/usr/local/bin/main-watch probe)
 grep -q "正常 http://127.0.0.1:$port/api/ready" <<< "$probe"
 
 echo '== a broken deployment is repaired instead of skipped'
+# Only the last systemd round is unhealthy: files and permissions match again before the rerun.
 chmod 700 /etc/main-watch
 systemctl start main-watch.service || true
+[[ $(systemctl show --property=Result --value main-watch.service) != success ]]
+chmod 750 /etc/main-watch
 bash "${installer[@]}" | tee "$fixture/repair.log"
 if grep -q '跳过部署' "$fixture/repair.log"; then echo 'Broken deployment was skipped' >&2; exit 1; fi
 [[ $(stat -c '%U:%G %a' /etc/main-watch) == "root:$service 750" ]]
@@ -127,5 +132,5 @@ echo '== management command and uninstall'
 /usr/local/bin/main-watch probe >/dev/null || true
 bash "${installer[@]}" --uninstall
 [[ ! -e /etc/systemd/system/main-watch.timer && ! -e /opt/main-watch && -f /etc/main-watch/config ]]
-fails systemctl is-active --quiet main-watch.timer
+if systemctl is-active --quiet main-watch.timer; then echo 'Timer still active after uninstall' >&2; exit 1; fi
 echo 'main-watch systemd acceptance passed'

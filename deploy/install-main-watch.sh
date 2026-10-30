@@ -64,10 +64,13 @@ while (($#)); do
 done
 [[ -z $source_revision || $source_revision =~ ^[a-f0-9]{40}$ ]] || die '--revision 必须是 40 位提交号。'
 
+# 不解析符号链接：系统升级换掉 python3.X 后，单元仍指向有效的 python3。依赖检查与服务使用同一个解释器。
+pick_python() { if [[ -x /usr/bin/python3 ]]; then python_bin=/usr/bin/python3; else python_bin=$(command -v python3 || true); fi; }
 system_ready() {
   local tool
-  for tool in python3 curl flock systemctl useradd runuser install cmp; do command -v "$tool" >/dev/null || return 1; done
-  python3 -I -c 'import sys, ssl; ssl.create_default_context(); sys.exit(sys.version_info < (3, 8))' 2>/dev/null
+  for tool in curl flock systemctl useradd runuser install cmp; do command -v "$tool" >/dev/null || return 1; done
+  pick_python
+  [[ -n $python_bin ]] && "$python_bin" -I -c 'import sys, ssl; ssl.create_default_context(); sys.exit(sys.version_info < (3, 8))' 2>/dev/null
 }
 if ! system_ready; then
   command -v apt-get >/dev/null || die '缺少 python3(>=3.8)/curl，且系统不是 apt 系，请先手工安装。'
@@ -77,9 +80,6 @@ if ! system_ready; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 curl ca-certificates util-linux passwd diffutils </dev/null >/dev/null
 fi
 system_ready || die '需要 python3 3.8+、curl 与 systemd。'
-# 不解析符号链接：系统升级换掉 python3.X 后，单元仍指向有效的 python3。
-python_bin=/usr/bin/python3
-[[ -x $python_bin ]] || python_bin=$(command -v python3)
 
 trusted() {
   python3 -I - "$@" <<'PY'

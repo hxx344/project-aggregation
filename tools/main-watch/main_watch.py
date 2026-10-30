@@ -167,8 +167,7 @@ def run_round(config, state, now, probe_fn, send_fn, log):
                 recovered.append((target, entry['recovery']))
             state[target] = fresh()
             continue
-        # 待补发的恢复通知属于上一次故障；再次失败后按新故障重新计数。
-        entry.pop('recovery', None)
+        # 待补发的恢复通知一直保留，直到发出或被新故障的告警取代，短暂复发不会把它丢掉。
         if entry['fails'] == 0:
             entry['since'] = now
         entry['fails'] += 1
@@ -181,6 +180,7 @@ def run_round(config, state, now, probe_fn, send_fn, log):
             send_fn(f'🔴 {config["name"]} 服务异常 {stamp}\n' + '\n'.join(state[t]['detail'] for t in down))
             for target in down:
                 state[target].update(alerted=True, last_alert=now)
+                state[target].pop('recovery', None)
             log(f'{stamp} 已发送异常告警：{" ".join(down)}')
         except Exception as error:
             log(f'{stamp} 飞书告警发送失败，下一轮重发：{error}')
