@@ -7,8 +7,9 @@ set -Eeuo pipefail
 [[ $(cat /proc/1/comm) == systemd ]] || { echo 'A real systemd PID 1 is required.' >&2; exit 1; }
 repository=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
 service=main-watch
-for target in /opt/main-watch /etc/main-watch /var/lib/main-watch /etc/systemd/system/main-watch.service \
-    /etc/systemd/system/main-watch.timer /usr/local/bin/main-watch; do
+units=(main-watch.service main-watch.timer main-watch-heartbeat.service main-watch-sender.service main-watch-sender.timer)
+for target in /opt/main-watch /etc/main-watch /var/lib/main-watch "${units[@]/#//etc/systemd/system/}" \
+    /usr/local/bin/main-watch /usr/local/bin/main-watch-sender; do
   [[ ! -e $target && ! -L $target ]] || { echo "Refusing to replace an existing fixture target: $target" >&2; exit 1; }
 done
 ! id "$service" >/dev/null 2>&1 || { echo 'Service account already exists.' >&2; exit 1; }
@@ -18,10 +19,10 @@ server_pid=''
 cleanup() {
   result=$?
   trap - EXIT
-  if ((result)); then journalctl -u main-watch.service --no-pager -n 40 || true; fi
+  if ((result)); then journalctl -u main-watch.service -u main-watch-heartbeat.service -u main-watch-sender.service --no-pager -n 60 || true; fi
   [[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null || true
-  systemctl disable --now main-watch.timer >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/main-watch.service /etc/systemd/system/main-watch.timer /usr/local/bin/main-watch
+  systemctl disable --now main-watch.timer main-watch-sender.timer main-watch-heartbeat.service >/dev/null 2>&1 || true
+  rm -f "${units[@]/#//etc/systemd/system/}" /usr/local/bin/main-watch /usr/local/bin/main-watch-sender
   rm -rf /opt/main-watch /etc/main-watch /var/lib/main-watch /var/lib/private/main-watch
   systemctl daemon-reload || true
   userdel "$service" >/dev/null 2>&1 || true
@@ -115,6 +116,54 @@ grep -qx "MAIN=127.0.0.1:$port" /etc/main-watch/config
 grep -qx "CHECKS=tcp://127.0.0.1:$port" /etc/main-watch/config
 probe=$(/usr/local/bin/main-watch probe)
 grep -q "正常 http://127.0.0.1:$port/api/ready" <<< "$probe"
+
+echo '== heartbeat receiver starts and prints the sender command'
+hb_port=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+bash "${installer[@]}" --heartbeat-listen "127.0.0.1:$hb_port" | tee "$fixture/heartbeat.log"
+token=$(sed -n 's/^HEARTBEAT_TOKEN=//p' /etc/main-watch/config)
+[[ ${#token} -ge 32 ]]
+grep -qF -- "--sender --send-to http://127.0.0.1:$hb_port/heartbeat --heartbeat-token $token" "$fixture/heartbeat.log"
+systemctl is-enabled --quiet main-watch-heartbeat.service && systemctl is-active --quiet main-watch-heartbeat.service
+grep -q "失败 heartbeat://127.0.0.1:$hb_port：尚未收到主服务器心跳" "$fixture/heartbeat.log"
+sender=("${installer[@]}" --sender)
+
+echo '== a sender with the wrong token is rolled back'
+fails '心跳推送失败' bash "${sender[@]}" --send-to "http://127.0.0.1:$hb_port/heartbeat" \
+  --heartbeat-token "$(printf 'w%.0s' {1..40})" --ready-url "http://127.0.0.1:$port/api/ready"
+[[ ! -e /etc/systemd/system/main-watch-sender.timer && ! -e /etc/main-watch/sender && ! -e /usr/local/bin/main-watch-sender ]]
+if systemctl is-enabled --quiet main-watch-sender.timer; then echo 'Sender timer enabled after a rejected install' >&2; exit 1; fi
+fails '只用于主服务器心跳推送' bash "${installer[@]}" --send-to "http://127.0.0.1:$hb_port/heartbeat"
+fails '只用于副服务器巡检' bash "${sender[@]}" --webhook "http://127.0.0.1:$port/hook"
+
+echo '== a real heartbeat makes the watcher healthy'
+bash "${sender[@]}" --send-to "http://127.0.0.1:$hb_port/heartbeat" --heartbeat-token "$token" \
+  --ready-url "http://127.0.0.1:$port/api/ready"
+systemctl is-enabled --quiet main-watch-sender.timer && systemctl is-active --quiet main-watch-sender.timer
+[[ $(stat -c '%U:%G %a' /etc/main-watch/sender) == "root:$service 640" ]]
+beat=$(readlink -f /var/lib/main-watch)/heartbeat.json
+python3 -I -c 'import json, sys; beat = json.load(open(sys.argv[1])); assert beat["ready"] is True and beat["peer"] == "127.0.0.1", beat' "$beat"
+/usr/local/bin/main-watch probe | grep -q "正常 heartbeat://127.0.0.1:$hb_port"
+/usr/local/bin/main-watch-sender check
+bash "${sender[@]}" | tee "$fixture/sender-noop.log"
+grep -q '跳过部署' "$fixture/sender-noop.log"
+
+echo '== an unready workbench is reported through the heartbeat'
+before=$(posts)
+bash "${sender[@]}" --ready-url "http://127.0.0.1:$port/down"
+python3 -I -c 'import json, sys; beat = json.load(open(sys.argv[1])); assert beat["ready"] is False and "503" in beat["detail"], beat' "$beat"
+systemctl start main-watch.service
+grep -q '主服务器自检未就绪：HTTP 503' "$fixture/posts.log"
+(( $(posts) > before ))
+
+echo '== removing the sender keeps the watcher; disabling heartbeat stops the receiver'
+bash "${sender[@]}" --uninstall
+[[ ! -e /etc/systemd/system/main-watch-sender.timer && ! -e /usr/local/bin/main-watch-sender && -f /opt/main-watch/main_watch.py ]]
+systemctl is-active --quiet main-watch.timer
+bash "${installer[@]}" --heartbeat-listen ''
+if systemctl is-active --quiet main-watch-heartbeat.service || systemctl is-enabled --quiet main-watch-heartbeat.service; then
+  echo 'Heartbeat receiver still running after disabling heartbeat' >&2; exit 1
+fi
+/usr/local/bin/main-watch probe
 
 echo '== a broken deployment is repaired instead of skipped'
 # Only the last systemd round is unhealthy: files and permissions match again before the rerun.
