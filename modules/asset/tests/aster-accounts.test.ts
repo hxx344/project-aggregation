@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {asterKey,readAsterAccounts,aggregateAster} from '../lib/aster-accounts.ts';
+import {asterKey,readAsterAccounts,aggregateAster,mergeAsterRefresh} from '../lib/aster-accounts.ts';
 import {asterAccountSchema,asterAccountDeleteSchema} from '../lib/validation.ts';
 import {snapshotValues} from '../lib/asset-values.ts';
 import type {Asset,AsterAccount,Connection} from '../lib/types.ts';
@@ -88,4 +88,16 @@ test('a successful zero balance resolves an unknown aggregate while independent 
   assert.equal(recovered.asset.error,undefined);
   assert.equal(recovered.connection.error,null);
   assert.equal(snapshotValues([recovered.asset],{error:null},Date.parse(now)).partial,false);
+});
+test('refresh results merge by identity: removed accounts stay removed and replaced credentials keep the newer state',()=>{
+  const base={...legacy()[0],details:[]};
+  const current:AsterAccount[]=[{...base,id:'kept',name:'保留',value:1},{...base,id:'rekeyed',name:'换钥',value:2,walletAddress:'0xnew'},{...base,id:'added',name:'新增',value:3}];
+  const merged=mergeAsterRefresh(current,[
+    {id:'kept',credential:'c-kept',patch:{value:10,error:null}},
+    {id:'rekeyed',credential:'c-old',patch:{value:20,walletAddress:'0xold'}},
+    {id:'removed',credential:'c-removed',patch:{value:30}},
+  ],new Map([[asterKey('kept'),'c-kept'],[asterKey('rekeyed'),'c-new'],[asterKey('added'),'c-added']]));
+  assert.deepEqual(merged.map(a=>[a.id,a.value,a.walletAddress]),[['kept',10,base.walletAddress],['rekeyed',2,'0xnew'],['added',3,base.walletAddress]]);
+  const failed=mergeAsterRefresh([current[0]],[{id:'kept',credential:'c-kept',patch:{error:'同步失败'}}],new Map([[asterKey('kept'),'c-kept']]));
+  assert.deepEqual([failed[0].value,failed[0].error],[1,'同步失败'],'A failed read records its error and keeps the last value');
 });

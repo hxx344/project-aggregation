@@ -12,10 +12,11 @@ test('SQLite upgrades preserve data, isolate owners and roll back a failed batch
   let database;
   try {
     const filename = join(dir, 'ledger.sqlite'), previous = join(dir, 'previous-migrations');
-    // Start from the schema before fill_cache existed, as an installed ledger would.
-    cpSync(resolve('drizzle'), previous, { recursive: true, filter: source => !source.endsWith('0002_fill_cache.sql') });
+    // Start from the schema before fill_cache and lock tokens existed, as an installed ledger would.
+    cpSync(resolve('drizzle'), previous, { recursive: true, filter: source => !source.endsWith('0002_fill_cache.sql') && !source.endsWith('0003_sync_lock_token.sql') });
     database = openDatabase(filename, previous);
     await database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-1', '{"value":123}').run();
+    await database.prepare('INSERT INTO sync_locks(owner,expires) VALUES (?,?)').bind('owner', 1).run();
     await assert.rejects(database.batch([
       database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('other', 'row-2', '{}'),
       database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-1', '{}'),
@@ -23,7 +24,8 @@ test('SQLite upgrades preserve data, isolate owners and roll back a failed batch
     assert.equal(await database.prepare('SELECT data FROM assets WHERE owner=?').bind('other').first(), null);
     database.close(); database = openDatabase(filename, resolve('drizzle'));
     assert.deepEqual({ ...await database.prepare('SELECT data FROM assets WHERE owner=?').bind('owner').first() }, { data: '{"value":123}' });
-    assert.equal((await database.prepare('SELECT * FROM _schema_migrations').all()).results.length, 3);
+    assert.equal((await database.prepare('SELECT * FROM _schema_migrations').all()).results.length, 4);
+    assert.deepEqual({ ...await database.prepare('SELECT * FROM sync_locks').first() }, { owner: 'owner', expires: 1, token: '' }, 'A lock left by the old version expires normally');
     assert.deepEqual((await database.prepare('SELECT * FROM fill_cache').all()).results, []);
   } finally { database?.close(); rmSync(dir, { recursive: true }); }
 });
