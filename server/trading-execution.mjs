@@ -610,7 +610,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次追价未发送'); }
         if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价停止价，本次追价未发送');
       };
-      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation }));
+      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation, amendSequence: order.amendCount }));
       requireLease();
       const current = orderFor(order.localId), filledQuantity = validateInspection(current, value);
       Object.assign(current, { filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });

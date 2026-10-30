@@ -21,6 +21,8 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  *   stop(credentials, { ...spec, id: string | null }, options) -> void (ACK only)
  * options = { accountMode: 'standard' | 'portfolio-margin' | 'unified' | 'cross' | 'isolated', signal,
  *   beforeMutation?: () => void } (the guard is an internal service callback).
+ *   amend also receives amendSequence: the persisted per-order intent number
+ *   (OKX derives its reqId from it; Binance ignores it).
  * spec = { symbol, side: 'buy' | 'sell', positionSide: 'BOTH' | 'LONG' | 'SHORT',
  *          quantity: decimal string, reduceOnly: boolean, clientId: string <= 32,
  *          stopPrice: positive decimal string }.

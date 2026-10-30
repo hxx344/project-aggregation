@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
 import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
+import { createOkxExecutionClient } from '../server/trading-okx-execution.mjs';
 import { normalizeIntent, splitQuantity } from '../server/trading-execution-plan.mjs';
 
 const baseTime = Date.UTC(2026, 9, 7, 10);
@@ -302,6 +303,47 @@ test('OKX native amendment retains original identity and total after partial fil
   assert.equal(f.creates.length, 2); assert.equal(f.job.legs.find(leg => leg.exchange === 'okx').filledQuantity, '5');
   for (const row of f.records.values()) f.fill(row.id);
   await f.service.tick(); assert.equal(f.job.status, 'completed');
+});
+
+test('OKX amendments sent through the real adapter never reuse a reqId after a rebuild, and a stale ACK leaves the result unknown', async t => {
+  const f = await fixture(t, { guarded: true });
+  const body = intent({ batchCount: 1, legs: intent().legs.map(leg => leg.exchange === 'binance' ? { ...leg, exchange: 'okx', quantity: '20' } : leg) });
+  f.start(await f.preview(body)); await f.service.tick();
+  const record = [...f.records.values()].find(row => row.kind === 'order'), sent = [];
+  let staleAck = null;
+  // Real OKX adapter; only HTTP is replaced. Its order rows mirror the fixture record.
+  const adapter = () => createOkxExecutionClient({ ErrorClass: ExecutionExchangeError, now: () => f.time, fetchImpl: async (url, init) => {
+    const parsed = new URL(url), parameters = init.body === undefined ? Object.fromEntries(parsed.searchParams) : JSON.parse(init.body);
+    const nativeId = 'ox' + createHash('sha256').update(record.clientId).digest('hex').slice(0, 30);
+    let data;
+    if (parsed.pathname === '/api/v5/public/instruments') data = [{ instId: 'CL-USDT-SWAP', instType: 'SWAP', ctType: 'linear', settleCcy: 'USDT', state: 'live', ctValCcy: 'CL', ctVal: '0.1', ctMult: '1', baseCcy: '', quoteCcy: '', tickSz: '0.01', lotSz: '1', minSz: '1', maxLmtSz: '100000000', maxLmtAmt: '20000000' }];
+    else if (parsed.pathname === '/api/v5/market/books') data = [{ bids: [[f.markets.okx.bid, '10', '0', '2']], asks: [[f.markets.okx.ask, '10', '0', '2']], ts: String(f.time) }];
+    else if (parsed.pathname === '/api/v5/trade/order' && init.method === 'GET') data = [{ instType: 'SWAP', instId: 'CL-USDT-SWAP', ordId: record.id, clOrdId: nativeId, ordType: 'post_only', state: 'live', tdMode: 'cross', posSide: 'long', side: 'buy', reduceOnly: 'false', sz: record.quantity, accFillSz: record.filledQuantity, px: record.price, avgPx: '', cTime: String(f.time), ccy: 'USDT', algoId: '', attachAlgoOrds: [] }];
+    else if (parsed.pathname === '/api/v5/trade/amend-order') {
+      sent.push(parameters); record.price = parameters.newPx;
+      data = [{ ordId: record.id, clOrdId: parameters.clOrdId, reqId: staleAck ?? parameters.reqId, sCode: '0' }];
+    } else throw new Error(`Unhandled fixture route ${parsed.pathname}`);
+    return new Response(JSON.stringify({ code: '0', data }), { status: 200 });
+  } });
+  let okx = adapter();
+  f.handlers['okx:amend'] = (...args) => okx.amend(...args);
+  // 71 → 72 → (adapter rebuilt) → 71: the returning price is a new intent.
+  for (const [bid, rebuild] of [['71', false], ['72', false], ['71', true]]) {
+    if (rebuild) okx = adapter();
+    f.markets.okx = { bid, ask: '72.5' }; f.advance(1000); await f.service.tick();
+  }
+  assert.deepEqual(sent.map(row => row.newPx), ['71', '72', '71']);
+  assert.equal(new Set(sent.map(row => row.reqId)).size, 3);
+  assert.equal(f.job.status, 'running');
+  // An ACK carrying an earlier reqId cannot confirm the next intent.
+  staleAck = sent[0].reqId; okx = adapter();
+  f.markets.okx = { bid: '72', ask: '72.5' }; f.advance(1000); await f.service.tick();
+  assert.equal(sent.length, 4); assert.equal(new Set(sent.map(row => row.reqId)).size, 4);
+  assert.equal(f.job.status, 'paused'); assert.equal(record.terminal, true);
+  // The unknown amendment was settled only by cancelling the original; no new amendment or order.
+  f.markets.okx = { bid: '73', ask: '73.5' }; f.advance(1000); await f.service.tick();
+  assert.equal(sent.length, 4); assert.equal(f.creates.length, 2);
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
 });
 
 test('changed OKX contract multiplier blocks all submission and max notional applies per contract size', async t => {
