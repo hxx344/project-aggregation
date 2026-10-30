@@ -505,16 +505,22 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // Operator confirmation for a Bybit strategy create without an answer. It is
   // accepted only after the request can no longer arrive, while the symbol has
   // no live strategy, no unclaimed strategy created around the request (venue
-  // clock tolerance included), and the position matches the known fills.
+  // clock tolerance included), including ones that already ended (status 3,
+  // read from a bounded window around the request), and the position matches
+  // the known fills.
   async function confirmNotCreated(order) {
     const created = Date.parse(order.createdAt);
     if (!Number.isFinite(created) || now() < createSettledAt(order)) throw new ExecutionError(409, '下单请求仍可能送达交易所，请稍后再确认');
     const { account, matches } = await freshPosition(order);
     if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
+    const window = callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS, ctx = context(order.exchange, order.accountRevision);
+    const ended = await call(signal => ctx.client.endedStrategies(ctx.credentials, { ...ctx.options, signal, symbol: order.spec.symbol, startTime: created - window, endTime: created + window }));
+    requireLease();
+    if (!Array.isArray(ended)) throw new ExecutionError(502, '无法读取 Bybit 已终结追逐策略，暂不确认');
     // Strategies any Hub job already claimed are accounted for by that job.
     const claimed = new Set(stmt.prepare("SELECT json_extract(json,'$.remoteId') AS id FROM execution_orders WHERE json_extract(json,'$.exchange')='bybit' AND json_extract(json,'$.remoteId') IS NOT NULL").all().map(row => row.id));
-    const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS; };
-    const candidates = account.strategies.filter(strategy => strategy.symbol === order.spec.symbol && !claimed.has(strategy.id));
+    const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= window; };
+    const candidates = [...account.strategies, ...ended].filter(strategy => strategy.symbol === order.spec.symbol && !claimed.has(strategy.id));
     if (candidates.some(strategy => strategy.status !== 'terminal')) throw new ExecutionError(409, 'Bybit 该合约仍有运行中的追逐策略，请填写其策略编号核对');
     if (candidates.some(nearby)) throw new ExecutionError(409, 'Bybit 存在下单时段前后创建的同合约追逐策略，请填写其策略编号核对');
     if (!matches) throw new ExecutionError(409, 'Bybit 当前仓位或挂单与本任务已知成交不一致，不能确认策略未创建');

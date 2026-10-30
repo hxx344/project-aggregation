@@ -540,6 +540,27 @@ test('Bybit refuses missing cursors, cursor cycles, and inconsistent or foreign 
   }
 });
 
+test('Bybit ended-strategy lookup is bounded to a creation window, status 3 and complete pages', async () => {
+  const window = { symbol: 'CLUSDT', startTime: NOW - 600_000, endTime: NOW + 600_000 };
+  const { client, calls } = harness('bybit', call => call.url.pathname === '/v5/strategy/list'
+    ? { list: [strategy({ status: 3, side: 'Sell' })], nextCursor: '' } : undefined);
+  const result = await client.endedStrategies(credentials, window);
+  assert.deepEqual(result, [{ id: STRATEGY, symbol: 'CLUSDT', side: 'sell', quantity: '2', filledQuantity: '0', status: 'terminal', reduceOnly: false, createdAt: new Date(NOW).toISOString() }]);
+  const query = calls.find(call => call.url.pathname === '/v5/strategy/list').parameters;
+  assert.deepEqual(query, { category: 'UTA_USDT', symbol: 'CLUSDT', strategyType: 'chaseOrder', status: '3', startTime: String(window.startTime), endTime: String(window.endTime), pageSize: '50' });
+  for (const invalid of [{ ...window, endTime: window.startTime + 3_600_001 }, { ...window, startTime: undefined }, { ...window, endTime: window.startTime }, { ...window, symbol: 'BTCUSDT' }]) {
+    const rejected = harness('bybit');
+    await assert.rejects(rejected.client.endedStrategies(credentials, invalid), isError('input'));
+    assert.equal(rejected.calls.length, 0);
+  }
+  const binance = harness('binance');
+  await assert.rejects(binance.client.endedStrategies(credentials, window), isError('input'));
+  const duplicated = harness('bybit', call => call.url.pathname === '/v5/strategy/list' ? { list: [strategy({ status: 3 }), strategy({ status: 3 })], nextCursor: '' } : undefined);
+  await assert.rejects(duplicated.client.endedStrategies(credentials, window), isError('invalid_data'));
+  const unfinished = harness('bybit', call => call.url.pathname === '/v5/strategy/list' ? { list: [strategy({ status: 3 })], nextCursor: 'same' } : undefined);
+  await assert.rejects(unfinished.client.endedStrategies(credentials, window), isError('pagination'));
+});
+
 test('Bybit paused and untriggered strategies remain unresolved even with no child orders', async () => {
   for (const status of [5, 6]) {
     const { client } = harness('bybit', call => call.url.pathname.endsWith('/strategy/list') ? { list: [strategy({ status })], nextCursor: '' }

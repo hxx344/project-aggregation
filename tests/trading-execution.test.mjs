@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
-import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
+import { createExecutionExchangeClient, ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 import { createOkxExecutionClient } from '../server/trading-okx-execution.mjs';
 import { normalizeIntent, splitQuantity } from '../server/trading-execution-plan.mjs';
 
@@ -27,10 +27,11 @@ async function fixture(t, options = {}) {
   const records = new Map(), calls = [], handlers = {}, markets = {};
   const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map((exchange, index) => [exchange, { identity: guarded ? String(index + 1) : exchange === 'binance' ? null : 'fixture-uid', modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
-  const factory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
+  const factory = exchange => Object.fromEntries(['verify', 'account', 'endedStrategies', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
     if (handlers[`${exchange}:${method}`]) return handlers[`${exchange}:${method}`](...args);
     if (method === 'verify') return { identity: accounts[exchange].identity };
+    if (method === 'endedStrategies') return [];
     if (method === 'account') return structuredClone(accounts[exchange]);
     if (method === 'market') { const value = market(args[0]); return { ...value, ...(exchange === 'okx' ? { rule: { ...value.rule, quantityStep: '1', minQuantity: '1', contractSize: args[0] === 'CLUSDT' ? '0.1' : '0.01', instrumentId: args[0] === 'CLUSDT' ? 'CL-USDT-SWAP' : 'BZ-USDT-SWAP', quantityUnit: '张', minNotional: '0' } } : {}), ...markets[exchange] }; }
     const spec = args[1];
@@ -946,6 +947,64 @@ test('Bybit strategy create without an answer can be confirmed absent only after
   await f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true });
   assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true);
   assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  assert.equal(f.creates.length, 2);
+});
+
+test('Bybit not-created confirmation reads ended strategies near the request through the real adapter', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.handlers['bybit:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const leg = f.job.legs.find(row => row.exchange === 'bybit'), created = f.time;
+  for (const step of [50_000, 50_000, 25_000]) { f.advance(step); await f.service.tick(); }
+  assert.equal(f.job.status, 'attention');
+  // Real Bybit adapter; only HTTP is replaced. The venue keeps ended (status 3)
+  // strategies out of the active buckets and filters them by creation time.
+  const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const venue = { ended: [], shortQuantity: '0', ignoreWindow: false, endlessPages: false }, lists = [];
+  const row = (n, time, status = 3) => ({ strategyId: id(n), category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Sell', size: '2', executedSize: '0', strategyType: 'chaseOrder', status, reduceOnly: false, createdTimeE3: String(time), updatedTimeE3: String(time), chaseOrderPrice: '70', executedAvgPrice: '0' });
+  const bybit = createExecutionExchangeClient('bybit', { now: () => f.time, fetchImpl: async url => {
+    const parsed = new URL(url), query = Object.fromEntries(parsed.searchParams), path = parsed.pathname;
+    let result;
+    if (path === '/v5/user/query-api') result = { readOnly: 0, userID: '2', permissions: { ContractTrade: ['Order', 'Position'], Derivatives: ['DerivativesTrade'], Wallet: [], Spot: [], Options: [], Earn: [] } };
+    else if (path === '/v5/account/info') result = { unifiedMarginStatus: 6 };
+    else if (path === '/v5/position/list') result = { category: 'linear', list: [{ symbol: query.symbol, positionIdx: 1, side: '', size: '0' }, { symbol: query.symbol, positionIdx: 2, side: query.symbol === 'CLUSDT' && venue.shortQuantity !== '0' ? 'Sell' : '', size: query.symbol === 'CLUSDT' ? venue.shortQuantity : '0' }], nextPageCursor: '' };
+    else if (path === '/v5/order/realtime') result = { category: 'linear', list: [], nextPageCursor: '' };
+    else if (path === '/v5/strategy/list') {
+      lists.push(query);
+      if (query.status !== '3') result = { list: [], nextCursor: '' };
+      else if (venue.endlessPages) result = { list: [row(90, created)], nextCursor: 'again' };
+      else result = { list: venue.ended.filter(item => venue.ignoreWindow || Number(item.createdTimeE3) >= Number(query.startTime) && Number(item.createdTimeE3) <= Number(query.endTime)), nextCursor: '' };
+    } else throw new Error(`Unhandled fixture route ${path}`);
+    return new Response(JSON.stringify({ retCode: 0, retMsg: 'OK', result }), { status: 200 });
+  } });
+  f.handlers['bybit:account'] = (...args) => bybit.account(...args);
+  f.handlers['bybit:endedStrategies'] = (...args) => bybit.endedStrategies(...args);
+  const confirm = () => f.service.reconcile(f.job.id, { legId: leg.id, notCreated: true, acknowledge: true });
+  // A zero-fill strategy that ended right after the request blocks the confirmation.
+  venue.ended = [row(1, created + 2000)];
+  await assert.rejects(confirm(), /下单时段前后/);
+  const history = lists.filter(query => query.status === '3');
+  assert.equal(history.length, 1);
+  assert.ok(Number(history[0].startTime) <= created - 300_000 && Number(history[0].endTime) >= created + 300_000);
+  assert.ok(Number(history[0].endTime) - Number(history[0].startTime) <= 3_600_000);
+  // Incomplete pagination proves nothing.
+  venue.endlessPages = true;
+  await assert.rejects(confirm(), /分页结果不完整/);
+  venue.endlessPages = false;
+  // A position that differs from known fills still blocks it.
+  venue.ended = []; venue.shortQuantity = '1';
+  await assert.rejects(confirm(), /仓位或挂单与本任务已知成交不一致/);
+  venue.shortQuantity = '0';
+  assert.equal(f.job.status, 'attention');
+  // Far history (even when the venue ignores the window) and strategies another
+  // Hub job already claimed do not block it.
+  f.db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run('earlier-order', 'earlier-job', JSON.stringify({ exchange: 'bybit', remoteId: id(2) }));
+  venue.ended = [row(2, created + 1000), row(3, created - 3_600_000)]; venue.ignoreWindow = true;
+  await confirm();
+  assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true);
+  assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
+  // Routine account reads only query the active status buckets.
+  assert.deepEqual([...new Set(lists.filter(query => !query.startTime).map(query => query.status))].sort(), ['2', '4', '5', '6']);
   assert.equal(f.creates.length, 2);
 });
 
