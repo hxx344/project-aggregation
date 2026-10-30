@@ -69,8 +69,13 @@ test('slots follow the configured timezone, weekdays and interval', () => {
   assert.equal(latestSlot(night, at('2026-11-01T06:30:00Z'), 15), null, 'the repeated 01:30 does not fire again');
   const hourly = { ...ny, mode: 'interval', intervalMinutes: 60 };
   assert.equal(latestSlot(hourly, at('2026-11-01T05:00:00Z'), 1), at('2026-11-01T05:00:00Z'));
-  assert.equal(latestSlot(hourly, at('2026-11-01T06:00:00Z'), 1), null);
-  assert.equal(latestSlot(hourly, at('2026-11-01T07:00:00Z'), 1), at('2026-11-01T07:00:00Z'));
+  assert.equal(latestSlot(hourly, at('2026-11-01T06:00:00Z'), 1), at('2026-11-01T06:00:00Z'), 'an interval is real time, so the repeated hour still sends');
+  for (const [timezone, first, second, time] of [['Australia/Lord_Howe', '2026-04-04T14:45:00Z', '2026-04-04T15:15:00Z', '01:45'], ['Antarctica/Troll', '2026-10-25T00:30:00Z', '2026-10-25T02:30:00Z', '02:30']]) {
+    const plan = { ...ny, timezone, times: [time] };
+    assert.equal(localClock(at(first) * 60000, timezone).time, localClock(at(second) * 60000, timezone).time, timezone);
+    assert.equal(latestSlot(plan, at(first), 1), at(first), timezone);
+    assert.equal(latestSlot(plan, at(second), 1), null, timezone);
+  }
   assert.equal(nextSlot({ ...ny, times: ['02:30'] }, at('2027-03-14T05:00:00Z')), at('2027-03-15T06:30:00Z'), 'a skipped local time has no slot that day');
 });
 
@@ -208,6 +213,20 @@ test('a retry from a send that was under way does not survive disabling or clear
   await digest.close();
 });
 
+test('changing the schedule during a send drops the retry of its old slot', async () => {
+  let release;
+  const refused = [];
+  const { digest, clock } = manager({ at: AT_NINE - 60000, manager: { readSections: () => new Promise(resolve => { release = () => resolve([section('hub:a')]); }), fetcher: async (url, init) => { refused.push(init); return { ok: true, status: 200, json: async () => ({ code: 11232 }) }; } } });
+  enable(digest);
+  clock.now = AT_NINE; digest.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  digest.save(defaults({ enabled: true, schedule: { ...DIGEST_DEFAULTS.schedule, times: ['23:00'] } }));
+  release(); await settled(digest);
+  clock.now += 120000; digest.tick(); await settled(digest);
+  assert.equal(refused.length, 1);
+  await digest.close();
+});
+
 test('clearing the webhook or closing while reading sends nothing and records nothing', async () => {
   const posted = [];
   const hanging = () => new Promise(() => {});
@@ -238,6 +257,8 @@ test('previews share one read until it expires, and a failed read is not kept', 
   broken = false;
   await digest.preview(defaults());
   assert.equal(reads, 3);
+  await digest.preview(defaults(), { fresh: true });
+  assert.equal(reads, 4);
   await digest.close();
 });
 
@@ -423,5 +444,8 @@ test('workbench routes require the session and never expose the webhook', async 
     assert.equal(preview.omitted, 0);
     assert.equal((await (await request('')).json()).config.title, '日报');
     assert.equal((await request('/preview', 'POST', { config: { enabled: true } })).status, 400);
+    assert.equal((await request('/preview', 'POST', { config: defaults(), fresh: true })).status, 200);
+    assert.equal((await request('/preview', 'POST', { config: defaults(), fresh: 'yes' })).status, 400);
+    assert.equal((await request('/config', 'PUT', { config: defaults(), fresh: true })).status, 400);
   } finally { await app.close(); }
 });

@@ -68,15 +68,16 @@ export function localClock(ms, timezone) {
   const time = `${parts.hour}:${parts.minute}`;
   return { weekday: WEEKDAYS[parts.weekday], time, minuteOfDay: Number(parts.hour) * 60 + Number(parts.minute), label: `${parts.month}-${parts.day} ${time}` };
 }
-// When clocks go back a local time happens twice; shifts are 30 or 60 minutes in every current zone.
-const repeated = (minute, timezone, label) => [30, 60].some(shift => localClock((minute - shift) * 60000, timezone).label === label);
+// When clocks go back a local time happens twice; zones shift by 30 minutes (Lord Howe), 60, or 120 (Troll).
+const repeated = (minute, timezone, label) => [30, 60, 120].some(shift => localClock((minute - shift) * 60000, timezone).label === label);
 // A slot is a minute since the epoch; matching on local clock parts keeps it right across DST.
-// A repeated local time counts once, and one skipped by the spring change has no slot that day.
+// A named time that repeats counts once, and one skipped by the spring change has no slot that day.
+// An interval keeps running through a repeated hour: its slots are real time apart.
 function isDue(plan, minute) {
   const clock = localClock(minute * 60000, plan.timezone);
   if (!plan.weekdays.includes(clock.weekday)) return false;
-  const matches = plan.mode === 'times' ? plan.times.includes(clock.time) : clock.minuteOfDay % plan.intervalMinutes === 0;
-  return matches && !repeated(minute, plan.timezone, clock.label);
+  if (plan.mode === 'interval') return clock.minuteOfDay % plan.intervalMinutes === 0;
+  return plan.times.includes(clock.time) && !repeated(minute, plan.timezone, clock.label);
 }
 export function latestSlot(plan, minute, graceMinutes) {
   for (let slot = minute; slot > minute - graceMinutes; slot--) if (isDue(plan, slot)) return slot;

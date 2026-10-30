@@ -49,8 +49,8 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
   }
   // A send already under way must not bring back a retry the user has cancelled.
   function invalidate() { epoch++; retry = null; }
-  function previewSections() {
-    if (!previewRead || now() - previewRead.at >= PREVIEW_CACHE_MS) {
+  function previewSections(fresh) {
+    if (fresh || !previewRead || now() - previewRead.at >= PREVIEW_CACHE_MS) {
       const read = { at: now(), items: readSections() };
       previewRead = read;
       read.items.catch(() => { if (previewRead === read) previewRead = null; });
@@ -134,8 +134,8 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
       rmSync(channelPath, { force: true }); channelHost = null; channelError = null;
       return state();
     },
-    async preview(value) {
-      const next = checked(validateDigestConfig, value), items = await previewSections();
+    async preview(value, { fresh = false } = {}) {
+      const next = checked(validateDigestConfig, value), items = await previewSections(fresh);
       const digest = buildDigest(items, next, now()), { bytes, omitted } = renderCard(digest, next);
       return { digest, bytes, omitted, catalog: items.map(({ id, name, level, status, metrics }) => ({ id, name, level, status, metrics: metrics.map(({ key, label }) => ({ key, label })) })) };
     },

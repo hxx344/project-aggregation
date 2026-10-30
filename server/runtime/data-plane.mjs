@@ -275,8 +275,9 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       const body = await bodyOf();
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
       if (action === 'save' || action === 'preview') {
-        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供汇总配置');
-        return reply(200, await feishuDigest[action](body.config));
+        const { config, ...rest } = body, fresh = action === 'preview' && rest.fresh === true;
+        if (config === undefined || Object.keys(rest).length !== (fresh ? 1 : 0)) throw new HttpError(400, '请提供汇总配置');
+        return reply(200, await feishuDigest[action](config, { fresh }));
       }
       if (action === 'setChannel') return reply(200, feishuDigest.setChannel(body));
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
