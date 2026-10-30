@@ -1,6 +1,7 @@
 // Aero LP wallet valuation for the Asset ledger, in the pool's quote token (USDC): position values, wallet
 // token balances and unclaimed AERO from the latest cycle. Gas ETH is left out. null: no wallet configured.
 // An incomplete cycle yields total null with an error, so Asset keeps its previous value instead of a partial sum.
+// staleAfterSec follows the LP's own check interval (the same limit as the Feishu digest); Asset enforces it.
 const DETAIL_LIMIT = 100;
 const number = value => {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN;
@@ -10,7 +11,8 @@ const number = value => {
 export function aeroLpValuation(state) {
   if (!state?.wallet) return null;
   const cycle = state.lastCycle;
-  const base = { wallet: state.wallet, state: state.state, at: cycle?.at ?? null, total: null, details: [], error: null };
+  const staleAfterSec = Math.max(600, (state.config?.intervalSec ?? 60) * 3);
+  const base = { wallet: state.wallet, state: state.state, at: cycle?.at ?? null, staleAfterSec, total: null, details: [], error: null };
   const fail = error => ({ ...base, error });
   if (!cycle) return fail(state.state === 'running' || state.state === 'starting' ? 'Aero LP 尚未完成首轮检查' : 'Aero LP 未运行，尚无链上估值');
   const [symbol0, symbol1] = Array.isArray(cycle.symbols) ? cycle.symbols : [];

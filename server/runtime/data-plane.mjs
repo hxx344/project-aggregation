@@ -131,7 +131,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
     close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),
   };
-  let assetSync = null;
+  let assetSync = null, aeroLpReady = false;
 
   function snapshot(project) {
     const base = { project, state: 'unconfigured', message: '等待首次读取数据', checkedAt: null, updatedAt: null, latencyMs: null, metrics: [], ...(project.adapter === 'asset' ? { sync: assetSync?.getStatus(project.id) || null } : {}) };
@@ -360,7 +360,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   assetSync = createAssetSync({
     listTargets: () => projects.all().filter(row => !embeddedModules || moduleIds.includes(row.id)).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
     intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
-    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader, syncBody: () => ({ aeroLp: aeroLpValuation(aeroLp.state()) }),
+    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader, // Until the LP manager has loaded its wallet, state() reads as "no wallet"; omit the field so Asset keeps the row.
+    syncBody: () => aeroLpReady ? { aeroLp: aeroLpValuation(aeroLp.state()) } : {},
     onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
   });
   async function refresh(dueOnly = false) { await Promise.allSettled(getProjects().filter(project => {
@@ -394,7 +395,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
     prepareStop: () => aeroLp.prepareStop(),
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); feishuDigest.initialize(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); aeroLpReady = true; feishuDigest.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,

@@ -9,12 +9,14 @@ const cycle = (extra = {}) => ({
   wallet: { RSGP: '10000.0', USDC: '25.5', ETH: '0.01', AERO: '3.0' },
   rewards: { price: 0.5, pending: '4.0', deferred: '0.0' }, ...extra,
 });
-const state = (lastCycle, extra = {}) => ({ wallet: WALLET, state: 'running', lastCycle, ...extra });
+const state = (lastCycle, extra = {}) => ({ wallet: WALLET, state: 'running', lastCycle, config: { intervalSec: 300 }, ...extra });
 
 test('values positions, wallet tokens and unclaimed AERO in USDC, leaving gas ETH out', () => {
   const result = aeroLpValuation(state(cycle()));
   assert.equal(result.error, null);
   assert.equal(result.at, '2026-10-30T02:00:00.000Z');
+  assert.equal(result.staleAfterSec, 900);
+  assert.equal(aeroLpValuation(state(cycle(), { config: { intervalSec: 60 } })).staleAfterSec, 600);
   // 400 + 100 + 10000 × 0.002 + 25.5 + 3 × 0.5 + 4 × 0.5
   assert.equal(result.total, 549);
   assert.deepEqual(result.details.map(row => [row.account, row.coin]), [

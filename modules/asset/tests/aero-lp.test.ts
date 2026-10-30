@@ -22,19 +22,19 @@ process.env.ASSET_DATA_DIR = dataDir;
 test.after(() => rmSync(dataDir, { recursive: true, force: true }));
 const store = await import('../lib/store.ts');
 const { control } = await import('./fixtures/store-fakes.ts');
-const { parseAeroLp, planAeroLp, INVALID_AERO_LP } = await import('../lib/aero-lp.ts');
+const { parseAeroLp, planAeroLp, supersedes, INVALID_AERO_LP } = await import('../lib/aero-lp.ts');
 
 const WALLET = '0x' + 'ab'.repeat(20);
 const valuation = (total: number | null, at: string | null, extra = {}) => ({
-  wallet: WALLET, state: 'running', at, total, error: null,
+  wallet: WALLET, state: 'running', at, staleAfterSec: 1800, total, error: null,
   details: total === null ? [] : [{ account: '头寸 #7（质押）', coin: 'USDC', quantity: total, value: total }], ...extra,
 });
 const usdc = (price: number, at = '2026-10-30T02:00:00.000Z') => ({ price, at, source: 'test' });
 const row = (extra: Partial<Asset> = {}): Asset => ({ id: 'row-3', project: 'Aero LP', kind: '链上 LP', quantity: 500, price: 1, value: 500, cell: 'E3', mode: 'aero', updatedAt: '2026-10-30T01:00:00.000Z', status: '工作台同步 · 链上估值时间', ...extra });
 const others: Asset[] = [{ id: 'row-1', project: 'virtual', kind: '代币', quantity: 1, price: 1, value: 1, cell: 'E1', mode: 'market', updatedAt: '', status: '' }];
 
-test('the workbench valuation is converted with the USDC quote and dated by the older source', () => {
-  const plan = planAeroLp(others, valuation(1000, '2026-10-30T02:00:30.000Z'), usdc(0.998), undefined, Date.parse('2026-10-30T02:01:00Z'));
+test('the workbench valuation is converted with the USDC quote, dated by it, and shows the chain check time', () => {
+  const plan = planAeroLp(others, valuation(1000, '2026-10-30T01:40:30.000Z'), usdc(0.998), undefined, Date.parse('2026-10-30T02:01:00Z'));
   assert.equal(plan.type, 'save');
   if (plan.type !== 'save') return;
   assert.equal(plan.asset.id, 'row-2');
@@ -43,7 +43,27 @@ test('the workbench valuation is converted with the USDC quote and dated by the 
   assert.equal(plan.asset.value, 998);
   assert.equal(plan.asset.details?.[0].value, 998);
   assert.equal(plan.asset.updatedAt, '2026-10-30T02:00:00.000Z');
+  assert.equal(plan.asset.status, '工作台同步 · 链上检查 10-30 09:40');
   assert.match(plan.asset.kind, /0xabab…abab$/);
+  const stopped = planAeroLp(others, valuation(1000, '2026-10-30T01:40:30.000Z', { state: 'stopped' }), usdc(1), undefined, Date.parse('2026-10-30T02:01:00Z'));
+  assert.equal(stopped.type === 'save' && stopped.asset.status, '工作台同步 · 链上检查 10-30 09:40 · LP 未运行');
+});
+
+test('a chain check older than its own limit keeps the previous value as a failure', () => {
+  const now = Date.parse('2026-10-30T02:00:00Z');
+  const late = planAeroLp([...others, row()], valuation(1000, '2026-10-30T01:29:59.000Z'), usdc(1), undefined, now);
+  assert.deepEqual(late, { type: 'save', asset: { ...row(), status: '同步失败 · 保留旧值', error: 'Aero LP 链上检查已超过 30 分钟未更新' } });
+  assert.equal(planAeroLp(others, valuation(1000, '2026-10-30T01:30:00.000Z'), usdc(1), undefined, now).type, 'save');
+});
+
+test('a late request does not replace a newer chain check', () => {
+  const saved = JSON.stringify(valuation(1000, '2026-10-30T02:00:00.000Z'));
+  assert.equal(supersedes(valuation(900, '2026-10-30T01:59:00.000Z'), saved), false);
+  assert.equal(supersedes(valuation(900, '2026-10-30T02:00:00.000Z'), saved), true);
+  assert.equal(supersedes(valuation(null, null, { error: 'Aero LP 尚未完成首轮检查' }), saved), true);
+  assert.equal(supersedes(null, saved), true);
+  assert.equal(supersedes('invalid', saved), true);
+  assert.equal(supersedes(valuation(900, '2026-10-30T01:59:00.000Z'), undefined), true);
 });
 
 test('a failed valuation keeps the previous value and never creates a row', () => {
@@ -54,8 +74,9 @@ test('a failed valuation keeps the previous value and never creates a row', () =
     ['invalid', usdc(1), INVALID_AERO_LP],
   ];
   for (const [input, quote, error] of cases) {
-    assert.deepEqual(planAeroLp([...others, row()], input, quote, '行情失败'), { type: 'save', asset: { ...row(), status: '同步失败 · 保留旧值', error } });
-    assert.deepEqual(planAeroLp(others, input, quote, '行情失败'), { type: 'none' });
+    const now = Date.parse('2026-10-30T02:01:00Z');
+    assert.deepEqual(planAeroLp([...others, row()], input, quote, '行情失败', now), { type: 'save', asset: { ...row(), status: '同步失败 · 保留旧值', error } });
+    assert.deepEqual(planAeroLp(others, input, quote, '行情失败', now), { type: 'none' });
   }
 });
 
@@ -82,7 +103,7 @@ test('refresh applies a valuation that arrived while throttled on the next unthr
   t.mock.timers.tick(31_000);
   ledger = await store.refresh(owner);
   assert.equal(aero(ledger)?.value, 1996);
-  assert.equal(aero(ledger)?.updatedAt, '2026-10-30T02:00:05.000Z');
+  assert.equal(aero(ledger)?.updatedAt, '2026-10-30T02:00:41.000Z');
 
   await assert.rejects(store.editAsset(owner, { id: aero(ledger)!.id, quantity: 1, price: 1 }), /工作台同步维护/);
 

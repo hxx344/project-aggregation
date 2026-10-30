@@ -16,7 +16,7 @@ import { hubPositionsService } from './hub-positions';
 import { yuanQuote } from './fx';
 import { mapConcurrent, settleIndependent } from './concurrency';
 import { knownAssetValue, snapshotValues, configuredExchanges, refreshMarketAsset, withMarketQuantity } from './asset-values';
-import { parseAeroLp, planAeroLp, type AeroLpInput } from './aero-lp';
+import { parseAeroLp, planAeroLp, supersedes, type AeroLpInput } from './aero-lp';
 import type { Asset, Ledger, Connection, Withdrawal, FxStatus, AsterAccount } from './types';
 
 export const chinaDate=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});
@@ -220,7 +220,8 @@ export async function deleteAsterAccount(owner:string,id:string,action:'disconne
 export async function refresh(owner:string,aeroLp?:AeroLpInput|'invalid'){
   return withLock(owner,async lease=>{
     // Saved before the throttle below, so a workbench sync landing right after a page refresh is applied on the next one.
-    if(aeroLp!==undefined)await setting(lease,owner,'aero-lp',JSON.stringify(aeroLp));
+    const savedAero=aeroLp===undefined?undefined:(await db().prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner,'aero-lp').first<{value:string}>())?.value;
+    if(aeroLp!==undefined&&supersedes(aeroLp,savedAero))await setting(lease,owner,'aero-lp',JSON.stringify(aeroLp));
     const ledger=await getCurrentLedger(owner);
     const last=await db().prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner,'last-attempt').first<{value:string}>();
     if(last&&Date.now()-Number(last.value)<30000)return getLedger(owner);
