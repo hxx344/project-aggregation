@@ -366,8 +366,9 @@ export const STAGES = {
 };
 
 /**
- * 激活结果核验：服务健康，且安装器的部署记录（与在线更新读取的当前版本同源）
- * 等于本轮提交。健康端点只返回 {status:'ok'}；运行目录的 .source-sha 在内容未变时
+ * 激活结果核验：服务就绪，且安装器的部署记录（与在线更新读取的当前版本同源）
+ * 等于本轮提交。生产配置探测 /api/ready：/api/health 只说明 API 存活，runtime 失联时仍是 200。
+ * 就绪端点只返回 {ready}，不含版本；运行目录的 .source-sha 在内容未变时
  * 可以是更早的提交，不能代表已部署身份。
  */
 export async function verifyActivation(ctx, { attempts } = {}) {
