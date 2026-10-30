@@ -56,6 +56,10 @@ class RequestNotSent(ExchangeError):
     """A local admission check failed before any HTTP request was sent."""
 
 
+class SendBasisExpired(RequestNotSent):
+    """The account or quote evidence an order was sized from expired before HTTP."""
+
+
 class TransferRejected(ExchangeError):
     """A documented transfer rejection; the request was sent but not accepted."""
 
@@ -408,12 +412,18 @@ class API:
         self.account_writer = None
         self.writer_connection = None
         self._writer_prepared = ContextVar("aster_transport_prepared", default=None)
+        self._final_check = ContextVar("aster_transport_final_check", default=None)
         self.http.event_hooks["request"].append(self._before_account_request)
 
     def _before_account_request(self, request):
         prepared = self._writer_prepared.get()
         if prepared is not None:
             self.account_writer.before_send(prepared, request)
+        # Runs after every persistence and shared-admission wait, immediately
+        # before the transport; a veto here is still a proven local no-send.
+        final_check = self._final_check.get()
+        if final_check is not None:
+            final_check()
 
     def signed_parameters(self, params):
         if not self.credentials:
@@ -434,7 +444,7 @@ class API:
         data["signature"] = signature if signature.startswith("0x") else "0x" + signature
         return data
 
-    def call(self, method, path, params=None, signed=False, weight=1, *, timeout=None):
+    def call(self, method, path, params=None, signed=False, weight=1, *, timeout=None, before_send=None):
         # listenKey creation/renewal only maintains a private read stream. All
         # other signed non-GET calls must pass account admission before signing.
         writer = self.account_writer if signed and method != "GET" and path != "/fapi/v3/listenKey" else None
@@ -442,6 +452,7 @@ class API:
             raise RequestNotSent("受管理交易请求未绑定账户保护，未发送请求")
         prepared = writer.prepare(self, method, path, params or {}) if writer is not None else None
         token = self._writer_prepared.set(prepared)
+        final_token = self._final_check.set(before_send)
         try:
             try:
                 result = self._call(method, path, params, signed, weight, timeout=timeout)
@@ -465,6 +476,7 @@ class API:
                           for index, row in enumerate(result)]
             return result
         finally:
+            self._final_check.reset(final_token)
             self._writer_prepared.reset(token)
 
     def _call(self, method, path, params=None, signed=False, weight=1, *, timeout=None):
@@ -1288,13 +1300,28 @@ class LiveBroker:
             self._private_evidence.event(kind)
             self._invalidate_snapshot_reads(refresh_modes=kind not in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"))
 
-    def _account_write(self, method, path, params, *, weight=1, refresh_modes=False, timeout=None):
+    def _account_write(self, method, path, params, *, weight=1, refresh_modes=False, timeout=None,
+                       basis_generation=None, before_send=None):
         # No snapshot HTTP lock: in-flight background results are revoked by
         # generation instead of making a ready order wait for another request.
-        self.invalidate_account_reads("账户写入开始", refresh_modes=refresh_modes)
+        with self._snapshot_lock:
+            if basis_generation is not None and basis_generation != self._snapshot_generation:
+                raise SendBasisExpired("下单依据的账户快照已被账户事件或写入撤销，本批未发送，等待重新规划")
+            self.invalidate_account_reads("账户写入开始", refresh_modes=refresh_modes)
+            # This write's own invalidation is expected; any later one is not.
+            written = self._snapshot_generation
+        options = {"timeout": timeout} if timeout is not None else {}
+        if basis_generation is not None or before_send is not None:
+            def final_check():
+                if basis_generation is not None:
+                    with self._snapshot_lock:
+                        if written != self._snapshot_generation:
+                            raise SendBasisExpired("发送前账户发生变化，下单依据已失效，本批未发送，等待重新规划")
+                if before_send is not None:
+                    before_send()
+            options["before_send"] = final_check
         try:
-            return self.api.call(method, path, params, signed=True, weight=weight,
-                                 **({"timeout": timeout} if timeout is not None else {}))
+            return self.api.call(method, path, params, signed=True, weight=weight, **options)
         finally:
             # A refresh that started during this write must also be discarded.
             self.invalidate_account_reads("账户写入结束", refresh_modes=refresh_modes)
@@ -1683,9 +1710,14 @@ class LiveBroker:
                                        http_status=exc.http_status) from None
             raise
 
-    def submit(self, orders, *, timeout=None):
+    def submit(self, orders, *, timeout=None, basis_generation=None, before_send=None):
+        """``basis_generation`` and ``before_send`` re-check sizing evidence in the final HTTP hook."""
         self.leverage_snapshot = None
         options = {"timeout": timeout} if timeout is not None else {}
+        if basis_generation is not None:
+            options["basis_generation"] = basis_generation
+        if before_send is not None:
+            options["before_send"] = before_send
         if len(orders) == 1:
             return [self._account_write("POST", "/fapi/v3/order", orders[0], **options)]
         return self._account_write("POST", "/fapi/v3/batchOrders", {"batchOrders": json.dumps(orders, separators=(",", ":"))}, weight=5, **options)

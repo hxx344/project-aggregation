@@ -20,7 +20,7 @@ from .monitoring_status import compute_symbol_view
 from .hourly_summary import format_hourly_summary
 from .capacity_relay_client import CAPACITY_RELAY_SYMBOLS
 from .depth import DEPTH_POLL_INTERVAL, DEPTH_RESYNC_INTERVAL, DEPTH_WEIGHT
-from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
+from .exchange import BudgetWait, ExchangeError, LiveBroker, MarketData, PublicBracketsUnavailable, RateBudget, RequestNotSent, SendBasisExpired, SnapshotSuperseded, credentials_for, PUBLIC_BRACKETS_REFRESH_INTERVAL
 from .account_deletion import deletion_block
 from .execution import Executor
 from .ordinary_selection import ordinary_add_blocks, ordinary_add_symbols, ordinary_selection
@@ -367,9 +367,14 @@ class Engine:
             # fills do not prove an empty/rejected batch or warrant backoff.
             return
         previous = self.store.get(key) or {}
-        count = min(5, previous.get("failures", 0) + 1)
-        rejected = any(r.get("status") == "REJECTED" for r in intent["receipts"].values())
-        delay = min(120, (30 if rejected else 15) * 2 ** (count - 1))
+        receipts = intent["receipts"].values()
+        if receipts and all(r.get("basis_expired") for r in receipts):
+            # Stale local evidence is no exchange verdict: replan soon, without growing the backoff.
+            count, delay = previous.get("failures", 0), 10
+        else:
+            count = min(5, previous.get("failures", 0) + 1)
+            rejected = any(r.get("status") == "REJECTED" for r in receipts)
+            delay = min(120, (30 if rejected else 15) * 2 ** (count - 1))
         self.store.put(key, {"failures": count, "until": time.time() + delay})
         self.store.event(account_id, "waiting", f"{intent['symbol']} 本批无新增仓位，新开单等待 {delay} 秒；继续核对已有订单")
 
@@ -1031,9 +1036,10 @@ class Engine:
                 if campaign and (snapshot.margin_exceeds(campaign_limit, include_equal=True) or time.time() - campaign["last_fill_at"] >= 60):
                     self.store.finish_campaign(account, last_reason, snapshot.ratio)
                 return 5
-            except SnapshotSuperseded as exc:
-                # A revoked GET did not fail an order. Retain the durable batch
-                # and retry its read; never turn this into a new submission.
+            except (SnapshotSuperseded, SendBasisExpired) as exc:
+                # A revoked GET or a repair held back by its own basis did not
+                # fail an order. Retain the durable batch and retry its read;
+                # never turn this into a new submission.
                 pending = self.store.intent(account_id)
                 attention = account.get("pause_reason") or (pending and pending["status"] == "attention")
                 reason = (account.get("pause_reason") or (pending or {}).get("last_error") or str(exc)) if attention else str(exc)
@@ -1215,6 +1221,7 @@ class Engine:
             intent["status"] = "pending"
             if intent["kind"] == "pair":
                 intent["repair_attempts"] = 0
+                intent.pop("repair_basis_expired", None)
             self.store.save_intent(intent)
             with self.lock:
                 self.work(account_id).urgent = True

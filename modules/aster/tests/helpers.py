@@ -49,3 +49,12 @@ class Fixture:
 
     def close(self):
         self.directory.cleanup()
+
+
+def live_snapshot(live, read):
+    """Stamp a fixture account read the way LiveBroker.snapshot does."""
+    def snapshot(symbols, **kwargs):
+        result = read(symbols, **kwargs)
+        result.account_read_generation = live._snapshot_generation
+        return result
+    return snapshot

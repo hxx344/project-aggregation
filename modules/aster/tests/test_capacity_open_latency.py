@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import httpx
 
-from tests.helpers import Fixture
+from tests.helpers import Fixture, live_snapshot
 from trading.capacity_timing import initial_timing, observe_capacity_submit, capacity_timing_text
 from trading.engine import Engine, snapshot_json
 from trading.exchange import API, BudgetWait, LiveBroker, RateBudget
@@ -188,7 +188,7 @@ class AvailabilityPeriodTests(unittest.TestCase):
         self.engine.brokers["test"] = broker
         self.publish()
         self.tick = 100.5
-        with patch.object(broker, "snapshot", side_effect=self.f.broker.snapshot), \
+        with patch.object(broker, "snapshot", side_effect=live_snapshot(broker, self.f.broker.snapshot)), \
              patch("trading.request_timing.time", side_effect=lambda: WALL + self.tick), \
              patch("trading.request_timing.perf_counter", side_effect=lambda: self.tick):
             self.engine.tick_account("test")
@@ -213,6 +213,8 @@ class AvailabilityPeriodTests(unittest.TestCase):
         for changed in ("expired", "dropped", "recovered"):
             with self.subTest(changed=changed):
                 self.engine.work("test").capacity_available.clear()
+                # An unsent batch leaves the ordinary no-fill cooldown behind.
+                self.f.store.put(f"order_cooldown:test:{SYMBOL}", None)
                 self.tick = 100
                 self.publish()
                 self.tick = 100.4
@@ -236,6 +238,11 @@ class AvailabilityPeriodTests(unittest.TestCase):
                 if changed == "recovered":
                     self.assertEqual(timing["detected_at"], WALL + 100.6)
                     self.assertEqual(timing["latency_ms"], 200)
+                elif changed == "expired":
+                    # The same wait also expired the planning snapshot and BBO.
+                    self.assertEqual(timing["status"], "not_sent")
+                    self.assertIsNone(timing["latency_ms"])
+                    self.assertTrue(all(row.get("local_not_sent") for row in intent["receipts"].values()))
                 else:
                     self.assertEqual(timing["status"], "unrecorded")
                     self.assertIsNone(timing["latency_ms"])
