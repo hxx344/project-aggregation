@@ -59,6 +59,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
   // hold: why signing is held (maintenance / recovery); childPaused: the hold the child last confirmed.
   // Every hold message carries a new holdSeq; only the child's echo of the latest one counts.
   let hold = null, holdSeq = 0, childPaused = false, keyHanded = false, heldByRecovery = false;
+  // False until the saved wallet file has been read (or replaced/cleared): before that, address null is not "no wallet".
+  let walletKnown = false;
   const events = [];
   let ledgerCache = null;
   let operation = Promise.resolve();
@@ -203,6 +205,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
   }
   return {
     state,
+    walletKnown: () => walletKnown,
     async initialize() {
       if (initialized) return;
       initialized = true;
@@ -213,6 +216,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       try {
         const savedWallet = readBounded(walletPath, 16 * 1024);
         address = typeof savedWallet?.address === 'string' ? savedWallet.address : null;
+        walletKnown = true;
         const saved = readBounded(configPath, 64 * 1024);
         if (saved) {
           config = validateSettings(withPinnedKeys(saved));
@@ -262,7 +266,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       atomicJson(walletPath, { schema: 1, address: wallet, key: encrypt(key) });
       // A fault leaves enabled=true without a child; a new key must not auto-start on the next restart.
       enabled = false; persistWanted();
-      address = wallet; failure = null; lastCycle = null;
+      address = wallet; walletKnown = true; failure = null; lastCycle = null;
       return state();
     }),
     clearKey: (authorize = () => {}) => serial(() => {
@@ -270,7 +274,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       requireStopped();
       enabled = false; persistWanted();
       rmSync(walletPath, { force: true });
-      address = null; failure = null; lastCycle = null; return state();
+      address = null; walletKnown = true; failure = null; lastCycle = null; return state();
     }),
     async close() {
       closed = true; cleared(); clearInterval(maintenanceTimer);

@@ -108,6 +108,10 @@ test('refresh applies a valuation that arrived while throttled on the next unthr
   await assert.rejects(store.editAsset(owner, { id: aero(ledger)!.id, quantity: 1, price: 1 }), /工作台同步维护/);
 
   t.mock.timers.tick(31_000);
+  ledger = await store.refresh(owner, valuation(500, '2026-10-30T02:00:01.000Z'));
+  assert.equal(aero(ledger)?.value, 1996, 'a late request with an older chain check does not roll the value back');
+
+  t.mock.timers.tick(31_000);
   ledger = await store.refresh(owner, valuation(null, null, { error: 'Aero LP 本轮头寸估值读取失败' }));
   assert.equal(aero(ledger)?.value, 1996);
   assert.equal(aero(ledger)?.error, 'Aero LP 本轮头寸估值读取失败');
