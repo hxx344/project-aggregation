@@ -44,6 +44,7 @@ export type PairTransfer = {
 };
 export type PairMarginState = {
   enabled?: boolean;
+  running?: boolean;
   status?: string;
   reason?: string;
   error?: string | null;
@@ -448,6 +449,12 @@ export function pairMarginOnly(pair: Pair): boolean {
   return (
     pair.margin?.enabled === true &&
     pair.ordinary?.enabled === false
+  );
+}
+export function pairMarginRunning(pair: Pair): boolean {
+  return (
+    pair.state?.margin?.running ??
+    (pair.enabled === true && pair.margin?.enabled === true)
   );
 }
 // A margin-only pair hides the ordinary risk field, but a missing stored limit

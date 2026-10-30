@@ -25,6 +25,7 @@ from eth_account.messages import encode_typed_data
 from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, TransferRejected, api_wait_notice, credentials_for
 from .models import TradingError, dec, decimal_value, positive, wire
 from .pair_planning import PairRecoveryConflict
+from .margin_control import margin_running
 
 LOG = logging.getLogger("aster.trading")
 
@@ -511,7 +512,7 @@ class MarginBalancer:
         return result
 
     @staticmethod
-    def status_view(pair, journal, runtime_view=None):
+    def status_view(pair, journal, runtime_view=None, *, control=None):
         """Project the durable journal without letting an older view hide a write."""
         config = validate_margin(pair.get("margin", {}))
         if journal is None:
@@ -540,7 +541,7 @@ class MarginBalancer:
                 return view("blocked", "保证金划转日志时间无效", blocks=True)
         if not config["enabled"]:
             return view("disabled", "自动保证金平衡未启用")
-        if not pair.get("enabled"):
+        if not margin_running(pair, control):
             return view("paused", "配对组已暂停，不发起新划转；已有划转仍继续只读核对，需启动配对组后才重新评估新划转")
         if journal.get("blocked_reason"):
             return view("waiting" if journal.get("retry_without_blocking") else "blocked", journal["blocked_reason"],
@@ -854,12 +855,13 @@ class MarginBalancer:
                 reason = "工作台维护中，暂停新划转"
                 workspace = self.engine.workspace
                 if (not workspace.reads_paused and snapshot_loader is not None and config["enabled"]
-                        and pair.get("enabled") and now >= workspace.display_due.get(pair["id"], 0)):
+                        and margin_running(pair, self.store.get("pair_margin_control:" + pair["id"]))
+                        and now >= workspace.display_due.get(pair["id"], 0)):
                     reason = self._maintenance_read(pair, config, now, snapshot_loader) or reason
                 return self._view(state, config, "paused", reason, blocks=True)
             if not config["enabled"]:
                 return self._view(state, config, "disabled", "自动保证金平衡未启用")
-            if not pair.get("enabled"):
+            if not margin_running(pair, self.store.get("pair_margin_control:" + pair["id"])):
                 return self._view(state, config, "paused", "配对组已暂停，不发起新划转；已有划转仍继续只读核对，需启动配对组后才重新评估新划转")
             if any(not self.engine.live_allowed(member) for member in members.values()):
                 return self._view(state, config, "blocked", "实盘全局开关未开启，禁止划转", blocks=True)

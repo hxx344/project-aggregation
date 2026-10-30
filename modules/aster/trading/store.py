@@ -527,6 +527,7 @@ class Store:
                 db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(runtime), "pair_runtime:" + pair_id))
             db.execute("DELETE FROM pair_members WHERE pair_id=?", (pair_id,))
             db.execute("DELETE FROM pairs WHERE id=?", (pair_id,))
+            db.execute("DELETE FROM kv WHERE key=?", ("pair_margin_control:" + pair_id,))
             db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                        ("pair_deleted:" + pair_id, dumps({"deleted_at": deleted_at})))
 

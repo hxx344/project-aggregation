@@ -13,6 +13,7 @@ from .pair_legacy import without_cycle, has_legacy_cycle, require_no_legacy_cycl
 from .adl_config import validate_adl
 from .exchange import LiveBroker
 from .margin_balance import DEFAULT_MARGIN, validate_margin
+from .margin_control import adl_margin_start_allowed, margin_running, read_control, save_control
 from .models import AccountModeError, TradingError, dec, decimal_text, positive, wire
 
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, get_symbol_config, validate_symbol
@@ -252,6 +253,7 @@ class PairManager:
         pair = validate_pair({**data, "enabled": False})
         with self.locked(pair), self.engine.registration_lock:
             if (self.store.get("pair_runtime:" + pair["id"]) or self.store.get("pair_margin:" + pair["id"])
+                    or self.store.get("pair_margin_control:" + pair["id"]) is not None
                     or self.store.get("pair_deleted:" + pair["id"])):
                 raise TradingError("配对组标识存在历史记录，请使用新标识")
             if margin_only(pair):
@@ -489,18 +491,84 @@ class PairManager:
                         expected_margin=margin, accounts=accounts, check_current=check_current, message=message)
                 self.engine.adl.after_enable(saved)
             else:
+                # Revoke funds intent even if ADL already paused the strategy.
+                # Keep its frozen revision and emergency processing unchanged.
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    save_control(db, pair, enabled=False)
                 if not pair["enabled"]:
                     try:
                         self.engine.adl.require_clear(pair_id)
                     except TradingError:
                         # ADL already paused this pair. A repeated user pause
                         # must not change the incident's frozen config revision.
+                        self._changed(pair)
                         return pair
                 pair["enabled"] = False
                 saved = self.store.save_pair(pair)
                 self.store.event(pair_id, "pair", "配对组已暂停，停止新开仓和新划转；已提交普通订单及划转继续核对，底仓保留")
             self._changed(saved)
             return saved
+
+    @protected_pair_id
+    def enable_adl_margin(self, pair_id):
+        """Explicitly resume funds for an old/user-paused ADL hold, not trading."""
+        from .account_writer import funds_budget
+        from .margin_balance import MarginBalancer
+        from .pair_execution import PairTrader
+        pair = self.store.pair(pair_id)
+        if pair is None:
+            raise TradingError("配对组不存在")
+        with self.locked(pair), self.store.connection_scope():
+            pair = self.store.pair(pair_id)
+            if pair is None:
+                raise TradingError("配对组不存在")
+            incident = self.store.get("adl_pair:" + pair_id)
+            control = self.store.get("pair_margin_control:" + pair_id)
+            if not adl_margin_start_allowed(pair, incident):
+                raise TradingError("仅 ADL 暂停期间可单独启动已配置的保证金平衡")
+            if margin_running(pair, control):
+                return pair
+            trader = PairTrader(self.engine)
+            accounts, brokers, identities = trader._members(pair)
+
+            def check_current():
+                if self.engine.workspace.active or self.engine.shutdown.is_set():
+                    raise TradingError("工作台维护或停止中，不能启动保证金平衡")
+                for side, account in accounts.items():
+                    broker = brokers[side]
+                    if (not self.engine.live_allowed(account)
+                            or self.engine.brokers.get(account["id"]) is not broker):
+                        raise TradingError("保证金启动期间账户连接或实盘授权已变化")
+                    if isinstance(broker, LiveBroker) and any(
+                            broker.api.credentials[field].lower() != identities[side][field]
+                            for field in ("user", "signer")):
+                        raise TradingError("保证金启动期间账户身份已变化")
+                trader._margin_credentials(accounts, brokers)
+
+            check_current()
+            with funds_budget(self.engine, pair):
+                MarginBalancer(self.engine).verify_members(pair)
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
+                current_incident = db.execute("SELECT data FROM kv WHERE key=?", ("adl_pair:" + pair_id,)).fetchone()
+                if (not row or without_cycle(json.loads(row[0])) != pair
+                        or not current_incident or json.loads(current_incident[0]) != incident
+                        or read_control(db, pair_id) != control):
+                    raise TradingError("保证金启动期间配对、ADL 或暂停状态已变化，请重新操作")
+                for side, account in accounts.items():
+                    row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
+                    binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
+                    if (not row or self.store.account_defaults(json.loads(row[0])) != account
+                            or not binding or tuple(binding) != (pair_id, "LONG" if side == "long" else "SHORT")):
+                        raise TradingError("保证金启动期间子账户配置或归属已变化")
+                check_current()
+                save_control(db, pair)
+                db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                    (pair_id, "pair", "ADL 暂停期间已单独启动保证金平衡；交易策略和原事件保持不变", time.time()))
+            self._changed(pair)
+            return pair
 
     def _enable_margin(self, pair):
         """Start funds management without adopting or clearing strategy state."""
@@ -682,12 +750,14 @@ class PairManager:
         reader = reader or self.store
         rows = []
         for pair in reader.pairs():
+            control = reader.get("pair_margin_control:" + pair["id"])
             runtime = reader.get("pair_runtime:" + pair["id"]) or {}
             state = {"phase": "waiting" if pair["enabled"] else "paused",
                      "reason": pair.get("pause_reason") or ("等待系统首次检查两侧账户与策略条件" if pair["enabled"] else "配对组已暂停；核对设置后需点击启动"),
                      "updated_at": None, "snapshots": {}, "pending": None, **runtime}
             state["margin"] = MarginBalancer.status_view(pair,
-                reader.get("pair_margin:" + pair["id"], {}), state.get("margin"))
+                reader.get("pair_margin:" + pair["id"], {}), state.get("margin"), control=control)
+            state["margin"]["running"] = margin_running(pair, control)
             for field in ("progress", "cycle_costs", "execution_quality", "execution_quality_history"):
                 state.pop(field, None)
             if has_legacy_cycle(runtime, reader):
@@ -756,7 +826,8 @@ class PairManager:
     def _funds_poll_delay(self, pair, delay):
         """An ADL/strategy wait cannot move the independent funds deadline."""
         margin = self.store.get("pair_margin:" + pair["id"]) or {}
-        if isinstance(margin, dict) and (margin.get("pending") or pair["enabled"] and pair["margin"]["enabled"]):
+        if isinstance(margin, dict) and (margin.get("pending") or margin_running(
+                pair, self.store.get("pair_margin_control:" + pair["id"]))):
             deadlines = [margin.get("next_check_at", 0)]
             if not margin.get("pending"):
                 deadlines.append(margin.get("cooldown_until", 0))

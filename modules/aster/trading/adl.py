@@ -19,6 +19,7 @@ from .account_writer import protected_pair
 
 from . import adl_events, adl_exchange, adl_notifications
 from .adl_config import validate_adl
+from .margin_control import pause_for_adl
 from .exchange import ExchangeError, AmbiguousOrder, RequestNotSent, ORDER_REJECTION_CODES
 from .execution import Executor, TERMINAL
 from .models import TradingError, dec, floor_step, positive, wire
@@ -315,15 +316,18 @@ class AdlController:
         except TradingError:
             current = self.store.pair(pair["id"])
             if current and current["enabled"]:
-                self.store.save_pair({**current, "enabled": False, "pause_reason": "启动期间收到新的 ADL，继续保持暂停"})
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    pause_for_adl(self.store, db, current, "启动期间收到新的 ADL，继续保持暂停")
             raise
         blocked = False
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             state = _get(db, "adl_pair:" + pair["id"])
             if _unhandled(db, pair["id"]):
-                current = json.loads(db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()[0])
-                self.store._save_pair(db, {**current, "enabled": False, "pause_reason": "启动期间收到新的 ADL，继续保持暂停"})
+                from .pair_legacy import without_cycle
+                current = without_cycle(json.loads(db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()[0]))
+                pause_for_adl(self.store, db, current, "启动期间收到新的 ADL，继续保持暂停")
                 blocked = True
             elif state and state["status"] == "completed":
                 state["hold"] = False
@@ -360,7 +364,7 @@ class AdlController:
             db.execute("BEGIN IMMEDIATE")
             runtime = _get(db, "pair_runtime:" + pair["id"], {})
             incident["frozen_runtime"] = deepcopy(runtime)
-            saved = self.store._save_pair(db, {**pair, "enabled": False, "pause_reason": "ADL 已确认，核实持仓后保持暂停"})
+            saved = pause_for_adl(self.store, db, pair, "ADL 已确认，核实持仓后保持暂停")
             incident["revision"] = saved["revision"]
             self._include(incident, records)
             _put(db, "adl_pair:" + pair["id"], incident)
