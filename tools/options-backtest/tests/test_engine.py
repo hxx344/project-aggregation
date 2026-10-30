@@ -1,5 +1,9 @@
 """Engine, spec and report tests on a synthetic Black-76 market (standard library only)."""
+import contextlib
+import io
+import json
 import math
+import shutil
 import sys
 import tempfile
 import unittest
@@ -467,6 +471,117 @@ class ParquetMarketTest(unittest.TestCase):
                 self.assertIsNone(market.quote(hour + 1, expiry // 3600, 42000.0, True))  # no mark price
                 self.assertEqual(market.span(), (hour, hour + 1))
             self.assertTrue((Path(folder) / ".optbt-cache").is_dir())
+
+    def test_appending_later_quotes_keeps_earlier_prices_and_pnl(self):
+        from optbt.market import ParquetMarket
+        call = (FRIDAY_21 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.01, 0.009, 0.011)
+        expiring = (SUNDAY_08 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.0001, math.nan, 0.0002)  # delivery estimate
+        later = int(datetime(2024, 1, 20, tzinfo=timezone.utc).timestamp())
+        deep_puts = [(later + i * 3600, later + 6 * 86400 + 8 * 3600, 440000.0, False, 40000.0, 10.0, 9.9, 10.1) for i in range(4)]
+        spec = specs.validate({"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]},
+                               "expiry": {"weekday": "sun"}, "fill": "mark", "legs": [{"side": "sell", "type": "call", "delta": 0.3}]})
+        results = []
+        with tempfile.TemporaryDirectory() as folder:
+            for rows in ([call, expiring], [call, expiring] + deep_puts):  # rewrite the month with quotes after the backtest end
+                write_quotes(Path(folder) / "2024-01.parquet", rows)
+                market = ParquetMarket(folder)
+                quote = market.quote(FRIDAY_21, SUNDAY_08, 41000.0, True)
+                trades = engine.run(spec, market)[0]
+                results.append(((quote.mark, quote.bid, quote.ask), [(t["credit"], t["fees"], t["pnl"]) for t in trades]))
+        self.assertEqual(results[0], results[1])
+        (mark, bid, ask), trades = results[0]
+        self.assertAlmostEqual(mark, 400.0, places=2)
+        self.assertAlmostEqual(bid, 360.0, places=2)
+        self.assertAlmostEqual(ask, 440.0, places=2)
+        self.assertEqual(trades, [(400.0, 12.0, 388.0)])  # BTC premium in USD at the forward, OTM at delivery
+
+    def test_declared_units_are_shared_by_mark_bid_ask_and_never_guessed(self):
+        from optbt import parquet
+        from optbt.market import ParquetMarket
+        expiry = SUNDAY_08 * 3600
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "2024-01.parquet"
+            # Cheap USD prices (< 5) stay USD when the file declares them.
+            write_quotes(path, [(FRIDAY_21 * 3600 - 60, expiry, 60000.0, True, 40000.0, 3.0, 2.0, 4.0)], units={"price": "usd", "iv": "fraction"})
+            quote = ParquetMarket(folder).quote(FRIDAY_21, SUNDAY_08, 60000.0, True)
+            self.assertEqual((quote.mark, quote.bid, quote.ask), (3.0, 2.0, 4.0))
+            with self.assertRaisesRegex(parquet.UnitError, "configured but the file declares"):
+                ParquetMarket(folder, price_unit="btc").chain(FRIDAY_21)
+            # BTC columns with different distributions: asks only on a deep ITM put, still converted like the marks.
+            rows = [(FRIDAY_21 * 3600 - 60, expiry, strike, True, 40000.0, 0.02, math.nan, math.nan) for strike in (40000.0, 40500.0, 41000.0)]
+            rows.append((FRIDAY_21 * 3600 - 60, expiry, 440000.0, False, 40000.0, 10.0, 9.9, 10.1))
+            write_quotes(path, rows)
+            put = ParquetMarket(folder).quote(FRIDAY_21, SUNDAY_08, 440000.0, False)
+            self.assertAlmostEqual(put.mark, 400000.0, delta=1)
+            self.assertAlmostEqual(put.bid, 396000.0, delta=1)
+            self.assertAlmostEqual(put.ask, 404000.0, delta=1)
+            # A declared unit the quotes contradict is refused, not reinterpreted.
+            with self.assertRaisesRegex(parquet.UnitError, "mark prices are impossible read as usd"):
+                ParquetMarket(folder, price_unit="usd").chain(FRIDAY_21)
+            write_quotes(path, rows, iv=50.0)
+            with self.assertRaisesRegex(parquet.UnitError, "outside 0.5%-1000% read as fraction"):
+                ParquetMarket(folder).chain(FRIDAY_21)
+            self.assertAlmostEqual(ParquetMarket(folder, iv_unit="percent").quote(FRIDAY_21, SUNDAY_08, 40000.0, True).iv, 0.5, places=6)
+        # Epoch numbers are scaled one value at a time, not by the column's median.
+        seconds = int(datetime(2024, 1, 5, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(parquet.epoch_seconds(pa_array([seconds, seconds * 1000, seconds * 1000])).tolist(), [seconds] * 3)
+
+    def test_slim_declares_units_and_raw_files_need_them(self):
+        import pyarrow.parquet as pq
+        from optbt import parquet
+        from optbt.market import ParquetMarket
+        with tempfile.TemporaryDirectory() as folder:
+            raw, slim = Path(folder) / "raw", Path(folder) / "slim"
+            raw.mkdir()
+            write_quotes(raw / "2024-01.parquet", [(FRIDAY_21 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.01, 0.009, 0.011)], iv=50.0)
+            for flags, message in [([], "unit error: .*iv unit is not declared"), (["--iv-unit", "percent"], "unit error: .*price unit is not declared"),
+                                   (["--iv-unit", "fraction", "--price-unit", "btc"], "unit error: .*read as fraction")]:
+                with self.assertRaisesRegex(SystemExit, message):
+                    parquet.main(["slim", str(raw), "-o", str(slim), *flags])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(parquet.main(["slim", str(raw), "-o", str(slim), "--iv-unit", "percent", "--price-unit", "btc"]), 0)
+            self.assertEqual(json.loads(pq.read_schema(slim / "2024-01.parquet").metadata[b"optbt.units"]), {"price": "btc", "iv": "fraction"})
+            quote = ParquetMarket(slim).quote(FRIDAY_21, SUNDAY_08, 41000.0, True)
+            self.assertAlmostEqual(quote.mark, 400.0, places=2)
+            self.assertAlmostEqual(quote.iv, 0.5, places=6)
+            with self.assertRaisesRegex(parquet.UnitError, "configured but the file declares"):
+                ParquetMarket(slim, iv_unit="percent").chain(FRIDAY_21)
+
+    def test_cache_from_older_conversion_semantics_is_rebuilt(self):
+        import numpy as np
+        from optbt import market as markets
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "2024-01.parquet"
+            write_quotes(path, [(FRIDAY_21 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.01, 0.009, 0.011)])
+            markets.ParquetMarket(folder).chain(FRIDAY_21)
+            cache = Path(folder) / ".optbt-cache" / f"v{markets.CACHE_VERSION}" / "2024-01"
+            self.assertIn(f"schema={markets.DATA_SCHEMA}", (cache / "source.txt").read_text())
+            np.save(cache / "mark.npy", np.full(1, 0.01, "float32"))  # what the old month-median guess could have cached
+            stat = path.stat()
+            (cache / "source.txt").write_text(f"{stat.st_size}:{stat.st_mtime_ns}:{markets.CODE}")  # stamp written before DATA_SCHEMA
+            self.assertAlmostEqual(markets.ParquetMarket(folder).quote(FRIDAY_21, SUNDAY_08, 41000.0, True).mark, 400.0, places=2)
+
+
+def pa_array(values):
+    import pyarrow as pa
+    return pa.array(values, pa.int64())
+
+
+def write_quotes(path, rows, units=None, iv=0.5):
+    """A slim-format month file; rows are (snapshot s, expiry s, strike, is_call, forward, mark, bid, ask)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    times, expiries, strikes, calls, forwards, marks, bids, asks = zip(*rows)
+    table = pa.table({
+        "timestamp": pa.array([int(t * 1000) for t in times], pa.timestamp("ms", "UTC")),
+        "expiration": pa.array([int(e * 1000) for e in expiries], pa.timestamp("ms", "UTC")),
+        "strike_price": pa.array(strikes, pa.float32()), "type": ["call" if c else "put" for c in calls],
+        "mark_iv": [float(iv)] * len(rows), "underlying_price": list(forwards),
+        "mark_price": list(marks), "bid_price": list(bids), "ask_price": list(asks)})
+    if units:
+        table = table.replace_schema_metadata({b"optbt.units": json.dumps(units).encode()})
+    pq.write_table(table, path)
+    shutil.rmtree(Path(path).parent / ".optbt-cache", ignore_errors=True)  # a same-size rewrite may keep a coarse mtime
 
 
 if __name__ == "__main__":

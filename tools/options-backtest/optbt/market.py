@@ -16,8 +16,14 @@ from .engine import Quote
 DEFAULT_DATA = os.environ.get("OPTBT_DATA", "~/data/options_hourly/BTC")
 # Parsed months are kept as .npy files next to the data and memory-mapped. A month's cache is
 # rebuilt when its parquet file's size or mtime changes, when market.py or parquet.py changes
-# (CODE), or when CACHE_VERSION is bumped (bump it when the cache layout changes).
+# (CODE), when the units it was read with change, when DATA_SCHEMA is bumped (bump it when the
+# conversion from stored to cached values changes) or when CACHE_VERSION is bumped (bump it when
+# the cache layout changes).
 CACHE_VERSION = 1
+DATA_SCHEMA = 2  # 1: units guessed from each month's median; 2: declared units, see parquet.unit
+# Files without optbt.units metadata are the `bt slim` output this tool has always read: Deribit
+# option prices in BTC (mark, bid and ask alike) and IVs as fractions.
+SLIM_UNITS = {"price": "btc", "iv": "fraction"}
 CODE = hashlib.sha256(b"".join(Path(__file__).with_name(name).read_bytes() for name in ("market.py", "parquet.py"))).hexdigest()[:16]
 FLOAT32 = ("iv", "mark", "bid", "ask", "strike")
 STRIKE_BITS, OFFSET_BITS = 21, 14  # strike < 2.1M USD, expiry < 682 days after the quote hour
@@ -35,8 +41,10 @@ def encode(hour, expiry, strike, is_call):
 
 
 class ParquetMarket:
-    def __init__(self, directory=DEFAULT_DATA, cache_months=64):
+    def __init__(self, directory=DEFAULT_DATA, cache_months=64, price_unit=None, iv_unit=None):
+        """`price_unit` / `iv_unit` configure the units; a file declaring different ones is refused."""
         self.directory = Path(directory).expanduser()
+        self.units = {"price": price_unit, "iv": iv_unit}
         self.files = {}
         for path in sorted(self.directory.glob("*.parquet")):
             match = re.fullmatch(r"(\d{4})-(\d{2})", path.stem)
@@ -75,14 +83,15 @@ class ParquetMarket:
 
     def _cached(self, path):
         folder = path.parent / ".optbt-cache" / f"v{CACHE_VERSION}" / path.stem
+        units = {role: parquet.unit(path, role, self.units[role], SLIM_UNITS[role]) for role in SLIM_UNITS}
         stat = path.stat()
-        stamp = f"{stat.st_size}:{stat.st_mtime_ns}:{CODE}"
+        stamp = f"{stat.st_size}:{stat.st_mtime_ns}:{CODE}:schema={DATA_SCHEMA}:price={units['price']}:iv={units['iv']}"
         try:
             if (folder / "source.txt").read_text() == stamp:
                 return {file.stem: np.load(file, mmap_mode="r") for file in folder.glob("*.npy")}
         except (OSError, ValueError):
             pass
-        arrays = self._load(path)
+        arrays = self._load(path, units)
         arrays = {name: values.astype("float32") if name in FLOAT32 else values for name, values in arrays.items()}
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -101,25 +110,29 @@ class ParquetMarket:
         return {name: np.load(folder / f"{name}.npy", mmap_mode="r") for name in arrays}
 
     @staticmethod
-    def _load(path):
+    def _load(path, units):
+        """One month's quotes in USD; every row is converted by the declared units alone, so quotes
+        added to the file later never change the earlier ones."""
         columns = parquet.detect(pq.read_schema(path).names, {})
         parquet.require(columns)
-        _, data = parquet.load(path, columns)
+        _, data = parquet.load(path, columns, units["iv"])
         prices = parquet.load_prices(path, data)
         if "mark_price" not in prices:
             raise ValueError(f"{path.name} has no mark_price column; the backtest needs raw option prices")
+        parquet.check_prices(data, units["price"], path.name)
         data = parquet.latest_per_hour(data)
         hour = data["hour"].astype("int64")
         expiry = np.round(data["expiry"] / 3600).astype("int64")
         strike = np.round(data["strike"]).astype("int64")
-        mark = parquet.usd(data, "mark_price")
+        usd = lambda role: parquet.usd(data, role, units["price"])
+        mark = usd("mark_price")
         keep = (expiry >= hour) & (expiry - hour < 1 << OFFSET_BITS) & (strike > 0) & (strike < 1 << STRIKE_BITS) & (data["forward"] > 0) & np.isfinite(mark)
         arrays = {
             "key": encode(hour, expiry, strike, data["is_call"].astype("int64"))[keep],
             "time": data["time"][keep], "forward": data["forward"][keep], "iv": data["iv"][keep],
             "mark": mark[keep],
-            "bid": parquet.usd(data, "bid_price")[keep] if "bid_price" in data else np.full(int(keep.sum()), np.nan),
-            "ask": parquet.usd(data, "ask_price")[keep] if "ask_price" in data else np.full(int(keep.sum()), np.nan),
+            "bid": usd("bid_price")[keep] if "bid_price" in data else np.full(int(keep.sum()), np.nan),
+            "ask": usd("ask_price")[keep] if "ask_price" in data else np.full(int(keep.sum()), np.nan),
             "strike": data["strike"][keep],
         }
         order = np.lexsort((arrays["time"], arrays["key"]))

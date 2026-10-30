@@ -53,7 +53,9 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 
 **价格**
 
-- 使用原始 `mark_price` / `bid_price` / `ask_price`，标记价缺失的报价丢弃。原始单位是 BTC，按该合约自己的远期价换算成美元。
+- 使用原始 `mark_price` / `bid_price` / `ask_price`，标记价缺失的报价丢弃。三列共用同一价格单位，按该合约自己的远期价逐行换算成美元，不按数据分布猜单位，所以追加任何新数据都不会改变已有报价。
+- 单位来自数据文件的 `optbt.units` 元数据（`slim` 写入，如 `{"price": "btc", "iv": "fraction"}`）；没有元数据的文件按 `bt slim` 的约定读取：价格为 BTC、IV 为小数，当前数据目录即为此格式。`ParquetMarket(price_unit=..., iv_unit=...)` 指定的单位与文件声明不一致时直接报错。
+- 逐行核对标记价是否与声明单位矛盾（看涨不高于远期价、看跌不高于行权价、不低于内在价值超过远期价的 25%），IV 须在 0.5%–1000% 之间；有任何一行矛盾即拒绝读取该月，不改按其他单位解释。
 - 数据来自 Deribit，用来近似实盘所在的 Bybit。
 - 选腿时的 delta 用 `mark_iv` 和合约远期价，按 Black-76 现算。
 
@@ -121,11 +123,13 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 
 - 对应 parquet 的大小或修改时间变化；
 - `market.py` 或 `parquet.py` 的源码变化（按内容哈希判断）；
+- 读取该月使用的价格或 IV 单位变化；
+- `market.py` 的 `DATA_SCHEMA` 升级（从原始值到缓存值的换算语义改变时升级，缓存的 `source.txt` 记录该版本）；
 - `market.py` 的 `CACHE_VERSION` 升级（缓存目录结构改变时升级）。
 
 **增加数据**：
 
-1. 在本机运行 `python optbt/parquet.py slim <原始目录> -o <输出目录>`，需要 `pip install pyarrow numpy`。
+1. 在本机运行 `python optbt/parquet.py slim <原始目录> -o <输出目录> --price-unit btc --iv-unit percent`（按原始数据的实际单位填写），需要 `pip install pyarrow numpy`。原始文件没有 `optbt.units` 元数据时必须给出这两个单位，否则报错；输出文件会写入元数据（价格单位照原样，IV 统一为小数）。
 2. 把输出文件上传到数据目录。
 
 **parquet 工具**（`bt` 会转发给 `optbt/parquet.py`）：
@@ -136,6 +140,8 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 | `slim` | 瘦身 |
 | `convert` | 生成约 16 MB 的波动率曲线库 `btc_smiles.sqlite3` |
 | `verify` | 用原始报价检验曲线库的还原误差 |
+
+四个命令都按文件的 `optbt.units` 元数据读取单位；文件没有元数据时用 `--iv-unit fraction|percent`（以及 `slim` / `verify` 需要的 `--price-unit btc|usd`）指定，现有数据目录用 `--price-unit btc --iv-unit fraction`。
 
 曲线库的线性插值会让 IV 系统性偏高 0.1–0.3 个波动率点，所以回测引擎直接用原始报价，不用曲线库。
 
