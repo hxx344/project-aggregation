@@ -35,7 +35,7 @@ export function buildHubSummary(input: SummaryInput, now = Date.now()) {
   const manualAt = oldest(manual.map(asset => asset.updatedAt));
   const retainedAt = oldest([...retained].map(asset => asset.updatedAt));
   const updatedAt = staticValuation ? oldest(assets.map(asset => asset.updatedAt)) : oldest(dynamic.map(asset => asset.updatedAt));
-  const unknownMode = dynamic.some(asset => !['market', 'bybit', 'aster', 'binance', 'okx', 'gate', 'variational'].includes(asset.mode ?? ''));
+  const unknownMode = dynamic.some(asset => !['market', 'bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'aero'].includes(asset.mode ?? ''));
   const values = assets.map(knownAssetValue);
   const total = values.every(value => value !== null) ? values.reduce<number>((sum, value) => sum + value!, 0) : null;
   const withdrawals = sumKnownValues(assets.filter(asset => asset.project?.trim() === '出金')).total;

@@ -9,6 +9,7 @@ export const control = {
   held: new Set<string>(),
   values: new Map<string, number>(),
   pending: [] as Pending[],
+  usdc: 1,
 };
 
 let database: ReturnType<typeof openDatabase> | undefined;
@@ -24,7 +25,10 @@ export async function unseal(value: string, owner: string) {
 
 const failed = async (): Promise<never> => { throw new Error('not configured in this test'); };
 export const syncBybit = failed, syncBinance = failed, syncOkx = failed, syncGate = failed, syncVariational = failed;
-export async function quotes() { return { VIRTUAL: { price: 1, at: new Date().toISOString(), source: 'test' } }; }
+export async function quotes() {
+  const at = new Date().toISOString();
+  return { VIRTUAL: { price: 1, at, source: 'test' }, USDC: { price: control.usdc, at, source: 'test' } };
+}
 export async function yuanQuote(): Promise<{ rate: number; status: FxStatus }> {
   return { rate: 7.25, status: { source: 'Frankfurter', fetchedAt: new Date().toISOString(), rateDate: null, error: null } };
 }

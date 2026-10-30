@@ -32,6 +32,16 @@ test('server timer syncs enabled asset targets without any browser requests', as
   assert.equal(completed[0].status.state, 'success');
 });
 
+test('each sync carries the hub body read at its own start', async t => {
+  const target = fixture(); let clock = 100000; let total = 1; const bodies = [];
+  const worker = createAssetSync({ listTargets: () => [target], autoStart: false, now: () => clock,
+    syncBody: () => ({ aeroLp: { total } }), syncReader: async (_project, _credentials, { body }) => { bodies.push(body); return {}; },
+  });
+  t.after(() => worker.close());
+  await worker.run('asset'); total = 2; clock += 60000; await worker.run('asset');
+  assert.deepEqual(bodies, [{ aeroLp: { total: 1 } }, { aeroLp: { total: 2 } }]);
+});
+
 test('overlapping refresh and run share one flight and obey the per-project interval', async t => {
   const target = fixture(); let clock = 100000; let calls = 0; let release;
   const worker = createAssetSync({ listTargets: () => [target], autoStart: false, now: () => clock,
@@ -131,13 +141,13 @@ test('summary and sync share one login and only sync invokes POST /api/sync with
   const sync = syncAsset(project, credentials, { request });
   await until(() => !!finishLogin);
   assert.equal(calls.filter(call => call.route === '/api/login').length, 1);
-  finishLogin(); await Promise.all([read, sync]); await syncAsset(project, credentials, { request });
+  finishLogin(); await Promise.all([read, sync]); await syncAsset(project, credentials, { request, body: { aeroLp: null } });
   assert.equal(calls.filter(call => call.route === '/api/login').length, 1);
   assert.ok(calls.every(call => call.base === project.apiUrl && call.options.headers.Origin === project.authOrigin));
   const syncCalls = calls.filter(call => call.route === '/api/sync');
   assert.equal(syncCalls.length, 2);
   assert.ok(syncCalls.every(call => call.options.method === 'POST' && call.options.headers.Cookie === 'asset_session=shared-cookie'));
-  assert.deepEqual(syncCalls.map(call => call.options.body), [{}, {}]);
+  assert.deepEqual(syncCalls.map(call => call.options.body), [{}, { aeroLp: null }]);
   assert.ok(calls.filter(call => call.options.method === 'POST').every(call => ['/api/login', '/api/sync'].includes(call.route)));
 });
 

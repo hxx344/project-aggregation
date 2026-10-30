@@ -1,11 +1,11 @@
 import { requestAuthenticatedJson, UpstreamError } from './adapters.mjs';
 
 // Asset's existing route refreshes saved quotes and read-only exchange balances.
-export async function syncAsset(project, credentials, { deadline = Date.now() + 60000, signal, request } = {}) {
+export async function syncAsset(project, credentials, { deadline = Date.now() + 60000, signal, request, body = {} } = {}) {
   if (project.adapter !== 'asset') throw new UpstreamError('invalid', '仅资产项目支持自动同步');
   if (!project.embedded && !credentials?.password) throw new UpstreamError('unauthorized', '请先保存资产项目的网页登录密码');
   const response = await requestAuthenticatedJson(project, credentials, '/api/sync', {
-    ...(request ? { request } : {}), deadline, signal, method: 'POST', body: {}, retryUnauthorized: true,
+    ...(request ? { request } : {}), deadline, signal, method: 'POST', body, retryUnauthorized: true,
   });
   const data = response.data;
   if (!data || !Array.isArray(data.assets) || data.assets.length > 1000 || !Array.isArray(data.history)) throw new UpstreamError('invalid', '资产同步响应格式不正确');
@@ -21,7 +21,7 @@ const baseStatus = (state, message, nextAttemptAt = null) => ({
 
 export function createAssetSync({
   listTargets, onComplete = () => {}, intervalMs = 60000, timeoutMs = 60000,
-  now = Date.now, syncReader = syncAsset, autoStart = true,
+  now = Date.now, syncReader = syncAsset, autoStart = true, syncBody = () => ({}),
 }) {
   if (typeof listTargets !== 'function') throw new TypeError('listTargets is required');
   const period = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : 60000;
@@ -91,7 +91,8 @@ export function createAssetSync({
         result = await Promise.race([
           Promise.resolve().then(() => {
             if (controller.signal.aborted || closed) throw new UpstreamError('timeout', '资产同步已停止');
-            return syncReader(project, credentials, { deadline: started + timeLimit, signal: controller.signal });
+            // Hub-side sources (Aero LP) ride along so Asset can value them in the same ledger write.
+            return syncReader(project, credentials, { deadline: started + timeLimit, signal: controller.signal, body: syncBody() });
           }),
           canceled,
         ]);

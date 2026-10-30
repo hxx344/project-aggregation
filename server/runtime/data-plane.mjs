@@ -21,6 +21,7 @@ import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
 import { createAeroLp } from '../automation/aero-lp.mjs';
+import { aeroLpValuation } from '../automation/aero-lp-valuation.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
 
@@ -359,7 +360,9 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   assetSync = createAssetSync({
     listTargets: () => projects.all().filter(row => !embeddedModules || moduleIds.includes(row.id)).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
     intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
-    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader,
+    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader, // Until the LP manager has read its wallet file (not yet initialized, or the file is unreadable), state() reads as
+    // "no wallet"; omit the field so Asset keeps the row instead of removing it.
+    syncBody: () => aeroLp.walletKnown() ? { aeroLp: aeroLpValuation(aeroLp.state()) } : {},
     onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
   });
   async function refresh(dueOnly = false) { await Promise.allSettled(getProjects().filter(project => {

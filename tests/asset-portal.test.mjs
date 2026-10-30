@@ -182,7 +182,8 @@ test('automatic Asset page sessions and the independent background session share
   }
   assert.equal(f.syncCalls().length, 1);
   assert.equal(f.syncCalls()[0].cookie, 'asset_session=login-3');
-  assert.equal(f.syncCalls()[0].body, '{}');
+  // No Aero LP wallet is configured in this hub, so the background sync reports it as absent.
+  assert.equal(f.syncCalls()[0].body, '{"aeroLp":null}');
   assert.equal(f.syncCalls()[0].origin, f.upstreamOrigin);
   assert.equal(f.calls.filter(call => call.path === '/api/login').length, 3);
   assert.deepEqual(f.ledgerCalls().map(call => call.cookie).sort(), [
