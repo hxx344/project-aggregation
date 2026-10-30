@@ -1361,7 +1361,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `pipeline-deferred-stale-success-20261030`；审查阶段发现，未合入，未发生线上事故。
 
-**系统配置副作用补充（2026-10-31）：** PR #114 的 `d127de8` 修掉成功记录残留，但生产 `--apply` 在 activate 之前已经把配置写入 `/etc/project-aggregation.env`。目标不匹配返回 75 后只标 deferred，没有调用已有 config 补偿；旧程序和部署记录保留，新配置却留在系统中。真实 CLI 的 Windows 离线夹具复现 `PORT=3100→3200` 后 activate deferred，配置仍为 3200。目标不可用时也须处理之前阶段已执行的配置副作用，或延后应用配置；验证覆盖 config+activate 联动，不能仅给 activate 配测试。事件 `pipeline-deferred-applied-config-20261031`，引入于 2026-10-30，离线复现于 2026-10-31，线上发生日期未知；见[审查报告 F03](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。当前未修复，属于合入后的 P1 逃逸缺陷。
+**系统配置副作用补充（2026-10-31）：** PR #114 的 `d127de8` 修掉成功记录残留，但生产 `--apply` 在 activate 之前已经把配置写入 `/etc/project-aggregation.env`。目标不匹配返回 75 后只标 deferred，没有调用已有 config 补偿；旧程序和部署记录保留，新配置却留在系统中。真实 CLI 的 Windows 离线夹具复现 `PORT=3100→3200` 后 activate deferred，配置仍为 3200。目标不可用时也须处理之前阶段已执行的配置副作用，或延后应用配置；验证覆盖 config+activate 联动，不能仅给 activate 配测试。事件 `pipeline-deferred-applied-config-20261031`，引入于 2026-10-30，离线复现于 2026-10-31，线上发生日期未知；见[审查报告 F03](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。随后 `1e5b91d` 在目标不可用时恢复本轮配置，补偿失败和记录失败明确非零退出且不重复补偿；activate 16 项和 recovery 35 项本地通过，1 项 POSIX 等本次 CI。原发现属于合入后的 P1 逃逸缺陷，修复属于同一事件。
 
 ### L086：缓存核验要用与安装器相同的就绪标准，存活不等于就绪
 
@@ -1387,7 +1387,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** 在目录创建与元数据写入之间暂停第一个真实进程，启动第二个；必须最多一个进入受保护操作。再覆盖一个实例退出时另一实例的有效锁不能被删除。仅串行调用 acquire/release 不足。
 
-**证据：** project-aggregation `53d9d423` / PR #99 的 [acquireLock](tools/aero-lp/cli.mjs)；`4e19cfd` 上两个未修改 CLI 入口（managed 与独立 run）、零余额外部读取夹具和调度屏障复现同时进入 cycle，一方退出后仍运行者的锁消失。见[审查报告 F02](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。当前未修复；未发送链上交易，不声称实际资金损失。
+**证据：** project-aggregation `53d9d423` / PR #99 的 [acquireLock](tools/aero-lp/cli.mjs)；`4e19cfd` 上两个未修改 CLI 入口（managed 与独立 run）、零余额外部读取夹具和调度屏障复现同时进入 cycle，一方退出后仍运行者的锁消失。见[审查报告 F02](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。随后 `b947934` 以共享 guard 串行化创建/回收/释放，并核对唯一 token；真实 CLI 竞争、坏 owner/guard、旧释放和正常停止回归通过。未发送链上交易，不声称实际资金损失。
 
 **事件记录：** `aero-lock-owner-publication-20261031`；引入日期 2026-10-30，离线复现日期 2026-10-31（Asia/Shanghai），线上发生日期未知；P1 逃逸缺陷。
 
@@ -1401,7 +1401,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** 两个同下沿区间外头寸同时进入，核对合计等于共同分母的结果且不超过全池排放；另测一个区间内一个区间外、不同下沿和缺失估值。
 
-**证据：** project-aggregation `8a0fcb6` / PR #104；[emissionPerDay](tools/aero-lp/core.mjs)、[rewardView](tools/aero-lp/cli.mjs)、[dailyFact](src/AeroLpPage.tsx)。`4e19cfd` 离线计算中当前流动性100、两仓各200，全池86400 AERO/天，页面合计115200，共同情景应为69120。见[审查报告 F04](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。当前未修复，仅展示影响。
+**证据：** project-aggregation `8a0fcb6` / PR #104；[emissionPerDay](tools/aero-lp/core.mjs)、[rewardView](tools/aero-lp/cli.mjs)、[dailyFact](src/AeroLpPage.tsx)。`4e19cfd` 离线计算中当前流动性100、两仓各200，全池86400 AERO/天，页面合计115200，共同情景应为69120。见[审查报告 F04](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。随后 `b947934` 提供共同情景合计并采用 BigInt 精确求和/比较，`199631a` 同步飞书摘要；相同下沿、大额原始单位和不可聚合情景回归及页面验收通过。仅展示影响，沿用同一事件。
 
 **事件记录：** `aero-incompatible-reward-sum-20261031`；引入日期 2026-10-30，离线复现日期 2026-10-31（Asia/Shanghai），线上发生日期未知；P1 逃逸缺陷。
 
@@ -1415,7 +1415,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** 保持保存前的 GET，完成 PUT 并等待新 UI 渲染，再返回旧 GET；已保存值、启停状态与草稿标记应保持正确。另测保存失败、保存中继续编辑和后续真实刷新。
 
-**证据：** project-aggregation PR #119 的 [FeishuDigestPage](src/FeishuDigestPage.tsx)。`4e19cfd` 生产构建的真实浏览器夹具复现服务端 NEW、页面 NEW→OLD、保存按钮禁用；[AeroLpPage](src/AeroLpPage.tsx) 写操作前递增 generation 是同类负对照。见[审查报告 F05](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。当前未修复，未向真实飞书发送。
+**证据：** project-aggregation PR #119 的 [FeishuDigestPage](src/FeishuDigestPage.tsx)。`4e19cfd` 生产构建的真实浏览器夹具复现服务端 NEW、页面 NEW→OLD、保存按钮禁用；[AeroLpPage](src/AeroLpPage.tsx) 写操作前递增 generation 是同类负对照。见[审查报告 F05](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。随后 `199631a` 将写操作纳入读取代次，并显式保留保存期间新编辑（含改回旧值）；生产页面 6 场景通过，未向真实飞书发送。
 
 **事件记录：** `feishu-save-stale-read-20261031`；引入日期 2026-10-30，离线复现日期 2026-10-31（Asia/Shanghai），线上发生日期未知；P1 逃逸缺陷。
 
@@ -1429,7 +1429,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** 先保存旧标记，再令新标记和发送结果记录写失败，恢复旧磁盘状态并在补发窗口重启；确认失败时没有对外请求，或按明确语义避免重复。补正常重启和结果未知不重试的负对照。
 
-**证据：** project-aggregation PR #119 的 [persistState/tick](server/automation/feishu-digest.mjs)。`4e19cfd` 真实 manager 的本地 fetch 替身、临时文件原子替换失败探针复现发送1次→重启后2次，见[审查报告 F06](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。当前未修复，P2；没有真实通知或资金动作。
+**证据：** project-aggregation PR #119 的 [persistState/tick](server/automation/feishu-digest.mjs)。`4e19cfd` 真实 manager 的本地 fetch 替身、临时文件原子替换失败探针复现发送1次→重启后2次，见[审查报告 F06](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。随后 `199631a` 严格保存发送前时间点，失败保留重试资格；计划配置的第二次写失败恢复旧水位，恢复也失败时明确提示。真实文件故障与重启回归通过；没有真实通知或资金动作，沿用同一 P2 事件。
 
 **事件记录：** `feishu-failed-durable-claim-20261031`；引入日期 2026-10-30，离线复现日期 2026-10-31（Asia/Shanghai），线上发生日期未知。
 
@@ -1443,7 +1443,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **如何验证：** 在历史查询等待中改变仓位、挂单或活动策略，最终确认必须拒绝并保留 unknown；正常无变化仍可完成。核对共享写入记录与本地订单同时保持未决，而不只断言页面文案。
 
-**证据：** project-aggregation PR #116 的 `127c06f`、`6cc5c09`，[confirmNotCreated](server/trading-execution.mjs)。`4e19cfd` 真实服务、SQLite、共享 writer 夹具中，查询期间 SHORT 从0变1，仍输出 settled=true、unknown=false、canResume=true；见[审查报告 F01](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。当前未修复。后续预览/确认仍存在，不声称已证明重复实盘下单。
+**证据：** project-aggregation PR #116 的 `127c06f`、`6cc5c09`，[confirmNotCreated](server/trading-execution.mjs)。`4e19cfd` 真实服务、SQLite、共享 writer 夹具中，查询期间 SHORT 从0变1，仍输出 settled=true、unknown=false、canResume=true；见[审查报告 F01](docs/reviews/4e19cfd237fb0d047686f2297a0c5e1007b70950.md)。随后 `d201d78` 将最终账户读取移到历史查询后，复核 revision/unknown 并保留原租约与 writer 保护；44 项相关检查通过。后续预览/确认仍存在，不声称已证明重复实盘下单。
 
 **事件记录：** `bybit-history-stale-account-proof-20261031`；引入日期 2026-10-30，离线复现日期 2026-10-31（Asia/Shanghai），线上发生日期未知；P1 逃逸缺陷。
 
