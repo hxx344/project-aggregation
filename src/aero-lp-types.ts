@@ -4,14 +4,16 @@ export type AeroLpConfig = {
   upperPrice: number; gapBps: number; intervalSec: number; twapSec: number; maxTwapDeviationBps: number; slippageBps: number;
   keepInWallet: string; minDeploy: string; minEthForGas: string;
 };
-// state is the pool's own in-range test on ticks (lower inclusive, upper exclusive); amount/value/apr/aeroPerDay are
+// state is the pool's own in-range test on ticks (lower inclusive, upper exclusive); amount/value/apr/aeroPerDay/feeApr are
 // display estimates from the child, absent when reward reads failed that cycle.
 export type AeroLpPosition = {
   id: string; range: [number, number]; staked: boolean; liquidity: string; state?: 'below' | 'in' | 'above';
   amount0?: number | null; amount1?: number | null; value?: number | null; apr?: number | null; aprEstimated?: boolean;
   aeroPerDay?: number | null; aeroPerDayEstimated?: boolean;
+  // Fee APR the position would earn unstaked: staked liquidity's share of swap fees goes to voters.
+  feeApr?: number | null; feeAprEstimated?: boolean;
 };
-export type AeroLpRewards = { price: number | null; poolPerDay: number | null; pending: string; deferred: string };
+export type AeroLpRewards = { price: number | null; poolPerDay: number | null; feeWindowSec?: number | null; pending: string; deferred: string };
 export type AeroLpLedger = { txs: number; failed: number; gasEth: string; reward: string; since: string | null };
 export type AeroLpCycle = {
   at: string; event: 'cycle'; block: number; symbols?: [string, string]; price: number; twapPrice: number | null; twapError?: string;

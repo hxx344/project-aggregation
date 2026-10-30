@@ -28,6 +28,9 @@ const POOL_ABI = [
   'function rewardGrowthGlobalX128() view returns (uint256)',
   'function lastUpdated() view returns (uint32)',
   'function stakedLiquidity() view returns (uint128)',
+  'function liquidity() view returns (uint128)',
+  'function feeGrowthGlobal0X128() view returns (uint256)',
+  'function feeGrowthGlobal1X128() view returns (uint256)',
 ];
 const FACTORY_ABI = ['function getPool(address, address, int24) view returns (address)'];
 const GAUGE_ABI = [
@@ -307,15 +310,17 @@ export async function readRewards(ctx, wallet, stakedIds, budgetMs = REWARDS_BUD
 async function rewardReads(ctx, wallet, stakedIds) {
   const quoteOf = (from) => ctx.router.getAmountsOut(10n ** 18n, [{ from, to: ctx.token1, stable: false, factory: ctx.routerFactory }]).then((amounts) => Number(formatUnits(amounts[1], ctx.decimals1)), () => null);
   const quote = ctx.routerFactory ? Promise.all([quoteOf(AERO), quoteOf(LEGACY_AERO)]).then(([current, legacy]) => legacy || current || null) : null;
-  const [growth, updatedAt, stakedLiquidity, pending, deferred, aero, xaero, price] = await Promise.all([
+  const [growth, updatedAt, stakedLiquidity, liquidity, feeGrowth0, feeGrowth1, pending, deferred, aero, xaero, price] = await Promise.all([
     ctx.pool.rewardGrowthGlobalX128(), ctx.pool.lastUpdated(), ctx.pool.stakedLiquidity(),
+    // 手续费读数只用于手续费年化，单独失败时记为 null，不连带丢掉本轮奖励数据。
+    ...[ctx.pool.liquidity(), ctx.pool.feeGrowthGlobal0X128(), ctx.pool.feeGrowthGlobal1X128()].map((call) => call.then((v) => v, () => null)),
     stakedIds.length ? ctx.gauge.earned(wallet, stakedIds) : 0n,
     ctx.gauge.deferredEmissions(wallet),
     ctx.aero.balanceOf(wallet),
     ctx.xaero ? ctx.xaero.balanceOf(wallet) : null,
     quote,
   ]);
-  return { growth, updatedAt: Number(updatedAt), stakedLiquidity, pending, deferred, aero, xaero, price };
+  return { growth, updatedAt: Number(updatedAt), stakedLiquidity, liquidity, feeGrowth0, feeGrowth1, pending, deferred, aero, xaero, price };
 }
 
 const LEDGER_FILE = 'txs.jsonl';

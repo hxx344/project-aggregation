@@ -6,7 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Wallet, formatEther, formatUnits, getAddress, parseEther, parseUnits } from 'ethers';
-import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, emissionPerDay, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
+import { CONNECTION_KEYS, PRIVATE_KEY_PATTERN, belowTwap, emissionApr, emissionPerDay, feeApr, feeRate, nearestUsableTick, planCycle, positionAmounts, rangeState, targetRange, tickToPrice, validateSettings } from './core.mjs';
 import { connect, errorText, execute, provider, readRewards, readState, reconcileLedger } from './chain.mjs';
 
 const USAGE = 'Usage: lp {status|once|run} [--config FILE] [--dry-run]  |  lp run --managed --config FILE --data DIR';
@@ -104,7 +104,7 @@ async function reconcile(ctx, dataDir, wallet, log, dryRun) {
 
 // 奖励展示数据：池子排放速率由相邻两轮的 rewardGrowthGlobalX128 差值除以池子更新时间差得到，
 // 即单位质押流动性每秒分得的奖励；第一轮或池子期间无更新时沿用上一次的速率。
-function rewardView(ctx, state, rewards, memory) {
+function rewardView(ctx, state, rewards, memory, now = Date.now()) {
   const previous = memory.sample;
   if (previous && rewards.updatedAt > previous.updatedAt && rewards.growth >= previous.growth) {
     memory.perLiquidity = Number(rewards.growth - previous.growth) / 2 ** 128 / (rewards.updatedAt - previous.updatedAt);
@@ -112,18 +112,22 @@ function rewardView(ctx, state, rewards, memory) {
   if (!previous || rewards.updatedAt > previous.updatedAt) memory.sample = { growth: rewards.growth, updatedAt: rewards.updatedAt };
   const perSecond = memory.perLiquidity === undefined ? null : (memory.perLiquidity * Number(rewards.stakedLiquidity)) / 1e18;
   const price = { tick: state.tick, sqrt: state.sqrtPrice };
+  const fees = [rewards.liquidity, rewards.feeGrowth0, rewards.feeGrowth1].includes(null) ? memory.feeResult ?? null
+    : feeRate(memory, rewards.feeGrowth0, rewards.feeGrowth1, rewards.liquidity, rewards.stakedLiquidity, now);
   const positions = state.positions.map((p) => {
     const { amount0, amount1 } = positionAmounts(p, state.sqrtPrice, ctx.decimals0, ctx.decimals1);
     const value = amount0 * tickToPrice(state.tick, ctx.decimals0, ctx.decimals1) + amount1;
     const apr = p.staked && perSecond !== null ? emissionApr({ rewardPerSecond: perSecond, rewardPrice: rewards.price, stakedLiquidity: rewards.stakedLiquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 }) : null;
     const daily = p.staked && perSecond !== null ? emissionPerDay({ rewardPerSecond: perSecond, stakedLiquidity: rewards.stakedLiquidity, position: p, price }) : null;
+    const fee = fees && rewards.liquidity !== null ? feeApr({ feesPerSecond0: fees.perSecond0, feesPerSecond1: fees.perSecond1, activeLiquidity: rewards.liquidity, position: p, price, decimals0: ctx.decimals0, decimals1: ctx.decimals1 }) : null;
     return { amount0: round(amount0), amount1: round(amount1), value: round(value), apr: apr && round(apr.apr, 4), aprEstimated: apr?.estimated ?? false,
-      aeroPerDay: daily && round(daily.perDay), aeroPerDayEstimated: daily?.estimated ?? false };
+      aeroPerDay: daily && round(daily.perDay), aeroPerDayEstimated: daily?.estimated ?? false, feeApr: fee && round(fee.apr, 4), feeAprEstimated: fee?.estimated ?? false };
   });
   return {
     summary: {
       price: rewards.price === null ? null : round(rewards.price),
       poolPerDay: perSecond === null ? null : round(perSecond * 86_400),
+      feeWindowSec: fees && Math.round(fees.seconds),
       pending: formatUnits(rewards.pending, 18),
       deferred: formatUnits(rewards.deferred, 18),
     },
