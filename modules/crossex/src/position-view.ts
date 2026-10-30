@@ -2,6 +2,7 @@ import Decimal from 'decimal.js';
 import type { LivePosition, PositionFundingRate } from './live-types';
 import type { FundingLeg, FundingOpportunity } from './funding-opportunities';
 import { exact, formatDecimal, netBaseQuantity } from './live-display';
+import { positionAsset } from './position-actions';
 const D = Decimal.clone({ precision: 100 });
 
 export function fractionQuantity(quantity: string | null, percent: number, step?: string | null): string | null {
@@ -201,7 +202,7 @@ function positionMetrics(legs: LivePosition[], options: PositionMetricsOptions):
 
 export function groupPositions(positions: LivePosition[], options: PositionMetricsOptions = {}): PositionGroup[] {
   const groups = new Map<string, LivePosition[]>();
-  for (const p of positions) { const key = p.baseCurrency || p.symbol, legs = groups.get(key) || []; legs.push(p); groups.set(key, legs); }
+  for (const p of positions) { const key = positionAsset(p) || p.symbol, legs = groups.get(key) || []; legs.push(p); groups.set(key, legs); }
   return Array.from(groups, ([base, legs]) => ({ base, legs, net: netBaseQuantity(legs),
     entry: weightedPrice(legs, 'entryPrice'), mark: weightedPrice(legs, 'markPrice'),
     notional: sumNative(legs, p => p.notional, p => p.quoteCurrency),

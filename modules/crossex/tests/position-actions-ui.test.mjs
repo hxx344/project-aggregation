@@ -5,7 +5,7 @@ import { actionDecimal, addFractionQuantity, addQuantityFromTotal, commonQuantit
   positionActionInput, positionPairProblem, positionPreviewChanged, positionSnapshotChanged, sharedAvailableMargin, spreadDeviation } from '../src/position-actions.ts';
 
 const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
-  return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && specifier === './live-display' ? './live-display.ts' : specifier, context);
+  return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && ['./live-display', './position-actions'].includes(specifier) ? `${specifier}.ts` : specifier, context);
 } });
 const { groupPositions } = await import('../src/position-view.ts');
 sourceResolution.deregister();

@@ -7,6 +7,8 @@ export type PositionFundingRate = FundingLeg & { expiresAt: number };
 export type LivePosition = {
   id: string; symbol: string; exchange: string; side: string;
   quantity: string; baseQuantity: string | null; baseCurrency: string; quoteCurrency: string;
+  /** Verified 1:1 asset identity from the server (Gate/OKX LUNA = Binance LUNA2); baseCurrency stays native. */
+  canonicalBase?: string;
   entryPrice: string | null; markPrice: string | null; unrealizedPnl: string | null; pnlCurrency: string;
   margin: string | null; marginCurrency: string; liquidationPrice: string | null;
   external: boolean; updatedAt: number | null; openedAt?: number | null;
@@ -42,6 +44,8 @@ export type LiveView = {
   status: string; freshnessState: string; stale: boolean; partial: boolean; asOf: number | null;
   tradingAllowed: boolean; reasons: string[]; account: Record<string, unknown> | null;
   balances: Record<string, unknown>[]; positions: LivePosition[]; orders: LiveOrder[];
+  /** Finished local orders beyond the server limit; active and external orders are never omitted. */
+  closedOrdersOmitted?: number;
   executions: LiveExecution[]; alerts: (string | { message?: string; reason?: string })[];
   recentTrades?: Record<string, unknown>[]; accountBook?: Record<string, unknown>[]; fees?: Record<string, unknown>[];
   recentTradesAsOf?: number | null; recentTradesError?: string | null;

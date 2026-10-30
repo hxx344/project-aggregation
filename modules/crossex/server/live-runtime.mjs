@@ -3,12 +3,14 @@ import { AppError } from './model.mjs';
 import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
-import { isBaseBlocked } from '../../../server/asset-identity.mjs';
+import { canonicalBase, isBaseBlocked } from '../../../server/asset-identity.mjs';
 import { bindPositionAction, positionKey, positionDirection, validatePositionLegs } from './position-actions.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
 const ACTIVE = new Set(['NEW', 'OPEN', 'PARTIALLY_FILLED']);
 const REMOTE = new Set([...ACTIVE, 'FILLED', 'CANCELLED', 'FAIL', 'REJECT']);
+// Active, unknown and external orders are always returned; only finished local history is capped.
+const CLOSED_ORDER_LIMIT = 300;
 const POSITION_PROJECTION_WAIT_MS = 30000, POSITION_PROJECTION_TOLERANCE_MS = 1000, HISTORY_LOOKBACK_MS = 7 * 86400000;
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -918,7 +920,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const openedAt = Number.isSafeInteger(createdAt) && createdAt > 0 && createdAt <= Math.min(sourceAt ?? at, at) ? createdAt : null;
     return { ...p, id: positionKey(p), exchange: exchangeOf(p.symbol), side: side || 'UNKNOWN', directionSource, quantity, baseQuantity: quantity,
       signedQuantity: side ? D(quantity).times(side === 'SHORT' ? -1 : 1).toString() : null,
-      baseCurrency: parts[2] || '', quoteCurrency: parts.slice(3).join('_'), entryPrice: p.avg_price ?? p.entry_price ?? null,
+      // baseCurrency keeps the native coin name; canonicalBase is the verified 1:1 identity used to pair legs.
+      baseCurrency: parts[2] || '', canonicalBase: parts[2] ? canonicalBase(exchangeOf(p.symbol), parts[2]) : '', quoteCurrency: parts.slice(3).join('_'), entryPrice: p.avg_price ?? p.entry_price ?? null,
       markPrice: p.mark_price ?? null, notional: numeric(p.position_value)?.abs().toString() ?? null, positionValue: p.position_value ?? null,
       unrealizedPnl: p.upnl ?? null, unrealizedPnlRate: p.upnl_rate ?? null, pnlCurrency: p.currency || parts.at(-1), margin: p.initial_margin ?? null,
       maintenanceMargin: p.maintenance_margin ?? null, leverage: p.leverage ?? null, maxLeverage: p.max_leverage ?? null, riskLimit: p.risk_limit ?? null,
@@ -958,6 +961,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (record?.tradePermission === 'denied') reasons.push('此凭据只有读取权限');
     if (!owns()) reasons.push('本实例未持有执行锁');
     const externalOrders = cache.openOrders.filter(raw => !current.some(o => o.orderId ? o.orderId === String(raw.order_id) : o.text === raw.text));
+    const closedOrders = current.filter(o => TERMINAL.has(o.status));
     const byExecution = new Map();
     for (const order of tracked) {
       if (!byExecution.has(order.executionId)) byExecution.set(order.executionId, []);
@@ -969,7 +973,9 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       status: freshnessState, freshnessState, stale, partial, asOf: cache.asOf, tradingAllowed: connected && !!record.accountUid && !writerError && !writerLost && !stale && !partial && knownMode && record?.tradePermission !== 'denied' && owns(), reasons,
       account: cache.account, balances: Array.isArray(cache.account?.assets) ? cache.account.assets : [],
       positions: held.map(p => positionView(p, cache.asOf, details.adl || [])),
-      orders: [...current.map(o => orderView(o)), ...externalOrders.map(o => orderView(o, true))].slice(0, 300),
+      orders: [...current.filter(o => !TERMINAL.has(o.status)).map(o => orderView(o)), ...externalOrders.map(o => orderView(o, true)),
+        ...closedOrders.slice(0, CLOSED_ORDER_LIMIT).map(o => orderView(o))],
+      closedOrdersOmitted: Math.max(0, closedOrders.length - CLOSED_ORDER_LIMIT),
       recentTrades: historyRows('live_trades', record?.version), recentTradesAsOf: details.recentTradesAsOf ?? null, recentTradesError: details.recentTradesError ?? null,
       accountBook: historyRows('live_account_book', record?.version), accountBookAsOf: details.accountBookAsOf ?? null, accountBookError: details.accountBookError ?? null,
       fees: details.fees || [], feesAsOf: details.feesAsOf ?? null, feesError: details.feesError ?? null, adlAsOf: details.adlAsOf ?? null, adlError: details.adlError ?? null,

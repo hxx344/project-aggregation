@@ -9,7 +9,9 @@ import { time } from './display';
 import './position-metrics.css';
 
 const PositionCharts = lazy(() => import('./PositionCharts'));
-const healthLabels = { good: '良好', watch: '关注', risk: '风险', unknown: '待补全' };
+// Three fixed strategy rules, not an account risk assessment; scores and thresholds are unchanged.
+const observedRules = [['spread_narrowing', '价差收窄超 30%'], ['holding_age', '持仓超 7 天'], ['funding_reversal', '当前净资金费为负']] as const;
+const RULE_SCOPE = '仅观察这三项规则；保证金、强平价、ADL 需另行核对，流动性与执行敞口不在范围内';
 
 export function holdingDuration(ms: number | null) {
   if (ms === null || ms < 0 || !Number.isFinite(ms)) return '—';
@@ -22,7 +24,7 @@ export function PositionMetricsSummary({ group, stale }: { group: PositionGroup;
   return <div className="position-metrics-summary" aria-label={`${group.base} 组合指标`}>
     <div><span>综合年化收益率{stale && <small className="warning">旧值</small>}</span><strong className={amountClass(m.annualizedReturn)}>{percentage(m.annualizedReturn)}</strong><small>价差 + 累计资金费 / 当前保证金</small></div>
     <div><span>持仓时长</span><strong>{holdingDuration(m.holdingMs)}</strong><small>{m.openedAt ? `最早持仓腿 ${time(m.openedAt)}` : '交易所未提供完整开仓时间'}</small></div>
-    <div><span>健康度评分</span><strong className={`position-health ${stale ? 'unknown' : m.health}`}><i aria-hidden="true"/>{stale ? '数据待更新' : healthLabels[m.health]}{!stale && m.healthScore !== null && <small>{m.healthScore} / 100</small>}</strong><small>{stale ? '等待完整、新鲜的账户快照' : m.health === 'unknown' ? m.healthMissing.join('；') : m.healthDeductions.length ? m.healthDeductions.map(item => item.reason).join('；') : '三项规则均未触发扣分'}</small></div>
+    <div title={RULE_SCOPE}><span>三项规则观察</span><strong className={`position-health ${stale ? 'unknown' : m.health}`}><i aria-hidden="true"/>{stale ? '数据待更新' : m.health === 'unknown' ? '待补全' : m.healthDeductions.length ? `触发 ${m.healthDeductions.length} 项` : '未触发'}{!stale && m.healthScore !== null && <small>{m.healthScore} / 100</small>}</strong><small>{stale ? '等待完整、新鲜的账户快照' : m.health === 'unknown' ? m.healthMissing.join('；') : `${observedRules.map(([code, label]) => { const hit = m.healthDeductions.find(item => item.code === code); return `${label} ${hit ? `触发（扣 ${hit.points}）` : '未触发'}`; }).join(' · ')}。${RULE_SCOPE}`}</small></div>
   </div>;
 }
 
@@ -42,7 +44,7 @@ export function PositionMetricsDetails({ group, now, samples, stale }: { group: 
   const chartValues = [m.spreadReturn, m.fundingFee];
   const canShowComposition = chartValues.every(value => value !== null && new Decimal(value).gte(0)) && chartValues.some(value => value !== null && new Decimal(value).gt(0));
   return <div className="position-metrics-details">
-    {stale && <p className="metrics-note warning" role="status">快照待更新：保留已知收益和历史，不生成新的健康度评分或趋势样本。</p>}
+    {stale && <p className="metrics-note warning" role="status">快照待更新：保留已知收益和历史，不生成新的规则观察结论或趋势样本。</p>}
     <div className="position-detail-grid">
       <section className="position-detail-block" aria-label={`${group.base} 价差分析`}><h3>价差收益</h3>
         <dl className="position-metric-values">
@@ -76,7 +78,7 @@ export function PositionMetricsDetails({ group, now, samples, stale }: { group: 
         <div><dt>资金费反转概率</dt><dd>— <small>缺少历史样本与概率模型</small></dd></div>
       </dl>
       <div className="position-composition"><h4>收益构成</h4><p><span>价差收益</span><Amount value={m.spreadReturn} currency={m.currency}/></p><p><span>资金费收益</span><Amount value={m.fundingFee} currency={m.currency}/></p><p><span>合计</span><Amount value={m.totalReturn} currency={m.currency}/></p>{canShowComposition ? <Suspense fallback={null}><PositionCharts kind="composition" values={[m.spreadReturn!, m.fundingFee!]}/></Suspense> : <small className="metrics-note">存在亏损、零收益或缺失项时，按带符号金额展示构成。</small>}</div>
-      <p className="metrics-note metrics-method">综合年化 =（价差收益 + 累计资金费）/ 当前占用保证金 / 持仓天数 × 365，不含已实现盈亏与交易费。时长从最早的当前持仓腿计起，增减仓或保证金变化会影响指标，短时持仓的年化可能明显放大。健康度从 100 分起：价差绝对幅度较开仓收窄超过 30% 扣 30 分，持仓超过 7 天扣 20 分，当前持仓方向净资金费为负扣 25 分；≥70 良好、≥40 关注、低于 40 风险。此处“反转”指当前净费率为负，不代表已确认发生历史变号。</p>
+      <p className="metrics-note metrics-method">综合年化 =（价差收益 + 累计资金费）/ 当前占用保证金 / 持仓天数 × 365，不含已实现盈亏与交易费。时长从最早的当前持仓腿计起，增减仓或保证金变化会影响指标，短时持仓的年化可能明显放大。三项规则观察从 100 分起：价差绝对幅度较开仓收窄超过 30% 扣 30 分，持仓超过 7 天扣 20 分，当前持仓方向净资金费为负扣 25 分；≥70、≥40、低于 40 分别以绿、黄、红标示。该分值只反映这三项规则，不是综合风险评估；当前净费率为负不代表已确认发生历史变号。</p>
     </div></details>
   </div>;
 }

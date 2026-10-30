@@ -83,4 +83,11 @@ export const sideLabel = (side: string) => ({ long: '做多', short: '做空', b
 export const executionStatus = (state: string) => state.toLowerCase() === 'partial' ? '部分成交，需处理敞口' : liveStatus(state);
 const TERMINAL_ORDER_STATUSES = new Set(['FILLED', 'CANCELLED', 'CANCELED', 'FAIL', 'REJECT', 'REJECTED', 'EXPIRED']);
 export const orderIsTerminal = (status: string) => TERMINAL_ORDER_STATUSES.has(status.toUpperCase());
+export const CLOSED_ORDER_DISPLAY_LIMIT = 150;
+/** Active and unconfirmed orders always stay visible with their cancel entry; only finished history is capped. */
+export function visibleOrders<T extends { status: string }>(orders: T[], showClosed: boolean, serverOmitted = 0) {
+  const closed = showClosed ? orders.filter(order => orderIsTerminal(order.status)) : [];
+  return { orders: [...orders.filter(order => !orderIsTerminal(order.status)), ...closed.slice(0, CLOSED_ORDER_DISPLAY_LIMIT)],
+    hiddenClosed: showClosed ? Math.max(0, closed.length - CLOSED_ORDER_DISPLAY_LIMIT) + Math.max(0, serverOmitted) : 0 };
+}
 export const stateIsUncertain = (state: string) => ['UNKNOWN', 'SENDING', 'SUBMITTING', 'CANCEL_PENDING', 'RECONCILING', 'INVALID'].includes(state.toUpperCase());

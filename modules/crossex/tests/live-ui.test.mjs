@@ -4,7 +4,7 @@ import { registerHooks } from 'node:module';
 import { exact, formatDecimal, formatSigned, signedAmount, netBaseQuantity, positiveQuantity, stateIsUncertain, sideLabel, liquidationPrice } from '../src/live-display.ts';
 import { readPendingRequest, writePendingRequest, requestStorageKey, readRequestStatus, resolveRequestStatus } from '../src/live-requests.ts';
 const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
-  return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && specifier === './live-display' ? './live-display.ts' : specifier, context);
+  return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && ['./live-display', './position-actions'].includes(specifier) ? `${specifier}.ts` : specifier, context);
 } });
 const { fractionQuantity, groupPositions, instrumentFees, sumNative, weightedPrice, percentage } = await import('../src/position-view.ts');
 sourceResolution.deregister();

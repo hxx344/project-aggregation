@@ -126,9 +126,11 @@ async (page) => {
     const btc = group('BTC'), eth = group('ETH'), sol = group('SOL');
     await btc.locator('.position-metrics-summary').waitFor();
     const summary = await btc.locator('.position-metrics-summary').innerText();
-    for (const label of ['综合年化', '持仓时长', '健康度']) assert(summary.includes(label), `collapsed overview includes ${label}`);
-    assert(summary.includes('良好') && /100/.test(summary), 'complete BTC pair starts at health 100');
-    assert((await eth.locator('.position-metrics-summary').innerText()).includes('风险'), 'narrowing, long holding and adverse funding produce risk');
+    for (const label of ['综合年化', '持仓时长', '三项规则观察']) assert(summary.includes(label), `collapsed overview includes ${label}`);
+    assert(/未触发\s*100 \/ 100/.test(await btc.locator('.position-health').innerText()), 'complete BTC pair triggers no rule and starts at 100');
+    assert(summary.includes('保证金、强平价、ADL 需另行核对'), 'the summary states what the three rules do not cover');
+    assert(!/良好|关注|风险/.test(await module.locator('.position-health').allInnerTexts().then(values => values.join(' '))), 'conclusions do not read as an overall risk grade');
+    assert(/触发 3 项\s*25 \/ 100/.test(await eth.locator('.position-health').innerText()), 'narrowing, long holding and negative current funding trigger all three rules');
     assert((await sol.locator('.position-metrics-summary').innerText()).includes('待补全'), 'unpaired position is explicitly incomplete');
     assert(await module.locator('.position-metrics-details').count() === 0, 'details are collapsed by default');
     assert(requests.some(r => r.origin === origin && r.path.endsWith('/launch')), 'Hub launch path was exercised');
@@ -184,22 +186,22 @@ async (page) => {
     };
     missingFunding = true; await refresh();
     await btc.locator('.position-metrics-summary').getByText('待补全', { exact: true }).waitFor();
-    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'missing funding cannot retain a healthy label');
+    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('未触发'), 'missing funding cannot retain a no-trigger conclusion');
     missingFunding = false; partial = true; await refresh();
     await module.getByText('持仓数据不完整', { exact: false }).first().waitFor();
     await module.locator('.account-identity').getByText('数据不完整', { exact: true }).waitFor();
-    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'partial account evidence cannot retain a healthy label');
+    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('未触发'), 'partial account evidence cannot retain a no-trigger conclusion');
     partial = false; await refresh();
-    await btc.locator('.position-health').filter({ hasText: '良好' }).waitFor();
+    await btc.locator('.position-health').filter({ hasText: '未触发' }).waitFor();
 
     // No new successful response may be needed to expire a funding deadline.
     fundingTtl = 1000; await refresh(); holdState = true;
     await page.clock.runFor(2100);
     await btc.locator('.position-health').filter({ hasText: '待补全' }).waitFor();
     assert((await btc.locator('.position-metrics-summary').innerText()).includes('持仓资金费缺少完全匹配的新鲜双腿数据'), 'funding-only expiry explains the incomplete evidence');
-    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'the page clock independently expires funding evidence');
+    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('未触发'), 'the page clock independently expires funding evidence');
     release(); fundingTtl = 10_000; await refresh();
-    await btc.locator('.position-health').filter({ hasText: '良好' }).waitFor();
+    await btc.locator('.position-health').filter({ hasText: '未触发' }).waitFor();
 
     await btcToggle.click();
     // Each new source snapshot is one minute later. Repeated poll responses
@@ -241,10 +243,10 @@ async (page) => {
     await module.locator('.account-identity').getByText('数据已过期', { exact: true }).waitFor();
     assert(await module.locator('.account-identity').getByText('已同步', { exact: true }).count() === 0, 'cached live status cannot contradict local account expiry');
     assert(await btc.getByRole('button', { name: '平仓组合', exact: true }).isDisabled(), 'aged account data still disables closing');
-    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('良好'), 'expired evidence removes the healthy assessment');
+    assert(!(await btc.locator('.position-metrics-summary').innerText()).includes('未触发'), 'expired evidence removes the rule conclusion');
     await page.setViewportSize({ width: 1440, height: 1050 });
     accountAt = now; fundingAt = now; await refresh();
-    await btc.locator('.position-health').filter({ hasText: '良好' }).waitFor();
+    await btc.locator('.position-health').filter({ hasText: '未触发' }).waitFor();
     await module.locator('.account-identity').getByText('已同步', { exact: true }).waitFor();
 
     const mutations = requests.filter(r => r.method !== 'GET');
