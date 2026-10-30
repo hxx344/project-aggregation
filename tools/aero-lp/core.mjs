@@ -119,6 +119,56 @@ export function emissionApr({ rewardPerSecond, rewardPrice, stakedLiquidity, pos
   return { apr: (rewardPerSecond * SECONDS_PER_YEAR * rewardPrice * s.share) / value, estimated: s.entering };
 }
 
+// 不质押时的手续费年化。Slipstream 把质押流动性那份手续费记入 gaugeFees 归投票者，质押头寸本身不赚手续费；
+// 未质押流动性按活跃流动性比例分手续费（再扣 unstakedFee）。feesPerSecond0/1 是这部分手续费按全部活跃流动性
+// 折算后的池子总额（原始代币数量/秒，见 feeRate），头寸按当前活跃流动性份额分得，不质押与质押时份额相同。
+// 价格低于区间时按「价格刚进入下沿」估算：分母加上本头寸，价值与手续费都按下沿价格折算；价格在上沿或以上为 0。
+export function feeApr({ feesPerSecond0, feesPerSecond1, activeLiquidity, position, price, decimals0, decimals1 }) {
+  const L = Number(position.liquidity);
+  if (![feesPerSecond0, feesPerSecond1].every((r) => Number.isFinite(r) && r >= 0) || !(L > 0)) return null;
+  if (price.tick >= position.tickUpper) return { apr: 0, estimated: false };
+  const entering = price.tick < position.tickLower;
+  const share = L / (Number(activeLiquidity) + (entering ? L : 0));
+  if (!(share > 0) || share > 1) return null;
+  const sqrt = entering ? 1.0001 ** (position.tickLower / 2) : price.sqrt;
+  const rate = sqrt * sqrt * 10 ** (decimals0 - decimals1);
+  const { amount0, amount1 } = positionAmounts(position, sqrt, decimals0, decimals1);
+  const value = amount0 * rate + amount1;
+  if (!(value > 0)) return null;
+  const perSecond = share * ((feesPerSecond0 / 10 ** decimals0) * rate + feesPerSecond1 / 10 ** decimals1);
+  return { apr: (perSecond * SECONDS_PER_YEAR) / value, estimated: entering };
+}
+
+// 池子分给未质押流动性的手续费总额（已扣 unstakedFee，按全部活跃流动性折算）：每轮把 feeGrowthGlobal 的增量
+// 乘以前后两轮活跃流动性中较小的一个累加。不直接用 feeGrowthGlobal 的平均增速，因为流动性稀薄时少量成交就让
+// 单位增长暴涨，而真实头寸会摊薄这部分；取较小的流动性也是为了压住区间内价格穿过稀薄区的高估。
+// 与 Swap 事件对照（2026-10-29，RSGP/USDC）：10 分钟一轮约高估 15%～55%，1 分钟一轮在 ±15% 内。
+// gaugeFees 会被 gauge 不定期取走清零，不能用来测总手续费。活跃流动性全部质押时手续费全归 gauge、feeGrowthGlobal
+// 不涨，这类时段（任一端读数全部质押）不计入，速率按可测时长折算。手续费按成交一次性记账、波动大：累计值至少间隔
+// 5 分钟留一个样本，速率取最早样本到现在的平均（窗口最长约 24 小时）。增长值只增不减，读到更小的值（落后节点或重组）
+// 本轮跳过、不推进基准，沿用上次结果。
+const FEE_SAMPLE_GAP_MS = 5 * 60_000;
+const FEE_WINDOW_MS = 24 * 3_600_000;
+export function feeRate(memory, growth0, growth1, liquidity, stakedLiquidity, now) {
+  const last = memory.feeLast;
+  if (last && (growth0 < last.g0 || growth1 < last.g1 || now < last.at)) return memory.feeResult ?? null;
+  const total = (memory.feeTotal ??= { f0: 0n, f1: 0n, covered: 0 });
+  if (last && last.liquidity > last.staked && liquidity > stakedLiquidity) {
+    const weight = last.liquidity < liquidity ? last.liquidity : liquidity;
+    total.f0 += (growth0 - last.g0) * weight;
+    total.f1 += (growth1 - last.g1) * weight;
+    total.covered += now - last.at;
+  }
+  memory.feeLast = { g0: growth0, g1: growth1, liquidity, staked: stakedLiquidity, at: now };
+  const samples = (memory.feeSamples ??= []);
+  if (!samples.length || now - samples.at(-1).at >= FEE_SAMPLE_GAP_MS) samples.push({ at: now, ...total });
+  while (samples.length > 1 && now - samples[1].at >= FEE_WINDOW_MS) samples.shift();
+  const first = samples[0], covered = total.covered - first.covered;
+  memory.feeResult = covered < FEE_SAMPLE_GAP_MS ? null
+    : { perSecond0: Number(total.f0 - first.f0) / 2 ** 128 / (covered / 1000), perSecond1: Number(total.f1 - first.f1) / 2 ** 128 / (covered / 1000), seconds: covered / 1000 };
+  return memory.feeResult;
+}
+
 // 可配置参数（工作台页面与 CLI 共用同一套校验）。连接类参数变化时需要重连链上合约。
 export const SETTING_KEYS = ['rpcUrl', 'pool', 'factory', 'nft', 'gauge', 'token', 'token1', 'tickSpacing', 'upperPrice', 'gapBps', 'intervalSec', 'twapSec', 'maxTwapDeviationBps', 'slippageBps', 'keepInWallet', 'minDeploy', 'minEthForGas'];
 export const CONNECTION_KEYS = ['rpcUrl', 'pool', 'factory', 'nft', 'gauge', 'token', 'token1', 'tickSpacing'];

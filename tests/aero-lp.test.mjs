@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { belowTwap, emissionApr, emissionPerDay, nearestUsableTick, parseLedger, planCycle, positionAmounts, rangeState, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
+import { belowTwap, emissionApr, emissionPerDay, feeApr, feeRate, nearestUsableTick, parseLedger, planCycle, positionAmounts, rangeState, summarizeLedger, targetRange, tickToPrice } from '../tools/aero-lp/core.mjs';
 import { Interface, ZeroAddress, getAddress } from 'ethers';
 import { connect, execute, readRewards, reconcileLedger } from '../tools/aero-lp/chain.mjs';
 import { validateSettings } from '../tools/aero-lp/core.mjs';
@@ -214,7 +214,7 @@ test('ledger counts a gauge withdraw reward once: xAERO minted and burned elsewh
 
 test('reward reads give up after the time budget instead of delaying the cycle', async () => {
   const never = () => new Promise(() => {});
-  const ctx = { pool: { rewardGrowthGlobalX128: never, lastUpdated: never, stakedLiquidity: never }, gauge: { deferredEmissions: never }, aero: { balanceOf: never }, xaero: null, routerFactory: null };
+  const ctx = { pool: { rewardGrowthGlobalX128: never, lastUpdated: never, stakedLiquidity: never, liquidity: never, feeGrowthGlobal0X128: never, feeGrowthGlobal1X128: never }, gauge: { deferredEmissions: never }, aero: { balanceOf: never }, xaero: null, routerFactory: null };
   const started = Date.now();
   await assert.rejects(readRewards(ctx, WALLET, [], 50), /exceeded 50 ms/);
   assert.ok(Date.now() - started < 1000);
@@ -242,11 +242,58 @@ test('daily AERO estimate: live share in range, entry estimate below, zero above
   assert.equal(emissionPerDay({ ...common, rewardPerSecond: null, price: { tick: -333000 } }), null);
 });
 
+test('fee APR if unstaked: share of current active liquidity in range, entry estimate below, zero above', () => {
+  const position = { liquidity: 10n ** 18n, tickLower: -337000, tickUpper: UPPER };
+  const common = { feesPerSecond0: 2e18, feesPerSecond1: 3e6, activeLiquidity: 10n * 10n ** 18n, position, decimals0: 18, decimals1: 6 };
+  const inTick = -333000, inSqrt = sqrtAt(inTick), px = tickToPrice(inTick, 18, 6);
+  const inside = feeApr({ ...common, price: { tick: inTick, sqrt: inSqrt } });
+  const held = positionAmounts(position, inSqrt, 18, 6);
+  close(inside.apr, (2 * px + 3) / 10 * 365 * 86_400 / (held.amount0 * px + held.amount1), 'in range: L / active liquidity of the pool fees');
+  assert.equal(inside.estimated, false);
+  const below = feeApr({ ...common, price: { tick: -337100, sqrt: sqrtAt(-337100) } });
+  const lowPx = tickToPrice(-337000, 18, 6), entry = positionAmounts(position, sqrtAt(-337000), 18, 6);
+  close(below.apr, (2 * lowPx + 3) / 11 * 365 * 86_400 / (entry.amount0 * lowPx), 'below: own liquidity added, valued at the lower bound');
+  assert.equal(below.estimated, true);
+  assert.deepEqual(feeApr({ ...common, price: { tick: UPPER, sqrt: sqrtAt(UPPER) } }), { apr: 0, estimated: false });
+  assert.equal(feeApr({ ...common, feesPerSecond0: null, price: { tick: inTick, sqrt: inSqrt } }), null);
+  assert.equal(feeApr({ ...common, activeLiquidity: 0n, price: { tick: inTick, sqrt: inSqrt } }), null, 'no active liquidity: share unknown');
+});
+
+test('fee rate weights each growth step by the thinner of its two liquidity readings, averaged over samples 5 minutes apart', () => {
+  const memory = {}, Q = 2n ** 128n, min = 60_000, L = 10n ** 18n;
+  assert.equal(feeRate(memory, 0n, 0n, L, 0n, 0), null, 'first sample has no window yet');
+  // A big per-unit jump next to thin liquidity counts at the thin side, not the deeper reading.
+  assert.equal(feeRate(memory, 600n * Q, 0n, 100n * L, 0n, 4 * min), null, 'under 5 minutes');
+  assert.equal(memory.feeSamples.length, 1, 'samples closer than 5 minutes are not kept');
+  const r = feeRate(memory, 606n * Q, 1n * Q, 100n * L, 0n, 10 * min);
+  assert.equal(r.seconds, 600);
+  close(r.perSecond0, (600 * 1e18 + 6 * 100e18) / 600, 'step growth × min(liquidity before, after)');
+  close(r.perSecond1, 100e18 / 600, 'token1');
+  assert.equal(feeRate(memory, 605n * Q, 1n * Q, 100n * L, 0n, 11 * min), r, 'a lagging read is skipped and the last result kept');
+  assert.equal(memory.feeLast.g0, 606n * Q);
+  for (let t = 15; t <= 26 * 60; t += 5) feeRate(memory, 606n * Q, 1n * Q, L, 0n, t * min);
+  assert.ok(memory.feeSamples[0].at >= 2 * 60 * min && 26 * 60 * min - memory.feeSamples[1].at < 24 * 60 * min, 'window trimmed to about 24 hours');
+  const thinning = {};
+  feeRate(thinning, 0n, 0n, 100n * L, 0n, 0);
+  close(feeRate(thinning, 6n * Q, 0n, L, 0n, 5 * min).perSecond0, 6e18 / 300, 'liquidity thinned during the step: weighted by the thin reading');
+});
+
+test('fee rate leaves out time when all active liquidity is staked: fees then go to the gauge only', () => {
+  const memory = {}, Q = 2n ** 128n, min = 60_000, L = 10n ** 18n;
+  feeRate(memory, 0n, 0n, L, 0n, 0);
+  feeRate(memory, 0n, 0n, L, L, 10 * min);
+  feeRate(memory, 0n, 0n, L, L, 20 * min);
+  assert.equal(feeRate(memory, 0n, 0n, L, 0n, 25 * min), null, 'only fully staked steps so far: nothing measurable');
+  const r = feeRate(memory, 3n * Q, 0n, L, 0n, 30 * min);
+  assert.equal(r.seconds, 300, 'only the step with unstaked liquidity at both ends counts');
+  close(r.perSecond0, 3e18 / 300, 'rate over the measurable time');
+});
+
 test('AERO is priced from the deeper legacy token; the new token only when the legacy one has no route', async () => {
   const NEW = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee', LEGACY = '0x940181a94A35A4569E4529A3CDfB74e38FD98631';
   const quotes = { [NEW]: 900_000n, [LEGACY]: 661_459n };
   const ctx = {
-    pool: { rewardGrowthGlobalX128: async () => 0n, lastUpdated: async () => 1n, stakedLiquidity: async () => 0n },
+    pool: { rewardGrowthGlobalX128: async () => 0n, lastUpdated: async () => 1n, stakedLiquidity: async () => 0n, liquidity: async () => 0n, feeGrowthGlobal0X128: async () => 0n, feeGrowthGlobal1X128: async () => 0n },
     gauge: { deferredEmissions: async () => 0n }, aero: { balanceOf: async () => 5n }, xaero: null,
     routerFactory: '0x' + '55'.repeat(20), token1: '0x' + '66'.repeat(20), decimals1: 6,
     router: { getAmountsOut: async (amount, [route]) => [amount, quotes[route.from]] },
