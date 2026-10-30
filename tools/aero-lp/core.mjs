@@ -101,9 +101,37 @@ function emissionShare({ stakedLiquidity, position, price }) {
 
 // 质押头寸预估每天分得的 AERO 数量（不依赖报价）。
 export function emissionPerDay({ rewardPerSecond, stakedLiquidity, position, price }) {
-  if (!(rewardPerSecond > 0)) return null;
+  if (!Number.isFinite(rewardPerSecond) || rewardPerSecond < 0) return null;
   const s = emissionShare({ stakedLiquidity, position, price });
   return s && { perDay: rewardPerSecond * 86_400 * s.share, estimated: s.entering };
+}
+
+// The row estimates above each assume only that position enters. A wallet total
+// requires one common scenario: current price, or every live staked position
+// entering the same lower tick while external active liquidity stays unchanged.
+export function emissionTotalPerDay({ rewardPerSecond, stakedLiquidity, positions, price }) {
+  const unavailable = reason => ({ perDay: null, scenario: null, reason });
+  const live = positions.filter(p => p.staked && p.liquidity > 0n);
+  if (!live.length) return unavailable('no-staked');
+  if (!Number.isFinite(rewardPerSecond) || rewardPerSecond < 0) return unavailable('unavailable-rate');
+  if (rewardPerSecond === 0) return { perDay: 0, scenario: 'no-emissions', reason: null };
+  if (!Number.isInteger(price?.tick)) return unavailable('unavailable-price');
+  // Chain liquidity is uint128/BigInt: rounded per-position Numbers cannot be
+  // summed or compared with the separately rounded pool total reliably.
+  if (typeof stakedLiquidity !== 'bigint' || stakedLiquidity < 0n || live.some(p => typeof p.liquidity !== 'bigint')) return unavailable('invalid-liquidity');
+  const active = stakedLiquidity, own = live.reduce((sum, p) => sum + p.liquidity, 0n);
+  const states = live.map(p => rangeState(p, price.tick));
+  if (states.every(state => state === 'above')) return { perDay: 0, scenario: 'current', reason: null };
+  let denominator, scenario;
+  if (states.every(state => state === 'in')) {
+    if (own > active) return unavailable('invalid-liquidity');
+    denominator = active; scenario = 'current';
+  } else if (states.every(state => state === 'below')) {
+    if (!live.every(p => p.tickLower === live[0].tickLower)) return unavailable('different-lower');
+    denominator = active + own; scenario = 'same-lower';
+  } else return unavailable('mixed-ranges');
+  const perDay = rewardPerSecond * 86_400 * (Number(own) / Number(denominator));
+  return Number.isFinite(perDay) ? { perDay, scenario, reason: null } : unavailable('invalid-liquidity');
 }
 
 // 质押头寸的 AERO 排放年化：按 emissionShare 分得排放，价格低于区间时价值按下沿价格折算。

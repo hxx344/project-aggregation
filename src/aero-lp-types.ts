@@ -13,7 +13,11 @@ export type AeroLpPosition = {
   // Fee APR the position would earn unstaked: staked liquidity's share of swap fees goes to voters.
   feeApr?: number | null; feeAprEstimated?: boolean;
 };
-export type AeroLpRewards = { price: number | null; poolPerDay: number | null; feeWindowSec?: number | null; pending: string; deferred: string };
+export type AeroLpDailyTotal = {
+  perDay: number | null; scenario: 'current' | 'same-lower' | 'no-emissions' | null;
+  reason: 'no-staked' | 'unavailable-rate' | 'unavailable-price' | 'invalid-liquidity' | 'different-lower' | 'mixed-ranges' | null;
+};
+export type AeroLpRewards = { price: number | null; poolPerDay: number | null; dailyTotal?: AeroLpDailyTotal; feeWindowSec?: number | null; pending: string; deferred: string };
 export type AeroLpLedger = { txs: number; failed: number; gasEth: string; reward: string; since: string | null };
 export type AeroLpCycle = {
   at: string; event: 'cycle'; block: number; symbols?: [string, string]; price: number; twapPrice: number | null; twapError?: string;

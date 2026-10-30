@@ -81,17 +81,26 @@ function feeFact(cycle: AeroLpCycle | null | undefined) {
   const sample = rewards.feeWindowSec < 3_600 ? '样本不足 1 小时，波动大' : null;
   return { value: percent(p.feeApr), hint: [sample, actual, basis, `按${windowText(rewards.feeWindowSec)}可测样本平均，检查间隔越短越准`].filter(Boolean).join(' · ') };
 }
-// Expected AERO per day across the live staked positions; below-range positions count at their lower-bound entry estimate.
+// Only the backend common-scenario total is additive; below-range row estimates are independent.
 function dailyFact(cycle: AeroLpCycle | null | undefined, quote: string) {
   const rewards = cycle?.rewards;
   if (!cycle) return { value: '—', hint: '尚未完成检查' };
   if (!rewards) return { value: '—', hint: cycle.rewardsError ? '奖励数据读取失败，下一轮重试' : '奖励数据暂不可用' };
   const staked = cycle.positions.filter(p => p.staked && p.liquidity !== '0');
   if (!staked.length) return { value: '—', hint: cycle.positions.some(p => p.liquidity !== '0') ? '头寸未质押，不分 AERO 排放' : '暂无头寸' };
-  const known = staked.filter(p => typeof p.aeroPerDay === 'number');
-  if (known.length < staked.length) return { value: '—', hint: rewards.poolPerDay === null ? '需要两轮检查测出排放速率' : rewards.poolPerDay === 0 ? '池子当前无排放' : '头寸份额无法估算' };
-  const total = known.reduce((sum, p) => sum + p.aeroPerDay!, 0);
-  const basis = total === 0 ? '价格高于上沿，不分排放' : known.some(p => p.aeroPerDayEstimated) ? '价格低于区间：按刚进入下沿时估算' : '区间内实时';
+  const daily = rewards.dailyTotal;
+  if (!daily) return { value: '—', hint: '等待下一轮共同情景估计；逐仓独立估计不可相加' };
+  if (typeof daily.perDay !== 'number' || !Number.isFinite(daily.perDay)) {
+    const reason = daily.reason === 'different-lower' ? '头寸下沿不同，无法确定共同进入情景'
+      : daily.reason === 'mixed-ranges' ? '头寸所在区间状态不同，无法确定共同情景'
+      : daily.reason === 'unavailable-rate' ? '需要两轮检查测出排放速率'
+      : daily.reason === 'unavailable-price' ? '当前价格不可用' : '头寸份额无法估算';
+    return { value: '—', hint: `${reason}；逐仓独立估计不可相加` };
+  }
+  const total = daily.perDay;
+  const basis = daily.scenario === 'no-emissions' ? '池子当前无排放'
+    : daily.scenario === 'same-lower' ? '全部头寸同时进入相同下沿，假设外部活跃流动性不变'
+    : total === 0 ? '价格高于上沿，不分排放' : '区间内实时';
   const worth = typeof rewards.price === 'number' ? `≈ ${amount(total * rewards.price)} ${quote}/天` : null;
   return { value: `${amount(total)} AERO`, hint: [basis, worth, staked.length > 1 ? `${staked.length} 个质押头寸合计` : null].filter(Boolean).join(' · ') };
 }
@@ -255,10 +264,11 @@ export default function AeroLpPage({ onExpired }: { onExpired: () => void }) {
           {cycle?.positions.length ? cycle.positions.map(p => <tr key={p.id}><th scope="row">#{p.id}</th><td>{price(p.range[0])} – {price(p.range[1])}</td><td><RangeSpot range={p.range} current={cycle.price} state={p.state} /></td>
             <td>{typeof p.amount0 === 'number' ? <>{amount(p.amount0)} {symbol0}{p.amount1 ? <><br />{amount(p.amount1)} {symbol1}</> : null}</> : '—'}</td><td>{amount(p.value)}</td>
             <td>{typeof p.apr === 'number' ? `${percent(p.apr)}${p.aprEstimated ? '（估）' : ''}` : '—'}</td>
-            <td>{typeof p.aeroPerDay === 'number' ? `${amount(p.aeroPerDay)}${p.aeroPerDayEstimated ? '（估）' : ''}` : '—'}</td>
+            <td>{typeof p.aeroPerDay === 'number' ? `${amount(p.aeroPerDay)}${p.aeroPerDayEstimated ? '（独立估计）' : ''}` : '—'}</td>
             <td>{typeof p.feeApr === 'number' ? `${percent(p.feeApr)}${p.feeAprEstimated ? '（估）' : ''}` : '—'}</td><td>{p.staked ? '已质押' : '未质押'}</td></tr>)
             : <tr><td colSpan={9} className="lp-table-empty">{cycle ? '本池暂无头寸' : '等待第一轮检查'}</td></tr>}
         </tbody></table></div>
+        {cycle?.positions.some(p => p.aeroPerDayEstimated) ? <p className="muted">逐仓 AERO/天按该头寸单独进入下沿估计，不可直接相加；顶部合计使用全部头寸的共同情景。</p> : null}
         {cycle ? <p className="lp-plan"><span>本轮动作：{cycle.actions.length ? cycle.actions.join('、') : '无'}</span>{cycle.notes.map(note => <span key={note}>{note}</span>)}</p> : null}
       </section>
       <section className="panel lp-section" aria-label="钱包私钥"><div className="panel-heading"><h2>钱包私钥</h2><span className="muted">{snapshot.wallet ? `当前地址 ${snapshot.wallet}` : '尚未设置'}</span></div>
