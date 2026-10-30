@@ -275,13 +275,13 @@ test('OKX PostOnly open/close orders preserve native contracts, margin selection
 test('OKX create and amend stop before writing when fresh quotes cross the stop or expire', async () => {
   for (const action of ['create', 'amend']) {
     const h = harness();
-    await assert.rejects(h.client[action](credentials, { ...spec, id: ORDER, stopPrice: '80' }), isExecutionError('rejected'));
+    await assert.rejects(h.client[action](credentials, { ...spec, id: ORDER, stopPrice: '80' }, { amendSequence: 1 }), isExecutionError('rejected'));
     assert.equal(mutations(h.calls).length, 0);
     const stale = harness({ handler: call => call.url.pathname.endsWith('/books') ? [{ bids: [['80', '1']], asks: [['80.1', '1']], ts: String(NOW - 10_001) }] : undefined });
-    await assert.rejects(stale.client[action](credentials, { ...spec, id: ORDER }), isExecutionError('not_tradable'));
+    await assert.rejects(stale.client[action](credentials, { ...spec, id: ORDER }, { amendSequence: 1 }), isExecutionError('not_tradable'));
     assert.equal(mutations(stale.calls).length, 0);
     const expires = harness();
-    await assert.rejects(expires.client[action](credentials, { ...spec, id: ORDER }, { beforeMutation: () => { expires.state.now += 11_000; } }), isExecutionError('not_tradable'));
+    await assert.rejects(expires.client[action](credentials, { ...spec, id: ORDER }, { amendSequence: 1, beforeMutation: () => { expires.state.now += 11_000; } }), isExecutionError('not_tradable'));
     assert.equal(mutations(expires.calls).length, 0);
   }
 });
@@ -296,14 +296,14 @@ test('OKX native quantity limits and refreshed contract sizes block invalid subm
   assert.equal(mutations(bz.calls)[0].parameters.sz, '3000000');
   for (const action of ['create', 'amend']) {
     const h = harness();
-    await assert.rejects(h.client[action](credentials, { ...spec, id: ORDER, contractSize: '1', instrumentId: 'CL-USDT-SWAP' }), isExecutionError('not_tradable'));
+    await assert.rejects(h.client[action](credentials, { ...spec, id: ORDER, contractSize: '1', instrumentId: 'CL-USDT-SWAP' }, { amendSequence: 1 }), isExecutionError('not_tradable'));
     assert.equal(mutations(h.calls).length, 0);
     let instrumentReads = 0;
     const changed = harness({ handler: call => call.url.pathname.endsWith('/instruments')
       ? [rule(call.parameters.instId, ++instrumentReads > 1 ? { ctVal: '1' } : {})] : undefined });
     const preview = await changed.client.market('CLUSDT');
     await assert.rejects(changed.client[action](credentials, { ...spec, id: ORDER, contractSize: preview.rule.contractSize,
-      instrumentId: preview.rule.instrumentId }), isExecutionError('not_tradable'));
+      instrumentId: preview.rule.instrumentId }, { amendSequence: 1 }), isExecutionError('not_tradable'));
     assert.equal(mutations(changed.calls).length, 0);
   }
 });
@@ -311,7 +311,7 @@ test('OKX native quantity limits and refreshed contract sizes block invalid subm
 test('OKX native amendment preserves ID and original total and reconciles the asynchronous acknowledgement', async () => {
   const h = harness(); h.state.order = order({ sz: '10', accFillSz: '3', state: 'partially_filled', avgPx: '79.9' });
   let guards = 0;
-  const result = await h.client.amend(credentials, { ...spec, id: ORDER, quantity: '10' }, { beforeMutation: () => { guards += 1; } });
+  const result = await h.client.amend(credentials, { ...spec, id: ORDER, quantity: '10' }, { amendSequence: 1, beforeMutation: () => { guards += 1; } });
   assert.equal(result.id, ORDER); assert.equal(result.quantity, '10'); assert.equal(result.filledQuantity, '3'); assert.equal(result.price, '80');
   assert.equal(result.terminal, false); assert.equal(guards, 1);
   const sent = mutations(h.calls); assert.equal(sent.length, 1);
@@ -322,10 +322,37 @@ test('OKX native amendment preserves ID and original total and reconciles the as
   assert.equal(h.calls.filter(call => call.url.pathname === '/api/v5/trade/order' && call.init.method === 'GET').length, 2);
 });
 
+test('OKX amendment reqId follows the persisted intent sequence, not the adapter instance or the price', async () => {
+  const reqIds = [];
+  // 80 → 79 → 80 are three intents. Each harness is a fresh adapter, as after
+  // a restart; the persisted sequence continues and the old price returns.
+  for (const [sequence, bid] of [[1, '80'], [2, '79'], [3, '80']]) {
+    const h = harness({ handler: call => call.url.pathname.endsWith('/books') ? [{ bids: [[bid, '10', '0', '2']], asks: [['80.1', '12', '0', '2']], ts: String(NOW) }] : undefined });
+    await h.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: sequence });
+    const [sent] = mutations(h.calls);
+    assert.equal(sent.parameters.newPx, bid); reqIds.push(sent.parameters.reqId);
+  }
+  assert.equal(new Set(reqIds).size, 3);
+  // The same intent retried by another adapter keeps its reqId.
+  const again = harness(); await again.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: 1 });
+  assert.equal(mutations(again.calls)[0].parameters.reqId, reqIds[0]);
+  // An ACK echoing an earlier intent cannot confirm the new one.
+  const stale = harness({ handler: call => call.url.pathname.endsWith('/amend-order')
+    ? [{ ordId: ORDER, clOrdId: call.parameters.clOrdId, reqId: reqIds[0], sCode: '0' }] : undefined });
+  await assert.rejects(stale.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: 4 }), isExecutionError('invalid_data', true));
+  assert.equal(mutations(stale.calls).length, 1);
+  // Without a persisted intent number nothing is sent.
+  for (const amendSequence of [undefined, 0, 1.5, '2']) {
+    const missing = harness();
+    await assert.rejects(missing.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence }), isExecutionError('input'));
+    assert.equal(missing.calls.length, 0);
+  }
+});
+
 test('OKX unchanged or terminal original order skips unnecessary amendment', async () => {
   for (const changes of [{ px: '80' }, { state: 'filled', accFillSz: '2', avgPx: '79.99' }, { state: 'canceled' }]) {
     const h = harness(); h.state.order = order(changes);
-    await h.client.amend(credentials, { ...spec, id: ORDER });
+    await h.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: 1 });
     assert.equal(mutations(h.calls).length, 0);
   }
 });
@@ -333,7 +360,7 @@ test('OKX unchanged or terminal original order skips unnecessary amendment', asy
 test('OKX wrong original identity, order type or size cannot be amended or claimed', async () => {
   for (const changes of [{ clOrdId: 'foreign' }, { ordId: '999' }, { ordType: 'limit' }, { tdMode: 'isolated' }, { sz: '3' }, { side: 'sell' }, { attachAlgoOrds: [{ algoId: '8' }] }]) {
     const h = harness(); h.state.order = order(changes);
-    await assert.rejects(h.client.amend(credentials, { ...spec, id: ORDER }), isExecutionError('invalid_data'));
+    await assert.rejects(h.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: 1 }), isExecutionError('invalid_data'));
     assert.equal(mutations(h.calls).length, 0);
   }
 });
@@ -341,7 +368,7 @@ test('OKX wrong original identity, order type or size cannot be amended or claim
 test('OKX unresolved amendment ACK performs only bounded reads and never resubmits', async () => {
   const h = harness({ handler: call => call.url.pathname.endsWith('/amend-order')
     ? [{ ordId: ORDER, clOrdId: call.parameters.clOrdId, reqId: call.parameters.reqId, sCode: '0' }] : undefined });
-  await assert.rejects(h.client.amend(credentials, { ...spec, id: ORDER }), isExecutionError('upstream', true));
+  await assert.rejects(h.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: 1 }), isExecutionError('upstream', true));
   assert.equal(mutations(h.calls).length, 1);
   assert.equal(h.calls.filter(call => call.url.pathname === '/api/v5/trade/order' && call.init.method === 'GET').length, 4);
 });
@@ -353,7 +380,7 @@ test('OKX read failure after accepted amendment remains uncertain and never recr
     if (amended && call.url.pathname === '/api/v5/trade/order' && call.init.method === 'GET') return response({ code: '51603' });
     return undefined;
   } });
-  await assert.rejects(h.client.amend(credentials, { ...spec, id: ORDER }), isExecutionError('not_found', true));
+  await assert.rejects(h.client.amend(credentials, { ...spec, id: ORDER }, { amendSequence: 1 }), isExecutionError('not_found', true));
   assert.equal(mutations(h.calls).length, 1);
 });
 

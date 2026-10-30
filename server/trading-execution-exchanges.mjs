@@ -19,8 +19,12 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  *   }
  *   amend(credentials, { ...spec, id: string }, options) -> same as inspect (Binance / OKX)
  *   stop(credentials, { ...spec, id: string | null }, options) -> void (ACK only)
+ *   endedStrategies(credentials, { ...options, symbol, startTime, endTime }) -> strategies
+ *     (Bybit only; ended strategies created within a window of at most 1 h)
  * options = { accountMode: 'standard' | 'portfolio-margin' | 'unified' | 'cross' | 'isolated', signal,
  *   beforeMutation?: () => void } (the guard is an internal service callback).
+ *   amend also receives amendSequence: the persisted per-order intent number
+ *   (OKX derives its reqId from it; Binance ignores it).
  * spec = { symbol, side: 'buy' | 'sell', positionSide: 'BOTH' | 'LONG' | 'SHORT',
  *          quantity: decimal string, reduceOnly: boolean, clientId: string <= 32,
  *          stopPrice: positive decimal string }.
@@ -67,6 +71,7 @@ const MAX_PAGES = 40;
 const MAX_ROWS = 2000;
 const MAX_CLOCK_OFFSET = 300_000;
 const RULE_TTL = 60_000;
+export const MAX_STRATEGY_WINDOW = 7 * 86_400_000;
 const RECV_WINDOW = '5000';
 const ID_KEYS = new Set(['orderId', 'tranId', 'userID', 'userIDInt64', 'uid']);
 const BINANCE_RISKY_PERMISSIONS = ['enableWithdrawals', 'enableInternalTransfer', 'permitsUniversalTransfer', 'enableMargin', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
@@ -546,6 +551,27 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     return { identity: snapshot.identity, modes, positions, openOrders, strategies };
   }
 
+  // Operator confirmation only. Ended strategies (status 3) are outside the
+  // routine account snapshot, so a create that ended without a fill is looked
+  // up in a bounded window around the request instead of scanning history.
+  // The venue takes whole seconds and does not say which timestamp it filters,
+  // so the caller's window spans creation through now and it filters by
+  // creation time again; incomplete pagination fails.
+  async function endedStrategies(credentials, { accountMode, signal, symbol, startTime, endTime } = {}) {
+    if (exchange !== 'bybit' || !SYMBOLS.includes(symbol) || !Number.isSafeInteger(startTime) || !Number.isSafeInteger(endTime)
+      || startTime < 0 || endTime <= startTime || endTime - startTime > MAX_STRATEGY_WINDOW) fail('input');
+    const options = { accountMode: modeOf(accountMode), signal }, seen = new Set(), strategies = [];
+    const rows = await pages('strategies', credentials, { category: 'UTA_USDT', symbol, strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(startTime / 1000)), endTimeE0: String(Math.ceil(endTime / 1000)), pageSize: '50' }, options, { cursorField: 'nextCursor' });
+    for (const row of rows) {
+      const strategy = parseStrategy(row);
+      if (strategy.symbol !== symbol || seen.has(strategy.id)) fail();
+      seen.add(strategy.id);
+      strategies.push({ id: strategy.id, symbol, side: strategy.side, quantity: strategy.quantity, filledQuantity: strategy.filledQuantity, status: strategy.status, reduceOnly: strategy.reduceOnly, createdAt: strategy.createdAt });
+    }
+    checkAbort(signal);
+    return strategies;
+  }
+
   async function loadRule(symbol, signal) {
     const cached = ruleCache.get(symbol);
     if (cached && cached.expiresAt > clock()) return { ...cached.rule };
@@ -710,5 +736,5 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     } catch { fail('invalid_data', { uncertain: true }); }
   }
 
-  return Object.freeze({ verify, account, market, create, amend, inspect, stop });
+  return Object.freeze({ verify, account, endedStrategies, market, create, amend, inspect, stop });
 }

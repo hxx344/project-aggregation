@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
-import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
+import { createExecutionExchangeClient, ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
+import { createOkxExecutionClient } from '../server/trading-okx-execution.mjs';
 import { normalizeIntent, splitQuantity } from '../server/trading-execution-plan.mjs';
 
 const baseTime = Date.UTC(2026, 9, 7, 10);
@@ -26,10 +27,11 @@ async function fixture(t, options = {}) {
   const records = new Map(), calls = [], handlers = {}, markets = {};
   const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map((exchange, index) => [exchange, { identity: guarded ? String(index + 1) : exchange === 'binance' ? null : 'fixture-uid', modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
-  const factory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
+  const factory = exchange => Object.fromEntries(['verify', 'account', 'endedStrategies', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
     if (handlers[`${exchange}:${method}`]) return handlers[`${exchange}:${method}`](...args);
     if (method === 'verify') return { identity: accounts[exchange].identity };
+    if (method === 'endedStrategies') return [];
     if (method === 'account') return structuredClone(accounts[exchange]);
     if (method === 'market') { const value = market(args[0]); return { ...value, ...(exchange === 'okx' ? { rule: { ...value.rule, quantityStep: '1', minQuantity: '1', contractSize: args[0] === 'CLUSDT' ? '0.1' : '0.01', instrumentId: args[0] === 'CLUSDT' ? 'CL-USDT-SWAP' : 'BZ-USDT-SWAP', quantityUnit: '张', minNotional: '0' } } : {}), ...markets[exchange] }; }
     const spec = args[1];
@@ -302,6 +304,47 @@ test('OKX native amendment retains original identity and total after partial fil
   assert.equal(f.creates.length, 2); assert.equal(f.job.legs.find(leg => leg.exchange === 'okx').filledQuantity, '5');
   for (const row of f.records.values()) f.fill(row.id);
   await f.service.tick(); assert.equal(f.job.status, 'completed');
+});
+
+test('OKX amendments sent through the real adapter never reuse a reqId after a rebuild, and a stale ACK leaves the result unknown', async t => {
+  const f = await fixture(t, { guarded: true });
+  const body = intent({ batchCount: 1, legs: intent().legs.map(leg => leg.exchange === 'binance' ? { ...leg, exchange: 'okx', quantity: '20' } : leg) });
+  f.start(await f.preview(body)); await f.service.tick();
+  const record = [...f.records.values()].find(row => row.kind === 'order'), sent = [];
+  let staleAck = null;
+  // Real OKX adapter; only HTTP is replaced. Its order rows mirror the fixture record.
+  const adapter = () => createOkxExecutionClient({ ErrorClass: ExecutionExchangeError, now: () => f.time, fetchImpl: async (url, init) => {
+    const parsed = new URL(url), parameters = init.body === undefined ? Object.fromEntries(parsed.searchParams) : JSON.parse(init.body);
+    const nativeId = 'ox' + createHash('sha256').update(record.clientId).digest('hex').slice(0, 30);
+    let data;
+    if (parsed.pathname === '/api/v5/public/instruments') data = [{ instId: 'CL-USDT-SWAP', instType: 'SWAP', ctType: 'linear', settleCcy: 'USDT', state: 'live', ctValCcy: 'CL', ctVal: '0.1', ctMult: '1', baseCcy: '', quoteCcy: '', tickSz: '0.01', lotSz: '1', minSz: '1', maxLmtSz: '100000000', maxLmtAmt: '20000000' }];
+    else if (parsed.pathname === '/api/v5/market/books') data = [{ bids: [[f.markets.okx.bid, '10', '0', '2']], asks: [[f.markets.okx.ask, '10', '0', '2']], ts: String(f.time) }];
+    else if (parsed.pathname === '/api/v5/trade/order' && init.method === 'GET') data = [{ instType: 'SWAP', instId: 'CL-USDT-SWAP', ordId: record.id, clOrdId: nativeId, ordType: 'post_only', state: 'live', tdMode: 'cross', posSide: 'long', side: 'buy', reduceOnly: 'false', sz: record.quantity, accFillSz: record.filledQuantity, px: record.price, avgPx: '', cTime: String(f.time), ccy: 'USDT', algoId: '', attachAlgoOrds: [] }];
+    else if (parsed.pathname === '/api/v5/trade/amend-order') {
+      sent.push(parameters); record.price = parameters.newPx;
+      data = [{ ordId: record.id, clOrdId: parameters.clOrdId, reqId: staleAck ?? parameters.reqId, sCode: '0' }];
+    } else throw new Error(`Unhandled fixture route ${parsed.pathname}`);
+    return new Response(JSON.stringify({ code: '0', data }), { status: 200 });
+  } });
+  let okx = adapter();
+  f.handlers['okx:amend'] = (...args) => okx.amend(...args);
+  // 71 → 72 → (adapter rebuilt) → 71: the returning price is a new intent.
+  for (const [bid, rebuild] of [['71', false], ['72', false], ['71', true]]) {
+    if (rebuild) okx = adapter();
+    f.markets.okx = { bid, ask: '72.5' }; f.advance(1000); await f.service.tick();
+  }
+  assert.deepEqual(sent.map(row => row.newPx), ['71', '72', '71']);
+  assert.equal(new Set(sent.map(row => row.reqId)).size, 3);
+  assert.equal(f.job.status, 'running');
+  // An ACK carrying an earlier reqId cannot confirm the next intent.
+  staleAck = sent[0].reqId; okx = adapter();
+  f.markets.okx = { bid: '72', ask: '72.5' }; f.advance(1000); await f.service.tick();
+  assert.equal(sent.length, 4); assert.equal(new Set(sent.map(row => row.reqId)).size, 4);
+  assert.equal(f.job.status, 'paused'); assert.equal(record.terminal, true);
+  // The unknown amendment was settled only by cancelling the original; no new amendment or order.
+  f.markets.okx = { bid: '73', ask: '73.5' }; f.advance(1000); await f.service.tick();
+  assert.equal(sent.length, 4); assert.equal(f.creates.length, 2);
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
 });
 
 test('changed OKX contract multiplier blocks all submission and max notional applies per contract size', async t => {
@@ -765,6 +808,160 @@ test('a cancel left sending by a crash is resent after restart', async t => {
   assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
 });
 
+test('a first cancel lost between sending and its timestamp is resent after restart', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  const stops = () => f.calls.filter(call => call.exchange === 'binance' && call.method === 'stop').length;
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending'; delete order.cancelRequestedAt; delete order.cancelSent;
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  await f.service.close(); f.service = f.create(); await f.service.initializeProtection();
+  delete f.handlers['binance:stop'];
+  await f.service.tick();
+  assert.equal(stops(), 2); assert.equal(f.job.status, 'stopped');
+});
+
+test('a cancel the send guard refuses spends neither budget nor spacing', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  let posts = 0;
+  const assertOwned = f.writer.assertOwned.bind(f.writer);
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => {
+    f.writer.assertOwned = () => { throw new Error('lease moved'); };
+    try { options.beforeMutation(); } finally { f.writer.assertOwned = assertOwned; }
+    posts += 1;
+  };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  const stored = () => JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%').json);
+  assert.equal(posts, 0); assert.equal(stored().cancelSent, 0); assert.ok(!stored().cancelRequestedAt);
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); posts += 1; };
+  await f.service.tick();
+  assert.equal(posts, 1); assert.equal(stored().cancelSent, 1);
+});
+
+test('an older cancel record without a send count keeps its original budget', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(posts.length, 1);
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.cancelAttempt = 2; delete order.cancelSent; // Sequence 2: three requests already sent.
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  await restart(f);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 3);
+});
+
+test('a cancel retried after restart keeps the budget of a record without a send count', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation(); };
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending'; delete order.cancelSent; // One request sent, not yet counted.
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  const posts = rejectBinanceCancels(f);
+  await restart(f);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 4, 'the four requests left of the budget of five');
+});
+
+// Records the venue time of every Binance cancel that reached transport.
+function rejectBinanceCancels(f) {
+  const posts = [];
+  f.handlers['binance:stop'] = async (_credentials, _spec, options) => { options.beforeMutation?.(); posts.push(f.time); throw new ExecutionExchangeError('rejected'); };
+  return posts;
+}
+const restart = async f => { await f.service.close(); f.service = f.create(); await f.service.initializeProtection(); };
+const spaced = posts => posts.slice(1).every((time, index) => time - posts[index] >= 10_000);
+async function finishCancelledOriginal(f) {
+  delete f.handlers['binance:stop'];
+  const original = f.records.get(JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%').json).remoteId);
+  Object.assign(original, { status: 'terminal', terminal: true, childrenSettled: true });
+  f.advance(15_000); await f.service.tick();
+  assert.equal(f.job.status, 'stopped'); assert.equal(f.creates.length, 2);
+  assert.deepEqual(f.accounts.binance.positions, []);
+  assert.equal(f.writer?.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)) ?? false, false);
+}
+
+test('a rejected cancel restarted between attempts still gets five spaced POSTs', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(posts.length, 1); assert.equal(f.job.status, 'attention');
+  for (let i = 0; i < 8; i += 1) {
+    // Recovering the rejected cancel neither burns a send nor drops the spacing.
+    f.advance(1000); await restart(f); await f.service.tick();
+    f.advance(15_000); await f.service.tick();
+  }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
+test('a cancel prepared but never sent before a crash does not use up the cancel budget', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  assert.equal(posts.length, 1);
+  // The shared prepare succeeds, then every private write after `prepared`
+  // fails, as if the process died before transport.
+  const prepare = f.db.prepare.bind(f.db);
+  f.db.prepare = sql => {
+    const statement = prepare(sql);
+    if (sql.startsWith('INSERT INTO execution_orders')) {
+      const run = statement.run.bind(statement);
+      statement.run = (...args) => { const value = JSON.parse(args[2]); if (value.writerOperation?.action === 'cancel' && value.writerOperation.state !== 'prepared') throw new Error('SQLITE_IOERR'); return run(...args); };
+    }
+    return statement;
+  };
+  f.advance(15_000); await f.service.tick(); f.db.prepare = prepare;
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%').json).writerDispatch, 'prepared');
+  await restart(f); await f.service.tick();
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
+test('a cancel left sending by a crash counts once toward the cancel budget', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  f.advance(15_000); await f.service.tick();
+  assert.equal(posts.length, 2);
+  // The second request was in flight when the process stopped.
+  const row = f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"binance"%'), order = JSON.parse(row.json);
+  order.writerOperation.state = 'sending'; order.writerDispatch = 'sending';
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+  shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerOperation.operationId); shared.close();
+  f.advance(1000); await restart(f); await f.service.tick();
+  assert.equal(posts.length, 2);
+  for (let i = 0; i < 8; i += 1) { f.advance(15_000); await f.service.tick(); }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
+test('without a shared writer a rejected cancel gets five spaced POSTs and stops on the terminal original', async t => {
+  const f = await fixture(t);
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const posts = rejectBinanceCancels(f);
+  f.service.stop(f.job.id, {}); await f.service.tick();
+  for (let i = 0; i < 20; i += 1) { f.advance(5000); await f.service.tick(); }
+  assert.equal(posts.length, 5); assert.ok(spaced(posts), posts.join(','));
+  await finishCancelledOriginal(f);
+});
+
 test('connecting reads only the oil symbols so another market cannot block it', async t => {
   const f = await fixture(t);
   const reads = f.calls.filter(call => call.method === 'account');
@@ -815,6 +1012,90 @@ test('Bybit strategy create without an answer can be confirmed absent only after
   await f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true });
   assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true);
   assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  assert.equal(f.creates.length, 2);
+});
+
+test('Bybit not-created confirmation reads ended strategies near the request through the real adapter', async t => {
+  const f = await fixture(t, { guarded: true });
+  f.handlers['bybit:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  const leg = f.job.legs.find(row => row.exchange === 'bybit'), created = f.time;
+  for (const step of [50_000, 50_000, 25_000]) { f.advance(step); await f.service.tick(); }
+  assert.equal(f.job.status, 'attention');
+  // Real Bybit adapter; only HTTP is replaced. The venue keeps ended (status 3)
+  // strategies out of the active buckets and filters them by creation time.
+  const id = n => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+  const venue = { ended: [], shortQuantity: '0', ignoreWindow: false, endlessPages: false }, lists = [];
+  const row = (n, time, status = 3) => ({ strategyId: id(n), category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Sell', size: '2', executedSize: '0', strategyType: 'chaseOrder', status, reduceOnly: false, createdTimeE3: String(time), updatedTimeE3: String(time), chaseOrderPrice: '70', executedAvgPrice: '0' });
+  const bybit = createExecutionExchangeClient('bybit', { now: () => f.time, fetchImpl: async url => {
+    const parsed = new URL(url), query = Object.fromEntries(parsed.searchParams), path = parsed.pathname;
+    let result;
+    if (path === '/v5/user/query-api') result = { readOnly: 0, userID: '2', permissions: { ContractTrade: ['Order', 'Position'], Derivatives: ['DerivativesTrade'], Wallet: [], Spot: [], Options: [], Earn: [] } };
+    else if (path === '/v5/account/info') result = { unifiedMarginStatus: 6 };
+    else if (path === '/v5/position/list') result = { category: 'linear', list: [{ symbol: query.symbol, positionIdx: 1, side: '', size: '0' }, { symbol: query.symbol, positionIdx: 2, side: query.symbol === 'CLUSDT' && venue.shortQuantity !== '0' ? 'Sell' : '', size: query.symbol === 'CLUSDT' ? venue.shortQuantity : '0' }], nextPageCursor: '' };
+    else if (path === '/v5/order/realtime') result = { category: 'linear', list: [], nextPageCursor: '' };
+    else if (path === '/v5/strategy/list') {
+      lists.push(query);
+      if (query.status !== '3') result = { list: [], nextCursor: '' };
+      else if (venue.endlessPages) result = { list: [row(90, created)], nextCursor: 'again' };
+      else {
+        if (query.startTime || query.endTime) throw new Error('Unsupported strategy time parameters');
+        const stamp = item => Number(venue.filterByEnd ? item.endedAt : item.createdTimeE3);
+        result = { list: venue.ended.filter(item => venue.ignoreWindow || stamp(item) >= Number(query.beginTimeE0) * 1000 && stamp(item) <= Number(query.endTimeE0) * 1000), nextCursor: '' };
+      }
+    } else throw new Error(`Unhandled fixture route ${path}`);
+    return new Response(JSON.stringify({ retCode: 0, retMsg: 'OK', result }), { status: 200 });
+  } });
+  f.handlers['bybit:account'] = (...args) => bybit.account(...args);
+  f.handlers['bybit:endedStrategies'] = (...args) => bybit.endedStrategies(...args);
+  const confirm = () => f.service.reconcile(f.job.id, { legId: leg.id, notCreated: true, acknowledge: true });
+  // A zero-fill strategy that ended right after the request blocks the confirmation.
+  venue.ended = [row(1, created + 2000)];
+  await assert.rejects(confirm(), /下单时段前后/);
+  const history = lists.filter(query => query.status === '3');
+  assert.equal(history.length, 1);
+  assert.ok(Number(history[0].beginTimeE0) * 1000 <= created - 300_000 && Number(history[0].endTimeE0) * 1000 >= created + 300_000);
+  assert.ok(Number(history[0].endTimeE0) - Number(history[0].beginTimeE0) <= 7 * 86_400);
+  // The venue does not say which timestamp it filters: one that ended long after
+  // the request is still found when the window applies to the end time.
+  for (const edge = Number(history[0].endTimeE0) * 1000; f.time <= edge + 1000;) { f.advance(20_000); await f.service.tick(); }
+  venue.filterByEnd = true;
+  venue.ended = [{ ...row(1, created + 2000), endedAt: f.time }];
+  await assert.rejects(confirm(), /下单时段前后/);
+  // A venue clock ahead of ours: a strategy it already stamped as ended is still read.
+  venue.ended = [{ ...row(1, created + 2000), endedAt: f.time + 120_000 }];
+  await assert.rejects(confirm(), /下单时段前后/);
+  // Older than one venue window: history is read in segments through now, never truncated.
+  const bybitOrder = () => JSON.parse(f.db.prepare('SELECT json FROM execution_orders WHERE json LIKE ?').get('%"exchange":"bybit"%').json);
+  const setCreatedAt = value => { const order = bybitOrder(); order.createdAt = new Date(value).toISOString(); f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId); };
+  const originalCreatedAt = Date.parse(bybitOrder().createdAt), aged = originalCreatedAt - 8 * 86_400_000;
+  setCreatedAt(aged);
+  lists.length = 0;
+  venue.ended = [{ ...row(1, aged + 2000), endedAt: f.time }];
+  await assert.rejects(confirm(), /下单时段前后/);
+  const segments = lists.filter(query => query.status === '3');
+  assert.equal(segments.length, 2);
+  assert.ok(segments.every(query => Number(query.endTimeE0) - Number(query.beginTimeE0) <= 7 * 86_400));
+  setCreatedAt(originalCreatedAt);
+  venue.filterByEnd = false; venue.ended = [row(1, created + 2000)];
+  // Incomplete pagination proves nothing.
+  venue.endlessPages = true;
+  await assert.rejects(confirm(), /分页结果不完整/);
+  venue.endlessPages = false;
+  // A position that differs from known fills still blocks it.
+  venue.ended = []; venue.shortQuantity = '1';
+  await assert.rejects(confirm(), /仓位或挂单与本任务已知成交不一致/);
+  venue.shortQuantity = '0';
+  assert.equal(f.job.status, 'attention');
+  // Far history (even when the venue ignores the window) and strategies another
+  // Hub job already claimed do not block it.
+  f.db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run('earlier-order', 'earlier-job', JSON.stringify({ exchange: 'bybit', remoteId: id(2) }));
+  venue.ended = [row(2, created + 1000), row(3, created - 3_600_000)]; venue.ignoreWindow = true;
+  await confirm();
+  assert.equal(f.job.status, 'paused'); assert.equal(f.job.canResume, true);
+  assert.equal(f.writer.snapshot().operations.some(item => ['sending', 'unknown'].includes(item.state)), false);
+  // Routine account reads only query the active status buckets.
+  assert.deepEqual([...new Set(lists.filter(query => !query.beginTimeE0).map(query => query.status))].sort(), ['2', '4', '5', '6']);
   assert.equal(f.creates.length, 2);
 });
 

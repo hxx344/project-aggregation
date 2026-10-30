@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createExecutionExchangeClient, ExecutionExchangeError } from './trading-execution-exchanges.mjs';
+import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS } from './trading-markets.mjs';
@@ -18,6 +18,8 @@ const CREATE_ARRIVAL_MARGIN_MS = 60_000, CREATE_OBSERVE_MS = 120_000, ABSENT_CRE
 const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5, MISMATCH_RECHECK_MS = 60_000;
 // Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
 const VENUE_CLOCK_TOLERANCE_MS = 300_000;
+// The client rounds the window out to whole seconds; stay inside its limit after rounding.
+const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
 // Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
 const CONNECT_SYMBOLS = EXECUTION_MARKETS.oil.symbols;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
@@ -150,7 +152,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (order.writerDispatch === 'prepared' || operation.state === 'rejected' || imported.state === 'rejected') {
       accountWriter.resolve(operation.operationId, ticket, 'rejected'); operation.state = 'rejected';
       if (operation.action === 'create') Object.assign(order, { state: 'rejected', settled: true, unknown: false });
-      else { order.unknown = false; order.amendPending = false; if (operation.action === 'cancel') { order.cancelAttempt = (order.cancelAttempt || 0) + 1; order.cancelRequestedAt = null; } }
+      // A recovered cancel keeps its sequence, send count and send time; the
+      // next cancel takes a new sequence and still honours the spacing.
+      else { order.unknown = false; order.amendPending = false; }
     } else if (operation.state === 'confirmed' || order.settled) accountWriter.resolve(operation.operationId, ticket);
     saveOrder(order);
   }
@@ -503,16 +507,29 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // Operator confirmation for a Bybit strategy create without an answer. It is
   // accepted only after the request can no longer arrive, while the symbol has
   // no live strategy, no unclaimed strategy created around the request (venue
-  // clock tolerance included), and the position matches the known fills.
+  // clock tolerance included), including ones that already ended (status 3,
+  // read from a bounded window starting at the request), and the position matches
+  // the known fills.
   async function confirmNotCreated(order) {
     const created = Date.parse(order.createdAt);
     if (!Number.isFinite(created) || now() < createSettledAt(order)) throw new ExecutionError(409, '下单请求仍可能送达交易所，请稍后再确认');
     const { account, matches } = await freshPosition(order);
     if (!Array.isArray(account?.strategies)) throw new ExecutionError(502, '无法读取 Bybit 追逐策略，暂不确认');
+    const window = callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS, ctx = context(order.exchange, order.accountRevision);
+    // Runs through now plus clock skew, in segments: a strategy created near the
+    // request may have ended much later, and truncating the range would miss it.
+    const startTime = created - window, endTime = Math.max(created + window, now() + VENUE_CLOCK_TOLERANCE_MS), ended = [];
+    for (let from = startTime; from < endTime; from += STRATEGY_QUERY_STEP_MS) {
+      const range = { startTime: from, endTime: Math.min(from + STRATEGY_QUERY_STEP_MS, endTime) };
+      const rows = await call(signal => ctx.client.endedStrategies(ctx.credentials, { ...ctx.options, signal, symbol: order.spec.symbol, ...range }));
+      requireLease();
+      if (!Array.isArray(rows)) throw new ExecutionError(502, '无法读取 Bybit 已终结追逐策略，暂不确认');
+      ended.push(...rows);
+    }
     // Strategies any Hub job already claimed are accounted for by that job.
     const claimed = new Set(stmt.prepare("SELECT json_extract(json,'$.remoteId') AS id FROM execution_orders WHERE json_extract(json,'$.exchange')='bybit' AND json_extract(json,'$.remoteId') IS NOT NULL").all().map(row => row.id));
-    const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= callTimeoutMs + VENUE_CLOCK_TOLERANCE_MS; };
-    const candidates = account.strategies.filter(strategy => strategy.symbol === order.spec.symbol && !claimed.has(strategy.id));
+    const nearby = strategy => { const time = Date.parse(strategy.createdAt); return !Number.isFinite(time) || Math.abs(time - created) <= window; };
+    const candidates = [...account.strategies, ...ended].filter(strategy => strategy.symbol === order.spec.symbol && !claimed.has(strategy.id));
     if (candidates.some(strategy => strategy.status !== 'terminal')) throw new ExecutionError(409, 'Bybit 该合约仍有运行中的追逐策略，请填写其策略编号核对');
     if (candidates.some(nearby)) throw new ExecutionError(409, 'Bybit 存在下单时段前后创建的同合约追逐策略，请填写其策略编号核对');
     if (!matches) throw new ExecutionError(409, 'Bybit 当前仓位或挂单与本任务已知成交不一致，不能确认策略未创建');
@@ -523,18 +540,22 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // A cancel that was sent but left the order working is retried a bounded
   // number of times; repeating an exact-ID cancel can only reduce exposure.
   // `sending` survives here only when the process stopped during the request.
-  const cancelSpent = order => (order.cancelAttempt || 0) + 1 >= CANCEL_ATTEMPTS;
+  // `cancelAttempt` only names the shared operation; the budget counts
+  // requests that may have reached the venue (`cancelSent`). Older records
+  // without it assume every past sequence number was sent.
+  const cancelSends = order => order.cancelSent ?? (order.cancelRequestedAt || order.cancelAttempt ? (order.cancelAttempt || 0) + 1 : 0);
+  const cancelSpent = order => cancelSends(order) >= CANCEL_ATTEMPTS;
   const cancelRecent = order => !!order.cancelRequestedAt && now() - Date.parse(order.cancelRequestedAt) < CANCEL_RETRY_MS;
   function retryCancel(order, operation) {
     if (order.settled || !order.remoteId || cancelSpent(order)) return false;
     if (order.writerOperation?.operationId !== operation.operationId || !['sending', 'unknown', 'confirmed'].includes(order.writerOperation.state)) return false;
-    if (!order.cancelRequestedAt || cancelRecent(order)) return false;
+    if (cancelRecent(order)) return false;
     if (accountWriter && order.writerOperation.state !== 'confirmed') {
       const ticket = protectJob(jobFor(order.jobId));
       if (accountWriter.unresolved(ticket).some(item => item.operationId === operation.operationId)) accountWriter.resolve(operation.operationId, ticket, 'rejected');
       order.writerOperation.state = 'rejected';
     }
-    order.cancelAttempt = (order.cancelAttempt || 0) + 1; saveOrder(order);
+    order.cancelSent ??= cancelSends(order); order.cancelAttempt = (order.cancelAttempt || 0) + 1; saveOrder(order);
     return true;
   }
   async function cancelOrder(order) {
@@ -554,7 +575,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     // outcomes, is resent under the same attempt limit and spacing.
     if (order.writerOperation?.action === 'cancel' && order.writerOperation.state === 'rejected' || !accountWriter && order.cancelRequestedAt) {
       if (cancelSpent(order) || cancelRecent(order)) { await inspectOrder(order, undefined, true); return; }
-      order.cancelAttempt = (order.cancelAttempt || 0) + 1;
+      order.cancelSent ??= cancelSends(order); order.cancelAttempt = (order.cancelAttempt || 0) + 1;
     }
     let operation;
     try { operation = prepareWrite(order, 'cancel'); }
@@ -567,12 +588,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       catch { await inspectOrder(order, undefined, true); return; }
       if (operation?.skip) return;
     }
-    order.cancelRequestedAt = iso(now()); order.state = 'canceling'; saveOrder(order);
+    // Count the request before transport so a crash mid-request stays counted;
+    // only a guard refusal (nothing sent) gives the attempt and spacing back.
+    const sentBefore = cancelSends(order), requestedBefore = order.cancelRequestedAt;
+    order.cancelRequestedAt = iso(now()); order.cancelSent = sentBefore + 1; order.state = 'canceling'; saveOrder(order);
     try {
-      await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) accountWriter.assertOwned(operation, callTimeoutMs); } }));
+      await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次撤单未发送'); } } } }));
       finishWrite(operation, 'confirmed', order); saveOrder(order);
     }
     catch (error) {
+      if (error instanceof NotSubmittedError) Object.assign(order, { cancelSent: sentBefore, cancelRequestedAt: requestedBefore });
       finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', order);
       saveOrder(order);
       /* Even a failed or timed-out stop must be reconciled by a fresh query. */
@@ -600,7 +625,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次追价未发送'); }
         if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价停止价，本次追价未发送');
       };
-      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation }));
+      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation, amendSequence: order.amendCount }));
       requireLease();
       const current = orderFor(order.localId), filledQuantity = validateInspection(current, value);
       Object.assign(current, { filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });

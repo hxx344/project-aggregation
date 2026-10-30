@@ -33,7 +33,6 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
   }
   let protocol;
   try { protocol = createOkxProtocol(options); } catch (error) { throw convert(error); }
-  let amendSequence = 0;
   const wrapped = fn => async (...args) => { try { return await fn(...args); } catch (error) { throw convert(error); } };
   function modeOf(value) { const mode = value ?? 'cross'; if (!['cross', 'isolated'].includes(mode)) fail('account_mode'); return mode; }
   function specOf(value, requireId = false) {
@@ -187,13 +186,17 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
   const inspect = wrapped(async (credentials, rawSpec, { accountMode, signal, cancelRecovery = false } = {}) => {
     return readOrder(credentials, specOf(rawSpec), { accountMode: modeOf(accountMode), signal }, { cancelRecovery: cancelRecovery === true });
   });
-  const amend = wrapped(async (credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) => {
+  // `amendSequence` is the caller's persisted per-order intent number: every new
+  // amendment intent takes a new one, so reqId is never reused after a restart
+  // or adapter rebuild, and an ACK for an earlier intent cannot match (L062).
+  const amend = wrapped(async (credentials, rawSpec, { accountMode, signal, beforeMutation, amendSequence } = {}) => {
     const mode = modeOf(accountMode), spec = specOf(rawSpec, true), readOptions = { accountMode: mode, signal };
+    if (!Number.isSafeInteger(amendSequence) || amendSequence < 1) fail('input');
     const current = await readOrder(credentials, spec, readOptions);
     if (current.terminal) return current;
     const quote = await protocol.market(spec.symbol, { signal, refreshRule: true }), price = assertMarket(quote, spec);
     if (current.price === price) return current;
-    const reqId = createHash('sha256').update(spec.nativeClientId + ':' + String(++amendSequence)).digest('hex').slice(0, 32);
+    const reqId = createHash('sha256').update(spec.nativeClientId + ':amend:' + String(amendSequence)).digest('hex').slice(0, 32);
     const rows = await protocol.request('amend', credentials, {
       instId: instrumentId(spec.symbol), ordId: spec.id, clOrdId: spec.nativeClientId, reqId,
       newPx: price, cxlOnFail: false, pxAmendType: '0',
