@@ -347,6 +347,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_LAB_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-entropy-lighter-lab-systemd.sh
 
+  main-watch:
+    name: Main server watch (Ubuntu 24.04 systemd)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare trusted installation paths on the disposable runner
+        run: |
+          for path in /opt /usr/local /usr/local/bin; do
+            test -d "$path" && test ! -L "$path"
+            sudo setfacl --remove-all --remove-default "$path"
+            sudo chown root:root "$path"
+            sudo chmod go-w "$path"
+          done
+      - name: Check watcher logic and installer syntax
+        run: |
+          bash -n deploy/install-main-watch.sh
+          bash -n deploy/test-main-watch-systemd.sh
+          python3 -I tools/main-watch/test_main_watch.py -v
+      - name: Verify real systemd install, alert round, no-op, rollback and uninstall
+        if: ${{ !cancelled() }}
+        run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-main-watch-systemd.sh
+
   options-backtest:
     name: Options backtest engine
     runs-on: ubuntu-24.04
@@ -381,7 +404,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, release-mirror]
+    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, main-watch, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:
