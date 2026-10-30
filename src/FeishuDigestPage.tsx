@@ -111,7 +111,7 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     else setActionError(data.result.error ?? '发送未完成');
   };
   const heading = <header className="lp-heading"><div><h1>飞书汇总</h1><p>由工作台服务器定时发送，不需要打开页面；只读取各模块已有状态，不下单、不改设置</p></div><div className="lp-toolbar">
-    <button className="button secondary" disabled={!!busy} onClick={() => { void read(); if (draft) void loadPreview(draft, true); }}><RefreshCw size={15} className={previewing ? 'spin' : ''} />刷新</button>
+    <button className="button secondary" disabled={!!busy || previewing} onClick={() => { void read(); if (draft) void loadPreview(draft, true); }}><RefreshCw size={15} className={previewing ? 'spin' : ''} />刷新</button>
     <button className="button secondary" disabled={!snapshot?.channel.configured || dirty || !!busy} title={dirty ? '请先保存设置' : !snapshot?.channel.configured ? '请先保存机器人' : undefined} onClick={() => void send()}>{busy === 'send' ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}立即发送</button>
     <button className="button primary" disabled={!dirty || !!busy} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
   </div></header>;
