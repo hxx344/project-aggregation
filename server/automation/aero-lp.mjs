@@ -216,7 +216,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       try {
         const savedWallet = readBounded(walletPath, 16 * 1024);
         address = typeof savedWallet?.address === 'string' ? savedWallet.address : null;
-        walletKnown = true;
+        // A file that exists but holds no address is damaged, not an absent wallet.
+        walletKnown = savedWallet === null || address !== null;
         const saved = readBounded(configPath, 64 * 1024);
         if (saved) {
           config = validateSettings(withPinnedKeys(saved));

@@ -62,9 +62,9 @@ test('LP configuration accepts only the page parameters with their ranges', () =
 });
 
 test('the wallet counts as known only once its file was read, so Asset is never told "no wallet" by mistake', async () => {
-  const empty = fixtureDir(), broken = fixtureDir();
+  const blank = fixtureDir(), broken = fixtureDir();
   try {
-    const fresh = managerWith(empty).manager;
+    const fresh = managerWith(blank).manager;
     assert.equal(fresh.walletKnown(), false);
     await fresh.initialize();
     assert.equal(fresh.walletKnown(), true);
@@ -75,8 +75,15 @@ test('the wallet counts as known only once its file was read, so Asset is never 
     await corrupt.initialize();
     assert.equal(corrupt.state().wallet, null);
     assert.equal(corrupt.walletKnown(), false);
+    await corrupt.setKey(KEY);
+    assert.equal(corrupt.walletKnown(), true, 'saving a key replaces the unreadable file');
     await corrupt.close();
-  } finally { rmSync(empty, { recursive: true, force: true }); rmSync(broken, { recursive: true, force: true }); }
+    writeFileSync(join(broken, 'aero-lp', 'wallet.json'), '{"schema":1}');
+    const empty = managerWith(broken).manager;
+    await empty.initialize();
+    assert.equal(empty.walletKnown(), false, 'a wallet file without an address is damaged too');
+    await empty.close();
+  } finally { rmSync(blank, { recursive: true, force: true }); rmSync(broken, { recursive: true, force: true }); }
 });
 
 test('private key is stored encrypted, handed over IPC only, and never returned', async () => {
