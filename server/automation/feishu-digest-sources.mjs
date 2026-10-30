@@ -59,15 +59,18 @@ export function positionsSection(data) {
         const unrealized = numeric(position.unrealizedPnl), cycle = position.cycle?.status === 'complete' ? numeric(position.cycle.net) : null;
         if (unrealized === null || !position.pnlCurrency) pnlMissing++; else add(pnl, position.pnlCurrency, unrealized);
         if (cycle === null || !position.cycle?.currency) netMissing++; else add(net, position.cycle.currency, cycle);
-        items.push({ size: Math.abs(numeric(position.notional) ?? 0), line: `${exchange.name} ${position.symbol} ${position.side === 'long' ? '多' : '空'} ${amount(position.quantity)}${position.quantityUnit ? ` ${position.quantityUnit}` : ''} · 浮动 ${signed(position.unrealizedPnl)}${position.pnlCurrency ? ` ${position.pnlCurrency}` : ''}` });
+        items.push({ exchange: exchange.name, size: Math.abs(numeric(position.notional) ?? 0), line: `${position.symbol} ${position.side === 'long' ? '多' : '空'} ${amount(position.quantity)}${position.quantityUnit ? ` ${position.quantityUnit}` : ''} · 浮动 ${signed(position.unrealizedPnl)}${position.pnlCurrency ? ` ${position.pnlCurrency}` : ''}` });
       }
     }
   }
   items.sort((a, b) => b.size - a.size);
+  const byExchange = new Map();
+  for (const item of items) byExchange.set(item.exchange, [...(byExchange.get(item.exchange) ?? []), item.line]);
+  const groups = [...byExchange].sort(([a], [b]) => a.localeCompare(b)).map(([exchange, lines]) => ({ title: `${clean(exchange, 60)}（${lines.length} 笔）`, lines }));
   const note = partial ? '（来源不完整）' : '';
   return section(id, name, issues.length ? 'warn' : 'ok', issues.length ? '部分来源异常' : '正常', { asOf: oldest, issues, metrics: [
     metric('count', '持仓笔数', `${items.length}${note}`), metric('pnl', '浮动盈亏', `${perCurrency(pnl, pnlMissing)}${note}`), metric('cycleNet', '本轮净收益', `${perCurrency(net, netMissing)}${note}`),
-    rows('positions', '持仓明细', items.slice(0, ROW_LIMIT).map(item => item.line), items.length)] });
+    { key: 'positions', label: '持仓明细', text: items.length ? `${items.length} 项` : '无', groups }] });
 }
 
 export function fundingSection(state) {

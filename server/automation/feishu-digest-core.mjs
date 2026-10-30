@@ -114,7 +114,8 @@ const plain = content => ({ tag: 'div', text: { tag: 'plain_text', content } });
 const size = card => Buffer.byteLength(JSON.stringify({ msg_type: 'interactive', card }));
 function sectionBlock(section, timezone) {
   const when = section.asOf ? ` · 数据 ${localClock(section.asOf, timezone).label}` : '';
-  const lines = section.metrics.flatMap(metric => metric.lines?.length ? [`${metric.label}：`, ...metric.lines.map(line => `  ${line}`)] : [`${metric.label}：${metric.text}`]);
+  const nested = metric => metric.groups?.length ? metric.groups.flatMap(group => [group.title, ...group.lines.map(line => `  ${line}`)]) : metric.lines?.map(line => `  ${line}`) ?? [];
+  const lines = section.metrics.flatMap(metric => { const rows = nested(metric); return rows.length ? [`${metric.label}：`, ...rows] : [`${metric.label}：${metric.text}`]; });
   return [{ tag: 'hr' }, markdown(`${ICONS[section.level]} **${escapeMarkdown(section.name)}**　${escapeMarkdown(section.status)}${when}`), ...(lines.length ? [plain(lines.join('\n'))] : [])];
 }
 function attentionLines(digest) {

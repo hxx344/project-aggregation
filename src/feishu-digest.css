@@ -44,6 +44,8 @@
 .fd-preview-section dt{color:var(--text-secondary)}
 .fd-preview-section dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .fd-preview-section dd span{display:block}
+.fd-preview-section dd strong{display:block;margin-top:6px;font-weight:600}
+.fd-preview-section dd strong:first-child{margin-top:0}
 .fd-omitted{margin-top:12px;color:var(--warning)}
 @media (max-width:1100px){.fd-layout{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:560px){.fd-grid,.fd-metrics{grid-template-columns:minmax(0,1fr)}}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { BellRing, CircleAlert, KeyRound, LoaderCircle, RefreshCw, Save, Send, Trash2 } from 'lucide-react';
 import { api, ApiError } from './api';
@@ -18,7 +18,7 @@ const timeList = (text: string) => text.split(/[\s,，、]+/).filter(Boolean);
 function PreviewSection({ section }: { section: DigestSection }) {
   return <section className={`fd-preview-section ${section.level}`}>
     <h3><span className="fd-dot" aria-hidden="true" />{section.name}<small>{section.status}{section.asOf ? ` · 数据 ${when(section.asOf)}` : ''}</small></h3>
-    {section.metrics.length ? <dl>{section.metrics.map(metric => <div key={metric.key}><dt>{metric.label}</dt><dd>{metric.lines?.length ? metric.lines.map(line => <span key={line}>{line}</span>) : metric.text}</dd></div>)}</dl> : null}
+    {section.metrics.length ? <dl>{section.metrics.map(metric => <div key={metric.key}><dt>{metric.label}</dt><dd>{metric.groups?.length ? metric.groups.map(group => <Fragment key={group.title}><strong>{group.title}</strong>{group.lines.map((line, index) => <span key={index}>{line}</span>)}</Fragment>) : metric.lines?.length ? metric.lines.map((line, index) => <span key={index}>{line}</span>) : metric.text}</dd></div>)}</dl> : null}
   </section>;
 }
 

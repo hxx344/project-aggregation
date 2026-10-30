@@ -346,7 +346,8 @@ test('position totals stay per currency and say when they are incomplete', () =>
   assert.equal(full.level, 'ok');
   assert.equal(value('pnl').text, '+3.2 USDT / -1 USDC');
   assert.equal(value('cycleNet').text, '-1.5 USDT（1 笔未计入）');
-  assert.match(value('positions').lines[0], /^Binance BZUSDT 空/);
+  assert.deepEqual(value('positions').groups.map(group => group.title), ['Binance（2 笔）']);
+  assert.match(value('positions').groups[0].lines[0], /^BZUSDT 空/);
   const broken = positionsSection(positions([{ label: 'U 本位', status: 'error', fetchedAt: null, error: '接口失败', positions: [position()] }]));
   const quoted = positionsSection(positions([{ label: 'U 本位', status: 'error', fetchedAt: null, error: '请求失败 https://rpc.example/v2/key-123?token=abc 超时', positions: [] }]));
   assert.deepEqual(quoted.issues, ['Binance U 本位：请求失败 [地址已隐藏] 超时']);
@@ -361,8 +362,16 @@ test('position totals stay per currency and say when they are incomplete', () =>
   // A source nobody set up is not a fault; the Asset project section already says so.
   assert.equal(positionsSection({ sources: [{ name: 'Asset', status: 'unconfigured', error: '请保存地址', data: null }] }).level, 'idle');
   const many = positionsSection(positions([{ label: 'U', status: 'live', fetchedAt: null, positions: Array.from({ length: 15 }, (_, index) => position({ symbol: `S${index}` })) }]));
-  assert.equal(many.metrics.at(-1).lines.length, 13);
-  assert.match(many.metrics.at(-1).lines.at(-1), /其余 3 项/);
+  assert.equal(many.metrics.at(-1).text, '15 项');
+  assert.equal(many.metrics.at(-1).groups[0].lines.length, 15);
+  const mixed = positionsSection({ sources: [{ name: 'Asset', error: null, data: { exchanges: [
+    { name: 'Binance', accounts: [{ scopes: [{ label: 'U', status: 'live', fetchedAt: null, positions: [position({ symbol: 'A', notional: '1' }), position({ symbol: 'B', notional: '-9' })] }] }, { scopes: [{ label: 'U', status: 'live', fetchedAt: null, positions: [position({ symbol: 'C', notional: '5' })] }] }] },
+    { name: 'Aster', accounts: [{ scopes: [{ label: 'U', status: 'live', fetchedAt: null, positions: [position({ symbol: 'D' })] }] }] }] } }] }).metrics.at(-1);
+  assert.deepEqual(mixed.groups.map(group => [group.title, group.lines.map(line => line.split(' ')[0])]), [['Aster（1 笔）', ['D']], ['Binance（3 笔）', ['B', 'C', 'A']]]);
+  const config = defaults(), rendered = JSON.stringify(renderCard(buildDigest([{ ...many, metrics: [mixed] }], config, AT_NINE), config).card);
+  assert.match(rendered, /持仓明细：\\nAster（1 笔）\\n  D /);
+  assert.match(rendered, /\\nBinance（3 笔）\\n  B /);
+  assert.equal(positionsSection(positions([{ label: 'U', status: 'live', fetchedAt: null, positions: [] }])).metrics.at(-1).text, '无');
 });
 
 test('funding, execution, Aero and research sections show their own state', () => {
