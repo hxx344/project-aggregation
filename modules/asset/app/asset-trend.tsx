@@ -23,7 +23,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
   const month = annualized.monthlyPeriod;
   const monthlyHint = !month ? '上个自然月没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`
-    : month.returnRate === null ? '首末快照估值须完整，起始调整后资产须大于 0，收益率需为有效数值'
+    : month.returnRate === null ? '首末快照估值须完整，起始调整后资产须大于 0，变化率需为有效数值'
     : `${month.startDate} — ${month.endDate} · ${month.daysSpan} 天`;
   return <section className="panel trend-panel">
     <div className="panel-h"><h2>资产变化</h2><span className="panel-h-right">北京时间 · USD</span></div>
@@ -46,34 +46,35 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
         <Line type="monotoneX" strokeLinecap="round" strokeLinejoin="round" name="实际持有资产" dataKey="held" stroke="var(--chart-2)" strokeWidth={1.5} strokeDasharray="5 4" dot={history.length === 1 ? { r: 3 } : false} isAnimationActive={false}/>
       </LineChart></ResponsiveContainer>
     </div> : <div className="empty-state">刷新资产后生成第一条日快照</div>}
-    {history.length >= 2 && <section className="performance-metrics" aria-label="收益指标">
+    {history.length >= 2 && <section className="performance-metrics" aria-label="资产变化指标">
       <div className="performance-annualized">
         <div className="performance-card">
-          <span className="performance-label">月收益年化 <small>{annualized.referenceMonth}</small></span>
+          <span className="performance-label">上月资产变化年化 <small>{annualized.referenceMonth}</small></span>
           <strong className={performanceTone(annualized.monthlyAnnualized, 100)}>{formatReturnRate(annualized.monthlyAnnualized)}</strong>
           <p>{monthlyHint}</p>
         </div>
         <div className="performance-card">
-          <span className="performance-label">总体年化</span>
+          <span className="performance-label">全期间资产变化年化</span>
           <strong className={performanceTone(annualized.overallAnnualized, 100)}>{formatReturnRate(annualized.overallAnnualized)}</strong>
-          <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；' + (incomplete ? incomplete + '，不计算收益' : '首末快照估值须完整，起始调整后资产须大于 0，收益率需为有效数值')}</p>
+          <p>{first?.date} — {last?.date} · {annualized.daysSpan} 天{annualized.overallAnnualized === null && '；' + (incomplete ? incomplete + '，不计算变化' : '首末快照估值须完整，起始调整后资产须大于 0，变化率需为有效数值')}</p>
         </div>
       </div>
+      <p className="performance-note">仅加回已登记出金，入金未剔除；资产变化不等于投资收益。</p>
       <details className="performance-monthly">
-        <summary>每月表现 <span>（{monthly.length} 个月）</span>与收益口径</summary>
+        <summary>每月表现 <span>（{monthly.length} 个月）</span>与计算口径</summary>
         <div className="performance-monthly-body">
-          <div className="performance-heading"><h3>收益指标</h3><span>全历史 · 单利年化</span></div>
-          <p className="performance-note">基于调整后资产，入金未剔除。上月首末快照间隔至少 {MIN_MONTHLY_SPAN_DAYS} 天才计算月年化；按实际相隔天数及各年 365 / 366 天折算，不计复利。</p>
+          <div className="performance-heading"><h3>资产变化指标</h3><span>全历史 · 单利年化</span></div>
+          <p className="performance-note">基于调整后资产，入金未剔除。上月首末快照间隔至少 {MIN_MONTHLY_SPAN_DAYS} 天才计算上月资产变化年化；按实际相隔天数及各年 365 / 366 天折算，不计复利。</p>
           <div className="performance-table-scroll" role="region" aria-label="每月表现明细，可横向滚动" tabIndex={0}>
             <table className="performance-table">
               <caption>各月按月内首末已有快照计算，不补齐缺失日期。金额单位：USD。</caption>
-              <thead><tr><th scope="col">月份 / 快照区间</th><th scope="col">收益金额</th><th scope="col">收益率</th><th scope="col">期末调整后资产</th></tr></thead>
+              <thead><tr><th scope="col">月份 / 快照区间</th><th scope="col">变化金额</th><th scope="col">变化率</th><th scope="col">期末调整后资产</th></tr></thead>
               <tbody>{monthly.map(period => <tr key={period.month}>
                 <th scope="row">{period.month}{period.month === today.slice(0, 7) && <span className="performance-month-state">进行中</span>}
                   <small>{period.startDate.slice(5)} — {period.endDate.slice(5)} · {period.snapshotCount} 日快照</small>
-                  {period.snapshotCount < 2 && <small>仅一个日期，无法计算收益</small>}
+                  {period.snapshotCount < 2 && <small>仅一个日期，无法计算变化</small>}
                   {period.snapshotCount >= 2 && period.gain === null && <small>首末快照估值不完整或超出计算范围</small>}
-                  {period.snapshotCount >= 2 && period.startValue <= 0 && <small>起始资产不大于 0，收益率不可用</small>}
+                  {period.snapshotCount >= 2 && period.startValue <= 0 && <small>起始资产不大于 0，变化率不可用</small>}
                 </th>
                 <td className={performanceTone(period.gain)}>{period.gain === null ? '—' : '$ ' + formatGain(period.gain)}</td>
                 <td className={performanceTone(period.returnRate, 100)}>{formatReturnRate(period.returnRate)}</td>
@@ -85,6 +86,6 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
       </details>
     </section>}
     {history.length >= 2 && <DailyChanges version={changesVersion}/>}
-    <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。缺失估值的快照仅含已知金额，首末快照估值不完整时不计算收益。连线仅连接已有记录，不代表缺失日期的估值。<button className="text-button" onClick={onHistory}>查看记录</button></p>
+    <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。缺失估值的快照仅含已知金额，首末快照估值不完整时不计算变化。连线仅连接已有记录，不代表缺失日期的估值。<button className="text-button" onClick={onHistory}>查看记录</button></p>
   </section>;
 });

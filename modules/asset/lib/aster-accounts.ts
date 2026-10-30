@@ -8,6 +8,14 @@ export function readAsterAccounts(saved:string|undefined, keys:string[], asset:A
   }]:[];
   return accounts.map(account=>({...account,value:Number.isFinite(account.value)?account.value:null,configured:keys.includes(asterKey(account.id))}));
 }
+export type AsterRefresh={id:string;credential:string;patch:Partial<AsterAccount>};
+/** Apply refreshed results by account identity: removed accounts stay removed and replaced credentials keep the newer state. */
+export function mergeAsterRefresh(current:AsterAccount[],refreshed:readonly AsterRefresh[],credentials:ReadonlyMap<string,string>):AsterAccount[]{
+  return current.map(account=>{
+    const result=refreshed.find(r=>r.id===account.id);
+    return result&&credentials.get(asterKey(account.id))===result.credential?{...account,...result.patch}:account;
+  });
+}
 export function aggregateAster(accounts:AsterAccount[],asset:Asset,now:string):{asset:Asset;connection:Connection}{
   const values=sumKnownValues(accounts),value=values.partial?null:values.total;
   const errors=accounts.filter(a=>a.error||!a.configured||!Number.isFinite(a.value)).map(a=>a.name+'：'+[

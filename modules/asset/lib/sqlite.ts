@@ -17,7 +17,14 @@ class Statement {
     return (this.prepare(this.sql).get(...this.values) as T | undefined) ?? null;
   }
   async all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
-    return { results: this.prepare(this.sql).all(...this.values) as T[] };
+    return { results: this.rows<T>() };
+  }
+  /** Synchronous reads for use inside `transaction`. */
+  get<T = Record<string, unknown>>(): T | null {
+    return (this.prepare(this.sql).get(...this.values) as T | undefined) ?? null;
+  }
+  rows<T = Record<string, unknown>>(): T[] {
+    return this.prepare(this.sql).all(...this.values) as T[];
   }
   execute() {
     const result = this.prepare(this.sql).run(...this.values);
@@ -66,6 +73,16 @@ export function openDatabase(filename: string, migrations = resolve('drizzle')) 
         const results = statements.map(statement => statement.execute());
         connection.exec('COMMIT');
         return results;
+      } catch (error) { connection.exec('ROLLBACK'); throw error; }
+    },
+    /** Check and write in one short transaction. `run` must stay synchronous: no external calls inside. */
+    transaction<T>(run: () => T extends PromiseLike<unknown> ? never : T): T {
+      connection.exec('BEGIN IMMEDIATE');
+      try {
+        const result = run();
+        if (result instanceof Promise) throw new Error('transaction callback must be synchronous');
+        connection.exec('COMMIT');
+        return result;
       } catch (error) { connection.exec('ROLLBACK'); throw error; }
     },
     close: () => { statements.clear(); connection.close(); },

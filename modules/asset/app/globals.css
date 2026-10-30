@@ -297,6 +297,7 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .trend-panel .performance-label{font-size:11px;color:var(--subtle-foreground)}
 .trend-panel .performance-card strong{margin:2px 0;font-size:16px}
 .trend-panel .performance-card p{color:var(--subtle-foreground)}
+.trend-panel .performance-annualized+.performance-note{margin:0;padding:0 14px 10px;color:var(--subtle-foreground)}
 .trend-panel .performance-monthly{margin:0}
 .trend-panel .performance-monthly summary{min-height:38px;padding:9px 14px;font-size:12px;color:var(--muted-foreground)}
 .performance-monthly-body{padding:0 14px 12px}

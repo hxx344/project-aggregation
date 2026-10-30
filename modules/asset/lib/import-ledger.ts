@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { chinaDate, db, getLedger, lock, unlock } from './store';
+import { chinaDate, db, getLedger, withLock } from './store';
 import { seedLedger, type SourceLedger } from './seed';
 import { EXAMPLE_SOURCE, parseSource, isGateProject } from './source-ledger';
 import { snapshotValues, configuredExchanges, quantityValue, withMarketQuantity, UNKNOWN_QUANTITY_ERROR } from './asset-values';
@@ -55,8 +55,7 @@ export async function importLedger(owner: string, input: unknown, apply: boolean
   const source = parseSource(input);
   if (source.source === EXAMPLE_SOURCE) throw new Error('请选择从原表生成的导入文件，不能再次导入示例');
   const fingerprint = createHash('sha256').update(JSON.stringify(source)).digest('hex');
-  await lock(owner);
-  try {
+  return withLock(owner, async lease => {
     const current = await getLedger(owner);
     const priorFingerprint = await db().prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner, 'source-import-hash').first<{ value: string }>();
     if (priorFingerprint?.value === fingerprint) return { ledger: current, alreadyImported: true };
@@ -88,14 +87,15 @@ export async function importLedger(owner: string, input: unknown, apply: boolean
       partial, missingValues,
       updatedAt: new Date().toISOString(), assets: plan.ledger.assets };
     const settings: Record<string, string> = { 'source-ledger': JSON.stringify(source), 'source-import-hash': fingerprint, fx: String(plan.ledger.fx), 'fx-status': JSON.stringify(plan.ledger.fxStatus), 'last-attempt': '0' };
-    await db().batch([
+    const statements = [
       db().prepare('DELETE FROM assets WHERE owner = ?').bind(owner),
       ...plan.ledger.assets.map(asset => db().prepare('INSERT INTO assets(owner,id,data) VALUES(?,?,?)').bind(owner, asset.id, JSON.stringify(asset))),
       ...Object.entries(settings).map(([key, value]) => db().prepare('INSERT INTO settings(owner,key,value) VALUES(?,?,?) ON CONFLICT(owner,key) DO UPDATE SET value=excluded.value').bind(owner, key, value)),
       db().prepare('DELETE FROM snapshots WHERE owner = ?').bind(owner),
       ...archived.map(period => db().prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?)').bind(owner, period.id, JSON.stringify(period))),
       db().prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?)').bind(owner, date, JSON.stringify(today)),
-    ]);
+    ];
+    lease.write(() => { for (const statement of statements) statement.execute(); });
     return { ledger: await getLedger(owner), summary, backupName };
-  } finally { await unlock(owner); }
+  });
 }
