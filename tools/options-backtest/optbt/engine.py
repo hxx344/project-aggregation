@@ -78,7 +78,7 @@ class Position:
     max_loss: Optional[float]
     forward: float
     fallback_fills: int
-    worst: float = math.inf  # worst marked P&L while open (fees included)
+    worst: float = math.inf  # worst marked P&L while open (fees included), from the entry hour on
     marked_hours: int = 0
     missing_hours: int = 0
     extra: dict = field(default_factory=dict)
@@ -265,7 +265,9 @@ def open_position(chain, hour, spec, perp=None, carry=False, state=None):
     fees = sum(leg_fee(spec["fees"], leg, q.forward, leg.price) for leg, q in zip(legs, quotes) if not (carry and leg.is_perp))
     loss = max_loss(legs, credit - fees)
     margin = regular_margin(legs, quotes, spec, forward) if spec["margin"]["mode"] == "regular" or loss is None else loss
-    return Position(hour, legs, credit, fees, margin, loss, forward, fallbacks, extra={"trend": state}), None
+    # Marked at the same hour's marks right after the fills: the spread and entry fees already lost count.
+    entry = credit - fees + sum(leg.sign * leg.value(q.mark) * leg.qty for leg, q in zip(legs, quotes))
+    return Position(hour, legs, credit, fees, margin, loss, forward, fallbacks, worst=entry, extra={"trend": state}), None
 
 
 def close_value(position, quotes, spec):

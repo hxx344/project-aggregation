@@ -210,6 +210,13 @@ class EngineTest(unittest.TestCase):
         perp_fees = sum(t["fees"] for t in with_perp) - sum(t["fees"] for t in calls_only)
         self.assertAlmostEqual(perp_fees, 0.0005 * 40000.0 * 2, places=2)  # held through the roll: one open, one close
         self.assertAlmostEqual(sum(t["pnl"] for t in calls_only) - sum(t["pnl"] for t in with_perp), perp_fees, places=2)
+        spec = specs.validate(raw)
+        for trade, carry in zip(with_perp, (False, True)):  # the entry point counts, also after the held perp's fee refund
+            hour = trade["entry_hour"]
+            position, _ = engine.open_position(market.chain(hour), hour, spec, market.perp(hour), carry=carry)
+            entry = position.credit - position.fees + sum(leg.sign * leg.qty * market.quote(hour, leg.expiry, leg.strike, leg.is_call).mark
+                                                          for leg in position.legs if not leg.is_perp)  # the perp is worth its entry price
+            self.assertLessEqual(trade["worst_open_pnl"], round(entry, 2))
 
     def test_carry_after_early_exit_and_only_one_refund_per_reopen(self):
         perp, call = {"side": "buy", "type": "perp"}, {"side": "sell", "type": "call", "delta": 0.3}
@@ -331,6 +338,33 @@ class EngineTest(unittest.TestCase):
         self.assertEqual([(t["trend"], t["exit_hour"]) for t in flipped], [("above", SUNDAY_08), ("below", NEXT_FRIDAY_08)])
         self.assertRegex(flipped[1]["legs"], r"^-1 \w+-PERP")
         self.assertAlmostEqual(sum(t["fees"] for t in flipped) - sum(t["fees"] for t in held), 2 * 0.0005 * 38000.0, places=2)
+
+    def test_worst_open_pnl_starts_at_the_entry_fills(self):
+        market = FakeMarket(flat(), settlements={SATURDAY_08: 40000.0, SUNDAY_08: 40000.0})
+
+        def marked(position, hour):
+            return position.credit - position.fees + sum(leg.sign * leg.qty * market.quote(hour, leg.expiry, leg.strike, leg.is_call).mark
+                                                         for leg in position.legs)
+
+        put = {"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "expiry": {"weekday": "sun"},
+               "legs": [{"side": "sell", "type": "put", "delta": 0.3}]}
+        for fill in ("mid", "cross", "passive", "mark"):
+            for spec in (condor(fill=fill), specs.validate({**put, "fill": fill})):
+                position, _ = engine.open_position(market.chain(FRIDAY_21), FRIDAY_21, spec)
+                entry = marked(position, FRIDAY_21)
+                self.assertAlmostEqual(position.worst, entry, places=6)
+                trade = engine.run(spec, market)[0][0]
+                later = [marked(position, hour) for hour in range(FRIDAY_21 + 1, SUNDAY_08)]
+                self.assertEqual(trade["worst_open_pnl"], round(min(entry, *later, trade["pnl"]), 2), fill)
+                if fill == "cross":
+                    self.assertLess(entry, min(later))  # here the entry is the worst point: spread and fees just paid
+        # Settled in the hour after entry: no hourly mark, the entry point still counts.
+        spec = specs.validate({**put, "entry": {"weekdays": ["sat"], "hours": [7]}, "start": "2024-01-06", "end": "2024-01-06",
+                               "expiry": {"weekday": "sat"}, "fill": "cross"})
+        position, _ = engine.open_position(market.chain(SATURDAY_08 - 1), SATURDAY_08 - 1, spec)
+        trade = engine.run(spec, market)[0][0]
+        self.assertEqual((trade["exit_hour"], trade["worst_open_pnl"]), (SATURDAY_08, round(marked(position, SATURDAY_08 - 1), 2)))
+        self.assertLess(trade["worst_open_pnl"], trade["pnl"])
 
     def test_never_opens_a_contract_expiring_at_the_decision_hour(self):
         market = FakeMarket(flat(hours=range(FRIDAY_21, NEXT_FRIDAY_08 + 1)), settlements={SUNDAY_08: 40000.0}, expiring=True)
