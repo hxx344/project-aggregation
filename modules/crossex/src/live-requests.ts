@@ -1,3 +1,5 @@
+import { orderIsTerminal } from './live-display';
+
 export type PendingRequest = { version: 1; id: string; kind: 'confirm' | 'cancel'; orderId?: string };
 type RequestStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_.:-]{8,128}$/.test(value);
@@ -46,6 +48,5 @@ export function resolveRequestStatus(pending: PendingRequest, data: unknown): { 
   }
   const order = record(result.order) ? result.order : null;
   const orderId = typeof order?.id === 'string' ? order.id : typeof result.orderId === 'string' ? result.orderId : undefined;
-  const terminal = ['FILLED', 'CANCELLED', 'CANCELED', 'FAIL', 'REJECT', 'REJECTED', 'EXPIRED'];
-  return { resolved: !!order && terminal.includes(String(order.status).toUpperCase()), notSubmitted: false, ...(orderId ? { orderId } : {}) };
+  return { resolved: !!order && orderIsTerminal(String(order.status)), notSubmitted: false, ...(orderId ? { orderId } : {}) };
 }

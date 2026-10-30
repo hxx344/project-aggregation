@@ -14,7 +14,8 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const other = 'b'.repeat(40);
 
 // 模拟 install-all.sh --expect-commit：按“当前正式版”决定是否安装，安装后写部署记录并启动服务。
-// drift：安装过程中正式版变为该文件内容；unbound：安装器在安装时重新读取正式版（错误实现）；broken：服务起不来。
+// drift：安装过程中正式版变为该文件内容；unbound：安装器在安装时重新读取正式版（错误实现）；broken：服务起不来；
+// runtime-down：API 存活而 runtime 失联，安装成功后恢复。
 const installer = [
   "const fs=require('node:fs');",
   "const [flag,expected,record]=process.argv.slice(1);",
@@ -25,7 +26,7 @@ const installer = [
   "if(fs.existsSync('drift'))fs.writeFileSync('latest.txt',fs.readFileSync('drift'));",
   "const installed=fs.existsSync('unbound')?fs.readFileSync('latest.txt','utf8').trim():latest;",
   "fs.writeFileSync(record,installed+' '+'f'.repeat(64)+'\\n');",
-  "if(!fs.existsSync('broken'))fs.writeFileSync('service-up','');",
+  "if(!fs.existsSync('broken')){fs.writeFileSync('service-up','');fs.rmSync('runtime-down',{force:true});}",
 ].join('');
 
 async function fixture(t) {
@@ -44,9 +45,11 @@ async function fixture(t) {
   cpSync(path.join(root, 'deploy/pipeline'), path.join(directory, 'deploy/pipeline'), { recursive: true });
 
   const health = { hits: 0 };
+  // 探测路径取自生产配置：/api/health 不经过 runtime，只有 /api/ready 能发现 runtime 失联。
+  const probe = loadProfile(root, 'prod').stages.activate.healthUrl.replace(/^http:\/\/[^/]+/, '');
   const server = http.createServer((req, res) => {
     health.hits += 1;
-    const up = existsSync(path.join(directory, 'service-up'));
+    const up = existsSync(path.join(directory, 'service-up')) && (req.url !== '/api/ready' || !existsSync(path.join(directory, 'runtime-down')));
     res.writeHead(up ? 200 : 503, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ status: up ? 'ok' : 'unavailable' }));
   });
@@ -60,7 +63,7 @@ async function fixture(t) {
       requiresApply: true,
       commands: [{ cmd: process.execPath, args: ['-e', installer, '--', '--expect-commit', '{commit}', record], timeoutMs: 10000 }],
       targetMismatchExitCode: 75,
-      healthUrl: `http://127.0.0.1:${server.address().port}/api/health`, healthAttempts: 2, healthIntervalMs: 20,
+      healthUrl: `http://127.0.0.1:${server.address().port}${probe}`, healthAttempts: 2, healthIntervalMs: 20,
       deployedRecord: record,
     } },
   }));
@@ -202,6 +205,19 @@ test('latest 在安装中途变化：按已解析的 A 安装则成功；实际�
   assert.equal(g.activate().status, 'failed');
   assert.match(g.activate().reason, /不是本轮提交/);
   assert.equal(g.state().stages.activate.status, 'failed');
+});
+
+test('API 存活但 runtime 失联时缓存不算成功，回落到幂等安装器恢复', async t => {
+  const f = await fixture(t);
+  f.write('latest.txt', f.commit);
+  assert.equal((await f.run()).status, 0);
+  assert.equal(f.calls().length, 1);
+
+  f.write('runtime-down');
+  const recovered = await f.run();
+  assert.equal(recovered.status, 0, recovered.output);
+  assert.equal(f.activate().status, 'ok', recovered.output);
+  assert.equal(f.calls().length, 2);
 });
 
 test('激活配置必须绑定 {commit} 与部署记录；生产配置与安装器的退出码约定一致', () => {

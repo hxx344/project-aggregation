@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { registerHooks } from 'node:module';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -8,9 +9,14 @@ import * as loading from '../src/live-loading.ts';
 import * as freshness from '../src/freshness.ts';
 import * as display from '../src/display.ts';
 import * as liveDisplay from '../src/live-display.ts';
-import * as liveRequests from '../src/live-requests.ts';
 import * as positionActions from '../src/position-actions.ts';
 import * as hubNavigation from '../../../server/hub-navigation.mjs';
+
+const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
+  return nextResolve(context.parentURL?.endsWith('/src/live-requests.ts') && specifier === './live-display' ? `${specifier}.ts` : specifier, context);
+} });
+const liveRequests = await import('../src/live-requests.ts');
+sourceResolution.deregister();
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
