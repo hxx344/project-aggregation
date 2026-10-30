@@ -137,7 +137,7 @@ export default function App() {
     if (!pendingRequest || !state || busy) return;
     const execution = pendingRequest.kind === 'confirm' ? state.live.executions.find(item => item.requestId === pendingRequest.id || item.id === pendingRequest.id) : null;
     const order = pendingRequest.kind === 'cancel' && pendingRequest.orderId ? state.live.orders.find(item => item.id === pendingRequest.orderId || item.orderId === pendingRequest.orderId) : null;
-    if (execution && !stateIsUncertain(execution.state) || order && ['FILLED', 'CANCELLED', 'CANCELED', 'FAIL', 'REJECT', 'REJECTED', 'EXPIRED'].includes(order.status.toUpperCase())) {
+    if (execution && !stateIsUncertain(execution.state) || order && orderIsTerminal(order.status)) {
       rememberPending(null); setError(''); setNotice('已查询到先前操作的结果，请核对订单与逐腿持仓。');
     }
   }, [pendingRequest, state, busy, rememberPending]);

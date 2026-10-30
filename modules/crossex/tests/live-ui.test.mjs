@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
-import { exact, formatDecimal, formatSigned, signedAmount, netBaseQuantity, positiveQuantity, stateIsUncertain, sideLabel, liquidationPrice } from '../src/live-display.ts';
-import { readPendingRequest, writePendingRequest, requestStorageKey, readRequestStatus, resolveRequestStatus } from '../src/live-requests.ts';
+import { exact, formatDecimal, formatSigned, signedAmount, netBaseQuantity, positiveQuantity, stateIsUncertain, sideLabel, liquidationPrice, visibleOrders, CLOSED_ORDER_DISPLAY_LIMIT } from '../src/live-display.ts';
 const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
-  return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && ['./live-display', './position-actions'].includes(specifier) ? `${specifier}.ts` : specifier, context);
+  return nextResolve(/\/src\/(position-view|live-requests)\.ts$/.test(context.parentURL ?? '') && ['./live-display', './position-actions'].includes(specifier) ? `${specifier}.ts` : specifier, context);
 } });
 const { fractionQuantity, groupPositions, instrumentFees, sumNative, weightedPrice, percentage } = await import('../src/position-view.ts');
+const { readPendingRequest, writePendingRequest, requestStorageKey, readRequestStatus, resolveRequestStatus } = await import('../src/live-requests.ts');
 sourceResolution.deregister();
 
 test('exchange decimal amounts retain digits beyond JavaScript numeric precision', () => {
@@ -138,6 +138,15 @@ test('cancel recovery retains the tracked order identity until a real terminal o
   assert.equal(resolveRequestStatus(cancel, response('OPEN')).resolved, false);
   assert.equal(resolveRequestStatus(cancel, response('CANCELLED')).resolved, true);
   assert.equal(resolveRequestStatus(cancel, response('FILLED')).resolved, true);
+  assert.equal(resolveRequestStatus(cancel, response('UNSENT')).resolved, true);
+});
+
+test('UNSENT orders are finished history: capped with closed orders and never counted as active', () => {
+  const orders = Array.from({ length: CLOSED_ORDER_DISPLAY_LIMIT + 1 }, () => ({ status: 'UNSENT' }));
+  assert.deepEqual(visibleOrders(orders, false), { orders: [], hiddenClosed: 0 });
+  const history = visibleOrders(orders, true);
+  assert.equal(history.orders.length, CLOSED_ORDER_DISPLAY_LIMIT);
+  assert.equal(history.hiddenClosed, 1);
 });
 
 test('failed status reads cannot treat missing or unreachable service responses as no submission', async () => {
