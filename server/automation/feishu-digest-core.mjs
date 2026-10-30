@@ -107,16 +107,35 @@ const TEMPLATES = { ok: 'green', warn: 'orange', alert: 'red' };
 const ATTENTION_LINES = 20;
 // The webhook refuses bodies over 20 KB; the margin covers the signature fields.
 const CARD_BYTES = 19 * 1024;
+// Feishu limits: at most 5 tables in a card, at most 10 rows per page; longer tables page in the client.
+const TABLE_LIMIT = 5;
+const TABLE_PAGE_ROWS = 10;
 // Names come from project settings, so markdown and `<at>` markup must not act.
 const escapeMarkdown = text => text.replace(/[&\\`*_[\]()<>#]/g, char => `&#${char.codePointAt(0)};`).replace(/~/g, '&sim;');
 const markdown = content => ({ tag: 'div', text: { tag: 'lark_md', content } });
 const plain = content => ({ tag: 'div', text: { tag: 'plain_text', content } });
 const size = card => Buffer.byteLength(JSON.stringify({ msg_type: 'interactive', card }));
-function sectionBlock(section, timezone) {
+const table = ({ columns, rows }) => ({ tag: 'table', page_size: TABLE_PAGE_ROWS, row_height: 'low', freeze_first_column: false,
+  header_style: { text_align: 'left', text_size: 'normal', background_style: 'grey', text_color: 'default', bold: true, lines: 1 },
+  columns: columns.map(({ key, label, align = 'left' }) => ({ name: key, display_name: label, data_type: 'text', width: 'auto', horizontal_align: align })), rows });
+function sectionBlock(section, timezone, tables) {
   const when = section.asOf ? ` · 数据 ${localClock(section.asOf, timezone).label}` : '';
-  const nested = metric => metric.groups?.length ? metric.groups.flatMap(group => [group.title, ...group.lines.map(line => `  ${line}`)]) : metric.lines?.map(line => `  ${line}`) ?? [];
-  const lines = section.metrics.flatMap(metric => { const rows = nested(metric); return rows.length ? [`${metric.label}：`, ...rows] : [`${metric.label}：${metric.text}`]; });
-  return [{ tag: 'hr' }, markdown(`${ICONS[section.level]} **${escapeMarkdown(section.name)}**　${escapeMarkdown(section.status)}${when}`), ...(lines.length ? [plain(lines.join('\n'))] : [])];
+  const body = [];
+  let lines = [];
+  const flush = () => { if (lines.length) body.push(plain(lines.join('\n'))); lines = []; };
+  for (const metric of section.metrics) {
+    if (metric.groups?.length) {
+      lines.push(`${metric.label}：`);
+      for (const group of metric.groups) {
+        // Past the table limit a group stays readable as text rather than being dropped.
+        if (tables.left > 0) { tables.left--; flush(); body.push(markdown(`**${escapeMarkdown(group.title)}**`), table(group)); }
+        else lines.push(group.title, ...group.rows.map(row => `  ${group.columns.map(column => row[column.key]).join(' · ')}`));
+      }
+    } else if (metric.lines?.length) lines.push(`${metric.label}：`, ...metric.lines.map(line => `  ${line}`));
+    else lines.push(`${metric.label}：${metric.text}`);
+  }
+  flush();
+  return [{ tag: 'hr' }, markdown(`${ICONS[section.level]} **${escapeMarkdown(section.name)}**　${escapeMarkdown(section.status)}${when}`), ...body];
 }
 function attentionLines(digest) {
   const lines = digest.attention.flatMap(item => (item.issues.length ? item.issues : [item.status]).map(issue => `· ${item.name}：${issue}`));
@@ -126,7 +145,8 @@ export function renderCard(digest, { showIssues, schedule: plan }) {
   const count = digest.attention.length;
   const summary = [markdown(count ? `${ICONS[digest.level]} **${count} 个模块需要关注**` : `${ICONS.ok} **没有需要处理的问题**　共 ${digest.sections.length} 个模块`),
     ...(count && showIssues ? [plain(attentionLines(digest).join('\n'))] : [])];
-  const blocks = digest.sections.map(section => sectionBlock(section, plan.timezone));
+  const tables = { left: TABLE_LIMIT };
+  const blocks = digest.sections.map(section => sectionBlock(section, plan.timezone, tables));
   const compose = kept => {
     const omitted = blocks.length - kept;
     return { config: { wide_screen_mode: true }, header: { template: TEMPLATES[digest.level], title: { tag: 'plain_text', content: `${digest.title} ${digest.clock}` } },

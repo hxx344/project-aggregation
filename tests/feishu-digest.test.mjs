@@ -347,7 +347,7 @@ test('position totals stay per currency and say when they are incomplete', () =>
   assert.equal(value('pnl').text, '+3.2 USDT / -1 USDC');
   assert.equal(value('cycleNet').text, '-1.5 USDT（1 笔未计入）');
   assert.deepEqual(value('positions').groups.map(group => group.title), ['Binance（2 笔）']);
-  assert.match(value('positions').groups[0].lines[0], /^BZUSDT 空/);
+  assert.deepEqual(value('positions').groups[0].rows[0], { symbol: 'BZUSDT', side: '空', quantity: '10 桶', pnl: '-1 USDC' });
   const broken = positionsSection(positions([{ label: 'U 本位', status: 'error', fetchedAt: null, error: '接口失败', positions: [position()] }]));
   const quoted = positionsSection(positions([{ label: 'U 本位', status: 'error', fetchedAt: null, error: '请求失败 https://rpc.example/v2/key-123?token=abc 超时', positions: [] }]));
   assert.deepEqual(quoted.issues, ['Binance U 本位：请求失败 [地址已隐藏] 超时']);
@@ -363,14 +363,24 @@ test('position totals stay per currency and say when they are incomplete', () =>
   assert.equal(positionsSection({ sources: [{ name: 'Asset', status: 'unconfigured', error: '请保存地址', data: null }] }).level, 'idle');
   const many = positionsSection(positions([{ label: 'U', status: 'live', fetchedAt: null, positions: Array.from({ length: 15 }, (_, index) => position({ symbol: `S${index}` })) }]));
   assert.equal(many.metrics.at(-1).text, '15 项');
-  assert.equal(many.metrics.at(-1).groups[0].lines.length, 15);
+  assert.equal(many.metrics.at(-1).groups[0].rows.length, 15);
   const mixed = positionsSection({ sources: [{ name: 'Asset', error: null, data: { exchanges: [
     { name: 'Binance', accounts: [{ scopes: [{ label: 'U', status: 'live', fetchedAt: null, positions: [position({ symbol: 'A', notional: '1' }), position({ symbol: 'B', notional: '-9' })] }] }, { scopes: [{ label: 'U', status: 'live', fetchedAt: null, positions: [position({ symbol: 'C', notional: '5' })] }] }] },
     { name: 'Aster', accounts: [{ scopes: [{ label: 'U', status: 'live', fetchedAt: null, positions: [position({ symbol: 'D' })] }] }] }] } }] }).metrics.at(-1);
-  assert.deepEqual(mixed.groups.map(group => [group.title, group.lines.map(line => line.split(' ')[0])]), [['Aster（1 笔）', ['D']], ['Binance（3 笔）', ['B', 'C', 'A']]]);
-  const config = defaults(), rendered = JSON.stringify(renderCard(buildDigest([{ ...many, metrics: [mixed] }], config, AT_NINE), config).card);
-  assert.match(rendered, /持仓明细：\\nAster（1 笔）\\n  D /);
-  assert.match(rendered, /\\nBinance（3 笔）\\n  B /);
+  assert.deepEqual(mixed.groups.map(group => [group.title, group.rows.map(row => row.symbol)]), [['Aster（1 笔）', ['D']], ['Binance（3 笔）', ['B', 'C', 'A']]]);
+  const config = defaults(), { elements } = renderCard(buildDigest([{ ...many, metrics: [mixed] }], config, AT_NINE), config).card;
+  const tables = elements.filter(element => element.tag === 'table');
+  assert.deepEqual(tables.map(element => element.rows.map(row => row.symbol)), [['D'], ['B', 'C', 'A']]);
+  assert.deepEqual(tables[0].columns.map(column => [column.name, column.display_name, column.data_type]), [['symbol', '合约', 'text'], ['side', '方向', 'text'], ['quantity', '数量', 'text'], ['pnl', '浮动盈亏', 'text']]);
+  assert.ok(tables.every(element => element.page_size <= 10));
+  assert.equal(elements[elements.indexOf(tables[0]) - 1].text.content, '**Aster（1 笔）**', 'each table sits under its exchange');
+  const sixth = { key: 'positions', label: '持仓明细', text: '6 项', groups: ['A', 'B', 'C', 'D', 'E', 'F'].map(name => ({ title: `${name}（16 笔）`, columns: mixed.groups[0].columns, rows: Array.from({ length: 16 }, () => ({ symbol: `${name}USDT`, side: '多', quantity: '1', pnl: '+1' })) })) };
+  const overflow = renderCard(buildDigest([{ ...many, metrics: [sixth] }], config, AT_NINE), config).card.elements;
+  const shown = overflow.filter(element => element.tag === 'table');
+  assert.equal(shown.length, 5, 'Feishu refuses a sixth table');
+  assert.equal(shown.at(-1).rows.length, 16, 'long tables page instead of losing rows');
+  assert.equal(overflow.at(-3).text.tag, 'plain_text');
+  assert.match(overflow.at(-3).text.content, /^F（16 笔）\n  FUSDT · 多 · 1 · \+1\n/);
   assert.equal(positionsSection(positions([{ label: 'U', status: 'live', fetchedAt: null, positions: [] }])).metrics.at(-1).text, '无');
 });
 
