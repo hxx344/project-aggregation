@@ -11,6 +11,30 @@ const sequence = (value) => {
   if (!/^[1-9]\d*$/.test(String(value))) return null;
   return String(value);
 };
+// Contract rules shared by every paper path (two-leg paper, delayed study and
+// this scalper). Each assumed order is checked again with the metadata current
+// at its delayed fill, never only with the snapshot from the signal.
+export function tradableMarket(market) {
+  return Boolean(market) && market.status === 'active' && Number.isInteger(market.sizeDecimals)
+    && market.sizeDecimals >= 0 && market.sizeDecimals <= 10 && Number(market.multiplier) === 1
+    && finite(Number(market.minBaseAmount)) && Number(market.minBaseAmount) >= 0 && Number(market.minBaseAmount) <= 1e10
+    && positive(Number(market.minQuoteAmount));
+}
+export const orderRuleSnapshot = (market) => ({ nativeSymbol: market.nativeSymbol, quote: market.quote, sizeDecimals: market.sizeDecimals,
+  multiplier: market.multiplier, minBaseAmount: market.minBaseAmount, minQuoteAmount: market.minQuoteAmount });
+// `signal` is the rule snapshot frozen when the order was assumed sent; a
+// changed contract identity or size step fails closed, and the stricter of the
+// signal-time and fill-time minimums applies.
+export function orderRuleFailure(market, quantity, cash, signal = null) {
+  if (!tradableMarket(market)) return 'metadata_unavailable';
+  if (signal && (market.nativeSymbol !== signal.nativeSymbol || market.quote !== signal.quote
+    || market.sizeDecimals !== signal.sizeDecimals || Number(market.multiplier) !== Number(signal.multiplier))) return 'metadata_changed';
+  const units = quantity * 10 ** market.sizeDecimals;
+  if (!positive(quantity) || Math.abs(units - Math.round(units)) > 1e-9 * Math.max(1, units)) return 'quantity_precision';
+  if (quantity < Math.max(Number(market.minBaseAmount), Number(signal?.minBaseAmount ?? 0))
+    || !positive(cash) || cash < Math.max(Number(market.minQuoteAmount), Number(signal?.minQuoteAmount ?? 0))) return 'minimum_order_size';
+  return null;
+}
 const summary = () => ({ signals: 0, completed: 0, failedEntries: 0, unresolved: 0, lossesBeforeRebate: 0,
   turnover: 0, fees: 0, costReserve: 0, settledGrossPnl: 0, settledNetBeforeRebate: 0, minNetBeforeRebate: null });
 
@@ -70,10 +94,9 @@ export class BinanceScalper {
     const book = this.dependencies.fresh('entropy', symbol, now, wall);
     if (!this.validBook(book, 'entropy', symbol, now, wall)) return { book: null, market: null, reason: 'entropy_unavailable' };
     const market = this.dependencies.market('entropy', symbol);
-    if (!market || market.status !== 'active' || market.nativeSymbol !== book.nativeSymbol || market.quote !== book.quote
-      || !Number.isInteger(market.sizeDecimals) || market.sizeDecimals < 0 || market.sizeDecimals > 10
-      || Number(market.multiplier) !== 1 || !finite(Number(market.minBaseAmount)) || Number(market.minBaseAmount) < 0
-      || !positive(Number(market.minQuoteAmount))) return { book: null, market, reason: 'entropy_metadata_unavailable' };
+    if (!tradableMarket(market) || market.nativeSymbol !== book.nativeSymbol || market.quote !== book.quote) {
+      return { book: null, market, reason: 'entropy_metadata_unavailable' };
+    }
     return { book, market, reason: null };
   }
 
@@ -180,17 +203,12 @@ export class BinanceScalper {
     if (!incoming || !entropy.book || incoming.venue !== 'entropy' || incoming.symbol !== task.symbol
       || incoming.receivedMono < due || incoming.receivedMono <= sent || now < due
       || incoming.receivedMono !== entropy.book.receivedMono || incoming.sourceAt !== entropy.book.sourceAt) return;
-    if (entropy.market.nativeSymbol !== task.market.nativeSymbol || entropy.market.quote !== task.market.quote
-      || entropy.market.sizeDecimals !== task.market.sizeDecimals || Number(entropy.market.multiplier) !== Number(task.market.multiplier)) {
-      task.lastFillFailure = 'entropy_metadata_changed'; return;
-    }
     const side = (task.direction === 'long') === entering ? 'buy' : 'sell';
     const swept = this.dependencies.sweep(incoming, side, task.quantity, task.costConfig.slippageBpsPerFill);
+    const rule = orderRuleFailure(entropy.market, task.quantity, swept?.cash, task.market);
+    if (rule === 'metadata_changed') { task.lastFillFailure = 'entropy_metadata_changed'; return; }
     if (!swept || !positive(swept.cash) || !positive(swept.price)) { task.lastFillFailure = 'insufficient_depth'; return; }
-    if (task.quantity < Math.max(Number(task.market.minBaseAmount), Number(entropy.market.minBaseAmount))
-      || swept.cash < Math.max(Number(task.market.minQuoteAmount), Number(entropy.market.minQuoteAmount))) {
-      task.lastFillFailure = 'minimum_order_size'; return;
-    }
+    if (rule) { task.lastFillFailure = rule; return; }
     const fill = { ...swept, venue: 'entropy', at: wall, mono: now, sourceAt: incoming.sourceAt,
       receivedMono: incoming.receivedMono, fee: swept.cash * task.feeSnapshot.takerBps / 10000 };
     state.stats.fees += fill.fee; state.stats.turnover += fill.cash;

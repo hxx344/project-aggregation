@@ -4,6 +4,8 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Lab, Recorder, sweep, validateBook, validateConfig, studyEvaluation } from '../tools/entropy-lighter-lab/core.mjs';
+import { orderRuleFailure } from '../tools/entropy-lighter-lab/binance-scalper.mjs';
+import { createFeedDecoder, parseMetadata } from '../tools/entropy-lighter-lab/feeds.mjs';
 
 const template = JSON.parse(readFileSync(new URL('../tools/entropy-lighter-lab/config.example.json', import.meta.url), 'utf8'));
 const wall = 1793000000000;
@@ -139,7 +141,7 @@ test('missing second leg is counted and the filled leg incurs emergency close co
   assert.equal(result.failed, true);
   assert.ok(result.netBeforeRebate < 0);
   assert.equal(result.turnover.lighter, 0);
-  assert.equal(l.report().paper.test.failedLegs, 1);
+  assert.equal(l.report().paper.test.failedLegs, 1); assert.equal(l.report().paper.test.completed, 0);
 });
 
 test('missing exit is unknown and blocks new paper exposure rather than inventing zero loss', () => {
@@ -271,4 +273,85 @@ test('historical uncertain source times cannot create qualified sample counts or
   assert.equal(metric.completed, 32); assert.equal(metric.uncertainSourceSamples, 31);
   assert.equal(metric.costed, 1); assert.equal(metric.passedAfterCosts, 1); assert.equal(metric.qualitySpanMs, 0);
   assert.ok(metric.spanMs >= 300000, 'the full observation span must not substitute for qualified evidence');
+});
+
+// Real venue metadata and frames through the production decoder, not hand-built books.
+function metadata({ entropy = {}, lighter = {} } = {}) {
+  return [...parseMetadata('entropy', [{ collateralToken: 0, universe: [{ name: 'io:ANTH', szDecimals: 3 }, { name: 'io:SNDK', szDecimals: 4, ...entropy }] }, []]),
+    ...parseMetadata('lighter', { order_book_details: [
+      { symbol: 'ANTHROPIC', market_id: 193, market_type: 'perp', status: 'active', multiplier: '1', size_decimals: 5, min_base_amount: '0.00001', min_quote_amount: '10' },
+      { symbol: 'SNDK', market_id: 139, market_type: 'perp', status: 'active', multiplier: '1', size_decimals: 4, min_base_amount: '0.0001', min_quote_amount: '10', ...lighter }] })];
+}
+function decoderLab() {
+  const c = config(); c.simulation.notionalPerLeg = 12;
+  const events = [], diagnostics = [], l = new Lab(c, (e) => events.push(structuredClone(e)));
+  const markets = metadata(); l.setMarkets(markets, 0, wall);
+  const decoder = createFeedDecoder({ markets, onBook: (b) => l.book(b), onDiagnostic: (d) => diagnostics.push(d) });
+  const clocks = (ms) => ({ receivedAt: wall + ms, receivedMono: ms });
+  let nonce = 100, levels = null;
+  const entropy = (ms, bid, ask) => decoder.handle('entropy', { channel: 'l2Book', data: { coin: 'io:SNDK', time: wall + ms,
+    levels: [[{ px: String(bid), sz: '100' }], [{ px: String(ask), sz: '100' }]] } }, clocks(ms));
+  const lighter = (ms, bid, ask) => {
+    const side = (old, price) => [...(old && old !== price ? [{ price: String(old), size: '0' }] : []), { price: String(price), size: '100' }];
+    decoder.handle('lighter', { channel: 'order_book:139', type: levels ? 'update/order_book' : 'subscribed/order_book', offset: ms,
+      order_book: { nonce: nonce + 1, begin_nonce: levels ? nonce : 0, last_updated_at: (wall + ms) * 1000,
+        bids: side(levels?.bid, bid), asks: side(levels?.ask, ask) } }, clocks(ms));
+    nonce++; levels = { bid, ask };
+  };
+  return { l, events, diagnostics, entropy, lighter };
+}
+const delayed = (l) => l.report().opportunityStudy.bySymbol.SNDK.latency['test:entropy:lighter'];
+
+test('a delayed entry below the minimum notional is rejected, never a completed profitable roundtrip', () => {
+  const { l, events, diagnostics, entropy, lighter } = decoderLab();
+  entropy(0, 99, 100); lighter(0, 110, 111);
+  assert.equal(l.tasks.size, 1); assert.equal([...l.tasks.values()][0].quantity, 0.1085);
+  entropy(201, 79, 80); // 0.1085 x 80 = 8.68 USDC < 10 USDC at arrival
+  lighter(451, 110, 111); l.advance(551, wall + 551);
+  entropy(752, 105, 106); lighter(1002, 104, 105);
+  assert.deepEqual(diagnostics, []);
+  assert.equal(events.some((e) => e.type === 'paper_fill' && e.venue === 'entropy'), false);
+  assert.deepEqual(events.filter((e) => e.type === 'paper_rejected').map((e) => [e.venue, e.phase, e.reason]), [['entropy', 'entry', 'minimum_order_size']]);
+  const result = events.find((e) => e.type === 'paper_result');
+  assert.equal(result.failed, true); assert.equal(result.legs.find((leg) => leg.venue === 'entropy').entry, null);
+  const paper = l.report().paper.test;
+  assert.equal(paper.completed, 0); assert.equal(paper.failedLegs, 1);
+  assert.equal(delayed(l).failureReasons.minimum_order_size, 1); assert.equal(delayed(l).completed, 0);
+});
+
+test('a threshold raised after one leg filled rejects the other leg and keeps the unclosable exposure unresolved', () => {
+  const { l, events, entropy, lighter } = decoderLab();
+  entropy(0, 99, 100); lighter(0, 110, 111);
+  entropy(201, 99, 100); // legal Entropy entry: 10.85 USDC
+  l.setMarkets(metadata({ lighter: { min_quote_amount: '50' } }), 300, wall + 300);
+  lighter(451, 110, 111); // 11.935 USDC < raised 50 USDC minimum
+  entropy(652, 80, 81); // exit 8.68 USDC < 10 USDC cannot legally close
+  l.advance(852, wall + 852);
+  assert.deepEqual(events.filter((e) => e.type === 'paper_rejected').map((e) => [e.venue, e.reason]), [['lighter', 'minimum_order_size']]);
+  const unresolved = events.find((e) => e.type === 'paper_unresolved');
+  assert.equal(unresolved.venue, 'entropy'); assert.equal(unresolved.lastFillFailure, 'minimum_order_size'); assert.equal(unresolved.entry.cash, 10.85);
+  const result = events.find((e) => e.type === 'paper_result');
+  assert.equal(result.unresolved, true); assert.equal(result.netBeforeRebate, null);
+  assert.equal(result.legs.find((leg) => leg.venue === 'entropy').exit, null);
+  const paper = l.report().paper.test;
+  assert.deepEqual([paper.completed, paper.unresolved, paper.failedLegs, paper.netBeforeRebate], [0, 1, 1, null]);
+  entropy(20000, 99, 100); lighter(20000, 110, 111);
+  assert.equal(l.tasks.size, 0, 'the retained exposure keeps new paper entries blocked');
+});
+
+test('a changed size step or contract identity at arrival rejects delayed paper and study fills', () => {
+  const { l, events, entropy, lighter } = decoderLab();
+  entropy(0, 99, 100); lighter(0, 110, 111);
+  l.setMarkets(metadata({ entropy: { szDecimals: 2 } }), 100, wall + 100);
+  entropy(201, 99, 100); lighter(451, 110, 111); lighter(1002, 110, 111);
+  assert.deepEqual(events.filter((e) => e.type === 'paper_rejected').map((e) => [e.venue, e.reason]), [['entropy', 'metadata_changed']]);
+  assert.equal(events.find((e) => e.type === 'paper_result').failed, true);
+  assert.equal(l.report().paper.test.completed, 0);
+  assert.equal(delayed(l).failureReasons.metadata_changed, 1);
+  const market = { status: 'active', nativeSymbol: 'SNDK', quote: 'USDC', sizeDecimals: 2, multiplier: 1, minBaseAmount: 0.01, minQuoteAmount: 10 };
+  assert.equal(orderRuleFailure(market, 0.1085, 20), 'quantity_precision');
+  assert.equal(orderRuleFailure(market, 0.11, 20), null);
+  assert.equal(orderRuleFailure(market, 0.11, 20, { ...market, quote: 'USDT' }), 'metadata_changed');
+  assert.equal(orderRuleFailure(market, 0.11, 20, { ...market, minQuoteAmount: 30 }), 'minimum_order_size');
+  assert.equal(orderRuleFailure({ ...market, status: 'delisted' }, 0.11, 20), 'metadata_unavailable');
 });

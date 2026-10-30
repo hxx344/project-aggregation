@@ -2,7 +2,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { BinanceScalper } from './binance-scalper.mjs';
+import { BinanceScalper, orderRuleFailure, orderRuleSnapshot, tradableMarket } from './binance-scalper.mjs';
 
 export const SYMBOLS = ['SNDK', 'ANTH'];
 export const REBATE_RATIOS = Object.freeze([0, 1.1, 1.2]);
@@ -316,12 +316,13 @@ export class Lab {
     if (!finite(s.entropyTakerFeeBps) || !finite(s.lighterTakerFeeBps)) { this.reject('automatic_fees_unavailable'); return; }
     if (sourceTimeErrors.some((e) => e.error)) { this.reject('paper_source_time_unverified'); return; }
     const ma = this.markets.get(pairKey('entropy', symbol)), mb = this.markets.get(pairKey('lighter', symbol));
-    if (!ma || !mb || ma.status !== 'active' || mb.status !== 'active' || [ma, mb].some((m) => !Number.isInteger(m.sizeDecimals) || !bounded(m.sizeDecimals, 0, 10) || Number(m.multiplier) !== 1 || !bounded(Number(m.minBaseAmount), 0, 1e10) || !positive(Number(m.minQuoteAmount)))) { this.reject('metadata_unavailable'); return; }
+    if (!tradableMarket(ma) || !tradableMarket(mb)) { this.reject('metadata_unavailable'); return; }
     const decimals = Math.min(ma.sizeDecimals, mb.sizeDecimals);
     const quantity = Math.floor(s.notionalPerLeg / Math.max(mid(a), mid(b)) * 10 ** decimals) / 10 ** decimals;
     const buy = sweep(d.buy, 'buy', quantity, s.slippageBpsPerFill), sell = sweep(d.sell, 'sell', quantity, s.slippageBpsPerFill);
     if (!buy || !sell) { this.reject('insufficient_depth_or_size'); return; }
-    if ([ma, mb].some((m) => quantity < Number(m.minBaseAmount) || quantity * Math.min(buy.price, sell.price) < Number(m.minQuoteAmount))) { this.reject('minimum_order_size'); return; }
+    const ruleFailure = orderRuleFailure(ma, quantity, Math.min(buy.cash, sell.cash)) || orderRuleFailure(mb, quantity, Math.min(buy.cash, sell.cash));
+    if (ruleFailure) { this.reject(ruleFailure); return; }
     // Entry spread must pay all four taker fees and reserves without a rebate.
     const costBps = 2 * (s.entropyTakerFeeBps + s.lighterTakerFeeBps) + 2 * s.slippageBpsPerFill + s.fundingReserveBpsPerRoundTrip;
     const executableEdge = (sell.price / buy.price - 1) * 10000;
@@ -329,7 +330,8 @@ export class Lab {
     for (const scenario of s.latencyScenarios) {
       const key = `${scenario.name}:${symbol}`;
       if (this.tasks.has(key) || now < (this.next.get(key) || 0)) continue;
-      const legs = [d.buy, d.sell].map((book, i) => ({ venue: book.venue, side: i === 0 ? 'buy' : 'sell', due: now + scenario[`${book.venue}Ms`], state: 'pending', entry: null, exit: null }));
+      const legs = [d.buy, d.sell].map((book, i) => ({ venue: book.venue, side: i === 0 ? 'buy' : 'sell', due: now + scenario[`${book.venue}Ms`], state: 'pending', entry: null, exit: null,
+        rules: orderRuleSnapshot(book.venue === 'entropy' ? ma : mb), lastFillFailure: null }));
       const task = { key, symbol, scenario, quantity, signalAt: wall, signalMono: now, edgeBps: executableEdge, phase: 'entry', legs, failed: false,
         costConfig: context.config, feeSnapshot: context.feeSnapshot };
       this.tasks.set(key, task); this.counts.candidates++;
@@ -347,7 +349,7 @@ export class Lab {
         if (now > leg.due + s.fillWaitMs) {
           if (closing) {
             leg.state = 'unresolved';
-            this.emit({ type: 'paper_unresolved', key: t.key, symbol: t.symbol, venue: leg.venue, at: wall, reason: 'no_exit_quote_or_depth', entry: leg.entry });
+            this.emit({ type: 'paper_unresolved', key: t.key, symbol: t.symbol, venue: leg.venue, at: wall, reason: 'no_exit_quote_or_depth', lastFillFailure: leg.lastFillFailure, entry: leg.entry });
           } else { leg.state = 'rejected'; t.failed = true; this.results.get(t.scenario.name).failedLegs++; }
           continue;
         }
@@ -355,11 +357,19 @@ export class Lab {
         if (!incoming || incoming.venue !== leg.venue || incoming.symbol !== t.symbol || incoming.receivedMono < leg.due || validateBook(incoming, now, wall, this.config)) continue;
         const side = closing ? (leg.side === 'buy' ? 'sell' : 'buy') : leg.side;
         const fill = sweep(incoming, side, t.quantity, s.slippageBpsPerFill);
-        if (!fill) {
-          if (!closing) { leg.state = 'rejected'; t.failed = true; this.results.get(t.scenario.name).failedLegs++; }
+        // The delayed order must still be legal under the metadata current at arrival.
+        const failure = fill ? orderRuleFailure(this.markets.get(pairKey(leg.venue, t.symbol)), t.quantity, fill.cash, leg.rules) : 'insufficient_depth';
+        if (failure) {
+          leg.lastFillFailure = failure;
+          // A rejected exit keeps its filled entry open until it fills legally or becomes unresolved.
+          if (!closing) {
+            leg.state = 'rejected'; t.failed = true; this.results.get(t.scenario.name).failedLegs++;
+            this.emit({ type: 'paper_rejected', key: t.key, symbol: t.symbol, venue: leg.venue, phase: 'entry', at: wall, reason: failure });
+          }
           continue;
         }
         const feeBps = leg.venue === 'entropy' ? s.entropyTakerFeeBps : s.lighterTakerFeeBps;
+        leg.lastFillFailure = null;
         const record = { ...fill, fee: fill.cash * feeBps / 10000, receivedAt: wall, receivedMono: now, sourceAt: incoming.sourceAt, sequence: incoming.sequence,
           ...(t.feeSnapshot ? { feeSnapshot: t.feeSnapshot } : {}) };
         leg[closing ? 'exit' : 'entry'] = record;
@@ -407,15 +417,14 @@ export class Lab {
     this.lastStudy.set(symbol, now);
     const context = this.costContext(symbol, now, wall);
     const markets = ['entropy', 'lighter'].map((v) => this.markets.get(pairKey(v, symbol)));
-    const validMarket = markets.every((m) => m && m.status === 'active' && Number.isInteger(m.sizeDecimals) && bounded(m.sizeDecimals, 0, 10)
-      && Number(m.multiplier) === 1 && positive(Number(m.minQuoteAmount)) && bounded(Number(m.minBaseAmount), 0, 1e10));
+    const validMarket = markets.every(tradableMarket);
     const decimals = validMarket ? Math.min(...markets.map((m) => m.sizeDecimals)) : 0;
     const quantity = validMarket ? Math.floor(this.config.simulation.notionalPerLeg / Math.max(mid(entropy), mid(lighter)) * 10 ** decimals) / 10 ** decimals : 0;
     for (const [buyBook, sellBook] of [[entropy, lighter], [lighter, entropy]]) {
       const buy = sweep(buyBook, 'buy', quantity, this.config.simulation.slippageBpsPerFill);
       const sell = sweep(sellBook, 'sell', quantity, this.config.simulation.slippageBpsPerFill);
       const reason = !validMarket ? 'metadata_unavailable' : !buy || !sell ? 'insufficient_depth'
-        : markets.some((m) => quantity < Number(m.minBaseAmount) || Math.min(buy.cash, sell.cash) < Number(m.minQuoteAmount)) ? 'minimum_order_size' : null;
+        : orderRuleFailure(markets[0], quantity, Math.min(buy.cash, sell.cash)) || orderRuleFailure(markets[1], quantity, Math.min(buy.cash, sell.cash));
       const metric = this.studyMetric(symbol, buyBook.venue, sellBook.venue, null);
       this.attemptStudy(metric, now, wall);
       const evaluation = reason ? null : studyEvaluation({ buy: { ...buy, venue: buyBook.venue }, sell: { ...sell, venue: sellBook.venue }, config: context.config, feeSnapshot: context.feeSnapshot, at: wall,
@@ -427,9 +436,10 @@ export class Lab {
         const delayed = this.studyMetric(symbol, buyBook.venue, sellBook.venue, scenario);
         this.attemptStudy(delayed, now, wall);
         if (reason) { this.recordStudy(delayed, null, reason, now); continue; }
+        const rules = (venue) => orderRuleSnapshot(markets[venue === 'entropy' ? 0 : 1]);
         this.studyProbes.set(key, { key, symbol, quantity, metric: delayed, signalAt: wall, costConfig: context.config, feeSnapshot: context.feeSnapshot,
-          legs: [{ venue: buyBook.venue, side: 'buy', due: now + scenario[`${buyBook.venue}Ms`], fill: null },
-            { venue: sellBook.venue, side: 'sell', due: now + scenario[`${sellBook.venue}Ms`], fill: null }] });
+          legs: [{ venue: buyBook.venue, side: 'buy', due: now + scenario[`${buyBook.venue}Ms`], fill: null, rules: rules(buyBook.venue) },
+            { venue: sellBook.venue, side: 'sell', due: now + scenario[`${sellBook.venue}Ms`], fill: null, rules: rules(sellBook.venue) }] });
       }
     }
   }
@@ -448,8 +458,8 @@ export class Lab {
       if (!leg) continue;
       const fill = sweep(incoming, leg.side, probe.quantity, this.config.simulation.slippageBpsPerFill);
       if (!fill) { this.endStudy(probe, null, 'insufficient_depth'); continue; }
-      const market = this.markets.get(pairKey(incoming.venue, probe.symbol));
-      if (!market || fill.cash < Number(market.minQuoteAmount) || probe.quantity < Number(market.minBaseAmount)) { this.endStudy(probe, null, 'minimum_order_size'); continue; }
+      const failure = orderRuleFailure(this.markets.get(pairKey(incoming.venue, probe.symbol)), probe.quantity, fill.cash, leg.rules);
+      if (failure) { this.endStudy(probe, null, failure); continue; }
       leg.fill = { ...fill, venue: incoming.venue, sourceTimeUncertain: incoming.sourceAt === null || Boolean(validateBook(incoming, now, wall, this.config)) };
       if (probe.legs.every((l) => l.fill)) this.endStudy(probe, studyEvaluation({ buy: probe.legs[0].fill, sell: probe.legs[1].fill, config: probe.costConfig, feeSnapshot: probe.feeSnapshot, at: wall,
         sourceTimeUncertain: probe.legs.some((l) => l.fill.sourceTimeUncertain) }), null, now);
@@ -476,7 +486,10 @@ export class Lab {
       // Keep the symbol blocked: lost paper exposure must never silently reset.
       this.next.set(t.key, Infinity);
     } else {
-      r.completed++; r.settledGrossPnl += gross; r.settledNetBeforeRebate += net;
+      // A task with a rejected leg was never a completed hedged roundtrip; its
+      // realized unwind cash still settles, but it is counted only in failedLegs.
+      if (!t.failed) r.completed++;
+      r.settledGrossPnl += gross; r.settledNetBeforeRebate += net;
       if (net < 0) r.lossesBeforeRebate++;
       r.minNetBeforeRebate = r.minNetBeforeRebate === null ? net : Math.min(r.minNetBeforeRebate, net);
       this.next.set(t.key, now + this.config.simulation.cooldownMs);

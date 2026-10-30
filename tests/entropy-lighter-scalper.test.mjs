@@ -220,6 +220,23 @@ test('metadata, minimum amount and receive/source quality fail closed', () => {
   changed.tick(112); assert.equal(changed.report().stats.failedEntries, 1);
 });
 
+test('an exit that is illegal under fill-time metadata stays open and becomes unresolved', () => {
+  for (const [mutate, reason] of [
+    [(m) => { m.minQuoteAmount = 200; }, 'minimum_order_size'],
+    [(m) => { m.sizeDecimals = 2; }, 'entropy_metadata_changed'],
+  ]) {
+    const h = harness(); h.arm(); h.put('binance', 1, 104, 106); h.put('entropy', 11, 49, 50);
+    assert.equal(h.report().state, 'holding');
+    mutate(h.markets.get('entropy:SNDK'));
+    h.tick(111); assert.equal(h.report().state, 'exit_pending');
+    h.put('entropy', 122, 49, 50);
+    assert.equal(h.report().state, 'exit_pending'); assert.equal(h.engine.states.get('SNDK').get('base').task.lastFillFailure, reason);
+    h.tick(222); const row = h.report();
+    assert.equal(row.state, 'unresolved'); assert.equal(row.stats.completed, 0); assert.equal(row.stats.netBeforeRebate, null);
+    assert.equal(row.position.entryCash, 100);
+  }
+});
+
 test('events and reports are detached snapshots; history cap never clears loss or fee-revision totals', () => {
   const h = harness({ simulation: { cooldownMs: 1 } });
   for (let i = 0; i < 23; i++) {
