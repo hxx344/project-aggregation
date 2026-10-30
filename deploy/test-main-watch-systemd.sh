@@ -62,6 +62,15 @@ port=$(cat "$fixture/port")
 installer=("$fixture/source/deploy/install-main-watch.sh" --source "$fixture/source")
 posts() { [[ -f $fixture/posts.log ]] && wc -l < "$fixture/posts.log" || echo 0; }
 
+fails() { if "$@"; then echo "Expected failure: $*" >&2; exit 1; fi; }
+
+echo '== a rejected first install leaves no service behind'
+touch "$fixture/fail"
+fails bash "${installer[@]}" --main "127.0.0.1:$port" --webhook "http://127.0.0.1:$port/hook"
+[[ ! -e /opt/main-watch/main_watch.py && ! -e /etc/systemd/system/main-watch.timer && ! -e /etc/main-watch/config && ! -e /usr/local/bin/main-watch ]]
+fails systemctl is-enabled --quiet main-watch.timer
+rm "$fixture/fail"
+
 echo '== first install sends a test message and runs one real round'
 bash "${installer[@]}" --main "127.0.0.1:$port" --checks "http://127.0.0.1:$port/down" \
   --webhook "http://127.0.0.1:$port/hook" --secret ci --threshold 1 | tee "$fixture/first.log"
@@ -89,19 +98,34 @@ grep -q '跳过部署' "$fixture/noop.log"
 
 echo '== a rejected webhook rolls back configuration and keeps the timer running'
 touch "$fixture/fail"
-! bash "${installer[@]}" --threshold 5
+fails bash "${installer[@]}" --threshold 5
 [[ $(sha256sum /etc/main-watch/config) == "$config_before" ]]
 systemctl is-active --quiet main-watch.timer
 rm "$fixture/fail"
 
 echo '== invalid arguments change nothing'
-! bash "${installer[@]}" --checks 'ftp://nope'
+fails bash "${installer[@]}" --checks 'ftp://nope'
 [[ $(sha256sum /etc/main-watch/config) == "$config_before" ]]
 
+echo '== changing only the extra checks keeps the readiness check'
+bash "${installer[@]}" --checks "tcp://127.0.0.1:$port"
+grep -qx "MAIN=127.0.0.1:$port" /etc/main-watch/config
+grep -qx "CHECKS=tcp://127.0.0.1:$port" /etc/main-watch/config
+probe=$(/usr/local/bin/main-watch probe)
+grep -q "正常 http://127.0.0.1:$port/api/ready" <<< "$probe"
+
+echo '== a broken deployment is repaired instead of skipped'
+chmod 700 /etc/main-watch
+systemctl start main-watch.service || true
+bash "${installer[@]}" | tee "$fixture/repair.log"
+if grep -q '跳过部署' "$fixture/repair.log"; then echo 'Broken deployment was skipped' >&2; exit 1; fi
+[[ $(stat -c '%U:%G %a' /etc/main-watch) == "root:$service 750" ]]
+[[ $(systemctl show --property=Result --value main-watch.service) == success ]]
+
 echo '== management command and uninstall'
-main-watch check
-main-watch probe >/dev/null || true
+/usr/local/bin/main-watch check
+/usr/local/bin/main-watch probe >/dev/null || true
 bash "${installer[@]}" --uninstall
 [[ ! -e /etc/systemd/system/main-watch.timer && ! -e /opt/main-watch && -f /etc/main-watch/config ]]
-! systemctl is-active --quiet main-watch.timer
+fails systemctl is-active --quiet main-watch.timer
 echo 'main-watch systemd acceptance passed'

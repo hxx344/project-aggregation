@@ -51,6 +51,14 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(watch.ConfigError):
                 watch.validate({**BASE, **change})
 
+    def test_main_and_checks_are_kept_separately(self):
+        config = watch.validate({**BASE, 'MAIN': '10.0.0.5:3100', 'CHECKS': PORT})
+        self.assertEqual(config['checks'], [READY, PORT])
+        self.assertEqual(watch.validate({**BASE, 'MAIN': '10.0.0.5:3100', 'CHECKS': ''})['checks'], [READY])
+        for change in ({'MAIN': '', 'CHECKS': ''}, {'MAIN': 'host-only'}, {'MAIN': '10.0.0.5:3100', 'CHECKS': READY}):
+            with self.subTest(change=change), self.assertRaises(watch.ConfigError):
+                watch.validate({**BASE, **change})
+
     def test_signature_matches_feishu_formula(self):
         body = watch.feishu_body('hi', 'sec', 1700000000)
         expected = base64.b64encode(hmac.new(b'1700000000\nsec', b'', hashlib.sha256).digest()).decode()
@@ -84,6 +92,29 @@ class RoundTests(unittest.TestCase):
         state = rounds(fake, 1, state, start=1180)
         self.assertEqual(len(fake.sent), 1)
         self.assertTrue(state[READY]['alerted'])
+
+    def test_failed_recovery_notice_is_resent_once(self):
+        fake = Fake(down=[READY])
+        state = rounds(fake, 3)
+        fake.down.clear()
+        fake.send_ok = False
+        state = rounds(fake, 1, state, start=1180)
+        self.assertIn('中断约', state[READY]['recovery'])
+        fake.send_ok = True
+        state = rounds(fake, 2, state, start=1240)
+        self.assertEqual([text[0] for text in fake.sent], ['🔴', '🟢'])
+        self.assertEqual(state[READY], watch.fresh())
+
+    def test_pending_recovery_is_dropped_when_target_fails_again(self):
+        state = {READY: {**watch.fresh(), 'recovery': '• old'}}
+        state = rounds(Fake(down=[READY]), 1, state)
+        self.assertNotIn('recovery', state[READY])
+
+    def test_corrupt_state_entries_restart_counting(self):
+        fake = Fake(down=[READY])
+        state = rounds(fake, 1, state={READY: 'junk', PORT: {'fails': 'x', 'alerted': True}})
+        self.assertEqual(state[READY]['fails'], 1)
+        self.assertEqual(state[PORT], watch.fresh())
 
     def test_local_network_outage_does_not_count(self):
         fake = Fake(down=[READY], control=False)
@@ -155,6 +186,11 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.main('--test'), 1)
         self.main()
         self.assertFalse(json.loads(Path(self.state).read_text())[f'{self.base}/broken']['alerted'])
+
+    def test_response_without_code_is_not_success(self):
+        self.write(CHECKS=f'{self.base}/api/ready')
+        self.server.reply = {}
+        self.assertEqual(self.main('--test'), 1)
 
     def test_invalid_config_exits_2(self):
         self.write(CHECKS='nonsense')

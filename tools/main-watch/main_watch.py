@@ -6,8 +6,8 @@
 import argparse, base64, hashlib, hmac, ipaddress, json, os, socket, sys, time, urllib.error, urllib.request
 from urllib.parse import urlsplit
 
-KEYS = ('FEISHU_WEBHOOK', 'FEISHU_SECRET', 'NAME', 'CHECKS', 'FAIL_THRESHOLD', 'REMIND_MINUTES', 'TIMEOUT')
-DEFAULTS = {'FEISHU_SECRET': '', 'NAME': '主服务器', 'FAIL_THRESHOLD': '3', 'REMIND_MINUTES': '30', 'TIMEOUT': '10'}
+KEYS = ('FEISHU_WEBHOOK', 'FEISHU_SECRET', 'NAME', 'MAIN', 'CHECKS', 'FAIL_THRESHOLD', 'REMIND_MINUTES', 'TIMEOUT')
+DEFAULTS = {'FEISHU_SECRET': '', 'NAME': '主服务器', 'MAIN': '', 'CHECKS': '', 'FAIL_THRESHOLD': '3', 'REMIND_MINUTES': '30', 'TIMEOUT': '10'}
 SEND_TIMEOUT = 10
 MAX_CHECKS = 20
 
@@ -60,9 +60,13 @@ def validate(values):
     parts = urlsplit(webhook)
     if not (parts.hostname and not parts.username and (parts.scheme == 'https' or (parts.scheme == 'http' and loopback(parts.hostname)))):
         raise ConfigError('FEISHU_WEBHOOK 必须是 https 地址（如 https://open.feishu.cn/open-apis/bot/v2/hook/...）')
-    checks = config.get('CHECKS', '').split()
+    main = config['MAIN'].strip()
+    if main and not target_ok(f'tcp://{main}'):
+        raise ConfigError(f'MAIN 格式应为 主机:端口：{main}')
+    # MAIN 是工作台就绪检查，与额外目标 CHECKS 分开保存，单独修改任一项不会顶掉另一项。
+    checks = ([f'http://{main}/api/ready'] if main else []) + config['CHECKS'].split()
     if not checks:
-        raise ConfigError('CHECKS 至少需要一个检查目标')
+        raise ConfigError('MAIN 与 CHECKS 至少需要一个检查目标')
     if len(checks) > MAX_CHECKS or len(set(checks)) != len(checks):
         raise ConfigError(f'CHECKS 不能重复，最多 {MAX_CHECKS} 个')
     for target in checks:
@@ -120,7 +124,7 @@ def send(config, text):
     request = urllib.request.Request(config['webhook'], data, {'Content-Type': 'application/json; charset=utf-8'})
     with urllib.request.urlopen(request, timeout=SEND_TIMEOUT) as response:
         result = json.loads(response.read(65536) or b'{}')
-    code = result.get('code', result.get('StatusCode', 0))
+    code = result.get('code', result.get('StatusCode'))
     if code != 0:
         raise RuntimeError(f'飞书拒绝消息：code={code} {result.get("msg", "")}'.strip())
 
@@ -136,22 +140,35 @@ def fresh():
     return {'fails': 0, 'alerted': False, 'last_alert': 0, 'since': 0}
 
 
+def entry_of(value):
+    """状态文件损坏或字段类型不对时，从初始状态重新计数，不让单个条目拖垮整轮巡检。"""
+    entry = {**fresh(), **value} if isinstance(value, dict) else fresh()
+    numeric = all(isinstance(entry[key], (int, float)) and not isinstance(entry[key], bool) for key in ('fails', 'last_alert', 'since'))
+    if not (numeric and isinstance(entry['alerted'], bool) and isinstance(entry.get('recovery', ''), str)):
+        return fresh()
+    return entry
+
+
 def run_round(config, state, now, probe_fn, send_fn, log):
     """巡检一轮并返回新状态。告警发送失败不记为已告警，下一轮会重发。"""
     stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))
     if probe_fn(control_target(config['webhook']), config['timeout']) is not None:
         log(f'{stamp} 本机连不上飞书，跳过本轮，不计入主服务器失败')
         return state
-    state = {target: {**fresh(), **state.get(target, {})} for target in config['checks']}
+    state = {target: entry_of(state.get(target)) for target in config['checks']}
     down, recovered = [], []
     for target in config['checks']:
         entry = state[target]
         error = probe_fn(target, config['timeout'])
         if error is None:
             if entry['alerted']:
-                recovered.append(f'• {target}（中断约 {duration(now - entry["since"])}）')
+                recovered.append((target, f'• {target}（中断约 {duration(now - entry["since"])}）'))
+            elif entry.get('recovery'):
+                recovered.append((target, entry['recovery']))
             state[target] = fresh()
             continue
+        # 待补发的恢复通知属于上一次故障；再次失败后按新故障重新计数。
+        entry.pop('recovery', None)
         if entry['fails'] == 0:
             entry['since'] = now
         entry['fails'] += 1
@@ -171,10 +188,12 @@ def run_round(config, state, now, probe_fn, send_fn, log):
         entry.pop('detail', None)
     if recovered:
         try:
-            send_fn(f'🟢 {config["name"]} 服务恢复 {stamp}\n' + '\n'.join(recovered))
+            send_fn(f'🟢 {config["name"]} 服务恢复 {stamp}\n' + '\n'.join(line for _, line in recovered))
             log(f'{stamp} 已发送恢复通知')
         except Exception as error:
-            log(f'{stamp} 飞书恢复通知发送失败：{error}')
+            for target, line in recovered:
+                state[target]['recovery'] = line
+            log(f'{stamp} 飞书恢复通知发送失败，下一轮重发：{error}')
     return state
 
 

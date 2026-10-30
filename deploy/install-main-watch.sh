@@ -11,7 +11,8 @@ usage() {
   cat <<'USAGE'
 用法: sudo bash install-main-watch.sh [选项]
   --main HOST:PORT     主服务器工作台地址，检查 http://HOST:PORT/api/ready
-  --checks "目标 ..."  额外检查目标：http(s)://... 或 tcp://主机:端口，空格分隔
+  --checks "目标 ..."  额外检查目标：http(s)://... 或 tcp://主机:端口，空格分隔；传空串清除
+                       --main 与 --checks 分开保存，只改其中一项不影响另一项
   --webhook URL        飞书群机器人 Webhook
   --secret SECRET      机器人开启“签名校验”时的密钥
   --name NAME          告警里显示的服务器名称，默认“主服务器”
@@ -35,15 +36,17 @@ command_path=/usr/local/bin/main-watch
 repository=hxx344/project-aggregation
 files=(tools/main-watch/main_watch.py deploy/install-main-watch.sh)
 
-args=("$@") source_dir='' source_revision='' main='' checks='' send_test=0 uninstall=0
+args=("$@") source_dir='' source_revision='' send_test=0 uninstall=0
 settings=()
 while (($#)); do
   case $1 in
     --main|--checks|--webhook|--secret|--name|--threshold|--remind|--source|--revision)
       [[ $# -ge 2 ]] || die "$1 需要一个值"
       case $1 in
-        --main) main=$2 ;;
-        --checks) checks=$2 ;;
+        --main)
+          [[ $2 =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ || $2 =~ ^\[[0-9A-Fa-f:]+\]:[0-9]{1,5}$ ]] || die '--main 格式应为 主机:端口，例如 1.2.3.4:3100'
+          settings+=("MAIN=$2") ;;
+        --checks) settings+=("CHECKS=$2") ;;
         --webhook) settings+=("FEISHU_WEBHOOK=$2") ;;
         --secret) settings+=("FEISHU_SECRET=$2") ;;
         --name) settings+=("NAME=$2") ;;
@@ -59,26 +62,7 @@ while (($#)); do
     *) usage >&2; die "未知参数：$1" ;;
   esac
 done
-if [[ -n $main ]]; then
-  [[ $main =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ || $main =~ ^\[[0-9A-Fa-f:]+\]:[0-9]{1,5}$ ]] || die '--main 格式应为 主机:端口，例如 1.2.3.4:3100'
-  checks="http://$main/api/ready${checks:+ $checks}"
-fi
-[[ -z $checks ]] || settings+=("CHECKS=$checks")
 [[ -z $source_revision || $source_revision =~ ^[a-f0-9]{40}$ ]] || die '--revision 必须是 40 位提交号。'
-
-exec 9>/run/lock/main-watch-install.lock
-flock -n 9 || die '另一个 main-watch 安装正在运行。'
-
-if ((uninstall)); then
-  systemctl disable --now main-watch.timer >/dev/null 2>&1 || true
-  systemctl stop main-watch.service >/dev/null 2>&1 || true
-  rm -f -- "$unit" "$timer" "$command_path"
-  rm -rf -- "$root"
-  systemctl daemon-reload
-  systemctl reset-failed main-watch.service main-watch.timer >/dev/null 2>&1 || true
-  say "已移除巡检服务。配置保留在 $etc，状态在 /var/lib/$service；不再需要时可手工删除，并执行 userdel $service。"
-  exit 0
-fi
 
 system_ready() {
   local tool
@@ -88,11 +72,14 @@ system_ready() {
 if ! system_ready; then
   command -v apt-get >/dev/null || die '缺少 python3(>=3.8)/curl，且系统不是 apt 系，请先手工安装。'
   say '安装缺少的依赖：python3 curl ca-certificates'
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 curl ca-certificates util-linux passwd diffutils >/dev/null
+  # 经 curl | bash 运行时脚本在标准输入里，不能让 apt 读走。
+  apt-get update -qq </dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 curl ca-certificates util-linux passwd diffutils </dev/null >/dev/null
 fi
 system_ready || die '需要 python3 3.8+、curl 与 systemd。'
-python_bin=$(readlink -f "$(command -v python3)")
+# 不解析符号链接：系统升级换掉 python3.X 后，单元仍指向有效的 python3。
+python_bin=/usr/bin/python3
+[[ -x $python_bin ]] || python_bin=$(command -v python3)
 
 trusted() {
   python3 -I - "$@" <<'PY'
@@ -141,6 +128,20 @@ PY
 
 trusted "$root" "$etc" "$unit" "$timer" "$command_path"
 install -d -m 755 "$root" "$root/sources"
+exec 9>"$root/upgrade.lock"
+flock -n 9 || die '另一个 main-watch 安装正在运行。'
+
+if ((uninstall)); then
+  systemctl disable --now main-watch.timer >/dev/null 2>&1 || true
+  systemctl stop main-watch.service >/dev/null 2>&1 || true
+  rm -f -- "$unit" "$timer" "$command_path"
+  rm -rf -- "$root"
+  systemctl daemon-reload
+  systemctl reset-failed main-watch.service main-watch.timer >/dev/null 2>&1 || true
+  say "已移除巡检服务。配置保留在 $etc，状态在 /var/lib/$service；不再需要时可手工删除，并执行 userdel $service。"
+  exit 0
+fi
+
 scratch=$(mktemp -d "$root/.install-XXXXXX")
 backup="$scratch/backup" switched=0 timer_was_enabled=0 timer_was_active=0
 systemctl is-enabled --quiet main-watch.timer 2>/dev/null && timer_was_enabled=1
@@ -190,7 +191,7 @@ PY
   )
   source_dir="$root/sources/$source_revision"
   if [[ -f $source_dir/.source-complete ]]; then
-    trusted "$source_dir/.source-complete" "${files[@]/#/$source_dir/}"
+    trusted "$source_dir/.source-complete" "${files[@]/#/$source_dir/}" || die "源码缓存归属异常，请检查或删除：$source_dir"
     [[ $(source_digest "$source_dir") == "$(cat "$source_dir/.source-complete")" ]] || die '源码缓存校验失败，请删除后重试：'"$source_dir"
     say "正式版 ${source_revision:0:12} 已缓存，跳过下载。"
   else
@@ -219,7 +220,7 @@ revision_label=${source_revision:-local:$(source_digest "$source_dir" | cut -c1-
 # 合并配置：命令行给出的项覆盖已有配置，其余保留；未传参数时不改动配置文件。
 if [[ ! -f $config && ${#settings[@]} -eq 0 ]]; then usage >&2; die '首次安装需要 --main 或 --checks，以及 --webhook。'; fi
 if ((${#settings[@]})); then
-  python3 -I - "$(dirname -- "$program")" "$config" "$scratch/config" "${settings[@]}" <<'PY'
+  python3 -I -B - "$(dirname -- "$program")" "$config" "$scratch/config" "${settings[@]}" <<'PY'
 import os, sys
 sys.path.insert(0, sys.argv[1])
 import main_watch
@@ -306,12 +307,16 @@ for index in "${!targets[@]}"; do
 done
 id "$service" >/dev/null 2>&1 || useradd --system --user-group --no-create-home --home-dir /var/lib/$service --shell /usr/sbin/nologin "$service"
 [[ $(id -u "$service") != 0 ]] || die '服务账号不能是 root。'
-config_owner_ok=0
-[[ -f $config && $(stat -c '%U:%G %a' "$config") == "root:$service 640" ]] && config_owner_ok=1
-if ((${#changed[@]} == 0 && config_owner_ok)) && systemctl is-enabled --quiet main-watch.timer && systemctl is-active --quiet main-watch.timer &&
-    [[ $(systemctl show --property=NeedDaemonReload --value main-watch.service) == no ]]; then
+# 跳过标准与部署成功标准一致：文件与权限不变、定时器在运行，且 systemd 下最近一轮巡检成功。
+healthy=0
+if [[ -f $config && $(stat -c '%U:%G %a' "$config") == "root:$service 640" && $(stat -c '%U:%G %a' "$etc") == "root:$service 750" ]] &&
+    systemctl is-enabled --quiet main-watch.timer && systemctl is-active --quiet main-watch.timer &&
+    [[ $(systemctl show --property=NeedDaemonReload --value main-watch.service) == no &&
+       $(systemctl show --property=NeedDaemonReload --value main-watch.timer) == no &&
+       $(systemctl show --property=Result --value main-watch.service) == success ]]; then healthy=1; fi
+if ((${#changed[@]} == 0 && healthy)); then
   say "版本 $revision_label：程序、配置与定时器均未变化，跳过部署。"
-  if ((send_test)); then "$python_bin" -I "$root/main_watch.py" --config "$config" --test; fi
+  if ((send_test)); then runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test; fi
   exit 0
 fi
 
