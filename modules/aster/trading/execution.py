@@ -7,7 +7,7 @@ from fractions import Fraction
 
 from .ordinary_selection import ordinary_add_block_reason
 from .account_legacy import legacy_intent, legacy_block_reason, LEGACY_PENDING_REASON
-from .exchange import UNCERTAIN_ORDER_CODES, AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent, definitive_order_error, order_absent
+from .exchange import UNCERTAIN_ORDER_CODES, AmbiguousOrder, ExchangeError, LeverageRejected, LiveBroker, RequestNotSent, SendBasisExpired, definitive_order_error, order_absent
 from .exchange_messages import MISSING_REJECT_REASON, exchange_reason
 from .models import AccountModeError, MIN_BATCH_NOTIONAL, TradingError, dec, floor_step, hedge_balanced, minimum_open_leverage, opening_margin_limit, ordinary_leverage_wait, positive, require_non_decreasing_leverage, require_supported_leverage, wire
 from .paper import PaperBroker, PaperOrderAbsent
@@ -15,6 +15,36 @@ from .capacity_timing import initial_timing, observe_capacity_submit, capacity_t
 from . import recovery
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
+# Consecutive repairs held back by their own basis before a person must look.
+MAX_REPAIR_BASIS_EXPIRED = 5
+
+
+class SendBasis:
+    """The account snapshot and BBO an order was sized from.
+
+    Persistence and shared admission run after the planning checks, so the
+    same evidence is checked again immediately before the final HTTP send.
+    A repair sends with check_book=False: it only closes this batch's excess
+    and the BBO only caps its size, so a quote aging during the send path must
+    not hold it back. Planning a repair still needs a fresh BBO.
+    """
+
+    def __init__(self, snapshot, book, *, check_book=True):
+        self.snapshot, self.book, self.check_book = snapshot, book, check_book
+        self.generation = getattr(snapshot, "account_read_generation", None)
+
+    def record(self, orders):
+        return {"client_order_ids": [order["newClientOrderId"] for order in orders],
+                "account_at": self.snapshot.timestamp, "account_generation": self.generation,
+                "book_at": self.book.timestamp}
+
+    def require_fresh(self):
+        try:
+            self.snapshot.require_fresh()
+            if self.check_book:
+                self.book.require_fresh()
+        except TradingError as exc:
+            raise SendBasisExpired(f"发送前复核：{exc}，本批未发送，等待重新规划") from None
 
 
 class Executor:
@@ -65,7 +95,7 @@ class Executor:
                   "capacity_timing": initial_timing(symbol, long.leverage, capacity_observation)}
         self.store.save_intent(intent)  # FULL synchronous commit before any write request.
         self.store.event(account["id"], "order", f"{symbol} {long.leverage}x 提交双向市价批次，每边 {wire(plan.qty)}")
-        self.send(intent, orders, capacity_observation=capacity_observation)
+        self.send(intent, orders, capacity_observation=capacity_observation, basis=SendBasis(snapshot, book))
         return self.reconcile(account, intent)
 
     @staticmethod
@@ -73,9 +103,12 @@ class Executor:
         return {"symbol": symbol, "positionSide": position_side, "side": side, "type": "MARKET",
                 "quantity": wire(qty), "newClientOrderId": client_id, "newOrderRespType": "RESULT"}
 
-    def send(self, intent, orders, *, repair=False, capacity_observation=None, persist=None):
+    def send(self, intent, orders, *, repair=False, capacity_observation=None, persist=None, basis=None):
         account = self.store.account(intent["account_id"])
         recovery.mark_send(intent, account, self.broker, orders)
+        if basis is not None:
+            # Bind the sizing evidence to this durable send for later review.
+            intent["send_basis"] = basis.record(orders)
         # Commit the marked intent before entering the possibly-sent boundary.
         (self.store.save_intent if persist is None else persist)(intent)
         not_sent = None
@@ -85,7 +118,19 @@ class Executor:
                                                    live=isinstance(self.broker, LiveBroker))
                            if not repair and intent.get("kind") == "pair" and "capacity_timing" in intent else nullcontext())
             with measurement:
-                result = self.broker.submit(orders)
+                if basis is None:
+                    result = self.broker.submit(orders)
+                elif isinstance(self.broker, LiveBroker):
+                    if basis.generation is None:
+                        raise SendBasisExpired("下单依据缺少账户读取代次，本批未发送，等待重新规划")
+                    # Checked in the HTTP hook, after shared admission waits.
+                    result = self.broker.submit(orders, basis_generation=basis.generation,
+                                                before_send=basis.require_fresh)
+                else:
+                    basis.require_fresh()
+                    result = self.broker.submit(orders)
+            if repair:
+                intent.pop("repair_basis_expired", None)
             if not isinstance(result, list) or len(result) != len(orders):
                 raise TradingError("批量订单响应格式异常，等待逐笔核对")
             for order, row in zip(orders, result):
@@ -109,7 +154,11 @@ class Executor:
                     intent["receipts"][cid] = row
         except RequestNotSent as exc:
             not_sent = exc
-            # The local budget rejected the request before any network write.
+            if isinstance(exc, SendBasisExpired):
+                # Expired sizing evidence: record why; the next plan reads anew.
+                intent["last_error"] = str(exc)
+                rejections.append(str(exc))
+            # A local check rejected the request before any network write.
             # These orders are known absent and must never enter unknown-order recovery.
             for order in orders:
                 cid = order["newClientOrderId"]
@@ -117,14 +166,20 @@ class Executor:
                            "local_not_sent": True}
                 if isinstance(exc.code, int):
                     receipt["reject_code"] = exc.code
+                if isinstance(exc, SendBasisExpired):
+                    receipt["basis_expired"] = True
                 intent["receipts"][cid] = receipt
             if repair:
                 # Persist the refund with the known-absent receipt, so a restart
                 # cannot count a local budget denial as an exchange repair attempt.
                 intent["repair_attempts"] -= 1
+                if isinstance(exc, SendBasisExpired):
+                    intent["repair_basis_expired"] = intent.get("repair_basis_expired", 0) + 1
         except TradingError as exc:
             # Even a transport failure may have reached the exchange. Never resend.
             intent["last_error"] = str(exc)
+            if repair:
+                intent.pop("repair_basis_expired", None)
             if isinstance(exc, ExchangeError) and not isinstance(exc, AmbiguousOrder) and exc.code not in (-1006, -1007):
                 rejections.append(str(exc))
                 if definitive_order_error(exc.code, exc.http_status):
@@ -518,6 +573,8 @@ class Executor:
                 return self.attention(account, intent, "账户交易权限或未完成挂单不符合补偿条件，等待核对")
             if intent["repair_attempts"] >= 3:
                 return self._recover_known_state(account, intent, "单腿补偿已达上限，暂停并核对当前仓位")
+            if intent.get("repair_basis_expired", 0) >= MAX_REPAIR_BASIS_EXPIRED:
+                return self.attention(account, intent, f"单腿补偿连续 {MAX_REPAIR_BASIS_EXPIRED} 次在发送前依据失效，均未发出，已暂停；请核对后重试")
             side = "LONG" if long.qty > short.qty else "SHORT"
             book = self.market.book(intent["symbol"])
             book.require_fresh()
@@ -545,7 +602,7 @@ class Executor:
             intent["status"] = "repair"
             self.store.save_intent(intent)
             self.store.event(account["id"], "repair", f"{intent['symbol']} 处理单腿差额：仅市价平掉本批多出的 {side} {wire(qty)}")
-            not_sent = self.send(intent, [repair], repair=True)
+            not_sent = self.send(intent, [repair], repair=True, basis=SendBasis(snapshot, book, check_book=False))
             if not_sent is not None:
                 # Preserve the batch and let the scheduler honor retry_after.
                 # The next pass skips this known-absent order and can retry repair.

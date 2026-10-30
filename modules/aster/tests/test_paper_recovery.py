@@ -9,7 +9,7 @@ from trading.execution import Executor
 from trading.models import Plan, TradingError, dec
 from trading.paper import PaperBroker
 from trading.store import Store
-from .helpers import Fixture
+from .helpers import Fixture, live_snapshot
 
 
 class PaperRecoveryTests(unittest.TestCase):
@@ -186,7 +186,7 @@ class PaperRecoveryTests(unittest.TestCase):
                 fixture = self.fixture()
                 broker = LiveBroker({}, fixture.market, api=SimpleNamespace(budget=None, credentials={"user": "0xUser", "signer": "0xSigner"}))
                 executor = Executor(fixture.store, broker, fixture.market)
-                with patch.object(broker, "snapshot", side_effect=fixture.broker.snapshot), \
+                with patch.object(broker, "snapshot", side_effect=live_snapshot(broker, fixture.broker.snapshot)), \
                      patch.object(broker, "submit", side_effect=AmbiguousOrder("response lost")) as submit, \
                      patch.object(broker, "query", side_effect=error):
                     self.open(fixture, executor)
@@ -201,7 +201,7 @@ class PaperRecoveryTests(unittest.TestCase):
         fixture = self.fixture()
         broker = LiveBroker({}, fixture.market, api=SimpleNamespace(budget=None, credentials={"user": "0xUser", "signer": "0xSigner"}))
         executor = Executor(fixture.store, broker, fixture.market)
-        with patch.object(broker, "snapshot", side_effect=fixture.broker.snapshot), \
+        with patch.object(broker, "snapshot", side_effect=live_snapshot(broker, fixture.broker.snapshot)), \
              patch.object(broker, "set_leverage", side_effect=AmbiguousOrder("change response lost")) as change:
             executor.leverage(fixture.account, self.symbol, 5, 10)
             executor.reconcile(fixture.account)

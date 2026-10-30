@@ -11,7 +11,7 @@ from trading.execution import Executor
 from trading.models import Plan, dec, plan_pair
 from trading.paper import PaperBroker
 from trading.store import Store
-from .helpers import Fixture
+from .helpers import Fixture, live_snapshot
 
 
 class MarketExecutionTests(unittest.TestCase):
@@ -44,13 +44,13 @@ class MarketExecutionTests(unittest.TestCase):
                 raise AssertionError("Unexpected API request")
 
         self.live = LiveBroker({}, self.f.market, api=Gateway())
-        self.reader = patch.object(self.live, "snapshot", side_effect=self.f.broker.snapshot)
+        self.reader = patch.object(self.live, "snapshot", side_effect=live_snapshot(self.live, self.f.broker.snapshot))
         self.reader.start()
         self.addCleanup(self.reader.stop)
         self.executor = Executor(self.f.store, self.live, self.f.market)
 
     def open(self, qty=".12"):
-        snapshot = self.f.broker.snapshot(["XAUUSD1"])
+        snapshot = self.live.snapshot(["XAUUSD1"])
         return self.executor.open_pair(self.f.account, snapshot, "XAUUSD1", Plan(dec(qty)), self.f.market.book("XAUUSD1"))
 
     def assert_market(self, order):
@@ -142,7 +142,7 @@ class MarketExecutionTests(unittest.TestCase):
         self.assertIn("市价最小数量", pending["last_error"])
 
     def test_market_minimum_notional_uses_mark_price_when_it_differs_from_bbo(self):
-        snapshot = self.f.broker.snapshot(["XAUUSD1"])
+        snapshot = self.live.snapshot(["XAUUSD1"])
         book = replace(self.f.market.book("XAUUSD1"), bid=dec(20000), ask=dec(20001), mark=dec(10000))
         for depth, expected in ((".03", 0), (".05", ".05")):
             with self.subTest(depth=depth):
