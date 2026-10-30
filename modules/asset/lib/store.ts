@@ -16,6 +16,7 @@ import { hubPositionsService } from './hub-positions';
 import { yuanQuote } from './fx';
 import { mapConcurrent, settleIndependent } from './concurrency';
 import { knownAssetValue, snapshotValues, configuredExchanges, refreshMarketAsset, withMarketQuantity } from './asset-values';
+import { parseAeroLp, planAeroLp, type AeroLpInput } from './aero-lp';
 import type { Asset, Ledger, Connection, Withdrawal, FxStatus, AsterAccount } from './types';
 
 export const chinaDate=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});
@@ -81,6 +82,7 @@ export async function editAsset(owner:string,input:{id:string,quantity:number,pr
     const ledger=await getCurrentLedger(owner), asset=ledger.assets.find(a=>a.id===input.id);
     if(!asset)throw new Error('未找到该资产');
     if(asset.mode==='bybit'||asset.mode==='aster'||asset.mode==='binance'||asset.mode==='okx'||asset.mode==='gate'||asset.mode==='variational')throw new Error('交易所资产由只读接口维护');
+    if(asset.mode==='aero')throw new Error('Aero LP 资产由工作台同步维护');
     const price=asset.mode==='market'?asset.price:input.price;
     const edited=asset.mode==='market'?withMarketQuantity(asset,input.quantity):asset;
     const status=asset.mode==='manual'?'手动估值':edited.status;
@@ -215,8 +217,10 @@ export async function deleteAsterAccount(owner:string,id:string,action:'disconne
     await snapshot(lease,owner);return getLedger(owner);
   });
 }
-export async function refresh(owner:string){
+export async function refresh(owner:string,aeroLp?:AeroLpInput|'invalid'){
   return withLock(owner,async lease=>{
+    // Saved before the throttle below, so a workbench sync landing right after a page refresh is applied on the next one.
+    if(aeroLp!==undefined)await setting(lease,owner,'aero-lp',JSON.stringify(aeroLp));
     const ledger=await getCurrentLedger(owner);
     const last=await db().prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner,'last-attempt').first<{value:string}>();
     if(last&&Date.now()-Number(last.value)<30000)return getLedger(owner);
@@ -273,7 +277,16 @@ export async function refresh(owner:string){
           for(const statement of asterStatements(owner,accounts,asset))statement.execute();
         });
       }};
-      const completed=await Promise.allSettled([walletSync('bybit'),walletSync('binance'),asterSync()]);
+      const aeroSync=async()=>{
+        const saved=(await db().prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner,'aero-lp').first<{value:string}>())?.value;
+        if(saved===undefined)return;
+        const input=parseAeroLp({aeroLp:JSON.parse(saved)});
+        if(input===undefined)return;
+        const plan=planAeroLp(ledger.assets,input,prices?.USDC,marketError);
+        if(plan.type==='delete')commit(lease,[db().prepare('DELETE FROM assets WHERE owner = ? AND id = ?').bind(owner,plan.id)]);
+        else if(plan.type==='save')commit(lease,[db().prepare('INSERT INTO assets(owner,id,data) VALUES(?,?,?) ON CONFLICT(owner,id) DO UPDATE SET data=excluded.data').bind(owner,plan.asset.id,JSON.stringify(plan.asset))]);
+      };
+      const completed=await Promise.allSettled([walletSync('bybit'),walletSync('binance'),asterSync(),aeroSync()]);
       for(const result of completed)if(result.status==='rejected')throw result.reason;
     },async()=>{
       const row=stored.results.find(row=>row.exchange==='okx');

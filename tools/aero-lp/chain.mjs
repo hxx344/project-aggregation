@@ -137,6 +137,7 @@ export async function connect({ rpcUrl, pool: poolAddress, token, token1: expect
     gaugeFactory: new Contract(gaugeFactoryAddress, GAUGE_FACTORY_ABI, rpc),
     nft: new Contract(getAddress(expectedNft), NFT_ABI, signerOrProvider),
     erc0: new Contract(token0, ERC20_ABI, signerOrProvider),
+    erc1: t1,
     aero: new Contract(AERO, ERC20_ABI, rpc),
     xaero: receiptToken && new Contract(receiptToken, ERC20_ABI, rpc),
     router, routerFactory,
@@ -160,10 +161,11 @@ export async function readState(ctx, wallet, twapSec) {
   if (twapSec > 0) {
     try { observed = await read('observe', () => ctx.pool.observe([twapSec, 0])); } catch (error) { twapError = error.message; }
   }
-  const [slot0, blockNumber, walletToken0, walletEth, latestNonce, pendingNonce, stakedIds, ownedCount, penaltyRaw] = await read('state', () => Promise.all([
+  const [slot0, blockNumber, walletToken0, walletToken1, walletEth, latestNonce, pendingNonce, stakedIds, ownedCount, penaltyRaw] = await read('state', () => Promise.all([
     ctx.pool.slot0(),
     ctx.rpc.getBlockNumber(),
     ctx.erc0.balanceOf(wallet),
+    ctx.erc1.balanceOf(wallet),
     ctx.rpc.getBalance(wallet),
     ctx.rpc.getTransactionCount(wallet, 'latest'),
     ctx.rpc.getTransactionCount(wallet, 'pending'),
@@ -185,6 +187,7 @@ export async function readState(ctx, wallet, twapSec) {
     twapTick: observed ? Math.floor(Number(observed.tickCumulatives[1] - observed.tickCumulatives[0]) / twapSec) : null,
     twapError,
     walletToken0,
+    walletToken1,
     walletEth,
     inflight: pendingNonce > latestNonce,
     positions,

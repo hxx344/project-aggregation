@@ -167,7 +167,7 @@ async function cycle(ctx, config, wallet, log, { dryRun, dataDir, memory = {}, p
     positions: state.positions.map((p, i) => ({ id: String(p.tokenId), range: [price(p.tickLower), price(p.tickUpper)], staked: p.staked, liquidity: String(p.liquidity), state: rangeState(p, state.tick), ...rewards?.positions[i] })),
     status: plan.status,
     wallet: {
-      [ctx.symbol0]: formatUnits(state.walletToken0, ctx.decimals0), ETH: formatEther(state.walletEth),
+      [ctx.symbol0]: formatUnits(state.walletToken0, ctx.decimals0), [ctx.symbol1]: formatUnits(state.walletToken1, ctx.decimals1), ETH: formatEther(state.walletEth),
       ...(rewards && { AERO: formatUnits(rewards.raw.aero, 18) }), ...(rewards?.raw.xaero != null && { xAERO: formatUnits(rewards.raw.xaero, 18) }),
     },
     rewards: rewards?.summary ?? null,
