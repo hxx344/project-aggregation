@@ -31,7 +31,7 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 | `entry.hours` | `[0]` | 开仓小时列表 |
 | `expiry.weekday` | `null` | 设置后选距开仓至少 `min_hours` 小时的第一个该星期几到期日（实盘规则是 `"sun"`） |
 | `expiry.dte` | `2` | 未设 `weekday` 时，选离"开仓时间 + dte 天"最近的已上市到期日 |
-| `expiry.min_hours` | `1` | 到期日距开仓的最少小时数 |
+| `expiry.min_hours` | `1` | 到期日距开仓的最少小时数；为 0 时到期日仍须晚于开仓小时 |
 | `legs[]` | 必填 | 每条腿：`side` 为 `buy`/`sell`；`type` 为 `call`/`put`/`perp`（Binance 永续，见下方"永续腿"）；`delta` 是目标绝对值，取最接近的行权价；`qty` 是相对数量；`beyond: i` 表示只在第 i 条腿的更虚值一侧选（翼）；`expiry` 可单独设置，用于日历价差；`when` 为 `above`/`below` 时只在对应趋势状态下开这条腿（见下方"趋势过滤"），不写则总是开 |
 | `qty` | `1` | 每条腿的张数（1 张 = 1 BTC） |
 | `fill` | `mid` | 成交价模型，见下方"成交价" |
@@ -50,10 +50,13 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 
 - 小时 H 只使用 (H−1h, H] 内最后一次快照，所以在 H 时刻下单不会看到未来报价。
 - 平仓条件每小时检查一次，用平仓方向的成交价计算，并计入手续费。
+- `worst_open_pnl` 是持仓期间按标记价逐小时估值的最差盈亏（含已发生的手续费和资金费），从开仓小时算起：开仓时按实际成交价、同一小时的标记价和开仓费估值，吃单的点差和开仓费当即计入；再与之后每小时的估值和最终盈亏取最小。
 
 **价格**
 
-- 使用原始 `mark_price` / `bid_price` / `ask_price`，标记价缺失的报价丢弃。原始单位是 BTC，按该合约自己的远期价换算成美元。
+- 使用原始 `mark_price` / `bid_price` / `ask_price`，标记价缺失的报价丢弃。三列共用同一价格单位，按该合约自己的远期价逐行换算成美元，不按数据分布猜单位，所以追加任何新数据都不会改变已有报价。
+- 单位来自数据文件的 `optbt.units` 元数据（`slim` 写入，如 `{"price": "btc", "iv": "fraction"}`）；没有元数据的文件按 `bt slim` 的约定读取：价格为 BTC、IV 为小数，当前数据目录即为此格式。`ParquetMarket(price_unit=..., iv_unit=...)` 指定的单位与文件声明不一致时直接报错。
+- 逐行核对标记价是否与声明单位矛盾（看涨不高于远期价、看跌不高于行权价、不低于内在价值超过远期价的 25%），IV 须在 0.5%–1000% 之间；有任何一行矛盾即拒绝读取该月，不改按其他单位解释。
 - 数据来自 Deribit，用来近似实盘所在的 Bybit。
 - 选腿时的 delta 用 `mark_iv` 和合约远期价，按 Black-76 现算。
 
@@ -77,7 +80,9 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 **结算**
 
 - 到期小时用到期合约在最后一次快照里的远期价，近似 Deribit 交割价（交割价是 08:00 前 30 分钟的指数 TWAP）。
-- 找不到时，依次退回到更晚到期合约的远期价、前 1–2 小时的快照、最后一次估值时的远期价。用最后一次估值远期价结算的交易，退出原因记为 `expiry_last_forward`。
+- 找不到时，依次退回到更晚到期合约的远期价、前 1–2 小时的快照；到期 6 小时后仍没有，用该到期日各腿最后一次估值时的远期价。用最后一次估值远期价结算的交易，退出原因记为 `expiry_last_forward`。
+- 只开决策小时仍未到期的合约（到期时刻严格晚于开仓小时，`min_hours: 0` 也不例外）；到期小时里那张 07:59 的快照不能用来开仓。
+- 组合里最早的到期日一到就结算：每条已到期的腿（含等待期间又到期的远月腿）按各自到期日的交割价取内在价值，不再按到期前的旧盘口成交；未到期的腿按当时报价平仓，缺报价就等下一小时。某个已到期腿缺交割价时保持未决，回测结束仍未决的记为 `unsettled_at_data_end`（与普通的 `open_at_data_end` 区分）。
 
 **永续腿（perp）**
 
@@ -121,11 +126,13 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 
 - 对应 parquet 的大小或修改时间变化；
 - `market.py` 或 `parquet.py` 的源码变化（按内容哈希判断）；
+- 读取该月使用的价格或 IV 单位变化；
+- `market.py` 的 `DATA_SCHEMA` 升级（从原始值到缓存值的换算语义改变时升级，缓存的 `source.txt` 记录该版本）；
 - `market.py` 的 `CACHE_VERSION` 升级（缓存目录结构改变时升级）。
 
 **增加数据**：
 
-1. 在本机运行 `python optbt/parquet.py slim <原始目录> -o <输出目录>`，需要 `pip install pyarrow numpy`。
+1. 在本机运行 `python optbt/parquet.py slim <原始目录> -o <输出目录> --price-unit btc --iv-unit percent`（按原始数据的实际单位填写），需要 `pip install pyarrow numpy`。原始文件没有 `optbt.units` 元数据时必须给出这两个单位，否则报错；输出文件会写入元数据（价格单位照原样，IV 统一为小数）。
 2. 把输出文件上传到数据目录。
 
 **parquet 工具**（`bt` 会转发给 `optbt/parquet.py`）：
@@ -136,6 +143,8 @@ tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期
 | `slim` | 瘦身 |
 | `convert` | 生成约 16 MB 的波动率曲线库 `btc_smiles.sqlite3` |
 | `verify` | 用原始报价检验曲线库的还原误差 |
+
+四个命令都按文件的 `optbt.units` 元数据读取单位；文件没有元数据时用 `--iv-unit fraction|percent`（以及 `slim` / `verify` 需要的 `--price-unit btc|usd`）指定，现有数据目录用 `--price-unit btc --iv-unit fraction`。
 
 曲线库的线性插值会让 IV 系统性偏高 0.1–0.3 个波动率点，所以回测引擎直接用原始报价，不用曲线库。
 

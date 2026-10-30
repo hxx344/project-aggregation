@@ -1,5 +1,9 @@
 """Engine, spec and report tests on a synthetic Black-76 market (standard library only)."""
+import contextlib
+import io
+import json
 import math
+import shutil
 import sys
 import tempfile
 import unittest
@@ -20,10 +24,12 @@ NEXT_FRIDAY_08 = SUNDAY_08 + 5 * 24
 class FakeMarket:
     """Flat-IV chains around a forward path; bid/ask are mark -/+ `spread` of the mark."""
 
-    def __init__(self, forwards, iv=0.5, spread=0.02, settlements=None, perp_offset=0.0, funding_rate=0.0):
+    def __init__(self, forwards, iv=0.5, spread=0.02, settlements=None, perp_offset=0.0, funding_rate=0.0, expiring=False):
         """`iv` is a number or a function of the hour; the perp trades at forward + `perp_offset` and
-        charges `funding_rate` every 8 hours (00/08/16 UTC)."""
+        charges `funding_rate` every 8 hours (00/08/16 UTC). `expiring` also lists a contract at its
+        expiry hour from the 07:59 snapshot, as the parquet market does."""
         self.forwards, self.iv, self.spread = forwards, iv, spread
+        self.expiring = expiring
         self.settlements = settlements or {}
         self.perp_offset, self.funding_rate = perp_offset, funding_rate
 
@@ -43,10 +49,13 @@ class FakeMarket:
         forward = self.forwards[hour]
         strikes = [round(forward / 500) * 500 + 500 * step for step in range(-12, 13)]
         return [self._quote(hour, expiry, strike, is_call) for expiry in (SATURDAY_08, SUNDAY_08, NEXT_FRIDAY_08)
-                if expiry > hour for strike in strikes for is_call in (True, False)]
+                if self._listed(hour, expiry) for strike in strikes for is_call in (True, False)]
+
+    def _listed(self, hour, expiry):
+        return expiry > hour or (self.expiring and expiry == hour)
 
     def quote(self, hour, expiry, strike, is_call):
-        return self._quote(hour, expiry, strike, is_call) if hour in self.forwards and expiry > hour else None
+        return self._quote(hour, expiry, strike, is_call) if hour in self.forwards and self._listed(hour, expiry) else None
 
     def settlement(self, expiry):
         return self.settlements.get(expiry)
@@ -201,6 +210,13 @@ class EngineTest(unittest.TestCase):
         perp_fees = sum(t["fees"] for t in with_perp) - sum(t["fees"] for t in calls_only)
         self.assertAlmostEqual(perp_fees, 0.0005 * 40000.0 * 2, places=2)  # held through the roll: one open, one close
         self.assertAlmostEqual(sum(t["pnl"] for t in calls_only) - sum(t["pnl"] for t in with_perp), perp_fees, places=2)
+        spec = specs.validate(raw)
+        for trade, carry in zip(with_perp, (False, True)):  # the entry point counts, also after the held perp's fee refund
+            hour = trade["entry_hour"]
+            position, _ = engine.open_position(market.chain(hour), hour, spec, market.perp(hour), carry=carry)
+            entry = position.credit - position.fees + sum(leg.sign * leg.qty * market.quote(hour, leg.expiry, leg.strike, leg.is_call).mark
+                                                          for leg in position.legs if not leg.is_perp)  # the perp is worth its entry price
+            self.assertLessEqual(trade["worst_open_pnl"], round(entry, 2))
 
     def test_carry_after_early_exit_and_only_one_refund_per_reopen(self):
         perp, call = {"side": "buy", "type": "perp"}, {"side": "sell", "type": "call", "delta": 0.3}
@@ -322,6 +338,91 @@ class EngineTest(unittest.TestCase):
         self.assertEqual([(t["trend"], t["exit_hour"]) for t in flipped], [("above", SUNDAY_08), ("below", NEXT_FRIDAY_08)])
         self.assertRegex(flipped[1]["legs"], r"^-1 \w+-PERP")
         self.assertAlmostEqual(sum(t["fees"] for t in flipped) - sum(t["fees"] for t in held), 2 * 0.0005 * 38000.0, places=2)
+
+    def test_worst_open_pnl_starts_at_the_entry_fills(self):
+        market = FakeMarket(flat(), settlements={SATURDAY_08: 40000.0, SUNDAY_08: 40000.0})
+
+        def marked(position, hour):
+            return position.credit - position.fees + sum(leg.sign * leg.qty * market.quote(hour, leg.expiry, leg.strike, leg.is_call).mark
+                                                         for leg in position.legs)
+
+        put = {"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "expiry": {"weekday": "sun"},
+               "legs": [{"side": "sell", "type": "put", "delta": 0.3}]}
+        for fill in ("mid", "cross", "passive", "mark"):
+            for spec in (condor(fill=fill), specs.validate({**put, "fill": fill})):
+                position, _ = engine.open_position(market.chain(FRIDAY_21), FRIDAY_21, spec)
+                entry = marked(position, FRIDAY_21)
+                self.assertAlmostEqual(position.worst, entry, places=6)
+                trade = engine.run(spec, market)[0][0]
+                later = [marked(position, hour) for hour in range(FRIDAY_21 + 1, SUNDAY_08)]
+                self.assertEqual(trade["worst_open_pnl"], round(min(entry, *later, trade["pnl"]), 2), fill)
+                if fill == "cross":
+                    self.assertLess(entry, min(later))  # here the entry is the worst point: spread and fees just paid
+        # Settled in the hour after entry: no hourly mark, the entry point still counts.
+        spec = specs.validate({**put, "entry": {"weekdays": ["sat"], "hours": [7]}, "start": "2024-01-06", "end": "2024-01-06",
+                               "expiry": {"weekday": "sat"}, "fill": "cross"})
+        position, _ = engine.open_position(market.chain(SATURDAY_08 - 1), SATURDAY_08 - 1, spec)
+        trade = engine.run(spec, market)[0][0]
+        self.assertEqual((trade["exit_hour"], trade["worst_open_pnl"]), (SATURDAY_08, round(marked(position, SATURDAY_08 - 1), 2)))
+        self.assertLess(trade["worst_open_pnl"], trade["pnl"])
+
+    def test_never_opens_a_contract_expiring_at_the_decision_hour(self):
+        market = FakeMarket(flat(hours=range(FRIDAY_21, NEXT_FRIDAY_08 + 1)), settlements={SUNDAY_08: 40000.0}, expiring=True)
+        self.assertIn(SUNDAY_08, {q.expiry for q in market.chain(SUNDAY_08)})  # 07:59 snapshot, still has time value
+        spec = specs.validate({"start": "2024-01-07T08", "end": "2024-01-07T08", "entry": {"hours": [8]},
+                               "expiry": {"weekday": "sun", "min_hours": 0}, "legs": [{"side": "sell", "type": "call", "delta": 0.5}]})
+        self.assertEqual(engine.open_position(market.chain(SUNDAY_08), SUNDAY_08, spec), (None, "no_expiry"))
+        self.assertEqual(engine.run(spec, market)[:2], ([], {"no_expiry": 1}))
+        rule = {"weekday": None, "dte": 0, "min_hours": 0}
+        self.assertEqual(engine.choose_expiry([SUNDAY_08, NEXT_FRIDAY_08], SUNDAY_08, rule), NEXT_FRIDAY_08)
+        self.assertIsNone(engine.choose_expiry([SUNDAY_08], SUNDAY_08, rule))
+
+    def test_calendar_legs_settle_at_their_own_expiry(self):
+        spec = specs.validate({"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]}, "fill": "mark",
+                               "legs": [{"side": "sell", "type": "put", "delta": 0.5, "expiry": {"weekday": "sat"}},
+                                        {"side": "buy", "type": "call", "delta": 0.5, "expiry": {"weekday": "sun"}}]})
+        marked = range(FRIDAY_21, SATURDAY_08)  # both legs quoted until the near expiry
+        both = {SATURDAY_08: 40000.0, SUNDAY_08: 40000.0}
+        position, _ = engine.open_position(FakeMarket(flat()).chain(FRIDAY_21), FRIDAY_21, spec)
+        put, call = position.legs
+        self.assertEqual((put.expiry, call.expiry), (SATURDAY_08, SUNDAY_08))
+
+        def run(hours, settlements):
+            return engine.run(spec, FakeMarket(flat(hours=hours), settlements=settlements, expiring=True))
+
+        def settled(leg, price):
+            value = payoff(price, leg.strike, leg.is_call)
+            return leg.sign * value - min(0.00015 * price, 0.125 * value)
+
+        def closed(leg, market, hour):
+            mark = market.quote(hour, leg.expiry, leg.strike, leg.is_call).mark
+            return leg.sign * mark - min(0.0003 * 40000.0, 0.07 * mark)
+
+        # Normal calendar: the near leg settles, the far leg closes at market the same hour.
+        trade = run(range(FRIDAY_21, SUNDAY_08 + 1), both)[0][0]
+        market = FakeMarket(flat(), expiring=True)
+        self.assertEqual((trade["reason"], trade["exit_hour"], trade["fills"]), ("expiry", SATURDAY_08, 3))
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + closed(call, market, SATURDAY_08), places=2)
+        # Far quote missing at the near expiry: wait for the first quote while it is still alive.
+        trade = run([*marked, *range(SATURDAY_08 + 4, SUNDAY_08 + 1)], both)[0][0]
+        self.assertEqual((trade["reason"], trade["exit_hour"]), ("expiry", SATURDAY_08 + 4))
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + closed(call, market, SATURDAY_08 + 4), places=2)
+        # The far leg expires while waiting: its 07:59 quote is not tradable, it settles at its own delivery price.
+        trade = run([*marked, SUNDAY_08], both)[0][0]
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + settled(call, 40000.0), places=2)
+        self.assertEqual((trade["reason"], trade["exit_hour"], trade["settlement"], trade["fills"]), ("expiry", SUNDAY_08, 40000.0, 2))
+        far_up = run([*marked, SUNDAY_08], {SATURDAY_08: 40000.0, SUNDAY_08: 41000.0})[0][0]
+        self.assertAlmostEqual(far_up["pnl"], position.credit - position.fees + settled(put, 40000.0) + settled(call, 41000.0), places=2)
+        # No delivery evidence for the far expiry: unresolved and flagged, then the last marked forward after six hours.
+        self.assertEqual(run([*marked, *range(SUNDAY_08, SUNDAY_08 + 4)], {SATURDAY_08: 40000.0})[:2], ([], {"unsettled_at_data_end": 1}))
+        trade = run([*marked, *range(SUNDAY_08, SUNDAY_08 + 7)], {SATURDAY_08: 40000.0})[0][0]
+        self.assertEqual((trade["reason"], trade["exit_hour"]), ("expiry_last_forward", SUNDAY_08 + 6))
+        self.assertAlmostEqual(trade["pnl"], position.credit - position.fees + settled(put, 40000.0) + settled(call, 40000.0), places=2)
+        # A live far leg without quotes until the data ends stays open, not unsettled.
+        market = FakeMarket(flat(hours=[*marked, SATURDAY_08 + 1]), settlements=both, expiring=True)
+        quote = market.quote
+        market.quote = lambda hour, expiry, *rest: None if hour >= SATURDAY_08 else quote(hour, expiry, *rest)
+        self.assertEqual(engine.run(spec, market)[:2], ([], {"open_at_data_end": 1}))
 
 
 class SpecTest(unittest.TestCase):
@@ -467,6 +568,117 @@ class ParquetMarketTest(unittest.TestCase):
                 self.assertIsNone(market.quote(hour + 1, expiry // 3600, 42000.0, True))  # no mark price
                 self.assertEqual(market.span(), (hour, hour + 1))
             self.assertTrue((Path(folder) / ".optbt-cache").is_dir())
+
+    def test_appending_later_quotes_keeps_earlier_prices_and_pnl(self):
+        from optbt.market import ParquetMarket
+        call = (FRIDAY_21 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.01, 0.009, 0.011)
+        expiring = (SUNDAY_08 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.0001, math.nan, 0.0002)  # delivery estimate
+        later = int(datetime(2024, 1, 20, tzinfo=timezone.utc).timestamp())
+        deep_puts = [(later + i * 3600, later + 6 * 86400 + 8 * 3600, 440000.0, False, 40000.0, 10.0, 9.9, 10.1) for i in range(4)]
+        spec = specs.validate({"start": "2024-01-05", "end": "2024-01-05", "entry": {"weekdays": ["fri"], "hours": [21]},
+                               "expiry": {"weekday": "sun"}, "fill": "mark", "legs": [{"side": "sell", "type": "call", "delta": 0.3}]})
+        results = []
+        with tempfile.TemporaryDirectory() as folder:
+            for rows in ([call, expiring], [call, expiring] + deep_puts):  # rewrite the month with quotes after the backtest end
+                write_quotes(Path(folder) / "2024-01.parquet", rows)
+                market = ParquetMarket(folder)
+                quote = market.quote(FRIDAY_21, SUNDAY_08, 41000.0, True)
+                trades = engine.run(spec, market)[0]
+                results.append(((quote.mark, quote.bid, quote.ask), [(t["credit"], t["fees"], t["pnl"]) for t in trades]))
+        self.assertEqual(results[0], results[1])
+        (mark, bid, ask), trades = results[0]
+        self.assertAlmostEqual(mark, 400.0, places=2)
+        self.assertAlmostEqual(bid, 360.0, places=2)
+        self.assertAlmostEqual(ask, 440.0, places=2)
+        self.assertEqual(trades, [(400.0, 12.0, 388.0)])  # BTC premium in USD at the forward, OTM at delivery
+
+    def test_declared_units_are_shared_by_mark_bid_ask_and_never_guessed(self):
+        from optbt import parquet
+        from optbt.market import ParquetMarket
+        expiry = SUNDAY_08 * 3600
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "2024-01.parquet"
+            # Cheap USD prices (< 5) stay USD when the file declares them.
+            write_quotes(path, [(FRIDAY_21 * 3600 - 60, expiry, 60000.0, True, 40000.0, 3.0, 2.0, 4.0)], units={"price": "usd", "iv": "fraction"})
+            quote = ParquetMarket(folder).quote(FRIDAY_21, SUNDAY_08, 60000.0, True)
+            self.assertEqual((quote.mark, quote.bid, quote.ask), (3.0, 2.0, 4.0))
+            with self.assertRaisesRegex(parquet.UnitError, "configured but the file declares"):
+                ParquetMarket(folder, price_unit="btc").chain(FRIDAY_21)
+            # BTC columns with different distributions: asks only on a deep ITM put, still converted like the marks.
+            rows = [(FRIDAY_21 * 3600 - 60, expiry, strike, True, 40000.0, 0.02, math.nan, math.nan) for strike in (40000.0, 40500.0, 41000.0)]
+            rows.append((FRIDAY_21 * 3600 - 60, expiry, 440000.0, False, 40000.0, 10.0, 9.9, 10.1))
+            write_quotes(path, rows)
+            put = ParquetMarket(folder).quote(FRIDAY_21, SUNDAY_08, 440000.0, False)
+            self.assertAlmostEqual(put.mark, 400000.0, delta=1)
+            self.assertAlmostEqual(put.bid, 396000.0, delta=1)
+            self.assertAlmostEqual(put.ask, 404000.0, delta=1)
+            # A declared unit the quotes contradict is refused, not reinterpreted.
+            with self.assertRaisesRegex(parquet.UnitError, "mark prices are impossible read as usd"):
+                ParquetMarket(folder, price_unit="usd").chain(FRIDAY_21)
+            write_quotes(path, rows, iv=50.0)
+            with self.assertRaisesRegex(parquet.UnitError, "outside 0.5%-1000% read as fraction"):
+                ParquetMarket(folder).chain(FRIDAY_21)
+            self.assertAlmostEqual(ParquetMarket(folder, iv_unit="percent").quote(FRIDAY_21, SUNDAY_08, 40000.0, True).iv, 0.5, places=6)
+        # Epoch numbers are scaled one value at a time, not by the column's median.
+        seconds = int(datetime(2024, 1, 5, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(parquet.epoch_seconds(pa_array([seconds, seconds * 1000, seconds * 1000])).tolist(), [seconds] * 3)
+
+    def test_slim_declares_units_and_raw_files_need_them(self):
+        import pyarrow.parquet as pq
+        from optbt import parquet
+        from optbt.market import ParquetMarket
+        with tempfile.TemporaryDirectory() as folder:
+            raw, slim = Path(folder) / "raw", Path(folder) / "slim"
+            raw.mkdir()
+            write_quotes(raw / "2024-01.parquet", [(FRIDAY_21 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.01, 0.009, 0.011)], iv=50.0)
+            for flags, message in [([], "unit error: .*iv unit is not declared"), (["--iv-unit", "percent"], "unit error: .*price unit is not declared"),
+                                   (["--iv-unit", "fraction", "--price-unit", "btc"], "unit error: .*read as fraction")]:
+                with self.assertRaisesRegex(SystemExit, message):
+                    parquet.main(["slim", str(raw), "-o", str(slim), *flags])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(parquet.main(["slim", str(raw), "-o", str(slim), "--iv-unit", "percent", "--price-unit", "btc"]), 0)
+            self.assertEqual(json.loads(pq.read_schema(slim / "2024-01.parquet").metadata[b"optbt.units"]), {"price": "btc", "iv": "fraction"})
+            quote = ParquetMarket(slim).quote(FRIDAY_21, SUNDAY_08, 41000.0, True)
+            self.assertAlmostEqual(quote.mark, 400.0, places=2)
+            self.assertAlmostEqual(quote.iv, 0.5, places=6)
+            with self.assertRaisesRegex(parquet.UnitError, "configured but the file declares"):
+                ParquetMarket(slim, iv_unit="percent").chain(FRIDAY_21)
+
+    def test_cache_from_older_conversion_semantics_is_rebuilt(self):
+        import numpy as np
+        from optbt import market as markets
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "2024-01.parquet"
+            write_quotes(path, [(FRIDAY_21 * 3600 - 60, SUNDAY_08 * 3600, 41000.0, True, 40000.0, 0.01, 0.009, 0.011)])
+            markets.ParquetMarket(folder).chain(FRIDAY_21)
+            cache = Path(folder) / ".optbt-cache" / f"v{markets.CACHE_VERSION}" / "2024-01"
+            self.assertIn(f"schema={markets.DATA_SCHEMA}", (cache / "source.txt").read_text())
+            np.save(cache / "mark.npy", np.full(1, 0.01, "float32"))  # what the old month-median guess could have cached
+            stat = path.stat()
+            (cache / "source.txt").write_text(f"{stat.st_size}:{stat.st_mtime_ns}:{markets.CODE}")  # stamp written before DATA_SCHEMA
+            self.assertAlmostEqual(markets.ParquetMarket(folder).quote(FRIDAY_21, SUNDAY_08, 41000.0, True).mark, 400.0, places=2)
+
+
+def pa_array(values):
+    import pyarrow as pa
+    return pa.array(values, pa.int64())
+
+
+def write_quotes(path, rows, units=None, iv=0.5):
+    """A slim-format month file; rows are (snapshot s, expiry s, strike, is_call, forward, mark, bid, ask)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    times, expiries, strikes, calls, forwards, marks, bids, asks = zip(*rows)
+    table = pa.table({
+        "timestamp": pa.array([int(t * 1000) for t in times], pa.timestamp("ms", "UTC")),
+        "expiration": pa.array([int(e * 1000) for e in expiries], pa.timestamp("ms", "UTC")),
+        "strike_price": pa.array(strikes, pa.float32()), "type": ["call" if c else "put" for c in calls],
+        "mark_iv": [float(iv)] * len(rows), "underlying_price": list(forwards),
+        "mark_price": list(marks), "bid_price": list(bids), "ask_price": list(asks)})
+    if units:
+        table = table.replace_schema_metadata({b"optbt.units": json.dumps(units).encode()})
+    pq.write_table(table, path)
+    shutil.rmtree(Path(path).parent / ".optbt-cache", ignore_errors=True)  # a same-size rewrite may keep a coarse mtime
 
 
 if __name__ == "__main__":

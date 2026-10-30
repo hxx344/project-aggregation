@@ -20,8 +20,13 @@ prices are USD cents.
 Hour H holds the latest snapshot taken in (H-1h, H], so a backtest acting at H
 never sees later quotes; with open/close snapshots per hour this keeps "close".
 Column names are detected automatically; override with --map role=column.
+
+Units are declared, never guessed from the data: --price-unit btc|usd (mark, bid and ask
+share it) and --iv-unit fraction|percent, or the file's `optbt.units` schema metadata,
+which `slim` writes. A unit given on the command line must agree with the metadata.
 """
 import argparse
+import json
 import math
 import re
 import sqlite3
@@ -49,6 +54,8 @@ ROLES = {
 PRICES = {"mark_price": ["mark_price"], "bid_price": ["best_bid_price", "bid_price"], "ask_price": ["best_ask_price", "ask_price"]}
 NODES = np.arange(-3.0, 3.01, 0.5)
 SNAPSHOT_WINDOW = 15 * 60
+UNITS = {"price": ("btc", "usd"), "iv": ("fraction", "percent")}
+UNITS_KEY = b"optbt.units"  # parquet schema metadata: {"price": "btc"|"usd", "iv": "fraction"|"percent"}
 INSTRUMENT = re.compile(r"^[A-Z]+-(\d{1,2})([A-Z]{3})(\d{2})-(\d+(?:[.d]\d+)?)-([CP])$")
 MONTHS = {name: index for index, name in enumerate(["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 SCHEMA = """
@@ -64,6 +71,39 @@ CREATE TABLE smiles (
   PRIMARY KEY (hour, expiry)) WITHOUT ROWID;
 CREATE TABLE spot (hour INTEGER PRIMARY KEY, price INTEGER NOT NULL) WITHOUT ROWID;  -- USD cents, see meta.spot_source
 """
+
+
+class UnitError(ValueError):
+    """A price or IV unit that is undeclared, conflicting or contradicted by the quotes themselves."""
+
+
+def declared_units(path):
+    """The units a file declares in its `optbt.units` schema metadata ({} when it declares none)."""
+    metadata = pq.read_schema(path).metadata or {}
+    if UNITS_KEY not in metadata:
+        return {}
+    try:
+        units = json.loads(metadata[UNITS_KEY])
+    except ValueError as exc:
+        raise UnitError(f"{Path(path).name}: unreadable optbt.units metadata") from exc
+    if not isinstance(units, dict):
+        raise UnitError(f"{Path(path).name}: optbt.units metadata must be an object")
+    return units
+
+
+def unit(path, role, given=None, default=None):
+    """The unit of `role` ("price" or "iv") for one file: `given` (configuration) or the file's
+    declaration, else `default`; never inferred from the values. Disagreeing sources are refused."""
+    declared = declared_units(path).get(role)
+    if given is not None and declared is not None and given != declared:
+        raise UnitError(f"{Path(path).name}: {role} unit {given!r} was configured but the file declares {declared!r}")
+    value = next((choice for choice in (given, declared, default) if choice is not None), None)
+    if value is None:
+        raise UnitError(f"{Path(path).name}: {role} unit is not declared; pass --{role}-unit {'|'.join(UNITS[role])} "
+                        "(files written by slim declare it)")
+    if value not in UNITS[role]:
+        raise UnitError(f"{Path(path).name}: {role} unit must be one of {', '.join(UNITS[role])}, got {value!r}")
+    return value
 
 
 def files_in(directory):
@@ -104,11 +144,8 @@ def epoch_seconds(array):
         scale = {"s": 1, "ms": 1e3, "us": 1e6, "ns": 1e9}[kind.unit]
         return pc.cast(array, pa.int64()).to_numpy(zero_copy_only=False).astype("float64") / scale
     values = pc.cast(array, pa.float64()).to_numpy(zero_copy_only=False)
-    sample = np.nanmedian(np.abs(values)) if values.size else 0
-    for scale in (1e9, 1e6, 1e3):
-        if sample > 1e11 * scale / 1e3:
-            return values / scale
-    return values
+    size = np.abs(values)  # each value by its own magnitude (s, ms, us or ns), not by the file's distribution
+    return values / np.select([size > 1e17, size > 1e14, size > 1e11], [1e9, 1e6, 1e3], 1.0)
 
 
 def numbers(array):
@@ -136,22 +173,27 @@ def parse_instruments(array):
     return table[indices, 0].astype("float64"), table[indices, 1].astype("float64"), table[indices, 2].astype(bool)
 
 
-def load(path, columns):
+def load(path, columns, iv_unit):
+    """Quotes of one file with IVs as fractions; `iv_unit` is the file's declared IV unit."""
     needed = [c for c in columns.values() if c]
     table = pq.read_table(path, columns=sorted(set(needed)))
     data = {"time": epoch_seconds(table[columns["time"]])}
     if columns["expiry"] and columns["strike"] and columns["type"]:
-        data["expiry"] = epoch_seconds(table[columns["expiry"]])
-        if np.all(np.nan_to_num(data["expiry"]) % 86400 == 0):
-            data["expiry"] = data["expiry"] + 8 * 3600  # date-only expiries: Deribit settles 08:00 UTC
+        expiry = epoch_seconds(table[columns["expiry"]])
+        midnight = np.isfinite(expiry) & (np.nan_to_num(expiry) % 86400 == 0)
+        data["expiry"] = np.where(midnight, expiry + 8 * 3600, expiry)  # date-only expiries: Deribit settles 08:00 UTC
         data["strike"] = numbers(table[columns["strike"]])
         kinds = pc.utf8_lower(pc.cast(table[columns["type"]], pa.string()))
         data["is_call"] = pc.fill_null(pc.starts_with(kinds, "c"), False).to_numpy(zero_copy_only=False).astype(bool)
     else:
         data["expiry"], data["strike"], data["is_call"] = parse_instruments(table[columns["instrument"]])
-    iv = numbers(table[columns["iv"]])
-    scale = 100 if np.nanmedian(iv) > 3 else 1
-    data["iv"] = iv / scale
+    scale = {"fraction": 1, "percent": 100}[iv_unit]
+    iv = numbers(table[columns["iv"]]) / scale
+    bad = (iv > 0) & ((iv < 0.005) | (iv > 10))  # row by row: quotes contradicting the declared unit are refused, not reinterpreted
+    if bad.any():
+        raise UnitError(f"{Path(path).name}: {int(bad.sum()):,} {columns['iv']} values are outside 0.5%-1000% read as {iv_unit} "
+                        f"(e.g. {float(iv[bad][0]) * scale:g}); check --iv-unit")
+    data["iv"] = iv
     for side in ("bid_iv", "ask_iv"):
         data[side] = numbers(table[columns[side]]) / scale if columns[side] else np.full(iv.size, np.nan)
     data["forward"] = numbers(table[columns["forward"] or columns["index"]])
@@ -170,11 +212,26 @@ def load_prices(path, data):
     return list(found)
 
 
-def usd(data, role):
-    """A price column in USD: Deribit quotes option prices in BTC, converted at the contract's own forward."""
-    values = data[role]
-    finite = values[np.isfinite(values)]
-    return values * data["forward"] if finite.size and np.median(finite) < 5 else values
+def usd(data, role, price_unit):
+    """A price column in USD under the declared unit, which mark, bid and ask share. Deribit quotes
+    option prices in BTC, converted at the contract's own forward."""
+    return data[role] * data["forward"] if price_unit == "btc" else data[role]
+
+
+def check_prices(data, price_unit, name):
+    """Refuse a declared price unit that the mark prices contradict, row by row: an undiscounted call is
+    worth at most the forward and a put at most the strike, and neither far below its intrinsic value."""
+    if "mark_price" not in data:
+        return
+    forward, strike, call = data["forward"], data["strike"], data["is_call"]
+    mark = usd(data, "mark_price", price_unit)
+    cap = np.where(call, forward, strike)
+    intrinsic = np.maximum(np.where(call, forward - strike, strike - forward), 0)
+    bad = np.isfinite(mark) & (forward > 0) & (strike > 0) & ((mark > cap + 0.01 * forward) | (mark < intrinsic - 0.25 * forward))
+    if bad.any():
+        first = np.flatnonzero(bad)[0]
+        raise UnitError(f"{name}: {int(bad.sum()):,} mark prices are impossible read as {price_unit} (e.g. {data['mark_price'][first]:g} "
+                        f"for strike {strike[first]:g}, forward {forward[first]:g}); check --price-unit")
 
 
 def require(columns):
@@ -266,7 +323,7 @@ def inspect(args):
         if pq.read_schema(path).names != schema.names:
             print(f"  ! {path.name} has different columns: {pq.read_schema(path).names}")
             continue
-        rows, data = load(path, columns)
+        rows, data = load(path, columns, unit(path, "iv", args.iv_unit))
         kept += int(latest_per_hour(data)["hour"].size)
         groups = list(smiles(data))
         file_hours = {g[0] for g in groups}
@@ -300,8 +357,8 @@ def convert(args):
         ("spot_source", "index column" if columns["index"] else "forward of the nearest expiry (no index column)"), ("source_files", f"{files[0].name}..{files[-1].name}"), ("columns", repr(columns))])
     written = 0
     for path in files:
-        _, data = load(path, columns)
-        rows = [(h, e, int(round(f * 100)), int(encode_iv([a])[0]), int(encode_iv([w])[0]), n, encode_iv(nodes).tobytes())
+        _, data = load(path, columns, unit(path, "iv", args.iv_unit))
+        rows = [(h, e,int(round(f * 100)), int(encode_iv([a])[0]), int(encode_iv([w])[0]), n, encode_iv(nodes).tobytes())
                 for h, e, f, a, w, n, nodes in smiles(data) if not args.max_dte or e - h <= args.max_dte * 24]
         db.executemany("INSERT OR REPLACE INTO smiles VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
         if columns["index"]:
@@ -344,8 +401,10 @@ def slim(args):
             after += target.stat().st_size
             print(f"  {path.name}: already in {output}, skipped")
             continue
-        rows, data = load(path, columns)
+        rows, data = load(path, columns, unit(path, "iv", args.iv_unit))
         prices = load_prices(path, data)
+        price_unit = unit(path, "price", args.price_unit) if prices else None
+        check_prices(data, price_unit, path.name)
         data = latest_per_hour(data)
         if args.max_dte:
             keep = data["expiry"] - data["hour"] * 3600 <= args.max_dte * 86400
@@ -364,7 +423,9 @@ def slim(args):
             fields["index_price"] = pa.array(data["index"], from_pandas=True)
         fields.update({name: real(data[name]) for name in prices})
         partial = target.with_name(target.name + ".partial")
-        pq.write_table(pa.table(fields), partial, compression="zstd", compression_level=9)
+        units = {"price": price_unit, "iv": "fraction"} if prices else {"iv": "fraction"}  # prices are copied as stored, IVs as fractions
+        table = pa.table(fields).replace_schema_metadata({UNITS_KEY: json.dumps(units).encode()})
+        pq.write_table(table, partial, compression="zstd", compression_level=9)
         partial.replace(target)
         after += target.stat().st_size
         print(f"  {path.name}: {rows:,} -> {data['time'].size:,} rows, {path.stat().st_size / 1e6:.1f} -> {target.stat().st_size / 1e6:.1f} MB")
@@ -407,8 +468,9 @@ def verify(args):
     coverage = np.zeros((len(DTE_EDGES) - 1, 3), dtype="int64")  # no smile, outside stored nodes, rebuilt
     samples = []
     for path in files:
-        _, data = load(path, columns)
-        load_prices(path, data)
+        _, data = load(path, columns, unit(path, "iv", args.iv_unit))
+        price_unit = unit(path, "price", args.price_unit) if load_prices(path, data) else None
+        check_prices(data, price_unit, path.name)
         data = latest_per_hour(data)
         expiry_hour = np.round(data["expiry"] / 3600)
         label_years = (expiry_hour - data["hour"]) / 8760
@@ -439,7 +501,7 @@ def verify(args):
                  black(own_forward, k, pick(label_years), mark_iv, call)[0],
                  black(pick(forward), k, pick(label_years), mark_iv, call)[0],
                  black(pick(forward), k, pick(label_years), smile_iv, call)[0]]
-        to_usd = lambda name: pick(usd(data, name)) if name in data else np.full(picked.size, math.nan)
+        to_usd = lambda name: pick(usd(data, name, price_unit)) if name in data else np.full(picked.size, math.nan)
         mark, bid, ask = to_usd("mark_price"), to_usd("bid_price"), to_usd("ask_price")
         quoted = (bid > 0) & (ask >= bid)
         samples.append({"dte": pick(dte), "delta": np.abs(delta), "iv_error": smile_iv - mark_iv,
@@ -489,6 +551,9 @@ def main(argv=None):
         command.add_argument("directory", help="folder with YYYY-MM.parquet files")
         command.add_argument("--map", action="append", default=[], type=lambda text: tuple(text.split("=", 1)),
                              help="role=column override, e.g. --map iv=mark_iv")
+        command.add_argument("--iv-unit", choices=UNITS["iv"], help="unit of the IV columns (default: the file's optbt.units metadata)")
+        command.add_argument("--price-unit", choices=UNITS["price"],
+                             help="unit shared by mark/bid/ask prices (default: the file's optbt.units metadata)")
     convert_parser = commands.choices["convert"]
     convert_parser.add_argument("-o", "--output", default="btc_smiles.sqlite3")
     convert_parser.add_argument("--max-dte", type=int, default=0, help="drop expiries further than this many days (0 = keep all)")
@@ -500,7 +565,10 @@ def main(argv=None):
     verify_parser.add_argument("--db", default="btc_smiles.sqlite3", help="smile cache written by convert")
     verify_parser.add_argument("--sample", type=int, default=20000, help="rebuilt quotes sampled per file for the error tables")
     args = parser.parse_args(argv)
-    return {"inspect": inspect, "convert": convert, "slim": slim, "verify": verify}[args.command](args)
+    try:
+        return {"inspect": inspect, "convert": convert, "slim": slim, "verify": verify}[args.command](args)
+    except UnitError as exc:
+        sys.exit(f"unit error: {exc}")
 
 
 if __name__ == "__main__":
