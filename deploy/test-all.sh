@@ -240,6 +240,38 @@ stack_prefetch
 [[ $(wc -l < "$test_root/downloads") == 1 ]]
 grep -q $'^hub\t$' "$test_root/downloads"
 
+# --expect-commit binds the run to one commit: another stable release installs nothing.
+for invalid in '' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA abc "$(printf 'a%.0s' {1..41})"; do
+  if (stack_parse --expect-commit "$invalid"); then echo "Invalid expected commit accepted: $invalid" >&2; exit 1; fi
+done
+if (stack_parse --expect-commit); then exit 1; fi
+if (stack_parse --expect-commit "$(printf 'a%.0s' {1..40})" --expect-commit "$(printf 'a%.0s' {1..40})"); then exit 1; fi
+stack_parse --expect-commit "$(printf 'b%.0s' {1..40})"
+stack_parse
+[[ -z $stack_expect_commit ]]
+rm -f "$test_root/executed"
+: > "$test_root/downloads"
+new_run
+stack_parse --expect-commit "$(printf 'b%.0s' {1..40})"
+set +e
+(set -e; stack_prefetch; stack_run_installers) > "$test_root/mismatch.log" 2>&1
+result=$?
+set -e
+[[ $result == "$STACK_TARGET_MISMATCH" && ! -e "$test_root/executed" && ! -s "$test_root/downloads" ]]
+grep -q '不是指定提交 bbbbbbbbbbbb' "$test_root/mismatch.log"
+new_run
+stack_parse --expect-commit "$(printf 'a%.0s' {1..40})"
+stack_prefetch
+stack_run_installers
+cmp "$test_root/expected" "$test_root/executed"
+# An installer that happens to exit 75 still reports a failure, never "nothing installed".
+new_run
+stack_prefetch
+printf '#!/usr/bin/env bash\nexit 75\n' > "$stack_run/hub.sh"
+if stack_run_installers > /dev/null; then echo 'Installer failure accepted' >&2; exit 1; else result=$?; fi
+[[ $result == 1 ]]
+stack_parse
+
 if [[ $(uname -s) == Linux ]]; then
   # Real signal/lock test, with no actual application or system services.
   cat > "$test_root/signal-installer.sh" <<'SH'
@@ -286,6 +318,13 @@ SH
     grep -q '失败（23）' "$test_root/main-failed.log"
     if grep -q '所选项目均已完成' "$test_root/main-failed.log"; then echo 'False success summary' >&2; exit 1; fi
     rm "$test_root/fail-hub"
+    rm -f "$test_root/executed"
+    set +e
+    (set -e; stack_main --only hub --expect-commit "$(printf 'b%.0s' {1..40})") > "$test_root/main-mismatch.log" 2>&1
+    result=$?
+    set -e
+    [[ $result == "$STACK_TARGET_MISMATCH" && ! -e "$test_root/executed" ]]
+    if grep -q '所选项目均已完成' "$test_root/main-mismatch.log"; then echo 'False success summary' >&2; exit 1; fi
   fi
 fi
 printf 'All stack installer contract checks passed.\n'

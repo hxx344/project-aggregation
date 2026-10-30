@@ -12,7 +12,7 @@ import { ENV_IDS, PIPELINE_VERSION, STAGE_ORDER, TRIGGER_IDS } from './constants
 
 const VALUE_TYPES = new Set(['string', 'port', 'integer', 'boolean', 'url', 'path', 'enum']);
 const GUARD_KEYS = new Set(['branch', 'requireClean', 'tagPattern', 'requireConfirmation']);
-const STAGE_KEYS = new Set(['enabled', 'commands', 'applyCommands', 'inputs', 'outputs', 'frozen', 'target', 'applyTarget', 'applyWithSudo', 'architectures', 'releaseDirectory', 'healthUrl', 'requiresConfirmation', 'requiresApply', 'description']);
+const STAGE_KEYS = new Set(['enabled', 'commands', 'applyCommands', 'inputs', 'outputs', 'frozen', 'target', 'applyTarget', 'applyWithSudo', 'architectures', 'releaseDirectory', 'healthUrl', 'healthAttempts', 'healthIntervalMs', 'deployedRecord', 'targetMismatchExitCode', 'requiresConfirmation', 'requiresApply', 'description']);
 const CONFIG_KEYS = new Set(['name', 'type', 'required', 'secret', 'default', 'values', 'pattern', 'minLength', 'maxLength', 'min', 'max', 'absolute', 'description']);
 
 export class ConfigError extends Error {
@@ -131,6 +131,16 @@ function validateProfile(profile, envId) {
     if (stage.applyCommands?.length) {
       if (typeof stage.applyTarget !== 'string' || !path.isAbsolute(stage.applyTarget)) fail(`stages.${id}.applyTarget`, '必须声明实际写入的绝对路径');
       if (!stage.applyCommands.some(command => command.args?.includes('{applyTarget}'))) fail(`stages.${id}.applyCommands`, '必须引用 {applyTarget}');
+    }
+    for (const key of ['healthAttempts', 'healthIntervalMs']) {
+      if (stage[key] !== undefined && (!Number.isInteger(stage[key]) || stage[key] <= 0)) fail(`stages.${id}.${key}`, '必须为正整数');
+    }
+    if (stage.targetMismatchExitCode !== undefined && (!Number.isInteger(stage.targetMismatchExitCode)
+      || stage.targetMismatchExitCode < 2 || stage.targetMismatchExitCode > 125)) fail(`stages.${id}.targetMismatchExitCode`, '必须为 2–125 的整数');
+    // 激活必须绑定本轮提交：命令传入 {commit}，并核对安装器的部署记录。
+    if (id === 'activate' && stage.enabled !== false && stage.commands?.length) {
+      if (!stage.commands.some(command => command.args?.includes('{commit}'))) fail('stages.activate.commands', '必须以 {commit} 传入本轮目标提交');
+      if (typeof stage.deployedRecord !== 'string' || !path.isAbsolute(stage.deployedRecord)) fail('stages.activate.deployedRecord', '必须声明安装器部署记录的绝对路径');
     }
     if (id === 'package' && stage.enabled !== false) {
       if (!Array.isArray(stage.architectures) || !stage.architectures.length

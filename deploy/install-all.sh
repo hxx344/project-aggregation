@@ -13,7 +13,10 @@ declare -A stack_status=() stack_seconds=()
 stack_selected=()
 stack_workers=()
 stack_refresh=0 stack_run='' stack_active='' stack_child='' stack_viewer=''
-stack_with_tests=0 stack_mode=ci
+stack_with_tests=0 stack_mode=ci stack_expect_commit=''
+# Exit status reserved for "the current stable release is not the expected commit";
+# nothing has been installed. Callers (deploy pipeline) treat it as deferred.
+STACK_TARGET_MISMATCH=75
   stack_started=$SECONDS
 
 # BEGIN CI RELEASE HELPERS -- keep embedded copies identical to deploy/release-common.sh
@@ -1188,7 +1191,7 @@ stack_log() { printf '[总部署] %s\n' "$*"; }
 stack_fail() { stack_log "错误：$*" >&2; return 1; }
 stack_usage() {
   cat <<'HELP'
-用法：sudo bash install-all.sh [--only hub] [--refresh] [--with-tests]
+用法：sudo bash install-all.sh [--only hub] [--refresh] [--with-tests] [--expect-commit <40位提交>]
 统一安装工作台、Market Monitor、Asset Ledger、Gate CrossEx、Greeks，并保留原生交易模块。
 只部署一个工作台服务，业务模块不再单独安装、更新或监听 TCP 端口。
 默认锁定 GitHub 正式版本的源码，在服务器按需构建；设置 PROJECT_DEPLOY_MODE=ci 可使用预构建包。
@@ -1198,6 +1201,8 @@ stack_usage() {
   --only hub    兼容原总部署入口；各内置模块不再支持独立部署。
   --refresh     重新获取安装器，不强制构建、重装或重启。
   --with-tests  仅源码部署时补做行为测试。
+  --expect-commit <提交>
+                只部署该提交：当前正式版不是它时不运行任何安装器，以退出码 75 结束。
   --help        查看说明，无需 root。
 
 HELP
@@ -1208,6 +1213,7 @@ stack_parse() {
   local -A requested=()
   stack_with_tests=${PROJECT_DEPLOY_TESTS-0}
   stack_mode=${PROJECT_DEPLOY_MODE-source}
+  stack_expect_commit=''
   case "$stack_mode" in ci|source) ;; *) stack_fail 'PROJECT_DEPLOY_MODE 必须是 ci 或 source。'; return 1 ;; esac
   while (($#)); do
     case "$1" in
@@ -1216,6 +1222,11 @@ stack_parse() {
         only=$2; shift 2 ;;
       --refresh) stack_refresh=1; shift ;;
       --with-tests) stack_with_tests=1; shift ;;
+      --expect-commit)
+        (($# >= 2)) && [[ "$2" =~ ^[a-f0-9]{40}$ && -z "$stack_expect_commit" ]] || {
+          stack_fail '--expect-commit 需要一个 40 位小写十六进制提交，且只能指定一次。'; return 1;
+        }
+        stack_expect_commit=$2; shift 2 ;;
       *) stack_fail "未知参数：$1；使用 --help 查看说明。"; return 1 ;;
     esac
   done
@@ -1300,6 +1311,11 @@ stack_fetch() {
   local -a conditional=()
   ci_release_resolve "hxx344/${STACK_REPOS[$item]}" "$stack_run/$item.release" || return 1
   revision=$CI_RELEASE_COMMIT
+  if [[ -n "$stack_expect_commit" && "$revision" != "$stack_expect_commit" ]]; then
+    # Never fall back to another stable release or an unpromoted candidate.
+    stack_log "错误：当前正式版 ${revision:0:12} 不是指定提交 ${stack_expect_commit:0:12}；尚未开始部署。" >&2
+    return "$STACK_TARGET_MISMATCH"
+  fi
   if [[ "$stack_mode" == ci ]]; then
     curl --fail --silent --show-error --head --location --proto '=https' --tlsv1.2 \
       --retry 2 --connect-timeout 15 --max-time 90 \
@@ -1347,7 +1363,7 @@ stack_fetch() {
 }
 
 stack_prefetch() {
-  local offset item index result=0 pid
+  local offset item index result=0 pid status mismatch=0
   # At most three small downloads; builds and service activation remain sequential.
   for ((offset=0; offset<${#stack_selected[@]}; offset+=3)); do
     stack_workers=()
@@ -1356,11 +1372,19 @@ stack_prefetch() {
       (stack_fetch "$item") > "$stack_run/$item.download.log" 2>&1 &
       stack_workers+=("$!")
     done
-    for pid in "${stack_workers[@]}"; do wait "$pid" || result=1; done
+    for pid in "${stack_workers[@]}"; do
+      if wait "$pid"; then status=0; else status=$?; fi
+      if (( status == STACK_TARGET_MISMATCH )); then mismatch=1; fi
+      if (( status != 0 )); then result=1; fi
+    done
     stack_workers=()
     for ((index=offset; index<offset+3 && index<${#stack_selected[@]}; index++)); do
       cat "$stack_run/${stack_selected[index]}.download.log"
     done
+    if (( mismatch )); then
+      stack_log '当前正式版不是指定提交，未运行任何项目安装器；等待该提交晋级为正式版后重试。' >&2
+      return "$STACK_TARGET_MISMATCH"
+    fi
     (( result == 0 )) || { stack_fail '正式版本或安装器准备失败，尚未运行任何项目安装器；等待正式发布成功或修复下载问题后重试。'; return 1; }
   done
 }
@@ -1439,6 +1463,8 @@ stack_run_installers() {
       tail -n 40 "$stack_run/$item.log"
       stack_log '该项目的恢复结果请查看日志；此前成功的项目保留。修复后重复原命令即可。'
       stack_active=''
+      # The mismatch status means "nothing installed"; an installer failure must never look like it.
+      if (( result == STACK_TARGET_MISMATCH )); then result=1; fi
       return "$result"
     fi
     stack_status[$item]='完成检查/部署'
