@@ -448,8 +448,8 @@ class Store:
         if previous and previous.get("margin", {}).get("master_env_prefix") != pair.get("margin", {}).get("master_env_prefix"):
             from .margin_balance import MarginBalancer
             margin_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_margin:" + pair["id"],)).fetchone()
-            if MarginBalancer.unsettled_rejection(json.loads(margin_row[0]) if margin_row else {}):
-                raise TradingError("划转拒绝回执尚未完成共享结算，不能更换原主账户配置")
+            if MarginBalancer.unsettled_shared(json.loads(margin_row[0]) if margin_row else {}):
+                raise TradingError("保证金划转尚未完成共享结算，不能更换原主账户配置")
         if previous and previous["symbol"] != pair["symbol"] and not allow_symbol_change:
             raise TradingError("交易标的只能通过暂停后的空仓核验切换")
         members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]
@@ -500,7 +500,7 @@ class Store:
             margin_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_margin:" + pair_id,)).fetchone()
             margin = json.loads(margin_row[0]) if margin_row else {}
             from .margin_balance import MarginBalancer
-            if margin.get("pending") or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown") or MarginBalancer.unsettled_rejection(margin):
+            if margin.get("pending") or margin.get("status") in ("submitting", "acknowledged", "accepted", "unknown") or MarginBalancer.unsettled_shared(margin):
                 raise TradingError("保证金划转结果尚未核实")
             if expected_pair is not None:
                 if pair != expected_pair or runtime != expected_runtime or margin != expected_margin:

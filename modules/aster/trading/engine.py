@@ -1597,7 +1597,7 @@ class Engine:
                             for pair in funds_pairs:
                                 journal = self.store.get("pair_margin:" + pair["id"], {})
                                 if not (pair["margin"]["enabled"] or isinstance(journal, dict) and journal.get("pending")
-                                        or MarginBalancer.unsettled_rejection(journal)):
+                                        or MarginBalancer.unsettled_shared(journal)):
                                     continue
                                 key = "pair:" + pair["id"]
                                 if key not in pending and time.monotonic() >= due.get(key, 0):
