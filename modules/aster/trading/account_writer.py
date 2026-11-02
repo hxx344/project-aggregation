@@ -125,7 +125,7 @@ def protected_pair_id(method):
         journal = self.store.get("pair_margin:" + pair["id"], {})
         from .margin_balance import MarginBalancer
         priority = (pair["margin"]["enabled"] or isinstance(journal, dict) and journal.get("pending") is not None
-            or MarginBalancer.unsettled_rejection(journal))
+            or MarginBalancer.unsettled_shared(journal))
         with ExitStack() as ownership:
             with funds_budget(self.engine, pair) if priority else nullcontext():
                 ownership.enter_context(writer.accounts([pair["long_account_id"], pair["short_account_id"]]))
@@ -188,7 +188,10 @@ class ManagedWriter:
             last = margin_state.get("last_transfer") if isinstance(margin_state, dict) else None
             rejection = last.get("writer_rejection") if isinstance(last, dict) else None
             needs_rejection = isinstance(rejection, dict) and rejection.get("settled") is not True
-            if prefix and (pair.get("margin", {}).get("enabled") or pending or needs_rejection):
+            # A skipped unknown transfer is settled through the master binding,
+            # also after balancing is disabled.
+            follow_up = isinstance(margin_state, dict) and margin_state.get("unsettled_transfers") not in (None, [])
+            if prefix and (pair.get("margin", {}).get("enabled") or pending or needs_rejection or follow_up):
                 configured["master:" + prefix] = prefix
         with self.lock:
             for connection in set(self.connections) - set(configured):
@@ -250,7 +253,7 @@ class ManagedWriter:
         for pair in self.engine.store.pairs():
             journal = self.engine.store.get("pair_margin:" + pair["id"], {})
             if (pair["margin"]["enabled"] or isinstance(journal, dict) and journal.get("pending") is not None
-                    or MarginBalancer.unsettled_rejection(journal)):
+                    or MarginBalancer.unsettled_shared(journal)):
                 for connection in (pair["long_account_id"], pair["short_account_id"],
                         "master:" + pair["margin"]["master_env_prefix"]):
                     funding_connections[connection] = pair

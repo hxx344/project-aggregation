@@ -4,7 +4,7 @@ The caller holds the pair lock and both member-account locks. Transfer identity
 comes from authenticated Aster responses, never a locally supplied account name.
 """
 from contextlib import ExitStack, contextmanager, nullcontext
-from copy import copy
+from copy import copy, deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -38,6 +38,21 @@ TRANSFER_UNIT = Fraction(Decimal("0.00000001"))
 TRANSFER_WS_GRACE_SECONDS = 2
 TRANSFER_HISTORY_QUERY_LIMIT = 3
 TRANSFER_HISTORY_WAIT_SECONDS = 120
+# A skipped unknown transfer is settled only from history. One early read
+# after the observation window may confirm it; rejection needs two empty reads
+# at least SPACING apart, both taken after the whole SPAN has passed so a late
+# processed request is inside the window. The window also starts TOLERANCE
+# before the local send time to absorb clock skew. Failed or partial reads are
+# bounded by TRANSFER_HISTORY_QUERY_LIMIT, then a person settles it. The shared
+# admission refuses new writes on both accounts until then, so SPAN trades a
+# trading pause against a transfer the exchange processes minutes late; a wrong
+# rejection only moves funds between the pair's own sub-accounts again.
+TRANSFER_ABSENCE_READS = 2
+TRANSFER_ABSENCE_SPACING_SECONDS = 30
+TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 180
+TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
+SETTLE_WAIT = "结算前共享准入暂停该组账户的新写入，原请求不会重发"
+SETTLE_MANUAL = "请人工核对交易所划转记录后结算原请求；结算前共享准入暂停该组账户的新写入，原请求不会重发"
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
     -1102, -1103, -1104, -1105, -1106, -1111, -1130, -2014, -2015, -2019})
 
@@ -197,6 +212,12 @@ class MarginBalancer:
         return not isinstance(evidence, dict) or evidence.get("settled") is not True
 
     @staticmethod
+    def unsettled_shared(state):
+        """A rejection proof or a skipped unknown transfer still holds a shared write."""
+        return MarginBalancer.unsettled_rejection(state) or (
+            isinstance(state, dict) and state.get("unsettled_transfers") not in (None, []))
+
+    @staticmethod
     def resume_ready(state):
         """A balance refresh enables reserved trading, never another transfer."""
         pending = state.get("pending") if isinstance(state, dict) else None
@@ -270,6 +291,15 @@ class MarginBalancer:
             self._check_snapshots(pair, snapshots)
             done = {**pending, "status": "skipped", "refresh_source": "rest"}
             updated = {**state, "pending": None, "last_transfer": done}
+            # Skipping only releases the private reservation. The exact shared
+            # write stays unknown until bounded history settles it before the
+            # next transfer; otherwise every later transfer is ACCOUNT_UNRESOLVED.
+            follow_up = {key: deepcopy(pending[key]) for key in ("request_id", "source", "destination", "amount",
+                "created_at", "identity", "transaction_id", "before_receipts")
+                if key in pending and (pending[key] or key not in ("transaction_id", "before_receipts"))}
+            if writer_for(self.engine).enabled:
+                updated["unsettled_transfers"] = [*state.get("unsettled_transfers", []),
+                    {**follow_up, "failures": 0, "empty": 0}]
             for field in ("api_notice", "blocked_reason", "retry_without_blocking"):
                 updated.pop(field, None)
             archive = {"pair_id": pair["id"], "original": pending, "result": done,
@@ -523,6 +553,21 @@ class MarginBalancer:
         if MarginBalancer.unsettled_rejection(journal):
             return view("blocked", "划转拒绝回执已保存，等待恢复共享结算；完成前保留原配对配置和账户绑定", blocks=True)
         pending = journal.get("pending")
+        records = journal.get("unsettled_transfers")
+        if pending is None and records not in (None, []):
+            # Mirrors _settle_skipped(): visible even while disabled or paused.
+            # The latest check explains the exact step; the durable follow-up
+            # guarantees that explanation is still current.
+            if (isinstance(runtime_view, dict) and runtime_view.get("pending") is None
+                    and runtime_view.get("blocks_trading") is True
+                    and runtime_view.get("status") in {"unknown", "blocked"}
+                    and isinstance(runtime_view.get("reason"), str)):
+                return view(runtime_view["status"], runtime_view["reason"], blocks=True)
+            exhausted = not isinstance(records, list) or any(not MarginBalancer._valid_unsettled(record)
+                or record["failures"] >= TRANSFER_HISTORY_QUERY_LIMIT for record in records)
+            if exhausted:
+                return view("blocked", "上次结果未知的划转无法自动核实；" + SETTLE_MANUAL, blocks=True)
+            return view("unknown", "上次划转结果未知，系统正在有限次核对两侧划转流水并结算；" + SETTLE_WAIT, blocks=True)
         if pending is not None:
             if not isinstance(pending, dict) or pending.get("status") not in {"submitting", "unknown", "accepted", "acknowledged"}:
                 return view("blocked", "保证金划转待核对记录无效，停止新开仓和新划转；请人工核对服务器日志与交易所划转记录", blocks=True)
@@ -591,6 +636,199 @@ class MarginBalancer:
             result[side] = rows
         return result
 
+    @staticmethod
+    def _receipt_matches(pending, rows, state, start, end):
+        """Return unused USD1 transfer receipts per side: [source debits, destination credits]."""
+        matches = []
+        for side, sign in ((pending["source"], -1), (pending["destination"], 1)):
+            found = set()
+            for row in rows[side]:
+                txn = _identifier(row.get("tranId"))
+                kind = row.get("incomeType")
+                if row.get("asset") != "USD1" or kind not in TRANSFER_TYPES or not txn:
+                    continue
+                if pending.get("transaction_id") and txn != pending["transaction_id"]:
+                    continue
+                if [kind, txn] in pending.get("before_receipts", {}).get(side, []):
+                    continue
+                if [kind, txn] in state.get("used_receipts", []):
+                    continue
+                try:
+                    stamp = dec(row.get("time"))
+                    amount = dec(row.get("income"))
+                except TradingError:
+                    continue
+                if start <= stamp <= end and amount == dec(pending["amount"]) * sign:
+                    found.add((kind, txn))
+            matches.append(found)
+        return matches
+
+    @staticmethod
+    def _valid_unsettled(record):
+        if not (isinstance(record, dict) and _identifier(record.get("request_id"))
+                and {record.get("source"), record.get("destination")} == {"long", "short"}
+                and isinstance(record.get("identity"), str)
+                and type(record.get("created_at")) in (int, float) and math.isfinite(record["created_at"])
+                and record["created_at"] > 0
+                and type(record.get("failures")) is int and 0 <= record["failures"] <= TRANSFER_HISTORY_QUERY_LIMIT
+                and type(record.get("empty")) is int and 0 <= record["empty"] <= TRANSFER_ABSENCE_READS
+                and ("queried_at" not in record or type(record["queried_at"]) in (int, float)
+                     and math.isfinite(record["queried_at"]))
+                and isinstance(record.get("before_receipts", {}), dict)
+                and (record.get("transaction_id") is None or _identifier(record["transaction_id"]))):
+            return False
+        try:
+            positive(record.get("amount"))
+        except TradingError:
+            return False
+        return True
+
+    def _settle_skipped(self, pair, members, state, config):
+        """Settle the shared write of a skipped unknown transfer; never resend it.
+
+        Returns the view to show while it is unsettled, else None. Until then
+        the shared admission refuses new writes on these accounts, so every
+        view says trading waits; an unexpected failure only delays the check.
+        """
+        try:
+            return self._settle_skipped_records(pair, members, state, config)
+        except Exception as exc:  # noqa: BLE001 - surface as a retry, never crash the tick
+            LOG.warning("pair %s skipped transfer settlement failed: %s", pair["id"], type(exc).__name__)
+            return self._view(state, config, "unknown", "未知划转的共享结算暂未完成（" + str(exc)[:200]
+                + "），稍后重试；" + SETTLE_WAIT, blocks=True)
+
+    def _settle_skipped_records(self, pair, members, state, config):
+        """Confirm from one-to-one receipts, reject from two late empty reads."""
+        records = state.get("unsettled_transfers")
+        if records is None:
+            return None
+        key = "pair_margin:" + pair["id"]
+        writer = writer_for(self.engine)
+        if not writer.enabled:
+            # Standalone runs keep no shared write to settle.
+            state.pop("unsettled_transfers", None)
+            self.store.put(key, state)
+            return None
+        view = lambda status, reason: self._view(state, config, status, reason, blocks=True)
+        if not isinstance(records, list) or any(not self._valid_unsettled(record) for record in records):
+            return view("blocked", "未知划转的结算记录无效；" + SETTLE_MANUAL)
+        ids = [member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]
+        settled = []
+        while records:
+            record = records[0]
+            label = "上次划转（" + record["request_id"][:8] + "）结果未知"
+            exhausted = record["failures"] >= TRANSFER_HISTORY_QUERY_LIMIT
+            now = time.time()
+            created = record["created_at"]
+            span_end = created + TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS
+            ready_at = created + TRANSFER_HISTORY_WAIT_SECONDS
+            if "queried_at" in record:
+                ready_at = max(ready_at, record["queried_at"] + TRANSFER_ABSENCE_SPACING_SECONDS)
+                if record["queried_at"] < span_end:
+                    # The early read was not conclusive; wait for the full span.
+                    ready_at = max(ready_at, span_end)
+            if not exhausted and now < ready_at:
+                progress = "已有 1 次完整时间窗内两侧均无该笔划转，" if record["empty"] else ""
+                return view("unknown", label + "，" + progress + "等待观察时间结束后核对两侧划转流水"
+                    + _remaining_time(ready_at, now) + "；" + SETTLE_WAIT)
+            # Identity first: a shared row that the current accounts cannot see
+            # must not be read as already settled.
+            try:
+                self._verify_pending_identity(pair, members, record)
+            except TradingError as exc:
+                return view("blocked", label + "，" + str(exc) + "；恢复原账户凭据后自动继续核对。"
+                    "原账户已不可用时需人工核对交易所划转记录并处理；" + SETTLE_WAIT)
+            candidates = ("aster:transfer:" + record["request_id"],
+                          "aster:legacy:pair_margin:" + pair["id"] + ":" + record["request_id"])
+            with writer.accounts(ids) as ticket:
+                open_ids = {row["operationId"] for row in writer.registry.unresolved(ticket)} if ticket is not None else set()
+            open_ops = [value for value in candidates if value in open_ids]
+            if not open_ops:
+                # Settled elsewhere, including by a person after the bound.
+                records.pop(0)
+                self.store.put(key, state)
+                continue
+            if exhausted:
+                return view("blocked", label + f"，{TRANSFER_HISTORY_QUERY_LIMIT} 次流水核对仍无法确认；" + SETTLE_MANUAL)
+            if record["empty"] >= TRANSFER_ABSENCE_READS:
+                # The absence proof is durable; an earlier settle failed.
+                self._resolve_skipped(writer, ids, open_ops, rejected=True)
+                settled.append("rejected")
+                records.pop(0)
+                self.store.put(key, state)
+                continue
+            start = int((created - TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
+            end = int(min(now, span_end) * 1000)
+            complete = now >= span_end
+            observation = {}
+            try:
+                rows = self._income(members, start, end, reconciliation=True, observation=observation)
+            except ExchangeError as exc:
+                notice = api_wait_notice(exc)
+                if observation.get("queried"):
+                    record["queried_at"] = now
+                    if notice is None:
+                        record["failures"] += 1
+                    self.store.put(key, state)
+                return view("unknown", label + "，流水核对未完成（" + (notice["text"] if notice else self._read_error_detail(exc))
+                    + "），稍后有限次重试；" + SETTLE_WAIT)
+            except TradingError as exc:
+                if observation.get("queried"):
+                    record.update(queried_at=now, failures=record["failures"] + 1)
+                    self.store.put(key, state)
+                return view("unknown", label + "，流水核对失败：" + str(exc) + "；稍后有限次重试，" + SETTLE_WAIT)
+            # Persist the read before deciding, so a later failure still
+            # leaves the read spaced and bounded.
+            record["queried_at"] = now
+            self.store.put(key, state)
+            source, destination = self._receipt_matches(record, rows, state, start, end)
+            common = source & destination
+            if len(common) == 1 and len(source) == 1 and len(destination) == 1:
+                kind, txn = common.pop()
+                self._resolve_skipped(writer, ids, open_ops)
+                # Recorded after settling: recording first and crashing would
+                # hide this receipt from the next read and fake an absence.
+                # Crashing in between only leaves this receipt unrecorded.
+                state["used_receipts"] = (state.get("used_receipts", []) + [[kind, txn]])[-100:]
+                settled.append("confirmed")
+            elif not source and not destination:
+                if complete:
+                    record["empty"] += 1
+                self.store.put(key, state)
+                if record["empty"] < TRANSFER_ABSENCE_READS:
+                    later = ("约 " + str(TRANSFER_ABSENCE_SPACING_SECONDS) + " 秒后再核对一次" if complete
+                             else "完整时间窗结束后再核对两次")
+                    return view("unknown", label + "，本次两侧流水均无该笔划转；" + later + "；" + SETTLE_WAIT)
+                self._resolve_skipped(writer, ids, open_ops, rejected=True)
+                settled.append("rejected")
+            else:
+                record["failures"] += 1
+                self.store.put(key, state)
+                return view("unknown", label + "，两侧流水只部分匹配，继续有限次核对；" + SETTLE_WAIT)
+            records.pop(0)
+            self.store.put(key, state)
+        state.pop("unsettled_transfers", None)
+        if not settled:
+            self.store.put(key, state)
+            return None
+        # Do not plan a new transfer in the same check that settled the old
+        # one: wait a cooldown and start again from fresh balances.
+        now = time.time()
+        state["cooldown_until"] = max(state.get("cooldown_until", 0),
+            now + max(config["cooldown_seconds"], TRANSFER_ABSENCE_SPACING_SECONDS))
+        self.store.put(key, state)
+        if "confirmed" in settled:
+            self._invalidate(members)
+        outcome = "已由两侧流水核实到账" if settled[-1] == "confirmed" else "已核实未送达并结算"
+        return self._view(state, config, "cooldown", "上次结果未知的划转" + outcome
+                          + "；冷却结束后按最新余额重新评估，原请求不会重发")
+
+    @staticmethod
+    def _resolve_skipped(writer, ids, operation_ids, *, rejected=False):
+        with writer.accounts(ids):
+            for operation_id in operation_ids:
+                writer.resolve_prefix(operation_id, rejected=rejected)
+
     def _reconcile(self, pair, members, state, config):
         pending = state["pending"]
         if pending.get("status") == "submitting":
@@ -629,28 +867,7 @@ class MarginBalancer:
         if observation.get("queried"):
             recovery["query_rounds"] += 1
         self._record_success(pair, state)
-        matches = []
-        for side, sign in ((pending["source"], -1), (pending["destination"], 1)):
-            found = set()
-            for row in rows[side]:
-                txn = _identifier(row.get("tranId"))
-                kind = row.get("incomeType")
-                if row.get("asset") != "USD1" or kind not in TRANSFER_TYPES or not txn:
-                    continue
-                if pending.get("transaction_id") and txn != pending["transaction_id"]:
-                    continue
-                if [kind, txn] in pending.get("before_receipts", {}).get(side, []):
-                    continue
-                if [kind, txn] in state.get("used_receipts", []):
-                    continue
-                try:
-                    stamp = dec(row.get("time"))
-                    amount = dec(row.get("income"))
-                except TradingError:
-                    continue
-                if start <= stamp <= end and amount == dec(pending["amount"]) * sign:
-                    found.add((kind, txn))
-            matches.append(found)
+        matches = self._receipt_matches(pending, rows, state, start, end)
         common = matches[0] & matches[1]
         if len(common) != 1 or any(len(values) != 1 for values in matches):
             if recovery["query_rounds"] >= TRANSFER_HISTORY_QUERY_LIMIT and time.time() >= deadline:
@@ -851,6 +1068,10 @@ class MarginBalancer:
                 if pending["status"] == "acknowledged":
                     return self._refresh_acknowledged(pair, members, state, config)
                 return self._reconcile(pair, members, state, config)
+            # Settle a skipped unknown transfer even while balancing is disabled
+            # or the pair is paused, so a later urgent transfer is not the first
+            # to meet the blocker. Its own spacing bounds the reads.
+            held = None if self.engine.workspace.active else self._settle_skipped(pair, members, state, config)
             if self.engine.workspace.active:
                 reason = "工作台维护中，暂停新划转"
                 workspace = self.engine.workspace
@@ -859,6 +1080,8 @@ class MarginBalancer:
                         and now >= workspace.display_due.get(pair["id"], 0)):
                     reason = self._maintenance_read(pair, config, now, snapshot_loader) or reason
                 return self._view(state, config, "paused", reason, blocks=True)
+            if held is not None:
+                return held
             if not config["enabled"]:
                 return self._view(state, config, "disabled", "自动保证金平衡未启用")
             if not margin_running(pair, self.store.get("pair_margin_control:" + pair["id"])):

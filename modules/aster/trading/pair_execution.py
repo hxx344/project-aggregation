@@ -208,7 +208,7 @@ class PairTrader:
         margin = self.store.get("pair_margin:" + pair["id"], {})
         from .margin_balance import MarginBalancer
         if (not pair["margin"]["enabled"] and isinstance(margin, dict)
-                and margin.get("pending") is None and not MarginBalancer.unsettled_rejection(margin)):
+                and margin.get("pending") is None and not MarginBalancer.unsettled_shared(margin)):
             result = MarginBalancer.status_view(pair, margin, state.get("margin"))
             self._observe_margin_alert(pair, result, None)
             return result
