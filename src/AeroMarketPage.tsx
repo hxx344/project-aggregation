@@ -61,9 +61,9 @@ function pairMatches(pool: MarketPool, kind: PairKind) {
 }
 // 空输入表示不限；非数字同样不限，避免输入过程中的中间态把表格清空。
 const limitOf = (text: string) => { if (!text.trim()) return null; const v = Number(text); return Number.isFinite(v) && v >= 0 ? v : null; };
-type SortKey = 'score' | 'avgScore' | 'net' | 'avgNet' | 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
+type SortKey = 'score' | 'avgScore' | 'net' | 'recApr' | 'avgNet' | 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
 const SORTS: Record<SortKey, (m: Metrics) => number | null> = {
-  score: (m) => m.score, avgScore: (m) => m.avg?.score ?? null, net: (m) => m.best?.result.net ?? null, avgNet: (m) => m.avg?.best?.result.net ?? null,
+  score: (m) => m.score, avgScore: (m) => m.avg?.score ?? null, net: (m) => m.best?.result.net ?? null, recApr: (m) => m.best?.result.emission ?? null, avgNet: (m) => m.avg?.best?.result.net ?? null,
   tvl: (m) => m.pool.tvlUsd, staked: (m) => m.stakedShare, emission: (m) => m.aeroPerDay, emissionTvl: (m) => m.emissionTvl, apr: (m) => m.apr, narrowApr: (m) => m.narrowApr,
   vol24h: (m) => m.pool.vol24h?.daily ?? null, vol7d: (m) => m.pool.vol7d?.daily ?? null, days: (m) => m.daysIn, change: (m) => m.change,
 };
@@ -492,7 +492,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       <div className="lp-table-scroll"><table className="lp-table am-table">
         <thead><tr>
           <th scope="col">池子</th>
-          {header('score', '收益波动比', '净年化 ÷ 年化波动（σ × √365）')}{header('avgScore', '平均收益波动比', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}平均净年化 ÷ 平均年化波动`)}{header('net', '净年化', '推荐区间：按 tickSpacing 粒度搜索以当前价居中、预计在区间不短于「最短在区间」的区间中净年化最高者（排放 − 无常损失 − 停摆 − 调仓成本）')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，在预设宽度与推荐区间宽度中取平均值最高者`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
+          {header('score', '收益波动比', '净年化 ÷ 年化波动（σ × √365）')}{header('avgScore', '平均收益波动比', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}平均净年化 ÷ 平均年化波动`)}{header('net', '净年化', '推荐区间：按 tickSpacing 粒度搜索以当前价居中、预计在区间不短于「最短在区间」的区间中净年化最高者（排放 − 无常损失 − 停摆 − 调仓成本）')}{header('recApr', '推荐年化', '推荐区间的排放年化（按当前价位质押流动性稀释）；下方为扣掉的无常损失、停摆与调仓合计，扣完即净年化')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，在预设宽度与推荐区间宽度中取平均值最高者`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
           {header('emission', '日排放', '每天发给该池的 AERO')}{header('emissionTvl', '排放/TVL', '年化排放价值除以池子 TVL')}
           {header('apr', '区间年化', '所选区间宽度下的排放年化')}{header('narrowApr', '最窄年化', '单个 tickSpacing 区间的排放年化')}
           {header('vol24h', '日波动 24h', '小时对数收益折算到 1 天')}{header('vol7d', '日波动 7d')}
@@ -506,6 +506,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <td className="num strong">{m.score === null ? '—' : m.score.toFixed(1)}</td>
               <td className="num" title={averageNote(m)}>{m.avg?.score == null ? '—' : m.avg.score.toFixed(1)}</td>
               <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `${rangeLabel(m.pool, m.best.range)} · ${days(m.best.result.days)}` : ''}</small></td>
+              <td className="num">{pct(m.best?.result.emission, 0)}<small>{m.best ? `扣 ${pct(m.best.result.impermanent + m.best.result.downtime + m.best.result.rebalance, 0)}` : ''}</small></td>
               <td className={`num ${(m.avg?.best?.result.net ?? 0) > 0 ? 'up' : (m.avg?.best?.result.net ?? 0) < 0 ? 'down' : ''}`} title={averageNote(m)}>{pct(m.avg?.best?.result.net, 0)}<small>{m.avg?.best ? `${m.avg.best.label} · ${m.avg.hours} 小时` : ''}</small></td>
               <td className="num">{usd(m.pool.tvlUsd)}</td><td className="num">{pct(m.stakedShare, 0)}</td>
               <td className="num">{m.aeroPerDay === null ? '—' : amount(m.aeroPerDay)}<small>{usd(m.emissionUsdYear === null ? null : m.emissionUsdYear / 365)}</small></td>
@@ -516,7 +517,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <td className={`num ${(m.change ?? 0) > 0 ? 'up' : (m.change ?? 0) < 0 ? 'down' : ''}`} title={quoteOf(m.pool).pair}>{signed(m.change)}</td>
             </tr>;
         })}
-        {!rows.length ? <tr><td colSpan={15} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
+        {!rows.length ? <tr><td colSpan={16} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
       </table></div>
       {rows.length > limit ? <div className="am-more"><button className="button secondary" onClick={() => setLimit((v) => v + 60)}>显示更多（共 {rows.length} 个）</button></div> : null}
     </section>
