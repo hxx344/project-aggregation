@@ -808,6 +808,37 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((self.shared_state(operation_id), self.follow_up()["failures"]), ("unknown", 3))
         self.assertEqual(len(self.posts()), 1)
 
+    def test_a_full_window_of_two_milliseconds_is_incomplete(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, _ = self.window()
+        same = [{"asset": "USD1", "incomeType": "COMMISSION", "income": "-0.01", "tranId": index + 1,
+                 "time": start + 5000} for index in range(1000)]
+        calls = self.paged_income({"long": same})
+        with patch.object(margin_balance, "TRANSFER_INCOME_MAX_PAGES", 64):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertIn("极短时间窗", result["reason"])
+        self.assertLessEqual(calls[-1][2] - calls[-1][1], 1)
+        self.assertEqual((self.follow_up()["failures"], self.shared_state(operation_id)), (1, "unknown"))
+
+    def test_too_many_conflicting_receipts_go_to_manual_review(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        limit = margin_balance.TRANSFER_EVIDENCE_LIMIT
+        self.income_rows = {"long": [{**self.receipt("debit-" + str(index)), "income": "-1000.00000000"}
+                                     for index in range(limit + 1)]}
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertIn("人工核对", result["reason"])
+        record = self.follow_up()
+        self.assertEqual((len(record["evidence"]), record["failures"], record["empty"]),
+                         (limit, margin_balance.TRANSFER_HISTORY_QUERY_LIMIT, 0))
+        self.assertTrue(MarginBalancer._valid_unsettled(record))
+        queried = len(self.income_queries())
+        result = self.complete_read()
+        self.assertEqual((result["status"], len(self.income_queries())), ("blocked", queried), result)
+        self.assertEqual((self.shared_state(operation_id), len(self.posts())), ("unknown", 1))
+
     def test_official_acknowledgement_is_durable_before_shared_finish(self):
         original = self.writer.registry.finish
         observed = []

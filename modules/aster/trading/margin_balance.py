@@ -891,8 +891,10 @@ class MarginBalancer:
                 # that the transfer may exist, so later empty reads cannot
                 # reject it.
                 record["failures"] += 1
-                self._add_evidence(record, source, destination)
+                overflow = self._add_evidence(record, source, destination)
                 self.store.put(key, state)
+                if overflow:
+                    return view("blocked", label + "，两侧流水出现过多冲突回执；" + SETTLE_MANUAL)
                 return view("unknown", label + "，两侧流水只部分匹配，继续有限次核对；" + SETTLE_WAIT)
             records.pop(0)
             self.store.put(key, state)
@@ -919,12 +921,14 @@ class MarginBalancer:
                 (record["destination"], destination)) for kind, txn in sorted(found)]
         merged = evidence + [item for item in seen if item not in evidence]
         if not merged:
-            return
-        if len(merged) > TRANSFER_EVIDENCE_LIMIT:
+            return False
+        overflow = len(merged) > TRANSFER_EVIDENCE_LIMIT
+        if overflow:
             # Too many conflicting receipts to check later: a person decides.
             merged = merged[:TRANSFER_EVIDENCE_LIMIT]
             record["failures"] = TRANSFER_HISTORY_QUERY_LIMIT
         record.update(empty=0, evidence=merged)
+        return overflow
 
     def _keep_evidence(self, record, observation, state, start, end):
         """Keep receipts from the pages a failed read did complete; never confirm from them."""
