@@ -24,7 +24,7 @@ export const AssetTrend = memo(function AssetTrend({ ledger, today, onHistory }:
   const monthlyHint = !month ? '上个自然月没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`
     : month.returnRate === null ? '首末快照估值须完整，起始调整后资产须大于 0，变化率需为有效数值'
-    : `${month.startDate} — ${month.endDate} · ${month.daysSpan} 天`;
+    : `当月 ${formatReturnRate(month.returnRate)} · ${month.startDate} — ${month.endDate} · ${month.daysSpan} 天`;
   return <section className="panel trend-panel">
     <div className="panel-h"><h2>资产变化</h2><span className="panel-h-right">北京时间 · USD</span></div>
     <div className="trend-summary">
