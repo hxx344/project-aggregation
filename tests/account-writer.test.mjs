@@ -362,6 +362,33 @@ test('Python six legacy UNKNOWN orders backfill safely and admit Node T0 without
   assert.throws(() => writer.prepare(current, 'another-transfer', marginPayload()), code('ACCOUNT_UNRESOLVED'));
 });
 
+test('expired Aster unknown writes stop gating margin transfers', (t) => {
+  const f = fixture(t); const writer = f.writer('aster'); const values = marginIdentities(); const ticket = bindClaim(writer, values);
+  const orderTicket = subsetTicket(ticket, [accountKey(values[0])]);
+  writer.finish(writer.prepare(ticket, 'old-transfer', marginPayload()), 'unknown');
+  writer.importUnknown(ticket, 'old-opaque', { kind: 'order', purpose: 'margin' });
+  const age = (milliseconds, columns = ['created_at', 'updated_at']) => { for (const name of columns) writeRows(f.databasePath, `UPDATE aw_operations SET ${name}=${name}-? WHERE state='unknown'`, milliseconds); };
+  // Expiry runs from the last update (after the send ended), not creation.
+  age(1_200_000, ['created_at']);
+  assert.throws(() => writer.prepare(ticket, 'created-long-ago', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  age(115_000, ['updated_at']);
+  assert.throws(() => writer.prepare(ticket, 'early', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  age(5_000, ['updated_at']);
+  const transfer = writer.prepare(ticket, 'after-expiry', marginPayload());
+  assert.equal(writer.assertOwned(transfer), true);
+  writer.finish(transfer, 'rejected');
+  // An expired opaque write still gates ordinary orders; an expired transfer does not.
+  assert.throws(() => writer.prepare(orderTicket, 'order', { order: legacyOrder() }), code('ACCOUNT_UNRESOLVED'));
+  writer.resolve('old-opaque', ticket, 'rejected');
+  const order = writer.prepare(orderTicket, 'order', { order: legacyOrder() });
+  assert.equal(writer.assertOwned(order), true);
+  writer.finish(order, 'rejected');
+  writeRows(f.databasePath, "UPDATE aw_operations SET module_id='hub' WHERE operation_id='old-transfer'");
+  assert.throws(() => writer.prepare(ticket, 'foreign-expired', marginPayload()), code('ACCOUNT_UNRESOLVED'));
+  writeRows(f.databasePath, "UPDATE aw_operations SET module_id='aster' WHERE operation_id='old-transfer'");
+  assert.deepEqual(writer.unresolved(ticket).map((row) => [row.operationId, row.updatedAt > row.createdAt]), [['old-transfer', true]]);
+});
+
 test('margin transfer rejects forged priority, invalid request semantics and incomplete identities', (t) => {
   const f = fixture(t); const writer = f.writer('aster'); const values = marginIdentities(); const ticket = bindClaim(writer, values);
   const bad = [
@@ -798,5 +825,5 @@ test('Python registry contract and failure scenarios run under the normal Node t
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 30 tests/);
+  assert.match(result.stderr, /Ran 31 tests/);
 });

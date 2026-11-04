@@ -190,7 +190,8 @@ class ManagedWriter:
             needs_rejection = isinstance(rejection, dict) and rejection.get("settled") is not True
             # A skipped unknown transfer is settled through the master binding,
             # also after balancing is disabled.
-            follow_up = isinstance(margin_state, dict) and margin_state.get("unsettled_transfers") not in (None, [])
+            follow_up = isinstance(margin_state, dict) and (margin_state.get("unsettled_transfers") not in (None, [])
+                                                            or margin_state.get("unsettled_operations") not in (None, []))
             if prefix and (pair.get("margin", {}).get("enabled") or pending or needs_rejection or follow_up):
                 configured["master:" + prefix] = prefix
         with self.lock:
