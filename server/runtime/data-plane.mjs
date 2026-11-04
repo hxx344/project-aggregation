@@ -20,6 +20,7 @@ import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
+import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroLp } from '../automation/aero-lp.mjs';
 import { aeroLpValuation } from '../automation/aero-lp-valuation.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
@@ -47,6 +48,7 @@ export function resolveWarmup({ warmupEnabled = process.env.WARMUP_ENABLED !== '
 // stream counts through reportApiStats() (design doc 5.8).
 export function createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir, log, accountWriter = null,
   researchEnabledByDefault = embeddedModules,
+  aeroMarketEnabledByDefault = embeddedModules && process.env.NODE_ENV !== 'test' && process.env.AERO_MARKET_SCAN !== 'false',
   refreshInterval = 30000, timeoutMs = 5000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset,
   assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow,
   assetPositionsBackgroundMs = assetSyncIntervalMs > 0 ? 30000 : 0, assetFillsBackgroundMs = assetSyncIntervalMs > 0 ? ASSET_FILLS_BACKGROUND_MS : 0,
@@ -57,6 +59,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const { stmt, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
   const research = createEntropyLighterResearch({ dataDir, enabledByDefault: researchEnabledByDefault, log });
+  // 只读链上行情；测试、非内置实例与 AERO_MARKET_SCAN=false 时默认不扫描，避免启动即访问公共 RPC；页面保存的配置优先。
+  const aeroMarket = createAeroMarket({ dataDir, enabledByDefault: aeroMarketEnabledByDefault, log });
   const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
     readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
@@ -241,6 +245,32 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '启动和停止不接受额外参数');
       return reply(200, await research[action](authorize));
     }
+    if (pathname === '/api/research/aero-market' || pathname.startsWith('/api/research/aero-market/')) {
+      if (pathname === '/api/research/aero-market' && method === 'GET') {
+        const keys = [...url.searchParams.keys()];
+        const raw = url.searchParams.get('revision');
+        if (keys.some((k) => k !== 'revision') || keys.length > 1 || (raw !== null && !/^\d{1,12}$/.test(raw))) throw new HttpError(400, '市场接口只接受 revision 参数');
+        return reply(200, aeroMarket.state(raw === null ? {} : { since: Number(raw) }));
+      }
+      if (pathname === '/api/research/aero-market/pool' && method === 'GET') {
+        const keys = [...url.searchParams.keys()].sort().join(',');
+        if (keys !== 'address,chain') throw new HttpError(400, '请提供 chain 与 address');
+        return reply(200, aeroMarket.pool(url.searchParams.get('chain'), url.searchParams.get('address')));
+      }
+      if (url.search) throw new HttpError(400, '市场接口不接受查询参数');
+      const action = pathname === '/api/research/aero-market/config' && method === 'PUT' ? 'save'
+        : pathname === '/api/research/aero-market/refresh' && method === 'POST' ? 'refresh' : null;
+      if (!action) throw new HttpError(404, '市场接口不存在');
+      const body = await bodyOf();
+      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
+      authorize();
+      if (action === 'save') {
+        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供扫描配置');
+        return reply(200, await aeroMarket.save(body.config, authorize));
+      }
+      if (Object.keys(body).length) throw new HttpError(400, '刷新不接受额外参数');
+      return reply(200, aeroMarket.refresh(authorize));
+    }
     if (pathname === '/api/automation/aero-lp' || pathname.startsWith('/api/automation/aero-lp/')) {
       if (url.search) throw new HttpError(400, 'LP 接口不接受查询参数');
       if (pathname === '/api/automation/aero-lp' && method === 'GET') return reply(200, aeroLp.state());
@@ -396,7 +426,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
     prepareStop: () => aeroLp.prepareStop(),
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroLp.initialize(); feishuDigest.initialize(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroMarket.initialize(); await aeroLp.initialize(); feishuDigest.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -408,6 +438,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await aeroMarket.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }
