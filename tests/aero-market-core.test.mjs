@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dilutedApr, emissionRate, expectedDaysInRange, liquidityUnitUsd, poolPrice, priceChange, rangeTicks, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
+import { emissionRate, poolPrice, priceChange, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
+import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, rangeTicks } from '../src/aero-market-math.ts';
 
 const Q96 = 2 ** 96;
 const sqrtX96 = (rawPrice) => BigInt(Math.round(Math.sqrt(rawPrice) * Q96)).toString();

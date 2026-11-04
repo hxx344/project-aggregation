@@ -3,7 +3,7 @@ import type { FormEvent } from 'react';
 import { ArrowDown, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, Save, Settings2 } from 'lucide-react';
 import { CartesianGrid, Line, LineChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, ApiError } from './api';
-import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, rangeTicks } from '../server/research/aero-market-core.mjs';
+import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, rangeTicks } from './aero-market-math';
 import type { MarketChain, MarketConfig, MarketPool, MarketPoolHistory, MarketSnapshot, MarketUnchanged } from './aero-market-types';
 import './aero-lp.css';
 import './aero-market.css';
