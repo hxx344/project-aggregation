@@ -21,6 +21,7 @@ import { createPortalStore } from '../control/portal-store.mjs';
 import { updateSettings } from '../control/update-state.mjs';
 import { clientAddress } from '../slot-protocol.mjs';
 import { HttpError, send, readJson, readJsonBody, errorResponder } from '../http-common.mjs';
+import { createHostStatus } from '../host-status.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
@@ -74,7 +75,7 @@ export function supervisorTransports(supervisor) {
 // comes through attach(); probe connections take only GET and HEAD and no
 // upgrades once the slot serves.
 export function createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime, executionJobs, candidate = false, privateProbe = false,
-  updatesClient, secureCookies, configuredOrigin, distDir, loginLimits = resolveLoginLimits(), resolveTransport,
+  updatesClient, secureCookies, configuredOrigin, distDir, dataDir, loginLimits = resolveLoginLimits(), resolveTransport,
   overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS, statsIntervalMs = STATS_INTERVAL_MS, drainMs = REQUEST_TIMEOUT_MS }) {
   const { loginWindowMs, accountLockoutMs } = loginLimits;
   const { getSetting, setSetting, sessions, projects } = control;
@@ -86,6 +87,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     ...updateSettings(control),
   });
   let updates = candidate ? null : coordinator();
+  const hostStatus = createHostStatus({ dataDir });
   // Supervisor state joined with the trading maintenance gate; no pids, paths or secrets.
   async function moduleStatus() {
     const status = await supervisor.status();
@@ -298,12 +300,14 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
-    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/modules') {
+    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/modules' || pathname === '/api/system/host') {
       if (req.method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取基线');
       if (req.headers.origin) sameOrigin(req);
       if (pathname === '/api/system/modules') { send(res, 200, await moduleStatus()); return; }
+      // Served by the control plane itself, so it still answers while the data plane is down.
+      if (pathname === '/api/system/host') { send(res, 200, await hostStatus.read()); return; }
       await forward(req, res, url, current); return;
     }
     const moduleRestart = /^\/api\/system\/modules\/([^/]+)\/restart$/.exec(pathname);

@@ -92,7 +92,7 @@ export async function startApi({ dataDir, logger = defaultLogger, signal, fail =
     api = createApiServer({ control, catalog: createProjectCatalog({ control, embeddedModules: true }), encrypt: noCredentials, decrypt: noCredentials, embeddedModules: true, log: logger,
       supervisor, runtime: createSocketDataClient({ dir, connection, log: logger }), executionJobs: createExecutionJobsReader(db),
       candidate: !serving, privateProbe: !!slot, updatesClient, secureCookies: env.COOKIE_SECURE === 'true',
-      configuredOrigin: env.PUBLIC_ORIGIN ? validateAuthOrigin(env.PUBLIC_ORIGIN) : '', distDir, loginLimits, resolveTransport: supervisorTransports(supervisor) });
+      configuredOrigin: env.PUBLIC_ORIGIN ? validateAuthOrigin(env.PUBLIC_ORIGIN) : '', distDir, dataDir: resolvedData, loginLimits, resolveTransport: supervisorTransports(supervisor) });
     // A module in fault or backoff must not keep the API from starting: its
     // execution entry stays refused until it is confirmed, and the release
     // watcher keeps retrying it.
