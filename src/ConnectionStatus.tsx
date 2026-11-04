@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import type { SyntheticEvent } from 'react';
 import { Activity } from 'lucide-react';
 import { api } from './api';
 import { checkConnectionHealth, createConnectionMonitor, initialConnectionState } from './connection-quality';
@@ -27,7 +28,9 @@ export default function ConnectionStatus() {
     };
   }, []);
   const label = labels[state.quality];
-  return <details className={`connection-status connection-${state.quality}`}>
+  // On narrow screens the topbar panels share a corner: opening this one closes the others.
+  const toggle = (event: SyntheticEvent<HTMLDetailsElement>) => { const self = event.currentTarget; if (self.open) self.closest('.topbar-right')?.querySelectorAll('details[open]').forEach(other => { if (other !== self) (other as HTMLDetailsElement).open = false; }); };
+  return <details className={`connection-status connection-${state.quality}`} onToggle={toggle}>
     <summary aria-label={`本机到服务器：${label}${state.latencyMs !== null ? `，${state.latencyMs} 毫秒` : ''}`}>
       <Activity size={15} aria-hidden="true" /><span className="connection-label">本机 → 服务器</span>
       <span role="status">{label}</span>{state.latencyMs !== null ? <span className="connection-latency">{state.latencyMs} ms</span> : null}
