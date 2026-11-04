@@ -236,6 +236,130 @@ test('unexpected exits restart with backoff, then fault', async () => {
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
+// Restart budget used up: no child or retry timer, but control.json still says enabled=true.
+async function faulted(directory) {
+  const run = managerWith(directory, { manager: { retryDelays: [] } });
+  await run.manager.initialize(); await run.manager.setKey(KEY); await run.manager.start();
+  run.workers[0].emit('close', 1);
+  await until(() => run.manager.state().state === 'fault');
+  assert.equal(JSON.parse(readFileSync(join(directory, 'aero-lp/control.json'), 'utf8')).enabled, true);
+  return run;
+}
+const savedAddress = (directory) => JSON.parse(readFileSync(join(directory, 'aero-lp/wallet.json'), 'utf8')).address;
+const savedEnabled = (directory) => JSON.parse(readFileSync(join(directory, 'aero-lp/control.json'), 'utf8')).enabled;
+
+test('a key change whose stop cannot be saved publishes no new wallet, so a restart keeps the old pairing', async () => {
+  const directory = fixtureDir();
+  const other = '0x' + '22'.repeat(32);
+  const first = await faulted(directory);
+  try {
+    // The temp file cannot be written; the old control.json (enabled=true) stays valid, as with ENOSPC.
+    const blocked = join(directory, 'aero-lp/control.json.tmp');
+    mkdirSync(blocked);
+    await assert.rejects(first.manager.setKey(other), (error) => error.status === 500 && /启停设置保存失败，钱包未更换/.test(error.message));
+    assert.equal(savedAddress(directory), ADDRESS);
+    assert.equal(savedEnabled(directory), true);
+    // Memory still matches the file instead of claiming a stop that a restart would not honour.
+    assert.equal(first.manager.state().enabled, true); assert.equal(first.manager.state().wallet, ADDRESS);
+    await assert.rejects(first.manager.clearKey(), (error) => error.status === 500 && /钱包未清除/.test(error.message));
+    assert.equal(savedAddress(directory), ADDRESS); assert.equal(first.manager.state().enabled, true);
+    rmSync(blocked, { recursive: true });
+  } finally { await first.manager.close(); }
+  const second = managerWith(directory);
+  try {
+    await second.manager.initialize();
+    // Only the wallet the user had started may come back; the new key never reached disk.
+    await until(() => second.workers.length === 1);
+    assert.equal(second.manager.state().wallet, ADDRESS);
+    second.workers[0].emit('message', { type: 'aero-lp-ready' });
+    assert.equal(second.workers[0].sent.find((message) => message.type === 'aero-lp-key').key, KEY);
+  } finally { await second.manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a key change whose wallet write fails stays stopped with the old wallet intact across a restart', async () => {
+  const directory = fixtureDir();
+  const other = '0x' + '22'.repeat(32);
+  const first = await faulted(directory);
+  try {
+    const blocked = join(directory, 'aero-lp/wallet.json.tmp');
+    mkdirSync(blocked);
+    await assert.rejects(first.manager.setKey(other), (error) => error.status === 500 && /钱包保存失败，原钱包未更换，调仓已保持停止/.test(error.message));
+    // The stop reached disk first; this is also the state a crash between the two writes leaves behind.
+    assert.equal(savedEnabled(directory), false); assert.equal(first.manager.state().enabled, false);
+    assert.equal(savedAddress(directory), ADDRESS); assert.equal(first.manager.state().wallet, ADDRESS);
+    rmSync(blocked, { recursive: true });
+  } finally { await first.manager.close(); }
+  const second = managerWith(directory);
+  try {
+    await second.manager.initialize();
+    await delay(50);
+    assert.equal(second.launches.length, 0);
+    assert.equal(second.manager.state().state, 'stopped'); assert.equal(second.manager.state().wallet, ADDRESS);
+    // The old credential still decrypts: an explicit start runs it.
+    await second.manager.start();
+    second.workers[0].emit('message', { type: 'aero-lp-ready' });
+    assert.equal(second.workers[0].sent.find((message) => message.type === 'aero-lp-key').key, KEY);
+  } finally { await second.manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a failed key change during recovery quarantine stops without promising a restart and logs no key', async () => {
+  const directory = fixtureDir();
+  const other = '0x' + '22'.repeat(32);
+  await (await faulted(directory)).manager.close();
+  let admitted = false; const warnings = [];
+  const held = managerWith(directory, { manager: { readAdmission: () => admitted, log: { ...silent, warn: (...args) => warnings.push(args) } } });
+  try {
+    await held.manager.initialize();
+    assert.match(held.manager.state().error, /隔离恢复/); assert.equal(held.launches.length, 0);
+    mkdirSync(join(directory, 'aero-lp/wallet.json.tmp'));
+    await assert.rejects(held.manager.setKey(other), (error) => error.status === 500 && !error.message.includes(other.slice(2)));
+    const after = held.manager.state();
+    assert.equal(after.state, 'stopped'); assert.equal(after.error, null); assert.equal(savedEnabled(directory), false);
+    // Admission returning must not start the signer the failed change just stopped.
+    admitted = true; await delay(100);
+    assert.equal(held.launches.length, 0);
+    assert.equal(warnings.length, 1);
+    const logged = JSON.stringify(warnings, (key, value) => value instanceof Error ? { message: value.message, ...value } : value);
+    assert.ok(!logged.includes(other.slice(2)) && !logged.includes(KEY.slice(2)), 'warnings never carry a key');
+  } finally { await held.manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a start whose run setting cannot be saved stays stopped in memory as on disk', async () => {
+  const directory = fixtureDir();
+  const { manager, launches } = managerWith(directory);
+  try {
+    await manager.initialize(); await manager.setKey(KEY);
+    mkdirSync(join(directory, 'aero-lp/control.json.tmp'));
+    await assert.rejects(manager.start(), (error) => error.status === 500 && /调仓未启动/.test(error.message));
+    assert.equal(manager.state().enabled, false); assert.equal(manager.state().state, 'stopped');
+    assert.equal(savedEnabled(directory), false); assert.equal(launches.length, 0);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a start retried after a fault whose save fails keeps the run setting that is on disk', async () => {
+  const directory = fixtureDir();
+  const { manager, workers } = await faulted(directory);
+  try {
+    mkdirSync(join(directory, 'aero-lp/control.json.tmp'));
+    await assert.rejects(manager.start(), (error) => error.status === 500 && /调仓未启动/.test(error.message));
+    assert.equal(manager.state().enabled, true); assert.equal(savedEnabled(directory), true);
+    assert.equal(manager.state().state, 'fault'); assert.equal(workers.length, 1);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a wallet that cannot be renamed into place leaves no ciphertext of the new key behind', async () => {
+  const directory = fixtureDir();
+  const { manager } = managerWith(directory);
+  try {
+    await manager.initialize();
+    // A non-empty directory at the wallet path: the temp file is written, then the rename fails.
+    mkdirSync(join(directory, 'aero-lp/wallet.json')); writeFileSync(join(directory, 'aero-lp/wallet.json/keep'), '');
+    await assert.rejects(manager.setKey(KEY), (error) => error.status === 500 && /钱包保存失败/.test(error.message));
+    assert.equal(existsSync(join(directory, 'aero-lp/wallet.json.tmp')), false);
+    assert.equal(manager.state().enabled, false); assert.equal(manager.state().wallet, null);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
 test('workbench maintenance pauses transactions in the running child', async () => {
   const directory = fixtureDir(); let maintenance = false;
   const { manager, workers } = managerWith(directory, { manager: { readMaintenance: () => maintenance } });
