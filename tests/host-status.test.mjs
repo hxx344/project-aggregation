@@ -10,12 +10,12 @@ const GiB = 1024 ** 3;
 const core = (busy, idle) => ({ model: ' Test CPU ', times: { user: busy, nice: 0, sys: 0, idle, irq: 0 } });
 const fsInfo = (blocks, bfree, bavail) => ({ bsize: 4096, blocks, bfree, bavail });
 function fixture({ ticks, disks = {}, devices = {}, meminfo = 'SwapTotal:  2097152 kB\nSwapFree:   1048576 kB\n' }) {
-  let at = 0, index = 0;
+  let at = 0, index = 0, waits = 0;
   const host = createHostStatus({ dataDir: '/data', now: () => at, cpus: () => ticks[Math.min(index++, ticks.length - 1)],
     totalmem: () => 8 * GiB, freemem: () => 2 * GiB, loadavg: () => [0.123, 0.5, 1], uptime: () => 90061.7, meminfo: async () => meminfo,
     statDisk: async target => { if (!disks[target]) throw new Error('missing'); return disks[target]; },
-    statPath: async target => ({ dev: devices[target] ?? 1 }), wait: async () => {} });
-  return { host, advance: ms => { at += ms; } };
+    statPath: async target => ({ dev: devices[target] ?? 1 }), wait: async () => { waits++; await new Promise(resolve => setImmediate(resolve)); } });
+  return { host, advance: ms => { at += ms; }, samples: () => index, waits: () => waits };
 }
 
 test('host status reports CPU between readings, memory, swap and disks without paths', async () => {
@@ -38,9 +38,27 @@ test('host status reports CPU between readings, memory, swap and disks without p
   advance(1000); assert.equal((await host.read()).cpu.usagePercent, 90);
 });
 
+test('host status samples afresh after a long gap or a change in core count, and shares one first sample', async () => {
+  const { host, advance, samples, waits } = fixture({ ticks: [
+    [core(0, 100)], [core(50, 150)],
+    [core(1050, 1150)], [core(1060, 1240)],
+    [core(1100, 1300), core(0, 10)], [core(1108, 1342), core(2, 58)],
+  ] });
+  const [a, b] = await Promise.all([host.read(), host.read()]);
+  assert.equal(a.cpu.usagePercent, 50); assert.equal(b.cpu.usagePercent, 50);
+  assert.equal(samples(), 2, 'concurrent first reads share one pair of samples'); assert.equal(waits(), 1);
+  // An hour without readers: the busy average over the gap (1000/2000) is not reported.
+  advance(3_600_000); assert.equal((await host.read()).cpu.usagePercent, 10); assert.equal(samples(), 4);
+  // A core coming online brings its whole counters; that reading is skipped, the next one counts again.
+  advance(2000); assert.equal((await host.read()).cpu.usagePercent, 10); assert.equal((await host.read()).cpu.cores, 2);
+  advance(2000); assert.equal((await host.read()).cpu.usagePercent, 10);
+});
+
 test('host status merges the data directory into the system disk and keeps a failed disk visible', async () => {
   const same = fixture({ ticks: [[core(0, 10)]], disks: { '/data': fsInfo(10, 5, 5), '/': fsInfo(10, 5, 5) } });
   assert.deepEqual((await same.host.read()).disks.map(disk => disk.label), ['数据目录（系统盘）']);
+  const subvolume = fixture({ ticks: [[core(0, 10)]], disks: { '/data': fsInfo(10, 5, 5), '/': fsInfo(10, 5, 5) }, devices: { '/data': 40, '/': 41 } });
+  assert.deepEqual((await subvolume.host.read()).disks.map(disk => disk.label), ['数据目录（系统盘）'], 'btrfs subvolumes differ only in st_dev');
   const broken = fixture({ ticks: [[core(0, 10)]], disks: { '/': fsInfo(10, 5, 5) }, meminfo: 'MemTotal: 1 kB\n' });
   const value = await broken.host.read();
   assert.deepEqual(value.disks[0], { id: 'data', label: '数据目录', error: '无法读取' });
@@ -61,6 +79,7 @@ test('host status endpoint needs a same-origin session and is read-only', async 
   const cookie = login.headers.get('set-cookie').split(';')[0], { csrfToken } = await login.json();
   assert.equal((await fetch(route)).status, 401);
   assert.equal((await fetch(route, { headers: { Cookie: cookie, Origin: 'https://wrong.example' } })).status, 403);
+  assert.equal((await fetch(route, { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'same-site' } })).status, 403);
   assert.equal((await fetch(route + '?x=1', { headers: { Cookie: cookie } })).status, 400);
   assert.equal((await fetch(route, { method: 'POST', headers: { Cookie: cookie, Origin: origin, 'X-CSRF-Token': csrfToken } })).status, 405);
   const response = await fetch(route, { headers: { Cookie: cookie } });

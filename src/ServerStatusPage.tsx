@@ -39,14 +39,15 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const lifetime = useRef<AbortController | null>(null);
-  const inFlight = useRef(false);
+  // Bound to the lifetime that started it, so a remount (StrictMode) is not blocked by the aborted read.
+  const inFlight = useRef<AbortSignal | null>(null);
   const read = useCallback(async () => {
     const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted || inFlight.current) return;
-    inFlight.current = true; setLoading(true);
+    if (!signal || signal.aborted || inFlight.current === signal) return;
+    inFlight.current = signal; setLoading(true);
     try { const data = await api<HostStatus>('/api/system/host', { signal, timeoutMs: 10_000 }); if (!signal.aborted) { setStatus(data); setError(''); } }
     catch (reason) { if (!signal.aborted) { if (reason instanceof ApiError && reason.status === 401) onExpired(); else setError(message(reason)); } }
-    finally { inFlight.current = false; if (!signal.aborted) setLoading(false); }
+    finally { if (inFlight.current === signal) inFlight.current = null; if (!signal.aborted) setLoading(false); }
   }, [onExpired]);
   useEffect(() => {
     const controller = new AbortController(); lifetime.current = controller;
