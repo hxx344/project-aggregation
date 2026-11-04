@@ -100,7 +100,8 @@ test('scan builds rows with prices, emission and backfilled volatility, then ret
   assert.ok(weth.vol24h?.daily > 0); assert.equal(weth.vol7d, null);
   assert.equal(base.history.archive, 'archive');
   const next = clock.pending()[0];
-  assert.equal(next.ms, 15 * 60 * 1000);
+  assert.equal(base.history.pending, 168 - 1 - 24, '7 天整点中还有这些没补');
+  assert.equal(next.ms, 30_000, 'unfinished backfill continues soon instead of waiting the full interval');
 
   // revision 未变时只回 unchanged。
   assert.deepEqual(Object.keys(market.state({ since: state.revision })).sort(), ['revision', 'schema', 'serverNow', 'unchanged']);
@@ -118,7 +119,7 @@ test('scan builds rows with prices, emission and backfilled volatility, then ret
   fake.chain.failState = false;
   await clock.fire(); await settle(market);
   assert.equal(market.state().chains.find((c) => c.id === 'base').status, 'ok');
-  assert.equal(clock.pending()[0].ms, 15 * 60 * 1000);
+  assert.equal(clock.pending()[0].ms, 30_000);
   await market.close();
 
   // 重启后从磁盘恢复行与历史，不必等下一轮。
@@ -175,6 +176,44 @@ test('backfill tracks requested hours, so a block-time estimate error never re-r
   // 偏差下较早整点的实际时间离整点已超过 20 分钟。
   assert.ok(points.some((p) => Math.abs(p.t - p.slot) > 1200));
   assert.ok(points.length >= 72);
+});
+
+test('current rows publish before backfill, and backfill batches follow every 30 s until done', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const readHistory = fake.reads.readPoolHistory;
+  fake.reads.readPoolHistory = async (...args) => { await gate; return readHistory(...args); };
+  const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  await market.initialize();
+  const before = market.state().revision;
+  await clock.fire();
+  for (let i = 0; i < 20 && !market.state().pools.length; i++) await new Promise((r) => setTimeout(r, 5));
+  let state = market.state();
+  assert.equal(state.chains.find((c) => c.id === 'base').status, 'loading', 'backfill still running');
+  assert.equal(state.pools.length, 2, 'current rows are visible while history is backfilled');
+  assert.ok(state.revision > before);
+  release(); await settle(market);
+  const delays = [];
+  for (let i = 0; i < 10; i++) {
+    delays.push(clock.pending()[0].ms);
+    if (delays.at(-1) !== 30_000) break;
+    fake.chain.t += 30; await clock.fire(); await settle(market);
+  }
+  // 167 个整点按每批 24 个，要 7 批；之后回到常规间隔。
+  assert.deepEqual(delays, [30_000, 30_000, 30_000, 30_000, 30_000, 30_000, 15 * 60 * 1000]);
+  state = market.state();
+  assert.equal(state.chains.find((c) => c.id === 'base').history.pending, 0);
+  assert.equal(new Set(fake.chain.historyBlocks).size, fake.chain.historyBlocks.length, 'no hour is read twice');
+
+  // 回填出错（如限流）不追批，按常规间隔再试。
+  fake.chain.t += 3 * 3600; fake.chain.failHistory = 'timeout';
+  await clock.fire(); await settle(market);
+  assert.ok(market.state().chains.find((c) => c.id === 'base').history.pending > 0);
+  assert.equal(clock.pending()[0].ms, 15 * 60 * 1000);
+  await market.close();
 });
 
 test('config is strict, invalid saved config falls back with a notice, and refresh is rate limited', async (t) => {

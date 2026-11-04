@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowDown, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, Save, Settings2 } from 'lucide-react';
+import { ArrowDown, ArrowLeftRight, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, Save, Settings2 } from 'lucide-react';
 import { CartesianGrid, Line, LineChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, ApiError } from './api';
 import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, rangeTicks } from './aero-market-math';
@@ -56,21 +56,24 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
   };
 }
 
-// 以美元价较高的代币为基准报价，例如 WETH/USDC 显示每 WETH 多少 USDC。
-function quoteOf(pool: MarketPool) {
-  const invert = (pool.token1.usd ?? 0) > (pool.token0.usd ?? 0);
+// 默认以美元价较高的代币为基准报价，例如 WETH/USDC 显示每 WETH 多少 USDC；flip 时反过来。
+function quoteOf(pool: MarketPool, flip = false) {
+  const invert = ((pool.token1.usd ?? 0) > (pool.token0.usd ?? 0)) !== flip;
   const scale = 10 ** (pool.token0.decimals - pool.token1.decimals);
   const price = (tick: number) => { const raw = 1.0001 ** tick * scale; return invert ? 1 / raw : raw; };
   const label = invert ? `${pool.token1.symbol} / ${pool.token0.symbol}` : `${pool.token0.symbol} / ${pool.token1.symbol}`;
-  return { price, label: `每 ${invert ? pool.token1.symbol : pool.token0.symbol} 折合 ${invert ? pool.token0.symbol : pool.token1.symbol}`, pair: label };
+  return { price, label: `每 ${invert ? pool.token1.symbol : pool.token0.symbol} 折合 ${invert ? pool.token0.symbol : pool.token1.symbol}`, pair: label, base: invert ? pool.token1.symbol : pool.token0.symbol, quote: invert ? pool.token0.symbol : pool.token1.symbol };
 }
 const priceText = (v: number) => (v >= 1000 ? v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : v >= 1 ? v.toPrecision(6) : v.toPrecision(5));
 
 function PoolDetail({ metrics, history, error, width }: { metrics: Metrics; history: MarketPoolHistory | null; error: string; width: number }) {
   const { pool, range } = metrics;
-  const quote = quoteOf(pool);
+  const [flip, setFlip] = useState(false);
+  const quote = quoteOf(pool, flip);
   const data = (history?.points ?? []).map(([t, tick]) => ({ t, price: quote.price(tick) }));
   const [lo, hi] = [quote.price(range[0]), quote.price(range[1])].sort((a, b) => a - b);
+  // 反向报价常是 0.000xxx 这类长刻度：按最长刻度文字留宽，避免左侧被截。
+  const yWidth = Math.min(104, 16 + 7 * Math.max(...[lo, hi, ...data.map((d) => d.price)].map((v) => priceText(v).length)));
   return <div className="am-detail">
     <dl className="am-detail-facts">
       <div><dt>池子</dt><dd><code>{pool.address}</code></dd></div>
@@ -83,13 +86,14 @@ function PoolDetail({ metrics, history, error, width }: { metrics: Metrics; hist
       <div><dt>代币报价</dt><dd>{pool.token0.symbol} {usd(pool.token0.usd)} · {pool.token1.symbol} {usd(pool.token1.usd)}<small>从稳定币按池子深度逐级推算</small></dd></div>
     </dl>
     <figure className="am-chart" aria-label={`${pairName(pool)} 近 7 天价格，共 ${data.length} 个点`}>
-      <figcaption>近 7 天价格（{quote.label}），阴影为所选区间</figcaption>
+      <figcaption><span>近 7 天价格（{quote.label}），阴影为所选区间</span>
+        <button type="button" className="button secondary am-swap" onClick={() => setFlip((v) => !v)} aria-pressed={flip} title={`改为每 ${quote.quote} 折合 ${quote.base}`}><ArrowLeftRight size={13} />{quote.quote} / {quote.base}</button></figcaption>
       {error ? <p className="lp-error">{error}</p> : !history ? <p className="muted"><LoaderCircle size={14} className="spin" /> 正在读取历史…</p> : data.length < 2 ? <p className="muted">历史样本不足，扫描运行几个小时后会出现。</p>
         : <div className="am-chart-box"><ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 240 }} minWidth={0}>
           <LineChart data={data} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
             <CartesianGrid vertical={false} stroke="var(--surface-5)" />
             <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} tickFormatter={(v) => dates.format(Number(v))} tickLine={false} axisLine={false} minTickGap={48} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} />
-            <YAxis width={72} domain={[(min: number) => Math.min(min, lo), (max: number) => Math.max(max, hi)]} tickFormatter={(v) => priceText(Number(v))} tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} />
+            <YAxis width={yWidth} domain={[(min: number) => Math.min(min, lo), (max: number) => Math.max(max, hi)]} tickFormatter={(v) => priceText(Number(v))} tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} />
             <ReferenceArea y1={lo} y2={hi} fill="var(--accent)" fillOpacity={0.08} stroke="none" ifOverflow="extendDomain" />
             <Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString('zh-CN')} formatter={(v) => [priceText(Number(v)), quote.pair]} contentStyle={{ backgroundColor: 'var(--surface-3)', color: 'var(--text-primary)', border: '1px solid var(--surface-6)', borderRadius: 8, fontSize: 13 }} />
             <Line type="linear" dataKey="price" stroke="var(--accent)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
@@ -241,7 +245,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <div className="am-chain-head"><strong>{c.name}</strong><span className="am-chain-status">{c.status === 'loading' ? <LoaderCircle size={12} className="spin" /> : null}{stale ? '数据过期' : STATUS[c.status]}</span></div>
         <span>{c.activeCount ?? '—'} 个跟踪 / {c.poolCount ?? '—'} 个池 · {c.gaugeCount ?? '—'} 个有 gauge</span>
         <span>数据 {when(c.updatedAt)}{c.nextAt && c.enabled ? ` · 下次 ${when(c.nextAt)}` : ''}</span>
-        <span title={c.rpcHost}>{HISTORY[c.history.archive]} · {c.history.points} 点</span>
+        <span title={c.rpcHost}>{HISTORY[c.history.archive]} · {c.history.points} 点{c.history.pending > 0 ? ` · 还差 ${c.history.pending} 小时，每 30 秒补一批` : ''}</span>
         {c.error ? <span className="lp-error" title={c.error}>{when(c.errorAt)} {c.error}</span> : null}
       </div>;
     })}</section>

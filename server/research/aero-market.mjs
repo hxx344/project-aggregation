@@ -16,6 +16,8 @@ const HISTORY_SEC = 7 * 86400;
 const RATE_HISTORY_SEC = 25 * HOUR; // 这段时间内的历史点保留排放累计，更早的只留 tick
 const DISCOVERY_SEC = 6 * HOUR;
 const BACKFILL_PER_CYCLE = 24;
+// 回填未完成时不等常规间隔：每批之间只歇这么久，7 天历史几分钟补齐，而不是按 15 分钟一批拖近 2 小时。
+const BACKFILL_FOLLOW_SEC = 30;
 const RETRY_SEC = [60, 120, 300, 600];
 const MANUAL_MIN_GAP_MS = 30_000;
 const LIMITS = { registry: 8 * 1024 * 1024, history: 32 * 1024 * 1024, snapshot: 8 * 1024 * 1024, config: 64 * 1024 };
@@ -111,7 +113,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   let revision = Math.floor(Date.now() / 1000);
   const abort = new AbortController();
   const runtimes = new Map(AERO_CHAINS.map((c) => [c.id, { registry: null, snapshot: null, prev: null, history: { schema: 1, points: [] }, rows: [], rpc: null, rpcUrl: '',
-    status: 'idle', rediscover: false, error: null, errorAt: null, checkedAt: null, nextAt: null, running: null, timer: null, failures: 0, lastStart: 0, archive: null, writes: Promise.resolve() }]));
+    status: 'idle', backfillPending: 0, rediscover: false, error: null, errorAt: null, checkedAt: null, nextAt: null, running: null, timer: null, failures: 0, lastStart: 0, archive: null, writes: Promise.resolve() }]));
   const changed = () => { revision += 1; };
 
   function rpcFor(id) {
@@ -165,16 +167,20 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
 
   async function backfill(id, rpc, active, block, nowSec) {
     const rt = runtimes.get(id);
-    if (!rt.registry.blockTime || rt.archive?.failedAt && nowSec - rt.archive.failedAt < DISCOVERY_SEC) return;
+    rt.backfillPending = 0;
+    if (!rt.registry.blockTime || rt.archive?.failedAt && nowSec - rt.archive.failedAt < DISCOVERY_SEC) return false;
     const points = rt.history.points;
     // 按请求的整点判断是否已读：出块时间外推有偏差时，实际时间戳可能离整点超过 20 分钟，不能据此反复重读。
     const covered = (slot) => points.some((p) => p.slot === slot || Math.abs(p.t - slot) <= 1200);
     const slots = [];
-    for (let slot = floorHour(nowSec); slot > nowSec - HISTORY_SEC; slot -= HOUR) if (slot < nowSec - 60 && !covered(slot)) slots.push(slot);
+    // 早于创世区块的整点读不到，不计入待补数，否则会一直追批。
+    const targetOf = (slot) => block - Math.round((nowSec - slot) / rt.registry.blockTime);
+    for (let slot = floorHour(nowSec); slot > nowSec - HISTORY_SEC; slot -= HOUR) if (slot < nowSec - 60 && !covered(slot) && targetOf(slot) >= 1) slots.push(slot);
+    rt.backfillPending = slots.length;
     for (const slot of slots.slice(0, BACKFILL_PER_CYCLE)) {
-      if (closed) return;
-      const target = block - Math.round((nowSec - slot) / rt.registry.blockTime);
-      if (target < 1) continue;
+      if (closed) return false;
+      const target = targetOf(slot);
+      rt.backfillPending--;
       try {
         const read = await reads.readPoolHistory(rpc, active, target, slot >= nowSec - RATE_HISTORY_SEC);
         const rows = {};
@@ -182,16 +188,20 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
         points.push({ t: read.timestamp, slot, block: target, rows });
         rt.archive = { ok: true };
       } catch (error) {
-        if (closed) return;
+        rt.backfillPending++;
+        if (closed) return false;
         // 节点明确拒绝历史状态（非归档节点）时停止回填，6 小时后再试并改用本机样本；
         // 超时、限流等瞬时错误只结束本轮回填，下一轮继续。都不影响本轮当前数据。
         if (error?.kind === 'node') {
           rt.archive = { ok: false, failedAt: nowSec, error: error.message };
           log.warn?.({ type: 'aero-market', chain: id, err: error.message }, 'Aero 历史区块读取失败，改用本机累计样本');
+          rt.backfillPending = 0;
         }
-        break;
+        // 出错（含限流、超时）后按常规间隔再试，不连续追批。
+        return false;
       }
     }
+    return rt.backfillPending > 0;
   }
 
   function compactHistory(rt, nowSec) {
@@ -220,13 +230,16 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       if (rt.prev?.states[address]) rt.prev.states[address] = { ...rt.prev.states[address], rewardShare: null };
     }
     const nowSec = snapshot.t;
-    if (chain.archive) await backfill(id, rpc, active, block, nowSec);
+    // 先发布本轮当前数据，再回填历史：回填一批要十几秒，不能挡住价格、TVL 和排放的更新。
+    rt.rows = buildRows({ chain, registry, snapshot, prev: rt.prev, history: rt.history }); changed();
+    const follow = chain.archive ? await backfill(id, rpc, active, block, nowSec) : false;
     // 非归档链（或回填失败时）用本轮读数作为小时样本。
     const last = rt.history.points.at(-1);
     if ((!chain.archive || rt.archive?.ok === false) && (!last || nowSec - last.t >= 3000)) rt.history.points.push({ t: nowSec, block, rows: Object.fromEntries(Object.entries(snapshot.states).map(([a, s]) => [a, fullRow(s)])) });
     compactHistory(rt, nowSec);
     rt.rows = buildRows({ chain, registry, snapshot, prev: rt.prev, history: rt.history });
     persist(id);
+    return follow;
   }
 
   function persist(id) {
@@ -245,9 +258,9 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     rt.lastStart = now(); rt.status = rt.snapshot ? rt.status : 'loading'; changed();
     rt.running = (async () => {
       try {
-        await cycle(id);
+        const follow = await cycle(id);
         rt.status = 'ok'; rt.error = null; rt.errorAt = null; rt.failures = 0;
-        schedule(id, config.intervalMin * 60);
+        schedule(id, follow ? Math.min(BACKFILL_FOLLOW_SEC, config.intervalMin * 60) : config.intervalMin * 60);
       } catch (error) {
         if (closed) return;
         rt.status = 'error'; rt.error = String(error?.message || error).slice(0, 240); rt.errorAt = now();
@@ -301,7 +314,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
         return { id: c.id, name: c.name, enabled: config.enabled && cfg.enabled, rpcHost: rpcHost(cfg.rpcUrl), status: config.enabled && cfg.enabled ? rt.running ? 'loading' : rt.status : 'disabled',
           updatedAt: rt.snapshot ? rt.snapshot.t * 1000 : null, checkedAt: rt.checkedAt, nextAt: rt.nextAt, error: rt.error, errorAt: rt.errorAt,
           poolCount: rt.registry?.poolCount ?? null, activeCount: rt.registry?.active.length ?? null, gaugeCount: rt.registry ? rt.registry.pools.filter((p) => p.gauge).length : null,
-          history: { points: points.length, from: points.length ? points[0].t * 1000 : null, archive: c.archive ? rt.archive?.ok === false ? 'unavailable' : 'archive' : 'local' } };
+          history: { points: points.length, from: points.length ? points[0].t * 1000 : null, archive: c.archive ? rt.archive?.ok === false ? 'unavailable' : 'archive' : 'local', pending: rt.backfillPending } };
       }),
       pools: AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).flatMap((c) => runtimes.get(c.id).rows),
     };
