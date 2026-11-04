@@ -2,7 +2,8 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { ArrowLeft, ArrowLeftRight, CircleAlert, Crosshair, LoaderCircle, Minus, Plus, RefreshCw, Star, ZoomIn, ZoomOut } from 'lucide-react';
 import { api, ApiError } from './api';
-import { expectedDaysInRange, fullRange, netYield, priceText, quoteOf, rangeAmounts, rangeApr, rangeLabel, rangeTicks, rebalanceCost, riskVolOf } from './aero-market-math';
+import { expectedDaysInRange, fullRange, netYield, priceText, quoteOf, rangeAmounts, rangeApr, rangeLabel, rangeTicks, rebalanceCostOf, riskVolOf } from './aero-market-math';
+import type { RebalancePlan } from './aero-market-math';
 import type { NetYield } from './aero-market-math';
 import { dates, days, message, pct, tokenAmount, usd } from './aero-market-format';
 import type { MarketLiquidity, MarketPool, MarketPoolHistory } from './aero-market-types';
@@ -22,11 +23,11 @@ type Edge = 'lower' | 'upper';
 type View = { center: number; half: number };
 type Evaluation = { apr: number | null; net: NetYield | null; days: number | null; inRange: boolean };
 
-function evaluate(pool: MarketPool, aeroUsd: number | null, range: [number, number], deposit: number): Evaluation {
+function evaluate(pool: MarketPool, aeroUsd: number | null, range: [number, number], deposit: number, plan: RebalancePlan): Evaluation {
   const inRange = pool.tick >= range[0] && pool.tick < range[1];
   const vol = riskVolOf(pool);
   const apr = inRange ? rangeApr(pool, aeroUsd, range, deposit) : null;
-  return { apr, inRange, net: netYield({ apr, tick: pool.tick, lower: range[0], upper: range[1], dailyVol: vol, costFraction: rebalanceCost(pool, deposit) }), days: expectedDaysInRange(pool.tick, range[0], range[1], vol) };
+  return { apr, inRange, net: netYield({ apr, tick: pool.tick, lower: range[0], upper: range[1], dailyVol: vol, costFraction: rebalanceCostOf(pool, deposit).total, delayDays: plan.delayDays }), days: expectedDaysInRange(pool.tick, range[0], range[1], vol) };
 }
 const presetRange = (pool: MarketPool, width: number): [number, number] => (width < 0 ? fullRange(pool.tickSpacing) : rangeTicks(pool.tick, pool.tickSpacing, width));
 const sameRange = (a: [number, number], b: [number, number]) => a[0] === b[0] && a[1] === b[1];
@@ -46,11 +47,11 @@ function useWidth() {
 }
 
 type Props = {
-  pool: MarketPool; chainName: string; aeroUsd: number | null; initialWidth: number; recommended: [number, number] | null; depositText: string; onDeposit: (text: string) => void;
+  pool: MarketPool; chainName: string; aeroUsd: number | null; initialWidth: number; recommended: [number, number] | null; plan: RebalancePlan; depositText: string; onDeposit: (text: string) => void;
   favorite: boolean; favoriteDisabled: boolean; onFavorite: () => void; onBack: () => void; onExpired: () => void; notice?: string; children?: ReactNode;
 };
 
-export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth, recommended, depositText, onDeposit, favorite, favoriteDisabled, onFavorite, onBack, onExpired, notice, children }: Props) {
+export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth, recommended, plan, depositText, onDeposit, favorite, favoriteDisabled, onFavorite, onBack, onExpired, notice, children }: Props) {
   const spacing = pool.tickSpacing, full = fullRange(spacing);
   const deposit = Math.max(Number(depositText) || 0, 0);
   const [flip, setFlip] = useState(false);
@@ -169,11 +170,14 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
   const [liquidityBox, liquidityWidth] = useWidth();
   const [priceBox, priceWidth] = useWidth();
   const clipId = `am-clip-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
-  const selected = evaluate(pool, aeroUsd, range, deposit);
+  const selected = evaluate(pool, aeroUsd, range, deposit, plan);
+  const cost = rebalanceCostOf(pool, deposit);
+  const cycle = selected.days === null || selected.days === Infinity ? null : selected.days + plan.delayDays;
+  const perYear = cycle !== null && cycle > 0 ? 365 / cycle : null;
   const amounts = rangeAmounts(pool, range, deposit);
   // 推荐区间排在最前：列表按同一投入搜索得到，与预设重合时高亮推荐。
   const rows = [...(recommended ? [{ width: NaN, label: '推荐', range: recommended }] : []), ...PRESETS.map((p) => ({ ...p, range: presetRange(pool, p.width) }))]
-    .map((r) => ({ ...r, result: evaluate(pool, aeroUsd, r.range, deposit) }));
+    .map((r) => ({ ...r, result: evaluate(pool, aeroUsd, r.range, deposit, plan) }));
   const activePreset = rows.find((r) => sameRange(r.range, range));
 
   // 显示侧的低价、高价对应哪个 tick 边：报价随 tick 下降时（反向报价）低价是上沿。
@@ -255,8 +259,9 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
     {notice ? <div className="lp-callout warning"><CircleAlert size={15} />{notice}</div> : null}
     <section className="am-rewards" aria-label="所选区间收益">
       <div className="panel"><span>排放年化</span><strong>{selected.inRange ? pct(selected.apr, 1) : '0%'}</strong><small>{!pool.gauge ? '没有 gauge，不产生排放' : !selected.inRange ? '当前价不在区间内，不产生排放' : `按当前价位质押流动性稀释，投入 ${usd(deposit)}`}</small></div>
-      <div className="panel"><span>净年化</span><strong className={(selected.net?.net ?? 0) > 0 ? 'up' : (selected.net?.net ?? 0) < 0 ? 'down' : ''}>{pct(selected.net?.net, 1)}</strong><small>{selected.net ? `排放 ${pct(selected.net.emission, 0)} − 无常损失 ${pct(selected.net.impermanent, 0)} − 调仓 ${pct(selected.net.rebalance, 0)}` : '缺少波动率、排放或当前价不在区间内'}</small></div>
+      <div className="panel"><span>净年化</span><strong className={(selected.net?.net ?? 0) > 0 ? 'up' : (selected.net?.net ?? 0) < 0 ? 'down' : ''}>{pct(selected.net?.net, 1)}</strong><small>{selected.net ? `排放 ${pct(selected.net.emission, 0)} − 无常损失 ${pct(selected.net.impermanent, 0)} − 停摆 ${pct(selected.net.downtime, 0)} − 调仓 ${pct(selected.net.rebalance, 0)}` : '缺少波动率、排放或当前价不在区间内'}</small></div>
       <div className="panel"><span>预计在区间</span><strong>{days(selected.days)}</strong><small>按日波动 {pct(riskVolOf(pool), 2)} 的随机游走估算</small></div>
+      <div className="panel"><span>单次调仓成本</span><strong>{usd(cost.total * deposit)}</strong><small>{deposit > 0 ? `gas ${usd(cost.gasUsd)} + 换 ${usd(cost.swapUsd)} 的手续费 ${pct(cost.fee * 2, 2)}、冲击 ${cost.depthKnown ? pct(cost.slippage * 2, 2) : '深度未知未计'}；所选区间${perYear === null ? (cycle === null ? '不需调仓' : '一直在边沿') : `约每年 ${perYear.toFixed(perYear >= 10 ? 0 : 1)} 次`}，每次停摆 ${(plan.delayDays * 1440).toFixed(0)} 分钟` : '填写投入后计算'}</small></div>
       <div className="panel"><span>手续费年化</span><strong>不计入</strong><small>质押仓位的手续费归投票者；未质押分成 {pool.unstakedFee === null ? '—' : `${(pool.unstakedFee / 1e4).toFixed(0)}%`}</small></div>
     </section>
 
@@ -330,7 +335,7 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
 
     <section className="panel" aria-label="不同区间的年化">
       <div className="lp-table-scroll"><table className="lp-table am-table am-range-table">
-        <thead><tr><th scope="col">区间</th><th scope="col">价格范围（{quote.pair}）</th><th scope="col" className="num">排放年化</th><th scope="col" className="num">无常损失</th><th scope="col" className="num">调仓</th><th scope="col" className="num">净年化</th><th scope="col" className="num">预计在区间</th></tr></thead>
+        <thead><tr><th scope="col">区间</th><th scope="col">价格范围（{quote.pair}）</th><th scope="col" className="num">排放年化</th><th scope="col" className="num">无常损失</th><th scope="col" className="num">停摆</th><th scope="col" className="num">调仓</th><th scope="col" className="num">净年化</th><th scope="col" className="num">预计在区间</th></tr></thead>
         <tbody>{[...rows, ...(activePreset ? [] : [{ label: '自定义', width: NaN, range, result: selected }])].map((r) => {
           const prices = [quote.price(r.range[0]), quote.price(r.range[1])].sort((a, b) => a - b);
           const isFull = sameRange(r.range, full);
@@ -338,13 +343,13 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
             <th scope="row"><button type="button" className="am-pool">{r.label}{r.label === '推荐' ? <small>{rangeLabel(pool, r.range, flip)}</small> : null}</button></th>
             <td>{isFull ? '0 – ∞' : `${priceText(prices[0])} – ${priceText(prices[1])}`}</td>
             <td className="num">{r.result.inRange ? pct(r.result.apr, 0) : '0%'}</td>
-            <td className="num">{pct(r.result.net?.impermanent, 0)}</td><td className="num">{pct(r.result.net?.rebalance, 0)}</td>
+            <td className="num">{pct(r.result.net?.impermanent, 0)}</td><td className="num">{pct(r.result.net?.downtime, 0)}</td><td className="num">{pct(r.result.net?.rebalance, 0)}</td>
             <td className={`num strong ${(r.result.net?.net ?? 0) > 0 ? 'up' : (r.result.net?.net ?? 0) < 0 ? 'down' : ''}`}>{pct(r.result.net?.net, 0)}</td>
             <td className="num">{days(r.result.days)}</td>
           </tr>;
         })}</tbody>
       </table></div>
-      <p className="am-note">推荐区间按 tickSpacing 粒度以当前价居中搜索，在预计至少待满 1 天的居中区间中取净年化最高者，与列表的净年化列一致；预设区间以当前价为中心；排放年化按当前价位的质押流动性稀释，与列表同一口径（假设全程在区间内并质押），净年化 = 排放 − 无常损失 − 调仓成本。流动性分布按 tick 链上读数还原，浅色为全部流动性、深色为其中已质押的部分，只读取当前价 ÷4 至 ×4 内最近的至多 1500 个已初始化 tick。</p>
+      <p className="am-note">推荐区间按 tickSpacing 粒度以当前价居中搜索，在预计在区间不短于列表「最短在区间」的居中区间中取净年化最高者，与列表的净年化列一致；预设区间以当前价为中心；排放年化按当前价位的质押流动性稀释，与列表同一口径（假设全程在区间内并质押），净年化 = 排放 − 无常损失 − 停摆损失 − 调仓成本，按自动调仓估算：单次成本 = gas + 换半个仓位的池子手续费与价格冲击（按本池当前价位流动性近似，未计跨 tick 后流动性变化），停摆与最短在区间取列表的设置。流动性分布按 tick 链上读数还原，浅色为全部流动性、深色为其中已质押的部分，只读取当前价 ÷4 至 ×4 内最近的至多 1500 个已初始化 tick。</p>
     </section>
 
     {children ? <section className="panel am-facts-panel" aria-label="池子数据">{children}</section> : null}
