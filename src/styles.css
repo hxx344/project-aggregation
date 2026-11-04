@@ -185,6 +185,14 @@ small{font-size:.75rem}
 .connection-details .connection-problem{color:var(--error)}
 .connection-route{padding-left:7px;border-left:1px solid var(--surface-5);color:var(--text-secondary)}
 .connection-route.verified{color:var(--emerald)}
+.host-status summary{gap:8px}
+.host-metric{display:inline-flex;align-items:baseline;gap:4px;font-variant-numeric:tabular-nums;color:var(--text-primary)}
+.host-key{color:var(--text-tertiary)}
+.host-metric.warn,.host-worst.warn{color:var(--warning)}
+.host-metric.alert,.host-worst.alert,.host-status.alert>summary{color:var(--error)}
+.host-worst{display:none;font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.host-open{margin-top:8px;padding:0;border:0;background:none;color:var(--accent);font-size:.75rem;cursor:pointer}
+.host-open:hover{text-decoration:underline}
 .local-route-details{border-top:1px solid var(--surface-5);margin-top:12px;padding-top:12px}
 .local-route-details code{display:block;white-space:normal;overflow-wrap:anywhere;margin-top:8px;font-size:.6875rem;color:var(--text-primary)}
 .refresh-label{font-size:.75rem;color:var(--text-tertiary);font-variant-numeric:tabular-nums}
@@ -413,6 +421,8 @@ small{font-size:.75rem}
   .topbar-right{gap:4px;position:relative}
   .connection-status{position:static}
   .connection-status summary{padding-inline:8px;gap:5px}
+  .host-metric{display:none}
+  .host-worst{display:inline}
   .main-content{padding:14px 14px 20px}
   .page-heading{align-items:flex-start}
   .page-heading h1{font-size:1.125rem}
