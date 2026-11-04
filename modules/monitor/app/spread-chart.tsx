@@ -2,10 +2,8 @@
 
 import { memo, useMemo, useState } from "react";
 import { Activity, Check, Info } from "lucide-react";
-import {
-  Area, CartesianGrid, ComposedChart, Line, ReferenceArea, ReferenceDot, ReferenceLine,
-  ResponsiveContainer, Tooltip, XAxis, YAxis,
-} from "recharts";
+import { SvgPlot, createHoverStore, type PlotLayer } from "./svg-plot";
+import { fixedAxis, niceAxis } from "../lib/svg-plot";
 import { selectRange, type Point } from "../lib/market";
 import { sampleChartPoints } from "../lib/chart-sampling";
 import { calculateIndicators, type IndicatorPoint, type SpreadMetric } from "../lib/indicators";
@@ -32,8 +30,13 @@ const beijing = (time: number | string) => beijingFormatter.format(new Date(time
 const premiumText = (v: number | null) => v === null ? "未知" : `${v.toFixed(3)}%`;
 const tradeDetails = (marker: HynixTradeMarker) => tradeDetailLines(marker, beijing, { priceUnit: "", chartLabel: "图表同小时溢价率", chartNote: "小时收盘，未收盘小时为未知" }).join("\n");
 type TradeType = keyof typeof TRADE_TYPES;
+const zLayers: PlotLayer[] = [{ kind: "line", key: "zscore", color: "var(--chart-2)", width: 1.7, active: true }];
+const zZones = [{ from: -2, to: 2, fill: "var(--chart-2)", opacity: 0.035 }];
+const zeroLine = [{ y: 0, color: "var(--muted-foreground)", dash: "4 4" }];
+const premiumFill = <linearGradient id="premiumFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--primary)" stopOpacity={0.21}/><stop offset="100%" stopColor="var(--primary)" stopOpacity={0.01}/></linearGradient>;
+const zReferences = [{ y: 0, color: "var(--muted-foreground)" }, { y: 2, color: "var(--warning)", dash: "4 4" }, { y: -2, color: "var(--warning)", dash: "4 4" }];
 
-/** Recharts places this at the marker's chart value; labels stay React text, never markup. */
+/** Drawn at the marker's chart value; labels stay React text, never markup. */
 function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null; cy?: number | null; marker: HynixTradeMarker; selected: boolean; onSelect: (key: string) => void }) {
   if (cx == null || cy == null || !Number.isFinite(cx) || !Number.isFinite(cy)) return <g/>;
   const type = TRADE_TYPES[marker.event.type as TradeType], select = () => onSelect(marker.event.key);
@@ -60,15 +63,9 @@ function TradePanel({ trades, markers, selected, onSelect, chartMarkers }: { tra
   </section>;
 }
 
-function IndicatorTooltip({ active, payload, mode, enabled, zOnly = false }: {
-  active?: boolean;
-  payload?: { payload: IndicatorPoint }[];
-  mode: Mode;
-  enabled: Toggles;
-  zOnly?: boolean;
-}) {
-  const p = payload?.[0]?.payload;
-  if (!active || !p || p.premium == null) return null;
+/** Gap rows carry null prices and show no tooltip. */
+function indicatorTooltip(p: IndicatorPoint, mode: Mode, enabled: Toggles, zOnly = false) {
+  if (p.premium == null) return null;
   return <div className="chart-tooltip">
     <strong>{stamp(p.time)}</strong>
     {zOnly ? <>
@@ -114,8 +111,6 @@ function SpreadChart({ data, loading, range, onRangeChange, trades }: {
   // Fill premiums use trade prices, so the price chart has no matching axis.
   const plotted = useMemo(() => mode === "price" ? [] : markers.flatMap(marker => { const y = mode === "premium" ? marker.value : marker.usd; return y !== null && Number.isFinite(y) ? [{ marker, y }] : []; }),[markers,mode]);
   const lastTradeTime = plotted.reduce((max,item) => Math.max(max,item.marker.event.time),-Infinity);
-  // Fills in the still-open hour extend both synced charts past the last closed bar.
-  const xDomain = useMemo(() => ["dataMin",(max: number) => Math.max(max,lastTradeTime)] as const,[lastTradeTime]);
   const chartPoints = useMemo(() => points.flatMap((p,i) => i && p.time-points[i-1].time > 3_600_000 ? [
     { time: points[i-1].time+3_600_000, adr: null, equivalent: null, spread: null, premium: null, sma: null, basis: null, upper: null, lower: null, band: null, zscore: null }, p,
   ] : [p]),[points]);
@@ -123,15 +118,40 @@ function SpreadChart({ data, loading, range, onRangeChange, trades }: {
   const sampled = useMemo(() => sampleChartPoints(chartPoints, mode === "price" ? ["adr","equivalent"] : [
     metric, ...(enabled.sma ? ["sma"] as const : []), ...(enabled.bands ? ["basis","upper","lower"] as const : []), ...(enabled.zscore ? ["zscore"] as const : []),
   ]),[chartPoints,mode,metric,enabled]);
-  const domain = useMemo(() => {
-    const values = [...points.flatMap(p => [p[metric], ...(enabled.sma && p.sma !== null ? [p.sma] : []), ...(enabled.bands && p.band ? p.band : [])]), ...plotted.map(item => item.y)];
+  const domain = useMemo((): [number,number] => {
+    const values = [...points.flatMap(p => [p[metric], ...(enabled.sma && p.sma !== null ? [p.sma] : []), ...(enabled.bands && p.band ? p.band : [])]), ...plotted.map(item => item.y)].filter(Number.isFinite);
     if (!values.length) return [0,5];
     return [Math.floor(Math.min(0,...values)/5)*5, Math.ceil(Math.max(0,...values)/5)*5 || 5];
   },[points,metric,enabled.sma,enabled.bands,plotted]);
   const zDomain = useMemo(() => {
     const values = points.flatMap(p => p.zscore === null ? [] : [p.zscore]);
-    return [Math.min(-3,Math.floor(Math.min(0,...values))),Math.max(3,Math.ceil(Math.max(0,...values)))];
+    return [Math.min(-3,Math.floor(Math.min(0,...values))),Math.max(3,Math.ceil(Math.max(0,...values)))] as const;
   },[points]);
+  const priceDomain = useMemo(() => {
+    let low = Infinity, high = -Infinity;
+    for (const p of points) for (const value of [p.adr,p.equivalent]) if (Number.isFinite(value)) { low = Math.min(low,value); high = Math.max(high,value); }
+    return [low,high] as const;
+  },[points]);
+  // Premium/spread and z keep their explicit domains; only the price axis widens to round ticks.
+  const mainAxis = useMemo(() => mode === "price" ? niceAxis(priceDomain[0],priceDomain[1]) : fixedAxis(domain[0],domain[1]),[mode,priceDomain,domain]);
+  const zAxis = useMemo(() => fixedAxis(zDomain[0],zDomain[1]),[zDomain]);
+  // Fills in the still-open hour extend both synced charts past the last closed bar.
+  const xRange = useMemo(() => points.length ? [points[0].time,Math.max(points.at(-1)!.time,lastTradeTime)] as const : [0,1] as const,[points,lastTradeTime]);
+  const layers = useMemo((): PlotLayer[] => mode === "price" ? [
+    { kind: "line", key: "adr", color: "var(--chart-2)", width: 2, active: true },
+    { kind: "line", key: "equivalent", color: "var(--warning)", width: 2, active: true },
+  ] : [
+    ...(enabled.bands ? [
+      { kind: "area", key: "upper", lower: "lower", fill: "var(--chart-5)", opacity: 0.09 },
+      { kind: "line", key: "upper", color: "var(--chart-5)", width: 1, dash: "4 4" },
+      { kind: "line", key: "lower", color: "var(--chart-5)", width: 1, dash: "4 4" },
+      { kind: "line", key: "basis", color: "var(--chart-5)", width: 1, dash: "2 5", opacity: 0.6 },
+    ] as const : []),
+    { kind: "area", key: metric, lower: 0, fill: "url(#premiumFill)" },
+    { kind: "line", key: metric, color: "var(--primary)", width: 2, active: true },
+    ...(enabled.sma ? [{ kind: "line", key: "sma", color: "var(--warning)", width: 1.8 }] as const : []),
+  ],[mode,metric,enabled.bands,enabled.sma]);
+  const [hover] = useState(createHoverStore);
   const zState = !latest || latest.zscore === null ? (latest?.deviation === 0 ? "窗口无波动" : "等待 480 个连续小时") : latest.zscore > 2 ? "高于 +2σ" : latest.zscore < -2 ? "低于 −2σ" : "位于 ±2σ 内";
 
   return <section className="chart-panel" aria-label="历史价差图表">
@@ -159,49 +179,21 @@ function SpreadChart({ data, loading, range, onRangeChange, trades }: {
     </>}
     <div className="chart-container">
       {!points.length ? <div className="empty-chart"><Activity size={28}/><p>{loading ? "正在载入上市以来的历史行情" : "暂无可用行情"}</p><span>{loading ? "统一美元口径，对齐小时收盘时间" : "点击刷新行情重试"}</span></div> :
-        <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{width:800,height:300}}>
-          <ComposedChart data={sampled} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:25,right:14,left:0,bottom:6}} accessibilityLayer>
-            <defs><linearGradient id="premiumFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--primary)" stopOpacity={0.21}/><stop offset="100%" stopColor="var(--primary)" stopOpacity={0.01}/></linearGradient></defs>
-            <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/>
-            <XAxis dataKey="time" type="number" domain={xDomain} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}} dy={10}/>
-            <YAxis orientation="right" width={68} domain={mode === "price" ? ["auto","auto"] : domain} tickFormatter={v => mode === "premium" ? `${v.toFixed(0)}%` : `$${v.toFixed(0)}`} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{fontSize:12}}/>
-            <Tooltip content={<IndicatorTooltip mode={mode} enabled={enabled}/>} cursor={{stroke:"var(--muted-foreground)",strokeDasharray:"3 3"}}/>
-            {mode === "price" ? <>
-              <Line type="linear" dataKey="adr" stroke="var(--chart-2)" strokeWidth={2} dot={false} isAnimationActive={false}/>
-              <Line type="linear" dataKey="equivalent" stroke="var(--warning)" strokeWidth={2} dot={false} isAnimationActive={false}/>
-            </> : <>
-              <ReferenceLine y={0} stroke="var(--muted-foreground)" strokeDasharray="4 4"/>
-              {enabled.bands && <>
-                <Area type="linear" dataKey="band" fill="var(--chart-5)" fillOpacity={0.09} stroke="none" tooltipType="none" isAnimationActive={false}/>
-                <Line type="linear" dataKey="upper" stroke="var(--chart-5)" strokeWidth={1} strokeDasharray="4 4" dot={false} activeDot={false} tooltipType="none" isAnimationActive={false}/>
-                <Line type="linear" dataKey="lower" stroke="var(--chart-5)" strokeWidth={1} strokeDasharray="4 4" dot={false} activeDot={false} tooltipType="none" isAnimationActive={false}/>
-                <Line type="linear" dataKey="basis" stroke="var(--chart-5)" strokeOpacity={0.6} strokeWidth={1} strokeDasharray="2 5" dot={false} activeDot={false} tooltipType="none" isAnimationActive={false}/>
-              </>}
-              <Area type="linear" dataKey={metric} stroke="var(--primary)" strokeWidth={2} fill="url(#premiumFill)" isAnimationActive={false}/>
-              {enabled.sma && <Line type="linear" dataKey="sma" stroke="var(--warning)" strokeWidth={1.8} dot={false} activeDot={false} tooltipType="none" isAnimationActive={false}/>}
-              {plotted.map(({ marker, y }) => <ReferenceDot key={marker.event.key} x={marker.event.time} y={y} shape={props => <TradeMark cx={props.cx} cy={props.cy} marker={marker} selected={selectedKey === marker.event.key} onSelect={setSelectedKey}/>}/>)}
-            </>}
-          </ComposedChart>
-        </ResponsiveContainer>}
+        <SvgPlot rows={sampled} hoverRows={chartPoints} xDomain={xRange} yDomain={mainAxis.domain} yTicks={mainAxis.ticks} yTick={v => mode === "premium" ? `${Number(v.toFixed(2))}%` : `$${Number(v.toFixed(2))}`}
+          layers={layers} references={mode === "price" ? [] : zeroLine} margin={{top:25,right:82,bottom:36}} height={300} hover={hover}
+          label={mode === "price" ? "ADR 与正股 ÷ 10 小时收盘价格走势" : `ADR ${mode === "premium" ? "溢价率" : "每份美元价差"}小时走势`}
+          defs={premiumFill}
+          tooltip={row => indicatorTooltip(row as IndicatorPoint,mode,enabled)}
+          overlay={({ x, y }) => plotted.map(({ marker, y: value }) => <TradeMark key={marker.event.key} cx={x(marker.event.time)} cy={y(value)} marker={marker} selected={selectedKey === marker.event.key} onSelect={setSelectedKey}/>)}/>}
     </div>
     <div className="chart-caption"><span>{mode === "price" ? <><i className="legend-dot adr"/>ADR <i className="legend-dot ordinary"/>正股 ÷ 10</> : <><i className="legend-dot premium"/>ADR {mode === "premium" ? "溢价率" : "每份美元价差"}<span className="zero-line"/>0 = 平价</>}</span><span>{points.length ? `${date(points[0].time,true)} — ${date(points.at(-1)!.time,true)} · ${points.length.toLocaleString()} 个小时${sampled.length < chartPoints.length ? ` · 绘图保留极值与缺口共 ${sampled.length.toLocaleString()} 点，读数与统计使用全部记录` : ""}` : "小时收盘 · UTC"}</span></div>
     {trades && <TradePanel trades={trades} markers={markers} selected={selected} onSelect={setSelectedKey} chartMarkers={mode !== "price"}/>}
     {mode !== "price" && enabled.zscore && <div className="zscore-panel" aria-label="Z-score 历史走势">
       <div className="zscore-heading"><h3><span className="sample-line z-line"/>Z-score <span>20 日</span></h3><span>0 = 近期均值 · 虚线 = ±2σ</span></div>
       <div className="zscore-chart">
-        {points.some(p => p.zscore !== null) ? <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{width:800,height:160}}>
-          <ComposedChart data={sampled} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:12,right:14,left:0,bottom:6}} accessibilityLayer>
-            <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/>
-            <XAxis dataKey="time" type="number" domain={xDomain} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}}/>
-            <YAxis orientation="right" width={68} domain={zDomain} tickFormatter={v => `${v}σ`} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{fontSize:12}}/>
-            <ReferenceArea y1={-2} y2={2} fill="var(--chart-2)" fillOpacity={0.035}/>
-            <ReferenceLine y={0} stroke="var(--muted-foreground)"/>
-            <ReferenceLine y={2} stroke="var(--warning)" strokeDasharray="4 4"/>
-            <ReferenceLine y={-2} stroke="var(--warning)" strokeDasharray="4 4"/>
-            <Tooltip content={<IndicatorTooltip mode={mode} enabled={enabled} zOnly/>} cursor={{stroke:"var(--muted-foreground)",strokeDasharray:"3 3"}}/>
-            <Line type="linear" dataKey="zscore" stroke="var(--chart-2)" strokeWidth={1.7} dot={false} isAnimationActive={false}/>
-          </ComposedChart>
-        </ResponsiveContainer> : <div className="indicator-empty">{latest?.deviation === 0 ? "窗口内价差无波动，Z-score 无法定义。" : "累计 480 个连续小时后显示 Z-score。"}</div>}
+        {points.some(p => p.zscore !== null) ? <SvgPlot rows={sampled} hoverRows={chartPoints} xDomain={xRange} yDomain={zAxis.domain} yTicks={zAxis.ticks} yTick={v => `${v}σ`}
+          layers={zLayers} zones={zZones} references={zReferences} margin={{top:12,right:82,bottom:36}} height={160} hover={hover} label="20 日 Z-score 小时走势"
+          tooltip={row => indicatorTooltip(row as IndicatorPoint,mode,enabled,true)}/> : <div className="indicator-empty">{latest?.deviation === 0 ? "窗口内价差无波动，Z-score 无法定义。" : "累计 480 个连续小时后显示 Z-score。"}</div>}
       </div>
     </div>}
     {mode !== "price" && <details className="indicator-help"><summary><Info size={14}/>指标怎么看</summary><div>

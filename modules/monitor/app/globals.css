@@ -520,3 +520,4 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
   .hub-summary-card .hub-card-status { flex-direction: row; align-items: center; }
   .hub-summary-card .hub-card-status time { max-width: none; }
 }
+.svg-plot{height:100%;width:100%;position:relative}.svg-plot-surface{display:block;overflow:visible;touch-action:pan-y;outline:none}.svg-plot-surface:focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}.svg-plot-tick{fill:var(--muted-foreground);font-size:12px;font-variant-numeric:tabular-nums}.svg-plot-tooltip{position:absolute;top:4px;z-index:2;max-width:calc(100% - 8px);pointer-events:none}.svg-plot-tooltip .chart-tooltip{max-width:100%}
