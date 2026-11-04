@@ -73,3 +73,38 @@ test("switching metric recalculates values without mixing USD and percentage uni
   const precise=calculateIndicators(series([1e9+1,1e9+2,1e9+3]),"premium",{sma:2,bands:3}).at(-1);
   close(precise.deviation,Math.sqrt(2/3));
 });
+
+// Previous slice/shift implementation, kept as the exact reference for the in-place rewrite.
+function referenceIndicators(points,metric,periods){
+  let window=[],previous;
+  const maxPeriod=Math.max(periods.sma,periods.bands);
+  return points.map(point=>{
+    const result={...point,sma:null,basis:null,upper:null,lower:null,band:null,zscore:null,deviation:null,consecutiveHours:0};
+    if(!Number.isFinite(point.time)||!Number.isFinite(point[metric])){window=[];previous=undefined;return result;}
+    if(previous!==undefined&&point.time-previous!==hour) window=[];
+    previous=point.time;
+    window.push(point[metric]);
+    if(window.length>maxPeriod) window.shift();
+    result.consecutiveHours=window.length;
+    const mean=values=>values[0]+values.reduce((sum,x)=>sum+(x-values[0]),0)/values.length;
+    if(window.length>=periods.sma) result.sma=mean(window.slice(-periods.sma));
+    if(window.length>=periods.bands){
+      const values=window.slice(-periods.bands),basis=mean(values);
+      const deviation=Math.sqrt(values.reduce((sum,x)=>sum+(x-basis)**2,0)/values.length);
+      Object.assign(result,{basis,deviation,lower:basis-2*deviation,upper:basis+2*deviation});
+      result.band=[result.lower,result.upper];
+      result.zscore=deviation>0?(point[metric]-basis)/deviation:null;
+    }
+    return result;
+  });
+}
+
+test("in-place windows match the previous implementation exactly across gaps, invalid values and flat runs",()=>{
+  let seed=7;
+  const random=()=>(seed=(seed*16807)%2147483647)/2147483647;
+  const values=Array.from({length:4_000},(_,i)=>i>=900&&i<1_500?42.125:Math.sin(i/41)*30+random()*1e-3+1e6*(i%997===0));
+  const points=series(values).filter((_,i)=>i%1_237!==5).map((point,i)=>i===2_222?{...point,premium:Number.NaN,spread:Infinity}:point);
+  for(const metric of ["premium","spread"]) for(const periods of [{sma:168,bands:480},{sma:480,bands:168},{sma:2,bands:2},{sma:3,bands:5}]){
+    assert.deepEqual(calculateIndicators(points,metric,periods),referenceIndicators(points,metric,periods));
+  }
+});

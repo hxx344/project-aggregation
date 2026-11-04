@@ -22,9 +22,19 @@ export function calculateIndicators(
   if (![periods.sma, periods.bands].every(p => Number.isInteger(p) && p >= 2)) {
     throw new Error("Indicator periods must be integers of at least two hours");
   }
-  let window: number[] = [];
+  // Consecutive values of the current run; `start` trims it to the longest window
+  // without per-hour slices or shifts. Sums keep the original element order.
+  const window: number[] = [];
+  let start = 0;
   let previous: number | undefined;
   const maxPeriod = Math.max(periods.sma, periods.bands);
+  // Two-pass variance avoids cancellation from E[x²] − E[x]².
+  const mean = (from: number) => {
+    const first = window[from];
+    let sum = 0;
+    for (let i = from; i < window.length; i++) sum += window[i] - first;
+    return first + sum / (window.length - from);
+  };
 
   return points.map(point => {
     const result: IndicatorPoint = {
@@ -32,22 +42,23 @@ export function calculateIndicators(
       band: null, zscore: null, deviation: null, consecutiveHours: 0,
     };
     if (!Number.isFinite(point.time) || !Number.isFinite(point[metric])) {
-      window = []; previous = undefined;
+      window.length = 0; start = 0; previous = undefined;
       return result;
     }
-    if (previous !== undefined && point.time - previous !== 3_600_000) window = [];
+    if (previous !== undefined && point.time - previous !== 3_600_000) { window.length = 0; start = 0; }
     previous = point.time;
     window.push(point[metric]);
-    if (window.length > maxPeriod) window.shift();
-    result.consecutiveHours = window.length;
+    if (window.length - start > maxPeriod) start++;
+    const count = window.length - start;
+    result.consecutiveHours = count;
 
-    // Two-pass variance avoids cancellation from E[x²] − E[x]².
-    const mean = (values: number[]) => values[0] + values.reduce((sum, x) => sum + (x - values[0]), 0) / values.length;
-    if (window.length >= periods.sma) result.sma = mean(window.slice(-periods.sma));
-    if (window.length >= periods.bands) {
-      const values = window.slice(-periods.bands);
-      const basis = mean(values);
-      const deviation = Math.sqrt(values.reduce((sum, x) => sum + (x - basis) ** 2, 0) / values.length);
+    if (count >= periods.sma) result.sma = mean(window.length - periods.sma);
+    if (count >= periods.bands) {
+      const from = window.length - periods.bands;
+      const basis = mean(from);
+      let squares = 0;
+      for (let i = from; i < window.length; i++) squares += (window[i] - basis) ** 2;
+      const deviation = Math.sqrt(squares / periods.bands);
       result.basis = basis;
       result.deviation = deviation;
       result.lower = basis - 2 * deviation;

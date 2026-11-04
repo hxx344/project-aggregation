@@ -7,6 +7,7 @@ import {
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import { selectRange, type Point } from "../lib/market";
+import { sampleChartPoints } from "../lib/chart-sampling";
 import { calculateIndicators, type IndicatorPoint, type SpreadMetric } from "../lib/indicators";
 import { ranges } from "../lib/chart-ranges";
 import { hynixTradeEvents, hynixTradeMarkers, type HynixTradeMarker } from "../lib/hynix-trades";
@@ -118,6 +119,10 @@ function SpreadChart({ data, loading, range, onRangeChange, trades }: {
   const chartPoints = useMemo(() => points.flatMap((p,i) => i && p.time-points[i-1].time > 3_600_000 ? [
     { time: points[i-1].time+3_600_000, adr: null, equivalent: null, spread: null, premium: null, sma: null, basis: null, upper: null, lower: null, band: null, zscore: null }, p,
   ] : [p]),[points]);
+  // Long ranges plot bucket extrema only; readings, stats and trade markers keep every hour.
+  const sampled = useMemo(() => sampleChartPoints(chartPoints, mode === "price" ? ["adr","equivalent"] : [
+    metric, ...(enabled.sma ? ["sma"] as const : []), ...(enabled.bands ? ["basis","upper","lower"] as const : []), ...(enabled.zscore ? ["zscore"] as const : []),
+  ]),[chartPoints,mode,metric,enabled]);
   const domain = useMemo(() => {
     const values = [...points.flatMap(p => [p[metric], ...(enabled.sma && p.sma !== null ? [p.sma] : []), ...(enabled.bands && p.band ? p.band : [])]), ...plotted.map(item => item.y)];
     if (!values.length) return [0,5];
@@ -155,7 +160,7 @@ function SpreadChart({ data, loading, range, onRangeChange, trades }: {
     <div className="chart-container">
       {!points.length ? <div className="empty-chart"><Activity size={28}/><p>{loading ? "正在载入上市以来的历史行情" : "暂无可用行情"}</p><span>{loading ? "统一美元口径，对齐小时收盘时间" : "点击刷新行情重试"}</span></div> :
         <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{width:800,height:300}}>
-          <ComposedChart data={chartPoints} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:25,right:14,left:0,bottom:6}} accessibilityLayer>
+          <ComposedChart data={sampled} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:25,right:14,left:0,bottom:6}} accessibilityLayer>
             <defs><linearGradient id="premiumFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--primary)" stopOpacity={0.21}/><stop offset="100%" stopColor="var(--primary)" stopOpacity={0.01}/></linearGradient></defs>
             <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/>
             <XAxis dataKey="time" type="number" domain={xDomain} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}} dy={10}/>
@@ -179,13 +184,13 @@ function SpreadChart({ data, loading, range, onRangeChange, trades }: {
           </ComposedChart>
         </ResponsiveContainer>}
     </div>
-    <div className="chart-caption"><span>{mode === "price" ? <><i className="legend-dot adr"/>ADR <i className="legend-dot ordinary"/>正股 ÷ 10</> : <><i className="legend-dot premium"/>ADR {mode === "premium" ? "溢价率" : "每份美元价差"}<span className="zero-line"/>0 = 平价</>}</span><span>{points.length ? `${date(points[0].time,true)} — ${date(points.at(-1)!.time,true)} · ${points.length.toLocaleString()} 个小时` : "小时收盘 · UTC"}</span></div>
+    <div className="chart-caption"><span>{mode === "price" ? <><i className="legend-dot adr"/>ADR <i className="legend-dot ordinary"/>正股 ÷ 10</> : <><i className="legend-dot premium"/>ADR {mode === "premium" ? "溢价率" : "每份美元价差"}<span className="zero-line"/>0 = 平价</>}</span><span>{points.length ? `${date(points[0].time,true)} — ${date(points.at(-1)!.time,true)} · ${points.length.toLocaleString()} 个小时${sampled.length < chartPoints.length ? ` · 绘图保留极值与缺口共 ${sampled.length.toLocaleString()} 点，读数与统计使用全部记录` : ""}` : "小时收盘 · UTC"}</span></div>
     {trades && <TradePanel trades={trades} markers={markers} selected={selected} onSelect={setSelectedKey} chartMarkers={mode !== "price"}/>}
     {mode !== "price" && enabled.zscore && <div className="zscore-panel" aria-label="Z-score 历史走势">
       <div className="zscore-heading"><h3><span className="sample-line z-line"/>Z-score <span>20 日</span></h3><span>0 = 近期均值 · 虚线 = ±2σ</span></div>
       <div className="zscore-chart">
         {points.some(p => p.zscore !== null) ? <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{width:800,height:160}}>
-          <ComposedChart data={chartPoints} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:12,right:14,left:0,bottom:6}} accessibilityLayer>
+          <ComposedChart data={sampled} syncId="hynix-spread-indicators" syncMethod="value" margin={{top:12,right:14,left:0,bottom:6}} accessibilityLayer>
             <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/>
             <XAxis dataKey="time" type="number" domain={xDomain} tickFormatter={t => date(t)} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} minTickGap={65} tick={{fontSize:12}}/>
             <YAxis orientation="right" width={68} domain={zDomain} tickFormatter={v => `${v}σ`} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{fontSize:12}}/>
