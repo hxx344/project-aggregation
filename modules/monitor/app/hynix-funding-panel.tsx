@@ -4,6 +4,7 @@ import { memo, useMemo, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { ranges } from "../lib/chart-ranges";
+import { sampleChartPoints } from "../lib/chart-sampling";
 import { analyzeHynixFunding, type FundingChartPoint } from "../lib/hynix-funding-analysis";
 import { FUNDING_HOUR, type SettledFundingRow } from "../lib/hynix-funding-history";
 import { useFundingHistory } from "../hooks/use-funding-history";
@@ -36,6 +37,8 @@ function HynixFundingPanel({ range, onRangeChange }: { range: number | null; onR
   const end = data ? Math.max(rows.at(-1)!.time, Math.floor((Date.parse(data.metadata.fetchedAt) - 60_000) / FUNDING_HOUR) * FUNDING_HOUR) : undefined;
   const summary = useMemo(() => analyzeHynixFunding(rows, range, end), [rows, range, end]);
   const selectedMode = modes.find(item => item.id === mode)!;
+  // Long ranges plot bucket extrema and gap edges only; readings and coverage keep every hour.
+  const plotted = useMemo(() => sampleChartPoints(summary.chart, [selectedMode.short, selectedMode.long]), [summary.chart, selectedMode]);
   const unit = mode === "rate" ? "% / 小时" : mode === "annualized" ? "% / 年 · 简单年化" : "% · 区间累计";
   const stale = Boolean(error) || data?.status === "snapshot";
   const readings = [{ key: "short", name: "做空价差", position: "空 ADR、多正股", annualized: summary.shortAnnualized, cumulative: summary.shortCumulative }, { key: "long", name: "做多价差", position: "多 ADR、空正股", annualized: summary.longAnnualized, cumulative: summary.longCumulative }];
@@ -46,14 +49,14 @@ function HynixFundingPanel({ range, onRangeChange }: { range: number | null; onR
     <div className="chart-toolbar"><div className="chart-tabs" aria-label="资金费图表指标">{modes.map(item => <button type="button" key={item.id} aria-pressed={mode === item.id} className={mode === item.id ? "active" : ""} onClick={() => setMode(item.id)}>{item.label}</button>)}</div><span className="chart-unit">{unit}</span></div>
     <div className="funding-chart-key"><span><i className="funding-sample short"/>做空价差</span><span><i className="funding-sample long"/>做多价差</span><small>正值收款 · 负值付款</small><span className="funding-mobile-unit">{unit}</span></div>
     <div className="chart-container funding-curve" aria-label={`${selectedMode.label}曲线`}>
-      {!summary.count ? <div className="empty-chart" role="status"><p>{loading ? "正在载入历史结算费率…" : "所选区间没有共同结算数据"}</p><span>{error || "仅计算双方都有费率的结算小时"}</span></div> : <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{ width: 800, height: 280 }}><LineChart data={summary.chart} margin={{ top: 15, right: 12, left: 0, bottom: 8 }} accessibilityLayer>
+      {!summary.count ? <div className="empty-chart" role="status"><p>{loading ? "正在载入历史结算费率…" : "所选区间没有共同结算数据"}</p><span>{error || "仅计算双方都有费率的结算小时"}</span></div> : <ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{ width: 800, height: 280 }}><LineChart data={plotted} margin={{ top: 15, right: 12, left: 0, bottom: 8 }} accessibilityLayer>
         <CartesianGrid stroke="var(--border)" strokeDasharray="3 5" vertical={false}/><XAxis dataKey="time" type="number" domain={[summary.firstTime! - (summary.expectedHours === 1 ? FUNDING_HOUR / 2 : 0), summary.lastTime! + (summary.expectedHours === 1 ? FUNDING_HOUR / 2 : 0)]} tickFormatter={shortDate} minTickGap={65} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{ fontSize: 12 }}/>
         <YAxis orientation="right" width={76} tickFormatter={value => `${Number((value * 100).toPrecision(3))}%`} domain={[(min: number) => Math.min(-0.00001, min), (max: number) => Math.max(0.00001, max)]} stroke="var(--muted-foreground)" axisLine={false} tickLine={false} tick={{ fontSize: 12 }}/>
         <ReferenceLine y={0} stroke="var(--muted-foreground)" strokeDasharray="4 4"/><Tooltip content={<FundingTooltip/>} cursor={{ stroke: "var(--muted-foreground)", strokeDasharray: "3 3" }} wrapperStyle={{ maxWidth: "100%" }}/>
         <Line dataKey={selectedMode.short} name="做空价差" type="linear" stroke="var(--positive)" strokeWidth={1.8} dot={summary.missingHours ? { r: 1.5 } : summary.count === 1} activeDot={{ r: 4 }} connectNulls={false} isAnimationActive={false}/><Line dataKey={selectedMode.long} name="做多价差" type="linear" stroke="var(--chart-2)" strokeDasharray="5 3" strokeWidth={1.8} dot={summary.missingHours ? { r: 1.5 } : summary.count === 1} activeDot={{ r: 4 }} connectNulls={false} isAnimationActive={false}/>
       </LineChart></ResponsiveContainer>}
     </div>
-    <div className="funding-coverage"><span>{!data ? "正在检查数据覆盖范围…" : <>{summary.count.toLocaleString()} / {summary.expectedHours.toLocaleString()} 个共同结算小时{summary.missingHours > 0 ? ` · 缺少 ${summary.missingHours} 小时，累计仅含已覆盖数据` : " · 覆盖完整"}</>}</span><span>{stamp(summary.firstTime)} — {stamp(summary.lastTime)}</span></div>
+    <div className="funding-coverage"><span>{!data ? "正在检查数据覆盖范围…" : <>{summary.count.toLocaleString()} / {summary.expectedHours.toLocaleString()} 个共同结算小时{summary.missingHours > 0 ? ` · 缺少 ${summary.missingHours} 小时，累计仅含已覆盖数据` : " · 覆盖完整"}{plotted.length < summary.chart.length ? ` · 绘图保留极值与缺口共 ${plotted.length.toLocaleString()} 点` : ""}</>}</span><span>{stamp(summary.firstTime)} — {stamp(summary.lastTime)}</span></div>
     <div className="funding-history-status"><p className={stale ? "funding-stale" : ""} role="status">{status || (data ? "历史费率已同步" : "正在连接历史资金费接口…")}{data && <span> · 获取于 {stamp(data.metadata.fetchedAt)}</span>}</p><button type="button" className="refresh-button" disabled={loading} onClick={refresh}><RefreshCw size={14} className={loading ? "spinning" : ""}/>{loading ? "更新中" : "刷新资金费"}</button></div>
     <p className="funding-method">区间累计年化 = 净小时费率之和 ÷ 有效小时数 × 8,760，不复利。历史图按两腿等名义计算；顶部卡片按固定 10 份 ADR 对 1 股正股计算当前预估年化。</p>
     <button type="button" className="funding-method-toggle" aria-expanded={details} aria-controls="hynix-funding-method" onClick={() => setDetails(!details)}>计算口径与数据来源</button>
