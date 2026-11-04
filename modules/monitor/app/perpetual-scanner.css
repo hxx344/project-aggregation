@@ -573,3 +573,17 @@
   .perp-scanner > .perp-pagination { flex-wrap: wrap; gap: 8px; }
   .perp-scanner > .perp-pagination button { width: 38px; min-height: 38px; height: 38px; }
 }
+
+/* Grouped by asset: the lead row carries a count toggle; other combinations sit indented below it. */
+.perp-scanner .perp-base-cell .scanner-group-toggle { display: inline-flex; align-items: center; gap: 1px; margin-left: 6px; min-height: 18px; padding: 1px 4px; border: 1px solid var(--scanner-border); border-radius: 2px; background: transparent; color: var(--scanner-muted); font-size: 9px; font-weight: 500; line-height: 1.4; vertical-align: 1px; }
+.perp-scanner .perp-base-cell .scanner-group-toggle:hover { border-color: var(--scanner-focus); color: var(--scanner-text); }
+.perp-scanner .perp-base-cell .scanner-group-toggle[aria-expanded="true"] { border-color: var(--scanner-focus); color: var(--scanner-focus); }
+.perp-scanner .perp-base-cell .scanner-group-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+.perp-scanner .perp-scanner-table > tbody > tr.scanner-group-child:not(:hover):not(.perp-row-expanded),
+.perp-scanner .perp-scanner-table > tbody > tr.scanner-group-child:not(:hover):not(.perp-row-expanded) > .perp-base-cell { background: color-mix(in srgb, var(--scanner-hover) 45%, var(--scanner-bg)); }
+.perp-scanner .perp-scanner-table > tbody > tr.scanner-group-child > .perp-base-cell > div { padding-left: 10px; border-left: 2px solid var(--scanner-border); }
+.perp-scanner .perp-scanner-table > tbody > tr.scanner-group-more > td { padding: 8px 14px; color: var(--scanner-muted); font-size: 11px; background: color-mix(in srgb, var(--scanner-hover) 45%, var(--scanner-bg)); }
+.perp-scanner .perp-scanner-table > tbody > tr.scanner-group-more button { margin-left: 10px; padding: 3px 8px; border: 1px solid var(--scanner-border); border-radius: 3px; background: transparent; color: var(--scanner-text); font-size: 11px; }
+.perp-scanner .perp-scanner-table > tbody > tr.scanner-group-more button:hover { border-color: var(--scanner-focus); }
+.perp-scanner .perp-scanner-table > tbody > tr > td:is([data-column="fundingStability"], [data-column="breakEven"]) > div { display: grid; gap: 2px; }
+.perp-scanner .perp-scanner-table > tbody > tr > td:is([data-column="fundingStability"], [data-column="breakEven"]) small { font-size: 10px; white-space: nowrap; }

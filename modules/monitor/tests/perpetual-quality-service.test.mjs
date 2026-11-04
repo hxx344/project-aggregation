@@ -453,3 +453,22 @@ test('quality POST retains shared HTTP authentication, origin, JSON, and request
   assert.deepEqual((await response.json()).positioning, {});
   assert.equal(fetches, 0); assert.equal(writes, 0);
 });
+
+test('history-only reads keep sampling but never start positioning fetches', async t => {
+  const f = fixture(); await f.start(t);
+  const rows = [pair(f.quotes[0], f.quotes[1])];
+  f.service.read({ pairs: rows, positioning: false });
+  assert.equal(f.service.metrics().watchedPairs, 1);
+  await f.service.collectPositioning();
+  assert.equal(f.counts().fetches, 0);
+  // A page that shows positioning enables fetches; a concurrent history-only read does not cancel them.
+  f.service.read({ pairs: rows });
+  f.service.read({ pairs: rows, positioning: false });
+  await f.service.collectPositioning();
+  assert.equal(f.counts().fetches, 1);
+  // Without a positioning reader for longer than the watch window, fetches stop even if history reads continue.
+  f.advance(180_001); f.service.read({ pairs: rows, positioning: false });
+  const fetched = f.counts().fetches;
+  f.advance(300_001); await f.service.collectPositioning();
+  assert.equal(f.counts().fetches, fetched);
+});

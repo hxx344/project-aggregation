@@ -96,7 +96,8 @@ async page => {
       sessionStorage.setItem('scanner-sort-seeded', '1');
       localStorage.setItem(preferenceKey, JSON.stringify({ version: 2, sortBy: 'gross', minSpreadPercent: 0 }));
       localStorage.removeItem('market-monitor:perpetual-capital-assumptions:v1');
-      for (const key of [displayKey, rangeKey, sortKey]) localStorage.removeItem(key);
+      localStorage.setItem(displayKey, JSON.stringify({ version: 3, groupByBase: false }));
+      for (const key of [rangeKey, sortKey]) localStorage.removeItem(key);
     }
     const fixture = window.perpetualSortFixture = { initial, streams: [], created: 0, frames: 0, sequence: 0, long00: 100 };
     window.EventSource = class FixtureEventSource {

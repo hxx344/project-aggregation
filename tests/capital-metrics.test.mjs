@@ -4,6 +4,7 @@ import {
   DEFAULT_CAPITAL_ASSUMPTIONS,
   estimatePairCapital,
   estimatePairCapitalFromRatio,
+  estimateBreakEvenHours,
   estimatePairRoc,
   normalizeCapitalAssumptions,
   parseCapitalAssumptions,
@@ -113,4 +114,30 @@ test("funding cash flow and capital describe the same equal-quantity hedge", () 
     assert.equal(roc.fundingRocAnnualizedPercent, null);
     assert.match(roc.reason, /资金费缺失/);
   }
+});
+
+test("break-even hours repay the ROC scenario's net cost with long-notional weighted funding", () => {
+  // Long 100, short 110, both 1%/8h: carry is 0.1% of the long notional per 8h (L059).
+  const capital = estimatePairCapital({ longPrice: 100, shortPrice: 110, ...DEFAULT_CAPITAL_ASSUMPTIONS });
+  const roc = estimatePairRoc({ netSpreadPercent: -0.3, longFunding8h: 0.01, shortFunding8h: 0.01,
+    shortNotionalPercent: capital.shortNotionalPercent, capitalPercent: capital.capitalPercent, holdingHours: 24 });
+  close(roc.fundingPercent8h, 0.1);
+  const breakEven = estimateBreakEvenHours({ netSpreadPercent: -0.3, fundingPercent8h: roc.fundingPercent8h });
+  assert.equal(breakEven.status, "hours");
+  close(breakEven.hours, 24);
+  // At the break-even holding period the same scenario's ROC is zero.
+  const atBreakEven = estimatePairRoc({ netSpreadPercent: -0.3, longFunding8h: 0.01, shortFunding8h: 0.01,
+    shortNotionalPercent: capital.shortNotionalPercent, capitalPercent: capital.capitalPercent, holdingHours: breakEven.hours });
+  close(atBreakEven.rocPercent, 0);
+  assert.deepEqual(estimateBreakEvenHours({ netSpreadPercent: 0, fundingPercent8h: null }), { status: "covered", hours: 0, reason: "" });
+  assert.equal(estimateBreakEvenHours({ netSpreadPercent: 0.2, fundingPercent8h: -1 }).status, "covered");
+  for (const fundingPercent8h of [0, -0.01]) assert.equal(estimateBreakEvenHours({ netSpreadPercent: -0.1, fundingPercent8h }).status, "never");
+  for (const input of [{ netSpreadPercent: null, fundingPercent8h: 0.1 }, { netSpreadPercent: NaN, fundingPercent8h: 0.1 }, { netSpreadPercent: -0.1, fundingPercent8h: null }]) {
+    const result = estimateBreakEvenHours(input);
+    assert.deepEqual([result.status, result.hours], ["unavailable", null]);
+  }
+  // Every ROC result carries fundingPercent8h, null when it cannot be computed.
+  assert.equal(estimatePairRoc({ ...rocInput, netSpreadPercent: 1, capitalPercent: null, holdingHours: 24 }).fundingPercent8h, null);
+  assert.equal(estimatePairRoc({ ...rocInput, netSpreadPercent: null, capitalPercent: 48, holdingHours: 24 }).fundingPercent8h, null);
+  assert.equal(estimatePairRoc({ ...rocInput, longFunding8h: null, netSpreadPercent: 1, capitalPercent: 48, holdingHours: 24 }).fundingPercent8h, null);
 });

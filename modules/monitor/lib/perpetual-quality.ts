@@ -45,7 +45,11 @@ export interface PairQualityHistory {
   identity?: string;
   /** All history values are percentage points. Funding is normalized to 8h. */
   spread: StabilityStats;
-  funding: StabilityStats & { longStddev: number | null; shortStddev: number | null };
+  funding: StabilityStats & {
+    longStddev: number | null; shortStddev: number | null;
+    /** Optional for reports from older servers. Peak 8h spread and the trailing run of consecutive positive five-minute samples. */
+    max?: number | null; positiveRunMs?: number | null; positiveRunCapped?: boolean;
+  };
   /** A quoted entry-spread narrowing study, not observed exits, trades or realised returns. */
   convergence?: QuoteConvergenceHistory;
   /** Requested for one inspected pair only; real minute observations, never interpolated. */

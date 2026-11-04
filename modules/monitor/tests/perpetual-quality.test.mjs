@@ -587,3 +587,25 @@ test('narrowing rings expire without new ingestion and preserve bounded legacy s
   restored.ingest(sample.bucket, sample.rows, NOW);
   assert.deepEqual(readPair(restored).convergence, readPair(live).convergence);
 });
+
+test('funding peak and trailing positive run stop at a missing five-minute sample', () => {
+  assert.equal(NOW % 300_000, 0);
+  const step = 300_000;
+  const read = diffs => {
+    const history = createQualityHistory();
+    for (const [k, diff] of diffs) if (diff !== null) history.ingest(NOW - k * step, [historyRow(0.1, 0.01, 0.01 + diff)], NOW);
+    return readPair(history).funding;
+  };
+  // k = steps before NOW; k = 2 is missing, so the run is k = 1..0 only.
+  const gapped = read([[10, .01], [9, .01], [8, .01], [7, .01], [6, -.02], [5, .01], [4, .05], [3, .01], [2, null], [1, .01], [0, .01]]);
+  assert.ok(Math.abs(gapped.max - .05) < 1e-12);
+  assert.deepEqual([gapped.positiveRunMs, gapped.positiveRunCapped], [2 * step, false]);
+  const steady = read([[3, .01], [2, .02], [1, .01], [0, .03]]);
+  assert.deepEqual([steady.positiveRunMs, steady.positiveRunCapped], [4 * step, true]);
+  const negative = read([[1, .01], [0, -.01]]);
+  assert.deepEqual([negative.positiveRunMs, negative.positiveRunCapped], [0, false]);
+  const zero = read([[0, 0]]);
+  assert.equal(zero.positiveRunMs, 0);
+  const empty = createQualityHistory().get('BTC', 'binance:BTCUSDT', 'gate:BTCUSDT', NOW).funding;
+  assert.deepEqual([empty.max, empty.positiveRunMs, empty.positiveRunCapped], [null, null, false]);
+});

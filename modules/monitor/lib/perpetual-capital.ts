@@ -1,4 +1,4 @@
-import { estimatePairCapital, estimatePairRoc, type CapitalAssumptions } from "../../../server/capital-metrics.mjs";
+import { estimateBreakEvenHours, estimatePairCapital, estimatePairRoc, type CapitalAssumptions } from "../../../server/capital-metrics.mjs";
 import { normalizedFunding8h, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "./perpetual-spreads.ts";
 
 /** Display and sorting share the same price, currency and funding-time checks. */
@@ -16,5 +16,9 @@ export function scannerCapitalMetrics(row: PerpetualSpread, assumptions: Capital
   const roc = estimatePairRoc({ netSpreadPercent: row.netSpreadPercent,
     longFunding8h: normalizedFunding8h(row.long, data.now), shortFunding8h: normalizedFunding8h(row.short, data.now),
     shortNotionalPercent: capital.shortNotionalPercent, capitalPercent: capital.capitalPercent, holdingHours: assumptions.holdingHours });
-  return { capital, roc };
+  // Same scenario as ROC; a stale or unpriced pair has no capital and so no break-even either.
+  const breakEven = capital.capitalPercent === null
+    ? { status: "unavailable" as const, hours: null, reason: capital.reason }
+    : estimateBreakEvenHours({ netSpreadPercent: row.netSpreadPercent, fundingPercent8h: roc.fundingPercent8h });
+  return { capital, roc, breakEven };
 }

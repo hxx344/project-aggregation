@@ -56,7 +56,7 @@ async page => {
     if (location.origin !== localOrigin || sessionStorage.getItem('scanner-ranges-seeded')) return;
     sessionStorage.setItem('scanner-ranges-seeded', '1');
     localStorage.setItem(preferenceKey, JSON.stringify({ version: 2, sortBy: 'gross', minSpreadPercent: 0 }));
-    localStorage.removeItem(displayKey); localStorage.removeItem(rangeKey);
+    localStorage.setItem(displayKey, JSON.stringify({ version: 3, groupByBase: false })); localStorage.removeItem(rangeKey);
   }, { localOrigin: origin, preferenceKey, displayKey, rangeKey });
   page.on('pageerror', onError);
   const rows = page.locator('.perp-scanner:visible .perp-scanner-table > tbody > tr:not(.perp-detail-row)');
