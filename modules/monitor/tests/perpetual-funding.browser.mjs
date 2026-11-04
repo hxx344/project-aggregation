@@ -119,7 +119,7 @@ async page => {
     const history24 = base => rowFor(base).locator('[data-column="history24h"] strong');
     const menu = label => page.locator('.perp-scanner:visible .scanner-menu').filter({ has: page.locator('summary').filter({ hasText: label }) });
     const openMenu = async label => { const current = menu(label); if (!await current.getAttribute('open').then(value => value !== null)) await current.locator('summary').click(); return current; };
-    await page.goto(`${origin}/?monitor=perpetual&goldOil=cl&goldOilExchange=binance`);
+    await page.goto(`${origin}/?monitor=perpetual`);
     await waitBases(['BTC', 'ADA', 'ETH', 'SOL']);
     await filters.click();
     check(await sort.inputValue() === 'gross', 'Initial ranking is gross spread');

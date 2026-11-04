@@ -14,7 +14,7 @@ import { readInitialMarket } from '../server/initial-market.mjs';
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 async function until(condition) { for (let i = 0; i < 200; i++) { if (condition()) return; await delay(5); } assert.fail('Condition did not become true'); }
-const fresh = () => ({ version: 1, monitors: Object.fromEntries(['oil', 'cl-xau', 'hynix', 'perpetual'].map(id => [id, { enabled: true, revision: 0 }])) });
+const fresh = () => ({ version: 1, monitors: Object.fromEntries(['oil', 'hynix', 'perpetual'].map(id => [id, { enabled: true, revision: 0 }])) });
 const change = (services, id, enabled) => services.get(id).handle('runtime', 'PUT', { enabled, revision: services.get(id).runtime().revision });
 const shutdown = async services => { await Promise.all([...services.values()].map(service => service.stop())); await services.market.stop(); await services.notifications.stop(); };
 
@@ -29,6 +29,24 @@ test('module switches default on, persist independently and reject corrupt saved
     await writeFile(file, 'broken');
     await assert.rejects(openMonitorControlStore(directory), /monitor-control.json/);
     assert.equal(await readFile(file, 'utf8'), 'broken');
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('saved switches of the removed gold/oil monitor are ignored instead of rejecting the file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'monitor-controls-legacy-'));
+  try {
+    const file = join(directory, 'monitor-control.json'), legacy = fresh();
+    legacy.monitors.oil = { enabled: false, revision: 3 }; legacy.monitors['cl-xau'] = { enabled: false, revision: 7 };
+    await writeFile(file, JSON.stringify(legacy));
+    const store = await openMonitorControlStore(directory), loaded = store.get();
+    assert.deepEqual(Object.keys(loaded.monitors).sort(), ['hynix', 'oil', 'perpetual']);
+    assert.deepEqual(loaded.monitors.oil, { enabled: false, revision: 3 });
+    await store.save(loaded);
+    assert.equal(Object.hasOwn(JSON.parse(await readFile(file, 'utf8')).monitors, 'cl-xau'), false);
+    // Known modules still need a valid switch; only retired ids are tolerated.
+    const missing = fresh(); delete missing.monitors.hynix;
+    await writeFile(file, JSON.stringify(missing));
+    await assert.rejects(openMonitorControlStore(directory), /monitor-control.json/);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -122,7 +140,7 @@ test('resident switches close streams and sockets, reopen durable perpetual stor
       const quote = await services.get('perpetual').handle('quote', 'GET');
       assert.equal(quote.quotes[0].bid, 100 + cycle, 'Fresh service restores saved prices without deleting history');
     }
-    await change(services, 'perpetual', false); await change(services, 'hynix', false); await change(services, 'cl-xau', false);
+    await change(services, 'perpetual', false); await change(services, 'hynix', false);
     await new Promise(resolve => server.close(resolve)); server = null;
     await shutdown(services); services = null;
     const previousSockets = sockets.length, previousChecks = hynixChecks;

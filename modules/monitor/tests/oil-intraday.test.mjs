@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { HISTORY_START, fetchCandles } from '../modules/oil/binance.mjs';
 import { OIL_CANDLE_MS as BAR, pairIntradayCandles, createIntradaySnapshot, validateIntradaySnapshot, fetchIntradaySnapshot, intradayChartRows } from '../modules/oil/intraday.mjs';
-import { filterRows } from '../modules/oil/data-utils.mjs';
+import { oilHistory } from '../lib/oil-history.ts';
 
 const START = HISTORY_START;
 const saved = JSON.parse(await readFile(new URL('../public/oil/data/binance-15m.json', import.meta.url), 'utf8'));
@@ -22,9 +22,9 @@ test('real Binance archive starts April 1, exceeds 5,000 complete paired bars, a
     assert.ok(row.time + BAR <= Date.parse(snapshot.metadata.fetchedAt));
     assert.ok(Math.abs(row.spread - (row.brent - row.wti) / row.wti * 100) < 1e-12);
   });
-  assert.equal(filterRows(rows, '1d', BAR).length, 96);
-  assert.equal(filterRows(rows, '1w', BAR).length, 672);
-  assert.equal(filterRows(rows, 'all', BAR).length, rows.length);
+  const { points } = oilHistory(saved);
+  assert.equal(points.length, rows.length);
+  assert.deepEqual(points.at(-1), { time: rows.at(-1).time, adr: rows.at(-1).brent, ordinary: rows.at(-1).wti, equivalent: rows.at(-1).wti, spread: rows.at(-1).absolute, premium: rows.at(-1).spread });
 });
 
 test('pairs completed trade closes at matching times, preserving missing legs and real gaps', () => {
@@ -89,9 +89,4 @@ test('failure of either candle leg cannot mutate or retimestamp retained data', 
   const existing = createIntradaySnapshot([{time: START, brent: 80, wti: 70}], new Date(START + BAR).toISOString()), before = JSON.stringify(existing);
   await assert.rejects(fetchIntradaySnapshot(existing, { now: START + 2 * BAR, fetcher: async url => new URL(url).searchParams.get('symbol') === 'BZUSDT' ? Response.json([candle(START + BAR, 81)]) : new Response('', { status: 503 }) }));
   assert.equal(JSON.stringify(existing), before);
-});
-
-test('calendar month windows preserve intraday time and clamp month end', () => {
-  const timestamps = ['2026-02-28T10:00Z', '2026-02-28T10:15Z', '2026-03-31T10:00Z'];
-  assert.deepEqual(filterRows(timestamps.map(date => ({ date })), '1m', BAR).map(row => row.date), timestamps.slice(1));
 });

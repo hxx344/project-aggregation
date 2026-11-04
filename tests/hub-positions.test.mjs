@@ -17,11 +17,11 @@ const request = (overrides = {}) => ({ channel: 'project-hub', version: 1, type:
 
 test('positions requests accept only the documented shape', () => {
   assert.deepEqual(positionsRequest(request()), { requestId: 'req-1', market: 'oil', symbols: ['CL', 'BZ'] });
-  for (const market of ['oil', 'cl-xau', 'hynix', 'perpetual']) assert.ok(positionsRequest(request({ market })));
+  for (const market of ['oil', 'hynix', 'perpetual']) assert.ok(positionsRequest(request({ market })));
   assert.ok(positionsRequest(request({ requestId: 'a'.repeat(64), symbols: Array.from({ length: 20 }, (_, i) => `B${i}`) })));
   for (const invalid of [
     request({ type: 'positions' }), request({ requestId: '' }), request({ requestId: 'a'.repeat(65) }), request({ requestId: 'bad id' }), request({ requestId: 'x_y' }), request({ requestId: 7 }),
-    request({ market: 'gold' }), request({ market: undefined }), request({ symbols: [] }), request({ symbols: 'CL' }), request({ symbols: ['cl'] }), request({ symbols: ['CL-USDT'] }),
+    request({ market: 'gold' }), request({ market: 'cl-xau' }), request({ market: undefined }), request({ symbols: [] }), request({ symbols: 'CL' }), request({ symbols: ['cl'] }), request({ symbols: ['CL-USDT'] }),
     request({ symbols: ['A'.repeat(21)] }), request({ symbols: Array.from({ length: 21 }, (_, i) => `B${i}`) }), request({ symbols: [1] }), null, [], 'positions-request',
   ]) assert.equal(positionsRequest(invalid), null, JSON.stringify(invalid));
   assert.equal(openTradingRequest({ type: 'open-trading', market: 'hynix' }), 'hynix');

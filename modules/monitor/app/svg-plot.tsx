@@ -106,7 +106,7 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
       onFocus={event => { if (event.target === event.currentTarget && hoverRows.length) store.set(store.get() ?? hoverRows.at(-1)!.time); }}
       onBlur={event => { if (event.target === event.currentTarget) store.set(null); }}
       onKeyDown={event => { if (event.target !== event.currentTarget) return; if (event.key === "Escape") { store.set(null); return; } if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); step(event.key); }}>
-      <title>{label}</title><desc>缺失时段断线；触摸、鼠标或左右方向键查看每小时数值。</desc>
+      <title>{label}</title><desc>缺失时段断线；触摸、鼠标或左右方向键查看各时点数值。</desc>
       {defs && <defs>{defs}</defs>}
       {zones.map((zone, key) => { const top = geometry.y(Math.max(zone.from, zone.to)), bottom = geometry.y(Math.min(zone.from, zone.to)); return <rect key={key} x={geometry.left} width={geometry.right - geometry.left} y={top} height={Math.max(0, bottom - top)} fill={zone.fill} fillOpacity={zone.opacity}/>; })}
       {yTicks.map(value => { const y = geometry.y(value); return <g key={value}>

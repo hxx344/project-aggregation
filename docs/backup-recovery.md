@@ -50,7 +50,7 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 | 域 | 需要保留的材料 |
 | --- | --- |
 | Hub 与统一执行保护 | `hub.sqlite`、`credentials.key`、`execution-control.sqlite` 及其 `.required` 身份证据；任务、订单、幂等请求、账户归属、fence、UNKNOWN 和隔离记录 |
-| Monitor | 根及 `perpetual` 行情库；`notifications.json`、`monitor-control.json`、`variational-session.json`；`hynix/alerts.json`；`oil` 与四种 `cl-xau` 子目录的 `monitor.json`；合约告警、CrossEx 设置及 `paper-positions.json` |
+| Monitor | 根及 `perpetual` 行情库；`notifications.json`、`monitor-control.json`、`variational-session.json`；`hynix/alerts.json`；`oil/monitor.json`（金油比监控已于 2026-11 移除，旧版遗留的 `cl-xau/` 子目录不再写入，若仍在磁盘上则随递归 inventory 照常备份恢复，其中 `monitor.json` 按秘密材料加密）；合约告警、CrossEx 设置及 `paper-positions.json` |
 | Asset | `ledger.sqlite`、`config.json` 中的 `credentialKey`、登录配置与会话秘密，导入材料及 `backups/before-import-*.sqlite` |
 | CrossEx | `crossex.sqlite`、`credentials.key`，包含持仓、真实订单、执行、请求去重及财务历史 |
 | Greeks | `engine_state.json` 中的订单日志、任务、RFQ、持仓与绩效，以及模块 `.env` |

@@ -169,7 +169,7 @@ test('preview history has an independent five-minute cache, deduplicates request
   now += HISTORY_REFRESH_MS - 1; assert.equal((await read('oil', action)).fetchedAt, values[0].fetchedAt); assert.equal(calls, 1);
   now += 2; fail = true;
   const retained = await read('oil', action); assert.equal(retained.status, 'snapshot'); assert.equal(retained.fetchedAt, values[0].fetchedAt); assert.equal(calls, 2);
-  for (const id of ['perpetual', 'cl-xau']) await assert.rejects(read(id, action), /Unsupported/);
+  await assert.rejects(read('perpetual', action), /Unsupported/);
   await assert.rejects(read('oil', exchangeFundingAction('gate')), /Unsupported/);
   await assert.rejects(read('hynix', exchangeFundingAction('lighter')), /Unsupported/);
   await assert.rejects(read('oil', 'exchanges/fake/funding-history'));

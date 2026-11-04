@@ -2,8 +2,6 @@ import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import { readHubSummary } from './hub-summary.mjs';
 import { monitors } from '../lib/monitors.ts';
-import { parseGoldOilAction } from '../lib/gold-oil.ts';
-import { parseGoldOilChartRange } from '../lib/gold-oil-chart-data.ts';
 const compress = promisify(gzip);
 import { timingSafeEqual } from "node:crypto";
 
@@ -60,7 +58,7 @@ export function createHandler({ service, services, username, password, pageHandl
       if (services && path === '/api/hub/summary') {
         if (request.method !== 'GET') return json(response, 405, { error: '不支持此请求方法' });
         const summaryUrl = new URL(request.url, 'http://localhost');
-        const value = await readHubSummary(services, Date.now(), summaryUrl.searchParams.get('monitor') || 'oil', summaryUrl.searchParams.get('goldOil') || 'cl', summaryUrl.searchParams.get('goldOilExchange') || 'binance');
+        const value = await readHubSummary(services, Date.now(), summaryUrl.searchParams.get('monitor') || 'oil');
         return json(response, 200, new URL(request.url, 'http://localhost').searchParams.get('schemaVersion') === '2' ? { schemaVersion: 2, data: value } : { schemaVersion: 1, data: { updatedAt: value.updatedAt || new Date(0).toISOString(), metrics: value.metrics } });
       }
       if (services?.notifications && ["/api/notifications/feishu", "/api/notifications/feishu/test"].includes(path)) {
@@ -93,18 +91,12 @@ export function createHandler({ service, services, username, password, pageHandl
             if (request.headers["sec-fetch-site"] === "cross-site" || (origin && new URL(origin).host !== request.headers.host)) return json(response, 403, { error: "不接受跨站配置请求" });
             if (!/^application\/json(?:;|$)/i.test(request.headers["content-type"] || "")) return json(response, 415, { error: "请使用 JSON 请求" });
           }
-          const chartRead = !writing && id === 'cl-xau' && parseGoldOilAction(action)?.action === 'chart';
-          const historicalRead = !writing && ['oil', 'hynix', 'cl-xau'].includes(id)
+          const historicalRead = !writing && ['oil', 'hynix'].includes(id)
             && (/(?:^|\/)(?:history|funding)$/.test(action) || action.startsWith('candles/'));
           try {
             let input;
             if (writing) input = await body(request);
-            else if (chartRead) {
-              const params = new URL(request.url, 'http://localhost').searchParams;
-              if ([...params.keys()].some(key => key !== 'range') || params.getAll('range').length > 1) throw Object.assign(Error('无效的金油比图表查询参数'), { status: 400 });
-              input = { range: parseGoldOilChartRange(params.get('range')) };
-            }
-            return await json(response, 200, await backend.handle(action, request.method, input), chartRead || historicalRead || action === 'opportunities-v2' || (id === 'perpetual' && action === 'quote') ? request : undefined);
+            return await json(response, 200, await backend.handle(action, request.method, input), historicalRead || action === 'opportunities-v2' || (id === 'perpetual' && action === 'quote') ? request : undefined);
           }
           catch (error) { return json(response, error.status || (writing ? action.includes("test") ? 502 : 400 : 503), { error: writing ? error.message : "监控服务暂不可用" }); }
         }

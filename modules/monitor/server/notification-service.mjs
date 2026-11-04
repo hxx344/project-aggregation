@@ -58,7 +58,7 @@ export function createNotificationService(store, { deliver = sendFeishu, clock =
       state.lastTestAt = now; state.testResult = { time: new Date(now).toISOString(), status: "sending", error: "" };
       await persist(state);
       let error;
-      try { await send(`市场监控 · 飞书连接测试\n原油 / 金油比 / 海力士 / 合约价差告警共用此机器人。\n时间：${new Date(now).toISOString()}`); state.testResult.status = "sent"; }
+      try { await send(`市场监控 · 飞书连接测试\n原油 / 海力士 / 合约价差告警共用此机器人。\n时间：${new Date(now).toISOString()}`); state.testResult.status = "sent"; }
       catch (cause) { error = cause; state.testResult.status = "failed"; state.testResult.error = cause.message; }
       await persist(state);
       if (error) throw error;

@@ -22,14 +22,11 @@ export function serializePageProps(props) {
 }
 
 export function pageHtml(template, markup, props) {
-  const preload = props.initialMonitor === 'oil'
-    ? '<link rel="preload" href="/oil/panel.html" as="fetch" crossorigin="anonymous"><link rel="preload" href="/oil/styles.css" as="fetch" crossorigin="anonymous">'
-    : props.initialMonitor === 'cl-xau' ? '<link rel="preload" href="/oil/styles.css" as="style">' : '';
-  const values = { '<!--ssr-outlet-->': markup, '<!--ssr-props-->': serializePageProps(props), '<!--ssr-preload-->': preload };
+  const values = { '<!--ssr-outlet-->': markup, '<!--ssr-props-->': serializePageProps(props) };
   for (const marker of Object.keys(values)) if (template.split(marker).length !== 2) throw new Error(`Invalid page template: ${marker}`);
   // One pass prevents text inside rendered content or JSON from being treated
   // as a second template directive. Callback replacement preserves literal $.
-  return template.replace(/<!--ssr-(?:outlet|props|preload)-->/g, marker => values[marker]);
+  return template.replace(/<!--ssr-(?:outlet|props)-->/g, marker => values[marker]);
 }
 
 function pathname(request, development) {

@@ -10,11 +10,10 @@ export async function openMonitorControlStore(directory) {
   let state = { version: 1, monitors: Object.fromEntries(monitors.map(({ id }) => [id, { enabled: true, revision: 0 }])) };
   try {
     const text = await readFile(file, 'utf8'), loaded = JSON.parse(text);
-    if (text.length > 16_384 || loaded.version !== 1 || !loaded.monitors || Object.keys(loaded.monitors).some(id => !Object.hasOwn(state.monitors, id))) throw Error('Invalid state');
+    if (text.length > 16_384 || loaded.version !== 1 || !loaded.monitors || typeof loaded.monitors !== 'object' || Array.isArray(loaded.monitors)) throw Error('Invalid state');
+    // Switches of retired monitors (such as the removed gold/oil `cl-xau`) are ignored and dropped on the next save.
     for (const { id } of monitors) {
-      // Version 1 installations predate this module; retain all original switches.
-      if (id === 'cl-xau' && !Object.hasOwn(loaded.monitors, id)) continue;
-      const value = loaded.monitors[id];
+      const value = Object.hasOwn(loaded.monitors, id) ? loaded.monitors[id] : undefined;
       if (!value || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.revision) || value.revision < 0) throw Error('Invalid state');
       state.monitors[id] = { enabled: value.enabled, revision: value.revision };
     }

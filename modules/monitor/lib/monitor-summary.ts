@@ -1,27 +1,12 @@
 import type { LiveQuote } from "./market";
 import { createTrend, type MonitorTrend, type TrendHistory } from "./monitor-trend.ts";
 import { hynixExchangeQuote, type ExchangeQuote } from "./exchange-quotes.ts";
-import { goldOilChartPoints, GOLD_OIL_INTERVAL_MS, GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, goldOilUnits, type GoldOilExchange, type GoldOilType, type GoldOilQuote, type GoldOilHistory } from './gold-oil.ts';
-import { currentGoldOilFunding } from './gold-oil-funding.ts';
 import { getQuoteStaleAfterMs } from './market-freshness.ts';
 
 export type SummaryStatus = "loading" | "live" | "snapshot" | "stale" | "error";
 export type SummaryMetric = { label: string; value: string; tone?: "positive" | "negative" };
 export type MonitorSummary = { status: SummaryStatus; fetchedAt: string | null; staleAfterMs?: number; metrics: SummaryMetric[]; note?: string; trend?: MonitorTrend; comparison?: ExchangeQuote };
 export type SummaryProps = { onSummary?: (summary: MonitorSummary) => void };
-export function goldOilTrend(history: GoldOilHistory | null = null, error = false, oilType: GoldOilType = history?.oilType ?? 'cl', exchange: GoldOilExchange = history?.source === 'Bybit' ? 'bybit' : 'binance'): MonitorTrend {
-  return createTrend(history ? { fetchedAt: history.fetchedAt, status: history.status,
-    points: goldOilChartPoints(history, 7).flatMap(point => point.ratio === null ? [] : [{ time: point.time, value: point.ratio }]),
-  } : undefined, { days: 7, intervalMs: GOLD_OIL_INTERVAL_MS, label: '7 天 · 15 分钟线', shortLabel: '7天', unit: goldOilUnits(oilType, exchange).ratio }, error);
-}
-export function goldOilSummary(quote: GoldOilQuote | null, error = false, trend?: MonitorTrend, oilType: GoldOilType = quote?.oilType ?? 'cl', exchange: GoldOilExchange = quote?.source === 'Bybit' ? 'bybit' : 'binance'): MonitorSummary {
-  const funding = currentGoldOilFunding(quote);
-  return { status: quote ? error ? 'stale' : quote.status === 'snapshot' ? 'snapshot' : 'live' : error ? 'error' : 'loading',
-    fetchedAt: quote?.fetchedAt ?? null,
-    staleAfterMs: getQuoteStaleAfterMs(quote, 75_000),
-    metrics: [{ label: `金油比 · ${goldOilUnits(oilType, exchange).ratio}`, value: quote ? quote.ratio.toFixed(3) : '—' }, metric('净资金费 / 年化', funding ? funding.annualized * 100 : null, 2, '%')],
-    note: `${GOLD_OIL_EXCHANGES[exchange].name} · 空黄金、多${GOLD_OIL_INSTRUMENTS[oilType].name} · 等 USDT 名义`, trend: trend ?? goldOilTrend(null, false, oilType, exchange) };
-}
 export type OilSummaryUpdate = {
   status: SummaryStatus;
   /** (Brent - WTI) / WTI * 100, already expressed as a percentage. */

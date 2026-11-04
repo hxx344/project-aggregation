@@ -96,7 +96,7 @@ async page => {
       if (path.endsWith('/perpetual/funding-history')) return route.fulfill({ json: { schemaVersion: 1, generatedAt: now, legs: rawHistory(route.request().postDataJSON().pairs) } });
       return route.fulfill({ status: 503, json: { error: 'Unavailable fixture detail' } });
     });
-    await page.goto(`${origin}/?monitor=perpetual&goldOil=cl&goldOilExchange=binance`);
+    await page.goto(`${origin}/?monitor=perpetual`);
     await expectRows(bases.slice(0, 30));
     check((await page.locator('.perp-pagination').innerText()).includes('/ 65'), 'Default explicit zero spread produces 65 candidates');
     await page.getByRole('button', { name: '下一页', exact: true }).click();

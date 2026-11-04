@@ -4,7 +4,7 @@ import { exchangeContracts, type SpreadMarket } from './exchange-quotes.ts';
 /** Current same-venue spread in percent, keyed by exchange id (for example `binance`). */
 export type VenueSpreads = Record<string, { premium: number | null; stale: boolean }>;
 /** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. */
-export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], 'cl-xau': ['XAU', 'CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'] };
+export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'] };
 export type UnpairedReason = 'same-side' | 'multiple' | 'missing-leg';
 /** Why the realized half of a pair total is missing or qualified. */
 export type RealizedStatus = 'complete' | 'partial' | 'loading' | 'unavailable' | 'mixed-currency';

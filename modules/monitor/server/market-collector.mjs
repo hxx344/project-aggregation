@@ -10,8 +10,6 @@ import { comparisonExchanges, exchangeAction, EXCHANGE_REFRESH_MS } from '../lib
 import { createExchangeReader } from '../lib/exchange-service.ts';
 import { fetchIntradaySnapshot, OIL_CANDLE_ACTION, OIL_CANDLE_REFRESH_MS } from '../modules/oil/intraday.mjs';
 import oilIntradayArchive from '../public/oil/data/binance-15m.json' with { type: 'json' };
-import { createGoldOilReader } from '../lib/gold-oil-service.ts';
-import { GOLD_OIL_QUOTE_MS, GOLD_OIL_HISTORY_MS, GOLD_OIL_FUNDING_MS, GOLD_OIL_VARIANTS, goldOilAction } from '../lib/gold-oil.ts';
 import { exchangeFundingAction, fundingHistoryExchanges, HISTORY_REFRESH_MS } from '../lib/exchange-funding-history.ts';
 import { createExchangeFundingReader } from '../lib/exchange-funding-service.ts';
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
@@ -31,17 +29,8 @@ export function marketJobs({ oilIntervalMs = 30_000, variationalSession, variati
   const readExchange = createExchangeReader({ variationalSession, variationalFetcher });
   const readFundingHistory = createExchangeFundingReader();
   const readHedgePrices = createOilHedgePricesReader();
-  const goldOilJobs = GOLD_OIL_VARIANTS.flatMap(({ oilType, exchange }) => {
-    const reader = createGoldOilReader({ oilType, exchange });
-    return [
-      { id: 'cl-xau', action: goldOilAction('quote', oilType, exchange), intervalMs: GOLD_OIL_QUOTE_MS, load: () => reader.quote() },
-      { id: 'cl-xau', action: goldOilAction('history', oilType, exchange), intervalMs: GOLD_OIL_HISTORY_MS, load: previous => reader.history(previous) },
-      { id: 'cl-xau', action: goldOilAction('funding', oilType, exchange), intervalMs: GOLD_OIL_FUNDING_MS, load: previous => reader.funding(previous) },
-    ];
-  });
   const fetchMarket = async () => marketFromExchangeQuote(await readExchange('binance', 'oil'));
   return [
-    ...goldOilJobs,
     { id: 'hynix', action: 'quote', intervalMs: 10_000, load: () => loadQuote() },
     { id: 'oil', action: 'quote', intervalMs: oilIntervalMs, load: () => fetchMarket() },
     { id: 'hynix', action: 'history', intervalMs: 60_000, load: previous => loadMarket(fetch, Date.now(), previous ?? getMarketSnapshot()) },
@@ -123,17 +112,13 @@ export function createMarketCollector(store, { jobs = marketJobs(), clock = Date
     try { saved = new Map(store.status().map(row => [row.key, row])); }
     catch { saved = new Map(); }
     const now = clock();
-    let goldHistorySlot = 0;
     for (const job of selected) {
       const quote = job.action === 'quote' || job.action.endsWith('/quote');
       if (quote) { schedule(job); continue; }
       const row = saved.get(`${job.id}/${job.action}`);
       const remaining = row?.success_ms != null && !row.error && Number.isFinite(row.source_ms) && row.source_ms <= now
         ? Math.max(0, job.intervalMs - (now - row.source_ms)) : 0;
-      // Separate the four markets' history/funding starts without delaying
-      // live quotes or imposing a shared lock on unrelated collectors.
-      const stagger = job.id === 'cl-xau' ? goldHistorySlot++ * 350 : 0;
-      schedule(job, remaining + stagger);
+      schedule(job, remaining);
     }
   }
   return {

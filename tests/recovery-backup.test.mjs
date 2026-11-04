@@ -212,6 +212,7 @@ test('real Monitor notification migration and all ordinary configurations requir
   const hynix = await openHynixAlertStore(path.join(monitor, 'hynix')), hs = hynix.get();
   hs.config = { ...hs.config, ...channels[0] }; delete hs.config.id; await hynix.save(hs);
   await openHynixAlertStore(path.join(monitor, 'hynix'));
+  // `cl-xau/...` is left on disk by the removed gold/oil monitor; nothing writes it any more, but its webhook secrets must stay encrypted.
   for (const folder of ['oil', 'cl-xau/bybit/bz']) {
     const store = new FileStore(path.join(monitor, folder), true); await store.acquire();
     // Historical fields may remain on disk after the current reader strips them.

@@ -2,33 +2,19 @@ import type { LiveQuote, MarketData } from "./market";
 import type { MonitorRuntimeMap } from './monitor-control';
 import type { validateOilHistory, validateOilQuote } from "./market-validation";
 import { calculateShortSpreadFunding } from "../modules/oil/binance.mjs";
-import { goldOilTrend, hynixSummary, oilSummary } from "./monitor-summary.ts";
-import { createTrend, type MonitorTrend } from "./monitor-trend.ts";
+import { hynixSummary, oilSummary } from "./monitor-summary.ts";
+import { createTrend } from "./monitor-trend.ts";
 import { binanceOilExchangeQuote, type ExternalQuoteSet } from "./exchange-quotes.ts";
 import { intradayChartRows, type createIntradaySnapshot } from "../modules/oil/intraday.mjs";
 import { oilSpreadPercent } from "../modules/oil/spread.mjs";
-import type { GoldOilQuote, GoldOilHistory, GoldOilType, GoldOilExchange } from './gold-oil';
-import type { GoldOilFundingHistory } from './gold-oil-funding';
 import { getQuoteStaleAfterMs, type QuoteFreshness } from './market-freshness.ts';
 
-export type InitialGoldOilMarket = { quote: GoldOilQuote | null; history: GoldOilHistory | null; funding?: GoldOilFundingHistory | null; trend?: MonitorTrend };
 export type InitialMarketData = {
   renderedAt: number;
   runtime?: MonitorRuntimeMap;
-  'cl-xau'?: InitialGoldOilMarket & { bz?: InitialGoldOilMarket; bybit?: InitialGoldOilMarket & { bz?: InitialGoldOilMarket } };
   hynix: { quote: LiveQuote | null; history: MarketData | null; exchanges?: ExternalQuoteSet };
   oil: { quote: (ReturnType<typeof validateOilQuote> & QuoteFreshness & { status: "live" | "snapshot" }) | null; history?: ReturnType<typeof validateOilHistory> | null; candles?: ReturnType<typeof createIntradaySnapshot> | null; exchanges?: ExternalQuoteSet };
 };
-
-export function initialGoldOilMarket(initial: InitialMarketData | null | undefined, oilType: GoldOilType = 'cl', exchange: GoldOilExchange = 'binance') {
-  const market = exchange === 'bybit' ? initial?.['cl-xau']?.bybit : initial?.['cl-xau'];
-  return oilType === 'bz' ? market?.bz : market;
-}
-
-export function goldOilOverviewTrend(history: GoldOilHistory | null, error: boolean, seed: MonitorTrend | undefined, oilType: GoldOilType, exchange: GoldOilExchange): MonitorTrend {
-  if (history || !seed) return goldOilTrend(history, error, oilType, exchange);
-  return error ? { ...seed, status: 'stale' } : seed;
-}
 
 export function initialSummaries(initial: InitialMarketData | null) {
   const hynix = initial?.hynix, oil = initial?.oil;
