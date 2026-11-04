@@ -70,6 +70,16 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     operation = next.catch(() => {}); return next;
   };
   const persistWanted = () => atomicJson(controlPath, { schema: 1, enabled });
+  // Before a wallet change: if the stop cannot be saved, memory keeps matching the file on disk.
+  function persistStopped(unchanged) {
+    const wasEnabled = enabled;
+    enabled = false;
+    try { persistWanted(); } catch (error) {
+      enabled = wasEnabled;
+      log.warn?.({ type: 'aero-lp', err: error }, 'LP 启停设置保存失败');
+      throw new HttpError(500, `启停设置保存失败，${unchanged}，请检查数据目录权限后重试`);
+    }
+  }
   const send = (message) => { try { if (child?.connected) child.send(message); } catch {} };
   function readKey() {
     const saved = readBounded(walletPath, 16 * 1024);
@@ -240,7 +250,14 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       if (!existsSync(walletPath)) throw new HttpError(409, '请先填写钱包私钥');
       if (stopping) throw new HttpError(409, '上一次停止尚未完成，请稍候');
       if (readHold() === 'recovery') throw new HttpError(409, '账户写入处于隔离恢复状态，暂不能启动 LP 调仓');
-      enabled = true; persistWanted(); retry = 0; startChild(); return state();
+      const wasEnabled = enabled;
+      enabled = true;
+      try { persistWanted(); } catch (error) {
+        enabled = wasEnabled;
+        log.warn?.({ type: 'aero-lp', err: error }, 'LP 启停设置保存失败');
+        throw new HttpError(500, '启停设置保存失败，调仓未启动，请检查数据目录权限后重试');
+      }
+      retry = 0; startChild(); return state();
     }),
     // Halt first: a failed control.json write must never keep the signer running.
     stop: (authorize = () => {}) => serial(() => {
@@ -265,17 +282,29 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       requireStopped();
       const key = privateKey.trim();
       const wallet = new Wallet(key).address;
-      atomicJson(walletPath, { schema: 1, address: wallet, key: encrypt(key) });
-      // A fault leaves enabled=true without a child; a new key must not auto-start on the next restart.
-      enabled = false; persistWanted();
+      const saved = { schema: 1, address: wallet, key: encrypt(key) };
+      // A fault leaves enabled=true without a child. Revoke that run intent on disk before the new
+      // wallet is published, so no failure or crash can leave "new wallet + enabled=true" for a restart.
+      persistStopped('钱包未更换');
+      try { atomicJson(walletPath, saved); } catch (error) {
+        // Now stopped on disk: drop a fault or recovery hint that promises a restart, and the unpublished ciphertext.
+        failure = null; heldByRecovery = false;
+        try { rmSync(`${walletPath}.tmp`, { force: true }); } catch {}
+        log.warn?.({ type: 'aero-lp', err: error }, 'LP 钱包保存失败');
+        throw new HttpError(500, '钱包保存失败，原钱包未更换，调仓已保持停止，请检查数据目录权限后重试');
+      }
       address = wallet; walletKnown = true; failure = null; lastCycle = null;
       return state();
     }),
     clearKey: (authorize = () => {}) => serial(() => {
       authorize();
       requireStopped();
-      enabled = false; persistWanted();
-      rmSync(walletPath, { force: true });
+      persistStopped('钱包未清除');
+      try { rmSync(walletPath, { force: true }); } catch (error) {
+        failure = null; heldByRecovery = false;
+        log.warn?.({ type: 'aero-lp', err: error }, 'LP 钱包清除失败');
+        throw new HttpError(500, '钱包清除失败，调仓已保持停止，请检查数据目录权限后重试');
+      }
       address = null; walletKnown = true; failure = null; lastCycle = null; return state();
     }),
     async close() {
