@@ -33,7 +33,7 @@ type Metrics = {
 };
 // 最佳宽度只在预计至少能在区间内待这么久的宽度中选：否则窄区间靠高频调仓刷出的净年化不稳定，也不现实。
 const MIN_HOLD_DAYS = 1;
-// 稳健分的波动下限（日）：避免样本期内不动的池子分数无限大。
+// 日波动下限：样本期内不动的池子按此估算损耗、调仓与稳健分，避免零损耗与分数无限大。
 const VOL_FLOOR = 0.001;
 // 一次调仓（撤出、换币、重新添加并质押）的 gas 估算，美元。
 const REBALANCE_GAS_USD: Record<string, number> = { ethereum: 10 };
@@ -67,9 +67,10 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
   const aprFor = (range: [number, number]) => usdPerSecond === null || !pool.gauge ? null
     : dilutedApr({ usdPerSecond, competingLiquidity: pool.stakedLiquidity, unitUsd: liquidityUnitUsd(pool.sqrtPriceX96, range[0], range[1], pool.token0, pool.token1, p0, p1), deposit });
   const range = rangeTicks(pool.tick, pool.tickSpacing, width);
-  // 净年化用 24h 与 7d 中较大的日波动，偏保守；调仓成本 = 半仓换币手续费 + gas 占投入比例。
+  // 净年化、在区间天数与稳健分统一用 24h 与 7d 中较大的日波动，偏保守，并设下限：稳定币对短期一个 tick 都没动时
+  // 波动记为 0，不加下限会让最窄档零损耗、零调仓而排到最前。调仓成本 = 半仓换币手续费 + gas 占投入比例。
   const vols = [pool.vol24h?.daily, pool.vol7d?.daily].filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
-  const riskVol = vols.length ? Math.max(...vols) : null;
+  const riskVol = vols.length ? Math.max(...vols, VOL_FLOOR) : null;
   const costFraction = (pool.fee === null ? 0 : (0.5 * pool.fee) / 1e6) + (deposit > 0 ? (REBALANCE_GAS_USD[pool.chain] ?? DEFAULT_REBALANCE_GAS_USD) / deposit : 0);
   const netAt = (r: [number, number], apr: number | null) => netYield({ apr, tick: pool.tick, lower: r[0], upper: r[1], dailyVol: riskVol, costFraction });
   let best: Metrics['best'] = null;
@@ -87,8 +88,8 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
     aeroPerDay: pool.emissionPerSec === null ? null : pool.emissionPerSec * DAY,
     emissionUsdYear, emissionTvl: emissionUsdYear !== null && pool.tvlUsd ? emissionUsdYear / pool.tvlUsd : null,
     apr, narrowApr: aprFor(rangeTicks(pool.tick, pool.tickSpacing, 0)), net: netAt(range, apr), best,
-    score: best && riskVol !== null ? best.result.net / (Math.max(riskVol, VOL_FLOOR) * Math.sqrt(365)) : null,
-    daysIn: expectedDaysInRange(pool.tick, range[0], range[1], pool.vol24h?.daily ?? pool.vol7d?.daily),
+    score: best && riskVol !== null ? best.result.net / (riskVol * Math.sqrt(365)) : null,
+    daysIn: expectedDaysInRange(pool.tick, range[0], range[1], riskVol),
   };
 }
 
@@ -335,14 +336,14 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <label>最高日波动（%）<input type="number" min={0} step={0.5} placeholder="不限" value={maxVolText} onChange={(e) => setMaxVolText(e.target.value)} /></label>
         <label>最少在区间（天）<input type="number" min={0} step={1} placeholder="不限" value={minDaysText} onChange={(e) => setMinDaysText(e.target.value)} /></label>
         <button type="button" className="button secondary" onClick={resetFilters}><RotateCcw size={14} />重置筛选</button>
-        <small className="am-filter-hint">日波动取 24h，样本不足时用 7d；设了门槛时缺少该指标的池子不显示。区间年化、净年化与在区间天数随上面的区间宽度和投入变化。</small>
+        <small className="am-filter-hint">最高日波动按 24h（样本不足时用 7d）筛选；设了门槛时缺少该指标的池子不显示。区间年化、净年化与在区间天数随上面的区间宽度和投入变化。</small>
       </div>
-      <p className="am-note">排放年化 = 池子排放（AERO 计价）×（你的流动性 /（当前价位质押流动性 + 你的））÷ 投入，假设全程在区间内并质押；价格移动后的竞争流动性不同，仅用于同一时刻横向比较。不含手续费：质押仓位的手续费归投票者。预计在区间时间按 24 小时波动率（不足时用 7 天）的无漂移随机游走估算。
-        净年化 = 排放年化 − 无常损失 365·σ²/(4h) − 调仓成本 365/在区间天数 ×（0.5×费率 + gas/投入）；σ 取 24h 与 7d 日波动中较大者，h 约为区间对数半宽（按仓位实际价值精确计算），gas 按 Ethereum 10 美元、其余链 0.2 美元估算；在预计至少待满 1 天的宽度中取最高者并标出宽度。稳健分 = 净年化 ÷（日波动 × √365），即每承担一份年化波动换来的净收益，默认按它排序；稳定币对的脱锚风险、代币单边下跌（趋势）与排放随投票周期变化不在公式内，不含稳定币的交易对还承担两个币对美元的整体涨跌。</p>
+      <p className="am-note">排放年化 = 池子排放（AERO 计价）×（你的流动性 /（当前价位质押流动性 + 你的））÷ 投入，假设全程在区间内并质押；价格移动后的竞争流动性不同，仅用于同一时刻横向比较。不含手续费：质押仓位的手续费归投票者。预计在区间时间按日波动 σ 的无漂移随机游走估算。
+        净年化 = 排放年化 − 无常损失 365·σ²/(4h) − 调仓成本 365/在区间天数 ×（0.5×费率 + gas/投入）；σ 取 24h 与 7d 日波动中较大者（最低按 0.1%/天），h 约为区间对数半宽（按仓位实际价值精确计算），gas 按 Ethereum 10 美元、其余链 0.2 美元估算；在预计至少待满 1 天的宽度中取最高者并标出宽度。稳健分 = 净年化 ÷（日波动 × √365），即每承担一份年化波动换来的净收益，默认按它排序；稳定币对的脱锚风险、代币单边下跌（趋势）与排放随投票周期变化不在公式内，不含稳定币的交易对还承担两个币对美元的整体涨跌。</p>
       <div className="lp-table-scroll"><table className="lp-table am-table">
         <thead><tr>
           <th scope="col">池子</th>
-          {header('score', '稳健分', '净年化 ÷ 年化波动（日波动 × √365，最低按 0.1%/天）')}{header('net', '净年化', '在区间至少 1 天的宽度中取最高：排放 − 无常损失 − 调仓成本')}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
+          {header('score', '稳健分', '净年化 ÷ 年化波动（σ × √365）')}{header('net', '净年化', '在区间至少 1 天的宽度中取最高：排放 − 无常损失 − 调仓成本')}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
           {header('emission', '日排放', '每天发给该池的 AERO')}{header('emissionTvl', '排放/TVL', '年化排放价值除以池子 TVL')}
           {header('apr', '区间年化', '所选区间宽度下的排放年化')}{header('narrowApr', '最窄年化', '单个 tickSpacing 区间的排放年化')}
           {header('vol24h', '日波动 24h', '小时对数收益折算到 1 天')}{header('vol7d', '日波动 7d')}
