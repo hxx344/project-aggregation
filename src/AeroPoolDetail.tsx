@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { ArrowLeft, ArrowLeftRight, CircleAlert, Crosshair, LoaderCircle, Minus, Plus, RefreshCw, Star, ZoomIn, ZoomOut } from 'lucide-react';
 import { api, ApiError } from './api';
-import { expectedDaysInRange, fullRange, netYield, priceText, quoteOf, rangeAmounts, rangeApr, rangeTicks, rebalanceCost, riskVolOf } from './aero-market-math';
+import { expectedDaysInRange, fullRange, netYield, priceText, quoteOf, rangeAmounts, rangeApr, rangeLabel, rangeTicks, rebalanceCost, riskVolOf } from './aero-market-math';
 import type { NetYield } from './aero-market-math';
 import { dates, days, message, pct, tokenAmount, usd } from './aero-market-format';
 import type { MarketLiquidity, MarketPool, MarketPoolHistory } from './aero-market-types';
@@ -46,18 +46,18 @@ function useWidth() {
 }
 
 type Props = {
-  pool: MarketPool; chainName: string; aeroUsd: number | null; initialWidth: number; depositText: string; onDeposit: (text: string) => void;
+  pool: MarketPool; chainName: string; aeroUsd: number | null; initialWidth: number; recommended: [number, number] | null; depositText: string; onDeposit: (text: string) => void;
   favorite: boolean; favoriteDisabled: boolean; onFavorite: () => void; onBack: () => void; onExpired: () => void; notice?: string; children?: ReactNode;
 };
 
-export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth, depositText, onDeposit, favorite, favoriteDisabled, onFavorite, onBack, onExpired, notice, children }: Props) {
+export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth, recommended, depositText, onDeposit, favorite, favoriteDisabled, onFavorite, onBack, onExpired, notice, children }: Props) {
   const spacing = pool.tickSpacing, full = fullRange(spacing);
   const deposit = Math.max(Number(depositText) || 0, 0);
   const [flip, setFlip] = useState(false);
   const quote = quoteOf(pool, flip);
   // 报价方向向上（价格升高）对应的 tick 方向。
   const dir = quote.rising ? 1 : -1;
-  const [range, setRange] = useState<[number, number]>(() => rangeTicks(pool.tick, spacing, initialWidth));
+  const [range, setRange] = useState<[number, number]>(() => recommended ?? rangeTicks(pool.tick, spacing, initialWidth));
   const [period, setPeriod] = useState<Period>('7d');
   const [zoom, setZoom] = useState<View | null>(null);
   // initial 为聚焦时显示的文本：未改动就失焦不提交，避免四舍五入后的价格再取整让边界外移一档。
@@ -171,7 +171,9 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
   const clipId = `am-clip-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
   const selected = evaluate(pool, aeroUsd, range, deposit);
   const amounts = rangeAmounts(pool, range, deposit);
-  const rows = PRESETS.map((p) => { const r = presetRange(pool, p.width); return { ...p, range: r, result: evaluate(pool, aeroUsd, r, deposit) }; });
+  // 推荐区间排在最前：列表按同一投入搜索得到，与预设重合时高亮推荐。
+  const rows = [...(recommended ? [{ width: NaN, label: '推荐', range: recommended }] : []), ...PRESETS.map((p) => ({ ...p, range: presetRange(pool, p.width) }))]
+    .map((r) => ({ ...r, result: evaluate(pool, aeroUsd, r.range, deposit) }));
   const activePreset = rows.find((r) => sameRange(r.range, range));
 
   // 显示侧的低价、高价对应哪个 tick 边：报价随 tick 下降时（反向报价）低价是上沿。
@@ -264,7 +266,7 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
         <button type="button" className="button secondary am-swap" onClick={() => { setFlip((v) => !v); setDraft(null); }} aria-pressed={flip} title={`改为每 ${quote.quote} 折合 ${quote.base}`}><ArrowLeftRight size={13} />{quote.label}</button>
       </div>
       <div className="am-presets" role="group" aria-label="预设区间">
-        {rows.map((r) => <button key={r.label} type="button" className={activePreset?.label === r.label ? 'on' : ''} aria-pressed={activePreset?.label === r.label} onClick={() => choose(r.range)}>{r.label}</button>)}
+        {rows.map((r) => <button key={r.label} type="button" className={activePreset?.label === r.label ? 'on' : ''} aria-pressed={activePreset?.label === r.label} title={r.label === '推荐' ? `居中区间中净年化最高：${rangeLabel(pool, r.range, flip)}` : undefined} onClick={() => choose(r.range)}>{r.label === '推荐' ? `推荐 ${rangeLabel(pool, r.range, flip)}` : r.label}</button>)}
       </div>
       <div className="am-charts">
         <figure className="am-panel-chart">
@@ -332,8 +334,8 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
         <tbody>{[...rows, ...(activePreset ? [] : [{ label: '自定义', width: NaN, range, result: selected }])].map((r) => {
           const prices = [quote.price(r.range[0]), quote.price(r.range[1])].sort((a, b) => a - b);
           const isFull = sameRange(r.range, full);
-          return <tr key={r.label} className={sameRange(r.range, range) ? 'open' : undefined} onClick={() => choose(r.range)}>
-            <th scope="row"><button type="button" className="am-pool">{r.label}</button></th>
+          return <tr key={r.label} className={r.label === (activePreset?.label ?? '自定义') ? 'open' : undefined} onClick={() => choose(r.range)}>
+            <th scope="row"><button type="button" className="am-pool">{r.label}{r.label === '推荐' ? <small>{rangeLabel(pool, r.range, flip)}</small> : null}</button></th>
             <td>{isFull ? '0 – ∞' : `${priceText(prices[0])} – ${priceText(prices[1])}`}</td>
             <td className="num">{r.result.inRange ? pct(r.result.apr, 0) : '0%'}</td>
             <td className="num">{pct(r.result.net?.impermanent, 0)}</td><td className="num">{pct(r.result.net?.rebalance, 0)}</td>
@@ -342,7 +344,7 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
           </tr>;
         })}</tbody>
       </table></div>
-      <p className="am-note">预设区间以当前价为中心；排放年化按当前价位的质押流动性稀释，与列表同一口径（假设全程在区间内并质押），净年化 = 排放 − 无常损失 − 调仓成本。流动性分布按 tick 链上读数还原，浅色为全部流动性、深色为其中已质押的部分，只读取当前价 ÷4 至 ×4 内最近的至多 1500 个已初始化 tick。</p>
+      <p className="am-note">推荐区间按 tickSpacing 粒度以当前价居中搜索，在预计至少待满 1 天的居中区间中取净年化最高者，与列表的净年化列一致；预设区间以当前价为中心；排放年化按当前价位的质押流动性稀释，与列表同一口径（假设全程在区间内并质押），净年化 = 排放 − 无常损失 − 调仓成本。流动性分布按 tick 链上读数还原，浅色为全部流动性、深色为其中已质押的部分，只读取当前价 ÷4 至 ×4 内最近的至多 1500 个已初始化 tick。</p>
     </section>
 
     {children ? <section className="panel am-facts-panel" aria-label="池子数据">{children}</section> : null}
