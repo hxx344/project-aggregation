@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { emissionRate, liquiditySegments, poolPrice, priceChange, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
 import { readPoolLiquidity } from '../server/research/aero-market-rpc.mjs';
-import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, netYield, rangeTicks } from '../src/aero-market-math.ts';
+import { bestRange, dilutedApr, expectedDaysInRange, fullRange, liquidityUnitUsd, netYield, rangeApr, rangeLabel, rangeTicks, rebalanceCost, riskVolOf } from '../src/aero-market-math.ts';
 
 const Q96 = 2 ** 96;
 const sqrtX96 = (rawPrice) => BigInt(Math.round(Math.sqrt(rawPrice) * Q96)).toString();
@@ -157,4 +157,62 @@ test('pool liquidity read decodes the tick bitmap, reads all ticks at one block 
   const cut = await readPoolLiquidity(rpc, { address: '0xpool', tickSpacing: spacing }, { span: 100, maxTicks: 4 });
   assert.deepEqual(cut.ticks.map((r) => r[0]), [-20, -10, 0, 20]);
   assert.deepEqual([cut.from, cut.to], [-29, 39]);
+});
+
+const clPool = (spacing, vol, extra = {}) => ({
+  chain: 'base', address: '0xpool', gauge: '0xgauge', tickSpacing: spacing,
+  token0: { address: WETH, symbol: 'WETH', decimals: 18, usd: 3000 }, token1: { address: USDC, symbol: 'USDC', decimals: 6, usd: 1 },
+  fee: 500, unstakedFee: 1e5, tick: -196256, sqrtPriceX96: BigInt(Math.round(Math.sqrt(1.0001 ** -196256) * Q96)).toString(),
+  liquidity: '5000000000000000', stakedLiquidity: '3000000000000000', tvlUsd: 2e7, emissionPerSec: 0.05, emissionWindowSec: 1,
+  vol24h: { daily: vol, annual: 0, samples: 1 }, vol7d: { daily: vol, annual: 0, samples: 1 }, change24h: 0, ...extra,
+});
+const netOf = (pool, range) => netYield({ apr: rangeApr(pool, 1.2, range, 1000), tick: pool.tick, lower: range[0], upper: range[1], dailyVol: riskVolOf(pool), costFraction: rebalanceCost(pool, 1000) });
+
+test('best range searches at tick-spacing granularity, beats every 1% preset and stays at least a day in range', () => {
+  for (const [spacing, vol] of [[1, 0.0005], [10, 0.01], [100, 0.03], [200, 0.05]]) {
+    const pool = clPool(spacing, vol);
+    const best = bestRange(pool, 1.2, 1000);
+    assert.ok(best, `spacing ${spacing}`);
+    const [lower, upper] = best.range;
+    assert.ok(Number.isInteger(lower / spacing) && Number.isInteger(upper / spacing));
+    assert.ok(lower <= pool.tick && pool.tick < upper);
+    assert.ok(best.result.days >= 1);
+    for (const width of [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]) {
+      const preset = netOf(pool, rangeTicks(pool.tick, spacing, width));
+      if (preset && preset.days >= 1) assert.ok(best.result.net >= preset.net - 1e-12, `spacing ${spacing} width ${width}`);
+    }
+    // 与逐格穷举的居中区间相比差距很小。
+    const cell = Math.floor(pool.tick / spacing);
+    let brute = -Infinity;
+    for (let n = 1; n <= Math.min(Math.ceil(27_728 / spacing), 1500); n++) {
+      const lo = (cell - Math.floor(n / 2)) * spacing, r = netOf(pool, [lo, lo + n * spacing]);
+      if (r && r.days >= 1) brute = Math.max(brute, r.net);
+    }
+    assert.ok(best.result.net >= brute - Math.abs(brute) * 2e-3, `spacing ${spacing}: ${best.result.net} vs ${brute}`);
+  }
+  // 低波动的 tickSpacing=1 池子推荐比 1% 更窄的区间。
+  assert.equal(rangeLabel(clPool(1, 0.0005), bestRange(clPool(1, 0.0005), 1.2, 1000).range).startsWith('±0.'), true);
+});
+
+test('best range falls back to full range when emission cannot cover the loss, and needs every input', () => {
+  const pool = clPool(100, 0.05, { emissionPerSec: 1e-9 });
+  const best = bestRange(pool, 1.2, 1000);
+  assert.deepEqual(best.range, fullRange(100));
+  assert.equal(rangeLabel(pool, best.range), '全范围');
+  assert.equal(bestRange(clPool(100, 0.03, { gauge: null }), 1.2, 1000), null);
+  assert.equal(bestRange(clPool(100, 0.03, { emissionPerSec: null }), 1.2, 1000), null);
+  assert.equal(bestRange(clPool(100, 0.03, { vol24h: null, vol7d: null }), 1.2, 1000), null);
+  assert.equal(bestRange(clPool(100, 0.03), null, 1000), null);
+  assert.equal(bestRange(clPool(100, 0.03), 1.2, 0), null);
+});
+
+test('range label shows symmetric ranges as ±x% and asymmetric ones as both edges', () => {
+  const pool = clPool(10, 0.01);
+  assert.equal(rangeLabel(pool, rangeTicks(pool.tick, 10, 0.05)), '±5.0%');
+  const label = rangeLabel(pool, [pool.tick - 500, pool.tick + 2000]);
+  assert.match(label, /^−\d.*%\/\+\d.*%$/);
+  // 翻转报价后上下沿互换：下沿跌幅约等于原上沿涨幅对应的 1/(1+x)−1。
+  const [down, up] = label.split('/').map((t) => Number(t.replace('−', '-').replace('%', '')) / 100);
+  const flipped = rangeLabel(pool, [pool.tick - 500, pool.tick + 2000], true).split('/').map((t) => Number(t.replace('−', '-').replace('%', '')) / 100);
+  assert.ok(Math.abs(flipped[0] - (1 / (1 + up) - 1)) < 0.01 && Math.abs(flipped[1] - (1 / (1 + down) - 1)) < 0.01, `${label} vs ${flipped}`);
 });

@@ -117,3 +117,55 @@ export function quoteOf(pool: Pick<MarketPool, 'token0' | 'token1'>, flip = fals
   return { price, tickOf, rising: !invert, label: `每 ${base} 折合 ${quote}`, pair: `${base} / ${quote}`, base, quote };
 }
 export const priceText = (v: number) => (!Number.isFinite(v) ? '—' : v >= 1e12 ? v.toExponential(3) : v >= 1000 ? v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : v >= 1 ? v.toPrecision(6) : v >= 1e-12 ? v.toPrecision(5) : v.toExponential(3));
+
+// 推荐区间：在 tickSpacing 粒度上搜索以当前价居中的区间中净年化最高者，只在预计至少能在区间内待 minDays 天的区间中选，
+// 否则窄区间靠高频调仓刷出的净年化不稳定，也不现实。每个宽度只取最居中的摆放：模型假设价格无漂移，把当前价放到
+// 靠近一侧边沿能用同样的钱换到更多流动性，按公式净年化可再高几个百分点，但那是押注价格不往近的一侧走，且离开区间后
+// 重新调仓也是居中摆放，所以不采用。宽度先逐格试到 64 格，再按 1% 的几何步长试到当前价 ÷4 至 ×4，另外试全范围
+// （排放抵不过无常损失时越宽越好）；最后在最优宽度附近逐格细搜。
+export type RangeChoice = { range: [number, number]; result: NetYield };
+const SEARCH_EXACT_CELLS = 64;
+const SEARCH_STEP = 1.01;
+const SEARCH_SPAN_TICKS = 13_864;
+export function bestRange(pool: MarketPool, aeroUsd: number | null, deposit: number, minDays = 1): RangeChoice | null {
+  const vol = riskVolOf(pool);
+  if (vol === null || !pool.gauge || pool.emissionPerSec === null || aeroUsd === null || !(deposit > 0)) return null;
+  const s = pool.tickSpacing, tick = pool.tick, full = fullRange(s);
+  const costFraction = rebalanceCost(pool, deposit);
+  const maxCells = Math.max(1, Math.ceil((2 * SEARCH_SPAN_TICKS) / s));
+  let best: RangeChoice | null = null, bestCells = 0;
+  const tryRange = (lower: number, upper: number) => {
+    if (lower < full[0] || upper > full[1] || tick < lower || tick >= upper) return false;
+    const result = netYield({ apr: rangeApr(pool, aeroUsd, [lower, upper], deposit), tick, lower, upper, dailyVol: vol, costFraction });
+    if (!result || result.days < minDays || (best && result.net <= best.result.net)) return false;
+    best = { range: [lower, upper], result }; return true;
+  };
+  const tryCells = (cells: number) => {
+    const [lower, upper] = centeredRange(tick, s, cells);
+    if (tryRange(lower, upper)) bestCells = cells;
+  };
+  for (let cells = 1; cells <= maxCells; cells = cells < SEARCH_EXACT_CELLS ? cells + 1 : Math.ceil(cells * SEARCH_STEP)) tryCells(cells);
+  if (bestCells > SEARCH_EXACT_CELLS) {
+    const around = bestCells;
+    for (let cells = Math.floor(around / SEARCH_STEP); cells <= Math.ceil(around * SEARCH_STEP); cells++) tryCells(cells);
+  }
+  tryRange(full[0], full[1]);
+  return best;
+}
+
+// cells 格宽、对齐 tickSpacing 的区间：当前 tick 所在格之下包含 below 格，使当前价两侧的 tick 距离最接近。
+export function centeredRange(tick: number, tickSpacing: number, cells: number): [number, number] {
+  const s = tickSpacing, cell = Math.floor(tick / s);
+  const below = Math.min(Math.max(Math.round((cell * s - tick + (cells * s) / 2) / s), 0), cells - 1);
+  return [(cell - below) * s, (cell - below + cells) * s];
+}
+
+// 区间上下沿相对当前价的涨跌幅（按页面报价方向，flip 与 quoteOf 相同），近似对称时显示 ±x%。
+export function rangeLabel(pool: MarketPool, range: [number, number], flip = false): string {
+  const q = quoteOf(pool, flip), now = q.price(pool.tick);
+  const [a, b] = [q.price(range[0]) / now - 1, q.price(range[1]) / now - 1].sort((x, y) => x - y);
+  const abs = (v: number) => { const x = Math.abs(v) * 100; return x >= 10 ? x.toFixed(0) : x >= 1 ? x.toFixed(1) : x.toFixed(2); };
+  const fmt = (v: number) => `${v < 0 ? '−' : '+'}${abs(v)}`;
+  if (range[0] <= fullRange(pool.tickSpacing)[0] && range[1] >= fullRange(pool.tickSpacing)[1]) return '全范围';
+  return a < 0 && b > 0 && Math.abs(a + b) <= 0.1 * (b - a) ? `±${abs((b - a) / 2)}%` : `${fmt(a)}%/${fmt(b)}%`;
+}
