@@ -36,18 +36,19 @@ const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 type Metrics = {
   pool: MarketPool; change: number | null; stakedShare: number | null; aeroPerDay: number | null; emissionUsdYear: number | null; emissionTvl: number | null;
   apr: number | null; narrowApr: number | null; daysIn: number | null; range: [number, number];
-  net: NetYield | null; best: { width: number; result: NetYield } | null; score: number | null;
+  net: NetYield | null; best: { width: number; result: NetYield } | null; score: number | null; riskVol: number | null;
   // 与 RANGES 一一对应的各宽度净年化；avg 为过去窗口的平均值，由样本另行计算。
   widths: (NetYield | null)[]; avg: Average | null;
 };
 // 过去窗口内逐小时按当前宽度与投入重算后的平均；days 按平均调仓频率折回天数。
-type Average = { hours: number; samples: number; widths: (NetYield | null)[]; selected: NetYield | null; best: { width: number; result: NetYield } | null };
+// score 为平均收益波动比：最佳宽度的平均净年化 ÷（各点日波动的平均 × √365），用比值的平均会被个别低波动点放大。
+type Average = { hours: number; samples: number; widths: (NetYield | null)[]; selected: NetYield | null; best: { width: number; result: NetYield } | null; score: number | null };
 const WINDOWS: Record<MarketWindow, string> = { '24h': '近 24 小时', '3d': '近 3 天', '7d': '近 7 天', '30d': '近 30 天' };
 const WINDOW_HOURS: Record<MarketWindow, number> = { '24h': 24, '3d': 72, '7d': 168, '30d': 720 };
 const Q96 = 2 ** 96;
 // 最佳宽度只在预计至少能在区间内待这么久的宽度中选：否则窄区间靠高频调仓刷出的净年化不稳定，也不现实。
 const MIN_HOLD_DAYS = 1;
-// 日波动下限：样本期内不动的池子按此估算损耗、调仓与稳健分，避免零损耗与分数无限大。
+// 日波动下限：样本期内不动的池子按此估算损耗、调仓与收益波动比，避免零损耗与比值无限大。
 const VOL_FLOOR = 0.001;
 // 一次调仓（撤出、换币、重新添加并质押）的 gas 估算，美元。
 const REBALANCE_GAS_USD: Record<string, number> = { ethereum: 10 };
@@ -66,9 +67,9 @@ function pairMatches(pool: MarketPool, kind: PairKind) {
 }
 // 空输入表示不限；非数字同样不限，避免输入过程中的中间态把表格清空。
 const limitOf = (text: string) => { if (!text.trim()) return null; const v = Number(text); return Number.isFinite(v) && v >= 0 ? v : null; };
-type SortKey = 'score' | 'net' | 'avgNet' | 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
+type SortKey = 'score' | 'avgScore' | 'net' | 'avgNet' | 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
 const SORTS: Record<SortKey, (m: Metrics) => number | null> = {
-  score: (m) => m.score, net: (m) => m.best?.result.net ?? null, avgNet: (m) => m.avg?.best?.result.net ?? null,
+  score: (m) => m.score, avgScore: (m) => m.avg?.score ?? null, net: (m) => m.best?.result.net ?? null, avgNet: (m) => m.avg?.best?.result.net ?? null,
   tvl: (m) => m.pool.tvlUsd, staked: (m) => m.stakedShare, emission: (m) => m.aeroPerDay, emissionTvl: (m) => m.emissionTvl, apr: (m) => m.apr, narrowApr: (m) => m.narrowApr,
   vol24h: (m) => m.pool.vol24h?.daily ?? null, vol7d: (m) => m.pool.vol7d?.daily ?? null, days: (m) => m.daysIn, change: (m) => m.change,
 };
@@ -81,7 +82,7 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
   const aprFor = (range: [number, number]) => usdPerSecond === null || !pool.gauge ? null
     : dilutedApr({ usdPerSecond, competingLiquidity: pool.stakedLiquidity, unitUsd: liquidityUnitUsd(pool.sqrtPriceX96, range[0], range[1], pool.token0, pool.token1, p0, p1), deposit });
   const range = rangeTicks(pool.tick, pool.tickSpacing, width);
-  // 净年化、在区间天数与稳健分统一用 24h 与 7d 中较大的日波动，偏保守，并设下限：稳定币对短期一个 tick 都没动时
+  // 净年化、在区间天数与收益波动比统一用 24h 与 7d 中较大的日波动，偏保守，并设下限：稳定币对短期一个 tick 都没动时
   // 波动记为 0，不加下限会让最窄档零损耗、零调仓而排到最前。调仓成本 = 半仓换币手续费 + gas 占投入比例。
   const vols = [pool.vol24h?.daily, pool.vol7d?.daily].filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
   const riskVol = vols.length ? Math.max(...vols, VOL_FLOOR) : null;
@@ -101,8 +102,13 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
     apr, narrowApr: aprFor(rangeTicks(pool.tick, pool.tickSpacing, 0)), net: netAt(range, apr), best,
     score: best && riskVol !== null ? best.result.net / (riskVol * Math.sqrt(365)) : null,
     daysIn: expectedDaysInRange(pool.tick, range[0], range[1], riskVol),
-    widths, avg: null,
+    widths, avg: null, riskVol,
   };
+}
+
+function scoreOf(best: Metrics['best'], sums: { vol: number; volN: number }[]) {
+  const s = best ? sums[RANGES.findIndex((r) => r.value === best.width)] : null;
+  return best && s?.volN ? best.result.net / ((s.vol / s.volN) * Math.sqrt(365)) : null;
 }
 
 function bestOf(widths: (NetYield | null)[]): Metrics['best'] {
@@ -115,20 +121,25 @@ function bestOf(widths: (NetYield | null)[]): Metrics['best'] {
 // 区间按当时价格居中，相当于一直跟着价格调仓；调仓频率取各点 365/天数 的平均，避免个别长停留时间把平均天数拉高。
 function averageOf(pool: MarketPool, entry: MarketSamples['pools'][string] | undefined, width: number, deposit: number): Average | null {
   if (!entry) return null;
-  const sums = RANGES.map(() => ({ n: 0, net: 0, emission: 0, impermanent: 0, rebalance: 0, exits: 0 }));
+  // vol 只在该宽度结果有效的点上累计，平均收益波动比的分子分母用同一批样本。
+  const sums = RANGES.map(() => ({ n: 0, net: 0, emission: 0, impermanent: 0, rebalance: 0, exits: 0, vol: 0, volN: 0 }));
   for (const [, tick, staked, usd0, usd1, emissionUsd, v24, v7, fee] of entry.samples) {
     const vol = (daily: number | null) => (daily === null ? null : { daily, annual: daily * Math.sqrt(365), samples: 0 });
     const at: MarketPool = { ...pool, tick, sqrtPriceX96: String(Math.sqrt(1.0001 ** (tick + 0.5)) * Q96), stakedLiquidity: String(staked),
       token0: { ...pool.token0, usd: usd0 }, token1: { ...pool.token1, usd: usd1 }, emissionPerSec: emissionUsd, vol24h: vol(v24), vol7d: vol(v7), fee };
-    metricsFor(at, 1, width, deposit).widths.forEach((r, i) => {
+    const m = metricsFor(at, 1, width, deposit);
+    m.widths.forEach((r, i) => {
       if (!r) return;
       const s = sums[i];
       s.n++; s.net += r.net; s.emission += r.emission; s.impermanent += r.impermanent; s.rebalance += r.rebalance; s.exits += r.days === Infinity ? 0 : 365 / r.days;
+      if (m.riskVol !== null) { s.vol += m.riskVol; s.volN++; }
     });
   }
   const widths = sums.map((s) => (s.n ? { net: s.net / s.n, emission: s.emission / s.n, impermanent: s.impermanent / s.n, rebalance: s.rebalance / s.n, days: s.exits > 0 ? 365 / (s.exits / s.n) : Infinity } : null));
   const index = RANGES.findIndex((r) => r.value === width);
-  return { hours: entry.hours, samples: Math.max(...sums.map((s) => s.n)), widths, selected: index >= 0 ? widths[index] : null, best: bestOf(widths) };
+  const best = bestOf(widths);
+  return { hours: entry.hours, samples: Math.max(...sums.map((s) => s.n)), widths, selected: index >= 0 ? widths[index] : null, best,
+    score: scoreOf(best, sums) };
 }
 
 // 默认以美元价较高的代币为基准报价，例如 WETH/USDC 显示每 WETH 多少 USDC；flip 时反过来。
@@ -234,6 +245,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   samplesRef.current = samples;
   const [cachedAt, setCachedAt] = useState<number | null>(null);
   const [minScoreText, setMinScoreText] = useState('');
+  const [minAvgScoreText, setMinAvgScoreText] = useState('');
   const [maxVolText, setMaxVolText] = useState('');
   const [minDaysText, setMinDaysText] = useState('');
   const [sort, setSort] = useState<{ key: SortKey; desc: boolean }>({ key: 'score', desc: true });
@@ -344,8 +356,9 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const minNet = minNetText.trim() && Number.isFinite(Number(minNetText)) ? Number(minNetText) : null;
   const minAvg = minAvgText.trim() && Number.isFinite(Number(minAvgText)) ? Number(minAvgText) : null;
   const minScore = minScoreText.trim() && Number.isFinite(Number(minScoreText)) ? Number(minScoreText) : null;
+  const minAvgScore = minAvgScoreText.trim() && Number.isFinite(Number(minAvgScoreText)) ? Number(minAvgScoreText) : null;
   const minApr = limitOf(minAprText), maxVol = limitOf(maxVolText), minDays = limitOf(minDaysText);
-  const advancedCount = [pairKind !== 'all', spacingValue !== 'all', minScore !== null, minNet !== null, minAvg !== null, minApr !== null, maxVol !== null, minDays !== null].filter(Boolean).length;
+  const advancedCount = [pairKind !== 'all', spacingValue !== 'all', minScore !== null, minAvgScore !== null, minNet !== null, minAvg !== null, minApr !== null, maxVol !== null, minDays !== null].filter(Boolean).length;
   const rows = useMemo(() => {
     const words = search.trim().toLowerCase().split(/[\s/,]+/).filter(Boolean);
     const pick = SORTS[sort.key];
@@ -357,6 +370,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       && pairMatches(m.pool, pairKind)
       && (spacingValue === 'all' || m.pool.tickSpacing === Number(spacingValue))
       && (minScore === null || (m.score !== null && m.score >= minScore))
+      && (minAvgScore === null || (m.avg?.score != null && m.avg.score >= minAvgScore))
       && (minNet === null || (m.best !== null && m.best.result.net * 100 >= minNet))
       && (minAvg === null || (m.avg?.best ? m.avg.best.result.net * 100 >= minAvg : false))
       && (minApr === null || (m.apr !== null && m.apr * 100 >= minApr))
@@ -364,10 +378,10 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       && (minDays === null || (m.daysIn !== null && m.daysIn >= minDays))
       && words.every((w) => m.pool.token0.symbol.toLowerCase().includes(w) || m.pool.token1.symbol.toLowerCase().includes(w) || m.pool.address.startsWith(w)))
       .sort((a, b) => { const x = pick(a), y = pick(b); if (x === null && y === null) return 0; if (x === null) return 1; if (y === null) return -1; return sort.desc ? y - x : x - y; });
-  }, [all, chainFilter, emittingOnly, minTvl, search, sort, pairKind, spacingValue, minScore, minNet, minAvg, minApr, maxVol, minDays]);
+  }, [all, chainFilter, emittingOnly, minTvl, search, sort, pairKind, spacingValue, minScore, minAvgScore, minNet, minAvg, minApr, maxVol, minDays]);
   const resetFilters = () => {
     setChainFilter('all'); setSearch(''); setMinTvlText('100000'); setEmittingOnly(true);
-    setPairKind('all'); setSpacing('all'); setMinScoreText(''); setMinNetText(''); setMinAvgText(''); setMinAprText(''); setMaxVolText(''); setMinDaysText('');
+    setPairKind('all'); setSpacing('all'); setMinScoreText(''); setMinAvgScoreText(''); setMinNetText(''); setMinAvgText(''); setMinAprText(''); setMaxVolText(''); setMinDaysText('');
   };
   const openMetrics = open ? all.find((m) => key(m.pool) === open) ?? null : null;
 
@@ -442,7 +456,8 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       <div className="am-filters am-filters-more" id="am-more-filters" hidden={!showMore}>
         <label>交易对<select value={pairKind} onChange={(e) => setPairKind(e.target.value as PairKind)}>{Object.entries(PAIRS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label>
         <label>CL 档位<select value={spacingValue} onChange={(e) => setSpacing(e.target.value)}><option value="all">全部</option>{spacings.map((v) => <option key={v} value={v}>CL{v}</option>)}</select></label>
-        <label>最低稳健分<input type="number" step={0.5} placeholder="不限" value={minScoreText} onChange={(e) => setMinScoreText(e.target.value)} /></label>
+        <label>最低收益波动比<input type="number" step={0.5} placeholder="不限" value={minScoreText} onChange={(e) => setMinScoreText(e.target.value)} /></label>
+        <label>最低平均收益波动比<input type="number" step={0.5} placeholder="不限" value={minAvgScoreText} onChange={(e) => setMinAvgScoreText(e.target.value)} /></label>
         <label>最低净年化（%）<input type="number" step={10} placeholder="不限" value={minNetText} onChange={(e) => setMinNetText(e.target.value)} /></label>
         <label>最低平均净年化（%）<input type="number" step={10} placeholder="不限" value={minAvgText} onChange={(e) => setMinAvgText(e.target.value)} /></label>
         <label>最低区间年化（%）<input type="number" min={0} step={10} placeholder="不限" value={minAprText} onChange={(e) => setMinAprText(e.target.value)} /></label>
@@ -452,11 +467,11 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <small className="am-filter-hint">最高日波动按 24h（样本不足时用 7d）筛选；设了门槛时缺少该指标的池子不显示。区间年化、净年化与在区间天数随上面的区间宽度和投入变化。</small>
       </div>
       <p className="am-note">排放年化 = 池子排放（AERO 计价）×（你的流动性 /（当前价位质押流动性 + 你的））÷ 投入，假设全程在区间内并质押；价格移动后的竞争流动性不同，仅用于同一时刻横向比较。不含手续费：质押仓位的手续费归投票者。预计在区间时间按日波动 σ 的无漂移随机游走估算。
-        净年化 = 排放年化 − 无常损失 365·σ²/(4h) − 调仓成本 365/在区间天数 ×（0.5×费率 + gas/投入）；σ 取 24h 与 7d 日波动中较大者（最低按 0.1%/天），h 约为区间对数半宽（按仓位实际价值精确计算），gas 按 Ethereum 10 美元、其余链 0.2 美元估算；在预计至少待满 1 天的宽度中取最高者并标出宽度。平均净年化：服务端每小时记录一次各池读数（保留 30 天，从本功能上线后开始累计），按当前所选宽度与投入逐点重算净年化后取平均，长窗口均匀抽 24 个点；最佳宽度按平均值在平均在区间至少 1 天的宽度中选，能看出排放与流动性变化后收益是否持续。稳健分 = 净年化 ÷（日波动 × √365），即每承担一份年化波动换来的净收益，默认按它排序；稳定币对的脱锚风险、代币单边下跌（趋势）与排放随投票周期变化不在公式内，不含稳定币的交易对还承担两个币对美元的整体涨跌。</p>
+        净年化 = 排放年化 − 无常损失 365·σ²/(4h) − 调仓成本 365/在区间天数 ×（0.5×费率 + gas/投入）；σ 取 24h 与 7d 日波动中较大者（最低按 0.1%/天），h 约为区间对数半宽（按仓位实际价值精确计算），gas 按 Ethereum 10 美元、其余链 0.2 美元估算；在预计至少待满 1 天的宽度中取最高者并标出宽度。平均净年化：服务端每小时记录一次各池读数（保留 30 天，从本功能上线后开始累计），按当前所选宽度与投入逐点重算净年化后取平均，长窗口均匀抽 24 个点；最佳宽度按平均值在平均在区间至少 1 天的宽度中选，能看出排放与流动性变化后收益是否持续。收益波动比 = 净年化 ÷（日波动 × √365），即每承担一份年化波动换来的净收益，默认按它排序；平均收益波动比 = 平均净年化（最佳宽度）÷（窗口内各点日波动的平均 × √365），看这份性价比是否持续；稳定币对的脱锚风险、代币单边下跌（趋势）与排放随投票周期变化不在公式内，不含稳定币的交易对还承担两个币对美元的整体涨跌。</p>
       <div className="lp-table-scroll"><table className="lp-table am-table">
         <thead><tr>
           <th scope="col">池子</th>
-          {header('score', '稳健分', '净年化 ÷ 年化波动（σ × √365）')}{header('net', '净年化', '在区间至少 1 天的宽度中取最高：排放 − 无常损失 − 调仓成本')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，取平均值最高的宽度`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
+          {header('score', '收益波动比', '净年化 ÷ 年化波动（σ × √365）')}{header('avgScore', '平均收益波动比', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}平均净年化 ÷ 平均年化波动`)}{header('net', '净年化', '在区间至少 1 天的宽度中取最高：排放 − 无常损失 − 调仓成本')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，取平均值最高的宽度`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
           {header('emission', '日排放', '每天发给该池的 AERO')}{header('emissionTvl', '排放/TVL', '年化排放价值除以池子 TVL')}
           {header('apr', '区间年化', '所选区间宽度下的排放年化')}{header('narrowApr', '最窄年化', '单个 tickSpacing 区间的排放年化')}
           {header('vol24h', '日波动 24h', '小时对数收益折算到 1 天')}{header('vol7d', '日波动 7d')}
@@ -468,6 +483,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
             <tr className={isOpen ? 'open' : undefined} onClick={() => toggle(m)}>
               <th scope="row"><button type="button" className="am-pool" aria-expanded={isOpen}><strong>{pairName(m.pool)}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></th>
               <td className="num strong">{m.score === null ? '—' : m.score.toFixed(1)}</td>
+              <td className="num" title={averageNote(m)}>{m.avg?.score == null ? '—' : m.avg.score.toFixed(1)}</td>
               <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `${widthLabel(m.best.width)} · ${days(m.best.result.days)}` : ''}</small></td>
               <td className={`num ${(m.avg?.best?.result.net ?? 0) > 0 ? 'up' : (m.avg?.best?.result.net ?? 0) < 0 ? 'down' : ''}`} title={averageNote(m)}>{pct(m.avg?.best?.result.net, 0)}<small>{m.avg?.best ? `${widthLabel(m.avg.best.width)} · ${m.avg.hours} 小时` : ''}</small></td>
               <td className="num">{usd(m.pool.tvlUsd)}</td><td className="num">{pct(m.stakedShare, 0)}</td>
@@ -478,10 +494,10 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <td className="num">{days(m.daysIn)}</td>
               <td className={`num ${(m.change ?? 0) > 0 ? 'up' : (m.change ?? 0) < 0 ? 'down' : ''}`} title={quoteOf(m.pool).pair}>{signed(m.change)}</td>
             </tr>
-            {isOpen && openMetrics ? <tr className="am-detail-row"><td colSpan={14}><PoolDetail metrics={openMetrics} history={history?.key === k ? history.data : null} error={history?.key === k ? history.error : ''} width={width} average={averageNote(openMetrics)} /></td></tr> : null}
+            {isOpen && openMetrics ? <tr className="am-detail-row"><td colSpan={15}><PoolDetail metrics={openMetrics} history={history?.key === k ? history.data : null} error={history?.key === k ? history.error : ''} width={width} average={averageNote(openMetrics)} /></td></tr> : null}
           </Fragment>;
         })}
-        {!rows.length ? <tr><td colSpan={14} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
+        {!rows.length ? <tr><td colSpan={15} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
       </table></div>
       {rows.length > limit ? <div className="am-more"><button className="button secondary" onClick={() => setLimit((v) => v + 60)}>显示更多（共 {rows.length} 个）</button></div> : null}
     </section>
