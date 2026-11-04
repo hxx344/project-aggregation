@@ -136,6 +136,40 @@ test('scan builds rows with prices, emission and backfilled volatility, then ret
   await reopened.close();
 });
 
+test('each scan records hourly samples for gauge pools, served per window and only for enabled chains', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  const options = { dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer };
+  const market = createAeroMarket(options);
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const first = market.state().samples;
+  assert.equal(first.available, true); assert.ok(first.version > 0);
+  const read = market.samples('7d');
+  assert.deepEqual(Object.keys(read.pools).sort(), [`base:${POOL_WETH}`, `base:${POOL_AERO}`].sort());
+  const [sample] = read.pools[`base:${POOL_WETH}`].samples;
+  assert.equal(sample[0], Math.floor(fake.chain.t / 3600) * 3600);
+  assert.ok(Math.abs(sample[5] - 0.1 * 0.6) < 1e-6, 'emission is stored in USD at the AERO price of that scan');
+  assert.throws(() => market.samples('1y'), (e) => e.status === 400);
+  // 同一整点的后续轮次不新增样本；下一个整点再记一条。
+  await clock.fire(); await settle(market);
+  assert.equal(market.samples('7d').pools[`base:${POOL_WETH}`].hours, 1);
+  fake.chain.t += 3600;
+  while (clock.pending()[0]?.ms === 30_000) { await clock.fire(); await settle(market); }
+  await clock.fire(); await settle(market);
+  assert.equal(market.samples('7d').pools[`base:${POOL_WETH}`].hours, 2);
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, enabled: false } } });
+  assert.deepEqual(market.samples('7d').pools, {}, 'disabled chains are hidden like their rows');
+  await market.close();
+  const reopened = createAeroMarket(options);
+  await reopened.initialize();
+  await reopened.save(config);
+  assert.equal(reopened.samples('7d').pools[`base:${POOL_WETH}`].hours, 2, 'samples survive a restart');
+  await reopened.close();
+});
+
 test('archive failure falls back to locally accumulated hourly samples', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   onlyBase(dir);
@@ -324,6 +358,13 @@ test('workbench market API requires login and same origin and validates queries'
   assert.equal((await request('?file=/tmp')).status, 400);
   assert.equal((await request('/pool?chain=base')).status, 400);
   assert.equal((await request(`/pool?chain=base&address=${POOL_WETH}`)).status, 404);
+  const samples = await request('/samples?window=7d');
+  assert.equal(samples.status, 200);
+  assert.deepEqual((await samples.json()).pools, {});
+  assert.equal((await request('/samples')).status, 400);
+  assert.equal((await request('/samples?window=1y')).status, 400);
+  assert.equal((await request('/samples?window=7d&x=1')).status, 400);
+  assert.equal(state.samples.available, true);
   assert.equal((await request('', 'GET', undefined, { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
   assert.equal((await request('/refresh', 'POST', {}, { 'X-CSRF-Token': '' })).status, 403);
   assert.equal((await request('/refresh', 'POST', {})).status, 409);
