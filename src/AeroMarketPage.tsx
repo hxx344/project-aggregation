@@ -245,7 +245,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <div className="am-chain-head"><strong>{c.name}</strong><span className="am-chain-status">{c.status === 'loading' ? <LoaderCircle size={12} className="spin" /> : null}{stale ? '数据过期' : STATUS[c.status]}</span></div>
         <span>{c.activeCount ?? '—'} 个跟踪 / {c.poolCount ?? '—'} 个池 · {c.gaugeCount ?? '—'} 个有 gauge</span>
         <span>数据 {when(c.updatedAt)}{c.nextAt && c.enabled ? ` · 下次 ${when(c.nextAt)}` : ''}</span>
-        <span title={c.rpcHost}>{HISTORY[c.history.archive]} · {c.history.points} 点{c.history.pending > 0 ? ` · 还差 ${c.history.pending} 小时，每 30 秒补一批` : ''}</span>
+        <span title={c.rpcHost}>{HISTORY[c.history.archive]} · {c.history.points} 点{c.enabled && c.history.archive === 'archive' && c.history.pending > 0 ? ` · 还差 ${c.history.pending} 小时未补` : ''}</span>
         {c.error ? <span className="lp-error" title={c.error}>{when(c.errorAt)} {c.error}</span> : null}
       </div>;
     })}</section>

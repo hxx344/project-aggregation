@@ -165,17 +165,23 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     return { replaced, registry, snapshot: { t: full.timestamp, block, states: Object.fromEntries(Object.entries(states).filter(([a]) => active.has(a))) } };
   }
 
+  // 7 天内还没读过的整点。按请求的整点判断是否已读：出块时间外推有偏差时，实际时间戳可能离整点超过 20 分钟，不能据此反复重读。
+  function missingSlots(rt, nowSec, accept = () => true) {
+    const points = rt.history.points;
+    const covered = (slot) => points.some((p) => p.slot === slot || Math.abs(p.t - slot) <= 1200);
+    const slots = [];
+    for (let slot = floorHour(nowSec); slot > nowSec - HISTORY_SEC; slot -= HOUR) if (slot < nowSec - 60 && !covered(slot) && accept(slot)) slots.push(slot);
+    return slots;
+  }
+
   async function backfill(id, rpc, active, block, nowSec) {
     const rt = runtimes.get(id);
     rt.backfillPending = 0;
     if (!rt.registry.blockTime || rt.archive?.failedAt && nowSec - rt.archive.failedAt < DISCOVERY_SEC) return false;
     const points = rt.history.points;
-    // 按请求的整点判断是否已读：出块时间外推有偏差时，实际时间戳可能离整点超过 20 分钟，不能据此反复重读。
-    const covered = (slot) => points.some((p) => p.slot === slot || Math.abs(p.t - slot) <= 1200);
-    const slots = [];
     // 早于创世区块的整点读不到，不计入待补数，否则会一直追批。
     const targetOf = (slot) => block - Math.round((nowSec - slot) / rt.registry.blockTime);
-    for (let slot = floorHour(nowSec); slot > nowSec - HISTORY_SEC; slot -= HOUR) if (slot < nowSec - 60 && !covered(slot) && targetOf(slot) >= 1) slots.push(slot);
+    const slots = missingSlots(rt, nowSec, (slot) => targetOf(slot) >= 1);
     rt.backfillPending = slots.length;
     for (const slot of slots.slice(0, BACKFILL_PER_CYCLE)) {
       if (closed) return false;
@@ -205,7 +211,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   }
 
   function compactHistory(rt, nowSec) {
-    rt.history.points = rt.history.points.filter((p) => p.t > nowSec - HISTORY_SEC - HOUR).sort((a, b) => a.t - b.t);
+    // 回填点按请求的整点保留：出块时间外推偏差可让最老的点实际时间早于 7 天，按时间删会让该整点下一轮又算待补，每 30 秒重读。
+    rt.history.points = rt.history.points.filter((p) => (p.slot ?? p.t) > nowSec - HISTORY_SEC - HOUR).sort((a, b) => a.t - b.t);
     for (const p of rt.history.points) if (p.t < nowSec - RATE_HISTORY_SEC) for (const [k, row] of Object.entries(p.rows)) if (row.length > 1) p.rows[k] = [row[0]];
   }
 
@@ -281,6 +288,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       const history = readBounded(file('history', id), LIMITS.history);
       if (history?.schema === 1 && Array.isArray(history.points)) rt.history = { schema: 1, points: history.points.filter((p) => Number.isFinite(p?.t) && plainObject(p.rows)) };
       if (rt.snapshot) rt.rows = buildRows({ chain, registry: rt.registry, snapshot: rt.snapshot, prev: rt.prev, history: rt.history });
+      // 重启后按已存历史估算待补整点，让未补完的回填继续按短间隔追批。
+      if (chain.archive && rt.registry?.blockTime) rt.backfillPending = missingSlots(rt, now() / 1000).length;
     } catch (error) {
       log.warn?.({ type: 'aero-market', chain: id, err: error.message }, 'Aero 市场缓存无法读取，将重新扫描');
       rt.registry = null; rt.snapshot = null; rt.prev = null; rt.history = { schema: 1, points: [] }; rt.rows = [];
@@ -293,7 +302,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       if (!config.enabled || !config.chains[c.id].enabled) { schedule(c.id, 0); return; }
       if (rt.running || rt.timer) return;
       const age = rt.snapshot ? now() / 1000 - rt.snapshot.t : Infinity;
-      schedule(c.id, Math.max(2 + i * 3, age < config.intervalMin * 60 ? config.intervalMin * 60 - age : 0));
+      const due = rt.backfillPending > 0 ? Math.min(BACKFILL_FOLLOW_SEC, config.intervalMin * 60) : config.intervalMin * 60;
+      schedule(c.id, Math.max(2 + i * 3, age < due ? due - age : 0));
     });
   }
 
@@ -326,7 +336,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       const rt = runtimes.get(chainId);
       const key = String(address).toLowerCase();
       if (!rt || !/^0x[0-9a-f]{40}$/.test(key) || !rt.rows.some((r) => r.address === key)) throw new HttpError(404, '没有这个池子的数据');
-      const points = rt.history.points.filter((p) => p.rows[key]).map((p) => [p.t * 1000, p.rows[key][0]]);
+      // 回填进行中历史点按从新到旧追加，尚未排序。
+      const points = rt.history.points.filter((p) => p.rows[key]).map((p) => [p.t * 1000, p.rows[key][0]]).sort((a, b) => a[0] - b[0]);
       if (rt.snapshot?.states[key]) points.push([rt.snapshot.t * 1000, rt.snapshot.states[key].tick]);
       return { chain: chainId, address: key, points };
     },
