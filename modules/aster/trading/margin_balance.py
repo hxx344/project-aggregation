@@ -51,6 +51,18 @@ TRANSFER_ABSENCE_READS = 2
 TRANSFER_ABSENCE_SPACING_SECONDS = 30
 TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 180
 TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
+# Seen receipts are evidence that the transfer may exist. Once one is stored,
+# empty reads no longer count toward rejection; a person settles it at the
+# bound unless both sides later match the same receipt.
+TRANSFER_EVIDENCE_LIMIT = 20
+# /income returns at most one page of 1000 rows per window and an active
+# account may fill it with commissions and fills. A full page is split by
+# time (both halves share the midpoint, so either endTime convention is
+# covered and exact duplicates merge) up to this many requests per account;
+# a full window of two milliseconds or less, or the bound, leaves the read
+# incomplete.
+TRANSFER_INCOME_PAGE_ROWS = 1000
+TRANSFER_INCOME_MAX_PAGES = 8
 SETTLE_WAIT = "结算前共享准入暂停该组账户的新写入，原请求不会重发"
 SETTLE_MANUAL = "请人工核对交易所划转记录后结算原请求；结算前共享准入暂停该组账户的新写入，原请求不会重发"
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
@@ -299,7 +311,7 @@ class MarginBalancer:
                 if key in pending and (pending[key] or key not in ("transaction_id", "before_receipts"))}
             if writer_for(self.engine).enabled:
                 updated["unsettled_transfers"] = [*state.get("unsettled_transfers", []),
-                    {**follow_up, "failures": 0, "empty": 0}]
+                    {**follow_up, "failures": 0, "empty": 0, "evidence": []}]
             for field in ("api_notice", "blocked_reason", "retry_without_blocking"):
                 updated.pop(field, None)
             archive = {"pair_id": pair["id"], "original": pending, "result": done,
@@ -613,28 +625,71 @@ class MarginBalancer:
         result = {}
         for side, member in members.items():
             broker = self.engine.broker(member)
-            priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
-            with priority:
-                try:
-                    rows = broker.api.call("GET", "/fapi/v3/income",
-                        {"startTime": start, "endTime": end, "limit": 1000}, signed=True, weight=30)
-                except RequestNotSent:
-                    raise
-                except ExchangeError as exc:
-                    # A local cooldown has not made a historical query. An
-                    # actual network failure still consumes one bounded round.
-                    notice = api_wait_notice(exc)
-                    if observation is not None and not (notice and notice["kind"] == "cooldown"
-                            and exc.http_status is None and exc.code is None):
-                        observation["queried"] = True
-                    raise
-                else:
-                    if observation is not None:
-                        observation["queried"] = True
-            if not isinstance(rows, list) or len(rows) >= 1000 or any(not isinstance(row, dict) for row in rows):
-                raise TradingError("划转流水不完整，无法核对")
+            windows, rows, seen, pages = [(start, end)], [], set(), 0
+            while windows:
+                low, high = windows.pop()
+                if pages >= TRANSFER_INCOME_MAX_PAGES:
+                    raise TradingError(f"划转流水超过 {TRANSFER_INCOME_MAX_PAGES} 段读取上限，无法完整核对")
+                pages += 1
+                page = self._income_page(broker, low, high, reconciliation, observation)
+                if observation is not None:
+                    # Receipts already read stay usable as evidence when a
+                    # later page or side fails.
+                    observation.setdefault("rows", {}).setdefault(side, []).extend(page)
+                if len(page) >= TRANSFER_INCOME_PAGE_ROWS:
+                    if high - low <= 1:
+                        raise TradingError("划转流水在极短时间窗内超过单页上限，无法完整核对")
+                    middle = (low + high) // 2
+                    # Pop order reads the earlier half first.
+                    windows += [(middle, high), (low, middle)]
+                    continue
+                for row in page:
+                    identity = json.dumps(row, sort_keys=True, default=str)
+                    if identity not in seen:
+                        seen.add(identity)
+                        rows.append(row)
             result[side] = rows
         return result
+
+    @staticmethod
+    def _income_page(broker, start, end, reconciliation, observation):
+        priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
+        with priority:
+            try:
+                rows = broker.api.call("GET", "/fapi/v3/income",
+                    {"startTime": start, "endTime": end, "limit": TRANSFER_INCOME_PAGE_ROWS}, signed=True, weight=30)
+            except RequestNotSent:
+                raise
+            except ExchangeError as exc:
+                # A local cooldown has not made a historical query. An
+                # actual network failure still consumes one bounded round.
+                notice = api_wait_notice(exc)
+                if observation is not None and not (notice and notice["kind"] == "cooldown"
+                        and exc.http_status is None and exc.code is None):
+                    observation["queried"] = True
+                raise
+            else:
+                if observation is not None:
+                    observation["queried"] = True
+        if not isinstance(rows, list) or len(rows) > TRANSFER_INCOME_PAGE_ROWS or any(not isinstance(row, dict) for row in rows):
+            raise TradingError("划转流水不完整，无法核对")
+        for row in rows:
+            # Only a row that is clearly another asset or type may be left
+            # out; an unreadable candidate makes the read incomplete instead
+            # of looking like the transfer is absent.
+            asset, kind = row.get("asset"), row.get("incomeType")
+            if not isinstance(asset, str) or not isinstance(kind, str):
+                raise TradingError("划转流水含无法分类的记录，无法核对")
+            if asset != "USD1" or kind not in TRANSFER_TYPES:
+                continue
+            try:
+                if not _identifier(row.get("tranId")):
+                    raise TradingError("缺少流水编号")
+                dec(row.get("time"))
+                dec(row.get("income"))
+            except TradingError:
+                raise TradingError("划转流水含无法解析的 USD1 划转记录，无法核对") from None
+        return rows
 
     @staticmethod
     def _receipt_matches(pending, rows, state, start, end):
@@ -677,6 +732,13 @@ class MarginBalancer:
                 and isinstance(record.get("before_receipts", {}), dict)
                 and (record.get("transaction_id") is None or _identifier(record["transaction_id"]))):
             return False
+        evidence = record.get("evidence", [])
+        if not (isinstance(evidence, list) and len(evidence) <= TRANSFER_EVIDENCE_LIMIT
+                and all(isinstance(item, list) and len(item) == 3 and item[0] in ("long", "short")
+                        and item[1] in TRANSFER_TYPES and _identifier(item[2]) == item[2] for item in evidence)
+                # Evidence voids any absence streak; both at once is corrupt.
+                and not (evidence and record["empty"])):
+            return False
         try:
             positive(record.get("amount"))
         except TradingError:
@@ -712,6 +774,17 @@ class MarginBalancer:
         view = lambda status, reason: self._view(state, config, status, reason, blocks=True)
         if not isinstance(records, list) or any(not self._valid_unsettled(record) for record in records):
             return view("blocked", "未知划转的结算记录无效；" + SETTLE_MANUAL)
+        migrated = False
+        for record in records:
+            if "evidence" not in record:
+                # Written before evidence was kept: a partial or failed read
+                # may sit between its empty reads, so restart the run.
+                if record["failures"] and record["empty"]:
+                    record["empty"] = 0
+                record["evidence"] = []
+                migrated = True
+        if migrated:
+            self.store.put(key, state)
         ids = [member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]
         settled = []
         while records:
@@ -750,7 +823,7 @@ class MarginBalancer:
                 continue
             if exhausted:
                 return view("blocked", label + f"，{TRANSFER_HISTORY_QUERY_LIMIT} 次流水核对仍无法确认；" + SETTLE_MANUAL)
-            if record["empty"] >= TRANSFER_ABSENCE_READS:
+            if record["empty"] >= TRANSFER_ABSENCE_READS and not record.get("evidence"):
                 # The absence proof is durable; an earlier settle failed.
                 self._resolve_skipped(writer, ids, open_ops, rejected=True)
                 settled.append("rejected")
@@ -768,13 +841,16 @@ class MarginBalancer:
                 if observation.get("queried"):
                     record["queried_at"] = now
                     if notice is None:
-                        record["failures"] += 1
+                        # A failed read breaks the run of empty reads.
+                        record.update(failures=record["failures"] + 1, empty=0)
+                    self._keep_evidence(record, observation, state, start, end)
                     self.store.put(key, state)
                 return view("unknown", label + "，流水核对未完成（" + (notice["text"] if notice else self._read_error_detail(exc))
                     + "），稍后有限次重试；" + SETTLE_WAIT)
             except TradingError as exc:
                 if observation.get("queried"):
-                    record.update(queried_at=now, failures=record["failures"] + 1)
+                    record.update(queried_at=now, failures=record["failures"] + 1, empty=0)
+                    self._keep_evidence(record, observation, state, start, end)
                     self.store.put(key, state)
                 return view("unknown", label + "，流水核对失败：" + str(exc) + "；稍后有限次重试，" + SETTLE_WAIT)
             # Persist the read before deciding, so a later failure still
@@ -783,7 +859,9 @@ class MarginBalancer:
             self.store.put(key, state)
             source, destination = self._receipt_matches(record, rows, state, start, end)
             common = source & destination
-            if len(common) == 1 and len(source) == 1 and len(destination) == 1:
+            evidence = record.get("evidence", [])
+            if (len(common) == 1 and len(source) == 1 and len(destination) == 1
+                    and all((item[1], item[2]) in common for item in evidence)):
                 kind, txn = common.pop()
                 self._resolve_skipped(writer, ids, open_ops)
                 # Recorded after settling: recording first and crashing would
@@ -791,6 +869,13 @@ class MarginBalancer:
                 # Crashing in between only leaves this receipt unrecorded.
                 state["used_receipts"] = (state.get("used_receipts", []) + [[kind, txn]])[-100:]
                 settled.append("confirmed")
+            elif not source and not destination and evidence:
+                # An earlier read saw part of this transfer; an empty read now
+                # means the history view is unstable, not that it never landed.
+                record["failures"] += 1
+                self.store.put(key, state)
+                return view("unknown", label + "，此前已读到该笔划转的部分流水，本次两侧均未读到；"
+                    "不按未送达结算，继续有限次核对；" + SETTLE_WAIT)
             elif not source and not destination:
                 if complete:
                     record["empty"] += 1
@@ -802,8 +887,14 @@ class MarginBalancer:
                 self._resolve_skipped(writer, ids, open_ops, rejected=True)
                 settled.append("rejected")
             else:
+                # Partial or conflicting receipts: keep them as durable proof
+                # that the transfer may exist, so later empty reads cannot
+                # reject it.
                 record["failures"] += 1
+                overflow = self._add_evidence(record, source, destination)
                 self.store.put(key, state)
+                if overflow:
+                    return view("blocked", label + "，两侧流水出现过多冲突回执；" + SETTLE_MANUAL)
                 return view("unknown", label + "，两侧流水只部分匹配，继续有限次核对；" + SETTLE_WAIT)
             records.pop(0)
             self.store.put(key, state)
@@ -822,6 +913,30 @@ class MarginBalancer:
         outcome = "已由两侧流水核实到账" if settled[-1] == "confirmed" else "已核实未送达并结算"
         return self._view(state, config, "cooldown", "上次结果未知的划转" + outcome
                           + "；冷却结束后按最新余额重新评估，原请求不会重发")
+
+    @staticmethod
+    def _add_evidence(record, source, destination):
+        evidence = record.get("evidence", [])
+        seen = [[side, kind, txn] for side, found in ((record["source"], source),
+                (record["destination"], destination)) for kind, txn in sorted(found)]
+        merged = evidence + [item for item in seen if item not in evidence]
+        if not merged:
+            return False
+        overflow = len(merged) > TRANSFER_EVIDENCE_LIMIT
+        if overflow:
+            # Too many conflicting receipts to check later: a person decides.
+            merged = merged[:TRANSFER_EVIDENCE_LIMIT]
+            record["failures"] = TRANSFER_HISTORY_QUERY_LIMIT
+        record.update(empty=0, evidence=merged)
+        return overflow
+
+    def _keep_evidence(self, record, observation, state, start, end):
+        """Keep receipts from the pages a failed read did complete; never confirm from them."""
+        rows = observation.get("rows") or {}
+        if rows:
+            source, destination = self._receipt_matches(
+                record, {side: rows.get(side, []) for side in ("long", "short")}, state, start, end)
+            self._add_evidence(record, source, destination)
 
     @staticmethod
     def _resolve_skipped(writer, ids, operation_ids, *, rejected=False):

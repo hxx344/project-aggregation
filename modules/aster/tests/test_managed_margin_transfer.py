@@ -18,7 +18,7 @@ import httpx
 from tests.helpers import account
 from trading import margin_balance
 from trading.account_writer import ManagedWriter
-from trading.exchange import API, LiveBroker, RateBudget, RequestNotSent, TransferRejected
+from trading.exchange import API, BudgetWait, LiveBroker, RateBudget, RequestNotSent, TransferRejected
 from trading.margin_balance import MarginBalancer, TransferAPI
 from trading.models import TradingError
 from trading.pairing import PairManager, validate_pair
@@ -62,6 +62,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.reject_code = None
         self.income_rows = {}
         self.income_error = False
+        self.income_handler = None
         self.api_instances = []
         self.balances = {"long": "3000", "short": "1000", "master": "0"}
         self.engine = SimpleNamespace(store=self.store, market=DemoMarket(), brokers={},
@@ -106,6 +107,8 @@ class ManagedMarginTransferTests(unittest.TestCase):
             if request.method == "GET" and request.url.path.endswith("/income"):
                 if self.income_error:
                     raise httpx.ConnectError("injected income failure", request=request)
+                if self.income_handler is not None:
+                    return self.income_handler(aid, dict(parse_qsl(request.url.query.decode())), request)
                 return httpx.Response(200, json=self.income_rows.get(aid, []))
             if request.method == "POST" and request.url.path.endswith("/subAccountTransfer"):
                 if self.fail_dispatch:
@@ -483,6 +486,358 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((len(self.posts()), len(self.income_queries())), (1, 6))
         self.assertNotIn("unsettled_transfers", self.state())
         self.store.delete_pair("gold")
+
+    # -- Absence evidence, unreadable rows and paged history (#130 #131 #132) --
+
+    SPAN = margin_balance.TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS
+    SPACING = margin_balance.TRANSFER_ABSENCE_SPACING_SECONDS
+
+    def follow_up(self):
+        return self.state()["unsettled_transfers"][0]
+
+    def complete_read(self, first=False):
+        """Make the next history read due; the first one lands after the full span."""
+        self.due(self.SPAN + 1 if first else self.SPACING + 1)
+        return self.balancer.tick(self.pair, self.snapshots())
+
+    def window(self):
+        created = self.follow_up()["created_at"]
+        return (int((created - margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000),
+                int((created + self.SPAN) * 1000))
+
+    def paged_income(self, rows, *, exclusive_end=False, fail_on=None):
+        """Serve /income like the exchange: at most one page per time window."""
+        calls = []
+
+        def handler(aid, params, request):
+            low, high = int(params["startTime"]), int(params["endTime"])
+            calls.append((aid, low, high))
+            if fail_on is not None and len(calls) == fail_on:
+                raise httpx.ConnectError("injected page failure", request=request)
+            inside = sorted((row for row in rows.get(aid, []) if low <= row["time"]
+                             and (row["time"] < high if exclusive_end else row["time"] <= high)),
+                            key=lambda row: row["time"])
+            return httpx.Response(200, json=inside[:int(params["limit"])])
+        self.income_handler = handler
+        return calls
+
+    @staticmethod
+    def busy_rows(count, start, end):
+        step = (end - start) / count
+        return [{"asset": "USD1", "incomeType": "COMMISSION", "income": "-0.01", "tranId": index + 1,
+                 "symbol": "BTCUSDT", "time": int(start + index * step)} for index in range(count)]
+
+    def legacy_operation(self, request_id):
+        operation_id = "aster:legacy:pair_margin:gold:" + request_id
+        payload = {"id": None, "request_id": request_id, "kind": "margin", "symbol": None, "target_leverage": None,
+                   "amount": "1000", "source": "long", "destination": "short", "orders": []}
+        with self.writer.accounts(["long", "short", "master:ASTER_MASTER"], recovery=True) as ticket:
+            self.writer.registry.import_unknown(ticket, operation_id, payload)
+        return operation_id
+
+    def test_partial_receipt_voids_absence_so_later_empty_reads_never_reject(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.complete_read(first=True)
+        self.assertEqual(self.follow_up()["empty"], 1)
+        self.income_rows = {"long": [{**self.receipt("half"), "income": "-1000.00000000"}]}
+        self.complete_read()
+        record = self.follow_up()
+        self.assertEqual((record["empty"], record["failures"], record["evidence"]),
+                         (0, 1, [["long", "TRANSFER", "half"]]))
+        # The evidence is durable: empty reads after a restart still do not reject.
+        self.restart_writer()
+        self.income_rows = {}
+        for failures in (2, 3):
+            result = self.complete_read()
+            self.assertEqual(result["status"], "unknown", result)
+            self.assertIn("不按未送达结算", result["reason"])
+            self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (failures, 0))
+            self.assertEqual(self.shared_state(operation_id), "unknown")
+        queried = len(self.income_queries())
+        result = self.complete_read()
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertIn("人工核对", result["reason"])
+        self.assertEqual((len(self.income_queries()), len(self.posts())), (queried, 1))
+        self.assertEqual(self.shared_state(operation_id), "unknown")
+
+    def test_partial_receipt_then_both_sides_of_it_confirms(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        self.income_rows = {"short": [{**self.receipt("late"), "income": "1000.00000000"}]}
+        self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(self.follow_up()["evidence"], [["short", "TRANSFER", "late"]])
+        row = self.receipt("late")
+        self.income_rows = {"long": [{**row, "income": "-1000.00000000"}], "short": [{**row, "income": "1000.00000000"}]}
+        self.balances.update(long="2000", short="2000")
+        result = self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), result["status"], len(self.posts())), ("confirmed", "cooldown", 1))
+
+    def test_full_match_of_another_receipt_conflicts_with_stored_evidence(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        self.income_rows = {"long": [{**self.receipt("first"), "income": "-1000.00000000"}]}
+        self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(self.follow_up()["evidence"], [["long", "TRANSFER", "first"]])
+        row = self.receipt("second")
+        self.income_rows = {"long": [{**row, "income": "-1000.00000000"}], "short": [{**row, "income": "1000.00000000"}]}
+        result = self.complete_read()
+        self.assertEqual((result["status"], self.shared_state(operation_id)), ("unknown", "unknown"), result)
+        self.assertEqual(self.follow_up()["failures"], 2)
+        self.assertIn(["long", "TRANSFER", "first"], self.follow_up()["evidence"])
+
+    def test_unreadable_transfer_candidates_never_count_as_absence(self):
+        operation_id = self.skip_timed_out_transfer()
+        broken = (lambda row: {key: value for key, value in row.items() if key != "tranId"},
+                  lambda row: {**row, "time": "soon"},
+                  lambda row: {**row, "incomeType": None})
+        for failures, damage in enumerate(broken, 1):
+            self.due(self.SPAN + 1 if failures == 1 else self.SPACING + 1)
+            self.income_rows = {"long": [], "short": [damage({**self.receipt("bad"), "income": "1000.00000000"})]}
+            result = self.balancer.tick(self.pair, self.snapshots())
+            self.assertEqual(result["status"], "unknown", result)
+            self.assertRegex(result["reason"], "无法解析|无法分类")
+            self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (failures, 0))
+        result = self.complete_read()
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertEqual((self.shared_state(operation_id), len(self.posts())), ("unknown", 1))
+
+    def test_bad_amount_on_a_candidate_is_an_incomplete_read(self):
+        self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        self.income_rows = {"long": [{**self.receipt("bad"), "income": "abc"}]}
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertIn("无法解析", result["reason"])
+        self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (1, 0))
+
+    def test_failed_read_breaks_the_absence_run_but_unrelated_rows_do_not(self):
+        operation_id = self.skip_timed_out_transfer()
+        # Clearly another type or asset: excluded even without a usable ID.
+        unrelated = [{"asset": "USD1", "incomeType": "COMMISSION", "income": "-0.1", "time": 1},
+                     {"asset": "BTC", "incomeType": "TRANSFER", "income": "x"}]
+        self.income_rows = {"long": unrelated, "short": unrelated}
+        self.complete_read(first=True)
+        self.assertEqual(self.follow_up()["empty"], 1)
+        self.income_error = True
+        self.complete_read()
+        self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (1, 0))
+        self.income_error = False
+        self.restart_writer()
+        self.complete_read()
+        self.assertEqual((self.follow_up()["empty"], self.shared_state(operation_id)), (1, "unknown"))
+        result = self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), result["status"], len(self.posts())), ("rejected", "cooldown", 1))
+
+    def split_and_confirm(self, *, exclusive_end):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, end = self.window()
+        middle = (start + end) // 2
+        receipt = {"asset": "USD1", "incomeType": "TRANSFER", "tranId": "late-page", "time": middle}
+        busy = self.busy_rows(1200, start, end)
+        calls = self.paged_income({"long": busy + [{**receipt, "income": "-1000.00000000"}],
+                                   "short": busy + [{**receipt, "income": "1000.00000000"}]}, exclusive_end=exclusive_end)
+        self.balances.update(long="2000", short="2000")
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((self.shared_state(operation_id), result["status"], len(self.posts())), ("confirmed", "cooldown", 1))
+        # The full first page is split into two halves sharing the midpoint.
+        self.assertEqual([call[1:] for call in calls if call[0] == "long"], [(start, end), (start, middle), (middle, end)])
+
+    def test_full_income_page_is_split_by_time_with_an_inclusive_end(self):
+        self.split_and_confirm(exclusive_end=False)
+
+    def test_full_income_page_is_split_by_time_with_an_exclusive_end(self):
+        self.split_and_confirm(exclusive_end=True)
+
+    def test_page_boundary_999_rows_is_one_read_and_1000_rows_splits(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, end = self.window()
+        calls = self.paged_income({"long": self.busy_rows(999, start, end), "short": self.busy_rows(1000, start, end)})
+        self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(([call[0] for call in calls].count("long"), [call[0] for call in calls].count("short")), (1, 3))
+        self.assertEqual((self.follow_up()["empty"], self.shared_state(operation_id)), (1, "unknown"))
+
+    def test_rows_that_cannot_be_split_below_a_page_stop_at_the_page_bound(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, _ = self.window()
+        same = [{"asset": "USD1", "incomeType": "COMMISSION", "income": "-0.01", "tranId": index + 1,
+                 "time": start + 5000} for index in range(1000)]
+        calls = self.paged_income({"long": same})
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertIn("上限", result["reason"])
+        self.assertEqual(len(calls), margin_balance.TRANSFER_INCOME_MAX_PAGES)
+        self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (1, 0))
+        self.assertEqual(self.shared_state(operation_id), "unknown")
+
+    def test_a_failed_page_counts_one_bounded_failure(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, end = self.window()
+        calls = self.paged_income({"long": self.busy_rows(1200, start, end)}, fail_on=2)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((len(calls), result["status"]), (2, "unknown"), result)
+        self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (1, 0))
+        self.assertEqual((self.shared_state(operation_id), len(self.posts())), ("unknown", 1))
+
+    def test_local_budget_wait_and_server_rate_limit_are_not_counted_or_bypassed(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        snapshots = self.snapshots()
+        with patch.object(RateBudget, "require_available", side_effect=BudgetWait("本地额度等待", retry_after=5)):
+            result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(result["status"], "unknown", result)
+        self.assertEqual(self.income_queries(), [])
+        self.assertNotIn("queried_at", self.follow_up())
+        self.assertEqual(self.follow_up()["failures"], 0)
+        self.income_handler = lambda aid, params, request: httpx.Response(
+            429, headers={"Retry-After": "120"}, json={"code": -1003, "msg": "Too many requests"})
+        result = self.balancer.tick(self.pair, snapshots)
+        self.assertEqual(len(self.income_queries()), 1, result)
+        self.assertIn("queried_at", self.follow_up())
+        self.assertEqual((self.follow_up()["failures"], self.follow_up()["empty"]), (0, 0))
+        # The server's retry deadline is kept: later checks make no request.
+        # Balances were read before the throttle; the shared budget now waits.
+        self.income_handler = None
+        for _ in range(2):
+            self.due(self.SPACING + 1)
+            result = self.balancer.tick(self.pair, snapshots)
+            self.assertEqual(result["status"], "unknown", result)
+        self.assertEqual(len(self.income_queries()), 1)
+        self.assertEqual((self.follow_up()["failures"], self.shared_state(operation_id), len(self.posts())), (0, "unknown", 1))
+
+    def test_durable_absence_proof_settles_after_a_failed_shared_resolve_and_restart(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.complete_read(first=True)
+        self.due(self.SPACING + 1)
+        with patch.object(ManagedWriter, "resolve_prefix", side_effect=TradingError("injected shared failure")):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], self.follow_up()["empty"]), ("unknown", 2), result)
+        self.assertEqual(self.shared_state(operation_id), "unknown")
+        queried = len(self.income_queries())
+        self.restart_writer()
+        result = self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), result["status"]), ("rejected", "cooldown"), result)
+        self.assertEqual((len(self.income_queries()), len(self.posts())), (queried, 1))
+        self.assertNotIn("unsettled_transfers", self.state())
+
+    def test_shared_settlement_before_private_cleanup_is_not_repeated_after_restart(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.complete_read(first=True)
+        original = MarginBalancer._resolve_skipped
+
+        def resolve_then_exit(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("process exits before the private record is cleared")
+        with patch.object(MarginBalancer, "_resolve_skipped", staticmethod(resolve_then_exit)):
+            self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), self.follow_up()["empty"]), ("rejected", 2))
+        queried = len(self.income_queries())
+        self.restart_writer()
+        self.due(self.SPACING + 1)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        # The follow-up clears without another read; the old row stays rejected
+        # and only a new request from fresh balances is sent.
+        self.assertNotIn("unsettled_transfers", self.state())
+        self.assertEqual((self.shared_state(operation_id), len(self.income_queries())), ("rejected", queried))
+        self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 2), result)
+        self.assertEqual(self.unresolved(), [])
+
+    def test_legacy_prefix_alone_is_settled(self):
+        operation_id = self.skip_timed_out_transfer()
+        request_id = operation_id.removeprefix("aster:transfer:")
+        with self.writer.accounts(["long", "short", "master:ASTER_MASTER"]):
+            self.writer.resolve_prefix(operation_id, rejected=True)
+        legacy = self.legacy_operation(request_id)
+        self.complete_read(first=True)
+        self.assertEqual(self.shared_state(legacy), "unknown")
+        result = self.complete_read()
+        self.assertEqual((self.shared_state(legacy), result["status"], len(self.posts())), ("rejected", "cooldown", 1))
+        self.assertNotIn("unsettled_transfers", self.state())
+
+    def test_standard_and_legacy_prefixes_settle_together_across_a_failure_between_them(self):
+        operation_id = self.skip_timed_out_transfer()
+        legacy = self.legacy_operation(operation_id.removeprefix("aster:transfer:"))
+        self.complete_read(first=True)
+        original = self.writer.registry.resolve
+        calls = []
+
+        def fail_second(*args, **kwargs):
+            calls.append(args[0])
+            if len(calls) == 2:
+                raise TradingError("injected failure between prefixes")
+            return original(*args, **kwargs)
+        with patch.object(self.writer.registry, "resolve", side_effect=fail_second):
+            self.complete_read()
+        self.assertEqual(sorted((self.shared_state(operation_id), self.shared_state(legacy))), ["rejected", "unknown"])
+        self.assertEqual(self.follow_up()["empty"], 2)
+        queried = len(self.income_queries())
+        self.restart_writer()
+        result = self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), self.shared_state(legacy)), ("rejected", "rejected"))
+        self.assertEqual((result["status"], len(self.income_queries()), len(self.posts())), ("cooldown", queried, 1), result)
+        self.assertNotIn("unsettled_transfers", self.state())
+
+    def test_follow_up_written_before_evidence_restarts_its_absence_run(self):
+        operation_id = self.skip_timed_out_transfer()
+        # Old format: an empty read, then a partial or failed read whose
+        # receipt was not kept. One more empty read must not reject it.
+        state = self.state()
+        record = state["unsettled_transfers"][0]
+        del record["evidence"]
+        record.update(empty=1, failures=1, queried_at=record["created_at"] + 1)
+        self.store.put("pair_margin:gold", state)
+        self.complete_read(first=True)
+        self.assertEqual((self.follow_up()["empty"], self.follow_up()["evidence"]), (1, []))
+        self.assertEqual(self.shared_state(operation_id), "unknown")
+        self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), len(self.posts())), ("rejected", 1))
+
+    def test_receipt_read_before_the_other_side_fails_is_kept_as_evidence(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        receipt = {**self.receipt("seen"), "income": "-1000.00000000"}
+        calls = self.paged_income({"long": [receipt]}, fail_on=2)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(([call[0] for call in calls], result["status"]), (["long", "short"], "unknown"), result)
+        self.assertEqual((self.follow_up()["evidence"], self.follow_up()["empty"]), ([["long", "TRANSFER", "seen"]], 0))
+        # Both sides now look empty: the kept receipt still blocks rejection.
+        self.income_handler = None
+        for _ in range(2):
+            self.complete_read()
+        self.assertEqual((self.shared_state(operation_id), self.follow_up()["failures"]), ("unknown", 3))
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_a_full_window_of_two_milliseconds_is_incomplete(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, _ = self.window()
+        same = [{"asset": "USD1", "incomeType": "COMMISSION", "income": "-0.01", "tranId": index + 1,
+                 "time": start + 5000} for index in range(1000)]
+        calls = self.paged_income({"long": same})
+        with patch.object(margin_balance, "TRANSFER_INCOME_MAX_PAGES", 64):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertIn("极短时间窗", result["reason"])
+        self.assertLessEqual(calls[-1][2] - calls[-1][1], 1)
+        self.assertEqual((self.follow_up()["failures"], self.shared_state(operation_id)), (1, "unknown"))
+
+    def test_too_many_conflicting_receipts_go_to_manual_review(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        limit = margin_balance.TRANSFER_EVIDENCE_LIMIT
+        self.income_rows = {"long": [{**self.receipt("debit-" + str(index)), "income": "-1000.00000000"}
+                                     for index in range(limit + 1)]}
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertIn("人工核对", result["reason"])
+        record = self.follow_up()
+        self.assertEqual((len(record["evidence"]), record["failures"], record["empty"]),
+                         (limit, margin_balance.TRANSFER_HISTORY_QUERY_LIMIT, 0))
+        self.assertTrue(MarginBalancer._valid_unsettled(record))
+        queried = len(self.income_queries())
+        result = self.complete_read()
+        self.assertEqual((result["status"], len(self.income_queries())), ("blocked", queried), result)
+        self.assertEqual((self.shared_state(operation_id), len(self.posts())), ("unknown", 1))
 
     def test_official_acknowledgement_is_durable_before_shared_finish(self):
         original = self.writer.registry.finish
