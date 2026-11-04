@@ -34,6 +34,8 @@ export default function App() {
   const lastSelection = useRef('');
   const [preview, setPreview] = useState<LivePreview | null>(null), [cancelOrder, setCancelOrder] = useState<LiveOrder | null>(null);
   const [positionPreview, setPositionPreview] = useState<PositionActionInput | null>(null), [previewInvalidated, setPreviewInvalidated] = useState(false);
+  const [confirmRejected, setConfirmRejected] = useState(false);
+  const previewInput = useRef<PreviewInput | null>(null), writeNotSubmitted = useRef(false);
   const [requestStore] = useState(() => { let storage: Storage | null = null; try { storage = window.sessionStorage; } catch { /* Writes stay blocked when their identity cannot survive reload. */ } return { storage, key: requestStorageKey(location.pathname) }; });
   const [pendingRequest, setPendingRequest] = useState<PendingRequest | null>(() => readPendingRequest(requestStore.storage, requestStore.key)), [now, setNow] = useState(0);
   const pendingRef = useRef(pendingRequest);
@@ -146,6 +148,7 @@ export default function App() {
   async function mutate<T>(route: string, input: object, method = 'POST', actionKey?: string): Promise<T | null> {
     const administrative = route === '/api/settings' || route === '/api/live/connection';
     const csrfToken = administrative ? connectionInfo?.csrfToken : state?.csrfToken;
+    writeNotSubmitted.current = true;
     if (!validCsrf(csrfToken) || operationPending.current || !administrative && (!state || tradingDisabled) || actionKey && pendingRef.current) return null;
     operationPending.current = true; lifecycle.current.mutating = true; cancelRead(); cancelBootstrap(); setBusy(true); setError(''); setNotice('');
     let id: string | undefined;
@@ -155,10 +158,11 @@ export default function App() {
         const pending: PendingRequest = { version: 1, id, kind: actionKey.startsWith('cancel:') ? 'cancel' : 'confirm', ...(actionKey.startsWith('cancel:') ? { orderId: actionKey.slice(7) } : {}) };
         if (!rememberPending(pending)) { setError('此浏览器无法保存待确认请求，委托尚未发送。请允许会话存储后重试。'); return null; }
       }
+      writeNotSubmitted.current = false;
       const response = await fetch(route, { method, signal: AbortSignal.timeout(30_000), headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ ...input, ...(id ? { requestId: id } : {}) }) });
       const data = await response.json();
       if (!response.ok) {
-        if (actionKey && data.requestStatus === 'not_submitted') { rememberPending(null); setError(data.error || '委托未提交，请重新预览。'); return null; }
+        if (actionKey && data.requestStatus === 'not_submitted') { writeNotSubmitted.current = true; rememberPending(null); setError(data.error || '委托未提交，请重新预览。'); return null; }
         throw new Error(data.error || '请求未完成');
       }
       if (id) {
@@ -180,7 +184,7 @@ export default function App() {
       } finally { operationPending.current = false; setBusy(false); }
     }
   }
-  const go = (value: Tab) => { setTab(value); location.hash = value; };
+  const go = (value: Tab) => { setTab(value); location.hash = value; window.scrollTo(0, 0); };
   const queryAccount = async () => {
     if (operationPending.current) return;
     operationPending.current = true; lifecycle.current.mutating = true; cancelRead(); cancelBootstrap(); setBusy(true); setError(''); setNotice('');
@@ -212,14 +216,18 @@ export default function App() {
   };
   const previewOrder = async (input: PreviewInput) => {
     const data = await mutate<LivePreview | { preview: LivePreview }>('/api/live/preview', input);
-    if (data) { setPreview('preview' in data ? data.preview : data); setPositionPreview(input.kind === 'position' ? input : null); setPreviewInvalidated(false); }
+    if (data) { previewInput.current = input; setPreview('preview' in data ? data.preview : data); setPositionPreview(input.kind === 'position' ? input : null); setPreviewInvalidated(false); setConfirmRejected(false); }
     return !!data;
   };
+  const closePreview = () => { setPreview(null); setConfirmRejected(false); };
+  const repreviewOrder = async () => { if (previewInput.current) await previewOrder(previewInput.current); };
   const confirmOrder = async () => {
     if (!preview || positionPreviewInvalid || tradingDisabled || preview.legs.some(leg => !leg.reduceOnly) && openingDisabled) return;
     const current = preview;
     const data = await mutate<LiveExecution | { execution: LiveExecution }>('/api/live/confirm', { previewId: current.id }, 'POST', 'confirm:' + current.id);
-    setPreview(null); go('orders');
+    // Only a write that never left the browser or that the server proved unsent keeps the review open for an immediate re-preview.
+    if (!data && writeNotSubmitted.current) { setError(message => message || '委托未发送，请重新预览。'); setConfirmRejected(true); return; }
+    closePreview(); go('orders');
     if (data) { const result = 'execution' in data ? data.execution : data; setNotice('真实委托处理状态：' + executionStatus(result.state) + '。请核对逐腿成交结果。'); }
   };
   const confirmCancel = async () => {
@@ -266,7 +274,7 @@ export default function App() {
     </>}
     <footer className="app-footer"><span><i className="status-dot"/>手动实盘 · 北京时间 · 2 秒状态刷新</span><span><a href="https://github.com/hxx344/gate-crossex-arbitrage" target="_blank" rel="noreferrer">源代码</a><b>·</b><a href="https://github.com/your-quantguy/gate-crossex" target="_blank" rel="noreferrer">参考 your-quantguy/gate-crossex</a><b>·</b><a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">AGPL-3.0-only</a></span></footer>
   </main>
-  {preview && <TradeReview key={preview.id} preview={preview} now={now} busy={busy} disabled={positionPreviewInvalid || (preview.legs.some(leg => !leg.reduceOnly) ? openingDisabled : tradingDisabled)} invalidReason={positionPreviewInvalid ? '持仓数量、方向或账户已变化，请关闭并重新预览。' : undefined} close={() => setPreview(null)} confirm={() => void confirmOrder()}/>}
+  {preview && <TradeReview key={preview.id} preview={preview} now={now} busy={busy} disabled={positionPreviewInvalid || (preview.legs.some(leg => !leg.reduceOnly) ? openingDisabled : tradingDisabled)} invalidReason={positionPreviewInvalid ? '持仓数量、方向或账户已变化，请关闭并重新预览。' : undefined} error={error} rejected={confirmRejected} close={closePreview} confirm={() => void confirmOrder()} repreview={live && String(live.connection.version) === String(preview.connectionVersion) ? () => void repreviewOrder() : undefined}/>}
   {cancelOrder && <CancelReview order={cancelOrder} busy={busy} disabled={tradingDisabled} close={() => setCancelOrder(null)} confirm={() => void confirmCancel()}/>}
   </div>;
 }
