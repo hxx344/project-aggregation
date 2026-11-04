@@ -5,10 +5,10 @@ import { perpetualChartUrl, perpetualWorkspaceUrl, readPerpetualChartSelection, 
 const selected = { base: 'SKHX', longKey: 'binance:SKHXUSDT', shortKey: 'hyperliquid:xyz:SKHX', days: 7 };
 
 test('chart links round-trip exact contracts and direction without changing unrelated monitor state', () => {
-  const url = new URL(perpetualChartUrl('https://local.example/?monitor=oil&goldOil=bz&symbol=SKHX#panel', selected));
+  const url = new URL(perpetualChartUrl('https://local.example/?monitor=oil&view=kept&symbol=SKHX#panel', selected));
   assert.deepEqual(readPerpetualChartSelection(url.searchParams), selected);
   assert.equal(url.searchParams.get('monitor'), 'perpetual');
-  assert.equal(url.searchParams.get('goldOil'), 'bz'); assert.equal(url.hash, '#panel');
+  assert.equal(url.searchParams.get('view'), 'kept'); assert.equal(url.hash, '#panel');
   const reversed = { ...selected, longKey: selected.shortKey, shortKey: selected.longKey, days: 30 };
   assert.deepEqual(readPerpetualChartSelection(new URL(perpetualChartUrl(url.href, reversed)).searchParams), reversed);
   const back = new URL(perpetualChartUrl(url.href, null));

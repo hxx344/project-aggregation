@@ -5,9 +5,9 @@
 async page => {
   const origin = 'http://127.0.0.1:3189', base = Date.UTC(2026, 8, 24);
   const counts = new Map(), errors = [], scenarios = [];
-  const ids = ['oil', 'cl-xau', 'hynix', 'perpetual'];
+  const ids = ['oil', 'hynix', 'perpetual'];
   let now = base + 29_000, failOil = true, failHistory = true, failPerpetual = false;
-  let frozenOil = null, frozenGold = null, lastGoldSource = null;
+  let frozenOil = null;
   const count = action => counts.get(`/api/monitors/${action}`) ?? 0;
   const check = (condition, message) => { if (!condition) throw Error(message); };
   const until = async (condition, message) => {
@@ -20,7 +20,13 @@ async page => {
   const iso = time => new Date(time).toISOString();
   const sourceAt = () => base + Math.floor((now - base) / 30_000) * 30_000;
   const generation = time => (time - base) / 30_000;
-  const advance = async duration => { now += duration; await page.clock.runFor(duration); };
+  // Advance in 5-second steps so each interval's routed response settles before the next one fires (in-flight reads are deduplicated).
+  const advance = async duration => {
+    for (let left = duration; left > 0; left -= 5_000) {
+      const step = Math.min(5_000, left);
+      now += step; await page.clock.runFor(step); await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  };
   const pageError = error => errors.push(error.message);
   const unavailable = { status: 503, json: { error: 'Controlled unavailable response' } };
   await page.goto('about:blank');
@@ -46,13 +52,6 @@ async page => {
       }
       if (path === '/api/monitors/oil/candles/15m') return route.fulfill(failHistory ? unavailable : {
         json: { ...candles, status: 'live', metadata: { ...candles.metadata, fetchedAt: iso(now) } } });
-      if (path === '/api/monitors/cl-xau/quote') {
-        const source = frozenGold ?? sourceAt(), fetchedAt = iso(source);
-        lastGoldSource = source;
-        return route.fulfill({ json: { oilType: 'cl', source: 'Binance', currency: 'USDT', priceBasis: 'mark', status: 'live', fetchedAt,
-          oil: { symbol: 'CLUSDT', price: 80, updatedAt: fetchedAt }, xau: { symbol: 'XAUUSDT', price: 4000 + generation(source) * 80, updatedAt: fetchedAt },
-          funding: null, collection: { maxAgeMs: 75_000 } } });
-      }
       if (path === '/api/monitors/hynix/quote') return route.fulfill({ json: { status: 'live', fetchedAt: iso(now),
         ordinary: 1000, adr: 120, equivalent: 100, spread: 20, premium: 20, funding: null, collection: { maxAgeMs: 35_000 } } });
       if (path === '/api/monitors/perpetual/summary') {
@@ -65,10 +64,9 @@ async page => {
       return route.fulfill(unavailable);
     });
     await page.setViewportSize({ width: 1440, height: 1050 });
-    await page.goto(`${origin}/?monitor=oil&goldOil=cl&goldOilExchange=binance`);
+    await page.goto(`${origin}/?monitor=oil`);
     const overview = page.getByRole('region', { name: '市场行情概览' });
     const oil = overview.getByRole('button', { name: /^原油价差/ });
-    const gold = overview.getByRole('button', { name: /^金油比/ });
     const perpetual = overview.getByRole('button', { name: /^合约价差/ });
     const reading = card => card.locator('strong').first().textContent();
     const stamp = card => card.locator('time').getAttribute('datetime');
@@ -82,44 +80,39 @@ async page => {
       await until(() => count('oil/quote') === previous + 1, 'Oil must issue exactly one quote read each 10 seconds');
       if (!failOil) await waitReading(oil, oilValue());
     };
-    const readCounts = () => ['oil/quote', 'cl-xau/quote', 'perpetual/summary'].map(count);
+    const readCounts = () => ['oil/quote', 'perpetual/summary'].map(count);
     const sameCounts = expected => readCounts().every((value, index) => value === expected[index]);
     const verifyResume = async (previous, reason) => {
       const expected = previous.map(value => value + 1), resumedAt = now, resumedSource = sourceAt();
       await until(() => readCounts().every((value, index) => value >= expected[index]), `${reason} must immediately refresh each overview feed`);
-      await until(async () => await stamp(oil) === iso(resumedSource) && await stamp(gold) === iso(resumedSource) && await stamp(perpetual) === iso(resumedAt), `${reason} must apply the resumed responses`);
-      await waitStatus(oil, '实时'); await waitStatus(gold, '实时'); await waitStatus(perpetual, '实时');
+      await until(async () => await stamp(oil) === iso(resumedSource) && await stamp(perpetual) === iso(resumedAt), `${reason} must apply the resumed responses`);
+      await waitStatus(oil, '实时'); await waitStatus(perpetual, '实时');
       // Flush visibility-driven React effects without reaching the next 5-second poll.
       await advance(100);
       check(sameCounts(expected), `${reason} must refresh each overview feed exactly once`);
     };
 
-    // A first visit with no cached quote must expose the failure inside the oil shadow root.
+    // The server renders the seeded snapshot quote; a failed first read keeps it and marks the feed interrupted.
     const oilPanel = page.locator('[data-monitor="oil"]');
-    await waitStatus(oil, '行情暂不可用');
-    await oilPanel.locator('#connection-status').filter({ hasText: '连接失败' }).waitFor();
-    await oilPanel.locator('#data-through').filter({ hasText: '数据暂不可用' }).waitFor();
-    check(count('oil/quote') === 1, 'An empty failed first visit must issue only one quote request');
+    await waitStatus(oil, '更新中断 · 保留数据');
+    await oilPanel.locator('.data-status').filter({ hasText: '实时更新中断' }).waitFor();
+    check(count('oil/quote') === 1, 'A failed first visit must issue only one quote request');
     failOil = false; failHistory = false;
-    await oilPanel.locator('#retry').click();
+    await oilPanel.getByRole('button', { name: '刷新行情' }).click();
 
     // A 30-second collector last ran at source t=0; page polling starts at t=29s.
     await waitReading(oil, '+2.000%');
-    await waitReading(gold, '50.000');
     await waitReading(perpetual, '101');
-    await oilPanel.locator('#dashboard').waitFor();
-    check(count('oil/quote') === 2 && count('cl-xau/quote') === 1, 'One explicit oil retry must recover without creating another feed');
+    await oilPanel.locator('.primary-metric .metric-value').filter({ hasText: '+2.000%' }).waitFor();
+    check(count('oil/quote') === 2, 'One explicit oil retry must recover without creating another feed');
     scenarios.push('An uncached oil quote/history failure exposes the connection error; the detail retry recovers the quote');
     await tick(); await tick();
-    await waitStatus(gold, '实时');
-    check(now - Date.parse(await stamp(gold)) === 49_000, 'Gold must still show source t=0 at page t=49s');
-    check(count('cl-xau/quote') === 1, 'The 49-second check must precede the next gold page poll');
     await waitReading(perpetual, '105');
     check(count('perpetual/summary') === 5, 'The unopened perpetual card must update every five seconds');
     check(count('perpetual/quote') === 0 && count('perpetual/stream') === 0, 'Overview must not start full perpetual quotes or SSE');
-    scenarios.push('30s collector phase difference: gold source age 49s remains live; perpetual summary refreshes without detail');
+    scenarios.push('The unopened perpetual summary refreshes every five seconds without detail feeds');
 
-    await page.getByRole('tab', { name: '金油比', exact: true }).click();
+    await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
     const oilDetails = [count('oil/candles/15m'), count('oil/funding')], quoteBeforeSwitch = count('oil/quote');
     for (let cycle = 0; cycle < 31; cycle++) await tick();
     check(count('oil/quote') === quoteBeforeSwitch + 31, 'Inactive oil detail must retain its single 10-second overview feed');
@@ -128,7 +121,7 @@ async page => {
     const beforeReturn = count('oil/quote');
     await page.getByRole('tab', { name: '原油价差', exact: true }).click();
     await until(() => count('oil/candles/15m') === oilDetails[0] + 1, 'Returning must resume only the due detail history');
-    await page.locator('[data-monitor="oil"]').locator('#data-notice').filter({ hasText: '历史更新中断' }).waitFor();
+    await page.locator('[data-monitor="oil"]').locator('.notice').filter({ hasText: '历史更新中断' }).waitFor();
     check(count('oil/quote') === beforeReturn, 'Switching back must not restart the overview quote feed');
     await waitStatus(oil, '实时');
     scenarios.push('Oil keeps 10s overview quotes while inactive; 60s history and 300s funding stop; history failure cannot stale a fresh quote');
@@ -146,23 +139,17 @@ async page => {
     await waitStatus(oil, '实时'); await waitStatus(perpetual, '实时');
     check(await stamp(oil) !== retainedOil[1] && await stamp(perpetual) !== retainedPerpetual[1], 'A fresh success must clear failures and advance the real source time');
 
-    // The latest completed page read may lag a newer collector source by one 30-second poll.
-    await until(async () => lastGoldSource !== null && await stamp(gold) === iso(lastGoldSource), 'The last requested gold response must finish before freezing source time');
-    frozenOil = Date.parse(await stamp(oil)); frozenGold = Date.parse(await stamp(gold));
-    const frozenValues = [await reading(oil), await reading(gold)], beforeFrozen = [count('oil/quote'), count('cl-xau/quote')];
+    frozenOil = Date.parse(await stamp(oil));
+    const frozenValue = await reading(oil), beforeFrozen = count('oil/quote');
     for (let cycle = 0; cycle < 9; cycle++) await tick();
-    await waitStatus(oil, '行情待更新'); await waitStatus(gold, '行情待更新');
-    check(count('oil/quote') === beforeFrozen[0] + 9 && count('cl-xau/quote') === beforeFrozen[1] + 3, 'Repeated HTTP 200 reads must continue while their unchanged source data ages');
-    check(await stamp(oil) === iso(frozenOil) && await stamp(gold) === iso(frozenGold), 'HTTP receipt times must never replace frozen source timestamps');
-    check(await reading(oil) === frozenValues[0] && await reading(gold) === frozenValues[1], 'Real expiration must retain the last values');
-    const beforeThaw = count('cl-xau/quote');
-    frozenOil = null; frozenGold = null;
-    // Oil polls every 10s; allow gold its own next 30s deadline after unfreezing.
-    for (let cycle = 0; cycle < 3 && count('cl-xau/quote') === beforeThaw; cycle++) await tick();
-    await until(() => count('cl-xau/quote') > beforeThaw, 'Gold must read its recovered source within one quote interval');
-    await until(async () => await stamp(gold) === iso(lastGoldSource), 'The recovered gold response must reach the card');
-    await waitStatus(oil, '实时'); await waitStatus(gold, '实时');
-    scenarios.push('Oil and perpetual failures preserve values and recover; repeated 200s with old oil/gold source times still expire after 75s');
+    await waitStatus(oil, '行情待更新');
+    check(count('oil/quote') === beforeFrozen + 9, 'Repeated HTTP 200 reads must continue while their unchanged source data ages');
+    check(await stamp(oil) === iso(frozenOil), 'HTTP receipt times must never replace frozen source timestamps');
+    check(await reading(oil) === frozenValue, 'Real expiration must retain the last value');
+    frozenOil = null;
+    await tick();
+    await waitStatus(oil, '实时');
+    scenarios.push('Oil and perpetual failures preserve values and recover; repeated 200s with an old oil source time still expire after 75s');
 
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')); });
     const hiddenCounts = readCounts();

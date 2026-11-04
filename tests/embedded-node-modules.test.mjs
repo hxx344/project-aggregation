@@ -185,6 +185,7 @@ test('private Monitor request rejects redirects and honors the existing deadline
 test('Monitor factory serves built SSR without a TCP listener and releases its real data locks', { skip: process.platform === 'linux' ? 'Kernel flock is covered by the Linux supervisor integration' : false }, async t => {
   const dataDir = await directory(t, 'embedded-monitor-');
   await mkdir(dataDir, { recursive: true });
+  // The legacy `cl-xau` switch (removed gold/oil monitor) must not stop startup.
   await writeFile(join(dataDir, 'monitor-control.json'), JSON.stringify({ version: 1, monitors: Object.fromEntries(['cl-xau', 'hynix', 'oil', 'perpetual'].map(id => [id, { enabled: false, revision: 0 }])) }));
   const options = { root: join(root, 'modules/monitor'), dataDir, secret };
   const module = await createMonitorModule(options);

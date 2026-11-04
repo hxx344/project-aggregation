@@ -1,6 +1,5 @@
 import { oilSpreadPercent } from '../modules/oil/spread.mjs';
 import type { AlertConfig, AlertView } from "./alert-types";
-import { GOLD_OIL_INSTRUMENTS, GOLD_OIL_EXCHANGES, goldOilUnits, goldOilAction, validateGoldOilQuote, type GoldOilQuote, type GoldOilType, type GoldOilExchange } from './gold-oil.ts';
 
 export type MonitorAlertRule = {
   id: string; name: string; metric: string; direction: "above" | "below";
@@ -16,7 +15,7 @@ export type MonitorAlertView = {
   available: boolean; reason?: string; revision: number; draft: MonitorAlertDraft;
   webhookConfigured: boolean; checkedAt: string | null; lastSuccessAt: string | null;
   market: string; error: string; history: MonitorAlertEvent[];
-  /** Server-side market sample is past its freshness budget (oil and gold/oil report this). */
+  /** Server-side market sample is past its freshness budget (oil reports this). */
   stale?: boolean;
 };
 export type AlertMetric = { id: string; label: string; unit: string; hysteresisUnit: string; min: number; max: number };
@@ -96,51 +95,5 @@ export const oilAlerts: MonitorAlertAdapter = {
   },
 };
 
-function createGoldOilAlerts(oilType: GoldOilType, exchange: GoldOilExchange = 'binance'): MonitorAlertAdapter {
-  const instrument = GOLD_OIL_INSTRUMENTS[oilType], source = GOLD_OIL_EXCHANGES[exchange].name, units = goldOilUnits(oilType, exchange), endpoint = (action: string) => `/api/monitors/cl-xau/${goldOilAction(action, oilType, exchange)}`;
-  const read = async <T,>(action: string, signal: AbortSignal, fetcher: Fetcher, body?: unknown) => {
-    const result = await request<T & { oilType?: string; exchange?: string; source?: string }>(endpoint(action), signal, fetcher, body);
-    // Legacy Binance endpoints omitted identity; Bybit must never accept that payload.
-    if ((exchange === 'bybit' || result.oilType !== undefined) && result.oilType !== oilType
-      || (exchange === 'bybit' || result.exchange !== undefined) && result.exchange !== exchange
-      || (exchange === 'bybit' || result.source !== undefined) && result.source !== source) throw new Error('告警后台返回了其他交易所或合约的数据，现有配置与草稿已保留。');
-    return result;
-  };
-  return {
-  metrics: [{ id: 'ratio', label: `金油比 XAU / ${instrument.code}`, unit: units.ratio, hysteresisUnit: units.ratio, min: 0, max: 1e6 }],
-  maxRules: 50, nameMaxLength: 60, cooldownMax: 10080, hysteresisMax: 1e6,
-  example: `金油比＝黄金标记价 ÷ ${instrument.name}（${instrument.code}）标记价。阈值 50、回差 0.5 ${units.ratio}：触发后需回落到 49.5 以下，再次达到 50 且冷却结束才提醒。阈值和回差均为${units.ratio}。`,
-  newRule: draft => baseRule(draft, 'ratio', 30, 0.5),
-  async load(signal, fetcher = fetch) {
-    const status = await read<Omit<OilStatus, 'market'> & { market?: GoldOilQuote }>('status', signal, fetcher);
-    if (!status.available) return empty(status.reason);
-    const [config, events] = await Promise.all([
-      read<{ revision: number; config: OilConfig }>('config', signal, fetcher),
-      read<{ events: OilEvent[] }>('events', signal, fetcher),
-    ]);
-    let market: GoldOilQuote | null = null, marketError = '';
-    if (status.market) { try { market = validateGoldOilQuote(status.market, oilType, exchange); } catch { marketError = '行情合约标识或格式无效，已隐藏报价。'; } }
-    return { available: true, revision: config.revision, draft: oilDraft(config.config), webhookConfigured: status.webhookConfigured,
-      checkedAt: status.lastAttemptAt, lastSuccessAt: status.lastSuccessAt, stale: status.stale === true,
-      market: market ? `${source} 标记价${status.stale ? '（已过期）' : ''} · 金油比 XAU / ${instrument.code} ${market.ratio.toFixed(4)} ${units.ratio} · 黄金 ${market.xau.price.toFixed(4)} USDT/盎司 / ${instrument.name} ${market.oil.price.toFixed(4)} ${units.oil}` : '服务器尚未取得有效行情。',
-      error: [status.error, status.deliveryError, marketError].filter(Boolean).join('；'),
-      history: events.events.map(event => ({ id: event.id, time: event.time, status: event.status,
-        description: event.rules.map(rule => `[${source} ${instrument.code}] ${rule.label} · 金油比 ${rule.value.toFixed(4)} ${rule.operator === 'gte' ? '≥' : '≤'} ${rule.threshold} ${units.ratio}`).join('；'), error: event.error })),
-    };
-  },
-  async save(draft, revision, signal, fetcher = fetch) {
-    const result = await read<{ revision: number; config: OilConfig }>('config', signal, fetcher, { revision, config: oilConfig(draft) });
-    return { revision: result.revision, draft: oilDraft(result.config) };
-  },
-  };
-}
-export const goldOilAlerts = createGoldOilAlerts('cl');
-export const goldOilBzAlerts = createGoldOilAlerts('bz');
-export const goldOilBybitAlerts = createGoldOilAlerts('cl', 'bybit');
-export const goldOilBybitBzAlerts = createGoldOilAlerts('bz', 'bybit');
-export function goldOilAlertId(oilType: GoldOilType = 'cl', exchange: GoldOilExchange = 'binance') {
-  return `cl-xau${exchange === 'bybit' ? '-bybit' : ''}${oilType === 'bz' ? '-bz' : ''}`;
-}
-
 /** All alert-capable monitors use the hub's fixed editor slot and this contract. */
-export const monitorAlertAdapters: Record<string, MonitorAlertAdapter> = { oil: oilAlerts, hynix: hynixAlerts, 'cl-xau': goldOilAlerts, 'cl-xau-bz': goldOilBzAlerts, 'cl-xau-bybit': goldOilBybitAlerts, 'cl-xau-bybit-bz': goldOilBybitBzAlerts };
+export const monitorAlertAdapters: Record<string, MonitorAlertAdapter> = { oil: oilAlerts, hynix: hynixAlerts };

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nearestTimeIndex, samePriceRows, tablePage, TABLE_PAGE_SIZE } from '../modules/oil/chart-performance.mjs';
+import { nearestTimeIndex } from '../modules/oil/chart-performance.mjs';
 import { createOilSummaryReader } from '../lib/monitor-summary.ts';
 
 test('nearest observation matches a linear reference including gaps, endpoints and ties', () => {
@@ -18,28 +18,6 @@ test('large-history picking reads a logarithmic number of observations', () => {
   const rows=Array.from({length:100_000},(_,i)=>({get time(){reads++;return i*900_000;}}));
   assert.equal(nearestTimeIndex(rows,55_555*900_000+20),55_555);
   assert.ok(reads<30);
-});
-
-test('table pages retain every record exactly once in reverse order, including the partial final page', () => {
-  const rows=Array.from({length:5001},(_,time)=>({time})), collected=[];
-  for(let page=0;page<Math.ceil(rows.length/TABLE_PAGE_SIZE);page++) {
-    const view=tablePage(rows,page);
-    assert.ok(view.rows.length<=200);
-    collected.push(...view.rows);
-  }
-  assert.deepEqual(collected,[...rows].reverse());
-  assert.equal(tablePage(rows,25).rows.length,1);
-  assert.equal(tablePage(rows,25).first,5001);
-  assert.equal(tablePage(rows,99).page,25);
-  assert.equal(tablePage(rows,-1).page,0);
-  assert.deepEqual(tablePage([],0).rows,[]);
-});
-
-test('same-history reuse detects corrections, gaps and newly paired observations', () => {
-  const rows=[{time:0,brent:80,wti:75},{time:900_000,brent:81,wti:76}];
-  assert.ok(samePriceRows(rows,rows.map(row=>({...row}))));
-  for(const patch of [{brent:82},{wti:77},{time:1_800_000},{wti:null}]) assert.equal(samePriceRows(rows,[rows[0],{...rows[1],...patch}]),false);
-  assert.equal(samePriceRows(rows,rows.slice(0,1)),false);
 });
 
 test('quote updates reuse the oil trend; history corrections and metadata still become visible', () => {

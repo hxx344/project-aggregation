@@ -4,25 +4,20 @@ import { dirname } from 'node:path';
 import { validateHynixQuote, validateHynixHistory, validateHynixFunding, validateOilQuote, validateOilHistory, validateOilFunding } from '../lib/market-validation.ts';
 import { comparisonExchanges, exchangeAction, validateComparisonQuote } from '../lib/exchange-quotes.ts';
 import { OIL_CANDLE_ACTION, validateIntradaySnapshot } from '../modules/oil/intraday.mjs';
-import { validateGoldOilQuote, validateGoldOilHistory, GOLD_OIL_VARIANTS, goldOilAction } from '../lib/gold-oil.ts';
-import { validateGoldOilFunding } from '../lib/gold-oil-funding.ts';
 import { exchangeFundingAction, fundingHistoryExchanges, validateExchangeFundingHistory } from '../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION, validateOilHedgePrices } from '../lib/oil-hedge-prices.ts';
 import { staleMarketError } from './market-stale.mjs';
 
 const validators = { 'hynix/quote': validateHynixQuote, 'hynix/history': validateHynixHistory, 'hynix/funding': validateHynixFunding, 'oil/quote': validateOilQuote, 'oil/history': validateOilHistory, 'oil/funding': validateOilFunding };
 validators[`oil/${OIL_CANDLE_ACTION}`] = validateIntradaySnapshot;
-for (const { oilType, exchange } of GOLD_OIL_VARIANTS) for (const [action, validate] of Object.entries({ quote: validateGoldOilQuote, history: validateGoldOilHistory, funding: validateGoldOilFunding })) {
-  validators[`cl-xau/${goldOilAction(action, oilType, exchange)}`] = value => validate(value, oilType, exchange);
-}
 validators[`oil/${OIL_HEDGE_PRICES_ACTION}`] = validateOilHedgePrices;
 for (const id of ['oil', 'hynix']) for (const exchange of comparisonExchanges(id)) validators[`${id}/${exchangeAction(exchange)}`] = value => validateComparisonQuote(value, exchange, id);
 for (const id of ['oil', 'hynix']) for (const exchange of fundingHistoryExchanges(id)) validators[`${id}/${exchangeFundingAction(exchange)}`] = value => validateExchangeFundingHistory(value, exchange, id);
 export const datasetKeys = Object.keys(validators);
 const timestamp = value => Date.parse(value.fetchedAt ?? value.metadata?.fetchedAt);
 const keyFor = (id, action) => { const key = `${id}/${action}`; if (!Object.hasOwn(validators, key)) throw new Error('Unknown market dataset'); return key; };
-// Old CL payloads remain on disk; normalize only at the read boundary.
-const decode = (key, payload) => key.startsWith('cl-xau/') ? validators[key](JSON.parse(payload)) : JSON.parse(payload);
+// Rows of retired datasets (the removed gold/oil monitor) stay on disk untouched; only known keys are read.
+const decode = (_key, payload) => JSON.parse(payload);
 // Source changes use a new namespace. Existing Hyperliquid snapshots and every old observation stay untouched.
 export const storageKey = key => ['oil/quote', 'oil/history', 'oil/funding', `oil/${OIL_CANDLE_ACTION}`].includes(key) ? key.replace('oil/', 'oil/binance/') : key;
 

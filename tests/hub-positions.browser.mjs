@@ -110,11 +110,11 @@ async (page) => {
     assert(first.items.every(item => !('accountId' in item) && !('name' in item) && !('revision' in item) && Object.keys(item).length === 15 && item.exchangeId === 'binance'), 'items carry only protocol fields');
     assert(JSON.stringify(Object.keys(first).sort()) === JSON.stringify(['channel', 'generatedAt', 'incomplete', 'itemLimit', 'items', 'market', 'matchedCount', 'requestId', 'sourcesIncomplete', 'status', 'truncated', 'type', 'version']), `reply fields ${Object.keys(first)}`);
 
-    await ask(monitor, request('gold-1', { market: 'cl-xau', symbols: ['XAU', 'CL', 'BZ'] }));
-    const gold = await reply(monitor, 'gold-1');
-    assert(gold.status === 'ok' && gold.items.some(item => item.symbol === 'XAUUSDT' && item.base === 'XAU') && reads() === 1, 'cached response serves another market');
+    await ask(monitor, request('perp-1', { market: 'perpetual', symbols: ['XAU', 'CL', 'BZ'] }));
+    const perp = await reply(monitor, 'perp-1');
+    assert(perp.status === 'ok' && perp.items.some(item => item.symbol === 'XAUUSDT' && item.base === 'XAU') && reads() === 1, 'cached response serves another market');
 
-    for (const value of [request('bad-market', { market: 'gold' }), request('bad-empty', { symbols: [] }), request('bad-lower', { symbols: ['cl'] }),
+    for (const value of [request('bad-market', { market: 'gold' }), request('bad-retired', { market: 'cl-xau' }), request('bad-empty', { symbols: [] }), request('bad-lower', { symbols: ['cl'] }),
       request('bad-many', { symbols: Array.from({ length: 21 }, (_, i) => `B${i}`) }), request('bad id'), { type: 'positions-request', requestId: 'bad-missing', market: 'oil' }])
       await ask(monitor, value);
     await monitor.evaluate(() => parent.postMessage({ channel: 'project-hub', version: 2, type: 'positions-request', requestId: 'bad-version', market: 'oil', symbols: ['CL'] }, location.origin));
@@ -124,7 +124,7 @@ async (page) => {
       window.dispatchEvent(new MessageEvent('message', { data: { ...data, requestId: 'forged-origin' }, origin: 'https://untrusted.invalid', source: current }));
       window.postMessage({ ...data, requestId: 'forged-source' }, location.origin);
     });
-    await noReply(monitor, ['bad-market', 'bad-empty', 'bad-lower', 'bad-many', 'bad id', 'bad-missing', 'bad-version', 'forged-origin', 'forged-source']);
+    await noReply(monitor, ['bad-market', 'bad-retired', 'bad-empty', 'bad-lower', 'bad-many', 'bad id', 'bad-missing', 'bad-version', 'forged-origin', 'forged-source']);
 
     await ask(monitor, { type: 'open-trading', market: 'gold' });
     await page.waitForTimeout(300);

@@ -41,7 +41,7 @@ async (page) => {
   const candles = await (await page.request.get(`${monitorBuild}/oil/data/binance-15m.json`)).json();
   const monitorApi = (path, send) => {
     const now = Date.now(), iso = t => new Date(t).toISOString();
-    if (path === '/api/monitors') return send({ schemaVersion: 1, monitors: ['oil', 'cl-xau', 'hynix', 'perpetual'].map(id => ({ id, runtime: { available: true, monitorId: id, enabled: true, running: true, revision: 0 } })) });
+    if (path === '/api/monitors') return send({ schemaVersion: 1, monitors: ['oil', 'hynix', 'perpetual'].map(id => ({ id, runtime: { available: true, monitorId: id, enabled: true, running: true, revision: 0 } })) });
     if (path === '/api/monitors/oil/quote') { const leg = (coin, markPx) => ({ coin, markPx, fundingRate: 0.0001, fundingIntervalHours: 4, nextFundingAt: iso(now + 3_600_000) }); return send({ source: 'Binance', currency: 'USDT', status: 'live', fetchedAt: iso(now - 2000), brent: leg('BZUSDT', 66.42), wti: leg('CLUSDT', 62.85), collection: { maxAgeMs: 75_000 } }); }
     if (path === '/api/monitors/oil/candles/15m') return send({ ...candles, status: 'live', metadata: { ...candles.metadata, fetchedAt: iso(now) } });
     return send({ error: 'Controlled unavailable response' }, 503);

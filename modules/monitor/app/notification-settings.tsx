@@ -82,7 +82,7 @@ export default function NotificationSettings({ active = true }: { active?: boole
     <button className="alert-heading" aria-expanded={open} aria-controls="shared-feishu-body" onClick={() => setOpen(!open)}><span><Bell size={18}/><strong>统一飞书告警</strong><span className="alert-summary">{summary}{dirty ? " · 未保存" : ""}</span></span><span>设置<ChevronDown size={16} className={open ? "rotated" : ""}/></span></button>
     {open && <div className="alert-body" id="shared-feishu-body">
       {!connected ? <p className="alert-help">{loadError || view?.reason || "正在连接告警后台…"}</p> : <>
-        <p className="alert-help">原油、金油比、海力士和合约价差共用一个飞书机器人。各模块独立设置阈值与开关，关闭网页后告警仍由后台运行。</p>
+        <p className="alert-help">原油、海力士和合约价差共用一个飞书机器人。各模块独立设置阈值与开关，关闭网页后告警仍由后台运行。</p>
         <form onSubmit={(event: FormEvent) => { event.preventDefault(); void mutate(false); }}><fieldset className="alert-fields" disabled={busy}>
           {view.candidates.length > 0 && <div className="shared-migration"><p>原油和海力士原有机器人配置不同，请选择要共用的机器人。选择并保存前，两个模块暂停发送。</p><label>共用机器人<select aria-label="共用机器人" value={migrationSource} onChange={event => { edit(); setSource(event.target.value); setWebhook(""); setSecret(""); setClearWebhook(false); setClearSecret(false); }}><option value="">填写新的机器人</option>{view.candidates.map(source => <option key={source.id} value={source.id}>沿用{source.label}机器人 · {source.destination}{source.signingSecretConfigured ? " · 有签名" : ""}</option>)}</select></label></div>}
           {!migrationSource && <><div className="alert-form-grid">

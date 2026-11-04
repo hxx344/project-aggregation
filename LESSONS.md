@@ -768,6 +768,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `6026760` 的 [首屏读取](modules/monitor/server/initial-market.mjs) 序列化四组完整历史；用户实际工作台网络记录显示文档状态为 200、gzip 仍传输 1,919,809 字节，并在约 69 秒后才完成。四组历史分别有约 1.49 万至 1.97 万个点，是主要体积来源。
 
 **事件记录：** `monitor-initial-history-payload-20261015`；一次实际慢加载定位，不推进主线复盘检查点。
+**状态补充（2026-11）：** 金油比监控已于 2026-11 移除，首屏不再输出 `cl-xau` 数据；概览与详情分离的契约仍适用于原油、海力士和合约页面。
 
 ### L048：迟到的模块就绪消息仍需完成加载恢复
 
@@ -840,6 +841,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `eb6aab1` 的 [Binance reader](modules/monitor/lib/gold-oil-service.ts) 与 [Bybit reader](modules/monitor/lib/gold-oil-bybit-service.ts) 将最早缺口与近期起点取最小值。2026-10-16 用户报告更新或重启后图表明显慢；Windows 原生两万根历史夹具中，正常近期更新为 2 次请求，增加单个早期永久缺口后每轮变为 40 次，修复后首次最多 4 次、冷却期每轮 2 次。同一图表夹具默认七天为 672 点、约 79 KB，全部为 20,000 点、约 2.32 MB；未取得用户服务器重启期间的网络记录，不能将所有图表延迟归为同一来源。
 
 **事件记录：** `monitor-history-gap-refresh-amplification-20261016`；一次用户反馈及历史采集与详情读取链修复，关联 L047 的契约边界，不推进主线复盘检查点。
+**状态补充（2026-11）：** 金油比监控已于 2026-11 移除；上文引用的金油比修补测试与 Binance / Bybit reader 源码已随之删除，修补游标与有界窗口的做法仍适用于其他持久化 K 线。
 
 ### L053：镜像测速须验证真实正文，并接通实际下载路径
 

@@ -63,7 +63,7 @@ async page => {
       if (path.endsWith('/perpetual/quality')) { const body = route.request().postDataJSON(); qualityBodies.push(body); return route.fulfill({ json: quality(body.pairs) }); }
       return route.fulfill({ status: 503, json: { error: 'Unavailable fixture detail' } });
     });
-    await page.goto(`${origin}/?monitor=perpetual&goldOil=cl&goldOilExchange=binance`);
+    await page.goto(`${origin}/?monitor=perpetual`);
 
     // New users start grouped: one lead row per base, twenty bases per page.
     await expectRows(bases.slice(0, 20));

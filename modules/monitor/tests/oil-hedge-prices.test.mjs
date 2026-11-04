@@ -219,7 +219,7 @@ test('preview prices deduplicate independent requests, cache five minutes and ke
   assert.equal(retained.fetchedAt, initial[0].fetchedAt); assert.deepEqual(retained.legs, initial[0].legs); assert.deepEqual(passedPrevious, initial[0]);
   now += 14_999; await read('oil', ACTION); assert.equal(calls, 2);
   now += 2; await read('oil', ACTION); assert.equal(calls, 3);
-  for (const id of ['hynix', 'perpetual', 'cl-xau']) await assert.rejects(read(id, ACTION), /Unsupported/);
+  for (const id of ['hynix', 'perpetual']) await assert.rejects(read(id, ACTION), /Unsupported/);
   await assert.rejects(read('oil', `${ACTION}/extra`));
 });
 
@@ -245,7 +245,7 @@ test('persistent collection keeps all legs at shared hours, isolates the dataset
     const response = await fetch(url, { headers }); assert.equal(response.status, 200);
     const value = await response.json(); assert.deepEqual(value.legs, initial.legs); assert.equal(value.collection.source, 'database'); assert.equal(value.status, 'snapshot');
     assert.equal((await fetch(url, { method: 'POST', headers })).status, 405);
-    for (const id of ['hynix', 'perpetual', 'cl-xau']) assert.equal((await fetch(`${base}/api/monitors/${id}/${ACTION}`, { headers })).status, 404);
+    for (const id of ['hynix', 'perpetual']) assert.equal((await fetch(`${base}/api/monitors/${id}/${ACTION}`, { headers })).status, 404);
     assert.deepEqual(services.market.status(), before);
     const jobs = marketJobs().filter(job => job.action === ACTION);
     assert.equal(jobs.length, 1); assert.equal(jobs[0].id, 'oil'); assert.equal(jobs[0].intervalMs, HEDGE_PRICES_REFRESH_MS);
@@ -270,7 +270,7 @@ test('Next/Sites route exposes only the oil price action and preserves no-store 
   const context = (id, action = ACTION) => ({ params: Promise.resolve({ id, action: action.split('/') }) });
   const response = await GET(request, context('oil')); assert.equal(response.status, 200); assert.equal(response.headers.get('Cache-Control'), 'no-store');
   const body = await response.json(); assert.equal(body.action, ACTION); assert.equal(body.value.priceBasis, 'hour-open-mark');
-  for (const id of ['hynix', 'perpetual', 'cl-xau', 'unknown']) assert.equal((await GET(request, context(id))).status, 404);
+  for (const id of ['hynix', 'perpetual', 'unknown']) assert.equal((await GET(request, context(id))).status, 404);
   assert.equal((await GET(request, context('oil', `${ACTION}/extra`))).status, 404);
   assert.equal((await (await loadRoute(true)).GET(request, context('oil'))).status, 503);
 });

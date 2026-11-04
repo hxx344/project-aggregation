@@ -1,22 +1,8 @@
 import { TRADE_TYPES, tradeVenueKey } from './trades.mjs';
-import { nearestTimeIndex } from './chart-performance.mjs';
-import { OIL_CANDLE_MS } from './intraday.mjs';
 import { decimalDifference } from './spread.mjs';
 
-const ns = 'http://www.w3.org/2000/svg';
 /** Absolute spreads are left − right in the venue's own quote currency. */
 const absoluteSpread = venue => venue?.prices ? decimalDifference(venue.prices.left, venue.prices.right) : null;
-/** unit selects the chart metric: `percent` (row.spread) or `absolute` (row.absolute). */
-export function visibleTradeMarkers(events, rows, unit = 'percent') {
-  if (!rows.length) return [];
-  const start = rows[0].time, end = rows.at(-1).time, field = unit === 'absolute' ? 'absolute' : 'spread';
-  return events.filter(event => event.time >= start && event.time <= end).map(event => {
-    const nearest = rows[nearestTimeIndex(rows, event.time)];
-    const chartSpread = nearest && Math.abs(nearest.time - event.time) <= OIL_CANDLE_MS && Number.isFinite(nearest[field]) ? nearest[field] : null;
-    const traded = unit === 'absolute' ? absoluteSpread(event.spreadVenue) : event.spread;
-    return { event, unit, chartSpread, value: traded ?? chartSpread, basis: traded === null ? '图表价差' : '成交价差' };
-  });
-}
 const spreadText = (value, unit = 'percent') => value === null ? '未知' : unit === 'absolute' ? `${value < 0 ? '−' : ''}${Math.abs(value).toFixed(3)}` : `${value.toFixed(3)}%`;
 const cashText = totals => totals.map(item => `${item.amount === null ? item.known === null ? '未知' : `未知（已知 ${item.known}）` : item.amount} ${item.currency}`).join('；') || '未知';
 function venueLabels(venues) {
@@ -79,81 +65,4 @@ export function fillsStatusText(view, formatTime) {
     view.truncated ? '成交记录已截断' : null,
     '仅支持 Binance、Bybit、OKX', '最近 85 天',
   ].filter(Boolean).join(' · ');
-}
-/** Every user-controlled label is inserted as text, including SVG accessible names. */
-export function renderTradeMarkers(svg, markers, chart, { formatTime, show, hide }) {
-  const nodes = new Map(), doc = svg.ownerDocument;
-  for (const marker of markers) {
-    if (marker.value === null || !Number.isFinite(marker.value)) continue;
-    const { event } = marker, type = TRADE_TYPES[event.type], px = chart.x(event.time), py = chart.y(marker.value);
-    const node = doc.createElementNS(ns, 'g');
-    node.setAttribute('class', 'oil-trade-marker');
-    node.setAttribute('data-trade-type', event.type);
-    node.setAttribute('transform', `translate(${px},${py})`);
-    node.setAttribute('tabindex', '0'); node.setAttribute('role', 'button');
-    node.setAttribute('data-trade-key', event.key);
-    node.setAttribute('aria-label', `${type.label} · ${formatTime(event.time)} 北京时间 · ${marker.basis} ${spreadText(marker.value, marker.unit)}，查看成交明细`);
-    const hit = doc.createElementNS(ns, 'circle');
-    hit.setAttribute('r', '12'); hit.setAttribute('fill', 'transparent');
-    const symbol = doc.createElementNS(ns, 'text');
-    symbol.setAttribute('text-anchor', 'middle'); symbol.setAttribute('dy', '.35em');
-    symbol.setAttribute('aria-hidden', 'true'); symbol.textContent = type.symbol;
-    node.append(hit, symbol);
-    const display = event => { event?.stopPropagation(); show(marker, px); };
-    node.addEventListener('pointerenter', display);
-    node.addEventListener('pointermove', display);
-    node.addEventListener('pointerdown', display);
-    node.addEventListener('focus', display);
-    node.addEventListener('click', display);
-    node.addEventListener('blur', hide);
-    node.addEventListener('keydown', event => {
-      if (event.key === 'Escape') { event.stopPropagation(); hide(); }
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); display(event); }
-    });
-    svg.append(node); nodes.set(event.key, node);
-  }
-  return nodes;
-}
-export function createTradeLayer(root, formatTime) {
-  const $ = id => root.getElementById(id), tooltip = $('trade-tooltip'), details = $('oil-trade-details');
-  let markerNodes = new Map(), currentChart = null, shownKey = null;
-  const hide = () => { tooltip.hidden = true; };
-  const show = (marker, px) => {
-    shownKey = marker.event.key;
-    const lines = tradeDetailLines(marker, formatTime);
-    tooltip.textContent = lines.join('\n'); tooltip.hidden = false;
-    const width = $('main-chart').clientWidth;
-    tooltip.style.left = `${Math.max(0, Math.min(px * width / currentChart.width + 12, width - tooltip.offsetWidth))}px`;
-    tooltip.style.top = '38px';
-    details.textContent = lines.join('\n'); details.hidden = false;
-  };
-  return {
-    hide,
-    render({ markers, chart, view, fillsView, beforeShow }) {
-      currentChart = chart; hide();
-      $('oil-trades').hidden = view !== 'spread';
-      $('oil-trades-status').textContent = fillsStatusText(fillsView, formatTime);
-      const display = (marker, px) => { if (!tooltip.hidden && shownKey === marker.event.key) return; beforeShow(); show(marker, px); };
-      markerNodes = view === 'spread' && chart ? renderTradeMarkers($('main-chart'), markers, chart, { formatTime, show: display, hide }) : new Map();
-      const list = $('oil-trades-list');
-      list.replaceChildren(); details.hidden = true;
-      if (!markers.length) {
-        const empty = list.ownerDocument.createElement('p');
-        empty.textContent = fillsView.status === 'ok' && !fillsView.pending && !fillsView.incomplete ? '当前图表区间暂无套利成交' : '当前图表区间暂无可展示成交';
-        list.append(empty);
-      }
-      for (const marker of [...markers].reverse()) {
-        const button = list.ownerDocument.createElement('button'), type = TRADE_TYPES[marker.event.type];
-        button.type = 'button'; button.className = 'oil-trade-list-item';
-        button.setAttribute('data-trade-type', marker.event.type);
-        button.textContent = `${type.symbol} ${formatTime(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${spreadText(marker.value, marker.unit)}`;
-        button.addEventListener('click', () => {
-          const node = markerNodes.get(marker.event.key);
-          node?.focus(); node?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-          if (chart) display(marker, chart.x(marker.event.time));
-        });
-        list.append(button);
-      }
-    },
-  };
 }

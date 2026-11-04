@@ -35,19 +35,18 @@ test('selected module summaries preserve legacy keys, units and source time with
   const stale = await readHubSummary(services(), now + 100_000); assert.equal(stale.health.state, 'stale'); assert.match(stale.health.message, /原油/);
   const perpetual = await readHubSummary(services({ perpetual: { summary: () => ({ state: 'partial', updatedAt: now - 1000, quoteCount: 4900, exchangeCount: 7, liveExchangeCount: 6, message: 'gate 行情过期' }) } }), now, 'perpetual');
   assert.equal(perpetual.updatedAt, new Date(now - 1000).toISOString()); assert.equal(perpetual.health.state, 'partial'); assert.deepEqual(perpetual.metrics.map(item => item.key), ['exchanges', 'live_exchanges', 'quotes', 'modules']);
-  await assert.rejects(readHubSummary(services(), now, 'unknown'), /不存在/);
+  for (const id of ['unknown', 'cl-xau']) await assert.rejects(readHubSummary(services(), now, id), /不存在/);
 });
 
 const compressedRoutes = [
   ['perpetual', 'opportunities-v2'], ['perpetual', 'quote'],
   ['oil', 'history'], ['oil', 'candles/15m'], ['hynix', 'history'], ['hynix', 'funding'],
-  ...['', 'bz/', 'bybit/', 'bybit/bz/'].flatMap(prefix => ['history', 'funding'].map(action => ['cl-xau', prefix + action])),
 ];
 for (const [id, action] of compressedRoutes) test(`${id}/${action} compression negotiates gzip and preserves source times and the full JSON envelope`, async t => {
   const payload = { schemaVersion: action === 'quote' ? 1 : 2, generatedAt: now, monitorId: id, staleAfterMs: 30000,
     exchanges: [{ id: 'binance', status: 'live' }], quotes: Array.from({ length: 200 }, (_, i) => ({ symbol: `BTC${i}`, bid: 100, ask: 101, bidAskAt: now - 1000 })), signals: [],
     fetchedAt: timestamp, status: 'snapshot', coverageStart: now - 200 * 900000,
-    points: Array.from({ length: 200 }, (_, i) => ({ time: now - (200 - i) * 900000, oil: i === 1 ? null : 0, xau: i / 10000, ratio: i === 1 ? null : 50 })) };
+    points: Array.from({ length: 200 }, (_, i) => ({ time: now - (200 - i) * 900000, brent: i === 1 ? null : 0, wti: i / 10000, spread: i === 1 ? null : 50 })) };
   const server = createServer(createHandler({ services: new Map([[id, { actions: { [action]: ['GET'] }, handle: async () => payload }]]), username: 'test', password: 'test-password', nextHandler: (_q, r) => r.end() }));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));

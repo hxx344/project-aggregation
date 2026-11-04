@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { validateRows, filterRows, summarize, monthlyAverages, chartDomain } from '../modules/oil/data-utils.mjs';
+import { validateRows } from '../modules/oil/data-utils.mjs';
 import { ASSETS, DAY, YEAR_START, parseMarketResponse, pairDailyCandles, calculateShortSpreadFunding, requestInfo, fetchSnapshot } from '../modules/oil/hyperliquid.mjs';
 
 const snapshot = JSON.parse(await readFile(new URL('../public/oil/data/hyperliquid-2026.json', import.meta.url), 'utf8'));
@@ -107,22 +107,10 @@ test('verified live market example reproduces source-independent funding arithme
   near(calculateShortSpreadFunding(sample, 'notional').hourlyRate, -0.0000268261);
 });
 
-test('calendar ranges use the last completed candle and handle month-end clamping', () => {
-  assert.equal(filterRows(rows, 'ytd'), rows);
-  assert.equal(filterRows(rows, '1m').at(-1).date, rows.at(-1).date);
-  const examples = ['2026-02-27', '2026-02-28', '2026-03-01', '2026-03-31'].map(date => ({ date }));
-  assert.deepEqual(filterRows(examples, '1m').map(row => row.date), ['2026-02-28', '2026-03-01', '2026-03-31']);
-});
-
-test('monthly aggregation weights available observations and preserves sub-cent spread precision', () => {
-  const months = monthlyAverages(rows);
-  near(months.reduce((sum, month) => sum + month.average * month.count, 0) / rows.length, summarize(rows).average);
-  assert.equal(months.reduce((sum, month) => sum + month.count, 0), rows.length);
+test('daily rows preserve sub-cent spread precision and reject duplicate days', () => {
   const one = validateRows([{ date: '2026-03-04', brent: 100.001, wti: 99.999 }]);
   near(one[0].spread, 0.002 / 99.999 * 100);
   assert.throws(() => validateRows([rows[0], rows[0]]));
-  const domain = chartDomain([-1.245, 4.21]);
-  assert.ok(domain.min < -1.245 && domain.max > 4.21);
 });
 
 test('API calls are read-only and surface transport errors without returning fake values', async () => {

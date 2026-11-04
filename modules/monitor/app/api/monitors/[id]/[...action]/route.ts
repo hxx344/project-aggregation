@@ -5,9 +5,7 @@ import { OIL_CANDLE_ACTION } from "../../../../../modules/oil/intraday.mjs";
 import { unavailablePerpetualOpportunities } from "../../../../../lib/perpetual-opportunities.ts";
 import { fundingExchangeFromAction, supportsFundingHistory } from '../../../../../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION } from '../../../../../lib/oil-hedge-prices.ts';
-import { GOLD_OIL_EXCHANGES, parseGoldOilAction } from '../../../../../lib/gold-oil.ts';
 import { unavailablePerpetualSummary } from '../../../../../lib/perpetual-summary.ts';
-import { parseGoldOilChartRange, readGoldOilChartData } from '../../../../../lib/gold-oil-chart-data.ts';
 
 export async function GET(_request: Request, context: { params: Promise<{ id: string; action: string[] }> }) {
   const { id, action } = await context.params;
@@ -16,8 +14,6 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
   const exchange = exchangeFromAction(name);
   const fundingExchange = fundingExchangeFromAction(name);
   const hedgePrices = name === OIL_HEDGE_PRICES_ACTION;
-  const goldOil = id === 'cl-xau' ? parseGoldOilAction(name) : null;
-  const capability = goldOil?.action ?? name;
   const headers = { "Cache-Control": "no-store" };
   if (!monitor) return Response.json({ error: "监控模块不存在" }, { status: 404, headers });
   if (id === 'oil' && name === 'exchanges/variational/session') return Response.json({ available: false, configured: false, revision: 0, expiresAt: null, updatedAt: null, status: 'unavailable', error: '当前为网页预览，连接常驻监控服务后可更新 Var token。' }, { headers });
@@ -30,17 +26,8 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
   if (exchange && !supportsExchange(id, exchange)) return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
   if (fundingExchange && !supportsFundingHistory(id, fundingExchange)) return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
   if (hedgePrices && id !== 'oil') return Response.json({ error: '模块不支持此接口' }, { status: 404, headers });
-  if (goldOil?.action === 'chart') {
-    try {
-      const params = new URL(_request.url).searchParams;
-      if ([...params.keys()].some(key => key !== 'range') || params.getAll('range').length > 1) throw Error('无效的金油比图表查询参数');
-      const range = parseGoldOilChartRange(params.get('range'));
-      return Response.json(await readGoldOilChartData(action => readMonitorData(id, action), range, goldOil.oilType, goldOil.exchange), { headers });
-    } catch { return Response.json({ error: '无效的金油比图表时间范围' }, { status: 400, headers }); }
-  }
-  if (goldOil?.action === 'status') return Response.json({ available: false, monitorId: id, oilType: goldOil.oilType, exchange: goldOil.exchange, source: GOLD_OIL_EXCHANGES[goldOil.exchange].name, reason: '当前为网页行情版。Linux 一键部署后可运行常驻监控并保存飞书告警。' }, { headers });
   if (["alerts", "status"].includes(name)) return Response.json({ available: false, monitorId: id, reason: "当前为网页行情版。Linux 一键部署后可运行常驻监控并保存飞书告警。" }, { headers });
-  if ((!exchange && !fundingExchange && !hedgePrices && !["quote", "history", "funding", OIL_CANDLE_ACTION].includes(capability)) || !monitor.capabilities.includes(exchange || fundingExchange || hedgePrices ? "quote" : capability)) return Response.json({ error: "模块不支持此接口" }, { status: 404, headers });
+  if ((!exchange && !fundingExchange && !hedgePrices && !["quote", "history", "funding", OIL_CANDLE_ACTION].includes(name)) || !monitor.capabilities.includes(exchange || fundingExchange || hedgePrices ? "quote" : name)) return Response.json({ error: "模块不支持此接口" }, { status: 404, headers });
   try { return Response.json(await readMonitorData(id, name), { headers }); }
   catch { return Response.json({ error: "行情暂不可用，请稍后重试" }, { status: 503, headers }); }
 }

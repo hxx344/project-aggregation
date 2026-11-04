@@ -13,11 +13,15 @@ export type IndicatorPoint = Point & {
   consecutiveHours: number;
 };
 
-/** Includes the current closed hour; requires complete, consecutive windows. */
+/**
+ * Includes the current closed bar; requires complete, consecutive windows.
+ * `periods` count bars of `intervalMs` (hourly by default).
+ */
 export function calculateIndicators(
   points: Point[],
   metric: SpreadMetric,
   periods = INDICATOR_PERIODS,
+  intervalMs = 3_600_000,
 ): IndicatorPoint[] {
   if (![periods.sma, periods.bands].every(p => Number.isInteger(p) && p >= 2)) {
     throw new Error("Indicator periods must be integers of at least two hours");
@@ -45,7 +49,7 @@ export function calculateIndicators(
       window.length = 0; start = 0; previous = undefined;
       return result;
     }
-    if (previous !== undefined && point.time - previous !== 3_600_000) { window.length = 0; start = 0; }
+    if (previous !== undefined && point.time - previous !== intervalMs) { window.length = 0; start = 0; }
     previous = point.time;
     window.push(point[metric]);
     if (window.length - start > maxPeriod) start++;

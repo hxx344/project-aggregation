@@ -30,10 +30,10 @@ test('network transitions update activity immediately and are detached when the 
 });
 
 test('a new host asset selection leaves the old chart and replaces only navigation fields', () => {
-  const current = 'https://local.example/?monitor=perpetual&perpView=chart&chartBase=BTC&chartLong=binance%3ABTCUSDT&chartShort=aster%3ABTCUSDT&chartDays=30&symbol=BTC&longExchange=binance&goldOil=bz';
+  const current = 'https://local.example/?monitor=perpetual&perpView=chart&chartBase=BTC&chartLong=binance%3ABTCUSDT&chartShort=aster%3ABTCUSDT&chartDays=30&symbol=BTC&longExchange=binance&view=kept';
   const next = new URL(hubSelectionUrl(current, 'monitor', { symbol: 'ETH', shortExchange: 'bybit' }));
   assert.equal(next.searchParams.get('symbol'), 'ETH'); assert.equal(next.searchParams.get('shortExchange'), 'bybit');
-  assert.equal(next.searchParams.get('monitor'), 'perpetual'); assert.equal(next.searchParams.get('goldOil'), 'bz');
+  assert.equal(next.searchParams.get('monitor'), 'perpetual'); assert.equal(next.searchParams.get('view'), 'kept');
   for (const key of ['perpView', 'chartBase', 'chartLong', 'chartShort', 'chartDays', 'longExchange']) assert.equal(next.searchParams.has(key), false);
 });
 
@@ -60,7 +60,7 @@ test('positions requests carry a bounded market and validated base codes', () =>
   assert.deepEqual(cleanPositionsRequest('oil', ['CL', 'BZ', 'CL']), { market: 'oil', symbols: ['CL', 'BZ'] });
   assert.deepEqual(cleanPositionsRequest('perpetual', ['btc', 'ETH', 'A-B', 'X'.repeat(21), 'SOL']), { market: 'perpetual', symbols: ['ETH', 'SOL'] });
   assert.equal(cleanPositionsRequest('perpetual', Array.from({ length: 30 }, (_, index) => `C${index}`)).symbols.length, 20);
-  for (const [market, symbols] of [['stocks', ['CL']], ['oil', []], ['oil', ['cl']], ['oil', 'CL']]) assert.equal(cleanPositionsRequest(market, symbols), null);
+  for (const [market, symbols] of [['stocks', ['CL']], ['cl-xau', ['XAU', 'CL']], ['oil', []], ['oil', ['cl']], ['oil', 'CL']]) assert.equal(cleanPositionsRequest(market, symbols), null);
 });
 
 const item = (overrides = {}) => ({ key: 'k1', source: 'Gate CrossEx', exchange: 'Binance', symbol: 'CLUSDT', base: 'CL', side: 'long', quantity: '10', quantityUnit: '张', entryPrice: '70.10', markPrice: null, unrealizedPnl: '-1.5', pnlCurrency: 'USDT', updatedAt: '2026-10-20T08:00:00.000Z', stale: false, ...overrides });

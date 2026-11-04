@@ -227,5 +227,5 @@ test("the global API authenticates and validates writes, hides credentials, and 
   assert.equal((await fetch(endpoint, put)).status, 409);
   const tests = await Promise.all(["/api/notifications/feishu/test", "/api/monitors/hynix/alerts/test", "/api/monitors/oil/test-notification"].map(path => fetch(`${base}${path}`, { method: "POST", headers, body: "{}" })));
   assert.deepEqual(tests.map(response => response.status).sort(), [200, 429, 429]); assert.equal(deliveries, 1);
-  assert.deepEqual((await fetch(`${base}/healthz`).then(response => response.json())).monitors.sort(), ['cl-xau', "hynix", "oil", "perpetual"]);
+  assert.deepEqual((await fetch(`${base}/healthz`).then(response => response.json())).monitors.sort(), ["hynix", "oil", "perpetual"]);
 });

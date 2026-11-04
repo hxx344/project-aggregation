@@ -45,7 +45,7 @@ async page => {
       }
       throw new Error(`Expected ${expected} ranking rows; actual ${await page.locator('.perp-base-cell').count()}`);
     };
-    await page.goto(`${origin}/?monitor=perpetual&goldOil=cl&goldOilExchange=binance`);
+    await page.goto(`${origin}/?monitor=perpetual`);
     await waitCount(1);
     check((await page.locator('.perp-base-cell').innerText()).includes('BTC'), 'Only the qualified base/pair enters the ranking');
     await page.clock.resume();

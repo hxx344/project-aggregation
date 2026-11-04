@@ -8,7 +8,7 @@ import { gunzipSync } from 'node:zlib';
 import { createPageHandler, pageHtml } from '../server/page-handler.mjs';
 import { createHandler } from '../server/http.mjs';
 
-const template = '<!doctype html><html><head><!--ssr-preload--></head><body><div id="root"><!--ssr-outlet--></div><script id="page-props" type="application/json"><!--ssr-props--></script><script type="module" src="/assets/app-deadbeef.js"></script></body></html>';
+const template = '<!doctype html><html><head></head><body><div id="root"><!--ssr-outlet--></div><script id="page-props" type="application/json"><!--ssr-props--></script><script type="module" src="/assets/app-deadbeef.js"></script></body></html>';
 const literalMarkup = '<span>literal $& $` $\' <!--ssr-props--> <!--ssr-outlet--> <!--ssr-preload--></span>';
 const unsafeNote = '</script><script>globalThis.injected = true</script><!--ssr-outlet--><!--ssr-props--><!--ssr-preload--> $& $` $\' \u2028 \u2029';
 const assetText = 'console.log("page-handler-fixture");\n'.repeat(80);
@@ -102,7 +102,7 @@ async function fixture(t) {
 
 test('SSR keeps untrusted snapshots inside one JSON script and preserves literal template-like content', async t => {
   const f = await fixture(t), read = await f.start();
-  const response = await read('/?monitor=hynix&goldOil=bz&goldOilExchange=bybit');
+  const response = await read('/?monitor=hynix');
   assert.equal(response.status, 200);
   assert.match(response.headers['content-type'], /^text\/html/);
   assert.equal(response.headers['cache-control'], 'private, no-store');
@@ -115,14 +115,13 @@ test('SSR keeps untrusted snapshots inside one JSON script and preserves literal
   const props = embeddedProps(html);
   assert.equal(props.initial.hynix.quote.note, unsafeNote);
   assert.equal(props.initialMonitor, 'hynix');
-  assert.equal(props.initialGoldOil, 'bz');
-  assert.equal(props.initialGoldOilExchange, 'bybit');
+  assert.deepEqual(Object.keys(props).sort(), ['initial', 'initialMonitor']);
   assert.equal(props.initial.oil.quote, null, 'An unavailable unrelated cache does not block SSR');
 });
 
 test('malformed templates fail rather than send duplicate or missing hydration sections', () => {
   const props = { initialMonitor: 'hynix', note: unsafeNote };
-  for (const marker of ['<!--ssr-outlet-->', '<!--ssr-props-->', '<!--ssr-preload-->']) {
+  for (const marker of ['<!--ssr-outlet-->', '<!--ssr-props-->']) {
     assert.throws(() => pageHtml(template.replace(marker, ''), literalMarkup, props), /Invalid page template/);
     assert.throws(() => pageHtml(template + marker, literalMarkup, props), /Invalid page template/);
   }
@@ -138,13 +137,13 @@ test('each page reads current snapshots and degrades missing data without servin
   assert.match(second.body.toString(), /revision:2/);
   assert.equal(f.state.quoteReads, 2);
   f.state.unavailable = true;
-  const unavailable = await read('/?monitor=unrecognized&goldOil=unknown&goldOilExchange=unknown');
+  const retired = embeddedProps((await read('/?monitor=cl-xau&goldOil=bz&goldOilExchange=bybit')).body.toString());
+  assert.equal(retired.initialMonitor, 'oil', 'Old links to the removed gold/oil monitor open the oil monitor');
+  const unavailable = await read('/?monitor=unrecognized');
   assert.equal(unavailable.status, 200);
   const props = embeddedProps(unavailable.body.toString());
   assert.equal(props.initial.hynix.quote, null);
   assert.equal(props.initialMonitor, 'oil');
-  assert.equal(props.initialGoldOil, 'cl');
-  assert.equal(props.initialGoldOilExchange, 'binance');
   assert.match(unavailable.body.toString(), /revision:unavailable/);
 });
 

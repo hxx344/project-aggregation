@@ -27,10 +27,10 @@ test('known aliases and counter currencies retain exact CrossEx identity', () =>
 });
 
 test('a later ordinary navigation clears every import field from the previous URL', () => {
-  const url = new URL('http://local.test/?monitor=perpetual&goldOil=bz');
+  const url = new URL('http://local.test/?monitor=perpetual&view=kept');
   for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
   const next = new URL(hubSelectionUrl(url.href, 'monitor', { symbol: 'ETH' }));
   assert.equal(next.searchParams.get('symbol'), 'ETH');
-  assert.equal(next.searchParams.get('goldOil'), 'bz');
+  assert.equal(next.searchParams.get('view'), 'kept');
   for (const key of HUB_QUERY_KEYS.filter(key => key !== 'symbol')) assert.equal(next.searchParams.has(key), false, key);
 });
