@@ -258,9 +258,10 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         return reply(200, aeroMarket.pool(url.searchParams.get('chain'), url.searchParams.get('address')));
       }
       if (pathname === '/api/research/aero-market/samples' && method === 'GET') {
-        const keys = [...url.searchParams.keys()];
-        if (keys.length !== 1 || keys[0] !== 'window') throw new HttpError(400, '请提供 window');
-        return reply(200, aeroMarket.samples(url.searchParams.get('window')));
+        const keys = [...url.searchParams.keys()], tag = url.searchParams.get('tag');
+        if (keys.filter((k) => k === 'window').length !== 1 || keys.some((k) => k !== 'window' && k !== 'tag') || keys.filter((k) => k === 'tag').length > 1
+          || (tag !== null && (!tag || tag.length > 200))) throw new HttpError(400, '请提供 window，可选一个 tag');
+        return reply(200, aeroMarket.samples(url.searchParams.get('window'), tag));
       }
       if (url.search) throw new HttpError(400, '市场接口不接受查询参数');
       const action = pathname === '/api/research/aero-market/config' && method === 'PUT' ? 'save'

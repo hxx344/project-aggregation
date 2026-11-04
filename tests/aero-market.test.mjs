@@ -152,6 +152,10 @@ test('each scan records hourly samples for gauge pools, served per window and on
   assert.equal(sample[0], Math.floor(fake.chain.t / 3600) * 3600);
   assert.ok(Math.abs(sample[5] - 0.1 * 0.6) < 1e-6, 'emission is stored in USD at the AERO price of that scan');
   assert.throws(() => market.samples('1y'), (e) => e.status === 400);
+  // 浏览器带着缓存的标签来问：内容没变只回未变化标记。
+  assert.ok(read.tag);
+  assert.deepEqual(market.samples('7d', read.tag), { window: '7d', available: true, unchanged: true, tag: read.tag, version: read.version });
+  assert.equal(market.samples('24h', read.tag).unchanged, undefined, 'a tag only matches its own window');
   // 同一整点的后续轮次不新增样本；下一个整点再记一条。
   await clock.fire(); await settle(market);
   assert.equal(market.samples('7d').pools[`base:${POOL_WETH}`].hours, 1);
@@ -159,14 +163,17 @@ test('each scan records hourly samples for gauge pools, served per window and on
   while (clock.pending()[0]?.ms === 30_000) { await clock.fire(); await settle(market); }
   await clock.fire(); await settle(market);
   assert.equal(market.samples('7d').pools[`base:${POOL_WETH}`].hours, 2);
+  assert.equal(market.samples('7d', read.tag).unchanged, undefined, 'a new hourly sample changes the tag');
+  const beforeToggle = market.samples('7d').tag;
   const config = market.state().config;
   await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, enabled: false } } });
-  assert.deepEqual(market.samples('7d').pools, {}, 'disabled chains are hidden like their rows');
+  assert.deepEqual(market.samples('7d', beforeToggle).pools, {}, 'disabled chains are hidden like their rows, even for a cached tag');
   await market.close();
   const reopened = createAeroMarket(options);
   await reopened.initialize();
   await reopened.save(config);
-  assert.equal(reopened.samples('7d').pools[`base:${POOL_WETH}`].hours, 2, 'samples survive a restart');
+  const afterRestart = reopened.samples('7d', beforeToggle);
+  assert.equal(afterRestart.pools[`base:${POOL_WETH}`].hours, 2, 'samples survive a restart and an old tag never matches the new process');
   await reopened.close();
 });
 
@@ -364,6 +371,11 @@ test('workbench market API requires login and same origin and validates queries'
   assert.equal((await request('/samples')).status, 400);
   assert.equal((await request('/samples?window=1y')).status, 400);
   assert.equal((await request('/samples?window=7d&x=1')).status, 400);
+  assert.equal((await request('/samples?window=7d&tag=')).status, 400);
+  assert.equal((await request('/samples?window=7d&tag=a&tag=b')).status, 400);
+  assert.equal((await request('/samples?window=7d&window=24h')).status, 400);
+  assert.equal((await request(`/samples?window=7d&tag=${'x'.repeat(201)}`)).status, 400);
+  assert.equal((await request('/samples?tag=a&window=7d')).status, 200);
   assert.equal(state.samples.available, true);
   assert.equal((await request('', 'GET', undefined, { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
   assert.equal((await request('/refresh', 'POST', {}, { 'X-CSRF-Token': '' })).status, 403);

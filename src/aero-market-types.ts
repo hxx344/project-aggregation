@@ -26,6 +26,8 @@ export type MarketSamplesStatus = { available: boolean; error: string | null; ve
 export type MarketWindow = '24h' | '3d' | '7d' | '30d';
 // [整点秒, tick, 质押流动性, token0 美元价, token1 美元价, 排放美元/秒, 24h 日波动, 7d 日波动, 费率]
 export type MarketSampleRow = [number, number, number, number | null, number | null, number | null, number | null, number | null, number | null];
-export type MarketSamples = MarketSamplesStatus & { window: MarketWindow; from?: number; pools: Record<string, { hours: number; samples: MarketSampleRow[] }> };
+// tag 标识这份样本的内容；浏览器带着缓存的 tag 来问，未变时服务端只回 MarketSamplesUnchanged。
+export type MarketSamples = MarketSamplesStatus & { window: MarketWindow; unchanged?: false; tag?: string; from?: number; pools: Record<string, { hours: number; samples: MarketSampleRow[] }> };
+export type MarketSamplesUnchanged = { window: MarketWindow; available: true; unchanged: true; tag: string; version: number };
 export type MarketUnchanged = { schema: 1; revision: number; serverNow: number; unchanged: true };
 export type MarketPoolHistory = { chain: string; address: string; points: [number, number][] };

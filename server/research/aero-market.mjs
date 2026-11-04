@@ -113,6 +113,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   let samples = null;
   // 以启动时刻为起点：重启后不会与浏览器手里的旧 revision 撞号而误判未变化。
   let revision = Math.floor(Date.now() / 1000);
+  // 样本版本每次启动从 0 计：标签带上本次启动的随机标识，重启后不会与浏览器缓存里的旧标签撞号。
+  const boot = randomUUID().slice(0, 8);
   const abort = new AbortController();
   const runtimes = new Map(AERO_CHAINS.map((c) => [c.id, { registry: null, snapshot: null, prev: null, history: { schema: 1, points: [] }, rows: [], rpc: null, rpcUrl: '',
     status: 'idle', backfillPending: 0, rediscover: false, error: null, errorAt: null, checkedAt: null, nextAt: null, running: null, timer: null, failures: 0, lastStart: 0, archive: null, writes: Promise.resolve() }]));
@@ -346,13 +348,19 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       if (rt.snapshot?.states[key]) points.push([rt.snapshot.t * 1000, rt.snapshot.states[key].tick]);
       return { chain: chainId, address: key, points };
     },
-    samples(windowKey) {
+    // known 为浏览器缓存里的标签：内容未变时只回未变化标记，不重发约 700 KB 的样本。
+    samples(windowKey, known = null) {
       if (!Object.hasOwn(SAMPLE_WINDOWS, windowKey)) throw new HttpError(400, `窗口须为 ${Object.keys(SAMPLE_WINDOWS).join('、')} 之一`);
       if (!samples) return { window: windowKey, available: false, error: null, version: 0, pools: {} };
-      const enabled = new Set(AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).map((c) => c.id));
+      const enabled = AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).map((c) => c.id);
       const result = samples.read(windowKey);
+      if (!result.available) return result;
+      // 标签覆盖内容的全部来源：启动、样本版本、窗口起点（每整点前移）与启用的链。
+      const tag = `${boot}.${result.version}.${result.from}.${enabled.join(',')}`;
+      if (known === tag) return { window: windowKey, available: true, unchanged: true, tag, version: result.version };
+      const on = new Set(enabled);
       // 与列表一致：停用的链不返回样本。
-      return { ...result, pools: Object.fromEntries(Object.entries(result.pools).filter(([k]) => enabled.has(k.slice(0, k.indexOf(':'))))) };
+      return { ...result, tag, pools: Object.fromEntries(Object.entries(result.pools).filter(([k]) => on.has(k.slice(0, k.indexOf(':'))))) };
     },
     async initialize() {
       if (initialized) return;
