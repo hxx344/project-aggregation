@@ -263,9 +263,15 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
           || (tag !== null && (!tag || tag.length > 200))) throw new HttpError(400, '请提供 window，可选一个 tag');
         return reply(200, aeroMarket.samples(url.searchParams.get('window'), tag));
       }
+      if (pathname === '/api/research/aero-market/liquidity' && method === 'GET') {
+        const keys = [...url.searchParams.keys()].sort().join(',');
+        if (keys !== 'address,chain') throw new HttpError(400, '请提供 chain 与 address');
+        return reply(200, await aeroMarket.liquidity(url.searchParams.get('chain'), url.searchParams.get('address')));
+      }
       if (url.search) throw new HttpError(400, '市场接口不接受查询参数');
       const action = pathname === '/api/research/aero-market/config' && method === 'PUT' ? 'save'
-        : pathname === '/api/research/aero-market/refresh' && method === 'POST' ? 'refresh' : null;
+        : pathname === '/api/research/aero-market/refresh' && method === 'POST' ? 'refresh'
+          : pathname === '/api/research/aero-market/favorites' && method === 'PUT' ? 'favorites' : null;
       if (!action) throw new HttpError(404, '市场接口不存在');
       const body = await bodyOf();
       const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
@@ -273,6 +279,10 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (action === 'save') {
         if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供扫描配置');
         return reply(200, await aeroMarket.save(body.config, authorize));
+      }
+      if (action === 'favorites') {
+        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'favorites')) throw new HttpError(400, '请提供收藏列表');
+        return reply(200, await aeroMarket.saveFavorites(body.favorites, authorize));
       }
       if (Object.keys(body).length) throw new HttpError(400, '刷新不接受额外参数');
       return reply(200, aeroMarket.refresh(authorize));

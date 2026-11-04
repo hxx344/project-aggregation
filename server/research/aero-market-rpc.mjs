@@ -188,3 +188,47 @@ export async function readPoolHistory(rpc, pools, block, full = true) {
     }),
   };
 }
+
+const TICKS = new Interface([
+  'function tickBitmap(int16) view returns (uint256)',
+  // Slipstream Tick.Info：比 Uniswap v3 多出 stakedLiquidityNet 与 rewardGrowthOutsideX128（2026-11-04 Base 池子实测返回 10 个字段）。
+  'function ticks(int24) view returns (uint128 liquidityGross, int128 liquidityNet, int128 stakedLiquidityNet, uint256, uint256, uint256, int56, uint160, uint32, bool initialized)',
+]);
+export const MIN_TICK = -887272;
+export const MAX_TICK = 887272;
+// 详情页默认读取当前价 ÷4 至 ×4（ln4 / ln1.0001 ≈ 13864 个 tick）；已初始化 tick 过多时只留离当前价最近的这么多个。
+export const LIQUIDITY_SPAN_TICKS = 13_864;
+export const LIQUIDITY_MAX_TICKS = 1500;
+
+// 单个池子当前价附近的 tick 流动性，全部读数取自同一区块。from/to 为实际覆盖的 tick 范围（截断时收窄到最远保留的 tick）。
+export async function readPoolLiquidity(rpc, pool, { span = LIQUIDITY_SPAN_TICKS, maxTicks = LIQUIDITY_MAX_TICKS } = {}) {
+  const block = await rpc.blockNumber();
+  const head = await rpc.multicall([{ target: pool.address, iface: POOL, fn: 'slot0' }, { target: pool.address, iface: POOL, fn: 'liquidity' }, { target: pool.address, iface: POOL, fn: 'stakedLiquidity' }], block);
+  if (!head[0].ok || !head[1].ok) throw new RpcError('读取池子当前状态失败', { kind: 'format', method: 'slot0' });
+  const tick = Number(head[0].value[1]), spacing = pool.tickSpacing;
+  let from = Math.max(tick - span, MIN_TICK), to = Math.min(tick + span, MAX_TICK);
+  // 与合约 TickBitmap 一致：compressed = floor(tick / spacing)，word = compressed >> 8，bit = compressed & 255。
+  const wordOf = (t) => Math.floor(Math.floor(t / spacing) / 256);
+  const words = [];
+  for (let w = wordOf(from); w <= wordOf(to); w++) words.push(w);
+  const maps = await rpc.multicall(words.map((w) => ({ target: pool.address, iface: TICKS, fn: 'tickBitmap', args: [w] })), block);
+  let found = [];
+  words.forEach((w, i) => {
+    if (!maps[i].ok) throw new RpcError('读取 tick 位图失败', { kind: 'format', method: 'tickBitmap' });
+    let bits = BigInt(maps[i].value);
+    for (let b = 0; bits; b++, bits >>= 1n) if (bits & 1n) { const t = (w * 256 + b) * spacing; if (t >= from && t <= to) found.push(t); }
+  });
+  if (found.length > maxTicks) {
+    // 范围收窄到第一个舍弃的 tick 之内：范围内的已初始化 tick 必须全部读到，否则跨过缺失 tick 后的流动性是错的。
+    const cut = found.map((t) => Math.abs(t - tick)).sort((a, b) => a - b)[maxTicks];
+    from = Math.max(from, tick - cut + 1); to = Math.min(to, tick + cut - 1);
+    found = found.filter((t) => t >= from && t <= to);
+  }
+  found.sort((a, b) => a - b);
+  const rows = await rpc.multicall(found.map((t) => ({ target: pool.address, iface: TICKS, fn: 'ticks', args: [t] })), block);
+  const ticks = found.map((t, i) => {
+    if (!rows[i].ok) throw new RpcError('读取 tick 流动性失败', { kind: 'format', method: 'ticks' });
+    return [t, String(rows[i].value[1]), String(rows[i].value[2])];
+  });
+  return { block, tick, sqrtPriceX96: String(head[0].value[0]), liquidity: String(head[1].value), stakedLiquidity: head[2].ok ? String(head[2].value) : '0', from, to, ticks };
+}

@@ -8,7 +8,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { HttpError } from '../http-common.mjs';
 import { AERO_BASE, AERO_CHAINS, chainById } from './aero-market-chains.mjs';
-import { emissionRate, priceChange, realizedVol, solvePrices, tvlUsd } from './aero-market-core.mjs';
+import { emissionRate, liquiditySegments, priceChange, realizedVol, solvePrices, tvlUsd } from './aero-market-core.mjs';
 import * as chainReads from './aero-market-rpc.mjs';
 import { openMarketSamples, SAMPLE_WINDOWS } from './aero-market-samples.mjs';
 
@@ -21,7 +21,16 @@ const BACKFILL_PER_CYCLE = 24;
 const BACKFILL_FOLLOW_SEC = 30;
 const RETRY_SEC = [60, 120, 300, 600];
 const MANUAL_MIN_GAP_MS = 30_000;
-const LIMITS = { registry: 8 * 1024 * 1024, history: 32 * 1024 * 1024, snapshot: 8 * 1024 * 1024, config: 64 * 1024 };
+const LIMITS = { registry: 8 * 1024 * 1024, history: 32 * 1024 * 1024, snapshot: 8 * 1024 * 1024, config: 64 * 1024, favorites: 64 * 1024 };
+// 详情页流动性分布按需读链：同一池子 60 秒内复用结果（并发请求共用一次读取），失败不缓存；
+// 整次读取限时 25 秒（单个 RPC 请求 10 秒、瞬态失败重试一次），超时报错，由页面手动重试。
+const LIQUIDITY_TTL_MS = 60_000;
+const LIQUIDITY_CACHE_SIZE = 32;
+const LIQUIDITY_DEADLINE_MS = 25_000;
+const LIQUIDITY_RPC_TIMEOUT_MS = 10_000;
+const MAX_FAVORITES = 500;
+// 详情页长周期价格图：本机历史只有 7 天，更早的整点取自样本库（保留 30 天）。
+const PRICE_HISTORY_SEC = 30 * 86400;
 
 export const DEFAULT_CONFIG = Object.freeze({
   enabled: true, intervalMin: 15, minTvlUsd: 50_000,
@@ -47,6 +56,19 @@ export function strictMarketConfig(value) {
     chains[chain.id] = { enabled: row.enabled, rpcUrl };
   }
   return { enabled: value.enabled, intervalMin: value.intervalMin, minTvlUsd: value.minTvlUsd, chains };
+}
+
+// 收藏为 "链:池子地址"（小写）列表，按加入顺序保存，去重。
+export function strictFavorites(value) {
+  if (!Array.isArray(value) || value.length > MAX_FAVORITES) throw new HttpError(400, `收藏须为不超过 ${MAX_FAVORITES} 个池子的列表`);
+  const ids = new Set(AERO_CHAINS.map((c) => c.id)), out = [];
+  for (const item of value) {
+    const match = typeof item === 'string' ? /^([a-z]+):(0x[0-9a-fA-F]{40})$/.exec(item) : null;
+    if (!match || !ids.has(match[1])) throw new HttpError(400, '收藏的池子格式不正确');
+    const key = `${match[1]}:${match[2].toLowerCase()}`;
+    if (!out.includes(key)) out.push(key);
+  }
+  return out;
 }
 
 // 只显示主机名：RPC 地址可能带 API key。
@@ -108,6 +130,9 @@ export function buildRows({ chain, registry, snapshot, prev, history }) {
 export function createAeroMarket({ dataDir, enabledByDefault = true, log = console, now = Date.now, reads = chainReads, createRpc = chainReads.createRpc, setTimer = setTimeout, clearTimer = clearTimeout, openSamples = openMarketSamples } = {}) {
   const directory = path.join(dataDir, 'aero-market');
   const configPath = path.join(directory, 'config.json');
+  const favoritesPath = path.join(directory, 'favorites.json');
+  let favorites = [], favoritesError = null, favoriteWrites = Promise.resolve();
+  const liquidityCache = new Map();
   const file = (kind, id) => path.join(directory, `${kind}-${id}.json`);
   let config = { ...structuredClone(DEFAULT_CONFIG), enabled: enabledByDefault }, configError = null, initialized = false, closed = false;
   let samples = null;
@@ -323,7 +348,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   function state({ since } = {}) {
     if (since !== undefined && since === revision) return { schema: 1, revision, unchanged: true, serverNow: now() };
     return {
-      schema: 1, revision, serverNow: now(), config: structuredClone(config), configError, aero: aeroPrice(),
+      schema: 1, revision, serverNow: now(), config: structuredClone(config), configError, aero: aeroPrice(), favorites: [...favorites], favoritesError,
       chains: AERO_CHAINS.map((c) => {
         const rt = runtimes.get(c.id), cfg = config.chains[c.id];
         const points = rt.history.points;
@@ -346,7 +371,46 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       // 回填进行中历史点按从新到旧追加，尚未排序。
       const points = rt.history.points.filter((p) => p.rows[key]).map((p) => [p.t * 1000, p.rows[key][0]]).sort((a, b) => a[0] - b[0]);
       if (rt.snapshot?.states[key]) points.push([rt.snapshot.t * 1000, rt.snapshot.states[key].tick]);
-      return { chain: chainId, address: key, points };
+      // 本机历史之前的整点用样本库补到 30 天；样本库不可用时只有 7 天。
+      const first = points.length ? points[0][0] / 1000 : now() / 1000;
+      const older = samples ? samples.ticks(chainId, key, Math.floor(now() / 1000) - PRICE_HISTORY_SEC, first).map(([t, tick]) => [t * 1000, tick]) : [];
+      return { chain: chainId, address: key, points: [...older, ...points] };
+    },
+    // 详情页的流动性分布：按需读链，不进每轮扫描。停用的链不读，避免绕过扫描设置访问 RPC。
+    async liquidity(chainId, address) {
+      const rt = runtimes.get(chainId), chain = chainById.get(chainId);
+      const key = String(address).toLowerCase();
+      const row = rt && /^0x[0-9a-f]{40}$/.test(key) ? rt.rows.find((r) => r.address === key) : null;
+      if (!row) throw new HttpError(404, '没有这个池子的数据');
+      if (!config.enabled || !config.chains[chainId].enabled) throw new HttpError(409, `${chain.name} 扫描已停用，无法读取流动性分布`);
+      // 缓存只在 60 秒内且池子读数未变（没有新一轮扫描改变价格或流动性）时复用，避免当前价与分布来自不同区块。
+      const id = `${chainId}:${key}`, hit = liquidityCache.get(id), state = `${row.sqrtPriceX96}:${row.liquidity}:${row.stakedLiquidity}`;
+      if (hit && hit.state === state && (hit.pending || now() - hit.at < LIQUIDITY_TTL_MS)) return hit.promise;
+      const rpc = createRpc({ url: config.chains[chainId].rpcUrl, chainId: chain.chainId, timeoutMs: LIQUIDITY_RPC_TIMEOUT_MS, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(LIQUIDITY_DEADLINE_MS)]) });
+      const entry = { at: now(), state, pending: true, promise: null };
+      entry.promise = (async () => {
+        try {
+          const read = await reads.readPoolLiquidity(rpc, { address: key, tickSpacing: row.tickSpacing });
+          return { chain: chainId, address: key, at: now(), block: read.block, tick: read.tick, sqrtPriceX96: read.sqrtPriceX96, liquidity: read.liquidity, stakedLiquidity: read.stakedLiquidity,
+            from: read.from, to: read.to, initialized: read.ticks.length, segments: liquiditySegments(read) };
+        } catch (reason) {
+          if (liquidityCache.get(id) === entry) liquidityCache.delete(id);
+          throw new HttpError(502, `读取流动性分布失败：${String(reason?.message || reason).slice(0, 200)}`);
+        } finally { entry.pending = false; entry.at = now(); }
+      })();
+      liquidityCache.delete(id); liquidityCache.set(id, entry);
+      while (liquidityCache.size > LIQUIDITY_CACHE_SIZE) liquidityCache.delete(liquidityCache.keys().next().value);
+      return entry.promise;
+    },
+    // 收藏整体替换；写入串行，内存与文件始终是最后一次请求的结果。
+    async saveFavorites(value, authorize = () => {}) {
+      authorize();
+      const next = strictFavorites(value);
+      const write = favoriteWrites.then(() => atomicWrite(favoritesPath, next));
+      favoriteWrites = write.catch(() => {});
+      await write;
+      favorites = next; favoritesError = null; changed();
+      return state();
     },
     // known 为浏览器缓存里的标签：内容未变时只回未变化标记，不重发约 700 KB 的样本。
     samples(windowKey, known = null) {
@@ -369,6 +433,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       samples = openSamples({ file: path.join(directory, 'samples.sqlite'), log, now });
       try { const saved = readBounded(configPath, LIMITS.config); if (saved) config = strictMarketConfig(saved); }
       catch { configError = '扫描配置无效，已按默认配置运行，原文件已保留；重新保存后覆盖'; }
+      try { const saved = readBounded(favoritesPath, LIMITS.favorites); if (saved) favorites = strictFavorites(saved); }
+      catch { favoritesError = '收藏文件无效，已按空收藏显示，原文件已保留；重新收藏后覆盖'; }
       for (const c of AERO_CHAINS) load(c.id);
       startAll();
     },
@@ -399,6 +465,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       for (const rt of runtimes.values()) { clearTimer(rt.timer); rt.timer = null; }
       await Promise.allSettled([...runtimes.values()].map((rt) => rt.running));
       await Promise.allSettled([...runtimes.values()].map((rt) => rt.writes));
+      await favoriteWrites;
       samples?.close(); samples = null;
     },
     get directory() { return directory; },

@@ -55,6 +55,14 @@ function fakeChain({ start = 1_800_000_000, historyBlockTime = BLOCK_TIME, stall
       return { block, timestamp: t, states: pools.map((p) => { const s = stateOf(p.address, t); return full ? { tick: s.tick, rewardShare: s.rewardShare } : { tick: s.tick }; }) };
     },
   };
+  chain.liquidityReads = 0; chain.failLiquidity = false;
+  reads.readPoolLiquidity = async (_rpc, pool) => {
+    chain.liquidityReads++;
+    if (chain.failLiquidity) throw new Error('eth_call 超过 10 秒未响应');
+    const s = stateOf(pool.address, chain.t), lower = Math.floor(s.tick / pool.tickSpacing) * pool.tickSpacing - pool.tickSpacing;
+    return { block: blockAt(chain.t), tick: s.tick, sqrtPriceX96: s.sqrtPriceX96, liquidity: s.liquidity, stakedLiquidity: s.stakedLiquidity, from: s.tick - 1000, to: s.tick + 1000,
+      ticks: [[lower, s.liquidity, s.stakedLiquidity], [lower + 3 * pool.tickSpacing, `-${s.liquidity}`, `-${s.stakedLiquidity}`]] };
+  };
   const rpc = { blockNumber: async () => blockAt(chain.t), blockTimestamp: async (n) => 1_700_000_000 + n * BLOCK_TIME };
   return { chain, reads, createRpc: () => rpc };
 }
@@ -175,6 +183,91 @@ test('each scan records hourly samples for gauge pools, served per window and on
   const afterRestart = reopened.samples('7d', beforeToggle);
   assert.equal(afterRestart.pools[`base:${POOL_WETH}`].hours, 2, 'samples survive a restart and an old tag never matches the new process');
   await reopened.close();
+});
+
+test('favorites are validated, persisted in order and survive a restart; a broken file falls back with a notice', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  const options = { dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer };
+  const market = createAeroMarket(options);
+  await market.initialize();
+  assert.deepEqual(market.state().favorites, []);
+  const before = market.state().revision;
+  const upper = `base:0x${'A'.repeat(40)}`;
+  // 两次连续保存串行写入：内存和文件都是最后一次的结果。
+  const [, last] = await Promise.all([market.saveFavorites([`base:${POOL_WETH}`]), market.saveFavorites([`base:${POOL_AERO}`, upper, upper.toLowerCase(), `base:${POOL_WETH}`])]);
+  assert.deepEqual(last.favorites, [`base:${POOL_AERO}`, `base:0x${'a'.repeat(40)}`, `base:${POOL_WETH}`], 'addresses are lowercased and deduplicated in order');
+  assert.ok(last.revision > before, 'saving bumps the revision so polling clients pick it up');
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'aero-market/favorites.json'), 'utf8')), last.favorites);
+  for (const bad of ['base:0x1', `solana:${POOL_WETH}`, [`base:${POOL_WETH}`], Array.from({ length: 501 }, (_, i) => `base:0x${i.toString(16).padStart(40, '0')}`)]) {
+    await assert.rejects(market.saveFavorites(Array.isArray(bad) && bad.length > 1 ? bad : Array.isArray(bad) ? bad[0] : [bad]), (e) => e.status === 400);
+  }
+  assert.equal(market.state().favorites.length, 3, 'a rejected save keeps the previous list');
+  await assert.rejects(market.saveFavorites([], () => { throw Object.assign(new Error('expired'), { status: 401 }); }), (e) => e.status === 401);
+  await market.close();
+  const reopened = createAeroMarket(options);
+  await reopened.initialize();
+  assert.deepEqual(reopened.state().favorites, last.favorites);
+  await reopened.close();
+  writeFileSync(join(dir, 'aero-market/favorites.json'), '{"x":1}');
+  const broken = createAeroMarket(options);
+  await broken.initialize();
+  assert.deepEqual(broken.state().favorites, []);
+  assert.match(broken.state().favoritesError, /收藏文件无效/);
+  assert.equal(readFileSync(join(dir, 'aero-market/favorites.json'), 'utf8'), '{"x":1}', 'the invalid file is kept until the next save');
+  await broken.close();
+});
+
+test('liquidity distribution is read on demand, shared within 60 s, never cached on failure and refused for disabled chains', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  await market.initialize();
+  await assert.rejects(market.liquidity('base', POOL_WETH), (e) => e.status === 404, 'pools are only read after the scan knows them');
+  await clock.fire(); await settle(market);
+  const [a, b] = await Promise.all([market.liquidity('base', POOL_WETH), market.liquidity('base', POOL_WETH.toUpperCase().replace('0X', '0x'))]);
+  assert.equal(fake.chain.liquidityReads, 1, 'concurrent requests share one chain read');
+  assert.equal(a, b);
+  assert.equal(a.segments.length, 3);
+  assert.deepEqual(a.segments[1].slice(2), [1e18, 5e17]);
+  fake.chain.t += 59;
+  await market.liquidity('base', POOL_WETH);
+  assert.equal(fake.chain.liquidityReads, 1, 'a result is reused for 60 s');
+  fake.chain.t += 2;
+  fake.chain.failLiquidity = true;
+  await assert.rejects(market.liquidity('base', POOL_WETH), (e) => e.status === 502 && /流动性分布/.test(e.message));
+  fake.chain.failLiquidity = false;
+  await market.liquidity('base', POOL_WETH);
+  assert.equal(fake.chain.liquidityReads, 3, 'a failure is not cached, the next request reads again');
+  fake.chain.t += 10;
+  await clock.fire(); await settle(market);
+  await market.liquidity('base', POOL_WETH);
+  assert.equal(fake.chain.liquidityReads, 4, 'a scan that changed the pool state is not answered from the cache');
+  await assert.rejects(market.liquidity('base', '0x1234'), (e) => e.status === 404);
+  await assert.rejects(market.liquidity('nope', POOL_WETH), (e) => e.status === 404);
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, enabled: false } } });
+  await assert.rejects(market.liquidity('base', POOL_WETH), (e) => e.status === 409, 'a disabled chain is not read even though its last rows are kept');
+  await market.close();
+});
+
+test('pool price history extends past the 7-day local history with hourly samples', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const firstScan = fake.chain.t;
+  // 推进 8 天：本机历史只留 7 天，更早的整点由样本库补上，时间严格递增、不重复。
+  for (let h = 0; h < 8 * 24; h++) { fake.chain.t += 3600; while (clock.pending()[0]?.ms === 30_000) { await clock.fire(); await settle(market); } await clock.fire(); await settle(market); }
+  const points = market.pool('base', POOL_WETH).points;
+  assert.ok(points.some(([t]) => t === Math.floor(firstScan / 3600) * 3600_000), 'the first scan hour is still served from samples after it left the local history');
+  assert.ok(points.every((p, i) => i === 0 || p[0] > points[i - 1][0]), 'points are strictly increasing');
+  assert.ok(fake.chain.t * 1000 - points[0][0] > 7.5 * 86400_000);
+  await market.close();
 });
 
 test('archive failure falls back to locally accumulated hourly samples', async (t) => {
@@ -365,6 +458,16 @@ test('workbench market API requires login and same origin and validates queries'
   assert.equal((await request('?file=/tmp')).status, 400);
   assert.equal((await request('/pool?chain=base')).status, 400);
   assert.equal((await request(`/pool?chain=base&address=${POOL_WETH}`)).status, 404);
+  assert.equal((await request('/liquidity?chain=base')).status, 400);
+  assert.equal((await request(`/liquidity?chain=base&address=${POOL_WETH}&x=1`)).status, 400);
+  assert.equal((await request(`/liquidity?chain=base&address=${POOL_WETH}`)).status, 404);
+  assert.equal((await request('/favorites', 'PUT', { favorites: [`base:${POOL_WETH}`] }, { 'X-CSRF-Token': '' })).status, 403);
+  assert.equal((await request('/favorites', 'PUT', { favorites: ['x'] })).status, 400);
+  assert.equal((await request('/favorites', 'PUT', { favorites: [], extra: 1 })).status, 400);
+  const starred = await request('/favorites', 'PUT', { favorites: [`base:${POOL_WETH}`] });
+  assert.equal(starred.status, 200);
+  assert.deepEqual((await starred.json()).favorites, [`base:${POOL_WETH}`]);
+  assert.equal((await request('/favorites', 'POST', { favorites: [] })).status, 404);
   const samples = await request('/samples?window=7d');
   assert.equal(samples.status, 200);
   assert.deepEqual((await samples.json()).pools, {});
