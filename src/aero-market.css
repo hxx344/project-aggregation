@@ -12,6 +12,10 @@
 .am-filters input[type=number]{width:110px}
 .am-check{flex-direction:row!important;align-items:center;gap:6px!important;color:var(--text-secondary);font-size:.75rem;cursor:pointer}
 .am-filters .am-check{height:32px}
+.am-filters-more{background:var(--surface-2)}
+.am-filters-more[hidden]{display:none}
+.am-count{margin-left:auto;align-self:center;font-size:.75rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.am-filter-hint{flex:1 1 100%;font-size:.6875rem;color:var(--text-tertiary)}
 .am-note{margin:0;padding:8px 14px;font-size:.6875rem;line-height:1.65;color:var(--text-tertiary);border-bottom:1px solid var(--surface-4)}
 .am-table th.num,.am-table td.num{text-align:right}
 .am-table td small{display:block;color:var(--text-tertiary);font-size:.625rem}
@@ -43,7 +47,7 @@
 .am-chain-config input:not([type]){height:34px;min-width:0;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:6px 10px;color:var(--text-primary);background:var(--surface-1);font-size:.75rem}
 @media(max-width:900px){.am-detail{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:650px){
-  .am-filters{padding:12px 16px}.am-filters label{flex:1 1 140px}.am-filters input[type=search],.am-filters input[type=number]{width:100%;font-size:16px;height:40px}.am-filters select{height:40px;font-size:16px}
+  .am-filters{padding:12px 16px}.am-filters label{flex:1 1 140px}.am-filters input[type=search],.am-filters input[type=number]{width:100%;font-size:16px;height:40px}.am-filters select{height:40px;font-size:16px}.am-filters .button{min-height:40px}
   .am-detail-facts{grid-template-columns:minmax(0,1fr)}.am-note{padding:8px 16px}
   .am-detail{position:sticky;left:12px;width:calc(100vw - 56px)}
 }

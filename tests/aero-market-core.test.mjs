@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { emissionRate, poolPrice, priceChange, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
-import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, rangeTicks } from '../src/aero-market-math.ts';
+import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, netYield, rangeTicks } from '../src/aero-market-math.ts';
 
 const Q96 = 2 ** 96;
 const sqrtX96 = (rawPrice) => BigInt(Math.round(Math.sqrt(rawPrice) * Q96)).toString();
@@ -85,4 +85,29 @@ test('expected time in range is largest in the middle and zero at the edge', () 
   assert.equal(expectedDaysInRange(600, -500, 500, 0.02), null);
   assert.equal(expectedDaysInRange(0, -500, 500, null), null);
   assert.ok(Math.abs(priceChange(0, 100) - (1.0001 ** 100 - 1)) < 1e-12);
+});
+
+test('net yield: impermanent loss matches the CL position gamma, rebalance follows exit frequency', () => {
+  const tick = 0, lower = -500, upper = 500, vol = 0.02;
+  // 独立推导：CL 仓位价值 V(P) = L(2√P − √Pa − P/√Pb)，套利损耗速率 = σ²P²|V''|/2 ÷ V（每天）。
+  const pa = 1.0001 ** lower, pb = 1.0001 ** upper, V = (P) => 2 * Math.sqrt(P) - Math.sqrt(pa) - P / Math.sqrt(pb);
+  const e = 1e-4, gamma = (V(1 + e) - 2 * V(1) + V(1 - e)) / (e * e);
+  const daily = (vol * vol * Math.abs(gamma)) / 2 / V(1);
+  const result = netYield({ apr: 2, tick, lower, upper, dailyVol: vol, costFraction: 0.001 });
+  assert.ok(Math.abs(result.impermanent - 365 * daily) / (365 * daily) < 0.01);
+  // 调仓次数 = 365 / 期望在区间天数。
+  const days = expectedDaysInRange(tick, lower, upper, vol);
+  assert.ok(Math.abs(result.rebalance - (365 / days) * 0.001) < 1e-12);
+  assert.ok(Math.abs(result.net - (2 - result.impermanent - result.rebalance)) < 1e-12);
+  // 不动的池子没有损耗也不用调仓；缺波动率时不给结果。
+  const flat = netYield({ apr: 0.3, tick, lower, upper, dailyVol: 0, costFraction: 0.01 });
+  assert.equal(flat.net, 0.3); assert.equal(flat.days, Infinity);
+  assert.equal(netYield({ apr: 0.3, tick, lower, upper, dailyVol: null, costFraction: 0 }), null);
+  // 排放随区间收窄按 1/宽度 增长：排放强度高于损耗系数时，调仓成本让最佳宽度落在中间而不是越窄越好；
+  // 低于损耗系数时各宽度都亏，越宽亏得越少。
+  const sweep = (k) => [50, 200, 1000, 5000].map((half) => netYield({ apr: k / half, tick: 0, lower: -half, upper: half, dailyVol: 0.02, costFraction: 0.002 }).net);
+  const strong = sweep(1000), weak = sweep(50);
+  const best = strong.indexOf(Math.max(...strong));
+  assert.ok(best > 0 && best < strong.length - 1 && strong[best] > 0, `interior optimum, got ${strong}`);
+  assert.ok(weak.every((v) => v < 0) && weak.indexOf(Math.max(...weak)) === weak.length - 1, `weak emission loses everywhere, got ${weak}`);
 });
