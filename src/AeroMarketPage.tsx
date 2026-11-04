@@ -5,7 +5,7 @@ import { CartesianGrid, Line, LineChart, ReferenceArea, ResponsiveContainer, Too
 import { api, ApiError } from './api';
 import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, netYield, rangeTicks } from './aero-market-math';
 import type { NetYield } from './aero-market-math';
-import type { MarketChain, MarketConfig, MarketPool, MarketPoolHistory, MarketSnapshot, MarketUnchanged } from './aero-market-types';
+import type { MarketChain, MarketConfig, MarketPool, MarketPoolHistory, MarketSamples, MarketSnapshot, MarketUnchanged, MarketWindow } from './aero-market-types';
 import './aero-lp.css';
 import './aero-market.css';
 
@@ -30,7 +30,14 @@ type Metrics = {
   pool: MarketPool; change: number | null; stakedShare: number | null; aeroPerDay: number | null; emissionUsdYear: number | null; emissionTvl: number | null;
   apr: number | null; narrowApr: number | null; daysIn: number | null; range: [number, number];
   net: NetYield | null; best: { width: number; result: NetYield } | null; score: number | null;
+  // 与 RANGES 一一对应的各宽度净年化；avg 为过去窗口的平均值，由样本另行计算。
+  widths: (NetYield | null)[]; avg: Average | null;
 };
+// 过去窗口内逐小时按当前宽度与投入重算后的平均；days 按平均调仓频率折回天数。
+type Average = { hours: number; samples: number; widths: (NetYield | null)[]; selected: NetYield | null; best: { width: number; result: NetYield } | null };
+const WINDOWS: Record<MarketWindow, string> = { '24h': '近 24 小时', '3d': '近 3 天', '7d': '近 7 天', '30d': '近 30 天' };
+const WINDOW_HOURS: Record<MarketWindow, number> = { '24h': 24, '3d': 72, '7d': 168, '30d': 720 };
+const Q96 = 2 ** 96;
 // 最佳宽度只在预计至少能在区间内待这么久的宽度中选：否则窄区间靠高频调仓刷出的净年化不稳定，也不现实。
 const MIN_HOLD_DAYS = 1;
 // 日波动下限：样本期内不动的池子按此估算损耗、调仓与稳健分，避免零损耗与分数无限大。
@@ -52,9 +59,9 @@ function pairMatches(pool: MarketPool, kind: PairKind) {
 }
 // 空输入表示不限；非数字同样不限，避免输入过程中的中间态把表格清空。
 const limitOf = (text: string) => { if (!text.trim()) return null; const v = Number(text); return Number.isFinite(v) && v >= 0 ? v : null; };
-type SortKey = 'score' | 'net' | 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
+type SortKey = 'score' | 'net' | 'avgNet' | 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
 const SORTS: Record<SortKey, (m: Metrics) => number | null> = {
-  score: (m) => m.score, net: (m) => m.best?.result.net ?? null,
+  score: (m) => m.score, net: (m) => m.best?.result.net ?? null, avgNet: (m) => m.avg?.best?.result.net ?? null,
   tvl: (m) => m.pool.tvlUsd, staked: (m) => m.stakedShare, emission: (m) => m.aeroPerDay, emissionTvl: (m) => m.emissionTvl, apr: (m) => m.apr, narrowApr: (m) => m.narrowApr,
   vol24h: (m) => m.pool.vol24h?.daily ?? null, vol7d: (m) => m.pool.vol7d?.daily ?? null, days: (m) => m.daysIn, change: (m) => m.change,
 };
@@ -73,11 +80,8 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
   const riskVol = vols.length ? Math.max(...vols, VOL_FLOOR) : null;
   const costFraction = (pool.fee === null ? 0 : (0.5 * pool.fee) / 1e6) + (deposit > 0 ? (REBALANCE_GAS_USD[pool.chain] ?? DEFAULT_REBALANCE_GAS_USD) / deposit : 0);
   const netAt = (r: [number, number], apr: number | null) => netYield({ apr, tick: pool.tick, lower: r[0], upper: r[1], dailyVol: riskVol, costFraction });
-  let best: Metrics['best'] = null;
-  for (const option of RANGES) {
-    const r = rangeTicks(pool.tick, pool.tickSpacing, option.value), result = netAt(r, aprFor(r));
-    if (result && result.days >= MIN_HOLD_DAYS && (!best || result.net > best.result.net)) best = { width: option.value, result };
-  }
+  const widths = RANGES.map((option) => { const r = rangeTicks(pool.tick, pool.tickSpacing, option.value); return netAt(r, aprFor(r)); });
+  const best = bestOf(widths);
   const apr = aprFor(range);
   const emissionUsdYear = usdPerSecond === null ? null : usdPerSecond * 365 * DAY;
   // 涨跌与页面报价同向：以美元价较高的代币为基准。
@@ -90,7 +94,34 @@ function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, dep
     apr, narrowApr: aprFor(rangeTicks(pool.tick, pool.tickSpacing, 0)), net: netAt(range, apr), best,
     score: best && riskVol !== null ? best.result.net / (riskVol * Math.sqrt(365)) : null,
     daysIn: expectedDaysInRange(pool.tick, range[0], range[1], riskVol),
+    widths, avg: null,
   };
+}
+
+function bestOf(widths: (NetYield | null)[]): Metrics['best'] {
+  let best: Metrics['best'] = null;
+  widths.forEach((result, i) => { if (result && result.days >= MIN_HOLD_DAYS && (!best || result.net > best.result.net)) best = { width: RANGES[i].value, result }; });
+  return best;
+}
+
+// 每个样本按当时的价格、质押流动性、代币价、排放与波动重建池子读数，沿用同一套公式算各宽度净年化，再按宽度取平均。
+// 区间按当时价格居中，相当于一直跟着价格调仓；调仓频率取各点 365/天数 的平均，避免个别长停留时间把平均天数拉高。
+function averageOf(pool: MarketPool, entry: MarketSamples['pools'][string] | undefined, width: number, deposit: number): Average | null {
+  if (!entry) return null;
+  const sums = RANGES.map(() => ({ n: 0, net: 0, emission: 0, impermanent: 0, rebalance: 0, exits: 0 }));
+  for (const [, tick, staked, usd0, usd1, emissionUsd, v24, v7, fee] of entry.samples) {
+    const vol = (daily: number | null) => (daily === null ? null : { daily, annual: daily * Math.sqrt(365), samples: 0 });
+    const at: MarketPool = { ...pool, tick, sqrtPriceX96: String(Math.sqrt(1.0001 ** (tick + 0.5)) * Q96), stakedLiquidity: String(staked),
+      token0: { ...pool.token0, usd: usd0 }, token1: { ...pool.token1, usd: usd1 }, emissionPerSec: emissionUsd, vol24h: vol(v24), vol7d: vol(v7), fee };
+    metricsFor(at, 1, width, deposit).widths.forEach((r, i) => {
+      if (!r) return;
+      const s = sums[i];
+      s.n++; s.net += r.net; s.emission += r.emission; s.impermanent += r.impermanent; s.rebalance += r.rebalance; s.exits += r.days === Infinity ? 0 : 365 / r.days;
+    });
+  }
+  const widths = sums.map((s) => (s.n ? { net: s.net / s.n, emission: s.emission / s.n, impermanent: s.impermanent / s.n, rebalance: s.rebalance / s.n, days: s.exits > 0 ? 365 / (s.exits / s.n) : Infinity } : null));
+  const index = RANGES.findIndex((r) => r.value === width);
+  return { hours: entry.hours, samples: Math.max(...sums.map((s) => s.n)), widths, selected: index >= 0 ? widths[index] : null, best: bestOf(widths) };
 }
 
 // 默认以美元价较高的代币为基准报价，例如 WETH/USDC 显示每 WETH 多少 USDC；flip 时反过来。
@@ -103,7 +134,7 @@ function quoteOf(pool: MarketPool, flip = false) {
 }
 const priceText = (v: number) => (v >= 1000 ? v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : v >= 1 ? v.toPrecision(6) : v.toPrecision(5));
 
-function PoolDetail({ metrics, history, error, width }: { metrics: Metrics; history: MarketPoolHistory | null; error: string; width: number }) {
+function PoolDetail({ metrics, history, error, width, average }: { metrics: Metrics; history: MarketPoolHistory | null; error: string; width: number; average: string }) {
   const { pool, range } = metrics;
   const [flip, setFlip] = useState(false);
   const quote = quoteOf(pool, flip);
@@ -118,6 +149,7 @@ function PoolDetail({ metrics, history, error, width }: { metrics: Metrics; hist
       <div><dt>当前价格</dt><dd>{priceText(quote.price(pool.tick))}<small>{quote.label}</small></dd></div>
       <div><dt>所选区间</dt><dd>{priceText(lo)} – {priceText(hi)}<small>{width ? `±${(width * 100).toFixed(0)}%` : '最窄'}，tick {range[0]} 至 {range[1]}</small></dd></div>
       <div><dt>净年化（所选区间）</dt><dd>{pct(metrics.net?.net, 0)}<small>{metrics.net ? `排放 ${pct(metrics.net.emission, 0)} − 无常损失 ${pct(metrics.net.impermanent, 0)} − 调仓 ${pct(metrics.net.rebalance, 0)}` : '缺少波动率或排放'}{metrics.best ? `；最佳 ${widthLabel(metrics.best.width)} 为 ${pct(metrics.best.result.net, 0)}` : ''}</small></dd></div>
+      <div><dt>平均净年化（所选区间）</dt><dd>{pct(metrics.avg?.selected?.net, 0)}<small>{metrics.avg?.selected ? `排放 ${pct(metrics.avg.selected.emission, 0)} − 无常损失 ${pct(metrics.avg.selected.impermanent, 0)} − 调仓 ${pct(metrics.avg.selected.rebalance, 0)}；${average}` : average}{metrics.avg?.best ? `；最佳 ${widthLabel(metrics.avg.best.width)} 为 ${pct(metrics.avg.best.result.net, 0)}` : ''}</small></dd></div>
       <div><dt>手续费</dt><dd>{pool.fee === null ? '—' : `${(pool.fee / 1e4).toFixed(3)}%`}<small>未质押分成 {pool.unstakedFee === null ? '—' : `${(pool.unstakedFee / 1e4).toFixed(0)}%`}</small></dd></div>
       <div><dt>排放速率窗口</dt><dd>{pool.emissionWindowSec ? `${(pool.emissionWindowSec / 3600).toFixed(1)} 小时` : '—'}<small>按 voter 累计排放份额的差值计算</small></dd></div>
       <div><dt>波动率样本</dt><dd>24h {pool.vol24h?.samples ?? 0} 个 · 7d {pool.vol7d?.samples ?? 0} 个<small>年化 24h {pct(pool.vol24h?.annual)} · 7d {pct(pool.vol7d?.annual)}</small></dd></div>
@@ -187,6 +219,10 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const [spacing, setSpacing] = useState('all');
   const [minAprText, setMinAprText] = useState('');
   const [minNetText, setMinNetText] = useState('');
+  const [minAvgText, setMinAvgText] = useState('');
+  const [avgWindow, setAvgWindow] = useState<MarketWindow | 'off'>('7d');
+  const [samples, setSamples] = useState<{ window: MarketWindow; version: number; data: MarketSamples | null; error: string } | null>(null);
+  const samplesGeneration = useRef(0);
   const [minScoreText, setMinScoreText] = useState('');
   const [maxVolText, setMaxVolText] = useState('');
   const [minDaysText, setMinDaysText] = useState('');
@@ -229,14 +265,43 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const minTvl = Math.max(Number(minTvlText) || 0, 0);
   const aeroUsd = snapshot?.aero.usd ?? null;
   const chainNames = useMemo(() => new Map((snapshot?.chains ?? []).map((c) => [c.id, c.name])), [snapshot]);
-  const all = useMemo(() => (snapshot?.pools ?? []).map((p) => metricsFor(p, aeroUsd, width, deposit)), [snapshot, aeroUsd, width, deposit]);
+  const samplesVersion = snapshot?.samples?.version ?? null;
+  // 服务端按启用的链过滤样本：启停链后同一整点内样本版本不变，也要重读。
+  const enabledChains = snapshot ? (snapshot.config.enabled ? Object.keys(snapshot.config.chains).filter((id) => snapshot.config.chains[id].enabled).sort().join(',') : '') : '';
+  // 样本每整点才有新点：只在窗口切换、启用链变化或服务端样本版本变化时重读，不跟随 30 秒轮询。迟到的旧窗口响应按代次丢弃。
+  useEffect(() => {
+    if (avgWindow === 'off' || samplesVersion === null) return;
+    const signal = lifetime.current?.signal;
+    if (!signal) return;
+    const version = ++samplesGeneration.current;
+    setSamples((s) => (s?.window === avgWindow ? s : { window: avgWindow, version: samplesVersion, data: null, error: '' }));
+    void api<MarketSamples>(`${ROOT}/samples?window=${avgWindow}`, { signal, timeoutMs: 20_000 })
+      .then((data) => { if (!signal.aborted && version === samplesGeneration.current) setSamples({ window: avgWindow, version: samplesVersion, data, error: '' }); })
+      .catch((reason) => { if (!signal.aborted && version === samplesGeneration.current) fail(reason, (text) => setSamples((s) => ({ window: avgWindow, version: samplesVersion, data: s?.window === avgWindow ? s.data : null, error: text }))); });
+  }, [avgWindow, samplesVersion, enabledChains, fail]);
+  const sampleData = avgWindow !== 'off' && samples?.window === avgWindow ? samples.data : null;
+  const all = useMemo(() => (snapshot?.pools ?? []).map((p) => {
+    const m = metricsFor(p, aeroUsd, width, deposit);
+    return sampleData?.available ? { ...m, avg: averageOf(p, sampleData.pools[key(p)], width, deposit) } : m;
+  }), [snapshot, aeroUsd, width, deposit, sampleData]);
+  // 平均值的状态说明：样本库不可用、读取中、还在累计或覆盖不足时都要讲清楚，不能让空列看起来像是池子没收益。
+  const averageNote = (m: Metrics | null) => {
+    if (avgWindow === 'off') return '未计算（在筛选栏选择平均窗口）';
+    if (snapshot?.samples === undefined) return '服务端未提供样本，更新后可用';
+    if (samples?.window === avgWindow && samples.error) return `样本读取失败：${samples.error}`;
+    if (!sampleData) return '正在读取样本…';
+    if (!sampleData.available) return `样本库不可用${sampleData.error ? `：${sampleData.error}` : ''}`;
+    if (!m?.avg) return `${WINDOWS[avgWindow]}还没有该池的排放样本（每小时记录一次）`;
+    return `${WINDOWS[avgWindow]} ${m.avg.hours} / ${WINDOW_HOURS[avgWindow]} 小时有样本，按 ${m.avg.samples} 个点平均`;
+  };
   const spacings = useMemo(() => [...new Set((snapshot?.pools ?? []).map((p) => p.tickSpacing))].sort((a, b) => a - b), [snapshot]);
   // 轮询后若所选档位已不存在，按“全部”处理，避免下拉框与结果错位。
   const spacingValue = spacing !== 'all' && spacings.includes(Number(spacing)) ? spacing : 'all';
   const minNet = minNetText.trim() && Number.isFinite(Number(minNetText)) ? Number(minNetText) : null;
+  const minAvg = minAvgText.trim() && Number.isFinite(Number(minAvgText)) ? Number(minAvgText) : null;
   const minScore = minScoreText.trim() && Number.isFinite(Number(minScoreText)) ? Number(minScoreText) : null;
   const minApr = limitOf(minAprText), maxVol = limitOf(maxVolText), minDays = limitOf(minDaysText);
-  const advancedCount = [pairKind !== 'all', spacingValue !== 'all', minScore !== null, minNet !== null, minApr !== null, maxVol !== null, minDays !== null].filter(Boolean).length;
+  const advancedCount = [pairKind !== 'all', spacingValue !== 'all', minScore !== null, minNet !== null, minAvg !== null, minApr !== null, maxVol !== null, minDays !== null].filter(Boolean).length;
   const rows = useMemo(() => {
     const words = search.trim().toLowerCase().split(/[\s/,]+/).filter(Boolean);
     const pick = SORTS[sort.key];
@@ -249,15 +314,16 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       && (spacingValue === 'all' || m.pool.tickSpacing === Number(spacingValue))
       && (minScore === null || (m.score !== null && m.score >= minScore))
       && (minNet === null || (m.best !== null && m.best.result.net * 100 >= minNet))
+      && (minAvg === null || (m.avg?.best ? m.avg.best.result.net * 100 >= minAvg : false))
       && (minApr === null || (m.apr !== null && m.apr * 100 >= minApr))
       && (maxVol === null || ((vol(m) ?? Infinity) * 100 <= maxVol))
       && (minDays === null || (m.daysIn !== null && m.daysIn >= minDays))
       && words.every((w) => m.pool.token0.symbol.toLowerCase().includes(w) || m.pool.token1.symbol.toLowerCase().includes(w) || m.pool.address.startsWith(w)))
       .sort((a, b) => { const x = pick(a), y = pick(b); if (x === null && y === null) return 0; if (x === null) return 1; if (y === null) return -1; return sort.desc ? y - x : x - y; });
-  }, [all, chainFilter, emittingOnly, minTvl, search, sort, pairKind, spacingValue, minScore, minNet, minApr, maxVol, minDays]);
+  }, [all, chainFilter, emittingOnly, minTvl, search, sort, pairKind, spacingValue, minScore, minNet, minAvg, minApr, maxVol, minDays]);
   const resetFilters = () => {
     setChainFilter('all'); setSearch(''); setMinTvlText('100000'); setEmittingOnly(true);
-    setPairKind('all'); setSpacing('all'); setMinScoreText(''); setMinNetText(''); setMinAprText(''); setMaxVolText(''); setMinDaysText('');
+    setPairKind('all'); setSpacing('all'); setMinScoreText(''); setMinNetText(''); setMinAvgText(''); setMinAprText(''); setMaxVolText(''); setMinDaysText('');
   };
   const openMetrics = open ? all.find((m) => key(m.pool) === open) ?? null : null;
 
@@ -322,6 +388,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <label>搜索<input type="search" placeholder="代币或池子地址" value={search} onChange={(e) => setSearch(e.target.value)} /></label>
         <label>区间宽度<select value={width} onChange={(e) => setWidth(Number(e.target.value))}>{RANGES.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}</select></label>
         <label>投入（美元）<input type="number" min={1} step={100} value={depositText} onChange={(e) => setDepositText(e.target.value)} /></label>
+        <label>平均窗口<select value={avgWindow} onChange={(e) => setAvgWindow(e.target.value as MarketWindow | 'off')}>{Object.entries(WINDOWS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}<option value="off">不计算</option></select></label>
         <label>最低 TVL（美元）<input type="number" min={0} step={1000} value={minTvlText} onChange={(e) => setMinTvlText(e.target.value)} /></label>
         <label className="am-check"><input type="checkbox" checked={emittingOnly} onChange={(e) => setEmittingOnly(e.target.checked)} />只看有排放</label>
         <button type="button" className="button secondary am-more-toggle" aria-expanded={showMore} aria-controls="am-more-filters" onClick={() => setShowMore((v) => !v)}><SlidersHorizontal size={14} />更多筛选{advancedCount ? `（${advancedCount}）` : ''}</button>
@@ -332,6 +399,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <label>CL 档位<select value={spacingValue} onChange={(e) => setSpacing(e.target.value)}><option value="all">全部</option>{spacings.map((v) => <option key={v} value={v}>CL{v}</option>)}</select></label>
         <label>最低稳健分<input type="number" step={0.5} placeholder="不限" value={minScoreText} onChange={(e) => setMinScoreText(e.target.value)} /></label>
         <label>最低净年化（%）<input type="number" step={10} placeholder="不限" value={minNetText} onChange={(e) => setMinNetText(e.target.value)} /></label>
+        <label>最低平均净年化（%）<input type="number" step={10} placeholder="不限" value={minAvgText} onChange={(e) => setMinAvgText(e.target.value)} /></label>
         <label>最低区间年化（%）<input type="number" min={0} step={10} placeholder="不限" value={minAprText} onChange={(e) => setMinAprText(e.target.value)} /></label>
         <label>最高日波动（%）<input type="number" min={0} step={0.5} placeholder="不限" value={maxVolText} onChange={(e) => setMaxVolText(e.target.value)} /></label>
         <label>最少在区间（天）<input type="number" min={0} step={1} placeholder="不限" value={minDaysText} onChange={(e) => setMinDaysText(e.target.value)} /></label>
@@ -339,11 +407,11 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <small className="am-filter-hint">最高日波动按 24h（样本不足时用 7d）筛选；设了门槛时缺少该指标的池子不显示。区间年化、净年化与在区间天数随上面的区间宽度和投入变化。</small>
       </div>
       <p className="am-note">排放年化 = 池子排放（AERO 计价）×（你的流动性 /（当前价位质押流动性 + 你的））÷ 投入，假设全程在区间内并质押；价格移动后的竞争流动性不同，仅用于同一时刻横向比较。不含手续费：质押仓位的手续费归投票者。预计在区间时间按日波动 σ 的无漂移随机游走估算。
-        净年化 = 排放年化 − 无常损失 365·σ²/(4h) − 调仓成本 365/在区间天数 ×（0.5×费率 + gas/投入）；σ 取 24h 与 7d 日波动中较大者（最低按 0.1%/天），h 约为区间对数半宽（按仓位实际价值精确计算），gas 按 Ethereum 10 美元、其余链 0.2 美元估算；在预计至少待满 1 天的宽度中取最高者并标出宽度。稳健分 = 净年化 ÷（日波动 × √365），即每承担一份年化波动换来的净收益，默认按它排序；稳定币对的脱锚风险、代币单边下跌（趋势）与排放随投票周期变化不在公式内，不含稳定币的交易对还承担两个币对美元的整体涨跌。</p>
+        净年化 = 排放年化 − 无常损失 365·σ²/(4h) − 调仓成本 365/在区间天数 ×（0.5×费率 + gas/投入）；σ 取 24h 与 7d 日波动中较大者（最低按 0.1%/天），h 约为区间对数半宽（按仓位实际价值精确计算），gas 按 Ethereum 10 美元、其余链 0.2 美元估算；在预计至少待满 1 天的宽度中取最高者并标出宽度。平均净年化：服务端每小时记录一次各池读数（保留 30 天，从本功能上线后开始累计），按当前所选宽度与投入逐点重算净年化后取平均，长窗口均匀抽 24 个点；最佳宽度按平均值在平均在区间至少 1 天的宽度中选，能看出排放与流动性变化后收益是否持续。稳健分 = 净年化 ÷（日波动 × √365），即每承担一份年化波动换来的净收益，默认按它排序；稳定币对的脱锚风险、代币单边下跌（趋势）与排放随投票周期变化不在公式内，不含稳定币的交易对还承担两个币对美元的整体涨跌。</p>
       <div className="lp-table-scroll"><table className="lp-table am-table">
         <thead><tr>
           <th scope="col">池子</th>
-          {header('score', '稳健分', '净年化 ÷ 年化波动（σ × √365）')}{header('net', '净年化', '在区间至少 1 天的宽度中取最高：排放 − 无常损失 − 调仓成本')}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
+          {header('score', '稳健分', '净年化 ÷ 年化波动（σ × √365）')}{header('net', '净年化', '在区间至少 1 天的宽度中取最高：排放 − 无常损失 − 调仓成本')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，取平均值最高的宽度`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
           {header('emission', '日排放', '每天发给该池的 AERO')}{header('emissionTvl', '排放/TVL', '年化排放价值除以池子 TVL')}
           {header('apr', '区间年化', '所选区间宽度下的排放年化')}{header('narrowApr', '最窄年化', '单个 tickSpacing 区间的排放年化')}
           {header('vol24h', '日波动 24h', '小时对数收益折算到 1 天')}{header('vol7d', '日波动 7d')}
@@ -356,6 +424,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <th scope="row"><button type="button" className="am-pool" aria-expanded={isOpen}><strong>{pairName(m.pool)}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></th>
               <td className="num strong">{m.score === null ? '—' : m.score.toFixed(1)}</td>
               <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `${widthLabel(m.best.width)} · ${days(m.best.result.days)}` : ''}</small></td>
+              <td className={`num ${(m.avg?.best?.result.net ?? 0) > 0 ? 'up' : (m.avg?.best?.result.net ?? 0) < 0 ? 'down' : ''}`} title={averageNote(m)}>{pct(m.avg?.best?.result.net, 0)}<small>{m.avg?.best ? `${widthLabel(m.avg.best.width)} · ${m.avg.hours} 小时` : ''}</small></td>
               <td className="num">{usd(m.pool.tvlUsd)}</td><td className="num">{pct(m.stakedShare, 0)}</td>
               <td className="num">{m.aeroPerDay === null ? '—' : amount(m.aeroPerDay)}<small>{usd(m.emissionUsdYear === null ? null : m.emissionUsdYear / 365)}</small></td>
               <td className="num">{pct(m.emissionTvl, 0)}</td>
@@ -364,10 +433,10 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <td className="num">{days(m.daysIn)}</td>
               <td className={`num ${(m.change ?? 0) > 0 ? 'up' : (m.change ?? 0) < 0 ? 'down' : ''}`} title={quoteOf(m.pool).pair}>{signed(m.change)}</td>
             </tr>
-            {isOpen && openMetrics ? <tr className="am-detail-row"><td colSpan={13}><PoolDetail metrics={openMetrics} history={history?.key === k ? history.data : null} error={history?.key === k ? history.error : ''} width={width} /></td></tr> : null}
+            {isOpen && openMetrics ? <tr className="am-detail-row"><td colSpan={14}><PoolDetail metrics={openMetrics} history={history?.key === k ? history.data : null} error={history?.key === k ? history.error : ''} width={width} average={averageNote(openMetrics)} /></td></tr> : null}
           </Fragment>;
         })}
-        {!rows.length ? <tr><td colSpan={13} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
+        {!rows.length ? <tr><td colSpan={14} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
       </table></div>
       {rows.length > limit ? <div className="am-more"><button className="button secondary" onClick={() => setLimit((v) => v + 60)}>显示更多（共 {rows.length} 个）</button></div> : null}
     </section>

@@ -10,6 +10,7 @@ import { HttpError } from '../http-common.mjs';
 import { AERO_BASE, AERO_CHAINS, chainById } from './aero-market-chains.mjs';
 import { emissionRate, priceChange, realizedVol, solvePrices, tvlUsd } from './aero-market-core.mjs';
 import * as chainReads from './aero-market-rpc.mjs';
+import { openMarketSamples, SAMPLE_WINDOWS } from './aero-market-samples.mjs';
 
 const HOUR = 3600;
 const HISTORY_SEC = 7 * 86400;
@@ -104,11 +105,12 @@ export function buildRows({ chain, registry, snapshot, prev, history }) {
   }).filter(Boolean);
 }
 
-export function createAeroMarket({ dataDir, enabledByDefault = true, log = console, now = Date.now, reads = chainReads, createRpc = chainReads.createRpc, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+export function createAeroMarket({ dataDir, enabledByDefault = true, log = console, now = Date.now, reads = chainReads, createRpc = chainReads.createRpc, setTimer = setTimeout, clearTimer = clearTimeout, openSamples = openMarketSamples } = {}) {
   const directory = path.join(dataDir, 'aero-market');
   const configPath = path.join(directory, 'config.json');
   const file = (kind, id) => path.join(directory, `${kind}-${id}.json`);
   let config = { ...structuredClone(DEFAULT_CONFIG), enabled: enabledByDefault }, configError = null, initialized = false, closed = false;
+  let samples = null;
   // 以启动时刻为起点：重启后不会与浏览器手里的旧 revision 撞号而误判未变化。
   let revision = Math.floor(Date.now() / 1000);
   const abort = new AbortController();
@@ -245,6 +247,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     if ((!chain.archive || rt.archive?.ok === false) && (!last || nowSec - last.t >= 3000)) rt.history.points.push({ t: nowSec, block, rows: Object.fromEntries(Object.entries(snapshot.states).map(([a, s]) => [a, fullRow(s)])) });
     compactHistory(rt, nowSec);
     rt.rows = buildRows({ chain, registry, snapshot, prev: rt.prev, history: rt.history });
+    // 小时样本供平均净年化：AERO 价来自 Base，Base 尚未扫完时先记空，同一整点后续轮次补上。
+    samples?.record(id, nowSec, rt.rows, aeroPrice().usd);
     persist(id);
     return follow;
   }
@@ -327,6 +331,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
           history: { points: points.length, from: points.length ? points[0].t * 1000 : null, archive: c.archive ? rt.archive?.ok === false ? 'unavailable' : 'archive' : 'local', pending: rt.backfillPending } };
       }),
       pools: AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).flatMap((c) => runtimes.get(c.id).rows),
+      samples: samples ? samples.status() : { available: false, error: null, version: 0 },
     };
   }
 
@@ -341,10 +346,19 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       if (rt.snapshot?.states[key]) points.push([rt.snapshot.t * 1000, rt.snapshot.states[key].tick]);
       return { chain: chainId, address: key, points };
     },
+    samples(windowKey) {
+      if (!Object.hasOwn(SAMPLE_WINDOWS, windowKey)) throw new HttpError(400, `窗口须为 ${Object.keys(SAMPLE_WINDOWS).join('、')} 之一`);
+      if (!samples) return { window: windowKey, available: false, error: null, version: 0, pools: {} };
+      const enabled = new Set(AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).map((c) => c.id));
+      const result = samples.read(windowKey);
+      // 与列表一致：停用的链不返回样本。
+      return { ...result, pools: Object.fromEntries(Object.entries(result.pools).filter(([k]) => enabled.has(k.slice(0, k.indexOf(':'))))) };
+    },
     async initialize() {
       if (initialized) return;
       initialized = true;
       mkdirSync(directory, { recursive: true, mode: 0o700 });
+      samples = openSamples({ file: path.join(directory, 'samples.sqlite'), log, now });
       try { const saved = readBounded(configPath, LIMITS.config); if (saved) config = strictMarketConfig(saved); }
       catch { configError = '扫描配置无效，已按默认配置运行，原文件已保留；重新保存后覆盖'; }
       for (const c of AERO_CHAINS) load(c.id);
@@ -377,6 +391,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       for (const rt of runtimes.values()) { clearTimer(rt.timer); rt.timer = null; }
       await Promise.allSettled([...runtimes.values()].map((rt) => rt.running));
       await Promise.allSettled([...runtimes.values()].map((rt) => rt.writes));
+      samples?.close(); samples = null;
     },
     get directory() { return directory; },
   };
