@@ -62,6 +62,23 @@ function stats(points, expected, index = 1) {
   return { samples: count, expectedSamples: expected, coverage: Math.min(1, count / expected), firstAt: points[0][0], lastAt: points[count - 1][0], mean, stddev: Math.sqrt(variance / count), positiveRatio: positives / count, signChanges };
 }
 
+/**
+ * Peak and the trailing positive run of the 8h-normalized funding spread.
+ * A run only continues across consecutive five-minute samples; a missing sample
+ * ends it. Each sample stands for one step, so one positive sample is 5 minutes.
+ * `positiveRunCapped` means the run reaches the oldest retained sample, so the
+ * true run may be longer than the observed history.
+ */
+function fundingRun(points) {
+  if (!points.length) return { max: null, positiveRunMs: null, positiveRunCapped: false };
+  let max = -Infinity;
+  for (const point of points) if (point[1] > max) max = point[1];
+  let start = points.length - 1;
+  if (!(points[start][1] > 0)) return { max, positiveRunMs: 0, positiveRunCapped: false };
+  while (start > 0 && points[start - 1][1] > 0 && points[start][0] - points[start - 1][0] <= FUNDING_STEP) start--;
+  return { max, positiveRunMs: points.at(-1)[0] - points[start][0] + FUNDING_STEP, positiveRunCapped: start === 0 };
+}
+
 /** Bounded per-pair rings. Never splice different venues, directions, units or missing minutes together. */
 export function createQualityHistory({ maxPairs = 1000 } = {}) {
   const pairs = new Map();
@@ -144,7 +161,7 @@ export function createQualityHistory({ maxPairs = 1000 } = {}) {
       const convergenceAt = Math.floor(now / FUNDING_STEP) * FUNDING_STEP;
       if (item && item.convergenceCache?.at !== convergenceAt) item.convergenceCache = { at: convergenceAt, value: convergenceStats(item.convergence.filter(point => point[0] > convergenceAt - QUALITY_FUNDING_WINDOW_MS && point[0] <= convergenceAt), convergenceAt) };
       const convergence = item?.convergenceCache?.value ?? convergenceStats([], convergenceAt);
-      return { base, longKey, shortKey, identity: expectedIdentity ?? item?.identity, spread: stats(prices, 60), funding: { ...stats(funding, 288), longStddev: stats(funding, 288, 2).stddev, shortStddev: stats(funding, 288, 3).stddev }, convergence, ...(includeSeries ? { priceSeries: prices.map(point => [...point]) } : {}) };
+      return { base, longKey, shortKey, identity: expectedIdentity ?? item?.identity, spread: stats(prices, 60), funding: { ...stats(funding, 288), ...fundingRun(funding), longStddev: stats(funding, 288, 2).stddev, shortStddev: stats(funding, 288, 3).stddev }, convergence, ...(includeSeries ? { priceSeries: prices.map(point => [...point]) } : {}) };
     },
     metrics: () => ({ trackedPairs: pairs.size, pricePoints: [...pairs.values()].reduce((sum, pair) => sum + pair.spread.length, 0), fundingPoints: [...pairs.values()].reduce((sum, pair) => sum + pair.funding.length, 0), convergencePoints: [...pairs.values()].reduce((sum, pair) => sum + pair.convergence.length, 0) }),
   };

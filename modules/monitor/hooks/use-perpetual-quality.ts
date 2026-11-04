@@ -6,19 +6,27 @@ import { useEffect, useRef, useState } from "react";
 import { qualityRequestKey, startPerpetualQualityFeed, type QualityPairRequest } from "../lib/perpetual-quality-feed";
 import type { PerpetualQualityReport } from "../lib/perpetual-quality";
 
-export function usePerpetualQuality(pairs: QualityPairRequest[], active: boolean) {
+/** `positioning: false` reads cached history only and does not keep long/short ratio fetches alive. */
+export function usePerpetualQuality(pairs: QualityPairRequest[], active: boolean, positioning = true) {
   const [report, setReport] = useState<PerpetualQualityReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const controls = useRef<ReturnType<typeof startPerpetualQualityFeed> | null>(null);
   const requestKey = qualityRequestKey(pairs);
+  const wantsPositioning = useRef(positioning);
+  useEffect(() => {
+    const enabled = positioning && !wantsPositioning.current;
+    wantsPositioning.current = positioning;
+    // A feed already active for history only would otherwise wait for its next 60s poll.
+    if (enabled) controls.current?.refresh();
+  }, [positioning]);
 
   useEffect(() => {
     const feed = startPerpetualQualityFeed({
       load: async (requested, signal) => {
         const response = await fetch("/api/monitors/perpetual/quality", {
           method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pairs: requested }), signal,
+          body: JSON.stringify({ pairs: requested, positioning: wantsPositioning.current }), signal,
         });
         if (!response.ok) throw new Error("质量资料读取失败");
         const value = await response.json() as PerpetualQualityReport;

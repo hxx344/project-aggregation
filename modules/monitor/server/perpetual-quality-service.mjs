@@ -62,7 +62,8 @@ export function createPerpetualQualityService({ getSnapshot, store, clock = Date
     if (!running || ratioBusy || deferAuxiliary()) return;
     const now = clock();
     watched(now);
-    const keys = new Set([...watches.values()].flatMap(item => item.positioningKeys));
+    // Only reads that still display positioning keep external ratio fetches alive.
+    const keys = new Set([...watches.values()].flatMap(item => now - item.positioningAt > 180_000 ? [] : item.positioningKeys));
     const ready = [...keys].filter(key => now >= (attempts.get(key)?.retryAt ?? 0) && now >= (venueRetryAt.get(key.split(':')[0]) ?? 0));
     if (!ready.length) return;
     // Rotate the least recently attempted first. Missing/failed symbols cannot starve other rows.
@@ -112,7 +113,11 @@ export function createPerpetualQualityService({ getSnapshot, store, clock = Date
       const constituents = constituentsByBase.get(row.base);
       const keys = new Set([row.longKey, row.shortKey, ...constituents.map(item => item.key).filter(Boolean)]);
       const positioningKeys = [...keys].filter(key => byKey.has(key) && !positioningUnavailableReason(byKey.get(key)));
-      watches.delete(id); watches.set(id, { row: { base: row.base, longKey: row.longKey, shortKey: row.shortKey }, positioningKeys, at: now });
+      // History-only reads (e.g. the funding-stability column) keep sampling priority
+      // but must not start positioning fetches the page will not show.
+      const previous = watches.get(id), wantsPositioning = input.positioning !== false;
+      watches.delete(id); watches.set(id, { row: { base: row.base, longKey: row.longKey, shortKey: row.shortKey },
+        positioningKeys: wantsPositioning ? positioningKeys : previous?.positioningKeys ?? [], positioningAt: wantsPositioning ? now : previous?.positioningAt ?? -Infinity, at: now });
       while (watches.size > 60) watches.delete(watches.keys().next().value);
       const includeSeries = row.includeSeries === true && !seriesIncluded;
       if (includeSeries) seriesIncluded = true;

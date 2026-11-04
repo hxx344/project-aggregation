@@ -46,7 +46,7 @@ async page => {
   await page.addInitScript(({ origin, initial }) => {
     if (location.origin !== origin) return;
     localStorage.setItem('market-monitor:perpetual:v1', JSON.stringify({ version: 2, sortBy: 'gross', minSpreadPercent: 0 }));
-    localStorage.removeItem('market-monitor:perpetual-scanner:v1'); localStorage.removeItem('market-monitor:perpetual-scanner-ranges:v1');
+    localStorage.setItem('market-monitor:perpetual-scanner:v1', JSON.stringify({ version: 3, groupByBase: false })); localStorage.removeItem('market-monitor:perpetual-scanner-ranges:v1');
     const fixture = window.perpetualRefreshFixture = { initial, streams: [], created: 0, frames: 0, sequence: 0, price64: 102, growing: false, staleAt: null };
     window.EventSource = class FixtureEventSource {
       static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
@@ -96,7 +96,7 @@ async page => {
       if (url.origin !== origin) { external.push(url.origin); return route.abort('blockedbyclient'); }
       if (!path.startsWith('/api/')) return route.continue();
       counts.set(path, (counts.get(path) ?? 0) + 1);
-      if (!['GET', 'HEAD'].includes(request.method()) && !['metrics', 'funding-history', 'scanner-data'].some(name => path === `/api/monitors/perpetual/${name}`)) mutations.push(`${request.method()} ${path}`);
+      if (!['GET', 'HEAD'].includes(request.method()) && !['metrics', 'funding-history', 'scanner-data', 'quality'].some(name => path === `/api/monitors/perpetual/${name}`)) mutations.push(`${request.method()} ${path}`);
       if (path.endsWith('/perpetual/quote')) {
         const held = holdNextQuote;
         if (held) { holdNextQuote = null; await new Promise(resolve => { held.release = resolve; }); }

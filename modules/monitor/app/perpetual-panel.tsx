@@ -26,7 +26,7 @@ import { estimatePerpetualHoldingScenario } from "../lib/perpetual-opportunity";
 import { classifyPerpetualQuote, createPerpetualQuoteSelector, createPerpetualRankingSelector, defaultPerpetualFilters, normalizedFunding8h, parsePerpetualPreferences, perpetualSpreadKey, quotePriceTime, visiblePerpetualSnapshot, type PerpetualFilters, type PerpetualSpread } from "../lib/perpetual-spreads";
 import type { PerpetualExchange, PerpetualPairMode, PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from "../lib/perpetual-types";
 import type { SummaryProps } from "../lib/monitor-summary";
-import { SCANNER_COLUMNS, SCANNER_CATEGORIES, defaultScannerPreferences, parseScannerPreferences, scannerPairCategory, scannerQuoteCategory, annualizedFundingPercent, type ScannerPreferences, type ScannerCategoryId, type ScannerColumnId } from "../lib/perpetual-scanner";
+import { SCANNER_COLUMNS, SCANNER_CATEGORIES, SCANNER_GROUP_PAGE_SIZE, SCANNER_ROW_BUDGET, defaultScannerPreferences, formatBreakEvenHours, formatRunDuration, fundingStabilityView, groupScannerRows, normalizeScannerPrincipal, parseScannerPreferences, parseScannerPrincipal, scannerPairCategory, scannerQuoteCategory, annualizedFundingPercent, type ScannerPreferences, type ScannerRowGroup, type ScannerCategoryId, type ScannerColumnId } from "../lib/perpetual-scanner";
 import { ScannerMenu, ScannerLeg, ScannerFundingRate, ScannerHistory, ScannerMarketMetric, scannerPercent, scannerPolarity } from "./perpetual-scanner-parts";
 import { ScannerRangeFilters } from "./perpetual-scanner-filters";
 import { compileScannerRanges, evaluateScannerRanges, parseScannerRangeInputs, type ScannerRangeId, type ScannerRangeInputs } from "../lib/perpetual-scanner-filters";
@@ -50,6 +50,7 @@ const scannerPreferencesKey = "market-monitor:perpetual-scanner:v1";
 const scannerRangesKey = "market-monitor:perpetual-scanner-ranges:v1";
 const scannerSortKey = "market-monitor:perpetual-scanner-sort:v1";
 const capitalAssumptionsKey = "market-monitor:perpetual-capital-assumptions:v1";
+const principalKey = "market-monitor:perpetual-principal:v1";
 const sortableScannerColumns = new Set<string>(["fundingSpread", "annualized", "volume", "openInterest", "quote", "spread", "capital", "roc", "history24h", "history7d", "history30d"]);
 const preferencesKey = "market-monitor:perpetual:v1";
 const qualityBudgetKey = "market-monitor:perpetual-quality-budget:v1";
@@ -242,6 +243,9 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
   const [sortReady, setSortReady] = useState(false);
   const [capitalAssumptions, setCapitalAssumptions] = useState<CapitalAssumptions>(() => ({ ...DEFAULT_CAPITAL_ASSUMPTIONS }));
   const [capitalReady, setCapitalReady] = useState(false);
+  const [principal, setPrincipal] = useState(() => normalizeScannerPrincipal(undefined));
+  const [principalReady, setPrincipalReady] = useState(false);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
   const activeSort = useMemo<ScannerSort>(() => scannerSort ?? { column: filters.sortBy === "funding" ? "fundingSpread" : "spread", direction: "desc" }, [scannerSort, filters.sortBy]);
   const sortRequirements = useMemo(() => scannerSortRequirements(scannerSort), [scannerSort]);
   const [rangeInputs, setRangeInputs] = useState<ScannerRangeInputs>(() => parseScannerRangeInputs({ spread: { min: "0" } }));
@@ -354,12 +358,30 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
     }
     return counts;
   }, [opportunitiesActive, quoteSelection, filters.priceMode, now, data?.staleAfterMs]);
-  const totalItems = view === "rank" ? ranking.length : quoteSelection.keys.length;
-  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  const groups = useMemo(() => view === "rank" && scanner.groupByBase ? groupScannerRows(ranking) : null, [view, scanner.groupByBase, ranking]);
+  const itemPageSize = groups ? SCANNER_GROUP_PAGE_SIZE : pageSize;
+  const totalItems = view === "rank" ? groups ? groups.length : ranking.length : quoteSelection.keys.length;
+  const totalPages = Math.max(1, Math.ceil(totalItems / itemPageSize));
   const visiblePage = Math.max(1, Math.min(paused ? inspection.page : page, totalPages));
-  const rows = useMemo(() => ranking.slice((visiblePage - 1) * pageSize, visiblePage * pageSize), [ranking, visiblePage]);
+  const pageGroups = useMemo(() => groups ? groups.slice((visiblePage - 1) * itemPageSize, visiblePage * itemPageSize) : null, [groups, visiblePage, itemPageSize]);
+  // The open group's other combinations share the per-request pair budget with the page's lead rows.
+  const openPageGroup = pageGroups?.find(group => group.base === openGroup && group.others.length > 0) ?? null;
+  const childLimit = openPageGroup && pageGroups ? Math.max(0, SCANNER_ROW_BUDGET - pageGroups.length) : 0;
+  const rows = useMemo(() => pageGroups
+    ? pageGroups.flatMap(group => group === openPageGroup ? [group.lead, ...group.others.slice(0, childLimit)] : [group.lead])
+    : ranking.slice((visiblePage - 1) * pageSize, visiblePage * pageSize), [pageGroups, openPageGroup, childLimit, ranking, visiblePage]);
+  const rowGroups = useMemo(() => {
+    const lookup = new Map<string, { group: ScannerRowGroup<PerpetualSpread>; child: boolean }>();
+    for (const group of pageGroups ?? []) {
+      lookup.set(perpetualSpreadKey(group.lead), { group, child: false });
+      for (const row of group.others) lookup.set(perpetualSpreadKey(row), { group, child: true });
+    }
+    return lookup;
+  }, [pageGroups]);
+  const shownChildren = openPageGroup ? Math.min(openPageGroup.others.length, childLimit) : 0;
+  const lastShownKey = openPageGroup ? perpetualSpreadKey(shownChildren ? openPageGroup.others[shownChildren - 1] : openPageGroup.lead) : null;
   const qualityPairs = useMemo(() => rows.map(row => ({ base: row.base, longKey: `${row.long.exchange}:${row.long.symbol}`, shortKey: `${row.short.exchange}:${row.short.symbol}`, ...(perpetualSpreadKey(row) === expanded ? { includeSeries: true } : {}) })), [rows, expanded]);
-  const { report: qualityReport, loading: qualityLoading, error: qualityError } = usePerpetualQuality(qualityPairs, opportunitiesActive && view === "rank" && (scanner.columns.includes("quality") || paused || toolsOpen));
+  const { report: qualityReport, loading: qualityLoading, error: qualityError } = usePerpetualQuality(qualityPairs, opportunitiesActive && view === "rank" && (scanner.columns.includes("quality") || scanner.columns.includes("fundingStability") || paused || toolsOpen), scanner.columns.includes("quality") || paused || toolsOpen);
   const { report: fundingHistoryReport, error: fundingHistoryError } = usePerpetualFundingHistory(qualityPairs, opportunitiesActive && view === "rank" && (scanner.columns.some(column => column === "history24h" || column === "history7d" || column === "history30d") || paused));
   const { report: marketMetricsReport, error: marketMetricsError } = usePerpetualMarketMetrics(qualityPairs, opportunitiesActive && view === "rank" && (scanner.columns.includes("volume") || scanner.columns.includes("openInterest")));
   const qualities = useMemo(() => new Map(rows.map(row => [qualityPairKey(row), evaluateOpportunityQuality(row, qualityReport, now, qualityBudget, filters.priceMode)])), [rows, qualityReport, now, qualityBudget, filters.priceMode]);
@@ -408,6 +430,18 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
   useEffect(() => {
     if (capitalReady) { try { localStorage.setItem(capitalAssumptionsKey, JSON.stringify(capitalAssumptions)); } catch { /* ROC remains available without storage. */ } }
   }, [capitalAssumptions, capitalReady]);
+  useEffect(() => {
+    const restore = (event?: StorageEvent) => {
+      if (event && event.key !== principalKey) return;
+      try { setPrincipal(parseScannerPrincipal(localStorage.getItem(principalKey))); } catch { /* Storage is optional. */ }
+      setPrincipalReady(true);
+    };
+    restore(); window.addEventListener("storage", restore);
+    return () => window.removeEventListener("storage", restore);
+  }, []);
+  useEffect(() => {
+    if (principalReady) { try { localStorage.setItem(principalKey, JSON.stringify({ version: 1, principal })); } catch { /* The estimate remains available without storage. */ } }
+  }, [principal, principalReady]);
   useEffect(() => {
     function restoreRanges(event?: StorageEvent) {
       if (event && event.key !== scannerRangesKey) return;
@@ -522,7 +556,13 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
   function closeRanges() { setFiltersOpen(false); document.getElementById("perpetual-filter-toggle")?.focus({ preventScroll: true }); }
   function changeView(next: "rank" | "quotes") { setInspection(null); setView(next); setPage(1); }
   function changeOpportunityMode(funding: boolean) { changeView("rank"); updateFilters({ sortBy: funding ? "funding" : fundingSort ? "gross" : filters.sortBy }); }
-  function changePage(next: number) { setInspection(null); setPage(next); }
+  function changePage(next: number) { setInspection(null); setOpenGroup(null); setPage(next); }
+  function toggleGrouping() { setInspection(null); setPage(1); setOpenGroup(null); setScanner(previous => ({ ...previous, groupByBase: !previous.groupByBase })); }
+  function toggleGroup(base: string) {
+    // Collapsing or switching groups hides the open group's other combinations, so a detail among them closes too.
+    if (openPageGroup?.others.some(row => perpetualSpreadKey(row) === expanded)) setInspection(null);
+    setOpenGroup(previous => previous === base ? null : base);
+  }
   function toggleExchange(id: string) {
     const next = new Set(filters.exchanges ?? exchanges.map(exchange => exchange.id));
     if (next.has(id)) next.delete(id); else next.add(id);
@@ -594,9 +634,10 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
         <p>按交易所已核验分类；未知或两腿分类不一致归入未分类。</p>
       </ScannerMenu>
       <button type="button" className={`perp-tool-button ${filters.favoritesOnly ? "is-selected" : ""}`} aria-pressed={filters.favoritesOnly} onClick={() => updateFilters({ favoritesOnly: !filters.favoritesOnly })}><Star size={14}/>自选<span>{favoritePairs.size}{favorites.size ? ` + ${favorites.size} 币` : ""}</span></button>
+      {view === "rank" ? <button type="button" className={`perp-tool-button ${scanner.groupByBase ? "is-selected" : ""}`} aria-pressed={scanner.groupByBase} title="每个币种只显示当前排序下最靠前的组合，其余组合点击币种旁的数量展开" onClick={toggleGrouping}>按币种聚合</button> : null}
     </div>
     {filtersOpen ? <ScannerRangeFilters inputs={rangeInputs} compiled={ranges} onChange={updateRange} onClear={clearRanges} onClose={closeRanges}/> : null}
-    <div className="scanner-status"><div className={`perp-connection ${expired || error || data?.status === "unavailable" ? "is-warning" : ""}`} role="status"><i aria-hidden="true"/>{statusText}<span>{transportText}</span></div><span>{totalItems} {view === "rank" ? "组合" : "报价"} · {liveExchanges} / {exchanges.length} 平台在线 · 更新 {stamp(data?.generatedAt)} 北京时间</span><span className="scanner-direction-key"><i className="positive">多</i> 做多腿在上 <i className="negative">空</i> 做空腿在下</span></div>
+    <div className="scanner-status"><div className={`perp-connection ${expired || error || data?.status === "unavailable" ? "is-warning" : ""}`} role="status"><i aria-hidden="true"/>{statusText}<span>{transportText}</span></div><span>{totalItems} {view === "rank" ? groups ? "币种" : "组合" : "报价"} · {liveExchanges} / {exchanges.length} 平台在线 · 更新 {stamp(data?.generatedAt)} 北京时间</span><span className="scanner-direction-key"><i className="positive">多</i> 做多腿在上 <i className="negative">空</i> 做空腿在下</span></div>
     <RelatedPositions variant="strip" market="perpetual" symbols={contextBases} active={interactionActive} extra={<button type="button" className="detail-side-action" aria-expanded={toolsOpen && alertsOpen} aria-controls="perpetual-alert-region" onClick={() => openTool("alerts")}><Bell size={13} aria-hidden="true"/>提醒设置</button>}/>
     {view === "rank" && ranges.active.length > 0 ? <div className="scanner-filter-progress" role="status" aria-label="全量筛选状态">
       {!ranges.valid ? <span className="scanner-filter-pending">请修正无效范围</span> : <><span>筛选范围：全部 {categoryRanking.length} 个候选组合</span><span>匹配 {ranking.length}</span>{rangeSelection.pending > 0 ? <span className="scanner-filter-pending">{!ranges.needsMetrics && ranges.historyHours.length === 1 && ranges.historyHours[0] === 720 ? "30天历史待补齐" : "待采集"} {rangeSelection.pending}{scannerLoading ? " · 自动补齐中" : ""}</span> : null}{rangeSelection.missing > 0 ? <span>缺失或过期 {rangeSelection.missing}</span> : null}{(scannerData?.progress?.deferred ?? 0) > 0 ? <span>部分数据稍后重试</span> : null}</>}
@@ -623,7 +664,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
       return <th scope="col" key={column.id} data-column={column.id} aria-sort={sortable && sorted ? activeSort.direction === "desc" ? "descending" : "ascending" : undefined}>
         {sortable ? <button type="button" className="scanner-sort-column" aria-label={`${label}，${dualLeg ? "多腿，" : ""}点击按${nextDirection()}排序`} onClick={() => changeScannerSort(sortable, dualLeg ? "long" : undefined)}>{label}<span aria-hidden="true">{arrow}</span></button> : label}
         {dualLeg && sortable ? <div className="scanner-sort-legs">{(["long", "short"] as const).map(leg => <button type="button" key={leg} data-sort-leg={leg} aria-pressed={sorted && activeSort.leg === leg} aria-label={`${label}，${leg === "long" ? "多腿" : "空腿"}，点击按${nextDirection(leg)}排序`} onClick={() => changeScannerSort(sortable, leg)}>{leg === "long" ? "多" : "空"}{sorted && activeSort.leg === leg ? <span aria-hidden="true">{arrow}</span> : null}</button>)}</div> : null}
-        {column.id === "fundingSpread" ? <small>/ 8h</small> : column.id === "annualized" ? <small>当前费率估算</small> : column.id === "capital" ? <small>占多腿名义</small> : column.id === "roc" ? <small>{capitalAssumptions.holdingHours}h 情景</small> : column.id === "quote" ? <small>{filters.priceMode === "book" ? "多卖一 / 空买一" : "标记价 · 仅供参考"}</small> : null}
+        {column.id === "fundingSpread" ? <small>/ 8h</small> : column.id === "annualized" ? <small>当前费率估算</small> : column.id === "capital" ? <small>占多腿名义</small> : column.id === "roc" ? <small>{capitalAssumptions.holdingHours}h 情景</small> : column.id === "breakEven" ? <small>本金 {principal.toLocaleString("zh-CN")} U · {capitalAssumptions.holdingHours}h</small> : column.id === "fundingStability" ? <small>均值 · 最高 · 连续为正</small> : column.id === "quote" ? <small>{filters.priceMode === "book" ? "多卖一 / 空买一" : "标记价 · 仅供参考"}</small> : null}
       </th>;
     })}<th scope="col"><span className="perp-sr-only">展开组合详情</span></th></tr></thead>
       <tbody>{rows.map(row => {
@@ -642,7 +683,10 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
         const category = scannerPairCategory(row);
         const categoryLabel = SCANNER_CATEGORIES.find(item => item.id === category)?.label ?? "未分类";
         const annualized = annualizedFundingPercent(fundingSpread);
-        const { capital: rowCapital, roc: rowRoc } = scannerCapitalMetrics(row, capitalAssumptions, { now, priceMode: filters.priceMode, staleAfterMs: data?.staleAfterMs ?? 30_000 });
+        const { capital: rowCapital, roc: rowRoc, breakEven } = scannerCapitalMetrics(row, capitalAssumptions, { now, priceMode: filters.priceMode, staleAfterMs: data?.staleAfterMs ?? 30_000 });
+        const profit = rowRoc.rocPercent === null ? null : principal * rowRoc.rocPercent / 100;
+        const stability = fundingStabilityView(history?.funding, now);
+        const rowGroup = rowGroups.get(rowKey);
         const historyPair = { base: row.base, longKey: `${row.long.exchange}:${row.long.symbol}`, shortKey: `${row.short.exchange}:${row.short.symbol}` };
         const longMetric = scannerRequirements.metrics ? scannerData?.metrics[historyPair.longKey] : marketMetricsReport?.legs[historyPair.longKey];
         const shortMetric = scannerRequirements.metrics ? scannerData?.metrics[historyPair.shortKey] : marketMetricsReport?.legs[historyPair.shortKey];
@@ -658,14 +702,17 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
           spread: <div className={scannerPolarity(primarySpread)} title={historicalDeviation === null ? undefined : `较 1h 均值 ${historicalDeviation.toFixed(1)} bp`}><strong>{percent(primarySpread)}</strong><small className="secondary">{netSort ? "毛" : "净"} {percent(netSort ? row.spreadPercent : row.netSpreadPercent ?? null)}</small></div>,
           capital: <span title={rowCapital.capitalPercent === null ? rowCapital.reason : `按多腿 ${capitalAssumptions.longLeverage}x、空腿 ${capitalAssumptions.shortLeverage}x、缓冲 ${capitalAssumptions.marginBufferPercent}% 估算；资本占做多腿名义 ${rowCapital.capitalPercent.toFixed(1)}%`}>{rowCapital.capitalPercent === null ? "—" : `${rowCapital.capitalPercent.toFixed(1)}%`}</span>,
           roc: rowRoc.rocPercent === null ? <span title={rowCapital.reason || rowRoc.reason}>—</span> : <div className={scannerPolarity(rowRoc.rocPercent)} title={`ROC =（净价差 + ${capitalAssumptions.holdingHours}h 资金费）÷ 所需资本；按同数量双腿名义金额加权，连续外推当前费率，假设退出价差归零。${rowRoc.reason}`}><strong>{scannerPercent(rowRoc.rocPercent, 2)}</strong><small className="secondary">{rowRoc.fundingAvailable ? `资金费年化 ${scannerPercent(rowRoc.fundingRocAnnualizedPercent, 1)}` : "资金费缺失或过期 · 仅价差"}</small></div>,
+          fundingStability: stability ? <div className={scannerPolarity(stability.mean)} title={`近 24h 每 5 分钟采样 ${stability.samples} 个，覆盖 ${Math.round(stability.coverage * 100)}%。数值为按 8h 折算的空腿减多腿预估费率均值与最高值，不是已结算收益；连续为正指最近一段未中断的正费差采样${stability.positiveRunCapped ? "，已达到已保留历史的起点，实际可能更长" : ""}。`}><strong>{scannerPercent(stability.mean)}</strong><small className="secondary">高 {scannerPercent(stability.max)}{stability.positiveRunMs === null ? "" : stability.positiveRunMs === 0 ? " · 当前非正" : ` · 连续为正 ${stability.positiveRunCapped ? "≥" : ""}${formatRunDuration(stability.positiveRunMs)}`}</small></div>
+            : <span title={row.crossCurrency ? "跨计价币组合暂无同口径费差历史" : "需近 24h 至少 12 个真实 5 分钟样本且最新样本在 10 分钟内；历史积累中或读取暂停时显示 —"}>—</span>,
+          breakEven: <div className={(breakEven.status === "covered" && (profit === null || profit >= 0)) || (breakEven.status === "hours" && breakEven.hours! <= capitalAssumptions.holdingHours) ? "positive" : breakEven.status === "never" ? "negative" : ""} title={`回本时间 = −净价差 ÷ 每 8h 资金费 × 8，与 ROC 同一情景：已扣双腿 taker 往返费与滑点预算，假设退出价差归零、当前费率连续外推；资金费按同数量双腿名义加权。收益 = 本金 ${principal.toLocaleString("zh-CN")} USDT × ${capitalAssumptions.holdingHours}h ROC。${breakEven.reason ? ` ${breakEven.reason}` : ""}`}><strong>{breakEven.status === "covered" ? "已覆盖成本" : breakEven.status === "hours" ? `${formatBreakEvenHours(breakEven.hours!)} 回本` : breakEven.status === "never" ? "不回本" : "—"}</strong><small className={`secondary ${scannerPolarity(profit)}`}>{profit === null ? "收益 —" : `${profit >= 0 ? "+" : "−"}${Math.abs(profit).toLocaleString("zh-CN", { maximumFractionDigits: Math.abs(profit) < 100 ? 2 : 0 })} U / ${capitalAssumptions.holdingHours}h${rowRoc.fundingAvailable ? "" : " · 仅价差"}`}</small></div>,
           history24h: <ScannerHistory long={fundingHistoryReport?.legs[historyPair.longKey]} short={fundingHistoryReport?.legs[historyPair.shortKey]} total={scannerRequirements.historyHours.includes(24) ? scannerDataHistoryForPair(scannerData, historyPair, 24) ?? null : undefined} now={now}/>,
           history7d: <ScannerHistory long={fundingHistoryReport?.legs[historyPair.longKey]} short={fundingHistoryReport?.legs[historyPair.shortKey]} total={scannerRequirements.historyHours.includes(168) ? scannerDataHistoryForPair(scannerData, historyPair, 168) ?? null : undefined} now={now} hours={168}/>,
           history30d: <ScannerHistory long={fundingHistoryReport?.legs[historyPair.longKey]} short={fundingHistoryReport?.legs[historyPair.shortKey]} total={scannerRequirements.historyHours.includes(720) ? scannerDataHistoryForPair(scannerData, historyPair, 720) ?? null : undefined} now={now} hours={720}/>,
           time: <div className="scanner-time"><time dateTime={new Date(row.updatedAt).toISOString()}>{stamp(row.updatedAt)}</time><small>{age(row.updatedAt, now)}{paused ? now - row.updatedAt > (data?.staleAfterMs ?? 30_000) ? " · 已过期" : " · 已暂停" : ""}</small></div>,
           quality: <QualityCell quality={quality} pairLabel={pairLabel} onInspect={() => inspect(row, false, "quality")}/>,
         };
-        return <Fragment key={rowKey}><tr className={`${isExpanded ? "perp-row-expanded " : ""}scanner-chart-row`} onClick={event => { const target = event.target as HTMLElement; if (event.currentTarget.contains(target) && !target.closest('button, a, input, select, summary, [data-crossex-import]')) openChart(row); }}>
-          <th scope="row" className="perp-base-cell"><button type="button" className={`perp-star ${isFavorite ? "is-favorite" : ""}`} aria-label={`${isFavorite ? "移除" : "收藏"}组合：${pairLabel}`} aria-pressed={isFavorite} onClick={() => toggleFavorite(row)}><Star size={15} fill={isFavorite ? "currentColor" : "none"}/></button><div><strong>{row.base}</strong><small>{row.crossCurrency ? `${row.long.quoteCurrency} / ${row.short.quoteCurrency}` : row.long.quoteCurrency}{row.fxAdjusted ? " · 已换汇" : ""}</small><PerpetualPushToggle base={row.base} settings={crossex}/></div></th>
+        return <Fragment key={rowKey}><tr className={`${isExpanded ? "perp-row-expanded " : ""}${rowGroup?.child ? "scanner-group-child " : ""}scanner-chart-row`} onClick={event => { const target = event.target as HTMLElement; if (event.currentTarget.contains(target) && !target.closest('button, a, input, select, summary, [data-crossex-import]')) openChart(row); }}>
+          <th scope="row" className="perp-base-cell"><button type="button" className={`perp-star ${isFavorite ? "is-favorite" : ""}`} aria-label={`${isFavorite ? "移除" : "收藏"}组合：${pairLabel}`} aria-pressed={isFavorite} onClick={() => toggleFavorite(row)}><Star size={15} fill={isFavorite ? "currentColor" : "none"}/></button><div><strong>{row.base}{rowGroup && !rowGroup.child && rowGroup.group.others.length ? <button type="button" className="scanner-group-toggle" aria-expanded={openGroup === row.base} aria-label={`${openGroup === row.base ? "收起" : "展开"} ${row.base} 的其他 ${rowGroup.group.others.length} 个组合`} onClick={() => toggleGroup(row.base)}>+{rowGroup.group.others.length}<ChevronDown size={11} aria-hidden="true"/></button> : null}</strong><small>{row.crossCurrency ? `${row.long.quoteCurrency} / ${row.short.quoteCurrency}` : row.long.quoteCurrency}{row.fxAdjusted ? " · 已换汇" : ""}</small><PerpetualPushToggle base={row.base} settings={crossex}/></div></th>
           <td data-column="crossexImport"><CrossExImportButton row={row} pairLabel={pairLabel} options={importOptions} readNow={readNow}/></td>
           {visibleColumns.map(column => <td key={column.id} data-column={column.id} className="scanner-number">{cells[column.id]}</td>)}
           <td className="perp-expand-cell"><button type="button" aria-label={`${isExpanded ? "收起" : "展开"} ${pairLabel} 质量依据与各平台报价`} aria-expanded={isExpanded} aria-controls={detailId} onClick={() => inspect(row, true)}><ChevronDown size={16}/></button></td>
@@ -676,11 +723,14 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
           <div role="tabpanel" id={`${detailId}-content`} aria-labelledby={`${detailId}-tab-${detailTab}`} className="perp-detail-content"><Suspense fallback={<p role="status">正在加载组合详情…</p>}>
             {detailTab === "execution" ? <><PerpetualExecution long={row.long} short={row.short} active={interactionActive} now={now}/><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort}/><PerpetualTrend history={history} now={now} crossCurrency={row.crossCurrency}/></> : detailTab === "quality" ? <QualityEvidence row={row} report={qualityReport} quality={quality} venues={venues} now={now} slippagePercent={qualityBudget.slippagePercent}/> : detailTab === "exit" ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active={interactionActive && opportunitiesActive} now={now} onRegistered={() => { setInspection(null); setWorkspace("positions"); document.getElementById("perp-positions-tab")?.focus(); }}/> : <QuoteDetails crossex={crossex} quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={data?.staleAfterMs ?? 30_000}/>}
           </Suspense></div>
+        </td></tr> : null}{openPageGroup && rowKey === lastShownKey && openPageGroup.others.length > shownChildren ? <tr className="scanner-group-more"><td colSpan={visibleColumns.length + 3}>
+          <span>{openPageGroup.base} 还有 {openPageGroup.others.length - shownChildren} 个组合未显示：每页最多同时读取 {SCANNER_ROW_BUDGET} 个组合的历史与指标。</span>
+          {filters.search !== openPageGroup.base ? <button type="button" onClick={() => { const base = openPageGroup.base; updateFilters({ search: base }); setOpenGroup(base); }}>只看 {openPageGroup.base}</button> : <button type="button" onClick={toggleGrouping}>关闭聚合后翻页查看</button>}
         </td></tr> : null}</Fragment>;
       })}</tbody></table>
       {!rows.length ? <div className="perp-empty"><span aria-hidden="true">—</span><strong>{!data || data.status === "connecting" ? "等待实时报价" : fundingSort ? "暂无符合条件的资金费机会" : "暂无符合条件的价差"}</strong><p>{rangeEmptyMessage || emptyMessage}</p>{quotes.length > 0 ? <button type="button" onClick={resetFilters}>重置筛选</button> : null}</div> : null}
     </div>}
-    <div className="perp-pagination"><span>{totalItems ? `${(visiblePage - 1) * pageSize + 1}–${Math.min(visiblePage * pageSize, totalItems)} / ${totalItems} ${view === "rank" ? "组合" : "报价"}` : `0 ${view === "rank" ? "组合" : "报价"}`}<small>每页 {pageSize} 条</small></span><div><button type="button" aria-label="上一页" disabled={visiblePage <= 1} onClick={() => changePage(visiblePage - 1)}><ChevronLeft size={16}/></button><span>{visiblePage} / {totalPages}</span><button type="button" aria-label="下一页" disabled={visiblePage >= totalPages} onClick={() => changePage(visiblePage + 1)}><ChevronRight size={16}/></button></div></div>
+    <div className="perp-pagination"><span>{totalItems ? `${(visiblePage - 1) * itemPageSize + 1}–${Math.min(visiblePage * itemPageSize, totalItems)} / ${totalItems} ${view === "rank" ? groups ? "币种" : "组合" : "报价"}` : `0 ${view === "rank" ? groups ? "币种" : "组合" : "报价"}`}<small>每页 {itemPageSize} {groups ? "个币种" : "条"}{groups ? ` · 共 ${ranking.length} 组合` : ""}</small></span><div><button type="button" aria-label="上一页" disabled={visiblePage <= 1} onClick={() => changePage(visiblePage - 1)}><ChevronLeft size={16}/></button><span>{visiblePage} / {totalPages}</span><button type="button" aria-label="下一页" disabled={visiblePage >= totalPages} onClick={() => changePage(visiblePage + 1)}><ChevronRight size={16}/></button></div></div>
     {view === "rank" ? <p className="scanner-data-note">点击数值列表头切换升降序，成交额、持仓量和报价可分别按多腿 / 空腿排序；排序覆盖全部筛选结果。资金费差统一折算 / 8h；年化按当前费率简单外推。24h、7 天和 30 天实际为已结算资金费净累计，非账户盈亏。成交额与持仓金额保留来源计价币，点击数值查看来源时间；指标以 30 秒为更新目标，历史每 5 分钟更新，首次回补期间显示采集状态。展开组合可查看双腿累计与成本估算。</p> : null}
     <details className="scanner-tools" open={toolsOpen} onToggle={event => setToolsOpen(event.currentTarget.open)}><summary>监控工具与设置<ChevronDown size={14}/></summary><div className="scanner-tools-content">
       <details className="scanner-advanced-filters"><summary>更多筛选与排序设置</summary>
@@ -693,6 +743,7 @@ function PerpetualPanel({ active = true, interactionActive = active, onSummary, 
         <div className="perp-filter-fields">
           <label>ROC 杠杆 / 倍<input aria-label="ROC 杠杆" type="number" min={1} max={20} step="0.1" value={capitalAssumptions.longLeverage} onChange={event => { const value = event.target.valueAsNumber; if (Number.isFinite(value)) changeCapitalAssumption({ longLeverage: value, shortLeverage: value }); }}/></label>
           <label>ROC 保证金缓冲 / %<input aria-label="ROC 保证金缓冲" type="number" min={0} max={100} step="1" value={capitalAssumptions.marginBufferPercent} onChange={event => { const value = event.target.valueAsNumber; if (Number.isFinite(value)) changeCapitalAssumption({ marginBufferPercent: value }); }}/></label>
+          <label>收益估算本金 / USDT<input aria-label="收益估算本金" type="number" min={1} max={10000000} step="any" value={principal} onChange={event => { const value = event.target.valueAsNumber; if (Number.isFinite(value)) setPrincipal(normalizeScannerPrincipal(value)); }}/></label>
           <label>ROC 持有 / 小时<input aria-label="ROC 持有小时" type="number" min={1} max={168} step="1" value={capitalAssumptions.holdingHours} onChange={event => { const value = event.target.valueAsNumber; if (Number.isFinite(value)) changeCapitalAssumption({ holdingHours: value }); }}/></label>
         </div>
         <p className="scanner-data-note">ROC 假设仅用于估算所需资本与资本回报，不改变交易所实际保证金；默认按两腿 3x、20% 缓冲、24 小时连续外推；资金费按同数量双腿的各自名义金额加权，假设退出价差归零。与按实际结算时点计数的 24h 估算口径不同。</p>

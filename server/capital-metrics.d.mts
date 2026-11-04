@@ -15,6 +15,8 @@ export interface PairCapitalEstimate {
 
 export interface PairRocEstimate {
   expectedNetPercent: number | null;
+  /** Funding carry per 8h as a percentage of the long notional; null when unavailable. */
+  fundingPercent8h: number | null;
   rocPercent: number | null;
   annualizedRocPercent: number | null;
   fundingRocAnnualizedPercent: number | null;
@@ -51,3 +53,14 @@ export function estimatePairRoc(input: {
   capitalPercent: number | null | undefined;
   holdingHours: number;
 }): PairRocEstimate;
+
+export interface BreakEvenEstimate {
+  status: "covered" | "hours" | "never" | "unavailable";
+  hours: number | null;
+  reason: string;
+}
+
+export function estimateBreakEvenHours(input: {
+  netSpreadPercent: number | null | undefined;
+  fundingPercent8h: number | null | undefined;
+}): BreakEvenEstimate;

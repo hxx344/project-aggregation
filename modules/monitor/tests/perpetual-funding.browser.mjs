@@ -41,7 +41,7 @@ async page => {
     if (location.origin !== localOrigin) return;
     if (sessionStorage.getItem('scanner-regression-seeded')) return;
     sessionStorage.setItem('scanner-regression-seeded', '1');
-    localStorage.removeItem('market-monitor:perpetual-scanner:v1');
+    localStorage.setItem('market-monitor:perpetual-scanner:v1', JSON.stringify({ version: 3, groupByBase: false }));
     localStorage.removeItem('market-monitor:perpetual-scanner-ranges:v1');
     localStorage.setItem('market-monitor:perpetual:v1', JSON.stringify({ version: 2, sortBy: 'gross' }));
     localStorage.setItem('market-monitor:perpetual-quality-budget:v1', JSON.stringify({ version: 2, takerOverrides: { binance: 0.05, gate: 0.05 }, slippagePercent: 0.10 }));
@@ -315,7 +315,7 @@ async page => {
     await columns.locator('summary').press('Escape');
     await page.locator('.perp-scanner:visible thead [data-column="history24h"]').waitFor();
     await page.locator('.perp-scanner:visible thead [data-column="time"]').waitFor({ state: 'detached' });
-    check(await page.locator('.perp-scanner:visible thead [data-column]').count() === 12, 'Restoring columns returns exactly the twelve defaults');
+    check(await page.locator('.perp-scanner:visible thead [data-column]').count() === 16, 'Restoring columns returns exactly the sixteen defaults');
     for (let attempt = 0; attempt < 100 && historyRequests.length === historyBeforePause; attempt++) await tick(100);
     check(historyRequests.length > historyBeforePause, 'Restoring the visible history column resumes its requests');
     priceAge = 29_000;

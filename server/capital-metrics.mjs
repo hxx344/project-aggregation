@@ -78,19 +78,20 @@ export function estimatePairCapital({ longPrice, shortPrice, longLeverage, short
  */
 export function estimatePairRoc({ netSpreadPercent, longFunding8h, shortFunding8h, shortNotionalPercent, capitalPercent, holdingHours }) {
   const capital = finite(capitalPercent) && capitalPercent > 0 ? capitalPercent : null;
-  if (capital === null) return { expectedNetPercent: null, rocPercent: null, annualizedRocPercent: null, fundingRocAnnualizedPercent: null, fundingPercent: null, fundingAvailable: false, reason: "所需资本缺失" };
-  if (!finite(netSpreadPercent)) return { expectedNetPercent: null, rocPercent: null, annualizedRocPercent: null, fundingRocAnnualizedPercent: null, fundingPercent: null, fundingAvailable: false, reason: "净价差缺失" };
+  if (capital === null) return { expectedNetPercent: null, fundingPercent8h: null, rocPercent: null, annualizedRocPercent: null, fundingRocAnnualizedPercent: null, fundingPercent: null, fundingAvailable: false, reason: "所需资本缺失" };
+  if (!finite(netSpreadPercent)) return { expectedNetPercent: null, fundingPercent8h: null, rocPercent: null, annualizedRocPercent: null, fundingRocAnnualizedPercent: null, fundingPercent: null, fundingAvailable: false, reason: "净价差缺失" };
   const hours = readNumber(holdingHours, DEFAULT_CAPITAL_ASSUMPTIONS.holdingHours, 1, 168);
   const fundingAvailable = finite(longFunding8h) && finite(shortFunding8h) && finite(shortNotionalPercent) && shortNotionalPercent > 0;
   const fundingPercent8h = fundingAvailable ? shortFunding8h * shortNotionalPercent - longFunding8h * 100 : null;
   const fundingPercent = fundingAvailable ? fundingPercent8h * (hours / 8) : null;
   const expectedNetPercent = netSpreadPercent + (fundingPercent ?? 0);
   const rocPercent = expectedNetPercent / capital * 100;
-  if (!finite(expectedNetPercent) || !finite(rocPercent)) return { expectedNetPercent: null, rocPercent: null, annualizedRocPercent: null, fundingRocAnnualizedPercent: null, fundingPercent, fundingAvailable, reason: "ROC 超出可计算范围" };
+  if (!finite(expectedNetPercent) || !finite(rocPercent)) return { expectedNetPercent: null, fundingPercent8h, rocPercent: null, annualizedRocPercent: null, fundingRocAnnualizedPercent: null, fundingPercent, fundingAvailable, reason: "ROC 超出可计算范围" };
   const annualizedRocPercent = rocPercent * (365 * 24 / hours);
   const fundingRocAnnualizedPercent = fundingAvailable ? (fundingPercent8h * 3 * 365) / capital * 100 : null;
   return {
     expectedNetPercent,
+    fundingPercent8h,
     rocPercent,
     annualizedRocPercent: finite(annualizedRocPercent) ? annualizedRocPercent : null,
     fundingRocAnnualizedPercent: finite(fundingRocAnnualizedPercent) ? fundingRocAnnualizedPercent : null,
@@ -98,4 +99,21 @@ export function estimatePairRoc({ netSpreadPercent, longFunding8h, shortFunding8
     fundingAvailable,
     reason: fundingAvailable ? "" : "资金费缺失，仅按价差收敛估算",
   };
+}
+
+/**
+ * Hours until continuous funding repays the entry cost, in the same scenario as
+ * `estimatePairRoc`: `netSpreadPercent` (round-trip fees, slippage and the entry
+ * spread converging to zero) plus `fundingPercent8h` (long-notional weighted).
+ * Statuses: `covered` when the net spread alone is already non-negative,
+ * `hours` when funding repays it, `never` when funding is zero or an expense,
+ * `unavailable` when either input is missing.
+ */
+export function estimateBreakEvenHours({ netSpreadPercent, fundingPercent8h }) {
+  if (!finite(netSpreadPercent)) return { status: "unavailable", hours: null, reason: "净价差缺失" };
+  if (netSpreadPercent >= 0) return { status: "covered", hours: 0, reason: "" };
+  if (!finite(fundingPercent8h)) return { status: "unavailable", hours: null, reason: "资金费缺失或过期" };
+  if (fundingPercent8h <= 0) return { status: "never", hours: null, reason: "当前资金费差不为正，持有不能回本" };
+  const hours = -netSpreadPercent / fundingPercent8h * 8;
+  return finite(hours) ? { status: "hours", hours, reason: "" } : { status: "unavailable", hours: null, reason: "回本时间超出可计算范围" };
 }

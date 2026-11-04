@@ -41,7 +41,7 @@ async page => {
   await page.addInitScript(({ origins, initial, preferenceKey, displayKey, rangeKey }) => {
     if (!origins.includes(location.origin)) return;
     localStorage.setItem(preferenceKey, JSON.stringify({ version: 2, sortBy: 'gross', minSpreadPercent: 0 }));
-    localStorage.removeItem(displayKey); localStorage.removeItem(rangeKey);
+    localStorage.setItem(displayKey, JSON.stringify({ version: 3, groupByBase: false })); localStorage.removeItem(rangeKey);
     const fixture = window.perpetualBackgroundFixture = { streams: [], created: 0, closed: 0, hidden: false, sequence: 0, initial };
     // Explicit visibility events are deterministic even when the test runner retains OS focus.
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => fixture.hidden });

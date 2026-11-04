@@ -20,7 +20,7 @@ async page => {
   await page.addInitScript(localOrigin => {
     if (location.origin !== localOrigin) return;
     localStorage.setItem('market-monitor:perpetual:v1', JSON.stringify({ version: 2, sortBy: 'gross' }));
-    localStorage.removeItem('market-monitor:perpetual-scanner:v1');
+    localStorage.setItem('market-monitor:perpetual-scanner:v1', JSON.stringify({ version: 3, groupByBase: false }));
   }, origin);
   try {
     await page.route('**/api/**', async route => {
