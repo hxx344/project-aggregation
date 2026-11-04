@@ -13,7 +13,7 @@ export type MarketChain = {
   id: string; name: string; enabled: boolean; rpcHost: string; status: 'idle' | 'loading' | 'ok' | 'error' | 'disabled';
   updatedAt: number | null; checkedAt: number | null; nextAt: number | null; error: string | null; errorAt: number | null;
   poolCount: number | null; activeCount: number | null; gaugeCount: number | null;
-  history: { points: number; from: number | null; archive: 'archive' | 'unavailable' | 'local' };
+  history: { points: number; from: number | null; archive: 'archive' | 'unavailable' | 'local'; pending: number };
 };
 export type MarketSnapshot = {
   schema: 1; revision: number; serverNow: number; unchanged?: false;

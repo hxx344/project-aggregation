@@ -33,7 +33,8 @@
 .am-detail-facts dd small{display:block;color:var(--text-tertiary);font-size:.625rem;margin-top:2px}
 .am-detail-facts code{font-size:.6875rem}
 .am-chart{margin:0;min-width:0}
-.am-chart figcaption{font-size:.6875rem;color:var(--text-tertiary);margin-bottom:6px}
+.am-chart figcaption{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:.6875rem;color:var(--text-tertiary);margin-bottom:6px}
+.am-chart .am-swap{min-height:26px;padding:2px 8px;font-size:.75rem}
 .am-chart .muted{display:flex;align-items:center;gap:6px;font-size:.75rem}
 .am-chart-box{height:240px}
 .am-more{display:flex;justify-content:center;padding:12px}
