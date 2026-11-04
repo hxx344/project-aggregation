@@ -7,6 +7,8 @@ const TTL_MS = 60_000;
 export const RECOVERY_SCHEMA_VERSION = 1;
 const HEARTBEAT_MS = 5_000;
 const SAFETY_MS = 10_000;
+// Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance.
+const ASTER_WRITE_EXPIRY_MS = 120_000;
 const AUTHORITIES = new Set(['binance', 'bybit', 'okx', 'gate-crossex', 'aster']);
 const ENVIRONMENTS = new Set(['mainnet', 'testnet', 'demo']);
 const SECRET_KEY = /^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$/i;
@@ -162,6 +164,16 @@ function intentMetadata(moduleId, keys, payload) {
   // ASTER compatibility cannot be granted by self-described intent plus arbitrary payload.
   if (moduleId === 'aster' && (Object.keys(payload).some((key) => !['intentAction', 'intentTarget', 'price', 'quantity', 'groupId'].includes(key)) || ['price', 'quantity'].some((key) => Object.hasOwn(payload, key) && !positiveDecimal(payload[key])))) fail('INVALID_INTENT_TARGET');
   return { action, targetHash: payloadHash([targetKey], semanticTarget) };
+}
+// An expired unknown Aster write next to a margin transfer no longer gates the other.
+// Aster signs each write with a nonce valid only 60 s around server time. An
+// unknown row was last updated after its send attempt ended, so past that
+// window plus clock tolerance the original cannot execute. A new margin
+// transfer ignores any such write; any new write ignores such a transfer.
+function expiredAsterWrite(operation, pending, time) {
+  return operation.module_id === 'aster' && pending.module_id === 'aster' && pending.state === 'unknown'
+    && (operation.intent_action === 'margin-transfer' || pending.intent_action === 'margin-transfer')
+    && time - Math.max(pending.created_at, pending.updated_at) >= ASTER_WRITE_EXPIRY_MS;
 }
 function reducesAmendRisk(operation, pending) {
   return operation.intent_action === 'cancel' && operation.intent_target_hash && pending.module_id === operation.module_id && pending.intent_action === 'amend' && pending.intent_target_hash === operation.intent_target_hash;
@@ -521,7 +533,7 @@ export class AccountWriter {
     if (ticket.bindings.some((binding) => !keys.has(binding.accountKey))) fail('INVALID_TICKET');
     return true;
   }
-  _validateSending(ticket) {
+  _validateSending(ticket, time) {
     identifier(ticket.operationId, 'INVALID_OPERATION_ID');
     const operation = this.db.prepare('SELECT * FROM aw_operations WHERE operation_id=?').get(ticket.operationId);
     if (!operation) fail('OPERATION_NOT_FOUND');
@@ -530,11 +542,12 @@ export class AccountWriter {
     if (operation.state !== 'sending') fail(operation.state === 'confirmed' ? 'ALREADY_SUBMITTED' : operation.state === 'rejected' ? 'ALREADY_REJECTED' : 'OPERATION_UNRESOLVED');
     for (const claim of ticket.claims) {
       const pending = this.db.prepare("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.operation_id<>? AND o.state IN ('sending','unknown')").all(claim.accountKey, ticket.operationId);
-      if (pending.some((row) => row.state === 'unknown' ? !reducesAmendRisk(operation, row) && !this._marginCompatible(operation, row) : operation.intent_action === 'margin-transfer' && !this._marginCompatible(operation, row))) fail('ACCOUNT_UNRESOLVED');
+      if (pending.some((row) => row.state === 'unknown' ? !reducesAmendRisk(operation, row) && !this._marginCompatible(operation, row) && !expiredAsterWrite(operation, row, time) : operation.intent_action === 'margin-transfer' && !this._marginCompatible(operation, row))) fail('ACCOUNT_UNRESOLVED');
     }
   }
   _marginCompatible(operation, pending) {
-    if (operation.module_id !== 'aster' || operation.intent_action !== 'margin-transfer' || !operation.intent_target_hash || pending.module_id !== 'aster' || !['order', 'leverage', 'amend', 'cancel'].includes(pending.intent_action) || !pending.intent_target_hash) return false;
+    if (operation.module_id !== 'aster' || operation.intent_action !== 'margin-transfer' || !operation.intent_target_hash || pending.module_id !== 'aster') return false;
+    if (!['order', 'leverage', 'amend', 'cancel'].includes(pending.intent_action) || !pending.intent_target_hash) return false;
     if (pending.state === 'unknown') return true;
     if (pending.state !== 'sending') return false;
     // A fenced ticket may have passed its final guard already. Its sender must also be dead.
@@ -556,7 +569,7 @@ export class AccountWriter {
   }
   assertOwned(ticket, budgetMs = 35_000) {
     const time = this._time();
-    return this._transaction(() => { this._validate(ticket, time, budgetMs); if (budgetMs > 0 && Object.hasOwn(ticket, 'operationId')) this._validateSending(ticket); return true; });
+    return this._transaction(() => { this._validate(ticket, time, budgetMs); if (budgetMs > 0 && Object.hasOwn(ticket, 'operationId')) this._validateSending(ticket, time); return true; });
   }
   _heartbeatStart() {
     if (this.timer) return;
@@ -603,7 +616,7 @@ export class AccountWriter {
       if (!importing) for (const key of keys) {
         const pending = this.db.prepare("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.state IN ('sending','unknown')").all(key);
         const proposed = { module_id: this.moduleId, intent_action: intent.action, intent_target_hash: intent.targetHash };
-        if (pending.some((row) => !reducesAmendRisk(proposed, row) && !this._marginCompatible(proposed, row) && (intent.action === 'margin-transfer' || row.state !== 'sending' || row.module_id !== this.moduleId || row.owner_id !== this.ownerId || row.group_id !== groupId || row.account_keys !== JSON.stringify(keys) || JSON.stringify(JSON.parse(row.ticket_json)) !== JSON.stringify(ticket)))) fail('ACCOUNT_UNRESOLVED');
+        if (pending.some((row) => !reducesAmendRisk(proposed, row) && !this._marginCompatible(proposed, row) && !expiredAsterWrite(proposed, row, time) && (intent.action === 'margin-transfer' || row.state !== 'sending' || row.module_id !== this.moduleId || row.owner_id !== this.ownerId || row.group_id !== groupId || row.account_keys !== JSON.stringify(keys) || JSON.stringify(JSON.parse(row.ticket_json)) !== JSON.stringify(ticket)))) fail('ACCOUNT_UNRESOLVED');
       }
       const state = importing ? 'unknown' : 'sending';
       this.db.prepare('INSERT INTO aw_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)').run(operationId, this.moduleId, hash, JSON.stringify(keys), this.ownerId, JSON.stringify(ticket), state, time, time, groupId, intent.action, intent.targetHash);
@@ -646,7 +659,7 @@ export class AccountWriter {
     return this._transaction(() => {
       this._validate(ticket, time, 0);
       const keys = new Set(ticket.claims.map((claim) => claim.accountKey));
-      return this.db.prepare("SELECT operation_id,body_hash,account_keys,state,created_at FROM aw_operations WHERE module_id=? AND state IN ('sending','unknown') ORDER BY created_at,operation_id").all(this.moduleId).filter((row) => JSON.parse(row.account_keys).every((key) => keys.has(key))).map((row) => ({ operationId: row.operation_id, bodyHash: row.body_hash, state: row.state, createdAt: row.created_at }));
+      return this.db.prepare("SELECT operation_id,body_hash,account_keys,state,created_at,updated_at FROM aw_operations WHERE module_id=? AND state IN ('sending','unknown') ORDER BY created_at,operation_id").all(this.moduleId).filter((row) => JSON.parse(row.account_keys).every((key) => keys.has(key))).map((row) => ({ operationId: row.operation_id, bodyHash: row.body_hash, state: row.state, createdAt: row.created_at, updatedAt: row.updated_at }));
     });
   }
   freeze(identities, reason = 'legacy-conflict') {

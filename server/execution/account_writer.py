@@ -25,6 +25,8 @@ TTL_MS = 60_000
 RECOVERY_SCHEMA_VERSION = 1
 HEARTBEAT_MS = 5_000
 SAFETY_MS = 10_000
+# Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance.
+ASTER_WRITE_EXPIRY_MS = 120_000
 AUTHORITIES = frozenset(("binance", "bybit", "okx", "gate-crossex", "aster"))
 ENVIRONMENTS = frozenset(("mainnet", "testnet", "demo"))
 SECRET_KEY = re.compile(r"^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$", re.I)
@@ -251,6 +253,19 @@ def _intent_metadata(module_id, keys, payload):
     if module_id == "aster" and (set(payload) - {"intentAction", "intentTarget", "price", "quantity", "groupId"} or any(key in payload and not _positive_decimal(payload[key]) for key in ("price", "quantity"))):
         _fail("INVALID_INTENT_TARGET")
     return {"action": action, "targetHash": _payload_hash([target_key], semantic_target)}
+
+
+def _expired_aster_write(operation, pending, current):
+    """An expired unknown Aster write next to a margin transfer no longer gates the other.
+
+    Aster signs each write with a nonce valid only 60 s around server time. An
+    unknown row was last updated after its send attempt ended, so past that
+    window plus clock tolerance the original cannot execute. A new margin
+    transfer ignores any such write; any new write ignores such a transfer.
+    """
+    return (operation["module_id"] == "aster" and pending["module_id"] == "aster" and pending["state"] == "unknown"
+            and "margin-transfer" in (operation["intent_action"], pending["intent_action"])
+            and current - max(pending["created_at"], pending["updated_at"]) >= ASTER_WRITE_EXPIRY_MS)
 
 
 def _reduces_amend_risk(operation, pending):
@@ -831,11 +846,11 @@ class AccountWriter:
             def action():
                 self._validate(ticket, current, budget_ms)
                 if budget_ms > 0 and "operationId" in ticket:
-                    self._validate_sending(ticket)
+                    self._validate_sending(ticket, current)
                 return True
             return self._transaction(action)
 
-    def _validate_sending(self, ticket):
+    def _validate_sending(self, ticket, current):
         _identifier(ticket["operationId"], "INVALID_OPERATION_ID")
         operation = self._db.execute("SELECT * FROM aw_operations WHERE operation_id=?", (ticket["operationId"],)).fetchone()
         if operation is None:
@@ -847,11 +862,13 @@ class AccountWriter:
             _fail("ALREADY_SUBMITTED" if operation["state"] == "confirmed" else "ALREADY_REJECTED" if operation["state"] == "rejected" else "OPERATION_UNRESOLVED")
         for claim in ticket["claims"]:
             pending = self._db.execute("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.operation_id<>? AND o.state IN ('sending','unknown')", (claim["accountKey"], ticket["operationId"])).fetchall()
-            if any((not _reduces_amend_risk(operation, row) and not self._margin_compatible(operation, row)) if row["state"] == "unknown" else (operation["intent_action"] == "margin-transfer" and not self._margin_compatible(operation, row)) for row in pending):
+            if any((not _reduces_amend_risk(operation, row) and not self._margin_compatible(operation, row) and not _expired_aster_write(operation, row, current)) if row["state"] == "unknown" else (operation["intent_action"] == "margin-transfer" and not self._margin_compatible(operation, row)) for row in pending):
                 _fail("ACCOUNT_UNRESOLVED")
 
     def _margin_compatible(self, operation, pending):
-        if operation["module_id"] != "aster" or operation["intent_action"] != "margin-transfer" or not operation["intent_target_hash"] or pending["module_id"] != "aster" or pending["intent_action"] not in ("order", "leverage", "amend", "cancel") or not pending["intent_target_hash"]:
+        if operation["module_id"] != "aster" or operation["intent_action"] != "margin-transfer" or not operation["intent_target_hash"] or pending["module_id"] != "aster":
+            return False
+        if pending["intent_action"] not in ("order", "leverage", "amend", "cancel") or not pending["intent_target_hash"]:
             return False
         if pending["state"] == "unknown":
             return True
@@ -955,7 +972,7 @@ class AccountWriter:
                 for key in keys:
                     pending = self._db.execute("SELECT o.* FROM aw_operation_accounts a JOIN aw_operations o ON o.operation_id=a.operation_id WHERE a.account_key=? AND o.state IN ('sending','unknown')", (key,)).fetchall()
                     proposed = {"module_id": self.module_id, "intent_action": intent["action"], "intent_target_hash": intent["targetHash"]}
-                    if any(not _reduces_amend_risk(proposed, row) and not self._margin_compatible(proposed, row) and (intent["action"] == "margin-transfer" or row["state"] != "sending" or row["module_id"] != self.module_id or row["owner_id"] != self.owner_id or row["group_id"] != group_id or row["account_keys"] != _json(keys) or json.loads(row["ticket_json"]) != ticket) for row in pending):
+                    if any(not _reduces_amend_risk(proposed, row) and not self._margin_compatible(proposed, row) and not _expired_aster_write(proposed, row, current) and (intent["action"] == "margin-transfer" or row["state"] != "sending" or row["module_id"] != self.module_id or row["owner_id"] != self.owner_id or row["group_id"] != group_id or row["account_keys"] != _json(keys) or json.loads(row["ticket_json"]) != ticket) for row in pending):
                         _fail("ACCOUNT_UNRESOLVED")
             state = "unknown" if importing else "sending"
             self._db.execute("INSERT INTO aw_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (operation_id, self.module_id, body_hash, _json(keys), self.owner_id, _json(ticket), state, current, current, group_id, intent["action"], intent["targetHash"]))
@@ -1020,8 +1037,8 @@ class AccountWriter:
         def action():
             self._validate(ticket, current, 0)
             keys = {claim["accountKey"] for claim in ticket["claims"]}
-            rows = self._db.execute("SELECT operation_id,body_hash,account_keys,state,created_at FROM aw_operations WHERE module_id=? AND state IN ('sending','unknown') ORDER BY created_at,operation_id", (self.module_id,)).fetchall()
-            return [{"operationId": row["operation_id"], "bodyHash": row["body_hash"], "state": row["state"], "createdAt": row["created_at"]} for row in rows if set(json.loads(row["account_keys"])).issubset(keys)]
+            rows = self._db.execute("SELECT operation_id,body_hash,account_keys,state,created_at,updated_at FROM aw_operations WHERE module_id=? AND state IN ('sending','unknown') ORDER BY created_at,operation_id", (self.module_id,)).fetchall()
+            return [{"operationId": row["operation_id"], "bodyHash": row["body_hash"], "state": row["state"], "createdAt": row["created_at"], "updatedAt": row["updated_at"]} for row in rows if set(json.loads(row["account_keys"])).issubset(keys)]
 
         return self._transaction(action)
 

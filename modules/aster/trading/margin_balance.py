@@ -38,23 +38,19 @@ TRANSFER_UNIT = Fraction(Decimal("0.00000001"))
 TRANSFER_WS_GRACE_SECONDS = 2
 TRANSFER_HISTORY_QUERY_LIMIT = 3
 TRANSFER_HISTORY_WAIT_SECONDS = 120
-# A skipped unknown transfer is settled only from history. One early read
-# after the observation window may confirm it; rejection needs two empty reads
-# at least SPACING apart, both taken after the whole SPAN has passed so a late
-# processed request is inside the window. The window also starts TOLERANCE
-# before the local send time to absorb clock skew. Failed or partial reads are
-# bounded by TRANSFER_HISTORY_QUERY_LIMIT, then a person settles it. The shared
-# admission refuses new writes on both accounts until then, so SPAN trades a
-# trading pause against a transfer the exchange processes minutes late; a wrong
-# rejection only moves funds between the pair's own sub-accounts again.
-TRANSFER_ABSENCE_READS = 2
-TRANSFER_ABSENCE_SPACING_SECONDS = 30
+# Aster v3 accepts a signed write only while its microsecond nonce is within
+# 60 s of server time; there is no recvWindow (API docs; live enforcement not
+# probed). The nonce is signed just before dispatch and the shared row turns
+# unknown only after the send attempt ended, so 60 s after the row's last
+# update, plus 60 s for clock skew, the original can no longer execute. An
+# expired unknown transfer is then settled without further evidence: one
+# history read over [created - TOLERANCE, created + SPAN] only labels it
+# confirmed (one-to-one receipts) or rejected (anything else, including a
+# failed read). The label is audit only: balances are re-read either way and a
+# wrong rejection at worst moves funds between the pair's own sub-accounts.
+TRANSFER_NONCE_EXPIRY_SECONDS = 120
 TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 180
 TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
-# Seen receipts are evidence that the transfer may exist. Once one is stored,
-# empty reads no longer count toward rejection; a person settles it at the
-# bound unless both sides later match the same receipt.
-TRANSFER_EVIDENCE_LIMIT = 20
 # /income returns at most one page of 1000 rows per window and an active
 # account may fill it with commissions and fills. A full page is split by
 # time (both halves share the midpoint, so either endTime convention is
@@ -63,8 +59,12 @@ TRANSFER_EVIDENCE_LIMIT = 20
 # incomplete.
 TRANSFER_INCOME_PAGE_ROWS = 1000
 TRANSFER_INCOME_MAX_PAGES = 8
+# A local quota wait or exchange throttle reads nothing, so the label waits
+# for it, but only this long past expiry: settling must never depend on it.
+TRANSFER_LABEL_DEFER_SECONDS = 300
+TRANSFER_SETTLE_COOLDOWN_SECONDS = 30
+TRANSFER_SWEEP_SECONDS = 30
 SETTLE_WAIT = "结算前共享准入暂停该组账户的新写入，原请求不会重发"
-SETTLE_MANUAL = "请人工核对交易所划转记录后结算原请求；结算前共享准入暂停该组账户的新写入，原请求不会重发"
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
     -1102, -1103, -1104, -1105, -1106, -1111, -1130, -2014, -2015, -2019})
 
@@ -191,6 +191,7 @@ class MarginBalancer:
         self.engine = engine
         self.store = engine.store
         self.refreshed_snapshots = None
+        self._swept_at = {}
 
     def _members(self, pair):
         members = {side: self.store.account(pair[side + "_account_id"]) for side in ("long", "short")}
@@ -225,9 +226,9 @@ class MarginBalancer:
 
     @staticmethod
     def unsettled_shared(state):
-        """A rejection proof or a skipped unknown transfer still holds a shared write."""
-        return MarginBalancer.unsettled_rejection(state) or (
-            isinstance(state, dict) and state.get("unsettled_transfers") not in (None, []))
+        """A rejection proof or an unknown transfer write still holds a shared write."""
+        return MarginBalancer.unsettled_rejection(state) or (isinstance(state, dict) and (
+            state.get("unsettled_transfers") not in (None, []) or state.get("unsettled_operations") not in (None, [])))
 
     @staticmethod
     def resume_ready(state):
@@ -304,14 +305,15 @@ class MarginBalancer:
             done = {**pending, "status": "skipped", "refresh_source": "rest"}
             updated = {**state, "pending": None, "last_transfer": done}
             # Skipping only releases the private reservation. The exact shared
-            # write stays unknown until bounded history settles it before the
+            # write stays unknown until it expires and is settled before the
             # next transfer; otherwise every later transfer is ACCOUNT_UNRESOLVED.
             follow_up = {key: deepcopy(pending[key]) for key in ("request_id", "source", "destination", "amount",
                 "created_at", "identity", "transaction_id", "before_receipts")
                 if key in pending and (pending[key] or key not in ("transaction_id", "before_receipts"))}
             if writer_for(self.engine).enabled:
-                updated["unsettled_transfers"] = [*state.get("unsettled_transfers", []),
-                    {**follow_up, "failures": 0, "empty": 0, "evidence": []}]
+                # failures/empty/evidence keep the record valid for the previous release.
+                follow_up.update(failures=0, empty=0, evidence=[])
+                updated["unsettled_transfers"] = [*state.get("unsettled_transfers", []), follow_up]
             for field in ("api_notice", "blocked_reason", "retry_without_blocking"):
                 updated.pop(field, None)
             archive = {"pair_id": pair["id"], "original": pending, "result": done,
@@ -334,6 +336,10 @@ class MarginBalancer:
                     broker.require_snapshot_current(snapshots[side])
                 now = time.time()
                 done.update(skipped_at=now, refreshed_at=now)
+                if "unsettled_transfers" in updated:
+                    # The sender ended before this skip, so a write still
+                    # "sending" cannot be signed later than this moment.
+                    updated["unsettled_transfers"][-1]["skipped_at"] = now
                 updated.update(
                     cooldown_until=max(state.get("cooldown_until", 0), now + config["cooldown_seconds"]),
                     next_check_at=max(state.get("next_check_at", 0), now + config["check_interval_seconds"]))
@@ -566,7 +572,7 @@ class MarginBalancer:
             return view("blocked", "划转拒绝回执已保存，等待恢复共享结算；完成前保留原配对配置和账户绑定", blocks=True)
         pending = journal.get("pending")
         records = journal.get("unsettled_transfers")
-        if pending is None and records not in (None, []):
+        if pending is None and (records not in (None, []) or journal.get("unsettled_operations") not in (None, [])):
             # Mirrors _settle_skipped(): visible even while disabled or paused.
             # The latest check explains the exact step; the durable follow-up
             # guarantees that explanation is still current.
@@ -575,11 +581,7 @@ class MarginBalancer:
                     and runtime_view.get("status") in {"unknown", "blocked"}
                     and isinstance(runtime_view.get("reason"), str)):
                 return view(runtime_view["status"], runtime_view["reason"], blocks=True)
-            exhausted = not isinstance(records, list) or any(not MarginBalancer._valid_unsettled(record)
-                or record["failures"] >= TRANSFER_HISTORY_QUERY_LIMIT for record in records)
-            if exhausted:
-                return view("blocked", "上次结果未知的划转无法自动核实；" + SETTLE_MANUAL, blocks=True)
-            return view("unknown", "上次划转结果未知，系统正在有限次核对两侧划转流水并结算；" + SETTLE_WAIT, blocks=True)
+            return view("unknown", "上次划转结果未知，等待原请求过期后自动结算；" + SETTLE_WAIT, blocks=True)
         if pending is not None:
             if not isinstance(pending, dict) or pending.get("status") not in {"submitting", "unknown", "accepted", "acknowledged"}:
                 return view("blocked", "保证金划转待核对记录无效，停止新开仓和新划转；请人工核对服务器日志与交易所划转记录", blocks=True)
@@ -632,10 +634,6 @@ class MarginBalancer:
                     raise TradingError(f"划转流水超过 {TRANSFER_INCOME_MAX_PAGES} 段读取上限，无法完整核对")
                 pages += 1
                 page = self._income_page(broker, low, high, reconciliation, observation)
-                if observation is not None:
-                    # Receipts already read stay usable as evidence when a
-                    # later page or side fails.
-                    observation.setdefault("rows", {}).setdefault(side, []).extend(page)
                 if len(page) >= TRANSFER_INCOME_PAGE_ROWS:
                     if high - low <= 1:
                         raise TradingError("划转流水在极短时间窗内超过单页上限，无法完整核对")
@@ -720,24 +718,16 @@ class MarginBalancer:
 
     @staticmethod
     def _valid_unsettled(record):
+        # Older follow-ups also carry failures/empty/queried_at/evidence; they are unused.
         if not (isinstance(record, dict) and _identifier(record.get("request_id"))
                 and {record.get("source"), record.get("destination")} == {"long", "short"}
                 and isinstance(record.get("identity"), str)
                 and type(record.get("created_at")) in (int, float) and math.isfinite(record["created_at"])
                 and record["created_at"] > 0
-                and type(record.get("failures")) is int and 0 <= record["failures"] <= TRANSFER_HISTORY_QUERY_LIMIT
-                and type(record.get("empty")) is int and 0 <= record["empty"] <= TRANSFER_ABSENCE_READS
-                and ("queried_at" not in record or type(record["queried_at"]) in (int, float)
-                     and math.isfinite(record["queried_at"]))
                 and isinstance(record.get("before_receipts", {}), dict)
+                and all(isinstance(value, list) and all(isinstance(item, list) for item in value)
+                        for value in record.get("before_receipts", {}).values())
                 and (record.get("transaction_id") is None or _identifier(record["transaction_id"]))):
-            return False
-        evidence = record.get("evidence", [])
-        if not (isinstance(evidence, list) and len(evidence) <= TRANSFER_EVIDENCE_LIMIT
-                and all(isinstance(item, list) and len(item) == 3 and item[0] in ("long", "short")
-                        and item[1] in TRANSFER_TYPES and _identifier(item[2]) == item[2] for item in evidence)
-                # Evidence voids any absence streak; both at once is corrupt.
-                and not (evidence and record["empty"])):
             return False
         try:
             positive(record.get("amount"))
@@ -746,197 +736,195 @@ class MarginBalancer:
         return True
 
     def _settle_skipped(self, pair, members, state, config):
-        """Settle the shared write of a skipped unknown transfer; never resend it.
+        """Settle expired unknown transfer writes of this pair; never resend.
 
-        Returns the view to show while it is unsettled, else None. Until then
-        the shared admission refuses new writes on these accounts, so every
-        view says trading waits; an unexpected failure only delays the check.
+        Returns the view to show while one is still unexpired, else None. The
+        shared admission refuses new writes on these accounts until then, so
+        every view says trading waits; an unexpected failure only delays it.
         """
+        known = state.get("unsettled_transfers") is not None or state.get("unsettled_operations") not in (None, [])
+        if not known and (not config["enabled"] or any(member["mode"] != "live" for member in members.values())):
+            # Paper pairs keep no shared write; without balancing the master
+            # binding is released, so the sweep would only fail to bind.
+            return None
+        now = time.time()
+        if not known and now < self._swept_at.get(pair["id"], 0):
+            return None
         try:
             return self._settle_skipped_records(pair, members, state, config)
         except Exception as exc:  # noqa: BLE001 - surface as a retry, never crash the tick
-            LOG.warning("pair %s skipped transfer settlement failed: %s", pair["id"], type(exc).__name__)
+            LOG.warning("pair %s unknown transfer settlement failed: %s", pair["id"], type(exc).__name__)
+            if not known:
+                self._swept_at[pair["id"]] = now + TRANSFER_SWEEP_SECONDS
+                return None
             return self._view(state, config, "unknown", "未知划转的共享结算暂未完成（" + str(exc)[:200]
-                + "），稍后重试；" + SETTLE_WAIT, blocks=True)
+                + "），稍后自动重试；" + SETTLE_WAIT, blocks=True)
 
     def _settle_skipped_records(self, pair, members, state, config):
-        """Confirm from one-to-one receipts, reject from two late empty reads."""
-        records = state.get("unsettled_transfers")
-        if records is None:
-            return None
+        """Settle every expired unknown transfer write; history only labels it."""
         key = "pair_margin:" + pair["id"]
         writer = writer_for(self.engine)
+        records = state.get("unsettled_transfers")
         if not writer.enabled:
             # Standalone runs keep no shared write to settle.
-            state.pop("unsettled_transfers", None)
-            self.store.put(key, state)
+            if records is not None or "unsettled_operations" in state:
+                state.pop("unsettled_transfers", None)
+                state.pop("unsettled_operations", None)
+                self.store.put(key, state)
             return None
-        view = lambda status, reason: self._view(state, config, status, reason, blocks=True)
-        if not isinstance(records, list) or any(not self._valid_unsettled(record) for record in records):
-            return view("blocked", "未知划转的结算记录无效；" + SETTLE_MANUAL)
-        migrated = False
-        for record in records:
-            if "evidence" not in record:
-                # Written before evidence was kept: a partial or failed read
-                # may sit between its empty reads, so restart the run.
-                if record["failures"] and record["empty"]:
-                    record["empty"] = 0
-                record["evidence"] = []
-                migrated = True
-        if migrated:
-            self.store.put(key, state)
+        if records is not None and (not isinstance(records, list)
+                                    or any(not self._valid_unsettled(record) for record in records)):
+            # A corrupt follow-up cannot label anything; the sweep below still
+            # settles its shared write once the original has expired.
+            LOG.warning("pair %s dropped invalid unsettled transfer records", pair["id"])
+            state["unsettled_transfers"] = records = []
+        records = records or []
         ids = [member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]
+        prefixes = ("aster:transfer:", "aster:legacy:pair_margin:" + pair["id"] + ":")
+        with writer.accounts(ids) as ticket:
+            rows = writer.registry.unresolved(ticket) if ticket is not None else []
+        rows = {row["operationId"]: row for row in rows if row["operationId"].startswith(prefixes)}
+        now = time.time()
+
+        def expires_at(row, floor=0):
+            return max(row["createdAt"] / 1000, row["updatedAt"] / 1000, floor) + TRANSFER_NONCE_EXPIRY_SECONDS
+
+        view = lambda status, reason: self._view(state, config, status, reason, blocks=True)
         settled = []
         while records:
             record = records[0]
-            label = "上次划转（" + record["request_id"][:8] + "）结果未知"
-            exhausted = record["failures"] >= TRANSFER_HISTORY_QUERY_LIMIT
-            now = time.time()
-            created = record["created_at"]
-            span_end = created + TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS
-            ready_at = created + TRANSFER_HISTORY_WAIT_SECONDS
-            if "queried_at" in record:
-                ready_at = max(ready_at, record["queried_at"] + TRANSFER_ABSENCE_SPACING_SECONDS)
-                if record["queried_at"] < span_end:
-                    # The early read was not conclusive; wait for the full span.
-                    ready_at = max(ready_at, span_end)
-            if not exhausted and now < ready_at:
-                progress = "已有 1 次完整时间窗内两侧均无该笔划转，" if record["empty"] else ""
-                return view("unknown", label + "，" + progress + "等待观察时间结束后核对两侧划转流水"
-                    + _remaining_time(ready_at, now) + "；" + SETTLE_WAIT)
-            # Identity first: a shared row that the current accounts cannot see
-            # must not be read as already settled.
-            try:
-                self._verify_pending_identity(pair, members, record)
-            except TradingError as exc:
-                return view("blocked", label + "，" + str(exc) + "；恢复原账户凭据后自动继续核对。"
-                    "原账户已不可用时需人工核对交易所划转记录并处理；" + SETTLE_WAIT)
             candidates = ("aster:transfer:" + record["request_id"],
                           "aster:legacy:pair_margin:" + pair["id"] + ":" + record["request_id"])
-            with writer.accounts(ids) as ticket:
-                open_ids = {row["operationId"] for row in writer.registry.unresolved(ticket)} if ticket is not None else set()
-            open_ops = [value for value in candidates if value in open_ids]
+            # A skipped write may still be "sending" when its shared finish
+            # failed or the process died mid-send; the skip proves the sender
+            # ended, so it is settled the same way.
+            open_ops = [value for value in candidates if value in rows]
             if not open_ops:
-                # Settled elsewhere, including by a person after the bound.
+                # Settled elsewhere, or no longer on these accounts.
                 records.pop(0)
                 self.store.put(key, state)
                 continue
-            if exhausted:
-                return view("blocked", label + f"，{TRANSFER_HISTORY_QUERY_LIMIT} 次流水核对仍无法确认；" + SETTLE_MANUAL)
-            if record["empty"] >= TRANSFER_ABSENCE_READS and not record.get("evidence"):
-                # The absence proof is durable; an earlier settle failed.
-                self._resolve_skipped(writer, ids, open_ops, rejected=True)
-                settled.append("rejected")
-                records.pop(0)
+            if type(record.get("skipped_at")) not in (int, float) or not math.isfinite(record["skipped_at"]):
+                archive = self.store.get("pair_margin_skipped:" + pair["id"] + ":" + record["request_id"])
+                skipped = archive.get("result", {}).get("skipped_at") if isinstance(archive, dict) else None
+                # Without a durable skip time, expiry runs from first sight.
+                record["skipped_at"] = skipped if type(skipped) in (int, float) and math.isfinite(skipped) else now
                 self.store.put(key, state)
-                continue
-            start = int((created - TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
-            end = int(min(now, span_end) * 1000)
-            complete = now >= span_end
-            observation = {}
-            try:
-                rows = self._income(members, start, end, reconciliation=True, observation=observation)
-            except ExchangeError as exc:
-                notice = api_wait_notice(exc)
-                if observation.get("queried"):
-                    record["queried_at"] = now
-                    if notice is None:
-                        # A failed read breaks the run of empty reads.
-                        record.update(failures=record["failures"] + 1, empty=0)
-                    self._keep_evidence(record, observation, state, start, end)
-                    self.store.put(key, state)
-                return view("unknown", label + "，流水核对未完成（" + (notice["text"] if notice else self._read_error_detail(exc))
-                    + "），稍后有限次重试；" + SETTLE_WAIT)
-            except TradingError as exc:
-                if observation.get("queried"):
-                    record.update(queried_at=now, failures=record["failures"] + 1, empty=0)
-                    self._keep_evidence(record, observation, state, start, end)
-                    self.store.put(key, state)
-                return view("unknown", label + "，流水核对失败：" + str(exc) + "；稍后有限次重试，" + SETTLE_WAIT)
-            # Persist the read before deciding, so a later failure still
-            # leaves the read spaced and bounded.
-            record["queried_at"] = now
-            self.store.put(key, state)
-            source, destination = self._receipt_matches(record, rows, state, start, end)
-            common = source & destination
-            evidence = record.get("evidence", [])
-            if (len(common) == 1 and len(source) == 1 and len(destination) == 1
-                    and all((item[1], item[2]) in common for item in evidence)):
-                kind, txn = common.pop()
-                self._resolve_skipped(writer, ids, open_ops)
-                # Recorded after settling: recording first and crashing would
-                # hide this receipt from the next read and fake an absence.
-                # Crashing in between only leaves this receipt unrecorded.
-                state["used_receipts"] = (state.get("used_receipts", []) + [[kind, txn]])[-100:]
-                settled.append("confirmed")
-            elif not source and not destination and evidence:
-                # An earlier read saw part of this transfer; an empty read now
-                # means the history view is unstable, not that it never landed.
-                record["failures"] += 1
+            ready_at = max([expires_at(rows[value], record["skipped_at"] if rows[value]["state"] == "sending" else 0)
+                            for value in open_ops] + [record["created_at"] + TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS])
+            if now < ready_at:
+                self._swept_at.pop(pair["id"], None)
+                return view("unknown", "上次划转（" + record["request_id"][:8] + "）结果未知，等待原请求过期"
+                    + _remaining_time(ready_at, now) + "后自动结算；" + SETTLE_WAIT)
+            label = record.get("label")
+            if not isinstance(label, dict):
+                try:
+                    receipt, note = self._label_expired(pair, members, state, record, now, ready_at,
+                        defer=now < ready_at + TRANSFER_LABEL_DEFER_SECONDS)
+                except ExchangeError as exc:
+                    self._swept_at.pop(pair["id"], None)
+                    return view("unknown", "上次划转（" + record["request_id"][:8] + "）已过有效期，流水读取等待限流（"
+                        + api_wait_notice(exc)["text"] + "），稍后自动结算；" + SETTLE_WAIT)
+                # Persisted first: a failed settle retries without another read.
+                record["label"] = label = {"receipt": list(receipt)} if receipt is not None else {"note": note}
                 self.store.put(key, state)
-                return view("unknown", label + "，此前已读到该笔划转的部分流水，本次两侧均未读到；"
-                    "不按未送达结算，继续有限次核对；" + SETTLE_WAIT)
-            elif not source and not destination:
-                if complete:
-                    record["empty"] += 1
-                self.store.put(key, state)
-                if record["empty"] < TRANSFER_ABSENCE_READS:
-                    later = ("约 " + str(TRANSFER_ABSENCE_SPACING_SECONDS) + " 秒后再核对一次" if complete
-                             else "完整时间窗结束后再核对两次")
-                    return view("unknown", label + "，本次两侧流水均无该笔划转；" + later + "；" + SETTLE_WAIT)
-                self._resolve_skipped(writer, ids, open_ops, rejected=True)
-                settled.append("rejected")
-            else:
-                # Partial or conflicting receipts: keep them as durable proof
-                # that the transfer may exist, so later empty reads cannot
-                # reject it.
-                record["failures"] += 1
-                overflow = self._add_evidence(record, source, destination)
-                self.store.put(key, state)
-                if overflow:
-                    return view("blocked", label + "，两侧流水出现过多冲突回执；" + SETTLE_MANUAL)
-                return view("unknown", label + "，两侧流水只部分匹配，继续有限次核对；" + SETTLE_WAIT)
+            receipt = label.get("receipt")
+            receipt = receipt if isinstance(receipt, list) and len(receipt) == 2 else None
+            self._resolve_skipped(writer, ids, open_ops, rejected=receipt is None)
+            if receipt is not None:
+                # Recorded after settling: crashing in between only leaves this
+                # receipt unrecorded, never a settled write still open.
+                state["used_receipts"] = (state.get("used_receipts", []) + [receipt])[-100:]
+            outcome = "confirmed" if receipt is not None else "rejected"
+            settled.append(outcome)
+            self._audit_expired(pair, record["request_id"], outcome, label.get("note"), now)
+            for value in open_ops:
+                rows.pop(value)
             records.pop(0)
             self.store.put(key, state)
+        # Rows without a follow-up: written before this version, recorded by a
+        # crashed process, or whose follow-up was corrupt. No private pending
+        # exists here (the tick returns earlier), so nothing of ours is in
+        # flight. Only "unknown" rows qualify: a "sending" row without a skip
+        # may still belong to a live sender.
+        rows = {value: row for value, row in rows.items() if row["state"] == "unknown"}
+        expired = sorted(value for value, row in rows.items() if now >= expires_at(row))
+        if expired:
+            self._resolve_skipped(writer, ids, expired, rejected=True)
+            for operation_id in expired:
+                LOG.info("pair %s settled expired unknown transfer %s as rejected", pair["id"], operation_id)
+            settled.append("rejected")
+        waiting = sorted(value for value in rows if value not in expired)
+        # The durable marker keeps the master binding and the pair guards
+        # until every open row is settled, even if balancing is disabled.
+        before = (state.get("unsettled_transfers"), state.get("unsettled_operations"))
         state.pop("unsettled_transfers", None)
-        if not settled:
+        if waiting:
+            state["unsettled_operations"] = waiting
+        else:
+            state.pop("unsettled_operations", None)
+        if (state.get("unsettled_transfers"), state.get("unsettled_operations")) != before or settled:
             self.store.put(key, state)
+        if waiting:
+            self._swept_at.pop(pair["id"], None)
+            if not settled:
+                ready_at = max(expires_at(rows[value]) for value in waiting)
+                return view("unknown", "存在结果未知的旧划转，等待原请求过期" + _remaining_time(ready_at, now)
+                    + "后自动结算；" + SETTLE_WAIT)
+        else:
+            self._swept_at[pair["id"]] = now + TRANSFER_SWEEP_SECONDS
+        if not settled:
             return None
         # Do not plan a new transfer in the same check that settled the old
-        # one: wait a cooldown and start again from fresh balances.
-        now = time.time()
+        # one: balances may have moved, so wait a cooldown and read them again.
         state["cooldown_until"] = max(state.get("cooldown_until", 0),
-            now + max(config["cooldown_seconds"], TRANSFER_ABSENCE_SPACING_SECONDS))
+            now + max(config["cooldown_seconds"], TRANSFER_SETTLE_COOLDOWN_SECONDS))
         self.store.put(key, state)
-        if "confirmed" in settled:
-            self._invalidate(members)
-        outcome = "已由两侧流水核实到账" if settled[-1] == "confirmed" else "已核实未送达并结算"
+        self._invalidate(members)
+        outcome = "已由两侧流水核实到账" if settled == ["confirmed"] else "已过有效期并自动结算"
         return self._view(state, config, "cooldown", "上次结果未知的划转" + outcome
                           + "；冷却结束后按最新余额重新评估，原请求不会重发")
 
-    @staticmethod
-    def _add_evidence(record, source, destination):
-        evidence = record.get("evidence", [])
-        seen = [[side, kind, txn] for side, found in ((record["source"], source),
-                (record["destination"], destination)) for kind, txn in sorted(found)]
-        merged = evidence + [item for item in seen if item not in evidence]
-        if not merged:
-            return False
-        overflow = len(merged) > TRANSFER_EVIDENCE_LIMIT
-        if overflow:
-            # Too many conflicting receipts to check later: a person decides.
-            merged = merged[:TRANSFER_EVIDENCE_LIMIT]
-            record["failures"] = TRANSFER_HISTORY_QUERY_LIMIT
-        record.update(empty=0, evidence=merged)
-        return overflow
+    def _label_expired(self, pair, members, state, record, now, ready_at, *, defer=False):
+        """Label an expired write for audit: (receipt, None) or (None, note).
 
-    def _keep_evidence(self, record, observation, state, start, end):
-        """Keep receipts from the pages a failed read did complete; never confirm from them."""
-        rows = observation.get("rows") or {}
-        if rows:
-            source, destination = self._receipt_matches(
-                record, {side: rows.get(side, []) for side in ("long", "short")}, state, start, end)
-            self._add_evidence(record, source, destination)
+        With ``defer`` a quota wait or throttle is raised instead, so the label
+        comes from an actual read once the limit clears.
+        """
+        try:
+            self._verify_pending_identity(pair, members, record)
+        except TradingError:
+            return None, "账户身份已变化，未核对流水"
+        created = record["created_at"]
+        start = int((created - TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
+        # Up to expiry: a restore or late finish can move it past the span.
+        end = int(min(now, max(created + TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS, ready_at)) * 1000)
+        try:
+            rows = self._income(members, start, end, reconciliation=True)
+        except (ExchangeError, TradingError) as exc:
+            if defer and api_wait_notice(exc) is not None:
+                raise
+            # Remote response text is never published; local reasons are.
+            detail = self._read_error_detail(exc) if isinstance(exc, ExchangeError) else str(exc)[:120]
+            return None, "流水暂不可读（" + (detail or type(exc).__name__) + "）"
+        source, destination = self._receipt_matches(record, rows, state, start, end)
+        common = source & destination
+        if len(common) == 1 and len(source) == 1 and len(destination) == 1:
+            return common.pop(), None
+        return None, "两侧流水均无该笔划转" if not source and not destination else "两侧流水只部分匹配"
+
+    def _audit_expired(self, pair, request_id, outcome, note, now):
+        LOG.info("pair %s unknown transfer %s settled by expiry as %s%s", pair["id"], request_id[:8], outcome,
+                 ": " + note if note else "")
+        key = "pair_margin_skipped:" + pair["id"] + ":" + request_id
+        try:
+            archive = self.store.get(key)
+            if isinstance(archive, dict):
+                archive["settlement"] = {"outcome": outcome, "settled_at": now, "by": "expiry",
+                                         **({"note": note} if note else {})}
+                self.store.put(key, archive)
+        except Exception:  # noqa: BLE001 - audit only; the shared write is already settled
+            LOG.warning("pair %s transfer settlement audit failed", pair["id"])
 
     @staticmethod
     def _resolve_skipped(writer, ids, operation_ids, *, rejected=False):
@@ -1183,9 +1171,9 @@ class MarginBalancer:
                 if pending["status"] == "acknowledged":
                     return self._refresh_acknowledged(pair, members, state, config)
                 return self._reconcile(pair, members, state, config)
-            # Settle a skipped unknown transfer even while balancing is disabled
+            # Settle expired unknown transfers even while balancing is disabled
             # or the pair is paused, so a later urgent transfer is not the first
-            # to meet the blocker. Its own spacing bounds the reads.
+            # to meet the blocker. Each write is read at most once, for a label.
             held = None if self.engine.workspace.active else self._settle_skipped(pair, members, state, config)
             if self.engine.workspace.active:
                 reason = "工作台维护中，暂停新划转"

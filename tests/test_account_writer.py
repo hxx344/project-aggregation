@@ -13,7 +13,7 @@ import unittest
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server" / "execution"))
-from account_writer import AccountWriter, AccountWriterError, account_key
+from account_writer import ASTER_WRITE_EXPIRY_MS, AccountWriter, AccountWriterError, account_key
 
 
 def identity(account_id="112233445566", **extra):
@@ -172,6 +172,47 @@ class AccountWriterTests(unittest.TestCase):
             writer.resolve(operation_id, ticket, "rejected")
         self.assertTrue(writer.assert_owned(transfer))
         self.error("INVALID_INTENT_TARGET", lambda: writer.import_unknown(ticket, "forged-amend", {"intentAction": "amend", "intentTarget": {"accountKey": account_key(margin_identities()[0]), "symbol": "BTCUSDT", "clientOrderId": "old"}, "transfer": {"amount": "1"}}))
+
+    def test_expired_aster_unknown_writes_stop_gating_margin_transfers(self):
+        writer = self.writer("aster")
+        values = margin_identities()
+        ticket = self.ticket(writer, values)
+        order_ticket = subset_ticket(ticket, [account_key(values[0])])
+        old = writer.prepare(ticket, "old-transfer", margin_payload())
+        writer.finish(old, "unknown")
+        writer.import_unknown(ticket, "old-opaque", {"kind": "order", "purpose": "margin"})
+
+        def age(milliseconds, column="created_at,updated_at"):
+            with closing(sqlite3.connect(self.database_path)) as database:
+                for name in column.split(","):
+                    database.execute(f"UPDATE aw_operations SET {name}={name}-? WHERE state='unknown'", (milliseconds,))
+                database.commit()
+
+        # Expiry runs from the last update (after the send ended), not creation.
+        age(10 * ASTER_WRITE_EXPIRY_MS, "created_at")
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "created-long-ago", margin_payload()))
+        age(ASTER_WRITE_EXPIRY_MS - 5000, "updated_at")
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "early", margin_payload()))
+        age(5000, "updated_at")
+        transfer = writer.prepare(ticket, "after-expiry", margin_payload())
+        self.assertTrue(writer.assert_owned(transfer))
+        writer.finish(transfer, "rejected")
+        # An expired opaque write still gates ordinary orders; an expired
+        # transfer does not.
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(order_ticket, "order", {"order": legacy_order()}))
+        writer.resolve("old-opaque", ticket, "rejected")
+        order = writer.prepare(order_ticket, "order", {"order": legacy_order()})
+        self.assertTrue(writer.assert_owned(order))
+        writer.finish(order, "rejected")
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("UPDATE aw_operations SET module_id='hub' WHERE operation_id='old-transfer'")
+            database.commit()
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "foreign-expired", margin_payload()))
+        with closing(sqlite3.connect(self.database_path)) as database:
+            database.execute("UPDATE aw_operations SET module_id='aster' WHERE operation_id='old-transfer'")
+            database.commit()
+        rows = writer.unresolved(ticket)
+        self.assertEqual([(row["operationId"], row["updatedAt"] > row["createdAt"]) for row in rows], [("old-transfer", True)])
 
     def test_active_sending_blocks_t0_but_fenced_historical_sending_remains_preserved(self):
         writer = self.writer("aster")

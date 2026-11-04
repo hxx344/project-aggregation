@@ -135,7 +135,9 @@ function quarantineRegistry(directory, body, recoveryId, authorityId) {
     if (db.prepare('SELECT 1 FROM aw_accounts WHERE fence >= 9007199254740990 LIMIT 1').get() || db.prepare('SELECT 1 FROM aw_bindings WHERE generation >= 9007199254740990 LIMIT 1').get()) throw new Error('RECOVERY_FENCE_EXHAUSTED');
     setMeta(db, 'recovery_state', { schemaVersion: 1, state: 'quarantine', authorityId, recoveryId, checkpointId: body.checkpointId, sourceAuthorityId: body.sourceAuthorityId, ...(body.handoffId ? { handoffId: body.handoffId } : {}) });
     setMeta(db, 'recovery_epoch', randomUUID());
-    db.exec("UPDATE aw_owners SET status='closed'; UPDATE aw_accounts SET lease_until=0,fence=fence+1; UPDATE aw_bindings SET generation=generation+1; UPDATE aw_operations SET state='unknown' WHERE state='sending';");
+    db.exec("UPDATE aw_owners SET status='closed'; UPDATE aw_accounts SET lease_until=0,fence=fence+1; UPDATE aw_bindings SET generation=generation+1;");
+    // The restored row's expiry must run from now: the source could still have sent it.
+    db.prepare("UPDATE aw_operations SET state='unknown',updated_at=MAX(updated_at,?) WHERE state='sending'").run(Date.now());
     // A restored copy is never allowed to consume its ancestor's authority record.
     db.prepare("DELETE FROM aw_meta WHERE key='recovery_handoff'").run();
   });
