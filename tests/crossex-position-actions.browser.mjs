@@ -8,7 +8,7 @@ async (page) => {
   if (page.url() !== 'about:blank' && !allowed.has(new URL(page.url()).origin)) throw new Error('Isolated localhost:4175 required');
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const now = Date.UTC(2026, 9, 14, 12), errors = [], unexpected = [], requests = [], previews = [], confirmations = [];
-  let paused = false, partial = false, stale = false, holdPreview = false, releasePreview = null, previewFailure = '', executions = [];
+  let paused = false, partial = false, stale = false, holdPreview = false, releasePreview = null, previewFailure = '', confirmFailure = '', confirmCrash = false, rejectedConfirmations = 0, executions = [];
   const symbol = exchange => `${exchange.toUpperCase()}_FUTURE_BTC_USDT`;
   const held = [
     { id: 'btc-long', symbol: symbol('binance'), exchange: 'binance', side: 'LONG', quantity: '1', baseQuantity: '1', markPrice: '100', entryPrice: '100' },
@@ -73,6 +73,8 @@ async (page) => {
         if (url.pathname === '/api/overview') return send(overview);
         if (url.pathname === '/api/system/updates') return send(updates);
         if (url.pathname === '/api/health') return send({ status: 'ok' });
+        if (url.pathname === '/api/system/modules') return send({ schemaVersion: 1, enabled: false, modules: [] });
+        if (url.pathname === '/api/system/host') return send({ error: 'Host status is outside this fixture' }, 503);
       }
     } else {
       if (request.method() === 'GET') {
@@ -88,7 +90,10 @@ async (page) => {
         return send(result);
       }
       if (url.pathname === '/api/live/confirm' && request.method() === 'POST') {
-        const input = request.postDataJSON(); confirmations.push(input);
+        const input = request.postDataJSON();
+        if (confirmCrash) { confirmCrash = false; return send({ error: '测试：服务异常' }, 500); }
+        if (confirmFailure) { const error = confirmFailure; confirmFailure = ''; rejectedConfirmations++; return send({ error, requestStatus: 'not_submitted' }, 409); }
+        confirmations.push(input);
         assert(typeof input.requestId === 'string' && input.requestId.length > 0, 'confirmation includes a durable request ID');
         const plan = plans.get(input.previewId); assert(plan, 'confirmation references the displayed preview');
         for (const leg of plan.legs) { const p = held.find(p => p.id === leg.positionId); p.quantity = p.baseQuantity = leg.targetQuantity; }
@@ -143,8 +148,24 @@ async (page) => {
     assert(previews[0].quantity === '0.2' && previews[0].action === 'add', 'add request carries the exact increment');
     const review = module.getByRole('dialog');
     assert((await review.innerText()).includes('IOC'), 'review discloses the protected immediate-or-cancel orders');
+    confirmFailure = '测试：价格限制内的盘口深度不足，请降低数量或重新预览';
+    await review.getByRole('checkbox').check(); await review.getByRole('button', { name: '确认实盘下单', exact: true }).click();
+    await review.getByText('测试：价格限制内的盘口深度不足，请降低数量或重新预览', { exact: true }).waitFor();
+    assert(rejectedConfirmations === 1 && confirmations.length === 0, 'not-submitted confirmation sends nothing');
+    assert(await module.getByRole('heading', { name: '订单查询与撤单', exact: true }).count() === 0 && await addButton.count() === 1, 'rejected confirmation keeps the review on the current tab');
+    const retryRequest = page.waitForRequest(r => r.url().endsWith('/api/live/preview'));
+    await review.getByRole('button', { name: '重新预览', exact: true }).click();
+    await retryRequest;
+    await review.getByRole('button', { name: '确认实盘下单', exact: true }).waitFor();
+    assert(previews.length === 2 && JSON.stringify(previews[1]) === JSON.stringify(previews[0]), 're-preview resends the same order input');
+    assert(await review.getByRole('button', { name: '确认实盘下单', exact: true }).isDisabled(), 'the new preview still requires a fresh acknowledgement');
+    await page.setViewportSize({ width: 1440, height: 520 });
+    await module.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    const scrolledBeforeConfirm = await module.evaluate(() => scrollY);
     await review.getByRole('checkbox').check(); await review.getByRole('button', { name: '确认实盘下单', exact: true }).click();
     await module.getByRole('heading', { name: '订单查询与撤单', exact: true }).waitFor();
+    assert(scrolledBeforeConfirm > 0 && await module.evaluate(() => scrollY) === 0, 'confirmed order opens the orders tab at its top');
+    await page.setViewportSize({ width: 1440, height: 1000 });
     assert(confirmations.length === 1 && held.every(p => p.baseQuantity === '1.2'), 'one confirmation updates both held quantities');
     await toPositions();
     await setQuantities('1.2', '1');
@@ -215,10 +236,19 @@ async (page) => {
     connection.version = 'position-actions-2';
     await page.clock.runFor(2500);
     assert(await dialog('BTC · 选择平仓持仓腿').count() === 0, 'connection change discards the old account close selection');
+    await addButton.click(); picker = dialog('BTC · 加仓持仓组合');
+    await picker.getByRole('button', { name: '25%', exact: true }).click();
+    await picker.getByRole('button', { name: '预览加仓', exact: true }).click();
+    await module.getByRole('heading', { name: /核对.*加仓/ }).waitFor();
+    confirmCrash = true; const settledConfirmations = confirmations.length;
+    await module.getByRole('dialog').getByRole('checkbox').check(); await module.getByRole('button', { name: '确认实盘下单', exact: true }).click();
+    await module.getByRole('heading', { name: '订单查询与撤单', exact: true }).waitFor();
+    await module.getByText(/存在结果待确认的操作/).waitFor();
+    assert(await module.getByRole('dialog').count() === 0 && confirmations.length === settledConfirmations, 'an unknown confirmation result never offers an in-place retry');
     assert(unexpected.length === 0, `unexpected requests: ${unexpected.join('; ')}`);
     assert(errors.length === 0, `uncaught browser errors: ${errors.join('; ')}`);
-    return { passed: true, previews: previews.length, confirmations: confirmations.length, liveOrders: 0,
-      scenarios: ['real Hub entry', 'recurring spread and margin warnings', 'common lot-size validation', 'add percentage and exact request', 'preview lock', 'confirm and refresh',
+    return { passed: true, previews: previews.length, confirmations: confirmations.length, rejectedConfirmations, liveOrders: 0,
+      scenarios: ['real Hub entry', 'recurring spread and margin warnings', 'common lot-size validation', 'add percentage and exact request', 'preview lock', 'rejected confirm re-preview', 'confirm and refresh at top', 'unknown confirm result goes to orders',
         'reduce', 'increase', 'custom mixed target', 'mobile dialog', 'entry pause', 'server error in modal', 'review invalidation', 'snapshot changes', 'partial/stale account', 'close selection account scope'] };
   } finally { releasePreview?.(); await page.clock.resume(); }
 }
