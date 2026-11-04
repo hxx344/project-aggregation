@@ -2,6 +2,7 @@ import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } f
 import type { FormEvent, ReactNode } from 'react';
 import { Activity, ArrowLeftRight, ArrowUpRight, BellRing, Check, ChevronRight, CircleAlert, ChartNoAxesCombined, Droplets, FolderKanban, Gauge, Info, LayoutDashboard, LoaderCircle, LogOut, Menu, RefreshCw, Save, ScrollText, Server, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
 import { api, ApiError, setCsrfToken } from './api';
+import { clearCache as clearAeroMarketCache } from './aero-market-cache';
 import ProjectWorkspace from './ProjectWorkspace';
 import DiagnosticDetails from './DiagnosticDetails';
 import UpdateStatus from './UpdateStatus';
@@ -107,7 +108,8 @@ export default function App() {
     document.addEventListener('keydown', onKey); return () => document.removeEventListener('keydown', onKey);
   }, [menuOpen]);
 
-  const expire = useCallback(() => { tradingCache.clear(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
+  // 退出或会话过期时一并清掉 Aero 市场的本机缓存。
+  const expire = useCallback(() => { tradingCache.clear(); void clearAeroMarketCache(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
   useEffect(() => {
     const controller = new AbortController();
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { if (controller.signal.aborted) return; setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (!controller.signal.aborted && e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
@@ -217,7 +219,7 @@ export default function App() {
     catch (e) { setError(e instanceof Error ? e.message : '退出失败，请重试'); }
   };
   if (authenticated === null) return <div className="app-loading"><LoaderCircle className="spin" /><p>正在打开工作台</p></div>;
-  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); setError(''); setAuthenticated(true); }} /></>;
+  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); void clearAeroMarketCache(); setError(''); setAuthenticated(true); }} /></>;
   const serverNow = overview ? Date.parse(overview.generatedAt) + performance.now() - receivedAt.current : Date.now();
   const snapshots = overview?.projects.map(snapshot => ageSnapshot(snapshot, serverNow)) || [];
   const selected = snapshots.find(s => s.project.id === route.id);

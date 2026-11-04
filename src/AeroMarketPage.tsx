@@ -3,9 +3,10 @@ import type { FormEvent } from 'react';
 import { ArrowDown, ArrowLeftRight, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, RotateCcw, Save, Settings2, SlidersHorizontal } from 'lucide-react';
 import { CartesianGrid, Line, LineChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, ApiError } from './api';
+import { readCache, writeCache } from './aero-market-cache';
 import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, netYield, rangeTicks } from './aero-market-math';
 import type { NetYield } from './aero-market-math';
-import type { MarketChain, MarketConfig, MarketPool, MarketPoolHistory, MarketSamples, MarketSnapshot, MarketUnchanged, MarketWindow } from './aero-market-types';
+import type { MarketChain, MarketConfig, MarketPool, MarketPoolHistory, MarketSamples, MarketSamplesUnchanged, MarketSnapshot, MarketUnchanged, MarketWindow } from './aero-market-types';
 import './aero-lp.css';
 import './aero-market.css';
 
@@ -16,6 +17,12 @@ const STATUS: Record<MarketChain['status'], string> = { idle: '等待首次扫�
 const HISTORY: Record<MarketChain['history']['archive'], string> = { archive: '历史区块回填', unavailable: '历史区块不可读，本机累计', local: '本机按小时累计' };
 const dates = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
 const when = (ms: number | null) => (ms ? dates.format(ms) : '—');
+// 本地缓存不存 RPC 地址（可能带密钥）；显示缓存期间扫描设置不可用，等服务器的完整数据。
+const forCache = (data: MarketSnapshot): MarketSnapshot => ({ ...data, config: { ...data.config, chains: Object.fromEntries(Object.entries(data.config.chains).map(([id, c]) => [id, { ...c, rpcUrl: '' }])) } });
+const usableSnapshot = (data: unknown): data is MarketSnapshot => {
+  const d = data as MarketSnapshot | null;
+  return !!d && d.schema === 1 && Array.isArray(d.pools) && Array.isArray(d.chains) && !!d.config && typeof d.config.chains === 'object' && !!d.aero;
+};
 const message = (reason: unknown) => (reason instanceof Error ? reason.message : '请求失败，请重试。');
 const usd = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? '—' : v >= 1e6 ? `$${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `$${(v / 1e3).toFixed(1)}K` : `$${v.toFixed(v >= 10 ? 0 : 2)}`);
 const pct = (v: number | null | undefined, digits = 1) => (v === null || v === undefined || !Number.isFinite(v) ? '—' : `${(v * 100).toFixed(digits)}%`);
@@ -223,6 +230,9 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const [avgWindow, setAvgWindow] = useState<MarketWindow | 'off'>('7d');
   const [samples, setSamples] = useState<{ window: MarketWindow; version: number; data: MarketSamples | null; error: string } | null>(null);
   const samplesGeneration = useRef(0);
+  const samplesRef = useRef(samples);
+  samplesRef.current = samples;
+  const [cachedAt, setCachedAt] = useState<number | null>(null);
   const [minScoreText, setMinScoreText] = useState('');
   const [maxVolText, setMaxVolText] = useState('');
   const [minDaysText, setMinDaysText] = useState('');
@@ -234,7 +244,10 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const revision = useRef<number | null>(null);
   const generation = useRef(0);
   const fail = useCallback((reason: unknown, show: (text: string) => void) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else show(message(reason)); }, [onExpired]);
-  const accept = useCallback((data: MarketSnapshot) => { revision.current = data.revision; setSnapshot(data); setLoadError(''); }, []);
+  const accept = useCallback((data: MarketSnapshot) => {
+    revision.current = data.revision; setSnapshot(data); setCachedAt(null); setLoadError('');
+    void writeCache('snapshot', forCache(data));
+  }, []);
   const read = useCallback(async () => {
     const signal = lifetime.current?.signal;
     if (!signal || signal.aborted) return;
@@ -247,6 +260,11 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   }, [accept, fail]);
   useEffect(() => {
     const controller = new AbortController(); lifetime.current = controller;
+    // 先显示本机缓存，服务器的数据到了再替换；服务器先到（revision 已有值）时缓存直接作废。
+    void readCache<MarketSnapshot>('snapshot').then((hit) => {
+      if (!hit || controller.signal.aborted || revision.current !== null || !usableSnapshot(hit.data)) return;
+      setSnapshot(hit.data); setCachedAt(hit.savedAt);
+    });
     void read();
     const poll = setInterval(() => { if (!document.hidden) void read(); }, 30_000);
     return () => { controller.abort(); clearInterval(poll); };
@@ -269,16 +287,42 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   // 服务端按启用的链过滤样本：启停链后同一整点内样本版本不变，也要重读。
   const enabledChains = snapshot ? (snapshot.config.enabled ? Object.keys(snapshot.config.chains).filter((id) => snapshot.config.chains[id].enabled).sort().join(',') : '') : '';
   // 样本每整点才有新点：只在窗口切换、启用链变化或服务端样本版本变化时重读，不跟随 30 秒轮询。迟到的旧窗口响应按代次丢弃。
+  // 手里没有该窗口的数据时先取本机缓存；请求带上 tag，服务端内容未变时只回未变化标记，不重发样本。
+  // 快照还是本机缓存时只显示缓存样本、不发请求：服务器快照到了样本版本多半会变，提前请求会把约 700 KB 下载两遍。
+  const freshSnapshot = cachedAt === null;
   useEffect(() => {
     if (avgWindow === 'off' || samplesVersion === null) return;
-    const signal = lifetime.current?.signal;
-    if (!signal) return;
+    const page = lifetime.current?.signal;
+    if (!page) return;
+    // 每轮自带取消：窗口、版本或启用链一变就中止上一轮还在下载的样本。
+    const run = new AbortController();
+    const signal = AbortSignal.any([page, run.signal]);
     const version = ++samplesGeneration.current;
-    setSamples((s) => (s?.window === avgWindow ? s : { window: avgWindow, version: samplesVersion, data: null, error: '' }));
-    void api<MarketSamples>(`${ROOT}/samples?window=${avgWindow}`, { signal, timeoutMs: 20_000 })
-      .then((data) => { if (!signal.aborted && version === samplesGeneration.current) setSamples({ window: avgWindow, version: samplesVersion, data, error: '' }); })
-      .catch((reason) => { if (!signal.aborted && version === samplesGeneration.current) fail(reason, (text) => setSamples((s) => ({ window: avgWindow, version: samplesVersion, data: s?.window === avgWindow ? s.data : null, error: text }))); });
-  }, [avgWindow, samplesVersion, enabledChains, fail]);
+    const current = () => !signal.aborted && version === samplesGeneration.current;
+    const key = `samples:${avgWindow}`;
+    void (async () => {
+      let held = samplesRef.current?.window === avgWindow ? samplesRef.current.data : null;
+      if (!held) {
+        setSamples({ window: avgWindow, version: samplesVersion, data: null, error: '' });
+        const hit = await readCache<MarketSamples>(key);
+        if (!current()) return;
+        if (hit && hit.data?.window === avgWindow && hit.data.available && typeof hit.data.tag === 'string' && hit.data.pools && typeof hit.data.pools === 'object') {
+          held = hit.data;
+          setSamples({ window: avgWindow, version: samplesVersion, data: held, error: '' });
+        }
+      }
+      const kept = held;
+      if (!freshSnapshot) return;
+      try {
+        const data = await api<MarketSamples | MarketSamplesUnchanged>(`${ROOT}/samples?window=${avgWindow}${kept?.tag ? `&tag=${encodeURIComponent(kept.tag)}` : ''}`, { signal, timeoutMs: 20_000 });
+        if (!current()) return;
+        if (data.unchanged) { setSamples({ window: avgWindow, version: samplesVersion, data: kept, error: '' }); return; }
+        setSamples({ window: avgWindow, version: samplesVersion, data, error: '' });
+        if (data.available && data.tag) void writeCache(key, data);
+      } catch (reason) { if (current()) fail(reason, (text) => setSamples({ window: avgWindow, version: samplesVersion, data: kept, error: text })); }
+    })();
+    return () => run.abort();
+  }, [avgWindow, samplesVersion, enabledChains, freshSnapshot, fail]);
   const sampleData = avgWindow !== 'off' && samples?.window === avgWindow ? samples.data : null;
   const all = useMemo(() => (snapshot?.pools ?? []).map((p) => {
     const m = metricsFor(p, aeroUsd, width, deposit);
@@ -361,15 +405,16 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
     <div className="lp-heading">
       <div><h1>Aero 市场</h1><p>各链 Aero CL 池的 TVL、排放年化与波动率，按区间宽度和投入金额估算，用于比较入场机会。数据只读链上，AERO {usd(aeroUsd)}{snapshot.aero.at ? `（${when(snapshot.aero.at)}）` : ''}</p></div>
       <div className="lp-toolbar">
-        <button className="button secondary" onClick={() => setShowSettings((v) => !v)} aria-expanded={showSettings}><Settings2 size={15} />扫描设置</button>
-        <button className="button secondary" disabled={!!busy || !snapshot.config.enabled} onClick={() => void execute('refresh', '/refresh', 'POST', {})}><RefreshCw size={15} className={busy === 'refresh' ? 'spin' : ''} />立即刷新</button>
+        <button className="button secondary" disabled={cachedAt !== null} onClick={() => setShowSettings((v) => !v)} aria-expanded={showSettings}><Settings2 size={15} />扫描设置</button>
+        <button className="button secondary" disabled={!!busy || cachedAt !== null || !snapshot.config.enabled} onClick={() => void execute('refresh', '/refresh', 'POST', {})}><RefreshCw size={15} className={busy === 'refresh' ? 'spin' : ''} />立即刷新</button>
       </div>
     </div>
+    {cachedAt !== null ? <div className="lp-callout" role="status">{loadError ? <CircleAlert size={15} /> : <LoaderCircle size={15} className="spin" />}显示的是本机缓存（{when(cachedAt)} 保存），{loadError ? '服务器暂时读不到，30 秒后自动重试' : '正在从服务器更新…'}{loadError ? <button className="button secondary" onClick={() => void read()}><RefreshCw size={15} />重试</button> : null}</div> : null}
     {snapshot.configError ? <div className="lp-callout warning"><CircleAlert size={15} />{snapshot.configError}</div> : null}
     {!snapshot.config.enabled ? <div className="lp-callout warning"><CircleAlert size={15} />扫描已停用，页面显示的是上次保存的数据。可在「扫描设置」中启用。</div> : null}
     {loadError ? <div className="lp-callout warning"><CircleAlert size={15} />刷新失败：{loadError}（显示的是上次读取的数据）</div> : null}
     {actionError ? <div className="lp-callout warning"><CircleAlert size={15} />{actionError}</div> : null}
-    {showSettings ? <SettingsForm config={snapshot.config} busy={!!busy} onSave={(next) => void execute('save', '/config', 'PUT', { config: next })} /> : null}
+    {showSettings && cachedAt === null ? <SettingsForm config={snapshot.config} busy={!!busy} onSave={(next) => void execute('save', '/config', 'PUT', { config: next })} /> : null}
 
     <section className="am-chains" aria-label="各链状态">{snapshot.chains.map((c) => {
       const stale = c.enabled && c.updatedAt !== null && snapshot.serverNow - c.updatedAt > staleAfter;
