@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowDown, ArrowLeftRight, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, Save, Settings2 } from 'lucide-react';
+import { ArrowDown, ArrowLeftRight, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, RotateCcw, Save, Settings2, SlidersHorizontal } from 'lucide-react';
 import { CartesianGrid, Line, LineChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, ApiError } from './api';
 import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, rangeTicks } from './aero-market-math';
@@ -29,6 +29,19 @@ type Metrics = {
   pool: MarketPool; change: number | null; stakedShare: number | null; aeroPerDay: number | null; emissionUsdYear: number | null; emissionTvl: number | null;
   apr: number | null; narrowApr: number | null; daysIn: number | null; range: [number, number];
 };
+// 交易对类型按代币美元价判断：约 1 美元视为稳定币（不限于报价锚定的 USDC/USDT）；同价对指两币价差不超过 2%，如稳定币对、cbBTC/WBTC。
+const PAIRS = { all: '全部', stable: '含稳定币', volatile: '不含稳定币', pegged: '同价对（价差 ≤2%）' } as const;
+type PairKind = keyof typeof PAIRS;
+const isUsd = (t: MarketPool['token0']) => t.usd !== null && Math.abs(t.usd - 1) <= 0.02;
+function pairMatches(pool: MarketPool, kind: PairKind) {
+  if (kind === 'all') return true;
+  const s0 = isUsd(pool.token0), s1 = isUsd(pool.token1);
+  if (kind === 'stable') return s0 || s1;
+  if (kind === 'volatile') return !s0 && !s1;
+  return pool.token0.usd !== null && pool.token1.usd !== null && pool.token1.usd > 0 && Math.abs(pool.token0.usd / pool.token1.usd - 1) <= 0.02;
+}
+// 空输入表示不限；非数字同样不限，避免输入过程中的中间态把表格清空。
+const limitOf = (text: string) => { if (!text.trim()) return null; const v = Number(text); return Number.isFinite(v) ? v : null; };
 type SortKey = 'tvl' | 'staked' | 'emission' | 'emissionTvl' | 'apr' | 'narrowApr' | 'vol24h' | 'vol7d' | 'days' | 'change';
 const SORTS: Record<SortKey, (m: Metrics) => number | null> = {
   tvl: (m) => m.pool.tvlUsd, staked: (m) => m.stakedShare, emission: (m) => m.aeroPerDay, emissionTvl: (m) => m.emissionTvl, apr: (m) => m.apr, narrowApr: (m) => m.narrowApr,
@@ -144,6 +157,12 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const [depositText, setDepositText] = useState('1000');
   const [minTvlText, setMinTvlText] = useState('100000');
   const [emittingOnly, setEmittingOnly] = useState(true);
+  const [showMore, setShowMore] = useState(false);
+  const [pairKind, setPairKind] = useState<PairKind>('all');
+  const [spacing, setSpacing] = useState('all');
+  const [minAprText, setMinAprText] = useState('');
+  const [maxVolText, setMaxVolText] = useState('');
+  const [minDaysText, setMinDaysText] = useState('');
   const [sort, setSort] = useState<{ key: SortKey; desc: boolean }>({ key: 'apr', desc: true });
   const [limit, setLimit] = useState(60);
   const [open, setOpen] = useState<string | null>(null);
@@ -184,15 +203,29 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const aeroUsd = snapshot?.aero.usd ?? null;
   const chainNames = useMemo(() => new Map((snapshot?.chains ?? []).map((c) => [c.id, c.name])), [snapshot]);
   const all = useMemo(() => (snapshot?.pools ?? []).map((p) => metricsFor(p, aeroUsd, width, deposit)), [snapshot, aeroUsd, width, deposit]);
+  const minApr = limitOf(minAprText), maxVol = limitOf(maxVolText), minDays = limitOf(minDaysText);
+  const advancedCount = [pairKind !== 'all', spacing !== 'all', minApr !== null, maxVol !== null, minDays !== null].filter(Boolean).length;
+  const spacings = useMemo(() => [...new Set((snapshot?.pools ?? []).map((p) => p.tickSpacing))].sort((a, b) => a - b), [snapshot]);
   const rows = useMemo(() => {
     const words = search.trim().toLowerCase().split(/[\s/,]+/).filter(Boolean);
     const pick = SORTS[sort.key];
+    // 指标缺失的池子在设了对应门槛时排除：无法判断是否满足。
+    const vol = (m: Metrics) => m.pool.vol24h?.daily ?? m.pool.vol7d?.daily ?? null;
     return all.filter((m) => (chainFilter === 'all' || m.pool.chain === chainFilter)
       && (!emittingOnly || (m.pool.emissionPerSec ?? 0) > 0)
       && (m.pool.tvlUsd ?? 0) >= minTvl
+      && pairMatches(m.pool, pairKind)
+      && (spacing === 'all' || m.pool.tickSpacing === Number(spacing))
+      && (minApr === null || (m.apr !== null && m.apr * 100 >= minApr))
+      && (maxVol === null || ((vol(m) ?? Infinity) * 100 <= maxVol))
+      && (minDays === null || (m.daysIn !== null && m.daysIn >= minDays))
       && words.every((w) => m.pool.token0.symbol.toLowerCase().includes(w) || m.pool.token1.symbol.toLowerCase().includes(w) || m.pool.address.startsWith(w)))
       .sort((a, b) => { const x = pick(a), y = pick(b); if (x === null && y === null) return 0; if (x === null) return 1; if (y === null) return -1; return sort.desc ? y - x : x - y; });
-  }, [all, chainFilter, emittingOnly, minTvl, search, sort]);
+  }, [all, chainFilter, emittingOnly, minTvl, search, sort, pairKind, spacing, minApr, maxVol, minDays]);
+  const resetFilters = () => {
+    setChainFilter('all'); setSearch(''); setMinTvlText('100000'); setEmittingOnly(true);
+    setPairKind('all'); setSpacing('all'); setMinAprText(''); setMaxVolText(''); setMinDaysText('');
+  };
   const openMetrics = open ? all.find((m) => key(m.pool) === open) ?? null : null;
 
   const loadHistory = useCallback(async (chain: string, address: string, quiet: boolean) => {
@@ -258,7 +291,18 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <label>投入（美元）<input type="number" min={1} step={100} value={depositText} onChange={(e) => setDepositText(e.target.value)} /></label>
         <label>最低 TVL（美元）<input type="number" min={0} step={1000} value={minTvlText} onChange={(e) => setMinTvlText(e.target.value)} /></label>
         <label className="am-check"><input type="checkbox" checked={emittingOnly} onChange={(e) => setEmittingOnly(e.target.checked)} />只看有排放</label>
+        <button type="button" className="button secondary am-more-toggle" aria-expanded={showMore} aria-controls="am-more-filters" onClick={() => setShowMore((v) => !v)}><SlidersHorizontal size={14} />更多筛选{advancedCount ? `（${advancedCount}）` : ''}</button>
+        <span className="am-count">符合 {rows.length} / {all.length} 个池子</span>
       </div>
+      {showMore ? <div className="am-filters am-filters-more" id="am-more-filters">
+        <label>交易对<select value={pairKind} onChange={(e) => setPairKind(e.target.value as PairKind)}>{Object.entries(PAIRS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label>
+        <label>CL 档位<select value={spacing} onChange={(e) => setSpacing(e.target.value)}><option value="all">全部</option>{spacings.map((v) => <option key={v} value={v}>CL{v}</option>)}</select></label>
+        <label>最低区间年化（%）<input type="number" min={0} step={10} placeholder="不限" value={minAprText} onChange={(e) => setMinAprText(e.target.value)} /></label>
+        <label>最高日波动（%）<input type="number" min={0} step={0.5} placeholder="不限" value={maxVolText} onChange={(e) => setMaxVolText(e.target.value)} /></label>
+        <label>最少在区间（天）<input type="number" min={0} step={1} placeholder="不限" value={minDaysText} onChange={(e) => setMinDaysText(e.target.value)} /></label>
+        <button type="button" className="button secondary" onClick={resetFilters}><RotateCcw size={14} />重置筛选</button>
+        <small className="am-filter-hint">日波动取 24h，样本不足时用 7d；设了门槛时缺少该指标的池子不显示。区间年化与在区间天数随上面的区间宽度和投入变化。</small>
+      </div> : null}
       <p className="am-note">排放年化 = 池子排放（AERO 计价）×（你的流动性 /（当前价位质押流动性 + 你的））÷ 投入，假设全程在区间内并质押；价格移动后的竞争流动性不同，仅用于同一时刻横向比较。不含手续费：质押仓位的手续费归投票者。预计在区间时间按 24 小时波动率（不足时用 7 天）的无漂移随机游走估算。</p>
       <div className="lp-table-scroll"><table className="lp-table am-table">
         <thead><tr>

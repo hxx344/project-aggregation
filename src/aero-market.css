@@ -12,6 +12,9 @@
 .am-filters input[type=number]{width:110px}
 .am-check{flex-direction:row!important;align-items:center;gap:6px!important;color:var(--text-secondary);font-size:.75rem;cursor:pointer}
 .am-filters .am-check{height:32px}
+.am-filters-more{background:var(--surface-2)}
+.am-count{margin-left:auto;align-self:center;font-size:.75rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.am-filter-hint{flex:1 1 100%;font-size:.6875rem;color:var(--text-tertiary)}
 .am-note{margin:0;padding:8px 14px;font-size:.6875rem;line-height:1.65;color:var(--text-tertiary);border-bottom:1px solid var(--surface-4)}
 .am-table th.num,.am-table td.num{text-align:right}
 .am-table td small{display:block;color:var(--text-tertiary);font-size:.625rem}
