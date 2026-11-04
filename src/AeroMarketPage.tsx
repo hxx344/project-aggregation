@@ -492,7 +492,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       <div className="lp-table-scroll"><table className="lp-table am-table">
         <thead><tr>
           <th scope="col">池子</th>
-          {header('score', '收益波动比', '净年化 ÷ 年化波动（σ × √365）')}{header('avgScore', '平均收益波动比', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}平均净年化 ÷ 平均年化波动`)}{header('net', '净年化', '推荐区间：按 tickSpacing 粒度搜索以当前价居中、预计在区间不短于「最短在区间」的区间中净年化最高者（排放 − 无常损失 − 停摆 − 调仓成本）')}{header('recApr', '推荐年化', '推荐区间的排放年化（按当前价位质押流动性稀释）；下方为扣掉的无常损失、停摆与调仓合计，扣完即净年化')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，在预设宽度与推荐区间宽度中取平均值最高者`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
+          {header('score', '收益波动比', '净年化 ÷ 年化波动（σ × √365）')}{header('avgScore', '平均收益波动比', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}平均净年化 ÷ 平均年化波动`)}{header('net', '净年化', '推荐区间：按 tickSpacing 粒度搜索以当前价居中、预计在区间不短于「最短在区间」的区间中净年化最高者（排放 − 无常损失 − 停摆 − 调仓成本）')}{header('recApr', '推荐年化', '推荐区间扣除无常损失、停摆与调仓成本后的年化；下方为扣除前的排放年化（按当前价位质押流动性稀释）。点表头按扣除前排序')}{header('avgNet', '平均净年化', avgWindow === 'off' ? '在筛选栏选择平均窗口后计算' : `${WINDOWS[avgWindow]}逐小时重算净年化的平均，在预设宽度与推荐区间宽度中取平均值最高者`)}{header('tvl', 'TVL')}{header('staked', '质押占比', '当前价位质押流动性 / 全部流动性')}
           {header('emission', '日排放', '每天发给该池的 AERO')}{header('emissionTvl', '排放/TVL', '年化排放价值除以池子 TVL')}
           {header('apr', '区间年化', '所选区间宽度下的排放年化')}{header('narrowApr', '最窄年化', '单个 tickSpacing 区间的排放年化')}
           {header('vol24h', '日波动 24h', '小时对数收益折算到 1 天')}{header('vol7d', '日波动 7d')}
@@ -506,7 +506,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <td className="num strong">{m.score === null ? '—' : m.score.toFixed(1)}</td>
               <td className="num" title={averageNote(m)}>{m.avg?.score == null ? '—' : m.avg.score.toFixed(1)}</td>
               <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `${rangeLabel(m.pool, m.best.range)} · ${days(m.best.result.days)}` : ''}</small></td>
-              <td className="num">{pct(m.best?.result.emission, 0)}<small>{m.best ? `扣 ${pct(m.best.result.impermanent + m.best.result.downtime + m.best.result.rebalance, 0)}` : ''}</small></td>
+              <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `扣前 ${pct(m.best.result.emission, 0)}` : ''}</small></td>
               <td className={`num ${(m.avg?.best?.result.net ?? 0) > 0 ? 'up' : (m.avg?.best?.result.net ?? 0) < 0 ? 'down' : ''}`} title={averageNote(m)}>{pct(m.avg?.best?.result.net, 0)}<small>{m.avg?.best ? `${m.avg.best.label} · ${m.avg.hours} 小时` : ''}</small></td>
               <td className="num">{usd(m.pool.tvlUsd)}</td><td className="num">{pct(m.stakedShare, 0)}</td>
               <td className="num">{m.aeroPerDay === null ? '—' : amount(m.aeroPerDay)}<small>{usd(m.emissionUsdYear === null ? null : m.emissionUsdYear / 365)}</small></td>
