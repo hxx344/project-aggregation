@@ -19,8 +19,10 @@ export type MarketSnapshot = {
   schema: 1; revision: number; serverNow: number; unchanged?: false;
   config: MarketConfig; configError: string | null; aero: { usd: number | null; at: number | null };
   chains: MarketChain[]; pools: MarketPool[];
-  // 旧版服务端没有样本库字段。
+  // 旧版服务端没有样本库与收藏字段。
   samples?: MarketSamplesStatus;
+  // 收藏的池子："链:地址"（小写），按加入顺序。
+  favorites?: string[]; favoritesError?: string | null;
 };
 export type MarketSamplesStatus = { available: boolean; error: string | null; version: number };
 export type MarketWindow = '24h' | '3d' | '7d' | '30d';
@@ -31,3 +33,8 @@ export type MarketSamples = MarketSamplesStatus & { window: MarketWindow; unchan
 export type MarketSamplesUnchanged = { window: MarketWindow; available: true; unchanged: true; tag: string; version: number };
 export type MarketUnchanged = { schema: 1; revision: number; serverNow: number; unchanged: true };
 export type MarketPoolHistory = { chain: string; address: string; points: [number, number][] };
+// 详情页的流动性分布：segments 为 [下沿 tick, 上沿 tick, 流动性, 质押流动性]，只覆盖 [from, to]。
+export type MarketLiquidity = {
+  chain: string; address: string; at: number; block: number; tick: number; sqrtPriceX96: string; liquidity: string; stakedLiquidity: string;
+  from: number; to: number; initialized: number; segments: [number, number, number, number][];
+};

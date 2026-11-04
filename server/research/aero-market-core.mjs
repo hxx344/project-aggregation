@@ -84,3 +84,32 @@ export function realizedVol(points, windowSec, nowSec) {
 export function priceChange(fromTick, toTick) {
   return Number.isFinite(fromTick) && Number.isFinite(toTick) ? Math.exp((toTick - fromTick) * LOG_TICK) - 1 : null;
 }
+
+// 由当前流动性与各已初始化 tick 的净变化还原 [from, to] 内的分段流动性：向上跨过 tick 加 liquidityNet，向下跨过减去，
+// 质押流动性同理用 stakedLiquidityNet。ticks 为 [tick, liquidityNet, stakedLiquidityNet]（整数字符串），返回按 tick 升序、
+// 相邻同值已合并的 [下沿, 上沿, 流动性, 质押流动性]；流动性转成浮点数只用于作图和比例。
+export function liquiditySegments({ tick, liquidity, stakedLiquidity, ticks, from, to }) {
+  const rows = ticks.map(([t, net, staked]) => [t, BigInt(net), BigInt(staked)]).filter(([t]) => t > from && t < to).sort((a, b) => a[0] - b[0]);
+  const above = rows.findIndex(([t]) => t > tick);
+  const split = above === -1 ? rows.length : above;
+  const out = [];
+  let l = BigInt(liquidity), s = BigInt(stakedLiquidity);
+  for (let i = split; i >= 0; i--) {
+    out.push([i > 0 ? rows[i - 1][0] : from, i < rows.length ? rows[i][0] : to, l, s]);
+    if (i > 0) { l -= rows[i - 1][1]; s -= rows[i - 1][2]; }
+  }
+  out.reverse();
+  l = BigInt(liquidity); s = BigInt(stakedLiquidity);
+  for (let i = split; i < rows.length; i++) {
+    l += rows[i][1]; s += rows[i][2];
+    out.push([rows[i][0], i + 1 < rows.length ? rows[i + 1][0] : to, l, s]);
+  }
+  const merged = [];
+  for (const [lo, hi, a, b] of out) {
+    if (!(hi > lo)) continue;
+    const last = merged.at(-1);
+    if (last && last[2] === a && last[3] === b && last[1] === lo) last[1] = hi; else merged.push([lo, hi, a, b]);
+  }
+  const clamp = (v) => (v > 0n ? Number(v) : 0);
+  return merged.map(([lo, hi, a, b]) => [lo, hi, clamp(a), clamp(b)]);
+}

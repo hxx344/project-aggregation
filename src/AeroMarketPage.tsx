@@ -1,12 +1,13 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowDown, ArrowLeftRight, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, RotateCcw, Save, Settings2, SlidersHorizontal } from 'lucide-react';
-import { CartesianGrid, Line, LineChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { ArrowDown, ArrowLeft, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, RotateCcw, Save, Settings2, SlidersHorizontal, Star } from 'lucide-react';
 import { api, ApiError } from './api';
+import AeroPoolDetail from './AeroPoolDetail';
 import { readCache, writeCache } from './aero-market-cache';
-import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, netYield, rangeTicks } from './aero-market-math';
+import { amount, days, message, pct, signed, usd, when } from './aero-market-format';
+import { expectedDaysInRange, netYield, quoteOf, rangeApr, rangeTicks, rebalanceCost, riskVolOf } from './aero-market-math';
 import type { NetYield } from './aero-market-math';
-import type { MarketChain, MarketConfig, MarketPool, MarketPoolHistory, MarketSamples, MarketSamplesUnchanged, MarketSnapshot, MarketUnchanged, MarketWindow } from './aero-market-types';
+import type { MarketChain, MarketConfig, MarketPool, MarketSamples, MarketSamplesUnchanged, MarketSnapshot, MarketUnchanged, MarketWindow } from './aero-market-types';
 import './aero-lp.css';
 import './aero-market.css';
 
@@ -15,20 +16,13 @@ const DAY = 86400;
 const RANGES = [{ value: 0, label: '最窄（单个 tickSpacing）' }, { value: 0.01, label: '±1%' }, { value: 0.02, label: '±2%' }, { value: 0.05, label: '±5%' }, { value: 0.1, label: '±10%' }, { value: 0.2, label: '±20%' }];
 const STATUS: Record<MarketChain['status'], string> = { idle: '等待首次扫描', loading: '扫描中', ok: '正常', error: '最近一次失败', disabled: '已停用' };
 const HISTORY: Record<MarketChain['history']['archive'], string> = { archive: '历史区块回填', unavailable: '历史区块不可读，本机累计', local: '本机按小时累计' };
-const dates = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
-const when = (ms: number | null) => (ms ? dates.format(ms) : '—');
 // 本地缓存不存 RPC 地址（可能带密钥）；显示缓存期间扫描设置不可用，等服务器的完整数据。
 const forCache = (data: MarketSnapshot): MarketSnapshot => ({ ...data, config: { ...data.config, chains: Object.fromEntries(Object.entries(data.config.chains).map(([id, c]) => [id, { ...c, rpcUrl: '' }])) } });
 const usableSnapshot = (data: unknown): data is MarketSnapshot => {
   const d = data as MarketSnapshot | null;
   return !!d && d.schema === 1 && Array.isArray(d.pools) && Array.isArray(d.chains) && !!d.config && typeof d.config.chains === 'object' && !!d.aero;
 };
-const message = (reason: unknown) => (reason instanceof Error ? reason.message : '请求失败，请重试。');
-const usd = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? '—' : v >= 1e6 ? `$${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `$${(v / 1e3).toFixed(1)}K` : `$${v.toFixed(v >= 10 ? 0 : 2)}`);
-const pct = (v: number | null | undefined, digits = 1) => (v === null || v === undefined || !Number.isFinite(v) ? '—' : `${(v * 100).toFixed(digits)}%`);
-const signed = (v: number | null | undefined) => (v === null || v === undefined || !Number.isFinite(v) ? '—' : `${v > 0 ? '+' : ''}${(v * 100).toFixed(2)}%`);
-const days = (v: number | null) => (v === null ? '—' : v >= 365 ? '>1 年' : v >= 10 ? `${v.toFixed(0)} 天` : v >= 1 ? `${v.toFixed(1)} 天` : `${(v * 24).toFixed(1)} 小时`);
-const amount = (v: number) => (v >= 1e4 ? v.toLocaleString('zh-CN', { maximumFractionDigits: 0 }) : v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }));
+const NO_FAVORITES: string[] = [];
 const pairName = (p: MarketPool) => `${p.token0.symbol} / ${p.token1.symbol}`;
 const key = (p: MarketPool) => `${p.chain}:${p.address}`;
 const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
@@ -48,11 +42,6 @@ const WINDOW_HOURS: Record<MarketWindow, number> = { '24h': 24, '3d': 72, '7d': 
 const Q96 = 2 ** 96;
 // 最佳宽度只在预计至少能在区间内待这么久的宽度中选：否则窄区间靠高频调仓刷出的净年化不稳定，也不现实。
 const MIN_HOLD_DAYS = 1;
-// 日波动下限：样本期内不动的池子按此估算损耗、调仓与收益波动比，避免零损耗与比值无限大。
-const VOL_FLOOR = 0.001;
-// 一次调仓（撤出、换币、重新添加并质押）的 gas 估算，美元。
-const REBALANCE_GAS_USD: Record<string, number> = { ethereum: 10 };
-const DEFAULT_REBALANCE_GAS_USD = 0.2;
 const widthLabel = (w: number) => (w ? `±${(w * 100).toFixed(0)}%` : '最窄');
 // 交易对类型按代币美元价判断：约 1 美元视为稳定币（不限于报价锚定的 USDC/USDT）；同价对指两币价差不超过 2%，如稳定币对、cbBTC/WBTC。
 const PAIRS = { all: '全部', stable: '含稳定币', volatile: '不含稳定币', pegged: '同价对（价差 ≤2%）' } as const;
@@ -77,16 +66,10 @@ const SORTS: Record<SortKey, (m: Metrics) => number | null> = {
 // 区间收益只按当前价位的质押流动性稀释：价格离开当前位置后的竞争流动性不同，结果仅用于同一时刻横向比较。
 function metricsFor(pool: MarketPool, aeroUsd: number | null, width: number, deposit: number): Metrics {
   const liquidity = Number(pool.liquidity), staked = Number(pool.stakedLiquidity);
-  const p0 = pool.token0.usd === null ? null : { usd: pool.token0.usd }, p1 = pool.token1.usd === null ? null : { usd: pool.token1.usd };
   const usdPerSecond = pool.emissionPerSec !== null && aeroUsd !== null ? pool.emissionPerSec * aeroUsd : null;
-  const aprFor = (range: [number, number]) => usdPerSecond === null || !pool.gauge ? null
-    : dilutedApr({ usdPerSecond, competingLiquidity: pool.stakedLiquidity, unitUsd: liquidityUnitUsd(pool.sqrtPriceX96, range[0], range[1], pool.token0, pool.token1, p0, p1), deposit });
+  const aprFor = (range: [number, number]) => rangeApr(pool, aeroUsd, range, deposit);
   const range = rangeTicks(pool.tick, pool.tickSpacing, width);
-  // 净年化、在区间天数与收益波动比统一用 24h 与 7d 中较大的日波动，偏保守，并设下限：稳定币对短期一个 tick 都没动时
-  // 波动记为 0，不加下限会让最窄档零损耗、零调仓而排到最前。调仓成本 = 半仓换币手续费 + gas 占投入比例。
-  const vols = [pool.vol24h?.daily, pool.vol7d?.daily].filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
-  const riskVol = vols.length ? Math.max(...vols, VOL_FLOOR) : null;
-  const costFraction = (pool.fee === null ? 0 : (0.5 * pool.fee) / 1e6) + (deposit > 0 ? (REBALANCE_GAS_USD[pool.chain] ?? DEFAULT_REBALANCE_GAS_USD) / deposit : 0);
+  const riskVol = riskVolOf(pool), costFraction = rebalanceCost(pool, deposit);
   const netAt = (r: [number, number], apr: number | null) => netYield({ apr, tick: pool.tick, lower: r[0], upper: r[1], dailyVol: riskVol, costFraction });
   const widths = RANGES.map((option) => { const r = rangeTicks(pool.tick, pool.tickSpacing, option.value); return netAt(r, aprFor(r)); });
   const best = bestOf(widths);
@@ -142,56 +125,24 @@ function averageOf(pool: MarketPool, entry: MarketSamples['pools'][string] | und
     score: scoreOf(best, sums) };
 }
 
-// 默认以美元价较高的代币为基准报价，例如 WETH/USDC 显示每 WETH 多少 USDC；flip 时反过来。
-function quoteOf(pool: MarketPool, flip = false) {
-  const invert = ((pool.token1.usd ?? 0) > (pool.token0.usd ?? 0)) !== flip;
-  const scale = 10 ** (pool.token0.decimals - pool.token1.decimals);
-  const price = (tick: number) => { const raw = 1.0001 ** tick * scale; return invert ? 1 / raw : raw; };
-  const label = invert ? `${pool.token1.symbol} / ${pool.token0.symbol}` : `${pool.token0.symbol} / ${pool.token1.symbol}`;
-  return { price, label: `每 ${invert ? pool.token1.symbol : pool.token0.symbol} 折合 ${invert ? pool.token0.symbol : pool.token1.symbol}`, pair: label, base: invert ? pool.token1.symbol : pool.token0.symbol, quote: invert ? pool.token0.symbol : pool.token1.symbol };
-}
-const priceText = (v: number) => (v >= 1000 ? v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : v >= 1 ? v.toPrecision(6) : v.toPrecision(5));
 
-function PoolDetail({ metrics, history, error, width, average }: { metrics: Metrics; history: MarketPoolHistory | null; error: string; width: number; average: string }) {
-  const { pool, range } = metrics;
-  const [flip, setFlip] = useState(false);
-  const quote = quoteOf(pool, flip);
-  const data = (history?.points ?? []).map(([t, tick]) => ({ t, price: quote.price(tick) }));
-  const [lo, hi] = [quote.price(range[0]), quote.price(range[1])].sort((a, b) => a - b);
-  // 反向报价常是 0.000xxx 这类长刻度：按最长刻度文字留宽，避免左侧被截。
-  const yWidth = Math.min(104, 16 + 7 * Math.max(...[lo, hi, ...data.map((d) => d.price)].map((v) => priceText(v).length)));
-  return <div className="am-detail">
-    <dl className="am-detail-facts">
-      <div><dt>池子</dt><dd><code>{pool.address}</code></dd></div>
-      <div><dt>Gauge</dt><dd>{pool.gauge ? <code>{pool.gauge}</code> : '无（不产生排放）'}</dd></div>
-      <div><dt>当前价格</dt><dd>{priceText(quote.price(pool.tick))}<small>{quote.label}</small></dd></div>
-      <div><dt>所选区间</dt><dd>{priceText(lo)} – {priceText(hi)}<small>{width ? `±${(width * 100).toFixed(0)}%` : '最窄'}，tick {range[0]} 至 {range[1]}</small></dd></div>
-      <div><dt>净年化（所选区间）</dt><dd>{pct(metrics.net?.net, 0)}<small>{metrics.net ? `排放 ${pct(metrics.net.emission, 0)} − 无常损失 ${pct(metrics.net.impermanent, 0)} − 调仓 ${pct(metrics.net.rebalance, 0)}` : '缺少波动率或排放'}{metrics.best ? `；最佳 ${widthLabel(metrics.best.width)} 为 ${pct(metrics.best.result.net, 0)}` : ''}</small></dd></div>
-      <div><dt>平均净年化（所选区间）</dt><dd>{pct(metrics.avg?.selected?.net, 0)}<small>{metrics.avg?.selected ? `排放 ${pct(metrics.avg.selected.emission, 0)} − 无常损失 ${pct(metrics.avg.selected.impermanent, 0)} − 调仓 ${pct(metrics.avg.selected.rebalance, 0)}；${average}` : average}{metrics.avg?.best ? `；最佳 ${widthLabel(metrics.avg.best.width)} 为 ${pct(metrics.avg.best.result.net, 0)}` : ''}</small></dd></div>
-      <div><dt>手续费</dt><dd>{pool.fee === null ? '—' : `${(pool.fee / 1e4).toFixed(3)}%`}<small>未质押分成 {pool.unstakedFee === null ? '—' : `${(pool.unstakedFee / 1e4).toFixed(0)}%`}</small></dd></div>
-      <div><dt>排放速率窗口</dt><dd>{pool.emissionWindowSec ? `${(pool.emissionWindowSec / 3600).toFixed(1)} 小时` : '—'}<small>按 voter 累计排放份额的差值计算</small></dd></div>
-      <div><dt>波动率样本</dt><dd>24h {pool.vol24h?.samples ?? 0} 个 · 7d {pool.vol7d?.samples ?? 0} 个<small>年化 24h {pct(pool.vol24h?.annual)} · 7d {pct(pool.vol7d?.annual)}</small></dd></div>
-      <div><dt>代币报价</dt><dd>{pool.token0.symbol} {usd(pool.token0.usd)} · {pool.token1.symbol} {usd(pool.token1.usd)}<small>从稳定币按池子深度逐级推算</small></dd></div>
-    </dl>
-    <figure className="am-chart" aria-label={`${pairName(pool)} 近 7 天价格，共 ${data.length} 个点`}>
-      <figcaption><span>近 7 天价格（{quote.label}），阴影为所选区间</span>
-        <button type="button" className="button secondary am-swap" onClick={() => setFlip((v) => !v)} aria-pressed={flip} title={`改为每 ${quote.quote} 折合 ${quote.base}`}><ArrowLeftRight size={13} />{quote.quote} / {quote.base}</button></figcaption>
-      {error ? <p className="lp-error">{error}</p> : !history ? <p className="muted"><LoaderCircle size={14} className="spin" /> 正在读取历史…</p> : data.length < 2 ? <p className="muted">历史样本不足，扫描运行几个小时后会出现。</p>
-        : <div className="am-chart-box"><ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 1, height: 240 }} minWidth={0}>
-          <LineChart data={data} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
-            <CartesianGrid vertical={false} stroke="var(--surface-5)" />
-            <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} tickFormatter={(v) => dates.format(Number(v))} tickLine={false} axisLine={false} minTickGap={48} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} />
-            <YAxis width={yWidth} domain={[(min: number) => Math.min(min, lo), (max: number) => Math.max(max, hi)]} tickFormatter={(v) => priceText(Number(v))} tickLine={false} axisLine={false} tick={{ fontSize: 11, fill: 'var(--text-secondary)' }} />
-            <ReferenceArea y1={lo} y2={hi} fill="var(--accent)" fillOpacity={0.08} stroke="none" ifOverflow="extendDomain" />
-            <Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString('zh-CN')} formatter={(v) => [priceText(Number(v)), quote.pair]} contentStyle={{ backgroundColor: 'var(--surface-3)', color: 'var(--text-primary)', border: '1px solid var(--surface-6)', borderRadius: 8, fontSize: 13 }} />
-            <Line type="linear" dataKey="price" stroke="var(--accent)" strokeWidth={1.5} dot={false} isAnimationActive={false} />
-          </LineChart>
-        </ResponsiveContainer></div>}
-    </figure>
-  </div>;
+// 详情页底部的池子数据；净年化按列表当前的区间宽度与投入，便于和列表对照。
+function PoolFacts({ metrics, width, average }: { metrics: Metrics; width: number; average: string }) {
+  const { pool } = metrics;
+  return <dl className="am-detail-facts">
+    <div><dt>池子</dt><dd><code>{pool.address}</code></dd></div>
+    <div><dt>Gauge</dt><dd>{pool.gauge ? <code>{pool.gauge}</code> : '无（不产生排放）'}</dd></div>
+    <div><dt>净年化（列表 {widthLabel(width)}）</dt><dd>{pct(metrics.net?.net, 0)}<small>{metrics.net ? `排放 ${pct(metrics.net.emission, 0)} − 无常损失 ${pct(metrics.net.impermanent, 0)} − 调仓 ${pct(metrics.net.rebalance, 0)}` : '缺少波动率或排放'}{metrics.best ? `；最佳 ${widthLabel(metrics.best.width)} 为 ${pct(metrics.best.result.net, 0)}` : ''}</small></dd></div>
+    <div><dt>平均净年化（列表 {widthLabel(width)}）</dt><dd>{pct(metrics.avg?.selected?.net, 0)}<small>{metrics.avg?.selected ? `排放 ${pct(metrics.avg.selected.emission, 0)} − 无常损失 ${pct(metrics.avg.selected.impermanent, 0)} − 调仓 ${pct(metrics.avg.selected.rebalance, 0)}；${average}` : average}{metrics.avg?.best ? `；最佳 ${widthLabel(metrics.avg.best.width)} 为 ${pct(metrics.avg.best.result.net, 0)}` : ''}</small></dd></div>
+    <div><dt>TVL / 质押占比</dt><dd>{usd(pool.tvlUsd)} · {pct(metrics.stakedShare, 0)}<small>质押占比 = 当前价位质押流动性 / 全部流动性</small></dd></div>
+    <div><dt>日排放</dt><dd>{metrics.aeroPerDay === null ? '—' : `${amount(metrics.aeroPerDay)} AERO`}<small>{usd(metrics.emissionUsdYear === null ? null : metrics.emissionUsdYear / 365)} / 天 · 排放/TVL {pct(metrics.emissionTvl, 0)}</small></dd></div>
+    <div><dt>手续费</dt><dd>{pool.fee === null ? '—' : `${(pool.fee / 1e4).toFixed(3)}%`}<small>未质押分成 {pool.unstakedFee === null ? '—' : `${(pool.unstakedFee / 1e4).toFixed(0)}%`}</small></dd></div>
+    <div><dt>排放速率窗口</dt><dd>{pool.emissionWindowSec ? `${(pool.emissionWindowSec / 3600).toFixed(1)} 小时` : '—'}<small>按 voter 累计排放份额的差值计算</small></dd></div>
+    <div><dt>波动率样本</dt><dd>24h {pool.vol24h?.samples ?? 0} 个 · 7d {pool.vol7d?.samples ?? 0} 个<small>日波动 24h {pct(pool.vol24h?.daily, 2)} · 7d {pct(pool.vol7d?.daily, 2)}；24h 涨跌 {signed(metrics.change)}</small></dd></div>
+    <div><dt>代币报价</dt><dd>{pool.token0.symbol} {usd(pool.token0.usd)} · {pool.token1.symbol} {usd(pool.token1.usd)}<small>从稳定币按池子深度逐级推算</small></dd></div>
+  </dl>;
 }
 
-// 草稿只在打开表单时取一次服务端配置：轮询更新不能覆盖正在编辑的内容；保存成功后表单关闭。
 function SettingsForm({ config, busy, onSave }: { config: MarketConfig; busy: boolean; onSave: (next: MarketConfig) => void }) {
   const [draft, setDraft] = useState(config);
   const [error, setError] = useState('');
@@ -250,8 +201,15 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   const [minDaysText, setMinDaysText] = useState('');
   const [sort, setSort] = useState<{ key: SortKey; desc: boolean }>({ key: 'score', desc: true });
   const [limit, setLimit] = useState(60);
-  const [open, setOpen] = useState<string | null>(null);
-  const [history, setHistory] = useState<{ key: string; data: MarketPoolHistory | null; error: string } | null>(null);
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  // 收藏先在本地生效，再按顺序同步到服务端；同步中只发送最新的列表。
+  const [pendingFavorites, setPendingFavorites] = useState<string[] | null>(null);
+  const desiredFavorites = useRef<string[] | null>(null);
+  const syncingFavorites = useRef(false);
+  // 详情页由地址栏 pool=链:地址 决定，浏览器后退回到列表；工作台切换页面时也按地址栏重新判断。
+  const [, setRouteTick] = useState(0);
+  const detailKey = new URLSearchParams(location.search).get('pool');
+  const listScroll = useRef(0);
   const lifetime = useRef<AbortController | null>(null);
   const revision = useRef<number | null>(null);
   const generation = useRef(0);
@@ -292,6 +250,8 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
   };
 
   const deposit = Math.max(Number(depositText) || 0, 0);
+  const favorites = pendingFavorites ?? snapshot?.favorites ?? NO_FAVORITES;
+  const favoriteSet = useMemo(() => new Set(favorites), [favorites]);
   const minTvl = Math.max(Number(minTvlText) || 0, 0);
   const aeroUsd = snapshot?.aero.usd ?? null;
   const chainNames = useMemo(() => new Map((snapshot?.chains ?? []).map((c) => [c.id, c.name])), [snapshot]);
@@ -365,6 +325,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
     // 指标缺失的池子在设了对应门槛时排除：无法判断是否满足。
     const vol = (m: Metrics) => m.pool.vol24h?.daily ?? m.pool.vol7d?.daily ?? null;
     return all.filter((m) => (chainFilter === 'all' || m.pool.chain === chainFilter)
+      && (!favoritesOnly || favoriteSet.has(key(m.pool)))
       && (!emittingOnly || (m.pool.emissionPerSec ?? 0) > 0)
       && (m.pool.tvlUsd ?? 0) >= minTvl
       && pairMatches(m.pool, pairKind)
@@ -378,41 +339,80 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
       && (minDays === null || (m.daysIn !== null && m.daysIn >= minDays))
       && words.every((w) => m.pool.token0.symbol.toLowerCase().includes(w) || m.pool.token1.symbol.toLowerCase().includes(w) || m.pool.address.startsWith(w)))
       .sort((a, b) => { const x = pick(a), y = pick(b); if (x === null && y === null) return 0; if (x === null) return 1; if (y === null) return -1; return sort.desc ? y - x : x - y; });
-  }, [all, chainFilter, emittingOnly, minTvl, search, sort, pairKind, spacingValue, minScore, minAvgScore, minNet, minAvg, minApr, maxVol, minDays]);
+  }, [all, chainFilter, favoritesOnly, favoriteSet, emittingOnly, minTvl, search, sort, pairKind, spacingValue, minScore, minAvgScore, minNet, minAvg, minApr, maxVol, minDays]);
   const resetFilters = () => {
     setChainFilter('all'); setSearch(''); setMinTvlText('100000'); setEmittingOnly(true);
     setPairKind('all'); setSpacing('all'); setMinScoreText(''); setMinAvgScoreText(''); setMinNetText(''); setMinAvgText(''); setMinAprText(''); setMaxVolText(''); setMinDaysText('');
   };
-  const openMetrics = open ? all.find((m) => key(m.pool) === open) ?? null : null;
-
-  const loadHistory = useCallback(async (chain: string, address: string, quiet: boolean) => {
-    const k = `${chain}:${address}`, signal = lifetime.current?.signal;
-    if (!quiet) setHistory({ key: k, data: null, error: '' });
-    try {
-      const data = await api<MarketPoolHistory>(`${ROOT}/pool?chain=${encodeURIComponent(chain)}&address=${address}`, { signal, timeoutMs: 15_000 });
-      if (!signal?.aborted) setHistory((h) => (h?.key === k ? { key: k, data, error: '' } : h));
-    } catch (reason) { if (!signal?.aborted && !quiet) fail(reason, (text) => setHistory((h) => (h?.key === k ? { key: k, data: null, error: text } : h))); }
-  }, [fail]);
-  const toggle = (m: Metrics) => {
-    const k = key(m.pool);
-    if (open === k) { setOpen(null); return; }
-    setOpen(k); void loadHistory(m.pool.chain, m.pool.address, false);
+  useEffect(() => { const change = () => setRouteTick((v) => v + 1); window.addEventListener('popstate', change); return () => window.removeEventListener('popstate', change); }, []);
+  const openPool = (pool: MarketPool) => {
+    const params = new URLSearchParams(location.search);
+    params.set('pool', key(pool));
+    listScroll.current = window.scrollY;
+    history.pushState({ aeroPool: true }, '', `${location.pathname}?${params}`);
+    setRouteTick((v) => v + 1);
   };
-  // 新一轮扫描后静默刷新已展开池子的价格图；失败时保留当前图。
-  const openRef = useRef(open);
-  openRef.current = open;
-  useEffect(() => {
-    const k = openRef.current;
-    if (!k) return;
-    const [chain, address] = k.split(':');
-    void loadHistory(chain, address, true);
-  }, [snapshot?.revision, loadHistory]);
+  const closePool = () => {
+    if ((history.state as { aeroPool?: boolean } | null)?.aeroPool) { history.back(); return; }
+    // 直接打开详情链接时没有可后退的列表页：替换地址回到列表。
+    const params = new URLSearchParams(location.search);
+    params.delete('pool');
+    history.replaceState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}`);
+    setRouteTick((v) => v + 1);
+  };
+  const inDetail = detailKey !== null;
+  useLayoutEffect(() => { window.scrollTo(0, inDetail ? 0 : listScroll.current); }, [inDetail]);
+
+  const syncFavorites = async () => {
+    const signal = lifetime.current?.signal;
+    if (!signal || syncingFavorites.current) return;
+    syncingFavorites.current = true;
+    try {
+      while (!signal.aborted && desiredFavorites.current) {
+        const list = desiredFavorites.current;
+        // 发出与完成时都让进行中的列表读取作废，避免旧收藏覆盖刚改的（L089）。
+        generation.current++;
+        try {
+          const data = await api<MarketSnapshot>(`${ROOT}/favorites`, { method: 'PUT', body: JSON.stringify({ favorites: list }), signal, timeoutMs: 20_000 });
+          generation.current++;
+          if (signal.aborted) return;
+          // 被更新的列表取代时也接收：显示仍由待同步列表覆盖，之后若失败可回到服务端的真实状态。
+          accept(data);
+          if (desiredFavorites.current !== list) continue;
+          desiredFavorites.current = null; setPendingFavorites(null);
+        } catch (reason) {
+          generation.current++;
+          if (signal.aborted) return;
+          desiredFavorites.current = null; setPendingFavorites(null);
+          fail(reason, (text) => setActionError(`收藏未保存：${text}`));
+        }
+      }
+    } finally { syncingFavorites.current = false; }
+  };
+  const toggleFavorite = (pool: MarketPool) => {
+    const k = key(pool), next = favoriteSet.has(k) ? favorites.filter((f) => f !== k) : [...favorites, k];
+    setActionError('');
+    desiredFavorites.current = next; setPendingFavorites(next);
+    void syncFavorites();
+  };
+  const favoriteDisabled = cachedAt !== null;
+
   const header = (k: SortKey, label: string, title?: string) => <th scope="col" className="num" aria-sort={sort.key === k ? (sort.desc ? 'descending' : 'ascending') : 'none'}>
     <button type="button" className="am-sort" title={title} onClick={() => setSort((s) => ({ key: k, desc: s.key === k ? !s.desc : true }))}>{label}{sort.key === k ? sort.desc ? <ArrowDown size={12} /> : <ArrowUp size={12} /> : null}</button>
   </th>;
 
   if (!snapshot) return <div className="lp-page">{loadError ? <div className="panel lp-empty"><CircleAlert /><p>{loadError}</p><button className="button secondary" onClick={() => void read()}><RefreshCw size={15} />重试</button></div>
     : <div className="panel lp-empty" role="status"><LoaderCircle className="spin" /><p>正在读取 Aero 市场数据…</p></div>}</div>;
+
+  if (detailKey !== null) {
+    const detail = all.find((m) => key(m.pool) === detailKey);
+    if (!detail) return <div className="lp-page am-page"><div className="panel lp-empty"><CircleAlert /><p>没有找到这个池子：可能已不在跟踪范围内，或所在的链已停用。</p><button className="button secondary" onClick={closePool}><ArrowLeft size={15} />返回列表</button></div></div>;
+    return <AeroPoolDetail key={detailKey} pool={detail.pool} chainName={chainNames.get(detail.pool.chain) ?? detail.pool.chain} aeroUsd={aeroUsd} initialWidth={width}
+      depositText={depositText} onDeposit={setDepositText} favorite={favoriteSet.has(detailKey)} favoriteDisabled={favoriteDisabled} onFavorite={() => toggleFavorite(detail.pool)} onBack={closePool} onExpired={onExpired}
+      notice={actionError}>
+      <PoolFacts metrics={detail} width={width} average={averageNote(detail)} />
+    </AeroPoolDetail>;
+  }
 
   const staleAfter = snapshot.config.intervalMin * 60_000 * 2 + 120_000;
   return <div className="lp-page am-page">
@@ -450,6 +450,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <label>平均窗口<select value={avgWindow} onChange={(e) => setAvgWindow(e.target.value as MarketWindow | 'off')}>{Object.entries(WINDOWS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}<option value="off">不计算</option></select></label>
         <label>最低 TVL（美元）<input type="number" min={0} step={1000} value={minTvlText} onChange={(e) => setMinTvlText(e.target.value)} /></label>
         <label className="am-check"><input type="checkbox" checked={emittingOnly} onChange={(e) => setEmittingOnly(e.target.checked)} />只看有排放</label>
+        <label className="am-check"><input type="checkbox" checked={favoritesOnly} onChange={(e) => setFavoritesOnly(e.target.checked)} />只看收藏{favorites.length ? `（${favorites.length}）` : ''}</label>
         <button type="button" className="button secondary am-more-toggle" aria-expanded={showMore} aria-controls="am-more-filters" onClick={() => setShowMore((v) => !v)}><SlidersHorizontal size={14} />更多筛选{advancedCount ? `（${advancedCount}）` : ''}</button>
         <span className="am-count">符合 {rows.length} / {all.length} 个池子</span>
       </div>
@@ -478,10 +479,10 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
           {header('days', '在区间', '所选区间内的预计停留时间')}{header('change', '24h 涨跌')}
         </tr></thead>
         <tbody>{rows.slice(0, limit).map((m) => {
-          const k = key(m.pool), isOpen = open === k;
-          return <Fragment key={k}>
-            <tr className={isOpen ? 'open' : undefined} onClick={() => toggle(m)}>
-              <th scope="row"><button type="button" className="am-pool" aria-expanded={isOpen}><strong>{pairName(m.pool)}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></th>
+          const k = key(m.pool), starred = favoriteSet.has(k);
+          return <tr key={k} onClick={() => openPool(m.pool)}>
+              <th scope="row"><span className="am-pool-cell"><button type="button" className={`am-star${starred ? ' on' : ''}`} aria-pressed={starred} aria-label={`${starred ? '取消收藏' : '收藏'} ${pairName(m.pool)}`} title={favoriteDisabled ? '正在连接服务器，稍后可收藏' : starred ? '取消收藏' : '收藏'} disabled={favoriteDisabled} onClick={(e) => { e.stopPropagation(); toggleFavorite(m.pool); }}><Star size={15} /></button>
+                <button type="button" className="am-pool" title="查看池子详情"><strong>{pairName(m.pool)}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></span></th>
               <td className="num strong">{m.score === null ? '—' : m.score.toFixed(1)}</td>
               <td className="num" title={averageNote(m)}>{m.avg?.score == null ? '—' : m.avg.score.toFixed(1)}</td>
               <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `${widthLabel(m.best.width)} · ${days(m.best.result.days)}` : ''}</small></td>
@@ -493,9 +494,7 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
               <td className="num">{pct(m.pool.vol24h?.daily, 2)}</td><td className="num">{pct(m.pool.vol7d?.daily, 2)}</td>
               <td className="num">{days(m.daysIn)}</td>
               <td className={`num ${(m.change ?? 0) > 0 ? 'up' : (m.change ?? 0) < 0 ? 'down' : ''}`} title={quoteOf(m.pool).pair}>{signed(m.change)}</td>
-            </tr>
-            {isOpen && openMetrics ? <tr className="am-detail-row"><td colSpan={15}><PoolDetail metrics={openMetrics} history={history?.key === k ? history.data : null} error={history?.key === k ? history.error : ''} width={width} average={averageNote(openMetrics)} /></td></tr> : null}
-          </Fragment>;
+            </tr>;
         })}
         {!rows.length ? <tr><td colSpan={15} className="lp-table-empty">{snapshot.pools.length ? '没有符合筛选条件的池子' : '还没有扫描结果；首次扫描每条链约需 1 分钟'}</td></tr> : null}</tbody>
       </table></div>

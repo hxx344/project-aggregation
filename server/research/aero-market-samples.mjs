@@ -60,6 +60,8 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
         (SELECT group_concat(slot) FROM (SELECT slot FROM samples s WHERE s.pool = p.id AND s.slot >= ? ORDER BY slot DESC)) AS slots FROM pools p`);
     statements.read = db.prepare(`SELECT s.pool, s.slot, s.tick, s.staked, s.usd0, s.usd1, s.emission, s.aero_usd, s.vol24h, s.vol7d, s.fee
       FROM json_each(?) j JOIN samples s ON s.slot = j.value ->> 0 AND s.pool = j.value ->> 1 ORDER BY s.pool, s.slot`);
+    statements.ticks = db.prepare(`SELECT s.slot, s.tick FROM pools p JOIN samples s ON s.pool = p.id
+      WHERE p.chain = ? AND p.address = ? AND s.slot >= ? AND s.slot < ? ORDER BY s.slot`);
   } catch (reason) {
     error = String(reason?.message || reason).slice(0, 240);
     log.warn?.({ type: 'aero-market', err: error }, 'Aero 样本库无法打开，平均净年化停用');
@@ -149,8 +151,15 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
     return result;
   }
 
+  // 单个池子 [fromSec, toSec) 内的整点 tick，供详情页的长周期价格图；走 (池, 整点) 索引，30 天最多 720 行。
+  function ticks(chainId, address, fromSec, toSec) {
+    if (!db) return [];
+    try { return statements.ticks.all(chainId, address, fromSec, toSec).map((r) => [Number(r.slot), Number(r.tick)]); }
+    catch (reason) { log.warn?.({ type: 'aero-market', err: String(reason?.message || reason).slice(0, 240) }, 'Aero 样本库读取价格历史失败'); return []; }
+  }
+
   return {
-    record, read,
+    record, read, ticks,
     status: () => ({ available: db !== null, error, version }),
     close() { try { db?.close(); } catch { /* 关闭失败不影响退出 */ } db = null; cache.clear(); poolIds.clear(); },
   };

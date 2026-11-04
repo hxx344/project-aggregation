@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { emissionRate, poolPrice, priceChange, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
+import { emissionRate, liquiditySegments, poolPrice, priceChange, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
+import { readPoolLiquidity } from '../server/research/aero-market-rpc.mjs';
 import { dilutedApr, expectedDaysInRange, liquidityUnitUsd, netYield, rangeTicks } from '../src/aero-market-math.ts';
 
 const Q96 = 2 ** 96;
@@ -110,4 +111,50 @@ test('net yield: impermanent loss matches the CL position gamma, rebalance follo
   const best = strong.indexOf(Math.max(...strong));
   assert.ok(best > 0 && best < strong.length - 1 && strong[best] > 0, `interior optimum, got ${strong}`);
   assert.ok(weak.every((v) => v < 0) && weak.indexOf(Math.max(...weak)) === weak.length - 1, `weak emission loses everywhere, got ${weak}`);
+});
+
+test('liquidity segments walk liquidityNet up and down from the current tick and merge equal neighbours', () => {
+  // 两个仓位：[-200, 200] L=100（质押 60），[0, 400] L=50（未质押）；当前 tick 50 处活跃 150、质押 60。
+  const ticks = [[-200, '100', '60'], [0, '50', '0'], [200, '-100', '-60'], [400, '-50', '0'], [600, '0', '0']];
+  assert.deepEqual(liquiditySegments({ tick: 50, liquidity: '150', stakedLiquidity: '60', ticks, from: -1000, to: 1000 }), [
+    [-1000, -200, 0, 0], [-200, 0, 100, 60], [0, 200, 150, 60], [200, 400, 50, 0], [400, 1000, 0, 0],
+  ]);
+  // 当前价恰好在已初始化 tick 上时属于其上方的分段；超过 2^53 的流动性按 BigInt 累加后才转浮点数。
+  const big = (10n ** 30n).toString();
+  assert.deepEqual(liquiditySegments({ tick: 0, liquidity: '150', stakedLiquidity: '60', ticks, from: -100, to: 300 }), [[-100, 0, 100, 60], [0, 200, 150, 60], [200, 300, 50, 0]]);
+  assert.deepEqual(liquiditySegments({ tick: 5, liquidity: big, stakedLiquidity: '0', ticks: [[10, `-${big}`, '0']], from: 0, to: 20 }), [[0, 10, 1e30, 0], [10, 20, 0, 0]]);
+});
+
+test('pool liquidity read decodes the tick bitmap, reads all ticks at one block and narrows the range when truncated', async () => {
+  const spacing = 10, initialized = [-30, -20, -10, 0, 20, 40, 50];
+  const blocks = [];
+  const rpc = {
+    async blockNumber() { return 123; },
+    async multicall(calls, block) {
+      blocks.push(block);
+      return calls.map((c) => {
+        if (c.fn === 'slot0') return { ok: true, value: [79228162514264337593543950336n, 5n] };
+        if (c.fn === 'liquidity') return { ok: true, value: 1000n };
+        if (c.fn === 'stakedLiquidity') return { ok: true, value: 400n };
+        if (c.fn === 'tickBitmap') {
+          const w = Number(c.args[0]);
+          let bits = 0n;
+          for (const t of initialized) { const comp = Math.floor(t / spacing); if (Math.floor(comp / 256) === w) bits |= 1n << BigInt(((comp % 256) + 256) % 256); }
+          return { ok: true, value: bits };
+        }
+        if (c.fn === 'ticks') return { ok: true, value: [0n, BigInt(c.args[0]), -BigInt(c.args[0]), 0n, 0n, 0n, 0n, 0n, 0n, true] };
+        throw new Error(c.fn);
+      });
+    },
+  };
+  const all = await readPoolLiquidity(rpc, { address: '0xpool', tickSpacing: spacing }, { span: 100 });
+  assert.deepEqual(all.ticks.map((r) => r[0]), initialized, 'negative compressed ticks map back through floor division');
+  assert.deepEqual(all.ticks[0], [-30, '-30', '30']);
+  assert.deepEqual([all.from, all.to, all.tick, all.liquidity, all.stakedLiquidity], [-95, 105, 5, '1000', '400']);
+  assert.ok(blocks.every((b) => b === 123), 'state, bitmap and ticks come from the same block');
+  // 只留 4 个：离当前 tick 5 最近的是 0、-10、20（距离 5、15、15），第 4 近距离 25（-20），第 5 近 35（40、-30）被舍弃，
+  // 范围收窄到距离 34 以内，范围内的已初始化 tick 全部读到。
+  const cut = await readPoolLiquidity(rpc, { address: '0xpool', tickSpacing: spacing }, { span: 100, maxTicks: 4 });
+  assert.deepEqual(cut.ticks.map((r) => r[0]), [-20, -10, 0, 20]);
+  assert.deepEqual([cut.from, cut.to], [-29, 39]);
 });
