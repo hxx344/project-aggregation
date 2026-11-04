@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { emissionRate, liquiditySegments, poolPrice, priceChange, realizedVol, solvePrices, tvlUsd } from '../server/research/aero-market-core.mjs';
 import { readPoolLiquidity } from '../server/research/aero-market-rpc.mjs';
-import { bestRange, dilutedApr, expectedDaysInRange, fullRange, liquidityUnitUsd, netYield, rangeApr, rangeLabel, rangeTicks, rebalanceCost, riskVolOf } from '../src/aero-market-math.ts';
+import { bestRange, DEFAULT_PLAN, dilutedApr, expectedDaysInRange, fullRange, liquidityUnitUsd, netYield, rangeApr, rangeLabel, rangeTicks, rebalanceCost, rebalanceCostOf, riskVolOf, swapDepthUsd } from '../src/aero-market-math.ts';
 
 const Q96 = 2 ** 96;
 const sqrtX96 = (rawPrice) => BigInt(Math.round(Math.sqrt(rawPrice) * Q96)).toString();
@@ -166,32 +166,75 @@ const clPool = (spacing, vol, extra = {}) => ({
   liquidity: '5000000000000000', stakedLiquidity: '3000000000000000', tvlUsd: 2e7, emissionPerSec: 0.05, emissionWindowSec: 1,
   vol24h: { daily: vol, annual: 0, samples: 1 }, vol7d: { daily: vol, annual: 0, samples: 1 }, change24h: 0, ...extra,
 });
-const netOf = (pool, range) => netYield({ apr: rangeApr(pool, 1.2, range, 1000), tick: pool.tick, lower: range[0], upper: range[1], dailyVol: riskVolOf(pool), costFraction: rebalanceCost(pool, 1000) });
+const netOf = (pool, range, plan) => netYield({ apr: rangeApr(pool, 1.2, range, 1000), tick: pool.tick, lower: range[0], upper: range[1], dailyVol: riskVolOf(pool), costFraction: rebalanceCost(pool, 1000), delayDays: plan.delayDays });
+const DAILY = { delayDays: 0, minDays: 1 };
 
-test('best range searches at tick-spacing granularity, beats every 1% preset and stays at least a day in range', () => {
-  for (const [spacing, vol] of [[1, 0.0005], [10, 0.01], [100, 0.03], [200, 0.05]]) {
+test('best range searches at tick-spacing granularity, beats every 1% preset and respects the minimum time in range', () => {
+  for (const plan of [DAILY, DEFAULT_PLAN]) for (const [spacing, vol] of [[1, 0.0005], [10, 0.01], [100, 0.03], [200, 0.05]]) {
     const pool = clPool(spacing, vol);
-    const best = bestRange(pool, 1.2, 1000);
+    const best = bestRange(pool, 1.2, 1000, plan);
     assert.ok(best, `spacing ${spacing}`);
     const [lower, upper] = best.range;
     assert.ok(Number.isInteger(lower / spacing) && Number.isInteger(upper / spacing));
     assert.ok(lower <= pool.tick && pool.tick < upper);
-    assert.ok(best.result.days >= 1);
+    assert.ok(best.result.days >= plan.minDays);
     for (const width of [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]) {
-      const preset = netOf(pool, rangeTicks(pool.tick, spacing, width));
-      if (preset && preset.days >= 1) assert.ok(best.result.net >= preset.net - 1e-12, `spacing ${spacing} width ${width}`);
+      const preset = netOf(pool, rangeTicks(pool.tick, spacing, width), plan);
+      if (preset && preset.days >= plan.minDays) assert.ok(best.result.net >= preset.net - 1e-12, `spacing ${spacing} width ${width}`);
     }
     // 与逐格穷举的居中区间相比差距很小。
     const cell = Math.floor(pool.tick / spacing);
     let brute = -Infinity;
     for (let n = 1; n <= Math.min(Math.ceil(27_728 / spacing), 1500); n++) {
-      const lo = (cell - Math.floor(n / 2)) * spacing, r = netOf(pool, [lo, lo + n * spacing]);
-      if (r && r.days >= 1) brute = Math.max(brute, r.net);
+      const lo = (cell - Math.floor(n / 2)) * spacing, r = netOf(pool, [lo, lo + n * spacing], plan);
+      if (r && r.days >= plan.minDays) brute = Math.max(brute, r.net);
     }
     assert.ok(best.result.net >= brute - Math.abs(brute) * 2e-3, `spacing ${spacing}: ${best.result.net} vs ${brute}`);
   }
   // 低波动的 tickSpacing=1 池子推荐比 1% 更窄的区间。
-  assert.equal(rangeLabel(clPool(1, 0.0005), bestRange(clPool(1, 0.0005), 1.2, 1000).range).startsWith('±0.'), true);
+  assert.equal(rangeLabel(clPool(1, 0.0005), bestRange(clPool(1, 0.0005), 1.2, 1000, DAILY).range).startsWith('±0.'), true);
+  // 自动调仓（停摆 5 分钟、至少 1 小时）比每天调一次推荐更窄；停摆越长、投入越大（价格冲击越大）推荐越宽。
+  const pool = clPool(10, 0.01), width = (b) => b.range[1] - b.range[0];
+  const auto = bestRange(pool, 1.2, 1000), daily = bestRange(pool, 1.2, 1000, DAILY);
+  assert.ok(width(auto) < width(daily) && auto.result.net > daily.result.net, `${width(auto)} vs ${width(daily)}`);
+  assert.ok(width(bestRange(pool, 1.2, 1000, { delayDays: 1 / 24, minDays: 0 })) >= width(bestRange(pool, 1.2, 1000, { delayDays: 1 / 1440, minDays: 0 })));
+  assert.ok(width(bestRange(pool, 1.2, 100_000)) > width(auto));
+});
+
+test('rebalance cost: gas, half-position swap fee and exact constant-liquidity price impact', () => {
+  const pool = clPool(100, 0.03), deposit = 20_000, c = rebalanceCostOf(pool, deposit);
+  assert.equal(c.swapUsd, 10_000);
+  assert.ok(Math.abs(c.gas - 0.2 / deposit) < 1e-15);
+  assert.ok(Math.abs(c.fee - 0.5 * 500 / 1e6) < 1e-15);
+  // 独立模拟：用 10000 USDC 在本池买 WETH，√P 升到 √P + Δy/L，换到 Δx = L(1/√P − 1/√P')，与中间价相比的损失。
+  const L = 5e15, sp = Number(pool.sqrtPriceX96) / Q96, dy = 10_000 * 1e6;
+  const sp2 = sp + dy / L, dx = L * (1 / sp - 1 / sp2);
+  const lost = 1 - (dx / 1e18 * 3000) / 10_000;
+  assert.ok(Math.abs(c.slippage - 0.5 * lost) / (0.5 * lost) < 1e-3, `${c.slippage} vs ${0.5 * lost}`);
+  assert.ok(Math.abs(c.total - (c.gas + c.fee + c.slippage)) < 1e-15);
+  // 深度随流动性线性增长，投入越大冲击越大；当前价位没有流动性或缺价时深度未知，不计冲击。
+  assert.ok(Math.abs(swapDepthUsd(clPool(100, 0.03, { liquidity: '10000000000000000' })) / swapDepthUsd(pool) - 2) < 1e-9);
+  assert.ok(rebalanceCostOf(pool, 100_000).slippage > c.slippage);
+  assert.equal(c.depthKnown, true);
+  for (const extra of [{ liquidity: '0' }, { token0: { ...pool.token0, usd: null }, token1: { ...pool.token1, usd: null } }]) {
+    const unknown = rebalanceCostOf(clPool(100, 0.03, extra), deposit);
+    assert.equal(unknown.slippage, 0); assert.equal(unknown.depthKnown, false);
+  }
+});
+
+test('net yield with rebalance downtime: no emission or loss while out of range, fewer cycles per year', () => {
+  const args = { apr: 2, tick: 0, lower: -500, upper: 500, dailyVol: 0.02, costFraction: 0.001 };
+  const base = netYield(args), delay = 0.1, r = netYield({ ...args, delayDays: delay });
+  assert.equal(r.days, base.days);
+  // 时间加权：一年里只有 T/(T+停摆) 的时间在区间内（有排放也有损耗），调仓次数 365/(T+停摆)。
+  const T = base.days, inShare = T / (T + delay);
+  assert.ok(Math.abs(r.net - ((2 - base.impermanent) * inShare - (365 / (T + delay)) * 0.001)) < 1e-9);
+  // 停摆越长，净年化越趋近 0（几乎一直空仓）。
+  const long = netYield({ ...args, delayDays: 1e6 });
+  assert.ok(Math.abs(long.net) < Math.abs(r.net) && Math.abs(long.net) < 1e-3);
+  assert.equal(base.downtime, 0);
+  assert.equal(netYield({ ...args, delayDays: -1 }), null);
+  assert.equal(netYield({ ...args, dailyVol: 0, delayDays: 1 }).downtime, 0);
 });
 
 test('best range falls back to full range when emission cannot cover the loss, and needs every input', () => {

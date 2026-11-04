@@ -47,18 +47,21 @@ export function expectedDaysInRange(tick: number, lower: number, upper: number, 
 // 质押仓位的净年化 = 排放年化 − 无常损失年化 − 调仓成本年化（手续费归投票者，不计入）。
 // 无常损失：区间内仓位价值 V = L·√P·w，w = 2 − e^(−d₁/2) − e^(−d₂/2)（d₁、d₂ 为当前价到下沿、上沿的对数距离，窄区间时 w ≈ 半宽 h），
 // Γ = −L/(2P^1.5)，套利损耗速率 σ²P²|Γ|/2 ÷ V = σ²/(4w)，窄区间即全区间 v2 的 σ²/8 乘以集中倍数 2/h；按日波动 σ 折成年化 365·σ²/(4w)。
-// 调仓：出区间后重新居中，每次约把半个仓位换成另一种币（0.5×池子费率）加上 gas；
-// 次数按期望在区间天数 x(A−x)/σ² 计，年化 = 365 / 天数 × 单次成本占投入比例。
-export type NetYield = { net: number; emission: number; impermanent: number; rebalance: number; days: number };
-export function netYield({ apr, tick, lower, upper, dailyVol, costFraction }: { apr: number | null; tick: number; lower: number; upper: number; dailyVol: number | null | undefined; costFraction: number }): NetYield | null {
-  if (apr === null || !Number.isFinite(apr) || !(costFraction >= 0)) return null;
+// 调仓（假设自动调仓）：出区间后撤出、把半个仓位换成另一种币、重新居中添加并质押，单次成本见 rebalanceCostOf。
+// 一个周期 = 期望在区间天数 T = x(A−x)/σ² + 停摆 delayDays（出区间到新仓位质押生效，期间没有排放也没有无常损失），
+// 排放与无常损失只在 T/(T+停摆) 的时间里发生，差额记为停摆损失；调仓年化 = 365/(T+停摆) × 单次成本占投入比例。
+export type NetYield = { net: number; emission: number; impermanent: number; downtime: number; rebalance: number; days: number };
+export function netYield({ apr, tick, lower, upper, dailyVol, costFraction, delayDays = 0 }: { apr: number | null; tick: number; lower: number; upper: number; dailyVol: number | null | undefined; costFraction: number; delayDays?: number }): NetYield | null {
+  if (apr === null || !Number.isFinite(apr) || !(costFraction >= 0) || !(delayDays >= 0)) return null;
   const days = expectedDaysInRange(tick, lower, upper, dailyVol);
   if (days === null || dailyVol === null || dailyVol === undefined) return null;
   const w = 2 - Math.exp(-((tick - lower) * LOG_TICK) / 2) - Math.exp(-((upper - tick) * LOG_TICK) / 2);
   if (!(w > 0)) return null;
   const impermanent = (365 * dailyVol * dailyVol) / (4 * w);
-  const rebalance = days === Infinity ? 0 : (365 / days) * costFraction;
-  return { net: apr - impermanent - rebalance, emission: apr, impermanent, rebalance, days };
+  const cycle = days + delayDays;
+  const downtime = days === Infinity || !(cycle > 0) ? 0 : (apr - impermanent) * (delayDays / cycle);
+  const rebalance = days === Infinity ? 0 : cycle > 0 ? (365 / cycle) * costFraction : Infinity;
+  return { net: apr - impermanent - downtime - rebalance, emission: apr, impermanent, downtime, rebalance, days };
 }
 
 export const MIN_TICK = -887272;
@@ -80,9 +83,31 @@ export function riskVolOf(pool: Pick<MarketPool, 'vol24h' | 'vol7d'>): number | 
   return vols.length ? Math.max(...vols, VOL_FLOOR) : null;
 }
 
-// 调仓成本占投入比例 = 半仓换币手续费 + gas / 投入。
-export const rebalanceCost = (pool: Pick<MarketPool, 'fee' | 'chain'>, deposit: number) =>
-  (pool.fee === null ? 0 : (0.5 * pool.fee) / 1e6) + (deposit > 0 ? rebalanceGasUsd(pool.chain) / deposit : 0);
+// 池子当前价位的深度 D（美元）：在恒定流动性 L 下把 √P 推高 r 倍需要 (r−1)·D 的 token1，D = L·√P 折成美元
+// （token1 没有美元价时用 token0 一侧 L/√P 折算）。当前价位没有流动性（落在空档）时深度未知，返回空。
+export function swapDepthUsd(pool: Pick<MarketPool, 'liquidity' | 'sqrtPriceX96' | 'token0' | 'token1'>): number | null {
+  const l = Number(pool.liquidity), s = Number(pool.sqrtPriceX96) / Q96;
+  if (!(l > 0) || !(s > 0)) return null;
+  if (pool.token1.usd !== null) return finite(((l * s) / 10 ** pool.token1.decimals) * pool.token1.usd);
+  if (pool.token0.usd !== null) return finite(((l / s) / 10 ** pool.token0.decimals) * pool.token0.usd);
+  return null;
+}
+// 单次调仓成本占投入比例：gas / 投入 + 换币金额（半个仓位，居中区间按价值正好一半是另一种币）×（池子费率 + 价格冲击）。
+// 价格冲击按在本池成交、当前价位流动性 L 近似：恒定 L 下换入 X 美元后 √P 变为 (1 + X/D) 倍，成交均价相对中间价差 X/(D+X)。
+// 跨 tick 后流动性的变化未计入（集中流动性通常越远越薄，会低估），也未走聚合器拆单（会高估），方向不定。深度未知时不计冲击。
+export type RebalanceCost = { gas: number; fee: number; slippage: number; total: number; swapUsd: number; gasUsd: number; depthKnown: boolean };
+export function rebalanceCostOf(pool: Pick<MarketPool, 'fee' | 'chain' | 'liquidity' | 'sqrtPriceX96' | 'token0' | 'token1'>, deposit: number): RebalanceCost {
+  const gasUsd = rebalanceGasUsd(pool.chain), swapUsd = deposit > 0 ? deposit / 2 : 0, depth = swapDepthUsd(pool);
+  const gas = deposit > 0 ? gasUsd / deposit : 0;
+  const fee = pool.fee === null ? 0 : (0.5 * pool.fee) / 1e6;
+  const slippage = depth === null || !(swapUsd > 0) ? 0 : 0.5 * (swapUsd / (depth + swapUsd));
+  return { gas, fee, slippage, total: gas + fee + slippage, swapUsd, gasUsd, depthKnown: depth !== null };
+}
+export const rebalanceCost = (pool: Parameters<typeof rebalanceCostOf>[0], deposit: number) => rebalanceCostOf(pool, deposit).total;
+// 自动调仓的假设：出区间到新仓位质押生效的停摆天数（界面上限 1 天：停摆比在区间还长时模型会偏向几乎一直空仓的窄区间）；推荐区间只在预计至少待 minDays 天的区间中选
+// （σ 由小时样本估计，更短的尺度上首次离开时间不可靠）。
+export type RebalancePlan = { delayDays: number; minDays: number };
+export const DEFAULT_PLAN: RebalancePlan = { delayDays: 5 / 1440, minDays: 1 / 24 };
 
 const pricesOf = (pool: MarketPool) => [pool.token0.usd === null ? null : { usd: pool.token0.usd }, pool.token1.usd === null ? null : { usd: pool.token1.usd }] as const;
 
@@ -118,8 +143,8 @@ export function quoteOf(pool: Pick<MarketPool, 'token0' | 'token1'>, flip = fals
 }
 export const priceText = (v: number) => (!Number.isFinite(v) ? '—' : v >= 1e12 ? v.toExponential(3) : v >= 1000 ? v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : v >= 1 ? v.toPrecision(6) : v >= 1e-12 ? v.toPrecision(5) : v.toExponential(3));
 
-// 推荐区间：在 tickSpacing 粒度上搜索以当前价居中的区间中净年化最高者，只在预计至少能在区间内待 minDays 天的区间中选，
-// 否则窄区间靠高频调仓刷出的净年化不稳定，也不现实。每个宽度只取最居中的摆放：模型假设价格无漂移，把当前价放到
+// 推荐区间：在 tickSpacing 粒度上搜索以当前价居中的区间中净年化最高者，只在预计至少能在区间内待 plan.minDays 天的区间中选；
+// 调仓成本（gas、手续费、价格冲击）与停摆已计入净年化，越窄调仓越频繁，最优宽度由成本自然决定。每个宽度只取最居中的摆放：模型假设价格无漂移，把当前价放到
 // 靠近一侧边沿能用同样的钱换到更多流动性，按公式净年化可再高几个百分点，但那是押注价格不往近的一侧走，且离开区间后
 // 重新调仓也是居中摆放，所以不采用。宽度先逐格试到 64 格，再按 1% 的几何步长试到当前价 ÷4 至 ×4，另外试全范围
 // （排放抵不过无常损失时越宽越好）；最后在最优宽度附近逐格细搜。
@@ -127,7 +152,7 @@ export type RangeChoice = { range: [number, number]; result: NetYield };
 const SEARCH_EXACT_CELLS = 64;
 const SEARCH_STEP = 1.01;
 const SEARCH_SPAN_TICKS = 13_864;
-export function bestRange(pool: MarketPool, aeroUsd: number | null, deposit: number, minDays = 1): RangeChoice | null {
+export function bestRange(pool: MarketPool, aeroUsd: number | null, deposit: number, plan: RebalancePlan = DEFAULT_PLAN): RangeChoice | null {
   const vol = riskVolOf(pool);
   if (vol === null || !pool.gauge || pool.emissionPerSec === null || aeroUsd === null || !(deposit > 0)) return null;
   const s = pool.tickSpacing, tick = pool.tick, full = fullRange(s);
@@ -136,8 +161,8 @@ export function bestRange(pool: MarketPool, aeroUsd: number | null, deposit: num
   let best: RangeChoice | null = null, bestCells = 0;
   const tryRange = (lower: number, upper: number) => {
     if (lower < full[0] || upper > full[1] || tick < lower || tick >= upper) return false;
-    const result = netYield({ apr: rangeApr(pool, aeroUsd, [lower, upper], deposit), tick, lower, upper, dailyVol: vol, costFraction });
-    if (!result || result.days < minDays || (best && result.net <= best.result.net)) return false;
+    const result = netYield({ apr: rangeApr(pool, aeroUsd, [lower, upper], deposit), tick, lower, upper, dailyVol: vol, costFraction, delayDays: plan.delayDays });
+    if (!result || result.days < plan.minDays || (best && result.net <= best.result.net)) return false;
     best = { range: [lower, upper], result }; return true;
   };
   const tryCells = (cells: number) => {
