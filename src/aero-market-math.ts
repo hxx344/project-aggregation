@@ -35,8 +35,27 @@ export function dilutedApr({ usdPerSecond, competingLiquidity, unitUsd, deposit 
 }
 
 // 无漂移布朗运动在 [lower, upper] 内从当前 tick 出发的期望首次离开时间：x(A−x)/σ²（对数价格单位，σ 为日波动）。
+// 日波动为 0（如稳定币对在样本期内没动）时视为一直在区间内。
 export function expectedDaysInRange(tick: number, lower: number, upper: number, dailyVol: number | null | undefined): number | null {
-  if (!dailyVol || !(dailyVol > 0) || !(upper > lower) || tick < lower || tick >= upper) return null;
+  if (dailyVol === null || dailyVol === undefined || !(dailyVol >= 0) || !(upper > lower) || tick < lower || tick >= upper) return null;
+  if (dailyVol === 0) return Infinity;
   const x = (tick - lower) * LOG_TICK, A = (upper - lower) * LOG_TICK;
   return finite((x * (A - x)) / (dailyVol * dailyVol));
+}
+
+// 质押仓位的净年化 = 排放年化 − 无常损失年化 − 调仓成本年化（手续费归投票者，不计入）。
+// 无常损失：区间内仓位价值 V = L·√P·w，w = 2 − e^(−d₁/2) − e^(−d₂/2)（d₁、d₂ 为当前价到下沿、上沿的对数距离，窄区间时 w ≈ 半宽 h），
+// Γ = −L/(2P^1.5)，套利损耗速率 σ²P²|Γ|/2 ÷ V = σ²/(4w)，窄区间即全区间 v2 的 σ²/8 乘以集中倍数 2/h；按日波动 σ 折成年化 365·σ²/(4w)。
+// 调仓：出区间后重新居中，每次约把半个仓位换成另一种币（0.5×池子费率）加上 gas；
+// 次数按期望在区间天数 x(A−x)/σ² 计，年化 = 365 / 天数 × 单次成本占投入比例。
+export type NetYield = { net: number; emission: number; impermanent: number; rebalance: number; days: number };
+export function netYield({ apr, tick, lower, upper, dailyVol, costFraction }: { apr: number | null; tick: number; lower: number; upper: number; dailyVol: number | null | undefined; costFraction: number }): NetYield | null {
+  if (apr === null || !Number.isFinite(apr) || !(costFraction >= 0)) return null;
+  const days = expectedDaysInRange(tick, lower, upper, dailyVol);
+  if (days === null || dailyVol === null || dailyVol === undefined) return null;
+  const w = 2 - Math.exp(-((tick - lower) * LOG_TICK) / 2) - Math.exp(-((upper - tick) * LOG_TICK) / 2);
+  if (!(w > 0)) return null;
+  const impermanent = (365 * dailyVol * dailyVol) / (4 * w);
+  const rebalance = days === Infinity ? 0 : (365 / days) * costFraction;
+  return { net: apr - impermanent - rebalance, emission: apr, impermanent, rebalance, days };
 }
