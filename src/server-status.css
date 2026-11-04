@@ -1,0 +1,17 @@
+.ss-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px}
+.ss-card{display:flex;flex-direction:column;gap:12px;padding:16px 18px;min-width:0}
+.ss-title{display:flex;align-items:center;gap:8px;font-size:.8125rem;font-weight:600;color:var(--text-secondary)}
+.ss-title svg{color:var(--text-tertiary)}
+.ss-value{font-size:1.75rem;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.1}
+.ss-value small{margin-left:6px;font-size:.8125rem;font-weight:500;color:var(--text-tertiary)}
+.ss-meter{height:6px;border-radius:3px;background:var(--surface-4);overflow:hidden}
+.ss-meter span{display:block;height:100%;border-radius:inherit;background:var(--emerald);transition:width .4s ease}
+.ss-meter.warn span{background:var(--warning)}
+.ss-meter.alert span{background:var(--error)}
+.ss-card.warn .ss-value{color:var(--warning)}
+.ss-card.alert .ss-value{color:var(--error)}
+.ss-details{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 12px;margin:0;font-size:.75rem}
+.ss-details dt{color:var(--text-tertiary)}
+.ss-details dd{margin:0;text-align:right;color:var(--text-secondary);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.ss-unavailable{color:var(--text-tertiary);font-size:.8125rem}
+.ss-meta{color:var(--text-tertiary);font-size:.75rem}
